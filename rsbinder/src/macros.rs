@@ -516,7 +516,15 @@ macro_rules! declare_binder_interface {
 #[macro_export]
 macro_rules! impl_serialize_for_parcelable {
     ($parcelable:ident) => {
-        impl $crate::Serialize for $parcelable {
+        $crate::impl_serialize_for_parcelable!($parcelable < >);
+    };
+    ($parcelable:ident < $( $param:ident ),* , >) => {
+        $crate::impl_serialize_for_parcelable!($parcelable < $($param),* >);
+    };
+    // A generic parcelable (`parcelable Foo<T, U>`): the parameters carry
+    // no bound, as in AOSP's libbinder — they never reach the parcel.
+    ($parcelable:ident < $( $param:ident ),* >) => {
+        impl < $($param),* > $crate::Serialize for $parcelable < $($param),* > {
             fn serialize(&self, parcel: &mut $crate::Parcel) -> $crate::Result<()> {
                 <Self as $crate::SerializeOption>::serialize_option(
                     ::core::option::Option::Some(self),
@@ -525,9 +533,9 @@ macro_rules! impl_serialize_for_parcelable {
             }
         }
 
-        impl $crate::SerializeArray for $parcelable {}
+        impl < $($param),* > $crate::SerializeArray for $parcelable < $($param),* > {}
 
-        impl $crate::SerializeOption for $parcelable {
+        impl < $($param),* > $crate::SerializeOption for $parcelable < $($param),* > {
             fn serialize_option(
                 this: ::core::option::Option<&Self>,
                 parcel: &mut $crate::Parcel,
@@ -553,7 +561,15 @@ macro_rules! impl_serialize_for_parcelable {
 #[macro_export]
 macro_rules! impl_deserialize_for_parcelable {
     ($parcelable:ident) => {
-        impl $crate::Deserialize for $parcelable {
+        $crate::impl_deserialize_for_parcelable!($parcelable < >);
+    };
+    ($parcelable:ident < $( $param:ident ),* , >) => {
+        $crate::impl_deserialize_for_parcelable!($parcelable < $($param),* >);
+    };
+    // A generic parcelable: `Default` comes from the generated impl, which
+    // has no bound on the parameters either, so none is needed here.
+    ($parcelable:ident < $( $param:ident ),* >) => {
+        impl < $($param),* > $crate::Deserialize for $parcelable < $($param),* > {
             fn deserialize(parcel: &mut $crate::Parcel) -> $crate::Result<Self> {
                 $crate::DeserializeOption::deserialize_option(parcel)
                     .transpose()
@@ -577,9 +593,9 @@ macro_rules! impl_deserialize_for_parcelable {
             }
         }
 
-        impl $crate::DeserializeArray for $parcelable {}
+        impl < $($param),* > $crate::DeserializeArray for $parcelable < $($param),* > {}
 
-        impl $crate::DeserializeOption for $parcelable {
+        impl < $($param),* > $crate::DeserializeOption for $parcelable < $($param),* > {
             fn deserialize_option(
                 parcel: &mut $crate::Parcel,
             ) -> $crate::Result<::core::option::Option<Self>> {

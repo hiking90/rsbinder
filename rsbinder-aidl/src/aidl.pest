@@ -103,7 +103,11 @@ enum_decl = { ENUM ~ qualified_name ~ enum_decl_body }
 
 union_decl = { UNION ~ qualified_name ~ optional_type_params ~ "{" ~ parcelable_members* ~ "}" }
 
-optional_type_params = { ("<" ~ identifier ~ ("," ~ identifier)* ~ ">")? }
+// A type parameter may carry a requirement on its argument, as in AOSP
+// `MQDescriptor<@FixedSize T, Flavor>` (`aidl_language_y.yy`, `type_parameter`).
+type_param = { annotation_list* ~ identifier }
+
+optional_type_params = { ("<" ~ type_param ~ ("," ~ type_param)* ~ ">")? }
 
 variable_decl = {
     type ~ identifier ~ "=" ~ const_expr ~ ";" |

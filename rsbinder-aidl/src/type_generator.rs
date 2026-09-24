@@ -157,6 +157,10 @@ pub struct TypeGenerator {
     pub(crate) is_nullable: bool,
     pub value_type: ValueType,
     array_types: Vec<ArrayInfo>,
+    /// Arguments of the one user-defined generic type this generator names
+    /// (`MQDescriptor<byte, Flavor>` bare, as an array element, or as a
+    /// `List` element). Empty for every other type.
+    type_args: Vec<TypeGenerator>,
     pub identifier: String,
     direction: Direction,
     type_span: Option<(usize, usize)>,
@@ -165,6 +169,7 @@ pub struct TypeGenerator {
 impl TypeGenerator {
     pub fn new(aidl_type: &NonArrayType) -> Result<Self, AidlError> {
         let mut array_types = Vec::new();
+        let mut type_args = Vec::new();
         let value_type = match aidl_type.name.as_str() {
             "boolean" => ValueType::Bool(false),
             "byte" => ValueType::Byte(0),
@@ -184,7 +189,21 @@ impl TypeGenerator {
                     // `panic!` in `type_decl`. Reject it here with a proper
                     // diagnostic (AOSP `aidl` likewise rejects list-of-array
                     // semantically) rather than crashing the generator.
-                    let elem = gen.to_value_type()?;
+                    let args = gen.type_args();
+                    if args.len() != 1 {
+                        return Err(make_type_error(
+                            format!(
+                                "List can only have one type parameter, but got {}",
+                                args.len()
+                            ),
+                            aidl_type.name_span,
+                        ));
+                    }
+                    let elem_generator = Self::new_with_type(&args[0])?;
+                    // `List<Foo<int>>`: the element's arguments travel with
+                    // this generator (the list itself has none of its own).
+                    type_args = elem_generator.type_args;
+                    let elem = elem_generator.value_type;
                     if matches!(elem, ValueType::Array(_)) {
                         return Err(make_type_error(
                             "List element type cannot be an array",
@@ -252,10 +271,20 @@ impl TypeGenerator {
             ));
         }
 
+        // `Foo<A, B>` on a user-defined type: keep the arguments so the Rust
+        // path carries them. Whether `Foo` takes them is settled against the
+        // declaration in `ensure_resolvable`, which every use site calls.
+        if let (ValueType::UserDefined(_), Some(generic)) = (&value_type, &aidl_type.generic) {
+            for arg in generic.type_args() {
+                type_args.push(Self::new_with_type(&arg)?);
+            }
+        }
+
         Ok(Self {
             is_nullable: false,
             value_type,
             array_types,
+            type_args,
             identifier: String::new(),
             direction: Default::default(),
             type_span: aidl_type.name_span,
@@ -343,7 +372,7 @@ impl TypeGenerator {
     /// `ResolutionError::UnknownType` diagnostic instead of a panic. Must be
     /// invoked while the owning declaration's `NamespaceGuard` is active.
     pub fn ensure_resolvable(&self) -> Result<(), AidlError> {
-        let check = |value_type: &ValueType| -> Result<(), AidlError> {
+        let check = |value_type: &ValueType| -> Result<Option<LookupDecl>, AidlError> {
             if let ValueType::UserDefined(name) = value_type {
                 // `lookup_decl_from_name` falls back to the *current* namespace's
                 // own declaration when nothing matches, so an undefined type does
@@ -360,15 +389,141 @@ impl TypeGenerator {
                         span,
                     }));
                 }
+                return Ok(resolved);
             }
-            Ok(())
+            Ok(None)
         };
 
-        check(&self.value_type)?;
+        let mut named = check(&self.value_type)?;
         for array_info in &self.array_types {
-            check(&array_info.value_type)?;
+            if let Some(found) = check(&array_info.value_type)? {
+                named = Some(found);
+            }
+        }
+        for arg in &self.type_args {
+            arg.ensure_resolvable()?;
+        }
+        match named {
+            Some(lookup_decl) => self.ensure_type_args(&lookup_decl),
+            None => Ok(()),
+        }
+    }
+
+    /// AOSP `AidlTypeSpecifier::CheckValid` for a user-defined generic: the
+    /// argument count must match the declaration, and an argument must
+    /// satisfy each annotation its parameter carries (`@FixedSize T` takes
+    /// only what `can_be_fixed_size` admits, `@VintfStability T` only a
+    /// `@VintfStability` declaration).
+    fn ensure_type_args(&self, lookup_decl: &LookupDecl) -> Result<(), AidlError> {
+        let params: &[parser::TypeParam] = match &lookup_decl.decl {
+            Declaration::Parcelable(decl) => &decl.type_params,
+            Declaration::Union(decl) => &decl.type_params,
+            _ => &[],
+        };
+        let name = lookup_decl.decl.name();
+        if params.is_empty() {
+            if !self.type_args.is_empty() {
+                return Err(make_type_error(
+                    format!("'{name}' is not a generic type"),
+                    self.type_span,
+                ));
+            }
+            return Ok(());
+        }
+        if params.len() != self.type_args.len() {
+            return Err(make_type_error(
+                format!(
+                    "'{name}' must have {} type parameters, but got {}",
+                    params.len(),
+                    self.type_args.len()
+                ),
+                self.type_span,
+            ));
+        }
+        for (param, arg) in params.iter().zip(&self.type_args) {
+            // AOSP `GetRustName` names a type argument without its array or
+            // list form, and `void` has no name at all, so neither can be
+            // spelled in the generated Rust.
+            let unsupported = match &arg.value_type {
+                ValueType::Array(_) => Some("an array or List"),
+                ValueType::Void => Some("void"),
+                _ => None,
+            };
+            if let Some(what) = unsupported {
+                return Err(make_type_error(
+                    format!("'{name}': a type argument cannot be {what}"),
+                    arg.type_span,
+                ));
+            }
+            for requirement in param.requirements() {
+                let satisfied = match requirement.annotation.as_str() {
+                    "@FixedSize" => arg.can_be_fixed_size(),
+                    "@VintfStability" => arg.is_vintf_declaration(),
+                    _ => false,
+                };
+                if !satisfied {
+                    return Err(make_type_error(
+                        format!(
+                            "type '{}' used as type parameter '{}' of '{name}' must be \
+                             annotated with {}",
+                            arg.aidl_name(),
+                            param.name,
+                            requirement.annotation
+                        ),
+                        arg.type_span,
+                    ));
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Whether this is a bare user-defined type whose declaration is
+    /// `@VintfStability` (directly or through an enclosing declaration).
+    fn is_vintf_declaration(&self) -> bool {
+        if !self.array_types.is_empty() {
+            return false;
+        }
+        match &self.value_type {
+            ValueType::UserDefined(name) => lookup_decl_from_name(name, crate::Namespace::AIDL)
+                .is_some_and(|lookup| parser::is_vintf_scoped(&lookup.ns)),
+            _ => false,
+        }
+    }
+
+    /// The type as the AIDL author wrote its head, for diagnostics.
+    fn aidl_name(&self) -> String {
+        fn head(value_type: &ValueType) -> String {
+            match value_type {
+                ValueType::Bool(_) => "boolean".into(),
+                ValueType::Byte(_) => "byte".into(),
+                ValueType::Char(_) => "char".into(),
+                ValueType::Int32(_) => "int".into(),
+                ValueType::Int64(_) => "long".into(),
+                ValueType::Float(_) => "float".into(),
+                ValueType::Double(_) => "double".into(),
+                ValueType::String(_) => "String".into(),
+                ValueType::IBinder => "IBinder".into(),
+                ValueType::FileDescriptor => "ParcelFileDescriptor".into(),
+                ValueType::Holder => "ParcelableHolder".into(),
+                ValueType::Void => "void".into(),
+                ValueType::UserDefined(name) => name.clone(),
+                other => other.to_value_string(),
+            }
+        }
+        let name = match &self.value_type {
+            ValueType::Array(_) => self
+                .array_types
+                .first()
+                .map(|info| format!("{}[]", head(&info.value_type)))
+                .unwrap_or_default(),
+            other => head(other),
+        };
+        if self.is_nullable {
+            format!("@nullable {name}")
+        } else {
+            name
+        }
     }
 
     /// Reject a field that closes a reference cycle without a form that can
@@ -484,10 +639,26 @@ impl TypeGenerator {
             && self.is_nullable
             && !is_interface
             && Self::closes_reference_cycle(&lookup_decl);
-        let path = if !ns.is_empty() {
+        // A builtin is the runtime crate's type, not a module of this output.
+        let path = if let Some(builtin) = parser::builtin_rust_path(&lookup_decl.ns) {
+            format!("{}::{builtin}", crate_name())
+        } else if !ns.is_empty() {
             format!("{ns}::{simple}")
         } else {
             simple.into_owned()
+        };
+        // `Foo<A, B>`: the arguments as Rust types. AOSP `GetRustName` names
+        // an argument bare — its `Option`, `Vec` and `&` wrapping belong to
+        // the whole field or parameter, never to a type argument.
+        let path = if self.type_args.is_empty() {
+            path
+        } else {
+            let args: Vec<String> = self
+                .type_args
+                .iter()
+                .map(|arg| arg.type_arg_decl())
+                .collect();
+            format!("{path}<{}>", args.join(", "))
         };
         let name = if needs_box {
             format!("Box<{path}>")
@@ -500,6 +671,12 @@ impl TypeGenerator {
         } else {
             name
         }
+    }
+
+    /// This type in a type-argument position: the bare Rust name. The parser
+    /// refuses an annotation there, so there is no `@nullable` to reflect.
+    fn type_arg_decl(&self) -> String {
+        self.type_decl(&self.value_type, false)
     }
 
     // AIDL Enum is a kind of primitive type.
@@ -531,16 +708,16 @@ impl TypeGenerator {
     /// Can a field of this type appear in a `@FixedSize` parcelable or union?
     ///
     /// Ports AOSP `AidlTypenames::CanBeFixedSize` (`aidl_typenames.cpp`): a
-    /// generic (`List<T>`), a `@nullable` type, and a variable-length array
-    /// are all variable size; primitives and enums are fixed; a parcelable or
-    /// union is fixed only if it is itself `@FixedSize`; every other builtin
-    /// (`String`, `IBinder`, `ParcelFileDescriptor`, `ParcelableHolder`) and
-    /// every interface handle is not. Must be invoked while the owning
-    /// declaration's `NamespaceGuard` is active: a `UserDefined` name that
-    /// fails to resolve is reported as non-fixed, which would reject valid
-    /// input.
+    /// generic (`List<T>` or `Foo<T>`, whatever `Foo` is annotated), a
+    /// `@nullable` type, and a variable-length array are all variable size;
+    /// primitives and enums are fixed; a parcelable or union is fixed only if
+    /// it is itself `@FixedSize`; every other builtin (`String`, `IBinder`,
+    /// `ParcelFileDescriptor`, `ParcelableHolder`) and every interface handle
+    /// is not. Must be invoked while the owning declaration's
+    /// `NamespaceGuard` is active: a `UserDefined` name that fails to resolve
+    /// is reported as non-fixed, which would reject valid input.
     pub fn can_be_fixed_size(&self) -> bool {
-        if self.is_nullable {
+        if self.is_nullable || !self.type_args.is_empty() {
             return false;
         }
         let element = match self.array_types.first() {
@@ -589,13 +766,18 @@ impl TypeGenerator {
     /// element type when it is an array or a `List<T>`. Used to walk a
     /// `@VintfStability` declaration's reference closure.
     pub fn referenced_user_types(&self) -> Vec<&str> {
-        std::iter::once(&self.value_type)
+        let mut names: Vec<&str> = std::iter::once(&self.value_type)
             .chain(self.array_types.iter().map(|info| &info.value_type))
             .filter_map(|value_type| match value_type {
                 ValueType::UserDefined(name) => Some(name.as_str()),
                 _ => None,
             })
-            .collect()
+            .collect();
+        // A type argument is part of the signature too (`Foo<Bar>` names `Bar`).
+        for arg in &self.type_args {
+            names.extend(arg.referenced_user_types());
+        }
+        names
     }
 
     /// Can a `const` have this type?

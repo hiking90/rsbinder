@@ -193,6 +193,90 @@ pub(crate) fn is_builtin_aidl_type(fqcn: &str) -> bool {
     matches!(fqcn, "android.os.ParcelFileDescriptor")
 }
 
+/// A declaration the runtime crate ships compiled, so an `import` of it
+/// needs no `.aidl` beside the user's sources. The vendored source is
+/// parsed for its declaration (field types, `@VintfStability`, type
+/// parameters and their requirements) and nothing is generated for it;
+/// every reference names `<runtime crate>::<rust_path>` instead. A source
+/// found under an include directory takes precedence and is compiled
+/// normally.
+pub(crate) struct BuiltinDecl {
+    /// Fully-qualified AIDL name.
+    pub fqcn: &'static str,
+    /// Where the runtime crate exposes the type, relative to its root.
+    pub rust_path: &'static str,
+    /// Path of the vendored source, for diagnostics.
+    pub filename: &'static str,
+    /// The vendored AOSP source text.
+    pub source: &'static str,
+}
+
+/// AOSP `hardware/interfaces` types rsbinder provides: the Fast Message
+/// Queue descriptor (`rsbinder::fmq`) and the `NativeHandle` it carries.
+/// Vendored from `android17-release`; both packages are VINTF-stable and
+/// have not changed since Android 11.
+pub(crate) const BUILTIN_DECLS: &[BuiltinDecl] = &[
+    BuiltinDecl {
+        fqcn: "android.hardware.common.NativeHandle",
+        rust_path: "NativeHandle",
+        filename: "<rsbinder-aidl>/android/hardware/common/NativeHandle.aidl",
+        source: include_str!("../aidl/android/hardware/common/NativeHandle.aidl"),
+    },
+    BuiltinDecl {
+        fqcn: "android.hardware.common.fmq.GrantorDescriptor",
+        rust_path: "fmq::GrantorDescriptor",
+        filename: "<rsbinder-aidl>/android/hardware/common/fmq/GrantorDescriptor.aidl",
+        source: include_str!("../aidl/android/hardware/common/fmq/GrantorDescriptor.aidl"),
+    },
+    BuiltinDecl {
+        fqcn: "android.hardware.common.fmq.MQDescriptor",
+        rust_path: "fmq::MQDescriptor",
+        filename: "<rsbinder-aidl>/android/hardware/common/fmq/MQDescriptor.aidl",
+        source: include_str!("../aidl/android/hardware/common/fmq/MQDescriptor.aidl"),
+    },
+    BuiltinDecl {
+        fqcn: "android.hardware.common.fmq.SynchronizedReadWrite",
+        rust_path: "fmq::SynchronizedReadWrite",
+        filename: "<rsbinder-aidl>/android/hardware/common/fmq/SynchronizedReadWrite.aidl",
+        source: include_str!("../aidl/android/hardware/common/fmq/SynchronizedReadWrite.aidl"),
+    },
+    BuiltinDecl {
+        fqcn: "android.hardware.common.fmq.UnsynchronizedWrite",
+        rust_path: "fmq::UnsynchronizedWrite",
+        filename: "<rsbinder-aidl>/android/hardware/common/fmq/UnsynchronizedWrite.aidl",
+        source: include_str!("../aidl/android/hardware/common/fmq/UnsynchronizedWrite.aidl"),
+    },
+];
+
+pub(crate) fn builtin_decl(fqcn: &str) -> Option<&'static BuiltinDecl> {
+    BUILTIN_DECLS.iter().find(|decl| decl.fqcn == fqcn)
+}
+
+/// The `.aidl` files an import resolves to under the include directories.
+/// A builtin's name vendored under more than one include directory: the same
+/// refusal as for any other import (AOSP "Duplicate files found").
+fn ambiguous_builtin_copy(fqcn: &str, candidates: &[PathBuf]) -> AidlError {
+    AidlError::Config {
+        message: format!(
+            "'{fqcn}' found under more than one include directory: {}",
+            candidates
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn import_candidates(includes: &[PathBuf], import: &str) -> Vec<PathBuf> {
+    let rel_path = PathBuf::from(import.replace('.', "/")).with_extension("aidl");
+    includes
+        .iter()
+        .map(|dir| dir.join(&rel_path))
+        .filter(|p| p.exists())
+        .collect()
+}
+
 // AIDL permits names that are Rust keywords, so declarations and reference
 // paths must `r#`-escape them as AOSP's Rust backend does. `crate`/`self`/
 // `Self`/`super` cannot be raw identifiers at all and are rejected in the
@@ -266,6 +350,9 @@ pub struct Builder {
     // walked: cargo scans directories recursively, so the two together
     // trigger reruns on modifications and on additions/removals.
     dependencies: Vec<PathBuf>,
+    // Builtin declarations an import pulled in (`BUILTIN_DECLS`). Parsed so
+    // references resolve; never generated.
+    builtin_documents: Vec<parser::Document>,
 }
 
 impl Default for Builder {
@@ -286,6 +373,7 @@ impl Builder {
             trace: false,
             version_meta: HashMap::new(),
             dependencies: Vec::new(),
+            builtin_documents: Vec::new(),
         }
     }
 
@@ -492,6 +580,50 @@ impl Builder {
         Ok(content)
     }
 
+    /// Parse a builtin's vendored source so its declaration resolves, and
+    /// record the runtime-crate path every reference to it must use. Called
+    /// only once every source is parsed, so a declaration a source already
+    /// compiled keeps precedence and is not registered. The builtin's own
+    /// imports resolve like a source's: a copy under an include directory
+    /// is queued as a source, otherwise the import must be a builtin (or
+    /// `ParcelFileDescriptor`) and is queued behind this one.
+    fn add_builtin(
+        &mut self,
+        builtin: &'static BuiltinDecl,
+        includes: &[PathBuf],
+        sources: &mut Vec<PathBuf>,
+        pending: &mut Vec<&'static BuiltinDecl>,
+    ) -> Result<(), AidlError> {
+        let ns = Namespace::new(builtin.fqcn, Namespace::AIDL);
+        if parser::builtin_rust_path(&ns).is_some() || parser::is_declared(&ns) {
+            return Ok(());
+        }
+        parser::register_builtin_path(&ns, builtin.rust_path);
+        let ctx = parser::SourceContext::new(builtin.filename, builtin.source);
+        let doc = parser::parse_document(&ctx)?;
+        for import in doc.imports.values() {
+            if is_builtin_aidl_type(import) {
+                continue;
+            }
+            let mut candidates = import_candidates(includes, import);
+            match candidates.len() {
+                1 => sources.push(candidates.pop().expect("len checked")),
+                0 => {
+                    let dependency = builtin_decl(import).ok_or_else(|| AidlError::Config {
+                        message: format!(
+                            "builtin '{}' imports '{import}', which is not a builtin",
+                            builtin.fqcn
+                        ),
+                    })?;
+                    pending.push(dependency);
+                }
+                _ => return Err(ambiguous_builtin_copy(import, &candidates)),
+            }
+        }
+        self.builtin_documents.push(doc);
+        Ok(())
+    }
+
     fn parse_sources(
         &mut self,
     ) -> Result<Vec<(String, parser::Document, parser::SourceContext)>, AidlError> {
@@ -500,6 +632,7 @@ impl Builder {
         // would otherwise let the first one's symbol table leak into the
         // second.
         parser::reset();
+        self.builtin_documents.clear();
         let mut sources = take(&mut self.sources);
         let mut seen = HashSet::new();
         // `includes` keeps insertion order (user `include_dir()`s first,
@@ -538,7 +671,11 @@ impl Builder {
             Some(components.collect())
         }
 
-        while !sources.is_empty() {
+        // Builtins are registered only after every source is in: an include
+        // directory may vendor a declaration a builtin imports, and that copy
+        // is compiled, so the builtin must not claim the name first.
+        let mut pending_builtins: Vec<&'static BuiltinDecl> = Vec::new();
+        while !sources.is_empty() || !pending_builtins.is_empty() {
             for path in take(&mut sources) {
                 // `Path::is_dir()` follows symlinks, so a link cycle
                 // (`aidl/loop -> .`) yields endlessly deeper distinct path
@@ -576,13 +713,7 @@ impl Builder {
                                 if is_builtin_aidl_type(import) {
                                     continue;
                                 }
-                                let rel_path =
-                                    PathBuf::from(import.replace('.', "/")).with_extension("aidl");
-                                let mut candidates: Vec<PathBuf> = includes
-                                    .iter()
-                                    .map(|dir| dir.join(&rel_path))
-                                    .filter(|p| p.exists())
-                                    .collect();
+                                let mut candidates = import_candidates(&includes, import);
 
                                 // The exact byte offset of an import statement
                                 // is not preserved in the AST, so search the
@@ -603,6 +734,10 @@ impl Builder {
                                 match candidates.len() {
                                     1 => sources.push(candidates.pop().expect("len checked")),
                                     0 => {
+                                        if let Some(builtin) = builtin_decl(import) {
+                                            pending_builtins.push(builtin);
+                                            continue;
+                                        }
                                         let (src, span) = import_span();
                                         errors.push(AidlError::from(
                                             error::ResolutionError::ImportNotFound {
@@ -662,6 +797,61 @@ impl Builder {
                     }
                 };
             }
+            if !sources.is_empty() {
+                continue;
+            }
+            if let Some(builtin) = pending_builtins.pop() {
+                // The include set has grown since this import was met (every
+                // source adds its package directory), so look again: a copy
+                // that is now visible is a source, not a builtin.
+                let mut candidates = import_candidates(&includes, builtin.fqcn);
+                match candidates.len() {
+                    0 => {}
+                    1 => {
+                        sources.push(candidates.pop().expect("len checked"));
+                        continue;
+                    }
+                    _ => {
+                        errors.push(ambiguous_builtin_copy(builtin.fqcn, &candidates));
+                        continue;
+                    }
+                }
+                // Collected, not returned: the user sources' diagnostics
+                // gathered above must reach the same report.
+                if let Err(e) =
+                    self.add_builtin(builtin, &includes, &mut sources, &mut pending_builtins)
+                {
+                    errors.push(e);
+                }
+            }
+        }
+
+        // A builtin is chosen when no copy is visible at that moment. A copy
+        // that surfaced afterwards (an include directory another builtin's
+        // import discovered) would leave the name registered as the runtime
+        // crate's type and compiled as a module at once, so it is an error
+        // rather than a silent choice.
+        for builtin in BUILTIN_DECLS {
+            let ns = Namespace::new(builtin.fqcn, Namespace::AIDL);
+            if parser::builtin_rust_path(&ns).is_none() {
+                continue;
+            }
+            let candidates = import_candidates(&includes, builtin.fqcn);
+            if !candidates.is_empty() {
+                errors.push(AidlError::Config {
+                    message: format!(
+                        "'{}' was resolved to the runtime crate's type before its source {} \
+                         became visible; add Builder::include_dir() for that directory so \
+                         the copy is compiled instead",
+                        builtin.fqcn,
+                        candidates
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                });
+            }
         }
 
         // If there are parse errors, report them immediately without semantic analysis (prevents cascading errors)
@@ -707,6 +897,9 @@ impl Builder {
         // 1st pass: pre-register all enum symbols across all documents
         // so that parcelable default values can resolve enum references
         // regardless of file processing order.
+        for document in &self.builtin_documents {
+            generator::Generator::pre_register_enums(document);
+        }
         for document in &documents {
             generator::Generator::pre_register_enums(&document.1);
         }

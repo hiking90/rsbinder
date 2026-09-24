@@ -100,6 +100,31 @@ fn main() {
         .generate()
         .unwrap();
 
+    // Plan 12: the Fast Message Queue descriptor and the `NativeHandle` it
+    // carries, vendored from AOSP `hardware/interfaces` (`android17-release`;
+    // VINTF-stable, unchanged since Android 11). Exposed as `rsbinder::fmq`
+    // and `rsbinder::NativeHandle`. rsbinder-aidl maps a user's import of
+    // these packages to those paths, so they are compiled here exactly once.
+    new_builder()
+        .source(PathBuf::from(
+            "aidl/fmq/android/hardware/common/NativeHandle.aidl",
+        ))
+        .source(PathBuf::from(
+            "aidl/fmq/android/hardware/common/fmq/GrantorDescriptor.aidl",
+        ))
+        .source(PathBuf::from(
+            "aidl/fmq/android/hardware/common/fmq/MQDescriptor.aidl",
+        ))
+        .source(PathBuf::from(
+            "aidl/fmq/android/hardware/common/fmq/SynchronizedReadWrite.aidl",
+        ))
+        .source(PathBuf::from(
+            "aidl/fmq/android/hardware/common/fmq/UnsynchronizedWrite.aidl",
+        ))
+        .output(PathBuf::from("fmq.rs"))
+        .generate()
+        .unwrap();
+
     // Plan 10-7: the streaming contract. rsbinder's own package rather
     // than a vendored AOSP one — AOSP has no streaming interface — so it
     // sits in `aidl/stream/` under the package path the descriptor

@@ -138,24 +138,30 @@ pub mod {{mod}} {
     {%- if deprecated %}
     {{ deprecated }}
     {%- endif %}
-    pub struct {{name}} {
+    pub struct {{name}}{{generics}} {
     {%- for member in members %}
         {%- if member.deprecated %}
         {{ member.deprecated }}
         {%- endif %}
         pub r#{{ member.identifier }}: {{ member.type_decl }},
     {%- endfor %}
+    {%- for param in type_params %}
+        pub _phantom_{{ param }}: core::marker::PhantomData<{{ param }}>,
+    {%- endfor %}
     }
-    impl Default for {{ name }} {
+    impl{{generics}} Default for {{ name }}{{generics}} {
         fn default() -> Self {
             Self {
             {%- for member in members %}
                 r#{{ member.identifier }}: {{ member.init }},
             {%- endfor %}
+            {%- for param in type_params %}
+                _phantom_{{ param }}: core::marker::PhantomData,
+            {%- endfor %}
             }
         }
     }
-    impl {{crate}}::Parcelable for {{name}} {
+    impl{{generics}} {{crate}}::Parcelable for {{name}}{{generics}} {
         fn write_to_parcel(&self, _parcel: &mut {{crate}}::Parcel) -> {{crate}}::Result<()> {
             _parcel.sized_write(|_sub_parcel| {
                 {%- for member in members %}
@@ -185,9 +191,9 @@ pub mod {{mod}} {
             })
         }
     }
-    {{crate}}::impl_serialize_for_parcelable!({{name}});
-    {{crate}}::impl_deserialize_for_parcelable!({{name}});
-    impl {{crate}}::ParcelableMetadata for {{name}} {
+    {{crate}}::impl_serialize_for_parcelable!({{name}}{{generics}});
+    {{crate}}::impl_deserialize_for_parcelable!({{name}}{{generics}});
+    impl{{generics}} {{crate}}::ParcelableMetadata for {{name}}{{generics}} {
         fn descriptor() -> &'static str { "{{namespace}}" }
         {%- if is_vintf %}
         fn stability(&self) -> {{crate}}::Stability { {{crate}}::Stability::Vintf }
@@ -1027,6 +1033,7 @@ impl Default for ParcelableRender {
             nested: String::new(),
             is_vintf: false,
             deprecated: String::new(),
+            type_params: Vec::new(),
         }
     }
 }
@@ -1153,6 +1160,13 @@ pub struct ParcelableRender {
     pub is_vintf: bool,
     /// Rendered `#[deprecated…]` attribute for the parcelable, or empty.
     pub deprecated: String,
+    /// Type parameter names of a generic parcelable (`Foo<T, U>`), in
+    /// declaration order. Each becomes a `PhantomData` field, as AOSP's
+    /// Rust backend emits an unused parameter: no field may have a
+    /// parameter's type, so every parameter is unused. The field is `pub`
+    /// where AOSP's is private, so `Foo { a, ..Default::default() }`
+    /// compiles outside the generated module.
+    pub type_params: Vec<String>,
 }
 
 /// Render one parcelable module (`pub mod {module} { pub struct {name} … }`).
@@ -1168,6 +1182,14 @@ pub fn render_parcelable(r: &ParcelableRender) -> Result<String, AidlError> {
     context.insert("nested", &r.nested);
     context.insert("is_vintf", &r.is_vintf);
     context.insert("deprecated", &r.deprecated);
+    context.insert("type_params", &r.type_params);
+    // `<T, U>` or nothing, spelled once for the struct and every impl.
+    let generics = if r.type_params.is_empty() {
+        String::new()
+    } else {
+        format!("<{}>", r.type_params.join(", "))
+    };
+    context.insert("generics", &generics);
 
     template()
         .render("parcelable", &context)
@@ -2065,6 +2087,18 @@ impl Generator {
         // representable: emit the alias and ignore the Java/NDK/C++ markers
         // that only describe the other backends.
         if !decl.rust_type.is_empty() {
+            // `pub type Foo<T> = X;` needs `X` to use every parameter, and
+            // nothing here knows the shape of `X`.
+            if let Some(param) = decl.type_params.first() {
+                return Err(Self::decl_error(
+                    format!(
+                        "parcelable '{}' is generic and names a `rust_type`: a type alias \
+                         cannot carry the parameters, so declare it structured",
+                        decl.name
+                    ),
+                    param.name_span,
+                ));
+            }
             let escaped = crate::escape_rust_keyword(&decl.name);
             let rendered = format!(r#"
 pub mod {mod} {{
@@ -2115,11 +2149,20 @@ pub mod {mod} {{
         // Not scoped: a nested parcelable does not inherit `@FixedSize`.
         let is_fixed_size =
             parser::has_annotation(&decl.annotation_list, parser::AnnotationType::FixedSize);
+        Self::ensure_type_params(&decl.name, &decl.type_params, &decl.members)?;
+        let decl_type_params: Vec<String> =
+            decl.type_params.iter().map(|p| p.name.clone()).collect();
 
         // Parse struct variables only.
         for decl in &decl.members {
             if let Some(var) = decl.is_variable() {
                 let generator = var.r#type.to_generator()?;
+                Self::ensure_no_type_param_field(
+                    &generator,
+                    &decl_type_params,
+                    &owner_name,
+                    &var.identifier,
+                )?;
                 generator.ensure_resolvable()?;
                 generator.ensure_sized()?;
                 Self::ensure_declarable(&generator, &owner_name, &var.identifier)?;
@@ -2195,9 +2238,97 @@ pub mod {mod} {{
             nested: nested.trim().to_string(),
             is_vintf,
             deprecated: deprecated_attr(decl.deprecated.as_ref()),
+            type_params: decl_type_params,
         })?;
 
         Ok(add_indent(indent, rendered.trim()))
+    }
+
+    /// Names the parcelable template spells bare inside the generated struct
+    /// and its impls, where a type parameter of the same name would be found
+    /// first: the prelude items it uses and the primitive types.
+    const BARE_TEMPLATE_NAMES: &'static [&'static str] = &[
+        "String", "Vec", "Option", "Box", "Default", "core", "std", "bool", "i8", "u8", "i16",
+        "u16", "i32", "u32", "i64", "u64", "f32", "f64", "usize", "isize", "str",
+    ];
+
+    /// What a type parameter's name and a generic declaration's body must
+    /// satisfy for the generated Rust to compile.
+    ///
+    /// A parameter is spelled bare in `pub struct Foo<T>` and every impl
+    /// header, so it must not be a keyword, one of
+    /// [`BARE_TEMPLATE_NAMES`](Self::BARE_TEMPLATE_NAMES), the runtime
+    /// crate's path segment (`rsbinder::` or `crate::`, known only here), or
+    /// the declaration's own name (`impl<R> … for R<R>`). A nested
+    /// declaration is reachable from a field only by a path that starts bare
+    /// (`Bar::Baz::Baz`), so AOSP refuses nesting in a generic type
+    /// (`AidlDefinedType::CheckValidWithMembers`) and so does this.
+    fn ensure_type_params(
+        owner: &str,
+        type_params: &[parser::TypeParam],
+        members: &[parser::Declaration],
+    ) -> Result<(), AidlError> {
+        if type_params.is_empty() {
+            return Ok(());
+        }
+        for param in type_params {
+            let name = param.name.as_str();
+            let shadows = if crate::escape_rust_keyword(name) != name {
+                Some("a Rust keyword")
+            } else if Self::BARE_TEMPLATE_NAMES.contains(&name) {
+                Some("a name the generated Rust spells unqualified")
+            } else if name == crate::type_generator::crate_name() {
+                Some("the runtime crate's path")
+            } else if name == owner {
+                Some("the declaration it belongs to")
+            } else {
+                None
+            };
+            if let Some(what) = shadows {
+                return Err(Self::decl_error(
+                    format!("type parameter '{name}' of '{owner}' shadows {what}"),
+                    param.name_span,
+                ));
+            }
+        }
+        if let Some(nested) = members.iter().find(|m| m.is_variable().is_none()) {
+            return Err(Self::decl_error(
+                format!(
+                    "generic types can't have nested types: '{owner}' declares '{}'",
+                    nested.name()
+                ),
+                type_params[0].name_span,
+            ));
+        }
+        Ok(())
+    }
+
+    /// A field whose type is one of the declaration's own type parameters
+    /// (`parcelable Foo<T> { T value; }`) has no wire format: the parameter
+    /// never reaches the parcel, and AOSP's Rust backend emits `Serialize`
+    /// without a bound on it, so the generated code cannot write the field.
+    fn ensure_no_type_param_field(
+        generator: &crate::type_generator::TypeGenerator,
+        type_params: &[String],
+        owner: &str,
+        field: &str,
+    ) -> Result<(), AidlError> {
+        if type_params.is_empty() {
+            return Ok(());
+        }
+        for name in generator.referenced_user_types() {
+            if type_params.iter().any(|param| param == name) {
+                return Err(Self::decl_error(
+                    format!(
+                        "field '{field}' of '{owner}' has the type parameter '{name}' as its \
+                         type: a type parameter is not written to the parcel, so a field \
+                         cannot have its type"
+                    ),
+                    generator.type_span(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn register_enum_members(decl: &parser::EnumDecl) {
@@ -2341,6 +2472,22 @@ pub mod {mod} {{
         // Not scoped: a nested union does not inherit `@FixedSize`.
         let is_fixed_size =
             parser::has_annotation(&decl.annotation_list, parser::AnnotationType::FixedSize);
+
+        // A generic union has no Rust form: no variant may hold a parameter's
+        // type (it is not written to the parcel), and an enum with an unused
+        // parameter does not compile (E0392). AOSP's Rust backend emits the
+        // parameters and no phantom variant, so its output does not compile
+        // either.
+        if let Some(param) = decl.type_params.first() {
+            return Err(Self::decl_error(
+                format!(
+                    "union '{}' is generic: a union cannot take type parameters in the Rust \
+                     backend",
+                    decl.name
+                ),
+                param.name_span,
+            ));
+        }
 
         let mut constant_members = Vec::new();
         let mut members = Vec::new();

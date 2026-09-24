@@ -15,6 +15,42 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Added
 
+- **Generic parcelables** (`rsbinder-aidl`): `parcelable Foo<T, U> { … }`
+  generates `pub struct Foo<T, U>` with a `pub _phantom_T` /
+  `_phantom_U: PhantomData` field per parameter and generic `Default`,
+  `Parcelable`, `Serialize`/`Deserialize` and `ParcelableMetadata` impls, as
+  AOSP's Rust backend does. A parameter may carry a requirement on its
+  argument — `parcelable MQDescriptor<@FixedSize T, Flavor>` — and a use site
+  (`MQDescriptor<byte, SynchronizedReadWrite>`) is checked against the
+  declaration: argument count, `@FixedSize` (AOSP `CanBeFixedSize`) and
+  `@VintfStability`. The arguments are carried on the Rust path everywhere the
+  type appears (field, argument, return, array and `List` element, nested).
+  Rejected with a diagnostic: a field whose type is a parameter (nothing would
+  be written for it), a generic `union` (no Rust form), a nested declaration
+  inside a generic parcelable (AOSP's rule), a parameter named like something
+  the generated Rust spells unqualified (a keyword, `String`, `Vec`, a
+  primitive, the `rsbinder` crate, the parcelable itself), a generic
+  `rust_type` parcelable, an array, `List` or `void` as an argument, an
+  annotation on an argument, and any annotation other than the four AOSP
+  admits on a parameter (`@FixedSize`, `@VintfStability`, and the Java-only
+  `@JavaPassthrough`/`@JavaSuppressLint`, which are ignored).
+  `impl_serialize_for_parcelable!` and `impl_deserialize_for_parcelable!`
+  accept `Foo<T, U>`.
+- **Builtin `android.hardware.common` types** (`rsbinder-aidl` + `rsbinder`):
+  an `.aidl` that imports `android.hardware.common.fmq.MQDescriptor`,
+  `GrantorDescriptor`, `SynchronizedReadWrite`, `UnsynchronizedWrite` or
+  `android.hardware.common.NativeHandle` compiles without a vendored copy; the
+  generated code names `rsbinder::fmq::*` and `rsbinder::NativeHandle`, which
+  `rsbinder` compiles once from the AOSP sources (`hardware/interfaces`,
+  `android17-release`). A copy found under an include directory still takes
+  precedence and is compiled like any other source.
+- **`rsbinder::fmq`**: the `MQDescriptor` family on every platform, plus, on
+  Linux and Android, `rsbinder-fmq` re-exported and the two conversions that
+  join them — `Descriptor: TryFrom<&MQDescriptor<T, F>>` (duplicates the fds)
+  and `MQDescriptor<T, F>: TryFrom<Descriptor>` (takes them) — and
+  `StatusCode: From<rsbinder_fmq::Error>` (`BadValue`/`Corrupted` →
+  `BadValue`, `NoEventFlag`/`Unsupported` → `InvalidOperation`, `TimedOut` →
+  `TimedOut`, `Os(errno)` → the errno's status).
 - **New crate `rsbinder-fmq`**: Android's Fast Message Queue (`libfmq`) in
   Rust — the shared-memory ring with two 64-bit counters and a futex
   EventFlag word, laid out and driven exactly as `system/libfmq` does, so one
@@ -176,6 +212,12 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Changed
 
+- **`rsbinder-aidl` parser API**: `ParcelableDecl::type_params` and
+  `UnionDecl::type_params` are `Vec<TypeParam>` (name, span, annotations)
+  instead of `Vec<String>`, so a parameter's `@FixedSize`/`@VintfStability`
+  requirement survives parsing. `Generic::type_args()` returns the arguments
+  of a `Foo<A, B>` reference as written, whichever of the three `>>` grammar
+  shapes produced them.
 - **`to_bytes` / `from_bytes` no longer require the `rpc` feature.** Storing a
   value was never a transport concern: the encoder runs in the session-less
   parcel mode, and it is the *absence* of a session that refuses a binder

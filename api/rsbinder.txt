@@ -407,6 +407,203 @@ pub fn rsbinder::entry::connect<T: rsbinder::FromIBinder + ?core::marker::Sized>
 pub async fn rsbinder::entry::connect_async<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static>(&str) -> rsbinder::Result<rsbinder::Strong<T>>
 pub fn rsbinder::entry::connect_binder(&str) -> rsbinder::Result<rsbinder::SIBinder>
 pub fn rsbinder::entry::serve(&str) -> rsbinder::Result<rsbinder::Server>
+pub mod rsbinder::fmq
+pub use rsbinder::fmq::<<rsbinder_fmq::*>>
+pub struct rsbinder::fmq::GrantorDescriptor
+pub rsbinder::fmq::GrantorDescriptor::extent: i64
+pub rsbinder::fmq::GrantorDescriptor::fdIndex: i32
+pub rsbinder::fmq::GrantorDescriptor::offset: i32
+impl core::default::Default for rsbinder::fmq::GrantorDescriptor
+pub fn rsbinder::fmq::GrantorDescriptor::default() -> Self
+impl core::fmt::Debug for rsbinder::fmq::GrantorDescriptor
+pub fn rsbinder::fmq::GrantorDescriptor::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl rsbinder::Deserialize for rsbinder::fmq::GrantorDescriptor
+pub fn rsbinder::fmq::GrantorDescriptor::deserialize(&mut rsbinder::Parcel) -> rsbinder::Result<Self>
+pub fn rsbinder::fmq::GrantorDescriptor::deserialize_from(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::DeserializeArray for rsbinder::fmq::GrantorDescriptor
+pub fn rsbinder::fmq::GrantorDescriptor::deserialize_array(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<alloc::vec::Vec<Self>>>
+impl rsbinder::DeserializeOption for rsbinder::fmq::GrantorDescriptor
+pub fn rsbinder::fmq::GrantorDescriptor::deserialize_option(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<Self>>
+pub fn rsbinder::fmq::GrantorDescriptor::deserialize_option_from(&mut core::option::Option<Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::Parcelable for rsbinder::fmq::GrantorDescriptor
+pub fn rsbinder::fmq::GrantorDescriptor::read_from_parcel(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::fmq::GrantorDescriptor::write_to_parcel(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::ParcelableMetadata for rsbinder::fmq::GrantorDescriptor
+pub fn rsbinder::fmq::GrantorDescriptor::descriptor() -> &'static str
+pub fn rsbinder::fmq::GrantorDescriptor::stability(&self) -> rsbinder::Stability
+impl rsbinder::Serialize for rsbinder::fmq::GrantorDescriptor
+pub fn rsbinder::fmq::GrantorDescriptor::serialize(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::SerializeArray for rsbinder::fmq::GrantorDescriptor
+pub fn rsbinder::fmq::GrantorDescriptor::serialize_array(&[Self], &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::SerializeOption for rsbinder::fmq::GrantorDescriptor
+pub fn rsbinder::fmq::GrantorDescriptor::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl core::marker::Freeze for rsbinder::fmq::GrantorDescriptor
+impl core::marker::Send for rsbinder::fmq::GrantorDescriptor
+impl core::marker::Sync for rsbinder::fmq::GrantorDescriptor
+impl core::marker::Unpin for rsbinder::fmq::GrantorDescriptor
+impl core::marker::UnsafeUnpin for rsbinder::fmq::GrantorDescriptor
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::fmq::GrantorDescriptor
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::fmq::GrantorDescriptor
+pub struct rsbinder::fmq::MQDescriptor<T, Flavor>
+pub rsbinder::fmq::MQDescriptor::_phantom_Flavor: core::marker::PhantomData<Flavor>
+pub rsbinder::fmq::MQDescriptor::_phantom_T: core::marker::PhantomData<T>
+pub rsbinder::fmq::MQDescriptor::flags: i32
+pub rsbinder::fmq::MQDescriptor::grantors: alloc::vec::Vec<rsbinder::fmq::GrantorDescriptor>
+pub rsbinder::fmq::MQDescriptor::handle: rsbinder::NativeHandle
+pub rsbinder::fmq::MQDescriptor::quantum: i32
+impl<T, F: rsbinder::fmq::FlavorType> core::convert::TryFrom<&rsbinder::fmq::MQDescriptor<T, F>> for rsbinder_fmq::descriptor::Descriptor
+pub type rsbinder_fmq::descriptor::Descriptor::Error = rsbinder::StatusCode
+pub fn rsbinder_fmq::descriptor::Descriptor::try_from(&rsbinder::fmq::MQDescriptor<T, F>) -> core::result::Result<Self, rsbinder::StatusCode>
+impl<T, F: rsbinder::fmq::FlavorType> core::convert::TryFrom<rsbinder_fmq::descriptor::Descriptor> for rsbinder::fmq::MQDescriptor<T, F>
+pub type rsbinder::fmq::MQDescriptor<T, F>::Error = rsbinder::StatusCode
+pub fn rsbinder::fmq::MQDescriptor<T, F>::try_from(rsbinder_fmq::descriptor::Descriptor) -> core::result::Result<Self, rsbinder::StatusCode>
+impl<T, Flavor> core::default::Default for rsbinder::fmq::MQDescriptor<T, Flavor>
+pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::default() -> Self
+impl<T, Flavor> rsbinder::Deserialize for rsbinder::fmq::MQDescriptor<T, Flavor>
+pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::deserialize(&mut rsbinder::Parcel) -> rsbinder::Result<Self>
+pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::deserialize_from(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl<T, Flavor> rsbinder::DeserializeArray for rsbinder::fmq::MQDescriptor<T, Flavor>
+pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::deserialize_array(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<alloc::vec::Vec<Self>>>
+impl<T, Flavor> rsbinder::DeserializeOption for rsbinder::fmq::MQDescriptor<T, Flavor>
+pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::deserialize_option(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<Self>>
+pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::deserialize_option_from(&mut core::option::Option<Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl<T, Flavor> rsbinder::Parcelable for rsbinder::fmq::MQDescriptor<T, Flavor>
+pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::read_from_parcel(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::write_to_parcel(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl<T, Flavor> rsbinder::ParcelableMetadata for rsbinder::fmq::MQDescriptor<T, Flavor>
+pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::descriptor() -> &'static str
+pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::stability(&self) -> rsbinder::Stability
+impl<T, Flavor> rsbinder::Serialize for rsbinder::fmq::MQDescriptor<T, Flavor>
+pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::serialize(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl<T, Flavor> rsbinder::SerializeArray for rsbinder::fmq::MQDescriptor<T, Flavor>
+pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::serialize_array(&[Self], &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl<T, Flavor> rsbinder::SerializeOption for rsbinder::fmq::MQDescriptor<T, Flavor>
+pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl<T: core::fmt::Debug, Flavor: core::fmt::Debug> core::fmt::Debug for rsbinder::fmq::MQDescriptor<T, Flavor>
+pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<T, Flavor> core::marker::Freeze for rsbinder::fmq::MQDescriptor<T, Flavor>
+impl<T, Flavor> core::marker::Send for rsbinder::fmq::MQDescriptor<T, Flavor> where T: core::marker::Send, Flavor: core::marker::Send
+impl<T, Flavor> core::marker::Sync for rsbinder::fmq::MQDescriptor<T, Flavor> where T: core::marker::Sync, Flavor: core::marker::Sync
+impl<T, Flavor> core::marker::Unpin for rsbinder::fmq::MQDescriptor<T, Flavor> where T: core::marker::Unpin, Flavor: core::marker::Unpin
+impl<T, Flavor> core::marker::UnsafeUnpin for rsbinder::fmq::MQDescriptor<T, Flavor>
+impl<T, Flavor> core::panic::unwind_safe::RefUnwindSafe for rsbinder::fmq::MQDescriptor<T, Flavor> where T: core::panic::unwind_safe::RefUnwindSafe, Flavor: core::panic::unwind_safe::RefUnwindSafe
+impl<T, Flavor> core::panic::unwind_safe::UnwindSafe for rsbinder::fmq::MQDescriptor<T, Flavor> where T: core::panic::unwind_safe::UnwindSafe, Flavor: core::panic::unwind_safe::UnwindSafe
+pub struct rsbinder::fmq::SynchronizedReadWrite(pub i8)
+impl rsbinder::fmq::SynchronizedReadWrite
+pub const rsbinder::fmq::SynchronizedReadWrite::EMPTY: Self
+pub const fn rsbinder::fmq::SynchronizedReadWrite::enum_values() -> [Self; 1]
+pub const fn rsbinder::fmq::SynchronizedReadWrite::get(&self) -> i8
+impl core::clone::Clone for rsbinder::fmq::SynchronizedReadWrite
+pub fn rsbinder::fmq::SynchronizedReadWrite::clone(&self) -> rsbinder::fmq::SynchronizedReadWrite
+impl core::cmp::Eq for rsbinder::fmq::SynchronizedReadWrite
+impl core::cmp::Ord for rsbinder::fmq::SynchronizedReadWrite
+pub fn rsbinder::fmq::SynchronizedReadWrite::cmp(&self, &rsbinder::fmq::SynchronizedReadWrite) -> core::cmp::Ordering
+impl core::cmp::PartialEq for rsbinder::fmq::SynchronizedReadWrite
+pub fn rsbinder::fmq::SynchronizedReadWrite::eq(&self, &rsbinder::fmq::SynchronizedReadWrite) -> bool
+impl core::cmp::PartialOrd for rsbinder::fmq::SynchronizedReadWrite
+pub fn rsbinder::fmq::SynchronizedReadWrite::partial_cmp(&self, &rsbinder::fmq::SynchronizedReadWrite) -> core::option::Option<core::cmp::Ordering>
+impl core::default::Default for rsbinder::fmq::SynchronizedReadWrite
+pub fn rsbinder::fmq::SynchronizedReadWrite::default() -> rsbinder::fmq::SynchronizedReadWrite
+impl core::fmt::Debug for rsbinder::fmq::SynchronizedReadWrite
+pub fn rsbinder::fmq::SynchronizedReadWrite::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for rsbinder::fmq::SynchronizedReadWrite
+pub fn rsbinder::fmq::SynchronizedReadWrite::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for rsbinder::fmq::SynchronizedReadWrite
+impl core::marker::StructuralPartialEq for rsbinder::fmq::SynchronizedReadWrite
+impl core::ops::bit::BitAnd for rsbinder::fmq::SynchronizedReadWrite
+pub type rsbinder::fmq::SynchronizedReadWrite::Output = rsbinder::fmq::SynchronizedReadWrite
+pub fn rsbinder::fmq::SynchronizedReadWrite::bitand(self, Self) -> Self
+impl core::ops::bit::BitAndAssign for rsbinder::fmq::SynchronizedReadWrite
+pub fn rsbinder::fmq::SynchronizedReadWrite::bitand_assign(&mut self, Self)
+impl core::ops::bit::BitOr for rsbinder::fmq::SynchronizedReadWrite
+pub type rsbinder::fmq::SynchronizedReadWrite::Output = rsbinder::fmq::SynchronizedReadWrite
+pub fn rsbinder::fmq::SynchronizedReadWrite::bitor(self, Self) -> Self
+impl core::ops::bit::BitOrAssign for rsbinder::fmq::SynchronizedReadWrite
+pub fn rsbinder::fmq::SynchronizedReadWrite::bitor_assign(&mut self, Self)
+impl core::ops::bit::BitXor for rsbinder::fmq::SynchronizedReadWrite
+pub type rsbinder::fmq::SynchronizedReadWrite::Output = rsbinder::fmq::SynchronizedReadWrite
+pub fn rsbinder::fmq::SynchronizedReadWrite::bitxor(self, Self) -> Self
+impl core::ops::bit::BitXorAssign for rsbinder::fmq::SynchronizedReadWrite
+pub fn rsbinder::fmq::SynchronizedReadWrite::bitxor_assign(&mut self, Self)
+impl rsbinder::Deserialize for rsbinder::fmq::SynchronizedReadWrite
+pub fn rsbinder::fmq::SynchronizedReadWrite::deserialize(&mut rsbinder::Parcel) -> rsbinder::Result<Self>
+pub fn rsbinder::fmq::SynchronizedReadWrite::deserialize_from(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::DeserializeArray for rsbinder::fmq::SynchronizedReadWrite
+pub fn rsbinder::fmq::SynchronizedReadWrite::deserialize_array(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<alloc::vec::Vec<Self>>>
+impl rsbinder::Serialize for rsbinder::fmq::SynchronizedReadWrite
+pub fn rsbinder::fmq::SynchronizedReadWrite::serialize(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::SerializeArray for rsbinder::fmq::SynchronizedReadWrite
+pub fn rsbinder::fmq::SynchronizedReadWrite::serialize_array(&[Self], &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::fmq::FlavorType for rsbinder::fmq::SynchronizedReadWrite
+pub const rsbinder::fmq::SynchronizedReadWrite::FLAVOR: rsbinder_fmq::descriptor::Flavor
+impl core::marker::Freeze for rsbinder::fmq::SynchronizedReadWrite
+impl core::marker::Send for rsbinder::fmq::SynchronizedReadWrite
+impl core::marker::Sync for rsbinder::fmq::SynchronizedReadWrite
+impl core::marker::Unpin for rsbinder::fmq::SynchronizedReadWrite
+impl core::marker::UnsafeUnpin for rsbinder::fmq::SynchronizedReadWrite
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::fmq::SynchronizedReadWrite
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::fmq::SynchronizedReadWrite
+pub struct rsbinder::fmq::UnsynchronizedWrite(pub i8)
+impl rsbinder::fmq::UnsynchronizedWrite
+pub const rsbinder::fmq::UnsynchronizedWrite::EMPTY: Self
+pub const fn rsbinder::fmq::UnsynchronizedWrite::enum_values() -> [Self; 1]
+pub const fn rsbinder::fmq::UnsynchronizedWrite::get(&self) -> i8
+impl core::clone::Clone for rsbinder::fmq::UnsynchronizedWrite
+pub fn rsbinder::fmq::UnsynchronizedWrite::clone(&self) -> rsbinder::fmq::UnsynchronizedWrite
+impl core::cmp::Eq for rsbinder::fmq::UnsynchronizedWrite
+impl core::cmp::Ord for rsbinder::fmq::UnsynchronizedWrite
+pub fn rsbinder::fmq::UnsynchronizedWrite::cmp(&self, &rsbinder::fmq::UnsynchronizedWrite) -> core::cmp::Ordering
+impl core::cmp::PartialEq for rsbinder::fmq::UnsynchronizedWrite
+pub fn rsbinder::fmq::UnsynchronizedWrite::eq(&self, &rsbinder::fmq::UnsynchronizedWrite) -> bool
+impl core::cmp::PartialOrd for rsbinder::fmq::UnsynchronizedWrite
+pub fn rsbinder::fmq::UnsynchronizedWrite::partial_cmp(&self, &rsbinder::fmq::UnsynchronizedWrite) -> core::option::Option<core::cmp::Ordering>
+impl core::default::Default for rsbinder::fmq::UnsynchronizedWrite
+pub fn rsbinder::fmq::UnsynchronizedWrite::default() -> rsbinder::fmq::UnsynchronizedWrite
+impl core::fmt::Debug for rsbinder::fmq::UnsynchronizedWrite
+pub fn rsbinder::fmq::UnsynchronizedWrite::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for rsbinder::fmq::UnsynchronizedWrite
+pub fn rsbinder::fmq::UnsynchronizedWrite::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for rsbinder::fmq::UnsynchronizedWrite
+impl core::marker::StructuralPartialEq for rsbinder::fmq::UnsynchronizedWrite
+impl core::ops::bit::BitAnd for rsbinder::fmq::UnsynchronizedWrite
+pub type rsbinder::fmq::UnsynchronizedWrite::Output = rsbinder::fmq::UnsynchronizedWrite
+pub fn rsbinder::fmq::UnsynchronizedWrite::bitand(self, Self) -> Self
+impl core::ops::bit::BitAndAssign for rsbinder::fmq::UnsynchronizedWrite
+pub fn rsbinder::fmq::UnsynchronizedWrite::bitand_assign(&mut self, Self)
+impl core::ops::bit::BitOr for rsbinder::fmq::UnsynchronizedWrite
+pub type rsbinder::fmq::UnsynchronizedWrite::Output = rsbinder::fmq::UnsynchronizedWrite
+pub fn rsbinder::fmq::UnsynchronizedWrite::bitor(self, Self) -> Self
+impl core::ops::bit::BitOrAssign for rsbinder::fmq::UnsynchronizedWrite
+pub fn rsbinder::fmq::UnsynchronizedWrite::bitor_assign(&mut self, Self)
+impl core::ops::bit::BitXor for rsbinder::fmq::UnsynchronizedWrite
+pub type rsbinder::fmq::UnsynchronizedWrite::Output = rsbinder::fmq::UnsynchronizedWrite
+pub fn rsbinder::fmq::UnsynchronizedWrite::bitxor(self, Self) -> Self
+impl core::ops::bit::BitXorAssign for rsbinder::fmq::UnsynchronizedWrite
+pub fn rsbinder::fmq::UnsynchronizedWrite::bitxor_assign(&mut self, Self)
+impl rsbinder::Deserialize for rsbinder::fmq::UnsynchronizedWrite
+pub fn rsbinder::fmq::UnsynchronizedWrite::deserialize(&mut rsbinder::Parcel) -> rsbinder::Result<Self>
+pub fn rsbinder::fmq::UnsynchronizedWrite::deserialize_from(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::DeserializeArray for rsbinder::fmq::UnsynchronizedWrite
+pub fn rsbinder::fmq::UnsynchronizedWrite::deserialize_array(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<alloc::vec::Vec<Self>>>
+impl rsbinder::Serialize for rsbinder::fmq::UnsynchronizedWrite
+pub fn rsbinder::fmq::UnsynchronizedWrite::serialize(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::SerializeArray for rsbinder::fmq::UnsynchronizedWrite
+pub fn rsbinder::fmq::UnsynchronizedWrite::serialize_array(&[Self], &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::fmq::FlavorType for rsbinder::fmq::UnsynchronizedWrite
+pub const rsbinder::fmq::UnsynchronizedWrite::FLAVOR: rsbinder_fmq::descriptor::Flavor
+impl core::marker::Freeze for rsbinder::fmq::UnsynchronizedWrite
+impl core::marker::Send for rsbinder::fmq::UnsynchronizedWrite
+impl core::marker::Sync for rsbinder::fmq::UnsynchronizedWrite
+impl core::marker::Unpin for rsbinder::fmq::UnsynchronizedWrite
+impl core::marker::UnsafeUnpin for rsbinder::fmq::UnsynchronizedWrite
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::fmq::UnsynchronizedWrite
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::fmq::UnsynchronizedWrite
+pub trait rsbinder::fmq::FlavorType: rsbinder::fmq::convert::private::Sealed
+pub const rsbinder::fmq::FlavorType::FLAVOR: rsbinder_fmq::descriptor::Flavor
+impl rsbinder::fmq::FlavorType for rsbinder::fmq::SynchronizedReadWrite
+pub const rsbinder::fmq::SynchronizedReadWrite::FLAVOR: rsbinder_fmq::descriptor::Flavor
+impl rsbinder::fmq::FlavorType for rsbinder::fmq::UnsynchronizedWrite
+pub const rsbinder::fmq::UnsynchronizedWrite::FLAVOR: rsbinder_fmq::descriptor::Flavor
 pub mod rsbinder::hub
 pub mod rsbinder::hub::android_16
 pub mod rsbinder::hub::android_16::android
@@ -2895,6 +3092,8 @@ impl core::convert::From<rsbinder::StatusCode> for rsbinder::ExceptionCode
 pub fn rsbinder::ExceptionCode::from(rsbinder::StatusCode) -> Self
 impl core::convert::From<rsbinder::StatusCode> for rsbinder::Status
 pub fn rsbinder::Status::from(rsbinder::StatusCode) -> Self
+impl core::convert::From<rsbinder_fmq::error::Error> for rsbinder::StatusCode
+pub fn rsbinder::StatusCode::from(rsbinder_fmq::error::Error) -> Self
 impl core::convert::From<rustix::backend::io::errno::Errno> for rsbinder::StatusCode
 pub fn rsbinder::StatusCode::from(rustix::backend::io::errno::Errno) -> Self
 impl core::convert::From<std::io::error::Error> for rsbinder::StatusCode
@@ -3151,6 +3350,40 @@ impl core::marker::Unpin for rsbinder::thread_state::ExtendedError
 impl core::marker::UnsafeUnpin for rsbinder::thread_state::ExtendedError
 impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::thread_state::ExtendedError
 impl core::panic::unwind_safe::UnwindSafe for rsbinder::thread_state::ExtendedError
+pub struct rsbinder::NativeHandle
+pub rsbinder::NativeHandle::fds: alloc::vec::Vec<rsbinder::ParcelFileDescriptor>
+pub rsbinder::NativeHandle::ints: alloc::vec::Vec<i32>
+impl core::default::Default for rsbinder::NativeHandle
+pub fn rsbinder::NativeHandle::default() -> Self
+impl core::fmt::Debug for rsbinder::NativeHandle
+pub fn rsbinder::NativeHandle::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl rsbinder::Deserialize for rsbinder::NativeHandle
+pub fn rsbinder::NativeHandle::deserialize(&mut rsbinder::Parcel) -> rsbinder::Result<Self>
+pub fn rsbinder::NativeHandle::deserialize_from(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::DeserializeArray for rsbinder::NativeHandle
+pub fn rsbinder::NativeHandle::deserialize_array(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<alloc::vec::Vec<Self>>>
+impl rsbinder::DeserializeOption for rsbinder::NativeHandle
+pub fn rsbinder::NativeHandle::deserialize_option(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<Self>>
+pub fn rsbinder::NativeHandle::deserialize_option_from(&mut core::option::Option<Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::Parcelable for rsbinder::NativeHandle
+pub fn rsbinder::NativeHandle::read_from_parcel(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::NativeHandle::write_to_parcel(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::ParcelableMetadata for rsbinder::NativeHandle
+pub fn rsbinder::NativeHandle::descriptor() -> &'static str
+pub fn rsbinder::NativeHandle::stability(&self) -> rsbinder::Stability
+impl rsbinder::Serialize for rsbinder::NativeHandle
+pub fn rsbinder::NativeHandle::serialize(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::SerializeArray for rsbinder::NativeHandle
+pub fn rsbinder::NativeHandle::serialize_array(&[Self], &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::SerializeOption for rsbinder::NativeHandle
+pub fn rsbinder::NativeHandle::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl core::marker::Freeze for rsbinder::NativeHandle
+impl core::marker::Send for rsbinder::NativeHandle
+impl core::marker::Sync for rsbinder::NativeHandle
+impl core::marker::Unpin for rsbinder::NativeHandle
+impl core::marker::UnsafeUnpin for rsbinder::NativeHandle
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::NativeHandle
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::NativeHandle
 pub struct rsbinder::Parcel
 impl rsbinder::Parcel
 pub fn rsbinder::Parcel::allow_fds(&self) -> bool
@@ -3765,6 +3998,9 @@ pub fn i8::deserialize_from(&mut self, &mut rsbinder::Parcel) -> rsbinder::Resul
 impl rsbinder::Deserialize for rsbinder::ExceptionCode
 pub fn rsbinder::ExceptionCode::deserialize(&mut rsbinder::Parcel) -> rsbinder::Result<Self>
 pub fn rsbinder::ExceptionCode::deserialize_from(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::Deserialize for rsbinder::NativeHandle
+pub fn rsbinder::NativeHandle::deserialize(&mut rsbinder::Parcel) -> rsbinder::Result<Self>
+pub fn rsbinder::NativeHandle::deserialize_from(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::Deserialize for rsbinder::ParcelFileDescriptor
 pub fn rsbinder::ParcelFileDescriptor::deserialize(&mut rsbinder::Parcel) -> rsbinder::Result<Self>
 pub fn rsbinder::ParcelFileDescriptor::deserialize_from(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
@@ -3780,6 +4016,15 @@ pub fn rsbinder::Status::deserialize_from(&mut self, &mut rsbinder::Parcel) -> r
 impl rsbinder::Deserialize for rsbinder::StatusCode
 pub fn rsbinder::StatusCode::deserialize(&mut rsbinder::Parcel) -> rsbinder::Result<Self>
 pub fn rsbinder::StatusCode::deserialize_from(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::Deserialize for rsbinder::fmq::GrantorDescriptor
+pub fn rsbinder::fmq::GrantorDescriptor::deserialize(&mut rsbinder::Parcel) -> rsbinder::Result<Self>
+pub fn rsbinder::fmq::GrantorDescriptor::deserialize_from(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::Deserialize for rsbinder::fmq::SynchronizedReadWrite
+pub fn rsbinder::fmq::SynchronizedReadWrite::deserialize(&mut rsbinder::Parcel) -> rsbinder::Result<Self>
+pub fn rsbinder::fmq::SynchronizedReadWrite::deserialize_from(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::Deserialize for rsbinder::fmq::UnsynchronizedWrite
+pub fn rsbinder::fmq::UnsynchronizedWrite::deserialize(&mut rsbinder::Parcel) -> rsbinder::Result<Self>
+pub fn rsbinder::fmq::UnsynchronizedWrite::deserialize_from(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::Deserialize for rsbinder::hub::android_16::android::os::ConnectionInfo::ConnectionInfo
 pub fn rsbinder::hub::android_16::android::os::ConnectionInfo::ConnectionInfo::deserialize(&mut rsbinder::Parcel) -> rsbinder::Result<Self>
 pub fn rsbinder::hub::android_16::android::os::ConnectionInfo::ConnectionInfo::deserialize_from(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
@@ -3813,6 +4058,9 @@ pub fn u64::deserialize_from(&mut self, &mut rsbinder::Parcel) -> rsbinder::Resu
 impl rsbinder::Deserialize for u8
 pub fn u8::deserialize(&mut rsbinder::Parcel) -> rsbinder::Result<Self>
 pub fn u8::deserialize_from(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl<T, Flavor> rsbinder::Deserialize for rsbinder::fmq::MQDescriptor<T, Flavor>
+pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::deserialize(&mut rsbinder::Parcel) -> rsbinder::Result<Self>
+pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::deserialize_from(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl<T: rsbinder::Deserialize> rsbinder::Deserialize for alloc::boxed::Box<T>
 pub fn alloc::boxed::Box<T>::deserialize(&mut rsbinder::Parcel) -> rsbinder::Result<Self>
 pub fn alloc::boxed::Box<T>::deserialize_from(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
@@ -3846,10 +4094,18 @@ impl rsbinder::DeserializeArray for i64
 pub fn i64::deserialize_array(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<alloc::vec::Vec<Self>>>
 impl rsbinder::DeserializeArray for i8
 pub fn i8::deserialize_array(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<alloc::vec::Vec<Self>>>
+impl rsbinder::DeserializeArray for rsbinder::NativeHandle
+pub fn rsbinder::NativeHandle::deserialize_array(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<alloc::vec::Vec<Self>>>
 impl rsbinder::DeserializeArray for rsbinder::ParcelFileDescriptor
 pub fn rsbinder::ParcelFileDescriptor::deserialize_array(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<alloc::vec::Vec<Self>>>
 impl rsbinder::DeserializeArray for rsbinder::SIBinder
 pub fn rsbinder::SIBinder::deserialize_array(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<alloc::vec::Vec<Self>>>
+impl rsbinder::DeserializeArray for rsbinder::fmq::GrantorDescriptor
+pub fn rsbinder::fmq::GrantorDescriptor::deserialize_array(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<alloc::vec::Vec<Self>>>
+impl rsbinder::DeserializeArray for rsbinder::fmq::SynchronizedReadWrite
+pub fn rsbinder::fmq::SynchronizedReadWrite::deserialize_array(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<alloc::vec::Vec<Self>>>
+impl rsbinder::DeserializeArray for rsbinder::fmq::UnsynchronizedWrite
+pub fn rsbinder::fmq::UnsynchronizedWrite::deserialize_array(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<alloc::vec::Vec<Self>>>
 impl rsbinder::DeserializeArray for rsbinder::hub::android_16::android::os::ConnectionInfo::ConnectionInfo
 pub fn rsbinder::hub::android_16::android::os::ConnectionInfo::ConnectionInfo::deserialize_array(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<alloc::vec::Vec<Self>>>
 impl rsbinder::DeserializeArray for rsbinder::hub::android_16::android::os::Service::Service
@@ -3870,6 +4126,8 @@ impl rsbinder::DeserializeArray for u64
 pub fn u64::deserialize_array(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<alloc::vec::Vec<Self>>>
 impl rsbinder::DeserializeArray for u8
 pub fn u8::deserialize_array(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<alloc::vec::Vec<Self>>>
+impl<T, Flavor> rsbinder::DeserializeArray for rsbinder::fmq::MQDescriptor<T, Flavor>
+pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::deserialize_array(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<alloc::vec::Vec<Self>>>
 impl<T: rsbinder::DeserializeArray, const N: usize> rsbinder::DeserializeArray for [T; N]
 pub fn [T; N]::deserialize_array(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<alloc::vec::Vec<Self>>>
 impl<T: rsbinder::DeserializeOption> rsbinder::DeserializeArray for core::option::Option<T>
@@ -3900,12 +4158,18 @@ pub fn i64::deserialize_option_from(&mut core::option::Option<Self>, &mut rsbind
 impl rsbinder::DeserializeOption for i8
 pub fn i8::deserialize_option(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<Self>>
 pub fn i8::deserialize_option_from(&mut core::option::Option<Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::DeserializeOption for rsbinder::NativeHandle
+pub fn rsbinder::NativeHandle::deserialize_option(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<Self>>
+pub fn rsbinder::NativeHandle::deserialize_option_from(&mut core::option::Option<Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::DeserializeOption for rsbinder::ParcelFileDescriptor
 pub fn rsbinder::ParcelFileDescriptor::deserialize_option(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<Self>>
 pub fn rsbinder::ParcelFileDescriptor::deserialize_option_from(&mut core::option::Option<Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::DeserializeOption for rsbinder::SIBinder
 pub fn rsbinder::SIBinder::deserialize_option(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<Self>>
 pub fn rsbinder::SIBinder::deserialize_option_from(&mut core::option::Option<Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::DeserializeOption for rsbinder::fmq::GrantorDescriptor
+pub fn rsbinder::fmq::GrantorDescriptor::deserialize_option(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<Self>>
+pub fn rsbinder::fmq::GrantorDescriptor::deserialize_option_from(&mut core::option::Option<Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::DeserializeOption for rsbinder::hub::android_16::android::os::ConnectionInfo::ConnectionInfo
 pub fn rsbinder::hub::android_16::android::os::ConnectionInfo::ConnectionInfo::deserialize_option(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<Self>>
 pub fn rsbinder::hub::android_16::android::os::ConnectionInfo::ConnectionInfo::deserialize_option_from(&mut core::option::Option<Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
@@ -3936,6 +4200,9 @@ pub fn u64::deserialize_option_from(&mut core::option::Option<Self>, &mut rsbind
 impl rsbinder::DeserializeOption for u8
 pub fn u8::deserialize_option(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<Self>>
 pub fn u8::deserialize_option_from(&mut core::option::Option<Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl<T, Flavor> rsbinder::DeserializeOption for rsbinder::fmq::MQDescriptor<T, Flavor>
+pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::deserialize_option(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<Self>>
+pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::deserialize_option_from(&mut core::option::Option<Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl<T: core::fmt::Debug + rsbinder::DeserializeArray, const N: usize> rsbinder::DeserializeOption for [T; N]
 pub fn [T; N]::deserialize_option(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<Self>>
 pub fn [T; N]::deserialize_option_from(&mut core::option::Option<Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
@@ -4041,9 +4308,15 @@ pub fn rsbinder::Binder<T>::dump(&self, &mut dyn std::io::Write, &[alloc::string
 pub trait rsbinder::Parcelable
 pub fn rsbinder::Parcelable::read_from_parcel(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 pub fn rsbinder::Parcelable::write_to_parcel(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::Parcelable for rsbinder::NativeHandle
+pub fn rsbinder::NativeHandle::read_from_parcel(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::NativeHandle::write_to_parcel(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::Parcelable for rsbinder::ParcelableHolder
 pub fn rsbinder::ParcelableHolder::read_from_parcel(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 pub fn rsbinder::ParcelableHolder::write_to_parcel(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::Parcelable for rsbinder::fmq::GrantorDescriptor
+pub fn rsbinder::fmq::GrantorDescriptor::read_from_parcel(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::fmq::GrantorDescriptor::write_to_parcel(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::Parcelable for rsbinder::hub::android_16::android::os::ConnectionInfo::ConnectionInfo
 pub fn rsbinder::hub::android_16::android::os::ConnectionInfo::ConnectionInfo::read_from_parcel(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 pub fn rsbinder::hub::android_16::android::os::ConnectionInfo::ConnectionInfo::write_to_parcel(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
@@ -4056,9 +4329,18 @@ pub fn rsbinder::hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInf
 impl rsbinder::Parcelable for rsbinder::hub::android_16::android::os::ServiceWithMetadata::ServiceWithMetadata
 pub fn rsbinder::hub::android_16::android::os::ServiceWithMetadata::ServiceWithMetadata::read_from_parcel(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 pub fn rsbinder::hub::android_16::android::os::ServiceWithMetadata::ServiceWithMetadata::write_to_parcel(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl<T, Flavor> rsbinder::Parcelable for rsbinder::fmq::MQDescriptor<T, Flavor>
+pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::read_from_parcel(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::write_to_parcel(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 pub trait rsbinder::ParcelableMetadata
 pub fn rsbinder::ParcelableMetadata::descriptor() -> &'static str
 pub fn rsbinder::ParcelableMetadata::stability(&self) -> rsbinder::Stability
+impl rsbinder::ParcelableMetadata for rsbinder::NativeHandle
+pub fn rsbinder::NativeHandle::descriptor() -> &'static str
+pub fn rsbinder::NativeHandle::stability(&self) -> rsbinder::Stability
+impl rsbinder::ParcelableMetadata for rsbinder::fmq::GrantorDescriptor
+pub fn rsbinder::fmq::GrantorDescriptor::descriptor() -> &'static str
+pub fn rsbinder::fmq::GrantorDescriptor::stability(&self) -> rsbinder::Stability
 impl rsbinder::ParcelableMetadata for rsbinder::hub::android_16::android::os::ConnectionInfo::ConnectionInfo
 pub fn rsbinder::hub::android_16::android::os::ConnectionInfo::ConnectionInfo::descriptor() -> &'static str
 pub fn rsbinder::hub::android_16::android::os::ConnectionInfo::ConnectionInfo::stability(&self) -> rsbinder::Stability
@@ -4071,6 +4353,9 @@ pub fn rsbinder::hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInf
 impl rsbinder::ParcelableMetadata for rsbinder::hub::android_16::android::os::ServiceWithMetadata::ServiceWithMetadata
 pub fn rsbinder::hub::android_16::android::os::ServiceWithMetadata::ServiceWithMetadata::descriptor() -> &'static str
 pub fn rsbinder::hub::android_16::android::os::ServiceWithMetadata::ServiceWithMetadata::stability(&self) -> rsbinder::Stability
+impl<T, Flavor> rsbinder::ParcelableMetadata for rsbinder::fmq::MQDescriptor<T, Flavor>
+pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::descriptor() -> &'static str
+pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::stability(&self) -> rsbinder::Stability
 pub trait rsbinder::Proxy: core::marker::Sized + rsbinder::Interface
 pub fn rsbinder::Proxy::descriptor() -> &'static str
 pub fn rsbinder::Proxy::from_binder(rsbinder::SIBinder) -> core::option::Option<Self>
@@ -4165,6 +4450,8 @@ impl rsbinder::Serialize for i8
 pub fn i8::serialize(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::Serialize for rsbinder::ExceptionCode
 pub fn rsbinder::ExceptionCode::serialize(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::Serialize for rsbinder::NativeHandle
+pub fn rsbinder::NativeHandle::serialize(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::Serialize for rsbinder::ParcelFileDescriptor
 pub fn rsbinder::ParcelFileDescriptor::serialize(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::Serialize for rsbinder::ParcelableHolder
@@ -4175,6 +4462,12 @@ impl rsbinder::Serialize for rsbinder::Status
 pub fn rsbinder::Status::serialize(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::Serialize for rsbinder::StatusCode
 pub fn rsbinder::StatusCode::serialize(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::Serialize for rsbinder::fmq::GrantorDescriptor
+pub fn rsbinder::fmq::GrantorDescriptor::serialize(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::Serialize for rsbinder::fmq::SynchronizedReadWrite
+pub fn rsbinder::fmq::SynchronizedReadWrite::serialize(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::Serialize for rsbinder::fmq::UnsynchronizedWrite
+pub fn rsbinder::fmq::UnsynchronizedWrite::serialize(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::Serialize for rsbinder::hub::android_16::android::os::ConnectionInfo::ConnectionInfo
 pub fn rsbinder::hub::android_16::android::os::ConnectionInfo::ConnectionInfo::serialize(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::Serialize for rsbinder::hub::android_16::android::os::Service::Service
@@ -4209,6 +4502,8 @@ impl<P: rsbinder::BinderAsyncPool> rsbinder::Serialize for (dyn rsbinder::hub::a
 pub fn (dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsync<P> + '_)::serialize(&self, &mut rsbinder::Parcel) -> core::result::Result<(), rsbinder::StatusCode>
 impl<P: rsbinder::BinderAsyncPool> rsbinder::Serialize for (dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync<P> + '_)
 pub fn (dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync<P> + '_)::serialize(&self, &mut rsbinder::Parcel) -> core::result::Result<(), rsbinder::StatusCode>
+impl<T, Flavor> rsbinder::Serialize for rsbinder::fmq::MQDescriptor<T, Flavor>
+pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::serialize(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl<T: rsbinder::FromIBinder + rsbinder::Serialize + ?core::marker::Sized> rsbinder::Serialize for rsbinder::Strong<T>
 pub fn rsbinder::Strong<T>::serialize(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl<T: rsbinder::Serialize + ?core::marker::Sized> rsbinder::Serialize for &T
@@ -4243,10 +4538,18 @@ impl rsbinder::SerializeArray for i64
 pub fn i64::serialize_array(&[Self], &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::SerializeArray for i8
 pub fn i8::serialize_array(&[Self], &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::SerializeArray for rsbinder::NativeHandle
+pub fn rsbinder::NativeHandle::serialize_array(&[Self], &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::SerializeArray for rsbinder::ParcelFileDescriptor
 pub fn rsbinder::ParcelFileDescriptor::serialize_array(&[Self], &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::SerializeArray for rsbinder::SIBinder
 pub fn rsbinder::SIBinder::serialize_array(&[Self], &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::SerializeArray for rsbinder::fmq::GrantorDescriptor
+pub fn rsbinder::fmq::GrantorDescriptor::serialize_array(&[Self], &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::SerializeArray for rsbinder::fmq::SynchronizedReadWrite
+pub fn rsbinder::fmq::SynchronizedReadWrite::serialize_array(&[Self], &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::SerializeArray for rsbinder::fmq::UnsynchronizedWrite
+pub fn rsbinder::fmq::UnsynchronizedWrite::serialize_array(&[Self], &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::SerializeArray for rsbinder::hub::android_16::android::os::ConnectionInfo::ConnectionInfo
 pub fn rsbinder::hub::android_16::android::os::ConnectionInfo::ConnectionInfo::serialize_array(&[Self], &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::SerializeArray for rsbinder::hub::android_16::android::os::Service::Service
@@ -4267,6 +4570,8 @@ impl rsbinder::SerializeArray for u64
 pub fn u64::serialize_array(&[Self], &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::SerializeArray for u8
 pub fn u8::serialize_array(&[Self], &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl<T, Flavor> rsbinder::SerializeArray for rsbinder::fmq::MQDescriptor<T, Flavor>
+pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::serialize_array(&[Self], &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl<T: rsbinder::FromIBinder + rsbinder::Serialize + ?core::marker::Sized> rsbinder::SerializeArray for rsbinder::Strong<T>
 pub fn rsbinder::Strong<T>::serialize_array(&[Self], &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl<T: rsbinder::SerializeArray, const N: usize> rsbinder::SerializeArray for [T; N]
@@ -4299,10 +4604,14 @@ impl rsbinder::SerializeOption for i64
 pub fn i64::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::SerializeOption for i8
 pub fn i8::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::SerializeOption for rsbinder::NativeHandle
+pub fn rsbinder::NativeHandle::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::SerializeOption for rsbinder::ParcelFileDescriptor
 pub fn rsbinder::ParcelFileDescriptor::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::SerializeOption for rsbinder::SIBinder
 pub fn rsbinder::SIBinder::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl rsbinder::SerializeOption for rsbinder::fmq::GrantorDescriptor
+pub fn rsbinder::fmq::GrantorDescriptor::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::SerializeOption for rsbinder::hub::android_16::android::os::ConnectionInfo::ConnectionInfo
 pub fn rsbinder::hub::android_16::android::os::ConnectionInfo::ConnectionInfo::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::SerializeOption for rsbinder::hub::android_16::android::os::Service::Service
@@ -4335,6 +4644,8 @@ impl<P: rsbinder::BinderAsyncPool> rsbinder::SerializeOption for (dyn rsbinder::
 pub fn (dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsync<P> + '_)::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> core::result::Result<(), rsbinder::StatusCode>
 impl<P: rsbinder::BinderAsyncPool> rsbinder::SerializeOption for (dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync<P> + '_)
 pub fn (dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync<P> + '_)::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> core::result::Result<(), rsbinder::StatusCode>
+impl<T, Flavor> rsbinder::SerializeOption for rsbinder::fmq::MQDescriptor<T, Flavor>
+pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl<T: rsbinder::FromIBinder + rsbinder::SerializeOption + ?core::marker::Sized> rsbinder::SerializeOption for rsbinder::Strong<T>
 pub fn rsbinder::Strong<T>::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl<T: rsbinder::SerializeArray, const N: usize> rsbinder::SerializeOption for [T; N]

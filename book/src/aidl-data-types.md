@@ -23,6 +23,7 @@ The following table shows how AIDL primitive types map to Rust types. Input para
 | IBinder | &SIBinder | &mut Option\<SIBinder\> | |
 | ParcelFileDescriptor | &ParcelFileDescriptor | &mut Option\<ParcelFileDescriptor\> | |
 | An interface | &Strong\<dyn I\> | &mut Option\<Strong\<dyn I\>\> | |
+| A generic parcelable `Foo<A, B>` | &Foo\<A, B\> | &mut Foo\<A, B\> | The arguments follow the type everywhere it appears; see [Generic Parcelables](./aidl-parcelable.md#generic-parcelables) |
 
 Here is an AIDL interface that exercises the primitive types:
 
@@ -178,6 +179,38 @@ void Transform(inout int[] data);
 Use `inout` when the service needs to read the existing value and modify it in place. Prefer `in` or `out` when data only needs to flow in one direction, as this avoids unnecessary serialization overhead.
 
 > **Note**: Primitive types (`boolean`, `byte`, `char`, `int`, `long`, `float`, `double`) and `String` cannot carry an `out`/`inout` direction tag — the generator rejects it. As scalar (or, for `String`, value-typed) parameters they only ever flow `in`. Direction tags are meaningful only for arrays and parcelable types.
+
+## Builtin AOSP Types
+
+Two AOSP packages compile without a vendored `.aidl`: an `import` of one of
+these names resolves to a type the `rsbinder` crate provides, and the
+generated code refers to it by that path.
+
+| AIDL import | Rust type |
+|-------------|-----------|
+| `android.os.ParcelFileDescriptor` | `rsbinder::ParcelFileDescriptor` |
+| `android.hardware.common.NativeHandle` | `rsbinder::NativeHandle` |
+| `android.hardware.common.fmq.MQDescriptor` | `rsbinder::fmq::MQDescriptor<T, F>` |
+| `android.hardware.common.fmq.GrantorDescriptor` | `rsbinder::fmq::GrantorDescriptor` |
+| `android.hardware.common.fmq.SynchronizedReadWrite` | `rsbinder::fmq::SynchronizedReadWrite` |
+| `android.hardware.common.fmq.UnsynchronizedWrite` | `rsbinder::fmq::UnsynchronizedWrite` |
+
+```aidl
+import android.hardware.common.fmq.MQDescriptor;
+import android.hardware.common.fmq.SynchronizedReadWrite;
+
+interface IProducer {
+    // Generated: fn openQueue(&self) -> BinderResult<rsbinder::fmq::MQDescriptor<i8, rsbinder::fmq::SynchronizedReadWrite>>
+    MQDescriptor<byte, SynchronizedReadWrite> openQueue();
+}
+```
+
+The `hardware/interfaces` sources are VINTF-stable and unchanged since
+Android 11, so the wire format matches a C++ or Java HAL. A copy of one of
+these files under an include directory takes precedence and is compiled like
+any other source. On Linux and Android `rsbinder::fmq` also re-exports the
+`rsbinder-fmq` crate — the queue itself — with a conversion between
+`MQDescriptor` and its `Descriptor`; see the module documentation.
 
 ## Tips
 

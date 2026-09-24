@@ -35,6 +35,30 @@ thread_local! {
     // Non-fatal diagnostics accumulated during the current `parse_document`
     // call. Drained into `Document::warnings` before parse_document returns.
     static CURRENT_WARNINGS: RefCell<Vec<crate::error::AidlWarning>> = const { RefCell::new(Vec::new()) };
+
+    // Declarations the runtime crate provides (`crate::BUILTIN_DECLS`), keyed
+    // by their AIDL namespace: the Rust path relative to the runtime crate
+    // root that a reference must name instead of a generated module.
+    static BUILTIN_RUST_PATHS: RefCell<HashMap<Namespace, String>> = RefCell::new(HashMap::new());
+}
+
+/// Record that the declaration at `ns` is not generated here but provided by
+/// the runtime crate at `rust_path` (relative to its root).
+pub(crate) fn register_builtin_path(ns: &Namespace, rust_path: &str) {
+    BUILTIN_RUST_PATHS.with(|map| {
+        map.borrow_mut().insert(ns.clone(), rust_path.to_owned());
+    });
+}
+
+/// The runtime-crate path of a builtin declaration, or `None` for one that
+/// is generated from the sources being compiled.
+pub(crate) fn builtin_rust_path(ns: &Namespace) -> Option<String> {
+    BUILTIN_RUST_PATHS.with(|map| map.borrow().get(ns).cloned())
+}
+
+/// Whether a parsed document has declared `ns`.
+pub(crate) fn is_declared(ns: &Namespace) -> bool {
+    DECLARATION_MAP.with(|map| map.borrow().contains_key(ns))
 }
 
 /// AOSP-recognised AIDL annotations (`aidl_language.cpp::AidlAnnotation::AllSchemas()`,
@@ -483,7 +507,11 @@ fn by_value_type_name(ty: &Type) -> Option<&str> {
     if ty.array_types.iter().any(|a| a.const_expr.is_none()) {
         return None;
     }
-    if ty.non_array_type.generic.is_some() {
+    // `List`/`Map` alone hold their argument behind an allocation; a
+    // user-defined generic parcelable is inline like any parcelable.
+    if ty.non_array_type.generic.is_some()
+        && matches!(ty.non_array_type.name.as_str(), "List" | "Map")
+    {
         return None;
     }
     Some(&ty.non_array_type.name)
@@ -640,17 +668,21 @@ fn make_const_expr(const_expr: Option<&ConstExpr>, lookup_decl: &LookupDecl) -> 
         let ident = lookup_decl.name.ns.last().map_or("", String::as_str);
         fold_in_owner_scope(expr, &lookup_decl.ns, ident)
     } else {
-        let ns = current_namespace().relative_mod(&lookup_decl.ns);
-
-        let name = if !ns.is_empty() {
-            format!(
-                "{}{}{}",
-                ns,
-                Namespace::RUST,
-                lookup_decl.name.to_string(Namespace::RUST)
-            )
+        let name = if let Some(path) = builtin_rust_path(&lookup_decl.ns) {
+            let member = lookup_decl.name.ns.last().map_or("", String::as_str);
+            format!("{}::{path}::{member}", type_generator::crate_name())
         } else {
-            lookup_decl.name.to_string(Namespace::RUST)
+            let ns = current_namespace().relative_mod(&lookup_decl.ns);
+            if !ns.is_empty() {
+                format!(
+                    "{}{}{}",
+                    ns,
+                    Namespace::RUST,
+                    lookup_decl.name.to_string(Namespace::RUST)
+                )
+            } else {
+                lookup_decl.name.to_string(Namespace::RUST)
+            }
         };
         ConstExpr::new(ValueType::Name(name))
     }
@@ -1104,7 +1136,7 @@ pub struct ParcelableDecl {
     pub namespace: Namespace,
     pub name: String,
     pub name_span: Option<(usize, usize)>,
-    pub type_params: Vec<String>,
+    pub type_params: Vec<TypeParam>,
     pub cpp_header: String,
     pub ndk_header: String,
     pub rust_type: String,
@@ -1283,23 +1315,44 @@ pub enum Generic {
 }
 
 impl Generic {
-    pub fn to_value_type(&self) -> Result<ValueType, crate::error::AidlError> {
-        let generator = match self {
+    /// The type arguments as written, in order. The three grammar shapes
+    /// exist only to split a closing `>>`; `Foo<A, Bar<X>>` (shape 1) and
+    /// `Foo<Bar<X>>` (shape 2) each yield the inner `Bar<X>` as one argument.
+    pub fn type_args(&self) -> Vec<Type> {
+        let nested = |non_array_type: &NonArrayType, inner: &[Type]| Type {
+            annotation_list: Vec::new(),
+            non_array_type: NonArrayType {
+                name: non_array_type.name.clone(),
+                generic: Some(Box::new(Generic::Type3 {
+                    type_args: inner.to_vec(),
+                })),
+                name_span: non_array_type.name_span,
+            },
+            array_types: Vec::new(),
+        };
+        match self {
             Generic::Type1 {
                 type_args1,
-                non_array_type: _,
-                type_args2: _,
-            } => type_generator::TypeGenerator::new_with_type(&type_args1[0])?,
+                non_array_type,
+                type_args2,
+            } => {
+                let mut args = type_args1.clone();
+                args.push(nested(non_array_type, type_args2));
+                args
+            }
             Generic::Type2 {
                 non_array_type,
-                type_args: _,
-            } => type_generator::TypeGenerator::new(non_array_type)?,
-            Generic::Type3 { type_args } => {
-                type_generator::TypeGenerator::new_with_type(&type_args[0])?
-            }
-        };
+                type_args,
+            } => vec![nested(non_array_type, type_args)],
+            Generic::Type3 { type_args } => type_args.clone(),
+        }
+    }
 
-        Ok(generator.value_type)
+    /// The first type argument's value type. The grammar admits any number
+    /// of arguments; the caller checks the count.
+    pub fn to_value_type(&self) -> Result<ValueType, crate::error::AidlError> {
+        let args = self.type_args();
+        Ok(type_generator::TypeGenerator::new_with_type(&args[0])?.value_type)
     }
 }
 
@@ -2051,7 +2104,18 @@ fn parse_type_args(pairs: pest::iterators::Pairs<Rule>) -> Result<Vec<Type>, Aid
 
     for pair in pairs {
         match pair.as_rule() {
-            Rule::r#type => res.push(parse_type(pair.into_inner())?),
+            Rule::r#type => {
+                let ty = parse_type(pair.into_inner())?;
+                // AOSP `aidl_language_y.yy` (`type_args`): an annotation goes
+                // on the whole field or parameter, never on an argument.
+                if let Some(annotation) = ty.annotation_list.first() {
+                    return Err(make_invalid_operation_error(
+                        "Annotations for type arguments are not supported".to_owned(),
+                        annotation.annotation_span,
+                    ));
+                }
+                res.push(ty)
+            }
             _ => unreachable!("Unexpected rule in parse_type_args(): {}", pair),
         }
     }
@@ -2396,17 +2460,104 @@ fn parse_parcelable_members(
     Ok(res)
 }
 
-fn parse_optional_type_params(pairs: pest::iterators::Pairs<Rule>) -> Vec<String> {
-    let mut res = Vec::new();
+/// A declaration's type parameter: `<@FixedSize T, Flavor>` yields two.
+///
+/// A `@FixedSize` or `@VintfStability` annotation here is a requirement on
+/// the argument supplied at a use site, not a property of the parameter:
+/// `@FixedSize T` means `Foo<byte>` is accepted and `Foo<String>` is
+/// rejected. AOSP also admits `@JavaPassthrough` and `@JavaSuppressLint`
+/// (`CONTEXT_ALL`), which the Rust backend ignores.
+///
+/// The name is checked against what the generated Rust spells bare in the
+/// generator (`Generator::ensure_type_params`), where the crate mode and the
+/// owning declaration are known.
+#[derive(Debug, Default, Clone)]
+pub struct TypeParam {
+    pub name: String,
+    pub name_span: Option<(usize, usize)>,
+    pub annotation_list: Vec<Annotation>,
+}
+
+impl TypeParam {
+    /// The requirement annotations, in declaration order.
+    pub fn requirements(&self) -> impl Iterator<Item = &Annotation> {
+        self.annotation_list
+            .iter()
+            .filter(|a| TYPE_PARAM_REQUIREMENTS.contains(&a.annotation.as_str()))
+    }
+}
+
+/// Annotations that state a requirement on a type argument.
+const TYPE_PARAM_REQUIREMENTS: &[&str] = &["@FixedSize", "@VintfStability"];
+
+/// Annotations AOSP accepts on a type parameter (`AidlAnnotation::AllSchemas`,
+/// `CONTEXT_TYPE_PARAM`, which `CONTEXT_ALL` includes).
+const TYPE_PARAM_ANNOTATIONS: &[&str] = &[
+    "@FixedSize",
+    "@VintfStability",
+    "@JavaPassthrough",
+    "@JavaSuppressLint",
+];
+
+fn parse_type_param(pairs: pest::iterators::Pairs<Rule>) -> Result<TypeParam, AidlError> {
+    let mut param = TypeParam::default();
+    for pair in pairs {
+        match pair.as_rule() {
+            Rule::annotation_list => {
+                param
+                    .annotation_list
+                    .append(&mut parse_annotation_list(pair.into_inner())?);
+            }
+            Rule::identifier => {
+                let span = pair.as_span();
+                reject_unrepresentable_identifier(pair.as_str(), "type parameter", &span)?;
+                param.name = pair.as_str().into();
+                param.name_span = Some((span.start(), span.end()));
+            }
+            _ => unreachable!("Unexpected rule in parse_type_param(): {}", pair),
+        }
+    }
+    if let Some(other) = param
+        .annotation_list
+        .iter()
+        .find(|a| !TYPE_PARAM_ANNOTATIONS.contains(&a.annotation.as_str()))
+    {
+        return Err(make_invalid_operation_error(
+            format!(
+                "'{}' cannot annotate the type parameter '{}': only @FixedSize and \
+                 @VintfStability state a requirement on a type argument (AOSP also \
+                 admits the Java-only @JavaPassthrough and @JavaSuppressLint)",
+                other.annotation, param.name
+            ),
+            other.annotation_span,
+        ));
+    }
+    Ok(param)
+}
+
+fn parse_optional_type_params(
+    pairs: pest::iterators::Pairs<Rule>,
+) -> Result<Vec<TypeParam>, AidlError> {
+    let mut res: Vec<TypeParam> = Vec::new();
 
     for pair in pairs {
         match pair.as_rule() {
-            Rule::identifier => res.push(pair.as_str().into()),
+            Rule::type_param => {
+                let param = parse_type_param(pair.into_inner())?;
+                // AOSP `AidlParameterizable::CheckValid`: "Type parameter 'T' is repeated."
+                if res.iter().any(|p| p.name == param.name) {
+                    return Err(make_invalid_operation_error(
+                        format!("type parameter '{}' is repeated", param.name),
+                        param.name_span,
+                    ));
+                }
+                res.push(param);
+            }
             _ => unreachable!("Unexpected rule in parse_optional_type_params(): {}", pair),
         }
     }
 
-    res
+    Ok(res)
 }
 
 fn parse_unstructured_parcelable(
@@ -2472,7 +2623,7 @@ fn parse_parcelable_decl(
             }
 
             Rule::optional_type_params => {
-                parcelable.type_params = parse_optional_type_params(pair.into_inner());
+                parcelable.type_params = parse_optional_type_params(pair.into_inner())?;
             }
 
             Rule::parcelable_members => {
@@ -2589,7 +2740,7 @@ pub struct UnionDecl {
     pub annotation_list: Vec<Annotation>,
     pub name: String,
     pub name_span: Option<(usize, usize)>,
-    pub type_params: Vec<String>,
+    pub type_params: Vec<TypeParam>,
     pub members: Vec<Declaration>,
     pub deprecated: Option<String>,
 }
@@ -2612,7 +2763,7 @@ fn parse_union_decl(
                 union_decl.name_span = Some((span.start(), span.end()));
             }
             Rule::optional_type_params => {
-                union_decl.type_params = parse_optional_type_params(pair.into_inner());
+                union_decl.type_params = parse_optional_type_params(pair.into_inner())?;
             }
             Rule::parcelable_members => {
                 union_decl.members = parse_parcelable_members(pair.into_inner())?;
@@ -2991,6 +3142,9 @@ pub fn reset() {
     });
     CURRENT_WARNINGS.with(|w| {
         w.borrow_mut().clear();
+    });
+    BUILTIN_RUST_PATHS.with(|map| {
+        map.borrow_mut().clear();
     });
     reset_enum_resolution_state();
 }

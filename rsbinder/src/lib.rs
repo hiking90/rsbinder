@@ -331,6 +331,15 @@ pub mod cancel;
 // the same reason as `cancel` above.
 pub mod stream;
 
+// Fast Message Queue: the `android.hardware.common.fmq.MQDescriptor`
+// parcelable on every platform, plus `rsbinder-fmq` (the queue itself) on
+// Linux and Android. Plain comment for the same reason as `cancel` above.
+pub mod fmq;
+/// `android.hardware.common.NativeHandle`: file descriptors plus integers,
+/// as an AIDL HAL carries a `native_handle_t`. The `MQDescriptor` in
+/// [`fmq`] holds its shared memory in one.
+pub use fmq::generated::android::hardware::common::NativeHandle::NativeHandle;
+
 /// Async runtime implementations
 #[cfg(feature = "async")]
 mod rt;

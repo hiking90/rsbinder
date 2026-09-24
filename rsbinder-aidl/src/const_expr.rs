@@ -581,6 +581,12 @@ impl ValueType {
                     // Use proper namespace resolution for cross-package enum references
                     match parser::lookup_decl_from_name(enum_type, crate::Namespace::AIDL) {
                         Some(lookup_decl) => {
+                            if let Some(path) = parser::builtin_rust_path(&lookup_decl.ns) {
+                                return format!(
+                                    "{}::{path}::{member_name}",
+                                    crate::type_generator::crate_name()
+                                );
+                            }
                             let curr_ns = parser::current_namespace();
                             let ns = curr_ns.relative_mod(&lookup_decl.ns);
                             if !ns.is_empty() {

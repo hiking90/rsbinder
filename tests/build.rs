@@ -63,6 +63,9 @@ fn main() {
             "aidl/android/aidl/tests/StructuredParcelable.aidl",
         ))
         .source(PathBuf::from(
+            "aidl/android/aidl/tests/GenericStructuredParcelable.aidl",
+        ))
+        .source(PathBuf::from(
             "aidl/android/aidl/tests/SimpleParcelable.aidl",
         ))
         .source(PathBuf::from("aidl/android/aidl/tests/Union.aidl"))
@@ -161,6 +164,17 @@ fn main() {
         .source(PathBuf::from("aidl/tracedemo/ITraceVintf.aidl"))
         .trace(true)
         .output(PathBuf::from("trace_demo.rs"))
+        .generate()
+        .unwrap();
+
+    // Plan 12 F0: generic parcelables and the builtin
+    // `android.hardware.common` types (`MQDescriptor`, `NativeHandle`),
+    // which resolve to the runtime crate without a vendored `.aidl`.
+    // `tests/tests/fmq_parcel.rs` round-trips them through a `Parcel`, so no
+    // device and no feature.
+    rsbinder_aidl::Builder::new()
+        .source(PathBuf::from("aidl/fmqdemo/IFmqDemo.aidl"))
+        .output(PathBuf::from("fmq_demo.rs"))
         .generate()
         .unwrap();
 

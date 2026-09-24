@@ -204,6 +204,11 @@ jobs:
         # line in `rpc-suite` enumerates `--test` targets, so without this
         # step the adapter would have no run gate at all.
         run: cargo test -p tests --test async_runtime
+      - name: Generic parcelables + builtin FMQ types (hermetic — plan 12 F0)
+        # `tests/tests/fmq_parcel.rs` round-trips `MQDescriptor` (with a real
+        # queue's fd) and a generic parcelable through a `Parcel`: no
+        # /dev/binder, no feature.
+        run: cargo test -p tests --test fmq_parcel
       - name: Fast Message Queue tests (hermetic — plan 12 AC-12.1–12.6)
         # `rsbinder-fmq` needs memfd and futex only: no /dev/binder, no
         # servicemanager. Its `tests/libfmq_host.rs` is `#[ignore]`d — it
