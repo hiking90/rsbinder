@@ -64,9 +64,14 @@ This changelog starts at 0.9.0. For earlier releases, see the
   and a clone-able `EventFlag` handle that outlives the queue. Linux and
   Android; elsewhere it compiles and every constructor returns
   `Unsupported`. Verified against AOSP's own `MessageQueueBase` running on
-  the host (`rsbinder-fmq/tests/cpp`). The `MQDescriptor` parcelable and the
-  AIDL-side conversion are a following step; `rsbinder` already uses the
-  crate's ashmem detection for its shared-memory code.
+  the host (`rsbinder-fmq/tests/cpp`), and, with the descriptor carried by
+  binder, against libfmq's `AidlMessageQueue` over libbinder_ndk on an
+  Android 16 emulator in both directions — a queue rsbinder made (sealed
+  memfd) attached by libfmq, a queue libfmq made (ashmem, no seals) attached
+  by rsbinder, 5000 items each way over the blocking operations
+  (`example-hello/cpp/run_fmq_interop.sh`; the rsbinder-to-rsbinder half of
+  the same fixture over the kernel driver is `tests/tests/fmq_binder.rs`).
+  `rsbinder` uses the crate's ashmem detection for its shared-memory code.
 - **Streaming with back-pressure** (`rsbinder::stream`): `Sink<T>` for the
   producer and `Receiver<T>` for the consumer. The consumer makes a receiver,
   passes its sink binder to the service, and reads; the service wraps that

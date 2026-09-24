@@ -180,6 +180,9 @@ jobs:
         #     `#[ignore]`d for the same reason: the first waits on a live
         #     service manager, the second needs the process's one kernel
         #     binder mapping. integration-test.yml owns both.
+        #   * tests/tests/fmq_binder.rs — `#[ignore]`d: an FMQ descriptor
+        #     across the kernel binder between two rsbinder processes, so
+        #     /dev/binder plus a live rsb_hub. integration-test.yml owns it.
         #   * rsbinder-fmq/tests/libfmq_host.rs — `#[ignore]`d: needs the C++
         #     peer built from the AOSP checkout
         #     (`rsbinder-fmq/tests/cpp/build_host_peer.sh`). Run by hand.

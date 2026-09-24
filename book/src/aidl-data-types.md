@@ -210,7 +210,11 @@ Android 11, so the wire format matches a C++ or Java HAL. A copy of one of
 these files under an include directory takes precedence and is compiled like
 any other source. On Linux and Android `rsbinder::fmq` also re-exports the
 `rsbinder-fmq` crate — the queue itself — with a conversion between
-`MQDescriptor` and its `Descriptor`; see the module documentation.
+`MQDescriptor` and its `Descriptor`; see the module documentation. A
+descriptor returned or accepted by a generated service reaches AOSP's own
+`AidlMessageQueue` (libfmq over libbinder_ndk) intact in both directions,
+and a queue libfmq made as an ashmem region attaches on the rsbinder side:
+`example-hello/cpp/run_fmq_interop.sh` is that check on an emulator.
 
 ## Tips
 

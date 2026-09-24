@@ -178,6 +178,17 @@ fn main() {
         .generate()
         .unwrap();
 
+    // Plan 12 F2: an FMQ peer whose descriptor travels over binder. Served
+    // and driven by `src/fmq_peer.rs` (through `src/bin/fmq_probe.rs` on a
+    // device, `tests/fmq_binder.rs` on a Linux host with rsb_hub); the C++
+    // half compiles the same two files with the platform `aidl`.
+    rsbinder_aidl::Builder::new()
+        .source(PathBuf::from("aidl/fmqinterop/IFmqPeer.aidl"))
+        .source(PathBuf::from("aidl/fmqinterop/QueueView.aidl"))
+        .output(PathBuf::from("fmq_peer.rs"))
+        .generate()
+        .unwrap();
+
     // Plan 10-7: a service that streams into a caller-supplied sink. Both
     // halves of the same fixture use it — `tests/stream_rpc.rs` over a
     // session, and `src/bin/stream_probe.rs` over kernel binder — so it is

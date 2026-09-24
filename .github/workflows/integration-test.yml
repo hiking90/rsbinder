@@ -286,6 +286,22 @@ jobs:
             exit 1
           }
 
+      - name: Run fmq_binder (an FMQ descriptor across the kernel binder, #[ignore]'d)
+        run: |
+          # Plan 12-fmq F2. `fmq_probe serve` in a child process makes and
+          # adopts queues whose `MQDescriptor` (fds inside) crosses the
+          # kernel driver; the test attaches, moves 5000 items each way
+          # over the blocking operations and damages the counters. Needs
+          # /dev/binder and the permissive rsb_hub; registers a name of its
+          # own, so the shared test_service is not involved. The same
+          # fixture against AOSP's libfmq on an emulator is
+          # example-hello/cpp/run_fmq_interop.sh, run by hand.
+          RUST_BACKTRACE=1 cargo test -p tests --test fmq_binder -- --ignored || {
+            echo "::error::fmq_binder failed"
+            cp -f rsb_hub.log artifacts/fmq-binder-rsb_hub.log 2>/dev/null || true
+            exit 1
+          }
+
       - name: Restart test_service for test_death_recipient
         run: |
           # Each #[ignore]'d destructive test consumes a live

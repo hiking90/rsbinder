@@ -30,7 +30,8 @@ rsbinder = { workspace = true, features = ["android_10_plus"] }
 # its runtime by hand).
 tokio = { workspace = true, features = ["rt-multi-thread", "time", "macros"] }
 env_logger = { workspace = true }
-rustix = { workspace = true, features = ["pipe", "param"] }
+# `mm`: `src/fmq_peer.rs` maps a queue's fd to damage its counters.
+rustix = { workspace = true, features = ["pipe", "param", "mm"] }
 async-trait = { workspace = true }
 log.workspace = true
 tracing = { workspace = true, optional = true }
