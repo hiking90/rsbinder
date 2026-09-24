@@ -15,6 +15,22 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Added
 
+- **New crate `rsbinder-fmq`**: Android's Fast Message Queue (`libfmq`) in
+  Rust — the shared-memory ring with two 64-bit counters and a futex
+  EventFlag word, laid out and driven exactly as `system/libfmq` does, so one
+  end can be C++ on a device and the other this crate. It does not depend on
+  binder: `MessageQueue<T>::create` allocates a sealed, pre-faulted memfd,
+  `descriptor()` yields the fds and grantors an AIDL `MQDescriptor` carries,
+  and `attach` maps a peer's descriptor after checking it against an
+  `AttachPolicy` (largest ring, seals, EventFlag word) plus libfmq's own
+  rules. `SynchronizedReadWrite` flavor, primitive elements, blocking
+  `write_blocking`/`read_blocking` with libfmq's `NOT_FULL`/`NOT_EMPTY` bits,
+  and a clone-able `EventFlag` handle that outlives the queue. Linux and
+  Android; elsewhere it compiles and every constructor returns
+  `Unsupported`. Verified against AOSP's own `MessageQueueBase` running on
+  the host (`rsbinder-fmq/tests/cpp`). The `MQDescriptor` parcelable and the
+  AIDL-side conversion are a following step; `rsbinder` already uses the
+  crate's ashmem detection for its shared-memory code.
 - **Streaming with back-pressure** (`rsbinder::stream`): `Sink<T>` for the
   producer and `Receiver<T>` for the consumer. The consumer makes a receiver,
   passes its sink binder to the service, and reads; the service wraps that

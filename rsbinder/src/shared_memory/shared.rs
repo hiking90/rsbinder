@@ -191,78 +191,29 @@ pub fn region_size<F: AsFd>(fd: F) -> Result<usize> {
 }
 
 /// libcutils `__ashmem_is_ashmem`: is `fd` open on the ashmem character
-/// device? A peer-supplied fd must pass this before any
-/// ashmem ioctl is sent to it (and before an `st_size == 0` is trusted as
-/// "ashmem reports 0" rather than "never `ftruncate`d").
-#[cfg(target_os = "android")]
+/// device? A peer-supplied fd must pass this before any ashmem ioctl is
+/// sent to it. The answer is `rsbinder_fmq::shm`'s, shared with the FMQ
+/// attach checks so the device-node lookup exists once.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn is_ashmem_fd(fd: std::os::fd::BorrowedFd<'_>) -> bool {
-    let Ok(st) = rustix::fs::fstat(fd) else {
-        return false;
-    };
-    if !is_char_device(&st) {
-        return false;
-    }
-    ashmem_rdev().is_some_and(|rdev| st.st_rdev == rdev)
+    rsbinder_fmq::shm::is_ashmem_fd(fd)
 }
 
-/// The ashmem device number, the way libcutils `__init_ashmem_rdev` finds
-/// it: Android 11+ init duplicates the node as `/dev/ashmem<boot_id>`
-/// (same major/minor) and means to retire the bare name, so that path is
-/// tried first. Only a success is cached, as libcutils retries on `0`.
-#[cfg(target_os = "android")]
-fn ashmem_rdev() -> Option<u64> {
-    static RDEV: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    if let Some(rdev) = RDEV.get() {
-        return Some(*rdev);
-    }
-    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok();
-    let with_boot_id = boot_id.map(|id| format!("/dev/ashmem{}", id.trim()));
-    let rdev = with_boot_id
-        .iter()
-        .map(String::as_str)
-        .chain(["/dev/ashmem"])
-        .find_map(|path| rustix::fs::stat(path).ok())
-        .filter(is_char_device)
-        .map(|dev| dev.st_rdev)?;
-    let _ = RDEV.set(rdev);
-    Some(rdev)
-}
-
-// Not `st_mode & libc::S_IFMT`: the two differ in width on 32-bit Android.
-#[cfg(target_os = "android")]
-fn is_char_device(st: &rustix::fs::Stat) -> bool {
-    rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::CharacterDevice
-}
-
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub(crate) fn is_ashmem_fd(_fd: std::os::fd::BorrowedFd<'_>) -> bool {
     false
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn ashmem_size(fd: std::os::fd::BorrowedFd<'_>) -> Result<usize> {
-    use std::os::fd::AsRawFd;
-    // The fd came out of a parcel: verify it really is ashmem before
-    // issuing an ashmem-specific ioctl on it, exactly as libcutils
-    // `ashmem_get_size_region` does. Another driver could interpret the
-    // request number (and the argument register) its own way.
-    if !is_ashmem_fd(fd) {
-        return Err(StatusCode::BadValue);
-    }
-    // `ASHMEM_GET_SIZE` = `_IO(0x77, 4)`; the size is the ioctl's return
-    // value.
-    const ASHMEM_GET_SIZE: libc::c_ulong = 0x7704;
-    // SAFETY: `fd` was just verified to be an open `/dev/ashmem` fd, and
-    // ASHMEM_GET_SIZE takes no pointer argument (an explicit `0` is passed
-    // so the variadic slot is defined).
-    let r = unsafe { libc::ioctl(fd.as_raw_fd(), ASHMEM_GET_SIZE as _, 0) };
-    if r < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    usize::try_from(r).map_err(|_| StatusCode::BadValue)
+    let size = rsbinder_fmq::shm::ashmem_size(fd).map_err(|e| match e {
+        rsbinder_fmq::Error::Os(errno) => StatusCode::from(errno),
+        _ => StatusCode::BadValue,
+    })?;
+    usize::try_from(size).map_err(|_| StatusCode::BadValue)
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn ashmem_size(_fd: std::os::fd::BorrowedFd<'_>) -> Result<usize> {
     Err(StatusCode::BadValue)
 }

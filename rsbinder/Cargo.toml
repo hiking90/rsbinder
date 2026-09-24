@@ -145,6 +145,10 @@ libc = { workspace = true }
 # rustix omits the SCHED_* constants.
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 libc = { workspace = true }
+# Plan 12: the Fast Message Queue core. Binder-free, so it is a separate
+# crate this one builds on; the ashmem detection the shared-memory code
+# needs lives there so the two cannot drift.
+rsbinder-fmq = { workspace = true }
 
 [build-dependencies]
 # No `features = ["async"]` here. Cargo unifies features across the whole

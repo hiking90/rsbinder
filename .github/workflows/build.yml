@@ -180,6 +180,9 @@ jobs:
         #     `#[ignore]`d for the same reason: the first waits on a live
         #     service manager, the second needs the process's one kernel
         #     binder mapping. integration-test.yml owns both.
+        #   * rsbinder-fmq/tests/libfmq_host.rs — `#[ignore]`d: needs the C++
+        #     peer built from the AOSP checkout
+        #     (`rsbinder-fmq/tests/cpp/build_host_peer.sh`). Run by hand.
         # Adding a test target means adding it to one of those lines, or to
         # this list with the reason it cannot run here.
         run: |
@@ -201,6 +204,13 @@ jobs:
         # line in `rpc-suite` enumerates `--test` targets, so without this
         # step the adapter would have no run gate at all.
         run: cargo test -p tests --test async_runtime
+      - name: Fast Message Queue tests (hermetic — plan 12 AC-12.1–12.6)
+        # `rsbinder-fmq` needs memfd and futex only: no /dev/binder, no
+        # servicemanager. Its `tests/libfmq_host.rs` is `#[ignore]`d — it
+        # drives a C++ peer built from the AOSP checkout by
+        # `rsbinder-fmq/tests/cpp/build_host_peer.sh`, which this runner
+        # does not have.
+        run: cargo test -p rsbinder-fmq
 
   rpc-suite:
     name: RPC Transport Suite
@@ -472,6 +482,10 @@ jobs:
         # macOS so codegen regressions can't sneak through the macOS
         # path either.
         run: cargo test -p rsbinder-aidl
+      - name: Fast Message Queue on a target without one (plan 12 AC-12.8)
+        # The crate compiles everywhere; off Linux/Android every constructor
+        # returns `Unsupported`, and that is the one test that runs here.
+        run: cargo test -p rsbinder-fmq
 
   android-build:
     name: Android Build

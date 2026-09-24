@@ -20,11 +20,13 @@ For Android developers writing system-level Rust, **rsbinder** is the missing ND
 
 * **crate rsbinder** — library for implementing binder service / client functionality.
 * **[crate rsbinder-aidl][rsbinder-aidl-readme]** — AIDL → Rust code generator.
+* **[crate rsbinder-fmq][rsbinder-fmq-readme]** — Android's Fast Message Queue (`libfmq`) in Rust: a shared-memory ring with futex wake-ups, compatible with C++ peers, independent of binder.
 * **[crate rsbinder-tools][rsbinder-tools-readme]** — CLI tools: the Binder Service Manager for Linux (`rsb_hub`), the device setup helper (`rsb_device`), and the registry inspector (`rsb_service`).
 * **[crate tests][tests-readme]** — Android binder test cases ported to rsbinder.
 * **[crate example-hello][example-hello-readme]** — example service / client written using rsbinder.
 
 [rsbinder-aidl-readme]: https://github.com/hiking90/rsbinder/blob/master/rsbinder-aidl/README.md
+[rsbinder-fmq-readme]: https://github.com/hiking90/rsbinder/blob/master/rsbinder-fmq/README.md
 [rsbinder-tools-readme]: https://github.com/hiking90/rsbinder/blob/master/rsbinder-tools/README.md
 [tests-readme]: https://github.com/hiking90/rsbinder/blob/master/tests/README.md
 [example-hello-readme]: https://github.com/hiking90/rsbinder/tree/master/example-hello/README.md
