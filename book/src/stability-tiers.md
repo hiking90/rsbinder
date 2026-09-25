@@ -115,8 +115,11 @@ tweaks; wire formats are already locked.
   AOSP's, written as ordinary AIDL so a C++ or NDK peer can be either end (a
   Java peer is out of scope: AOSP has no Java FMQ). Validated
   rsbinder-to-rsbinder over kernel binder (two processes, including a real
-  Android driver) and over RPC; a gate against a C++ peer is the remaining
-  step. See [Streaming](./streaming.md).
+  Android driver) and over RPC, and over kernel binder against an NDK peer
+  built on the C reference headers, both directions
+  (`example-hello/cpp/run_stream_interop.sh`). A `libfmq` peer and the RPC
+  path against libbinder's `RpcSession` are the remaining gates. See
+  [Streaming](./streaming.md).
 - **Observability (new in 0.13.0)** — the work source functions
   (`set_calling_work_source_uid` and the five beside it, the AOSP
   `IPCThreadState` set), `Remotable::transaction_name` with

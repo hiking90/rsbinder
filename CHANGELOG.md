@@ -72,6 +72,24 @@ This changelog starts at 0.9.0. For earlier releases, see the
   (`example-hello/cpp/run_fmq_interop.sh`; the rsbinder-to-rsbinder half of
   the same fixture over the kernel driver is `tests/tests/fmq_binder.rs`).
   `rsbinder` uses the crate's ashmem detection for its shared-memory code.
+- **C reference headers for an NDK peer** (header-only, C11, usable from
+  C++): `rsbinder-fmq/c/rsbinder_fmq.h` is the synchronized FMQ — attach with
+  the checks `rsbinder-fmq` makes, create a sealed memfd, the counters and the
+  EventFlag futex — and `contrib/ndk/rsbinder_stream.h` is the kernel-binder
+  stream's record layer on it (`rsbs_send`/`rsbs_end` for a producer,
+  `rsbs_recv`/`rsbs_cancel` for a consumer, and `rsbs_on_binder_died`/
+  `rsbs_on_unlinked` with a per-stream cookie for an `AIBinder_DeathRecipient`,
+  whose reference keeps what a late death callback touches mapped after the
+  stream closes). Closing mirrors rsbinder's `Drop`: a consumer cancels, a
+  producer that did not end writes an `EX_ILLEGAL_STATE` end. Both carry C++
+  templates for the NDK backend's `MQDescriptor` and `StreamEndpoint`. An NDK
+  app cannot link `libfmq`, so this is how one takes part in a stream.
+  `rsbinder-fmq/tests/c_header.rs` runs the ring header against the crate in
+  both roles, and `tests/tests/c_stream_header.rs` the stream header under
+  AddressSanitizer (both compiled with the host's `cc`);
+  `example-hello/cpp/run_stream_interop.sh` runs an NDK client
+  against rsbinder on an Android emulator in both directions — order, the end
+  status, back-pressure, cancel, both deaths, an oversized item.
 - **Streaming with back-pressure** (`rsbinder::stream`): `Sink<T>` for the
   producer and `Receiver<T>` for the consumer. The consumer makes a receiver
   against its **peer** — a binder in the producer's process —

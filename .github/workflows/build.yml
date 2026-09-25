@@ -212,12 +212,19 @@ jobs:
         # queue's fd) and a generic parcelable through a `Parcel`: no
         # /dev/binder, no feature.
         run: cargo test -p tests --test fmq_parcel
+      - name: NDK stream header on the host (hermetic — plan 10-7b P4)
+        # `tests/tests/c_stream_header.rs` builds `contrib/ndk/rsbinder_stream.h`
+        # with the runner's `cc` (AddressSanitizer + UBSan) and `c++` and runs
+        # both ends of a stream in one process: no /dev/binder, no feature.
+        run: cargo test -p tests --test c_stream_header
       - name: Fast Message Queue tests (hermetic — plan 12 AC-12.1–12.6)
         # `rsbinder-fmq` needs memfd and futex only: no /dev/binder, no
         # servicemanager. Its `tests/libfmq_host.rs` is `#[ignore]`d — it
         # drives a C++ peer built from the AOSP checkout by
         # `rsbinder-fmq/tests/cpp/build_host_peer.sh`, which this runner
-        # does not have.
+        # does not have. `tests/c_header.rs` does run here: it compiles
+        # the C header's peer with the runner's own `cc` and `c++` (plan
+        # 10-7b P4).
         run: cargo test -p rsbinder-fmq
 
   rpc-suite:

@@ -30,4 +30,10 @@ Android (elsewhere the crate compiles and every constructor returns
 `AttachPolicy` before anything is mapped, and the counters are checked on
 every operation. See the crate documentation for the full contract.
 
+For a peer that cannot link `libfmq` — an NDK app, where it is not available —
+`c/rsbinder_fmq.h` is the same queue as one C11 header: attach with the same
+checks, create a sealed memfd, the counters and the EventFlag protocol, plus
+two C++ templates for the NDK backend's `MQDescriptor`. `tests/c_header.rs`
+runs it against this crate in both roles.
+
 Part of [rsbinder](https://github.com/hiking90/rsbinder). Apache-2.0.

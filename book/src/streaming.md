@@ -454,6 +454,24 @@ would not see the cancel. A consumer making the endpoint allocates the ring
 itself and puts a binder in `sink` for the producer to link to for death; no
 `IStreamSink` method is called on it.
 
+An NDK peer cannot link `libfmq` — it is not part of the NDK, and the device's
+`libfmq.so` is built against the platform's C++ library rather than the NDK's.
+Two header-only C11 files do that part instead:
+`rsbinder-fmq/c/rsbinder_fmq.h` is the ring (attach with the same checks
+rsbinder makes, create a sealed memfd, the counters, the EventFlag futex), and
+`contrib/ndk/rsbinder_stream.h` is the record layer on it (`rsbs_send`,
+`rsbs_end`, `rsbs_recv`, `rsbs_cancel`). For death, create the
+`AIBinder_DeathRecipient` with `rsbs_on_binder_died`, set
+`rsbs_on_unlinked` as its `onUnlinked` (API 33), and link with the stream's
+`rsbs_*_death_cookie`: libbinder can still be running the death callback after
+`AIBinder_unlinkToDeath` returns, and the cookie keeps what it touches mapped
+until `onUnlinked`, so the stream may be closed at any time. Each header has two
+C++ templates that convert to and from the NDK backend's generated
+`MQDescriptor` and `StreamEndpoint`.
+`example-hello/cpp/stream_interop.cpp` is a complete client for both
+directions, and `run_stream_interop.sh` runs it against rsbinder on an
+emulator.
+
 **Over RPC** the contract is the two interfaces:
 
 - **As the consumer**, implement `IStreamSink`. In `onStart`, turn the binder

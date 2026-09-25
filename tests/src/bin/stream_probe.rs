@@ -111,8 +111,7 @@ impl IStreamDemo for DemoSvc {
         Ok(())
     }
 
-    // The async producer and the failing terminator are covered by the
-    // RPC half; this probe exists for what only the driver shows.
+    // The async producer is the RPC half's; this probe is for what only the driver shows.
     fn r#subscribeAsync(
         &self,
         _endpoint: &StreamEndpoint,
@@ -123,14 +122,27 @@ impl IStreamDemo for DemoSvc {
         Err(Status::from(ExceptionCode::UnsupportedOperation))
     }
 
+    /// `count` items, then the failure: the end record `run_stream_interop.sh` parses in C.
     fn r#subscribeFailing(
         &self,
-        _endpoint: &StreamEndpoint,
-        _count: i32,
-        _code: i32,
-        _message: &str,
+        endpoint: &StreamEndpoint,
+        count: i32,
+        code: i32,
+        message: &str,
     ) -> BinderResult<()> {
-        Err(Status::from(ExceptionCode::UnsupportedOperation))
+        let mut producer = Sink::<i32>::open(endpoint)?;
+        let status = Status::new_service_specific_error(code, Some(message.to_string()));
+        thread::spawn(move || {
+            let sent = (0..count).try_for_each(|item| producer.send(&item));
+            let ended = match sent {
+                Ok(()) => producer.end_with(&status),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = ended {
+                eprintln!("stream_probe: subscribeFailing: {e:?}");
+            }
+        });
+        Ok(())
     }
 
     fn r#sent(&self) -> BinderResult<i32> {
