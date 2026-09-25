@@ -1149,7 +1149,8 @@ thread_local! {
 /// nested call (the `DRIVING` reentrant pin) re-enters an `Outgoing`
 /// slot unconditionally, but an `Incoming` one only while its dispatch
 /// grants it ([`ConnSlot::allow_nested`]) — a nested call from a
-/// *oneway* handler falls through to an `Outgoing` slot instead.
+/// *oneway* handler falls through to an `Outgoing` slot instead. A
+/// oneway call never re-enters an `Incoming` slot ([`ConnUse::ClientAsync`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SlotRole {
     /// This endpoint serves the connection (AOSP `mIncoming`): the
@@ -1167,11 +1168,19 @@ enum SlotRole {
 /// reentrant pin may be reused when the pinned slot is serve-driven.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ConnUse {
-    /// AOSP `ConnectionUse::CLIENT` — a transaction (twoway or oneway).
+    /// AOSP `ConnectionUse::CLIENT` — a twoway transaction.
     /// May reuse a serve-driven slot only while that slot's
     /// [`ConnSlot::allow_nested`] holds; otherwise it needs an
     /// `Outgoing` slot, since nothing would read the frame.
     Client,
+    /// AOSP `ConnectionUse::CLIENT_ASYNC` — a oneway transaction. Never
+    /// rides a serve-driven slot, even one whose dispatch grants nesting
+    /// ("asynchronous calls cannot be nested"): the sender does not wait,
+    /// so it goes on to write the reply to the transaction it is serving
+    /// while the peer may still be handling the oneway inside its reply
+    /// wait — and a twoway the peer's handler sends back on that socket
+    /// would then read that reply as its own. It needs an `Outgoing` slot.
+    ClientAsync,
     /// AOSP `ConnectionUse::CLIENT_REFCOUNT` — a reply-less
     /// `DEC_STRONG`. Always free to ride the *pinned* slot ("we currently
     /// allow ref count calls to be nested (so that you can use this
@@ -1197,7 +1206,7 @@ impl ConnUse {
     /// reply continues an exchange the peer is already waiting on; a
     /// `DEC_STRONG` opens none.
     fn is_new_transaction(self) -> bool {
-        matches!(self, ConnUse::Client)
+        matches!(self, ConnUse::Client | ConnUse::ClientAsync)
     }
 }
 
@@ -1659,8 +1668,9 @@ impl RpcSessionInner {
     ///     `exclusiveIncoming->allowNested`): a oneway dispatch leaves
     ///     nobody reading that socket, so the pin is **declined** and
     ///     the scan below applies. [`ConnUse::ClientRefcount`] ignores
-    ///     the grant (a `DEC_STRONG` awaits no reply) — this is the only
-    ///     place the two uses differ.
+    ///     the grant (a `DEC_STRONG` awaits no reply), and
+    ///     [`ConnUse::ClientAsync`] never takes a serve-driven pin at all
+    ///     — these are the only places the uses differ.
     ///  2. **Exclusive** — a slot whose `exclusive_tid == this tid`
     ///     (defensive: should be covered by 1).
     ///  3. **First available `Outgoing` slot** — the first slot with
@@ -1700,6 +1710,11 @@ impl RpcSessionInner {
     /// pinning oneway sends to a fixed slot.
     fn find_conn(&self) -> Result<ConnGuard<'_>> {
         self.find_conn_impl(ConnUse::Client)
+    }
+
+    /// [`find_conn`] for a oneway transaction ([`ConnUse::ClientAsync`]).
+    fn find_conn_async(&self) -> Result<ConnGuard<'_>> {
+        self.find_conn_impl(ConnUse::ClientAsync)
     }
 
     /// [`find_conn`] for reply-less `DEC_STRONG` sends. It differs from
@@ -1768,7 +1783,7 @@ impl RpcSessionInner {
                     Some(s) if s.unreadable => return Err(StatusCode::DeadObject),
                     Some(s)
                         if s.role == SlotRole::Outgoing
-                            || s.allow_nested
+                            || (s.allow_nested && use_ != ConnUse::ClientAsync)
                             || !use_.is_new_transaction() =>
                     {
                         Some(Arc::clone(&s.transport))
@@ -1849,14 +1864,15 @@ impl RpcSessionInner {
                     log::error!(
                         "RPC: r34 session has no outgoing connection — this endpoint \
                          accepted the connection, and the r34 profile cannot open or \
-                         attach one. Only a nested call (from inside a twoway handler) \
-                         can transact here; use `?profile=android13plus` for callbacks \
+                         attach one. Only a nested twoway call (from inside a twoway \
+                         handler) can transact here — a oneway never nests; use \
+                         `?profile=android13plus` for oneway calls and for callbacks \
                          outside a handler"
                     );
                 } else {
                     log::error!(
                         "RPC: session has no outgoing connection — a non-nested call (from \
-                         another thread, or a oneway outside a handler) needs the peer to open \
+                         another thread, or any oneway) needs the peer to open \
                          incoming connections (RpcUnixClientConfig::incoming_connections / \
                          ARpcSession_setMaxIncomingThreads); refusing instead of waiting forever"
                     );
@@ -3028,7 +3044,11 @@ impl RpcSessionInner {
         // if the pool is exhausted. Concurrent transacts on *other*
         // slots run unblocked.
         let oneway = (flags & FLAG_ONEWAY) != 0;
-        let conn = self.find_conn()?;
+        let conn = if oneway {
+            self.find_conn_async()?
+        } else {
+            self.find_conn()?
+        };
         let transport = conn.transport();
         // AOSP `BinderNode::asyncNumber` (send side, per-remote-addr).
         let async_number = if oneway {
@@ -6167,6 +6187,49 @@ mod tests {
         drop(slot_transport);
         let _ = peer_dup.shutdown(std::net::Shutdown::Both);
         peer_thread.join().expect("peer thread");
+    }
+
+    /// A oneway sent from inside a twoway dispatch does not ride the
+    /// serve-driven slot the dispatch granted to nested calls (AOSP
+    /// `CLIENT_ASYNC` skips `mIncoming`): the sender writes its reply next
+    /// without waiting, so a peer handling the oneway in its reply wait
+    /// would read that reply as the answer to its own nested call. With no
+    /// outgoing slot it is `WouldBlock`, as in AOSP; a twoway still nests.
+    #[test]
+    fn a_oneway_from_a_twoway_dispatch_never_nests_on_the_serving_slot() {
+        let (a, _b) = super::super::transport::UnixTransport::pair().expect("socketpair");
+        let session = RpcSession::new(Box::new(a), AddressSpace::Acceptor).expect("session");
+        let slot_id = {
+            let mut st = session.inner.conn_state.lock().expect("conn_state");
+            let slot = &mut st.slots[0];
+            // As a serve loop dispatching a twoway leaves it.
+            slot.role = SlotRole::Incoming;
+            slot.allow_nested = true;
+            slot.exclusive_tid = Some(current_tid());
+            slot.id
+        };
+        let sess_ptr = &*session.inner as *const RpcSessionInner as usize;
+        struct DrivingMark;
+        impl Drop for DrivingMark {
+            fn drop(&mut self) {
+                DRIVING.with(|d| {
+                    d.borrow_mut().pop();
+                });
+            }
+        }
+        DRIVING.with(|d| d.borrow_mut().push((sess_ptr, slot_id)));
+        let _mark = DrivingMark;
+
+        let nested = session
+            .inner
+            .find_conn()
+            .expect("a twoway nests on the serving slot");
+        assert_eq!(nested.slot_id, slot_id);
+        drop(nested);
+        assert!(
+            matches!(session.inner.find_conn_async(), Err(StatusCode::WouldBlock)),
+            "a oneway needs an outgoing slot, and this session has none"
+        );
     }
 
     /// Plan 2-21 B-7 — an unreadable slot is refused at *selection*, not

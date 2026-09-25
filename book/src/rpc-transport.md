@@ -445,9 +445,9 @@ kernel binder for, with a few extras specific to socket transport:
   interfaces, enums, unions, oneway methods.
 - **Callbacks (nested binders)** — a callback object created on the
   client crosses the socket like any other Binder and the server
-  invokes it back through the same session. From inside a handler
-  this always works; to call a callback from *any other* server
-  thread the client must open an incoming connection — see
+  invokes it back through the same session. A twoway call from inside
+  a handler always works; a `oneway` call, or a call from *any other*
+  server thread, needs the client to open an incoming connection — see
   [Callbacks outside a handler](#callbacks-outside-a-handler).
 - **`ParcelFileDescriptor`** — opt in with
   `RpcSession::negotiate_fd_transport` and
@@ -481,13 +481,21 @@ opens — use
 
 ### Callbacks outside a handler
 
-A server can always call a client's callback *while it is answering
-that client* — the nested call rides the connection the request came
-in on. Calling it from anywhere else (a timer, a worker thread, a
-oneway notification fired later) needs a connection the server can
-*send* on, and by default a session has none: the server fails such a
-call at once with `WouldBlock` (AOSP `WOULD_BLOCK`) rather than
-waiting for a slot that will never free up.
+A server can always make a twoway call to a client's callback *while
+it is answering that client* — the nested call rides the connection
+the request came in on. Calling it from anywhere else (a timer, a
+worker thread, a oneway notification fired later) needs a connection
+the server can *send* on, and by default a session has none: the
+server fails such a call at once with `WouldBlock` (AOSP `WOULD_BLOCK`)
+rather than waiting for a slot that will never free up.
+
+A `oneway` call needs that connection even from inside the handler.
+It never rides the connection the request came in on, as in AOSP
+libbinder ("asynchronous calls cannot be nested"): the server does not
+wait for it and goes on to write its reply, while the client may still
+be running the oneway inside its own reply wait — and a twoway call the
+client's handler makes back on that connection would then read the
+server's reply as its own.
 
 The client provides that connection, exactly as libbinder's
 `ARpcSession_setMaxIncomingThreads(n)` does:

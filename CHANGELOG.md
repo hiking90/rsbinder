@@ -268,6 +268,25 @@ in the release after 0.13.0. The single-connection one-liners
 (`setup_unix_client_android13plus`, `_abstract`, `_fd`,
 `setup_tcp_client_tls_android13plus`) are not deprecated.
 
+### Fixed
+
+- **RPC: a `oneway` call made inside a handler no longer rides the connection
+  the request came in on.** It was sent there while the handler served a
+  twoway call, and the server then wrote that call's reply without waiting.
+  The client, still in its reply wait, ran the oneway on the same thread; a
+  twoway call its handler made back on that connection read the server's
+  reply as its own answer, and the outer call read the nested call's reply.
+  Against libbinder this showed as a failed `IStreamSource` cast in
+  `onStart` followed by `UNEXPECTED_NULL`, or a libbinder abort ("Local
+  binder must have been sent"). A oneway now takes a connection this end
+  opened, as AOSP libbinder's `ExclusiveConnection::find` does on every
+  version ("asynchronous calls cannot be nested"), and is `WouldBlock` when
+  there is none: a server's oneway call to a client needs the client's
+  incoming connections (`RpcClientConfig::incoming_connections`,
+  `ARpcSession_setMaxIncomingThreads`) even from inside a handler, and the
+  r34 profile, which has no way to open one, cannot make it. Twoway nested
+  calls are unchanged.
+
 ## [0.12.0] - 2026-09-19
 
 ### Migrating from 0.11.0
