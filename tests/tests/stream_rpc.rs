@@ -331,12 +331,7 @@ fn an_rpc_peer_gets_a_sink_only_endpoint() {
     assert!(endpoint.sink.is_some());
 }
 
-/// Plan 10-7 AC-7.1 over RPC: every item crosses, in order, while the
-/// bytes in flight stay inside the granted window.
-///
-/// 64-byte batches hold 16 integers each, so 1000 items are 63 batches —
-/// enough that the consumer has to keep granting credit for the stream
-/// to finish at all.
+/// AC-7.1 over RPC: 1000 items in 63 batches cross in order inside the granted window.
 #[test]
 fn a_stream_of_a_thousand_items_crosses_a_session() {
     let f = fixture("ok", 1);
@@ -358,10 +353,7 @@ fn a_stream_of_a_thousand_items_crosses_a_session() {
     );
 }
 
-/// The opening window travels in `onStart`, and the consumer holds the
-/// producer to what it accepts. Over a session the sink is an RPC proxy
-/// with no descriptor, so that `onStart` is the hand-built request, not
-/// the generated proxy's.
+/// The opening window travels in `onStart`; the consumer holds the producer to it.
 #[test]
 fn a_window_wider_than_the_consumer_accepts_is_refused_across_a_session() {
     let f = fixture("wide", 1);
@@ -393,11 +385,7 @@ fn a_window_wider_than_the_consumer_accepts_is_refused_across_a_session() {
     }
 }
 
-/// The same stream with the producer as a task: waiting for credit
-/// suspends it, and each batch is sent from the blocking pool.
-///
-/// One opening credit and four-byte batches, so all but the first of the
-/// 300 batches wait on a grant that has to cross the session first.
+/// The producer as a task: one credit and four-byte batches, so 299 of 300 batches await a grant.
 #[test]
 fn an_async_producer_streams_across_a_session() {
     let f = fixture("async", 1);
@@ -486,6 +474,14 @@ fn the_window_bounds_what_the_producer_sends_before_anyone_drains() {
 
     // Nothing has been read yet, and credit is only granted for batches
     // the consumer has taken.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while f.demo.r#sent().expect("sent") < 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first batch never left"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
     thread::sleep(Duration::from_millis(200));
     assert_eq!(
         f.demo.r#sent().expect("sent"),
@@ -497,12 +493,7 @@ fn the_window_bounds_what_the_producer_sends_before_anyone_drains() {
     assert_eq!(got, (0..100).collect::<Vec<_>>());
 }
 
-/// A session that ends releases a consumer blocked in `recv`, the way a
-/// dead process does on kernel binder (`run_stream_ac.sh`).
-///
-/// Back-pressure means there is usually no call in flight to fail, so
-/// nothing reports the loss on its own: the death links the receiver put
-/// on the peer and on the source are what end the wait.
+/// A session that ends releases a consumer blocked in `recv`: only the death links end the wait.
 #[test]
 fn a_session_that_ends_releases_a_blocked_consumer() {
     let f = fixture("dead", 1);
@@ -516,10 +507,7 @@ fn a_session_that_ends_releases_a_blocked_consumer() {
         .r#subscribe(&endpoint, i32::MAX, 4, 1_000_000, 30_000_000)
         .expect("subscribe");
     assert!(rx.next().expect("item 0").is_ok());
-    // Pays the credit owed for that batch, so nothing is owed when the
-    // session goes. Otherwise the grant made before waiting would run
-    // into the dead session and report the loss itself, and this test
-    // would pass without the death link it is here for.
+    // Pays the owed credit, so the dead session is seen by the death link, not a grant.
     assert!(rx.try_recv().expect("still running").is_none());
 
     f.client.close_session();

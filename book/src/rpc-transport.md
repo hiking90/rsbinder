@@ -526,7 +526,7 @@ Two consequences worth knowing:
 This needs the android-13+ profile (the attach echoes the session id).
 [Streaming](./streaming.md) is the first thing in rsbinder itself that
 depends on it: a producer pushes batches from a thread of its own, so
-`Sink::new` checks for `TransportCaps::CALLBACKS` and refuses a session
+`Sink::open` checks for `TransportCaps::CALLBACKS` and refuses a session
 that has no incoming connection.
 
 ### How a connection ends

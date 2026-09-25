@@ -145,10 +145,7 @@ impl IStreamDemo for DemoSvc {
         Ok(self.last_error.load(Ordering::SeqCst))
     }
 
-    /// The service is the consumer. The receiver — and with it the ring
-    /// and the death link on `producer` — is made here, inside the
-    /// handler on a binder thread, and the endpoint goes back in the
-    /// reply; the reading happens on a thread of its own.
+    /// The service consumes: the receiver is made in the handler and read on its own thread.
     fn r#upload(&self, producer: &SIBinder, ring_bytes: i32) -> BinderResult<StreamEndpoint> {
         let (mut rx, endpoint) = Receiver::<i32>::with_policy(
             producer,
@@ -309,14 +306,6 @@ fn consume(name: &str, count: i32, ring_bytes: usize) -> Result<()> {
 
 /// Take `take` items, stop reading, and watch the producer stop at the
 /// ring's capacity; then read the rest.
-///
-/// No clock decides anything here. After `take` records have been read
-/// out, the ring is empty and the producer can write exactly
-/// [`ring_items`] more before its `send` blocks — so the service's
-/// `sent` counter must come to rest at `take + ring_items`, with the
-/// producer not finished. The probe polls for that value (the poll is
-/// bounded by the script's `timeout`, which is the only clock), and
-/// treats a higher one as a ring that admitted more than it holds.
 fn pause(name: &str, count: i32, ring_bytes: usize, take: i32) -> Result<()> {
     let demo = connect(name)?;
     let (mut rx, endpoint) = receiver_for(&demo, ring_bytes)?;
@@ -370,11 +359,6 @@ fn pause(name: &str, count: i32, ring_bytes: usize, take: i32) -> Result<()> {
 
 /// `streams` streams from one service at once, into a process whose
 /// binder mapping is a single page.
-///
-/// A page is the smallest mapping `binder://?mmap=` accepts. Twelve
-/// rings' worth of items would be refused many times over if any of it
-/// went through that mapping; on the ring nothing does, so the only
-/// binder traffic is the `subscribe` calls and their empty replies.
 fn crowd(name: &str, streams: usize, count: i32) -> Result<()> {
     let page = rustix::param::page_size();
     let demo = connect_via(&format!("binder://?mmap={page}"), name)?;
@@ -403,11 +387,7 @@ fn crowd(name: &str, streams: usize, count: i32) -> Result<()> {
     Ok(())
 }
 
-/// Subscribe, take `take` items, then leave without a word.
-///
-/// `std::process::exit` rather than a return: the point is a consumer
-/// whose process is simply gone, so `Receiver::drop` must not get to set
-/// `CANCEL` first.
+/// Take `take` items, then exit without `Receiver::drop`, so `CANCEL` is never set.
 fn die(name: &str, take: i32, ring_bytes: usize, delay_micros: i32) -> Result<()> {
     let demo = connect(name)?;
     let (mut rx, endpoint) = receiver_for(&demo, ring_bytes)?;
@@ -430,12 +410,7 @@ fn die(name: &str, take: i32, ring_bytes: usize, delay_micros: i32) -> Result<()
     std::process::exit(0);
 }
 
-/// Take `take` items and drop the receiver, which cancels.
-///
-/// The ring is small and the producer unpaced, so it is parked in the
-/// futex wait for room when the `CANCEL` bit is set; the wait returns
-/// and its `send` reports `InvalidOperation`. A return, not an exit:
-/// `Receiver::drop` is the point.
+/// Take `take` items and drop the receiver: a return, since `Receiver::drop` is what cancels.
 fn cancel(name: &str, take: i32, ring_bytes: usize) -> Result<()> {
     let demo = connect(name)?;
     let (mut rx, endpoint) = receiver_for(&demo, ring_bytes)?;
@@ -458,10 +433,6 @@ fn cancel(name: &str, take: i32, ring_bytes: usize) -> Result<()> {
 }
 
 /// Consume until the producer's process is killed out from under us.
-///
-/// The mirror of `die`: the producer paces itself, so the consumer is
-/// parked on an empty ring with nothing in flight when the service goes.
-/// Only the death link on the peer can end that wait.
 fn orphan(name: &str) -> Result<()> {
     let demo = connect(name)?;
     let (mut rx, endpoint) = receiver_for(&demo, ReceiverPolicy::default().ring_bytes)?;
@@ -482,10 +453,7 @@ fn orphan(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Push `count` items into the service and report what it took.
-///
-/// The `Token` is the binder the service watches; it lives until the
-/// stream has ended on both sides.
+/// Push `count` items and report what the service took; the `Token` lives until both sides end.
 fn upload(name: &str, count: i32, ring_bytes: usize) -> Result<()> {
     let demo = connect(name)?;
     let token = Token::new();
@@ -518,10 +486,6 @@ fn upload(name: &str, count: i32, ring_bytes: usize) -> Result<()> {
 
 /// Ask for an upload endpoint, push `send` items into it, and leave
 /// without ending the stream.
-///
-/// With `send` at zero the process is gone before it has even mapped the
-/// ring: the service's consumer is parked on an empty ring it made a
-/// moment ago, and only the death link on the token can release it.
 fn vanish(name: &str, send: i32) -> Result<()> {
     let demo = connect(name)?;
     let token = Token::new();

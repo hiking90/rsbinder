@@ -167,11 +167,7 @@ use crate::parcelable::{Deserialize, Serialize};
 use crate::status::{BinderResult, ExceptionCode, Status};
 use crate::SIBinder;
 
-// The generated contract is an implementation detail bar the endpoint:
-// the public surface here is `Sink` and `Receiver`. Exposing the tree
-// would put every generated trait, proxy and stub under the crate's
-// stability promise, and a caller that wants the raw interface can
-// compile the shipped `.aidl` itself.
+// Private bar the endpoint: exposing it puts every generated trait under the stability promise.
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/stream.rs"));
 }
@@ -188,8 +184,9 @@ pub use generated::rsbinder::stream::StreamEndpoint::StreamEndpoint;
 /// room and [`Sink::end`] never waits for the consumer to make it.
 ///
 /// 256 holds the 4-byte header, the two `int` status fields and a line of
-/// message, and is 0.4% of the default ring. A ring must be larger than
-/// this, and its largest item is `ring_bytes - END_RESERVE - 4`.
+/// message, and is 0.4% of the default ring. A ring must exceed this by
+/// more than an item header (`END_RESERVE + 4`), and its largest item is
+/// `ring_bytes - END_RESERVE - 4`.
 pub const END_RESERVE: usize = 256;
 
 /// What a [`Receiver`] is made with: the ring on the kernel path, the
@@ -197,7 +194,7 @@ pub const END_RESERVE: usize = 256;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReceiverPolicy {
     /// Kernel binder: bytes of ring the consumer allocates, and so the
-    /// most the producer can run ahead by. Must exceed [`END_RESERVE`];
+    /// most the producer can run ahead by. Must exceed [`END_RESERVE`]` + 4`;
     /// the largest item is `ring_bytes - END_RESERVE - 4`, so a stream of
     /// large items needs a larger ring. The memory is allocated up front
     /// and charged to the consumer's process.
@@ -343,13 +340,7 @@ impl std::fmt::Debug for Token {
 // Shared by both paths
 // ---------------------------------------------------------------------
 
-/// Register `recipient` for `binder`'s death; `Ok(None)` when `binder` is
-/// neither a kernel proxy nor an RPC proxy, which are the only two a death
-/// link can be put on. That is an object in this process — including a
-/// local wrapper standing in for a remote one, whose peer's death this
-/// stream therefore does not see. The returned `Arc` is what keeps the
-/// link alive — the binder holds only a `Weak`, and dropping it only makes
-/// the link inert, so the owner unlinks it (`unlink_death`).
+/// Link `recipient` to `binder`'s death, held alive by the returned `Arc`; `Ok(None)` if local.
 fn watch_death<R>(binder: &SIBinder, recipient: R) -> Result<Option<Arc<dyn crate::DeathRecipient>>>
 where
     R: crate::DeathRecipient + 'static,
@@ -368,11 +359,7 @@ where
     Ok(Some(recipient))
 }
 
-/// Undo what [`watch_death`] registered. Dropping the recipient leaves a
-/// dead `Weak` in the proxy's list, which never shrinks on its own: the
-/// kernel subscription stays, and a later `link_to_death` on the same
-/// proxy finds the list non-empty and never asks for one. Call it with no
-/// lock held — it reaches into the proxy.
+/// Undo `watch_death` (no lock held): a dropped `Arc` alone leaves the kernel subscription.
 fn unlink_death(binder: &SIBinder, recipient: &Option<Arc<dyn crate::DeathRecipient>>) {
     let Some(recipient) = recipient else { return };
     // Callers include `Drop`: a kernel proxy's `unlink_to_death` panics on
@@ -435,10 +422,7 @@ fn decode_item<T: Deserialize>(bytes: &[u8]) -> Result<T> {
 const UNCARRIABLE_TERMINATOR: &str =
     "the stream's producer ended with a status that cannot be carried";
 
-/// The terminator for a stream that lost items: a clean `EX_NONE` over
-/// lost items would read exactly like a stream that ran out, so it is
-/// replaced — but only when the producer has no failure of its own to
-/// report, which is the more specific answer.
+/// Terminator for lost items; a producer's own failure, being more specific, takes precedence.
 fn truncated_terminator(exception: i32, lost: i32) -> Option<String> {
     if lost <= 0 || exception != ExceptionCode::None as i32 {
         return None;
@@ -508,10 +492,7 @@ fn exception_from_i32(exception: i32) -> Result<ExceptionCode> {
         -7 => ExceptionCode::UnsupportedOperation,
         -8 => ExceptionCode::ServiceSpecific,
         -9 => ExceptionCode::Parcelable,
-        // -127 and -128 say "a blob precedes the real code", which a
-        // reply has and this call does not; -129 says the binder layer
-        // failed, which a call that arrived cannot report. Anything else
-        // is a peer speaking a code this build does not know.
+        // -127/-128 are reply-header markers, -129 a binder-layer failure: none arrives in a call.
         other => {
             log::error!("stream: {other} is not a valid stream terminator exception code");
             return Err(StatusCode::BadValue);
@@ -577,7 +558,7 @@ impl<T: Serialize + ?Sized> Sink<T> {
     ///   producer will not map (larger than
     ///   [`SinkPolicy::max_ring_bytes`], not sealed against shrinking,
     ///   no EventFlag word, or a descriptor that does not describe a
-    ///   ring), or a ring no larger than [`END_RESERVE`].
+    ///   ring), or a ring no larger than [`END_RESERVE`]` + 4`.
     /// - [`StatusCode::InvalidOperation`] when the transport cannot carry
     ///   the stream: on the RPC path, a session whose client did not open
     ///   incoming connections
@@ -600,7 +581,7 @@ impl<T: Serialize + ?Sized> Sink<T> {
     ///
     /// # Errors
     ///
-    /// Everything [`open`](Self::open) returns, plus
+    /// Everything [`open`](Self::open) returns, plus, on the RPC path,
     /// [`StatusCode::BadValue`] for an [`initial_credits`](SinkPolicy::initial_credits)
     /// of zero, or too large for the `int` that carries it. A window the
     /// consumer refuses is not an error here — `onStart` is `oneway` —
@@ -631,6 +612,11 @@ impl<T: Serialize + ?Sized> Sink<T> {
     ///
     /// # Errors
     ///
+    /// On the ring an error always means this item was not written,
+    /// whichever write failed — this call's, or a record a dropped
+    /// [`send_async`](Self::send_async) left on the pool, whose failure
+    /// the next call reports before writing anything.
+    ///
     /// - [`StatusCode::InvalidOperation`] once the consumer has
     ///   cancelled. Nothing further will be delivered, so stop.
     /// - [`StatusCode::DeadObject`] when the consumer's process is gone.
@@ -643,18 +629,28 @@ impl<T: Serialize + ?Sized> Sink<T> {
     ///   counters the consumer has moved out of their invariant, after
     ///   which nothing more can be written and every later call returns
     ///   it.
-    /// - Anything else is a batch send on the RPC path failing, and that
-    ///   batch's items are lost: [`end`](Self::end) tells the consumer
-    ///   how many went missing, so the stream ends as failed either way.
-    ///   A dead session, a refused transaction
-    ///   ([`StatusCode::FailedTransaction`]) or an expired send deadline
-    ///   ([`StatusCode::TimedOut`]) mean the batch did not arrive; its
-    ///   credit comes back and the stream stays usable. Any other failure
-    ///   leaves it unknown whether the batch arrived, and with it how
-    ///   much credit is left; the consumer ends a stream on a batch sent
-    ///   without credit, so nothing more is sent, and every later
-    ///   [`send`](Self::send) and [`flush`](Self::flush) returns the same
-    ///   error without queueing anything.
+    /// - Anything else is a batch send on the RPC path failing: the one
+    ///   this call made when the pending batch reached its threshold, or
+    ///   one a dropped `send_async` or [`flush_async`](Self::flush_async)
+    ///   left on the pool, whose failure the next call reports. The failed
+    ///   batch's items are lost, and [`end`](Self::end) tells the consumer
+    ///   how many, so the stream ends as failed either way. What follows
+    ///   depends on whether the batch arrived:
+    ///   - It did not — a dead session, a refused transaction
+    ///     ([`StatusCode::FailedTransaction`]), an expired send deadline
+    ///     ([`StatusCode::TimedOut`]), or a call refused before anything
+    ///     was sent for want of a free connection
+    ///     ([`StatusCode::WouldBlock`]). Its credit comes back and the
+    ///     stream stays usable. When the failed batch was an earlier one,
+    ///     this call's item was queued after it and is still pending; it
+    ///     goes out with the next flush. [`pending`](Self::pending) tells
+    ///     the two cases apart.
+    ///   - Unknown — any other failure. How much credit is left is then
+    ///     unknown too, and the consumer ends a stream on a batch sent
+    ///     without credit, so nothing more is sent: this and every later
+    ///     [`send`](Self::send) and [`flush`](Self::flush) return the same
+    ///     error without queueing anything, and items still pending are
+    ///     counted as lost at [`end`](Self::end).
     pub fn send(&mut self, item: &T) -> Result<()> {
         match &mut self.inner {
             SinkInner::Calls(p) => p.send(item),
@@ -682,7 +678,7 @@ impl<T: Serialize + ?Sized> Sink<T> {
     /// was dropped with its record still waiting for room, in which case
     /// it waits for that record. On the RPC path it sends the pending
     /// batch even if it is not full, blocking for credit when there is
-    /// something to send; it does nothing, and cannot block, when nothing
+    /// something to send; it sends nothing, and cannot block, when nothing
     /// is queued. There, batches leave on the byte threshold and on this
     /// call, never on a clock: a producer whose items arrive at their own
     /// pace — an event feed, a log tail — calls this after each event or
@@ -691,6 +687,13 @@ impl<T: Serialize + ?Sized> Sink<T> {
     /// bounded wait. Flushing after every item costs a producer on the
     /// ring nothing, so a producer unsure which path it is on can simply
     /// flush.
+    ///
+    /// The errors are those of [`send`](Self::send), including a
+    /// failure a dropped future left behind: this call reports it before
+    /// sending anything, and what it leaves pending follows the same
+    /// rules. On the RPC path with nothing queued, such a failure is
+    /// reported only once the dropped future's batch has settled; this
+    /// call does not wait for it.
     pub fn flush(&mut self) -> Result<()> {
         match &mut self.inner {
             SinkInner::Calls(p) => p.flush(),
@@ -704,7 +707,9 @@ impl<T: Serialize + ?Sized> Sink<T> {
     /// blocks for credit — unless the consumer has cancelled, in which
     /// case they are dropped and only the terminator goes out. On the
     /// ring the end record has room reserved for it ([`END_RESERVE`]),
-    /// so this never waits for the consumer.
+    /// so this never waits for the consumer — unless a `send_async`
+    /// future was dropped with its record still waiting for room, in
+    /// which case it waits for that record first.
     ///
     /// Call it on every path, including the failing ones —
     /// [`end_with`](Self::end_with) is that path. A `Sink` dropped
@@ -773,7 +778,10 @@ impl<T: Serialize + ?Sized> Sink<T> {
     /// leaves the item queued (RPC) or unwritten (ring). Dropping it
     /// mid-wait is safe too: a record or batch already handed to the pool
     /// still goes out, in its place, and the next call waits for it
-    /// first.
+    /// first. On the ring, a future dropped while it still waits for such
+    /// an earlier record drops its own item, and the terminator counts it
+    /// as lost: [`pending`](Self::pending) cannot tell the two cases apart,
+    /// so the stream does not end clean with the item missing.
     ///
     /// # Panics
     ///
@@ -883,9 +891,9 @@ impl<T: ?Sized> Sink<T> {
     /// Items accepted by [`send`](Self::send) or `send_async` and not
     /// yet on their way.
     ///
-    /// On the RPC path, the pending batch: zero right after
-    /// [`flush`](Self::flush) and after any `send` that crossed the byte
-    /// threshold, and a non-zero reading while the consumer reports
+    /// On the RPC path, the pending batch: zero right after a
+    /// [`flush`](Self::flush), or a `send` that crossed the byte
+    /// threshold, that returned `Ok`, and a non-zero reading while the consumer reports
     /// nothing arriving is the signature of a producer that should be
     /// flushing. On the ring, at most one: the record a dropped
     /// `send_async` future left waiting for room.
@@ -962,7 +970,7 @@ impl<T: Deserialize> Receiver<T> {
     /// # Errors
     ///
     /// [`StatusCode::BadValue`] for a ring no larger than
-    /// [`END_RESERVE`]; whatever allocating the ring fails with (memfd,
+    /// [`END_RESERVE`]` + 4`; whatever allocating the ring fails with (memfd,
     /// `fallocate`, seals); whatever linking to `peer`'s death fails with
     /// — [`StatusCode::DeadObject`] for a peer already gone.
     pub fn new(peer: &SIBinder) -> Result<(Self, StreamEndpoint)> {
@@ -1109,8 +1117,11 @@ impl<T: Deserialize> Receiver<T> {
     /// How the producer ended the stream, once it has.
     ///
     /// `None` while the stream is still running. After it ends this is
-    /// the status the producer passed to [`Sink::end`], including
-    /// `Status::ok()` for a stream that simply ran out.
+    /// the status the stream ended on: the one passed to [`Sink::end`] or
+    /// [`Sink::end_with`] (`Status::ok()` for a stream that ran out),
+    /// unless items were lost (`EX_ILLEGAL_STATE`, saying how many), the
+    /// producer died ([`StatusCode::DeadObject`]), or this side refused
+    /// what it read.
     pub fn end_status(&self) -> Option<Status> {
         match &self.inner {
             ReceiverInner::Calls(c) => c.end_status(),

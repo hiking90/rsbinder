@@ -105,11 +105,7 @@ impl Shared {
         }
     }
 
-    /// Write one record: `Ok(true)` once it is in, `Ok(false)` when there
-    /// is no room and `blocking` is off. With `blocking` on it waits for
-    /// `NOT_FULL` — and, for an item, sees a `CANCEL` — so it returns only
-    /// with the record in or with a reason. An end record is not held
-    /// back by a cancel: the caller's terminator still stands.
+    /// Write one record: no room is `Ok(false)` unless `blocking`; only an item yields to `CANCEL`.
     fn write_record(
         &self,
         header: u32,
@@ -210,14 +206,9 @@ impl WriteFailure {
     }
 }
 
-/// What a pool task left behind: for a producer, the record it carried;
-/// for a consumer, the wait it made. At most one is out at a time, and
-/// the owning thread waits for it before it writes or waits itself — a
-/// second record would overtake the first, and two waiters on one mask
-/// would consume each other's wake.
+/// What a pool task left behind: one at most, which the owner waits for before writing or waiting.
 #[derive(Default)]
 struct TransitState {
-    in_transit: bool,
     /// Items accepted and never written. Only the terminator reports them.
     lost: i32,
     /// A failure with nobody told yet; the next call returns it.
@@ -229,6 +220,8 @@ struct TransitState {
 #[derive(Default)]
 struct Transit {
     state: Mutex<TransitState>,
+    /// Written under `state`'s lock; read without it on the fast path.
+    in_transit: std::sync::atomic::AtomicBool,
     idle: Condvar,
     #[cfg(feature = "tokio")]
     notify: tokio::sync::Notify,
@@ -241,11 +234,12 @@ impl Transit {
 
     #[cfg(feature = "tokio")]
     fn begin(&self) {
-        self.lock().in_transit = true;
+        let _guard = self.lock();
+        self.in_transit.store(true, Ordering::SeqCst);
     }
 
     fn in_transit(&self) -> bool {
-        self.lock().in_transit
+        self.in_transit.load(Ordering::SeqCst)
     }
 
     fn lost(&self) -> i32 {
@@ -280,7 +274,7 @@ impl Transit {
                     state.broken.get_or_insert(e);
                 }
             }
-            state.in_transit = false;
+            self.in_transit.store(false, Ordering::SeqCst);
         }
         self.idle.notify_all();
         #[cfg(feature = "tokio")]
@@ -291,7 +285,7 @@ impl Transit {
     /// first.
     fn wait_idle_until(&self, deadline: Option<Instant>) -> bool {
         let mut state = self.lock();
-        while state.in_transit {
+        while self.in_transit.load(Ordering::SeqCst) {
             let Some(deadline) = deadline else {
                 state = self.idle.wait(state).unwrap_or_else(|e| e.into_inner());
                 continue;
@@ -319,7 +313,7 @@ impl Transit {
             // Created before the check: a `Notified` receives
             // `notify_waiters` from the moment it exists.
             let notified = self.notify.notified();
-            if !self.lock().in_transit {
+            if !self.in_transit.load(Ordering::SeqCst) {
                 return;
             }
             notified.await;
@@ -451,6 +445,18 @@ impl Drop for RecordInTransit {
     }
 }
 
+/// Counts a `send_async` item dropped while an earlier record held the pool: unwritten, unqueued.
+#[cfg(feature = "tokio")]
+struct Unhanded<'a>(&'a Transit);
+
+#[cfg(feature = "tokio")]
+impl Drop for Unhanded<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.lock();
+        state.lost = state.lost.saturating_add(1);
+    }
+}
+
 /// The producer over the ring: one record per item, written in place,
 /// waiting on `NOT_FULL` when the ring is full.
 pub(super) struct Producer<T: ?Sized> {
@@ -479,9 +485,10 @@ impl<T: Serialize + ?Sized> Producer<T> {
             StatusCode::from(e)
         })?;
         let capacity = queue.capacity();
-        if capacity <= END_RESERVE {
+        // An item record needs its header and a payload byte past the reserve.
+        if capacity <= END_RESERVE + HEADER {
             log::error!(
-                "Sink::open: a ring of {capacity} bytes leaves no room past the \
+                "Sink::open: a ring of {capacity} bytes leaves no room for an item past the \
                  {END_RESERVE}-byte reserve for the end record"
             );
             return Err(StatusCode::BadValue);
@@ -576,7 +583,9 @@ impl<T: Serialize + ?Sized> Producer<T> {
         let staged = self.encode(item);
         async move {
             let bytes = staged?;
+            let unhanded = Unhanded(&self.transit);
             self.transit.idle_async().await;
+            std::mem::forget(unhanded);
             self.reported()?;
             // Room now means no pool: the copy is the whole cost.
             if self.write_item(&bytes, false)? {
@@ -774,10 +783,7 @@ impl crate::DeathRecipient for ConsumerDeath {
     }
 }
 
-/// The sink binder of a ring endpoint. The producer links to its death
-/// and calls nothing on it; a call that arrives anyway is a peer
-/// speaking the RPC contract to a ring endpoint, and is logged and
-/// dropped.
+/// A ring endpoint's sink binder, a death link only; RPC-contract calls are logged and dropped.
 struct RingSink;
 
 impl Interface for RingSink {}
@@ -834,6 +840,7 @@ impl WaitInTransit {
 #[cfg(feature = "tokio")]
 impl Drop for WaitInTransit {
     fn drop(&mut self) {
+        // Not handed on: the consumer joins this wait before it looks, so it looks after the wake.
         self.transit.settle(self.failure, false, false);
     }
 }
@@ -867,16 +874,20 @@ pub(super) struct Consumer<T> {
     /// Scratch for the record being read: a record is copied out of the
     /// ring before anything interprets it.
     buf: Vec<u8>,
+    /// Test hook, run at the last point before a call commits to sleeping.
+    #[cfg(test)]
+    about_to_park: Option<Box<dyn FnMut() + Send>>,
     _item: PhantomData<fn() -> T>,
 }
 
 impl<T: Deserialize> Consumer<T> {
     /// Make the ring and the sink binder; the caller builds the endpoint.
     pub(super) fn new(policy: &ReceiverPolicy) -> Result<(Self, Ring, SIBinder)> {
-        if policy.ring_bytes <= END_RESERVE {
+        // Same bound as `Producer::open`: a header and a byte of payload past the reserve.
+        if policy.ring_bytes <= END_RESERVE + HEADER {
             log::error!(
-                "Receiver::new: a ring of {} bytes leaves no room past the {END_RESERVE}-byte \
-                 reserve for the end record",
+                "Receiver::new: a ring of {} bytes leaves no room for an item past the \
+                 {END_RESERVE}-byte reserve for the end record",
                 policy.ring_bytes
             );
             return Err(StatusCode::BadValue);
@@ -897,6 +908,8 @@ impl<T: Deserialize> Consumer<T> {
             finished: false,
             sink_binder: sink_binder.clone(),
             buf: Vec::new(),
+            #[cfg(test)]
+            about_to_park: None,
             _item: PhantomData,
         };
         Ok((consumer, ring, sink_binder))
@@ -941,6 +954,20 @@ impl<T: Deserialize> Consumer<T> {
             return None;
         }
         loop {
+            // Join before looking, like the producer: an orphan takes each wake until it settles.
+            if !matches!(wait, Wait::Never) && self.transit.in_transit() {
+                let deadline = match wait {
+                    Wait::Until(deadline) => Some(deadline),
+                    _ => None,
+                };
+                if !self.transit.wait_idle_until(deadline) {
+                    return None;
+                }
+                if let Some(e) = self.transit.take_unreported() {
+                    self.fail(Status::from(e));
+                }
+                continue;
+            }
             match self.step() {
                 Step::Item(item) => return Some(Ok(item)),
                 Step::End(status) => return self.finish(status),
@@ -951,14 +978,9 @@ impl<T: Deserialize> Consumer<T> {
                 Wait::Until(deadline) => Some(deadline),
                 Wait::Forever => None,
             };
-            // A wait a dropped future left on the pool is joined, not
-            // waited beside: two waiters on one mask consume each other's
-            // wake. Its own wake means something happened, so look again.
-            if self.transit.in_transit() {
-                if !self.transit.wait_idle_until(deadline) {
-                    return None;
-                }
-                continue;
+            #[cfg(test)]
+            if let Some(hook) = self.about_to_park.as_mut() {
+                hook();
             }
             let timeout = match deadline {
                 Some(deadline) => {
@@ -986,15 +1008,22 @@ impl<T: Deserialize> Consumer<T> {
             return None;
         }
         loop {
+            // As in `next`: a wait left on the pool is joined before the look.
+            if self.transit.in_transit() {
+                self.transit.idle_async().await;
+                if let Some(e) = self.transit.take_unreported() {
+                    self.fail(Status::from(e));
+                }
+                continue;
+            }
             match self.step() {
                 Step::Item(item) => return Some(Ok(item)),
                 Step::End(status) => return self.finish(status),
                 Step::Nothing => {}
             }
-            // As in `next`: a wait left on the pool is joined.
-            if self.transit.in_transit() {
-                self.transit.idle_async().await;
-                continue;
+            #[cfg(test)]
+            if let Some(hook) = self.about_to_park.as_mut() {
+                hook();
             }
             let wait = WaitInTransit::new(self.shared.clone(), self.transit.clone());
             if let Err(e) = on_pool(wait, |wait| {
@@ -1161,7 +1190,8 @@ impl<T> Drop for Consumer<T> {
     }
 }
 
-#[cfg(test)]
+// `MessageQueue::create` is `Unsupported` off Linux/Android.
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 mod tests {
     use super::*;
     #[cfg(feature = "tokio")]
@@ -1499,10 +1529,10 @@ mod tests {
     #[test]
     fn a_ring_no_larger_than_the_reserve_is_refused() {
         assert_eq!(
-            Consumer::<i32>::new(&receiver_policy(END_RESERVE)).err(),
+            Consumer::<i32>::new(&receiver_policy(END_RESERVE + HEADER)).err(),
             Some(StatusCode::BadValue)
         );
-        assert!(Consumer::<i32>::new(&receiver_policy(END_RESERVE + 1)).is_ok());
+        assert!(Consumer::<i32>::new(&receiver_policy(END_RESERVE + HEADER + 1)).is_ok());
     }
 
     #[test]
@@ -1577,6 +1607,31 @@ mod tests {
         );
     }
 
+    /// A live `recv_async` wait consumes its wake for good and leaves `NOT_EMPTY` clear.
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn a_finished_recv_async_wait_leaves_the_futex_clear() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .expect("runtime");
+        let (mut tx, mut rx) = pair::<i32>(512);
+        let got = runtime.block_on(async {
+            let mut pending = std::pin::pin!(rx.recv_async());
+            // One poll: nothing to read, so the wait goes to the pool.
+            let polled = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(pending.as_mut().poll(cx).is_pending())
+            })
+            .await;
+            assert!(polled);
+            tx.send(&7).expect("send");
+            pending.await
+        });
+        assert_eq!(got.expect("an item").expect("ok"), 7);
+        assert_eq!(rx.shared.flag.peek() & NOT_EMPTY, 0, "the wake is consumed");
+        assert_eq!(rx.try_recv().expect("no error"), None);
+    }
+
     /// A `recv_async` dropped mid-wait leaves its wait on the pool. The
     /// next call — sync or async — joins it rather than waiting beside
     /// it, so the wake the orphan consumes is not lost.
@@ -1599,13 +1654,21 @@ mod tests {
         });
         assert!(rx.transit.in_transit(), "the orphan is on the pool");
 
-        tx.send(&9).expect("send");
-        // The record is read at once; the orphan, which the write woke,
-        // settles on its own thread.
-        assert_eq!(
-            rx.recv_timeout(Duration::from_secs(5)).expect("no error"),
-            Some(9)
+        // The consumer parks first, so the orphan takes the write's wake.
+        let (done, watch) = mpsc::channel();
+        thread::spawn(move || {
+            let got = rx.recv_timeout(Duration::from_secs(5));
+            let _ = done.send((got, rx));
+        });
+        assert!(
+            watch.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the consumer must be parked behind the orphan"
         );
+        tx.send(&9).expect("send");
+        let (got, mut rx) = watch
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the write must release the consumer");
+        assert_eq!(got.expect("no error"), Some(9));
         let deadline = Instant::now() + Duration::from_secs(5);
         while rx.transit.in_transit() {
             assert!(Instant::now() < deadline, "the orphan must settle");
@@ -1618,12 +1681,126 @@ mod tests {
             let _ =
                 std::future::poll_fn(|cx| std::task::Poll::Ready(pending.as_mut().poll(cx))).await;
         });
+        let (done, watch) = mpsc::channel();
+        let handle = runtime.handle().clone();
+        thread::spawn(move || {
+            let got = handle.block_on(rx.recv_async());
+            let _ = done.send((got, rx));
+        });
+        assert!(
+            watch.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the async consumer must be parked behind the orphan"
+        );
         tx.send(&10).expect("send");
-        let got = runtime.block_on(rx.recv_async());
+        let (got, rx) = watch
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the write must release the async consumer");
         assert_eq!(got.expect("an item").expect("ok"), 10);
         drop(rx);
         // Dropping the consumer releases an orphan too; the runtime must
         // not be left waiting for a pool thread parked for good.
+        runtime.shutdown_timeout(Duration::from_secs(5));
+    }
+
+    /// Leave one `recv_async` wait on the pool.
+    #[cfg(feature = "tokio")]
+    fn park_an_orphan(runtime: &tokio::runtime::Runtime, rx: &mut Consumer<i32>) {
+        runtime.block_on(async {
+            let mut pending = std::pin::pin!(rx.recv_async());
+            let polled = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(pending.as_mut().poll(cx).is_pending())
+            })
+            .await;
+            assert!(polled, "nothing to read, so the wait goes to the pool");
+        });
+        assert!(rx.transit.in_transit(), "the orphan is on the pool");
+    }
+
+    /// §10.3's window: `recv` is held before sleeping; a record lands and an orphan takes the wake.
+    #[cfg(feature = "tokio")]
+    fn a_record_lands_in_the_window(
+        mut rx: Consumer<i32>,
+        mut tx: Producer<i32>,
+        recv: impl FnOnce(&mut Consumer<i32>) -> Option<i32> + Send + 'static,
+    ) -> (Option<i32>, Consumer<i32>) {
+        let (in_window, window) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        rx.about_to_park = Some(Box::new(move || {
+            let _ = in_window.send(());
+            let _ = released.recv_timeout(Duration::from_secs(5));
+        }));
+        let transit = rx.transit.clone();
+        let (done, watch) = mpsc::channel();
+        thread::spawn(move || {
+            let got = recv(&mut rx);
+            let _ = done.send((got, rx));
+        });
+        // Either held in the window or joined the orphan first; the record goes in either way.
+        let held = window.recv_timeout(Duration::from_millis(500)).is_ok();
+        tx.send(&9).expect("send");
+        if held {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while transit.in_transit() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the orphan must take the wake and settle"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            release
+                .send(())
+                .expect("the consumer is waiting in the hook");
+        }
+        let (got, mut rx) = watch
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the consumer call must return");
+        rx.about_to_park = None;
+        (got, rx)
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn a_record_that_lands_after_the_look_is_not_slept_through_by_recv() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .expect("runtime");
+        let (tx, mut rx) = pair::<i32>(512);
+        park_an_orphan(&runtime, &mut rx);
+        let (got, rx) = a_record_lands_in_the_window(rx, tx, |rx| {
+            rx.recv_timeout(Duration::from_secs(2)).expect("no error")
+        });
+        assert_eq!(
+            got,
+            Some(9),
+            "the record is in the ring; the call must not sleep past it"
+        );
+        drop(rx);
+        runtime.shutdown_timeout(Duration::from_secs(5));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn a_record_that_lands_after_the_look_is_not_slept_through_by_recv_async() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .expect("runtime");
+        let (tx, mut rx) = pair::<i32>(512);
+        park_an_orphan(&runtime, &mut rx);
+        let handle = runtime.handle().clone();
+        // Asleep past the record, this thread is held; the helper's bounded wait fails the test.
+        let (got, rx) = a_record_lands_in_the_window(rx, tx, move |rx| {
+            handle
+                .block_on(rx.recv_async())
+                .map(|item| item.expect("ok"))
+        });
+        assert_eq!(
+            got,
+            Some(9),
+            "the record is in the ring; the call must not sleep past it"
+        );
+        drop(rx);
         runtime.shutdown_timeout(Duration::from_secs(5));
     }
 
@@ -1709,6 +1886,48 @@ mod tests {
                 .contains("1 queued item"),
             "the given-up record is reported: {ended:?}"
         );
+        runtime.shutdown_timeout(Duration::from_secs(5));
+    }
+
+    /// A `send_async` dropped behind an orphan loses its item, and the terminator counts it.
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn a_send_async_dropped_behind_an_orphan_is_counted_lost() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .expect("runtime");
+        let (mut tx, mut rx) = pair::<i32>(512);
+        let fill = item_records(512) as i32;
+        for item in 0..fill {
+            tx.send(&item).expect("fills the ring");
+        }
+        runtime.block_on(async {
+            for item in [fill, fill + 1] {
+                let mut pending = std::pin::pin!(tx.send_async(&item));
+                let polled = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(pending.as_mut().poll(cx).is_pending())
+                })
+                .await;
+                assert!(polled, "item {item} waits");
+            }
+        });
+        assert_eq!(tx.pending(), 1, "only the first record is on the pool");
+        assert_eq!(tx.transit.lost(), 1, "the second item is counted");
+
+        let producer = thread::spawn(move || end(tx));
+        for expected in 0..=fill {
+            assert_eq!(rx.recv().expect("item").expect("ok"), expected);
+        }
+        let ended = rx.recv().expect("the end").expect_err("not a clean end");
+        assert!(
+            ended
+                .message()
+                .unwrap_or_default()
+                .contains("1 queued item"),
+            "the dropped item is reported: {ended:?}"
+        );
+        producer.join().expect("producer").expect("end");
         runtime.shutdown_timeout(Duration::from_secs(5));
     }
 

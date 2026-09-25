@@ -108,12 +108,15 @@ tweaks; wire formats are already locked.
   `wait_for_interface_async`, `check_interface_async`, `death_signal` /
   `DeathSignal`. Wire behavior is that of the synchronous calls they wrap.
 - **Streaming (new in 0.13.0)** — the `stream` module: `Sink`, `Receiver`,
-  and the two AIDL interfaces in `rsbinder/aidl/stream/`
-  (`rsbinder.stream.IStreamSink` / `IStreamSource`). The contract is rsbinder's
-  own rather than AOSP's, written as ordinary AIDL so a C++ or Java peer can be
-  either end. Validated rsbinder-to-rsbinder over kernel binder (two processes,
-  including a real Android driver) and over RPC; a gate against a C++ peer is
-  the remaining step. See [Streaming](./streaming.md).
+  and the three AIDL files in `rsbinder/aidl/stream/`: the
+  `rsbinder.stream.StreamEndpoint` parcelable (the ring's record layout and
+  EventFlag bits on the kernel path) and the two interfaces `IStreamSink` /
+  `IStreamSource` (the RPC path). The contract is rsbinder's own rather than
+  AOSP's, written as ordinary AIDL so a C++ or NDK peer can be either end (a
+  Java peer is out of scope: AOSP has no Java FMQ). Validated
+  rsbinder-to-rsbinder over kernel binder (two processes, including a real
+  Android driver) and over RPC; a gate against a C++ peer is the remaining
+  step. See [Streaming](./streaming.md).
 - **Observability (new in 0.13.0)** — the work source functions
   (`set_calling_work_source_uid` and the five beside it, the AOSP
   `IPCThreadState` set), `Remotable::transaction_name` with

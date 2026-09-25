@@ -1,15 +1,9 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! The RPC path: batches as `oneway` calls on `IStreamSink`, credit as
-//! `oneway` calls back on `IStreamSource`.
-//!
-//! A socket holds its sender until the peer reads, so a `oneway` call
-//! here is never refused for want of space the way a kernel `oneway` can
-//! be; what paces the producer is the credit the consumer grants, and the
-//! only failures are a session that ends and a frame that could not go
-//! out whole. The types here are what [`Sink`](super::Sink) and
-//! [`Receiver`](super::Receiver) wrap when the endpoint has no ring.
+//! The RPC path: batches as `oneway` calls on `IStreamSink`, credit as `oneway` calls back on
+//! `IStreamSource`; what [`Sink`](super::Sink) and [`Receiver`](super::Receiver) wrap without a ring.
+//! A socket send is never refused for want of space as a kernel `oneway` is, so credit alone paces.
 
 use std::collections::VecDeque;
 use std::marker::PhantomData;
@@ -193,12 +187,7 @@ impl Interface for SourceObject {}
 impl IStreamSource for SourceObject {
     fn r#request(&self, total: i64) -> BinderResult<()> {
         if total <= 0 {
-            // A total of nothing grants nothing, and a negative one would
-            // have to mean "take credit back", which the producer may
-            // already have spent. The call is `oneway`, so the log is the
-            // only place this can be said. A total seen before is not a
-            // mistake — it is a grant sent again — and is passed over in
-            // silence by `granted_up_to`.
+            // `oneway`: a non-positive total cannot be refused, only logged.
             log::warn!("stream: ignoring a granted total of {total}");
             return Ok(());
         }
@@ -216,11 +205,7 @@ impl IStreamSource for SourceObject {
 // Talking to a binder that may not know its own interface yet
 // ---------------------------------------------------------------------
 
-/// A sink or source binder, resolved once. An RPC proxy off the wire
-/// carries no descriptor, and a typed cast would stamp one permanently
-/// (`OnceLock`) onto the proxy the per-address cache shares, so it is
-/// driven by hand as [`cancel_remote`](crate::cancel::cancel_remote)
-/// drives one.
+/// Resolved once, driven by hand: a typed cast stamps a descriptor on a shared wire proxy for good.
 enum Peer<I: FromIBinder + ?Sized> {
     Typed(Strong<I>),
     #[cfg(feature = "rpc")]
@@ -342,22 +327,18 @@ enum Outcome {
     Unknown(StatusCode),
 }
 
-/// Whether a `oneway` send that failed with `e` is known not to have
-/// arrived. A dead session, a session that refused the transaction and a
-/// send deadline that expired before the frame went out whole all leave
-/// nothing the peer could dispatch; any other failure may have come after
-/// the frame was written, with the batch already on its way.
+/// `e` left the peer nothing to dispatch: refused, dead, or unsent (`TimedOut`, `WouldBlock`).
 fn certainly_not_delivered(e: StatusCode) -> bool {
     matches!(
         e,
-        StatusCode::FailedTransaction | StatusCode::DeadObject | StatusCode::TimedOut
+        StatusCode::FailedTransaction
+            | StatusCode::DeadObject
+            | StatusCode::TimedOut
+            | StatusCode::WouldBlock
     )
 }
 
-/// One batch between the pending buffer and the consumer, holding the
-/// credit taken for it. Delivered, refused, dropped by a pool task that
-/// never ran, or unwound past — every way out goes through `Drop`, which
-/// is where an undelivered batch gives its credit back and is counted.
+/// Batch and credit; `Drop`, the only exit, refunds an undelivered batch and counts it lost.
 struct BatchInTransit {
     credit: Arc<Credit>,
     ledger: Arc<Ledger>,
@@ -410,10 +391,7 @@ impl Drop for BatchInTransit {
             if let Some(e) = failure {
                 state.lost = state.lost.saturating_add(self.count);
                 state.unreported = Some(e);
-                // Given back, the credit would be one the consumer never
-                // issued if the batch did arrive, and the consumer ends a
-                // stream on a batch sent without credit. Kept, it would
-                // shrink the window for good if the batch did not.
+                // Delivery unknown: the credit can neither be given back nor kept safely.
                 if !not_delivered {
                     state.broken = Some(e);
                 }
@@ -428,10 +406,7 @@ impl Drop for BatchInTransit {
     }
 }
 
-/// The terminator on its way to the blocking pool. A pool task has the
-/// same ways out as a batch, and a terminator that goes nowhere leaves the
-/// consumer blocked with both processes alive — so one dropped unsent is
-/// sent from wherever the drop happens.
+/// Pool-bound terminator; `Drop` sends it if not run, or the consumer blocks with both ends alive.
 #[cfg(feature = "tokio")]
 struct TerminatorInTransit {
     peer: Arc<Peer<dyn IStreamSink>>,
@@ -474,9 +449,7 @@ impl Drop for TerminatorInTransit {
     }
 }
 
-/// The producer over the RPC path: items are encoded into a pending
-/// batch, which leaves as one `onBatch` call once it reaches the byte
-/// threshold or is flushed, and each batch spends one credit.
+/// RPC-path producer: a batch goes out as one `onBatch` for one credit, when full or flushed.
 pub(super) struct Producer<T: ?Sized> {
     /// Shared so an async send can move it onto the blocking pool.
     peer: Arc<Peer<dyn IStreamSink>>,
@@ -576,11 +549,10 @@ impl<T: Serialize + ?Sized> Producer<T> {
     pub(super) fn flush(&mut self) -> Result<()> {
         self.usable()?;
         if self.count == 0 {
-            return Ok(());
+            // Without blocking: a failure a dropped future's batch has already settled.
+            return self.reported();
         }
-        // A batch a dropped future left on the pool goes out first, or
-        // this one overtakes it; a failure that future could not report
-        // is this call's to return, before it sends anything more.
+        // A batch a dropped future left on the pool goes out first, and its failure is this call's.
         self.ledger.wait_idle();
         self.reported()?;
         self.credit.wait_credit()?;
@@ -678,7 +650,7 @@ impl<T: Serialize + ?Sized> Producer<T> {
     pub(super) async fn flush_async(&mut self) -> Result<()> {
         self.usable()?;
         if self.count == 0 {
-            return Ok(());
+            return self.reported();
         }
         // As in `flush`.
         self.ledger.idle_async().await;
@@ -707,8 +679,23 @@ impl<T: Serialize + ?Sized> Producer<T> {
     ) -> Result<()> {
         // As in `terminate`.
         self.ledger.idle_async().await;
-        let stale = self.ledger.take_unreported();
-        let failed = match (self.flush_async().await, stale) {
+        // Put back if the future is dropped at the await below, so `Drop` still reports it.
+        struct Stale(Arc<Ledger>, Option<StatusCode>);
+        impl Stale {
+            fn take(mut self) -> Option<StatusCode> {
+                self.1.take()
+            }
+        }
+        impl Drop for Stale {
+            fn drop(&mut self) {
+                if let Some(e) = self.1.take() {
+                    self.0.lock().unreported.get_or_insert(e);
+                }
+            }
+        }
+        let stale = Stale(self.ledger.clone(), self.ledger.take_unreported());
+        let flushed = self.flush_async().await;
+        let failed = match (flushed, stale.take()) {
             (Err(e), _) => {
                 // Nothing will send what that flush left queued.
                 self.abandon_pending();
@@ -742,10 +729,7 @@ impl<T: Serialize + ?Sized> Producer<T> {
             outcome: outcome.clone(),
             sent: false,
         };
-        // Set only now: everything above suspends, and a future dropped
-        // there has to leave `Drop` a stream still to terminate. From
-        // here the terminator is the token's to send, whatever becomes
-        // of this future or of the pool task.
+        // Set only now: a future dropped in the awaits above must leave `Drop` a stream to end.
         self.ended = true;
         let pooled = on_pool(terminator, |terminator| {
             terminator.send();
@@ -794,10 +778,7 @@ impl<T: ?Sized> Producer<T> {
         self.count as usize
     }
 
-    /// Take the pending batch out, leaving an empty one. The caller has
-    /// taken a credit for it, which the batch now holds. `None` when the
-    /// bytes could not be taken out; the ledger has that failure, and the
-    /// credit is back.
+    /// Take the pending batch with the caller's credit; `None`: failure in the ledger, credit back.
     fn take_pending(&mut self) -> Option<BatchInTransit> {
         let batch = std::mem::replace(&mut self.batch, Parcel::new_data_only());
         let count = std::mem::replace(&mut self.count, 0);
@@ -935,29 +916,20 @@ const ONEWAY_FLAGS: crate::TransactionFlags =
 // Consumer
 // ---------------------------------------------------------------------
 
-/// What the sink object receives and what the consumer has asked for,
-/// shared between the binder threads that deliver the producer's calls
-/// and the one thread or task that consumes.
+/// What the sink receives and the consumer asks for, shared by binder threads and the consumer.
 #[derive(Default)]
 struct StreamState {
-    /// Undecoded batches: bytes and the item count the producer stated.
-    /// Decoding happens on the consumer's thread so a malformed batch
-    /// surfaces as its error rather than being dropped on a binder
-    /// worker.
+    /// Raw batches, decoded on the consumer's thread so a malformed one surfaces as its error.
     batches: VecDeque<(Vec<u8>, i32)>,
-    /// Set once — by `onEnd`, by the producer's death, or by a grant that
-    /// could not be sent with nothing left to prompt another. `None`
-    /// while the stream runs.
+    /// Set once by `onEnd`, producer death, or a failed grant with nothing to prompt another.
     end: Option<Status>,
     /// Where to grant and cancel; `None` until `onStart` arrives.
     source: Option<Arc<Peer<dyn IStreamSource>>>,
     /// The same binder, kept for the unlink in the consumer's `Drop`.
     source_binder: Option<SIBinder>,
-    /// Holds the death link on the source; the binder keeps only a
-    /// `Weak`.
+    /// Holds the death link on the source; the binder keeps only a `Weak`.
     death: Option<Arc<dyn crate::DeathRecipient>>,
-    /// The consumer wants no more. An `onStart` that arrives after this
-    /// is answered with a cancel on the spot.
+    /// The consumer wants no more; an `onStart` arriving after this is cancelled on the spot.
     canceled: bool,
     /// The receiver is gone, so nothing will drain a batch again.
     closed: bool,
@@ -965,14 +937,9 @@ struct StreamState {
     declared: u32,
     /// Batches accepted into the queue.
     received: u64,
-    /// Batches the consumer has taken out of it. A grant is this number:
-    /// the running total `IStreamSource.request` carries. Under this lock
-    /// with the two below because the consumer's wait reads them.
+    /// Batches taken out; the running total a grant carries, read by the wait with the two below.
     drained: u64,
-    /// The highest total a grant has been tried with. Whether a failed
-    /// `oneway` send arrived cannot always be told, so a total that was
-    /// tried counts as one the producer may have — and being a total, it
-    /// counts once however often it is tried.
+    /// Highest total a grant tried; a failed `oneway` may have arrived, so the total counts once.
     announced: u64,
     /// The highest total a grant was sent with.
     granted: u64,
@@ -1048,12 +1015,7 @@ impl Stream {
         self.wake();
     }
 
-    /// End a stream the consumer's side gave up on. Unlike a terminator
-    /// or a death, the producer does not know: it is alive, will get no
-    /// more credit, and is released only by the cancel this returns.
-    /// `overriding` replaces an end already recorded — for a failure the
-    /// consumer is being handed, which outranks a terminator that arrived
-    /// first and would have `end_status` report success.
+    /// End a stream the consumer gave up on; `overriding` replaces an end already recorded.
     fn fail(&self, status: Status, overriding: bool) -> CancelDue {
         let source = {
             let mut state = self.lock();
@@ -1066,6 +1028,20 @@ impl Stream {
         };
         self.wake();
         CancelDue(source)
+    }
+
+    /// End the stream for a refused `onStart` unless a source is kept; true = cancel `source`.
+    fn refuse_start(&self, source: &SIBinder, status: Status) -> bool {
+        {
+            let mut state = self.lock();
+            if let Some(kept) = &state.source_binder {
+                return *kept != SIBinder::downgrade(source);
+            }
+            state.end.get_or_insert(status);
+            state.canceled = true;
+        }
+        self.wake();
+        true
     }
 }
 
@@ -1087,11 +1063,7 @@ impl Drop for CancelDue {
     }
 }
 
-/// One grant: the running total to announce. It holds nothing that has to
-/// be given back — what is owed is `drained - granted`, and a grant that
-/// is refused, or carried by a pool task that never ran, leaves `granted`
-/// where it was, so the next grant announces the same total or a higher
-/// one. The producer counts a total once however often it hears it.
+/// One grant: the running total to announce. A lost one leaves `granted` as it was, owing nothing.
 struct GrantToken {
     stream: Arc<Stream>,
     source: Arc<Peer<dyn IStreamSource>>,
@@ -1136,11 +1108,7 @@ fn send_grant(grant: GrantToken) -> Result<()> {
     Ok(())
 }
 
-/// Watches the producer — its source, and the peer the consumer was made
-/// with — and ends the stream the way a terminator does, with
-/// [`StatusCode::DeadObject`], so a consumer blocked in `recv` learns that
-/// no batch is coming without a case of its own. `Weak`, because the
-/// stream state owns this recipient.
+/// Ends the stream with `DeadObject` when the producer dies; `Weak` since the stream owns it.
 pub(super) struct SourceDeath(std::sync::Weak<Stream>);
 
 impl crate::DeathRecipient for SourceDeath {
@@ -1165,10 +1133,7 @@ impl IStreamSink for SinkObject {
                 "IStreamSink.onStart",
             )
         };
-        // Looked at before anything below can refuse: a second `onStart`
-        // is somebody else's mistake, and must not end a stream that is
-        // running, whatever it carries. The locked check further down
-        // settles a race.
+        // Early answer to a second `onStart`; `refuse_start` and the keep below settle the race.
         let second = self
             .0
             .lock()
@@ -1187,11 +1152,8 @@ impl IStreamSink for SinkObject {
         let peer = match resolve() {
             Ok(peer) => Arc::new(peer),
             Err(code) => {
-                // Without a usable source there is no way to grant, so
-                // the stream would stall after the opening window. Say
-                // so now; the call is `oneway`, so the consumer is the
-                // only one who can be told.
-                self.0.fail(Status::from(code), false).send();
+                // Without a source the stream stalls; `oneway`, so only the consumer can be told.
+                self.0.refuse_start(source, Status::from(code));
                 return Ok(());
             }
         };
@@ -1203,29 +1165,21 @@ impl IStreamSink for SinkObject {
                 self.0.max_opening
             );
             log::error!("stream: {message}");
-            // The producer has whatever it stated and would spend it on
-            // batches this stream discards, then park.
-            let _ = peer.cancel();
-            self.0
-                .fail(
-                    Status::from((ExceptionCode::IllegalArgument, message.as_str())),
-                    false,
-                )
-                .send();
+            let status = Status::from((ExceptionCode::IllegalArgument, message.as_str()));
+            if self.0.refuse_start(source, status) {
+                // The producer has whatever it stated and would spend it on
+                // batches this stream discards, then park.
+                let _ = peer.cancel();
+            }
             return Ok(());
         };
         // Linked before taking the lock: no binder call under it.
         let death = match watch_death(source, SourceDeath(Arc::downgrade(&self.0))) {
             Ok(death) => death,
             Err(code) => {
-                // Unwatched, a producer that dies leaves the consumer
-                // blocked for a batch that cannot come. The producer is
-                // told too: without this it spends its opening window on
-                // batches this stream now discards and then parks on
-                // credit no drain will ever prompt. `fail` cancels the
-                // source the stream kept, which this one never became.
-                let _ = peer.cancel();
-                self.0.fail(Status::from(code), false).send();
+                if self.0.refuse_start(source, Status::from(code)) {
+                    let _ = peer.cancel();
+                }
                 return Ok(());
             }
         };
@@ -1235,12 +1189,7 @@ impl IStreamSink for SinkObject {
             let mut state = self.0.lock();
             if let Some(kept_source) = &state.source_binder {
                 log::warn!("stream: ignoring a second onStart");
-                // A second producer that is not told parks on credit this
-                // stream will never grant, since every grant goes to the
-                // source kept above. The same producer sending `onStart`
-                // twice is the stream itself and must not be cancelled —
-                // compared through `WIBinder`, which is the identity that
-                // survives a proxy's resurrection.
+                // Only another producer is cancelled; `WIBinder` survives a proxy's resurrection.
                 cancel_now = *kept_source != SIBinder::downgrade(source);
             } else {
                 kept = !state.closed;
@@ -1271,11 +1220,7 @@ impl IStreamSink for SinkObject {
                 ExceptionCode::IllegalArgument,
                 "IStreamSink.onBatch needs a non-negative item count",
             ));
-            // The call is `oneway`, so this return value is logged and
-            // dropped; ending the stream is what reaches the consumer,
-            // which would otherwise read a peer that skipped a batch as
-            // one that sent every item. Same treatment as a batch whose
-            // bytes and `count` disagree (`Consumer::batch_failed`).
+            // oneway drops the returned error; ending the stream is what reaches the consumer.
             self.0.fail(status.clone(), false).send();
             return Err(status);
         }
@@ -1334,9 +1279,7 @@ enum Queued {
     Nothing,
 }
 
-/// The consumer over the RPC path: batches arrive on the sink object,
-/// are decoded on the consuming thread, and each drained batch is paid
-/// back with credit.
+/// RPC-path consumer: batches land on the sink, decode on the consuming thread, repaid in credit.
 pub(super) struct Consumer<T> {
     stream: Arc<Stream>,
     sink_binder: SIBinder,
@@ -1446,11 +1389,7 @@ impl<T: Deserialize> Consumer<T> {
     pub(super) async fn recv_async(&mut self) -> Option<BinderResult<T>> {
         self.retry_armed = true;
         loop {
-            // Created before looking: a `Notified` receives
-            // `notify_waiters` from the moment it exists, so a batch
-            // landing between the look and the await is not missed.
-            // Through a clone of the handle so the waiter does not borrow
-            // `self` across `advance_async`.
+            // Created before looking, so a batch landing before the await is not missed.
             let stream = self.stream.clone();
             let notified = stream.notify.notified();
             if let Some(done) = self.advance_async().await {
@@ -1460,12 +1399,7 @@ impl<T: Deserialize> Consumer<T> {
         }
     }
 
-    /// Hand out an item, or decode the next batch, or report the end.
-    /// `None` means nothing is queued and the stream is still running, so
-    /// the caller waits — and whatever credit was owed has been granted
-    /// first, because a producer out of credit sends nothing that would
-    /// prompt a later grant. `blocking` says the caller will then wait
-    /// without a bound, which is what can make that grant the last chance.
+    /// An item, the next batch decoded, or the end; `None` (nothing queued) grants owed credit.
     fn advance(&mut self, blocking: bool) -> Option<Option<BinderResult<T>>> {
         loop {
             if let Some(answer) = self.ready() {
@@ -1529,10 +1463,7 @@ impl<T: Deserialize> Consumer<T> {
                 Queued::End => return Some(self.finish()),
                 Queued::Nothing => {
                     if let Err(e) = on_pool(self.grant_due(true, true)?, send_grant).await {
-                        // The pool is gone, so what is owed can never be
-                        // sent from here, and nothing would wake a
-                        // consumer that went on to wait. The cancel goes
-                        // from this thread for the same reason.
+                        // No pool: the grant never goes out, and nothing wakes a parked consumer.
                         self.stream.fail(Status::from(e), false).send();
                     }
                     let ended = self.stream.lock().end.is_some();
@@ -1565,11 +1496,7 @@ impl<T: Deserialize> Consumer<T> {
         (Some(Err(e.into())), cancel)
     }
 
-    /// Whether a consumer with nothing to hand out has to park. An empty
-    /// queue and no end is not enough: credit that came back from a grant
-    /// nobody sent is one [`advance`](Self::advance) can send now, and the
-    /// producer may be parked waiting for exactly that. Credit that came
-    /// back from a grant that *failed* is not: that waits for a batch.
+    /// Park only with nothing queued, no end, and no grant to send (none owed, or the last failed).
     fn must_wait(&self, state: &StreamState) -> bool {
         if !state.batches.is_empty() || state.end.is_some() {
             return false;
@@ -1606,11 +1533,7 @@ impl<T: Deserialize> Consumer<T> {
     fn decode_batch(&mut self, bytes: &[u8], count: i32) -> Result<()> {
         let mut parcel = Parcel::from_slice(bytes);
         for decoded in 0..count {
-            // Checked rather than trusted: `count` comes off the wire,
-            // and without this a peer claiming `i32::MAX` items in an
-            // empty batch would spin here. It also rules out an item
-            // type that encodes to nothing, which no count could
-            // describe.
+            // `count` is off the wire: unchecked, an empty batch claiming `i32::MAX` items spins.
             if parcel.data_avail() == 0 {
                 log::error!("stream: batch claims {count} items, bytes ran out after {decoded}");
                 return Err(StatusCode::NotEnoughData);
@@ -1630,13 +1553,7 @@ impl<T: Deserialize> Consumer<T> {
         Ok(())
     }
 
-    /// The grant that is due now. With more batches already queued (`all`
-    /// false) none is due until half a window is owed, or the producer's
-    /// whole opening window if that is less; with nothing queued whatever
-    /// is owed is due. `blocking` says the caller is about to wait
-    /// without a bound: if the producer may be out of credit as well,
-    /// this grant is the last chance, and one that failed before is tried
-    /// again regardless.
+    /// The grant due now; on a starved producer's last chance, a retry that fails ends the stream.
     fn grant_due(&mut self, all: bool, blocking: bool) -> Option<GrantToken> {
         let mut state = self.stream.lock();
         if state.owed() == 0 {
@@ -1937,11 +1854,7 @@ mod tests {
         assert!(unwound.is_err());
     }
 
-    /// An item that left is either delivered or counted as lost, whichever
-    /// way the batch goes. Its credit comes back when the batch is known
-    /// not to have arrived. When that is not known there is no right
-    /// answer — given back, it may be credit the consumer never issued —
-    /// so the stream is marked broken and sends no more.
+    /// A departed item is delivered or lost; only sure non-arrival refunds, else the stream breaks.
     #[test]
     fn a_batch_in_transit_settles_on_every_way_out() {
         #[derive(Clone, Copy, Debug)]
@@ -2016,15 +1929,14 @@ mod tests {
         }
     }
 
-    /// A dead session, a refused transaction and an expired send deadline
-    /// all leave a frame the peer cannot dispatch; any other failure may
-    /// have come after the frame was written.
+    /// Refused, dead, timed out or `WouldBlock` left nothing to dispatch; other failures may have.
     #[test]
     fn what_a_failed_send_says_about_the_batch() {
         for (e, known) in [
             (StatusCode::FailedTransaction, true),
             (StatusCode::DeadObject, true),
             (StatusCode::TimedOut, true),
+            (StatusCode::WouldBlock, true),
             (StatusCode::Unknown, false),
             (StatusCode::BadValue, false),
         ] {
@@ -2085,12 +1997,7 @@ mod tests {
         );
     }
 
-    /// A grant is a running total, so however it goes — sent, refused, or
-    /// carried by a pool task that never ran — it is counted once: what
-    /// the producer may have been given does not grow with each try, and
-    /// what is owed stays owed until a grant is sent. A refusal with
-    /// nothing left to prompt a retry ends the stream instead: that is a
-    /// consumer about to block on a producer that may have no credit.
+    /// A grant's total counts once however it goes; a refusal nothing will retry ends the stream.
     #[test]
     fn a_grant_settles_on_every_way_out() {
         for last_chance in [false, true] {
@@ -2422,13 +2329,10 @@ mod tests {
         producer.join().expect("producer thread");
     }
 
-    /// A producer whose opening window is smaller than the consumer's
-    /// grant threshold runs out of credit before the threshold is ever
-    /// reached. The consumer has to grant what it owes before it waits,
-    /// or both ends wait on each other.
+    /// One opening batch, window eight, runs to the end: clamp or idle grant pays each batch back.
     #[test]
     fn an_opening_window_below_the_grant_threshold_does_not_stall() {
-        // Threshold is half of eight; the producer opens with one.
+        // Half of eight would be four; held to the one batch the producer opened with.
         let (mut rx, sink_binder) = Consumer::<i32>::new(&receiver_policy(8, 4));
         let mut sink = Producer::<i32>::open(&sink_binder, &sink_policy(4, 1)).expect("open");
 
@@ -2475,10 +2379,7 @@ mod tests {
         );
     }
 
-    /// An async producer waiting for credit gives the thread back. On a
-    /// current-thread runtime that is the difference between finishing
-    /// and deadlock: the consumer task that would grant the credit runs
-    /// on the same thread the producer would otherwise be parked on.
+    /// An async producer awaiting credit yields the thread; on one thread the consumer needs it.
     #[cfg(feature = "tokio")]
     #[test]
     fn an_async_producer_waits_for_credit_without_holding_the_thread() {
@@ -2815,6 +2716,14 @@ mod tests {
         let (_other_rx, not_a_source) = Consumer::<i32>::new(&ReceiverPolicy::default());
         sink.r#onStart(&not_a_source, 4).expect("onStart");
         assert!(rx.end_status().is_none());
+
+        // Nor one that passed the early check before the first was kept.
+        let refused = Status::from(ExceptionCode::IllegalArgument);
+        assert!(
+            rx.stream.refuse_start(&intruder, refused),
+            "another producer is cancelled"
+        );
+        assert!(rx.end_status().is_none());
     }
 
     /// With more queued, a grant waits for half a window to be owed —
@@ -2837,10 +2746,7 @@ mod tests {
         assert_eq!(calls.granted.load(Ordering::SeqCst), 2);
     }
 
-    /// A producer can make every grant fail while its process stays
-    /// alive, so no death link fires. However often the consumer retries,
-    /// what the producer may send does not grow: the bound on the queue
-    /// is the opening window.
+    /// Every grant failing, producer alive, no death link: retries must not raise what it may send.
     #[test]
     fn grants_that_keep_failing_do_not_raise_what_the_producer_may_send() {
         let (mut rx, sink, calls) = started::<i32>(2, 4, 4);
@@ -2907,10 +2813,7 @@ mod tests {
         assert!(rx.end_status().is_none());
     }
 
-    /// A consumer about to block has nobody to call it again. Whether a
-    /// failed grant is then the end depends on the producer: one with
-    /// credit left sends again and that prompts the retry; one without
-    /// waits for this grant, and both ends would wait for good.
+    /// Nobody re-calls a blocking recv: a failed grant ends it only if the producer may starve.
     #[test]
     fn a_blocking_consumer_gives_up_only_on_a_producer_that_may_be_out_of_credit() {
         // Credit to spare: four declared, one used.
