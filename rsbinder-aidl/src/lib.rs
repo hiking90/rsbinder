@@ -246,6 +246,14 @@ pub(crate) const BUILTIN_DECLS: &[BuiltinDecl] = &[
         filename: "<rsbinder-aidl>/android/hardware/common/fmq/UnsynchronizedWrite.aidl",
         source: include_str!("../aidl/android/hardware/common/fmq/UnsynchronizedWrite.aidl"),
     },
+    // rsbinder's own: the consumer's end of a stream (`rsbinder::stream`),
+    // which a user's `.aidl` takes or returns in the call that opens one.
+    BuiltinDecl {
+        fqcn: "rsbinder.stream.StreamEndpoint",
+        rust_path: "stream::StreamEndpoint",
+        filename: "<rsbinder-aidl>/rsbinder/stream/StreamEndpoint.aidl",
+        source: include_str!("../aidl/rsbinder/stream/StreamEndpoint.aidl"),
+    },
 ];
 
 pub(crate) fn builtin_decl(fqcn: &str) -> Option<&'static BuiltinDecl> {

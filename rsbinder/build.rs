@@ -128,9 +128,13 @@ fn main() {
     // Plan 10-7: the streaming contract. rsbinder's own package rather
     // than a vendored AOSP one — AOSP has no streaming interface — so it
     // sits in `aidl/stream/` under the package path the descriptor
-    // names. The two interfaces are the two directions of one stream and
-    // are compiled together into one module tree.
+    // names. The endpoint parcelable and the two interfaces (the two
+    // directions of the RPC path) are compiled together into one module
+    // tree; the endpoint's `MQDescriptor` field resolves to `fmq.rs` above.
     new_builder()
+        .source(PathBuf::from(
+            "aidl/stream/rsbinder/stream/StreamEndpoint.aidl",
+        ))
         .source(PathBuf::from(
             "aidl/stream/rsbinder/stream/IStreamSink.aidl",
         ))

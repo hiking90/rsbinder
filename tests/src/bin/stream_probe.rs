@@ -1,24 +1,22 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Streaming probe (Plan 10-7 Phase C, kernel half).
+//! Streaming probe (Plan 10-7b, kernel half).
 //!
 //! `rsbinder::stream`'s unit tests put both ends in one process and
-//! `tests/stream_rpc.rs` puts them on an RPC session. Neither runs a
-//! batch through the kernel driver, which is where three things this
+//! `tests/stream_rpc.rs` puts them on an RPC session. Neither carries the
+//! endpoint through the kernel driver, which is where three things this
 //! module depends on actually live:
 //!
-//! * `oneway` calls to one node stay in order, so the terminator cannot
-//!   overtake the batches it follows (`binder.c`, `async_todo`);
-//! * asynchronous transactions share half the receiving process's
-//!   mapping, a limit the credit window has to stay under or the driver
-//!   answers `FAILED_TRANSACTION` rather than blocking;
-//! * a consumer whose process is gone turns the producer's next batch
-//!   into `DeadObject` — and a producer parked for credit never gets
-//!   that far, which is the case `link_to_death` on the sink covers. The
-//!   consumer's own link, on the source that arrived in `onStart`, is
-//!   made from a binder thread inside a `oneway` handler, which only a
-//!   real driver exercises.
+//! * the ring's memfd crosses as a file descriptor inside the
+//!   `MQDescriptor`, and the producer maps memory the consumer allocated
+//!   and sealed in another process;
+//! * the two processes wake each other through the ring's futex word,
+//!   with no binder call carrying an item — so a long stream is paced by
+//!   the ring alone and never touches the receiver's asynchronous space;
+//! * a peer whose process is gone is seen only through a death link: a
+//!   producer parked on a full ring and a consumer parked on an empty
+//!   one have nothing in flight to fail.
 //!
 //! ```text
 //! stream_probe serve   <name>
@@ -36,7 +34,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use rsbinder::stream::{Receiver, Sink};
+use rsbinder::stream::{Receiver, ReceiverPolicy, Sink, SinkPolicy, StreamEndpoint};
 use rsbinder::*;
 
 include!(concat!(env!("OUT_DIR"), "/stream_demo.rs"));
@@ -55,20 +53,24 @@ impl Interface for DemoSvc {}
 impl IStreamDemo for DemoSvc {
     fn r#subscribe(
         &self,
-        sink: &SIBinder,
+        endpoint: &StreamEndpoint,
         count: i32,
         max_batch_bytes: i32,
         initial_credits: i32,
         delay_micros: i32,
     ) -> BinderResult<()> {
-        let mut producer =
-            Sink::<i32>::with_limits(sink, max_batch_bytes as usize, initial_credits as u32)?;
+        let policy = SinkPolicy {
+            max_batch_bytes: max_batch_bytes as usize,
+            initial_credits: initial_credits as u32,
+            ..SinkPolicy::default()
+        };
+        let mut producer = Sink::<i32>::open_with(endpoint, &policy)?;
         let sent = self.sent.clone();
         let finished = self.finished.clone();
         let last_error = self.last_error.clone();
         let delay = Duration::from_micros(delay_micros.max(0) as u64);
-        // The handler returns the source at once; the pushing happens on
-        // this thread, outside any transaction.
+        // The handler returns at once; the pushing happens on this
+        // thread, outside any transaction.
         thread::spawn(move || {
             let mut stopped_early = false;
             for item in 0..count {
@@ -98,7 +100,7 @@ impl IStreamDemo for DemoSvc {
     // RPC half; this probe exists for what only the driver shows.
     fn r#subscribeAsync(
         &self,
-        _sink: &SIBinder,
+        _endpoint: &StreamEndpoint,
         _count: i32,
         _max_batch_bytes: i32,
         _initial_credits: i32,
@@ -108,7 +110,7 @@ impl IStreamDemo for DemoSvc {
 
     fn r#subscribeFailing(
         &self,
-        _sink: &SIBinder,
+        _endpoint: &StreamEndpoint,
         _count: i32,
         _code: i32,
         _message: &str,
@@ -148,17 +150,27 @@ fn connect(name: &str) -> Result<Strong<dyn IStreamDemo>> {
     <dyn IStreamDemo as FromIBinder>::try_from(binder)
 }
 
-/// A consumer takes no wider an opening window than it was made for, so
-/// each mode makes one for the window it asks the service to open with.
-fn receiver_for(initial_credits: i32) -> (Receiver<i32>, SIBinder) {
-    Receiver::with_limits(4, initial_credits.max(1) as u32)
+/// A receiver against the service, its endpoint carrying a ring: the
+/// service is a kernel proxy here. `max_opening` only matters on the RPC
+/// path, and is kept so the same modes read the same on both halves.
+fn receiver_for(
+    demo: &Strong<dyn IStreamDemo>,
+    initial_credits: i32,
+) -> Result<(Receiver<i32>, StreamEndpoint)> {
+    Receiver::with_policy(
+        &demo.as_binder(),
+        &ReceiverPolicy {
+            max_opening: initial_credits.max(1) as u32,
+            ..ReceiverPolicy::default()
+        },
+    )
 }
 
 /// Take the whole stream and report what arrived.
 fn consume(name: &str, count: i32, max_batch_bytes: i32, initial_credits: i32) -> Result<()> {
     let demo = connect(name)?;
-    let (mut rx, sink_binder) = receiver_for(initial_credits);
-    demo.r#subscribe(&sink_binder, count, max_batch_bytes, initial_credits, 0)
+    let (mut rx, endpoint) = receiver_for(&demo, initial_credits)?;
+    demo.r#subscribe(&endpoint, count, max_batch_bytes, initial_credits, 0)
         .map_err(|e| e.transaction_error())?;
 
     let mut received = 0i32;
@@ -166,9 +178,9 @@ fn consume(name: &str, count: i32, max_batch_bytes: i32, initial_credits: i32) -
     let mut failure = None;
     for item in &mut rx {
         match item {
-            // Order is the point: the driver may not reorder `oneway`
-            // calls to one node, and a batch boundary must not drop or
-            // duplicate an item either.
+            // Order is the point: records leave the ring in the order
+            // they were committed, and neither end may drop or duplicate
+            // one at a wrap.
             Ok(item) => {
                 if item != received {
                     ordered = false;
@@ -192,8 +204,8 @@ fn consume(name: &str, count: i32, max_batch_bytes: i32, initial_credits: i32) -
 /// Subscribe, take `take` items, then leave without a word.
 ///
 /// `std::process::exit` rather than a return: the point is a consumer
-/// whose process is simply gone, so `Receiver::drop` must not get to send
-/// its cancel first.
+/// whose process is simply gone, so `Receiver::drop` must not get to set
+/// `CANCEL` first.
 fn die(
     name: &str,
     take: i32,
@@ -202,9 +214,9 @@ fn die(
     delay_micros: i32,
 ) -> Result<()> {
     let demo = connect(name)?;
-    let (mut rx, sink_binder) = receiver_for(initial_credits);
+    let (mut rx, endpoint) = receiver_for(&demo, initial_credits)?;
     demo.r#subscribe(
-        &sink_binder,
+        &endpoint,
         i32::MAX,
         max_batch_bytes,
         initial_credits,
@@ -231,14 +243,13 @@ fn die(
 
 /// Consume until the producer's process is killed out from under us.
 ///
-/// The mirror of `die`: the producer paces itself and holds credit to
-/// spare, so the consumer is blocked in `recv` with nothing in flight
-/// when the service goes. Only the death link on the source can end that
-/// wait.
+/// The mirror of `die`: the producer paces itself, so the consumer is
+/// parked on an empty ring with nothing in flight when the service goes.
+/// Only the death link on the peer can end that wait.
 fn orphan(name: &str) -> Result<()> {
     let demo = connect(name)?;
-    let (mut rx, sink_binder) = receiver_for(1_000_000);
-    demo.r#subscribe(&sink_binder, i32::MAX, 4, 1_000_000, 5000)
+    let (mut rx, endpoint) = receiver_for(&demo, 1_000_000)?;
+    demo.r#subscribe(&endpoint, i32::MAX, 4, 1_000_000, 5000)
         .map_err(|e| e.transaction_error())?;
 
     let mut received = 0;

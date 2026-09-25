@@ -6,15 +6,19 @@
 package rsbinder.stream;
 
 /**
- * The consumer end of a stream: the producer calls this to deliver items
- * and to say the stream is over.
+ * The consumer end of a stream over an RPC session: the producer calls
+ * this to deliver items and to say the stream is over.
+ *
+ * This interface is the RPC path only. A StreamEndpoint made against a
+ * kernel binder peer carries a ring, the items travel on it, and this
+ * object — still the endpoint's `sink` — is only linked to for death;
+ * no method here is called. StreamEndpoint.aidl has the ring's layout.
  *
  * rsbinder distributes this file so a C++ or Java peer can take part
  * without rsbinder on its side. Every method is `oneway`, which is what
- * keeps the calls in order: the kernel orders `oneway` calls to one node
- * against each other, but not against a `twoway` to a different node, so
- * a reply-carrying method here would let `onEnd` overtake the batches it
- * is supposed to follow.
+ * keeps the calls in order: a session orders `oneway` calls to one
+ * object against each other, so a reply-carrying method here would let
+ * `onEnd` overtake the batches it is supposed to follow.
  *
  * The shape is the reactive-streams one — `onStart` / `onBatch` /
  * `onEnd` here are `onSubscribe` / `onNext` / `onComplete`-or-`onError`

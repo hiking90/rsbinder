@@ -20,8 +20,9 @@
 //!   names `rsbinder::fmq::MQDescriptor` and `rsbinder::NativeHandle` for
 //!   those imports.
 //! * The queue — `MessageQueue`, `EventFlag`, `Descriptor`, `AttachPolicy`
-//!   — is `rsbinder-fmq`, re-exported here on Linux and Android, where the
-//!   shared memory and futex it needs exist.
+//!   — is `rsbinder-fmq`, re-exported here on every platform. Making or
+//!   attaching a queue works on Linux and Android, where the shared memory
+//!   and futex it needs exist, and returns `Error::Unsupported` elsewhere.
 //! * The two conversions below join them: an [`MQDescriptor`] that arrived in
 //!   a parcel becomes a `Descriptor` to attach to (`TryFrom<&MQDescriptor>`),
 //!   and a queue's `Descriptor` becomes the [`MQDescriptor`] to send
@@ -59,13 +60,10 @@ pub use generated::android::hardware::common::fmq::{
     GrantorDescriptor::GrantorDescriptor, MQDescriptor::MQDescriptor,
     SynchronizedReadWrite::SynchronizedReadWrite, UnsynchronizedWrite::UnsynchronizedWrite,
 };
-#[cfg(any(target_os = "linux", target_os = "android"))]
 pub use rsbinder_fmq::*;
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
 pub use convert::FlavorType;
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
 mod convert {
     use std::os::fd::OwnedFd;
 

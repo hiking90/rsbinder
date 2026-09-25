@@ -73,65 +73,62 @@ This changelog starts at 0.9.0. For earlier releases, see the
   the same fixture over the kernel driver is `tests/tests/fmq_binder.rs`).
   `rsbinder` uses the crate's ashmem detection for its shared-memory code.
 - **Streaming with back-pressure** (`rsbinder::stream`): `Sink<T>` for the
-  producer and `Receiver<T>` for the consumer. The consumer makes a receiver,
-  passes its sink binder to the service, and reads; the service wraps that
-  binder in a `Sink` and writes. Items are encoded with the same codec as
-  `to_bytes`, carried in batches sent once they reach `DEFAULT_MAX_BATCH_BYTES`
-  (a threshold, not a cap — a larger item goes out with the batch it was added
-  to), and the
-  producer waits once it has `DEFAULT_CREDIT_WINDOW` batches in flight with
-  none granted — `send`/`flush`/`end` park the thread, and with the `tokio`
-  feature `send_async`/`flush_async`/`end_async`/`end_with_async` suspend the
-  task instead and send from the blocking pool. `Receiver` yields
-  `BinderResult<T>` through `recv`, `try_recv`, `recv_timeout`, `Iterator`,
-  and `recv_async` with the `tokio` feature; no `futures-core` type appears in
-  the public API. The stream ends with a status, so a service-specific failure
-  reaches the consumer with its code and message intact even though the method
-  that started the stream already returned.
-  The contract is two ordinary AIDL interfaces shipped in
-  `rsbinder/aidl/stream/` — `rsbinder.stream.IStreamSink` (`onStart`,
-  `onBatch`, `onEnd`) and `IStreamSource` (`request`, `cancel`) — so a C++ or
-  Java peer can be either end. It is the reactive-streams shape — except that
-  `request(long total)` states a running total where reactive-streams'
-  `request(n)` adds `n`, so that a grant sent again is counted once — and every
-  call in it is `oneway`: the producer introduces itself with `onStart`, so
-  the method that starts a stream has nothing to return, and a credit grant
-  costs the consumer one local send rather than a wait on the producer's
-  threads. The consumer grants half a window at a time while batches keep
-  arriving and whatever it owes before it waits, so a producer whose opening
-  window is small does not stall; a grant that cannot be sent is retried, or
-  ends the stream when nothing would prompt a retry — a consumer about to
-  block on a producer that has used all the credit it is known to have.
-  `try_recv`, and `recv_timeout` with a timeout an `Instant` can express,
-  return to a caller who calls again, so there a failed grant never ends the
-  stream.
-  The producer states its opening window in `onStart`, and the consumer holds
-  it to that window plus what it has granted: a batch beyond it ends the
-  stream with `EX_ILLEGAL_STATE` rather than being queued, which bounds the
-  memory an untrusted producer — a client uploading to a service — can make
-  the consumer hold, at the opening window, however many grants that
-  producer makes fail. A batch the driver refuses (`FailedTransaction`, a
-  consumer whose `oneway` buffer is full) did not arrive, so its credit comes
-  back and the stream goes on, its items counted as lost; after any other
-  failure the producer cannot know how much credit it has, and sends only the
-  terminator. `Receiver::with_limits` sets the widest opening window a
-  consumer accepts (`DEFAULT_CREDIT_WINDOW` by default, the producer's own
-  default); a wider one is refused at the start with `EX_ILLEGAL_ARGUMENT`.
-  Batches leave on the byte threshold and on `flush`/`end`, never on a clock,
-  so a producer whose items arrive at their own pace calls `flush` to decide
-  when the consumer sees them; `Sink::pending` reports what is still queued.
-  Dropping a `Sink` without `end` delivers what credit allows and terminates
-  the stream with `EX_ILLEGAL_STATE` rather than leaving the consumer blocked
-  — that flush does not wait for credit, and the terminator's message says how
-  many items were lost. Dropping a `Receiver` cancels, releasing a producer
-  waiting for credit, including one that has not introduced itself yet.
-  Each end watches the other's binder for death, because back-pressure means
-  there is usually no call in flight to fail: a producer waiting for credit
-  and a consumer blocked in `recv` both end with `DeadObject` when the peer's
-  process goes, rather than waiting forever.
-  `Sink::new` refuses a transport that cannot carry a call to the consumer
-  outside a handler, which on the RPC stack means a client that opened no
-  incoming connections.
+  producer and `Receiver<T>` for the consumer. The consumer makes a receiver
+  against its **peer** — a binder in the producer's process —
+  (`Receiver::new(&peer)`), which yields a `StreamEndpoint`; that parcelable
+  travels in the one `twoway` call that opens the stream (as an argument for
+  a download, as the return value for an upload, where the client passes any
+  binder of its own or a `stream::Token`), and the service opens
+  `Sink::open(&endpoint)` on it. `rsbinder.stream.StreamEndpoint` is shipped
+  in `rsbinder/aidl/stream/` and `rsbinder-aidl` resolves an import of it to
+  `rsbinder::stream::StreamEndpoint`, so a service's own `.aidl` names it
+  without a copy. Items are encoded with the same codec as `to_bytes`; the
+  consumer's `T` need only agree on the wire.
+  Two transports, chosen by the peer. **Kernel binder** (and two ends in one
+  process): the endpoint carries a ring — a synchronized Fast Message Queue
+  of bytes (`rsbinder::fmq`) the consumer allocates, sealed and charged to
+  itself, and the producer maps. Each item is one record written in place,
+  `send` parks on the ring's futex while the ring is full and `recv` while it
+  is empty, and after the opening call no binder call carries anything in
+  either direction. `ReceiverPolicy::ring_bytes` (default 64 KiB) is the
+  whole of the flow control and bounds the largest item at
+  `ring_bytes - END_RESERVE - 4`; `SinkPolicy::max_ring_bytes` (default
+  4 MiB) is the largest ring a producer maps. The last `END_RESERVE`
+  (256) bytes are kept free of items so the end record always has room and
+  `Sink::end`, and a dropped `Sink`, never wait for the consumer.
+  `StreamEndpoint.aidl` documents the record layout and the EventFlag bits
+  (`NOT_FULL`, `NOT_EMPTY`, and `CANCEL`, waited on by the producer alone),
+  which a C++ peer on `libfmq` implements against. A ring whose counters or
+  headers break the contract ends the stream with `EX_ILLEGAL_STATE` and
+  sets `CANCEL`. **RPC**: the endpoint carries only the consumer's sink and
+  the stream is the two `oneway` interfaces `rsbinder.stream.IStreamSink`
+  (`onStart`, `onBatch`, `onEnd`) and `IStreamSource` (`request`, `cancel`),
+  credit-based: the producer states an opening window of batches
+  (`SinkPolicy::initial_credits`, default 4), sends batches of up to
+  `SinkPolicy::max_batch_bytes` (default 16 KiB, a threshold not a cap), and
+  the consumer grants more as it drains (`ReceiverPolicy::credit_window`) and
+  refuses a window wider than `ReceiverPolicy::max_opening` with
+  `EX_ILLEGAL_ARGUMENT`, holding the producer to its credit so an untrusted
+  producer cannot make it queue without bound. `request(long total)` states a
+  running total so a grant sent again counts once. `Sink::open` refuses a
+  session whose client opened no incoming connections rather than failing on
+  the first batch. On the RPC path `flush` sends the pending batch and a
+  producer whose items arrive at their own pace calls it; on the ring nothing
+  is queued and `flush` returns at once.
+  `send`/`flush`/`end` park the thread; with the `tokio` feature
+  `send_async`/`flush_async`/`end_async`/`end_with_async` and `recv_async`
+  make their wait from the blocking pool (a futex cannot be polled, so on the
+  ring each wait holds one pool thread). `Receiver` yields `BinderResult<T>`
+  through `recv`, `try_recv`, `recv_timeout`, `Iterator` and `recv_async`;
+  no `futures-core` type appears in the public API. The stream ends with a
+  status, so a service-specific failure reaches the consumer with its code
+  and message intact after the opening call already returned; a dropped
+  `Sink` ends it with `EX_ILLEGAL_STATE` without waiting for the consumer,
+  and a dropped `Receiver` cancels, releasing a parked producer. Each end
+  watches the other's binder for death — the producer the endpoint's sink,
+  the consumer its peer — because back-pressure leaves nothing in flight to
+  fail: a producer parked for room and a consumer parked for an item both
+  end with `DeadObject` when the peer's process goes.
 - **Work source API** (AOSP `IPCThreadState` / Java `Binder` work source):
   `set_calling_work_source_uid`, `get_calling_work_source_uid`,
   `clear_calling_work_source`, `restore_calling_work_source`,
