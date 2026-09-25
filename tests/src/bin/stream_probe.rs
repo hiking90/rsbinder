@@ -30,12 +30,17 @@
 //! stream_probe upload  <name> <count> <ringBytes>
 //! stream_probe vanish  <name> <sendN>
 //! stream_probe status  <name>
+//! stream_probe serve-rpc <socketPath>          (feature `rpc`)
 //! ```
 //!
-//! Every mode but `serve` prints one `RESULT` line;
+//! Every mode but `serve` and `serve-rpc` prints one `RESULT` line;
 //! `tests/scripts/run_stream_ac.sh` drives them. The `subscribe` call's
 //! batch and credit arguments only shape the RPC path, so the probe
 //! passes the producer's defaults and lets the ring do the pacing.
+//!
+//! `serve-rpc` is the same service as the root of an `RpcServer` on a
+//! Unix socket, for a libbinder `RpcSession` client to stream against
+//! (`example-hello/cpp/run_stream_rpc_interop.sh`).
 
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
@@ -79,6 +84,9 @@ impl IStreamDemo for DemoSvc {
             ..SinkPolicy::default()
         };
         let mut producer = Sink::<i32>::open_with(endpoint, &policy)?;
+        // Per stream, so a client polling `finished` does not see the previous stream's.
+        self.finished.store(false, Ordering::SeqCst);
+        self.last_error.store(0, Ordering::SeqCst);
         let sent = self.sent.clone();
         let finished = self.finished.clone();
         let last_error = self.last_error.clone();
@@ -171,6 +179,8 @@ impl IStreamDemo for DemoSvc {
         let finished = self.upload_finished.clone();
         let error = self.upload_error.clone();
         ordered.store(true, Ordering::SeqCst);
+        finished.store(false, Ordering::SeqCst);
+        error.store(0, Ordering::SeqCst);
         thread::spawn(move || {
             let mut expected = 0i32;
             while let Some(item) = rx.recv() {
@@ -215,6 +225,20 @@ fn serve(name: &str) -> Result<()> {
     let demo = BnStreamDemo::new_binder(DemoSvc::default());
     let server = rsbinder::serve("binder://")?.add(name, Interface::as_binder(&demo))?;
     println!("SERVING {name}");
+    use std::io::Write;
+    std::io::stdout().flush().ok();
+    server.run()
+}
+
+/// The service as an RPC root: a libbinder client asks for the root object, not a name.
+#[cfg(feature = "rpc")]
+fn serve_rpc(path: &str) -> Result<()> {
+    let server = rsbinder::rpc::RpcServer::setup_unix_server(path)?;
+    server.set_android13plus(2);
+    // Batches, grants and cancels are oneway calls from the client; a few threads take them.
+    server.set_max_threads(4);
+    server.set_root(BnStreamDemo::new_binder(DemoSvc::default()).as_binder())?;
+    println!("SERVING {path}");
     use std::io::Write;
     std::io::stdout().flush().ok();
     server.run()
@@ -559,7 +583,8 @@ fn main() {
              \x20      stream_probe orphan <name>\n\
              \x20      stream_probe upload <name> <count> <ringBytes>\n\
              \x20      stream_probe vanish <name> <sendN>\n\
-             \x20      stream_probe status <name>"
+             \x20      stream_probe status <name>\n\
+             \x20      stream_probe serve-rpc <socketPath>"
         );
         std::process::exit(2)
     };
@@ -584,6 +609,8 @@ fn main() {
         (Some("upload"), 5) => upload(&args[2], num(3), size(4)),
         (Some("vanish"), 4) => vanish(&args[2], num(3)),
         (Some("status"), 3) => status(&args[2]),
+        #[cfg(feature = "rpc")]
+        (Some("serve-rpc"), 3) => serve_rpc(&args[2]),
         _ => usage(),
     };
     if let Err(e) = r {

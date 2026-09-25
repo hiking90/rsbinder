@@ -89,7 +89,13 @@ This changelog starts at 0.9.0. For earlier releases, see the
   AddressSanitizer (both compiled with the host's `cc`);
   `example-hello/cpp/run_stream_interop.sh` runs an NDK client
   against rsbinder on an Android emulator in both directions — order, the end
-  status, back-pressure, cancel, both deaths, an oversized item.
+  status, back-pressure, cancel, both deaths, an oversized item — and the same
+  cases with a second client whose ring is AOSP's own `libfmq`
+  (`AidlMessageQueue` and `EventFlag`, the ring libcutils ashmem when libfmq
+  makes it), writing only the records and bits itself.
+  `example-hello/cpp/run_stream_rpc_interop.sh` runs the RPC path against the
+  device's libbinder `RpcSession` in both directions: order and grant totals,
+  the end status, cancel, and a death on either side.
 - **Streaming with back-pressure** (`rsbinder::stream`): `Sink<T>` for the
   producer and `Receiver<T>` for the consumer. The consumer makes a receiver
   against its **peer** — a binder in the producer's process —
