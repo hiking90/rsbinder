@@ -9,8 +9,9 @@
 //! module depends on actually live:
 //!
 //! * the ring's memfd crosses as a file descriptor inside the
-//!   `MQDescriptor`, and the producer maps memory the consumer allocated
-//!   and sealed in another process;
+//!   `MQDescriptor` — in an argument for a download, in a reply for an
+//!   upload — and the producer maps memory the consumer allocated and
+//!   sealed in another process;
 //! * the two processes wake each other through the ring's futex word,
 //!   with no binder call carrying an item — so a long stream is paced by
 //!   the ring alone and never touches the receiver's asynchronous space;
@@ -20,21 +21,30 @@
 //!
 //! ```text
 //! stream_probe serve   <name>
-//! stream_probe consume <name> <count> <maxBatchBytes> <initialCredits>
-//! stream_probe die     <name> <takeN> <maxBatchBytes> <initialCredits> <delayMicros>
+//! stream_probe consume <name> <count> <ringBytes>
+//! stream_probe pause   <name> <count> <ringBytes> <takeN>
+//! stream_probe crowd   <name> <streams> <count>
+//! stream_probe die     <name> <takeN> <ringBytes> <delayMicros>
+//! stream_probe cancel  <name> <takeN> <ringBytes>
 //! stream_probe orphan  <name>
+//! stream_probe upload  <name> <count> <ringBytes>
+//! stream_probe vanish  <name> <sendN>
 //! stream_probe status  <name>
 //! ```
 //!
-//! `consume`, `die`, `orphan` and `status` each print one `RESULT` line;
-//! `tests/scripts/run_stream_ac.sh` drives them.
+//! Every mode but `serve` prints one `RESULT` line;
+//! `tests/scripts/run_stream_ac.sh` drives them. The `subscribe` call's
+//! batch and credit arguments only shape the RPC path, so the probe
+//! passes the producer's defaults and lets the ring do the pacing.
 
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use rsbinder::stream::{Receiver, ReceiverPolicy, Sink, SinkPolicy, StreamEndpoint};
+use rsbinder::stream::{
+    Receiver, ReceiverPolicy, Sink, SinkPolicy, StreamEndpoint, Token, END_RESERVE,
+};
 use rsbinder::*;
 
 include!(concat!(env!("OUT_DIR"), "/stream_demo.rs"));
@@ -46,6 +56,10 @@ struct DemoSvc {
     sent: Arc<AtomicI32>,
     finished: Arc<AtomicBool>,
     last_error: Arc<AtomicI32>,
+    uploaded: Arc<AtomicI32>,
+    upload_ordered: Arc<AtomicBool>,
+    upload_finished: Arc<AtomicBool>,
+    upload_error: Arc<AtomicI32>,
 }
 
 impl Interface for DemoSvc {}
@@ -70,7 +84,8 @@ impl IStreamDemo for DemoSvc {
         let last_error = self.last_error.clone();
         let delay = Duration::from_micros(delay_micros.max(0) as u64);
         // The handler returns at once; the pushing happens on this
-        // thread, outside any transaction.
+        // thread, outside any transaction, and blocks there whenever the
+        // ring is full.
         thread::spawn(move || {
             let mut stopped_early = false;
             for item in 0..count {
@@ -129,6 +144,62 @@ impl IStreamDemo for DemoSvc {
     fn r#lastError(&self) -> BinderResult<i32> {
         Ok(self.last_error.load(Ordering::SeqCst))
     }
+
+    /// The service is the consumer. The receiver — and with it the ring
+    /// and the death link on `producer` — is made here, inside the
+    /// handler on a binder thread, and the endpoint goes back in the
+    /// reply; the reading happens on a thread of its own.
+    fn r#upload(&self, producer: &SIBinder, ring_bytes: i32) -> BinderResult<StreamEndpoint> {
+        let (mut rx, endpoint) = Receiver::<i32>::with_policy(
+            producer,
+            &ReceiverPolicy {
+                ring_bytes: ring_bytes.max(0) as usize,
+                ..ReceiverPolicy::default()
+            },
+        )?;
+        let uploaded = self.uploaded.clone();
+        let ordered = self.upload_ordered.clone();
+        let finished = self.upload_finished.clone();
+        let error = self.upload_error.clone();
+        ordered.store(true, Ordering::SeqCst);
+        thread::spawn(move || {
+            let mut expected = 0i32;
+            while let Some(item) = rx.recv() {
+                match item {
+                    Ok(item) => {
+                        if item != expected {
+                            ordered.store(false, Ordering::SeqCst);
+                        }
+                        expected += 1;
+                        uploaded.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Err(status) => {
+                        eprintln!("stream_probe: upload ended with {status:?}");
+                        error.store(i32::from(status.transaction_error()), Ordering::SeqCst);
+                        break;
+                    }
+                }
+            }
+            finished.store(true, Ordering::SeqCst);
+        });
+        Ok(endpoint)
+    }
+
+    fn r#uploaded(&self) -> BinderResult<i32> {
+        Ok(self.uploaded.load(Ordering::SeqCst))
+    }
+
+    fn r#uploadOrdered(&self) -> BinderResult<bool> {
+        Ok(self.upload_ordered.load(Ordering::SeqCst))
+    }
+
+    fn r#uploadFinished(&self) -> BinderResult<bool> {
+        Ok(self.upload_finished.load(Ordering::SeqCst))
+    }
+
+    fn r#uploadError(&self) -> BinderResult<i32> {
+        Ok(self.upload_error.load(Ordering::SeqCst))
+    }
 }
 
 fn serve(name: &str) -> Result<()> {
@@ -140,8 +211,8 @@ fn serve(name: &str) -> Result<()> {
     server.run()
 }
 
-fn connect(name: &str) -> Result<Strong<dyn IStreamDemo>> {
-    let binder = rsbinder::Client::open("binder://")
+fn connect_via(uri: &str, name: &str) -> Result<Strong<dyn IStreamDemo>> {
+    let binder = rsbinder::Client::open(uri)
         .and_then(|_| hub::check_service(name).ok_or(StatusCode::NameNotFound))?;
     if binder.as_remote().is_none() {
         eprintln!("stream_probe: {name} is local to this process, not a proxy");
@@ -150,41 +221,67 @@ fn connect(name: &str) -> Result<Strong<dyn IStreamDemo>> {
     <dyn IStreamDemo as FromIBinder>::try_from(binder)
 }
 
-/// A receiver against the service, its endpoint carrying a ring: the
-/// service is a kernel proxy here. `max_opening` only matters on the RPC
-/// path, and is kept so the same modes read the same on both halves.
+fn connect(name: &str) -> Result<Strong<dyn IStreamDemo>> {
+    connect_via("binder://", name)
+}
+
+/// A receiver against the service, its endpoint carrying a ring of
+/// `ring_bytes`: the service is a kernel proxy here.
 fn receiver_for(
     demo: &Strong<dyn IStreamDemo>,
-    initial_credits: i32,
+    ring_bytes: usize,
 ) -> Result<(Receiver<i32>, StreamEndpoint)> {
     Receiver::with_policy(
         &demo.as_binder(),
         &ReceiverPolicy {
-            max_opening: initial_credits.max(1) as u32,
+            ring_bytes,
             ..ReceiverPolicy::default()
         },
     )
 }
 
-/// Take the whole stream and report what arrived.
-fn consume(name: &str, count: i32, max_batch_bytes: i32, initial_credits: i32) -> Result<()> {
-    let demo = connect(name)?;
-    let (mut rx, endpoint) = receiver_for(&demo, initial_credits)?;
-    demo.r#subscribe(&endpoint, count, max_batch_bytes, initial_credits, 0)
-        .map_err(|e| e.transaction_error())?;
+/// `subscribe` with the RPC path's arguments at the producer's defaults;
+/// on a ring they are not read.
+fn subscribe(
+    demo: &Strong<dyn IStreamDemo>,
+    endpoint: &StreamEndpoint,
+    count: i32,
+    delay_micros: i32,
+) -> Result<()> {
+    let defaults = SinkPolicy::default();
+    demo.r#subscribe(
+        endpoint,
+        count,
+        defaults.max_batch_bytes as i32,
+        defaults.initial_credits as i32,
+        delay_micros,
+    )
+    .map_err(|e| e.transaction_error())
+}
 
+/// Items of an `i32` stream that fit the part of a ring items may use:
+/// each is a 4-byte header and a 4-byte payload.
+fn ring_items(ring_bytes: usize) -> i32 {
+    ((ring_bytes - END_RESERVE) / 8) as i32
+}
+
+/// Drain `rx` to the end and say what came: items, whether they were
+/// `from..` in order, and how the stream ended.
+fn drain(rx: &mut Receiver<i32>, from: i32) -> (i32, bool, String) {
     let mut received = 0i32;
+    let mut expected = from;
     let mut ordered = true;
     let mut failure = None;
-    for item in &mut rx {
+    for item in rx {
         match item {
             // Order is the point: records leave the ring in the order
             // they were committed, and neither end may drop or duplicate
             // one at a wrap.
             Ok(item) => {
-                if item != received {
+                if item != expected {
                     ordered = false;
                 }
+                expected += 1;
                 received += 1;
             }
             Err(status) => {
@@ -197,7 +294,112 @@ fn consume(name: &str, count: i32, max_batch_bytes: i32, initial_credits: i32) -
         Some(detail) => format!("err:{detail}"),
         None => "ok".to_string(),
     };
+    (received, ordered, ended)
+}
+
+/// Take the whole stream and report what arrived.
+fn consume(name: &str, count: i32, ring_bytes: usize) -> Result<()> {
+    let demo = connect(name)?;
+    let (mut rx, endpoint) = receiver_for(&demo, ring_bytes)?;
+    subscribe(&demo, &endpoint, count, 0)?;
+    let (received, ordered, ended) = drain(&mut rx, 0);
     println!("RESULT consume {received} {ordered} {ended}");
+    Ok(())
+}
+
+/// Take `take` items, stop reading, and watch the producer stop at the
+/// ring's capacity; then read the rest.
+///
+/// No clock decides anything here. After `take` records have been read
+/// out, the ring is empty and the producer can write exactly
+/// [`ring_items`] more before its `send` blocks — so the service's
+/// `sent` counter must come to rest at `take + ring_items`, with the
+/// producer not finished. The probe polls for that value (the poll is
+/// bounded by the script's `timeout`, which is the only clock), and
+/// treats a higher one as a ring that admitted more than it holds.
+fn pause(name: &str, count: i32, ring_bytes: usize, take: i32) -> Result<()> {
+    let demo = connect(name)?;
+    let (mut rx, endpoint) = receiver_for(&demo, ring_bytes)?;
+    subscribe(&demo, &endpoint, count, 0)?;
+
+    let mut taken = 0i32;
+    let mut ordered = true;
+    while taken < take {
+        match rx.recv() {
+            Some(Ok(item)) => {
+                if item != taken {
+                    ordered = false;
+                }
+                taken += 1;
+            }
+            Some(Err(status)) => {
+                println!("RESULT pause ERROR {status:?}");
+                return Ok(());
+            }
+            None => {
+                println!("RESULT pause ERROR ended-early");
+                return Ok(());
+            }
+        }
+    }
+
+    let full = take + ring_items(ring_bytes);
+    let mut sent;
+    loop {
+        sent = demo.r#sent().map_err(|e| e.transaction_error())?;
+        if sent >= full {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    // Read once more: the counter rose to `full` and must stay there —
+    // an overshoot would mean the ring admitted more than it holds.
+    let again = demo.r#sent().map_err(|e| e.transaction_error())?;
+    let finished = demo.r#finished().map_err(|e| e.transaction_error())?;
+    let parked = sent == full && again == full && !finished;
+    if !parked {
+        eprintln!("stream_probe: sent={sent} again={again} finished={finished} full={full}");
+    }
+
+    let (rest, rest_ordered, ended) = drain(&mut rx, take);
+    let received = taken + rest;
+    let ordered = ordered && rest_ordered;
+    println!("RESULT pause {received} {ordered} parked={parked} {ended}");
+    Ok(())
+}
+
+/// `streams` streams from one service at once, into a process whose
+/// binder mapping is a single page.
+///
+/// A page is the smallest mapping `binder://?mmap=` accepts. Twelve
+/// rings' worth of items would be refused many times over if any of it
+/// went through that mapping; on the ring nothing does, so the only
+/// binder traffic is the `subscribe` calls and their empty replies.
+fn crowd(name: &str, streams: usize, count: i32) -> Result<()> {
+    let page = rustix::param::page_size();
+    let demo = connect_via(&format!("binder://?mmap={page}"), name)?;
+    let mut receivers = Vec::with_capacity(streams);
+    for _ in 0..streams {
+        let (rx, endpoint) = Receiver::<i32>::new(&demo.as_binder())?;
+        subscribe(&demo, &endpoint, count, 0)?;
+        receivers.push(rx);
+    }
+    let workers: Vec<_> = receivers
+        .into_iter()
+        .map(|mut rx| thread::spawn(move || drain(&mut rx, 0)))
+        .collect();
+    let mut total = 0i32;
+    let mut ordered = true;
+    let mut ended = "ok".to_string();
+    for worker in workers {
+        let (received, in_order, end) = worker.join().expect("a consumer thread");
+        total += received;
+        ordered &= in_order;
+        if end != "ok" && ended == "ok" {
+            ended = end;
+        }
+    }
+    println!("RESULT crowd {streams} {total} {ordered} {ended}");
     Ok(())
 }
 
@@ -206,23 +408,10 @@ fn consume(name: &str, count: i32, max_batch_bytes: i32, initial_credits: i32) -
 /// `std::process::exit` rather than a return: the point is a consumer
 /// whose process is simply gone, so `Receiver::drop` must not get to set
 /// `CANCEL` first.
-fn die(
-    name: &str,
-    take: i32,
-    max_batch_bytes: i32,
-    initial_credits: i32,
-    delay_micros: i32,
-) -> Result<()> {
+fn die(name: &str, take: i32, ring_bytes: usize, delay_micros: i32) -> Result<()> {
     let demo = connect(name)?;
-    let (mut rx, endpoint) = receiver_for(&demo, initial_credits)?;
-    demo.r#subscribe(
-        &endpoint,
-        i32::MAX,
-        max_batch_bytes,
-        initial_credits,
-        delay_micros,
-    )
-    .map_err(|e| e.transaction_error())?;
+    let (mut rx, endpoint) = receiver_for(&demo, ring_bytes)?;
+    subscribe(&demo, &endpoint, i32::MAX, delay_micros)?;
 
     let mut received = 0;
     while received < take {
@@ -241,6 +430,33 @@ fn die(
     std::process::exit(0);
 }
 
+/// Take `take` items and drop the receiver, which cancels.
+///
+/// The ring is small and the producer unpaced, so it is parked in the
+/// futex wait for room when the `CANCEL` bit is set; the wait returns
+/// and its `send` reports `InvalidOperation`. A return, not an exit:
+/// `Receiver::drop` is the point.
+fn cancel(name: &str, take: i32, ring_bytes: usize) -> Result<()> {
+    let demo = connect(name)?;
+    let (mut rx, endpoint) = receiver_for(&demo, ring_bytes)?;
+    subscribe(&demo, &endpoint, i32::MAX, 0)?;
+
+    let mut received = 0;
+    while received < take {
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(Some(_)) => received += 1,
+            Ok(None) => break,
+            Err(status) => {
+                println!("RESULT cancel ERROR {status:?}");
+                return Ok(());
+            }
+        }
+    }
+    drop(rx);
+    println!("RESULT cancel {received}");
+    Ok(())
+}
+
 /// Consume until the producer's process is killed out from under us.
 ///
 /// The mirror of `die`: the producer paces itself, so the consumer is
@@ -248,9 +464,8 @@ fn die(
 /// Only the death link on the peer can end that wait.
 fn orphan(name: &str) -> Result<()> {
     let demo = connect(name)?;
-    let (mut rx, endpoint) = receiver_for(&demo, 1_000_000)?;
-    demo.r#subscribe(&endpoint, i32::MAX, 4, 1_000_000, 5000)
-        .map_err(|e| e.transaction_error())?;
+    let (mut rx, endpoint) = receiver_for(&demo, ReceiverPolicy::default().ring_bytes)?;
+    subscribe(&demo, &endpoint, i32::MAX, 5000)?;
 
     let mut received = 0;
     let outcome = loop {
@@ -267,15 +482,90 @@ fn orphan(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Push `count` items into the service and report what it took.
+///
+/// The `Token` is the binder the service watches; it lives until the
+/// stream has ended on both sides.
+fn upload(name: &str, count: i32, ring_bytes: usize) -> Result<()> {
+    let demo = connect(name)?;
+    let token = Token::new();
+    let endpoint = demo
+        .r#upload(&token.binder(), ring_bytes as i32)
+        .map_err(|e| e.transaction_error())?;
+    let mut tx = Sink::<i32>::open(&endpoint)?;
+    for item in 0..count {
+        tx.send(&item)?;
+    }
+    tx.end()?;
+    // The end record is in the ring; the service's thread has yet to
+    // read it. Polled on the service's own flag, bounded by the script's
+    // `timeout`.
+    while !demo.r#uploadFinished().map_err(|e| e.transaction_error())? {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let uploaded = demo.r#uploaded().map_err(|e| e.transaction_error())?;
+    let ordered = demo.r#uploadOrdered().map_err(|e| e.transaction_error())?;
+    let err = demo.r#uploadError().map_err(|e| e.transaction_error())?;
+    let ended = if err == 0 {
+        "ok".to_string()
+    } else {
+        format!("err:{err}")
+    };
+    println!("RESULT upload {uploaded} {ordered} {ended}");
+    drop(token);
+    Ok(())
+}
+
+/// Ask for an upload endpoint, push `send` items into it, and leave
+/// without ending the stream.
+///
+/// With `send` at zero the process is gone before it has even mapped the
+/// ring: the service's consumer is parked on an empty ring it made a
+/// moment ago, and only the death link on the token can release it.
+fn vanish(name: &str, send: i32) -> Result<()> {
+    let demo = connect(name)?;
+    let token = Token::new();
+    let endpoint = demo
+        .r#upload(&token.binder(), ReceiverPolicy::default().ring_bytes as i32)
+        .map_err(|e| e.transaction_error())?;
+    let mut sent = 0;
+    if send > 0 {
+        let mut tx = Sink::<i32>::open(&endpoint)?;
+        for item in 0..send {
+            tx.send(&item)?;
+            sent += 1;
+        }
+        std::mem::forget(tx);
+    }
+    println!("RESULT vanish {sent}");
+    use std::io::Write;
+    std::io::stdout().flush().ok();
+    // Neither the sink's end record nor the token's unlink: the process
+    // is simply gone.
+    std::process::exit(0);
+}
+
 fn status(name: &str) -> Result<()> {
     let demo = connect(name)?;
-    let sent = demo.r#sent().map_err(|e| e.transaction_error())?;
-    let finished = demo.r#finished().map_err(|e| e.transaction_error())?;
-    let err = demo.r#lastError().map_err(|e| e.transaction_error())?;
+    let code = |e: Status| e.transaction_error();
+    let sent = demo.r#sent().map_err(code)?;
+    let finished = demo.r#finished().map_err(code)?;
+    let err = demo.r#lastError().map_err(code)?;
+    let uploaded = demo.r#uploaded().map_err(code)?;
+    let up_ordered = demo.r#uploadOrdered().map_err(code)?;
+    let up_finished = demo.r#uploadFinished().map_err(code)?;
+    let up_err = demo.r#uploadError().map_err(code)?;
     // Compared here rather than in the shell: the integer is a
     // discriminant of this build's `StatusCode`, not a wire constant.
-    let dead = err == i32::from(StatusCode::DeadObject);
-    println!("RESULT status sent={sent} finished={finished} dead={dead} err={err}");
+    let dead_code = i32::from(StatusCode::DeadObject);
+    let dead = err == dead_code;
+    let canceled = err == i32::from(StatusCode::InvalidOperation);
+    let up_dead = up_err == dead_code;
+    println!(
+        "RESULT status sent={sent} finished={finished} dead={dead} canceled={canceled} err={err} \
+         up_received={uploaded} up_ordered={up_ordered} up_finished={up_finished} \
+         up_dead={up_dead} up_err={up_err}"
+    );
     Ok(())
 }
 
@@ -285,9 +575,14 @@ fn main() {
     let usage = || -> ! {
         eprintln!(
             "usage: stream_probe serve <name>\n\
-             \x20      stream_probe consume <name> <count> <maxBatchBytes> <initialCredits>\n\
-             \x20      stream_probe die <name> <takeN> <maxBatchBytes> <initialCredits> <delayMicros>\n\
+             \x20      stream_probe consume <name> <count> <ringBytes>\n\
+             \x20      stream_probe pause <name> <count> <ringBytes> <takeN>\n\
+             \x20      stream_probe crowd <name> <streams> <count>\n\
+             \x20      stream_probe die <name> <takeN> <ringBytes> <delayMicros>\n\
+             \x20      stream_probe cancel <name> <takeN> <ringBytes>\n\
              \x20      stream_probe orphan <name>\n\
+             \x20      stream_probe upload <name> <count> <ringBytes>\n\
+             \x20      stream_probe vanish <name> <sendN>\n\
              \x20      stream_probe status <name>"
         );
         std::process::exit(2)
@@ -297,11 +592,21 @@ fn main() {
             .and_then(|a| a.parse().ok())
             .unwrap_or_else(|| usage())
     };
+    let size = |i: usize| -> usize {
+        args.get(i)
+            .and_then(|a| a.parse().ok())
+            .unwrap_or_else(|| usage())
+    };
     let r = match (args.get(1).map(String::as_str), args.len()) {
         (Some("serve"), 3) => serve(&args[2]),
-        (Some("consume"), 6) => consume(&args[2], num(3), num(4), num(5)),
-        (Some("die"), 7) => die(&args[2], num(3), num(4), num(5), num(6)),
+        (Some("consume"), 5) => consume(&args[2], num(3), size(4)),
+        (Some("pause"), 6) => pause(&args[2], num(3), size(4), num(5)),
+        (Some("crowd"), 5) => crowd(&args[2], size(3), num(4)),
+        (Some("die"), 6) => die(&args[2], num(3), size(4), num(5)),
+        (Some("cancel"), 5) => cancel(&args[2], num(3), size(4)),
         (Some("orphan"), 3) => orphan(&args[2]),
+        (Some("upload"), 5) => upload(&args[2], num(3), size(4)),
+        (Some("vanish"), 4) => vanish(&args[2], num(3)),
         (Some("status"), 3) => status(&args[2]),
         _ => usage(),
     };

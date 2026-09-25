@@ -1,16 +1,17 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-// Plan 10-7 fixture: a service that streams integers into an endpoint
-// the caller supplies.
+// Plan 10-7 / 10-7b fixture: a service that streams integers into an
+// endpoint the caller supplies, and takes a stream the caller pushes.
 //
 // `rsbinder.stream.StreamEndpoint` resolves to `rsbinder::stream::
 // StreamEndpoint` — rsbinder-aidl ships the declaration — so the service
 // opens a `Sink` on exactly what the caller's `Receiver` made. Which
 // transport the stream runs on is decided by the caller's peer: over
 // kernel binder the endpoint carries a ring, over an RPC session only the
-// sink. The methods return nothing: the stream's own records or calls
-// carry everything.
+// sink. The `subscribe*` methods return nothing: the stream's own
+// records or calls carry everything. `upload` is the other direction
+// and returns the endpoint the caller then pushes into.
 package streamdemo;
 
 import rsbinder.stream.StreamEndpoint;
@@ -48,4 +49,30 @@ interface IStreamDemo {
     // mid-stream is only visible to the producer this way, and only on
     // kernel binder — which is why `run_stream_ac.sh` exists.
     int lastError();
+
+    // The upload direction: the caller is the producer. `producer` is a
+    // binder in the caller's process — a `rsbinder::stream::Token` will
+    // do — that the service's `Receiver::new` picks the transport by and
+    // watches for death; it is made inside this handler, on a binder
+    // thread. On kernel binder the ring is `ringBytes` long, allocated
+    // here and charged to the service. The service takes the whole
+    // stream on a thread of its own; the `upload*` getters report what
+    // it saw.
+    StreamEndpoint upload(IBinder producer, int ringBytes);
+
+    // How many items the upload consumer has taken so far.
+    int uploaded();
+
+    // Whether every item taken so far was the next integer in sequence.
+    boolean uploadOrdered();
+
+    // Whether the upload consumer's thread has left its loop: the stream
+    // ended, cleanly or not.
+    boolean uploadFinished();
+
+    // The `StatusCode` the upload stream ended with, as its integer
+    // value, or 0 while it runs or after a clean end. A producer that
+    // dies is visible to the consumer only this way — through the death
+    // link on `producer` — and only on kernel binder.
+    int uploadError();
 }

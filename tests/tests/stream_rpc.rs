@@ -33,7 +33,7 @@ use std::time::Duration;
 use rsbinder::rpc::{RpcClientConfig, RpcServer, RpcSession};
 use rsbinder::stream::{Receiver, ReceiverPolicy, Sink, SinkPolicy, StreamEndpoint};
 use rsbinder::{
-    BinderResult, ExceptionCode, FromIBinder, Interface, Status, Strong, TransportCaps,
+    BinderResult, ExceptionCode, FromIBinder, Interface, SIBinder, Status, Strong, TransportCaps,
 };
 
 include!(concat!(env!("OUT_DIR"), "/stream_demo.rs"));
@@ -51,6 +51,10 @@ struct DemoSvc {
     sent: Arc<AtomicI32>,
     finished: Arc<AtomicBool>,
     last_error: Arc<AtomicI32>,
+    uploaded: Arc<AtomicI32>,
+    upload_ordered: Arc<AtomicBool>,
+    upload_finished: Arc<AtomicBool>,
+    upload_error: Arc<AtomicI32>,
 }
 
 impl Interface for DemoSvc {}
@@ -195,6 +199,59 @@ impl IStreamDemo for DemoSvc {
 
     fn r#lastError(&self) -> BinderResult<i32> {
         Ok(self.last_error.load(Ordering::SeqCst))
+    }
+
+    // The upload direction is exercised by the kernel half
+    // (`stream_probe`); this implementation keeps the fixture whole.
+    fn r#upload(&self, producer: &SIBinder, ring_bytes: i32) -> BinderResult<StreamEndpoint> {
+        let (mut rx, endpoint) = Receiver::<i32>::with_policy(
+            producer,
+            &ReceiverPolicy {
+                ring_bytes: ring_bytes.max(0) as usize,
+                ..ReceiverPolicy::default()
+            },
+        )?;
+        let uploaded = self.uploaded.clone();
+        let ordered = self.upload_ordered.clone();
+        let finished = self.upload_finished.clone();
+        let error = self.upload_error.clone();
+        ordered.store(true, Ordering::SeqCst);
+        thread::spawn(move || {
+            let mut expected = 0i32;
+            while let Some(item) = rx.recv() {
+                match item {
+                    Ok(item) => {
+                        if item != expected {
+                            ordered.store(false, Ordering::SeqCst);
+                        }
+                        expected += 1;
+                        uploaded.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Err(status) => {
+                        error.store(i32::from(status.transaction_error()), Ordering::SeqCst);
+                        break;
+                    }
+                }
+            }
+            finished.store(true, Ordering::SeqCst);
+        });
+        Ok(endpoint)
+    }
+
+    fn r#uploaded(&self) -> BinderResult<i32> {
+        Ok(self.uploaded.load(Ordering::SeqCst))
+    }
+
+    fn r#uploadOrdered(&self) -> BinderResult<bool> {
+        Ok(self.upload_ordered.load(Ordering::SeqCst))
+    }
+
+    fn r#uploadFinished(&self) -> BinderResult<bool> {
+        Ok(self.upload_finished.load(Ordering::SeqCst))
+    }
+
+    fn r#uploadError(&self) -> BinderResult<i32> {
+        Ok(self.upload_error.load(Ordering::SeqCst))
     }
 }
 
