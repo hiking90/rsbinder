@@ -26,6 +26,21 @@ fn test_missing_semicolon() {
     }
 }
 
+// AOSP `ParseInt` on the token text: a suffix or separator is a parse error, never a typed literal.
+#[test]
+fn test_transaction_code_is_a_plain_decimal() {
+    for code in ["200u8", "3L", "1_0"] {
+        let input = format!("interface IFoo {{\n    void m() = {code};\n}}");
+        let err = expect_parse_error(&input, "test.aidl");
+        let AidlError::Parse(pe) = &err else {
+            panic!("expected a parse error for `{code}`, got {err:?}");
+        };
+        assert_eq!(pe.message, format!("Could not parse int value: {code}"));
+    }
+    let ctx = SourceContext::new("test.aidl", "interface IFoo {\n    void m() = 200;\n}");
+    parse_document(&ctx).expect("a plain decimal is accepted");
+}
+
 // Completely invalid input
 #[test]
 fn test_completely_invalid_input() {

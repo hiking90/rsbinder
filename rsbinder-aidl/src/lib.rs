@@ -899,6 +899,30 @@ impl Builder {
                 });
             }
         }
+        // AOSP `AidlTypenames` "redefinition": one qualified name declared in two files.
+        let mut defined: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
+        for document in &documents {
+            let package = document.1.package.as_deref().unwrap_or_default();
+            for decl in &document.1.decls {
+                let qualified = if package.is_empty() {
+                    decl.name().to_string()
+                } else {
+                    format!("{package}.{}", decl.name())
+                };
+                // Within one file `Generator::document` reports it, with a span.
+                let Some(earlier) = defined.insert(qualified.clone(), &document.2.filename) else {
+                    continue;
+                };
+                if earlier != document.2.filename {
+                    return Err(AidlError::Config {
+                        message: format!(
+                            "type '{qualified}' is defined in both {earlier} and {}",
+                            document.2.filename
+                        ),
+                    });
+                }
+            }
+        }
         self.emit_rerun_if_changed();
         Self::emit_warnings(&documents);
 

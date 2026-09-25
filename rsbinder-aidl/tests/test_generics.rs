@@ -109,10 +109,7 @@ pub mod GenericStructuredParcelable {
     );
 }
 
-/// A use site names the arguments on the Rust path: bare, as an array
-/// element, as a `List` element, nested (`Foo<Bar<int>>` and
-/// `Foo<int, Bar<int>>` are the two `>>` grammar shapes), and under a
-/// `@nullable` that belongs to the whole field.
+/// Type arguments reach the Rust path: bare, array/`List` element, nested, under field `@nullable`.
 #[test]
 fn type_arguments_reach_the_rust_path() {
     let out = generate(
@@ -205,14 +202,15 @@ fn fixed_size_requirement_is_checked_at_the_use_site() {
     assert!(msg.contains("FixedSizeNonFixedField"), "{msg}");
 }
 
-/// An annotation on a type argument is refused at parse time, as AOSP's
-/// grammar refuses it: `@nullable` belongs to the whole field, so there is
-/// no `Option` to put inside the argument list.
+/// Every type argument's annotation is refused at parse time; AOSP refuses only the first's.
 #[test]
 fn type_argument_cannot_be_annotated() {
     for input in [
         "package p; parcelable Q<T, F> { int a; } parcelable E { int x; } enum F { A } \
          parcelable Use { Q<@nullable E, F> a; }",
+        "package p; parcelable Q<T, F> { int a; } parcelable E { int x; } \
+         parcelable Use { Q<E, @nullable E> a; }",
+        "package p; parcelable Use { Map<String, @nullable String> a; }",
         "package p; parcelable Use { List<@nullable String> a; }",
         "package p; parcelable Q<T> { int a; } parcelable Use { Q<@utf8InCpp String> a; }",
     ] {
@@ -396,10 +394,7 @@ fn type_parameter_declaration_is_validated() {
     )
     .is_ok());
 
-    // A parameter is spelled bare in the generated Rust: a keyword, a name
-    // the templates use unqualified, the runtime crate's own name, or the
-    // declaration's own name cannot be one. Checked by the generator, where
-    // the crate mode is known.
+    // A parameter is spelled bare in the generated Rust; the generator refuses these names.
     for (name, what) in [
         ("String", "a name the generated Rust spells unqualified"),
         ("Vec", "a name the generated Rust spells unqualified"),
@@ -515,10 +510,7 @@ fn generic_union_is_rejected() {
     assert!(msg.contains("union 'U' is generic"), "{msg}");
 }
 
-/// Importing `android.hardware.common.fmq.MQDescriptor` without a vendored
-/// `.aidl` resolves to the runtime crate's type, with the argument
-/// requirement (`@FixedSize T`) still enforced, and generates no module for
-/// the builtin itself.
+/// An imported builtin FMQ type maps to the runtime crate, enforces `@FixedSize`, emits no module.
 #[test]
 fn builtin_fmq_types_map_to_the_runtime_crate() {
     let dir = scratch_dir("builtin_fmq");
@@ -637,11 +629,7 @@ fn a_vendored_source_takes_precedence_over_the_builtin() {
     assert!(generated.contains("pub mod NativeHandle"), "{generated}");
 }
 
-/// The include set grows while sources are parsed. A copy that becomes
-/// visible only after the import was met — here the second source's package
-/// directory holds it, and the first source's directory is not
-/// package-derived — still wins over the builtin: the choice is made when no
-/// more sources are pending, not when the import is first seen.
+/// A vendored copy that only a later source's include dir reveals still wins over the builtin.
 #[test]
 fn a_copy_discovered_by_a_later_source_still_takes_precedence() {
     let dir = scratch_dir("builtin_late_include");

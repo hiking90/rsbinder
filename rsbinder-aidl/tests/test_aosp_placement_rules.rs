@@ -330,6 +330,26 @@ union Foo {
     assert!(out.contains("pub enum r#Foo"), "{out}");
 }
 
+#[test]
+fn union_field_whose_variant_is_not_a_rust_identifier_is_rejected() {
+    // The variant is the field's UpperCamel form: `SELF` and `self_` become
+    // `Self`, `_1` becomes `1`, `__` becomes nothing; none is a valid identifier.
+    for (field, variant) in [("SELF", "Self"), ("self_", "Self"), ("_1", "1"), ("__", "")] {
+        assert_error_contains(
+            &format!(
+                r#"
+package test;
+union Foo {{
+    int {field};
+    long other;
+}}
+        "#
+            ),
+            &format!("union 'Foo': field '{field}' maps to the Rust variant '{variant}'"),
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // `@FixedSize` — AOSP `aidl_language.cpp` `AidlParcelable::CheckValid` +
 // `aidl_typenames.cpp` `AidlTypenames::CanBeFixedSize`.
@@ -911,6 +931,79 @@ interface IFoo {
         "#,
         "interface 'IFoo' has a duplicate method name 'm'",
     );
+}
+
+#[test]
+fn duplicate_constant_name_is_rejected() {
+    // AOSP `AidlDefinedType::CheckValid`; otherwise rustc E0428 downstream.
+    assert_error_contains(
+        r#"
+package test;
+interface IFoo {
+    const int X = 1;
+    const int X = 2;
+}
+        "#,
+        "interface 'IFoo' has a duplicate constant name 'X'",
+    );
+    assert_error_contains(
+        r#"
+package test;
+parcelable P {
+    const int X = 1;
+    const int X = 2;
+}
+        "#,
+        "'P' has a duplicate constant name 'X'",
+    );
+}
+
+#[test]
+fn duplicate_field_name_is_rejected() {
+    // AOSP `AidlStructuredParcelable::CheckValid`; otherwise rustc E0124 downstream.
+    assert_error_contains(
+        r#"
+package test;
+parcelable P {
+    int a;
+    long a;
+}
+        "#,
+        "'P' has a duplicate field name 'a'",
+    );
+}
+
+#[test]
+fn duplicate_names_the_rust_output_cannot_hold_are_rejected() {
+    // Each would otherwise be a rustc error (E0428 / E0124) in the consumer's build.
+    for (input, needle) in [
+        (
+            "package test;\nunion U { int a; const int X = 1; const int X = 2; }",
+            "union 'U' has a duplicate constant name 'X'",
+        ),
+        (
+            "package test;\nparcelable Foo<T> { int _phantom_T; }",
+            "'Foo' field '_phantom_T' collides with the generated PhantomData field",
+        ),
+        (
+            "package test;\nparcelable P { parcelable Q { int a; } parcelable Q { int b; } int x; }",
+            "'P' has a duplicate nested type 'Q'",
+        ),
+        (
+            "package test;\ninterface I { parcelable I { int a; } }",
+            "nested type 'I' has the same name as its parent",
+        ),
+        (
+            "package test;\nenum E { A, A }",
+            "enum 'E' has a duplicate enumerator 'A'",
+        ),
+        (
+            "package test;\nparcelable A { int a; } parcelable A { int b; }",
+            "duplicate type 'A'",
+        ),
+    ] {
+        assert_error_contains(input, needle);
+    }
 }
 
 #[test]

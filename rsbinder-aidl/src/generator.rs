@@ -1769,6 +1769,7 @@ impl Generator {
 
         let mut content = String::new();
 
+        Self::ensure_nested_names(None, &document.decls)?;
         content += &self.declarations(&document.decls, 0)?;
 
         Ok((document.package.clone().unwrap_or_default(), content))
@@ -1810,6 +1811,38 @@ impl Generator {
         }
 
         Ok(content)
+    }
+
+    /// AOSP `CheckValidWithMembers`: a type named twice in a scope, or as its parent, is E0428.
+    fn ensure_nested_names(
+        owner: Option<&str>,
+        decls: &[parser::Declaration],
+    ) -> Result<(), AidlError> {
+        let mut names = std::collections::HashSet::new();
+        for decl in decls {
+            let span = match decl {
+                parser::Declaration::Interface(d) => d.name_span,
+                parser::Declaration::Parcelable(d) => d.name_span,
+                parser::Declaration::Enum(d) => d.name_span,
+                parser::Declaration::Union(d) => d.name_span,
+                parser::Declaration::Variable(_) => continue,
+            };
+            let name = decl.name();
+            if Some(name) == owner {
+                return Err(Self::decl_error(
+                    format!("nested type '{name}' has the same name as its parent"),
+                    span,
+                ));
+            }
+            if !names.insert(name) {
+                let message = match owner {
+                    Some(owner) => format!("'{owner}' has a duplicate nested type '{name}'"),
+                    None => format!("duplicate type '{name}'"),
+                };
+                return Err(Self::decl_error(message, span));
+            }
+        }
+        Ok(())
     }
 
     /// Declaration-level semantic diagnostic carrying the current source
@@ -1995,9 +2028,20 @@ impl Generator {
         }
 
         // Second pass: process constants with resolved values
+        let mut constant_names = std::collections::HashSet::new();
         for constant in decl.constant_list.iter() {
             let generator = constant.r#type.to_generator()?;
             generator.ensure_resolvable()?;
+            // AOSP `AidlDefinedType::CheckValid`: two `pub const` of one name is E0428 downstream.
+            if !constant_names.insert(constant.identifier.as_str()) {
+                return Err(Generator::decl_error(
+                    format!(
+                        "interface '{}' has a duplicate constant name '{}'",
+                        decl.name, constant.identifier
+                    ),
+                    generator.type_span(),
+                ));
+            }
             Self::ensure_declarable(&generator, &decl.name, &constant.identifier)?;
             Self::ensure_constant_type(&generator, &decl.name, &constant.identifier)?;
             const_members.push((
@@ -2030,6 +2074,7 @@ impl Generator {
             fn_members.push(make_fn_member(method, self.get_crate_name(), vintf_owner)?);
         }
 
+        Self::ensure_nested_names(Some(&decl.name), &decl.members)?;
         let nested = &self.declarations(&decl.members, indent + 1)?;
 
         let namespace = parser::get_descriptor_from_annotation_list(&decl.annotation_list)
@@ -2154,9 +2199,42 @@ pub mod {mod} {{
             decl.type_params.iter().map(|p| p.name.clone()).collect();
 
         // Parse struct variables only.
+        let mut field_names = std::collections::HashSet::new();
+        let mut constant_names = std::collections::HashSet::new();
         for decl in &decl.members {
             if let Some(var) = decl.is_variable() {
                 let generator = var.r#type.to_generator()?;
+                // AOSP `AidlStructuredParcelable::CheckValid`: a duplicate is rustc E0124/E0428.
+                let names = if var.constant {
+                    &mut constant_names
+                } else {
+                    &mut field_names
+                };
+                if !names.insert(var.identifier.as_str()) {
+                    return Err(Generator::decl_error(
+                        format!(
+                            "'{}' has a duplicate {} name '{}'",
+                            owner_name,
+                            if var.constant { "constant" } else { "field" },
+                            var.identifier
+                        ),
+                        generator.type_span(),
+                    ));
+                }
+                // `PARCELABLE_TEMPLATE` adds a `_phantom_<param>` field per type parameter.
+                if !var.constant
+                    && decl_type_params
+                        .iter()
+                        .any(|p| var.identifier.strip_prefix("_phantom_") == Some(p.as_str()))
+                {
+                    return Err(Generator::decl_error(
+                        format!(
+                            "'{}' field '{}' collides with the generated PhantomData field",
+                            owner_name, var.identifier
+                        ),
+                        generator.type_span(),
+                    ));
+                }
                 Self::ensure_no_type_param_field(
                     &generator,
                     &decl_type_params,
@@ -2219,6 +2297,7 @@ pub mod {mod} {{
             }
         }
 
+        Self::ensure_nested_names(Some(&owner_name), &declarations)?;
         let nested = &self.declarations(&declarations, indent + 1)?;
         let namespace = parser::get_descriptor_from_annotation_list(&decl.annotation_list)
             .unwrap_or_else(|| decl.namespace.to_string(Namespace::AIDL));
@@ -2244,25 +2323,13 @@ pub mod {mod} {{
         Ok(add_indent(indent, rendered.trim()))
     }
 
-    /// Names the parcelable template spells bare inside the generated struct
-    /// and its impls, where a type parameter of the same name would be found
-    /// first: the prelude items it uses and the primitive types.
+    /// Names the parcelable template spells unqualified; a same-named type parameter shadows them.
     const BARE_TEMPLATE_NAMES: &'static [&'static str] = &[
         "String", "Vec", "Option", "Box", "Default", "core", "std", "bool", "i8", "u8", "i16",
         "u16", "i32", "u32", "i64", "u64", "f32", "f64", "usize", "isize", "str",
     ];
 
-    /// What a type parameter's name and a generic declaration's body must
-    /// satisfy for the generated Rust to compile.
-    ///
-    /// A parameter is spelled bare in `pub struct Foo<T>` and every impl
-    /// header, so it must not be a keyword, one of
-    /// [`BARE_TEMPLATE_NAMES`](Self::BARE_TEMPLATE_NAMES), the runtime
-    /// crate's path segment (`rsbinder::` or `crate::`, known only here), or
-    /// the declaration's own name (`impl<R> … for R<R>`). A nested
-    /// declaration is reachable from a field only by a path that starts bare
-    /// (`Bar::Baz::Baz`), so AOSP refuses nesting in a generic type
-    /// (`AidlDefinedType::CheckValidWithMembers`) and so does this.
+    /// Parameter names are spelled bare (see `BARE_TEMPLATE_NAMES`); nesting is refused as in AOSP.
     fn ensure_type_params(
         owner: &str,
         type_params: &[parser::TypeParam],
@@ -2303,10 +2370,7 @@ pub mod {mod} {{
         Ok(())
     }
 
-    /// A field whose type is one of the declaration's own type parameters
-    /// (`parcelable Foo<T> { T value; }`) has no wire format: the parameter
-    /// never reaches the parcel, and AOSP's Rust backend emits `Serialize`
-    /// without a bound on it, so the generated code cannot write the field.
+    /// Refuses `Foo<T> { T value; }`: a field typed by an own type parameter has no wire form.
     fn ensure_no_type_param_field(
         generator: &crate::type_generator::TypeGenerator,
         type_params: &[String],
@@ -2378,7 +2442,18 @@ pub mod {mod} {{
         };
 
         // Second pass: render the values resolved by the shared enum member path.
+        let mut enumerator_names = std::collections::HashSet::new();
         for enumerator in &decl.enumerator_list {
+            // Not an AOSP check: two same-named constants in `declare_binder_enum!` do not compile.
+            if !enumerator_names.insert(enumerator.identifier.as_str()) {
+                return Err(Self::decl_error(
+                    format!(
+                        "enum '{}' has a duplicate enumerator '{}'",
+                        decl.name, enumerator.identifier
+                    ),
+                    decl.name_span,
+                ));
+            }
             if let Some(expr) =
                 parser::enum_member_const_expr_from_lookup(&lookup_decl, &enumerator.identifier)
             {
@@ -2473,11 +2548,7 @@ pub mod {mod} {{
         let is_fixed_size =
             parser::has_annotation(&decl.annotation_list, parser::AnnotationType::FixedSize);
 
-        // A generic union has no Rust form: no variant may hold a parameter's
-        // type (it is not written to the parcel), and an enum with an unused
-        // parameter does not compile (E0392). AOSP's Rust backend emits the
-        // parameters and no phantom variant, so its output does not compile
-        // either.
+        // A generic union has no Rust form (E0392 without a phantom variant); AOSP's fails too.
         if let Some(param) = decl.type_params.first() {
             return Err(Self::decl_error(
                 format!(
@@ -2492,6 +2563,7 @@ pub mod {mod} {{
         let mut constant_members = Vec::new();
         let mut members = Vec::new();
         let mut declarations = Vec::new();
+        let mut constant_names = std::collections::HashSet::new();
 
         for member in &decl.members {
             if let parser::Declaration::Variable(var) = member {
@@ -2500,6 +2572,16 @@ pub mod {mod} {{
                 generator.ensure_sized()?;
                 Self::ensure_declarable(&generator, &decl.name, &var.identifier)?;
                 if var.constant {
+                    // Fields go through `seen_variants`; two same-named `pub const` are E0428.
+                    if !constant_names.insert(var.identifier.as_str()) {
+                        return Err(Self::decl_error(
+                            format!(
+                                "union '{}' has a duplicate constant name '{}'",
+                                decl.name, var.identifier
+                            ),
+                            generator.type_span(),
+                        ));
+                    }
                     Self::ensure_constant_type(&generator, &decl.name, &var.identifier)?;
                 }
                 if !var.constant {
@@ -2584,6 +2666,19 @@ pub mod {mod} {{
         let mut seen_variants: std::collections::HashMap<&str, &str> =
             std::collections::HashMap::new();
         for (variant, _, field, _, _, _) in &members {
+            // UpperCamel makes `SELF`/`self_` into `Self` and `_1` into `1`; `r#` rescues neither.
+            let usable = variant.chars().next().is_some_and(|c| !c.is_ascii_digit())
+                && variant.as_str() != "Self";
+            if !usable {
+                return Err(Self::decl_error(
+                    format!(
+                        "union '{}': field '{field}' maps to the Rust variant '{variant}', which is \
+                         not a valid identifier; rename it",
+                        decl.name
+                    ),
+                    decl.name_span,
+                ));
+            }
             if let Some(previous) = seen_variants.insert(variant, field) {
                 return Err(Self::decl_error(
                     format!(
@@ -2596,6 +2691,7 @@ pub mod {mod} {{
             }
         }
 
+        Self::ensure_nested_names(Some(&decl.name), &declarations)?;
         let nested = &self.declarations(&declarations, indent + 1)?;
         let namespace = parser::get_descriptor_from_annotation_list(&decl.annotation_list)
             .unwrap_or_else(|| decl.namespace.to_string(Namespace::AIDL));

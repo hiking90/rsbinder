@@ -36,9 +36,7 @@ thread_local! {
     // call. Drained into `Document::warnings` before parse_document returns.
     static CURRENT_WARNINGS: RefCell<Vec<crate::error::AidlWarning>> = const { RefCell::new(Vec::new()) };
 
-    // Declarations the runtime crate provides (`crate::BUILTIN_DECLS`), keyed
-    // by their AIDL namespace: the Rust path relative to the runtime crate
-    // root that a reference must name instead of a generated module.
+    // Each `crate::BUILTIN_DECLS` entry: AIDL namespace -> Rust path relative to the runtime crate.
     static BUILTIN_RUST_PATHS: RefCell<HashMap<Namespace, String>> = RefCell::new(HashMap::new());
 }
 
@@ -887,7 +885,7 @@ pub fn name_to_enum_member_const_expr(name: &str, target_enum: Option<&str>) -> 
     })
 }
 
-// `self`/`Self`/`super`/`crate` cannot be raw identifiers, so no generated name can carry them.
+// `self`/`Self`/`super`/`crate`/`_` cannot be raw identifiers, so no generated name can carry them.
 fn reject_unrepresentable_identifier(
     ident: &str,
     role: &str,
@@ -895,7 +893,7 @@ fn reject_unrepresentable_identifier(
 ) -> Result<(), AidlError> {
     let Some(keyword) = ident
         .split('.')
-        .find(|segment| matches!(*segment, "self" | "Self" | "super" | "crate"))
+        .find(|segment| matches!(*segment, "self" | "Self" | "super" | "crate" | "_"))
     else {
         return Ok(());
     };
@@ -1315,9 +1313,7 @@ pub enum Generic {
 }
 
 impl Generic {
-    /// The type arguments as written, in order. The three grammar shapes
-    /// exist only to split a closing `>>`; `Foo<A, Bar<X>>` (shape 1) and
-    /// `Foo<Bar<X>>` (shape 2) each yield the inner `Bar<X>` as one argument.
+    /// The type arguments as written, in order; shapes 1 and 2 yield their inner `Bar<X>` as one argument.
     pub fn type_args(&self) -> Vec<Type> {
         let nested = |non_array_type: &NonArrayType, inner: &[Type]| Type {
             annotation_list: Vec::new(),
@@ -2106,8 +2102,7 @@ fn parse_type_args(pairs: pest::iterators::Pairs<Rule>) -> Result<Vec<Type>, Aid
         match pair.as_rule() {
             Rule::r#type => {
                 let ty = parse_type(pair.into_inner())?;
-                // AOSP `aidl_language_y.yy` (`type_args`): an annotation goes
-                // on the whole field or parameter, never on an argument.
+                // AOSP `aidl_language_y.yy` refuses only the first argument's; every one here.
                 if let Some(annotation) = ty.annotation_list.first() {
                     return Err(make_invalid_operation_error(
                         "Annotations for type arguments are not supported".to_owned(),
@@ -2121,6 +2116,20 @@ fn parse_type_args(pairs: pest::iterators::Pairs<Rule>) -> Result<Vec<Type>, Aid
     }
 
     Ok(res)
+}
+
+// Shape 1/2 inner: `Generic::type_args` would drop its `<...>` (`X<A<B><C>>`); AOSP rejects it.
+fn parse_split_non_array_type(
+    pairs: pest::iterators::Pairs<Rule>,
+) -> Result<NonArrayType, AidlError> {
+    let inner = parse_non_array_type(pairs)?;
+    if inner.generic.is_some() {
+        return Err(make_invalid_operation_error(
+            "Can only specify one set of type parameters.".to_owned(),
+            inner.name_span,
+        ));
+    }
+    Ok(inner)
 }
 
 fn parse_non_array_type(pairs: pest::iterators::Pairs<Rule>) -> Result<NonArrayType, AidlError> {
@@ -2137,7 +2146,7 @@ fn parse_non_array_type(pairs: pest::iterators::Pairs<Rule>) -> Result<NonArrayT
                 let mut pairs = pair.into_inner();
                 let generic = Generic::Type1 {
                     type_args1: parse_type_args(pairs.next().unwrap().into_inner())?,
-                    non_array_type: parse_non_array_type(pairs.next().unwrap().into_inner())?,
+                    non_array_type: parse_split_non_array_type(pairs.next().unwrap().into_inner())?,
                     type_args2: parse_type_args(pairs.next().unwrap().into_inner())?,
                 };
 
@@ -2147,7 +2156,7 @@ fn parse_non_array_type(pairs: pest::iterators::Pairs<Rule>) -> Result<NonArrayT
             Rule::generic_type2 => {
                 let mut pairs = pair.into_inner();
                 let generic = Generic::Type2 {
-                    non_array_type: parse_non_array_type(pairs.next().unwrap().into_inner())?,
+                    non_array_type: parse_split_non_array_type(pairs.next().unwrap().into_inner())?,
                     type_args: parse_type_args(pairs.next().unwrap().into_inner())?,
                 };
 
@@ -2288,8 +2297,7 @@ fn parse_arg(pairs: pest::iterators::Pairs<Rule>) -> Result<Arg, AidlError> {
                 arg.r#type = parse_type(pair.into_inner())?;
             }
             Rule::identifier => {
-                let span = pair.as_span();
-                reject_unrepresentable_identifier(pair.as_str(), "argument name", &span)?;
+                // Any name: arguments are emitted as `_arg_<name>`, never raw.
                 arg.identifier = pair.as_str().into();
             }
             _ => unreachable!("Unexpected rule in parse_arg(): {}", pair),
@@ -2335,19 +2343,16 @@ fn parse_method_decl(pairs: pest::iterators::Pairs<Rule>) -> Result<MethodDecl, 
             }
             Rule::INTVALUE => {
                 let span = pair.as_span();
-                let expr = parse_intvalue(pair.as_str(), (span.start(), span.end()))?
-                    .calculate()
-                    .map_err(|e| make_parse_error(e.message, span.start(), span.end()))?;
-                decl.intvalue = Some(match expr.value {
-                    ValueType::Byte(v) => v as _,
-                    ValueType::Int32(v) => v as _,
-                    ValueType::Int64(v) => v,
-                    _ => unreachable!(
-                        "Unexpected Expression in parse_method_decl(): {}, \"{}\"",
-                        pair,
-                        pair.as_str()
-                    ),
-                });
+                let text = pair.as_str();
+                // AOSP `ParseInt`: a plain decimal only; a suffix or `_` is refused, not typed.
+                let value = text.parse::<i64>().map_err(|_| {
+                    make_parse_error(
+                        format!("Could not parse int value: {text}"),
+                        span.start(),
+                        span.end(),
+                    )
+                })?;
+                decl.intvalue = Some(value);
                 decl.intvalue_span = Some((span.start(), span.end()));
             }
             _ => unreachable!(
@@ -2460,17 +2465,7 @@ fn parse_parcelable_members(
     Ok(res)
 }
 
-/// A declaration's type parameter: `<@FixedSize T, Flavor>` yields two.
-///
-/// A `@FixedSize` or `@VintfStability` annotation here is a requirement on
-/// the argument supplied at a use site, not a property of the parameter:
-/// `@FixedSize T` means `Foo<byte>` is accepted and `Foo<String>` is
-/// rejected. AOSP also admits `@JavaPassthrough` and `@JavaSuppressLint`
-/// (`CONTEXT_ALL`), which the Rust backend ignores.
-///
-/// The name is checked against what the generated Rust spells bare in the
-/// generator (`Generator::ensure_type_params`), where the crate mode and the
-/// owning declaration are known.
+/// A declaration's type parameter; its annotation is a requirement on the use-site argument.
 #[derive(Debug, Default, Clone)]
 pub struct TypeParam {
     pub name: String,
@@ -3153,6 +3148,22 @@ pub fn reset() {
 mod tests {
     use super::*;
     use std::error::Error;
+
+    #[test]
+    fn test_second_type_parameter_set_is_rejected() -> Result<(), Box<dyn Error>> {
+        // Shape 2, inner `A` already has `<B>`: without the parse-time check it made `List<A<C>>`.
+        let ctx = SourceContext::new("p.aidl", "parcelable P { List<A<B><C>> x; }");
+        let err = parse_document(&ctx).expect_err("second `<...>` must be rejected");
+        assert!(
+            err.to_string()
+                .contains("Can only specify one set of type parameters"),
+            "{err}"
+        );
+
+        let ctx = SourceContext::new("p.aidl", "parcelable P { List<A<B>> x; }");
+        parse_document(&ctx)?;
+        Ok(())
+    }
 
     #[test]
     fn test_parse_string_concat_expression() -> Result<(), Box<dyn Error>> {

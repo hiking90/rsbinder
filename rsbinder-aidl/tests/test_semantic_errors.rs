@@ -533,3 +533,32 @@ fn test_no_backing_annotation_defaults_to_byte() {
     let gen = Generator::new(false, false);
     assert!(gen.document(&doc).is_ok());
 }
+
+/// AOSP `AidlTypenames` "redefinition": one type in two files of a package
+/// would otherwise render `pub mod A` twice in one package module (E0428).
+#[test]
+fn test_same_type_in_two_files_is_a_redefinition() {
+    let tmp = scratch_dir("redefinition");
+    let first = tmp.join("first");
+    let second = tmp.join("second");
+    for dir in [&first, &second] {
+        std::fs::create_dir_all(dir.join("test")).unwrap();
+        std::fs::write(
+            dir.join("test/A.aidl"),
+            "package test;\nparcelable A { int x; }",
+        )
+        .unwrap();
+    }
+
+    let err = rsbinder_aidl::Builder::new()
+        .source(first.join("test/A.aidl"))
+        .source(second.join("test/A.aidl"))
+        .output(&tmp)
+        .generate()
+        .expect_err("the second declaration of test.A must be refused");
+    let message = err.to_string();
+    assert!(
+        message.contains("'test.A'") && message.contains("first") && message.contains("second"),
+        "got: {message}"
+    );
+}

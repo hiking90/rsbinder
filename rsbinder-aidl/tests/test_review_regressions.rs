@@ -289,14 +289,16 @@ fn array_literal_shape_mismatches_are_diagnostics() {
     assert!(out.contains("[1,2,]"), "got: {out}");
 }
 
-/// Constants (and members) named `self`/`Self`/`super`/`crate` cannot be
-/// emitted — `r#self` is not a valid Rust raw identifier — so they are
-/// rejected at parse time instead of producing non-compiling output.
+/// Member names self/Self/super/crate/_ have no raw-identifier form, so parsing rejects them.
 #[test]
 fn reserved_path_keyword_member_names_are_diagnostics() {
     for src in [
         "interface IFoo { const int self = 1; }",
         "parcelable P { int crate; }",
+        "parcelable P { int _; }",
+        "enum E { _ }",
+        "interface IFoo { void _(); }",
+        "parcelable Foo<_> { int a; }",
     ] {
         assert!(!generate_ok(src), "reserved name must error: {src}");
     }
@@ -612,13 +614,19 @@ fn duplicated_argument_direction_is_rejected() {
 fn unrepresentable_identifiers_are_rejected_everywhere() {
     for src in [
         "package a; interface I { void self(); }",
-        "package a; interface I { void f(in int crate); }",
         "package a; @Backing(type=\"int\") enum E { self = 1 }",
         "package a; interface self { void f(); }",
         "package a; parcelable crate { int x; }",
         "package a; parcelable P { int self; }",
     ] {
         assert!(!generate_ok(src), "must be rejected: {src}");
+    }
+    // Argument names are emitted as `_arg_<name>`, so any AIDL identifier is representable.
+    for src in [
+        "package a; interface I { void f(in int crate); }",
+        "package a; interface I { void f(in int _); }",
+    ] {
+        assert!(generate_ok(src), "must be accepted: {src}");
     }
 }
 
