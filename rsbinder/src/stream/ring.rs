@@ -877,6 +877,9 @@ pub(super) struct Consumer<T> {
     /// Test hook, run at the last point before a call commits to sleeping.
     #[cfg(test)]
     about_to_park: Option<Box<dyn FnMut() + Send>>,
+    /// Test hook, run after a look found the ring empty and before that look's verdict.
+    #[cfg(test)]
+    after_empty_look: Option<Box<dyn FnMut() + Send>>,
     _item: PhantomData<fn() -> T>,
 }
 
@@ -910,6 +913,8 @@ impl<T: Deserialize> Consumer<T> {
             buf: Vec::new(),
             #[cfg(test)]
             about_to_park: None,
+            #[cfg(test)]
+            after_empty_look: None,
             _item: PhantomData,
         };
         Ok((consumer, ring, sink_binder))
@@ -1045,13 +1050,20 @@ impl<T: Deserialize> Consumer<T> {
 
     /// One record, if there is one: copied out, then interpreted.
     fn step(&mut self) -> Step<T> {
+        // Before the look: a death noticed after it may follow an end record the look missed.
+        let ended = self.shared.end();
         let is_end = match self.read_record() {
             Ok(Some(is_end)) => is_end,
             Ok(None) => {
-                return match self.shared.end() {
+                #[cfg(test)]
+                if let Some(hook) = self.after_empty_look.as_mut() {
+                    hook();
+                }
+                // An end recorded since then woke `NOT_EMPTY`, so the next look runs at once.
+                return match ended {
                     Some(status) => Step::End(status),
                     None => Step::Nothing,
-                }
+                };
             }
             Err(what) => return self.corrupted(what),
         };
@@ -1222,6 +1234,25 @@ mod tests {
     /// the ring items may use.
     fn item_records(ring_bytes: usize) -> usize {
         (ring_bytes - END_RESERVE) / 8
+    }
+
+    /// The producer ends cleanly and dies after the consumer's look found nothing: the end is read.
+    #[test]
+    fn an_end_committed_before_a_death_noticed_after_the_look_is_read() {
+        let (tx, mut rx) = pair::<i32>(512);
+        let shared = rx.shared.clone();
+        let mut tx = Some(tx);
+        rx.after_empty_look = Some(Box::new(move || {
+            if let Some(tx) = tx.take() {
+                end(tx).expect("the end record");
+                // What `ConsumerDeath` does once the producer's process is gone.
+                shared.dead.store(true, Ordering::SeqCst);
+                shared.set_end(Status::from(StatusCode::DeadObject), false);
+                let _ = shared.flag.wake(NOT_EMPTY);
+            }
+        }));
+        assert!(rx.recv().is_none(), "a clean end, not DeadObject");
+        assert!(rx.shared.end().expect("ended").is_ok());
     }
 
     #[test]
