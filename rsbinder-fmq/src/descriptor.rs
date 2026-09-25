@@ -159,10 +159,7 @@ pub(crate) const fn align_up(x: u64) -> u64 {
     (x + ALIGN - 1) & !(ALIGN - 1)
 }
 
-/// The layout libfmq builds for a queue on a single fd
-/// (`AidlMQDescriptorShimBase.h`): counters, ring, then the EventFlag word,
-/// each at the next 8-aligned offset. Returns the grantors and the total
-/// byte length they span.
+/// `AidlMQDescriptorShimBase.h` single-fd layout: counters, ring, EventFlag word, each 8-aligned.
 pub(crate) fn default_layout(data_bytes: u64, event_flag: bool) -> (Vec<Grantor>, u64) {
     let sizes: [u64; 4] = [8, 8, data_bytes, 4];
     let count = if event_flag { 4 } else { 3 };
@@ -191,9 +188,7 @@ pub(crate) struct Geometry {
     pub capacity: usize,
 }
 
-/// The checks of `MessageQueueBase::initMemory` / `mapGrantorDescr` plus the
-/// policy's. Every queue libfmq makes passes; the failure text names the
-/// check.
+/// libfmq's `initMemory`/`mapGrantorDescr` checks, the policy's, and `i32::MAX` offsets/extents.
 pub(crate) fn validate(
     desc: &Descriptor,
     quantum: usize,
@@ -235,7 +230,12 @@ pub(crate) fn validate(
         let size = match sizes[fd_index] {
             Some(s) => s,
             None => {
-                let s = shm::region_size(desc.fds[fd_index].as_fd())?;
+                // Seal before size: a seal never comes off, so the size read after it is a floor.
+                let fd = desc.fds[fd_index].as_fd();
+                if policy.require_seal && !(shm::shrink_sealed(fd) || shm::is_ashmem_fd(fd)) {
+                    return Err(Error::BadValue("fd is neither shrink-sealed nor ashmem"));
+                }
+                let s = shm::region_size(fd)?;
                 sizes[fd_index] = Some(s);
                 s
             }
@@ -266,18 +266,6 @@ pub(crate) fn validate(
             let (b0, b1) = (u64::from(gb.offset), u64::from(gb.offset) + gb.extent);
             if a0 < b1 && b0 < a1 {
                 return Err(Error::BadValue("grantor regions overlap"));
-            }
-        }
-    }
-
-    if policy.require_seal {
-        for (fd_index, size) in sizes.iter().enumerate() {
-            if size.is_none() {
-                continue;
-            }
-            let fd = desc.fds[fd_index].as_fd();
-            if !(shm::shrink_sealed(fd) || shm::is_ashmem_fd(fd)) {
-                return Err(Error::BadValue("fd is neither shrink-sealed nor ashmem"));
             }
         }
     }

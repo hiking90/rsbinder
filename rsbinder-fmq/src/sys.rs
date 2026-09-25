@@ -23,35 +23,38 @@ pub(crate) struct Mapping {
 
 // SAFETY: the mapping is a plain address range with no thread affinity.
 // Whether the memory behind it may be touched concurrently is the queue's
-// concern, and it only ever reaches the memory through atomics and volatile
-// copies.
+// concern, and it only ever reaches the memory through atomics and copies
+// ordered by them.
 unsafe impl Send for Mapping {}
 unsafe impl Sync for Mapping {}
 
 impl Mapping {
     /// The first byte of the grantor's region.
     pub(crate) fn ptr(&self) -> NonNull<u8> {
-        // SAFETY: `delta < len`, so the result stays inside the mapping.
+        // SAFETY: `delta < len` (`map` rejects an empty extent), so the
+        // result stays inside the mapping.
         unsafe { NonNull::new_unchecked(self.base.as_ptr().add(self.delta)) }
     }
 }
 
-/// The absolute `CLOCK_MONOTONIC` time `timeout` from now, the form
-/// `FUTEX_WAIT_BITSET` takes. `None` for no deadline.
+/// Absolute `CLOCK_MONOTONIC` deadline for `FUTEX_WAIT_BITSET`; `None` for none or past the clock.
 pub(crate) fn deadline_after(timeout: Option<std::time::Duration>) -> Result<Option<Timespec>> {
     let Some(timeout) = timeout else {
         return Ok(None);
     };
     let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
-    let secs = i64::try_from(timeout.as_secs())
-        .map_err(|_| Error::BadValue("timeout overflows the clock"))?;
+    let Ok(secs) = i64::try_from(timeout.as_secs()) else {
+        return Ok(None);
+    };
     let add = Timespec {
         tv_sec: secs,
         tv_nsec: timeout.subsec_nanos() as _,
     };
-    now.checked_add(add)
-        .map(Some)
-        .ok_or(Error::BadValue("timeout overflows the clock"))
+    let deadline = now.checked_add(add);
+    // Pre-5.1 kernels lack futex_time64: 32-bit targets pass `i32` seconds; past that, no deadline.
+    #[cfg(target_pointer_width = "32")]
+    let deadline = deadline.filter(|d| i32::try_from(d.tv_sec).is_ok());
+    Ok(deadline)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -71,7 +74,8 @@ mod imp {
             let len = usize::try_from(extent)
                 .ok()
                 .and_then(|e| e.checked_add(delta))
-                .filter(|l| *l > 0)
+                // A non-empty extent keeps `delta < len`, which `ptr` relies on.
+                .filter(|_| extent > 0)
                 .ok_or(Error::BadValue("grantor extent exceeds the address space"))?;
             // SAFETY: a null hint lets the kernel choose the address; `len` is
             // non-zero; `fd` is open for the call. The region is owned by
@@ -119,10 +123,7 @@ mod imp {
         Ok(fd)
     }
 
-    /// `FUTEX_WAIT_BITSET` without `FUTEX_PRIVATE_FLAG`, so a waiter in one
-    /// process is woken by another. Returns `Ok` on a wake, on `EAGAIN` (the
-    /// word no longer held `expected`) and on `EINTR`; the caller re-examines
-    /// the word in every case. `TimedOut` when `deadline` passed.
+    /// Non-private `FUTEX_WAIT_BITSET`; `Ok` on wake/`EAGAIN`/`EINTR`; caller rechecks the word.
     pub(crate) fn futex_wait(
         word: &AtomicU32,
         expected: u32,

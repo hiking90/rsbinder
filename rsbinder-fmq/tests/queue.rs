@@ -182,6 +182,13 @@ fn wrap_splits_the_regions_and_keeps_the_order() {
         regions.read_at(2, &mut b).unwrap();
         assert_eq!(a, [10, 11]);
         assert_eq!(b, [12, 13, 14, 15]);
+        // Starting at the wrap and past it: only the second part is read.
+        let mut at_wrap = [0u16; 3];
+        let mut past_wrap = [0u16; 2];
+        regions.read_at(3, &mut at_wrap).unwrap();
+        regions.read_at(4, &mut past_wrap).unwrap();
+        assert_eq!(at_wrap, [13, 14, 15]);
+        assert_eq!(past_wrap, [14, 15]);
         let mut c = [0u16; 1];
         assert_eq!(
             regions.read_at(6, &mut c).unwrap_err(),
@@ -289,6 +296,41 @@ fn write_blocking_times_out_on_a_full_queue() {
     assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
     // The item was not written.
     assert_eq!(w.available_to_write().unwrap(), 0);
+}
+
+#[test]
+fn a_timeout_past_the_clock_waits_without_a_deadline() {
+    let mut q = MessageQueue::<u8>::create(2, true).unwrap();
+    for timeout in [Duration::MAX, Duration::from_secs(i64::MAX as u64)] {
+        q.write_blocking(&[1], NOT_FULL, NOT_EMPTY, Some(timeout))
+            .unwrap();
+        let mut out = [0u8];
+        q.read_blocking(&mut out, NOT_EMPTY, NOT_FULL, Some(timeout))
+            .unwrap();
+        assert_eq!(out, [1]);
+    }
+
+    // And a write that really sleeps: on a full queue, `Duration::MAX` must not
+    // turn into a deadline already past, which would be `TimedOut` at once.
+    let mut w = MessageQueue::<u8>::create(2, true).unwrap();
+    let mut r = attach(&w);
+    w.write(&[1, 2]).unwrap();
+    let reader = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        let mut out = [0u8];
+        r.read_blocking(&mut out, NOT_EMPTY, NOT_FULL, None)
+            .unwrap();
+        out
+    });
+    let started = std::time::Instant::now();
+    w.write_blocking(&[3], NOT_FULL, NOT_EMPTY, Some(Duration::MAX))
+        .unwrap();
+    assert!(
+        started.elapsed() >= Duration::from_millis(40),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(reader.join().unwrap(), [1]);
 }
 
 #[test]
@@ -657,6 +699,17 @@ fn corrupted_counters_are_reported_on_every_operation() {
         Error::Corrupted("counter not a multiple of the element size")
     );
 
+    // Passes the three checks above, and a commit would wrap it.
+    raw.set(u64::MAX - 7, u64::MAX - 7);
+    assert_eq!(
+        w.write(&[1, 2]).unwrap_err(),
+        Error::Corrupted("counter too close to wrapping")
+    );
+    assert_eq!(
+        r.available_to_read().unwrap_err(),
+        Error::Corrupted("counter too close to wrapping")
+    );
+
     // Exactly full is not corruption.
     raw.set(0, 16 * 4);
     assert_eq!(w.available_to_write().unwrap(), 0);
@@ -703,6 +756,11 @@ fn create_rejects_impossible_sizes() {
     );
     assert_eq!(
         MessageQueue::<u8>::create(i32::MAX as usize + 1, true).unwrap_err(),
+        Error::BadValue("queue too large")
+    );
+    // 16 + data is `i32::MAX`; libfmq rounds it up to 8 and refuses it.
+    assert_eq!(
+        MessageQueue::<u8>::create(i32::MAX as usize - 16, false).unwrap_err(),
         Error::BadValue("queue too large")
     );
 }
@@ -797,7 +855,5 @@ fn send_but_not_sync() {
     is_sync::<rsbinder_fmq::EventFlag>();
     is_send::<Descriptor>();
     is_sync::<Descriptor>();
-    // `MessageQueue` must not be `Sync`; this is checked by the type not
-    // implementing it, which `static_assertions` would spell out — here the
-    // `PhantomData<Cell<()>>` in its definition is the guarantee.
+    // `!Sync` is checked by the `compile_fail` doctest on `MessageQueue`.
 }

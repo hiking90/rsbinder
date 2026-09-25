@@ -9,7 +9,9 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::descriptor::{default_layout, validate, AttachPolicy, Descriptor, Flavor, Grantor};
+use crate::descriptor::{
+    align_up, default_layout, validate, AttachPolicy, Descriptor, Flavor, Grantor,
+};
 use crate::error::{Error, Result};
 use crate::event_flag::EventFlag;
 use crate::sys::{self, Mapping};
@@ -45,10 +47,11 @@ struct Counter {
 
 impl Counter {
     fn map(desc: &Descriptor, g: Grantor) -> Result<Self> {
+        // Only the 8-byte word: a peer-sized extent would be the peer's choice of address space.
         let mapping = Mapping::map(
             desc.fds[g.fd_index as usize].as_fd(),
             u64::from(g.offset),
-            g.extent,
+            8,
         )?;
         let ptr = mapping.ptr().cast::<AtomicU64>();
         debug_assert_eq!(ptr.as_ptr() as usize % std::mem::align_of::<AtomicU64>(), 0);
@@ -90,6 +93,11 @@ struct Ring {
 /// [`attach`](Self::attach)) are fine as long as one only writes and the
 /// other only reads.
 ///
+/// ```compile_fail,E0277
+/// fn is_sync<T: Sync>() {}
+/// is_sync::<rsbinder_fmq::MessageQueue<u8>>();
+/// ```
+///
 /// # What the reader sees
 ///
 /// A write is visible only after [`commit_write`](Self::commit_write) moves
@@ -100,7 +108,7 @@ struct Ring {
 /// # The ring is the peer's memory too
 ///
 /// Nothing here hands out a `&[T]` into the ring. [`Regions`] copies
-/// elements in and out with volatile accesses, and a reader interprets
+/// elements in and out between the counter accesses, and a reader interprets
 /// what it copied out, never the ring itself — a peer may rewrite the
 /// bytes at any moment, and a hostile one will.
 ///
@@ -138,8 +146,11 @@ impl<T: Element> MessageQueue<T> {
     /// (`AidlMQDescriptorShimBase.h`): read counter at 0, write counter at
     /// 8, data at 16, EventFlag word at the next multiple of 8.
     ///
-    /// `capacity` must be at least 1 and `capacity * size_of::<T>()` at
-    /// most `i32::MAX` (the AIDL `extent` field's range).
+    /// `capacity` must be at least 1, and `16 + capacity * size_of::<T>()`,
+    /// rounded up to a multiple of 8, at most `i32::MAX`: libfmq's limit,
+    /// since the EventFlag word's offset lands there and the AIDL `offset`
+    /// field is an `int`. [`attach`](Self::attach) caps `extent` (a `long`
+    /// in AIDL) at `i32::MAX` too, so that a ring fits a 32-bit `usize`.
     pub fn create(capacity: usize, event_flag: bool) -> Result<Self> {
         let quantum = size_of::<T>();
         if quantum == 0 {
@@ -153,6 +164,10 @@ impl<T: Element> MessageQueue<T> {
             .filter(|b| *b <= i32::MAX as u64)
             .ok_or(Error::BadValue("queue too large"))?;
         let (grantors, total) = default_layout(data_bytes, event_flag);
+        // libfmq's bound, with or without the EventFlag word.
+        if align_up(16 + data_bytes) > i32::MAX as u64 {
+            return Err(Error::BadValue("queue too large"));
+        }
         let fd = sys::create_shared(total)?;
         let desc = Descriptor {
             fds: vec![fd],
@@ -177,7 +192,10 @@ impl<T: Element> MessageQueue<T> {
 
     /// Map a queue a peer described, after checking the descriptor against
     /// `policy` and libfmq's own rules (see [`AttachPolicy`]). The fds are
-    /// duplicated; `desc` stays usable.
+    /// duplicated; `desc` stays usable. A synchronized single-fd queue that
+    /// libfmq made is within the `i32::MAX` caps (its shim bounds offsets
+    /// there too); a two-fd one may exceed the `extent` cap, and an
+    /// unsynchronized one is refused.
     ///
     /// The counters are left as they are. A queue is attached once per
     /// side; attaching a second handle to read while the first writes is
@@ -187,6 +205,10 @@ impl<T: Element> MessageQueue<T> {
     }
 
     fn open(desc: Descriptor, policy: &AttachPolicy) -> Result<Self> {
+        // Before validation: off Linux no fd is sealed, so the policy would refuse first.
+        if cfg!(not(any(target_os = "linux", target_os = "android"))) {
+            return Err(Error::Unsupported);
+        }
         let geo = validate(&desc, size_of::<T>(), policy)?;
         let read = Counter::map(&desc, geo.read)?;
         let write = Counter::map(&desc, geo.write)?;
@@ -205,10 +227,11 @@ impl<T: Element> MessageQueue<T> {
             }
         };
         let flag = match geo.event_flag {
+            // The 4-byte word only, as for the counters.
             Some(g) => Some(EventFlag::from_mapping(Mapping::map(
                 desc.fds[g.fd_index as usize].as_fd(),
                 u64::from(g.offset),
-                g.extent,
+                4,
             )?)),
             None => None,
         };
@@ -245,10 +268,7 @@ impl<T: Element> MessageQueue<T> {
         self.flag.clone()
     }
 
-    /// Both counters, checked: `read ≤ write`, `write − read ≤ ring bytes`,
-    /// both multiples of the quantum. libfmq's reader skips the second
-    /// check; without it a peer that inflates the write counter makes the
-    /// wrapped region longer than the ring.
+    /// Both counters, checked against a hostile peer: order, in-flight ≤ ring, no wrap, alignment.
     fn positions(&self) -> Result<(u64, u64)> {
         let write = self.write.get().load(Ordering::Acquire);
         let read = self.read.get().load(Ordering::Acquire);
@@ -257,6 +277,10 @@ impl<T: Element> MessageQueue<T> {
         }
         if write - read > self.ring.bytes as u64 {
             return Err(Error::Corrupted("more bytes in flight than the ring holds"));
+        }
+        // A commit adds at most `bytes`; a counter this high would wrap.
+        if write > u64::MAX - self.ring.bytes as u64 {
+            return Err(Error::Corrupted("counter too close to wrapping"));
         }
         let q = size_of::<T>() as u64;
         if read % q != 0 || write % q != 0 {
@@ -284,7 +308,10 @@ impl<T: Element> MessageQueue<T> {
         let q = size_of::<T>();
         let offset = (position % self.ring.bytes as u64) as usize;
         let contiguous = (self.ring.bytes - offset) / q;
-        // SAFETY: `offset < bytes`, so the pointer stays inside the ring.
+        debug_assert_eq!(offset % q, 0);
+        // SAFETY: `offset < bytes` keeps the pointer inside the ring, and
+        // `offset` is a multiple of `size_of::<T>()`, so the cast is aligned
+        // for `T` (the ring base is 8-aligned and `align_of::<T>() ≤ 8`).
         let first = unsafe { self.ring.base.as_ptr().add(offset) }.cast::<T>();
         let (first_len, second_len) = if n > contiguous {
             (contiguous, n - contiguous)
@@ -484,8 +511,8 @@ impl<T: Element> std::fmt::Debug for MessageQueue<T> {
 ///
 /// Indices in [`write_at`](Self::write_at) and [`read_at`](Self::read_at)
 /// run over both parts as one sequence, so a caller lays out a record
-/// without knowing where the wrap falls. Every access is a volatile copy;
-/// there is no way to hold a reference into the ring.
+/// without knowing where the wrap falls. Every access is a copy; there is
+/// no way to hold a reference into the ring.
 pub struct Regions<'a, T: Element> {
     first: NonNull<T>,
     first_len: usize,
@@ -515,15 +542,22 @@ impl<T: Element> Regions<'_, T> {
         self.second_len
     }
 
-    fn slot(&self, index: usize) -> *mut T {
-        // SAFETY: callers check `index < len()`, and each part's pointer
-        // plus its length stays inside the ring.
+    /// The ring runs `start..start + n` covers, before and after the wrap, as `(pointer, length)`.
+    fn runs(&self, start: usize, n: usize) -> [(*mut T, usize); 2] {
+        let head = self.first_len.saturating_sub(start).min(n);
+        // SAFETY: callers check `start + n <= len()`. The first offset is at
+        // most `first_len` (one past the part's end when `start` is beyond
+        // it), the second at most `second_len`; both stay in the ring.
         unsafe {
-            if index < self.first_len {
-                self.first.as_ptr().add(index)
-            } else {
-                self.second.as_ptr().add(index - self.first_len)
-            }
+            [
+                (self.first.as_ptr().add(start.min(self.first_len)), head),
+                (
+                    self.second
+                        .as_ptr()
+                        .add(start.saturating_sub(self.first_len)),
+                    n - head,
+                ),
+            ]
         }
     }
 
@@ -536,13 +570,15 @@ impl<T: Element> Regions<'_, T> {
         {
             return Err(Error::BadValue("write past the reserved elements"));
         }
-        for (i, item) in src.iter().enumerate() {
-            // SAFETY: `start + i < len()`, checked above; the slot is
-            // aligned for `T` (ring base is 8-aligned, `T`'s alignment ≤ 8,
-            // and its size is a multiple of that). Volatile: the peer may
-            // read the ring concurrently, and the counter store that
-            // publishes the copy is a separate `Release`.
-            unsafe { std::ptr::write_volatile(self.slot(start + i), *item) };
+        let [(head, head_len), (tail, tail_len)] = self.runs(start, src.len());
+        // SAFETY: both runs are inside the ring (bound checked above) and
+        // aligned for `T` (see `regions_at`); `src` cannot overlap them, since
+        // nothing hands out a reference into the ring. The peer reads these
+        // elements only after `commit_write`'s `Release` store, which the
+        // copy cannot move past — libfmq's `write` is the same `memcpy`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), head, head_len);
+            std::ptr::copy_nonoverlapping(src.as_ptr().add(head_len), tail, tail_len);
         }
         Ok(())
     }
@@ -556,11 +592,14 @@ impl<T: Element> Regions<'_, T> {
         {
             return Err(Error::BadValue("read past the available elements"));
         }
-        for (i, item) in dst.iter_mut().enumerate() {
-            // SAFETY: as in `write_at`. Any bit pattern is a `T` (the
-            // `Element` contract), so a concurrent rewrite by the peer
-            // yields a wrong value, not an invalid one.
-            *item = unsafe { std::ptr::read_volatile(self.slot(start + i)) };
+        let [(head, head_len), (tail, tail_len)] = self.runs(start, dst.len());
+        // SAFETY: as in `write_at`, with the reader's `Acquire` load before
+        // the copy. A peer that rewrites the elements anyway leaves some bit
+        // pattern in `dst`, and every one is a `T` (the `Element` contract):
+        // a wrong value, not an invalid one.
+        unsafe {
+            std::ptr::copy_nonoverlapping(head, dst.as_mut_ptr(), head_len);
+            std::ptr::copy_nonoverlapping(tail, dst.as_mut_ptr().add(head_len), tail_len);
         }
         Ok(())
     }

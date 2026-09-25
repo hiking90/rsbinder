@@ -37,18 +37,21 @@ fn spawn_server(name: &str) -> Server {
         .spawn()
         .expect("spawn fmq_probe");
     let stdout = child.stdout.take().unwrap();
-    let mut lines = BufReader::new(stdout).lines();
-    let started = Instant::now();
-    loop {
-        match lines.next() {
-            Some(Ok(line)) if line.starts_with("SERVING ") => break,
-            Some(Ok(_)) => {}
-            _ => panic!("fmq_probe ended before serving"),
+    // Read on a thread: `lines.next()` has no deadline of its own.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if tx.send(line).is_err() {
+                break;
+            }
         }
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "no SERVING line"
-        );
+    });
+    loop {
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Ok(line)) if line.starts_with("SERVING ") => break,
+            Ok(Ok(_)) => {}
+            other => panic!("fmq_probe did not serve: {other:?}"),
+        }
     }
     Server(child)
 }

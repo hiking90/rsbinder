@@ -201,7 +201,8 @@ mod convert {
         }
     }
 
-    #[cfg(test)]
+    // `MessageQueue::create` is `Unsupported` off Linux/Android.
+    #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
     mod tests {
         use super::*;
         use rsbinder_fmq::MessageQueue;
