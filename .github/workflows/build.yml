@@ -285,6 +285,8 @@ jobs:
           t cargo test -p rsbinder --features rpc --lib cancel::
           t cargo test -p rsbinder --features rpc --lib transport_caps::
           t cargo test -p rsbinder --features rpc --lib observe::
+          t cargo test -p rsbinder --features rpc --lib fmq::
+          t cargo test -p rsbinder --features rpc --lib thread_state::tests::work_source_
           cargo test -p rsbinder --features rpc --test rpc_e2e --test rpc_scenarios --test rpc_server --test rpc_fd --test rpc_shared_memory --test rpc_cross_stack --test rpc_transport_conformance --test source_invariants --test blob_rpc --test pipe_rpc
           cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_tls --test rpc_transport_conformance
       - name: RPC accessor (hermetic, requires android_16 — gap-fill)

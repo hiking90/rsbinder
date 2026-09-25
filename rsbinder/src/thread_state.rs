@@ -876,10 +876,7 @@ fn replace_work_source(ws: WorkSource) -> WorkSource {
     WORK_SOURCE.with(|c| c.replace(ws))
 }
 
-/// Resets the thread's work source to unset for the duration of an
-/// inbound dispatch and restores the caller's value on drop, including on
-/// unwind. AOSP `IPCThreadState::executeCommand` `BR_TRANSACTION`
-/// (`IPCThreadState.cpp:1521-1527`, `:1617-1618`).
+/// Unset work source for one inbound dispatch (AOSP `BR_TRANSACTION`); restored on drop.
 pub(crate) struct WorkSourceDispatchGuard {
     saved: WorkSource,
 }
@@ -1275,7 +1272,7 @@ fn dispatch_transact_caught(
 /// [`dispatch_transact_caught`] between the transaction observer's calls.
 /// Runs where the handler runs: no `THREAD_STATE` borrow is held.
 fn dispatch_kernel_observed(
-    descriptor: &str,
+    binder: &SIBinder,
     transactable: &dyn Transactable,
     tr: &binder::binder_transaction_data,
     reader: &mut Parcel,
@@ -1283,8 +1280,9 @@ fn dispatch_kernel_observed(
 ) -> Result<()> {
     let code = tr.code;
     crate::observe::observed(
+        // `descriptor()` is user code too, so it is looked up inside the caught closure.
         || crate::observe::TxnContext {
-            descriptor,
+            descriptor: binder.descriptor(),
             code,
             method: transactable.transaction_name(code),
             is_oneway: tr.flags & transaction_flags_TF_ONE_WAY != 0,
@@ -1400,7 +1398,7 @@ fn execute_command(cmd: i32) -> Result<()> {
                                     // reject rather than `expect`-panic on the worker loop.
                                     let result = match strong.as_transactable() {
                                         Some(t) => dispatch_kernel_observed(
-                                            strong.descriptor(),
+                                            &strong,
                                             t,
                                             &tr_secctx.transaction_data,
                                             &mut reader,
@@ -1436,7 +1434,7 @@ fn execute_command(cmd: i32) -> Result<()> {
                         match ProcessState::as_self().context_manager() {
                             Some(context) => match context.as_transactable() {
                                 Some(t) => dispatch_kernel_observed(
-                                    context.descriptor(),
+                                    &context,
                                     t,
                                     &tr_secctx.transaction_data,
                                     &mut reader,

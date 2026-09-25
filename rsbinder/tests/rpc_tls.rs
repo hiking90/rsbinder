@@ -983,13 +983,7 @@ fn close_within(session: &RpcSession, what: &str) {
     assert_eq!(live, 0, "{what}: incoming threads still running");
 }
 
-/// Plan 10-7 Phase 0: `ClientOptions::incoming_connections` on `tls://`.
-/// Each incoming connection is its own TCP connection and TLS session to
-/// the same endpoint, as AOSP `setupClient` opens them over inet; with
-/// one, the server reaches the client's callback from a thread inside no
-/// handler, twoway and oneway, and both ends report `CALLBACKS`. Without
-/// one, the same call fails at once with `WouldBlock`. The outgoing
-/// fan-out, bound by the same unix-only gate before, rides along.
+/// `incoming_connections` on `tls://` carry out-of-handler callbacks; without one, `WouldBlock`.
 #[test]
 fn entry_tls_incoming_connections_carry_callbacks() {
     use rsbinder::TransportCaps;
@@ -1150,6 +1144,7 @@ fn client_config_tls_constructor_opens_a_fan_out_session() {
     )
     .expect("tls constructor");
     assert_eq!(session.negotiated_max_threads(), 2);
+    assert_eq!(session.__slot_count(), 2, "founding + one fan-out");
     let root = session.get_root().expect("get_root");
     assert_eq!(ping_via(&root, "cfg-tls").unwrap(), "pong:cfg-tls");
 
@@ -1159,10 +1154,7 @@ fn client_config_tls_constructor_opens_a_fan_out_session() {
     let _ = bg.join();
 }
 
-/// Fd passing needs a Unix-domain socket, so the setup refuses the mode
-/// instead of agreeing on it and failing on the first descriptor sent.
-/// The founding connection decides it, which is what makes the rule reach
-/// a `RpcClientConfig::new` connect function too.
+/// Unix fd mode needs a Unix socket; `RpcClientConfig::tls` refuses it on the founding connection.
 #[test]
 fn fd_mode_unix_over_tls_is_refused_at_setup() {
     use rsbinder::rpc::{FileDescriptorTransportMode, RpcClientConfig};
