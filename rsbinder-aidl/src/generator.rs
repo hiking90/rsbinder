@@ -943,8 +943,8 @@ pub struct InterfaceRender {
 /// from 0 up to the last id reached while no more than 10 ids in total have
 /// been skipped, each holding its method's name or `""`. Mirrors AOSP
 /// `GetFunctionNames` / `GetMaxId` (`system/tools/aidl/aidl_to_common.cpp`),
-/// so a sparse explicit numbering does not produce a table the size of its
-/// largest id. Ids above AOSP `kMaxUserSetMethodId` are the meta methods,
+/// including that skips count only after the first id, so a large first id
+/// still sizes the table. Ids above AOSP `kMaxUserSetMethodId` are the meta methods,
 /// which the runtime names without the table.
 pub fn function_names(fn_members: &[FnMembers]) -> Vec<String> {
     const MAX_SKIP: u32 = 10;
@@ -2132,8 +2132,7 @@ impl Generator {
         // representable: emit the alias and ignore the Java/NDK/C++ markers
         // that only describe the other backends.
         if !decl.rust_type.is_empty() {
-            // `pub type Foo<T> = X;` needs `X` to use every parameter, and
-            // nothing here knows the shape of `X`.
+            // An alias must use every parameter, and nothing here knows the shape of `rust_type`.
             if let Some(param) = decl.type_params.first() {
                 return Err(Self::decl_error(
                     format!(

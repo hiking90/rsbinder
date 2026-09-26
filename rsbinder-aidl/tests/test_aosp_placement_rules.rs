@@ -332,8 +332,7 @@ union Foo {
 
 #[test]
 fn union_field_whose_variant_is_not_a_rust_identifier_is_rejected() {
-    // The variant is the field's UpperCamel form: `SELF` and `self_` become
-    // `Self`, `_1` becomes `1`, `__` becomes nothing; none is a valid identifier.
+    // The variant is the field's UpperCamel form; none of these is a valid identifier.
     for (field, variant) in [("SELF", "Self"), ("self_", "Self"), ("_1", "1"), ("__", "")] {
         assert_error_contains(
             &format!(

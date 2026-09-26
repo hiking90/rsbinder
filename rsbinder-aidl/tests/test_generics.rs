@@ -45,9 +45,7 @@ fn error_message(input: &str) -> String {
     }
 }
 
-/// A generic parcelable: every parameter becomes a `PhantomData` field and
-/// every impl is generic over it, as AOSP's Rust backend emits it. The
-/// parameters have no bound: they never reach the parcel.
+/// As AOSP's Rust backend: unbounded parameters, since they never reach the parcel.
 #[test]
 fn generic_parcelable_emits_phantom_fields() {
     assert_generated(
@@ -147,8 +145,7 @@ fn type_arguments_reach_the_rust_path() {
     }
 }
 
-/// `@FixedSize T` is a requirement on the argument: a `byte` and a
-/// `@FixedSize` parcelable satisfy it, a `String` does not.
+/// `@FixedSize T` admits a `byte` or a `@FixedSize` parcelable, not a `String`.
 #[test]
 fn fixed_size_requirement_is_checked_at_the_use_site() {
     assert!(generate(
@@ -177,8 +174,7 @@ fn fixed_size_requirement_is_checked_at_the_use_site() {
         "{msg}"
     );
 
-    // A generic instantiation is never fixed size, whatever its declaration
-    // is annotated (AOSP `CanBeFixedSize`: `IsGeneric()` first).
+    // A generic instantiation is never fixed size (AOSP `CanBeFixedSize`: `IsGeneric()` first).
     let msg = error_message(
         r#"
         package p;
@@ -223,8 +219,7 @@ fn type_argument_cannot_be_annotated() {
     }
 }
 
-/// `List` takes one argument; the grammar admits more and AOSP refuses them
-/// (`aidl_language.cpp`: "List can only have one type parameter").
+/// The grammar admits more, but AOSP `aidl_language.cpp` refuses them for `List`.
 #[test]
 fn list_takes_exactly_one_type_argument() {
     let msg = error_message(
@@ -264,9 +259,7 @@ fn vintf_stability_requirement_is_checked_at_the_use_site() {
     );
 }
 
-/// A generic parcelable held by value is an edge of the sizing graph like
-/// any parcelable: a cycle closed only through `Foo<int>` fields is boxed
-/// when `@nullable` and rejected when not.
+/// A generic held by value is a sizing-graph edge like any parcelable.
 #[test]
 fn a_cycle_through_generic_parcelables_is_boxed_or_rejected() {
     let out = generate(
@@ -350,6 +343,7 @@ fn type_argument_cannot_be_an_array_list_or_void() {
     for (arg, what) in [
         ("int[]", "an array or List"),
         ("List<String>", "an array or List"),
+        ("void", "void"),
     ] {
         let msg = error_message(&format!(
             r#"
@@ -365,8 +359,7 @@ fn type_argument_cannot_be_an_array_list_or_void() {
     }
 }
 
-/// The parameter list itself: only `@FixedSize` and `@VintfStability` may
-/// annotate a parameter, and a name may not repeat.
+/// Only the AOSP type-parameter annotations are accepted, and a parameter name may not repeat.
 #[test]
 fn type_parameter_declaration_is_validated() {
     let ctx = SourceContext::new(
@@ -383,8 +376,7 @@ fn type_parameter_declaration_is_validated() {
     let msg = format!("{:?}", parse_document(&ctx).unwrap_err());
     assert!(msg.contains("type parameter 'T' is repeated"), "{msg}");
 
-    // The Java-only annotations AOSP admits here are accepted and ignored:
-    // they state no requirement on the argument.
+    // Java-only annotations AOSP admits here are accepted and ignored: no argument requirement.
     assert!(generate(
         r#"
         package p;
@@ -410,9 +402,7 @@ fn type_parameter_declaration_is_validated() {
         );
     }
 
-    // AOSP: "Generic types can't have nested types." A nested declaration is
-    // reachable from a field only by a bare-headed path (`Bar::Baz::Baz`),
-    // which a parameter named `Bar` would capture.
+    // AOSP: "Generic types can't have nested types" (a parameter `Bar` would shadow `Bar::Baz`).
     let msg = error_message(
         r#"
         package p;
@@ -428,8 +418,7 @@ fn type_parameter_declaration_is_validated() {
     );
 }
 
-/// `ParcelableHolder` is a nameable type, so it can be a type argument (AOSP
-/// accepts it; only a field, array or `List` of it is restricted).
+/// AOSP accepts `ParcelableHolder` as a type argument; array/`List`/`@nullable` forms are refused.
 #[test]
 fn parcelable_holder_can_be_a_type_argument() {
     let out = generate(
@@ -588,8 +577,7 @@ fn builtin_fmq_types_map_to_the_runtime_crate() {
     );
 }
 
-/// A vendored copy under an include directory wins over the builtin: it is
-/// compiled like any other source and referenced through its own module.
+/// A vendored copy under an include dir is compiled and referenced instead of the builtin.
 #[test]
 fn a_vendored_source_takes_precedence_over_the_builtin() {
     let dir = scratch_dir("builtin_override");
@@ -633,8 +621,7 @@ fn a_vendored_source_takes_precedence_over_the_builtin() {
 #[test]
 fn a_copy_discovered_by_a_later_source_still_takes_precedence() {
     let dir = scratch_dir("builtin_late_include");
-    // `src/A.aidl` with `package demo;`: `src` is not `…/demo`, so no
-    // include directory is derived from it.
+    // `src/A.aidl` with `package demo;`: `src` is not `…/demo`, so no include dir derives.
     let a = dir.join("src").join("A.aidl");
     std::fs::create_dir_all(a.parent().unwrap()).unwrap();
     std::fs::write(
@@ -676,9 +663,7 @@ fn a_copy_discovered_by_a_later_source_still_takes_precedence() {
     assert!(!generated.contains("rsbinder::NativeHandle"), "{generated}");
 }
 
-/// The vendored copy also wins when a builtin imports it: `MQDescriptor`
-/// stays the runtime crate's type while `NativeHandle` is compiled from the
-/// include directory, whichever import is resolved first.
+/// A vendored `NativeHandle` wins even as a builtin's import, whichever import resolves first.
 #[test]
 fn a_vendored_dependency_of_a_builtin_takes_precedence() {
     let dir = scratch_dir("builtin_dependency_override");

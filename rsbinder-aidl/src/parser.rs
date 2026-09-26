@@ -40,16 +40,14 @@ thread_local! {
     static BUILTIN_RUST_PATHS: RefCell<HashMap<Namespace, String>> = RefCell::new(HashMap::new());
 }
 
-/// Record that the declaration at `ns` is not generated here but provided by
-/// the runtime crate at `rust_path` (relative to its root).
+/// Record that `ns` is not generated but provided at the runtime crate's `rust_path`.
 pub(crate) fn register_builtin_path(ns: &Namespace, rust_path: &str) {
     BUILTIN_RUST_PATHS.with(|map| {
         map.borrow_mut().insert(ns.clone(), rust_path.to_owned());
     });
 }
 
-/// The runtime-crate path of a builtin declaration, or `None` for one that
-/// is generated from the sources being compiled.
+/// The runtime-crate path of a builtin declaration; `None` when it is generated here.
 pub(crate) fn builtin_rust_path(ns: &Namespace) -> Option<String> {
     BUILTIN_RUST_PATHS.with(|map| map.borrow().get(ns).cloned())
 }
@@ -505,8 +503,7 @@ fn by_value_type_name(ty: &Type) -> Option<&str> {
     if ty.array_types.iter().any(|a| a.const_expr.is_none()) {
         return None;
     }
-    // `List`/`Map` alone hold their argument behind an allocation; a
-    // user-defined generic parcelable is inline like any parcelable.
+    // Only `List`/`Map` hold their argument on the heap; a user-defined generic is inline.
     if ty.non_array_type.generic.is_some()
         && matches!(ty.non_array_type.name.as_str(), "List" | "Map")
     {
@@ -1313,7 +1310,7 @@ pub enum Generic {
 }
 
 impl Generic {
-    /// The type arguments as written, in order; shapes 1 and 2 yield their inner `Bar<X>` as one argument.
+    /// The type arguments in order; shapes 1 and 2 yield their inner `Bar<X>` as one argument.
     pub fn type_args(&self) -> Vec<Type> {
         let nested = |non_array_type: &NonArrayType, inner: &[Type]| Type {
             annotation_list: Vec::new(),
@@ -1344,8 +1341,7 @@ impl Generic {
         }
     }
 
-    /// The first type argument's value type. The grammar admits any number
-    /// of arguments; the caller checks the count.
+    /// The first type argument's value type; panics on a `Generic` with no arguments.
     pub fn to_value_type(&self) -> Result<ValueType, crate::error::AidlError> {
         let args = self.type_args();
         Ok(type_generator::TypeGenerator::new_with_type(&args[0])?.value_type)
@@ -2485,8 +2481,7 @@ impl TypeParam {
 /// Annotations that state a requirement on a type argument.
 const TYPE_PARAM_REQUIREMENTS: &[&str] = &["@FixedSize", "@VintfStability"];
 
-/// Annotations AOSP accepts on a type parameter (`AidlAnnotation::AllSchemas`,
-/// `CONTEXT_TYPE_PARAM`, which `CONTEXT_ALL` includes).
+/// Annotations AOSP accepts on a type parameter (`AllSchemas` entries with `CONTEXT_TYPE_PARAM`).
 const TYPE_PARAM_ANNOTATIONS: &[&str] = &[
     "@FixedSize",
     "@VintfStability",
@@ -3151,7 +3146,7 @@ mod tests {
 
     #[test]
     fn test_second_type_parameter_set_is_rejected() -> Result<(), Box<dyn Error>> {
-        // Shape 2, inner `A` already has `<B>`: without the parse-time check it made `List<A<C>>`.
+        // Shape 2 with inner `A<B>`: `Generic::type_args` would drop `<B>` and yield `List<A<C>>`.
         let ctx = SourceContext::new("p.aidl", "parcelable P { List<A<B><C>> x; }");
         let err = parse_document(&ctx).expect_err("second `<...>` must be rejected");
         assert!(

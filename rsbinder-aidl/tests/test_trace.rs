@@ -41,9 +41,7 @@ fn trace_off_emits_no_table() {
     }
 }
 
-/// Every proxy call, sync and async, opens its client span with the method's
-/// own name and code. `getInterfaceVersion`/`getInterfaceHash` take the same
-/// hook; `tests/tests/aidl_spans.rs` calls them at runtime.
+/// Version/hash getters take the same hook; `tests/tests/aidl_spans.rs` runs the version one.
 #[test]
 fn trace_on_opens_a_client_span_per_proxy_call() {
     for enabled_async in [false, true] {
@@ -109,8 +107,7 @@ fn explicit_ids_leave_empty_slots() {
     assert_eq!(names, ["a", "", "", "b"]);
 }
 
-/// 0 → 5 skips 4 ids and 5 → 30 skips 24 more: past AOSP `kMaxSkip` (10),
-/// so the table stops at id 5 rather than growing to 31 entries.
+/// 4 + 24 skipped ids exceed AOSP `kMaxSkip` (10), so the table stops at id 5, not 31 entries.
 #[test]
 fn table_stops_once_more_than_ten_ids_are_skipped() {
     let names = function_names(&[

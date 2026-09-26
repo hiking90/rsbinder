@@ -193,13 +193,7 @@ pub(crate) fn is_builtin_aidl_type(fqcn: &str) -> bool {
     matches!(fqcn, "android.os.ParcelFileDescriptor")
 }
 
-/// A declaration the runtime crate ships compiled, so an `import` of it
-/// needs no `.aidl` beside the user's sources. The vendored source is
-/// parsed for its declaration (field types, `@VintfStability`, type
-/// parameters and their requirements) and nothing is generated for it;
-/// every reference names `<runtime crate>::<rust_path>` instead. A source
-/// found under an include directory takes precedence and is compiled
-/// normally.
+/// A declaration the runtime crate ships compiled: parsed, never generated (plans/12-fmq.md §10.1).
 pub(crate) struct BuiltinDecl {
     /// Fully-qualified AIDL name.
     pub fqcn: &'static str,
@@ -211,10 +205,7 @@ pub(crate) struct BuiltinDecl {
     pub source: &'static str,
 }
 
-/// AOSP `hardware/interfaces` types rsbinder provides: the Fast Message
-/// Queue descriptor (`rsbinder::fmq`) and the `NativeHandle` it carries.
-/// Vendored from `android17-release`; both packages are VINTF-stable and
-/// have not changed since Android 11.
+/// AOSP FMQ types vendored from `android17-release` (unchanged since Android 11), plus rsbinder's.
 pub(crate) const BUILTIN_DECLS: &[BuiltinDecl] = &[
     BuiltinDecl {
         fqcn: "android.hardware.common.NativeHandle",
@@ -246,8 +237,7 @@ pub(crate) const BUILTIN_DECLS: &[BuiltinDecl] = &[
         filename: "<rsbinder-aidl>/android/hardware/common/fmq/UnsynchronizedWrite.aidl",
         source: include_str!("../aidl/android/hardware/common/fmq/UnsynchronizedWrite.aidl"),
     },
-    // rsbinder's own: the consumer's end of a stream (`rsbinder::stream`),
-    // which a user's `.aidl` takes or returns in the call that opens one.
+    // rsbinder's own: a stream's consumer end (`rsbinder::stream`), passed in the opening call.
     BuiltinDecl {
         fqcn: "rsbinder.stream.StreamEndpoint",
         rust_path: "stream::StreamEndpoint",
@@ -260,9 +250,7 @@ pub(crate) fn builtin_decl(fqcn: &str) -> Option<&'static BuiltinDecl> {
     BUILTIN_DECLS.iter().find(|decl| decl.fqcn == fqcn)
 }
 
-/// The `.aidl` files an import resolves to under the include directories.
-/// A builtin's name vendored under more than one include directory: the same
-/// refusal as for any other import (AOSP "Duplicate files found").
+/// Refuses a builtin vendored under two include dirs, as AOSP does ("Duplicate files found").
 fn ambiguous_builtin_copy(fqcn: &str, candidates: &[PathBuf]) -> AidlError {
     AidlError::Config {
         message: format!(
@@ -358,8 +346,7 @@ pub struct Builder {
     // walked: cargo scans directories recursively, so the two together
     // trigger reruns on modifications and on additions/removals.
     dependencies: Vec<PathBuf>,
-    // Builtin declarations an import pulled in (`BUILTIN_DECLS`). Parsed so
-    // references resolve; never generated.
+    // Builtin declarations an import pulled in: parsed so references resolve, never generated.
     builtin_documents: Vec<parser::Document>,
 }
 
@@ -588,13 +575,7 @@ impl Builder {
         Ok(content)
     }
 
-    /// Parse a builtin's vendored source so its declaration resolves, and
-    /// record the runtime-crate path every reference to it must use. Called
-    /// only once every source is parsed, so a declaration a source already
-    /// compiled keeps precedence and is not registered. The builtin's own
-    /// imports resolve like a source's: a copy under an include directory
-    /// is queued as a source, otherwise the import must be a builtin (or
-    /// `ParcelFileDescriptor`) and is queued behind this one.
+    /// Parse a builtin's vendored source and register its runtime path (plans/12-fmq.md §10.1).
     fn add_builtin(
         &mut self,
         builtin: &'static BuiltinDecl,
@@ -679,9 +660,7 @@ impl Builder {
             Some(components.collect())
         }
 
-        // Builtins are registered only after every source is in: an include
-        // directory may vendor a declaration a builtin imports, and that copy
-        // is compiled, so the builtin must not claim the name first.
+        // Builtins wait for every source: an include dir may vendor a name a builtin imports.
         let mut pending_builtins: Vec<&'static BuiltinDecl> = Vec::new();
         while !sources.is_empty() || !pending_builtins.is_empty() {
             for path in take(&mut sources) {
@@ -809,9 +788,7 @@ impl Builder {
                 continue;
             }
             if let Some(builtin) = pending_builtins.pop() {
-                // The include set has grown since this import was met (every
-                // source adds its package directory), so look again: a copy
-                // that is now visible is a source, not a builtin.
+                // Look again: every source since this import was met added its package dir.
                 let mut candidates = import_candidates(&includes, builtin.fqcn);
                 match candidates.len() {
                     0 => {}
@@ -824,8 +801,7 @@ impl Builder {
                         continue;
                     }
                 }
-                // Collected, not returned: the user sources' diagnostics
-                // gathered above must reach the same report.
+                // Collected, not returned: the sources' diagnostics above share the report.
                 if let Err(e) =
                     self.add_builtin(builtin, &includes, &mut sources, &mut pending_builtins)
                 {
@@ -834,11 +810,7 @@ impl Builder {
             }
         }
 
-        // A builtin is chosen when no copy is visible at that moment. A copy
-        // that surfaced afterwards (an include directory another builtin's
-        // import discovered) would leave the name registered as the runtime
-        // crate's type and compiled as a module at once, so it is an error
-        // rather than a silent choice.
+        // A copy seen after its builtin was registered is refused (plans/12-fmq.md §10.3).
         for builtin in BUILTIN_DECLS {
             let ns = Namespace::new(builtin.fqcn, Namespace::AIDL);
             if parser::builtin_rust_path(&ns).is_none() {

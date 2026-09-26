@@ -534,8 +534,7 @@ fn test_no_backing_annotation_defaults_to_byte() {
     assert!(gen.document(&doc).is_ok());
 }
 
-/// AOSP `AidlTypenames` "redefinition": one type in two files of a package
-/// would otherwise render `pub mod A` twice in one package module (E0428).
+/// AOSP `AidlTypenames` "redefinition"; accepting it would emit `pub mod A` twice (E0428).
 #[test]
 fn test_same_type_in_two_files_is_a_redefinition() {
     let tmp = scratch_dir("redefinition");

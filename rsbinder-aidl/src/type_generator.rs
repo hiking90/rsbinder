@@ -157,9 +157,7 @@ pub struct TypeGenerator {
     pub(crate) is_nullable: bool,
     pub value_type: ValueType,
     array_types: Vec<ArrayInfo>,
-    /// Arguments of the one user-defined generic type this generator names
-    /// (`MQDescriptor<byte, Flavor>` bare, as an array element, or as a
-    /// `List` element). Empty for every other type.
+    /// User-defined generic's arguments, bare or as array/`List` element; empty otherwise.
     type_args: Vec<TypeGenerator>,
     pub identifier: String,
     direction: Direction,
@@ -200,8 +198,7 @@ impl TypeGenerator {
                         ));
                     }
                     let elem_generator = Self::new_with_type(&args[0])?;
-                    // `List<Foo<int>>`: the element's arguments travel with
-                    // this generator (the list itself has none of its own).
+                    // `List<Foo<int>>`: the list carries its element's type arguments.
                     type_args = elem_generator.type_args;
                     let elem = elem_generator.value_type;
                     if matches!(elem, ValueType::Array(_)) {
@@ -271,9 +268,7 @@ impl TypeGenerator {
             ));
         }
 
-        // `Foo<A, B>` on a user-defined type: keep the arguments so the Rust
-        // path carries them. Whether `Foo` takes them is settled against the
-        // declaration in `ensure_resolvable`, which every use site calls.
+        // Arity and requirements are checked later, in `ensure_resolvable` at every use site.
         if let (ValueType::UserDefined(_), Some(generic)) = (&value_type, &aidl_type.generic) {
             for arg in generic.type_args() {
                 type_args.push(Self::new_with_type(&arg)?);
@@ -409,11 +404,7 @@ impl TypeGenerator {
         }
     }
 
-    /// AOSP `AidlTypeSpecifier::CheckValid` for a user-defined generic: the
-    /// argument count must match the declaration, and an argument must
-    /// satisfy each annotation its parameter carries (`@FixedSize T` takes
-    /// only what `can_be_fixed_size` admits, `@VintfStability T` only a
-    /// `@VintfStability` declaration).
+    /// AOSP `AidlTypeSpecifier::CheckValid` for a user-defined generic's arguments.
     fn ensure_type_args(&self, lookup_decl: &LookupDecl) -> Result<(), AidlError> {
         let params: &[parser::TypeParam] = match &lookup_decl.decl {
             Declaration::Parcelable(decl) => &decl.type_params,
@@ -441,9 +432,7 @@ impl TypeGenerator {
             ));
         }
         for (param, arg) in params.iter().zip(&self.type_args) {
-            // AOSP `GetRustName` names a type argument without its array or
-            // list form, and `void` has no name at all, so neither can be
-            // spelled in the generated Rust.
+            // AOSP `GetRustName` drops `[]`, mis-names `List`; refusing `void` is an rsbinder rule.
             let unsupported = match &arg.value_type {
                 ValueType::Array(_) => Some("an array or List"),
                 ValueType::Void => Some("void"),
@@ -478,8 +467,7 @@ impl TypeGenerator {
         Ok(())
     }
 
-    /// Whether this is a bare user-defined type whose declaration is
-    /// `@VintfStability` (directly or through an enclosing declaration).
+    /// Whether this is a bare user-defined type in `@VintfStability` scope (own or enclosing).
     fn is_vintf_declaration(&self) -> bool {
         if !self.array_types.is_empty() {
             return false;
@@ -647,9 +635,7 @@ impl TypeGenerator {
         } else {
             simple.into_owned()
         };
-        // `Foo<A, B>`: the arguments as Rust types. AOSP `GetRustName` names
-        // an argument bare — its `Option`, `Vec` and `&` wrapping belong to
-        // the whole field or parameter, never to a type argument.
+        // AOSP `GetRustName` names an argument bare: `Option`/`Vec`/`&` wrap only the whole type.
         let path = if self.type_args.is_empty() {
             path
         } else {
@@ -673,8 +659,7 @@ impl TypeGenerator {
         }
     }
 
-    /// This type in a type-argument position: the bare Rust name. The parser
-    /// refuses an annotation there, so there is no `@nullable` to reflect.
+    /// Bare Rust name as a type argument; the parser refuses `@nullable` there.
     fn type_arg_decl(&self) -> String {
         self.type_decl(&self.value_type, false)
     }
