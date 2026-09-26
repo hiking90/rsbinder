@@ -101,11 +101,8 @@ impl Credit {
 
     /// One step of taking a credit: `None` if the caller has to wait.
     fn poll_credit(state: &mut CreditState) -> Option<Result<()>> {
-        if state.dead {
-            return Some(Err(StatusCode::DeadObject));
-        }
-        if state.canceled {
-            return Some(Err(StatusCode::InvalidOperation));
+        if let Err(e) = Self::latch(state) {
+            return Some(Err(e));
         }
         if state.available > 0 {
             state.available -= 1;
@@ -116,6 +113,21 @@ impl Credit {
 
     fn is_canceled(&self) -> bool {
         self.lock().canceled
+    }
+
+    /// The latched death or cancel as an error; `Ok` while neither.
+    fn latched(&self) -> Result<()> {
+        Self::latch(&self.lock())
+    }
+
+    fn latch(state: &CreditState) -> Result<()> {
+        if state.dead {
+            return Err(StatusCode::DeadObject);
+        }
+        if state.canceled {
+            return Err(StatusCode::InvalidOperation);
+        }
+        Ok(())
     }
 
     /// Non-blocking, for the producer's `Drop`, which must not park an unwinding thread.
@@ -484,6 +496,7 @@ impl<T: Serialize + ?Sized> Producer<T> {
     pub(super) fn send(&mut self, item: &T) -> Result<()> {
         // Before the item is queued: nothing will send it.
         self.usable()?;
+        self.credit.latched()?;
         if self.encode(item)? {
             self.flush()?;
         }
@@ -589,7 +602,10 @@ impl<T: Serialize + ?Sized> Producer<T> {
         &mut self,
         item: &T,
     ) -> impl std::future::Future<Output = Result<()>> + Send + '_ {
-        let encoded = self.usable().and_then(|()| self.encode(item));
+        let encoded = self
+            .usable()
+            .and_then(|()| self.credit.latched())
+            .and_then(|()| self.encode(item));
         async move {
             if encoded? {
                 self.flush_async().await?;
@@ -2244,10 +2260,9 @@ mod tests {
         let mut sink = Producer::<i32>::open(&sink_binder, &SinkPolicy::default())
             .expect("the sink object is still there");
         assert!(sink.is_canceled(), "`onStart` must have been answered");
-        assert_eq!(
-            sink.send(&1).and_then(|()| sink.flush()).err(),
-            Some(StatusCode::InvalidOperation)
-        );
+        // Refused on entry, as on the ring, not queued into a batch that will never leave.
+        assert_eq!(sink.send(&1).err(), Some(StatusCode::InvalidOperation));
+        assert_eq!(sink.pending(), 0);
     }
 
     /// An async producer awaiting credit yields the thread; on one thread the consumer needs it.
