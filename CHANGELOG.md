@@ -156,6 +156,12 @@ This changelog starts at 0.9.0. For earlier releases, see the
   the consumer its peer — because back-pressure leaves nothing in flight to
   fail: a producer parked for room and a consumer parked for an item both
   end with `DeadObject` when the peer's process goes.
+  `SinkPolicy::send_timeout` (default `None`, wait indefinitely) bounds each
+  producer call's wait for ring room or RPC credit with one deadline, the
+  blocking-pool wait of an async call included, so a consumer that is alive
+  but neither reads nor cancels cannot hold a service thread forever: the
+  call returns `TimedOut`, the item is not written or queued, and the stream
+  stays usable (`end` still ends it, reporting what it had to give up).
 - **Work source API** (AOSP `IPCThreadState` / Java `Binder` work source):
   `set_calling_work_source_uid`, `get_calling_work_source_uid`,
   `clear_calling_work_source`, `restore_calling_work_source`,
@@ -259,6 +265,35 @@ This changelog starts at 0.9.0. For earlier releases, see the
   `false` on such a parcel in every feature configuration, which is what makes
   `write_blob` store its payload inline there. Nothing about the wire changes,
   and no signature changes; a build with `rpc` behaves as before.
+- **`get_calling_uid()` / `get_calling_pid()` outside a transaction return
+  this process's own uid and pid**, as AOSP's `IPCThreadState` does
+  (`getuid()` / `getpid()`), instead of `0`. `0` is root's uid, so a uid
+  check made on an in-process call, or on a thread the transaction did not
+  arrive on, passed as root. Inside a transaction nothing changes.
+- **RPC `link_to_death` is refused with `InvalidOperation` on a session that
+  would not notice its connection dropping** — a client with no incoming
+  connections and no serve loop — as AOSP `BpBinder::linkToDeath` refuses an
+  RPC binder whose session has no incoming threads. Such a link used to
+  succeed and then report nothing until a later call happened to fail. The
+  server side, a client with `incoming_connections(n)`, and a session served
+  by the new `RpcSession::spawn_serve` (or already inside `serve_blocking`)
+  are unaffected; code that linked first and started its serve thread
+  afterwards calls `spawn_serve` before linking. `death_signal` over RPC
+  follows the same rule.
+- **`RpcServer::setup_unix_server` removes only a stale socket.** It used to
+  delete whatever was at the path. Now a regular file there is refused with
+  `AlreadyExists` and a socket another server is listening on with
+  `EADDRINUSE`; a socket nobody listens on (`ECONNREFUSED`, what a crashed
+  server leaves) is still replaced. Dropping the server removes the socket
+  file only if it is still the one it bound (same device and inode), so it
+  no longer deletes a successor's socket at the same path.
+- **A kernel `Client::get` / `connect` reports the service manager's own
+  failure** instead of `NameNotFound` when the service manager cannot be
+  reached, and `hub` logs why once: no context manager (`rsb_hub` not
+  running), or an Android SDK whose `android_*` feature this build lacks.
+- **`ServerGuard` and `Server` are `#[must_use]`.** A bare
+  `serve(uri)?.spawn()?;` dropped the guard at once, which stops an RPC
+  server while the same line keeps a kernel server running.
 
 ### Deprecated
 
@@ -295,6 +330,11 @@ in the release after 0.13.0. The single-connection one-liners
   `ARpcSession_setMaxIncomingThreads`) even from inside a handler, and the
   r34 profile, which has no way to open one, cannot make it. Twoway nested
   calls are unchanged.
+- **`connect_async("binder://…")` can be cancelled.** Its wait for the name
+  ran inside `spawn_blocking`, so dropping the future under a `timeout` or
+  `select!` left a blocking-pool thread waiting until the service appeared,
+  and `Runtime::drop` waited for that thread. It now waits through
+  `wait_for_interface_async`, which ends the wait when the future is dropped.
 
 ## [0.12.0] - 2026-09-19
 

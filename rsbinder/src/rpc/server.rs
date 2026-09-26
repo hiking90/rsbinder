@@ -77,14 +77,15 @@ enum ServerListener {
 /// abstract Unix, `Vsock`, and `Tcp` have no filesystem cleanup (the
 /// kernel reclaims the bind on `Drop` of the listener fd itself).
 enum BindAddress {
-    Unix(PathBuf),
+    /// `file`: the bound socket's (dev, ino), so `Drop` never unlinks a successor's socket.
+    Unix {
+        path: PathBuf,
+        file: Option<(u64, u64)>,
+    },
     #[cfg(any(target_os = "linux", target_os = "android"))]
     UnixAbstract,
     #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
-    Vsock {
-        cid: u32,
-        port: u32,
-    },
+    Vsock { cid: u32, port: u32 },
     #[cfg(feature = "rpc-tls")]
     Tcp(SocketAddr),
 }
@@ -493,18 +494,77 @@ pub struct RpcServer {
     live_sessions: Mutex<Vec<std::sync::Weak<RpcSessionInner>>>,
 }
 
+/// Clear `path` for a bind: only a socket that refuses connections is removed.
+fn remove_stale_socket(path: &Path) -> Result<()> {
+    use std::io::ErrorKind;
+    use std::os::unix::fs::FileTypeExt;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    if !meta.file_type().is_socket() {
+        log::error!(
+            "RpcServer::setup_unix_server: {path:?} exists and is not a socket; not removing it"
+        );
+        return Err(StatusCode::AlreadyExists);
+    }
+    match UnixStream::connect(path) {
+        Ok(_) => {
+            log::error!("RpcServer::setup_unix_server: another server is listening on {path:?}");
+            Err(StatusCode::from(rustix::io::Errno::ADDRINUSE))
+        }
+        Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
+            std::fs::remove_file(path).or_else(|e| match e.kind() {
+                ErrorKind::NotFound => Ok(()),
+                _ => Err(StatusCode::from(e)),
+            })
+        }
+        Err(e) => {
+            log::error!("RpcServer::setup_unix_server: cannot probe {path:?}: {e}");
+            Err(e.into())
+        }
+    }
+}
+
+/// The (device, inode) of the file at `path`, without following a symlink.
+fn socket_file_id(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path)
+        .ok()
+        .map(|meta| (meta.dev(), meta.ino()))
+}
+
 impl RpcServer {
-    /// Bind + listen on a Unix-domain socket path. A stale socket file
-    /// at `path` is removed first (best effort).
+    /// Bind + listen on a Unix-domain socket path.
+    ///
+    /// Something already at `path` is removed only when it is a **stale**
+    /// socket — a socket file nothing listens on, which a connect attempt
+    /// finds refused (`ECONNREFUSED`), as a crashed server leaves behind.
+    /// Anything else is left alone and refused:
+    ///
+    /// - a socket another server is listening on →
+    ///   `StatusCode::Errno(-EADDRINUSE)`, so a second instance cannot
+    ///   silently take over a running server's path;
+    /// - a file that is not a socket → [`StatusCode::AlreadyExists`].
+    ///
+    /// AOSP `RpcServer::setupUnixDomainServer` never removes anything and
+    /// fails on every existing path; the stale-socket case is kept so a
+    /// restart after a crash needs no manual cleanup.
+    ///
+    /// Dropping the server removes the socket file only while it is still
+    /// the one this server bound (same device and inode), so a server that
+    /// has since been replaced at the same path keeps its socket.
     pub fn setup_unix_server(path: impl Into<PathBuf>) -> Result<Arc<RpcServer>> {
         let path = path.into();
-        let _ = std::fs::remove_file(&path);
+        remove_stale_socket(&path)?;
         // `StatusCode: From<std::io::Error>` — `?` converts directly.
         let listener = UnixListener::bind(&path)?;
+        let file = socket_file_id(&path);
         let listener = ServerListener::Unix(listener);
         // Non-blocking accept so the loop can observe `shutdown`.
         listener.set_nonblocking(true)?;
-        Ok(Self::wrap(listener, BindAddress::Unix(path)))
+        Ok(Self::wrap(listener, BindAddress::Unix { path, file }))
     }
 
     /// Bind + listen on a Linux/Android abstract Unix-domain socket.
@@ -1926,7 +1986,7 @@ impl RpcServer {
     /// to expose.
     pub fn path(&self) -> Option<&Path> {
         match &self.bind {
-            BindAddress::Unix(p) => Some(p.as_path()),
+            BindAddress::Unix { path, .. } => Some(path.as_path()),
             #[cfg(any(target_os = "linux", target_os = "android"))]
             BindAddress::UnixAbstract => None,
             #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
@@ -1943,7 +2003,7 @@ impl RpcServer {
     pub fn vsock_address(&self) -> Option<(u32, u32)> {
         match &self.bind {
             BindAddress::Vsock { cid, port } => Some((*cid, *port)),
-            BindAddress::Unix(_) => None,
+            BindAddress::Unix { .. } => None,
             BindAddress::UnixAbstract => None,
             #[cfg(feature = "rpc-tls")]
             BindAddress::Tcp(_) => None,
@@ -1958,7 +2018,7 @@ impl RpcServer {
     pub fn tcp_address(&self) -> Option<SocketAddr> {
         match &self.bind {
             BindAddress::Tcp(addr) => Some(*addr),
-            BindAddress::Unix(_) => None,
+            BindAddress::Unix { .. } => None,
             #[cfg(any(target_os = "linux", target_os = "android"))]
             BindAddress::UnixAbstract => None,
             #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
@@ -2004,10 +2064,11 @@ impl Drop for RpcServer {
         self.shutdown.store(true, Ordering::SeqCst);
         // Best-effort backend-specific cleanup; never panic in Drop.
         match &self.bind {
-            BindAddress::Unix(p) => {
-                // Remove the UDS file so a follow-up `setup_unix_server`
-                // on the same path doesn't see a stale ENOENT/EADDRINUSE.
-                let _ = std::fs::remove_file(p);
+            BindAddress::Unix { path, file } => {
+                // Only our own socket: another server may have bound this path since.
+                if file.is_some() && socket_file_id(path) == *file {
+                    let _ = std::fs::remove_file(path);
+                }
             }
             #[cfg(any(target_os = "linux", target_os = "android"))]
             BindAddress::UnixAbstract => {}

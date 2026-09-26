@@ -402,7 +402,7 @@ fn an_async_producer_streams_across_a_session() {
     assert_eq!(f.demo.r#lastError().expect("lastError"), 0);
 }
 
-/// The producer runs outside any handler, so `Sink::open` refuses, not the first batch.
+/// Without incoming connections the consumer refuses in its own process, before any call is made.
 #[test]
 fn a_session_without_callback_connections_refuses_the_stream() {
     let f = fixture("nocb", 0);
@@ -411,15 +411,10 @@ fn a_session_without_callback_connections_refuses_the_stream() {
         "a founding connection alone never grants CALLBACKS"
     );
 
-    let (_rx, endpoint) = f.default_receiver();
-    let refused = f
-        .demo
-        .r#subscribe(&endpoint, 10, 64, default_credits(), 0)
-        .expect_err("the service cannot push over this session");
     assert_eq!(
-        refused.transaction_error(),
-        rsbinder::StatusCode::InvalidOperation,
-        "the refusal names the transport, not the request: {refused:?}"
+        Receiver::<i32>::new(&f.demo.as_binder()).err(),
+        Some(rsbinder::StatusCode::InvalidOperation),
+        "nothing would read the producer's batches nor see it die"
     );
 }
 

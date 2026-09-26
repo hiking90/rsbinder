@@ -2769,10 +2769,11 @@ impl rsbinder::DeathRecipient for DeathFlag {
 /// A `DeathRecipient` linked to an RPC proxy fires when the **session
 /// connection drops** (AOSP `RpcState::sendObituaries`). The peer that
 /// wants the notification runs a serve loop (the AOSP "incoming
-/// thread" requirement); when the server process is killed the
-/// client's `serve_blocking` ends on `EndOfStream` and delivers the
-/// obituary. Also covers `unlink_to_death` (an unlinked recipient must
-/// NOT fire) and the post-death `link_to_death`→`DeadObject` contract.
+/// thread" requirement) and a link before it starts is refused; when the
+/// server process is killed the client's serve loop ends on `EndOfStream`
+/// and delivers the obituary. Also covers `unlink_to_death` (an unlinked
+/// recipient must NOT fire) and the post-death `link_to_death`→`DeadObject`
+/// contract.
 ///
 /// Mutant: dropping the `send_session_obituaries()` call from
 /// `serve_blocking` (or making `RpcProxy::link_to_death` an
@@ -2813,6 +2814,15 @@ fn rpc_death_recipient_fires_on_session_drop() {
 
     let weak_live: std::sync::Weak<dyn rsbinder::DeathRecipient> = Arc::downgrade(&live) as _;
     let weak_dead: std::sync::Weak<dyn rsbinder::DeathRecipient> = Arc::downgrade(&dead) as _;
+
+    // Nothing reads this session yet, so its loss would go unnoticed (AOSP: no incoming threads).
+    assert_eq!(
+        root.link_to_death(weak_live.clone()),
+        Err(rsbinder::StatusCode::InvalidOperation)
+    );
+    // The "incoming thread": recorded before the thread starts, so the links below never race it.
+    let serve = client.spawn_serve().expect("spawn_serve");
+
     root.link_to_death(weak_live.clone()).expect("link live");
     root.link_to_death(weak_dead.clone()).expect("link dead");
     // Single-position removal: only `dead` is unlinked.
@@ -2824,13 +2834,6 @@ fn rpc_death_recipient_fires_on_session_drop() {
         ),
         "a second unlink of an already-removed recipient is NameNotFound"
     );
-
-    // The "incoming thread": the client serves this session so it can
-    // observe the connection drop (AOSP getMaxIncomingThreads>=1).
-    let serving = client.clone();
-    let serve = std::thread::spawn(move || {
-        let _ = serving.serve_blocking();
-    });
 
     // Kill the server process ⇒ socket closes ⇒ client serve loop ends
     // ⇒ obituary delivered.
@@ -2896,6 +2899,8 @@ fn rpc_death_signal_completes_on_session_drop() {
 
     let client = RpcSession::setup_unix_client(&path).expect("connect");
     let root = client.get_root().expect("get_root");
+    // The "incoming thread" requirement, as in the test above: before the link.
+    let serve = client.spawn_serve().expect("spawn_serve");
     let signal = rsbinder::death_signal(&root).expect("death_signal on a live RPC proxy");
 
     // Awaited from a runtime of its own, so the completion has to travel from
@@ -2909,12 +2914,6 @@ fn rpc_death_signal_completes_on_session_drop() {
             .expect("runtime");
         rt.block_on(signal);
         let _ = tx_done.try_send(());
-    });
-
-    // The "incoming thread" requirement, as in the test above.
-    let serving = client.clone();
-    let serve = std::thread::spawn(move || {
-        let _ = serving.serve_blocking();
     });
 
     child.kill().expect("kill server");
@@ -3795,8 +3794,9 @@ fn b_entry_client_open_with_incoming() {
 }
 
 /// AC-20.5 — a client with an incoming connection learns of the server's
-/// death from that connection dropping; one without learns only from its
-/// next failed call.
+/// death from that connection dropping; one without cannot link a death
+/// recipient at all (AOSP `linkToDeath` without incoming threads), and its
+/// next failed call still ends the session.
 #[test]
 fn c_server_death_is_eager_with_incoming() {
     if let Ok(path) = std::env::var("RSB_RPC_DEATH_A13_SERVER") {
@@ -3840,28 +3840,27 @@ fn c_server_death_is_eager_with_incoming() {
     let eager_root = eager.get_root().expect("root");
     let lazy_root = lazy.get_root().expect("root");
     let (tx_e, rx_e) = std::sync::mpsc::sync_channel::<()>(1);
-    let (tx_l, rx_l) = std::sync::mpsc::sync_channel::<()>(1);
+    let (tx_l, _rx_l) = std::sync::mpsc::sync_channel::<()>(1);
     let flag_e: Arc<DeathFlag> = Arc::new(DeathFlag(tx_e));
     let flag_l: Arc<DeathFlag> = Arc::new(DeathFlag(tx_l));
     eager_root
         .link_to_death(Arc::downgrade(&flag_e) as _)
         .expect("link eager");
-    lazy_root
-        .link_to_death(Arc::downgrade(&flag_l) as _)
-        .expect("link lazy");
+    assert_eq!(
+        lazy_root.link_to_death(Arc::downgrade(&flag_l) as _),
+        Err(StatusCode::InvalidOperation),
+        "without an incoming connection nothing would observe the drop"
+    );
     child.0.kill().expect("kill server child");
     child.0.wait().expect("reap server child");
     assert!(
         rx_e.recv_timeout(Duration::from_secs(3)).is_ok(),
         "the incoming connection's drop must fire the obituary at once"
     );
-    assert!(
-        rx_l.recv_timeout(Duration::from_millis(500)).is_err(),
-        "without an incoming connection nothing observes the drop yet"
-    );
     assert!(EchoProxy(lazy_root.clone()).echo("x").is_err());
-    assert!(
-        rx_l.recv_timeout(Duration::from_secs(3)).is_ok(),
+    assert_eq!(
+        EchoProxy(lazy_root.clone()).echo("y"),
+        Err(StatusCode::DeadObject),
         "the failed call declares the session dead"
     );
     eager.close_session();
@@ -4389,4 +4388,76 @@ fn c_losing_the_last_outgoing_slot_declares_death_with_incoming() {
         "losing the last outgoing slot must run the death sequence"
     );
     assert_eq!(h.root.echo("after"), Err(StatusCode::DeadObject));
+}
+
+// ---- Unix socket path ownership ------------------------------------------
+
+fn file_id(path: &std::path::Path) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path).expect("stat");
+    (meta.dev(), meta.ino())
+}
+
+/// A regular file at the path is never removed to make room for a socket.
+#[test]
+fn a_unix_server_refuses_a_path_that_is_not_a_socket() {
+    let path = tmp_sock("notsock");
+    std::fs::write(&path, b"keep me").expect("write");
+    assert_eq!(
+        RpcServer::setup_unix_server(&path).err(),
+        Some(StatusCode::AlreadyExists)
+    );
+    assert_eq!(std::fs::read(&path).expect("still there"), b"keep me");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A second server cannot take a live server's path; the first keeps its socket.
+#[test]
+fn a_unix_server_refuses_a_path_another_server_listens_on() {
+    let path = tmp_sock("live");
+    let first = RpcServer::setup_unix_server(&path).expect("first server");
+    let bound = file_id(&path);
+    assert_eq!(
+        RpcServer::setup_unix_server(&path).err(),
+        Some(StatusCode::Errno(
+            -(rustix::io::Errno::ADDRINUSE.raw_os_error())
+        ))
+    );
+    assert_eq!(
+        file_id(&path),
+        bound,
+        "the first server's socket must be untouched"
+    );
+    std::os::unix::net::UnixStream::connect(&path).expect("the first server still answers");
+    drop(first);
+    assert!(!path.exists(), "the first server removes its own socket");
+}
+
+/// A socket nobody listens on is what a crashed server leaves; it is replaced.
+#[test]
+fn a_unix_server_replaces_a_stale_socket() {
+    let path = tmp_sock("stale");
+    drop(std::os::unix::net::UnixListener::bind(&path).expect("bind"));
+    assert!(path.exists(), "a dropped listener leaves its socket file");
+    let server = RpcServer::setup_unix_server(&path).expect("a stale socket is replaced");
+    drop(server);
+    assert!(!path.exists());
+}
+
+/// Dropping a server whose path was taken over since does not delete the successor's socket.
+#[test]
+fn dropping_a_unix_server_spares_a_successor_at_the_same_path() {
+    let path = tmp_sock("successor");
+    let first = RpcServer::setup_unix_server(&path).expect("first server");
+    std::fs::remove_file(&path).expect("unlink behind the first server's back");
+    let second = RpcServer::setup_unix_server(&path).expect("second server");
+    let successor = file_id(&path);
+    drop(first);
+    assert_eq!(
+        file_id(&path),
+        successor,
+        "the successor's socket must survive"
+    );
+    drop(second);
+    assert!(!path.exists());
 }

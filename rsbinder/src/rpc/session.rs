@@ -1505,6 +1505,8 @@ pub(crate) struct SharedSession {
     /// was woken out of `recv`, found its slot gone, or was holding a
     /// frame it had just read. Never cleared.
     ended_locally: AtomicBool,
+    /// A user serve loop was started on this session (`serve_blocking*`, `spawn_serve`); sticky.
+    serve_declared: AtomicBool,
     /// Which side of the connection this session is: decides the
     /// founding slot's [`SlotRole`] and the client-vs-server teardown
     /// rules for serve-driven slots.
@@ -2708,6 +2710,18 @@ impl RpcSessionInner {
             .expect("serve_read_deadline poisoned")
     }
 
+    /// Whether a connection loss is noticed when it happens, so a death recipient can be told.
+    ///
+    /// True on the server side (its workers read every connection), for a
+    /// client with incoming connections (their threads read them), and once
+    /// a serve loop has been started on the session. AOSP's counterpart is
+    /// `BpBinder::linkToDeath`'s `getMaxIncomingThreads() >= 1` test.
+    pub(crate) fn notices_connection_loss(&self) -> bool {
+        self.shared.space() == AddressSpace::Acceptor
+            || self.shared.serve_declared.load(Ordering::SeqCst)
+            || self.incoming_slot_count() > 0
+    }
+
     fn incoming_slot_count(&self) -> usize {
         self.conn_state
             .lock()
@@ -3904,6 +3918,7 @@ impl RpcSession {
             rpc_session_id: gen_rpc_session_id()?,
             lifecycle: SessionLifecycle::new(),
             ended_locally: AtomicBool::new(false),
+            serve_declared: AtomicBool::new(false),
             space,
         }))
     }
@@ -4560,6 +4575,41 @@ impl RpcSession {
         self.serve_blocking_on(Self::FOUNDING_SLOT_ID)
     }
 
+    /// [`serve_blocking`](Self::serve_blocking) on a new thread, with the
+    /// serve loop recorded on the session **before** the thread starts.
+    ///
+    /// This is the way to make a session without incoming connections
+    /// notice a connection loss, so that
+    /// [`link_to_death`](crate::IBinder::link_to_death) on its proxies is
+    /// accepted: a `link_to_death` made after this returns never races the
+    /// thread's start. A thread spawned by hand that calls `serve_blocking`
+    /// records the loop only once it runs, so a `link_to_death` issued right
+    /// after the spawn can still be refused.
+    ///
+    /// The loop holds the founding connection while it waits, so a
+    /// single-connection session makes no further calls of its own once it
+    /// is served — only nested ones from inside a handler. A client that
+    /// keeps calling and also wants death notification opens incoming
+    /// connections instead
+    /// ([`RpcClientConfig::incoming_connections`]).
+    ///
+    /// The thread ends when the session does; join the handle for its
+    /// [`SessionEnd`]. Fails only if the thread cannot be created.
+    pub fn spawn_serve(&self) -> Result<std::thread::JoinHandle<SessionEnd>> {
+        self.inner
+            .shared
+            .serve_declared
+            .store(true, Ordering::SeqCst);
+        let session = self.clone();
+        std::thread::Builder::new()
+            .name("rsbinder-rpc-serve".into())
+            .spawn(move || session.serve_blocking())
+            .map_err(|e| {
+                log::error!("RpcSession::spawn_serve: cannot start the serve thread: {e}");
+                StatusCode::from(e)
+            })
+    }
+
     /// Serve a *specific* slot of the pool until its read reaches end of
     /// stream or the loop fails (the server worker's API — each accepted
     /// connection's worker drives the slot it was added as via
@@ -4613,6 +4663,10 @@ impl RpcSession {
         clear_deadline_after_first: bool,
         admission_deadline_armed: bool,
     ) -> SessionEnd {
+        self.inner
+            .shared
+            .serve_declared
+            .store(true, Ordering::SeqCst);
         // Read the slot's role now: a `RpcSession::close_session` racing this
         // loop clears the pool, and a role read after the loop would come
         // back `false` for a slot that is simply gone.

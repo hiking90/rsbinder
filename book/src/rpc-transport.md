@@ -523,9 +523,14 @@ refuses the rest, which the client sees as a setup error.
 
 Two consequences worth knowing:
 
-- **Death is observed at once.** The serving thread sees the server's
-  connection drop and fires the linked death recipients immediately —
-  the session no longer waits for its next failed call to notice.
+- **Death can be observed at all.** The serving thread sees the server's
+  connection drop and fires the linked death recipients immediately. A
+  client session without incoming connections has nobody reading its
+  connection, so `link_to_death` is refused there with `InvalidOperation`
+  (AOSP refuses it the same way). The other way to get notified is
+  `RpcSession::spawn_serve`, which dedicates the founding connection to a
+  serve loop: the session then makes no calls of its own, only nested ones
+  from inside a handler.
 - **Stop the session explicitly.** The serving threads keep the session
   alive; dropping the `RpcSession` handle and every proxy does not end
   them. Call `RpcSession::close_session()` when you are done — it shuts

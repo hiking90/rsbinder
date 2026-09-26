@@ -268,6 +268,16 @@ impl Drop for RpcProxy {
     }
 }
 
+/// Why an RPC `link_to_death` was refused; logged each time (the RPC stack keeps no globals).
+fn unwatched_session_link() {
+    log::error!(
+        "link_to_death over RPC refused: nothing reads this session's connections, so its \
+         loss would go unnoticed. Open incoming connections \
+         (RpcClientConfig::incoming_connections / ClientOptions::incoming_connections) \
+         or start a serve loop with RpcSession::spawn_serve first."
+    );
+}
+
 impl IBinder for RpcProxy {
     /// Register a death recipient. Death over RPC = the **session
     /// connection dropping** (AOSP `RpcState::sendObituaries`): the
@@ -276,24 +286,30 @@ impl IBinder for RpcProxy {
     /// minus the kernel `requestDeathNotification` IPC (RPC has no
     /// death wire message).
     ///
-    /// **Detection requires the session to be served.** AOSP rejects an
-    /// RPC `linkToDeath` outright unless `getMaxIncomingThreads() >= 1`;
-    /// the rsbinder analogue is that the obituary is delivered by
-    /// [`RpcSession::serve_blocking`](super::session::RpcSession) on
-    /// connection loss, so a peer that wants death notification must
-    /// run a serve loop (it already does for nested callbacks). A
-    /// session that is never served still registers the recipient and
-    /// delivers **lazily**: the first transaction that fails on the lost
-    /// connection runs the same death sequence (obituaries + local
-    /// object release) — a documented rsbinder model property, faithful
-    /// to AOSP's incoming-thread requirement.
+    /// **Refused with [`StatusCode::InvalidOperation`] on a session that
+    /// would not notice the loss** — AOSP `BpBinder::linkToDeath` refuses an
+    /// RPC binder the same way unless its session has incoming threads. A
+    /// session notices a connection loss when something reads its
+    /// connections at all times:
     ///
-    /// A client built with
-    /// [`RpcClientConfig::incoming_connections`](super::session::RpcClientConfig::incoming_connections)
-    /// `≥ 1` *is* served — by the threads on its incoming (callback)
-    /// connections — so it observes the drop at once (AOSP
-    /// `onSessionAllIncomingThreadsEnded`) with no serve loop of its own.
+    /// - the server side of a session (its workers serve every connection);
+    /// - a client with incoming connections
+    ///   ([`RpcClientConfig::incoming_connections`](super::session::RpcClientConfig::incoming_connections)
+    ///   `≥ 1`), whose threads observe the drop at once;
+    /// - a session whose serve loop has been started —
+    ///   [`RpcSession::spawn_serve`](super::session::RpcSession::spawn_serve),
+    ///   or a call already inside
+    ///   [`serve_blocking`](super::session::RpcSession::serve_blocking).
+    ///
+    /// Anywhere else a recipient would hear nothing until a later call
+    /// happened to fail, so it is not registered. A call that fails on a
+    /// lost connection still runs the session's death sequence, which is
+    /// what fires the recipients registered on a session that qualifies.
     fn link_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()> {
+        if !self.session.notices_connection_loss() {
+            unwatched_session_link();
+            return Err(StatusCode::InvalidOperation);
+        }
         // Lock first, then check `obituary_sent` — kernel/AOSP ordering
         // (`BpBinder::linkToDeath` checks `mObitsSent` under `mLock`).
         let mut recipients = self.recipients.write().map_err(|_| {
