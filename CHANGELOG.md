@@ -33,7 +33,10 @@ This changelog starts at 0.9.0. For earlier releases, see the
   `rust_type` parcelable, an array, `List` or `void` as an argument, an
   annotation on an argument, and any annotation other than the four AOSP
   admits on a parameter (`@FixedSize`, `@VintfStability`, and the Java-only
-  `@JavaPassthrough`/`@JavaSuppressLint`, which are ignored).
+  `@JavaPassthrough`/`@JavaSuppressLint`). As in AOSP, every parameter
+  annotation is a requirement on the argument, and the Java-only two can
+  never be met, so a generic declared with one parses but every use of it is
+  rejected.
   `impl_serialize_for_parcelable!` and `impl_deserialize_for_parcelable!`
   accept `Foo<T, U>`.
 - **Builtin `android.hardware.common` types** (`rsbinder-aidl` + `rsbinder`):

@@ -444,7 +444,8 @@ impl TypeGenerator {
                     arg.type_span,
                 ));
             }
-            for requirement in param.requirements() {
+            // AOSP reads every parameter annotation as a requirement; any other is never met.
+            for requirement in &param.annotation_list {
                 let satisfied = match requirement.annotation.as_str() {
                     "@FixedSize" => arg.can_be_fixed_size(),
                     "@VintfStability" => arg.is_vintf_declaration(),

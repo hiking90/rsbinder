@@ -376,15 +376,27 @@ fn type_parameter_declaration_is_validated() {
     let msg = format!("{:?}", parse_document(&ctx).unwrap_err());
     assert!(msg.contains("type parameter 'T' is repeated"), "{msg}");
 
-    // Java-only annotations AOSP admits here are accepted and ignored: no argument requirement.
+    // AOSP admits Java-only annotations on a parameter but reads them as unmeetable requirements.
     assert!(generate(
         r#"
         package p;
         parcelable Q<@JavaSuppressLint(value={"NewApi"}) T, @JavaPassthrough(annotation="@X") U> { int a; }
-        parcelable Use { Q<String, IBinder> a; }
         "#,
     )
     .is_ok());
+    let msg = error_message(
+        r#"
+        package p;
+        parcelable Q<@JavaPassthrough(annotation="@X") U> { int a; }
+        parcelable Use { Q<String> a; }
+        "#,
+    );
+    assert!(
+        msg.contains(
+            "type 'String' used as type parameter 'U' of 'Q' must be annotated with @JavaPassthrough"
+        ),
+        "{msg}"
+    );
 
     // A parameter is spelled bare in the generated Rust; the generator refuses these names.
     for (name, what) in [

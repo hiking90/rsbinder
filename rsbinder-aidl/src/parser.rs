@@ -2469,18 +2469,6 @@ pub struct TypeParam {
     pub annotation_list: Vec<Annotation>,
 }
 
-impl TypeParam {
-    /// The requirement annotations, in declaration order.
-    pub fn requirements(&self) -> impl Iterator<Item = &Annotation> {
-        self.annotation_list
-            .iter()
-            .filter(|a| TYPE_PARAM_REQUIREMENTS.contains(&a.annotation.as_str()))
-    }
-}
-
-/// Annotations that state a requirement on a type argument.
-const TYPE_PARAM_REQUIREMENTS: &[&str] = &["@FixedSize", "@VintfStability"];
-
 /// Annotations AOSP accepts on a type parameter (`AllSchemas` entries with `CONTEXT_TYPE_PARAM`).
 const TYPE_PARAM_ANNOTATIONS: &[&str] = &[
     "@FixedSize",
