@@ -488,7 +488,10 @@ impl Client {
     /// [`get`](Self::get)).
     pub fn binder(&self, name: &str) -> Result<SIBinder> {
         match &self.inner {
-            Inner::Kernel => crate::hub::wait_for_service(name).ok_or(StatusCode::NameNotFound),
+            // The service manager's own failure, not `NameNotFound`: the name was never looked up.
+            Inner::Kernel => crate::hub::default()?
+                .wait_for_service(name)
+                .ok_or(StatusCode::NameNotFound),
             #[cfg(feature = "rpc")]
             Inner::Rpc(s) => s.get_service(name),
         }

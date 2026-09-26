@@ -33,12 +33,13 @@ use rsbinder::StatusCode;
 #[test]
 #[ignore = "requires kernel binder (/dev/binder); run on REMOTE_LINUX/emulator"]
 fn a_kernel_option_the_process_cannot_honor_is_refused() {
-    // First in the process: this one decides the pool size.
-    rsbinder::serve("binder://?threads=4").expect("the first serve initializes ProcessState");
+    // First in the process: this one decides the pool size. Only the check at `serve` is tested.
+    let _ =
+        rsbinder::serve("binder://?threads=4").expect("the first serve initializes ProcessState");
 
     // Asking again for what is already true is not an error — the caller
     // gets exactly what it asked for.
-    rsbinder::serve("binder://?threads=4").expect("the same value must be accepted");
+    let _ = rsbinder::serve("binder://?threads=4").expect("the same value must be accepted");
 
     // A different value cannot be applied, and saying so is the point:
     // the pool stays at 4 either way, but now the caller is told.
@@ -50,7 +51,7 @@ fn a_kernel_option_the_process_cannot_honor_is_refused() {
 
     // Omitting the option asks for nothing, so it always succeeds — this
     // is what keeps a second server in the same process working.
-    rsbinder::serve("binder://").expect("no `?threads=` asks for nothing");
+    let _ = rsbinder::serve("binder://").expect("no `?threads=` asks for nothing");
 
     // The same rule through `ServeOptions`, which is applied later (at
     // `spawn`) than the URI form (at `serve`).
@@ -83,7 +84,7 @@ fn a_kernel_option_the_process_cannot_honor_is_refused() {
         rsbinder::ProcessState::default_mmap_size(),
         "the first serve carried no `?mmap=`, so the default is what it mapped"
     );
-    rsbinder::serve(&format!("binder://?mmap={in_force}"))
+    let _ = rsbinder::serve(&format!("binder://?mmap={in_force}"))
         .expect("the size already in force must be accepted");
     assert_eq!(
         rsbinder::serve(&format!(

@@ -100,6 +100,7 @@ pub struct ServeOptions {
 /// asked for a different driver or thread count, which the process
 /// cannot give it). RPC: the listener is bound at `run`/`spawn` so
 /// [`ServeOptions`] (TLS config, limits) can be applied first.
+#[must_use = "a Server serves nothing until `run` or `spawn` is called"]
 pub struct Server {
     uri: Uri,
     options: ServeOptions,
@@ -112,6 +113,11 @@ pub struct Server {
 /// drop returns whether or not clients are still attached. For the
 /// kernel there is nothing to stop — the process thread pool has no
 /// shutdown — so the guard is inert.
+///
+/// Bind it to a named variable (`let _server = ...`): `let _ = ...` and a
+/// bare `spawn()?;` drop it at once, which stops an RPC server while the
+/// same line keeps a kernel server running.
+#[must_use = "dropping the guard stops an RPC server; bind it to a named variable"]
 pub struct ServerGuard {
     #[cfg(feature = "rpc")]
     rpc: Option<(

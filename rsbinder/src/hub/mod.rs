@@ -575,6 +575,44 @@ fn android_15_feature_missing(numbering: Android15Numbering) -> StatusCode {
     StatusCode::InvalidOperation
 }
 
+/// Handle 0 could not be reached: no context manager (no `rsb_hub` on Linux) or no binder driver.
+fn service_manager_unreachable(err: StatusCode) {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        log::error!(
+            "the service manager (binder handle 0) is unreachable: {err:?}. On Linux, \
+             start `rsb_hub` first; lookups fail until it runs."
+        );
+    });
+}
+
+/// An SDK whose service-manager protocol this build has no feature for.
+#[cfg(target_os = "android")]
+fn sdk_feature_missing(sdk: u32) -> StatusCode {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    let feature = match sdk {
+        sdk_versions::ANDROID_10 => Some("android_10"),
+        sdk_versions::ANDROID_11 => Some("android_11"),
+        sdk_versions::ANDROID_12 | sdk_versions::ANDROID_12L => Some("android_12"),
+        sdk_versions::ANDROID_13 => Some("android_13"),
+        sdk_versions::ANDROID_14 => Some("android_14"),
+        _ => None,
+    };
+    LOGGED.call_once(|| match feature {
+        Some(feature) => log::error!(
+            "this device runs Android SDK {sdk}, whose service-manager protocol needs the \
+             `{feature}` feature; rsbinder was built without it, so the service manager is \
+             refused rather than addressed with the wrong transaction codes"
+        ),
+        None => log::error!(
+            "Android SDK {sdk} is outside the range rsbinder supports (SDK {} through {})",
+            sdk_versions::ANDROID_10,
+            sdk_versions::ANDROID_17
+        ),
+    });
+    StatusCode::InvalidOperation
+}
+
 /// Returns the global ServiceManager instance appropriate for the current Android version.
 ///
 /// The singleton is created on first call and reused afterwards. The correct
@@ -608,7 +646,9 @@ pub fn default() -> Result<Arc<ServiceManager>> {
     }
 
     let process = ProcessState::as_self();
-    let context = process.context_object()?;
+    let context = process
+        .context_object()
+        .inspect_err(|e| service_manager_unreachable(*e))?;
     #[cfg(target_os = "android")]
     let sdk_version = crate::get_android_sdk_version();
 
@@ -674,7 +714,7 @@ pub fn default() -> Result<Arc<ServiceManager>> {
             sdk_versions::ANDROID_11 => create_service_manager!(Android11, android_11),
             #[cfg(feature = "android_10")]
             sdk_versions::ANDROID_10 => create_service_manager!(Android10, android_10),
-            _ => return Err(StatusCode::InvalidOperation),
+            _ => return Err(sdk_feature_missing(sdk_version)),
         }
     };
 
