@@ -262,7 +262,7 @@ pub fn check_permission(reader: &Parcel, permission_name: &str) -> bool {
         warn_enforce_permission_over_rpc();
         return false;
     }
-    // Outside a transaction uid/pid read as 0 and PMS grants root.
+    // Outside a transaction there is no caller: uid/pid would name this process itself.
     if !crate::is_handling_transaction() {
         return false;
     }

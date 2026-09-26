@@ -98,7 +98,7 @@ pub struct ProxyHandle {
     descriptor: String,
     /// Uid attributed to this proxy at construction
     /// time, used by [`crate::proxy_count`]'s per-uid map. Captured
-    /// via [`thread_state::get_calling_uid_or_self`], which mirrors
+    /// via [`thread_state::get_calling_uid`], which mirrors
     /// AOSP `IPCThreadState::getCallingUid()`: the kernel-delivered
     /// sender uid inside a `BR_TRANSACTION`, or this process's own
     /// `getuid()` when no incoming transaction is on the stack.
@@ -159,11 +159,8 @@ impl ProxyHandle {
         descriptor: String,
         stability: Stability,
     ) -> Result<Arc<Self>> {
-        // Capture the calling uid via the AOSP-faithful helper so the
-        // per-uid tracking map matches `IPCThreadState::getCallingUid()`
-        // semantics (this process's `getuid()` outside a transaction,
-        // kernel-delivered sender uid inside).
-        let tracked_uid = thread_state::get_calling_uid_or_self();
+        // Outside a transaction this is this process's own uid, as in AOSP.
+        let tracked_uid = thread_state::get_calling_uid();
         // Bump the kernel ref FIRST. If this errors, the `Arc` we build
         // below is dropped immediately, and `Drop::drop` must NOT call
         // `proxy_count::on_proxy_drop` — otherwise we'd post a drop for

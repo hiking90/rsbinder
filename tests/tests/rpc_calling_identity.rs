@@ -113,8 +113,11 @@ fn run(server_t: Box<dyn RpcTransport>, client_t: Box<dyn RpcTransport>) {
             "calling_caller() must surface Caller::Rpc(PeerIdentity::Local) over Unix RPC"
         );
 
-        // Outside any handler the calling context is clear.
-        assert_eq!(rsbinder::get_calling_uid(), 0);
+        // Outside any handler the caller is this process itself (AOSP), never root.
+        assert_eq!(
+            rsbinder::get_calling_uid(),
+            rustix::process::getuid().as_raw()
+        );
         assert!(!rsbinder::is_handling_transaction());
     }
 

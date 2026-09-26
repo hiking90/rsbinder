@@ -2435,10 +2435,11 @@ pub fn get_calling_sid() -> Option<CString> {
 ///
 /// Returns the sender PID delivered by the kernel via
 /// `binder_transaction_data.sender_pid` when this thread is dispatching a
-/// `BR_TRANSACTION` / `BR_TRANSACTION_SEC_CTX`, and `0` when not handling
-/// a transaction (matches AOSP `IPCThreadState::getCallingPid()` which
-/// returns the saved `mCallingPid` field; the field is zero-initialized
-/// outside a transaction).
+/// `BR_TRANSACTION` / `BR_TRANSACTION_SEC_CTX`, and this process's own
+/// pid (`getpid(2)`) when not handling a transaction — AOSP
+/// `IPCThreadState::getCallingPid()`, whose `clearCaller()` sets
+/// `mCallingPid = getpid()` (`IPCThreadState.cpp`). A call that never
+/// crossed a process boundary is this process calling itself.
 ///
 /// Convenience wrapper around `CallingContext::default().pid` for the
 /// common case where only the PID is needed — avoids the
@@ -2450,25 +2451,31 @@ pub fn get_calling_pid() -> binder::pid_t {
     if let Some((_, pid)) = rpc_calling() {
         return pid;
     }
+    let own_pid = || rustix::process::getpid().as_raw_nonzero().get() as binder::pid_t;
     if !ProcessState::is_initialized() {
-        return 0;
+        return own_pid();
     }
-    THREAD_STATE.with(|thread_state| {
-        thread_state
-            .borrow()
-            .transaction
-            .as_ref()
-            .map_or(0, |tr| tr.calling_pid)
-    })
+    THREAD_STATE
+        .with(|thread_state| {
+            thread_state
+                .borrow()
+                .transaction
+                .as_ref()
+                .map(|tr| tr.calling_pid)
+        })
+        .unwrap_or_else(own_pid)
 }
 
 /// UID of the caller for the current in-flight binder transaction.
 ///
 /// Returns the sender UID delivered by the kernel via
 /// `binder_transaction_data.sender_euid` when this thread is dispatching
-/// a `BR_TRANSACTION` / `BR_TRANSACTION_SEC_CTX`, and `0` when not
-/// handling a transaction (matches AOSP `IPCThreadState::getCallingUid()`
-/// which returns the saved `mCallingUid` field).
+/// a `BR_TRANSACTION` / `BR_TRANSACTION_SEC_CTX`, and this process's own
+/// uid (`getuid(2)`) when not handling a transaction — AOSP
+/// `IPCThreadState::getCallingUid()` returns `getuid()` whenever no
+/// caller is recorded. An in-process call, or a check made on a thread
+/// the transaction did not arrive on, therefore reads as this process,
+/// never as root.
 ///
 /// Convenience wrapper around `CallingContext::default().uid` for the
 /// common case where only the UID is needed.
@@ -2497,42 +2504,6 @@ pub fn get_calling_uid() -> binder::uid_t {
     // read without forcing `THREAD_STATE` (pure-RPC safe). Non-uid
     // transports were stamped with `RPC_UNKNOWN_CALLING_UID` by the
     // dispatch path, so this stays fail-closed there.
-    if let Some((uid, _)) = rpc_calling() {
-        return uid;
-    }
-    if !ProcessState::is_initialized() {
-        return 0;
-    }
-    THREAD_STATE.with(|thread_state| {
-        thread_state
-            .borrow()
-            .transaction
-            .as_ref()
-            .map_or(0, |tr| tr.calling_uid)
-    })
-}
-
-/// AOSP-faithful variant of [`get_calling_uid`]: outside a transaction,
-/// returns the current process's own uid (`getuid(2)`) instead of `0`.
-///
-/// Mirrors AOSP `IPCThreadState::getCallingUid()`, which initializes
-/// `mCallingUid` to `getuid()` rather than zero — observers downstream
-/// (e.g. per-uid accounting in [`crate::proxy_count`]) get the same
-/// attribution they would on real Android.
-///
-/// # RPC transports (Plan 2-16 Phase B)
-///
-/// During an RPC transaction this returns the RPC caller uid, exactly as
-/// [`get_calling_uid`]: the kernel-vouched peer uid over Unix RPC, or the
-/// fail-closed sentinel (`u32::MAX`) over transports without a uid
-/// (`Vsock` / TLS `Certificate` / `Anonymous`). The self-uid fallback
-/// applies only outside any (kernel or RPC) transaction, so
-/// [`crate::proxy_count`] attribution over a uid-less RPC transport buckets
-/// under the `u32::MAX` sentinel rather than this process's uid.
-pub(crate) fn get_calling_uid_or_self() -> binder::uid_t {
-    // Plan 2-16 Phase B: prefer the RPC caller uid when dispatching an RPC
-    // transaction; otherwise fall back to the process's own uid without
-    // forcing `THREAD_STATE` in a pure-RPC process.
     if let Some((uid, _)) = rpc_calling() {
         return uid;
     }
@@ -2809,11 +2780,19 @@ pub fn has_explicit_identity() -> bool {
 mod tests {
     use super::*;
 
+    fn own_uid() -> binder::uid_t {
+        rustix::process::getuid().as_raw()
+    }
+
+    fn own_pid() -> binder::pid_t {
+        rustix::process::getpid().as_raw_nonzero().get() as binder::pid_t
+    }
+
     /// Plan 2-16 Phase B/C: the RPC calling context is read by the public
     /// accessors (`get_calling_uid/pid`, `calling_caller`), restores on
     /// guard drop, nests correctly, and is fail-closed for non-uid
     /// transports — all without a kernel `ProcessState` (hermetic, runs on
-    /// macOS). The `0`/`!handling`/`None` outside the guard also proves the
+    /// macOS). The self/`!handling`/`None` outside the guard also proves the
     /// pure-RPC accessors are panic-free with `ProcessState` uninitialized.
     #[cfg(feature = "rpc")]
     #[test]
@@ -2821,10 +2800,9 @@ mod tests {
         use crate::rpc::transport::PeerIdentity;
         use std::sync::Arc;
 
-        // Outside any transaction (pure-RPC, no ProcessState): defined,
-        // not a panic.
-        assert_eq!(get_calling_uid(), 0);
-        assert_eq!(get_calling_pid(), 0);
+        // Outside any transaction (pure-RPC, no ProcessState): this process, as in AOSP.
+        assert_eq!(get_calling_uid(), own_uid());
+        assert_eq!(get_calling_pid(), own_pid());
         assert!(!is_handling_transaction());
         assert!(get_calling_sid().is_none());
         assert!(calling_caller().is_none());
@@ -2894,7 +2872,7 @@ mod tests {
         }
 
         // Fully restored.
-        assert_eq!(get_calling_uid(), 0);
+        assert_eq!(get_calling_uid(), own_uid());
         assert!(!is_handling_transaction());
         assert!(calling_caller().is_none());
         assert!(calling_caps().is_none());
@@ -3542,14 +3520,15 @@ mod tests {
         // entry, not thread-local state.
         let _ = THREAD_STATE.with(|ts| ts.borrow_mut().transaction.take());
         assert!(!is_handling_transaction());
-        assert_eq!(get_calling_uid(), 0);
-        assert_eq!(get_calling_pid(), 0);
+        // AOSP `IPCThreadState::getCallingUid/Pid`: this process, never root.
+        assert_eq!(get_calling_uid(), own_uid());
+        assert_eq!(get_calling_pid(), own_pid());
         assert!(get_calling_sid().is_none());
         assert!(!has_explicit_identity());
         // clear/restore are no-ops outside a transaction.
         assert_eq!(clear_calling_identity(), 0);
         restore_calling_identity(0xDEAD_BEEF_DEAD_BEEFu64 as i64); // must not panic
-        assert_eq!(get_calling_uid(), 0);
+        assert_eq!(get_calling_uid(), own_uid());
     }
 
     /// With a fake transaction installed, the calling-identity getters
