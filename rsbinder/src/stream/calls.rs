@@ -141,26 +141,70 @@ impl Credit {
     }
 
     /// Death ends the wait too: with nothing in flight, nothing else tells a parked producer.
-    fn wait_credit(&self) -> Result<()> {
+    fn wait_credit(&self, deadline: Option<Instant>) -> Result<()> {
         let mut state = self.lock();
         loop {
             if let Some(answer) = Self::poll_credit(&mut state) {
                 return answer;
             }
-            state = self.wake.wait(state).unwrap_or_else(|e| e.into_inner());
+            let Some(deadline) = deadline else {
+                state = self.wake.wait(state).unwrap_or_else(|e| e.into_inner());
+                continue;
+            };
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(StatusCode::TimedOut);
+            }
+            state = self
+                .wake
+                .wait_timeout(state, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
         }
     }
 
     /// [`wait_credit`](Self::wait_credit) that suspends the task instead of parking the thread.
     #[cfg(feature = "tokio")]
-    async fn wait_credit_async(&self) -> Result<()> {
-        loop {
-            // Created first: a `Notified` sees `notify_waiters` from creation, so none is missed.
-            let notified = self.notify.notified();
-            if let Some(answer) = Self::poll_credit(&mut self.lock()) {
-                return answer;
+    async fn wait_credit_async(self: &Arc<Self>, deadline: Option<Instant>) -> Result<()> {
+        let Some(deadline) = deadline else {
+            loop {
+                // Created first: a `Notified` sees every `notify_waiters` from its creation on.
+                let notified = self.notify.notified();
+                if let Some(answer) = Self::poll_credit(&mut self.lock()) {
+                    return answer;
+                }
+                notified.await;
             }
-            notified.await;
+        };
+        if let Some(answer) = Self::poll_credit(&mut self.lock()) {
+            return answer;
+        }
+        // No `tokio/time` to suspend against, so the bounded wait is a condvar on the pool.
+        let pooled = on_pool(self.clone(), move |credit| {
+            credit.await_credit_until(deadline);
+            Ok(())
+        })
+        .await;
+        match Self::poll_credit(&mut self.lock()) {
+            Some(answer) => answer,
+            None => Err(pooled.err().unwrap_or(StatusCode::TimedOut)),
+        }
+    }
+
+    /// Block until there is credit, a latch or `deadline`, taking nothing: the caller takes it.
+    #[cfg(feature = "tokio")]
+    fn await_credit_until(&self, deadline: Instant) {
+        let mut state = self.lock();
+        while Self::latch(&state).is_ok() && state.available == 0 {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            state = self
+                .wake
+                .wait_timeout(state, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
         }
     }
 }
@@ -493,14 +537,21 @@ impl<T: Serialize + ?Sized> Producer<T> {
         })
     }
 
-    pub(super) fn send(&mut self, item: &T) -> Result<()> {
+    pub(super) fn send(&mut self, item: &T, deadline: Option<Instant>) -> Result<()> {
         // Before the item is queued: nothing will send it.
         self.usable()?;
         self.credit.latched()?;
-        if self.encode(item)? {
-            self.flush()?;
+        let mark = self.batch.data_size();
+        if !self.encode(item)? {
+            return Ok(());
         }
-        Ok(())
+        // As in `flush`, but a credit timeout takes this item back out: `TimedOut` = not queued.
+        self.ledger.wait_idle();
+        self.reported()?;
+        if let Err(e) = self.credit.wait_credit(deadline) {
+            return self.unqueue_on_timeout(e, mark);
+        }
+        self.send_with_credit()
     }
 
     /// The error that broke the stream, if one has: see `LedgerState::broken`.
@@ -520,7 +571,8 @@ impl<T: Serialize + ?Sized> Producer<T> {
         Ok(self.batch.data_size() >= self.max_batch_bytes)
     }
 
-    pub(super) fn flush(&mut self) -> Result<()> {
+    /// A credit timeout leaves the pending batch as it was, for a later flush to send.
+    pub(super) fn flush(&mut self, deadline: Option<Instant>) -> Result<()> {
         self.usable()?;
         if self.count == 0 {
             // Without blocking: a failure a dropped future's batch has already settled.
@@ -529,11 +581,25 @@ impl<T: Serialize + ?Sized> Producer<T> {
         // A batch a dropped future left on the pool goes out first, and its failure is this call's.
         self.ledger.wait_idle();
         self.reported()?;
-        self.credit.wait_credit()?;
+        self.credit.wait_credit(deadline)?;
+        self.send_with_credit()
+    }
+
+    /// The caller holds a credit: send the pending batch with it.
+    fn send_with_credit(&mut self) -> Result<()> {
         if let Some(batch) = self.take_pending() {
             batch.send(&self.peer);
         }
         self.reported()
+    }
+
+    /// `e` from the credit wait after the item at `mark` was queued; a timeout un-queues it.
+    fn unqueue_on_timeout(&mut self, e: StatusCode, mark: usize) -> Result<()> {
+        if e == StatusCode::TimedOut {
+            self.truncate_batch(mark)?;
+            self.count -= 1;
+        }
+        Err(e)
     }
 
     /// The last batch's failure, reported once; a broken stream reports it on every call.
@@ -544,6 +610,7 @@ impl<T: Serialize + ?Sized> Producer<T> {
 
     pub(super) fn terminate(
         mut self,
+        deadline: Option<Instant>,
         exception: i32,
         service_specific: i32,
         message: Option<&str>,
@@ -553,7 +620,7 @@ impl<T: Serialize + ?Sized> Producer<T> {
         // Don't overtake a pool batch; take its failure so the flush still sends what is queued.
         self.ledger.wait_idle();
         let stale = self.ledger.take_unreported();
-        let failed = match (self.flush(), stale) {
+        let failed = match (self.flush(deadline), stale) {
             (Err(e), _) => {
                 // Nothing will send what that flush left queued.
                 self.abandon_pending();
@@ -601,21 +668,30 @@ impl<T: Serialize + ?Sized> Producer<T> {
     pub(super) fn send_async(
         &mut self,
         item: &T,
+        timeout: Option<Duration>,
     ) -> impl std::future::Future<Output = Result<()>> + Send + '_ {
+        let mark = self.batch.data_size();
         let encoded = self
             .usable()
             .and_then(|()| self.credit.latched())
             .and_then(|()| self.encode(item));
         async move {
-            if encoded? {
-                self.flush_async().await?;
+            let deadline = super::call_deadline(timeout);
+            if !encoded? {
+                return Ok(());
             }
-            Ok(())
+            // As in `send`.
+            self.ledger.idle_async().await;
+            self.reported()?;
+            if let Err(e) = self.credit.wait_credit_async(deadline).await {
+                return self.unqueue_on_timeout(e, mark);
+            }
+            self.send_with_credit_async().await
         }
     }
 
     #[cfg(feature = "tokio")]
-    pub(super) async fn flush_async(&mut self) -> Result<()> {
+    pub(super) async fn flush_async(&mut self, deadline: Option<Instant>) -> Result<()> {
         self.usable()?;
         if self.count == 0 {
             return self.reported();
@@ -623,7 +699,13 @@ impl<T: Serialize + ?Sized> Producer<T> {
         // As in `flush`.
         self.ledger.idle_async().await;
         self.reported()?;
-        self.credit.wait_credit_async().await?;
+        self.credit.wait_credit_async(deadline).await?;
+        self.send_with_credit_async().await
+    }
+
+    /// [`send_with_credit`](Self::send_with_credit), the send made from the pool.
+    #[cfg(feature = "tokio")]
+    async fn send_with_credit_async(&mut self) -> Result<()> {
         if let Some(batch) = self.take_pending() {
             let peer = self.peer.clone();
             // `batch` records its outcome itself: the future may drop, the task may never run.
@@ -639,6 +721,7 @@ impl<T: Serialize + ?Sized> Producer<T> {
     #[cfg(feature = "tokio")]
     pub(super) async fn terminate_async(
         mut self,
+        deadline: Option<Instant>,
         exception: i32,
         service_specific: i32,
         message: Option<String>,
@@ -660,7 +743,7 @@ impl<T: Serialize + ?Sized> Producer<T> {
             }
         }
         let stale = Stale(self.ledger.clone(), self.ledger.take_unreported());
-        let flushed = self.flush_async().await;
+        let flushed = self.flush_async(deadline).await;
         let failed = match (flushed, stale.take()) {
             (Err(e), _) => {
                 // Nothing will send what that flush left queued.
@@ -1862,10 +1945,10 @@ mod tests {
         // Eight bytes to a batch: every second `i32` is what sends one.
         let mut sink = Producer::<i32>::open(&sink_binder, &sink_policy(8, 4)).expect("open");
 
-        sink.send(&0).expect("queued");
-        assert_eq!(sink.send(&1).err(), Some(StatusCode::Unknown));
+        sink.send(&0, None).expect("queued");
+        assert_eq!(sink.send(&1, None).err(), Some(StatusCode::Unknown));
         assert_eq!(
-            sink.send(&2).err(),
+            sink.send(&2, None).err(),
             Some(StatusCode::Unknown),
             "every later send reports it, one that would only have queued too"
         );
@@ -1874,14 +1957,15 @@ mod tests {
             0,
             "and queues nothing, since nothing will send it"
         );
-        assert_eq!(sink.flush().err(), Some(StatusCode::Unknown));
+        assert_eq!(sink.flush(None).err(), Some(StatusCode::Unknown));
         assert_eq!(
             sink.credits(),
             3,
             "the credit is neither spent twice nor returned"
         );
         assert_eq!(
-            sink.terminate(ExceptionCode::None as i32, 0, None).err(),
+            sink.terminate(None, ExceptionCode::None as i32, 0, None)
+                .err(),
             Some(StatusCode::Unknown)
         );
 
@@ -2050,7 +2134,7 @@ mod tests {
         runtime.shutdown_background();
 
         assert_eq!(
-            handle.block_on(sink.terminate_async(ExceptionCode::None as i32, 0, None)),
+            handle.block_on(sink.terminate_async(None, ExceptionCode::None as i32, 0, None)),
             Ok(())
         );
         assert_eq!(recorded.ends.load(Ordering::SeqCst), 1);
@@ -2066,7 +2150,8 @@ mod tests {
 
         // No runtime here, so `spawn_blocking` panics with the call in hand.
         let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut end = std::pin::pin!(sink.terminate_async(ExceptionCode::None as i32, 0, None));
+            let mut end =
+                std::pin::pin!(sink.terminate_async(None, ExceptionCode::None as i32, 0, None));
             let mut context = std::task::Context::from_waker(std::task::Waker::noop());
             let _ = std::future::Future::poll(end.as_mut(), &mut context);
         }));
@@ -2119,9 +2204,9 @@ mod tests {
         let (mut sink, mut rx) = default_pair::<i32>();
         let sent: Vec<i32> = (0..10).collect();
         for item in &sent {
-            sink.send(item).expect("send");
+            sink.send(item, None).expect("send");
         }
-        sink.terminate(ExceptionCode::None as i32, 0, None)
+        sink.terminate(None, ExceptionCode::None as i32, 0, None)
             .expect("end");
 
         let mut got = Vec::new();
@@ -2145,12 +2230,12 @@ mod tests {
         let (progress, watch) = mpsc::channel();
         let producer = thread::spawn(move || {
             for item in 0..4i32 {
-                if sink.send(&item).is_err() {
+                if sink.send(&item, None).is_err() {
                     return;
                 }
                 let _ = progress.send(item);
             }
-            let _ = sink.terminate(ExceptionCode::None as i32, 0, None);
+            let _ = sink.terminate(None, ExceptionCode::None as i32, 0, None);
         });
 
         assert_eq!(
@@ -2183,7 +2268,7 @@ mod tests {
         let counter = sent.clone();
         let producer = thread::spawn(move || {
             for item in 0..1000i32 {
-                if sink.send(&item).is_err() {
+                if sink.send(&item, None).is_err() {
                     return;
                 }
                 counter.fetch_add(1, Ordering::SeqCst);
@@ -2228,13 +2313,14 @@ mod tests {
         thread::spawn(move || {
             let mut sent = Ok(());
             for item in 0..20i32 {
-                sent = sink.send(&item);
+                sent = sink.send(&item, None);
                 if sent.is_err() {
                     break;
                 }
             }
-            let _ =
-                done.send(sent.and_then(|()| sink.terminate(ExceptionCode::None as i32, 0, None)));
+            let _ = done.send(
+                sent.and_then(|()| sink.terminate(None, ExceptionCode::None as i32, 0, None)),
+            );
         });
 
         let mut got = Vec::new();
@@ -2261,7 +2347,10 @@ mod tests {
             .expect("the sink object is still there");
         assert!(sink.is_canceled(), "`onStart` must have been answered");
         // Refused on entry, as on the ring, not queued into a batch that will never leave.
-        assert_eq!(sink.send(&1).err(), Some(StatusCode::InvalidOperation));
+        assert_eq!(
+            sink.send(&1, None).err(),
+            Some(StatusCode::InvalidOperation)
+        );
         assert_eq!(sink.pending(), 0);
     }
 
@@ -2283,13 +2372,13 @@ mod tests {
                 // `tokio::spawn` also checks that the futures are `Send`.
                 let producer = tokio::spawn(async move {
                     // Spends the only credit.
-                    sink.send_async(&0).await?;
+                    sink.send_async(&0, None).await?;
                     spent.notify_one();
                     // So this one finds none, and nothing is reading yet.
                     for item in 1..50i32 {
-                        sink.send_async(&item).await?;
+                        sink.send_async(&item, None).await?;
                     }
-                    sink.terminate_async(ExceptionCode::None as i32, 0, None)
+                    sink.terminate_async(None, ExceptionCode::None as i32, 0, None)
                         .await
                 });
                 // Held back until the producer is out of credit, so its next send has to wait.
@@ -2311,6 +2400,49 @@ mod tests {
         );
     }
 
+    /// A bounded async credit wait ends at its deadline and takes the item back out of the batch.
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn a_send_async_out_of_credit_times_out_and_the_item_is_not_queued() {
+        let timeout = Duration::from_millis(50);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .expect("runtime");
+        let (mut rx, sink_binder) = Consumer::<i32>::new(&receiver_policy(1, 4));
+        let mut sink = Producer::<i32>::open(&sink_binder, &sink_policy(4, 1)).expect("open");
+        runtime
+            .block_on(sink.send_async(&0, Some(timeout)))
+            .expect("the opening credit");
+
+        let (done, watch) = mpsc::channel();
+        let handle = runtime.handle().clone();
+        thread::spawn(move || {
+            let before = Instant::now();
+            let sent = handle.block_on(sink.send_async(&1, Some(timeout)));
+            let _ = done.send((sent, before.elapsed(), sink));
+        });
+        let (sent, elapsed, mut sink) = watch
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the timeout must end the wait for credit");
+        assert_eq!(sent.err(), Some(StatusCode::TimedOut));
+        assert!(elapsed >= timeout, "returned after {elapsed:?}");
+        assert_eq!(sink.pending(), 0, "the item was taken back out");
+
+        // Window 1: draining the batch grants its credit back.
+        assert_eq!(rx.recv().expect("item 0").expect("ok"), 0);
+        runtime
+            .block_on(sink.send_async(&1, Some(timeout)))
+            .expect("a grant came");
+        runtime
+            .block_on(sink.terminate_async(None, ExceptionCode::None as i32, 0, None))
+            .expect("end");
+        assert_eq!(rx.recv().expect("item 1").expect("ok"), 1);
+        assert!(rx.recv().is_none());
+        assert!(rx.end_status().expect("ended").is_ok());
+        runtime.shutdown_timeout(Duration::from_secs(5));
+    }
+
     #[test]
     fn a_cancel_releases_a_producer_waiting_for_credit() {
         let (rx, sink_binder) = Consumer::<i32>::new(&receiver_policy(1, 4));
@@ -2319,8 +2451,8 @@ mod tests {
         let (outcome, watch) = mpsc::channel();
         let producer = thread::spawn(move || {
             // The first send spends the opening credit; the second parks.
-            let first = sink.send(&0);
-            let second = sink.send(&1);
+            let first = sink.send(&0, None);
+            let second = sink.send(&1, None);
             let _ = outcome.send((first, second, sink.is_canceled()));
         });
 
@@ -2347,8 +2479,8 @@ mod tests {
     #[test]
     fn a_dropped_producer_flushes_and_reports_that_it_never_ended() {
         let (mut sink, mut rx) = default_pair::<i32>();
-        sink.send(&1).expect("send");
-        sink.send(&2).expect("send");
+        sink.send(&1, None).expect("send");
+        sink.send(&2, None).expect("send");
         assert_eq!(sink.pending(), 2, "neither item filled a 16 KB batch");
         drop(sink);
 
@@ -2366,11 +2498,11 @@ mod tests {
         // Eight bytes to a batch is two `i32`s, and one opening credit.
         let mut sink = Producer::<i32>::open(&sink_binder, &sink_policy(8, 1)).expect("open");
 
-        sink.send(&0).expect("send");
+        sink.send(&0, None).expect("send");
         // Fills the batch, so this one spends the only credit.
-        sink.send(&1).expect("send");
+        sink.send(&1, None).expect("send");
         // Queued with no credit left and nothing draining, so no grant is coming either.
-        sink.send(&2).expect("send");
+        sink.send(&2, None).expect("send");
         assert_eq!(sink.credits(), 0);
         assert_eq!(sink.pending(), 1);
 
@@ -2405,10 +2537,10 @@ mod tests {
         // One `i32` per batch, and enough credit that nothing here waits.
         let mut sink = Producer::<i32>::open(&sink_binder, &sink_policy(4, 4)).expect("open");
 
-        sink.send(&0).expect_err("the first batch is refused");
+        sink.send(&0, None).expect_err("the first batch is refused");
         // The failure cost that item only: the stream is still usable, as `send`'s rustdoc says.
-        sink.send(&1).expect("send");
-        sink.terminate(ExceptionCode::None as i32, 0, None)
+        sink.send(&1, None).expect("send");
+        sink.terminate(None, ExceptionCode::None as i32, 0, None)
             .expect("end");
 
         let (exception, message) = recorded

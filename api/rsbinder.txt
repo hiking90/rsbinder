@@ -2845,6 +2845,7 @@ pub struct rsbinder::stream::SinkPolicy
 pub rsbinder::stream::SinkPolicy::initial_credits: u32
 pub rsbinder::stream::SinkPolicy::max_batch_bytes: usize
 pub rsbinder::stream::SinkPolicy::max_ring_bytes: usize
+pub rsbinder::stream::SinkPolicy::send_timeout: core::option::Option<core::time::Duration>
 impl core::clone::Clone for rsbinder::stream::SinkPolicy
 pub fn rsbinder::stream::SinkPolicy::clone(&self) -> rsbinder::stream::SinkPolicy
 impl core::cmp::Eq for rsbinder::stream::SinkPolicy

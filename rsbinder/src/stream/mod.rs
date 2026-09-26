@@ -143,6 +143,11 @@
 //! * **Cancel.** [`Receiver::cancel`], and dropping a `Receiver`, release
 //!   a parked producer, whose next [`Sink::send`] reports
 //!   [`StatusCode::InvalidOperation`].
+//! * **A consumer that neither reads nor cancels** is alive, so no death
+//!   link fires, and by default a producer waits on it indefinitely. A
+//!   service streaming to a client it does not trust sets
+//!   [`SinkPolicy::send_timeout`], after which a wait for room or credit
+//!   ends with [`StatusCode::TimedOut`] and the stream stays usable.
 //!
 //! # Async
 //!
@@ -158,7 +163,7 @@
 
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::binder::Interface;
 use crate::error::{Result, StatusCode};
@@ -264,6 +269,54 @@ pub struct SinkPolicy {
     /// that started with none would wait for a grant nothing can
     /// trigger. Default 4.
     pub initial_credits: u32,
+    /// Both paths: how long one call may wait for the consumer — for room
+    /// in the ring, or for credit on the RPC path.
+    ///
+    /// `None`, the default, waits for as long as it takes. A consumer that
+    /// is alive but neither reads nor cancels then holds the producer's
+    /// thread for good — or, for an `*_async` call on the ring, a
+    /// blocking-pool thread — which a service streaming to an untrusted
+    /// client should not allow.
+    ///
+    /// `Some(d)` sets one deadline per call, `d` after a blocking method
+    /// is called or after an `*_async` future is first polled, and every
+    /// wait for room or credit that call makes shares it:
+    /// [`send_all`](Sink::send_all) has one deadline for all its items,
+    /// not one per item. On expiry the call returns
+    /// [`StatusCode::TimedOut`], and no thread is left parked past the
+    /// deadline, the pool thread of an `*_async` call included. It bounds
+    /// only waits for room or credit: the RPC transaction that carries a
+    /// batch or the terminator waits under the session's own deadline
+    /// (`RpcSession::set_timeout`, or `RpcServer::set_reply_timeout` on a
+    /// server), and a batch a dropped `*_async` future left sending is
+    /// waited for under that deadline too.
+    ///
+    /// What a timeout leaves behind:
+    ///
+    /// * [`send`](Sink::send): the item was not written (ring) or not
+    ///   queued (RPC), and items accepted before it are unaffected. The
+    ///   stream stays usable: send it again, or [`end`](Sink::end).
+    /// * [`flush`](Sink::flush), on the RPC path: the pending batch stays
+    ///   pending, whole, and a later successful flush — or `end` — sends
+    ///   it. On the ring, flush waits only for a record a dropped
+    ///   `send_async` future left on the pool; that record waits under the
+    ///   deadline of the call that made it, and one whose deadline expires
+    ///   is counted lost, which `end` reports.
+    /// * [`end`](Sink::end) and [`end_with`](Sink::end_with): the end
+    ///   record never waits for room ([`END_RESERVE`]) and the RPC
+    ///   terminator needs no credit, so what times out is only what had to
+    ///   go before it — the pending batch on RPC, a dropped future's
+    ///   record on the ring. That is given up and counted lost, the stream
+    ///   still ends, as `EX_ILLEGAL_STATE` saying how many items were not
+    ///   sent, and the call returns `TimedOut`.
+    ///
+    /// `Some(Duration::ZERO)` never waits: a call writes or sends if room
+    /// or credit is there now and returns `TimedOut` otherwise. A duration
+    /// too long for an `Instant` to express waits without a bound, as
+    /// `None` does. On the RPC path a bounded `*_async` credit wait holds
+    /// a blocking-pool thread while it lasts (this build has no timer to
+    /// suspend the task against); an unbounded one suspends the task.
+    pub send_timeout: Option<Duration>,
 }
 
 impl Default for SinkPolicy {
@@ -272,6 +325,7 @@ impl Default for SinkPolicy {
             max_ring_bytes: 4 * 1024 * 1024,
             max_batch_bytes: 16 * 1024,
             initial_credits: 4,
+            send_timeout: None,
         }
     }
 }
@@ -349,7 +403,15 @@ where
     let recipient: Arc<dyn crate::DeathRecipient> = Arc::new(recipient);
     // Fatal: back-pressure leaves nothing in flight to fail, so only this link reports death.
     if let Err(e) = binder.link_to_death(Arc::downgrade(&recipient)) {
-        log::error!("stream: cannot watch the peer for death: {e:?}");
+        if e == StatusCode::InvalidOperation && binder.as_remote().is_some() {
+            log::error!(
+                "stream: the RPC session to the other end has no incoming connections, so the \
+                 stream could neither be pushed to nor see that end die; open them \
+                 (ClientOptions::incoming_connections / RpcClientConfig::incoming_connections)"
+            );
+        } else {
+            log::error!("stream: cannot watch the peer for death: {e:?}");
+        }
         return Err(e);
     }
     Ok(Some(recipient))
@@ -382,6 +444,11 @@ fn peer_caps(binder: &SIBinder) -> crate::TransportCaps {
 fn over_ring(peer: &SIBinder) -> bool {
     cfg!(any(target_os = "linux", target_os = "android"))
         && peer_caps(peer).contains(crate::TransportCaps::KERNEL_KNOBS)
+}
+
+/// The deadline one `Sink` call's waits share; `None` = no bound, also past what `Instant` holds.
+fn call_deadline(timeout: Option<Duration>) -> Option<Instant> {
+    timeout.and_then(|timeout| Instant::now().checked_add(timeout))
 }
 
 /// One item as record or batch bytes, via the `to_bytes` codec (which refuses a binder or an fd).
@@ -528,6 +595,8 @@ enum SinkInner<T: ?Sized> {
 /// which is bounded by that one send rather than by the consumer.
 pub struct Sink<T: ?Sized> {
     inner: SinkInner<T>,
+    /// [`SinkPolicy::send_timeout`]; each call turns it into a deadline.
+    send_timeout: Option<Duration>,
 }
 
 impl<T: Serialize + ?Sized> Sink<T> {
@@ -578,7 +647,10 @@ impl<T: Serialize + ?Sized> Sink<T> {
             Some(ring) => SinkInner::Ring(ring::Producer::open(ring, sink, policy)?),
             None => SinkInner::Calls(Box::new(calls::Producer::open(sink, policy)?)),
         };
-        Ok(Sink { inner })
+        Ok(Sink {
+            inner,
+            send_timeout: policy.send_timeout,
+        })
     }
 
     /// Add one item to the stream.
@@ -590,7 +662,8 @@ impl<T: Serialize + ?Sized> Sink<T> {
     /// queued, and leaves once the pending batch reaches
     /// [`SinkPolicy::max_batch_bytes`] or at [`flush`](Self::flush) or
     /// [`end`](Self::end); there the call blocks when a batch is ready to
-    /// go and the consumer has granted no credit for it.
+    /// go and the consumer has granted no credit for it. Either wait is
+    /// bounded by [`SinkPolicy::send_timeout`] when that is set.
     ///
     /// # Errors
     ///
@@ -599,6 +672,13 @@ impl<T: Serialize + ?Sized> Sink<T> {
     /// [`send_async`](Self::send_async) left on the pool, whose failure
     /// the next call reports before writing anything.
     ///
+    /// - [`StatusCode::TimedOut`] when [`SinkPolicy::send_timeout`]
+    ///   expired before there was room (ring) or credit for the batch
+    ///   this item completed (RPC): the item was not written or queued,
+    ///   and the stream stays usable. On the RPC path a batch send the
+    ///   session timed out returns it too (the last entry); that batch did
+    ///   not arrive either, so sending the item again never duplicates it,
+    ///   but its items are counted lost.
     /// - [`StatusCode::InvalidOperation`] once the consumer has
     ///   cancelled. Nothing further will be delivered, so stop.
     /// - [`StatusCode::DeadObject`] when the consumer's process is gone.
@@ -634,21 +714,31 @@ impl<T: Serialize + ?Sized> Sink<T> {
     ///     error without queueing anything, and items still pending are
     ///     counted as lost at [`end`](Self::end).
     pub fn send(&mut self, item: &T) -> Result<()> {
+        let deadline = call_deadline(self.send_timeout);
+        self.send_until(item, deadline)
+    }
+
+    fn send_until(&mut self, item: &T, deadline: Option<Instant>) -> Result<()> {
         match &mut self.inner {
-            SinkInner::Calls(p) => p.send(item),
-            SinkInner::Ring(p) => p.send(item),
+            SinkInner::Calls(p) => p.send(item, deadline),
+            SinkInner::Ring(p) => p.send(item, deadline),
         }
     }
 
     /// [`send`](Self::send) for each item in turn, stopping at the first
     /// failure.
+    ///
+    /// One call, so one [`send_timeout`](SinkPolicy::send_timeout)
+    /// deadline for all the items. On `TimedOut` the items before the one
+    /// that timed out were accepted, and that one and the rest were not.
     pub fn send_all<'a, I>(&mut self, items: I) -> Result<()>
     where
         I: IntoIterator<Item = &'a T>,
         T: 'a,
     {
+        let deadline = call_deadline(self.send_timeout);
         for item in items {
-            self.send(item)?;
+            self.send_until(item, deadline)?;
         }
         Ok(())
     }
@@ -676,10 +766,17 @@ impl<T: Serialize + ?Sized> Sink<T> {
     /// rules. On the RPC path with nothing queued, such a failure is
     /// reported only once the dropped future's batch has settled; this
     /// call does not wait for it.
+    ///
+    /// With [`SinkPolicy::send_timeout`] set, a flush that runs out of
+    /// time returns [`StatusCode::TimedOut`]. On the RPC path, where the
+    /// wait is for credit, the pending batch stays pending, whole: nothing
+    /// is lost, and the next flush tries again. On the ring the wait is
+    /// for a dropped future's record, which that field's entry covers.
     pub fn flush(&mut self) -> Result<()> {
+        let deadline = call_deadline(self.send_timeout);
         match &mut self.inner {
-            SinkInner::Calls(p) => p.flush(),
-            SinkInner::Ring(p) => p.flush(),
+            SinkInner::Calls(p) => p.flush(deadline),
+            SinkInner::Ring(p) => p.flush(deadline),
         }
     }
 
@@ -697,6 +794,12 @@ impl<T: Serialize + ?Sized> Sink<T> {
     /// [`end_with`](Self::end_with) is that path. A `Sink` dropped
     /// without either ends the stream as having failed, which is the
     /// only honest reading of a producer that vanished.
+    ///
+    /// With [`SinkPolicy::send_timeout`] set, those waits share one
+    /// deadline. If it expires, what was waiting — the pending batch, or
+    /// the dropped future's record — is given up and counted lost, the
+    /// stream still ends, as `EX_ILLEGAL_STATE` saying how many items
+    /// were not sent, and this returns [`StatusCode::TimedOut`].
     pub fn end(self) -> Result<()> {
         self.terminate(ExceptionCode::None as i32, 0, None)
     }
@@ -740,9 +843,10 @@ impl<T: Serialize + ?Sized> Sink<T> {
     }
 
     fn terminate(self, exception: i32, service_specific: i32, message: Option<&str>) -> Result<()> {
+        let deadline = call_deadline(self.send_timeout);
         match self.inner {
-            SinkInner::Calls(p) => p.terminate(exception, service_specific, message),
-            SinkInner::Ring(p) => p.terminate(exception, service_specific, message),
+            SinkInner::Calls(p) => p.terminate(deadline, exception, service_specific, message),
+            SinkInner::Ring(p) => p.terminate(deadline, exception, service_specific, message),
         }
     }
 
@@ -765,6 +869,13 @@ impl<T: Serialize + ?Sized> Sink<T> {
     /// as lost: [`pending`](Self::pending) cannot tell the two cases apart,
     /// so the stream does not end clean with the item missing.
     ///
+    /// [`SinkPolicy::send_timeout`] counts from the first poll. A record
+    /// handed to the pool waits there under that deadline and no longer,
+    /// whether or not the future is still awaited: an awaited one that
+    /// expires returns [`StatusCode::TimedOut`] with the item unwritten,
+    /// as [`send`](Self::send) does; a dropped one's record is counted
+    /// lost.
+    ///
     /// # Panics
     ///
     /// Outside a Tokio runtime — see the [module docs](self#async).
@@ -774,21 +885,25 @@ impl<T: Serialize + ?Sized> Sink<T> {
         &mut self,
         item: &T,
     ) -> impl std::future::Future<Output = Result<()>> + Send + '_ {
+        let timeout = self.send_timeout;
         match &mut self.inner {
-            SinkInner::Calls(p) => pool::Either::A(p.send_async(item)),
-            SinkInner::Ring(p) => pool::Either::B(p.send_async(item)),
+            SinkInner::Calls(p) => pool::Either::A(p.send_async(item, timeout)),
+            SinkInner::Ring(p) => pool::Either::B(p.send_async(item, timeout)),
         }
     }
 
     /// [`flush`](Self::flush) for a producer running as a task.
+    ///
+    /// [`SinkPolicy::send_timeout`] counts from the first poll.
     ///
     /// # Panics
     ///
     /// Outside a Tokio runtime — see the [module docs](self#async).
     #[cfg(feature = "tokio")]
     pub async fn flush_async(&mut self) -> Result<()> {
+        let deadline = call_deadline(self.send_timeout);
         match &mut self.inner {
-            SinkInner::Calls(p) => p.flush_async().await,
+            SinkInner::Calls(p) => p.flush_async(deadline).await,
             SinkInner::Ring(p) => p.flush_async().await,
         }
     }
@@ -803,6 +918,9 @@ impl<T: Serialize + ?Sized> Sink<T> {
     /// pool — and a future dropped before that leaves the stream to
     /// [`Drop`](Sink#impl-Drop-for-Sink), which ends it as failed rather
     /// than as done.
+    ///
+    /// [`SinkPolicy::send_timeout`] counts from the first poll, with the
+    /// outcome [`end`](Self::end) describes.
     ///
     /// # Panics
     ///
@@ -844,9 +962,10 @@ impl<T: Serialize + ?Sized> Sink<T> {
         service_specific: i32,
         message: Option<String>,
     ) -> Result<()> {
+        let deadline = call_deadline(self.send_timeout);
         match self.inner {
             SinkInner::Calls(p) => {
-                p.terminate_async(exception, service_specific, message)
+                p.terminate_async(deadline, exception, service_specific, message)
                     .await
             }
             SinkInner::Ring(p) => {
@@ -952,7 +1071,12 @@ impl<T: Deserialize> Receiver<T> {
     /// [`StatusCode::BadValue`] for a ring no larger than
     /// [`END_RESERVE`]` + 4`; whatever allocating the ring fails with (memfd,
     /// `fallocate`, seals); whatever linking to `peer`'s death fails with
-    /// — [`StatusCode::DeadObject`] for a peer already gone.
+    /// — [`StatusCode::DeadObject`] for a peer already gone, and
+    /// [`StatusCode::InvalidOperation`] for an RPC `peer` whose client
+    /// session has no incoming connections
+    /// ([`ClientOptions::incoming_connections`](crate::ClientOptions::incoming_connections)),
+    /// which a stream over RPC needs in either direction: nothing would
+    /// read the producer's batches, nor notice that end dying.
     pub fn new(peer: &SIBinder) -> Result<(Self, StreamEndpoint)> {
         Self::with_policy(peer, &ReceiverPolicy::default())
     }
@@ -1384,6 +1508,183 @@ mod tests {
                 status.service_specific_error()
             );
         }
+    }
+
+    fn timed_policy(timeout: Duration) -> SinkPolicy {
+        SinkPolicy {
+            send_timeout: Some(timeout),
+            ..SinkPolicy::default()
+        }
+    }
+
+    /// Run `call` on its own thread: a wait the timeout failed to bound fails the test, not hangs.
+    fn bounded<S: Send + 'static, R: Send + 'static>(
+        subject: S,
+        call: impl FnOnce(&mut S) -> R + Send + 'static,
+    ) -> (R, Duration, S) {
+        let (done, watch) = mpsc::channel();
+        thread::spawn(move || {
+            let mut subject = subject;
+            let before = Instant::now();
+            let outcome = call(&mut subject);
+            let _ = done.send((outcome, before.elapsed(), subject));
+        });
+        watch
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the timeout must end the wait")
+    }
+
+    /// A ring holding nothing but `(512 - END_RESERVE) / 8` unread `i32` records.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn full_ring(policy: &SinkPolicy) -> (Sink<i32>, Receiver<i32>, i32) {
+        let peer = Token::new().binder();
+        let (rx, endpoint) = Receiver::<i32>::with_policy(
+            &peer,
+            &ReceiverPolicy {
+                ring_bytes: 512,
+                ..ReceiverPolicy::default()
+            },
+        )
+        .expect("a receiver");
+        assert!(endpoint.ring.is_some());
+        let mut sink = Sink::<i32>::open_with(&endpoint, policy).expect("open");
+        let fill = ((512 - END_RESERVE) / 8) as i32;
+        for item in 0..fill {
+            sink.send(&item).expect("room for it");
+        }
+        (sink, rx, fill)
+    }
+
+    /// A consumer nobody reads keeps the ring full; the timeout ends the send and costs no item.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_send_timeout_ends_a_send_on_a_full_ring_and_the_stream_goes_on() {
+        let timeout = Duration::from_millis(50);
+        let (sink, mut rx, fill) = full_ring(&timed_policy(timeout));
+        let (sent, elapsed, mut sink) = bounded(sink, |sink| sink.send(&-1));
+        assert_eq!(sent.err(), Some(StatusCode::TimedOut));
+        assert!(elapsed >= timeout, "returned after {elapsed:?}");
+        assert!(!sink.is_canceled());
+
+        for expected in 0..fill {
+            assert_eq!(rx.try_recv().expect("no error"), Some(expected));
+        }
+        assert_eq!(
+            rx.try_recv().expect("no error"),
+            None,
+            "the item is not in the ring"
+        );
+        sink.send(&fill).expect("room again");
+        sink.end().expect("end");
+        assert_eq!(rx.recv().expect("the item").expect("ok"), fill);
+        assert!(rx.recv().is_none());
+        assert!(
+            rx.end_status().expect("ended").is_ok(),
+            "a clean end: nothing was lost"
+        );
+    }
+
+    /// `Duration::ZERO` tries once; `send_all` stops at the item that timed out, keeping the rest.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_zero_send_timeout_never_waits_and_send_all_keeps_what_went_in() {
+        let (sink, mut rx, fill) = full_ring(&timed_policy(Duration::ZERO));
+        let (sent, _, sink) = bounded(sink, |sink| sink.send(&-1));
+        assert_eq!(sent.err(), Some(StatusCode::TimedOut));
+
+        // Room for two records, then three to send: the third times out, the first two stay.
+        assert_eq!(rx.try_recv().expect("no error"), Some(0));
+        assert_eq!(rx.try_recv().expect("no error"), Some(1));
+        let extra = [fill, fill + 1, fill + 2];
+        let (sent, _, sink) = bounded(sink, move |sink| sink.send_all(extra.iter()));
+        assert_eq!(sent.err(), Some(StatusCode::TimedOut));
+        sink.end().expect("end");
+        let rest: Vec<i32> = (&mut rx).map(|item| item.expect("ok")).collect();
+        assert_eq!(rest, (2..fill + 2).collect::<Vec<_>>());
+        assert!(rx.end_status().expect("ended").is_ok());
+    }
+
+    /// An RPC-path pair over a local sink: one opening credit, one `i32` a batch.
+    fn out_of_credit_pair(policy: SinkPolicy) -> (Sink<i32>, calls::Consumer<i32>) {
+        let (rx, sink_binder) = calls::Consumer::<i32>::new(&ReceiverPolicy {
+            credit_window: 1,
+            max_opening: 4,
+            ..ReceiverPolicy::default()
+        });
+        let endpoint = StreamEndpoint {
+            ring: None,
+            sink: Some(sink_binder),
+        };
+        let policy = SinkPolicy {
+            initial_credits: 1,
+            ..policy
+        };
+        let mut sink = Sink::<i32>::open_with(&endpoint, &policy).expect("open");
+        sink.send(&0).expect("the opening credit");
+        if sink.pending() > 0 {
+            sink.flush().expect("the opening credit");
+        }
+        (sink, rx)
+    }
+
+    /// Out of credit: `send` gives the item back, and the stream runs on once a grant arrives.
+    #[test]
+    fn a_send_timeout_ends_a_wait_for_credit_and_the_item_is_not_queued() {
+        let timeout = Duration::from_millis(50);
+        let (sink, mut rx) = out_of_credit_pair(SinkPolicy {
+            max_batch_bytes: 4,
+            ..timed_policy(timeout)
+        });
+        let (sent, elapsed, mut sink) = bounded(sink, |sink| sink.send(&1));
+        assert_eq!(sent.err(), Some(StatusCode::TimedOut));
+        assert!(elapsed >= timeout, "returned after {elapsed:?}");
+        assert_eq!(sink.pending(), 0, "the item was taken back out");
+
+        // Window 1: draining the batch grants its credit back.
+        assert_eq!(rx.recv().expect("item 0").expect("ok"), 0);
+        sink.send(&1).expect("a grant came");
+        sink.end().expect("end");
+        assert_eq!(rx.recv().expect("item 1").expect("ok"), 1);
+        assert!(rx.recv().is_none());
+        assert!(
+            rx.end_status().expect("ended").is_ok(),
+            "a clean end: nothing was lost"
+        );
+    }
+
+    /// A flush out of credit keeps its batch; `end` out of credit gives it up but still ends.
+    #[test]
+    fn a_flush_that_times_out_keeps_its_batch_and_an_end_that_does_still_ends() {
+        let timeout = Duration::from_millis(50);
+        let (mut sink, mut rx) = out_of_credit_pair(timed_policy(timeout));
+        sink.send(&1).expect("queued");
+        let (flushed, elapsed, mut sink) = bounded(sink, |sink| sink.flush());
+        assert_eq!(flushed.err(), Some(StatusCode::TimedOut));
+        assert!(elapsed >= timeout, "returned after {elapsed:?}");
+        assert_eq!(sink.pending(), 1, "the batch stays pending, whole");
+
+        // Window 1: draining the batch grants its credit back.
+        assert_eq!(rx.recv().expect("item 0").expect("ok"), 0);
+        sink.flush().expect("a grant came");
+
+        // No grant this time: nothing drains until `end` has returned.
+        sink.send(&2).expect("queued");
+        let (ended, elapsed, _) = bounded(Some(sink), |sink| sink.take().expect("sink").end());
+        assert_eq!(ended.err(), Some(StatusCode::TimedOut));
+        assert!(elapsed >= timeout, "returned after {elapsed:?}");
+        assert_eq!(rx.recv().expect("item 1").expect("ok"), 1);
+        let failure = rx
+            .recv()
+            .expect("a terminator")
+            .expect_err("not a clean end");
+        assert_eq!(failure.exception_code(), ExceptionCode::IllegalState);
+        assert!(
+            failure
+                .message()
+                .unwrap_or_default()
+                .contains("1 queued item"),
+            "the given-up batch is reported: {failure:?}"
+        );
     }
 
     /// A binder cannot cross as bytes; it is refused before anything is written.

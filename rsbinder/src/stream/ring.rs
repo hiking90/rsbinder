@@ -98,12 +98,12 @@ impl Shared {
         }
     }
 
-    /// Write one record: no room is `Ok(false)` unless `blocking`; only an item yields to `CANCEL`.
+    /// Write one record: no room is `Ok(false)` for `Wait::Never`; only an item yields to `CANCEL`.
     fn write_record(
         &self,
         header: u32,
         payload: &[u8],
-        blocking: bool,
+        wait: Wait,
     ) -> std::result::Result<bool, WriteFailure> {
         let is_end = header & KIND_END != 0;
         let limit = if is_end {
@@ -152,13 +152,22 @@ impl Shared {
                     return Ok(true);
                 }
             }
-            if !blocking {
-                return Ok(false);
-            }
-            let seen = self
-                .flag
-                .wait(NOT_FULL | CANCEL, None)
-                .map_err(WriteFailure::broken)?;
+            let timeout = match wait {
+                Wait::Never => return Ok(false),
+                Wait::Forever => None,
+                Wait::Until(deadline) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(WriteFailure::TimedOut);
+                    }
+                    Some(left)
+                }
+            };
+            let seen = match self.flag.wait(NOT_FULL | CANCEL, timeout) {
+                Ok(seen) => seen,
+                Err(rsbinder_fmq::Error::TimedOut) => return Err(WriteFailure::TimedOut),
+                Err(e) => return Err(WriteFailure::broken(e)),
+            };
             if seen & CANCEL != 0 {
                 self.canceled.store(true, Ordering::SeqCst);
                 if !is_end {
@@ -178,6 +187,8 @@ enum WriteFailure {
     Canceled,
     /// The producer's `Drop` gave the record up.
     Abandoned,
+    /// `SinkPolicy::send_timeout` expired with no room; the ring is untouched and still usable.
+    TimedOut,
     /// The counters fail their invariant or the futex failed; nothing more can be written.
     Broken(StatusCode),
 }
@@ -193,6 +204,7 @@ impl WriteFailure {
             WriteFailure::Canceled => StatusCode::InvalidOperation,
             // Never handed to the ring, so it did not arrive.
             WriteFailure::Abandoned => StatusCode::FailedTransaction,
+            WriteFailure::TimedOut => StatusCode::TimedOut,
             WriteFailure::Broken(e) => e,
         }
     }
@@ -269,6 +281,18 @@ impl Transit {
         self.idle.notify_all();
         #[cfg(feature = "tokio")]
         self.notify.notify_waiters();
+    }
+
+    /// The awaiting future takes back its own record's timeout: reported to it, so not lost.
+    #[cfg(feature = "tokio")]
+    fn reclaim_timed_out(&self) -> bool {
+        let mut state = self.lock();
+        if state.unreported != Some(StatusCode::TimedOut) {
+            return false;
+        }
+        state.unreported = None;
+        state.lost = state.lost.saturating_sub(1);
+        true
     }
 
     /// Block until nothing is in transit; `false` if `deadline` passes first.
@@ -375,17 +399,20 @@ struct RecordInTransit {
     shared: Arc<Shared>,
     transit: Arc<Transit>,
     bytes: Vec<u8>,
+    /// The `send_async` call's deadline, kept by the pool wait even if the future is dropped.
+    wait: Wait,
     outcome: std::result::Result<(), WriteFailure>,
 }
 
 #[cfg(feature = "tokio")]
 impl RecordInTransit {
-    fn new(shared: Arc<Shared>, transit: Arc<Transit>, bytes: Vec<u8>) -> Self {
+    fn new(shared: Arc<Shared>, transit: Arc<Transit>, bytes: Vec<u8>, wait: Wait) -> Self {
         transit.begin();
         RecordInTransit {
             shared,
             transit,
             bytes,
+            wait,
             // What a pool task that never runs leaves it as.
             outcome: Err(WriteFailure::Abandoned),
         }
@@ -397,10 +424,10 @@ impl RecordInTransit {
         self.outcome =
             match self
                 .shared
-                .write_record(item_header(self.bytes.len()), &self.bytes, true)
+                .write_record(item_header(self.bytes.len()), &self.bytes, self.wait)
             {
                 Ok(true) => Ok(()),
-                // Blocking: it returns only with the record in.
+                // Never `Wait::Never`: it returns only with the record in or a failure.
                 Ok(false) => Err(WriteFailure::Broken(StatusCode::BadValue)),
                 Err(failure) => Err(failure),
             };
@@ -499,11 +526,11 @@ impl<T: Serialize + ?Sized> Producer<T> {
         Ok(bytes)
     }
 
-    /// Write an item record; `Ok(false)` only when not `blocking` and the ring is full.
-    fn write_item(&self, bytes: &[u8], blocking: bool) -> Result<bool> {
+    /// Write an item record; `Ok(false)` only for `Wait::Never` and a full ring.
+    fn write_item(&self, bytes: &[u8], wait: Wait) -> Result<bool> {
         match self
             .shared
-            .write_record(item_header(bytes.len()), bytes, blocking)
+            .write_record(item_header(bytes.len()), bytes, wait)
         {
             Ok(written) => Ok(written),
             Err(failure) => {
@@ -515,23 +542,29 @@ impl<T: Serialize + ?Sized> Producer<T> {
         }
     }
 
-    pub(super) fn send(&mut self, item: &T) -> Result<()> {
+    pub(super) fn send(&mut self, item: &T, deadline: Option<Instant>) -> Result<()> {
         let bytes = self.encode(item)?;
         // A pool record goes in first, and its unreported failure is returned before any write.
-        self.transit.wait_idle();
+        if !self.transit.wait_idle_until(deadline) {
+            return Err(StatusCode::TimedOut);
+        }
         self.reported()?;
-        self.write_item(&bytes, true).map(|_| ())
+        self.write_item(&bytes, Wait::from_deadline(deadline))
+            .map(|_| ())
     }
 
     /// Nothing is queued here: this waits out a record in transit and reports what it came to.
-    pub(super) fn flush(&mut self) -> Result<()> {
+    pub(super) fn flush(&mut self, deadline: Option<Instant>) -> Result<()> {
         self.usable()?;
-        self.transit.wait_idle();
+        if !self.transit.wait_idle_until(deadline) {
+            return Err(StatusCode::TimedOut);
+        }
         self.reported()
     }
 
     pub(super) fn terminate(
         mut self,
+        deadline: Option<Instant>,
         exception: i32,
         service_specific: i32,
         message: Option<&str>,
@@ -539,8 +572,14 @@ impl<T: Serialize + ?Sized> Producer<T> {
         // `Drop` runs next and must not write a second end record.
         self.ended = true;
         // The end record must not overtake a record still on the pool.
-        self.transit.wait_idle();
-        let failed = self.transit.take_unreported().or(self.transit.broken());
+        let failed = if self.transit.wait_idle_until(deadline) {
+            self.transit.take_unreported().or(self.transit.broken())
+        } else {
+            // Out of time: give the record up as `Drop` does; `finish` reports it lost.
+            self.give_up_in_transit();
+            let _ = self.transit.take_unreported();
+            Some(StatusCode::TimedOut)
+        };
         self.finish(failed, exception, service_specific, message)
     }
 
@@ -549,25 +588,36 @@ impl<T: Serialize + ?Sized> Producer<T> {
     pub(super) fn send_async(
         &mut self,
         item: &T,
+        timeout: Option<Duration>,
     ) -> impl std::future::Future<Output = Result<()>> + Send + '_ {
         let staged = self.encode(item);
         async move {
+            let deadline = super::call_deadline(timeout);
             let bytes = staged?;
             let unhanded = Unhanded(&self.transit);
+            // Needs no deadline of its own: an orphan's deadline is no later than this call's.
             self.transit.idle_async().await;
             std::mem::forget(unhanded);
             self.reported()?;
             // Room now means no pool: the copy is the whole cost.
-            if self.write_item(&bytes, false)? {
+            if self.write_item(&bytes, Wait::Never)? {
                 return Ok(());
             }
-            let record = RecordInTransit::new(self.shared.clone(), self.transit.clone(), bytes);
+            if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+                return Err(StatusCode::TimedOut);
+            }
+            let wait = Wait::from_deadline(deadline);
+            let record =
+                RecordInTransit::new(self.shared.clone(), self.transit.clone(), bytes, wait);
             // The record settles itself: a dropped future detaches the task, which may never run.
             let _ = on_pool(record, |record| {
                 record.send();
                 Ok(())
             })
             .await;
+            if self.transit.reclaim_timed_out() {
+                return Err(StatusCode::TimedOut);
+            }
             self.reported()
         }
     }
@@ -578,6 +628,15 @@ impl<T: ?Sized> Producer<T> {
     /// The largest item this ring takes.
     fn max_item_bytes(&self) -> usize {
         self.shared.capacity - END_RESERVE - HEADER
+    }
+
+    /// Give up the pool's record, woken via this side's own mask; it settles as lost at once.
+    fn give_up_in_transit(&self) {
+        if self.transit.in_transit() {
+            self.shared.abandoned.store(true, Ordering::SeqCst);
+            let _ = self.shared.flag.wake(NOT_FULL);
+            self.transit.wait_idle();
+        }
     }
 
     /// The error that broke the ring, if one has.
@@ -637,7 +696,7 @@ impl<T: ?Sized> Producer<T> {
         let payload = end_payload(exception, service_specific, message);
         match self
             .shared
-            .write_record(end_header(payload.len()), &payload, false)
+            .write_record(end_header(payload.len()), &payload, Wait::Never)
         {
             Ok(true) => Ok(()),
             Ok(false) => {
@@ -698,12 +757,8 @@ impl<T: ?Sized> Drop for Producer<T> {
         if self.ended {
             return;
         }
-        if self.transit.in_transit() {
-            // `Drop` does not wait on the consumer: give up the pool's record, woken via own mask.
-            self.shared.abandoned.store(true, Ordering::SeqCst);
-            let _ = self.shared.flag.wake(NOT_FULL);
-            self.transit.wait_idle();
-        }
+        // `Drop` does not wait on the consumer.
+        self.give_up_in_transit();
         if let Some(e) = self.transit.take_unreported() {
             log::warn!("stream: a record could not be written: {e:?}");
         }
@@ -794,12 +849,20 @@ impl Drop for WaitInTransit {
     }
 }
 
-/// How long a consumer call waits for a record.
+/// How long a call waits: the consumer for a record, the producer for room.
+#[derive(Clone, Copy)]
 enum Wait {
     /// Not at all.
     Never,
     Until(Instant),
     Forever,
+}
+
+impl Wait {
+    /// A producer call's wait for room: `None` is no deadline, not no wait.
+    fn from_deadline(deadline: Option<Instant>) -> Self {
+        deadline.map_or(Wait::Forever, Wait::Until)
+    }
 }
 
 /// What one look at the ring came to.
@@ -1174,7 +1237,7 @@ mod tests {
     }
 
     fn end<T: Serialize + ?Sized>(tx: Producer<T>) -> Result<()> {
-        tx.terminate(ExceptionCode::None as i32, 0, None)
+        tx.terminate(None, ExceptionCode::None as i32, 0, None)
     }
 
     /// How many eight-byte `i32` records fill the part of the ring items may use.
@@ -1207,7 +1270,7 @@ mod tests {
         let (mut tx, mut rx) = pair::<i32>(512);
         let producer = thread::spawn(move || {
             for item in 0..200i32 {
-                tx.send(&item).expect("send");
+                tx.send(&item, None).expect("send");
             }
             end(tx).expect("end");
         });
@@ -1227,9 +1290,9 @@ mod tests {
         let (mut tx, mut rx) = pair::<Vec<u8>>(1024);
         // A `Vec<u8>` encodes as a length and the bytes, padded to four.
         let too_big = vec![0u8; 1024 - END_RESERVE];
-        assert_eq!(tx.send(&too_big).err(), Some(StatusCode::BadValue));
+        assert_eq!(tx.send(&too_big, None).err(), Some(StatusCode::BadValue));
         let fits = vec![7u8; 700];
-        tx.send(&fits).expect("an item within the limit");
+        tx.send(&fits, None).expect("an item within the limit");
         end(tx).expect("end");
         assert_eq!(rx.recv().expect("the item").expect("ok"), fits);
         assert!(rx.recv().is_none(), "the refused item never went in");
@@ -1244,7 +1307,7 @@ mod tests {
         let counter = sent.clone();
         let producer = thread::spawn(move || {
             for item in 0..1000i32 {
-                tx.send(&item).expect("send");
+                tx.send(&item, None).expect("send");
                 counter.fetch_add(1, Ordering::SeqCst);
             }
             end(tx).expect("end");
@@ -1276,7 +1339,7 @@ mod tests {
         for dropped in [false, true] {
             let (mut tx, mut rx) = pair::<i32>(512);
             for item in 0..item_records(512) as i32 {
-                tx.send(&item).expect("fills the ring");
+                tx.send(&item, None).expect("fills the ring");
             }
             let (done, watch) = mpsc::channel();
             thread::spawn(move || {
@@ -1327,12 +1390,12 @@ mod tests {
         let producer = thread::spawn(move || {
             let mut sent = 0;
             let parked = loop {
-                match tx.send(&sent) {
+                match tx.send(&sent, None) {
                     Ok(()) => sent += 1,
                     Err(e) => break e,
                 }
             };
-            let _ = outcome.send((sent, parked, tx.is_canceled(), tx.send(&0)));
+            let _ = outcome.send((sent, parked, tx.is_canceled(), tx.send(&0, None)));
         });
         let full = item_records(512) * 8;
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1362,10 +1425,10 @@ mod tests {
     #[test]
     fn dropping_the_consumer_cancels_the_producer() {
         let (mut tx, rx) = pair::<i32>(512);
-        tx.send(&1).expect("send");
+        tx.send(&1, None).expect("send");
         drop(rx);
         assert!(tx.is_canceled());
-        assert_eq!(tx.send(&2).err(), Some(StatusCode::InvalidOperation));
+        assert_eq!(tx.send(&2, None).err(), Some(StatusCode::InvalidOperation));
         // The ring outlives the consumer's mapping, so the terminator goes in and succeeds.
         end(tx).expect("end after cancel");
     }
@@ -1378,7 +1441,7 @@ mod tests {
         let (outcome, watch) = mpsc::channel();
         let producer = thread::spawn(move || {
             let parked = loop {
-                if let Err(e) = tx.send(&0) {
+                if let Err(e) = tx.send(&0, None) {
                     break e;
                 }
             };
@@ -1398,7 +1461,7 @@ mod tests {
     #[test]
     fn a_dead_producer_releases_a_blocked_consumer_after_what_it_wrote() {
         let (mut tx, mut rx) = pair::<i32>(512);
-        tx.send(&1).expect("send");
+        tx.send(&1, None).expect("send");
         let death = rx.death_recipient();
         let (done, watch) = mpsc::channel();
         thread::spawn(move || {
@@ -1477,7 +1540,7 @@ mod tests {
     #[test]
     fn a_death_notice_is_no_end_status_while_records_remain() {
         let (mut tx, mut rx) = pair::<i32>(512);
-        tx.send(&1).expect("send");
+        tx.send(&1, None).expect("send");
         let death = rx.death_recipient();
         crate::DeathRecipient::binder_died(&death, &SIBinder::downgrade(&tx.sink));
         assert!(rx.end_status().is_none(), "an item is still in the ring");
@@ -1524,7 +1587,7 @@ mod tests {
         // Two bytes cannot be an `i64`.
         assert!(tx
             .shared
-            .write_record(item_header(2), &[1, 2], false)
+            .write_record(item_header(2), &[1, 2], Wait::Never)
             .expect("write"));
         assert!(rx.recv().expect("a report").is_err());
         assert!(rx.recv().is_none());
@@ -1536,7 +1599,7 @@ mod tests {
         let (tx, mut rx) = pair::<i32>(512);
         // Three bytes a character and 244 is not a multiple of three, so the cut steps back.
         let long: String = "가".repeat(200);
-        tx.terminate(ExceptionCode::ServiceSpecific as i32, 42, Some(&long))
+        tx.terminate(None, ExceptionCode::ServiceSpecific as i32, 42, Some(&long))
             .expect("end_with");
         let failure = rx.recv().expect("the failure").expect_err("an error");
         assert_eq!(failure.exception_code(), ExceptionCode::ServiceSpecific);
@@ -1581,7 +1644,7 @@ mod tests {
         );
         assert!(before.elapsed() >= Duration::from_millis(100));
         assert!(!rx.is_finished());
-        tx.send(&5).expect("send");
+        tx.send(&5, None).expect("send");
         assert_eq!(
             rx.recv_timeout(Duration::from_secs(5)).expect("no error"),
             Some(5)
@@ -1603,7 +1666,7 @@ mod tests {
                 // `tokio::spawn` also checks that the futures are `Send`.
                 let producer = tokio::spawn(async move {
                     for item in 0..500i32 {
-                        tx.send_async(&item).await?;
+                        tx.send_async(&item, None).await?;
                     }
                     tx.terminate_async(ExceptionCode::None as i32, 0, None)
                         .await
@@ -1642,7 +1705,7 @@ mod tests {
             })
             .await;
             assert!(polled);
-            tx.send(&7).expect("send");
+            tx.send(&7, None).expect("send");
             pending.await
         });
         assert_eq!(got.expect("an item").expect("ok"), 7);
@@ -1680,7 +1743,7 @@ mod tests {
             watch.recv_timeout(Duration::from_millis(300)).is_err(),
             "the consumer must be parked behind the orphan"
         );
-        tx.send(&9).expect("send");
+        tx.send(&9, None).expect("send");
         let (got, mut rx) = watch
             .recv_timeout(Duration::from_secs(5))
             .expect("the write must release the consumer");
@@ -1707,7 +1770,7 @@ mod tests {
             watch.recv_timeout(Duration::from_millis(300)).is_err(),
             "the async consumer must be parked behind the orphan"
         );
-        tx.send(&10).expect("send");
+        tx.send(&10, None).expect("send");
         let (got, rx) = watch
             .recv_timeout(Duration::from_secs(5))
             .expect("the write must release the async consumer");
@@ -1752,7 +1815,7 @@ mod tests {
         });
         // Either held in the window or joined the orphan first; the record goes in either way.
         let held = window.recv_timeout(Duration::from_millis(500)).is_ok();
-        tx.send(&9).expect("send");
+        tx.send(&9, None).expect("send");
         if held {
             let deadline = Instant::now() + Duration::from_secs(5);
             while transit.in_transit() {
@@ -1830,10 +1893,10 @@ mod tests {
         let (mut tx, mut rx) = pair::<i32>(512);
         let fill = item_records(512) as i32;
         for item in 0..fill {
-            tx.send(&item).expect("fills the ring");
+            tx.send(&item, None).expect("fills the ring");
         }
         runtime.block_on(async {
-            let mut pending = std::pin::pin!(tx.send_async(&fill));
+            let mut pending = std::pin::pin!(tx.send_async(&fill, None));
             let polled = std::future::poll_fn(|cx| {
                 std::task::Poll::Ready(pending.as_mut().poll(cx).is_pending())
             })
@@ -1846,7 +1909,7 @@ mod tests {
         assert_eq!(rx.recv().expect("item").expect("ok"), 0);
         let (done, watch) = mpsc::channel();
         let producer = thread::spawn(move || {
-            let next = tx.send(&(fill + 1));
+            let next = tx.send(&(fill + 1), None);
             let _ = done.send(next);
             tx
         });
@@ -1867,10 +1930,10 @@ mod tests {
 
         // A record on the pool, the ring full, then the producer dropped: `Drop` must not wait.
         for item in 0..fill {
-            tx.send(&item).expect("fills the ring");
+            tx.send(&item, None).expect("fills the ring");
         }
         runtime.block_on(async {
-            let mut pending = std::pin::pin!(tx.send_async(&fill));
+            let mut pending = std::pin::pin!(tx.send_async(&fill, None));
             let _ =
                 std::future::poll_fn(|cx| std::task::Poll::Ready(pending.as_mut().poll(cx))).await;
         });
@@ -1912,11 +1975,11 @@ mod tests {
         let (mut tx, mut rx) = pair::<i32>(512);
         let fill = item_records(512) as i32;
         for item in 0..fill {
-            tx.send(&item).expect("fills the ring");
+            tx.send(&item, None).expect("fills the ring");
         }
         runtime.block_on(async {
             for item in [fill, fill + 1] {
-                let mut pending = std::pin::pin!(tx.send_async(&item));
+                let mut pending = std::pin::pin!(tx.send_async(&item, None));
                 let polled = std::future::poll_fn(|cx| {
                     std::task::Poll::Ready(pending.as_mut().poll(cx).is_pending())
                 })
@@ -1940,6 +2003,158 @@ mod tests {
             "the dropped item is reported: {ended:?}"
         );
         producer.join().expect("producer").expect("end");
+        runtime.shutdown_timeout(Duration::from_secs(5));
+    }
+
+    /// An awaited `send_async` that times out on the pool: the thread is back, the item not lost.
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn a_send_async_that_times_out_returns_its_pool_thread_and_loses_nothing() {
+        let timeout = Duration::from_millis(50);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .expect("runtime");
+        let (mut tx, mut rx) = pair::<i32>(512);
+        let fill = item_records(512) as i32;
+        for item in 0..fill {
+            tx.send(&item, None).expect("fills the ring");
+        }
+        let (done, watch) = mpsc::channel();
+        let handle = runtime.handle().clone();
+        thread::spawn(move || {
+            let before = Instant::now();
+            let sent = handle.block_on(tx.send_async(&-1, Some(timeout)));
+            let _ = done.send((sent, before.elapsed(), tx));
+        });
+        let (sent, elapsed, mut tx) = watch
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the timeout must end the pool's wait");
+        assert_eq!(sent.err(), Some(StatusCode::TimedOut));
+        assert!(elapsed >= timeout, "returned after {elapsed:?}");
+        assert!(!tx.transit.in_transit(), "the pool task has finished");
+        assert_eq!(
+            tx.transit.lost(),
+            0,
+            "reported to its caller, so not counted lost"
+        );
+
+        for expected in 0..fill {
+            assert_eq!(rx.try_recv().expect("no error"), Some(expected));
+        }
+        assert_eq!(
+            rx.try_recv().expect("no error"),
+            None,
+            "the item is not in the ring"
+        );
+        tx.send(&fill, None).expect("room again");
+        end(tx).expect("end");
+        assert_eq!(rx.recv().expect("the item").expect("ok"), fill);
+        assert!(rx.recv().is_none());
+        assert!(rx.end_status().expect("ended").is_ok());
+        runtime.shutdown_timeout(Duration::from_secs(5));
+    }
+
+    /// A dropped `send_async`'s record keeps its deadline on the pool, then settles as lost.
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn a_dropped_send_async_gives_its_pool_thread_back_at_the_deadline() {
+        let timeout = Duration::from_millis(50);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .expect("runtime");
+        let (mut tx, mut rx) = pair::<i32>(512);
+        let fill = item_records(512) as i32;
+        for item in 0..fill {
+            tx.send(&item, None).expect("fills the ring");
+        }
+        let before = Instant::now();
+        runtime.block_on(async {
+            let mut pending = std::pin::pin!(tx.send_async(&-1, Some(timeout)));
+            let polled = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(pending.as_mut().poll(cx).is_pending())
+            })
+            .await;
+            assert!(polled, "no room, so the record went to the pool");
+        });
+        assert!(
+            tx.transit
+                .wait_idle_until(Some(Instant::now() + Duration::from_secs(5))),
+            "the pool's wait must end at the deadline, with nobody reading"
+        );
+        assert!(before.elapsed() >= timeout);
+        assert_eq!(
+            tx.transit.lost(),
+            1,
+            "nobody was told, so the terminator counts it"
+        );
+
+        let producer = thread::spawn(move || end(tx));
+        for expected in 0..fill {
+            assert_eq!(rx.recv().expect("item").expect("ok"), expected);
+        }
+        let ended = rx.recv().expect("the end").expect_err("not a clean end");
+        assert!(
+            ended
+                .message()
+                .unwrap_or_default()
+                .contains("1 queued item"),
+            "the timed-out record is reported: {ended:?}"
+        );
+        assert_eq!(
+            producer.join().expect("producer").err(),
+            Some(StatusCode::TimedOut),
+            "`end` reports the failure the record left"
+        );
+        runtime.shutdown_timeout(Duration::from_secs(5));
+    }
+
+    /// `end` past its deadline gives up the dropped future's record and still ends the stream.
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn an_end_past_its_deadline_gives_up_the_record_in_transit() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .expect("runtime");
+        let (mut tx, mut rx) = pair::<i32>(512);
+        let fill = item_records(512) as i32;
+        for item in 0..fill {
+            tx.send(&item, None).expect("fills the ring");
+        }
+        // An unbounded record on the pool, so only `end`'s own deadline can end the wait.
+        runtime.block_on(async {
+            let mut pending = std::pin::pin!(tx.send_async(&-1, None));
+            let _ =
+                std::future::poll_fn(|cx| std::task::Poll::Ready(pending.as_mut().poll(cx))).await;
+        });
+        assert!(tx.transit.in_transit());
+        let (done, watch) = mpsc::channel();
+        thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(50);
+            let _ = done.send(tx.terminate(Some(deadline), ExceptionCode::None as i32, 0, None));
+        });
+        let ended = watch
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the deadline must end the wait for the record");
+        assert_eq!(ended.err(), Some(StatusCode::TimedOut));
+        let mut got = 0;
+        let status = loop {
+            match rx.recv() {
+                Some(Ok(_)) => got += 1,
+                Some(Err(status)) => break status,
+                None => panic!("the given-up record must be reported"),
+            }
+        };
+        assert_eq!(got, fill);
+        assert!(
+            status
+                .message()
+                .unwrap_or_default()
+                .contains("1 queued item"),
+            "{status:?}"
+        );
         runtime.shutdown_timeout(Duration::from_secs(5));
     }
 

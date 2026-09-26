@@ -194,6 +194,7 @@ ignored. `Receiver::new` and `Sink::open` take the defaults.
 | `SinkPolicy::max_ring_bytes` | kernel | 4 MiB | The largest ring the producer maps; a bigger one is refused at `Sink::open` |
 | `SinkPolicy::max_batch_bytes` | RPC | 16 KiB | The byte threshold at which a pending batch is sent |
 | `SinkPolicy::initial_credits` | RPC | 4 | The window the producer opens with — its ceiling on batches in flight |
+| `SinkPolicy::send_timeout` | both | `None` | How long one `send`/`send_all`/`flush`/`end` call (or `*_async` future, from its first poll) may wait for ring room or credit before it returns `TimedOut`; the item is not written or queued and the stream stays usable. `Some(Duration::ZERO)` never waits. It does not bound the RPC session's own send deadline |
 | `ReceiverPolicy::credit_window` | RPC | 4 | The consumer's grant threshold: a grant leaves once half of it is owed |
 | `ReceiverPolicy::max_opening` | RPC | 4 | The widest opening window the consumer accepts |
 
@@ -364,18 +365,20 @@ queued is reported lost.
 
 ## Over RPC
 
-The producer calls the consumer from a thread of its own, outside any handler,
-and a default RPC session cannot carry a call in that direction. The client has
-to open an **incoming connection** — see
+Each end calls the other from outside any handler — the producer sends batches
+from a thread of its own, the consumer sends grants and `cancel` — and each end
+watches the other for death. A default RPC session can do neither toward the
+client: nothing on the client reads its connection except inside its own calls.
+The client has to open an **incoming connection** — see
 [Callbacks outside a handler](./rpc-transport.md#callbacks-outside-a-handler):
 
 ```rust
 let client = rsbinder::Client::open_with(uri, |o, _| o.incoming_connections = Some(1))?;
 ```
 
-Without one, `Sink::open` refuses the stream with `StatusCode::InvalidOperation`
-and logs which option is missing, so the starting method fails at once instead
-of the first batch failing later. `Client::caps()` reports
+Without one, the client's end refuses with `StatusCode::InvalidOperation`
+before any call is made — `Receiver::new` when the client consumes,
+`Sink::open` when it produces — and logs which option is missing. `Client::caps()` reports
 `TransportCaps::CALLBACKS` when the session can carry a stream. A session with
 incoming connections has to be ended with `close_session()`.
 
