@@ -161,9 +161,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         std::process::exit(15);
     });
 
-    // Two outgoing slots: the oneway callback handler below calls the
-    // server back, and with a single slot that nested call would wait on
-    // whatever `main` has in flight.
+    // Two outgoing slots: the callback handler calls the server back while `main` holds one.
     let session = match sock.strip_prefix("tcp:") {
         Some(addr) => connect_inet(addr)?,
         None => RpcSession::setup_client_android13plus_with_config(

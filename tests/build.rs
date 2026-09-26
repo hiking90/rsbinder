@@ -156,7 +156,7 @@ fn main() {
         .generate()
         .unwrap();
 
-    // Plan 10-9: traced interfaces for `tests/transaction_names.rs`; `version`/`hash` stamp the preceding source.
+    // Plan 10-9 (`tests/transaction_names.rs`): `version`/`hash` stamp the preceding source.
     rsbinder_aidl::Builder::new()
         .source(PathBuf::from("aidl/tracedemo/ITraceDemo.aidl"))
         .version(1)
@@ -167,21 +167,14 @@ fn main() {
         .generate()
         .unwrap();
 
-    // Plan 12 F0: generic parcelables and the builtin
-    // `android.hardware.common` types (`MQDescriptor`, `NativeHandle`),
-    // which resolve to the runtime crate without a vendored `.aidl`.
-    // `tests/tests/fmq_parcel.rs` round-trips them through a `Parcel`, so no
-    // device and no feature.
+    // Plan 12 F0: builtin `android.hardware.common` types resolve without a vendored `.aidl`.
     rsbinder_aidl::Builder::new()
         .source(PathBuf::from("aidl/fmqdemo/IFmqDemo.aidl"))
         .output(PathBuf::from("fmq_demo.rs"))
         .generate()
         .unwrap();
 
-    // Plan 12 F2: an FMQ peer whose descriptor travels over binder. Served
-    // and driven by `src/fmq_peer.rs` (through `src/bin/fmq_probe.rs` on a
-    // device, `tests/fmq_binder.rs` on a Linux host with rsb_hub); the C++
-    // half compiles the same two files with the platform `aidl`.
+    // Plan 12 F2 (`src/fmq_peer.rs`): the C++ half compiles the same two files with `aidl`.
     rsbinder_aidl::Builder::new()
         .source(PathBuf::from("aidl/fmqinterop/IFmqPeer.aidl"))
         .source(PathBuf::from("aidl/fmqinterop/QueueView.aidl"))
@@ -189,10 +182,7 @@ fn main() {
         .generate()
         .unwrap();
 
-    // Plan 10-7: a service that streams into a caller-supplied sink. Both
-    // halves of the same fixture use it — `tests/stream_rpc.rs` over a
-    // session, and `src/bin/stream_probe.rs` over kernel binder — so it is
-    // generated unconditionally rather than behind `rpc`.
+    // Plan 10-7: `stream_rpc.rs` and the kernel `stream_probe` share it, so not behind `rpc`.
     rsbinder_aidl::Builder::new()
         .source(PathBuf::from("aidl/streamdemo/IStreamDemo.aidl"))
         .output(PathBuf::from("stream_demo.rs"))

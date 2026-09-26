@@ -44,8 +44,9 @@
 //! - A panic in either call is caught and logged. It does not change the
 //!   transaction's result, and `on_reply` still runs after a panicking
 //!   `on_transact` (with `tag = None`). The same holds for a panic in the
-//!   user `Interface::transaction_name` impl that builds the [`TxnContext`],
-//!   and on kernel binder for `Remotable::descriptor`: it is logged, and
+//!   user [`Remotable::transaction_name`](crate::Remotable::transaction_name)
+//!   impl that builds the [`TxnContext`], and on kernel binder for
+//!   `Remotable::descriptor`: it is logged, and
 //!   the transaction is dispatched without either observer call. On RPC
 //!   the dispatch calls `descriptor` again outside that guard, so a
 //!   panicking `descriptor` still unwinds the serve loop there.
@@ -175,8 +176,7 @@ fn log_panic(which: &str, payload: &(dyn Any + Send)) {
     log::error!("{which} panicked: {msg}");
 }
 
-/// Run `dispatch` between the observer's two calls. `ctx` is only built
-/// when an observer is installed, so its lookups cost nothing otherwise.
+/// Run `dispatch` between the observer's two calls; `ctx` is built only if an observer is set.
 pub(crate) fn observed<'a>(
     ctx: impl FnOnce() -> TxnContext<'a>,
     dispatch: impl FnOnce() -> Result<()>,

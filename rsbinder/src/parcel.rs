@@ -22,6 +22,25 @@
 //! This module provides the `Parcel` type for marshalling and unmarshalling data
 //! in binder transactions. Parcels handle the low-level details of data layout,
 //! alignment, and object references required for cross-process communication.
+//!
+//! All non-kernel serialization state is bundled into one struct,
+//! `RpcFields` (AOSP `Parcel.h`'s `RpcFields`, the RPC arm of its
+//! `std::variant<KernelFields, RpcFields> mVariantFields`). Unlike AOSP
+//! there is no `KernelFields`: the kernel offset table is `Parcel::objects`,
+//! a wholly separate field, so only the RPC arm has to be bundled.
+//!
+//! A `Parcel` carries it as `Option<RpcFields>`: `Some` ⇒ RPC mode (session
+//! hooks attached, or none in the data-only mode), `None` ⇒ kernel path
+//! (`Parcel::is_kernel_backed`),
+//! byte-identical to the kernel wire. Tying every RPC field's existence to
+//! the mode flag in the type makes "RPC mode ⇒ RPC state present" an
+//! invariant the compiler enforces, instead of seven independently-defaulted
+//! fields gated on a separate bool.
+//!
+//! Every field of `RpcFields` is behind `rpc`, the struct is not: without the
+//! feature it is empty and `Some(RpcFields::default())` is exactly what
+//! `Parcel::new_data_only` needs — a parcel that has no session to marshal a
+//! binder or an fd through. `rpc` adds the state a session fills in.
 
 use std::default::Default;
 use std::vec::Vec;
@@ -228,8 +247,7 @@ impl<T: Clone + Default> ParcelData<T> {
         ParcelData::Vec(Vec::with_capacity(capacity))
     }
 
-    // Adopting a ready-made byte buffer as a parcel: the RPC stack, and
-    // `from_bytes` decoding a stored value.
+    // Adopts a ready-made buffer: the RPC stack, and `from_bytes` decoding a stored value.
     fn from_vec(data: Vec<T>) -> Self {
         ParcelData::Vec(data)
     }
@@ -368,26 +386,7 @@ pub(crate) trait RpcParcelOps: Send + Sync {
     fn read_binder(&self, parcel: &mut Parcel) -> Result<Option<crate::binder::SIBinder>>;
 }
 
-/// All non-kernel serialization state for a [`Parcel`], bundled into
-/// one struct (AOSP `Parcel.h`'s `RpcFields`, the RPC arm of its
-/// `std::variant<KernelFields, RpcFields> mVariantFields`). Unlike
-/// AOSP we need no `KernelFields`: rsbinder keeps the kernel offset
-/// table in [`Parcel::objects`], a wholly separate field, so only the
-/// RPC arm has to be bundled.
-///
-/// A `Parcel` carries this as `Option<RpcFields>`: `Some` ⇒ the
-/// session-less RPC mode, `None` ⇒ kernel path
-/// ([`Parcel::is_kernel_backed`]), byte-identical to the kernel wire.
-/// Tying every RPC field's existence to the mode flag in the type
-/// makes "RPC mode ⇒ RPC state present" an invariant the compiler
-/// enforces, instead of seven independently-defaulted fields gated on
-/// a separate bool.
-///
-/// Every field is behind `rpc`, the struct is not: without the
-/// feature it is empty and `Some(RpcFields::default())` is exactly
-/// what [`Parcel::new_data_only`] needs — a parcel that has no session
-/// to marshal a binder or an fd through. `rpc` adds the state a
-/// session fills in.
+/// All non-kernel serialization state of a [`Parcel`] (AOSP `RpcFields`); see the module doc.
 #[derive(Default)]
 struct RpcFields {
     /// Object-marshalling hooks for RPC mode (android `mSession`
@@ -632,10 +631,7 @@ impl Parcel {
     /// wholesale — carries its own write-time refusal for them. All of
     /// them refuse before anything is written, which is why there is no
     /// second check on the finished bytes to keep in step with them.
-    ///
-    /// Available without the `rpc` feature: the mode is the absence of a
-    /// session, and the refusals follow from that absence rather than
-    /// from anything the RPC transport contributes.
+    /// Not behind `rpc`: the refusals follow from the missing session, not from the transport.
     pub(crate) fn new_data_only() -> Self {
         let mut p = Parcel::new();
         p.set_for_rpc(true);
@@ -783,8 +779,7 @@ impl Parcel {
         {
             self.rpc_fd_mode() == crate::rpc::FileDescriptorTransportMode::Unix
         }
-        // Without `rpc` the only non-kernel parcel is the session-less
-        // data-only one, which has no session to carry an fd over.
+        // Without `rpc` the only non-kernel parcel is data-only, with no session to carry an fd.
         #[cfg(not(feature = "rpc"))]
         false
     }
@@ -3142,13 +3137,7 @@ mod wire_golden {
     }
 }
 
-/// `to_bytes` / `from_bytes`: the promise is that the bytes are
-/// self-contained, so every test here is about something that would
-/// break that.
-///
-/// The module is not behind `rpc`: the refusals it pins are what a
-/// build without that feature relies on too, and there the kernel
-/// arms they guard are the only ones compiled in.
+/// `to_bytes` output must be self-contained; not behind `rpc`, as non-`rpc` builds rely on it too.
 #[cfg(test)]
 mod data_serde {
     use super::*;
@@ -3263,8 +3252,7 @@ mod data_serde {
         );
     }
 
-    // An object position is RPC state; without the feature a data-only
-    // parcel has no way to acquire one.
+    // An object position is RPC state; without the feature no parcel can acquire one.
     #[cfg(feature = "rpc")]
     #[test]
     fn a_parcel_holding_a_reference_refuses_to_hand_out_its_bytes() {

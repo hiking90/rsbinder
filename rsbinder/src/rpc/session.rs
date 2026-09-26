@@ -58,7 +58,7 @@ enum RpcUnixAddr<'a> {
 ///
 /// Superseded by [`RpcClientConfig`], which takes the same knobs on every
 /// transport: [`RpcClientConfig::unix`] and
-/// [`RpcClientConfig::unix_abstract`] replace the two constructors here.
+/// `RpcClientConfig::unix_abstract` (Linux/Android) replace the two constructors here.
 #[deprecated(
     since = "0.13.0",
     note = "use `RpcClientConfig::unix`/`unix_abstract`, which carry the same knobs on every transport"
@@ -149,8 +149,7 @@ impl<'a> RpcUnixClientConfig<'a> {
         }
     }
 
-    /// For the deprecated attach calls, which 0.12.0 shipped accepting a
-    /// session `timeout` and ignoring it; they keep doing that.
+    /// For the deprecated attach calls, which ignore `timeout` as 0.12.0 shipped them.
     fn into_attach(self) -> RpcClientConfig<'a> {
         RpcClientConfig {
             timeout: None,
@@ -169,16 +168,10 @@ fn unix_connect(addr: RpcUnixAddr<'_>) -> Result<Box<dyn RpcTransport>> {
     Ok(Box::new(t))
 }
 
-/// Opens one connection to the server; see [`RpcClientConfig::new`].
-///
-/// `Send` so that a [`RpcClientConfig`] can be built on one thread and
-/// consumed on another, which is what the `RpcUnixClientConfig` it
-/// replaces allowed.
+/// Opens one connection; `Send` so a config built on one thread can be consumed on another.
 type Connector<'a> = Box<dyn FnMut() -> Result<Box<dyn RpcTransport>> + Send + 'a>;
 
-/// Where a [`RpcClientConfig`] opens its connections. The connect
-/// function is built from this once the handshake deadline is known, so
-/// a built-in transport can apply that deadline to its own connect.
+/// Where a config connects; the connector is built once the handshake deadline is known.
 enum ClientSource<'a> {
     Unix(RpcUnixAddr<'a>),
     #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
@@ -241,12 +234,7 @@ impl<'a> ClientSource<'a> {
     }
 }
 
-/// A fresh TCP connection and TLS session to `host:port`, each blocking
-/// step bounded by `handshake_timeout`. The first address that connects
-/// is pinned in `pinned`, which lives in the connector one config built,
-/// so it covers the connections that config opens, as AOSP
-/// `setupInetClient` resolves once: another server behind the same name
-/// would not know the session id.
+/// TCP then TLS, each bounded by `handshake_timeout`; for `pinned` see [`RpcClientConfig::tls`].
 #[cfg(feature = "rpc-tls")]
 fn connect_tls(
     host: &str,
@@ -288,11 +276,7 @@ fn connect_tls(
             }
         }
     };
-    // The TLS handshake is the rest of this phase, and it is blocking I/O
-    // on the socket: bound it too, or a peer that accepts the connection
-    // and never sends a ServerHello hangs the setup — the very failure
-    // this option promises to cut. The server side bounds its half the
-    // same way, before `wrap_accepted`.
+    // Bound the TLS handshake too: a peer that never sends ServerHello would hang setup.
     if let Some(d) = handshake_timeout {
         tcp.set_read_timeout(Some(d))?;
         tcp.set_write_timeout(Some(d))?;
@@ -300,9 +284,7 @@ fn connect_tls(
     let t = super::transport::TlsTransport::connect(tcp, server_name, config.clone())
         .map_err(StatusCode::from)?;
     if handshake_timeout.is_some() {
-        // Handshake over: what follows (the android-13+ handshake, then
-        // the session's own traffic) arms its own deadlines, and a sticky
-        // one here would cut an idle session short.
+        // Later traffic arms its own deadlines; a sticky one here would cut an idle session.
         t.set_read_timeout(None).map_err(StatusCode::from)?;
         t.set_write_timeout(None).map_err(StatusCode::from)?;
     }
@@ -325,7 +307,7 @@ struct AttachParts<'a> {
 /// [`add_incoming_connection_with_config`](RpcSession::add_incoming_connection_with_config)).
 ///
 /// One constructor per transport: [`unix`](Self::unix),
-/// [`unix_abstract`](Self::unix_abstract), `vsock` (`rpc-vsock`), `tls`
+/// `unix_abstract` (Linux/Android), `vsock` (`rpc-vsock`), `tls`
 /// (`rpc-tls`), `tcp_debug` (`rpc-tcp-debug`), or [`new`](Self::new)
 /// with a connect function of your own. The knobs are
 /// the same whichever one built it, because the setup opens every
@@ -406,7 +388,7 @@ impl<'a> RpcClientConfig<'a> {
 
     /// Connect to a **plaintext** TCP server — the `rpc-tcp-debug`
     /// transport, which is for tests and bring-up, not for a network you
-    /// do not control. [`tls`](Self::tls) is the TCP transport to ship.
+    /// do not control. `tls` (`rpc-tls`) is the TCP transport to ship.
     #[cfg(feature = "rpc-tcp-debug")]
     pub fn tcp_debug(addr: std::net::SocketAddr, max_version: u32) -> Self {
         Self::with_source(ClientSource::TcpDebug(addr), max_version)
@@ -506,11 +488,11 @@ impl<'a> RpcClientConfig<'a> {
     /// its own TLS session), attached with the `INCOMING` header bit,
     /// added to the server's session as a slot the server *sends* on,
     /// and served here by a dedicated thread. Without at least one, the
-    /// server can reach this client's callbacks only from inside a
-    /// handler that is answering one of this client's calls (a nested
-    /// call); a call from any other server thread — a timer, a worker, a
-    /// oneway notification — fails at once with
-    /// [`StatusCode::WouldBlock`] on the server (AOSP `WOULD_BLOCK`).
+    /// server can reach this client's callbacks only with a **twoway**
+    /// call from inside a handler that is answering one of this client's
+    /// calls (a nested call); a oneway, even from inside that handler, and
+    /// a call from any other server thread — a timer, a worker — fail at
+    /// once with [`StatusCode::WouldBlock`] on the server (AOSP `WOULD_BLOCK`).
     ///
     /// Side effect: a session with an incoming connection detects the
     /// server's death as soon as the connection drops (obituaries fire
@@ -598,8 +580,7 @@ impl<'a> RpcClientConfig<'a> {
         self
     }
 
-    /// One connection, for a caller that drives the wire itself (the
-    /// entry layer's r34 path).
+    /// One connection, for a caller that drives the wire itself (the entry layer's r34 path).
     pub(crate) fn connect_once(self) -> Result<Box<dyn RpcTransport>> {
         (self.source.into_connector(self.handshake_timeout))()
     }
@@ -1041,8 +1022,8 @@ fn client_handshake_err(e: RpcError, requesting_new_session: bool) -> StatusCode
             RpcError::Timeout => log::error!(
                 "rsbinder RPC: the android-13+ handshake stalled and a read deadline armed on \
                  this connection elapsed — that deadline is the caller's own \
-                 (`RpcUnixClientConfig::handshake_timeout`, the 10s \
-                 `RpcSession::from_preconnected_fd` arms, or one set on the transport \
+                 (`RpcClientConfig::handshake_timeout` or `ClientOptions::handshake_timeout`, \
+                 the 10s `RpcSession::from_preconnected_fd` arms, or one set on the transport \
                  directly), so it may simply be shorter than this peer's legitimate response \
                  time. A peer that should have answered well within it may be speaking the \
                  r34 (default) profile instead"
@@ -1149,8 +1130,8 @@ thread_local! {
 /// nested call (the `DRIVING` reentrant pin) re-enters an `Outgoing`
 /// slot unconditionally, but an `Incoming` one only while its dispatch
 /// grants it ([`ConnSlot::allow_nested`]) — a nested call from a
-/// *oneway* handler falls through to an `Outgoing` slot instead. A
-/// oneway call never re-enters an `Incoming` slot ([`ConnUse::ClientAsync`]).
+/// *oneway* handler falls through to an `Outgoing` slot instead.
+/// A oneway call never re-enters an `Incoming` slot ([`ConnUse::ClientAsync`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SlotRole {
     /// This endpoint serves the connection (AOSP `mIncoming`): the
@@ -1173,13 +1154,7 @@ enum ConnUse {
     /// [`ConnSlot::allow_nested`] holds; otherwise it needs an
     /// `Outgoing` slot, since nothing would read the frame.
     Client,
-    /// AOSP `ConnectionUse::CLIENT_ASYNC` — a oneway transaction. Never
-    /// rides a serve-driven slot, even one whose dispatch grants nesting
-    /// ("asynchronous calls cannot be nested"): the sender does not wait,
-    /// so it goes on to write the reply to the transaction it is serving
-    /// while the peer may still be handling the oneway inside its reply
-    /// wait — and a twoway the peer's handler sends back on that socket
-    /// would then read that reply as its own. It needs an `Outgoing` slot.
+    /// A oneway (AOSP `CLIENT_ASYNC`): never nests on an `Incoming` pin (plan 10-7b §13.3).
     ClientAsync,
     /// AOSP `ConnectionUse::CLIENT_REFCOUNT` — a reply-less
     /// `DEC_STRONG`. Always free to ride the *pinned* slot ("we currently
@@ -1668,9 +1643,8 @@ impl RpcSessionInner {
     ///     `exclusiveIncoming->allowNested`): a oneway dispatch leaves
     ///     nobody reading that socket, so the pin is **declined** and
     ///     the scan below applies. [`ConnUse::ClientRefcount`] ignores
-    ///     the grant (a `DEC_STRONG` awaits no reply), and
-    ///     [`ConnUse::ClientAsync`] never takes a serve-driven pin at all
-    ///     — these are the only places the uses differ.
+    ///     the grant (a `DEC_STRONG` awaits no reply).
+    ///     [`ConnUse::ClientAsync`] never takes a serve-driven pin at all.
     ///  2. **Exclusive** — a slot whose `exclusive_tid == this tid`
     ///     (defensive: should be covered by 1).
     ///  3. **First available `Outgoing` slot** — the first slot with
@@ -1732,7 +1706,7 @@ impl RpcSessionInner {
     /// once the socket buffer fills — with the slot's `exclusive_tid`
     /// held, which locks its serve loop out of its own connection.
     /// A client that wants prompt release opens an incoming connection
-    /// ([`RpcUnixClientConfig::incoming_connections`], plan 2-20).
+    /// ([`RpcClientConfig::incoming_connections`], plan 2-20).
     fn find_conn_lenient(&self) -> Result<ConnGuard<'_>> {
         self.find_conn_impl(ConnUse::ClientRefcount)
     }
@@ -1873,7 +1847,8 @@ impl RpcSessionInner {
                     log::error!(
                         "RPC: session has no outgoing connection — a non-nested call (from \
                          another thread, or any oneway) needs the peer to open \
-                         incoming connections (RpcUnixClientConfig::incoming_connections / \
+                         incoming connections (RpcClientConfig::incoming_connections / \
+                         ClientOptions::incoming_connections / \
                          ARpcSession_setMaxIncomingThreads); refusing instead of waiting forever"
                     );
                 }
@@ -2151,12 +2126,7 @@ impl RpcSessionInner {
     /// count and is zero on the default single-slot path (no waiters
     /// at all), so the trade favors mixed-waiter correctness.
     ///
-    /// `Err(DeadObject)` for a torn-down session; `Err(BadType)` for a
-    /// transport whose traits differ from the founding connection's.
-    /// The two are kept apart because a live session
-    /// refusing a mismatched transport must not reach the caller as a
-    /// dead one — the caller's answer to `DeadObject` is to drop the
-    /// proxy or close the session.
+    /// DeadObject if torn down, BadType on a trait mismatch — a live session must not read as dead.
     ///
     /// The teardown gate sits in the *same*
     /// critical section as the push (like
@@ -2201,9 +2171,8 @@ impl RpcSessionInner {
     /// `setMaxIncomingThreads` cap **atomically** with the push and — in
     /// the same critical section — the anti-resurrection gate. Counts
     /// only `incoming` slots (AOSP caps `mIncoming.size()`, not the
-    /// callback connections the client opened toward us). Returns
-    /// `Err(FailedTransaction)` at the cap; its other refusals are
-    /// [`add_slot_inner`](Self::add_slot_inner)'s, with the same codes.
+    /// callback connections the client opened toward us).
+    /// Returns `Err(FailedTransaction)` at the cap, else [`Self::add_slot_inner`]'s codes.
     fn add_incoming_slot_capped(
         &self,
         transport: Box<dyn RpcTransport>,
@@ -2254,12 +2223,8 @@ impl RpcSessionInner {
 
     /// Like [`add_slot_inner`](Self::add_slot_inner) but enforces a
     /// maximum number of callback (`Outgoing`) slots **atomically** under
-    /// the `conn_state` lock: returns `Err(FailedTransaction)` (adding
-    /// nothing, closing `transport`) when the pool already holds `cap` of
-    /// them, and the two refusals of `add_slot_inner` as it does — a
-    /// budget that is spent, a session that is dead and a transport that
-    /// does not match are three different things to the caller that has
-    /// to answer them. Serve-driven
+    /// the `conn_state` lock: returns `Err(FailedTransaction)` (adding nothing, closing
+    /// `transport`) when the pool already holds `cap` of them. Serve-driven
     /// slots do not count — a client's outgoing fan-out must never eat
     /// into its callback budget. Used for the server callback-slot
     /// admission cap — callback slots have no serve loop and are only
@@ -2267,6 +2232,7 @@ impl RpcSessionInner {
     /// let concurrent attach workers each pass the check and overshoot the
     /// cap, letting an untrusted peer grow the pool (and its held fds)
     /// unbounded. Folding the check into the push closes that TOCTOU.
+    /// Other refusals: those of [`add_slot_inner`](Self::add_slot_inner), same codes.
     ///
     /// `claimed`: push the slot already driven by the calling thread
     /// (`exclusive_tid = current`), so the caller can finish a wire
@@ -3598,17 +3564,7 @@ impl RpcSessionInner {
             let _work_source = crate::thread_state::WorkSourceDispatchGuard::enter();
             crate::observe::observed(observed_ctx, || {
                 consume_rpc_interface_token(&mut reader, target.descriptor()).and_then(|()| {
-                    // Mirror the kernel server entrypoint's `dispatch_transact_caught`
-                    // (thread_state.rs): a panic in the user `on_transact` handler
-                    // must NOT unwind through the serve loop, because that would skip
-                    // the `serve_blocking_on_inner` cleanup (drop_connection /
-                    // send_session_obituaries / remove_slot) and leave a slot pinned
-                    // to a dead worker — deadlock + session-lifecycle corruption +
-                    // missed obituaries. Catch it here and turn it into a
-                    // deterministic error reply, symmetric with the kernel path. On
-                    // the error path the reply parcel is unused (`send_reply` sends an
-                    // empty body with the status), so a partially-written `reply`
-                    // cannot leak to the peer.
+                    // Unwinding would skip the serve loop's slot cleanup; mirrors the kernel path.
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         target.rpc_transact(code, &mut reader, &mut reply)
                     }))
@@ -3871,7 +3827,7 @@ impl RpcSessionInner {
 /// [`RpcSession::close_session`] is the explicit break for it.
 ///
 /// A client session with incoming (callback) connections
-/// ([`RpcUnixClientConfig::incoming_connections`]) owns the threads that
+/// ([`RpcClientConfig::incoming_connections`]) owns the threads that
 /// serve them, and those threads keep the session alive: dropping every
 /// handle and proxy does not stop them. They end when the server closes
 /// the session or on [`RpcSession::close_session`] — call it when you are done
@@ -3902,12 +3858,13 @@ impl RpcSession {
     /// from outside a dispatch fail with
     /// [`StatusCode::WouldBlock`], because writing a request into
     /// a connection the peer only reads inside its own reply wait would
-    /// sit unread. Callbacks *from inside a twoway handler* are
-    /// unaffected (they re-enter the dispatching connection). To call
+    /// sit unread. Twoway callbacks *from inside a twoway handler* are
+    /// unaffected (they re-enter the dispatching connection); a oneway
+    /// never re-enters it. To call
     /// out of an acceptor otherwise, the peer must open incoming
     /// connections, which needs the android-13+ profile
     /// (`?profile=android13plus`,
-    /// `RpcUnixClientConfig::incoming_connections`); the r34 profile has
+    /// `RpcClientConfig::incoming_connections`); the r34 profile has
     /// no such mechanism.
     pub fn new(transport: Box<dyn RpcTransport>, space: AddressSpace) -> RpcResult<RpcSession> {
         // Default = android-12 r34, byte-unchanged.
@@ -4061,12 +4018,8 @@ impl RpcSession {
     /// (client, init=true)` for `incoming` headers). Does NOT bump
     /// the lifecycle count (callback slots are not serve-driven; AOSP
     /// also does not gate session lifetime on `mOutgoing.size()`).
-    /// `Err(DeadObject)` if the session was already torn down when the
-    /// call started, or died in between — which the atomic gate below
-    /// catches under the same lock as the cap (the lifecycle covers both
-    /// `Dying` and `Dead` in a single check). `Err(FailedTransaction)` if
-    /// the session already holds `cap` callback slots, `Err(BadType)` if
-    /// the transport does not match the founding connection's.
+    /// `Err(DeadObject)` if torn down at the start or in between (checked under the cap's lock).
+    /// `Err(FailedTransaction)` at `cap` callback slots, `Err(BadType)` on a transport mismatch.
     ///
     /// `cap` and the teardown gate are both enforced atomically inside
     /// [`add_slot_inner_capped`] (`RpcSessionInner`) so concurrent attach
@@ -4716,7 +4669,7 @@ impl RpcSession {
         // loop. Eager death by design, *not* AOSP (whose
         // client-side `onSessionAllIncomingThreadsEnded` is a no-op) —
         // the trade-off is on
-        // [`RpcUnixClientConfig::incoming_connections`].
+        // [`RpcClientConfig::incoming_connections`].
         if !client_incoming && self.inner.shared.lifecycle.drop_connection() {
             self.inner.on_session_dead();
         }
@@ -4777,7 +4730,7 @@ impl RpcSession {
     /// session.
     ///
     /// The threads serving this client's incoming (callback) connections
-    /// (`RpcUnixClientConfig::incoming_connections`) are stopped and
+    /// (`RpcClientConfig::incoming_connections`) are stopped and
     /// joined here — every slot's transport is shut down, which ends
     /// their serve loops — except a thread that calls `close_session` from
     /// inside its own callback handler, which is left to finish on its
@@ -5031,10 +4984,7 @@ impl RpcSession {
 
         let mut connect = source.into_connector(handshake_timeout);
         let founding = connect()?;
-        // Decided by the transport, not by how the config was built, so a
-        // `RpcClientConfig::new` connector is held to it too. The
-        // handshake would otherwise agree on `Unix` mode and every fd
-        // send fail later.
+        // Checked on the transport (custom ones too), or `Unix` is agreed and fd sends fail later.
         if requested_fd_mode == Some(FileDescriptorTransportMode::Unix)
             && !founding.supports_fd_passing()
         {
@@ -5056,8 +5006,7 @@ impl RpcSession {
             session.set_timeout(timeout);
         }
         if local == 1 && incoming == 0 {
-            // Single-connection path: byte-identical to
-            // `connect_android13plus_fd` on the first transport.
+            // Single connection: byte-identical to `connect_android13plus_fd`.
             return Ok(session);
         }
 
@@ -5168,8 +5117,7 @@ impl RpcSession {
         self.add_outgoing_connection_named(config, "RpcClientConfig::handshake_timeout")
     }
 
-    /// `what` names the setter the caller used, so a deprecated wrapper's
-    /// caller is not pointed at a setter it never had.
+    /// `what` names the caller's own setter, which a deprecated wrapper's caller may lack.
     fn add_outgoing_connection_named(&self, config: RpcClientConfig, what: &str) -> Result<u64> {
         let AttachParts {
             mut connect,
@@ -5187,15 +5135,13 @@ impl RpcSession {
         )
     }
 
-    /// The single connection and knobs a manual attach runs on, with the
-    /// combinations an attach cannot express refused first.
+    /// The connection and knobs of a manual attach, refusing what an attach cannot express.
     fn attach_parts<'a>(&self, config: RpcClientConfig<'a>, what: &str) -> Result<AttachParts<'a>> {
         reject_zero_handshake_timeout(config.handshake_timeout, what)?;
         if config.outgoing_connections.max(1) != 1
             || config.incoming_connections != 0
             || config.session_id.len() != 32
-            // The attach joins a session that already has its deadline;
-            // accepting one here would silently drop it.
+            // The session already has its deadline; accepting one here would silently drop it.
             || config.timeout.is_some()
         {
             return Err(StatusCode::BadValue);
@@ -5240,10 +5186,7 @@ impl RpcSession {
             WireProfile::Android13Plus(c) => c.version(),
             WireProfile::R34(_) => return Err(StatusCode::BadType),
         };
-        // Checked here, as the incoming attach does: `add_outgoing_slot`
-        // refuses a torn-down session anyway, and reaching it would have
-        // cost a connect, a handshake and the `confirm_attach` roundtrip
-        // — and left the server holding a slot and a worker thread.
+        // Checked early: reaching `add_outgoing_slot` costs a connect, handshake and a server slot.
         if self.inner.shared.lifecycle.is_torn_down() {
             return Err(StatusCode::DeadObject);
         }
@@ -5329,8 +5272,7 @@ impl RpcSession {
         self.add_incoming_connection_named(config, "RpcClientConfig::handshake_timeout")
     }
 
-    /// `what` names the setter the caller used, so a deprecated wrapper's
-    /// caller is not pointed at a setter it never had.
+    /// `what` names the caller's own setter, which a deprecated wrapper's caller may lack.
     fn add_incoming_connection_named(&self, config: RpcClientConfig, what: &str) -> Result<u64> {
         let AttachParts {
             mut connect,
@@ -5705,10 +5647,7 @@ mod tests {
     use super::*;
     use std::os::fd::{AsFd, OwnedFd};
 
-    /// After the first TCP connect, `connect_tls` no longer resolves the
-    /// host: the second call reaches the pinned address even though its
-    /// host name cannot resolve. The peer drops every connection, so both
-    /// TLS handshakes fail — only the TCP connects are under test.
+    /// The peer drops every connection, so both TLS handshakes fail; only TCP connects are tested.
     #[cfg(feature = "rpc-tls")]
     #[test]
     fn tls_connections_stay_on_the_first_resolved_address() {
@@ -6189,12 +6128,7 @@ mod tests {
         peer_thread.join().expect("peer thread");
     }
 
-    /// A oneway sent from inside a twoway dispatch does not ride the
-    /// serve-driven slot the dispatch granted to nested calls (AOSP
-    /// `CLIENT_ASYNC` skips `mIncoming`): the sender writes its reply next
-    /// without waiting, so a peer handling the oneway in its reply wait
-    /// would read that reply as the answer to its own nested call. With no
-    /// outgoing slot it is `WouldBlock`, as in AOSP; a twoway still nests.
+    /// plans/10-7b-streaming-over-fmq.md §13.3: a twoway still nests, a oneway is `WouldBlock`.
     #[test]
     fn a_oneway_from_a_twoway_dispatch_never_nests_on_the_serving_slot() {
         let (a, _b) = super::super::transport::UnixTransport::pair().expect("socketpair");
@@ -6653,9 +6587,7 @@ mod tests {
         let session = RpcSession::from_android13plus(Box::new(t0), codec, FD_MODE_NONE, false)
             .expect("build session");
 
-        // All three report the mismatch as itself: the session is alive
-        // and its callback budget untouched, so `DeadObject` or
-        // `FailedTransaction` would send the caller after the wrong cause.
+        // All three report `BadType`: the session is alive, so `DeadObject` would mislead.
         let (u, _pu) = UnixTransport::pair().expect("socketpair");
         assert_eq!(
             session.inner.add_outgoing_slot(Box::new(u)),

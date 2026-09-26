@@ -28,7 +28,8 @@ pub struct ClientOptions {
     /// RPC (android13plus profile, every RPC transport): number of
     /// incoming (callback) connections to open — AOSP
     /// `setMaxIncomingThreads`. Needed for the server to call this
-    /// client's callbacks from outside a handler. Each one is a further
+    /// client's callbacks from outside a handler, and for any oneway
+    /// callback. Each one is a further
     /// connection to the same endpoint (a `tls://` one is its own TLS
     /// session), because the android-13+ wire lets the server start a
     /// call only on a connection the client reads outside its own reply
@@ -351,25 +352,20 @@ fn rpc_connect(uri: &Uri, o: &ClientOptions) -> Result<crate::rpc::RpcSession> {
     if let Some(t) = o.handshake_timeout {
         cfg = cfg.handshake_timeout(t);
     }
-    // Forward rather than drop: the session layer refuses a combination
-    // it cannot honor (`BadValue`), which is the "never ignored" contract.
+    // Forwarded, not dropped: the session layer refuses what it cannot honor (never ignored).
     if let Some(id) = o.session_id.as_deref() {
         cfg = cfg.session_id(id);
     }
 
     if versioned.is_some() {
-        // Fan-out and incoming connections open one connection each, as
-        // AOSP `setupClient` calls `connectAndInit` — on every transport.
-        // At the defaults (1 and 0) this is the plain single-connection
-        // handshake.
+        // One connection each, as AOSP `setupClient` calls `connectAndInit`, on every transport.
         return RpcSession::setup_client_android13plus_with_config(
             cfg.outgoing_connections(fan_out)
                 .incoming_connections(incoming),
         );
     }
 
-    // r34 wire: no handshake, so the session is built on the connection
-    // itself.
+    // r34 wire: no handshake, so the session is built on the connection itself.
     let session =
         RpcSession::new(cfg.connect_once()?, AddressSpace::Initiator).map_err(StatusCode::from)?;
     // Before the negotiation below, not after `rpc_connect` returns: that
@@ -383,9 +379,7 @@ fn rpc_connect(uri: &Uri, o: &ClientOptions) -> Result<crate::rpc::RpcSession> {
     Ok(session)
 }
 
-/// The session-layer config for `endpoint`, offering wire version
-/// `max_version` (ignored on the r34 wire). What the build lacks for an
-/// endpoint is refused here, before any socket work.
+/// Session config offering `max_version` (ignored on r34); refuses what the build lacks early.
 #[cfg(feature = "rpc")]
 fn client_config<'a>(
     endpoint: &'a Endpoint,

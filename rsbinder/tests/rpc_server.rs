@@ -3672,9 +3672,7 @@ fn b_incoming_config_validation() {
     ));
 }
 
-/// A session `timeout` has nowhere to go on a manual attach. The calls
-/// that take a `RpcClientConfig` refuse it; the deprecated ones shipped
-/// in 0.12.0 ignoring it, and a released call keeps what it did.
+/// Manual attach: `RpcClientConfig` calls refuse a `timeout`; released deprecated ones ignore it.
 #[allow(deprecated)]
 #[test]
 fn a_manual_attach_with_a_session_timeout() {

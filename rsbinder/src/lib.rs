@@ -326,14 +326,10 @@ pub mod blob;
 // their intra-doc links at the crate root, breaking them.
 pub mod cancel;
 
-// Streaming a sequence of values with credit-based back-pressure
-// (`rsbinder.stream.IStreamSink` / `IStreamSource`). Plain comment for
-// the same reason as `cancel` above.
+// Streaming with credit-based back-pressure; plain comment, same reason as `cancel` above.
 pub mod stream;
 
-// Fast Message Queue: the `android.hardware.common.fmq.MQDescriptor`
-// parcelable on every platform, plus `rsbinder-fmq` (the queue itself) on
-// Linux and Android. Plain comment for the same reason as `cancel` above.
+// Fast Message Queue (`MQDescriptor` + `rsbinder-fmq`); plain comment, same reason as `cancel`.
 pub mod fmq;
 /// `android.hardware.common.NativeHandle`: file descriptors plus integers,
 /// as an AIDL HAL carries a `native_handle_t`. The `MQDescriptor` in
@@ -428,10 +424,7 @@ pub use thread_state::{
 };
 
 pub use parcel::Parcel;
-// Value ↔ bytes, for storing what an interface already knows how to
-// describe. The encoder runs in the session-less parcel mode — the
-// absence of a session is what refuses binders and fds — so this needs
-// no feature: nothing here talks to a socket.
+// No feature needed: the session-less parcel mode is what refuses binders and fds.
 pub use parcel::{from_bytes, to_bytes};
 
 // From `parcelable` — (de)serialization trait stack.

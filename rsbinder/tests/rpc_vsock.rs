@@ -243,10 +243,7 @@ fn vsock_session_shutdown_ends_serve_thread() {
     }
 }
 
-/// Plan 10-7 Phase 0: `ClientOptions::incoming_connections` on
-/// `vsock://`. The server reaches the client's callback from a thread
-/// inside no handler, twoway and oneway; without an incoming connection
-/// the same call fails at once with `WouldBlock`.
+/// Plan 10-7 Phase 0: off-handler callbacks, twoway and oneway; `WouldBlock` without incoming.
 #[test]
 #[ignore = "needs Linux vsock loopback (modprobe vsock_loopback) or a peer VM"]
 fn entry_vsock_incoming_connections_carry_callbacks() {
@@ -366,8 +363,7 @@ fn entry_vsock_incoming_connections_carry_callbacks() {
     while calls.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
-    // Off-thread under a deadline: an incoming thread `close_session`
-    // fails to wake would otherwise hang the run.
+    // Off-thread under a deadline: an incoming thread `close_session` fails to wake would hang.
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
         session.close_session();

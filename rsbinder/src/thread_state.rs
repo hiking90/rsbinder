@@ -925,9 +925,7 @@ pub fn set_calling_work_source_uid(uid: binder::uid_t) -> i64 {
     .token()
 }
 
-/// Replace the work source uid without touching the propagation flag.
-/// AOSP marks this "internal only"; `check_interface` uses it to install
-/// the value read from the request header.
+/// Keeps the propagation flag; `check_interface` installs the header's value (AOSP internal).
 pub(crate) fn set_calling_work_source_uid_without_propagation(uid: binder::uid_t) -> i64 {
     let current = work_source();
     replace_work_source(WorkSource { uid, ..current }).token()
@@ -1269,8 +1267,7 @@ fn dispatch_transact_caught(
     }
 }
 
-/// [`dispatch_transact_caught`] between the transaction observer's calls.
-/// Runs where the handler runs: no `THREAD_STATE` borrow is held.
+/// [`dispatch_transact_caught`] between the observer's calls, with no `THREAD_STATE` borrow held.
 fn dispatch_kernel_observed(
     binder: &SIBinder,
     transactable: &dyn Transactable,
@@ -3846,9 +3843,7 @@ mod tests {
 
     const UNSET_UID: binder::uid_t = UNSET_WORK_SOURCE as binder::uid_t;
 
-    /// Plan 10-9 AC-9.2: the six AOSP work-source calls on a thread with no
-    /// transaction and no `ProcessState` (each `#[test]` runs on its own
-    /// thread, so the thread-local starts unset).
+    /// Plan 10-9 AC-9.2; each `#[test]` runs on its own thread, so the thread-local starts unset.
     #[test]
     fn work_source_set_clear_restore_outside_a_transaction() {
         assert_eq!(get_calling_work_source_uid(), UNSET_UID);
@@ -3881,8 +3876,7 @@ mod tests {
         );
     }
 
-    /// A received value is installed without propagation: it reaches the
-    /// handler but not the next hop unless the handler sets it again.
+    /// A received value reaches the handler but not the next hop unless the handler sets it again.
     #[test]
     fn work_source_received_value_does_not_propagate() {
         let token = set_calling_work_source_uid_without_propagation(77);
@@ -3892,9 +3886,7 @@ mod tests {
         assert_eq!(get_calling_work_source_uid(), UNSET_UID);
     }
 
-    /// The dispatch guard hands the handler an unset work source and puts
-    /// the thread's own value back afterwards — also when nested, which is
-    /// how a server thread that is itself a client re-enters dispatch.
+    /// Nesting is how a server thread that is itself a client re-enters dispatch.
     #[test]
     fn work_source_dispatch_guard_resets_and_restores_when_nested() {
         set_calling_work_source_uid(10);
@@ -3928,8 +3920,7 @@ mod tests {
         assert_eq!(get_calling_work_source_uid(), 10);
     }
 
-    /// The request header carries the work source only while propagation
-    /// is on (AOSP `Parcel::writeInterfaceToken`, `Parcel.cpp:1136-1140`).
+    /// As AOSP `Parcel::writeInterfaceToken` (`Parcel.cpp:1136-1140`).
     #[test]
     fn work_source_is_written_to_the_request_header_only_when_propagating() {
         fn header_work_source() -> i32 {

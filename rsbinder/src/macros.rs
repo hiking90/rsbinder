@@ -249,11 +249,7 @@ macro_rules! __declare_binder_interface {
     };
 }
 
-/// The generated `Bn*` type's method-name table, `None` unless the
-/// interface was generated with `trace` (AOSP `aidl --trace`). A separate
-/// macro because in the `async` variant the `Remotable` impl sits inside
-/// an optional repetition, where the optional `function_names` argument
-/// cannot be repeated again.
+/// `Bn*` method-name table (`None` without `trace`); a macro of its own for the async repetition.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __transaction_names {
@@ -521,8 +517,7 @@ macro_rules! impl_serialize_for_parcelable {
     ($parcelable:ident < $( $param:ident ),* , >) => {
         $crate::impl_serialize_for_parcelable!($parcelable < $($param),* >);
     };
-    // A generic parcelable (`parcelable Foo<T, U>`): the parameters carry
-    // no bound, as in AOSP's libbinder — they never reach the parcel.
+    // Generic parcelable: parameters carry no bound, as in AOSP; they never reach the parcel.
     ($parcelable:ident < $( $param:ident ),* >) => {
         impl < $($param),* > $crate::Serialize for $parcelable < $($param),* > {
             fn serialize(&self, parcel: &mut $crate::Parcel) -> $crate::Result<()> {
@@ -566,8 +561,7 @@ macro_rules! impl_deserialize_for_parcelable {
     ($parcelable:ident < $( $param:ident ),* , >) => {
         $crate::impl_deserialize_for_parcelable!($parcelable < $($param),* >);
     };
-    // A generic parcelable: `Default` comes from the generated impl, which
-    // has no bound on the parameters either, so none is needed here.
+    // Generic parcelable: the generated `Default` has no parameter bound, so none is needed here.
     ($parcelable:ident < $( $param:ident ),* >) => {
         impl < $($param),* > $crate::Deserialize for $parcelable < $($param),* > {
             fn deserialize(parcel: &mut $crate::Parcel) -> $crate::Result<Self> {

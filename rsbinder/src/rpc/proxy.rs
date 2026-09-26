@@ -198,10 +198,7 @@ impl RpcProxy {
         Ok(data)
     }
 
-    /// This proxy's session capabilities, for a caller holding only the
-    /// binder. `RpcSession::caps` answers the same question given the
-    /// session, which a hand-written stub that came by its proxy through
-    /// `read_binder` does not have.
+    /// `RpcSession::caps` for a caller holding only the binder (e.g. from `read_binder`).
     pub(crate) fn session_caps(&self) -> crate::TransportCaps {
         self.session.caps()
     }

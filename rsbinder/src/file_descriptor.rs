@@ -203,12 +203,7 @@ impl PartialEq for ParcelFileDescriptor {
 
 impl Eq for ParcelFileDescriptor {}
 
-/// Which RPC fd body a parcel carries. The single place the
-/// `FileDescriptorTransportMode` policy is decided for fd writes/reads.
-///
-/// Without `rpc` no parcel can carry one — `rpc_fd_profile` answers
-/// `Ok(None)` or `Err(FdsNotAllowed)` there — so the variants are
-/// constructed only under that feature.
+/// The RPC fd body a parcel carries; only `rpc` builds construct it (hence the `allow`).
 #[cfg_attr(not(feature = "rpc"), allow(dead_code))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RpcFdProfile {
@@ -220,11 +215,7 @@ enum RpcFdProfile {
     V1Plus,
 }
 
-/// `Ok(None)` ⇒ kernel-marshalled (fd crosses as `BINDER_TYPE_FD`);
-/// `Err(FdsNotAllowed)` ⇒ a parcel whose fd mode forbids fds — an RPC
-/// session that negotiated none, or the session-less data-only mode,
-/// which negotiated nothing (AOSP `Parcel::writeFileDescriptor`,
-/// android-16.0.0_r4).
+/// `None` = kernel `BINDER_TYPE_FD`; `FdsNotAllowed` = no fd mode negotiated (RPC or data-only).
 fn rpc_fd_profile(parcel: &Parcel) -> Result<Option<RpcFdProfile>> {
     if parcel.is_kernel_backed() {
         return Ok(None);
@@ -304,8 +295,7 @@ fn write_raw_owned_fd(parcel: &mut Parcel, dup: OwnedFd) -> Result<()> {
 /// itself, **consumed** (a second read of the same position is
 /// `BadValue`).
 pub(crate) fn read_raw_fd(parcel: &mut Parcel) -> Result<OwnedFd> {
-    // Decides the body shape, and refuses a parcel whose fd mode
-    // forbids fds before any of it is read.
+    // Refuses a parcel whose fd mode forbids fds before any of it is read.
     let profile = rpc_fd_profile(parcel)?;
     #[cfg(not(feature = "rpc"))]
     let _ = profile;

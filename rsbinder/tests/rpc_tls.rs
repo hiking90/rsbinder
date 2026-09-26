@@ -174,12 +174,7 @@ fn tls_valid_cert_e2e_and_peer_identity() {
     assert_eq!(ping_via(&root, "hello").unwrap(), "pong:hello");
     assert_eq!(ping_via(&root, "").unwrap(), "pong:");
 
-    // Plan 10-0: a certificate is an identity, but not a uid, and TCP
-    // carries neither file descriptors nor a shared kernel — so a default
-    // TLS session has no capabilities at all; `CALLBACKS` needs incoming
-    // connections (`entry_tls_incoming_connections_carry_callbacks`).
-    // Anything needing one is refused here, before the first transaction,
-    // rather than on the wire later.
+    // Plan 10-0: no uid, fds or shared kernel over TCP; CALLBACKS needs incoming connections.
     use rsbinder::TransportCaps;
     assert_eq!(client.caps(), TransportCaps::NONE);
     assert_eq!(
@@ -877,8 +872,7 @@ fn setup_unix_server_tls_e2e() {
 const HOLDER_DESC: &str = "rsbinder.test.IHolder";
 const TX_HOLD: TransactionCode = FIRST_CALL_TRANSACTION;
 
-/// Keeps the last binder a client hands it, for the test to call back on
-/// from outside any handler.
+/// Keeps the last binder a client hands it, for the test to call from outside any handler.
 struct Holder(Arc<Mutex<Option<SIBinder>>>);
 impl Interface for Holder {}
 impl Remotable for Holder {
@@ -917,8 +911,7 @@ fn hold_via(holder: &SIBinder, cb: &SIBinder) -> Result<()> {
     }
 }
 
-/// A ping callback that counts its calls, so a oneway one can be seen
-/// landing.
+/// Counts its calls, so a oneway one can be seen landing.
 struct CountingPing(Arc<AtomicUsize>);
 impl Interface for CountingPing {}
 impl IPing for CountingPing {
@@ -936,8 +929,7 @@ fn counting_callback() -> (SIBinder, Arc<AtomicUsize>) {
     (cb, calls)
 }
 
-/// Call the held callback from a fresh thread — inside no handler — once
-/// twoway and once oneway.
+/// Call the held callback from a fresh thread, outside any handler: once twoway, once oneway.
 fn call_back_from_outside(held: &Mutex<Option<SIBinder>>) -> (Result<String>, Result<()>) {
     let cb = held.lock().unwrap().take().expect("a held callback");
     thread::spawn(move || {
@@ -968,8 +960,7 @@ fn poll_until(mut f: impl FnMut() -> bool) -> bool {
     f()
 }
 
-/// Close the session off-thread under a deadline: a TLS incoming thread
-/// that `close_session` fails to wake would hang the test otherwise.
+/// Off-thread under a deadline: an incoming thread `close_session` fails to wake would hang.
 fn close_within(session: &RpcSession, what: &str) {
     let s = session.clone();
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
@@ -1050,9 +1041,7 @@ fn entry_tls_incoming_connections_carry_callbacks() {
     assert!(landed, "the oneway callback never reached the client");
 }
 
-/// The transport-generic session API: `RpcClientConfig` over a transport
-/// the entry does not name — TLS over a Unix socket — with `connect`
-/// called once per connection.
+/// `RpcClientConfig` over a transport the entry does not name (TLS on Unix), one `connect` each.
 #[test]
 fn client_config_opens_incoming_connections_over_tls_on_unix() {
     let path = std::env::temp_dir().join(format!("rsb_tls_in_{}.sock", std::process::id()));
@@ -1103,8 +1092,7 @@ fn client_config_opens_incoming_connections_over_tls_on_unix() {
     assert!(landed, "the oneway callback never reached the client");
 }
 
-/// A TLS server for the two `RpcClientConfig::tls` cases below: android-13+,
-/// two threads, a `PingSvc` root.
+/// For the two `RpcClientConfig::tls` cases below: android-13+, two threads, a `PingSvc` root.
 fn tls_ping_server() -> (Arc<rsbinder::rpc::RpcServer>, std::net::SocketAddr) {
     let server = rsbinder::rpc::RpcServer::setup_tcp_server_tls(
         "127.0.0.1:0",
@@ -1122,8 +1110,7 @@ fn tls_ping_server() -> (Arc<rsbinder::rpc::RpcServer>, std::net::SocketAddr) {
     (server, addr)
 }
 
-/// Plan 10-7 Phase 0b: the `tls` constructor drives the same setup the
-/// entry layer uses, fan-out included.
+/// Plan 10-7 Phase 0b: the `tls` constructor drives the entry layer's setup, fan-out included.
 #[test]
 fn client_config_tls_constructor_opens_a_fan_out_session() {
     use rsbinder::rpc::RpcClientConfig;

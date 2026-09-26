@@ -190,10 +190,7 @@ pub fn region_size<F: AsFd>(fd: F) -> Result<usize> {
     ashmem_size(fd.as_fd())
 }
 
-/// libcutils `__ashmem_is_ashmem`: is `fd` open on the ashmem character
-/// device? A peer-supplied fd must pass this before any ashmem ioctl is
-/// sent to it. The answer is `rsbinder_fmq::shm`'s, shared with the FMQ
-/// attach checks so the device-node lookup exists once.
+/// libcutils `__ashmem_is_ashmem`; a peer's fd must pass it before any ashmem ioctl.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn is_ashmem_fd(fd: std::os::fd::BorrowedFd<'_>) -> bool {
     rsbinder_fmq::shm::is_ashmem_fd(fd)
