@@ -908,6 +908,7 @@ name = "rsbinder-fmq"
 version = "0.12.0"
 dependencies = [
  "libc",
+ "log",
  "rustix",
 ]
 

@@ -145,7 +145,10 @@ impl Shared {
                     }
                     queue.commit_write(n).map_err(WriteFailure::broken)?;
                     drop(queue);
-                    self.flag.wake(NOT_EMPTY).map_err(WriteFailure::broken)?;
+                    // Committed is delivered: libfmq's `writeBlocking` ignores a failed wake too.
+                    if let Err(e) = self.flag.wake(NOT_EMPTY) {
+                        log::error!("stream: the wake after a committed record failed: {e:?}");
+                    }
                     return Ok(true);
                 }
             }

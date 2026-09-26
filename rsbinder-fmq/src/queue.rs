@@ -416,6 +416,12 @@ impl<T: Element> MessageQueue<T> {
     /// word, `BadValue` when `items` exceed the capacity (the wait could
     /// never end) or `wait_bits == 0`, and
     /// [`TimedOut`](Error::TimedOut) when `timeout` elapses first.
+    ///
+    /// Once the items are committed the call succeeds: a failure of the
+    /// `wake_bits` wake that follows is logged, not returned, as libfmq's
+    /// `writeBlocking` ignores it. An `Err` there would invite a retry that
+    /// writes the items twice. The bits are set before the futex call, so a
+    /// waiter that has not yet slept still sees them.
     pub fn write_blocking(
         &mut self,
         items: &[T],
@@ -433,14 +439,16 @@ impl<T: Element> MessageQueue<T> {
         let deadline = sys::deadline_after(timeout)?;
         loop {
             if self.write(items)? {
-                return flag.wake(wake_bits);
+                wake_after_commit(&flag, wake_bits);
+                return Ok(());
             }
             match flag.wait_until(wait_bits, deadline) {
                 Ok(_) => {}
                 // One more try: the reader may have run while the clock ran out.
                 Err(Error::TimedOut) => {
                     if self.write(items)? {
-                        return flag.wake(wake_bits);
+                        wake_after_commit(&flag, wake_bits);
+                        return Ok(());
                     }
                     return Err(Error::TimedOut);
                 }
@@ -472,19 +480,28 @@ impl<T: Element> MessageQueue<T> {
         let deadline = sys::deadline_after(timeout)?;
         loop {
             if self.read(out)? {
-                return flag.wake(wake_bits);
+                wake_after_commit(&flag, wake_bits);
+                return Ok(());
             }
             match flag.wait_until(wait_bits, deadline) {
                 Ok(_) => {}
                 Err(Error::TimedOut) => {
                     if self.read(out)? {
-                        return flag.wake(wake_bits);
+                        wake_after_commit(&flag, wake_bits);
+                        return Ok(());
                     }
                     return Err(Error::TimedOut);
                 }
                 Err(e) => return Err(e),
             }
         }
+    }
+}
+
+/// The transfer is committed, so a failed wake is logged rather than returned (libfmq does too).
+fn wake_after_commit(flag: &EventFlag, bits: u32) {
+    if let Err(e) = flag.wake(bits) {
+        log::error!("fmq: the wake after a committed transfer failed: {e:?}");
     }
 }
 

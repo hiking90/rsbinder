@@ -19,6 +19,9 @@ all-features = true
 # unix, which keeps one implementation of the queue for all targets — the
 # platform-specific primitives live in `src/sys.rs`.
 rustix = { workspace = true, features = ["fs", "mm", "param", "time"] }
+# A wake that fails after a committed transfer is logged, as libfmq's
+# `EventFlag::wake` does, rather than returned.
+log = { workspace = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 # `thread` carries the futex calls; rustix has them only for Linux.

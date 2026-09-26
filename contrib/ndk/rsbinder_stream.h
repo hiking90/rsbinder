@@ -248,7 +248,9 @@ static inline int rsbs__write(rsbs_producer *p, uint32_t header, const void *pay
             if ((r = rsbfmq_commit_write(&p->q, n)) != 0) {
                 return r;
             }
-            return rsbfmq_wake(&p->q, RSBFMQ_NOT_EMPTY);
+            /* Committed is delivered: libfmq's writeBlocking ignores a failed wake too. */
+            (void)rsbfmq_wake(&p->q, RSBFMQ_NOT_EMPTY);
+            return 0;
         }
         if (!blocking) {
             return -EAGAIN;
