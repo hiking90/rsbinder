@@ -37,8 +37,7 @@ use super::{
 /// The descriptor type the endpoint carries: a ring of bytes.
 pub(super) type Ring = MQDescriptor<i8, SynchronizedReadWrite>;
 
-/// EventFlag bit the consumer sets when it wants no more; only the
-/// producer waits on it, so only the producer consumes it.
+/// EventFlag bit the consumer sets to want no more; only the producer waits on it and consumes it.
 pub(super) const CANCEL: u32 = 0x04;
 
 /// Bytes of record header: a little-endian `u32`.
@@ -51,23 +50,18 @@ const END_FIELDS: usize = 8;
 /// Bytes of message an end record can carry within the reserve.
 const END_MESSAGE_MAX: usize = END_RESERVE - HEADER - END_FIELDS;
 
-// ---------------------------------------------------------------------
-// The ring, as both ends and the pool see it
-// ---------------------------------------------------------------------
+// --- The ring, as both ends and the pool see it ---
 
-/// One end's handle on the ring, shared with a pool task carrying a
-/// record or a wait, and with the death recipient that has to wake it.
+/// One end's ring handle, shared with its pool task and the death recipient that wakes it.
 struct Shared {
-    /// The queue is one reader or one writer, which is this end; the lock
-    /// only lets a pool task and the owning thread take turns.
+    /// This end is the queue's one reader or writer; the lock lets a pool task and owner alternate.
     queue: Mutex<MessageQueue<u8>>,
     flag: EventFlag,
     /// Ring bytes.
     capacity: usize,
     /// The peer's process is gone.
     dead: AtomicBool,
-    /// Producer: `CANCEL` was seen. The bit itself is consumed by the
-    /// wait that sees it, so it is latched here.
+    /// Producer: `CANCEL` was seen; latched, since the wait that sees the bit consumes it.
     canceled: AtomicBool,
     /// Producer: `Drop` gave up on the record in transit.
     abandoned: AtomicBool,
@@ -96,8 +90,7 @@ impl Shared {
         self.end.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// Record how the stream ended. `overriding` replaces what is there;
-    /// otherwise the first word stands.
+    /// Record how the stream ended; `overriding` replaces it, otherwise the first word stands.
     fn set_end(&self, status: Status, overriding: bool) {
         let mut end = self.end.lock().unwrap_or_else(|e| e.into_inner());
         if overriding || end.is_none() {
@@ -127,23 +120,20 @@ impl Shared {
                 self.canceled.store(true, Ordering::SeqCst);
                 return Err(WriteFailure::Canceled);
             }
-            // `Drop` sets this and then writes the end record itself, so
-            // only an item record is given up.
+            // `Drop` sets this, then writes the end record itself, so only an item gives up.
             if !is_end && self.abandoned.load(Ordering::SeqCst) {
                 return Err(WriteFailure::Abandoned);
             }
             {
                 let mut queue = self.queue();
-                // `available_to_read` on the writer's side is the bytes in
-                // flight, counters checked.
+                // On the writer's side this is the bytes in flight, counters checked.
                 let in_flight = queue.available_to_read().map_err(WriteFailure::broken)?;
                 if in_flight + n <= limit {
                     {
                         let Some(mut regions) =
                             queue.begin_write(n).map_err(WriteFailure::broken)?
                         else {
-                            // The counters said it fits and now say it does
-                            // not: the peer moved them under us.
+                            // The counters said it fits; the peer moved them since.
                             return Err(WriteFailure::Broken(StatusCode::BadValue));
                         };
                         regions
@@ -185,8 +175,7 @@ enum WriteFailure {
     Canceled,
     /// The producer's `Drop` gave the record up.
     Abandoned,
-    /// The ring is unusable: its counters fail their invariant, or the
-    /// futex failed. Nothing more can be written.
+    /// The counters fail their invariant or the futex failed; nothing more can be written.
     Broken(StatusCode),
 }
 
@@ -258,9 +247,7 @@ impl Transit {
         self.lock().broken.get_or_insert(e);
     }
 
-    /// The token is done: nothing is in transit, and a failure is left
-    /// for the next call. `lost` says the token carried an item that did
-    /// not go in.
+    /// The token is done: leave `failure` for the next call; `lost` = its item did not go in.
     #[cfg(feature = "tokio")]
     fn settle(&self, failure: Option<StatusCode>, lost: bool, broken: bool) {
         {
@@ -281,8 +268,7 @@ impl Transit {
         self.notify.notify_waiters();
     }
 
-    /// Block until nothing is in transit. `false` when `deadline` passes
-    /// first.
+    /// Block until nothing is in transit; `false` if `deadline` passes first.
     fn wait_idle_until(&self, deadline: Option<Instant>) -> bool {
         let mut state = self.lock();
         while self.in_transit.load(Ordering::SeqCst) {
@@ -310,8 +296,7 @@ impl Transit {
     #[cfg(feature = "tokio")]
     async fn idle_async(&self) {
         loop {
-            // Created before the check: a `Notified` receives
-            // `notify_waiters` from the moment it exists.
+            // Made before the check: a `Notified` gets `notify_waiters` from its creation on.
             let notified = self.notify.notified();
             if !self.in_transit.load(Ordering::SeqCst) {
                 return;
@@ -321,9 +306,7 @@ impl Transit {
     }
 }
 
-// ---------------------------------------------------------------------
-// Records
-// ---------------------------------------------------------------------
+// --- Records ---
 
 fn item_header(len: usize) -> u32 {
     // Checked against the ring before any header is built.
@@ -334,8 +317,7 @@ fn end_header(len: usize) -> u32 {
     KIND_END | len as u32
 }
 
-/// The longest prefix of `message` within `max` bytes that ends on a
-/// character boundary.
+/// The longest prefix of `message` within `max` bytes that ends on a character boundary.
 fn fitted(message: &str, max: usize) -> &str {
     if message.len() <= max {
         return message;
@@ -347,8 +329,7 @@ fn fitted(message: &str, max: usize) -> &str {
     &message[..end]
 }
 
-/// The end record's payload: the three `onEnd` arguments, the message
-/// cut to what the reserve holds.
+/// The end record's payload: the three `onEnd` arguments, the message cut to fit the reserve.
 fn end_payload(exception: i32, service_specific: i32, message: Option<&str>) -> Vec<u8> {
     let mut payload = Vec::with_capacity(END_RESERVE - HEADER);
     payload.extend_from_slice(&exception.to_le_bytes());
@@ -359,8 +340,7 @@ fn end_payload(exception: i32, service_specific: i32, message: Option<&str>) -> 
     payload
 }
 
-/// The status an end record carries. `payload` is at least
-/// `END_FIELDS` long, checked by the reader.
+/// The status an end record carries; the reader checked `payload` holds `END_FIELDS`.
 fn end_status(payload: &[u8]) -> Status {
     let exception = i32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
     let service_specific = i32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
@@ -368,32 +348,25 @@ fn end_status(payload: &[u8]) -> Status {
         .then(|| String::from_utf8_lossy(&payload[END_FIELDS..]).into_owned());
     match status_from_fields(exception, service_specific, message.as_deref()) {
         Ok(status) => status,
-        // Unreadable, so the stream still has to stop; the decode failure
-        // is the reason it did.
+        // Unreadable, yet the stream must stop; the decode failure is why.
         Err(code) => Status::from(code),
     }
 }
 
-// ---------------------------------------------------------------------
-// Producer
-// ---------------------------------------------------------------------
+// --- Producer ---
 
-/// Watches the consumer's sink: a producer parked on a full ring has no
-/// call in flight to fail, so this is how it learns nobody reads.
+/// Sink death: a producer parked on a full ring has no call in flight that would fail.
 struct ProducerDeath(Arc<Shared>);
 
 impl crate::DeathRecipient for ProducerDeath {
     fn binder_died(&self, _who: &crate::WIBinder) {
         self.0.dead.store(true, Ordering::SeqCst);
-        // The producer's own mask, not the consumer's: this wakes the
-        // waiter on this side, which then finds `dead`.
+        // The producer's own mask: wakes the waiter on this side, which then finds `dead`.
         let _ = self.0.flag.wake(NOT_FULL);
     }
 }
 
-/// One record on its way to the ring from the blocking pool. Written,
-/// refused, given up by `Drop`, dropped by a pool that never ran it, or
-/// unwound past — every way out goes through `Drop`, which settles it.
+/// A record the pool carries to the ring; every exit, unwind included, settles in `Drop`.
 #[cfg(feature = "tokio")]
 struct RecordInTransit {
     shared: Arc<Shared>,
@@ -457,8 +430,7 @@ impl Drop for Unhanded<'_> {
     }
 }
 
-/// The producer over the ring: one record per item, written in place,
-/// waiting on `NOT_FULL` when the ring is full.
+/// The producer over the ring: one record per item, waiting on `NOT_FULL` when full.
 pub(super) struct Producer<T: ?Sized> {
     shared: Arc<Shared>,
     transit: Arc<Transit>,
@@ -524,8 +496,7 @@ impl<T: Serialize + ?Sized> Producer<T> {
         Ok(bytes)
     }
 
-    /// Write an item record. `Ok(false)` only when `blocking` is off and
-    /// the ring is full.
+    /// Write an item record; `Ok(false)` only when not `blocking` and the ring is full.
     fn write_item(&self, bytes: &[u8], blocking: bool) -> Result<bool> {
         match self
             .shared
@@ -543,16 +514,13 @@ impl<T: Serialize + ?Sized> Producer<T> {
 
     pub(super) fn send(&mut self, item: &T) -> Result<()> {
         let bytes = self.encode(item)?;
-        // A record a dropped future left on the pool goes in first, or
-        // this one overtakes it; a failure it could not report is this
-        // call's to return before anything more is written.
+        // A pool record goes in first, and its unreported failure is returned before any write.
         self.transit.wait_idle();
         self.reported()?;
         self.write_item(&bytes, true).map(|_| ())
     }
 
-    /// Nothing is queued on this path, so this only reports what a
-    /// record in transit came to — after waiting for it.
+    /// Nothing is queued here: this waits out a record in transit and reports what it came to.
     pub(super) fn flush(&mut self) -> Result<()> {
         self.usable()?;
         self.transit.wait_idle();
@@ -573,8 +541,7 @@ impl<T: Serialize + ?Sized> Producer<T> {
         self.finish(failed, exception, service_specific, message)
     }
 
-    /// The item is encoded now; the returned future writes it, from the
-    /// pool if it has to wait.
+    /// Encode now; the returned future writes it, from the pool if it has to wait.
     #[cfg(feature = "tokio")]
     pub(super) fn send_async(
         &mut self,
@@ -592,9 +559,7 @@ impl<T: Serialize + ?Sized> Producer<T> {
                 return Ok(());
             }
             let record = RecordInTransit::new(self.shared.clone(), self.transit.clone(), bytes);
-            // The outcome is the record's to settle, not this future's:
-            // dropping the future detaches the pool task, and a task the
-            // runtime drops unrun never returns anything.
+            // The record settles itself: a dropped future detaches the task, which may never run.
             let _ = on_pool(record, |record| {
                 record.send();
                 Ok(())
@@ -617,15 +582,13 @@ impl<T: ?Sized> Producer<T> {
         self.transit.broken().map_or(Ok(()), Err)
     }
 
-    /// The failure a record in transit left behind, as this call's — and
-    /// as every later call's, once one has broken the ring.
+    /// A transit failure, returned once; a broken ring's error, returned on every call.
     fn reported(&self) -> Result<()> {
         let unreported = self.transit.take_unreported();
         unreported.or(self.transit.broken()).map_or(Ok(()), Err)
     }
 
-    /// Write the end record and settle what the call returns. `failed` is
-    /// what an earlier record left unreported.
+    /// Write the end record; `failed` is what an earlier record left unreported.
     fn finish(
         &self,
         failed: Option<StatusCode>,
@@ -638,9 +601,7 @@ impl<T: ?Sized> Producer<T> {
             return Err(StatusCode::DeadObject);
         }
         let canceled = self.is_canceled();
-        // A cancel drops nothing here — every accepted item is already in
-        // the ring — so the caller's own terminator stands; otherwise an
-        // item that went missing is reported here or nowhere.
+        // After a cancel no loss is reported: the consumer asked for nothing more.
         let truncated = match truncated_terminator(exception, self.transit.lost()) {
             Some(truncated) if !canceled => Some(truncated),
             _ => None,
@@ -652,9 +613,7 @@ impl<T: ?Sized> Producer<T> {
             None => self.write_end(exception, service_specific, message),
         };
         match failed {
-            // The consumer is alive and blocked in `recv` whatever went
-            // wrong earlier, so the end record still went in; the caller
-            // hears about the earlier failure.
+            // The consumer still waits in `recv`, so the end went in; return the earlier failure.
             Some(e) if !canceled => {
                 if let Err(end) = wrote {
                     log::warn!("stream: the end record could not be written: {end:?}");
@@ -665,8 +624,7 @@ impl<T: ?Sized> Producer<T> {
         }
     }
 
-    /// Write the end record. Never waits: the reserve keeps room for it,
-    /// so no room means the consumer moved the read counter.
+    /// Never waits: the reserve keeps room, so no room means the consumer moved the read counter.
     fn write_end(
         &self,
         exception: i32,
@@ -703,8 +661,7 @@ impl<T: ?Sized> Producer<T> {
         self.reported()
     }
 
-    /// The end record never waits, so nothing here goes to the pool; the
-    /// one suspension is for a record a dropped future left there.
+    /// The end record never waits; the one suspension is for a record a dropped future left.
     #[cfg(feature = "tokio")]
     pub(super) async fn terminate_async(
         mut self,
@@ -714,8 +671,7 @@ impl<T: ?Sized> Producer<T> {
     ) -> Result<()> {
         self.transit.idle_async().await;
         let failed = self.transit.take_unreported().or(self.transit.broken());
-        // Set only now: the wait above suspends, and a future dropped
-        // there has to leave `Drop` a stream still to terminate.
+        // Set only after the wait: a future dropped there must leave `Drop` a stream to end.
         self.ended = true;
         self.finish(failed, exception, service_specific, message.as_deref())
     }
@@ -731,21 +687,16 @@ impl<T: ?Sized> Producer<T> {
 }
 
 impl<T: ?Sized> Drop for Producer<T> {
-    /// End the stream, without waiting for the consumer; see
-    /// [`Sink`](super::Sink)'s `Drop`.
+    /// End the stream without waiting for the consumer; see [`Sink`](super::Sink)'s `Drop`.
     fn drop(&mut self) {
-        // Unlinked whether or not the stream was ended: dropping the
-        // recipient leaves a dead `Weak` in the sink's recipient list,
-        // which never shrinks on its own.
+        // Unlink always: a dropped recipient leaves a dead `Weak` in the sink's list for good.
         let death = self.death.take();
         unlink_death(&self.sink, &death);
         if self.ended {
             return;
         }
         if self.transit.in_transit() {
-            // A record on the pool is waiting for the consumer, which is
-            // a wait `Drop` does not make; it is given up and counted.
-            // Woken with this side's own mask, as a death does.
+            // `Drop` does not wait on the consumer: give up the pool's record, woken via own mask.
             self.shared.abandoned.store(true, Ordering::SeqCst);
             let _ = self.shared.flag.wake(NOT_FULL);
             self.transit.wait_idle();
@@ -763,13 +714,9 @@ impl<T: ?Sized> Drop for Producer<T> {
     }
 }
 
-// ---------------------------------------------------------------------
-// Consumer
-// ---------------------------------------------------------------------
+// --- Consumer ---
 
-/// Watches the producer and ends the stream the way an end record does,
-/// with [`StatusCode::DeadObject`], so a consumer blocked on an empty ring
-/// learns that no record is coming. `Weak`: the consumer owns the ring.
+/// Producer death ends the stream as `DeadObject`; `Weak` because the consumer owns the ring.
 pub(super) struct ConsumerDeath(Weak<Shared>);
 
 impl crate::DeathRecipient for ConsumerDeath {
@@ -810,8 +757,7 @@ impl IStreamSink for RingSink {
     }
 }
 
-/// One wait on the pool. It is the only waiter on this side while it is
-/// out: the consumer joins it rather than waiting beside it.
+/// One wait on the pool, this side's only waiter while out: the consumer joins it, not beside.
 #[cfg(feature = "tokio")]
 struct WaitInTransit {
     shared: Arc<Shared>,
@@ -862,17 +808,14 @@ enum Step<T> {
     Nothing,
 }
 
-/// The consumer over the ring: reads one record at a time, waiting on
-/// `NOT_EMPTY` when the ring is empty.
+/// The consumer over the ring: one record at a time, waiting on `NOT_EMPTY` when empty.
 pub(super) struct Consumer<T> {
     shared: Arc<Shared>,
     transit: Arc<Transit>,
-    /// Set once the end has been reported, so it is reported once and
-    /// the stream then reads as finished.
+    /// The end was reported; later calls read as finished.
     finished: bool,
     sink_binder: SIBinder,
-    /// Scratch for the record being read: a record is copied out of the
-    /// ring before anything interprets it.
+    /// Scratch: a record is copied out of the ring before anything interprets it.
     buf: Vec<u8>,
     /// Test hook, run at the last point before a call commits to sleeping.
     #[cfg(test)]
@@ -880,6 +823,9 @@ pub(super) struct Consumer<T> {
     /// Test hook, run after a look found the ring empty and before that look's verdict.
     #[cfg(test)]
     after_empty_look: Option<Box<dyn FnMut() + Send>>,
+    /// Test hook, run between the verdict on an end record and the recording of it.
+    #[cfg(test)]
+    end_record_read: Option<Box<dyn FnMut() + Send>>,
     _item: PhantomData<fn() -> T>,
 }
 
@@ -915,6 +861,8 @@ impl<T: Deserialize> Consumer<T> {
             about_to_park: None,
             #[cfg(test)]
             after_empty_look: None,
+            #[cfg(test)]
+            end_record_read: None,
             _item: PhantomData,
         };
         Ok((consumer, ring, sink_binder))
@@ -951,9 +899,7 @@ impl<T: Deserialize> Consumer<T> {
         self.next(wait).transpose()
     }
 
-    /// The next item, or how the stream ended, waiting as `wait` says.
-    /// `None` when the stream is over — reported once, as an error when
-    /// it ended badly — or when the wait ran out.
+    /// Next item, or the end reported once (an error if bad); `None` after that or on timeout.
     fn next(&mut self, wait: Wait) -> Option<BinderResult<T>> {
         if self.finished {
             return None;
@@ -1037,8 +983,7 @@ impl<T: Deserialize> Consumer<T> {
             })
             .await
             {
-                // The pool is gone, so no wait can be made from here, and
-                // a consumer that went on to spin would never be woken.
+                // The pool is gone: no wait can be made, so end rather than spin unwoken.
                 self.fail(Status::from(e));
                 continue;
             }
@@ -1067,19 +1012,24 @@ impl<T: Deserialize> Consumer<T> {
             }
             Err(what) => return self.corrupted(what),
         };
-        // Every read wakes, as libfmq does: a producer waiting for room
-        // for more than one record waits below full.
+        // Wake on every read, as libfmq does: a producer may wait for room for several records.
         let _ = self.shared.flag.wake(NOT_FULL);
         if is_end {
             let status = end_status(&self.buf);
-            // The record is the producer's own last word; only a death
-            // notice that raced ahead of reading it is set aside.
-            let overriding = self
-                .shared
-                .end()
-                .is_some_and(|end| end.transaction_error() == StatusCode::DeadObject);
-            self.shared.set_end(status.clone(), overriding);
-            return Step::End(status);
+            // The producer's last word outranks only a death notice; one lock, so none slips in.
+            let mut end = self.shared.end.lock().unwrap_or_else(|e| e.into_inner());
+            let outranks = end
+                .as_ref()
+                .is_none_or(|end| end.transaction_error() == StatusCode::DeadObject);
+            #[cfg(test)]
+            if let Some(hook) = self.end_record_read.as_mut() {
+                hook();
+            }
+            if outranks {
+                *end = Some(status.clone());
+            }
+            // What was recorded is the end, as the empty-ring branch reports it.
+            return Step::End(end.clone().unwrap_or(status));
         }
         match decode_item::<T>(&self.buf) {
             Ok(item) => Step::Item(item),
@@ -1087,8 +1037,7 @@ impl<T: Deserialize> Consumer<T> {
         }
     }
 
-    /// Copy the next record into `buf`: `Ok(Some(is_end))`, `Ok(None)`
-    /// for an empty ring, `Err(what)` for a ring that broke its contract.
+    /// Copy the next record into `buf`: `Some(is_end)`, `None` if empty, `Err` on a broken ring.
     fn read_record(&mut self) -> std::result::Result<Option<bool>, String> {
         // Split so the guard on `shared` and the write to `buf` coexist.
         let Consumer { shared, buf, .. } = self;
@@ -1123,8 +1072,7 @@ impl<T: Deserialize> Consumer<T> {
             return Err(format!("a record header claiming {len} bytes"));
         }
         if available < HEADER + len {
-            // A record is committed whole, so the bytes are there or the
-            // counters lie.
+            // A record is committed whole, so a short count means the counters lie.
             return Err(format!(
                 "a record of {len} bytes with {available} bytes in the ring"
             ));
@@ -1143,8 +1091,7 @@ impl<T: Deserialize> Consumer<T> {
         Ok(Some(is_end))
     }
 
-    /// The ring broke its contract: end the stream with `EX_ILLEGAL_STATE`
-    /// and stop the producer.
+    /// The ring broke its contract: end with `EX_ILLEGAL_STATE` and stop the producer.
     fn corrupted(&mut self, what: String) -> Step<T> {
         log::error!("stream: {what}");
         self.fail(Status::from((
@@ -1153,8 +1100,7 @@ impl<T: Deserialize> Consumer<T> {
         )))
     }
 
-    /// End the stream from this side, overriding whatever ended it first,
-    /// and tell the producer the one way it listens.
+    /// End the stream here, overriding any earlier end, and set `CANCEL` for the producer.
     fn fail(&mut self, status: Status) -> Step<T> {
         self.shared.set_end(status.clone(), true);
         let _ = self.shared.flag.wake(CANCEL);
@@ -1178,11 +1124,11 @@ impl<T> Consumer<T> {
     }
 
     pub(super) fn end_status(&self) -> Option<Status> {
-        self.shared.end()
+        // A death notice can land before the ring is drained; it is the end only once read as one.
+        self.finished.then(|| self.shared.end()).flatten()
     }
 
-    /// Set `CANCEL`. The producer sees it before its next write, or in
-    /// the wait it is parked in.
+    /// Set `CANCEL`; the producer sees it before its next write or in the wait it is parked in.
     pub(super) fn cancel(&self) -> Result<()> {
         self.shared.flag.wake(CANCEL)?;
         Ok(())
@@ -1191,12 +1137,10 @@ impl<T> Consumer<T> {
 
 impl<T> Drop for Consumer<T> {
     fn drop(&mut self) {
-        // A producer parked on a full ring has no other way to learn that
-        // nobody reads any more.
+        // A producer parked on a full ring has no other way to learn nobody reads any more.
         let _ = self.shared.flag.wake(CANCEL);
         if self.transit.in_transit() {
-            // A wait a dropped future left on the pool: woken with this
-            // side's own mask so the pool thread is given back.
+            // Wake an orphaned pool wait with this side's own mask so its thread is given back.
             let _ = self.shared.flag.wake(NOT_EMPTY);
         }
     }
@@ -1230,8 +1174,7 @@ mod tests {
         tx.terminate(ExceptionCode::None as i32, 0, None)
     }
 
-    /// An `i32` is an eight-byte record; how many of them fill the part of
-    /// the ring items may use.
+    /// How many eight-byte `i32` records fill the part of the ring items may use.
     fn item_records(ring_bytes: usize) -> usize {
         (ring_bytes - END_RESERVE) / 8
     }
@@ -1257,8 +1200,7 @@ mod tests {
 
     #[test]
     fn records_cross_the_ring_in_order_and_the_end_is_last() {
-        // 512 bytes hold 32 item records: 200 items wrap the ring several
-        // times over, with the consumer draining as they come.
+        // 512 bytes hold 32 item records, so 200 items wrap the ring several times.
         let (mut tx, mut rx) = pair::<i32>(512);
         let producer = thread::spawn(move || {
             for item in 0..200i32 {
@@ -1290,8 +1232,7 @@ mod tests {
         assert!(rx.recv().is_none(), "the refused item never went in");
     }
 
-    /// Plan 10-7b AC-7b.2, in one process: the producer stops at the
-    /// ring's item capacity and moves again once the consumer reads.
+    /// Plan 10-7b AC-7b.2, in one process: the producer stops at item capacity until reads.
     #[test]
     fn a_full_ring_stops_the_producer_until_the_consumer_reads() {
         let (mut tx, mut rx) = pair::<i32>(512);
@@ -1326,8 +1267,7 @@ mod tests {
         producer.join().expect("producer");
     }
 
-    /// Plan 10-7b AC-7b.7: the reserve keeps room for the end record, so
-    /// `end` and `Drop` write it at once with the ring full of items.
+    /// Plan 10-7b AC-7b.7: the reserve lets `end` and `Drop` write into a ring full of items.
     #[test]
     fn the_end_record_goes_in_without_waiting_when_the_ring_is_full() {
         for dropped in [false, true] {
@@ -1376,8 +1316,7 @@ mod tests {
         }
     }
 
-    /// Plan 10-7b AC-7b.5: a cancel releases a producer parked on a full
-    /// ring, and its next send is refused.
+    /// Plan 10-7b AC-7b.5: a cancel releases a producer parked on a full ring; later sends fail.
     #[test]
     fn a_cancel_releases_a_producer_parked_on_a_full_ring() {
         let (mut tx, rx) = pair::<i32>(512);
@@ -1392,8 +1331,14 @@ mod tests {
             };
             let _ = outcome.send((sent, parked, tx.is_canceled(), tx.send(&0)));
         });
+        let full = item_records(512) * 8;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while rx.shared.queue().available_to_read().expect("counters") < full {
+            assert!(Instant::now() < deadline, "the producer must fill the ring");
+            thread::sleep(Duration::from_millis(5));
+        }
         assert!(
-            watch.recv_timeout(Duration::from_millis(300)).is_err(),
+            watch.try_recv().is_err(),
             "the producer must be parked on the full ring"
         );
         rx.cancel().expect("cancel");
@@ -1410,8 +1355,7 @@ mod tests {
         producer.join().expect("producer");
     }
 
-    /// Dropping the consumer cancels too, and a producer that was not
-    /// parked sees it before its next write.
+    /// Dropping the consumer cancels too; an unparked producer sees it before its next write.
     #[test]
     fn dropping_the_consumer_cancels_the_producer() {
         let (mut tx, rx) = pair::<i32>(512);
@@ -1419,13 +1363,11 @@ mod tests {
         drop(rx);
         assert!(tx.is_canceled());
         assert_eq!(tx.send(&2).err(), Some(StatusCode::InvalidOperation));
-        // The terminator still goes in: the ring outlives the consumer's
-        // mapping, and the caller's own status stands.
+        // The ring outlives the consumer's mapping, so the terminator goes in and succeeds.
         end(tx).expect("end after cancel");
     }
 
-    /// Plan 10-7b AC-7b.4, the producer's half: a death notice releases a
-    /// producer parked on a full ring with `DeadObject`.
+    /// Plan 10-7b AC-7b.4, the producer's half: death releases a producer parked on a full ring.
     #[test]
     fn a_dead_consumer_releases_a_parked_producer() {
         let (mut tx, _rx) = pair::<i32>(512);
@@ -1449,8 +1391,7 @@ mod tests {
         producer.join().expect("producer");
     }
 
-    /// The consumer's half: a death notice ends the wait on an empty ring
-    /// — after what is already in the ring has come out.
+    /// AC-7b.4, the consumer's half: death ends a wait on an empty ring, once the ring is drained.
     #[test]
     fn a_dead_producer_releases_a_blocked_consumer_after_what_it_wrote() {
         let (mut tx, mut rx) = pair::<i32>(512);
@@ -1482,9 +1423,7 @@ mod tests {
         assert!(third.is_none(), "reported once");
     }
 
-    /// The end record is the producer's own last word: a death notice
-    /// that fires after the producer wrote it must not turn a clean end
-    /// into `DeadObject`.
+    /// A death notice after the end record was written must not turn a clean end into `DeadObject`.
     #[test]
     fn an_end_record_outranks_a_death_that_followed_it() {
         let (tx, mut rx) = pair::<i32>(512);
@@ -1496,14 +1435,64 @@ mod tests {
         assert!(rx.end_status().expect("ended").is_ok());
     }
 
-    /// Plan 10-7b AC-7b.6: a header claiming more than the ring holds
-    /// ends the stream with `EX_ILLEGAL_STATE` and sets `CANCEL`.
+    /// No death notice can be recorded between the verdict on an end record and its recording.
+    #[test]
+    fn an_end_record_outranks_a_death_noticed_while_it_is_being_read() {
+        let (tx, mut rx) = pair::<i32>(512);
+        let death = rx.death_recipient();
+        let sink = tx.sink.clone();
+        let shared = rx.shared.clone();
+        let reached = Arc::new(AtomicBool::new(false));
+        let seen = reached.clone();
+        end(tx).expect("end");
+        rx.end_record_read = Some(Box::new(move || {
+            seen.store(true, Ordering::SeqCst);
+            // `binder_died` records under `end`: a free lock here is a window it could slip into.
+            let window_open = shared.end.try_lock().is_ok();
+            if window_open {
+                crate::DeathRecipient::binder_died(&death, &SIBinder::downgrade(&sink));
+            }
+        }));
+        assert!(rx.recv().is_none(), "a clean end");
+        assert!(reached.load(Ordering::SeqCst), "the hook sat on the path");
+        assert!(rx.end_status().expect("ended").is_ok(), "not DeadObject");
+    }
+
+    /// A failure recorded here before the look is what `recv` reports over a clean end record.
+    #[test]
+    fn a_failure_recorded_before_a_clean_end_record_is_the_reported_end() {
+        let (tx, mut rx) = pair::<i32>(512);
+        end(tx).expect("end");
+        // What `next` and `recv_async` do on a failed wait before they look again.
+        let _ = rx.fail(Status::from(StatusCode::InvalidOperation));
+        let ended = rx.recv().expect("the end").expect_err("an error");
+        assert_eq!(ended.transaction_error(), StatusCode::InvalidOperation);
+        let status = rx.end_status().expect("ended");
+        assert_eq!(status.transaction_error(), StatusCode::InvalidOperation);
+    }
+
+    #[test]
+    fn a_death_notice_is_no_end_status_while_records_remain() {
+        let (mut tx, mut rx) = pair::<i32>(512);
+        tx.send(&1).expect("send");
+        let death = rx.death_recipient();
+        crate::DeathRecipient::binder_died(&death, &SIBinder::downgrade(&tx.sink));
+        assert!(rx.end_status().is_none(), "an item is still in the ring");
+        assert_eq!(rx.recv().expect("the item").expect("ok"), 1);
+        let ended = rx.recv().expect("the end").expect_err("an error");
+        assert_eq!(ended.transaction_error(), StatusCode::DeadObject);
+        assert_eq!(
+            rx.end_status().expect("ended").transaction_error(),
+            StatusCode::DeadObject
+        );
+    }
+
+    /// Plan 10-7b AC-7b.6: an oversized header ends as `EX_ILLEGAL_STATE` and sets `CANCEL`.
     #[test]
     fn a_record_header_the_ring_cannot_hold_ends_the_stream() {
         let (rx, ring, _sink) = Consumer::<i32>::new(&receiver_policy(512)).expect("a ring");
         let mut rx = rx;
-        // A second writer on the same memory, outside the producer's
-        // checks, is what a hostile peer amounts to.
+        // A second writer outside the producer's checks is what a hostile peer amounts to.
         let policy = AttachPolicy {
             max_capacity: 512,
             require_seal: true,
@@ -1525,8 +1514,7 @@ mod tests {
         assert!(rx.try_recv().expect("over").is_none());
     }
 
-    /// A record whose payload is not one item of `T` is a decode failure,
-    /// reported once, with the producer cancelled.
+    /// A payload that is not one `T` is a decode failure, reported once, with `CANCEL` set.
     #[test]
     fn a_record_that_does_not_decode_ends_the_stream() {
         let (tx, mut rx) = pair::<i64>(512);
@@ -1543,8 +1531,7 @@ mod tests {
     #[test]
     fn the_end_message_is_cut_to_the_reserve_on_a_character_boundary() {
         let (tx, mut rx) = pair::<i32>(512);
-        // Three bytes a character: 244 is not a multiple of three, so the
-        // cut has to step back.
+        // Three bytes a character and 244 is not a multiple of three, so the cut steps back.
         let long: String = "가".repeat(200);
         tx.terminate(ExceptionCode::ServiceSpecific as i32, 42, Some(&long))
             .expect("end_with");
@@ -1599,9 +1586,7 @@ mod tests {
         assert_eq!(rx.try_recv().expect("no error"), None);
     }
 
-    /// An async producer parked on a full ring gives the thread back. On
-    /// a current-thread runtime that is the difference between finishing
-    /// and deadlock: the consumer task runs on the same thread.
+    /// A parked async producer must yield the thread, or a current-thread runtime deadlocks.
     #[cfg(feature = "tokio")]
     #[test]
     fn an_async_pair_finishes_on_a_current_thread_runtime() {
@@ -1612,8 +1597,7 @@ mod tests {
                 .expect("runtime");
             let got = runtime.block_on(async {
                 let (mut tx, mut rx) = pair::<i32>(512);
-                // `tokio::spawn` is also the check that the futures are
-                // `Send`.
+                // `tokio::spawn` also checks that the futures are `Send`.
                 let producer = tokio::spawn(async move {
                     for item in 0..500i32 {
                         tx.send_async(&item).await?;
@@ -1663,9 +1647,7 @@ mod tests {
         assert_eq!(rx.try_recv().expect("no error"), None);
     }
 
-    /// A `recv_async` dropped mid-wait leaves its wait on the pool. The
-    /// next call — sync or async — joins it rather than waiting beside
-    /// it, so the wake the orphan consumes is not lost.
+    /// A `recv_async` dropped mid-wait leaves an orphan; the next call joins it and loses no wake.
     #[cfg(feature = "tokio")]
     #[test]
     fn a_dropped_recv_async_does_not_lose_the_next_record() {
@@ -1728,8 +1710,7 @@ mod tests {
             .expect("the write must release the async consumer");
         assert_eq!(got.expect("an item").expect("ok"), 10);
         drop(rx);
-        // Dropping the consumer releases an orphan too; the runtime must
-        // not be left waiting for a pool thread parked for good.
+        // Dropping the consumer releases the orphan too, or shutdown waits on a parked thread.
         runtime.shutdown_timeout(Duration::from_secs(5));
     }
 
@@ -1835,9 +1816,7 @@ mod tests {
         runtime.shutdown_timeout(Duration::from_secs(5));
     }
 
-    /// A `send_async` dropped while its record waits for room leaves the
-    /// record on the pool; the next send goes in behind it, in order, and
-    /// `Drop` gives it up rather than wait for the consumer.
+    /// A dropped `send_async` keeps its place on the pool; `Drop` gives it up rather than wait.
     #[cfg(feature = "tokio")]
     #[test]
     fn a_dropped_send_async_keeps_its_place_and_is_given_up_on_drop() {
@@ -1883,8 +1862,7 @@ mod tests {
         assert_eq!(rx.recv().expect("item").expect("ok"), fill);
         assert_eq!(rx.recv().expect("item").expect("ok"), fill + 1);
 
-        // A record left on the pool with the ring full, then the producer
-        // dropped: `Drop` does not wait for the consumer.
+        // A record on the pool, the ring full, then the producer dropped: `Drop` must not wait.
         for item in 0..fill {
             tx.send(&item).expect("fills the ring");
         }

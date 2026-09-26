@@ -40,8 +40,7 @@ include!(concat!(env!("OUT_DIR"), "/stream_demo.rs"));
 
 use streamdemo::IStreamDemo::{BnStreamDemo, IStreamDemo};
 
-/// The producer's default opening window, as the `int` the fixture
-/// carries it in.
+/// The producer's default opening window, as the fixture's `int`.
 fn default_credits() -> i32 {
     SinkPolicy::default().initial_credits as i32
 }
@@ -59,8 +58,7 @@ struct DemoSvc {
 
 impl Interface for DemoSvc {}
 
-/// Where `subscribeAsync` runs its producers. Process-wide and never
-/// dropped: a runtime dropped with a blocking task in flight waits for it.
+/// Never dropped: a runtime dropped with a blocking task in flight waits for it.
 fn runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
     RUNTIME.get_or_init(|| {
@@ -80,9 +78,7 @@ fn sink_policy(max_batch_bytes: i32, initial_credits: i32) -> SinkPolicy {
 }
 
 impl DemoSvc {
-    /// Start the producer on a thread of its own. That is the whole
-    /// point: the handler returns right away and the pushing happens
-    /// outside any transaction.
+    /// Own thread on purpose: the handler returns at once and pushing is outside any transaction.
     fn spawn(
         &self,
         endpoint: &StreamEndpoint,
@@ -201,8 +197,7 @@ impl IStreamDemo for DemoSvc {
         Ok(self.last_error.load(Ordering::SeqCst))
     }
 
-    // The upload direction is exercised by the kernel half
-    // (`stream_probe`); this implementation keeps the fixture whole.
+    // Upload is exercised by the kernel half (`stream_probe`); this keeps the fixture whole.
     fn r#upload(&self, producer: &SIBinder, ring_bytes: i32) -> BinderResult<StreamEndpoint> {
         let (mut rx, endpoint) = Receiver::<i32>::with_policy(
             producer,
@@ -255,8 +250,7 @@ impl IStreamDemo for DemoSvc {
     }
 }
 
-/// A server on its own socket, and a client session with `incoming`
-/// callback connections.
+/// A server on its own socket and a client session with `incoming` callback connections.
 struct Fixture {
     _server: thread::JoinHandle<()>,
     client: RpcSession,
@@ -272,9 +266,7 @@ impl Drop for Fixture {
 }
 
 impl Fixture {
-    /// A receiver against the service's proxy — an RPC proxy, so the
-    /// endpoint carries only the sink — with the grant window and the
-    /// widest opening window set.
+    /// Against an RPC proxy, so the endpoint carries only the sink.
     fn receiver(&self, credit_window: u32, max_opening: u32) -> (Receiver<i32>, StreamEndpoint) {
         Receiver::<i32>::with_policy(
             &self.demo.as_binder(),
@@ -304,8 +296,7 @@ fn fixture(tag: &str, incoming: u32) -> Fixture {
         .expect("set_root");
     let server = server.run_background();
 
-    // `setup_unix_server` has already bound the listener, so connecting
-    // straight away cannot race the background thread.
+    // `setup_unix_server` already bound the listener, so connecting now cannot race the thread.
     let client = RpcSession::setup_client_android13plus_with_config(
         RpcClientConfig::unix(&path, 2).incoming_connections(incoming),
     )
@@ -321,8 +312,7 @@ fn fixture(tag: &str, incoming: u32) -> Fixture {
     }
 }
 
-/// An RPC peer makes a sink-only endpoint: there is no shared memory to
-/// carry a ring across a socket.
+/// An RPC peer gets a sink-only endpoint: no shared memory carries a ring across a socket.
 #[test]
 fn an_rpc_peer_gets_a_sink_only_endpoint() {
     let f = fixture("endpoint", 1);
@@ -374,8 +364,7 @@ fn a_window_wider_than_the_consumer_accepts_is_refused_across_a_session() {
     f.demo
         .r#subscribe(&endpoint, 1000, 64, default_credits() + 1, 0)
         .expect("subscribe");
-    // With a bound: a grant that did not cross the wire leaves both ends
-    // alive and waiting, which is a hang rather than a failure.
+    // Bounded: a grant lost on the wire leaves both ends waiting, a hang rather than a failure.
     let mut got = 0;
     while got < 1000 {
         match rx.recv_timeout(Duration::from_secs(10)) {
@@ -413,9 +402,7 @@ fn an_async_producer_streams_across_a_session() {
     assert_eq!(f.demo.r#lastError().expect("lastError"), 0);
 }
 
-/// The producer runs outside any handler, so a session that cannot carry
-/// a call in that direction is refused at `Sink::open` rather than at the
-/// first batch.
+/// The producer runs outside any handler, so `Sink::open` refuses, not the first batch.
 #[test]
 fn a_session_without_callback_connections_refuses_the_stream() {
     let f = fixture("nocb", 0);
@@ -436,9 +423,7 @@ fn a_session_without_callback_connections_refuses_the_stream() {
     );
 }
 
-/// The failure a service would have returned, arriving after the method
-/// that started the stream already succeeded — with its service-specific
-/// code intact, which is why the terminator carries three fields.
+/// A late failure keeps its service-specific code, which is why the terminator has three fields.
 #[test]
 fn a_failing_stream_keeps_its_service_specific_code_across_the_wire() {
     let f = fixture("fail", 1);
@@ -459,21 +444,18 @@ fn a_failing_stream_keeps_its_service_specific_code_across_the_wire() {
     assert!(rx.next().is_none(), "the failure is reported once");
 }
 
-/// Plan 10-7 AC-7.2 over RPC: with one batch of credit and nothing
-/// draining, the producer stops after that batch and stays stopped.
+/// Plan 10-7 AC-7.2 over RPC: one batch of credit, no drain, so the producer stops after it.
 #[test]
 fn the_window_bounds_what_the_producer_sends_before_anyone_drains() {
     let f = fixture("window", 1);
 
     let (mut rx, endpoint) = f.receiver(1, default_credits() as u32);
-    // Four bytes to a batch is one integer to a batch, and one opening
-    // credit, so exactly one item may leave before a grant.
+    // One integer per 4-byte batch and one opening credit: one item may leave before a grant.
     f.demo
         .r#subscribe(&endpoint, 100, 4, 1, 0)
         .expect("subscribe");
 
-    // Nothing has been read yet, and credit is only granted for batches
-    // the consumer has taken.
+    // Nothing read yet, and credit is granted only for batches the consumer has taken.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while f.demo.r#sent().expect("sent") < 1 {
         assert!(
@@ -500,9 +482,7 @@ fn a_session_that_ends_releases_a_blocked_consumer() {
 
     // A consumer takes no wider an opening window than it was made for.
     let (mut rx, endpoint) = f.receiver(default_credits() as u32, 1_000_000);
-    // Half a minute between items and credit to spare: after the first
-    // item nothing else arrives within this test, so when the session
-    // goes the consumer is waiting and the producer is not parked.
+    // 30 s per item, spare credit: at close the consumer is waiting and the producer not parked.
     f.demo
         .r#subscribe(&endpoint, i32::MAX, 4, 1_000_000, 30_000_000)
         .expect("subscribe");
@@ -512,8 +492,7 @@ fn a_session_that_ends_releases_a_blocked_consumer() {
 
     f.client.close_session();
 
-    // Bounded rather than `recv`: without the death link this waits for
-    // a batch that cannot come, and a test that hangs reports nothing.
+    // Bounded rather than `recv`: without the death link this would hang, reporting nothing.
     let failure = loop {
         match rx.recv_timeout(Duration::from_secs(10)) {
             // Batches already queued come out first.
@@ -532,8 +511,7 @@ fn a_session_that_ends_releases_a_blocked_consumer() {
     );
 }
 
-/// A consumer that walks away releases the producer instead of leaving
-/// it parked on a credit that will never come.
+/// Dropping the receiver releases a producer parked on a credit that will never come.
 #[test]
 fn dropping_the_receiver_stops_the_producer() {
     let f = fixture("drop", 1);
@@ -544,21 +522,26 @@ fn dropping_the_receiver_stops_the_producer() {
         .expect("subscribe");
     assert_eq!(rx.next().expect("item 0").expect("ok"), 0);
 
-    // Parked, and nothing left to grant: with the receiver still here
-    // this is where it stays.
-    thread::sleep(Duration::from_millis(200));
+    // Parked with nothing left to grant: while the receiver lives, it stays here.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while f.demo.r#sent().expect("sent") < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the grant for batch 0 must let item 1 through"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
     assert!(
         !f.demo.r#finished().expect("finished"),
         "the producer must still be waiting for credit"
     );
     let stopped = f.demo.r#sent().expect("sent");
-    assert!(
-        stopped < 1_000_000,
-        "the producer must be far short of the whole stream"
+    assert_eq!(
+        stopped, 2,
+        "item 0 on the opening credit, item 1 on the one grant"
     );
 
-    // What releases it is the cancel the drop sends. Polled rather than
-    // slept on: the cancel and the producer's wake are on two threads.
+    // The drop's cancel releases it; polled, as the cancel and the wake are on two threads.
     drop(rx);
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while !f.demo.r#finished().expect("finished") {

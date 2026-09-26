@@ -91,9 +91,7 @@ impl IStreamDemo for DemoSvc {
         let finished = self.finished.clone();
         let last_error = self.last_error.clone();
         let delay = Duration::from_micros(delay_micros.max(0) as u64);
-        // The handler returns at once; the pushing happens on this
-        // thread, outside any transaction, and blocks there whenever the
-        // ring is full.
+        // Pushes outside any transaction and blocks here, not in the handler, on a full ring.
         thread::spawn(move || {
             let mut stopped_early = false;
             for item in 0..count {
@@ -258,8 +256,7 @@ fn connect(name: &str) -> Result<Strong<dyn IStreamDemo>> {
     connect_via("binder://", name)
 }
 
-/// A receiver against the service, its endpoint carrying a ring of
-/// `ring_bytes`: the service is a kernel proxy here.
+/// The service is a kernel proxy here, so the endpoint carries a ring of `ring_bytes`.
 fn receiver_for(
     demo: &Strong<dyn IStreamDemo>,
     ring_bytes: usize,
@@ -273,8 +270,7 @@ fn receiver_for(
     )
 }
 
-/// `subscribe` with the RPC path's arguments at the producer's defaults;
-/// on a ring they are not read.
+/// The RPC-path arguments at the producer's defaults; a ring does not read them.
 fn subscribe(
     demo: &Strong<dyn IStreamDemo>,
     endpoint: &StreamEndpoint,
@@ -292,14 +288,12 @@ fn subscribe(
     .map_err(|e| e.transaction_error())
 }
 
-/// Items of an `i32` stream that fit the part of a ring items may use:
-/// each is a 4-byte header and a 4-byte payload.
+/// Each `i32` item takes a 4-byte header and a 4-byte payload.
 fn ring_items(ring_bytes: usize) -> i32 {
     ((ring_bytes - END_RESERVE) / 8) as i32
 }
 
-/// Drain `rx` to the end and say what came: items, whether they were
-/// `from..` in order, and how the stream ended.
+/// Drain `rx`: items received, whether they were `from..` in order, and how the stream ended.
 fn drain(rx: &mut Receiver<i32>, from: i32) -> (i32, bool, String) {
     let mut received = 0i32;
     let mut expected = from;
@@ -307,9 +301,7 @@ fn drain(rx: &mut Receiver<i32>, from: i32) -> (i32, bool, String) {
     let mut failure = None;
     for item in rx {
         match item {
-            // Order is the point: records leave the ring in the order
-            // they were committed, and neither end may drop or duplicate
-            // one at a wrap.
+            // Order is the point: neither end may drop or duplicate a record at a wrap.
             Ok(item) => {
                 if item != expected {
                     ordered = false;
@@ -340,8 +332,7 @@ fn consume(name: &str, count: i32, ring_bytes: usize) -> Result<()> {
     Ok(())
 }
 
-/// Take `take` items, stop reading, and watch the producer stop at the
-/// ring's capacity; then read the rest.
+/// Take `take` items, check the producer parks at ring capacity, then read the rest.
 fn pause(name: &str, count: i32, ring_bytes: usize, take: i32) -> Result<()> {
     let demo = connect(name)?;
     let (mut rx, endpoint) = receiver_for(&demo, ring_bytes)?;
@@ -377,8 +368,7 @@ fn pause(name: &str, count: i32, ring_bytes: usize, take: i32) -> Result<()> {
         }
         thread::sleep(Duration::from_millis(20));
     }
-    // Read once more: the counter rose to `full` and must stay there —
-    // an overshoot would mean the ring admitted more than it holds.
+    // Read again: an overshoot past `full` means the ring admitted more than it holds.
     let again = demo.r#sent().map_err(|e| e.transaction_error())?;
     let finished = demo.r#finished().map_err(|e| e.transaction_error())?;
     let parked = sent == full && again == full && !finished;
@@ -393,8 +383,7 @@ fn pause(name: &str, count: i32, ring_bytes: usize, take: i32) -> Result<()> {
     Ok(())
 }
 
-/// `streams` streams from one service at once, into a process whose
-/// binder mapping is a single page.
+/// `streams` streams from one service at once, into a process with a one-page binder mapping.
 fn crowd(name: &str, streams: usize, count: i32) -> Result<()> {
     let page = rustix::param::page_size();
     let demo = connect_via(&format!("binder://?mmap={page}"), name)?;
@@ -478,8 +467,7 @@ fn orphan(name: &str) -> Result<()> {
     let outcome = loop {
         match rx.recv_timeout(Duration::from_secs(20)) {
             Ok(Some(_)) => received += 1,
-            // A clean terminator cannot happen here — the producer is
-            // streaming `i32::MAX` items and is killed long before.
+            // Impossible: the producer streams `i32::MAX` items and is killed long before.
             Ok(None) if rx.is_finished() => break "ended-clean".to_string(),
             Ok(None) => break "timeout".to_string(),
             Err(status) => break format!("err:{:?}", status.transaction_error()),
@@ -501,9 +489,7 @@ fn upload(name: &str, count: i32, ring_bytes: usize) -> Result<()> {
         tx.send(&item)?;
     }
     tx.end()?;
-    // The end record is in the ring; the service's thread has yet to
-    // read it. Polled on the service's own flag, bounded by the script's
-    // `timeout`.
+    // The service may not have read the end record yet; the script's `timeout` bounds this.
     while !demo.r#uploadFinished().map_err(|e| e.transaction_error())? {
         thread::sleep(Duration::from_millis(20));
     }
@@ -520,8 +506,7 @@ fn upload(name: &str, count: i32, ring_bytes: usize) -> Result<()> {
     Ok(())
 }
 
-/// Ask for an upload endpoint, push `send` items into it, and leave
-/// without ending the stream.
+/// Push `send` items into an upload endpoint and leave without ending the stream.
 fn vanish(name: &str, send: i32) -> Result<()> {
     let demo = connect(name)?;
     let token = Token::new();
@@ -540,8 +525,7 @@ fn vanish(name: &str, send: i32) -> Result<()> {
     println!("RESULT vanish {sent}");
     use std::io::Write;
     std::io::stdout().flush().ok();
-    // Neither the sink's end record nor the token's unlink: the process
-    // is simply gone.
+    // Neither the sink's end record nor the token's unlink: the process is simply gone.
     std::process::exit(0);
 }
 
@@ -555,8 +539,7 @@ fn status(name: &str) -> Result<()> {
     let up_ordered = demo.r#uploadOrdered().map_err(code)?;
     let up_finished = demo.r#uploadFinished().map_err(code)?;
     let up_err = demo.r#uploadError().map_err(code)?;
-    // Compared here rather than in the shell: the integer is a
-    // discriminant of this build's `StatusCode`, not a wire constant.
+    // Compared here, not in the shell: a `StatusCode` discriminant is not a wire constant.
     let dead_code = i32::from(StatusCode::DeadObject);
     let dead = err == dead_code;
     let canceled = err == i32::from(StatusCode::InvalidOperation);

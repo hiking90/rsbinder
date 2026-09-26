@@ -4,6 +4,19 @@
 //! Handing a token to the blocking pool (`tokio` feature), so that a wait
 //! the executor cannot poll — a binder send on the RPC path, a futex wait
 //! on the ring — does not hold an executor thread.
+//!
+//! A token settles by being dropped, so a task dropped unrun settles its
+//! token with it. [`carry`] covers the one way out that skips even that: a
+//! hand-off that queues the task and then unwinds — `spawn_blocking` does,
+//! when the OS refuses a thread — leaves the task neither run nor dropped,
+//! and `carry` then takes the token back out of the task's slot and drops it.
+//!
+//! [`on_pool`] hands the task over when it is called, not when the future is
+//! polled, so dropping the future detaches the task. Its `Err` says only that
+//! the pool did not run the task; what the task did is the token's to report.
+//! It goes through [`Tokio`](crate::Tokio) rather than `spawn_blocking`
+//! directly, because inside a transaction handler the work has to stay on the
+//! current thread and that rule lives there.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -12,9 +25,7 @@ use std::task::{Context, Poll};
 
 use crate::error::Result;
 
-/// A token and what to do with it, as the task a pool is handed. The
-/// token sits in a slot rather than in the task so that [`carry`] can
-/// take it back.
+/// A token and the task a pool is handed; the token sits in a slot so [`carry`] can take it back.
 pub(super) struct Carried<R, F> {
     slot: Arc<Mutex<Option<R>>>,
     run: F,
@@ -40,18 +51,13 @@ impl<R> Drop for TakeBack<R> {
     fn drop(&mut self) {
         if self.armed {
             let token = self.slot.lock().unwrap_or_else(|e| e.into_inner()).take();
-            // Dropped with the slot unlocked: settling may make binder
-            // calls or wake a futex.
+            // Dropped with the slot unlocked: settling may make binder calls or wake a futex.
             drop(token);
         }
     }
 }
 
-/// Give `hand_off` a task that runs `run` on `token`. A task dropped unrun
-/// drops the token with it, which is how a token settles. The one way out
-/// that skips even that is a hand-off that queues the task and then
-/// unwinds — `spawn_blocking` does, when the OS refuses a thread — leaving
-/// the task neither run nor dropped; the token is dropped here instead.
+/// Give `hand_off` a task that runs `run` on `token`; see the module doc for how it settles.
 pub(super) fn carry<R, F, H, O>(token: R, run: F, hand_off: H) -> O
 where
     H: FnOnce(Carried<R, F>) -> O,
@@ -66,12 +72,7 @@ where
     handed
 }
 
-/// Run `run` on `token` from the blocking pool. Handed over when this is
-/// called, not when the future is polled, so dropping the future detaches
-/// the task. `Err` says only that the pool did not run it; what the task
-/// did is the token's to report. Through [`Tokio`](crate::Tokio) rather
-/// than `spawn_blocking` directly, because inside a transaction handler
-/// the work has to stay on the current thread and that rule lives there.
+/// Run `run` on `token` from the blocking pool; see the module doc for its contract.
 pub(super) fn on_pool<R, F>(token: R, run: F) -> crate::BoxFuture<'static, Result<()>>
 where
     R: Send + 'static,
@@ -85,8 +86,7 @@ where
     })
 }
 
-/// One of two futures with the same output, for a method that returns
-/// `impl Future` and has two transports to pick from.
+/// One of two futures with the same output, for an `impl Future` method with two transports.
 pub(super) enum Either<A, B> {
     A(A),
     B(B),
@@ -100,10 +100,7 @@ where
     type Output = O;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<O> {
-        // SAFETY: structural pinning of whichever variant is in use. The
-        // variant is never moved out of the enum, `Either` has no `Drop`
-        // impl, and its `Unpin` is the automatic one (both variants
-        // `Unpin`), so a pinned `Either` pins its variant.
+        // SAFETY: structural pinning; no variant moves out, no `Drop` impl, `Unpin` is automatic.
         unsafe {
             match self.get_unchecked_mut() {
                 Either::A(a) => Pin::new_unchecked(a).poll(cx),
@@ -127,9 +124,7 @@ mod tests {
         }
     }
 
-    /// `spawn_blocking` queues the task before it finds the OS will not
-    /// give it a thread, and then panics: the task is neither run nor
-    /// dropped. Nothing may be left waiting on a token inside it.
+    /// `spawn_blocking` can queue the task and then panic, leaving it neither run nor dropped.
     #[test]
     fn a_hand_off_that_queues_and_unwinds_gives_the_token_back() {
         let settled = Arc::new(AtomicUsize::new(0));

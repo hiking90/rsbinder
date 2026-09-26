@@ -336,9 +336,7 @@ impl std::fmt::Debug for Token {
     }
 }
 
-// ---------------------------------------------------------------------
-// Shared by both paths
-// ---------------------------------------------------------------------
+// --- Shared by both paths ---
 
 /// Link `recipient` to `binder`'s death, held alive by the returned `Arc`; `Ok(None)` if local.
 fn watch_death<R>(binder: &SIBinder, recipient: R) -> Result<Option<Arc<dyn crate::DeathRecipient>>>
@@ -349,9 +347,7 @@ where
         return Ok(None);
     }
     let recipient: Arc<dyn crate::DeathRecipient> = Arc::new(recipient);
-    // Fatal to the stream: back-pressure leaves nothing in flight to
-    // fail, so this link is the only way either end learns the other is
-    // gone.
+    // Fatal: back-pressure leaves nothing in flight to fail, so only this link reports death.
     if let Err(e) = binder.link_to_death(Arc::downgrade(&recipient)) {
         log::error!("stream: cannot watch the peer for death: {e:?}");
         return Err(e);
@@ -362,9 +358,7 @@ where
 /// Undo `watch_death` (no lock held): a dropped `Arc` alone leaves the kernel subscription.
 fn unlink_death(binder: &SIBinder, recipient: &Option<Arc<dyn crate::DeathRecipient>>) {
     let Some(recipient) = recipient else { return };
-    // Callers include `Drop`: a kernel proxy's `unlink_to_death` panics on
-    // a poisoned recipients lock, and a panic leaving `Drop` during an
-    // unwind aborts the process (`bridge::unlink_all` catches for this).
+    // `Drop` calls this; a panic here during an unwind (poisoned recipients lock) would abort.
     let unlinked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _ = binder.unlink_to_death(Arc::downgrade(recipient));
     }));
@@ -373,8 +367,7 @@ fn unlink_death(binder: &SIBinder, recipient: &Option<Arc<dyn crate::DeathRecipi
     }
 }
 
-/// What the transport under `binder` can do: an RPC proxy answers from
-/// its session, anything else is local or kernel and can always be called.
+/// An RPC proxy answers from its session; anything else is local or kernel and always callable.
 fn peer_caps(binder: &SIBinder) -> crate::TransportCaps {
     #[cfg(feature = "rpc")]
     if let Some(proxy) = (**binder).as_any().downcast_ref::<crate::rpc::RpcProxy>() {
@@ -385,24 +378,20 @@ fn peer_caps(binder: &SIBinder) -> crate::TransportCaps {
     crate::TransportCaps::KERNEL
 }
 
-/// Whether a stream to `peer` runs on a ring: the two ends share a kernel
-/// binder driver — or a process — and the platform has the shared memory
-/// and futex the ring needs. Anything else is the RPC path.
+/// A ring needs one kernel driver (or process) for both ends plus OS shared memory and futex.
 fn over_ring(peer: &SIBinder) -> bool {
     cfg!(any(target_os = "linux", target_os = "android"))
         && peer_caps(peer).contains(crate::TransportCaps::KERNEL_KNOBS)
 }
 
-/// One item as the bytes a record or a batch carries: the `to_bytes`
-/// codec, which refuses a binder or a file descriptor.
+/// One item as record or batch bytes, via the `to_bytes` codec (which refuses a binder or an fd).
 fn encode_item<T: Serialize + ?Sized>(item: &T) -> Result<Vec<u8>> {
     let mut parcel = Parcel::new_data_only();
     parcel.write(item)?;
     parcel.into_bytes()
 }
 
-/// One item back from its bytes, all of them: bytes left over mean the
-/// producer's `T` and this one disagree on the wire.
+/// One item from all of `bytes`; leftovers mean the two ends' `T` disagree on the wire.
 fn decode_item<T: Deserialize>(bytes: &[u8]) -> Result<T> {
     let mut parcel = Parcel::from_slice(bytes);
     let item = parcel.read::<T>()?;
@@ -416,9 +405,7 @@ fn decode_item<T: Deserialize>(bytes: &[u8]) -> Result<T> {
     Ok(item)
 }
 
-/// What the consumer is told when [`Sink::end_with`] was handed a status
-/// the wire cannot carry. The sink is consumed by then, so the stream ends
-/// on this rather than on the producer's own status.
+/// Ends the stream when [`Sink::end_with`] got a status the wire cannot carry.
 const UNCARRIABLE_TERMINATOR: &str =
     "the stream's producer ended with a status that cannot be carried";
 
@@ -462,9 +449,7 @@ fn status_fields(status: &Status) -> Result<(i32, i32, Option<String>)> {
     }
 }
 
-/// Rebuild a [`Status`] from the three `onEnd` arguments, reading
-/// `service_specific` only for `EX_SERVICE_SPECIFIC` — the one exception
-/// AOSP's `Status::writeToParcel` writes that field for.
+/// Inverse of [`status_fields`]; like AOSP, reads `service_specific` only for EX_SERVICE_SPECIFIC.
 fn status_from_fields(
     exception: i32,
     service_specific: i32,
@@ -500,13 +485,10 @@ fn exception_from_i32(exception: i32) -> Result<ExceptionCode> {
     })
 }
 
-// ---------------------------------------------------------------------
-// Producer
-// ---------------------------------------------------------------------
+// --- Producer ---
 
 enum SinkInner<T: ?Sized> {
-    /// Boxed: the pending batch and the credit state make it several
-    /// times the ring producer's size.
+    /// Boxed: the pending batch and credit state make it several times the ring producer's size.
     Calls(Box<calls::Producer<T>>),
     Ring(ring::Producer<T>),
 }
@@ -921,9 +903,7 @@ impl<T: ?Sized> std::fmt::Debug for Sink<T> {
     }
 }
 
-// ---------------------------------------------------------------------
-// Consumer
-// ---------------------------------------------------------------------
+// --- Consumer ---
 
 enum ReceiverInner<T> {
     Calls(calls::Consumer<T>),
@@ -1119,9 +1099,13 @@ impl<T: Deserialize> Receiver<T> {
     /// `None` while the stream is still running. After it ends this is
     /// the status the stream ended on: the one passed to [`Sink::end`] or
     /// [`Sink::end_with`] (`Status::ok()` for a stream that ran out),
-    /// unless items were lost (`EX_ILLEGAL_STATE`, saying how many), the
-    /// producer died ([`StatusCode::DeadObject`]), or this side refused
-    /// what it read.
+    /// except: `EX_ILLEGAL_STATE` when the producer lost queued items or
+    /// dropped its [`Sink`] without ending (the message says how many
+    /// items were not sent, possibly zero), `EX_ILLEGAL_ARGUMENT` when
+    /// [`Sink::end_with`] was given a status the wire cannot carry,
+    /// [`StatusCode::DeadObject`] when the producer died, and the
+    /// transport's own error when this side refused what it read or could
+    /// not wait or grant.
     pub fn end_status(&self) -> Option<Status> {
         match &self.inner {
             ReceiverInner::Calls(c) => c.end_status(),
@@ -1159,9 +1143,7 @@ impl<T: Deserialize> Iterator for Receiver<T> {
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        // Before the inner consumer goes: dropping the recipient only
-        // makes the link inert, and the peer's recipient list never
-        // shrinks on its own.
+        // Unlink first: dropping the recipient only makes the link inert, the peer's list stays.
         let death = self.death.take();
         unlink_death(&self.peer, &death);
     }
@@ -1189,9 +1171,7 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
 
-    /// A pair through the public surface. A local peer is a kernel-class
-    /// transport, so on Linux this is the ring; the RPC path's own
-    /// end-to-end is `tests/stream_rpc.rs`.
+    /// A local peer is kernel-class, so this is the ring on Linux; RPC is `tests/stream_rpc.rs`.
     fn pair<T: Serialize + Deserialize>() -> (Sink<T>, Receiver<T>) {
         let peer = Token::new().binder();
         let (rx, endpoint) = Receiver::<T>::new(&peer).expect("a receiver");
@@ -1227,8 +1207,7 @@ mod tests {
         assert!(rx.end_status().expect("a terminator arrived").is_ok());
     }
 
-    /// The failure a service would have returned, arriving after the
-    /// method that started the stream already succeeded.
+    /// The service's failure arrives after the call that started the stream already succeeded.
     #[test]
     fn a_service_specific_failure_survives_the_terminator() {
         let (mut sink, mut rx) = pair::<i32>();
@@ -1250,9 +1229,7 @@ mod tests {
         );
     }
 
-    /// `EX_TRANSACTION_FAILED` says the binder layer failed, which a call
-    /// that arrived cannot report, so the producer's own status is
-    /// refused — and the stream still ends, on `EX_ILLEGAL_ARGUMENT`.
+    /// No arrived call can report `EX_TRANSACTION_FAILED`; it is refused, the stream still ends.
     #[test]
     fn a_terminator_that_cannot_be_carried_is_refused() {
         let (sink, mut rx) = pair::<i32>();
@@ -1266,8 +1243,7 @@ mod tests {
         assert_eq!(ended.message(), Some(UNCARRIABLE_TERMINATOR));
     }
 
-    /// A producer that goes away mid-stream still ends the stream, because
-    /// the consumer blocked in `recv` has no other way to find out.
+    /// A consumer blocked in `recv` learns of a producer gone mid-stream only from the terminator.
     #[test]
     fn a_dropped_sink_ends_the_stream_as_failed() {
         let (mut sink, mut rx) = pair::<i32>();
@@ -1341,17 +1317,14 @@ mod tests {
         let binder = token.binder();
         assert!(binder.as_remote().is_none(), "a local object");
         assert_eq!(binder.descriptor(), "rsbinder.stream.Token");
-        // The same object each time, so a service that compares the
-        // argument with what it linked to sees one binder.
+        // The same object each time, so a service comparing it with its link sees one binder.
         assert_eq!(
             SIBinder::downgrade(&token.binder()),
             SIBinder::downgrade(&binder)
         );
     }
 
-    /// What the producer agrees to send and what the consumer agrees to
-    /// read are one set: a status accepted here and refused there makes
-    /// `end_with` succeed while the consumer's stream ends on `BadValue`.
+    /// A status `end_with` accepts but the reader refuses would end the stream on `BadValue`.
     #[test]
     fn a_status_the_producer_accepts_is_one_the_consumer_reads() {
         for code in [
@@ -1392,8 +1365,7 @@ mod tests {
         }
     }
 
-    /// Every field AOSP's `Status` wire carries survives the three
-    /// arguments, which is why they are three rather than one.
+    /// Every field of AOSP's `Status` wire survives, which is why the arguments are three, not one.
     #[test]
     fn a_status_round_trips_through_the_terminator_arguments() {
         for status in [
@@ -1414,8 +1386,7 @@ mod tests {
         }
     }
 
-    /// An item holding a binder cannot cross as bytes and is refused
-    /// before anything is written.
+    /// A binder cannot cross as bytes; it is refused before anything is written.
     #[test]
     fn an_item_with_a_binder_is_refused() {
         let (mut sink, mut rx) = pair::<SIBinder>();
