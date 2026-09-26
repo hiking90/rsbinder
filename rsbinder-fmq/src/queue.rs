@@ -33,8 +33,7 @@ pub unsafe trait Element: Copy + 'static {}
 
 macro_rules! elements {
     ($($t:ty),* $(,)?) => { $(
-        // SAFETY: a primitive integer or float has no padding, every bit
-        // pattern is a value, and its alignment is at most 8.
+        // SAFETY: primitive numbers: no padding, every bit pattern valid, align <= 8.
         unsafe impl Element for $t {}
     )* };
 }
@@ -62,9 +61,7 @@ impl Counter {
     }
 
     fn get(&self) -> &AtomicU64 {
-        // SAFETY: `ptr` lies inside `_mapping`, is 8-aligned (grantor
-        // offsets are multiples of 8, mappings page-aligned), and every peer
-        // touches it only atomically.
+        // SAFETY: in `_mapping`, 8-aligned (grantor offsets are 8-aligned), atomic-only.
         unsafe { self.ptr.as_ref() }
     }
 }
@@ -86,10 +83,10 @@ struct Ring {
 ///
 /// # One handle, one side
 ///
-/// A `MessageQueue` is `Send` but not `Sync`: every operation takes
-/// `&mut self`, and the flavor's rule that there is one reader and one
-/// writer is the caller's to keep. Two handles on the same queue in one
-/// process (one from [`create`](Self::create), one from
+/// A `MessageQueue` is `Send` but not `Sync`: every operation that moves a
+/// counter or touches the ring takes `&mut self`, and the flavor's rule
+/// that there is one reader and one writer is the caller's to keep. Two
+/// handles on the same queue in one process (one from [`create`](Self::create), one from
 /// [`attach`](Self::attach)) are fine as long as one only writes and the
 /// other only reads.
 ///
@@ -130,8 +127,7 @@ pub struct MessageQueue<T: Element> {
     _element: PhantomData<T>,
 }
 
-// SAFETY: the raw pointers point into mappings the struct owns (`Mapping`
-// is `Send`), and no other handle aliases them mutably through this one.
+// SAFETY: pointers into owned `Mapping`s (`Send`), reached only via atomics and `Regions` copies.
 unsafe impl<T: Element> Send for MessageQueue<T> {}
 
 impl<T: Element> MessageQueue<T> {
@@ -309,9 +305,7 @@ impl<T: Element> MessageQueue<T> {
         let offset = (position % self.ring.bytes as u64) as usize;
         let contiguous = (self.ring.bytes - offset) / q;
         debug_assert_eq!(offset % q, 0);
-        // SAFETY: `offset < bytes` keeps the pointer inside the ring, and
-        // `offset` is a multiple of `size_of::<T>()`, so the cast is aligned
-        // for `T` (the ring base is 8-aligned and `align_of::<T>() ≤ 8`).
+        // SAFETY: `offset < bytes` stays in the ring; alignment: see "Soundness" on `Regions`.
         let first = unsafe { self.ring.base.as_ptr().add(offset) }.cast::<T>();
         let (first_len, second_len) = if n > contiguous {
             (contiguous, n - contiguous)
@@ -513,6 +507,20 @@ impl<T: Element> std::fmt::Debug for MessageQueue<T> {
 /// run over both parts as one sequence, so a caller lays out a record
 /// without knowing where the wrap falls. Every access is a copy; there is
 /// no way to hold a reference into the ring.
+///
+/// # Soundness
+///
+/// Both runs of a copy lie inside the ring (the index range is checked
+/// against [`len`](Self::len)) and are aligned for `T`: every offset is a
+/// multiple of `size_of::<T>()` from an 8-aligned ring base, and
+/// `align_of::<T>() <= 8`. The caller's slice cannot overlap them, since
+/// nothing hands out a reference into the ring. The peer reads written
+/// elements only after [`commit_write`](MessageQueue::commit_write)'s
+/// `Release` store, which the copy cannot move past (libfmq's `write` is the
+/// same `memcpy`); a read copies after the `Acquire` load of the write
+/// counter. A peer that rewrites the elements anyway leaves some bit pattern
+/// in the destination, and every one is a `T` (the [`Element`] contract): a
+/// wrong value, not an invalid one.
 pub struct Regions<'a, T: Element> {
     first: NonNull<T>,
     first_len: usize,
@@ -545,9 +553,7 @@ impl<T: Element> Regions<'_, T> {
     /// The ring runs `start..start + n` covers, before and after the wrap, as `(pointer, length)`.
     fn runs(&self, start: usize, n: usize) -> [(*mut T, usize); 2] {
         let head = self.first_len.saturating_sub(start).min(n);
-        // SAFETY: callers check `start + n <= len()`. The first offset is at
-        // most `first_len` (one past the part's end when `start` is beyond
-        // it), the second at most `second_len`; both stay in the ring.
+        // SAFETY: callers check `start + n <= len()`, so each offset is at most its part's length.
         unsafe {
             [
                 (self.first.as_ptr().add(start.min(self.first_len)), head),
@@ -571,11 +577,7 @@ impl<T: Element> Regions<'_, T> {
             return Err(Error::BadValue("write past the reserved elements"));
         }
         let [(head, head_len), (tail, tail_len)] = self.runs(start, src.len());
-        // SAFETY: both runs are inside the ring (bound checked above) and
-        // aligned for `T` (see `regions_at`); `src` cannot overlap them, since
-        // nothing hands out a reference into the ring. The peer reads these
-        // elements only after `commit_write`'s `Release` store, which the
-        // copy cannot move past — libfmq's `write` is the same `memcpy`.
+        // SAFETY: in the ring (checked above), aligned, unaliased; see "Soundness" on `Regions`.
         unsafe {
             std::ptr::copy_nonoverlapping(src.as_ptr(), head, head_len);
             std::ptr::copy_nonoverlapping(src.as_ptr().add(head_len), tail, tail_len);
@@ -593,10 +595,7 @@ impl<T: Element> Regions<'_, T> {
             return Err(Error::BadValue("read past the available elements"));
         }
         let [(head, head_len), (tail, tail_len)] = self.runs(start, dst.len());
-        // SAFETY: as in `write_at`, with the reader's `Acquire` load before
-        // the copy. A peer that rewrites the elements anyway leaves some bit
-        // pattern in `dst`, and every one is a `T` (the `Element` contract):
-        // a wrong value, not an invalid one.
+        // SAFETY: as in `write_at`; a racing peer leaves a wrong `T`, never an invalid one.
         unsafe {
             std::ptr::copy_nonoverlapping(head, dst.as_mut_ptr(), head_len);
             std::ptr::copy_nonoverlapping(tail, dst.as_mut_ptr().add(head_len), tail_len);

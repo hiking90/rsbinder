@@ -147,8 +147,7 @@ fn rust_creates_c_reads() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// Rust creates and reads; the C header attaches and writes, waiting on
-/// `NOT_FULL` at the ring's capacity.
+/// Rust creates and reads; the C header attaches and writes, waiting on `NOT_FULL` when full.
 #[test]
 fn rust_creates_c_writes() {
     let (child, mut sock, path) = start("c1w", "attach", "write");
@@ -165,8 +164,7 @@ fn rust_creates_c_writes() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// The C header creates and writes; Rust attaches under the strict policy
-/// and reads. Its layout is `create`'s, and its memfd is shrink-sealed.
+/// The C header creates and writes; Rust attaches under the strict policy and reads.
 #[test]
 fn c_creates_rust_reads() {
     let (child, mut sock, path) = start("c2r", "create", "write");
@@ -210,8 +208,7 @@ fn c_creates_rust_writes() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// `probe` mode: what the header answers to `desc` (with `max_capacity`),
-/// and, when it attached, to the counters after `damage` ran.
+/// `probe` mode: the header's answer to `desc`, then to the counters after `damage` ran.
 fn probe(tag: &str, desc: &Descriptor, max_capacity: usize, damage: impl FnOnce()) -> String {
     let path = common::sock_path(tag);
     let _ = std::fs::remove_file(&path);
@@ -238,6 +235,12 @@ fn rust_queue() -> (MessageQueue<u32>, Descriptor) {
     (q, desc)
 }
 
+// The page-rounded memfd size, not a hard-coded 4096: pages are 16/64 KiB on some aarch64 hosts.
+fn region_end(d: &Descriptor) -> u32 {
+    let size = rsbinder_fmq::shm::region_size(d.fds[0].as_fd()).unwrap();
+    u32::try_from(size).unwrap()
+}
+
 /// The descriptor checks `validate` makes, answered `-EINVAL` by the header.
 #[test]
 fn c_refuses_what_rust_refuses() {
@@ -247,13 +250,16 @@ fn c_refuses_what_rust_refuses() {
     let out = probe("ok", &desc, CAPACITY, || {});
     assert!(out.contains("attach=0"), "a valid descriptor: {out}");
 
-    // (tag, how the descriptor is broken, the probe's max_capacity)
-    // Each edit breaks one rule only: the word moves within the fd's page, clear of the ring.
+    // Each edit breaks one rule: a moved word stays clear of the ring, in the fd but for past-end.
     type Case = (&'static str, fn(&mut Descriptor), usize);
     let cases: [Case; 8] = [
         ("misaligned", |d| d.grantors[3].offset += 4, CAPACITY),
         ("no-word", |d| d.grantors.truncate(3), CAPACITY),
-        ("past-end", |d| d.grantors[3].offset = 4096, CAPACITY),
+        (
+            "past-end",
+            |d| d.grantors[3].offset = region_end(d),
+            CAPACITY,
+        ),
         ("overlap", |d| d.grantors[1].offset = 0, CAPACITY),
         ("fd-index", |d| d.grantors[3].fd_index = 1, CAPACITY),
         ("min-extent", |d| d.grantors[0].extent = 4, CAPACITY),
@@ -302,15 +308,14 @@ fn c_refuses_hostile_counters() {
     let damages: [(&str, u64, u64); 4] = [
         ("read-ahead", 8, 0),
         ("overfull", 0, 4 * CAPACITY as u64 + 4),
-        ("misaligned", 2, 2),
+        ("unaligned-counters", 2, 2),
         ("near-wrap", near_wrap, near_wrap),
     ];
     for (tag, read, write) in damages {
         let (_q, desc) = rust_queue();
         let fd = desc.fds[0].try_clone().unwrap();
         let out = probe(tag, &desc, CAPACITY, move || {
-            // SAFETY: a fresh shared mapping of the queue's first page, where
-            // the two counters live (offsets 0 and 8); unmapped right after.
+            // SAFETY: a fresh shared map of the counters' page (offsets 0, 8); unmapped after.
             unsafe {
                 let base = rustix::mm::mmap(
                     std::ptr::null_mut(),
@@ -336,8 +341,7 @@ fn c_refuses_hostile_counters() {
     }
 }
 
-/// The header as C++: the NDK-type templates convert a created queue out
-/// and back, and a negative field is refused.
+/// The header as C++: NDK-type templates round-trip a created queue and refuse a negative field.
 #[test]
 fn cxx_templates_round_trip() {
     let exe = compile(

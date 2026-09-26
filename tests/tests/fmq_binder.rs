@@ -81,8 +81,7 @@ fn every_case_holds_across_the_kernel_binder() {
     assert_eq!(outcomes.len(), 5);
     assert!(outcomes.iter().all(|o| o.ok), "{outcomes:#?}");
 
-    // What rsbinder reports for each damage is its own contract:
-    // `Corrupted` on every operation, so the report is -1 throughout.
+    // rsbinder's own contract: `Corrupted` on every operation, so the report is -1 throughout.
     for outcome in &outcomes[2..] {
         assert!(
             outcome.line.ends_with("avail=-1/-1 read=-1 sum=0"),

@@ -21,8 +21,7 @@ struct Inner {
     word: NonNull<AtomicU32>,
 }
 
-// SAFETY: `word` points into `_mapping`, which lives as long as `Inner`, and
-// the word is only ever touched through `AtomicU32`.
+// SAFETY: `word` points into `_mapping`, owned by `Inner`, and is touched only as `AtomicU32`.
 unsafe impl Send for Inner {}
 unsafe impl Sync for Inner {}
 
@@ -68,9 +67,7 @@ impl EventFlag {
     }
 
     fn word(&self) -> &AtomicU32 {
-        // SAFETY: the word lies inside the mapping `inner` owns, is 4-aligned
-        // (every grantor offset is a multiple of 8 and the mapping is
-        // page-aligned), and is accessed only atomically by every peer.
+        // SAFETY: in `inner`'s mapping, 4-aligned (grantor offsets are 8-aligned), atomic-only.
         unsafe { self.inner.word.as_ref() }
     }
 
@@ -99,8 +96,7 @@ impl EventFlag {
         self.wait_until(bits, sys::deadline_after(timeout)?)
     }
 
-    /// [`wait`](Self::wait) against an absolute deadline, so a loop that
-    /// waits repeatedly keeps one deadline.
+    /// [`wait`](Self::wait) against an absolute deadline, so a retry loop keeps one deadline.
     pub(crate) fn wait_until(&self, bits: u32, deadline: Option<Timespec>) -> Result<u32> {
         if bits == 0 {
             return Err(Error::BadValue("empty bit mask"));
@@ -111,8 +107,7 @@ impl EventFlag {
             if set != 0 {
                 return Ok(set);
             }
-            // Sleep only while the word still reads as it did with our bits
-            // clear; a change in between means a wake we would otherwise miss.
+            // Sleep only if the word is unchanged since the clear: a wake in between is kept.
             sys::futex_wait(self.word(), old & !bits, bits, deadline.as_ref())?;
         }
     }

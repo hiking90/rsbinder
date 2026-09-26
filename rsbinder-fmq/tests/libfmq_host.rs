@@ -78,8 +78,7 @@ fn read_all(q: &mut MessageQueue<u32>) {
     assert_eq!(sum, expected_sum());
 }
 
-/// S1: rsbinder creates; libfmq attaches (its attach resets the counters,
-/// so the first write waits for the peer's "attached") and reads.
+/// S1: rsbinder creates; libfmq reads. Its attach resets the counters, so writes wait for it.
 #[test]
 #[ignore = "needs RSBINDER_FMQ_LIBFMQ_PEER (tests/cpp/build_host_peer.sh)"]
 fn s1_rsbinder_creates_libfmq_reads() {
@@ -106,8 +105,7 @@ fn s1_rsbinder_creates_libfmq_reads() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// S1, the other role: rsbinder creates and reads; libfmq attaches and
-/// writes, blocking on `NOT_FULL` at the ring's capacity.
+/// S1, the other role: rsbinder creates and reads; libfmq writes, blocking on `NOT_FULL`.
 #[test]
 #[ignore = "needs RSBINDER_FMQ_LIBFMQ_PEER (tests/cpp/build_host_peer.sh)"]
 fn s1_rsbinder_creates_libfmq_writes() {
@@ -135,10 +133,7 @@ fn s1_rsbinder_creates_libfmq_writes() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// S2: libfmq creates (a memfd sealed `GROW | SHRINK`, the libcutils
-/// memfd path) and writes; rsbinder attaches under the strict policy and
-/// reads. The layout libfmq built is checked against the one `create`
-/// builds.
+/// S2: libfmq creates (libcutils memfd, sealed `GROW | SHRINK`) and writes; rsbinder reads.
 #[test]
 #[ignore = "needs RSBINDER_FMQ_LIBFMQ_PEER (tests/cpp/build_host_peer.sh)"]
 fn s2_libfmq_creates_rsbinder_reads() {
@@ -178,8 +173,7 @@ fn s2_libfmq_creates_rsbinder_reads() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// S2, the other role: libfmq creates and reads; rsbinder attaches and
-/// writes.
+/// S2, the other role: libfmq creates and reads; rsbinder attaches and writes.
 #[test]
 #[ignore = "needs RSBINDER_FMQ_LIBFMQ_PEER (tests/cpp/build_host_peer.sh)"]
 fn s2_libfmq_creates_rsbinder_writes() {
@@ -205,9 +199,7 @@ fn s2_libfmq_creates_rsbinder_writes() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// libfmq's `bufferFd` constructor is not exercised by the peer; this pins
-/// the grantor roles the peer's descriptor is expected to carry so a
-/// layout change in libfmq shows up as a diff, not a hang.
+/// Pins the single-fd grantor layout, so a libfmq layout change shows up as a diff, not a hang.
 #[test]
 fn expected_single_fd_layout() {
     let d = MessageQueue::<u32>::create(64, true)

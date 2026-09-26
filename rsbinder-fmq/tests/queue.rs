@@ -263,6 +263,7 @@ fn write_blocking_returns_only_after_the_reader_frees_space() {
     let mut r = attach(&w);
     assert!(w.write(&[1, 2, 3, 4]).unwrap());
 
+    let started = Instant::now();
     let reader = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(150));
         let mut out = [0u8; 2];
@@ -271,7 +272,6 @@ fn write_blocking_returns_only_after_the_reader_frees_space() {
         assert_eq!(out, [1, 2]);
         r
     });
-    let started = Instant::now();
     w.write_blocking(&[5, 6], NOT_FULL, NOT_EMPTY, Some(Duration::from_secs(5)))
         .unwrap();
     assert!(started.elapsed() >= Duration::from_millis(100));
@@ -310,11 +310,11 @@ fn a_timeout_past_the_clock_waits_without_a_deadline() {
         assert_eq!(out, [1]);
     }
 
-    // And a write that really sleeps: on a full queue, `Duration::MAX` must not
-    // turn into a deadline already past, which would be `TimedOut` at once.
+    // A write that really sleeps: `Duration::MAX` must not become a past deadline (`TimedOut`).
     let mut w = MessageQueue::<u8>::create(2, true).unwrap();
     let mut r = attach(&w);
     w.write(&[1, 2]).unwrap();
+    let started = std::time::Instant::now();
     let reader = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(50));
         let mut out = [0u8];
@@ -322,7 +322,6 @@ fn a_timeout_past_the_clock_waits_without_a_deadline() {
             .unwrap();
         out
     });
-    let started = std::time::Instant::now();
     w.write_blocking(&[3], NOT_FULL, NOT_EMPTY, Some(Duration::MAX))
         .unwrap();
     assert!(
@@ -337,12 +336,12 @@ fn a_timeout_past_the_clock_waits_without_a_deadline() {
 fn read_blocking_wakes_on_the_writers_notification() {
     let mut w = MessageQueue::<u32>::create(4, true).unwrap();
     let mut r = attach(&w);
+    let started = Instant::now();
     let writer = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(150));
         w.write_blocking(&[9, 8, 7], NOT_FULL, NOT_EMPTY, None)
             .unwrap();
     });
-    let started = Instant::now();
     let mut out = [0u32; 3];
     r.read_blocking(&mut out, NOT_EMPTY, NOT_FULL, Some(Duration::from_secs(5)))
         .unwrap();
@@ -384,9 +383,7 @@ fn blocking_rejects_a_request_the_queue_can_never_satisfy() {
     );
 }
 
-/// The writer's `wake` is issued on every successful write, not only when
-/// the ring goes from empty to non-empty: a reader waiting for more than
-/// one element is woken by each write until enough are in.
+/// The writer wakes on every write, not only on empty to non-empty.
 #[test]
 fn reader_waiting_for_several_elements_is_woken_by_each_write() {
     let mut w = MessageQueue::<u8>::create(8, true).unwrap();
@@ -600,8 +597,7 @@ fn attach_ignores_grantors_past_the_event_flag_word() {
     assert_eq!(out, [42]);
 }
 
-/// libfmq's `bufferFd` constructor puts the ring on a second fd; the
-/// counters and the word stay on the first.
+/// libfmq's `bufferFd` constructor: the ring on a second fd, counters and word on the first.
 #[test]
 fn attach_accepts_a_ring_on_a_second_fd() {
     let flags = rustix::fs::MemfdFlags::CLOEXEC | rustix::fs::MemfdFlags::ALLOW_SEALING;
@@ -726,8 +722,7 @@ fn create_allocates_every_page_up_front_and_seals_the_fd() {
     let size = st.st_size as u64;
     assert!(size >= 16 + 3 * 4096 + 100 + 4);
     assert_eq!(size % 4096, 0, "page-rounded like libfmq's ashmem region");
-    // `fallocate` backs every page before any peer touches one, which is
-    // what pins the memory charge to the creating process.
+    // `fallocate` backs every page up front, charging the memory to the creating process.
     assert!(
         st.st_blocks as u64 * 512 >= size,
         "st_blocks {} × 512 < size {size}",
@@ -774,11 +769,11 @@ fn event_flag_outlives_the_queue_and_wakes_across_threads() {
     let waker = flag.clone();
     drop(q);
 
+    let started = Instant::now();
     let t = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(100));
         waker.wake(NOT_EMPTY).unwrap();
     });
-    let started = Instant::now();
     assert_eq!(
         flag.wait(NOT_EMPTY, Some(Duration::from_secs(5))).unwrap(),
         NOT_EMPTY
@@ -830,13 +825,13 @@ fn a_waiter_sees_only_the_bits_of_its_own_mask() {
     let q = MessageQueue::<u8>::create(8, true).unwrap();
     let flag = q.event_flag().unwrap();
     let waker = flag.clone();
+    let started = Instant::now();
     let t = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(60));
         waker.wake(NOT_FULL).unwrap(); // not in the waiter's mask: no wake
         std::thread::sleep(Duration::from_millis(60));
         waker.wake(NOT_EMPTY).unwrap();
     });
-    let started = Instant::now();
     assert_eq!(
         flag.wait(NOT_EMPTY, Some(Duration::from_secs(5))).unwrap(),
         NOT_EMPTY

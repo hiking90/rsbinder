@@ -13,26 +13,21 @@ pub(crate) use rustix::time::Timespec;
 
 use crate::error::{Error, Result};
 
-/// One `mmap` of a grantor's region; unmapped on drop. The mapping starts at
-/// the page below `offset`, and [`ptr`](Self::ptr) points at `offset` itself.
+/// One `mmap` of a grantor's region, from the page below its offset; unmapped on drop.
 pub(crate) struct Mapping {
     base: NonNull<u8>,
     len: usize,
     delta: usize,
 }
 
-// SAFETY: the mapping is a plain address range with no thread affinity.
-// Whether the memory behind it may be touched concurrently is the queue's
-// concern, and it only ever reaches the memory through atomics and copies
-// ordered by them.
+// SAFETY: an address range without thread affinity; users reach it via atomics/ordered copies.
 unsafe impl Send for Mapping {}
 unsafe impl Sync for Mapping {}
 
 impl Mapping {
     /// The first byte of the grantor's region.
     pub(crate) fn ptr(&self) -> NonNull<u8> {
-        // SAFETY: `delta < len` (`map` rejects an empty extent), so the
-        // result stays inside the mapping.
+        // SAFETY: `delta < len` (`map` rejects an empty extent), so this stays in the mapping.
         unsafe { NonNull::new_unchecked(self.base.as_ptr().add(self.delta)) }
     }
 }
@@ -77,9 +72,7 @@ mod imp {
                 // A non-empty extent keeps `delta < len`, which `ptr` relies on.
                 .filter(|_| extent > 0)
                 .ok_or(Error::BadValue("grantor extent exceeds the address space"))?;
-            // SAFETY: a null hint lets the kernel choose the address; `len` is
-            // non-zero; `fd` is open for the call. The region is owned by
-            // this `Mapping` and unmapped exactly once, in `Drop`.
+            // SAFETY: null hint, `len > 0`, `fd` open; this `Mapping` unmaps it once, in `Drop`.
             let raw = unsafe {
                 rustix::mm::mmap(
                     std::ptr::null_mut(),
@@ -97,16 +90,12 @@ mod imp {
 
     impl Drop for Mapping {
         fn drop(&mut self) {
-            // SAFETY: `base`/`len` are exactly what `mmap` returned, and no
-            // pointer derived from them outlives `self` (they are handed out
-            // only under borrows of the owning structure).
+            // SAFETY: `mmap`'s own `base`/`len`; derived pointers live only under owner borrows.
             let _ = unsafe { rustix::mm::munmap(self.base.as_ptr().cast(), self.len) };
         }
     }
 
-    /// A memfd of `total` bytes (rounded up to a page, as libfmq rounds its
-    /// ashmem region), with every page allocated by `fallocate` and sealed
-    /// `GROW | SHRINK | SEAL`.
+    /// A sealed, fully allocated memfd of `total` bytes, page-rounded as libfmq rounds ashmem.
     pub(crate) fn create_shared(total: u64) -> Result<OwnedFd> {
         let page = rustix::param::page_size() as u64;
         let total = total

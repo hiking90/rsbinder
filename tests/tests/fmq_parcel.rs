@@ -31,8 +31,7 @@ where
     back
 }
 
-/// The phantom parameter costs nothing on the wire and is not written: two
-/// instantiations of one generic parcelable produce the same bytes.
+/// The phantom parameter is not written: two instantiations produce the same bytes.
 #[test]
 fn generic_parcelable_round_trips_and_ignores_its_parameter() {
     let value = Tagged::<QueueBundle> {
@@ -56,8 +55,7 @@ fn generic_parcelable_round_trips_and_ignores_its_parameter() {
     );
 }
 
-/// The builtin parcelables are the runtime crate's: a `QueueBundle` holds an
-/// `MQDescriptor` and a `NativeHandle` by those paths and round-trips.
+/// The builtin `MQDescriptor` and `NativeHandle` resolve to the runtime crate's types.
 #[test]
 fn builtin_descriptor_round_trips_inside_a_user_parcelable() {
     let bundle = QueueBundle {
@@ -80,8 +78,7 @@ fn builtin_descriptor_round_trips_inside_a_user_parcelable() {
     assert!(back.extra.fds.is_empty());
 }
 
-/// A real queue's descriptor, as the service would return it: through the
-/// parcel with its fd, then attached to and read from on the other side.
+/// A real queue's descriptor crosses the parcel with its fd, then attaches and reads.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn a_queue_descriptor_survives_the_parcel_and_attaches() {
@@ -110,8 +107,7 @@ fn a_queue_descriptor_survives_the_parcel_and_attaches() {
     assert_eq!(&out, b"fmq");
 }
 
-/// The generated service trait is implementable with the mapped types: this
-/// is the compile check for `openQueue`'s return and `closeQueue`'s argument.
+/// Compile check: the generated trait takes the mapped types in `openQueue` and `closeQueue`.
 struct Demo;
 impl Interface for Demo {}
 impl IFmqDemo for Demo {

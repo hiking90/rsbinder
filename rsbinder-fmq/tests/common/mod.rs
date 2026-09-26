@@ -129,8 +129,7 @@ pub fn spawn(cmd: &mut Command) -> Child {
         .expect("spawn peer")
 }
 
-/// The peer's stdout once it exits; killed and failed if it does not within
-/// the deadline (a wait that never woke).
+/// The peer's stdout once it exits; past the deadline it is killed and the test panics.
 pub fn finish(mut child: Child) -> String {
     use std::io::Read;
     let started = Instant::now();

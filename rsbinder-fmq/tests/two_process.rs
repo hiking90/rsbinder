@@ -60,9 +60,7 @@ fn expected_sum() -> u64 {
     (0..ITEMS).map(u64::from).sum()
 }
 
-/// Parent allocates and writes; child attaches and reads. The ring holds
-/// 64 of the 5000 items, so both sides block and wake each other across
-/// the process boundary many times.
+/// Parent writes, child reads; the ring is far smaller than the stream, so both sides block.
 #[test]
 fn parent_creates_child_reads() {
     if is_child() {
@@ -117,17 +115,14 @@ fn parent_creates_child_reads() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// Child allocates (memfd made in another process, sealed there) and
-/// writes; parent attaches — the seal check crosses the fd's origin — and
-/// reads.
+/// Child allocates and writes; parent attaches, so the seal check sees a foreign memfd.
 #[test]
 fn child_creates_parent_reads() {
     if is_child() {
         let mut sock = child_sock();
         let mut queue = MessageQueue::<u32>::create(CAPACITY, true).expect("create");
         common::send_descriptor(&sock, &queue.descriptor().expect("descriptor"));
-        // Wait for the parent to attach before the first write, as a libfmq
-        // peer's attach would reset the counters.
+        // Wait for the attach before writing: a libfmq peer's attach resets the counters.
         let mut ack = [0u8; 1];
         sock.read_exact(&mut ack).expect("attach ack");
         for v in 0..ITEMS {
@@ -175,10 +170,7 @@ fn child_creates_parent_reads() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// A wait in one process is ended by a wake in another, with nothing else
-/// in flight: the child parks on `NOT_EMPTY` on an empty queue, the parent
-/// waits long enough for it to be asleep, then wakes it through the
-/// `EventFlag` handle alone.
+/// The child parks on `NOT_EMPTY`; the parent wakes it through the `EventFlag` alone, no write.
 #[test]
 fn wake_crosses_the_process_boundary() {
     if is_child() {
@@ -186,8 +178,8 @@ fn wake_crosses_the_process_boundary() {
         let desc = common::recv_descriptor(&sock);
         let queue = MessageQueue::<u8>::attach(&desc, &policy()).expect("attach");
         let flag = queue.event_flag().expect("event flag");
-        sock.write_all(&[1]).expect("ready");
         let started = Instant::now();
+        sock.write_all(&[1]).expect("ready");
         let bits = flag.wait(NOT_EMPTY, WAIT).expect("wait");
         println!(
             "woke bits={bits} after_ms={}",

@@ -50,6 +50,22 @@
 //! size: `MQDescriptor<byte, …>` is `MQDescriptor<i8, …>` and the queue over
 //! it is `MessageQueue<u8>` or `MessageQueue<i8>`; what matters is
 //! `quantum`, which `MessageQueue::attach` checks against `size_of::<T>()`.
+//!
+//! `TryFrom<&MQDescriptor>` duplicates the fds, so the parcelable stays
+//! usable (for example to forward it). It returns `BadValue` when a signed
+//! field is negative or `flags` is not `F`'s flavor; the geometry itself is
+//! checked by [`MessageQueue::attach`](rsbinder_fmq::MessageQueue::attach).
+//! `TryFrom<Descriptor>` takes the descriptor's fds and returns `BadValue`
+//! when the descriptor's flavor is not `F`, or when a value does not fit the
+//! AIDL's signed field (an offset past `i32::MAX`, which no queue libfmq or
+//! `rsbinder-fmq` makes has).
+//!
+//! `rsbinder-fmq`'s `Error` becomes a binder `StatusCode` as follows. A
+//! descriptor or policy check and a corrupted counter are both `BadValue`
+//! (the caller cannot tell a hostile peer from a defective one and treats
+//! both as the end of the queue), a missing EventFlag word or an unsupported
+//! platform is `InvalidOperation`, a wait that ran out is `TimedOut`, and an
+//! OS error keeps its errno.
 
 #[allow(clippy::all, unused_imports, dead_code)]
 pub(crate) mod generated {
@@ -95,12 +111,7 @@ mod convert {
         const FLAVOR: Flavor = Flavor::UnsynchronizedWrite;
     }
 
-    /// `rsbinder-fmq`'s error as a binder status: a descriptor or policy
-    /// check and a corrupted counter are both `BadValue` (the caller cannot
-    /// tell a hostile peer from a defective one and treats both as the end
-    /// of the queue), a missing EventFlag word or an unsupported platform is
-    /// `InvalidOperation`, a wait that ran out is `TimedOut`, and an OS error
-    /// keeps its errno.
+    /// `rsbinder-fmq`'s error as a binder status; the mapping is in the module doc.
     impl From<rsbinder_fmq::Error> for StatusCode {
         fn from(e: rsbinder_fmq::Error) -> Self {
             match e {
@@ -112,17 +123,13 @@ mod convert {
                 }
                 rsbinder_fmq::Error::TimedOut => StatusCode::TimedOut,
                 rsbinder_fmq::Error::Os(errno) => StatusCode::from(errno),
-                // `Error` is `#[non_exhaustive]`: a variant added later has no
-                // better mapping until this arm names it.
+                // `Error` is `#[non_exhaustive]`; a new variant is `Unknown` until named here.
                 _ => StatusCode::Unknown,
             }
         }
     }
 
-    /// The parcelable as a [`Descriptor`], with duplicated fds: the
-    /// parcelable stays usable, for example to forward it. `BadValue` when a
-    /// signed field is negative or `flags` is not `F`'s flavor; the geometry
-    /// itself is checked by [`MessageQueue::attach`](rsbinder_fmq::MessageQueue::attach).
+    /// The parcelable as a [`Descriptor`], with duplicated fds; the checks are in the module doc.
     impl<T, F: FlavorType> TryFrom<&MQDescriptor<T, F>> for Descriptor {
         type Error = StatusCode;
 
@@ -159,10 +166,7 @@ mod convert {
         }
     }
 
-    /// The descriptor as the parcelable to send, taking its fds. `BadValue`
-    /// when the descriptor's flavor is not `F`, or when a value does not fit
-    /// the AIDL's signed field (an offset past `i32::MAX`, which no queue
-    /// libfmq or `rsbinder-fmq` makes has).
+    /// The descriptor as the parcelable to send, taking its fds; the checks are in the module doc.
     impl<T, F: FlavorType> TryFrom<Descriptor> for MQDescriptor<T, F> {
         type Error = StatusCode;
 

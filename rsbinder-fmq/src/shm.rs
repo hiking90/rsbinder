@@ -33,10 +33,7 @@ pub fn is_ashmem_fd(_fd: BorrowedFd<'_>) -> bool {
     false
 }
 
-/// The ashmem device number, the way libcutils `__init_ashmem_rdev` finds
-/// it: Android 11+ init duplicates the node as `/dev/ashmem<boot_id>` (same
-/// major/minor) and means to retire the bare name, so that path is tried
-/// first. Only a success is cached, as libcutils retries on `0`.
+/// The ashmem rdev as libcutils `__init_ashmem_rdev` finds and caches it (boot_id node first).
 #[cfg(target_os = "android")]
 fn ashmem_rdev() -> Option<u64> {
     static RDEV: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -73,9 +70,7 @@ pub fn ashmem_size(fd: BorrowedFd<'_>) -> Result<u64> {
     }
     // `ASHMEM_GET_SIZE` = `_IO(0x77, 4)`; the size is the ioctl's return value.
     const ASHMEM_GET_SIZE: libc::c_ulong = 0x7704;
-    // SAFETY: `fd` was just verified to be an open `/dev/ashmem` fd, and
-    // ASHMEM_GET_SIZE takes no pointer argument (an explicit `0` is passed
-    // so the variadic slot is defined).
+    // SAFETY: `fd` is a verified ashmem fd; the request takes no pointer (`0` fills the vararg).
     let r = unsafe { libc::ioctl(fd.as_raw_fd(), ASHMEM_GET_SIZE as _, 0) };
     if r < 0 {
         return Err(rustix::io::Errno::from_raw_os_error(

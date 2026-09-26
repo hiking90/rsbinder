@@ -37,16 +37,14 @@ pub use fmqinterop::QueueView::QueueView;
 
 /// Longest any blocking operation waits for the other side.
 pub const WAIT: Option<Duration> = Some(Duration::from_secs(10));
-/// Items a traffic leg moves; well past the capacity, so the ring wraps
-/// and both sides block many times.
+/// Items a traffic leg moves; well past the capacity, so the ring wraps and both sides block.
 pub const DEFAULT_COUNT: i32 = 5000;
 pub const DEFAULT_CAPACITY: i32 = 64;
 
 type Desc = MQDescriptor<i32, SynchronizedReadWrite>;
 type FmqResult<T> = std::result::Result<T, FmqError>;
 
-/// A receiver's demands: memfd with `F_SEAL_SHRINK` or an ashmem region,
-/// and the EventFlag word the blocking legs need.
+/// Receiver policy: shrink-sealed memfd or ashmem, plus the EventFlag word the blocking legs need.
 pub fn policy() -> AttachPolicy {
     AttachPolicy {
         max_capacity: 1 << 16,
@@ -74,8 +72,7 @@ pub fn write_all(q: &mut MessageQueue<i32>, count: i32) -> FmqResult<()> {
     Ok(())
 }
 
-/// Read `count` items in chunks of seven, waiting for them. Returns their
-/// sum and whether they arrived as `0..count`.
+/// Read `count` items in chunks of seven; returns their sum and whether they came as `0..count`.
 pub fn read_all(q: &mut MessageQueue<i32>, count: i32) -> FmqResult<(i64, bool)> {
     let mut next = 0i32;
     let mut sum = 0i64;
@@ -182,8 +179,7 @@ impl IFmqPeer for Peer {
     }
 }
 
-/// Publish a `Peer` as `name` on the kernel binder and serve it; returns
-/// only when the loop ends.
+/// Publish a `Peer` as `name` on the kernel binder and serve it until the loop ends.
 pub fn serve(name: &str) -> Result<()> {
     let peer = BnFmqPeer::new_binder(Peer::default());
     let server = rsbinder::serve("binder://")?.add(name, Interface::as_binder(&peer))?;
@@ -195,8 +191,7 @@ pub fn serve(name: &str) -> Result<()> {
 
 // ---- the driver -----------------------------------------------------------
 
-/// A proxy for the peer `name`, refused when the name resolves to a
-/// binder of this process.
+/// A proxy for the peer `name`; refused when the name resolves to this process's binder.
 pub fn connect(name: &str) -> Result<Strong<dyn IFmqPeer>> {
     let binder = rsbinder::Client::open("binder://")
         .and_then(|_| hub::check_service(name).ok_or(StatusCode::NameNotFound))?;
@@ -221,11 +216,9 @@ fn word(ok: bool) -> &'static str {
     }
 }
 
-/// The two traffic legs over an attached queue: the peer produces while
-/// we read, then we write while the peer consumes. Returns `(in, out)`.
+/// Peer produces while we read, then we write while it consumes. Returns `(in, out)`.
 fn traffic(peer: &Strong<dyn IFmqPeer>, q: &mut MessageQueue<i32>, count: i32) -> (bool, bool) {
-    // The service's half of each leg blocks in its handler, so it runs
-    // on a thread of ours while this thread does the local half.
+    // The service's half blocks in its handler, so it runs on a thread while we do ours.
     let remote = peer.clone();
     let producer = thread::spawn(move || remote.r#produce(count));
     let inbound = match read_all(q, count) {
@@ -287,9 +280,7 @@ pub fn server_queue(peer: &Strong<dyn IFmqPeer>, count: i32, capacity: i32) -> O
     }
 }
 
-/// We make the queue; its descriptor goes out as an argument. Nothing is
-/// written before `adopt` returns: a libfmq peer resets the counters when
-/// it attaches.
+/// We make the queue and send it as an argument; nothing is written before `adopt` (libfmq resets).
 pub fn client_queue(peer: &Strong<dyn IFmqPeer>, count: i32, capacity: i32) -> Outcome {
     let (mut q, desc) = match make_queue(capacity) {
         Ok(pair) => pair,
@@ -326,8 +317,7 @@ fn make_queue(capacity: i32) -> Result<(MessageQueue<i32>, Desc)> {
     Ok((q, desc))
 }
 
-/// The queue's two counters, reached through a mapping of our own, the
-/// way a hostile peer would reach them.
+/// The queue's two counters, through a mapping of our own, as a hostile peer would reach them.
 struct Counters {
     base: *mut u8,
     len: usize,
@@ -353,8 +343,7 @@ impl Counters {
     }
 
     fn set(&self, read: u64, write: u64) {
-        // SAFETY: offsets 0 and 8 of the layout `create` made, inside the
-        // mapping.
+        // SAFETY: offsets 0 and 8 of the layout `create` made, inside the mapping.
         unsafe {
             (*self.base.cast::<AtomicU64>()).store(read, Ordering::SeqCst);
             (*self.base.add(8).cast::<AtomicU64>()).store(write, Ordering::SeqCst);
@@ -369,11 +358,7 @@ impl Drop for Counters {
     }
 }
 
-/// S4: we make the queue, the peer adopts it, and we damage the counters
-/// one way at a time, asking the peer what its library reports after
-/// each. Nothing about the report is asserted beyond the call returning:
-/// the point is to record how the other library answers a ring that
-/// breaks its invariants. One line per damage.
+/// S4: damage our queue's counters one way at a time; records the peer's answer, asserts none.
 pub fn corrupt(peer: &Strong<dyn IFmqPeer>, capacity: i32) -> Vec<Outcome> {
     let fail = |what: &str, e: &dyn std::fmt::Debug| {
         vec![Outcome {
