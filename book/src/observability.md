@@ -10,7 +10,7 @@ Three pieces tell you what a binder service is doing and for whom:
 
 None of them changes the wire format. The work source rides in a field every
 kernel binder request header already has; names and observers are local to
-the process. All three are new in 0.13.0.
+the process. All three are new in 0.12.0.
 
 ## Work source
 
@@ -197,7 +197,7 @@ of a span called `aidl` (target `rsbinder::aidl`, level `TRACE`).
 
 ```toml
 [dependencies]
-rsbinder = { version = "0.13", features = ["tracing"] }
+rsbinder = { version = "0.12", features = ["tracing"] }
 ```
 
 ```rust

@@ -194,6 +194,7 @@ Complete API parity is not a goal — rsbinder's architecture differs from `libb
 - [x] Shared memory (`IMemory` / `MemoryHeapBase` / `MemoryDealer`).
 - [x] Interface macros — `#[rsbinder::interface]` without `.aidl`.
 - [x] Parcel data serialization (`to_bytes` / `from_bytes`).
+- [x] Fast Message Queue (`rsbinder-fmq`, `rsbinder::fmq`).
 - [x] Streaming with back-pressure (`rsbinder::stream`).
 
 **RPC transport**

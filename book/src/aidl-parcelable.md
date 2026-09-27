@@ -284,9 +284,10 @@ every use site: `@FixedSize T` accepts a primitive, an enum, or a `@FixedSize`
 parcelable or union (`MQDescriptor<byte, …>` compiles, `MQDescriptor<String, …>`
 does not; a generic instantiation such as `Elem<int>` never qualifies, as in
 AOSP), and `@VintfStability T` accepts only a `@VintfStability` declaration.
-The Java-only `@JavaPassthrough` and `@JavaSuppressLint` are accepted there,
-as AOSP accepts them, and ignored. The argument count must match the
-declaration.
+Any other annotation on a parameter is a requirement no argument meets: the
+Java-only `@JavaPassthrough` and `@JavaSuppressLint` parse on the declaration,
+as in AOSP, but every use of such a generic is rejected. The argument count
+must match the declaration.
 
 The generator rejects, with a diagnostic naming the reason:
 

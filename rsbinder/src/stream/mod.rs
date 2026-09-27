@@ -118,8 +118,9 @@
 //! than letting the first batch fail. A peer's death is a session that
 //! ends.
 //!
-//! Which one a stream gets is the consumer's peer: a kernel proxy or a
-//! local object makes a ring, an RPC proxy makes a sink-only endpoint.
+//! Which one a stream gets is the consumer's peer: a kernel proxy makes a
+//! ring, and so does a local object on Linux and Android; an RPC proxy
+//! makes a sink-only endpoint, and so does a local object elsewhere.
 //! [`Sink::open`] follows whichever the endpoint carries.
 //!
 //! # What the two have in common
@@ -1056,12 +1057,13 @@ impl<T: Deserialize> Receiver<T> {
     /// `peer` is a binder in the producer's process — the service about
     /// to be called, or the binder an uploading client passed (see the
     /// [module docs](self#the-endpoint-and-the-call-that-opens-a-stream)).
-    /// It picks the transport: a kernel proxy or a local object makes a
-    /// ring endpoint, an RPC proxy a sink-only one. And it is watched for
-    /// death, so a producer that dies releases a consumer blocked in
-    /// [`recv`](Self::recv); a `peer` that is not in the producer's
-    /// process leaves that death unseen, and a local object is not
-    /// watched at all.
+    /// It picks the transport: a kernel proxy makes a ring endpoint, and so
+    /// does a local object on Linux and Android; an RPC proxy makes a
+    /// sink-only one, and so does a local object elsewhere. And it is
+    /// watched for death, so a producer that dies releases a consumer
+    /// blocked in [`recv`](Self::recv); a `peer` that is not in the
+    /// producer's process leaves that death unseen, and a local object is
+    /// not watched at all.
     ///
     /// Pass the endpoint to the method that starts the stream — declared
     /// in `.aidl` as `rsbinder.stream.StreamEndpoint`.
@@ -1220,14 +1222,18 @@ impl<T: Deserialize> Receiver<T> {
 
     /// How the producer ended the stream, once it has.
     ///
-    /// `None` while the stream is still running. After it ends this is
+    /// `None` until the end has been read: a death notice or terminator
+    /// that lands while items remain is not yet the end, and those items
+    /// come out of [`recv`](Self::recv) first. After it ends this is
     /// the status the stream ended on: the one passed to [`Sink::end`] or
     /// [`Sink::end_with`] (`Status::ok()` for a stream that ran out),
     /// except: `EX_ILLEGAL_STATE` when the producer lost queued items or
     /// dropped its [`Sink`] without ending (the message says how many
     /// items were not sent, possibly zero), `EX_ILLEGAL_ARGUMENT` when
     /// [`Sink::end_with`] was given a status the wire cannot carry,
-    /// [`StatusCode::DeadObject`] when the producer died, and the
+    /// [`StatusCode::DeadObject`] when the producer died before its end
+    /// reached this side (an end record already in the ring, or an
+    /// `onEnd` already received, is the end instead), and the
     /// transport's own error when this side refused what it read or could
     /// not wait or grant.
     pub fn end_status(&self) -> Option<Status> {

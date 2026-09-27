@@ -17,7 +17,7 @@ what it is not for:
 | Bytes — a file, a log, a media stream | [`ParcelFileDescriptor::pipe`](./parcel-file-descriptor.md) | The kernel already does back-pressure on a pipe |
 | A large buffer both sides read in place | [Shared memory](./shared-memory.md) | No copy at all |
 
-New in 0.13.0. The same two types run over kernel binder and over
+New in 0.12.0. The same two types run over kernel binder and over
 [RPC](./rpc-transport.md), on different wires: over kernel binder the items
 travel on a shared-memory **ring** the consumer allocates, over RPC as `oneway`
 batches paced by **credit** — see [What is on the wire](#what-is-on-the-wire).
@@ -85,10 +85,20 @@ for line in &mut lines {
 ```
 
 The peer decides two things: which transport the stream runs on (a kernel
-proxy or a local object makes a ring endpoint, an RPC proxy a sink-only one)
-and whom the consumer watches for death. Because the opening call is `twoway`,
+proxy makes a ring endpoint, and so does a local object on Linux and Android;
+an RPC proxy makes a sink-only one, and so does a local object elsewhere) and
+whom the consumer watches for death. Because the opening call is `twoway`,
 a refusal — the transport cannot carry the stream, the ring is larger than the
-producer accepts — comes back as that call's error.
+producer accepts, SELinux denies the mapping — comes back as that call's error.
+
+On Android the default SELinux policy grants `memfd_file` access only on a
+domain's own memfds, and the ring is the consumer's memfd, which the producer
+checks, reads and writes. A producer in another domain therefore needs
+`memfd_file { getattr read write map }` on the consumer's domain, besides the
+`fd use` any descriptor passed between the two needs — a platform service that
+streams to apps carries
+`allow <service> appdomain:memfd_file { getattr read write map };` in its own
+`.te` — or `Sink::open` fails with `EACCES`.
 
 When the **client is the producer** — an upload — the direction of the call
 flips: the client passes a binder of its own (or a `stream::Token` made for the
@@ -106,6 +116,11 @@ let endpoint = service.r#upload(&token.binder())?;
 let mut sink = Sink::<Chunk>::open(&endpoint)?;
 // ... keep `token` alive for as long as the stream runs.
 ```
+
+Either way the endpoint crosses in the reply or the arguments of one `twoway`
+call. A service that wants to start a stream from a `oneway` callback — an
+event it pushes to the client — has no reply to carry the endpoint, so the
+consumer needs one more `twoway` call to hand it over.
 
 `Receiver<T>` is an `Iterator<Item = BinderResult<T>>` that ends when the
 producer does; `recv`, `try_recv` and `recv_timeout` are the same thing one item
@@ -281,7 +296,9 @@ sink.end_with(&rsbinder::Status::new_service_specific_error(
 On the other side the iterator yields that `Status` as its last `Err`, with the
 [service-specific code](./error-handling.md#service-specific-errors) and message
 intact, and then ends. `Receiver::end_status()` has the final status afterwards,
-including a clean one. On the ring the message is cut to what the end reserve
+including a clean one, and is `None` until the end has been read: a death
+notice or terminator that lands while items remain is not yet the end, and
+those items come out first. On the ring the message is cut to what the end reserve
 holds (244 bytes).
 
 Call `end` on every path. A `Sink` that is dropped without it still ends the
@@ -297,10 +314,13 @@ waiting for room is given up.
 `Receiver::cancel()` tells the producer to stop, and dropping the receiver sends
 it for you. A parked producer is released; its `send` returns
 `StatusCode::InvalidOperation` and `Sink::is_canceled()` is what tells that apart
-from a transport problem. On the ring the producer sees the cancel before its
-next write, or in the wait it is parked in; over RPC a cancel made before the
-producer has introduced itself is held and delivered the moment `onStart`
-arrives.
+from a transport problem. From then on every `send` returns it at once without
+taking the item, on both paths. `end` still sends the terminator it was given,
+without reporting a loss: over RPC the items still queued are dropped. On the
+ring the producer sees the cancel before
+its next write, or in the wait it is parked in; over RPC a cancel made before
+the producer has introduced itself is held and delivered the moment `onStart`
+arrives, and the producer sees it at its next `send`.
 
 Back-pressure means that most of the time neither side has a call in flight, so
 nothing would fail by itself if the other process went away. Each end therefore
@@ -310,6 +330,13 @@ the peer it was made against: a producer parked for room or credit gets
 same error as the stream's last item. A peer that is not in the producer's
 process leaves the producer's death unseen, and a local object is not watched
 at all. Over RPC, a session that ends is a death in the same sense.
+
+Death does not take back what already arrived: the consumer reads every item
+already in the ring or in a delivered batch before it sees the death, and an
+end that reached it first — an end record already in the ring, an `onEnd`
+already received — is the end the stream reports, not `DeadObject`. Once the
+producer knows the consumer is dead, every `send` returns `DeadObject` at once
+without taking the item, on both paths, and so does `end`.
 
 ## Async
 
@@ -367,20 +394,28 @@ queued is reported lost.
 
 Each end calls the other from outside any handler — the producer sends batches
 from a thread of its own, the consumer sends grants and `cancel` — and each end
-watches the other for death. A default RPC session can do neither toward the
+watches the other for death. Even the producer's `onStart`, sent from inside
+the handler of a download, is `oneway` and so never rides the connection the
+request came in on. A default RPC session can do none of this toward the
 client: nothing on the client reads its connection except inside its own calls.
-The client has to open an **incoming connection** — see
+The client has to open an **incoming connection**, which takes the android-13+
+profile — see
 [Callbacks outside a handler](./rpc-transport.md#callbacks-outside-a-handler):
 
 ```rust
-let client = rsbinder::Client::open_with(uri, |o, _| o.incoming_connections = Some(1))?;
+let client = rsbinder::Client::open_with(
+    "unix:///run/demo.sock?profile=android13plus",
+    |o, _| o.incoming_connections = Some(1),
+)?;
 ```
 
 Without one, the client's end refuses with `StatusCode::InvalidOperation`
 before any call is made — `Receiver::new` when the client consumes,
 `Sink::open` when it produces — and logs which option is missing. `Client::caps()` reports
 `TransportCaps::CALLBACKS` when the session can carry a stream. A session with
-incoming connections has to be ended with `close_session()`.
+incoming connections has to be ended explicitly, with
+`client.session().unwrap().close_session()`: its serving threads keep it
+alive after every handle is dropped.
 
 One more thing to size: the consumer's grants go out on the session's *outgoing*
 connections, and a grant waits for a free one. A client that keeps its only
@@ -442,7 +477,12 @@ A Java peer is out of scope: AOSP has no Java FMQ.
 Compile the three `.aidl` files from `rsbinder/aidl/stream/` with the
 platform's `aidl` — `StreamEndpoint.aidl` imports
 `android.hardware.common.fmq.MQDescriptor`, so the platform's FMQ AIDL has to be
-on the include path — and implement the side you need. Which wire you have to
+on the include path — and implement the side you need. The SDK build-tools
+`aidl` does not parse the `@FixedSize T` in the current FMQ files; include the
+frozen V1 API instead
+(`hardware/interfaces/common/fmq/aidl/aidl_api/android.hardware.common.fmq/1`
+and `hardware/interfaces/common/aidl/aidl_api/android.hardware.common/1`),
+which has the same wire. Which wire you have to
 speak is decided by the endpoint you receive or make: a `ring` on kernel
 binder, a `sink` alone over RPC.
 
@@ -455,7 +495,21 @@ keeps the last 256 bytes free of item records so the end record always fits,
 and waits with the mask `NOT_FULL | CANCEL` rather than `writeBlocking`, which
 would not see the cancel. A consumer making the endpoint allocates the ring
 itself and puts a binder in `sink` for the producer to link to for death; no
-`IStreamSink` method is called on it.
+`IStreamSink` method is called on it. What else a `libfmq` peer must do, with
+the details in `StreamEndpoint.aidl`:
+
+- Attach with `AidlMessageQueue(desc, /*resetPointers=*/false)`: the other end
+  may already have written.
+- Wake the other side after every read and every write, as `libfmq` itself
+  does, not only on a full-to-not-full change: a waiter may need room for more
+  than one record.
+- As the producer, load `getEventFlagWord()` before each item record and stop
+  on `CANCEL` (`libfmq` has no peek), and remember a cancel your wait returned:
+  the wait consumes the bit.
+- Treat the ring as the other process's memory. A producer applies the checks
+  rsbinder applies before it maps (a memfd sealed against shrinking or an
+  ashmem region, an EventFlag word, a size bound, a capacity above 260 bytes);
+  a consumer checks each record's length against the ring before reading it.
 
 An NDK peer cannot link `libfmq` — it is not part of the NDK, and the device's
 `libfmq.so` is built against the platform's C++ library rather than the NDK's.
@@ -471,11 +525,16 @@ rsbinder makes, create a sealed memfd, the counters, the EventFlag futex), and
 until `onUnlinked`, so the stream may be closed at any time. Each header has two
 C++ templates that convert to and from the NDK backend's generated
 `MQDescriptor` and `StreamEndpoint`.
-`example-hello/cpp/stream_interop.cpp` is a complete client for both
-directions, and `run_stream_interop.sh` runs it against rsbinder on an
-emulator.
+`example-hello/cpp/stream_interop.cpp` is a complete client on the two headers
+for both directions, `example-hello/cpp/stream_libfmq_interop.cpp` the same
+client with its ring on `libfmq`, and `run_stream_interop.sh` runs both against
+rsbinder on an emulator.
 
-**Over RPC** the contract is the two interfaces:
+**Over RPC** the contract is the two interfaces, and the client opens incoming
+connections as [above](#over-rpc) (libbinder's
+`ARpcSession_setMaxIncomingThreads`). `example-hello/cpp/stream_rpc_interop.cpp`
+implements both ends on the device's libbinder `RpcSession`, and
+`run_stream_rpc_interop.sh` runs it against rsbinder:
 
 - **As the consumer**, implement `IStreamSink`. In `onStart`, turn the binder
   into the interface (`IStreamSource::asInterface`,
@@ -497,8 +556,12 @@ emulator.
   starts at zero waits for a grant that nothing can trigger — and it ends the
   stream on a batch sent beyond the stated window plus its grants, or on a
   window wider than it accepts (4 unless it was made with a larger
-  `ReceiverPolicy::max_opening`). If an `onBatch` fails in a way that does not
-  tell you whether it arrived, stop sending batches and send `onEnd`: you no
-  longer know how much credit you have.
+  `ReceiverPolicy::max_opening`). A batch sent before `onStart` has no credit
+  and ends the stream with `EX_ILLEGAL_STATE`, a negative `count` with
+  `EX_ILLEGAL_ARGUMENT`. An rsbinder consumer sends `cancel` when its receiver
+  is dropped, also after a clean end, so ignore a `cancel` that arrives after
+  your `onEnd`. If an `onBatch` fails in a way that does not tell you whether
+  it arrived, stop sending batches and send `onEnd`: you no longer know how
+  much credit you have.
   `onEnd`'s three arguments are the fields of a `binder::Status`; `-129`, `-127`
   and `-128` are never sent.

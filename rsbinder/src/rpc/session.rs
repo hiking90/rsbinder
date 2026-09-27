@@ -60,7 +60,7 @@ enum RpcUnixAddr<'a> {
 /// transport: [`RpcClientConfig::unix`] and
 /// `RpcClientConfig::unix_abstract` (Linux/Android) replace the two constructors here.
 #[deprecated(
-    since = "0.13.0",
+    since = "0.12.0",
     note = "use `RpcClientConfig::unix`/`unix_abstract`, which carry the same knobs on every transport"
 )]
 pub struct RpcUnixClientConfig<'a> {
@@ -4980,7 +4980,7 @@ impl RpcSession {
     /// `confirm_attach`) — a refused attach is an error here, not a
     /// session whose every call fails.
     #[deprecated(
-        since = "0.13.0",
+        since = "0.12.0",
         note = "use `setup_client_android13plus_with_config(RpcClientConfig::unix(path, v).session_id(id))`"
     )]
     #[allow(deprecated)]
@@ -4996,7 +4996,7 @@ impl RpcSession {
 
     /// Client: connect to a Unix-domain android-13+ server using a config object.
     #[deprecated(
-        since = "0.13.0",
+        since = "0.12.0",
         note = "use `setup_client_android13plus_with_config` with `RpcClientConfig::unix`/`unix_abstract`"
     )]
     #[allow(deprecated)]
@@ -5133,7 +5133,7 @@ impl RpcSession {
     /// pool stays at one slot ⇒ `find_conn` is byte-identical to the
     /// `enter_connection` path.
     #[deprecated(
-        since = "0.13.0",
+        since = "0.12.0",
         note = "use `add_outgoing_connection_with_config(RpcClientConfig::unix(path, v).session_id(id))`"
     )]
     pub fn add_outgoing_connection_android13plus(
@@ -5151,7 +5151,7 @@ impl RpcSession {
     /// [manual attach](RpcClientConfig#manual-attach) rule except that a
     /// session `timeout` is ignored rather than refused.
     #[deprecated(
-        since = "0.13.0",
+        since = "0.12.0",
         note = "use `add_outgoing_connection_with_config` with a `RpcClientConfig`"
     )]
     #[allow(deprecated)]
@@ -5304,7 +5304,7 @@ impl RpcSession {
     /// (its callback-slot budget, `2 * set_max_threads`, is spent)
     /// surfaces as a handshake error.
     #[deprecated(
-        since = "0.13.0",
+        since = "0.12.0",
         note = "use `add_incoming_connection_with_config` with a `RpcClientConfig`"
     )]
     #[allow(deprecated)]
@@ -5462,7 +5462,7 @@ impl RpcSession {
     /// manual `add_outgoing_connection_android13plus` loop and tolerate
     /// per-extra failures.
     #[deprecated(
-        since = "0.13.0",
+        since = "0.12.0",
         note = "use `setup_client_android13plus_with_config(RpcClientConfig::unix(path, v).outgoing_connections(n))`"
     )]
     pub fn setup_unix_client_android13plus_fan_out(

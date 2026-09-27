@@ -276,7 +276,7 @@ let session = RpcSession::setup_client_android13plus_with_config(
 
 The Unix-only predecessor `RpcUnixClientConfig`, and the
 `setup_unix_client_android13plus_{with_config,with_id,fan_out}` helpers,
-are deprecated since 0.13.0 and will be removed in the release after it.
+are deprecated since 0.12.0 and will be removed in the release after it.
 
 > **The id you echo must come from `RpcSession::get_session_id()`** — one
 > round trip that asks the server for it. `RpcSession::session_id()` is a

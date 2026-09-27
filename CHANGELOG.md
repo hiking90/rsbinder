@@ -13,287 +13,209 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ## [Unreleased]
 
+## [0.12.0] - Unreleased
+
+### Migrating from 0.11.0
+
+- **`Endpoint::Kernel` gained an `mmap_size` field** (see *Added*). It is not
+  `#[non_exhaustive]`, so a struct literal or a `match` arm naming every field
+  no longer compiles; add `mmap_size: None` for the previous behavior. Matching
+  with `..` and endpoints obtained from `serve` / `Client::open` are unaffected.
+- **A kernel option `serve` / `Client::open` cannot honor is now `BadValue`.**
+  `binder://?threads=`, `?driver=`, `ServeOptions::threads` and
+  `ClientOptions::driver` are fixed by whoever initializes `ProcessState`
+  first; a later *different* value used to log a warning and now returns
+  `StatusCode::BadValue` (omitting it or repeating the value still works).
+  Likewise `ClientOptions::driver` / `mmap_size` must agree with the URI's
+  `?driver=` / `?mmap=`.
+- **An RPC session refuses a connection whose transport differs from its
+  founding one** (fd passing or local peer) with `BadType` at attach. Only
+  hand-assembled sessions (e.g. `RpcServer::serve_connection`) can hit this.
+- **`StatusCode::from(ExceptionCode::ServiceSpecific)` is
+  `ServiceSpecific(0)`, not `Ok`**, as in AOSP; `StatusCode::from(status)` for
+  such a `Status` now yields `ServiceSpecific(0)`, not `FailedTransaction`.
+- **`rsbinder-aidl` now rejects `.aidl` that AOSP's `aidl` also rejects** (see
+  *Added*). An rsbinder-only contract relying on the missing validation now
+  fails, with a diagnostic naming the rule.
+- **`render::ConstMember` and `render::EnumMember` gained a trailing
+  deprecation element**; pass `String::new()` to keep the previous output. The
+  `#[non_exhaustive]` render structs' new `deprecated` field needs no change.
+- **`error::SemanticError` is now `#[non_exhaustive]`** and gained
+  `FixedSizeNonFixedField` and `VintfStabilityLeak`; add a `_ => …` arm.
+- **A declaration nested in a `@VintfStability` type is now VINTF-stable** (see
+  *Fixed*): a `ParcelableHolder` records VINTF stability for it, and
+  `ParcelableHolder::set_parcelable` returns `BadValue` for a payload without
+  VINTF stability. Nothing in the build warns.
+- **`#[deprecated]` codegen can break a downstream `-D warnings` build**: an
+  existing `/** @deprecated … */` javadoc now generates `#[deprecated]`. Drop
+  the tag, or allow the lint at the call site.
+- **`#[rsbinder::interface]` and the derives now refuse shapes `.aidl` cannot
+  express**, so moving an interface to `.aidl` stays a no-op. The diagnostic
+  names the `.aidl` form to use instead. Refused: directions and nullability
+  AIDL lacks (`out String`, `Option<i32>`, a bare `out` binder or fd); `in`
+  spellings `.aidl` never renders (`&String`, `&Vec<T>`, `&i32`, a by-value
+  `String` or binder); array-element `Option`s spelled the other way
+  (`&mut Vec<Option<Cfg>>`, `Option<&[String]>`) and `i8` in an array element;
+  scalars AIDL has no type for (`u32`, `u64`, `usize`, `u128`, `char`); and
+  other shapes such as `BinderResult<T, E>`, `()` or `&mut [T]` arguments,
+  duplicate names, receiver attributes, an empty `descriptor`, and on
+  `#[derive(Parcelable)]` a bare binder or fd field.
+- **The `tokio` feature no longer enables `tokio/full`**, only `tokio/rt` and
+  `tokio/rt-multi-thread`. A crate that received `tokio/net`, `time`,
+  `signal`, `fs`, `io-util` or `macros` through rsbinder must declare them in
+  its own `Cargo.toml`.
+- **`BinderAsyncRuntime for TokioRuntime<Runtime>` and
+  `for TokioRuntime<Arc<Runtime>>` are gone** (an owned runtime in a binder
+  panics in `Runtime::drop` when the last `Strong` drops on a worker). Wrap
+  `runtime.handle().clone()` in `TokioRuntime<Handle>` instead.
+- **A kernel transaction dispatched inside an RPC handler now reports the
+  kernel caller**: `calling_caller()`, `get_calling_uid()` / `pid()` / `sid()`
+  and `CallingContext::default()` return `Caller::Kernel` and the kernel
+  sender's values, not the suspended RPC peer's. Re-check handlers that pick
+  an authorization rule by `match`ing on the `Caller` arm.
+- **Outside a transaction `get_calling_uid()` / `get_calling_pid()` return
+  this process's own uid and pid** instead of `0` (root), as AOSP's
+  `IPCThreadState` does. Inside a transaction nothing changes.
+- **RPC `link_to_death` (and `death_signal`) is refused with
+  `InvalidOperation` on a session that would not notice its connection
+  dropping** (a client with no incoming connections and no serve loop). Open
+  incoming connections (`incoming_connections(n)`), or call the new
+  `RpcSession::spawn_serve` before linking; the server side is unaffected.
+- **A `oneway` call made inside an RPC handler needs a connection this end
+  opened** (see *Fixed*); without one it is `WouldBlock`, so a server's oneway
+  callback needs the client's incoming connections. Twoway is unchanged.
+- **`RpcServer::setup_unix_server` removes only a stale socket**: a regular
+  file is refused with `AlreadyExists`, a listening socket with `EADDRINUSE`.
+  Drop removes the socket file only while it is still the one bound.
+- **A kernel `Client::get` / `connect` reports the service manager's own
+  failure** instead of `NameNotFound` when it cannot be reached, and `hub`
+  logs why once.
+- **`ServerGuard` and `Server` are `#[must_use]`**: `serve(uri)?.spawn()?;`
+  stopped an RPC server at once. Bind the guard to a named variable.
+- **`rsbinder-aidl` parser API: `ParcelableDecl::type_params` and
+  `UnionDecl::type_params` are `Vec<TypeParam>`** (name, span, annotations)
+  instead of `Vec<String>`; read `TypeParam::name`. New `Generic::type_args()`
+  returns a `Foo<A, B>` reference's arguments as written.
+- **Several RPC client setup calls are deprecated** in favor of
+  `RpcClientConfig` (see *Deprecated*); they still work, but `-D warnings`
+  flags them.
+
 ### Added
 
 - **Generic parcelables** (`rsbinder-aidl`): `parcelable Foo<T, U> { … }`
-  generates `pub struct Foo<T, U>` with a `pub _phantom_T` /
-  `_phantom_U: PhantomData` field per parameter and generic `Default`,
-  `Parcelable`, `Serialize`/`Deserialize` and `ParcelableMetadata` impls, as
-  AOSP's Rust backend does. A parameter may carry a requirement on its
-  argument — `parcelable MQDescriptor<@FixedSize T, Flavor>` — and a use site
-  (`MQDescriptor<byte, SynchronizedReadWrite>`) is checked against the
-  declaration: argument count, `@FixedSize` (AOSP `CanBeFixedSize`) and
-  `@VintfStability`. The arguments are carried on the Rust path everywhere the
-  type appears (field, argument, return, array and `List` element, nested).
-  Rejected with a diagnostic: a field whose type is a parameter (nothing would
-  be written for it), a generic `union` (no Rust form), a nested declaration
-  inside a generic parcelable (AOSP's rule), a parameter named like something
-  the generated Rust spells unqualified (a keyword, `String`, `Vec`, a
-  primitive, the `rsbinder` crate, the parcelable itself), a generic
-  `rust_type` parcelable, an array, `List` or `void` as an argument, an
-  annotation on an argument, and any annotation other than the four AOSP
-  admits on a parameter (`@FixedSize`, `@VintfStability`, and the Java-only
-  `@JavaPassthrough`/`@JavaSuppressLint`). As in AOSP, every parameter
-  annotation is a requirement on the argument, and the Java-only two can
-  never be met, so a generic declared with one parses but every use of it is
-  rejected.
-  `impl_serialize_for_parcelable!` and `impl_deserialize_for_parcelable!`
+  generates `pub struct Foo<T, U>` with a `_phantom_T: PhantomData` field per
+  parameter, as AOSP does. Parameter requirements
+  (`MQDescriptor<@FixedSize T, Flavor>`) are checked at each use site; shapes
+  with no Rust or AOSP form (a field typed as a parameter, a generic `union`,
+  reserved names, …) are rejected. `impl_{serialize,deserialize}_for_parcelable!`
   accept `Foo<T, U>`.
-- **Builtin `android.hardware.common` types** (`rsbinder-aidl` + `rsbinder`):
-  an `.aidl` that imports `android.hardware.common.fmq.MQDescriptor`,
-  `GrantorDescriptor`, `SynchronizedReadWrite`, `UnsynchronizedWrite` or
-  `android.hardware.common.NativeHandle` compiles without a vendored copy; the
-  generated code names `rsbinder::fmq::*` and `rsbinder::NativeHandle`, which
-  `rsbinder` compiles once from the AOSP sources (`hardware/interfaces`,
-  `android17-release`). A copy found under an include directory still takes
-  precedence and is compiled like any other source.
-- **`rsbinder::fmq`**: the `MQDescriptor` family on every platform, plus, on
-  Linux and Android, `rsbinder-fmq` re-exported and the two conversions that
-  join them — `Descriptor: TryFrom<&MQDescriptor<T, F>>` (duplicates the fds)
-  and `MQDescriptor<T, F>: TryFrom<Descriptor>` (takes them) — and
-  `StatusCode: From<rsbinder_fmq::Error>` (`BadValue`/`Corrupted` →
-  `BadValue`, `NoEventFlag`/`Unsupported` → `InvalidOperation`, `TimedOut` →
-  `TimedOut`, `Os(errno)` → the errno's status).
+- **Builtin `android.hardware.common` types**: importing
+  `android.hardware.common.fmq.{MQDescriptor, GrantorDescriptor,
+  SynchronizedReadWrite, UnsynchronizedWrite}` or
+  `android.hardware.common.NativeHandle` needs no vendored copy; the generated
+  code names `rsbinder::fmq::*` / `rsbinder::NativeHandle`.
+- **`rsbinder::fmq`**: the `MQDescriptor` family, `rsbinder-fmq` re-exported,
+  `TryFrom` conversions between `Descriptor` and `MQDescriptor<T, F>`, and
+  `StatusCode: From<rsbinder_fmq::Error>`, on every platform; making or
+  attaching a queue works on Linux and Android.
 - **New crate `rsbinder-fmq`**: Android's Fast Message Queue (`libfmq`) in
-  Rust — the shared-memory ring with two 64-bit counters and a futex
-  EventFlag word, laid out and driven exactly as `system/libfmq` does, so one
-  end can be C++ on a device and the other this crate. It does not depend on
-  binder: `MessageQueue<T>::create` allocates a sealed, pre-faulted memfd,
-  `descriptor()` yields the fds and grantors an AIDL `MQDescriptor` carries,
-  and `attach` maps a peer's descriptor after checking it against an
-  `AttachPolicy` (largest ring, seals, EventFlag word) plus libfmq's own
-  rules. `SynchronizedReadWrite` flavor, primitive elements, blocking
-  `write_blocking`/`read_blocking` with libfmq's `NOT_FULL`/`NOT_EMPTY` bits,
-  and a clone-able `EventFlag` handle that outlives the queue. Linux and
-  Android; elsewhere it compiles and every constructor returns
-  `Unsupported`. Verified against AOSP's own `MessageQueueBase` running on
-  the host (`rsbinder-fmq/tests/cpp`), and, with the descriptor carried by
-  binder, against libfmq's `AidlMessageQueue` over libbinder_ndk on an
-  Android 16 emulator in both directions — a queue rsbinder made (sealed
-  memfd) attached by libfmq, a queue libfmq made (ashmem, no seals) attached
-  by rsbinder, 5000 items each way over the blocking operations
-  (`example-hello/cpp/run_fmq_interop.sh`; the rsbinder-to-rsbinder half of
-  the same fixture over the kernel driver is `tests/tests/fmq_binder.rs`).
-  `rsbinder` uses the crate's ashmem detection for its shared-memory code.
-- **C reference headers for an NDK peer** (header-only, C11, usable from
-  C++): `rsbinder-fmq/c/rsbinder_fmq.h` is the synchronized FMQ — attach with
-  the checks `rsbinder-fmq` makes, create a sealed memfd, the counters and the
-  EventFlag futex — and `contrib/ndk/rsbinder_stream.h` is the kernel-binder
-  stream's record layer on it (`rsbs_send`/`rsbs_end` for a producer,
-  `rsbs_recv`/`rsbs_cancel` for a consumer, and `rsbs_on_binder_died`/
-  `rsbs_on_unlinked` with a per-stream cookie for an `AIBinder_DeathRecipient`,
-  whose reference keeps what a late death callback touches mapped after the
-  stream closes). Closing mirrors rsbinder's `Drop`: a consumer cancels, a
-  producer that did not end writes an `EX_ILLEGAL_STATE` end. Both carry C++
-  templates for the NDK backend's `MQDescriptor` and `StreamEndpoint`. An NDK
-  app cannot link `libfmq`, so this is how one takes part in a stream.
-  `rsbinder-fmq/tests/c_header.rs` runs the ring header against the crate in
-  both roles, and `tests/tests/c_stream_header.rs` the stream header under
-  AddressSanitizer (both compiled with the host's `cc`);
-  `example-hello/cpp/run_stream_interop.sh` runs an NDK client
-  against rsbinder on an Android emulator in both directions — order, the end
-  status, back-pressure, cancel, both deaths, an oversized item — and the same
-  cases with a second client whose ring is AOSP's own `libfmq`
-  (`AidlMessageQueue` and `EventFlag`, the ring libcutils ashmem when libfmq
-  makes it), writing only the records and bits itself.
-  `example-hello/cpp/run_stream_rpc_interop.sh` runs the RPC path against the
-  device's libbinder `RpcSession` in both directions: order and grant totals,
-  the end status, cancel, and a death on either side.
-- **Streaming with back-pressure** (`rsbinder::stream`): `Sink<T>` for the
-  producer and `Receiver<T>` for the consumer. The consumer makes a receiver
-  against its **peer** — a binder in the producer's process —
-  (`Receiver::new(&peer)`), which yields a `StreamEndpoint`; that parcelable
-  travels in the one `twoway` call that opens the stream (as an argument for
-  a download, as the return value for an upload, where the client passes any
-  binder of its own or a `stream::Token`), and the service opens
-  `Sink::open(&endpoint)` on it. `rsbinder.stream.StreamEndpoint` is shipped
-  in `rsbinder/aidl/stream/` and `rsbinder-aidl` resolves an import of it to
-  `rsbinder::stream::StreamEndpoint`, so a service's own `.aidl` names it
-  without a copy. Items are encoded with the same codec as `to_bytes`; the
-  consumer's `T` need only agree on the wire.
-  Two transports, chosen by the peer. **Kernel binder** (and two ends in one
-  process): the endpoint carries a ring — a synchronized Fast Message Queue
-  of bytes (`rsbinder::fmq`) the consumer allocates, sealed and charged to
-  itself, and the producer maps. Each item is one record written in place,
-  `send` parks on the ring's futex while the ring is full and `recv` while it
-  is empty, and after the opening call no binder call carries anything in
-  either direction. `ReceiverPolicy::ring_bytes` (default 64 KiB) is the
-  whole of the flow control and bounds the largest item at
-  `ring_bytes - END_RESERVE - 4`; `SinkPolicy::max_ring_bytes` (default
-  4 MiB) is the largest ring a producer maps. The last `END_RESERVE`
-  (256) bytes are kept free of items so the end record always has room and
-  `Sink::end`, and a dropped `Sink`, never wait for the consumer.
-  `StreamEndpoint.aidl` documents the record layout and the EventFlag bits
-  (`NOT_FULL`, `NOT_EMPTY`, and `CANCEL`, waited on by the producer alone),
-  which a C++ peer on `libfmq` implements against. A ring whose counters or
-  headers break the contract ends the stream with `EX_ILLEGAL_STATE` and
-  sets `CANCEL`. **RPC**: the endpoint carries only the consumer's sink and
-  the stream is the two `oneway` interfaces `rsbinder.stream.IStreamSink`
-  (`onStart`, `onBatch`, `onEnd`) and `IStreamSource` (`request`, `cancel`),
-  credit-based: the producer states an opening window of batches
-  (`SinkPolicy::initial_credits`, default 4), sends batches of up to
-  `SinkPolicy::max_batch_bytes` (default 16 KiB, a threshold not a cap), and
-  the consumer grants more as it drains (`ReceiverPolicy::credit_window`) and
-  refuses a window wider than `ReceiverPolicy::max_opening` with
-  `EX_ILLEGAL_ARGUMENT`, holding the producer to its credit so an untrusted
-  producer cannot make it queue without bound. `request(long total)` states a
-  running total so a grant sent again counts once. `Sink::open` refuses a
-  session whose client opened no incoming connections rather than failing on
-  the first batch. On the RPC path `flush` sends the pending batch and a
-  producer whose items arrive at their own pace calls it; on the ring nothing
-  is queued and `flush` returns at once.
-  `send`/`flush`/`end` park the thread; with the `tokio` feature
-  `send_async`/`flush_async`/`end_async`/`end_with_async` and `recv_async`
-  make their wait from the blocking pool (a futex cannot be polled, so on the
-  ring each wait holds one pool thread). `Receiver` yields `BinderResult<T>`
-  through `recv`, `try_recv`, `recv_timeout`, `Iterator` and `recv_async`;
-  no `futures-core` type appears in the public API. The stream ends with a
-  status, so a service-specific failure reaches the consumer with its code
-  and message intact after the opening call already returned; a dropped
-  `Sink` ends it with `EX_ILLEGAL_STATE` without waiting for the consumer,
-  and a dropped `Receiver` cancels, releasing a parked producer. Each end
-  watches the other's binder for death — the producer the endpoint's sink,
-  the consumer its peer — because back-pressure leaves nothing in flight to
-  fail: a producer parked for room and a consumer parked for an item both
-  end with `DeadObject` when the peer's process goes.
-  `SinkPolicy::send_timeout` (default `None`, wait indefinitely) bounds each
-  producer call's wait for ring room or RPC credit with one deadline, the
-  blocking-pool wait of an async call included, so a consumer that is alive
-  but neither reads nor cancels cannot hold a service thread forever: the
-  call returns `TimedOut`, the item is not written or queued, and the stream
-  stays usable (`end` still ends it, reporting what it had to give up).
-- **Work source API** (AOSP `IPCThreadState` / Java `Binder` work source):
-  `set_calling_work_source_uid`, `get_calling_work_source_uid`,
-  `clear_calling_work_source`, `restore_calling_work_source`,
-  `clear_propagate_work_source` and `should_propagate_work_source`, at the crate
-  root and in `thread_state`. The work source is now per-thread state, as in
-  AOSP: a client thread can set it outside any transaction and every outgoing
-  kernel binder call carries it in the request header, which previously always
-  said "unset" because the value could only be stored while a transaction was
-  being served. A handler sees what its caller sent; a received value is not
-  forwarded unless the handler sets it again, and the thread's own value comes
-  back when the handler returns. The RPC wire format has no work-source field
-  (AOSP's neither), so an RPC handler always reports the unset value; a value
-  set inside one still propagates to the kernel binder calls it makes, and the
-  RPC dispatch resets it per call so it cannot leak into the next call served
-  on that thread.
-- **Transaction names** (AOSP `aidl --trace`): `rsbinder_aidl::Builder::trace(true)`
-  emits a method-name table for every interface, and the generated service
-  answers the new `Remotable::transaction_name(code)` with the AIDL method name
-  (plus `getInterfaceVersion` / `getInterfaceHash`). The table follows AOSP's
-  layout — indexed by method id, cut off once more than ten ids are skipped —
-  and is off by default, as in AOSP. `transaction_name` has a default that
-  returns `None`, so hand-written `Remotable`s are unaffected. The wire format
-  does not change.
-  `declare_binder_interface!` takes an optional trailing `function_names: [..]`
-  argument to carry the table.
-- **Transaction observers** (`rsbinder::observe`): `set_observer` installs one
-  process-wide `TransactionObserver`, called on the serving thread before and
-  after every incoming transaction, on kernel binder and over RPC alike. Its
-  `TxnContext` carries the descriptor, code, method name (with
-  `Builder::trace`), one-way flag, caller uid/pid and transport; `on_reply` gets
-  the handler's result and its duration. A panic in the observer is logged and
-  does not change the transaction's result, and the observer may make binder
-  calls itself. With no observer installed a dispatch pays one atomic load.
-  Closest AOSP counterpart: Java `Binder.setObserver`; nothing on the wire
-  changes. `Transactable` gained a defaulted `transaction_name` so the
-  dispatcher can name the method.
-- **Provided observers**: `observe::LogObserver` (one `debug` line per
-  transaction, target `rsbinder::observe`) and `observe::StatsObserver`
-  (per-method call and transport-error counts, total/max handler time, a
-  power-of-two microsecond latency histogram, and the current and peak number
-  of transactions served at once, read through `snapshot()`).
-- **`tracing` feature** (off by default): AIDL spans named as AOSP names its
-  ATrace sections, `AIDL::rust::<descriptor>::<method>::server|client`, in the
-  `name` field of a `TRACE`-level span `aidl` (target `rsbinder::aidl`); a code
-  the name table does not cover is written `#<code>`, as in AOSP.
-  `observe::TracingObserver` opens the server span around each handler; proxies
-  generated with `Builder::trace(true)` open the client span around each
-  transaction, parented to the caller's current span for the async proxy as
-  well. Without the feature the generated hook is a plain call, and output
-  generated without `trace` does not change.
-- **Incoming (callback) connections and outgoing fan-out on every RPC
-  transport.** `ClientOptions::incoming_connections` and
-  `outgoing_connections` now work on `vsock://` and `tls://` as well as
-  `unix://` (they were `BadValue` there), so a server can call a vsock or TLS
-  client's callbacks from outside a handler and the session reports
-  `TransportCaps::CALLBACKS`. Each extra connection is a further connection to
-  the same endpoint — over `tls://` its own TLS session — which is how AOSP
-  `RpcSession::setupClient` builds them over inet and vsock; the server side
-  already accepted such attaches on every transport. For transports the entry
-  does not name (TLS over a Unix socket or vsock, `rpc-tcp-debug`), the new
-  `rpc::RpcClientConfig` takes a `connect` function called once per connection,
-  consumed by `RpcSession::setup_client_android13plus_with_config`. No wire
-  change.
+  Rust, wire-compatible and independent of binder: `MessageQueue<T>::create`
+  (sealed memfd), `descriptor()`, `attach` with an `AttachPolicy`,
+  `write_blocking` / `read_blocking` and `EventFlag`. Synchronized flavor
+  only; Linux and Android. Validated against libfmq on an Android emulator.
+- **C reference headers for an NDK peer**, since an NDK app cannot link
+  `libfmq`: `rsbinder-fmq/c/rsbinder_fmq.h` (the FMQ) and
+  `contrib/ndk/rsbinder_stream.h` (the kernel-binder stream's record layer,
+  `rsbs_*`), with C++ templates for the NDK `MQDescriptor` and
+  `StreamEndpoint`.
+- **Streaming with back-pressure** (`rsbinder::stream`): `Sink<T>` and
+  `Receiver<T>`. `Receiver::new(&peer)` yields a `StreamEndpoint` passed in
+  the call that opens the stream; the service calls `Sink::open(&endpoint)`.
+  Kernel binder uses an FMQ ring the consumer allocates; RPC uses the
+  `oneway` `IStreamSink` / `IStreamSource` with credits. Configured through
+  `SinkPolicy` (incl. `send_timeout`) and `ReceiverPolicy`; async variants
+  with `tokio`. See the Streaming chapter of the book.
+- **Work source API**: `set_calling_work_source_uid`,
+  `get_calling_work_source_uid`, `clear_calling_work_source`,
+  `restore_calling_work_source`, `clear_propagate_work_source` and
+  `should_propagate_work_source`. The work source is per-thread, as in AOSP,
+  and outgoing kernel calls now carry it (RPC has no field for it).
+- **Transaction names** (AOSP `aidl --trace`): `Builder::trace(true)` emits a
+  method-name table answered through the new defaulted
+  `Remotable::transaction_name(code)`; `declare_binder_interface!` takes an
+  optional `function_names: [..]`.
+- **Transaction observers** (`rsbinder::observe`): `set_observer` installs a
+  process-wide `TransactionObserver` called around every incoming
+  transaction (kernel and RPC) with a `TxnContext`. Provided:
+  `observe::LogObserver` and `observe::StatsObserver` (`snapshot()`).
+  `Transactable` gained a defaulted `transaction_name`.
+- **`tracing` feature** (off by default): `aidl` spans named
+  `AIDL::rust::<descriptor>::<method>::server|client`, as AOSP's ATrace;
+  `observe::TracingObserver` and `Builder::trace(true)` proxies open them.
 - **`rpc::RpcClientConfig`, one android-13+ client config for every
-  transport.** Constructors `unix`, `unix_abstract`, `vsock`, `tls`,
-  `tcp_debug` and `new` (your own connect function), with the same knobs on all
-  of them (`session_id`, `outgoing_connections`, `incoming_connections`,
-  `fd_mode`, `timeout`, `handshake_timeout`). `RpcSession` gained
-  `add_outgoing_connection_with_config` and
-  `add_incoming_connection_with_config`, which take it; the incoming one
-  attaches a callback connection over any transport, where the call it replaces
-  was Unix-only. Both refuse a config that sets anything session-wide, such as
-  `timeout`, with `BadValue` — the session they join already has its settings
-  — where the calls they replace accept a `timeout` and ignore it, and still
-  do. `RpcClientConfig::tls` resolves its host once per config and
-  opens every connection that config makes to that address (AOSP
-  `setupInetClient` does the same); `handshake_timeout` bounds its `connect(2)`
-  and TLS handshake too.
-  Requesting `FileDescriptorTransportMode::Unix` on a transport that cannot
-  pass descriptors is now `BadValue` from the setup call, decided by the
-  founding connection's `supports_fd_passing()`, instead of failing on the
-  first fd sent.
+  transport** (`unix`, `unix_abstract`, `vsock`, `tls`, `tcp_debug`, `new`).
+  `ClientOptions::incoming_connections` / `outgoing_connections` now work on
+  `vsock://` and `tls://` too. New
+  `RpcSession::add_{outgoing,incoming}_connection_with_config` work over any
+  transport and refuse session-wide settings (`timeout`) with `BadValue`.
+  `FileDescriptorTransportMode::Unix` on a transport that cannot pass fds is
+  now `BadValue` at setup.
+- **`ParcelFileDescriptor::pipe()`**, plus `Read` and `Write` for
+  `ParcelFileDescriptor` and `&ParcelFileDescriptor`. Both ends are
+  `O_CLOEXEC`. A pipe holds about 64 KB, so a writer needs a reader draining it.
+- **`Parcel::write_blob` / `read_blob`**: AOSP's large-payload convention,
+  inline up to `BLOB_INPLACE_LIMIT` (16 KB), otherwise in a memfd; compatible
+  with Java's `Parcel.writeBlob`. Inline whenever fds cannot travel (see the
+  now public `Parcel::allow_fds()`) or the blob cannot be sealed (Linux < 5.1).
+- **Cooperative cancellation**: `cancel::CancellationSignal`,
+  `CancellationToken` and `cancel_remote`, over AOSP's
+  `android.os.ICancellationSignal`, interoperable with framework peers.
+  Delivery is best-effort and unordered (see the module docs).
+- **Service-specific errors can be a type instead of an `i32`**:
+  `ServiceSpecificError`, `Status::service_specific`,
+  `Status::service_error::<T>()`, `#[derive(ServiceSpecificError)]` and
+  `impl_service_specific_error!` (for `.aidl` enums). The wire is unchanged.
+- **`Status::message()`**: the message a peer attached.
+- **The receive mapping is now configurable**: `ProcessState::init_with_mmap_size`,
+  `binder://?mmap=<bytes>`, `ClientOptions::mmap_size`, `MAX_BINDER_MMAP_SIZE`
+  (4 MB), `ProcessState::default_mmap_size()` / `mmap_size()`. Raising it lets
+  a service accept larger transactions. Out of range, or different from the
+  size in force (incl. `ServeOptions::mmap_size`), is `BadValue`.
+- **`TransportCaps`**: `FD_PASSING`, `TRUSTED_UID`, `CALLBACKS`, `SAME_HOST`,
+  `KERNEL_KNOBS`, read from `Client::caps()`, `RpcSession::caps()`,
+  `Endpoint::static_caps()` or `calling_caps()`; `caps.require(..)` fails
+  early with `InvalidOperation`. A summary; underlying checks still apply.
+- **`wait_for_interface_async` and `check_interface_async`** (`tokio`):
+  dropping the future ends the wait.
+- **`death_signal` / `DeathSignal`** (`tokio`): await a binder's death, over
+  kernel binder and RPC; dropping the signal unlinks. The `tokio` feature now
+  also enables `tokio/sync`.
+- **`rsbinder-aidl`: AIDL validation matching AOSP.** Now rejected with a
+  diagnostic: a non-fixed-size field in a `@FixedSize` type; a non-VINTF
+  reference from a `@VintfStability` type (a `@RustOnlyStableParcelable` is
+  exempt); misplaced `ParcelableHolder` or `void`; an empty `union`; duplicate
+  names of any kind, including a type defined in two input files; a type
+  argument on a non-generic type; a `const` not of a primitive, `String` or
+  array of those; a union variant that is not a Rust identifier (`SELF`); a
+  non-decimal transaction code (`1_0`, `10L`). Any argument name is accepted.
+- **`@deprecated` support.** `rsbinder-aidl` emits a `/** @deprecated note */`
+  javadoc as `#[deprecated = "note"]` (AOSP `FindDeprecated` rules), and
+  `rsbinder-macros` carries `#[deprecated]` through as AIDL `@deprecated`
+  (`since` / `note = …` are refused). `render::deprecated_attr` is public.
+- **`rsbinder-macros`: `#[nonnull]`** on an `out` binder or fd means
+  `out IFoo` (a `None` left behind is `UNEXPECTED_NULL`); without it,
+  `&mut Option<_>` means `out @nullable`. The signature checks now cover
+  every out/inout and `in` array shape `.aidl` renders.
 
 ### Changed
 
-- **`rsbinder-aidl` parser API**: `ParcelableDecl::type_params` and
-  `UnionDecl::type_params` are `Vec<TypeParam>` (name, span, annotations)
-  instead of `Vec<String>`, so a parameter's `@FixedSize`/`@VintfStability`
-  requirement survives parsing. `Generic::type_args()` returns the arguments
-  of a `Foo<A, B>` reference as written, whichever of the three `>>` grammar
-  shapes produced them.
-- **`to_bytes` / `from_bytes` no longer require the `rpc` feature.** Storing a
-  value was never a transport concern: the encoder runs in the session-less
-  parcel mode, and it is the *absence* of a session that refuses a binder
-  (`BadType`) and a file descriptor (`FdsNotAllowed`). A build without `rpc`
-  had no session-less parcel mode to run in and did not compile the two
-  functions at all; the mode and both functions are now there without the
-  feature, with those refusals applied at the write. Reading is refused the
-  same way, so a forged
-  object in stored bytes cannot become a proxy. `Parcel::allow_fds` answers
-  `false` on such a parcel in every feature configuration, which is what makes
-  `write_blob` store its payload inline there. Nothing about the wire changes,
-  and no signature changes; a build with `rpc` behaves as before.
-- **`get_calling_uid()` / `get_calling_pid()` outside a transaction return
-  this process's own uid and pid**, as AOSP's `IPCThreadState` does
-  (`getuid()` / `getpid()`), instead of `0`. `0` is root's uid, so a uid
-  check made on an in-process call, or on a thread the transaction did not
-  arrive on, passed as root. Inside a transaction nothing changes.
-- **RPC `link_to_death` is refused with `InvalidOperation` on a session that
-  would not notice its connection dropping** — a client with no incoming
-  connections and no serve loop — as AOSP `BpBinder::linkToDeath` refuses an
-  RPC binder whose session has no incoming threads. Such a link used to
-  succeed and then report nothing until a later call happened to fail. The
-  server side, a client with `incoming_connections(n)`, and a session served
-  by the new `RpcSession::spawn_serve` (or already inside `serve_blocking`)
-  are unaffected; code that linked first and started its serve thread
-  afterwards calls `spawn_serve` before linking. `death_signal` over RPC
-  follows the same rule.
-- **`RpcServer::setup_unix_server` removes only a stale socket.** It used to
-  delete whatever was at the path. Now a regular file there is refused with
-  `AlreadyExists` and a socket another server is listening on with
-  `EADDRINUSE`; a socket nobody listens on (`ECONNREFUSED`, what a crashed
-  server leaves) is still replaced. Dropping the server removes the socket
-  file only if it is still the one it bound (same device and inode), so it
-  no longer deletes a successor's socket at the same path.
-- **A kernel `Client::get` / `connect` reports the service manager's own
-  failure** instead of `NameNotFound` when the service manager cannot be
-  reached, and `hub` logs why once: no context manager (`rsb_hub` not
-  running), or an Android SDK whose `android_*` feature this build lacks.
-- **`ServerGuard` and `Server` are `#[must_use]`.** A bare
-  `serve(uri)?.spawn()?;` dropped the guard at once, which stops an RPC
-  server while the same line keeps a kernel server running.
+- **`to_bytes` / `from_bytes` no longer require the `rpc` feature.** Binders
+  (`BadType`) and file descriptors (`FdsNotAllowed`) are still refused on
+  write and read, and `Parcel::allow_fds` is `false` on such a parcel. No wire
+  or signature change.
+
+The behavior changes an existing program can observe are listed under
+*Migrating from 0.11.0* above.
 
 ### Deprecated
 
@@ -308,668 +230,141 @@ This changelog starts at 0.9.0. For earlier releases, see the
   `add_{outgoing,incoming}_connection_with_config`.
 
 The deprecated items still work and delegate to the new ones; they are removed
-in the release after 0.13.0. The single-connection one-liners
+in the release after 0.12.0. The single-connection one-liners
 (`setup_unix_client_android13plus`, `_abstract`, `_fd`,
 `setup_tcp_client_tls_android13plus`) are not deprecated.
 
 ### Fixed
 
 - **RPC: a `oneway` call made inside a handler no longer rides the connection
-  the request came in on.** It was sent there while the handler served a
-  twoway call, and the server then wrote that call's reply without waiting.
-  The client, still in its reply wait, ran the oneway on the same thread; a
-  twoway call its handler made back on that connection read the server's
-  reply as its own answer, and the outer call read the nested call's reply.
-  Against libbinder this showed as a failed `IStreamSource` cast in
-  `onStart` followed by `UNEXPECTED_NULL`, or a libbinder abort ("Local
-  binder must have been sent"). A oneway now takes a connection this end
-  opened, as AOSP libbinder's `ExclusiveConnection::find` does on every
-  version ("asynchronous calls cannot be nested"), and is `WouldBlock` when
-  there is none: a server's oneway call to a client needs the client's
-  incoming connections (`RpcClientConfig::incoming_connections`,
-  `ARpcSession_setMaxIncomingThreads`) even from inside a handler, and the
-  r34 profile, which has no way to open one, cannot make it. Twoway nested
-  calls are unchanged.
-- **`connect_async("binder://…")` can be cancelled.** Its wait for the name
-  ran inside `spawn_blocking`, so dropping the future under a `timeout` or
-  `select!` left a blocking-pool thread waiting until the service appeared,
-  and `Runtime::drop` waited for that thread. It now waits through
-  `wait_for_interface_async`, which ends the wait when the future is dropped.
-
-## [0.12.0] - 2026-09-19
-
-### Migrating from 0.11.0
-
-- **`Endpoint::Kernel` gained an `mmap_size` field** (see *Added*). The variant
-  is a struct variant without `#[non_exhaustive]`, so a struct literal that
-  builds one, or a `match` arm that names every field, is a compile error until
-  `mmap_size` is added (`mmap_size: None` reproduces the previous behavior).
-  Matching with `..`, and every other way of obtaining an `Endpoint` — `serve`,
-  `Client::open`, `Server::endpoint()` — are unaffected.
-- **A kernel option `serve` / `Client::open` cannot honor is now `BadValue`.**
-  `binder://?threads=`, `?driver=`, `ServeOptions::threads` and
-  `ClientOptions::driver` are fixed process-wide by whoever initializes
-  `ProcessState` first. A later call naming a *different* value used to log a
-  warning and continue with the value already in force; it now returns
-  `StatusCode::BadValue`, which is what every other inapplicable option in this
-  layer already returned. Omitting the option, or passing the value already in
-  force, is unaffected — so a second `serve("binder://")` in one process still
-  works. Code that called `serve` twice with different thread counts was not
-  getting the second one; now it is told.
-- **A kernel setting given twice to `Client::open` must agree.**
-  `ClientOptions::driver` used to override a different `binder://?driver=`
-  without a word. The two — and `ClientOptions::mmap_size` against `?mmap=` —
-  are now `StatusCode::BadValue` when they differ, the same answer as for a key
-  repeated inside the URI. Giving the value once, or the same value twice, is
-  unaffected.
-- **An RPC session refuses a connection whose transport differs from its
-  founding one.** A later connection must match the first in whether it can
-  carry file descriptors and in whether its peer is local; one that does not
-  is dropped at attach (`BadType` on the server's attach path). Every
-  built-in setup path opens all of a session's connections over one transport
-  and is unaffected. What this rules out is a hand-assembled session — say a
-  Unix socket attached to a session founded over vsock through
-  `RpcServer::serve_connection` — whose `caps()` had no single right answer.
-- **`StatusCode::from(ExceptionCode::ServiceSpecific)` is
-  `ServiceSpecific(0)`, not `Ok`.** A `Status` built from the bare exception
-  code therefore carries code `0` — what AOSP's
-  `Status::fromExceptionCode(EX_SERVICE_SPECIFIC)` carries and what the wire
-  always read back — instead of a local-only state that changed on its first
-  trip through a parcel. `service_specific_error()` returned `0` for it before
-  and still does; `StatusCode::from(status)` now yields `ServiceSpecific(0)`
-  where it yielded `FailedTransaction`.
-- **`rsbinder-aidl` now rejects `.aidl` that AOSP's `aidl` also rejects.** The
-  new checks are listed under *Added*. Each one fires on a contract the AOSP
-  compiler already refuses, so an `.aidl` that builds against both compilers is
-  unaffected — but an rsbinder-only contract that leaned on the missing
-  validation now fails to build. The diagnostic names the rule and the AOSP
-  behavior it mirrors.
-- **`render::ConstMember` and `render::EnumMember` gained a field.**
-  `ConstMember` is now `(identifier, type, initializer, deprecation attribute)`
-  and `EnumMember` is `(identifier, discriminant, deprecation attribute)`. Both
-  are positional tuples that a second front-end fills directly, so this is a
-  compile error at those call sites, not a silent change; pass `String::new()`
-  for the new element to keep the previous output. The `#[non_exhaustive]`
-  render structs (`InterfaceRender`, `ParcelableRender`, `EnumRender`,
-  `FnMembers`, `ParcelableMember`) also gained a `deprecated` field, but they
-  are built through `new()`/`Default`, so those keep compiling.
-- **`error::SemanticError` is now `#[non_exhaustive]`** and gained two variants,
-  `FixedSizeNonFixedField` and `VintfStabilityLeak` (appended, so no existing
-  variant's discriminant moved). An exhaustive `match` over it needs a `_ => …`
-  arm added — once: from here on a new diagnostic is a minor release.
-- **A declaration nested in a `@VintfStability` type is now VINTF-stable** (see
-  *Fixed*), which changes both the wire and a runtime check for it: a
-  `ParcelableHolder` field of such a nested type records VINTF stability
-  instead of the default, and `ParcelableHolder::set_parcelable` now returns
-  `StatusCode::BadValue` for a payload whose own stability does not include
-  VINTF, where it previously succeeded. Nothing in the build warns.
-- **`#[deprecated]` codegen can break a downstream `-D warnings` build.** An
-  existing `.aidl` whose `/** @deprecated … */` javadoc was previously ignored
-  now generates `#[deprecated]`, and by design that warns outside the generated
-  module. Drop the javadoc tag, or allow the lint at the call site.
-- **`#[rsbinder::interface]` and the derives now refuse shapes `.aidl` cannot
-  express.** Each compiled in 0.11.0 and generated code that worked
-  rsbinder-to-rsbinder, but had no `.aidl` equivalent — so moving the interface
-  to `.aidl` later was not the no-op the macro promises, and some of them put a
-  value on the wire a conforming peer cannot decode. The diagnostic names the
-  `.aidl` form to use instead. Refused now: an `out`/`inout` `String`, even
-  spelled `&mut Option<String>` (`@nullable` does not widen a direction); a
-  nullable primitive (`Option<i32>`) anywhere, including behind a slice or an
-  array; a `ParcelableHolder` as an argument or a return type; an array with
-  `Option<_>` elements where `.aidl` spells them bare (`&mut Vec<Option<Cfg>>` —
-  the nullable array is `&mut Option<Vec<_>>`); a bare `out` binder or fd
-  (`&mut Strong<dyn IFoo>`, `&mut SIBinder`, `&mut ParcelFileDescriptor`), which
-  `.aidl` renders as `&mut Option<_>`; `()`, a trait object or `&mut [T]` as an
-  argument; a duplicate method or argument name; `BinderResult<T, E>`; an
-  argument to `#[oneway(..)]` / `#[inout(..)]`; an attribute or an explicit
-  lifetime on the receiver (`#[oneway] &self`, `&'static self`); a second
-  `descriptor = …`; an empty `descriptor = ""`, which would let two interfaces
-  cast to each other's proxy; an `in` argument spelled `&String`, `&Vec<T>`,
-  `&Option<T>` or `&i32`, including inside an `Option<&_>`, where `.aidl`
-  renders `&str`, `&[T]`, `Option<&T>` and the bare primitive; an `in` argument
-  taken by value where `.aidl` borrows it (`String`, `Vec<T>`, `[T; N]`,
-  `ParcelFileDescriptor`, `SIBinder`, `Strong<dyn IFoo>` and their `Option<_>`
-  forms), since `.aidl` renders every `in` type but a scalar behind a reference —
-  the bytes match and the call site does not, which is the one thing moving a
-  trait to `.aidl` must not change; a by-value bare name stays accepted, because
-  it may be a `#[derive(BinderEnum)]` enum, which `.aidl` does pass by value, and
-  the generated `Copy` assertion is what refuses the parcelable half; a `@nullable`
-  array with bare elements (`Option<&[String]>` — `.aidl` gives every
-  non-primitive element of a `@nullable` array its own `Option`, except in a
-  fixed-size `in` one, which is the one that keeps them bare); a fixed-size
-  `#[inout]` binder or fd array with bare elements
-  (`&mut [ParcelFileDescriptor; N]`, which `.aidl` renders
-  `&mut [Option<_>; N]`); a return type whose array elements are spelled the
-  other way (`BinderResult<Option<Vec<String>>>`, which `.aidl` renders
-  `Option<Vec<Option<String>>>`); `()` or a trait object nested in a container
-  (`Vec<()>`, `&[dyn IFoo]`) and a trait object or a qualified path as a return
-  type; a scalar `.aidl` never renders, in an argument, a return type or a
-  parcelable field (`u32`, `u64`, `i16`, `usize`, `u128`, Rust's `char`, or a
-  `u8` outside an array element), where AIDL has only `bool`, `i8`, `i32`,
-  `i64`, `f32`, `f64` and `u16` — the nearest `.aidl` renders a different Rust
-  type, and `u128` also put sixteen bytes on the wire no conforming AIDL peer
-  can decode; an `i8` *inside* an array element (`&[i8]`, `Vec<i8>`), which
-  `.aidl` always spells `u8` there, so `byte`'s spelling moves with the place
-  and neither half is accepted in the other's; and, on
-  `#[derive(Parcelable)]`, a `#[parcelable(..)]` on a
-  field or a field borrowing below the top level (`Option<&str>`, `Vec<&str>`),
-  a `()` field, and an array field whose elements are spelled the other way
-  (`Option<Vec<String>>` and `Vec<Option<String>>`, which `.aidl` renders
-  `Option<Vec<Option<String>>>` and `Vec<String>`; a fixed-size binder or fd
-  field array needs `Option<_>` elements, since the field has no value to start
-  each slot from), and a bare binder or fd field (`Strong<dyn IFoo>`,
-  `SIBinder`, `ParcelFileDescriptor`), which `.aidl` renders `Option<_>`
-  whether or not the field is `@nullable` — the field has no value to start
-  from, so the wrapping applies to the whole field and not only to an array
-  slot, and here that `Option<_>` is AIDL's `@nullable` field.
-- **The `tokio` feature no longer enables `tokio/full`.** It now enables
-  `tokio/rt` and `tokio/rt-multi-thread`, which is everything the library uses
-  (`spawn_blocking`, `Handle`, and `block_in_place` in the async
-  runtime adapter). A crate that was receiving `tokio/net`, `time`, `signal`,
-  `fs`, `io-util` or `macros` through feature unification with rsbinder now has
-  to declare them in its own `Cargo.toml` — which is where they belonged.
-- **`BinderAsyncRuntime for TokioRuntime<Runtime>` and
-  `for TokioRuntime<Arc<Runtime>>` are gone.** `TokioRuntime<Handle>` remains
-  and is what every recipe in the book and the examples uses. An owned runtime
-  inside a binder is a latent panic in any case: `Runtime::drop` panics when the
-  last `Strong` to the service is released on one of that runtime's worker
-  threads. Wrap `runtime.handle().clone()` instead.
-- **A kernel transaction dispatched inside an RPC handler now reports the
-  kernel caller.** Binder's nested IPC delivers a re-entrant `BR_TRANSACTION`
-  to the very thread parked waiting for a reply, so an RPC handler that makes
-  an outgoing kernel call can have a kernel transaction dispatched inside it.
-  Inside that inner kernel handler, `calling_caller()` used to return
-  `Caller::Rpc(..)` and `get_calling_uid()` / `get_calling_pid()` /
-  `get_calling_sid()` / `CallingContext::default()` the suspended RPC peer's
-  values — for a transport that carries no uid, the `u32::MAX` sentinel and pid
-  `-1`. They now answer for
-  the kernel caller the inner transaction actually came from:
-  `Caller::Kernel`, the kernel-delivered `sender_euid` / `sender_pid`, and the
-  SELinux context (`CallingContext::default()` reports those same three in one
-  value). The RPC values come back when the inner transaction
-  returns, and `is_handling_transaction()` is unchanged in both places. Only a
-  process that mixes kernel binder and RPC on one thread is affected; a
-  handler that `match`es on the `Caller` arm to pick an authorization rule now
-  takes the `Kernel` arm there, so re-check such handlers — a rule written for
-  the RPC arm (a cert allowlist, a Unix-peer uid ACL) no longer runs for a
-  caller that arrived over kernel binder.
-
-### Added
-
-- **`ParcelFileDescriptor::pipe()`**, plus `Read` and `Write` for
-  `ParcelFileDescriptor` and `&ParcelFileDescriptor` — the AOSP idiom for an
-  open-ended payload (`ParcelFileDescriptor.createPipe`), with the two
-  boilerplate steps it used to take now gone: a hand-rolled `pipe()` with two
-  `unsafe` `from_raw_fd`s, and cloning the descriptor into a `std::fs::File`
-  before anything could read or write it. Both ends are `O_CLOEXEC`, as AOSP's
-  are.
-
-  The adapters mean what `File`'s mean, including `Ok(0)` at end of file and
-  `BrokenPipe` once the reader is gone. Note that a pipe holds about 64 KB:
-  whoever writes more needs a reader already draining it, usually the peer once
-  the read end has been sent. For `tokio`, convert once with
-  `tokio::fs::File::from_std(std::fs::File::from(OwnedFd::from(pfd)))` —
-  rsbinder does not wrap that, since its `tokio` feature deliberately does not
-  pull `tokio/fs`.
-- **`Parcel::write_blob` / `read_blob`** — AOSP's convention for a large byte
-  payload: inline when it is at most `BLOB_INPLACE_LIMIT` (16 KB), through a
-  shared-memory region when it is larger, with the form recorded on the wire as
-  a tag the reader follows. The bytes are Java's `Parcel.writeBlob` — an int32
-  length, then what C++ `Parcel::writeBlob` writes — so a Java peer reads what
-  rsbinder wrote, and a C++ peer does by reading the length before
-  `Parcel::readBlob(len, …)`, as the JNI layer does.
-
-  The region is a memfd, which AOSP's reader accepts: libcutils' `ashmem_valid`
-  answers yes for a `/memfd:` link and takes the size from `fstat`, and an
-  immutable blob carries `F_SEAL_FUTURE_WRITE` — the same seal AOSP's own memfd
-  path adds for `ashmem_set_prot_region(fd, PROT_READ)`. On a kernel that cannot
-  apply that seal (Linux before 5.1) an immutable blob goes inline instead of
-  out over a region a reader could write.
-
-  Where a transport carries no file descriptors — vsock, TLS, or the
-  session-less data-only parcel behind `to_bytes` — the payload goes inline
-  whatever its size, which is AOSP's `!mAllowFds` branch and needs no option.
-  `Parcel::allow_fds()` is the predicate behind that, public because a
-  handwritten parcelable choosing its own representation needs the same answer.
-- **Cooperative cancellation** — `cancel::CancellationSignal`,
-  `cancel::CancellationToken` and `cancel::cancel_remote`, over a vendored
-  `android.os.ICancellationSignal`. A service makes a signal per operation,
-  returns `create_transport()` to the caller, and watches
-  `token.is_canceled()` (or, with the `tokio` feature,
-  `token.canceled().await`); the caller sends the `oneway cancel()` through the
-  transport binder. Since the descriptor is AOSP's, a framework client can
-  cancel an rsbinder service and rsbinder can cancel one of theirs — both
-  directions are covered by a STAGE3 harness against real `libbinder`.
-
-  Only this direction exists: the service creates, the caller cancels. The
-  mirror image makes every poll a transaction back to the caller, and on the
-  RPC stack it would require the client to have opened incoming connections.
-  Two properties worth reading the module docs for — what a cancellation
-  *means* is the service's to decide (as it is in AOSP, which throws
-  `OperationCanceledException` from the service), and delivery is both
-  best-effort and unordered against your other calls, because the transport is
-  a different binder object than the service and the kernel orders a `oneway`
-  to one against a twoway to the other not at all.
-- **Service-specific errors can be a type instead of an `i32`** —
-  `ServiceSpecificError` (trait), `Status::service_specific` and
-  `Status::service_error::<T>()`, with `#[derive(ServiceSpecificError)]` for a
-  plain Rust enum and `impl_service_specific_error!` for one that came from
-  `.aidl`. The wire is untouched: a code is the `i32` AOSP's
-  `Status::fromServiceSpecificError` writes, so a C++ or Java peer reads what
-  it always did — what changes is that the enum ↔ code mapping is written once
-  rather than at each call site.
-
-  `service_error` answers `None` for a status that is not a service-specific
-  failure at all *and* for one whose code the type does not declare, which is
-  what a peer built against a newer contract looks like from here;
-  `service_specific_error()` still has the raw number in both cases. Attaching
-  either macro is deliberate rather than automatic for every enum: the code
-  space is `i32`, so a `long`-backed `.aidl` enum has none, and saying so is a
-  compile error at the attachment rather than a value that truncates on the
-  wire.
-- **`Status::message()`** — the message a peer attached, which until now only
-  `Display` could reach.
-- **The receive mapping is now configurable** — `ProcessState::init_with_mmap_size`,
-  `binder://?mmap=<bytes>` and `ClientOptions::mmap_size`, with
-  `MAX_BINDER_MMAP_SIZE`,
-  `ProcessState::default_mmap_size()` and `ProcessState::mmap_size()` alongside.
-  The "1 MB binder limit" is this mapping: the driver copies an incoming
-  transaction into a buffer allocated out of the **destination** process's
-  mapping, so raising it on a service is what lets that service accept larger
-  calls — from an AOSP `libbinder` peer as much as from rsbinder, since the wire
-  does not change and there is nothing to negotiate. A payload too large for the
-  destination still comes back to the sender as `FailedTransaction`.
-
-  Bytes only, between one page and `MAX_BINDER_MMAP_SIZE` (4 MB); outside that
-  is `BadValue`, deliberately including *above*, because the driver clamps to
-  4 MB without telling anyone and a process that asked for 8 MB should not have
-  to discover it got half. The value is rounded up to a page (what `mmap(2)`
-  maps) and `ProcessState::mmap_size()` reports the rounded figure. Oneway
-  transactions may use only half of the mapping, the driver's rule, not a new
-  one. Process-wide and fixed by whoever initializes `ProcessState` first, so it
-  follows the `?driver=` / `?threads=` rule above: a later different value is
-  `BadValue`.
-
-  Both the range check and that refusal belong to `serve` / `Client::open` and
-  to the call that initializes the process. `ProcessState::init_with_mmap_size`
-  called directly on a process that is already initialized does not look at its
-  arguments at all — it returns the existing state, whatever size was asked
-  for. `ServeOptions::mmap_size` is in the position `ServeOptions::threads` is
-  in: `serve` initializes `ProcessState` before the option is read, so the
-  field cannot make the mapping — it is compared against the size already in
-  force, and a different one is `BadValue` at `run` / `spawn`. On a kernel
-  server the size is set by `binder://?mmap=`, or by
-  `ProcessState::init_with_mmap_size` called before `serve`.
-- **`TransportCaps`** — what the transport under a binder can do, as five bits:
-  `FD_PASSING`, `TRUSTED_UID`, `CALLBACKS`, `SAME_HOST`, `KERNEL_KNOBS`. Read it
-  from `Client::caps()`, `RpcSession::caps()`, `Endpoint::static_caps()`, or —
-  inside a handler, for the call being served — `calling_caps()`.
-  `caps.require(bits, "what for")` turns a missing capability
-  into `InvalidOperation` plus a log line saying when the missing bit holds,
-  at setup rather than on the first transaction.
-
-  It is a **summary, not a rule**: every bit is derived from a fact some other
-  type already owns and still enforces. Ignore `FD_PASSING` and the fd write
-  refuses on its own, exactly as before; ignore `TRUSTED_UID` and
-  `get_calling_uid()` still returns its fail-closed sentinel. Two distinctions
-  are worth reading the rustdoc for — `Endpoint::static_caps()` answers for the
-  transport *family*, and it bounds a session in neither direction:
-  `FD_PASSING` is an upper bound (a `unix://` endpoint claims it before any
-  session negotiates the `Unix` fd mode), while `CALLBACKS` is a lower one (no
-  *RPC* endpoint reports it — `binder://` does, since kernel binder has every
-  bit — although a session opened with `ClientOptions::incoming_connections > 0`
-  does) — and a session's caps are a
-  snapshot that changes as connections come and go.
-- **`wait_for_interface_async` and `check_interface_async`** — the awaitable
-  forms of `hub::wait_for_interface` / `hub::check_interface`, at the crate root
-  next to `get_interface_async` (`tokio` feature). The wait keeps the
-  synchronous contract (unbounded, event-driven through the service manager's
-  registration callback, ~1s re-poll without a thread pool, `BadType` on a
-  descriptor mismatch) and adds one thing the hand-rolled
-  `spawn_blocking(hub::wait_for_interface)` cannot do: **dropping the future
-  ends the wait**, unregistering the callback and releasing the blocking-pool
-  thread. Each outstanding wait holds one thread of the pool outbound calls
-  share, so it is meant for the waits a process does at start-up.
-- **`death_signal` / `DeathSignal`** — await a binder's death instead of
-  implementing `DeathRecipient` (`tokio` feature). The signal holds the binder
-  and the recipient itself, so the usual "keep your `Arc` alive" and "keep the
-  handle alive" conditions do not apply; an already-dead binder yields a
-  completed future rather than an error, a local binder is still
-  `InvalidOperation`, and dropping the signal unlinks. Works over kernel binder
-  and RPC (where death is the session's connection dropping).
-- **`rsbinder`'s `tokio` feature now also enables `tokio/sync`** (for the
-  `oneshot` behind `DeathSignal`). Still no `tokio/time` or `tokio/macros`: the
-  waits are condvar-based, so nothing here needs a timer.
-- **`rsbinder-aidl`: AIDL type-placement validation matching AOSP.** The
-  `@FixedSize` and `@VintfStability` rules are contract-level — rsbinder
-  generated compiling code either way, so without them an `.aidl` authored here
-  could be refused by AOSP's `aidl`. The `void` and `ParcelableHolder`
-  placements marked below are not contract-level: the code rsbinder generated
-  for them never compiled, and the check turns a rustc error in the generated
-  crate into an AIDL diagnostic.
-  - `@FixedSize` parcelables and unions now require every field to be fixed
-    size, porting AOSP `AidlTypenames::CanBeFixedSize` (primitives, enums,
-    fixed-size arrays of those, and other `@FixedSize` types qualify; `String`,
-    `IBinder`, `ParcelFileDescriptor`, `ParcelableHolder`, `List<T>`,
-    variable-length arrays, and `@nullable` types do not). `@FixedSize` is not
-    inherited by nested declarations, matching AOSP.
-  - `@VintfStability` declarations may only reference `@VintfStability` types.
-    AOSP enforces this compilation-wide through `aidl_interface { stability:
-    "vintf" }`; rsbinder has no such mode and enforces the reference closure
-    that rule implies, which fires on exactly the contracts AOSP refuses. A
-    non-VINTF type may still use a VINTF one.
-  - `ParcelableHolder` is rejected as an array element, as a `List` element, as
-    `@nullable`, as a method argument, as a method return type, and as a union
-    member. The array, `List` and `@nullable` forms are the ones that did not
-    compile (`Vec<ParcelableHolder>` has no `SerializeArray`,
-    `Option<ParcelableHolder>` no `SerializeOption`); the argument, return-type
-    and union-member forms compiled, so those three are contract-level.
-  - `void` is rejected as a parameter type, a field or constant type, and an
-    array or `List` element — none of which compiled. It remains valid as a
-    bare method return type.
-  - A `union` with no fields is rejected, porting AOSP `AidlUnionDecl::
-    CheckValid`. `const` members do not count as fields: the enum rendered for
-    such a union is uninhabited, so its `Default` impl and its `write_to_parcel`
-    match never compiled.
-  - A duplicate argument name in a method is rejected, porting AOSP
-    `AidlMethod::CheckValid`. Both arguments rendered as the same `_arg_<name>`
-    binding, so the defect used to surface as rustc E0415 in the consumer's
-    crate.
-  - A duplicate method name in an interface is rejected, porting AOSP
-    `AidlInterface::CheckValid`. The second declaration collapsed into the
-    first, so one method disappeared from the generated trait and every
-    transaction code after it shifted.
-  - A type argument on a type that takes none (`String<int>`, `IBinder<T>`) is
-    rejected, porting AOSP `AidlTypeSpecifier::CheckValid`. The generic was
-    being dropped silently, so `String<int>` compiled as a plain `String`.
-    `List`, `Map` and parameterizable user-defined parcelables are unaffected.
-  - A `const` must have a primitive or `String` type, or an array of those. A
-    handle (`IBinder`, `ParcelFileDescriptor`, `ParcelableHolder`) has no
-    constant form, and a user-defined type is refused by AOSP outright
-    (`AidlConstantDeclaration::CheckValid`). AOSP's set is narrower still —
-    `boolean`, `char` and constant arrays are deliberate rsbinder extensions,
-    pinned by its test suite, and are kept.
-  - A `@VintfStability` declaration may reference a `@RustOnlyStableParcelable`
-    (one declared with `rust_type`) without it being `@VintfStability` itself,
-    matching AOSP's stable-API-parcelable exemption (`IsStableApiParcelable`):
-    there is no generated declaration to carry the annotation.
-- **`rsbinder-aidl`: `@deprecated` javadoc is now emitted as `#[deprecated]`.**
-  A `/** @deprecated note */` block above an interface, parcelable, union,
-  enum, method, field, constant, or enumerator becomes `#[deprecated = "note"]`
-  on the generated item (`#[deprecated]` with no note), following AOSP's
-  `FindDeprecated` rules: only the last comment of the preceding run counts,
-  and only when it is a block comment. Generated modules carry a module-scoped
-  `#![allow(deprecated)]` so the generated proxy and dispatch plumbing does not
-  warn about the items it must name; callers outside the module still do.
-- **`rsbinder-macros`: `#[nonnull]` on an `out` binder or file descriptor.**
-  `out IFoo` and `out @nullable IFoo` share one Rust spelling —
-  `&mut Option<Strong<dyn IFoo>>` — because that `Option` is what the generator
-  reaches for when the callee has no value to start from, not a `@nullable`.
-  Without the attribute the macro means the nullable form; with it the server
-  answers a `None` the service left behind with `UNEXPECTED_NULL`, which is
-  AOSP's `out_scalar_needs_unwrap`. That is the only ambiguous spelling, so the
-  attribute is refused anywhere else.
-- **`rsbinder-macros`: `#[deprecated]` carries through as AIDL's
-  `@deprecated`.** On a trait, a method, a `#[derive(Parcelable)]` struct or one
-  of its fields, `#[deprecated]` and `#[deprecated = "…"]` render the attribute
-  the `.aidl` path renders, through the same `render::deprecated_attr`. The
-  richer Rust forms (`since`, `note = …`) carry fields `.aidl` has nowhere to
-  put and are refused rather than silently dropped.
-- **`rsbinder-aidl`: `render::deprecated_attr` is public.** A second front-end
-  filling the `deprecated` fields of the render structs needs the same escaping
-  the AIDL path uses; `#[rsbinder::interface]` is its first caller.
-- **`rsbinder-macros`: the signature checks now cover every out/inout and `in`
-  array shape `.aidl` renders.** Three golden tests hold the macro's output
-  against the generator's across the whole table — 25 out/inout forms, 16 `in`
-  array forms, and the `#[nonnull]` pair — so an element `Option`, a `@nullable`
-  wrapper and a fixed dimension, which interact differently in each direction,
-  are pinned per row instead of by a rule that is right for one and wrong for
-  the next.
-
-### Fixed
-
-- **`list_services` on Android 10 no longer stops at a name it cannot read.**
-  The legacy C service manager answers a listing one entry at a time out of a
-  256-byte reply buffer, which a 127-character name — the longest it lets you
-  register — overflows, so that entry comes back without a string. rsbinder
-  took the failed read for the end of the list and returned only the services
-  registered *after* that one; every other service on the device was missing.
-  The loop now ends only on a failed transaction, as AOSP's Android 10
-  `listServices` does, and keeps such an entry as an empty string. Found when
-  the Android CI job started running its tests natively: the API 29 image has
-  no ARM translation, so the aarch64 test binary had never executed there.
+  the request came in on**, where the server's reply to the outer call could
+  be misread by nested calls (seen against libbinder as `UNEXPECTED_NULL` or
+  an abort). It now takes a connection this end opened, as AOSP does, and is
+  `WouldBlock` when there is none (see *Migrating from 0.11.0*).
+- **`connect_async("binder://…")` can be cancelled**: dropping the future now
+  ends the wait instead of leaving a blocking-pool thread waiting for the
+  service (which also stalled `Runtime::drop`).
+- **`list_services` on Android 10 no longer stops at a name it cannot read**
+  (a 127-character name overflows the legacy service manager's reply buffer).
+  Such an entry is kept as an empty string, and the listing ends only on a
+  failed transaction, as in AOSP.
 - **A synchronous handle to a local async service no longer panics when called
-  from async code.** `Bn*::new_async_binder` returns a *sync*
-  `Strong<dyn IFoo>` whose methods are implemented as
-  `rt.block_on(inner.method())`. Calling it from a task on a multi-threaded
-  runtime — a gateway fronting its own service, start-up code, a test — hit
-  Tokio's "Cannot start a runtime from within a runtime". `TokioRuntime` now
-  releases the worker's core with `block_in_place` first. Two positions still
-  panic and one class of handle still stalls; `TokioRuntime`'s docs give the
-  conditions, split by the two things that decide them — where the call is made
-  from, and which runtime the handle points at. On a path that calls repeatedly,
-  convert once with `into_async::<P>()` instead — that route never enters
-  `block_on`.
-- **Codegen `async` can be turned off again by a downstream crate.** 0.11.0 set
-  `rsbinder-aidl`'s default features to `[]` so that a sync-only `rsbinder`
-  would not receive async code it cannot compile, but at the same time pinned
-  `features = ["async"]` on rsbinder's own build-dependency. Cargo unifies
-  features across the build-dependency graph, so that pin reached every
-  downstream's `rsbinder-aidl` too: `rsbinder` with `default-features = false`
-  still generated async code, which then failed with "cannot find type
-  `BoxFuture`". The pin is gone; the conditional `async = ["rsbinder-aidl/async",
-  …]` edge carries it, so codegen follows the runtime's own feature with nothing
-  declared downstream. A crate that deliberately wants async codegen against a
-  sync-only runtime can still ask, with `features = ["async"]` or
-  `Builder::set_async_support(true)`.
+  from async code** ("Cannot start a runtime from within a runtime"):
+  `TokioRuntime` now uses `block_in_place`. Two positions still panic and one
+  still stalls (see `TokioRuntime`'s docs); on a hot path convert once with
+  `into_async::<P>()`.
+- **Codegen `async` can be turned off again by a downstream crate.** A pinned
+  `features = ["async"]` on rsbinder's own `rsbinder-aidl` build-dependency
+  leaked through feature unification, so `default-features = false` still
+  generated async code that failed to compile. Codegen now follows the
+  runtime's `async` feature; `Builder::set_async_support(true)` still forces it.
 - **`rsbinder-aidl`: a nested declaration inside a `@VintfStability` type now
-  inherits that stability.** AOSP resolves `@VintfStability` with a scoped
-  lookup that walks to the enclosing type, so a parcelable nested in a
-  `@VintfStability` parcelable is VINTF-stable. rsbinder read only the
-  declaration's own annotations, so such a nested type reported default
-  stability — which is what a `ParcelableHolder` records for it, making this
-  visible on the wire.
+  inherits that stability**, as in AOSP; it previously reported default
+  stability, visible on the wire through `ParcelableHolder`.
 - **`rsbinder-aidl`: a `@VintfStability` interface published through the sync
-  path registered with the default `System` stability.** The generated
-  `declare_binder_interface!` never emitted a `stability:` field, so the macro
-  fell back to `Stability::default()`. Because `System` does not include
-  `Vintf`, a peer requiring VINTF refused the binder — the annotation had no
-  effect at all on a sync service. AOSP emits the field
-  (`generate_rust.cpp`); rsbinder now does too. Parcelables, unions and the
-  async path were already correct.
+  path registered with the default `System` stability**, so peers requiring
+  VINTF refused it. The generated `declare_binder_interface!` now emits
+  `stability:`.
 - **`rsbinder-aidl`: a type nested three or more levels deep could not name a
-  type from a grandparent scope.** The enclosing-scope walk in
-  `lookup_decl_from_name` stopped after two levels, so a reference AOSP
-  resolves — `AidlDefinedType::ResolveName` recurses with no depth limit — was
-  rejected as an unknown type, and with a misleading message at that. The walk
-  now runs to the package boundary.
+  type from a grandparent scope.** Name lookup now walks to the package
+  boundary, as AOSP does.
 
 ### Security
 
 - Raised the `rustls` floor to 0.23.45 for RUSTSEC-2026-0285 (TLS 1.3 handshake
   messages accepted across encryption level boundaries). Affects the `rpc-tls`
-  feature only. The floor is in the manifest, not just the lockfile: a library's
-  `Cargo.lock` does not constrain its consumers, so a `version = "0.23"` floor
-  would have left a downstream free to resolve a vulnerable 0.23.x.
+  feature only. The floor is in the manifest, so it constrains downstream
+  lockfiles too.
 
 ## [0.11.0] - 2026-09-10
 
 ### Migrating from 0.10.0
 
-The short form of this release's breaking changes; *Changed* and *Removed*
-below carry the rationale for the ones that have it. Some entries change only
-behavior or a value, so nothing in your build will warn. The little-endian
-wire fix under *Platform support* belongs here too — it changes bytes only on
-a big-endian host.
+This release's breaking changes; some change only behavior or a value, so
+nothing in your build will warn. The little-endian wire fix under *Platform
+support* belongs here too (it changes bytes only on a big-endian host).
 
-- **`ProcessState::init(path, 0)` no longer means "the default".** The count
-  now reaches the kernel as written, so `0` asks for zero binder threads. The
-  signature did not change, so nothing warns: `cargo-semver-checks` cannot see
-  it and neither can your build. If you meant the default, pass the newly
-  public `DEFAULT_MAX_BINDER_THREADS`. `init_default()` and a `binder://` URI
-  without `?threads=` are unchanged.
-- **`FLAG_PRIVATE_VENDOR` is now `0x10000000`, not `0`.** It was defined as
-  `FLAG_PRIVATE_LOCAL`, so passing it to `transact` set no bit; it now sets
-  bit 28 on the wire, matching AOSP `IBinder.h`. Only the value changed, so
-  nothing warns and a peer sees the difference. `FLAG_PRIVATE_LOCAL` is
-  unchanged (`0`).
-- **`RpcServer::set_root` / `RpcSession::set_root` return `Result<()>`.** They
-  now refuse a *remote* binder (see *Changed*), so they have a value to
-  report. An unused `Result` is only a warning, so a build without
-  `-D warnings` still compiles and the refusal goes unnoticed: add `?` or
-  `.expect(...)` at every call. Nothing else about them changed.
+- **`ProcessState::init(path, 0)` no longer means "the default".** `0` now
+  asks the kernel for zero binder threads, and nothing warns. Pass the newly
+  public `DEFAULT_MAX_BINDER_THREADS` for the default. `init_default()` and a
+  `binder://` URI without `?threads=` are unchanged.
+- **`FLAG_PRIVATE_VENDOR` is now `0x10000000`, not `0`**, matching AOSP
+  `IBinder.h`; passing it to `transact` now sets bit 28 on the wire. Nothing
+  warns. `FLAG_PRIVATE_LOCAL` is unchanged (`0`).
+- **`RpcServer::set_root` / `RpcSession::set_root` return `Result<()>`**, since
+  they now refuse a *remote* binder (see *Changed*). Add `?` or
+  `.expect(...)` at every call; without `-D warnings` the refusal goes
+  unnoticed.
 - **`rpc::transport::TlsStream` gained a required `shutdown_stream()`.**
   Custom stream implementations must add
-  `fn shutdown_stream(&self) -> std::io::Result<()>` (shut the underlying
-  stream down in both directions). There is no default body on purpose:
-  silently doing nothing would leave a client's incoming-connection threads
-  blocked in `recv` with nothing to wake them, so `RpcSession::close_session`
-  would hang on the join. The bundled `TcpStream`/`UnixStream`/`VsockStream`
-  impls are unaffected.
-- **`shutdown` now names one operation; four methods are renamed.** The name
-  had spread to five public methods with five meanings — two of them, on the
-  adjacent `RpcServer` and `ServerGuard`, with opposite join semantics. Only
-  the transport half-close keeps it (`rpc::transport::RpcTransport::shutdown`,
-  the same operation as `TcpStream::shutdown`). The rest are renamed, with no
-  deprecated aliases. Of the four, only `RpcServer::shutdown` was public in
-  0.10.0 — `ServerGuard::shutdown`, `RpcSession::shutdown` and
-  `TlsStream::shutdown` arrived after it, so a 0.10.0 build can only be
-  calling the first:
-  - `RpcServer::shutdown` → `RpcServer::stop_accepting`: raise the accept
-    flag; connected sessions drain as their peers leave; nothing is joined.
-    To end connected sessions too, `RpcServer::terminate`.
-  - `ServerGuard::shutdown` → `ServerGuard::stop_and_join`: stop accepting,
-    end every session, join the threads — what dropping the guard does.
-  - `RpcSession::shutdown` → `RpcSession::close_session`: declare the session
-    dead, shut every connection down, join its incoming threads.
+  `fn shutdown_stream(&self) -> std::io::Result<()>` that shuts the stream down
+  in both directions (a no-op would hang `RpcSession::close_session`). The
+  bundled `TcpStream`/`UnixStream`/`VsockStream` impls are unaffected.
+- **`shutdown` now names one operation; four methods are renamed**, with no
+  deprecated aliases. Only the transport half-close keeps the name
+  (`rpc::transport::RpcTransport::shutdown`). Only the first was public in
+  0.10.0:
+  - `RpcServer::shutdown` → `RpcServer::stop_accepting` (drain; nothing is
+    joined). To end connected sessions too, use `RpcServer::terminate`.
+  - `ServerGuard::shutdown` → `ServerGuard::stop_and_join`.
+  - `RpcSession::shutdown` → `RpcSession::close_session`.
   - `TlsStream::shutdown` → `TlsStream::shutdown_stream` (above).
-- **`RpcError::PeerClosed` is now `RpcError::EndOfStream`.** The variant never
-  knew who ended the stream: this end's own write failing after its own
-  `shutdown` folded into it exactly as a peer's EOF did, so the name and the
-  `Display` text ("RPC peer closed the connection", now "RPC stream ended")
-  put a false attribution in logs. Who decided is `SessionEnd::by`; whether
-  the transport's close signal arrived is `UncleanEndOfStream`. Match arms
-  need the new name; a wildcard arm is unaffected.
+- **`RpcError::PeerClosed` is now `RpcError::EndOfStream`** (`Display`: "RPC
+  stream ended"), since it never knew who ended the stream; that is
+  `SessionEnd::by`. Match arms need the new name.
 - **A TLS stream that ends without `close_notify` is no longer a clean close.**
-  `rpc::RpcError` gained `UncleanEndOfStream` for it (projects to
-  `StatusCode::DeadObject`), and a serve loop that reaches it ends with
-  `Err(DeadObject)` where it used to return `Ok(())`. `TlsTransport::shutdown`
-  now sends `close_notify` before the socket shutdown, so a deliberate close
-  on one end is the clean `EndOfStream` on the other; only a cut stream is
-  unclean. From the moment `shutdown` is called, this end's own sends fail
-  at once with `EndOfStream` — the contract every other backend already
-  met by cutting the socket — and the one send already in flight is
-  allowed to finish before the alert goes out, so every frame a sender was
-  told went out is one the peer reads. That wait is bounded, so a peer
-  that has stopped reading cannot hold teardown; it reads the unclean end
-  it was heading for.
-  Plain-socket backends are unaffected — they have no close signal
-  to miss. Code that treated every TLS end of stream as clean now sees the
-  difference; code matching `RpcError` with a wildcard arm is unaffected.
+  It is the new `RpcError::UncleanEndOfStream` (`StatusCode::DeadObject`), and
+  a serve loop reaching it returns `Err(DeadObject)` instead of `Ok(())`.
+  `TlsTransport::shutdown` now sends `close_notify`, so a deliberate close is
+  still a clean `EndOfStream`; after it, this end's sends fail with
+  `EndOfStream`. Plain-socket backends are unaffected.
 - **`RpcSession::serve_blocking`, `serve_blocking_on` and
   `serve_blocking_clearing_deadline_after_first` return `rpc::SessionEnd`,
-  not `Result<()>`.** The value says how the loop ended on three axes —
-  `stream` (still intact?), `by` (did this end decide?), `reason` (what
-  happened) — and `SessionEnd::into_result()` is the one projection back:
-  `Ok(())` for an intact stream, `Err(StatusCode::DeadObject)` for a lost one.
-  Migration is `.into_result()` on the call. Two ends project differently
-  from before: a deadline that elapsed between frames (idle eviction) is an
-  intact stream and is now `Ok(())` where it was `Err(TimedOut)`; and every
-  lost stream is `DeadObject` — an unexpected `REPLY` (`BadType`) and a frame
-  that was cut (`NotEnoughData`) are told apart by `reason`, not by the code.
-  A local `RpcSession::close_session` or `RpcServer::terminate` now ends every
-  serve loop of the session as `EndedBy::Local` with an intact stream; it
-  used to come back as `Ok(())` or `Err(DeadObject)` depending on whether the
-  worker was parked in `recv` or inside a handler at the time.
-- **`rpc::transport::RpcTransport::shutdown` is a required method.** The
-  method itself arrived after 0.10.0, and the default it first carried did
-  nothing and returned `Ok(())`, so a transport that inherited it
-  left every serve loop and incoming-connection thread parked in `recv` with
-  nothing to wake them, and `RpcSession::close_session` hung on the join — the
-  reason `TlsStream::shutdown_stream` was already required. Every in-tree backend
-  overrides it; a custom transport must now implement it (or return an
-  error and accept that its session cannot be joined). Its rustdoc now
-  states the contract in full: what happens to bytes already received is
-  platform- and backend-dependent and must not be assumed; a reader woken
-  by it returns the end of stream; it is idempotent; its `Err` is
-  diagnostic; it is not `close`.
-- **`rpc::transport::MemTransport::shutdown` models a Linux socket.** Frames
-  already queued on either side are still delivered, then the end of
-  stream, and sends on either side fail — where the form this method first
-  took, after 0.10.0, dropped what was queued on its own side and left the
-  peer untouched. Linux is the
-  deployment target and the platform where a caller that assumes a
-  shutdown discards the queue is wrong; the hermetic backend now exercises
-  that case instead of certifying the assumption. A test that relied on a
-  queued frame vanishing at `shutdown`, or on the peer reading on after it,
-  sees the difference.
-- **`rpc::RpcError` gained `DeadlineMidFrame`.** A read deadline that
-  elapses part-way through a frame was `Truncated` (`NotEnoughData`), the
-  same as a stream that ended mid-frame; it is now `DeadlineMidFrame`
-  (`TimedOut`), and a serve loop that hits it ends with
-  `EndReason::DeadlineMidFrame` — this end's own policy, a lost position.
-  Code matching `RpcError::Truncated` for a deadline case needs the new arm.
-- **A transaction that could not be sent fails with `StatusCode::WouldBlock`.**
-  Two cases that never reached the wire reported other codes: a call on a
-  session with no outgoing connection (a server calling a client proxy
-  outside any handler, the client having opened no incoming connection)
-  returned `FailedTransaction`, and a call whose wait for a free connection
-  slot hit the session deadline returned `TimedOut` — the same code as a
-  reply wait that expired after the peer may already have executed the
-  request. Both are now `WouldBlock`, AOSP's `WOULD_BLOCK` for exactly this:
-  nothing was sent, so the call is safe to retry. `TimedOut` from a transact
-  means the reply wait expired after the request went out — with one
-  exception: on an android-13+ connection whose write deadline is armed
-  (`RpcServer::set_idle_timeout`, which the server applies to its serve-phase
-  and callback slots), a send deadline that expires before the first byte is
-  `TimedOut` too, and nothing was sent in that case either (see the
-  send-failure entry below). `FailedTransaction` keeps its other meanings (an
-  oneway backlog flushed, an attach past the incoming-slot cap).
+  not `Result<()>`.** Add `.into_result()` to the call. Differences from
+  before: idle eviction is now `Ok(())` (was `Err(TimedOut)`), every lost
+  stream is `DeadObject` (tell causes apart by `reason`), and a local
+  `close_session` / `terminate` ends as `EndedBy::Local` with an intact stream.
+- **`rpc::transport::RpcTransport::shutdown` is a required method** (its
+  post-0.10.0 no-op default hung `close_session`). A custom transport must
+  implement it; the rustdoc states the contract.
+- **`rpc::transport::MemTransport::shutdown` models a Linux socket**: queued
+  frames on either side are still delivered, then end of stream, and sends on
+  either side fail. Tests relying on a queued frame vanishing see the
+  difference.
+- **`rpc::RpcError` gained `DeadlineMidFrame`** (`TimedOut`) for a read
+  deadline that elapses mid-frame, previously `Truncated` (`NotEnoughData`);
+  a serve loop ends with `EndReason::DeadlineMidFrame`. Code matching
+  `RpcError::Truncated` for a deadline case needs the new arm.
+- **A transaction that could not be sent fails with `StatusCode::WouldBlock`**
+  (safe to retry), as AOSP does: a call on a session with no outgoing
+  connection (was `FailedTransaction`) and a wait for a free connection slot
+  that hit the deadline (was `TimedOut`). `TimedOut` now means the reply wait
+  expired after the request went out, except for an armed android-13+ write
+  deadline (`RpcServer::set_idle_timeout`) expiring before the first byte.
 - **Dropping a `ServerGuard` now ends the server, connected clients
-  included.** `ServerGuard` arrived after 0.10.0; the form it first took
-  flipped the accept flag and joined the workers, which
-  blocked for as long as any client stayed connected — a `?` or a panic that
-  dropped the guard before the client hung there. `RpcServer::terminate` is
-  new: it stops accepting, ends every session the server minted (their
-  transports are shut down, so workers parked in `recv` wake and exit) and
-  joins the workers; the guard's drop calls it. `RpcServer::stop_accepting`
-  keeps its drain meaning — stop accepting, let peers leave — and reaches
-  nothing a peer keeps open; code that relied on it to end a server wants
-  `terminate`. `RpcSession::close_session` now ends a session whatever its
-  connection count; it
-  used to log a warning and do nothing on a session driven by more than one
-  connection.
-- **rsbinder-aidl rejects `.aidl` it used to accept.** Five inputs that
-  previously generated silently-wrong or non-compiling Rust are now build
-  errors: a `@JavaOnlyStableParcelable` / `cpp_header` / `ndk_header`
-  declaration with no `rust_type`, an `in out` (or `out in`) argument,
-  `self`/`Self`/`super`/`crate` used as a method, argument, enum-member,
-  declaration-name or package segment, an enum discriminant outside its
-  `@Backing` range, and a `@RustDerive` parameter outside AOSP's schema
-  (`Copy`, `Clone`, `PartialOrd`, `Ord`, `PartialEq`, `Eq`, `Hash`; `Debug`
-  and `Default` are accepted and dropped, since the templates always emit
-  them). All but the `in out` case (a plain syntax error) name the
-  declaration.
-- **rsbinder-aidl resolves names in AOSP's order** — enclosing scopes, then
-  imports, then the package. An `import a.IFoo` now outranks a top-level
-  `IFoo` declared in the referencing package (it used to lose to it), and a
-  qualified constant names a *direct* member of its owner: `Outer.X` no
-  longer reaches `Outer.Inner.X`. A build that leaned on either shadowing
-  fails with an unresolved-name diagnostic rather than changing value.
-- **`AidlError::Template` gained a `source` field** carrying the underlying
-  `tera::Error`, whose cause chain holds the detail its `Display` omits.
-  `AidlError` is not `#[non_exhaustive]`, so a `match` arm written as
-  `AidlError::Template { message }` needs `..` added.
+  included**, through the new `RpcServer::terminate` (stop accepting, end
+  every session, join the workers). `RpcServer::stop_accepting` only drains;
+  code that relied on it to end a server wants `terminate`.
+  `RpcSession::close_session` now ends a session whatever its connection
+  count.
+- **rsbinder-aidl rejects `.aidl` it used to accept**: a
+  `@JavaOnlyStableParcelable` / `cpp_header` / `ndk_header` declaration with
+  no `rust_type`, an `in out` argument, `self`/`Self`/`super`/`crate` as an
+  identifier or package segment, an enum discriminant outside its `@Backing`
+  range, and a `@RustDerive` parameter outside AOSP's schema (`Debug` and
+  `Default` are accepted and dropped).
+- **rsbinder-aidl resolves names in AOSP's order** (enclosing scopes, imports,
+  package): an `import a.IFoo` now outranks a same-package `IFoo`, and
+  `Outer.X` no longer reaches `Outer.Inner.X`. Code relying on either fails
+  with an unresolved-name diagnostic.
+- **`AidlError::Template` gained a `source` field** (the `tera::Error`); a
+  `match` arm `AidlError::Template { message }` needs `..`.
 - **`out` arguments of `IBinder` / `ParcelFileDescriptor` / an interface are
-  now `&mut Option<T>`** in generated traits (matching AOSP). The wire is
-  unchanged; implementations need the parameter type updated. `inout` is
-  unaffected.
+  now `&mut Option<T>`** in generated traits, as in AOSP. Update
+  implementations; the wire and `inout` are unchanged.
 - **`@nullable` `out`/`inout` arrays of a primitive or enum are now
-  `&mut Option<Vec<T>>`**, not `&mut Option<Vec<Option<T>>>` — the element
-  `Option` encoded a null-marker word per element that libbinder does not
-  write (AOSP `UsesOptionInNullableVector`). Non-primitive elements keep the
-  `Option`, and fixed-size arrays follow the same rule. Implementations need
-  the parameter type updated.
+  `&mut Option<Vec<T>>`**, not `&mut Option<Vec<Option<T>>>`, matching
+  libbinder's wire (fixed-size arrays too). Update implementations.
 - **`rsbinder::service` is gone** — `Registry`, `Broker`,
   `service::{kernel,rpc}::{Host,Broker}`. Use `serve` / `connect`; the
   call-by-call mapping is under *Removed*.
@@ -981,32 +376,23 @@ a big-endian host.
 - **Low-level `Parcel` accessors are `pub(crate)`** (`as_ptr`, `as_mut_ptr`,
   `capacity`, `set_data_size`, `close_file_descriptors`, `is_empty`,
   `from_vec`), along with the RPC-ops plumbing and three `thread_state`
-  helpers. `Parcel::from_ipc_parts` remains the supported raw-buffer entry
-  point; `Parcel::set_for_rpc` is now internal (see below).
+  helpers. Use `Parcel::from_ipc_parts` for raw buffers.
 - **The RPC wire codec is private** (`WireMessage`, `WireCodec`, `R34Codec`,
-  `Android13PlusCodec`, `WireReply`, `WireTransaction`, `RpcState`). The
-  supported RPC surface is `RpcServer` / `RpcSession` / `RpcProxy`, the
-  transport traits, and the address and identity types.
+  `Android13PlusCodec`, `WireReply`, `WireTransaction`, `RpcState`). Use
+  `RpcServer` / `RpcSession` / `RpcProxy` and the transport traits.
 - **`LazyServiceRegistrar::register_service` now registers, and the process
-  exits when its last client goes away.** It used to touch nothing outside
-  the struct. Code that called it *and* did its own `addService` /
-  `registerClientCallback` must drop those calls; code that relied on it
-  being inert needs `set_active_services_callback` or `force_persist`. Its
-  signature moved too: it takes `impl Into<SIBinder>` (drop the
-  `.as_binder()`) and returns `Result<(), Status>`, which keeps the service
-  manager's refusal code and message. `?` into a `StatusCode` still compiles
-  — `From<Status> for StatusCode` covers it — but a binding or `map_err` that
-  named `StatusCode` has to be retyped.
-- **`WIBinder` has no `Native` fallback for proxies.** A proxy's weak identity
-  is stamped at construction; only an exhaustive `match` on the enum notices.
-- **`IMemoryHeap::base` returns `Option<SharedBytes<'_>>`**, not `&[u8]`. The
-  window aliases memory another process writes at any moment, which a `&[u8]`
-  cannot soundly describe. The view is read-only (`load` / `copy_to` / `slice`
-  / `to_vec`); writes go through `write_at` on the concrete heap types, which
-  also refuses a `FLAG_READ_ONLY` mapping.
-- **Nine module paths are gone; the crate root is the only way in.** Each of
-  them re-exported exactly what the root already did, so the fix is to drop
-  the module segment — every replacement below is the same type:
+  exits when its last client goes away.** Drop your own `addService` /
+  `registerClientCallback` calls next to it; to keep the process alive use
+  `set_active_services_callback` or `force_persist`. It now takes
+  `impl Into<SIBinder>` (drop `.as_binder()`) and returns
+  `Result<(), Status>`; retype bindings that named `StatusCode`.
+- **`WIBinder` has no `Native` fallback for proxies**; only an exhaustive
+  `match` on the enum notices.
+- **`IMemoryHeap::base` returns `Option<SharedBytes<'_>>`**, not `&[u8]`: a
+  read-only view (`load` / `copy_to` / `slice` / `to_vec`). Write through
+  `write_at` on the concrete heap types.
+- **Nine module paths are gone; the crate root is the only way in.** Drop the
+  module segment — every replacement below is the same type:
 
   | Was | Now |
   |---|---|
@@ -1021,1512 +407,574 @@ a big-endian host.
   | `rsbinder::binder_async::{BoxFuture, BinderAsyncPool, BinderAsyncRuntime}` | `rsbinder::{BoxFuture, BinderAsyncPool, BinderAsyncRuntime}` |
   | `rsbinder::file_descriptor::ParcelFileDescriptor` | `rsbinder::ParcelFileDescriptor` |
 
-  `rsbinder::status::Result` is the one that was worth removing rather than
-  merely deduplicating: it is `Result<T, Status>`, while `rsbinder::Result`
-  is `Result<T, StatusCode>` — a different type with the same name, so
-  `use rsbinder::status::Result;` silently changed what `Result` meant in a
-  file. Use `BinderResult`, which is the same type under a name that does
-  not collide. A type's methods are unaffected by any of this; only the path
-  to name the type changes. Domain modules (`hub`, `rpc`, `thread_state`,
-  `shared_memory`, `entry`, `bridge`, and the rest) are untouched.
+  `rsbinder::status::Result` (`Result<T, Status>`) collided with
+  `rsbinder::Result` (`Result<T, StatusCode>`); use `BinderResult`, the same
+  type. Domain modules (`hub`, `rpc`, `thread_state`, `shared_memory`,
+  `entry`, `bridge`, …) are untouched.
 - **`Parcel::is_for_rpc` is deprecated in favour of `Parcel::is_kernel_backed`,
-  with the polarity inverted.** `!p.is_kernel_backed()` is the literal
-  replacement. The old name described one consumer of the mode rather than
-  what the flag controls — whether the kernel driver's object table backs the
-  parcel — and it read fail-open at the one place it guards: "deny if this is
-  RPC" lets through a parcel that is neither kernel nor RPC, while "deny
-  unless the kernel backs this" does not. `Parcel::set_for_rpc` is now
-  internal; production code reaches the mode through the RPC session, and
-  `rsbinder::to_bytes` covers the data case.
-- **`rsbinder::get_interface` is now `rsbinder::get_interface_async`.** It is
-  the tokio one, and nothing in the old name said so while `hub::get_interface`
-  sat beside it, synchronous. Matches `connect_async`. It now looks up through
-  `hub::try_get_interface`, so on Android 10 it also drops the ~5s client-side
-  poll `hub::get_interface` did; if you need to wait, use
-  `hub::wait_for_interface`.
+  with the polarity inverted**: replace with `!p.is_kernel_backed()`.
+  `Parcel::set_for_rpc` is now internal; use the RPC session, or
+  `rsbinder::to_bytes` for data.
+- **`rsbinder::get_interface` is now `rsbinder::get_interface_async`** (it is
+  the tokio one), matching `connect_async`. It no longer does the Android 10
+  ~5s client-side poll; use `hub::wait_for_interface` to wait.
 - **`hub::get_service` / `get_interface` and the two `ServiceManager` methods
-  of the same names are removed** (deprecated since 0.10.0). The replacement
-  is **`try_get_service` / `try_get_interface`**, which issue the same wire
-  call `get_service` did (`getService`, or `getService2` on Android 16 and
-  17) and therefore behave identically on Android 11+ and
-  on Linux — including letting the service manager start an unregistered
-  lazy service, which `check_service` does *not* do. (Android 15 `r6`+ is the
-  exception: its `checkService` returns a union rsbinder does not parse, so
-  `check_service` is sent as `getService` there and starts a lazy service
-  too.) They differ only in returning the failure instead of flattening it:
+  of the same names are removed** (deprecated since 0.10.0). Use
+  **`try_get_service` / `try_get_interface`**, the same wire call, which
+  return the failure instead of flattening it:
 
   | Was | Now |
   |---|---|
   | `hub::get_service(n)` | `hub::try_get_service(n).ok().flatten()` |
   | `hub::get_interface::<T>(n)` | `hub::try_get_interface::<T>(n)?.ok_or(StatusCode::NameNotFound)` |
 
-  What you lose is the Android 10 client-side ~5s poll, which is the reason
-  these were deprecated: the wait was inconsistent across versions and
-  invisible in the name. If you want it, ask for it — `wait_for_service` /
-  `wait_for_interface` block until the service appears, on every version.
+  The Android 10 client-side ~5s poll is gone; use `wait_for_service` /
+  `wait_for_interface` to wait on every version.
 - **A `ParcelableHolder` no longer moves freely between kernel and RPC
-  parcels.** Four behavior changes, none of which your build can see; all
-  four are under *Fixed* with the reasoning:
-  - A holder received over RPC (or decoded with `from_bytes`) forwarded into
-    a kernel binder transaction is `BadType` as soon as it carries a payload
-    — the refusal does not look at what is in it. Those bytes were never
-    checked against a kernel object table, and a kernel reader accepts a
-    null-pointer, null-cookie `flat_binder_object` without one.
-  - A holder received over kernel binder forwarded onto an RPC transaction,
-    or into `to_bytes`, is `BadType` when its payload carries an object
-    (`FdsNotAllowed` when every object in it is a file descriptor). The
-    object table used to be dropped and the bytes copied as payload.
-  - A holder read out of an RPC parcel now yields an RPC-mode sub-parcel, so
-    24 bytes that merely look like a `flat_binder_object` no longer decode as
-    a binder on the way back out — reading one that way is now `BadType`.
-  - A holder read out of an RPC *session*'s parcel passed to `to_bytes` is
-    `BadType`, whatever its payload holds. `get_parcelable::<T>` for the
-    payload's own type still resolves it into a value that encodes anywhere.
+  parcels** (details under *Fixed*); nothing in the build warns:
+  - one received over RPC (or from `from_bytes`) is `BadType` in a kernel
+    transaction once it carries a payload;
+  - one received over kernel binder is `BadType` on RPC or in `to_bytes` when
+    its payload carries an object (`FdsNotAllowed` if all are fds);
+  - one read from an RPC parcel yields an RPC-mode sub-parcel, so reading a
+    binder out of it is `BadType`;
+  - one read from an RPC *session*'s parcel is `BadType` in `to_bytes`;
+    `get_parcelable::<T>` still resolves it to a value that encodes anywhere.
 - **An fd written to an RPC parcel with no negotiated fd mode now fails with
-  `FdsNotAllowed`, not `BadType`.** Observable to an RPC peer, and a fidelity
-  fix: AOSP's `Parcel::writeFileDescriptor` answers `FDS_NOT_ALLOWED` for
-  exactly this condition (`FileDescriptorTransportMode::NONE`;
-  android-15.0.0_r36 and android-16.0.0_r4 alike). The old code was faithful
-  to android-13.0.0_r84, which rejected every fd on an RPC parcel with a
-  blanket `if (isForRpc()) return BAD_TYPE;` — a shape from before
-  fd-over-RPC existed and one rsbinder no longer implements. A binder
-  written to a parcel with no session stays `BadType`; that condition has no
-  AOSP counterpart, and `InvalidOperation` is already spoken for by the
-  cross-stack refusal, where it matches AOSP.
-- **Test- and fuzz-only entry points need a feature.** The nine `__fuzz_*`
-  decoders now need `fuzzing`, and `RpcSession::__slot_count`,
-  `__incoming_thread_*`, `RpcServer::__set_attach_shutdown_probe` and
-  `Parcel::__set_for_rpc` need `test-util`. They are `#[doc(hidden)]`, which
-  hides an item from the documentation and from nothing else — so the nine
-  0.10.0 already shipped (its eight `__fuzz_*` decoders and
-  `__set_attach_shutdown_probe`) were in the ABI and in what
-  `cargo-semver-checks` compares. If you were calling one, enable the
-  feature; if you were not, those nine left your build. The rest are new
-  here.
+  `FdsNotAllowed`, not `BadType`**, as current AOSP does. A binder written to
+  a parcel with no session stays `BadType`.
+- **Test- and fuzz-only entry points need a feature.** The `__fuzz_*`
+  decoders need `fuzzing`; `RpcSession::__slot_count`, `__incoming_thread_*`,
+  `RpcServer::__set_attach_shutdown_probe` and `Parcel::__set_for_rpc` need
+  `test-util`. If you called one of the nine 0.10.0 shipped (eight
+  `__fuzz_*` and `__set_attach_shutdown_probe`), enable the feature.
 
 ### Platform support
 
-- **The parcel wire is little-endian on every host.** It used to be whatever
-  the CPU was: nothing said so, nothing checked it, and a big-endian target
-  built clean and then produced parcels no other machine could read. RPC was
-  the worst of it — the framing was already explicit little-endian, so the
-  handshake succeeded and only the body was wrong.
-
-  **No little-endian build produces a different byte than before.**
-  `to_le_bytes` is the identity there, so the encoding is still the memory
-  layout; a big-endian host pays a swap and gains parcels its peers can read.
-  Verified by capturing the emitted bytes as goldens before the change and
-  running them unchanged afterwards, on x86_64 and on s390x under qemu-user.
-
-  Not everything moved: the `BC_*`/`BR_*` command stream and the UAPI structs
-  (`flat_binder_object`, `binder_transaction_data`) go to the kernel driver,
-  which parses them with native loads, and stay host-native. On a big-endian
-  host a kernel parcel carrying a binder is therefore a mixture — correctly,
-  since only the scalars cross to a peer.
-
-  Support tiers, stated honestly: the RPC path is supported and verified on
-  big-endian; the kernel-binder path is structurally correct but unverified,
-  because no big-endian system ships binderfs to test it on.
+- **The parcel wire is little-endian on every host.** It used to follow the
+  CPU, so a big-endian host produced parcels no other machine could read.
+  Little-endian builds emit identical bytes. The `BC_*`/`BR_*` stream and
+  UAPI structs stay host-native, as the kernel driver requires. The RPC path
+  is verified on big-endian (s390x under qemu); the kernel path is
+  structurally correct but unverified.
 
 ### Added
 
-- **rsbinder:** `to_bytes` / `from_bytes` — store a value the way an
-  interface already describes it. An AIDL definition is a schema and the
-  generated code is a complete serializer; these give it somewhere to write
-  other than a transaction, so a project need not maintain a second
-  description of the same data in protobuf or serde:
+- **rsbinder:** `to_bytes` / `from_bytes` — store a value using its AIDL
+  encoding, without a second schema in protobuf or serde:
 
   ```rust
   std::fs::write("settings.bin", rsbinder::to_bytes(&settings)?)?;
   let settings: Settings = rsbinder::from_bytes(&std::fs::read("settings.bin")?)?;
   ```
 
-  The bytes are the IPC bytes — same codec, same layout, and, for a value that
-  carries no object and no `ParcelableHolder` filled from a kernel parcel,
-  portable across architectures now that the wire is fixed
-  little-endian. Binders and file
-  descriptors are refused at the point they are written, before any `dup`,
-  since neither means anything outside the process that made it; and bytes
-  that merely look like a binder object are never turned into one on the way
-  back. Reading is strict: leftover bytes are an error, not a partial read.
-  Forward compatibility comes from the parcelable's length header, so wrap
-  what you store in a parcelable rather than storing a bare scalar. Behind
-  the `rpc` feature, which is where the parcel mode it uses lives. See the
-  book's *Storing Values*, and `example-hello`'s `serde_demo` for the whole
-  thing running against real `.aidl` definitions.
-
+  Binders and file descriptors are refused on write, reading is strict
+  (leftover bytes are an error), and a parcelable wrapper gives forward
+  compatibility. Behind the `rpc` feature. See the book's *Storing Values*
+  and `example-hello`'s `serde_demo`.
 - **rsbinder:** a **gateway** is now one line. `Strong<I>` implements
-  `Interface` (delegating to the binder it holds), and generated interfaces —
-  from `.aidl` and from `#[interface]` alike — implement themselves for
-  `Strong<dyn IFoo>`, so a proxy satisfies `BnFoo::new_binder`'s bound:
-  `serve(uri)?.add("foo", BnFoo::new_binder(upstream_proxy))?` re-publishes a
-  service reached over one transport onto another. `getInterfaceVersion` /
-  `getInterfaceHash` report the *upstream's* values, not the delegating
-  module's. Binder-typed arguments still have to be re-wrapped by hand — see
-  the book's [cross-transport chapter], which also covers what stops at a
-  gateway (caller identity, fd rights, uid, death, one worker per forwarded
-  call), and `example-hello`'s new `gateway_service` binary.
+  `Interface` and generated interfaces implement themselves for
+  `Strong<dyn IFoo>`, so `serve(uri)?.add("foo", BnFoo::new_binder(upstream_proxy))?`
+  re-publishes a service onto another transport; version and hash report the
+  upstream's values. Binder arguments still need re-wrapping; see the book's
+  [cross-transport chapter] and `example-hello`'s `gateway_service`.
 
   [cross-transport chapter]: https://hiking90.github.io/rsbinder/cross-transport-services.html
-- **`rsbinder::bridge::Rewrap`** — one local wrapper per remote binder, for
-  gateways that forward a binder *argument*. Re-wrapping inline
-  (`BnCallback::new_binder(cb.clone())`) is correct per call and wrong across
-  calls: it mints a new object each time, so an upstream that pairs
-  `register(cb)` with `unregister(cb)` by identity never matches the second.
-  `Rewrap::new(BnCallback::new_binder)` then `.wrap(cb)` returns the
-  same object for the same live remote. It holds only weak references, so it
-  never keeps a wrapper alive; entries go when the remote dies (death
-  notification), when the wrapper is dropped, or on `purge_dead()`.
+- **`rsbinder::bridge::Rewrap`** — one local wrapper per remote binder, so a
+  gateway forwarding a binder argument keeps identity across calls
+  (`register(cb)` / `unregister(cb)`). `Rewrap::new(BnCallback::new_binder)`
+  then `.wrap(cb)`; holds only weak references, pruned on death, drop or
+  `purge_dead()`.
 - **rsbinder (RPC):** client-side **incoming (callback) connections** —
   `RpcUnixClientConfig::incoming_connections(n)`,
   `RpcSession::add_incoming_connection_android13plus_with_config`, and
-  `ClientOptions::incoming_connections` (AOSP `setMaxIncomingThreads`).
-  Until now a server could reach a client's callback only from inside a
-  handler answering that client; a call from any other server thread
-  blocked forever. With `n ≥ 1` the client attaches `n` connections the
-  server sends on, each served by a thread the session owns, so callbacks
-  work from timers, workers, and oneway notifications. Such a session also
-  observes the server's death as soon as the connection drops — eagerly, not
-  precisely: losing the last incoming connection *is* the session's death,
-  so a server that retires only that connection (its `set_reply_timeout`
-  elapsing on a slow callback, say) tears the whole session down, founding
-  connection included. The threads
-  keep the session alive until `RpcSession::close_session()` (which now shuts
-  every connection down and joins them) or the server closes the session.
-  Android-13+ profile, Unix sockets.
+  `ClientOptions::incoming_connections` (AOSP `setMaxIncomingThreads`), so a
+  server can call a client's callbacks from any thread. Losing the last
+  incoming connection is the session's death. Android-13+ profile, Unix
+  sockets.
 - **rsbinder (RPC):** `ClientOptions::handshake_timeout` and
   `RpcUnixClientConfig::handshake_timeout` — a deadline for the connection
-  **handshake**, the phase `timeout` cannot reach because it is applied to a
-  session that does not exist yet. Covers the founding connect and every
-  fan-out / incoming attach on `?profile=android13plus`, plus the `tls://`
-  `connect(2)` and TLS handshake. `None` (default) keeps the previous
-  unbounded behavior; without it a peer that accepts the socket and then
-  writes nothing hangs `Client::open` forever. The r34 wire has no
-  connection handshake for it to bound, so setting it on a plain
-  (non-`tls://`, non-versioned) endpoint is `StatusCode::BadValue` — per
-  `ClientOptions`' rule that an option which does not apply is refused,
-  never ignored. The client-side counterpart of
-  `ServeOptions::handshake_timeout`.
-- **rsbinder (RPC):** `RpcServer::set_reply_timeout` — bounds how long this
-  server waits for a reply to a callback it issued, by setting
-  `RpcSession::set_timeout` on every session the server builds. `None`
-  (default) keeps the previous block-forever behavior. Callback connections
-  are exempt from the `set_idle_timeout` *read* deadline (a sticky
-  `SO_RCVTIMEO` would cut this very wait short), so this is the only bound
-  available on that path.
+  handshake on `?profile=android13plus` and `tls://` (default `None`,
+  unbounded). On a plain r34 endpoint it is `StatusCode::BadValue`.
+  Client-side counterpart of `ServeOptions::handshake_timeout`.
+- **rsbinder (RPC):** `RpcServer::set_reply_timeout` — bounds how long the
+  server waits for a reply to a callback it issued (default `None`).
 - **rsbinder (`binder`):** `Strong::try_into_async` — the fallible form of
-  `into_async`. A local service published sync-only (`Bn*::new_binder`)
-  cannot back the async view; the generated cast reports `BadType`, which
-  `into_async` turns into a panic (now documented on it).
-- **rsbinder (RPC, `vsock`):** the vsock transport implements the raw
-  (unframed) byte access the android-13+ wire profile needs. Until now
-  `vsock://…?profile=android13plus` parsed and then failed at the first
-  handshake byte — on the Microdroid/AVF target the backend exists for, where
-  the peer is real libbinder and speaks only that profile.
+  `into_async`, returning `BadType` for a sync-only local service where
+  `into_async` panics.
+- **rsbinder (RPC, `vsock`):** `vsock://…?profile=android13plus` now works
+  (it failed at the first handshake byte), e.g. against libbinder on
+  Microdroid/AVF.
 - **rsbinder (kernel):** a thread that talked to the binder driver now sends
-  `BINDER_THREAD_EXIT` (after a final flush) when it ends — AOSP
-  `IPCThreadState::threadDestructor`. Without it every short-lived thread that
-  made one call left a `binder_thread` behind in the kernel until the fd
-  closed, and a recycled tid inherited the dead thread's looper state.
+  `BINDER_THREAD_EXIT` when it ends, as AOSP does, instead of leaving a
+  `binder_thread` behind in the kernel.
 - **rsbinder (`hub`):** an `android_15` feature — the Android 15
-  service-manager protocol from `android-15.0.0_r6` on. That release inserted
-  `getService2` at index 1 of `IServiceManager` and shifted every transaction
-  code after it by one, without changing the SDK version, so Android 15 has
-  two protocols and no way to tell them apart by version. `android_14` still
-  serves the initial release; enable both (`android_14_plus` and everything
-  wider do) and `hub::default` probes the running service manager once to
-  pick between them. Only one enabled still works — the other numbering is
-  refused, with the missing feature named.
-
-  The module reaches services through `getService` (code 0) only, including
-  `check_service`. `getService2`/`checkService` return a `Service` union
-  whose payload *is* release-dependent (`r6` sends
-  `{binder, accessor}`, `r20`–`r36` send `{serviceWithMetadata, accessor}`),
-  and nothing on the wire says which; `getService` returns a bare
-  `@nullable IBinder` throughout. Not parsing that union is what lets one
-  module cover `r6` through `r36`. The union's `accessor` arm — VINTF
-  `<accessor>` resolution over RPC — is consequently not supported on
-  Android 15; that bridge remains Android 16 only.
-- **rsbinder (`lazy_service`):** `LazyServiceRegistrar::instance` — the
-  process-wide registrar, AOSP `getInstance`. A registrar has to outlive the
-  services it registers: the `IClientCallback` binder survives it (the
-  service manager holds a reference), but its link back to the bookkeeping is
-  weak, so dropping the last handle leaves the service manager calling a
-  callback that does nothing — services registered, process never shutting
-  down, nothing logged. `new` is still there for a second, independent
-  registrar (AOSP `createExtraTestInstance`) and now says so.
-- **rsbinder (`lazy_service`):** `LazyServiceRegistrar::set_active_services_callback`
-  — AOSP `setActiveServicesCallback`. Reports whether any service in the
-  process has clients, and by returning `true` takes the shutdown decision
-  over from the registrar. Fires only when the answer changes.
-- **example-hello (`hello_callback_demo`):** a real lazy service now — it
-  registers through `LazyServiceRegistrar` and exits by itself once the last
-  client goes away, rather than printing `onClients` transitions for a human
-  to read. `tests/scripts/run_lazy_service_ac.sh` runs it against `rsb_hub`
-  and gates on the exit status, so the half of the lazy path that only exists
-  on a wire — the flag reaching the registry, the client callback landing,
-  the hub's 5-second poller driving the shutdown, `tryUnregisterService`
-  actually removing the name — is covered automatically for the first time.
-  `example-hello/cpp/run_lazy_service_stage3.sh` runs the same thing against
-  Android's own `servicemanager` instead of `rsb_hub`, which removes the
-  circularity of testing our port against our port.
-- **rsbinder-tools (`rsb_hub`):** an honoured `tryUnregisterService` now logs
-  `Unregistering <name>`, as AOSP `ServiceManager.cpp` does. Without it a
-  lazy shutdown and a crash are indistinguishable in the log — the name
-  disappears either way, since the death notification would clear it too.
-- **rsbinder-tools (`rsb_service`):** a new CLI for asking the running service
-  manager what it knows — the Linux counterpart of Android's `service` and
-  `dumpsys -l`. `list`, `info`, `check`, `declared`, `instances`,
-  `connection`, and `dump <name> [args...]` (which sends `DUMP_TRANSACTION`
-  to any service, not just the hub). Exit status is the answer: `0` yes, `1`
-  no, `2` the question could not be answered. It is an ordinary binder client,
-  so `rsb_hub`'s policy applies to it like anything else, and a denial is
-  reported as a denial rather than as an empty result.
-- **rsbinder-tools (`rsb_hub`):** `dump` support. `rsb_service dump manager`
-  (or a `DUMP_TRANSACTION` to handle 0) prints the registry as the hub sees
-  it: every registration with its pid, uid, dump-priority flags and callback
-  counts, the death-subscription count, the access-control mode, and the
-  names something is *waiting* on that nothing has registered. Gated on
-  `list`, with each name filtered by `find`; withheld names are counted, not
-  listed. AOSP's `servicemanager` does not implement `dump` at all — on
-  Android these questions are answered by `dumpsys`, `service list` and the
-  init/VINTF files, none of which exist on Linux.
-- **rsbinder-tools (`rsb_hub`):** service-supervisor integration. `SIGTERM`
-  and `SIGINT` now stop the hub cleanly (exit 0 with a log line, instead of
-  dying by signal), and under systemd `Type=notify` it reports `READY=1` only
-  once it holds handle 0 — so units ordered `After=` it cannot race the
-  registry — plus `STOPPING=1` on a deliberate stop and a `STATUS=` line for
-  `systemctl status`. No `libsystemd` dependency: `$NOTIFY_SOCKET` takes one
-  datagram. Starting a second hub on a device that already has one now names
-  the cause instead of surfacing a raw ioctl errno.
-- **rsbinder (hub):** error-preserving `try_*` counterparts for the client
-  calls that used to swallow the service manager's `Status` —
-  `try_list_services`, `try_is_declared`, `try_get_declared_instances`,
-  `try_get_connection_info`, `try_get_service_debug_info` (each on
-  `ServiceManager` and as a free function). The swallowing wrappers report a
-  policy denial as an empty list / `false` / `None`, indistinguishable from
-  the negative answer; anything that must explain *why* needs the status.
-
-- **rsbinder-tools (`rsb_hub`):** on-demand service start. A `[[service]]`
-  entry with `start = { systemd = "unit" }` or `start = { exec = [...] }` is
-  brought up when a `getService` misses it — AOSP's `tryStartService`, with
-  the declaration standing in for the `ctl.interface_start` property. Until
-  now the lazy-service machinery was all present (the client-callback poller,
-  `onClients`, `tryUnregisterService`) except the trigger, so
-  `wait_for_service` on a service that had not started yet waited forever.
-  `checkService` still never starts anything. At most one attempt per name is
-  outstanding at a time, so polling cannot spawn a copy per attempt.
-- **rsbinder-tools (`rsb_hub`):** the configuration is now checked before it
-  is read, and `rsb_hub` refuses to start if it or any file in it is writable
-  by anyone but its owner, or owned by someone other than root or `rsb_hub`.
-  A `start` entry runs with `rsb_hub`'s privileges and is triggered by any
-  client allowed to look the name up, so a file anyone can edit is a file
-  anyone can use to run code. Same discipline sudo, ssh and cron apply.
+  service-manager protocol from `android-15.0.0_r6` on, which shifted
+  transaction codes without changing the SDK version. `android_14` still
+  serves the initial release; with both enabled `hub::default` probes once
+  and picks. Lookups go through `getService` only, so VINTF `<accessor>` is
+  not supported on Android 15.
+- **rsbinder (`lazy_service`):** `LazyServiceRegistrar::instance`, the
+  process-wide registrar (AOSP `getInstance`; `new` remains for an independent
+  one), and `set_active_services_callback` (AOSP `setActiveServicesCallback`;
+  returning `true` takes over the shutdown decision).
+- **example-hello (`hello_callback_demo`):** now a real lazy service that
+  exits once the last client goes away, tested against both `rsb_hub` and
+  Android's `servicemanager`. `rsb_hub` logs `Unregistering <name>` for an
+  honoured `tryUnregisterService`, as AOSP does.
+- **rsbinder-tools (`rsb_service`):** a new CLI for querying the service
+  manager (Linux counterpart of `service` / `dumpsys -l`): `list`, `info`,
+  `check`, `declared`, `instances`, `connection`, `dump <name> [args...]`.
+  Exit status `0` yes, `1` no, `2` could not answer; policy denials are
+  reported as such.
+- **rsbinder-tools (`rsb_hub`):** `dump` support: `rsb_service dump manager`
+  prints registrations, subscriptions, access-control mode and names being
+  waited on. Gated on `list`, filtered by `find`.
+- **rsbinder-tools (`rsb_hub`):** service-supervisor integration: clean exit
+  on `SIGTERM` / `SIGINT`, and systemd `Type=notify` (`READY=1` once it holds
+  handle 0, `STOPPING=1`, `STATUS=`) without `libsystemd`. A second hub on the
+  same device names the cause.
 - **rsbinder (hub):** `hub::get_declared_instances` and
-  `hub::get_connection_info` — the client half of the two calls above.
-  `isDeclared` had a wrapper; these two were reachable only through the raw
-  AIDL proxy. Available from the Android 12 and 13 protocols respectively,
-  and on Linux.
-- **rsbinder-tools (`rsb_hub`):** service declarations. A `[[service]]` entry
-  in the configuration names a concrete instance
-  (`pack.age.IFoo/instance`, split as AOSP's `NameUtil.h` splits it) and
-  answers `isDeclared`, `getDeclaredInstances` and `getConnectionInfo` — the
-  three calls that were stubs because they read VINTF manifests on Android
-  and there is no VINTF on a plain Linux host. A declaration is the
-  equivalent statement: these instances are expected to exist, so a client
-  can tell "not installed" from "not started yet". Declared instances are
-  filtered by `find`, as AOSP filters `getUpdatableNames`. A host that
-  declares nothing behaves exactly as before.
+  `hub::get_connection_info` (Android 12 / 13 protocols and Linux), and
+  error-preserving `try_list_services`, `try_is_declared`,
+  `try_get_declared_instances`, `try_get_connection_info` and
+  `try_get_service_debug_info` (on `ServiceManager` and as free functions).
+- **rsbinder-tools (`rsb_hub`):** on-demand service start: a `[[service]]`
+  entry with `start = { systemd = "unit" }` or `start = { exec = [...] }` is
+  started when a `getService` misses it (AOSP `tryStartService`), at most one
+  attempt per name at a time; `checkService` never starts anything. `rsb_hub`
+  now refuses a configuration writable by anyone but its owner, or owned by
+  someone other than root or `rsb_hub`.
+- **rsbinder-tools (`rsb_hub`):** service declarations: a `[[service]]` entry
+  (`pack.age.IFoo/instance`) answers `isDeclared`, `getDeclaredInstances` and
+  `getConnectionInfo` in place of VINTF, filtered by `find`.
 - **rsbinder:** `WIBinder` now implements `PartialEq<SIBinder>` (and the
-  reverse), so a `DeathRecipient` can ask the question it actually has —
-  "is this the binder that died?" — as `*who == stored`. Writing it by hand
-  meant downgrading the stored strong reference and comparing two weaks, which
-  was the shape of the bug fixed below.
+  reverse), so a `DeathRecipient` can test `*who == stored`.
 - **rsbinder (`macros` feature):** `#[rsbinder::interface]`,
-  `#[derive(Parcelable)]` and `#[derive(BinderEnum)]` — declare a binder
-  interface as a Rust trait and its data types as ordinary structs and enums,
-  with no `.aidl` file and no `build.rs`. `&mut T` is an out parameter,
-  `#[inout]` makes it round-trip, `Option<T>` is nullable, `#[oneway]` drops
-  the reply, and transaction codes follow declaration order. The macros fill
-  the same render structs `rsbinder-aidl` fills and run the same templates, so
-  a declaration here and the equivalent `.aidl` produce **identical** generated
-  code — golden-tested in `rsbinder-macros`, interface and parcelable alike.
-  `#[derive(Parcelable)]` emits only the codec, leaving `Default`/`Debug`/… to
-  the usual derives. `#[derive(BinderEnum)]` needs `#[repr(i8|i32|i64)]` (the
-  wire format) and explicit variant values, and is **closed**: an undeclared
-  value is `BadValue`, where an `.aidl` enum carries it through — use `.aidl`
-  or `declare_binder_enum!` across version skew. `.aidl` stays canonical for
-  unions, constants, `@VintfStability`, `@EnforcePermission`,
-  `ParcelableHolder`, generics and nested types. Off by default; the macros
-  pull the AIDL compiler in as a proc-macro dependency.
+  `#[derive(Parcelable)]` and `#[derive(BinderEnum)]` — declare an interface
+  as a Rust trait with no `.aidl` or `build.rs`, generating code identical to
+  the equivalent `.aidl`. `&mut T` is out, `#[inout]` round-trips,
+  `Option<T>` is nullable, `#[oneway]` drops the reply. `BinderEnum` needs
+  `#[repr(i8|i32|i64)]` and is closed (undeclared values are `BadValue`).
+  `.aidl` stays canonical for unions, constants, `@VintfStability`,
+  `@EnforcePermission`, `ParcelableHolder`, generics and nested types.
 - **rsbinder-aidl:** new public `render` module — `FnMembers`,
-  `InterfaceRender` / `ParcelableRender` / `EnumRender`, and
-  `render_interface` / `render_parcelable` / `render_enum`. This is the seam
-  `rsbinder-macros` plugs into: the templates and their inputs are now a
-  documented surface rather than private detail, so a second front-end cannot
-  drift from the AIDL one. Generated output is byte-for-byte unchanged. The
-  input structs are `#[non_exhaustive]` with `new()` constructors, so a
-  template gaining a field stays a minor release, and `ParcelableMember` is a
-  named struct rather than a five-element tuple whose two adjacent `bool`s
-  could be swapped without a compile error.
-- **rsbinder-aidl:** `Builder::dest_dir` — set the output directory directly
-  instead of through the process-wide `OUT_DIR` environment variable, which a
-  caller outside a `build.rs` cannot set without a data race.
-
+  `InterfaceRender` / `ParcelableRender` / `EnumRender`, `ParcelableMember`,
+  and `render_interface` / `render_parcelable` / `render_enum`, the seam
+  `rsbinder-macros` uses. Input structs are `#[non_exhaustive]` with `new()`.
+  Generated output is unchanged.
+- **rsbinder-aidl:** `Builder::dest_dir` — set the output directory without
+  the process-wide `OUT_DIR` variable.
 - **rsbinder (entry API):** `rsbinder::serve(uri)` / `rsbinder::connect::<dyn I>(uri)`
-  / `rsbinder::Client` — one bootstrap for every transport, selected by a
-  URI (`binder://`, `unix://`, `unix-abstract://`, `vsock://`, `tls://`,
-  `#service`, `?profile=android13plus`). `serve("binder://")?.add(name,
-  BnFoo::new_binder(impl))?.run()?` is the whole kernel service setup
-  (`ProcessState` init + thread pool + `hub::add_service` + join); the same
-  three lines with `unix:///path` are an RPC server. Options that do not fit
-  a URI go through `ServeOptions` / `ClientOptions`; an option for the wrong
-  transport is `BadValue` at `run`/`open` time, logged. `connect_async` under
-  the `tokio` feature. `CallRestriction` is now re-exported at the crate root.
-  `ServerGuard::server()` and `Client::session()` are the escape hatches to
-  the underlying `RpcServer` / `RpcSession` (bound address after a `:0`
-  port, session counters, RPC-only powers the entry layer does not wrap).
-  `Client::open_with`'s closure also receives the parsed `Endpoint`, and
-  `Endpoint::supports_fd_passing()` names the one predicate behind fd-mode
-  validation, so transport-conditional options never need URI string matching.
-  `CallRestriction` is documented, `#[non_exhaustive]`, and `PartialEq`.
-- **rsbinder (rpc):** `RpcSession::close_session()` — declare a session dead now
-  (obituaries + release of the peer's local objects, AOSP `RpcState::clear`).
-  This is the only way to break the `session → local object → stored proxy →
-  session` cycle for a session that has no serve loop and will never transact
-  again. It shuts every connection down and joins the session's own incoming
-  (callback) threads; unlike AOSP `shutdownAndWait` it does not join a
-  user-driven `serve_blocking` on the founding slot — that loop exits on its
-  own once the transport is shut down.
+  / `rsbinder::Client` — one bootstrap for every transport, selected by a URI
+  (`binder://`, `unix://`, `unix-abstract://`, `vsock://`, `tls://`,
+  `#service`, `?profile=android13plus`):
+  `serve("binder://")?.add(name, BnFoo::new_binder(impl))?.run()?`. Other
+  options go through `ServeOptions` / `ClientOptions` (wrong transport is
+  `BadValue`); `connect_async` with `tokio`. `ServerGuard::server()` /
+  `Client::session()` expose the RPC layer, `Client::open_with`'s closure
+  receives the `Endpoint`, and `Endpoint::supports_fd_passing()` is public.
+  `CallRestriction` is re-exported at the root, `#[non_exhaustive]` and
+  `PartialEq`.
+- **rsbinder (rpc):** `RpcSession::close_session()` — declare a session dead
+  now (obituaries, release of the peer's local objects, AOSP
+  `RpcState::clear`), shutting every connection down and joining the incoming
+  threads. It does not join a user-driven `serve_blocking`.
 - **rsbinder (shared memory):** `shared_memory` is now a working
-  implementation instead of a trait skeleton. `MemoryHeapBase` allocates an
-  anonymous shared region (`memfd_create` + `F_ADD_SEALS` on Linux/Android,
-  matching AOSP `MemoryHeapBase`'s `FORCE_MEMFD` path; `shm_open` on macOS)
-  and `MappedHeap` maps a received fd with the wire geometry
-  (`from_fd_strict` additionally verifies the sender's seals). New
-  wire-faithful stubs `BnMemoryHeap`/`BpMemoryHeap` and `BnMemory`/`BpMemory`
-  (`android.utils.IMemoryHeap` / `android.utils.IMemory`, handwritten AOSP
-  `IMemory.cpp` layout, no AIDL) let a heap travel over the kernel binder or
-  a Unix-socket RPC session with `FileDescriptorTransportMode::Unix`.
-  `SharedMemory` mirrors `android.os.SharedMemory` / NDK `ASharedMemory`:
-  one fd on the wire, size recovered from the fd (`fstat`, or
-  `ASHMEM_GET_SIZE` for legacy ashmem on Android), `Serialize`/`Deserialize`
-  byte-identical to `ParcelFileDescriptor`. Verified against the real
-  libbinder `IMemory`/`MemoryHeapBase` on an Android 16 emulator in both
-  directions (`example-hello/cpp/run_imemory_interop.sh`). `rustix` gains the
-  `fs` feature (and `shm` on macOS). Plan: `plans/4-7a-shared-memory-impl.md`.
-  On macOS the same protections memfd seals give are kernel-backed too: a
-  POSIX shm object's size is fixed after creation, and a read-only heap
-  exports an `O_RDONLY` fd the kernel refuses to map writable.
-  `MemoryHeapBase::seals()` reports these as the same `SEAL_*` bits and
-  `MappedHeap::from_fd_strict` works there; new
-  `MemoryHeapBase::seal_future_write` / `MappedHeap::seal_future_write`.
-  Plan: `plans/4-7b-macos-shared-memory.md`.
+  implementation: `MemoryHeapBase` (memfd with seals on Linux/Android,
+  `shm_open` on macOS), `MappedHeap` (`from_fd_strict` verifies seals),
+  wire-compatible `BnMemoryHeap`/`BpMemoryHeap` and `BnMemory`/`BpMemory`
+  (`android.utils.IMemoryHeap` / `IMemory`), and `SharedMemory`
+  (`android.os.SharedMemory`, byte-identical to `ParcelFileDescriptor`).
+  Also `MemoryHeapBase::seals()` and `seal_future_write` on both heap types.
+  Validated against libbinder on an Android 16 emulator. `rustix` gains `fs`
+  (and `shm` on macOS).
 - **rsbinder (shared memory):** `MemoryDealer` — AOSP's chunk allocator over
-  one shared heap (`SimpleBestFitAllocator`: 32-byte granules, best-fit,
-  coalescing, page-aligned blocks). Each `Allocation` is an
-  `android.utils.IMemory` window returned to the dealer on drop. On the
-  receiving side `HeapCache` shares one `BpMemoryHeap` per heap binder, so a
-  peer maps a dealer's heap once (`BpMemory::new_with_cache`).
-- **example-hello / book:** `shm_service` / `shm_client` (kernel binder or
-  Unix-socket RPC with `--features rpc`) and a *Shared Memory* chapter
-  covering both the `SharedMemory` region and the `MemoryDealer` frame
-  patterns.
-- **rsbinder (internal):** `ParcelFileDescriptor` serialization is now layered
-  on crate-private `write_raw_fd` / `read_raw_fd` (AOSP
-  `Parcel::writeFileDescriptor` / `readFileDescriptor` — the bare fd object
-  without the AIDL not-null / comm markers), which the handwritten
-  `IMemoryHeap` wire uses directly. Bytes on every transport are unchanged.
-- **rsbinder-tools (`rsb_hub`):** per-name access control. `rsb_hub` now gates
-  every AIDL entry point on an `add` / `find` / `list` policy keyed on the
-  caller's uid and its NSS-resolved groups — the same policy model AOSP's
-  `servicemanager` applies through SELinux, but keyed on credentials every
-  platform reports rather than on an LSM that most Linux distributions do not
-  enable and macOS does not have. Policy is TOML, `--config <PATH>` takes a
-  file or a directory of `*.toml` loaded in file-name order, and the first rule
-  whose `name` pattern matches decides. `SIGHUP` reloads in place; a reload
-  that fails to parse or resolve keeps the policy already in force. A denied
-  *lookup* reports "not registered" rather than an error, matching AOSP's
-  `tryGetBinder`; every other denial is `EX_SECURITY`. `listServices` and
-  `getServiceDebugInfo` apply the global `list` gate *and* filter their results
-  per-name by `find`, which is stricter than AOSP's all-or-nothing `canList`.
-  Deliberately **not** keyed on pid: pid reuse makes pid-derived attributes
-  unsound for authorization, which is why AOSP names its own field `debugPid`.
-  See `plans/6-1-hub-access-control.md` and the
+  one shared heap; each `Allocation` is an `IMemory` window freed on drop.
+  `HeapCache` / `BpMemory::new_with_cache` map a dealer's heap once.
+- **example-hello / book:** `shm_service` / `shm_client` and a *Shared Memory*
+  chapter.
+- **rsbinder (internal):** `ParcelFileDescriptor` serialization is layered on
+  crate-private `write_raw_fd` / `read_raw_fd`; bytes are unchanged.
+- **rsbinder-tools (`rsb_hub`):** per-name access control: every entry point
+  is gated on an `add` / `find` / `list` policy keyed on the caller's uid and
+  groups (not pid). TOML via `--config <PATH>` (file or directory), first
+  matching rule wins, `SIGHUP` reloads. A denied lookup reports "not
+  registered"; other denials are `EX_SECURITY`; listings are also filtered
+  per name by `find`. See the
   [Service Manager chapter](https://hiking90.github.io/rsbinder/service-manager.html#access-control).
 - **rsbinder-tools (`rsb_device`):** `--group` and `--mode` for the binder
-  device node. Binder has no in-kernel access control of its own, so the node
-  is the only gate on who may speak binder at all.
+  device node, the only gate on who may speak binder.
 
 ### Changed
 
 - **rsbinder:** writing a binder that belongs to the *other* IPC stack — an
   RPC proxy into a kernel parcel, or a kernel proxy into an RPC parcel — is
-  now refused at **write time** with `InvalidOperation`, matching libbinder
-  (`Parcel::flattenBinder`, `RpcState::onBinderLeaving`). It used to be
-  accepted and then fail on the receiver's *first call* with
-  `UnknownTransaction`, which pointed at the wrong process. rsbinder already
-  refused the third case libbinder does (a proxy from an unrelated RPC
-  session); that check is now pinned by a test. Registration refuses the same
-  mistake up front: `serve(rpc://…).add`, `RpcServer::add_service`,
-  `RpcServer::set_root` and `RpcSession::set_root` reject a remote binder. To
-  re-publish a service reached over one transport on another, wrap the proxy
-  in a local `Bn*` — `BnFoo::new_binder(proxy)`, the gateway pattern — rather
-  than forwarding the binder itself. Kernel `hub::add_service` still takes a
-  *kernel* proxy — re-registering one with the system service manager is
-  legitimate — but an RPC proxy is refused there too, by the write-time check
-  above.
-- **`RpcServer::set_root` and `RpcSession::set_root` return `Result<()>`**
-  (was `()`), so they can report the refusal above. Callers passing a local
-  binder are unaffected apart from handling the value — `?` in a function
-  that returns `Result`, `.expect("set_root")` in a test.
+  now refused at **write time** with `InvalidOperation`, matching libbinder,
+  instead of failing on the receiver's first call. `serve(rpc://…).add`,
+  `RpcServer::add_service` and `set_root` (which now return `Result<()>`, see
+  *Migrating*) reject a remote binder up front; wrap the proxy in a local
+  `Bn*` (`BnFoo::new_binder(proxy)`) instead. Kernel `hub::add_service` still
+  accepts a *kernel* proxy.
 - **rsbinder (RPC):** a non-nested call on a session with no connection to
-  send on — a server calling a client callback outside any handler, the
-  client having opened no incoming connection — now fails immediately with
-  `WouldBlock` (AOSP `WOULD_BLOCK`) and a log line naming the
-  remedy, instead of waiting forever (or until `set_timeout`). Connection
-  slots are now tagged with the direction they are used in (AOSP
-  `mOutgoing`/`mIncoming`), so a serve-driven connection is never claimed
-  by another thread's transaction between two of its messages. A
-  same-thread nested call re-enters a serve-driven connection only while a
-  *twoway* handler is running on it (AOSP `RpcConnection::allowNested`):
-  from inside a **oneway** handler the peer is no longer reading that
-  socket, so the nested call now goes out on a connection the peer does
-  read — or fails with `WouldBlock` if there is none — instead of
-  blocking forever on a reply that could never arrive.
-  **Breaking for `RpcSession::new(t, AddressSpace::Acceptor)`:** the
-  founding connection of an acceptor session is serve-driven, so such a
-  session can no longer open a transaction of its own — `get_root`,
-  `RpcProxy::transact` and `ping_binder` from outside a dispatch return
-  `WouldBlock` where they used to round-trip on that connection.
-  Callbacks from inside a twoway handler are unaffected. To call out of
-  an acceptor otherwise the peer must open incoming connections, which
-  needs `?profile=android13plus`; the r34 profile has no such mechanism.
-- **rsbinder (RPC):** the server's callback-slot budget (`2 × set_max_threads`
-  per session) now counts callback connections only; a client's outgoing
-  fan-out no longer eats into it (before, a default server admitted a single
-  callback connection). The server also no longer arms the `set_idle_timeout`
-  *read* deadline on callback slots (it would have cut short a server's own
-  reply wait there) — the write deadline stays, as the only bound on a
-  callback send to a peer that has stopped reading — and confirms a callback
-  attach only after admitting it, so a refused attach is an error on the
-  client instead of a silently dead connection. With that read deadline gone,
-  `RpcServer::set_reply_timeout` is what bounds a callback's *reply* wait:
-  without it a client that accepts a callback and never answers pins the
-  sending worker — and everything queued behind it on that session — forever.
-- **rsbinder (RPC):** a `DEC_STRONG` no longer takes a **serve-driven**
-  connection slot from the scan; only a slot the calling thread already
-  drives (the reentrant pin) may carry one. This matches AOSP
-  `ExclusiveConnection::find`, which looks `mIncoming` up with
-  `available = nullptr`. The peer reads such a connection only inside its
-  own reply wait, so writing there is not a delayed frame but a send that
-  blocks once the socket buffer fills — while the sender holds the slot's
-  `exclusive_tid`, locking that slot's serve loop out of its own
-  connection. Consequence: on a session with no outgoing connection the
-  reference is released at session end instead of promptly, which is the
-  documented best-effort contract for refcounts. A client that wants
-  prompt release opens an incoming connection
-  (`RpcUnixClientConfig::incoming_connections`).
-- **rsbinder (RPC):** on session death every connection slot's transport is
-  shut down and the pool is emptied, releasing callback-slot descriptors at
-  once rather than when the session object is finally dropped. The shutdown
-  now runs *first*, before the obituaries and the local-object drop, so a
-  `binder_died` handler (or a `Drop`) that calls `RpcSession::close_session` can
-  join the incoming threads instead of deadlocking on them.
-- **rsbinder (RPC):** attaching a connection to a session that died during the
-  attach handshake now fails with `DeadObject` instead of pushing a slot no
-  serve loop will ever retire. The gate moved inside the pool lock, where it
-  is serialized against the death sequence emptying that pool.
+  send on now fails at once with `WouldBlock` and a log line, instead of
+  waiting forever. Connection slots are tagged by direction (AOSP
+  `mOutgoing`/`mIncoming`), and a nested call from inside a **oneway**
+  handler goes out on a connection the peer reads (or `WouldBlock`).
+  **Breaking for `RpcSession::new(t, AddressSpace::Acceptor)`:** such a
+  session can no longer transact outside a dispatch (`get_root`,
+  `RpcProxy::transact`, `ping_binder` return `WouldBlock`); the peer must open
+  incoming connections (`?profile=android13plus`).
+- **rsbinder (RPC):** the server's callback-slot budget (`2 × set_max_threads`)
+  now counts callback connections only; callback slots no longer get the
+  `set_idle_timeout` read deadline (use `RpcServer::set_reply_timeout`), and a
+  refused callback attach is an error on the client.
+- **rsbinder (RPC):** a `DEC_STRONG` no longer takes a serve-driven slot
+  (AOSP `ExclusiveConnection::find`); without an outgoing connection the
+  reference is released at session end. Open an incoming connection for
+  prompt release.
+- **rsbinder (RPC):** on session death every connection is shut down first and
+  the pool emptied, so a `binder_died` handler may call
+  `RpcSession::close_session` without deadlocking.
+- **rsbinder (RPC):** attaching to a session that died during the attach
+  handshake now fails with `DeadObject`.
 - **rsbinder (`shared_memory`) — breaking:** `IMemoryHeap::base` now returns
-  `Option<SharedBytes<'_>>`, a read-only view. A `&[u8]` over a `MAP_SHARED`
-  region promises the compiler an immutability the peer process does not
-  keep, so it was undefined behaviour to hold; the view copies through
-  atomics instead, and offers no store — a `FLAG_READ_ONLY` receiver maps
-  `PROT_READ`, so a writable view would let safe code fault. `read_at` /
-  `write_at` copy through the same atomics (word-sized wherever the window
-  is word-aligned), which also makes `MemoryHeapBase`'s `Sync` sound — two
-  threads writing the same window through one `Arc` used to be a data race
-  reachable from safe code. `MemoryDealer::allocate` now hands out a window
-  of the *requested* size rather than the granule-rounded one (AOSP
-  `MemoryDealer::allocate` does the same); the rounding exposed up to 31
-  bytes of whatever a freed neighbour had left in the granule.
+  `Option<SharedBytes<'_>>`, a read-only view copying through atomics (a
+  `&[u8]` over peer-written memory was unsound). `read_at` / `write_at` use
+  the same atomics, making `MemoryHeapBase: Sync` sound.
+  `MemoryDealer::allocate` returns a window of the requested size, not the
+  granule-rounded one.
 - **rsbinder (`shared_memory`):** `MappedHeap::from_fd` refuses a zero-length
-  fd unless it really is an ashmem device (previously any `st_size == 0` was
-  "trusted as ashmem"). A memfd the sender never `ftruncate`d mapped fine
-  and `SIGBUS`ed this process on first access — a remote crash. The Android
-  `ASHMEM_GET_SIZE` ioctl in `SharedMemory` is gated the same way, as
-  libcutils does, instead of being issued on whatever fd arrived.
-  `MemoryHeapBase::seal_future_write` reports `InvalidOperation` on
-  Linux/Android for a heap created without `FLAG_MEMFD_ALLOW_SEALING`
-  (`F_SEAL_SEAL` makes it impossible; the docs now say so — only the macOS
-  caveat was documented).
+  fd unless it is really ashmem (an un-`ftruncate`d memfd caused `SIGBUS`), and
+  `SharedMemory` gates `ASHMEM_GET_SIZE` the same way.
+  `MemoryHeapBase::seal_future_write` reports `InvalidOperation` for a heap
+  created without `FLAG_MEMFD_ALLOW_SEALING`.
 - **rsbinder (`proxy`):** `ProxyHandle` equality is `(handle, generation)`,
-  as its own `generation` field documents, and it is now `Eq`. Comparing by
-  handle alone called two proxies equal when the kernel had recycled the
-  number for a different node.
+  and it is now `Eq`.
 - **rsbinder (`Parcel`):** `set_data_position` ignores (and logs) a position
-  above `i32::MAX`, as AOSP's `LOG_ALWAYS_FATAL` guard does; and a forward
-  seek with nothing written behind it no longer inflates the byte count
-  handed to the kernel — see *Fixed*.
-- **rsbinder (entry):** `ClientOptions::tls` / `tls_server_name` on anything
-  but a `tls://` endpoint, and `ServeOptions::tls` likewise, are `BadValue`.
-  Both were silently ignored — a caller asking for TLS got a plaintext socket
-  and no error. `ServeOptions::tls` had also accepted `unix://` and
-  `vsock://`, which no client this facade builds can reach; TLS over those
-  sockets stays available one layer down (`RpcServer::setup_unix_server_tls`
-  / `setup_vsock_server_tls`). The option types already promised "never
-  ignored". A `ClientOptions::session_id` on the multi-connection path was
-  dropped the same way and opened a fresh session; it is forwarded now (the
-  session layer refuses the combination).
-- **rsbinder (RPC):** a `GET_FD_MODE` on a session already in `Unix` fd mode
-  answers `1` and changes nothing. It used to re-run the negotiation — which
-  on the client role can only ever compute `None` — so any peer packet
-  downgraded an established session, dropping in-flight fds and, on the r34
-  profile, desynchronising the fd-aware receive buffer. An unsolicited
-  `REPLY` now ends the session (AOSP `processCommand` does the same) instead
-  of being logged and skipped at wire speed. `find_conn` waits are bounded by
-  `RpcSession::set_timeout` (`WouldBlock`) instead of parking forever when
-  every slot is driven by another thread. `RpcSession::close_session` logs when it
-  finds nothing to tear down.
+  above `i32::MAX`, as AOSP does; see also *Fixed*.
+- **rsbinder (entry):** `ClientOptions::tls` / `tls_server_name` and
+  `ServeOptions::tls` on anything but `tls://` are `BadValue` instead of
+  silently plaintext (TLS over Unix/vsock remains via
+  `RpcServer::setup_unix_server_tls` / `setup_vsock_server_tls`).
+  `ClientOptions::session_id` on the multi-connection path is now forwarded.
+- **rsbinder (RPC):** `GET_FD_MODE` on a session already in `Unix` fd mode
+  changes nothing (it used to downgrade it); an unsolicited `REPLY` ends the
+  session; `find_conn` waits are bounded by `RpcSession::set_timeout`
+  (`WouldBlock`); `close_session` logs when there is nothing to tear down.
 - **rsbinder (`lazy_service`):** `force_persist` may **not** be called from
-  the active-services callback — the docs listed it as allowed, but it
-  re-takes the lock the callback runs under (AOSP's `forcePersist` does too,
-  and AOSP's header never allowed it either). `try_unregister` / `re_register`
-  remain the callback's tools.
-- **rsbinder-aidl — breaking:** declarations with no Rust representation are
-  now build errors instead of silently generating an empty type. A
-  `@JavaOnlyStableParcelable` declaration, or an unstructured parcelable
-  declared only with `cpp_header` / `ndk_header`, previously produced a
-  field-less `pub struct Foo {}` together with a live `Parcelable` impl that
-  wrote an empty payload — wire-incompatible with any peer that has the real
-  type, and announced only through an `eprintln!` that cargo hides without
-  `-vv`. Such a declaration is now an `AidlError::Semantic` naming the
-  declaration. A `rust_type "..."` alias is still generated as before, and
-  takes precedence over the other markers.
-- **rsbinder-aidl — breaking:** an `out` argument whose type has no `Default`
-  (`IBinder`, `ParcelFileDescriptor`, an interface `Strong<_>`) is now
-  declared as `&mut Option<T>`, matching AOSP
-  `aidl_to_rust.cpp::RustNameOf` for `OUT_ARGUMENT`. The previous `&mut T`
-  could not compile: the server's local is initialised with
-  `Default::default()`. `inout` arguments read their value from the parcel
-  and stay unwrapped. Implementations of affected traits need the parameter
-  type updated; the wire format is unchanged.
-- **rsbinder-aidl — breaking:** `in out` / `out in` argument declarations are
-  rejected. The grammar accepted a run of direction keywords and kept only
-  the last, so a mistyped `inout` silently generated one-way semantics. AOSP
-  `aidl_language_y.yy` allows a single direction; rsbinder now matches.
-- **rsbinder-aidl — breaking:** `AidlError::Template` gained a `source` field
-  carrying the underlying `tera::Error`, whose cause chain holds the detail its
-  `Display` omits. `AidlError` is not `#[non_exhaustive]`, so a `match` arm
-  written as `AidlError::Template { message }` needs `..` added.
-- **rsbinder-aidl — breaking:** `self`, `Self`, `super` and `crate` are
-  rejected as method names, argument names, enum member names, declaration
-  names and package segments (each segment of a dotted name is checked), not
-  only as parcelable/union member names. None of the four is a legal Rust raw
-  identifier, so every emission site produced code that could not compile.
-- **rsbinder-aidl — breaking:** a `@nullable` `out` or `inout` array of a
-  primitive or enum element is declared as `&mut Option<Vec<T>>`. The previous
-  `Vec<Option<T>>` element type serialised a null-marker word before every
-  element, which libbinder neither writes nor reads for primitives (AOSP
-  `aidl_to_rust.cpp::UsesOptionInNullableVector`); `in` arguments already
-  followed that rule. Elements that are parcelables, strings, binders or
-  interfaces keep the per-element `Option`.
-- **rsbinder-aidl — breaking:** `@RustDerive` accepts only the seven traits
-  AOSP's schema lists (`Copy`, `Clone`, `PartialOrd`, `Ord`, `PartialEq`,
-  `Eq`, `Hash`); anything else is dropped rather than interpolated into a
-  `#[derive(...)]`. `Debug` and `Default` were emitted a second time next to
-  the impl the templates always generate (E0119), and an unknown name became
-  E0405 in the generated crate.
-- **rsbinder-aidl:** the generic-nesting guard is now separate from the
-  bracket guard and much tighter (12 vs 256). Parse cost is exponential in
-  generic depth (~3.7x per level), so the old shared limit let a build hang
-  rather than report a diagnostic. Only a `<` that a `>` closes counts as
-  generic nesting, so a statement full of `<` comparisons is not mistaken for
-  one (an unclosed run is still bounded, at the looser bracket limit). The
-  diagnostic names which limit it hit — bracket nesting, generic type
-  nesting, or operators in one expression.
-- **rsbinder-aidl:** `Builder::hash("")` now panics like `Builder::version(0)`
-  already did. An empty hash is falsy to Tera and silently suppressed
-  `getInterfaceHash()`.
-
+  the active-services callback (it deadlocks); use `try_unregister` /
+  `re_register` there.
+- **rsbinder-aidl — breaking** (each listed under *Migrating*): a
+  `@JavaOnlyStableParcelable` or `cpp_header` / `ndk_header`-only parcelable
+  without `rust_type` is an `AidlError::Semantic` instead of an empty struct;
+  `out` arguments without `Default` are `&mut Option<T>` (was uncompilable);
+  `in out` / `out in` and `self`/`Self`/`super`/`crate` identifiers are
+  rejected; `@nullable` `out`/`inout` primitive or enum arrays are
+  `&mut Option<Vec<T>>`; `@RustDerive` accepts only AOSP's seven traits
+  (`Copy`, `Clone`, `PartialOrd`, `Ord`, `PartialEq`, `Eq`, `Hash`);
+  `AidlError::Template` gained `source`.
+- **rsbinder-aidl:** generic nesting has its own, tighter limit (12, vs 256
+  for brackets), so deep generics report a diagnostic instead of hanging the
+  build; the diagnostic names which limit it hit.
+- **rsbinder-aidl:** `Builder::hash("")` now panics like `Builder::version(0)`.
 - **rsbinder (`lazy_service`) — breaking:** `LazyServiceRegistrar` now does
-  what its name says. `register_service` makes the service-manager calls
-  itself — `addService` with AOSP's `FLAG_IS_LAZY_SERVICE`, then
-  `registerClientCallback` with an `IClientCallback` the module owns — routes
-  the incoming `onClients` into its own state machine, and once nothing is
-  using any of its services unregisters them and exits the process with
-  status 0. That is AOSP `tryShutdownLocked`, and the reason the pattern
-  exists: the service manager starts the process again on the next lookup.
-  It used to be an in-process state machine that made no calls at all, so
-  `register_service` registered nothing and a caller owed every one of those
-  steps by hand — none of which the type could tell them about.
-
-  `force_persist` suspends the shutdown as before (and releasing it re-checks
-  immediately, as AOSP does); the new `set_active_services_callback` takes the
-  decision over entirely. `re_register` no longer resets `has_clients` to
-  `true`: AOSP `reRegisterLocked` leaves it alone, and inventing clients hides
-  the state the service manager just reported. `LazyServiceRegistrar` is
-  `Clone`, sharing one set of registrations the way AOSP's handle shares its
-  `ClientCounterCallback`. Re-registering a name replaces the tracking entry
-  when the binder differs — AOSP keeps the first, which then fails to match
-  its own `onClients` — but never registers a second client callback: the
-  service manager stores those by name and de-duplicates nothing. The entry
-  is published before the `addService` / `registerClientCallback` round trips
-  rather than after: the service manager dispatches `onClients` from inside
-  those calls, and since `IClientCallback` is `oneway` that notification runs
-  on a binder pool thread while the round trip is still open — an entry that
-  is not there yet would drop it, with no repeat coming. A newly registered
-  service starts with *no* clients, as AOSP's `Service::clients` does;
-  assuming one would be an assumption nothing takes back, because the service
-  manager reports only changes and never announces a name nobody looked up.
-
-  `register_service` takes `impl Into<SIBinder>` (so a `Strong<dyn IFoo>`
-  goes in directly, as with `hub::add_service`) and returns
-  `Result<(), Status>` rather than `Result<(), StatusCode>`, which kept the
-  service manager's refusal code and message. **Android 10 is refused before
-  `addService` is called**: that service manager has neither
-  `registerClientCallback` nor `tryUnregisterService`, so a service published
-  there could be neither tracked nor taken back down.
-
-  One deliberate departure from AOSP: the *state* lock is not held across the
-  service-manager calls, so an `onClients` arriving mid-round-trip is recorded
-  when it arrives instead of queueing behind the call it answers. What AOSP's
-  single `mMutex` also buys — no two service-manager sequences interleaving —
-  is kept by a second lock that spans a whole `register_service` or shutdown
-  decision. A shutdown that waited on a `register_service` runs the moment it
-  returns, so registering several services in a row can end mid-loop with the
-  process exiting; hold it with `force_persist(true)` if every service has to
-  be up first.
-- **rsbinder — breaking:** `ProcessState::init`'s `max_threads` is now passed
-  to `BINDER_SET_MAX_THREADS` **as written**, matching AOSP's
-  `setThreadPoolMaxThreadCount`. Previously `0` was a sentinel meaning "use
-  the default" and any value `>= 15` was silently clamped down to 15, so
-  neither "literally zero" nor a larger pool was expressible. Zero is what a
-  single-threaded service manager asks for (AOSP's `servicemanager` does),
-  and 15 is a *default*, not a maximum — a service that asked for 32 got 15
-  and stalled at it under load, with nothing in the log to say so.
-
-  The default now lives where the default is chosen: `init_default()` passes
-  the newly public `DEFAULT_MAX_BINDER_THREADS` explicitly, and a `binder://`
-  URI without `?threads=` does the same, so both are byte-for-byte unchanged.
-  `?threads=0` asks for zero and gets it. Callers that wrote
-  `ProcessState::init(path, 0)` meaning "the default" must now write
-  `DEFAULT_MAX_BINDER_THREADS`; the difference is only observable in a
-  process that also calls `start_thread_pool()`, which is exactly the case
-  that has always logged a warning about it — and that warning was
-  unreachable until now, because the clamp guaranteed the stored value could
-  never be 0.
-
-  The resolved ceiling is logged at `info` on init, calling out the two ends
-  of the range.
-
+  what its name says: `register_service` calls `addService` (with
+  `FLAG_IS_LAZY_SERVICE`) and `registerClientCallback` itself, tracks
+  `onClients`, and once no service has clients unregisters them and exits
+  with status 0 (AOSP `tryShutdownLocked`). It takes `impl Into<SIBinder>`,
+  returns `Result<(), Status>`, and refuses Android 10. The registrar is
+  `Clone`; `re_register` no longer resets `has_clients`; a new service starts
+  with no clients. Registering several services in a row can exit mid-loop;
+  hold it with `force_persist(true)` first.
+- **rsbinder — breaking:** `ProcessState::init`'s `max_threads` is passed to
+  `BINDER_SET_MAX_THREADS` **as written**, as AOSP does: `0` no longer means
+  "the default" and values `>= 15` are no longer clamped. `init_default()`
+  and `binder://` without `?threads=` pass the new `DEFAULT_MAX_BINDER_THREADS`
+  and are unchanged; `?threads=0` gets zero. The ceiling is logged at `info`.
 - **rsbinder — breaking (internal representation):** a proxy's weak identity
-  is now stamped into the `ProxyHandle` at construction instead of being looked
-  up in the proxy cache on every `SIBinder::downgrade`. `WIBinder` no longer
-  has a `Native` fallback for proxies, `downgrade` no longer takes the cache
-  lock, and it no longer requires an initialized `ProcessState`. Two weak
-  references naming the same `(handle, generation)` compare equal even when
-  they come from different `Arc<ProxyHandle>` allocations — which was already
-  the documented intent for case-(b) resurrection, and is now also true after
-  the obituary.
-- **rsbinder-tools (`rsb_hub`) — breaking:** `rsb_hub` refuses to start unless
-  it can load an access-control policy, and denies every request the policy
-  does not allow. Previously any local process could register, overwrite, look
-  up, and enumerate any service. Existing deployments must supply a policy
-  (`--config <PATH>`, default `/etc/rsbinder/hub.d`) or opt out explicitly with
-  `--insecure-allow-all`, which is named that way on purpose and cannot be
-  reached by accident. There is no permissive fallback for a policy that fails
-  to load: a typo in a config file must never silently remove access control
-  from a running system.
-- **rsbinder-tools (`rsb_device`) — breaking:** the binder device node is now
-  created `0600` (root only) instead of `0666` (world read/write). Grant access
-  deliberately: `sudo rsb_device binder --group binder --mode 0660`, with your
-  user in that group — the same model as `/dev/kvm` being `0660 root:kvm`.
+  is stamped into the `ProxyHandle` at construction. `WIBinder` has no
+  `Native` fallback for proxies, `downgrade` no longer takes the cache lock or
+  needs an initialized `ProcessState`, and weak references to the same
+  `(handle, generation)` compare equal.
+- **rsbinder-tools (`rsb_hub`) — breaking:** refuses to start without an
+  access-control policy and denies what it does not allow (see *Migrating*);
+  a policy that fails to load never falls back to permissive.
+- **rsbinder-tools (`rsb_device`) — breaking:** the binder node is created
+  `0600` instead of `0666`; `sudo rsb_device binder --group binder --mode 0660`.
 - **rsbinder-tools (`rsb_hub`):** `listServices` and `getServiceDebugInfo`
-  return names in sorted order. The registry is a `BTreeMap` now, matching
-  AOSP's `std::map`; previously the order shuffled between calls.
-- **rsbinder-aidl / rsbinder (async):** generated `IFooAsyncService` impls now
-  carry `#[rsbinder::__async_trait]` instead of `#[::async_trait::async_trait]`,
-  and `rsbinder` re-exports the attribute. A crate that only consumes generated
-  code no longer needs an `async-trait` line of its own — which the
-  `#[rsbinder::interface]` path had no way to tell users about, since it has no
-  `build.rs` step to document. Existing manifests keep working; the dependency
-  is simply redundant now. This changes the generated source text (not the
-  wire) for async builds.
-- **rsbinder (rpc):** an RPC proxy now holds its `RpcSession` **strongly**
-  (AOSP `BpBinder` ↔ `sp<RpcSession>`). Dropping the `RpcSession` handle no
-  longer invalidates proxies obtained from it — the proxy alone keeps the
-  connection open, and the connection closes when the last proxy (and
-  handle) is gone. Previously every call on such a proxy returned
-  `DeadObject`. Code that relied on "drop the session to disconnect" while
-  still holding a proxy must drop the proxy too. To keep the strong ref
-  acyclic, session death now also releases every local object the peer
-  held (AOSP `RpcState::clear`), on both the served path and — new — a
-  client-only session whose last connection is lost (detected on the next
-  failed transaction, which also fires `DeathRecipient`s). Because a failing
-  transaction may now declare session death before the slot's own serve
-  worker exits, `serve_blocking` no longer trips a debug assertion on that
-  ordering.
+  return names in sorted order, as AOSP does.
+- **rsbinder-aidl / rsbinder (async):** generated `IFooAsyncService` impls use
+  the re-exported `#[rsbinder::__async_trait]`, so consumers no longer need
+  their own `async-trait` dependency. Generated source changes, not the wire.
+- **rsbinder (rpc):** an RPC proxy now holds its `RpcSession` **strongly**, as
+  AOSP does: dropping the session handle no longer invalidates its proxies,
+  and the connection closes with the last proxy. Code that dropped the session
+  to disconnect must drop the proxies too. Session death now releases the
+  peer's local objects, including for a client-only session whose last
+  connection is lost (which also fires `DeathRecipient`s).
 - **rsbinder (entry API):** `ServeOptions::fd_modes` / `ClientOptions::fd_mode`
-  now reject Unix fd passing on a transport that cannot carry `SCM_RIGHTS`
-  (vsock, TLS, kernel binder) instead of agreeing a mode that fails later on
-  the wire.
+  reject Unix fd passing on a transport that cannot carry `SCM_RIGHTS`.
 - **rsbinder (AOSP alignment):** `FLAG_PRIVATE_VENDOR` is now `0x10000000`
-  (AOSP `IBinder.h`) instead of `0`. Code passing this flag to `transact`
-  now sets bit 28 on the wire. `FLAG_PRIVATE_LOCAL` is unchanged (`0`).
-- **rsbinder (`rpc` feature, breaking):** `WireMessage::DecStrong` now carries
-  the decrement amount (`DecStrong(RpcAddress, u32)`), and
-  `RpcState::dec_strong_local` takes an `amount` argument. A batched
-  `RpcDecStrong` from a libbinder peer (AOSP `sendDecStrongToTarget` sends
-  `timesRecd - target`) is now honored instead of applying a single decrement,
-  which under-counted and leaked local nodes.
-- **rsbinder (`rpc` feature, breaking):** the RPC wire-codec types
+  (see *Migrating*).
+- **rsbinder (`rpc` feature, breaking):** `WireMessage::DecStrong(RpcAddress,
+  u32)` and `RpcState::dec_strong_local(.., amount)` carry the decrement
+  amount, so a batched `RpcDecStrong` from libbinder no longer leaks nodes.
+- **rsbinder (breaking):** no longer public: the RPC wire-codec types
   (`WireMessage`, `WireCodec`, `R34Codec`, `Android13PlusCodec`, `WireReply`,
-  `WireTransaction`) and `RpcState` are no longer part of the public API. They
-  were internal implementation detail — the codec is selected internally with no
-  user injection point, and `RpcState` is per-session bookkeeping. The public
-  RPC surface stays `RpcServer`, `RpcSession`, `RpcProxy`, the transport traits
-  (`RpcTransport`/`PeerIdentity`/`CertId`), and the address/identity types. This
-  lets the wire protocol evolve without further semver-breaking releases.
-- **rsbinder (breaking):** additional helpers that were `pub` but never part of
-  the intended API are now `pub(crate)`: the `Parcel` RPC-ops plumbing
-  (`RpcParcelOps`, `Parcel::attach_rpc_ops`, `FnFreeBuffer`), `rpc::RpcSessionInner`,
-  `RpcProxy::stamp_descriptor`, and the `thread_state` functions `check_interface`,
-  `is_handling_transaction`, and `get_calling_uid_or_self`. The public
-  `rsbinder::is_handling_transaction` (re-exported from `native`) is unchanged.
-- **rsbinder (breaking):** the low-level `Parcel` buffer accessors `as_ptr`,
-  `as_mut_ptr`, `capacity`, `set_data_size`, `close_file_descriptors`, `is_empty`,
-  and `from_vec` are now `pub(crate)` (internal kernel-buffer plumbing).
-  `Parcel::from_ipc_parts` (the documented `unsafe` raw-buffer primitive)
-  remains public. `Parcel::set_for_rpc` is `pub(crate)` as well: production
-  code reaches the RPC mode through the session, and `rsbinder::to_bytes`
-  covers the data case.
-- **rsbinder (kernel binder):** a driver that consumed only part of the queued
-  command buffer used to `panic!`; it now writes the diagnosis to stderr and
-  **aborts the process**, as AOSP `LOG_ALWAYS_FATAL`s there. The remainder was
-  never seen by the kernel, so the reference counts and buffer ownership this
-  process believes in are no longer the kernel's — and a panic was not a way
-  out, because the reply path's `catch_unwind` would catch it and resume
-  transacting on that desynchronized stream. stderr rather than `log`, so a
-  consumer that installed no logger does not die mute.
-- **rsbinder (kernel binder):** a failed `BINDER_WRITE_READ` now names the
-  command the driver refused. The errno alone cannot tell a caller's bug from
-  a driver one, and `write_consumed` is the offset the driver gave up at — so
-  the command starting there is decoded into the log line, and an
-  over-released proxy's `BC_RELEASE` or a `BC_FREE_BUFFER` for a buffer
-  already returned now says which it was.
+  `WireTransaction`), `RpcState`, `RpcParcelOps`, `Parcel::attach_rpc_ops`,
+  `FnFreeBuffer`, `rpc::RpcSessionInner`, `RpcProxy::stamp_descriptor`,
+  `thread_state::{check_interface, is_handling_transaction,
+  get_calling_uid_or_self}` and `Parcel::{as_ptr, as_mut_ptr, capacity,
+  set_data_size, close_file_descriptors, is_empty, from_vec, set_for_rpc}`.
+  `rsbinder::is_handling_transaction` and `Parcel::from_ipc_parts` remain.
+- **rsbinder (kernel binder):** a driver that consumed only part of the
+  command buffer now prints the diagnosis to stderr and **aborts the process**
+  (as AOSP does) instead of `panic!`, which could be caught and continue on a
+  desynchronized stream.
+- **rsbinder (kernel binder):** a failed `BINDER_WRITE_READ` now logs the
+  command the driver refused.
 
 ### Removed
 
 - **rsbinder (`service` module):** the `rsbinder::service` facade (`Registry` /
   `Broker`, `service::kernel::{Host, Broker}`, `service::rpc::{Host, Broker}`)
-  is gone, replaced by the entry API above (`serve` / `connect` / `Client`).
-  Migration: `kernel::Host::new()? + add_service + serve()` →
+  is gone, replaced by the entry API (`serve` / `connect` / `Client`):
+  `kernel::Host::new()? + add_service + serve()` →
   `serve("binder://")?.add(..)?.run()?`; `rpc::Host::unix(p)` →
   `serve("unix://<p>")`; `kernel::Broker::new()?.get_interface(n)` →
   `connect("binder://<n>")`; `rpc::Broker::unix(p)?.get_interface(n)` →
   `connect("unix://<p>#<n>")`; `Host::builder()` options → `ServeOptions`
-  via `Server::with`. The examples, the book chapter *Cross-Transport
-  Services*, and the crate quick-start now use the entry API.
+  via `Server::with`.
 
 ### Fixed
 
 - **rsbinder (kernel binder) — a service registered without an AIDL
-  interface could not be resolved at all.** Such a service answers
-  `INTERFACE_TRANSACTION` with a null string; `query_interface` read it as a
-  non-nullable `String` and returned `UnexpectedNull`, and because every
-  proxy construction goes through it, the whole lookup failed. On a stock
-  Android 34 image that is 23 of 280 services — `battery`, `cpuinfo`,
-  `dbinfo`, `DockObserver`, `app_binding` and the rest of the native
-  diagnostic services — unreachable from rsbinder while `service check`
-  finds them. AOSP folds the null to empty
-  (`String16 res(reply.readString16())` in
-  `BpBinder::getInterfaceDescriptor`, android-16.0.0_r4) and this now does
-  the same. The bug survived because the deprecated `hub::get_service`
-  flattened the error to `None`, so callers read it as "not registered".
+  interface could not be resolved at all** (its null `INTERFACE_TRANSACTION`
+  answer was `UnexpectedNull`; 23 of 280 services on a stock Android 34
+  image). The null is now read as empty, as AOSP does.
 - **rsbinder (RPC, TLS) — a session's own shutdown read as a truncation on
-  its own side.** With `UncleanEndOfStream` in place, the end of stream
-  rsbinder's own `shutdown()` produced for its own reader — no
-  `close_notify` from the peer, by construction — would have been reported
-  as a cut, and a session this end shut down would have ended its serve loop
-  with a lost stream. The transport remembers that it shut itself down and
-  reports the clean end.
+  its own side**; the transport now reports its own shutdown as a clean end.
 - **rsbinder (RPC) — a second `shutdown()` on a socket transport failed on
-  macOS.** `shutdown(2)` raises `ENOTCONN` the second time there (Linux
-  returns `Ok`), and a normal teardown calls it twice on the same slot —
-  `on_session_dead` shuts every transport down, then the unreadable-slot
-  path shuts its own — so every such teardown logged a failure. The socket
-  backends absorb it; `shutdown` is idempotent on every backend, and the
-  failures that remain are logged at `warn!` with what the backend said,
-  not at `debug!` with a guess.
+  macOS** (`ENOTCONN`). `shutdown` is idempotent on every backend; remaining
+  failures are logged at `warn!`.
 - **rsbinder (RPC) — a slot a nested call had marked unreadable could still
-  be handed out for writing.** The mark gated only the two readers; the slot
-  selectors did not look at it, so a handler that swallowed the nested
-  call's error and returned normally had its reply written on the lost
-  stream, and a concurrent caller could claim the slot and send a request
-  the reply wait would then refuse — executed by the peer, answer thrown
-  away. The selectors now refuse it: the frame that owns it gets
-  `DeadObject` before writing, a scan for a free outgoing slot skips it (a
-  session whose only outgoing slot is unreadable fails fast with
-  `WouldBlock` rather than waiting), and the non-blocking selector declines
-  it.
+  be handed out for writing.** The slot selectors now refuse it (`DeadObject`
+  for its owner, `WouldBlock` if it was the only outgoing slot).
 - **rsbinder (RPC) — a local shutdown ended a serve loop as `Ok(())` or
-  `Err(DeadObject)` by race.** `on_session_dead` shuts the transports down
-  and then clears the slot pool; a worker parked in `recv` woke with end of
-  stream (`Ok(())`), while one inside a handler found its slot gone on the
-  next pass (`Err(DeadObject)`). No contract could be written for that, and
-  four attempts at one were each wrong in a new way. The session now records
-  the local decision (`ended_locally`) before the transports go down, and
-  the serve loop reads it both at its exit — every end after the decision is
-  `EndedBy::Local` — and right after a read, so a frame that a kernel which
-  keeps its queue hands over after the shutdown ends the loop
-  (`EndReason::Interrupted`) instead of being dispatched on a dead session.
-  The frame-boundary guarantee (`EndOfStream`/`Timeout` only) that the reply
-  wait and the serve loop both classify by now has one owner,
-  `RpcError::leaves_frame_boundary_intact`; the two had already diverged on
-  `Truncated`.
+  `Err(DeadObject)` by race.** Every end after a local decision is now
+  `EndedBy::Local`, and a frame read after it ends the loop
+  (`EndReason::Interrupted`) instead of being dispatched.
 - **rsbinder (RPC, fd-mode) — `UnixTransport::shutdown` left buffered bytes
-  for the next reader.** An fd-mode connection reads with `recvmsg` into its
-  own buffer, and an error that cut a frame short leaves that frame's prefix
-  there. `shutdown` shut the socket down and left that buffer alone, so a
-  serve loop woken by a session teardown could go on decoding the connection
-  just ended out of it — before it touched the socket — on every platform,
-  since the bytes were already in userspace. The socket now goes down first
-  (a reader parked in `recvmsg` holds that buffer's lock for the whole call,
-  so taking the lock first would deadlock against it) and the buffer is
-  cleared right after.
+  for the next reader**; the buffer is now cleared after the socket goes down.
 - **rsbinder (RPC, `rpc-tcp-debug`) — a preconnected `AF_INET` fd could not
-  complete the android-13+ handshake.** `RpcSession::from_preconnected_fd`
-  wraps such an fd in `TcpDebugTransport`, whose first handshake byte is a
-  raw write; the transport had no `send_raw`/`recv_raw`, so the trait default
-  refused it with `Protocol("this transport has no raw byte access")`.
-  `vsock` had been broken and fixed the same way; `tcp_debug` was not fixed
-  with it. Both raw methods are now implemented.
+  complete the android-13+ handshake** (`RpcSession::from_preconnected_fd`);
+  `TcpDebugTransport` now implements raw byte access.
 - **rsbinder (RPC) — `ServerGuard::drop` blocked for as long as a client
-  stayed connected.** `RpcServer::stop_accepting` only sets a flag the accept loop
-  polls; a worker already parked in `recv` never reads it, and the server had
-  no path that shut a session's transports down, so `join_workers` waited on
-  exactly the workers that were hung. The guard's own rustdoc promised
-  "workers joined"; `join_workers`' said not to rely on `Drop`.
-  `RpcServer::terminate` now ends every minted session — an r34 session has
-  no id and was never in the id registry, so the server keeps a second,
-  `Weak` list of all of them — and joins the workers, repeating until a pass
-  finds nothing, so a connection accepted as the flag went up is ended too
-  (its worker ends the session itself on seeing the flag). Calling it from a
-  handler skips that worker's own handle instead of self-joining.
-  `RpcSession::close_session` on a session with more than one live connection
-  used to warn and return without tearing anything down;
-  `SessionLifecycle::force_dying` takes `Live(n) → Dying` for any `n`, so it
-  — and `terminate` through it — ends the session whole.
+  stayed connected.** `RpcServer::terminate` now ends every session the server
+  minted (r34 included) and joins the workers, and is safe from a handler.
+  `RpcSession::close_session` now ends a session with several connections.
 - **rsbinder (RPC, TLS) — a TCP end without `close_notify` read as a clean
-  close.** `TlsTransport::recv_raw` folded rustls's `UnexpectedEof` — the one
-  signal it gives for a stream that ended without the TLS close alert — into
-  a 0-byte read, and `pump_incoming` never told rustls about the EOF at all,
-  so the framing reader saw an ordinary end of stream and a serve loop
-  returned `Ok(())`. On the one backend built for untrusted networks that is
-  what a truncation attack at a frame boundary looks like (mid-frame it was
-  already `Truncated`). It is now `RpcError::UncleanEndOfStream`
-  (`StatusCode::DeadObject`, with a `warn!`), carried through the `Read`
-  adapters as the `io::Error` payload so the framing readers hand it back
-  unchanged; and `TlsTransport::shutdown` sends `close_notify` first, so
-  rsbinder's own deliberate close is the clean end on the peer. Only the
-  thread holding the write lock may transmit, so `shutdown` refuses every
-  new send, waits for the one in flight, and only then queues and sends the
-  alert — a frame can no longer be encrypted behind it, where the peer would
-  discard it after the sender was told it went out. The wait is bounded, so
-  a peer that has stopped reading cannot hold teardown. No
-  transaction was ever misdelivered by this — a truncated reply already failed
-  the caller's wait; what was lost was the signal.
-- **rsbinder (RPC) — a refused attach was reported to the client as success.**
-  The outgoing direction of an android-13+ attach carries no acknowledgement
-  (AOSP writes `RpcNewSessionResponse` only for a new session, and an outgoing
-  connection's `"cci"` flows client→server), so a peer that refused the
-  connection — `session_id` unknown or stale, its `set_max_threads`
-  outgoing-slot cap already spent, shutting down — could only close the socket.
-  `RpcSession::add_outgoing_connection_android13plus` returned `Ok(slot)`
-  anyway and left the dead connection in the pool, where it broke one *later,
-  unrelated* call — whichever one the connection picker happened to route onto
-  that slot — and was then reclaimed, so a single-threaded client saw exactly
-  one inexplicable failure per run and a multi-threaded one saw them
-  intermittently. `setup_unix_client_android13plus_with_id` (and
-  `ClientOptions::session_id` over it) likewise handed back a session whose
-  only connection the peer had already closed. Both now confirm admission with
-  one `GET_SESSION_ID` round trip on the fresh connection *before* using it —
-  the reply must carry the id that was echoed — and report the refusal at the
-  attach call. Costs one extra round trip per attached connection; a new
-  session (empty id) is untouched, and so is the incoming (callback)
-  direction, whose post-admission `"cci"` already reported refusals. A
-  client's `RpcSession::session_id()` is a client-local value that is never
-  the peer's id (only `get_session_id()` fetches that), which is the mistake
-  this used to accept silently; its rustdoc now says so.
+  close**, which is what a truncation attack looks like. It is now
+  `RpcError::UncleanEndOfStream` (`DeadObject`, logged), and
+  `TlsTransport::shutdown` waits for the in-flight send and then sends
+  `close_notify` (bounded wait).
+- **rsbinder (RPC) — a refused attach was reported to the client as success**,
+  breaking a later unrelated call. `add_outgoing_connection_android13plus`
+  and `setup_unix_client_android13plus_with_id` (and
+  `ClientOptions::session_id`) now confirm admission with one
+  `GET_SESSION_ID` round trip. `RpcSession::session_id()` is client-local;
+  `get_session_id()` fetches the peer's.
 - **rsbinder (RPC) — a nested call that lost track of the stream left the
-  connection for the outer call to read.** A reentrant frame borrows the outer
-  frame's slot, so it cannot retire it, and the stale-reply marker it uses
-  instead does not fit bytes that came off the wire without yielding a frame:
-  whether this call's `REPLY` is still coming is then exactly what is unknown.
-  If it was, the outer frame read it next and — `WireReply` carrying no
-  transaction id — took it as its own answer. The slot is now marked
-  unreadable, so its owner retires it instead of interpreting another frame —
-  the path a non-reentrant frame already used; AOSP ends the whole session here
-  (`RpcState::waitForReply`: "processCommand must shutdown on failure"). The
-  connection is shut down too, but only to wake a blocked reader: what a
-  shutdown does to bytes already received is platform- and backend-dependent,
-  so the flag is what holds. A frame that does not decode is one way in (only
-  a peer that violates the wire reaches that: AOSP's command set is exactly the
-  three rsbinder decodes); a read that fails without the guarantee of having
-  stopped at a frame boundary — truncated, over-large, an I/O or protocol
-  error — is another, and is now classified the same way. A serve loop that
-  ends this way reports `StatusCode::DeadObject`, not the `Ok(())` of end of
-  stream, so `RpcSession::serve_blocking` callers and the `RpcServer` worker
-  log can still tell the two apart.
+  connection for the outer call to read**, which could take the nested reply
+  as its own. The slot is now marked unreadable and retired; a serve loop
+  ending this way reports `DeadObject`.
 - **rsbinder (RPC) — a send that stopped part-way left its connection in the
-  pool.** A write that stops mid-frame leaves the peer a header it will
-  complete out of whatever arrives next, and no transport makes such a
-  failure sticky, so the slot must never carry another frame — but only a
-  client call's request send acted on it: a reply, and a `DEC_STRONG` from
-  any of its three senders, discarded the error and returned the connection
-  for the next frame to be written on. Every send now funnels through one
-  rule — the frame that owns the slot retires it, a reentrant frame (which
-  owns nothing, the outer frame holds the slot) marks it unreadable and shuts
-  the transport down. A failure that put nothing on the wire is exempt: a
-  codec or protocol error, raised before the first byte, and a send deadline
-  that expired before the first byte, which the socket backends' android-13+
-  senders now report as `RpcError::Timeout` (`StatusCode::TimedOut`) rather
-  than as a transport error.
-  Both leave the stream frame-synchronized and the connection serving, so a
-  best-effort `DEC_STRONG` timing out on a socket-backed server with
-  `set_idle_timeout` no longer takes a live connection down. `rpc-tls` is the
-  exception, and deliberately so: a record its socket write dropped is gone
-  from the AEAD sequence however far it got, so a TLS send failure always
-  retires its slot.
+  pool** (replies and `DEC_STRONG` ignored the error). Every partial send now
+  retires or poisons its slot. A failure before the first byte (including a
+  send deadline, now `RpcError::Timeout` / `TimedOut`) keeps the connection,
+  except on `rpc-tls`, which always retires it.
 - **rsbinder (RPC) — a zero handshake deadline was neither honored nor
-  reported.** `RpcUnixClientConfig::handshake_timeout(Duration::ZERO)` and
-  `ClientOptions::handshake_timeout = Some(Duration::ZERO)` travelled to
-  `set_read_timeout` (and, on `tls://`, `TcpStream::connect_timeout`), both of
-  which document an error for a zero duration, so setup failed with an
-  unexplained `StatusCode::Unknown`. A zero duration cannot be a deadline and
-  `None` already means "no deadline", so it is now refused: the setup and
-  attach entries return `BadValue` naming the option, before any connect, and
-  the one place every handshake deadline is armed refuses it as well — no
-  `RpcTransport` implementation can be handed a value its socket rejects, or
-  quietly turn the caller's bound into no bound at all.
+  reported** (`StatusCode::Unknown`); `handshake_timeout` of
+  `Duration::ZERO` is now `BadValue` before any connect.
 - **rsbinder (RPC) — a write-side disconnect on an android-13+ session
-  reported `Unknown` instead of `DeadObject`.** `RawTransportIo` bridges the
-  transport to `std::io`, and its write side stringified the `RpcError`
-  into `io::Error::other`, so an `EndOfStream` raised while *sending* came
-  back from the other side of that boundary as `Io(Other)` — a peer that had
-  gone away was reported as an unclassified error, on the send path of every
-  call on a non-fd session as well as the handshake. `From<RpcError> for io::Error` is now
-  kind-preserving for the two variants that have an `io::ErrorKind` meaning
-  the same thing (`EndOfStream` → `BrokenPipe`, `Timeout` → `TimedOut`), so a
-  peer close comes back from the bridge as `EndOfStream` and a timeout comes
-  back in the shape the framing reader's deadline arm keys on. The TLS
-  transport's R34 framing adapter (`transport::tls`'s `RawIo`) carried the
-  same stringifying projection on its write side and is fixed with it, so an
-  `rpc-tls` R34 session now reports a dead peer as `DeadObject` too.
+  reported `Unknown` instead of `DeadObject`.** `From<RpcError> for io::Error`
+  now maps `EndOfStream` → `BrokenPipe` and `Timeout` → `TimedOut`; the TLS
+  R34 adapter is fixed too.
 - **rsbinder (RPC) — a wire-profile mismatch never mentioned the profile.**
-  An android-13+ server clamps whatever version the connection header
-  decodes to (`min(client_version, server_max_version)`, as AOSP does), so an
-  r34 (default) client's leading bytes got past the header: the server
-  accepted the connection, answered, and failed at the `"cci"` check with a
-  reject that named nothing an operator could act on; the server's handshake
-  log also flattened every cause into the opaque `RpcError` status name. In
-  the other direction an r34 server hung up mid-handshake and the client got
-  a bare dead-peer status with no log at all. Both rejects now name the r34
-  profile as the likely cause, in the same shape as the existing
-  `Client::open` diagnostics. Which side of that exchange notices the
-  disconnect first is a host- and timing-dependent race (EOF on the client's
-  response read, or `EPIPE`/`ECONNRESET` on its `"cci"` write), so the client
-  hint covers both — and a stall or a mid-frame cut names the deadline or the
-  partial response instead of guessing. An attach whose `max_version` is
-  below the session's negotiated version (which can never work — an attach
-  does not negotiate) now logs that `wire_protocol_version()` is the value
-  to pass instead of failing with a bare `BadType`.
+  Both sides' rejects now name the r34 profile as the likely cause, and an
+  attach with too low a `max_version` points at `wire_protocol_version()`.
 - **rsbinder (kernel) — a failed reply flush left a `BC_REPLY` pointing at
-  freed memory.** `write_transaction_data` stores raw pointers to the reply
-  parcel (or the status word on the stack) in the thread's command buffer.
-  When `wait_for_response` failed before the driver consumed that command —
-  a queued `BR_DEAD_REPLY`/`BR_FAILED_REPLY`, or an ioctl error — the
-  function returned through `?`, the reply was dropped, and the next flush
-  (`join_thread_pool`'s exit, or any later call on that thread) handed the
-  kernel the dangling pointer to copy into the peer: a cross-process
-  use-after-free. The panic path already rewound the buffer; the error path
-  did not. The reply path now retries the flush while the pointers are
-  still valid and rewinds the unconsumed tail otherwise; outbound
-  `transact` only rewinds — a retried `BC_TRANSACTION` would leave a
-  two-way call in flight whose reply the next call on that thread would
-  take as its own. An `IBinder::dec_strong` failure on the same path no longer
-  skips the reply (the two-way caller hung forever) or the transaction-state
-  restore (the next call inherited the previous caller's uid).
+  freed memory** (a cross-process use-after-free). The reply path retries or
+  rewinds the unconsumed command; a `dec_strong` failure no longer skips the
+  reply or the calling-identity restore.
 - **rsbinder (`Parcel`) — a safe forward seek could make the kernel read past
-  the buffer.** `data_size()` is `max(len, pos)` (AOSP `dataSize`), and the
-  outbound path sent exactly that with `as_ptr()`, so
-  `set_data_position(1024)` on a 48-byte parcel followed by a transact made
-  the driver `copy_from_user` a kilobyte from a 256-byte allocation and
-  deliver the surplus heap to the peer — from `pub`, non-`unsafe` calls. The
-  kernel now receives the initialized length. The `Vec::set_len` contract in
-  `ParcelData` was also misstated (and one test violated it by claiming
-  never-written capacity); growing is now a separate `unsafe` entry used
-  only for the driver-filled read buffer, and the byte-copy generics
-  (`write_aligned` / `write_array` / `read_array`) are sealed behind a
-  `ParcelPod` marker instead of trusting whichever type instantiates them.
+  the buffer** and send heap bytes to the peer. The kernel now gets the
+  initialized length; the byte-copy generics are sealed behind `ParcelPod`.
 - **rsbinder (kernel) — `become_context_manager` never asked for the
-  caller's security context.** AOSP registers with
-  `FLAT_BINDER_FLAG_TXN_SECURITY_CTX`, the one bit the kernel reads to decide
-  whether the context manager gets `BR_TRANSACTION_SEC_CTX`; rsbinder passed
-  only `ACCEPTS_FDS`, so every transaction into `rsb_hub` arrived without a
-  security context and `get_calling_sid()` was always `None` there. The flag
-  is now set on Android and on Linux with SELinux mounted — and deliberately
-  *not* elsewhere, because a kernel that cannot produce a context fails every
-  transaction to such a node with `BR_FAILED_REPLY` (verified on a
-  non-SELinux box). `ACCEPTS_FDS` stays set, unlike AOSP, since `rsb_hub`
-  answers `DUMP_TRANSACTION`, which carries an fd.
+  caller's security context**, so `get_calling_sid()` was always `None` in
+  `rsb_hub`. `FLAT_BINDER_FLAG_TXN_SECURITY_CTX` is now set on Android and on
+  Linux with SELinux mounted.
 - **rsbinder (`parcelable`) — the array pre-allocation cap bounded the count,
-  not the bytes.** `Vec::with_capacity(min(len, data_avail()))` still
-  multiplies by `size_of::<T>()`: a 64 MiB RPC frame declaring
-  `len = 64_000_000` for `Vec<String>` requested ~1.5 GiB up front, and an
-  allocation failure aborts. Every element on that path costs at least 4 wire
-  bytes, so the cap is now `data_avail() / 4`.
-- **rsbinder (RPC) — a `DEC_STRONG` could deadlock the session.**
-  `RpcState::dec_strong_local` dropped the freed node's strong ref while the
-  state lock was held; if that was the last reference to a user service
-  holding a proxy of the same session, `RpcProxy::drop` re-took the lock on
-  the same thread. The removed reference is now handed back and dropped after
-  the guard, as `clear_local` already did. The same drop from inside a
-  dispatch used to send its `DEC_STRONG` inline, *ahead of the reply* being
-  built — so a binder passed as an argument and returned in the same call
-  (`repeatBinder`) came back to its owner after the owner had already freed
-  the node, and the owner minted a bogus proxy to itself. Such a `DEC` is
-  deferred until the slot is free, which is the ordering AOSP has.
+  not the bytes** (~1.5 GiB for a crafted `Vec<String>`); it is now
+  `data_avail() / 4` elements.
+- **rsbinder (RPC) — a `DEC_STRONG` could deadlock the session** (a node's
+  last reference dropped under the state lock). The drop now happens after
+  the lock, and a `DEC_STRONG` from inside a dispatch is deferred until after
+  the reply, as in AOSP, so a returned binder is not freed early.
 - **rsbinder (RPC) — a peer could plant a proxy entry in our own address
-  subspace.** `RpcState::remote_proxy` minted a remote proxy for any unknown
-  address; AOSP `onBinderEntering` refuses one the receiving side would have
-  created itself. A forged address could then alias a local node and the next
-  legitimately minted one. Refused as `BadValue` now.
+  subspace**; such an address is now refused with `BadValue`, as AOSP does.
 - **rsbinder (RPC, `tokio`) — a nested callback from an RPC handler
-  deadlocked in a pure-RPC process.** `BinderAsyncPool::spawn` gated the
-  run-on-this-thread arm on `ProcessState::is_initialized()`, a guard that
-  `is_handling_transaction()` had since taken over itself. Without kernel
-  binder the call went to the blocking pool, where the session's thread-local
-  re-entrancy pin does not follow it, and it parked on the slot the
-  dispatching thread was waiting on.
-- **rsbinder (RPC, macOS) — a non-`AF_UNIX` fd resolved to a root peer.**
-  `getpeereid` on a TCP socket *succeeds* on macOS with `euid = 0`
-  (measured), which the `rc != 0` ladder could not catch, so
-  `UnixTransport::from_owned_fd` on a foreign-family fd minted
-  `PeerIdentity::Local { uid: 0 }`. The socket family is checked first. On
-  Linux/Android `SO_PEERCRED` is read through libc rather than rustix's
-  `Pid(NonZeroI32)`, which the kernel's `pid == 0` (peer outside our PID
-  namespace) would have made an invalid value.
+  deadlocked in a pure-RPC process**; `BinderAsyncPool::spawn` now runs it on
+  the dispatching thread.
+- **rsbinder (RPC, macOS) — a non-`AF_UNIX` fd resolved to a root peer**
+  (`getpeereid` succeeds on TCP with `euid = 0`); the socket family is checked
+  first. On Linux/Android a peer `pid == 0` no longer yields an invalid value.
 - **rsbinder (RPC server) — the r34 (default) profile never lifted the
-  handshake *write* deadline.** Only the read side was cleared after the
-  first frame, so `SO_SNDTIMEO` stayed armed for the session's whole life and
-  a large reply to a slow reader failed with `WouldBlock` — contrary to
-  `set_handshake_timeout`'s contract. The incoming-slot cap on attach was a
-  check-then-act (concurrent attaches could overshoot it) and counted the
-  peer's callback connections against `setMaxIncomingThreads`; it is now one
-  critical section over serve-driven slots only, as AOSP counts.
+  handshake *write* deadline**, so large replies to slow readers failed. The
+  incoming-slot cap on attach is now atomic and counts serve-driven slots
+  only, as AOSP does.
 - **rsbinder (`proxy_count`) — a panicking `ProxyCountCallback` escaped a
-  `Drop`.** The remaining queued events were lost with it and, during an
-  unwind, the process aborted. Callbacks are isolated with `catch_unwind`
-  like death recipients already were.
+  `Drop`**; callbacks are now isolated with `catch_unwind`.
 - **rsbinder (`lazy_service`) — a failed re-registration could hide a service
-  forever.** `restore` copied back the optimistic `registered: true` the call
-  itself had just written, so after a public `try_unregister` followed by a
-  refused `register_service` the entry said "registered" while the service
-  manager had nothing, and `re_register` skipped it for good.
+  forever** (the entry stayed "registered").
 - **rsbinder (`lazy_service`) — a refused `registerClientCallback` came back
-  as `EX_TRANSACTION_FAILED`.** The service manager's own exception
-  (`EX_SECURITY` for a policy refusal, `EX_ILLEGAL_STATE` for a binder it
-  does not know) was folded into a `StatusCode` on the way through `hub`
-  and re-wrapped, so `register_service` could never report what its
-  `# Errors` section promises. The registrar now keeps the service
-  manager's `Status` for both round trips.
+  as `EX_TRANSACTION_FAILED`**; the service manager's own `Status` is kept.
 - **rsbinder (`hub`, Android 15) — the numbering probe ran on every
-  `default()`.** A refused numbering (only one of `android_14` /
-  `android_15` compiled in) re-sent the probe transaction and re-logged the
-  five-line refusal on every lookup; the answer is now cached for the
-  process and logged once. A build with neither feature meeting an
-  Android 15 device also failed silently — it now names both features.
+  `default()`**; the answer is cached and logged once, and a build with
+  neither feature names both.
 - **rsbinder (RPC) — a proxy from another session was sent as a local
-  address.** `write_binder` reused an `RpcProxy`'s address without checking
-  which session minted it, so a proxy obtained over session A and written
-  into session B's parcel named one of A's peer's nodes on B's wire —
-  which B's peer resolved against its *own* nodes (the android-13+ address
-  is a small counter). AOSP `onBinderLeaving` refuses this with
-  `INVALID_OPERATION`; so does rsbinder now.
+  address**; it is now refused with `INVALID_OPERATION`, as AOSP does.
 - **rsbinder (`hub`, Android 15 r6+) — `check_service` starts lazy
-  services.** It is carried by `getService` (the only lookup that returns a
-  bare `IBinder` across the release range), and AOSP's servicemanager runs
-  `tryStartService` for an unregistered name on `getService` but not on
-  `checkService`. Documented on the function and in the lookup table; the
-  behaviour cannot change without parsing the release-dependent `Service`
-  union.
+  services**, since it is sent as `getService`; now documented.
 - **rsbinder (`file_descriptor`) — the fd null marker accepted any non-zero
-  value** (AOSP rejects anything but `1` as `UNEXPECTED_NULL`), and a
-  reliable-pipe `ParcelFileDescriptor` from Java never received the
-  `DETACHED` notice on its comm channel, so the sender's `checkError()`
-  reported a clean close. The notice is best-effort, as in AOSP: a sender
-  that already closed its end (a oneway send followed by `close()`) no
-  longer fails the whole fd read with `BadType`, and the write cannot raise
-  `SIGPIPE`.
-- **rsbinder (RPC) — hardening and housekeeping:** `wire_android13` reads a
-  message body straight into its final buffer (a 16-byte header could commit
-  twice `bodySize` before any body byte arrived) and rejects unknown
-  `RpcWireAddress` option bits instead of normalizing them; the in-memory
-  test transport enforces `MAX_FRAME_LEN` like every real backend; a failed
-  `SCM_RIGHTS` attach is an error rather than a `debug_assert`; a reaper-thread
-  spawn failure is logged (it silently lost every deferred `DEC_STRONG`);
-  `unix-abstract` and `binder://name` URIs decode percent-escapes like their
-  siblings and `%+9` is no longer an escape.
-- **rsbinder — comments and tests that said the wrong thing:** the
-  `AccessorRoot` drop-order note (the proxy holds the session strongly), the
-  `ParcelableHolder` `!Send` claim (it is `Send + Sync`), the `obituary_sent`
-  ordering rationale, the `RefCounter` double-dec assertion (it could never
-  fire — the sentinel reset made `c == INITIAL_STRONG_VALUE`), the Android 15
-  probe pin (it never referenced the probe constant), and several tests that
-  could not fail or asserted on the wrong gate (`test_strong`, `test_errors`,
-  `test_try_from`, the `Status` round trip that could not see `message`, the
-  RPC parcel fuzz target's binder claim, the abstract-socket
-  `stdout` fd test that took ownership of fd 1).
-- **rsbinder-aidl — an unqualified constant reference could resolve to an
-  unrelated declaration's constant.** Interface constants were registered in a
-  flat symbol table under their bare name, and that table was consulted before
-  the namespace-aware lookup. With `interface IX { const int A = 999; }`
-  anywhere in the build, a sibling `parcelable P { const int A = 1; const int
-  B = A + 1; }` generated `B = 1000`. Constants are now keyed by their
-  declaring namespace and resolved outward through enclosing scopes only —
-  and an imported interface's constant (`import a.IFoo; … IFoo.BAR`) still
-  resolves, through the import's own candidate.
-- **rsbinder-aidl — a constant's expression was folded in the referencing
-  declaration's scope.** `IFoo.BAR` defined as `BASE + 1` and read from
-  `IBaz` resolved `BASE` against `IBaz`, so a same-named constant there
-  changed the value (or an absent one failed the build); the fully-qualified
-  spelling had the same problem. A constant is now folded where it is
-  declared, once per constant, so a diamond of cross-package references and
-  a genuine reference cycle (still reported as such) both terminate.
+  value** (now only `1`), and a Java reliable-pipe `ParcelFileDescriptor` now
+  gets the best-effort `DETACHED` notice without `BadType` or `SIGPIPE`.
+- **rsbinder (RPC) — hardening and housekeeping:** bounded body allocation
+  and strict address option bits in `wire_android13`, `MAX_FRAME_LEN` in the
+  in-memory transport, a failed `SCM_RIGHTS` attach is an error, a reaper
+  spawn failure is logged, and `unix-abstract` / `binder://name` URIs decode
+  percent-escapes (`%+9` is no longer one).
+- **rsbinder — comments and tests that said the wrong thing** were corrected
+  (e.g. `ParcelableHolder` is `Send + Sync`), and tests that could not fail
+  now can.
+- **rsbinder-aidl — constant resolution:** an unqualified constant could
+  resolve to an unrelated interface's constant, and a constant's expression
+  was folded in the referencing scope. Constants are now keyed by namespace,
+  resolved through enclosing scopes and imports, and folded where declared.
 - **rsbinder-aidl — `@JavaOnlyImmutable` parcelables and unions lost all their
-  members.** The annotation check was a `starts_with("@JavaOnly")` prefix
-  match, so it also caught `@JavaOnlyImmutable` — a *structured* parcelable
-  that AOSP's Rust backend generates normally. Affected parcelables rendered
-  as `pub struct Foo {}`, and affected unions produced no type at all.
-- **rsbinder-aidl — enum references folded incorrectly in comparisons and
-  float expressions.** `ValueType::Reference` outranked every arithmetic type
-  in the promotion order, so `Status.OK == 0` folded to `false` while
-  `0 == Status.OK` folded to `true`, `Status.OK != Status.OK` folded to
-  `true`, and a float operand was truncated to the reference's integer width.
-  A reference now promotes to its integral value, per AOSP
-  `AidlConstantReference`. `to_bool`/`to_f64` accept references too, so
-  `E.FOO || false` no longer fails to build, and unary `-E.FOO` / `~E.FOO`
-  fold like `!E.FOO` instead of failing on the unfolded reference.
-- **rsbinder-aidl — an enum reference widened the expression around it.** A
-  reference folded as `long` whatever its `@Backing` type, so with
-  `@Backing(type="int") enum F { BIT = 1 }`, `F.BIT << 31` was rejected as
-  out of range for `int` while the identical `1 << 31` folded to
-  `-2147483648`. A reference now folds at its backing width (`byte` promoting
-  to `int`, as in C++).
-- **rsbinder-aidl — a non-nullable `out` argument could send a null.** The
-  server's local for an `out` `IBinder` / `ParcelFileDescriptor` / interface
-  is `Option<T>` initialised to `None`; a service that left it unset had that
-  `None` written straight into the reply. The server now fails with
-  `UNEXPECTED_NULL` instead, as AOSP `generate_rust.cpp` does. The matching
-  guard for out `ParcelFileDescriptor` arrays now covers fixed-size arrays
-  too, which AOSP also guards.
-- **rsbinder-aidl — a `@nullable` fixed-size array wrapped its elements
-  unconditionally.** `@nullable out int[3]` became `Option<[Option<i32>; 3]>`,
-  prefixing every element with a null marker libbinder does not write, and
-  `@nullable out MyEnum[3]` did not compile at all (`declare_binder_enum!`
-  implements no `SerializeOption`). Fixed-size arrays now use the same
-  primitive/enum rule as vectors.
-- **rsbinder-aidl — the trait signature and the server local disagreed for
-  `inout` arrays.** For example `inout ParcelFileDescriptor[]` declared the
-  trait parameter as `&mut Vec<T>` while the server declared its local as
-  `Vec<Option<T>>` and passed `&mut` it straight in (E0308). Both are now
-  `Vec<T>`: an `inout` vector is read from the parcel fully populated, so its
-  elements need no `Default`, and AOSP `aidl_to_rust.cpp::RustNameOf` keeps
-  `element_mode = VALUE` for `INOUT_ARGUMENT` for the same reason.
-- **rsbinder-aidl — a fixed-size array constant did not compile.**
-  `const int[3] X = {1,2,3};` emitted `pub const r#X: &[i32; 3] = [1,2,3,];`
-  — a reference type initialised with an array literal. Fixed-size constants
-  are now value types (`[&str; N]` for `String` elements, whose initializer is
-  string literals); the variable-length form still emits a slice. A
-  `@nullable` `String` array constant now declares the element `Option` its
-  initializer actually emits — `const @nullable String[] X` was typed
-  `&[&str]` while initialised `Some(&[Some("a")])`.
-- **rsbinder-aidl — a directory source containing a symlink cycle never
-  finished.** `Path::is_dir()` follows symlinks and the visited set was keyed
-  by the path string, so `aidl/loop -> .` produced endlessly deeper paths.
-  The set is now keyed by the canonical path, and so is the include-directory
-  set: an absolute `include_dir` plus a relative `source` under the same
-  directory listed it twice, so every import beneath it was reported as an
-  `AmbiguousImport` between two spellings of one file. A source sitting
-  directly under its own package path (`source("android/os/IFoo.aidl")` with
-  `package android.os;`) derives an empty include path, which names the
-  working directory rather than a directory of its own — it no longer
-  collides with `include_dir(".")`, and no longer leaves an empty
-  `cargo:rerun-if-changed=`.
-- **rsbinder-aidl — the output directory was never created.** `generate()`
-  failed with a bare "No such file or directory (os error 2)" when `dest_dir`
-  did not exist (including the documented `aidl_gen/` fallback outside cargo)
-  or when `output` named a subdirectory. It is created on demand, and I/O
-  failures now name the path.
+  members** (mistaken for `@JavaOnly…`); they are generated normally.
+- **rsbinder-aidl — enum references in constant expressions:** they now
+  promote to their integral value at their `@Backing` width, as in AOSP, so
+  `Status.OK == 0`, float operands, `E.FOO || false`, unary `-`/`~` and
+  `F.BIT << 31` fold correctly.
+- **rsbinder-aidl — a non-nullable `out` argument could send a null**; the
+  server now fails with `UNEXPECTED_NULL`, as AOSP does, including for
+  fixed-size and nested fixed-size `out ParcelFileDescriptor` arrays.
+- **rsbinder-aidl — array type fixes:** a `@nullable` fixed-size array follows
+  the primitive/enum rule of vectors; `inout` arrays use `Vec<T>` in both the
+  trait and the server (was E0308); fixed-size array constants are value
+  types, and `@nullable String` array constants are typed correctly.
+- **rsbinder-aidl — source discovery:** a symlink cycle no longer loops
+  forever, include directories are deduplicated by canonical path (no false
+  `AmbiguousImport`), and an empty derived include path no longer collides
+  with `include_dir(".")`.
+- **rsbinder-aidl — the output directory is created on demand**, and I/O
+  errors name the path.
 - **rsbinder-aidl — a second `Builder` could inherit the first one's
-  declarations.** Parsing happens in `generate()` but the parser was reset in
-  `Builder::new()`, so two builders constructed before either generated shared
-  state: the second resolved types the first had declared without importing
-  them. The reset moved to the parse phase.
-- **rsbinder-aidl — legitimate AIDL was rejected as "nesting too deep".** The
-  pre-parse guard counted `>>` only as a shift, so generic depth accumulated
-  across a statement and a signature with 129 `List<List<T>>` arguments was
-  refused at a real nesting depth of 2.
-- **rsbinder-aidl — enum discriminants outside their `@Backing` range were
-  emitted anyway.** `@Backing(type="byte") enum E { A = 200 }` produced a
-  literal that is a deny-by-default rustc error in the generated crate,
-  pointing at `OUT_DIR` rather than the `.aidl`. The range is now checked at
-  AIDL-compile time, as AOSP does.
-- **rsbinder-aidl — two union fields could collapse into one Rust variant.**
-  `union U { int my_field; int myField; }` emitted `r#MyField` twice (E0428);
-  the collision is now a diagnostic naming both fields.
-- **rsbinder-aidl — `@RustDerive(Debug=true)` emitted `#[derive(Debug)]`
-  twice** (E0119); the templates already derive it unconditionally. A
-  parameter outside the schema (`@RustDerive(Cloen=true)`) is now a
-  diagnostic naming it; it used to be dropped silently and surface as a
-  missing trait in the user's crate.
-- **rsbinder-aidl — a nested fixed-size `out ParcelFileDescriptor` array did
-  not compile.** The `UNEXPECTED_NULL` guard iterated one level of
-  `[[Option<_>; 3]; 2]`; it now flattens one level per extra dimension.
-- **rsbinder-aidl — a `rust_type` declaration named after a Rust keyword was
-  not escaped**, unlike every other declaration path.
-- **rsbinder-aidl — a negative out-of-range shift amount was reported by its
-  magnitude.** `1 << -100` said "shift amount 100", which does not match the
-  source.
-- **rsbinder-aidl — a package segment that is a Rust keyword was emitted
-  unescaped.** `package com.example.impl;` produced `pub mod impl {`, while
-  references to it were escaped as `super::r#impl::...`. The escape list also
-  covers `gen`, reserved in Rust 2024 — generated code is compiled in the
-  consumer's edition.
+  declarations**; the parser is reset at parse time.
+- **rsbinder-aidl — legitimate AIDL was rejected as "nesting too deep"**
+  (`>>` counted only as a shift).
+- **rsbinder-aidl — codegen that failed in rustc is now an AIDL diagnostic or
+  correct output:** enum discriminants outside their `@Backing` range, two
+  union fields mapping to one variant, `@RustDerive(Debug=true)` (E0119) or
+  an unknown parameter, unescaped `rust_type` names and keyword package
+  segments (incl. `gen`), and a negative shift amount reported by magnitude.
 - **rsbinder-aidl — the `#[allow(clippy::all)]` / `#[allow(unused_imports)]`
-  header applied only to the first top-level module** in the generated file,
-  and to nothing at all in a document without a `package`. Both lints are now
-  part of every generated module's inner `#![allow(...)]`, alongside the
-  naming allowances; the header stays on each top-level package module, whose
-  own lints (e.g. `module_inception` against the `include!` site) an inner
-  attribute one level down cannot cover.
-
+  header applied only to the first top-level module**; both are now in every
+  generated module's inner `#![allow(...)]`.
 - **rsbinder (`hub`) — Android 15 QPR builds are now refused instead of
-  silently losing registrations.** `android-15.0.0_r6` inserted `getService2`
-  at index 1 of `IServiceManager.aidl`, shifting every transaction code after
-  it by one (`addService` 2 → 3, `registerClientCallback` 11 → 12,
-  `tryUnregisterService` 12 → 13) while leaving the SDK at 35 — the interface
-  is not a frozen `aidl_interface`, and AOSP is unaffected because
-  `servicemanager` and `libbinder` ship in one image. rsbinder picks its
-  protocol from the SDK version, so on such a build it addressed the wrong
-  method for everything past `getService`: measured against the
-  `BP11.241210.004` servicemanager, `addService` lands on `checkService`,
-  which reads the name and leaves the rest of the parcel, and AOSP's
-  generated `onTransact` rejects the leftovers with `BAD_PARCELABLE`. Nothing
-  is registered, and the error says nothing about why.
-  `hub::default` now measures which numbering the device speaks — one
-  argument-free transaction to a code that exists in exactly one of the two —
-  and dispatches accordingly. The shifted numbering is served by the new
-  `android_15` feature (see *Added*); a build without it refuses the device
-  rather than addressing the wrong method, and says which feature is missing.
-  Every other version is unaffected. Only kernel-binder use through `hub` is
-  in scope — the RPC transport does not go through the service manager.
+  silently losing registrations.** `android-15.0.0_r6` shifted every
+  `IServiceManager` transaction code after `getService` by one without
+  changing the SDK version. `hub::default` now probes which numbering the
+  device speaks and dispatches to `android_14` or the new `android_15`
+  feature; a build without the needed feature refuses the device and names it.
 - **rsbinder (hub):** `ServiceManager::get_connection_info` did not compile
-  on Android 13/14 — each version generates its own `ConnectionInfo` and the
-  dispatch arms returned the version's type where the unified one was
-  expected. Latent because no build enabled those features together.
-- **rsbinder (`ProxyHandle::dump`):** a `write_object` that failed after the
-  descriptor had been detached from its RAII wrapper leaked the descriptor.
-  Every other path is covered by the parcel's own ownership of it.
-- **rsbinder:** a `DeathRecipient` could not identify the binder that died.
-  `SIBinder::downgrade` read a proxy's generation from the proxy cache and fell
-  back to the `Native` variant when the entry was missing — and the obituary
-  retires that entry *before* dispatching `binder_died`. Every weak taken
-  inside a death recipient therefore compared unequal to the `who` it was
-  handed and to every weak taken while the binder was alive, so a recipient
-  watching more than one binder matched none of them. This is what made
-  `rsb_hub` keep dead services in its registry (see below); any user code
-  matching `who` against stored binders hit the same wall.
+  with Android 13 and 14 enabled together.
+- **rsbinder (`ProxyHandle::dump`):** a failed `write_object` leaked the
+  descriptor.
+- **rsbinder:** a `DeathRecipient` could not identify the binder that died:
+  weak references taken inside `binder_died` compared unequal to `who` and to
+  earlier weaks. Fixed by stamping the weak identity at construction (see
+  *Changed*).
 - **rsbinder-tools (`rsb_hub`):** a dead service was never removed from the
-  registry. The death handler matched the obituary against a *freshly*
-  downgraded `WIBinder`, but a proxy `WIBinder` compares on
-  `(handle, proxy-cache generation)` and the obituary retires that cache entry
-  before invoking callbacks — so every death matched nothing and retired zero
-  entries. A crashed service kept its name reserved, kept being handed to
-  clients as a dead binder, and leaked its callbacks and death subscription
-  until `rsb_hub` restarted. The underlying `SIBinder::downgrade` defect is
-  fixed above; `rsb_hub` now matches `who` against its stored binders directly.
+  registry (same cause); `rsb_hub` now matches `who` against its stored
+  binders.
 - **rsbinder-tools (`rsb_hub`):** death subscriptions are reference-counted per
-  binder, so link and unlink can no longer drift apart. They drifted both ways:
-  `unregisterForNotifications` removed a callback without unlinking, so every
-  register/unregister cycle left another subscription behind — unbounded, and
-  reachable by any local caller — and one binder registered under K names took
-  K subscriptions, so its death ran K full cleanup sweeps instead of one.
+  binder; `unregisterForNotifications` leaked one per cycle, and a binder
+  under K names took K subscriptions.
 - **rsbinder-tools (`rsb_hub`):** `getService2`/`checkService2` now report
-  `isLazyService` from the registered `FLAG_IS_LAZY_SERVICE` instead of always
-  `false`. AOSP's client uses it to skip caching a lazy service, which can
-  withdraw via `tryUnregisterService` *without dying* — so no death
-  notification would have invalidated the client's cached binder.
-- **rsbinder-tools (`rsb_hub`):** exception-code parity with AOSP on three
-  replies that are visible to a C++ `LazyServiceRegistrar`: "only a server can
-  register client callbacks" and "only a server can unregister itself" are now
+  `isLazyService` from the registered `FLAG_IS_LAZY_SERVICE` (was always
+  `false`).
+- **rsbinder-tools (`rsb_hub`):** exception codes match AOSP: "only a server
+  can register client callbacks" / "unregister itself" are
   `EX_UNSUPPORTED_OPERATION` (were `EX_SECURITY`), and `tryUnregisterService`
-  on an unregistered or mismatched name is `EX_ILLEGAL_STATE` (was
+  on an unknown or mismatched name is `EX_ILLEGAL_STATE` (was
   `EX_ILLEGAL_ARGUMENT`).
-- **rsbinder-tools (`rsb_hub`):** a failed self-registration no longer stops
-  the process — it is logged, as AOSP does. Clients reach the hub through
-  handle 0 regardless. `addService` also warns when `dumpPriority` sets no
-  `DUMP_FLAG_PRIORITY_*` bit, which silently hides the service from every
-  `listServices` filter.
-- **rsbinder (`macros` feature):** signature shapes the macros accepted but
-  should not have, all found by review and each now refused with a compile-fail
-  case in `rsbinder-macros/tests/ui`: a `#[oneway]` method with an out/inout
-  parameter (which `.aidl` rejects, and whose value could never come back); a
-  `ParcelableHolder` field, whose derived codec could never decode a peer's
-  `@VintfStability` holder; borrowed types nested inside another type; an
-  `unsafe` or `auto` trait and a variadic method, whose modifiers the
-  re-render dropped without a word; and a fixed-array length written as a named
-  constant, which the macro cannot evaluate and so silently mis-initialised.
-- **rsbinder (`macros` feature):** shapes that no `.aidl` can express are now
-  refused instead of building an interface with no migration path — `out`/
-  `inout` on a primitive, on `String` or on `ParcelFileDescriptor`, and
-  `Option<T>` over a primitive. AOSP's `GetArgumentAspect` gives every
-  non-array builtin `in` as its only direction and rejects `@nullable` on a
-  scalar; `rsbinder-aidl` matched it, the macros did not.
-- **rsbinder (`macros` feature):** shapes the macros accepted and now render
-  correctly, unit-tested in `rsbinder-macros`: a nullable out vector, which
-  generated code that did not type-check; an out `ParcelFileDescriptor` array,
-  which silently omitted the null guard `.aidl` emits and would have put a null
-  fd on the wire; a raw-identifier field such as `r#type`, which rendered as
-  `r#r#type`; and a fixed-size out array longer than 32. A by-value argument
-  must be `Copy` (the proxy passes it twice) and a derived parcelable must
-  implement `Default` — both are now stated in the rustdoc and asserted against
-  the user's own type instead of failing inside generated code.
-  `#[derive(BinderEnum)]` no longer requires `Copy` and accepts
-  `#[repr(i32, align(8))]`; an unrecognised method attribute is refused rather
-  than dropped; and the generated items follow the trait's own visibility.
-- **rsbinder (`macros` feature):** `#[derive(BinderEnum)]` re-emitted each
-  variant's discriminant *expression* and cast that, so the literal inside was
-  typed on its own and fell back to `i32`: `#[repr(i64)] A = 1 << 31` went on
-  the wire as `-2147483648` instead of `2147483648`, and `1 << 40` failed to
-  compile with a message about `i32`. Both ends of the macro used the same
-  wrong value, so only a `.aidl` or AOSP peer saw the mismatch. The codec now
-  casts the declared variant.
-- **rsbinder (`macros` feature):** a `descriptor = "…"` containing a backslash
-  or a quote was spliced verbatim into the generated source, either changing
-  the wire descriptor or breaking the string literal — the latter surfacing as
-  a parse failure printing the whole generated module. It is now refused on the
-  attribute itself. The `.aidl` path is spared this by its grammar.
-- **rsbinder (`macros` feature):** a type reaching the macros through a
-  `macro_rules!` `$t:ty` capture, or wrapped in parentheses, was refused as
-  "unsupported" even when it was something as ordinary as `i32` — `syn` hands
-  such a capture over inside invisible delimiters, which the type walkers now
-  see through. `#[derive(Parcelable)]` on a raw-identifier type also sent
-  `"r#type"` as its descriptor, where the `.aidl` path sends `"type"`; the
-  descriptor is wire-visible through `ParcelableHolder`, which records and
-  compares it.
-
-- **rsbinder-aidl:** an interface that names *itself* in a signature
-  (`interface IFoo { void register(in IFoo cb); }`) rendered as
-  `Strong<dyn Box<IFoo>>` and did not compile — the guard that boxes a
-  self-referencing *parcelable* field, which genuinely needs the indirection,
-  was being applied to interfaces, where `Strong<dyn …>` is already a handle.
-  Self-referencing callbacks now generate correctly; recursive parcelables are
-  unchanged, and so is every other generated file.
-- **rsbinder-aidl:** two parcelables that reference *each other* produced an
-  infinitely sized Rust type (`E0072`). The box guard compared names, so it saw
-  only cycles of length one; it now walks the declaration graph. A cycle that
-  runs through an interface stays unboxed — `Strong<dyn …>` is a handle, which
-  is what makes the AOSP `CircularParcelable` / `ITestService` pair finite. So
-  is a cycle that runs through an array or a `List`: a `Vec` element is a
-  fixed-size handle whatever it holds, and `Box<T>` implements neither
-  `SerializeArray` nor `DeserializeArray`, so boxing one emitted a
-  `Vec<Box<T>>` that did not compile. `<Union>.Tag` is likewise never boxed —
-  it resolves to its parent union's namespace, which made it look like the
-  union itself, but the generated `Tag` is a scalar newtype holding no union.
+- **rsbinder-tools (`rsb_hub`):** a failed self-registration is logged instead
+  of stopping the process, and `addService` warns when `dumpPriority` sets no
+  `DUMP_FLAG_PRIORITY_*` bit.
+- **rsbinder (`macros` feature) — shapes now refused:** a `#[oneway]` method
+  with an out/inout parameter, a `ParcelableHolder` field, nested borrowed
+  types, `unsafe`/`auto` traits and variadic methods, a named-constant array
+  length, `out`/`inout` on a primitive, `String` or `ParcelFileDescriptor`,
+  `Option<T>` over a primitive, a `descriptor` with a backslash or quote,
+  trait attributes, where clauses, `async`/`unsafe`/`const`/`extern` methods,
+  unrecognised method attributes, and `BinderResult<Option<&T>>`.
+- **rsbinder (`macros` feature) — shapes that now render correctly:** a
+  nullable out vector, an out `ParcelFileDescriptor` array (null guard), raw
+  identifiers (`r#type`) in fields, methods and arguments, fixed-size out
+  arrays longer than 32, qualified-path out parameters, `self::` paths, types
+  from a `macro_rules!` `$t:ty` capture or in parentheses, and a raw-identifier
+  parcelable's descriptor. The generated module follows the trait's
+  visibility. A by-value argument must be `Copy` and a derived parcelable
+  `Default`, now asserted on the user's type. `#[derive(BinderEnum)]` no
+  longer requires `Copy` and accepts `#[repr(i32, align(8))]`.
+- **rsbinder (`macros` feature):** `#[derive(BinderEnum)]` encoded
+  discriminant expressions as `i32` (`#[repr(i64)] A = 1 << 31` went out as
+  `-2147483648`); it now casts the declared variant.
+- **rsbinder-aidl:** an interface that names *itself* in a signature rendered
+  as `Strong<dyn Box<IFoo>>` and did not compile.
+- **rsbinder-aidl:** mutually recursive parcelables produced an infinitely
+  sized type (`E0072`); cycles are now found across the declaration graph
+  and boxed, except through an interface, an array or `List`, or a union's
+  `Tag`.
 - **rsbinder-aidl:** a cycle closed by a **non-nullable** field is now a
-  diagnostic (`aidl::recursive_parcelable`) rather than a box. `Box<T>` alone
-  breaks the size, not the recursion: the generated `impl Default` — which is
-  the deserialization entry point, not decoration — called itself until the
-  stack ran out, so a peer's parcel aborted the process. `@nullable` renders
-  the field as `Option<Box<T>>`, which terminates; AOSP likewise requires the
-  cycle-closing field to be nullable.
-- **rsbinder (`macros` feature):** a second batch of signature shapes, each now
-  covered by a test. A raw identifier — `fn r#type`, or an argument named
-  `r#match` — rendered as `fn r#r#type` / `_arg_r#type` and did not lex, the
-  same double-escape already fixed for parcelable fields. An out parameter
-  spelled through a qualified path (`&mut std::vec::Vec<i32>`) silently lost
-  the length word `.aidl` writes, and a qualified `ParcelFileDescriptor`
-  element lost the null guard that keeps a null fd off the wire — those
-  decisions now read the type, not its rendered text. `BinderResult<Option<&T>>`
-  was rewritten to `Option<String>` with no diagnostic on the declaration. An
-  attribute on the *trait* (a `#[cfg]`, a trait-level `#[oneway]`), a where
-  clause, and `async`/`unsafe`/`const`/`extern` on a method were all dropped by
-  the re-render rather than refused. `self::` in a signature resolved inside the
-  generated module instead of the caller's. The generated module followed
-  neither the trait's visibility — a private trait was reachable through it —
-  nor the scope its own `Copy` assertion used, so a path in a by-value argument
-  was resolved at two different depths.
+  diagnostic (`aidl::recursive_parcelable`), since its `Default` recursed
+  forever; make the field `@nullable`, as AOSP requires.
 - **fuzz:** the `rpc_wire_decode` / `rpc_address_decode` / `rpc_session_handshake`
-  targets compile again — their entrypoints are re-exported as
-  `rsbinder::rpc::__fuzz_*` after the wire-codec module became crate-private.
-  New `rpc_raw_fd` target covers the bare (`IMemoryHeap`-style) fd decode.
-
+  targets compile again through `rsbinder::rpc::__fuzz_*`; new `rpc_raw_fd`
+  target.
 - **rsbinder:** a remote binder handle is serialized through the full 8-byte
-  object union, so no uninitialized stack bytes are copied onto the wire; the
-  proxy path previously wrote only the 32-bit handle and leaked 4 bytes to the
-  peer.
-- **rsbinder (`rpc`):** a discarded RPC reply's reference-count bumps are rolled
-  back on the handler-error and oneway dispatch paths, preventing local-node
-  leaks.
-- **rsbinder:** `Parcel::append_from` bounds the source range against the
-  backing buffer length instead of the logical size, avoiding a panic when the
-  source cursor sits past its data end.
+  object union, so 4 uninitialized stack bytes no longer reach the peer.
+- **rsbinder (`rpc`):** a discarded RPC reply's reference-count bumps are
+  rolled back on the handler-error and oneway paths.
+- **rsbinder:** `Parcel::append_from` no longer panics when the source cursor
+  sits past its data end.
 - **rsbinder (`rpc`):** the Unix transport retries `EINTR` on a raw read and
-  rejects file descriptors attached to an empty frame instead of dropping them.
-- **rsbinder:** `get_extended_error` and `query_interface` return a recoverable
-  error instead of panicking in a pure-RPC or malformed-reply path.
+  rejects fds attached to an empty frame.
+- **rsbinder:** `get_extended_error` and `query_interface` return an error
+  instead of panicking on pure-RPC or malformed-reply paths.
 - **rsbinder (`rpc`):** `StatusCode::RpcError` no longer shares AOSP
-  `FROZEN_OBJECT`'s `status_t` value, so an incoming frozen-object status is not
-  mis-decoded.
-- **rsbinder (`rpc`):** a `ParcelableHolder`'s sub-parcel now inherits the
-  marshalling mode of the parcel it was cut from. A holder read out of an RPC
-  parcel became a kernel-mode sub-parcel, so 24 bytes that merely look like a
-  `flat_binder_object` — payload there, with no object-table entry — could be
-  decoded as a binder on the way back out.
-- **rsbinder (`rpc`):** `Parcel::append_from` refuses to copy RPC or data-only
-  bytes into a kernel-mode parcel (`BadType`). They were never checked against
-  a kernel object table, and a kernel reader accepts a null-pointer,
-  null-cookie `flat_binder_object` without one, so payload could come back out
-  as a binder. Copying the other way is newly refused too: a kernel range
-  carrying objects into an RPC or data-only parcel is `BadType`
-  (`FdsNotAllowed` when every object in the range is a file descriptor),
-  where the object table used to be dropped and the bytes copied as payload.
-  User-visible: forwarding a `ParcelableHolder` decoded with `from_bytes` or
-  received over RPC into a kernel binder transaction now returns `BadType`,
-  and forwarding one received over kernel binder whose payload carries a
-  binder or a file descriptor onto an RPC transaction, or into `to_bytes`,
-  now returns `BadType` / `FdsNotAllowed` where the object used to be
-  silently dropped.
-- **rsbinder (`rpc`):** `Parcel::append_from` refuses to copy the bytes of a
-  parcel bound to an RPC session into one that has no session (`BadType`). A
-  binder in an RPC parcel is flattened into the body as a session address,
-  and only the android-16 v2 wire records where — so neither parcel's object
-  table can tell such a range from data, and the copy landed the address in a
-  parcel that `to_bytes` then handed out as file bytes. User-visible:
-  `to_bytes` on a `ParcelableHolder` read out of an RPC transaction now
-  returns `BadType` instead of bytes; resolving it first with
-  `get_parcelable::<T>` gives a value that encodes as usual.
+  `FROZEN_OBJECT`'s `status_t` value.
+- **rsbinder (`rpc`):** `ParcelableHolder` and `Parcel::append_from` no longer
+  let bytes cross between kernel, RPC and data-only parcels unchecked: a
+  holder's sub-parcel inherits its parent's mode, and copies that could turn
+  payload into a binder, or drop objects, are refused with `BadType` /
+  `FdsNotAllowed` (user-visible effects listed under *Migrating*).
 - **rsbinder (kernel binder):** a caught panic on the reply path leaked a
-  kernel transaction buffer. The recovery truncated the whole outgoing command
-  parcel to drop the half-written `BC_REPLY` — but on a looper thread
-  `flush_if_needed` never flushes, so a nested call's `BC_FREE_BUFFER` could
-  still be queued in the same parcel, and dropping it left the kernel holding
-  a buffer nothing would ever reclaim. The recovery now rewinds to the mark
-  taken before the reply was written, as the normal failure path and
-  `transact` already did.
+  kernel transaction buffer; the recovery now rewinds only to the reply's
+  mark.
 
 ## [0.10.0] - 2026-07-11
 
