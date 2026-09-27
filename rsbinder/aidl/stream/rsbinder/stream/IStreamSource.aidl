@@ -15,6 +15,11 @@ package rsbinder.stream;
  * notification, not a question, and a consumer that had to wait for the
  * producer's reply before taking its next batch would be paced by how
  * busy the producer's threads are.
+ *
+ * This interface is the RPC path only: on a StreamEndpoint that carries
+ * a ring the consumer cancels through the ring's EventFlag, and there is
+ * no credit to grant, so this object is never made. IStreamSink.aidl has
+ * what the session needs to carry a stream.
  */
 interface IStreamSource {
     /**
@@ -39,10 +44,10 @@ interface IStreamSource {
      * smaller than that threshold: a larger item still goes out, with
      * the batch it was added to.
      *
-     * A grant that cannot be delivered fails at the sender — the driver
-     * reports a dead or full receiver on a `oneway` call too — and the
+     * A grant that cannot be delivered fails at the sender — the session
+     * has ended, or it has no free connection to send on — and the
      * consumer sends its total again later, by then perhaps a larger
-     * one.
+     * one. A total that is not positive is ignored.
      *
      * A consumer grants again for every batch it drains, for as long as
      * it wants more: a producer that runs out of credit sends nothing
@@ -59,9 +64,16 @@ interface IStreamSource {
     /**
      * No more items are wanted.
      *
-     * The producer stops at its next batch boundary and is released from
-     * any wait for credit. It may still send IStreamSink.onEnd; a
-     * consumer that has cancelled can ignore it.
+     * The producer sends no further IStreamSink.onBatch — items it has
+     * not yet sent are dropped — and is released from any wait for
+     * credit. It may still send IStreamSink.onEnd; a consumer that has
+     * cancelled can ignore it.
+     *
+     * A cancel is also how a consumer that refused the stream says so
+     * (IStreamSink.onStart, IStreamSink.onBatch): the reason stays on the
+     * consumer's side. And a consumer that closes cancels even after
+     * IStreamSink.onEnd, so a producer takes a cancel that arrives after
+     * its end as nothing.
      */
     oneway void cancel();
 }
