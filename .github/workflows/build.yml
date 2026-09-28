@@ -226,6 +226,11 @@ jobs:
         # the C header's peer with the runner's own `cc` and `c++` (plan
         # 10-7b P4).
         run: cargo test -p rsbinder-fmq
+      - name: rsbinder-tools unit tests (hermetic)
+        # The `rsb_hub` configuration parser, policy and enforcer, the NSS
+        # and notify helpers, and the three binaries' own tests: none opens
+        # the binder device, so the whole package runs here.
+        run: cargo test -p rsbinder-tools
 
   rpc-suite:
     name: RPC Transport Suite
@@ -250,7 +255,7 @@ jobs:
           cargo build -p rsbinder --features rpc-tcp-debug
           cargo build -p rsbinder --features rpc-tls
           cargo build -p rsbinder --features rpc-vsock
-      - name: RPC unit + e2e (rsbinder, hermetic — multi-conn now default per AC-12.6)
+      - name: rsbinder unit + doc + RPC e2e (hermetic — multi-conn now default per AC-12.6)
         # `rpc_transport_conformance` is what makes the
         # `RpcTransport::shutdown` contract measured rather than merely
         # written, and the behaviour it pins differs by platform — so it
@@ -263,37 +268,17 @@ jobs:
         # the PR gate covers it, not only the manual integration-test
         # workflow.
         #
-        # `rpc`-gated *lib unit* tests live outside `rpc::` too, so every
-        # module holding one needs its own filter line below: `rpc` is not
-        # a default feature, so the `--no-default-features` runs elsewhere
-        # cannot see them at all. The filters are per module rather than a
-        # bare `--lib` because `thread_state::tests` and
-        # `tests::process_state` open `/dev/binderfs/binder`, which a
-        # hermetic runner has not got.
+        # The *lib unit* tests run whole, less the ones that open the binder
+        # device: `scripts/ci_rsbinder_lib_tests.sh` holds that list and
+        # why one `--features rpc` run covers every other lib test.
         run: |
-          # libtest exits 0 when a filter matches nothing, so a renamed,
-          # moved or newly `cfg`-gated module would empty a filter line
-          # silently. Every line below is a filter, so every line goes
-          # through this: it fails the step unless the run reported at
-          # least one passing test.
+          # libtest exits 0 when a filter matches nothing, so a renamed
+          # target would empty a filter line silently. Every filtered line
+          # goes through this: it fails the step unless the run reported
+          # at least one passing test.
           t() { "$@" 2>&1 | tee /tmp/rpc_filter.out; grep -qE 'test result: ok\. [1-9][0-9]* passed' /tmp/rpc_filter.out; }
-          t cargo test -p rsbinder --features rpc --lib rpc::
-          t cargo test -p rsbinder --features rpc --lib parcel::
-          t cargo test -p rsbinder --features rpc --lib file_descriptor::
-          t cargo test -p rsbinder --features rpc --lib hub::
-          t cargo test -p rsbinder --features rpc --lib parcelable_holder::
-          t cargo test -p rsbinder --features rpc --lib permission_controller::
-          t cargo test -p rsbinder --features rpc --lib thread_state::tests::rpc_
-          # Modules that touch no device at all — a local binder dispatches
-          # in-process — and so belong on a hermetic runner as much as the
-          # RPC ones do. Without a line here their unit tests run nowhere
-          # in this workflow.
-          t cargo test -p rsbinder --features rpc --lib stream::
-          t cargo test -p rsbinder --features rpc --lib cancel::
-          t cargo test -p rsbinder --features rpc --lib transport_caps::
-          t cargo test -p rsbinder --features rpc --lib observe::
-          t cargo test -p rsbinder --features rpc --lib fmq::
-          t cargo test -p rsbinder --features rpc --lib thread_state::tests::work_source_
+          bash scripts/ci_rsbinder_lib_tests.sh
+          t cargo test -p rsbinder --features rpc --doc
           cargo test -p rsbinder --features rpc --test rpc_e2e --test rpc_scenarios --test rpc_server --test rpc_fd --test rpc_shared_memory --test rpc_cross_stack --test rpc_transport_conformance --test source_invariants --test blob_rpc --test pipe_rpc --test parcel_alloc
           cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_tls --test rpc_transport_conformance
           t cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_server -- --exact tls_android13plus_nested_callback_e2e
@@ -487,7 +472,7 @@ jobs:
         run: cargo build -p rsbinder-tools --release
       - name: rsb_device unit (mounts parser)
         run: cargo test -p rsbinder-tools --bin rsb_device
-      - name: RPC hermetic (multi-conn now default per AC-12.6)
+      - name: rsbinder unit + doc + RPC hermetic (multi-conn now default per AC-12.6)
         # The macOS half of the `shutdown` conformance gate: this is the
         # platform that drops its receive queue on a local shutdown and
         # accepts the peer's first send afterwards, so the suite has to
@@ -496,7 +481,8 @@ jobs:
         run: |
           # Filter lines must report a passing test: see `t()` in `rpc-suite`.
           t() { "$@" 2>&1 | tee "$RUNNER_TEMP/rpc_filter.out"; grep -qE 'test result: ok\. [1-9][0-9]* passed' "$RUNNER_TEMP/rpc_filter.out"; }
-          t cargo test -p rsbinder --features rpc --lib rpc::
+          bash scripts/ci_rsbinder_lib_tests.sh
+          t cargo test -p rsbinder --features rpc --doc
           cargo test -p rsbinder --features rpc --test rpc_e2e --test rpc_scenarios --test rpc_server --test rpc_fd --test rpc_shared_memory --test rpc_cross_stack --test rpc_transport_conformance --test source_invariants --test blob_rpc --test pipe_rpc --test parcel_alloc
           cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_tls --test rpc_transport_conformance
           t cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_server -- --exact tls_android13plus_nested_callback_e2e
