@@ -134,12 +134,13 @@ jobs:
       - name: Run rsbinder unit tests (slow-path / hardening regression gate)
         run: |
           # The `rsbinder` crate's own unit tests are NOT exercised by the
-          # `cargo test --package tests` loop below, and build.yml only
-          # compiles them (`--no-run`). Several of them need a live binder
-          # device + service manager (handle 0) — e.g. the P1/P2/P3
-          # slow-path concurrency / same-thread re-entrant obituary
-          # deadlock guards (PR #118, `481b8c9`). This binder-enabled job
-          # is the only place they can actually run, so gate them here.
+          # `cargo test --package tests` loop below, and build.yml skips
+          # the ones that need a live binder device + service manager
+          # (handle 0; the list is `scripts/ci_rsbinder_lib_tests.sh`) —
+          # e.g. the P1/P2/P3 slow-path concurrency / same-thread
+          # re-entrant obituary deadlock guards (PR #118, `481b8c9`). This
+          # binder-enabled job is the only place they can actually run, so
+          # gate them here, with `parcel_alloc`'s `#[ignore]`d handle case.
           # rsb_hub is already up (handle 0); test_service is up so the
           # cache has real entries to resurrect.
           #
@@ -158,7 +159,8 @@ jobs:
           # test stays reliably non-vacuous (no sibling keeps the handle-0
           # Weak upgradeable). If this step flakes, the bug is a missing
           # `#[serial(binder)]`, not a reason to re-add `--test-threads=1`.
-          RUST_BACKTRACE=1 cargo test --package rsbinder || {
+          { RUST_BACKTRACE=1 cargo test --package rsbinder &&
+            RUST_BACKTRACE=1 cargo test --package rsbinder --test parcel_alloc -- --ignored; } || {
             echo "::error::rsbinder unit tests failed — capturing dmesg"
             sudo dmesg | tail -200
             cat rsb_hub.log
@@ -404,12 +406,50 @@ jobs:
           RUST_BACKTRACE=1 cargo test --package tests -- --ignored --exact \
             test_client::test_dump_fast_fails_on_dead_proxy_closes_fd
 
+      - name: Restart test_service for test_weak_upgrade_after_sole_strong_drop_is_dead_then_reresolve_works
+        run: |
+          [ -f test_service.pid ] && sudo kill "$(cat test_service.pid)" 2>/dev/null || true
+          sleep 1
+          RUST_LOG=info nohup target/debug/test_service > test_service.log 2>&1 &
+          echo $! > test_service.pid
+          bash scripts/ci_wait_test_service_ready.sh test_service.log test_service.pid
+
+      - name: Run test_weak_upgrade_after_sole_strong_drop_is_dead_then_reresolve_works (sole holder)
+        run: |
+          # Not destructive, but it must be the only strong holder of the
+          # test_service handle: it drops its `Strong` and requires the
+          # kernel strong count to reach 0, which any concurrent test's
+          # `Strong` would prevent. So it runs alone, like the steps above.
+          RUST_BACKTRACE=1 cargo test --package tests -- --ignored --exact \
+            test_client::test_weak_upgrade_after_sole_strong_drop_is_dead_then_reresolve_works
+
       - name: Stop background services
         if: always()
         run: |
           [ -f test_service.pid ] && sudo kill "$(cat test_service.pid)" 2>/dev/null || true
           [ -f rsb_hub.pid ] && sudo kill "$(cat rsb_hub.pid)" 2>/dev/null || true
           sleep 1
+
+      - name: Run the kernel acceptance scripts (tests/scripts/run_*_ac.sh, run_d8b_register.sh)
+        # Each starts its own rsb_hub and refuses to while another runs, so
+        # they follow the step above. The binaries they drive are from the
+        # workspace build at the top of this job.
+        run: |
+          rc=0
+          for s in tests/scripts/run_*_ac.sh example-hello/cpp/run_d8b_register.sh; do
+            echo "=== $s"
+            bash "$s" || { echo "::error::$s failed"; rc=1; }
+          done
+          exit $rc
+
+      - name: Run the vsock loopback tests (#[ignore]'d)
+        run: |
+          if ! sudo modprobe vsock_loopback 2>/dev/null || [ ! -e /dev/vsock ]; then
+            echo "::warning::vsock_loopback is unavailable on this runner kernel; rpc_vsock not run"
+            exit 0
+          fi
+          cargo test -p rsbinder --features rpc-vsock --test rpc_vsock -- --ignored
+          cargo test -p rsbinder --features rpc-tls,rpc-vsock --test rpc_tls -- --ignored --exact vsock_tls_loopback_e2e
 
       - name: Check kernel log for binder errors (issue #97 regression gate)
         # `always()` so that a failure inside the test loop does not skip

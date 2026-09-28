@@ -7,30 +7,29 @@ project-specific conventions are worth knowing up front.
 
 ## Build & test
 
-The workspace builds with `cargo build`. The hermetic test suites need
-no special environment:
+The workspace builds with `cargo build`. Before opening a PR, run the
+local gate; it runs what CI runs and what CI cannot:
 
 ```
-cargo test -p rsbinder --features rpc --lib rpc::
-cargo test -p rsbinder --features rpc --test rpc_server --test rpc_e2e --test rpc_fd
-cargo test -p rsbinder --features rpc-tls --test rpc_tls
-cargo test -p rsbinder --features rpc,android_16 --test rpc_accessor
-cargo test -p rsbinder --features rpc-experimental-multiconn --test rpc_server
-cargo test -p rsbinder-tools --bin rsb_device
+scripts/local_gate.sh                 # all three tiers
+scripts/local_gate.sh hermetic        # one tier
+scripts/local_gate.sh stage3 --only fmq_interop,stream_interop
 ```
 
-The full kernel-binder integration suite is Linux-only and needs a
-running `rsb_hub` + `test_service`:
+| Tier | Runs | Needs |
+| --- | --- | --- |
+| `hermetic` | every step of `.github/workflows/build.yml`: fmt, clippy, rustdoc, MSRV, all hermetic test targets, big-endian (s390x), public API goldens, Android builds | nothing beyond Rust; `cross` + docker, the pinned nightly + `cargo-public-api`, `cargo-semver-checks`, `cargo-ndk` enable their steps |
+| `kernel` | the Linux job of `integration-test.yml` (unit tests with a live binder, the `tests` suite sync/async, the `#[ignore]`d kernel tests one by one), `tests/scripts/run_*_ac.sh`, `run_d8b_register.sh`, vsock loopback, the libfmq host peer | a writable `/dev/binderfs/binder` (`sudo target/debug/rsb_device binder`), no `rsb_hub` already running; `vsock_loopback` and the AOSP checkout enable their steps |
+| `stage3` | the interop scripts (`example-hello/cpp/run_*.sh`, `run_stream_ac.sh --adb`) against the real servicemanager, libbinder and libfmq | one booted rootable device or emulator (`-s SERIAL` otherwise), `cargo-ndk`, `ANDROID_NDK_HOME`, the AOSP checkout at `$AOSP` for the libfmq/libbinder header builds |
 
-```
-cargo build --bin rsb_hub --bin test_service
-RUST_LOG=warn nohup ./target/debug/rsb_hub > /tmp/rsb_hub.log 2>&1 & disown
-sleep 2
-RUST_LOG=warn nohup ./target/debug/test_service > /tmp/test_service.log 2>&1 & disown
-sleep 2
-cargo test -p tests
-cargo test -p tests test_death_recipient -- --ignored
-```
+Whatever a tier cannot run on the machine is listed as `SKIP` with what
+it needs; the exit status is non-zero when a step fails, and each step's
+output is under `target/local-gate/<timestamp>/`. `stage3` runs only when
+the diff against `--base` (default `origin/master`) touches a crate a
+device run exercises; `--stage3-all` forces it. Each script is selected by
+the device's SDK level, so an Android 16 emulator runs the most of them;
+`run_a15_qpr_stage3.sh`, `run_phasec_vintf.sh` and
+`run_rt_inherit_interop.sh` are run by hand (see their headers).
 
 Android cross-compile via [`cargo-ndk`](https://github.com/bbqsrc/cargo-ndk):
 
@@ -45,11 +44,8 @@ Linux/Android-only.
 
 ## Pull request checklist
 
-- `cargo fmt --all`
-- `cargo clippy --all-targets --all-features -- -D warnings`
-- `cargo doc --workspace --all-features --no-deps` — 0 warnings
-- Run the test matrix relevant to your change (full hermetic + kernel-
-  binder e2e for anything touching `rsbinder::*` or `rpc::`)
+- `scripts/local_gate.sh` passes: at least `hermetic`, plus `kernel` for
+  anything touching `rsbinder::*` or `rpc::`
 - `cargo-semver-checks` runs automatically on PRs against `rsbinder`
   and `rsbinder-aidl` — intentional API breaks need acknowledgment in
   the PR description
