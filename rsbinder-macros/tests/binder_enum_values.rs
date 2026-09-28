@@ -16,8 +16,7 @@ pub enum Mode {
     Safe = 1,
 }
 
-/// A derived enum is closed: a value no variant declares is rejected rather
-/// than carried along, which is the one place it parts company with `.aidl`.
+/// A derived enum is closed, unlike `.aidl`'s: an undeclared value is rejected.
 #[test]
 fn rejects_an_undeclared_value() {
     assert_eq!(Mode::try_from_binder_value(0), Ok(Mode::Fast));
@@ -37,10 +36,7 @@ pub enum Wide {
     Negative = -5,
 }
 
-/// The wire value is the one the declaration shows. Re-emitting the
-/// discriminant expression instead would type it on its own, where an integer
-/// literal falls back to `i32`: `1 << 31` would go out as `-2147483648`, and
-/// `1 << 40` would not even compile.
+/// Re-emitted as `i32`, `1 << 31` would go out negative and `1 << 40` would not compile.
 #[test]
 fn a_wide_repr_keeps_the_declared_value() {
     for (declared, value) in [
@@ -54,8 +50,7 @@ fn a_wide_repr_keeps_the_declared_value() {
     assert_eq!(Wide::try_from_binder_value(1 << 40), Ok(Wide::Bit40));
 }
 
-/// A binder enum asks nothing of the user's type beyond its `repr`: the codec
-/// matches on the variant rather than casting through a shared reference.
+/// Not `Copy`: the codec matches on the variant rather than casting through `&self`.
 #[derive(BinderEnum, Clone, PartialEq, Eq, Debug)]
 #[repr(i8)]
 pub enum NotCopy {
@@ -66,4 +61,29 @@ pub enum NotCopy {
 fn does_not_require_copy_at_runtime() {
     assert_eq!(NotCopy::One.binder_value(), 1);
     assert_eq!(NotCopy::try_from_binder_value(1), Ok(NotCopy::One));
+}
+
+/// Items named like the prelude's; the derive output must not resolve to them.
+#[allow(dead_code)]
+mod shadowed {
+    pub struct Option;
+    pub struct Vec;
+    pub struct Ok;
+    pub struct Err;
+
+    #[derive(rsbinder::BinderEnum, PartialEq, Eq, Debug)]
+    #[repr(i32)]
+    pub enum Level {
+        Low = 0,
+    }
+}
+
+#[test]
+fn a_module_shadowing_the_prelude_still_derives() {
+    use shadowed::Level;
+    assert_eq!(Level::try_from_binder_value(0), Ok(Level::Low));
+    assert_eq!(
+        Level::try_from_binder_value(9),
+        Err(rsbinder::StatusCode::BadValue)
+    );
 }

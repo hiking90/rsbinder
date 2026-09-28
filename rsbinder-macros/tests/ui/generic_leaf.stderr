@@ -1,0 +1,23 @@
+error: `.aidl` renders this as `Option<Vec<Option<Pair<Cfg>>>>` here, and a call site written against one does not take the other; use `Option<Vec<Option<Pair<Cfg>>>>`
+  --> tests/ui/generic_leaf.rs:13:43
+   |
+13 |     fn f(&self) -> rsbinder::BinderResult<Option<Vec<Pair<Cfg>>>>;
+   |                                           ^^^^^^^^^^^^^^^^^^^^^^
+
+error: `.aidl` renders this as `Option<&[Option<Pair<Cfg>>]>` here, and a call site written against one does not take the other; use `Option<&[Option<Pair<Cfg>>]>`
+  --> tests/ui/generic_leaf.rs:18:20
+   |
+18 |     fn f(&self, v: Option<&[Pair<Cfg>]>) -> rsbinder::BinderResult<()>;
+   |                    ^^^^^^^^^^^^^^^^^^^^
+
+error: `.aidl` renders this as `&Pair<Cfg>` here, and a call site written against one does not take the other; use `&Pair<Cfg>`
+  --> tests/ui/generic_leaf.rs:23:20
+   |
+23 |     fn f(&self, p: Pair<Cfg>) -> rsbinder::BinderResult<()>;
+   |                    ^^^^^^^^^
+
+error: `.aidl` renders this as `Option<[Option<Pair<Cfg>>; 3]>` here, and a call site written against one does not take the other; use `Option<[Option<Pair<Cfg>>; 3]>`
+  --> tests/ui/generic_leaf.rs:28:12
+   |
+28 |     pub p: Option<[Pair<Cfg>; 3]>,
+   |            ^^^^^^^^^^^^^^^^^^^^^^

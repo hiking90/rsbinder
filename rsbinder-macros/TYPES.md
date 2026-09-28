@@ -1,6 +1,6 @@
 # What `.aidl` renders
 
-Every spelling the AIDL compiler produces, by type and by position. A trait written with these is a trait an `.aidl` port reproduces exactly; anything else the macro refuses, naming the cell you wanted.
+The spelling the AIDL compiler produces for each kind of type, by position. One scalar stands for its kind: `long`, `float`, `double` and `char` follow the `int` rows as `i64`, `f32`, `f64` and `u16`. `List<T>` and generic parcelables are not listed. A trait written with these is a trait an `.aidl` port reproduces exactly; any other spelling of these types the macro refuses, naming the cell you wanted — except between the `Cfg` and `Mode` rows, which are both a bare name to the macro, and a field's `Option<Box<Cfg>>`, which `.aidl` writes for a `@nullable` parcelable field that closes a reference cycle.
 
 `—` marks a combination AIDL itself rejects.
 

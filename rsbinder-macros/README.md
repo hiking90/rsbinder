@@ -30,7 +30,12 @@ templates, so a trait here and the equivalent `.aidl` produce **identical**
 generated code — moving from one to the other never touches a call site. That
 equality is enforced by golden tests in this crate. For the same reason a
 signature `.aidl` cannot express, or spells differently, is a compile error
-naming the `.aidl` form; the crate docs carry the full type table. Two
+naming the `.aidl` form — except where only the element's kind decides the
+spelling (an enum and a parcelable are both a bare name to the macro), where
+it depends on a reference cycle the macro cannot see (a parcelable field's
+`Option<Box<T>>`), or the type is reached through an alias or a rename, which
+the macro cannot see through; the crate docs list all three and carry the full
+type table. Two
 attributes fill the gaps a Rust signature leaves: `#[nonnull]` marks an `out`
 binder or fd that is not `@nullable`, and `#[deprecated]` renders AIDL's
 `@deprecated`.

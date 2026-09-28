@@ -8,13 +8,10 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{Data, DeriveInput, Fields, Ident};
 
-/// Reprs whose whole range fits the `i32` a `Status` carries. `i64` is
-/// absent on purpose: a code that does not fit would go on the wire
-/// truncated.
+/// Signed reprs whose whole range fits the `i32` a `Status` carries; `i64` would truncate.
 const REPRS: [&str; 3] = ["i8", "i16", "i32"];
 
-/// Int reprs a user plausibly writes and this derive refuses, echoed in
-/// the diagnostic.
+/// Int reprs a user plausibly writes and this derive refuses, echoed in the diagnostic.
 const REJECTED_REPRS: [&str; 9] = [
     "u8", "u16", "u32", "u64", "u128", "usize", "i64", "i128", "isize",
 ];
@@ -33,9 +30,7 @@ pub fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
              fixed set of values",
         ));
     };
-    // Checked but not otherwise used: the cast below is `as i32`, so a
-    // repr that does not fit i32 is the one thing that could silently
-    // change a code between the declaration and the wire.
+    // Only checked: the cast below is `as i32`, which a wider repr would silently truncate.
     require_repr(input)?;
 
     let name = &input.ident;
@@ -64,9 +59,7 @@ pub fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
         ));
     }
 
-    // Cast the variant rather than re-emitting its discriminant
-    // expression: re-emitted, `1 << 8` on a `#[repr(i8)]` enum would be
-    // typed on its own and disagree with what the variant actually is.
+    // Cast the variant: a re-emitted discriminant (`1 << 8`) is typed apart from the repr.
     let code_arms = variants
         .iter()
         .map(|ident| quote! { #name::#ident => #name::#ident as i32, });
@@ -90,20 +83,16 @@ pub fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
     })
 }
 
-/// The `#[repr(..)]`, which decides whether a declared code can reach the
-/// wire unchanged.
+/// The `#[repr(..)]`, which decides whether a declared code can reach the wire unchanged.
 fn require_repr(input: &DeriveInput) -> syn::Result<Ident> {
     let mut found = None;
-    // Kept apart from the unknown so the refusal can say which of the two
-    // reasons applies: unsigned, or wider than the i32 the wire carries.
+    // Kept apart from "none" so the refusal can name its reason: unsigned, wider, or `isize`.
     let mut rejected: Option<Ident> = None;
     for attr in &input.attrs {
         if !attr.path().is_ident("repr") {
             continue;
         }
-        // Token scan, not `parse_nested_meta`, for the same reason as
-        // `binder_enum`: the callback would have to consume `align(8)`'s
-        // argument list, and failing to leaves syn reporting `expected ,`.
+        // Token scan: see `binder_enum::backing_type`.
         let Ok(list) = attr.meta.require_list() else {
             continue;
         };
@@ -124,8 +113,18 @@ fn require_repr(input: &DeriveInput) -> syn::Result<Ident> {
     let needs = "a service-specific error enum needs `#[repr(i8)]`, `#[repr(i16)]` or \
                  `#[repr(i32)]`";
     let msg = match &rejected {
-        Some(repr) => format!("{needs}, found `#[repr({repr})]`"),
-        None => format!("{needs}, found none"),
+        Some(repr) if repr.to_string().starts_with('u') => {
+            format!("{needs}, found `#[repr({repr})]`, which is unsigned")
+        }
+        Some(repr) if *repr == "isize" => format!(
+            "{needs}, found `#[repr(isize)]`, whose width depends on the target, so it is not \
+             guaranteed to fit the `i32` a binder status carries"
+        ),
+        Some(repr) => format!(
+            "{needs}, found `#[repr({repr})]`, which is wider than the `i32` a binder status \
+             carries"
+        ),
+        None => format!("{needs}, found no integer repr"),
     };
     Err(syn::Error::new_spanned(&input.ident, msg))
 }

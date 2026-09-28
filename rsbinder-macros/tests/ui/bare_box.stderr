@@ -1,0 +1,29 @@
+error: `.aidl` never renders this `Box` — it boxes only a `@nullable` parcelable field that closes a reference cycle, as `Option<Box<T>>`, never an argument or a return, and a call site written against one does not take the other; use `T` (a parcelable of your own named `Box` needs a qualified path, such as `crate::…::Box<T>`)
+  --> tests/ui/bare_box.rs:10:43
+   |
+10 |     fn f(&self) -> rsbinder::BinderResult<Box<Cfg>>;
+   |                                           ^^^^^^^^
+
+error: `.aidl` never renders this `Box` — it boxes only a `@nullable` parcelable field that closes a reference cycle, as `Option<Box<T>>`, never an argument or a return, and a call site written against one does not take the other; use `T` (a parcelable of your own named `Box` needs a qualified path, such as `crate::…::Box<T>`)
+  --> tests/ui/bare_box.rs:15:21
+   |
+15 |     fn f(&self, c: &Box<Cfg>) -> rsbinder::BinderResult<()>;
+   |                     ^^^^^^^^
+
+error: `.aidl` never renders this `Box` — it boxes only a `@nullable` parcelable field that closes a reference cycle, as `Option<Box<T>>`, never an argument or a return, and a call site written against one does not take the other; use `T` (a parcelable of your own named `Box` needs a qualified path, such as `crate::…::Box<T>`)
+  --> tests/ui/bare_box.rs:20:50
+   |
+20 |     fn f(&self) -> rsbinder::BinderResult<Option<Box<Cfg>>>;
+   |                                                  ^^^^^^^^
+
+error: `.aidl` never renders this `Box` — it boxes only a `@nullable` parcelable field that closes a reference cycle, as `Option<Box<T>>`, never an argument or a return, and a call site written against one does not take the other; use `T` (a parcelable of your own named `Box` needs a qualified path, such as `crate::…::Box<T>`)
+  --> tests/ui/bare_box.rs:25:28
+   |
+25 |     fn f(&self, c: Option<&Box<Cfg>>) -> rsbinder::BinderResult<()>;
+   |                            ^^^^^^^^
+
+error: `.aidl` never renders this `Box` — it boxes only a `@nullable` parcelable field that closes a reference cycle, as `Option<Box<T>>`, never an argument or a return, and a call site written against one does not take the other; use `T` (a parcelable of your own named `Box` needs a qualified path, such as `crate::…::Box<T>`)
+  --> tests/ui/bare_box.rs:30:12
+   |
+30 |     pub c: Box<Cfg>,
+   |            ^^^^^^^^
