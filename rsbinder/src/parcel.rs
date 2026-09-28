@@ -83,7 +83,8 @@
 //!   fd-table index, each taken at most once.
 //! - `leaving_addrs` records the session addresses of local binders whose
 //!   `timesSent` was bumped (`RpcState::on_binder_leaving`) while flattened
-//!   into this outgoing parcel. The parcel owns those bumps while it is
+//!   into this outgoing parcel, and at wire v2 of the peer's addresses whose
+//!   proxy send was counted (`RpcState::on_proxy_leaving`). The parcel owns those bumps while it is
 //!   `NotSent`: its `Drop` (and `set_for_rpc(false)`) hands them back through
 //!   `RpcParcelOps::cancel_leaving`, so a parcel written and never sent, or
 //!   refused before the send (`WouldBlock`, `DeadObject`, an encode failure),
@@ -103,9 +104,11 @@
 //!   positions only there); rsbinder records `leaving_addrs` on every profile
 //!   and settles on all of them.
 //! - `pinned` holds the remote proxies flattened into this outgoing parcel
-//!   until it drops, so their `DEC_STRONG` cannot overtake the send that names
-//!   them (AOSP keeps argument refs until the reply is out). A binder, proxy or
-//!   local, is written only into a `NotSent` parcel.
+//!   until it drops (AOSP keeps argument refs until the reply is out). Below
+//!   wire v2 that is what orders a proxy's `DEC_STRONG` after the send naming
+//!   it; at v2 the counted send holds the release until the peer pays it back
+//!   (`rpc::state` "Ref-count model"). A binder, proxy or local, is written
+//!   only into a `NotSent` parcel.
 //! - `entered` is AOSP `RpcFields::mAcquiredEnteringBinders` (android-16.0.0_r4):
 //!   for a `Received` parcel, the address and binder each object position
 //!   entered, sorted by position and found by binary search. The first read of
@@ -610,7 +613,7 @@ pub(crate) trait RpcParcelOps: Send + Sync {
 #[cfg(feature = "rpc")]
 #[derive(Default)]
 pub(crate) struct CopiedBinders {
-    /// Local nodes bumped once each, recorded in the destination's `leaving_addrs`.
+    /// Counted sends (local nodes; proxies at v2), recorded in the destination's `leaving_addrs`.
     pub(crate) leaving: Vec<crate::rpc::RpcAddress>,
     /// Live proxies of the peer's addresses, held like `write_binder`'s pin.
     pub(crate) pinned: Vec<crate::binder::SIBinder>,
@@ -688,7 +691,7 @@ struct RpcFields {
     /// AOSP `mSendState`; `NotSent` owns `leaving_addrs`, `Sent` handed them to the peer.
     #[cfg(feature = "rpc")]
     send_state: std::sync::atomic::AtomicU8,
-    /// Remote proxies held until drop, so their `DEC_STRONG` cannot overtake this send.
+    /// Remote proxies held until drop; below v2 this orders their `DEC_STRONG` after this send.
     #[cfg(feature = "rpc")]
     pinned: Vec<crate::binder::SIBinder>,
     /// AOSP `mAcquiredEnteringBinders`: what each object position entered, sorted by position.

@@ -34,6 +34,16 @@
 //!   callback connection, finish in bounded time; the owed `DEC_STRONG`s arrive in one
 //!   command per address before the next reply. With a callback connection they arrive on
 //!   it, without a twoway.
+//! - `t9_a_proxy_release_waits_for_the_owners_receipt`: against a raw android-13+ owner, a
+//!   proxy dropped right after a oneway on it sends nothing until the owner pays the
+//!   oneway's target back, then its `DEC_STRONG` 1. Sent at once, it could be read before the
+//!   oneway on another connection, which libbinder aborts on.
+//! - `t10_a_proxy_argument_counts_at_v2`: the proxy also sent as that oneway's argument
+//!   needs both receipts at v2 and only the target's at v1.
+//! - `t11_the_release_waits_on_the_wires_that_count_targets`: rsbinder on both ends; on r34
+//!   the release goes at once, on android-13+ with the server's receipt before its next reply.
+//! - `t12_a_proxy_in_a_v2_reply_waits_for_its_receipt`: a server's proxy returned in a v2
+//!   reply is released only after the raw caller pays that receipt.
 //!
 //! # Mutation gates
 //!
@@ -53,6 +63,10 @@
 //! - T7: stop `enter_every_binder` at the first failure.
 //! - T8: let `dec_route` take an `Incoming` pin whatever its `allow_nested`; both halves time
 //!   out (with a callback connection the pin still comes first).
+//! - T9, T11: drop the target count in `client_transact` (`counts_target`).
+//! - T10, T12: drop the proxy count in `write_binder` (fails at v2).
+//! - `state::tests::a_held_release_keeps_the_send_counter_for_a_successor`: close the
+//!   `async_number` book in `RpcState::release_proxy`'s held arm.
 //!
 //! Outside this file, `strong_session_tests::argument_proxy_dec_strong_follows_the_reply_on_the_serving_connection`
 //! fails when `execute_dispatched` arms `AllowNestedGuard` after building `reply` (its proxies
@@ -677,4 +691,232 @@ fn t8_with_a_callback_connection_the_decs_go_there() {
 
     drop(p);
     let _ = callback_serve.join();
+}
+
+impl RawClient {
+    /// The next message, or `None` when nothing arrives within `wait`.
+    fn recv_within(&mut self, wait: Duration) -> Option<WireMessage> {
+        self.stream.set_read_timeout(Some(wait)).unwrap();
+        let frame = read_aosp_message(&mut self.stream).ok();
+        self.stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        frame.map(|f| self.codec.decode_message(&f).expect("decode"))
+    }
+
+    fn reply(&mut self, reply: WireReply) {
+        let frame = self.codec.encode_reply(&reply).expect("encode");
+        write_aosp_message(&mut self.stream, &frame).expect("write");
+    }
+
+    fn dec_strong(&mut self, addr: &RpcAddress, amount: u32) {
+        for frame in self.codec.encode_dec_strong(addr, amount) {
+            write_aosp_message(&mut self.stream, &frame).expect("write");
+        }
+    }
+}
+
+/// A raw android-13+ owner of `target`, and an rsbinder client holding a proxy of it.
+fn raw_owner(version: u32) -> (RpcSession, RawClient, RpcAddress, SIBinder) {
+    let (a, b) = UnixStream::pair().expect("socketpair");
+    let client = session(a, AddressSpace::Initiator, Wire::V(version));
+    b.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut raw = RawClient {
+        stream: b,
+        codec: Android13PlusCodec::with_version(version).unwrap(),
+    };
+    let mut ctr = 0u64;
+    let target = RpcAddress::unique(&mut ctr, AddressSpace::Acceptor);
+    let c = client.clone();
+    let root = std::thread::spawn(move || c.get_root());
+    assert!(matches!(raw.recv(), WireMessage::Transact(_)));
+    let mut data = 1i32.to_le_bytes().to_vec();
+    data.extend_from_slice(&Android13PlusCodec::encode_addr(&target));
+    data.extend_from_slice(&0i32.to_le_bytes());
+    let object_positions = if version >= PROTOCOL_V2 {
+        vec![0]
+    } else {
+        vec![]
+    };
+    raw.reply(WireReply {
+        status: 0,
+        data,
+        object_positions,
+    });
+    let root = root.join().expect("get_root").expect("root");
+    (client, raw, target, root)
+}
+
+/// A `GET_MAX_THREADS` the raw owner answers with `acks` receipts of `target` paid first.
+fn pay_before_a_reply(client: &RpcSession, raw: &mut RawClient, target: &RpcAddress, acks: u32) {
+    let c = client.clone();
+    let call = std::thread::spawn(move || {
+        c.inner
+            .client_transact(RpcAddress::zero(), 1, &Parcel::new(), 0)
+            .map(drop)
+    });
+    assert!(matches!(raw.recv(), WireMessage::Transact(_)));
+    if acks > 0 {
+        raw.dec_strong(target, acks);
+    }
+    raw.reply(WireReply {
+        status: 0,
+        data: 0i32.to_le_bytes().to_vec(),
+        object_positions: vec![],
+    });
+    call.join().expect("caller").expect("GET_MAX_THREADS");
+}
+
+/// T9: a dropped proxy's `DEC_STRONG` waits until the owner paid the oneway sent on it.
+#[test]
+fn t9_a_proxy_release_waits_for_the_owners_receipt() {
+    for version in [1, PROTOCOL_V2] {
+        let (client, mut raw, target, root) = raw_owner(version);
+        let d = rpc_of(&root).build_request(DESC).expect("request");
+        rpc_of(&root)
+            .transact(FIRST_CALL_TRANSACTION, &d, FLAG_ONEWAY)
+            .expect("oneway");
+        drop(d);
+        assert!(matches!(raw.recv(), WireMessage::Transact(t) if t.address == target));
+        drop(root);
+        // Sent now, it could be read before the oneway on another connection.
+        assert!(
+            raw.recv_within(Duration::from_millis(300)).is_none(),
+            "v{version}: the proxy was released before the owner paid the oneway"
+        );
+        pay_before_a_reply(&client, &mut raw, &target, 1);
+        match raw.recv() {
+            WireMessage::DecStrong(a, 1) if a == target => {}
+            other => panic!("v{version}: expected the release after the receipt, got {other:?}"),
+        }
+        client.close_session();
+    }
+}
+
+/// T10: at v2 a proxy sent as an argument is a send too, and the release waits for both
+/// receipts. Below v2 the owner pays an argument only if it reads it, so it is not counted.
+#[test]
+fn t10_a_proxy_argument_counts_at_v2() {
+    for (version, sends) in [(1, 1), (PROTOCOL_V2, 2)] {
+        let (client, mut raw, target, root) = raw_owner(version);
+        let mut d = rpc_of(&root).build_request(DESC).expect("request");
+        d.write(&Some(root.clone())).expect("argument");
+        rpc_of(&root)
+            .transact(FIRST_CALL_TRANSACTION, &d, FLAG_ONEWAY)
+            .expect("oneway");
+        assert!(matches!(raw.recv(), WireMessage::Transact(t) if t.address == target));
+        drop(d);
+        drop(root);
+        for paid in 0..sends {
+            assert!(
+                raw.recv_within(Duration::from_millis(300)).is_none(),
+                "v{version}: released after {paid} of {sends} receipts"
+            );
+            pay_before_a_reply(&client, &mut raw, &target, 1);
+        }
+        match raw.recv() {
+            WireMessage::DecStrong(a, 1) if a == target => {}
+            other => panic!("v{version}: expected the release after {sends}, got {other:?}"),
+        }
+        client.close_session();
+    }
+}
+
+/// T12: at v2 a proxy a handler returns in its reply is a send; the proxy's release waits for
+/// the caller to pay it back, however the reply and the release are routed.
+#[test]
+fn t12_a_proxy_in_a_v2_reply_waits_for_its_receipt() {
+    let (a, b) = UnixStream::pair().expect("socketpair");
+    let server = session(a, AddressSpace::Acceptor, Wire::V(2));
+    server.set_root(local()).expect("set_root");
+    let s = server.clone();
+    let serve = std::thread::spawn(move || s.serve_blocking());
+    b.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut raw = RawClient {
+        stream: b,
+        codec: Android13PlusCodec::with_version(PROTOCOL_V2).unwrap(),
+    };
+    let (root_reply, _) = raw.call(WireTransaction {
+        code: SpecialTransaction::GetRoot.code(),
+        ..Default::default()
+    });
+    let root = Android13PlusCodec::decode_addr(&root_reply.data, 4).expect("root address");
+    let mut ctr = 0u64;
+    let mine = RpcAddress::unique(&mut ctr, AddressSpace::Initiator);
+
+    let mut token = Parcel::new();
+    write_rpc_interface_token(&mut token, DESC).unwrap();
+    let mut data = token.rpc_data_bytes().to_vec();
+    let at = data.len() as u32;
+    data.extend_from_slice(&1i32.to_le_bytes());
+    data.extend_from_slice(&Android13PlusCodec::encode_addr(&mine));
+    data.extend_from_slice(&0i32.to_le_bytes());
+    let (reply, _) = raw.call(WireTransaction {
+        address: root,
+        code: TX_ECHO,
+        data,
+        object_positions: vec![at],
+        ..Default::default()
+    });
+    assert_eq!(reply.status, 0);
+    let ping = WireTransaction {
+        address: root,
+        code: PING_TRANSACTION,
+        ..Default::default()
+    };
+    let (_, decs) = raw.call(ping.clone());
+    assert!(
+        decs.iter().all(|(a, _)| *a != mine),
+        "released before the reply's send was paid back: {decs:?}"
+    );
+    // The receipt of our own binder in the reply, as an owner pays it.
+    raw.dec_strong(&mine, 1);
+    let (_, decs) = raw.call(ping);
+    assert!(
+        decs.contains(&(mine, 1)),
+        "the release follows the payment: {decs:?}"
+    );
+
+    drop(raw);
+    let _ = serve.join();
+}
+
+/// T11: rsbinder on both ends. The r34 wire does not count targets, so the release goes at
+/// once; on android-13+ it waits for the server's receipt, which the server holds for its
+/// next `REPLY`.
+#[test]
+fn t11_the_release_waits_on_the_wires_that_count_targets() {
+    for (wire, counts_targets) in [(Wire::R34, false), (Wire::V(1), true)] {
+        let mut p = Pair::new(wire);
+        let addr = p.root_addr();
+        let root = p.root.take().expect("root");
+        let d = rpc_of(&root).build_request(DESC).expect("request");
+        rpc_of(&root)
+            .transact(TX_TAKE, &d, FLAG_ONEWAY)
+            .expect("oneway");
+        drop(d);
+        drop(root);
+        let released = |within: Duration| {
+            let deadline = Instant::now() + within;
+            while dec_received(&p.server, &addr).0 == 0 {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            true
+        };
+        if counts_targets {
+            assert!(
+                !released(Duration::from_millis(300)),
+                "{wire:?}: released early"
+            );
+            p.client
+                .inner
+                .client_transact(RpcAddress::zero(), 1, &Parcel::new(), 0)
+                .expect("GET_MAX_THREADS");
+        }
+        assert!(released(Duration::from_secs(5)), "{wire:?}: never released");
+        assert_eq!(dec_received(&p.server, &addr), (1, 1), "{wire:?}");
+    }
 }

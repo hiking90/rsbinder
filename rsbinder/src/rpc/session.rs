@@ -201,8 +201,10 @@
 //! # Deferred `DEC_STRONG`
 //!
 //! Every `DEC_STRONG` this end owes goes through `send_dec_strong`: a proxy's drop, an excess
-//! receipt, one of our own binders coming home, and on the android-13+ wire the target of each
-//! inbound transaction (`super::state` module doc "Ref-count model"). It never waits for a
+//! receipt, one of our own binders coming home, on the android-13+ wire the target of each
+//! inbound transaction, and a proxy's release held until the peer paid back the sends of its
+//! address (`super::state` module doc "Ref-count model"). The route below never orders a
+//! release after a send on another connection; the hold does. It never waits for a
 //! slot, because `RpcProxy::drop` runs on arbitrary user threads and a slot wait there would let
 //! a hung peer block the user's `Drop`. It writes only where the peer is reading: rsbinder reads
 //! a connection no serve loop drives only inside its own reply wait (it has no counterpart of
@@ -2118,12 +2120,11 @@ impl RpcSessionInner {
         self.send_session_obituaries();
         self.shared.lifecycle.mark_dead();
         let root = self.shared.root.lock().expect("root poisoned").take();
-        let locals = self
-            .shared
-            .state
-            .lock()
-            .expect("rpc state poisoned")
-            .clear_local();
+        let locals = {
+            let mut st = self.shared.state.lock().expect("rpc state poisoned");
+            st.clear_remote_sends();
+            st.clear_local()
+        };
         drop(locals);
         drop(root);
     }
@@ -2361,9 +2362,20 @@ impl RpcSessionInner {
                         log::error!("RPC: cannot write a binder into a sent or received parcel");
                         return Err(StatusCode::InvalidOperation);
                     }
-                    // Pinned past the send, so its DEC_STRONG cannot precede the reply naming it.
+                    let addr = rp.address();
+                    // At v2 the peer pays it back read or not, so the release waits for that.
+                    if self.profile.records_binder_positions() {
+                        self.shared
+                            .state
+                            .lock()
+                            .expect("rpc state poisoned")
+                            .on_proxy_leaving(addr);
+                        // Recorded so an unsent parcel gives it back on drop (`cancel_leaving`).
+                        parcel.rpc_record_leaving_addr(addr);
+                    }
+                    // Pinned past the send, so below v2 its DEC_STRONG follows the reply naming it.
                     parcel.rpc_pin_binder(b.clone());
-                    rp.address()
+                    addr
                 } else if (**b).is_remote() {
                     // Kernel proxy: AOSP `onBinderLeaving` "Cannot send binder proxy over sockets".
                     log::error!("RPC: cannot send a kernel binder proxy over sockets");
@@ -2542,17 +2554,21 @@ impl RpcSessionInner {
         let mut took = CopiedBinders::default();
         // Clones and released nodes drop after the guard: a user `Drop` may re-enter the session.
         let mut release: Vec<SIBinder> = Vec::new();
+        let mut releases: Vec<(RpcAddress, u32)> = Vec::new();
         let result = {
             let mut st = self.shared.state.lock().expect("rpc state poisoned");
             let result = self.acquire_copied_locked(&mut st, &addrs, &mut took, &mut release);
             if result.is_err() {
                 for addr in took.leaving.drain(..) {
-                    release.extend(st.cancel_binder_leaving(&addr));
+                    let (node, held) = st.cancel_leaving(&addr);
+                    release.extend(node);
+                    releases.push((addr, held));
                 }
             }
             result
         };
         drop(release);
+        self.send_held_releases(releases);
         result.map(|()| took)
     }
 
@@ -2584,6 +2600,11 @@ impl RpcSessionInner {
                 log::error!("RPC: a copied binder names no node of this session: {addr:?}");
                 return Err(StatusCode::BadValue);
             } else if let Some(proxy) = st.lookup_remote(addr) {
+                // AOSP `appendFrom` calls `onBinderLeaving` on a proxy too; counted as in `write_binder`.
+                if self.profile.records_binder_positions() {
+                    st.on_proxy_leaving(*addr);
+                    took.leaving.push(*addr);
+                }
                 took.pinned.push(proxy);
             }
             // No live proxy: a source that neither received nor wrote it (parcel.rs "append_from").
@@ -2613,19 +2634,57 @@ impl RpcSessionInner {
             return;
         }
         // Released nodes drop after the guard: a user `Drop` may re-enter this session.
-        let released: Vec<SIBinder> = {
+        let (released, releases): (Vec<SIBinder>, Vec<(RpcAddress, u32)>) = {
             // Reached from a `Drop`, maybe while unwinding: a poisoned table is still consistent.
             let mut st = self
                 .shared
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            addrs
-                .iter()
-                .filter_map(|a| st.cancel_binder_leaving(a))
-                .collect()
+            let mut released = Vec::new();
+            let mut releases = Vec::new();
+            for a in addrs {
+                let (node, held) = st.cancel_leaving(a);
+                released.extend(node);
+                releases.push((*a, held));
+            }
+            (released, releases)
         };
         drop(released);
+        self.send_held_releases(releases);
+    }
+
+    /// Send the proxy releases a rollback or a payment let go; the lock is already dropped.
+    fn send_held_releases(&self, releases: Vec<(RpcAddress, u32)>) {
+        for (addr, amount) in releases {
+            self.send_dec_strong(addr, amount);
+        }
+    }
+
+    /// An inbound `DEC_STRONG`: our node's release (AOSP `doDecStrong`) or the peer paying back
+    /// sends of its own address, which may let a held proxy release go.
+    fn apply_dec_strong(&self, addr: RpcAddress, amount: u32) {
+        // Bound: a statement temporary would drop the ref (user `Drop`) under the guard.
+        let (released, held) = {
+            let mut st = self.shared.state.lock().expect("rpc state poisoned");
+            (
+                st.dec_strong_local(&addr, amount),
+                st.pay_proxy_sends(&addr, amount),
+            )
+        };
+        drop(released);
+        self.send_dec_strong(addr, held);
+    }
+
+    /// `RpcProxy::drop`: forget the proxy and send its `DEC_STRONG`, or hold it for unpaid sends.
+    pub(crate) fn release_proxy(&self, addr: RpcAddress, who: *const ()) {
+        let now = self
+            .shared
+            .state
+            .lock()
+            .expect("rpc state poisoned")
+            .release_proxy(&addr, who);
+        self.send_dec_strong(addr, now);
     }
 
     /// Undo a oneway attempt's `async_number` reservation; binder bumps belong to the parcel.
@@ -2663,15 +2722,19 @@ impl RpcSessionInner {
             }
         };
         let transport = conn.transport();
+        // AOSP `transactInternal` `onBinderLeaving`: the peer pays the target back (r34 does not).
+        let counts_target = !addr.is_zero() && self.profile.aosp_framing();
         // AOSP `BinderNode::asyncNumber` (send side, per-remote-addr).
-        let async_number = if oneway {
-            self.shared
-                .state
-                .lock()
-                .expect("rpc state poisoned")
-                .next_send_async_number(addr)
-        } else {
-            0
+        let async_number = {
+            let mut st = self.shared.state.lock().expect("rpc state poisoned");
+            if counts_target {
+                st.on_proxy_leaving(addr);
+            }
+            if oneway {
+                st.next_send_async_number(addr)
+            } else {
+                0
+            }
         };
         let txn = WireTransaction {
             address: addr,
@@ -2682,24 +2745,33 @@ impl RpcSessionInner {
             // Binder (v2) / FD (v1+) positions from serialization; empty on R34 / v0.
             object_positions: data.rpc_object_positions().to_vec(),
         };
-        // The attempt's own resource is the async number; the parcel keeps its binder bumps.
+        // The attempt's own resources are the async number and the target send; the parcel
+        // keeps its binder bumps. Returns a held proxy release the target send let go.
         let rollback = || {
             if oneway {
                 self.cancel_oneway_number(addr, async_number);
             }
             data.rpc_end_send(false);
+            if counts_target {
+                let mut st = self.shared.state.lock().expect("rpc state poisoned");
+                st.pay_proxy_sends(&addr, 1)
+            } else {
+                0
+            }
         };
         let frame = match self.profile.codec().encode_transact(&txn) {
             Ok(frame) => frame,
             Err(e) => {
-                rollback();
+                let held = rollback();
+                self.send_dec_strong(addr, held);
                 return Err(e.into());
             }
         };
         // Out-of-band fds (empty unless `Unix` fd-mode).
         if let Err(e) = self.send_msg(transport, &frame, data.rpc_out_fds()) {
-            rollback();
+            let held = rollback();
             self.retire_after_failed_send(&conn, &e);
+            self.send_dec_strong(addr, held);
             return Err(e.into());
         }
         data.rpc_end_send(true);
@@ -2790,16 +2862,7 @@ impl RpcSessionInner {
                     entered?;
                     return Ok(Some(reply));
                 }
-                WireMessage::DecStrong(a, amount) => {
-                    // Bound: a statement temporary would drop the ref under the guard.
-                    let released = self
-                        .shared
-                        .state
-                        .lock()
-                        .expect("rpc state poisoned")
-                        .dec_strong_local(&a, amount);
-                    drop(released);
-                }
+                WireMessage::DecStrong(a, amount) => self.apply_dec_strong(a, amount),
                 WireMessage::Transact(t) => {
                     // Inline nested callback; a failed lift strands our `REPLY`, so record it.
                     let _restore = match NestedDeadlineGuard::lift(transport, deadline) {
@@ -2873,14 +2936,6 @@ impl RpcSessionInner {
             .find(|s| s.id == slot_id)
             .map(|s| std::mem::take(&mut s.pending_dec))
             .unwrap_or_default()
-    }
-
-    pub(crate) fn forget_remote_if(&self, addr: &RpcAddress, who: *const ()) {
-        self.shared
-            .state
-            .lock()
-            .expect("rpc state poisoned")
-            .forget_remote_if(addr, who);
     }
 
     /// Fire each cached proxy's `binder_died` (AOSP `sendObituaries`) unlocked; idempotent.
@@ -3275,14 +3330,7 @@ impl RpcSessionInner {
                 }
             }
             WireMessage::DecStrong(a, amount) => {
-                // Bound: a statement temporary would drop the ref (user `Drop`) under the guard.
-                let released = self
-                    .shared
-                    .state
-                    .lock()
-                    .expect("rpc state poisoned")
-                    .dec_strong_local(&a, amount);
-                drop(released);
+                self.apply_dec_strong(a, amount);
                 ServeStep::Continue
             }
             WireMessage::Reply(_) => {
