@@ -787,10 +787,12 @@ impl RpcServer {
     /// bounds its first frame via the handshake deadline.)
     ///
     /// The serve phase arms this value on the **write** side too, so a peer
-    /// that stops draining replies is evicted as well — but a consumer that
-    /// legitimately reads a large reply slower than `d` is also dropped
-    /// mid-send (the connection is torn down, not desynced). Size `d`
-    /// against the slowest acceptable consumer, not just the idle gap.
+    /// that stops draining replies ends the session as well. The write half
+    /// bounds each wait for socket buffer space, not a whole reply: a
+    /// consumer that reads a large reply slowly but steadily is not cut,
+    /// one that reads nothing for `d` is. With
+    /// [`set_reply_timeout`](Self::set_reply_timeout) also set, the smaller
+    /// of the two bounds the sends.
     ///
     /// On callback connections (a client's incoming attaches, which this
     /// server only ever *sends* on) the **read** half is exempt: they

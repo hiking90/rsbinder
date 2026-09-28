@@ -210,6 +210,13 @@ pub trait TlsStream: Send + Sync {
     /// Shut the underlying stream down in both directions (wakes a
     /// blocked `read`).
     fn shutdown_stream(&self) -> std::io::Result<()>;
+    /// The stream's own peer-liveness check, as
+    /// [`RpcTransport::set_liveness`] describes it. The default is a
+    /// no-op; `TcpStream` implements it, since keepalive and
+    /// `TCP_USER_TIMEOUT` are TCP options.
+    fn set_liveness(&self, _t: Option<Duration>) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 // std streams implement `Read`/`Write` for `&Stream`, so `&self` forwards with no lock.
@@ -231,6 +238,10 @@ impl TlsStream for TcpStream {
     }
     fn shutdown_stream(&self) -> std::io::Result<()> {
         TcpStream::shutdown(self, std::net::Shutdown::Both)
+    }
+    fn set_liveness(&self, t: Option<Duration>) -> std::io::Result<()> {
+        use std::os::fd::AsFd;
+        super::tcp_liveness(self.as_fd(), t)
     }
 }
 
@@ -602,6 +613,11 @@ impl RpcTransport for TlsTransport {
 
     fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> RpcResult<()> {
         self.stream.set_write_timeout(timeout)?;
+        Ok(())
+    }
+
+    fn set_liveness(&self, timeout: Option<std::time::Duration>) -> RpcResult<()> {
+        self.stream.set_liveness(timeout)?;
         Ok(())
     }
 

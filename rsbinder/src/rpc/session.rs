@@ -137,6 +137,20 @@
 //!   session has no timeout, so a leftover handshake deadline would bound every later `recv`
 //!   and send on the slot and break a client's callback serve loop outright.
 //!
+//! # Liveness
+//!
+//! libbinder has no timeout on the RPC path, so these are rsbinder's (plan 2-24 D4, D5).
+//! `arm_liveness` sets two things on a slot's transport from two session values: the send
+//! deadline (`SO_SNDTIMEO`) is the smaller of `set_timeout` and the server's idle deadline
+//! (`set_serve_read_deadline`), and `RpcTransport::set_liveness` gets `set_timeout` (keepalive
+//! and `TCP_USER_TIMEOUT` on TCP; keepalive stays on at the system's intervals with `None`). It
+//! runs on every slot as it joins the pool, after the push and outside the lock, and on every
+//! slot again whenever either value changes; a value stored before a snapshot of the pool
+//! reaches every slot in it, and a slot pushed after the snapshot reads the value itself. A
+//! handshake deadline never outlives this: the connect and attach handshakes finish (and their
+//! guard drops) before the transport moves into the pool, and `clear_handshake_timeouts`
+//! re-arms rather than clears the send side.
+//!
 //! # Attach confirmation
 //!
 //! An outgoing attach (a connection whose header echoes a server-minted `session_id`) gets no
@@ -1461,9 +1475,9 @@ pub(crate) struct SharedSession {
     max_threads: AtomicU32,
     /// `min(local, remote)` after the client handshake (0 until done).
     negotiated: AtomicU32,
-    /// Optional reply/handshake wait deadline.
+    /// `set_timeout`: reply, slot and send waits, and the liveness check (module doc "Liveness").
     timeout: Mutex<Option<Duration>>,
-    /// Serve slots' idle deadline (`set_idle_timeout`), restored after a nested reply deadline.
+    /// Server `set_idle_timeout`: serve slots' read baseline, and a send bound on every slot.
     serve_read_deadline: Mutex<Option<Duration>>,
     /// Negotiated FD-over-RPC mode; the default `None` refuses every fd.
     fd_mode: Mutex<crate::rpc::FileDescriptorTransportMode>,
@@ -1841,15 +1855,44 @@ impl RpcSessionInner {
         }
     }
 
-    /// Lift every slot's read/write deadlines after a bounded handshake, so none stays sticky.
+    /// Lift every slot's handshake deadlines: reads unbounded, sends back to the session's own.
     fn clear_handshake_timeouts(&self) {
-        let transports: Vec<Arc<dyn RpcTransport>> = {
-            let st = self.conn_state.lock().expect("conn_state poisoned");
-            st.slots.iter().map(|s| Arc::clone(&s.transport)).collect()
-        };
-        for t in transports {
+        for t in self.slot_transports() {
             let _ = t.set_read_timeout(None);
-            let _ = t.set_write_timeout(None);
+            self.arm_liveness(&*t);
+        }
+    }
+
+    /// Every pooled slot's transport, copied out so the syscalls run unlocked.
+    fn slot_transports(&self) -> Vec<Arc<dyn RpcTransport>> {
+        let st = self.conn_state.lock().expect("conn_state poisoned");
+        st.slots.iter().map(|s| Arc::clone(&s.transport)).collect()
+    }
+
+    /// Arm `transport`'s send deadline and liveness check; see module doc "Liveness".
+    fn arm_liveness(&self, transport: &dyn RpcTransport) {
+        let timeout = *self.shared.timeout.lock().expect("timeout poisoned");
+        let idle = *self
+            .shared
+            .serve_read_deadline
+            .lock()
+            .expect("serve_read_deadline poisoned");
+        let send = match (timeout, idle) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        if let Err(e) = transport.set_write_timeout(send) {
+            log::warn!("RPC: failed to arm a connection's send deadline: {e:?}");
+        }
+        if let Err(e) = transport.set_liveness(timeout) {
+            log::warn!("RPC: failed to arm a connection's liveness check: {e:?}");
+        }
+    }
+
+    /// `arm_liveness` on every slot, after either input of it changed.
+    fn arm_liveness_all(&self) {
+        for t in self.slot_transports() {
+            self.arm_liveness(&*t);
         }
     }
 
@@ -1872,6 +1915,7 @@ impl RpcSessionInner {
         }
         let id = st.next_slot_id;
         st.next_slot_id += 1;
+        let armed = Arc::clone(&transport);
         st.slots.push(ConnSlot {
             transport,
             exclusive_tid: None,
@@ -1881,6 +1925,7 @@ impl RpcSessionInner {
             pending_dec: Vec::new(),
         });
         drop(st);
+        self.arm_liveness(&*armed);
         self.slot_cv.notify_all();
         Ok(id)
     }
@@ -1911,6 +1956,7 @@ impl RpcSessionInner {
         let transport: Arc<dyn RpcTransport> = Arc::from(transport);
         let id = st.next_slot_id;
         st.next_slot_id += 1;
+        let armed = Arc::clone(&transport);
         st.slots.push(ConnSlot {
             transport,
             exclusive_tid: None,
@@ -1920,6 +1966,7 @@ impl RpcSessionInner {
             pending_dec: Vec::new(),
         });
         drop(st);
+        self.arm_liveness(&*armed);
         self.slot_cv.notify_all();
         Ok(id)
     }
@@ -1956,6 +2003,7 @@ impl RpcSessionInner {
         let transport: Arc<dyn RpcTransport> = Arc::from(transport);
         let id = st.next_slot_id;
         st.next_slot_id += 1;
+        let armed = Arc::clone(&transport);
         st.slots.push(ConnSlot {
             transport,
             exclusive_tid: if claimed { Some(current_tid()) } else { None },
@@ -1965,6 +2013,7 @@ impl RpcSessionInner {
             pending_dec: Vec::new(),
         });
         drop(st);
+        self.arm_liveness(&*armed);
         self.slot_cv.notify_all();
         Ok(id)
     }
@@ -3391,6 +3440,7 @@ impl RpcSession {
             allow_nested: false,
             pending_dec: Vec::new(),
         };
+        let armed = Arc::clone(&founding.transport);
         let (dec_strong_tx, dec_strong_rx) = mpsc::channel();
         let inner = Arc::new(RpcSessionInner {
             conn_state: Mutex::new(ConnState {
@@ -3408,6 +3458,7 @@ impl RpcSession {
             incoming_joined: AtomicUsize::new(0),
         });
         *inner.self_weak.lock().expect("self_weak") = Arc::downgrade(&inner);
+        inner.arm_liveness(&*armed);
         // Detached reaper for deferred DEC_STRONG; exits when the inner drops its sender.
         let weak_for_reaper = Arc::downgrade(&inner);
         if let Err(e) = std::thread::Builder::new()
@@ -4123,18 +4174,40 @@ impl RpcSession {
     /// the call on another thread (or as a future) and stops waiting for
     /// it instead.
     ///
+    /// The same value bounds how long the peer may leave this end's sends
+    /// stuck and its host unanswering (plan 2-24 D4), on every connection
+    /// of the session, the ones added later included, and from the moment
+    /// this is called:
+    ///
+    /// - **Sends**: `SO_SNDTIMEO`, so a send that makes no progress for `d`
+    ///   because the peer stopped reading fails and ends the session. A
+    ///   peer that reads slowly but steadily is not cut: the deadline
+    ///   bounds each wait for socket buffer space, not the whole send.
+    /// - **The peer's host**, on TCP (`tcp_debug`, `tls` over TCP): kernel
+    ///   keepalive probes and `TCP_USER_TIMEOUT`, which end the session
+    ///   within about `d` of the host going silent even when no call is
+    ///   waiting ([`RpcTransport::set_liveness`] has the values and the
+    ///   relay limit). With `None`, keepalive stays on at the operating
+    ///   system's intervals (about two hours on Linux).
+    ///
+    /// A server's [`set_idle_timeout`](super::RpcServer::set_idle_timeout)
+    /// also bounds its sends; with both set the smaller one applies.
+    ///
     /// `Some(Duration::ZERO)` is **not** a valid deadline — the reply wait
     /// arms it as `SO_RCVTIMEO`, which rejects a zero duration — so it is
     /// refused (logged) and treated as `None` rather than failing every
     /// transaction on this session.
+    ///
+    /// [`RpcTransport::set_liveness`]: super::transport::RpcTransport::set_liveness
     pub fn set_timeout(&self, timeout: Option<Duration>) {
         *self.inner.shared.timeout.lock().expect("timeout poisoned") = reject_zero_deadline(
             timeout,
             "RpcSession::set_timeout: a zero duration is not a valid deadline; ignoring",
         );
+        self.inner.arm_liveness_all();
     }
 
-    /// The server's serve-connection read deadline, restored (not cleared) after a reply deadline.
+    /// The server's idle deadline: serve slots' read baseline and every slot's send bound.
     pub(crate) fn set_serve_read_deadline(&self, deadline: Option<Duration>) {
         *self
             .inner
@@ -4142,6 +4215,7 @@ impl RpcSession {
             .serve_read_deadline
             .lock()
             .expect("serve_read_deadline poisoned") = deadline;
+        self.inner.arm_liveness_all();
     }
 
     /// `min(local, remote)` worker count established by
@@ -4951,6 +5025,11 @@ mod tests {
     //! * `a_failed_send_ends_the_whole_session`: make `end_after_failed_send` return before
     //!   `fail_session` and the fan-out slot keeps the session up after its founding
     //!   connection's send failed.
+    //! * `liveness_follows_the_session_values_on_every_slot` and
+    //!   `a_send_the_peer_stops_reading_ends_the_session`: drop `arm_liveness_all` from
+    //!   `set_timeout` and the recorder sees no new value, and the stalled send never gives up
+    //!   (the test's bounded wait fails it); drop `arm_liveness` from a slot push and the added
+    //!   slot is never armed.
     //! * `the_kernels_etimedout_under_an_armed_deadline_is_not_an_eviction` gates both halves of
     //!   the `ETIMEDOUT` split. Count `TimedOut` in `transport::is_timeout`, or drop the
     //!   `Io(TimedOut)` arm of `serve_once_on_slot`'s receive, and the loop ends on
@@ -5629,6 +5708,140 @@ mod tests {
             "the other outgoing connection does not keep the session up"
         );
         assert_eq!(session.inner.slot_count(), 0);
+    }
+
+    /// Every slot, founding and added, follows the session's two values; module doc "Liveness".
+    #[test]
+    fn liveness_follows_the_session_values_on_every_slot() {
+        #[derive(Default)]
+        struct Seen {
+            send: Mutex<Vec<Option<Duration>>>,
+            live: Mutex<Vec<Option<Duration>>>,
+        }
+        impl Seen {
+            fn last(&self) -> (Option<Duration>, Option<Duration>) {
+                let send = *self
+                    .send
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .expect("send deadline armed");
+                let live = *self.live.lock().unwrap().last().expect("liveness armed");
+                (send, live)
+            }
+        }
+        struct Recorder(Arc<Seen>);
+        impl RpcTransport for Recorder {
+            fn send_frame(&self, _: &[u8]) -> RpcResult<()> {
+                Ok(())
+            }
+            fn recv_frame(&self) -> RpcResult<Vec<u8>> {
+                Err(RpcError::EndOfStream)
+            }
+            fn peer_identity(&self) -> PeerIdentity {
+                PeerIdentity::Anonymous
+            }
+            fn describe(&self) -> &str {
+                "recorder"
+            }
+            fn set_write_timeout(&self, t: Option<Duration>) -> RpcResult<()> {
+                self.0.send.lock().unwrap().push(t);
+                Ok(())
+            }
+            fn set_liveness(&self, t: Option<Duration>) -> RpcResult<()> {
+                self.0.live.lock().unwrap().push(t);
+                Ok(())
+            }
+            fn shutdown(&self) -> RpcResult<()> {
+                Ok(())
+            }
+        }
+        let secs = |n| Some(Duration::from_secs(n));
+        let founding = Arc::new(Seen::default());
+        let session = RpcSession::new(
+            Box::new(Recorder(Arc::clone(&founding))),
+            AddressSpace::Initiator,
+        )
+        .expect("session");
+        assert_eq!(founding.last(), (None, None), "keepalive with no timeout");
+
+        session.set_timeout(secs(8));
+        assert_eq!(founding.last(), (secs(8), secs(8)));
+        // A server's idle deadline bounds sends too; the smaller one applies.
+        session.set_serve_read_deadline(secs(3));
+        assert_eq!(founding.last(), (secs(3), secs(8)));
+
+        let added = Arc::new(Seen::default());
+        session
+            .inner
+            .add_outgoing_slot(Box::new(Recorder(Arc::clone(&added))))
+            .expect("fan-out slot");
+        assert_eq!(added.last(), (secs(3), secs(8)), "a slot added later");
+
+        session.set_timeout(None);
+        assert_eq!(founding.last(), (secs(3), None));
+        assert_eq!(added.last(), (secs(3), None));
+    }
+
+    /// A peer that stops reading ends the session one send deadline later; module doc "Liveness".
+    #[test]
+    fn a_send_the_peer_stops_reading_ends_the_session() {
+        use super::super::transport::UnixTransport;
+        let (a, _unread) = UnixTransport::pair().expect("socketpair");
+        let session = RpcSession::new(Box::new(a), AddressSpace::Initiator).expect("session");
+        session.set_timeout(Some(Duration::from_millis(300)));
+        let mut data = Parcel::new();
+        // Far past any socket buffer, so the send has to wait for the peer.
+        data.write(&vec![0u8; 8 << 20]).expect("payload");
+
+        let (tx, rx) = mpsc::channel();
+        let inner = Arc::clone(&session.inner);
+        std::thread::spawn(move || {
+            let r = inner.client_transact(RpcAddress::zero(), 1, &data, FLAG_ONEWAY);
+            let _ = tx.send(r.map(|_| ()));
+        });
+        // Bounded, so a missing send deadline fails the test instead of hanging it.
+        let sent = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the send must give up");
+        assert_eq!(
+            sent,
+            Err(StatusCode::TimedOut),
+            "a send deadline, mid-frame"
+        );
+        assert!(session.inner.shared.lifecycle.is_torn_down());
+    }
+
+    /// A peer that reads slowly but steadily is not cut: the deadline bounds each wait, not the send.
+    #[test]
+    fn a_peer_that_reads_slowly_is_not_cut_by_the_send_deadline() {
+        use super::super::transport::UnixTransport;
+        let (a, peer) = UnixTransport::pair().expect("socketpair");
+        let session = RpcSession::new(Box::new(a), AddressSpace::Initiator).expect("session");
+        session.set_timeout(Some(Duration::from_millis(300)));
+        let payload = 2usize << 20;
+        let mut data = Parcel::new();
+        data.write(&vec![0u8; payload]).expect("payload");
+
+        // 64 KiB every 50 ms: the sender waits about 50 ms at a time, far under its 300 ms.
+        let reader = std::thread::spawn(move || {
+            let mut buf = vec![0u8; 64 << 10];
+            let mut total = 0usize;
+            while total < payload {
+                match peer.recv_raw(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => total += n,
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            total
+        });
+        let sent = session
+            .inner
+            .client_transact(RpcAddress::zero(), 1, &data, FLAG_ONEWAY);
+        assert!(matches!(sent, Ok(None)), "got {sent:?}");
+        assert!(reader.join().expect("reader") >= payload);
+        assert!(!session.inner.shared.lifecycle.is_torn_down());
     }
 
     /// A loop started on an ended session, or on an id not in the pool, serves nothing.

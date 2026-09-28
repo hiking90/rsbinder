@@ -174,6 +174,37 @@ pub trait RpcTransport: Send + Sync {
         Ok(())
     }
 
+    /// Arm the kernel's own check that the peer's host still answers, sized
+    /// to `timeout` — the session's
+    /// [`set_timeout`](super::RpcSession::set_timeout), which calls this on
+    /// every connection. The default is a no-op: `unix`, `vsock` and `mem`
+    /// have no such check, and a caller's own transport gets the default
+    /// until it overrides this. `tcp_debug` and `tls` over TCP implement it:
+    ///
+    /// - `SO_KEEPALIVE` is on whatever `timeout` is. With `None` the probe
+    ///   intervals are the operating system's defaults (Linux: first probe
+    ///   after 7200 s idle, then 9 probes 75 s apart), so a connection whose
+    ///   peer vanished ends in about two hours instead of never.
+    /// - With `Some(d)` the connection is declared dead once the peer's host
+    ///   has not acknowledged anything for about `d`: first probe after
+    ///   `d / 2` of silence, then three probes `d / 6` apart (each at least
+    ///   one second, the socket option's unit), and on Linux and Android
+    ///   `TCP_USER_TIMEOUT` = `d` bounds data sent and not acknowledged.
+    ///   macOS has no `TCP_USER_TIMEOUT`, so unacknowledged data there is
+    ///   bounded by the system's retransmission limit.
+    ///
+    /// A connection the kernel gives up on reads and writes as
+    /// `ETIMEDOUT` ([`RpcError::Io`]), which ends the session. Setting
+    /// `None` after `Some(d)` turns `TCP_USER_TIMEOUT` back to the system
+    /// default but leaves the probe intervals as `Some(d)` set them: no
+    /// socket option restores the system's interval defaults. The probes
+    /// reach only the first TCP endpoint on the path; a relay that ends TCP
+    /// (`adb forward`, `ssh -L`, a TLS terminator) answers them itself, so a
+    /// break behind it goes unnoticed here.
+    fn set_liveness(&self, _timeout: Option<std::time::Duration>) -> RpcResult<()> {
+        Ok(())
+    }
+
     /// Shut the connection down in both directions: wake a reader blocked
     /// in [`recv_frame`](Self::recv_frame) / [`recv_raw`](Self::recv_raw)
     /// and make this end's later sends fail. (The *peer's* sends are the
@@ -534,6 +565,42 @@ pub(crate) fn is_timeout(e: &std::io::Error) -> bool {
     e.kind() == ErrorKind::WouldBlock
 }
 
+/// Keepalive probes after the first: three tolerate two lost probe segments before a verdict.
+#[cfg(any(feature = "rpc-tcp-debug", feature = "rpc-tls"))]
+const KEEPALIVE_PROBES: u32 = 3;
+
+/// Idle before the first probe and the probe interval for `d`: `d/2 + 3·d/6` ≈ `d`, each ≥ 1 s.
+#[cfg(any(feature = "rpc-tcp-debug", feature = "rpc-tls"))]
+fn keepalive_intervals(d: std::time::Duration) -> (std::time::Duration, std::time::Duration) {
+    let secs = |n: u64| std::time::Duration::from_secs(n.max(1));
+    (secs(d.as_secs() / 2), secs(d.as_secs() / 6))
+}
+
+/// `RpcTransport::set_liveness` for a TCP socket: see that method's doc for the values.
+#[cfg(any(feature = "rpc-tcp-debug", feature = "rpc-tls"))]
+pub(crate) fn tcp_liveness(
+    fd: std::os::fd::BorrowedFd<'_>,
+    timeout: Option<std::time::Duration>,
+) -> std::io::Result<()> {
+    use rustix::net::sockopt;
+    sockopt::set_socket_keepalive(fd, true)?;
+    // 0 is the kernel default; a positive deadline is at least 1 ms, so it never reads as 0.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    sockopt::set_tcp_user_timeout(
+        fd,
+        timeout.map_or(0, |d| {
+            u32::try_from(d.as_millis()).unwrap_or(u32::MAX).max(1)
+        }),
+    )?;
+    if let Some(d) = timeout {
+        let (idle, interval) = keepalive_intervals(d);
+        sockopt::set_tcp_keepidle(fd, idle)?;
+        sockopt::set_tcp_keepintvl(fd, interval)?;
+        sockopt::set_tcp_keepcnt(fd, KEEPALIVE_PROBES)?;
+    }
+    Ok(())
+}
+
 /// Socket `shutdown` result, absorbing macOS's `ENOTCONN` on a second call (trait: idempotent).
 pub(crate) fn absorb_already_shut(r: std::io::Result<()>) -> RpcResult<()> {
     match r {
@@ -712,6 +779,51 @@ mod tests {
             "a deadline past the first byte left a partial frame on the wire"
         );
         assert!(write_all_reporting(&mut Stall(5), b"frame").is_ok());
+    }
+
+    /// `tcp_liveness`'s socket options, read back with `getsockopt`.
+    #[cfg(any(feature = "rpc-tcp-debug", feature = "rpc-tls"))]
+    #[test]
+    fn tcp_liveness_sizes_keepalive_to_the_timeout() {
+        use rustix::net::sockopt;
+        use std::os::fd::AsFd;
+        use std::time::Duration;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let stream = std::net::TcpStream::connect(listener.local_addr().unwrap()).expect("connect");
+        let fd = stream.as_fd();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let user_timeout = || sockopt::tcp_user_timeout(fd).expect("TCP_USER_TIMEOUT");
+
+        tcp_liveness(fd, None).expect("no timeout");
+        assert!(
+            sockopt::socket_keepalive(fd).unwrap(),
+            "keepalive is on with no timeout"
+        );
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert_eq!(user_timeout(), 0, "the kernel default");
+
+        tcp_liveness(fd, Some(Duration::from_secs(12))).expect("12 s");
+        assert_eq!(sockopt::tcp_keepidle(fd).unwrap(), Duration::from_secs(6));
+        assert_eq!(sockopt::tcp_keepintvl(fd).unwrap(), Duration::from_secs(2));
+        assert_eq!(sockopt::tcp_keepcnt(fd).unwrap(), KEEPALIVE_PROBES);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert_eq!(user_timeout(), 12_000);
+
+        // Under two seconds the intervals floor at the socket option's one-second unit.
+        tcp_liveness(fd, Some(Duration::from_millis(1500))).expect("1.5 s");
+        assert_eq!(sockopt::tcp_keepidle(fd).unwrap(), Duration::from_secs(1));
+        assert_eq!(sockopt::tcp_keepintvl(fd).unwrap(), Duration::from_secs(1));
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert_eq!(user_timeout(), 1_500);
+
+        tcp_liveness(fd, None).expect("back to none");
+        assert!(sockopt::socket_keepalive(fd).unwrap());
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert_eq!(
+            user_timeout(),
+            0,
+            "None turns TCP_USER_TIMEOUT back to the default"
+        );
     }
 
     /// `ETIMEDOUT` fails as `Io`, a read deadline as `Timeout`; see module doc "Mutation gates".
