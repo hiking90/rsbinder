@@ -299,6 +299,16 @@ in the release after 0.12.0. The single-connection one-liners
 
 ### Fixed
 
+- **RPC: dropping a proxy right after a oneway on it no longer aborts a
+  libbinder peer.** The proxy's `DEC_STRONG` could go out on another
+  connection than the oneway and be handled first; the peer then freed its
+  node and aborted on the oneway (`Local binder must have been sent`), and an
+  rsbinder peer dropped it as addressed to an unknown node. rsbinder now counts
+  what the peer pays back with a `DEC_STRONG`, as AOSP `sentRef` does: each
+  transaction's target on the android-13+ wire, and at v2 each proxy written
+  into a parcel. A dropped proxy's `DEC_STRONG` waits until those are paid, so
+  releasing the peer's object can wait for this end's next twoway on that
+  connection, or for the session's end.
 - **RPC: an android-13+ libbinder client no longer keeps an rsbinder object
   alive until the session ends.** It counts each transaction's target and each
   binder it sends back home as a send owed a `DEC_STRONG`, which rsbinder never

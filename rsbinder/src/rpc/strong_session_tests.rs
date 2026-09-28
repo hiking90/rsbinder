@@ -26,13 +26,15 @@
 //!   next call fails, which must run the same death sequence (clear) so the
 //!   client graph is reclaimed once the user's own handles are gone.
 //! - `argument_proxy_dec_strong_follows_the_reply_on_the_serving_connection`:
-//!   the `DEC_STRONG` for a proxy a handler received as an argument goes out
-//!   after the reply and on the same connection, even when the session has
-//!   an idle callback slot (a real-libbinder peer's incoming connection) that
-//!   a free-slot scan would pick first. Sent there it races the reply on the
-//!   serving connection, and a peer that handles the DEC first frees the node
-//!   the reply names. Only the raw handshake helper can open a callback
-//!   connection, so the test is in-crate.
+//!   below wire v2, the `DEC_STRONG` for a proxy a handler received as an
+//!   argument goes out after the reply and on the same connection, even when
+//!   the session has an idle callback slot (a real-libbinder peer's incoming
+//!   connection) that a free-slot scan would pick first. Sent there it races
+//!   the reply on the serving connection, and a peer that handles the DEC
+//!   first frees the node the reply names. At v2 the reply's send is counted
+//!   and the release waits for the peer to pay it back instead
+//!   (`ref_accounting_tests` T12). Only the raw handshake helper can open a
+//!   callback connection, so the test is in-crate.
 
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
@@ -289,7 +291,8 @@ fn argument_proxy_dec_strong_follows_the_reply_on_the_serving_connection() {
             .as_nanos()
     ));
     let server = RpcServer::setup_unix_server(&path).expect("bind");
-    server.set_android13plus(2);
+    // v1: at v2 the release is ordered by the count, not by the connection (module doc).
+    server.set_android13plus(1);
     server
         .set_root(Interface::as_binder(&Binder::new(Holder::default())))
         .expect("set_root");
@@ -301,10 +304,10 @@ fn argument_proxy_dec_strong_follows_the_reply_on_the_serving_connection() {
         std::thread::sleep(Duration::from_millis(5));
     }
 
-    let client = RpcSession::setup_unix_client_android13plus(&path, 2).expect("connect");
+    let client = RpcSession::setup_unix_client_android13plus(&path, 1).expect("connect");
     let sid = client.get_session_id().expect("session id");
     let mut callback_conn = UnixStream::connect(&path).expect("raw connect");
-    client_connect_with_id(&mut callback_conn, 2, true, FD_MODE_NONE, &sid)
+    client_connect_with_id(&mut callback_conn, 1, true, FD_MODE_NONE, &sid)
         .expect("attach an incoming (callback) connection");
     // The callback slot is admitted asynchronously by the accept worker.
     let id: [u8; 32] = sid.as_slice().try_into().expect("32-byte session id");
