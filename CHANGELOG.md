@@ -90,6 +90,30 @@ This changelog starts at 0.9.0. For earlier releases, see the
 - **A kernel `Client::get` / `connect` reports the service manager's own
   failure** instead of `NameNotFound` when it cannot be reached, and `hub`
   logs why once.
+- **An RPC `Parcel` is sent once** (see *Fixed*): build a new request per
+  call. Sending the same parcel again, or a reply or incoming parcel as a
+  request, returns `InvalidOperation`; a parcel built on another session's
+  proxy returns `BadType` (AOSP `RpcState::validateParcel`), as do a local
+  binder written into a sent parcel and a `ParcelableHolder` read on one
+  session written into a parcel of another. In 0.11.0 a scalar-only request
+  could be resent. `RpcProxy::transact` refuses a parcel built for no session
+  (`Parcel::new()`) with `BadType`; build it with `build_request`. A handler
+  that replaces its reply with such a parcel, or with one built on another
+  session, sends the caller `BadType`; with a received or already-sent parcel,
+  `InvalidOperation`. 0.11.0 sent their bytes.
+- **An unresolved `ParcelableHolder` cannot be relayed over an r34 or
+  android-13 v0/v1 RPC session; relay requires wire v2** (android-16). Writing
+  a holder that was read but not decoded with `get_parcelable` into a parcel
+  of such a session is `BadType`, even when the payload holds only data: those
+  wires do not record where a binder sits, so the copy could neither take the
+  references its binders need nor prove there are none. Decode the payload
+  first and write the typed value. On v2 the relay carries binders and fds.
+  In 0.11.0 the bytes were copied as they were, and relaying a holder that held
+  one of the peer's own references freed the node early.
+- **A session parcel takes a holder's bytes only from its own session** (AOSP
+  `Parcel::appendFrom`): a holder read from a kernel parcel, decoded with
+  `from_bytes` or read on another session, written undecoded into an RPC
+  session parcel, is `BadType`. It was copied as is.
 - **`ServerGuard` and `Server` are `#[must_use]`**: `serve(uri)?.spawn()?;`
   stopped an RPC server at once. Bind the guard to a named variable.
 - **`rsbinder-aidl` parser API: `ParcelableDecl::type_params` and
@@ -99,6 +123,20 @@ This changelog starts at 0.9.0. For earlier releases, see the
 - **Several RPC client setup calls are deprecated** in favor of
   `RpcClientConfig` (see *Deprecated*); they still work, but `-D warnings`
   flags them.
+- **`rsb_hub` checks every directory above its configuration, not only the
+  configuration itself** (see *Changed*). A group- or world-writable (sticky
+  or not) or foreign-owned directory anywhere on the path refuses the load:
+  one kept under `/tmp` no longer loads, nor does `~/rsbinder/hub.d` when
+  `~/rsbinder` was made `0775` under umask `002`. Move it under
+  `$XDG_RUNTIME_DIR` or `$HOME` and `chmod g-w,o-w` the directories on the
+  way. `rsbinder_tools::config::check_path`
+  is removed: the check now runs on held descriptors, and a path-based probe
+  would report a different inode than the one read.
+- **`rsbinder_tools::nss::gids_for_uid` returns `Option<BTreeSet<u32>>`**:
+  `None` is a failed lookup, not an unknown uid (that is `Some` of an empty
+  set). `nss::GroupCache` and `config::Enforcer` hold a boxed resolver and are
+  no longer `UnwindSafe` / `RefUnwindSafe`; wrap them in `AssertUnwindSafe`
+  where `catch_unwind` needs it.
 
 ### Added
 
@@ -213,6 +251,27 @@ This changelog starts at 0.9.0. For earlier releases, see the
   (`BadType`) and file descriptors (`FdsNotAllowed`) are still refused on
   write and read, and `Parcel::allow_fds` is `false` on such a parcel. No wire
   or signature change.
+- **rsbinder-tools (`rsb_hub`):** the configuration trust check, which in
+  0.11.0 looked at the configuration path and its files only, walks from `/`
+  one `openat(O_NOFOLLOW)` per component, checks every directory on the way
+  and follows symlinks itself (the directory holding one is checked too), and
+  reads or lists the final inode through the descriptor it checked, so a
+  rename or symlink swap between check and read changes nothing. A group- or
+  world-writable (sticky or not) or foreign-owned directory on the way is
+  refused, so `/tmp` does not qualify.
+- **rsbinder-tools (`rsb_hub`):** a caller denied by a group rule has its
+  groups re-read, at most once every 15 s per uid
+  (`GroupCache::MIN_REVALIDATE`), and is judged again. glibc returns a subset
+  of the groups as a success when one backend (e.g. sssd) is down, and that
+  subset used to be held until SIGHUP; a failed lookup was retried on every
+  transaction and is now held as an empty set under the same limit. A re-read
+  is merged into the cached set and never shrinks it, so a removed group
+  still takes effect only at SIGHUP. `nss::gids_for_uid` returns `Option` and
+  documents that its `Some` may be a subset. New API:
+  `GroupCache::{with_resolver, revalidate, MIN_REVALIDATE}`, `nss::Resolver`,
+  `Policy::group_could_grant`. An `_r` lookup's errno is now always a failure
+  on glibc/BSD (`ENOENT`, `ESRCH`, `EBADF`, `EPERM` used to read as
+  not-found, so a missing `/etc/passwd` looked like an unknown user).
 
 The behavior changes an existing program can observe are listed under
 *Migrating from 0.11.0* above.
@@ -236,6 +295,47 @@ in the release after 0.12.0. The single-connection one-liners
 
 ### Fixed
 
+- **RPC: an android-13+ libbinder client no longer keeps an rsbinder object
+  alive until the session ends.** It counts each transaction's target and each
+  binder it sends back home as a send owed a `DEC_STRONG`, which rsbinder never
+  returned; it now does, as AOSP `flushExcessBinderRefs` does. On the v2 wire a
+  parcel dropped unread also pays back the binders it carried.
+- **RPC: reading a binder twice no longer returns a reference the peer never
+  gave.** A `ParcelableHolder` retried after a failed `get_parcelable`, or a
+  request read back before it was sent, cost the peer an extra `DEC_STRONG`:
+  libbinder 16_r4+ ends the session, other peers free the node early
+  (`DeadObject`). A proxy written into a received parcel is `InvalidOperation`.
+- **RPC: a peer that only sends oneways can no longer stall a server.** A
+  `DEC_STRONG` raised while serving a oneway went out on that connection, which
+  an rsbinder sender reads only while waiting for a reply; enough of them
+  blocked both ends. It now goes to a connection the peer serves, or waits for
+  the next reply on that one.
+- **An RPC parcel dropped without being sent releases its local binders'
+  `timesSent` reservations** (AOSP `mSendState`); a request refused before the
+  send (`WouldBlock`, `DeadObject`) keeps them, so the documented retry with
+  the same parcel is sound. Sending one parcel twice is `InvalidOperation`
+  (see *Migrating from 0.11.0*).
+  Writing a local binder into a parcel of an ended session is `DeadObject`
+  (was accepted, leaking the node).
+- **RPC: a `ParcelableHolder` read from a transaction decodes the binders and
+  v1+ fds in its payload.** Its sub-parcel dropped the object positions and
+  the received fds, so on v2 a binder read as `BadValue` and on v1/v2 an fd
+  failed to read. On v2 an undecoded holder written back into the session now
+  takes its own reference on each binder and duplicates each fd (see
+  *Migrating from 0.11.0* for the other wires).
+- **A `ParcelableHolder` whose read fails after the stability check is left
+  empty**, as AOSP `ParcelableHolder::readFromParcel` leaves it; it kept its
+  previous value.
+- **RPC: a handler reply refused at the send** now reaches the caller as a
+  status and the connection keeps serving, as in AOSP
+  `RpcState::processTransactInternal`: `BadValue` for more than 64 fds
+  (rsbinder's per-frame cap; AOSP allows 253) and `FailedTransaction` for a
+  reply over `MAX_FRAME_LEN`. Both ended the connection.
+- **Kernel binder: a handler can return a binder proxy it received in the same
+  transaction.** A kernel `Parcel` now holds a strong reference on every proxy
+  written into it until it drops (AOSP `acquire_object`); the reply failed with
+  `FailedTransaction` when the handler's own references to the proxy were
+  released before `BC_REPLY`.
 - **RPC: a `oneway` call made inside a handler no longer rides the connection
   the request came in on**, where the server's reply to the outer call could
   be misread by nested calls (seen against libbinder as `UNEXPECTED_NULL` or
@@ -268,8 +368,19 @@ in the release after 0.12.0. The single-connection one-liners
 - **`rsbinder-aidl`: a type nested three or more levels deep could not name a
   type from a grandparent scope.** Name lookup now walks to the package
   boundary, as AOSP does.
+- **`rsbinder-aidl`: `@Descriptor("")` no longer produces an empty interface
+  descriptor**; as in AOSP `AidlInterface::GetDescriptor`, the canonical name
+  is used, so the interface token matches AOSP-generated peers.
 
 ### Security
+
+- **`rsbinder-aidl`: a permission annotation written after `oneway`
+  (`oneway @EnforcePermission("X") void m();`) is enforced.** It was parsed as
+  a return-type annotation and ignored, so the generated service ran the
+  method for every caller. AOSP applies annotations on either side of `oneway`
+  to the method; rsbinder now does the same, and also applies the
+  interface-and-method conflict check and the repeated-annotation check to
+  that position. Rebuild services generated from AIDL of this shape.
 
 - Raised the `rustls` floor to 0.23.45 for RUSTSEC-2026-0285 (TLS 1.3 handshake
   messages accepted across encryption level boundaries). Affects the `rpc-tls`

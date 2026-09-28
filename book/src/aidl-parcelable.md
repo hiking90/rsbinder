@@ -242,6 +242,7 @@ Key points about `ParcelableHolder`:
 - **Arc wrapping**: Extensions are set using `Arc<T>`, which allows shared ownership of the extension data.
 - **Multiple holders**: A single parcelable can have multiple `ParcelableHolder` fields (as shown with `ext` and `ext2` above), each holding a different extension type.
 - **Versioning**: This mechanism is particularly useful for forward compatibility. Older code that does not know about newer extension types can still deserialize the base parcelable and pass the `ParcelableHolder` through without losing data.
+- **Passing through over RPC**: an undecoded holder can be passed on over kernel binder, and within one RPC session on the android-16 (v2) wire. On the r34 and android-13 v0/v1 wires, and into a different session or transport, writing it returns `BadType`; decode it with `get_parcelable::<T>()` first. The `ParcelableHolder` rustdoc lists each case.
 
 ## Generic Parcelables
 
