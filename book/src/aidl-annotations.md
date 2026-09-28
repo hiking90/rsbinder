@@ -323,8 +323,8 @@ exist so every method can declare its permission posture).
 | `@nullable(heap=true)` | field | `heap=true` is ignored; rsbinder boxes a field its own cycle analysis finds recursive |
 | `@utf8InCpp` | String | No effect in Rust (strings are always UTF-8) |
 | `@Descriptor` | interface | Overrides the wire descriptor string |
-| `@VintfStability` | parcelable, interface | Stamps `Stability::Vintf`; every referenced type must be VINTF-stable (checked) |
-| `@FixedSize` | parcelable, union | Fields checked to be fixed-size; no layout change (`Copy` comes from `@RustDerive(Copy=true)`) |
+| `@VintfStability` | parcelable, interface, type parameter | Stamps `Stability::Vintf`; every referenced type must be VINTF-stable (checked). On a type parameter (`Foo<@VintfStability T>`): the argument must be a `@VintfStability` declaration |
+| `@FixedSize` | parcelable, union, type parameter | Fields checked to be fixed-size; no layout change (`Copy` comes from `@RustDerive(Copy=true)`). On a type parameter (`MQDescriptor<@FixedSize T, Flavor>`): the argument must itself be fixed-size |
 | `@deprecated` (javadoc) | any declaration, method, field, constant, enumerator | Emits `#[deprecated]` / `#[deprecated = "note"]` |
 | `@EnforcePermission` | interface method | Generates a `PermissionManagerService` check (kernel-only; denied over RPC) |
 

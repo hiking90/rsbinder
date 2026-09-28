@@ -27,8 +27,7 @@ use rsbinder::*;
 const DESCRIPTOR: &str = "rsbinder.test.worksource.IProbe";
 /// Reply: `[uid][propagate]` as the handler sees them.
 const GET: TransactionCode = FIRST_CALL_TRANSACTION;
-/// Arg: `i32` uid to set before forwarding, or [`NO_SET`]. Calls `GET` on
-/// the next service. Reply: `[uid received][uid the next service saw]`.
+/// Arg: uid to set, or [`NO_SET`]; `GET`s the next service. Reply: `[uid received][uid next saw]`.
 const FORWARD: TransactionCode = FIRST_CALL_TRANSACTION + 1;
 const NO_SET: i32 = -2;
 const UNSET: i32 = -1;

@@ -63,6 +63,9 @@ fn main() {
             "aidl/android/aidl/tests/StructuredParcelable.aidl",
         ))
         .source(PathBuf::from(
+            "aidl/android/aidl/tests/GenericStructuredParcelable.aidl",
+        ))
+        .source(PathBuf::from(
             "aidl/android/aidl/tests/SimpleParcelable.aidl",
         ))
         .source(PathBuf::from("aidl/android/aidl/tests/Union.aidl"))
@@ -153,7 +156,7 @@ fn main() {
         .generate()
         .unwrap();
 
-    // Plan 10-9: traced interfaces for `tests/transaction_names.rs`; `version`/`hash` stamp the preceding source.
+    // Plan 10-9 (`tests/transaction_names.rs`): `version`/`hash` stamp the preceding source.
     rsbinder_aidl::Builder::new()
         .source(PathBuf::from("aidl/tracedemo/ITraceDemo.aidl"))
         .version(1)
@@ -161,6 +164,28 @@ fn main() {
         .source(PathBuf::from("aidl/tracedemo/ITraceVintf.aidl"))
         .trace(true)
         .output(PathBuf::from("trace_demo.rs"))
+        .generate()
+        .unwrap();
+
+    // Plan 12 F0: builtin `android.hardware.common` types resolve without a vendored `.aidl`.
+    rsbinder_aidl::Builder::new()
+        .source(PathBuf::from("aidl/fmqdemo/IFmqDemo.aidl"))
+        .output(PathBuf::from("fmq_demo.rs"))
+        .generate()
+        .unwrap();
+
+    // Plan 12 F2 (`src/fmq_peer.rs`): the C++ half compiles the same two files with `aidl`.
+    rsbinder_aidl::Builder::new()
+        .source(PathBuf::from("aidl/fmqinterop/IFmqPeer.aidl"))
+        .source(PathBuf::from("aidl/fmqinterop/QueueView.aidl"))
+        .output(PathBuf::from("fmq_peer.rs"))
+        .generate()
+        .unwrap();
+
+    // Plan 10-7: `stream_rpc.rs` and the kernel `stream_probe` share it, so not behind `rpc`.
+    rsbinder_aidl::Builder::new()
+        .source(PathBuf::from("aidl/streamdemo/IStreamDemo.aidl"))
+        .output(PathBuf::from("stream_demo.rs"))
         .generate()
         .unwrap();
 

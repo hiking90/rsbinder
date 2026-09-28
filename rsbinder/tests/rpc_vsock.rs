@@ -19,7 +19,13 @@
 //! factory + `run_background` pattern as the UDS e2e suite. The
 //! underlying `VsockTransport::from_stream` / `VsockTransport::connect`
 //! are exercised (one through the server's accept loop, the other
-//! through the test's client construction).
+//! through the test's client construction). The round-trip test's client connects through
+//! `VsockTransport::connect` directly so its `PeerIdentity::Vsock` assertion reads what the
+//! wire reports.
+//!
+//! `RpcTransport::shutdown` waking a blocked `recv_frame` is the primitive that ends a
+//! client's incoming-connection threads and any user `serve_blocking` on session death;
+//! `vsock_shutdown_wakes_blocked_recv` pins it for vsock.
 
 #![cfg(all(feature = "rpc-vsock", target_os = "linux"))]
 
@@ -86,13 +92,7 @@ fn ping_via(root: &SIBinder, msg: &str) -> Result<String> {
     r.read::<String>()
 }
 
-/// Core round-trip over loopback vsock (`VMADDR_CID_LOCAL`) — server
-/// built with `RpcServer::setup_vsock_server`.
-///
-/// Server-side: the same factory + `run_background` shape used by the
-/// UDS e2e suite — backend swap is the only difference. Client-side:
-/// `VsockTransport::connect` so the `PeerIdentity::Vsock`
-/// assertion keeps its original wire-level reach.
+/// Loopback vsock round-trip through a `VsockTransport::connect` client; see module doc.
 #[test]
 #[ignore = "needs Linux vsock loopback (modprobe vsock_loopback) or a peer VM"]
 fn vsock_loopback_e2e() {
@@ -129,10 +129,7 @@ fn vsock_loopback_e2e() {
     let _ = bg.join();
 }
 
-/// Plan 2-20 (`RpcTransport::shutdown`): a thread blocked in `recv_frame`
-/// on a vsock connection returns once `shutdown()` is called on the same
-/// transport — the primitive that ends a client's incoming-connection
-/// threads and any user `serve_blocking` on session death.
+/// Plan 2-20: `shutdown()` on a vsock transport wakes a thread blocked in its `recv_frame`.
 #[test]
 #[ignore = "needs Linux vsock loopback (modprobe vsock_loopback) or a peer VM"]
 fn vsock_shutdown_wakes_blocked_recv() {
@@ -151,11 +148,7 @@ fn vsock_shutdown_wakes_blocked_recv() {
 
     let t: Arc<dyn RpcTransport> =
         Arc::new(VsockTransport::connect(VMADDR_CID_LOCAL, port).expect("client connect"));
-    // The reader reports through a channel, so "shutdown must wake it"
-    // is a `recv_timeout` that *fails* on regression. Asserting on
-    // `elapsed()` after `reader.join()` cannot: if `shutdown` stops
-    // waking the reader, the join never returns and the test hangs
-    // until the CI timeout instead of failing here.
+    // A channel, not `join()`: a reader `shutdown` fails to wake would hang the join, not fail.
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     let reader = {
         let t = Arc::clone(&t);
@@ -175,17 +168,14 @@ fn vsock_shutdown_wakes_blocked_recv() {
     );
     reader.join().expect("reader thread");
     server.stop_accepting();
-    // Join the workers before the accept loop, as the sibling test does:
-    // a worker still serving this client would otherwise outlive the test.
+    // Workers first: one still serving this client would otherwise outlive the test.
     server.join_workers();
     if let Err(p) = bg.join() {
-        eprintln!("WARNING: vsock accept loop panicked: {p:?}");
+        std::panic::resume_unwind(p);
     }
 }
 
-/// Plan 2-20 (`RpcSession::close_session` on a vsock session): a user
-/// `serve_blocking` thread ends, the death recipient fires, and the
-/// server sees the connection go — the whole teardown path over vsock.
+/// Plan 2-20: `close_session` ends `serve_blocking`, fires death, and the server sees the close.
 #[test]
 #[ignore = "needs Linux vsock loopback (modprobe vsock_loopback) or a peer VM"]
 fn vsock_session_shutdown_ends_serve_thread() {
@@ -216,10 +206,10 @@ fn vsock_session_shutdown_ends_serve_thread() {
     assert_eq!(ping_via(&root, "pre").unwrap(), "pong:pre");
     let (tx, rx) = mpsc::sync_channel::<()>(1);
     let flag: Arc<Flag> = Arc::new(Flag(tx));
+    // Served before the link: a session nothing reads refuses it.
+    let serve = client.spawn_serve().expect("spawn_serve");
     root.link_to_death(Arc::downgrade(&flag) as _)
         .expect("link_to_death");
-    let serving = client.clone();
-    let serve = std::thread::spawn(move || serving.serve_blocking());
 
     std::thread::sleep(Duration::from_millis(200));
     client.close_session();
@@ -236,9 +226,144 @@ fn vsock_session_shutdown_ends_serve_thread() {
     drop(client);
     server.stop_accepting();
     server.join_workers();
-    // Surface an accept-loop panic instead of discarding it — a future
-    // regression there would otherwise leave every test green.
+    // Surface an accept-loop panic; discarding it would leave every test green.
     if let Err(p) = bg.join() {
-        eprintln!("WARNING: vsock accept loop panicked: {p:?}");
+        std::panic::resume_unwind(p);
     }
+}
+
+/// Plan 10-7 Phase 0: off-handler callbacks, twoway and oneway; `WouldBlock` without incoming.
+#[test]
+#[ignore = "needs Linux vsock loopback (modprobe vsock_loopback) or a peer VM"]
+fn entry_vsock_incoming_connections_carry_callbacks() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    use vsock::VMADDR_CID_LOCAL;
+
+    const TX_HOLD: TransactionCode = FIRST_CALL_TRANSACTION + 1;
+    struct Holder(Arc<Mutex<Option<SIBinder>>>);
+    impl Interface for Holder {}
+    impl Remotable for Holder {
+        fn descriptor() -> &'static str {
+            DESC
+        }
+        fn on_transact(
+            &self,
+            code: TransactionCode,
+            r: &mut Parcel,
+            reply: &mut Parcel,
+        ) -> Result<()> {
+            match code {
+                TX_HOLD => {
+                    *self.0.lock().unwrap() = Some(r.read()?);
+                    reply.write(&Status::from(StatusCode::Ok))
+                }
+                _ => Err(StatusCode::UnknownTransaction),
+            }
+        }
+        fn on_dump(&self, _w: &mut dyn std::io::Write, _a: &[String]) -> Result<()> {
+            Ok(())
+        }
+    }
+    struct CountingPing(Arc<AtomicUsize>);
+    impl Interface for CountingPing {}
+    impl IPing for CountingPing {
+        fn ping(&self, s: &str) -> Result<String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(format!("pong:{s}"))
+        }
+    }
+    let hold = |holder: &SIBinder, cb: &SIBinder| -> Result<()> {
+        let rp = (**holder)
+            .as_any()
+            .downcast_ref::<rsbinder::rpc::RpcProxy>()
+            .expect("RpcProxy");
+        let mut d = rp.build_request(DESC)?;
+        d.write(cb)?;
+        let mut r = rp
+            .transact(TX_HOLD, &d, 0)?
+            .ok_or(StatusCode::UnexpectedNull)?;
+        let st: Status = r.read()?;
+        if st.is_ok() {
+            Ok(())
+        } else {
+            Err(StatusCode::from(st))
+        }
+    };
+    let held = Arc::new(Mutex::new(None::<SIBinder>));
+    // Twoway, then oneway, from a fresh thread: inside no handler.
+    let call_back = || {
+        let cb = held.lock().unwrap().take().expect("a held callback");
+        std::thread::spawn(move || {
+            let twoway = ping_via(&cb, "outside");
+            let rp = (*cb)
+                .as_any()
+                .downcast_ref::<rsbinder::rpc::RpcProxy>()
+                .expect("RpcProxy");
+            let oneway = rp.build_request(DESC).and_then(|mut d| {
+                d.write(&"oneway")?;
+                rp.transact(TX_PING, &d, rsbinder::FLAG_ONEWAY).map(|_| ())
+            });
+            (twoway, oneway)
+        })
+        .join()
+        .expect("caller thread")
+    };
+    let counting = || {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cb = Interface::as_binder(&Binder::new(BnPing(Box::new(CountingPing(Arc::clone(
+            &calls,
+        ))))));
+        (cb, calls)
+    };
+
+    let port = TEST_PORT + 3;
+    let uri = format!("vsock://{VMADDR_CID_LOCAL}:{port}?profile=android13plus");
+    let _guard = rsbinder::serve(&uri)
+        .expect("serve vsock://")
+        .add(
+            "holder",
+            Interface::as_binder(&Binder::new(Holder(Arc::clone(&held)))),
+        )
+        .expect("add")
+        .spawn()
+        .expect("spawn");
+
+    // Control: no incoming connection, nothing for the server to send on.
+    {
+        let client = rsbinder::Client::open(&uri).expect("open vsock://");
+        let (cb, calls) = counting();
+        hold(&client.binder("holder").expect("holder"), &cb).expect("hold");
+        let (twoway, oneway) = call_back();
+        assert_eq!(twoway, Err(StatusCode::WouldBlock));
+        assert_eq!(oneway, Err(StatusCode::WouldBlock));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    let client = rsbinder::Client::open_with(&uri, |o, _| o.incoming_connections = Some(1))
+        .expect("open vsock:// with an incoming connection");
+    let session = client.session().expect("rpc session").clone();
+    let (cb, calls) = counting();
+    hold(&client.binder("holder").expect("holder"), &cb).expect("hold");
+    let has_callbacks = client.caps().contains(rsbinder::TransportCaps::CALLBACKS);
+    let (twoway, oneway) = call_back();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while calls.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Off-thread under a deadline: an incoming thread `close_session` fails to wake would hang.
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        session.close_session();
+        let _ = tx.send(session.__incoming_thread_live_count());
+    });
+    let live = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("close_session did not return");
+    assert!(has_callbacks, "an incoming connection grants CALLBACKS");
+    assert_eq!(twoway.as_deref(), Ok("pong:outside"));
+    assert_eq!(oneway, Ok(()));
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "the oneway never landed");
+    assert_eq!(live, 0, "incoming thread still running after close_session");
 }

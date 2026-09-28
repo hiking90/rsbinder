@@ -23,23 +23,11 @@ struct Service {
     has_clients: bool,
     guarantee_client: bool,
     context: rsbinder::thread_state::CallingContext,
-    /// Descriptor-based accessor marking. Set at `addService` time by
-    /// checking whether `binder.descriptor()` equals
-    /// `"android.os.IAccessor"`. AOSP's servicemanager distinguishes
-    /// accessors via VINTF `<accessor>` entries; without VINTF,
-    /// descriptor inspection is the closest semantic equivalent (the
-    /// binder itself self-identifies as `IAccessor`). When `true`,
-    /// `getService2`/`checkService2` wraps the binder in
-    /// `Service::Accessor(Some(binder))` instead of
-    /// `Service::ServiceWithMetadata`, so the consume-side accessor
-    /// arm in `rsbinder::hub::servicemanager_16` picks it up.
+    /// Descriptor is `android.os.IAccessor`; stands in for AOSP's VINTF `<accessor>` entries.
     is_accessor: bool,
 }
 
-/// A callback invocation deferred until after the `Inner` mutex guard is
-/// dropped. Collected while holding the lock, fired afterwards — outbound
-/// binder transactions must never run while holding state (R1), and AOSP's
-/// servicemanager likewise fans out callbacks without holding its lock.
+/// Collected under the `Inner` lock, fired after it drops: no outbound transaction under it (R1).
 enum PendingCallback {
     Registration {
         callback:
@@ -72,23 +60,12 @@ impl PendingCallback {
     }
 }
 
-/// Fire each collected callback after the caller has dropped the `Inner`
-/// guard. Order is preserved (collection order = invocation order). Errors
-/// are logged and swallowed — matches the prior in-lock notification paths.
+/// Errors are logged, not returned: one dead callback must not fail the call that fired it.
 fn fire_pending(pending: Vec<PendingCallback>) {
     for cb in pending {
         cb.fire()
             .unwrap_or_else(|e| log::error!("Failed to notify client callback: {e:?}"));
     }
-}
-
-/// Like [`fire_pending`] but propagates the first callback error, preserving
-/// `addService`'s original error-propagating semantics for `onRegistration`.
-fn fire_pending_propagate(pending: Vec<PendingCallback>) -> rsbinder::BinderResult<()> {
-    for cb in pending {
-        cb.fire()?;
-    }
-    Ok(())
 }
 
 struct DeathRecipientWrapper(mpsc::Sender<rsbinder::WIBinder>);
@@ -101,62 +78,26 @@ impl rsbinder::DeathRecipient for DeathRecipientWrapper {
     }
 }
 
-/// Lock the registry mutex, recovering from poisoning instead of
-/// propagating it. The service manager is the single point of failure for
-/// the whole device's IPC: every transaction handler runs under
-/// `catch_unwind`, so a panic *under* the guard poisons the mutex rather
-/// than crashing the process — and a plain `.lock().unwrap()` would then
-/// turn that one panic into a permanent outage (every subsequent request,
-/// and the death-notification thread, would panic on the poison).
-/// `into_inner` always yields a type-valid `Inner`, and the worst surviving
-/// inconsistency from a panic mid-section is a leaked death link or a
-/// skipped notification — never a corrupted map or a deadlock — so
-/// continuing on the recovered state degrades gracefully rather than
-/// wedging device IPC.
+/// Handlers run under `catch_unwind`, so one panic would poison every later request; recover.
 fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// The name `rsb_hub` publishes itself under, so clients can reach the
-/// service manager through the registry as well as through handle 0.
-/// Matches AOSP `main.cpp`'s `addService("manager", ...)`.
+/// AOSP `main.cpp`'s `addService("manager", ...)`.
 const SELF_SERVICE_NAME: &str = "manager";
 
-/// Upper bound on registration / client callbacks held per service name.
-/// `registerForNotifications` has no uid gating on Linux, so without a cap
-/// (and identity de-duplication) a client could loop-register to grow the
-/// heap without bound and multiply every per-service notification by the
-/// duplicate count. AOSP relies on SELinux/uid admission that rsb_hub does
-/// not have; this is the defense in its place. Generous enough that no
-/// legitimate caller hits it.
+/// Per-name callback cap, in place of AOSP's SELinux/uid admission that rsb_hub lacks.
 const MAX_CALLBACKS_PER_NAME: usize = 256;
 
-/// Upper bound on the number of *distinct service names* held in each registry
-/// map (`name_to_service`, `name_to_registration_callbacks`,
-/// `name_to_client_callbacks`). `MAX_CALLBACKS_PER_NAME` caps callbacks per
-/// name but not the number of names, so without this a single client could
-/// loop over distinct names (`addService("svc.{i}")`,
-/// `registerForNotifications("svc.{i}")`, ...) and grow the heap without bound.
-/// Like `MAX_CALLBACKS_PER_NAME`, this is the defense in place of the
-/// SELinux/uid admission AOSP relies on and rsb_hub lacks. Generous enough that
-/// no real device (a few hundred services) hits it.
+/// Distinct names per registry map: the per-name cap does not stop looping over new names.
 const MAX_DISTINCT_NAMES: usize = 10_000;
 
-/// True when inserting `name` would add a *new* distinct key to a registry
-/// `map` that already holds `MAX_DISTINCT_NAMES` names. Overwriting an existing
-/// key never grows the map, so it is always allowed. Factored out for testing.
+/// Overwriting an existing key never grows the map, so only a new key can exceed the cap.
 fn distinct_name_cap_exceeded<V>(map: &BTreeMap<String, V>, name: &str) -> bool {
     !map.contains_key(name) && map.len() >= MAX_DISTINCT_NAMES
 }
 
-/// One kernel death subscription, and how many registry entries currently
-/// depend on it.
-///
-/// The binder is held *weakly*: the maps that need it alive already hold it
-/// strongly, and a strong reference here would keep a proxy — and its
-/// kernel ref — alive past the registry entry that justified it. The weak
-/// reference is what an obituary carries, so it is also what
-/// [`Inner::retire_dead_binder`] matches on.
+/// Weak so it cannot outlive its registry entries; it is also what an obituary matches on.
 struct DeathLink {
     weak: rsbinder::WIBinder,
     count: usize,
@@ -164,24 +105,7 @@ struct DeathLink {
 
 struct Inner {
     death_recipient: Arc<DeathRecipientWrapper>,
-    /// Death subscriptions, one per proxy handle, reference-counted by the
-    /// number of registry entries depending on each.
-    ///
-    /// `ProxyHandle::link_to_death` appends to a per-proxy `Vec` without
-    /// deduplicating and `unlink_to_death` removes a single entry, so a
-    /// registry that links and unlinks ad hoc drifts in both directions.
-    /// It drifted both ways: one binder registered under K names took K
-    /// subscriptions and so fired `binder_died` K times, each a full
-    /// O(registry) cleanup sweep; and `unregisterForNotifications` removed
-    /// the callback without unlinking, so every register/unregister cycle
-    /// left another subscription behind — unbounded, and reached by any
-    /// local caller, which is exactly what `MAX_CALLBACKS_PER_NAME` exists
-    /// to prevent.
-    ///
-    /// Counting here makes the pairing structural: link on 0→1, unlink on
-    /// 1→0, and neither drift is expressible. Keyed by handle because that
-    /// is what the kernel subscription is keyed by; native (`Bn*`) binders
-    /// have no death notification and are skipped.
+    /// Link on 0→1, unlink on 1→0: `link_to_death` does not dedupe, so ad hoc pairing drifts.
     death_links: BTreeMap<u32, DeathLink>,
     name_to_service: BTreeMap<String, Service>,
     name_to_registration_callbacks: BTreeMap<
@@ -195,22 +119,10 @@ struct Inner {
 }
 
 impl Inner {
-    /// "Known clients" subtraction passed to
-    /// [`Inner::handle_service_client_callback`] from **on-demand**
-    /// callsites (`addService`, `tryGetBinder`, `registerClientCallback`,
-    /// `tryUnregisterService`). The active binder transaction holds one
-    /// ref + servicemanager holds one ref ⇒ `2`. Matches AOSP
-    /// `ServiceManager.cpp:1109` (`constexpr size_t kKnownClients = 2`).
+    /// The in-flight transaction's ref plus ours; AOSP `kKnownClients = 2`.
     const KNOWN_CLIENTS_ON_DEMAND: usize = 2;
 
-    /// "Known clients" subtraction passed from the **periodic poller**
-    /// ([`ServiceManager::run_client_callback_poller`]). The poller runs
-    /// outside any binder transaction, so only servicemanager's own ref
-    /// counts as "known" ⇒ `1`. Matches AOSP `ServiceManager.cpp:985`
-    /// (`handleClientCallbacks` body: `handleServiceClientCallback(1
-    /// /* sm has one refcount */, name, true)`). Using `2` here would
-    /// under-count, masking the presence of a single real client and
-    /// firing spurious `onClients(false)` notifications.
+    /// The poller runs outside any transaction, so only our own ref; AOSP passes `1` there too.
     const KNOWN_CLIENTS_PERIODIC: usize = 1;
 
     fn new(death_sender: mpsc::Sender<rsbinder::WIBinder>) -> Self {
@@ -228,13 +140,7 @@ impl Inner {
         Ok(())
     }
 
-    /// Start depending on `binder`'s death notification, taking the kernel
-    /// subscription if this is the first dependant.
-    ///
-    /// A native binder cannot be linked and is silently skipped, so callers
-    /// do not need to test for it. Every successful call must be paired
-    /// with exactly one [`Inner::release_death_link`] or, once the binder
-    /// has died, one [`Inner::retire_dead_binder`].
+    /// Pair each `Ok` with one `release_death_link` or `retire_dead_binder`; native = no-op.
     fn retain_death_link(&mut self, binder: &SIBinder) -> rsbinder::BinderResult<()> {
         let Some(handle) = binder.as_proxy().map(|proxy| proxy.handle()) else {
             return Ok(());
@@ -247,18 +153,7 @@ impl Inner {
         })
     }
 
-    /// Bookkeeping half of [`Inner::retain_death_link`], with the kernel
-    /// call passed in.
-    ///
-    /// Split because the two halves fail differently: taking a subscription
-    /// needs a live proxy and so a live binder device, while the accounting
-    /// is pure — and the accounting is what drifted. The seam lets a test
-    /// assert *how many times* the kernel call happens for a given sequence
-    /// of retains and releases, which is the property that was wrong.
-    ///
-    /// `link` runs only when this is the first dependant, and the entry is
-    /// recorded only if it succeeds — a failed link leaves no accounting
-    /// behind to release.
+    /// Kernel call injected so tests can count links; a failed `link` records nothing.
     fn retain_counted(
         &mut self,
         handle: u32,
@@ -280,13 +175,7 @@ impl Inner {
         Ok(())
     }
 
-    /// Stop depending on `binder`'s death notification, dropping the kernel
-    /// subscription once nothing depends on it.
-    ///
-    /// Dropping it matters: `ProxyHandle::Drop` does not clear the kernel
-    /// subscription (rsbinder has no `~Service` hook the way AOSP does), so
-    /// a registration that is replaced or unregistered would otherwise leak
-    /// a `BC_REQUEST_DEATH_NOTIFICATION` for the rest of the process's life.
+    /// `ProxyHandle::Drop` does not clear the kernel subscription, so an unpaired one leaks.
     fn release_death_link(&mut self, binder: &SIBinder) {
         let Some(handle) = binder.as_proxy().map(|proxy| proxy.handle()) else {
             return;
@@ -294,9 +183,7 @@ impl Inner {
         let recipient: Arc<dyn rsbinder::DeathRecipient> = self.death_recipient.clone();
         self.release_counted(handle, || {
             if let Err(e) = binder.unlink_to_death(Arc::downgrade(&recipient)) {
-                // A binder that died between its obituary and this call is
-                // the ordinary racing case — not worth a warning on every
-                // service restart.
+                // Died before this call: the ordinary race on every service restart.
                 if e == rsbinder::StatusCode::DeadObject {
                     log::debug!("death notification for handle {handle} was already gone");
                 } else {
@@ -306,10 +193,7 @@ impl Inner {
         });
     }
 
-    /// Bookkeeping half of [`Inner::release_death_link`]; see
-    /// [`Inner::retain_counted`] for why it is split. `unlink` runs, and the
-    /// entry is dropped, only when the last dependant goes away. A release
-    /// with no matching entry is ignored rather than underflowing.
+    /// A release with no matching entry is ignored rather than underflowing.
     fn release_counted(&mut self, handle: u32, unlink: impl FnOnce()) {
         let Some(link) = self.death_links.get_mut(&handle) else {
             return;
@@ -322,9 +206,7 @@ impl Inner {
         self.death_links.remove(&handle);
     }
 
-    /// Mutate `service.has_clients` under the lock and *collect* (do not
-    /// invoke) the resulting `onClients` notifications into `pending`. The
-    /// caller fires them via [`fire_pending`] after dropping the guard (R1).
+    /// Collects `onClients` into `pending`; the caller fires them after dropping the guard (R1).
     fn send_client_callback_notification(
         &mut self,
         service_name: &str,
@@ -342,12 +224,7 @@ impl Inner {
         };
 
         if service.has_clients == has_clients {
-            // AOSP's servicemanager treats this with `CHECK_NE` (process
-            // abort) — same invariant ("we only notify on state
-            // transitions"), but losing the SM kills the whole machine
-            // on Linux too. Demote to a loud error + no-op; the only
-            // visible consequence of a spurious duplicate is a missed
-            // diagnostic, not corrupted state.
+            // AOSP aborts (`CHECK_NE`); losing the hub takes all IPC down, so log instead.
             log::error!(
                 "send_client_callback_notification called with the same state {has_clients} when {context} — ignored"
             );
@@ -383,8 +260,7 @@ impl Inner {
         }
     }
 
-    /// Like its name suggests, but collects callbacks into `pending` instead
-    /// of invoking them (see [`Inner::send_client_callback_notification`]).
+    /// AOSP `handleServiceClientCallback`, collecting callbacks into `pending`.
     fn handle_service_client_callback(
         &mut self,
         known_clients: usize,
@@ -405,13 +281,7 @@ impl Inner {
             return Ok(true);
         };
 
-        // `strong_ref_count_for_node` is a kernel-binder ioctl over a
-        // `ProxyHandle`; it has no analogue for native (Bn*) services
-        // hosted in this process, since the kernel never sees their
-        // refcount. AOSP's servicemanager can't be queried for its own
-        // refcount either; we mirror that by reporting `has_clients =
-        // true` (the safe over-estimate that suppresses spurious
-        // `onClients(false)` notifications).
+        // No kernel refcount for a local binder: over-estimate, as AOSP's `count == -1`.
         let Some(proxy) = service.binder.as_proxy() else {
             return Ok(true);
         };
@@ -438,17 +308,9 @@ impl Inner {
             }
 
             if let Some(service) = self.name_to_service.get_mut(service_name) {
-                service.has_clients = true;
-                // Guarantee is temporary — fired (or skipped) above; reset so
-                // subsequent (periodic-poll or on-demand) entries don't
-                // re-trigger the "guaranteed in use" branch every call.
-                // Mirrors AOSP `ServiceManager.cpp:1012`. Without this
-                // reset the 5s poller ping-pongs onClients(true/false)
-                // every cycle for any service that ever guaranteed a
-                // client (i.e., that anyone ever called `tryGetBinder`
-                // on), defeating the lazy-service contract.
+                // Temporary, as AOSP `ServiceManager.cpp:1004`; `has_clients` moves only on notify.
                 service.guarantee_client = false;
-                has_clients = true;
+                has_clients = service.has_clients;
             }
         }
 
@@ -479,15 +341,7 @@ impl Inner {
         Ok(has_clients)
     }
 
-    /// Look up a registered service by name.
-    ///
-    /// The metadata rides along because `getService2`/`checkService2` put it
-    /// on the wire; see [`Lookup`].
-    /// No `start_if_not_found`: AOSP takes it here, but starting a service
-    /// means spawning a process, and this runs under the registry lock.
-    /// `getService` triggers the start itself, after the lock is dropped
-    /// and the reply is decided — see
-    /// [`ServiceManager::try_start_service`].
+    /// No `start_if_not_found` as in AOSP: this runs under the lock; callers start after it.
     fn try_get_binder(
         &mut self,
         name: &str,
@@ -516,17 +370,7 @@ impl Inner {
         }))
     }
 
-    /// Drop every registration callback for `binder` under `name`, and
-    /// return how many entries went.
-    ///
-    /// The count, not a bool: each entry holds one reference on the
-    /// callback's death subscription, so `unregisterForNotifications` has
-    /// to release exactly as many as it removed.
-    ///
-    /// Matches on binder identity (`Arc` pointer equality), which is what
-    /// the proxy cache guarantees for two references to the same live
-    /// handle. The dead-binder path cannot use this and goes through
-    /// [`Inner::retire_dead_binder`] instead.
+    /// Returns a count: each removed entry holds one death-link reference to release.
     fn remove_registration_callback(&mut self, name: &str, binder: &SIBinder) -> usize {
         let mut removed = 0;
         if let Some(callbacks) = self.name_to_registration_callbacks.get_mut(name) {
@@ -542,16 +386,7 @@ impl Inner {
         removed
     }
 
-    /// Drop every registration owned by a binder that has died: its service
-    /// names, its registration callbacks, its client callbacks, and its
-    /// death-subscription record. Returns `(services, callbacks)` retired.
-    ///
-    /// Matching `who` against a stored `SIBinder` is only sound because
-    /// [`SIBinder::downgrade`] takes a proxy's identity from the proxy
-    /// itself. It used to read it from the proxy cache, which the obituary
-    /// retires *before* dispatching — so this comparison answered `false`
-    /// for every binder and each death retired nothing, leaving the
-    /// registry to hand out dead binders and hold their names forever.
+    /// Matching relies on `SIBinder::downgrade` not reading the proxy cache the obituary clears.
     fn retire_dead_binder(&mut self, who: &rsbinder::WIBinder) -> (usize, usize) {
         let before = self.name_to_service.len();
         self.name_to_service
@@ -568,17 +403,13 @@ impl Inner {
             !entries.is_empty()
         });
 
-        // AOSP `ServiceManager::binderDied`'s third loop: without this the
-        // dead `IClientCallback` is held for the lifetime of rsb_hub and
-        // `onClients` keeps firing at a dead proxy on every state change.
+        // AOSP `binderDied`'s third loop; else `onClients` keeps firing at a dead proxy.
         self.name_to_client_callbacks.retain(|_, entries| {
             entries.retain(|callback| *who != callback.as_binder());
             !entries.is_empty()
         });
 
-        // Last: the entries above each held a reference on this
-        // subscription, and the kernel released it when it sent the
-        // obituary, so there is nothing to unlink.
+        // No unlink: the kernel dropped the subscription when it sent the obituary.
         self.death_links.retain(|_, link| link.weak != *who);
 
         (services, callbacks)
@@ -587,14 +418,11 @@ impl Inner {
 
 struct ServiceManager {
     inner: Arc<Mutex<Inner>>,
-    /// When `false` (the default), `addService` refuses to overwrite a live
-    /// registration owned by a different UID — the signature of a
-    /// service-name hijack. `--allow-cross-uid-overwrite` sets it `true`
-    /// for deployments that intentionally re-register across UIDs.
+    /// Held from collecting to firing, taken before `inner`: oneway fires keep their order.
+    fire_order: Arc<Mutex<()>>,
+    /// `--allow-cross-uid-overwrite`; off, a cross-UID overwrite is refused as a hijack.
     allow_cross_uid_overwrite: bool,
-    /// Per-name `add`/`find`/`list` access control. Every AIDL entry point
-    /// consults this before touching the registry; see
-    /// [`ServiceManager::require`] and `plans/6-1-hub-access-control.md`.
+    /// Consulted before the registry by every entry point; `plans/6-1-hub-access-control.md`.
     enforcer: Arc<Enforcer>,
     /// Brings a declared service up when a lookup misses it.
     activator: Activator,
@@ -618,6 +446,7 @@ impl ServiceManager {
 
         let this = Self {
             inner: Arc::new(Mutex::new(Inner::new(death_sender))),
+            fire_order: Arc::new(Mutex::new(())),
             allow_cross_uid_overwrite,
             enforcer,
             activator,
@@ -639,10 +468,7 @@ impl ServiceManager {
                         let mut inner = lock_recover(&inner_clone);
                         inner.retire_dead_binder(&who)
                     };
-                    // Worth a line even at zero: a death that retires nothing
-                    // means the obituary matched no registration, which is
-                    // the shape this cleanup failing takes — and when it
-                    // fails the registry keeps handing out a dead binder.
+                    // Logged at zero too: retiring nothing is how a broken match shows.
                     log::info!(
                         "binder died: retired {services} service name(s) and \
                          {callbacks} registration callback(s)"
@@ -650,39 +476,18 @@ impl ServiceManager {
                 }
             });
         if let Err(e) = spawn_result {
-            log::error!("Failed to spawn death receiver thread: {e}");
+            log::error!("Failed to spawn death receiver thread, exiting: {e}");
+            std::process::exit(1);
         }
     }
 
-    /// AOSP parity: mirror of `ClientCallbackCallback`
-    /// (`frameworks/native/cmds/servicemanager/main.cpp:91-144`) — on a
-    /// 5-second cadence, walk every registered service and call
-    /// [`Inner::handle_service_client_callback`] with
-    /// `is_called_on_interval = true`.
-    ///
-    /// Without this, lazy services never receive the `onClients(false)`
-    /// notification that tells them to shut down: the on-demand
-    /// callsites scattered through `addService` / `try_get_binder` /
-    /// `registerClientCallback` all pass `is_called_on_interval =
-    /// false`, which by design short-circuits the "no clients" arm at
-    /// [`Inner::handle_service_client_callback`] (the comment at the
-    /// `is_called_on_interval` branch documents the contract).
-    ///
-    /// The poller holds a `Weak<Mutex<Inner>>` and exits when the
-    /// upgrade fails (i.e., the owning [`ServiceManager`] is dropped).
-    /// In production the SM lives for the whole process lifetime, so
-    /// the exit branch is primarily a test-cleanup convenience; in
-    /// tests it lets the thread die without an extra shutdown channel.
+    /// AOSP `ClientCallbackCallback`: the only source of `onClients(false)` for lazy services.
     fn run_client_callback_poller(&self) {
-        /// 5-second cadence matches AOSP `kClientCallbackCheckInterval`
-        /// (`main.cpp:103-112` — timerfd interval). The per-call
-        /// "known clients" subtraction is [`Inner::KNOWN_CLIENTS_PERIODIC`]
-        /// (= 1, matches AOSP `ServiceManager.cpp:985`), distinct from
-        /// the on-demand callsites' [`Inner::KNOWN_CLIENTS_ON_DEMAND`]
-        /// (= 2) because the poller runs outside any binder transaction.
+        /// AOSP `main.cpp` timerfd interval.
         const INTERVAL: Duration = Duration::from_secs(5);
 
         let inner_weak = Arc::downgrade(&self.inner);
+        let fire_order = Arc::clone(&self.fire_order);
         let spawn_result = std::thread::Builder::new()
             .name("rsb_hub:cbpoll".to_owned())
             .spawn(move || loop {
@@ -693,19 +498,10 @@ impl ServiceManager {
                     return;
                 };
 
-                // Recover from poisoning rather than exiting: if the poller
-                // gave up here, lazy services would never again receive their
-                // periodic `onClients(false)` and could never shut down. The
-                // guarded state is a self-contained map mutation, so the
-                // recovered state is safe to continue from.
+                let order = lock_recover(&fire_order);
                 let mut inner = lock_recover(&inner_arc);
 
-                // Snapshot the names before iterating so we don't hold a
-                // borrow into `name_to_service` across calls that may
-                // mutate it (e.g., `send_client_callback_notification`
-                // writing back `service.has_clients`). The map is small
-                // (one entry per registered service) — a transient `Vec`
-                // is cheaper than the alternative refactor.
+                // Snapshot: the loop body mutates `name_to_service`.
                 let names: Vec<String> = inner.name_to_service.keys().cloned().collect();
                 let mut pending = Vec::new();
                 for name in &names {
@@ -720,50 +516,19 @@ impl ServiceManager {
                 }
                 drop(inner);
                 fire_pending(pending);
+                drop(order);
             });
         if let Err(e) = spawn_result {
-            log::error!("Failed to spawn client callback poller thread: {e}");
+            log::error!("Failed to spawn client callback poller thread, exiting: {e}");
+            std::process::exit(1);
         }
     }
 
     fn is_valid_service_name(name: &str) -> bool {
-        if name.is_empty() || name.len() > 127 {
-            return false;
-        }
-        for c in name.chars() {
-            if c == '_' || c == '-' || c == '.' || c == '/' {
-                continue;
-            }
-            if c.is_ascii_lowercase() {
-                continue;
-            }
-            if c.is_ascii_uppercase() {
-                continue;
-            }
-            if c.is_ascii_digit() {
-                continue;
-            }
-            return false;
-        }
-
-        true
+        config::is_valid_service_name(name)
     }
 
-    /// May the current caller exercise `permission` on `name`?
-    ///
-    /// `rsbinder::calling_caller()` is `None` exactly when this thread is
-    /// not dispatching a binder transaction. For `rsb_hub` that is one call
-    /// and one only: publishing itself as [`SELF_SERVICE_NAME`] at startup,
-    /// which the generated code routes as a direct Rust call rather than a
-    /// transaction. There is no remote peer to authorize, and a policy
-    /// cannot be expected to grant the hub access to itself.
-    ///
-    /// The bypass is scoped to exactly that permission and that name rather
-    /// than to "no transaction" in general: a request that arrived over
-    /// binder is always inside a transaction, but `rsb_hub`'s own
-    /// death-notification and client-callback-poller threads are not, and
-    /// if either ever grows a path through here it must be denied, not
-    /// waved through. See `plans/6-1-hub-access-control.md` D10.
+    /// No caller = startup self-registration only; hub threads must not get a bypass (6-1 D10).
     fn allows(&self, permission: Permission, name: &str) -> bool {
         match rsbinder::calling_caller() {
             Some(caller) => self.enforcer.check_caller(permission, name, &caller),
@@ -771,16 +536,7 @@ impl ServiceManager {
         }
     }
 
-    /// Ask for `name` to be started, if it is declared with a way to start
-    /// it. AOSP's `tryStartService`, with a declaration standing in for the
-    /// init property.
-    ///
-    /// Only `getService`/`getService2` reach this — `checkService` is
-    /// documented as non-blocking and must not have side effects. It
-    /// returns immediately either way: the start runs on its own thread,
-    /// and the caller has already answered "not registered". What tells the
-    /// client the service came up is the registration notification it is
-    /// waiting on, exactly as on Android.
+    /// AOSP `tryStartService`; `getService*` only: `checkService` must not start anything.
     fn try_start_service(&self, name: &str) {
         let config = self.enforcer.config();
         match config.declarations.activation(name) {
@@ -792,15 +548,7 @@ impl ServiceManager {
         }
     }
 
-    /// [`Self::allows`], as a `Result` for the entry points whose denial is
-    /// reported to the caller as `EX_SECURITY`.
-    ///
-    /// The *lookup* entry points do not use this: AOSP's `tryGetBinder`
-    /// returns an empty result rather than an error when `canFind` fails
-    /// (`ServiceManager.cpp:468-470`), and `getService` is documented to
-    /// return ok regardless. Reporting a denied lookup as "not registered"
-    /// also keeps a denied caller from using the error to probe which names
-    /// exist.
+    /// Not for lookups: AOSP `tryGetBinder` answers a denied find with null, not an error.
     fn require(&self, permission: Permission, name: &str) -> rsbinder::BinderResult<()> {
         if self.allows(permission, name) {
             return Ok(());
@@ -814,17 +562,7 @@ impl ServiceManager {
         Err((ExceptionCode::Security, msg.as_str()).into())
     }
 
-    /// Add-time access-control decision for an `addService` that would
-    /// overwrite an existing registration: returns `true` when the
-    /// overwrite must be rejected as a likely service-name hijack.
-    ///
-    /// Rejected iff the operator has NOT opted into cross-UID overwrites,
-    /// the incoming binder is a *different* object than the one registered
-    /// (`!same_binder`), AND the caller's UID differs from the registrant's.
-    /// A same-UID overwrite (e.g. a service restart under a new PID) and a
-    /// re-registration of the identical binder are always allowed. Pure and
-    /// total so the security-relevant branch is unit-testable without two
-    /// real OS UIDs.
+    /// Pure so the hijack check is testable without two real UIDs.
     fn is_cross_uid_overwrite_rejected(
         allow_cross_uid_overwrite: bool,
         same_binder: bool,
@@ -835,11 +573,7 @@ impl ServiceManager {
     }
 }
 
-/// One registry row, copied out from under the mutex.
-///
-/// The rendering pass runs outside the lock because the per-name `find`
-/// filter it depends on resolves group membership, which can hit the name
-/// service — the same reason [`IServiceManager::listServices`] snapshots.
+/// Copied out of the lock: the `find` filter can hit the name service.
 struct DumpRow {
     name: String,
     pid: i32,
@@ -852,15 +586,10 @@ struct DumpRow {
     client_callbacks: usize,
 }
 
-/// Everything [`render_dump`] needs, so the renderer is pure and testable
-/// without a registry, a policy, or a live binder.
+/// Everything [`render_dump`] needs, so it is testable without a registry or binder.
 struct DumpSnapshot {
     services: Vec<DumpRow>,
-    /// Names something is *waiting* on: a registration or client callback
-    /// is held for them, but nothing has registered. AOSP has no equivalent
-    /// (its `servicemanager` does not implement `dump` at all) — but "who is
-    /// blocked on a service that never came up" is the question an operator
-    /// actually arrives with.
+    /// Names with callbacks held but nothing registered.
     awaited: Vec<(String, usize, usize)>,
     death_subscriptions: usize,
     /// `None` when running under `--insecure-allow-all`.
@@ -872,16 +601,11 @@ struct DumpSnapshot {
     hidden: usize,
 }
 
-/// True when `name` passes the caller-supplied `args` filter. An empty
-/// filter passes everything; otherwise a substring match against any arg
-/// is enough, which is what makes `rsb_service dump manager IFoo` useful
-/// without teaching the hub a pattern syntax.
+/// Empty passes all; else a substring of any arg, so the hub needs no pattern syntax.
 fn dump_filter_matches(filter: &[String], name: &str) -> bool {
     filter.is_empty() || filter.iter().any(|f| name.contains(f.as_str()))
 }
 
-/// Render a registry snapshot as the `dumpsys`-style text a
-/// `DUMP_TRANSACTION` returns.
 fn render_dump(w: &mut dyn std::io::Write, snap: &DumpSnapshot) -> std::io::Result<()> {
     writeln!(w, "rsb_hub {}", env!("CARGO_PKG_VERSION"))?;
     match snap.rules {
@@ -951,15 +675,8 @@ fn yes_no(b: bool) -> &'static str {
 }
 
 impl ServiceManager {
-    /// Copy the registry out from under the mutex for [`render_dump`],
-    /// keeping only what this caller is allowed to see.
-    ///
-    /// The `find` filter runs *outside* the lock, as in
-    /// [`IServiceManager::listServices`]: it resolves group membership,
-    /// which can hit the name service, and no binder-visible state may be
-    /// held across that (R1).
+    /// The `find` filter runs outside the lock: it can hit the name service (R1).
     fn dump_snapshot(&self, filter: Vec<String>) -> DumpSnapshot {
-        /// How many callbacks a name holds in one of the callback maps.
         /// Generic because the two maps hold different callback traits.
         fn count<V>(map: &BTreeMap<String, Vec<V>>, name: &str) -> usize {
             map.get(name).map_or(0, |v| v.len())
@@ -1000,8 +717,7 @@ impl ServiceManager {
             (rows, awaited, inner.death_links.len())
         };
 
-        // Narrow by the caller's own filter first, so `hidden` counts only
-        // what the *policy* withheld from what was asked for.
+        // Caller's filter first, so `hidden` counts only what the policy withheld.
         rows.retain(|row| dump_filter_matches(&filter, &row.name));
         awaited.retain(|(name, _, _)| dump_filter_matches(&filter, name));
 
@@ -1024,18 +740,7 @@ impl ServiceManager {
 }
 
 impl Interface for ServiceManager {
-    /// The registry as `rsb_hub` sees it — what `rsb_service dump manager`
-    /// prints, and what a `DUMP_TRANSACTION` to handle 0 returns.
-    ///
-    /// Not AOSP parity: `servicemanager` does not override `dump` at all,
-    /// because on Android the same questions are answered by `dumpsys -l`,
-    /// `service list` and the init/VINTF files. None of those exist on
-    /// Linux, so the hub answers them itself.
-    ///
-    /// Gated by `list`, like [`listServices`](IServiceManager::listServices)
-    /// and `getServiceDebugInfo`, with each name filtered by `find` on top:
-    /// a dump that named services the caller may not look up would be a way
-    /// around the per-name policy. `args` narrow the listing by substring.
+    /// Gated by `list`, each name by `find` too, else it would bypass the per-name policy.
     fn dump(&self, writer: &mut dyn std::io::Write, args: &[String]) -> rsbinder::Result<()> {
         if !self.allows(Permission::List, "") {
             let ctx = rsbinder::thread_state::CallingContext::default();
@@ -1044,9 +749,7 @@ impl Interface for ServiceManager {
                 ctx.uid,
                 ctx.pid
             );
-            // Written to the caller's fd as well as logged: the fd is the
-            // only channel `dump` has, and a caller that sees nothing at
-            // all cannot tell a denial from an empty registry.
+            // Also to the fd: its only channel, else a denial looks like an empty registry.
             let _ = writeln!(
                 writer,
                 "rsb_hub: policy denies `list` to uid={} (pid={})",
@@ -1066,29 +769,11 @@ impl Interface for ServiceManager {
 /// A registered service, as `getService2`/`checkService2` need to see it.
 struct Lookup {
     binder: SIBinder,
-    /// Stamped at `addService` time from the binder's own descriptor;
-    /// selects the `Service::Accessor` arm below.
     is_accessor: bool,
-    /// `dumpPriority & FLAG_IS_LAZY_SERVICE`, which the client uses to
-    /// decide whether the binder may be cached. AOSP's
-    /// `BackendUnifiedServiceManager::updateCache`
-    /// (`BackendUnifiedServiceManager.cpp:150-153`) returns early for a lazy
-    /// service, because a lazy service can be unregistered via
-    /// `tryUnregisterService` *without dying* — so no death notification
-    /// invalidates the cache, and the client would keep handing out a binder
-    /// to a service that has withdrawn.
+    /// Clients must not cache a lazy binder: it can unregister without dying.
     is_lazy: bool,
 }
 
-/// Convert a `Inner::try_get_binder` lookup result
-/// into the `Service` union arm shape returned by
-/// `getService2`/`checkService2`. Routes `is_accessor=true`
-/// registrations to `Service::Accessor(Some(_))` and regular services
-/// to `Service::ServiceWithMetadata`; the `None` arm preserves the
-/// prior placeholder behavior so the consume-side accessor arm + the
-/// process-local fallback in `rsbinder::hub::servicemanager_16` can
-/// still pick up locally-registered providers when servicemanager has
-/// no binder under this name.
 fn classify_for_service_union(
     lookup: Option<Lookup>,
 ) -> hub::android_16::android::os::Service::Service {
@@ -1107,13 +792,7 @@ fn classify_for_service_union(
             service: Some(binder),
             isLazyService: is_lazy,
         }),
-        // Not found. AOSP returns `serviceWithMetadata(nullptr)` for a
-        // missing non-accessor name, which an AOSP client routes into its
-        // local `getInjectedAccessor(name)` fallback; an `accessor(nullptr)`
-        // reply would instead just log and return null, skipping that
-        // fallback. rsbinder's own consume side runs
-        // `try_process_local_fallback` on this arm too (it handles
-        // `swm.service.is_none()` identically).
+        // As AOSP: only this arm, not `accessor(null)`, leads clients to their local fallback.
         None => Service::Service::ServiceWithMetadata(ServiceWithMetadata::ServiceWithMetadata {
             service: None,
             isLazyService: false,
@@ -1122,14 +801,12 @@ fn classify_for_service_union(
 }
 
 impl IServiceManager for ServiceManager {
-    /// Like AOSP's, this starts a declared service that is not running:
-    /// `getService` is the "start it if you have to" half of the pair, and
-    /// [`checkService`](Self::checkService) is the non-blocking half that
-    /// must not. See [`try_start_service`](Self::try_start_service).
+    /// Starts a declared service on a miss, as AOSP; `checkService` must not.
     fn getService(&self, name: &str) -> rsbinder::BinderResult<Option<rsbinder::SIBinder>> {
         if !self.allows(Permission::Find, name) {
             return Ok(None);
         }
+        let order = lock_recover(&self.fire_order);
         let mut pending = Vec::new();
         let result = {
             let mut inner = lock_recover(&self.inner);
@@ -1138,26 +815,14 @@ impl IServiceManager for ServiceManager {
                 .map(|found| found.binder)
         };
         fire_pending(pending);
+        drop(order);
         if result.is_none() {
             self.try_start_service(name);
         }
         Ok(result)
     }
 
-    /// Security note (Linux): unlike AOSP's `servicemanager`, this
-    /// implementation performs **no add-time access control**. AOSP
-    /// rejects app UIDs (`multiuser_get_app_id(uid) >= AID_APP`) and
-    /// runs the SELinux `canAddService` hook; both depend on Android's
-    /// UID model / policy and have no equivalent on a plain Linux host.
-    /// Consequently any client can register, or silently overwrite, any
-    /// service name — and a binder that reports the
-    /// `android.os.IAccessor` descriptor is trusted as an accessor on
-    /// the registrant's word alone (AOSP instead derives the accessor
-    /// relationship from a signed VINTF `<accessor>` manifest entry).
-    /// As a minimal mitigation we log a loud warning when a registration
-    /// overwrites an entry owned by a different uid/pid (the signature of
-    /// a hijack). Vendors needing real enforcement must wrap this with
-    /// their own authorization layer.
+    /// An `IAccessor` descriptor is trusted on the registrant's word; AOSP uses VINTF.
     fn addService(
         &self,
         name: &str,
@@ -1171,10 +836,7 @@ impl IServiceManager for ServiceManager {
             return Err(ExceptionCode::IllegalArgument.into());
         }
 
-        // Not fatal, and AOSP does not reject it either
-        // (`ServiceManager.cpp:539`) — but a service registered with no
-        // priority bit is invisible to every `listServices` filter, which is
-        // almost always a caller bug rather than an intent.
+        // AOSP accepts it too, but no priority bit hides it from every `listServices` filter.
         if dumpPriority & DUMP_FLAG_PRIORITY_ALL == 0 {
             log::warn!(
                 "addService: '{name}' registered with dumpPriority {dumpPriority:#x}, which sets \
@@ -1182,32 +844,20 @@ impl IServiceManager for ServiceManager {
             );
         }
 
-        // Detect `IAccessor` binders by interface descriptor at registration.
-        // Hardcoding the AOSP-stable `android.os.IAccessor` string (instead of
-        // pulling the `IAccessor` symbol) keeps rsb_hub buildable without the
-        // `rpc` feature. NOTE: self-asserted by the registrant — see the fn
-        // rustdoc for the trust caveat vs. AOSP's VINTF-derived accessors.
+        // A literal, not the `IAccessor` symbol, so rsb_hub builds without the `rpc` feature.
         let is_accessor = service.descriptor() == "android.os.IAccessor";
 
-        // Capture the registrant's identity once on this binder thread, so
-        // we can both stamp the new entry and detect cross-identity overwrites.
         let caller = rsbinder::thread_state::CallingContext::default();
 
-        // `allowIsolated` is accepted by AIDL for AOSP source
-        // compatibility but unused on Linux — there is no isolated-app
-        // sandbox UID range to gate on.
+        // Linux has no isolated-app UID range to gate on.
         let _ = allowIsolated;
 
-        // `client_pending` errors are swallowed (prior `onClients` path),
-        // `reg_pending` errors are propagated (prior `onRegistration` used `?`).
+        let _order = lock_recover(&self.fire_order);
         let mut client_pending = Vec::new();
         let mut reg_pending = Vec::new();
         let result: rsbinder::BinderResult<()> = (|| {
             let mut inner = lock_recover(&self.inner);
 
-            // distinct-name DoS cap: refuse a *new* service name once the
-            // registry is full (overwriting an existing name never grows the
-            // map, so it is still allowed). See `MAX_DISTINCT_NAMES`.
             if distinct_name_cap_exceeded(&inner.name_to_service, name) {
                 log::warn!(
                     "addService: service registry full (max {MAX_DISTINCT_NAMES} names), \
@@ -1217,27 +867,13 @@ impl IServiceManager for ServiceManager {
             }
 
             let mut prev_clients = false;
-            // `SIBinder: PartialEq` is `Arc::ptr_eq`, so this is binder
-            // identity: is the *same* object being re-registered under this
-            // name?
+            // `SIBinder: PartialEq` is `Arc::ptr_eq`: binder identity.
             let mut same_binder = false;
-            // The old binder being replaced, captured (cheap Arc clone) so it
-            // can be unlinked *after* the new one is linked — see below.
             let mut old_to_unlink: Option<SIBinder> = None;
             if let Some(existing) = inner.name_to_service.get(name) {
                 prev_clients = existing.has_clients;
                 same_binder = existing.binder == *service;
-                // Add-time access control (see fn rustdoc and
-                // `is_cross_uid_overwrite_rejected`). A cross-UID overwrite of
-                // a *different* live binder is the signature of a service-name
-                // hijack (MITM): AOSP rejects app UIDs and runs the SELinux
-                // canAddService hook, neither of which exists on a plain Linux
-                // host, so reject it by default. A same-UID re-registration
-                // (e.g. a service restart under a new PID) and re-registering
-                // the identical binder are always allowed; the owning UID
-                // dying frees the name via the death recipient, after which
-                // any UID may claim it. `--allow-cross-uid-overwrite` opts
-                // back into the prior permissive (warn-only) behavior.
+                // Stands in for AOSP's app-UID and SELinux `canAddService` checks.
                 if Self::is_cross_uid_overwrite_rejected(
                     self.allow_cross_uid_overwrite,
                     same_binder,
@@ -1275,12 +911,7 @@ impl IServiceManager for ServiceManager {
                 }
             }
 
-            // Take a reference on the new binder's subscription BEFORE
-            // releasing the old one's: a failure here then leaves the
-            // existing registration and its subscription intact (a clean
-            // no-op) instead of stranding an unmonitored entry. Skipped when
-            // the same binder is re-registered, since this entry's existing
-            // reference carries over.
+            // Retain before release: a failed link then leaves the old registration intact.
             if !same_binder {
                 inner.retain_death_link(service)?;
             }
@@ -1335,15 +966,16 @@ impl IServiceManager for ServiceManager {
 
         result?;
         fire_pending(client_pending);
-        fire_pending_propagate(reg_pending)
+        fire_pending(reg_pending);
+        Ok(())
     }
 
-    /// Non-blocking, and free of side effects: unlike
-    /// [`getService`](Self::getService) this never starts anything.
+    /// Non-blocking; never starts anything, but sets `guarantee_client` as AOSP does.
     fn checkService(&self, name: &str) -> rsbinder::BinderResult<Option<SIBinder>> {
         if !self.allows(Permission::Find, name) {
             return Ok(None);
         }
+        let _order = lock_recover(&self.fire_order);
         let mut pending = Vec::new();
         let result = {
             let mut inner = lock_recover(&self.inner);
@@ -1355,17 +987,11 @@ impl IServiceManager for ServiceManager {
         Ok(result)
     }
 
-    /// Two gates, unlike AOSP's single all-or-nothing `canList`: the
-    /// caller must be allowed to enumerate at all, *and* each name it
-    /// would learn about must be one it may `find`. The per-name filter
-    /// mirrors what AOSP already does in `getUpdatableNames`
-    /// (`ServiceManager.cpp:789-793`) — a name the caller could not look
-    /// up is a name it has no business learning the existence of.
+    /// `list`, then `find` per name, as AOSP's `getUpdatableNames` filters.
     fn listServices(&self, dump_priority: i32) -> rsbinder::BinderResult<Vec<String>> {
         self.require(Permission::List, "")?;
 
-        // Collect under the lock, filter outside it: `allows` resolves
-        // group membership, which can hit the name service.
+        // Filter outside the lock: `allows` can hit the name service.
         let candidates: Vec<String> = {
             let inner = lock_recover(&self.inner);
             inner
@@ -1395,13 +1021,12 @@ impl IServiceManager for ServiceManager {
             return Err(ExceptionCode::IllegalArgument.into());
         }
 
+        let _order = lock_recover(&self.fire_order);
         let mut pending = Vec::new();
         {
             let mut inner = lock_recover(&self.inner);
 
-            // Drop idempotent re-registrations and cap the list before
-            // taking a death link or storing the callback (so neither leaks
-            // on the rejected paths). See `MAX_CALLBACKS_PER_NAME`.
+            // Before the death link, so a rejected call leaks nothing.
             if let Some(existing) = inner.name_to_registration_callbacks.get(name) {
                 let cb_binder = arg_callback.as_binder();
                 if existing.iter().any(|c| c.as_binder() == cb_binder) {
@@ -1416,8 +1041,6 @@ impl IServiceManager for ServiceManager {
                 }
             }
 
-            // distinct-name DoS cap (orthogonal to the per-name cap above):
-            // refuse a *new* name once the map is full. See `MAX_DISTINCT_NAMES`.
             if distinct_name_cap_exceeded(&inner.name_to_registration_callbacks, name) {
                 let msg = format!(
                     "registerForNotifications: name registry full (max {MAX_DISTINCT_NAMES})"
@@ -1426,8 +1049,7 @@ impl IServiceManager for ServiceManager {
                 return Err((ExceptionCode::IllegalState, msg.as_str()).into());
             }
 
-            // One reference per (name, callback) entry; the idempotency
-            // guard above means this cannot double-count a single name.
+            // One reference per (name, callback) entry.
             inner.retain_death_link(&arg_callback.as_binder())?;
 
             inner
@@ -1465,53 +1087,48 @@ impl IServiceManager for ServiceManager {
         if removed == 0 {
             return Err(ExceptionCode::IllegalState.into());
         }
-        // Release one reference per entry removed. Without this the
-        // subscription outlives every registration that justified it, and
-        // the next `registerForNotifications` for the same binder takes a
-        // second one — unbounded growth across register/unregister cycles.
         for _ in 0..removed {
             inner.release_death_link(&binder);
         }
         Ok(())
     }
 
-    /// Answered from the `[[service]]` entries in rsb_hub's configuration,
-    /// which stand in for AOSP's VINTF manifests: both say which instances
-    /// are expected to exist before anyone registers them, which is what
-    /// lets a client tell "not installed" from "not started yet". A host
-    /// that declares nothing gets `false` for everything, as before.
+    /// Config `[[service]]` entries stand in for AOSP's VINTF manifests.
     fn isDeclared(&self, arg_name: &str) -> rsbinder::BinderResult<bool> {
         self.require(Permission::Find, arg_name)?;
         Ok(self.enforcer.config().declarations.is_declared(arg_name))
     }
 
-    /// See [`isDeclared`](Self::isDeclared). Instances are filtered by
-    /// `find`, as AOSP filters `getUpdatableNames`: an instance the caller
-    /// could not look up is one it has no business learning about.
+    /// Filtered by `find`, as AOSP `getDeclaredInstances` filters by `canFindService`.
     fn getDeclaredInstances(&self, arg_iface: &str) -> rsbinder::BinderResult<Vec<String>> {
         let declarations = &self.enforcer.config().declarations;
-        Ok(declarations
-            .instances_of(arg_iface)
+        let all = declarations.instances_of(arg_iface);
+        let declared = all.len();
+        let allowed: Vec<String> = all
             .into_iter()
             .filter(|instance| self.allows(Permission::Find, &format!("{arg_iface}/{instance}")))
-            .collect())
+            .collect();
+        // AOSP `ServiceManager.cpp:748`: all filtered out is a denial, not "none declared".
+        if allowed.is_empty() && declared != 0 {
+            let ctx = rsbinder::thread_state::CallingContext::default();
+            let msg = format!(
+                "policy denied find on every instance of {arg_iface:?} for uid={} (pid={})",
+                ctx.uid, ctx.pid
+            );
+            log::warn!("{msg}");
+            return Err((ExceptionCode::Security, msg.as_str()).into());
+        }
+        Ok(allowed)
     }
 
-    /// APEX (Android Pony EXpress) is an Android-only packaging
-    /// system; there is no equivalent on a plain Linux host. Returning
-    /// `None` truthfully reports "no APEX governs this service". Demoted
-    /// to `debug` because under steady-state load every `getService`
-    /// caller that asks may hit this — `warn` would flood the log.
+    /// No APEX on Linux; `debug`, not `warn`, since callers may ask on every lookup.
     fn updatableViaApex(&self, arg_name: &str) -> rsbinder::BinderResult<Option<String>> {
         self.require(Permission::Find, arg_name)?;
         log::debug!("updatableViaApex is not implemented on Linux (APEX is Android-only)");
         Ok(None)
     }
 
-    /// AOSP surfaces the VINTF `<ip>`+`<port>` of an AIDL service here
-    /// (`getVintfConnectionInfo`); rsb_hub reads the same pair from a
-    /// declaration's `connection` table. `None` when the instance is not
-    /// declared or declared without one.
+    /// A declaration's `connection` table stands in for AOSP's VINTF `<ip>`/`<port>`.
     fn getConnectionInfo(
         &self,
         arg_name: &str,
@@ -1541,6 +1158,7 @@ impl IServiceManager for ServiceManager {
     ) -> rsbinder::BinderResult<()> {
         self.require(Permission::Add, name)?;
 
+        let _order = lock_recover(&self.fire_order);
         let mut pending = Vec::new();
         let result: rsbinder::BinderResult<()> = (|| {
             let mut inner = lock_recover(&self.inner);
@@ -1553,9 +1171,7 @@ impl IServiceManager for ServiceManager {
                 return Err((ExceptionCode::IllegalArgument, msg.as_str()).into());
             };
 
-            // AOSP `ServiceManager.cpp:911` answers this with
-            // `EX_UNSUPPORTED_OPERATION`, not `EX_SECURITY`; the code is on
-            // the wire, so a C++ `LazyServiceRegistrar` sees the difference.
+            // AOSP `ServiceManager.cpp:911`: EX_UNSUPPORTED_OPERATION, visible on the wire.
             if service.context.pid != rsbinder::thread_state::CallingContext::default().pid {
                 let msg = format!(
                     "{:?} Only a server can register for client callbacks (for {})",
@@ -1571,14 +1187,10 @@ impl IServiceManager for ServiceManager {
                 return Err((ExceptionCode::IllegalArgument, msg.as_str()).into());
             }
 
-            // Copy what the rest of this function needs so the borrow on the
-            // registry ends here; everything below mutates it.
             let service_binder = service.binder.clone();
             let service_has_clients = service.has_clients;
 
-            // Drop idempotent re-registrations and cap the list before
-            // taking a death link or storing the callback. See
-            // `MAX_CALLBACKS_PER_NAME`.
+            // Before the death link, so a rejected call leaks nothing.
             if let Some(existing) = inner.name_to_client_callbacks.get(name) {
                 let cb_binder = arg_callback.as_binder();
                 if existing.iter().any(|c| c.as_binder() == cb_binder) {
@@ -1593,10 +1205,6 @@ impl IServiceManager for ServiceManager {
                 }
             }
 
-            // distinct-name DoS cap. Defense-in-depth: client callbacks require
-            // a registered service (checked above), so this map's names are
-            // already a subset of the service-name map, which is itself capped —
-            // but bound it explicitly to stay robust. See `MAX_DISTINCT_NAMES`.
             if distinct_name_cap_exceeded(&inner.name_to_client_callbacks, name) {
                 let msg = format!(
                     "registerClientCallback: name registry full (max {MAX_DISTINCT_NAMES})"
@@ -1605,12 +1213,7 @@ impl IServiceManager for ServiceManager {
                 return Err((ExceptionCode::IllegalState, msg.as_str()).into());
             }
 
-            // One reference per (name, callback) entry, as in
-            // `registerForNotifications`. There is no unregister call for a
-            // client callback, so these are released only when the binder
-            // dies — matching AOSP, which likewise keeps them across a
-            // `tryUnregisterService` so a reactivating lazy service does not
-            // have to re-register.
+            // Released only on death: kept across `tryUnregisterService`, as in AOSP.
             inner.retain_death_link(&arg_callback.as_binder())?;
 
             if service_has_clients {
@@ -1651,6 +1254,7 @@ impl IServiceManager for ServiceManager {
 
         let context = rsbinder::thread_state::CallingContext::default();
 
+        let _order = lock_recover(&self.fire_order);
         let mut pending = Vec::new();
         let result: rsbinder::BinderResult<()> = (|| {
             let mut inner = lock_recover(&self.inner);
@@ -1690,17 +1294,7 @@ impl IServiceManager for ServiceManager {
                 return Err((ExceptionCode::IllegalState, msg.as_str()).into());
             }
 
-            // AOSP `ServiceManager.cpp:1111` checks the *return value*
-            // (`bool` → "this service has clients, refuse to unregister").
-            // The earlier port checked `res.is_err()` instead — but
-            // `handle_service_client_callback` never returns `Err` in
-            // current rsbinder (all "can't determine" paths fall back to
-            // `Ok(true)`), so the refusal branch was dead and every
-            // unregister request silently succeeded even with live clients.
-            // `unwrap_or(true)` is defensive — if a future change makes
-            // `Err` reachable, we conservatively treat it as "clients
-            // present" (matches AOSP `ServiceManager.cpp:1001` `if (count
-            // == -1) return true;`).
+            // true = has clients; `Err` counts as true, as AOSP's `count == -1`.
             let has_clients = inner
                 .handle_service_client_callback(
                     Inner::KNOWN_CLIENTS_ON_DEMAND,
@@ -1718,14 +1312,10 @@ impl IServiceManager for ServiceManager {
                 return Err((ExceptionCode::IllegalState, msg.as_str()).into());
             }
 
-            // AOSP `ServiceManager.cpp:1128`. The only log that separates an
-            // honoured unregister from a death-driven cleanup, which is what
-            // the entry disappearing looks like either way.
+            // The only log telling an honoured unregister from a death cleanup (AOSP :1128).
             log::info!("{context:?} Unregistering {name}");
 
-            // Release this registration's reference on the subscription
-            // before dropping the entry, so a register→tryUnregister cycle
-            // (a lazy service idling and reactivating) is net-zero.
+            // Keeps a lazy service's register/tryUnregister cycle net-zero on subscriptions.
             inner.release_death_link(arg_service);
             inner.name_to_service.remove(name);
 
@@ -1765,18 +1355,17 @@ impl IServiceManager for ServiceManager {
         &self,
         name: &str,
     ) -> rsbinder::BinderResult<hub::android_16::android::os::Service::Service> {
-        // Routing logic lives in `classify_for_service_union` so
-        // `checkService2` stays byte-identical without re-stating the
-        // match arms.
         if !self.allows(Permission::Find, name) {
             return Ok(classify_for_service_union(None));
         }
+        let order = lock_recover(&self.fire_order);
         let mut pending = Vec::new();
         let lookup = {
             let mut inner = lock_recover(&self.inner);
             inner.try_get_binder(name, &mut pending)?
         };
         fire_pending(pending);
+        drop(order);
         if lookup.is_none() {
             self.try_start_service(name);
         }
@@ -1787,11 +1376,10 @@ impl IServiceManager for ServiceManager {
         &self,
         name: &str,
     ) -> rsbinder::BinderResult<hub::android_16::android::os::Service::Service> {
-        // See `getService2` — both route through
-        // `classify_for_service_union`.
         if !self.allows(Permission::Find, name) {
             return Ok(classify_for_service_union(None));
         }
+        let _order = lock_recover(&self.fire_order);
         let mut pending = Vec::new();
         let lookup = {
             let mut inner = lock_recover(&self.inner);
@@ -1801,26 +1389,16 @@ impl IServiceManager for ServiceManager {
         Ok(classify_for_service_union(lookup))
     }
 
-    /// See [`updatableViaApex`](Self::updatableViaApex) — same
-    /// APEX-on-Linux rationale, same demoted log level. An empty `Vec`
-    /// is the truthful "no APEX-updatable services" answer.
+    /// No APEX on Linux; see `updatableViaApex`.
     fn getUpdatableNames(&self, _apex_name: &str) -> rsbinder::BinderResult<Vec<String>> {
         log::debug!("getUpdatableNames is not implemented on Linux (APEX is Android-only)");
         Ok(vec![])
     }
 }
 
-/// Where `rsb_hub` looks for its configuration when `--config` is not
-/// given. Every `*.toml` in it is loaded, sorted by file name.
 const DEFAULT_CONFIG_DIR: &str = "/etc/rsbinder/hub.d";
 
-/// Report an unloadable configuration and exit.
-///
-/// `rsb_hub` does not start without one. Falling back to a permissive mode
-/// here would mean a typo in a config file silently drops all access
-/// control on a running system — the one failure mode that must never be
-/// quiet. `--insecure-allow-all` exists for the cases that genuinely want
-/// no policy, and it has to be asked for by that name.
+/// No permissive fallback: a config typo must not silently drop access control.
 fn exit_without_config(path: &Path, err: &config::ConfigError) -> ! {
     eprintln!("rsb_hub: cannot load its configuration");
     eprintln!("  {err}");
@@ -1840,28 +1418,20 @@ fn exit_without_config(path: &Path, err: &config::ConfigError) -> ! {
     eprintln!("    name = \"com.example.IFoo/default\"");
     eprintln!("    start = {{ systemd = \"example-foo.service\" }}");
     eprintln!();
-    eprintln!("It must not be writable by anyone but its owner: a start entry runs with");
-    eprintln!("rsb_hub's privileges when a lookup misses.");
+    eprintln!("Neither it nor any directory above it may be writable by anyone but its owner");
+    eprintln!("(so not under /tmp): a start entry runs with rsb_hub's privileges when a lookup");
+    eprintln!("misses.");
     eprintln!();
     eprintln!("Point rsb_hub at a different path with --config <PATH>, or pass");
     eprintln!("--insecure-allow-all to run with no access control (development only).");
     std::process::exit(1);
 }
 
-/// The signals `rsb_hub` consumes itself rather than dying from.
-///
-/// SIGHUP reloads the configuration; SIGTERM and SIGINT are a deliberate
-/// stop. Handling the latter two is what lets the hub tell its supervisor
-/// it is going down on purpose — a hub killed by the default disposition
-/// exits "by signal", which systemd records as a failure and a reader of
-/// the journal cannot tell from a crash.
+/// SIGTERM/SIGINT handled so systemd does not record a deliberate stop as a crash.
 const HANDLED_SIGNALS: [libc::c_int; 3] = [libc::SIGHUP, libc::SIGTERM, libc::SIGINT];
 
-/// A `sigset_t` containing exactly [`HANDLED_SIGNALS`].
 fn handled_signal_set() -> std::io::Result<libc::sigset_t> {
-    // SAFETY: `sigemptyset` fully initializes the zeroed set before
-    // `sigaddset` or any reader touches it, and both take a valid pointer
-    // to a live local.
+    // SAFETY: `sigemptyset` initializes the set before any other use; pointers are to a live local.
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
         if libc::sigemptyset(&mut set) != 0 {
@@ -1876,17 +1446,10 @@ fn handled_signal_set() -> std::io::Result<libc::sigset_t> {
     }
 }
 
-/// Block [`HANDLED_SIGNALS`] in this thread, and therefore in every thread
-/// spawned later.
-///
-/// `pthread_sigmask` is per-thread and a new thread inherits its creator's
-/// mask, so doing this before anything else spawns is what makes the signal
-/// thread's `sigwait` the single consumer. Without the block, each signal's
-/// default disposition would simply kill rsb_hub.
+/// Must run before any spawn: threads inherit the mask, making `sigwait` the sole consumer.
 fn block_handled_signals() -> std::io::Result<()> {
     let set = handled_signal_set()?;
-    // SAFETY: `set` is initialized above and only read by the call; the
-    // null `oldset` means "do not report the previous mask".
+    // SAFETY: `set` is initialized and only read; a null `oldset` is allowed and means "no report".
     let rc = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) };
     if rc != 0 {
         return Err(std::io::Error::from_raw_os_error(rc));
@@ -1894,28 +1457,13 @@ fn block_handled_signals() -> std::io::Result<()> {
     Ok(())
 }
 
-/// What a SIGHUP reloads, when there is a configuration to reload.
-///
-/// `None` under `--insecure-allow-all`: there is no configuration, so a
-/// SIGHUP has nothing to do — but the thread still runs, because SIGTERM
-/// must be handled in that mode too.
+/// Absent under `--insecure-allow-all`; the signal thread still runs for SIGTERM.
 struct Reloadable {
     enforcer: Arc<Enforcer>,
     path: PathBuf,
 }
 
-/// Consume [`HANDLED_SIGNALS`] for the life of the process.
-///
-/// A failed reload **keeps the configuration already in force**. Dropping
-/// to deny-all would take the machine's IPC down over a typo, and falling
-/// back to permissive would do the opposite and worse; continuing with the
-/// last known-good configuration is the only option that neither breaks nor
-/// silently opens the system. The failure is logged at error level.
-///
-/// SIGTERM/SIGINT exit the process from this thread. There is nothing to
-/// flush — the registry is in memory and dies with it, exactly as AOSP's
-/// `servicemanager` does when init kills it — so "graceful" here means
-/// telling the supervisor this was intentional and saying so in the log.
+/// A failed reload keeps the config in force: deny-all breaks IPC, permissive opens it.
 fn spawn_signal_thread(reloadable: Option<Reloadable>, notifier: Arc<Notifier>) {
     let spawn_result = std::thread::Builder::new()
         .name("rsb_hub:signals".to_owned())
@@ -1923,29 +1471,25 @@ fn spawn_signal_thread(reloadable: Option<Reloadable>, notifier: Arc<Notifier>) 
             let set = match handled_signal_set() {
                 Ok(set) => set,
                 Err(e) => {
-                    log::error!(
-                        "rsb_hub: cannot build the signal set; reload and clean shutdown \
-                         are disabled: {e}"
-                    );
-                    return;
+                    log::error!("rsb_hub: cannot build the signal set, exiting: {e}");
+                    std::process::exit(1);
                 }
             };
             loop {
                 let mut signo: libc::c_int = 0;
-                // SAFETY: `set` is an initialized sigset that outlives the
-                // call, and `signo` is a live local the call writes once.
+                // SAFETY: `set` is initialized and outlives the call; `signo` is a live local.
                 let rc = unsafe { libc::sigwait(&set, &mut signo) };
+                // Exit, not return: the signals stay blocked, so nothing else could stop us.
                 if rc != 0 {
                     log::error!(
-                        "rsb_hub: sigwait failed; reload and clean shutdown are disabled: {}",
+                        "rsb_hub: sigwait failed, exiting: {}",
                         std::io::Error::from_raw_os_error(rc)
                     );
-                    return;
+                    std::process::exit(1);
                 }
                 match signo {
                     libc::SIGHUP => reload(reloadable.as_ref(), &notifier),
-                    // SIGTERM is `systemctl stop`; SIGINT is Ctrl-C from the
-                    // terminal that started it. Same intent, same answer.
+                    // SIGTERM (`systemctl stop`) or SIGINT (Ctrl-C): same intent.
                     _ => {
                         let name = if signo == libc::SIGINT {
                             "SIGINT"
@@ -1954,16 +1498,15 @@ fn spawn_signal_thread(reloadable: Option<Reloadable>, notifier: Arc<Notifier>) 
                         };
                         log::info!("rsb_hub: {name} received, shutting down");
                         notifier.stopping("shutting down");
-                        // Exit successfully: this was asked for. Nothing is
-                        // pending that a longer unwind would finish, and the
-                        // binder device is released by the kernel on exit.
+                        // Nothing to flush: the registry is in memory, as in AOSP.
                         std::process::exit(0);
                     }
                 }
             }
         });
     if let Err(e) = spawn_result {
-        log::error!("rsb_hub: failed to spawn the signal thread: {e}");
+        eprintln!("rsb_hub: failed to spawn the signal thread: {e}");
+        std::process::exit(1);
     }
 }
 
@@ -1996,9 +1539,7 @@ fn reload(reloadable: Option<&Reloadable>, notifier: &Notifier) {
 }
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    // Both before anything spawns a thread: the signal mask is inherited by
-    // every later thread, and `Notifier::from_environment` mutates the
-    // environment, which is only sound while single-threaded.
+    // Before any thread: the mask is inherited, and `from_environment` mutates the env.
     if let Err(e) = block_handled_signals() {
         eprintln!("rsb_hub: cannot block signals: {e}");
         std::process::exit(1);
@@ -2093,9 +1634,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     }
 
     let (enforcer, reloadable, ready_status) = if insecure_allow_all {
-        // Loud on stderr as well as the log: this is a running service
-        // manager with no access control, and the operator has to be able
-        // to see that from the terminal that started it.
+        // Stderr too, so the operator sees it from the terminal that started it.
         eprintln!(
             "rsb_hub: WARNING --insecure-allow-all: no access control. Any local \
              process may register, look up, and enumerate any service."
@@ -2130,9 +1669,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     log::info!("Starting rsb_hub with binder device: {}", binder_path);
 
-    // 0 = AOSP's `setThreadPoolMaxThreadCount(0)`: rsb_hub is deliberately
-    // single-threaded, exactly like `servicemanager`, and the kernel is now
-    // told exactly that.
+    // 0 = AOSP's `setThreadPoolMaxThreadCount(0)`: single-threaded like `servicemanager`.
     ProcessState::init(&binder_path, 0)?;
 
     // Create a binder service.
@@ -2140,10 +1677,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         allow_cross_uid_overwrite,
         Arc::clone(&enforcer),
     ));
-    // Log and carry on, as AOSP does (`main.cpp`: "Could not self register
-    // servicemanager"). Clients reach the hub through handle 0 regardless;
-    // the registry entry is a convenience, and refusing to come up without
-    // it would take the machine's IPC down for a cosmetic failure.
+    // Non-fatal, as AOSP `main.cpp`: clients reach the hub through handle 0 regardless.
     if let Err(e) = service.addService(
         SELF_SERVICE_NAME,
         &service.as_binder(),
@@ -2153,10 +1687,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         log::error!("rsb_hub: could not self-register as '{SELF_SERVICE_NAME}': {e:?}");
     }
 
-    // A binder device has exactly one context manager, and the kernel is
-    // what enforces it — a lock file here would be a second, weaker truth.
-    // What is worth adding is a legible failure: the raw ioctl error says
-    // nothing about the one thing that is almost always the cause.
+    // The kernel enforces one context manager; the raw ioctl error does not name the cause.
     if let Err(e) = ProcessState::as_self().become_context_manager(service.as_binder()) {
         eprintln!("rsb_hub: cannot become the service manager for {binder_path}: {e}");
         eprintln!();
@@ -2169,9 +1700,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    // Only now: handle 0 is ours, so this is the first instant at which a
-    // client can reach the hub. Announcing readiness any earlier would let
-    // systemd release units ordered `After=` into a race.
+    // Only once handle 0 is ours, else `After=` units race the registry.
     log::info!("rsb_hub: serving on {binder_path}");
     notifier.ready(&ready_status);
 
@@ -2182,9 +1711,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
 
-    /// A local binder, purely as a source of distinct `WIBinder` identities
-    /// for the death-link tests — every `fake_binder()` is its own
-    /// allocation and so its own identity. Never transacted on.
+    /// Each `fake_binder()` is its own allocation, so its own `WIBinder` identity.
     struct FakeBinder;
 
     impl Interface for FakeBinder {}
@@ -2232,10 +1759,7 @@ mod tests {
         }
     }
 
-    /// H-1b: one binder registered under many names must take **one**
-    /// kernel subscription, so its death fires `binder_died` once and
-    /// triggers one cleanup sweep — not one per name. Releasing all but the
-    /// last name must not drop the subscription the remaining name needs.
+    /// One binder under many names takes one subscription, dropped only with the last name.
     #[test]
     fn one_subscription_per_binder_regardless_of_name_count() {
         let mut inner = test_inner();
@@ -2261,11 +1785,7 @@ mod tests {
         assert!(!inner.death_links.contains_key(&7));
     }
 
-    /// H-1: the register/unregister cycle that used to leak. Each iteration
-    /// re-links because the previous unregister removed the callback from
-    /// the map without releasing the subscription, so a client could grow
-    /// the recipient list — and the per-death sweep count — without bound.
-    /// Paired accounting must keep it flat.
+    /// Any client can drive this cycle, so it must leave no subscription behind.
     #[test]
     fn register_unregister_cycles_do_not_accumulate_subscriptions() {
         let mut inner = test_inner();
@@ -2287,8 +1807,7 @@ mod tests {
         );
     }
 
-    /// A failed link must leave no accounting behind: a later release would
-    /// otherwise unlink a subscription that was never taken.
+    /// Else a later release would unlink a subscription that was never taken.
     #[test]
     fn failed_link_records_nothing() {
         let mut inner = test_inner();
@@ -2306,14 +1825,7 @@ mod tests {
         assert_eq!(ledger.unlinks.get(), 0);
     }
 
-    /// H-2: an obituary retires the dead binder's record — whatever its
-    /// count, since the kernel released the subscription itself — and
-    /// attempts no unlink. Only that binder's record goes.
-    ///
-    /// The identity comparison this rests on is pinned in `rsbinder`
-    /// (`proxy_downgrade_keeps_its_identity_without_a_cache_entry`); the
-    /// registry-sweeping half needs proxies with real handles and lives in
-    /// `tests/scripts/run_hub_policy_ac.sh`.
+    /// The sweep with real proxies is covered by `tests/scripts/run_hub_policy_ac.sh`.
     #[test]
     fn obituary_finds_its_record_by_the_stored_weak() {
         let mut inner = test_inner();
@@ -2341,8 +1853,6 @@ mod tests {
         assert_eq!(ledger.unlinks.get(), 0, "the obituary path must not unlink");
     }
 
-    /// An obituary for a binder nothing tracks must be inert, not a panic
-    /// and not a sweep keyed on a handle it guessed.
     #[test]
     fn obituary_for_an_untracked_binder_is_inert() {
         let mut inner = test_inner();
@@ -2351,8 +1861,7 @@ mod tests {
         assert!(inner.death_links.is_empty());
     }
 
-    /// A native (`Bn*`) binder has no death notification, so both halves are
-    /// no-ops. Callers rely on this to avoid testing for it themselves.
+    /// Callers rely on this instead of testing for a native binder themselves.
     #[test]
     fn native_binders_are_skipped() {
         let mut inner = test_inner();
@@ -2367,11 +1876,7 @@ mod tests {
         assert!(inner.death_links.is_empty());
     }
 
-    /// M-1: `isLazyService` must reflect `FLAG_IS_LAZY_SERVICE` in the
-    /// registered dumpPriority. AOSP's client uses it to decide whether the
-    /// binder may be cached, and a lazy service withdraws via
-    /// `tryUnregisterService` *without dying* — so a stuck `false` hands out
-    /// a cached binder to a service that is gone.
+    /// A stuck `false` lets clients cache a lazy binder that can unregister without dying.
     #[test]
     fn lazy_flag_reaches_the_service_union() {
         use hub::android_16::android::os::Service::Service;
@@ -2405,21 +1910,14 @@ mod tests {
         assert!(matches!(accessor, Service::Accessor(Some(_))));
     }
 
-    /// The lazy bit is the one AOSP defines, and it is outside
-    /// `DUMP_FLAG_PRIORITY_ALL` — so a lazy registration still needs a
-    /// priority bit of its own to appear in `listServices`.
+    /// So a lazy registration still needs its own priority bit to appear in `listServices`.
     #[test]
     fn lazy_flag_is_disjoint_from_the_priority_mask() {
         assert_eq!(FLAG_IS_LAZY_SERVICE, 1 << 30);
         assert_eq!(FLAG_IS_LAZY_SERVICE & DUMP_FLAG_PRIORITY_ALL, 0);
     }
 
-    /// The self-registration bypass in [`ServiceManager::allows`] rests
-    /// entirely on `calling_caller()` being `None` outside a transaction.
-    /// If that ever changed, `rsb_hub` would authorize its own startup
-    /// `addService("manager")` against the caller's own uid and refuse to
-    /// start under any policy that does not happen to grant it — a
-    /// startup failure with a very confusing message. Pin the premise.
+    /// The self-registration bypass in [`ServiceManager::allows`] rests on this premise.
     #[test]
     fn calling_caller_is_none_outside_a_transaction() {
         assert!(
@@ -2428,11 +1926,6 @@ mod tests {
         );
     }
 
-    /// Add-time access control: a cross-UID overwrite of a different live
-    /// binder is rejected by default; same-UID restarts, identical-binder
-    /// re-registration, and the explicit opt-in are all allowed. (The
-    /// real two-UID transaction path is exercised by deployment; this pins
-    /// the decision predicate deterministically.)
     #[test]
     fn cross_uid_overwrite_decision() {
         // Reject: different UID, different binder, flag off (hijack).
@@ -2470,8 +1963,7 @@ mod tests {
         // 127-char boundary — the inclusive upper bound.
         let max_len = "a".repeat(127);
         assert!(ServiceManager::is_valid_service_name(&max_len));
-        // The legacy AOSP service names that motivate the
-        // permitted-charset list — all should pass.
+        // The AOSP names that motivate the permitted charset.
         assert!(ServiceManager::is_valid_service_name(
             "android.os.IServiceManager"
         ));
@@ -2514,11 +2006,6 @@ mod tests {
         assert!(!ServiceManager::is_valid_service_name("café"));
     }
 
-    /// HUB-1: the distinct-name cap rejects a *new* name once a registry map is
-    /// full, but always allows overwriting an existing name (which does not
-    /// grow the map). Bounds the unbounded heap growth a client could cause by
-    /// looping over distinct service names — the per-name cap does not cover
-    /// the distinct-name axis.
     fn dump_row(name: &str, dump_priority: i32) -> DumpRow {
         DumpRow {
             name: name.to_owned(),
@@ -2551,9 +2038,7 @@ mod tests {
         }
     }
 
-    /// A registration's flags have to be readable *as flags*, not just as
-    /// the hex the client sent: `lazy=yes` is the difference between "this
-    /// binder may be cached" and "it may not".
+    /// Flags decoded, not just hex: `lazy=yes` decides whether the binder may be cached.
     #[test]
     fn a_dump_reports_each_registration_and_its_flags() {
         let mut snap = empty_snapshot();
@@ -2578,9 +2063,7 @@ mod tests {
         assert_eq!(out.matches("lazy=no").count(), 1, "{out}");
     }
 
-    /// L-3's warning, on the read side: a registration with no priority bit
-    /// never appears in `listServices`, which looks like a lost
-    /// registration until you see the mask.
+    /// No priority bit hides it from `listServices`, which looks like a lost registration.
     #[test]
     fn a_registration_with_no_priority_bit_is_called_out() {
         let mut snap = empty_snapshot();
@@ -2592,9 +2075,6 @@ mod tests {
         assert!(!dump_to_string(&snap).contains("no priority bit"));
     }
 
-    /// "Nothing is registered and something is waiting for it" is the state
-    /// an operator debugs most often, so it gets its own section rather
-    /// than being invisible.
     #[test]
     fn names_that_are_only_waited_on_get_their_own_section() {
         let mut snap = empty_snapshot();
@@ -2610,9 +2090,6 @@ mod tests {
         assert!(!dump_to_string(&empty_snapshot()).contains("awaiting registration"));
     }
 
-    /// `--insecure-allow-all` is the one fact about a running hub that a
-    /// dump must never bury: everything else in the output is the same
-    /// whether or not access control is on.
     #[test]
     fn allow_all_is_reported_as_disabled_access_control() {
         let mut snap = empty_snapshot();
@@ -2628,9 +2105,7 @@ mod tests {
         );
     }
 
-    /// Names withheld by the policy are counted, never listed: the count
-    /// tells the operator the view is partial without telling a denied
-    /// caller which names exist.
+    /// Counted, never named: a denied caller must not learn which names exist.
     #[test]
     fn withheld_names_are_counted_not_named() {
         let mut snap = empty_snapshot();
@@ -2654,9 +2129,7 @@ mod tests {
         assert!(!dump_filter_matches(&filter, "com.example.IBar/default"));
     }
 
-    /// The mask has to cover *shutdown* as well as reload: a signal that
-    /// reaches the thread but is not in the set blocked at startup would
-    /// have already killed the process by its default disposition.
+    /// An unblocked handled signal would kill the process by its default disposition.
     #[test]
     fn the_blocked_signal_set_covers_reload_and_shutdown() {
         let set = handled_signal_set().expect("building a sigset cannot fail here");
@@ -2665,16 +2138,15 @@ mod tests {
                 HANDLED_SIGNALS.contains(&signo),
                 "signal {signo} must be handled"
             );
-            // SAFETY: `set` is a live, fully initialized sigset and
-            // `sigismember` only reads it.
+            // SAFETY: `set` is a live, fully initialized sigset and `sigismember` only reads it.
             assert_eq!(unsafe { libc::sigismember(&set, signo) }, 1);
         }
-        // And nothing else: blocking a signal nobody consumes would make it
-        // silently ineffective instead of doing what the operator expects.
+        // Nothing else: a blocked signal nobody consumes is silently ineffective.
         // SAFETY: as above.
         assert_eq!(unsafe { libc::sigismember(&set, libc::SIGUSR1) }, 0);
     }
 
+    /// Overwriting an existing name never grows the map, so it passes a full cap.
     #[test]
     fn distinct_name_cap_rejects_new_but_allows_existing() {
         // Below capacity: any name is allowed.

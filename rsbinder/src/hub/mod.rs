@@ -55,11 +55,11 @@
 //! | Function | Returns | Not registered | SM unreachable | Cast mismatch |
 //! |---|---|---|---|---|
 //! | [`check_service`](crate::hub::check_service) | `Option<SIBinder>` | `None` | `None` | — |
-//! | [`check_interface`](crate::hub::check_interface) | `Result<Strong<T>>` | `Err(NameNotFound)` | `Err(NameNotFound)` | `Err(BadType)` |
+//! | [`check_interface`](crate::hub::check_interface) | `Result<Strong<T>>` | `Err(NameNotFound)` | [`default`](crate::hub::default)'s `Err(..)` if it fails, else `Err(NameNotFound)` | `Err(BadType)` |
 //! | [`try_get_service`](crate::hub::try_get_service) | `Result<Option<SIBinder>>` | `Ok(None)` | `Err(..)` | — |
 //! | [`try_get_interface`](crate::hub::try_get_interface) | `Result<Option<Strong<T>>>` | `Ok(None)` | `Err(..)` | `Err(BadType)` |
 //! | [`wait_for_service`](crate::hub::wait_for_service) | `Option<SIBinder>` | *blocks*; `None` on give-up | `None` | — |
-//! | [`wait_for_interface`](crate::hub::wait_for_interface) | `Result<Strong<T>>` | *blocks*; `Err(NameNotFound)` on give-up | `Err(NameNotFound)` | `Err(BadType)` |
+//! | [`wait_for_interface`](crate::hub::wait_for_interface) | `Result<Strong<T>>` | *blocks*; `Err(NameNotFound)` on give-up | [`default`](crate::hub::default)'s `Err(..)` if it fails, else `Err(NameNotFound)` | `Err(BadType)` |
 //!
 //! Use `wait_*` for a dependency expected to appear (client startup),
 //! `check_*` for an optional service probed once, and `try_*` when you must
@@ -88,22 +88,37 @@
 //!     }
 //! }
 //! ```
+//!
+//! ## Implementation notes
+//!
+//! ### Pre-16 callback forwarding
+//!
+//! `register_for_notifications`, `unregister_for_notifications` and
+//! `register_client_callback` hand the caller's callback to a pre-16
+//! service manager through a thin forwarder (`ForwardServiceCallback`,
+//! `ForwardClientCallback`) that returns the original `SIBinder`, instead of
+//! reconstructing a typed `Strong` of the per-version trait.
+//!
+//! Each `android_N::IServiceCallback` / `IClientCallback` is generated from
+//! its own AIDL unit, so they are distinct trait types with independently
+//! built vtables; transmuting a `Strong<dyn _>` (a `Box<dyn _>` fat
+//! pointer) across them would dispatch through a foreign vtable, a layout
+//! Rust does not guarantee. A `FromIBinder::try_from` round-trip is also
+//! wrong: it rejects a *local* callback whose concrete native type differs
+//! from the target version's (the descriptor matches but the `Inner<B>`
+//! downcast fails), which is the normal case for this API.
+//!
+//! These calls only serialize the callback as its underlying `SIBinder`
+//! (`Serialize for dyn _` calls `as_binder()` and nothing else), so the
+//! forwarder is wire- and behavior-identical for local and proxy callbacks,
+//! with no `unsafe`. `onRegistration` / `onClients` are unreachable on the
+//! forwarder: it is only serialized and sent, and the kernel delivers
+//! inbound notifications to the original binder node, never to this
+//! transient local object.
 
 use std::sync::{Arc, OnceLock};
 
-/// The common body of every per-version `servicemanager_N` module
-/// (Android 11 through 15). Each call expands to the same
-/// `BpServiceManager` re-exports + dispatch wrappers; version-specific
-/// additions (e.g. `get_service_debug_info` since 12) go in the
-/// `$($extra:tt)*` repetition. Caller emits `include!(...)` for the
-/// generated AIDL bindings *before* invoking this macro so that the
-/// `android::os::*` paths below resolve in the caller's scope.
-///
-/// The plain form also emits `check_service` over the `checkService` wire
-/// call. `@custom_check_service` omits it, for a version where that method
-/// does not return an `@nullable IBinder` — Android 15's returns a `Service`
-/// union, so `servicemanager_15` supplies its own (see the module docs there
-/// for why it does not parse the union).
+/// Common body of `servicemanager_{11..15}`, plus `$extra`; `include!` the AIDL bindings first.
 #[cfg(all(
     target_os = "android",
     any(
@@ -115,6 +130,7 @@ use std::sync::{Arc, OnceLock};
     )
 ))]
 macro_rules! impl_sm_module_body {
+    // No `check_service`: 15's `checkService` returns a `Service` union (see `servicemanager_15`).
     (@custom_check_service $($extra:tt)*) => {
         use crate::*;
         pub use android::os::IServiceManager::{
@@ -130,13 +146,14 @@ macro_rules! impl_sm_module_body {
         /// (one attempt; not blocking). Use `wait_for_service` to block until
         /// the service appears, or `check_service` for an explicit
         /// non-blocking lookup.
-        // `getService` carries an `@deprecated` javadoc from Android 15 on
-        // ("use getService2"), which the AIDL backend renders as
-        // `#[deprecated]`. This module keeps calling it deliberately: the
-        // `Service` union `getService2` returns has a payload that varies by
-        // release train, so `servicemanager_15` never parses it (see that
-        // module's docs). Scoped to the call, not the crate, so a future
-        // deprecation elsewhere still warns.
+        ///
+        /// `getService` carries an `@deprecated` javadoc from Android 15 on
+        /// ("use getService2"), which the AIDL backend renders as
+        /// `#[deprecated]`. This module keeps calling it deliberately: the
+        /// `Service` union `getService2` returns has a payload that varies by
+        /// release train, so `servicemanager_15` never parses it (see that
+        /// module's docs). The `allow(deprecated)` is scoped to each call, not
+        /// the crate, so a future deprecation elsewhere still warns.
         #[allow(deprecated)]
         pub fn get_service(sm: &BpServiceManager, name: &str) -> Option<SIBinder> {
             match sm.getService(name) {
@@ -152,8 +169,7 @@ macro_rules! impl_sm_module_body {
         /// collapsing it to `None`, so a waiter can tell "not yet registered"
         /// (`Ok(None)`) from "service manager unreachable" (`Err`) — the
         /// distinction AOSP `realGetService` carries in its `Status`.
-        // See `get_service` for why the deprecated `getService` is the one
-        // this module calls.
+        // See `get_service` for why the deprecated `getService` is called.
         #[allow(deprecated)]
         pub fn try_get_service(sm: &BpServiceManager, name: &str) -> Result<Option<SIBinder>> {
             sm.getService(name).map_err(|e| e.into())
@@ -230,8 +246,7 @@ macro_rules! impl_sm_module_body {
             }
         }
 
-        // See `get_service` for why the deprecated `getService` is the one
-        // this module calls.
+        // See `get_service` for why the deprecated `getService` is called.
         #[allow(deprecated)]
         pub fn get_interface<T: FromIBinder + ?Sized>(
             sm: &BpServiceManager,
@@ -390,12 +405,7 @@ pub mod android_15 {
 
 #[cfg(feature = "rpc")]
 pub(crate) mod accessor_16;
-/// Register-side companion to [`accessor_16`]. Defines
-/// `AccessorSockAddr` + `AccessorAddrProvider`, `LocalAccessor`,
-/// the `add_accessor_provider` / `create_accessor` /
-/// `remove_accessor_provider` process-local registry, and the
-/// `resolve_via_process_local` fallback helper. Same
-/// `cfg(feature = "rpc")` gate as the consume side.
+/// Register side of the accessor bridge, companion to [`accessor_16`] (same `rpc` gate).
 #[cfg(feature = "rpc")]
 pub(crate) mod accessor_register;
 mod servicemanager_16;
@@ -412,8 +422,7 @@ pub mod android_16 {
         ERROR_FAILED_TO_CONNECT_TO_SOCKET, ERROR_FAILED_TO_CREATE_SOCKET,
         ERROR_UNSUPPORTED_SOCKET_FAMILY,
     };
-    // Async-trait re-export gated on the runtime `async` feature —
-    // mirrors the codegen gate in `accessor_16::pub use ...`.
+    // Same `async` gate as the codegen re-export in `accessor_16`.
     #[cfg(all(feature = "rpc", feature = "async"))]
     pub use super::accessor_16::IAccessorAsyncService;
     /// Register-side public surface.
@@ -492,8 +501,7 @@ pub enum ServiceManager {
     Android16(android_16::BpServiceManager),
 }
 
-/// Which of Android 15's two service-manager numberings this device speaks;
-/// see [`android_15`] for the split.
+/// Which of Android 15's two service-manager numberings this device speaks ([`android_15`]).
 #[cfg(all(
     target_os = "android",
     any(feature = "android_14", feature = "android_15")
@@ -506,18 +514,17 @@ enum Android15Numbering {
     Shifted,
 }
 
-/// Side-effect-free on both numberings: past the end pre-r6, `getServiceDebugInfo()` on r6+ (`numbering_pins` pins it).
+/// Side-effect-free: past the end pre-r6, `getServiceDebugInfo()` on r6+ (`numbering_pins`).
 #[allow(dead_code)] // only issued on android; pinned everywhere
 pub(crate) const ANDROID_15_PROBE_CODE: TransactionCode = 14;
 
-/// Tell the two Android 15 service-manager numberings apart with one
-/// side-effect-free transaction ([`ANDROID_15_PROBE_CODE`]). See [`android_15`].
+/// Tells the two Android 15 numberings apart with one [`ANDROID_15_PROBE_CODE`] transaction.
 #[cfg(all(
     target_os = "android",
     any(feature = "android_14", feature = "android_15")
 ))]
 fn check_android_15_numbering(context: &SIBinder) -> Result<Android15Numbering> {
-    // The answer never changes for the process; a refused numbering would otherwise re-probe on every `default()`.
+    // Cached: fixed per process, else a refused numbering re-probes on every `default()`.
     static PROBED: OnceLock<Android15Numbering> = OnceLock::new();
     if let Some(&numbering) = PROBED.get() {
         return Ok(numbering);
@@ -547,9 +554,7 @@ fn check_android_15_numbering(context: &SIBinder) -> Result<Android15Numbering> 
     Ok(*PROBED.get_or_init(|| numbering))
 }
 
-/// Refuse an Android 15 numbering this build has no module for, naming the
-/// feature that would cover it; see [`android_15`] for why refusing beats
-/// addressing it with the wrong codes.
+/// Refuses a numbering this build lacks, naming the feature; [`android_15`] says why not guess.
 #[cfg(all(
     target_os = "android",
     any(
@@ -571,6 +576,44 @@ fn android_15_feature_missing(numbering: Android15Numbering) -> StatusCode {
              apart by SDK version, so the service manager is refused rather than \
              addressed with the wrong transaction codes."
         );
+    });
+    StatusCode::InvalidOperation
+}
+
+/// Handle 0 could not be reached: no context manager (no `rsb_hub` on Linux) or no binder driver.
+fn service_manager_unreachable(err: StatusCode) {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        log::error!(
+            "the service manager (binder handle 0) is unreachable: {err:?}. On Linux, \
+             start `rsb_hub` first; lookups fail until it runs."
+        );
+    });
+}
+
+/// An SDK whose service-manager protocol this build has no feature for.
+#[cfg(target_os = "android")]
+fn sdk_feature_missing(sdk: u32) -> StatusCode {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    let feature = match sdk {
+        sdk_versions::ANDROID_10 => Some("android_10"),
+        sdk_versions::ANDROID_11 => Some("android_11"),
+        sdk_versions::ANDROID_12 | sdk_versions::ANDROID_12L => Some("android_12"),
+        sdk_versions::ANDROID_13 => Some("android_13"),
+        sdk_versions::ANDROID_14 => Some("android_14"),
+        _ => None,
+    };
+    LOGGED.call_once(|| match feature {
+        Some(feature) => log::error!(
+            "this device runs Android SDK {sdk}, whose service-manager protocol needs the \
+             `{feature}` feature; rsbinder was built without it, so the service manager is \
+             refused rather than addressed with the wrong transaction codes"
+        ),
+        None => log::error!(
+            "Android SDK {sdk} is outside the range rsbinder supports (SDK {} through {})",
+            sdk_versions::ANDROID_10,
+            sdk_versions::ANDROID_17
+        ),
     });
     StatusCode::InvalidOperation
 }
@@ -608,7 +651,9 @@ pub fn default() -> Result<Arc<ServiceManager>> {
     }
 
     let process = ProcessState::as_self();
-    let context = process.context_object()?;
+    let context = process
+        .context_object()
+        .inspect_err(|e| service_manager_unreachable(*e))?;
     #[cfg(target_os = "android")]
     let sdk_version = crate::get_android_sdk_version();
 
@@ -623,10 +668,7 @@ pub fn default() -> Result<Arc<ServiceManager>> {
         }
 
         match sdk_version {
-            // Android 17 (SDK 37) shares Android 16's service-manager wire
-            // format — the `android/os/*` AIDL is byte-identical between
-            // android-16.0.0_r4 and android-17.0.0_r1 (and the kernel binder
-            // UAPI is unchanged), so it is served by the `android_16` module.
+            // SDK 37: 17.0.0_r1 AIDL and UAPI match 16.0.0_r4, so `android_16` serves it.
             sdk_versions::ANDROID_16 | sdk_versions::ANDROID_17 => {
                 create_service_manager!(Android16, android_16)
             }
@@ -674,7 +716,7 @@ pub fn default() -> Result<Arc<ServiceManager>> {
             sdk_versions::ANDROID_11 => create_service_manager!(Android11, android_11),
             #[cfg(feature = "android_10")]
             sdk_versions::ANDROID_10 => create_service_manager!(Android10, android_10),
-            _ => return Err(StatusCode::InvalidOperation),
+            _ => return Err(sdk_feature_missing(sdk_version)),
         }
     };
 
@@ -683,32 +725,11 @@ pub fn default() -> Result<Arc<ServiceManager>> {
         android_16::BpServiceManager::from_binder(context).ok_or(StatusCode::BadType)?,
     );
 
-    // Cache only on success; a failed init returned above is not stored,
-    // so a later call may retry. If two threads race here, get_or_init
-    // keeps the first stored instance and the extra one is dropped.
+    // Only success is cached, so a failed init can retry; a racing loser's instance is dropped.
     Ok(GLOBAL_SM.get_or_init(|| Arc::new(service_manager)).clone())
 }
 
-/// Forwards an existing `IServiceCallback` to a per-version
-/// service-manager shim without reconstructing a typed `Strong`.
-///
-/// Each `android_N::IServiceCallback` is generated from its own AIDL unit,
-/// so they are distinct trait types with independently-built vtables;
-/// transmuting a `Strong<dyn _>` (a `Box<dyn _>` fat pointer) across them
-/// would dispatch through a foreign vtable, a layout Rust does not
-/// guarantee. A `FromIBinder::try_from` round-trip is also wrong: it
-/// rejects a *local* callback whose concrete native type differs from the
-/// target version's (descriptor matches but the `Inner<B>` downcast
-/// fails), which is the normal case for this API.
-///
-/// `register/unregister_for_notifications` only ever serialize the
-/// callback as its underlying `SIBinder` (`Serialize for dyn _` calls
-/// `as_binder()` and nothing else), so a thin wrapper that returns the
-/// original `SIBinder` is wire-identical and behavior-identical for both
-/// local and proxy callbacks, with no `unsafe`. `onRegistration` is
-/// unreachable here: the wrapper is only serialized and sent; inbound
-/// notifications are delivered by the kernel to the original binder node,
-/// never to this transient local forwarder.
+/// Hands a callback's `SIBinder` to a pre-16 shim; see module doc "Pre-16 callback forwarding".
 #[cfg(all(
     target_os = "android",
     any(
@@ -737,10 +758,7 @@ impl crate::Interface for ForwardServiceCallback {
     }
 }
 
-/// Build a per-version `Strong<dyn IServiceCallback>` that wraps the
-/// unified callback into [`ForwardServiceCallback`]. Used by the
-/// `register_for_notifications` / `unregister_for_notifications`
-/// dispatch arms on every pre-16 protocol that has them.
+/// Wraps the unified callback as a per-version `Strong<dyn IServiceCallback>` (pre-16 arms).
 #[cfg(all(
     target_os = "android",
     any(
@@ -759,10 +777,7 @@ macro_rules! wrap_callback {
     };
 }
 
-/// Collect a per-version `Vec<android_N::ServiceDebugInfo>` into the
-/// unified `Vec<ServiceDebugInfo>`. Used by the `get_service_debug_info`
-/// dispatch arms on every pre-16 protocol that has it (16 returns the
-/// unified type directly).
+/// Converts a pre-16 `Vec<android_N::ServiceDebugInfo>` to the unified type (16 returns it).
 #[cfg(all(
     target_os = "android",
     any(
@@ -785,12 +800,7 @@ macro_rules! collect_debug_info {
     }};
 }
 
-/// The `Status` an error-preserving `try_*` call returns when the running
-/// service manager's protocol predates the method it was asked for.
-///
-/// `EX_UNSUPPORTED_OPERATION` is AOSP's code for "this interface has no
-/// such method"; the message names the first Android version that does,
-/// which is the actionable half for whoever reads it.
+/// `EX_UNSUPPORTED_OPERATION` (AOSP "no such method") naming the first version with `method`.
 #[cfg(all(
     target_os = "android",
     any(feature = "android_10", feature = "android_11", feature = "android_12")
@@ -803,8 +813,7 @@ fn unsupported(method: &str, since: u32) -> Status {
         .into()
 }
 
-/// Emits the per-version `IServiceCallback` impl for [`ForwardServiceCallback`]
-/// (one per supported pre-16 version).
+/// Emits the per-version `IServiceCallback` impl for `ForwardServiceCallback` (pre-16).
 macro_rules! forward_service_callback_impl {
     ($modu:ident, $feat:literal) => {
         #[cfg(all(target_os = "android", feature = $feat))]
@@ -814,9 +823,7 @@ macro_rules! forward_service_callback_impl {
                 _name: &str,
                 _binder: &crate::SIBinder,
             ) -> crate::BinderResult<()> {
-                // Unreachable on the serialize-only path; see the
-                // ForwardServiceCallback doc. Return an error rather than
-                // panic in library code if it is ever reached.
+                // Unreachable on the serialize-only path (type doc); error rather than panic.
                 Err(crate::StatusCode::UnknownTransaction.into())
             }
         }
@@ -829,14 +836,7 @@ forward_service_callback_impl!(android_13, "android_13");
 forward_service_callback_impl!(android_14, "android_14");
 forward_service_callback_impl!(android_15, "android_15");
 
-/// `IClientCallback` analogue of [`ForwardServiceCallback`], used by
-/// `register_client_callback` on every pre-16 protocol that has it. Same
-/// rationale: the
-/// per-version `android_N::IClientCallback` trait types have distinct
-/// vtables, but `registerClientCallback` only serializes the callback as
-/// its underlying `SIBinder`, so forwarding that binder is wire- and
-/// behavior-identical. `onClients` is unreachable on the serialize-only
-/// path (the kernel delivers notifications to the original binder node).
+/// `IClientCallback` analogue of [`ForwardServiceCallback`]; same module doc section.
 #[cfg(all(
     target_os = "android",
     any(
@@ -865,10 +865,7 @@ impl crate::Interface for ForwardClientCallback {
     }
 }
 
-/// Build a per-version `Strong<dyn IClientCallback>` wrapping the unified
-/// callback into [`ForwardClientCallback`]. Used by the
-/// `register_client_callback` dispatch arms on every pre-16 protocol that
-/// has it.
+/// Wraps the unified callback as a per-version `Strong<dyn IClientCallback>` (pre-16 arms).
 #[cfg(all(
     target_os = "android",
     any(
@@ -887,8 +884,7 @@ macro_rules! wrap_client_callback {
     };
 }
 
-/// Emits the per-version `IClientCallback` impl for [`ForwardClientCallback`]
-/// (one per supported pre-16 version).
+/// Emits the per-version `IClientCallback` impl for `ForwardClientCallback` (pre-16).
 macro_rules! forward_client_callback_impl {
     ($modu:ident, $feat:literal) => {
         #[cfg(all(target_os = "android", feature = $feat))]
@@ -898,9 +894,7 @@ macro_rules! forward_client_callback_impl {
                 _registered: &crate::SIBinder,
                 _has_clients: bool,
             ) -> crate::BinderResult<()> {
-                // Unreachable on the serialize-only path; see the
-                // ForwardClientCallback doc. Return an error rather than
-                // panic in library code if it is ever reached.
+                // Unreachable on the serialize-only path (type doc); error rather than panic.
                 Err(crate::StatusCode::UnknownTransaction.into())
             }
         }
@@ -1072,10 +1066,7 @@ impl ServiceManager {
         match self {
             #[cfg(all(target_os = "android", feature = "android_10"))]
             ServiceManager::Android10(sm) => {
-                // The legacy protocol enumerates by index and stops at the
-                // first index that does not answer, so a failure part-way
-                // through is indistinguishable from the end of the list.
-                // There is no status to preserve.
+                // Index enumeration stops at the first gap: a mid-list failure looks like the end.
                 Ok(android_10::list_services(sm, dump_priority))
             }
             #[cfg(all(target_os = "android", feature = "android_11"))]
@@ -1177,9 +1168,7 @@ impl ServiceManager {
                 log::error!("get_connection_info: not supported on Android 12");
                 None
             }
-            // Each version generates its own `ConnectionInfo`; rebuild the
-            // unified one field by field, as the `getServiceDebugInfo`
-            // dispatch does for `ServiceDebugInfo`.
+            // Per-version `ConnectionInfo`: rebuild field by field, as for `ServiceDebugInfo`.
             #[cfg(all(target_os = "android", feature = "android_13"))]
             ServiceManager::Android13(sm) => {
                 android_13::get_connection_info(sm, name).map(|info| ConnectionInfo {
@@ -1255,7 +1244,7 @@ impl ServiceManager {
         }
     }
 
-    /// `add_service` + `FLAG_IS_LAZY_SERVICE` (15 r6+ and 16 only; 11–14 have no such bit, 10 is refused).
+    /// `add_service` + `FLAG_IS_LAZY_SERVICE`: 15 r6+ and 16 (11–14 lack the bit, 10 is refused).
     pub(crate) fn add_lazy_service(
         &self,
         identifier: &str,
@@ -1263,9 +1252,7 @@ impl ServiceManager {
     ) -> std::result::Result<(), Status> {
         let binder = binder.into();
         match self {
-            // The legacy C protocol has neither `registerClientCallback` nor
-            // `tryUnregisterService`, so a service published here could
-            // never be tracked *or* taken back down. Refuse before it is.
+            // Legacy C protocol lacks client callbacks and unregister: refuse before publishing.
             #[cfg(all(target_os = "android", feature = "android_10"))]
             ServiceManager::Android10(_) => Err(unsupported("lazy service registration", 11)),
             #[cfg(all(target_os = "android", feature = "android_11"))]
@@ -1470,9 +1457,7 @@ impl ServiceManager {
         }
     }
 
-    /// [`register_client_callback`](Self::register_client_callback) keeping the
-    /// service manager's own [`Status`] (`EX_SECURITY` and so on), for
-    /// [`LazyServiceRegistrar`](crate::lazy_service::LazyServiceRegistrar).
+    /// `register_client_callback` keeping the SM's own [`Status`], for `LazyServiceRegistrar`.
     pub(crate) fn register_client_callback_status(
         &self,
         name: &str,
@@ -1523,9 +1508,7 @@ impl ServiceManager {
         }
     }
 
-    /// [`try_unregister_service`](Self::try_unregister_service) keeping the
-    /// service manager's own [`Status`], for
-    /// [`LazyServiceRegistrar`](crate::lazy_service::LazyServiceRegistrar).
+    /// `try_unregister_service` keeping the SM's own [`Status`], for `LazyServiceRegistrar`.
     pub(crate) fn try_unregister_service_status(
         &self,
         name: &str,
@@ -1655,7 +1638,9 @@ impl ServiceManager {
     /// service manager is unreachable" (e.g. to fail fast instead of retrying).
     ///
     /// This is the `getService` wire call, so unlike `check_service` it lets
-    /// the service manager start an unregistered lazy service.
+    /// the service manager start an unregistered lazy service — except on
+    /// Android 15 r6+, where `check_service` is carried by `getService` too
+    /// (see the module doc).
     ///
     /// It is also what [`wait_for_service`](Self::wait_for_service) uses to give
     /// up on a dead service manager instead of looping forever (AOSP
@@ -1720,7 +1705,10 @@ impl ServiceManager {
     /// The wait is **unbounded** on every supported version (matching AOSP's
     /// `while(true)`): it returns when the service appears, or `None` when the
     /// service manager itself is unreachable — a transport error on the lookup,
-    /// mirroring AOSP's `realGetService`-error → `nullptr`.
+    /// mirroring AOSP's `realGetService`-error → `nullptr`. It also returns
+    /// `None` when the service manager refuses `registerForNotifications` for
+    /// `name` (an invalid service name, or an SELinux `find` denial), as AOSP
+    /// does: such a name could never be delivered, so waiting would not end.
     ///
     /// # Thread pool: event-driven vs. polling
     ///
@@ -1740,31 +1728,34 @@ impl ServiceManager {
     /// polling. The contract is the same (unbounded until the service appears),
     /// except that the legacy protocol cannot distinguish "not registered" from
     /// a transport error, so the wait does not give up early there — it keeps
-    /// polling.
+    /// polling. The per-second pause is a condvar wait on the waiter's
+    /// cancellation state rather than `thread::sleep`, so a dropped
+    /// `wait_for_interface_async` future releases its blocking-pool thread
+    /// at once there too.
+    ///
+    /// # Cancellation
+    ///
+    /// `crate::wait_for_interface_async` (plan 11-1 §3.1) runs this wait on
+    /// the blocking pool with a caller-owned waiter state and cancels it from
+    /// its guard's `Drop` when the future is dropped. `onRegistration` and
+    /// the cancel signal wake the same condition variable, so the wait has
+    /// one blocking point and the cancel latency is the notify, not the 1 s
+    /// tick: the thread leaves and unregisters its callback at once.
+    /// Cancellation is checked before registering too, so a future dropped
+    /// during the fast path never registers a callback, and a cancel issued
+    /// before the thread blocks stays set, so that wait also gives up.
     pub fn wait_for_service(&self, name: &str) -> Option<SIBinder> {
-        // A wait nobody can cancel: the state is private to this call, so
-        // `cancelled` is never set and the loop below is AOSP's `while(true)`.
+        // Private state is never cancelled, so this is AOSP's `while(true)`.
         self.wait_for_service_cancellable(name, Arc::new(WaiterState::default()))
     }
 
-    /// [`wait_for_service`](Self::wait_for_service) with a caller-owned
-    /// [`WaiterState`], whose [`cancel`](WaiterState::cancel) ends the wait
-    /// with `None` at once instead of at the next tick.
-    ///
-    /// This is what makes the wait usable from a future that can be dropped
-    /// (`crate::wait_for_interface_async`, plan 11-1 §3.1): the async wrapper
-    /// runs this on the blocking pool and cancels from the guard's `Drop`, so
-    /// the thread leaves and `UnregisterOnDrop` runs immediately rather than
-    /// up to a second later. Cancellation is checked before registering too,
-    /// so a future dropped during the fast path never registers a callback.
+    /// `wait_for_service` that `state.cancel()` ends at once; see its rustdoc "Cancellation".
     pub(crate) fn wait_for_service_cancellable(
         &self,
         name: &str,
         state: Arc<WaiterState>,
     ) -> Option<SIBinder> {
-        // Fast path: already registered — no callback needed. A transport error
-        // means the SM is unreachable, so give up (AOSP's initial
-        // `realGetService` error → `nullptr`).
+        // Fast path; a transport error means SM unreachable (AOSP `realGetService` → nullptr).
         match self.try_get_service(name) {
             Ok(Some(binder)) => return Some(binder),
             Ok(None) => {}
@@ -1774,8 +1765,7 @@ impl ServiceManager {
             }
         }
 
-        // Cancelled during the fast-path round trip: leave without touching
-        // the service manager's callback list.
+        // Cancelled during the fast path: leave the service manager's callback list untouched.
         if state.is_cancelled() {
             return None;
         }
@@ -1783,13 +1773,13 @@ impl ServiceManager {
         let callback = BnServiceCallback::new_binder(Waiter(state.clone()));
 
         if let Err(err) = self.register_for_notifications(name, &callback) {
-            // Notifications unsupported (Android 10) or the SM is unreachable;
-            // either way fall back to polling.
-            log::warn!(
-                "wait_for_service: notifications unavailable for {name} ({err:?}); \
-                 falling back to polling"
-            );
-            return self.poll_for_service(name, &state);
+            #[cfg(all(target_os = "android", feature = "android_10"))]
+            if matches!(self, ServiceManager::Android10(_)) {
+                return self.poll_for_service(name, &state);
+            }
+            // AOSP `waitForService`: a refused registration (bad name, SELinux) ends the wait.
+            log::warn!("wait_for_service: registerForNotifications({name}) failed ({err:?})");
+            return None;
         }
         // Always unregister, even on early return / panic (AOSP's `Defer`).
         let _unregister = UnregisterOnDrop {
@@ -1816,14 +1806,12 @@ impl ServiceManager {
                     return None;
                 }
             }
-            // Throttle to ~every 10s so a slow/missing service stays visible
-            // without flooding the log every second.
+            // Every ~10s: a missing service stays visible without flooding the log.
             if waited_secs % 10 == 0 {
                 log::warn!("wait_for_service: still waiting for {name} ({waited_secs}s)...");
             }
             waited_secs += 1;
-            // Lazy-service race: re-poll each tick (AOSP `realGetService`),
-            // giving up if the service manager has become unreachable.
+            // Lazy-service race: re-poll each tick (AOSP `realGetService`); stop if SM is gone.
             match self.try_get_service(name) {
                 Ok(Some(binder)) => return Some(binder),
                 Ok(None) => {}
@@ -1847,19 +1835,8 @@ impl ServiceManager {
         }
     }
 
-    /// Unbounded fallback poll used by
-    /// [`wait_for_service`](Self::wait_for_service) when the service manager
-    /// has no registration notifications (Android 10) or the notification
-    /// registration failed. Polls once per second until the service appears
-    /// (`Some`) or a transport error shows the service manager is unreachable
-    /// (`None`) — the same contract as the event path. On Android 10 a failure
-    /// is reported as not-found, so it keeps polling rather than giving up.
-    ///
-    /// The per-tick sleep is a `cv` wait on `state` rather than
-    /// `thread::sleep`, so a cancelled wait leaves here as promptly as it
-    /// leaves the event path. Without that, the fallback — which is the whole
-    /// wait on Android 10 — would keep a blocking-pool thread polling after
-    /// the caller's future was dropped.
+    /// Android 10 only: 1s polls until the service appears or the wait is cancelled.
+    #[cfg(all(target_os = "android", feature = "android_10"))]
     fn poll_for_service(&self, name: &str, state: &WaiterState) -> Option<SIBinder> {
         loop {
             match self.try_get_service(name) {
@@ -1882,23 +1859,14 @@ impl ServiceManager {
     }
 }
 
-/// Shared state between a [`Waiter`] callback (registered with the service
-/// manager) and the thread blocked in [`ServiceManager::wait_for_service`].
-/// `onRegistration` stores the binder and signals `cv`; the waiter observes
-/// it under `inner`.
-///
-/// A third party — the async wrapper's drop guard — reaches the same `cv`
-/// through [`cancel`](Self::cancel). Both wake-ups are the same mechanism, so
-/// the wait has one blocking point and the cancel latency is the notify, not
-/// the 1s tick.
+/// Shared by [`Waiter`], the blocked waiter and `cancel`: one `cv` for both wake-ups.
 #[derive(Default)]
 pub(crate) struct WaiterState {
     inner: std::sync::Mutex<WaiterInner>,
     cv: std::sync::Condvar,
 }
 
-/// The `cv`-protected half of [`WaiterState`]: what the wait is waiting for,
-/// and whether the caller has given up.
+/// The `cv`-protected half of [`WaiterState`]: the awaited binder and the give-up flag.
 #[derive(Default)]
 struct WaiterInner {
     binder: Option<SIBinder>,
@@ -1906,12 +1874,8 @@ struct WaiterInner {
 }
 
 impl WaiterState {
-    /// End the wait without a service. The blocked thread wakes, returns
-    /// `None`, and unregisters its callback on the way out.
-    ///
-    /// Idempotent, and safe to call when no thread is waiting (the flag stays
-    /// set, so a wait that has not reached its blocking point yet also gives
-    /// up).
+    /// Ends the wait with `None` (idempotent, sticky); only the async drop guard calls it.
+    #[cfg(feature = "tokio")]
     pub(crate) fn cancel(&self) {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         guard.cancelled = true;
@@ -1927,9 +1891,7 @@ impl WaiterState {
     }
 }
 
-/// One-shot [`IServiceCallback`] that records the registered binder and wakes
-/// [`ServiceManager::wait_for_service`]. Mirrors the local `Waiter` class
-/// inside AOSP `IServiceManager::waitForService`.
+/// One-shot callback waking the waiter; AOSP `waitForService`'s local `Waiter` class.
 struct Waiter(Arc<WaiterState>);
 
 impl Interface for Waiter {}
@@ -1939,15 +1901,13 @@ impl IServiceCallback for Waiter {
         let mut guard = self.0.inner.lock().unwrap_or_else(|e| e.into_inner());
         guard.binder = Some(service.clone());
         drop(guard);
-        // Exactly one thread waits on this state (the matching
-        // `wait_for_service` call), mirroring AOSP's `mCv.notify_one()`.
+        // One waiter per state (its `wait_for_service` call), as AOSP's `mCv.notify_one()`.
         self.0.cv.notify_one();
         Ok(())
     }
 }
 
-/// RAII: unregister the wait callback when the wait ends (success, error, or
-/// panic), mirroring the `Defer unregister` in AOSP `waitForService`.
+/// Unregisters the wait callback on any exit, as AOSP `waitForService`'s `Defer unregister`.
 struct UnregisterOnDrop<'a> {
     sm: &'a ServiceManager,
     name: &'a str,
@@ -1962,10 +1922,7 @@ impl Drop for UnregisterOnDrop<'_> {
     }
 }
 
-//------------------------------------------------------------------------------
-// Convenience Functions
-//------------------------------------------------------------------------------
-// The following functions provide a simpler API by using the default ServiceManager instance
+// --- Convenience functions over the default ServiceManager instance ---------
 
 /// Convenience function to list services from the default ServiceManager.
 ///
@@ -2048,7 +2005,7 @@ pub(crate) fn add_lazy_service(
     default()?.add_lazy_service(identifier, binder)
 }
 
-/// `default().register_client_callback_status(..)`; see [`ServiceManager::register_client_callback_status`].
+/// [`ServiceManager::register_client_callback_status`] on [`default`].
 pub(crate) fn register_client_callback_status(
     name: &str,
     service: &SIBinder,
@@ -2057,7 +2014,7 @@ pub(crate) fn register_client_callback_status(
     default()?.register_client_callback_status(name, service, callback)
 }
 
-/// `default().try_unregister_service_status(..)`; see [`ServiceManager::try_unregister_service_status`].
+/// [`ServiceManager::try_unregister_service_status`] on [`default`].
 pub(crate) fn try_unregister_service_status(
     name: &str,
     service: &SIBinder,
@@ -2141,7 +2098,8 @@ pub fn try_get_interface<T: FromIBinder + ?Sized>(name: &str) -> Result<Option<S
 /// This is equivalent to `default().is_declared(name)`.
 ///
 /// Panics on an uninitialized `ProcessState` — see [`default`]'s `# Panics`.
-/// A `false` here means "not declared", never "no service manager".
+/// `false` also covers an unreachable or refusing service manager; use
+/// [`try_is_declared`] to tell those apart.
 #[inline]
 pub fn is_declared(name: &str) -> bool {
     default().map(|sm| sm.is_declared(name)).unwrap_or(false)

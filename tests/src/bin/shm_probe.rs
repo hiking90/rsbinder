@@ -82,8 +82,7 @@ fn open(name: &str) -> Result<BpMemory> {
     Ok(bp)
 }
 
-/// `Ok(Err(detail))` = the peer answered, but its heap is not the one
-/// asked for.
+/// `Ok(Err(detail))` = the peer answered, but its heap is not the one asked for.
 fn read(name: &str, len: usize) -> Result<std::result::Result<u32, String>> {
     let bp = open(name)?;
     let heap = bp.resolve()?;

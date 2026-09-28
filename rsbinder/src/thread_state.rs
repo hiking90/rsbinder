@@ -63,8 +63,183 @@
 //!   in a `RefCell` borrow across a callback risks dragging the borrow into
 //!   re-entrant code.
 //!
-//! See `b17d522` for the regression that motivated the explicit P2 split in
-//! `process_pending_derefs`.
+//! `process_pending_derefs` applies P2 explicitly; see below.
+//!
+//! ## R1 at specific call sites
+//!
+//! - **`process_pending_derefs`** is called with no `THREAD_STATE` or
+//!   `BINDER_DEREFS` borrow held. Each `deref_native_kernel(id)` may, when an
+//!   entry's counters both reach zero, reach `remove_entry_if_zero`, which
+//!   drops the canonical `Arc<dyn IBinder>` and runs the user's
+//!   `Inner<T>::drop` synchronously. A user destructor that makes an outgoing
+//!   synchronous call goes `wait_for_response` → `talk_with_driver` →
+//!   `execute_command`, whose `BR_RELEASE` / `BR_DECREFS` arms push into
+//!   `BINDER_DEREFS` through a fresh `borrow_mut()`. The function therefore
+//!   alternates: take the borrow, take the whole weak queue (or pop one strong
+//!   id), release the borrow, dispatch outside it. Re-entrant pushes land in
+//!   a fresh borrow and the outer loop picks them up on its next iteration;
+//!   do not hoist the borrow out of the loop. Order matches libbinder: all
+//!   weak derefs drain before the next strong one is dispatched, so a weak
+//!   deref queued by a strong-deref destructor runs ahead of the next pending
+//!   strong; each queue is FIFO (`VecDeque::pop_front` / `mem::take`).
+//! - **`dispatch_transact_caught`** is called with no `THREAD_STATE` or
+//!   `BINDER_DEREFS` borrow held: `Transactable::transact` is user code that
+//!   may make nested binder calls into this module.
+//! - **`talk_with_driver`** holds an immutable `THREAD_STATE` borrow across the
+//!   `BINDER_WRITE_READ` ioctl to read `driver`. This is sound only because
+//!   the ioctl does not re-enter Rust on the same thread (the kernel queues
+//!   incoming work and returns). EINTR / signal-safety / cancellation handling
+//!   or any same-thread Rust callback added at this point breaks that
+//!   property and turns the borrow into an R1 violation; the fix then is to
+//!   clone the `Arc<File>` out under a short borrow and pass it by value
+//!   across the syscall.
+//!
+//! # RPC calling context
+//!
+//! The kernel calling identity lives in `THREAD_STATE.transaction`, but
+//! `ThreadState::new()` eagerly pulls `ProcessState::as_self()`, which
+//! **panics in a pure-RPC process** (no kernel binder). The RPC dispatch path
+//! therefore must not touch `THREAD_STATE`. Instead it stamps the caller into
+//! the separate, `ProcessState`-independent `RPC_CALLING` thread-local for the
+//! duration of one RPC `on_transact`, and the public calling-identity
+//! accessors consult it *first*, so they work in a pure-RPC process and never
+//! force the kernel thread-local (Plan 2-16 Phase B).
+//!
+//! The cell holds an `Arc<PeerIdentity>` — the full peer, so handler-side
+//! authorization can see the uid *and* the certificate/vsock identity. It is
+//! borrowed only momentarily (clone-out) and never across the user handler:
+//! set → run handler → restore, so R1 holds by construction. The `Arc` keeps
+//! the per-dispatch and oneway-drain installs cheap.
+//!
+//! `RPC_CALLING_CAPS` holds the dispatching session's `TransportCaps`,
+//! installed by the same guard. It is a separate cell rather than a field
+//! beside the peer for two reasons: `Caller::Rpc(PeerIdentity)` is a public
+//! tuple variant, so widening it would break every `match` on it; and caps are
+//! a `Copy` `u32` that a `Cell` returns without a borrow, so reading them
+//! cannot hold anything across a user callback. The caps are a snapshot taken
+//! when the transaction was dispatched: the session can gain or lose a
+//! connection while the handler runs, and the handler still sees what the
+//! call arrived over.
+//!
+//! `RpcCallingGuard::install` stamps both cells around one RPC dispatch and
+//! restores their previous values on drop, so nested dispatches nest, unwind
+//! included. `RpcCallingGuard::suspend` clears them wherever the kernel driver
+//! makes this thread run user code. A thread parked in `wait_for_response`
+//! executes whatever the driver returns, so an RPC handler that makes an
+//! outgoing kernel call can have driver-initiated user code run inside it, and
+//! that code's caller is not the RPC peer. With the cells left installed every
+//! calling-identity accessor would answer for the suspended RPC peer
+//! (`calling_caps` would report the RPC session's caps for a caller that has
+//! all of them).
+//!
+//! # Calling-identity token
+//!
+//! `clear_calling_identity` returns the 64-bit token of AOSP
+//! `packCallingIdentity` (`IPCThreadState.cpp:498-511`), bit for bit:
+//!
+//! ```text
+//! 32b      |        1b         |         1b            |        30b
+//! uid      | pid sign bit      | hasExplicitIdentity   | pid (rest)
+//! ```
+//!
+//! `hasExplicitIdentity` sits in the second-highest bit of the low half so a
+//! negative pid (top sign bit) still round-trips. Tokens never go on the wire;
+//! the AOSP layout keeps `clear`/`restore` tokens comparable across
+//! implementations and lets AOSP tests against the bit pattern pass. The pid
+//! window is 30 bits plus sign: a value such as `i32::MIN`, which overlaps the
+//! `hasExplicitIdentity` bit, is outside it.
+//!
+//! `TransactionState::has_explicit_identity` is AOSP `mHasExplicitIdentity`:
+//! `true` after `clear_calling_identity()` has replaced the kernel-delivered
+//! `calling_uid`/`calling_pid` with this process's own, and reset to `false`
+//! on every incoming `BR_TRANSACTION` (`IPCThreadState.cpp:1141`,
+//! `mHasExplicitIdentity = false`).
+//!
+//! # Thread exit
+//!
+//! `ThreadExitGuard` is AOSP `IPCThreadState::threadDestructor`: when a thread
+//! that talked to the driver ends, it flushes what is still queued and sends
+//! `BINDER_THREAD_EXIT`. Without it the kernel keeps the thread's
+//! `binder_thread` until the fd closes, and a recycled tid inherits it. The
+//! guard is armed from `talk_with_driver`, the one function every driver
+//! round trip goes through, so every thread that touched the driver gets
+//! exactly one.
+//!
+//! # Dispatch notes
+//!
+//! - **`TF_STATUS_CODE` reply carrying 0.** AOSP
+//!   `IPCThreadState::waitForResponse` ends the status-code branch with an
+//!   unconditional `goto finish` (`return err`, even for `NO_ERROR`), so such
+//!   a reply yields a successful empty reply and never loops.
+//!   `wait_for_response` returns an empty `Parcel` to match; falling through
+//!   would re-enter its loop and block in `talk_with_driver` waiting for a
+//!   command a conforming peer never sends, hanging (possibly the main
+//!   thread) on a malformed or hostile reply.
+//! - **Native target ref balance.** For a `BR_TRANSACTION` to a local binder,
+//!   `target.ptr` is the process-monotonic id assigned by `publish_native`.
+//!   It is resolved via the sidecar table (read-only, no count change); the
+//!   table keeps `Inner<T>` alive while the entry exists, so the `SIBinder`
+//!   built there can drive the user's `Transactable`. Its `RefCounter` ops
+//!   balance within the block: `from_arc` calls `inc_strong` (+1),
+//!   `attempt_increase` adds one (+1), `decrease()` cancels one (−1), and the
+//!   `SIBinder`'s `Drop` cancels the last (−1).
+//! - **Reply path containment.** The saved transaction state is restored on
+//!   every exit (an `Err` or panic must not leak it into the next command),
+//!   and a panic from the reply flush/await — `talk_with_driver` or a nested
+//!   dispatch; OOM aborts and is not catchable — is caught rather than
+//!   unwinding the worker loop (as `dispatch_transact_caught` does; a dropped
+//!   reply reaches a sync caller as `BR_DEAD_REPLY`). The `unflushed_mark` is
+//!   taken outside `catch_unwind` so the panic arm can rewind to it too. That
+//!   arm rewinds only this transaction's bytes: truncating the whole
+//!   `out_parcel` would also drop a `BC_FREE_BUFFER` queued earlier by a
+//!   nested call — which `flush_if_needed` never flushes on a looper thread —
+//!   and the kernel would never reclaim that transaction buffer. It does not
+//!   `retry_flush` either: the panic may have come from `talk_with_driver`,
+//!   and a re-entry would unwind outside the `catch_unwind`.
+//! - **Call restriction before queuing.** `transact` enforces
+//!   `CallRestriction` *before* queuing `BC_TRANSACTION`.
+//!   `write_transaction_data` records raw pointers into the caller's `data`;
+//!   if the `FatalIfNotOneway` `panic!` unwinds instead of aborting (it is
+//!   reachable under `dispatch_transact_caught`'s `catch_unwind` for a nested
+//!   sync call, and under tokio's `spawn_blocking` panic capture), a completed
+//!   `BC_TRANSACTION` with dangling pointers would stay in `out_parcel` and be
+//!   flushed later — a cross-process use-after-free. AOSP checks *after*
+//!   queuing, but its `LOG_ALWAYS_FATAL` aborts, so its queued command is
+//!   never flushed.
+//! - **Rewinding unflushed commands.** When a transact or reply fails,
+//!   `discard_unflushed_commands` rewinds `out_parcel` to the `queued_at` mark
+//!   taken by `unflushed_mark`: the command there points into memory the
+//!   caller is about to release. `out_flush_epoch` is bumped each time the
+//!   driver consumes `out_parcel`, so the mark tells "my command is still
+//!   queued" from "consumed, and the buffer refilled since"; only the former
+//!   is rewound. With `retry_flush` (`BC_REPLY` only) one more flush is tried
+//!   first, so a transient failure does not cost the peer its reply. A retried
+//!   `BC_TRANSACTION` would instead leave a two-way call in flight whose
+//!   `BR_REPLY` the next `transact` would take.
+//! - **Handler panics.** `dispatch_transact_caught` catches a panic from
+//!   `Transactable::transact`, discards the partial reply, and returns
+//!   `StatusCode::Unknown`, so the `BR_TRANSACTION` reply path sends the
+//!   client a deterministic error reply instead of leaving it waiting for
+//!   `BR_REPLY`. This mirrors the guard around `DeathRecipient` callbacks in
+//!   `ProxyHandle::dispatch_obituary_callbacks`; the `Transactable` trait doc
+//!   states the full guarantee.
+//! - **Dead-binder handshake.** For `BR_DEAD_BINDER`,
+//!   `drive_dead_binder_handshake` runs three phases: `obituary` (the user
+//!   callbacks), `queue_done` (write `BC_DEAD_BINDER_DONE`), and `pin_release`
+//!   (flush `release_obituary_pin`'s `BC_DECREFS`). The kernel `binder_ref`
+//!   slot leaks for good if either of the last two is lost, so both run
+//!   whatever the obituary returned. The obituary error takes priority over
+//!   the pin-release error, which is logged so it is not lost when both fail.
+//!   A `queue_done` failure (only when `out_parcel` is unhealthy, e.g. OOM)
+//!   skips `pin_release` and the slot leaks; the next ioctl on this thread
+//!   fails anyway.
+//! - **Refused commands.** A `BINDER_WRITE_READ` that fails or stops short
+//!   reports `write_consumed`, the offset the driver gave up at, so the
+//!   command starting there is the one it rejected. `describe_refused_command`
+//!   names it because the usual causes are caller bugs the errno alone cannot
+//!   tell apart: a refcount underflow from an over-released proxy
+//!   (`BC_RELEASE` / `BC_DECREFS`), or a `BC_FREE_BUFFER` for a buffer already
+//!   returned.
 
 use log::error;
 use std::backtrace::Backtrace;
@@ -79,30 +254,22 @@ use crate::{
     binder::*, command_stream::CommandStream, error::*, parcel::*, process_state::*, sys::*,
 };
 
-// See module doc — R1: borrows of these `RefCell`s must not be held across
-// calls that may re-borrow either cell (user callbacks, other binder entry
-// points). Use the P2 (minimal scope) and P3 (stack-save) patterns.
+// R1 (module doc): no borrow of these cells across a call that may re-borrow them.
 thread_local! {
     static THREAD_STATE: RefCell<ThreadState> = RefCell::new(ThreadState::new());
     static BINDER_DEREFS: RefCell<BinderDerefs> = RefCell::new(BinderDerefs::new());
-    // Kept apart from `THREAD_STATE` on purpose: a `Drop` on `ThreadState`
-    // itself could not reach `THREAD_STATE.with` (its own destructor is
-    // running), so the guard carries everything it needs.
+    // Apart from `THREAD_STATE`: `ThreadState`'s own Drop could not reach `THREAD_STATE.with`.
     static THREAD_EXIT_GUARD: RefCell<Option<ThreadExitGuard>> = const { RefCell::new(None) };
 }
 
-/// AOSP `IPCThreadState::threadDestructor`: when a thread that talked to the
-/// driver ends, flush what it still has queued and send `BINDER_THREAD_EXIT`
-/// (without it the kernel keeps the thread's `binder_thread` until the fd
-/// closes, and a recycled tid inherits it).
+/// AOSP `threadDestructor`: flush, then `BINDER_THREAD_EXIT`; see module doc "Thread exit".
 struct ThreadExitGuard {
     driver: Arc<File>,
 }
 
 impl Drop for ThreadExitGuard {
     fn drop(&mut self) {
-        // Thread-local destruction order is unspecified; `THREAD_STATE` may
-        // already be gone, in which case there is nothing left to flush.
+        // TLS destruction order is unspecified; `THREAD_STATE` may already be gone.
         if THREAD_STATE.try_with(|_| ()).is_ok() {
             if let Err(e) = flush_commands() {
                 log::warn!("flush on binder thread exit failed: {e}");
@@ -114,9 +281,7 @@ impl Drop for ThreadExitGuard {
     }
 }
 
-/// Arm [`ThreadExitGuard`] for this thread if it is not armed yet. Called
-/// from `talk_with_driver`, the one function every driver round-trip goes
-/// through, so any thread that ever touched the driver gets exactly one.
+/// Arms [`ThreadExitGuard`] once per thread, from `talk_with_driver` (every round trip).
 fn ensure_thread_exit_guard(driver: &Arc<File>) {
     let _ = THREAD_EXIT_GUARD.try_with(|g| {
         let mut g = g.borrow_mut();
@@ -128,58 +293,21 @@ fn ensure_thread_exit_guard(driver: &Arc<File>) {
     });
 }
 
-// ---- RPC calling context (Plan 2-16 Phase B) ------------------------
-//
-// The kernel calling identity lives in `THREAD_STATE.transaction`, but
-// `ThreadState::new()` eagerly pulls `ProcessState::as_self()`, which
-// **panics in a pure-RPC process** (no kernel binder). The RPC dispatch
-// path therefore must NOT touch `THREAD_STATE`. Instead it stamps the
-// caller's uid/pid into this separate, ProcessState-independent
-// thread-local for the duration of one RPC `on_transact`, and the public
-// calling-identity accessors consult it *first* (so they work in a
-// pure-RPC process and never force the kernel thread-local).
-//
-// The store holds an `Arc<PeerIdentity>` (the full peer, so handler-side
-// authorization can see uid *and* the cert/vsock identity), borrowed only
-// momentarily (clone-out) and never across the user handler — the R1
-// borrow discipline (module doc) satisfied by construction: set → run
-// handler → restore, no live borrow during the callout. `Arc` keeps the
-// per-dispatch and oneway-drain installs cheap.
+// ---- RPC calling context: see module doc "RPC calling context" ----
 #[cfg(feature = "rpc")]
 thread_local! {
     static RPC_CALLING: std::cell::RefCell<Option<std::sync::Arc<crate::rpc::transport::PeerIdentity>>> =
         const { std::cell::RefCell::new(None) };
-    /// The dispatching session's [`TransportCaps`](crate::TransportCaps),
-    /// snapshotted alongside [`RPC_CALLING`] by the same guard.
-    ///
-    /// A separate cell rather than a field beside the peer, for two
-    /// reasons: `Caller::Rpc(PeerIdentity)` is a public tuple variant and
-    /// widening it would break every `match` on it, and caps are a `Copy`
-    /// `u32` that a `Cell` hands back without a borrow — so reading them
-    /// cannot hold anything across a user callback (module doc R1).
+    /// Session caps beside `RPC_CALLING`, a `Cell` on purpose; see module doc (RPC context).
     static RPC_CALLING_CAPS: std::cell::Cell<Option<crate::TransportCaps>> =
         const { std::cell::Cell::new(None) };
 }
 
-/// Fail-closed calling uid for RPC transports that carry **no** uid
-/// (`Vsock` cid, TLS `Certificate`, `Anonymous`). `u32::MAX`
-/// (`(uid_t)-1`) is never a real privileged uid, so a hand-rolled uid
-/// ACL (`if get_calling_uid() == AID_SYSTEM { … }`) can never
-/// accidentally match — and it is deliberately **not** `0`, so it can
-/// never be mistaken for root. See Plan 2-16 §1.2.
+/// Uid for uid-less peers: `(uid_t)-1` matches no uid ACL and is not root; Plan 2-16 §1.2.
 #[cfg(feature = "rpc")]
 pub(crate) const RPC_UNKNOWN_CALLING_UID: binder::uid_t = binder::uid_t::MAX;
 
-/// Owns this thread's RPC calling context — the caller's
-/// [`PeerIdentity`](crate::rpc::PeerIdentity) in [`RPC_CALLING`] and the
-/// dispatching session's caps in [`RPC_CALLING_CAPS`] — for the duration of
-/// one dispatch, restoring **both** cells to their previous values on drop
-/// (so nested dispatches nest correctly, unwind included).
-///
-/// [`install`](Self::install) stamps the two cells around an RPC dispatch.
-/// [`suspend`](Self::suspend) clears them wherever the kernel driver makes
-/// this thread run user code — that code's caller is not the RPC peer, even
-/// when an RPC dispatch is further up the stack.
+/// Sets or clears both RPC calling cells for one scope, restoring both on drop (see module doc).
 #[cfg(feature = "rpc")]
 pub(crate) struct RpcCallingGuard {
     previous: Option<std::sync::Arc<crate::rpc::transport::PeerIdentity>>,
@@ -188,11 +316,7 @@ pub(crate) struct RpcCallingGuard {
 
 #[cfg(feature = "rpc")]
 impl RpcCallingGuard {
-    /// Install the peer and the dispatching session's caps for one
-    /// handler. `caps` is a snapshot taken when the transaction was
-    /// dispatched — the session can gain or lose a connection while the
-    /// handler runs, and the handler still sees what the call arrived
-    /// over.
+    /// Installs the peer and the `caps` snapshotted at dispatch for one handler.
     pub(crate) fn install(
         peer: std::sync::Arc<crate::rpc::transport::PeerIdentity>,
         caps: crate::TransportCaps,
@@ -205,15 +329,7 @@ impl RpcCallingGuard {
         }
     }
 
-    /// Clear the RPC calling context while the kernel driver runs user
-    /// code on this thread, restoring it on drop.
-    ///
-    /// A thread parked in `wait_for_response` executes whatever the driver
-    /// returns, so an RPC handler that makes an outgoing kernel call can
-    /// have driver-initiated user code run inside it. Leaving the RPC
-    /// cells installed would make every calling-identity accessor answer
-    /// for the suspended RPC peer instead (`calling_caps` would report the
-    /// RPC session's caps for a caller that has all of them).
+    /// Clears the RPC context while the driver runs user code here; see module doc.
     pub(crate) fn suspend() -> Self {
         let previous = RPC_CALLING.with(|c| c.borrow_mut().take());
         let previous_caps = RPC_CALLING_CAPS.with(|c| c.take());
@@ -232,10 +348,7 @@ impl Drop for RpcCallingGuard {
     }
 }
 
-/// `(uid, pid)` mapping for the current RPC peer: a Unix peer carries a
-/// kernel-vouched uid/pid; transports without a uid (`Vsock` /
-/// `Certificate` / `Anonymous`) map to the fail-closed
-/// [`RPC_UNKNOWN_CALLING_UID`] sentinel and pid `-1`.
+/// A local peer's kernel-vouched `(uid, pid)`, else `(RPC_UNKNOWN_CALLING_UID, -1)`.
 #[cfg(feature = "rpc")]
 pub(crate) fn peer_uid_pid(
     peer: &crate::rpc::transport::PeerIdentity,
@@ -246,10 +359,7 @@ pub(crate) fn peer_uid_pid(
     }
 }
 
-/// The current RPC caller's `(uid, pid)`, or `None` when not dispatching
-/// an RPC transaction (always `None` without the `rpc` feature). Never
-/// touches `THREAD_STATE`/`ProcessState`, so it is safe to call in a
-/// pure-RPC process.
+/// The RPC caller's `(uid, pid)` if dispatching RPC; never touches `THREAD_STATE`/`ProcessState`.
 #[inline]
 fn rpc_calling() -> Option<(binder::uid_t, binder::pid_t)> {
     #[cfg(feature = "rpc")]
@@ -309,8 +419,7 @@ pub enum Caller {
 /// injectable policy across both transports, see
 /// [`crate::permission_controller::PermissionAuthority`].
 pub fn calling_caller() -> Option<Caller> {
-    // RPC takes precedence and never touches the ProcessState-coupled
-    // kernel thread-local (works in a pure-RPC process).
+    // RPC first: it never forces the ProcessState-coupled kernel thread-local.
     #[cfg(feature = "rpc")]
     {
         if let Some(peer) = RPC_CALLING.with(|c| c.borrow().as_deref().cloned()) {
@@ -326,11 +435,7 @@ pub fn calling_caller() -> Option<Caller> {
             let sid = if tr.calling_sid.is_null() {
                 None
             } else {
-                // SAFETY: `calling_sid` is the kernel-delivered, NUL-
-                // terminated SELinux context for this in-flight
-                // `BR_TRANSACTION_SEC_CTX`. The dispatch arm nulls it when
-                // it frees the buffer, so non-null means the buffer is
-                // still ours. Same contract as `get_calling_sid`.
+                // SAFETY: non-null = live NUL-terminated kernel sid (nulled on free).
                 Some(unsafe { CStr::from_ptr(tr.calling_sid as _).to_owned() })
             };
             Caller::Kernel {
@@ -365,11 +470,7 @@ pub fn calling_caller() -> Option<Caller> {
 /// Pure-RPC safe: the RPC arm never touches the kernel thread-local or
 /// [`ProcessState`].
 pub fn calling_caps() -> Option<crate::TransportCaps> {
-    // Same precedence as `calling_caller`: an RPC dispatch answers
-    // without forcing the ProcessState-coupled kernel thread-local. A
-    // kernel transaction dispatched inside an RPC handler clears the cell
-    // for its duration (`RpcCallingGuard::suspend`), so this precedence
-    // resolves to the innermost dispatch rather than to the RPC one.
+    // RPC first, as in `calling_caller`; `suspend` clears it so the innermost dispatch answers.
     #[cfg(feature = "rpc")]
     {
         if let Some(caps) = RPC_CALLING_CAPS.with(|c| c.get()) {
@@ -388,10 +489,7 @@ pub fn calling_caps() -> Option<crate::TransportCaps> {
     })
 }
 
-// Freeze observer BR labels (nr=20/21/22).
-// `BR_TRANSACTION_SEC_CTX` (nr=2) is dispatched by the special-case
-// above `return_to_str`'s indexed lookup, so the nr=20 slot is free
-// for `BR_TRANSACTION_PENDING_FROZEN`.
+// `return_to_str` special-cases BR_TRANSACTION_SEC_CTX (nr=2), so nr=20 is PENDING_FROZEN.
 const RETURN_STRINGS: [&str; 23] = [
     "BR_ERROR",
     "BR_OK",
@@ -432,9 +530,7 @@ fn return_to_str(cmd: std::os::raw::c_uint) -> &'static str {
     }
 }
 
-// Freeze observer BC labels (nr=19/20/21). Used for debug-print
-// symmetry with `RETURN_STRINGS`; the BC send path is not yet wired
-// into `write_command`.
+// Freeze BC labels (nr=19/20/21) are debug-print only; nothing queues these commands.
 const COMMAND_STRINGS: [&str; 22] = [
     "BC_TRANSACTION",
     "BC_REPLY",
@@ -478,15 +574,8 @@ struct TransactionState {
     calling_pid: binder::pid_t,
     calling_sid: *const u8,
     calling_uid: binder::uid_t,
-    // strict_mode_policy: i32,
     last_transaction_binder_flags: u32,
-    /// AOSP `mHasExplicitIdentity` — `true` after `clear_calling_identity()`
-    /// has overridden the kernel-delivered `calling_uid`/`calling_pid`
-    /// with the current process's own uid/pid. Reset to `false` on every
-    /// new incoming `BR_TRANSACTION` ([IPCThreadState.cpp:1141][1] —
-    /// `mHasExplicitIdentity = false`).
-    ///
-    /// [1]: https://cs.android.com/android/platform/superproject/main/+/main:frameworks/native/libs/binder/IPCThreadState.cpp
+    /// AOSP `mHasExplicitIdentity`: set by `clear_calling_identity`, reset per `BR_TRANSACTION`.
     has_explicit_identity: bool,
 }
 
@@ -496,28 +585,13 @@ impl TransactionState {
             calling_pid: data.transaction_data.sender_pid,
             calling_sid: data.secctx as _,
             calling_uid: data.transaction_data.sender_euid,
-            // strict_mode_policy: 0,
             last_transaction_binder_flags: data.transaction_data.flags,
             has_explicit_identity: false,
         }
     }
 }
 
-/// Pack `(has_explicit, uid, pid)` into the 64-bit AOSP calling-identity
-/// token. Wire-equivalent to `packCallingIdentity` in
-/// `IPCThreadState.cpp:498-511`:
-///
-/// ```text
-/// 32b      |        1b         |         1b            |        30b
-/// uid      | pid sign bit      | hasExplicitIdentity   | pid (rest)
-/// ```
-///
-/// AOSP packs `hasExplicitIdentity` into the 2nd bit from the left of the
-/// lower 32-bit half so that negative PIDs (which use the top sign bit)
-/// can still round-trip. rsbinder uses the exact same layout — although
-/// tokens never go on the wire, AOSP-faithful encoding makes
-/// `clear`/`restore` tokens comparable across implementations and lets
-/// any AOSP regression test against the bit pattern still pass.
+/// AOSP `packCallingIdentity` layout; see module doc "Calling-identity token".
 fn pack_calling_identity(has_explicit: bool, uid: binder::uid_t, pid: binder::pid_t) -> i64 {
     let pid_low = pid as u32;
     let pid_low = if has_explicit {
@@ -547,22 +621,7 @@ fn unpack_calling_pid(token: i64) -> binder::pid_t {
     }
 }
 
-// Storage for inbound BR_RELEASE / BR_DECREFS payloads — process-monotonic
-// u64 ids delivered by the kernel for native binders we previously
-// published. Processed lazily on the next driver round-trip via
-// `process_pending_derefs`.
-//
-// Under the new id-encoding model (replacing the fat-pointer scheme that
-// could dangle when `Inner<T>` was dropped between BR_RELEASE and
-// BR_DECREFS), the pending entries are pure ids — `deref_native_kernel`
-// looks them up in `ProcessState::published_natives` and drives
-// `kernel_refs--` / entry-removal-on-zero. No SIBinder reconstruction
-// from a raw pointer, no method dispatch on a possibly-freed `Inner<T>`.
-//
-// Outbound proxy ref-count (BC_ACQUIRE / BC_RELEASE / BC_INCREFS /
-// BC_DECREFS) is not routed through this state — proxies own kernel
-// strong refs 1-per-Arc (acquire in `ProxyHandle::new_acquired`, release
-// in `ProxyHandle::Drop`) and the cache pin owns the kernel weak ref.
+// Inbound BR_RELEASE/BR_DECREFS ids (not pointers) of our natives; `process_pending_derefs`.
 struct BinderDerefs {
     pending_strong_derefs: VecDeque<u64>,
     pending_weak_derefs: VecDeque<u64>,
@@ -577,46 +636,10 @@ impl BinderDerefs {
     }
 }
 
-/// Drain `BINDER_DEREFS` of pending BR_RELEASE / BR_DECREFS ids.
-///
-/// Each `deref_native_kernel(id)` call may, when an entry's counters
-/// both reach zero, trigger `remove_entry_if_zero` which drops the
-/// canonical `Arc<dyn IBinder>` and synchronously fires
-/// `Inner<T>::drop` on the user's `Remotable` instance. A user
-/// destructor that initiates an outgoing synchronous IPC ends up in
-/// `wait_for_response` → `talk_with_driver` → `execute_command`,
-/// whose BR_RELEASE / BR_DECREFS arms try to push back into
-/// `BINDER_DEREFS` via a fresh `borrow_mut()`.
-///
-/// To make that re-entrancy safe, this function never holds the
-/// `BINDER_DEREFS` `RefCell` borrow across a `deref_native_kernel`
-/// call. It alternates between:
-///
-///   1. Acquire the borrow, take the entire weak queue (or pop one
-///      strong id), release the borrow.
-///   2. Dispatch outside the borrow.
-///
-/// Pushes from re-entrant BR handlers go into a fresh `borrow_mut`,
-/// and the outer loop picks them up on the next iteration.
-///
-/// Order matches Android's libbinder: drain ALL weak derefs before
-/// dispatching the next strong, so a strong-deref destructor that
-/// queues a weak-deref gets drained ahead of the next pending
-/// strong. FIFO within each queue (`VecDeque::pop_front` /
-/// `mem::take` preserves insertion order).
-///
-/// # Borrow discipline (R1)
-///
-/// Must be called with NO `THREAD_STATE` or `BINDER_DEREFS` borrow held
-/// — `deref_native_kernel` may invoke user `Inner<T>::drop`, which can
-/// re-enter the binder stack. The acquire/release alternation inside this
-/// function maintains R1; do not hoist the borrow out of the loop.
+/// Drains `BR_RELEASE`/`BR_DECREFS` ids; see module doc "R1 at specific call sites".
 fn process_pending_derefs() -> Result<()> {
     loop {
-        // Inner loop: drain weak fully. Re-take after each batch
-        // because dispatch may push more weak entries (from
-        // `Inner<T>::drop` running user destructor code that
-        // synchronously triggers another BR_DECREFS).
+        // Drain weak fully; re-take per batch, since a user `Inner<T>::drop` may queue more.
         loop {
             let batch: VecDeque<u64> =
                 BINDER_DEREFS.with(|d| std::mem::take(&mut d.borrow_mut().pending_weak_derefs));
@@ -630,11 +653,7 @@ fn process_pending_derefs() -> Result<()> {
             }
         }
 
-        // Pop exactly one strong id under a fresh borrow, then
-        // dispatch outside the borrow. If none, both queues are
-        // empty (the inner loop just confirmed weak is empty), so
-        // we're done. Re-checking weak after dispatch is handled by
-        // looping back to the inner loop above.
+        // Pop one strong id, dispatch outside the borrow; none left means both queues are empty.
         let id = BINDER_DEREFS.with(|d| d.borrow_mut().pending_strong_derefs.pop_front());
         match id {
             Some(id) => {
@@ -654,9 +673,7 @@ pub(crate) struct ThreadState {
     strict_mode_policy: i32,
     is_looper: bool,
     is_flushing: bool,
-    /// Bumped each time the driver consumes `out_parcel`; lets a failed
-    /// transact tell "my command is still queued" from "consumed, and the
-    /// buffer has been refilled since" (see `discard_unflushed_commands`).
+    /// Bumped per driver consume of `out_parcel`: "still queued" vs "consumed and refilled".
     out_flush_epoch: u64,
     call_restriction: CallRestriction,
     driver: Arc<File>,
@@ -681,8 +698,7 @@ impl ThreadState {
         self.strict_mode_policy = policy;
     }
 
-    /// Where the next command will be queued: `(flush epoch, out_parcel
-    /// length)`, for `discard_unflushed_commands`.
+    /// Next command's `(flush epoch, out_parcel length)`, for `discard_unflushed_commands`.
     fn unflushed_mark(&self) -> (u64, usize) {
         (self.out_flush_epoch, self.out_parcel.data_size())
     }
@@ -720,10 +736,6 @@ impl ThreadState {
         let mut target = binder_transaction_data__bindgen_ty_1 { ptr: 0 };
         target.handle = handle;
 
-        // let all_flags: u32 = FLAG_PRIVATE_VENDOR | FLAG_CLEAR_BUF | FLAG_ONEWAY;
-        // if (flags & !all_flags) != 0 {
-        //     log::error!("Unrecognized flags sent: {:X}", flags);
-        // }
         let tr = if *status == StatusCode::Ok.into() {
             binder_transaction_data {
                 target,
@@ -764,9 +776,7 @@ impl ThreadState {
         let start = self.out_parcel.data_size();
         self.out_parcel.write_cmd::<u32>(&cmd)?;
         if let Err(e) = self.out_parcel.write_transaction(&tr) {
-            // Roll back the orphan cmd word: flushing a bare BC_* opcode with
-            // no binder_transaction_data behind it would desync the driver
-            // protocol.
+            // Roll back the orphan cmd word: a bare BC_* opcode would desync the driver.
             let _ = self.out_parcel.set_data_size(start);
             return Err(e);
         }
@@ -807,8 +817,7 @@ pub(crate) fn call_restriction() -> CallRestriction {
 /// Mirrors AOSP `IPCThreadState::setStrictModePolicy(int32_t)`
 /// (`IPCThreadState.cpp:575`).
 pub fn set_strict_mode_policy(policy: i32) {
-    // In a pure-RPC process the kernel `THREAD_STATE` is not initialized;
-    // touching it would panic (`ThreadState::new` pulls `ProcessState`).
+    // Pure-RPC process: `ThreadState::new` would panic pulling `ProcessState`.
     if !ProcessState::is_initialized() {
         return;
     }
@@ -876,10 +885,7 @@ fn replace_work_source(ws: WorkSource) -> WorkSource {
     WORK_SOURCE.with(|c| c.replace(ws))
 }
 
-/// Resets the thread's work source to unset for the duration of an
-/// inbound dispatch and restores the caller's value on drop, including on
-/// unwind. AOSP `IPCThreadState::executeCommand` `BR_TRANSACTION`
-/// (`IPCThreadState.cpp:1521-1527`, `:1617-1618`).
+/// Unset work source for one inbound dispatch (AOSP `BR_TRANSACTION`); restored on drop.
 pub(crate) struct WorkSourceDispatchGuard {
     saved: WorkSource,
 }
@@ -928,9 +934,7 @@ pub fn set_calling_work_source_uid(uid: binder::uid_t) -> i64 {
     .token()
 }
 
-/// Replace the work source uid without touching the propagation flag.
-/// AOSP marks this "internal only"; `check_interface` uses it to install
-/// the value read from the request header.
+/// Keeps the propagation flag; `check_interface` installs the header's value (AOSP internal).
 pub(crate) fn set_calling_work_source_uid_without_propagation(uid: binder::uid_t) -> i64 {
     let current = work_source();
     replace_work_source(WorkSource { uid, ..current }).token()
@@ -1001,13 +1005,7 @@ pub(crate) fn _setup_polling() -> Result<()> {
 enum UntilResponse {
     Reply,
     TransactionComplete,
-    /// Inbound `BR_ACQUIRE_RESULT` arm. Currently unreachable because
-    /// `BC_ATTEMPT_ACQUIRE` is no longer issued by rsbinder — under the
-    /// cache-pin model, regular `BC_ACQUIRE` always succeeds (the cache
-    /// pin keeps the slot alive) and `Weak<I>::upgrade` covers the
-    /// "atomically promote a weak ref" semantics. The variant is kept
-    /// only so the kernel-direction match in `wait_for_response` stays
-    /// exhaustive.
+    /// Unreachable (no `BC_ATTEMPT_ACQUIRE` under the cache pin); keeps the match exhaustive.
     #[allow(dead_code)]
     AcquireResult,
 }
@@ -1080,14 +1078,11 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
                 }
                 binder::BR_REPLY => {
                     let tr = thread_state.borrow_mut().in_parcel.read_transaction()?;
-                    // SAFETY: for a kernel-delivered BR_REPLY the driver populates
-                    // the `data.ptr` arm of the union (buffer/offsets pointers into
-                    // the mmap region), so reading that arm is valid.
+                    // SAFETY: a kernel BR_REPLY populates the `data.ptr` union arm.
                     let (buffer, offsets) = unsafe { (tr.data.ptr.buffer, tr.data.ptr.offsets) };
                     if let UntilResponse::Reply = until {
                         if (tr.flags & transaction_flags_TF_STATUS_CODE) == 0 {
-                            // SAFETY: buffer and offsets are valid pointers from binder driver
-                            // transaction data, with sizes given by tr.data_size and tr.offsets_size
+                            // SAFETY: sized driver buffer, unshared until `free_buffer`.
                             let reply = unsafe {
                                 Parcel::from_ipc_parts(
                                     buffer as _,
@@ -1100,11 +1095,7 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
                             };
                             return Ok(Some(reply));
                         } else {
-                            // SAFETY: Reading status code from binder transaction reply
-                            // - We verify tr.data_size >= size_of::<i32>() before reading
-                            // - buffer points to valid memory owned by binder driver
-                            // - The data remains valid for the transaction lifetime
-                            // - We convert to StatusCode immediately after reading
+                            // SAFETY: guarded by the size check; buffer live until `free_buffer`.
                             let status: StatusCode =
                                 if tr.data_size >= std::mem::size_of::<i32>() as u64 {
                                     unsafe { (*(buffer as *const i32)).into() }
@@ -1129,16 +1120,7 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
                                 log::warn!("binder::BR_REPLY ({status})");
                                 return Err(status);
                             }
-                            // AOSP `IPCThreadState::waitForResponse` ends the
-                            // status-code branch with an unconditional `goto
-                            // finish` (`return err`, even for NO_ERROR), so a
-                            // `TF_STATUS_CODE` reply carrying status 0 yields a
-                            // successful empty reply — it never loops. Falling
-                            // through here instead would re-enter the outer
-                            // `loop` and block in `talk_with_driver` waiting for
-                            // a command a conforming peer never sends, hanging
-                            // (potentially the main thread) on a malformed or
-                            // hostile reply. Return the empty reply to match.
+                            // Status 0 returns too, as AOSP: module doc "Dispatch notes".
                             return Ok(Some(Parcel::new()));
                         }
                     } else {
@@ -1160,23 +1142,7 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
     })
 }
 
-/// Drive the kernel handshake for `BR_DEAD_BINDER` so that a
-/// user-side `send_obituary` failure cannot strand the kernel
-/// `binder_ref` slot.
-///
-/// The kernel slot is leaked permanently if either:
-///   1. `BC_DEAD_BINDER_DONE` is not written to `out_parcel`, or
-///   2. `release_obituary_pin`'s `BC_DECREFS` is not flushed.
-///
-/// So phases 2 (`queue_done`) and 3 (`pin_release`) always run
-/// regardless of phase 1's (`obituary`) outcome. The user-visible
-/// obituary error takes priority over the pin-release error;
-/// the pin error is also logged so it is not lost when both fail.
-///
-/// Residual edge: if `queue_done` itself fails (rare — `out_parcel`
-/// is unhealthy under e.g. allocator OOM), phase 3 is skipped and the
-/// pin leak still occurs. Documented; the next ioctl on this thread
-/// will fail anyway.
+/// `BR_DEAD_BINDER` phases; only a `queue_done` error skips `pin_release`. See module doc.
 fn drive_dead_binder_handshake<O, Q, P>(
     handle: binder::binder_uintptr_t,
     obituary: O,
@@ -1188,17 +1154,10 @@ where
     Q: FnOnce() -> Result<()>,
     P: FnOnce() -> Result<()>,
 {
-    // Phase 1: dispatch recipients. Capture the result; do NOT
-    // short-circuit — kernel handshake must always complete.
+    // Phase 1: dispatch recipients; never short-circuit, the handshake must complete.
     let obituary_result = obituary();
 
-    // Phase 2: queue BC_DEAD_BINDER_DONE unconditionally. A failure
-    // here means out_parcel is unhealthy; propagate immediately
-    // because the next ioctl will surface it anyway. Phase 3 is
-    // skipped in this rare path (acknowledged residual edge). Log
-    // the obituary error first if it would otherwise be swallowed
-    // by the queue error — the obituary diagnostic is most valuable
-    // exactly when the kernel handshake is also breaking.
+    // Phase 2: a failure skips phase 3 (see fn doc); log the obituary error it would hide.
     if let Err(qe) = queue_done() {
         if let Err(oe) = &obituary_result {
             error!(
@@ -1209,10 +1168,7 @@ where
         return Err(qe);
     }
 
-    // Phase 3: release the cache pin (BC_DECREFS via flush). Always
-    // attempted, even if obituary errored. A pin-release error is
-    // logged here so the diagnostic is not swallowed when the
-    // obituary error is surfaced below.
+    // Phase 3: always release the pin; log its error now, as the obituary error wins below.
     let pin_result = pin_release();
     if let Err(e) = &pin_result {
         error!(
@@ -1221,30 +1177,13 @@ where
         );
     }
 
-    // Surface obituary error first (user-visible — death recipient
-    // observed the failure). Fall back to pin error when obituary
-    // succeeded but pin failed.
+    // The user-visible obituary error wins; the pin error surfaces only on its own.
     obituary_result?;
     pin_result?;
     Ok(())
 }
 
-/// Invoke `Transactable::transact`, catching panics so a buggy
-/// service handler cannot terminate the binder worker thread.
-///
-/// On panic, the partial reply (if any) is discarded and the caller
-/// receives `StatusCode::Unknown`, so the existing `BR_TRANSACTION`
-/// reply path synthesizes a deterministic error reply for the
-/// calling client (rather than leaving the client hung waiting for
-/// `BR_REPLY`). Mirrors the panic guard around `DeathRecipient`
-/// callbacks in `ProxyHandle::dispatch_obituary_callbacks`. See the
-/// `Transactable` trait doc for the full guarantee scope.
-///
-/// # Borrow discipline (R1)
-///
-/// Must be called with NO `THREAD_STATE` or `BINDER_DEREFS` borrow held —
-/// `Transactable::transact` is user code that may issue nested binder
-/// calls (re-entering this module). See module doc.
+/// `transact` with panics caught; call with no borrow held (R1). See module doc "Handler panics".
 fn dispatch_transact_caught(
     transactable: &dyn Transactable,
     code: TransactionCode,
@@ -1263,19 +1202,16 @@ fn dispatch_transact_caught(
                 .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
                 .unwrap_or("<non-string panic payload>");
             error!("Transactable::transact panicked for code {code}: {msg}");
-            // Discard any partially-written reply so the client does
-            // not misparse half-formed data; the reply path below
-            // turns `Err` into a clean error status.
+            // Discard the partial reply so the client never parses half-formed data.
             *reply = Parcel::new();
             Err(StatusCode::Unknown)
         }
     }
 }
 
-/// [`dispatch_transact_caught`] between the transaction observer's calls.
-/// Runs where the handler runs: no `THREAD_STATE` borrow is held.
+/// [`dispatch_transact_caught`] between the observer's calls, no `THREAD_STATE` borrow held.
 fn dispatch_kernel_observed(
-    descriptor: &str,
+    binder: &SIBinder,
     transactable: &dyn Transactable,
     tr: &binder::binder_transaction_data,
     reader: &mut Parcel,
@@ -1283,8 +1219,9 @@ fn dispatch_kernel_observed(
 ) -> Result<()> {
     let code = tr.code;
     crate::observe::observed(
+        // `descriptor()` is user code too, so it is looked up inside the caught closure.
         || crate::observe::TxnContext {
-            descriptor,
+            descriptor: binder.descriptor(),
             code,
             method: transactable.transaction_name(code),
             is_oneway: tr.flags & transaction_flags_TF_ONE_WAY != 0,
@@ -1325,13 +1262,7 @@ fn execute_command(cmd: i32) -> Result<()> {
                     }
                 };
 
-                // SAFETY: `tr_secctx` was just filled by the kernel on the
-                // BR_TRANSACTION(_SEC_CTX) path, so `transaction_data` is
-                // fully initialized and the `data.ptr` union variant (buffer
-                // + offsets, not `data.buf`) is the active one for a
-                // kernel-delivered transaction. `from_ipc_parts` adopts the
-                // driver-owned buffer/offsets with sizes taken from the same
-                // struct and the matching `free_buffer` reclaimer.
+                // SAFETY: kernel-filled `data.ptr` arm; sized, unshared until `free_buffer`.
                 let mut reader = unsafe {
                     let tr = &tr_secctx.transaction_data;
 
@@ -1344,9 +1275,7 @@ fn execute_command(cmd: i32) -> Result<()> {
                     )
                 };
 
-                // TODO: Skip now, because if below implmentation is mandatory.
-                // const void* origServingStackPointer = mServingStackPointer;
-                // mServingStackPointer = &origServingStackPointer; // anything on the stack
+                // TODO: AOSP `mServingStackPointer` is not tracked.
 
                 let (transaction_old, strict_mode_policy_old) = {
                     let mut thread_state = thread_state.borrow_mut();
@@ -1361,46 +1290,26 @@ fn execute_command(cmd: i32) -> Result<()> {
                 // Unset until an AIDL stub's `check_interface` installs the caller's value.
                 let _work_source = WorkSourceDispatchGuard::enter();
 
-                // This thread may already be inside an RPC handler that made
-                // an outgoing kernel call (nested IPC re-enters here). The
-                // kernel transaction just installed is the inner dispatch, so
-                // the RPC calling context is suspended for its duration —
-                // restored on drop, including on unwind.
+                // Nested IPC may enter from an RPC handler: suspend its calling context meanwhile.
                 #[cfg(feature = "rpc")]
                 let _rpc_suspended = RpcCallingGuard::suspend();
 
                 let mut reply = Parcel::new();
 
                 let result = {
-                    // SAFETY: kernel-delivered transaction (see above); for a
-                    // transaction targeting a local binder the `target` union's
-                    // `ptr` variant is the active one. Read-only.
+                    // SAFETY: kernel txn to a local binder; `target.ptr` is the active arm.
                     let target_ptr = unsafe { tr_secctx.transaction_data.target.ptr };
                     if target_ptr != 0 {
-                        // `target_ptr` is now the process-monotonic id
-                        // assigned by `publish_native`. Resolve via the
-                        // sidecar table (read-only, no count change) —
-                        // the table guarantees `Inner<T>` is alive
-                        // while the entry exists, so the SIBinder we
-                        // construct here can safely drive the user's
-                        // `Transactable` impl. SIBinder construction
-                        // is contained within this scope and the
-                        // RefCounter ops balance pairwise: `from_arc`
-                        // calls `inc_strong` (+1), `attempt_increase`
-                        // adds another (+1), `decrease()` cancels one
-                        // (−1), and `strong`'s `Drop` cancels the
-                        // last (−1) — net zero across the block.
+                        // A `publish_native` id; ref balance: module doc "Dispatch notes".
                         let id = target_ptr;
                         match ProcessState::as_self().lookup_native(id) {
                             Some(arc) => {
                                 let strong = SIBinder::from_arc(arc);
                                 if strong.attempt_increase() {
-                                    // `as_transactable()` is a public-trait method that
-                                    // may return `None` for a caller-supplied `IBinder`;
-                                    // reject rather than `expect`-panic on the worker loop.
+                                    // May be `None` for a user `IBinder`: reject, no panic.
                                     let result = match strong.as_transactable() {
                                         Some(t) => dispatch_kernel_observed(
-                                            strong.descriptor(),
+                                            &strong,
                                             t,
                                             &tr_secctx.transaction_data,
                                             &mut reader,
@@ -1411,13 +1320,7 @@ fn execute_command(cmd: i32) -> Result<()> {
                                             Err(StatusCode::UnknownTransaction)
                                         }
                                     };
-                                    // Never `?` out of here: the reply
-                                    // send and the `transaction` restore
-                                    // below must run even if a user
-                                    // `IBinder::dec_strong` fails, or the
-                                    // two-way caller hangs on a reply that
-                                    // never comes and the next command
-                                    // inherits this call's identity.
+                                    // No `?`: the reply and state restore must still run.
                                     if let Err(e) = strong.decrease() {
                                         log::error!("dec_strong failed for native id {id}: {e:?}");
                                     }
@@ -1436,7 +1339,7 @@ fn execute_command(cmd: i32) -> Result<()> {
                         match ProcessState::as_self().context_manager() {
                             Some(context) => match context.as_transactable() {
                                 Some(t) => dispatch_kernel_observed(
-                                    context.descriptor(),
+                                    &context,
                                     t,
                                     &tr_secctx.transaction_data,
                                     &mut reader,
@@ -1456,25 +1359,14 @@ fn execute_command(cmd: i32) -> Result<()> {
                         }
                     }
                 };
-                // Freed before the reply, as AOSP `executeCommand` does
-                // (b/238777741): the client can otherwise receive the reply and
-                // send its next transaction while this one's space is still
-                // charged to it.
+                // Freed before the reply, as AOSP `executeCommand` does (b/238777741).
                 drop(reader);
-                // `calling_sid` points into the buffer just freed; a death
-                // recipient run during the reply wait must not read it.
+                // `calling_sid` points into the freed buffer; a death recipient must not read it.
                 if let Some(tr) = thread_state.borrow_mut().transaction.as_mut() {
                     tr.calling_sid = std::ptr::null();
                 }
                 let flags = tr_secctx.transaction_data.flags;
-                // Restore the saved transaction state on every exit (an `Err`
-                // or panic must not leak it into the next command), and contain
-                // a panic from the reply flush/await — `talk_with_driver` or a
-                // nested dispatch; OOM aborts and is not catchable — rather than
-                // unwinding the worker loop (mirrors `dispatch_transact_caught`;
-                // a dropped reply reaches a sync caller as BR_DEAD_REPLY).
-                // Taken outside `catch_unwind` so the panic arm below can rewind to
-                // it too; inside, only the `Ok` path could see it.
+                // Outside the catch so the panic arm can rewind; see module doc "Dispatch notes".
                 let queued_at = thread_state.borrow().unflushed_mark();
                 let reply_result =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
@@ -1484,7 +1376,7 @@ fn execute_command(cmd: i32) -> Result<()> {
                                 Ok(_) => StatusCode::Ok.into(),
                                 Err(err) => err.into(),
                             };
-                            // The queued BC_REPLY points at `reply`/`status`; a failed flush must rewind it, not leave it.
+                            // BC_REPLY points at `reply`/`status`: a failed flush must rewind it.
                             thread_state.borrow_mut().write_transaction_data(
                                 binder::BC_REPLY,
                                 flags,
@@ -1501,8 +1393,7 @@ fn execute_command(cmd: i32) -> Result<()> {
                             let mut log = format!(
                                 "oneway function results for code {} on binder at {:X}",
                                 tr_secctx.transaction_data.code,
-                                // SAFETY: kernel-delivered transaction; `target.ptr`
-                                // is the active union variant. Read-only (logging).
+                                // SAFETY: kernel txn; `target.ptr` is the active arm.
                                 unsafe { tr_secctx.transaction_data.target.ptr }
                             );
                             log += &format!(" will be dropped but finished with status {err}");
@@ -1516,11 +1407,7 @@ fn execute_command(cmd: i32) -> Result<()> {
                     }));
 
                 {
-                    // `check_interface` overwrites `strict_mode_policy` with
-                    // the inbound header's value, so a thread that also acts
-                    // as a client would ship the last caller's policy on its
-                    // own outgoing calls unless it is put back here
-                    // (`IPCThreadState::executeCommand` does the same).
+                    // Undo `check_interface`'s policy overwrite, as AOSP `executeCommand` does.
                     let mut thread_state = thread_state.borrow_mut();
                     thread_state.transaction = transaction_old;
                     thread_state.strict_mode_policy = strict_mode_policy_old;
@@ -1529,15 +1416,7 @@ fn execute_command(cmd: i32) -> Result<()> {
                 match reply_result {
                     Ok(inner) => inner?,
                     Err(_payload) => {
-                        // A caught panic may leave `out_parcel` holding an
-                        // unflushed/partial BC_REPLY; rewind just this
-                        // transaction's bytes. Truncating the whole parcel would
-                        // also drop a `BC_FREE_BUFFER` queued earlier by a nested
-                        // call — on a looper thread `flush_if_needed` never
-                        // flushes it — and the kernel would never reclaim that
-                        // transaction buffer. No `retry_flush`: the panic may have
-                        // come from `talk_with_driver`, and a re-entry would
-                        // unwind outside this `catch_unwind`.
+                        // Rewind only this reply's bytes, no retry (module doc "Dispatch notes").
                         discard_unflushed_commands(thread_state, queued_at, false);
                         log::error!(
                             "reply path panicked for code {}; reply dropped",
@@ -1551,22 +1430,11 @@ fn execute_command(cmd: i32) -> Result<()> {
             binder::BR_INCREFS => {
                 let mut state = thread_state.borrow_mut();
                 let id = state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?;
-                // The cookie half is unused under the new id encoding
-                // but the kernel still emits the original `cookie`
-                // (always 0 for our published natives). Echo it back
-                // verbatim in BC_INCREFS_DONE.
+                // Cookie (0 for our natives) is echoed verbatim in BC_INCREFS_DONE.
                 let cookie_echo = state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?;
                 drop(state);
 
-                // BR_INCREFS reflects the kernel acquiring a weak ref
-                // to one of our published natives. Pure id
-                // bookkeeping: bump `kernel_refs` in the table; the
-                // RefCounter.weak alive-signal is held above zero by
-                // `publish_native` for the entry's lifetime — no
-                // per-event RefCounter touch needed (and no SIBinder
-                // construction, no method dispatch on a possibly-freed
-                // `Inner<T>`, closing the UAF that the old
-                // fat-pointer encoding could expose).
+                // Id bookkeeping only; the table holds RefCounter.weak up for the entry's life.
                 if ProcessState::as_self().ref_native_kernel(id).is_none() {
                     log::error!("BR_INCREFS for unknown native id {id}");
                     debug_assert!(false, "BR_INCREFS for unknown native id {id}");
@@ -1589,10 +1457,7 @@ fn execute_command(cmd: i32) -> Result<()> {
                 let cookie_echo = state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?;
                 drop(state);
 
-                // Same shape as BR_INCREFS — bookkeeping only.
-                // `RefCounter.strong` alive-signal is held by the
-                // table's `binder_pin: SIBinder` for the entry's
-                // lifetime.
+                // Bookkeeping only, as BR_INCREFS; `binder_pin` holds RefCounter.strong up.
                 if ProcessState::as_self().ref_native_kernel(id).is_none() {
                     log::error!("BR_ACQUIRE for unknown native id {id}");
                     debug_assert!(false, "BR_ACQUIRE for unknown native id {id}");
@@ -1636,13 +1501,7 @@ fn execute_command(cmd: i32) -> Result<()> {
                 let _cookie_echo = state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?;
                 drop(state);
 
-                // Probe the table's binary alive-signal: entry exists
-                // ⟹ promotion may proceed. If alive, bump
-                // `kernel_refs` (the kernel will hold a new strong
-                // ref on success). Unknown id is permitted here — it
-                // can race against unpublish (kernel may probe a
-                // binder that just lost its last ref); reply
-                // `success=0` without `debug_assert`.
+                // Alive entry ⟹ promote; an unknown id may race unpublish, so no debug_assert.
                 let success = ProcessState::as_self().ref_native_kernel(id).is_some();
 
                 let mut state = thread_state.borrow_mut();
@@ -1666,8 +1525,7 @@ fn execute_command(cmd: i32) -> Result<()> {
 
                 log::trace!("BR_DEAD_BINDER: handle {handle:X}");
 
-                // `binder_died` runs inside the handshake below and is not an
-                // RPC dispatch, so the suspended RPC peer must not answer for it.
+                // `binder_died` is not an RPC dispatch; hide the suspended RPC peer from it.
                 #[cfg(feature = "rpc")]
                 let _rpc_suspended = RpcCallingGuard::suspend();
 
@@ -1701,15 +1559,7 @@ fn execute_command(cmd: i32) -> Result<()> {
     })
 }
 
-/// Name the queued command the driver refused, for a `BINDER_WRITE_READ` that
-/// failed or stopped short.
-///
-/// `stopped_at` is the driver's `write_consumed`: the offset it gave up at, so
-/// the command starting there is the one it rejected. That is the datum worth
-/// having, because the usual causes are caller bugs the errno alone cannot
-/// distinguish — a refcount underflow from an over-released proxy
-/// (`BC_RELEASE`/`BC_DECREFS`), or a `BC_FREE_BUFFER` for a buffer already
-/// returned.
+/// Names the command at `stopped_at` (`write_consumed`); see module doc "Refused commands".
 fn describe_refused_command(out: &mut CommandStream, stopped_at: usize) -> String {
     let total = out.data_size();
     if stopped_at >= total {
@@ -1725,25 +1575,7 @@ fn describe_refused_command(out: &mut CommandStream, stopped_at: usize) -> Strin
     format!("consumed {stopped_at} of {total}; driver stopped at {named}")
 }
 
-/// Drive one round-trip with the binder kernel driver.
-///
-/// # Borrow discipline (H1, hygiene only)
-///
-/// The `BINDER_WRITE_READ` ioctl does not re-enter Rust on the same
-/// thread (the kernel only schedules our incoming queue and returns),
-/// so holding a `THREAD_STATE` borrow across the syscall does not
-/// violate R1 today. The current code does hold an immutable
-/// `thread_state.borrow()` across the `write_read` call to read
-/// `driver` — correct under the no-re-entry property.
-///
-/// H1 is the hygiene note that this boundary should ideally be
-/// tightened: future EINTR / signal-safety / cancellation handling
-/// changes, or any logic that gains a same-thread Rust callback here,
-/// would break the no-re-entry assumption and quietly turn this into
-/// an R1 violation. A defensive refactor would clone the `Arc<File>`
-/// out under a short borrow and pass it by value across the syscall.
-/// Not done today (no concrete risk); recorded so a future change
-/// knows to revisit.
+/// One driver round trip; see module doc "R1 at specific call sites" for its ioctl borrow.
 fn talk_with_driver(do_receive: bool) -> Result<()> {
     THREAD_STATE.with(|thread_state| -> Result<()> {
         let mut bwr = {
@@ -1787,30 +1619,16 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
                 do_receive
             );
         }
-        // unsafe {
-        //     loop {
-        //         let res = binder::write_read(thread_state.borrow().driver.as_raw_fd(), &mut bwr);
-        //         match res {
-        //             Ok(_) => break,
-        //             Err(errno) if errno != nix::errno::Errno::EINTR => {
-        //                 log::error!("binder::write_read() error : {}", errno);
-        //                 return Err(StatusCode::Errno(errno as _));
-        //             },
-        //             _ => {}
-        //         }
-        //     }
-        // }
 
         ensure_thread_exit_guard(&thread_state.borrow().driver);
 
         loop {
-            let res = binder::write_read(&thread_state.borrow().driver, &mut bwr);
+            // SAFETY: `bwr` points at `out_parcel` (`data_size`) and `in_parcel` (`capacity`).
+            let res = unsafe { binder::write_read(&thread_state.borrow().driver, &mut bwr) };
             match res {
                 Ok(_) => break,
                 Err(errno) if errno != rustix::io::Errno::INTR => {
-                    // The driver rejects a command by failing the whole ioctl,
-                    // so this — not the partial-consume abort below — is where a
-                    // caller's refcount or buffer bug actually surfaces.
+                    // A bad command fails the whole ioctl, so caller bugs surface here, not below.
                     let detail = describe_refused_command(
                         &mut thread_state.borrow_mut().out_parcel,
                         bwr.write_consumed as _,
@@ -1840,8 +1658,7 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
                         &mut thread_state.out_parcel,
                         bwr.write_consumed as _,
                     );
-                    // Written straight to stderr, not through `log`: a consumer
-                    // that installed no logger would otherwise die mute.
+                    // stderr, not `log`: a consumer with no logger would otherwise die mute.
                     eprintln!(
                         "rsbinder FATAL: driver did not consume the write buffer — {detail}\n\
                          The remainder was never seen by the kernel, so the reference\n\
@@ -1849,9 +1666,7 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
                          longer the kernel's. Queued commands:\n{:?}",
                         thread_state.out_parcel
                     );
-                    // AOSP `LOG_ALWAYS_FATAL`s here. Abort rather than panic:
-                    // the reply path's `catch_unwind` would otherwise resume on
-                    // that desynchronized stream.
+                    // Abort like AOSP: a caught panic would resume on the desynced stream.
                     std::process::abort();
                 }
                 thread_state.out_parcel.set_data_size(0)?;
@@ -1859,11 +1674,7 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
             }
 
             if bwr.read_consumed > 0 {
-                // SAFETY: the driver just wrote `read_consumed` bytes into
-                // `in_parcel`'s spare capacity through the `read_buffer`
-                // pointer taken from `as_mut_ptr()` above, so `0..read_consumed`
-                // is initialized. This is the one grow `set_data_size` itself
-                // refuses.
+                // SAFETY: the driver just filled `0..read_consumed` through `read_buffer`.
                 unsafe {
                     thread_state
                         .in_parcel
@@ -1925,9 +1736,40 @@ pub(crate) fn inc_strong_handle(handle: u32) -> Result<()> {
     })
 }
 
+// `THREAD_STATE` torn down at thread exit: write one command directly, then exit the thread again.
+fn write_without_thread_state<T: NativeScalar>(cmd: u32, arg: T) -> Result<()> {
+    let mut out = CommandStream::new();
+    out.write_cmd::<u32>(&cmd)?;
+    out.write_cmd::<T>(&arg)?;
+    let driver = ProcessState::as_self().driver();
+    let mut bwr = binder::binder_write_read {
+        write_size: out.data_size() as _,
+        write_consumed: 0,
+        write_buffer: out.as_mut_ptr() as _,
+        read_size: 0,
+        read_consumed: 0,
+        read_buffer: 0,
+    };
+    loop {
+        // SAFETY: `write_buffer` is the live local `out` (`data_size` bytes); nothing is read.
+        match unsafe { binder::write_read(&*driver, &mut bwr) } {
+            Ok(()) => break,
+            Err(errno) if errno == rustix::io::Errno::INTR => {}
+            Err(errno) => {
+                log::error!("binder::write_read() after thread-local teardown: {errno}");
+                return Err(StatusCode::from(errno));
+            }
+        }
+    }
+    if let Err(e) = binder::thread_exit(&*driver, 0) {
+        log::warn!("BINDER_THREAD_EXIT after thread-local teardown failed: {e}");
+    }
+    Ok(())
+}
+
 pub(crate) fn dec_strong_handle(handle: u32) -> Result<()> {
     log::trace!("dec_strong_handle: {handle}");
-    THREAD_STATE.with(|thread_state| -> Result<()> {
+    let queued = THREAD_STATE.try_with(|thread_state| -> Result<()> {
         {
             let mut state = thread_state.borrow_mut();
 
@@ -1938,7 +1780,11 @@ pub(crate) fn dec_strong_handle(handle: u32) -> Result<()> {
         flush_if_needed()?;
 
         Ok(())
-    })
+    });
+    match queued {
+        Ok(result) => result,
+        Err(_) => write_without_thread_state::<u32>(binder::BC_RELEASE, handle),
+    }
 }
 
 pub(crate) fn inc_weak_handle(handle: u32) -> Result<()> {
@@ -1959,7 +1805,7 @@ pub(crate) fn inc_weak_handle(handle: u32) -> Result<()> {
 
 pub(crate) fn dec_weak_handle(handle: u32) -> Result<()> {
     log::trace!("dec_weak_handle: {handle}");
-    THREAD_STATE.with(|thread_state| -> Result<()> {
+    let queued = THREAD_STATE.try_with(|thread_state| -> Result<()> {
         {
             let mut state = thread_state.borrow_mut();
 
@@ -1970,7 +1816,11 @@ pub(crate) fn dec_weak_handle(handle: u32) -> Result<()> {
         flush_if_needed()?;
 
         Ok(())
-    })
+    });
+    match queued {
+        Ok(result) => result,
+        Err(_) => write_without_thread_state::<u32>(binder::BC_DECREFS, handle),
+    }
 }
 
 pub(crate) fn flush_if_needed() -> Result<bool> {
@@ -1982,10 +1832,7 @@ pub(crate) fn flush_if_needed() -> Result<bool> {
             }
         }
 
-        // Reset is_flushing on every exit (Ok / Err / panic) so a failed
-        // flush_commands() cannot leave the flag stuck true and wedge all
-        // future flushes. Must NOT hold a THREAD_STATE borrow across
-        // flush_commands() — it re-borrows internally (R1).
+        // Reset is_flushing on every exit, or later flushes wedge; no borrow held across (R1).
         struct FlushGuard;
         impl Drop for FlushGuard {
             fn drop(&mut self) {
@@ -2054,15 +1901,7 @@ pub(crate) fn transact(
 ) -> Result<Option<Parcel>> {
     flags |= transaction_flags_TF_ACCEPT_FDS;
 
-    // Enforce the call restriction BEFORE queuing BC_TRANSACTION into
-    // out_parcel. `write_transaction_data` records raw pointers into `data`'s
-    // buffer/offsets; if the FatalIfNotOneway `panic!` unwinds instead of
-    // aborting (it is reachable under `dispatch_transact_caught`'s
-    // `catch_unwind` for a nested sync call, and under tokio's spawn_blocking
-    // panic capture), a completed BC_TRANSACTION with now-dangling pointers
-    // would remain in out_parcel and be flushed to the kernel later —
-    // cross-process use-after-free. AOSP checks *after* queuing, but its
-    // LOG_ALWAYS_FATAL aborts, so the queued command is never flushed.
+    // Checked before queuing, unlike AOSP: see module doc "Dispatch notes".
     if (flags & transaction_flags_TF_ONE_WAY) == 0 {
         match call_restriction() {
             CallRestriction::ErrorIfNotOneway => {
@@ -2075,9 +1914,7 @@ pub(crate) fn transact(
         }
     }
 
-    // As in the BR_TRANSACTION reply path: the queued BC_TRANSACTION holds
-    // raw pointers into the caller's `data`. If the flush fails, rewind it
-    // before `data` can go out of scope in the caller.
+    // The queued BC_TRANSACTION points into `data`: rewind it if the flush fails.
     let queued_at = THREAD_STATE.with(|thread_state| -> Result<(u64, usize)> {
         let mut thread_state = thread_state.borrow_mut();
         let queued_at = thread_state.unflushed_mark();
@@ -2107,9 +1944,7 @@ pub(crate) fn transact(
     }
 }
 
-/// Rewind `out_parcel` to the `queued_at` mark: the command there points into memory the caller is about to release.
-/// `retry_flush` (BC_REPLY only) tries one more flush first so a transient failure does not cost the peer its reply;
-/// a retried BC_TRANSACTION would instead leave a two-way call in flight whose BR_REPLY the next `transact` would take.
+/// Rewinds `out_parcel` to `queued_at`; `retry_flush` is `BC_REPLY` only. See module doc.
 fn discard_unflushed_commands(
     thread_state: &RefCell<ThreadState>,
     queued_at: (u64, usize),
@@ -2142,7 +1977,7 @@ fn free_buffer(
         parcel.close_file_descriptors()
     }
 
-    THREAD_STATE.with(|thread_state| -> Result<()> {
+    let queued = THREAD_STATE.try_with(|thread_state| -> Result<()> {
         let mut thread_state = thread_state.borrow_mut();
         thread_state
             .out_parcel
@@ -2151,7 +1986,13 @@ fn free_buffer(
             .out_parcel
             .write_cmd::<binder_uintptr_t>(&data)?;
         Ok(())
-    })?;
+    });
+    match queued {
+        Ok(result) => result?,
+        Err(_) => {
+            return write_without_thread_state::<binder_uintptr_t>(binder::BC_FREE_BUFFER, data)
+        }
+    }
 
     flush_if_needed()?;
 
@@ -2166,9 +2007,7 @@ pub(crate) fn query_interface(handle: u32) -> Result<String> {
 
     let data = Parcel::new();
     let reply = transact(handle, INTERFACE_TRANSACTION, &data, 0)?;
-    // `wait_for_response` can surface `Ok(None)` — a recoverable error, not a
-    // panic; a null descriptor folds to empty (AOSP `readString16` has no
-    // error path).
+    // `Ok(None)` is an error, not a panic; a null descriptor folds to empty (AOSP readString16).
     let interface: Option<String> = reply.ok_or(StatusCode::UnexpectedNull)?.read()?;
 
     Ok(interface.unwrap_or_default())
@@ -2192,9 +2031,7 @@ pub(crate) fn join_thread_pool(is_main: bool) -> Result<()> {
             .current_threads
             .fetch_add(1, Ordering::SeqCst);
 
-        // Decrement on every exit — including the `?` early-returns below.
-        // A write/ioctl failure that skipped the decrement would permanently
-        // inflate `current_threads` and stall the pool's spawn heuristic.
+        // Decrement on every exit, `?` included, or `current_threads` stays inflated.
         struct ThreadCountGuard;
         impl Drop for ThreadCountGuard {
             fn drop(&mut self) {
@@ -2236,10 +2073,7 @@ pub(crate) fn join_thread_pool(is_main: bool) -> Result<()> {
                         break;
                     }
                     _ => {
-                        // A non-EINTR ioctl error (EAGAIN/EBUSY/ENOMEM/…)
-                        // must not abort the process. Leave the thread pool
-                        // gracefully like the TimedOut/CONNREFUSED arms so
-                        // the pool can spawn a replacement looper.
+                        // Other errors leave too, not abort: the pool can spawn a replacement.
                         log::error!(
                             "get_and_execute_command() returned unexpected error {e}; \
                              leaving the thread pool"
@@ -2259,9 +2093,7 @@ pub(crate) fn join_thread_pool(is_main: bool) -> Result<()> {
 
         {
             let mut thread_state = thread_state.borrow_mut();
-            // Flag first: if the write fails and `?` leaves, `is_looper` must
-            // not stay `true` — `flush_if_needed` would then never flush this
-            // thread's BC_FREE_BUFFER / BC_RELEASE again.
+            // Flag first: a stuck `is_looper` would stop `flush_if_needed` for good.
             thread_state.is_looper = false;
             thread_state
                 .out_parcel
@@ -2323,10 +2155,7 @@ pub struct CallingContext {
 
 impl std::default::Default for CallingContext {
     fn default() -> CallingContext {
-        // Plan 2-16 Phase B: an in-flight RPC transaction takes precedence
-        // and is read from the ProcessState-independent thread-local
-        // (works in a pure-RPC process). RPC has no SELinux context, so
-        // `sid` is always `None`.
+        // An in-flight RPC transaction wins (pure-RPC safe); RPC carries no SELinux `sid`.
         if let Some((uid, pid)) = rpc_calling() {
             return CallingContext {
                 pid,
@@ -2334,10 +2163,7 @@ impl std::default::Default for CallingContext {
                 sid: None,
             };
         }
-        // Kernel path. `THREAD_STATE`'s ctor pulls `ProcessState::as_self()`,
-        // which panics if uninitialized — so in a pure-RPC process with no
-        // in-flight RPC transaction, return the documented
-        // out-of-transaction self identity without forcing the thread-local.
+        // Pure-RPC process: `THREAD_STATE` would panic; answer with the self identity.
         if !ProcessState::is_initialized() {
             return CallingContext {
                 pid: rustix::process::getpid().as_raw_nonzero().get() as _,
@@ -2350,11 +2176,7 @@ impl std::default::Default for CallingContext {
             match thread_state.transaction.as_ref() {
                 Some(transaction) => {
                     let calling_sid = if !transaction.calling_sid.is_null() {
-                        // SAFETY: The calling_sid pointer is provided by the binder driver
-                        // and is a valid null-terminated C string while the transaction
-                        // buffer is held. The dispatch arm nulls it when it frees the
-                        // buffer, and null was checked above.
-                        // The pointer is cast from *const u8 to *const i8 as required by CStr::from_ptr.
+                        // SAFETY: non-null = live NUL-terminated kernel sid (nulled on free).
                         unsafe { Some(CStr::from_ptr(transaction.calling_sid as _).to_owned()) }
                     } else {
                         None
@@ -2379,9 +2201,7 @@ impl std::default::Default for CallingContext {
 }
 
 pub(crate) fn is_handling_transaction() -> bool {
-    // Plan 2-16 Phase B: an in-flight RPC transaction counts (and is
-    // detected without forcing the ProcessState-coupled `THREAD_STATE`,
-    // which would panic in a pure-RPC process).
+    // An in-flight RPC transaction counts, detected without forcing `THREAD_STATE`.
     if rpc_calling().is_some() {
         return true;
     }
@@ -2413,9 +2233,7 @@ pub(crate) fn is_handling_transaction() -> bool {
 /// pointer is lazily copied at every call, so leaking is not possible).
 ///
 pub fn get_calling_sid() -> Option<CString> {
-    // RPC carries no SELinux context (see `PeerIdentity`); during an RPC
-    // transaction return `None` without forcing `THREAD_STATE` (which
-    // would panic in a pure-RPC process).
+    // RPC has no SELinux context; return early without forcing `THREAD_STATE`.
     if rpc_calling().is_some() || !ProcessState::is_initialized() {
         return None;
     }
@@ -2425,13 +2243,7 @@ pub fn get_calling_sid() -> Option<CString> {
         if transaction.calling_sid.is_null() {
             return None;
         }
-        // SAFETY: `calling_sid` is a pointer into the kernel-delivered mmap
-        // region for the current BR_TRANSACTION_SEC_CTX (set in
-        // `TransactionState::from_transaction_data`). The kernel guarantees
-        // it points to a null-terminated string that stays valid until we
-        // issue `BC_FREE_BUFFER` for the same transaction. The dispatch arm
-        // nulls this pointer in the same step, so a non-null value (checked
-        // above) means the buffer has not been freed.
+        // SAFETY: non-null = kernel NUL-terminated sid, valid until BC_FREE_BUFFER nulls it.
         Some(unsafe { CStr::from_ptr(transaction.calling_sid as _).to_owned() })
     })
 }
@@ -2440,40 +2252,45 @@ pub fn get_calling_sid() -> Option<CString> {
 ///
 /// Returns the sender PID delivered by the kernel via
 /// `binder_transaction_data.sender_pid` when this thread is dispatching a
-/// `BR_TRANSACTION` / `BR_TRANSACTION_SEC_CTX`, and `0` when not handling
-/// a transaction (matches AOSP `IPCThreadState::getCallingPid()` which
-/// returns the saved `mCallingPid` field; the field is zero-initialized
-/// outside a transaction).
+/// `BR_TRANSACTION` / `BR_TRANSACTION_SEC_CTX`, and this process's own
+/// pid (`getpid(2)`) when not handling a transaction — AOSP
+/// `IPCThreadState::getCallingPid()`, whose `clearCaller()` sets
+/// `mCallingPid = getpid()` (`IPCThreadState.cpp`). A call that never
+/// crossed a process boundary is this process calling itself.
 ///
 /// Convenience wrapper around `CallingContext::default().pid` for the
 /// common case where only the PID is needed — avoids the
 /// `Option<CString>` allocation of the full context.
 pub fn get_calling_pid() -> binder::pid_t {
-    // Plan 2-16 Phase B: an RPC transaction's pid (Unix RPC; `-1`/unknown
-    // on transports without a pid) takes precedence and is read without
-    // forcing `THREAD_STATE` (pure-RPC safe).
+    // An RPC caller's pid (`-1` without one) wins, read without forcing `THREAD_STATE`.
     if let Some((_, pid)) = rpc_calling() {
         return pid;
     }
+    let own_pid = || rustix::process::getpid().as_raw_nonzero().get() as binder::pid_t;
     if !ProcessState::is_initialized() {
-        return 0;
+        return own_pid();
     }
-    THREAD_STATE.with(|thread_state| {
-        thread_state
-            .borrow()
-            .transaction
-            .as_ref()
-            .map_or(0, |tr| tr.calling_pid)
-    })
+    THREAD_STATE
+        .with(|thread_state| {
+            thread_state
+                .borrow()
+                .transaction
+                .as_ref()
+                .map(|tr| tr.calling_pid)
+        })
+        .unwrap_or_else(own_pid)
 }
 
 /// UID of the caller for the current in-flight binder transaction.
 ///
 /// Returns the sender UID delivered by the kernel via
 /// `binder_transaction_data.sender_euid` when this thread is dispatching
-/// a `BR_TRANSACTION` / `BR_TRANSACTION_SEC_CTX`, and `0` when not
-/// handling a transaction (matches AOSP `IPCThreadState::getCallingUid()`
-/// which returns the saved `mCallingUid` field).
+/// a `BR_TRANSACTION` / `BR_TRANSACTION_SEC_CTX`, and this process's own
+/// uid (`getuid(2)`) when not handling a transaction — AOSP
+/// `IPCThreadState::getCallingUid()` returns `getuid()` whenever no
+/// caller is recorded. An in-process call, or a check made on a thread
+/// the transaction did not arrive on, therefore reads as this process,
+/// never as root.
 ///
 /// Convenience wrapper around `CallingContext::default().uid` for the
 /// common case where only the UID is needed.
@@ -2498,46 +2315,7 @@ pub fn get_calling_pid() -> binder::pid_t {
 /// `RpcServer::set_authorizer` instead. `@EnforcePermission` over RPC is
 /// always denied regardless of uid (Plan 2-16 Phase A).
 pub fn get_calling_uid() -> binder::uid_t {
-    // Plan 2-16 Phase B: an RPC transaction's uid takes precedence and is
-    // read without forcing `THREAD_STATE` (pure-RPC safe). Non-uid
-    // transports were stamped with `RPC_UNKNOWN_CALLING_UID` by the
-    // dispatch path, so this stays fail-closed there.
-    if let Some((uid, _)) = rpc_calling() {
-        return uid;
-    }
-    if !ProcessState::is_initialized() {
-        return 0;
-    }
-    THREAD_STATE.with(|thread_state| {
-        thread_state
-            .borrow()
-            .transaction
-            .as_ref()
-            .map_or(0, |tr| tr.calling_uid)
-    })
-}
-
-/// AOSP-faithful variant of [`get_calling_uid`]: outside a transaction,
-/// returns the current process's own uid (`getuid(2)`) instead of `0`.
-///
-/// Mirrors AOSP `IPCThreadState::getCallingUid()`, which initializes
-/// `mCallingUid` to `getuid()` rather than zero — observers downstream
-/// (e.g. per-uid accounting in [`crate::proxy_count`]) get the same
-/// attribution they would on real Android.
-///
-/// # RPC transports (Plan 2-16 Phase B)
-///
-/// During an RPC transaction this returns the RPC caller uid, exactly as
-/// [`get_calling_uid`]: the kernel-vouched peer uid over Unix RPC, or the
-/// fail-closed sentinel (`u32::MAX`) over transports without a uid
-/// (`Vsock` / TLS `Certificate` / `Anonymous`). The self-uid fallback
-/// applies only outside any (kernel or RPC) transaction, so
-/// [`crate::proxy_count`] attribution over a uid-less RPC transport buckets
-/// under the `u32::MAX` sentinel rather than this process's uid.
-pub(crate) fn get_calling_uid_or_self() -> binder::uid_t {
-    // Plan 2-16 Phase B: prefer the RPC caller uid when dispatching an RPC
-    // transaction; otherwise fall back to the process's own uid without
-    // forcing `THREAD_STATE` in a pure-RPC process.
+    // An RPC uid wins (fail-closed sentinel on non-uid transports), pure-RPC safe.
     if let Some((uid, _)) = rpc_calling() {
         return uid;
     }
@@ -2601,9 +2379,7 @@ pub(crate) fn get_calling_uid_or_self() -> binder::uid_t {
 /// token cannot carry a `PeerIdentity` back. Authorize an RPC caller
 /// through [`calling_caller`] or `RpcServer::set_authorizer` instead.
 pub fn clear_calling_identity() -> i64 {
-    // An RPC dispatch is the innermost frame: any kernel transaction under it
-    // belongs to an outer frame and is not this handler's to rewrite. In a
-    // pure-RPC process there is no kernel `THREAD_STATE` to touch at all.
+    // An RPC dispatch is innermost: the kernel transaction under it is an outer frame's.
     if rpc_calling().is_some() || !ProcessState::is_initialized() {
         return 0;
     }
@@ -2613,8 +2389,7 @@ pub fn clear_calling_identity() -> i64 {
             return 0;
         };
         let token = pack_calling_identity(tr.has_explicit_identity, tr.calling_uid, tr.calling_pid);
-        // AOSP `clearCaller()`: replace with own uid/pid, drop SID
-        // ("expensive to lookup"), and stamp explicit-identity.
+        // AOSP `clearCaller()`: own uid/pid, SID dropped ("expensive to lookup").
         tr.calling_uid = rustix::process::getuid().as_raw();
         tr.calling_pid = rustix::process::getpid().as_raw_nonzero().get() as _;
         tr.calling_sid = std::ptr::null();
@@ -2648,8 +2423,7 @@ pub fn clear_calling_identity() -> i64 {
 /// (caller wraps `clear`/`restore` in a `Drop` impl) is recommended; see
 /// AOSP `IPCThreadState::CallingIdentityScope` for the C++ analogue.
 pub fn restore_calling_identity(token: i64) {
-    // Same gate as `clear_calling_identity`: the token an RPC handler holds
-    // is `0`, and the kernel transaction under it is an outer frame's.
+    // Same gate as `clear_calling_identity`: an RPC handler's token is `0`.
     if rpc_calling().is_some() || !ProcessState::is_initialized() {
         return;
     }
@@ -2686,17 +2460,10 @@ pub fn restore_calling_identity(token: i64) {
 /// the handler.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn get_current_scheduler_policy() -> Result<i32> {
-    // SAFETY: FFI to libc::sched_getscheduler. No pointer arguments;
-    // pid=0 means "the current thread" and is always a valid input.
-    // The return value is a plain i32; on -1 the libc errno is set
-    // and the read below is the standard POSIX recovery.
+    // SAFETY: no pointer arguments; pid 0 (the calling thread) is always valid.
     let raw = unsafe { libc::sched_getscheduler(0) };
     if raw < 0 {
-        // POSIX guarantees errno is set when sched_getscheduler
-        // returns -1; the `unwrap_or` fallback below would only fire
-        // on a library or kernel bug, so prefer `EINVAL` over `0`
-        // (which is itself a valid "success" errno and would mislead
-        // the caller).
+        // POSIX sets errno on -1; the fallback is EINVAL because `0` would read as success.
         let errno = std::io::Error::last_os_error()
             .raw_os_error()
             .unwrap_or(libc::EINVAL);
@@ -2761,10 +2528,7 @@ pub struct ExtendedError {
 /// **Opt-in**: rsbinder does *not* call this automatically from the
 /// `BR_FAILED_REPLY` arm. A no-op for callers that never invoke it.
 pub fn get_extended_error() -> Result<ExtendedError> {
-    // Consistent with the other public accessors in this module (calling
-    // uid/pid/sid, strict-mode policy, identity): in a pure-RPC process kernel
-    // binder was never initialized, so return an error instead of panicking in
-    // `ProcessState::as_self()`.
+    // Pure-RPC process: an error, as the other accessors do, instead of an `as_self` panic.
     if !ProcessState::is_initialized() {
         return Err(StatusCode::InvalidOperation);
     }
@@ -2812,24 +2576,57 @@ pub fn has_explicit_identity() -> bool {
 
 #[cfg(test)]
 mod tests {
+    //! Tests that touch `THREAD_STATE` are Linux + binderfs only: `THREAD_STATE.with(..)` runs
+    //! `ThreadState::new`, which captures the global `ProcessState` driver, so they call
+    //! `ProcessState::init_default` (opens `/dev/binderfs/binder`) and run under
+    //! `serial(binder)`. They run in `.github/workflows/integration-test.yml`, except the
+    //! `rpc`-gated ones (`nested_kernel_transaction_answers_for_the_kernel_caller`): that job
+    //! builds with default features, so they run only by hand (`--features rpc`, binderfs).
+    //!
+    //! # Mutation gates
+    //!
+    //! - `rpc_calling_context_is_read_restored_and_failclosed` (Plan 2-16 Phase B/C): runs
+    //!   without a kernel `ProcessState` (hermetic, also on macOS). The own-uid / `!handling` /
+    //!   `None` answers outside the guard also prove the pure-RPC accessors do not panic while
+    //!   `ProcessState` is uninitialized.
+    //! - `test_drive_dead_binder_handshake_orchestration`: pins that phases run obituary →
+    //!   queue → pin on success; an obituary error short-circuits neither queue nor pin; a
+    //!   queue error skips pin; with obituary and pin both failing the obituary error wins; the
+    //!   kernel handshake (queue + pin) runs whenever queue succeeds. Losing any of these (e.g. a
+    //!   `?` early return on the obituary error) leaks the kernel `binder_ref` slot.
+    //! - `test_process_pending_derefs_handles_reentrant_push_from_drop`: a `BINDER_DEREFS` borrow held
+    //!   across `deref_native_kernel` panics on the second `borrow_mut()` when entry removal runs
+    //!   an `Inner<T>::drop` whose destructor makes another `BR_RELEASE` / `BR_DECREFS` land
+    //!   (outgoing IPC → `wait_for_response` → `talk_with_driver` → `execute_command`). The test
+    //!   stands in for that by pushing a second id into `pending_weak_derefs` from a
+    //!   drop-fired sentinel, with no kernel involved.
+    //! - `nested_kernel_transaction_answers_for_the_kernel_caller`: the `BR_TRANSACTION` is fed
+    //!   to `execute_command` itself, so deleting `RpcCallingGuard::suspend()` from the kernel
+    //!   dispatch path fails the test. The forged transaction is `TF_ONE_WAY` (no `BC_REPLY`, no
+    //!   driver round trip) with an empty buffer; `free_buffer` would queue a `BC_FREE_BUFFER`
+    //!   for a pointer the driver does not own, so the thread is marked a looper for the call
+    //!   (suppressing the flush) and those bytes are discarded afterwards.
+
     use super::*;
 
-    /// Plan 2-16 Phase B/C: the RPC calling context is read by the public
-    /// accessors (`get_calling_uid/pid`, `calling_caller`), restores on
-    /// guard drop, nests correctly, and is fail-closed for non-uid
-    /// transports — all without a kernel `ProcessState` (hermetic, runs on
-    /// macOS). The `0`/`!handling`/`None` outside the guard also proves the
-    /// pure-RPC accessors are panic-free with `ProcessState` uninitialized.
+    fn own_uid() -> binder::uid_t {
+        rustix::process::getuid().as_raw()
+    }
+
+    fn own_pid() -> binder::pid_t {
+        rustix::process::getpid().as_raw_nonzero().get() as binder::pid_t
+    }
+
+    /// Accessors read the RPC context, restore and nest with the guard, and fail closed.
     #[cfg(feature = "rpc")]
     #[test]
     fn rpc_calling_context_is_read_restored_and_failclosed() {
         use crate::rpc::transport::PeerIdentity;
         use std::sync::Arc;
 
-        // Outside any transaction (pure-RPC, no ProcessState): defined,
-        // not a panic.
-        assert_eq!(get_calling_uid(), 0);
-        assert_eq!(get_calling_pid(), 0);
+        // Outside any transaction (pure-RPC, no ProcessState): this process, as in AOSP.
+        assert_eq!(get_calling_uid(), own_uid());
+        assert_eq!(get_calling_pid(), own_pid());
         assert!(!is_handling_transaction());
         assert!(get_calling_sid().is_none());
         assert!(calling_caller().is_none());
@@ -2859,8 +2656,7 @@ mod tests {
             }
             // The caps of the dispatching session.
             assert_eq!(calling_caps(), Some(unix_caps));
-            // No callback connection on this session, so a feature that
-            // needs one is refused here rather than on the wire.
+            // No callback connection here, so a feature needing one is refused locally.
             assert_eq!(
                 calling_caps()
                     .unwrap()
@@ -2868,9 +2664,7 @@ mod tests {
                 Err(crate::StatusCode::InvalidOperation)
             );
 
-            // Nested re-entrant callback over the same connection: a
-            // non-uid transport (vsock) stamps the fail-closed sentinel;
-            // the outer identity is restored when it returns.
+            // Nested vsock callback: the fail-closed sentinel, then the outer identity again.
             {
                 let _g2 = RpcCallingGuard::install(
                     Arc::new(PeerIdentity::Vsock { cid: 7 }),
@@ -2899,7 +2693,7 @@ mod tests {
         }
 
         // Fully restored.
-        assert_eq!(get_calling_uid(), 0);
+        assert_eq!(get_calling_uid(), own_uid());
         assert!(!is_handling_transaction());
         assert!(calling_caller().is_none());
         assert!(calling_caps().is_none());
@@ -2960,11 +2754,7 @@ mod tests {
         );
     }
 
-    /// BR constants match the kernel UAPI
-    /// (`_IO('r', 20)`, `_IOR('r', 21, binder_frozen_state_info)`,
-    /// `_IOR('r', 22, binder_uintptr_t)`). Locking these in here means
-    /// a kernel-header drift would surface as a test failure rather than
-    /// a silent wire mismatch.
+    /// `_IO('r', 20)`, `_IOR('r', 21, binder_frozen_state_info)`, `_IOR('r', 22, uintptr)`.
     #[test]
     fn freeze_observer_br_constants_match_uapi() {
         // _IO('r', 20)
@@ -2975,10 +2765,7 @@ mod tests {
         assert_eq!(binder::BR_CLEAR_FREEZE_NOTIFICATION_DONE, 2148037142);
     }
 
-    /// BC constants match the kernel UAPI
-    /// (`_IOW('c', 19, binder_handle_cookie)`,
-    /// `_IOW('c', 20, binder_handle_cookie)`,
-    /// `_IOW('c', 21, binder_uintptr_t)`).
+    /// `_IOW('c', 19 and 20, binder_handle_cookie)`, `_IOW('c', 21, binder_uintptr_t)`.
     #[test]
     fn freeze_observer_bc_constants_match_uapi() {
         // _IOW('c', 19, binder_handle_cookie) — sizeof packed = 12
@@ -2989,11 +2776,7 @@ mod tests {
         assert_eq!(binder::BC_FREEZE_NOTIFICATION_DONE, 1074291477);
     }
 
-    /// `binder_frozen_state_info` layout: cookie (u64), is_frozen (u32),
-    /// reserved (u32) = 16 bytes, aligned 8. Nothing reads it yet — the
-    /// `BR_FROZEN_BINDER` arm is unimplemented and the command falls to
-    /// `execute_command`'s "BAD COMMAND" default — so pinning the layout
-    /// here is what keeps the payload right for whenever that arm lands.
+    /// u64 cookie + u32 is_frozen + u32 reserved = 16 bytes, align 8; no arm reads it yet.
     #[test]
     fn binder_frozen_state_info_layout() {
         use crate::sys::binder_frozen_state_info;
@@ -3058,12 +2841,7 @@ mod tests {
         );
     }
 
-    /// A panicking `Transactable::transact` must not unwind through
-    /// `dispatch_transact_caught` and must surface as
-    /// `Err(StatusCode::Unknown)` so the existing `BR_TRANSACTION`
-    /// reply path can synthesize a deterministic error reply for the
-    /// client. The partial reply (if any) must also be reset so the
-    /// client does not misparse half-formed bytes.
+    /// A panic becomes `Err(Unknown)` with the partial reply reset (module doc "Handler panics").
     #[test]
     fn test_dispatch_transact_caught_isolates_panic() {
         struct PanickingTransactable;
@@ -3074,8 +2852,7 @@ mod tests {
                 _reader: &mut Parcel,
                 reply: &mut Parcel,
             ) -> Result<()> {
-                // Write a few bytes then panic, so the test verifies
-                // the partial reply is discarded.
+                // Partial write then panic: the test checks the partial reply is discarded.
                 reply.write::<i32>(&0x6EAD_BEEFi32).ok();
                 panic!("simulated transactable panic");
             }
@@ -3097,10 +2874,7 @@ mod tests {
         );
     }
 
-    /// A non-panicking `Transactable::transact` must propagate its
-    /// `Result` unchanged through `dispatch_transact_caught` —
-    /// regression check that the panic guard does not interfere with
-    /// the normal path.
+    /// A non-panicking `transact`'s `Result` passes through the panic guard unchanged.
     #[test]
     fn test_dispatch_transact_caught_propagates_normal_result() {
         struct OkTransactable;
@@ -3138,16 +2912,7 @@ mod tests {
         assert!(matches!(err, Err(StatusCode::PermissionDenied)));
     }
 
-    /// `drive_dead_binder_handshake` orchestration must guarantee:
-    /// - Phases run in obituary → queue → pin order on success
-    /// - An obituary error does NOT short-circuit queue or pin
-    /// - A queue error skips pin (acknowledged residual edge)
-    /// - When obituary errors and pin errors, obituary takes priority
-    /// - The kernel handshake (queue + pin) runs whenever queue succeeds
-    ///
-    /// These properties protect against a kernel `binder_ref` slot
-    /// leak: losing any of them (e.g. a naive `?`-based early return on
-    /// the obituary error) re-introduces the leak.
+    /// Phase order, no short-circuit and error priority; see `# Mutation gates`.
     #[test]
     fn test_drive_dead_binder_handshake_orchestration() {
         use std::cell::RefCell;
@@ -3175,10 +2940,7 @@ mod tests {
         assert_eq!(*order.borrow(), vec!["obituary", "queue", "pin"]);
         order.borrow_mut().clear();
 
-        // Case B: obituary errors → queue and pin still run; obituary
-        // error surfaces. This is the headline guarantee: previously
-        // the kernel handshake was skipped on obituary error, leaking
-        // the binder_ref slot.
+        // Case B: obituary errors → queue and pin still run, so the binder_ref slot never leaks.
         let result = drive_dead_binder_handshake(
             42,
             || {
@@ -3198,8 +2960,7 @@ mod tests {
         assert_eq!(*order.borrow(), vec!["obituary", "queue", "pin"]);
         order.borrow_mut().clear();
 
-        // Case C: queue write fails → pin is skipped (documented
-        // residual edge), queue error surfaces.
+        // Case C: queue write fails → pin skipped (documented edge); queue error surfaces.
         let result = drive_dead_binder_handshake(
             42,
             || {
@@ -3239,9 +3000,7 @@ mod tests {
         assert_eq!(*order.borrow(), vec!["obituary", "queue", "pin"]);
         order.borrow_mut().clear();
 
-        // Case E: obituary errors AND pin errors → obituary error
-        // surfaces (priority); pin error is logged in the error path
-        // (asserting log content is out of scope for a unit test).
+        // Case E: obituary and pin both fail → obituary error surfaces; pin error only logged.
         let result = drive_dead_binder_handshake(
             42,
             || {
@@ -3264,25 +3023,7 @@ mod tests {
         assert_eq!(*order.borrow(), vec!["obituary", "queue", "pin"]);
     }
 
-    /// Regression test for `b17d522`: `process_pending_derefs` must
-    /// tolerate a re-entrant push to `BINDER_DEREFS` from a user
-    /// `Inner<T>::drop` callback.
-    ///
-    /// Pre-`b17d522`, the function held the `BINDER_DEREFS` borrow
-    /// across `deref_native_kernel`. When entry removal triggered an
-    /// `Inner<T>::drop` whose user destructor synchronously caused
-    /// another BR_RELEASE / BR_DECREFS to land (path: outgoing IPC →
-    /// `wait_for_response` → `talk_with_driver` → `execute_command`
-    /// queues into `BINDER_DEREFS`), the second `borrow_mut()` panicked.
-    ///
-    /// We simulate that re-entrancy in-process by pushing a second id
-    /// into `BINDER_DEREFS.pending_weak_derefs` directly from a
-    /// drop-fired sentinel — no kernel needed.
-    ///
-    /// **Linux + binderfs only** (uses `ProcessState::init_default`,
-    /// which opens `/dev/binderfs/binder`). Same convention as the
-    /// `process_state` M4 tests; surfaces under
-    /// `.github/workflows/integration-test.yml`.
+    /// A re-entrant push from a user `Inner<T>::drop` mid-drain; see `# Mutation gates`.
     #[test]
     #[cfg_attr(
         not(any(target_os = "linux", target_os = "android")),
@@ -3349,9 +3090,7 @@ mod tests {
             }
         }
 
-        // Sentinel A: drop pushes B's id back into BINDER_DEREFS,
-        // simulating an outgoing IPC's BR_DECREFS landing during the
-        // drain.
+        // Sentinel A: its drop pushes B's id into BINDER_DEREFS, like a mid-drain BR_DECREFS.
         struct ReentrantPusher {
             my_id: Arc<AtomicU64>,
             target: Arc<AtomicU64>,
@@ -3418,9 +3157,7 @@ mod tests {
         });
         let id_b = process.publish_native(Arc::clone(&arc_b));
         id_b_holder.store(id_b, Ordering::SeqCst);
-        // Bump kernel_refs so deref_native_kernel later drives it 1→0
-        // and removes the entry. Drop the returned strong arc at
-        // semicolon so the table's binder_pin is the only holder.
+        // kernel_refs 1 so the deref removes the entry; binder_pin stays the only holder.
         process
             .ref_native_kernel(id_b)
             .expect("ref_native_kernel(id_b)");
@@ -3443,19 +3180,15 @@ mod tests {
             .expect("ref_native_kernel(id_a)");
         drop(arc_a);
 
-        // Push id_a as a strong deref. Do NOT push id_b — A's drop
-        // will push it during the drain.
+        // Push only id_a as a strong deref: A's drop pushes id_b during the drain.
         BINDER_DEREFS.with(|d| {
             d.borrow_mut().pending_strong_derefs.push_back(id_a);
         });
 
-        // Drive the drain. Pre-`b17d522` this would panic with
-        // "already mutably borrowed: BorrowError" the moment A's drop
-        // tried to re-borrow BINDER_DEREFS.
+        // A's drop re-borrows BINDER_DEREFS mid-drain; a borrow held across it would panic.
         process_pending_derefs().expect("process_pending_derefs must not panic or error");
 
-        // Both natives must have dropped — re-entrant push picked up
-        // by the outer loop.
+        // Both natives dropped: the outer loop picked up the re-entrant push.
         let log = drop_log.lock().unwrap();
         assert_eq!(
             log.len(),
@@ -3483,19 +3216,9 @@ mod tests {
         assert!(process.lookup_native(id_b).is_none());
     }
 
-    // ----------------------------------------------------------------
-    // calling-identity + strict-mode public API
-    // ----------------------------------------------------------------
-    //
-    // Helpers below construct a synthetic `TransactionState` directly
-    // and install it into the thread-local `THREAD_STATE.transaction`,
-    // so the public calling-identity functions can be exercised without
-    // a running binder driver.
+    // ---- calling-identity + strict-mode API: synthetic `TransactionState`, no driver ----
 
-    /// Install a fake in-flight transaction for the duration of the
-    /// returned guard. On drop, the previous transaction state (usually
-    /// `None`) is restored — keeps tests hermetic against each other
-    /// even though `THREAD_STATE` is per-thread.
+    /// Installs a fake in-flight transaction; drop restores the previous one (usually `None`).
     #[cfg(target_os = "linux")]
     struct FakeTransactionGuard {
         previous: Option<TransactionState>,
@@ -3529,39 +3252,27 @@ mod tests {
         }
     }
 
-    /// With no in-flight transaction, the calling-identity free
-    /// functions return the documented "outside a transaction" values
-    /// (None / 0 / 0) with zero side-effects.
-    ///
-    /// **Linux + binderfs only** — `THREAD_STATE.with(..)` triggers
-    /// `ThreadState::new` which captures the global `ProcessState` driver.
-    /// Same convention as the other binder-driver-bound tests in this
-    /// module (uses `ProcessState::init_default` + `serial(binder)`).
+    /// Outside a transaction: own uid/pid, no SID, clear token 0, restore a no-op.
     #[test]
     #[cfg(target_os = "linux")]
     #[serial_test::serial(binder)]
     fn test_get_calling_outside_transaction_returns_defaults() {
         ProcessState::init_default().expect("init_default");
-        // Discard whatever the prior in-thread test may have left in
-        // `THREAD_STATE.transaction`; `serial(binder)` only serializes
-        // entry, not thread-local state.
+        // Clear a prior test's `THREAD_STATE.transaction`: `serial(binder)` keeps thread-locals.
         let _ = THREAD_STATE.with(|ts| ts.borrow_mut().transaction.take());
         assert!(!is_handling_transaction());
-        assert_eq!(get_calling_uid(), 0);
-        assert_eq!(get_calling_pid(), 0);
+        // AOSP `IPCThreadState::getCallingUid/Pid`: this process, never root.
+        assert_eq!(get_calling_uid(), own_uid());
+        assert_eq!(get_calling_pid(), own_pid());
         assert!(get_calling_sid().is_none());
         assert!(!has_explicit_identity());
         // clear/restore are no-ops outside a transaction.
         assert_eq!(clear_calling_identity(), 0);
         restore_calling_identity(0xDEAD_BEEF_DEAD_BEEFu64 as i64); // must not panic
-        assert_eq!(get_calling_uid(), 0);
+        assert_eq!(get_calling_uid(), own_uid());
     }
 
-    /// With a fake transaction installed, the calling-identity getters
-    /// return the kernel-delivered values; the SID is a lazy CString
-    /// copy of the secctx pointer.
-    ///
-    /// **Linux + binderfs only** — see `test_get_calling_outside_transaction_returns_defaults`.
+    /// Getters return the kernel-delivered values; the SID is a lazy `CString` copy of secctx.
     #[test]
     #[cfg(target_os = "linux")]
     #[serial_test::serial(binder)]
@@ -3577,16 +3288,13 @@ mod tests {
         let sid = get_calling_sid().expect("SID present when secctx pointer non-null");
         assert_eq!(sid.to_str().unwrap(), "u:r:system_server:s0");
 
-        // Each call must allocate a fresh owned CString — the pointer
-        // remains owned by the kernel mmap region, never by us.
+        // Each call copies into a fresh CString; the kernel mmap keeps owning the pointer.
         let sid2 = get_calling_sid().expect("second call also returns Some");
         assert_eq!(sid, sid2);
         assert!(!std::ptr::eq(sid.as_ptr(), sid2.as_ptr()));
     }
 
-    /// Native binder that records what the calling-identity accessors
-    /// answer *inside* the dispatch, so the test can read them back after
-    /// `execute_command` has returned and dropped its guards.
+    /// Records the calling-identity answers inside the dispatch, read after `execute_command`.
     #[cfg(all(target_os = "linux", feature = "rpc"))]
     #[derive(Default)]
     struct RecordingNative {
@@ -3641,22 +3349,7 @@ mod tests {
         }
     }
 
-    /// A kernel transaction dispatched inside an RPC handler (nested IPC
-    /// re-enters the thread parked in `wait_for_response`) answers for
-    /// the kernel caller, not for the RPC peer whose handler is still on
-    /// the stack.
-    ///
-    /// The `BR_TRANSACTION` is fed to `execute_command` directly rather
-    /// than faked around it, so what is pinned is that the kernel dispatch
-    /// path itself suspends the RPC calling context — deleting
-    /// `RpcCallingGuard::suspend()` from that path fails this test. The
-    /// forged transaction is `TF_ONE_WAY` (no `BC_REPLY`, so no driver
-    /// round trip) and carries an empty buffer; `free_buffer` would queue a
-    /// `BC_FREE_BUFFER` for a pointer the driver does not own, so the
-    /// thread is marked a looper for the call (suppressing the flush) and
-    /// those bytes are discarded afterwards.
-    ///
-    /// **Linux + binderfs only** — see `test_get_calling_outside_transaction_returns_defaults`.
+    /// A kernel call nested in an RPC handler sees the kernel caller; see `# Mutation gates`.
     #[test]
     #[cfg(all(target_os = "linux", feature = "rpc"))]
     #[serial_test::serial(binder)]
@@ -3673,8 +3366,7 @@ mod tests {
         let unix_caps = crate::TransportCaps::FD_PASSING
             | crate::TransportCaps::TRUSTED_UID
             | crate::TransportCaps::SAME_HOST;
-        // This thread is running an RPC handler that made an outgoing
-        // kernel call; the kernel transaction below is delivered into it.
+        // An RPC handler's outgoing kernel call delivers the kernel transaction below into it.
         let _rpc = RpcCallingGuard::install(
             Arc::new(PeerIdentity::Local { uid: 1234, pid: 42 }),
             unix_caps,
@@ -3745,11 +3437,7 @@ mod tests {
         assert_eq!(get_calling_uid(), 1234);
     }
 
-    /// When secctx is null (plain `BR_TRANSACTION`, not
-    /// `BR_TRANSACTION_SEC_CTX`), `get_calling_sid` returns None even
-    /// though we're handling a transaction.
-    ///
-    /// **Linux + binderfs only** — see `test_get_calling_outside_transaction_returns_defaults`.
+    /// Plain `BR_TRANSACTION` (not `_SEC_CTX`): no SID even while handling a transaction.
     #[test]
     #[cfg(target_os = "linux")]
     #[serial_test::serial(binder)]
@@ -3761,12 +3449,7 @@ mod tests {
         assert!(get_calling_sid().is_none());
     }
 
-    /// Pack/unpack round-trip across the
-    /// `(has_explicit, pid_sign)` quadrants that AOSP `static_assert`s
-    /// cover in IPCThreadState.cpp:530-560. The encoding only reserves
-    /// 30 bits + sign for the PID — values like `i32::MIN` (which would
-    /// overlap with the `hasExplicitIdentity` bit position) are outside
-    /// the documented window and intentionally not tested.
+    /// `(has_explicit, pid sign)` quadrants of AOSP `static_assert`s (IPCThreadState.cpp:530-560).
     #[test]
     fn test_calling_identity_token_pack_unpack_round_trip() {
         for &(has_explicit, uid, pid) in &[
@@ -3796,11 +3479,7 @@ mod tests {
         }
     }
 
-    /// Clear → restore round-trip inside a
-    /// transaction. Clear stamps self uid/pid + has_explicit; restore
-    /// pulls the original values back.
-    ///
-    /// **Linux + binderfs only** — see `test_get_calling_outside_transaction_returns_defaults`.
+    /// Clear stamps own uid/pid and `has_explicit`; restore brings the originals back.
     #[test]
     #[cfg(target_os = "linux")]
     #[serial_test::serial(binder)]
@@ -3829,11 +3508,7 @@ mod tests {
         assert!(!has_explicit_identity());
     }
 
-    /// Set/get strict-mode policy round-trip thread-locally.
-    /// The reset at the end protects subsequent tests that share the
-    /// same thread (thread-local).
-    ///
-    /// **Linux + binderfs only** — see `test_get_calling_outside_transaction_returns_defaults`.
+    /// Resets the policy at the end: later tests on this thread share the thread-local.
     #[test]
     #[cfg(target_os = "linux")]
     #[serial_test::serial(binder)]
@@ -3848,9 +3523,7 @@ mod tests {
 
     const UNSET_UID: binder::uid_t = UNSET_WORK_SOURCE as binder::uid_t;
 
-    /// Plan 10-9 AC-9.2: the six AOSP work-source calls on a thread with no
-    /// transaction and no `ProcessState` (each `#[test]` runs on its own
-    /// thread, so the thread-local starts unset).
+    /// Plan 10-9 AC-9.2; each `#[test]` runs on its own thread, so the thread-local starts unset.
     #[test]
     fn work_source_set_clear_restore_outside_a_transaction() {
         assert_eq!(get_calling_work_source_uid(), UNSET_UID);
@@ -3883,8 +3556,7 @@ mod tests {
         );
     }
 
-    /// A received value is installed without propagation: it reaches the
-    /// handler but not the next hop unless the handler sets it again.
+    /// A received value reaches the handler but not the next hop unless the handler sets it again.
     #[test]
     fn work_source_received_value_does_not_propagate() {
         let token = set_calling_work_source_uid_without_propagation(77);
@@ -3894,9 +3566,7 @@ mod tests {
         assert_eq!(get_calling_work_source_uid(), UNSET_UID);
     }
 
-    /// The dispatch guard hands the handler an unset work source and puts
-    /// the thread's own value back afterwards — also when nested, which is
-    /// how a server thread that is itself a client re-enters dispatch.
+    /// Nesting is how a server thread that is itself a client re-enters dispatch.
     #[test]
     fn work_source_dispatch_guard_resets_and_restores_when_nested() {
         set_calling_work_source_uid(10);
@@ -3930,8 +3600,7 @@ mod tests {
         assert_eq!(get_calling_work_source_uid(), 10);
     }
 
-    /// The request header carries the work source only while propagation
-    /// is on (AOSP `Parcel::writeInterfaceToken`, `Parcel.cpp:1136-1140`).
+    /// As AOSP `Parcel::writeInterfaceToken` (`Parcel.cpp:1136-1140`).
     #[test]
     fn work_source_is_written_to_the_request_header_only_when_propagating() {
         fn header_work_source() -> i32 {
@@ -3947,8 +3616,7 @@ mod tests {
         assert_eq!(header_work_source(), UNSET_WORK_SOURCE);
     }
 
-    /// The driver reports how far it got, not which command it disliked; the
-    /// offset is what turns one into the other.
+    /// The driver reports an offset, not a command; the offset names the refused command.
     #[test]
     fn a_refused_command_is_named_from_the_offset_the_driver_stopped_at() {
         let mut out = CommandStream::new();

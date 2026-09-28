@@ -38,12 +38,17 @@
 //! ([`Policy::check`]), a catch-all belongs in the highest-numbered file.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 
+use rustix::fs::FileType;
 use serde::Deserialize;
 
-use super::declaration::{Activation, ConnectionInfo, Declaration, Declarations, InstanceName};
+use super::declaration::{
+    is_valid_service_name, Activation, ConnectionInfo, Declaration, Declarations, InstanceName,
+};
 use super::policy::{NamePattern, Policy, PolicyError, Rule, Subjects};
+use super::trust::{At, Trusted};
 use crate::nss::{self, NssError};
 
 /// Resolves user and group names to numeric ids.
@@ -149,6 +154,32 @@ pub enum ConfigError {
         /// The instance whose `exec` is empty.
         name: String,
     },
+    /// An `exec` whose program is not an absolute path. A relative one would
+    /// be resolved through rsb_hub's `PATH` or working directory, and run
+    /// with rsb_hub's privileges.
+    #[error("{path}: service {name:?}: `exec` program {program:?} must be an absolute path")]
+    RelativeExec {
+        /// The offending file.
+        path: PathBuf,
+        /// The instance whose `exec` is relative.
+        name: String,
+        /// The program as written.
+        program: String,
+    },
+    /// A `[[service]]` name that is not `interface/instance` with both halves
+    /// non-empty, or that `addService` would refuse (see
+    /// [`is_valid_service_name`](super::is_valid_service_name)). There is no
+    /// implicit instance: AOSP `AidlName::fill` likewise refuses a name without `/`.
+    #[error(
+        "{path}: service {name:?}: name must be `interface/instance`, both parts non-empty, \
+         at most 127 bytes of [A-Za-z0-9._/-]"
+    )]
+    BadServiceName {
+        /// The offending file.
+        path: PathBuf,
+        /// The name as written.
+        name: String,
+    },
     /// A configuration path anyone but root or this process can rewrite.
     /// See [`TrustProblem`](super::TrustProblem).
     #[error("{path} is {problem}; refusing to load configuration from it")]
@@ -207,6 +238,13 @@ struct RawConnection {
 
 impl RawService {
     fn resolve(self, path: &Path) -> Result<Declaration, ConfigError> {
+        let parsed = InstanceName::parse(&self.name).filter(|_| is_valid_service_name(&self.name));
+        let Some(name) = parsed else {
+            return Err(ConfigError::BadServiceName {
+                path: path.to_owned(),
+                name: self.name,
+            });
+        };
         let activation = match self.start {
             None => None,
             Some(RawActivation {
@@ -223,10 +261,16 @@ impl RawService {
                         name: self.name,
                     });
                 }
+                if !Path::new(&argv[0]).is_absolute() {
+                    return Err(ConfigError::RelativeExec {
+                        path: path.to_owned(),
+                        name: self.name,
+                        program: argv[0].clone(),
+                    });
+                }
                 Some(Activation::Exec(argv))
             }
-            // Neither or both: refuse rather than pick one. What starts a
-            // service is not somewhere to guess.
+            // Neither or both: refuse rather than guess what starts the service.
             Some(_) => {
                 return Err(ConfigError::BadActivation {
                     path: path.to_owned(),
@@ -235,7 +279,7 @@ impl RawService {
             }
         };
         Ok(Declaration {
-            name: InstanceName::parse(&self.name),
+            name,
             activation,
             connection: self.connection.map(|c| ConnectionInfo {
                 ip: c.ip,
@@ -318,8 +362,7 @@ pub struct FileContents {
     pub global_list: Option<Subjects>,
     /// Access rules, in file order.
     pub rules: Vec<Rule>,
-    /// Service declarations, paired with the full instance name they were
-    /// written under.
+    /// Service declarations, paired with the full instance name they were written under.
     pub services: Vec<(String, Declaration)>,
 }
 
@@ -358,8 +401,7 @@ pub fn parse_file(
             })?;
         rules.push(Rule {
             pattern,
-            // An omitted permission denies. Nothing is inherited from a
-            // previous rule or from `[global]`.
+            // An omitted permission denies; nothing inherits from earlier rules or `[global]`.
             add: match raw_rule.add {
                 Some(s) => s.resolve(path, resolver)?,
                 None => Subjects::None,
@@ -377,40 +419,67 @@ pub fn parse_file(
     })
 }
 
-/// Refuse a path anyone else can rewrite. See [`super::trust`] for why
-/// this is fatal rather than a warning.
-fn check_trusted(path: &Path, our_uid: u32) -> Result<(), ConfigError> {
-    match super::trust::check_path(path, our_uid) {
-        Ok(None) => Ok(()),
-        Ok(Some(bad)) => Err(ConfigError::Untrusted {
-            path: bad.path,
-            problem: bad.problem,
-        }),
-        Err(source) => Err(ConfigError::Io {
-            path: path.to_owned(),
-            source,
-        }),
-    }
+/// Walk `rel` from `start`, refusing what others can rewrite or redirect; see [`super::trust`].
+fn check_trusted(
+    root: At<'_>,
+    start: At<'_>,
+    rel: &Path,
+    given: &Path,
+    our_uid: u32,
+) -> Result<Trusted, ConfigError> {
+    let io = |source| ConfigError::Io {
+        path: given.to_owned(),
+        source,
+    };
+    let untrusted = |bad: super::trust::Untrusted| ConfigError::Untrusted {
+        path: bad.path,
+        problem: bad.problem,
+    };
+    super::trust::check_from(root, start, rel, our_uid)
+        .map_err(io)?
+        .map_err(untrusted)
 }
 
-/// Every `*.toml` under `dir`, sorted by file name.
-fn policy_files(dir: &Path) -> Result<Vec<PathBuf>, ConfigError> {
-    let entries = std::fs::read_dir(dir).map_err(|source| ConfigError::Io {
-        path: dir.to_owned(),
-        source,
-    })?;
-    let mut files = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|source| ConfigError::Io {
-            path: dir.to_owned(),
+/// Read the checked inode through the descriptor that was checked.
+fn read_trusted(entry: Trusted) -> Result<String, ConfigError> {
+    use std::io::Read;
+    let Trusted { fd, shown, .. } = entry;
+    let mut text = String::new();
+    std::fs::File::from(fd)
+        .read_to_string(&mut text)
+        .map_err(|source| ConfigError::Io {
+            path: shown,
             source,
         })?;
-        let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "toml") && path.is_file() {
-            files.push(path);
+    Ok(text)
+}
+
+/// Every regular `*.toml` in the held directory `dir`, sorted by file name.
+fn policy_files(root: At<'_>, dir: &Trusted, our_uid: u32) -> Result<Vec<Trusted>, ConfigError> {
+    use std::os::unix::ffi::OsStringExt;
+    let io = |source: rustix::io::Errno| ConfigError::Io {
+        path: dir.shown.clone(),
+        source: source.into(),
+    };
+    let mut names = Vec::new();
+    for entry in rustix::fs::Dir::read_from(&dir.fd).map_err(io)? {
+        let name = std::ffi::OsString::from_vec(entry.map_err(io)?.file_name().to_bytes().to_vec());
+        if Path::new(&name)
+            .extension()
+            .is_some_and(|ext| ext == "toml")
+        {
+            names.push(name);
         }
     }
-    files.sort();
+    names.sort();
+    let mut files = Vec::new();
+    for name in names {
+        let shown = dir.shown.join(&name);
+        let entry = check_trusted(root, dir.at(), Path::new(&name), &shown, our_uid)?;
+        if entry.kind == FileType::RegularFile {
+            files.push(entry);
+        }
+    }
     Ok(files)
 }
 
@@ -431,29 +500,57 @@ pub struct Config {
 /// a policy that silently dropped the rule it could not parse would be a
 /// policy that fails open.
 pub fn load(path: &Path, resolver: &dyn NameResolver) -> Result<Config, ConfigError> {
-    let our_uid = rustix::process::getuid().as_raw();
-    check_trusted(path, our_uid)?;
+    let io = |source| ConfigError::Io {
+        path: path.to_owned(),
+        source,
+    };
+    let root = super::trust::open_root(Path::new("/")).map_err(io)?;
+    let abs = std::path::absolute(path).map_err(io)?;
+    let rel = abs.strip_prefix("/").unwrap_or(&abs);
+    let at = At {
+        fd: root.as_fd(),
+        shown: Path::new("/"),
+    };
+    load_at(at, rel, path, resolver)
+}
 
-    let files = if path.is_dir() {
-        let files = policy_files(path)?;
-        if files.is_empty() {
-            return Err(ConfigError::NoConfigFiles(path.to_owned()));
+/// `load` below a directory we hold; tests pass their own so nothing above it is looked at.
+fn load_at(
+    root: At<'_>,
+    rel: &Path,
+    given: &Path,
+    resolver: &dyn NameResolver,
+) -> Result<Config, ConfigError> {
+    let our_uid = rustix::process::getuid().as_raw();
+    let top = check_trusted(root, root, rel, given, our_uid)?;
+
+    let files = match top.kind {
+        FileType::Directory => {
+            let files = policy_files(root, &top, our_uid)?;
+            if files.is_empty() {
+                return Err(ConfigError::NoConfigFiles(given.to_owned()));
+            }
+            files
         }
-        files
-    } else {
-        vec![path.to_owned()]
+        FileType::RegularFile => vec![top],
+        _ => {
+            return Err(ConfigError::Io {
+                path: top.shown,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "not a regular file or a directory",
+                ),
+            })
+        }
     };
 
     let mut config = Config::default();
     let mut global_origin: Option<PathBuf> = None;
     let mut service_origin: BTreeMap<String, PathBuf> = BTreeMap::new();
 
-    for file in files {
-        check_trusted(&file, our_uid)?;
-        let text = std::fs::read_to_string(&file).map_err(|source| ConfigError::Io {
-            path: file.clone(),
-            source,
-        })?;
+    for entry in files {
+        let file = entry.shown.clone();
+        let text = read_trusted(entry)?;
         let contents = parse_file(&file, &text, resolver)?;
         if let Some(global) = contents.global_list {
             if let Some(first) = &global_origin {
@@ -487,8 +584,7 @@ mod tests {
     use super::*;
     use crate::config::{Permission, Subject};
 
-    /// Deterministic stand-in for the name service: `"svcuser"` is uid
-    /// 1000 and `"svcgroup"` is gid 50, on every machine.
+    /// Fixed name service, so tests never depend on the build machine's accounts.
     struct FakeResolver;
 
     impl NameResolver for FakeResolver {
@@ -536,6 +632,70 @@ mod tests {
         Subject {
             uid,
             gids: gids.iter().copied().collect(),
+        }
+    }
+
+    /// A configuration directory `cfg` under a held root, loaded through `load_at`.
+    struct ConfigDir {
+        root: std::os::fd::OwnedFd,
+        base: PathBuf,
+    }
+
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    impl ConfigDir {
+        /// Explicit modes: under umask 0002 the defaults are group-writable and fail the check.
+        fn new(tag: &str, files: &[(&str, &str)]) -> Self {
+            let base = std::env::temp_dir().join(format!("rsb-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).unwrap();
+            chmod(&base, 0o755);
+            let root = crate::config::trust::open_root(&base).unwrap();
+            let this = ConfigDir { root, base };
+            this.dir("cfg");
+            for (name, text) in files {
+                this.file(&format!("cfg/{name}"), text);
+            }
+            this
+        }
+
+        fn dir(&self, rel: &str) -> PathBuf {
+            let path = self.base.join(rel);
+            std::fs::create_dir_all(&path).unwrap();
+            // Intermediate directories get the umask default too, so chmod every level.
+            for made in path.ancestors().take_while(|p| *p != self.base) {
+                chmod(made, 0o755);
+            }
+            path
+        }
+
+        fn file(&self, rel: &str, text: &str) -> PathBuf {
+            let path = self.base.join(rel);
+            std::fs::write(&path, text).unwrap();
+            chmod(&path, 0o644);
+            path
+        }
+
+        fn cfg(&self) -> PathBuf {
+            self.base.join("cfg")
+        }
+
+        fn load(&self) -> Result<Config, ConfigError> {
+            let at = At {
+                fd: self.root.as_fd(),
+                shown: &self.base,
+            };
+            load_at(at, Path::new("cfg"), &self.cfg(), &FakeResolver)
+        }
+    }
+
+    impl Drop for ConfigDir {
+        fn drop(&mut self) {
+            chmod(&self.base, 0o755);
+            let _ = std::fs::remove_dir_all(&self.base);
         }
     }
 
@@ -635,35 +795,30 @@ mod tests {
         assert!(!policy.check(Permission::Add, "x", &subject(1235, &[])));
     }
 
-    /// Directory load: file-name order decides rule precedence, and the
-    /// first match wins — so `10-` beats the catch-all in `99-`.
+    /// File-name order decides precedence and the first match wins, so `10-` beats `99-`.
     #[test]
     fn directory_load_orders_by_file_name() {
-        let dir = std::env::temp_dir().join(format!("rsb-policy-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("99-catchall.toml"),
-            "[[rule]]\nname = \"*\"\nadd = \"any\"\nfind = \"any\"\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("10-specific.toml"),
-            "[global]\nlist = \"any\"\n\n[[rule]]\nname = \"locked.*\"\nadd = \"none\"\nfind = \"none\"\n",
-        )
-        .unwrap();
-        // Not a .toml — must be ignored, not parsed.
-        std::fs::write(dir.join("README"), "not toml at all {{{").unwrap();
+        let dir = ConfigDir::new(
+            "policy",
+            &[
+                (
+                    "99-catchall.toml",
+                    "[[rule]]\nname = \"*\"\nadd = \"any\"\nfind = \"any\"\n",
+                ),
+                (
+                    "10-specific.toml",
+                    "[global]\nlist = \"any\"\n\n[[rule]]\nname = \"locked.*\"\nadd = \"none\"\nfind = \"none\"\n",
+                ),
+                // Not a .toml — must be ignored, not parsed.
+                ("README", "not toml at all {{{"),
+            ],
+        );
 
-        let policy = load(&dir, &FakeResolver)
-            .expect("directory must load")
-            .policy;
+        let policy = dir.load().expect("directory must load").policy;
         let anyone = subject(1234, &[]);
         assert!(!policy.check(Permission::Add, "locked.foo", &anyone));
         assert!(policy.check(Permission::Add, "open.foo", &anyone));
         assert!(policy.check(Permission::List, "", &anyone));
-
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -705,9 +860,7 @@ mod tests {
             d.activation("com.example.IFoo/secondary"),
             Some(Activation::Exec(argv)) if argv[0] == "/usr/bin/exampled"
         ));
-        // Declared but not startable: `isDeclared` still answers true, which
-        // is the point — the client can tell "not installed" from "not
-        // started", even where rsb_hub cannot start it.
+        // Not startable, still declared: the client can tell "not installed" from "not started".
         assert!(d.is_declared("com.example.IBar/default"));
         assert!(d.activation("com.example.IBar/default").is_none());
     }
@@ -735,6 +888,56 @@ mod tests {
         assert!(matches!(empty, ConfigError::EmptyExec { .. }), "{empty:?}");
     }
 
+    /// A relative program would be looked up through rsb_hub's `PATH` or cwd, as root.
+    #[test]
+    fn a_relative_exec_program_is_rejected() {
+        for prog in ["exampled", "./exampled", "bin/exampled"] {
+            let text = format!("[[service]]\nname = \"a/b\"\nstart = {{ exec = [\"{prog}\"] }}\n");
+            let err = parse_services(&text).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::RelativeExec { ref program, .. } if program == prog),
+                "{err:?}"
+            );
+        }
+    }
+
+    /// No implicit `default` instance: `getDeclaredInstances` and `isDeclared` must agree.
+    #[test]
+    fn a_service_name_without_both_halves_is_rejected() {
+        for name in ["com.example.IFoo", "com.example.IFoo/", "/default", "/"] {
+            let text = format!("[[service]]\nname = \"{name}\"\n");
+            let err = parse_services(&text).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::BadServiceName { .. }),
+                "{name}: {err:?}"
+            );
+        }
+    }
+
+    /// A name `addService` refuses could never be registered, so a client would wait forever.
+    #[test]
+    fn a_service_name_add_service_would_refuse_is_rejected() {
+        let long = format!("a.IFoo/{}", "x".repeat(121));
+        for name in [
+            "a.IFoo/café",
+            "a.IFoo/de fault",
+            "a.IFoo/x@y",
+            long.as_str(),
+        ] {
+            let text = format!("[[service]]\nname = \"{name}\"\n");
+            let err = parse_services(&text).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::BadServiceName { .. }),
+                "{name}: {err:?}"
+            );
+        }
+        assert!(parse_services(&format!(
+            "[[service]]\nname = \"a.IFoo/{}\"\n",
+            "x".repeat(120)
+        ))
+        .is_ok());
+    }
+
     #[test]
     fn unknown_service_keys_are_rejected() {
         let err = parse_services("[[service]]\nname = \"a/b\"\nstrat = \"x\"\n").unwrap_err();
@@ -744,25 +947,24 @@ mod tests {
     /// Two files declaring the same instance is ambiguity about what runs.
     #[test]
     fn duplicate_service_declaration_is_an_error() {
-        let dir = std::env::temp_dir().join(format!("rsb-cfg-dupsvc-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("10-a.toml"),
-            "[[service]]\nname = \"a/b\"\nstart = { systemd = \"one.service\" }\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("20-b.toml"),
-            "[[service]]\nname = \"a/b\"\nstart = { systemd = \"two.service\" }\n",
-        )
-        .unwrap();
-        let err = load(&dir, &FakeResolver).unwrap_err();
+        let dir = ConfigDir::new(
+            "cfg-dupsvc",
+            &[
+                (
+                    "10-a.toml",
+                    "[[service]]\nname = \"a/b\"\nstart = { systemd = \"one.service\" }\n",
+                ),
+                (
+                    "20-b.toml",
+                    "[[service]]\nname = \"a/b\"\nstart = { systemd = \"two.service\" }\n",
+                ),
+            ],
+        );
+        let err = dir.load().unwrap_err();
         assert!(
             matches!(err, ConfigError::DuplicateService { ref name, .. } if name == "a/b"),
             "{err:?}"
         );
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Rules and declarations coexist in one file and load independently.
@@ -787,60 +989,169 @@ mod tests {
 
     #[test]
     fn empty_directory_is_an_error_not_deny_all() {
-        let dir = std::env::temp_dir().join(format!("rsb-policy-empty-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        assert!(matches!(
-            load(&dir, &FakeResolver),
-            Err(ConfigError::NoConfigFiles(_))
-        ));
-        std::fs::remove_dir_all(&dir).unwrap();
+        let dir = ConfigDir::new("policy-empty", &[]);
+        assert!(matches!(dir.load(), Err(ConfigError::NoConfigFiles(_))));
     }
 
-    /// The configuration decides what runs; a file anyone can rewrite is a
-    /// file anyone can use to run it.
+    /// The configuration decides what runs, so whoever can rewrite it decides what runs.
     #[test]
     fn a_world_writable_directory_is_refused() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("rsb-cfg-perm-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("10.toml"),
-            "[[rule]]\nname = \"*\"\nfind = \"any\"\n",
-        )
-        .unwrap();
+        let dir = ConfigDir::new(
+            "cfg-perm",
+            &[("10.toml", "[[rule]]\nname = \"*\"\nfind = \"any\"\n")],
+        );
 
         // Sane to begin with.
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(load(&dir, &FakeResolver).is_ok());
+        assert!(dir.load().is_ok());
 
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
-        let err = load(&dir, &FakeResolver).unwrap_err();
+        chmod(&dir.cfg(), 0o777);
+        let err = dir.load().unwrap_err();
         assert!(matches!(err, ConfigError::Untrusted { .. }), "{err:?}");
 
         // And a sane directory holding a writable file is refused too.
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::set_permissions(dir.join("10.toml"), std::fs::Permissions::from_mode(0o666))
-            .unwrap();
-        let err = load(&dir, &FakeResolver).unwrap_err();
+        chmod(&dir.cfg(), 0o755);
+        chmod(&dir.cfg().join("10.toml"), 0o666);
+        let err = dir.load().unwrap_err();
         assert!(matches!(err, ConfigError::Untrusted { .. }), "{err:?}");
-
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn duplicate_global_is_an_error() {
-        let dir = std::env::temp_dir().join(format!("rsb-policy-dup-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("10-a.toml"), "[global]\nlist = \"any\"\n").unwrap();
-        std::fs::write(dir.join("20-b.toml"), "[global]\nlist = \"none\"\n").unwrap();
+        let dir = ConfigDir::new(
+            "policy-dup",
+            &[
+                ("10-a.toml", "[global]\nlist = \"any\"\n"),
+                ("20-b.toml", "[global]\nlist = \"none\"\n"),
+            ],
+        );
         assert!(matches!(
-            load(&dir, &FakeResolver),
+            dir.load(),
             Err(ConfigError::DuplicateGlobal { .. })
         ));
-        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The root fd is where the walk starts, so the temp directory's own mode never matters.
+    #[test]
+    fn load_at_does_not_look_above_the_root() {
+        let outer = ConfigDir::new("above-root", &[]);
+        let inner_base = outer.dir("root");
+        let inner = ConfigDir {
+            root: crate::config::trust::open_root(&inner_base).unwrap(),
+            base: inner_base,
+        };
+        inner.dir("cfg");
+        inner.file("cfg/10.toml", "[[rule]]\nname = \"*\"\nfind = \"any\"\n");
+        chmod(&outer.base, 0o777);
+
+        let policy = inner
+            .load()
+            .expect("nothing above the root is checked")
+            .policy;
+        assert!(policy.check(Permission::Find, "x", &subject(1, &[])));
+    }
+
+    /// `--config /`, or a link to `.`, ends the walk on the held `O_PATH` root; it must still list.
+    #[test]
+    fn the_root_itself_loads_as_a_directory() {
+        let dir = ConfigDir::new("cfg-root", &[]);
+        dir.file("10.toml", "[[rule]]\nname = \"*\"\nfind = \"any\"\n");
+        std::os::unix::fs::symlink(".", dir.base.join("here")).unwrap();
+        let at = At {
+            fd: dir.root.as_fd(),
+            shown: &dir.base,
+        };
+        for rel in ["", "here"] {
+            let config = load_at(at, Path::new(rel), &dir.base, &FakeResolver)
+                .unwrap_or_else(|e| panic!("{rel:?}: {e}"));
+            assert!(config.policy.check(Permission::Find, "x", &subject(1, &[])));
+        }
+    }
+
+    /// A symlinked entry is read, and the directory it points into is checked.
+    #[test]
+    fn a_symlinked_entry_is_followed_and_its_directory_checked() {
+        let dir = ConfigDir::new("cfg-symlink", &[]);
+        let shared = dir.dir("shared");
+        dir.file("shared/10.toml", "[[rule]]\nname = \"*\"\nfind = \"any\"\n");
+        std::os::unix::fs::symlink("../shared/10.toml", dir.cfg().join("10.toml")).unwrap();
+
+        let policy = dir.load().expect("a symlinked entry loads").policy;
+        assert!(policy.check(Permission::Find, "x", &subject(1, &[])));
+
+        chmod(&shared, 0o775);
+        match dir.load().unwrap_err() {
+            ConfigError::Untrusted { path, .. } => assert_eq!(path, shared),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Without `O_NONBLOCK` the open of the FIFO would wait for a writer; this test then hangs.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_fifo_named_toml_is_skipped_without_blocking() {
+        use rustix::fs::{mknodat, Mode};
+        let dir = ConfigDir::new(
+            "cfg-fifo",
+            &[("20.toml", "[[rule]]\nname = \"*\"\nfind = \"any\"\n")],
+        );
+        mknodat(
+            &dir.root,
+            "cfg/10.toml",
+            FileType::Fifo,
+            Mode::from_raw_mode(0o644),
+            0,
+        )
+        .unwrap();
+
+        let policy = dir.load().expect("the FIFO is skipped").policy;
+        assert_eq!(policy.rules.len(), 1);
+    }
+
+    fn checked(dir: &ConfigDir, rel: &str) -> Trusted {
+        let at = At {
+            fd: dir.root.as_fd(),
+            shown: &dir.base,
+        };
+        let us = rustix::process::getuid().as_raw();
+        check_trusted(at, at, Path::new(rel), &dir.base.join(rel), us).expect("must be trusted")
+    }
+
+    /// What `read_trusted` returns is the inode `check_trusted` held, whatever the path is now.
+    #[test]
+    fn a_file_swapped_after_the_check_is_not_what_is_read() {
+        let dir = ConfigDir::new("cfg-swap-file", &[("hub.toml", "A"), ("other.toml", "B")]);
+        let entry = checked(&dir, "cfg/hub.toml");
+        std::fs::rename(dir.cfg().join("other.toml"), dir.cfg().join("hub.toml")).unwrap();
+        assert_eq!(read_trusted(entry).unwrap(), "A");
+    }
+
+    /// policy_files lists the held directory, not whatever either path names after a swap.
+    #[test]
+    fn a_directory_swapped_after_the_check_does_not_change_the_file_set() {
+        let dir = ConfigDir::new("cfg-swap-link", &[]);
+        dir.dir("real1");
+        dir.dir("real2");
+        dir.file("real1/10.toml", "");
+        dir.file("real2/99.toml", "");
+        let link = dir.cfg().join("hub.d");
+        std::os::unix::fs::symlink("../real1", &link).unwrap();
+        let at = At {
+            fd: dir.root.as_fd(),
+            shown: &dir.base,
+        };
+
+        let top = checked(&dir, "cfg/hub.d");
+        assert_eq!(top.shown, dir.base.join("real1"));
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("../real2", &link).unwrap();
+        std::fs::rename(dir.base.join("real1"), dir.base.join("old")).unwrap();
+        std::fs::rename(dir.base.join("real2"), dir.base.join("real1")).unwrap();
+        let us = rustix::process::getuid().as_raw();
+        let names: Vec<PathBuf> = policy_files(at, &top, us)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.shown)
+            .collect();
+        assert_eq!(names, [dir.base.join("real1/10.toml")]);
     }
 }

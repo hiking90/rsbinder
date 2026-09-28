@@ -77,9 +77,9 @@ tweaks; wire formats are already locked.
   `MappedHeap`, `MemoryDealer`, `HeapCache`, and the `IMemory` / `IMemoryHeap`
   wire (handwritten AOSP wire, not AIDL). STAGE3-gated against real
   `libbinder` in both directions.
-- **Data serialization (new in 0.11.0)** — `to_bytes` / `from_bytes` (`rpc`
-  feature). The bytes are the IPC bytes, so only the two signatures may still
-  change. See [Storing Values](./data-serialization.md).
+- **Data serialization (new in 0.11.0)** — `to_bytes` / `from_bytes`, no
+  feature required since 0.12.0. The bytes are the IPC bytes, so only the two
+  signatures may still change. See [Storing Values](./data-serialization.md).
 - **Cross-stack bridging (new in 0.11.0)** — `impl Interface for Strong<I>`
   (a proxy publishes as a local service, so a gateway is one line) and
   `bridge::Rewrap`. See
@@ -107,6 +107,58 @@ tweaks; wire formats are already locked.
 - **Awaitable lookups and death (new in 0.12.0, `tokio` feature)** —
   `wait_for_interface_async`, `check_interface_async`, `death_signal` /
   `DeathSignal`. Wire behavior is that of the synchronous calls they wrap.
+- **Fast Message Queue (new in 0.12.0)** — the `rsbinder-fmq` crate
+  (`MessageQueue`, `EventFlag`, `Descriptor`, `AttachPolicy`; the synchronized
+  flavor, primitive elements, Linux and Android) and `rsbinder::fmq`, which
+  re-exports it on every platform beside the AOSP parcelables `MQDescriptor`,
+  `GrantorDescriptor`, `SynchronizedReadWrite`, `UnsynchronizedWrite` and
+  `NativeHandle`, with the two `TryFrom` conversions between `MQDescriptor`
+  and `Descriptor`. `rsbinder-aidl` resolves imports of
+  `android.hardware.common` and `android.hardware.common.fmq` to those types
+  and compiles generic parcelables such as `MQDescriptor<T, Flavor>`. The
+  parcelables are AOSP's VINTF-stable wire, and the queue keeps `libfmq`'s
+  memory layout, counters and futex protocol, so only the Rust signatures may
+  still change. For an NDK peer, which cannot link `libfmq`, the reference
+  implementation is two header-only C11 files: `rsbinder-fmq/c/rsbinder_fmq.h`
+  (the queue) and `contrib/ndk/rsbinder_stream.h` (the stream's records on
+  it). Validated against AOSP's own `libfmq` on the host, both roles
+  (`rsbinder-fmq/tests/libfmq_host.rs`), and across binder on an emulator
+  with either side as the service (`example-hello/cpp/run_fmq_interop.sh`);
+  the queue header against the crate on the host
+  (`rsbinder-fmq/tests/c_header.rs`), the record header with both ends under
+  AddressSanitizer (`tests/tests/c_stream_header.rs`), and both against
+  rsbinder on an emulator (`example-hello/cpp/run_stream_interop.sh`).
+  See [Builtin AOSP Types](./aidl-data-types.md#builtin-aosp-types) and
+  [Generic Parcelables](./aidl-parcelable.md#generic-parcelables).
+- **Streaming (new in 0.12.0)** — the `stream` module: `Sink`, `Receiver`,
+  and the three AIDL files in `rsbinder/aidl/stream/`: the
+  `rsbinder.stream.StreamEndpoint` parcelable (the ring's record layout and
+  EventFlag bits on the kernel path) and the two interfaces `IStreamSink` /
+  `IStreamSource` (the RPC path). The contract is rsbinder's own rather than
+  AOSP's, written as ordinary AIDL so a C++ or NDK peer can be either end (a
+  Java peer is out of scope: AOSP has no Java FMQ). Validated
+  rsbinder-to-rsbinder over kernel binder (two processes, including a real
+  Android driver) and over RPC, and over kernel binder against an NDK peer
+  built on the C reference headers and against one whose ring is AOSP's own
+  `libfmq`, both directions (`example-hello/cpp/run_stream_interop.sh`), and
+  over RPC against the device's libbinder `RpcSession`, both directions
+  (`example-hello/cpp/run_stream_rpc_interop.sh`). See
+  [Streaming](./streaming.md).
+- **Observability (new in 0.12.0)** — the work source functions
+  (`set_calling_work_source_uid` and the five beside it, the AOSP
+  `IPCThreadState` set), `Remotable::transaction_name` with
+  `rsbinder_aidl::Builder::trace`, the `observe` module
+  (`TransactionObserver`, `set_observer`, `LogObserver`, `StatsObserver`), and
+  the `tracing` feature (`TracingObserver` and the client spans of proxies
+  generated with `trace(true)`). None of it changes
+  the wire: the work source uses a header field kernel binder already has. The
+  work source is STAGE3-gated against real `libbinder`. See
+  [Observability](./observability.md).
+- **`RpcClientConfig` (new in 0.12.0)** — one android-13+ client configuration
+  for every transport (`unix`, `unix_abstract`, `vsock`, `tls`, `tcp_debug`,
+  `new`), with `incoming_connections` and `outgoing_connections` on all of
+  them. It replaces `RpcUnixClientConfig` and the Unix-only multi-connection
+  helpers, which are deprecated and go in the release after.
 - **AIDL compiler, beyond the Stable entry points** —
   `Builder::{dest_dir, hash}` and the public `render` module, the seam
   `rsbinder-macros` plugs into. Its input structs are `#[non_exhaustive]`, so

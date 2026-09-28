@@ -41,9 +41,13 @@ The accessors (all `rsbinder::…`):
 | `calling_caller()` | `Option<Caller>` (transport-tagged) | kernel binder, RPC |
 
 These are only meaningful **inside a handler, on the dispatching thread**.
-Outside a transaction they return `0` / `None`. If you spawn a new thread
-inside a handler, that thread has no calling context (it reads `0`) — just
-like AOSP.
+Outside a transaction `get_calling_uid()` / `get_calling_pid()` return this
+process's own uid and pid (`getuid()` / `getpid()`), `get_calling_sid()`
+returns `None` and `calling_caller()` returns `None` — as AOSP's
+`IPCThreadState` does. A thread you spawn inside a handler has no calling
+context, so it reads this process, not the caller: do the check on the
+dispatching thread and pass the result along. An in-process call to a
+local service reads the same way — this process calling itself.
 
 ### Fail-closed values, never fabricated ones
 

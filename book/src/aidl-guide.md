@@ -23,7 +23,13 @@ Read them in that order the first time; *Annotations* is a reference to come bac
 - `void` anywhere but a method return type.
 - A `union` with no fields (`const` members do not count).
 - A duplicate method name in an interface, or a duplicate argument name in a method.
-- A type argument on a type that takes none (`String<int>`, `IBinder<T>`).
+- A type argument on a type that takes none (`String<int>`, `IBinder<T>`, `Plain<int>` on a non-generic parcelable), or the wrong number of them.
+- A type argument that does not meet its parameter's requirement (`MQDescriptor<String, …>` where the parameter is `@FixedSize T`), or that is an array, a `List`, `void` or `ParcelableHolder`.
+- A generic parcelable field whose type is one of the parameters (`parcelable Foo<T> { T value; }`), and a generic `union`. See [Generic Parcelables](./aidl-parcelable.md#generic-parcelables).
 - A `const` whose type is not a primitive, a `String`, or an array of those.
 
-rsbinder keeps `boolean`, `char` and array constants, which AOSP refuses. Then move on to [Service Development](./service-development.md) for the runtime patterns that put these types to work.
+rsbinder keeps `boolean`, `char` and array constants, which AOSP refuses.
+
+It does not check an AIDL name against the items the generated Rust adds next to it. A clash shows up as a rustc duplicate-definition error (E0428, or E0201 for an enumerator) in the generated file under `OUT_DIR`, as it does with AOSP's Rust backend. For an interface `IFoo`, those items are `BnFoo`, `BpFoo`, `IFooDefault`, `IFooDefaultRef`, `IFooAsync`, `IFooAsyncService` and a `transactions` module, plus `VERSION` and `HASH` when a version or hash is set; a union adds `Tag`, and an enum adds the methods `get` and `enum_values`. A nested type, constant or enumerator with one of those names — `const int VERSION = 1;` in a versioned interface, a nested `parcelable Tag` in a union — needs another name.
+
+Then move on to [Service Development](./service-development.md) for the runtime patterns that put these types to work.

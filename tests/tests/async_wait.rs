@@ -310,6 +310,47 @@ fn dropping_the_wait_returns_the_blocking_thread() {
     outcome.expect("blocking thread was not reclaimed");
 }
 
+/// `connect_async("binder://…")` waits through the same cancellable path.
+///
+/// Mutant: moving the kernel arm back onto `spawn_blocking(connect)` keeps
+/// the blocking thread past the timeout and the second probe fails.
+#[test]
+#[ignore = "needs a kernel binder device and a running service manager"]
+fn a_timed_out_connect_async_returns_the_blocking_thread() {
+    ProcessState::init_default().expect("ProcessState::init_default");
+    ProcessState::start_thread_pool();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    let outcome: std::result::Result<(), String> = rt.block_on(async {
+        let uri = format!("binder://{}", service_name("never-connect"));
+        let timed_out = tokio::time::timeout(
+            Duration::from_millis(300),
+            rsbinder::connect_async::<dyn IAsyncRt>(&uri),
+        )
+        .await;
+        if timed_out.is_ok() {
+            return Err("a name nobody registers must not resolve".into());
+        }
+        match tokio::time::timeout(Duration::from_secs(3), tokio::task::spawn_blocking(|| ())).await
+        {
+            Ok(joined) => joined.map_err(|e| format!("blocking task: {e:?}")),
+            Err(_) => {
+                Err("the blocking thread must come back once connect_async is dropped".into())
+            }
+        }
+    });
+
+    // As above: a wait that ignores the drop would wedge `Runtime::drop`.
+    rt.shutdown_timeout(Duration::from_secs(2));
+    outcome.expect("blocking thread was not reclaimed");
+}
+
 /// AC-11-1.1(b) — a dropped wait leaves no callback registered.
 ///
 /// The service manager's callback list is not readable from here, so the

@@ -115,6 +115,13 @@ pretty_hex = { workspace = true }
 async-trait = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 rsproperties.workspace = true
+# Plan 12: the Fast Message Queue core. Binder-free, so it is a separate
+# crate this one builds on; the ashmem detection the shared-memory code
+# needs lives there so the two cannot drift. On every target, so that
+# `rsbinder::stream`'s ring path is one implementation: the crate itself
+# compiles everywhere and reports `Unsupported` where there is no shared
+# memory or futex.
+rsbinder-fmq = { workspace = true }
 # RPC additive backends (subplan 2-4) — all optional, feature-gated,
 # so default / `rpc` / `rpc-tcp-debug` builds pull none of them.
 vsock = { version = "0.5", optional = true }

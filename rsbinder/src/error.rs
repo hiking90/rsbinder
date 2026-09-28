@@ -131,11 +131,7 @@ impl From<StatusCode> for i32 {
             StatusCode::BadIndex => -(rustix::io::Errno::OVERFLOW.raw_os_error()),
             StatusCode::FdsNotAllowed => UNKNOWN_ERROR + 7,
             StatusCode::UnexpectedNull => UNKNOWN_ERROR + 8,
-            // `UNKNOWN_ERROR + 9` is AOSP `FROZEN_OBJECT` (Errors.h); keep
-            // `RpcError` off that slot so an incoming kernel `FROZEN_OBJECT`
-            // status is not mis-decoded as an RPC transport error (and so a
-            // stray `RpcError` on a `status_t` wire is not read as "frozen" by a
-            // C++ peer). `+ 10` is unused by AOSP's status_t table.
+            // `+ 9` is AOSP `FROZEN_OBJECT` (Errors.h); `+ 10` is unused there, so no misdecode.
             #[cfg(feature = "rpc")]
             StatusCode::RpcError => UNKNOWN_ERROR + 10,
             StatusCode::NotEnoughData => -(rustix::io::Errno::NODATA.raw_os_error()),
@@ -150,12 +146,7 @@ impl From<StatusCode> for i32 {
 
 impl From<i32> for StatusCode {
     fn from(code: i32) -> Self {
-        // Lifting the forward map's values into `const`s (each is
-        // `const`-evaluable: `Errno::raw_os_error` is `const fn` and
-        // `UNKNOWN_ERROR + N` are integer constants) lets this match
-        // lower to a jump-table / equality cascade instead of a linear
-        // chain of `code == <variant>.into()` guards. Per-platform errno
-        // mapping is preserved.
+        // `const` patterns let the match lower to a jump table, not a chain of `.into()` guards.
         use rustix::io::Errno;
         const OK: i32 = 0;
         const UNKNOWN: i32 = UNKNOWN_ERROR;
@@ -218,10 +209,7 @@ impl From<std::array::TryFromSliceError> for StatusCode {
 
 impl From<std::io::Error> for StatusCode {
     fn from(err: std::io::Error) -> Self {
-        // Preserve the underlying errno instead of flattening every I/O
-        // failure to BadFd. OS-backed errors route through the errno
-        // mapping (BADF still yields BadFd); non-OS errors have no errno
-        // to map, so they surface as Unknown.
+        // Keep the errno (BADF still yields BadFd); a non-OS error has none, so it is Unknown.
         match err.raw_os_error() {
             Some(raw) => StatusCode::from(rustix::io::Errno::from_raw_os_error(raw)),
             None => StatusCode::Unknown,
@@ -496,13 +484,7 @@ mod tests {
         assert_eq!(code, StatusCode::Errno(-64));
     }
 
-    // Pin the round-trip between the forward `From<StatusCode> for i32`
-    // and the reverse `From<i32> for StatusCode`. Each named variant
-    // must come back through the const-pattern match identically,
-    // otherwise the const initialisers diverged from the forward map's
-    // calls into `rustix::io::Errno::*.raw_os_error()`. Run on every
-    // target (macOS / Linux / Android) since the errno wire values
-    // differ per OS.
+    // Errno values differ per OS, so this runs on every target.
     #[test]
     fn from_i32_round_trip_pins_every_named_variant() {
         let variants = [
@@ -541,23 +523,14 @@ mod tests {
         }
     }
 
-    // Pre-existing convention preserved post-refactor: a *positive*
-    // i32 that doesn't match any named status falls into
-    // `ServiceSpecific`; a *negative* one falls into `Errno`. The
-    // refactor's wildcard arms (`x if x < 0 => Errno(x)` and
-    // `x => ServiceSpecific(x)`) lock that boundary.
     #[test]
     fn from_i32_unrecognized_routes_to_service_specific_or_errno() {
         assert_eq!(StatusCode::from(12345), StatusCode::ServiceSpecific(12345));
         assert_eq!(StatusCode::from(1), StatusCode::ServiceSpecific(1));
-        // Pick a negative value the refactor's const map doesn't claim.
-        // `-999` is not in any AOSP errno table.
+        // `-999` is in no AOSP errno table, so no named arm claims it.
         assert_eq!(StatusCode::from(-999), StatusCode::Errno(-999));
     }
 
-    // Regression: `From<std::io::Error>` must preserve the underlying
-    // errno through the Errno mapping instead of flattening every I/O
-    // failure to `BadFd`. Non-OS errors (no errno) surface as `Unknown`.
     #[test]
     fn status_code_from_io_error_preserves_errno() {
         let enoent = std::io::Error::from_raw_os_error(rustix::io::Errno::NOENT.raw_os_error());

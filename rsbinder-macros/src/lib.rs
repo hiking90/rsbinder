@@ -100,15 +100,22 @@
 //! **A `@nullable` array wraps its elements** — except where it does not. The
 //! rule turns on direction, arity and whether the element has a `Default` of
 //! its own, and a fixed-size `in` or returned array is its exception. Every
-//! cell of it is in the table below rather than spelled out here: this passage
-//! drifted from the rules in four separate review rounds, which is why the
-//! table is generated from them and checked against them.
+//! cell of it is in the table below, which is generated from the rules and
+//! checked against them.
 //!
 //! One cell no table can decide for you. A `#[derive(BinderEnum)]` element
 //! counts as a primitive and stays bare; a parcelable element takes an
 //! `Option<_>`. The macro sees a name and not which of the two it is, so it
 //! accepts either and cannot tell you which is right — spell an enum element
 //! bare and a parcelable element `Option<_>`, as `.aidl` renders them.
+//!
+//! **A `Box` appears in one place only.** `.aidl` boxes a `@nullable`
+//! parcelable field that closes a reference cycle — `Option<Box<T>>` — and
+//! nothing else, so a `Box` anywhere else is refused, including every argument
+//! and return: a cycle is judged against the declaration being generated, and
+//! an interface is never part of one. Whether a field's
+//! cycle closes depends on declarations the macro cannot see, so it accepts
+//! that spelling on any parcelable field; write it only where the cycle is real.
 //!
 //! **Paths resolve inside the generated module.** The body lands in a
 //! `{Trait}_binder` module one level below where the macro was written, and it
@@ -117,7 +124,9 @@
 //! written in, not its parent, so a signature that means the parent has to say
 //! `crate::X`. `self::` is rejected outright for the same reason; `super::` is
 //! left legal because it is the only way to name a type the generated module
-//! shadows (`BnFoo`, `BpFoo`, `transactions`, the trait's own name).
+//! shadows (`BnFoo`, `BpFoo`, `transactions`, the trait's own name). Use the
+//! macro at module scope: inside a function body `super::*` skips the block,
+//! so items declared in that block are not visible to the signature.
 //!
 //! **Spell types directly.** A proc macro cannot see through a type alias or
 //! a `use … as` rename, and every check above reads the spelling. `&mut Ids`
@@ -131,9 +140,9 @@
 //! qualification is fine — `std::vec::Vec<i32>` is matched structurally — but
 //! an alias or a rename is not.
 //!
-//! A doc comment on a method documents the declaration, not the generated
-//! trait: the render layer carries no doc field, so rustdoc for the emitted
-//! `IFoo` comes from the crate-level docs, not from here.
+//! A doc comment on the trait or a method is accepted but not carried: the
+//! render layer has no doc field, so the emitted `IFoo`, its methods and
+//! `BnFoo`/`BpFoo` carry no rustdoc from here.
 //!
 //! # What it emits
 //!
@@ -155,11 +164,7 @@
 //! The generated code names `rsbinder::` directly, so the dependency has to
 //! keep that name — a `package = "rsbinder"` rename will not resolve.
 
-// The reference table, generated from the same rules the macro enforces and
-// checked against them by `type_matrix::the_reference_table_matches_the_rules`.
-// Prose restating what `.aidl` renders drifted from the rules in four separate
-// review rounds; this half of the documentation cannot, because a change to the
-// rules without a change to the file fails the build.
+// Generated; `type_matrix::the_reference_table_matches_the_rules` fails when it falls behind.
 #![doc = include_str!("../TYPES.md")]
 
 use proc_macro::TokenStream;
@@ -724,7 +729,10 @@ fn make_fn_member(f: &TraitItemFn, index: u32) -> syn::Result<FnMembers> {
             transaction_write.push(write);
             read_onto_params.push(ident.clone());
         }
-        transaction_params += &format!("{}, ", func_call_param(&ident, &as_written, &owned, dir));
+        transaction_params += &format!(
+            "{}, ",
+            func_call_param(&ident, &pat_ty.ty, &as_written, &owned, dir)
+        );
     }
 
     let return_type = return_type(f)?;
@@ -753,7 +761,7 @@ fn make_fn_member(f: &TraitItemFn, index: u32) -> syn::Result<FnMembers> {
 }
 
 /// Bridge `owned` to `as_written` off the signature alone, so no type list is needed.
-fn func_call_param(ident: &str, as_written: &str, owned: &str, dir: Dir) -> String {
+fn func_call_param(ident: &str, ty: &Type, as_written: &str, owned: &str, dir: Dir) -> String {
     if dir != Dir::In {
         return format!("&mut {ident}");
     }
@@ -766,13 +774,15 @@ fn func_call_param(ident: &str, as_written: &str, owned: &str, dir: Dir) -> Stri
     if as_written.starts_with('&') {
         return format!("&{ident}");
     }
-    // `Option<&str>` / `Option<&[T]>` borrow through, anything else by ref.
-    if owned.starts_with("Option<Vec<") || owned.starts_with("Option<String>") {
-        format!("{ident}.as_deref()")
-    } else if owned.starts_with("Option<") {
-        format!("{ident}.as_ref()")
-    } else {
-        format!("&{ident}")
+    // Structural, so `std::option::Option<&str>` borrows through like `Option<&str>`.
+    let borrowed = type_str::option_inner(ty).map(type_str::unwrap_group);
+    match borrowed {
+        Some(Type::Reference(r)) => match type_str::unwrap_group(&r.elem) {
+            Type::Path(p) if p.path.is_ident("str") => format!("{ident}.as_deref()"),
+            Type::Slice(_) => format!("{ident}.as_deref()"),
+            _ => format!("{ident}.as_ref()"),
+        },
+        _ => format!("&{ident}"),
     }
 }
 
@@ -848,9 +858,17 @@ fn by_value_types(item: &ItemTrait) -> syn::Result<Vec<Type>> {
 
 /// `#[deprecated]` / `#[deprecated = "…"]` as `.aidl` renders `@deprecated`.
 pub(crate) fn deprecated_of(attrs: &[syn::Attribute]) -> syn::Result<String> {
-    let Some(attr) = attrs.iter().find(|a| a.path().is_ident("deprecated")) else {
+    let mut found = attrs.iter().filter(|a| a.path().is_ident("deprecated"));
+    let Some(attr) = found.next() else {
         return Ok(String::new());
     };
+    // The input item is not re-emitted, so rustc's own E0550 never sees the second one.
+    if let Some(second) = found.next() {
+        return Err(syn::Error::new_spanned(
+            second,
+            "#[deprecated] is given more than once",
+        ));
+    }
     match &attr.meta {
         syn::Meta::Path(_) => Ok(rsbinder_aidl::render::deprecated_attr(Some(&String::new()))),
         syn::Meta::NameValue(nv) => {
@@ -882,7 +900,8 @@ fn has_attr(attrs: &[syn::Attribute], name: &str) -> bool {
 /// The re-render drops an unrecognised attribute, e.g. a mistyped `#[oneway]` or a `#[cfg]`.
 fn check_attrs(attrs: &[syn::Attribute], allowed: &[&str]) -> syn::Result<()> {
     for attr in attrs {
-        if attr.path().is_ident("doc") {
+        // Only `#[doc = "…"]`: a `#[doc(hidden)]` has no field to survive the re-render in.
+        if attr.path().is_ident("doc") && matches!(attr.meta, syn::Meta::NameValue(_)) {
             continue;
         }
         if let Some(name) = allowed.iter().find(|a| attr.path().is_ident(a)) {
@@ -1408,8 +1427,7 @@ interface IGolden8 {
         );
     }
 
-    /// `#[nonnull]` is the other half of the ambiguous spelling: the same
-    /// `&mut Option<T>` that means `out @nullable T` without it.
+    /// `#[nonnull]` makes the `&mut Option<T>` that is otherwise `out @nullable T` plain `out T`.
     #[test]
     fn nonnull_out_binders_match_the_non_nullable_aidl() {
         assert_same_files(
@@ -1451,8 +1469,7 @@ interface IGolden8 {
         );
     }
 
-    /// Anywhere else the spelling already says which `.aidl` form it is, so the
-    /// attribute would be a second, silent source of truth.
+    /// Anywhere else the spelling decides, so the attribute would be a second source of truth.
     #[test]
     fn rejects_nonnull_where_the_spelling_is_not_ambiguous() {
         for decl in [
@@ -1486,8 +1503,7 @@ interface IGolden8 {
         }
     }
 
-    /// `@deprecated` reaches the trait and the method alike, and renders the
-    /// same attribute `.aidl` renders.
+    /// `@deprecated` on the trait and the method renders what `.aidl` renders.
     #[test]
     fn deprecation_matches_aidl() {
         assert_same(
@@ -1527,8 +1543,54 @@ interface IGolden12 {
         assert!(err.contains("no AIDL form"), "{err}");
     }
 
-    /// Every `in` array shape `.aidl` renders. The element `Option` follows a
-    /// different rule here than for `out`, so the two tables are both needed.
+    /// Only the first would render; the rest would vanish without a word.
+    #[test]
+    fn rejects_a_repeated_deprecation() {
+        let err = reject(quote! {
+            pub trait IBad {
+                #[deprecated = "a"]
+                #[deprecated = "b"]
+                fn go(&self) -> BinderResult<()>;
+            }
+        });
+        assert!(err.contains("more than once"), "{err}");
+    }
+
+    /// `#[doc(hidden)]` has nowhere to go in the render, so it would be dropped.
+    #[test]
+    fn rejects_a_doc_attribute_the_re_render_would_drop() {
+        for attr in [quote!(#[doc(hidden)]), quote!(#[doc(alias = "x")])] {
+            let err = reject(quote! {
+                #attr
+                pub trait IBad {
+                    fn go(&self) -> BinderResult<()>;
+                }
+            });
+            assert!(err.contains("unsupported attribute"), "{attr}: {err}");
+        }
+        // A doc comment is `#[doc = "…"]`, and stays legal.
+        render(quote! {
+            /// Documented.
+            pub trait IOk {
+                /// Documented too.
+                fn go(&self) -> BinderResult<()>;
+            }
+        });
+    }
+
+    /// Advice for a nullable bare path must keep the `Option`: `@nullable Mode` has no form.
+    #[test]
+    fn a_nullable_by_value_path_is_pointed_at_the_borrowed_form() {
+        let err = reject(quote! {
+            pub trait IBad {
+                fn go(&self, c: Option<Cfg>) -> BinderResult<()>;
+            }
+        });
+        assert!(err.contains("`Option<&Cfg>`"), "{err}");
+        assert!(!err.contains("`Cfg` or"), "{err}");
+    }
+
+    /// Every `in` array shape `.aidl` renders; the element `Option` rule differs from `out`.
     #[test]
     fn every_in_array_shape_matches_aidl() {
         assert_same_files(
@@ -1607,8 +1669,7 @@ interface IGolden12 {
         );
     }
 
-    /// An element `Option` that `.aidl` spells bare lets the service send a
-    /// null element a conforming peer cannot decode.
+    /// An element `Option` `.aidl` spells bare lets a null go out that a peer cannot decode.
     #[test]
     fn rejects_an_array_of_options_aidl_would_spell_bare() {
         for decl in [
@@ -1637,8 +1698,7 @@ interface IGolden12 {
         }
     }
 
-    /// A fixed-size `#[inout]` array defaults each slot like an `out` one, and a
-    /// `@nullable` array wraps every element a primitive.
+    /// A fixed `#[inout]` array defaults slots like `out`; `@nullable` wraps non-primitives.
     #[test]
     fn rejects_array_elements_aidl_spells_the_other_way() {
         for (decl, needle) in [
@@ -1746,6 +1806,59 @@ interface IGolden12 {
         });
     }
 
+    /// `.aidl` has no variable-length dimension beside another, nor an `Option` around one.
+    #[test]
+    fn rejects_arrays_nested_the_way_aidl_cannot_render() {
+        for (decl, needle) in [
+            (
+                quote!(
+                    fn go(&self) -> BinderResult<Vec<[i32; 3]>>;
+                ),
+                "fixed-size in every dimension",
+            ),
+            (
+                quote!(
+                    fn go(&self, v: &[[i32; 3]]) -> BinderResult<()>;
+                ),
+                "fixed-size in every dimension",
+            ),
+            (
+                quote!(
+                    fn go(
+                        &self,
+                        v: &mut Vec<[rsbinder::ParcelFileDescriptor; 3]>,
+                    ) -> BinderResult<()>;
+                ),
+                "fixed-size in every dimension",
+            ),
+            (
+                quote!(
+                    fn go(&self) -> BinderResult<Vec<Vec<i32>>>;
+                ),
+                "fixed-size in every dimension",
+            ),
+            (
+                quote!(
+                    fn go(&self) -> BinderResult<Option<Vec<Option<[String; 3]>>>>;
+                ),
+                "`Option` of another array",
+            ),
+            (
+                quote!(
+                    fn go(&self) -> BinderResult<[Option<[String; 3]>; 2]>;
+                ),
+                "`Option` of another array",
+            ),
+        ] {
+            let err = reject(quote! {
+                pub trait IBad {
+                    #decl
+                }
+            });
+            assert!(err.contains(needle), "{needle}: {err}");
+        }
+    }
+
     /// The spellings `.aidl` never renders for an `in` argument.
     #[test]
     fn rejects_a_borrowed_owned_container() {
@@ -1790,8 +1903,7 @@ interface IGolden12 {
         }
     }
 
-    /// A scalar `.aidl` cannot render would make the `.aidl` port a different
-    /// type; the argument and return axes share one helper.
+    /// A scalar `.aidl` cannot render makes the `.aidl` port a different type.
     #[test]
     fn rejects_scalars_aidl_never_renders() {
         for (decl, needle) in [
@@ -1844,6 +1956,19 @@ interface IGolden12 {
                 ),
                 "`u128`",
             ),
+            // Below a generic other than `Vec`/`Option` the argument is still a scalar.
+            (
+                quote!(
+                    fn go(&self) -> BinderResult<Box<u128>>;
+                ),
+                "`u128`",
+            ),
+            (
+                quote!(
+                    fn go(&self, p: &Pair<u32>) -> BinderResult<()>;
+                ),
+                "`u32`",
+            ),
         ] {
             let err = reject(quote! {
                 pub trait IBad {
@@ -1860,6 +1985,104 @@ interface IGolden12 {
                 fn c(&self, v: &[u8]) -> BinderResult<()>;
                 fn d(&self, v: Option<&[u8]>) -> BinderResult<()>;
                 fn e(&self) -> BinderResult<i64>;
+            }
+        });
+    }
+
+    /// `.aidl` boxes only the cycle-closing `@nullable` parcelable field, at its outer `Option`.
+    #[test]
+    fn rejects_a_box_aidl_never_renders() {
+        for decl in [
+            quote!(
+                fn go(&self) -> BinderResult<Box<Cfg>>;
+            ),
+            quote!(
+                fn go(&self, c: &Box<Cfg>) -> BinderResult<()>;
+            ),
+            quote!(
+                fn go(&self, c: &mut Box<Cfg>) -> BinderResult<()>;
+            ),
+            quote!(
+                fn go(&self) -> BinderResult<Vec<Option<Box<Cfg>>>>;
+            ),
+            quote!(
+                fn go(&self) -> BinderResult<Option<Box<i32>>>;
+            ),
+            quote!(
+                fn go(&self, c: Option<Box<Cfg>>) -> BinderResult<()>;
+            ),
+            quote!(
+                fn go(&self) -> BinderResult<std::boxed::Box<Cfg>>;
+            ),
+            quote!(
+                fn go(&self) -> BinderResult<Option<Box<Cfg>>>;
+            ),
+            quote!(
+                fn go(&self, c: Option<&Box<Cfg>>) -> BinderResult<()>;
+            ),
+            quote!(
+                fn go(&self, c: &mut Option<Box<Cfg>>) -> BinderResult<()>;
+            ),
+        ] {
+            let err = reject(quote! {
+                pub trait IBad {
+                    #decl
+                }
+            });
+            assert!(err.contains("never renders this `Box`"), "{decl}: {err}");
+        }
+        render(quote! {
+            pub trait IOk {
+                fn d(&self) -> BinderResult<crate::p::Box<Cfg>>;
+            }
+        });
+        let input: syn::DeriveInput = syn::parse2(quote! {
+            pub struct Node {
+                pub next: Option<Box<Node>>,
+            }
+        })
+        .unwrap();
+        parcelable::render_source(&input).expect("a field's `Option<Box<T>>` is accepted");
+    }
+
+    /// `.aidl` refuses an array, `List` or `@nullable` as a user generic's type argument.
+    #[test]
+    fn rejects_a_generic_argument_aidl_never_renders() {
+        for decl in [
+            quote!(
+                fn go(&self) -> BinderResult<Pair<Vec<i32>>>;
+            ),
+            quote!(
+                fn go(&self, p: &Pair<[i32; 3]>) -> BinderResult<()>;
+            ),
+            quote!(
+                fn go(&self) -> BinderResult<Vec<Pair<Vec<i32>>>>;
+            ),
+            quote!(
+                fn go(&self) -> BinderResult<crate::p::Box<Option<Cfg>>>;
+            ),
+        ] {
+            let err = reject(quote! {
+                pub trait IBad {
+                    #decl
+                }
+            });
+            assert!(err.contains("names a type argument bare"), "{decl}: {err}");
+        }
+        let input: syn::DeriveInput = syn::parse2(quote! {
+            pub struct Holder {
+                pub p: Pair<Option<Cfg>>,
+            }
+        })
+        .unwrap();
+        let err = parcelable::render_source(&input)
+            .expect_err("a field's `Pair<Option<Cfg>>` is refused")
+            .to_string();
+        assert!(err.contains("names a type argument bare"), "{err}");
+        render(quote! {
+            pub trait IOk {
+                fn a(&self, p: &Pair<Cfg>) -> BinderResult<Option<Pair<Pair<String>>>>;
+                fn b(&self) -> BinderResult<Vec<Pair<i32>>>;
             }
         });
     }
@@ -2434,8 +2657,7 @@ interface IGolden11 {
         assert!(err.contains("duplicate method name `go`"), "{err}");
     }
 
-    /// The receiver is the one place that allows nothing, and an empty
-    /// allow-list must not render as an empty `understands only` list.
+    /// The receiver allows nothing; an empty allow-list must not render `understands only`.
     #[test]
     fn an_empty_allow_list_names_no_attribute() {
         let err = reject(quote! {
@@ -2502,6 +2724,29 @@ interface IGolden11 {
         assert!(err.contains("`self::`"), "{err}");
     }
 
+    /// A `Self` outside the receiver makes the generated trait unusable as `dyn IFoo`.
+    #[test]
+    fn rejects_self_in_a_signature() {
+        for decl in [
+            quote!(
+                fn go(&self, other: &Self) -> BinderResult<()>;
+            ),
+            quote!(
+                fn go(&self, v: &[Self]) -> BinderResult<()>;
+            ),
+            quote!(
+                fn go(&self) -> BinderResult<Option<Self>>;
+            ),
+        ] {
+            let err = reject(quote! {
+                pub trait IBad {
+                    #decl
+                }
+            });
+            assert!(err.contains("cannot name `Self`"), "{err}");
+        }
+    }
+
     /// Matched structurally, so a qualified `Vec` carries the same length word.
     #[test]
     fn qualified_vec_is_still_a_length_carrying_out_vector() {
@@ -2545,13 +2790,29 @@ interface IGolden11 {
         assert!(s.contains("iter().any(Option::is_none)"), "{s}");
     }
 
-    /// Pinned here, not in `tests/ui`: the rustc diagnostic's wording moves between releases.
-    ///
-    /// A bare path is the only by-value argument left — `.aidl` renders every
-    /// other `in` type behind a reference — and it is exactly the spelling the
-    /// macro cannot classify, since an enum (passed by value) and a parcelable
-    /// (not) look the same here. The `Copy` assertion is what makes rustc
-    /// refuse the parcelable half.
+    /// A qualified nullable `in` borrows through as the bare `Option<&T>` does.
+    #[test]
+    fn qualified_nullable_in_arguments_borrow_through() {
+        let s = render(quote! {
+            pub trait IIn {
+                fn a(&self, x: std::option::Option<&str>) -> BinderResult<()>;
+                fn b(&self, x: std::option::Option<&Cfg>) -> BinderResult<()>;
+                fn c(&self, x: core::option::Option<&[u8]>) -> BinderResult<()>;
+            }
+        });
+        for (method, call) in [
+            ("a", "_arg_x.as_deref()"),
+            ("b", "_arg_x.as_ref()"),
+            ("c", "_arg_x.as_deref()"),
+        ] {
+            assert!(
+                s.contains(&format!("_service.r#{method}({call})")),
+                "{method}: {s}"
+            );
+        }
+    }
+
+    /// The `Copy` assertion refuses a by-value parcelable; pinned here as rustc's wording moves.
     #[test]
     fn by_value_argument_is_asserted_copy() {
         let item: ItemTrait = syn::parse2(quote! {

@@ -13,6 +13,33 @@
 //! Separate test binary: no shared process with the kernel
 //! binder unit tests. Each test owns its own server + sessions ⇒
 //! parallel-safe.
+//!
+//! # Mutation gates
+//!
+//! - `kernel_parcel_refuses_the_accessor_root_wrapper`: `AccessorRoot::as_any` forwards to
+//!   the inner `RpcProxy` (so `as_remote` / `as_proxy` see the concrete type); that forward
+//!   lets the one check in `SerializeOption for SIBinder` cover the wrapper without a second
+//!   branch. Dropping the forward turns this test red.
+//! - `accessor_arm_handles_nonblocking_fd_from_libbinder`: AOSP `singleSocketConnection`
+//!   (`frameworks/native/libs/binder/RpcSession.cpp:614`, android-16.0.0_r4) opens its
+//!   preconnected socket with `SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK`, so every fd
+//!   `IAccessor::addConnection()` returns is non-blocking. rsbinder RPC I/O is blocking (the
+//!   handshake reads the `RpcNewSessionResponse` via `read_exact_raw`, which assumes `read`
+//!   blocks); without the `O_NONBLOCK` clear in `RpcSession::from_preconnected_fd` the
+//!   handshake's first `read()` returns `EAGAIN` and tears the connection down. Removing that
+//!   clear fails this test hermetically, before the android-16 emulator STAGE3 run.
+//! - `process_local_provider_resolves_root_via_resolve_helper`: removing the
+//!   `or_else(|| try_process_local_fallback(name))` from
+//!   `hub::servicemanager_16::dispatch_typed_service` (the *consume*-side wire-up) does not
+//!   break this test, because the test calls `resolve_via_process_local` directly;
+//!   `hub::servicemanager_16::tests` catches it
+//!   (`dispatch_falls_back_when_accessor_arm_binder_is_none`).
+//! - `resolve_via_process_local_keys_strictly_by_instance_name`: a provider that returns
+//!   `Some(_)` for every name *and* a registry that ignores its instance set, both at once,
+//!   resolve the `unknown` lookup, and the `is_none()` assertions fail. Either mutant alone
+//!   passes: the test provider answers only its own name. This is the contract the
+//!   `hub::servicemanager_16::dispatch_typed_service` fallback relies on; the dispatcher's own
+//!   routing is exercised by the unit tests in `hub::servicemanager_16::tests`.
 
 #![cfg(all(feature = "rpc", feature = "android_16"))]
 
@@ -92,32 +119,17 @@ fn make_echo(calls: Arc<AtomicI64>) -> SIBinder {
 
 // ---- MockAccessor (the IAccessor implementation under test) ---------
 
-/// What the Accessor reports on `getInstanceName()`. Tests can lie
-/// (return a different name than the looked-up service) to drive the
-/// `validateAccessor` rejection path.
+/// Test `IAccessor`; `name` may differ from the lookup to drive the `validateAccessor` reject.
 struct MockAccessor {
-    /// Server-side socket path; `addConnection()` opens a fresh
-    /// `UnixStream::connect()` to it on every call (the AOSP shape:
-    /// "may be called multiple times" — rsbinder's single-connection
-    /// session model uses exactly one).
+    /// Socket path; every `addConnection()` connects anew (AOSP allows repeats; rsbinder uses one).
     server_path: PathBuf,
-    /// Reported instance name (the bridge enforces match vs. the
-    /// caller-supplied lookup name).
+    /// Reported instance name; the bridge requires it to match the lookup name.
     name: String,
-    /// Optional override returning a synthetic
-    /// `ServiceSpecificError(code)` from `addConnection()` — exercises
-    /// the decode + reject path.
+    /// If set, `addConnection()` fails with `ServiceSpecificError(code)` (decode + reject path).
     add_connection_error: Option<i32>,
-    /// Bumped on every `addConnection()` so a test can assert the
-    /// bridge made exactly one connection attempt (or none, for a
-    /// pre-empted instance-name rejection).
+    /// Counts `addConnection()` calls: one per bridge attempt, none after a name reject.
     addconnection_calls: Arc<AtomicU32>,
-    /// Set `O_NONBLOCK` on the fd before returning it. Mirrors AOSP
-    /// `singleSocketConnection` (frameworks/native/libs/binder/
-    /// RpcSession.cpp:614, android-16.0.0_r4), which always creates
-    /// its preconnected socket with `SOCK_NONBLOCK`. The bridge under
-    /// test must clear that flag in `from_preconnected_fd` so the
-    /// blocking RPC machinery doesn't trip over EAGAIN mid-handshake.
+    /// Return the fd `O_NONBLOCK`, as AOSP `singleSocketConnection` does (module doc).
     nonblocking: bool,
 }
 
@@ -161,12 +173,15 @@ fn make_mock_accessor(mock: MockAccessor) -> SIBinder {
 // ---- harness helpers ------------------------------------------------
 
 fn tmp_sock(tag: &str) -> PathBuf {
-    // Per-test, per-PID, per-time: parallel test binaries never collide.
+    // Unique per test, PID and time; short prefix for macOS's 104-byte `sun_path`.
     let mut p = std::env::temp_dir();
     p.push(format!(
-        "rsbinder-accessor-{tag}-{}-{}",
+        "rsb_acc_{tag}_{}_{}.sock",
         std::process::id(),
-        Instant::now().elapsed().as_nanos()
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
     ));
     p
 }
@@ -181,9 +196,7 @@ fn wait_for_sock(path: &PathBuf) {
     panic!("server socket {path:?} did not appear in time");
 }
 
-/// Spin up an `RpcServer` (android-13+ wire, max=2 ⇒ android-16 v2)
-/// serving an `EchoSvc` root, return (socket path, call counter, drop
-/// guard that shuts the server cleanly).
+/// `RpcServer` (android-13+ wire, max=2 ⇒ android-16 v2) serving `EchoSvc`; drop stops it.
 struct EchoServerGuard {
     path: PathBuf,
     calls: Arc<AtomicI64>,
@@ -220,8 +233,7 @@ impl Drop for EchoServerGuard {
     }
 }
 
-/// Tiny client-side typed wrapper around the RPC root SIBinder
-/// returned by the bridge. Echos a string via TX_ECHO.
+/// Echo `s` via `TX_ECHO` on the bridged RPC root.
 fn rpc_echo(root: &SIBinder, s: &str) -> Result<String> {
     let rp = (**root)
         .as_any()
@@ -254,8 +266,7 @@ fn accessor_arm_resolves_root_and_echoes() {
         nonblocking: false,
     });
 
-    // Contract: a `Service::Accessor` arm resolves to
-    // `ServiceWithMetadata { service: Some(rpc_root), isLazyService: false }`.
+    // `Service::Accessor` → `ServiceWithMetadata { Some(rpc_root), isLazyService: false }`.
     let swm = resolve_accessor("test.echo", accessor).expect("bridge resolves");
     assert!(!swm.r#isLazyService);
     let root = swm.r#service.expect("bridge yields an RPC root binder");
@@ -271,19 +282,11 @@ fn accessor_arm_resolves_root_and_echoes() {
     }
     assert_eq!(server.calls.load(Ordering::SeqCst), 22);
 
-    // Drop the user-visible root: the wrapper's `Drop` must release the
-    // inner proxy first (best-effort DEC_STRONG), then the session
-    // (peer-side serve loop exits on EndOfStream). No leak / no panic.
+    // The wrapper's `Drop` releases the inner proxy (DEC_STRONG) before the session.
     drop(root);
 }
 
-/// AC-22.1. The `AccessorRoot` wrapper the bridge hands back is an RPC
-/// binder in a trench coat, so a kernel parcel must refuse it too.
-///
-/// `AccessorRoot::as_any` deliberately forwards to the inner `RpcProxy`
-/// (so `as_remote` / `as_proxy` see the concrete type); that forward is
-/// what makes the one check in `SerializeOption for SIBinder` cover the
-/// wrapper without a second branch. Dropping the forward turns this red.
+/// AC-22.1: the `AccessorRoot` wrapper is an RPC binder, so a kernel parcel refuses it too.
 #[test]
 fn kernel_parcel_refuses_the_accessor_root_wrapper() {
     let server = EchoServerGuard::start("xstack");
@@ -317,8 +320,7 @@ fn accessor_instance_name_mismatch_rejects() {
     let addconn_calls = Arc::new(AtomicU32::new(0));
     let accessor = make_mock_accessor(MockAccessor {
         server_path: server.path.clone(),
-        // Accessor lies about its name; bridge must reject before
-        // calling `addConnection()`.
+        // Accessor lies about its name; bridge must reject before `addConnection()`.
         name: "evil.imposter".to_string(),
         add_connection_error: None,
         addconnection_calls: addconn_calls.clone(),
@@ -329,9 +331,7 @@ fn accessor_instance_name_mismatch_rejects() {
         resolve_accessor("test.echo", accessor).is_none(),
         "instance-name mismatch must reject"
     );
-    // AOSP `validateAccessor` rejects *before* the fd is allocated;
-    // mirror that to keep a misbehaving Accessor from getting a free
-    // socket out of us.
+    // As AOSP `validateAccessor`: reject before a misbehaving Accessor gets a socket.
     assert_eq!(
         addconn_calls.load(Ordering::SeqCst),
         0,
@@ -364,8 +364,7 @@ fn accessor_add_connection_service_specific_error_rejects_and_logs() {
             "ERROR={code} must reject"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        // Symbolic name lookup must round-trip — the deterministic
-        // gate (the log line is what an operator sees).
+        // The symbolic name is what the operator-facing log line shows.
         let name = accessor_error_name(code);
         assert!(
             name.starts_with("ERROR_"),
@@ -389,39 +388,34 @@ fn accessor_root_keeps_session_alive_then_terminates_on_drop() {
     });
     let swm = resolve_accessor("test.echo", accessor).expect("bridge");
     let root = swm.r#service.expect("root");
-    // The caller never sees an `RpcSession` directly — the wrapper
-    // holds it. A transact through the proxy must succeed without
-    // `DeadObject`.
+    // The wrapper holds the `RpcSession` the caller never sees.
     assert_eq!(rpc_echo(&root, "alive").unwrap(), "alive");
 
-    // Cloning the SIBinder is allowed (cheap Arc clone); the clone
-    // must also stay alive.
+    // A clone of the SIBinder must stay usable too.
     let clone = root.clone();
     assert_eq!(rpc_echo(&clone, "still-alive").unwrap(), "still-alive");
     drop(root);
-    // Dropping the original keeps the clone (and thus the session)
-    // alive; AOSP `setSessionSpecificRoot` has the same shape.
+    // The clone keeps the session alive, as with AOSP `setSessionSpecificRoot`.
     assert_eq!(rpc_echo(&clone, "after-drop").unwrap(), "after-drop");
+    assert!(
+        server.server.live_session_node_count() >= 1,
+        "the root node is live"
+    );
     drop(clone);
-    // After the last reference drops, the session shuts down — but
-    // that's an internal detail. The test merely asserts no panic.
+    // The last reference closes the session, so the server's side releases its nodes.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while server.server.live_session_node_count() != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the session outlived its last root reference"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
 }
 
 // ---- STAGE3 regression gate: non-blocking preconnected fd -----------
 
-/// AOSP `singleSocketConnection` (frameworks/native/libs/binder/
-/// RpcSession.cpp:614, android-16.0.0_r4) opens its preconnected
-/// socket with `SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK`, so every
-/// fd `IAccessor::addConnection()` returns is **non-blocking**.
-/// rsbinder RPC I/O is blocking by construction (the handshake reads
-/// the `RpcNewSessionResponse` via `read_exact_raw` which assumes
-/// `read` blocks); without explicit `O_NONBLOCK` clear in
-/// `from_preconnected_fd`, the handshake's first `read()` returns
-/// `EAGAIN` and tears the connection down — which STAGE3 interop caught
-/// against the real android-16 emulator. This test is the hermetic
-/// regression gate so a future refactor that removes the
-/// `O_NONBLOCK` clear in [`RpcSession::from_preconnected_fd`] fails
-/// here, before reaching the live emulator.
+/// A non-blocking preconnected fd, as AOSP returns, still handshakes; see module doc gates.
 #[test]
 fn accessor_arm_handles_nonblocking_fd_from_libbinder() {
     let server = EchoServerGuard::start("nonblock");
@@ -439,8 +433,7 @@ fn accessor_arm_handles_nonblocking_fd_from_libbinder() {
     let root = swm.r#service.expect("RPC root");
     assert_eq!(addconn_calls.load(Ordering::SeqCst), 1);
 
-    // Full transact must succeed — the handshake completed only because
-    // the bridge cleared the inherited `O_NONBLOCK` flag.
+    // Completes only because the bridge cleared the inherited `O_NONBLOCK`.
     assert_eq!(rpc_echo(&root, "hello-nonblock").unwrap(), "hello-nonblock");
     for i in 0..10 {
         assert_eq!(rpc_echo(&root, &format!("n{i}")).unwrap(), format!("n{i}"));
@@ -455,44 +448,15 @@ use rsbinder::hub::android_16::{
 };
 use std::collections::HashSet;
 
-/// End-to-end from `add_accessor_provider` registration
-/// to `resolve_via_process_local` returning an `RpcSession` root that
-/// echoes:
-///
-/// 1. Spin up an `RpcServer` (background) serving `EchoSvc` as root.
-/// 2. Register a `LocalAccessor` (via `create_accessor`) under a
-///    unique instance name through `add_accessor_provider`.
-/// 3. Call `resolve_via_process_local(name)` — the public entrypoint
-///    (`getInjectedAccessor` + `Service::accessor → toBinder` AOSP
-///    combined). Asserts:
-///    * lookup hits the registered provider (the registry is global,
-///      but the instance name is process+line-scoped so no
-///      cross-test collision),
-///    * `resolve_accessor` runs cleanly against the live RPC
-///      server: instance-name validation passes, `addConnection`
-///      yields a connected fd, `from_preconnected_fd` handshakes v2,
-///      `get_root()` returns the echo binder,
-///    * a full `TX_ECHO` round-trip succeeds (so the registered
-///      provider's `AccessorAddrProvider` closure was actually called
-///      with the right path).
-///
-/// Mutant gate: removing the `or_else(|| try_process_local_fallback)`
-/// from `hub::servicemanager_16::get_service` (the *consume*-side
-/// wire-up) wouldn't break this test, because the test calls
-/// `resolve_via_process_local` directly — that wire-up is exercised
-/// by [`process_local_fallback_takes_priority_when_accessor_arm_is_none`]
-/// below.
+/// `add_accessor_provider` → `resolve_via_process_local` root echoes; see module doc gates.
 #[test]
 fn process_local_provider_resolves_root_via_resolve_helper() {
     let server = EchoServerGuard::start("a5-helper");
 
-    // Unique instance name per test (process-id + line for cross-test
-    // safety; the registry is process-wide static).
+    // The registry is process-wide, so the name is unique per process and line.
     let instance = format!("rsb.test.a5.helper.{}.{}", std::process::id(), line!());
 
-    // `LocalAccessor` whose `addr_provider` always hands back the
-    // RpcServer's listening UDS path. Registered under `instance` via
-    // the process-local registry.
+    // A `LocalAccessor` whose `addr_provider` always returns the server's UDS path.
     let server_path = server.path.clone();
     let provider: AccessorProviderFn = {
         let want = instance.clone();
@@ -511,16 +475,12 @@ fn process_local_provider_resolves_root_via_resolve_helper() {
     let provider_handle =
         add_accessor_provider(HashSet::from([instance.clone()]), provider).expect("registry add");
 
-    // Public entrypoint — combined `getInjectedAccessor` +
-    // `toBinder` path.
+    // Public entrypoint: combined `getInjectedAccessor` + `toBinder` path.
     let swm = resolve_via_process_local(&instance).expect("process-local fallback yields root SWM");
     assert!(!swm.r#isLazyService, "RPC root is never a LazyService");
     let root = swm.r#service.expect("RPC root binder");
 
-    // Full transact round-trip: the registered provider's
-    // `addr_provider` closure was hit, `LocalAccessor::addConnection`
-    // connected to the RpcServer's listener, and the resulting RPC
-    // root services TX_ECHO.
+    // An echo proves `addr_provider` ran and `addConnection` reached the server's listener.
     assert_eq!(
         rpc_echo(&root, "a5-hello").unwrap(),
         "a5-hello",
@@ -530,17 +490,7 @@ fn process_local_provider_resolves_root_via_resolve_helper() {
     drop(provider_handle);
 }
 
-/// `resolve_via_process_local` keys lookups
-/// **strictly** by instance name — unregistered names yield `None`
-/// (not a phantom binder), and a sibling registration must not leak
-/// into unrelated names. This is the contract the
-/// `hub::servicemanager_16::dispatch_typed_service` fallback relies on;
-/// the dispatcher's own routing is exercised by the unit tests in
-/// [`hub::servicemanager_16::tests`].
-///
-/// **Mutant gate**: a provider that returns `Some(_)` for every name
-/// (or a registry that ignores its instance set) would resurrect the
-/// `unknown` lookup ⇒ the `is_none()` assertions below fail.
+/// Unregistered names stay `None` even beside a sibling registration; see module doc gates.
 #[test]
 fn resolve_via_process_local_keys_strictly_by_instance_name() {
     let server = EchoServerGuard::start("a5-fallback");
@@ -549,19 +499,13 @@ fn resolve_via_process_local_keys_strictly_by_instance_name() {
         std::process::id(),
         line!()
     );
-    // Sanity: an instance no provider ever claimed yields `None` (not
-    // a phantom binder), so the fallback path in `get_service` is
-    // genuinely None when the registry is empty for `name`.
+    // An instance no provider ever claimed yields `None`, not a phantom binder.
     assert!(
         resolve_via_process_local(&unknown).is_none(),
         "unregistered name must not yield a phantom binder"
     );
 
-    // Now register a provider for a *different* instance and verify
-    // the fallback dispatches *only* to the registered name — proving
-    // the registry's `instance` keying is honored end-to-end (an
-    // overly-eager provider that returns `Some(_)` for every name
-    // would silently shadow legitimate misses).
+    // A provider for a *different* instance must answer only its registered name.
     let target = format!("rsb.test.a5.targeted.{}.{}", std::process::id(), line!());
     let server_path = server.path.clone();
     let provider: AccessorProviderFn = {
@@ -578,10 +522,7 @@ fn resolve_via_process_local_keys_strictly_by_instance_name() {
             }
         })
     };
-    // RAII handle — name-prefixed (not `_h`) so a future refactor that
-    // accidentally rebinds to `_` (immediate drop = unregister) is
-    // visible at the patch site instead of silently breaking the
-    // assertions below.
+    // Named, not `_`: dropping the RAII handle unregisters the provider.
     let provider_handle =
         add_accessor_provider(HashSet::from([target.clone()]), provider).expect("registry add");
 
@@ -602,16 +543,11 @@ fn resolve_via_process_local_keys_strictly_by_instance_name() {
 
 #[test]
 fn accessor_error_name_unknown_codes_safe() {
-    // The bridge `service_specific_error()` returns `0` for any
-    // non-ServiceSpecific Status; a future regression that *adds* an
-    // `ERROR_*=0` collision would silently mask other failures, so
-    // lock the contract: `0` maps to `ERROR_CONNECTION_INFO_NOT_FOUND`
-    // (AIDL constant value), all other unknowns to `"unknown"`.
+    // Non-ServiceSpecific statuses read as `0`, so another `ERROR_*=0` would mask failures.
     assert_eq!(accessor_error_name(0), "ERROR_CONNECTION_INFO_NOT_FOUND");
     assert_eq!(accessor_error_name(42), "unknown");
     assert_eq!(accessor_error_name(-1), "unknown");
-    // Ensure the re-export path through `hub::android_16` matches the
-    // module-local one (surface lock).
+    // The `hub::android_16` re-export matches the module-local one.
     assert_eq!(
         a16::accessor_error_name(0),
         "ERROR_CONNECTION_INFO_NOT_FOUND"

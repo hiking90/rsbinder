@@ -54,8 +54,12 @@ mod policy;
 mod trust;
 
 pub use activation::{ActivationRunner, Activator, SystemRunner};
-pub use declaration::{Activation, ConnectionInfo, Declaration, Declarations, InstanceName};
+pub use declaration::{
+    is_valid_service_name, Activation, ConnectionInfo, Declaration, Declarations, InstanceName,
+};
 pub use enforcer::Enforcer;
-pub use parse::{load, parse_file, ConfigError, NameResolver, SystemResolver};
+pub use parse::{
+    load, parse_file, Config, ConfigError, FileContents, NameResolver, SystemResolver,
+};
 pub use policy::{NamePattern, Permission, Policy, PolicyError, Rule, Subject, Subjects};
-pub use trust::{check_path, trust_problem, TrustProblem, Untrusted};
+pub use trust::{trust_problem, TrustProblem, Untrusted};

@@ -242,6 +242,68 @@ Key points about `ParcelableHolder`:
 - **Arc wrapping**: Extensions are set using `Arc<T>`, which allows shared ownership of the extension data.
 - **Multiple holders**: A single parcelable can have multiple `ParcelableHolder` fields (as shown with `ext` and `ext2` above), each holding a different extension type.
 - **Versioning**: This mechanism is particularly useful for forward compatibility. Older code that does not know about newer extension types can still deserialize the base parcelable and pass the `ParcelableHolder` through without losing data.
+- **Passing through over RPC**: an undecoded holder can be passed on over kernel binder, and within one RPC session on the android-16 (v2) wire. On the r34 and android-13 v0/v1 wires, and into a different session or transport, writing it returns `BadType`; decode it with `get_parcelable::<T>()` first. The `ParcelableHolder` rustdoc lists each case.
+
+## Generic Parcelables
+
+A parcelable may take type parameters, as AOSP's
+`android.hardware.common.fmq.MQDescriptor<T, Flavor>` does:
+
+```aidl
+parcelable MQDescriptor<@FixedSize T, Flavor> {
+    GrantorDescriptor[] grantors;
+    NativeHandle handle;
+    int quantum;
+    int flags;
+}
+```
+
+A parameter never reaches the parcel. It is a compile-time label that ties the
+descriptor to an element type and a flavor, so two instantiations produce the
+same bytes. The generated struct mirrors AOSP's Rust backend:
+
+```rust
+pub struct MQDescriptor<T, Flavor> {
+    pub grantors: Vec<GrantorDescriptor>,
+    pub handle: NativeHandle,
+    pub quantum: i32,
+    pub flags: i32,
+    pub _phantom_T: core::marker::PhantomData<T>,
+    pub _phantom_Flavor: core::marker::PhantomData<Flavor>,
+}
+```
+
+Every impl (`Default`, `Parcelable`, `Serialize`, `Deserialize`,
+`ParcelableMetadata`) is generic with no bound on the parameters. The phantom
+fields are `pub` (AOSP keeps them private) so `MQDescriptor { quantum: 4,
+..Default::default() }` compiles outside the generated module. Note that
+`#[derive(Debug)]` and `@RustDerive` bound the parameters the way any derive
+does: `Foo<Bar>: PartialEq` needs `Bar: PartialEq`.
+
+An annotation on a parameter is a requirement on the argument, checked at
+every use site: `@FixedSize T` accepts a primitive, an enum, or a `@FixedSize`
+parcelable or union (`MQDescriptor<byte, …>` compiles, `MQDescriptor<String, …>`
+does not; a generic instantiation such as `Elem<int>` never qualifies, as in
+AOSP), and `@VintfStability T` accepts only a `@VintfStability` declaration.
+Any other annotation on a parameter is a requirement no argument meets: the
+Java-only `@JavaPassthrough` and `@JavaSuppressLint` parse on the declaration,
+as in AOSP, but every use of such a generic is rejected. The argument count
+must match the declaration.
+
+The generator rejects, with a diagnostic naming the reason:
+
+- a field whose type is a parameter (`parcelable Foo<T> { T value; }`) —
+  nothing would be written for it;
+- a generic `union` — an enum with an unused parameter has no Rust form;
+- a nested declaration inside a generic parcelable — AOSP's rule ("Generic
+  types can't have nested types"); a field could only reach it by a path the
+  parameter's name would capture;
+- a parameter named like something the generated Rust spells unqualified: a
+  keyword, `String`, `Vec`, `Option`, a primitive, the `rsbinder` crate, or
+  the parcelable itself (`parcelable R<R>`);
+- an array, a `List` or `void` as a type argument;
+- an annotation on a type argument (`Q<@nullable Elem>`) — as in AOSP,
+  `@nullable` belongs to the whole field: `@nullable Q<Elem>`.
 
 ## Tips
 

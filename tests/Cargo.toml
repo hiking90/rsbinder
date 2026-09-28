@@ -30,7 +30,8 @@ rsbinder = { workspace = true, features = ["android_10_plus"] }
 # its runtime by hand).
 tokio = { workspace = true, features = ["rt-multi-thread", "time", "macros"] }
 env_logger = { workspace = true }
-rustix = { workspace = true, features = ["pipe", "param"] }
+# `mm`: `src/fmq_peer.rs` maps a queue's fd to damage its counters.
+rustix = { workspace = true, features = ["pipe", "param", "mm"] }
 async-trait = { workspace = true }
 log.workspace = true
 tracing = { workspace = true, optional = true }
@@ -53,7 +54,7 @@ required-features = ["rpc", "macros"]
 [[test]]
 name = "data_serde"
 path = "tests/data_serde.rs"
-required-features = ["rpc", "macros"]
+required-features = ["macros"]
 
 [[test]]
 name = "work_source_rpc"
@@ -63,6 +64,11 @@ required-features = ["rpc"]
 [[test]]
 name = "observer_rpc"
 path = "tests/observer_rpc.rs"
+required-features = ["rpc"]
+
+[[test]]
+name = "stream_rpc"
+path = "tests/stream_rpc.rs"
 required-features = ["rpc"]
 
 [[test]]

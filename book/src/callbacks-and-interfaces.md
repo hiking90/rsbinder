@@ -360,6 +360,12 @@ Two conditions are easy to miss:
   returns an error; there is no other process to outlive.
 - `binder_died` arrives as an inbound transaction, so the linking process needs
   its thread pool running, even if it otherwise only makes outbound calls.
+- Over RPC the same need is checked when you link: a client session that nothing
+  reads — no incoming connections and no serve loop — would never see its
+  connection drop, so `link_to_death` (and `death_signal`) return
+  `InvalidOperation` there, as AOSP does. Open incoming connections
+  (`ClientOptions::incoming_connections`) or start `RpcSession::spawn_serve`
+  first; see [RPC Transport](./rpc-transport.md).
 
 ## Tips
 

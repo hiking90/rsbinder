@@ -22,13 +22,18 @@ pub struct ClientOptions {
     /// RPC (android13plus profile): join an existing server session by
     /// its 32-byte id instead of opening a new one.
     pub session_id: Option<Vec<u8>>,
-    /// RPC (android13plus profile, `unix`/`unix-abstract`): number of
+    /// RPC (android13plus profile, every RPC transport): number of
     /// outgoing connections to open (AOSP `setupClient` fan-out).
     pub outgoing_connections: Option<u32>,
-    /// RPC, android-13+ profile, Unix sockets only: number of incoming
-    /// (callback) connections to open — AOSP `setMaxIncomingThreads`.
-    /// Needed for the server to call this client's callbacks from
-    /// outside a handler.
+    /// RPC (android13plus profile, every RPC transport): number of
+    /// incoming (callback) connections to open — AOSP
+    /// `setMaxIncomingThreads`. Needed for the server to call this
+    /// client's callbacks from outside a handler, and for any oneway
+    /// callback. Each one is a further
+    /// connection to the same endpoint (a `tls://` one is its own TLS
+    /// session), because the android-13+ wire lets the server start a
+    /// call only on a connection the client reads outside its own reply
+    /// wait.
     ///
     /// Setting this `> 0` makes the resulting [`Client`] one that must be
     /// shut down explicitly (`client.session().unwrap().close_session()`):
@@ -41,11 +46,11 @@ pub struct ClientOptions {
     // The target only exists with `rpc`, so only link it then.
     #[cfg_attr(
         feature = "rpc",
-        doc = "[`RpcUnixClientConfig::incoming_connections`](crate::rpc::RpcUnixClientConfig::incoming_connections)."
+        doc = "[`RpcClientConfig::incoming_connections`](crate::rpc::RpcClientConfig::incoming_connections)."
     )]
     #[cfg_attr(
         not(feature = "rpc"),
-        doc = "`RpcUnixClientConfig::incoming_connections` (`rpc` feature)."
+        doc = "`RpcClientConfig::incoming_connections` (`rpc` feature)."
     )]
     pub incoming_connections: Option<u32>,
     /// RPC: FD transport mode to negotiate. Requesting
@@ -83,8 +88,8 @@ pub struct ClientOptions {
     /// ignore it.
     ///
     /// It bounds each blocking step of that phase — one `connect(2)` per
-    /// address the host resolves to, then each handshake read and write —
-    /// and is not a budget for the phase as a whole, so `open` can take a
+    /// address the founding connection tries, then each handshake read and
+    /// write — and is not a budget for the phase as a whole, so `open` can take a
     /// multiple of it before returning. What it guarantees is that no
     /// single step waits on a silent peer forever. Resolving the host name
     /// is the one step it cannot reach: that blocks in the platform's
@@ -179,9 +184,7 @@ enum Inner {
     Rpc(crate::rpc::RpcSession),
 }
 
-/// A setting that can arrive both as a [`ClientOptions`] field and as a
-/// URI query key: two different values are refused, like every other
-/// conflict in [`Client::open`].
+/// Merges a [`ClientOptions`] field with its URI key; differing values are `BadValue`.
 fn one_source<T: PartialEq + std::fmt::Debug>(
     what: &str,
     from_option: Option<T>,
@@ -284,13 +287,9 @@ fn rpc_connect(uri: &Uri, o: &ClientOptions) -> Result<crate::rpc::RpcSession> {
         log::error!("rsbinder::Client::open: option `{what}` does not apply to {endpoint:?}");
         StatusCode::BadValue
     };
-    use crate::rpc::transport::RpcTransport;
-    use crate::rpc::{AddressSpace, FileDescriptorTransportMode, RpcSession};
+    use crate::rpc::{AddressSpace, RpcSession};
 
-    // Before any connect: this value reaches a read deadline on every
-    // RPC endpoint and `TcpStream::connect_timeout` on `tls://`, and
-    // both reject a zero duration — refuse it here, where the option
-    // that carries it can still be named.
+    // Refuse zero here, where the option can be named; its downstream consumers reject it too.
     crate::rpc::session::reject_zero_handshake_timeout(
         o.handshake_timeout,
         "ClientOptions::handshake_timeout",
@@ -298,9 +297,7 @@ fn rpc_connect(uri: &Uri, o: &ClientOptions) -> Result<crate::rpc::RpcSession> {
     let versioned = uri.wire_max_version;
     let fan_out = o.outgoing_connections.unwrap_or(1).max(1);
     let incoming = o.incoming_connections.unwrap_or(0);
-    // Gate on `is_some()`, not on the value: `Some(0)`/`Some(1)` is still
-    // the caller asking for an option this endpoint may not have, and
-    // `ClientOptions` promises such an option is `BadValue`, never ignored.
+    // `is_some()`, not the value: a set option this endpoint lacks is `BadValue`, never ignored.
     let multi_conn = o.outgoing_connections.is_some() || o.incoming_connections.is_some();
     if versioned.is_none() && (o.session_id.is_some() || multi_conn) {
         log::error!(
@@ -310,12 +307,7 @@ fn rpc_connect(uri: &Uri, o: &ClientOptions) -> Result<crate::rpc::RpcSession> {
         );
         return Err(StatusCode::BadValue);
     }
-    // Same contract for the handshake deadline. The r34 wire has no
-    // connection handshake at all — the session exists as soon as the
-    // socket does, and what `open` does after that is bounded by
-    // `timeout` — so on a plain r34 endpoint there is nothing for this
-    // option to bound. `tls://` is the exception either way: its
-    // `connect(2)` and TLS handshake below are bounded by it.
+    // r34 has no handshake to bound (see `ClientOptions::handshake_timeout`); `tls://` does.
     if versioned.is_none()
         && o.handshake_timeout.is_some()
         && !matches!(uri.endpoint, Endpoint::Tls(..))
@@ -328,49 +320,7 @@ fn rpc_connect(uri: &Uri, o: &ClientOptions) -> Result<crate::rpc::RpcSession> {
         return Err(StatusCode::BadValue);
     }
 
-    // The unix fan-out / incoming-connection path has its own
-    // multi-connection setup.
-    if let (Some(v), true) = (versioned, multi_conn) {
-        let mut cfg = match &uri.endpoint {
-            Endpoint::Unix(path) => crate::rpc::RpcUnixClientConfig::path(path, v),
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            Endpoint::UnixAbstract(name) => {
-                crate::rpc::RpcUnixClientConfig::abstract_name(name.as_slice(), v)
-            }
-            _ => {
-                log::error!(
-                    "rsbinder::Client::open: outgoing_connections > 1 / incoming_connections \
-                     are unix-only"
-                );
-                return Err(StatusCode::BadValue);
-            }
-        }
-        .outgoing_connections(fan_out)
-        .incoming_connections(incoming);
-        if let Some(m) = o.fd_mode {
-            cfg = cfg.fd_mode(m);
-        }
-        if let Some(t) = o.timeout {
-            cfg = cfg.timeout(t);
-        }
-        if let Some(t) = o.handshake_timeout {
-            cfg = cfg.handshake_timeout(t);
-        }
-        // Forward rather than drop: the session layer refuses the
-        // combination (`BadValue`), which is the "never ignored" contract.
-        if let Some(id) = o.session_id.as_deref() {
-            cfg = cfg.session_id(id);
-        }
-        #[cfg(feature = "rpc-tls")]
-        if o.tls.is_some() || o.tls_server_name.is_some() {
-            return Err(reject_option("tls/tls_server_name", &uri.endpoint));
-        }
-        return RpcSession::setup_unix_client_android13plus_with_config(cfg);
-    }
-
-    // `ClientOptions::tls` is honored only for `tls://`; every other
-    // endpoint would otherwise connect in plaintext while the caller
-    // believes the link is encrypted.
+    // TLS only on `tls://`: elsewhere it would connect in plaintext the caller thinks encrypted.
     #[cfg(feature = "rpc-tls")]
     if !matches!(uri.endpoint, Endpoint::Tls(..))
         && (o.tls.is_some() || o.tls_server_name.is_some())
@@ -378,27 +328,68 @@ fn rpc_connect(uri: &Uri, o: &ClientOptions) -> Result<crate::rpc::RpcSession> {
         return Err(reject_option("tls/tls_server_name", &uri.endpoint));
     }
 
-    let transport: Box<dyn RpcTransport> = match &uri.endpoint {
+    let mut cfg = client_config(&uri.endpoint, o, versioned.unwrap_or(0))?;
+    if let Some(m) = o.fd_mode {
+        cfg = cfg.fd_mode(m);
+    }
+    if let Some(t) = o.timeout {
+        cfg = cfg.timeout(t);
+    }
+    if let Some(t) = o.handshake_timeout {
+        cfg = cfg.handshake_timeout(t);
+    }
+    // Forwarded, not dropped: the session layer refuses what it cannot honor (never ignored).
+    if let Some(id) = o.session_id.as_deref() {
+        cfg = cfg.session_id(id);
+    }
+
+    if versioned.is_some() {
+        // One connection each, as AOSP `setupClient` calls `connectAndInit`, on every transport.
+        return RpcSession::setup_client_android13plus_with_config(
+            cfg.outgoing_connections(fan_out)
+                .incoming_connections(incoming),
+        );
+    }
+
+    // r34 wire: no handshake, so the session is built on the connection itself.
+    let session =
+        RpcSession::new(cfg.connect_once()?, AddressSpace::Initiator).map_err(StatusCode::from)?;
+    // Before the negotiation below: that transaction reads this value when it runs.
+    session.set_timeout(o.timeout);
+    // r34 negotiates the FD mode by a transaction after connect (versioned: in the handshake).
+    if let Some(mode) = o.fd_mode {
+        session.negotiate_fd_transport(mode)?;
+    }
+    Ok(session)
+}
+
+/// Session config offering `max_version` (ignored on r34); refuses what the build lacks early.
+#[cfg(feature = "rpc")]
+fn client_config<'a>(
+    endpoint: &'a Endpoint,
+    o: &'a ClientOptions,
+    max_version: u32,
+) -> Result<crate::rpc::RpcClientConfig<'a>> {
+    use crate::rpc::RpcClientConfig;
+    match endpoint {
         Endpoint::Kernel { .. } => unreachable!("kernel handled by caller"),
-        Endpoint::Unix(path) => Box::new(crate::rpc::transport::UnixTransport::connect(path)?),
+        Endpoint::Unix(path) => Ok(RpcClientConfig::unix(path, max_version)),
         Endpoint::UnixAbstract(name) => {
             #[cfg(any(target_os = "linux", target_os = "android"))]
             {
-                Box::new(crate::rpc::transport::UnixTransport::connect_abstract(
-                    name,
-                )?)
+                Ok(RpcClientConfig::unix_abstract(name, max_version))
             }
             #[cfg(not(any(target_os = "linux", target_os = "android")))]
             {
                 let _ = name;
                 log::error!("rsbinder::Client::open: abstract Unix sockets are Linux/Android only");
-                return Err(StatusCode::InvalidOperation);
+                Err(StatusCode::InvalidOperation)
             }
         }
         Endpoint::Vsock(cid, port) => {
             #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
             {
-                Box::new(crate::rpc::transport::VsockTransport::connect(*cid, *port)?)
+                Ok(RpcClientConfig::vsock(*cid, *port, max_version))
             }
             #[cfg(not(all(
                 feature = "rpc-vsock",
@@ -409,101 +400,25 @@ fn rpc_connect(uri: &Uri, o: &ClientOptions) -> Result<crate::rpc::RpcSession> {
                 log::error!(
                     "rsbinder::Client::open: vsock needs the `rpc-vsock` feature (Linux/Android)"
                 );
-                return Err(StatusCode::InvalidOperation);
+                Err(StatusCode::InvalidOperation)
             }
         }
         Endpoint::Tls(host, port) => {
             #[cfg(feature = "rpc-tls")]
             {
-                let cfg = o.tls.clone().ok_or_else(|| {
+                let tls = o.tls.clone().ok_or_else(|| {
                     log::error!("rsbinder::Client::open: `tls://` requires `ClientOptions::tls`");
                     StatusCode::BadValue
                 })?;
                 let name = o.tls_server_name.as_deref().unwrap_or(host);
-                let tcp = match o.handshake_timeout {
-                    // `connect_timeout` takes one resolved address, so try
-                    // each until one connects — what `TcpStream::connect`
-                    // does internally for a `(host, port)` pair.
-                    Some(d) => {
-                        use std::net::ToSocketAddrs;
-                        let mut last = None;
-                        let mut sock = None;
-                        for addr in (host.as_str(), *port).to_socket_addrs()? {
-                            match std::net::TcpStream::connect_timeout(&addr, d) {
-                                Ok(t) => {
-                                    sock = Some(t);
-                                    break;
-                                }
-                                Err(e) => last = Some(e),
-                            }
-                        }
-                        match sock {
-                            Some(t) => t,
-                            None => {
-                                return Err(StatusCode::from(last.unwrap_or_else(|| {
-                                    std::io::Error::new(
-                                        std::io::ErrorKind::NotFound,
-                                        "no address resolved",
-                                    )
-                                })))
-                            }
-                        }
-                    }
-                    None => std::net::TcpStream::connect((host.as_str(), *port))?,
-                };
-                // The TLS handshake is the rest of this phase, and it is
-                // blocking I/O on the socket: bound it too, or a peer that
-                // accepts the connection and never sends a ServerHello
-                // hangs `open` — the very failure this option promises to
-                // cut. The server side bounds its half the same way,
-                // before `wrap_accepted`.
-                if let Some(d) = o.handshake_timeout {
-                    tcp.set_read_timeout(Some(d))?;
-                    tcp.set_write_timeout(Some(d))?;
-                }
-                let t = crate::rpc::transport::TlsTransport::connect(tcp, name, cfg)?;
-                if o.handshake_timeout.is_some() {
-                    // Handshake over: what follows (the android-13+
-                    // handshake, then the session's own traffic) arms its
-                    // own deadlines, and a sticky one here would cut an
-                    // idle session short.
-                    t.set_read_timeout(None).map_err(StatusCode::from)?;
-                    t.set_write_timeout(None).map_err(StatusCode::from)?;
-                }
-                Box::new(t)
+                Ok(RpcClientConfig::tls(host, *port, name, tls, max_version))
             }
             #[cfg(not(feature = "rpc-tls"))]
             {
-                let _ = (host, port);
+                let _ = (host, port, o);
                 log::error!("rsbinder::Client::open: `tls://` needs the `rpc-tls` feature");
-                return Err(StatusCode::InvalidOperation);
+                Err(StatusCode::InvalidOperation)
             }
-        }
-    };
-    match versioned {
-        None => {
-            let session =
-                RpcSession::new(transport, AddressSpace::Initiator).map_err(StatusCode::from)?;
-            // Before the negotiation below, not after `rpc_connect`
-            // returns: that transaction reads this value when it runs.
-            session.set_timeout(o.timeout);
-            // r34 wire: FD mode is negotiated by a special transaction
-            // after connect (versioned profiles do it in the handshake).
-            if let Some(mode) = o.fd_mode {
-                session.negotiate_fd_transport(mode)?;
-            }
-            Ok(session)
-        }
-        Some(v) => {
-            let session = RpcSession::connect_android13plus_fd_with_id_hs(
-                transport,
-                v,
-                o.fd_mode.unwrap_or(FileDescriptorTransportMode::None),
-                o.session_id.as_deref().unwrap_or(&[]),
-                o.handshake_timeout,
-            )?;
-            session.set_timeout(o.timeout);
-            Ok(session)
         }
     }
 }
@@ -557,7 +472,10 @@ impl Client {
     /// [`get`](Self::get)).
     pub fn binder(&self, name: &str) -> Result<SIBinder> {
         match &self.inner {
-            Inner::Kernel => crate::hub::wait_for_service(name).ok_or(StatusCode::NameNotFound),
+            // The service manager's own failure, not `NameNotFound`: the name was never looked up.
+            Inner::Kernel => crate::hub::default()?
+                .wait_for_service(name)
+                .ok_or(StatusCode::NameNotFound),
             #[cfg(feature = "rpc")]
             Inner::Rpc(s) => s.get_service(name),
         }
@@ -611,9 +529,7 @@ impl Client {
 mod tests {
     use super::*;
 
-    /// One rule for every setting that has both a `ClientOptions` field
-    /// and a URI key: agreeing or single values pass, a conflict is
-    /// refused rather than resolved in favor of either side.
+    /// Option vs URI key: agreeing or single values pass; a conflict is refused, not resolved.
     #[test]
     fn a_setting_given_twice_must_agree() {
         assert_eq!(one_source::<usize>("mmap_size", None, None), Ok(None));

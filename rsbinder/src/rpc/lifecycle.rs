@@ -3,9 +3,9 @@
 
 //! Typed session lifecycle.
 //!
-//! Replaces the prior `live_conns: AtomicUsize` + `obituary_sent:
-//! AtomicBool` pair on [`super::session::SharedSession`] with a single
-//! atomic-backed state machine:
+//! The live connection count and the obituary state of
+//! [`super::session::SharedSession`] share a single atomic-backed state
+//! machine:
 //!
 //! ```text
 //!         try_bump_live ────┐
@@ -30,79 +30,97 @@
 //!
 //! **Default single-connection sessions** never leave `Live(1)` until
 //! teardown. The `is_torn_down` snapshot can return `true` in
-//! the `Dying` window *before* the obituary completes — a strict
-//! improvement (a `RpcProxy::drop` reaper that races the dying founding
-//! worker skips its best-effort `DEC_STRONG` slightly earlier, never
-//! deadlocking on an empty pool; the prior `obituary_sent.load` only
-//! flipped after the obituary callback returned).
+//! the `Dying` window *before* the obituary completes, so a
+//! `RpcProxy::drop` reaper that races the dying founding worker skips its
+//! best-effort `DEC_STRONG` without waiting for the obituary callback to
+//! return, and never deadlocks on an empty pool.
+//!
+//! # Encoding
+//!
+//! 56 count bits exceed any plausible live connection count and leave a
+//! margin against the `Live`-tag `+1` overflow path; the word is `u64` so
+//! the encoded state stays one lock-free word on every supported target.
+//!
+//! # Anti-resurrection
+//!
+//! Once obituaries fired, `try_bump_live` never succeeds: a session whose
+//! obituaries fired must never acquire another driver, else `binder_died`
+//! is silently lost for any `DeathRecipient` linked through the attaching
+//! connection. `try_bump_live` is a CAS loop rather than
+//! optimistic-bump-then-rollback: the latter closes the single-attacker
+//! race but not the multi-attacker one — two attackers A and B bumping
+//! after the founding connection's decrement to 0 could let B see A's
+//! transient `prev=1` before A rolls back, attaching to a dying session.
+//! Deciding on the loaded value inside the CAS closes it.
+//!
+//! # Death edge
+//!
+//! Three transitions leave `Live`, and across all of them at most one
+//! caller observes the edge to `Dying`, which is what the obituary contract
+//! needs. The caller that gets `true` fires session obituaries and then
+//! calls `mark_dead`; every other caller finds a settled state and gets a
+//! quiet `false`.
+//!
+//! - `drop_connection` (connection teardown): `Live(n>1)` CAS-decrements
+//!   and returns `false`; `Live(1) → Dying` returns `true`. From
+//!   `Dying`/`Dead` it returns `false`: death was already declared by
+//!   another connection's exit, by `try_drop_sole_connection` when a
+//!   failing transaction emptied the slot pool first, or by `force_dying`.
+//! - `try_drop_sole_connection` (client-side death detection):
+//!   `Live(1) → Dying` only when this is the sole connection and the
+//!   session is still `Live`; `false` with no assert from any other state.
+//!   Used when a session with no serve worker loses its last pool slot (a
+//!   client whose peer went away) so the same obituary + clear sequence
+//!   runs there. It races a serve worker's own `drop_connection` and either
+//!   may win.
+//! - `force_dying` (explicit shutdown): `Live(n) → Dying` from any `n`.
+//!   The live count is discarded on purpose — the caller is shutting those
+//!   connections down, and their workers' later `drop_connection` calls
+//!   return `false` quietly.
 
 #[cfg(test)]
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Top byte holds the state tag; lower 56 bits hold the `Live` count
-/// (0 in non-`Live` states). 56 bits is enough for any plausible live
-/// connection count and leaves a clear margin against the `Live`-tag
-/// `+1` overflow path; the wider type is `u64` to keep the encoded
-/// state in a single lock-free word on every supported target.
+/// State tag in the top byte, `Live` count (0 otherwise) below; see module doc "Encoding".
 const STATE_SHIFT: u32 = 56;
 const COUNT_MASK: u64 = (1u64 << STATE_SHIFT) - 1;
 const STATE_LIVE_TAG: u64 = 0;
 const STATE_DYING_TAG: u64 = 1;
 const STATE_DEAD_TAG: u64 = 2;
 
-/// A read-only snapshot of [`SessionLifecycle`] — the type the unit
-/// tests match against. Production code uses the boolean/count helpers
-/// ([`SessionLifecycle::is_torn_down`], [`SessionLifecycle::live_count`])
-/// for the hot path; the typed snapshot is the grep-friendly
-/// exhaustive-match surface and exists only in test builds.
+/// Test-only exhaustive-match snapshot; production uses `is_torn_down` / `live_count`.
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionLifecycleSnapshot {
-    /// At least one connection is still driving the session. `n` is the
-    /// current live connection count.
+    /// At least one connection drives the session; `n` is the live connection count.
     Live(NonZeroUsize),
-    /// The last `Live` connection dropped; the founding worker is
-    /// firing session obituaries. Transient — moves to `Dead` once the
-    /// obituary callback returns.
+    /// Last `Live` connection dropped; obituaries are firing. Becomes `Dead` when they return.
     Dying,
-    /// Obituary callbacks have completed. A subsequent
-    /// [`SessionLifecycle::try_bump_live`] never succeeds (anti-
-    /// resurrection — a session whose obituaries fired must never
-    /// acquire another driver, else `binder_died` would be silently
-    /// lost for any `DeathRecipient` linked through the attaching
-    /// connection).
+    /// Obituaries completed; `try_bump_live` never succeeds (module doc "Anti-resurrection").
     Dead,
 }
 
-/// Single atomic-backed session lifecycle. Stores state + live count in
-/// one `AtomicU64`; every method is lock-free.
+/// Session state + live count in one `AtomicU64`; every method is lock-free.
 pub(crate) struct SessionLifecycle {
     inner: AtomicU64,
 }
 
 impl SessionLifecycle {
-    /// Initial state for a newly-minted session — `Live(1)` (the
-    /// founding connection).
+    /// `Live(1)`: the founding connection.
     pub(crate) fn new() -> Self {
         Self {
             inner: AtomicU64::new(encode_live(1)),
         }
     }
 
-    /// Lock-free typed snapshot. Production code prefers
-    /// [`is_torn_down`](Self::is_torn_down) (boolean) or
-    /// [`live_count`](Self::live_count) (numeric) for the hot path;
-    /// `snapshot` is the test surface that exhaustively matches every
-    /// variant.
+    /// Typed snapshot for tests; the hot path uses `is_torn_down` / `live_count`.
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> SessionLifecycleSnapshot {
         decode(self.inner.load(Ordering::SeqCst))
     }
 
-    /// Hot-path "is this session past its `Live` window?" check (used
-    /// by `RpcProxy::drop`, the reaper, and `add_callback_slot`).
-    /// `true` in both `Dying` and `Dead` — neither admits new work.
+    /// `true` in `Dying`/`Dead` (no new work); read by `RpcProxy::drop`, `add_callback_slot`.
     pub(crate) fn is_torn_down(&self) -> bool {
         self.inner.load(Ordering::Acquire) >> STATE_SHIFT != STATE_LIVE_TAG
     }
@@ -117,18 +135,7 @@ impl SessionLifecycle {
         }
     }
 
-    /// **Anti-resurrection primitive.** Atomically bump the live
-    /// count *if* the session is still `Live`. Returns `false` from
-    /// `Dying` or `Dead` (never attaches to a session whose obituaries
-    /// fired / are firing).
-    ///
-    /// CAS-loop rather than optimistic-bump-then-rollback — the latter
-    /// closes the *single-attacker* race but not the
-    /// **multi-attacker** one: two concurrent
-    /// attackers A and B both bumping after the founding `fetch_sub`'d
-    /// to 0 could let B see A's transient `prev=1` before A rolls
-    /// back, attaching to a dying session. Value-decision CAS closes
-    /// it.
+    /// Bumps the count iff still `Live`, else `false`; CAS loop per module doc "Anti-resurrection".
     pub(crate) fn try_bump_live(&self) -> bool {
         let mut v = self.inner.load(Ordering::SeqCst);
         loop {
@@ -136,9 +143,7 @@ impl SessionLifecycle {
                 return false;
             }
             let new_v = v + 1;
-            // The +1 stays inside the count bits unless the count
-            // overflowed 56-bit range. Defensive — never reached in
-            // practice (a session would need 2^56 live connections).
+            // Only 2^56 live connections could carry the +1 into the tag bits.
             debug_assert!(
                 new_v >> STATE_SHIFT == STATE_LIVE_TAG,
                 "SessionLifecycle live-count overflow"
@@ -153,26 +158,12 @@ impl SessionLifecycle {
         }
     }
 
-    /// Connection-teardown counterpart of [`try_bump_live`]. Returns
-    /// `true` iff *this* call observed the `1→0` edge (the last
-    /// connection); the caller is responsible for firing session
-    /// obituaries and then calling [`mark_dead`](Self::mark_dead).
-    ///
-    /// In a `Live(n)` state with `n > 1` this CAS-decrements and
-    /// returns `false`. In `Live(1)` it CAS-transitions to `Dying` and
-    /// returns `true`. From `Dying`/`Dead` it returns `false`: death has
-    /// already been declared, either by another connection's exit or by
-    /// [`try_drop_sole_connection`](Self::try_drop_sole_connection) when
-    /// a failing transaction emptied the slot pool first. At most one
-    /// caller ever observes the `1→0` edge, which is what the obituary
-    /// contract needs.
+    /// `true` iff this call took the `1→0` edge to `Dying`; see module doc "Death edge".
     pub(crate) fn drop_connection(&self) -> bool {
         let mut v = self.inner.load(Ordering::SeqCst);
         loop {
             if v >> STATE_SHIFT != STATE_LIVE_TAG {
-                // Death already declared. Refusing (rather than letting `v - 1`
-                // underflow the tag/count) is what keeps a torn-down session
-                // from being resurrected — the invariant this type exists for.
+                // Death declared: `v - 1` would underflow the tag and resurrect the session.
                 return false;
             }
             let count = v & COUNT_MASK;
@@ -192,15 +183,7 @@ impl SessionLifecycle {
         }
     }
 
-    /// Client-side death detection counterpart of [`drop_connection`]:
-    /// `Live(1) → Dying` **only** when this is the sole connection and
-    /// the session is still `Live`; `false` (no-op, no assert) from any
-    /// other state. Used when a session with no serve worker loses its
-    /// last pool slot (a client whose peer went away) so the same
-    /// obituary + clear sequence runs there. This races a serve worker's
-    /// own `drop_connection` and either may win: whichever call observes
-    /// the `1→0` edge runs the death sequence, and the loser gets
-    /// `false` from a settled state.
+    /// `Live(1) → Dying` only, for a client losing its last slot; see module doc "Death edge".
     pub(crate) fn try_drop_sole_connection(&self) -> bool {
         self.inner
             .compare_exchange(
@@ -212,15 +195,7 @@ impl SessionLifecycle {
             .is_ok()
     }
 
-    /// Explicit-shutdown counterpart of [`drop_connection`](Self::drop_connection),
-    /// which only ever takes the `1→0` edge: declare death from **any**
-    /// `Live(n)`. Exactly one caller gets `true` (`Live(n) → Dying`) and
-    /// owns the death sequence + [`mark_dead`](Self::mark_dead);
-    /// `Dying`/`Dead` return `false`. The live count is discarded on
-    /// purpose — the caller is shutting those connections down, and their
-    /// workers' later `drop_connection` calls find a settled state and
-    /// return `false` quietly, as they already do after a
-    /// [`try_drop_sole_connection`](Self::try_drop_sole_connection).
+    /// Explicit shutdown: `Live(n) → Dying` from any `n`, once; see module doc "Death edge".
     pub(crate) fn force_dying(&self) -> bool {
         let mut v = self.inner.load(Ordering::SeqCst);
         loop {
@@ -239,12 +214,9 @@ impl SessionLifecycle {
         }
     }
 
-    /// Transition `Dying → Dead`. The caller MUST have just fired
-    /// session obituaries (the only path that reaches `Dying`).
+    /// `Dying → Dead`; the caller MUST have just fired the session obituaries.
     pub(crate) fn mark_dead(&self) {
-        // Only `Dying → Dead`. An unconditional `swap` would clobber a `Live`
-        // state (silently killing a live session in release if called out of
-        // order); the CAS makes any out-of-order call a no-op instead.
+        // CAS, not `swap`: an out-of-order call must not kill a `Live` session in release.
         let res = self.inner.compare_exchange(
             encode_dying(),
             encode_dead(),
@@ -257,8 +229,7 @@ impl SessionLifecycle {
 
 fn encode_live(n: usize) -> u64 {
     debug_assert!(n >= 1 && (n as u64) <= COUNT_MASK);
-    // STATE_LIVE_TAG == 0 so no shift needed; the count occupies the
-    // lower 56 bits unchanged.
+    // STATE_LIVE_TAG == 0, so the count alone is the encoding.
     n as u64
 }
 
@@ -335,19 +306,12 @@ mod tests {
         assert!(!lc.try_bump_live(), "Dead must refuse new attach");
     }
 
-    /// Multi-attacker hole, hermetic regression. A naive
-    /// optimistic-bump-then-rollback shape would let one of N
-    /// concurrent attackers attach to a dying session by observing
-    /// another's transient bump. The CAS-loop primitive — which the
-    /// typed enum here preserves — must keep `Dying`/`Dead` invariant
-    /// under any interleaving.
+    /// Multi-attacker race: a bump-then-rollback `try_bump_live` lets an attacker reach `Dying`.
     #[test]
     fn concurrent_bumpers_against_drop_never_attach_to_dying() {
         for _ in 0..32 {
             let lc = Arc::new(SessionLifecycle::new());
-            // Pre-bump so the founding's drop transitions Live(2) →
-            // Live(1) (not directly to Dying), giving N attackers a
-            // wider race window across the eventual 1→0 edge.
+            // Start at Live(2) to widen the attackers' window across the eventual 1→0 edge.
             assert!(lc.try_bump_live());
             assert_eq!(lc.live_count(), 2);
 
@@ -369,20 +333,9 @@ mod tests {
                     thread::spawn(move || {
                         let ok = lc.try_bump_live();
                         if ok {
-                            // Re-validate: count must still be Live (this
-                            // attacker holds its own bump, so count >= 1).
+                            // This attacker holds its own bump, so the state is still Live.
                             assert!(matches!(lc.snapshot(), SessionLifecycleSnapshot::Live(_)));
-                            // Honor the `drop_connection` contract: whichever
-                            // connection observes the 1→0 edge — the founding
-                            // dropper OR a racing attacker whose un-bump won
-                            // that edge — must complete the teardown with
-                            // `mark_dead`. Discarding `was_last` here left the
-                            // session stuck in `Dying` whenever an attacker
-                            // (not the dropper) took the edge, tripping the
-                            // `Dying` assertion below ~2.5% of the time under
-                            // load. The production state machine is unchanged;
-                            // this only makes the test faithful to the
-                            // "edge-observer marks dead" contract.
+                            // Whoever observes the 1→0 edge, dropper or attacker, marks dead.
                             if lc.drop_connection() {
                                 lc.mark_dead();
                             }
@@ -397,26 +350,12 @@ mod tests {
                 let _ = a.join().unwrap();
             }
 
-            // Every credit is consumed by join time (the dropper spends the
-            // initial two, each attacker spends its own), so the only
-            // final state is `Dead`; `Live` here would mean a bump was
-            // never paid back, and `Dying` that `mark_dead` was skipped.
+            // All bumps are repaid by join: `Live` = unpaid bump, `Dying` = skipped `mark_dead`.
             assert_eq!(lc.snapshot(), SessionLifecycleSnapshot::Dead);
         }
     }
 
-    /// Hermetic regression: a `drop_connection` from `Live(1)` must
-    /// expose `is_torn_down() == true` *before* `mark_dead` is called.
-    /// This is the strict improvement over the prior `obituary_sent`
-    /// scheme — a racing `RpcProxy::drop` reaper now sees the
-    /// `Dying` state and skips immediately instead of blocking on an
-    /// empty slot pool.
-    /// A failing transaction that empties the slot pool
-    /// (`try_drop_sole_connection`) may declare death before the slot's
-    /// own serve worker reaches its unconditional `drop_connection()` on
-    /// exit. That later call must be a quiet `false`, not a panic:
-    /// `serve_blocking` is public API and this ordering is reachable
-    /// whenever a client runs a serve loop and transacts concurrently.
+    /// A worker's exit `drop_connection` after an emptied pool declared death is a quiet `false`.
     #[test]
     fn drop_connection_after_death_declared_elsewhere_is_quiet() {
         let lc = SessionLifecycle::new();
@@ -434,8 +373,7 @@ mod tests {
         lc.mark_dead();
     }
 
-    /// `force_dying` takes the edge from any live count, once; the
-    /// connections' own later `drop_connection`s are then quiet.
+    /// `force_dying` takes the edge from any live count, once; later `drop_connection`s are quiet.
     #[test]
     fn force_dying_from_live_n_takes_the_edge_exactly_once() {
         let lc = SessionLifecycle::new();
@@ -458,6 +396,7 @@ mod tests {
         assert_eq!(lc.snapshot(), SessionLifecycleSnapshot::Dead);
     }
 
+    /// `drop_connection` from `Live(1)` shows `is_torn_down()` before `mark_dead` (reaper skip).
     #[test]
     fn dying_window_is_observable_to_hot_path_checks() {
         let lc = SessionLifecycle::new();

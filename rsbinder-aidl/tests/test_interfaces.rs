@@ -287,8 +287,7 @@ interface IExplicit {
 
 #[test]
 fn test_explicit_transaction_code_zero() -> Result<(), Box<dyn Error>> {
-    // The second code must not coincide with its implicit position, or this
-    // test cannot tell the explicit branch from the implicit one.
+    // The second code differs from its implicit position, so the explicit branch is visible.
     let input = r#"
 interface IZero {
     void method1() = 0;
@@ -343,8 +342,7 @@ interface IDuplicate {
     );
 }
 
-/// An interface that names *itself* stays `Strong<dyn IFoo>`: the box guard is
-/// for infinitely-sized parcelable fields, and `dyn Box<IFoo>` is not a trait.
+/// A self-naming interface stays `Strong<dyn IFoo>`: `dyn Box<IFoo>` is not a trait.
 #[test]
 fn self_referencing_interface_is_not_boxed() -> Result<(), Box<dyn Error>> {
     let ctx = rsbinder_aidl::SourceContext::new(
@@ -379,14 +377,12 @@ interface ISelfRef {
         out.contains("Vec<rsbinder::Strong<dyn ISelfRef>>"),
         "arrays must still be Vec:\n{out}"
     );
-    // `Box<…>` is syntactically valid, so parsing alone would not catch it —
-    // the assertion above is the guard; this only rules out other breakage.
+    // `Box<…>` parses fine: the assertion above is the guard, this rules out other breakage.
     syn::parse_file(&out).map_err(|e| format!("generated code does not parse: {e}\n{out}"))?;
     Ok(())
 }
 
-/// The counterpart the box guard exists for: a parcelable naming itself is
-/// infinitely sized without one, so this must keep boxing.
+/// A self-naming parcelable is infinitely sized without a box, so it keeps boxing.
 #[test]
 fn self_referencing_parcelable_is_still_boxed() -> Result<(), Box<dyn Error>> {
     let ctx = rsbinder_aidl::SourceContext::new(
@@ -408,8 +404,7 @@ parcelable Node {
     Ok(())
 }
 
-/// Two parcelables that reference each other form a cycle just as a
-/// self-reference does, so the field that closes it needs the same box.
+/// Mutually referencing parcelables form a cycle too; the closing field needs the box.
 #[test]
 fn mutually_recursive_parcelables_are_boxed() -> Result<(), Box<dyn Error>> {
     let ctx = rsbinder_aidl::SourceContext::new(
@@ -436,8 +431,7 @@ parcelable Leaf {
     Ok(())
 }
 
-/// A parcelable that merely *uses* another one is not a cycle, so nothing is
-/// boxed — the guard must not fire on every cross-reference.
+/// Merely using another parcelable is not a cycle: the guard must not fire on every reference.
 #[test]
 fn acyclic_parcelable_reference_is_not_boxed() -> Result<(), Box<dyn Error>> {
     let ctx = rsbinder_aidl::SourceContext::new(
@@ -461,8 +455,7 @@ parcelable Inner {
     Ok(())
 }
 
-/// `InterfaceRender::new` takes the unescaped name: escaping before the call
-/// would put `r#` inside `Bn`/`Bp`, which does not lex.
+/// `InterfaceRender::new` takes the raw name: pre-escaping would put `r#` inside `Bn`/`Bp`.
 #[test]
 fn render_constructors_escape_rust_keywords() -> Result<(), Box<dyn Error>> {
     use rsbinder_aidl::render::{EnumRender, InterfaceRender, ParcelableRender};
@@ -477,17 +470,14 @@ fn render_constructors_escape_rust_keywords() -> Result<(), Box<dyn Error>> {
     assert_eq!(p.name, "r#type");
     assert_eq!(p.module, "r#type");
 
-    // The enum template writes the name through `declare_binder_enum!`, which
-    // prefixes `r#` itself.
+    // `declare_binder_enum!` prefixes `r#` itself.
     let e = EnumRender::new("type", "i32");
     assert_eq!(e.name, "type");
     assert_eq!(e.module, "r#type");
     Ok(())
 }
 
-/// A cycle that runs through an *interface* is finite — `Strong<dyn …>` is a
-/// handle — so nothing may be boxed. This is the AOSP `CircularParcelable` /
-/// `ITestService` shape.
+/// A cycle through an interface handle is finite: AOSP `CircularParcelable`/`ITestService` shape.
 #[test]
 fn cycle_through_an_interface_is_not_boxed() -> Result<(), Box<dyn Error>> {
     let ctx = rsbinder_aidl::SourceContext::new(
@@ -514,10 +504,7 @@ interface IRing {
     Ok(())
 }
 
-/// A `Vec` element is a fixed-size handle whatever it holds, so an array
-/// member neither closes a sizing cycle nor takes a box — and it must not,
-/// because `Box<T>` implements no array codec, so `Vec<Box<T>>` would emit
-/// code that does not compile.
+/// A `Vec` closes no sizing cycle, and `Vec<Box<T>>` has no array codec, so it must not box.
 #[test]
 fn a_cycle_through_an_array_is_not_boxed() -> Result<(), Box<dyn Error>> {
     let ctx = rsbinder_aidl::SourceContext::new(
@@ -546,9 +533,7 @@ parcelable Node {
     Ok(())
 }
 
-/// A `<Union>.Tag` is the scalar `declare_binder_enum!` newtype, not the union
-/// it names — it cannot hold the enclosing declaration, so it is never boxed.
-/// Its lookup reports the parent union's namespace, which is exactly the trap.
+/// `<Union>.Tag` is a scalar newtype, never boxed, though its lookup reports the union's namespace.
 #[test]
 fn a_union_tag_field_is_not_boxed() -> Result<(), Box<dyn Error>> {
     let ctx = rsbinder_aidl::SourceContext::new(
@@ -574,9 +559,7 @@ parcelable Node {
     Ok(())
 }
 
-/// A non-nullable cycle has no terminating form: boxing it alone would give
-/// the generated `Default` — the deserialization entry point — infinite
-/// recursion, so it must be a diagnostic rather than a runtime abort.
+/// A non-nullable cycle recurses forever in the generated `Default`: diagnose, don't abort.
 #[test]
 fn a_non_nullable_cycle_is_rejected() {
     aidl_generator_should_fail(
@@ -600,8 +583,7 @@ parcelable Node {
     );
 }
 
-/// A fixed-size array keeps its elements inline, so it closes a cycle that a
-/// variable-length one would not — and no box can rescue it.
+/// A fixed-size array stores elements inline, so it closes a cycle no box can break.
 #[test]
 fn a_fixed_size_array_cycle_is_rejected() {
     aidl_generator_should_fail(

@@ -126,13 +126,11 @@ impl TransportCaps {
     /// a socket.
     pub const KERNEL_KNOBS: Self = Self(1 << 4);
 
-    /// No capabilities — what a vsock or TLS session has. The incoming
-    /// (callback) connections *rsbinder* opens are Unix-only today, so an
-    /// rsbinder client cannot reach [`CALLBACKS`](Self::CALLBACKS) there
-    /// either. A server can: its accept path is transport-generic, so a
-    /// peer that attaches an incoming connection over vsock or TLS — as
-    /// AOSP's `RpcSession` does — makes that session report `CALLBACKS`
-    /// and nothing else.
+    /// No capabilities — what a default vsock or TLS session has. With
+    /// incoming connections
+    /// ([`ClientOptions::incoming_connections`](crate::ClientOptions::incoming_connections))
+    /// such a session reports [`CALLBACKS`](Self::CALLBACKS) and nothing
+    /// else, on both ends.
     pub const NONE: Self = Self(0);
 
     /// Everything: kernel binder, which is the only transport that has
@@ -180,6 +178,11 @@ impl TransportCaps {
     /// needs [`CALLBACKS`](Self::CALLBACKS) fails here, at setup, with a
     /// log line saying when the missing bit holds, rather than on a
     /// transaction minutes later.
+    ///
+    /// The log names every missing bit in its own clause, because acting on only the first
+    /// one leaves the call failing for the bits it did not mention. Each clause states when
+    /// the bit holds, not a procedure: the reader may be on either end of any transport, and
+    /// a procedure is right for only one of those positions.
     pub fn require(self, needed: Self, what: &str) -> Result<()> {
         if self.contains(needed) {
             return Ok(());
@@ -193,13 +196,7 @@ impl TransportCaps {
         Err(StatusCode::InvalidOperation)
     }
 
-    /// One clause per missing bit, joined by `; `, for the
-    /// [`require`](Self::require) log. Each states when the bit holds, not
-    /// a procedure: the reader may be on either end of any transport, and
-    /// a procedure is right for only one of those positions.
-    ///
-    /// Every missing bit gets its own clause, because acting on only the
-    /// first one leaves the call failing for the bits it did not mention.
+    /// One clause per missing bit, joined by `; `, for the [`require`](Self::require) log.
     fn remedy(self) -> String {
         let mut out = String::new();
         for (bit, advice) in [
@@ -299,8 +296,7 @@ mod tests {
         assert!(unix.contains(TransportCaps::FD_PASSING | TransportCaps::SAME_HOST));
         assert!(!unix.contains(TransportCaps::CALLBACKS));
         assert!(!unix.contains(TransportCaps::KERNEL));
-        // Every set contains the empty one, and none is empty once a bit
-        // is set.
+        // Every set contains the empty one, and none is empty once a bit is set.
         assert!(unix.contains(TransportCaps::NONE));
         assert!(TransportCaps::NONE.contains(TransportCaps::NONE));
         assert!(TransportCaps::NONE.is_empty());

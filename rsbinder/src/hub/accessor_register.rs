@@ -25,9 +25,31 @@
 //! backend the binary/target cannot use surfaces as the same AOSP-
 //! faithful service-specific error a wrong-family `addConnection`
 //! returns.
+//!
+//! # Process-local provider registry
+//!
+//! AOSP `gAccessorProviders` (`IServiceManager.cpp:200-201`) is a
+//! process-local list of `AccessorProvider{ instances, providerCallback }`.
+//! `addAccessorProvider` checks for duplicate instances and refuses,
+//! then appends; `removeAccessorProvider` walks the list and drops the
+//! matching shared_ptr. The cross-process pickup is via
+//! `getInjectedAccessor` — `BackendUnifiedServiceManager::getService2`
+//! calls it as a *fallback* when servicemanager returns no binder for
+//! `name`. `add_accessor_provider`, `remove_accessor_provider` and
+//! `resolve_via_process_local` are the rsbinder counterparts.
+//!
+//! The registry is one process-wide `Mutex<Vec<_>>`, built lazily through a
+//! `OnceLock` so a process that never adds, removes or looks up a provider
+//! never allocates it, and walked on add, remove and lookup. Lookup follows AOSP
+//! `getInjectedAccessor` (`IServiceManager.cpp:284-312`): it snapshots the
+//! matching entries' `Arc` callbacks under the lock, releases the lock,
+//! then calls each closure until one returns `Some(binder)` — no callback
+//! runs under the lock (`IServiceManager.cpp:286-291`). `None` means no
+//! live provider knows the name, and the fallback caller returns the
+//! original `Service::Accessor(None)` / `ServiceWithMetadata(None)` it was
+//! trying to backfill.
 
-// cfg lives on the mod decl in super — duplicating here trips
-// clippy::duplicated_attributes.
+// cfg lives on the mod decl in super; repeating it trips clippy::duplicated_attributes.
 
 use std::io;
 use std::net::SocketAddrV4;
@@ -141,6 +163,14 @@ impl AccessorSockAddr {
 /// preserved so callers can surface the OS-level cause alongside the
 /// AOSP code in their `log::warn!` line (matching the pattern used by
 /// [`super::accessor_16::resolve_accessor`]).
+///
+/// The AF_UNIX helpers never produce `CreateSocketFailed`: `std`'s
+/// `UnixStream::connect` reports `socket(2)` and `connect(2)` failures
+/// alike as one `io::Error`, while AOSP's `singleSocketConnection`
+/// distinguishes them with a separate `::socket()` call. Every
+/// non-`EACCES` failure there is reported as `ConnectFailed` (the more
+/// common case); `CreateSocketFailed` is reserved for backends where
+/// `socket(2)` is a distinct syscall the helper can inspect.
 #[derive(Debug)]
 pub enum AccessorConnectError {
     /// AOSP `ERROR_UNSUPPORTED_SOCKET_FAMILY` — the address family
@@ -181,12 +211,7 @@ impl std::fmt::Display for AccessorConnectError {
 
 impl std::error::Error for AccessorConnectError {}
 
-/// AF_UNIX connect helper. Cross-platform (Linux + macOS) — `std`'s
-/// `UnixStream::connect(path)` is stable on both. The resulting
-/// stream's `OwnedFd` is the *client-side endpoint of a connected
-/// socket pair* whose server-side endpoint is whoever accepted on
-/// `path` (typically the same process's `RpcServer::setup_unix_server`
-/// listener).
+/// AF_UNIX connect (Linux + macOS): the client end of a connection accepted on `path`.
 fn connect_unix_owned_fd(path: &PathBuf) -> std::result::Result<OwnedFd, AccessorConnectError> {
     use std::os::unix::net::UnixStream;
     match UnixStream::connect(path) {
@@ -194,13 +219,7 @@ fn connect_unix_owned_fd(path: &PathBuf) -> std::result::Result<OwnedFd, Accesso
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             Err(AccessorConnectError::ConnectFailedEacces)
         }
-        // `socket(2)` and `connect(2)` failures both surface as
-        // `io::Error` from `UnixStream::connect` — AOSP's
-        // `singleSocketConnection` distinguishes them with a separate
-        // `::socket()` call. Without retracing that we report all
-        // pre-EACCES failures as `ConnectFailed` (the more common
-        // case); `CreateSocketFailed` is reserved for backends where
-        // `socket(2)` is a distinct syscall the helper can inspect.
+        // `std` merges socket(2) and connect(2) failures: see `AccessorConnectError` doc.
         Err(e) => Err(AccessorConnectError::ConnectFailed(e)),
     }
 }
@@ -228,9 +247,7 @@ fn connect_unix_abstract_owned_fd(
     Err(AccessorConnectError::UnsupportedFamily)
 }
 
-/// AF_VSOCK connect helper. Behind `rpc-vsock`; when the feature is
-/// off, returns `UnsupportedFamily` so an instance configured for
-/// vsock surfaces with AOSP-faithful semantics on a `rpc`-only build.
+/// AF_VSOCK connect; without `rpc-vsock` the stub returns `UnsupportedFamily` (AOSP-faithful).
 #[cfg(feature = "rpc-vsock")]
 fn connect_vsock_owned_fd(
     cid: u32,
@@ -240,11 +257,8 @@ fn connect_vsock_owned_fd(
     use vsock::{VsockAddr, VsockStream};
     match VsockStream::connect(&VsockAddr::new(cid, port)) {
         Ok(stream) => {
-            // SAFETY: `into_raw_fd` transfers ownership; wrapping in
-            // `OwnedFd` immediately re-establishes RAII. AOSP-sanctioned
-            // pattern, identical to `VsockTransport::from_owned_fd` in
-            // [`crate::rpc::transport::vsock`].
             let raw = stream.into_raw_fd();
+            // SAFETY: `raw` is fresh from `into_raw_fd`, so this `OwnedFd` is its sole owner.
             Ok(unsafe { OwnedFd::from_raw_fd(raw) })
         }
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -262,8 +276,7 @@ fn connect_vsock_owned_fd(
     Err(AccessorConnectError::UnsupportedFamily)
 }
 
-/// AF_INET v4 connect helper. Behind `rpc-tcp-debug` (debug-only
-/// transport); when off, returns `UnsupportedFamily`.
+/// AF_INET v4 connect, behind debug-only `rpc-tcp-debug`; the stub returns `UnsupportedFamily`.
 #[cfg(feature = "rpc-tcp-debug")]
 fn connect_inet_owned_fd(addr: SocketAddrV4) -> std::result::Result<OwnedFd, AccessorConnectError> {
     use std::net::TcpStream;
@@ -336,9 +349,8 @@ impl LocalAccessor {
     ///
     /// Returned wrapped as a `Strong<dyn IAccessor>` so callers can
     /// trivially `as_binder()` for `addService` or stash on a server's
-    /// service directory. The `Strong<dyn IAccessor>` is also what a
-    /// future [`add_accessor_provider`] returns from its
-    /// closure.
+    /// service directory. [`create_accessor`] returns its `SIBinder`,
+    /// which is what an [`AccessorProviderFn`] hands back.
     pub fn new_binder(
         instance: impl Into<String>,
         addr_provider: AccessorAddrProvider,
@@ -354,10 +366,7 @@ impl Interface for LocalAccessor {}
 
 impl IAccessor for LocalAccessor {
     fn addConnection(&self) -> crate::BinderResult<ParcelFileDescriptor> {
-        // Step 1: ask the user-supplied closure for a socket address.
-        // A `Result::Err` here is AOSP `ERROR_CONNECTION_INFO_NOT_FOUND`
-        // (the provider could not derive an address for this name —
-        // `singleSocketConnection` was never even attempted).
+        // Step 1: a provider `Err` is AOSP `ERROR_CONNECTION_INFO_NOT_FOUND` (no connect tried).
         let addr = match (self.addr_provider)(&self.instance) {
             Ok(a) => a,
             Err(e) => {
@@ -370,10 +379,7 @@ impl IAccessor for LocalAccessor {
             }
         };
 
-        // Step 2: open the server-process side of the socket pair (an
-        // ordinary `connect(2)` inside *this* process; the peer is the
-        // `RpcServer::setup_unix_server` listener at the same path,
-        // not the remote client) and return the fd.
+        // Step 2: `connect(2)` from *this* process; the peer is the local listener, not the client.
         match addr.connect_owned_fd() {
             Ok(fd) => Ok(ParcelFileDescriptor::new(fd)),
             Err(err) => {
@@ -395,8 +401,7 @@ impl IAccessor for LocalAccessor {
     }
 }
 
-/// Map an [`AccessorConnectError`] onto the AOSP `IAccessor::ERROR_*`
-/// service-specific code + a symbolic label for logging.
+/// Maps an [`AccessorConnectError`] to its AOSP `IAccessor::ERROR_*` code and a log label.
 fn accessor_error_code_for(err: &AccessorConnectError) -> (i32, &'static str) {
     match err {
         AccessorConnectError::UnsupportedFamily => (
@@ -418,8 +423,9 @@ fn accessor_error_code_for(err: &AccessorConnectError) -> (i32, &'static str) {
     }
 }
 
-/// Closure type returned by [`add_accessor_provider`] and called
-/// by [`LocalAccessor::addConnection`] to resolve an instance
+/// Closure type taken by [`LocalAccessor::new_binder`] /
+/// [`create_accessor`] and called by
+/// [`LocalAccessor::addConnection`] to resolve an instance
 /// name to the socket address it should connect to. Mirrors AOSP
 /// `RpcSocketAddressProvider`'s `(name, sockaddr*, size_t) -> status_t`
 /// signature but returns the strongly-typed [`AccessorSockAddr`]
@@ -433,20 +439,11 @@ fn accessor_error_code_for(err: &AccessorConnectError) -> (i32, &'static str) {
 /// binder driver may dispatch on a different thread than the one that
 /// registered the provider).
 ///
-/// [`add_accessor_provider`]: super::accessor_register::add_accessor_provider
+/// [`create_accessor`]: super::accessor_register::create_accessor
 /// [`LocalAccessor::addConnection`]: super::accessor_register::LocalAccessor
 pub type AccessorAddrProvider = Box<dyn Fn(&str) -> Result<AccessorSockAddr> + Send + Sync>;
 
-// --- process-local AccessorProvider registry ----
-//
-// AOSP `gAccessorProviders` (`IServiceManager.cpp:200-201`) is a
-// process-local list of `AccessorProvider{ instances, providerCallback }`.
-// `addAccessorProvider` checks for duplicate instances and refuses,
-// then appends; `removeAccessorProvider` walks the list and drops the
-// matching shared_ptr. The cross-process pickup is via
-// `getInjectedAccessor` — `BackendUnifiedServiceManager::getService2`
-// calls it as a *fallback* when servicemanager returns no binder for
-// `name`.
+// --- process-local AccessorProvider registry (AOSP mapping: module doc) ----
 
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock, Weak};
@@ -462,35 +459,20 @@ use std::sync::{Arc, OnceLock, Weak};
 /// the registry — see `IServiceManager.cpp:286-291` snapshot pattern).
 pub type AccessorProviderFn = Box<dyn Fn(&str) -> Option<crate::binder::SIBinder> + Send + Sync>;
 
-/// One entry in the process-local accessor registry. Owns its set of
-/// instance names (so `lookup_accessor_provider` can match without
-/// taking shared ownership of the closure) and a reference-counted
-/// callback (so a [`AccessorProviderHandle`] can identify "its" entry
-/// on drop). `Arc` not `Box` so the handle's `Weak` upgrade is the
-/// canonical liveness test.
+/// Registry entry: instance names + an `Arc` callback whose `Weak` in the handle tests liveness.
 struct AccessorProviderEntry {
     instances: HashSet<String>,
     provider: Arc<AccessorProviderFn>,
 }
 
-/// Process-wide accessor provider registry. AOSP `gAccessorProviders`
-/// byte-equivalent — a single global, locked with a `Mutex`, walked on
-/// `add`/`remove`/lookup.
-///
-/// Initialized lazily via `OnceLock` so the `rpc`-OFF /
-/// non-android-16 build never allocates the mutex. The
-/// `Mutex<Vec<_>>` shape is the AOSP-faithful one — readers (lookup)
-/// snapshot the entries inside the lock, then release
-/// before calling the provider closure (no callback under the lock
-/// — see `IServiceManager.cpp:286-291`).
+/// AOSP `gAccessorProviders`; no closure runs under this lock (module doc, registry section).
 static REGISTRY: OnceLock<std::sync::Mutex<Vec<AccessorProviderEntry>>> = OnceLock::new();
 
 fn registry() -> &'static std::sync::Mutex<Vec<AccessorProviderEntry>> {
     REGISTRY.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
-/// AOSP `IServiceManager.cpp:359-366` `isInstanceProvidedLocked`. The
-/// caller already holds the registry lock.
+/// AOSP `isInstanceProvidedLocked` (`IServiceManager.cpp:359-366`); caller holds the lock.
 fn is_instance_provided_locked(entries: &[AccessorProviderEntry], instance: &str) -> bool {
     entries.iter().any(|e| e.instances.contains(instance))
 }
@@ -601,10 +583,7 @@ impl std::fmt::Debug for AccessorProviderHandle {
 }
 
 impl AccessorProviderHandle {
-    /// Liveness probe — `true` iff the underlying provider entry is
-    /// still in the registry (the `Arc` hasn't been dropped via
-    /// [`remove_accessor_provider`] or by the handle's own Drop).
-    /// Used by tests; not part of the public API contract.
+    /// Test-only: `true` while the provider entry is still in the registry.
     #[cfg(test)]
     fn is_live(&self) -> bool {
         self.provider.strong_count() > 0
@@ -613,10 +592,7 @@ impl AccessorProviderHandle {
 
 impl Drop for AccessorProviderHandle {
     fn drop(&mut self) {
-        // RAII unregister. Race with explicit
-        // `remove_accessor_provider` is fine: the second remove sees a
-        // stale `Weak` and is a no-op (the entry has already been
-        // dropped, and the `Arc` count is 0). Never panic in Drop.
+        // Racing an explicit remove is fine: the loser sees a stale `Weak`. Never panic in Drop.
         let Some(target) = self.provider.upgrade() else {
             return;
         };
@@ -626,24 +602,9 @@ impl Drop for AccessorProviderHandle {
     }
 }
 
-/// Lookup a provider by instance name. AOSP
-/// `getInjectedAccessor` (`IServiceManager.cpp:284-312`) — snapshot
-/// the registry under the lock, then walk the snapshot *outside* the
-/// lock calling each provider's closure until one returns
-/// `Some(binder)`. `None` ⇒ no live provider knows about `name`
-/// (fallback caller should return the original
-/// `Service::Accessor(None)` / `ServiceWithMetadata(None)` they were
-/// trying to backfill).
-///
-/// Consumed by [`resolve_via_process_local`] (the fallback the public
-/// `hub::try_get_service` arm uses) and by the hermetic tests.
-/// `pub(crate)` keeps all callers inside the crate.
+/// AOSP `getInjectedAccessor`: first provider returning `Some` for `name`; see module doc.
 pub(crate) fn lookup_accessor_provider(name: &str) -> Option<crate::binder::SIBinder> {
-    // Snapshot of `Arc<AccessorProviderFn>` for entries that include
-    // `name`. We deliberately keep `Arc` instead of `Weak` here so the
-    // closure can't disappear between snapshot and call — AOSP keeps
-    // `shared_ptr` copies for the same reason
-    // (`IServiceManager.cpp:289-290`).
+    // `Arc`, not `Weak`: no closure may vanish between snapshot and call (AOSP cpp:289-290).
     let snapshot: Vec<Arc<AccessorProviderFn>> = {
         let reg = registry().lock().expect("accessor registry poisoned");
         reg.iter()
@@ -651,10 +612,7 @@ pub(crate) fn lookup_accessor_provider(name: &str) -> Option<crate::binder::SIBi
             .map(|e| Arc::clone(&e.provider))
             .collect()
     };
-    // Call closures *outside* the lock (AOSP comment: "Unlocked to
-    // call the providers. This requires the providers to be
-    // threadsafe and not contain any references to objects that could
-    // be deleted.").
+    // Unlocked, as AOSP: providers must be thread-safe and hold no deletable references.
     for provider in snapshot {
         if let Some(binder) = provider(name) {
             return Some(binder);
@@ -704,9 +662,7 @@ mod tests {
     use std::os::fd::AsRawFd;
     use std::os::unix::net::{UnixListener, UnixStream};
 
-    /// Family-string dispatch is order-independent across variants and
-    /// stable across feature flags (`Vsock`/`Inet` variants exist
-    /// unconditionally — see the module doc).
+    /// `family_str` names every variant; `Vsock`/`Inet` exist regardless of features.
     #[test]
     fn family_str_covers_all_variants() {
         let unix = AccessorSockAddr::Unix(PathBuf::from("/tmp/rsbinder-test-2-14.sock"));
@@ -719,9 +675,7 @@ mod tests {
         assert_eq!(inet.family_str(), "AF_INET");
     }
 
-    /// `Clone`/`Debug` derives compile and round-trip the inner data
-    /// (defensive — a future `Clone` regression would otherwise leak
-    /// fd-bearing types into the variant).
+    /// `Clone`/`Debug` derive and keep the inner data, so no variant may hold an fd-bearing type.
     #[test]
     fn clone_and_debug_roundtrip() {
         let a = AccessorSockAddr::Unix(PathBuf::from("/tmp/x"));
@@ -731,10 +685,7 @@ mod tests {
         assert!(dbg.contains("/tmp/x"));
     }
 
-    /// The provider closure type accepts the obvious `|name| Ok(...)`
-    /// shape; this is a compile-time witness so a future refactor that
-    /// breaks `Fn` boxing (e.g. accidentally requiring `FnMut`) fails
-    /// here rather than at the call site.
+    /// Compile witness: a `|name| Ok(..)` closure boxes as an `Fn` `AccessorAddrProvider`.
     #[test]
     fn provider_closure_compiles() {
         let path = PathBuf::from("/tmp/rsbinder-test-provider.sock");
@@ -749,13 +700,7 @@ mod tests {
         }
     }
 
-    /// Helper: bind+listen a unique-path Unix socket and return
-    /// `(listener, path)`. The path is removed before bind to make the
-    /// test idempotent under crashed previous runs. macOS' default
-    /// `std::env::temp_dir()` is `/var/folders/.../T/` (~47 chars), so
-    /// we keep the file name short (`rsb_${tag}_${pid}.sock` —
-    /// `tag` capped to ≤ 8 chars at call sites) to stay well under
-    /// `SUN_LEN = 104`.
+    /// Binds temp-dir `rsb_{tag}_{pid}.sock`; `tag` ≤ 8 chars keeps macOS paths under `SUN_LEN`.
     fn unique_unix_listener(tag: &str) -> (UnixListener, PathBuf) {
         let mut p = std::env::temp_dir();
         p.push(format!("rsb_{}_{}.sock", tag, std::process::id()));
@@ -764,10 +709,7 @@ mod tests {
         (l, p)
     }
 
-    /// Unix path — `connect_owned_fd` returns a real, connected
-    /// `OwnedFd` whose other endpoint is the listener's `accept`. The
-    /// fd is byte-functional (echo round-trip) — proves the fd isn't
-    /// dropped/closed somewhere in the wrapping.
+    /// Unix `connect_owned_fd` returns a connected fd that survives an echo round-trip.
     #[test]
     fn connect_owned_fd_unix_roundtrips() {
         use std::io::{Read, Write};
@@ -782,9 +724,7 @@ mod tests {
 
         let addr = AccessorSockAddr::Unix(path.clone());
         let fd = addr.connect_owned_fd().expect("connect");
-        // Drive bytes through the adopted fd. `UnixStream::from(fd)`
-        // takes ownership of the fd, so the fd lives exactly as long as
-        // the stream.
+        // `UnixStream::from(fd)` owns the fd, so it lives exactly as long as the stream.
         let mut stream = UnixStream::from(fd);
         stream.write_all(&[0x42]).expect("client write");
         let mut got = [0u8; 1];
@@ -828,10 +768,7 @@ mod tests {
         server_handle.join().expect("server join");
     }
 
-    /// Unix path — connect to a non-existent path surfaces as
-    /// `ConnectFailed` (not `UnsupportedFamily` or panic). The exact
-    /// `io::ErrorKind` is host-OS dependent (Linux = `ConnectionRefused`,
-    /// macOS = `NotFound`), so we only assert the variant.
+    /// A missing Unix path is `ConnectFailed`; only the variant, as `io::ErrorKind` varies by OS.
     #[test]
     fn connect_owned_fd_unix_missing_path_is_connect_failed() {
         let path = PathBuf::from(format!("/tmp/rsb_2_14_nope_{}.sock", std::process::id()));
@@ -843,14 +780,7 @@ mod tests {
         );
     }
 
-    /// Vsock / inet `UnsupportedFamily` when the feature is off
-    /// (= rsbinder default build on macOS). This is the AOSP-faithful
-    /// `ERROR_UNSUPPORTED_SOCKET_FAMILY` path. When the feature **is**
-    /// built in, the connect attempt would surface as `ConnectFailed`
-    /// (no listener on `cid:port` / `127.0.0.1:0`) — that arm is left
-    /// for the integration test in `tests/rpc_accessor_register.rs`,
-    /// since exercising it requires a live listener and the
-    /// vsock crate's connect behaviour differs on macOS.
+    /// Without `rpc-vsock`, vsock is `UnsupportedFamily`; the feature-on arm needs a live listener.
     #[cfg(not(feature = "rpc-vsock"))]
     #[test]
     fn connect_owned_fd_vsock_disabled_is_unsupported() {
@@ -873,9 +803,7 @@ mod tests {
         );
     }
 
-    /// `AccessorConnectError::Display` includes the inner `io::Error`
-    /// message when present — important for `log::warn!` lines that
-    /// surface the OS-level cause next to the AOSP error code.
+    /// `Display` includes the inner `io::Error`, so logs show the OS cause beside the AOSP code.
     #[test]
     fn connect_error_display_includes_inner_cause() {
         let e = AccessorConnectError::ConnectFailed(io::Error::new(
@@ -887,9 +815,7 @@ mod tests {
         assert!(s.contains("connect(2)"), "Display missing op label: {s}");
     }
 
-    /// Anti-leak invariant — `connect_owned_fd` on a successful
-    /// connect returns a fd whose `AsRawFd` is non-negative and
-    /// non-stdio (>= 3). Compile-time witness for the OwnedFd shape.
+    /// A successful connect returns a real fd (>= 3, not stdio).
     #[test]
     fn connect_owned_fd_returns_real_fd() {
         let (listener, path) = unique_unix_listener("a02-fd");
@@ -912,22 +838,13 @@ mod tests {
 
     use crate::FromIBinder;
 
-    /// Happy path: `LocalAccessor::new_binder(...)` ⇒ Bn-side
-    /// SIBinder ⇒ in-process `BpAccessor::from_binder` (via the
-    /// generated `IAccessor::FromIBinder` hook) ⇒
-    /// `getInstanceName()` returns the stored name + `addConnection()`
-    /// returns a fd connected to a listener on the provider's path.
-    /// This is the round-trip witness that the AIDL marshalling +
-    /// kernel binder driver path works on the *same* process (no
-    /// cross-process kernel binder needed — `Binder::new` + local
-    /// proxy stand in for the kernel hop).
+    /// In-process Bn/Bp round-trip: `getInstanceName` and an `addConnection` fd that echoes.
     #[test]
     fn local_accessor_inprocess_roundtrip() {
         use std::io::{Read, Write};
         use std::os::unix::net::UnixStream;
         let (listener, path) = unique_unix_listener("a03-rt");
-        // Server thread — echo one byte so we can prove the fd is
-        // bidirectionally functional after transfer.
+        // Echo one byte: proves the fd works in both directions after transfer.
         let server_handle = std::thread::spawn(move || {
             let (mut s, _) = listener.accept().expect("accept");
             let mut buf = [0u8; 1];
@@ -941,8 +858,7 @@ mod tests {
         let strong = LocalAccessor::new_binder("rsbinder.test.a03", provider);
         let sib: crate::binder::SIBinder = strong.as_binder();
 
-        // Cast back to `dyn IAccessor` via the AIDL `FromIBinder` hook
-        // — exactly the path a consumer would take.
+        // Cast back via the AIDL `FromIBinder` hook, the path a consumer takes.
         let bp = <dyn IAccessor as FromIBinder>::try_from(sib).expect("FromIBinder");
         assert_eq!(
             bp.getInstanceName().expect("getInstanceName"),
@@ -962,10 +878,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Provider error path: provider returns `Err` ⇒
-    /// `addConnection()` ⇒ `Status::ServiceSpecific(ERROR_CONNECTION_INFO_NOT_FOUND)`.
-    /// `getInstanceName()` keeps working — the error is *per-call*,
-    /// not per-instance.
+    /// Provider `Err` ⇒ `ERROR_CONNECTION_INFO_NOT_FOUND` per call; `getInstanceName` still works.
     #[test]
     fn local_accessor_provider_error_maps_to_connection_info_not_found() {
         let provider: AccessorAddrProvider =
@@ -988,12 +901,7 @@ mod tests {
         );
     }
 
-    /// Connect-failure path: provider returns a valid
-    /// `AccessorSockAddr::Unix` whose path has no listener ⇒
-    /// `addConnection()` ⇒
-    /// `Status::ServiceSpecific(ERROR_FAILED_TO_CONNECT_TO_SOCKET)`.
-    /// Confirms the (AccessorConnectError → ERROR_* code) mapping is
-    /// wired through the AIDL marshal correctly.
+    /// A Unix path with no listener ⇒ `ERROR_FAILED_TO_CONNECT_TO_SOCKET` through the AIDL marshal.
     #[test]
     fn local_accessor_connect_failure_maps_to_connect_to_socket() {
         let path = PathBuf::from(format!(
@@ -1014,14 +922,7 @@ mod tests {
         );
     }
 
-    /// Unsupported-family path (feature-disabled vsock on
-    /// macOS-default build): provider returns `Vsock { .. }` ⇒
-    /// `addConnection()` ⇒
-    /// `Status::ServiceSpecific(ERROR_UNSUPPORTED_SOCKET_FAMILY)`.
-    /// The same code path that AOSP returns for a wrong family — so an
-    /// `instance` configured for vsock on a build without
-    /// `rpc-vsock` surfaces with AOSP-faithful semantics rather than a
-    /// compile-time mismatch.
+    /// Vsock without `rpc-vsock` ⇒ `ERROR_UNSUPPORTED_SOCKET_FAMILY`, AOSP's wrong-family code.
     #[cfg(not(feature = "rpc-vsock"))]
     #[test]
     fn local_accessor_unsupported_family_maps_to_unsupported() {
@@ -1039,20 +940,11 @@ mod tests {
         );
     }
 
-    // --- process-local registry tests --------------------------
-    //
-    // `REGISTRY` is a process-wide `OnceLock<Mutex<Vec<_>>>`; under
-    // `cargo test` multiple test threads share it. We give every test
-    // a unique instance-name namespace (`format!(..., line!())`) so
-    // concurrent registrations from sibling tests don't false-collide
-    // on the duplicate-instance reject — AOSP test scaffolding uses
-    // the same pattern (`gAccessorProviders` is global, tests
-    // namespace their fake instances).
+    // --- process-local registry tests: `REGISTRY` is shared, so names are per-test unique ---
 
     #[track_caller]
     fn unique_instance(tag: &str) -> String {
-        // `line!()` would expand to *this* line for every caller; the
-        // caller's line needs `#[track_caller]`.
+        // `line!()` would name this line for every caller; `#[track_caller]` gives the caller's.
         format!(
             "rsb.test.a4.{}.{}.{}",
             tag,
@@ -1061,10 +953,7 @@ mod tests {
         )
     }
 
-    /// AOSP `addAccessorProvider` happy path — register two providers
-    /// for disjoint instance sets, verify each handle is live, verify
-    /// `lookup_accessor_provider` dispatches to the matching
-    /// provider's closure and returns its binder.
+    /// Two providers for disjoint instances: each lookup returns the matching closure's binder.
     #[test]
     fn add_two_providers_disjoint_instances() {
         let instance_a = unique_instance("disjoint-a");
@@ -1115,9 +1004,7 @@ mod tests {
         assert!(h_a.is_live());
         assert!(h_b.is_live());
 
-        // Lookup dispatches to the matching provider. Each provider
-        // returns *its* binder; `getInstanceName` round-trips the
-        // configured instance name.
+        // Each lookup reaches the matching provider, which returns *its* binder.
         let bp_a = <dyn IAccessor as FromIBinder>::try_from(
             lookup_accessor_provider(&instance_a).expect("lookup a"),
         )
@@ -1140,10 +1027,7 @@ mod tests {
         assert!(lookup_accessor_provider(&instance_b).is_none());
     }
 
-    /// AOSP duplicate-instance reject: a second
-    /// `add_accessor_provider` with an instance already claimed by a
-    /// live entry returns `Err(StatusCode::AlreadyExists)` and adds
-    /// nothing. The first handle must stay live and authoritative.
+    /// A second provider for a claimed instance is `AlreadyExists` and adds nothing; first stays.
     #[test]
     fn add_accessor_provider_rejects_duplicate_instance() {
         let instance = unique_instance("dup");
@@ -1181,8 +1065,7 @@ mod tests {
             "dup-instance must surface AlreadyExists, got {err:?}"
         );
 
-        // Lookup still hits the *first* provider — second add added
-        // nothing.
+        // Lookup still hits the *first* provider: the second add added nothing.
         let bp = <dyn IAccessor as FromIBinder>::try_from(
             lookup_accessor_provider(&instance).expect("lookup hits first"),
         )
@@ -1193,8 +1076,7 @@ mod tests {
         assert!(lookup_accessor_provider(&instance).is_none());
     }
 
-    /// `add_accessor_provider(HashSet::new(), ...)` ⇒ `BadValue`. AOSP
-    /// `ALOGE("Set of instances is empty!")`+empty-weak.
+    /// An empty instance set is `BadValue` (AOSP `ALOGE("Set of instances is empty!")`).
     #[test]
     fn add_accessor_provider_rejects_empty_instances() {
         let provider: AccessorProviderFn = Box::new(|_| None);
@@ -1203,11 +1085,7 @@ mod tests {
         assert_eq!(err, crate::error::StatusCode::BadValue);
     }
 
-    /// RAII unregister — dropping the handle removes the entry from
-    /// the registry; subsequent lookups return `None`.
-    /// `remove_accessor_provider` on the already-dropped handle cannot
-    /// be tested — it consumes the handle — so the explicit-removal
-    /// path is covered by [`explicit_remove_succeeds`].
+    /// Dropping the handle unregisters it; explicit removal is `explicit_remove_succeeds`.
     #[test]
     fn handle_drop_unregisters() {
         let instance = unique_instance("raii");
@@ -1237,9 +1115,7 @@ mod tests {
         );
     }
 
-    /// `remove_accessor_provider(live_handle)` ⇒ `Ok(())` and the
-    /// entry is gone. Test name is also the explicit-removal-success
-    /// witness.
+    /// `remove_accessor_provider(live_handle)` returns `Ok(())` and the entry is gone.
     #[test]
     fn explicit_remove_succeeds() {
         let instance = unique_instance("explicit");
@@ -1268,13 +1144,9 @@ mod tests {
         );
     }
 
-    /// Concurrent register + lookup — thread-safety witness. Multiple
-    /// threads register disjoint instances and look up each other's
-    /// instances; no panic, no deadlock, and every lookup either
-    /// finds the registered provider or returns `None` (never a stale
-    /// proxy from another thread's registration in flight).
+    /// Concurrent register + lookup: no panic or deadlock; a lookup finds its provider or `None`.
     #[test]
-    fn concurrent_register_and_lookup_p6() {
+    fn concurrent_register_and_lookup() {
         const N: usize = 8;
         let mut handles = Vec::new();
         let started = Arc::new(std::sync::Barrier::new(N));
@@ -1310,9 +1182,7 @@ mod tests {
                 )
                 .expect("cast");
                 assert_eq!(bp.getInstanceName().unwrap(), instance);
-                // Cross-lookup of an instance that wasn't registered
-                // by anyone returns None (validates that the registry
-                // doesn't return stale entries between threads).
+                // A name nobody registered returns None: no stale entries across threads.
                 assert!(lookup_accessor_provider("rsb.test.a4.p6.never").is_none());
                 drop(h);
             }));

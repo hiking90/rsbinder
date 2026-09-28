@@ -25,8 +25,7 @@ fn test_circular_enum_reference_is_a_diagnostic() -> Result<(), Box<dyn Error>> 
         }
     "##;
 
-    // A cycle has no discriminant. Accepting it would bake a fabricated wire
-    // value, so it must be a diagnostic — not merely "did not crash".
+    // A cycle has no discriminant: it must be a diagnostic, not merely "did not crash".
     let err = test_aidl_generation(input).expect_err("a 3-cycle must be rejected");
     let msg = err.to_string();
     assert!(
@@ -38,7 +37,7 @@ fn test_circular_enum_reference_is_a_diagnostic() -> Result<(), Box<dyn Error>> 
 
 #[test]
 fn test_deep_nesting_stability() -> Result<(), Box<dyn Error>> {
-    // Test deeply nested enum references to ensure recursion depth limiting works
+    // Cross-enum reference chains fold: Level5.VAL = (((1 + 1) * 2) << 1) | 4 = 12.
     let input = r##"
         package test.deep;
         
@@ -72,6 +71,7 @@ fn test_deep_nesting_stability() -> Result<(), Box<dyn Error>> {
     // Should work without crashes
     assert!(result.contains("pub mod BaseEnum"));
     assert!(result.contains("pub mod Level5"));
+    assert!(result.contains("r#VAL = 12,"), "{result}");
     println!("Deep nesting test passed successfully");
 
     Ok(())
@@ -171,7 +171,7 @@ fn test_large_enum_auto_reference_chain_resolves() -> Result<(), Box<dyn Error>>
 
 #[test]
 fn test_android_keymint_style_simplified() -> Result<(), Box<dyn Error>> {
-    // Simplified version of Android KeyMint style enum - should work now
+    // Simplified Android KeyMint style enum: cross-enum references and `|` must resolve.
     let input = r##"
         package android.hardware.security.keymint;
         
@@ -195,11 +195,13 @@ fn test_android_keymint_style_simplified() -> Result<(), Box<dyn Error>> {
 
     // Should work without panicking
     assert!(result.contains("pub mod TagType"));
-    assert!(result.contains("pub mod Tag"));
+    assert!(result.contains("pub mod Tag {"));
 
     // Verify some basic values are calculated
     assert!(result.contains("r#INVALID = 0"));
     assert!(result.contains("r#UINT = 805306368")); // 0x30000000
+    assert!(result.contains("r#KEY_SIZE = 805306371"));
+    assert!(result.contains("r#COMPUTED = 805306372"));
 
     println!("Android KeyMint style test passed successfully");
 
@@ -208,8 +210,7 @@ fn test_android_keymint_style_simplified() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn test_char_escape_sequences_decoded() -> Result<(), Box<dyn Error>> {
-    // `'\n'` must decode to the newline code point, not the literal char 'n'
-    // (regression: the parser returned the post-backslash char verbatim).
+    // `'\n'` must decode to the newline code point, not the literal char 'n'.
     let input = r##"
         package test.ch;
 
@@ -235,9 +236,7 @@ fn test_char_escape_sequences_decoded() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn test_unknown_type_is_diagnostic_not_panic() {
-    // An undefined field type must reach the user as a
-    // `ResolutionError::UnknownType` diagnostic, not as a panic inside
-    // `make_user_defined_type_name`.
+    // Undefined type: `ResolutionError::UnknownType`, not a `make_user_defined_type_name` panic.
     let input = r##"
         package test.unknown;
 
@@ -257,11 +256,7 @@ fn test_unknown_type_is_diagnostic_not_panic() {
 
 #[test]
 fn test_operator_chain_rejected_before_stack_overflow() {
-    // A long *unbracketed* operator chain bypasses the bracket/angle nesting
-    // guard yet still drives one parser/walker recursion per operator. It must
-    // be rejected as an ordinary diagnostic, never overflow the stack (the
-    // chains here stay under the stack-overflow threshold but exceed
-    // `MAX_OPERATOR_RUN`, so the pre-parse guard rejects them).
+    // Unbracketed chains recurse per operator; these exceed `MAX_OPERATOR_RUN` but not the stack.
     let unary = "~".repeat(4000);
     let unary_input = format!("package test.dos;\ninterface IFoo {{ const int X = {unary}5; }}");
     assert!(
@@ -285,9 +280,7 @@ fn test_operator_chain_rejected_before_stack_overflow() {
 
 #[test]
 fn test_unresolvable_const_reference_is_diagnostic() {
-    // A typo'd / missing constant reference must surface a diagnostic instead
-    // of silently folding to 0 (AOSP hard-fails with "Can't find <name>").
-    // Covers both a bare reference and one inside an arithmetic expression.
+    // Missing constant, bare or in arithmetic: AOSP hard-fails with "Can't find <name>".
     for input in [
         "package test.u;\ninterface IFoo { const int A = TYPO_NAME; }",
         "package test.u;\ninterface IFoo { const int A = TYPO_NAME + 1; }",
@@ -298,9 +291,7 @@ fn test_unresolvable_const_reference_is_diagnostic() {
         );
     }
 
-    // A *circular* reference has no well-defined value: AOSP hard-fails, and
-    // folding to a neutral 0 would silently bake a fabricated constant into
-    // the generated IPC code. It must be a diagnostic too.
+    // A circular reference has no value: AOSP hard-fails, so it is a diagnostic too.
     let circular = test_aidl_generation(
         "package test.c;\ninterface IFoo { const int A = B; const int B = A; }",
     );
@@ -312,9 +303,7 @@ fn test_unresolvable_const_reference_is_diagnostic() {
 
 #[test]
 fn test_overflowing_shift_is_diagnostic() {
-    // `1 << 40` overflows the int32 shift operand type and is rejected by
-    // AOSP; rsbinder must not silently truncate it to 0. The declared `long`
-    // does not widen the shift (operands promote to int independently).
+    // AOSP rejects `1 << 40` (int operands); a declared `long` does not widen the shift.
     assert!(
         test_aidl_generation("package test.s;\ninterface IFoo { const long C = 1 << 40; }")
             .is_err(),
@@ -337,11 +326,7 @@ fn test_overflowing_shift_is_diagnostic() {
 
 #[test]
 fn test_rust_keyword_type_names_are_escaped() {
-    // AIDL permits type names that are Rust keywords (`type`, `loop`,
-    // `match`, …); the generated mod/struct/trait declarations AND the
-    // reference paths that name them must `r#`-escape so the output compiles
-    // (AOSP's Rust backend does the same). Escaping member names alone is not
-    // enough — a keyword-named type would emit non-compiling Rust.
+    // Keyword type names: declarations and reference paths both need `r#` (as AOSP's backend).
     let parc = test_aidl_generation("package test.kw;\nparcelable type { int a; }")
         .expect("keyword parcelable should generate");
     assert!(parc.contains("pub mod r#type"), "got:\n{parc}");
@@ -352,8 +337,7 @@ fn test_rust_keyword_type_names_are_escaped() {
     assert!(iface.contains("pub mod r#loop"), "got:\n{iface}");
     assert!(iface.contains("pub trait r#loop"), "got:\n{iface}");
 
-    // Cross-reference: a field typed as a keyword-named parcelable must
-    // produce a fully `r#`-escaped path, never a bare keyword path.
+    // A field typed as a keyword-named parcelable needs a fully `r#`-escaped path.
     let xref = test_aidl_generation(
         "package test.kw;\nparcelable match { int a; }\nparcelable Holder { match m; }",
     )
@@ -368,17 +352,14 @@ fn test_rust_keyword_type_names_are_escaped() {
 
 #[test]
 fn test_enum_discriminant_eval_failure_is_diagnostic() {
-    // `A = 1/0` must not fall through into the auto-increment
-    // counter and generated `A = 0` — a silently wrong wire discriminant.
-    // AOSP rejects the expression at build time.
+    // AOSP rejects `A = 1/0` at build time; auto-increment must not fill in a value.
     let result = test_aidl_generation("package test.e;\nenum E { A = 1/0 }");
     assert!(
         result.is_err(),
         "enum discriminant with failing evaluation must error, got: {result:?}"
     );
 
-    // A later auto-increment member is poisoned by the earlier failure and
-    // must not silently receive a fabricated value either.
+    // A later auto-increment member depends on the failure and must error too.
     let result = test_aidl_generation("package test.e;\nenum E { A = 1/0, B }");
     assert!(
         result.is_err(),
@@ -388,9 +369,7 @@ fn test_enum_discriminant_eval_failure_is_diagnostic() {
 
 #[test]
 fn test_enum_discriminant_unresolved_reference_is_diagnostic() {
-    // `A = foo.Missing.X` must not resolve through the current-declaration
-    // lookup fallback, and must not be skipped as an unresolved `Name`;
-    // generated `A = 0`. AOSP rejects the reference at build time.
+    // AOSP rejects `foo.Missing.X`; neither the lookup fallback nor a `Name` skip may accept it.
     let result = test_aidl_generation("package test.e;\nenum E { A = foo.Missing.X }");
     assert!(
         result.is_err(),
@@ -400,8 +379,7 @@ fn test_enum_discriminant_unresolved_reference_is_diagnostic() {
 
 #[test]
 fn test_enum_discriminant_circular_reference_is_diagnostic() {
-    // `enum E { A = B, B = A }` must not generate the fabricated values
-    // A=1, B=1. A discriminant cycle has no well-defined value; AOSP errors.
+    // A discriminant cycle has no value; AOSP errors.
     let result = test_aidl_generation("package test.e;\nenum E { A = B, B = A }");
     assert!(
         result.is_err(),
@@ -411,9 +389,7 @@ fn test_enum_discriminant_circular_reference_is_diagnostic() {
 
 #[test]
 fn test_phantom_package_type_is_diagnostic_not_self_reference() {
-    // A field typed as `<missing-package>.P` whose simple name equals the
-    // enclosing parcelable must not resolve to that parcelable via the lookup
-    // fallback — that would emit a self-referential `Box<P>` field.
+    // `no.such.pkg.P` inside `P` must not resolve to `P` via the lookup fallback.
     let result = test_aidl_generation("package test.p;\nparcelable P { no.such.pkg.P other; }");
     let err = result.expect_err("phantom package type must produce an error");
     let msg = err.to_string();
@@ -425,9 +401,7 @@ fn test_phantom_package_type_is_diagnostic_not_self_reference() {
 
 #[test]
 fn test_enum_array_default_initializers() {
-    // Characterization: no golden test covered `init_enum_array_value` (enum
-    // array field defaults). Pins both the non-nullable and nullable forms so
-    // the init_value extraction cannot silently change them.
+    // Pins `init_enum_array_value` output for non-nullable and nullable enum array defaults.
     let input = r##"
         package test.enumarr;
         enum Color { RED = 0, GREEN = 1, BLUE = 2 }

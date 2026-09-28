@@ -150,8 +150,7 @@ pub fn parse(uri: &str) -> Result<Uri> {
     };
     let mut service = match fragment {
         Some("") => return Err(bad("empty `#service`", uri)),
-        // A raw `?` here is a query written after the fragment, which would
-        // otherwise be swallowed into the service name and never applied.
+        // A raw `?` is a query after the fragment; it would join the service name, never applied.
         Some(f) if f.contains('?') => return Err(bad("`?query` must come before `#service`", uri)),
         Some(f) => Some(percent_decode_str(f, uri)?),
         None => None,
@@ -282,8 +281,7 @@ fn percent_decode(s: &str, uri: &str) -> Result<Vec<u8>> {
         if b[i] == b'%' {
             let hex = b
                 .get(i + 1..i + 3)
-                // `from_str_radix` accepts a leading sign, so require two
-                // hex digits explicitly (`%+9` is not an escape).
+                // `from_str_radix` accepts a sign, so require two hex digits (`%+9` is no escape).
                 .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
                 .and_then(|h| std::str::from_utf8(h).ok())
                 .and_then(|h| u8::from_str_radix(h, 16).ok())
@@ -322,10 +320,7 @@ mod tests {
             }
         );
         assert_eq!(u.service, None);
-        // `?threads=0` must survive as `Some(0)`. Collapsing it to `None`
-        // would turn "single-threaded, like a service manager" back into
-        // "give me the default" — the overload `ProcessState::init` exists
-        // to have removed.
+        // `?threads=0` stays `Some(0)` (single-threaded), distinct from `None` (the default).
         assert_eq!(
             p("binder://?threads=0").endpoint,
             Endpoint::Kernel {
@@ -348,20 +343,16 @@ mod tests {
         assert_eq!(u.service.as_deref(), Some("svc"));
         assert!(parse("binder://a#b").is_err());
         assert!(parse("binder://?profile=android13plus").is_err());
-        // Bytes only: a `4M` shorthand would have to be guessed at, and
-        // this parser refuses what it does not know rather than guess.
+        // Bytes only: the parser refuses a `4M` shorthand rather than guess its meaning.
         assert!(parse("binder://?mmap=4M").is_err());
-        // Last-value-wins would hand `kernel_init` the 4 KB and silently
-        // drop the 4 MB the caller also asked for.
+        // Last-value-wins would silently drop the 4 MB the caller also asked for.
         assert!(parse("binder://?mmap=4194304&mmap=4096").is_err());
         assert!(parse("binder://?threads=1&threads=2").is_err());
-        // A query after the fragment would become part of the service
-        // name and never be applied.
+        // A query after the fragment would join the service name and never be applied.
         assert!(parse("binder://#svc?driver=/dev/x").is_err());
         assert!(parse("unix:///tmp/x.sock#svc?profile=android13plus").is_err());
         assert_eq!(p("binder://#a%3Fb").service.as_deref(), Some("a?b"));
-        // The range itself is `ProcessState`'s to judge, at init time —
-        // the parser only insists on a number.
+        // The parser only insists on a number; `ProcessState` judges the range at init.
         assert_eq!(
             p("binder://?mmap=1").endpoint,
             Endpoint::Kernel {
@@ -397,8 +388,7 @@ mod tests {
         );
         assert!(parse("unix:///a?profile=nope").is_err());
         assert!(parse("unix:///a?threads=1").is_err());
-        // Kernel-only: an RPC transport has no receive mapping, so the
-        // key is refused there rather than parsed and dropped.
+        // Kernel-only: RPC has no receive mapping, so the key is refused, not silently dropped.
         assert!(parse("unix:///a?mmap=4194304").is_err());
         assert!(parse("unix:///a#").is_err());
         assert!(parse("http://x").is_err());

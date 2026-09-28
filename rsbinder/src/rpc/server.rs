@@ -13,6 +13,115 @@
 //!
 //! Naming: android semantics, snake_case (`setup_unix_server`,
 //! `get_root`, `add_service`, `set_max_threads`).
+//!
+//! # Accept and wrap
+//!
+//! The accept loop only calls `accept(2)`; every other step runs on the
+//! connection's worker thread, so a failure there drops only that
+//! connection. The worker switches the stream back to blocking (the
+//! listener is non-blocking only so the loop can poll `shutdown`),
+//! disables Nagle on TCP (small-frame traffic, as the client-side
+//! `TlsTransport::connect` does), and wraps it — natively, or through a
+//! server-side TLS handshake. Keeping the handshake off the accept loop is
+//! what stops a slow-handshake peer from stalling it: the worker absorbs
+//! the handshake time, and `set_max_connections` bounds how many
+//! handshakes are in flight.
+//!
+//! The TLS handshake does blocking reads and writes on the raw socket
+//! before the worker arms its admission deadline on the wrapped
+//! transport, so the handshake deadline is armed on the raw stream first:
+//! on the read side for a connected-but-silent peer, and on the write side
+//! for a peer that is admitted but stops reading, stalling our handshake
+//! `write_all` once its receive window fills. Without it such a peer pins
+//! its worker — and, under `set_max_connections`, the whole accept loop —
+//! indefinitely. Arming is best-effort: a failure means no deadline. On
+//! the plain (UDS/vsock) path the wrap does no I/O and the same deadline
+//! is re-armed before the native handshake reads.
+//!
+//! The worker snapshots the TLS config instead of the accept loop; that is
+//! sound because only the `setup_*_server_tls` factories set it, before
+//! the server is shared as an `Arc`.
+//!
+//! TCP is internal-only. There is no public plaintext `setup_tcp_server`
+//! (plaintext network RPC is never production-appropriate, see the
+//! [`super`] module doc): the TCP listener is reached only through
+//! `setup_tcp_server_tls`, and a plain TCP wrap is refused.
+//!
+//! # Admission and deadlines
+//!
+//! - **Authorizer.** Runs on the connection's worker, concurrently across
+//!   connections and never blocking the accept loop, but before the
+//!   wire-profile branch, session build, handshake or any `recv_frame`, so
+//!   a rejected peer receives zero RPC bytes. It is pure on
+//!   `RpcTransport::peer_identity` (unix `SO_PEERCRED`/`getpeereid`, TLS
+//!   certificate, vsock cid) and is the enforcement point for that
+//!   identity. It is cloned out of its lock and called lock-free, so it may
+//!   re-enter the server without self-deadlock (the same discipline as
+//!   `RpcProxy::send_obituary`). Unset, every peer is admitted.
+//! - **Handshake deadline.** Armed on read and write before the blocking
+//!   serve loop. The android-13+ path lifts both sides after its handshake;
+//!   the r34 path, which has no handshake, lifts the write side before the
+//!   serve loop and the read side after the first frame. The 10 s default
+//!   exists so a peer that never sends its handshake cannot hold a
+//!   `max_connections` slot, or pin the server's `Arc`, forever.
+//! - **Serve deadlines.** After the android-13+ handshake the handshake
+//!   deadline is replaced by the idle timeout on both read and write —
+//!   `None` by default, so an established session may idle unbounded. A
+//!   callback slot (a client's incoming attach, which the server only
+//!   sends on) has no serve loop and arms only the write side.
+//! - **`max_connections`.** The rsbinder analogue of AOSP `RpcServer`'s
+//!   bounded server resources, not a wire or semantic port: rsbinder is one
+//!   connection = one session = one worker, so the bounded resource is the
+//!   concurrent worker count. At capacity the accept loop stops accepting
+//!   and excess clients wait in the kernel listen backlog. Making workers
+//!   fewer than connections would need I/O multiplexing, which is out of
+//!   scope.
+//!
+//! # Session registry
+//!
+//! `sessions` maps a server-minted `RpcSessionId` to a `Weak` of the
+//! founding `RpcSessionInner` (AOSP `RpcServer::mSessions`). The
+//! android-13+ accept handshake reads the client's
+//! `RpcConnectionHeader.sessionId`:
+//!
+//! - **empty** (every single-connection client): a new session; its id is
+//!   registered here and never looked up on this path, so the default flow
+//!   is unchanged.
+//! - **non-empty, live**: the connection attaches to that session.
+//!   `add_incoming_slot_capped` adds a slot onto the single founding inner,
+//!   so the `RpcProxy`s cached in `state.remote_proxies` point at the only
+//!   inner and a server worker's nested `proxy.transact` `find_conn` stays
+//!   within that inner's slot pool (no cross-slot aliasing). An attach that
+//!   built a fresh session instead would leave `attached_count` at 0 and the
+//!   second connection unable to reach the founding connection's binder.
+//! - **non-empty, unknown or stale**, or any id that is not 32 bytes (AOSP
+//!   `kSessionIdBytes == 32`): the connection is rejected (AOSP `ALOGE` +
+//!   return) and counted in `rejected_unknown_id_count`.
+//!
+//! The map holds `Weak`s so it never keeps a session alive; dead entries
+//! are pruned on the next registration, since no single exit marks a
+//! session's death. An entry does outlive session death while a proxy
+//! still pins the dead inner (proxies hold `Arc<RpcSessionInner>`); an id
+//! echoed onto such a session is refused by its lifecycle —
+//! `try_bump_live_conns` inside `add_incoming_slot_capped` refuses
+//! `Dying`/`Dead` — not by a dangling `Weak`. The key is the
+//! `RpcSessionId` newtype to mark the 32 bytes as an attach capability;
+//! public APIs keep `&[u8]` / `[u8; 32]`.
+//!
+//! # Termination
+//!
+//! `terminating` is raised only by `terminate`, and stored before it takes
+//! `live_sessions`. `track_session` and that take share the
+//! `live_sessions` mutex, so a session the take missed was listed after
+//! the store, and its worker's `minted_after_terminate` check — run right
+//! after listing — sees the flag and ends the session instead of serving.
+//! `live_sessions` lists every minted session because the id-keyed
+//! `sessions` map knows only android-13+ sessions; an attach adds a slot to
+//! an inner already listed. `terminating` is separate from `shutdown`
+//! because the graceful `stop_accepting` also raises `shutdown` and must
+//! leave a just-accepted session serving. The two flags carry no cross
+//! invariant: a worker can read one raised and the other not, and a check
+//! on one never substitutes for a check on the other.
 
 use std::collections::HashMap;
 #[cfg(feature = "rpc-tls")]
@@ -42,28 +151,11 @@ use super::transport::{PeerIdentity, RpcTransport, UnixTransport};
 use super::transport::{TlsStream, TlsTransport};
 use super::RpcResult;
 
-/// Server-side TLS handle. `Some` ⇒ every accepted
-/// connection is TLS-wrapped on its worker thread (handshake under the
-/// `max_connections` cap, so a slow-handshake attacker can stall its own
-/// worker but never the accept loop). `None` ⇒ plain transport
-/// (byte-identical to a non-TLS server). `Mutex<Option<...>>` mirrors the other
-/// late-bind config fields (`max_threads`, `authorizer`, etc.) so a
-/// caller that builds the server then `set_*`s knobs has a single
-/// mutability discipline.
+/// Server TLS config, `None` = plain; `Mutex<Option>` like the other late-bound knobs.
 #[cfg(feature = "rpc-tls")]
 type TlsServerConfigCell = Mutex<Option<Arc<rustls::ServerConfig>>>;
 
-/// Backend-agnostic listener kind for [`RpcServer`].
-/// The accept loop in [`RpcServer::run`] holds one of these and the
-/// `accept_raw` helper produces a [`RawAccepted`] so the wrap step
-/// (native or TLS) happens on the worker thread. Default
-/// `setup_unix_server` callers stay on the `Unix` variant, so the wire
-/// is byte-unchanged on that path.
-///
-/// **Tcp variant**: TCP is *internal-only*. There is no public
-/// `setup_tcp_server` factory because plaintext network RPC is never
-/// production-appropriate (see [`super`] module doc). The TCP arm is
-/// reached only through [`setup_tcp_server_tls`](RpcServer::setup_tcp_server_tls).
+/// The accept loop's listener; `Tcp` is TLS-only (see module doc "Accept and wrap").
 enum ServerListener {
     Unix(UnixListener),
     #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
@@ -72,32 +164,22 @@ enum ServerListener {
     Tcp(TcpListener),
 }
 
-/// Backend-agnostic bind metadata. `Drop` branches on this for the
-/// per-backend cleanup: path `Unix` removes the socket file;
-/// abstract Unix, `Vsock`, and `Tcp` have no filesystem cleanup (the
-/// kernel reclaims the bind on `Drop` of the listener fd itself).
+/// Bind metadata; only a path `Unix` bind leaves a file for `Drop` to remove.
 enum BindAddress {
-    Unix(PathBuf),
+    /// `file`: the bound socket's (dev, ino), so `Drop` never unlinks a successor's socket.
+    Unix {
+        path: PathBuf,
+        file: Option<(u64, u64)>,
+    },
     #[cfg(any(target_os = "linux", target_os = "android"))]
     UnixAbstract,
     #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
-    Vsock {
-        cid: u32,
-        port: u32,
-    },
+    Vsock { cid: u32, port: u32 },
     #[cfg(feature = "rpc-tls")]
     Tcp(SocketAddr),
 }
 
-/// Raw accepted stream awaiting the worker-thread
-/// wrap. Yielded by [`ServerListener::accept_raw`]; consumed by
-/// [`RawAccepted::into_transport`] inside the spawned worker.
-///
-/// Splitting accept (cheap kernel `accept(2)`) from wrap
-/// (potentially-expensive TLS handshake) is what keeps a slow-
-/// handshake attacker from stalling the accept loop — the worker
-/// thread eats the handshake time, bounded by
-/// [`RpcServer::set_max_connections`](RpcServer::set_max_connections).
+/// An accepted stream awaiting its wrap on the worker; see module doc "Accept and wrap".
 enum RawAccepted {
     Unix(UnixStream),
     #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
@@ -107,9 +189,7 @@ enum RawAccepted {
 }
 
 impl ServerListener {
-    /// Set the listener to non-blocking so the accept loop can poll
-    /// `shutdown`. The `vsock` crate exposes `set_nonblocking` on
-    /// `VsockListener` mirroring `UnixListener`/`TcpListener`'s std API.
+    /// Non-blocking, so the accept loop can poll `shutdown`.
     fn set_nonblocking(&self, on: bool) -> std::io::Result<()> {
         match self {
             ServerListener::Unix(l) => l.set_nonblocking(on),
@@ -120,17 +200,9 @@ impl ServerListener {
         }
     }
 
-    /// Per-backend accept: returns the raw stream paired with its
-    /// backend tag, *without* wrapping it as `RpcTransport`. The wrap
-    /// (and any TLS handshake) runs in the worker thread spawned by
-    /// [`RpcServer::serve_connection_raw`].
+    /// `accept(2)` only; the wrap and any TLS handshake run on the worker.
     fn accept_raw(&self) -> std::io::Result<RawAccepted> {
-        // Only `accept(2)` here — the per-stream setup (blocking mode, TCP
-        // nodelay) is deferred to the worker via `prepare_for_worker`, so a
-        // setup failure on one connection (e.g. a peer that RST between SYN
-        // and our `setsockopt`, which can surface as ECONNRESET or even
-        // EINVAL) drops only that connection instead of propagating into the
-        // accept loop's error match and killing the whole server.
+        // Only `accept(2)`: setup runs on the worker, so one peer's RST can't end the loop.
         match self {
             ServerListener::Unix(l) => {
                 let (stream, _addr) = l.accept()?;
@@ -151,13 +223,7 @@ impl ServerListener {
 }
 
 impl RawAccepted {
-    /// Configure the accepted stream for its worker: switch it to blocking
-    /// (the listener is non-blocking only so the accept loop can poll
-    /// `shutdown`; the worker does blocking `recv_frame` and, for TLS, a
-    /// blocking handshake), and for TCP disable Nagle (small-frame RPC
-    /// traffic; matches the client-side `TlsTransport::connect`). Runs on the
-    /// *worker* thread so a failure drops only this connection — see
-    /// [`ServerListener::accept_raw`].
+    /// Blocking mode, plus `TCP_NODELAY` on TCP, for the worker; see module doc "Accept and wrap".
     fn prepare_for_worker(&self) -> std::io::Result<()> {
         match self {
             RawAccepted::Unix(s) => s.set_nonblocking(false),
@@ -171,17 +237,7 @@ impl RawAccepted {
         }
     }
 
-    /// Arm a read deadline on the raw stream *before* it is wrapped, so
-    /// the pre-wrap TLS handshake (driven inside [`into_transport`],
-    /// which performs blocking reads on this socket) is itself bounded.
-    /// Without this, the [`run_connection_in_worker`] deadline — armed
-    /// only after the wrap returns — never covers the handshake, so a
-    /// connected-but-silent TLS peer would pin its worker thread (and,
-    /// under [`set_max_connections`](RpcServer::set_max_connections), the
-    /// whole accept loop) indefinitely. Best-effort: a set failure just
-    /// means no deadline. Harmless on the plain (UDS/vsock) path — that
-    /// wrap performs no I/O and the same deadline is re-armed before the
-    /// native handshake reads.
+    /// Bound the pre-wrap TLS handshake reads; see module doc "Accept and wrap".
     fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
         match self {
             RawAccepted::Unix(s) => s.set_read_timeout(timeout),
@@ -192,12 +248,7 @@ impl RawAccepted {
         }
     }
 
-    /// Companion to [`set_read_timeout`](Self::set_read_timeout): bound the
-    /// pre-wrap handshake's *write* side too. A peer that completes enough
-    /// of the handshake to be admitted but then stops reading would stall
-    /// our blocking handshake-reply `write_all` once its receive window
-    /// fills, pinning this worker (and its admission slot) — symmetric to
-    /// the read-side Slowloris. Best-effort.
+    /// Bound the pre-wrap handshake writes to a peer that stops reading; see module doc.
     fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
         match self {
             RawAccepted::Unix(s) => s.set_write_timeout(timeout),
@@ -208,14 +259,7 @@ impl RawAccepted {
         }
     }
 
-    /// Wrap the raw stream as `RpcTransport`, on the
-    /// worker thread. `tls_config = Some(cfg)` ⇒ drive a server-side
-    /// TLS handshake via [`TlsTransport::accept_stream`] over the raw
-    /// byte stream; `None` ⇒ a plain backend transport
-    /// (`UnixTransport`/`VsockTransport`).
-    ///
-    /// Plain TCP is rejected here (`TLS-only on TCP` — see
-    /// [`ServerListener::Tcp`]).
+    /// Wrap on the worker: TLS handshake if `tls_config` is set, else native (plain TCP refused).
     #[cfg(feature = "rpc-tls")]
     fn into_transport(
         self,
@@ -257,22 +301,10 @@ impl RawAccepted {
 const DIRECTORY_DESC: &str = "rsbinder.rpc.IServiceDirectory";
 const TX_GET_SERVICE: TransactionCode = crate::binder::FIRST_CALL_TRANSACTION;
 
-/// Default handshake/admission read deadline (see
-/// [`RpcServer::set_handshake_timeout`]). Bounds only the pre-serve
-/// phase; a connected peer that never sends its handshake is dropped
-/// after this so it cannot hold a `max_connections` slot (or pin the
-/// server's `Arc`) forever.
+/// Default `set_handshake_timeout`: a silent peer cannot hold its slot or the server `Arc` forever.
 const DEFAULT_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Built-in name → binder directory, used to back [`RpcServer::add_service`]
-/// (android RPC has a single root object; this *is* that root when
-/// named services are registered). Reused, unmodified, via the same
-/// `Remotable::on_transact` server path as any AIDL stub.
-///
-/// The map is **shared** (`Arc<Mutex<…>>`) with [`RpcServer::named`], so
-/// the directory binder is built once and every later
-/// [`RpcServer::add_service`] is an O(1) insert visible through this same
-/// directory — no per-call rebuild or root swap.
+/// The single root (android RPC has one) behind `add_service`; its map is `RpcServer::named`.
 struct ServiceDirectory {
     services: Arc<Mutex<HashMap<String, SIBinder>>>,
 }
@@ -313,10 +345,7 @@ impl Remotable for ServiceDirectory {
     }
 }
 
-/// Authorization hook: given the connecting
-/// peer's [`PeerIdentity`], return `true` to admit, `false` to refuse
-/// (the connection is closed before any RPC byte). `Arc` so it can be
-/// cloned out of the lock and invoked lock-free.
+/// `true` admits the peer; `Arc` so it is cloned out of the lock and called lock-free.
 type Authorizer = Arc<dyn Fn(&PeerIdentity) -> bool + Send + Sync>;
 
 /// An RPC server. Backend is chosen by the constructor:
@@ -328,183 +357,116 @@ type Authorizer = Arc<dyn Fn(&PeerIdentity) -> bool + Send + Sync>;
 pub struct RpcServer {
     listener: ServerListener,
     bind: BindAddress,
-    /// `Some(cfg)` ⇒ TLS server, every accepted
-    /// connection is handshaken on its worker thread with this config.
-    /// `None` ⇒ plain transport (the default; byte-identical to
-    /// a non-TLS `RpcServer` for UDS/vsock). Late-bound via
-    /// [`setup_unix_server_tls`](Self::setup_unix_server_tls),
-    /// [`setup_tcp_server_tls`](Self::setup_tcp_server_tls), and
-    /// [`setup_vsock_server_tls`](Self::setup_vsock_server_tls).
+    /// `Some` ⇒ every accepted connection is TLS-handshaken on its worker; set by `setup_*_tls`.
     #[cfg(feature = "rpc-tls")]
     tls_config: TlsServerConfigCell,
     root: Mutex<Option<SIBinder>>,
-    /// Named services backing [`add_service`](RpcServer::add_service).
-    /// `Arc` so the single [`ServiceDirectory`] root (`directory`) shares
-    /// this exact map — each later `add_service` is an O(1) insert, no
-    /// rebuild. Per-server instance state, not a process global.
+    /// Services behind `add_service`; shared with the `directory` root, so no rebuild per insert.
     named: Arc<Mutex<HashMap<String, SIBinder>>>,
-    /// The directory root binder, built once at construction over the
-    /// shared `named` map (so it reads later inserts live) and installed
-    /// as the root on the first `add_service`. Per-server instance state.
+    /// Directory root over `named`, built once; `add_service` installs it as the root.
     directory: SIBinder,
     max_threads: Mutex<u32>,
-    /// Whether per-connection sessions advertise `Unix` FD support
-    /// (default false ⇒ FD reject everywhere).
+    /// Whether sessions advertise `Unix` FD support (default false ⇒ every FD refused).
     fd_unix_supported: AtomicBool,
-    /// Opt-in android-13+ versioned wire:
-    /// `None` ⇒ the default android-12 r34 wire (byte-unchanged);
-    /// `Some(max)` ⇒ each accepted connection runs the AOSP handshake
-    /// negotiating `min(max, client_max)`.
+    /// `None` ⇒ android-12 r34 wire; `Some(max)` ⇒ AOSP handshake negotiating `min(max, client)`.
     wire_max_version: Mutex<Option<u32>>,
-    /// Opt-in **server-side admission bound** on the number of
-    /// *concurrent* connection-worker threads. `None` (default) ⇒
-    /// unbounded, byte-for-byte a server that never sets the bound
-    /// (additive invariant). `Some(max)` ⇒ the accept loop stops accepting while
-    /// `max` workers are live (excess clients wait in the kernel listen
-    /// backlog — clean backpressure, no reactor, no dropped client),
-    /// resuming when a worker finishes. This is the rsbinder analogue
-    /// of AOSP `RpcServer`'s bounded server resources (rsbinder is
-    /// 1-connection = 1-session = 1-worker, so the resource to bound is
-    /// the concurrent worker count); it is **not** a wire/semantic port
-    /// and does **not** reduce workers below the connection count
-    /// (that would require I/O multiplexing — explicitly out of scope).
+    /// Cap on live connection workers (`None` = none); see module doc "Admission and deadlines".
     max_connections: Mutex<Option<usize>>,
-    /// Handshake/admission read deadline applied to each accepted
-    /// connection *before* it enters the blocking serve loop.
-    /// `Some(d)` (the default — see [`DEFAULT_HANDSHAKE_TIMEOUT`]) ⇒ a
-    /// connected-but-silent peer that never sends its handshake surfaces
-    /// as a worker-loop error after `d`, releasing both its
-    /// `Arc<RpcServer>` and its `max_connections` admission slot. `None`
-    /// ⇒ no deadline (a hung peer can hold a slot indefinitely). The
-    /// deadline is cleared once serving begins, so an established
-    /// two-way session may idle between requests unbounded.
+    /// Deadline through the handshake / r34 first frame (10 s); see `set_handshake_timeout`.
     handshake_timeout: Mutex<Option<std::time::Duration>>,
-    /// Optional per-connection *idle* read deadline applied to the
-    /// android-13+ serve loop **after** the handshake completes. `None`
-    /// (the default) ⇒ an established session idles between requests
-    /// unbounded (byte-identical to a server that never sets it). `Some(d)` ⇒ a peer
-    /// that completes the handshake and then goes silent surfaces as a
-    /// serve-loop read error after `d`, releasing its worker and its
-    /// [`set_max_connections`](Self::set_max_connections) admission slot —
-    /// the post-handshake Slowloris defense that
-    /// [`set_handshake_timeout`](Self::set_handshake_timeout) (handshake
-    /// phase only) does not cover. Set this only when the protocol has
-    /// regular traffic or idle eviction is acceptable.
+    /// Serve-phase deadline after the android-13+ handshake (default none); see `set_idle_timeout`.
     idle_timeout: Mutex<Option<std::time::Duration>>,
     reply_timeout: Mutex<Option<std::time::Duration>>,
-    /// Opt-in authorization hook. `None`
-    /// (default) ⇒ accept-all = byte-for-byte a server without the hook
-    /// (additive invariant). When set, it runs on the connection's own
-    /// worker thread (`run_connection_in_worker`, shared by the accept
-    /// loop and [`serve_connection`](RpcServer::serve_connection)),
-    /// concurrently across connections and never blocking the accept
-    /// loop — but **before** the wire-profile branch, session build,
-    /// handshake, or any `recv_frame`, so a rejected peer receives
-    /// **zero RPC bytes** (the connection is closed).
-    /// Backend-independent: it is
-    /// pure on [`RpcTransport::peer_identity`] (unix `SO_PEERCRED`/
-    /// `getpeereid`, tls cert, vsock cid, …). `Arc` (not `Box`) so the
-    /// hook is cloned out of the lock and invoked **lock-free**, so a
-    /// hook may itself touch the server without self-deadlock (same
-    /// discipline as `RpcProxy::send_obituary`). This is the
-    /// *enforcement point* for `peer_identity()`.
+    /// Admission hook run before any RPC byte; see module doc "Admission and deadlines".
     authorizer: Mutex<Option<Authorizer>>,
-    /// Shutdown-reject e2e scaffolding hook
-    /// (`#[doc(hidden)]`, test-only). When set, the closure runs on the
-    /// android-13+ attach arm *between* a successful handshake and the
-    /// `server.shutdown.load()` gate (the very race window the test
-    /// targets, otherwise un-bound by code observability alone). An integration
-    /// test acquires the worker at this barrier, calls
-    /// [`stop_accepting`](RpcServer::stop_accepting), then releases the worker so it
-    /// re-reads the now-true flag and takes the reject branch — turning
-    /// the otherwise sub-microsecond window into a deterministic test
-    /// point. `None` default ⇒ no invocation, byte-identical to the
-    /// attach path without the probe. `Arc<dyn Fn>` so the closure is cloned out
-    /// of the lock and invoked **lock-free** (same discipline as
-    /// `authorizer` — re-entrant calls into `server` from the probe do
-    /// not self-deadlock). Same `__`-prefix unstable-API discipline as
-    /// `__fuzz_decode_rpc_parcel`; not part of the supported API.
+    /// Test barrier on the attach arm before the `shutdown` gate (`__set_attach_shutdown_probe`).
     #[doc(hidden)]
     attach_shutdown_probe: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    /// Session-id → shared-session registry
-    /// (AOSP `RpcServer::mSessions`). The android-13+ accept handshake
-    /// reads the client's `RpcConnectionHeader.sessionId`:
-    ///  - **empty** id (the default — every single-connection client) ⇒ a
-    ///    brand-new session; its server-minted id is registered here
-    ///    (a [`std::sync::Weak`] of the session's shared state) and is
-    ///    **never looked up** on this path, so the default behavior is
-    ///    byte-for-byte unchanged (purely additive);
-    ///  - **non-empty** id that resolves to a live session ⇒ **attach**
-    ///    this connection to that pre-existing `SharedSession`
-    ///    (id-demux: a binder published over the founding connection is
-    ///    reachable here — shared `state`/`root`);
-    ///  - **non-empty** id that is unknown / stale ⇒ reject (AOSP
-    ///    `ALOGE`+return).
-    ///
-    /// `Weak` so a fully-torn-down session (all connections gone) is
-    /// reclaimable and a later echo of its id is treated as unknown.
-    /// Written on every mint, resolved on every non-empty id; an attach
-    /// that produced a fresh session (instead of reaching the founding
-    /// one) would leave `attached_count` at 0 and the 2nd connection
-    /// unable to reach the founding connection's binder.
-    /// `RpcSessionId` keys (newtype) — type-explicit that the
-    /// 32-byte map key is an *attach capability*, not just an opaque
-    /// hash. Internal-only; public APIs continue to take `&[u8]` /
-    /// `[u8; 32]` for compatibility.
-    /// Holds a `Weak` of the founding `RpcSessionInner` itself so
-    /// id-echoing attaches add a slot onto the *single* inner via
-    /// [`RpcSession::add_incoming_slot_capped`] —
-    /// `state.remote_proxies`-cached `RpcProxy`s' `Arc<RpcSessionInner>`
-    /// then point to the only inner and any server worker's nested
-    /// `proxy.transact` `find_conn`s stay within its own slot pool
-    /// (no cross-slot aliasing). The public API
-    /// (`live_session_node_count`/`session_live_conns`) is byte-
-    /// unchanged via `RpcSessionInner` delegate methods.
+    /// Id → founding inner (AOSP `RpcServer::mSessions`); see module doc "Session registry".
     sessions: Mutex<HashMap<RpcSessionId, std::sync::Weak<RpcSessionInner>>>,
-    /// Observability counters. Plain atomics off the per-transaction
-    /// path — zero-cost on the default (empty-id) flow.
-    /// `session_registered` = new-session mints; `attached_count` =
-    /// id-demux attaches; `rejected_unknown_id` = id-carrying
-    /// connections refused for any reason (see
-    /// [`rejected_unknown_id_count`](RpcServer::rejected_unknown_id_count)).
+    /// Mints, attaches and refusals for the `*_count` getters; atomics off the transaction path.
     session_registered: AtomicUsize,
     attached_count: AtomicUsize,
     rejected_unknown_id: AtomicUsize,
     shutdown: Arc<AtomicBool>,
-    /// Raised by [`terminate`](RpcServer::terminate) only, and stored
-    /// before it takes `live_sessions` — that order alone is what makes
-    /// the store-before-take handshake in `minted_after_terminate` hold
-    /// (`track_session` and the take share the `live_sessions` mutex, so a
-    /// session the take missed was listed after this store). Separate from
-    /// `shutdown`
-    /// because that flag is also raised by the graceful
-    /// [`stop_accepting`](RpcServer::stop_accepting), which must leave a
-    /// just-accepted session serving. The two flags carry no cross
-    /// invariant in either direction — they are independent stores, so a
-    /// worker can read one raised and the other not, and a check on one is
-    /// never a substitute for a check on the other.
+    /// Raised only by `terminate`, before its `live_sessions` take; see module doc "Termination".
     terminating: Arc<AtomicBool>,
     workers: Mutex<Vec<JoinHandle<()>>>,
-    /// Every session this server minted, for
-    /// [`terminate`](RpcServer::terminate). The id-keyed `sessions` map
-    /// above knows only android-13+ sessions — an r34 session has no id
-    /// — so this is the list that can end them all. `Weak`, pruned on
-    /// push; an attach adds a slot to an inner already listed here.
+    /// Every minted session, r34 included, for `terminate`; `Weak`, pruned on push.
     live_sessions: Mutex<Vec<std::sync::Weak<RpcSessionInner>>>,
 }
 
+/// Clear `path` for a bind: only a socket that refuses connections is removed.
+fn remove_stale_socket(path: &Path) -> Result<()> {
+    use std::io::ErrorKind;
+    use std::os::unix::fs::FileTypeExt;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    if !meta.file_type().is_socket() {
+        log::error!(
+            "RpcServer::setup_unix_server: {path:?} exists and is not a socket; not removing it"
+        );
+        return Err(StatusCode::AlreadyExists);
+    }
+    match UnixStream::connect(path) {
+        Ok(_) => {
+            log::error!("RpcServer::setup_unix_server: another server is listening on {path:?}");
+            Err(StatusCode::from(rustix::io::Errno::ADDRINUSE))
+        }
+        Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
+            std::fs::remove_file(path).or_else(|e| match e.kind() {
+                ErrorKind::NotFound => Ok(()),
+                _ => Err(StatusCode::from(e)),
+            })
+        }
+        Err(e) => {
+            log::error!("RpcServer::setup_unix_server: cannot probe {path:?}: {e}");
+            Err(e.into())
+        }
+    }
+}
+
+/// The (device, inode) of the file at `path`, without following a symlink.
+fn socket_file_id(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path)
+        .ok()
+        .map(|meta| (meta.dev(), meta.ino()))
+}
+
 impl RpcServer {
-    /// Bind + listen on a Unix-domain socket path. A stale socket file
-    /// at `path` is removed first (best effort).
+    /// Bind + listen on a Unix-domain socket path.
+    ///
+    /// Something already at `path` is removed only when it is a **stale**
+    /// socket — a socket file nothing listens on, which a connect attempt
+    /// finds refused (`ECONNREFUSED`), as a crashed server leaves behind.
+    /// Anything else is left alone and refused:
+    ///
+    /// - a socket another server is listening on →
+    ///   `StatusCode::Errno(-EADDRINUSE)`, so a second instance cannot
+    ///   silently take over a running server's path;
+    /// - a file that is not a socket → [`StatusCode::AlreadyExists`].
+    ///
+    /// AOSP `RpcServer::setupUnixDomainServer` never removes anything and
+    /// fails on every existing path; the stale-socket case is kept so a
+    /// restart after a crash needs no manual cleanup.
+    ///
+    /// Dropping the server removes the socket file only while it is still
+    /// the one this server bound (same device and inode), so a server that
+    /// has since been replaced at the same path keeps its socket.
     pub fn setup_unix_server(path: impl Into<PathBuf>) -> Result<Arc<RpcServer>> {
         let path = path.into();
-        let _ = std::fs::remove_file(&path);
+        remove_stale_socket(&path)?;
         // `StatusCode: From<std::io::Error>` — `?` converts directly.
         let listener = UnixListener::bind(&path)?;
+        let file = socket_file_id(&path);
         let listener = ServerListener::Unix(listener);
         // Non-blocking accept so the loop can observe `shutdown`.
         listener.set_nonblocking(true)?;
-        Ok(Self::wrap(listener, BindAddress::Unix(path)))
+        Ok(Self::wrap(listener, BindAddress::Unix { path, file }))
     }
 
     /// Bind + listen on a Linux/Android abstract Unix-domain socket.
@@ -555,13 +517,9 @@ impl RpcServer {
         Ok(Self::wrap(listener, BindAddress::Vsock { cid, port }))
     }
 
-    /// Backend-agnostic `RpcServer` construction. All factories
-    /// (`setup_unix_server`, `setup_vsock_server`, and the TLS
-    /// factories) funnel through here so the field set stays in one
-    /// place.
+    /// Common constructor behind every `setup_*` factory, so the field set lives in one place.
     fn wrap(listener: ServerListener, bind: BindAddress) -> Arc<RpcServer> {
-        // Build the directory root once over the shared `named` map; later
-        // `add_service` inserts are seen through it with no rebuild.
+        // One directory root over the shared `named` map; `add_service` needs no rebuild.
         let named: Arc<Mutex<HashMap<String, SIBinder>>> = Arc::new(Mutex::new(HashMap::new()));
         let directory = Interface::as_binder(&Binder::new(ServiceDirectory {
             services: Arc::clone(&named),
@@ -656,9 +614,7 @@ impl RpcServer {
         Ok(server)
     }
 
-    /// Snapshot of the current TLS config (cloned `Arc`), or `None` for
-    /// a plain server. Called once per accepted connection so a worker
-    /// gets a stable `Arc<ServerConfig>` for its whole lifetime.
+    /// TLS config snapshot (`None` = plain), taken once per connection for the worker's lifetime.
     #[cfg(feature = "rpc-tls")]
     fn tls_snapshot(&self) -> Option<Arc<rustls::ServerConfig>> {
         self.tls_config.lock().expect("tls_config poisoned").clone()
@@ -692,10 +648,7 @@ impl RpcServer {
             .lock()
             .expect("named poisoned")
             .insert(name.to_string(), binder);
-        // Install the once-built directory as the root (idempotent; shares
-        // `named`, so the just-inserted entry is already visible through
-        // it). Reinstalling makes `add_service` win over any prior
-        // `set_root`.
+        // Reinstall the shared directory as root, so `add_service` wins over any prior `set_root`.
         *self.root.lock().expect("root poisoned") = Some(self.directory.clone());
         Ok(())
     }
@@ -716,7 +669,18 @@ impl RpcServer {
     ///    `ARpcSession_setMaxIncomingThreads` / rsbinder's client-side
     ///    incoming connections, on which this server *sends* — are
     ///    budgeted separately at `2 * n` per session; served slots do
-    ///    not count against that budget.
+    ///    not count against that budget. A callback slot has no read loop
+    ///    and lives until the whole session tears down (an outgoing attach
+    ///    is reclaimed by `remove_slot` on disconnect), so without that
+    ///    budget a peer holding the session id could grow the slot pool —
+    ///    and its held fds — without bound. AOSP opens symmetric incoming
+    ///    and outgoing connections, each bounded by the negotiated
+    ///    max-threads, so `2 * n` never refuses a well-behaved client. The
+    ///    budget is checked and the slot pushed under one `conn_state`
+    ///    lock, so concurrent attach workers cannot overshoot it. Likewise
+    ///    the `n` cap check, the anti-resurrection gate
+    ///    (`try_bump_live_conns`) and the slot push form one critical
+    ///    section, and only served slots count toward `n`.
     ///
     /// Distinct from [`set_max_connections`](RpcServer::set_max_connections),
     /// which caps *concurrent connection-worker threads*
@@ -787,9 +751,7 @@ impl RpcServer {
     /// refused: it is logged and the default is kept. Pass `None` to
     /// disable the deadline deliberately.
     pub fn set_handshake_timeout(&self, timeout: Option<std::time::Duration>) {
-        // Zero cannot fall back to `reject_zero_deadline`'s `None` here:
-        // this deadline's default is 10s, so `None` (unbounded) is just as
-        // wrong as zero. Keep the default instead.
+        // Zero keeps the 10s default: here `None` (unbounded) is as wrong as zero.
         let timeout = match timeout {
             Some(d) if d.is_zero() => {
                 log::error!(
@@ -905,10 +867,7 @@ impl RpcServer {
             );
     }
 
-    /// Reap finished worker handles and return the live (concurrent)
-    /// count. Shared by [`serve_connection`](RpcServer::serve_connection)
-    /// (bounds `workers` by concurrent, not cumulative, connections)
-    /// and the accept-loop admission gate.
+    /// Reap finished worker handles and return the live count, for the accept-loop admission gate.
     fn live_worker_count(&self) -> usize {
         let mut workers = self.workers.lock().expect("workers poisoned");
         workers.retain(|h| !h.is_finished());
@@ -927,9 +886,8 @@ impl RpcServer {
     ///
     /// rsbinder provides only the gate; the policy is the caller's
     /// closure, e.g.
-    /// `|p| p.uid() == Some(EXPECTED_UID)` or, with the
-    /// `rpc-macos-codesign` feature,
-    /// `matches!(p, PeerIdentity::CodeSigned(c) if c.team_id() == Some("TEAMID"))`.
+    /// `|p| p.uid() == Some(EXPECTED_UID)` or, over TLS,
+    /// `matches!(p, PeerIdentity::Certificate(c) if c.fingerprint() == &EXPECTED_SHA256)`.
     /// Backend-independent (unix/mem/tls/vsock). The hook must not
     /// block indefinitely: it runs on the connection's own worker
     /// thread — concurrently across connections, not serialized by the
@@ -966,10 +924,7 @@ impl RpcServer {
             .expect("attach_shutdown_probe poisoned") = Some(Arc::new(f));
     }
 
-    /// Run the `#[doc(hidden)]` attach-shutdown probe (no-op when
-    /// unset). Clones the `Arc<dyn Fn>` out of the mutex first so the
-    /// closure runs **lock-free** (the closure may re-enter `server`
-    /// without self-deadlock — same discipline as `authorizer`).
+    /// Run the attach-shutdown probe, if set, outside its lock so it may re-enter the server.
     fn run_attach_shutdown_probe(&self) {
         let probe = self
             .attach_shutdown_probe
@@ -995,9 +950,10 @@ impl RpcServer {
     /// this server offers (`0` = android-13, `1` = android-14/15,
     /// **`2` = android-16**); each accepted connection
     /// then runs the AOSP connection handshake and negotiates
-    /// `min(max_version, client_max)`. Default (unset) keeps the
-    /// android-12 r34 wire, byte-unchanged. Has effect only on a
-    /// transport with raw byte access (`unix`).
+    /// `min(max_version, client_max)`. Default (unset) speaks the
+    /// AOSP android-12 r34 wire. Has effect only on a
+    /// transport with raw byte access (every built-in backend but the
+    /// frame-only `mem`).
     ///
     /// **Sequencing:** advertising `2` is sound
     /// only because the Parcel binder/FD object-position producer
@@ -1009,26 +965,31 @@ impl RpcServer {
     /// no-object traffic is v1≡v2 byte-identical and safe at any
     /// version. Negotiating down to v0/v1 against an older peer stays
     /// correct (the codec is version-keyed).
+    ///
+    /// A `max_version` this build does not implement is logged at `error`
+    /// and clamped to the highest supported version, so a client offering
+    /// a version above it (e.g. `EXPERIMENTAL`) still negotiates instead of
+    /// failing before its session response.
     pub fn set_android13plus(&self, max_version: u32) {
+        let max_version = if super::wire_android13::is_supported_protocol_version(max_version) {
+            max_version
+        } else {
+            let max = super::wire_android13::SUPPORTED_MAX_VERSION;
+            log::error!("set_android13plus({max_version}): unsupported version, using {max}");
+            max
+        };
         *self
             .wire_max_version
             .lock()
             .expect("wire_max_version poisoned") = Some(max_version);
     }
 
-    /// Apply this server's shared root + negotiated max-threads + FD
-    /// policy to a freshly-built per-connection session (its `RpcState`
-    /// is fresh — isolated). Shared by the r34 and android-13+
-    /// connection paths.
+    /// Apply root, max threads, reply timeout and FD policy to a new r34 or android-13+ session.
     fn configure_session(&self, session: &RpcSession) {
-        // Bind the clone first: an `if let` scrutinee temporary lives for
-        // the whole body, which would hold the server's `root` lock while
-        // taking the session's.
+        // Clone first: an `if let` scrutinee would hold `root` while taking the session's lock.
         let root = self.root.lock().expect("root poisoned").clone();
         if let Some(root) = root {
-            // Unreachable: `set_root` / `add_service` already refused a remote
-            // root, so this can only fail on an invariant break. Logged, not
-            // panicked — we are on the accept loop.
+            // Unreachable (remote roots are refused at `set_root`); logged, not panicked.
             if let Err(e) = session.set_root(root) {
                 log::error!("RPC: server root rejected by the new session: {e:?}");
             }
@@ -1042,8 +1003,7 @@ impl RpcServer {
         }
     }
 
-    /// Build a per-connection r34 session sharing this server's root +
-    /// negotiated max-threads (its `RpcState` is fresh — isolated).
+    /// Build, configure and track a new r34 session with its own fresh `RpcState`.
     fn make_session(&self, transport: Box<dyn RpcTransport>) -> super::RpcResult<RpcSession> {
         // The server accepted this connection ⇒ Acceptor subspace.
         let session = RpcSession::new(transport, super::address::AddressSpace::Acceptor)?;
@@ -1052,25 +1012,14 @@ impl RpcServer {
         Ok(session)
     }
 
-    /// List a freshly minted session for [`terminate`](Self::terminate).
-    /// Both minting paths call this (r34 [`make_session`](Self::make_session),
-    /// android-13+ new session); an attach lands on an inner already
-    /// listed. The worker checks the terminate flag right after, so a
-    /// session minted as `terminate` runs is either in the list it takes
-    /// or ends itself.
+    /// List a minted session for `terminate`; the caller checks `minted_after_terminate` next.
     fn track_session(&self, inner: &Arc<RpcSessionInner>) {
         let mut live = self.live_sessions.lock().expect("live_sessions poisoned");
         live.retain(|w| w.strong_count() > 0);
         live.push(Arc::downgrade(inner));
     }
 
-    /// The worker's half of the [`terminate`](Self::terminate) handshake:
-    /// once listed, a session minted after the flag went up ends itself
-    /// instead of serving — `terminate` stored the flag *before* taking
-    /// the list, so a session it did not take always sees it here. Reads
-    /// `terminating`, not `shutdown`: the graceful
-    /// [`stop_accepting`](Self::stop_accepting) raises only the latter and
-    /// must leave a session that was just accepted serving.
+    /// Ends `session` once `terminating` is up; worker half of module doc "Termination".
     fn minted_after_terminate(&self, session: &RpcSession) -> bool {
         if self.terminating.load(Ordering::SeqCst) {
             log::debug!("RPC: connection accepted as the server was terminating; ending it");
@@ -1082,37 +1031,17 @@ impl RpcServer {
 
     // --- session-id → shared-session registry
 
-    /// Register a newly-minted session's founding `RpcSessionInner`
-    /// under its 32-byte id (new-session / empty-id accept path). Stored
-    /// as a `Weak` so the registry never keeps a session alive on its
-    /// own; the entry does outlive session death while any proxy still
-    /// pins the dead inner (proxies hold `Arc<RpcSessionInner>`), and an
-    /// id echoed onto such a session is rejected by the lifecycle —
-    /// `add_incoming_slot_capped`'s `try_bump_live_conns` refuses `Dying`/`Dead`
-    /// — not by a dangling `Weak`. The `Weak<RpcSessionInner>` (rather
-    /// than of `SharedSession`) is what lets the attach path add a slot
-    /// onto the founding inner directly.
+    /// Register a new session's founding inner as a `Weak`; see module doc "Session registry".
     fn register_session(&self, id: RpcSessionId, inner: &Arc<RpcSessionInner>) {
         let mut map = self.sessions.lock().expect("sessions poisoned");
-        // Opportunistically prune fully-dead sessions so the map is
-        // bounded by *live* sessions, not cumulative over the server's
-        // lifetime (random 32-byte ids never collide in practice, so a
-        // dead `Weak` would otherwise linger forever). Explicit
-        // `unregister_session` is unnecessary — the founding worker's
-        // exit is not the session's death (any *last* slot exit is), so
-        // prune-on-register suffices.
+        // Prune here to bound the map by live sessions; no single exit marks a session's death.
         map.retain(|_, w| w.strong_count() > 0);
         map.insert(id, Arc::downgrade(inner));
         drop(map);
         self.session_registered.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// Resolve a client-echoed id to a **live** founding inner
-    /// (id-demux, returning the `RpcSessionInner` so the attach path
-    /// can `add_incoming_slot_capped` on it directly). `None` for any
-    /// non-32-byte id (AOSP
-    /// `kSessionIdBytes == 32`), an unknown id, or a stale `Weak`
-    /// (session fully torn down) — all of which the caller rejects.
+    /// Echoed id → live founding inner; `None` for a non-32-byte, unknown or stale id.
     fn resolve_session(&self, id: &[u8]) -> Option<Arc<RpcSessionInner>> {
         let key = RpcSessionId::try_from_slice(id)?;
         self.sessions
@@ -1174,8 +1103,7 @@ impl RpcServer {
     /// or `Live(1) → Dying`) without a `sleep(N ms)`
     /// heuristic that races scheduler jitter.
     pub fn session_live_conns(&self, id: &[u8; 32]) -> Option<usize> {
-        // Public API keeps the raw-byte shape (internal-only newtype);
-        // wrap inline for the map lookup.
+        // The public API keeps raw bytes; the id newtype is internal-only.
         let key = RpcSessionId::new(*id);
         self.sessions
             .lock()
@@ -1211,7 +1139,7 @@ impl RpcServer {
     }
 
     /// Serve one already-connected transport on its own worker thread
-    /// (used by in-memory tests and by [`super::session`] direct calls).
+    /// (for transports the accept loop does not produce, e.g. in-memory tests).
     /// The accept loop uses the private `serve_connection_raw`
     /// to keep TLS handshake (if any) on the worker side.
     pub fn serve_connection(self: &Arc<Self>, transport: Box<dyn RpcTransport>) {
@@ -1228,41 +1156,23 @@ impl RpcServer {
             }
         };
         let mut workers = self.workers.lock().expect("workers poisoned");
-        // Reap finished handles so `workers` is bounded by *concurrent*
-        // (not cumulative) connections — same discipline as the accept
-        // loop's reaping.
+        // Reap finished handles so `workers` tracks concurrent, not cumulative, connections.
         workers.retain(|h| !h.is_finished());
         workers.push(handle);
     }
 
-    /// Accept loop entry point. Takes the raw
-    /// accepted stream (the kernel `accept(2)` result, before any
-    /// blocking I/O on the socket), spawns a worker thread, and wraps
-    /// the stream as `RpcTransport` *inside* that worker — so a
-    /// potentially-expensive TLS handshake never stalls the accept
-    /// loop. The handshake budget is bounded by
-    /// [`set_max_connections`](Self::set_max_connections) (the worker-
-    /// thread cap also bounds the in-flight handshake count). Plain
-    /// transports (UDS / vsock) skip the TLS branch and wrap natively.
+    /// Spawn a worker that wraps `raw` and serves it; see module doc "Accept and wrap".
     fn serve_connection_raw(self: &Arc<Self>, raw: RawAccepted) {
         let server = Arc::clone(self);
         let spawned = std::thread::Builder::new()
             .name("rpc-conn".into())
             .spawn(move || {
-                // Switch the accepted socket to blocking (+ TCP nodelay) on
-                // the worker so a per-connection setup failure drops just this
-                // connection, not the whole accept loop.
+                // Set up here: a failure drops only this connection, not the accept loop.
                 if let Err(e) = raw.prepare_for_worker() {
                     log::warn!("RPC: failed to prepare accepted stream, dropping: {e:?}");
                     return;
                 }
-                // Bound the pre-wrap handshake phase on the raw socket before
-                // any blocking I/O. The TLS handshake runs inside
-                // `wrap_accepted` (below), *before* `run_connection_in_worker`
-                // arms its deadline, so a silent peer would otherwise pin this
-                // worker — and, with `set_max_connections`, the accept loop —
-                // forever. `run_connection_in_worker` re-arms (idempotent) and
-                // clears it before the long-lived serve.
+                // The TLS handshake in `wrap_accepted` precedes the worker's own deadline.
                 let handshake_timeout = *server
                     .handshake_timeout
                     .lock()
@@ -1284,9 +1194,7 @@ impl RpcServer {
                 };
                 Self::run_connection_in_worker(server, transport);
             });
-        // Thread creation can fail on resource exhaustion (EAGAIN); dropping
-        // the connection is correct — the accept loop's EMFILE/ENOMEM back-off
-        // would be undone by a `spawn` panic here.
+        // Spawn can fail (EAGAIN): drop the connection rather than panic in the accept loop.
         let handle = match spawned {
             Ok(h) => h,
             Err(e) => {
@@ -1299,13 +1207,7 @@ impl RpcServer {
         workers.push(handle);
     }
 
-    /// Worker-thread helper that wraps a `RawAccepted` as
-    /// `Box<dyn RpcTransport>`. Two cfg variants so the function
-    /// signature stays uniform — the snapshot of `tls_config` happens
-    /// here (worker thread) rather than at accept time; that's safe
-    /// because `tls_config` is set only by the factories
-    /// (`setup_*_server_tls`) before the server is shared as `Arc`,
-    /// so it's effectively immutable from the accept loop's PoV.
+    /// Wrap on the worker with the TLS config snapshot; see module doc "Accept and wrap".
     #[cfg(feature = "rpc-tls")]
     fn wrap_accepted(&self, raw: RawAccepted) -> RpcResult<Box<dyn RpcTransport>> {
         raw.into_transport(self.tls_snapshot())
@@ -1315,32 +1217,17 @@ impl RpcServer {
         raw.into_transport()
     }
 
-    /// Transition a connection from the bounded handshake/admission phase
-    /// to the long-lived serving phase (best-effort), arming **both** the
-    /// read and write deadlines. By default both are lifted (`None`), so an
-    /// established two-way session may idle between requests unbounded —
-    /// byte-identical to a server with no idle deadline set. If
-    /// [`set_idle_timeout`](Self::set_idle_timeout) was called, the serve
-    /// loop inherits that value on each side, so a peer that completes the
-    /// handshake and then goes silent (or stops reading our replies) — a
-    /// post-handshake Slowloris that would otherwise pin a
-    /// [`set_max_connections`](Self::set_max_connections) admission slot
-    /// forever — surfaces as a serve-loop error and is evicted.
+    /// Swap the handshake deadline for the idle timeout (default none) on read and write.
     fn arm_serve_timeouts(&self, transport: &dyn RpcTransport) {
         let idle = *self.idle_timeout.lock().expect("idle_timeout poisoned");
         if let Err(e) = transport.set_read_timeout(idle) {
             log::debug!("RPC: failed to set serve-phase read timeout: {e:?}");
         }
-        // Mirror the deadline onto the write side so a peer that idles
-        // *and* stops reading can't pin the worker via a blocked reply
-        // send. `None` (the default) leaves writes unbounded; a
-        // configured idle timeout bounds both directions.
+        // Mirror onto writes: a peer that idles and stops reading can't pin us on a reply.
         self.arm_write_timeout(transport);
     }
 
-    /// The write half of [`arm_serve_timeouts`](Self::arm_serve_timeouts),
-    /// on its own for the callback-slot path, which arms the write
-    /// deadline but must leave the read side unbounded.
+    /// Write half of `arm_serve_timeouts`, for callback slots that must leave reads unbounded.
     fn arm_write_timeout(&self, transport: &dyn RpcTransport) {
         let idle = *self.idle_timeout.lock().expect("idle_timeout poisoned");
         if let Err(e) = transport.set_write_timeout(idle) {
@@ -1348,20 +1235,9 @@ impl RpcServer {
         }
     }
 
-    /// Runs **inside** the worker thread after the transport has been
-    /// wrapped (native or TLS). Performs authorization, then dispatches
-    /// to the r34 / android-13+ branch and serves the session inline
-    /// (no nested spawn — we're already on the worker thread).
+    /// Worker body after the wrap: authorize, then serve the r34 or android-13+ path inline.
     fn run_connection_in_worker(server: Arc<Self>, transport: Box<dyn RpcTransport>) {
-        // Authorization gate. The single
-        // chokepoint common to r34, android-13+, AND in-memory test
-        // direct calls — *before* the wire-profile branch, session
-        // build, handshake, or any `recv_frame`, so a rejected peer
-        // gets zero RPC bytes. Default (unset) ⇒ no-op, byte-identical
-        // (additive). On a TLS server the peer identity is
-        // already final here (the TLS handshake completed in
-        // `into_transport`, so `transport.peer_identity()` returns the
-        // post-handshake `Certificate` or `Anonymous`).
+        // Authorization gate (`authorizer` field doc); a TLS peer identity is already final.
         let authorizer = server
             .authorizer
             .lock()
@@ -1374,12 +1250,7 @@ impl RpcServer {
                 return;
             }
         }
-        // Bound the pre-serve handshake/first-contact phase so a
-        // connected-but-silent peer can't pin its `Arc<RpcServer>` +
-        // admission slot forever. Transitioned to the serve-phase deadline
-        // by `arm_serve_timeouts` before any long-lived serve (`None`
-        // ⇒ idle unbounded, or the configured `set_idle_timeout`).
-        // Best-effort: a set failure just means no deadline.
+        // Bound the handshake phase; `arm_serve_timeouts` swaps in the serve deadline later.
         let handshake_timeout = *server
             .handshake_timeout
             .lock()
@@ -1398,48 +1269,25 @@ impl RpcServer {
             .expect("wire_max_version poisoned");
         match a13_max {
             Some(max) => {
-                // android-13+: the AOSP connection handshake is
-                // blocking I/O on the accepted socket. We're already in
-                // the worker — handshake/serve inline (no nested spawn).
-                // The AOSP handshake reads the
-                // client's `RpcConnectionHeader.fileDescriptorTransport
-                // Mode`; honor `Unix` only if this server opted in
-                // (`set_supported_fd_modes`) — else degrade to `None`
-                // (the fd write then `BAD_TYPE`-rejects). `false` keeps
-                // the byte-identical no-FD android-13+ path.
+                // A client's `Unix` fd mode is honored only if `set_supported_fd_modes` opted in.
                 let fd_unix = server.fd_unix_supported.load(Ordering::SeqCst);
-                // Split handshake from build so we can branch on
-                // the client-supplied session id (new vs attach vs
-                // reject) and direction (outgoing vs incoming).
+                // Handshake apart from build: branch on the client's session id and direction.
                 let (transport, codec, client_fd_mode, client_id, incoming) =
                     match RpcSession::android13plus_accept_handshake(transport, max) {
                         Ok(parts) => parts,
                         Err(e) => {
-                            // Abnormal interop/security event
-                            // (version mismatch, truncated header,
-                            // hostile peer) — `warn!` not `debug!`.
-                            // `{e}` not `{e:?}`: the `RpcError` Display
-                            // carries the wire-level reason, which is
-                            // what names a profile mismatch.
+                            // Interop failure: `warn!`; `{e}` names a profile mismatch.
                             log::warn!("android-13+ RPC handshake failed: {e}");
                             return;
                         }
                     };
                 if incoming {
-                    // Attach + incoming: resolve the session, register a
-                    // callback slot, exit the worker (never served here).
-                    // A callback slot has no serve loop — a sticky
-                    // `SO_RCVTIMEO` here would cut short this server's own
-                    // reply wait, so only the write half is armed (see
-                    // `set_idle_timeout` / `set_reply_timeout`).
+                    // Callback slot: no serve loop, so only the write deadline is armed.
                     if let Err(e) = transport.set_read_timeout(None) {
                         log::debug!("RPC: failed to clear callback-slot read timeout: {e:?}");
                     }
                     server.arm_write_timeout(transport.as_ref());
-                    // The slot lives in the pool for server→client
-                    // sends; there is no read loop because
-                    // client→server traffic only uses outgoing
-                    // connections (per AOSP `RpcSession::mConnections.mOutgoing`).
+                    // No read loop: clients call only on outgoing conns (AOSP `mOutgoing`).
                     match server.resolve_session(&client_id) {
                         Some(inner) => {
                             if inner.wire_protocol_version() != Some(codec.version()) {
@@ -1453,9 +1301,7 @@ impl RpcServer {
                                 drop(transport);
                                 return;
                             }
-                            // Shutdown-reject e2e scaffolding (see
-                            // `__set_attach_shutdown_probe`). No-op
-                            // unless a test installed a barrier.
+                            // Test barrier (`__set_attach_shutdown_probe`); no-op unless set.
                             server.run_attach_shutdown_probe();
                             if server.shutdown.load(Ordering::SeqCst) {
                                 server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
@@ -1466,25 +1312,7 @@ impl RpcServer {
                                 drop(transport);
                                 return;
                             }
-                            // Bound callback (incoming) slots. Unlike outgoing
-                            // attaches — which carry a serve loop and are
-                            // reclaimed by `remove_slot` on disconnect — a
-                            // callback slot has no read loop and lives until
-                            // the whole session tears down, so without a cap a
-                            // peer holding the session id could grow the slot
-                            // pool (and its held fds) without bound. AOSP opens
-                            // symmetric incoming+outgoing connections (each
-                            // bounded by the negotiated max-threads), so cap the
-                            // callback slots at `2 * max_threads` (served slots
-                            // are not counted) — tight enough to bound the DoS,
-                            // loose enough never to refuse a well-behaved
-                            // client's callback connections.
-                            //
-                            // The cap is enforced atomically inside
-                            // `add_callback_slot` (check-and-push under the
-                            // `conn_state` lock) rather than via a separate
-                            // pre-check, so concurrent attach workers cannot
-                            // each clear an advisory check and overshoot it.
+                            // Cap `2 * max_threads`, checked atomically (`set_max_threads`).
                             let incoming_cap =
                                 (inner.max_threads_value() as usize).saturating_mul(2);
                             let session = RpcSession::wrap_inner(inner);
@@ -1510,16 +1338,10 @@ impl RpcServer {
                     }
                     return;
                 }
-                // Handshake done: transition the admission deadline to the
-                // serve-phase deadline — `None` (default, unbounded idle) or
-                // the configured `set_idle_timeout` so a post-handshake
-                // silent peer is evicted instead of pinning its slot.
+                // Handshake done: swap the admission deadline for the serve-phase one.
                 server.arm_serve_timeouts(transport.as_ref());
                 if client_id.is_empty() {
-                    // New session: mint, register, serve. Registry
-                    // entry is `Weak`; reclaimed by the next
-                    // `register_session` prune when the founding
-                    // `Arc<RpcSessionInner>` is dropped.
+                    // New session: mint, register (a `Weak`, pruned on a later register), serve.
                     let session = match RpcSession::from_android13plus(
                         transport,
                         codec,
@@ -1539,23 +1361,13 @@ impl RpcServer {
                         return;
                     }
                     server.configure_session(&session);
-                    // Baseline `arm_serve_timeouts` just armed on this
-                    // connection: a callback's reply deadline must be
-                    // *restored* to it, not cleared, or the first nested
-                    // callback silently disables idle eviction here.
-                    // Bind the value first, as `configure_session` does: an
-                    // argument temporary lives to the end of the statement,
-                    // which would hold the server's lock while taking the
-                    // session's.
+                    // Bind first: a temporary would hold our lock while taking the session's.
                     let idle = *server.idle_timeout.lock().expect("idle_timeout poisoned");
+                    // Callback reply deadlines restore to this, else idle eviction would end.
                     session.set_serve_read_deadline(idle);
                     session.serve_blocking().log("RPC session ended");
                 } else if let Some(inner) = server.resolve_session(&client_id) {
-                    // Attach: add a slot on the founding inner so
-                    // proxy-cache + slot-pool stay unified (no
-                    // cross-slot aliasing). Reject on profile
-                    // mismatch — codec version is immutable for
-                    // the session.
+                    // Attach onto the founding inner; its codec version is fixed for the session.
                     if inner.wire_protocol_version() != Some(codec.version()) {
                         server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
                         log::warn!(
@@ -1567,44 +1379,21 @@ impl RpcServer {
                         drop(transport);
                         return;
                     }
-                    // Shutdown-reject e2e scaffolding
-                    // (see `__set_attach_shutdown_probe`). No-op
-                    // unless a test installed a barrier; the
-                    // production race window sits exactly between
-                    // this point and the `load` below.
+                    // Test barrier; the race window runs from here to the `load` below.
                     server.run_attach_shutdown_probe();
-                    // Shutdown gate: refuse attaches
-                    // once the server is shutting down (clean
-                    // teardown semantics — a late-arriving
-                    // id-echoing client must not be allowed to
-                    // hook onto a session whose worker pool is
-                    // already winding down).
+                    // Refuse attaches once shutting down; the worker pool is winding down.
                     if server.shutdown.load(Ordering::SeqCst) {
                         server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
                         log::warn!("android-13+ RPC: attach after server shutdown; rejecting");
                         drop(transport);
                         return;
                     }
-                    // AOSP-faithful `setMaxIncomingThreads` cap; see
-                    // `RpcServer::set_max_threads` rustdoc for the
-                    // advertise vs. slot-cap split. The cap check, the
-                    // anti-resurrection gate (`try_bump_live_conns`) and
-                    // the slot push are one critical section, so N
-                    // concurrent attach workers cannot each pass a
-                    // pre-check and overshoot the cap — and only
-                    // serve-driven slots count, not the callback
-                    // connections this client opened toward us.
+                    // Cap, live-conn bump and push are one critical section (`set_max_threads`).
                     let cap = inner.max_threads_value() as usize;
                     let session = RpcSession::wrap_inner(inner);
-                    // Record what `arm_serve_timeouts` just armed, as the
-                    // founding connection does: the baseline is what a reply
-                    // deadline is restored to, and what says whether a
-                    // `TimedOut` between frames is our own idle eviction.
-                    // It is one cell per session — see `set_idle_timeout`
-                    // on why the value must not change while one is live.
-                    // Bound first so the server's lock is not held while the
-                    // session's is taken (see `configure_session`).
+                    // Bind first, as `configure_session` does: no server lock under the session's.
                     let idle = *server.idle_timeout.lock().expect("idle_timeout poisoned");
+                    // Baseline for reply-deadline restore and for telling our own idle eviction.
                     session.set_serve_read_deadline(idle);
                     let slot_id = match session.add_incoming_slot_capped(transport, cap) {
                         Ok(id) => id,
@@ -1628,14 +1417,12 @@ impl RpcServer {
                             server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
                             log::warn!(
                                 "android-13+ RPC: session torn down between \
-                                 resolve and attach (F4 race); rejecting: {e:?}"
+                                 resolve and attach; rejecting: {e:?}"
                             );
                             return;
                         }
                     };
-                    // Bump *after* `add_incoming_slot_capped` succeeded
-                    // so external observers never see a count for
-                    // a slot that never reached the pool.
+                    // Bump only once the slot reached the pool.
                     server.attached_count.fetch_add(1, Ordering::SeqCst);
                     session
                         .serve_blocking_on(slot_id)
@@ -1650,11 +1437,7 @@ impl RpcServer {
                 }
             }
             None => {
-                // r34 (default): build session (incl. its handshake-
-                // free first-contact shape) + serve inline. We're
-                // already on the worker thread — no nested spawn.
-                // r34 writes nothing before its first frame: lift the handshake write deadline now, or
-                // `SO_SNDTIMEO` outlives the handshake (the serve loop clears only the read side).
+                // The serve loop lifts only the read deadline; r34 writes nothing before frame 1.
                 if let Err(e) = transport.set_write_timeout(None) {
                     log::debug!("RPC r34: failed to lift handshake write deadline: {e:?}");
                 }
@@ -1669,10 +1452,7 @@ impl RpcServer {
                     return;
                 }
                 session
-                    // Pass the deadline this worker actually armed above:
-                    // with `set_handshake_timeout(None)` the first frame is
-                    // waited for with none, and a `TimedOut` there is the
-                    // kernel's `ETIMEDOUT`, not an idle eviction of ours.
+                    // No deadline armed ⇒ a first-frame `TimedOut` is the kernel's, not ours.
                     .serve_blocking_clearing_admission_deadline(handshake_timeout.is_some())
                     .log("RPC session ended");
             }
@@ -1681,22 +1461,30 @@ impl RpcServer {
 
     /// Run the accept loop until [`RpcServer::stop_accepting`]. Each accepted
     /// connection gets its own session + worker thread.
+    ///
+    /// With [`set_max_connections`](Self::set_max_connections) at capacity the
+    /// loop does not accept: pending clients wait in the kernel listen
+    /// backlog and `shutdown` is still re-checked every tick. The cap is
+    /// copied out before the worker count and the sleep, so a
+    /// `set_max_connections` caller never waits on the poll interval.
+    ///
+    /// Accept errors: a reset between SYN and `accept` (`ECONNABORTED`,
+    /// `ECONNRESET`), `EINTR`, and the pending network errors `accept(2)`
+    /// documents as retry-like (`EPROTO`, `ENETDOWN`, `ENETUNREACH`,
+    /// `EHOSTUNREACH`, `ETIMEDOUT`) are logged and skipped. Resource
+    /// exhaustion (`EMFILE`/`ENFILE`/`ENOMEM`/`ENOBUFS`; a peer that churns
+    /// connections can drive the process to `RLIMIT_NOFILE`) maps to
+    /// `ErrorKind::Uncategorized`/`OutOfMemory`, so it has its own arm: it
+    /// heals as in-flight sessions close their fds, and the loop backs off
+    /// longer than for `EINTR` and keeps serving rather than turn an
+    /// overload into a permanent outage. Any other error (e.g. the listener
+    /// was closed) ends the loop with `Err`, logged at `error`.
     pub fn run(self: &Arc<Self>) -> Result<()> {
         loop {
             if self.shutdown.load(Ordering::SeqCst) {
                 break;
             }
-            // Admission bound (opt-in; `None` ⇒ skip entirely, bit-
-            // identical to an unbounded server). At capacity we simply don't
-            // accept this iteration: pending clients wait in the kernel
-            // listen backlog (reactor-free backpressure, no client
-            // dropped). `continue` re-checks `shutdown` every tick, so
-            // a full server still shuts down promptly. `live_worker_
-            // count()` reaps finished handles, so a freed slot is
-            // observed here.
-            // Copy the cap and drop the guard before `live_worker_count()`
-            // (which locks `workers`) and the sleep, so a `set_max_connections`
-            // caller is never blocked behind the accept loop's poll interval.
+            // Cap copied out (guard dropped before sleep); at capacity clients wait in the backlog.
             let max_connections = *self
                 .max_connections
                 .lock()
@@ -1709,16 +1497,11 @@ impl RpcServer {
             }
             match self.listener.accept_raw() {
                 Ok(raw) => {
-                    // `accept_raw` returns the raw stream without
-                    // wrapping; `serve_connection_raw` spawns the
-                    // worker and wraps the stream (native or TLS)
-                    // *inside* the worker — so TLS handshake never
-                    // stalls the accept loop.
+                    // The worker wraps (TLS handshake included), never this loop.
                     self.serve_connection_raw(raw);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // Listener is non-blocking only so we can poll
-                    // `shutdown`; no pending connection.
+                    // Non-blocking only to poll `shutdown`; nothing pending.
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
                 Err(e)
@@ -1737,12 +1520,7 @@ impl RpcServer {
                                 || code == libc::ETIMEDOUT
                     ) =>
                 {
-                    // Transient: peer reset between SYN and accept()
-                    // (ECONNABORTED/ECONNRESET), EINTR, or a pending network
-                    // error that `accept(2)` documents as retry-like (EPROTO /
-                    // ENETDOWN / ENETUNREACH / EHOSTUNREACH / ETIMEDOUT). A
-                    // normal accept loop continues past these — they must NOT
-                    // take the whole server down for all future clients.
+                    // Transient per `accept(2)`: continue; these must not end the server.
                     log::warn!("transient accept error, continuing: {e}");
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
@@ -1756,27 +1534,12 @@ impl RpcServer {
                                 || code == libc::ENOBUFS
                     ) =>
                 {
-                    // Resource exhaustion: the process or system fd table
-                    // is full (EMFILE/ENFILE) or the kernel is out of
-                    // memory/buffers (ENOMEM/ENOBUFS). A peer that churns
-                    // connections can drive us to RLIMIT_NOFILE, at which
-                    // point `accept` returns EMFILE. These map to
-                    // `ErrorKind::Uncategorized`/`OutOfMemory`, so without
-                    // this arm they fall through to the fatal branch and
-                    // kill the listener for ALL future clients — turning a
-                    // transient overload into a permanent outage. The
-                    // condition is self-healing as in-flight sessions close
-                    // their fds, so back off (longer than the EINTR case to
-                    // give descriptors time to free) and keep serving.
+                    // Exhaustion heals as sessions close: back off, don't end the server.
                     log::warn!("accept resource exhaustion, backing off: {e}");
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 Err(e) => {
-                    // Fatal (e.g. the listener was closed): surface it.
-                    // Never disguise a hard failure as `Ok(())`, which
-                    // would make `run_background` silently dead. Logged at
-                    // `error` because this terminates the whole accept loop —
-                    // higher severity than the transient (`warn`) arms above.
+                    // Fatal: surface it, or `run_background` dies silently.
                     log::error!("accept loop ending (fatal): {e}");
                     return Err(e.into());
                 }
@@ -1789,8 +1552,7 @@ impl RpcServer {
     pub fn run_background(self: &Arc<Self>) -> JoinHandle<()> {
         let me = Arc::clone(self);
         std::thread::spawn(move || {
-            // Surface a fatal accept-loop error instead of silently discarding
-            // it — otherwise the background server dies with no trace.
+            // Log a fatal accept-loop error; otherwise the server dies with no trace.
             if let Err(e) = me.run() {
                 log::error!("RPC accept loop terminated with error: {e:?}");
             }
@@ -1856,10 +1618,7 @@ impl RpcServer {
     /// until then it is bounded only by
     /// [`set_handshake_timeout`](Self::set_handshake_timeout).
     pub fn terminate(&self) {
-        // `terminating` before the `live_sessions` take below: that is the
-        // whole handshake with `minted_after_terminate`. The order against
-        // `shutdown` carries no invariant — two independent stores are not
-        // an atomic pair, and a worker may see either without the other.
+        // `terminating` before the `live_sessions` take (field doc); no order vs `shutdown`.
         self.terminating.store(true, Ordering::SeqCst);
         self.shutdown.store(true, Ordering::SeqCst);
         loop {
@@ -1903,9 +1662,7 @@ impl RpcServer {
         Self::join_handles(handles);
     }
 
-    /// Join `handles`, skipping the calling thread's own — a handler that
-    /// ends its server would otherwise deadlock on itself; that worker
-    /// exits when the handler returns, and dropping the handle detaches it.
+    /// Join `handles` except the caller's own: a handler ending its server must not self-join.
     fn join_handles(handles: Vec<JoinHandle<()>>) {
         let me = std::thread::current().id();
         for h in handles {
@@ -1926,7 +1683,7 @@ impl RpcServer {
     /// to expose.
     pub fn path(&self) -> Option<&Path> {
         match &self.bind {
-            BindAddress::Unix(p) => Some(p.as_path()),
+            BindAddress::Unix { path, .. } => Some(path.as_path()),
             #[cfg(any(target_os = "linux", target_os = "android"))]
             BindAddress::UnixAbstract => None,
             #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
@@ -1943,7 +1700,7 @@ impl RpcServer {
     pub fn vsock_address(&self) -> Option<(u32, u32)> {
         match &self.bind {
             BindAddress::Vsock { cid, port } => Some((*cid, *port)),
-            BindAddress::Unix(_) => None,
+            BindAddress::Unix { .. } => None,
             BindAddress::UnixAbstract => None,
             #[cfg(feature = "rpc-tls")]
             BindAddress::Tcp(_) => None,
@@ -1958,7 +1715,7 @@ impl RpcServer {
     pub fn tcp_address(&self) -> Option<SocketAddr> {
         match &self.bind {
             BindAddress::Tcp(addr) => Some(*addr),
-            BindAddress::Unix(_) => None,
+            BindAddress::Unix { .. } => None,
             #[cfg(any(target_os = "linux", target_os = "android"))]
             BindAddress::UnixAbstract => None,
             #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
@@ -2004,24 +1761,21 @@ impl Drop for RpcServer {
         self.shutdown.store(true, Ordering::SeqCst);
         // Best-effort backend-specific cleanup; never panic in Drop.
         match &self.bind {
-            BindAddress::Unix(p) => {
-                // Remove the UDS file so a follow-up `setup_unix_server`
-                // on the same path doesn't see a stale ENOENT/EADDRINUSE.
-                let _ = std::fs::remove_file(p);
+            BindAddress::Unix { path, file } => {
+                // Only our own socket: another server may have bound this path since.
+                if file.is_some() && socket_file_id(path) == *file {
+                    let _ = std::fs::remove_file(path);
+                }
             }
             #[cfg(any(target_os = "linux", target_os = "android"))]
             BindAddress::UnixAbstract => {}
             #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
             BindAddress::Vsock { .. } => {
-                // vsock has no filesystem entry; the kernel reclaims the
-                // (cid, port) when the listener fd is closed (the
-                // listener is owned by `self.listener` so Drop closes it
-                // for us — no explicit step needed).
+                // No filesystem entry; closing the listener fd releases the (cid, port).
             }
             #[cfg(feature = "rpc-tls")]
             BindAddress::Tcp(_) => {
-                // TCP has no filesystem entry; the kernel reclaims the
-                // bound port when the listener fd is closed.
+                // No filesystem entry; closing the listener fd releases the port.
             }
         }
     }

@@ -9,9 +9,7 @@ use rsbinder_aidl::error::SemanticError;
 use rsbinder_aidl::{parse_document, AidlError, Generator, SourceContext};
 use std::path::PathBuf;
 
-/// A per-test directory under the target dir: the name keeps tests in this
-/// binary from deleting each other's fixtures mid-generation, and the target
-/// dir keeps them out of the machine-wide `std::env::temp_dir()`.
+/// Per-test dir under the target dir: tests cannot clobber each other or the system temp dir.
 fn scratch_dir(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
     let _ = std::fs::remove_dir_all(&dir);
@@ -311,8 +309,7 @@ fn test_parse_error_blocks_semantic_analysis() {
     )
     .unwrap();
 
-    // B.aidl: syntactically valid, imports and uses A's type.
-    // Without cascading prevention this would also fail with UnknownType at generation.
+    // B.aidl: valid, uses A's type; cascading prevention must suppress its UnknownType.
     std::fs::write(
         pkg.join("B.aidl"),
         "package test;\nimport test.A;\nparcelable B {\n    A item;\n}",
@@ -329,9 +326,7 @@ fn test_parse_error_blocks_semantic_analysis() {
     assert!(result.is_err(), "Expected parse error from A.aidl");
     let err = result.unwrap_err();
 
-    // Cascading prevention: only A's ParseError may be reported. B's
-    // generation-phase `UnknownType` is a `ResolutionError`, so matching on
-    // `AidlError::Semantic` alone would never observe it.
+    // Only A's ParseError: B's `UnknownType` is a `ResolutionError`, not `AidlError::Semantic`.
     let reported: Vec<&AidlError> = match &err {
         AidlError::Multiple { errors } => errors.iter().collect(),
         single => vec![single],
@@ -422,8 +417,7 @@ fn test_inout_string_span_points_to_inout_keyword() {
 
 // ── @Backing(type=...) validation (AOSP allowlist: byte/int/long) ────────────
 
-/// Helper: assert that `input` produces an InvalidBackingType diagnostic whose
-/// label points exactly at the supplied `expected_annotation` source text.
+/// Asserts an InvalidBackingType diagnostic labelled exactly at `expected_annotation`.
 fn assert_invalid_backing_type(input: &str, expected_type_name: &str, expected_annotation: &str) {
     let err = expect_generation_error(input, "test.aidl");
     let AidlError::Semantic(se) = &err else {
@@ -496,11 +490,8 @@ fn test_invalid_backing_type_char_rejected() {
 }
 
 #[test]
-fn test_invalid_backing_type_list_replaces_old_invalid_operation() {
-    // Prior behaviour: List backing hit TypeGenerator's "List must have
-    // Generic Type" arm and surfaced as InvalidOperation. The dedicated
-    // InvalidBackingType validation runs first, so List is now reported
-    // with the AOSP-faithful diagnostic instead.
+fn test_list_backing_type_is_an_invalid_backing_type_error() {
+    // Backing validation runs before TypeGenerator, so List is InvalidBackingType (AOSP).
     assert_invalid_backing_type(
         "package foo;\n@Backing(type=\"List\")\nenum MyEnum { V1 = 1 }",
         "List",
@@ -526,10 +517,56 @@ fn test_valid_backing_types_generate_successfully() {
 
 #[test]
 fn test_no_backing_annotation_defaults_to_byte() {
-    // The implicit-byte default must not regress into the new validator.
+    // The implicit byte backing passes @Backing validation.
     let input = "package foo;\nenum MyEnum { V1 = 1 }";
     let ctx = SourceContext::new("test.aidl", input);
     let doc = parse_document(&ctx).expect("parse");
     let gen = Generator::new(false, false);
-    assert!(gen.document(&doc).is_ok());
+    let (_, out) = gen.document(&doc).expect("generate");
+    assert!(out.contains("r#MyEnum : [i8; 1]"), "{out}");
+}
+
+/// AOSP schema `{"type", kStringType, required}`: no `type` is an error, not a byte default.
+#[test]
+fn test_backing_without_type_is_rejected() {
+    for input in [
+        "package foo;\n@Backing(\"long\")\nenum MyEnum { V1 = 1 }",
+        "package foo;\n@Backing(typ=\"long\")\nenum MyEnum { V1 = 1 }",
+        "package foo;\n@Backing\nenum MyEnum { V1 = 1 }",
+    ] {
+        let ctx = SourceContext::new("test.aidl", input);
+        let doc = parse_document(&ctx).expect("parse");
+        assert!(
+            Generator::new(false, false).document(&doc).is_err(),
+            "{input}"
+        );
+    }
+}
+
+/// AOSP `AidlTypenames` "redefinition"; accepting it would emit `pub mod A` twice (E0428).
+#[test]
+fn test_same_type_in_two_files_is_a_redefinition() {
+    let tmp = scratch_dir("redefinition");
+    let first = tmp.join("first");
+    let second = tmp.join("second");
+    for dir in [&first, &second] {
+        std::fs::create_dir_all(dir.join("test")).unwrap();
+        std::fs::write(
+            dir.join("test/A.aidl"),
+            "package test;\nparcelable A { int x; }",
+        )
+        .unwrap();
+    }
+
+    let err = rsbinder_aidl::Builder::new()
+        .source(first.join("test/A.aidl"))
+        .source(second.join("test/A.aidl"))
+        .output(&tmp)
+        .generate()
+        .expect_err("the second declaration of test.A must be refused");
+    let message = err.to_string();
+    assert!(
+        message.contains("'test.A'") && message.contains("first") && message.contains("second"),
+        "got: {message}"
+    );
 }

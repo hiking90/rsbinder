@@ -22,6 +22,77 @@
 //! This module provides helper types and functions for implementing binder services
 //! on the server side, including the `Binder` wrapper for native service objects
 //! and transaction handling utilities.
+//!
+//! # Local-binder cast soundness
+//!
+//! `Binder::<B>::try_from(SIBinder)` recovers the local binder behind a
+//! type-erased handle (the Rust counterpart of C++ `IBinder::localBinder`) by
+//! reinterpreting the trait-object `Arc`'s data pointer as `Inner<B>`. The
+//! cast is layout-correct only because of three facts:
+//!
+//! - `as_any().downcast_ref::<Inner<B>>()` succeeds. On its own this proves
+//!   only that `as_any()` returns *an* `Inner<B>`: an external `IBinder` impl
+//!   that delegates `as_any()` and `descriptor()` to a wrapped inner object
+//!   passes it while its `Arc` points at the wrapper allocation.
+//! - `as_any()` returned the `Arc`'s own data pointer. Without this check the
+//!   reinterpret, and the refcount operations on it, would be UB; a mismatch
+//!   fails the cast with `BadValue`.
+//! - `Inner<T>` is crate-private and never embedded by value in another type,
+//!   so an `Inner<B>` at an `Arc`'s data address is that `Arc`'s own pointee.
+//!   A wrapper with an `Inner<B>` first field could otherwise pass both checks.
+//!
+//! Refcount: cloning the trait-object `Arc` and consuming it with
+//! `Arc::into_raw` leaks one strong reference; `Arc::from_raw` on the cast
+//! pointer reclaims it as `Arc<Inner<B>>`, so the total strong count is
+//! conserved once `ibinder` drops.
+//!
+//! # Flat-binder flags
+//!
+//! `BinderFeatures::flat_flags` encodes the `flat_binder_object.flags` word.
+//! `FLAT_BINDER_FLAG_ACCEPTS_FDS` is always set: rsbinder accepts file
+//! descriptors unconditionally in its native binder protocol. Bit layout
+//! (cross-checked against `kernel/include/uapi/linux/android/binder.h`):
+//!
+//! ```text
+//! bit 0-7   (0xff):   FLAT_BINDER_FLAG_PRIORITY_MASK
+//! bit 8     (0x100):  FLAT_BINDER_FLAG_ACCEPTS_FDS
+//! bit 9-10  (0x600):  scheduler policy (SHIFT = 9, VALUE_MASK = 0x3)
+//! bit 11    (0x800):  FLAT_BINDER_FLAG_INHERIT_RT
+//! bit 12    (0x1000): FLAT_BINDER_FLAG_TXN_SECURITY_CTX
+//! ```
+//!
+//! An out-of-range `min_priority` is masked to the low byte and
+//! `min_sched_policy` to two bits, so neither bleeds into the adjacent
+//! scheduler-policy or `INHERIT_RT` field and changes the scheduler class of
+//! every transaction.
+//!
+//! # Runtime stability
+//!
+//! `Inner` stores its `Stability` as an `AtomicU8` tag (`STABILITY_TAG_*`),
+//! so the runtime setters (`mark_vintf`, `force_downgrade_to_system_stability`,
+//! `force_downgrade_to_vendor_stability`) mutate it without a lock while the
+//! `flat_binder_object` emit path reads it. `Relaxed` is enough for the tag:
+//! the `parceled` flag (Acquire/Release) provides the only happens-before the
+//! setters depend on.
+//!
+//! `parceled` is AOSP `BBinder::mParceled`. It becomes `true` the first time
+//! the binder is written to a parcel; after that the setters refuse with
+//! `InvalidOperation`. AOSP aborts at the same point via
+//! `LOG_ALWAYS_FATAL_IF(mParceled, ...)`
+//! ([`Binder.cpp:579,606,659,678,713`](https://cs.android.com/android/platform/superproject/+/android-16.0.0_r4:frameworks/native/libs/binder/Binder.cpp;l=579));
+//! rsbinder returns an error so the refusal composes with the `Result`-based
+//! AIDL surface.
+//!
+//! # Attached objects
+//!
+//! AOSP `BBinder::Extras::mObjectMgr` (Binder.cpp:523) keys attachments by
+//! `const void*` identity; rsbinder keys them by `TypeId`, which avoids the
+//! provenance / ABA hazard of raw-pointer identity. Trade-off: one attached
+//! object per Rust type per binder; callers that need several objects of one
+//! concrete type wrap them in distinct newtypes. The map starts empty (no
+//! allocation until the first `attach_object`), so the per-binder cost is the
+//! unlocked `Mutex` header plus an empty `HashMap` header (~56 bytes on
+//! 64-bit).
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
@@ -82,9 +153,9 @@ pub struct BinderFeatures {
     /// transaction's worker thread to the requested floor before
     /// running the handler.
     ///
-    /// Default: `None` (kernel keeps the caller's policy). Setting this
-    /// without `inherit_rt = true` on a real-time policy is undefined —
-    /// see [`Self::inherit_rt`] for the canonical RT escalation gate.
+    /// Default: `None` (kernel keeps the caller's policy). Acts as a
+    /// floor: the driver applies it after [`Self::inherit_rt`] has
+    /// decided whether an RT caller keeps its policy.
     pub min_sched_policy: Option<i32>,
 
     /// Minimum priority within the policy declared
@@ -107,28 +178,14 @@ pub struct BinderFeatures {
     /// transaction duration. Required for audio/camera HAL latency
     /// guarantees.
     ///
-    /// Default: `false`. The setting only takes effect if `min_sched_policy`
-    /// declares an RT policy, otherwise the kernel falls back to the
-    /// caller's normal policy.
+    /// Default: `false`. Independent of `min_sched_policy`: without it the
+    /// driver demotes an RT caller to `SCHED_NORMAL` before applying the
+    /// node's minimum (`binder.c::binder_transaction_priority`).
     pub inherit_rt: bool,
 }
 
 impl BinderFeatures {
-    /// Encode this feature set into the `flat_binder_object.flags`
-    /// bitfield. `FLAT_BINDER_FLAG_ACCEPTS_FDS` is always set —
-    /// rsbinder unconditionally accepts file descriptors in its
-    /// native binder protocol implementation.
-    ///
-    /// Bit layout (cross-checked against
-    /// `kernel/include/uapi/linux/android/binder.h`):
-    ///
-    /// ```text
-    /// bit 0-7   (0xff):   FLAT_BINDER_FLAG_PRIORITY_MASK
-    /// bit 8     (0x100):  FLAT_BINDER_FLAG_ACCEPTS_FDS
-    /// bit 9-10  (0x600):  scheduler policy (SHIFT = 9, VALUE_MASK = 0x3)
-    /// bit 11    (0x800):  FLAT_BINDER_FLAG_INHERIT_RT
-    /// bit 12    (0x1000): FLAT_BINDER_FLAG_TXN_SECURITY_CTX
-    /// ```
+    /// Encodes the `flat_binder_object.flags` word; bit layout in module doc "Flat-binder flags".
     pub(crate) fn flat_flags(self) -> u32 {
         let mut f = crate::sys::FLAT_BINDER_FLAG_ACCEPTS_FDS;
         if self.set_requesting_sid {
@@ -138,9 +195,7 @@ impl BinderFeatures {
             f |= (priority as u32) & crate::sys::FLAT_BINDER_FLAG_PRIORITY_MASK;
         }
         if let Some(policy) = self.min_sched_policy {
-            // Only the low 2 bits of policy live in the flat field —
-            // higher bits are kernel-internal and would corrupt the
-            // adjacent INHERIT_RT bit.
+            // Only 2 policy bits fit; higher bits would corrupt the adjacent INHERIT_RT bit.
             f |= ((policy as u32) & 0x3) << 9;
         }
         if self.inherit_rt {
@@ -150,11 +205,7 @@ impl BinderFeatures {
     }
 }
 
-/// Compact tag for [`Stability`] used by [`Inner`]'s atomic field.
-///
-/// Runtime stability mutation needs interior-mutable storage; an
-/// `AtomicU8` with a 4-value tag is cheaper than locking around the
-/// `Stability` field and keeps reads on the wire-emit hot path lock-free.
+/// `Stability` tags for `Inner::stability`; see module doc "Runtime stability".
 const STABILITY_TAG_LOCAL: u8 = 0;
 const STABILITY_TAG_VENDOR: u8 = 1;
 const STABILITY_TAG_SYSTEM: u8 = 2;
@@ -175,57 +226,28 @@ fn stability_from_tag(tag: u8) -> Stability {
         STABILITY_TAG_VENDOR => Stability::Vendor,
         STABILITY_TAG_SYSTEM => Stability::System,
         STABILITY_TAG_VINTF => Stability::Vintf,
-        // The only producer is `stability_to_tag`, which emits 0..=3;
-        // a different value implies a corrupt `AtomicU8` load. Wire
-        // stability is binder-protocol-critical, so abort rather than
-        // silently fall through to `System` and emit a mis-stamped
-        // `flat_binder_object`.
+        // Only `stability_to_tag` stores (0..=3): abort, never emit a mis-stamped flat object.
         other => unreachable!("invalid stability tag {other}: only 0..=3 are stored"),
     }
 }
 
-// Must stay crate-private and never be embedded by value in another type:
-// `try_from`'s Arc reinterpret cast relies on an `Inner<B>` at an Arc's data
-// address being the Arc's own pointee.
+// Crate-private, never embedded by value: `try_from`'s Arc cast relies on it (see module doc).
 struct Inner<T: Remotable + Send + Sync> {
     remotable: T,
-    /// `AtomicU8` storing a [`Stability`] tag (see `STABILITY_TAG_*`).
-    /// Atomic so [`Self::force_downgrade_to_system_stability`] and friends
-    /// can mutate at runtime without blocking concurrent reads from the
-    /// `flat_binder_object` emit path. Default `Relaxed` ordering is
-    /// sufficient because the [`Self::parceled`] guard (Acquire/Release)
-    /// provides the only correctness-relevant happens-before.
+    /// `STABILITY_TAG_*` value, `Relaxed`; see module doc "Runtime stability".
     stability: AtomicU8,
-    /// AOSP `BBinder::mParceled` equivalent. Flipped to
-    /// `true` the first time this binder is written to a parcel, after
-    /// which the runtime stability setters refuse mutation (matches the
-    /// `LOG_ALWAYS_FATAL_IF(mParceled, ...)` guards in
-    /// [`Binder.cpp:579,606,659,678,713`](https://cs.android.com/android/platform/superproject/+/android-16.0.0_r4:frameworks/native/libs/binder/Binder.cpp;l=579)).
+    /// AOSP `BBinder::mParceled`: set on the first parcel write, then the stability setters refuse.
     parceled: AtomicBool,
     binder_flags: u32,
     strong: RefCounter,
     weak: RefCounter,
     extension: RwLock<Option<SIBinder>>,
-    /// Typed object attach/find/detach store. Empty
-    /// `HashMap` on construction (no allocation until first
-    /// `attach_object`), so the per-binder cost is just the unlocked
-    /// `Mutex` header + empty `HashMap` header (~56 bytes on 64-bit).
-    ///
-    /// AOSP `BBinder::Extras::mObjectMgr` (Binder.cpp:523) keyed by
-    /// `const void*` identity; rsbinder keys by `TypeId` to sidestep
-    /// the LLVM provenance / ABA hazard of raw pointer identity.
-    /// Trade-off: one attached object per Rust type per
-    /// binder. Callers that need multiple attachments of the same
-    /// concrete type should wrap them in distinct newtype shells.
+    /// Attached objects, one per `TypeId`; see module doc "Attached objects".
     objects: Mutex<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>,
 }
 
 impl<T: Remotable> Inner<T> {
-    /// Gated stability mutation. Refuses if the binder
-    /// has already been written to a parcel ([`Self::parceled`] is `true`),
-    /// matching the `LOG_ALWAYS_FATAL_IF(mParceled, ...)` guard pattern in
-    /// AOSP [`Binder.cpp`](https://cs.android.com/android/platform/superproject/+/android-16.0.0_r4:frameworks/native/libs/binder/Binder.cpp;l=579)
-    /// (rsbinder returns `Err(InvalidOperation)` rather than aborting).
+    /// `InvalidOperation` once `parceled` is set; AOSP aborts on `mParceled` (Binder.cpp:579).
     fn set_stability_guarded(&self, level: Stability) -> Result<()> {
         if self.parceled.load(Ordering::Acquire) {
             return Err(StatusCode::InvalidOperation);
@@ -258,12 +280,7 @@ impl<T: Remotable> Inner<T> {
                     argv.push(_reader.read::<String>()?);
                 }
 
-                // SAFETY:
-                // 1. The fd comes from a valid flat_binder_object validated by read_object()
-                // 2. We use ManuallyDrop because the kernel owns this fd - it will be closed
-                //    by the binder driver when the transaction completes
-                // 3. The fd is only valid for the duration of this transaction
-                // 4. We only use it for writing (dump output), never transfer ownership
+                // SAFETY: `_reader` owns and closes the fd; ManuallyDrop avoids a double close.
                 let mut file = unsafe { ManuallyDrop::new(File::from_raw_fd(fd as _)) };
 
                 self.remotable.on_dump(file.deref_mut(), argv.as_slice())
@@ -301,9 +318,7 @@ impl<T: 'static + Remotable> IBinder for Inner<T> {
         Err(StatusCode::InvalidOperation)
     }
 
-    /// Remove a previously registered death notification.
-    /// The recipient will no longer be called if this object
-    /// dies.
+    /// Always `InvalidOperation`: a local binder has no death notification to remove.
     fn unlink_to_death(&self, _recipient: Weak<dyn DeathRecipient>) -> Result<()> {
         log::error!("Binder<T> does not support unlink_to_death.");
         Err(StatusCode::InvalidOperation)
@@ -350,16 +365,7 @@ impl<T: 'static + Remotable> IBinder for Inner<T> {
         Some(self)
     }
 
-    /// RPC server dispatch. Mirrors the code
-    /// dispatch of `Inner::transact` **minus** the kernel
-    /// `check_interface` call and minus the `reader.set_data_position(0)`
-    /// reset — the RPC adapter has already consumed + validated the RPC
-    /// interface token and positioned `reader` at the arguments. This
-    /// neither calls nor changes `Inner::transact` /
-    /// `thread_state::check_interface`; it is an additive sibling
-    /// entrypoint, so the kernel server path stays bit-identical
-    /// (`Inner::transact` untouched). It calls the same generated,
-    /// transport-neutral `Remotable::on_transact`.
+    /// RPC dispatch: `Inner::transact` minus `check_interface` and the position reset (adapter's).
     #[cfg(feature = "rpc")]
     fn rpc_transact(
         &self,
@@ -384,8 +390,7 @@ impl<T: 'static + Remotable> IBinder for Inner<T> {
             _ => match self.remotable.on_transact(code, reader, reply) {
                 Ok(_) => Ok(()),
                 Err(StatusCode::UnknownTransaction) => {
-                    // Same fallback as `Inner::transact`: handle
-                    // INTERFACE_TRANSACTION etc. via `Inner::on_transact`.
+                    // As `Inner::transact`: fall back for INTERFACE_TRANSACTION etc.
                     self.on_transact(code, reader, reply)
                 }
                 Err(err) => Err(err),
@@ -468,10 +473,7 @@ impl<T: Remotable> Transactable for Inner<T> {
                 if (FIRST_CALL_TRANSACTION..=LAST_CALL_TRANSACTION).contains(&code)
                     && !(thread_state::check_interface(reader, T::descriptor())?)
                 {
-                    // BAD_TYPE as the transaction *status* (the dispatcher
-                    // emits a TF_STATUS_CODE reply), matching AOSP NDK
-                    // `ABBinder::onTransact` — never as reply payload, which
-                    // clients would parse as a success.
+                    // Status, never payload (read as success); as AOSP NDK `ABBinder::onTransact`.
                     return Err(StatusCode::BadType);
                 }
 
@@ -642,16 +644,13 @@ impl<T: 'static + Remotable> Deref for Binder<T> {
     }
 }
 
-// This implementation is an idiomatic implementation of the C++
-// `IBinder::localBinder` interface if the binder object is a Rust binder
-// service.
+// Rust counterpart of C++ `IBinder::localBinder`; soundness: see module doc.
 impl<B: Remotable + 'static> TryFrom<SIBinder> for Binder<B> {
     type Error = StatusCode;
 
     fn try_from(ibinder: SIBinder) -> Result<Self> {
         if B::descriptor() != ibinder.descriptor() {
-            // The single funnel for every failed interface cast (into_interface,
-            // Strong::try_from, hub::*_interface) — the one place BadType is explained.
+            // Single funnel of every failed interface cast: the one place BadType is explained.
             log::error!(
                 "binder interface cast mismatch: expected `{}`, got `{}`",
                 B::descriptor(),
@@ -661,14 +660,7 @@ impl<B: Remotable + 'static> TryFrom<SIBinder> for Binder<B> {
         }
 
         if let Some(inner_ref) = ibinder.as_any().downcast_ref::<Inner<B>>() {
-            // Soundness guard for a caller-supplied `IBinder`: the cast below
-            // reinterprets the trait-object Arc's *data* allocation as
-            // `Inner<B>`. `downcast_ref` only proves that `as_any()`'s return
-            // is *an* `Inner<B>` — an external impl that delegates `as_any()`/
-            // `descriptor()` to a wrapped inner object would pass both checks
-            // while its Arc points at the *wrapper* allocation, making the
-            // reinterpret (and the refcount ops on it) UB. Require that
-            // `as_any()` returned this Arc's own data before casting.
+            // A delegating `as_any()` must not pass: see module doc "Local-binder cast soundness".
             let data_ptr = Arc::as_ptr(ibinder.as_arc()) as *const u8;
             let any_ptr = inner_ref as *const Inner<B> as *const u8;
             if !std::ptr::eq(data_ptr, any_ptr) {
@@ -678,28 +670,15 @@ impl<B: Remotable + 'static> TryFrom<SIBinder> for Binder<B> {
                 );
                 return Err(StatusCode::BadValue);
             }
-            // SAFETY: `downcast_ref::<Inner<B>>` confirmed the underlying value
-            // is `Inner<B>`, and the pointer-identity check above confirms the
-            // trait-object Arc's data pointer addresses that same `Inner<B>`,
-            // which can only be the Arc's own pointee because `Inner<T>` is
-            // crate-private and never embedded by value (a wrapper with an
-            // `Inner<B>` first field could otherwise pass both checks), so
-            // casting `*const dyn IBinder` to `*const Inner<B>` is
-            // layout-correct. Cloning the trait-object Arc and consuming it via
-            // `Arc::into_raw` leaks one strong ref; `Arc::from_raw` on the cast
-            // pointer reclaims that ref as `Arc<Inner<B>>`, conserving the total
-            // strong count after `ibinder` drops at the end of this function.
             let arc_dyn = Arc::clone(ibinder.as_arc());
             let raw_dyn = Arc::into_raw(arc_dyn);
             let inner_raw = raw_dyn as *const Inner<B>;
+            // SAFETY: the Arc's own `Inner<B>` (module doc); from_raw reclaims the into_raw ref.
             let inner = unsafe { Arc::from_raw(inner_raw) };
 
             Ok(Self { inner })
         } else {
-            // Descriptor matched (checked above) but the object is not a local
-            // `Binder<B>` — a remote proxy for the same interface, or a
-            // different `Remotable` type sharing the descriptor. Logging both
-            // descriptors would just print the same string twice.
+            // Descriptor matched, so log it once: a remote proxy or another `Remotable` type.
             log::error!(
                 "cast to local Binder<{}> failed: not a local binder (remote proxy or different Remotable)",
                 B::descriptor()
@@ -761,8 +740,7 @@ mod feature_flags_tests {
         assert_ne!(flags & FLAT_BINDER_FLAG_ACCEPTS_FDS, 0);
     }
 
-    // BinderFeatures sched policy / priority / inherit_rt encoding into
-    // flat_binder_object.flags.
+    // BinderFeatures sched policy / priority / inherit_rt encoding into flat_binder_object.flags.
 
     use crate::sys::{
         FLAT_BINDER_FLAG_INHERIT_RT, FLAT_BINDER_FLAG_PRIORITY_MASK,
@@ -781,8 +759,7 @@ mod feature_flags_tests {
         assert_eq!(FLAT_BINDER_FLAG_SCHED_POLICY_MASK, 0x600);
     }
 
-    /// The default `BinderFeatures` (no RT opt-ins) must produce flat-flags
-    /// with RT bit, SCHED_POLICY bits, and priority bits all unset.
+    /// Default `BinderFeatures` leaves the INHERIT_RT, SCHED_POLICY and priority bits unset.
     #[test]
     fn default_features_zero_rt_bits() {
         let b = Binder::new(DummyRemotable);
@@ -792,10 +769,7 @@ mod feature_flags_tests {
         assert_eq!(flags & FLAT_BINDER_FLAG_PRIORITY_MASK, 0);
     }
 
-    /// Setting an RT policy + priority must produce the exact
-    /// AOSP bit pattern — priority in bits 0-7, policy << 9 in bits
-    /// 9-10. We pick `SCHED_FIFO = 1` and priority `42` so the result
-    /// is unambiguous: `0x100 << 1 | 42 = 0x22A | ACCEPTS_FDS`.
+    /// SCHED_FIFO (1) with priority 42 encodes as `1 << 9 | 42 = 0x22A`, plus ACCEPTS_FDS.
     #[test]
     fn rt_policy_and_priority_encoded_in_canonical_bit_positions() {
         let features = BinderFeatures {
@@ -811,8 +785,7 @@ mod feature_flags_tests {
         assert_eq!(flags & FLAT_BINDER_FLAG_INHERIT_RT, 0);
     }
 
-    /// `inherit_rt = true` independently flips bit 11 and
-    /// composes with the other RT fields without overlap.
+    /// `inherit_rt` sets bit 11 without overlapping the policy and priority fields.
     #[test]
     fn inherit_rt_sets_bit_11_independently_of_policy_field() {
         let features = BinderFeatures {
@@ -832,10 +805,7 @@ mod feature_flags_tests {
         assert_eq!((2u32 << 9) & 99, 0);
     }
 
-    /// Priority values larger than 8 bits must be masked
-    /// (silently dropped) so they cannot bleed into the adjacent
-    /// SCHED_POLICY field — a wire-corruption regression that would
-    /// reroute every transaction to a different scheduler class.
+    /// Priority bits above 8 are dropped so they cannot change the SCHED_POLICY field.
     #[test]
     fn out_of_range_priority_is_masked_to_low_byte() {
         let features = BinderFeatures {
@@ -848,8 +818,7 @@ mod feature_flags_tests {
         assert_eq!(flags & FLAT_BINDER_FLAG_SCHED_POLICY_MASK, 0);
     }
 
-    /// Scheduler policy values larger than 2 bits must be
-    /// masked so they cannot bleed into bit 11 (INHERIT_RT) or higher.
+    /// Policy bits above 2 are dropped so they cannot set bit 11 (INHERIT_RT) or higher.
     #[test]
     fn out_of_range_policy_is_masked_to_two_bits() {
         let features = BinderFeatures {
@@ -857,18 +826,13 @@ mod feature_flags_tests {
             ..Default::default()
         };
         let flags = features.flat_flags();
-        // Only bits 9-10 (mask 0x600) should be touched; bit 11 must
-        // not leak.
+        // Only bits 9-10 (mask 0x600) should be touched; bit 11 must not leak.
         assert_eq!(flags & FLAT_BINDER_FLAG_SCHED_POLICY_MASK, 0x600);
         assert_eq!(flags & FLAT_BINDER_FLAG_INHERIT_RT, 0);
     }
 }
 
-/// Runtime stability mutation API tests.
-///
-/// AOSP equivalents: `Stability::forceDowngradeToSystemStability` (Stability.cpp:41),
-/// `Stability::forceDowngradeToVendorStability` (:45), `Stability::markVintf` (:54),
-/// `BBinder::setParceled` (Binder.cpp:725) parceled-guard.
+/// Stability setters vs AOSP Stability.cpp:41/45/54 and `BBinder::setParceled` (Binder.cpp:725).
 #[cfg(test)]
 mod stability_mutation_tests {
     use super::*;
@@ -894,8 +858,6 @@ mod stability_mutation_tests {
         }
     }
 
-    /// Default-constructed binder reports `System`
-    /// stability and `was_parceled == false`.
     #[test]
     fn default_binder_is_system_and_not_parceled() {
         let b = Binder::new(DummyRemotable);
@@ -903,23 +865,17 @@ mod stability_mutation_tests {
         assert!(!b.inner.was_parceled());
     }
 
-    /// `mark_vintf` upgrades `System` to `Vintf` and the
-    /// canonical wire bits (`0b111111`) follow.
+    /// After the upgrade the wire `i32` decodes back to `Vintf`.
     #[test]
     fn mark_vintf_upgrades_to_vintf() {
         let b = Binder::new(DummyRemotable);
         b.inner.mark_vintf().expect("not parceled yet");
         assert_eq!(b.inner.stability(), Stability::Vintf);
         let wire: i32 = b.inner.stability().into();
-        // Decode independent of the wire format — raw level (off-android /
-        // SDK ≠ 31,32) puts the level in the low byte, the android-12 Category
-        // repr puts it in the high byte — so round-trip through the decoder
-        // rather than masking a fixed byte.
+        // Level byte is low (raw) or high (android-12 Category repr): decode, don't mask.
         assert_eq!(Stability::try_from(wire).unwrap(), Stability::Vintf);
     }
 
-    /// `force_downgrade_to_vendor_stability` flips the
-    /// declared level to `Vendor`, independent of starting level.
     #[test]
     fn force_downgrade_to_vendor_works_from_system() {
         let b = Binder::new(DummyRemotable);
@@ -929,8 +885,7 @@ mod stability_mutation_tests {
         assert_eq!(b.inner.stability(), Stability::Vendor);
     }
 
-    /// Vintf → System round-trips, matching AOSP
-    /// `forceDowngradeToStability(binder, SYSTEM)`.
+    /// Vintf → System, matching AOSP `forceDowngradeToStability(binder, SYSTEM)`.
     #[test]
     fn vintf_then_force_downgrade_to_system() {
         let b = Binder::new(DummyRemotable);
@@ -939,11 +894,7 @@ mod stability_mutation_tests {
         assert_eq!(b.inner.stability(), Stability::System);
     }
 
-    /// Parceled guard: once `set_parceled()` has fired, all
-    /// three mutation entry points refuse with `InvalidOperation`.
-    /// Mirrors AOSP `LOG_ALWAYS_FATAL_IF(mParceled, ...)` (rsbinder
-    /// returns an error rather than aborting, so it composes with the
-    /// `Result`-based AIDL surface).
+    /// After `set_parceled()` all three setters return `InvalidOperation` (AOSP aborts there).
     #[test]
     fn parceled_guard_blocks_all_setters() {
         let b = Binder::new(DummyRemotable);
@@ -961,13 +912,11 @@ mod stability_mutation_tests {
             b.inner.force_downgrade_to_vendor_stability().unwrap_err(),
             StatusCode::InvalidOperation
         );
-        // Stability must remain at construction-time level — the
-        // failing setter must not partially update.
+        // The failing setter must not partially update: stability stays at construction level.
         assert_eq!(b.inner.stability(), Stability::System);
     }
 
-    /// Same setters routed through `SIBinder` (the public
-    /// API surface most callers hold).
+    /// The same setters routed through `SIBinder`, the handle most callers hold.
     #[test]
     fn sibinder_delegation_path_round_trips() {
         let b = Binder::new(DummyRemotable);
@@ -980,8 +929,7 @@ mod stability_mutation_tests {
         assert!(!si.was_parceled());
     }
 
-    /// Explicit `Stability::Vintf` construction should match
-    /// what `mark_vintf` would set, and remain mutable until parceled.
+    /// Constructing with `Vintf` matches `mark_vintf` and stays mutable until parceled.
     #[test]
     fn explicit_vintf_construction_is_observable_and_mutable() {
         let b = Binder::new_with_stability(DummyRemotable, Stability::Vintf);
@@ -990,10 +938,7 @@ mod stability_mutation_tests {
         assert_eq!(b.inner.stability(), Stability::System);
     }
 
-    /// Round-trip a typed object through
-    /// `attach_object`/`find_object`/`detach_object`. Equivalent to
-    /// AOSP `BBinder::attachObject` insert + `findObject` lookup +
-    /// `detachObject` removal.
+    /// AOSP `BBinder::attachObject` / `findObject` / `detachObject` round-trip on one type.
     #[test]
     fn attach_find_detach_round_trip() {
         let b = Binder::new(DummyRemotable);
@@ -1008,9 +953,7 @@ mod stability_mutation_tests {
         assert!(b.find_object::<Side>().is_none(), "detach removes entry");
     }
 
-    /// Re-attaching the same type returns the
-    /// previously-stored value, matching AOSP's "old replaced by new"
-    /// contract (Binder.cpp:523-531).
+    /// Re-attaching a type returns the stored value, as AOSP does (Binder.cpp:523-531).
     #[test]
     fn attach_object_replaces_returns_old() {
         let b = Binder::new(DummyRemotable);
@@ -1025,8 +968,7 @@ mod stability_mutation_tests {
         assert_eq!(b.find_object::<Side>().unwrap().0, 2);
     }
 
-    /// Distinct Rust types coexist independently
-    /// under the TypeId-keyed map.
+    /// Distinct Rust types coexist in the `TypeId`-keyed map.
     #[test]
     fn distinct_types_do_not_collide() {
         let b = Binder::new(DummyRemotable);
@@ -1041,9 +983,7 @@ mod stability_mutation_tests {
         assert!(b.find_object::<B>().is_some(), "B still attached");
     }
 
-    /// `Binder` drop releases attached object
-    /// references. Verified via `Arc::strong_count`: after `Binder`
-    /// drops, the external `Arc` should be the only strong ref.
+    /// After the `Binder` drops, the test's own `Arc` is the only strong reference left.
     #[test]
     fn binder_drop_releases_attached_objects() {
         struct Probe(#[allow(dead_code)] u32);
@@ -1061,20 +1001,14 @@ mod stability_mutation_tests {
         );
     }
 
-    /// Emit-site simulation. The serializer invokes
-    /// `binder.set_parceled()` on `&SIBinder` after writing the
-    /// `flat_binder_object` + stability int32; this test simulates
-    /// that exact dispatch (deref `SIBinder` → `dyn IBinder` →
-    /// `Inner<T>::set_parceled`) without pulling in `ProcessState`,
-    /// which is not initializable in a host-tree hermetic test.
+    /// The serializer's `set_parceled()` via `SIBinder` → `dyn IBinder`, without `ProcessState`.
     #[test]
     fn sibinder_set_parceled_via_trait_dispatch_flips_guard() {
         let b = Binder::new(DummyRemotable);
         let si = crate::Interface::as_binder(&b);
         assert!(!si.was_parceled());
 
-        // Exactly what `parcelable::SerializeOption::serialize_option`
-        // does after the wire write (parcelable.rs:484).
+        // Exactly what `parcelable::SerializeOption::serialize_option` does after the wire write.
         si.set_parceled();
 
         assert!(si.was_parceled());

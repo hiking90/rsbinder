@@ -73,9 +73,7 @@ impl VsockTransport {
 
 impl RpcTransport for VsockTransport {
     fn send_frame(&self, buf: &[u8]) -> RpcResult<()> {
-        // `&VsockStream: Write` (vsock 0.5+), so a shared `&self` can
-        // send while another thread receives — same lock-free duplex
-        // pattern as `UnixTransport`.
+        // `&VsockStream: Write` (vsock 0.5+): lock-free duplex, as in `UnixTransport`.
         let mut w = &self.stream;
         write_frame(&mut w, buf)
     }
@@ -86,10 +84,10 @@ impl RpcTransport for VsockTransport {
     }
 
     /// Raw, unframed write for the android-13+ profile (the real android
-    /// RPC wire has no length prefix). Mirrors `UnixTransport::send_raw`;
-    /// without it a `vsock://…?profile=android13plus` connection failed at
-    /// its first handshake byte — on the Microdroid/AVF target this module
-    /// exists for, where the peer is real libbinder and speaks only this.
+    /// RPC wire has no length prefix). Mirrors `UnixTransport::send_raw`.
+    /// The trait default refuses raw access, and a
+    /// `vsock://…?profile=android13plus` session starts with a raw write:
+    /// on Microdroid/AVF the peer is libbinder and speaks only this wire.
     fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
         use std::io::Write;
         let mut w = &self.stream;

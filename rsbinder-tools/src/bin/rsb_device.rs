@@ -10,17 +10,13 @@ use anstyle::*;
 use rsbinder::*;
 use rsbinder_tools::nss::gid_for_group;
 
-/// Returns `true` if `binderfs_path` is a current mount point in `/proc/mounts`.
-///
-/// Matches the mount target field exactly: substring matching against
-/// `"binder"` aliases other binderfs mounts (`hwbinder` / `vndbinder`).
+/// Exact target match: a substring match on "binder" also hits `hwbinder` / `vndbinder` mounts.
 fn is_mounted(binderfs_path: &Path) -> std::io::Result<bool> {
     let mounts = std::fs::read_to_string("/proc/mounts")?;
     Ok(mounts_text_contains_target(&mounts, binderfs_path))
 }
 
-/// Pure parser split off from `is_mounted` for unit-testability without
-/// `/proc` access.
+/// Split from `is_mounted` so tests need no `/proc`.
 fn mounts_text_contains_target(mounts: &str, target: &Path) -> bool {
     mounts.lines().any(|line| {
         line.split_whitespace()
@@ -29,19 +25,10 @@ fn mounts_text_contains_target(mounts: &str, target: &Path) -> bool {
     })
 }
 
-/// Default permission bits for a newly created binder device node.
-///
-/// Root-only. Binder has no in-kernel access control of its own, so the
-/// device node's mode is the only gate on *who can speak binder at all* —
-/// the same model as `/dev/kvm` (`0660 root:kvm`). An operator grants
-/// access deliberately with `--group` / `--mode`; nothing is world-writable
-/// by default.
+/// Root-only: binder has no in-kernel access control, so the node's mode is the only gate.
 const DEFAULT_DEVICE_MODE: u32 = 0o600;
 
-/// Parse an octal permission spec (`"660"`, `"0660"`, `"0o660"`).
-///
-/// Rejects set-uid / set-gid / sticky bits: they are meaningless on a
-/// character device and would only widen the blast radius of a typo.
+/// Rejects set-uid/set-gid/sticky: meaningless on a char device, and the shape of a typo.
 fn parse_mode(spec: &str) -> std::result::Result<u32, String> {
     let digits = spec
         .strip_prefix("0o")
@@ -103,9 +90,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     env_logger::init();
 
-    // Resolve --mode and --group up front. Everything below this point
-    // mutates the system (mounting binderfs, allocating a device node), and a
-    // rejected argument must not leave half of that behind.
+    // Validate every argument before the mount below, so a rejection leaves nothing behind.
     let mode = match app.get_one::<String>("mode") {
         Some(spec) => match parse_mode(spec) {
             Ok(mode) => mode,
@@ -120,6 +105,26 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         },
         None => None,
     };
+
+    let device_name = app.get_one::<String>("device_name").unwrap();
+
+    // Runs as root and is joined into paths below: one component, within BINDERFS_MAX_NAME (255).
+    if device_name.is_empty()
+        || device_name == "."
+        || device_name == ".."
+        || device_name.contains('/')
+        || device_name.contains('\0')
+        || device_name.len() > 255
+    {
+        log_err(&format!("Invalid binder device name: {device_name:?}"));
+    }
+    // binderfs root entries: add_device reports EEXIST and the chown/chmod would hit them.
+    if matches!(
+        device_name.as_str(),
+        "binder-control" | "features" | "binder_logs"
+    ) {
+        log_err(&format!("{device_name:?} is reserved by binderfs"));
+    }
 
     let binderfs_path = Path::new(DEFAULT_BINDERFS_PATH);
     let control_path = Path::new(DEFAULT_BINDER_CONTROL_PATH);
@@ -153,11 +158,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             binderfs_path.display()
         )),
         Ok(false) => {
-            // Absolute path, not `mount` via `$PATH`: this runs as root,
-            // so resolving the binary through `$PATH` would let a planted
-            // `mount` earlier on the path execute as root. `/bin/mount`
-            // is the util-linux location on both merged- and split-`/usr`
-            // systems.
+            // Absolute path: as root, a `mount` planted earlier on `$PATH` would run instead.
             let status = Command::new("/bin/mount")
                 .arg("-t")
                 .arg("binder")
@@ -180,21 +181,6 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     }
 
     // Add binder device.
-    let device_name = app.get_one::<String>("device_name").unwrap();
-
-    // This runs as root and the name is interpolated into binderfs and
-    // /dev paths below, so require a single path component — otherwise a
-    // name like "../etc/foo" would redirect the chmod'd device or the
-    // /dev symlink outside its intended directory.
-    if device_name.is_empty()
-        || device_name == "."
-        || device_name == ".."
-        || device_name.contains('/')
-        || device_name.contains('\0')
-    {
-        log_err(&format!("Invalid binder device name: {device_name:?}"));
-    }
-
     match binderfs::add_device(control_path, device_name) {
         Ok((_, _)) => log_ok(&format!(
             "New binder device allocated:\n\t- Device name: {device_name}\n\t- Accessible path: /dev/binderfs/{device_name}"
@@ -214,10 +200,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             err
         )),
     };
-    // Chown before chmod: widening the mode first would leave a window in
-    // which the node is group-accessible while still owned by the *old*
-    // group. Ordering it this way means the node is never more permissive
-    // than the operator asked for.
+    // Chown before chmod, or the widened mode briefly applies to the old group.
     if let Some((spec, gid)) = &gid {
         let gid = *gid;
         match std::os::unix::fs::chown(&device_path, None, Some(gid)) {
@@ -317,8 +300,7 @@ tmpfs /tmp tmpfs rw,nosuid,nodev 0 0
         ));
     }
 
-    /// Substring trap: the path `/dev/binderfs` appears as a *prefix*
-    /// in `/dev/binderfs2`. Exact-match parsing must distinguish them.
+    /// `/dev/binderfs` is a prefix of `/dev/binderfs2`.
     #[test]
     fn substring_prefix_does_not_match() {
         let mounts = "binder /dev/binderfs2 binder rw 0 0\n";
@@ -348,9 +330,7 @@ tmpfs /tmp tmpfs rw,nosuid,nodev 0 0
         assert_eq!(parse_mode("777").unwrap(), 0o777);
     }
 
-    /// `8`/`9` are decimal digits that are *not* octal — a spec like "666"
-    /// read as decimal would silently mean 0o1232, so the digit class must
-    /// be checked, not just `from_str_radix`'s error.
+    /// `8`/`9` are decimal but not octal digits, so the digit class is checked explicitly.
     #[test]
     fn parse_mode_rejects_non_octal() {
         assert!(parse_mode("").is_err());
@@ -361,8 +341,7 @@ tmpfs /tmp tmpfs rw,nosuid,nodev 0 0
         assert!(parse_mode(" 660").is_err());
     }
 
-    /// set-uid / set-gid / sticky on a character device is never wanted and
-    /// is the shape a typo takes (`4660` for `0660`).
+    /// `4660` for `0660` is the typo this guards against.
     #[test]
     fn parse_mode_rejects_special_bits() {
         assert!(parse_mode("4660").is_err());

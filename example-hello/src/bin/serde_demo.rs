@@ -11,12 +11,10 @@
 //! a second time in protobuf or serde.
 //!
 //! ```text
-//! cargo run -p example-hello --features rpc --bin serde_demo
+//! cargo run -p example-hello --bin serde_demo
 //! ```
 //!
 //! No binder device, no service manager, no socket — this talks to nothing.
-//! The `rpc` feature is required only because `to_bytes` encodes in the
-//! session-less parcel mode that feature carries.
 //!
 //! See `book/src/data-serialization.md`.
 

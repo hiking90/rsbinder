@@ -9,7 +9,7 @@
 //! What the gate proves, on the real wire:
 //!
 //! 1. the INCOMING-bit attach + `"cci"` read that
-//!    `RpcUnixClientConfig::incoming_connections(1)` performs is what
+//!    `RpcClientConfig::incoming_connections(1)` performs is what
 //!    libbinder's `RpcServer::establishConnection` expects
 //!    (`addOutgoingConnection(init=true)`);
 //! 2. libbinder's `ExclusiveConnection::find` from a non-handler thread
@@ -23,12 +23,17 @@
 //!    connection blocks until the session dies;
 //! 4. `RpcSession::close_session` ends the incoming thread cleanly.
 //!
+//! The argument picks the transport: a socket path, or `tcp:<host>:<port>`
+//! for inet (the `tcp-debug` feature). Over inet every connection comes
+//! from one `RpcClientConfig` connect function, as AOSP `setupClient`
+//! opens them over `setupInetClient` — the case plan 10-7 Phase 0 opened.
+//!
 //! Exit code 0 = PASS; non-zero = the failing step.
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rsbinder::rpc::{RpcProxy, RpcSession, RpcUnixClientConfig};
+use rsbinder::rpc::{RpcClientConfig, RpcProxy, RpcSession};
 use rsbinder::*;
 
 const ROOT_DESC: &str = "rsbinder.test.IIncomingInterop";
@@ -119,6 +124,23 @@ fn read_status(reply: &mut Parcel) -> Result<()> {
     }
 }
 
+#[cfg(feature = "tcp-debug")]
+fn connect_inet(addr: &str) -> Result<RpcSession> {
+    use rsbinder::rpc::RpcClientConfig;
+    let addr: std::net::SocketAddr = addr.parse().map_err(|_| StatusCode::BadValue)?;
+    RpcSession::setup_client_android13plus_with_config(
+        RpcClientConfig::tcp_debug(addr, 2)
+            .outgoing_connections(2)
+            .incoming_connections(1),
+    )
+}
+
+#[cfg(not(feature = "tcp-debug"))]
+fn connect_inet(_addr: &str) -> Result<RpcSession> {
+    eprintln!("[rsbinder-client] tcp: needs the `tcp-debug` feature");
+    Err(StatusCode::InvalidOperation)
+}
+
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("rsbinder::rpc=info"),
@@ -139,14 +161,15 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         std::process::exit(15);
     });
 
-    let session = RpcSession::setup_unix_client_android13plus_with_config(
-        RpcUnixClientConfig::path(std::path::Path::new(&sock), 2)
-            // Two outgoing slots: the oneway callback handler below calls
-            // the server back, and with a single slot that nested call
-            // would wait on whatever `main` has in flight.
-            .outgoing_connections(2)
-            .incoming_connections(1),
-    )?;
+    // Two outgoing slots: the callback handler calls the server back while `main` holds one.
+    let session = match sock.strip_prefix("tcp:") {
+        Some(addr) => connect_inet(addr)?,
+        None => RpcSession::setup_client_android13plus_with_config(
+            RpcClientConfig::unix(std::path::Path::new(&sock), 2)
+                .outgoing_connections(2)
+                .incoming_connections(1),
+        )?,
+    };
     // Bound every reply wait from here on (the default is to block forever).
     session.set_timeout(Some(Duration::from_secs(10)));
     eprintln!(

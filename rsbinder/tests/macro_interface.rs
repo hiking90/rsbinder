@@ -7,6 +7,11 @@
 //!
 //! The byte-identity of this generated code against the `.aidl` path is
 //! pinned separately, by the golden tests inside `rsbinder-macros`.
+//!
+//! AC-22.9 (`macro_interface_gateway_republishes_a_proxy`): `#[interface]` renders through the
+//! same generator as `.aidl` (plan 2-19 D1), so the delegating
+//! `impl IFoo for Strong<dyn IFoo>` exists here too — a proxy satisfies `Bn*::new_binder`'s
+//! bound, and the gateway spelling compiles and forwards on this path as well.
 
 #![cfg(all(feature = "macros", feature = "rpc"))]
 #![allow(non_snake_case)]
@@ -196,8 +201,7 @@ fn macro_interface_round_trips_over_rpc() {
     assert_eq!(echo.maybe(Some("shout")).unwrap().as_deref(), Some("SHOUT"));
     assert_eq!(echo.maybe(None).unwrap(), None);
 
-    // A oneway call has no reply to wait on, so pair it with a twoway call
-    // to know the server has drained it.
+    // A twoway call after the oneway one proves the server has drained it.
     echo.ping().unwrap();
     echo.echo("barrier").unwrap();
     assert_eq!(*pinged.lock().unwrap(), 1);
@@ -226,8 +230,7 @@ fn macro_interface_carries_a_callback_binder() {
     assert_eq!(seen.lock().unwrap().as_slice(), ["from-server"]);
 }
 
-/// The descriptor is what goes on the wire — over RPC it is checked by the
-/// interface token on the first transact, not by the cast.
+/// The descriptor goes on the wire; over RPC the first transact's token checks it, not the cast.
 #[test]
 fn macro_interface_descriptor_is_the_attribute_value() {
     assert_eq!(
@@ -240,10 +243,7 @@ fn macro_interface_descriptor_is_the_attribute_value() {
     );
 }
 
-/// AC-22.9. `#[interface]` renders through the same generator as `.aidl`
-/// (plan 2-19 D1), so the delegating `impl IFoo for Strong<dyn IFoo>` is
-/// there too — a proxy satisfies `Bn*::new_binder`'s bound and the
-/// gateway spelling compiles and forwards on this path as well.
+/// AC-22.9: a macro-interface proxy republishes through `Bn*::new_binder`; see module doc.
 #[test]
 fn macro_interface_gateway_republishes_a_proxy() {
     let up = SockPath::new("gwup");

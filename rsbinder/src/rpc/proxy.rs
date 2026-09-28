@@ -15,6 +15,57 @@
 //! kernel-only `as_proxy().unwrap()`, so the **generated** `Bp*` stub
 //! drives this proxy directly — the same single stub also drives the
 //! kernel `ProxyHandle`.
+//!
+//! # Descriptor
+//!
+//! The RPC wire transmits only an address, not a descriptor string, so a
+//! proxy resolved from `read_binder`/`get_root` starts with an empty
+//! descriptor. The generated typed stub's `from_binder` stamps its own
+//! descriptor onto the already-cached proxy once, in place
+//! (`stamp_descriptor`), since the descriptor is known only to the stub at
+//! compile time. First write wins and is idempotent for the same interface
+//! (one wire address identifies one remote object, so one interface). The
+//! proxy is never replaced: a replacement would send a second `DEC_STRONG`
+//! on drop and split the per-address dedup cache.
+//!
+//! Because `from_binder` stamps before its `binder.descriptor() !=
+//! $descriptor` check, that check is self-referential for a fresh RPC proxy:
+//! unlike the kernel `ProxyHandle` path it does not validate the remote's
+//! actual interface. A wrong-interface cast is not rejected at `from_binder`;
+//! it surfaces as a transact-time `StatusCode` when the server rejects the
+//! interface token. This follows from the Android RPC wire (no descriptor
+//! transmitted). First-write-wins also protects an in-use proxy from a later
+//! differing cast: the second `from_binder`'s descriptor check returns
+//! `None`. `stamp_descriptor` returns whether this call wrote the descriptor
+//! (the `OnceLock::set` result), so a caller can tell a fresh stamp from an
+//! existing one without a `descriptor()` round-trip; `from_binder` ignores it.
+//!
+//! # Session
+//!
+//! A proxy holds its session strongly (AOSP `BpBinder::RpcSessionBinder`
+//! holds `sp<RpcSession>`), so a proxy alone keeps its session, and thus the
+//! connection, alive. The session's `remote_proxies` table is `Weak`, so the
+//! only cycle back to the session runs through a local object the peer
+//! holds. `RpcSessionInner::on_session_dead` breaks it; it runs when a serve
+//! loop ends, when a transaction fails on a lost connection, or on an
+//! explicit [`RpcSession::close_session`](super::RpcSession::close_session),
+//! the last being the only break available to a session that neither serves
+//! nor transacts again.
+//!
+//! # Death notification
+//!
+//! Death state mirrors the kernel `ProxyHandle`. RPC has no death wire
+//! message (AOSP `RpcState::sendObituaries`): an RPC object dies when its
+//! session connection drops, so the session fires every cached proxy's
+//! obituary when its serve loop ends
+//! (`RpcSessionInner::send_session_obituaries`). `send_obituary` follows
+//! the kernel `ProxyHandle::send_obituary` state machine minus the
+//! kernel-only `BC_CLEAR_DEATH_NOTIFICATION` / `flush_commands`.
+//! `obituary_sent` is set once the obituary is dispatched and is touched only
+//! under the `recipients` write lock (kernel `mLock` parity), which supplies
+//! the happens-before, hence `Relaxed` throughout. A second call (a serve
+//! loop ending after a transact already observed the close) sees it set and
+//! returns.
 
 use std::any::Any;
 use std::mem::ManuallyDrop;
@@ -32,34 +83,11 @@ use super::session::RpcSessionInner;
 /// A handle to a remote object reachable over an RPC session.
 pub struct RpcProxy {
     addr: RpcAddress,
-    /// The interface descriptor. The RPC wire transmits only an
-    /// address (not a descriptor string), so a proxy resolved from
-    /// `read_binder`/`get_root` starts empty and is stamped **once,
-    /// in place** by the generated typed stub's `from_binder`
-    /// (via `stamp_descriptor`).
-    /// In-place — never a replacement proxy — keeps the dedup-cache
-    /// identity and the single `DEC_STRONG` intact.
+    /// Empty off the wire, stamped once in place by `from_binder`; see module doc "Descriptor".
     descriptor: OnceLock<String>,
-    /// **Strong** session ref (AOSP `BpBinder::RpcSessionBinder` holds
-    /// `sp<RpcSession>`): a proxy alone keeps its session — and thus
-    /// the connection — alive. The session's `remote_proxies` table is
-    /// `Weak`, so the only cycle back to the session runs through a
-    /// *local* object the peer holds; that is broken by
-    /// [`RpcSessionInner::on_session_dead`], which runs when a serve loop
-    /// ends, when a transaction fails on a lost connection, or on an
-    /// explicit [`RpcSession::close_session`](super::RpcSession::close_session) —
-    /// the last being the only break available to a session that neither
-    /// serves nor transacts again.
+    /// Strong, as AOSP `sp<RpcSession>`: a proxy keeps its session alive; see module doc "Session".
     session: Arc<RpcSessionInner>,
-    /// Death-notification state, mirroring the kernel
-    /// [`ProxyHandle`](crate::proxy::ProxyHandle) exactly. RPC has no
-    /// death *wire* message (AOSP `RpcState::sendObituaries`): an RPC
-    /// object dies when its **session connection drops**, so the
-    /// session fires every cached proxy's obituary when its serve loop
-    /// ends (see [`RpcSessionInner::send_session_obituaries`]). Set
-    /// once when the obituary is dispatched. Every access is under the
-    /// `recipients` write lock (kernel `mLock` parity), which supplies
-    /// the happens-before — hence `Relaxed` throughout.
+    /// Set once the obituary is dispatched; only under the `recipients` write lock, so `Relaxed`.
     obituary_sent: AtomicBool,
     recipients: RwLock<Vec<sync::Weak<dyn DeathRecipient>>>,
 }
@@ -80,22 +108,10 @@ impl RpcProxy {
         }
     }
 
-    /// Fire `binder_died` on every registered recipient — called by the
-    /// owning session when its connection drops (AOSP
-    /// `BpBinder::sendObituary`, the RPC branch). Mirrors the kernel
-    /// [`ProxyHandle::send_obituary`](crate::proxy::ProxyHandle) state
-    /// machine **minus** the kernel-only `BC_CLEAR_DEATH_NOTIFICATION`
-    /// / `flush_commands` (death over RPC is connection-drop-driven,
-    /// not a wire command). Idempotent: a second call (e.g. a serve
-    /// loop ending after a transact already observed the close) sees
-    /// `obituary_sent == true` and returns.
+    /// Fire `binder_died` on each recipient (AOSP `BpBinder::sendObituary`, RPC); idempotent.
     pub(crate) fn send_obituary(&self, who: &WIBinder) {
         let snapshot: Vec<sync::Weak<dyn DeathRecipient>> = {
-            // All `obituary_sent` reads/writes that race `link`/`unlink`
-            // happen under this write lock (kernel parity: `mLock`).
-            // A poisoned recipients lock means a prior panic on this
-            // proxy's death pathway — log + return best-effort instead
-            // of panicking the serve loop.
+            // `obituary_sent` is touched only under this lock; poison logs, never panics.
             let mut recipients = match self.recipients.write() {
                 Ok(g) => g,
                 Err(_) => {
@@ -113,11 +129,7 @@ impl RpcProxy {
             self.obituary_sent.store(true, Ordering::Relaxed);
             snapshot
         };
-        // Callbacks outside the lock so a recipient may re-enter
-        // `unlink_to_death`/`link_to_death` without self-deadlock
-        // (AOSP unlocks before `reportOneDeath`). Panic-isolated so one
-        // buggy recipient cannot abort the serve thread or starve the
-        // rest.
+        // Unlocked so a recipient may re-link/unlink (AOSP `reportOneDeath`); panic-isolated.
         for weak in &snapshot {
             let Some(recipient) = weak.upgrade() else {
                 continue;
@@ -144,38 +156,12 @@ impl RpcProxy {
         self.addr
     }
 
-    /// Stamp the interface descriptor — known only to
-    /// the generated typed stub at compile time — onto this
-    /// **already-cached** proxy, in place. First write wins and is
-    /// idempotent for the same interface (one wire address identifies
-    /// one remote object = one interface). Never replaces the proxy:
-    /// a replacement would send a second `DEC_STRONG` on drop and
-    /// split the per-address dedup cache.
-    ///
-    /// Because the generated `from_binder` stamps *its own*
-    /// `$descriptor` here **before** its `binder.descriptor() !=
-    /// $descriptor` check, that check is self-referential for a fresh
-    /// RPC proxy: unlike the kernel `ProxyHandle` path it does **not**
-    /// validate the remote's actual interface. A wrong-interface cast
-    /// is not rejected at `from_binder`; it surfaces as a transact-time
-    /// `StatusCode` when the server rejects the interface token. This
-    /// is inherent to the Android RPC wire (no descriptor transmitted),
-    /// not a defect — `first write wins` additionally protects an
-    /// in-use proxy from a later differing cast (the second
-    /// `from_binder`'s descriptor check then returns `None`).
-    ///
-    /// **Return**: `true` if this call wrote the descriptor, `false`
-    /// if it was already stamped. Surfacing the `OnceLock::set` result
-    /// lets a caller distinguish fresh-stamp from already-stamped
-    /// without an extra `descriptor()` round-trip; existing callers
-    /// (generator `from_binder`) can keep ignoring the result with
-    /// `let _ = …`.
+    /// Stamp `descriptor` in place, first write wins; `true` if this call wrote it. See module doc.
     pub(crate) fn stamp_descriptor(&self, descriptor: &str) -> bool {
         self.descriptor.set(descriptor.to_string()).is_ok()
     }
 
-    /// The stamped descriptor, or `""` if not yet stamped (a proxy
-    /// fresh off the wire before its typed stub is built).
+    /// The stamped descriptor, or `""` for a proxy fresh off the wire.
     fn descriptor_str(&self) -> &str {
         self.descriptor.get().map(String::as_str).unwrap_or("")
     }
@@ -187,8 +173,7 @@ impl RpcProxy {
     pub fn build_request(&self, descriptor: &str) -> Result<Parcel> {
         let inner = &self.session;
         let mut data = Parcel::new();
-        // Enter RPC mode + stamp the negotiated FD policy (default
-        // `None` ⇒ `ParcelFileDescriptor::serialize` rejects FDs).
+        // FD policy defaults to `None`, so `ParcelFileDescriptor::serialize` rejects FDs.
         data.configure_rpc(
             inner.parcel_ops(),
             inner.fd_mode(),
@@ -198,14 +183,35 @@ impl RpcProxy {
         Ok(data)
     }
 
+    /// `RpcSession::caps` for a caller holding only the binder (e.g. from `read_binder`).
+    pub(crate) fn session_caps(&self) -> crate::TransportCaps {
+        self.session.caps()
+    }
+
     /// Send an outbound transaction to the remote object. Returns the
     /// reply parcel (`None` for oneway).
+    ///
+    /// A parcel is sent at most once: after `Ok` the same parcel is refused
+    /// with [`StatusCode::InvalidOperation`], as is a reply received from a
+    /// session. A parcel built by another session's proxy is refused with
+    /// [`StatusCode::BadType`] (AOSP `RpcState::validateParcel`), and so is a
+    /// parcel built for no session at all, such as [`Parcel::new`]: build the
+    /// request with [`RpcProxy::build_request`] or
+    /// [`prepare_transact`](crate::RemoteProxy::prepare_transact).
+    /// After an error raised before the send (`WouldBlock`, `DeadObject`, an
+    /// encode failure) it may be sent again as is, or dropped, which releases
+    /// the binders it reserved.
     pub fn transact(
         &self,
         code: TransactionCode,
         data: &Parcel,
         flags: TransactionFlags,
     ) -> Result<Option<Parcel>> {
+        // AOSP `validateParcel`; internal specials send `Parcel::new()` via `client_transact`.
+        if data.rpc_session_id().is_none() {
+            log::error!("RPC: the parcel was built for no session; use `build_request`");
+            return Err(StatusCode::BadType);
+        }
         self.session.client_transact(self.addr, code, data, flags)
     }
 }
@@ -243,24 +249,22 @@ impl crate::binder::RemoteProxy for RpcProxy {
 
 impl Drop for RpcProxy {
     fn drop(&mut self) {
-        // Last `Arc<RpcProxy>` for this address is going away: tell the
-        // peer to drop its strong ref. Best-effort — never panic in
-        // Drop, and a dead session simply means the peer is already
-        // gone.
-        //
-        // `queue_dec_strong` is a non-blocking mpsc enqueue handled by
-        // the session's reaper thread, rather than a synchronous send:
-        // on a single-slot session a synchronous `find_conn` would
-        // `cv.wait` if another thread already drives the slot, blocking
-        // the user's hot path for the full peer round-trip.
+        // Never waits on a slot in a user `Drop`: see session module doc "Deferred `DEC_STRONG`".
         let inner = &self.session;
-        inner.queue_dec_strong(self.addr);
-        // Identity-checked: if this proxy's `Arc` already hit 0 and
-        // a concurrent `read_binder` re-cached a fresh live proxy
-        // for the same address, this stale `Drop` must NOT evict
-        // that successor (see `forget_remote_if`).
+        inner.send_dec_strong(self.addr, 1);
+        // Identity-checked: must not evict a successor re-cached by a racing `read_binder`.
         inner.forget_remote_if(&self.addr, self as *const RpcProxy as *const ());
     }
+}
+
+/// Why an RPC `link_to_death` was refused; logged each time (the RPC stack keeps no globals).
+fn unwatched_session_link() {
+    log::error!(
+        "link_to_death over RPC refused: nothing reads this session's connections, so its \
+         loss would go unnoticed. Open incoming connections \
+         (RpcClientConfig::incoming_connections / ClientOptions::incoming_connections) \
+         or start a serve loop with RpcSession::spawn_serve first."
+    );
 }
 
 impl IBinder for RpcProxy {
@@ -271,31 +275,33 @@ impl IBinder for RpcProxy {
     /// minus the kernel `requestDeathNotification` IPC (RPC has no
     /// death wire message).
     ///
-    /// **Detection requires the session to be served.** AOSP rejects an
-    /// RPC `linkToDeath` outright unless `getMaxIncomingThreads() >= 1`;
-    /// the rsbinder analogue is that the obituary is delivered by
-    /// [`RpcSession::serve_blocking`](super::session::RpcSession) on
-    /// connection loss, so a peer that wants death notification must
-    /// run a serve loop (it already does for nested callbacks). A
-    /// session that is never served still registers the recipient and
-    /// delivers **lazily**: the first transaction that fails on the lost
-    /// connection runs the same death sequence (obituaries + local
-    /// object release) — a documented rsbinder model property, faithful
-    /// to AOSP's incoming-thread requirement.
+    /// **Refused with [`StatusCode::InvalidOperation`] on a session that
+    /// would not notice the loss** — AOSP `BpBinder::linkToDeath` refuses an
+    /// RPC binder the same way unless its session has incoming threads. A
+    /// session notices a connection loss when something reads its
+    /// connections at all times:
     ///
-    /// A client built with
-    /// [`RpcUnixClientConfig::incoming_connections`](super::session::RpcUnixClientConfig::incoming_connections)
-    /// `≥ 1` *is* served — by the threads on its incoming (callback)
-    /// connections — so it observes the drop at once (AOSP
-    /// `onSessionAllIncomingThreadsEnded`) with no serve loop of its own.
+    /// - the server side of a session (its workers serve every connection);
+    /// - a client with incoming connections
+    ///   ([`RpcClientConfig::incoming_connections`](super::session::RpcClientConfig::incoming_connections)
+    ///   `≥ 1`), whose threads observe the drop at once;
+    /// - a session whose serve loop has been started —
+    ///   [`RpcSession::spawn_serve`](super::session::RpcSession::spawn_serve),
+    ///   or a call already inside
+    ///   [`serve_blocking`](super::session::RpcSession::serve_blocking).
+    ///
+    /// Anywhere else a recipient would hear nothing until a later call
+    /// happened to fail, so it is not registered. A call that fails on a
+    /// lost connection still runs the session's death sequence, which is
+    /// what fires the recipients registered on a session that qualifies.
     fn link_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()> {
-        // Lock first, then check `obituary_sent` — kernel/AOSP ordering
-        // (`BpBinder::linkToDeath` checks `mObitsSent` under `mLock`).
+        if !self.session.notices_connection_loss() {
+            unwatched_session_link();
+            return Err(StatusCode::InvalidOperation);
+        }
+        // Check `obituary_sent` under the lock, as AOSP `linkToDeath` checks `mObitsSent`.
         let mut recipients = self.recipients.write().map_err(|_| {
-            // A poisoned recipients lock means a prior panic on this
-            // proxy's death pathway. Surface as `DeadObject` so a
-            // caller can recover (drop the binder, re-establish) rather
-            // than panicking out of a public `IBinder` method.
+            // Poison = a prior panic on the death path; `DeadObject` lets the caller reconnect.
             StatusCode::DeadObject
         })?;
         if self.obituary_sent.load(Ordering::Relaxed) {
@@ -311,10 +317,7 @@ impl IBinder for RpcProxy {
     /// registration keeps its remaining subscriptions).
     fn unlink_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()> {
         let mut recipients = self.recipients.write().map_err(|_| {
-            // A poisoned recipients lock means a prior panic on this
-            // proxy's death pathway. Surface as `DeadObject` so a
-            // caller can recover (drop the binder, re-establish) rather
-            // than panicking out of a public `IBinder` method.
+            // Poison = a prior panic on the death path; `DeadObject` lets the caller reconnect.
             StatusCode::DeadObject
         })?;
         if self.obituary_sent.load(Ordering::Relaxed) {
@@ -354,9 +357,7 @@ impl IBinder for RpcProxy {
         true
     }
 
-    // RPC ref-count is driven by the wire `DEC_STRONG` (sent from
-    // `Drop`), not by these `SIBinder`/`WIBinder` clone/drop hooks —
-    // same no-op shape as `ProxyHandle` under the cache-pin model.
+    // The wire `DEC_STRONG` from `Drop` drives the ref-count; these hooks are no-ops.
     fn inc_strong(&self, _strong: &SIBinder) -> Result<()> {
         Ok(())
     }

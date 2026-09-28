@@ -23,7 +23,7 @@ name: Integration Test
 #     fd lifetime, socket cleanup, process-level death — paths the
 #     in-process tests can hide) and (b) a soak loop over the same
 #     hermetic tests to race-mine macOS scheduler/timing flakes (e.g.
-#     AC-12.1 cv-wait `pool_exhausted_condvar_blocks_not_busy_loops`,
+#     AC-12.1 cv-wait `pool_exhausted_third_caller_waits_for_a_free_slot`,
 #     which slipped past a single-shot run in PR #133).
 
 on:
@@ -267,6 +267,38 @@ jobs:
           RUST_BACKTRACE=1 cargo test -p tests --features rpc --test gateway_kernel -- --ignored || {
             echo "::error::gateway_kernel (rpc -> gateway -> kernel) failed"
             cp -f rsb_hub.log artifacts/gateway-rsb_hub.log 2>/dev/null || true
+            exit 1
+          }
+
+      - name: Run async_wait and entry_kernel_options (kernel-only, #[ignore]'d)
+        run: |
+          # Both need what this job already has up — /dev/binder and a
+          # permissive rsb_hub — and are `#[ignore]`d everywhere else, so
+          # without this step they run in no workflow. `async_wait` is the
+          # awaitable service-manager lookups (plan 11-1): each test
+          # registers a service of its own name, so the shared test_service
+          # is neither needed nor disturbed. `entry_kernel_options` pins
+          # that a kernel option the process can no longer honor is refused.
+          # One thread: the tests share the process's binder state.
+          RUST_BACKTRACE=1 cargo test -p tests --features rpc --test async_wait --test entry_kernel_options -- --ignored --test-threads=1 || {
+            echo "::error::async_wait / entry_kernel_options failed"
+            cp -f rsb_hub.log artifacts/async-wait-rsb_hub.log 2>/dev/null || true
+            exit 1
+          }
+
+      - name: Run fmq_binder (an FMQ descriptor across the kernel binder, #[ignore]'d)
+        run: |
+          # Plan 12-fmq F2. `fmq_probe serve` in a child process makes and
+          # adopts queues whose `MQDescriptor` (fds inside) crosses the
+          # kernel driver; the test attaches, moves 5000 items each way
+          # over the blocking operations and damages the counters. Needs
+          # /dev/binder and the permissive rsb_hub; registers a name of its
+          # own, so the shared test_service is not involved. The same
+          # fixture against AOSP's libfmq on an emulator is
+          # example-hello/cpp/run_fmq_interop.sh, run by hand.
+          RUST_BACKTRACE=1 cargo test -p tests --test fmq_binder -- --ignored || {
+            echo "::error::fmq_binder failed"
+            cp -f rsb_hub.log artifacts/fmq-binder-rsb_hub.log 2>/dev/null || true
             exit 1
           }
 
@@ -688,7 +720,7 @@ jobs:
   #   (b) Hermetic soak — re-run the same RPC test set that `macos-build`
   #       runs once per PR, this time N times in a loop, to race-mine
   #       macOS-specific scheduler/timing flakes. AC-12.1 cv-wait
-  #       (`pool_exhausted_condvar_blocks_not_busy_loops`) is the
+  #       (`pool_exhausted_third_caller_waits_for_a_free_slot`) is the
   #       canonical example: a single shot passed at merge time but
   #       flaked on PR #133 with ~221 ms scheduling slack vs the ~50-100 ms
   #       assumed by the bound. The soak is the gate that would have

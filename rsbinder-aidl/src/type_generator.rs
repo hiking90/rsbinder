@@ -7,18 +7,12 @@ use crate::const_expr::{ConstExpr, InitParam, ValueType};
 use crate::error::{AidlError, ResolutionError, SemanticError};
 use crate::parser::{self, *};
 
-/// Resolves the current source name/span into the `(NamedSource, SourceSpan)`
-/// pair every type-level diagnostic needs, falling back to a placeholder
-/// filename when no source context is active (e.g. unit tests).
+/// Source and span for a type-level diagnostic; placeholder name without source context.
 fn diagnostic_source(span: Option<(usize, usize)>) -> (NamedSource<String>, SourceSpan) {
     let filename = parser::current_source_name();
     let source = parser::current_source_text();
     let (start, end) = span.unwrap_or((0, 0));
-    // Clamp into the attached source so a stale offset cannot make miette
-    // replace the snippet with an `OutOfBounds` notice. With no source
-    // context (`Generator::document()` called outside `Builder::generate`)
-    // there is nothing to render either way, so the raw offsets are kept —
-    // they are still the AIDL positions a programmatic consumer reads.
+    // Clamp against miette `OutOfBounds`; with no source, keep raw offsets for API consumers.
     let (start, end) = if source.is_empty() {
         (start, end)
     } else {
@@ -46,8 +40,7 @@ fn make_type_error(message: impl Into<String>, span: Option<(usize, usize)>) -> 
 }
 
 thread_local! {
-    // Thread-local like the rest of the compiler state (parser.rs); set by
-    // `Generator::new`, the single source of truth.
+    // Thread-local like the parser.rs compiler state; only `Generator::new` sets it.
     static IS_CRATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -82,11 +75,7 @@ impl ArrayInfo {
                 // `T[]` — variable-length dimension; 0 marks "not fixed".
                 None => sizes.push(0),
                 Some(expr) => {
-                    // A dimension that fails to evaluate must be a diagnostic:
-                    // folding it to 0 would silently demote the fixed array to
-                    // `Vec<T>`, changing the wire format. AOSP rejects failing,
-                    // negative, and non-integral dimensions; rsbinder also
-                    // rejects 0 (used internally as the "not fixed" sentinel).
+                    // AOSP rejects bad/negative/non-integral sizes; 0 is our "not fixed" sentinel.
                     let calculated = expr.calculate().map_err(|e| {
                         make_type_error(
                             format!("cannot evaluate fixed-size array dimension: {}", e.message),
@@ -157,6 +146,8 @@ pub struct TypeGenerator {
     pub(crate) is_nullable: bool,
     pub value_type: ValueType,
     array_types: Vec<ArrayInfo>,
+    /// User-defined generic's arguments, bare or as array/`List` element; empty otherwise.
+    type_args: Vec<TypeGenerator>,
     pub identifier: String,
     direction: Direction,
     type_span: Option<(usize, usize)>,
@@ -165,6 +156,7 @@ pub struct TypeGenerator {
 impl TypeGenerator {
     pub fn new(aidl_type: &NonArrayType) -> Result<Self, AidlError> {
         let mut array_types = Vec::new();
+        let mut type_args = Vec::new();
         let value_type = match aidl_type.name.as_str() {
             "boolean" => ValueType::Bool(false),
             "byte" => ValueType::Byte(0),
@@ -178,25 +170,28 @@ impl TypeGenerator {
             "IBinder" => ValueType::IBinder,
             "List" => match &aidl_type.generic {
                 Some(gen) => {
-                    // The grammar admits an array-typed generic argument
-                    // (`List<int[]>`), but a list-of-array element would be
-                    // stored as `ValueType::Array` and later hit the
-                    // `panic!` in `type_decl`. Reject it here with a proper
-                    // diagnostic (AOSP `aidl` likewise rejects list-of-array
-                    // semantically) rather than crashing the generator.
-                    let elem = gen.to_value_type()?;
+                    // `List<int[]>` parses but would hit `type_decl`'s panic; AOSP rejects it too.
+                    let args = gen.type_args();
+                    if args.len() != 1 {
+                        return Err(make_type_error(
+                            format!(
+                                "List can only have one type parameter, but got {}",
+                                args.len()
+                            ),
+                            aidl_type.name_span,
+                        ));
+                    }
+                    let elem_generator = Self::new_with_type(&args[0])?;
+                    // `List<Foo<int>>`: the list carries its element's type arguments.
+                    type_args = elem_generator.type_args;
+                    let elem = elem_generator.value_type;
                     if matches!(elem, ValueType::Array(_)) {
                         return Err(make_type_error(
                             "List element type cannot be an array",
                             aidl_type.name_span,
                         ));
                     }
-                    // `void` and `ParcelableHolder` have no element
-                    // representation: `Vec<()>` and
-                    // `Vec<ParcelableHolder>` have no `SerializeArray`
-                    // counterpart, so they would fail in rustc rather than
-                    // here. AOSP rejects both as `List` elements
-                    // (`aidl_language.cpp`, the `kListUsage` whitelist).
+                    // No `SerializeArray` for these; AOSP `kListUsage` (aidl_language.cpp) rejects.
                     if matches!(elem, ValueType::Void) {
                         return Err(make_type_error(
                             "List element type cannot be void",
@@ -237,12 +232,7 @@ impl TypeGenerator {
             _ => ValueType::UserDefined(aidl_type.name.to_owned()),
         };
 
-        // AOSP `AidlTypeSpecifier::CheckValid`: only `List`, `Map`, and a
-        // parameterizable user-defined type may carry type arguments. The
-        // arms above drop the generic on everything else, so `String<int>`
-        // would silently become a plain `String`. `ValueType::Array` here is
-        // the `List` arm; `UserDefined` covers both a generic parcelable and
-        // `Map` — which stays an unknown type, keeping its own diagnostic.
+        // AOSP `AidlTypeSpecifier::CheckValid`: only List (Array here) and UserDefined are generic.
         if aidl_type.generic.is_some()
             && !matches!(value_type, ValueType::Array(_) | ValueType::UserDefined(_))
         {
@@ -252,10 +242,18 @@ impl TypeGenerator {
             ));
         }
 
+        // Arity and requirements are checked later, in `ensure_resolvable` at every use site.
+        if let (ValueType::UserDefined(_), Some(generic)) = (&value_type, &aidl_type.generic) {
+            for arg in generic.type_args() {
+                type_args.push(Self::new_with_type(&arg)?);
+            }
+        }
+
         Ok(Self {
             is_nullable: false,
             value_type,
             array_types,
+            type_args,
             identifier: String::new(),
             direction: Default::default(),
             type_span: aidl_type.name_span,
@@ -268,10 +266,7 @@ impl TypeGenerator {
         let is_nullable = has_annotation(&_type.annotation_list, AnnotationType::IsNullable);
         let is_array = !_type.array_types.is_empty();
 
-        // AOSP `AidlTypeSpecifier::CheckValid` (`aidl_language.cpp`): `void`
-        // is legal only as a bare method return type, and `ParcelableHolder`
-        // has no array or nullable form. Both would otherwise generate code
-        // that compiles here but has no counterpart in any AOSP backend.
+        // AOSP `CheckValid`: void only bare, ParcelableHolder never array or nullable.
         if matches!(this.value_type, ValueType::Void) && (is_array || is_nullable) {
             return Err(make_type_error(
                 "void type cannot be an array or nullable",
@@ -294,22 +289,14 @@ impl TypeGenerator {
         }
 
         if !_type.array_types.is_empty() {
-            // An array of `List<T>` (`List<T>[]`): the non-array type is
-            // already a List (stored as `ValueType::Array`), so the
-            // trailing `[]` would be silently dropped by `array()`'s
-            // early-return — generating code byte-identical to a bare
-            // `List<T>`. AOSP rejects arrays of lists.
+            // `List<T>[]`: `array()` would drop the `[]`; AOSP rejects arrays of lists.
             if matches!(this.value_type, ValueType::Array(_)) {
                 return Err(make_type_error(
                     "an array of List is not supported",
                     _type.non_array_type.name_span,
                 ));
             }
-            // A variable-length array must be one-dimensional; multi-
-            // dimensional arrays must be fixed-size in *every* dimension.
-            // Otherwise the extra dimensions silently collapse into one
-            // (`int[][]`/`int[3][]`/`int[][3]` all become `Vec<i32>`),
-            // dropping wire length-prefixes. AOSP rejects this.
+            // AOSP: multi-dim arrays must be fixed in every dim, or `int[][]` becomes `Vec<i32>`.
             if _type.array_types.len() > 1
                 && _type.array_types.iter().any(|a| a.const_expr.is_none())
             {
@@ -343,12 +330,9 @@ impl TypeGenerator {
     /// `ResolutionError::UnknownType` diagnostic instead of a panic. Must be
     /// invoked while the owning declaration's `NamespaceGuard` is active.
     pub fn ensure_resolvable(&self) -> Result<(), AidlError> {
-        let check = |value_type: &ValueType| -> Result<(), AidlError> {
+        let check = |value_type: &ValueType| -> Result<Option<LookupDecl>, AidlError> {
             if let ValueType::UserDefined(name) = value_type {
-                // `lookup_decl_from_name` falls back to the *current* namespace's
-                // own declaration when nothing matches, so an undefined type does
-                // not return `None`; confirm the resolved declaration's simple
-                // name actually equals the requested one to detect that case.
+                // Lookup falls back to the current decl on a miss, so compare the simple name.
                 let requested = name.rsplit('.').next().unwrap_or(name.as_str());
                 let resolved = lookup_decl_from_name(name, crate::Namespace::AIDL)
                     .filter(|lookup_decl| lookup_decl.decl.name() == requested);
@@ -360,15 +344,135 @@ impl TypeGenerator {
                         span,
                     }));
                 }
+                return Ok(resolved);
             }
-            Ok(())
+            Ok(None)
         };
 
-        check(&self.value_type)?;
+        let mut named = check(&self.value_type)?;
         for array_info in &self.array_types {
-            check(&array_info.value_type)?;
+            if let Some(found) = check(&array_info.value_type)? {
+                named = Some(found);
+            }
+        }
+        for arg in &self.type_args {
+            arg.ensure_resolvable()?;
+        }
+        match named {
+            Some(lookup_decl) => self.ensure_type_args(&lookup_decl),
+            None => Ok(()),
+        }
+    }
+
+    /// AOSP `AidlTypeSpecifier::CheckValid` for a user-defined generic's arguments.
+    fn ensure_type_args(&self, lookup_decl: &LookupDecl) -> Result<(), AidlError> {
+        let params: &[parser::TypeParam] = match &lookup_decl.decl {
+            Declaration::Parcelable(decl) => &decl.type_params,
+            Declaration::Union(decl) => &decl.type_params,
+            _ => &[],
+        };
+        let name = lookup_decl.decl.name();
+        if params.is_empty() {
+            if !self.type_args.is_empty() {
+                return Err(make_type_error(
+                    format!("'{name}' is not a generic type"),
+                    self.type_span,
+                ));
+            }
+            return Ok(());
+        }
+        if params.len() != self.type_args.len() {
+            return Err(make_type_error(
+                format!(
+                    "'{name}' must have {} type parameters, but got {}",
+                    params.len(),
+                    self.type_args.len()
+                ),
+                self.type_span,
+            ));
+        }
+        for (param, arg) in params.iter().zip(&self.type_args) {
+            // AOSP `GetRustName` drops `[]`, mis-names `List`; refusing `void` is an rsbinder rule.
+            let unsupported = match &arg.value_type {
+                ValueType::Array(_) => Some("an array or List"),
+                ValueType::Void => Some("void"),
+                _ => None,
+            };
+            if let Some(what) = unsupported {
+                return Err(make_type_error(
+                    format!("'{name}': a type argument cannot be {what}"),
+                    arg.type_span,
+                ));
+            }
+            // AOSP reads every parameter annotation as a requirement; any other is never met.
+            for requirement in &param.annotation_list {
+                let satisfied = match requirement.annotation.as_str() {
+                    "@FixedSize" => arg.can_be_fixed_size(),
+                    "@VintfStability" => arg.is_vintf_declaration(),
+                    _ => false,
+                };
+                if !satisfied {
+                    return Err(make_type_error(
+                        format!(
+                            "type '{}' used as type parameter '{}' of '{name}' must be \
+                             annotated with {}",
+                            arg.aidl_name(),
+                            param.name,
+                            requirement.annotation
+                        ),
+                        arg.type_span,
+                    ));
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Whether this is a bare user-defined type in `@VintfStability` scope (own or enclosing).
+    fn is_vintf_declaration(&self) -> bool {
+        if !self.array_types.is_empty() {
+            return false;
+        }
+        match &self.value_type {
+            ValueType::UserDefined(name) => lookup_decl_from_name(name, crate::Namespace::AIDL)
+                .is_some_and(|lookup| parser::is_vintf_scoped(&lookup.ns)),
+            _ => false,
+        }
+    }
+
+    /// The type as the AIDL author wrote its head, for diagnostics.
+    fn aidl_name(&self) -> String {
+        fn head(value_type: &ValueType) -> String {
+            match value_type {
+                ValueType::Bool(_) => "boolean".into(),
+                ValueType::Byte(_) => "byte".into(),
+                ValueType::Char(_) => "char".into(),
+                ValueType::Int32(_) => "int".into(),
+                ValueType::Int64(_) => "long".into(),
+                ValueType::Float(_) => "float".into(),
+                ValueType::Double(_) => "double".into(),
+                ValueType::String(_) => "String".into(),
+                ValueType::IBinder => "IBinder".into(),
+                ValueType::FileDescriptor => "ParcelFileDescriptor".into(),
+                ValueType::Holder => "ParcelableHolder".into(),
+                ValueType::Void => "void".into(),
+                ValueType::UserDefined(name) => name.clone(),
+                other => other.to_value_string(),
+            }
+        }
+        let name = match &self.value_type {
+            ValueType::Array(_) => self
+                .array_types
+                .first()
+                .map(|info| format!("{}[]", head(&info.value_type)))
+                .unwrap_or_default(),
+            other => head(other),
+        };
+        if self.is_nullable {
+            format!("@nullable {name}")
+        } else {
+            name
+        }
     }
 
     /// Reject a field that closes a reference cycle without a form that can
@@ -382,10 +486,7 @@ impl TypeGenerator {
     /// process. AOSP likewise makes the cycle-closing field nullable. Must be
     /// invoked while the owning declaration's `NamespaceGuard` is active.
     pub fn ensure_sized(&self) -> Result<(), AidlError> {
-        // A `Vec` element is finite whatever it holds, so only a bare field or
-        // a fixed-size array — which keeps its elements inline — can close a
-        // cycle. Nullability rescues the former; nothing rescues the latter,
-        // since `Box<T>` implements no array codec.
+        // Only bare fields (`@nullable` rescues) and inline `[T; N]` (no Box codec) close cycles.
         let (type_name, nullable_rescues) = match &self.value_type {
             ValueType::UserDefined(name) => (name, true),
             ValueType::Array(_) => match self.array_types.first() {
@@ -438,10 +539,7 @@ impl TypeGenerator {
         }
     }
 
-    // Would a by-value field of `lookup_decl` make the enclosing Rust struct
-    // infinitely sized? Only a parcelable or union holds its declaration
-    // inline; an interface is a `Strong<dyn …>` handle and an enum is a
-    // scalar, so neither can close a cycle.
+    // Only a parcelable or union is held inline; interfaces are handles and enums are scalars.
     fn closes_reference_cycle(lookup_decl: &crate::parser::LookupDecl) -> bool {
         if !matches!(
             lookup_decl.decl,
@@ -459,35 +557,38 @@ impl TypeGenerator {
         refers_to_self || crate::parser::declaration_reaches(&lookup_decl.ns, &curr_ns)
     }
 
-    /// `allow_box` is false in an array element position: `Vec<T>` and
-    /// `[T; N]` never take the box a cycle-closing field does. For `Vec<T>`
-    /// the allocation already makes the field finite, and `Box<T>` implements
-    /// neither `SerializeArray` nor `DeserializeArray`, so boxing an element
-    /// would emit code that does not compile. A fixed-size array cannot be
-    /// rescued at all and is rejected by [`Self::ensure_sized`].
+    /// `allow_box` is false for array elements: `Box<T>` has no `SerializeArray` impl.
     fn make_user_defined_type_name(&self, type_name: &str, allow_box: bool) -> String {
         let lookup_decl = lookup_decl_from_name(type_name, crate::Namespace::AIDL)
             .expect("type must be resolved during code generation");
         let curr_ns = current_namespace();
         let ns = curr_ns.relative_mod(&lookup_decl.ns);
-        // Escape the simple type name if it is a Rust keyword (AIDL allows it)
-        // so the generated path / `Strong<dyn …>` / `Box<…>` compiles. The
-        // `relative_mod` module path is already keyword-escaped.
+        // AIDL allows Rust keywords as names; `relative_mod` already escaped the module path.
         let simple = crate::escape_rust_keyword(lookup_decl.name.ns.last().unwrap());
         let is_interface = matches!(lookup_decl.decl, Declaration::Interface(_));
-        // Only `@nullable` earns the box. The `Option` is what gives the field
-        // a terminating `Default`; a bare `Box<T>` would make the generated
-        // `Default` impl recurse until the stack runs out — and that `Default`
-        // is the deserialization entry point, not decoration.
-        // `ensure_sized` rejects the non-nullable case with a diagnostic.
+        // Only `@nullable` boxes: `Option` ends `Default` recursion; `ensure_sized` rejects others.
         let needs_box = allow_box
             && self.is_nullable
             && !is_interface
             && Self::closes_reference_cycle(&lookup_decl);
-        let path = if !ns.is_empty() {
+        // A builtin is the runtime crate's type, not a module of this output.
+        let path = if let Some(builtin) = parser::builtin_rust_path(&lookup_decl.ns) {
+            format!("{}::{builtin}", crate_name())
+        } else if !ns.is_empty() {
             format!("{ns}::{simple}")
         } else {
             simple.into_owned()
+        };
+        // AOSP `GetRustName` names an argument bare: `Option`/`Vec`/`&` wrap only the whole type.
+        let path = if self.type_args.is_empty() {
+            path
+        } else {
+            let args: Vec<String> = self
+                .type_args
+                .iter()
+                .map(|arg| arg.type_arg_decl())
+                .collect();
+            format!("{path}<{}>", args.join(", "))
         };
         let name = if needs_box {
             format!("Box<{path}>")
@@ -500,6 +601,11 @@ impl TypeGenerator {
         } else {
             name
         }
+    }
+
+    /// Bare Rust name as a type argument; the parser refuses `@nullable` there.
+    fn type_arg_decl(&self) -> String {
+        self.type_decl(&self.value_type, false)
     }
 
     // AIDL Enum is a kind of primitive type.
@@ -516,10 +622,7 @@ impl TypeGenerator {
         }
     }
 
-    // `@nullable T[]` wraps each element only for a non-primitive, non-enum
-    // element (AOSP `aidl_to_rust.cpp::UsesOptionInNullableVector`): a
-    // primitive is written bare, so `Vec<Option<i32>>` would put a null-marker
-    // word before every value that the peer does not expect.
+    // AOSP `UsesOptionInNullableVector`: primitives and enums stay bare (no null-marker word).
     fn nullable_element(value_type: &ValueType, type_name: &str) -> String {
         if Self::is_primitive(value_type) {
             type_name.to_owned()
@@ -531,16 +634,16 @@ impl TypeGenerator {
     /// Can a field of this type appear in a `@FixedSize` parcelable or union?
     ///
     /// Ports AOSP `AidlTypenames::CanBeFixedSize` (`aidl_typenames.cpp`): a
-    /// generic (`List<T>`), a `@nullable` type, and a variable-length array
-    /// are all variable size; primitives and enums are fixed; a parcelable or
-    /// union is fixed only if it is itself `@FixedSize`; every other builtin
-    /// (`String`, `IBinder`, `ParcelFileDescriptor`, `ParcelableHolder`) and
-    /// every interface handle is not. Must be invoked while the owning
-    /// declaration's `NamespaceGuard` is active: a `UserDefined` name that
-    /// fails to resolve is reported as non-fixed, which would reject valid
-    /// input.
+    /// generic (`List<T>` or `Foo<T>`, whatever `Foo` is annotated), a
+    /// `@nullable` type, and a variable-length array are all variable size;
+    /// primitives and enums are fixed; a parcelable or union is fixed only if
+    /// it is itself `@FixedSize`; every other builtin (`String`, `IBinder`,
+    /// `ParcelFileDescriptor`, `ParcelableHolder`) and every interface handle
+    /// is not. Must be invoked while the owning declaration's
+    /// `NamespaceGuard` is active: a `UserDefined` name that fails to resolve
+    /// is reported as non-fixed, which would reject valid input.
     pub fn can_be_fixed_size(&self) -> bool {
-        if self.is_nullable {
+        if self.is_nullable || !self.type_args.is_empty() {
             return false;
         }
         let element = match self.array_types.first() {
@@ -568,8 +671,7 @@ impl TypeGenerator {
                 match lookup_decl_from_name(name, crate::Namespace::AIDL) {
                     Some(lookup_decl) => match &lookup_decl.decl {
                         Declaration::Enum(_) => true,
-                        // `@FixedSize` is not scoped: a nested declaration does
-                        // not inherit it from its enclosing type.
+                        // `@FixedSize` is not scoped: nested declarations do not inherit it.
                         Declaration::Parcelable(decl) => {
                             has_annotation(&decl.annotation_list, AnnotationType::FixedSize)
                         }
@@ -589,13 +691,18 @@ impl TypeGenerator {
     /// element type when it is an array or a `List<T>`. Used to walk a
     /// `@VintfStability` declaration's reference closure.
     pub fn referenced_user_types(&self) -> Vec<&str> {
-        std::iter::once(&self.value_type)
+        let mut names: Vec<&str> = std::iter::once(&self.value_type)
             .chain(self.array_types.iter().map(|info| &info.value_type))
             .filter_map(|value_type| match value_type {
                 ValueType::UserDefined(name) => Some(name.as_str()),
                 _ => None,
             })
-            .collect()
+            .collect();
+        // A type argument is part of the signature too (`Foo<Bar>` names `Bar`).
+        for arg in &self.type_args {
+            names.extend(arg.referenced_user_types());
+        }
+        names
     }
 
     /// Can a `const` have this type?
@@ -688,8 +795,7 @@ impl TypeGenerator {
                     | ValueType::Holder => true,
                     ValueType::UserDefined(name) => {
                         match lookup_decl_from_name(name, crate::Namespace::AIDL) {
-                            // Strong<dyn IFoo> has no sensible Default, so struct
-                            // interface fields must be represented as Option<Strong<_>>.
+                            // `Strong<dyn IFoo>` has no Default: fields are `Option<Strong<_>>`.
                             Some(lookup_decl) => {
                                 !matches!(lookup_decl.decl, Declaration::Interface(_))
                             }
@@ -848,8 +954,7 @@ impl TypeGenerator {
     }
 
     fn list_type_decl_fixed(&self, array_info: &ArrayInfo, is_struct: bool) -> String {
-        // A fixed-size array's wrapping is direction-independent: only
-        // nullability decides whether it is wrapped in `Option<_>`.
+        // Fixed-size array wrapping ignores direction; only nullability adds `Option<_>`.
         let fixed_array = self.make_fixed_array(array_info, is_struct);
         if self.is_nullable {
             format!("Option<{fixed_array}>")
@@ -885,9 +990,7 @@ impl TypeGenerator {
                         Self::nullable_element(&sub_type.value_type, &type_name)
                     )
                 } else {
-                    // AOSP `RustNameOf` keeps `element_mode = VALUE` for
-                    // `INOUT_ARGUMENT`: the vector is read from the parcel
-                    // fully populated, so no element needs a `Default`.
+                    // AOSP `RustNameOf` INOUT: read fully populated, no element needs `Default`.
                     format!("Vec<{type_name}>")
                 }
             }
@@ -925,7 +1028,6 @@ impl TypeGenerator {
             ValueType::Array(_) => {
                 // Vec<> is managed other functions. Therefore, here we just use a panic.
                 panic!("type_decl() can't process Array Type.")
-                // Self::type_decl(sub_value.expect("Array must know the type of item."), None)
             }
             ValueType::IBinder => format!("{}::SIBinder", crate_name()),
             ValueType::FileDescriptor => format!("{}::ParcelFileDescriptor", crate_name()),
@@ -940,7 +1042,7 @@ impl TypeGenerator {
         let name = match &self.value_type {
             ValueType::Array(_) => self.list_type_decl(is_struct),
             _ => {
-                // No-`Default` types are `Option<T>` for fields and `out` locals; `inout` is read from the parcel (AOSP `RustNameOf`).
+                // No-`Default` fields and `out` locals are `Option<T>`; AOSP `RustNameOf`.
                 if !Self::can_be_defaulted(&self.value_type, is_struct)
                     && (is_struct || matches!(self.direction, Direction::Out))
                 {
@@ -1065,9 +1167,7 @@ impl TypeGenerator {
                 }
             }
             Direction::Inout => {
-                // Must mirror `list_type_decl`'s `Inout` arm exactly: the
-                // server declares its local with that type and passes
-                // `&mut` it straight into this signature.
+                // Must match `list_type_decl`'s `Inout` arm: the server passes `&mut` its local.
                 if self.is_nullable {
                     format!(
                         "&mut Option<Vec<{}>>",
@@ -1118,8 +1218,7 @@ impl TypeGenerator {
                         ));
                     }
                     let name = self.type_decl(&self.value_type, true);
-                    // Mirrors `type_declaration`: an `out` argument of a type
-                    // with no `Default` is wrapped in `Option`.
+                    // Mirrors `type_declaration`: a no-`Default` `out` arg is wrapped in `Option`.
                     if self.is_nullable
                         || (matches!(self.direction, Direction::Out)
                             && !Self::can_be_defaulted(&self.value_type, false))
@@ -1146,12 +1245,10 @@ impl TypeGenerator {
     }
 
     pub fn const_type_decl(&self) -> Result<String, AidlError> {
-        // A String-element const array renders its elements as string
-        // literals, which do not coerce to `String` in const position.
+        // String const arrays hold literals, which do not coerce to `String` in const position.
         if matches!(self.value_type, ValueType::Array(_)) {
             if let Some(info) = self.array_types.first() {
-                // Must match `init_array_branch`'s predicate exactly: that is
-                // what decides whether each element is emitted as `Some(..)`.
+                // Must match `init_array_branch`'s predicate, which decides `Some(..)` elements.
                 let element = |name: &str| {
                     if self.is_nullable && Self::is_aidl_nullable(&info.value_type) {
                         format!("Option<{name}>")
@@ -1170,9 +1267,7 @@ impl TypeGenerator {
                 if is_str && !info.is_fixed() {
                     return Ok(outer(format!("&[{}]", element("&str"))));
                 }
-                // A fixed-size array constant is emitted by value: its
-                // initializer is an array literal (`[1,2,3,]`), which does not
-                // coerce to a slice reference in const position.
+                // Fixed-size consts are by value: `[1,2,3,]` does not coerce to a slice in const.
                 if info.is_fixed() {
                     let base = if is_str {
                         element("&str")
@@ -1244,14 +1339,7 @@ impl TypeGenerator {
         )
     }
 
-    /// Initializer for a fixed-size array whose `Default::default()` would
-    /// not compile. `Default` is only implemented for arrays up to length
-    /// 32, so a non-nullable fixed-size array with any dimension > 32 needs
-    /// an explicit `std::array::from_fn` (one per dimension; sizes inferred
-    /// from the field/param type annotation). Returns `None` (keep
-    /// `Default::default()`, unchanged output) for nullable arrays
-    /// (`Option<[T;N]>::default()` is `None`) and for arrays whose every
-    /// dimension is <= 32.
+    /// `std::array::from_fn` init for a non-nullable array with a dim > 32 (no `Default` impl).
     fn fixed_array_default(&self) -> Option<String> {
         if self.is_nullable {
             return None;
@@ -1280,7 +1368,7 @@ impl TypeGenerator {
                             format!(
                                 "{}::{}",
                                 self.make_user_defined_type_name(name, false),
-                                first.identifier
+                                crate::escape_rust_keyword(&first.identifier)
                             )
                         }
                         _ => "Default::default()".to_owned(),
@@ -1343,8 +1431,7 @@ impl TypeGenerator {
 
         match &calculated.value {
             ValueType::Reference { enum_type, .. } => {
-                // Same member names are common across enums; ensure a default
-                // belongs to the field's enum family before rendering Rust.
+                // Member names repeat across enums; the default must belong to the field's enum.
                 if enum_type != &target_enum {
                     return Err(make_type_error(
                         format!(
@@ -1412,10 +1499,7 @@ impl TypeGenerator {
             ));
         };
 
-        let mut enum_values = Vec::new();
-        for value in values {
-            enum_values.push(self.validate_enum_value(&value, target_lookup)?);
-        }
+        let enum_values = self.validate_enum_elements(&values, target_lookup)?;
         if let Some(info) = self.array_types.first() {
             self.check_fixed_arity(&enum_values, &info.sizes)?;
         }
@@ -1427,17 +1511,32 @@ impl TypeGenerator {
         ))
     }
 
-    /// A fixed-size array default must supply exactly the declared number of
-    /// elements per dimension — a mismatched literal would emit a
-    /// non-compiling `[T; N]` initializer instead of an AIDL diagnostic.
+    // A nested array literal is one dimension of a multi-dimensional enum array.
+    fn validate_enum_elements(
+        &self,
+        values: &[ConstExpr],
+        target_lookup: &LookupDecl,
+    ) -> Result<Vec<ConstExpr>, AidlError> {
+        values
+            .iter()
+            .map(|value| match &value.value {
+                ValueType::Array(inner) => Ok(ConstExpr::new(ValueType::Array(
+                    self.validate_enum_elements(inner, target_lookup)?,
+                ))),
+                _ => self.validate_enum_value(value, target_lookup),
+            })
+            .collect()
+    }
+
+    /// Rank per dimension and exact count per fixed one, else the initializer would not compile.
     fn check_fixed_arity(&self, values: &[ConstExpr], sizes: &[i64]) -> Result<(), AidlError> {
+        // `List<T>` carries no dims: it is one variable-length dimension.
+        let sizes: &[i64] = if sizes.is_empty() { &[0] } else { sizes };
         let Some((&dim, rest)) = sizes.split_first() else {
             return Ok(());
         };
-        if dim <= 0 {
-            return Ok(()); // variable-length dimension
-        }
-        if values.len() as i64 != dim {
+        // A variable-length dimension (0) skips only the count check.
+        if dim > 0 && values.len() as i64 != dim {
             return Err(make_type_error(
                 format!(
                     "fixed-size array default has {} element(s), expected {dim}",
@@ -1447,8 +1546,18 @@ impl TypeGenerator {
             ));
         }
         for v in values {
-            if let ValueType::Array(inner) = &v.value {
-                self.check_fixed_arity(inner, rest)?;
+            match (&v.value, rest.is_empty()) {
+                (ValueType::Array(inner), false) => self.check_fixed_arity(inner, rest)?,
+                (ValueType::Array(_), true) | (_, false) => {
+                    return Err(make_type_error(
+                        format!(
+                            "array default element {} has the wrong rank",
+                            v.to_value_string()
+                        ),
+                        self.type_span,
+                    ))
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -1461,8 +1570,7 @@ impl TypeGenerator {
         param: InitParam,
         is_nullable: bool,
     ) -> Result<String, AidlError> {
-        // Evaluation/conversion failure is a user-facing diagnostic (AOSP
-        // rejects), never a silent `Default::default()`.
+        // Evaluation failure is a diagnostic (AOSP rejects), never `Default::default()`.
         let converted = expr
             .calculate()
             .and_then(|c| c.convert_to(&array_info.value_type))
@@ -1481,9 +1589,7 @@ impl TypeGenerator {
         ))
     }
 
-    /// Renders the initializer for an array-typed field/const default.
-    /// Returns the bare initializer; the outer `Option` wrap (when nullable) is
-    /// applied by `init_value`.
+    /// Bare initializer for an array default; `init_value` adds the nullable `Some(..)`.
     fn init_array_branch(&self, expr: &ConstExpr, param: InitParam) -> Result<String, AidlError> {
         let array_info = self.array_types.first().expect("array_types is empty.");
         let is_nullable = self.is_nullable && Self::is_aidl_nullable(&array_info.value_type);
@@ -1504,31 +1610,25 @@ impl TypeGenerator {
         self.init_array_value(expr, array_info, param, is_nullable)
     }
 
-    /// Renders the initializer for a scalar (non-array) field/const default.
-    /// Returns the bare initializer; the outer `Option` wrap (when nullable) is
-    /// applied by `init_value`. Enum-typed targets are always primitive and
-    /// thus never nullable, so the wrap is a no-op for them.
+    /// Bare initializer for a scalar default; `init_value` adds `Some(..)` (never for enums).
     fn init_scalar_branch(&self, expr: &ConstExpr, param: InitParam) -> Result<String, AidlError> {
         if let Some(enum_lookup) = self.enum_lookup() {
             return self.init_enum_value(expr, &enum_lookup, param);
         }
 
         let scalar_param = param.with_fixed_array(false).with_nullable(false);
-        // Evaluation failures below are user-facing diagnostics (AOSP rejects
-        // all of them at build time), never a fabricated default.
+        // Every failure below is a diagnostic (AOSP rejects at build time), never a default.
         let calculated = expr
             .calculate()
             .map_err(|e| make_type_error(e.message, self.type_span))?;
-        // A value that is *still* a bare name means the reference does not
-        // resolve at all (typo / missing import).
+        // Still a bare name: the reference does not resolve (typo or missing import).
         if let ValueType::Name(name) = &calculated.value {
             return Err(make_type_error(
                 format!("cannot resolve constant reference '{name}'"),
                 self.type_span,
             ));
         }
-        // An array literal on a scalar target would sail through the
-        // element-wise `convert_to` below and emit a slice initializer.
+        // `convert_to` is element-wise, so an array literal would pass and emit a slice.
         if matches!(calculated.value, ValueType::Array(_)) {
             return Err(make_type_error(
                 format!(
@@ -1539,17 +1639,27 @@ impl TypeGenerator {
             ));
         }
         Ok(match &calculated.value {
-            // An enum reference whose target is the enum type keeps the
-            // symbolic member; a primitive target (e.g. int) takes its value.
-            ValueType::Reference { value, .. } => {
-                if matches!(&self.value_type, ValueType::UserDefined(_)) {
-                    calculated.value.to_init(scalar_param)
-                } else {
-                    ValueType::Int64(*value).to_init(scalar_param)
-                }
+            // Enum targets returned above: a `UserDefined` target is a non-enum (AOSP rejects).
+            ValueType::Reference { .. }
+                if matches!(&self.value_type, ValueType::UserDefined(_)) =>
+            {
+                return Err(make_type_error(
+                    format!(
+                        "enum reference {} cannot initialize the non-enum type {}",
+                        calculated.to_value_string(),
+                        self.type_decl(&self.value_type, true)
+                    ),
+                    self.type_span,
+                ));
             }
-            // A type-mismatched default (e.g. `const int A = "x";`) fails
-            // `convert_to` and is diagnosed here, matching AOSP.
+            ValueType::Reference {
+                enum_type, value, ..
+            } => parser::enum_reference_promoted(enum_type, *value)
+                .convert_to(&self.value_type)
+                .map_err(|e| make_type_error(e.message, self.type_span))?
+                .value
+                .to_init(scalar_param),
+            // Laxer than AOSP `ValueString` for char/float/double targets; non-enum types error.
             _ => calculated
                 .convert_to(&self.value_type)
                 .map_err(|e| make_type_error(e.message, self.type_span))?
@@ -1564,13 +1674,7 @@ impl TypeGenerator {
         param: InitParam,
     ) -> Result<String, AidlError> {
         let Some(expr) = const_expr else {
-            // A non-nullable fixed-size array with any dimension > 32 cannot
-            // use `Default::default()` (Default is only implemented up to
-            // length 32). This is the parcelable struct-field path (the most
-            // common place such a field appears); `default_value` /
-            // `transaction_decl` handle the other sites. Returns `None` for
-            // nullable (`Option<[T;N]>::default()` is `None`) and for arrays
-            // whose every dimension is <= 32, so output is unchanged there.
+            // Struct-field path for dims > 32; `default_value`/`transaction_decl` cover the rest.
             if let Some(init) = self.fixed_array_default() {
                 return Ok(init);
             }
@@ -1677,8 +1781,7 @@ mod tests {
                 .type_declaration(false),
             "Vec<Option<rsbinder::SIBinder>>"
         );
-        // `inout` is read from the parcel fully populated, so its elements
-        // need no `Default` — AOSP `RustNameOf` keeps `element_mode = VALUE`.
+        // `inout` elements need no `Default`: AOSP `RustNameOf` keeps `element_mode = VALUE`.
         assert_eq!(
             array_gen
                 .clone()
@@ -1744,8 +1847,7 @@ mod tests {
                 .unwrap(),
             "&mut Vec<Option<rsbinder::ParcelFileDescriptor>>"
         );
-        // Must equal `list_type_decl(false)` for the same generator: the
-        // server passes `&mut` its local of that type into this signature.
+        // Must equal `list_type_decl(false)`: the server passes `&mut` its local here.
         assert_eq!(
             array_gen
                 .clone()
@@ -1795,8 +1897,7 @@ mod tests {
             "&mut Vec<bool>"
         );
 
-        // ITestService.aidl
-        // fn ReverseUtf8CppStringList(&self, _arg_input: Option<&[Option<String>]>, _arg_repeated: &mut Option<Vec<Option<String>>>) -> binder::Result<Option<Vec<Option<String>>>>;
+        // `ITestService.aidl` `ReverseUtf8CppStringList` input: `Option<&[Option<String>]>`.
         let gen = TypeGenerator::new(&NonArrayType {
             name: "String".to_owned(),
             generic: None,
@@ -1812,11 +1913,7 @@ mod tests {
 
     #[test]
     fn fixed_array_over_32_uses_array_from_fn_default() {
-        // A non-nullable `int[40]` field cannot use `Default::default()`
-        // (Default is only implemented for arrays up to length 32), so every
-        // default-emission path must use `std::array::from_fn`. Covers the
-        // parcelable struct-field path (`init_value(None)`) — the most common
-        // site — plus `default_value` (out-params / union members).
+        // `int[40]` has no `Default`: `init_value(None)` and `default_value` need `from_fn`.
         let big = TypeGenerator::new(&NonArrayType {
             name: "int".to_owned(),
             generic: None,
@@ -1837,8 +1934,7 @@ mod tests {
         );
         assert!(big.default_value().contains("std::array::from_fn"));
 
-        // A fixed array whose every dimension is <= 32 keeps Default::default()
-        // (Default is implemented there) — no codegen churn.
+        // Every dimension <= 32 keeps `Default::default()`.
         let small = TypeGenerator::new(&NonArrayType {
             name: "int".to_owned(),
             generic: None,

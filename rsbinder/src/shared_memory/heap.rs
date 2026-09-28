@@ -21,13 +21,18 @@
 //! that `F_SEAL_FUTURE_WRITE` leaves the owner's own mapping writable,
 //! exactly like AOSP `MemoryHeapBase.cpp`. Receivers map `PROT_READ`
 //! only when [`FLAG_READ_ONLY`] is set — and on every backend the
-//! kernel refuses a writable mapping to a peer that ignores the flag.
+//! kernel refuses a writable mapping to a peer that ignores the flag
+//! (Linux 5.1+; an older kernel lacks `F_SEAL_FUTURE_WRITE`, which
+//! `seals()` reports).
 //!
 //! `seals()` reports the **effective protections** of the fd a heap
 //! exports as `SEAL_*` bits: `F_GET_SEALS` on Linux/Android, synthesized
 //! from the kernel semantics above on macOS (`SEAL_SHRINK | SEAL_GROW`,
 //! plus `SEAL_FUTURE_WRITE` when the exported fd is read-only; never
-//! `SEAL_SEAL`).
+//! `SEAL_SEAL`). On macOS only a POSIX shm object qualifies: it has no
+//! vnode, so `st_mode` carries no `S_IFMT` bits. A regular file (resizable
+//! by any holder) yields `None`, matching `F_GET_SEALS` failing on
+//! non-memfd fds on Linux.
 //!
 //! **Aliasing.** A shared mapping is, by definition, writable by other
 //! processes at any time, so no safe accessor ever exposes it as `&[u8]`:
@@ -36,6 +41,18 @@
 //! [`SharedBytes`] view built on the same copies. Only the raw
 //! [`as_ptr`](MemoryHeapBase::as_ptr) carries AOSP's `unsecurePointer()`
 //! caveat, and it is the caller's `unsafe` to dereference.
+//!
+//! The heaps' shared state is `Send + Sync` on the same basis. Its only
+//! non-auto-`Send`/`Sync` member is the mapping's raw pointer; the region
+//! behind it has no thread affinity, and every safe access goes through
+//! `Mapping::region` — atomic loads and stores, uniformly word-sized on the
+//! word part — so concurrent `read_at`/`write_at`/`base` from several
+//! threads (or another process) are data races only in the hardware sense,
+//! never in Rust's model. Stores are gated on the heap being writable, so a
+//! `PROT_READ` mapping is never written. The atomic view relies on `mmap`
+//! returning page-aligned memory (the word part is `usize`-aligned),
+//! `AtomicUsize` having `usize`'s size and alignment, and `AtomicU8` being
+//! `repr(transparent)` over `u8`.
 
 use std::os::fd::{AsFd, OwnedFd};
 use std::ptr::NonNull;
@@ -99,10 +116,7 @@ impl Mapping {
         if writable {
             prot |= ProtFlags::WRITE;
         }
-        // SAFETY: `ptr` is null (kernel picks the address), `len` is
-        // non-zero, and `fd` is a live fd owned by the caller for the
-        // duration of the call. The returned region is owned by this
-        // `Mapping` and unmapped exactly once in `Drop`.
+        // SAFETY: null hint, `len > 0`, live `fd`; only this `Mapping`'s `Drop` unmaps it.
         let raw = unsafe {
             rustix::mm::mmap(
                 std::ptr::null_mut(),
@@ -119,18 +133,11 @@ impl Mapping {
 }
 
 impl Mapping {
-    /// The mapping as atomics (see [`Region`]): a plain `&[u8]` over
-    /// memory other processes write would assert an immutability the
-    /// hardware does not provide.
+    /// The mapping as atomics ([`Region`]): `&[u8]` would assert immutability peers can break.
     fn region(&self) -> Region<'_> {
         let words = self.len / WORD;
         let base = self.ptr.as_ptr();
-        // SAFETY: `ptr..ptr+len` is the live mapping owned by `self`
-        // (unmapped only in `Drop`) and the borrows cannot outlive it.
-        // `mmap` returns page-aligned memory, so the first `words * WORD`
-        // bytes are `usize`-aligned; `AtomicUsize` has `usize`'s size and
-        // alignment and `AtomicU8` is `repr(transparent)` over `u8`. The
-        // two slices are disjoint.
+        // SAFETY: live page-aligned mapping outlives the borrows; atomic layouts match; disjoint.
         let (words, tail) = unsafe {
             (
                 std::slice::from_raw_parts(base.cast::<AtomicUsize>(), words),
@@ -146,8 +153,7 @@ impl Mapping {
 
 impl Drop for Mapping {
     fn drop(&mut self) {
-        // SAFETY: `ptr`/`len` came from a successful `mmap` in
-        // `Mapping::map` and nothing else unmaps them.
+        // SAFETY: `ptr`/`len` came from a successful `mmap` and nothing else unmaps them.
         let _ = unsafe { rustix::mm::munmap(self.ptr.as_ptr().cast(), self.len) };
     }
 }
@@ -155,11 +161,9 @@ impl Drop for Mapping {
 /// Shared state behind both heap types.
 struct HeapInner {
     fd: OwnedFd,
-    /// macOS owner only: the `O_RDONLY` handle on the same object,
-    /// exported instead of `fd` once the heap is read-only for peers.
+    /// macOS owner only: `O_RDONLY` handle on the same object, exported once peers are RO.
     ro_fd: Option<OwnedFd>,
-    /// Export the read-only handle (macOS) — set by `FLAG_READ_ONLY` at
-    /// construction or by a later `seal_future_write`.
+    /// Export `ro_fd` (macOS); set by `FLAG_READ_ONLY` or a later `seal_future_write`.
     export_ro: AtomicBool,
     map: Option<Mapping>,
     size: usize,
@@ -168,13 +172,7 @@ struct HeapInner {
     writable: bool,
 }
 
-// SAFETY: the only non-auto-`Send`/`Sync` member is `Mapping`'s raw
-// pointer. The region behind it has no thread affinity, and every safe
-// access through `HeapInner` goes via `Mapping::region` — atomic loads and
-// stores, uniformly word-sized on the word part — so concurrent
-// `read_at`/`write_at`/`base` from several threads (or another process)
-// are data races only in the hardware sense, never in Rust's model. Stores
-// are gated on `writable`, so a `PROT_READ` mapping is never written.
+// SAFETY: every access to the raw mapping is atomic via `Mapping::region` (module doc, Aliasing).
 unsafe impl Send for HeapInner {}
 unsafe impl Sync for HeapInner {}
 
@@ -205,8 +203,7 @@ impl HeapInner {
         self.map.as_ref().map(|m| m.ptr.as_ptr())
     }
 
-    /// The fd peers receive: the read-only handle when one exists and
-    /// the heap is read-only for peers, else the primary fd.
+    /// The fd peers receive: `ro_fd` when present and `export_ro` is set, else `fd`.
     fn export_fd(&self) -> &OwnedFd {
         match &self.ro_fd {
             Some(ro) if self.export_ro.load(Ordering::Relaxed) => ro,
@@ -222,10 +219,7 @@ impl HeapInner {
         backend::get_seals(self.export_fd())
     }
 
-    /// Make every *future* exported mapping read-only
-    /// (`F_SEAL_FUTURE_WRITE` on Linux/Android; switch to the
-    /// `O_RDONLY` handle on macOS). Existing mappings stay as they are.
-    /// `InvalidOperation` when the fd refuses further seals (`F_SEAL_SEAL`).
+    /// See `MemoryHeapBase::seal_future_write`; maps `F_SEAL_SEAL`'s EPERM to `InvalidOperation`.
     fn seal_future_write(&self) -> Result<()> {
         backend::seal_future_write(&self.fd, self.ro_fd.as_ref()).map_err(|e| {
             if e == StatusCode::PermissionDenied {
@@ -238,21 +232,16 @@ impl HeapInner {
         Ok(())
     }
 
-    /// AOSP `getHeapID()` — the fd that goes on the wire, i.e. the
-    /// exported (possibly read-only) handle.
+    /// AOSP `getHeapID()`: the fd on the wire, i.e. the exported (possibly read-only) handle.
     fn impl_heap_id(&self) -> i32 {
         use std::os::fd::AsRawFd;
         self.export_fd().as_raw_fd()
     }
 }
 
-// ---------------------------------------------------------------------
-// Platform backends
-// ---------------------------------------------------------------------
+// --- Platform backends -----------------------------------------------
 
-/// What a backend allocates: the owner's fd plus, where the platform
-/// expresses read-only as a separate handle (macOS), an `O_RDONLY` fd
-/// on the same object.
+/// Backend allocation: the owner's fd plus, on macOS, an `O_RDONLY` fd on the same object.
 struct Created {
     fd: OwnedFd,
     ro_fd: Option<OwnedFd>,
@@ -274,8 +263,7 @@ mod backend {
         Ok(())
     }
 
-    /// Apply the AOSP `MemoryHeapBase` seal set. Must run *after* the
-    /// owner mapping exists so `F_SEAL_FUTURE_WRITE` does not revoke it.
+    /// AOSP `MemoryHeapBase` seal set; run *after* the owner mapping, which FUTURE_WRITE blocks.
     pub(super) fn seal(fd: &OwnedFd, flags: u32) -> Result<()> {
         let mut seals = SealFlags::GROW | SealFlags::SHRINK;
         if flags & FLAG_READ_ONLY != 0 {
@@ -286,9 +274,7 @@ mod backend {
         }
         match rustix::fs::fcntl_add_seals(fd, seals) {
             Ok(()) => Ok(()),
-            // Pre-5.1 kernels reject F_SEAL_FUTURE_WRITE with EINVAL;
-            // fall back to the remaining seals (degraded read-only
-            // enforcement, observable via `seals()`).
+            // Pre-5.1 kernel lacks FUTURE_WRITE (EINVAL): apply the rest; `seals()` shows the gap.
             Err(rustix::io::Errno::INVAL) if seals.contains(SealFlags::FUTURE_WRITE) => {
                 log::warn!("memfd F_SEAL_FUTURE_WRITE unsupported by this kernel; read-only heap is not write-sealed");
                 rustix::fs::fcntl_add_seals(fd, seals - SealFlags::FUTURE_WRITE)?;
@@ -309,12 +295,9 @@ mod backend {
     use rustix::fs::Mode;
     use rustix::shm::OFlags;
 
-    /// Opens the object twice — `O_RDWR` for the owner's mapping and
-    /// `O_RDONLY` to hand to read-only peers — then unlinks the name.
+    /// Opens the object `O_RDWR` (owner) and `O_RDONLY` (read-only peers), then unlinks it.
     pub(super) fn create(name: &str, size: usize) -> Result<Created> {
-        // PSHMNAMLEN = 31 on darwin; names are "/rsb<pid>-<ctr>-<tag>"
-        // with the tag reduced to ASCII alphanumerics so truncation
-        // never lands inside a multi-byte char.
+        // PSHMNAMLEN = 31 on darwin; an ASCII-only tag keeps truncate(31) on a char boundary.
         let pid = rustix::process::getpid().as_raw_nonzero().get();
         let tag: String = name.chars().filter(char::is_ascii_alphanumeric).collect();
         let mut last = StatusCode::Unknown;
@@ -334,8 +317,7 @@ mod backend {
                 }
                 Err(e) => return Err(e.into()),
             };
-            // The RO re-open must precede unlink; EXCL above guarantees
-            // the name is ours for that window.
+            // RO re-open before unlink; EXCL above keeps the name ours for that window.
             let ro = rustix::shm::open(shm_name.as_str(), OFlags::RDONLY, Mode::empty());
             let _ = rustix::shm::unlink(shm_name.as_str());
             let ro = ro?;
@@ -349,15 +331,12 @@ mod backend {
         Err(last)
     }
 
-    /// Size is fixed by the kernel after the single `ftruncate`; the
-    /// read-only export is selected per fd, so nothing to do here.
+    /// No-op: the kernel fixes size after the one `ftruncate`; read-only export is per fd.
     pub(super) fn seal(_fd: &OwnedFd, _flags: u32) -> Result<()> {
         Ok(())
     }
 
-    /// An owner switches its export to the `O_RDONLY` handle; a received
-    /// fd cannot be re-opened, but one that is already read-only is
-    /// trivially sealed (idempotent, like `F_ADD_SEALS`).
+    /// Owner switches export to `O_RDONLY`; a received fd passes only if already read-only.
     pub(super) fn seal_future_write(fd: &OwnedFd, ro: Option<&OwnedFd>) -> Result<()> {
         if ro.is_some() || is_read_only_fd(fd) {
             Ok(())
@@ -374,12 +353,7 @@ mod backend {
             .unwrap_or(false)
     }
 
-    /// Effective protections synthesized from darwin semantics (plan
-    /// 4-7b §1): a POSIX shm object's size is immutable after creation,
-    /// and an `O_RDONLY` fd cannot be mapped or upgraded to `PROT_WRITE`.
-    /// Only a shm object qualifies — it has no vnode, so `st_mode` carries
-    /// no `S_IFMT` bits; a regular file (resizable by any holder) yields
-    /// `None`, matching `F_GET_SEALS` failing on non-memfd fds on Linux.
+    /// Darwin-synthesized protections (plan 4-7b §1); shm objects only, see module doc `seals()`.
     pub(super) fn get_seals(fd: &OwnedFd) -> Option<u32> {
         let st = rustix::fs::fstat(fd).ok()?;
         if u32::from(st.st_mode) & u32::from(libc::S_IFMT) != 0 {
@@ -417,8 +391,7 @@ pub(super) fn is_read_only_fd<F: AsFd>(fd: F) -> bool {
     backend::is_read_only_fd(fd)
 }
 
-/// Effective protections (`SEAL_*` bits) of a bare fd, before any
-/// mapping exists — the fd-level form of [`MappedHeap::seals`].
+/// `SEAL_*` protections of a bare fd before any mapping (fd form of [`MappedHeap::seals`]).
 pub(crate) fn fd_seals(fd: &OwnedFd) -> Option<u32> {
     backend::get_seals(fd)
 }
@@ -432,9 +405,7 @@ pub const fn is_supported() -> bool {
     ))
 }
 
-// ---------------------------------------------------------------------
-// MemoryHeapBase — owner side
-// ---------------------------------------------------------------------
+// --- MemoryHeapBase: owner side --------------------------------------
 
 /// Owner-side heap: AOSP `MemoryHeapBase` (anonymous / `FORCE_MEMFD`
 /// constructor). See the [module doc](self) for the per-target backing
@@ -442,8 +413,8 @@ pub const fn is_supported() -> bool {
 ///
 /// `size` is rounded up to a whole number of pages, as in AOSP. The
 /// owner's own mapping is always writable, even with [`FLAG_READ_ONLY`]
-/// — that flag restricts *receivers* (and, on Linux/Android, any future
-/// mapping via `F_SEAL_FUTURE_WRITE`).
+/// — that flag restricts *receivers* (and, on Linux/Android with a 5.1+
+/// kernel, any future mapping via `F_SEAL_FUTURE_WRITE`).
 pub struct MemoryHeapBase(HeapInner);
 
 impl std::fmt::Debug for MemoryHeapBase {
@@ -577,9 +548,7 @@ impl IMemoryHeap for MemoryHeapBase {
     }
 }
 
-// ---------------------------------------------------------------------
-// MappedHeap — receiver side
-// ---------------------------------------------------------------------
+// --- MappedHeap: receiver side ---------------------------------------
 
 /// Receiver-side heap: an fd that arrived through a parcel, mapped with
 /// the wire geometry. AOSP `BpMemoryHeap::assertReallyMapped()`
@@ -815,9 +784,7 @@ mod tests {
         );
     }
 
-    /// Copies that start and end inside a word, span several words, and
-    /// run into the sub-word tail of an odd-sized mapping all round-trip,
-    /// and a partial-word store leaves its neighbours alone.
+    /// Intra-word, multi-word and odd-tail copies round-trip; partial-word stores spare neighbours.
     #[test]
     fn unaligned_copies_round_trip_and_preserve_neighbours() {
         let ps = page_size();
@@ -857,9 +824,7 @@ mod tests {
         h.write_at(0, b"owner").unwrap();
     }
 
-    /// Leak check: with the default macOS `ulimit -n` (256) this loop
-    /// exhausts fds within the first few hundred iterations if `Drop`
-    /// failed to close the backing fd or unmap the region.
+    /// Leak check: 2048 heaps exhaust macOS's default `ulimit -n` (256) if `Drop` leaks the fd.
     #[test]
     fn drop_releases_fd_and_mapping() {
         for _ in 0..2048 {
@@ -943,9 +908,7 @@ mod tests {
     mod linux {
         use super::*;
 
-        // The macOS module has the mirror-image test (there the call is a
-        // no-op that always succeeds); this pins the Linux precondition so
-        // the platform split shows up in CI.
+        // Linux half of the platform split; the macOS mirror test expects success.
         #[test]
         fn seal_future_write_needs_allow_sealing() {
             assert_eq!(
@@ -1034,9 +997,7 @@ mod tests {
         }
     }
 
-    /// macOS: the protections are synthesized from darwin semantics —
-    /// size is fixed after creation and a read-only heap exports an
-    /// `O_RDONLY` fd the kernel refuses to map writable.
+    /// macOS: seals synthesized from darwin semantics (fixed size, `O_RDONLY` read-only export).
     #[cfg(target_os = "macos")]
     mod macos {
         use super::*;

@@ -110,13 +110,10 @@ pub const SET_RPC_CLIENT_TRANSACTION: u32 = b_pack_chars('_', 'R', 'P', 'C');
 pub const START_RECORDING_TRANSACTION: u32 = b_pack_chars('_', 'S', 'R', 'D');
 pub const STOP_RECORDING_TRANSACTION: u32 = b_pack_chars('_', 'E', 'R', 'D');
 
-// See android.os.IBinder.TWEET_TRANSACTION
-// Most importantly, messages can be anything not exceeding 130 UTF-8
-// characters, and callees should exclaim "jolly good message old boy!"
+// See android.os.IBinder.TWEET_TRANSACTION.
 pub const TWEET_TRANSACTION: u32 = b_pack_chars('_', 'T', 'W', 'T');
 
-// See android.os.IBinder.LIKE_TRANSACTION
-// Improve binder self-esteem.
+// See android.os.IBinder.LIKE_TRANSACTION.
 pub const LIKE_TRANSACTION: u32 = b_pack_chars('_', 'L', 'I', 'K');
 
 pub const INTERFACE_HEADER: u32 = b_pack_chars('S', 'Y', 'S', 'T');
@@ -143,9 +140,7 @@ pub trait Interface: Send + Sync {
              This is a programmer error - only Binder objects should implement Interface.",
             std::any::type_name::<Self>()
         );
-        // Reachable from safe code (`Strong::new(Box::new(service))` on a
-        // type with an empty `impl Interface`), so a plain `panic!` with
-        // the actionable message — not `unreachable!`.
+        // Reachable from safe code (an empty `impl Interface`): `panic!`, not `unreachable!`.
         panic!(
             "as_binder() called on a non-binder Interface impl ({}): wrap the \
              service with Bn*::new_binder before creating a Strong handle",
@@ -260,10 +255,11 @@ pub trait IBinder: Any + Send + Sync {
     /// duration of the link — otherwise the notification silently never fires.
     ///
     /// Over the RPC transport, death is detected as a dropped session
-    /// connection rather than a kernel `BR_DEAD_BINDER`, so notifications
-    /// only fire while the session is actively served (the peer must run a
-    /// serve loop, e.g. via `RpcServer::run`); see the `rpc` proxy
-    /// implementation for details.
+    /// connection rather than a kernel `BR_DEAD_BINDER`, and the link is
+    /// refused with `InvalidOperation` unless this side's session notices a
+    /// connection loss: the server side, a client with incoming
+    /// connections, or a session whose serve loop runs (`spawn_serve` /
+    /// `serve_blocking`); see the `rpc` proxy implementation for details.
     fn link_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()>;
 
     /// Remove a previously registered death notification.
@@ -297,8 +293,8 @@ pub trait IBinder: Any + Send + Sync {
     /// On a native binder it returns the locally-stored extension.
     ///
     /// **Staleness on proxy.** The proxy cache holds a strong
-    /// `SIBinder` for the parent's lifetime in the common case (see
-    /// `ProxyHandle`'s `ExtensionCache` doc for the cache shape and
+    /// `SIBinder` for the parent's lifetime in the common case (see the
+    /// `proxy` module doc, "Extension cache", for the cache shape and
     /// the `BC_RELEASE`/`BC_ACQUIRE` thrash motivation). The cache
     /// is **not** invalidated when the extension itself is
     /// obituary'd: subsequent `get_extension()` calls return the same
@@ -494,8 +490,7 @@ pub fn __rpc_stamp_descriptor(_binder: &SIBinder, _descriptor: &str) {}
 
 impl std::fmt::Debug for dyn IBinder {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        // `as_any()` formats as the useless `Any { .. }`; surface the fields a
-        // reader actually needs from a bare `&dyn IBinder` instead.
+        // `as_any()` would format as the useless `Any { .. }`; show the useful fields instead.
         f.debug_struct("dyn IBinder")
             .field("descriptor", &self.descriptor())
             .field("remote", &self.is_remote())
@@ -654,6 +649,31 @@ where
 /// An interface can promise to be a stable vendor interface ([`Stability::Vintf`]), or
 /// makes no stability guarantees ([`Stability::Local`]). [`Stability::System`] is
 /// the default stability, matching Android's `getLocalLevel()` for non-VNDK builds.
+///
+/// # Wire encoding
+///
+/// Android 12 (SDK 31/32) writes the stability field as
+/// `Category::repr()` = `(level << 24) | version`, the level in the high
+/// byte and a nonzero wire-format version in the low byte. android-11,
+/// android-13+ and non-Android builds write the raw `Level`: the level value
+/// itself (0/3/12/63) in the low byte, high bytes zero. On Android the encoder
+/// picks by the runtime SDK version (`frameworks/native/libs/binder/include/binder/Stability.h`,
+/// android-11.0.0_r21 through android-14.0.0_r2).
+///
+/// AOSP-12 declares `Category { uint8_t version; uint8_t reserved[2]; Level level; }`,
+/// builds it with `currentFromLevel` = `{ version: 1, reserved: 0, level }`, and
+/// reinterprets it as an `int32_t`. The stability word is an ordinary wire `i32`
+/// and the wire is little-endian on every host, so `(level << 24) | version`
+/// holds everywhere and the encoder needs no `target_endian` branch
+/// (`frameworks/native/libs/binder/{include/binder/Stability.h,Stability.cpp}`,
+/// android-12.0.0_r34).
+///
+/// The decoder accepts both. If any bit above the low byte is set, the value
+/// is a Category and decodes by level whatever its version byte. Otherwise
+/// the low byte is the raw level — except the bare android-12 wire-format
+/// version `0x0000_0001` (Category with level 0), which decodes to `Local`. A
+/// level-0 Category with any other version byte is byte-ambiguous with a raw
+/// level and cannot be distinguished; AOSP-12 only ever writes version 1.
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Stability {
     /// Default stability, visible to other modules in the same compilation
@@ -679,33 +699,17 @@ impl Stability {
     }
 }
 
-/// AOSP `Stability::kBinderWireFormatVersion` (`Stability.cpp:31`) — the wire
-/// version stamped into an android-12 `Category`.
+/// AOSP `Stability::kBinderWireFormatVersion` (`Stability.cpp:31`), stamped into a `Category`.
 const BINDER_WIRE_FORMAT_VERSION: i32 = 1;
 
-/// android-12 `Stability::Category::repr()` for a raw `Level`.
-///
-/// AOSP-12 `Category { uint8_t version; uint8_t reserved[2]; Level level; }`
-/// with `currentFromLevel` = `{ version: 1, reserved: 0, level }`, which
-/// AOSP reinterprets as an `int32_t`. The stability word is an ordinary
-/// wire `i32`, and the wire is little-endian on every host, so
-/// `repr() == (level << 24) | version` everywhere — this arithmetic needs
-/// no `target_endian` of its own
-/// (`frameworks/native/libs/binder/{include/binder/Stability.h,Stability.cpp}`,
-/// android-12.0.0_r34).
+/// android-12 `Category::repr()` for a raw `Level`; see `Stability` doc "Wire encoding".
 // Only reachable in the `target_os = "android"` encode branch (and unit tests).
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 const fn android12_category_repr(level: i32) -> i32 {
     (level << 24) | BINDER_WIRE_FORMAT_VERSION
 }
 
-// Android 12 version uses "Category" as the stability format for passed on the wire lines,
-// whereas other versions do not. Therefore, we can use the android_properties crate
-// to determine the Android version and perform different handling accordingly.
-// http://aospxref.com/android-11.0.0_r21/xref/frameworks/native/libs/binder/include/binder/Stability.h
-// http://aospxref.com/android-12.0.0_r3/xref/frameworks/native/include/binder/Stability.h
-// http://aospxref.com/android-13.0.0_r3/xref/frameworks/native/libs/binder/include/binder/Stability.h
-// http://aospxref.com/android-14.0.0_r2/xref/frameworks/native/libs/binder/include/binder/Stability.h
+// Encoding chosen by SDK version: see the `Stability` rustdoc, "Wire encoding".
 impl From<Stability> for i32 {
     fn from(stability: Stability) -> i32 {
         use Stability::*;
@@ -736,20 +740,7 @@ impl TryFrom<i32> for Stability {
     fn try_from(stability: i32) -> Result<Stability> {
         use Stability::*;
 
-        // A stability field arrives in one of two on-wire encodings:
-        //   * Raw `Level` (android-11, android-13+, and the non-android
-        //     build): the level value itself in the low byte (0/3/12/63),
-        //     high bytes zero.
-        //   * android-12 `Category::repr()` = `(level << 24) | version`, i.e.
-        //     the level in the high byte with a nonzero wire-format version in
-        //     the low byte.
-        // If any bit above the low byte is set it is a Category (a
-        // nonzero-level Category decodes by level whatever its version byte).
-        // Otherwise the low byte is the raw level — except the bare android-12
-        // wire-format version `0x0000_0001` (Category with level 0), which
-        // decodes to `Local`. A level-0 Category with any other version byte
-        // is byte-ambiguous with a raw level and cannot be distinguished;
-        // AOSP-12 only ever writes version 1.
+        // Raw level or android-12 Category: see the `Stability` rustdoc, "Wire encoding".
         let level = if stability & !0xFF != 0 {
             (stability >> 24) & 0xFF
         } else if stability == BINDER_WIRE_FORMAT_VERSION {
@@ -790,25 +781,15 @@ impl SIBinder {
     }
 
     pub(crate) fn from_arc(inner: Arc<dyn IBinder>) -> Self {
-        // Used on the construction path inside `process_state` after
-        // `ProxyHandle::new_acquired` has already issued `BC_ACQUIRE`.
-        // For proxies, `inc_strong` is a no-op so this is equivalent to
-        // `Self::new`. Kept as a separate constructor so the proxy
-        // resurrection path makes its no-op-on-proxy intent explicit.
+        // After `ProxyHandle::new_acquired` sent `BC_ACQUIRE`; as `new`, since proxies no-op.
         let this = Self { inner };
-        // Native binders still need their `RefCounter.strong` driven
-        // here; proxies will short-circuit to `Ok(())`.
+        // Drives a native `RefCounter.strong`; proxies short-circuit to `Ok(())`.
         this.increase()
             .expect("inc_strong on existing Arc<dyn IBinder> must not fail");
         this
     }
 
-    /// Borrow the underlying `Arc<dyn IBinder>`.
-    ///
-    /// Provides a non-consuming view of the inner trait-object Arc so
-    /// callers can clone it for sidecar tables (e.g.
-    /// `ProcessState::published_natives`) or compare identity via
-    /// `Arc::as_ptr` without an unsafe round trip through raw pointers.
+    /// Inner `Arc`, for sidecar tables (`published_natives`) and `Arc::as_ptr` identity checks.
     pub(crate) fn as_arc(&self) -> &Arc<dyn IBinder> {
         &self.inner
     }
@@ -835,17 +816,18 @@ impl SIBinder {
     /// For native binders, the `WIBinder` is a plain
     /// `sync::Weak<dyn IBinder>` — `upgrade()` succeeds iff some
     /// `Arc<dyn IBinder>` to the inner binder is still alive.
+    ///
+    /// A proxy's `(handle, generation)` is read from the `ProxyHandle`
+    /// itself, not from the proxy cache. The obituary retires the cache entry
+    /// before dispatching `binder_died`, so a cache lookup answers `None` for
+    /// exactly the binders a death recipient needs to identify. Reading it
+    /// from the proxy makes a downgrade taken after the obituary compare equal
+    /// to one taken before, which lets `binder_died` match `who` against a
+    /// stored `SIBinder`.
     pub fn downgrade(this: &Self) -> WIBinder {
         let weak = Arc::downgrade(&this.inner);
         if let Some(proxy_handle) = this.inner.as_any().downcast_ref::<proxy::ProxyHandle>() {
-            // `(handle, generation)` comes off the `ProxyHandle` itself, not
-            // off the proxy cache. The distinction is the whole contract of
-            // this function: the obituary retires the cache entry *before*
-            // dispatching `binder_died`, so a cache lookup answers `None`
-            // for exactly the binders a death recipient needs to identify.
-            // Reading it from the proxy makes a downgrade taken after the
-            // obituary compare equal to one taken before, which is what
-            // lets `binder_died` match `who` against a stored `SIBinder`.
+            // Identity from the `ProxyHandle`, not the cache (retired before `binder_died`).
             WIBinder {
                 inner: WIBinderInner::Proxy {
                     handle: proxy_handle.handle(),
@@ -1018,11 +1000,7 @@ pub struct WIBinder {
 }
 
 pub(crate) enum WIBinderInner {
-    /// Proxy weak reference. Carries a `sync::Weak<dyn IBinder>` for the
-    /// actual upgrade, plus a `(handle, stability, generation)` snapshot
-    /// used for `PartialEq` identity (two `WIBinder`s are equal iff they
-    /// name the same kernel binder_node, stable across a re-resolve that
-    /// allocates a fresh `Arc<ProxyHandle>`).
+    /// `weak` upgrades; `(handle, generation)` is the identity, stable across a re-resolve.
     Proxy {
         handle: u32,
         stability: Stability,
@@ -1034,6 +1012,29 @@ pub(crate) enum WIBinderInner {
 }
 
 impl WIBinder {
+    /// Upgrade to a strong reference, or `Err(DeadObject)` once the binder is gone.
+    ///
+    /// A native weak reference upgrades while some `Arc<dyn IBinder>` to the
+    /// binder is alive.
+    ///
+    /// A proxy weak reference is genuinely weak: it upgrades only while some
+    /// `Arc<ProxyHandle>` for the handle is alive in the process, i.e. while
+    /// the kernel strong count is above 0. This mirrors Android
+    /// `wp<BpBinder>::promote()`: `BpBinder` is `OBJECT_LIFETIME_WEAK`, so
+    /// promoting a weak reference with strong == 0 goes through
+    /// `IPCThreadState::attemptIncStrongHandle`, which returns
+    /// `INVALID_OPERATION` and refuses the promote (`RefBase.cpp:627-703`,
+    /// `BpBinder.cpp:267`). AOSP never revives a strong reference from
+    /// weak-only on a binder handle.
+    ///
+    /// A strong-0 handle is never re-acquired. Once the last user `Strong`
+    /// drops and its `BC_RELEASE` drives the kernel strong count to 0, a
+    /// re-`BC_ACQUIRE` (0→1) followed by a transaction is rejected by the
+    /// kernel with `BR_FAILED_REPLY`: the `BC_INCREFS` cache pin keeps the
+    /// `binder_ref` slot from being freed but does not make a strong-0
+    /// reference transactable. A transactable strong reference requires a
+    /// fresh wire delivery of the handle, e.g. re-resolving the service by
+    /// name through the service manager.
     pub fn upgrade(&self) -> Result<SIBinder> {
         match &self.inner {
             WIBinderInner::Native(weak) => weak
@@ -1041,29 +1042,7 @@ impl WIBinder {
                 .map(SIBinder::from_arc)
                 .ok_or(StatusCode::DeadObject),
             WIBinderInner::Proxy { weak, .. } => {
-                // A proxy weak reference is genuinely weak — it upgrades
-                // iff some `Arc<ProxyHandle>` for this handle is still
-                // alive in the process, which means the kernel strong
-                // count is > 0. This mirrors Android
-                // `wp<BpBinder>::promote()`: `BpBinder` is
-                // `OBJECT_LIFETIME_WEAK`, so promoting a weak when
-                // strong == 0 routes through
-                // `IPCThreadState::attemptIncStrongHandle`, which
-                // returns `INVALID_OPERATION` and refuses the promote
-                // (RefBase.cpp:627-703, BpBinder.cpp:267) — AOSP never
-                // revives a strong ref from weak-only on a binder handle.
-                //
-                // The slow path used to "resurrect" via a fresh
-                // `BC_ACQUIRE` on the cache-pinned handle. That is the
-                // bug: once the last user `Strong` dropped and its
-                // `BC_RELEASE` drove the kernel strong count to 0, a
-                // re-`BC_ACQUIRE` (0→1) followed by a transaction is
-                // rejected by the kernel with `BR_FAILED_REPLY` — the
-                // `BC_INCREFS` cache pin keeps the `binder_ref` slot
-                // from being freed but does NOT make a strong-0 ref
-                // transactable again. Re-acquiring a transactable strong
-                // ref requires a fresh wire delivery of the handle (e.g.
-                // re-resolving by name through the service manager).
+                // Never re-acquires a strong-0 handle (kernel: BR_FAILED_REPLY); see rustdoc.
                 weak.upgrade()
                     .map(SIBinder::from_arc)
                     .ok_or(StatusCode::DeadObject)
@@ -1213,8 +1192,7 @@ impl<I: FromIBinder + ?Sized> Strong<I> {
     where
         I: ToSyncInterface,
     {
-        // By implementing the ToSyncInterface trait, it is guaranteed that the binder
-        // object is also valid for the target type.
+        // ToSyncInterface guarantees the binder is also valid for the target type.
         FromIBinder::try_from(self.0.as_binder())
             .expect("ToSyncInterface guarantees binder compatibility")
     }
@@ -1240,7 +1218,7 @@ impl<I: FromIBinder + ?Sized> Strong<I> {
 /// Drop the interface type and recover the underlying [`SIBinder`].
 ///
 /// Lets APIs that take a raw binder — e.g. [`crate::hub::add_service`] — accept
-/// a `Strong<dyn IFoo>` directly via `impl Into<SIBinder>`, so callers no longer
+/// a `Strong<dyn IFoo>` directly via `impl Into<SIBinder>`, so callers need not
 /// spell out `.as_binder()`. `&Strong<I>` is also accepted so the handle can be
 /// reused afterwards.
 impl<I: FromIBinder + ?Sized> From<Strong<I>> for SIBinder {
@@ -1272,9 +1250,7 @@ impl<I: FromIBinder + ?Sized> TryFrom<SIBinder> for Strong<I> {
 
 impl<I: FromIBinder + ?Sized> Clone for Strong<I> {
     fn clone(&self) -> Self {
-        // Since we hold a strong reference, we should always be able to create
-        // a new strong reference to the same interface type, so try_from()
-        // should never fail here.
+        // A held strong reference always casts back to its own interface type.
         FromIBinder::try_from(self.0.as_binder())
             .expect("Failed to clone Strong<I>: existing strong reference guarantees valid binder")
     }
@@ -1397,10 +1373,7 @@ mod tests {
     // use crate::proxy::ProxyHandle;
     use super::*;
 
-    /// Minimal `IBinder` impl for unit-testing the `SIBinder` / `WIBinder`
-    /// pair without needing `/dev/binderfs/binder`. Ref-count methods are
-    /// no-ops — the fallibility test below relies on Rust `Arc`/`Weak`
-    /// semantics, not on `RefCounter` state.
+    /// Driver-free native `IBinder`; no-op ref counts, so tests see bare `Arc` semantics.
     struct MockBinder;
 
     impl IBinder for MockBinder {
@@ -1442,22 +1415,18 @@ mod tests {
         }
     }
 
-    /// `WIBinder::upgrade()` is genuinely weak: once the last
-    /// `Arc<dyn IBinder>` is dropped, `upgrade()` returns
-    /// `Err(StatusCode::DeadObject)`.
+    /// A native `WIBinder::upgrade()` returns `DeadObject` once the last `Arc` is dropped.
     #[test]
     fn test_wibinder_upgrade_after_strong_drop_returns_dead_object() {
         let strong = SIBinder::new(Arc::new(MockBinder)).expect("SIBinder::new");
         let weak = SIBinder::downgrade(&strong);
 
-        // While `strong` is alive, upgrade succeeds and yields a binder
-        // pointing at the same allocation.
+        // While `strong` is alive, upgrade yields the same allocation.
         let upgraded = weak.upgrade().expect("upgrade while alive");
         assert!(Arc::ptr_eq(&strong.inner, &upgraded.inner));
         drop(upgraded);
 
-        // Drop the only strong holder; the underlying Arc's strong count
-        // drops to 0. Now upgrade must fail with DeadObject.
+        // Dropping the only strong holder makes upgrade fail with DeadObject.
         drop(strong);
         match weak.upgrade() {
             Err(StatusCode::DeadObject) => {}
@@ -1471,9 +1440,7 @@ mod tests {
         }
     }
 
-    /// `WIBinder::clone` and `PartialEq` are allocation-identity based:
-    /// two clones compare equal before and after the strong holder is
-    /// gone, and neither upgrades afterwards.
+    /// Two `WIBinder` clones stay equal after the strong holder is gone, and neither upgrades.
     #[test]
     fn test_wibinder_clone_and_ptr_eq_after_drop() {
         let strong = SIBinder::new(Arc::new(MockBinder)).expect("SIBinder::new");
@@ -1484,8 +1451,7 @@ mod tests {
         assert_eq!(weak1, weak2);
 
         drop(strong);
-        // After drop, both still ptr_eq each other (Weak::ptr_eq compares
-        // allocation addresses, which remain stable).
+        // Weak::ptr_eq compares stable allocation addresses, so the clones stay equal.
         assert_eq!(weak1, weak2);
         // ...but neither upgrades.
         assert!(matches!(weak1.upgrade(), Err(StatusCode::DeadObject)));
@@ -1519,10 +1485,7 @@ mod stability_tests {
     // === Wire value tests ===
     #[test]
     fn test_stability_wire_values() {
-        // On a real android SDK 31/32 device the wire form is the Category
-        // repr `(level << 24) | 1`; on every other target it is the raw level.
-        // Assert the exact bytes for whichever encoding is active, and that
-        // the decoder round-trips it back.
+        // SDK 31/32 devices wire `(level << 24) | 1`, other targets the raw level.
         for (s, level) in [
             (Stability::Local, 0),
             (Stability::Vendor, 0b000011),
@@ -1566,22 +1529,19 @@ mod stability_tests {
 
     #[test]
     fn test_stability_category_format() {
-        // android-12 Category repr = (level << 24) | version(1), byte-exact to
-        // AOSP-12.0.0_r34 Stability::Category::currentFromLevel.
+        // (level << 24) | 1, byte-exact to AOSP-12.0.0_r34 `Category::currentFromLevel`.
         assert_eq!(super::android12_category_repr(0), 0x0000_0001);
         assert_eq!(super::android12_category_repr(0b000011), 0x0300_0001);
         assert_eq!(super::android12_category_repr(0b001100), 0x0c00_0001);
         assert_eq!(super::android12_category_repr(0b111111), 0x3f00_0001);
 
-        // Decode every Category repr back to its level — including the
-        // Local/UNDECLARED case (0x0000_0001).
+        // Every Category repr decodes, including Local/UNDECLARED (0x0000_0001).
         assert_eq!(Stability::try_from(0x0000_0001).unwrap(), Stability::Local);
         assert_eq!(Stability::try_from(0x0300_0001).unwrap(), Stability::Vendor);
         assert_eq!(Stability::try_from(0x0c00_0001).unwrap(), Stability::System);
         assert_eq!(Stability::try_from(0x3f00_0001).unwrap(), Stability::Vintf);
 
-        // A nonzero-level Category with a different (future) version byte
-        // still decodes by level (AOSP reads only Category.level).
+        // Any version byte on a nonzero-level Category decodes by level (AOSP reads only level).
         assert_eq!(
             Stability::try_from((0b001100 << 24) | 12).unwrap(),
             Stability::System
@@ -1597,11 +1557,9 @@ mod stability_tests {
     #[test]
     fn test_stability_invalid_value() {
         assert_eq!(Stability::try_from(0x7F).unwrap_err(), StatusCode::BadValue);
-        // A low-byte value that is neither a valid raw level nor the android-12
-        // wire-format version tag is rejected.
+        // A low byte that is neither a raw level nor the android-12 version tag is rejected.
         assert_eq!(Stability::try_from(0x05).unwrap_err(), StatusCode::BadValue);
-        // 0x01 is the android-12 Local/UNDECLARED Category repr — it decodes
-        // to Local, not BadValue.
+        // 0x01 is the android-12 Local/UNDECLARED Category repr: Local, not BadValue.
         assert_eq!(Stability::try_from(0x01).unwrap(), Stability::Local);
     }
 

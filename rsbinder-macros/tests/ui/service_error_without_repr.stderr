@@ -1,4 +1,4 @@
-error: a service-specific error enum needs `#[repr(i8)]`, `#[repr(i16)]` or `#[repr(i32)]`, found none
+error: a service-specific error enum needs `#[repr(i8)]`, `#[repr(i16)]` or `#[repr(i32)]`, found no integer repr
  --> tests/ui/service_error_without_repr.rs:4:10
   |
 4 | pub enum LookupError {

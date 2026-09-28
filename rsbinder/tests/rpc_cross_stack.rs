@@ -16,6 +16,17 @@
 //! before `flat_binder_object::from` calls `ProcessState::as_self()`,
 //! so a pure-RPC process (macOS, or any Linux process that never opened
 //! `/dev/binder`) gets the rejection rather than a panic.
+//!
+//! # Mutation gates
+//!
+//! - `kernel_parcel_refuses_rpc_proxy`: `From<&SIBinder> for flat_binder_object` calls
+//!   `ProcessState::as_self()`, which panics in a process that never initialized it. Moving
+//!   the check after that conversion turns this test red on macOS.
+//! - `rpc_parcel_refuses_kernel_proxy`: without the check the kernel proxy is registered as a
+//!   *local* node (the `local_node_count` assertion) and the peer's first call to it dies with
+//!   `UnknownTransaction`.
+//! - `rpc_parcel_refuses_another_sessions_proxy`: removing the `ptr::eq` session guard makes
+//!   the foreign-proxy write `Ok`.
 
 #![cfg(feature = "rpc")]
 
@@ -51,8 +62,7 @@ fn local_root() -> SIBinder {
     Interface::as_binder(&Binder::new(BnSvc))
 }
 
-/// A served RPC session pair. The server half runs `serve_blocking` on
-/// its own thread; dropping the guard tears it down.
+/// Served RPC session pair: the server runs `serve_blocking` on its own thread; drop tears down.
 struct Pair {
     client: RpcSession,
     server: Option<RpcSession>,
@@ -84,9 +94,7 @@ impl Pair {
 
 impl Drop for Pair {
     fn drop(&mut self) {
-        // `close_session` (not a bare drop) — `self.client` outlives this
-        // body, so the transport stays open and `serve_blocking` would park
-        // in `recv` forever waiting for an EOF that never comes.
+        // Not a bare drop: `self.client` keeps the transport open; `serve_blocking` never sees EOF.
         if let Some(s) = self.server.take() {
             s.close_session();
         }
@@ -96,9 +104,7 @@ impl Drop for Pair {
     }
 }
 
-/// A binder that claims to be remote but is not RPC-backed — what a
-/// kernel `ProxyHandle` looks like to the RPC write path. Built by hand
-/// so the test needs no `/dev/binder`.
+/// Remote but not RPC-backed: a kernel `ProxyHandle` stand-in that needs no `/dev/binder`.
 struct KernelishProxy;
 
 impl IBinder for KernelishProxy {
@@ -146,14 +152,7 @@ fn kernelish() -> SIBinder {
 
 // ---- AC-22.1: kernel parcel ← RPC proxy -----------------------------
 
-/// AC-22.1. A kernel-mode `Parcel` refuses an RPC proxy, in every shape
-/// the single `SerializeOption for SIBinder` funnel is reached through,
-/// and **without** touching `ProcessState`.
-///
-/// The panic-vs-reject distinction is the point: `From<&SIBinder> for
-/// flat_binder_object` calls `ProcessState::as_self()`, which panics in
-/// a process that never initialized it. Moving the check after that
-/// conversion turns this test red on macOS.
+/// AC-22.1: a kernel parcel refuses an RPC proxy in every funnel shape, before `ProcessState`.
 #[test]
 fn kernel_parcel_refuses_rpc_proxy() {
     let pair = Pair::new();
@@ -183,16 +182,13 @@ fn kernel_parcel_refuses_rpc_proxy() {
         "AC-22.1: Vec<SIBinder> takes the same funnel"
     );
 
-    // A null `Option` still writes: the rejection is about the object,
-    // not about the parcel being kernel-mode.
+    // A null `Option` still writes: the rejection is about the object, not the parcel mode.
     let mut p = Parcel::new();
     p.write(&None::<SIBinder>)
         .expect("a null binder is still writable into a kernel parcel");
 }
 
-/// AC-22.5. The rejection is *type*-based, not mode-based: a local
-/// `Binder<T>` still serializes into an RPC parcel, and a local binder
-/// is what the kernel path has always accepted.
+/// AC-22.5: the refusal is type-based, not mode-based; a local `Binder<T>` writes into RPC.
 #[test]
 fn local_binder_still_writes_into_an_rpc_parcel() {
     let pair = Pair::new();
@@ -206,10 +202,7 @@ fn local_binder_still_writes_into_an_rpc_parcel() {
 
 // ---- AC-22.2: RPC parcel ← kernel proxy -----------------------------
 
-/// AC-22.2. An RPC-mode `Parcel` refuses a remote binder that is not
-/// RPC-backed — i.e. a kernel proxy. Without the check the binder is
-/// registered as a *local* node and the peer's first call to it dies
-/// with `UnknownTransaction`.
+/// AC-22.2: an RPC parcel refuses a remote binder that is not RPC-backed (a kernel proxy).
 #[test]
 fn rpc_parcel_refuses_kernel_proxy() {
     let pair = Pair::new();
@@ -223,9 +216,7 @@ fn rpc_parcel_refuses_kernel_proxy() {
         "AC-22.2: a kernel proxy cannot be written into an RPC parcel"
     );
 
-    // And no local node was registered for it on the way out. The parcel
-    // belongs to the *client* session, so that is the side whose table the
-    // `else` arm would have grown.
+    // Nor registered as a local node in the *client* session, which owns the parcel.
     assert_eq!(
         pair.client.local_node_count(),
         0,
@@ -235,9 +226,7 @@ fn rpc_parcel_refuses_kernel_proxy() {
 
 // ---- AC-22.3: RPC parcel ← another session's proxy ------------------
 
-/// AC-22.3. An `RpcProxy` belonging to a *different* session is refused,
-/// because its address means nothing to this peer (AOSP
-/// `onBinderLeaving`). Removing the `ptr::eq` guard makes this `Ok`.
+/// AC-22.3: another session's `RpcProxy` (address foreign here) is refused, as `onBinderLeaving`.
 #[test]
 fn rpc_parcel_refuses_another_sessions_proxy() {
     let one = Pair::new();
@@ -254,8 +243,7 @@ fn rpc_parcel_refuses_another_sessions_proxy() {
         "AC-22.3: a proxy from an unrelated RPC session is refused"
     );
 
-    // Same session's own proxy is fine — the guard is about identity,
-    // not about proxies in general.
+    // Same session's own proxy is fine: the guard is about identity, not proxies.
     let mut data = rp.prepare_transact(false).expect("prepare_transact");
     data.write(&remote_two)
         .expect("AC-22.3: this session's own proxy may travel back home");
@@ -263,16 +251,13 @@ fn rpc_parcel_refuses_another_sessions_proxy() {
 
 // ---- AC-22.4: registration-time refusal -----------------------------
 
-/// AC-22.4. `RpcServer::set_root` / `add_service` and
-/// `RpcSession::set_root` refuse a remote binder up front, rather than
-/// letting it fail on the first parcel that carries it.
+/// AC-22.4: server/session `set_root` and `add_service` refuse a remote binder up front.
 #[test]
 fn registration_refuses_a_remote_binder() {
     let pair = Pair::new();
     let proxy = pair.remote_root();
 
-    // Bound but never run — this test only exercises the registration
-    // guards, so no accept loop is needed.
+    // Bound but never run: registration guards need no accept loop.
     let path = SockPath::new("reg");
     let server = RpcServer::setup_unix_server(&path.0).expect("bind");
     assert_eq!(
@@ -291,8 +276,7 @@ fn registration_refuses_a_remote_binder() {
         .add_service("gw", local_root())
         .expect("local service accepted");
 
-    // A kernel proxy is refused the same way — the rule is `is_remote`,
-    // not "is an RpcProxy".
+    // A kernel proxy is refused the same way: the rule is `is_remote`, not "is an RpcProxy".
     assert_eq!(
         server.set_root(kernelish()).unwrap_err(),
         StatusCode::InvalidOperation,
@@ -309,8 +293,7 @@ fn registration_refuses_a_remote_binder() {
     session.set_root(local_root()).expect("local root accepted");
 }
 
-/// A socket path that unlinks itself, so a failing assertion above does
-/// not leave the file behind.
+/// Socket path that unlinks itself on drop, even after a failed assertion.
 struct SockPath(std::path::PathBuf);
 
 impl SockPath {
@@ -335,9 +318,7 @@ impl Drop for SockPath {
     }
 }
 
-/// AC-22.5. Assert the fixture root is a *local* binder, so the tests
-/// above are refusing something the same code path would otherwise have
-/// accepted.
+/// AC-22.5: the fixture root is local, so the refusals above are not vacuous.
 #[test]
 fn fixture_root_is_local() {
     assert!(

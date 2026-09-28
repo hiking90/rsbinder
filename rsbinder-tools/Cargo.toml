@@ -19,7 +19,7 @@ env_logger.workspace = true
 anstyle.workspace = true
 clap.workspace = true
 libc.workspace = true
-rustix.workspace = true
+rustix = { workspace = true, features = ["fs", "process"] }
 thiserror.workspace = true
 serde.workspace = true
 toml.workspace = true

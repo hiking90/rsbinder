@@ -6,15 +6,13 @@ use crate::*;
 // Interface descriptor for the Android 10 C service manager.
 pub const SERVICE_MANAGER_DESCRIPTOR: &str = "android.os.IServiceManager";
 
-// Re-export the priority/proto flags from the hub root so values can never
-// drift from the AIDL-generated constants used by API 30+.
+// Re-exported from the hub root so they cannot drift from the API 30+ AIDL constants.
 pub use crate::hub::{
     DUMP_FLAG_PRIORITY_ALL, DUMP_FLAG_PRIORITY_CRITICAL, DUMP_FLAG_PRIORITY_DEFAULT,
     DUMP_FLAG_PRIORITY_HIGH, DUMP_FLAG_PRIORITY_NORMAL, DUMP_FLAG_PROTO,
 };
 
-// `addService` allow_isolated argument; the C service manager treats any
-// non-zero value as true.
+// `addService` allow_isolated; the C service manager treats any non-zero value as true.
 const ALLOW_ISOLATED_FALSE: i32 = 0;
 
 // Transaction codes used by the Android 10 C service manager.
@@ -73,9 +71,7 @@ pub fn get_service(sm: &BpServiceManager, name: &str) -> Option<SIBinder> {
 
         match result {
             Ok(Some(binder)) => return Some(binder),
-            // Not yet registered (the C SM's not-found reply also surfaces
-            // here as a short read). Retry. Logged at debug so a benign
-            // boot-time miss doesn't flood logcat across all attempts.
+            // Not registered yet; the C SM's not-found (a short read) lands in `Err`, at debug.
             Ok(None) => {}
             Err(err) => {
                 log::debug!("get_service({name}) attempt {attempt} failed, retrying: {err:?}");
@@ -125,11 +121,7 @@ pub fn check_service(sm: &BpServiceManager, name: &str) -> Option<SIBinder> {
     match result {
         Ok(binder) => binder,
         Err(err) => {
-            // The legacy C service manager signals "not found" as a single
-            // `u32 0` (no flat object), which surfaces here as a short-read
-            // `Err`. That is the normal absent-service path, not an error —
-            // log at `debug` like `get_service`/`try_get_service` (and unlike
-            // API 11+, where it is a silent `Ok(None)`).
+            // The C SM's "not found" is a bare `u32 0`, a short-read `Err` here: log at debug only.
             log::debug!("check_service({name}): not found or read error: {err}");
             None
         }
@@ -138,6 +130,11 @@ pub fn check_service(sm: &BpServiceManager, name: &str) -> Option<SIBinder> {
 
 /// Return a list of all currently running services.
 /// Iterates one entry at a time using an index, unlike API 30+.
+///
+/// Only a failed transaction ends the list, as in AOSP's `listServices`.
+/// An entry whose name cannot be read is kept as an empty string: the C
+/// service manager replies out of a 256-byte buffer, which a 127-character
+/// name overflows, and ending there would hide every service after it.
 pub fn list_services(sm: &BpServiceManager, dump_priority: i32) -> Vec<String> {
     let mut services = Vec::new();
     let mut n: i32 = 0;
@@ -152,19 +149,12 @@ pub fn list_services(sm: &BpServiceManager, dump_priority: i32) -> Vec<String> {
 
         match result {
             Ok(mut reply) => {
-                // Only a failed transaction ends the list, as in AOSP's
-                // `listServices`. An entry whose name cannot be read is kept
-                // as an empty string: the C service manager replies out of
-                // a 256-byte buffer, which a 127-character name overflows,
-                // and ending here would hide every service after it.
+                // Only a failed transaction ends the list; an unreadable name stays (see fn doc).
                 services.push(reply.read::<String>().unwrap_or_default());
                 n += 1;
             }
             Err(err) => {
-                // Termination is signalled by an error after the last
-                // entry, so a failure on n>0 is the normal end-of-list
-                // path. n==0 means we never read a single entry — that
-                // is a real IPC failure worth surfacing.
+                // An error after the last entry ends the list; only a failure at n == 0 is real.
                 if n == 0 {
                     log::error!("Failed to list services: {err}");
                 }

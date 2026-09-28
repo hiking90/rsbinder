@@ -1,6 +1,8 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub mod fmq_peer;
 mod test_accessor_rsb_hub;
 mod test_client;
 mod test_sm;

@@ -343,7 +343,7 @@ fn caps_do_not_replace_the_write_time_check() {
 /// and `outgoing_connections_do_not_grant_callbacks` pin.
 #[test]
 fn incoming_connections_grant_callbacks_on_both_ends() {
-    use rsbinder::rpc::{RpcServer, RpcUnixClientConfig};
+    use rsbinder::rpc::{RpcClientConfig, RpcServer};
 
     let mut path = std::env::temp_dir();
     path.push(format!("rsb_caps_cb_{}.sock", std::process::id()));
@@ -359,8 +359,8 @@ fn incoming_connections_grant_callbacks_on_both_ends() {
 
     // The listener is bound by `setup_unix_server`, so the socket exists
     // before `run_background` — connect straight away.
-    let client = RpcSession::setup_unix_client_android13plus_with_config(
-        RpcUnixClientConfig::path(&path, 2).incoming_connections(1),
+    let client = RpcSession::setup_client_android13plus_with_config(
+        RpcClientConfig::unix(&path, 2).incoming_connections(1),
     )
     .expect("connect with a callback connection");
 
@@ -448,7 +448,7 @@ fn require_refuses_a_partially_satisfied_requirement() {
 /// `CALLBACKS`.
 #[test]
 fn outgoing_connections_do_not_grant_callbacks() {
-    use rsbinder::rpc::{RpcServer, RpcUnixClientConfig};
+    use rsbinder::rpc::{RpcClientConfig, RpcServer};
 
     let mut path = std::env::temp_dir();
     path.push(format!("rsb_caps_fanout_{}.sock", std::process::id()));
@@ -465,8 +465,8 @@ fn outgoing_connections_do_not_grant_callbacks() {
         .expect("set_root");
     let bg = server.run_background();
 
-    let client = RpcSession::setup_unix_client_android13plus_with_config(
-        RpcUnixClientConfig::path(&path, 2).outgoing_connections(2),
+    let client = RpcSession::setup_client_android13plus_with_config(
+        RpcClientConfig::unix(&path, 2).outgoing_connections(2),
     )
     .expect("connect with a fan-out");
     assert_eq!(

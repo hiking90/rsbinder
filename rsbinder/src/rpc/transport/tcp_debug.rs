@@ -28,9 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use super::{read_frame, write_frame, PeerIdentity, RpcTransport};
 use crate::rpc::RpcResult;
 
-/// Set the first time *any* `TcpDebugTransport` is constructed in this
-/// process. Drives the one-time insecure warning and lets tests assert
-/// the warning fired without capturing the log backend.
+/// Set on the first `TcpDebugTransport` construction; gates the one-time warning, read by tests.
 static INSECURE_WARNED: AtomicBool = AtomicBool::new(false);
 
 fn warn_once() {
@@ -198,9 +196,7 @@ mod tests {
         // Identity is hard-wired Anonymous on both ends.
         assert_eq!(client.peer_identity(), PeerIdentity::Anonymous);
         assert_eq!(server.peer_identity(), PeerIdentity::Anonymous);
-        // (`insecure_warning_emitted()` is deliberately not asserted here:
-        // the flag is process-global and another test's `bind_loopback`
-        // may have set it first, so the assert could not fail.)
+        // `insecure_warning_emitted()` is process-global (another test may set it): not asserted.
 
         let client = Arc::new(client);
         for size in [0usize, 1, 64 * 1024, 1 << 20] {
@@ -215,14 +211,12 @@ mod tests {
         }
     }
 
-    /// `from_owned_fd` adopt → frame roundtrip. Mirrors the `unix`
-    /// counterpart but uses the TCP loopback pair.
+    /// `from_owned_fd` adopt → frame roundtrip over TCP loopback, mirroring the `unix` test.
     #[test]
     fn tcp_debug_from_owned_fd_roundtrip() {
         use std::os::fd::OwnedFd;
 
-        // Bind a listener, connect a client, accept on the server end —
-        // exactly what an external bridge would hand us as two fds.
+        // Connect + accept: the two fds an external bridge would hand us.
         let listener = TcpDebugTransport::bind_loopback().expect("bind");
         let addr = listener.local_addr().unwrap();
         let client_stream = TcpStream::connect(addr).expect("connect");
@@ -244,9 +238,7 @@ mod tests {
         sender.join().unwrap();
     }
 
-    /// Plan 2-21 B-4 — the raw (unframed) path the android-13+ profile
-    /// needs. The trait default refuses it; `from_preconnected_fd` wraps
-    /// an `AF_INET` fd here and goes straight into that handshake.
+    /// Plan 2-21: TCP serves the raw (unframed) android-13+ path the trait default refuses.
     #[test]
     fn tcp_debug_raw_bytes_roundtrip() {
         let (client, server) = TcpDebugTransport::pair_loopback().expect("loopback pair");

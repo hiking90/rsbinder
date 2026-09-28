@@ -21,8 +21,7 @@ impl Ctx {
     }
 }
 
-/// Where a type sits. A field has no direction of its own, so it answers the
-/// direction-dependent rules for itself (`type_declaration(is_struct = true)`).
+/// Where a type sits; a field answers the direction rules as `type_declaration(is_struct)`.
 #[derive(Clone, Copy)]
 pub enum Place {
     In,
@@ -141,7 +140,7 @@ fn reject_parenthesized(args: &PathArguments) -> syn::Result<()> {
     Ok(())
 }
 
-/// The body lands one module deeper, so `self::` would name the generated module.
+/// `self::` names the generated module (one level deeper); `Self` makes the trait non-`dyn`.
 fn reject_self_path(p: &syn::TypePath) -> syn::Result<()> {
     if p.path.leading_colon.is_none() && p.path.segments.first().is_some_and(|s| s.ident == "self")
     {
@@ -151,6 +150,15 @@ fn reject_self_path(p: &syn::TypePath) -> syn::Result<()> {
              so the path would resolve there rather than where you wrote it — and for the \
              same reason `super::` names *this* module, not its parent. Use the bare name, \
              or `crate::` to reach the parent",
+        ));
+    }
+    if p.path.leading_colon.is_none() && p.path.segments.first().is_some_and(|s| s.ident == "Self")
+    {
+        return Err(syn::Error::new_spanned(
+            p,
+            "a binder signature cannot name `Self` — the generated code uses the trait as \
+             `dyn IFoo`, which a `Self` outside the receiver rules out; name the interface as \
+             `rsbinder::Strong<dyn IFoo>`",
         ));
     }
     Ok(())
@@ -206,16 +214,13 @@ pub fn owned(ty: &Type) -> syn::Result<String> {
     })
 }
 
-/// Every gate a type must pass, keyed by where it sits. The argument, return
-/// and parcelable-field paths call only this, so a rule added here is reached
-/// from all of them rather than from the one position that prompted it.
+/// Every gate a type must pass; the one entry point for arguments, returns and fields.
 pub fn check_type_at(ty: &Type, place: Place) -> syn::Result<()> {
     match place {
-        // `check_supported` is the argument-shape gate: it opens with
-        // `reject_non_argument` and `check_scalar_names` itself.
+        // Opens with `reject_non_argument` and `check_scalar_names` itself.
         Place::In | Place::Out | Place::Inout => check_supported(ty)?,
         Place::Return => {
-            // Not `check_supported`: its `Option<&str>` would silently become `Option<String>` here.
+            // Not `check_supported`: its `Option<&str>` would become `Option<String>` here.
             reject_any_reference(ty)?;
             // `()` is `void`, which only the whole return type may be.
             if !matches!(unwrap_group(ty), Type::Tuple(t) if t.elems.is_empty()) {
@@ -230,16 +235,17 @@ pub fn check_type_at(ty: &Type, place: Place) -> syn::Result<()> {
             check_scalar_names(ty)?;
         }
     }
+    reject_bare_box(ty, place)?;
     reject_nullable_primitive(ty)?;
     reject_parcelable_holder(ty, place)?;
+    reject_nested_arrays(ty)?;
     if matches!(place, Place::Out | Place::Inout) {
         check_out_capable(ty, place.word())?;
     }
     check_array_elements(ty, place.word())?;
-    // Last, so a shape that cannot go on the wire at all keeps its own
-    // diagnostic: the rules above each describe one way to be wrong, and this
-    // asks the only question that actually matters — whether `.aidl` would
-    // have written what you wrote.
+    reject_nested_option(ty)?;
+    reject_generic_arg_shape(ty)?;
+    // Last, so a shape with no wire form at all keeps the specific rule's diagnostic.
     crate::aidl_shape::check_canonical(ty, place)
 }
 
@@ -254,8 +260,80 @@ fn reject_field_references(ty: &Type) -> syn::Result<()> {
     reject_inner_references(ty)
 }
 
-/// Matched structurally, so a holder inside `Option<_>` is caught too. Both
-/// messages live here so neither can start recommending what the other refuses.
+/// `.aidl` boxes only a `@nullable` parcelable field closing a reference cycle, and only there.
+fn reject_bare_box(ty: &Type, place: Place) -> syn::Result<()> {
+    match cycle_box(ty, place) {
+        Some(boxed) => reject_any_box(boxed),
+        None => reject_any_box(ty),
+    }
+}
+
+/// The `T` of a field's `Option<Box<T>>`; an interface never boxes, its namespace closes no cycle.
+fn cycle_box(ty: &Type, place: Place) -> Option<&Type> {
+    if !matches!(place, Place::Field) {
+        return None;
+    }
+    let inner = unwrap_group(named_generic(unwrap_group(ty), "Option").and_then(first_type_arg)?);
+    let boxed = unwrap_group(std_box_arg(inner)?);
+    let user_path = matches!(boxed, Type::Path(p) if p.qself.is_none())
+        && !is_primitive(boxed)
+        && !is_string(boxed)
+        && !lacks_default(boxed)
+        && ["Vec", "Option", "Box"]
+            .iter()
+            .all(|n| named_generic(boxed, n).is_none());
+    user_path.then_some(boxed)
+}
+
+/// std's `Box<T>` (bare or `…::boxed::Box`); a parcelable named `Box` is reached by its path.
+pub(crate) fn std_box_arg(ty: &Type) -> Option<&Type> {
+    let Type::Path(p) = unwrap_group(ty) else {
+        return None;
+    };
+    let segs = &p.path.segments;
+    let is_std = match segs.len() {
+        1 => p.path.leading_colon.is_none(),
+        n => segs[n - 2].ident == "boxed",
+    };
+    if !is_std {
+        return None;
+    }
+    named_generic(ty, "Box").and_then(first_type_arg)
+}
+
+fn reject_any_box(ty: &Type) -> syn::Result<()> {
+    let ty = unwrap_group(ty);
+    if std_box_arg(ty).is_some() {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "`.aidl` never renders this `Box` — it boxes only a `@nullable` parcelable field \
+             that closes a reference cycle, as `Option<Box<T>>`, never an argument or a \
+             return, and a call site written against one does not take the other; use `T` \
+             (a parcelable of your own named `Box` needs a qualified path, such as \
+             `crate::…::Box<T>`)",
+        ));
+    }
+    match ty {
+        Type::Reference(r) => reject_any_box(&r.elem),
+        Type::Slice(s) => reject_any_box(&s.elem),
+        Type::Array(a) => reject_any_box(&a.elem),
+        Type::Path(p) => {
+            for seg in &p.path.segments {
+                if let PathArguments::AngleBracketed(args) = &seg.arguments {
+                    for arg in &args.args {
+                        if let GenericArgument::Type(t) = arg {
+                            reject_any_box(t)?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Both messages in one place, so neither recommends what the other refuses.
 fn reject_parcelable_holder(ty: &Type, place: Place) -> syn::Result<()> {
     if !mentions_parcelable_holder(ty) {
         return Ok(());
@@ -365,8 +443,7 @@ pub fn reject_non_argument(ty: &Type) -> syn::Result<()> {
     }
 }
 
-/// Reject a scalar name `.aidl` never renders: the `.aidl` port would spell it
-/// another type, and `u128` puts a width no AIDL peer can decode on the wire.
+/// Reject a scalar name `.aidl` never renders; `u128` also writes a width no peer decodes.
 pub fn check_scalar_names(ty: &Type) -> syn::Result<()> {
     check_scalar_names_at(ty, false)
 }
@@ -386,10 +463,21 @@ fn check_scalar_names_at(ty: &Type, element: bool) -> syn::Result<()> {
                 return check_scalar_names_at(inner, element);
             }
             let Some(name) = plain_name(ty) else {
+                // `Box<u128>` or `Pair<u32>`: the argument is a scalar in its own right.
+                if let Type::Path(p) = ty {
+                    for seg in &p.path.segments {
+                        if let PathArguments::AngleBracketed(args) = &seg.arguments {
+                            for arg in &args.args {
+                                if let GenericArgument::Type(t) = arg {
+                                    check_scalar_names_at(t, false)?;
+                                }
+                            }
+                        }
+                    }
+                }
                 return Ok(());
             };
-            // `byte` swaps spelling by place — `i8` as a scalar, `u8` as an
-            // array element (`array_type_name`) — and neither the other way.
+            // `byte` is `i8` as a scalar, `u8` as an element (`array_type_name`), never swapped.
             if element && name == "i8" {
                 return Err(syn::Error::new_spanned(
                     ty,
@@ -430,8 +518,7 @@ fn scalar_advice(name: &str) -> &'static str {
     }
 }
 
-/// Spellings that compile and carry the same wire as the `in` argument `.aidl`
-/// renders, but do not give the same call site.
+/// Spellings with `.aidl`'s `in` wire but not its call site (`&String`, `&Vec<T>`, `&i32`).
 fn reject_borrowed_container(ty: &Type, nullable: bool) -> syn::Result<()> {
     let ty = unwrap_group(ty);
     if is_primitive(ty) {
@@ -504,8 +591,7 @@ pub fn reject_any_reference(ty: &Type) -> syn::Result<()> {
     reject_inner_references(ty)
 }
 
-/// Reject any reference in `ty`, itself included; callers pass what sits below
-/// the one `&` they allow.
+/// Reject any reference in `ty`, itself included; callers pass what is below their one `&`.
 pub fn reject_inner_references(ty: &Type) -> syn::Result<()> {
     let ty = unwrap_group(ty);
     match ty {
@@ -617,7 +703,7 @@ pub fn is_variable_array(ty: &Type) -> bool {
 }
 
 /// `Option<T>`, ignoring any leading references.
-fn option_inner(ty: &Type) -> Option<&Type> {
+pub(crate) fn option_inner(ty: &Type) -> Option<&Type> {
     named_generic(peel(ty), "Option").and_then(first_type_arg)
 }
 
@@ -668,12 +754,10 @@ const PRIMITIVE_NAMES: &[&str] = &[
     "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "f32", "f64", "char",
 ];
 
-/// The scalar names `TypeGenerator::type_decl` renders; `u8` is an array
-/// element only, where `array_type_name` rewrites `byte`'s `i8`.
+/// Scalars `TypeGenerator::type_decl` renders; `u8` only as `array_type_name`'s element.
 const RENDERABLE_SCALARS: &[&str] = &["bool", "i8", "i32", "i64", "f32", "f64", "u16"];
 
-/// Rust's own scalar spellings, so a name outside `RENDERABLE_SCALARS` is
-/// refused as a scalar rather than taken for a user-defined type.
+/// Rust's scalars, so an unrenderable one is refused rather than taken for a user type.
 const RUST_SCALARS: &[&str] = &[
     "bool", "char", "f32", "f64", "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32",
     "u64", "u128", "usize",
@@ -705,8 +789,7 @@ fn lacks_default(ty: &Type) -> bool {
         || named_generic(ty, "Strong").is_some()
 }
 
-/// `&mut Option<T>` where the `Option` is the generator's, not a `@nullable`:
-/// the one spelling `out T` and `out @nullable T` share.
+/// `&mut Option<T>` over a binder or fd: the spelling `out T` and `out @nullable T` share.
 pub fn out_option_is_ambiguous(ty: &Type) -> bool {
     option_inner(peel(ty)).is_some_and(lacks_default)
 }
@@ -720,6 +803,51 @@ fn out_array_elem(ty: &Type) -> Option<&Type> {
         elem = Some(t);
     }
     elem
+}
+
+/// Reject an array nested in a way `TypeGenerator` refuses (`T[][]`, `T[N][]`, `T[][N]`).
+fn reject_nested_arrays(ty: &Type) -> syn::Result<()> {
+    let outer = unwrap_group(peel(ty));
+    let mut elem = option_inner(outer).map_or(outer, |inner| unwrap_group(peel(inner)));
+    let mut dims = 0usize;
+    let mut variable = false;
+    loop {
+        if let Some(inner) = vec_elem(elem) {
+            elem = unwrap_group(inner);
+            variable = true;
+        } else {
+            match elem {
+                Type::Slice(s) => {
+                    elem = unwrap_group(&s.elem);
+                    variable = true;
+                }
+                Type::Array(a) => elem = unwrap_group(&a.elem),
+                _ => break,
+            }
+        }
+        dims += 1;
+    }
+    if dims > 1 && variable {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "a multi-dimensional array must be fixed-size in every dimension — `.aidl` has \
+             `T[N][M]` (`[[T; M]; N]`) and no variable-length dimension beside another, so \
+             this type has no `.aidl` form",
+        ));
+    }
+    let array_under_option = dims > 0
+        && option_inner(elem).is_some_and(|u| {
+            vec_elem(u).is_some() || matches!(unwrap_group(u), Type::Slice(_) | Type::Array(_))
+        });
+    if array_under_option {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "an array element cannot be an `Option` of another array — `.aidl` gives an \
+             element its own `Option` only around the innermost type, so this type has no \
+             `.aidl` form",
+        ));
+    }
+    Ok(())
 }
 
 /// Reject an array element spelling `.aidl` does not render for this direction.
@@ -752,8 +880,7 @@ pub fn check_array_elements(ty: &Type, direction: &str) -> syn::Result<()> {
     if !is_array {
         return Ok(());
     }
-    // A return type's direction is `Direction::None`, which `list_type_decl` and
-    // `make_fixed_array` both render down the same arm as `in`.
+    // A return is `Direction::None`, which `list_type_decl`/`make_fixed_array` render as `in`.
     let in_like = matches!(direction, "in" | "return");
     let field = direction == "field";
     let (article, label) = match direction {
@@ -761,10 +888,7 @@ pub fn check_array_elements(ty: &Type, direction: &str) -> syn::Result<()> {
         "field" => ("a", "parcelable field".to_string()),
         d => ("an", format!("`{d}`")),
     };
-    // A `@nullable` array wraps every non-primitive element except in a
-    // fixed-size `in` one; a bare array only where the callee defaults a slot.
-    // A field has no direction: `make_fixed_array`'s `is_struct` arm wraps a
-    // fixed slot with no `Default` of its own, whatever the nullability.
+    // Whether `.aidl` wraps each element: `nullable_element`, or `make_fixed_array`'s slots.
     let wraps = if field {
         nullable.is_some() || (fixed && lacks_default(option_inner(elem).unwrap_or(elem)))
     } else if nullable.is_some() {
@@ -860,6 +984,73 @@ pub fn check_out_capable(ty: &Type, direction: &str) -> syn::Result<()> {
              return it instead, or use a `Vec<T>` or a parcelable"
         ),
     ))
+}
+
+/// `.aidl` has one `@nullable` per type, so it never renders an `Option` directly in another.
+fn reject_nested_option(ty: &Type) -> syn::Result<()> {
+    let ty = peel(ty);
+    if option_inner(ty).and_then(option_inner).is_some() {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "`.aidl` has one `@nullable`, so an `Option` directly inside another has no form; \
+             drop one",
+        ));
+    }
+    match ty {
+        Type::Path(p) => {
+            for seg in &p.path.segments {
+                if let PathArguments::AngleBracketed(args) = &seg.arguments {
+                    for arg in &args.args {
+                        if let GenericArgument::Type(t) = arg {
+                            reject_nested_option(t)?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        Type::Slice(s) => reject_nested_option(&s.elem),
+        Type::Array(a) => reject_nested_option(&a.elem),
+        _ => Ok(()),
+    }
+}
+
+/// A user generic's argument is bare in `.aidl`: no array, `List` or `@nullable` there.
+fn reject_generic_arg_shape(ty: &Type) -> syn::Result<()> {
+    let ty = peel(ty);
+    match ty {
+        Type::Path(p) => {
+            let user = ["Vec", "Option", "Strong"]
+                .iter()
+                .all(|n| named_generic(ty, n).is_none())
+                && std_box_arg(ty).is_none();
+            for seg in &p.path.segments {
+                if let PathArguments::AngleBracketed(args) = &seg.arguments {
+                    for arg in &args.args {
+                        if let GenericArgument::Type(t) = arg {
+                            let arg_ty = unwrap_group(t);
+                            let shaped = matches!(arg_ty, Type::Slice(_) | Type::Array(_))
+                                || named_generic(arg_ty, "Vec").is_some()
+                                || named_generic(arg_ty, "Option").is_some();
+                            if user && shaped {
+                                return Err(syn::Error::new_spanned(
+                                    t,
+                                    "`.aidl` names a type argument bare — it refuses an array, \
+                                     a `List` or `@nullable` there, so this has no `.aidl` \
+                                     form; wrap it in a parcelable of its own",
+                                ));
+                            }
+                            reject_generic_arg_shape(t)?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        Type::Slice(s) => reject_generic_arg_shape(&s.elem),
+        Type::Array(a) => reject_generic_arg_shape(&a.elem),
+        _ => Ok(()),
+    }
 }
 
 /// Reject `Option<T>` over a scalar, which has no null form on the wire.

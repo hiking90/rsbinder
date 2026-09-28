@@ -1,6 +1,272 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+//! Process-wide kernel binder state: the driver fd and receive mapping,
+//! the handle → proxy cache, the published-native sidecar table, and the
+//! binder thread pool.
+//!
+//! # Receive mapping
+//!
+//! The mapping is `PROT_READ`, owned for the whole `ProcessState` lifetime,
+//! and the only access *through `MemoryMap::ptr`* is the single
+//! `munmap(ptr, size)` in `ProcessState::drop` — which is why `MemoryMap` is
+//! `Send + Sync`. The region is the kernel-delivered transaction-buffer area
+//! and *is* read as Rust data elsewhere (`thread_state` reads inbound
+//! `BR_TRANSACTION`/`BR_REPLY` buffers and `calling_sid` out of it), but that
+//! access goes through the kernel pointers in the transaction, not `ptr`, and
+//! is synchronized by the driver's buffer-lifetime protocol (a buffer stays
+//! valid until `BC_FREE_BUFFER`). Because the mapping lives for the
+//! singleton's whole lifetime (an init-race loser never serviced a
+//! transaction), no such read is outstanding at drop.
+//!
+//! The size floor is one page: the granularity `mmap(2)` works in and the
+//! smallest mapping the driver serves a buffer from (measured: a 4096-byte
+//! mapping carries a ~3.9 KB call). The floor also keeps a
+//! `default_mmap_size()` that degenerated to 0 out of `mmap(len = 0)`. The
+//! ceiling is the driver's silent `SZ_4M` clamp.
+//!
+//! `normalized_mmap_size` returns the size rounded up to a page, as `mmap(2)`
+//! rounds it. That rounded value is what `mmap_size` reports and what the
+//! entry layer compares a later request against; carrying the raw request
+//! would make the same size compare unequal to itself.
+//!
+//! # Proxy cache slow path
+//!
+//! `strong_proxy_for_handle_stability` misses its read-lock fast path, then
+//! runs three phases so no IPC happens with `handle_to_proxy` locked:
+//!
+//! - **P1** — short write-lock window. Decides the sub-case and, for case
+//!   (a) (entry absent), issues `BC_INCREFS` + `flush_commands` so the cache
+//!   pin is live in the kernel before any IPC enters. The write lock is
+//!   taken even though P1 only reads, so two concurrent slow paths cannot
+//!   both observe "absent" and produce two case-(a) commits with distinct
+//!   generations; a second one collapses onto P3's `(CaseA, Some(_))` race
+//!   arm instead. Pinning under the lock also means P3's `BC_ACQUIRE` never
+//!   races a freed `binder_ref` slot. `flush_commands` inside the lock is
+//!   sound because it is a write-only ioctl (`talk_with_driver(false)`,
+//!   `read_size = 0`): no `BR_*` — `BR_DEAD_BINDER` included — is
+//!   dispatched, and re-entrant `send_obituary_for_handle` paths only
+//!   originate from `BR_DEAD_BINDER`.
+//! - **P2** — lock released. IPC (`ping_binder` for handle 0 on sdk >= 30,
+//!   `query_interface` for case (a)) runs without the lock, so a re-entrant
+//!   `BR_DEAD_BINDER` → `send_obituary_for_handle` on the same thread can
+//!   take it without deadlocking against `std::sync::RwLock`'s
+//!   non-reentrant write lock.
+//! - **P3** — write lock re-acquired. Re-checks case (c) and the case
+//!   (a)→(b) cross-thread race, undoes any spare pin, and commits the entry.
+//!
+//! Sub-cases decided in P1:
+//!
+//! - **(a)** entry absent. P1 pins, and this thread owns the pin until P3
+//!   moves it into the new entry or undoes it (`undo_case_a_pin`).
+//! - **(b)** entry present but its `weak` dangles. The entry keeps owning its
+//!   pin; P1 snapshots descriptor and generation, P2 skips `query_interface`
+//!   (the descriptor is immutable for the `binder_ref` slot's lifetime), and
+//!   P3 resurrects under the same generation if the snapshot still matches.
+//! - **(c)** another thread inserted or upgraded the entry between the
+//!   fast-path miss and P1; the live entry is returned.
+//!
+//! `commit_new_acquired` undoes the pin on a `new_acquired` failure only when
+//! this thread owns it (`owns_case_a_pin`): case (b) and the cross-thread
+//! `(CaseA, Some(_))` race pass `false`, because the existing entry owns that
+//! pin. The pin undo itself is best-effort: if its `BC_DECREFS` or flush
+//! fails, the failure is logged and the pin leaks until obituary or process
+//! teardown, since returning the secondary error would mask the original one.
+//!
+//! The P2 lock release matters because the catch-all arm of
+//! `wait_for_response` dispatches `BR_DEAD_BINDER` to `execute_command`, which
+//! calls `send_obituary_for_handle` and takes the same write lock.
+//!
+//! P3 covers a race in which another thread T2 ran a complete case (a) during
+//! this thread's P2 IPC and then dropped its `Arc`: the plan is `CaseA`, yet
+//! the slot is again "present + dangling weak", so there is one spare
+//! `BC_INCREFS` pin (this thread's) on top of T2's entry-owned pin. P3 undoes
+//! the spare pin and adopts T2's descriptor and generation, restoring one pin
+//! per entry. The companion `(CaseB, None)` arm — the entry vanished mid-flight
+//! through an obituary — returns `DeadObject` rather than sending `BC_ACQUIRE`
+//! against a freed `binder_ref` slot; it is the one window where the
+//! precondition "`BC_ACQUIRE` requires a live pin" could otherwise break.
+//!
+//! P3 race resolution (P2 output × cache state at P3):
+//!
+//! | ready  | cached at P3 | action                                              |
+//! |--------|--------------|-----------------------------------------------------|
+//! | (any)  | live entry   | drop this thread's work; if CaseA, undo its pin     |
+//! | CaseA  | None         | standard commit; new generation                     |
+//! | CaseA  | Some(_)      | undo this thread's pin; commit with cached desc/gen |
+//! | CaseB  | None         | DeadObject (cache pin gone — BC_ACQUIRE unsafe)     |
+//! | CaseB  | Some, gen=   | resurrect under same generation                     |
+//! | CaseB  | Some, gen≠   | adopt new entry's desc/gen                          |
+//!
+//! # Proxy cache entry
+//!
+//! A `CacheEntry`'s `weak` lets the process build a fresh `Arc<ProxyHandle>`
+//! after the previous one dropped, reusing the cached `descriptor` instead of
+//! issuing a new `INTERFACE_TRANSACTION`. The kernel weak ref (`BC_INCREFS`)
+//! that keeps `binder_ref(handle)` alive while the user-side strong count is 0
+//! is not a field: the entry's presence in `handle_to_proxy` owns it. The pin
+//! is acquired exactly once on case-(a) insertion and released exactly once on
+//! obituary teardown.
+//!
+//! `generation` comes from the process-wide monotonic `next_generation`,
+//! bumped once per case-(a) insertion (u64, so wrap-around is not a concern).
+//! A proxy `WIBinder` records the generation seen at `SIBinder::downgrade`, so
+//! its `PartialEq` identity `(handle, generation)` is stable across case-(b)
+//! re-lookups (a fresh `Arc<ProxyHandle>` is a new allocation) and a recycled
+//! handle id naming a different `binder_node` is distinguishable. Case (b)
+//! keeps the entry's generation — same kernel slot, and a fresh wire-delivered
+//! strong ref makes it transactable again; only case (a) allocates one.
+//!
+//! A case-(b) re-lookup through `strong_proxy_for_handle_stability` is driven
+//! by a fresh wire delivery of the handle (servicemanager `checkService`, or an
+//! incoming transaction carrying it), which gives the new `BC_ACQUIRE` a
+//! kernel strong count it can transact on. `WIBinder::upgrade()` differs: it
+//! is purely weak and never re-`BC_ACQUIRE`s a strong-0 handle.
+//!
+//! # Published natives
+//!
+//! `flat_binder_object.binder` carries a process-monotonic u64 id (from
+//! `next_native_id`), not a pointer into the object. The kernel echoes the id
+//! in `BR_INCREFS` / `BR_ACQUIRE` / `BR_RELEASE` / `BR_DECREFS` /
+//! `BR_ATTEMPT_ACQUIRE` / `BR_TRANSACTION` (`target.ptr`), and a round-trip
+//! `BINDER_TYPE_BINDER` read carries it too; `published_natives` resolves it
+//! to the live `Arc` through `binder_pin.as_arc()`. A pointer encoding would
+//! let a weak-ref handler (`BR_DECREFS`) run after `Inner<T>` had been dropped
+//! (a use-after-free); Android's two-allocation `weakref_type*` + `BBinder*`
+//! design addresses the same shape.
+//!
+//! A `PublishedNative` is created on the first `From<&SIBinder>`
+//! (`BINDER_TYPE_BINDER`), held while parcel-side (`publish_count`) or
+//! kernel-side (`kernel_refs`) refs are outstanding, and removed when both are
+//! zero and `pending_reservations` is zero. While it exists, `binder_pin` keeps
+//! `Inner<T>` alive and holds `RefCounter.strong` / `RefCounter.weak` at the
+//! "alive" level (>= 1) so `attempt_inc_*` succeeds: `SIBinder::from_arc`'s
+//! `inc_strong` sets that at creation and `SIBinder::Drop`'s
+//! `dec_strong(None)` releases it at removal. `publish_count` follows
+//! `flat_binder_object::acquire` / `release`, called from
+//! `Parcel::write_object`, `Parcel::append_from` and `Parcel::release_objects`.
+//! `kernel_refs` rises on `BR_INCREFS` / `BR_ACQUIRE` and falls on
+//! `BR_RELEASE` / `BR_DECREFS`, deferred through `pending_*_derefs` and
+//! processed FIFO.
+//!
+//! `pending_reservations` counts `publish_native` dedup hits whose matching
+//! `acquire` (`incref_publish`) has not landed yet. A dedup returns an existing
+//! id, but only the `acquire` right after it bumps `publish_count`; without the
+//! reservation a concurrent `decref_publish` / `deref_native_kernel` that
+//! drives the counters to zero in that gap would remove the entry, and the
+//! pending `acquire` would ship an id the kernel can no longer resolve. It is
+//! bumped under the write lock on dedup and consumed by the next
+//! `incref_publish`. The reservation is keyed by id, not by the specific
+//! dedup, so an `append_from`-clone `acquire` on the same id can consume it.
+//! That closes the common window (a `decref`/`deref` racing a dedup) but not
+//! the one where a clone's whole `acquire`..`release` lifetime nests inside a
+//! single dedup's `publish_native`..`acquire` gap; that gap is two adjacent
+//! statements with no blocking call. Closing it fully would need an "is-dedup"
+//! flag threaded into `flat_binder_object::acquire`, a `binder_object.rs`
+//! protocol change.
+//!
+//! `publish_native` takes one write lock for dedup and insert and dedups by
+//! `Arc::ptr_eq` against `binder_pin`, so publishing one `Arc` twice returns
+//! the same id, as Android allocates one `binder_node` per `weakref_type*`
+//! however often it is sent. A dedup hit only bumps `pending_reservations`. A
+//! fresh insert drives `RefCounter.strong` 0→1 through `SIBinder::from_arc`
+//! and `RefCounter.weak` 0→1 through an explicit `inc_weak`; that table-held
+//! +1 keeps both counts above zero, so user-side increments and decrements
+//! never reach the count→0 closure path. `publish_count` starts at 0 and the
+//! `Parcel::write_object` → `flat_binder_object::acquire` right after brings
+//! it to 1. The only leak path is a `Parcel::write_aligned` failure between
+//! `From<&SIBinder>` returning and that `acquire()`: a panic (typically OOM),
+//! or `Err(BadValue)` when the write would end past `i32::MAX`.
+//!
+//! `incref_publish` returns `false` for an unknown id. Every `acquire` follows
+//! a `From<&SIBinder>` that just inserted the entry, or is an `append_from`
+//! clone of a buffer that already holds one, so the caller treats `false` as
+//! a bug: `debug_assert!` in debug builds, `log::error!` and skip in release.
+//! `ref_native_kernel` returns `None` for an unknown id — a kernel invariant
+//! violation for `BR_INCREFS` / `BR_ACQUIRE`, an expected race for
+//! `BR_ATTEMPT_ACQUIRE`.
+//!
+//! Removal is two-phase. `decref_publish` / `deref_native_kernel` mutate the
+//! counters under the write lock and release it; `remove_entry_if_zero` then
+//! re-takes the lock, re-checks that `publish_count`, `kernel_refs` and
+//! `pending_reservations` are all zero, removes the entry, and drops
+//! `binder_pin` after releasing the lock. The drop calls `dec_strong(None)`,
+//! which may run user destructor code (`Inner<T>::drop`) that calls back into
+//! `ProcessState`, so holding the write lock there would deadlock. If a
+//! concurrent `BR_INCREFS` / `From<&SIBinder>` raised a counter between the
+//! phases, the re-check aborts the removal.
+//!
+//! # Obituary teardown
+//!
+//! Phase 1, `send_obituary_for_handle`, removes the cache entry under the
+//! write lock and notifies death recipients. Phase 2, `release_obituary_pin`,
+//! releases the cache pin with `BC_DECREFS`; `thread_state::execute_command`'s
+//! `BR_DEAD_BINDER` arm calls it after queueing `BC_DEAD_BINDER_DONE` in this
+//! thread's out-parcel.
+//!
+//! Phase 1 can run on the thread that issued the originating transaction,
+//! including one inside `strong_proxy_for_handle_stability`; its
+//! `handle_to_proxy.write()` would deadlock if the slow path held the lock
+//! across IPC, which is why P2 runs unlocked. It must be called with no
+//! `THREAD_STATE` or `BINDER_DEREFS` borrow held: `send_obituary` runs user
+//! `DeathRecipient::binder_died` callbacks, which can issue nested binder
+//! calls (R1; see the `thread_state` module doc).
+//!
+//! Phase 2's first `flush_commands()` commits `BC_DEAD_BINDER_DONE` and any
+//! `BC_RELEASE` queued on this thread before `BC_DECREFS` reaches the kernel.
+//! It does not drain other threads' out-parcels: a `BC_RELEASE` from a `Drop`
+//! on another thread can still arrive after the `BC_DECREFS`, and the kernel
+//! rejects it with `-EINVAL` and a dmesg line. Closing that window would take
+//! cross-thread synchronization of every out-parcel flush, which is not done.
+//!
+//! # Published-native `kernel_refs` drift
+//!
+//! `deref_native_kernel` decrements `kernel_refs` with `saturating_sub`,
+//! clamping at 0 under a cross-thread race where `BR_DECREFS` is processed
+//! before its matching `BR_INCREFS`. The kernel queues both to
+//! `proc->todo` (process-wide FIFO), so distinct binder threads can pop the
+//! pair in FIFO order but dispatch out of order if the `BR_INCREFS` thread
+//! is preempted before reaching `ref_native_kernel`. The late `BR_INCREFS`
+//! then bumps `kernel_refs` from 0 to 1 — the decrement that should have
+//! followed was already spent.
+//!
+//! Each occurrence on an id adds one to `kernel_refs`' over-count against
+//! the kernel's true ref count. The accumulation is **unbounded** over the
+//! binder's lifetime if races recur, leaving the entry stranded with
+//! `kernel_refs >= 1` after the kernel has fully released; the bound is one
+//! stranded entry per long-lived published binder that ever raced. This is
+//! accepted over a `debug_assert` panic: the race is a property of kernel
+//! scheduling, not of this bookkeeping, so panicking would fail CI on a
+//! legitimate interleaving. A signed counter with a dual-direction removal
+//! trigger could bound the drift but introduces premature-removal hazards
+//! in multi-pair scenarios; left as a follow-up.
+//!
+//! # Context manager security context
+//!
+//! AOSP always registers the context manager with
+//! `FLAT_BINDER_FLAG_TXN_SECURITY_CTX`; `selinux_available` decides whether
+//! `become_context_manager` does. The flag makes the kernel deliver
+//! `BR_TRANSACTION_SEC_CTX` to the context manager — without it
+//! `get_calling_sid()` is always `None` there. But `binder_transaction` then
+//! calls `security_secid_to_secctx()` for every transaction to that node and
+//! fails the whole transaction with `BR_FAILED_REPLY` when that errors, which
+//! it does on a kernel without SELinux: every call into the service manager
+//! would fail. Android always has SELinux; on Linux a mounted selinuxfs is the
+//! signal, the same check libselinux's `is_selinux_enabled()` makes.
+//!
+//! # Tests
+//!
+//! - `test_strong_proxy_under_same_thread_dead_binder_no_deadlock`: the
+//!   cfg(test) `slow_path_p2` hook calls `send_obituary_for_handle` on the
+//!   same thread right after P1 releases the lock and before P2's IPC. Driving
+//!   a real obituary would need a service crashing mid-transaction, and the
+//!   lock semantics under test do not depend on the driver. The test is
+//!   wall-clock bounded, so a deadlock fails as a CI timeout instead of a
+//!   hang. The `fired` flag asserts the hook ran: the singleton `ProcessState`
+//!   is shared with parallel tests, and a sibling holding an `Arc` for handle 0
+//!   keeps the cache `Weak` upgradeable, so P1 would return at case (c)
+//!   without firing the hook (a vacuous pass).
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::os::raw::c_void;
@@ -11,13 +277,7 @@ use std::thread;
 
 use crate::{binder::*, error::*, proxy::*, sys::binder, thread_state};
 
-/// Best-effort undo of the case (a) `BC_INCREFS` pin after a failure
-/// downstream of the pin's flush (descriptor query failure or
-/// `ProxyHandle::new_acquired` failure). If the kernel ack of the
-/// undo command is itself lost — driver write_read ioctl failure —
-/// we log and accept that the pin leaks until obituary or process
-/// teardown. The alternative (returning the secondary error) would
-/// mask the original failure that triggered the undo.
+/// Best-effort undo of a case (a) pin; see module doc "Proxy cache slow path".
 fn undo_case_a_pin(handle: u32) {
     if let Err(err) = thread_state::dec_weak_handle(handle) {
         log::warn!(
@@ -36,55 +296,31 @@ fn undo_case_a_pin(handle: u32) {
     }
 }
 
-/// Plan computed under P1's write lock and consumed by P2/P3.
-///
-/// Drives the lock-decoupled three-phase slow path: the case decision
-/// is made under one short write-lock window, IPC runs with the lock
-/// released, and a second short write-lock window commits the cache
-/// entry while re-checking cross-thread races.
+/// P1's case decision, consumed by P2/P3; see module doc "Proxy cache slow path".
 enum SlowPathPlan {
-    /// Sub-case (a): entry absent at P1 time. P1 issued `BC_INCREFS`
-    /// then flushed, so this thread now owns the cache pin. P3 either
-    /// transfers ownership to the cache entry on insert, or undoes the
-    /// pin via [`undo_case_a_pin`] on failure / cross-thread race.
+    /// Case (a): this thread owns the P1 pin until P3 moves it into the entry or undoes it.
     CaseA,
-    /// Sub-case (b): entry present at P1 time but its `weak` is
-    /// dangling. The cache pin remains owned by the existing entry —
-    /// this thread does not issue or own a pin. P1 snapshotted the
-    /// entry's descriptor and generation; P2 skips
-    /// `query_interface` (descriptor immutable for the binder_ref
-    /// slot's lifetime) and P3 resurrects under the same generation
-    /// when the snapshot still matches.
+    /// Case (b): the entry owns the pin; P2 reuses this snapshot instead of `query_interface`.
     CaseB { descriptor: String, generation: u64 },
 }
 
-/// Outcome of P1: either we observed a live entry and the slow path
-/// is done, or we have a [`SlowPathPlan`] to drive P2/P3.
+/// Outcome of P1: a live entry (slow path done) or a [`SlowPathPlan`] for P2/P3.
 enum SlowPathDecision {
-    /// Sub-case (c): another thread inserted/upgraded between the
-    /// read-fast-path miss and the P1 write-lock acquisition.
+    /// Case (c): another thread inserted or upgraded the entry before P1 took the write lock.
     Cached(SIBinder),
     /// Sub-cases (a)/(b) — proceed to P2 (IPC) and P3 (commit).
     NeedIpc(SlowPathPlan),
 }
 
-/// Output of P2 — carries the descriptor each branch needs into P3,
-/// so the (CaseA, _) commit arms can consume the freshly-queried
-/// descriptor without going through an `Option<String>` that P3
-/// would otherwise have to runtime-`expect` for `(CaseA, None)`.
+/// P2 output; each case carries its descriptor, so P3 never `expect`s an `Option<String>`.
 enum SlowPathReady {
-    /// Sub-case (a) ready for commit: P2 issued `query_interface`
-    /// and obtained a fresh descriptor.
+    /// Case (a): descriptor freshly obtained by P2's `query_interface`.
     CaseA { descriptor: String },
-    /// Sub-case (b) ready for commit: descriptor and generation
-    /// snapshotted by P1, no IPC required in P2.
+    /// Case (b): descriptor and generation snapshotted by P1; P2 made no IPC.
     CaseB { descriptor: String, generation: u64 },
 }
 
-/// RAII guard that restores this thread's [`CallRestriction`] to its
-/// pre-call value when dropped. Applied around `ping_binder(0)` in
-/// P2 so an early-`Err` return or panic cannot leak
-/// [`CallRestriction::None`] into subsequent calls on this thread.
+/// Restores the thread's [`CallRestriction`] on drop, so P2's `ping_binder(0)` cannot leak it.
 struct RestoreCallRestriction(CallRestriction);
 
 impl Drop for RestoreCallRestriction {
@@ -93,16 +329,7 @@ impl Drop for RestoreCallRestriction {
     }
 }
 
-// Test-only hook fired at the entry of `ProcessState::slow_path_p2`
-// (immediately after P1 releases the `handle_to_proxy` write lock
-// and before P2 issues any IPC). Used by the same-thread deadlock
-// regression test to invoke `send_obituary_for_handle` on the same
-// thread that is currently in the slow path — the pre-fix code held
-// the write lock across this point and would deadlock on the
-// obituary's `handle_to_proxy.write()` re-entry; the post-fix split
-// releases the lock during P2 so the obituary acquires it cleanly.
-// Empty-by-default; tests install a closure via
-// `set_slow_path_p2_test_hook`.
+// Fired at P2 entry, lock released, so a test can re-enter `send_obituary_for_handle` there.
 #[cfg(test)]
 type SlowPathP2TestHook = Box<dyn FnMut(u32)>;
 
@@ -119,9 +346,7 @@ fn set_slow_path_p2_test_hook(hook: Option<SlowPathP2TestHook>) {
 
 #[cfg(test)]
 fn slow_path_p2_test_hook(handle: u32) {
-    // Take the closure out before invoking so the hook body can
-    // re-enter `strong_proxy_for_handle` (and thus this function)
-    // without a nested-borrow panic on the RefCell.
+    // Take the closure out first so a re-entrant hook can't double-borrow the RefCell.
     let hook = SLOW_PATH_P2_TEST_HOOK.with(|h| h.borrow_mut().take());
     if let Some(mut hook) = hook {
         hook(handle);
@@ -129,15 +354,7 @@ fn slow_path_p2_test_hook(handle: u32) {
     }
 }
 
-/// P3 commit primitive: acquire one kernel strong ref
-/// (`BC_ACQUIRE`) and insert (or replace) the cache entry. Caller
-/// holds the `handle_to_proxy` write lock.
-///
-/// `owns_case_a_pin` records whether *this thread* issued the
-/// case (a) `BC_INCREFS` pin during P1; on `new_acquired` failure it
-/// gates whether to undo our own pin. Case (b) and the cross-thread
-/// `(CaseA, Some(_))` race both pass `false` because the existing
-/// cache entry's pin is owned by the entry, not by us.
+/// P3 `BC_ACQUIRE` + insert, caller holds the write lock; `owns_case_a_pin`: see module doc.
 fn commit_new_acquired(
     handle_to_proxy: &mut HashMap<u32, CacheEntry>,
     handle: u32,
@@ -166,123 +383,22 @@ fn commit_new_acquired(
     Ok(SIBinder::from_arc(arc as Arc<dyn IBinder>))
 }
 
-/// Per-handle cache entry under the cache-pin model.
-///
-/// `weak` lets the process resurrect a fresh `Arc<ProxyHandle>` after the
-/// previous one has been dropped, without issuing a new
-/// `INTERFACE_TRANSACTION` (the cached `descriptor` is reused).
-///
-/// The kernel weak ref (`BC_INCREFS`) that keeps `binder_ref(handle)`
-/// alive while user-side strong count is 0 is **not** a separate field —
-/// it is owned implicitly by this entry's presence in
-/// `handle_to_proxy`. The pin is acquired exactly once on first
-/// insertion (slow-path case (a)) and released exactly once on obituary
-/// teardown.
-///
-/// **Slow-path lock discipline.** The slow path is split into three
-/// phases (P1/P2/P3) so that the descriptor query (and the
-/// `ping_binder(0)` issued for service manager on Android sdk>=30)
-/// runs with `handle_to_proxy` *unlocked*. This is required for
-/// re-entrancy: the catch-all arm of `wait_for_response` dispatches
-/// `BR_DEAD_BINDER` to `execute_command`, which calls
-/// [`ProcessState::send_obituary_for_handle`] and re-acquires the
-/// same write lock. Holding the lock across IPC would deadlock under
-/// `std::sync::RwLock`'s non-reentrant write semantics.
-///
-/// To preserve the cache pin invariant under that split, P3 covers a
-/// race where another thread (T2) ran a complete case (a) during our
-/// P2 IPC and then dropped its `Arc`: when our P3 plan was CaseA but
-/// the cache slot is again "present + dangling weak", we have one
-/// spare BC_INCREFS pin (ours) on top of T2's cache-owned pin. P3
-/// undoes our pin and adopts T2's descriptor/generation, restoring
-/// "entry-1 ↔ pin-1". The companion `(CaseB, None)` arm — cache
-/// entry vanished mid-flight via obituary — returns `DeadObject`
-/// rather than racing BC_ACQUIRE against a freed binder_ref slot;
-/// this is the one window where the "BC_ACQUIRE precondition = pin
-/// alive" invariant could otherwise break.
-///
-/// `generation` is a process-wide monotonic counter snapshotted at
-/// case-(a) insertion. A proxy `WIBinder` records the generation it
-/// observed at `SIBinder::downgrade` time so `WIBinder` identity
-/// (`PartialEq`) is stable across case-(b) re-lookups (a fresh
-/// `Arc<ProxyHandle>` is a new allocation, but the `(handle,
-/// generation)` pair is unchanged), and so a recycled handle id
-/// (different `binder_node`) is distinguishable. Case (b) preserves
-/// the existing entry's generation (same kernel slot, fresh
-/// wire-delivered strong ref re-establishes transactability); only
-/// case (a) allocates a new generation.
-///
-/// Case-(b) re-lookup here (via `strong_proxy_for_handle_stability`)
-/// is driven by a fresh wire delivery of the handle — e.g. servicemanager
-/// `checkService` or an incoming transaction carrying it — which gives
-/// the new `BC_ACQUIRE` a kernel strong count it can transact on. This
-/// is distinct from `WIBinder::upgrade()`, which is purely weak: it
-/// never re-`BC_ACQUIRE`s a strong-0 handle (see `WIBinder::upgrade`).
+/// Per-handle proxy cache entry; its presence owns the pin (module doc "Proxy cache entry").
 pub(crate) struct CacheEntry {
     pub(crate) weak: sync::Weak<ProxyHandle>,
     pub(crate) descriptor: String,
     pub(crate) generation: u64,
 }
 
-/// Sidecar-table entry for a native binder this process has published.
-///
-/// Replaces the previous fat-pointer encoding (`flat_binder_object.binder` =
-/// data pointer, `flat_binder_object.cookie` = vtable pointer) with a
-/// process-monotonic u64 id. The id is what the kernel echoes back in
-/// `BR_INCREFS` / `BR_ACQUIRE` / `BR_RELEASE` / `BR_DECREFS` /
-/// `BR_TRANSACTION` (`target.ptr`); lookup resolves to the live Arc via
-/// `binder_pin.as_arc()`. Closes a UAF where weak-ref BR handlers
-/// (`BR_DECREFS`) could fire after the underlying `Inner<T>` had been
-/// dropped under the old encoding — see Android's two-allocation
-/// (`weakref_type*` + `BBinder*`) design for the canonical fix shape.
-///
-/// Lifecycle: created on first `From<&SIBinder>` (BINDER_TYPE_BINDER), held
-/// as long as either parcel-side (`publish_count`) or kernel-side
-/// (`kernel_refs`) refs are outstanding, removed when both reach zero.
-/// While the entry exists, `binder_pin` keeps `Inner<T>` alive and
-/// `RefCounter.strong` / `RefCounter.weak` sit at the binary "alive"
-/// level (>= 1) so that `attempt_inc_*` succeeds.
+/// Sidecar entry for a published native, keyed by a u64 id; see module doc "Published natives".
 pub(crate) struct PublishedNative {
-    /// Owns `RefCounter.strong` >= 1 via `SIBinder::from_arc`'s
-    /// `inc_strong` (entry creation) and `SIBinder::Drop`'s
-    /// `dec_strong(None)` (entry removal). Also keeps the underlying
-    /// `Arc<dyn IBinder>` strong > 0 — this is the canonical reference
-    /// that keeps `Inner<T>` alive while the kernel or any outgoing
-    /// parcel still references the published binder.
+    /// Holds `RefCounter.strong` >= 1 and keeps `Inner<T>` alive while the entry exists.
     pub(crate) binder_pin: SIBinder,
-    /// Number of live `flat_binder_object` instances of type
-    /// `BINDER_TYPE_BINDER` for this id across all parcel buffers in
-    /// this process. Driven by `flat_binder_object::acquire` /
-    /// `release` (the existing pair already invoked from
-    /// `Parcel::write_object`, `Parcel::append_from`, and
-    /// `Parcel::release_objects`).
+    /// Live `BINDER_TYPE_BINDER` objects for this id across this process's parcel buffers.
     pub(crate) publish_count: u32,
-    /// Number of outstanding kernel refs against this id.
-    /// `BR_INCREFS` / `BR_ACQUIRE` increment; `BR_RELEASE` /
-    /// `BR_DECREFS` decrement (deferred via `pending_*_derefs`,
-    /// processed FIFO).
+    /// Kernel refs: +1 per `BR_INCREFS`/`BR_ACQUIRE`, -1 per deferred `BR_RELEASE`/`BR_DECREFS`.
     pub(crate) kernel_refs: u32,
-    /// Number of `publish_native` dedup hits whose matching
-    /// `acquire` (`incref_publish`) has not landed yet. A dedup
-    /// returns an existing id but `publish_count` is only bumped by
-    /// the immediately-following `acquire`; without this reservation
-    /// a concurrent `decref_publish`/`deref_native_kernel` that drives
-    /// the counters to zero in that gap would remove the entry, and
-    /// the pending `acquire` would then ship a `binder` id the kernel
-    /// can no longer resolve. Bumped under the write lock on dedup,
-    /// consumed by the next `incref_publish`, and required to be zero
-    /// before any removal.
-    ///
-    /// Best-effort: the reservation is keyed by id, not by the specific
-    /// dedup, so an `append_from`-clone `acquire` on the same id can
-    /// consume it. That closes the common window (a `decref`/`deref`
-    /// racing a dedup) but not the pathological one where a clone's entire
-    /// `acquire`..`release` lifetime nests inside a single dedup's
-    /// `publish_native`..`acquire` gap — that gap is two adjacent
-    /// statements with no blocking call, so it is not reachable in
-    /// practice. Fully closing it would require threading "is-dedup" into
-    /// `flat_binder_object::acquire` (a `binder_object.rs` protocol
-    /// change); deferred.
+    /// Dedup hits whose `incref_publish` is pending; removal needs 0 (module doc).
     pub(crate) pending_reservations: u32,
 }
 
@@ -297,7 +413,8 @@ pub enum CallRestriction {
     None,
     /// Log when a blocking call is made.
     ErrorIfNotOneway,
-    /// Abort the process on a blocking call.
+    /// Panic on a blocking call. A `catch_unwind` around a handler turns
+    /// the panic into an error reply; AOSP aborts the process instead.
     FatalIfNotOneway,
 }
 
@@ -321,18 +438,7 @@ struct MemoryMap {
     ptr: *mut c_void,
     size: usize,
 }
-// SAFETY: `ptr` is a PROT_READ binder mapping owned for the whole
-// ProcessState lifetime. Accesses *through this handle* are limited to the
-// single `munmap(ptr, size)` in ProcessState::drop. The region itself is the
-// kernel-delivered transaction-buffer area and *is* read as Rust data
-// elsewhere (thread_state reads inbound `BR_TRANSACTION`/`BR_REPLY` buffers
-// and `calling_sid` out of it), but that access is synchronized by the binder
-// driver's buffer-lifetime protocol (a buffer stays valid until
-// `BC_FREE_BUFFER`), not by this handle — and it goes through the kernel
-// pointers in the transaction, not `ptr`. Because the mapping lives for the
-// singleton's whole lifetime (the init-race loser never serviced a
-// transaction), no such read is outstanding at drop. No data race is possible
-// through this handle, so it is safe to send and share across threads.
+// SAFETY: only Drop's `munmap` goes through `ptr`; see module doc "Receive mapping".
 unsafe impl Sync for MemoryMap {}
 unsafe impl Send for MemoryMap {}
 
@@ -343,42 +449,19 @@ pub struct ProcessState {
     mmap: RwLock<MemoryMap>,
     context_manager: RwLock<Option<SIBinder>>,
     handle_to_proxy: RwLock<HashMap<u32, CacheEntry>>,
-    /// Monotonic counter for `CacheEntry::generation`. Incremented
-    /// exactly once per case-(a) cache insertion (i.e. per fresh
-    /// `BC_INCREFS` pin). Wrap-around is not a practical concern (u64).
+    /// Source of `CacheEntry::generation`, bumped once per case-(a) insertion (fresh pin).
     next_generation: AtomicU64,
-    /// Native binders this process has published, keyed by a
-    /// process-monotonic u64 id encoded in `flat_binder_object.binder`
-    /// (replacing the previous fat-pointer encoding). Lookup resolves
-    /// the id to a live `Arc<dyn IBinder>` for `BR_TRANSACTION` /
-    /// `BR_INCREFS` / `BR_ACQUIRE` / `BR_RELEASE` / `BR_DECREFS` /
-    /// `BR_ATTEMPT_ACQUIRE` and for round-trip
-    /// `BINDER_TYPE_BINDER` deserialization. See
-    /// `PublishedNative` for entry-lifecycle invariants.
+    /// Published natives by the u64 id in `flat_binder_object.binder`; see `PublishedNative`.
     published_natives: RwLock<HashMap<u64, PublishedNative>>,
-    /// Monotonic id allocator for `published_natives`. u64 wrap-around
-    /// is not a practical concern.
+    /// Monotonic u64 id allocator for `published_natives`.
     next_native_id: AtomicU64,
     disable_background_scheduling: AtomicBool,
     call_restriction: RwLock<CallRestriction>,
     thread_pool_started: AtomicBool,
     thread_pool_seq: AtomicUsize,
-    /// Counts pooled-thread spawns driven by kernel `BR_SPAWN_LOOPER`
-    /// commands — i.e. `spawn_pooled_thread(is_main = false)` from
-    /// [`thread_state::join_thread_pool`]. Incremented asynchronously
-    /// by binder worker threads at any time after they start running,
-    /// so it is **not** a deterministic indicator of any particular
-    /// caller's effect. Use [`Self::main_thread_spawned`] when you
-    /// need to observe the spawn driven by `start_thread_pool` itself.
+    /// `BR_SPAWN_LOOPER` spawns, bumped asynchronously by workers; not tied to any one caller.
     kernel_started_threads: AtomicUsize,
-    /// Counts pooled-thread spawns driven by [`Self::start_thread_pool`]
-    /// — i.e. `spawn_pooled_thread(is_main = true)`. The
-    /// `thread_pool_started` CAS in `start_thread_pool` admits at most
-    /// one successful spawn for the process lifetime, so this counter
-    /// is monotonic `0 → 1`. Split from `kernel_started_threads` so
-    /// tests can verify the `start_thread_pool` spawn contract without
-    /// racing kernel-driven `BR_SPAWN_LOOPER` spawns from prior
-    /// serial-test workers that stay alive in the process.
+    /// `start_thread_pool` spawns (`0 → 1` via its CAS), kept apart from kernel spawns for tests.
     main_thread_spawned: AtomicUsize,
     pub(crate) current_threads: AtomicUsize,
 }
@@ -423,16 +506,7 @@ impl ProcessState {
             .expect("Call restriction lock poisoned")
     }
 
-    /// Say what `max_threads` will mean, at `info`, before the kernel is
-    /// told.
-    ///
-    /// Every value is honored as written — AOSP's
-    /// `setThreadPoolMaxThreadCount` passes it straight to
-    /// `BINDER_SET_MAX_THREADS` and so does this — so the log is the only
-    /// place a caller finds out what it actually asked for. The two ends of
-    /// the range are the ones worth spelling out: `0` disables
-    /// kernel-driven spawning entirely, and a value above the default is a
-    /// deliberate choice that should be visible next to the memory it costs.
+    /// Log what `max_threads` means; as in AOSP, it reaches `BINDER_SET_MAX_THREADS` unchanged.
     fn log_max_threads(max_threads: u32) {
         match max_threads {
             0 => log::info!(
@@ -449,24 +523,10 @@ impl ProcessState {
         }
     }
 
-    /// Check a requested receive-mapping size and return the size the
-    /// kernel will actually map.
-    ///
-    /// `mmap(2)` rounds a length up to a page boundary, so a request that
-    /// is not a whole number of pages buys more than it asked for. The
-    /// rounded value is what [`Self::mmap_size`] reports and what the
-    /// entry layer compares a later request against — carrying the raw
-    /// request instead would make the same size compare unequal to
-    /// itself.
+    /// Range-check a receive-mapping size and page-round it; see module doc "Receive mapping".
     pub(crate) fn normalized_mmap_size(mmap_size: usize) -> Result<usize> {
         let page = rustix::param::page_size();
-        // One page is the granularity `mmap(2)` works in and the
-        // smallest mapping the driver serves a buffer from (measured: a
-        // 4096-byte mapping carries a ~3.9 KB call). It also keeps a
-        // `default_mmap_size()` that degenerated to 0 out of
-        // `mmap(len = 0)`, which the `vm_size > 0` in `inner_init`'s
-        // SAFETY comment rests on. The ceiling is the driver's silent
-        // `SZ_4M` clamp.
+        // The page floor also backs `vm_size > 0` in `inner_init`'s SAFETY comment.
         if mmap_size < page || mmap_size > MAX_BINDER_MMAP_SIZE {
             log::error!(
                 "binder mmap size {mmap_size} is outside [{page}, {MAX_BINDER_MMAP_SIZE}]; \
@@ -491,12 +551,7 @@ impl ProcessState {
 
         let driver = open_driver(&driver_name, max_threads)?;
 
-        // SAFETY: `mmap` is unsafe because it creates a new mapping. `driver`
-        // is a live, open binder device fd; `vm_size > 0`; addr is null so
-        // the kernel chooses the address; PROT_READ + MAP_PRIVATE means the
-        // region is never written through this pointer; offset 0 is the
-        // binder ABI contract. The result is `?`-checked, and the mapping is
-        // unmapped exactly once in ProcessState::drop.
+        // SAFETY: live binder fd, `vm_size > 0`, null addr, read-only; unmapped once in Drop.
         let mmap = unsafe {
             let vm_start = rustix::mm::mmap(
                 std::ptr::null_mut(),
@@ -608,10 +663,7 @@ impl ProcessState {
         if let Some(existing) = cell.get() {
             return Ok(existing);
         }
-        // Build outside the cell so a failed init is NOT cached: a later
-        // call can retry (this is why `get_or_try_init`, still unstable,
-        // is avoided). If two threads race here, `get_or_init` keeps the
-        // first stored instance and the extra one is dropped.
+        // Built outside the cell so a failed init isn't cached (`get_or_try_init` is unstable).
         let instance = Self::inner_init(driver_name, max_threads, mmap_size)?;
         Ok(cell.get_or_init(|| instance))
     }
@@ -621,9 +673,7 @@ impl ProcessState {
     /// (`ProcessState.cpp`). Page size is a runtime value, so this is a
     /// function rather than a constant.
     pub fn default_mmap_size() -> usize {
-        // Saturating because a page larger than 512 KB would underflow;
-        // the range check in `init_with_mmap_size` then refuses the 0
-        // rather than this panicking.
+        // Saturating: a page over 512 KB yields 0, which `init_with_mmap_size` refuses.
         (1024usize * 1024).saturating_sub(rustix::param::page_size() * 2)
     }
 
@@ -637,9 +687,7 @@ impl ProcessState {
         Self::init(Self::default_driver_path(), DEFAULT_MAX_BINDER_THREADS)
     }
 
-    /// The driver path [`init_default`](Self::init_default) would use, so a
-    /// caller that only wants to override `max_threads` does not have to
-    /// re-derive it.
+    /// The driver path [`init_default`](Self::init_default) would use.
     pub(crate) fn default_driver_path() -> &'static str {
         if Path::new(crate::DEFAULT_BINDER_PATH).exists() {
             crate::DEFAULT_BINDER_PATH
@@ -670,8 +718,7 @@ impl ProcessState {
             return Ok(());
         }
 
-        // ACCEPTS_FDS stays set, unlike AOSP: `rsb_hub` answers
-        // DUMP_TRANSACTION, which carries an fd.
+        // ACCEPTS_FDS stays set, unlike AOSP: `rsb_hub` answers DUMP_TRANSACTION (carries an fd).
         let mut flags = binder::FLAT_BINDER_FLAG_ACCEPTS_FDS;
         // TXN_SECURITY_CTX only where the kernel can honour it — see `selinux_available`.
         if selinux_available() {
@@ -680,8 +727,6 @@ impl ProcessState {
         let obj = binder::flat_binder_object::new_binder_with_flags(flags);
 
         if binder::set_context_mgr_ext(&self.driver, obj).is_err() {
-            //     android_errorWriteLog(0x534e4554, "121035042");
-            // let unused: i32 = 0;
             if let Err(e) = binder::set_context_mgr(&self.driver, 0) {
                 return Err(format!("Binder ioctl to become context manager failed: {e}").into());
             }
@@ -714,8 +759,7 @@ impl ProcessState {
         handle: u32,
         stability: Stability,
     ) -> Result<SIBinder> {
-        // Read-lock fast path: pure Arc::clone, no kernel command. Common
-        // case under steady-state load.
+        // Read-lock fast path: pure Arc::clone, no kernel command.
         if let Some(arc) = self
             .handle_to_proxy
             .read()
@@ -726,24 +770,7 @@ impl ProcessState {
             return Ok(SIBinder::from_arc(arc));
         }
 
-        // Slow path: lock-decoupled three phases.
-        //
-        //   P1: short write-lock window. Decide the sub-case and, for
-        //        case (a), issue BC_INCREFS + flush so the cache pin
-        //        is live in the kernel before any IPC enters.
-        //        flush_commands is a write-only ioctl (read_size = 0),
-        //        so no BR_* — including BR_DEAD_BINDER — can be
-        //        dispatched while the lock is held; reentrant
-        //        send_obituary_for_handle paths only originate from
-        //        BR_DEAD_BINDER.
-        //   P2: lock released. IPC (ping_binder for handle 0 sdk>=30
-        //        and query_interface for case (a)) runs without the
-        //        handle_to_proxy lock held, so a re-entrant
-        //        BR_DEAD_BINDER → send_obituary_for_handle path can
-        //        take the lock without deadlocking against us.
-        //   P3: re-acquire write lock. Re-check case (c) and the
-        //        case (a)→(b) cross-thread race, undo any spare pin,
-        //        and commit the cache entry.
+        // Slow path in three lock-decoupled phases: see module doc "Proxy cache slow path".
         let plan = match self.slow_path_p1(handle)? {
             SlowPathDecision::Cached(arc) => return Ok(arc),
             SlowPathDecision::NeedIpc(plan) => plan,
@@ -752,30 +779,20 @@ impl ProcessState {
         self.slow_path_p3(handle, stability, ready)
     }
 
-    /// Slow-path phase 1: short write-lock window that decides the
-    /// sub-case and, for case (a), issues the kernel cache pin
-    /// (`BC_INCREFS` + `flush_commands`) before releasing the lock.
+    /// P1, under the write lock: decide the sub-case; case (a) pins (`BC_INCREFS` + flush).
     fn slow_path_p1(&self, handle: u32) -> Result<SlowPathDecision> {
-        // Write lock — even though P1 only reads, holding the write
-        // lock here prevents two concurrent slow paths from both
-        // observing "absent" and producing two case-(a) commits with
-        // distinct generations. The write lock serializes the
-        // BC_INCREFS issue point.
+        // Write lock though P1 only reads: it serializes the BC_INCREFS issue point.
         let handle_to_proxy = self
             .handle_to_proxy
             .write()
             .expect("Handle to proxy lock poisoned");
 
-        // Sub-case (c): another thread inserted/upgraded between the
-        // read-fast-path miss and this write-lock acquisition.
+        // Case (c): another thread inserted/upgraded since the read-fast-path miss.
         if let Some(arc) = handle_to_proxy.get(&handle).and_then(|e| e.weak.upgrade()) {
             return Ok(SlowPathDecision::Cached(SIBinder::from_arc(arc)));
         }
 
-        // Sub-case (b): entry present with dangling weak. Snapshot the
-        // descriptor/generation; the cache pin (BC_INCREFS issued at
-        // first insertion) is still active so P3's BC_ACQUIRE will
-        // succeed without needing a new pin.
+        // Case (b): weak dead; the first-insertion pin still backs P3's BC_ACQUIRE.
         if let Some(entry) = handle_to_proxy.get(&handle) {
             return Ok(SlowPathDecision::NeedIpc(SlowPathPlan::CaseB {
                 descriptor: entry.descriptor.clone(),
@@ -783,18 +800,7 @@ impl ProcessState {
             }));
         }
 
-        // Sub-case (a): entry absent. Pin the kernel binder_ref slot
-        // here, under the lock, so that:
-        //   - the pin is observable in the kernel before P2 runs any
-        //     transaction on this handle (BC_ACQUIRE in P3 cannot
-        //     race against a freed binder_ref slot);
-        //   - concurrent slow paths cannot both observe "absent" and
-        //     thus collapse onto the (CaseA, Some(_)) race in P3
-        //     instead of producing two true case-(a) commits.
-        //
-        // BC_INCREFS + flush_commands inside the lock is safe —
-        // talk_with_driver(false) sets read_size = 0 so no BR_* are
-        // dispatched, including BR_DEAD_BINDER.
+        // Case (a): pin under the lock; see module doc "Proxy cache slow path" for why.
         thread_state::inc_weak_handle(handle)?;
         if let Err(err) = thread_state::flush_commands() {
             log::warn!(
@@ -806,24 +812,14 @@ impl ProcessState {
         Ok(SlowPathDecision::NeedIpc(SlowPathPlan::CaseA))
     }
 
-    /// Slow-path phase 2: lock-released IPC.
-    ///
-    /// Performs `ping_binder(0)` for `handle == 0 && sdk_at_least(30)`
-    /// and, for [`SlowPathPlan::CaseA`], `query_interface(handle)`.
-    /// On any IPC failure, undoes our case (a) pin (if owned) before
-    /// propagating the error.
+    /// P2, lock released: `ping_binder(0)` (sdk >= 30), then CaseA's `query_interface`.
     fn slow_path_p2(&self, handle: u32, plan: SlowPathPlan) -> Result<SlowPathReady> {
-        // P2 entry hook (test-only). Used by the same-thread deadlock
-        // regression test to fire `send_obituary_for_handle(handle)`
-        // from inside the slow path while the `handle_to_proxy` lock
-        // is released — the exact scenario that used to deadlock under
-        // the monolithic pre-fix slow path.
+        // Test-only: the same-thread obituary test re-enters the cache here, lock released.
         #[cfg(test)]
         slow_path_p2_test_hook(handle);
 
         if handle == 0 && crate::sdk_at_least(30) {
-            // RAII restore so a ping failure can't leak
-            // CallRestriction::None into later calls on this thread.
+            // RAII restore: a ping failure can't leak CallRestriction::None into later calls.
             let _restore = RestoreCallRestriction(thread_state::call_restriction());
             thread_state::set_call_restriction(CallRestriction::None);
             if let Err(err) = thread_state::ping_binder(handle) {
@@ -851,38 +847,21 @@ impl ProcessState {
         }
     }
 
-    /// Slow-path phase 3: short write-lock window that re-checks
-    /// races spawned during P2 and commits the cache entry.
-    ///
-    /// Race resolution table (P2 ready × cache state at P3):
-    ///
-    /// | ready  | cached at P3 | action                                              |
-    /// |--------|--------------|-----------------------------------------------------|
-    /// | (any)  | live entry   | drop our work; if CaseA, undo our pin               |
-    /// | CaseA  | None         | standard commit; new generation                     |
-    /// | CaseA  | Some(_)      | undo our pin; commit using cached desc/gen          |
-    /// | CaseB  | None         | DeadObject (cache pin gone — BC_ACQUIRE unsafe)     |
-    /// | CaseB  | Some, gen=   | resurrect under same generation                     |
-    /// | CaseB  | Some, gen≠   | adopt new entry's desc/gen                          |
+    /// P3: re-check races from P2 and commit; see the table in module doc "Proxy cache slow path".
     fn slow_path_p3(
         &self,
         handle: u32,
         stability: Stability,
         ready: SlowPathReady,
     ) -> Result<SIBinder> {
-        // Declared BEFORE the write lock so it drops AFTER (reverse order):
-        // any watermark callback that `new_acquired` → `proxy_count::
-        // on_proxy_create` would fire is queued and only runs once this lock
-        // is released, so a callback re-entering the proxy cache can't
-        // deadlock against the write lock this thread still holds.
+        // Declared first so it drops after the lock: watermark callbacks may re-enter the cache.
         let _proxy_count_defer = crate::proxy_count::CallbackDeferGuard::new();
         let mut handle_to_proxy = self
             .handle_to_proxy
             .write()
             .expect("Handle to proxy lock poisoned");
 
-        // Re-check (c): a concurrent slow path completed during our
-        // P2 IPC. Our work is redundant.
+        // Re-check (c): a concurrent slow path completed during our P2; ours is redundant.
         if let Some(arc) = handle_to_proxy.get(&handle).and_then(|e| e.weak.upgrade()) {
             if matches!(ready, SlowPathReady::CaseA { .. }) {
                 undo_case_a_pin(handle);
@@ -908,13 +887,7 @@ impl ProcessState {
                 )
             }
             (SlowPathReady::CaseA { .. }, Some((cached_desc, cached_gen))) => {
-                // Cross-thread race: while P2 ran, another thread
-                // (T2) completed a case (a) for this handle and then
-                // dropped its Arc, leaving the entry present + weak
-                // dead. T2's BC_INCREFS pin is owned by the cache
-                // entry; ours is spare. Undo ours so the
-                // "entry-1 ↔ pin-1" invariant holds, then resurrect
-                // under T2's descriptor/generation.
+                // T2 ran a case (a) during our P2 (module doc, P3 race): undo our spare pin.
                 undo_case_a_pin(handle);
                 commit_new_acquired(
                     &mut handle_to_proxy,
@@ -932,8 +905,7 @@ impl ProcessState {
                 },
                 Some((_, cached_gen)),
             ) if cached_gen == generation => {
-                // CaseB confirmed: same entry, same generation. The
-                // cache pin from first insertion is still active.
+                // Same entry, same generation: the first-insertion pin is still active.
                 commit_new_acquired(
                     &mut handle_to_proxy,
                     handle,
@@ -944,9 +916,7 @@ impl ProcessState {
                 )
             }
             (SlowPathReady::CaseB { .. }, Some((cached_desc, cached_gen))) => {
-                // Generation differs: original entry was obituary'd
-                // and a new case (a) installed a fresh slot during
-                // P2. Drop our CaseB plan and follow the new entry.
+                // An obituary plus a new case (a) replaced the entry during P2; follow it.
                 commit_new_acquired(
                     &mut handle_to_proxy,
                     handle,
@@ -957,27 +927,13 @@ impl ProcessState {
                 )
             }
             (SlowPathReady::CaseB { .. }, None) => {
-                // Cache entry vanished mid-flight (obituary). The
-                // pin we relied on for BC_ACQUIRE may be gone.
-                // Surfacing DeadObject is safer than racing
-                // BC_ACQUIRE against a freed binder_ref slot — the
-                // user's contract is to re-resolve through service
-                // manager, identical to BR_DEAD_BINDER recovery.
+                // Obituary may have freed the pin; callers re-resolve as after BR_DEAD_BINDER.
                 Err(StatusCode::DeadObject)
             }
         }
     }
 
-    /// Snapshot the cache entry's generation for `handle`, if present.
-    ///
-    /// Called from `SIBinder::downgrade` when constructing a proxy
-    /// `WIBinder` so the resulting weak reference carries the
-    /// generation it observed at construction time. A subsequent
-    /// Test-only. Production code reads the generation off the
-    /// `ProxyHandle` instead ([`crate::SIBinder::downgrade`]), because this
-    /// answers `None` once the obituary has retired the entry — precisely
-    /// when a death recipient needs the identity. What remains here is the
-    /// cache-side invariant the resurrection tests assert on.
+    /// Test-only: the cache entry's generation for `handle` (production reads the `ProxyHandle`).
     #[cfg(test)]
     pub(crate) fn cache_generation_for(&self, handle: u32) -> Option<u64> {
         self.handle_to_proxy
@@ -987,45 +943,15 @@ impl ProcessState {
             .map(|e| e.generation)
     }
 
-    /// Phase 1 of obituary teardown: remove the cache entry under write
-    /// lock and notify recipients. Phase 2 (BC_DECREFS to release the
-    /// cache pin) is performed by `release_obituary_pin`, called from
-    /// `thread_state::execute_command`'s BR_DEAD_BINDER arm AFTER
-    /// BC_DEAD_BINDER_DONE has been queued.
-    ///
-    /// # Reentrancy with the slow path
-    ///
-    /// `wait_for_response`'s catch-all arm dispatches
-    /// `BR_DEAD_BINDER` to `execute_command`, which calls this
-    /// method on the same thread that issued the originating
-    /// transaction — including a thread currently inside
-    /// [`Self::strong_proxy_for_handle_stability`]. Under
-    /// `std::sync::RwLock`'s non-reentrant write semantics, the
-    /// `handle_to_proxy.write()` taken here would deadlock if the
-    /// slow path were holding that lock across IPC; the slow path's
-    /// P1/P2/P3 split keeps the lock released during all IPC for
-    /// exactly this reason.
-    ///
-    /// # Borrow discipline (R1)
-    ///
-    /// Must be called with NO `THREAD_STATE` or `BINDER_DEREFS` borrow
-    /// held — `arc.send_obituary` invokes user
-    /// `DeathRecipient::binder_died` callbacks, which can issue nested
-    /// binder calls. See [`thread_state`](super::thread_state) module doc.
+    /// Obituary phase 1; R1: call with no `THREAD_STATE`/`BINDER_DEREFS` borrow (module doc).
     pub(crate) fn send_obituary_for_handle(&self, handle: u32) -> Result<()> {
-        // The read guard is dropped before `downgrade` runs. `downgrade` no
-        // longer consults the cache — it reads `(handle, generation)` off the
-        // `ProxyHandle` — so the ordering against the removal below is no
-        // longer load-bearing for identity; it is kept because building `who`
-        // needs a live `Arc`, which the entry's weak is what we have.
+        // `downgrade` reads identity off the `ProxyHandle`; reading first only secures a live Arc.
         let arc = {
             let handle_to_proxy = self
                 .handle_to_proxy
                 .read()
                 .expect("Handle to proxy lock poisoned");
-            // The entry's `weak` may or may not still upgrade. Recipients are
-            // only meaningful while a live proxy exists, since `link_to_death`
-            // requires an `Arc<ProxyHandle>` to hand out recipients.
+            // Recipients exist only on a live proxy (`link_to_death` needs the Arc).
             handle_to_proxy
                 .get(&handle)
                 .and_then(|entry| entry.weak.upgrade())
@@ -1043,9 +969,7 @@ impl ProcessState {
             handle_to_proxy.remove(&handle).is_some()
         };
 
-        // `send_obituary` runs user callbacks, so it is invoked with no
-        // `handle_to_proxy` lock held (and it is idempotent, so a racing
-        // double obituary for the same handle is harmless).
+        // Runs user callbacks, so no lock held; idempotent, so a racing double obituary is fine.
         match (arc, who) {
             (Some(arc), Some(who)) => arc.send_obituary(&who)?,
             _ if existed => {
@@ -1057,19 +981,7 @@ impl ProcessState {
         Ok(())
     }
 
-    /// Phase 2 of obituary teardown: release the cache pin
-    /// (BC_DECREFS). Called from `thread_state::execute_command`'s
-    /// BR_DEAD_BINDER arm AFTER `BC_DEAD_BINDER_DONE` has been queued
-    /// in this thread's out-parcel.
-    ///
-    /// `flush_commands()` here commits BC_DEAD_BINDER_DONE plus any
-    /// BC_RELEASEs queued IN THIS THREAD before BC_DECREFS reaches the
-    /// kernel. It does NOT drain other threads' out-parcels —
-    /// concurrent BC_RELEASEs from Drops on other threads can still
-    /// arrive after our BC_DECREFS. The kernel rejects those with
-    /// -EINVAL and a dmesg log entry, which is acceptable; strict
-    /// elimination of that window would require global cross-thread
-    /// synchronization which isn't worth the cost.
+    /// Obituary phase 2: `BC_DECREFS` the pin after `BC_DEAD_BINDER_DONE`; see module doc.
     pub(crate) fn release_obituary_pin(&self, handle: u32) -> Result<()> {
         thread_state::flush_commands()?;
         thread_state::dec_weak_handle(handle)?;
@@ -1077,59 +989,23 @@ impl ProcessState {
         Ok(())
     }
 
-    /// Publish a native binder into the sidecar table and return its id.
-    ///
-    /// The id is what `flat_binder_object.binder` will carry under the new
-    /// encoding (replacing the data half of the old fat-pointer pair).
-    ///
-    /// Dedup is by `Arc::ptr_eq` against existing `binder_pin` entries —
-    /// publishing the same `Arc` twice returns the same id, matching
-    /// Android's behavior where a single `binder_node` is allocated per
-    /// `weakref_type*` regardless of how many times it is sent. A dedup
-    /// hit bumps `pending_reservations` (the only counter side effect)
-    /// to pin the entry against a concurrent removal until the matching
-    /// `acquire` lands; see that field's doc.
-    ///
-    /// On a fresh insert, `RefCounter.strong` is driven 0→1 via
-    /// `SIBinder::from_arc` (which calls `inc_strong` once on the inner
-    /// trait object) and `RefCounter.weak` is driven 0→1 via an explicit
-    /// `arc.inc_weak(&dummy_wi)` call. Both counters stay at the binary
-    /// "alive" floor while the entry exists; user-side strong/weak
-    /// increments ride on top and never trigger the count→0 closure path
-    /// because the table-controlled +1 keeps the count above zero.
-    ///
-    /// `publish_count` starts at 0; the immediately-following
-    /// `Parcel::write_object` → `flat_binder_object::acquire` brings it
-    /// to 1. The single-statement window between this method returning
-    /// and the first `acquire` is the only leak path under
-    /// `Parcel::write_aligned` panics (typically OOM): `From<&SIBinder>`
-    /// returning before `acquire()` is called.
+    /// Publish a native (dedup by `Arc::ptr_eq`) and return its id; see module doc.
     pub(crate) fn publish_native(&self, arc: Arc<dyn IBinder>) -> u64 {
-        // Single write lock for dedup + insert: a read-then-write split
-        // would race two concurrent publishes of the same Arc into
-        // duplicate entries, breaking the dedup invariant.
+        // One write lock for dedup + insert: a read-then-write split would duplicate entries.
         let mut map = self
             .published_natives
             .write()
             .expect("Published natives lock poisoned");
         for (existing_id, entry) in map.iter_mut() {
             if Arc::ptr_eq(entry.binder_pin.as_arc(), &arc) {
-                // Reserve the entry against a concurrent removal until
-                // the matching `acquire` (incref_publish) lands; see
-                // `PublishedNative::pending_reservations`. `saturating_add`
-                // for symmetry with every decrement in this file (a wrap
-                // to 0 would defeat the reservation).
+                // Hold the entry until the matching `acquire`; a wrap to 0 would defeat that.
                 entry.pending_reservations = entry.pending_reservations.saturating_add(1);
                 return *existing_id;
             }
         }
         // Drive RefCounter.strong 0→1 via SIBinder::from_arc → inc_strong.
         let binder_pin = SIBinder::from_arc(Arc::clone(&arc));
-        // Drive RefCounter.weak 0→1 via explicit inc_weak. The dummy
-        // WIBinder satisfies the trait signature; native::inc_weak
-        // ignores it. WIBinder has no custom Drop impl, so dropping
-        // dummy_wi at scope end only decrements the std::sync::Weak's
-        // own reference count — RefCounter.weak is untouched.
+        // native::inc_weak ignores dummy_wi; dropping it never touches RefCounter.weak.
         let dummy_wi = SIBinder::downgrade(&binder_pin);
         arc.inc_weak(&dummy_wi)
             .expect("inc_weak on Arc<dyn IBinder> must not fail");
@@ -1146,14 +1022,7 @@ impl ProcessState {
         id
     }
 
-    /// `flat_binder_object::acquire` BINDER_TYPE_BINDER arm.
-    ///
-    /// Returns `false` if `id` is unknown — should not happen in practice
-    /// because every `acquire` is paired with a `From<&SIBinder>` that
-    /// just inserted the entry (or a buffer-clone via
-    /// `Parcel::append_from` whose source already holds an entry).
-    /// Callers `debug_assert!` in dev builds and `log::error!` + skip in
-    /// production.
+    /// `acquire` arm for `BINDER_TYPE_BINDER`; `false` (a caller bug) for an unknown id.
     pub(crate) fn incref_publish(&self, id: u64) -> bool {
         let mut map = self
             .published_natives
@@ -1162,11 +1031,7 @@ impl ProcessState {
         match map.get_mut(&id) {
             Some(entry) => {
                 entry.publish_count += 1;
-                // Consume one outstanding reservation if any. The reservation
-                // is keyed by id, not by a specific dedup, so this closes the
-                // common window (a `decref`/`deref` racing a dedup before its
-                // acquire) but is best-effort: see the residual note on
-                // `PublishedNative::pending_reservations`.
+                // Consume a reservation; best-effort, keyed by id (see `pending_reservations`).
                 entry.pending_reservations = entry.pending_reservations.saturating_sub(1);
                 true
             }
@@ -1174,12 +1039,7 @@ impl ProcessState {
         }
     }
 
-    /// `flat_binder_object::release` BINDER_TYPE_BINDER arm.
-    ///
-    /// Decrements `publish_count`. If both `publish_count` and
-    /// `kernel_refs` reach zero, the entry is removed (drives
-    /// `RefCounter.strong` / `RefCounter.weak` 1→0, drops the
-    /// `binder_pin` SIBinder). Returns `false` if `id` is unknown.
+    /// `release` arm for `BINDER_TYPE_BINDER`; removes the entry at zero, `false` if unknown.
     pub(crate) fn decref_publish(&self, id: u64) -> bool {
         let trigger_remove = {
             let mut map = self
@@ -1188,12 +1048,7 @@ impl ProcessState {
                 .expect("Published natives lock poisoned");
             match map.get_mut(&id) {
                 Some(entry) => {
-                    // `saturating_sub` is the production safety net for
-                    // an unpaired `release` (which would otherwise wrap
-                    // u32 → 4 billion); the `debug_assert` makes the
-                    // unpaired call loud during dev/CI so a future
-                    // `acquire`/`release` pairing bug doesn't slip
-                    // through silently.
+                    // Release builds clamp an unpaired release; debug builds assert on it.
                     debug_assert!(
                         entry.publish_count > 0,
                         "decref_publish on id {id} with publish_count == 0 \
@@ -1214,11 +1069,7 @@ impl ProcessState {
         true
     }
 
-    /// `BR_INCREFS` / `BR_ACQUIRE` / `BR_ATTEMPT_ACQUIRE` arms: bump
-    /// `kernel_refs`. Returns `Some(arc)` while the entry is alive
-    /// (caller may dispatch methods on the arc); `None` if `id` is
-    /// unknown (kernel invariant violation in `BR_INCREFS` / `BR_ACQUIRE`,
-    /// expected race for `BR_ATTEMPT_ACQUIRE`).
+    /// `BR_INCREFS`/`BR_ACQUIRE`/`BR_ATTEMPT_ACQUIRE`: bump `kernel_refs`; `None` if unknown.
     pub(crate) fn ref_native_kernel(&self, id: u64) -> Option<Arc<dyn IBinder>> {
         let mut map = self
             .published_natives
@@ -1229,12 +1080,7 @@ impl ProcessState {
         Some(Arc::clone(entry.binder_pin.as_arc()))
     }
 
-    /// `BR_RELEASE` / `BR_DECREFS` arms (deferred via
-    /// `pending_*_derefs`): decrement `kernel_refs`. If both
-    /// `publish_count` and `kernel_refs` reach zero, the entry is
-    /// removed (RefCounter floor torn down, Arc dropped). Returns
-    /// `Some(arc)` while the entry was still present pre-removal;
-    /// `None` if `id` is unknown.
+    /// Deferred `BR_RELEASE`/`BR_DECREFS`: decrement `kernel_refs`, removing the entry at zero.
     pub(crate) fn deref_native_kernel(&self, id: u64) -> Option<Arc<dyn IBinder>> {
         let (arc, trigger_remove) = {
             let mut map = self
@@ -1242,29 +1088,7 @@ impl ProcessState {
                 .write()
                 .expect("Published natives lock poisoned");
             let entry = map.get_mut(&id)?;
-            // `saturating_sub` clamps at 0 under a cross-thread race
-            // where `BR_DECREFS` is processed before its matching
-            // `BR_INCREFS`. The kernel queues `BR_INCREFS` /
-            // `BR_DECREFS` to `proc->todo` (process-wide FIFO), so
-            // distinct binder threads can pop the matching pair in
-            // FIFO order but dispatch out of order if the
-            // `BR_INCREFS` thread is preempted before reaching
-            // `ref_native_kernel`. Under that race the late
-            // `BR_INCREFS` will bump `kernel_refs` from 0 to 1 (we
-            // missed the dec that should have followed). Each race
-            // occurrence on a given id adds one to `kernel_refs`'s
-            // over-count vs the kernel's true ref count; the
-            // accumulation is **unbounded** over the binder's
-            // lifetime if races recur, leaving the entry permanently
-            // stranded with `kernel_refs >= 1` even after the kernel
-            // has fully released. Bounded only by "one entry per
-            // long-lived published binder that ever raced." We
-            // accept this over a `debug_assert` panic: the race is a
-            // property of kernel scheduling, not our bookkeeping, so
-            // panicking would fail CI on a legitimate interleaving.
-            // A signed counter + dual-direction removal trigger could
-            // bound the drift, but introduces premature-removal hazards
-            // in multi-pair scenarios; left as a follow-up.
+            // Clamps a BR_DECREFS-before-BR_INCREFS race; see module doc "`kernel_refs` drift".
             entry.kernel_refs = entry.kernel_refs.saturating_sub(1);
             let arc = Arc::clone(entry.binder_pin.as_arc());
             let trigger = entry.publish_count == 0
@@ -1278,9 +1102,7 @@ impl ProcessState {
         Some(arc)
     }
 
-    /// `BR_TRANSACTION` and round-trip `BINDER_TYPE_BINDER` receive
-    /// path: read-only lookup. Does not change counts. Returns `None`
-    /// if the id is unknown.
+    /// Read-only lookup for `BR_TRANSACTION` and a round-trip `BINDER_TYPE_BINDER` read.
     pub(crate) fn lookup_native(&self, id: u64) -> Option<Arc<dyn IBinder>> {
         let map = self
             .published_natives
@@ -1289,20 +1111,7 @@ impl ProcessState {
         map.get(&id).map(|e| Arc::clone(e.binder_pin.as_arc()))
     }
 
-    /// Remove the entry for `id` and tear down the RefCounter floor —
-    /// but only if both `publish_count` and `kernel_refs` are still zero
-    /// when re-checked under the write lock. The two-phase pattern
-    /// (counter-mutate under lock, release lock, re-acquire for
-    /// removal) is required because `SIBinder::Drop` calls
-    /// `dec_strong(None)` which may run user destructor code (via
-    /// `Inner<T>::drop`) that itself calls back into `ProcessState` —
-    /// holding the write lock across that path would deadlock.
-    ///
-    /// The re-check under the new lock makes the two-phase pattern
-    /// race-free: if a concurrent `BR_INCREFS` / `From<&SIBinder>`
-    /// bumped a counter back above zero between phases, we abort the
-    /// removal. Same shape as the proxy-side `CacheEntry` removal in
-    /// `send_obituary_for_handle`.
+    /// Removal phase 2: re-check the counters, remove, drop unlocked; see module doc.
     fn remove_entry_if_zero(&self, id: u64) {
         let entry = {
             let mut map = self
@@ -1318,20 +1127,10 @@ impl ProcessState {
             }
             map.remove(&id).expect("just observed Some")
         };
-        // Symmetric with publish_native: dec_weak first (no destructor
-        // side effect — `Inner<T>::dec_weak` only touches RefCounter.weak),
-        // then drop binder_pin which fires SIBinder::Drop →
-        // dec_strong(None) → RefCounter.strong 1→0. The Arc inside
-        // binder_pin is the canonical strong reference; if no user-side
-        // SIBinder clones survive, that drop also takes the Arc strong
-        // count to zero, triggering Inner<T>::drop CLEANLY — kernel has
-        // guaranteed no further BR_* will reference this id (kernel_refs
-        // was 0 to reach this branch).
+        // dec_weak (no side effect) before the drop that may run `Inner<T>::drop`; no BR_* left.
         let arc_for_weak = Arc::clone(entry.binder_pin.as_arc());
         if let Err(e) = arc_for_weak.dec_weak() {
-            // Symmetric with `publish_native`'s `inc_weak` (which is loud on
-            // failure); a discarded error here would hide a RefCounter.weak
-            // underflow / leak.
+            // Loud like `publish_native`'s `inc_weak`: silence hides a RefCounter.weak underflow.
             log::error!("unpublish_native: dec_weak failed for id {id}: {e:?}");
         }
         drop(entry.binder_pin);
@@ -1350,16 +1149,12 @@ impl ProcessState {
         self.driver.clone()
     }
 
-    /// The binder driver path this process was initialized with. Used by
-    /// [`crate::serve`] / [`crate::Client`] to detect a
-    /// conflicting re-init (Plan 2-16 §6) — `init`/`init_default` are
-    /// idempotent and keep the first config.
+    /// Init-time driver path; `serve`/`Client` compare it to detect a conflicting re-init.
     pub(crate) fn driver_name(&self) -> &std::path::Path {
         &self.driver_name
     }
 
-    /// The max-threads value this process was initialized with (`0` =
-    /// kernel default). See [`Self::driver_name`].
+    /// Init-time `max_threads` (`0` = no kernel-driven spawns); see [`Self::driver_name`].
     pub(crate) fn max_threads(&self) -> u32 {
         self.max_threads
     }
@@ -1400,6 +1195,16 @@ impl ProcessState {
     /// Calling it after `init(.., 0)` warns: the pool is enabled but pinned
     /// at the single worker spawned here, because a `max_threads` of zero
     /// tells the kernel never to ask for more.
+    ///
+    /// Call this before any thread joins the pool. A `BR_SPAWN_LOOPER` that
+    /// arrives before this call is dropped, as in AOSP `spawnPooledThread`
+    /// (`frameworks/native/libs/binder/ProcessState.cpp`, the TODO about a
+    /// late `startThreadPool`). The kernel counts that request in
+    /// `requested_threads` and decrements it only on `BC_REGISTER_LOOPER`, so
+    /// once one is dropped it never requests another pooled thread, even after
+    /// this call. The sequence is `init_default()`, then `join_thread_pool()`
+    /// receiving a transaction, then a late `start_thread_pool()`. This
+    /// function itself is CAS-idempotent.
     pub fn start_thread_pool() {
         let this = Self::as_self();
         if this
@@ -1407,11 +1212,7 @@ impl ProcessState {
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
         {
-            // Reachable now that `0` is stored as written: one worker is
-            // spawned here, but with `max_threads = 0` the kernel never
-            // sends `BR_SPAWN_LOOPER`, so the pool can never grow past it.
-            // AOSP warns about the mirror-image mistake in
-            // `checkExpectingThreadPoolStart` (pool sized but never started).
+            // Mirror of AOSP `checkExpectingThreadPoolStart` (pool sized but never started).
             if this.max_threads == 0 {
                 log::warn!(
                     "start_thread_pool() with max_threads = 0: one worker is spawned, but the \
@@ -1441,22 +1242,13 @@ impl ProcessState {
             let name = self.make_binder_thread_name();
             log::info!("Spawning new pooled thread, name={name}");
             match thread::Builder::new().name(name).spawn(move || {
-                // The `JoinHandle` is dropped below, so this is the only
-                // place a looper's exit error (BC_REGISTER_LOOPER /
-                // BC_EXIT_LOOPER write, final flush) can be seen.
+                // The `JoinHandle` is dropped, so a looper's exit error is only visible here.
                 if let Err(e) = thread_state::join_thread_pool(is_main) {
                     log::error!("pooled binder thread exited with {e}");
                 }
             }) {
                 Ok(_) => {
-                    // Account into the per-origin counter so tests can verify
-                    // the `start_thread_pool` spawn contract without racing
-                    // kernel-driven `BR_SPAWN_LOOPER` spawns. See the field
-                    // docs on `main_thread_spawned` / `kernel_started_threads`.
-                    // Only on success — a failed spawn must not desync the
-                    // counter, and on a `BR_SPAWN_LOOPER` request the kernel
-                    // would otherwise wait forever for a looper that never
-                    // registered.
+                    // Count only real spawns, per origin (see `main_thread_spawned` docs).
                     if is_main {
                         self.main_thread_spawned.fetch_add(1, Ordering::SeqCst);
                     } else {
@@ -1468,10 +1260,7 @@ impl ProcessState {
                 }
             }
         }
-        // AOSP's late-startThreadPool desync TODO can't arise here: BC_REGISTER_LOOPER is
-        // emitted only from the BR_SPAWN_LOOPER handler (1:1 with a kernel request), the
-        // main/manual loopers use BC_ENTER_LOOPER (untracked), and start_thread_pool is
-        // CAS-idempotent. See frameworks/native/libs/binder/ProcessState.cpp spawnPooledThread.
+        // Dropped before the pool starts, as in AOSP; see `start_thread_pool` rustdoc.
     }
 
     pub fn strong_ref_count_for_node(&self, node: &ProxyHandle) -> Result<usize> {
@@ -1534,34 +1323,16 @@ fn open_driver(
     Ok(fd)
 }
 
-/// Whether the running kernel can attach an SELinux context to a
-/// transaction, which decides if `become_context_manager` registers with
-/// `FLAT_BINDER_FLAG_TXN_SECURITY_CTX` (AOSP always does).
-///
-/// The flag is what makes the kernel deliver `BR_TRANSACTION_SEC_CTX` to the
-/// context manager — without it `get_calling_sid()` is always `None` there.
-/// But `binder_transaction` then calls `security_secid_to_secctx()` for every
-/// transaction to that node and fails the whole transaction with
-/// `BR_FAILED_REPLY` when that errors, which it does on a kernel without
-/// SELinux: every call into the service manager would fail. Android always
-/// has SELinux; on Linux a mounted selinuxfs is the signal (the same check
-/// libselinux's `is_selinux_enabled()` makes).
+/// Kernel can attach SELinux contexts; see module doc "Context manager security context".
 fn selinux_available() -> bool {
     cfg!(target_os = "android") || std::path::Path::new("/sys/fs/selinux/enforce").exists()
 }
 
 impl Drop for ProcessState {
     fn drop(self: &mut ProcessState) {
-        // This `Drop` runs on the `init` race loser too; a `munmap` failure is
-        // not worth aborting the process (a `Drop` panic while unwinding
-        // aborts immediately). A poisoned lock still yields usable data —
-        // `ptr`/`size` are a POD pair a panicking reader cannot leave
-        // inconsistent — so unmap anyway rather than leak the mapping.
+        // No panic here (init-race losers drop too); a poisoned POD `ptr`/`size` is still valid.
         let mmap = self.mmap.read().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: `mmap.ptr`/`mmap.size` are exactly the address and length
-        // returned by the `mmap` call in `ProcessState::inner_init`. This runs only
-        // in `Drop`, so the mapping is still live and is unmapped exactly
-        // once; no references into the region outlive `ProcessState`.
+        // SAFETY: `inner_init`'s own live mapping, unmapped once here; nothing outlives `self`.
         unsafe {
             if let Err(e) = rustix::mm::munmap(mmap.ptr, mmap.size) {
                 log::error!("ProcessState::drop: munmap failed: {e}");
@@ -1574,38 +1345,23 @@ impl Drop for ProcessState {
 mod tests {
     use super::*;
 
-    /// Shared init + invariant checks for the two tests that assert a
-    /// freshly-initialized `ProcessState`. Deliberately NOT `#[serial]`:
-    /// both callers already run inside the `binder` serial section, so
-    /// keeping this a plain fn avoids depending on serial_test's lock
-    /// being reentrant for a same-thread nested `#[serial]` call.
-    /// AOSP parity pin: `DEFAULT_MAX_BINDER_THREADS`
-    /// (`frameworks/native/libs/binder/ProcessState.cpp:49`). It is a
-    /// *default*, not a ceiling — `init` honors larger values as written,
-    /// as AOSP's `setThreadPoolMaxThreadCount` does.
+    /// AOSP `DEFAULT_MAX_BINDER_THREADS` (`ProcessState.cpp:49`): a default `init` may exceed.
     #[test]
     fn the_default_thread_ceiling_matches_aosp() {
         assert_eq!(DEFAULT_MAX_BINDER_THREADS, 15);
     }
 
-    /// Plan 10-1 AC-1.1. No device needed: the size is decided before
-    /// the driver is opened, so the range and the rounding are testable
-    /// on their own.
+    /// Plan 10-1 AC-1.1; driver-free, since the size is decided before the driver opens.
     #[test]
     fn a_receive_mapping_size_is_range_checked_then_page_rounded() {
         let page = rustix::param::page_size();
 
-        // The AOSP-shaped default is what `init` asks for, and it is a
-        // whole number of pages already — rounding it must be identity,
-        // or every `init` would disagree with its own argument.
+        // Rounding the default must be identity, or `init` would disagree with its argument.
         let default = ProcessState::default_mmap_size();
         assert_eq!(default, (1024 * 1024) - page * 2);
         assert_eq!(ProcessState::normalized_mmap_size(default), Ok(default));
 
-        // Below a page and above the driver's silent 4 MB clamp are the
-        // two ends that must be refused rather than shrunk. The floor
-        // also keeps a `default_mmap_size()` that degenerated to 0 (a
-        // page above 512 KB) out of `mmap(len = 0)`.
+        // Both ends are refused, not shrunk; the floor also keeps a 0 default out of `mmap`.
         assert_eq!(
             ProcessState::normalized_mmap_size(0),
             Err(StatusCode::BadValue)
@@ -1614,8 +1370,7 @@ mod tests {
             ProcessState::normalized_mmap_size(page - 1),
             Err(StatusCode::BadValue)
         );
-        // One page is legal: the driver serves a buffer from it, so
-        // refusing it would refuse a mapping that works.
+        // One page is legal: the driver serves a buffer from it.
         assert_eq!(ProcessState::normalized_mmap_size(page), Ok(page));
         assert_eq!(
             ProcessState::normalized_mmap_size(MAX_BINDER_MMAP_SIZE),
@@ -1626,9 +1381,7 @@ mod tests {
             Err(StatusCode::BadValue)
         );
 
-        // A request that is not a whole number of pages gets the next
-        // page up — what `mmap(2)` maps — and rounding never crosses the
-        // ceiling, since the ceiling is itself a page multiple.
+        // Partial pages round up; the ceiling is a page multiple, so rounding never passes it.
         assert_eq!(ProcessState::normalized_mmap_size(page + 1), Ok(page * 2));
         assert_eq!(
             ProcessState::normalized_mmap_size(MAX_BINDER_MMAP_SIZE - 1),
@@ -1636,10 +1389,10 @@ mod tests {
         );
     }
 
+    /// Shared init checks; not `#[serial]`: callers already hold the `binder` serial lock.
     fn assert_process_state_initialized() {
         let process = ProcessState::init_default().expect("init_default");
-        // `init_default` asks for the default *explicitly* — nothing
-        // downstream rewrites a sentinel into it any more.
+        // `init_default` passes the default explicitly; no sentinel is rewritten into it.
         assert_eq!(process.max_threads, DEFAULT_MAX_BINDER_THREADS);
         assert_eq!(
             process.driver_name,
@@ -1679,13 +1432,7 @@ mod tests {
         assert!(process.strong_proxy_for_handle(0).is_ok());
     }
 
-    /// N threads racing on the same uncached handle (service manager =
-    /// 0) must converge on a single cache entry and a single `Arc`
-    /// identity. Exercises the lock-decoupled three-phase slow path's
-    /// race-resolution table — at most one P3 winner installs the
-    /// entry, every other thread either short-circuits in P1's case
-    /// (c) re-check, P3's case (c) re-check, or P3's
-    /// `(CaseA, Some(_))` cross-thread arm.
+    /// N threads on uncached handle 0 converge on one entry and one `Arc` (P3 race table).
     #[test]
     #[cfg_attr(
         not(any(target_os = "linux", target_os = "android")),
@@ -1723,13 +1470,7 @@ mod tests {
         );
     }
 
-    /// Drop all live `Arc<ProxyHandle>` for handle 0 so the cache
-    /// entry's `weak` is dangling, then race N threads through the
-    /// resurrection path. Each thread observes case (b) in P1 (entry
-    /// present, weak dead) and races to commit in P3 — only one
-    /// winner; the rest fall through P3's case (c) re-check and reuse
-    /// the winner's Arc. Verifies the case (b) generation-preservation
-    /// invariant survives concurrent resurrection.
+    /// N threads resurrect a dangling handle-0 entry via case (b): one `Arc`, generation kept.
     #[test]
     #[cfg_attr(
         not(any(target_os = "linux", target_os = "android")),
@@ -1747,9 +1488,7 @@ mod tests {
             .expect("entry must exist for handle 0");
         // Drop all strong refs to make `weak` dangling.
         drop(initial);
-        // Yield so any other Arc borrowers (e.g. `context_manager`
-        // cache) settle. In a clean test process there are no other
-        // strong refs to handle 0 by this point.
+        // Let other handle-0 Arc holders (e.g. `context_manager`) settle; a clean process has none.
         std::thread::yield_now();
 
         let handles: Vec<_> = (0..8)
@@ -1770,8 +1509,7 @@ mod tests {
                 "concurrent case (b) resurrection must produce a single Arc"
             );
         }
-        // Generation preserved (case (b) reuses the existing entry's
-        // generation; a fresh case (a) would have allocated a new one).
+        // Case (b) keeps the entry's generation; a fresh case (a) would allocate a new one.
         assert_eq!(
             ProcessState::as_self().cache_generation_for(0),
             Some(initial_gen),
@@ -1779,35 +1517,7 @@ mod tests {
         );
     }
 
-    /// Same-thread re-entrant obituary regression guard.
-    ///
-    /// Reproduces the exact deadlock the P1/P2/P3 split closes:
-    /// while the slow path is mid-flight, a `BR_DEAD_BINDER` for the
-    /// same handle dispatches `send_obituary_for_handle` on the
-    /// *same* thread, which re-acquires `handle_to_proxy.write()`.
-    /// Under the pre-fix monolithic slow path that lock was already
-    /// held by this thread → `std::sync::RwLock`'s non-reentrant
-    /// write semantics → hang. Under the post-fix split P1 has
-    /// released the lock by the time the obituary fires, so the
-    /// re-acquisition succeeds.
-    ///
-    /// The simulation drives the slow path on a worker thread that
-    /// installs a `slow_path_p2` cfg(test) hook calling
-    /// `send_obituary_for_handle` from the same thread (fired the
-    /// instant P1 releases the lock and before P2 enters IPC).
-    /// Driving the obituary from the actual binder driver would
-    /// require crashing a service mid-transact — too brittle for a
-    /// unit test, and the lock semantics being tested are
-    /// driver-independent.
-    ///
-    /// Wallclock-bounded so a regression manifests as a CI timeout
-    /// failure rather than an indefinite hang. The `fired` flag
-    /// asserts the hook actually ran — required because the
-    /// process-wide singleton `ProcessState` is shared with other
-    /// parallel tests, and a sibling test holding an `Arc` for
-    /// handle 0 could keep the cache `Weak` upgradeable, causing P1
-    /// to short-circuit at case (c) and the hook to never fire
-    /// (vacuous pass).
+    /// A same-thread obituary between P1 and P2 takes the lock, no deadlock; module doc "Tests".
     #[test]
     #[cfg_attr(
         not(any(target_os = "linux", target_os = "android")),
@@ -1817,11 +1527,7 @@ mod tests {
     fn test_strong_proxy_under_same_thread_dead_binder_no_deadlock() {
         let process = ProcessState::init_default().expect("init_default");
 
-        // Seed handle 0 (service manager) into the cache, then drop
-        // so the next lookup hits case (b) — entry present, weak
-        // dead. Case (b) lets us exercise the lock pattern without
-        // having to issue a fresh BC_INCREFS that the kernel might
-        // reject mid-test.
+        // Seed and drop handle 0 so the lookup takes case (b), which issues no fresh BC_INCREFS.
         let seed = process
             .strong_proxy_for_handle(0)
             .expect("seed strong_proxy_for_handle(0) must succeed");
@@ -1832,9 +1538,7 @@ mod tests {
 
         let (tx, rx) = std::sync::mpsc::channel();
         let join = std::thread::spawn(move || {
-            // Hook is thread-local: install on the worker so the
-            // injected obituary fires on the same thread that is
-            // running strong_proxy_for_handle.
+            // The hook is thread-local: install it on the thread that runs the lookup.
             super::set_slow_path_p2_test_hook(Some(Box::new(move |handle| {
                 fired_w.store(true, std::sync::atomic::Ordering::SeqCst);
                 ProcessState::as_self()
@@ -1846,8 +1550,7 @@ mod tests {
             tx.send(r).expect("result channel must not drop");
         });
 
-        // Wallclock bound: regression in the lock structure manifests
-        // as an indefinite hang here.
+        // Wallclock bound: a lock-structure regression fails here as a timeout, not a hang.
         let result = rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("strong_proxy_for_handle must complete within 5s — deadlock regression");
@@ -1860,11 +1563,7 @@ mod tests {
              cache Weak upgradeable. Test passed vacuously."
         );
 
-        // Either outcome is acceptable — what we are guarding
-        // against is the deadlock, not the resolution. After the
-        // obituary, P3's (CaseB, None) arm normally returns
-        // DeadObject; a parallel resurrection might also produce a
-        // live Arc.
+        // Guards the deadlock only: (CaseB, None) gives DeadObject, a parallel resurrection Ok.
         match result {
             Ok(_arc) => {}
             Err(StatusCode::DeadObject) => {}
@@ -1891,18 +1590,7 @@ mod tests {
     )]
     #[serial_test::serial(binder)]
     fn test_process_state_start_thread_pool() {
-        // Observe `main_thread_spawned` — incremented **only** by
-        // `spawn_pooled_thread(is_main = true)`, whose sole caller is
-        // `start_thread_pool`. Kernel-driven `BR_SPAWN_LOOPER` spawns
-        // go to `kernel_started_threads` and never touch this counter,
-        // so the assertion is race-free against leftover worker
-        // threads from prior `serial(binder)` tests that stay alive in
-        // the process and may receive `BR_SPAWN_LOOPER` at any time.
-        //
-        // The contract: the first `start_thread_pool` call flips
-        // `thread_pool_started` and increments `main_thread_spawned`
-        // exactly once; subsequent calls are no-ops (CAS rejects
-        // re-entry).
+        // `main_thread_spawned`, not `kernel_started_threads`: leftover loopers can't race it.
         assert_process_state_initialized();
         let process = ProcessState::as_self();
         let was_started = process.thread_pool_started.load(Ordering::SeqCst);
@@ -1917,10 +1605,7 @@ mod tests {
         }
     }
 
-    /// Minimal `IBinder` impl for the `published_natives` bookkeeping
-    /// tests below. Ref-count methods are no-ops — these tests exercise
-    /// the table's accounting (publish_count / kernel_refs and entry
-    /// removal-on-zero) without relying on `RefCounter` state.
+    /// Driver-free native `IBinder` with no-op ref counts, for the `published_natives` tests.
     struct MockNative;
 
     impl IBinder for MockNative {
@@ -1962,23 +1647,7 @@ mod tests {
         }
     }
 
-    /// End-to-end of the table-controlled lifecycle that closes the UAF
-    /// window:
-    ///
-    ///   1. publish a native binder → entry created, `publish_count = 0`,
-    ///      `kernel_refs = 0`, RefCounter floor armed.
-    ///   2. `incref_publish` (mirrors the first `acquire()` that
-    ///      `Parcel::write_object` would call): `publish_count = 1`.
-    ///   3. drop the local user-side strong ref (under the OLD encoding
-    ///      this could dangle `Inner<T>` once the kernel finished
-    ///      releasing; under the new model the table's `binder_pin`
-    ///      keeps the canonical Arc alive).
-    ///   4. simulate `BR_INCREFS` / `BR_ACQUIRE` / `BR_RELEASE` /
-    ///      `BR_DECREFS` arrival as pure id-bookkeeping.
-    ///   5. mirror `Parcel::release_objects` → `release()` →
-    ///      `decref_publish`: `publish_count = 0`. Now both counters
-    ///      are zero and the entry is removed → `lookup_native` returns
-    ///      `None`.
+    /// Only `binder_pin` holds the `Arc`; the entry lives until both counters reach 0.
     #[test]
     #[cfg_attr(
         not(any(target_os = "linux", target_os = "android")),
@@ -1995,23 +1664,20 @@ mod tests {
             "incref on freshly published id must succeed"
         );
 
-        // Drop the user-side Arc clone; only the table's binder_pin
-        // SIBinder keeps the inner Arc alive now.
+        // Only the table's binder_pin keeps the inner Arc alive from here on.
         drop(arc);
 
         // BR_INCREFS / BR_ACQUIRE: kernel_refs goes 0→1→2.
         assert!(process.ref_native_kernel(id).is_some());
         assert!(process.ref_native_kernel(id).is_some());
-        // BR_RELEASE: kernel_refs 2→1. Entry still alive
-        // (publish_count=1, kernel_refs=1).
+        // BR_RELEASE: kernel_refs 2→1; entry still alive (publish_count=1).
         assert!(process.deref_native_kernel(id).is_some());
         assert!(
             process.lookup_native(id).is_some(),
             "entry must remain while publish_count > 0"
         );
 
-        // Parcel::release_objects → release() → decref_publish:
-        // publish_count 1→0; kernel_refs still 1.
+        // Parcel::release_objects → decref_publish: publish_count 1→0; kernel_refs still 1.
         assert!(process.decref_publish(id));
         assert!(
             process.lookup_native(id).is_some(),
@@ -2032,10 +1698,7 @@ mod tests {
         assert!(process.deref_native_kernel(id).is_none());
     }
 
-    /// Two `publish_native` calls with the same `Arc<dyn IBinder>`
-    /// dedup to the same id. Driving each parcel slot's
-    /// `acquire`/`release` independently keeps the entry alive until
-    /// the last `release` fires.
+    /// Publishing one `Arc` twice dedups to one id, alive until the last `release`.
     #[test]
     #[cfg_attr(
         not(any(target_os = "linux", target_os = "android")),
@@ -2050,8 +1713,7 @@ mod tests {
         let id2 = process.publish_native(Arc::clone(&arc));
         assert_eq!(id1, id2, "publishing the same Arc twice must dedup");
 
-        // Two parcel slots reference the same id — `acquire` runs
-        // twice, `release` must run twice before the entry can drop.
+        // Two parcel slots share the id: two `release`s are needed before the entry drops.
         assert!(process.incref_publish(id1));
         assert!(process.incref_publish(id1));
 
@@ -2070,12 +1732,7 @@ mod tests {
         drop(arc);
     }
 
-    /// A dedup hit reserves the entry against a concurrent removal that
-    /// drives `publish_count` to zero before the dedup's matching
-    /// `acquire` lands. This replays the dangerous interleaving
-    /// deterministically: without `pending_reservations` the `decref`
-    /// below would remove the entry and the trailing `incref` would
-    /// fail (the kernel would be handed an unresolvable id).
+    /// Without `pending_reservations` the `decref` removes the entry and the later `incref` fails.
     #[test]
     #[cfg_attr(
         not(any(target_os = "linux", target_os = "android")),
@@ -2090,13 +1747,11 @@ mod tests {
         let id = process.publish_native(Arc::clone(&arc));
         assert!(process.incref_publish(id));
 
-        // Thread B publishes the same Arc (dedup) — its acquire is still
-        // pending at this point.
+        // Thread B publishes the same Arc (dedup); its acquire is still pending.
         let id_b = process.publish_native(Arc::clone(&arc));
         assert_eq!(id, id_b);
 
-        // Thread A's parcel is freed (release) -> publish_count = 0. The
-        // entry must NOT be removed, because B's dedup acquire is pending.
+        // A's release -> publish_count = 0; B's pending dedup acquire must keep the entry.
         assert!(process.decref_publish(id));
         assert!(
             process.lookup_native(id).is_some(),
@@ -2112,9 +1767,7 @@ mod tests {
         drop(arc);
     }
 
-    /// Distinct `Arc`s get distinct ids (no false-positive dedup via
-    /// e.g. `MockNative` being a unit struct — `Arc::ptr_eq` keys on
-    /// allocation, not type).
+    /// Distinct `Arc`s of a unit struct get distinct ids: `Arc::ptr_eq` keys on allocation.
     #[test]
     #[cfg_attr(
         not(any(target_os = "linux", target_os = "android")),
@@ -2139,10 +1792,7 @@ mod tests {
         }
     }
 
-    /// `lookup_native` is read-only — does not change `publish_count`
-    /// or `kernel_refs`. Exercises the BR_TRANSACTION /
-    /// `deserialize_option` round-trip path where the kernel routes a
-    /// previously-published binder back to its publisher.
+    /// `lookup_native` (`BR_TRANSACTION`/`deserialize_option` round trip) leaves counts unchanged.
     #[test]
     #[cfg_attr(
         not(any(target_os = "linux", target_os = "android")),

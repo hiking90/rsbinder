@@ -43,7 +43,13 @@
 //!   thread; the value `on_transact` returns comes back as `tag`.
 //! - A panic in either call is caught and logged. It does not change the
 //!   transaction's result, and `on_reply` still runs after a panicking
-//!   `on_transact` (with `tag = None`).
+//!   `on_transact` (with `tag = None`). The same holds for a panic in the
+//!   user [`Remotable::transaction_name`](crate::Remotable::transaction_name)
+//!   impl that builds the [`TxnContext`], and on kernel binder for
+//!   `Remotable::descriptor`: it is logged, and
+//!   the transaction is dispatched without either observer call. On RPC
+//!   the dispatch calls `descriptor` again outside that guard, so a
+//!   panicking `descriptor` still unwinds the serve loop there.
 //! - `result` is the transport-level result of the handler. An AIDL method
 //!   that returns an exception or service-specific error writes it into the
 //!   reply and still reports `Ok(())` here.
@@ -167,11 +173,10 @@ fn log_panic(which: &str, payload: &(dyn Any + Send)) {
         .copied()
         .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
         .unwrap_or("<non-string panic payload>");
-    log::error!("TransactionObserver::{which} panicked: {msg}");
+    log::error!("{which} panicked: {msg}");
 }
 
-/// Run `dispatch` between the observer's two calls. `ctx` is only built
-/// when an observer is installed, so its lookups cost nothing otherwise.
+/// Run `dispatch` between the observer's two calls; `ctx` is built only if an observer is set.
 pub(crate) fn observed<'a>(
     ctx: impl FnOnce() -> TxnContext<'a>,
     dispatch: impl FnOnce() -> Result<()>,
@@ -179,10 +184,17 @@ pub(crate) fn observed<'a>(
     let Some(observer) = current() else {
         return dispatch();
     };
-    let ctx = ctx();
+    // `ctx` runs user `transaction_name`/`descriptor` impls; contain them like the observer calls.
+    let ctx = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(ctx)) {
+        Ok(ctx) => ctx,
+        Err(payload) => {
+            log_panic("TxnContext (transaction_name/descriptor)", &*payload);
+            return dispatch();
+        }
+    };
     let tag = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer.on_transact(&ctx)))
         .unwrap_or_else(|payload| {
-            log_panic("on_transact", &*payload);
+            log_panic("TransactionObserver::on_transact", &*payload);
             None
         });
     let start = Instant::now();
@@ -191,7 +203,7 @@ pub(crate) fn observed<'a>(
     if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         observer.on_reply(&ctx, tag, &result, elapsed)
     })) {
-        log_panic("on_reply", &*payload);
+        log_panic("TransactionObserver::on_reply", &*payload);
     }
     result
 }

@@ -13,6 +13,12 @@
 //! reject. Non-UDS transports (`mem`/`vsock`/`tls`) can never select
 //! `Unix` — enforced by type (the transport trait's default
 //! fd methods reject) and by negotiation.
+//!
+//! Negotiation is a one-shot `GET_FD_MODE` exchange driven by
+//! `RpcSession::negotiate_fd_transport` / `RpcSessionInner::serve_special`:
+//! the client sends "want Unix? 1/0", the server replies the agreed mode
+//! (1 = Unix iff both opted in, else 0). `Unix` requires *both* peers to opt
+//! in; otherwise the session falls back to `None`, never an error.
 
 /// How (if at all) file descriptors may cross an RPC session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -25,9 +31,3 @@ pub enum FileDescriptorTransportMode {
     /// transport is a Unix domain socket.
     Unix,
 }
-
-// Negotiation is a one-shot `GET_FD_MODE` exchange driven by
-// `RpcSession::negotiate_fd_transport` / `RpcSessionInner::serve_special`:
-// the client sends "want Unix? 1/0", the server replies the agreed
-// mode (1=Unix iff both opted in, else 0). `Unix` requires *both*
-// peers to opt in — otherwise a safe `None` fallback, never an error.

@@ -26,13 +26,7 @@ pub trait ActivationRunner: Send + Sync {
 
 /// Starts declared services, at most one attempt at a time per name.
 pub struct Activator {
-    /// Names with a start attempt outstanding.
-    ///
-    /// Without this a client polling for a service it cannot reach would
-    /// spawn a fresh copy on every lookup — and `wait_for_service` polls.
-    /// For an `Exec` activation the entry is held for the service's whole
-    /// lifetime, which is the debounce you want: never a second copy of a
-    /// service that is already running.
+    /// Names with a start outstanding, so a polling client cannot spawn a copy per lookup.
     in_flight: Arc<Mutex<BTreeSet<String>>>,
     runner: Arc<dyn ActivationRunner>,
 }
@@ -70,12 +64,12 @@ impl Activator {
         let spawned = std::thread::Builder::new()
             .name("rsb_hub:start".to_owned())
             .spawn(move || {
-                log::info!("{owned_name} is not registered; starting it on demand");
-                runner.run(&owned_name, &activation);
-                in_flight
-                    .lock()
-                    .expect("activator lock poisoned")
-                    .remove(&owned_name);
+                let slot = InFlightSlot {
+                    in_flight,
+                    name: owned_name,
+                };
+                log::info!("{} is not registered; starting it on demand", slot.name);
+                runner.run(&slot.name, &activation);
             });
         if let Err(e) = spawned {
             log::error!("failed to spawn the start thread for {name}: {e}");
@@ -87,15 +81,25 @@ impl Activator {
     }
 }
 
+/// Frees a name's in-flight slot on drop, so a panicking runner does not wedge that name.
+struct InFlightSlot {
+    in_flight: Arc<Mutex<BTreeSet<String>>>,
+    name: String,
+}
+
+impl Drop for InFlightSlot {
+    fn drop(&mut self) {
+        // Poison-tolerant: a panic here during unwind would abort the whole hub.
+        let mut in_flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        in_flight.remove(&self.name);
+    }
+}
+
 /// Runs activations for real.
 pub struct SystemRunner;
 
 impl SystemRunner {
-    /// Absolute paths only, and never a shell. This runs with rsb_hub's
-    /// privileges — often root — so resolving the program through `PATH`
-    /// would let anything earlier on that path execute as root, and a shell
-    /// would make quoting inside the config file part of the trust
-    /// boundary. Same reasoning as rsb_device invoking `/bin/mount`.
+    /// Absolute paths only: a `PATH` lookup would let an earlier entry run as root.
     fn systemctl() -> Option<&'static str> {
         ["/usr/bin/systemctl", "/bin/systemctl"]
             .into_iter()
@@ -111,24 +115,27 @@ impl ActivationRunner for SystemRunner {
                     log::error!("cannot start {name}: no systemctl on this host");
                     return;
                 };
-                // `--no-block`: systemd queues the job and returns, so this
-                // thread is not held for the unit's whole startup. The
-                // client is waiting on a registration notification, not on
-                // us.
+                // `--no-block`: the client waits for a registration notification, not us.
                 let mut c = std::process::Command::new(systemctl);
                 c.arg("--no-block").arg("start").arg(unit);
                 c
             }
             Activation::Exec(argv) => {
-                let mut c = std::process::Command::new(&argv[0]);
+                // Parse checks this too; a hand-built `Activation` must not reach a `PATH` search.
+                let Some(program) = argv
+                    .first()
+                    .filter(|p| std::path::Path::new(p).is_absolute())
+                else {
+                    log::error!("cannot start {name}: `exec` program must be an absolute path");
+                    return;
+                };
+                let mut c = std::process::Command::new(program);
                 c.args(&argv[1..]);
                 c
             }
         };
 
-        // Wait, rather than detach: an unreaped child becomes a zombie, and
-        // for `Exec` the wait is also what holds the in-flight slot for as
-        // long as the service runs — which is exactly the debounce wanted.
+        // Wait, not detach: reaps the child, and for `Exec` holds the in-flight slot while it runs.
         match command.spawn() {
             Ok(mut child) => match child.wait() {
                 Ok(status) if status.success() => {
@@ -146,6 +153,7 @@ impl ActivationRunner for SystemRunner {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+    use std::time::Duration;
 
     struct Recorder {
         started: mpsc::Sender<String>,
@@ -178,8 +186,9 @@ mod tests {
         for _ in 0..5 {
             activator.try_start("a/b", &act);
         }
-        assert!(
-            rx.try_recv().is_err(),
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(200)),
+            Err(mpsc::RecvTimeoutError::Timeout),
             "requests while one is in flight must be dropped"
         );
 
@@ -203,5 +212,33 @@ mod tests {
         assert_eq!(seen, vec!["a/b".to_owned(), "c/d".to_owned()]);
 
         *release.lock().unwrap() = true;
+    }
+
+    struct Panicker(mpsc::Sender<()>);
+
+    impl ActivationRunner for Panicker {
+        fn run(&self, _name: &str, _activation: &Activation) {
+            self.0.send(()).unwrap();
+            panic!("runner failure injected by the test");
+        }
+    }
+
+    /// Without the drop guard the slot outlives the panic and every later start is dropped.
+    #[test]
+    fn a_panicking_runner_frees_its_slot() {
+        let (tx, rx) = mpsc::channel();
+        let activator = Activator::new(Arc::new(Panicker(tx)));
+        let act = Activation::Systemd("x.service".to_owned());
+
+        activator.try_start("a/b", &act);
+        rx.recv().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while activator.in_flight.lock().unwrap().contains("a/b") {
+            assert!(std::time::Instant::now() < deadline, "slot never freed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        activator.try_start("a/b", &act);
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("the name must start again after a panic");
     }
 }

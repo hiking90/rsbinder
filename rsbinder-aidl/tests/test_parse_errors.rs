@@ -26,6 +26,21 @@ fn test_missing_semicolon() {
     }
 }
 
+// AOSP `ParseInt` on the token text: a suffix or separator is a parse error, never a typed literal.
+#[test]
+fn test_transaction_code_is_a_plain_decimal() {
+    for code in ["200u8", "3L", "1_0"] {
+        let input = format!("interface IFoo {{\n    void m() = {code};\n}}");
+        let err = expect_parse_error(&input, "test.aidl");
+        let AidlError::Parse(pe) = &err else {
+            panic!("expected a parse error for `{code}`, got {err:?}");
+        };
+        assert_eq!(pe.message, format!("Could not parse int value: {code}"));
+    }
+    let ctx = SourceContext::new("test.aidl", "interface IFoo {\n    void m() = 200;\n}");
+    parse_document(&ctx).expect("a plain decimal is accepted");
+}
+
 // Completely invalid input
 #[test]
 fn test_completely_invalid_input() {
@@ -107,8 +122,7 @@ fn test_error_span_points_to_correct_location() {
     if let AidlError::Parse(pe) = &err {
         let labels: Vec<_> = pe.labels().expect("must have labels").collect();
         assert!(!labels.is_empty(), "must have at least one label");
-        // `offset <= len` holds structurally, so it would still pass if every
-        // diagnostic collapsed onto byte 0. Pin the actual location.
+        // `offset <= len` holds even if every span collapsed to byte 0: pin the location.
         let offset = labels[0].inner().offset();
         let bad = input
             .find("123bad")
@@ -122,11 +136,7 @@ fn test_error_span_points_to_correct_location() {
     }
 }
 
-// A backslash or control byte in a String constant would be
-// emitted verbatim into the generated Rust `"..."` and fail to compile (a raw
-// `\X` is not necessarily a valid Rust escape; rsbinder does not decode string
-// escapes). They are rejected at parse time. Non-ASCII (UTF-8) text stays
-// valid — rsbinder is intentionally more lenient than AOSP there.
+// `\` and control bytes would break the emitted Rust literal; non-ASCII stays (laxer than AOSP).
 #[test]
 fn test_string_constant_backslash_or_control_rejected() {
     for src in [
@@ -150,10 +160,7 @@ fn test_string_constant_backslash_or_control_rejected() {
     }
 }
 
-// An unsupported char escape must be rejected, not fall through to the
-// post-backslash char verbatim — that silently yields the wrong code point
-// (`'\a'` -> 'a' = 97, not bell = 7). Supported escapes still decode and a
-// plain char still parses.
+// Unsupported char escapes are rejected: a fall-through would make `'\a'` 97, not bell (7).
 #[test]
 fn test_char_constant_unknown_escape_rejected() {
     for src in [
@@ -179,9 +186,7 @@ fn test_char_constant_unknown_escape_rejected() {
     }
 }
 
-/// `>>` closes two open generics; counting it only as a shift made
-/// `angle_depth` accumulate across a statement, so a signature with enough
-/// `List<List<T>>` arguments was rejected at a real nesting depth of 2.
+/// `>>` closes two generics; as a bare shift, `angle_open` would accumulate across arguments.
 #[test]
 fn closing_shift_token_does_not_accumulate_generic_depth() {
     for n in [128usize, 400] {
@@ -195,9 +200,7 @@ fn closing_shift_token_does_not_accumulate_generic_depth() {
     }
 }
 
-/// The generic-nesting guard is far tighter than the bracket guard because
-/// the parser's cost is exponential in generic depth, and the diagnostic must
-/// name the limit it actually hit.
+/// Generic depth is capped below brackets (parse cost is exponential in it); errors name the cap.
 #[test]
 fn deep_generic_nesting_is_rejected_with_a_naming_diagnostic() {
     let deep = format!(

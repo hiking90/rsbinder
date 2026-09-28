@@ -33,18 +33,15 @@ use crate::type_str::Place;
 /// What the macro can tell about a type from its spelling alone.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kind {
-    /// An AIDL scalar. An `.aidl` enum is one of these on the wire too, which
-    /// is why [`Kind::User`] has to be rendered both ways.
+    /// An AIDL scalar; an `.aidl` enum is one on the wire too, hence [`Kind::User`]'s two renders.
     Primitive,
     Str,
-    /// A binder, an interface handle or a fd: no `Default` for a reader to
-    /// start from, so `.aidl` stores it as `Option<_>` wherever there is
-    /// nothing to start from (`can_be_defaulted` false in both modes).
+    /// A binder, interface or fd: no `Default`, so `Option<_>` wherever nothing starts it.
     NoDefault,
-    /// A bare path. An `.aidl` `enum` and a `parcelable` are spelled the same
-    /// way in Rust and render differently, and nothing in the signature says
-    /// which it is — so both renderings are canonical here.
+    /// A bare path: an enum or a parcelable, which render differently, so both are canonical.
     User,
+    /// A path with type arguments: `.aidl` gives those to a parcelable or union, never an enum.
+    Generic,
 }
 
 impl Kind {
@@ -66,15 +63,13 @@ impl Kind {
         }
     }
 
-    /// `TypeGenerator::can_be_defaulted`, which agrees in both modes for every
-    /// kind the macro can name: only the no-`Default` group is false.
+    /// `TypeGenerator::can_be_defaulted`, the same in both modes for every kind named here.
     fn can_be_defaulted(self) -> bool {
         !matches!(self, Kind::NoDefault)
     }
 }
 
-/// Scalar, `T[]`, or `T[N]` — sizes outermost first, as `make_fixed_array`
-/// folds them.
+/// Scalar, `T[]`, or `T[N]` — sizes outermost first, as `make_fixed_array` folds them.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) enum Arity {
     Scalar,
@@ -86,21 +81,14 @@ pub(crate) enum Arity {
 #[derive(Clone)]
 pub(crate) struct Shape {
     pub kind: Kind,
-    /// The Rust spelling of the scalar, as the signature writes it (`i32`,
-    /// `String`, `rsbinder::SIBinder`, `super::Cfg::Cfg`).
+    /// The scalar as the signature spells it (`i32`, `String`, `super::Cfg::Cfg`).
     pub base: String,
     /// The outer `@nullable`, not an element's own.
     pub nullable: bool,
     pub arity: Arity,
 }
 
-/// The shape a written type carries, recovered from any spelling rather than
-/// only the canonical one — that is the whole point: a wrong spelling still has
-/// to yield the shape its author meant, so [`canonical`] can name what `.aidl`
-/// would have written for it.
-///
-/// `None` for a type with no AIDL shape at all (`()`, a trait object, a
-/// tuple); those keep their own diagnostics.
+/// The shape of any spelling, wrong ones included, so a refusal can name the right one.
 pub(crate) fn shape_of(ty: &syn::Type) -> Option<Shape> {
     use crate::type_str::unwrap_group;
     use syn::Type;
@@ -111,8 +99,7 @@ pub(crate) fn shape_of(ty: &syn::Type) -> Option<Shape> {
         cur = unwrap_group(&r.elem);
     }
 
-    // The outermost `Option` is the `@nullable`; an inner one belongs to an
-    // element and is derived, not written.
+    // The outermost `Option` is the `@nullable`; an element's own is the generator's.
     let mut nullable = false;
     if let Some(inner) = option_arg(cur) {
         nullable = true;
@@ -186,9 +173,7 @@ fn generic_arg<'a>(ty: &'a syn::Type, name: &str) -> Option<&'a syn::Type> {
     })
 }
 
-/// What the leaf names, and the scalar spelling to render it by. `u8` is
-/// `byte`'s element spelling, so inside an array it means the same scalar
-/// `i8` does — otherwise the shape would render a type nobody wrote.
+/// The leaf's kind and scalar spelling; an array's `u8` is `byte`, so it renders from `i8`.
 fn leaf_kind(leaf: &syn::Type, in_array: bool) -> Option<(Kind, String)> {
     let written = crate::type_str::as_written(leaf).ok()?;
     let name = match crate::type_str::unwrap_group(leaf) {
@@ -199,6 +184,10 @@ fn leaf_kind(leaf: &syn::Type, in_array: bool) -> Option<(Kind, String)> {
         crate::type_str::unwrap_group(leaf),
         syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| matches!(s.arguments, syn::PathArguments::None))
     );
+    let angled = matches!(
+        crate::type_str::unwrap_group(leaf),
+        syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| matches!(s.arguments, syn::PathArguments::AngleBracketed(_)))
+    );
     Some(match name.as_deref() {
         Some("str" | "String") => (Kind::Str, "String".to_string()),
         Some("u8") if in_array && plain => (Kind::Primitive, "i8".to_string()),
@@ -208,13 +197,15 @@ fn leaf_kind(leaf: &syn::Type, in_array: bool) -> Option<(Kind, String)> {
         Some("SIBinder" | "ParcelFileDescriptor") if plain => (Kind::NoDefault, written),
         Some("Strong") => (Kind::NoDefault, written),
         Some(_) if plain => (Kind::User, written),
+        Some("Vec" | "Option") => return None,
+        Some(_) if angled && crate::type_str::std_box_arg(leaf).is_none() => {
+            (Kind::Generic, written)
+        }
         _ => return None,
     })
 }
 
-/// Every spelling `.aidl` renders for this shape at this place: one, or two
-/// when the base is a bare path that may be an enum or a parcelable. Empty
-/// when `.aidl` refuses the combination outright (`out String`, `out int`).
+/// `.aidl`'s spellings here: two for a bare path, none where it refuses (`out int`).
 pub(crate) fn canonical(shape: &Shape, place: Place) -> Vec<String> {
     let mut out = Vec::new();
     let assumptions: &[bool] = if shape.kind == Kind::User {
@@ -232,13 +223,7 @@ pub(crate) fn canonical(shape: &Shape, place: Place) -> Vec<String> {
     out
 }
 
-/// The written type against what `.aidl` renders for its shape — the last
-/// word, after the specific rules have had their say, so anything they do not
-/// name is still held to the contract.
-///
-/// Silent on a type with no AIDL shape (`()`, a trait object, `Vec<Vec<T>>`):
-/// those have their own diagnostics, and refusing them here on a shape nobody
-/// computed would be worse than saying nothing.
+/// The written type against `.aidl`'s rendering; silent where no shape exists (`()`, `dyn`).
 pub(crate) fn check_canonical(ty: &syn::Type, place: Place) -> syn::Result<()> {
     let Some(shape) = shape_of(ty) else {
         return Ok(());
@@ -254,11 +239,7 @@ pub(crate) fn check_canonical(ty: &syn::Type, place: Place) -> syn::Result<()> {
     {
         return Ok(());
     }
-    // The spelling offered is the one this table computed, and `type_matrix`
-    // holds that table against the generator and the generator's output
-    // against the gate — so the advice is accepted by construction rather than
-    // by a reviewer noticing. That is the whole reason this reads as a
-    // comparison and not as another rule.
+    // The advice is this table's output, which `type_matrix` proves the gate accepts.
     let message = match rendered.as_slice() {
         [one] => format!(
             "`.aidl` renders this as `{one}` here, and a call site written against one does \
@@ -274,9 +255,7 @@ pub(crate) fn check_canonical(ty: &syn::Type, place: Place) -> syn::Result<()> {
     Err(syn::Error::new_spanned(ty, message))
 }
 
-/// The spelling, with `Vec` and `Option` reduced to their last segment. A
-/// qualified `std::vec::Vec<T>` is the same type the generator writes bare, so
-/// comparing the two literally would refuse a spelling the crate supports.
+/// The spelling with `Vec`/`Option` unqualified, so `std::vec::Vec<T>` matches `Vec<T>`.
 fn simplified(ty: &syn::Type) -> String {
     use crate::type_str::unwrap_group;
     use syn::Type;
@@ -331,8 +310,7 @@ fn simplified(ty: &syn::Type) -> String {
     }
 }
 
-/// `array_type_name`: `byte`'s spelling moves with the place — `i8` as a
-/// scalar, `u8` as an array element.
+/// `array_type_name`: `byte` is `i8` as a scalar and `u8` as an array element.
 fn elem_name(shape: &Shape) -> String {
     if shape.kind == Kind::Primitive && shape.base == "i8" {
         "u8".to_string()
@@ -341,8 +319,7 @@ fn elem_name(shape: &Shape) -> String {
     }
 }
 
-/// `nullable_element`: a `@nullable` array wraps each element unless it is a
-/// primitive, which is written bare.
+/// `nullable_element`: a `@nullable` array wraps each element but a primitive.
 fn nullable_element(shape: &Shape, user_is_enum: bool, elem: &str) -> String {
     if shape.kind.is_primitive(user_is_enum) {
         elem.to_string()
@@ -391,13 +368,7 @@ fn fixed_elem(shape: &Shape, place: Place, user_is_enum: bool, elem: &str) -> St
     }
 }
 
-/// One rendering, under one assumption about what a bare path names. `None`
-/// when `.aidl` refuses the combination.
-///
-/// Reachable on its own so the equivalence test can pin the assumption: the
-/// fixture knows which of its two bare paths is the enum, and `.aidl` refuses
-/// some cells for one of them only (`@nullable Mode`), which the union
-/// [`canonical`] returns cannot express.
+/// One rendering under one enum-or-not assumption (`None` if `.aidl` refuses), for the tests.
 pub(crate) fn render(shape: &Shape, place: Place, user_is_enum: bool) -> Option<String> {
     let borrowed = matches!(place, Place::In | Place::Out | Place::Inout);
     match &shape.arity {
@@ -447,6 +418,10 @@ fn scalar_arg(shape: &Shape, place: Place, user_is_enum: bool) -> Option<String>
             format!("&mut {base}")
         });
     }
+    // `.aidl` refuses `@nullable` on a primitive, so no by-value spelling keeps the `Option`.
+    if shape.nullable && shape.kind.is_primitive(user_is_enum) {
+        return None;
+    }
     Some(if shape.kind.is_primitive(user_is_enum) {
         base.clone()
     } else if shape.nullable {
@@ -456,8 +431,7 @@ fn scalar_arg(shape: &Shape, place: Place, user_is_enum: bool) -> Option<String>
     })
 }
 
-/// `type_declaration`'s non-array arm: a value with no `Default` becomes
-/// `Option<_>` in a field, whatever its nullability.
+/// `type_declaration`'s non-array arm: a field with no `Default` is always `Option<_>`.
 fn scalar_owned(shape: &Shape, place: Place) -> String {
     let promoted =
         shape.nullable || (matches!(place, Place::Field) && !shape.kind.can_be_defaulted());

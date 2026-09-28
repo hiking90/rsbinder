@@ -35,16 +35,13 @@ pub fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
                 "a binder enum variant carries no data — only its value goes on the wire",
             ));
         }
-        let Some((_, discriminant)) = &variant.discriminant else {
+        if variant.discriminant.is_none() {
             return Err(syn::Error::new_spanned(
                 &variant.ident,
                 "every variant needs an explicit value: it is what goes on the wire, so it \
                  must be visible here rather than implied by declaration order",
             ));
-        };
-        // The discriminant is required so the wire value is visible at the
-        // declaration, but it is never re-emitted: see `read_arms` below.
-        let _ = discriminant;
+        }
         variants.push(variant.ident.clone());
     }
     if variants.is_empty() {
@@ -54,17 +51,11 @@ pub fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
         ));
     }
 
-    // Cast the declared variant rather than re-emitting its discriminant
-    // expression: re-emitted, the expression is typed on its own and an
-    // integer literal falls back to `i32`, so `#[repr(i64)] A = 1 << 31`
-    // would go on the wire as `-2147483648` while `A as i64` is
-    // `2147483648`. A unit-only variant is guaranteed above, so the cast is
-    // always valid.
+    // Cast the variant: a re-emitted `1 << 31` falls back to `i32` and goes out negative.
     let read_arms = variants.iter().map(|ident| {
-        quote! { v if v == #name::#ident as #backing => Ok(#name::#ident), }
+        quote! { v if v == #name::#ident as #backing => ::core::result::Result::Ok(#name::#ident), }
     });
-    // `self as #backing` would move out of `&self` unless the enum is `Copy`;
-    // matching asks nothing of the user's type.
+    // Matched, not `self as #backing`, which would move out of `&self` unless `Copy`.
     let write_arms = variants.iter().map(|ident| {
         quote! { #name::#ident => #name::#ident as #backing, }
     });
@@ -81,7 +72,8 @@ pub fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
                 slice: &[Self],
                 parcel: &mut rsbinder::Parcel,
             ) -> rsbinder::Result<()> {
-                let values: Vec<#backing> = slice.iter().map(#name::binder_value).collect();
+                let values: ::std::vec::Vec<#backing> =
+                    slice.iter().map(#name::binder_value).collect();
                 <#backing as rsbinder::SerializeArray>::serialize_array(&values, parcel)
             }
         }
@@ -96,8 +88,8 @@ pub fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
         impl rsbinder::DeserializeArray for #name {
             fn deserialize_array(
                 parcel: &mut rsbinder::Parcel,
-            ) -> rsbinder::Result<Option<Vec<Self>>> {
-                let values: Option<Vec<#backing>> =
+            ) -> rsbinder::Result<::core::option::Option<::std::vec::Vec<Self>>> {
+                let values: ::core::option::Option<::std::vec::Vec<#backing>> =
                     <#backing as rsbinder::DeserializeArray>::deserialize_array(parcel)?;
                 values
                     .map(|values| values.into_iter().map(Self::try_from_binder_value).collect())
@@ -122,7 +114,7 @@ pub fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
             pub fn try_from_binder_value(value: #backing) -> rsbinder::Result<Self> {
                 match value {
                     #(#read_arms)*
-                    _ => Err(rsbinder::StatusCode::BadValue),
+                    _ => ::core::result::Result::Err(rsbinder::StatusCode::BadValue),
                 }
             }
         }
@@ -136,9 +128,7 @@ fn backing_type(input: &DeriveInput) -> syn::Result<Ident> {
         if !attr.path().is_ident("repr") {
             continue;
         }
-        // Token scan, not `parse_nested_meta`: the callback would have to
-        // consume `align(8)`'s argument list, and failing to leaves syn
-        // reporting `expected ,` instead of anything about the backing type.
+        // Token scan: `parse_nested_meta` chokes on `align(8)`'s list with `expected ,`.
         let Ok(list) = attr.meta.require_list() else {
             continue;
         };
@@ -236,8 +226,7 @@ mod tests {
 
     #[test]
     fn does_not_require_copy() {
-        // `self as #backing` would move out of `&self`; the emitted code must
-        // match on the variant instead.
+        // `self as #backing` would move out of `&self`; the output must match on the variant.
         let input: DeriveInput = syn::parse2(quote! {
             #[repr(i32)]
             enum Mode { Fast = 0, Safe = 1 }
@@ -248,10 +237,7 @@ mod tests {
         assert!(out.contains("match self"), "{out}");
     }
 
-    /// The wire value must come from the declared variant, not from a
-    /// re-emitted discriminant expression: re-emitted, an integer literal is
-    /// typed on its own and falls back to `i32`, so `#[repr(i64)] A = 1 << 31`
-    /// would go out as `-2147483648`.
+    /// A re-emitted `#[repr(i64)] A = 1 << 31` is typed `i32` and goes out as `-2147483648`.
     #[test]
     fn casts_the_variant_not_the_discriminant_expression() {
         let input: DeriveInput = syn::parse2(quote! {

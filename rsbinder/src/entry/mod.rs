@@ -82,12 +82,31 @@ pub fn connect_binder(uri: &str) -> Result<SIBinder> {
     client::new_client(parsed, ClientOptions::default())?.binder(&name)
 }
 
-/// Async [`connect`] for the Tokio runtime: runs the blocking connect on
-/// `spawn_blocking`. `T` may be a generated `dyn IFooAsync<Tokio>`.
+/// Async [`connect`] for the Tokio runtime. `T` may be a generated
+/// `dyn IFooAsync<Tokio>`.
+///
+/// Kernel (`binder://`): the wait for registration is
+/// [`wait_for_interface_async`](crate::wait_for_interface_async), so
+/// dropping this future — under `tokio::time::timeout` or `select!` —
+/// ends the wait instead of leaving a blocking-pool thread parked until
+/// the service appears. RPC: the connect runs on `spawn_blocking`; it does
+/// not wait for a name to appear, only for the connection and the lookup.
 #[cfg(feature = "tokio")]
 pub async fn connect_async<T: FromIBinder + ?Sized + 'static>(uri: &str) -> Result<Strong<T>> {
     if crate::is_handling_transaction() {
         return connect::<T>(uri);
+    }
+    let mut parsed = uri::parse(uri)?;
+    if matches!(parsed.endpoint, Endpoint::Kernel { .. }) {
+        let Some(name) = parsed.service.take() else {
+            log::error!(
+                "rsbinder::connect_async: no service in {uri:?} (use `#name`, or `binder://name`)"
+            );
+            return Err(crate::StatusCode::BadValue);
+        };
+        // Initializes `ProcessState` as `connect` does; it only opens the driver, it never waits.
+        client::new_client(parsed, ClientOptions::default())?;
+        return crate::wait_for_interface_async::<T>(&name).await;
     }
     let uri = uri.to_string();
     match tokio::task::spawn_blocking(move || connect::<T>(&uri)).await {

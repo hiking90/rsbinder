@@ -176,6 +176,16 @@ jobs:
         #     and needs /dev/binder plus a live rsb_hub to drive an RPC client
         #     through a gateway to a kernel service, so integration-test.yml
         #     owns it.
+        #   * tests/tests/async_wait.rs, tests/tests/entry_kernel_options.rs —
+        #     `#[ignore]`d for the same reason: the first waits on a live
+        #     service manager, the second needs the process's one kernel
+        #     binder mapping. integration-test.yml owns both.
+        #   * tests/tests/fmq_binder.rs — `#[ignore]`d: an FMQ descriptor
+        #     across the kernel binder between two rsbinder processes, so
+        #     /dev/binder plus a live rsb_hub. integration-test.yml owns it.
+        #   * rsbinder-fmq/tests/libfmq_host.rs — `#[ignore]`d: needs the C++
+        #     peer built from the AOSP checkout
+        #     (`rsbinder-fmq/tests/cpp/build_host_peer.sh`). Run by hand.
         # Adding a test target means adding it to one of those lines, or to
         # this list with the reason it cannot run here.
         run: |
@@ -197,6 +207,25 @@ jobs:
         # line in `rpc-suite` enumerates `--test` targets, so without this
         # step the adapter would have no run gate at all.
         run: cargo test -p tests --test async_runtime
+      - name: Generic parcelables + builtin FMQ types (hermetic — plan 12 F0)
+        # `tests/tests/fmq_parcel.rs` round-trips `MQDescriptor` (with a real
+        # queue's fd) and a generic parcelable through a `Parcel`: no
+        # /dev/binder, no feature.
+        run: cargo test -p tests --test fmq_parcel
+      - name: NDK stream header on the host (hermetic — plan 10-7b P4)
+        # `tests/tests/c_stream_header.rs` builds `contrib/ndk/rsbinder_stream.h`
+        # with the runner's `cc` (AddressSanitizer + UBSan) and `c++` and runs
+        # both ends of a stream in one process: no /dev/binder, no feature.
+        run: cargo test -p tests --test c_stream_header
+      - name: Fast Message Queue tests (hermetic — plan 12 AC-12.1–12.6)
+        # `rsbinder-fmq` needs memfd and futex only: no /dev/binder, no
+        # servicemanager. Its `tests/libfmq_host.rs` is `#[ignore]`d — it
+        # drives a C++ peer built from the AOSP checkout by
+        # `rsbinder-fmq/tests/cpp/build_host_peer.sh`, which this runner
+        # does not have. `tests/c_header.rs` does run here: it compiles
+        # the C header's peer with the runner's own `cc` and `c++` (plan
+        # 10-7b P4).
+        run: cargo test -p rsbinder-fmq
 
   rpc-suite:
     name: RPC Transport Suite
@@ -255,8 +284,20 @@ jobs:
           t cargo test -p rsbinder --features rpc --lib parcelable_holder::
           t cargo test -p rsbinder --features rpc --lib permission_controller::
           t cargo test -p rsbinder --features rpc --lib thread_state::tests::rpc_
-          cargo test -p rsbinder --features rpc --test rpc_e2e --test rpc_scenarios --test rpc_server --test rpc_fd --test rpc_shared_memory --test rpc_cross_stack --test rpc_transport_conformance --test source_invariants
+          # Modules that touch no device at all — a local binder dispatches
+          # in-process — and so belong on a hermetic runner as much as the
+          # RPC ones do. Without a line here their unit tests run nowhere
+          # in this workflow.
+          t cargo test -p rsbinder --features rpc --lib stream::
+          t cargo test -p rsbinder --features rpc --lib cancel::
+          t cargo test -p rsbinder --features rpc --lib transport_caps::
+          t cargo test -p rsbinder --features rpc --lib observe::
+          t cargo test -p rsbinder --features rpc --lib fmq::
+          t cargo test -p rsbinder --features rpc --lib thread_state::tests::work_source_
+          cargo test -p rsbinder --features rpc --test rpc_e2e --test rpc_scenarios --test rpc_server --test rpc_fd --test rpc_shared_memory --test rpc_cross_stack --test rpc_transport_conformance --test source_invariants --test blob_rpc --test pipe_rpc --test parcel_alloc
           cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_tls --test rpc_transport_conformance
+          t cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_server -- --exact tls_android13plus_nested_callback_e2e
+          t cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_server -- --exact preconnected_inet_fd_handshakes_over_tcp_debug
       - name: RPC accessor (hermetic, requires android_16 — gap-fill)
         # `rpc_accessor.rs` is `#![cfg(all(feature = "rpc", feature =
         # "android_16"))]`; without `android_16` the file compiles to
@@ -273,14 +314,16 @@ jobs:
         # crate is therefore named here: `entry_rpc` (the
         # `serve`/`connect`/`Client` gate), `codegen_shapes`, the async stub
         # adapter, `get_calling_uid` over RPC, the `@EnforcePermission` deny,
-        # and `gateway_rpc` (the re-publish/`Rewrap` gate). `macro_cross`
+        # `gateway_rpc` (the re-publish/`Rewrap` gate), `transport_caps`, and
+        # the RPC halves of cancellation and streaming. `macro_cross`
         # and `data_serde` need `macros` too and are on the next step; the
         # two mesh targets and `gateway_kernel` are integration-test.yml's
         # (see the ledger on `linux-build`'s "Check test builds").
         run: |
           cargo test -p tests --features rpc --test rpc_generated_stub --test entry_rpc --test gateway_rpc --test codegen_shapes \
             --test rpc_async --test rpc_calling_identity --test rpc_enforce_permission_deny \
-            --test work_source_rpc --test observer_rpc --test transaction_names
+            --test work_source_rpc --test observer_rpc --test transaction_names \
+            --test transport_caps --test cancel_rpc --test stream_rpc
           cargo test -p tests --features rpc-tcp-debug --test rpc_generated_stub
           # `aidl_spans` installs a global `tracing` subscriber, so it needs
           # the `tracing` feature on top of `rpc`.
@@ -359,9 +402,17 @@ jobs:
         # matches nothing, so a renamed or newly `cfg`-gated `mod tests`
         # would empty these lines silently and the job would stay green
         # with no big-endian signal at all.
+        #
+        # The `blob` line is x86_64-only: it is the one test that pins
+        # `allow_fds() == false` on a data-only parcel, which is what
+        # makes `write_blob` store its payload inline there, and it
+        # exercises a memfd on the shared-memory side that qemu-user
+        # does not implement.
         run: |
-          cargo test -p rsbinder --no-default-features --lib parcel -- --skip shared_memory 2>&1 | tee /tmp/control_parcel.out
+          cargo test -p rsbinder --no-default-features --lib parcel -- --skip shared_memory --skip fmq:: 2>&1 | tee /tmp/control_parcel.out
           grep -qE 'test result: ok\. [1-9][0-9]* passed' /tmp/control_parcel.out
+          cargo test -p rsbinder --no-default-features --lib blob:: 2>&1 | tee /tmp/control_blob.out
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' /tmp/control_blob.out
       - name: Install cross
         run: cargo install cross --locked
       - name: Confirm the binary really is big-endian
@@ -378,18 +429,23 @@ jobs:
         # build that reproduces them is cross-endian compatible by
         # construction — no networking, no peer.
         #
-        # `--skip shared_memory` drops two tests that create a memfd,
-        # which qemu-user does not implement. They are endianness-blind
-        # and covered by every other job.
+        # The bare `parcel` filter is a substring match, so it also pulls
+        # in tests named after parcels from modules that create a memfd,
+        # which qemu-user does not implement. `--skip` drops each such
+        # module (`shared_memory`, `fmq::`); they are endianness-blind
+        # and covered by every other job. The control step above runs the
+        # same filter, skips included.
         #
-        # The fd-over-RPC body goldens and `parcel::data_serde` are
-        # `#[cfg(feature = "rpc")]`, so the `--no-default-features` run
-        # cannot see them even though they too assert literal LE bytes.
-        # The feature set matches the AC-7.2 step below so the build is
-        # shared rather than a third cross compile.
+        # The fd-over-RPC body goldens are `#[cfg(feature = "rpc")]`, so
+        # the `--no-default-features` run cannot see them even though
+        # they too assert literal LE bytes. The feature set matches the
+        # AC-7.2 step below so the build is shared rather than a third
+        # cross compile. (`parcel::data_serde` needs no feature and so
+        # runs in the first line, where its stored bytes are asserted
+        # against the same goldens on a big-endian host.)
         run: |
           cross test -p rsbinder --target s390x-unknown-linux-gnu \
-            --no-default-features --lib parcel -- --skip shared_memory 2>&1 | tee /tmp/be_parcel.out
+            --no-default-features --lib parcel -- --skip shared_memory --skip fmq:: 2>&1 | tee /tmp/be_parcel.out
           grep -qE 'test result: ok\. [1-9][0-9]* passed' /tmp/be_parcel.out
           cross test -p rsbinder --target s390x-unknown-linux-gnu \
             --features rpc,rpc-tcp-debug --lib file_descriptor:: 2>&1 | tee /tmp/be_fd.out
@@ -438,9 +494,13 @@ jobs:
         # run on both runners to pin the split. See the matching step in
         # `rpc-suite` for the feature-gate reasoning.
         run: |
-          cargo test -p rsbinder --features rpc --lib rpc::
-          cargo test -p rsbinder --features rpc --test rpc_e2e --test rpc_scenarios --test rpc_server --test rpc_fd --test rpc_shared_memory --test rpc_cross_stack --test rpc_transport_conformance --test source_invariants
+          # Filter lines must report a passing test: see `t()` in `rpc-suite`.
+          t() { "$@" 2>&1 | tee "$RUNNER_TEMP/rpc_filter.out"; grep -qE 'test result: ok\. [1-9][0-9]* passed' "$RUNNER_TEMP/rpc_filter.out"; }
+          t cargo test -p rsbinder --features rpc --lib rpc::
+          cargo test -p rsbinder --features rpc --test rpc_e2e --test rpc_scenarios --test rpc_server --test rpc_fd --test rpc_shared_memory --test rpc_cross_stack --test rpc_transport_conformance --test source_invariants --test blob_rpc --test pipe_rpc --test parcel_alloc
           cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_tls --test rpc_transport_conformance
+          t cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_server -- --exact tls_android13plus_nested_callback_e2e
+          t cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_server -- --exact preconnected_inet_fd_handshakes_over_tcp_debug
           cargo test -p rsbinder --features rpc,android_16 --test rpc_accessor
       - name: AIDL compiler tests (hermetic — plan 3 AC-3.4)
         # See the matching step in `linux-build` — plan 3 AC-3.4
@@ -448,6 +508,10 @@ jobs:
         # macOS so codegen regressions can't sneak through the macOS
         # path either.
         run: cargo test -p rsbinder-aidl
+      - name: Fast Message Queue on a target without one (plan 12 AC-12.8)
+        # The crate compiles everywhere; off Linux/Android every constructor
+        # returns `Unsupported`, and that is the one test that runs here.
+        run: cargo test -p rsbinder-fmq
 
   android-build:
     name: Android Build

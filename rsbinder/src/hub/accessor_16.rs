@@ -3,8 +3,8 @@
 
 //! The `IAccessor` bridge that turns the
 //! `Service::Accessor` arm of [`hub::android_16::get_service`]
-//! /[`check_service`](super::servicemanager_16) — historically dropped
-//! to `None` with a warning — into a usable RPC root binder.
+//! /[`check_service`](super::servicemanager_16) into a usable RPC root
+//! binder.
 //!
 //! AOSP `BackendUnifiedServiceManager::toBinder` (android-16.0.0_r4):
 //! 1. `getService2(name)` → `Service::accessor` (kernel-binder remote
@@ -16,25 +16,42 @@
 //! rsbinder follows the same five-step path. The new piece this module
 //! introduces is the *session lifetime owner*
 //! ([`AccessorRoot`]): the user-returned `ServiceWithMetadata.service`
-//! must keep the underlying [`RpcSession`] alive (the [`RpcProxy`]
-//! itself only holds a `Weak<RpcSessionInner>` — once the session drops
-//! the connection drops and the proxy's next call is `DeadObject`).
+//! must keep the underlying [`RpcSession`] alive — once the session drops
+//! the connection drops and the proxy's next call is `DeadObject`.
 //! [`AccessorRoot`] is a tiny `IBinder` wrapper that holds the proxy
 //! `SIBinder` and a strong [`RpcSession`] side-by-side; dropping the
 //! wrapper drops the inner proxy first (best-effort `DEC_STRONG`) and
 //! then the session (tears down the socket — peer-side cleanup is the
 //! normal "peer closed" `serve_blocking` exit, AOSP-faithful).
 //!
-//! All of this is `cfg(feature = "rpc")` — the `rpc`-OFF build keeps
-//! the legacy `Service::Accessor → log + None` arm byte-for-byte
+//! # `AccessorRoot`
+//!
+//! The wrapper pins the [`RpcSession`] for as long as the user holds the binder the accessor
+//! bridge returned; it is an implementation detail of [`resolve_accessor`]. `as_any`
+//! deliberately forwards to the inner `RpcProxy` — that is what the AIDL-generated `Bp*`
+//! stubs and `<dyn IBinder>::as_remote()`/`as_proxy()` downcast against, so the wrapper is
+//! transparent to consumers. The inner proxy is the only concrete `IBinder` anyone outside
+//! this module needs to recognise.
+//!
+//! Its `inner` field is the RPC root `SIBinder` returned by `RpcSession::get_root`. Through its
+//! `Arc<RpcProxy>` it is what keeps the proxy alive: the session-side cache in
+//! `RpcSessionInner.state` holds only a `Weak` (it dedups without keeping proxies alive), so
+//! dropping `inner` is what fires `RpcProxy::drop`.
+//!
+//! Its `session` field is belt and braces. `RpcProxy` holds a *strong*
+//! `Arc<RpcSessionInner>` (as AOSP `sp<RpcSession>`), so `inner` alone already keeps the
+//! session — and its connection — alive until the proxy's `DEC_STRONG` has gone out; the
+//! handle only makes that visible in the type. Field order is not load-bearing.
+//!
+//! All of this is `cfg(feature = "rpc")` — the `rpc`-OFF build maps
+//! `Service::Accessor` to a log line and `None`
 //! ([`super::servicemanager_16`] cfg guards the whole resolve path).
 //!
 //! Process-wide state: **none**. There is no global registry, no
 //! `OnceLock<Mutex<Vec<RpcSession>>>`; the session
 //! lives exactly as long as the wrapper the caller holds.
 
-// cfg lives on the mod decl in super — duplicating here trips
-// clippy::duplicated_attributes.
+// cfg lives on the mod decl in super; repeating it trips clippy::duplicated_attributes.
 
 use std::any::Any;
 use std::mem::ManuallyDrop;
@@ -48,9 +65,7 @@ use crate::error::Result;
 use crate::parcel::Parcel;
 use crate::rpc::RpcSession;
 
-// Generated `IAccessor` stub. The accessor AIDL is its
-// own AIDL output so the `IServiceManager.aidl` transitive resolution
-// stays unchanged.
+// A separate AIDL output keeps `IServiceManager.aidl`'s transitive resolution unchanged.
 include!(concat!(env!("OUT_DIR"), "/accessor_16.rs"));
 
 pub use android::os::IAccessor::{
@@ -59,35 +74,15 @@ pub use android::os::IAccessor::{
     ERROR_FAILED_TO_CONNECT_TO_SOCKET, ERROR_FAILED_TO_CREATE_SOCKET,
     ERROR_UNSUPPORTED_SOCKET_FAMILY,
 };
-// The async-trait variants (`IAccessorAsync`, `IAccessorAsyncService`)
-// are only emitted by the codegen when the runtime crate's `async`
-// feature is on — see [`rsbinder/build.rs`] (`set_async_support`).
-// Re-export them under the same gate so sync-only RPC builds
-// (`--no-default-features --features rpc,...`) compile cleanly.
+// Codegen emits the async traits only with `async` (`rsbinder/build.rs` `set_async_support`).
 #[cfg(feature = "async")]
 pub use android::os::IAccessor::{IAccessorAsync, IAccessorAsyncService};
 
-/// Wrapper `IBinder` that pins the underlying [`RpcSession`] alive for
-/// as long as the user holds the binder returned by the accessor
-/// bridge. Implementation detail of [`resolve_accessor`].
-///
-/// `as_any` deliberately forwards to the inner `RpcProxy` — that is
-/// what the AIDL-generated `Bp*` stubs and
-/// `<dyn IBinder>::as_remote()`/`as_proxy()` downcast against, so the
-/// wrapper is transparent to consumers. The inner proxy is the only
-/// concrete `IBinder` anyone outside this module needs to recognise.
+/// Transparent `IBinder` wrapper pinning the session to the root; see module doc "`AccessorRoot`".
 pub(crate) struct AccessorRoot {
-    /// The RPC root `SIBinder` returned by `RpcSession::get_root`. This is,
-    /// via its `Arc<RpcProxy>`, what keeps the proxy alive: the session-side
-    /// cache in `RpcSessionInner.state` holds only a `Weak` (it dedups without
-    /// keeping proxies alive), so dropping `inner` is what fires
-    /// `RpcProxy::drop`.
+    /// The `get_root` binder; it keeps the proxy alive (the session cache holds only a `Weak`).
     inner: SIBinder,
-    /// Belt and braces. `RpcProxy` holds a *strong* `Arc<RpcSessionInner>`
-    /// (see `rpc::proxy::RpcProxy::session`), so `inner` alone already keeps
-    /// the session — and its connection — alive until the proxy's
-    /// `DEC_STRONG` has gone out; this handle only makes that visible in
-    /// the type. Field order is not load-bearing.
+    /// Redundant with `inner`'s strong session ref; it states the lifetime in the type.
     #[allow(dead_code)]
     session: RpcSession,
 }
@@ -121,11 +116,7 @@ impl IBinder for AccessorRoot {
         self.inner_binder().ping_binder()
     }
 
-    /// Deliberate forward: `as_any` reports the **inner** `RpcProxy`
-    /// rather than `AccessorRoot` itself so `<dyn IBinder>::as_remote`
-    /// / `as_proxy` and `__rpc_stamp_descriptor` see the concrete
-    /// proxy type they expect. `AccessorRoot` is `pub(crate)` and
-    /// nothing in the codebase downcasts to it.
+    /// The inner `RpcProxy`, so `as_remote`/`as_proxy`/`__rpc_stamp_descriptor` see its type.
     fn as_any(&self) -> &dyn Any {
         self.inner_binder().as_any()
     }
@@ -202,8 +193,7 @@ pub fn resolve_accessor(
     name: &str,
     accessor: SIBinder,
 ) -> Option<super::servicemanager_16::android::os::ServiceWithMetadata::ServiceWithMetadata> {
-    // Step 1: kernel `BpAccessor`. `<dyn IAccessor>::try_from(SIBinder)`
-    // is the generated FromIBinder hook.
+    // Step 1: kernel `BpAccessor` via the generated `FromIBinder` hook.
     let bp = match <dyn IAccessor as crate::FromIBinder>::try_from(accessor) {
         Ok(bp) => bp,
         Err(e) => {
@@ -245,10 +235,7 @@ pub fn resolve_accessor(
     };
     let fd: std::os::fd::OwnedFd = pfd.into();
 
-    // Step 4: adopt the fd and run the android-13+ versioned handshake
-    // with the android-16 ceiling (max_version=2). Version negotiation
-    // happens on the wire — the peer can downgrade to v0/v1 if it's an
-    // older Accessor.
+    // Step 4: versioned handshake capped at android-16's v2; an older peer may pick v0/v1.
     let session = match RpcSession::from_preconnected_fd(fd, 2) {
         Ok(s) => s,
         Err(e) => {
@@ -280,10 +267,7 @@ pub fn resolve_accessor(
     Some(
         super::servicemanager_16::android::os::ServiceWithMetadata::ServiceWithMetadata {
             r#service: Some(wrapped),
-            // RPC roots are not `LazyService`s — they are not registered
-            // through `registerLazyService` and have no shutdown hook;
-            // AOSP `setSessionSpecificRoot` always keeps the binder hot
-            // for the session's lifetime. Match that here.
+            // Never lazy: AOSP `setSessionSpecificRoot` keeps an RPC root for the session.
             r#isLazyService: false,
         },
     )
@@ -315,9 +299,7 @@ pub fn accessor_error_name(code: i32) -> &'static str {
 #[cfg(any(test, feature = "fuzzing"))]
 #[doc(hidden)]
 pub fn __fuzz_accessor_error_decode(input: &[u8]) {
-    // Pad / truncate to exactly 4 bytes — any extra is ignored, any
-    // missing reads as zero. Equivalent to the AIDL wire's `i32`
-    // serialization range.
+    // Pad/truncate to 4 bytes (missing bytes read as zero): the AIDL wire's `i32` range.
     let mut buf = [0u8; 4];
     let n = input.len().min(4);
     buf[..n].copy_from_slice(&input[..n]);
@@ -359,8 +341,7 @@ mod tests {
 
     #[test]
     fn accessor_error_name_unknown_is_safe() {
-        // Out-of-range values (positive overflow, negative, max/min)
-        // must never panic and must return the fallback string.
+        // Out-of-range values return the fallback string and never panic.
         for code in [5, 6, 1_000, -1, -1_000, i32::MAX, i32::MIN] {
             assert_eq!(accessor_error_name(code), "unknown", "code {code}");
         }
@@ -368,9 +349,7 @@ mod tests {
 
     #[test]
     fn fuzz_accessor_error_decode_never_panics() {
-        // Mirrors what a libFuzzer corpus drive would do — exercise the
-        // shrink/grow inputs at the boundaries plus a sweep across the
-        // signed-i32 cardinal points.
+        // Boundary input lengths plus the signed-i32 cardinal points, as a fuzz corpus would.
         __fuzz_accessor_error_decode(&[]);
         __fuzz_accessor_error_decode(&[0]);
         __fuzz_accessor_error_decode(&[0, 0]);

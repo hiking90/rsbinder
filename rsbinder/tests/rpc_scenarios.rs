@@ -21,6 +21,16 @@
 //! - `OnewayCallDoesNotWait`        → `oneway_call_does_not_wait_for_handler`
 //! - (rsbinder) a nested call that times out must not desync the
 //!   connection → `late_reply_of_a_timed_out_nested_call_is_skipped`
+//!
+//! # Mutation gates
+//!
+//! - `repeat_binder_round_trips_as_the_same_local_binder`: the server's argument proxy goes
+//!   out of scope before the reply is sent; the reply parcel pins it (`write_binder`) so its
+//!   `DEC_STRONG` follows the reply instead of overtaking it. Without the pin the client frees
+//!   the node before the address comes back and mints a fresh proxy for its own object.
+//! - `late_reply_of_a_timed_out_nested_call_is_skipped`: the nested call cannot retire the
+//!   slot (the outer frame owns it), so without the skip the late reply would be taken for the
+//!   outer call's reply.
 
 #![cfg(feature = "rpc")]
 
@@ -38,15 +48,14 @@ const DESC: &str = "rsbinder.test.IRpcScenario";
 const CB_DESC: &str = "rsbinder.test.IScenarioCallback";
 
 const TX_BIG_ECHO: TransactionCode = FIRST_CALL_TRANSACTION; // Vec<u8> -> Vec<u8>
-const TX_REPEAT_BINDER: TransactionCode = FIRST_CALL_TRANSACTION + 1; // @nullable IBinder -> @nullable IBinder
+const TX_REPEAT_BINDER: TransactionCode = FIRST_CALL_TRANSACTION + 1; // nullable IBinder echo
 const TX_HOLD_BINDER: TransactionCode = FIRST_CALL_TRANSACTION + 2;
 const TX_GET_HELD: TransactionCode = FIRST_CALL_TRANSACTION + 3;
 const TX_SAME_BINDER: TransactionCode = FIRST_CALL_TRANSACTION + 4; // -> always the same IBinder
 const TX_PING_DELAY: TransactionCode = FIRST_CALL_TRANSACTION + 5; // oneway: sleep then bump
-const TX_CALL_CB: TransactionCode = FIRST_CALL_TRANSACTION + 6; // (IBinder cb, String) -> String via cb
+const TX_CALL_CB: TransactionCode = FIRST_CALL_TRANSACTION + 6; // (cb, String) -> String via cb
 const TX_SLOW: TransactionCode = FIRST_CALL_TRANSACTION + 7; // (i64 ms) -> (): sleeps
-                                                             // Deliberately never handled by the server (tests UNKNOWN_TRANSACTION).
-const TX_UNKNOWN: TransactionCode = FIRST_CALL_TRANSACTION + 100;
+const TX_UNKNOWN: TransactionCode = FIRST_CALL_TRANSACTION + 100; // never handled by the server
 
 // Callback transaction the client's callback object answers.
 const TX_CB_ECHO: TransactionCode = FIRST_CALL_TRANSACTION;
@@ -171,8 +180,7 @@ impl Remotable for BnScenarioCallback {
     }
 }
 
-/// A callback whose handler calls *back into the server* (a nested call on
-/// the connection it is being served on) and records the outcome.
+/// Callback whose handler calls back into the server (nested call) and records the outcome.
 struct BnNestingCallback {
     target: ScenarioProxy,
     slow_ms: i64,
@@ -358,8 +366,7 @@ impl Drop for ServeCleanup {
     }
 }
 
-/// Boot a server with a fresh `ScenarioSvc` root and return everything a
-/// test needs (the proxy + the entry/done signals it may assert on).
+/// A booted server with a fresh `ScenarioSvc` root, plus the handles a test asserts on.
 struct Booted {
     _cu: ServeCleanup,
     proxy: ScenarioProxy,
@@ -397,8 +404,7 @@ fn boot(tag: &str) -> Booted {
 
 // ---- tests ----------------------------------------------------------
 
-/// AOSP `SendLargeVector` — a payload well past one socket buffer must
-/// round-trip intact over the framed RPC transport.
+/// AOSP `SendLargeVector`: a payload past one socket buffer round-trips intact.
 #[test]
 fn send_large_vector_round_trips() {
     let b = boot("big");
@@ -409,8 +415,7 @@ fn send_large_vector_round_trips() {
     assert_eq!(got, v, "large vector corrupted in transit");
 }
 
-/// AOSP `UnknownTransaction` — an unhandled code returns
-/// `UNKNOWN_TRANSACTION`, not a panic or a hang.
+/// AOSP `UnknownTransaction`: an unhandled code returns `UNKNOWN_TRANSACTION`, no panic or hang.
 #[test]
 fn unknown_transaction_returns_unknown() {
     let b = boot("unk");
@@ -418,13 +423,7 @@ fn unknown_transaction_returns_unknown() {
     assert_eq!(err, StatusCode::UnknownTransaction);
 }
 
-/// AOSP `RepeatBinder` — a binder passed as an argument AND returned in the
-/// same transaction comes back as the **same local object** (exercises the
-/// arg-and-return binder wire path in one call). The server's argument
-/// proxy goes out of scope before the reply is sent; the reply parcel pins
-/// it (`write_binder`) so its `DEC_STRONG` follows the reply instead of
-/// overtaking it — otherwise the client frees the node before the address
-/// comes back and mints a fresh proxy for its own object.
+/// AOSP `RepeatBinder`: an arg binder returned in the same call is the same local object.
 #[test]
 fn repeat_binder_round_trips_as_the_same_local_binder() {
     let b = boot("repeat");
@@ -449,8 +448,7 @@ fn repeat_binder_null() {
     assert!(got.is_none(), "null binder must round-trip as null");
 }
 
-/// AOSP `HoldBinder`/`getHeldBinder` — the server stores a client binder
-/// across calls and hands it back; the retrieved proxy is still callable.
+/// AOSP `HoldBinder`/`getHeldBinder`: a binder held across calls returns as the same object.
 #[test]
 fn hold_and_get_binder() {
     let b = boot("hold");
@@ -466,9 +464,7 @@ fn hold_and_get_binder() {
     );
 }
 
-/// AOSP `alwaysGiveMeTheSameBinder` / `SameBinderEquality` — the server
-/// returns one stable binder on every call; the client must observe the two
-/// returned proxies as equal (the session de-duplicates by address).
+/// AOSP `alwaysGiveMeTheSameBinder`/`SameBinderEquality`: two fetches compare equal.
 #[test]
 fn same_binder_returned_twice_is_equal() {
     let b = boot("same");
@@ -479,8 +475,7 @@ fn same_binder_returned_twice_is_equal() {
         "the same server binder must compare equal across two fetches"
     );
 
-    // A server-returned binder is callable in the normal client→server
-    // direction (exercises the returned proxy end-to-end).
+    // A server-returned binder is callable in the normal client→server direction.
     let rp = (*first)
         .as_any()
         .downcast_ref::<RpcProxy>()
@@ -495,8 +490,7 @@ fn same_binder_returned_twice_is_equal() {
     assert_eq!(r.read::<String>().expect("result"), "cb:x");
 }
 
-/// AOSP `OnewayCallDoesNotWait` — a oneway call returns to the caller before
-/// the (slow) server handler has finished running.
+/// AOSP `OnewayCallDoesNotWait`: a oneway call returns before the slow handler finishes.
 #[test]
 fn oneway_call_does_not_wait_for_handler() {
     let b = boot("oneway");
@@ -521,18 +515,11 @@ fn oneway_call_does_not_wait_for_handler() {
     );
 }
 
-/// A nested call (client callback → server, on the connection the callback
-/// is being served on) that gives up on its reply (`set_timeout`) must not
-/// desync that connection: the late reply is skipped, the outer call still
-/// gets *its* reply, and the connection stays usable. The nested call
-/// cannot retire the slot — the outer frame owns it — so without the
-/// skip the late reply would be taken for the outer call's reply.
+/// A timed-out nested call's late reply is skipped; outer reply and connection stay intact.
 #[test]
 fn late_reply_of_a_timed_out_nested_call_is_skipped() {
     let b = boot("stale");
-    // The outer reply follows the server's `slow_ms` sleep, against a deadline
-    // re-armed when the nested call gives up: `timeout < slow_ms < 2 * timeout`,
-    // with a wide margin on both sides for a loaded CI runner.
+    // Deadline re-arms after the nested timeout: needs `timeout < slow_ms < 2 * timeout`.
     b.client.set_timeout(Some(Duration::from_millis(1000)));
     let nested = Arc::new(Mutex::new(Vec::new()));
     let cb: SIBinder = Interface::as_binder(&Binder::new(BnNestingCallback {

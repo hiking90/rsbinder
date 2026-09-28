@@ -31,14 +31,7 @@ struct Base {
     aidl: &'static str,
     primitive: bool,
     string: bool,
-    /// A `@Backing` enum, which AIDL counts as a primitive in both rules
-    /// below: the generator refuses `@nullable Mode` ("cannot get nullable
-    /// annotation") and `out Mode` ("a primitive type") alike, while
-    /// `@nullable Mode[]` stays legal. Both were established by letting the
-    /// cell reach the generator rather than by assuming. Kept apart from
-    /// `primitive` because it is a fact about what AIDL does with an enum,
-    /// not a claim that the macro can tell one from a parcelable — it sees a
-    /// bare path either way, which is what [`USER_PATHS`] is for.
+    /// A `@Backing` enum: AIDL refuses `@nullable Mode` and `out Mode`, the macro cannot tell.
     enum_like: bool,
 }
 
@@ -80,6 +73,12 @@ const BASES: &[Base] = &[
         enum_like: true,
     },
     Base {
+        aidl: "MatrixPair<MatrixCfg>",
+        primitive: false,
+        string: false,
+        enum_like: false,
+    },
+    Base {
         aidl: "ParcelFileDescriptor",
         primitive: false,
         string: false,
@@ -99,16 +98,7 @@ const BASES: &[Base] = &[
     },
 ];
 
-/// The bases a macro user spells as a bare path, which the macro therefore
-/// cannot classify: an `.aidl` `enum` and a `parcelable` look identical in a
-/// Rust signature, and the generator renders them differently — `in` by value
-/// against by reference, and a `@nullable` array's elements bare against
-/// wrapped. Both are in the fixture and both normalise to one placeholder, so a
-/// spelling *either* can render counts as canonical. The macro has no way to
-/// refuse one without refusing the other; this is the crate's documented blind
-/// spot, stated here as a rule rather than left to drift.
-/// Spelled the way `quote` prints a path, since that is the form [`norm`]
-/// substitutes into.
+/// Enum and parcelable bases, one placeholder for both: the macro cannot tell them apart.
 const USER_PATHS: &[&str] = &[
     "super :: MatrixCfg :: MatrixCfg",
     "super :: MatrixMode :: MatrixMode",
@@ -120,22 +110,14 @@ const USER_PLACEHOLDER: &str = "super :: U :: U";
 /// Scalar, variable-length array, fixed-size array.
 const ARITIES: &[&str] = &["", "[]", "[3]"];
 
-/// Why a cross-product cell is not in the fixture. Each is a rule AOSP's `aidl`
-/// enforces too, so the cell has no `.aidl` spelling to be canonical at all —
-/// which is exactly what the over-acceptance direction then demands the macro
-/// refuse. Anything not listed here must generate; a new refusal in the
-/// generator shows up as a generation panic, never as a quietly missing row.
+/// The cells AOSP's `aidl` refuses too; any other cell that fails to generate panics.
 fn aidl_refuses(place: &str, base: &Base, nullable: bool, arity: &str) -> bool {
     let scalar = arity.is_empty();
-    // `AidlTypeSpecifier::CheckValid`: a primitive has no null form on the
-    // wire, and an enum is carried as its backing scalar — the generator
-    // refuses `@nullable Mode` as "Primitive type(UserDefined(..)) cannot get
-    // nullable annotation". An array of either still takes `@nullable`.
+    // `CheckValid`: no `@nullable` on a scalar primitive or enum; an array of either takes it.
     if nullable && (base.primitive || base.enum_like) && scalar {
         return true;
     }
-    // `direction_at`: AIDL passes a primitive, an enum and a `String` `in`
-    // only — `out Mode` is refused as "a primitive type", like `out int`.
+    // `direction_at`: a primitive, an enum and a `String` go `in` only.
     if scalar
         && (base.primitive || base.enum_like || base.string)
         && matches!(place, "out" | "inout")
@@ -191,28 +173,25 @@ fn fixture_files() -> Vec<(String, String)> {
                 .to_string(),
         ),
         (
+            "p/MatrixPair.aidl".to_string(),
+            "package p;\nparcelable MatrixPair<T> {\n    int a;\n}\n".to_string(),
+        ),
+        (
             "p/IMatrix.aidl".to_string(),
             format!(
-                "package p;\nimport p.IMatrixCb;\nimport p.MatrixCfg;\nimport p.MatrixMode;\ninterface IMatrix {{\n{methods}}}\n"
+                "package p;\nimport p.IMatrixCb;\nimport p.MatrixCfg;\nimport p.MatrixMode;\nimport p.MatrixPair;\ninterface IMatrix {{\n{methods}}}\n"
             ),
         ),
         (
             "p/MatrixFields.aidl".to_string(),
             format!(
-                "package p;\nimport p.IMatrixCb;\nimport p.MatrixCfg;\nimport p.MatrixMode;\nparcelable MatrixFields {{\n{fields}}}\n"
+                "package p;\nimport p.IMatrixCb;\nimport p.MatrixCfg;\nimport p.MatrixMode;\nimport p.MatrixPair;\nparcelable MatrixFields {{\n{fields}}}\n"
             ),
         ),
     ]
 }
 
-/// One spelling in `quote`'s own spacing, so the two sides compare as text
-/// without either going through `type_str`'s printers — those are what these
-/// tests hold to account.
-///
-/// The spacing is kept rather than stripped: `&mut T` collapses to `&mutT`,
-/// which parses as a shared reference to a path named `mutT`, so a stripped
-/// spelling fed back to `syn` silently becomes a different type. Every `out`
-/// and `inout` row went through that hole before the round-trip test found it.
+/// `quote`'s spacing, not `type_str`'s printers; kept, as a stripped `&mutT` re-parses wrong.
 fn norm(ty: &Type) -> String {
     let mut s = quote::quote!(#ty).to_string();
     for path in USER_PATHS {
@@ -334,9 +313,7 @@ fn canonical() -> BTreeMap<&'static str, BTreeSet<String>> {
     out
 }
 
-/// The Rust bases the candidates are built over, spelled as the generated code
-/// spells them so the two sides compare directly. `i8`/`u8` are both here
-/// because `byte` moves spelling with the place.
+/// Candidate bases in the generator's spelling; `i8` and `u8` both, as `byte` moves.
 const RUST_BASES: &[&str] = &[
     "i32",
     "bool",
@@ -346,9 +323,9 @@ const RUST_BASES: &[&str] = &[
     "rsbinder::ParcelFileDescriptor",
     "rsbinder::SIBinder",
     "rsbinder::Strong<dyn super::IMatrixCb::IMatrixCb>",
-    // Normalises to the placeholder, so this one base stands for every bare
-    // user-defined name — the case the macro cannot classify.
+    // Normalises to the placeholder, so it stands for every bare user-defined name.
     "super::MatrixCfg::MatrixCfg",
+    "super::MatrixPair::MatrixPair<super::MatrixCfg::MatrixCfg>",
 ];
 
 /// Every wrapping the grammar admits, as a format string over one base.
@@ -383,6 +360,22 @@ const SHAPES: &[&str] = &[
     "&[Option<{b}>; 3]",
     "&mut [Option<{b}>; 3]",
     "Option<[Option<{b}>; 3]>",
+    "Vec<[{b}; 3]>",
+    "&[[{b}; 3]]",
+    "&mut Vec<[{b}; 3]>",
+    "Vec<Vec<{b}>>",
+    "[Vec<{b}>; 3]",
+    "Option<Vec<Option<[{b}; 3]>>>",
+    "[Option<[{b}; 3]>; 2]",
+    "Box<{b}>",
+    "&Box<{b}>",
+    "&mut Box<{b}>",
+    "Vec<Box<{b}>>",
+    "Option<Box<{b}>>",
+    "Option<&Box<{b}>>",
+    "&mut Option<Box<{b}>>",
+    "Option<Option<{b}>>",
+    "&mut Option<Option<{b}>>",
 ];
 
 /// `String`'s borrowed spelling is `&str`, which no other base has.
@@ -405,9 +398,7 @@ fn candidates() -> Vec<String> {
     out
 }
 
-/// The places a spelling can reach, mirroring `direction()`: a `&mut _`
-/// argument is `out` (or `inout` with the attribute) and can be nothing else,
-/// and everything else is `in`. A return and a field take any spelling.
+/// Places a spelling can reach, as `direction()` reads them; return and field take any.
 fn places_for(ty: &Type) -> Vec<(&'static str, Place)> {
     let is_mut_ref =
         matches!(crate::type_str::unwrap_group(ty), Type::Reference(r) if r.mutability.is_some());
@@ -421,11 +412,7 @@ fn places_for(ty: &Type) -> Vec<(&'static str, Place)> {
     out
 }
 
-/// The rows of the reference table, with names a reader recognises rather than
-/// the fixture's. `canonical` treats the base as an opaque string, so swapping
-/// in a readable one renders through the same rules the equivalence test holds
-/// against the generator. The two halves of [`Kind::User`] get a row each:
-/// "or" would leave the reader to work out which is which.
+/// Reference-table rows under readable names; each half of [`Kind::User`] gets its own.
 const DOC_ROWS: &[(&str, Kind, &str, bool)] = &[
     ("int", Kind::Primitive, "i32", false),
     ("boolean", Kind::Primitive, "bool", false),
@@ -454,10 +441,15 @@ fn types_md() -> String {
     out.push_str(
         "# What `.aidl` renders\n\
          \n\
-         Every spelling the AIDL compiler produces, by type and by position. \
-         A trait written with these is a trait an `.aidl` port reproduces \
-         exactly; anything else the macro refuses, naming the cell you \
-         wanted.\n\
+         The spelling the AIDL compiler produces for each kind of type, by \
+         position. One scalar stands for its kind: `long`, `float`, `double` \
+         and `char` follow the `int` rows as `i64`, `f32`, `f64` and `u16`. \
+         `List<T>` and generic parcelables are not listed. A trait written \
+         with these is a trait an `.aidl` port reproduces exactly; any other \
+         spelling of these types the macro refuses, naming the cell you \
+         wanted — except between the `Cfg` and `Mode` rows, which are both a \
+         bare name to the macro, and a field's `Option<Box<Cfg>>`, which `.aidl` \
+         writes for a `@nullable` parcelable field that closes a reference cycle.\n\
          \n\
          `—` marks a combination AIDL itself rejects.\n\
          \n\
@@ -481,11 +473,7 @@ fn types_md() -> String {
                 "[]" => Arity::Var,
                 _ => Arity::Fixed(vec!["N".to_string()]),
             };
-            // A reference table documents the fixed-size case generically, so
-            // both halves of the row have to say `N`: the fixture's literal
-            // size would leave the AIDL column claiming `[3]` next to a Rust
-            // column saying `N`. Only emptiness reaches `aidl_refuses`, so the
-            // substitution cannot change which cells are legal.
+            // `N` on both sides; `aidl_refuses` reads only emptiness, so legality is unchanged.
             let shown = if arity_aidl.is_empty() { "" } else { "[N]" };
             let shown = if *arity_aidl == "[]" { "[]" } else { shown };
             for nullable in [false, true] {
@@ -528,11 +516,7 @@ fn strip_note(label: &str) -> &str {
     label.split_once(" (").map_or(label, |(name, _)| name)
 }
 
-/// The enumerated half of the crate docs drifted from the rules in four
-/// separate review rounds, because nothing but attention tied them together.
-/// Here the table is generated from the same rules the gate enforces, and this
-/// test fails when the committed file falls behind — the file itself has to be
-/// committed, since docs.rs builds documentation without running tests.
+/// `TYPES.md` is committed, since docs.rs builds without running tests; this keeps it current.
 #[test]
 fn the_reference_table_matches_the_rules() {
     let expected = types_md();
@@ -552,8 +536,7 @@ fn the_reference_table_matches_the_rules() {
     );
 }
 
-/// The Rust spelling the generator gives each fixture base, and what the macro
-/// can tell about it from that spelling alone.
+/// The generator's Rust spelling of a fixture base, and the kind the macro reads off it.
 fn rust_base(aidl: &str) -> (Kind, &'static str) {
     match aidl {
         "int" => (Kind::Primitive, "i32"),
@@ -562,6 +545,10 @@ fn rust_base(aidl: &str) -> (Kind, &'static str) {
         "String" => (Kind::Str, "String"),
         "MatrixCfg" => (Kind::User, "super::MatrixCfg::MatrixCfg"),
         "MatrixMode" => (Kind::User, "super::MatrixMode::MatrixMode"),
+        "MatrixPair<MatrixCfg>" => (
+            Kind::Generic,
+            "super::MatrixPair::MatrixPair<super::MatrixCfg::MatrixCfg>",
+        ),
         "ParcelFileDescriptor" => (Kind::NoDefault, "rsbinder::ParcelFileDescriptor"),
         "IMatrixCb" => (
             Kind::NoDefault,
@@ -572,11 +559,7 @@ fn rust_base(aidl: &str) -> (Kind, &'static str) {
     }
 }
 
-/// `aidl_shape` states the generator's rendering table once so that a refusal
-/// can be a comparison against it. That only holds if the table *is* the
-/// generator's — otherwise it is a third hand-written copy, verified by nobody
-/// and free to drift exactly as the scattered predicates did. So every cell of
-/// the same cross product is rendered both ways and the two must agree.
+/// `aidl_shape`'s table must be the generator's, cell for cell, or its refusals mean nothing.
 #[test]
 fn the_shape_table_renders_what_the_generator_renders() {
     let from_generator = canonical();
@@ -644,11 +627,7 @@ fn the_shape_table_renders_what_the_generator_renders() {
     );
 }
 
-/// Normalize-and-compare turns a refusal into "what you wrote is not what
-/// `.aidl` renders". That is only safe if the normalizer recovers the shape
-/// from the canonical spelling itself — otherwise a correct type would be
-/// refused for not matching its own canonical form, which is the worst
-/// regression this change could cause.
+/// A canonical spelling must recover its own shape, or a correct type would be refused.
 #[test]
 fn every_generated_spelling_round_trips_through_its_shape() {
     let from_generator = canonical();
@@ -721,14 +700,23 @@ fn every_accepted_spelling_is_one_aidl_renders() {
             if crate::type_str::check_type_at(&ty, place).is_err() {
                 continue;
             }
+            // `.aidl` writes it only for a cycle, and the fixture has none to render it from.
+            if place_name == "field"
+                && [
+                    "Option<Box<super::MatrixCfg::MatrixCfg>>",
+                    "Option<Box<super::MatrixPair::MatrixPair<super::MatrixCfg::MatrixCfg>>>",
+                ]
+                .iter()
+                .any(|cycle| norm_str(&spelling) == norm_str(cycle))
+            {
+                continue;
+            }
             let normalized = norm_str(&spelling);
             let renders = canonical
                 .get(place_name)
                 .is_some_and(|set| set.contains(&normalized));
             if !renders {
-                // A by-value argument still meets the generated `Copy`
-                // assertion, so a non-`Copy` one fails in rustc rather than
-                // silently; a `Copy` one diverges with nothing to catch it.
+                // Only rustc's `Copy` assertion stops a by-value one, and not when it is `Copy`.
                 let by_value = matches!(place_name, "in" | "out" | "inout")
                     && !matches!(crate::type_str::unwrap_group(&ty), Type::Reference(_));
                 let note = if by_value { "  (by value)" } else { "" };

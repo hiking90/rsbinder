@@ -255,23 +255,28 @@ These functions exist only on Linux and Android (the abstract namespace
 is a Linux kernel feature).
 
 For the android-13+ client there is also a builder,
-[`RpcUnixClientConfig`](https://docs.rs/rsbinder/latest/rsbinder/rpc/struct.RpcUnixClientConfig.html),
-consumed by `RpcSession::setup_unix_client_android13plus_with_config`.
-One config combines filesystem-path or abstract addressing with the
-optional knobs the positional helpers expose individually — attaching to
-an existing session by echoing its 32-byte id, an outgoing-connection
-fan-out, and the fd transport mode (session-id attach and fan-out are
+[`RpcClientConfig`](https://docs.rs/rsbinder/latest/rsbinder/rpc/struct.RpcClientConfig.html),
+consumed by `RpcSession::setup_client_android13plus_with_config`. It has
+one constructor per transport — `unix`, `unix_abstract`, `vsock`, `tls`,
+`tcp_debug`, and `new` for a connect function of your own — and the same
+knobs on all of them: attaching to an existing session by echoing its
+32-byte id, an outgoing-connection fan-out, incoming (callback)
+connections, and the fd transport mode (session-id attach and fan-out are
 mutually exclusive):
 
 ```rust
-use rsbinder::rpc::{FileDescriptorTransportMode, RpcSession, RpcUnixClientConfig};
+use rsbinder::rpc::{FileDescriptorTransportMode, RpcClientConfig, RpcSession};
 
-let session = RpcSession::setup_unix_client_android13plus_with_config(
-    RpcUnixClientConfig::abstract_name(b"my.rpc.name", 2)
+let session = RpcSession::setup_client_android13plus_with_config(
+    RpcClientConfig::unix_abstract(b"my.rpc.name", 2)
         .outgoing_connections(2)
         .fd_mode(FileDescriptorTransportMode::Unix),
 )?;
 ```
+
+The Unix-only predecessor `RpcUnixClientConfig`, and the
+`setup_unix_client_android13plus_{with_config,with_id,fan_out}` helpers,
+are deprecated since 0.12.0 and will be removed in the release after it.
 
 > **The id you echo must come from `RpcSession::get_session_id()`** — one
 > round trip that asks the server for it. `RpcSession::session_id()` is a
@@ -440,9 +445,9 @@ kernel binder for, with a few extras specific to socket transport:
   interfaces, enums, unions, oneway methods.
 - **Callbacks (nested binders)** — a callback object created on the
   client crosses the socket like any other Binder and the server
-  invokes it back through the same session. From inside a handler
-  this always works; to call a callback from *any other* server
-  thread the client must open an incoming connection — see
+  invokes it back through the same session. A twoway call from inside
+  a handler always works; a `oneway` call, or a call from *any other*
+  server thread, needs the client to open an incoming connection — see
   [Callbacks outside a handler](#callbacks-outside-a-handler).
 - **`ParcelFileDescriptor`** — opt in with
   `RpcSession::negotiate_fd_transport` and
@@ -476,46 +481,66 @@ opens — use
 
 ### Callbacks outside a handler
 
-A server can always call a client's callback *while it is answering
-that client* — the nested call rides the connection the request came
-in on. Calling it from anywhere else (a timer, a worker thread, a
-oneway notification fired later) needs a connection the server can
-*send* on, and by default a session has none: the server fails such a
-call at once with `WouldBlock` (AOSP `WOULD_BLOCK`) rather than
-waiting for a slot that will never free up.
+A server can always make a twoway call to a client's callback *while
+it is answering that client* — the nested call rides the connection
+the request came in on. Calling it from anywhere else (a timer, a
+worker thread, a oneway notification fired later) needs a connection
+the server can *send* on, and by default a session has none: the
+server fails such a call at once with `WouldBlock` (AOSP `WOULD_BLOCK`)
+rather than waiting for a slot that will never free up.
+
+A `oneway` call needs that connection even from inside the handler.
+It never rides the connection the request came in on, as in AOSP
+libbinder ("asynchronous calls cannot be nested"): the server does not
+wait for it and goes on to write its reply, while the client may still
+be running the oneway inside its own reply wait — and a twoway call the
+client's handler makes back on that connection would then read the
+server's reply as its own.
 
 The client provides that connection, exactly as libbinder's
 `ARpcSession_setMaxIncomingThreads(n)` does:
 
 ```rust
-use rsbinder::rpc::{RpcSession, RpcUnixClientConfig};
+use rsbinder::rpc::{RpcClientConfig, RpcSession};
 
-let session = RpcSession::setup_unix_client_android13plus_with_config(
-    RpcUnixClientConfig::path(std::path::Path::new(RPC_SOCKET), 2)
-        .incoming_connections(1),
+let session = RpcSession::setup_client_android13plus_with_config(
+    RpcClientConfig::unix(std::path::Path::new(RPC_SOCKET), 2).incoming_connections(1),
 )?;
 ```
 
 or, through the unified entry, `Client::open_with(uri, |o, _| {
 o.incoming_connections = Some(1) })` on an `?profile=android13plus`
-URI. Each incoming connection is attached to the same session and
-served by a thread the session owns; `n` of them let `n` server
-threads call back in parallel. The server budgets them at
+URI. This works on every RPC transport — `unix://`, `vsock://` and
+`tls://` alike. Each incoming connection is a further connection to the
+same endpoint (over `tls://`, its own TLS session), attached to the same
+session and served by a thread the session owns; `n` of them let `n`
+server threads call back in parallel. For a transport the entry does not
+name — TLS over a Unix socket, say — build the connections yourself with
+`RpcClientConfig::new(version, connect)`, whose `connect` is called once
+per connection. The server budgets them at
 `2 × set_max_threads` per session (two on a default server) and
 refuses the rest, which the client sees as a setup error.
 
 Two consequences worth knowing:
 
-- **Death is observed at once.** The serving thread sees the server's
-  connection drop and fires the linked death recipients immediately —
-  the session no longer waits for its next failed call to notice.
+- **Death can be observed at all.** The serving thread sees the server's
+  connection drop and fires the linked death recipients immediately. A
+  client session without incoming connections has nobody reading its
+  connection, so `link_to_death` is refused there with `InvalidOperation`
+  (AOSP refuses it the same way). The other way to get notified is
+  `RpcSession::spawn_serve`, which dedicates the founding connection to a
+  serve loop: the session then makes no calls of its own, only nested ones
+  from inside a handler.
 - **Stop the session explicitly.** The serving threads keep the session
   alive; dropping the `RpcSession` handle and every proxy does not end
   them. Call `RpcSession::close_session()` when you are done — it shuts
   the connections down and joins the threads.
 
-This needs the android-13+ profile (the attach echoes the session id)
-and is currently offered for Unix-domain sockets.
+This needs the android-13+ profile (the attach echoes the session id).
+[Streaming](./streaming.md) is the first thing in rsbinder itself that
+depends on it: a producer pushes batches from a thread of its own, so
+`Sink::open` checks for `TransportCaps::CALLBACKS` and refuses a session
+that has no incoming connection.
 
 ### How a connection ends
 

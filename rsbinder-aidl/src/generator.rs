@@ -11,8 +11,7 @@ use crate::error::{AidlError, DuplicateCodeRelated, SemanticError};
 use crate::parser::Direction;
 use crate::{add_indent, parser, Namespace};
 
-// `deprecated`: generated plumbing must name the item it deprecates; the allow
-// is module-scoped, so consumers outside the module still warn.
+// `deprecated` allow: plumbing names the item; module-scoped, so outside consumers still warn.
 const ENUM_TEMPLATE: &str = r##"
 pub mod {{mod}} {
     #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, deprecated)]
@@ -138,24 +137,30 @@ pub mod {{mod}} {
     {%- if deprecated %}
     {{ deprecated }}
     {%- endif %}
-    pub struct {{name}} {
+    pub struct {{name}}{{generics}} {
     {%- for member in members %}
         {%- if member.deprecated %}
         {{ member.deprecated }}
         {%- endif %}
         pub r#{{ member.identifier }}: {{ member.type_decl }},
     {%- endfor %}
+    {%- for param in type_params %}
+        pub _phantom_{{ param }}: core::marker::PhantomData<{{ param }}>,
+    {%- endfor %}
     }
-    impl Default for {{ name }} {
+    impl{{generics}} Default for {{ name }}{{generics}} {
         fn default() -> Self {
             Self {
             {%- for member in members %}
                 r#{{ member.identifier }}: {{ member.init }},
             {%- endfor %}
+            {%- for param in type_params %}
+                _phantom_{{ param }}: core::marker::PhantomData,
+            {%- endfor %}
             }
         }
     }
-    impl {{crate}}::Parcelable for {{name}} {
+    impl{{generics}} {{crate}}::Parcelable for {{name}}{{generics}} {
         fn write_to_parcel(&self, _parcel: &mut {{crate}}::Parcel) -> {{crate}}::Result<()> {
             _parcel.sized_write(|_sub_parcel| {
                 {%- for member in members %}
@@ -185,9 +190,9 @@ pub mod {{mod}} {
             })
         }
     }
-    {{crate}}::impl_serialize_for_parcelable!({{name}});
-    {{crate}}::impl_deserialize_for_parcelable!({{name}});
-    impl {{crate}}::ParcelableMetadata for {{name}} {
+    {{crate}}::impl_serialize_for_parcelable!({{name}}{{generics}});
+    {{crate}}::impl_deserialize_for_parcelable!({{name}}{{generics}});
+    impl{{generics}} {{crate}}::ParcelableMetadata for {{name}}{{generics}} {
         fn descriptor() -> &'static str { "{{namespace}}" }
         {%- if is_vintf %}
         fn stability(&self) -> {{crate}}::Stability { {{crate}}::Stability::Vintf }
@@ -208,7 +213,7 @@ pub mod {{mod}} {
     {%- endif %}
     pub const r#{{ member.0 }}: {{ member.1 }} = {{ member.2 }};
     {%- endfor %}
-    {%- if version %}
+    {%- if version is number %}
     /// Stable-AIDL interface version. Echoed verbatim through
     /// `getInterfaceVersion()`. Matches AOSP `aidl --version N`.
     pub const VERSION: i32 = {{ version }};
@@ -231,7 +236,7 @@ pub mod {{mod}} {
         {%- endif %}
         fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::BinderResult<{{ member.return_type }}>;
         {%- endfor %}
-        {%- if version %}
+        {%- if version is number %}
         // Server-side default returns the module's VERSION constant.
         // `{{bp_name}}` overrides this with a cache+transact pattern.
         fn r#getInterfaceVersion(&self) -> {{crate}}::BinderResult<i32> {
@@ -271,7 +276,7 @@ pub mod {{mod}} {
         {%- endif %}
         fn r#{{ member.identifier }}<'a>({{ member.args_async }}) -> {{crate}}::BoxFuture<'a, {{crate}}::BinderResult<{{ member.return_type }}>>;
         {%- endfor %}
-        {%- if version %}
+        {%- if version is number %}
         // Default returns the module's VERSION constant (correct for a local
         // service); `{{bp_name}}` overrides it with the cache+transact pattern.
         // Mirrors AOSP's versioned-interface Rust backend.
@@ -405,7 +410,7 @@ pub mod {{mod}} {
         {%- set_global counter = counter + 1 %}
         {%- endif %}
         {%- endfor %}
-        {%- if version %}
+        {%- if version is number %}
         // AOSP stable-AIDL meta transactions; offsets match
         // `system/tools/aidl/include/aidl/transaction_ids.h`:
         // kLastCallTransaction (0x00ffffff) - kFirstCallTransaction (1).
@@ -426,9 +431,9 @@ pub mod {{mod}} {
                 r#async: {{ name }}AsyncService,
                 {%- endif %}
             },
-            {%- if version or hash %}
+            {%- if version is number or hash %}
             proxy: {{ bp_name }} {
-                {%- if version %}
+                {%- if version is number %}
                 cached_version: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1){% if hash %},{% endif %}
                 {%- endif %}
                 {%- if hash %}
@@ -493,7 +498,7 @@ pub mod {{mod}} {
             {%- endif %}
         }
         {%- endfor %}
-        {%- if version %}
+        {%- if version is number %}
         fn build_parcel_getInterfaceVersion(&self) -> {{crate}}::Result<{{crate}}::Parcel> {
             let data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_transact(true)?;
             Ok(data)
@@ -539,7 +544,7 @@ pub mod {{mod}} {
             {%- endif %}
         }
         {%- endfor %}
-        {%- if version %}
+        {%- if version is number %}
         fn r#getInterfaceVersion(&self) -> {{crate}}::BinderResult<i32> {
             let _aidl_version = self.cached_version.load(std::sync::atomic::Ordering::Relaxed);
             if _aidl_version != -1 { return Ok(_aidl_version); }
@@ -599,7 +604,7 @@ pub mod {{mod}} {
             )
         }
         {%- endfor %}
-        {%- if version %}
+        {%- if version is number %}
         fn r#getInterfaceVersion<'a>(&'a self) -> {{crate}}::BoxFuture<'a, {{crate}}::BinderResult<i32>> {
             let _aidl_version = self.cached_version.load(std::sync::atomic::Ordering::Relaxed);
             if _aidl_version != -1 { return Box::pin(std::future::ready(Ok(_aidl_version))); }
@@ -669,6 +674,25 @@ pub mod {{mod}} {
             {%- endif %}
         }
         {%- endfor %}
+        {%- if version is number %}
+        // Forward so an in-process call sees the same override `on_transact` dispatches to.
+        fn r#getInterfaceVersion(&self) -> {{crate}}::BinderResult<i32> {
+            {%- if enabled_async %}
+            self.0.as_sync().r#getInterfaceVersion()
+            {%- else %}
+            self.0.r#getInterfaceVersion()
+            {%- endif %}
+        }
+        {%- endif %}
+        {%- if hash %}
+        fn r#getInterfaceHash(&self) -> {{crate}}::BinderResult<String> {
+            {%- if enabled_async %}
+            self.0.as_sync().r#getInterfaceHash()
+            {%- else %}
+            self.0.r#getInterfaceHash()
+            {%- endif %}
+        }
+        {%- endif %}
     }
     /// A typed handle implements the interface it points at, so a proxy can be
     /// re-published as a local service on another transport in one line:
@@ -682,7 +706,7 @@ pub mod {{mod}} {
             (**self).r#{{ member.identifier }}({{ member.func_call_params }})
         }
         {%- endfor %}
-        {%- if version %}
+        {%- if version is number %}
         // Report the *upstream* version, not this module's constant: a gateway
         // speaks for the service it fronts. The trait's default body would
         // silently answer with `VERSION` if this override were dropped.
@@ -733,7 +757,7 @@ pub mod {{mod}} {
                 Ok(())
             }
         {%- endfor %}
-        {%- if version %}
+        {%- if version is number %}
             transactions::r#getInterfaceVersion => {
                 let _aidl_return = _service.r#getInterfaceVersion();
                 match &_aidl_return {
@@ -859,9 +883,7 @@ pub fn deprecated_attr(note: Option<&String>) -> String {
     }
 }
 
-/// Quotes `s` as a Rust string literal. The note comes from a comment, which
-/// the AIDL grammar does not constrain at all, so every character that cannot
-/// sit in a literal is escaped.
+/// Quotes `s` as a Rust string literal; the note is unconstrained comment text, so escape all.
 fn quote_rust_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -919,9 +941,8 @@ pub struct InterfaceRender {
     pub nested: String,
     pub enabled_async: bool,
     pub is_vintf: bool,
-    /// Stable-AIDL `--version N`. `None` suppresses the whole version
-    /// plumbing, keeping output byte-identical to the pre-versioning
-    /// generator.
+    /// Stable-AIDL `--version N`. `None` emits no `VERSION` constant, no meta
+    /// transaction code and no proxy-side cache.
     pub version: Option<i32>,
     /// Stable-AIDL `--hash <s>`, echoed verbatim. Independent of `version`.
     pub hash: Option<String>,
@@ -937,8 +958,8 @@ pub struct InterfaceRender {
 /// from 0 up to the last id reached while no more than 10 ids in total have
 /// been skipped, each holding its method's name or `""`. Mirrors AOSP
 /// `GetFunctionNames` / `GetMaxId` (`system/tools/aidl/aidl_to_common.cpp`),
-/// so a sparse explicit numbering does not produce a table the size of its
-/// largest id. Ids above AOSP `kMaxUserSetMethodId` are the meta methods,
+/// including that skips count only after the first id, so a large first id
+/// still sizes the table. Ids above AOSP `kMaxUserSetMethodId` are the meta methods,
 /// which the runtime names without the table.
 pub fn function_names(fn_members: &[FnMembers]) -> Vec<String> {
     const MAX_SKIP: u32 = 10;
@@ -988,9 +1009,7 @@ pub fn function_names(fn_members: &[FnMembers]) -> Vec<String> {
     names
 }
 
-/// `crate_name` defaults to `"rsbinder"`, not the empty string a derived
-/// `Default` would give: an empty path renders `impl ::Parcelable for Foo`,
-/// which the render functions would still return as `Ok`.
+/// `crate_name` is `rsbinder`, not empty: `impl ::Parcelable for Foo` would still render `Ok`.
 impl Default for InterfaceRender {
     fn default() -> Self {
         Self {
@@ -1027,6 +1046,7 @@ impl Default for ParcelableRender {
             nested: String::new(),
             is_vintf: false,
             deprecated: String::new(),
+            type_params: Vec::new(),
         }
     }
 }
@@ -1119,8 +1139,7 @@ pub fn render_interface(r: &InterfaceRender) -> Result<String, AidlError> {
     context.insert("nested", &r.nested);
     context.insert("enabled_async", &r.enabled_async);
     context.insert("is_vintf", &r.is_vintf);
-    // `version` and `hash` are independent — the template emits each only if
-    // its key is set, matching AOSP's per-flag conditional.
+    // `version`/`hash` are independent: each emits only if set, as AOSP's per-flag conditional.
     context.insert("version", &r.version);
     context.insert("hash", &r.hash);
     context.insert("deprecated", &r.deprecated);
@@ -1153,6 +1172,13 @@ pub struct ParcelableRender {
     pub is_vintf: bool,
     /// Rendered `#[deprecated…]` attribute for the parcelable, or empty.
     pub deprecated: String,
+    /// Type parameter names of a generic parcelable (`Foo<T, U>`), in
+    /// declaration order. Each becomes a `PhantomData` field, as AOSP's
+    /// Rust backend emits an unused parameter: no field may have a
+    /// parameter's type, so every parameter is unused. The field is `pub`
+    /// where AOSP's is private, so `Foo { a, ..Default::default() }`
+    /// compiles outside the generated module.
+    pub type_params: Vec<String>,
 }
 
 /// Render one parcelable module (`pub mod {module} { pub struct {name} … }`).
@@ -1168,6 +1194,14 @@ pub fn render_parcelable(r: &ParcelableRender) -> Result<String, AidlError> {
     context.insert("nested", &r.nested);
     context.insert("is_vintf", &r.is_vintf);
     context.insert("deprecated", &r.deprecated);
+    context.insert("type_params", &r.type_params);
+    // `<T, U>` or nothing, spelled once for the struct and every impl.
+    let generics = if r.type_params.is_empty() {
+        String::new()
+    } else {
+        format!("<{}>", r.type_params.join(", "))
+    };
+    context.insert("generics", &generics);
 
     template()
         .render("parcelable", &context)
@@ -1282,8 +1316,10 @@ pub struct FnMembers {
     pub has_explicit_code: bool,
     /// Pre-rendered Rust block that runs at the top of this method's
     /// `on_transact` arm and replies with `ExceptionCode::Security`
-    /// (AOSP `EX_SECURITY`) on permission denial. `None` when the
-    /// method carries no `@EnforcePermission`.
+    /// (AOSP `EX_SECURITY`) on permission denial. `None` when neither the
+    /// method nor its interface carries `@EnforcePermission`; an
+    /// interface-level expression applies to every method without its own
+    /// (AOSP Java backend).
     pub enforce_permission_check: Option<String>,
     /// Rendered `#[deprecated…]` attribute for the method, or empty.
     pub deprecated: String,
@@ -1301,9 +1337,7 @@ impl FnMembers {
     }
 }
 
-/// `vintf_owner` is `Some(interface name)` when the enclosing interface is
-/// `@VintfStability`, which makes every type in the method signature part of
-/// the VINTF reference closure.
+/// `vintf_owner`: the `@VintfStability` interface name; signature types join its VINTF closure.
 fn make_fn_member(
     method: &parser::MethodDecl,
     crate_name: &str,
@@ -1324,9 +1358,7 @@ fn make_fn_member(
         let generator = arg.to_generator()?;
         generator.ensure_resolvable()?;
 
-        // AOSP `AidlMethod::CheckValid`: duplicate argument names. Both would
-        // render as the same `_arg_<name>` binding, so without this the defect
-        // surfaces as rustc E0415 in the consumer's crate.
+        // AOSP `AidlMethod::CheckValid`: duplicates clash as `_arg_<name>` (consumer's E0415).
         if !arg_names.insert(arg.identifier.as_str()) {
             return Err(Generator::decl_error(
                 format!(
@@ -1346,10 +1378,7 @@ fn make_fn_member(
                 generator.type_span(),
             ));
         }
-        // AOSP `AidlArgument::CheckValid` (`aidl_language.cpp`):
-        // `AidlTypenames::GetArgumentAspect` hands `ParcelableHolder` an empty
-        // direction set, so `in`/`out`/`inout` are all refused — a holder is a
-        // field type only (b/156872582).
+        // AOSP `GetArgumentAspect`: `ParcelableHolder` has no direction, field-only (b/156872582).
         if generator.is_parcelable_holder() {
             return Err(Generator::decl_error(
                 format!(
@@ -1450,9 +1479,7 @@ fn make_fn_member(
         };
     generator.ensure_resolvable()?;
 
-    // AOSP `AidlMethod::CheckValid`: a `ParcelableHolder` return value has no
-    // representation in the C++/NDK backends, so the contract is rejected
-    // rather than made unimplementable for a peer.
+    // AOSP `AidlMethod::CheckValid`: C++/NDK peers cannot represent a `ParcelableHolder` return.
     if generator.is_parcelable_holder() {
         return Err(Generator::decl_error(
             format!(
@@ -1495,25 +1522,30 @@ fn make_fn_member(
     })
 }
 
-/// Renders `@EnforcePermission(...)` into the `on_transact` arm's
-/// early-deny block; short-circuits per AOSP
-/// `system/tools/aidl/generate_cpp.cpp::WriteEnforcePermissionCheck`.
+/// AOSP `AidlAnnotatable::IsPermissionAnnotated`.
+fn is_permission_annotated(annotation_list: &[parser::Annotation]) -> bool {
+    annotation_list.iter().any(|a| {
+        matches!(
+            a.annotation.as_str(),
+            "@EnforcePermission" | "@RequiresNoPermission" | "@PermissionManuallyEnforced"
+        )
+    })
+}
+
+/// Early-deny block run before any arg is read (rsbinder design; AOSP C++/Rust backends refuse).
 fn render_enforce_permission_check(
     expr: &parser::EnforcePermissionExpr,
     crate_name: &str,
 ) -> String {
     fn lit(s: &str) -> String {
-        // The AIDL pest grammar already forbids `\` and `"` in
-        // permission strings; the escape stays as defense-in-depth
-        // against future grammar relaxation.
+        // The grammar forbids `\` and `"` here; the escape guards a future relaxation.
         debug_assert!(
             !s.contains('\\') && !s.contains('"'),
             "AIDL grammar must reject {s:?} before reaching codegen"
         );
         s.replace('\\', "\\\\").replace('"', "\\\"")
     }
-    // `_reader` lets the runtime deny over RPC before it reads a uid: an RPC
-    // peer's uid is not a PMS uid (plan/2-16 Phase A).
+    // `_reader`: deny over RPC before reading a uid, which is no PMS uid (plan/2-16 Phase A).
     let call = |p: &str| {
         format!(
             "{crate_name}::permission_controller::check_permission(_reader, \"{}\")",
@@ -1534,12 +1566,7 @@ fn render_enforce_permission_check(
     )
 }
 
-/// Enforces AOSP's transaction-code rules for an interface's methods, before
-/// any code is emitted: explicit codes are all-or-nothing, and when present
-/// they must be non-negative, within `u32` range, and unique. Each violation
-/// becomes a `SemanticError` pointing at the offending span. Methods with
-/// implicit codes are numbered positionally by the template, so they need no
-/// validation here.
+/// AOSP code rules: explicit codes are all-or-nothing, non-negative, within `u32`, unique.
 fn validate_transaction_codes(decl: &parser::InterfaceDecl) -> Result<(), AidlError> {
     let explicit_count = decl
         .method_list
@@ -1595,13 +1622,7 @@ fn validate_transaction_codes(decl: &parser::InterfaceDecl) -> Result<(), AidlEr
             }
             .into());
         }
-        // AOSP reserves the top 100 transaction IDs for auto-generated meta
-        // methods (getInterfaceVersion = 16777214, getInterfaceHash =
-        // 16777213, ...). A user code in that range silently collides with
-        // a meta method, producing two `on_transact` arms with the same
-        // value (the user-vs-user dup check below cannot catch it). Reject
-        // codes above `kMaxUserSetMethodId` (16777114), mirroring AOSP
-        // `aidl.cpp` (`system/tools/aidl/include/aidl/transaction_ids.h`).
+        // AOSP `transaction_ids.h`: the top 100 IDs are meta methods the dup check can't see.
         const K_MAX_USER_SET_METHOD_ID: i64 = 16_777_114;
         if code > K_MAX_USER_SET_METHOD_ID {
             return Err(SemanticError::TransactionCodeReserved {
@@ -1639,16 +1660,9 @@ fn validate_transaction_codes(decl: &parser::InterfaceDecl) -> Result<(), AidlEr
 pub struct Generator {
     enabled_async: bool,
     is_crate: bool,
-    /// Stable-AIDL `--version N` equivalent. When `Some`, the interface
-    /// template emits `pub const VERSION`, the two synthetic meta
-    /// transactions (`getInterfaceVersion` / `getInterfaceHash`), and the
-    /// proxy-side cache plumbing. `None` ⇒ wire-byte-identical to the
-    /// pre-versioning generator output.
+    /// AOSP `--version N`; `@VersionSupport` overrides it per interface (`interface_version`).
     version: Option<i32>,
-    /// Stable-AIDL `--hash <s>` equivalent. Echoed verbatim through the
-    /// generated `getInterfaceHash()` method; generator does not compute
-    /// or validate it. Independent of `version` — set either, both, or
-    /// neither (matches AOSP's per-flag conditional).
+    /// AOSP `--hash <s>`: echoed verbatim, never validated; independent of `version`.
     hash: Option<String>,
     /// AOSP `aidl --trace`: emit each interface's method-name table.
     trace: bool,
@@ -1656,10 +1670,7 @@ pub struct Generator {
 
 impl Generator {
     pub fn new(enabled_async: bool, is_crate: bool) -> Self {
-        // Single source of truth for the crate prefix: templates read
-        // `self.is_crate`, type paths read the thread-local — asserting it
-        // here keeps both in sync for direct `Generator` users and for
-        // Builders constructed on a different thread.
+        // Templates read `self.is_crate`, type paths a thread-local: set here so both agree.
         crate::type_generator::set_crate_support(is_crate);
         Self {
             enabled_async,
@@ -1678,9 +1689,7 @@ impl Generator {
         self
     }
 
-    // Mirrors AOSP `aidl --version N --hash <s>`; `None` suppresses the
-    // corresponding emission, per AOSP's per-flag conditional. The public
-    // entry points are `Builder::version` / `Builder::hash`.
+    // AOSP `aidl --version N --hash <s>`; public entry points: `Builder::version`/`hash`.
     pub(crate) fn with_version_meta(mut self, version: Option<i32>, hash: Option<String>) -> Self {
         self.version = version;
         self.hash = hash;
@@ -1747,6 +1756,7 @@ impl Generator {
 
         let mut content = String::new();
 
+        Self::ensure_nested_names(None, &document.decls)?;
         content += &self.declarations(&document.decls, 0)?;
 
         Ok((document.package.clone().unwrap_or_default(), content))
@@ -1790,8 +1800,39 @@ impl Generator {
         Ok(content)
     }
 
-    /// Declaration-level semantic diagnostic carrying the current source
-    /// context, for declarations that cannot be represented in Rust.
+    /// AOSP `CheckValidWithMembers`: a type named twice in a scope, or as its parent, is E0428.
+    fn ensure_nested_names(
+        owner: Option<&str>,
+        decls: &[parser::Declaration],
+    ) -> Result<(), AidlError> {
+        let mut names = std::collections::HashSet::new();
+        for decl in decls {
+            let span = match decl {
+                parser::Declaration::Interface(d) => d.name_span,
+                parser::Declaration::Parcelable(d) => d.name_span,
+                parser::Declaration::Enum(d) => d.name_span,
+                parser::Declaration::Union(d) => d.name_span,
+                parser::Declaration::Variable(_) => continue,
+            };
+            let name = decl.name();
+            if Some(name) == owner {
+                return Err(Self::decl_error(
+                    format!("nested type '{name}' has the same name as its parent"),
+                    span,
+                ));
+            }
+            if !names.insert(name) {
+                let message = match owner {
+                    Some(owner) => format!("'{owner}' has a duplicate nested type '{name}'"),
+                    None => format!("duplicate type '{name}'"),
+                };
+                return Err(Self::decl_error(message, span));
+            }
+        }
+        Ok(())
+    }
+
+    /// Diagnostic, with the current source context, for a declaration Rust cannot represent.
     fn decl_error(message: impl Into<String>, span: Option<(usize, usize)>) -> AidlError {
         let (start, end) = span.unwrap_or((0, 0));
         let source = parser::current_source_text();
@@ -1809,10 +1850,7 @@ impl Generator {
         .into()
     }
 
-    /// AOSP `AidlVariableDeclaration::CheckValid` (`aidl_language.cpp`): no
-    /// declaration — parcelable field, union member, or interface constant —
-    /// may have type `void`. The array and nullable forms are already
-    /// rejected in `TypeGenerator::new_with_type`.
+    /// AOSP `AidlVariableDeclaration::CheckValid`: no `void` (array/nullable: new_with_type).
     fn ensure_declarable(
         generator: &crate::type_generator::TypeGenerator,
         owner: &str,
@@ -1830,8 +1868,7 @@ impl Generator {
         Ok(())
     }
 
-    /// Builds the `(NamedSource, SourceSpan)` pair a declaration-level
-    /// diagnostic needs from a span in the current source.
+    /// Builds a declaration diagnostic's `(NamedSource, SourceSpan)` from a current-source span.
     fn diagnostic_at(span: Option<(usize, usize)>) -> (NamedSource<String>, SourceSpan) {
         let (start, end) = span.unwrap_or((0, 0));
         let source = parser::current_source_text();
@@ -1847,8 +1884,7 @@ impl Generator {
         )
     }
 
-    /// AOSP `AidlParcelable::CheckValid`: every field of a `@FixedSize`
-    /// parcelable or union must itself be fixed size.
+    /// AOSP `AidlParcelable::CheckValid`: every `@FixedSize` field must itself be fixed size.
     fn ensure_fixed_size_field(
         generator: &crate::type_generator::TypeGenerator,
         kind: &'static str,
@@ -1869,9 +1905,7 @@ impl Generator {
         .into())
     }
 
-    /// A constant's type must be one that has a constant form. See
-    /// [`TypeGenerator::is_supported_constant_type`] for how this relates to
-    /// AOSP's stricter set.
+    /// A constant's type needs a constant form; AOSP's stricter set: `is_supported_constant_type`.
     fn ensure_constant_type(
         generator: &crate::type_generator::TypeGenerator,
         owner: &str,
@@ -1889,9 +1923,7 @@ impl Generator {
         ))
     }
 
-    /// A `@VintfStability` declaration may only name `@VintfStability` types —
-    /// the reference closure AOSP's compilation-wide `stability: "vintf"`
-    /// (`aidl.cpp`) implies, rsbinder having no such mode.
+    /// VINTF types name only VINTF types: AOSP's `stability: "vintf"` closure (`aidl.cpp`).
     fn ensure_vintf_closure(
         generator: &crate::type_generator::TypeGenerator,
         kind: &'static str,
@@ -1904,11 +1936,7 @@ impl Generator {
             if parser::is_vintf_scoped(&lookup.ns) {
                 continue;
             }
-            // AOSP exempts a stable-API parcelable from the stability sweep
-            // (`aidl.cpp`, `IsStableApiParcelable`). For the Rust backend that
-            // is `@RustOnlyStableParcelable`, whose Rust type is supplied by
-            // `rust_type` rather than generated — there is no declaration to
-            // annotate `@VintfStability`.
+            // AOSP `IsStableApiParcelable`: a `rust_type` parcelable has nothing to annotate.
             if matches!(&lookup.decl, parser::Declaration::Parcelable(decl)
                 if !decl.rust_type.is_empty())
             {
@@ -1947,10 +1975,7 @@ impl Generator {
                 decl.name_span,
             ));
         }
-        // Scoped, not local: a nested declaration inherits `@VintfStability`
-        // from its enclosing type (AOSP `GetScopedAnnotation`). The
-        // declaration's own annotation is read directly so the answer never
-        // depends on the declaration map being populated.
+        // AOSP `GetScopedAnnotation`: nested types inherit it; own annotation needs no decl map.
         let is_vintf = parser::has_annotation(
             &decl.annotation_list,
             parser::AnnotationType::VintfStability,
@@ -1973,9 +1998,20 @@ impl Generator {
         }
 
         // Second pass: process constants with resolved values
+        let mut constant_names = std::collections::HashSet::new();
         for constant in decl.constant_list.iter() {
             let generator = constant.r#type.to_generator()?;
             generator.ensure_resolvable()?;
+            // AOSP `AidlDefinedType::CheckValid`: two `pub const` of one name is E0428 downstream.
+            if !constant_names.insert(constant.identifier.as_str()) {
+                return Err(Generator::decl_error(
+                    format!(
+                        "interface '{}' has a duplicate constant name '{}'",
+                        decl.name, constant.identifier
+                    ),
+                    generator.type_span(),
+                ));
+            }
             Self::ensure_declarable(&generator, &decl.name, &constant.identifier)?;
             Self::ensure_constant_type(&generator, &decl.name, &constant.identifier)?;
             const_members.push((
@@ -1992,10 +2028,15 @@ impl Generator {
         validate_transaction_codes(&decl)?;
 
         let vintf_owner = is_vintf.then_some(decl.name.as_str());
+        // AOSP Java `GeneratePermissionMethod`: an interface-level expression guards every method.
+        let iface_permission_check =
+            parser::enforce_permission_from_annotation_list(&decl.annotation_list, &decl.name)?
+                .map(|expr| render_enforce_permission_check(&expr, self.get_crate_name()));
+        let iface_permission_annotated = is_permission_annotated(&decl.annotation_list);
+        let version = parser::interface_version(&decl.annotation_list, self.version)?;
         let mut method_names = std::collections::HashSet::new();
         for method in decl.method_list.iter() {
-            // AOSP `AidlInterface::CheckValid`: a duplicate would otherwise
-            // collapse into one method, taking its transaction code with it.
+            // AOSP `AidlInterface::CheckValid`: duplicates would merge, losing a transaction code.
             if !method_names.insert(method.identifier.as_str()) {
                 return Err(Generator::decl_error(
                     format!(
@@ -2005,17 +2046,69 @@ impl Generator {
                     method.identifier_span,
                 ));
             }
-            fn_members.push(make_fn_member(method, self.get_crate_name(), vintf_owner)?);
+            // AOSP `AidlInterface::CheckValid` `reserved_methods`, matched by signature.
+            let reserved = match (method.identifier.as_str(), method.arg_list.as_slice()) {
+                ("asBinder" | "getInterfaceHash" | "getInterfaceVersion", []) => true,
+                ("getTransactionName", [arg]) => {
+                    let ty = &arg.r#type;
+                    ty.non_array_type.name == "int"
+                        && ty.non_array_type.generic.is_none()
+                        && ty.array_types.is_empty()
+                }
+                _ => false,
+            };
+            if reserved {
+                return Err(Generator::decl_error(
+                    format!(
+                        "interface '{}': method '{}' is reserved for internal use",
+                        decl.name, method.identifier
+                    ),
+                    method.identifier_span,
+                ));
+            }
+            // Rust has no overloading: a generated trait item takes its name for every signature.
+            let generated = match method.identifier.as_str() {
+                // `dump`/`as_binder`: supertrait `rsbinder::Interface` items, E0034 on `dyn IFoo`.
+                "descriptor" | "getDefaultImpl" | "setDefaultImpl" | "dump" | "as_binder" => true,
+                "getInterfaceVersion" => version.is_some(),
+                "getInterfaceHash" => self.hash.is_some(),
+                _ => false,
+            };
+            if generated {
+                return Err(Generator::decl_error(
+                    format!(
+                        "interface '{}': method '{}' collides with an item of the generated \
+                         Rust trait",
+                        decl.name, method.identifier
+                    ),
+                    method.identifier_span,
+                ));
+            }
+            // AOSP `AidlInterface::CheckValidPermissionAnnotations`.
+            if iface_permission_annotated && is_permission_annotated(&method.annotation_list) {
+                return Err(Generator::decl_error(
+                    format!(
+                        "the interface '{}' uses a permission annotation but the method '{}' \
+                         is also annotated; distribute the annotation to each method",
+                        decl.name, method.identifier
+                    ),
+                    method.identifier_span,
+                ));
+            }
+            let mut member = make_fn_member(method, self.get_crate_name(), vintf_owner)?;
+            if member.enforce_permission_check.is_none() {
+                member.enforce_permission_check = iface_permission_check.clone();
+            }
+            fn_members.push(member);
         }
 
+        Self::ensure_nested_names(Some(&decl.name), &decl.members)?;
         let nested = &self.declarations(&decl.members, indent + 1)?;
 
-        let namespace = parser::get_descriptor_from_annotation_list(&decl.annotation_list)
+        let namespace = parser::get_descriptor_from_annotation_list(&decl.annotation_list)?
             .unwrap_or_else(|| decl.namespace.to_string(Namespace::AIDL));
 
-        // Escape a Rust-keyword interface name (AIDL permits it) so the
-        // generated `pub mod` / `pub trait` compiles. `bn_name`/`bp_name` are
-        // `Bn`/`Bp`-prefixed and thus never keywords.
+        // AIDL allows keyword names; `Bn`/`Bp`-prefixed names are never keywords.
         let escaped_name = crate::escape_rust_keyword(&decl.name).into_owned();
         let stem = interface_stem(&decl.name);
 
@@ -2033,10 +2126,8 @@ impl Generator {
             nested: nested.trim().to_string(),
             enabled_async: self.enabled_async,
             is_vintf,
-            // Stable-AIDL `getInterfaceVersion`/`getInterfaceHash` plumbing.
-            // Both missing ⇒ wire byte-identical to the pre-versioning
-            // generator.
-            version: self.version,
+            // `None` emits no meta transaction code and no cache.
+            version,
             hash: self.hash.clone(),
             deprecated: deprecated_attr(decl.deprecated.as_ref()),
             function_names,
@@ -2052,19 +2143,25 @@ impl Generator {
     ) -> Result<String, AidlError> {
         let mut decl = arg_decl.clone();
 
-        // Scoped, not local: a nested declaration inherits `@VintfStability`
-        // from its enclosing type (AOSP `GetScopedAnnotation`). The
-        // declaration's own annotation is read directly so the answer never
-        // depends on the declaration map being populated.
+        // AOSP `GetScopedAnnotation`: nested types inherit it; own annotation needs no decl map.
         let is_vintf = parser::has_annotation(
             &decl.annotation_list,
             parser::AnnotationType::VintfStability,
         ) || parser::is_vintf_scoped(&decl.namespace);
 
-        // An unstructured parcelable that names its `rust_type` is
-        // representable: emit the alias and ignore the Java/NDK/C++ markers
-        // that only describe the other backends.
+        // A named `rust_type` is representable; Java/NDK/C++ markers describe other backends.
         if !decl.rust_type.is_empty() {
+            // An alias must use every parameter, and nothing here knows the shape of `rust_type`.
+            if let Some(param) = decl.type_params.first() {
+                return Err(Self::decl_error(
+                    format!(
+                        "parcelable '{}' is generic and names a `rust_type`: a type alias \
+                         cannot carry the parameters, so declare it structured",
+                        decl.name
+                    ),
+                    param.name_span,
+                ));
+            }
             let escaped = crate::escape_rust_keyword(&decl.name);
             let rendered = format!(r#"
 pub mod {mod} {{
@@ -2104,6 +2201,17 @@ pub mod {mod} {{
                 ));
             }
         }
+        // AOSP `aidl.cpp`: the Rust backend refuses unstructured parcelables.
+        if decl.is_unstructured {
+            return Err(Self::decl_error(
+                format!(
+                    "parcelable '{}' is unstructured and names no `rust_type`: its definition \
+                     lives outside AIDL, so no Rust type can be generated",
+                    decl.name
+                ),
+                decl.name_span,
+            ));
+        }
 
         decl.pre_process();
 
@@ -2115,11 +2223,53 @@ pub mod {mod} {{
         // Not scoped: a nested parcelable does not inherit `@FixedSize`.
         let is_fixed_size =
             parser::has_annotation(&decl.annotation_list, parser::AnnotationType::FixedSize);
+        Self::ensure_type_params(&decl.name, &decl.type_params, &decl.members)?;
+        let decl_type_params: Vec<String> =
+            decl.type_params.iter().map(|p| p.name.clone()).collect();
 
         // Parse struct variables only.
+        let mut field_names = std::collections::HashSet::new();
+        let mut constant_names = std::collections::HashSet::new();
         for decl in &decl.members {
             if let Some(var) = decl.is_variable() {
                 let generator = var.r#type.to_generator()?;
+                // AOSP `AidlStructuredParcelable::CheckValid`: a duplicate is rustc E0124/E0428.
+                let names = if var.constant {
+                    &mut constant_names
+                } else {
+                    &mut field_names
+                };
+                if !names.insert(var.identifier.as_str()) {
+                    return Err(Generator::decl_error(
+                        format!(
+                            "'{}' has a duplicate {} name '{}'",
+                            owner_name,
+                            if var.constant { "constant" } else { "field" },
+                            var.identifier
+                        ),
+                        generator.type_span(),
+                    ));
+                }
+                // `PARCELABLE_TEMPLATE` adds a `_phantom_<param>` field per type parameter.
+                if !var.constant
+                    && decl_type_params
+                        .iter()
+                        .any(|p| var.identifier.strip_prefix("_phantom_") == Some(p.as_str()))
+                {
+                    return Err(Generator::decl_error(
+                        format!(
+                            "'{}' field '{}' collides with the generated PhantomData field",
+                            owner_name, var.identifier
+                        ),
+                        generator.type_span(),
+                    ));
+                }
+                Self::ensure_no_type_param_field(
+                    &generator,
+                    &decl_type_params,
+                    &owner_name,
+                    &var.identifier,
+                )?;
                 generator.ensure_resolvable()?;
                 generator.ensure_sized()?;
                 Self::ensure_declarable(&generator, &owner_name, &var.identifier)?;
@@ -2176,12 +2326,12 @@ pub mod {mod} {{
             }
         }
 
+        Self::ensure_nested_names(Some(&owner_name), &declarations)?;
         let nested = &self.declarations(&declarations, indent + 1)?;
-        let namespace = parser::get_descriptor_from_annotation_list(&decl.annotation_list)
+        let namespace = parser::get_descriptor_from_annotation_list(&decl.annotation_list)?
             .unwrap_or_else(|| decl.namespace.to_string(Namespace::AIDL));
 
-        // Escape a Rust-keyword parcelable name so `pub mod` / `pub struct`
-        // compiles.
+        // A Rust-keyword parcelable name needs `r#` in `pub mod` / `pub struct`.
         let escaped_name = crate::escape_rust_keyword(&decl.name).into_owned();
 
         let rendered = render_parcelable(&ParcelableRender {
@@ -2195,9 +2345,82 @@ pub mod {mod} {{
             nested: nested.trim().to_string(),
             is_vintf,
             deprecated: deprecated_attr(decl.deprecated.as_ref()),
+            type_params: decl_type_params,
         })?;
 
         Ok(add_indent(indent, rendered.trim()))
+    }
+
+    /// Names the parcelable template spells unqualified; a same-named type parameter shadows them.
+    const BARE_TEMPLATE_NAMES: &'static [&'static str] = &[
+        "String", "Vec", "Option", "Box", "Default", "core", "std", "bool", "i8", "u8", "i16",
+        "u16", "i32", "u32", "i64", "u64", "f32", "f64", "usize", "isize", "str",
+    ];
+
+    /// Parameter names are spelled bare (see `BARE_TEMPLATE_NAMES`); nesting is refused as in AOSP.
+    fn ensure_type_params(
+        owner: &str,
+        type_params: &[parser::TypeParam],
+        members: &[parser::Declaration],
+    ) -> Result<(), AidlError> {
+        if type_params.is_empty() {
+            return Ok(());
+        }
+        for param in type_params {
+            let name = param.name.as_str();
+            let shadows = if crate::escape_rust_keyword(name) != name {
+                Some("a Rust keyword")
+            } else if Self::BARE_TEMPLATE_NAMES.contains(&name) {
+                Some("a name the generated Rust spells unqualified")
+            } else if name == crate::type_generator::crate_name() {
+                Some("the runtime crate's path")
+            } else if name == owner {
+                Some("the declaration it belongs to")
+            } else {
+                None
+            };
+            if let Some(what) = shadows {
+                return Err(Self::decl_error(
+                    format!("type parameter '{name}' of '{owner}' shadows {what}"),
+                    param.name_span,
+                ));
+            }
+        }
+        if let Some(nested) = members.iter().find(|m| m.is_variable().is_none()) {
+            return Err(Self::decl_error(
+                format!(
+                    "generic types can't have nested types: '{owner}' declares '{}'",
+                    nested.name()
+                ),
+                type_params[0].name_span,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Refuses `Foo<T> { T value; }`: a field typed by an own type parameter has no wire form.
+    fn ensure_no_type_param_field(
+        generator: &crate::type_generator::TypeGenerator,
+        type_params: &[String],
+        owner: &str,
+        field: &str,
+    ) -> Result<(), AidlError> {
+        if type_params.is_empty() {
+            return Ok(());
+        }
+        for name in generator.referenced_user_types() {
+            if type_params.iter().any(|param| param == name) {
+                return Err(Self::decl_error(
+                    format!(
+                        "field '{field}' of '{owner}' has the type parameter '{name}' as its \
+                         type: a type parameter is not written to the parcel, so a field \
+                         cannot have its type"
+                    ),
+                    generator.type_span(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn register_enum_members(decl: &parser::EnumDecl) {
@@ -2247,7 +2470,18 @@ pub mod {mod} {{
         };
 
         // Second pass: render the values resolved by the shared enum member path.
+        let mut enumerator_names = std::collections::HashSet::new();
         for enumerator in &decl.enumerator_list {
+            // Not an AOSP check: two same-named constants in `declare_binder_enum!` do not compile.
+            if !enumerator_names.insert(enumerator.identifier.as_str()) {
+                return Err(Self::decl_error(
+                    format!(
+                        "enum '{}' has a duplicate enumerator '{}'",
+                        decl.name, enumerator.identifier
+                    ),
+                    decl.name_span,
+                ));
+            }
             if let Some(expr) =
                 parser::enum_member_const_expr_from_lookup(&lookup_decl, &enumerator.identifier)
             {
@@ -2261,9 +2495,7 @@ pub mod {mod} {{
                     )
                 };
                 let calculated = expr.calculate().map_err(|e| diag(e.message))?;
-                // Only integral kinds (bool included, per AOSP
-                // `AreCompatibleOperandTypes`) may become a discriminant;
-                // `to_i64` alone would lossily accept float/char.
+                // Integral only (bool too, AOSP `AreCompatibleOperandTypes`); `to_i64` takes float.
                 let value = match &calculated.value {
                     ValueType::Byte(_)
                     | ValueType::Int32(_)
@@ -2278,7 +2510,7 @@ pub mod {mod} {{
                         )))
                     }
                 };
-                // An out-of-range literal would only fail in the generated crate; reject it here as AOSP does.
+                // As AOSP: reject out-of-range here, not in the generated crate.
                 let (min, max, backing) = match generator.value_type {
                     ValueType::Byte(_) => (i8::MIN as i64, i8::MAX as i64, "byte"),
                     ValueType::Int32(_) => (i32::MIN as i64, i32::MAX as i64, "int"),
@@ -2297,8 +2529,7 @@ pub mod {mod} {{
             }
         }
 
-        // The enum *name* is `r#`-escaped in the template; escape the module
-        // name (which is not) for a Rust-keyword enum name.
+        // The template `r#`-escapes the enum name but not the module name.
         let rendered = render_enum(&EnumRender {
             crate_name: self.get_crate_name().to_string(),
             module: crate::escape_rust_keyword(&decl.name).into_owned(),
@@ -2329,10 +2560,7 @@ pub mod {mod} {{
             ));
         }
 
-        // Scoped, not local: a nested declaration inherits `@VintfStability`
-        // from its enclosing type (AOSP `GetScopedAnnotation`). The
-        // declaration's own annotation is read directly so the answer never
-        // depends on the declaration map being populated.
+        // AOSP `GetScopedAnnotation`: nested types inherit it; own annotation needs no decl map.
         let is_vintf = parser::has_annotation(
             &decl.annotation_list,
             parser::AnnotationType::VintfStability,
@@ -2342,9 +2570,22 @@ pub mod {mod} {{
         let is_fixed_size =
             parser::has_annotation(&decl.annotation_list, parser::AnnotationType::FixedSize);
 
+        // A generic union has no Rust form (E0392 without a phantom variant); AOSP's fails too.
+        if let Some(param) = decl.type_params.first() {
+            return Err(Self::decl_error(
+                format!(
+                    "union '{}' is generic: a union cannot take type parameters in the Rust \
+                     backend",
+                    decl.name
+                ),
+                param.name_span,
+            ));
+        }
+
         let mut constant_members = Vec::new();
         let mut members = Vec::new();
         let mut declarations = Vec::new();
+        let mut constant_names = std::collections::HashSet::new();
 
         for member in &decl.members {
             if let parser::Declaration::Variable(var) = member {
@@ -2353,12 +2594,20 @@ pub mod {mod} {{
                 generator.ensure_sized()?;
                 Self::ensure_declarable(&generator, &decl.name, &var.identifier)?;
                 if var.constant {
+                    // Fields go through `seen_variants`; two same-named `pub const` are E0428.
+                    if !constant_names.insert(var.identifier.as_str()) {
+                        return Err(Self::decl_error(
+                            format!(
+                                "union '{}' has a duplicate constant name '{}'",
+                                decl.name, var.identifier
+                            ),
+                            generator.type_span(),
+                        ));
+                    }
                     Self::ensure_constant_type(&generator, &decl.name, &var.identifier)?;
                 }
                 if !var.constant {
-                    // AOSP `AidlUnionDecl::CheckValid`: a union member cannot be
-                    // a `ParcelableHolder` (b/170807936). Only fields are
-                    // restricted; a `const` never has a holder type anyway.
+                    // AOSP `AidlUnionDecl::CheckValid`: no `ParcelableHolder` field (b/170807936).
                     if generator.is_parcelable_holder() {
                         return Err(Self::decl_error(
                             format!(
@@ -2391,9 +2640,7 @@ pub mod {mod} {{
                         deprecated_attr(var.deprecated.as_ref()),
                     ));
                 } else {
-                    // Honor an explicit `= EnumType.VARIANT` default; the union's
-                    // `Default` impl uses members[0] (AOSP-faithful), so only the
-                    // first member's default expression is emitted.
+                    // `Default` uses members[0] (as AOSP), so only its default expr is emitted.
                     let default_expr = if !members.is_empty() {
                         String::new()
                     } else if var.const_expr.is_some() {
@@ -2412,8 +2659,7 @@ pub mod {mod} {{
                         generator.type_declaration(true),
                         var.identifier(),
                         default_expr,
-                        // needs_unexpected_null: see
-                        // `TypeGenerator::is_option_but_not_nullable` rustdoc.
+                        // needs_unexpected_null: see `is_option_but_not_nullable`.
                         generator.is_option_but_not_nullable(),
                         deprecated_attr(var.deprecated.as_ref()),
                     ));
@@ -2423,10 +2669,7 @@ pub mod {mod} {{
             }
         }
 
-        // AOSP `AidlUnionDecl::CheckValid` (`aidl_language.cpp`): a union needs
-        // at least one field. `const`-only members do not count — the rendered
-        // enum would be uninhabited, so its `Default` impl has nothing to
-        // return and the `write_to_parcel` match has no arm behind `&Self`.
+        // AOSP `AidlUnionDecl::CheckValid`: consts don't count; an empty enum has no `Default`.
         if members.is_empty() {
             return Err(Self::decl_error(
                 format!("the union '{}' has no fields", decl.name),
@@ -2437,6 +2680,19 @@ pub mod {mod} {{
         let mut seen_variants: std::collections::HashMap<&str, &str> =
             std::collections::HashMap::new();
         for (variant, _, field, _, _, _) in &members {
+            // UpperCamel makes `SELF`/`self_` into `Self` and `_1` into `1`; `r#` rescues neither.
+            let usable = variant.chars().next().is_some_and(|c| !c.is_ascii_digit())
+                && variant.as_str() != "Self";
+            if !usable {
+                return Err(Self::decl_error(
+                    format!(
+                        "union '{}': field '{field}' maps to the Rust variant '{variant}', which is \
+                         not a valid identifier; rename it",
+                        decl.name
+                    ),
+                    decl.name_span,
+                ));
+            }
             if let Some(previous) = seen_variants.insert(variant, field) {
                 return Err(Self::decl_error(
                     format!(
@@ -2449,14 +2705,14 @@ pub mod {mod} {{
             }
         }
 
+        Self::ensure_nested_names(Some(&decl.name), &declarations)?;
         let nested = &self.declarations(&declarations, indent + 1)?;
-        let namespace = parser::get_descriptor_from_annotation_list(&decl.annotation_list)
+        let namespace = parser::get_descriptor_from_annotation_list(&decl.annotation_list)?
             .unwrap_or_else(|| decl.namespace.to_string(Namespace::AIDL));
 
         let mut context = self.new_context();
 
-        // The union *name* is `r#`-escaped in the template; escape the module
-        // name (which is not) for a Rust-keyword union name.
+        // The template `r#`-escapes the union name but not the module name.
         context.insert("mod", &crate::escape_rust_keyword(&decl.name));
         context.insert("union_name", &decl.name);
         context.insert("derive", &parser::rust_derive_list(&decl.annotation_list));
@@ -2519,5 +2775,92 @@ mod tests {
             },
             other => panic!("Expected Semantic error, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn binder_impl_forwards_version_and_hash() {
+        let source = "package t; interface IFoo { void m(); }";
+        for (enabled_async, call) in [(false, "self.0.r#"), (true, "self.0.as_sync().r#")] {
+            let ctx = crate::SourceContext::new("t.aidl", source);
+            let doc = crate::parse_document(&ctx).expect("parse");
+            let out = Generator::new(enabled_async, false)
+                .with_version_meta(Some(3), Some("h".into()))
+                .document(&doc)
+                .expect("generate")
+                .1;
+            let start = out
+                .find("impl IFoo for rsbinder::Binder<BnFoo>")
+                .expect("Binder impl");
+            let block = &out[start..start + out[start..].find("\n    }\n").expect("impl end")];
+            assert!(
+                block.contains(&format!("{call}getInterfaceVersion()")),
+                "{block}"
+            );
+            assert!(
+                block.contains(&format!("{call}getInterfaceHash()")),
+                "{block}"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_trait_item_names_are_rejected_for_any_signature() {
+        let generate = |source: &str, version: Option<i32>, hash: Option<String>| {
+            let ctx = crate::SourceContext::new("t.aidl", source);
+            let doc = crate::parse_document(&ctx).expect("parse");
+            Generator::new(false, false)
+                .with_version_meta(version, hash)
+                .document(&doc)
+        };
+        for source in [
+            "package t; interface IFoo { String descriptor(); }",
+            "package t; interface IFoo { void getDefaultImpl(int x); }",
+            "package t; interface IFoo { void setDefaultImpl(); }",
+            "package t; interface IFoo { void dump(); }",
+            "package t; interface IFoo { void as_binder(int x); }",
+        ] {
+            assert!(generate(source, None, None).is_err(), "{source}");
+        }
+        let version = "package t; interface IFoo { int getInterfaceVersion(int x); }";
+        let hash = "package t; interface IFoo { String getInterfaceHash(int x); }";
+        assert!(generate(version, Some(1), None).is_err());
+        assert!(generate(hash, None, Some("h".into())).is_err());
+        // Without the meta method there is no generated item to collide with (AOSP signature rule).
+        assert!(generate(version, None, None).is_ok());
+        assert!(generate(hash, None, None).is_ok());
+    }
+
+    /// AOSP `AidlInterface::Version`: `@VersionSupport` versions the interface without `--version`.
+    #[test]
+    fn version_support_annotation_emits_version_meta() {
+        let generate = |source: &str, version: Option<i32>| {
+            let ctx = crate::SourceContext::new("t.aidl", source);
+            let doc = crate::parse_document(&ctx).expect("parse");
+            Generator::new(false, false)
+                .with_version_meta(version, None)
+                .document(&doc)
+                .map(|(_, rust)| rust)
+        };
+        let annotated = "package t; @VersionSupport(version = 3) interface IFoo { void m(); }";
+        for cli in [None, Some(3)] {
+            let out = generate(annotated, cli).expect("generate");
+            assert!(out.contains("pub const VERSION: i32 = 3;"), "{out}");
+            assert!(out.contains("fn r#getInterfaceVersion(&self)"), "{out}");
+        }
+        // AOSP `VersionSpecificCheckValid`.
+        assert!(generate(annotated, Some(1)).is_err());
+        // The `{"version", kIntType, required}` schema.
+        for source in [
+            "package t; @VersionSupport interface IFoo {}",
+            "package t; @VersionSupport(ver = 1) interface IFoo {}",
+            "package t; @VersionSupport(version = \"1\") interface IFoo {}",
+        ] {
+            assert!(generate(source, None).is_err(), "{source}");
+        }
+        // AOSP emits the meta method whenever the annotation has a value, zero included.
+        let zero = "package t; @VersionSupport(version = 0) interface IFoo { void m(); }";
+        let out = generate(zero, None).expect("generate");
+        assert!(out.contains("pub const VERSION: i32 = 0;"), "{out}");
+        assert!(out.contains("fn r#getInterfaceVersion(&self)"), "{out}");
     }
 }

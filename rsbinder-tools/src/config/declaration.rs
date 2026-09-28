@@ -13,8 +13,8 @@
 
 use std::collections::BTreeMap;
 
-/// An AIDL instance name, split the way AOSP's `NameUtil.h` splits it:
-/// `pack.age.IFoo/instance`.
+/// An AIDL instance name, `pack.age.IFoo/instance`, split at the first `/`,
+/// as `ServiceManager.cpp` `AidlName::fill` does.
 ///
 /// The split is what `getDeclaredInstances` needs — it is asked for an
 /// interface and answers with the instance halves.
@@ -27,23 +27,49 @@ pub struct InstanceName {
 }
 
 impl InstanceName {
-    /// Split `pack.age.IFoo/instance`.
+    /// Split `pack.age.IFoo/instance` at the first `/`.
     ///
-    /// A name with no `/` is an interface with the implicit instance
-    /// `"default"`, matching how AOSP's `IServiceManager` treats a bare
-    /// interface name.
-    pub fn parse(name: &str) -> InstanceName {
-        match name.split_once('/') {
-            Some((interface, instance)) => InstanceName {
-                interface: interface.to_owned(),
-                instance: instance.to_owned(),
-            },
-            None => InstanceName {
-                interface: name.to_owned(),
-                instance: "default".to_owned(),
-            },
+    /// `None` when there is no `/`, or when either half is empty. AOSP's
+    /// `AidlName::fill` likewise refuses a name without the `/`.
+    pub fn parse(name: &str) -> Option<InstanceName> {
+        let (interface, instance) = name.split_once('/')?;
+        if interface.is_empty() || instance.is_empty() {
+            return None;
         }
+        Some(InstanceName {
+            interface: interface.to_owned(),
+            instance: instance.to_owned(),
+        })
     }
+}
+
+/// Is `name` one `rsb_hub` accepts in `addService`: 1 to 127 bytes of
+/// `[A-Za-z0-9._/-]`.
+///
+/// A declaration is held to the same rule, so a name no service could ever
+/// register is refused when the configuration loads rather than leaving a
+/// declared-but-unregistrable instance for clients to wait on.
+pub fn is_valid_service_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 127 {
+        return false;
+    }
+    for c in name.chars() {
+        if c == '_' || c == '-' || c == '.' || c == '/' {
+            continue;
+        }
+        if c.is_ascii_lowercase() {
+            continue;
+        }
+        if c.is_ascii_uppercase() {
+            continue;
+        }
+        if c.is_ascii_digit() {
+            continue;
+        }
+        return false;
+    }
+
+    true
 }
 
 /// How to bring a declared service up on demand.
@@ -88,11 +114,11 @@ pub struct Declarations {
 }
 
 impl Declarations {
-    /// Build from an iterator of `(full name, declaration)`.
+    /// Add `declaration` under `full_name`, replacing any declaration already
+    /// there, and return the replaced one.
     ///
-    /// A repeated name is an error rather than a last-one-wins: two files
-    /// declaring the same instance differently is ambiguity in a file that
-    /// decides what runs.
+    /// No duplicate check happens here; [`load`](super::load) is what refuses
+    /// an instance declared twice.
     pub fn insert(&mut self, full_name: String, declaration: Declaration) -> Option<Declaration> {
         self.by_name.insert(full_name, declaration)
     }
@@ -142,7 +168,7 @@ mod tests {
         (
             name.to_owned(),
             Declaration {
-                name: InstanceName::parse(name),
+                name: InstanceName::parse(name).unwrap(),
                 activation: None,
                 connection: None,
             },
@@ -151,23 +177,23 @@ mod tests {
 
     #[test]
     fn instance_names_split_on_the_slash() {
-        let n = InstanceName::parse("com.example.IFoo/default");
+        let n = InstanceName::parse("com.example.IFoo/default").unwrap();
         assert_eq!(n.interface, "com.example.IFoo");
         assert_eq!(n.instance, "default");
     }
 
-    /// A bare interface name means its `default` instance, as AOSP treats it.
+    /// An implicit instance would make `getDeclaredInstances` disagree with `isDeclared`.
     #[test]
-    fn a_bare_name_is_the_default_instance() {
-        let n = InstanceName::parse("com.example.IFoo");
-        assert_eq!(n.interface, "com.example.IFoo");
-        assert_eq!(n.instance, "default");
+    fn a_name_without_both_halves_is_refused() {
+        for name in ["com.example.IFoo", "com.example.IFoo/", "/default", "/"] {
+            assert_eq!(InstanceName::parse(name), None, "{name:?}");
+        }
     }
 
     /// Only the first `/` splits — an instance may contain one.
     #[test]
     fn only_the_first_slash_splits() {
-        let n = InstanceName::parse("com.example.IFoo/a/b");
+        let n = InstanceName::parse("com.example.IFoo/a/b").unwrap();
         assert_eq!(n.interface, "com.example.IFoo");
         assert_eq!(n.instance, "a/b");
     }

@@ -27,27 +27,44 @@
 //!   Production `CacheEntry { weak: sync::Weak<ProxyHandle>, .. }`
 //!   cannot be loom-modeled directly, so the PoC's cache is
 //!   `RwLock<HashMap<u32, ()>>` — pin presence only, no Arc sharing.
-//!   The race that the cache-pin model closes (per-thread out-parcel
-//!   buffering, kernel BC_ACQUIRE seeing a freed slot) is captured
-//!   here only at the **kernel-state-invariant** level, not at the
-//!   per-thread out-parcel buffering level.
+//!   The model encodes the pin ordering; it does not exercise a
+//!   pin-release race (per-thread out-parcel buffering, kernel
+//!   BC_ACQUIRE seeing a freed slot).
 //! - Production race detection lives in the **integration test
 //!   matrix** (`tests/src/test_client.rs::test_cache_pin_race_*`)
 //!   running 100 iterations × sync+async on real binderfs in CI.
 //!   Loom passing here is a *complementary* signal, not a substitute.
 //!
-//! ### Invariants this PoC's exhaustive interleaving DOES validate
+//! ### Invariants this PoC checks
 //!
-//! - **I1 (cache contains h ⟹ binder_ref(h).weak ≥ 1)** — under
-//!   exhaustive interleaving of N=2 worker threads doing
-//!   lookup/drop loops, the mock kernel never sees `BC_ACQUIRE`
-//!   against a freed slot (`(0, 0)` state) when the cache has a pin
-//!   record for `h`.
+//! - **I1 (cache contains h ⟹ binder_ref(h).weak ≥ 1)** — holds by
+//!   construction in this model, not by interleaving: `BC_INCREFS` and
+//!   the pin insert run under one write lock, and no path removes a pin
+//!   (`bc_decrefs` is unused; the production releases — the obituary
+//!   path and `undo_case_a_pin` — are not modeled). The `saw_acquire_to_freed_slot`
+//!   check is therefore 0 on every interleaving and would stay 0 even
+//!   if a pin-release race existed in production.
 //! - **No double-pin** — case (b) (cache present) reuses the pin and
 //!   does not issue a second `BC_INCREFS` for the same handle.
 //! - **Paired `BC_ACQUIRE` / `BC_RELEASE`** — every
 //!   `Arc<MockProxyHandle>` allocation Drops exactly once, and
 //!   Drop's `BC_RELEASE` always lands on a live slot.
+//!
+//! ### Run-end assertions
+//!
+//! `cache_pin_holds_under_concurrent_lookup_and_drop` runs two worker
+//! threads that each do one lookup-then-drop. Even with one operation per
+//! thread the state space is large, because each `loom::sync::*` operation
+//! is a preemption point. At the end of each interleaving it asserts:
+//!
+//! 1. The kernel never saw `BC_ACQUIRE` against a freed slot
+//!    (`saw_acquire_to_freed_slot == 0`): **I1**.
+//! 2. `bc_increfs_count == 1`: the pin is issued once across the run. Case
+//!    (a) fires for the first thread only; the second finds the pin either
+//!    on the read-lock fast path or on the write-lock double-check.
+//! 3. `bc_acquire_count == bc_release_count`: paired.
+//! 4. Final kernel state `(strong = 0, weak = 1)`: the cache pin is still
+//!    held; there is no obituary in this model.
 //!
 //! ### Why N=2 worker threads
 //!
@@ -81,8 +98,7 @@
 //! Path-A integration would swap rsbinder's own sync primitives
 //! (process_state.rs cache RwLock, thread_state.rs THREAD_STATE
 //! thread-local, etc.) via cfg(loom) and add a `KernelCommander`
-//! trait abstraction over the ioctl path. That refactor is a
-//! separate follow-up tracked outside this PR.
+//! trait abstraction over the ioctl path. That refactor is not done.
 
 #![cfg(loom)]
 
@@ -90,11 +106,7 @@ use loom::sync::atomic::{AtomicU32, Ordering};
 use loom::sync::{Arc, Mutex, RwLock};
 use std::collections::HashMap;
 
-/// Mock kernel `binder_ref` state. Maps handle → (strong, weak).
-/// Entries lazily created on first BC_INCREFS / BC_ACQUIRE. A handle
-/// whose entry has `(strong, weak) == (0, 0)` is considered freed and
-/// any subsequent BC_INCREFS / BC_ACQUIRE returns `Err(DeadObject)` —
-/// matching Linux binder driver behavior.
+/// Mock `binder_ref` table (handle → (strong, weak)); `bc_acquire` on `(0, 0)` is a freed slot.
 #[derive(Default)]
 struct MockKernel {
     refs: Mutex<HashMap<u32, (u32, u32)>>,
@@ -102,8 +114,7 @@ struct MockKernel {
     bc_release_count: AtomicU32,
     bc_increfs_count: AtomicU32,
     bc_decrefs_count: AtomicU32,
-    /// Set if any `bc_acquire` fails with DeadObject during the run.
-    /// I1 violation triggers this.
+    /// Count of `bc_acquire` calls that hit a freed slot (an I1 violation).
     saw_acquire_to_freed_slot: AtomicU32,
 }
 
@@ -165,9 +176,7 @@ impl MockKernel {
     }
 }
 
-/// Mock `ProxyHandle`. Drop sends BC_RELEASE just like the production
-/// type. `Arc<MockProxyHandle>` is created per lookup (this PoC does
-/// not test Arc-identity sharing — see file-level docstring).
+/// Mock `ProxyHandle`: drop sends `BC_RELEASE`; one `Arc` per lookup (no identity sharing).
 struct MockProxyHandle {
     handle: u32,
     kernel: Arc<MockKernel>,
@@ -175,23 +184,15 @@ struct MockProxyHandle {
 
 impl Drop for MockProxyHandle {
     fn drop(&mut self) {
-        // Cache pin keeps weak ≥ 1, so this BC_RELEASE always finds
-        // the slot alive. Verified by the assertion at the end of the
-        // loom model.
+        // Cache pin keeps weak ≥ 1, so the slot is alive (asserted at the end of the model).
         let _ = self.kernel.bc_release(self.handle);
     }
 }
 
-/// Mock cache: just records which handles have an active pin. Real
-/// production cache stores `sync::Weak<ProxyHandle>` for Arc identity
-/// sharing — this PoC's simplified cache is sufficient to verify
-/// kernel-side I1 (the actual race the cache-pin model closes).
+/// Pin presence only; encodes the pin ordering, not a pin-release race (module doc, I1).
 type Cache = RwLock<HashMap<u32, ()>>;
 
-/// Mock `ProcessState::strong_proxy_for_handle_stability` simplified
-/// to the kernel-side ordering: case (a) issues `BC_INCREFS` then
-/// `BC_ACQUIRE`; case (b) reuses the pin and only issues
-/// `BC_ACQUIRE`. Returns a fresh `Arc<MockProxyHandle>` per call.
+/// `strong_proxy_for_handle_stability` order: (a) `BC_INCREFS` + `BC_ACQUIRE`, (b) `BC_ACQUIRE`.
 fn strong_proxy_for_handle(
     cache: &Cache,
     kernel: &Arc<MockKernel>,
@@ -204,8 +205,7 @@ fn strong_proxy_for_handle(
     };
 
     if !pin_already_held {
-        // Slow path: acquire write lock, double-check, then issue
-        // BC_INCREFS pin.
+        // Slow path: write lock, double-check, then issue the BC_INCREFS pin.
         let mut write = cache.write().unwrap();
         if let std::collections::hash_map::Entry::Vacant(slot) = write.entry(handle) {
             kernel.bc_increfs(handle)?;
@@ -213,10 +213,7 @@ fn strong_proxy_for_handle(
         }
     }
 
-    // Issue BC_ACQUIRE. The cache pin (issued above or by an earlier
-    // caller) keeps `binder_ref(handle).weak >= 1`, so this BC_ACQUIRE
-    // must succeed. If it ever returns DeadObject, the cache-pin
-    // invariant is broken — `MockKernel::bc_acquire` records that.
+    // The pin keeps weak >= 1; a DeadObject here breaks I1 (`MockKernel::bc_acquire` records it).
     kernel.bc_acquire(handle)?;
 
     Ok(Arc::new(MockProxyHandle {
@@ -225,21 +222,7 @@ fn strong_proxy_for_handle(
     }))
 }
 
-/// Loom model: 2 worker threads each do one lookup-then-drop. Even
-/// with K=1 per thread the state space is large because each
-/// `loom::sync::*` operation is a preemption point.
-///
-/// Invariants checked at run end:
-///
-/// 1. Kernel never observed `BC_ACQUIRE` against a freed slot
-///    (counter `saw_acquire_to_freed_slot == 0`). This is **I1**.
-/// 2. `bc_increfs_count == 1` — pin issued exactly once across the
-///    run (case (a) only fires for the first thread; the second
-///    hits case (b) — fast path — even if it doesn't see the cache
-///    insert until it acquires the read lock again).
-/// 3. `bc_acquire_count == bc_release_count` — paired.
-/// 4. Final kernel state `(strong = 0, weak = 1)` — cache pin still
-///    held; no obituary in this model.
+/// Two threads each look up then drop; see module doc "Run-end assertions".
 #[test]
 fn cache_pin_holds_under_concurrent_lookup_and_drop() {
     const HANDLE: u32 = 42;
@@ -267,8 +250,7 @@ fn cache_pin_holds_under_concurrent_lookup_and_drop() {
         t1.join().unwrap();
         t2.join().unwrap();
 
-        // Settled-state assertions: every thread has joined, all BC_*
-        // commands have committed.
+        // Settled state: every thread joined, every BC_* committed.
         assert_eq!(
             kernel.saw_acquire_to_freed_slot.load(Ordering::Relaxed),
             0,
@@ -308,11 +290,7 @@ fn cache_pin_holds_under_concurrent_lookup_and_drop() {
     });
 }
 
-/// Sequential variant: T1 establishes the cache entry and drops, then
-/// T2 enters with the cache pin already held but no live Arc — this
-/// exercises the case (b)-equivalent path (pin held, BC_ACQUIRE only).
-/// Smaller state space than the fully-concurrent test above, but
-/// directly targets case (b).
+/// T1 pins and drops, then T2 takes case (b) with no live `Arc`: pin held, `BC_ACQUIRE` only.
 #[test]
 fn case_b_path_reuses_existing_pin() {
     const HANDLE: u32 = 7;
@@ -331,9 +309,7 @@ fn case_b_path_reuses_existing_pin() {
         assert_eq!(s_mid, 0, "post-drop strong must be 0");
         assert_eq!(w_mid, 1, "pin keeps weak == 1 across lookup-then-drop");
 
-        // T2 enters: cache contains pin, so no new BC_INCREFS, just
-        // BC_ACQUIRE. The pin keeps the slot alive so BC_ACQUIRE must
-        // succeed.
+        // T2: pin cached, so BC_ACQUIRE only; the pin keeps the slot alive for it.
         let kernel_t2 = Arc::clone(&kernel);
         let cache_t2 = Arc::clone(&cache);
         let t2 = loom::thread::spawn(move || {

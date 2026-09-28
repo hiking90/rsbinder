@@ -1,0 +1,11 @@
+error: `.aidl` has one `@nullable`, so an `Option` directly inside another has no form; drop one
+  --> tests/ui/nested_option.rs:10:43
+   |
+10 |     fn f(&self) -> rsbinder::BinderResult<Option<Option<Cfg>>>;
+   |                                           ^^^^^^^^^^^^^^^^^^^
+
+error: `.aidl` has one `@nullable`, so an `Option` directly inside another has no form; drop one
+  --> tests/ui/nested_option.rs:15:12
+   |
+15 |     pub c: Option<Option<String>>,
+   |            ^^^^^^^^^^^^^^^^^^^^^^

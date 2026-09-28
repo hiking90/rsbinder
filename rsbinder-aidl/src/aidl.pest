@@ -33,9 +33,7 @@ interface_decl = {
     ONEWAY* ~ INTERFACE ~ qualified_name ~ "{" ~ interface_members? ~ "}"
 }
 
-// Iterative like `parcelable_members`; a per-member recursive rule would
-// overflow the stack on interfaces with a few thousand methods, bypassing
-// the bracket-based `check_nesting_depth` guard.
+// Iterative: per-member recursion overflows on 1000s of methods, unseen by `check_nesting_depth`.
 interface_members = { (method_decl | constant_decl | decl)+ }
 
 constant_decl = {
@@ -73,14 +71,13 @@ type = {
 type_args = { type ~ ("," ~ type)* }
 
 method_decl = {
-    annotation_list* ~ ONEWAY? ~ type ~ identifier ~ "(" ~ arg_list* ~ ")" ~ ";" |
-    annotation_list* ~ ONEWAY? ~ type ~ identifier ~ "(" ~ arg_list* ~ ")" ~ "=" ~ INTVALUE ~ ";"
+    annotation_list* ~ ONEWAY? ~ type ~ identifier ~ "(" ~ arg_list? ~ ")" ~ ";" |
+    annotation_list* ~ ONEWAY? ~ type ~ identifier ~ "(" ~ arg_list? ~ ")" ~ "=" ~ INTVALUE ~ ";"
 }
 
 direction = @{ (INOUT | IN | OUT) ~ &WHITESPACE }
 
-// A single direction, as in AOSP `aidl_language_y.yy`
-// (`direction: IN | OUT | INOUT | empty`).
+// A single direction, as AOSP `aidl_language_y.yy` (`direction: IN | OUT | INOUT | empty`).
 arg = {
     direction? ~ type ~ identifier
 }
@@ -103,7 +100,10 @@ enum_decl = { ENUM ~ qualified_name ~ enum_decl_body }
 
 union_decl = { UNION ~ qualified_name ~ optional_type_params ~ "{" ~ parcelable_members* ~ "}" }
 
-optional_type_params = { ("<" ~ identifier ~ ("," ~ identifier)* ~ ">")? }
+// AOSP `type_parameter` may be annotated, as in `MQDescriptor<@FixedSize T, Flavor>`.
+type_param = { annotation_list* ~ identifier }
+
+optional_type_params = { ("<" ~ type_param ~ ("," ~ type_param)* ~ ">")? }
 
 variable_decl = {
     type ~ identifier ~ "=" ~ const_expr ~ ";" |
@@ -125,7 +125,7 @@ parameter_list = { parameter ~ ("," ~ parameter)* }
 
 annotation = {
     ANNOTATION ~ "(" ~ const_expr ~ ")" |
-    ANNOTATION ~ "(" ~ parameter_list* ~ ")" |
+    ANNOTATION ~ "(" ~ parameter_list? ~ ")" |
     ANNOTATION
 }
 
@@ -140,10 +140,7 @@ const_expr = {
     CHARVALUE | expression
 }
 
-// Precedence matches AOSP's C-style yacc levels (aidl_language_y.yy):
-// || < && < | < ^ < & < (== !=) < (< > <= >=) < (<< >>) < (+ -) < (* / %).
-// Bitwise operators bind LOOSER than comparisons, so `a & M == M` folds to
-// the same constant as AOSP's aidl.
+// C precedence as AOSP aidl_language_y.yy: `a & M == M` is `a & (M == M)`, as in AOSP aidl.
 expression = { logical_or ~ (logical_or_op ~ logical_or)* }
 logical_or_op = { LOGICAL_OR }
 logical_or = { logical_and ~ (logical_and_op ~ logical_and)* }
@@ -168,9 +165,7 @@ factor = { "(" ~ expression ~ ")" | unary | value }
 unary = { unary_op ~ factor }
 unary_op = { "+" | "-" | "!" | "~" }
 
-// C_STR participates in the ordinary expression grammar (AOSP has a single
-// expression grammar): `A + "y"` and parenthesized concat chains parse here;
-// type mixing is rejected at const-expr evaluation, exactly as AOSP does.
+// One expression grammar for C_STR too, as AOSP; type mixing is rejected at evaluation.
 value = {
     TRUE_LITERAL | FALSE_LITERAL | HEXVALUE | FLOATVALUE | INTVALUE |
     C_STR | qualified_name
@@ -179,7 +174,7 @@ value = {
 ANNOTATION = @{ "@" ~ identifier }
 
 INTERFACE = _{ "interface" }
-ONEWAY = { "oneway" }
+ONEWAY = @{ "oneway" ~ !("_" | ASCII_ALPHANUMERIC) }
 CONST = _{ "const" }
 RSHIFT = { ">>" }
 LSHIFT = { "<<" }
@@ -193,32 +188,21 @@ NDK_HEADER = { "ndk_header" }
 RUST_TYPE = { "rust_type" }
 PARCELABLE = _{ "parcelable" }
 IDENTIFIER = @{ ("_" | ASCII_ALPHA)+ ~ ("_" | ASCII_ALPHA | ASCII_DIGIT)* }
-TRUE_LITERAL = { "true" }
-FALSE_LITERAL = { "false" }
-// CHARVALUE = @{ !"\n" ~ ANY }
-// CHARVALUE = @{ "'" ~ (!("'" | "\n") ~ ANY) ~ "'" }
+TRUE_LITERAL = @{ "true" ~ !("_" | ASCII_ALPHANUMERIC) }
+FALSE_LITERAL = @{ "false" ~ !("_" | ASCII_ALPHANUMERIC) }
 CHARVALUE = @{ "'" ~ ("\\" ~ ANY | !"'" ~ ANY) ~ "'" }
 INT_SUFFIX = _{ "l" | "L" | "u8" | "u32" | "u64" }
-// Digits with optional `_` separators between digits (AOSP allows e.g.
-// `1_000_000`); the suffixes match AOSP's u8/u32/u64/l/L set.
+// `_` between digits (AOSP `1_000_000`); suffixes are AOSP's u8/u32/u64/l/L.
 INTVALUE = @{ ASCII_DIGIT ~ ("_"? ~ ASCII_DIGIT)* ~ INT_SUFFIX? }
 HEXVALUE = @{ "0" ~ ("x" | "X") ~ ASCII_HEX_DIGIT ~ ("_"? ~ ASCII_HEX_DIGIT)* ~ INT_SUFFIX? }
-// A PEG cannot backtrack a leading `ASCII_DIGIT*`, so each float shape is
-// spelled out with a fixed trailing requirement (a dot, an exponent, or an
-// `f`) — covering `5f` / `10f` / `1e10` — while a bare integer still falls
-// through to INTVALUE.
+// No PEG backtracking: each shape needs `.`, exponent or `f`, so a bare int falls to INTVALUE.
 FLOATVALUE = @{
     (ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ ~ (("e" | "E") ~ ("-" | "+")? ~ ASCII_DIGIT+)? ~ "f"?)
   | ("." ~ ASCII_DIGIT+ ~ (("e" | "E") ~ ("-" | "+")? ~ ASCII_DIGIT+)? ~ "f"?)
   | (ASCII_DIGIT+ ~ ("e" | "E") ~ ("-" | "+")? ~ ASCII_DIGIT+ ~ "f"?)
   | (ASCII_DIGIT+ ~ "f")
 }
-// HEXVALUE = @{ hex_value ~ int_suffix? }
-// hex_value = @{ "0" ~ ("x" | "X") ~ (ASCII_DIGIT | 'a'..'f' | 'A'..'F')+ }
-// Try the `\X` escape alternative first so an escaped quote `\"` is consumed
-// as one unit instead of the bare `\` being eaten and the following `"`
-// terminating the string early. (String-constant backslashes are rejected in
-// `parse_string_term`, but a clean tokenization yields a clear diagnostic.)
+// `\X` first so `\"` does not end the string; `parse_c_str` then rejects the backslash.
 C_STR = @{ "\"" ~ ( "\\" ~ ANY | !("\"") ~ ANY)* ~ "\"" }
 
 LOGICAL_OR = { "||" }
@@ -231,8 +215,7 @@ LT = @{ !"<<" ~ "<" }
 GT = @{ !">>" ~ ">" }
 
 LONG_COMMENT = _{ "/*" ~ (!"*/" ~ ANY)* ~ "*/" }
-// A `//` comment may be terminated by end-of-input as well as a newline —
-// a file whose last line is a comment without a trailing newline is valid.
+// EOI also ends a `//` comment: a file may end in a comment without a trailing newline.
 LINE_COMMENT = _{ "//" ~ (!"\n" ~ ANY)* ~ ("\n" | EOI) }
 COMMENT = _{ LONG_COMMENT | LINE_COMMENT }
 WHITESPACE = _{ (" " | "\t" | "\r" | "\n")+ }

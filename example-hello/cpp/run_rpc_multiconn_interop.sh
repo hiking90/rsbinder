@@ -93,17 +93,20 @@ done
 [ -n "$CXX" ] || { echo "no NDK clang++ for $TRIPLE at API <= $sdk under $NDK" >&2; exit 2; }
 echo "==> target $TRIPLE, API $API (device SDK $sdk)"
 
-echo "==> verifying device $DEVICE is Android 16"
-[[ "$sdk" == "36" ]] || { echo "device $DEVICE is SDK $sdk, expected 36"; exit 1; }
+# Android 17 (SDK 37) speaks the android-16 RPC wire byte for byte.
+echo "==> verifying device $DEVICE is Android 16 or later"
+[[ "$sdk" -ge 36 ]] || { echo "device $DEVICE is SDK $sdk, expected >= 36"; exit 1; }
 
 echo "==> pulling libbinder_*.so so we can link against them"
-adb -s "$DEVICE" pull /system/lib64/libbinder_ndk.so /tmp/libbinder_ndk.so >/dev/null
-adb -s "$DEVICE" pull /system/lib64/libbinder_rpc_unstable.so /tmp/libbinder_rpc_unstable.so >/dev/null
+SYS="$REPO_ROOT/target/rpc_multiconn_interop/sys"
+mkdir -p "$SYS"
+adb -s "$DEVICE" pull /system/lib64/libbinder_ndk.so "$SYS/libbinder_ndk.so" >/dev/null
+adb -s "$DEVICE" pull /system/lib64/libbinder_rpc_unstable.so "$SYS/libbinder_rpc_unstable.so" >/dev/null
 
 echo "==> building C++ launcher (NDK)"
 "$CXX" \
     -O2 -Wall -std=c++17 -static-libstdc++ \
-    -L /tmp \
+    -L "$SYS" \
     -lbinder_ndk -lbinder_rpc_unstable -llog \
     "$CPP_DIR/rpc_multiconn_interop_launcher.cpp" \
     -o "$CPP_DIR/rpc_multiconn_interop_launcher"

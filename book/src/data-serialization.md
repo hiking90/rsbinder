@@ -15,13 +15,12 @@ std::fs::write("settings.bin", &bytes)?;
 let settings: Settings = rsbinder::from_bytes(&std::fs::read("settings.bin")?)?;
 ```
 
-Both need the `rpc` feature — not because anything here talks to a socket,
-but because the encoder runs in the same session-less parcel mode the RPC
-transport uses, and that mode is what refuses binders and file descriptors.
-The `#[derive(rsbinder::Parcelable)]` below additionally needs `macros`
-(`rpc` does not imply it, and neither is on by default); a type generated
-from `.aidl` does not, since the generator emits the `Parcelable` impl
-directly.
+Neither needs a feature. The encoder runs in the same session-less parcel
+mode the RPC transport uses, and the absence of a session is what refuses
+binders and file descriptors — so storage costs nothing to a build that
+only speaks kernel binder. The `#[derive(rsbinder::Parcelable)]` below does
+need `macros`, which is not on by default; a type generated from `.aidl`
+does not, since the generator emits the `Parcelable` impl directly.
 
 Everything on this page is demonstrated end to end, against real `.aidl`
 definitions, by
@@ -29,7 +28,7 @@ definitions, by
 — it needs no binder device, no service manager and no socket:
 
 ```bash
-$ cargo run -p example-hello --features rpc --bin serde_demo
+$ cargo run -p example-hello --bin serde_demo
 ```
 
 ## What you can store

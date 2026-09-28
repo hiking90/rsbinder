@@ -72,22 +72,66 @@ use crate::binder::{DeathRecipient, FromIBinder, Interface, SIBinder, Strong, WI
 /// `Rewrap` is transport-agnostic: the remote may be an RPC proxy or a
 /// kernel one.
 ///
+/// # Implementation notes
+///
+/// - `wrap` mints outside the table lock: `make_local` is user code,
+///   `link_to_death` reaches the driver or the RPC session, and a re-entrant
+///   `wrap` from inside `make_local` would deadlock on the non-reentrant
+///   `std::sync::Mutex`. Unlinks likewise run after the lock is dropped.
+/// - The death link is best effort: a local binder has no death to report
+///   (`InvalidOperation`), and a proxy whose peer is already gone returns
+///   `DeadObject`. Either way a later sweep (the next `wrap` miss, or
+///   `purge_dead`) collects the entry once either half is gone; a call's own
+///   sweep runs before its entry is inserted.
+/// - When two threads race to the same remote, the wrapper already in the
+///   table wins, since it may already be upstream — unless it fails to cast
+///   to `I`, in which case the new one displaces it and the displaced entry
+///   is unlinked with the swept ones.
+/// - The table is swept on the `wrap` miss path only: minting a binder and a
+///   death link costs far more than scanning the table, and the sweep bounds
+///   the table without a timer.
+/// - The death callback evicts an entry only if its remote is the binder that
+///   died, since the key may have been re-used. Liveness cannot stand in for
+///   identity: both obituary drivers hold a strong reference to the remote
+///   across the callback. The callback does not unlink; the link dies with
+///   the reporting proxy.
+/// - Dropping the table unlinks every entry. Otherwise each proxy keeps a
+///   dead `Weak` in its recipient list, which on the kernel arm blocks every
+///   later `BC_REQUEST`/`BC_CLEAR` transition.
+/// - An entry leaves the table outside `Drop` and the death callback only
+///   through `take_removed`, which returns every swept entry and whatever an
+///   insert displaced. Dropping an entry in place only makes it inert (a
+///   proxy's recipient list never shrinks on its own), so the caller unlinks
+///   each returned entry once it has dropped the table lock, since unlinking
+///   reaches into the proxy.
+/// - `unlink_all` finishes the list even when one entry's unlink panics.
+///   Nothing prunes a dead `Weak` from a proxy's recipient list, and
+///   `link_to_death` queues `BC_REQUEST_DEATH_NOTIFICATION` only while that
+///   list is empty, so one skipped unlink costs an unrelated later caller its
+///   death notification on that proxy. The panic is reachable without a bug
+///   here: `ProxyHandle::link_to_death` holds its `recipients` write guard
+///   across `talk_with_driver`, which panics if the driver under-consumes,
+///   and that poisons the guard so every later unlink on that proxy panics
+///   too. The first panic is re-raised once the list is finished, so a
+///   non-`Drop` caller still fails; `Drop` swallows it, since unwinding out of
+///   a drop during another unwind aborts.
+/// - There is no `Default`: the only argument-free factory is `|p| p`, which
+///   hands the remote straight back and is then refused at the transport
+///   boundary — a silently wrong table is worse than none.
+///
 /// [`purge_dead`]: Self::purge_dead
 pub struct Rewrap<I: FromIBinder + ?Sized> {
-    // `Box<dyn Fn>` rather than a fn pointer so a capturing closure is also
-    // accepted; `new` takes `impl Fn`, so `BnFoo::new_binder` passes as-is.
+    // `Box<dyn Fn>`, not a fn pointer, so a capturing closure is accepted too.
     #[allow(clippy::type_complexity)]
     make_local: Box<dyn Fn(Strong<I>) -> Strong<I> + Send + Sync>,
-    // `Arc`, not a plain field, so a `Reaper` can hold a `Weak` to just the
-    // map — keeping the death recipient free of `I` and out of any cycle.
+    // `Arc` so a `Reaper` can hold a `Weak` to just the map: free of `I`, out of any cycle.
     entries: Arc<Mutex<HashMap<usize, Entry>>>,
 }
 
 struct Entry {
     remote: WIBinder,
     local: WIBinder,
-    /// The death link holds only a weak reference to its recipient, so the
-    /// table has to own the `Arc` or the notification would never fire.
+    /// Owned here: the death link holds only a `Weak` to its recipient.
     reaper: Arc<Reaper>,
 }
 
@@ -97,9 +141,7 @@ impl Entry {
         Some((self.remote.upgrade().ok()?, self.local.upgrade().ok()?))
     }
 
-    /// Undo the death link: dropping the entry only makes it inert, and a
-    /// proxy's recipient list never shrinks on its own. Call with the table
-    /// lock released — this reaches into the proxy.
+    /// Undo the death link (dropping only makes the entry inert); call without the table lock.
     fn unlink(&self) {
         if let Ok(remote) = self.remote.upgrade() {
             let _ = remote.unlink_to_death_arc(&self.reaper);
@@ -107,12 +149,7 @@ impl Entry {
     }
 }
 
-/// The one place an entry leaves the table outside `Drop` and
-/// `Reaper::binder_died`: it takes every entry whose remote or wrapper is
-/// gone and, when `insert` is given, installs it — returning the swept
-/// entries *and* whatever the insert displaced. Dropping an `Entry` in place
-/// only makes it inert (`Entry::unlink`), so the caller must unlink every
-/// entry returned here, once it has dropped the table lock.
+/// Sweep dead entries and do `insert`; returns swept + displaced ones to unlink after unlocking.
 fn take_removed(entries: &mut HashMap<usize, Entry>, insert: Option<(usize, Entry)>) -> Vec<Entry> {
     let keys: Vec<usize> = entries
         .iter()
@@ -121,28 +158,13 @@ fn take_removed(entries: &mut HashMap<usize, Entry>, insert: Option<(usize, Entr
         .collect();
     let mut removed: Vec<Entry> = keys.iter().filter_map(|k| entries.remove(k)).collect();
     if let Some((key, entry)) = insert {
-        // A key whose entry is still live is re-filled rather than swept —
-        // the displaced entry leaves the table like any other removal.
+        // A still-live entry under `key` is displaced and returned like a swept one.
         removed.extend(entries.insert(key, entry));
     }
     removed
 }
 
-/// Unlink every entry that left the table, finishing the list even when one
-/// entry's proxy panics.
-///
-/// Abandoning the rest is the damage worth avoiding: nothing prunes a dead
-/// `Weak` from a proxy's recipient list, and `link_to_death` queues
-/// `BC_REQUEST_DEATH_NOTIFICATION` only while that list is empty — so one
-/// skipped unlink silently costs an unrelated later caller its death
-/// notification on that proxy. A panic here is reachable without a bug in
-/// this file: `ProxyHandle::link_to_death` holds its `recipients` write guard
-/// across `talk_with_driver`, which panics if the driver under-consumes, and
-/// that poisons the guard so every later unlink on that proxy panics too.
-///
-/// `resume` re-raises the first panic once the list is finished, so a
-/// non-`Drop` caller still fails; `Drop` passes `false`, since unwinding out
-/// of a drop during another unwind aborts.
+/// Unlink every entry, past a panicking one; `resume` re-raises the first. See `Rewrap` impl notes.
 fn unlink_all(dead: &[Entry], resume: bool) {
     let mut first: Option<Box<dyn std::any::Any + Send>> = None;
     for e in dead {
@@ -161,8 +183,7 @@ fn unlink_all(dead: &[Entry], resume: bool) {
     }
 }
 
-/// Removes one entry when its remote dies. Holds a `Weak` to the table so a
-/// live death link cannot keep the gateway's table alive.
+/// Removes one entry when its remote dies; the `Weak` table keeps a death link from pinning it.
 struct Reaper {
     table: std::sync::Weak<Mutex<HashMap<usize, Entry>>>,
     key: usize,
@@ -174,10 +195,7 @@ impl DeathRecipient for Reaper {
             return;
         };
         let mut entries = entries.lock().expect("rewrap table poisoned");
-        // Evict only the binder that died: the slot may have been re-keyed
-        // since this link was made. Its remote is still alive here — both
-        // obituary drivers hold a strong reference across the callback — so
-        // liveness cannot stand in for identity.
+        // Match identity, not liveness (key may be re-used); see `Rewrap` implementation notes.
         if entries.get(&self.key).is_some_and(|e| e.remote == *who) {
             entries.remove(&self.key);
         }
@@ -211,27 +229,17 @@ impl<I: FromIBinder + ?Sized> Rewrap<I> {
             return hit;
         }
 
-        // Mint outside the lock: `make_local` is user code and
-        // `link_to_death` reaches the driver / the RPC session, and a
-        // re-entrant `wrap` from inside `make_local` would deadlock
-        // (`std::sync::Mutex` is not reentrant).
+        // Mint outside the lock (user code, driver calls); see `Rewrap` implementation notes.
         let local = (self.make_local)(remote.clone());
         let reaper = Arc::new(Reaper {
             table: Arc::downgrade(&self.entries),
             key,
         });
-        // Best effort: a local binder has no death to report
-        // (`InvalidOperation`), and a proxy whose peer is already gone
-        // returns `DeadObject`. Either way a *later* sweep — the next `wrap`
-        // miss, or `purge_dead` — collects the entry once either half is
-        // gone; this call's sweep runs before the entry is inserted.
+        // Best effort: a later sweep collects a failed link; see `Rewrap` implementation notes.
         let _ = remote_binder.link_to_death_arc(&reaper);
 
         let mut entries = self.entries.lock().expect("rewrap table poisoned");
-        // Another thread may have raced us to the same remote. Its wrapper
-        // is as good as ours and may already be upstream, so it wins —
-        // unless it no longer casts to `I`, in which case ours displaces it
-        // below and the displaced entry is unlinked with the others.
+        // A racing thread's wrapper may already be upstream, so it wins if it casts to `I`.
         if let Some((r, l)) = entries.get(&key).and_then(Entry::live) {
             if r == remote_binder {
                 if let Ok(existing) = <I as FromIBinder>::try_from(l) {
@@ -241,9 +249,7 @@ impl<I: FromIBinder + ?Sized> Rewrap<I> {
                 }
             }
         }
-        // Swept on the miss path only: minting a binder and a death link
-        // already costs far more than scanning a table this size, and it
-        // bounds the table without a timer.
+        // Swept on the miss path only; this bounds the table without a timer.
         let dead = take_removed(
             &mut entries,
             Some((
@@ -256,8 +262,7 @@ impl<I: FromIBinder + ?Sized> Rewrap<I> {
             )),
         );
         drop(entries);
-        // Unlink outside the lock: it takes the proxy's recipient lock and can
-        // reach the driver, and this `Mutex` is not reentrant.
+        // Unlink outside the lock: it takes the proxy's recipient lock and can reach the driver.
         unlink_all(&dead, true);
         local
     }
@@ -304,10 +309,7 @@ impl<I: FromIBinder + ?Sized> Rewrap<I> {
 
 impl<I: FromIBinder + ?Sized> Drop for Rewrap<I> {
     fn drop(&mut self) {
-        // Dropping the table removes every entry, and the links outlive it
-        // otherwise: the `Arc<Reaper>`s go, but each proxy keeps a dead
-        // `Weak` in its recipient list, which on the kernel arm blocks every
-        // later `BC_REQUEST`/`BC_CLEAR` transition.
+        // Unlink all, or each proxy keeps a dead `Weak`; see `Rewrap` implementation notes.
         let dead: Vec<Entry> = {
             // Never panic in a `Drop`: drain a poisoned table instead.
             let mut entries = self
@@ -316,15 +318,12 @@ impl<I: FromIBinder + ?Sized> Drop for Rewrap<I> {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             entries.drain().map(|(_, e)| e).collect()
         };
-        // `false`: a panic must not leave this `Drop`, or an unwind already in
-        // progress would abort the process.
+        // `false`: a panic leaving `Drop` during an unwind would abort the process.
         unlink_all(&dead, false);
     }
 }
 
-// No `Default`: the only factory that needs no arguments is `|p| p`, which
-// hands the remote straight back and is then refused at the boundary — a
-// silently wrong table is worse than none.
+// No `Default`: see `Rewrap` implementation notes.
 
 impl<I: FromIBinder + ?Sized> std::fmt::Debug for Rewrap<I> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -332,9 +331,7 @@ impl<I: FromIBinder + ?Sized> std::fmt::Debug for Rewrap<I> {
     }
 }
 
-// Identity key: the `Arc`'s data address, thinned so two vtables for the same
-// allocation cannot disagree. Stable while `Entry.remote`'s `Weak` reserves
-// the allocation.
+// Thin data address (vtables may differ); `Entry.remote`'s `Weak` keeps it from being reused.
 fn key_of(binder: &SIBinder) -> usize {
     Arc::as_ptr(binder.as_arc()) as *const () as usize
 }
@@ -346,9 +343,7 @@ mod tests {
     use std::mem::ManuallyDrop;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// A binder whose `unlink_to_death` either counts the call or panics —
-    /// standing in for a proxy whose `recipients` lock has been poisoned by an
-    /// earlier driver panic, which is how this is reachable in production.
+    /// `unlink_to_death` counts or panics, like a proxy with a poisoned `recipients` lock.
     struct Unlinkable {
         panics: bool,
         unlinked: Arc<AtomicUsize>,
@@ -412,14 +407,11 @@ mod tests {
                 key: 0,
             }),
         };
-        // The caller keeps the strong `SIBinder` alive so `unlink`'s
-        // `remote.upgrade()` succeeds.
+        // The caller keeps `b` alive so `unlink`'s `remote.upgrade()` succeeds.
         (b, e)
     }
 
-    /// One entry panicking must not cost the rest their unlink. Nothing prunes
-    /// a dead `Weak` from a proxy's recipient list, so a skipped unlink
-    /// silently blocks a later `link_to_death` from subscribing.
+    /// One entry panicking must not cost the rest their unlink; `resume = true` re-raises it.
     #[test]
     fn unlink_all_finishes_the_list_after_a_panic() {
         let unlinked = Arc::new(AtomicUsize::new(0));
@@ -442,8 +434,7 @@ mod tests {
         );
     }
 
-    /// `Drop` swallows the panic instead: unwinding out of a drop that is
-    /// itself running during an unwind aborts the process.
+    /// `Drop` swallows the panic: unwinding out of a drop during another unwind aborts.
     #[test]
     fn unlink_all_swallows_the_panic_for_drop() {
         let unlinked = Arc::new(AtomicUsize::new(0));

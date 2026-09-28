@@ -22,6 +22,17 @@
 //! This module defines the core traits and utilities for types that can be
 //! serialized and deserialized in binder parcels, providing the foundation
 //! for AIDL-generated types and custom parcelable implementations.
+//!
+//! # Receiving `BINDER_TYPE_BINDER`
+//!
+//! Cross-process binder transfers reach the receiver as `BINDER_TYPE_HANDLE`;
+//! the kernel emits `BINDER_TYPE_BINDER` only when it routes a binder back to
+//! its publisher, this process. The id is therefore looked up in the process's
+//! native-binder table. An unknown id means either a kernel bug surfacing a
+//! binder never published here, or an entry already torn down, which the round
+//! trip rules out because the receiving process's outstanding handle keeps
+//! `kernel_refs > 0`. Either way it is an integrity error, reported as
+//! `DeadObject`.
 
 use crate::{binder::*, error::*, parcel::Parcel, process_state::*, sys::*};
 
@@ -154,9 +165,7 @@ macro_rules! impl_parcelable_ex {
     {Serialize, $to_ty:ty, $ty:ty} => {
         impl Serialize for $ty {
             fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
-                // The widening happens first: the wire slot is the
-                // 4-byte `$to_ty`, so the byte order applies to that and
-                // not to the one or two bytes of `$ty`.
+                // Widen first: the byte order applies to the 4-byte `$to_ty` slot, not to `$ty`.
                 let val: $to_ty = *self as _;
                 parcel.write_le(&val)
             }
@@ -300,8 +309,7 @@ impl SerializeOption for str {
             None => parcel.write::<i32>(&-1),
 
             Some(text) => {
-                let mut utf16 = Vec::with_capacity(text.len() + 2); // Adding space for final 0 and
-                                                                    // padding.
+                let mut utf16 = Vec::with_capacity(text.len() + 2); // Room for NUL and padding.
                 utf16.extend(text.encode_utf16());
 
                 let len = utf16.len();
@@ -310,22 +318,14 @@ impl SerializeOption for str {
 
                 parcel.write::<i32>(&(len as i32))?;
 
-                // The byte view below is a host-order view of the code
-                // units, and the wire wants them little-endian. Swapping
-                // the units first keeps that view the whole encoding on
-                // every host; `cfg!` is a compile-time constant, so a
-                // little-endian build does not contain this loop.
+                // Pre-swap units to LE so the byte view below is the wire form; LE builds omit it.
                 if cfg!(target_endian = "big") {
                     for unit in utf16.iter_mut() {
                         *unit = unit.swap_bytes();
                     }
                 }
 
-                // SAFETY: We're creating a byte view of the UTF-16 encoded string.
-                // - utf16 is a valid Vec<u16> with proper alignment
-                // - The byte count is exactly utf16.len() * size_of::<u16>()
-                // - The resulting byte slice will not outlive the utf16 vector
-                // - write_aligned_data handles 4-byte padding internally
+                // SAFETY: the view covers exactly `utf16`'s bytes and ends with this call.
                 parcel.write_aligned_data(unsafe {
                     std::slice::from_raw_parts(
                         utf16.as_ptr() as *const u8,
@@ -383,13 +383,7 @@ macro_rules! impl_parcelable_struct {
         impl Deserialize for $ty {
             fn deserialize(parcel: &mut Parcel) -> Result<Self> {
                 const SIZE: usize = std::mem::size_of::<$ty>();
-                // SAFETY: this macro arm is only instantiated for the
-                // bindgen `#[repr(C)]` binder-ABI structs listed in the
-                // `parcelable_struct!` invocations below — plain-old-data
-                // (integers / unions / fixed arrays) with no invalid bit
-                // patterns, so every `[u8; SIZE]` is a valid `$ty`.
-                // `parcel.try_into()?` yields exactly `SIZE` initialized
-                // bytes (length-checked; returns Err otherwise).
+                // SAFETY: `$ty` is a POD binder-ABI struct (see below): any `[u8; SIZE]` is valid.
                 Ok(unsafe { std::mem::transmute::<[u8; SIZE], $ty>(parcel.try_into()?) })
             }
         }
@@ -427,24 +421,11 @@ impl DeserializeOption for String {
         }
 
         if (0..i32::MAX).contains(&len) {
-            // String16 wire = `len + 1` UTF-16 code units (the trailing
-            // NUL terminator is sent too). Route the byte count through
-            // `checked_array_layout` so a hostile near-`i32::MAX` `len`
-            // cannot wrap `(len + 1) * 2` — nor the `+ 3` inside
-            // `read_aligned_data`'s `pad_size` — past `usize::MAX` on
-            // 32-bit targets (armv7 Android, i686 Linux) and slip past
-            // the bounds check into a slice-index panic (remote DoS).
-            // `len + 1` is in `1..=i32::MAX` here, and 64-bit is
-            // byte-identical to the previous unchecked arithmetic.
+            // `len + 1` units incl. NUL, checked so a hostile `len` cannot wrap on 32-bit targets.
             let (byte_count, _) =
                 crate::parcel::checked_array_layout(len + 1, std::mem::size_of::<u16>())?;
             let data = parcel.read_aligned_data(byte_count)?;
-            // `data` is borrowed from the parcel's `Vec<u8>` whose base is
-            // only 1-byte aligned, so reinterpreting it as `&[u16]` via
-            // `from_raw_parts(_ as *const u16, _)` would construct an
-            // under-aligned reference (UB; Miri-detectable). Copy the bytes
-            // into an aligned `Vec<u16>` instead — mirroring the
-            // `chunks_exact` copy used by `read_array_char`.
+            // A `&[u16]` view of the 1-byte-aligned buffer would be UB, so copy into a `Vec<u16>`.
             let u16_data: Vec<u16> = data[..len as usize * std::mem::size_of::<u16>()]
                 .chunks_exact(std::mem::size_of::<u16>())
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
@@ -495,21 +476,18 @@ impl Serialize for SIBinder {
 
 impl SerializeOption for SIBinder {
     fn serialize_option(this: Option<&Self>, parcel: &mut Parcel) -> Result<()> {
-        // RPC mode: marshal as `RpcAddress` via the attached session
-        // hooks, not `flat_binder_object`. Kernel path below is
-        // byte-identical on a driver-backed parcel.
-        #[cfg(feature = "rpc")]
+        // No hooks = data-only mode: refuse before `binder.into()`, which panics without a driver.
         if !parcel.is_kernel_backed() {
-            let ops = parcel.rpc_ops().ok_or(StatusCode::BadType)?;
-            return ops.write_binder(this, parcel);
+            #[cfg(feature = "rpc")]
+            if let Some(ops) = parcel.rpc_ops() {
+                return ops.write_binder(this, parcel);
+            }
+            return Err(StatusCode::BadType);
         }
 
         match this {
             Some(binder) => {
-                // AOSP `Parcel::flattenBinder`: "Sending a socket binder over
-                // kernel binder is prohibited" → `INVALID_OPERATION`. Must stay
-                // *before* `binder.into()`, which calls `ProcessState::as_self()`
-                // and would panic in a pure-RPC process that never initialized it.
+                // Reject RPC binders (AOSP) before `into()`, which panics with no ProcessState.
                 #[cfg(feature = "rpc")]
                 if (**binder)
                     .as_any()
@@ -519,15 +497,11 @@ impl SerializeOption for SIBinder {
                     log::error!("Sending a socket (RPC) binder over kernel binder is prohibited");
                     return Err(StatusCode::InvalidOperation);
                 }
-                parcel.write::<flat_binder_object>(&binder.into())?;
+                parcel.write_binder_object(&binder.into(), binder)?;
                 if crate::sdk_at_least(30) {
                     parcel.write::<i32>(&binder.stability().into())?;
                 }
-                // Freeze runtime stability mutation once
-                // this binder has crossed the IPC boundary (AOSP
-                // `BBinder::setParceled` equivalent). Default trait impl
-                // is a no-op for proxies — only `Inner<T>` flips its
-                // `AtomicBool`.
+                // Freeze stability once parceled (AOSP `BBinder::setParceled`); no-op for proxies.
                 binder.set_parceled();
                 Ok(())
             }
@@ -561,13 +535,13 @@ impl Deserialize for SIBinder {
 
 impl DeserializeOption for SIBinder {
     fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
-        // RPC mode: unmarshal from `RpcAddress` via the attached
-        // session hooks. The kernel `flat_binder_object`
-        // path below is byte-identical on a driver-backed parcel.
-        #[cfg(feature = "rpc")]
+        // No hooks = data-only mode: no table could turn the bytes into a binder.
         if !parcel.is_kernel_backed() {
-            let ops = parcel.rpc_ops().ok_or(StatusCode::BadType)?;
-            return ops.read_binder(parcel);
+            #[cfg(feature = "rpc")]
+            if let Some(ops) = parcel.rpc_ops() {
+                return ops.read_binder(parcel);
+            }
+            return Err(StatusCode::BadType);
         }
 
         let flat: flat_binder_object = parcel.read()?;
@@ -579,18 +553,7 @@ impl DeserializeOption for SIBinder {
 
         match flat.header_type() {
             BINDER_TYPE_BINDER => {
-                // Receiving BINDER_TYPE_BINDER means the kernel routed
-                // a binder back to its original publisher (us).
-                // Cross-process binder transfers reach receivers as
-                // BINDER_TYPE_HANDLE — the kernel only emits
-                // BINDER_TYPE_BINDER on the publisher loopback path.
-                // Look up the id in our sidecar table; an unknown id
-                // here would mean either (a) a kernel bug surfacing a
-                // BINDER_TYPE_BINDER we never published, or (b) the
-                // entry was already torn down (shouldn't happen
-                // because the round-trip ride keeps `kernel_refs > 0`
-                // via the receiving process's outstanding handle).
-                // Either way it's an integrity error → DeadObject.
+                // Only the publisher receives BINDER_TYPE_BINDER; see module doc for an unknown id.
                 let id = flat.pointer();
                 if id != 0 {
                     let arc = ProcessState::as_self().lookup_native(id).ok_or_else(|| {
@@ -635,12 +598,11 @@ pub const NON_NULL_PARCELABLE_FLAG: i32 = 1;
 pub const NULL_PARCELABLE_FLAG: i32 = 0;
 
 /// Helper trait for types that can be nullable when serialized.
-// We really need this trait instead of implementing `Serialize for Option<T>`
-// because of the Rust orphan rule which prevents us from doing
-// `impl Serialize for Option<&dyn IFoo>` for AIDL interfaces.
-// Instead we emit `impl SerializeOption for dyn IFoo` which is allowed.
-// We also use it to provide a default implementation for AIDL-generated
-// parcelables.
+///
+/// It exists instead of `Serialize for Option<T>` because the orphan rule
+/// forbids `impl Serialize for Option<&dyn IFoo>` for AIDL interfaces, while
+/// `impl SerializeOption for dyn IFoo` is allowed. It also carries the default
+/// implementation for AIDL-generated parcelables.
 pub trait SerializeOption: Serialize {
     /// Serialize an Option of this type into the given parcel.
     fn serialize_option(this: Option<&Self>, parcel: &mut Parcel) -> Result<()> {
@@ -763,16 +725,14 @@ impl<T: SerializeOption> SerializeArray for Option<T> {}
 /// Helper trait for types that can be serialized as arrays.
 /// Defaults to calling Serialize::serialize() manually for every element,
 /// but can be overridden for custom implementations like `writeByteArray`.
-// Until specialization is stabilized in Rust, we need this to be a separate
-// trait because it's the only way to have a default implementation for a method.
-// We want the default implementation for most types, but an override for
-// a few special ones like `readByteArray` for `u8`.
+///
+/// It is a separate trait because, without stable specialization, that is the
+/// only way to give most types a default method while a few (`u8`'s
+/// `writeByteArray`) override it.
 pub trait SerializeArray: Serialize + Sized {
     /// Serialize an array of this type into the given parcel.
     fn serialize_array(slice: &[Self], parcel: &mut Parcel) -> Result<()> {
-        // The wire length word is an `i32`; a slice too large to fit is a
-        // `BadValue`, not a silently truncated (possibly negative) count.
-        // Matches AOSP's Rust `SerializeArray` (`try_into().or(BAD_VALUE)`).
+        // An `i32` length word: an oversized slice is `BadValue`, as in AOSP's Rust binder.
         let len: i32 = slice.len().try_into().or(Err(StatusCode::BadValue))?;
         parcel.write::<i32>(&len)?;
 
@@ -787,6 +747,17 @@ pub trait SerializeArray: Serialize + Sized {
 /// Helper trait for types that can be deserialized as arrays.
 /// Defaults to calling Deserialize::deserialize() manually for every element,
 /// but can be overridden for custom implementations like `readByteArray`.
+///
+/// The default implementation caps its speculative pre-allocation at
+/// `data_avail() / 4` elements. Every element on that path costs at least 4
+/// wire bytes (`read_aligned_data` pads to 4; the byte-sized primitives
+/// override `deserialize_array`), so a well-formed array always satisfies
+/// `len <= data_avail() / 4`. The cap divides the wire bytes rather than
+/// clamping the count because `Vec::with_capacity` multiplies by
+/// `size_of::<Self>()`: under a count-only clamp, a 64 MiB RPC frame declaring
+/// `len = 64_000_000` for `Vec<String>` (24 B each) requests about 1.5 GiB up
+/// front, and an allocation failure aborts the process. Valid input decodes
+/// identically; the loop still pushes exactly `len`, growing on demand.
 pub trait DeserializeArray: Deserialize {
     /// Deserialize an array of type from the given parcel.
     fn deserialize_array(parcel: &mut Parcel) -> Result<Option<Vec<Self>>> {
@@ -801,18 +772,7 @@ pub trait DeserializeArray: Deserialize {
         if len == 0 {
             return Ok(Some(Vec::new()));
         }
-        // Cap the *speculative* pre-allocation by the bytes still left in
-        // the parcel. Every element on this path costs at least 4 wire
-        // bytes (`read_aligned_data` pads to 4; the byte-sized primitives
-        // override `deserialize_array` and never come here), so a
-        // well-formed array always satisfies `len <= data_avail() / 4`.
-        // Dividing by the wire size — not just clamping the *count* —
-        // matters because `Vec::with_capacity` multiplies by
-        // `size_of::<Self>()`: with a count-only clamp a 64 MiB RPC frame
-        // declaring `len = 64_000_000` for `Vec<String>` (24 B each) still
-        // requested ~1.5 GiB up front, and an allocation failure aborts.
-        // Byte-for-byte identical for all valid input; the loop still
-        // pushes exactly `len`, growing on demand.
+        // Pre-allocate at most one element per 4 wire bytes left; see the trait rustdoc.
         let cap = (len as usize).min(parcel.data_avail() / 4);
         let mut res: Vec<Self> = Vec::with_capacity(cap);
 
@@ -910,15 +870,25 @@ impl<T: DeserializeArray, const N: usize> DeserializeArray for [T; N] {}
 
 #[cfg(test)]
 mod tests {
+    //! # Notes
+    //!
+    //! - `hostile_string16_length_returns_err_not_panic`: on 32-bit targets the `(len + 1) * 2`
+    //!   byte count — and the `+ 3` inside `pad_size` — could wrap `usize` and slip past the
+    //!   bounds check into a slice-index panic; routing through `checked_array_layout` rejects
+    //!   it as `BadValue`. 64-bit surfaces it as `NotEnoughData`; either way it is an `Err`.
+    //! - `generic_vec_deserialize_rejects_null_but_accepts_empty`: the generic
+    //!   `DeserializeArray::deserialize_array` default is the path of `String` / `bool` /
+    //!   parcelable elements, distinct from the `u8` / `u16` fast paths in `parcel.rs`. A
+    //!   non-null `Vec<T>` rejects null; an `Option<Vec<T>>` maps `0` to `Some(empty)`, not
+    //!   `None`.
+    //! - `default_option_rejects_garbage_sentinel`: the default
+    //!   `DeserializeOption::deserialize_option` serves primitive `Option<T>` such as
+    //!   `Option<i32>`; any sentinel other than `0` / `1` is `UnexpectedNull`, matching AOSP's
+    //!   `readData(Parcelable*)` `present != kNonNullParcelableFlag`.
+
     use super::*;
 
-    /// A hostile String16 length (untrusted parcel input) must surface an
-    /// error rather than panic. On 32-bit targets the `(len + 1) * 2` byte
-    /// count — and the `+ 3` inside `pad_size` — could wrap `usize` and slip
-    /// past the bounds check into a slice-index panic; routing through
-    /// `checked_array_layout` rejects it as `BadValue` instead. (64-bit
-    /// surfaces it as `NotEnoughData`; either way it is an `Err`, not a
-    /// panic.)
+    /// A hostile String16 length is an `Err`, not a panic; see this module's doc.
     #[test]
     fn hostile_string16_length_returns_err_not_panic() {
         for len in [-2, i32::MAX - 1, i32::MAX] {
@@ -941,8 +911,7 @@ mod tests {
         assert_eq!(got, s);
     }
 
-    /// The empty-string boundary (len == 0 ⇒ only the NUL terminator) must
-    /// also round-trip without tripping the `len + 1` layout check.
+    /// An empty string (len 0, NUL only) round-trips past the `len + 1` layout check.
     #[test]
     fn empty_string16_round_trip() {
         let mut p = Parcel::new();
@@ -953,12 +922,7 @@ mod tests {
         assert_eq!(got, s);
     }
 
-    /// The generic `DeserializeArray::deserialize_array` default — the path
-    /// taken by `String` / `bool` / parcelable elements, distinct from the
-    /// `u8` / `u16` fast paths in `parcel.rs` — must also distinguish a null
-    /// array (`-1`) from an empty one (`0`) and reject other negatives. A
-    /// non-null `Vec<T>` rejects null; an `Option<Vec<T>>` maps `0` to
-    /// `Some(empty)`, not `None`.
+    /// Generic `deserialize_array` default: -1 is null, 0 is empty, other negatives are rejected.
     #[test]
     fn generic_vec_deserialize_rejects_null_but_accepts_empty() {
         let mut p = Parcel::new();
@@ -976,10 +940,7 @@ mod tests {
         assert_eq!(p.read::<Vec<String>>(), Err(StatusCode::UnexpectedNull));
     }
 
-    /// The default `DeserializeOption::deserialize_option` (used by primitive
-    /// `Option<T>` such as `Option<i32>`) accepts only `0` (null) / `1`
-    /// (present); any other sentinel is `UnexpectedNull`, matching AOSP's
-    /// `readData(Parcelable*)` `present != kNonNullParcelableFlag`.
+    /// Default `deserialize_option` takes only 0/1, as AOSP `present != kNonNullParcelableFlag`.
     #[test]
     fn default_option_rejects_garbage_sentinel() {
         let mut p = Parcel::new();
@@ -994,9 +955,7 @@ mod tests {
         assert_eq!(p.read::<Option<i32>>(), Err(StatusCode::UnexpectedNull));
     }
 
-    /// The `impl_deserialize_for_parcelable!` macro — the code path real
-    /// AIDL-generated parcelables use — must reject a presence sentinel other
-    /// than `0` / `1`, just like the trait defaults above.
+    /// `impl_deserialize_for_parcelable!` (the AIDL parcelable path) rejects sentinels beyond 0/1.
     #[test]
     fn macro_parcelable_rejects_garbage_sentinel() {
         #[derive(Default, Debug, PartialEq)]
@@ -1023,8 +982,7 @@ mod tests {
 
         assert_eq!(p.read::<Tiny>(), Ok(Tiny { x: 7 }));
         assert_eq!(p.read::<Option<Tiny>>(), Ok(None));
-        // Any non-{0,1} flag is UNEXPECTED_NULL, matching AOSP C++
-        // `Parcel::readData` and the `DeserializeOption` default path.
+        // Any non-{0,1} flag is UNEXPECTED_NULL, as in AOSP `Parcel::readData`.
         assert_eq!(p.read::<Option<Tiny>>(), Err(StatusCode::UnexpectedNull));
     }
 }

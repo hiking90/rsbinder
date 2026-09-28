@@ -1,20 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
-//
-// `@EnforcePermission` codegen.
-//
-// Validates that the generated `on_transact` arm:
-//
-//   * Includes a `check_permission` call for each form
-//     (`@EnforcePermission("X")` / `(value = "X")` /
-//     `(allOf = {...})` / `(anyOf = {...})`).
-//   * Uses `&&` for `allOf` and `||` for `anyOf` — short-circuit shape
-//     matches AOSP `generate_cpp.cpp::WriteEnforcePermissionCheck`.
-//   * Emits the deny branch (`Status::from(ExceptionCode::Security)` +
-//     `return Ok(())`) **before** any argument deserialization — the
-//     check appears earlier in the generated arm than the
-//     `let _arg_x: ... = _reader.read()` statements.
-//   * Leaves un-annotated methods byte-identical — the `IPlain` arm
-//     contains no `check_permission` reference.
+
+//! `@EnforcePermission` codegen.
+//!
+//! Validates that the generated `on_transact` arm:
+//!
+//!   * Includes a `check_permission` call for each form
+//!     (`@EnforcePermission("X")` / `(value = "X")` /
+//!     `(allOf = {...})` / `(anyOf = {...})`).
+//!   * Uses `&&` for `allOf` and `||` for `anyOf` — the short-circuit shape
+//!     is rsbinder's own design: AOSP's C++ and Rust backends refuse
+//!     permission annotations (`generate_cpp.cpp` `#error`), and its Java
+//!     backend checks in a `<method>_enforcePermission()` helper.
+//!   * Emits the deny branch (`Status::from(ExceptionCode::Security)` +
+//!     `return Ok(())`) **before** any argument deserialization — the
+//!     check appears earlier in the generated arm than the
+//!     `let _arg_x: ... = _reader.read()` statements.
+//!   * Leaves un-annotated methods byte-identical — the `IPlain` arm
+//!     contains no `check_permission` reference.
+//!
+//! `@PermissionManuallyEnforced` and `@RequiresNoPermission` are documentation-only in AOSP's
+//! AIDL: they let `aidl` enforce that every method declares its permission posture, but emit no
+//! runtime check. rsbinder-aidl must recognize them (no `cargo:warning=`) and leave the generated
+//! arm byte-identical to the un-annotated version.
 
 fn generate(input: &str) -> String {
     let ctx = rsbinder_aidl::SourceContext::new("test.aidl", input);
@@ -31,9 +38,7 @@ fn generate_async(input: &str) -> String {
 }
 
 fn arm_for(method_id: &str, generated: &str) -> String {
-    // Extract from `transactions::r#<method> => {` up to the matching
-    // `}` brace of the arm. The arms are emitted single-level inside a
-    // `match _code { ... }` so a simple brace counter is sufficient.
+    // Arms sit one level inside `match _code { ... }`, so a brace counter finds the end.
     let needle = format!("transactions::r#{method_id} =>");
     let start = generated
         .find(&needle)
@@ -82,8 +87,7 @@ interface IFoo {
 
 #[test]
 fn enforce_permission_value_param_form_is_single() {
-    // `@EnforcePermission(value = "X")` is the named-parameter spelling
-    // of the single form — same emit as `@EnforcePermission("X")`.
+    // Named-parameter spelling of the single form: same emit as `@EnforcePermission("X")`.
     let out = generate(
         r#"
 package test;
@@ -129,7 +133,7 @@ interface IFoo {
         arm.contains("check_permission(_reader, \"ACCESS_NETWORK_STATE\")"),
         "{arm}"
     );
-    // The `&&` is the documented AOSP short-circuit shape.
+    // The `&&` short-circuit shape is rsbinder's own (see the module doc).
     assert!(arm.contains(" && "), "AllOf must join with `&&`:\n{arm}");
     assert!(!arm.contains(" || "), "AllOf must not emit `||`:\n{arm}");
 }
@@ -160,12 +164,7 @@ interface IFoo {
 
 #[test]
 fn enforce_permission_check_runs_before_arg_deserialization() {
-    // AOSP `WriteEnforcePermissionCheck` emits the deny early — before
-    // any `_reader.read()` for arguments. We mirror that so a missing
-    // permission cannot trigger argument deserialization side-effects
-    // (allocations, fd dup, etc.). Regression check: the
-    // `check_permission` call MUST appear before the first
-    // `_reader.read*` for an annotated method.
+    // rsbinder design, not an AOSP port: a denied call must not deserialize (alloc, fd dup).
     let out = generate(
         r#"
 package test;
@@ -193,8 +192,7 @@ interface IFoo {
 
 #[test]
 fn methods_without_enforce_permission_get_no_check() {
-    // Un-annotated methods must produce byte-identical generated code: no
-    // permission scaffolding at all.
+    // Un-annotated methods get no permission scaffolding at all.
     let out = generate(
         r#"
 package test;
@@ -214,15 +212,7 @@ interface IPlain {
     );
 }
 
-/// `@PermissionManuallyEnforced` and `@RequiresNoPermission`
-/// are documentation-only annotations in AOSP's AIDL — they exist so
-/// `aidl` can enforce that *every* interface method declares its
-/// permission posture, but neither emits runtime checks. rsbinder-aidl
-/// must (a) recognize them (no `cargo:warning=` for typos) and (b) leave
-/// the generated arm byte-identical to the un-annotated version.
-///
-/// Locking-in test: compare generated output for the same interface
-/// with and without the annotation — they MUST match exactly.
+/// Documentation-only annotation (see the module doc): output must match the plain interface.
 #[test]
 fn permission_manually_enforced_produces_byte_identical_codegen() {
     let plain = generate(
@@ -242,8 +232,7 @@ interface IFoo {
 }
         "#,
     );
-    // Anchor the content: "identical" degenerates into "identically empty"
-    // if interface codegen ever collapses.
+    // Anchor the content: "identical" must not pass as "identically empty".
     assert!(plain.contains("fn r#echo"), "{plain}");
     assert_eq!(
         plain, annotated,
@@ -270,8 +259,7 @@ interface IFoo {
 }
         "#,
     );
-    // Anchor the content: "identical" degenerates into "identically empty"
-    // if interface codegen ever collapses.
+    // Anchor the content: "identical" must not pass as "identically empty".
     assert!(plain.contains("fn r#echo"), "{plain}");
     assert_eq!(
         plain, annotated,
@@ -310,10 +298,7 @@ interface IFoo {
 
 #[test]
 fn mixed_methods_only_emit_check_for_annotated_arm() {
-    // An interface with both annotated and un-annotated methods must
-    // emit the check ONLY in the annotated method's arm. Surfaces a
-    // generator regression where the check would leak across arms via
-    // shared template state.
+    // The check must not leak into other arms through shared template state.
     let out = generate(
         r#"
 package test;
@@ -339,12 +324,7 @@ interface IMixed {
 
 #[test]
 fn enforce_permission_emitted_for_async_service() {
-    // The async service stub dispatches through the *same* generated
-    // `on_transact` (the `Bn*Adapter` calls `on_transact(self.as_sync(), …)`),
-    // so an `@EnforcePermission` method served by an *async* impl must still
-    // be checked before the handler runs. This guards against a regression
-    // where the deny would be emitted only on the sync path — an async
-    // service would otherwise silently skip authorization.
+    // `Bn*Adapter` reuses the sync `on_transact`, so an async impl must hit the same check.
     let input = r#"
 package test;
 interface IFoo {
@@ -366,17 +346,207 @@ interface IFoo {
     let check_pos = arm
         .find("check_permission(_reader,")
         .expect("check present");
-    if let Some(read_pos) = arm.find("_reader.read") {
-        assert!(
-            check_pos < read_pos,
-            "check must precede arg deserialization in async codegen:\n{arm}"
-        );
-    }
+    let read_pos = arm.find("_reader.read").unwrap_or_else(|| {
+        panic!("no `_reader.read` marker: the ordering guard would be dead. arm:\n{arm}")
+    });
+    assert!(
+        check_pos < read_pos,
+        "check must precede arg deserialization in async codegen:\n{arm}"
+    );
 
-    // Sanity: the async path is actually generated (so this isn't silently
-    // testing the sync output).
+    // Sanity: the async path is really generated, not just the sync output.
     assert!(
         out.contains("AsyncService"),
         "expected async service stub in async-enabled generation"
+    );
+}
+
+/// AOSP Java `GeneratePermissionMethod`: an interface-level expression guards every method.
+#[test]
+fn interface_level_enforce_permission_guards_every_method() {
+    let out = generate(
+        r#"
+package test;
+@EnforcePermission(anyOf = {"A", "B"})
+interface IFoo {
+    void one();
+    void two(in int x);
+}
+        "#,
+    );
+    for method in ["one", "two"] {
+        let arm = arm_for(method, &out);
+        assert!(
+            arm.contains("check_permission(_reader, \"A\") || rsbinder::permission_controller"),
+            "interface-level check missing from `{method}`:\n{arm}"
+        );
+    }
+}
+
+/// AOSP `AidlInterface::CheckValidPermissionAnnotations`.
+#[test]
+fn interface_and_method_permission_annotations_are_rejected() {
+    for method_annotation in [
+        "@EnforcePermission(\"B\")",
+        "@RequiresNoPermission",
+        "@PermissionManuallyEnforced",
+    ] {
+        let input = format!(
+            "package test; @EnforcePermission(\"A\") interface IFoo {{ {method_annotation} void m(); }}"
+        );
+        let ctx = rsbinder_aidl::SourceContext::new("test.aidl", &input);
+        let document = rsbinder_aidl::parse_document(&ctx).expect("parse");
+        let err = rsbinder_aidl::Generator::new(false, false)
+            .document(&document)
+            .expect_err("both annotated must be rejected");
+        assert!(
+            format!("{err:?}").contains("is also annotated"),
+            "{method_annotation}: {err:?}"
+        );
+    }
+}
+
+/// AOSP `AidlAnnotation::EnforceExpression()`: `value`, else `anyOf`, else `allOf`.
+#[test]
+fn enforce_permission_parameters_pick_aosp_order_not_source_order() {
+    let out = generate(
+        r#"
+package test;
+interface IFoo {
+    @EnforcePermission(anyOf = {"A", "B"}, value = "C")
+    void single();
+    @EnforcePermission(allOf = {"X", "Y"}, anyOf = {"A", "B"})
+    void any();
+}
+        "#,
+    );
+    let arm = arm_for("single", &out);
+    assert!(arm.contains("check_permission(_reader, \"C\")"), "{arm}");
+    assert!(!arm.contains("check_permission(_reader, \"A\")"), "{arm}");
+    let arm = arm_for("any", &out);
+    assert!(arm.contains("check_permission(_reader, \"A\")"), "{arm}");
+    assert!(!arm.contains("check_permission(_reader, \"X\")"), "{arm}");
+}
+
+/// AOSP `AidlAnnotation::CheckValid()` rejects unknown and ill-typed parameters.
+#[test]
+fn enforce_permission_unknown_or_ill_typed_parameter_is_rejected() {
+    for args in [
+        "value = 5, anyOf = {\"A\"}",
+        "valeu = \"X\", anyOf = {\"A\"}",
+        "anyOf = {\"A\"}, allOf = {1}",
+    ] {
+        let input =
+            format!("package test; interface IFoo {{ @EnforcePermission({args}) void m(); }}");
+        let ctx = rsbinder_aidl::SourceContext::new("test.aidl", &input);
+        let document = rsbinder_aidl::parse_document(&ctx).expect("parse");
+        let err = rsbinder_aidl::Generator::new(false, false)
+            .document(&document)
+            .expect_err("malformed @EnforcePermission must be rejected");
+        assert!(
+            format!("{err:?}").contains("MalformedEnforcePermission"),
+            "{args}: {err:?}"
+        );
+    }
+}
+
+/// AOSP `ParamValue` evaluates the value, so a string concatenation names one permission.
+#[test]
+fn enforce_permission_value_is_a_folded_constant_expression() {
+    let out = generate(
+        r#"
+package test;
+interface IFoo {
+    @EnforcePermission("android.permission." + "X")
+    void single();
+    @EnforcePermission(anyOf = {"A" + "B", "C"})
+    void any();
+}
+        "#,
+    );
+    let arm = arm_for("single", &out);
+    assert!(
+        arm.contains("check_permission(_reader, \"android.permission.X\")"),
+        "{arm}"
+    );
+    let arm = arm_for("any", &out);
+    assert!(arm.contains("check_permission(_reader, \"AB\")"), "{arm}");
+}
+
+/// AOSP refuses a redefined parameter (grammar) and a repeated annotation (`CheckValid`).
+#[test]
+fn enforce_permission_given_twice_is_rejected() {
+    for (annotations, expected) in [
+        (
+            "@EnforcePermission(value = \"A\", value = \"B\")",
+            "Trying to redefine parameter value.",
+        ),
+        (
+            "@EnforcePermission(\"A\") @EnforcePermission(\"B\")",
+            "'EnforcePermission' is repeated, but not allowed.",
+        ),
+    ] {
+        let input = format!("package test; interface IFoo {{ {annotations} void m(); }}");
+        let ctx = rsbinder_aidl::SourceContext::new("test.aidl", &input);
+        let err = rsbinder_aidl::parse_document(&ctx).expect_err("must be rejected");
+        assert!(
+            format!("{err:?}").contains(expected),
+            "{annotations}: {err:?}"
+        );
+    }
+    // `@JavaPassthrough` is the one repeatable annotation in the AOSP schema.
+    let input = "package test; interface IFoo { @JavaPassthrough(annotation = \"@A\") \
+                 @JavaPassthrough(annotation = \"@B\") void m(); }";
+    let ctx = rsbinder_aidl::SourceContext::new("test.aidl", input);
+    rsbinder_aidl::parse_document(&ctx).expect("repeatable");
+}
+
+/// AOSP `method_decl`: `annotation_list ONEWAY type` annotates the return type with the list
+/// before `oneway` and the one inside `type` alike, so either position guards the method.
+#[test]
+fn oneway_enforce_permission_is_checked_on_either_side_of_oneway() {
+    for method in [
+        "@EnforcePermission(\"INTERNET\") oneway void m();",
+        "oneway @EnforcePermission(\"INTERNET\") void m();",
+    ] {
+        let out = generate(&format!("package test; interface IFoo {{ {method} }}"));
+        let arm = arm_for("m", &out);
+        assert!(
+            arm.contains("check_permission(_reader, \"INTERNET\")"),
+            "{method}: missing check in arm:\n{arm}"
+        );
+    }
+}
+
+#[test]
+fn oneway_permission_annotation_after_oneway_meets_the_method_rules() {
+    let input = "package test; @EnforcePermission(\"A\") interface IFoo { \
+                 oneway @RequiresNoPermission void m(); }";
+    let ctx = rsbinder_aidl::SourceContext::new("test.aidl", input);
+    let document = rsbinder_aidl::parse_document(&ctx).expect("parse");
+    let err = rsbinder_aidl::Generator::new(false, false)
+        .document(&document)
+        .expect_err("both annotated must be rejected");
+    assert!(format!("{err:?}").contains("is also annotated"), "{err:?}");
+
+    let input = "package test; interface IFoo { \
+                 @EnforcePermission(\"A\") oneway @EnforcePermission(\"B\") void m(); }";
+    let ctx = rsbinder_aidl::SourceContext::new("test.aidl", input);
+    let err = rsbinder_aidl::parse_document(&ctx).expect_err("must be rejected");
+    assert!(
+        format!("{err:?}").contains("'EnforcePermission' is repeated, but not allowed."),
+        "{err:?}"
+    );
+
+    // The moved list still reaches the return-type checks: `void` takes no `@nullable`.
+    let input = "package test; interface IFoo { oneway @nullable void m(); }";
+    let ctx = rsbinder_aidl::SourceContext::new("test.aidl", input);
+    let document = rsbinder_aidl::parse_document(&ctx).expect("parse");
+    let err = rsbinder_aidl::Generator::new(false, false)
+        .document(&document)
+        .expect_err("nullable void must be rejected");
+    assert!(
+        format!("{err:?}").contains("cannot get nullable"),
+        "{err:?}"
     );
 }

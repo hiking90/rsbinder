@@ -4,7 +4,7 @@
 // Plan 2-20 STAGE3 gate (e) — the **reverse** direction of gate (d) in
 // `rpc_multiconn_interop_launcher.cpp`: a real-libbinder **RPC server**
 // (this launcher) and an rsbinder **client** that opened one incoming
-// connection (`RpcUnixClientConfig::incoming_connections(1)`).
+// connection (`RpcClientConfig::incoming_connections(1)`).
 //
 // The client hands us a callback and asks (`TX_SCHEDULE_CALLBACK`) for it
 // to be driven later. We do that from a plain `std::thread` — no handler
@@ -30,6 +30,8 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -252,6 +254,33 @@ int bind_uds_listen(const std::string& path) {
     return fd;
 }
 
+// Loopback inet listener: `ARpcServer_newBoundSocket` serves whatever bound
+// socket it is given, so this is libbinder's inet RPC server.
+int bind_inet_listen(int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        perror("[cpp-server] socket(AF_INET)");
+        return -1;
+    }
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(port));
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        perror("[cpp-server] bind(AF_INET)");
+        close(fd);
+        return -1;
+    }
+    if (listen(fd, 5) < 0) {
+        perror("[cpp-server] listen");
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -261,7 +290,9 @@ int main(int argc, char** argv) {
     ABinderProcess_setThreadPoolMaxThreadCount(2);
     ABinderProcess_startThreadPool();
 
-    int sockfd = bind_uds_listen(sock_path);
+    // `tcp:<port>` = loopback inet; anything else is a Unix socket path.
+    int sockfd = strncmp(sock_path, "tcp:", 4) == 0 ? bind_inet_listen(atoi(sock_path + 4))
+                                                    : bind_uds_listen(sock_path);
     if (sockfd < 0) return 1;
 
     g_cb_clazz = AIBinder_Class_define(kCallbackDescriptor, on_create, on_destroy,

@@ -22,6 +22,48 @@
 //! This module provides `ParcelableHolder`, a type-erased container that can hold
 //! any parcelable object. It's primarily used for AIDL union types and other
 //! scenarios where the specific parcelable type is not known at compile time.
+//!
+//! # Stability on the wire
+//!
+//! A holder's stability is written as AOSP's `Parcelable::Stability` enum
+//! (`STABILITY_LOCAL = 0`, `STABILITY_VINTF = 1`). This is a *different* wire value from the
+//! binder-object `internal::Stability::Level` bitmask (0/3/12/63 via
+//! `From<Stability> for i32`) used on the `writeStrongBinder` path, and it is
+//! version-independent: `frameworks/native/libs/binder/ParcelableHolder.cpp` writes
+//! `writeInt32(static_cast<int32_t>(getStability()))` unchanged on every Android version
+//! (byte-identical between android-12 and android-16), with no `Category` repr or Android-12
+//! `0x0c000000` adjustment. The AIDL `@VintfStability` annotation maps a holder field to
+//! `STABILITY_VINTF` (`system/tools/aidl` `generate_cpp.cpp`); everything else is
+//! `STABILITY_LOCAL`. The binder-object encoding would put 63 (`0x0c00003f` on Android 12) on
+//! the wire where a real libbinder peer expects 1, and the peer rejects any `@VintfStability`
+//! holder field with `BAD_VALUE`.
+//!
+//! # Data-only payloads
+//!
+//! A holder carries its payload in a sub-parcel built by `read_from_parcel`, and that
+//! sub-parcel inherits the marshalling mode of the parcel it was cut from. Otherwise the
+//! data-only decoder behind `crate::from_bytes` hands its bytes to a kernel-mode reader, and
+//! `read_object`'s null-meta shortcut waves a null-pointer, null-cookie object through without
+//! an offset-table entry: a forged `BINDER_TYPE_HANDLE` with handle 0 becomes a proxy to the
+//! context manager (or panics on `ProcessState::as_self()` in a process that never initialized
+//! the driver). Both contradict what `from_bytes` promises about bytes you did not write.
+//!
+//! Keeping the payload data-only is not enough on its own: serializing the holder into a
+//! *kernel* parcel would copy those bytes back into a buffer whose reader trusts them, and
+//! one kernel round trip would turn file bytes into a proxy for the context manager.
+//! `append_from` refuses that copy, and the copy into an RPC session parcel too; a data-only
+//! sink still accepts the holder.
+//!
+//! # Objects
+//!
+//! `Parcel::sub_parcel` builds the sub-parcel: besides the mode it keeps the session profile
+//! and the RPC objects inside the payload, so a binder and a v1+ fd decode from it as from the
+//! parcel it was cut from. It is a received parcel when its source is, and keeps each binder it
+//! reads for as long as the holder keeps the payload, so a `get_parcelable` retried after a
+//! failure reads the same binder again without owing the peer a second `DEC_STRONG` (the
+//! `parcel` module doc "`append_from`" has the details). Relaying the undecoded payload into a session parcel is
+//! `append_from`, whose per-profile rules are in the `parcel` module doc "`append_from`" and
+//! in the struct rustdoc "Relaying undecoded bytes".
 
 use crate::binder::Stability;
 use crate::error::{Result, StatusCode};
@@ -34,9 +76,7 @@ use std::any::Any;
 use std::sync::{Arc, Mutex};
 
 trait AnyParcelable: Parcelable + std::fmt::Debug + Send + Sync + 'static {
-    // Upcast to `dyn Any` so the holder can `Arc::downcast` back to the
-    // concrete parcelable type in `get_parcelable`. `Arc<Self>` is an
-    // object-safe receiver, so this works through the trait object.
+    // Upcast so `get_parcelable` can `Arc::downcast` through the trait object to the concrete type.
     fn into_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>;
 }
 impl<T: Parcelable + std::fmt::Debug + Send + Sync + 'static> AnyParcelable for T {
@@ -63,27 +103,58 @@ enum ParcelableHolderData {
 ///
 /// `ParcelableHolder` is `Send + Sync`: its state sits behind a `Mutex` and
 /// rsbinder's `Parcel` is plain owned data (unlike AOSP's, which wraps a raw
-/// `AParcel` pointer).
+/// `AParcel` pointer). The `Mutex` exists because `get_parcelable` takes
+/// `&self`, as in C++; taking `&mut self` would remove it, but then callers
+/// would need a mutable holder even for that getter.
+///
+/// # Stability on the wire
+///
+/// A holder writes AOSP's `Parcelable::Stability` enum (`STABILITY_LOCAL = 0`,
+/// `STABILITY_VINTF = 1`), not the binder-object `Stability` level bitmask
+/// (0/3/12/63). A `@VintfStability` holder therefore puts `1` on the wire, and
+/// a libbinder peer rejects any other value (63, or `0x0c00003f` on Android 12)
+/// with `BAD_VALUE`. The values are checked against android-12 and android-16
+/// `frameworks/native/libs/binder/ParcelableHolder.cpp` and `Parcelable.h`, and
+/// `system/tools/aidl` `generate_cpp.cpp` (vintf holder field init). An
+/// rsbinder-to-rsbinder round trip cannot catch a wrong value, because both
+/// ends share the encoding; only a golden byte or libbinder interop does.
 ///
 /// # Relaying undecoded bytes
 ///
-/// A holder that still carries undecoded bytes taken from an RPC or
-/// data-only parcel — one read from an RPC transaction, or decoded with
-/// `from_bytes` (the `rpc` feature) — cannot be written into a kernel parcel:
-/// the write returns `BadType` rather than handing a kernel reader bytes no
-/// session vouched for. Calling
-/// [`get_parcelable::<T>`](Self::get_parcelable) for the payload's own type
-/// first resolves the bytes into a typed value, and that value re-encodes
-/// into any parcel. So whether a relay succeeds depends on whether the
-/// holder has been resolved, not only on where its bytes came from.
+/// A holder read from a parcel keeps the payload's bytes undecoded until
+/// [`get_parcelable::<T>`](Self::get_parcelable) is called for the payload's
+/// own type. Writing such a holder copies those bytes, and the copy has to
+/// stay meaningful in the destination, so it succeeds only where the objects
+/// in it can follow:
+///
+/// - Into a kernel parcel only from a kernel parcel. Bytes from an RPC
+///   transaction or from `from_bytes` (the `rpc` feature) are `BadType`
+///   rather than bytes a kernel reader would trust.
+/// - Into an RPC session parcel only from a parcel of the same session
+///   (AOSP `Parcel::appendFrom`); a holder read from a kernel parcel, from
+///   `from_bytes` or from another session is `BadType`.
+/// - Within one session, on the android-16 wire (v2), which records where
+///   each binder and fd sits: every binder in the payload takes its own
+///   reference and every fd is duplicated, as AOSP `appendFrom` does from
+///   android-16.0.0_r4, so the relay may carry both.
+/// - Within one session on the r34 wire or android-13+ v0/v1: `BadType` for
+///   any non-empty payload, data-only ones included. These wires do not
+///   record where a binder sits, so the copy could not take the references
+///   its binders need, and cannot prove there are none.
+///
+/// Resolving first always works: [`get_parcelable::<T>`](Self::get_parcelable)
+/// decodes the payload into a typed value, and that value re-encodes into any
+/// parcel it could be written to directly. So whether a relay succeeds
+/// depends on whether the holder has been resolved, not only on where its
+/// bytes came from. A handler whose reply fails this way returns the status
+/// to its caller; the session stays usable.
+///
+/// Reading is not limited this way: a holder read from an RPC parcel decodes
+/// its binders on every wire, and its fds on v1 and v2 (r34 and v0 record no
+/// fd position, so an fd in an undecoded payload cannot be decoded there).
 #[derive(Debug)]
 pub struct ParcelableHolder {
-    // This is a `Mutex` because of `get_parcelable`
-    // which takes `&self` for consistency with C++.
-    // We could make `get_parcelable` take a `&mut self`
-    // and get rid of the `Mutex` here for a performance
-    // improvement, but then callers would require a mutable
-    // `ParcelableHolder` even for that getter method.
+    // A `Mutex` because `get_parcelable` takes `&self`, as in C++; see the struct rustdoc.
     data: Mutex<ParcelableHolderData>,
     stability: Stability,
 }
@@ -204,6 +275,16 @@ impl ParcelableHolder {
     pub fn get_stability(&self) -> Stability {
         self.stability
     }
+
+    /// The undecoded payload parcel, if any, for a test of what `read_from_parcel` kept.
+    #[cfg(all(test, feature = "rpc"))]
+    pub(crate) fn with_payload_parcel<R>(&self, f: impl FnOnce(Option<&mut Parcel>) -> R) -> R {
+        let mut data = self.data.lock().expect("Parcelable holder lock poisoned");
+        match *data {
+            ParcelableHolderData::Parcel(ref mut p) => f(Some(p)),
+            _ => f(None),
+        }
+    }
 }
 
 impl Serialize for ParcelableHolder {
@@ -247,21 +328,7 @@ impl Deserialize for ParcelableHolder {
     }
 }
 
-/// Encode a holder's stability as AOSP's `Parcelable::Stability` enum
-/// (`STABILITY_LOCAL = 0`, `STABILITY_VINTF = 1`).
-///
-/// This is a *different* wire value from the binder-object
-/// `internal::Stability::Level` bitmask (0/3/12/63 via `From<Stability> for
-/// i32`) used on the `writeStrongBinder` path, and it is version-independent:
-/// `frameworks/native/libs/binder/ParcelableHolder.cpp` writes
-/// `writeInt32(static_cast<int32_t>(getStability()))` unchanged on every
-/// Android version (verified byte-identical between android-12 and android-16),
-/// with no `Category` repr or Android-12 `0x0c000000` adjustment. The AIDL
-/// `@VintfStability` annotation maps a holder field to `STABILITY_VINTF`
-/// (`system/tools/aidl` `generate_cpp.cpp`); everything else is
-/// `STABILITY_LOCAL`. Reusing the binder-object encoding here put 63 (and
-/// `0x0c00003f` on Android 12) on the wire where a real libbinder peer expects
-/// 1, so any `@VintfStability` holder field was rejected with `BAD_VALUE`.
+/// AOSP `Parcelable::Stability` (0 local, 1 VINTF), not the binder bitmask; see module doc.
 fn parcelable_stability_repr(stability: Stability) -> i32 {
     match stability {
         Stability::Vintf => 1, // STABILITY_VINTF
@@ -318,53 +385,35 @@ impl Parcelable for ParcelableHolder {
 
             return Err(StatusCode::BadValue);
         }
+        // AOSP `ParcelableHolder::readFromParcel`: any later failure leaves the holder empty.
+        *self
+            .data
+            .get_mut()
+            .expect("Parcelable holder lock poisoned") = ParcelableHolderData::Empty;
 
         let data_size: i32 = parcel.read()?;
         if data_size < 0 {
-            // C++ returns BAD_VALUE here,
-            // while Java returns ILLEGAL_ARGUMENT
+            // C++ returns BAD_VALUE here, while Java returns ILLEGAL_ARGUMENT.
             return Err(StatusCode::BadValue);
         }
         if data_size == 0 {
-            *self
-                .data
-                .get_mut()
-                .expect("Parcelable holder lock poisoned") = ParcelableHolderData::Empty;
             return Ok(());
         }
 
-        // TODO: C++ ParcelableHolder accepts sizes up to SIZE_MAX here, but we
-        // only go up to i32::MAX because that's what our API uses everywhere
         let data_start: usize = parcel.data_position();
         let data_end: usize = data_start
             .checked_add(data_size as usize)
             .ok_or(StatusCode::BadValue)?;
 
-        // The payload keeps the marshalling mode of the parcel it came from.
-        // Handing RPC / data-only bytes to a kernel-mode reader would let a
-        // forged `flat_binder_object` resolve through the kernel object path:
-        // `read_object`'s null-meta shortcut returns a null-pointer,
-        // null-cookie object without consulting the offset table, so
-        // `BINDER_TYPE_HANDLE` with handle 0 would become a live proxy.
-        let mut new_parcel = Parcel::new();
-        #[cfg(feature = "rpc")]
-        if !parcel.is_kernel_backed() {
-            new_parcel.set_for_rpc(true);
-            if let Some(ops) = parcel.rpc_ops() {
-                new_parcel.attach_rpc_ops(ops);
-            }
-        }
-        new_parcel.append_from(parcel, data_start, data_size as usize)?;
+        // Same mode and objects as the source (module doc "Data-only payloads", "Objects").
+        let new_parcel = parcel.sub_parcel(data_start, data_size as usize)?;
         *self
             .data
             .get_mut()
             .expect("Parcelable holder lock poisoned") =
             ParcelableHolderData::Parcel(Box::new(new_parcel));
 
-        // `append_from` checks whether `data_size` overflows
-        // `parcel` and returns `BAD_VALUE` if that happens. We also
-        // explicitly check for negative and zero `data_size` above,
-        // so `data_end` is guaranteed to be greater than `data_start`.
+        // `sub_parcel` bounded `data_size`, and it is positive, so `data_end` is in range.
         parcel.set_data_position(data_end);
 
         Ok(())
@@ -377,19 +426,7 @@ mod tests {
 
     #[test]
     fn holder_serializes_parcelable_stability_not_binder_level_bitmask() {
-        // A `ParcelableHolder` writes AOSP's `Parcelable::Stability` enum
-        // (`STABILITY_LOCAL = 0`, `STABILITY_VINTF = 1`), NOT the binder-object
-        // `internal::Stability::Level` bitmask (0/3/12/63). A `@VintfStability`
-        // holder therefore puts `1` on the wire; a real libbinder peer rejects
-        // any other value (the old 63, or `0x0c00003f` on Android 12) with
-        // BAD_VALUE. Golden values verified against android-12 and android-16
-        // `frameworks/native/libs/binder/ParcelableHolder.cpp` + `Parcelable.h`
-        // and `system/tools/aidl` `generate_cpp.cpp` (vintf holder field init).
-        //
-        // This cannot be caught by rsbinder<->rsbinder round trips: both ends
-        // share the same encoding, so a wrong-but-symmetric value always
-        // agrees. Only a fixed golden byte (or real-libbinder interop) detects
-        // it — hence the explicit `== 1` / `== 0` assertions below.
+        // Golden bytes, as a symmetric round trip cannot catch a wrong value; see struct rustdoc.
         let vintf = ParcelableHolder::new(Stability::Vintf);
         let mut vp = Parcel::new();
         vintf.write_to_parcel(&mut vp).unwrap();
@@ -415,8 +452,7 @@ mod tests {
         let mut dst = ParcelableHolder::new(Stability::Vintf);
         dst.read_from_parcel(&mut vp).unwrap();
 
-        // The stability-mismatch guard still holds: a fresh Local holder must
-        // reject a Vintf (1) wire value with BadValue.
+        // A Local holder still rejects a Vintf (1) wire value with BadValue.
         vp.set_data_position(0);
         let mut local_dst = ParcelableHolder::default();
         assert!(matches!(
@@ -425,9 +461,7 @@ mod tests {
         ));
     }
 
-    /// `ParcelableHolder` is non-nullable: only `NON_NULL_PARCELABLE_FLAG`
-    /// (`1`) is accepted. Null (`0`) and any other sentinel are rejected as
-    /// `UnexpectedNull`, never silently treated as present.
+    /// Non-nullable: only `NON_NULL_PARCELABLE_FLAG` (1) passes; 0 or garbage is `UnexpectedNull`.
     #[test]
     fn holder_rejects_null_and_garbage_sentinels() {
         for status in [NULL_PARCELABLE_FLAG, 2, -1] {
@@ -444,18 +478,7 @@ mod tests {
         }
     }
 
-    /// A holder carries its payload in a sub-parcel built by
-    /// `read_from_parcel`. That sub-parcel must inherit the marshalling
-    /// mode of the parcel it was cut from, or the data-only decoder
-    /// behind [`crate::from_bytes`] hands its bytes to a kernel-mode
-    /// reader — and `read_object`'s null-meta shortcut waves a
-    /// null-pointer, null-cookie object through without an offset-table
-    /// entry, so a forged `BINDER_TYPE_HANDLE` with handle 0 would
-    /// become a proxy to the context manager (or panic on
-    /// `ProcessState::as_self()` in a process that never initialized the
-    /// driver). Both outcomes contradict what `from_bytes` promises
-    /// about bytes you did not write.
-    #[cfg(feature = "rpc")]
+    /// The payload sub-parcel inherits data-only mode; see module doc "Data-only payloads".
     #[test]
     fn a_forged_object_inside_a_holder_never_becomes_a_binder() {
         #[derive(Debug, Default)]
@@ -477,9 +500,7 @@ mod tests {
             }
         }
 
-        // Descriptor, then the 24 bytes of a `flat_binder_object` naming
-        // handle 0 with a null pointer and cookie, then the trailing
-        // stability `int32` the kernel binder path reads after it.
+        // Descriptor, a null-pointer/cookie handle-0 `flat_binder_object`, then its stability i32.
         let mut payload = Parcel::new_data_only();
         payload
             .write(&BinderCarrier::descriptor().to_string())
@@ -505,14 +526,7 @@ mod tests {
         );
     }
 
-    /// Keeping the payload data-only is not enough on its own: serializing
-    /// the holder into a *kernel* parcel would copy those bytes back into a
-    /// buffer whose reader trusts them. `read_object`'s null-meta shortcut
-    /// waves a null-pointer, null-cookie `flat_binder_object` through with
-    /// no offset-table entry, so one kernel round trip would turn file
-    /// bytes into a proxy for the context manager. `append_from` refuses
-    /// the copy instead; a same-mode sink still accepts the holder.
-    #[cfg(feature = "rpc")]
+    /// `append_from` refuses a data-only holder into a kernel parcel; see "Data-only payloads".
     #[test]
     fn a_data_only_holder_is_refused_by_a_kernel_parcel() {
         let mut payload = Parcel::new_data_only();
@@ -545,5 +559,41 @@ mod tests {
         data_only
             .write(&holder)
             .expect("a same-mode sink still accepts the holder");
+    }
+
+    /// AOSP `readFromParcel`: past the stability check, a failed read leaves the holder empty.
+    #[test]
+    fn a_failed_read_empties_the_holder() {
+        #[derive(Debug, Default)]
+        struct Value(i32);
+        impl ParcelableMetadata for Value {
+            fn descriptor() -> &'static str {
+                "rsbinder.test.Value"
+            }
+        }
+        impl Parcelable for Value {
+            fn write_to_parcel(&self, parcel: &mut Parcel) -> Result<()> {
+                parcel.write(&self.0)
+            }
+            fn read_from_parcel(&mut self, parcel: &mut Parcel) -> Result<()> {
+                self.0 = parcel.read()?;
+                Ok(())
+            }
+        }
+        // (stability, payload size): wrong stability keeps the value, as AOSP returns first.
+        for (stability, size, kept) in [(1i32, 0i32, true), (0, -1, false), (0, 64, false)] {
+            let mut holder = ParcelableHolder::default();
+            holder.set_parcelable(Arc::new(Value(9))).unwrap();
+            let mut p = Parcel::new();
+            p.write(&stability).unwrap();
+            p.write(&size).unwrap();
+            p.set_data_position(0);
+            assert!(
+                holder.read_from_parcel(&mut p).is_err(),
+                "({stability}, {size})"
+            );
+            let value = holder.get_parcelable::<Value>().unwrap().map(|v| v.0);
+            assert_eq!(value, kept.then_some(9), "({stability}, {size})");
+        }
     }
 }

@@ -23,6 +23,10 @@ android_16 = ["rsbinder/android_16"]
 # a STAGE3 harness rather than an example, so it carries the feature
 # rather than the counters being on for everyone.
 test-util = ["rsbinder/test-util"]
+# Plaintext TCP (`rsbinder/rpc-tcp-debug`) for the inet half of
+# `run_rpc_incoming_interop.sh`: libbinder's inet RPC server has no TLS
+# unless both sides set up certificates.
+tcp-debug = ["rsbinder/rpc-tcp-debug"]
 
 [[bin]]
 name = "rpc_hello_service"
@@ -133,12 +137,10 @@ name = "shm_client"
 
 # Data serialization: AIDL parcelables stored in a file with
 # `rsbinder::to_bytes` instead of sent in a transaction. Talks to nothing —
-# no binder device, no socket. `rpc` carries the session-less parcel mode
-# `to_bytes` encodes in.
-#   cargo run -p example-hello --features rpc --bin serde_demo
+# no binder device, no socket, and no feature.
+#   cargo run -p example-hello --bin serde_demo
 [[bin]]
 name = "serde_demo"
-required-features = ["rpc"]
 
 # STAGE3 gate for the Android 15 service-manager split: drives the whole
 # `hub` surface against a real AOSP `servicemanager` and checks that every

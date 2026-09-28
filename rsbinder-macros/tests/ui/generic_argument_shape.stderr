@@ -1,0 +1,17 @@
+error: `.aidl` names a type argument bare — it refuses an array, a `List` or `@nullable` there, so this has no `.aidl` form; wrap it in a parcelable of its own
+  --> tests/ui/generic_argument_shape.rs:13:48
+   |
+13 |     fn f(&self) -> rsbinder::BinderResult<Pair<Vec<i32>>>;
+   |                                                ^^^^^^^^
+
+error: `.aidl` names a type argument bare — it refuses an array, a `List` or `@nullable` there, so this has no `.aidl` form; wrap it in a parcelable of its own
+  --> tests/ui/generic_argument_shape.rs:18:26
+   |
+18 |     fn f(&self, p: &Pair<[i32; 3]>) -> rsbinder::BinderResult<()>;
+   |                          ^^^^^^^^
+
+error: `.aidl` names a type argument bare — it refuses an array, a `List` or `@nullable` there, so this has no `.aidl` form; wrap it in a parcelable of its own
+  --> tests/ui/generic_argument_shape.rs:23:17
+   |
+23 |     pub p: Pair<Option<Cfg>>,
+   |                 ^^^^^^^^^^^

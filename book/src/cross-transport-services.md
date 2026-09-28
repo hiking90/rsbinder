@@ -326,14 +326,9 @@ or — inside a handler, for the call being served — `calling_caps()`.
 |---|:---:|:---:|:---:|:---:|
 | `FD_PASSING` | ✅ | after negotiating `Unix` fd mode | ❌ | ❌ |
 | `TRUSTED_UID` | ✅ | ✅ | ❌ | ❌ |
-| `CALLBACKS` | ✅ | with `incoming_connections > 0` | ❌[^cb] | ❌[^cb] |
+| `CALLBACKS` | ✅ | with `incoming_connections > 0` | with `incoming_connections > 0` | with `incoming_connections > 0` |
 | `SAME_HOST` | ✅ | ✅ | ❌ | ❌ |
 | `KERNEL_KNOBS` | ✅ | ❌ | ❌ | ❌ |
-
-[^cb]: Incoming (callback) connections are Unix-only today —
-`ClientOptions::incoming_connections` on a `vsock://` or `tls://` URI is
-`BadValue`, and the session layer offers the option only on
-`RpcUnixClientConfig`. So a vsock or TLS session never reports `CALLBACKS`.
 
 Three things to keep straight.
 

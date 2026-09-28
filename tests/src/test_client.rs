@@ -1871,6 +1871,33 @@ fn test_binder_array() {
     assert_eq!(result, Ok(array));
 }
 
+/// A received proxy goes back in the service's reply, which pins it (`Parcel` "Kernel proxies").
+#[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
+fn test_binder_array_returns_a_received_proxy() {
+    let service = get_test_service();
+
+    for i in 0..20 {
+        let local =
+            INamedCallback::BnNamedCallback::new_binder(ExtNamedCallback(format!("echo_{i}")));
+        let array = vec![local.as_binder()];
+        let mut repeated = vec![Default::default(); array.len()];
+
+        let result = service
+            .ReverseIBinderArray(&array, &mut repeated)
+            .unwrap_or_else(|err| panic!("ReverseIBinderArray iter {i} failed: {err:?}"));
+        assert_eq!(result, array, "iter {i}");
+        assert_eq!(
+            repeated.into_iter().collect::<Option<Vec<_>>>(),
+            Some(array),
+            "iter {i}"
+        );
+    }
+}
+
 #[test]
 #[cfg_attr(
     not(any(target_os = "linux", target_os = "android")),

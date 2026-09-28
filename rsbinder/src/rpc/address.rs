@@ -58,6 +58,9 @@ impl RpcAddress {
     /// disjoint — uniqueness then holds across the *whole connection*,
     /// not just one endpoint. The counter is session-owned (no global);
     /// the value is never `zero()` (counter ≥ 1).
+    ///
+    /// A consequence: a peer-supplied address carrying *our* role tag is one this end would
+    /// have minted itself, so it must already be in the local table, never a fresh remote.
     pub fn unique(counter: &mut u64, space: AddressSpace) -> Self {
         *counter = counter.wrapping_add(1);
         let mut bytes = [0u8; RPC_ADDR_LEN];
@@ -66,10 +69,7 @@ impl RpcAddress {
         RpcAddress { bytes }
     }
 
-    /// The allocating-role tag byte (see [`unique`](Self::unique)): which
-    /// endpoint's subspace this address was minted in. A peer-supplied
-    /// address carrying *our* tag is one we would have minted ourselves —
-    /// and so must already be in our local table, never a fresh remote.
+    /// The role tag byte naming the subspace that minted this address; see [`Self::unique`].
     pub(crate) fn space_tag(&self) -> u8 {
         self.bytes[8]
     }
@@ -167,8 +167,7 @@ mod tests {
         assert_eq!(RpcAddress::zero().as_wire_bytes(), &[0u8; RPC_ADDR_LEN]);
     }
 
-    /// 1e6 `unique()` calls in one session collide 0 times and never
-    /// equal `zero()`.
+    /// 1e6 `unique()` calls in one session collide 0 times and never equal `zero()`.
     #[test]
     fn unique_is_collision_free_and_nonzero() {
         let mut ctr = 0u64;
@@ -211,9 +210,7 @@ mod tests {
             SpecialTransaction::from_code(2),
             Some(SpecialTransaction::GetSessionId)
         );
-        // 0..=2 are the android-12 r34 special codes. Code 3
-        // (`GetFdMode`) is the rsbinder FD-mode extension — explicitly
-        // NOT r34, sent only when a client opts into FD passing.
+        // 0..=2 are r34's; 3 (`GetFdMode`) is an rsbinder extension, sent only on FD opt-in.
         assert_eq!(
             SpecialTransaction::from_code(3),
             Some(SpecialTransaction::GetFdMode)

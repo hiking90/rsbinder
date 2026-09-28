@@ -4,10 +4,18 @@
 # drives an rsbinder **client**'s callback from a plain `std::thread`; the
 # client opened one incoming connection (`incoming_connections(1)`).
 #
+# Two runs of the same pair: over a Unix socket, and over loopback inet
+# (plan 10-7 Phase 0 — incoming connections on every RPC transport; the
+# rsbinder client builds them with `RpcClientConfig` over plaintext TCP,
+# as libbinder's inet server speaks no TLS without certificates on both
+# sides).
+#
 # STATUS: see the bottom of this file / the plan (plans/2-20-*.md).
 #
 # Prereqs: as run_rpc_multiconn_interop.sh (Android 16 AVD, NDK, cargo ndk,
-# the rustup target for the device's ABI).
+# the rustup target for the device's ABI). The Unix-socket half needs
+# `adb root` first: the `shell` SELinux domain cannot create a socket file
+# under /data/local/tmp (EACCES); the inet half runs as `shell`.
 #
 # Usage: ./run_rpc_incoming_interop.sh [-s emulator-5554] [-t <abi>]
 # The ABI defaults to the device's own; -t overrides it.
@@ -18,6 +26,7 @@ set -euo pipefail
 DEVICE=emulator-5554
 ABI=""
 SOCK=/data/local/tmp/rsinc.sock
+INET_PORT=5711
 CPP_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$CPP_DIR/../.." && pwd)"
 NDK="${ANDROID_NDK_HOME:-/opt/homebrew/share/android-ndk}"
@@ -53,17 +62,20 @@ done
 [ -n "$CXX" ] || { echo "no NDK clang++ for $TRIPLE at API <= $sdk under $NDK" >&2; exit 2; }
 echo "==> target $TRIPLE, API $API (device SDK $sdk)"
 
-echo "==> verifying device $DEVICE is Android 16"
-[[ "$sdk" == "36" ]] || { echo "device $DEVICE is SDK $sdk, expected 36"; exit 1; }
+# Android 17 (SDK 37) speaks the android-16 RPC wire byte for byte.
+echo "==> verifying device $DEVICE is Android 16 or later"
+[[ "$sdk" -ge 36 ]] || { echo "device $DEVICE is SDK $sdk, expected >= 36"; exit 1; }
 
 echo "==> pulling libbinder_*.so so we can link against them"
-adb -s "$DEVICE" pull /system/lib64/libbinder_ndk.so /tmp/libbinder_ndk.so >/dev/null
-adb -s "$DEVICE" pull /system/lib64/libbinder_rpc_unstable.so /tmp/libbinder_rpc_unstable.so >/dev/null
+SYS="$REPO_ROOT/target/rpc_incoming_interop/sys"
+mkdir -p "$SYS"
+adb -s "$DEVICE" pull /system/lib64/libbinder_ndk.so "$SYS/libbinder_ndk.so" >/dev/null
+adb -s "$DEVICE" pull /system/lib64/libbinder_rpc_unstable.so "$SYS/libbinder_rpc_unstable.so" >/dev/null
 
 echo "==> building C++ server launcher (NDK)"
 "$CXX" \
     -O2 -Wall -std=c++17 -static-libstdc++ \
-    -L /tmp \
+    -L "$SYS" \
     -lbinder_ndk -lbinder_rpc_unstable -llog \
     "$CPP_DIR/rpc_incoming_interop_launcher.cpp" \
     -o "$CPP_DIR/rpc_incoming_interop_launcher"
@@ -71,7 +83,7 @@ echo "==> building C++ server launcher (NDK)"
 echo "==> cross-compiling rsbinder client"
 ( cd "$REPO_ROOT" && ANDROID_NDK_HOME="$NDK" \
     cargo ndk -t "$TRIPLE" -p "$API" build --release -p example-hello \
-        --features rpc,test-util \
+        --features rpc,test-util,tcp-debug \
         --bin rpc_incoming_interop_client )
 
 echo "==> pushing binaries"
@@ -79,33 +91,55 @@ adb -s "$DEVICE" push "$CPP_DIR/rpc_incoming_interop_launcher" /data/local/tmp/ 
 adb -s "$DEVICE" push "$REPO_ROOT/target/$TRIPLE/release/rpc_incoming_interop_client" \
     /data/local/tmp/ >/dev/null
 
-echo "==> killing any old launcher + cleaning state"
-adb -s "$DEVICE" shell "pkill -9 -f rpc_incoming_interop 2>/dev/null; rm -f $SOCK /data/local/tmp/rsinc.stdout /data/local/tmp/rsinc.stderr; sleep 1" || true
+FAILED=0
+# run_pair <label> <launcher arg> <client arg>
+run_pair() {
+    echo
+    echo "=== $1"
+    echo "==> killing any old launcher + cleaning state"
+    # Bracket pattern: the plain one matches this `sh -c` itself, and
+    # `pkill -f` kills the shell before it reaches the `rm` and the sleep.
+    adb -s "$DEVICE" shell "pkill -9 -f '[r]pc_incoming_interop' 2>/dev/null; rm -f $SOCK /data/local/tmp/rsinc.stdout /data/local/tmp/rsinc.stderr; sleep 1" || true
 
-echo "==> starting libbinder server launcher (background)"
-adb -s "$DEVICE" shell "nohup /data/local/tmp/rpc_incoming_interop_launcher $SOCK > /data/local/tmp/rsinc.stdout 2> /data/local/tmp/rsinc.stderr &" &
-sleep 3
-adb -s "$DEVICE" shell "cat /data/local/tmp/rsinc.stderr"
+    echo "==> starting libbinder server launcher (background)"
+    adb -s "$DEVICE" shell "nohup /data/local/tmp/rpc_incoming_interop_launcher $2 > /data/local/tmp/rsinc.stdout 2> /data/local/tmp/rsinc.stderr &" &
+    # The launcher prints READY once it has bound, and the client's session
+    # setup has no retry: a fixed sleep decides this gate on a cold device.
+    for _ in $(seq 1 40); do
+        if [ -n "$(adb -s "$DEVICE" shell "grep READY /data/local/tmp/rsinc.stderr 2>/dev/null")" ]; then
+            break
+        fi
+        sleep 0.5
+    done
+    adb -s "$DEVICE" shell "cat /data/local/tmp/rsinc.stderr"
 
-echo "==> running rsbinder client"
-# `timeout` so a wedged client fails the gate instead of hanging it; the
-# client carries its own 60 s watchdog, this is the backstop for a stall
-# before that thread starts (adb itself, a dead device).
-client_out=$(timeout 180 adb -s "$DEVICE" shell "/data/local/tmp/rpc_incoming_interop_client $SOCK 2>&1; echo client-exit=\$?" | tr -d '\r') || true
-printf '%s\n' "$client_out"
+    echo "==> running rsbinder client"
+    # `timeout` so a wedged client fails the gate instead of hanging it; the
+    # client carries its own 60 s watchdog, this is the backstop for a stall
+    # before that thread starts (adb itself, a dead device).
+    local client_out
+    client_out=$(timeout 180 adb -s "$DEVICE" shell "/data/local/tmp/rpc_incoming_interop_client $3 2>&1; echo client-exit=\$?" | tr -d '\r') || true
+    printf '%s\n' "$client_out"
 
-echo "==> server log"
-adb -s "$DEVICE" shell "cat /data/local/tmp/rsinc.stderr"
+    echo "==> server log"
+    adb -s "$DEVICE" shell "cat /data/local/tmp/rsinc.stderr"
 
-echo "==> stopping launcher"
-adb -s "$DEVICE" shell "pkill -9 -f rpc_incoming_interop_launcher 2>/dev/null; rm -f $SOCK" || true
+    echo "==> stopping launcher"
+    adb -s "$DEVICE" shell "pkill -9 -f '[r]pc_incoming_interop_launcher' 2>/dev/null; rm -f $SOCK" || true
 
-if ! grep -q '^client-exit=0$' <<<"$client_out"; then
-    echo "FAIL: rsbinder client exited non-zero"
-    exit 1
-fi
-if ! grep -q '^PASS' <<<"$client_out"; then
-    echo "FAIL: no PASS marker"
-    exit 1
-fi
-echo "PASS: plan 2-20 (e) rsbinder incoming connection ↔ real libbinder RpcServer"
+    if ! grep -q '^client-exit=0$' <<<"$client_out"; then
+        echo "FAIL ($1): rsbinder client exited non-zero"
+        FAILED=1
+    elif ! grep -q '^PASS' <<<"$client_out"; then
+        echo "FAIL ($1): no PASS marker"
+        FAILED=1
+    else
+        echo "PASS ($1)"
+    fi
+}
+
+run_pair "unix" "$SOCK" "$SOCK"
+run_pair "inet" "tcp:$INET_PORT" "tcp:127.0.0.1:$INET_PORT"
+
+[ "$FAILED" -eq 0 ] || exit 1
+echo "PASS: plan 2-20 (e) rsbinder incoming connection ↔ real libbinder RpcServer (unix + inet)"

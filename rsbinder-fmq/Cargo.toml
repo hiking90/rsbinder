@@ -1,0 +1,39 @@
+[package]
+name = "rsbinder-fmq"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+description = "AOSP-compatible Fast Message Queue (libfmq) in pure Rust — a shared-memory ring with futex wake-ups, independent of binder."
+homepage = { workspace = true }
+repository = { workspace = true }
+readme = "README.md"
+rust-version = { workspace = true }
+keywords = ["android", "fmq", "shared-memory", "ipc", "linux"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+# `time` is for the absolute `CLOCK_MONOTONIC` deadline a futex wait takes;
+# `param` for the page size the mappings are aligned to. Both compile on every
+# unix, which keeps one implementation of the queue for all targets — the
+# platform-specific primitives live in `src/sys.rs`.
+rustix = { workspace = true, features = ["fs", "mm", "param", "time"] }
+# A wake that fails after a committed transfer is logged, as libfmq's
+# `EventFlag::wake` does, rather than returned.
+log = { workspace = true }
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+# `thread` carries the futex calls; rustix has them only for Linux.
+rustix = { workspace = true, features = ["thread"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# `ASHMEM_GET_SIZE`: rustix's ioctl patterns carry no "the return value is
+# the result" shape, and libcutils reads the size exactly that way.
+libc = { workspace = true }
+
+[dev-dependencies]
+# `net` is for the two-process test, which hands the queue's fd to a child
+# over a unix socket (`SCM_RIGHTS`) — the transport the plan assigns to F1,
+# before any binder wiring exists.
+rustix = { workspace = true, features = ["net"] }

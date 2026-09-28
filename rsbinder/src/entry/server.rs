@@ -78,6 +78,9 @@ pub struct ServeOptions {
     /// over those sockets is still available one layer down
     /// (`RpcServer::setup_unix_server_tls` / `setup_vsock_server_tls`),
     /// with a hand-assembled `TlsTransport::connect_stream` client.
+    /// Refusing rather than ignoring matters most on an abstract socket,
+    /// which has no filesystem permissions, so mTLS may be the only
+    /// authentication the operator configured.
     #[cfg(feature = "rpc-tls")]
     pub tls: Option<std::sync::Arc<crate::rpc::rustls::ServerConfig>>,
     /// RPC: `RpcServer::set_supported_fd_modes`. Advertising
@@ -100,6 +103,7 @@ pub struct ServeOptions {
 /// asked for a different driver or thread count, which the process
 /// cannot give it). RPC: the listener is bound at `run`/`spawn` so
 /// [`ServeOptions`] (TLS config, limits) can be applied first.
+#[must_use = "a Server serves nothing until `run` or `spawn` is called"]
 pub struct Server {
     uri: Uri,
     options: ServeOptions,
@@ -112,6 +116,11 @@ pub struct Server {
 /// drop returns whether or not clients are still attached. For the
 /// kernel there is nothing to stop — the process thread pool has no
 /// shutdown — so the guard is inert.
+///
+/// Bind it to a named variable (`let _server = ...`): `let _ = ...` and a
+/// bare `spawn()?;` drop it at once, which stops an RPC server while the
+/// same line keeps a kernel server running.
+#[must_use = "dropping the guard stops an RPC server; bind it to a named variable"]
 pub struct ServerGuard {
     #[cfg(feature = "rpc")]
     rpc: Option<(
@@ -152,8 +161,7 @@ impl ServerGuard {
     fn stop(&mut self) {
         #[cfg(feature = "rpc")]
         if let Some((server, jh)) = self.rpc.take() {
-            // Flag first so the accept loop exits; join it so nothing is
-            // accepted past this point; then end what is connected.
+            // Flag, then join, so nothing is accepted after this; then end what is connected.
             server.stop_accepting();
             if jh.join().is_err() {
                 log::warn!("RPC: accept loop thread panicked");
@@ -193,29 +201,13 @@ pub(super) fn new_server(uri: Uri) -> Result<Server> {
     })
 }
 
-/// Initialize the process-global kernel `ProcessState` (idempotent).
-///
-/// The process-wide state is fixed by whoever initializes it first, so a
-/// later caller naming a *different* driver or `max_threads` cannot have
-/// what it asked for. That is [`StatusCode::BadValue`], the same answer
-/// every other inapplicable option gets from this layer — an option this
-/// facade cannot honor is refused, never silently dropped. Omitting the
-/// option (`None`) asks for nothing and always succeeds.
-///
-/// `max_threads` is `None` when the URI carried no `?threads=`, which is
-/// the only thing that means "the default" — `?threads=0` asks for a
-/// literal zero and gets it, as [`ProcessState::init`] documents. The
-/// same reading applies to `mmap_size`.
+/// Idempotent kernel `ProcessState` init; `None` asks for nothing, a mismatch is `BadValue`.
 pub(super) fn kernel_init(
     driver: Option<&std::path::Path>,
     max_threads: Option<u32>,
     mmap_size: Option<usize>,
 ) -> Result<()> {
-    // Round (and range-check) before init so an impossible size is
-    // `BadValue` — what every other rejected option here returns —
-    // rather than the `NoInit` an init failure maps to, and so the
-    // comparison below is against the size the kernel would map rather
-    // than the bytes the caller happened to type.
+    // Normalize first: a bad size is `BadValue` (not `NoInit`) and compares as the kernel maps it.
     let mmap_size = mmap_size
         .map(ProcessState::normalized_mmap_size)
         .transpose()?;
@@ -233,11 +225,7 @@ pub(super) fn kernel_init(
         log::error!("rsbinder: ProcessState init failed: {e}");
         StatusCode::NoInit
     })?;
-    // Compare against the state `init` returned, not against a
-    // `is_initialized()` sample taken before it: two threads racing the
-    // first init both read `false` there, and the loser would drop its
-    // own options silently. When this call won, the values match by
-    // construction, so the check costs nothing.
+    // Check what `init` returned: a pre-init `is_initialized()` sample misses a racing init.
     let driver_mismatch = driver.is_some_and(|d| d != ps.driver_name());
     let threads_mismatch = max_threads.is_some_and(|n| n != ps.max_threads());
     let mmap_mismatch = mmap_size.is_some_and(|n| n != ps.mmap_size());
@@ -370,10 +358,7 @@ impl Server {
             return Err(self.reject("tls"));
         }
         if o.threads.is_some() || o.mmap_size.is_some() {
-            // Neither can change anything after init — the pool size and
-            // the receive mapping are both fixed there. Treat them like
-            // the URI form (`BadValue` on a mismatch) by re-running the
-            // idempotent init.
+            // Both are fixed at init; re-running init makes a mismatch `BadValue`, as in a URI.
             kernel_init(None, o.threads, o.mmap_size)?;
         }
         if let Some(cr) = o.call_restriction {
@@ -399,12 +384,7 @@ impl Server {
         }
         #[cfg(feature = "rpc-tls")]
         let tls = o.tls.clone();
-        // Same gate as `ClientOptions::tls`: the facade has no TLS client
-        // over a Unix or vsock socket, so a TLS server it built there
-        // would be unreachable from it. Refusing is the "never silently
-        // ignored" contract — and it matters most on an abstract socket,
-        // which has no filesystem permissions, so mTLS may be the only
-        // authentication the operator configured.
+        // As `ClientOptions::tls`: no facade TLS client over unix/vsock, so refuse, never ignore.
         #[cfg(feature = "rpc-tls")]
         if tls.is_some() && !matches!(uri.endpoint, Endpoint::Tls(..)) {
             log::error!(
@@ -479,9 +459,7 @@ impl Server {
         if let Some(t) = o.idle_timeout {
             server.set_idle_timeout(Some(t));
         }
-        // Before `run`/`run_background`, which the caller reaches only
-        // after `build_rpc` returns — the setter is read once per session,
-        // when its founding connection is accepted.
+        // Set before `run`: it is read once per session, when the founding connection is accepted.
         if let Some(t) = o.reply_timeout {
             server.set_reply_timeout(Some(t));
         }

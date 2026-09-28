@@ -21,9 +21,7 @@ fn expect_parse_ok(input: &str) {
 }
 
 fn error_message(e: &AidlError) -> String {
-    // Debug renders all inner diagnostics when the error is a
-    // Multiple-variant aggregate; Display would show only the outer
-    // "N error(s) occurred" wrapper.
+    // Debug renders every inner diagnostic of `Multiple`; Display shows only the wrapper.
     format!("{e:?}")
 }
 
@@ -117,11 +115,7 @@ interface IFoo {
 
 #[test]
 fn oneway_read_response_propagates_transport_error() {
-    // A oneway proxy call must surface a `submit_transact` transport
-    // failure (dead object, bad type) rather than swallow it as `Ok(())`.
-    // AOSP `generate_rust.cpp` emits `let _aidl_reply = _aidl_reply?;` for
-    // oneway too — the `?` sits *outside* its oneway guard — so the generated
-    // `read_response` must propagate before returning `Ok(())`.
+    // AOSP `generate_rust.cpp` puts `_aidl_reply?` outside its oneway guard: oneway propagates too.
     let ctx = SourceContext::new(
         "test.aidl",
         r#"
@@ -136,10 +130,7 @@ interface IFoo {
         .expect("generate")
         .1;
 
-    // The all-oneway interface's only `read_response` must propagate the
-    // reply Result via `?` (`_aidl_reply?;`); the non-oneway form is
-    // `_aidl_reply?.ok_or(...)`. A bare `Ok(())` would swallow transport
-    // errors.
+    // Only `read_response` here is oneway; the twoway form would be `_aidl_reply?.ok_or(...)`.
     assert!(
         out.contains("_aidl_reply?;"),
         "oneway read_response must propagate transport errors via `?`; generated:\n{out}"
@@ -148,8 +139,7 @@ interface IFoo {
 
 #[test]
 fn multiple_oneway_violations_are_all_reported() {
-    // Mirrors AOSP error-collection style — one violation should not
-    // mask the others in the same interface.
+    // AOSP collects errors: one violation must not mask the others in the same interface.
     let err = expect_parse_error(
         r#"
 interface IFoo {
