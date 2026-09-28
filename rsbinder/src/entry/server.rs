@@ -65,7 +65,8 @@ pub struct ServeOptions {
     /// The only bound on that wait, so set it on any server that issues
     /// callbacks to clients it does not control (see
     /// [`ClientOptions::incoming_connections`](super::ClientOptions::incoming_connections),
-    /// the client side of that path).
+    /// the client side of that path). Its expiry ends the session with
+    /// that client.
     pub reply_timeout: Option<Duration>,
     /// RPC: `RpcServer::set_authorizer` — accept/reject a peer by identity.
     #[cfg(feature = "rpc")]

@@ -38,11 +38,11 @@ pub struct ClientOptions {
     /// Setting this `> 0` makes the resulting [`Client`] one that must be
     /// shut down explicitly (`client.session().unwrap().close_session()`):
     /// the serving threads keep the session alive, so dropping every
-    /// handle reclaims nothing. It also makes the loss of the last such
-    /// connection this session's death — including a connection the
-    /// server retires on its own reply timeout, which closes the
-    /// founding connection and fires `binder_died` on every proxy while
-    /// the peer is still up. See
+    /// handle reclaims nothing. Like every connection of the session, the
+    /// loss of one ends the whole session — including the server's own
+    /// reply timeout elapsing on a slow callback handler, which closes the
+    /// founding connection and fires `binder_died` on every proxy although
+    /// the handler was only slow. See
     // The target only exists with `rpc`, so only link it then.
     #[cfg_attr(
         feature = "rpc",
@@ -63,7 +63,8 @@ pub struct ClientOptions {
     /// session as soon as it exists, so besides the calls made
     /// afterwards it bounds the round trips `open` makes *after* that
     /// point: the r34 fd-mode negotiation, and the `GET_MAX_THREADS` /
-    /// `GET_SESSION_ID` exchanges a multi-connection setup needs.
+    /// `GET_SESSION_ID` exchanges a multi-connection setup needs. An
+    /// expired reply wait ends the session.
     ///
     /// It does **not** bound the connection handshake, which runs before
     /// the session exists — use

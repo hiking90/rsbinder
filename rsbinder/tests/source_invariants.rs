@@ -29,28 +29,18 @@
 //!
 //! # `remove_slot` callers
 //!
-//! `RpcSessionInner::remove_slot` is private to `rpc/session.rs` and safe to call from more
-//! than one site because `find_conn` / `find_conn_pinned` return
-//! `Err(StatusCode::DeadObject)` (not an `expect` panic) when their reentrant slot lookup
-//! misses. `remove_slot_has_exactly_six_callers` pins the six sanctioned callers:
+//! `RpcSessionInner::remove_slot` is private to `rpc/session.rs`. A slot that carried a
+//! session frame leaves the pool only with the whole session (`on_session_dead`, `session`
+//! module doc "Session end"), so `remove_slot` exists only for a slot that never carried
+//! one. `remove_slot_has_exactly_two_callers` pins the two sanctioned callers, the attach
+//! rollbacks: an incoming connection whose serve thread failed to spawn, and a callback slot
+//! whose connection-init write never reached the client.
 //!
-//! - the slot's own `serve_blocking_on` exit;
-//! - `retire_after_failed_send`, the one rule every outbound frame's transport-level send
-//!   failure funnels through; it is what lets a serve-less client session reach death
-//!   detection (`remove_slot`'s empty-pool hook, Plan 2-17 A.1b);
-//! - `client_transact`'s two reply-wait slot-retiring paths: a reply wait that failed to arm,
-//!   read, decode or nested-dispatch, and the reply wait's refusal of a slot a nested call
-//!   marked unreadable;
-//! - the two attach rollbacks, which un-push a slot the peer can never use: an incoming
-//!   connection whose serve thread failed to spawn, and a callback slot whose
-//!   connection-init write never reached the client.
-//!
-//! The first three retire a slot whose peer is gone or whose stream is desynced, so it is
-//! never reused. A NEW caller MUST first re-audit that every slot-lookup path tolerates a
-//! missing slot; the bound guards against a lookup that assumes the slot is always present.
-//! The scan is
-//! `cfg`-blind (it reads every `.rs` under `src/`), so a `#[cfg(test)]` caller counts too:
-//! raise the number deliberately rather than route around it.
+//! A NEW caller that un-pushes a slot which carried a frame brings back the partial session
+//! that plan 2-24 removed: the peer's books count frames on it (a oneway number, a
+//! `DEC_STRONG`, a reply) that the session would then go on without. It MUST end the session
+//! instead (`fail_session`). The scan is `cfg`-blind (it reads every `.rs` under `src/`), so a
+//! `#[cfg(test)]` caller counts too: raise the number deliberately rather than route around it.
 //!
 //! # Byte order
 //!
@@ -157,9 +147,9 @@ fn prose_does_not_restate_refuted_shutdown_claims() {
     );
 }
 
-/// Pins `remove_slot`'s six callers in `rpc/session.rs`; see module doc "`remove_slot` callers".
+/// Pins `remove_slot`'s two callers in `rpc/session.rs`; see module doc "`remove_slot` callers".
 #[test]
-fn remove_slot_has_exactly_six_callers() {
+fn remove_slot_has_exactly_two_callers() {
     let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     // A binary pushed to a device cannot see the baked-in sources; host builds always can.
     if !src_root.is_dir() {
@@ -174,17 +164,13 @@ fn remove_slot_has_exactly_six_callers() {
     );
     assert_eq!(
         hits.len(),
-        6,
-        "RpcSessionInner::remove_slot must have exactly six callers. \
+        2,
+        "RpcSessionInner::remove_slot must have exactly two callers. \
          Found {} call sites: {:#?}\n\
-         INVARIANT: only serve_blocking_on's exit path, \
-         retire_after_failed_send, client_transact's failed-reply-wait / \
-         unreadable-slot retirements, the \
-         incoming-connection attach's spawn-failure rollback, and the \
-         callback attach's init-write-failure rollback may call remove_slot — \
-         find_conn / find_conn_pinned must return DeadObject (not panic) \
-         on a missing slot. A new caller MUST audit every slot-lookup \
-         path before being added.",
+         INVARIANT: only the incoming-connection attach's spawn-failure \
+         rollback and the callback attach's init-write-failure rollback may \
+         call remove_slot — a slot that carried a session frame leaves the \
+         pool only with the session (fail_session / close).",
         hits.len(),
         hits,
     );

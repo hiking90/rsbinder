@@ -13,6 +13,11 @@
 //! One bullet per test whose mutant, or whose reason for an assertion,
 //! does not fit its one-line doc.
 //!
+//! - `client_timeout_on_hung_server`,
+//!   `a_reply_timeout_on_one_connection_ends_the_fan_out_session`: drop the
+//!   `fail_session` from `client_transact`'s reply-wait failure and the
+//!   session outlives its reply timeout, so the next call and the other
+//!   connection's call do not fail and no obituary fires.
 //! - `max_connections_admission_bound`: deleting the `max_connections`
 //!   gate in `RpcServer::run` serves the third client at once, so its
 //!   bounded-timeout `get_root` succeeds and the test fails.
@@ -31,9 +36,11 @@
 //!   echoes it and attaches, so `c2.get_session_id() == sid1` (the id
 //!   lives in `SharedSession`, so this holds only if state is shared) and
 //!   `attached_count == 1`; client #3 sends an unknown id and is
-//!   rejected. Dropping #2 must not end the session: #1 keeps working
-//!   with the same id. The full-teardown side is
-//!   `rpc_death_recipient_fires_on_session_drop`. Mutant: make
+//!   rejected. Dropping #2 ends the shared session, and #1 fails with
+//!   `DeadObject` (plan 2-24 D1); `ac_12_f8_attach_unifies_to_single_inner`
+//!   checks the same through the pool. Mutant for both: drop the
+//!   `fail_session` a serve loop's end calls
+//!   (`RpcSession::serve_blocking_on_inner`), and #1 keeps working. Mutant: make
 //!   `RpcServer::run_connection_in_worker`'s attach arm build a fresh
 //!   session with `RpcSession::from_android13plus(transport, codec,
 //!   client_fd_mode, fd_unix)`, as the empty-id arm does; #2 then gets its
@@ -910,7 +917,67 @@ fn client_timeout_on_hung_server() {
         t0.elapsed() < Duration::from_secs(2),
         "must return promptly on timeout, not block for the full 5s"
     );
+    // The late `REPLY` has no id to be told apart by, so the session ended (plan 2-24 D2).
+    assert_eq!(root.echo("after"), Err(StatusCode::DeadObject));
     // _cu handles teardown.
+}
+
+/// One connection's reply timeout ends a fan-out session: the other call dies, obituaries fire.
+#[test]
+fn a_reply_timeout_on_one_connection_ends_the_fan_out_session() {
+    let path = tmp_sock("tofan");
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    server.set_android13plus(1);
+    // Two outgoing connections and one callback connection from the client.
+    server.set_max_threads(2);
+    let slow_entered = Arc::new(AtomicBool::new(false));
+    server
+        .set_root(make_service_with_slow_signal(
+            Arc::new(AtomicI64::new(0)),
+            Arc::clone(&slow_entered),
+        ))
+        .expect("set_root");
+    let bg = server.run_background();
+    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
+    wait_for_sock(&path);
+
+    let client = RpcSession::setup_client_android13plus_with_config(
+        RpcClientConfig::unix(&path, 1)
+            .outgoing_connections(2)
+            .incoming_connections(1),
+    )
+    .expect("fan-out connect");
+    let root = EchoProxy(client.get_root().expect("get_root"));
+    // The incoming connection is what lets a client link (AOSP: max incoming threads >= 1).
+    let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let flag: Arc<DeathFlag> = Arc::new(DeathFlag(tx));
+    root.0
+        .link_to_death(Arc::downgrade(&flag) as _)
+        .expect("link_to_death");
+
+    // No deadline for this call: it can end only through the session's end.
+    let other = {
+        let root = EchoProxy(root.0.clone());
+        std::thread::spawn(move || root.slow(3_000))
+    };
+    assert!(
+        poll_until(|| slow_entered.load(Ordering::SeqCst)),
+        "the first slow call must hold a server worker"
+    );
+    // Well past the send, so that call has read the session's (absent) deadline already.
+    std::thread::sleep(Duration::from_millis(100));
+
+    client.set_timeout(Some(Duration::from_millis(200)));
+    assert_eq!(root.slow(3_000), Err(StatusCode::TimedOut));
+    assert_eq!(
+        other.join().expect("other call"),
+        Err(StatusCode::DeadObject),
+        "a call in flight on the other connection dies with the session"
+    );
+    rx.recv_timeout(Duration::from_secs(5))
+        .expect("the session's end fires the obituary");
+    assert_eq!(root.echo("after"), Err(StatusCode::DeadObject));
+    client.close_session();
 }
 
 // ---- opt-in android-13+ versioned-wire profile ---------------------
@@ -1223,7 +1290,7 @@ fn r34_profile_reports_no_wire_version() {
     drop(client);
 }
 
-/// Id-demux: echoed id attaches, unknown id is refused, partial loss survives; see module doc.
+/// Id-demux: echoed id attaches, unknown id is refused, one lost connection ends it; module doc.
 #[test]
 fn multi_connection_shared_session() {
     let path = tmp_sock("a0b");
@@ -1300,21 +1367,19 @@ fn multi_connection_shared_session() {
     // Sever only #2; `root2` first, as a proxy holds its session (AOSP `sp<>` in `BpBinder`).
     drop(root2);
     drop(c2);
-    // Poll the live-conn ledger to 1 (not a sleep), so the probe below sees a reaped state.
+    // One connection's loss ends the shared session (plan 2-24 D1, AOSP `handleRpcError`).
     let sid1_arr: [u8; 32] = sid1
         .as_slice()
         .try_into()
         .expect("32-byte session id (AOSP kSessionIdBytes)");
     assert!(
-        poll_until(|| server.session_live_conns(&sid1_arr) == Some(1)),
-        "partial-loss reap: server's attached worker must have \
-         decremented live_conns 2→1 within budget"
+        poll_until(|| matches!(server.session_live_conns(&sid1_arr), None | Some(0))),
+        "the attached connection's end must end the server's session"
     );
     assert_eq!(
-        c1.get_session_id().expect("get_session_id #1 post-partial"),
-        sid1,
-        "founding connection + shared session survive a partial \
-         (attached) connection loss — no spurious obituary/teardown"
+        c1.get_session_id(),
+        Err(StatusCode::DeadObject),
+        "the founding connection went down with the session"
     );
     assert_eq!(server.attached_count(), 1, "attach count stable post-drop");
 
@@ -1358,7 +1423,7 @@ fn ac_12_f8_attach_unifies_to_single_inner() {
         RpcClientConfig::unix(&path, 1).session_id(&sid),
     )
     .expect("a13+ #2 (attach)");
-    // No `_` prefix: the explicit `drop(root2)` below triggers the partial-loss reap.
+    // No `_` prefix: the explicit `drop(root2)` below ends connection #2.
     let root2 = EchoProxy(c2.get_root().expect("get_root #2"));
     assert!(
         poll_until(|| server.attached_count() == 1),
@@ -1371,18 +1436,14 @@ fn ac_12_f8_attach_unifies_to_single_inner() {
          (mutant: fresh-inner-on-attach leaves slot_count == 1)"
     );
 
-    // Partial loss: the pool shrinks back to 1 and the founding connection survives.
+    // One connection's end ends the one inner: its pool empties, the founding slot with it.
     drop(root2);
     drop(c2);
     assert!(
-        poll_until(|| server.session_slot_count(&sid_arr) == Some(1)),
-        "remove_slot on attached worker exit shrinks the pool back to 1"
+        poll_until(|| matches!(server.session_slot_count(&sid_arr), None | Some(0))),
+        "the session's end empties the founding inner's pool"
     );
-    assert_eq!(
-        c1.get_session_id().expect("get_session_id #1 post-partial"),
-        sid,
-        "founding still alive and on the same shared session"
-    );
+    assert_eq!(c1.get_session_id(), Err(StatusCode::DeadObject));
 }
 
 /// `set_max_threads(N)` (AOSP `setMaxIncomingThreads`) advertises and caps slots; see module doc.

@@ -846,7 +846,10 @@ impl RpcServer {
     ///
     /// Set it on any server that issues callbacks to clients it does not
     /// control. Size it against the slowest legitimate handler, not the
-    /// round-trip: it bounds the peer's *think time*. It also bounds the
+    /// round-trip: it bounds the peer's *think time*, and its expiry ends
+    /// the whole session with that client, as
+    /// [`RpcSession::set_timeout`](super::RpcSession::set_timeout)
+    /// describes. It also bounds the
     /// wait for a free connection slot on the same session
     /// ([`RpcSession::set_timeout`](super::RpcSession::set_timeout)), so a
     /// callback behind a busy pool can take up to twice this value

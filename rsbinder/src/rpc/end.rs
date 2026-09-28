@@ -24,18 +24,25 @@
 //! | reason | `by` | `stream` |
 //! |---|---|---|
 //! | `EndOfStream` | local decision? | `InSync` |
-//! | `UncleanEndOfStream`, `Unreadable`, `Frame(_)` (a frame cut, undecodable, a wire violation, or a connection the kernel gave up on) | local decision? | `Lost` |
+//! | `UncleanEndOfStream`, `Frame(_)` (a frame cut, undecodable, a wire violation, or a connection the kernel gave up on) | local decision? | `Lost` |
 //! | `Frame(TimedOut)`, a deadline armed (idle eviction) | `Local` | `InSync` |
 //! | `Frame(TimedOut)`, no deadline armed | local decision? | `Lost` |
 //! | `DeadlineMidFrame`, a deadline armed (one of ours cut the frame) | `Local` | `Lost` |
 //! | `DeadlineMidFrame`, no deadline armed | local decision? | `Lost` |
 //! | `Interrupted` | `Local` | `InSync` |
-//! | `Retired`, `Dispatch(_)` | local decision? | `InSync` if this end decided, else `Lost` |
+//! | `SessionEnded`, `Dispatch(_)` | local decision? | `InSync` if this end decided, else `Lost` |
 //!
 //! "Local decision?" is `Local` when this end had decided, else `NotLocal`. A fault this loop
 //! observed itself (a cut, an undecodable frame, a lost position) is `Lost` whoever decided;
-//! only the ambiguous ends — a slot already gone, a dispatch that failed — are read in the
-//! light of who ended the session.
+//! only the ambiguous ends — a session another connection already ended, a dispatch that
+//! failed — are read in the light of who ended the session.
+//!
+//! Every loop's end ends the whole session, whichever connection it served: a fault on one
+//! connection leaves the others no way to tell what the peer lost (a oneway number, a
+//! `DEC_STRONG`, a reply), so the session ends there, as libbinder's `RpcState::handleRpcError`
+//! ends it on any send or receive error. The loops of the other connections then stop with
+//! whatever their transport's shutdown gives them, or with `SessionEnded` when they were
+//! between frames.
 //!
 //! The two timeout reasons come only from a read deadline. A socket read deadline expires as
 //! `EAGAIN`, which every backend reports as `RpcError::Timeout` / `RpcError::DeadlineMidFrame`;
@@ -77,17 +84,17 @@ pub enum StreamState {
     /// for: an end of stream that was signaled, a deadline *of this
     /// end's* that elapsed between frames, or an end this loop reached
     /// after this end had already decided to stop — a frame it
-    /// discarded, a slot it had already retired, or a dispatch that
+    /// discarded, a session it had already ended, or a dispatch that
     /// failed.
     InSync,
     /// Not known to be intact — a frame stopped part-way or did not
-    /// decode, a nested call lost the position, the stream ended
+    /// decode, the stream ended
     /// without its close signal, the connection was lost (the kernel's
     /// `ETIMEDOUT`, a peer whose host went away), or a read timed out
     /// with no deadline of this end's known to be armed. Also the ends
-    /// this loop cannot place — a slot
-    /// already gone from the pool, a dispatch that failed — when this
-    /// end had not decided to stop, since whatever retired the slot or
+    /// this loop cannot place — a session another connection already
+    /// ended, a dispatch that failed — when this
+    /// end had not decided to stop, since whatever ended the session or
     /// failed the dispatch may have left a frame half-written. Nothing
     /// further should be read from it, and the peer's side of the story
     /// is not known either.
@@ -104,16 +111,31 @@ pub enum EndReason {
     /// The stream ended without the transport's close signal
     /// ([`RpcError::UncleanEndOfStream`](super::RpcError::UncleanEndOfStream)).
     UncleanEndOfStream,
-    /// A nested call made from a handler on this connection lost track
-    /// of what the peer sends next and marked the slot unreadable.
+    /// Never produced. A nested call that loses track of what the peer
+    /// sends next ends the session, and the loop ends with the session's
+    /// end.
+    #[deprecated(
+        since = "0.12.0",
+        note = "never produced: a nested call that loses the stream ends the session, and the \
+                loop reports the session's end"
+    )]
     Unreadable,
-    /// The slot was gone from the pool when the loop went to pin it —
-    /// retired by a transaction that failed on it (a lost stream or an
-    /// expired reply deadline), or by the session ending. On a client the
-    /// loop leaves the session to that retirement, which ends it only when
-    /// no outgoing connection is left: a fan-out session stays up on its
-    /// other connections.
+    /// Never produced. A connection is no longer retired while its
+    /// session lives on; a loop whose slot is gone reports
+    /// [`SessionEnded`](Self::SessionEnded).
+    #[deprecated(
+        since = "0.12.0",
+        note = "never produced: a connection fault ends the whole session; see `SessionEnded`"
+    )]
     Retired,
+    /// The session had already ended when the loop went to pin its slot —
+    /// before the first frame or between two frames — so there was nothing
+    /// left to serve. Another connection's fault, a reply deadline, or this
+    /// end's [`close_session`](super::RpcSession::close_session) ended it;
+    /// [`SessionEnd::by`] and [`SessionEnd::stream`] follow that end: this
+    /// end's decision reads `Local` and `InSync`, anything else `NotLocal`
+    /// and `Lost`.
+    SessionEnded,
     /// This end ended the session while the loop held a frame it had
     /// just read; the frame was not dispatched.
     Interrupted,
@@ -147,12 +169,10 @@ pub enum EndReason {
 /// [`RpcSession::serve_blocking`](super::RpcSession::serve_blocking),
 /// [`serve_blocking_on`](super::RpcSession::serve_blocking_on) and
 /// [`serve_blocking_clearing_deadline_after_first`](super::RpcSession::serve_blocking_clearing_deadline_after_first).
-/// A loop's end ends the session — every remote object reachable over it
-/// is dead and its death recipients have fired — unless other connections
-/// keep it up: a server session ends with the last of its connections'
-/// loops, a client's incoming connections with the last of theirs, and a
-/// client loop whose slot was [`Retired`](EndReason::Retired) leaves the
-/// session to the retirement. This value says how the loop ended.
+/// A loop's end ends the session, whichever of its connections the loop
+/// served — every remote object reachable over it is dead and its death
+/// recipients have fired (module doc "How the axes are decided"). This
+/// value says how the loop ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 #[must_use = "the serve loop's end says whether the stream was lost; call into_result() or is_clean()"]
@@ -167,6 +187,7 @@ pub struct SessionEnd {
 
 impl SessionEnd {
     /// Derives both axes from the reason, a local decision and an armed deadline; see module doc.
+    #[allow(deprecated)] // Maps the never-produced variants too: the match stays exhaustive.
     pub(crate) fn new(reason: EndReason, ended_locally: bool, deadline_armed: bool) -> Self {
         use EndReason::*;
         use StreamState::*;
@@ -182,7 +203,7 @@ impl SessionEnd {
             EndOfStream | Interrupted => InSync,
             Frame(StatusCode::TimedOut) if idle_eviction => InSync,
             UncleanEndOfStream | Unreadable | DeadlineMidFrame | Frame(_) => Lost,
-            Retired | Dispatch(_) => {
+            SessionEnded | Retired | Dispatch(_) => {
                 if ended_locally {
                     InSync
                 } else {
@@ -267,10 +288,9 @@ mod tests {
             (EndOfStream, true, false, Local, InSync, true),
             (UncleanEndOfStream, false, false, NotLocal, Lost, false),
             (UncleanEndOfStream, true, false, Local, Lost, false),
-            (Unreadable, false, false, NotLocal, Lost, false),
-            (Unreadable, true, false, Local, Lost, false),
-            (Retired, false, false, NotLocal, Lost, false),
-            (Retired, true, false, Local, InSync, true),
+            // Stopped by a session already ended: read in the light of who ended it.
+            (SessionEnded, false, false, NotLocal, Lost, false),
+            (SessionEnded, true, false, Local, InSync, true),
             (Interrupted, true, false, Local, InSync, true),
             // `Interrupted` alone is `Local`; only this row reaches that arm (not `ended_locally`).
             (Interrupted, false, false, Local, InSync, true),

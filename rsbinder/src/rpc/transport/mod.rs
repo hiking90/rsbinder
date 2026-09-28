@@ -43,16 +43,17 @@
 //!
 //! `write_all_reporting` is `write_all` that tells a failure which put
 //! nothing on the wire apart from one that stopped part-way; `write_all`
-//! reports the same error either way. The session's send-failure rule needs
-//! the difference: a frame that stopped part-way left the peer a header it
-//! will complete out of whatever arrives next, so its connection must be
-//! retired, while a frame that never started left the stream
-//! frame-synchronized and its connection healthy. A send deadline
+//! reports the same error either way. A frame that stopped part-way left the
+//! peer a header it will complete out of whatever arrives next, while a frame
+//! that never started left the stream frame-synchronized. A send deadline
 //! (`SO_SNDTIMEO`) that expires before the first byte is therefore
 //! [`RpcError::Timeout`] (the value a read deadline that consumed nothing
 //! already yields), and every other failure, at any position, stays the
-//! transport error. The writer must report partial progress honestly, as a
-//! socket does. An adapter that hands the whole buffer to another
+//! transport error. The session ends on both (its "Failed sends" rule: the
+//! peer did not read for the whole deadline either way); the variant keeps
+//! saying which position the stream was left in. The writer must report
+//! partial progress honestly, as a socket does. An adapter that hands the
+//! whole buffer to another
 //! all-or-nothing send does not, and classifies at its own level instead:
 //! `tls` never reports this, because a record its socket write dropped is
 //! gone from the sequence whether or not a byte of it went out.
@@ -75,7 +76,8 @@
 //!
 //! - `a_send_deadline_is_a_timeout_only_before_the_first_byte`: dropping the
 //!   `sent == 0` guard in `write_all_reporting` makes the second case report
-//!   `Timeout` as well, and a peer left half a frame keeps its slot.
+//!   `Timeout` as well, a frame-synchronized stream the peer was left half a
+//!   frame of.
 //! - `the_kernels_etimedout_is_a_lost_connection_not_a_deadline`: counting
 //!   `TimedOut` in `is_timeout` makes a send that failed before its
 //!   first byte and a read that consumed nothing report `Timeout`, and a
@@ -181,7 +183,7 @@ pub trait RpcTransport: Send + Sync {
     /// either way.)
     /// This is how a session ends its
     /// connections — `RpcSession::close_session`, `RpcServer::terminate`, a
-    /// slot retired after a lost stream. Required, with no default on
+    /// fault on any of its connections. Required, with no default on
     /// purpose: a transport that silently did nothing here would leave a
     /// serve loop or an incoming-connection thread parked in `recv`
     /// forever, and `RpcSession::close_session` would hang on the join. The
@@ -198,7 +200,8 @@ pub trait RpcTransport: Send + Sync {
     ///   transport's own buffer may survive (`tls`'s decrypted plaintext)
     ///   or be cleared (`unix` fd-mode clears its leftover here). A caller
     ///   that must not read what is buffered keeps that decision in
-    ///   session state — the slot's `unreadable` mark — not here. `mem`
+    ///   session state — the session's end empties the slot pool — not
+    ///   here. `mem`
     ///   models the Linux behaviour, so a hermetic test exercises the case
     ///   that hides bugs.
     /// - **A reader woken by this returns the end of stream** —
@@ -679,7 +682,7 @@ mod tests {
         ));
     }
 
-    /// `Timeout` (connection kept) only while nothing went out; see module doc "Mutation gates".
+    /// `Timeout` (stream in step) only while nothing went out; see module doc "Mutation gates".
     #[test]
     fn a_send_deadline_is_a_timeout_only_before_the_first_byte() {
         struct Stall(usize);

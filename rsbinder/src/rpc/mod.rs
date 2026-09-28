@@ -185,7 +185,8 @@ pub enum RpcError {
     /// [`Truncated`](Self::Truncated), never this. A *send* that
     /// disconnects past its first byte is this variant with the position
     /// lost — no writer can report how much of the frame went out — which
-    /// is why the session's send-failure rule retires a slot on it.
+    /// is one reason the session's send-failure rule ends the session on
+    /// it.
     /// Projects to [`StatusCode::DeadObject`](crate::StatusCode).
     EndOfStream,
     /// The stream ended without the transport's own close signal — a TLS

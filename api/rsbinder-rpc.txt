@@ -2437,6 +2437,7 @@ pub rsbinder::rpc::end::EndReason::EndOfStream
 pub rsbinder::rpc::end::EndReason::Frame(rsbinder::StatusCode)
 pub rsbinder::rpc::end::EndReason::Interrupted
 pub rsbinder::rpc::end::EndReason::Retired
+pub rsbinder::rpc::end::EndReason::SessionEnded
 pub rsbinder::rpc::end::EndReason::UncleanEndOfStream
 pub rsbinder::rpc::end::EndReason::Unreadable
 impl core::clone::Clone for rsbinder::rpc::end::EndReason
@@ -2892,6 +2893,7 @@ pub rsbinder::rpc::EndReason::EndOfStream
 pub rsbinder::rpc::EndReason::Frame(rsbinder::StatusCode)
 pub rsbinder::rpc::EndReason::Interrupted
 pub rsbinder::rpc::EndReason::Retired
+pub rsbinder::rpc::EndReason::SessionEnded
 pub rsbinder::rpc::EndReason::UncleanEndOfStream
 pub rsbinder::rpc::EndReason::Unreadable
 impl core::clone::Clone for rsbinder::rpc::end::EndReason
