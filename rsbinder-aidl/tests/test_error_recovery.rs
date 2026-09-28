@@ -7,9 +7,7 @@
 use rsbinder_aidl::{parse_document, AidlError, Generator, SourceContext};
 use std::path::PathBuf;
 
-/// A per-test directory under the target dir: the name keeps tests in this
-/// binary from deleting each other's fixtures mid-generation, and the target
-/// dir keeps them out of the machine-wide `std::env::temp_dir()`.
+/// Per-test dir under the target dir: tests cannot clobber each other or the system temp dir.
 fn scratch_dir(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
     let _ = std::fs::remove_dir_all(&dir);
@@ -28,9 +26,7 @@ fn expect_generation_error(input: &str, filename: &str) -> AidlError {
     }
 }
 
-// ============================================================
-// parser.rs panic removal verification
-// ============================================================
+// ==================== parser.rs: no panic on bad input ====================
 
 // u8 overflow (256u8) should return Err, not panic
 #[test]
@@ -79,9 +75,7 @@ parcelable Foo {
     assert!(result.is_ok(), "0u8 should be valid");
 }
 
-// Unknown type in parcelable — should not panic
-// Note: The generator treats unknown types as user-defined types and proceeds gracefully,
-// so this test verifies no panic rather than requiring an error.
+// Unknown type in parcelable: only the absence of a panic is checked, not the result.
 #[test]
 fn test_unknown_type_no_panic() {
     let result = std::panic::catch_unwind(|| {
@@ -129,7 +123,7 @@ fn test_unknown_type_in_method_param() {
     assert!(result.is_ok(), "Should not panic on unknown param type");
 }
 
-// Verify catch_unwind is completely removed from non-test source code
+// Non-test source code must not contain catch_unwind.
 #[test]
 fn test_catch_unwind_removed() {
     let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -137,9 +131,7 @@ fn test_catch_unwind_removed() {
         let path = entry.unwrap().path();
         if path.extension().is_some_and(|ext| ext == "rs") {
             let content = std::fs::read_to_string(&path).unwrap();
-            // Split at the trailing `#[cfg(test)] mod tests`, not at the first
-            // `#[cfg(test)]` of any kind: a test-only helper early in the file
-            // would otherwise hide everything after it.
+            // Split at the last `mod tests`: an early `#[cfg(test)]` helper would hide the rest.
             let non_test = match content.rfind("\n#[cfg(test)]\nmod tests") {
                 Some(idx) => &content[..idx],
                 None => &content,
@@ -153,9 +145,7 @@ fn test_catch_unwind_removed() {
     }
 }
 
-// ============================================================
-// type_generator.rs panic removal verification
-// ============================================================
+// ==================== type_generator.rs: no panic on bad input ====================
 
 // List without generic type parameter
 #[test]
@@ -308,13 +298,9 @@ interface IFoo {
     );
 }
 
-// ============================================================
-// const_expr.rs panic removal verification (AIDL-level)
-// ============================================================
+// ==================== const_expr.rs: no panic on bad input (AIDL-level) ====================
 
-// Bitwise OR on float literal — should not panic
-// Note: ConstExprError is silently handled via unwrap_or_else in pre_process(),
-// so the expression may degrade gracefully. We verify no panic.
+// Bitwise OR on float literal: only the absence of a panic is checked.
 #[test]
 fn test_bitwise_op_on_float() {
     let input = r#"
@@ -368,9 +354,7 @@ parcelable Foo {
     assert!(result.is_ok(), "Should not panic on unary not with float");
 }
 
-// Surrogate code point (0xD800) in char field — must not panic
-// char::from_u32(0xD800) returns None (surrogate range is not valid Unicode scalar).
-// The ConstExprError is caught by the caller and silently falls back; no panic.
+// Surrogate 0xD800 in a char field (`char::from_u32` gives None) must not panic.
 #[test]
 fn test_invalid_unicode_surrogate() {
     let input = r#"
@@ -392,8 +376,7 @@ parcelable Foo {
     );
 }
 
-// Code point beyond Unicode maximum (0x110000) in char field — must not panic
-// char::from_u32(0x110000) returns None; ConstExprError is caught silently.
+// 0x110000 (past the Unicode maximum) in a char field must not panic.
 #[test]
 fn test_invalid_unicode_too_large() {
     let input = r#"
@@ -414,31 +397,41 @@ parcelable Foo {
     );
 }
 
-// Maximum valid Unicode scalar value (0x10FFFF) in char field — must not panic
-// char::from_u32(0x10FFFF) returns Some; conversion succeeds normally.
+// AIDL `char` is 16-bit: a code point above U+FFFF is a diagnostic, not an `as u16` truncation.
 #[test]
-fn test_valid_unicode_boundary() {
-    let input = r#"
-parcelable Foo {
-    char ok = 0x10FFFF;
-}
-    "#;
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let ctx = SourceContext::new("test.aidl", input);
-        if let Ok(doc) = parse_document(&ctx) {
-            let gen = Generator::new(false, false);
-            let _ = gen.document(&doc);
-        }
-    }));
-    assert!(
-        result.is_ok(),
-        "Should not panic on maximum valid Unicode code point 0x10FFFF"
-    );
+fn test_char_beyond_u16_is_rejected() {
+    for input in [
+        "parcelable Foo { char bad = 0x10FFFF; }",
+        "parcelable Foo { const char C = '\u{1F600}'; }",
+    ] {
+        let err = expect_generation_error(input, "test.aidl");
+        assert!(format!("{err:?}").contains("char"), "{input}: {err:?}");
+    }
+    let ctx = SourceContext::new("test.aidl", "parcelable Foo { char ok = 0xFFFF; }");
+    let doc = parse_document(&ctx).expect("parse");
+    let out = Generator::new(false, false)
+        .document(&doc)
+        .expect("0xFFFF fits a char")
+        .1;
+    assert!(out.contains("r#ok: '\u{ffff}' as u16"), "{out}");
 }
 
-// ============================================================
-// lib.rs .unwrap() removal verification
-// ============================================================
+// The error for an unreadable source names the file.
+#[test]
+fn test_unreadable_source_names_the_file() {
+    let tmp = scratch_dir("non_utf8");
+    let file_path = tmp.join("Latin1.aidl");
+    std::fs::write(&file_path, b"// caf\xe9\nparcelable Foo {}").unwrap();
+    let err = rsbinder_aidl::Builder::new()
+        .source(&file_path)
+        .dest_dir(&tmp)
+        .output("gen.rs")
+        .generate()
+        .expect_err("a non-UTF-8 source must fail");
+    assert!(err.to_string().contains("Latin1.aidl"), "{err}");
+}
+
+// ==================== lib.rs: no `.unwrap()` panic on odd file names ====================
 
 // File without extension should not panic
 #[test]
@@ -447,8 +440,7 @@ fn test_file_without_extension() {
     let file_path = tmp.join("NoExtension");
     std::fs::write(&file_path, "parcelable Foo {}").unwrap();
 
-    // An extension-less source is still a valid AIDL file; it must generate,
-    // not panic on `file_stem`.
+    // An extension-less source is valid AIDL; it must generate, not panic on `file_stem`.
     rsbinder_aidl::Builder::new()
         .source(&file_path)
         .dest_dir(&tmp)

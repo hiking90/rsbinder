@@ -456,8 +456,7 @@ pub mod ITestService {
     Ok(())
 }
 
-// Tests for GitHub issue #67: Panic when generating for nested types in unions
-// https://github.com/hiking90/rsbinder/issues/67
+// GitHub issue #67 (panic on nested types in unions): github.com/hiking90/rsbinder/issues/67
 
 #[test]
 fn test_union_with_nested_enum() -> Result<(), Box<dyn Error>> {

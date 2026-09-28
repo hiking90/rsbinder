@@ -39,9 +39,7 @@ fn expect_generation_error(input: &str, filename: &str) -> AidlError {
     }
 }
 
-// ============================================================
-// Error output format verification
-// ============================================================
+// ==================== Error output format verification ====================
 
 // Parse error output includes filename, source snippet, diagnostic code
 #[test]
@@ -75,9 +73,10 @@ interface IDup {
         rendered.contains("aidl::duplicate_transaction_code"),
         "Should contain diagnostic code:\n{rendered}"
     );
+    let message = err.to_string();
     assert!(
-        rendered.contains("m1") || rendered.contains("m2"),
-        "Should mention method names:\n{rendered}"
+        message.contains("'m1'") && message.contains("'m2'"),
+        "Should mention method names:\n{message}"
     );
 }
 
@@ -100,8 +99,7 @@ fn test_multiple_errors_output_format() {
 // Error output includes help section
 #[test]
 fn test_error_output_includes_help() {
-    // `UnsupportedType` is one of the diagnostics that carries a `help`;
-    // the point of this test is that the renderer surfaces it.
+    // `UnsupportedType` carries a `help`; the renderer must surface it.
     let err = expect_generation_error(
         r#"
 parcelable Foo {
@@ -111,8 +109,7 @@ parcelable Foo {
         "test.aidl",
     );
     let rendered = render_error(&err);
-    // `render_report` always writes at least the severity and message, so a
-    // non-empty check would pass with every `#[diagnostic(help(...))]` gone.
+    // A non-empty check would pass even with every `#[diagnostic(help(...))]` gone.
     assert!(
         rendered.contains("help:"),
         "the diagnostic must carry a help section:\n{rendered}"
@@ -125,18 +122,14 @@ fn test_error_output_includes_source_snippet() {
     let input = "parcelable Foo {\n    int field\n}";
     let err = expect_parse_error(input, "test.aidl");
     let rendered = render_error(&err);
-    // Anchor on the rendered source line itself: the expectation list in the
-    // message ("expected parcelable_decl, interface_decl, ...") contains
-    // "int"/"parcelable" as substrings, so those alone prove nothing.
+    // Anchor on the source line: the "expected ..." list already contains "int"/"parcelable".
     assert!(
         rendered.contains("int field"),
         "the rendered report must quote the offending source line:\n{rendered}"
     );
 }
 
-// ============================================================
-// Boundary condition tests
-// ============================================================
+// ==================== Boundary condition tests ====================
 
 // Empty input
 #[test]
@@ -200,10 +193,7 @@ fn test_unicode_in_string_constant() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-// A transaction code in the reserved meta-method range (the top 100 IDs,
-// i.e. > kMaxUserSetMethodId = 16777114) must be rejected — AOSP reserves
-// them for getInterfaceVersion/getInterfaceHash etc. (`u32::MAX` is well
-// inside that range).
+// Codes > kMaxUserSetMethodId (16777114) are out of bounds (AOSP aidl.cpp); u32::MAX included.
 #[test]
 fn test_transaction_code_reserved_range() {
     let err = expect_generation_error(
@@ -216,13 +206,12 @@ interface IFoo {
     );
     let msg = format!("{err}");
     assert!(
-        msg.contains("reserved") || msg.contains("16777114"),
-        "Error should mention the reserved meta-method range: {msg}"
+        msg.contains("outside the user range 0..=16777114"),
+        "Error should name the user transaction-code range: {msg}"
     );
 }
 
-// The largest user-settable transaction code (kMaxUserSetMethodId =
-// 16777114) and below are accepted.
+// kMaxUserSetMethodId (16777114) and below are accepted.
 #[test]
 fn test_transaction_code_max_user_id_accepted() -> Result<(), Box<dyn Error>> {
     let input = r#"
@@ -257,9 +246,7 @@ interface IFoo {
     );
 }
 
-// ============================================================
-// fancy / non-fancy / ascii output format verification
-// ============================================================
+// ==================== fancy / non-fancy / ascii output format ====================
 
 // Fancy mode: GraphicalTheme::unicode() — includes ANSI color codes
 #[test]

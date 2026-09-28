@@ -1,19 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
-//
-// Regression tests for codegen defects found in the full-source review.
-// Each case is parseable input that must surface as a recoverable error (or
-// compute without panicking) rather than aborting the AIDL compiler — the
-// project's "no panic on user input" invariant.
+
+//! Regression tests for codegen defects.
+//! Each case is parseable input that must surface as a recoverable error (or
+//! compute without panicking) rather than aborting the AIDL compiler — the
+//! project's "no panic on user input" invariant.
 
 /// Returns `true` only when BOTH parsing and code generation succeed.
 fn generate_ok(input: &str) -> bool {
     generate_str(input).is_some()
 }
 
-/// Returns the generated Rust source (the `.1` of `Generator::document`) when
-/// parse + generation both succeed. NOTE: the generator does not type-check its
-/// output, so this succeeding does not prove the emitted Rust *compiles* — use
-/// it to assert on the emitted text directly.
+/// Generated Rust on success; the generator does not type-check, so assert on the text itself.
 fn generate_str(input: &str) -> Option<String> {
     let ctx = rsbinder_aidl::SourceContext::new("test.aidl", input);
     let document = rsbinder_aidl::parse_document(&ctx).ok()?;
@@ -21,10 +18,7 @@ fn generate_str(input: &str) -> Option<String> {
     gen.document(&document).ok().map(|(_, rust)| rust)
 }
 
-/// A `List<T[]>` (list-of-array) is grammar-valid and must be rejected with a
-/// diagnostic rather than reaching the unconditional
-/// `panic!("type_decl() can't process Array Type.")`. A plain `List<T>` still
-/// works.
+/// `List<T[]>` is grammar-valid but must be a diagnostic, never `type_decl()`'s array panic.
 #[test]
 fn list_of_array_is_rejected_not_panicked() {
     for src in [
@@ -43,9 +37,7 @@ fn list_of_array_is_rejected_not_panicked() {
     );
 }
 
-/// Mutually-referential constants must terminate rather than recurse until the
-/// stack overflows: the cycle guard has to survive a binary operator between
-/// the two references. Non-cyclic chains that cross operators must resolve.
+/// The constant cycle guard must see through binary operators, or the recursion overflows.
 #[test]
 fn cyclic_constants_do_not_overflow() {
     // Reaching the end of this call without aborting is the assertion.
@@ -57,25 +49,23 @@ fn cyclic_constants_do_not_overflow() {
     );
 }
 
-/// An `i64::MAX` enumerator followed by an auto-increment member must wrap
-/// (AOSP C++ semantics) rather than panic on a debug build's `enum_val += 1`.
+/// AOSP `previous + 1` auto-increment: past `i64::MAX` it is an overflow diagnostic, not a wrap.
 #[test]
-fn enum_autoincrement_overflow_wraps() {
+fn enum_autoincrement_overflow_is_rejected() {
     let src = "@Backing(type=\"long\") enum Big { MAXV = 9223372036854775807, NEXT }";
-    let out = generate_str(src).expect("i64::MAX auto-increment must still generate");
-    assert!(out.contains("r#MAXV = 9223372036854775807,"), "got: {out}");
-    assert!(
-        out.contains("r#NEXT = -9223372036854775808,"),
-        "auto-increment past i64::MAX must wrap, got: {out}"
-    );
+    let ctx = rsbinder_aidl::SourceContext::new("test.aidl", src);
+    let document = rsbinder_aidl::parse_document(&ctx).expect("parse");
+    let err = rsbinder_aidl::Generator::new(false, false)
+        .document(&document)
+        .expect_err("auto-increment past i64::MAX must be rejected");
+    assert!(format!("{err:?}").contains("overflows"), "got: {err:?}");
+
+    let src = "@Backing(type=\"long\") enum Big { MAXV = 9223372036854775807, NEXT = 0, N2 }";
+    let out = generate_str(src).expect("an explicit value after i64::MAX must still generate");
+    assert!(out.contains("r#N2 = 1,"), "got: {out}");
 }
 
-/// An empty `{}` initializer must surface as a recoverable parse diagnostic in
-/// all five parser positions where an aggregate initializer is not a valid
-/// value (enumerator value, nested array element, annotation argument, named
-/// annotation parameter, array dimension), not as an `unwrap()` panic.
-/// Reaching the assertions without aborting is itself the regression guard. The legitimate empty-array initializer `int[] x = {}`
-/// (the one position where `{}` is valid) must still parse + generate.
+/// `{}` where no aggregate is valid is a diagnostic, not an `unwrap()` panic; `int[] x = {}` is ok.
 #[test]
 fn empty_brace_initializer_is_rejected_not_panicked() {
     for src in [
@@ -96,11 +86,7 @@ fn empty_brace_initializer_is_rejected_not_panicked() {
     );
 }
 
-/// A negative byte literal inside an array default must be re-emitted
-/// as its unsigned `u8` representation (AOSP `aidl_to_rust.cpp`). The array's
-/// Rust element type is `u8` (i8 maps to u8 via `array_type_name`), which
-/// cannot hold a negated literal, so the previous `[-1, ...]` / `vec![-1, ...]`
-/// output did not compile. Positive bytes are unchanged.
+/// A byte array's element is `u8`, so negatives are re-emitted unsigned (AOSP `aidl_to_rust.cpp`).
 #[test]
 fn negative_byte_array_default_emits_unsigned() {
     let out = generate_str("parcelable P { byte[] a = {-1, -2, 3}; byte[2] f = {-1, 127}; }")
@@ -120,10 +106,7 @@ fn negative_byte_array_default_emits_unsigned() {
     );
 }
 
-/// A float/double field default that folds to a non-finite value
-/// (e.g. `1.0e400` parses to infinity) must emit a valid Rust float constant
-/// (`f64::INFINITY` / `f32::INFINITY` / `NAN`), not `inff64` / `NaNf32` which
-/// do not compile. Finite defaults keep the suffixed-decimal form.
+/// A non-finite float default (`1.0e400`) emits `f64::INFINITY`-style constants, not `inff64`.
 #[test]
 fn non_finite_float_default_emits_valid_constant() {
     let out =
@@ -149,13 +132,7 @@ fn non_finite_float_default_emits_valid_constant() {
     );
 }
 
-/// A non-nullable IBinder / ParcelFileDescriptor union member is stored as
-/// `Option<T>` only for lack of `Default`. AOSP unwraps it with
-/// UNEXPECTED_NULL on write and rejects an inbound null on read; it must not
-/// silently cross the wire as a null marker in either direction. Mirrors the
-/// `member.4` pattern already used on the parcelable write path. Assertions
-/// are anchored per variant arm so an over-application to the `@nullable`
-/// member cannot slip through.
+/// `Option` only for lack of `Default`: like AOSP, a null member is UNEXPECTED_NULL both ways.
 #[test]
 fn union_non_nullable_binder_member_is_null_strict() {
     let out = generate_str(
@@ -204,9 +181,7 @@ fn union_non_nullable_binder_member_is_null_strict() {
     );
 }
 
-/// Parcelable read side of the same contract: the write path already unwraps
-/// a non-nullable IBinder field with UNEXPECTED_NULL, but the read path used
-/// to accept an inbound null into the non-nullable field.
+/// Parcelable read side of the same contract: an inbound null in a non-nullable field is refused.
 #[test]
 fn parcelable_non_nullable_binder_field_read_is_null_strict() {
     let out = generate_str(
@@ -228,9 +203,7 @@ fn parcelable_non_nullable_binder_field_read_is_null_strict() {
     );
 }
 
-/// A fixed-size array dimension that fails to evaluate (or is non-positive)
-/// must be a diagnostic, as in AOSP: folding it to 0 silently demotes the
-/// field to a `Vec<T>`, a different wire format.
+/// A bad array dimension is a diagnostic (AOSP): folding to 0 would demote it to a `Vec<T>` wire.
 #[test]
 fn bad_fixed_array_dimension_is_diagnostic() {
     // Unresolvable dimension constant.
@@ -266,10 +239,7 @@ fn bad_fixed_array_dimension_is_diagnostic() {
     );
 }
 
-/// A fixed-size array default must supply exactly the declared element count,
-/// and an array literal must not initialize a scalar target — either one emits
-/// non-compiling Rust (`[i32; 2] = [1,2,3,]` / `i32 = &[]`) unless it is an
-/// AIDL diagnostic.
+/// Arity mismatches and array-on-scalar defaults are diagnostics, else rustc rejects the output.
 #[test]
 fn array_literal_shape_mismatches_are_diagnostics() {
     assert!(
@@ -304,9 +274,7 @@ fn reserved_path_keyword_member_names_are_diagnostics() {
     }
 }
 
-/// Unary operators on string literals (newly reachable now that `C_STR`
-/// participates in the expression grammar) must be diagnostics — AOSP rejects
-/// them; a silent pass-through would drop the operator.
+/// Unary operators on string literals are diagnostics (AOSP); a pass-through drops the operator.
 #[test]
 fn unary_operator_on_string_is_diagnostic() {
     for src in [
@@ -318,9 +286,7 @@ fn unary_operator_on_string_is_diagnostic() {
     }
 }
 
-/// A `const String[]` renders as `&[&str]` — its initializer elements are
-/// emitted as string literals, which do not coerce to `&[String]` in const
-/// position.
+/// `const String[]` renders as `&[&str]`: string literals do not coerce to `&[String]` in a const.
 #[test]
 fn const_string_array_renders_as_str_slice() {
     let out = generate_str("interface IFoo { const String[] S = {\"a\",\"b\"}; }")
@@ -331,10 +297,7 @@ fn const_string_array_renders_as_str_slice() {
     );
 }
 
-/// An enum discriminant referencing a sibling interface constant must fold to
-/// the constant's value with correct auto-increment afterwards: a stale cache
-/// entry from the pre-registration pass duplicates one wire discriminant
-/// across members (`A = X, B` folding to A=5, B=5).
+/// A stale pre-registration cache entry would fold `A = X, B` to A=5, B=5 (a duplicate).
 #[test]
 fn enum_discriminant_referencing_interface_constant_auto_increments() {
     let ctx = rsbinder_aidl::SourceContext::new(
@@ -353,9 +316,7 @@ fn enum_discriminant_referencing_interface_constant_auto_increments() {
     );
 }
 
-/// Float / char enum discriminants must be diagnostics, not lossy `to_i64`
-/// truncations (`A = 1.5` silently becoming 1). Bool comparisons stay
-/// legal — AOSP treats bool as integral in const expressions.
+/// Float/char discriminants are errors, not `to_i64` truncations; AOSP treats bool as integral.
 #[test]
 fn non_integral_enum_discriminants_are_diagnostics() {
     assert!(
@@ -372,9 +333,7 @@ fn non_integral_enum_discriminants_are_diagnostics() {
     );
 }
 
-/// AOSP `ClassName` strips the leading `I` from an interface name only when
-/// it is followed by an uppercase letter — stripping unconditionally garbles
-/// `interface Foo3` into `Bnoo3`/`Bpoo3`.
+/// AOSP `ClassName` strips a leading `I` only before an uppercase letter (`Foo3` -> `BnFoo3`).
 #[test]
 fn bn_bp_names_follow_aosp_i_prefix_rule() {
     let out = generate_str("package test.n;\ninterface Foo3 { void m(); }").expect("must generate");
@@ -396,9 +355,7 @@ fn bn_bp_names_follow_aosp_i_prefix_rule() {
     assert!(out.contains("BnIfoo"), "expected BnIfoo (got: {out})");
 }
 
-/// Constant names must be emitted verbatim (AOSP Rust backend), not
-/// upper-cased: `kMagicValue` stays `kMagicValue`, and `foo`/`FOO` remain
-/// distinct constants instead of colliding (E0428).
+/// Constant names stay verbatim (AOSP Rust backend); upper-casing collides `foo`/`FOO` (E0428).
 #[test]
 fn const_names_are_verbatim_not_uppercased() {
     let out = generate_str(
@@ -419,9 +376,7 @@ fn const_names_are_verbatim_not_uppercased() {
     );
 }
 
-/// A default whose type cannot convert to the declared type must be an AIDL
-/// diagnostic (AOSP rejects it), not an unconverted emit
-/// (`pub const r#A: i32 = "x";`) that only fails at the rustc stage.
+/// A default of an unconvertible type is an AIDL diagnostic (as in AOSP), not a rustc error.
 #[test]
 fn type_mismatched_default_is_diagnostic() {
     assert!(
@@ -436,10 +391,7 @@ fn type_mismatched_default_is_diagnostic() {
     assert!(generate_ok("interface IFoo { const int A = 3; }"));
 }
 
-/// String concatenation must compose through the ordinary expression grammar
-/// (AOSP has a single expression grammar): a reference-first concat
-/// (`A + "y"`) and a parenthesized concat (`("y" + "z")`) are both valid — a
-/// string rule requiring a literal first operand would reject them.
+/// AOSP has one expression grammar, so `A + "y"` and `("y" + "z")` concat like any operand.
 #[test]
 fn string_concat_composes_like_aosp() {
     let out =
@@ -457,10 +409,7 @@ fn string_concat_composes_like_aosp() {
     assert!(out.contains(r#"r#D: &str = "ab""#), "got: {out}");
 }
 
-/// An explicit empty (and non-empty) array constant must emit a slice
-/// literal. Treating `const T[] X = {};` as "no initializer" would emit
-/// `Default::default()`, which is not a const expression for `&[T]`
-/// (E0658/E0015 at the rustc stage).
+/// `const T[] X = {};` emits `&[]`: `Default::default()` is not const for `&[T]` (E0658/E0015).
 #[test]
 fn const_array_emits_slice_literal() {
     let out = generate_str("interface IFoo { const int[] A = {}; const int[] B = {1,2}; }")
@@ -480,8 +429,7 @@ fn const_array_emits_slice_literal() {
     );
 }
 
-/// A `//` comment on the last line of a file without a trailing newline used
-/// to be a parse error (LINE_COMMENT demanded `\n`).
+/// A `//` comment may end at EOF: LINE_COMMENT does not require a trailing `\n`.
 #[test]
 fn trailing_line_comment_without_newline_parses() {
     assert!(
@@ -494,13 +442,9 @@ fn trailing_line_comment_without_newline_parses() {
     );
 }
 
-// ---------------------------------------------------------------
-// Codegen/API shape defects.
-// ---------------------------------------------------------------
+// ---- Codegen/API shape defects ----
 
-/// An unqualified constant reference must resolve inside its own declaration
-/// (or an enclosing one), never against a same-named constant elsewhere in the
-/// flat symbol table — that silently bakes a wrong wire value.
+/// An unqualified constant resolves in its own or an enclosing scope, never a same-named other.
 #[test]
 fn unqualified_constant_does_not_leak_across_declarations() {
     let out = generate_str(
@@ -519,10 +463,7 @@ fn unqualified_constant_does_not_leak_across_declarations() {
     assert!(nested.contains("r#B = 6,"), "got:\n{nested}");
 }
 
-/// `@JavaOnlyImmutable` marks a *structured* parcelable that AOSP's Rust
-/// backend generates normally; only `@JavaOnlyStableParcelable` means "no Rust
-/// definition". A prefix match on `@JavaOnly` conflates them and emits a
-/// fieldless struct with a live `Parcelable` impl — a silent wire break.
+/// AOSP Rust generates `@JavaOnlyImmutable` normally; only `@JavaOnlyStableParcelable` has no Rust.
 #[test]
 fn java_only_immutable_keeps_its_fields() {
     let out = generate_str(
@@ -537,8 +478,7 @@ fn java_only_immutable_keeps_its_fields() {
     assert!(u.contains("pub enum r#U"), "got:\n{u}");
 }
 
-/// A declaration with no Rust representation must be a diagnostic, not a
-/// fieldless struct whose `Parcelable` impl writes an empty payload.
+/// No Rust representation is a diagnostic, not a fieldless struct writing an empty payload.
 #[test]
 fn unrepresentable_declarations_are_diagnostics() {
     for src in [
@@ -557,9 +497,7 @@ fn unrepresentable_declarations_are_diagnostics() {
     assert!(out.contains("pub type PB = crate::pb::PB;"), "got:\n{out}");
 }
 
-/// An enum reference is its integral value in a binary expression (AOSP
-/// `AidlConstantReference`). Ranking it above every arithmetic type made
-/// comparisons asymmetric and truncated float operands.
+/// An enum reference is its integral value in a binary expression (AOSP `AidlConstantReference`).
 #[test]
 fn enum_reference_compares_as_its_value() {
     let src = |expr: &str| {
@@ -590,9 +528,7 @@ fn enum_reference_compares_as_its_value() {
     assert!(d.contains("pub const r#D: f64 = 2.5f64;"), "got:\n{d}");
 }
 
-/// AOSP's grammar accepts a single direction (`direction: IN | OUT | INOUT |
-/// empty`). Accepting `direction*` kept only the last keyword, so a mistyped
-/// `in out` silently generated `out` semantics.
+/// AOSP's grammar takes at most one direction; `in out` must not silently become `out`.
 #[test]
 fn duplicated_argument_direction_is_rejected() {
     for src in [
@@ -607,9 +543,7 @@ fn duplicated_argument_direction_is_rejected() {
     ));
 }
 
-/// `r#self` / `r#Self` / `r#super` / `r#crate` are not valid Rust raw
-/// identifiers, and the bare forms are path keywords, so an AIDL name matching
-/// one has no representation anywhere it is emitted.
+/// `self`/`Self`/`super`/`crate` are path keywords with no raw form, so no emit site can hold them.
 #[test]
 fn unrepresentable_identifiers_are_rejected_everywhere() {
     for src in [
@@ -630,13 +564,10 @@ fn unrepresentable_identifiers_are_rejected_everywhere() {
     }
 }
 
-/// A package segment may be a Rust keyword; the `pub mod` that declares it
-/// must be escaped the same way `Namespace::relative_mod` escapes references
-/// to it, or the two disagree.
+/// A keyword package segment's `pub mod` is escaped like `Namespace::relative_mod` references.
 #[test]
 fn keyword_package_segment_is_escaped() {
-    // The module nesting is built by `Builder::generate_all`, not by
-    // `Generator::document`, so this has to go through the Builder.
+    // Module nesting is built by `Builder::generate_all`, not `Generator::document`.
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("keyword_pkg");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -656,10 +587,7 @@ fn keyword_package_segment_is_escaped() {
     assert!(out.contains("pub mod r#impl {"), "got:\n{out}");
 }
 
-/// An `out` argument whose type has no `Default` is stored as `Option<T>`
-/// (AOSP `aidl_to_rust.cpp::RustNameOf`); its local is initialised with
-/// `Default::default()`, which `SIBinder`/`ParcelFileDescriptor` lack. `inout`
-/// reads its value from the parcel and stays unwrapped.
+/// A `Default`-less `out` type is `Option<T>` (AOSP `aidl_to_rust.cpp::RustNameOf`); `inout` isn't.
 #[test]
 fn out_argument_without_default_is_optional() {
     let out =
@@ -674,8 +602,7 @@ fn out_argument_without_default_is_optional() {
     );
 }
 
-/// The trait signature and the server's local for an `inout` array must be the
-/// same type — the server passes `&mut` its local straight into the call.
+/// The server passes `&mut` its `inout` local straight in, so it must match the trait signature.
 #[test]
 fn inout_array_signature_matches_server_local() {
     for (src, ty) in [
@@ -708,8 +635,7 @@ fn inout_array_signature_matches_server_local() {
     }
 }
 
-/// A fixed-size array constant is initialised with an array literal, which
-/// does not coerce to a slice reference in const position.
+/// A fixed-size array constant's literal does not coerce to a slice reference in a const.
 #[test]
 fn fixed_size_const_array_is_a_value_type() {
     let out = generate_str("package a; interface I { const int[3] X = {1,2,3}; void f(); }")
@@ -727,9 +653,7 @@ fn fixed_size_const_array_is_a_value_type() {
     );
 }
 
-/// An enum discriminant is emitted as a literal into a `[<backing>; N]`
-/// newtype, where an out-of-range literal is a deny-by-default rustc error in
-/// the generated crate. AOSP rejects it at AIDL-compile time.
+/// Out-of-range discriminants are rejected as in AOSP; rustc would deny the emitted literal.
 #[test]
 fn enum_discriminant_must_fit_its_backing_type() {
     assert!(!generate_ok(
@@ -743,8 +667,7 @@ fn enum_discriminant_must_fit_its_backing_type() {
     ));
 }
 
-/// `to_case(UpperCamel)` maps two distinct AIDL field names onto one Rust
-/// variant; emitting both is `E0428`, so it must be a diagnostic.
+/// Two field names mapping to one UpperCamel variant would be `E0428`, so it is a diagnostic.
 #[test]
 fn colliding_union_variant_names_are_a_diagnostic() {
     assert!(!generate_ok(
@@ -755,8 +678,7 @@ fn colliding_union_variant_names_are_a_diagnostic() {
     ));
 }
 
-/// The templates always emit `#[derive(Debug)]`; repeating it from
-/// `@RustDerive` is a conflicting impl (`E0119`).
+/// The templates always emit `#[derive(Debug)]`; repeating it from `@RustDerive` is `E0119`.
 #[test]
 fn rust_derive_does_not_duplicate_debug() {
     let out =
@@ -770,7 +692,7 @@ fn rust_derive_does_not_duplicate_debug() {
     assert!(out.contains("#[derive(Clone)]"), "got:\n{out}");
 }
 
-/// `rust_type` was the one declaration path that emitted the name unescaped.
+/// A `rust_type` declaration's name is escaped like every other declaration path.
 #[test]
 fn rust_type_declaration_name_is_escaped() {
     let out = generate_str("package a; parcelable type rust_type \"i32\";").expect("must generate");
@@ -778,8 +700,43 @@ fn rust_type_declaration_name_is_escaped() {
     assert!(out.contains("pub type r#type = i32;"), "got:\n{out}");
 }
 
-/// `Path::is_dir()` follows symlinks, so a link cycle produced endlessly
-/// deeper distinct path strings and the directory walk never terminated.
+/// AOSP `ValueString`: a char literal initializes only a `char`.
+#[test]
+fn char_literal_initializes_only_char() {
+    for src in [
+        "parcelable P { boolean b = '\\0'; }",
+        "parcelable P { int i = 'a'; }",
+        "interface I { const long L = 'a'; }",
+    ] {
+        assert!(!generate_ok(src), "must be rejected: {src}");
+    }
+    assert!(generate_ok(
+        "parcelable P { char c = 'a'; char[] cs = {'a'}; }"
+    ));
+}
+
+/// rustc denies a raw bidi control in a literal (`text_direction_codepoint_in_literal`).
+#[test]
+fn bidi_controls_in_literals_are_escaped() {
+    let out = generate_str("parcelable P { String s = \"\u{202E}abc\"; char c = '\u{2066}'; }")
+        .expect("generates");
+    assert!(out.contains("\\u{202e}abc"), "{out}");
+    assert!(out.contains("'\\u{2066}'"), "{out}");
+    assert!(
+        !out.contains('\u{202E}') && !out.contains('\u{2066}'),
+        "{out}"
+    );
+}
+
+/// A dotted `rust_type` name would emit `pub mod Outer.Inner`, a rustc syntax error.
+#[test]
+fn qualified_rust_type_parcelable_name_is_rejected() {
+    assert!(!generate_ok(
+        "package a; parcelable Outer.Inner rust_type \"i32\";"
+    ));
+}
+
+/// `Path::is_dir()` follows symlinks, so a link cycle yields ever-deeper distinct paths.
 #[cfg(unix)]
 #[test]
 fn symlink_cycle_in_a_source_directory_terminates() {
@@ -807,7 +764,7 @@ fn symlink_cycle_in_a_source_directory_terminates() {
     match rx.recv_timeout(Duration::from_secs(20)) {
         Ok(ok) => assert!(ok, "generation over a symlinked directory must succeed"),
         Err(_) => {
-            // The walker is still descending; `abort` skips libtest's capture flush, so write stderr directly.
+            // Still walking; `abort` skips libtest's capture flush, so write stderr directly.
             use std::io::Write;
             let _ = std::io::stderr()
                 .write_all(b"symlink cycle test: the directory walk did not terminate; aborting\n");
@@ -816,8 +773,7 @@ fn symlink_cycle_in_a_source_directory_terminates() {
     }
 }
 
-/// The output directory is created on demand, whether `dest_dir` is missing
-/// or `output` names a subdirectory.
+/// The output directory is created whether `dest_dir` is missing or `output` names a subdir.
 #[test]
 fn output_directory_is_created_on_demand() {
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("out_dir_create");
@@ -842,10 +798,7 @@ fn output_directory_is_created_on_demand() {
     assert!(dir.join("nested/gen.rs").is_file());
 }
 
-/// Parsing happens in `generate()`, so the parser must be reset there: two
-/// builders constructed before either generates must not share declarations.
-/// `P` names `T` without importing it, so it resolves only if the first
-/// builder's declaration table leaked into the second.
+/// The parser resets in `generate()`; `P`'s unimported `T` resolves only if declarations leak.
 #[test]
 fn a_second_builder_does_not_inherit_the_first_declarations() {
     let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("two_builders");
@@ -872,8 +825,7 @@ fn a_second_builder_does_not_inherit_the_first_declarations() {
     assert!(err.to_string().contains("unknown type 'T'"), "got: {err:?}");
 }
 
-/// A fixed-size `String` constant is a by-value array of the `&str` literals
-/// its initializer emits, like the `&[&str]` slice for the variable-length form.
+/// A fixed-size `String` constant is a `[&str; N]`, matching the variable-length `&[&str]`.
 #[test]
 fn fixed_size_string_array_constant_is_a_str_array() {
     let out = generate_str(
@@ -890,8 +842,7 @@ fn fixed_size_string_array_constant_is_a_str_array() {
     );
 }
 
-/// An enum reference folds at its `@Backing` width, so an expression is not
-/// widened just by naming a member of an `int`-backed enum.
+/// An enum reference folds at its `@Backing` width; naming an `int` enum member does not widen.
 #[test]
 fn enum_reference_promotes_at_its_backing_width() {
     let out = generate_str(
@@ -917,8 +868,7 @@ fn enum_reference_promotes_at_its_backing_width() {
     );
 }
 
-/// `-E.A` and `~E.A` fold through the reference's integral value like `!E.A`
-/// already does, rather than failing on the unfolded reference.
+/// `-E.A`, `~E.A` and `!E.A` all fold through the reference's integral value.
 #[test]
 fn unary_operators_apply_to_enum_references() {
     let out = generate_str(
@@ -931,9 +881,7 @@ fn unary_operators_apply_to_enum_references() {
     assert!(out.contains("pub const r#NOT: i32 = 0;"), "got:\n{out}");
 }
 
-/// A package segment is emitted as a `mod` name, and `self`/`Self`/`super`/
-/// `crate` cannot be raw identifiers, so the four are rejected there like in
-/// every other name position. A dotted declaration name is checked per segment.
+/// Package segments become `mod` names, so path keywords are refused there too, per dotted segment.
 #[test]
 fn unrepresentable_keywords_are_rejected_in_package_and_qualified_names() {
     for src in [
@@ -958,10 +906,7 @@ fn unrepresentable_keywords_are_rejected_in_package_and_qualified_names() {
     ));
 }
 
-/// Every generated module carries the lint allowances as an inner attribute,
-/// so a declaration is covered wherever it lands — including a document with
-/// no `package`, which `generate_all` wraps in no module and therefore gives
-/// no outer attribute to.
+/// Lint allowances are inner attributes: a package-less document has no outer module to hold them.
 #[test]
 fn every_generated_module_carries_the_lint_allowances() {
     let out =
@@ -972,8 +917,7 @@ fn every_generated_module_carries_the_lint_allowances() {
         "got:\n{out}"
     );
 
-    // The package-less path through `Builder`: no wrapping module, so the
-    // inner attributes are the only ones there are.
+    // The package-less path through `Builder`: no wrapping module, only inner attributes.
     let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("package_less");
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
@@ -996,9 +940,7 @@ fn every_generated_module_carries_the_lint_allowances() {
     );
 }
 
-/// A non-nullable `out` argument with no `Default` is stored as `Option<T>`;
-/// leaving it unset must fail the transaction rather than write a null, and
-/// an out `ParcelFileDescriptor` array is guarded at both lengths.
+/// An unset non-nullable `Option` out argument (fd arrays too) fails the call, never writes null.
 #[test]
 fn non_nullable_out_arguments_reject_an_unset_value() {
     let out =
@@ -1024,9 +966,7 @@ fn non_nullable_out_arguments_reject_an_unset_value() {
     );
 }
 
-/// A `@nullable` array wraps its elements only for non-primitive, non-enum
-/// element types (AOSP `UsesOptionInNullableVector`) — fixed-size arrays
-/// included, where an `Option` element also has no `SerializeOption` impl.
+/// AOSP `UsesOptionInNullableVector` applies to fixed-size arrays too (primitive/enum stay bare).
 #[test]
 fn nullable_fixed_array_follows_the_vector_element_rule() {
     let out = generate_str(
@@ -1043,8 +983,7 @@ fn nullable_fixed_array_follows_the_vector_element_rule() {
     }
 }
 
-/// A `@nullable` `String` array constant declares the element `Option` its
-/// initializer emits, at both lengths.
+/// A `@nullable String` array constant's type has the element `Option` its initializer emits.
 #[test]
 fn nullable_string_array_constant_type_matches_its_initializer() {
     let out = generate_str(
@@ -1064,8 +1003,7 @@ fn nullable_string_array_constant_type_matches_its_initializer() {
     );
 }
 
-/// The pre-parse guard counts a `<` as generic nesting only once a `>` closes
-/// it, so a statement full of comparisons is not read as a deep generic.
+/// The pre-parse guard counts `<` as nesting only once a `>` closes it, so comparisons pass.
 #[test]
 fn comparison_operators_do_not_trip_the_generic_guard() {
     let cmp = format!(
@@ -1094,9 +1032,7 @@ fn comparison_operators_do_not_trip_the_generic_guard() {
     );
 }
 
-/// An enum reference keeps its value when it does not fit the `@Backing`
-/// type. `decl_enum`'s range check only runs when the enum itself is
-/// generated, so narrowing here would silently emit a wrong constant.
+/// Unfit enum references keep their value: `decl_enum`'s range check runs only on its own output.
 #[test]
 fn an_out_of_range_enum_reference_is_not_truncated() {
     let e = rsbinder_aidl::SourceContext::new(
@@ -1118,9 +1054,7 @@ fn an_out_of_range_enum_reference_is_not_truncated() {
     );
 }
 
-/// `@RustDerive` follows AOSP's seven-trait schema; a name of an impl the
-/// templates always emit (`Debug`, `Default`) is accepted and dropped, and
-/// anything else is an error (`unknown_rust_derive_parameter_is_an_error`).
+/// AOSP's seven-trait `@RustDerive` schema; always-emitted impls (`Debug`, `Default`) are dropped.
 #[test]
 fn rust_derive_accepts_only_the_aosp_schema() {
     let out =
@@ -1132,11 +1066,7 @@ fn rust_derive_accepts_only_the_aosp_schema() {
     assert!(out.contains("impl Default for P"), "got:\n{out}");
 }
 
-/// An empty include path names the working directory — the spelling
-/// `strip_package` derives for a source sitting directly under its own
-/// package path. It must dedup against the other spellings of that directory
-/// rather than listing it twice (every import under it then resolves to two
-/// candidates) and rather than reaching cargo as a bare `rerun-if-changed=`.
+/// `""` (from `strip_package`) is the cwd: dedup with `.`, never emit a bare `rerun-if-changed=`.
 #[test]
 fn an_empty_include_path_is_the_working_directory() {
     let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("empty_include");
@@ -1163,9 +1093,7 @@ fn an_empty_include_path_is_the_working_directory() {
     );
 }
 
-/// Two spellings of one include directory (here a symlink and its target;
-/// `./aidl` versus an absolute path is the same case) are one directory: an
-/// import under it resolves to one file, not to an `AmbiguousImport`.
+/// Two spellings of one include dir (symlink/target, `./aidl`/absolute) are no `AmbiguousImport`.
 #[cfg(unix)]
 #[test]
 fn one_include_directory_under_two_spellings_is_not_ambiguous() {
@@ -1185,8 +1113,7 @@ fn one_include_directory_under_two_spellings_is_not_ambiguous() {
     .unwrap();
     std::os::unix::fs::symlink(root.join("aidl"), root.join("link")).unwrap();
 
-    // `include_dir` names the target; the source's package-derived include
-    // directory is the link.
+    // `include_dir` names the target; the source's package-derived include dir is the link.
     rsbinder_aidl::Builder::new()
         .include_dir(root.join("aidl"))
         .source(root.join("link/hello/IHello.aidl"))
@@ -1196,8 +1123,7 @@ fn one_include_directory_under_two_spellings_is_not_ambiguous() {
         .expect("one directory under two names must not be an ambiguous import");
 }
 
-/// An empty hash is falsy to Tera and would silently emit no
-/// `getInterfaceHash()` — the trap `Builder::version` already guards.
+/// An empty hash is falsy to Tera and would silently drop `getInterfaceHash()` (cf. `version`).
 #[test]
 #[should_panic(expected = "the hash must be non-empty")]
 fn empty_interface_hash_is_rejected() {
@@ -1205,10 +1131,7 @@ fn empty_interface_hash_is_rejected() {
     let _ = rsbinder_aidl::Builder::new().source("I.aidl").hash("");
 }
 
-/// A constant of an interface reached through `import` resolves by the
-/// imported simple name: `import a.IFoo;` makes `IFoo.BAR` mean `a.IFoo.BAR`.
-/// Same-package references never needed the import, so only a second package
-/// exercises this path.
+/// `import a.IFoo;` makes `IFoo.BAR` mean `a.IFoo.BAR`; only a second package exercises it.
 #[test]
 fn imported_interface_constant_resolves_across_packages() {
     let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("import_const");
@@ -1216,8 +1139,7 @@ fn imported_interface_constant_resolves_across_packages() {
     let (a, b) = (root.join("aidl/a"), root.join("aidl/b"));
     std::fs::create_dir_all(&a).unwrap();
     std::fs::create_dir_all(&b).unwrap();
-    // `BAR` is an expression over `IFoo`'s own `BASE`; `IBaz` shadows that name
-    // with a different value, so a fold in the wrong scope shows up as 101.
+    // `IBaz` shadows `IFoo`'s `BASE`, so folding `BAR` in the wrong scope yields 101.
     std::fs::write(
         a.join("IFoo.aidl"),
         "package a; interface IFoo { const int BASE = 10; const int BAR = BASE + 1; }",
@@ -1246,8 +1168,7 @@ fn imported_interface_constant_resolves_across_packages() {
     );
 }
 
-/// An explicit `import` outranks a same-named declaration in the referencing
-/// package (AOSP `AidlDocument::ResolveName`).
+/// An `import` outranks a same-named package declaration (AOSP `AidlDocument::ResolveName`).
 #[test]
 fn an_import_outranks_a_same_named_package_declaration() {
     let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("import_shadow");
@@ -1284,10 +1205,7 @@ fn an_import_outranks_a_same_named_package_declaration() {
     );
 }
 
-/// The `UNEXPECTED_NULL` guard on an `out ParcelFileDescriptor` array reaches
-/// the `Option` elements of a nested fixed-size array through one `.flatten()`
-/// per extra dimension, so a `None` left in any cell is refused before the
-/// reply is written, as for the one-dimensional form.
+/// The out-fd-array null guard adds one `.flatten()` per extra dimension to reach every cell.
 #[test]
 fn out_fd_array_null_guard_flattens_nested_dimensions() {
     let one = generate_str("package a; interface I { void f(out ParcelFileDescriptor[2] fds); }")
@@ -1305,8 +1223,7 @@ fn out_fd_array_null_guard_flattens_nested_dimensions() {
     );
 }
 
-/// `@RustDerive` accepts exactly AOSP's schema; a name outside it is an error
-/// with the annotation's span, not a derive that silently goes missing.
+/// A `@RustDerive` name outside AOSP's schema is a spanned error, not a silently missing derive.
 #[test]
 fn unknown_rust_derive_parameter_is_an_error() {
     let ctx = rsbinder_aidl::SourceContext::new(
@@ -1325,9 +1242,61 @@ fn unknown_rust_derive_parameter_is_an_error() {
     );
 }
 
-/// A dotted constant reference whose owner does not exist must stay
-/// unresolved: neither the lexical fallback (the current declaration) nor a
-/// parent declaration may supply the member.
+/// AOSP `CheckValid` runs `ValueString(boolean)`: only a bool or an integer is a derive flag.
+#[test]
+fn rust_derive_value_must_be_a_boolean() {
+    for src in [
+        "package a; @RustDerive(Clone='\\0') parcelable P { int x; }",
+        "package a; @RustDerive(Clone=\"true\") parcelable P { int x; }",
+        "package a; @RustDerive(Clone=1.0) parcelable P { int x; }",
+    ] {
+        let ctx = rsbinder_aidl::SourceContext::new("test.aidl", src);
+        let err = rsbinder_aidl::parse_document(&ctx).expect_err(src);
+        assert!(
+            err.to_string()
+                .contains("Invalid value for parameter Clone on annotation RustDerive."),
+            "{src}: {err}"
+        );
+    }
+    assert!(generate_ok(
+        "package a; @RustDerive(Clone=1, PartialEq=false) parcelable P { int x; }"
+    ));
+}
+
+/// AOSP `ConstReferenceFinder`: an annotation value naming a constant is refused in any order.
+#[test]
+fn annotation_value_reference_is_rejected_in_any_source_order() {
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("annotation_reference");
+    let _ = std::fs::remove_dir_all(&root);
+    let (a, b) = (root.join("a/p"), root.join("b/q"));
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    let consts = a.join("IConsts.aidl");
+    std::fs::write(
+        &consts,
+        "package p; interface IConsts { const int YES = 1; }",
+    )
+    .unwrap();
+    let user = b.join("P.aidl");
+    std::fs::write(
+        &user,
+        "package q; @RustDerive(Clone = p.IConsts.YES) parcelable P { int x; }",
+    )
+    .unwrap();
+    for (first, second) in [(&consts, &user), (&user, &consts)] {
+        let err = rsbinder_aidl::Builder::new()
+            .source(first)
+            .source(second)
+            .collect_aidl_dependencies()
+            .expect_err("a reference in an annotation value");
+        assert!(
+            format!("{err:?}").contains("contains reference to p.IConsts.YES"),
+            "{first:?} then {second:?}: {err:?}"
+        );
+    }
+}
+
+/// A phantom owner's member stays unresolved: no lexical or parent fallback may supply it.
 #[test]
 fn dotted_constant_with_a_phantom_owner_is_unresolved() {
     assert!(
@@ -1370,8 +1339,7 @@ fn dotted_constant_with_a_phantom_owner_is_unresolved() {
     );
 }
 
-/// A qualified constant names a *direct* member of its owner: `Outer.X` is
-/// not `Outer.Inner.X`, whose own scope would otherwise fold it wrongly.
+/// A qualified constant names a *direct* member: `Outer.X` is not `Outer.Inner.X`.
 #[test]
 fn nested_declaration_constants_are_not_members_of_the_outer() {
     assert!(
@@ -1392,9 +1360,7 @@ fn nested_declaration_constants_are_not_members_of_the_outer() {
     );
 }
 
-/// A diamond of cross-package references (`c` → `a` → `b` → `a`) folds every
-/// constant in its own owner's scope, even the one reached while its owner
-/// is already being folded: one constant has one value, wherever it is read.
+/// In a `c`→`a`→`b`→`a` diamond every constant folds in its owner's scope, even re-entrantly.
 #[test]
 fn diamond_constant_references_fold_in_their_owners_scope() {
     let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("const_diamond");
@@ -1437,4 +1403,261 @@ fn diamond_constant_references_fold_in_their_owners_scope() {
     ] {
         assert!(out.contains(pin), "missing `{pin}`: {out}");
     }
+}
+
+/// Debug text of the parse or generation error; panics when both succeed.
+fn generate_err(input: &str) -> String {
+    let ctx = rsbinder_aidl::SourceContext::new("test.aidl", input);
+    let result = rsbinder_aidl::parse_document(&ctx)
+        .and_then(|doc| rsbinder_aidl::Generator::new(false, false).document(&doc));
+    match result {
+        Ok((_, out)) => panic!("expected an error for {input:?}, got:\n{out}"),
+        Err(err) => format!("{err:?}"),
+    }
+}
+
+/// AOSP lexes longest-match, so `trueCount` and `onewayResult` are identifiers.
+#[test]
+fn keyword_prefixed_identifiers_are_identifiers() {
+    let out = generate_str("interface I { const int trueCount = 1; const int X = trueCount; }")
+        .expect("`trueCount` is a constant name");
+    assert!(out.contains("pub const r#X: i32 = 1;"), "{out}");
+    let out =
+        generate_str("parcelable onewayResult { int x; } interface I { onewayResult get(); }")
+            .expect("`onewayResult` is a type name");
+    assert!(
+        out.contains("fn r#get(&self) -> rsbinder::BinderResult<"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("FLAG_ONEWAY"),
+        "`get` must not be oneway:\n{out}"
+    );
+}
+
+/// AOSP grammar separates arguments and annotation parameters with commas.
+#[test]
+fn missing_list_commas_are_parse_errors() {
+    generate_err("interface I { void f(int a int b); }");
+    generate_err("@JavaDerive(equals=true toString=true) parcelable P { int x; }");
+}
+
+/// A qualifier that names no declaration must not fall back to the enum being declared.
+#[test]
+fn unknown_enum_qualifier_is_not_the_current_enum() {
+    let err = generate_err("enum E { X = 5, Y = Nope.X }");
+    assert!(
+        err.contains("invalid discriminant") || err.contains("Nope"),
+        "{err}"
+    );
+}
+
+/// AOSP refuses unstructured parcelables for the Rust backend.
+#[test]
+fn unstructured_parcelable_is_rejected() {
+    let err = generate_err("parcelable Foo;");
+    assert!(err.contains("is unstructured"), "{err}");
+    assert!(
+        generate_ok("parcelable Foo {}"),
+        "an empty structured parcelable still generates"
+    );
+}
+
+/// An enum reference converts to the target like any other value (AOSP `ValueString`).
+#[test]
+fn enum_reference_converts_to_a_non_enum_target() {
+    let out = generate_str(
+        "@Backing(type=\"int\") enum E { A = 1, BIG = 300 } parcelable P { boolean b = E.A; }",
+    )
+    .expect("an int enum value initializes a boolean");
+    assert!(out.contains("r#b: true"), "{out}");
+    generate_err(
+        "@Backing(type=\"int\") enum E { A = 1, BIG = 300 } interface I { const byte B = E.BIG; }",
+    );
+    generate_err("enum E { A } parcelable Q { int x; } parcelable P { Q q = E.A; }");
+}
+
+/// AOSP `ValueString`: a defined type that is not an enum takes no constant value at all.
+#[test]
+fn non_enum_defined_type_takes_no_constant() {
+    for src in [
+        "parcelable Q { int x; } parcelable P { Q q = 5; }",
+        "interface IFoo { void m(); } parcelable P { IFoo f = \"x\"; }",
+        "enum E { A } parcelable Q { int x; } parcelable P { Q[] qs = {E.A}; }",
+    ] {
+        generate_err(src);
+    }
+}
+
+/// AOSP `ValueString`: String takes only a string, integral targets never take a float.
+#[test]
+fn const_conversions_reject_mismatched_kinds() {
+    for src in [
+        "interface I { const String S = 5; }",
+        "interface I { const String S = true; }",
+        "interface I { const String[] N = { UNDEFINED }; }",
+        "interface I { const int X = 1.5; }",
+        "interface I { const long L = 1e19; }",
+        "parcelable P { boolean b = 0.5; }",
+    ] {
+        generate_err(src);
+    }
+}
+
+/// AOSP `AidlUnaryConstExpression::IsCompatibleType`: no char; bool per `OverflowGuard<bool>`.
+#[test]
+fn unary_operators_follow_aosp_on_char_and_bool() {
+    generate_err("interface I { const char A = 'a'; const char B = -A; }");
+    generate_err("interface I { const char A = 'a'; const char B = ~A; }");
+    generate_err("interface I { const char A = 'a'; const char B = +A; }");
+    generate_err("interface I { const char A = 'a'; const boolean B = !A; }");
+    generate_err("interface I { const int A = !1.5; }");
+    // `AreCompatibleOperandTypes` has no CHARACTER case, whatever the promoted type.
+    generate_err("interface I { const char A = 'a'; const float F = A + 1.5; }");
+    generate_err("interface I { const char A = 'a'; const boolean B = A == 97; }");
+    let out = generate_str("interface I { const float F = +1.5; const float G = -1.5; }")
+        .expect("unary +/- apply to a float");
+    assert!(out.contains("r#G"), "{out}");
+    generate_err("interface I { const int A = -(1 == 0); }");
+    generate_err("interface I { const int A = ~(1 == 1); }");
+    let out = generate_str("interface I { const int A = -(1 == 1); }").expect("-true is true");
+    assert!(out.contains("pub const r#A: i32 = 1;"), "{out}");
+    // `!` on an integer keeps `T` (`OverflowGuard<T>::operator!`), so a further unary is integral.
+    let out = generate_str(
+        "interface I { const int A = -!0; const int B = -!5; const int C = ~!0; \
+         const long D = -!0L; const boolean E = !5; const int F = ~!1000; }",
+    )
+    .expect("! on an integer stays integral");
+    for want in [
+        "pub const r#A: i32 = -1;",
+        "pub const r#B: i32 = 0;",
+        "pub const r#C: i32 = -2;",
+        "pub const r#D: i64 = -1;",
+        "pub const r#E: bool = false;",
+        "pub const r#F: i32 = -1;",
+    ] {
+        assert!(out.contains(want), "missing `{want}`:\n{out}");
+    }
+}
+
+/// A reference resolves against constants only, never a field default.
+#[test]
+fn field_default_is_not_a_constant() {
+    generate_err("parcelable P { int x = 5; int y = x; }");
+}
+
+/// AOSP `Parser::CheckValidTypeName`.
+#[test]
+fn qualified_structured_type_name_is_rejected() {
+    for src in [
+        "package a; parcelable b.Foo { int x; }",
+        "package a; interface b.IFoo { void m(); }",
+        "package a; enum b.E { A }",
+        "package a; union b.U { int x; }",
+    ] {
+        assert!(generate_err(src).contains("can't be qualified"), "{src}");
+    }
+}
+
+/// AOSP `AidlInterface::CheckValid` reserves the meta-method signatures.
+#[test]
+fn reserved_meta_methods_are_rejected() {
+    for src in [
+        "interface I { int getInterfaceVersion(); }",
+        "interface I { String getInterfaceHash(); }",
+        "interface I { String getTransactionName(int code); }",
+        "interface I { IBinder asBinder(); }",
+    ] {
+        assert!(generate_err(src).contains("reserved"), "{src}");
+    }
+    assert!(generate_ok(
+        "interface I { void getTransactionName(String s); }"
+    ));
+}
+
+/// Nested enum array literals are validated per dimension; the arity must match every dimension.
+#[test]
+fn multi_dimensional_array_defaults() {
+    let out =
+        generate_str("enum E { A, B } parcelable P { E[2][2] m = {{E.A, E.B}, {E.A, E.B}}; }")
+            .expect("a 2-D enum array default generates");
+    assert!(out.contains("E::B"), "{out}");
+    generate_err("parcelable P { int[2][2] x = {1, 2}; }");
+    generate_err("parcelable P { int[2] x = {{1}, {2}}; }");
+    // Variable-length dims and `List<T>` are rank-checked too (else `vec![vec![..]]` for a Vec).
+    generate_err("parcelable P { int[] x = {{1}, {2}}; }");
+    generate_err("enum E { A } parcelable P { E[] e = {{E.A}}; }");
+    generate_err("parcelable P { List<String> l = {{\"a\"}}; }");
+    assert!(generate_ok(
+        "enum E { A } parcelable P { E[] e = {E.A}; int[] x = {1, 2}; }"
+    ));
+}
+
+/// Enum paths in defaults are `r#`-escaped like every other generated path.
+#[test]
+fn keyword_enum_member_default_is_escaped() {
+    let out = generate_str("enum Op { move, copy } parcelable P { Op o = Op.move; Op d; }")
+        .expect("generates");
+    assert!(out.contains("Op::r#move"), "{out}");
+    assert!(!out.contains("Op::move"), "{out}");
+}
+
+/// Constant lookup stops at the package boundary of the referencing declaration.
+#[test]
+fn unqualified_constant_does_not_resolve_through_a_package_segment() {
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("const_package_floor");
+    let _ = std::fs::remove_dir_all(&root);
+    let (a, ab) = (root.join("aidl/a"), root.join("aidl/a/b"));
+    std::fs::create_dir_all(&ab).unwrap();
+    std::fs::write(
+        a.join("b.aidl"),
+        "package a; interface b { const int X = 1; }",
+    )
+    .unwrap();
+    std::fs::write(
+        ab.join("I.aidl"),
+        "package a.b; interface I { const int Y = X; }",
+    )
+    .unwrap();
+    let result = rsbinder_aidl::Builder::new()
+        .source(root.join("aidl"))
+        .dest_dir(root.join("out"))
+        .output("gen.rs")
+        .generate();
+    assert!(
+        result.is_err(),
+        "`X` must not resolve to interface `a.b`'s constant"
+    );
+}
+
+/// `import p.IOuter.Inner;` finds `p/IOuter.aidl` (AOSP `ImportResolver::FindImportFile`).
+#[test]
+fn nested_type_import_resolves_to_the_enclosing_file() {
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("nested_import");
+    let _ = std::fs::remove_dir_all(&root);
+    let p = root.join("aidl/p");
+    std::fs::create_dir_all(&p).unwrap();
+    std::fs::write(
+        p.join("IOuter.aidl"),
+        "package p; interface IOuter { parcelable Inner { int x; } }",
+    )
+    .unwrap();
+    std::fs::write(
+        p.join("IFoo.aidl"),
+        "package p; import p.IOuter.Inner; interface IFoo { Inner get(); }",
+    )
+    .unwrap();
+
+    // Only `IFoo` is a source: `IOuter.aidl` is reachable through the import alone.
+    rsbinder_aidl::Builder::new()
+        .source(p.join("IFoo.aidl"))
+        .dest_dir(root.join("out"))
+        .output("gen.rs")
+        .generate()
+        .expect("a nested-type import resolves to its enclosing file");
+    let out = std::fs::read_to_string(root.join("out/gen.rs")).unwrap();
+    assert!(
+        out.contains("BinderResult<super::IOuter::Inner::Inner>"),
+        "`Inner` names the nested type: {out}"
+    );
 }

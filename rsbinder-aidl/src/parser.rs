@@ -28,12 +28,11 @@ thread_local! {
     static ENUM_VALUE_CACHE: RefCell<HashMap<String, ConstExpr>> = RefCell::new(HashMap::new());
     static ENUM_RESOLUTION_STACK: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
 
-    // Filename and source text of the source currently being parsed (used for error message generation)
+    // Filename and text of the source being parsed, for error diagnostics.
     static CURRENT_SOURCE_NAME: RefCell<String> = const { RefCell::new(String::new()) };
     static CURRENT_SOURCE_TEXT: RefCell<String> = const { RefCell::new(String::new()) };
 
-    // Non-fatal diagnostics accumulated during the current `parse_document`
-    // call. Drained into `Document::warnings` before parse_document returns.
+    // Non-fatal diagnostics of the current `parse_document`, drained into `Document::warnings`.
     static CURRENT_WARNINGS: RefCell<Vec<crate::error::AidlWarning>> = const { RefCell::new(Vec::new()) };
 
     // Each `crate::BUILTIN_DECLS` entry: AIDL namespace -> Rust path relative to the runtime crate.
@@ -57,10 +56,7 @@ pub(crate) fn is_declared(ns: &Namespace) -> bool {
     DECLARATION_MAP.with(|map| map.borrow().contains_key(ns))
 }
 
-/// AOSP-recognised AIDL annotations (`aidl_language.cpp::AidlAnnotation::AllSchemas()`,
-/// 23 entries as of android-16). Annotations outside this set are
-/// surfaced as `cargo:warning=...` so typos and unsupported annotations
-/// don't silently disappear. Sorted alphabetically for grep-ability.
+/// AOSP `AllSchemas()` android-16 (`@JavaDefault`) ∪ android-17 (`@VersionSupport`); others warn.
 const KNOWN_ANNOTATIONS: &[&str] = &[
     "@Backing",
     "@Descriptor",
@@ -82,6 +78,7 @@ const KNOWN_ANNOTATIONS: &[&str] = &[
     "@SensitiveData",
     "@SuppressWarnings",
     "@UnsupportedAppUsage",
+    "@VersionSupport",
     "@VintfStability",
     "@nullable",
     "@utf8InCpp",
@@ -152,21 +149,16 @@ pub fn current_source_text() -> String {
 struct CommentSpan {
     start: usize,
     end: usize,
-    /// `/* … */` (including `/** … */`). AOSP only reads block comments for
-    /// javadoc tags; a trailing `//` comment detaches the run entirely.
+    /// AOSP reads javadoc tags from block comments only; a trailing `//` detaches the run.
     is_block: bool,
 }
 
 thread_local! {
-    // Comment index of the source currently being parsed, ascending by start
-    // offset. Built once per `SourceGuard` so `deprecated_at` is a lookup
-    // rather than a rescan per declaration.
+    // Current source's comments by start offset; built once per `SourceGuard`, not per decl.
     static CURRENT_COMMENTS: RefCell<Vec<CommentSpan>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Finds every comment in `source`, skipping string and char literals so a
-/// `//` or `/*` inside one is not mistaken for a comment (the AIDL grammar's
-/// `C_STR` and `CHARVALUE` both admit backslash escapes).
+/// Every comment in `source`, skipping string/char literals (both admit `\` escapes).
 fn scan_comments(source: &str) -> Vec<CommentSpan> {
     let bytes = source.as_bytes();
     let mut spans = Vec::new();
@@ -191,8 +183,7 @@ fn scan_comments(source: &str) -> Vec<CommentSpan> {
                 while i < bytes.len() && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/')) {
                     i += 1;
                 }
-                // An unterminated block comment runs to end of input; the
-                // parser rejects the file either way.
+                // Unterminated: runs to end of input; the parser rejects the file anyway.
                 i = (i + 2).min(bytes.len());
                 spans.push(CommentSpan {
                     start,
@@ -234,8 +225,7 @@ pub fn deprecated_at(start: usize) -> Option<String> {
     }
     CURRENT_SOURCE_TEXT.with(|text| {
         let text = text.borrow();
-        // Only whitespace may sit between the comment and the item; anything
-        // else means the comment belongs to something before it.
+        // Anything but whitespace in between means the comment belongs to an earlier item.
         let gap = text.get(span.end..start)?;
         if !gap.chars().all(char::is_whitespace) {
             return None;
@@ -244,9 +234,7 @@ pub fn deprecated_at(start: usize) -> Option<String> {
     })
 }
 
-/// AOSP `TrimmedLines` for a block comment: drop the `/*` and `*/` markers,
-/// then per line drop leading whitespace, one optional `*`, and one optional
-/// space, and trim the trailing whitespace.
+/// AOSP `TrimmedLines` for a block comment.
 fn trimmed_block_lines(body: &str) -> Vec<&str> {
     let stripped = body.strip_prefix("/*").unwrap_or(body);
     let stripped = stripped.strip_suffix("*/").unwrap_or(stripped);
@@ -261,10 +249,7 @@ fn trimmed_block_lines(body: &str) -> Vec<&str> {
         .collect()
 }
 
-/// AOSP `BlockTags` + `FindDeprecated`: a line whose first non-space
-/// character is `@` opens a block tag whose name runs to the first
-/// non-alphabetic character; following non-tag lines extend its description.
-/// The first `@deprecated` wins.
+/// AOSP `BlockTags` + `FindDeprecated`: an `@` line opens a tag; the first `@deprecated` wins.
 fn find_deprecated(body: &str) -> Option<String> {
     let mut tag: Option<&str> = None;
     let mut paragraph: Vec<&str> = Vec::new();
@@ -406,11 +391,7 @@ pub fn lookup_decl_from_name(name: &str, style: &str) -> Option<LookupDecl> {
             .map(|package| Namespace::new(package, Namespace::AIDL))
     });
 
-    // 1. the current declaration and every enclosing one, outward. AOSP
-    //    `AidlDefinedType::ResolveName` recurses through `GetEnclosingScope()`
-    //    with no depth limit, so a type three levels deep still sees its
-    //    grandparent's siblings. The package guard and `pop()` terminate the
-    //    walk (a package-less document's empty scope stays a candidate).
+    // 1. Enclosing scopes outward, unbounded as AOSP `GetEnclosingScope()`; stop at the package.
     let mut curr_ns = current_namespace();
     loop {
         if package_ns.as_ref() == Some(&curr_ns) {
@@ -452,14 +433,7 @@ pub fn lookup_decl_from_name(name: &str, style: &str) -> Option<LookupDecl> {
             }
         }
 
-        // Lexical-scope fallback: a *simple* (dot-free) name that matched no
-        // namespace candidate may still be a member of the declaration
-        // currently being generated (e.g. a parcelable constant referencing a
-        // sibling constant before any symbol registration). A qualified name
-        // must NOT take this fallback — `foo.Missing.X` would silently
-        // resolve against the current declaration, fabricating enum
-        // discriminants and phantom self-referential `Box<Self>` fields for
-        // types that do not exist.
+        // Only a simple name may fall back to the current decl; `foo.Missing.X` must not.
         if namespace.ns.len() == 1 {
             let curr_ns = current_namespace();
             if let Some(decl) = hashmap.borrow().get(&curr_ns) {
@@ -470,12 +444,7 @@ pub fn lookup_decl_from_name(name: &str, style: &str) -> Option<LookupDecl> {
         None
     })?;
 
-    // Synthetic union-tag enums (`EnumDecl::tag_of_union`) record the
-    // parent union's namespace as their codegen-effective module path
-    // — the `Tag` struct is a sibling inside `mod <Union>`, not its
-    // own `mod Tag`, so the default `<ns>::<name>` doubling needs to
-    // resolve against the union's ns to emit `<Union>::Tag` instead
-    // of `<Union>::Tag::Tag`.
+    // A union `Tag` sits in `mod <Union>`: use the union's ns (`<Union>::Tag`, not `Tag::Tag`).
     let effective_ns = match &decl {
         Declaration::Enum(e) if e.tag_of_union.is_some() => {
             e.tag_of_union.clone().expect("checked Some above")
@@ -495,10 +464,7 @@ pub fn lookup_decl_from_name(name: &str, style: &str) -> Option<LookupDecl> {
     })
 }
 
-// The one type name a member holds by value — the edges of the sizing graph
-// in `declaration_reaches`. A `Vec`/`HashMap` member is a fixed-size handle
-// whatever it holds, so only a bare name (or one under fixed-size array
-// dimensions) can close a sizing cycle.
+// Edge of the `declaration_reaches` sizing graph; a `Vec`/`HashMap` is a handle, never an edge.
 fn by_value_type_name(ty: &Type) -> Option<&str> {
     if ty.array_types.iter().any(|a| a.const_expr.is_none()) {
         return None;
@@ -560,8 +526,7 @@ pub fn is_vintf_scoped(ns: &Namespace) -> bool {
     }
 }
 
-/// Whether a declaration stores its members by value, without cloning the
-/// subtree [`value_members`] would hand back just to test it.
+/// Whether `ns` stores members by value, without cloning what [`value_members`] returns.
 fn is_value_decl(ns: &Namespace) -> bool {
     DECLARATION_MAP.with(|map| {
         matches!(
@@ -597,8 +562,7 @@ pub fn declaration_reaches(start: &Namespace, target: &Namespace) -> bool {
             continue;
         };
 
-        // Member type names are written relative to their own declaration, so
-        // resolve them under that declaration's namespace and imports.
+        // Member type names resolve under their declaring namespace and imports.
         let _doc = declaration_document_context(&ns).map(|ctx| DocumentGuard::new(&ctx));
         let _guard = NamespaceGuard::new(&ns);
         for member in &members {
@@ -614,9 +578,7 @@ pub fn declaration_reaches(start: &Namespace, target: &Namespace) -> bool {
             let Some(found) = lookup_decl_from_name(name, Namespace::AIDL) else {
                 continue;
             };
-            // A synthetic union `Tag` reports its parent union's namespace, so
-            // the declaration kind — not the namespace — decides whether this
-            // member is an edge. A `Tag` is a scalar and holds no union.
+            // Decide by decl kind, not ns: a union `Tag` reports its union's ns but is a scalar.
             if !matches!(
                 found.decl,
                 Declaration::Parcelable(_) | Declaration::Union(_)
@@ -687,7 +649,8 @@ fn lookup_name_from_decl(decl: &Declaration, lookup_decl: &LookupDecl) -> Option
     let lookup_ident = lookup_decl.name.ns.last().unwrap().to_owned();
     match decl {
         Declaration::Variable(decl) => {
-            if decl.identifier == lookup_ident {
+            // AOSP resolves a reference against constants only, never a field default.
+            if decl.constant && decl.identifier == lookup_ident {
                 Some(make_const_expr(decl.const_expr.as_ref(), lookup_decl))
             } else {
                 None
@@ -718,7 +681,7 @@ fn lookup_name_from_decl(decl: &Declaration, lookup_decl: &LookupDecl) -> Option
     }
 }
 
-// Direct members only: `Outer.X` never means `Outer.Inner.X` (a nested owner is matched as a candidate itself).
+// Direct members only: `Outer.X` never means `Outer.Inner.X`; a nested owner is its own candidate.
 fn lookup_name_members(members: &[Declaration], lookup_decl: &LookupDecl) -> Option<ConstExpr> {
     members
         .iter()
@@ -762,10 +725,7 @@ pub(crate) fn enum_member_const_expr_from_lookup(
     let _guard = NamespaceGuard::new(&lookup_decl.ns);
     let mut result = None;
 
-    // `carried` holds an explicit value that would not fold (non-integral,
-    // failed evaluation, unresolved reference). Passing it through poisons the
-    // auto-increment counter so `decl_enum`'s `to_i64()` reports a diagnostic
-    // instead of fabricating a zeroed wire discriminant.
+    // An unfoldable explicit value poisons auto-increment so `decl_enum` diagnoses, not zeroes.
     let mut carried: Option<ConstExpr> = None;
     let mut result_is_carried = false;
     for enumerator in &enum_decl.enumerator_list {
@@ -773,10 +733,7 @@ pub(crate) fn enum_member_const_expr_from_lookup(
             match const_expr.calculate() {
                 Ok(calculated) => match &calculated.value {
                     ValueType::Name(_) => carried = Some(const_expr.clone()),
-                    // AOSP treats bool as integral in const expressions
-                    // (`AreCompatibleOperandTypes`); float/char/string/array
-                    // enumerators are rejected there, so they poison instead
-                    // of being lossily folded (`A = 1.5` must not become 1).
+                    // AOSP `AreCompatibleOperandTypes`: bool is integral; the rest poison.
                     ValueType::Byte(_)
                     | ValueType::Int32(_)
                     | ValueType::Int64(_)
@@ -812,22 +769,25 @@ pub(crate) fn enum_member_const_expr_from_lookup(
             break;
         }
 
-        // `wrapping_add` matches AOSP's C++ wraparound semantics and avoids
-        // a debug-build panic / release silent overflow when an enumerator
-        // carries an explicit `i64::MAX` value followed by an auto-increment
-        // member.
-        enum_val = enum_val.wrapping_add(1);
+        // AOSP auto-increments with `previous + 1`, whose fold rejects an overflow.
+        match enum_val.checked_add(1) {
+            Some(next) => enum_val = next,
+            None => {
+                let next = ConstExpr::new_expr(
+                    ConstExpr::new(ValueType::Int64(enum_val)),
+                    "+",
+                    ConstExpr::new(ValueType::Int64(1)),
+                );
+                carried = carried.or(Some(next));
+            }
+        }
     }
 
     ENUM_RESOLUTION_STACK.with(|stack| {
         stack.borrow_mut().remove(&resolution_key);
     });
 
-    // A carried (poisoned) result must NOT be cached: it may have been
-    // computed before all symbols were registered, and a cache hit would
-    // freeze the unresolved expression — every later member re-reading it
-    // through the auto-increment path would silently duplicate one wire
-    // discriminant. Recomputing either resolves correctly or diagnoses.
+    // Never cache a carried result: frozen before symbols register, it duplicates discriminants.
     if let Some(expr) = &result {
         if !result_is_carried {
             ENUM_VALUE_CACHE.with(|cache| {
@@ -840,11 +800,12 @@ pub(crate) fn enum_member_const_expr_from_lookup(
 }
 
 pub fn name_to_enum_member_const_expr(name: &str, target_enum: Option<&str>) -> Option<ConstExpr> {
-    // A field default has a target type. Use it to resolve unqualified
-    // members and reject defaults from a different enum family.
+    // A field default's target type resolves bare members and rejects other enums' members.
     if let Some((enum_name, member_name)) = name.rsplit_once('.') {
         let lookup_decl = lookup_decl_from_name(enum_name, Namespace::AIDL)?;
-        if !matches!(lookup_decl.decl, Declaration::Enum(_)) {
+        // The simple-name fallback may return the current declaration under another name.
+        let written = enum_name.rsplit('.').next().unwrap_or(enum_name);
+        if !matches!(&lookup_decl.decl, Declaration::Enum(e) if e.name == written) {
             return None;
         }
 
@@ -882,6 +843,18 @@ pub fn name_to_enum_member_const_expr(name: &str, target_enum: Option<&str>) -> 
     })
 }
 
+// AOSP `Parser::CheckValidTypeName`; only an unstructured parcelable may be qualified.
+fn reject_qualified_type_name(name: &str, span: &pest::Span<'_>) -> Result<(), AidlError> {
+    if !name.contains('.') {
+        return Ok(());
+    }
+    Err(make_parse_error(
+        format!("type name '{name}' can't be qualified; use `package`"),
+        span.start(),
+        span.end(),
+    ))
+}
+
 // `self`/`Self`/`super`/`crate`/`_` cannot be raw identifiers, so no generated name can carry them.
 fn reject_unrepresentable_identifier(
     ident: &str,
@@ -898,9 +871,7 @@ fn reject_unrepresentable_identifier(
         format!(
             "'{keyword}' cannot be used as a{} {role} \
              (not representable as a Rust raw identifier)",
-            // No role here starts with a consonant-sounding vowel, and `u`
-            // is excluded because every one that starts with it reads "a"
-            // ("a union name").
+            // `u` is excluded: every role starting with it reads "a" ("a union name").
             if role.starts_with(['a', 'e', 'i', 'o']) {
                 "n"
             } else {
@@ -912,10 +883,7 @@ fn reject_unrepresentable_identifier(
     ))
 }
 
-// The integral type an enum reference promotes to in a binary expression:
-// its `@Backing` type, with `byte` promoting to `int` as in C++ (AOSP
-// `AidlConstantReference` folds through the declared enum type). An enum whose
-// declaration is not in this translation unit keeps the widest type.
+// Promote to `@Backing` (`byte` -> `int`, AOSP `AidlConstantReference`); unknown enum -> i64.
 pub(crate) fn enum_reference_promoted(enum_type: &str, value: i64) -> ConstExpr {
     let backing = lookup_decl_from_name(enum_type, crate::Namespace::AIDL).and_then(|lookup| {
         match lookup.decl {
@@ -926,9 +894,7 @@ pub(crate) fn enum_reference_promoted(enum_type: &str, value: i64) -> ConstExpr 
         }
     });
     match backing {
-        // A value too wide for the backing type is a `decl_enum` diagnostic,
-        // but that check only runs when the enum itself is generated; keep the
-        // value intact here rather than truncating it into a wrong constant.
+        // Too wide is `decl_enum`'s diagnostic (only if generated); never truncate here.
         Some(ValueType::Byte(_)) | Some(ValueType::Int32(_)) => match i32::try_from(value) {
             Ok(v) => ConstExpr::new(ValueType::Int32(v)),
             Err(_) => ConstExpr::new(ValueType::Int64(value)),
@@ -942,9 +908,7 @@ pub fn register_symbol(name: &str, value: ConstExpr, namespace: Option<&str>) {
     SYMBOL_TABLE.with(|table| {
         let mut table = table.borrow_mut();
 
-        // Always key by the declaring namespace. A bare simple name is not
-        // globally unique, and a bare key lets an unrelated declaration's
-        // constant win an unqualified lookup.
+        // Key by declaring namespace: a bare key lets an unrelated decl's constant win.
         match namespace {
             Some(ns) => {
                 table.insert(format!("{ns}.{name}"), value);
@@ -962,10 +926,7 @@ pub fn name_to_const_expr(name: &str) -> Option<ConstExpr> {
         return Some(expr);
     }
 
-    // For dotted names, try namespace-aware declaration lookup before variant stripping.
-    // This ensures that qualified names like "ParcelableWithNested.Status.OK"
-    // are resolved with full namespace context rather than being stripped to
-    // shorter variants that may lose parent type information.
+    // Dotted names: namespace-aware lookup first, since suffix stripping loses the parent type.
     if name.contains('.') {
         if let Some(lookup_decl) = lookup_decl_from_name(name, Namespace::AIDL) {
             if let Some(expr) = lookup_name_from_decl(&lookup_decl.decl, &lookup_decl) {
@@ -974,9 +935,7 @@ pub fn name_to_const_expr(name: &str) -> Option<ConstExpr> {
         }
     }
 
-    // Variants are ordered scope-first (`<current_ns>.<name>` before the bare
-    // name), so an unqualified reference resolves against its own declaration
-    // rather than a same-named constant elsewhere.
+    // Scope-first order: an unqualified name resolves against its own declaration first.
     let alternative_formats = generate_name_variants(name);
     for variant in alternative_formats {
         let variant_result = SYMBOL_TABLE.with(|table| table.borrow().get(&variant).cloned());
@@ -999,9 +958,7 @@ pub fn name_to_const_expr(name: &str) -> Option<ConstExpr> {
     None
 }
 
-// Symbol-table keys for `name`, most specific first: an unqualified
-// reference resolves outward through its enclosing scopes only, so an
-// unrelated declaration's same-named constant can never win.
+// Symbol-table keys, most specific first; an unqualified name searches enclosing scopes only.
 fn generate_name_variants(name: &str) -> Vec<String> {
     let mut variants = Vec::new();
     let dotted = name.contains('.');
@@ -1010,10 +967,17 @@ fn generate_name_variants(name: &str) -> Vec<String> {
         variants.push(name.to_string());
     }
 
-    let current_ns = current_namespace().to_string(crate::Namespace::AIDL);
+    let current = current_namespace();
+    // Stop at the package boundary: a package segment is not a scope that holds constants.
+    let floor = declaration_document_context(&current)
+        .and_then(|ctx| ctx.package)
+        .map_or(0, |package| {
+            Namespace::new(&package, Namespace::AIDL).ns.len()
+        });
+    let current_ns = current.to_string(crate::Namespace::AIDL);
     if !current_ns.is_empty() {
         let segments: Vec<&str> = current_ns.split('.').collect();
-        for end in (1..=segments.len()).rev() {
+        for end in (floor + 1..=segments.len()).rev() {
             variants.push(format!("{}.{}", segments[..end].join("."), name));
         }
     }
@@ -1135,9 +1099,10 @@ pub struct ParcelableDecl {
     pub cpp_header: String,
     pub ndk_header: String,
     pub rust_type: String,
+    /// Declared with `;` instead of a body: the definition lives outside AIDL.
+    pub is_unstructured: bool,
     pub members: Vec<Declaration>,
     pub deprecated: Option<String>,
-    // pub name_dict: Option<HashMap<String, ConstExpr>>,
 }
 
 impl ParcelableDecl {
@@ -1400,9 +1365,7 @@ pub fn has_annotation(annotation_list: &[Annotation], query_type: AnnotationType
     })
 }
 
-/// Collects the enabled `@RustDerive(...)` trait names as a comma-separated
-/// list (e.g. `"Clone,PartialEq"`), or an empty string when the annotation is
-/// absent. The result is interpolated directly into the generated `#[derive]`.
+/// The traits a `@RustDerive(...)` parameter may name.
 const RUST_DERIVE_SCHEMA: &[&str] = &[
     "Copy",
     "Clone",
@@ -1413,9 +1376,12 @@ const RUST_DERIVE_SCHEMA: &[&str] = &[
     "Hash",
 ];
 
-/// Impls the templates always emit; accepted in `@RustDerive` and dropped, so they are not derived twice.
+/// Always emitted by the templates; `@RustDerive` accepts and drops them to avoid a double derive.
 const RUST_DERIVE_ALWAYS_EMITTED: &[&str] = &["Debug", "Default"];
 
+/// Collects the enabled `@RustDerive(...)` trait names as a comma-separated
+/// list (e.g. `"Clone,PartialEq"`), or an empty string when the annotation is
+/// absent. The result is interpolated directly into the generated `#[derive]`.
 pub fn rust_derive_list(annotation_list: &[Annotation]) -> String {
     for annotation in annotation_list {
         if annotation.annotation == "@RustDerive" {
@@ -1445,43 +1411,52 @@ pub enum EnforcePermissionExpr {
     AnyOf(Vec<String>),
 }
 
-/// Walks an `Annotation::const_expr` (or array element) and returns the
-/// owned string when the value is `ValueType::String(_)`. The pest
-/// grammar already strips the surrounding double quotes, so no
-/// `trim_matches('"')` is required.
+/// The first constant name an unevaluated annotation value refers to.
+fn const_reference(expr: &ConstExpr) -> Option<&str> {
+    match &expr.value {
+        ValueType::Name(name) => Some(name),
+        ValueType::Array(items) => items.iter().find_map(const_reference),
+        ValueType::Map(key, value) => const_reference(key).or_else(|| const_reference(value)),
+        ValueType::Expr { lhs, rhs, .. } => const_reference(lhs).or_else(|| const_reference(rhs)),
+        ValueType::Unary { expr, .. } => const_reference(expr),
+        _ => None,
+    }
+}
+
+/// The folded string value (AOSP `ParamValue<std::string>`); the grammar stripped the quotes.
 fn const_expr_as_string(expr: &ConstExpr) -> Option<String> {
-    if let crate::const_expr::ValueType::String(ref s) = expr.value {
-        Some(s.clone())
+    if let Ok(ValueType::String(s)) = expr.calculate().map(|c| c.value) {
+        Some(s)
     } else {
         None
     }
 }
 
-/// Walks an `Annotation::const_expr` representing an AIDL string-array
-/// literal (`{"A", "B"}`) and returns the contained strings. Returns
-/// `None` for non-array values or arrays containing non-string elements
-/// — both are AOSP-rejected per
-/// `aidl_language.cpp::AidlAnnotation::CheckValid()`.
+/// A string array's folded items, or `None` (AOSP `AidlAnnotation::CheckValid()` rejects).
 fn const_expr_as_string_array(expr: &ConstExpr) -> Option<Vec<String>> {
-    let crate::const_expr::ValueType::Array(items) = &expr.value else {
+    let Ok(ValueType::Array(items)) = expr.calculate().map(|c| c.value) else {
         return None;
     };
     let mut out = Vec::with_capacity(items.len());
-    for item in items {
+    for item in &items {
         out.push(const_expr_as_string(item)?);
     }
     Some(out)
 }
 
-/// Extracts a parsed `@EnforcePermission(...)` from a method's annotation
-/// list, or `None` when the annotation is absent or syntactically
-/// malformed (no `value`/`allOf`/`anyOf` recognized — already surfaced by
-/// `parse_annotation_list`'s unknown-annotation warning path).
+/// Extracts a parsed `@EnforcePermission(...)` from an annotation list:
+/// `Ok(None)` when the annotation is absent;
+/// `Err(MalformedEnforcePermission)` when it is present with no parameter,
+/// or with a parameter that is not one of `value`/`allOf`/`anyOf` or whose
+/// value has the wrong type (AOSP `AidlAnnotation::CheckValid()` fails the
+/// build too).
 ///
 /// AOSP schema reference: `aidl_language.cpp:211-214` declares
 /// `EnforcePermission` with `{{"value", kStringType}, {"anyOf",
 /// kStringArrayType}, {"allOf", kStringArrayType}}` — exactly the three
-/// forms decoded here.
+/// forms decoded here. When several are given, the expression is chosen as
+/// `AidlAnnotation::EnforceExpression()` does, regardless of source order:
+/// `value`, else `anyOf`, else `allOf`.
 pub fn enforce_permission_from_annotation_list(
     annotation_list: &[Annotation],
     method_name: &str,
@@ -1491,40 +1466,40 @@ pub fn enforce_permission_from_annotation_list(
             continue;
         }
 
-        // Shorthand `@EnforcePermission("X")`: AIDL grammar parses the
-        // bare positional argument into `annotation.const_expr` rather
-        // than `parameter_list`.
+        // Shorthand `@EnforcePermission("X")`: the positional argument is in `const_expr`.
         if let Some(c) = &annotation.const_expr {
             if let Some(s) = const_expr_as_string(c) {
                 return Ok(Some(EnforcePermissionExpr::Single(s)));
             }
         }
 
-        // Named-parameter forms — match the AOSP schema's three keys.
+        // Named-parameter forms: AOSP `CheckValid()` rejects any unknown or ill-typed parameter.
+        let (mut single, mut any_of, mut all_of) = (None, None, None);
+        let mut well_formed = true;
         for param in &annotation.parameter_list {
-            match param.identifier.as_str() {
-                "value" => {
-                    if let Some(s) = const_expr_as_string(&param.const_expr) {
-                        return Ok(Some(EnforcePermissionExpr::Single(s)));
-                    }
-                }
-                "allOf" => {
-                    if let Some(items) = const_expr_as_string_array(&param.const_expr) {
-                        return Ok(Some(EnforcePermissionExpr::AllOf(items)));
-                    }
-                }
-                "anyOf" => {
-                    if let Some(items) = const_expr_as_string_array(&param.const_expr) {
-                        return Ok(Some(EnforcePermissionExpr::AnyOf(items)));
-                    }
-                }
-                _ => {}
+            let ok = match param.identifier.as_str() {
+                "value" => const_expr_as_string(&param.const_expr).map(|s| single = Some(s)),
+                "anyOf" => const_expr_as_string_array(&param.const_expr).map(|v| any_of = Some(v)),
+                "allOf" => const_expr_as_string_array(&param.const_expr).map(|v| all_of = Some(v)),
+                _ => None,
+            };
+            well_formed &= ok.is_some();
+        }
+
+        // AOSP `EnforceExpression()` order, independent of source order: value, anyOf, allOf.
+        if well_formed {
+            if let Some(s) = single {
+                return Ok(Some(EnforcePermissionExpr::Single(s)));
+            }
+            if let Some(items) = any_of {
+                return Ok(Some(EnforcePermissionExpr::AnyOf(items)));
+            }
+            if let Some(items) = all_of {
+                return Ok(Some(EnforcePermissionExpr::AllOf(items)));
             }
         }
 
-        // `@EnforcePermission` annotation present but no recognized
-        // argument form matched. Refuse to emit an unguarded Bn —
-        // AOSP rejects this at build time too.
+        // Present but malformed: refuse an unguarded Bn, as AOSP fails the build.
         let (start, end) = annotation.annotation_span.unwrap_or((0, 0));
         return Err(crate::error::AidlError::Semantic(Box::new(
             crate::error::SemanticError::MalformedEnforcePermission {
@@ -1537,18 +1512,76 @@ pub fn enforce_permission_from_annotation_list(
     Ok(None)
 }
 
-pub fn get_descriptor_from_annotation_list(annotation_list: &Vec<Annotation>) -> Option<String> {
-    for annotation in annotation_list {
-        if annotation.annotation == "@Descriptor" {
-            for param in &annotation.parameter_list {
-                if param.identifier == "value" {
-                    return Some(param.const_expr.to_value_string());
-                }
-            }
+/// AOSP `AidlInterface::Version`: `@VersionSupport` wins; `--version` applies only without it.
+pub(crate) fn interface_version(
+    annotation_list: &[Annotation],
+    cli_version: Option<i32>,
+) -> Result<Option<i32>, AidlError> {
+    let Some(annotation) = annotation_list
+        .iter()
+        .find(|a| a.annotation == "@VersionSupport")
+    else {
+        return Ok(cli_version);
+    };
+    let fail = |message: String| make_invalid_operation_error(message, annotation.annotation_span);
+    // Schema `{"version", kIntType, required}`, as AOSP `AidlAnnotation::CheckValid`.
+    let mut expr = None;
+    for param in &annotation.parameter_list {
+        if param.identifier != "version" {
+            return Err(fail(format!(
+                "Parameter {} not supported for annotation VersionSupport.",
+                param.identifier
+            )));
         }
+        expr = Some(&param.const_expr);
     }
+    let expr = expr.ok_or_else(|| fail("Missing 'version' on @VersionSupport.".into()))?;
+    let version = match expr.calculate().map(|c| c.value) {
+        Ok(ValueType::Byte(v)) => Some(i32::from(v)),
+        Ok(ValueType::Int32(v)) => Some(v),
+        Ok(ValueType::Int64(v)) => i32::try_from(v).ok(),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        fail("Invalid value for parameter version on annotation VersionSupport.".into())
+    })?;
+    // AOSP `VersionSpecificCheckValid`.
+    if let Some(cli) = cli_version.filter(|&cli| cli != version) {
+        return Err(fail(format!(
+            "The version declared in the @VersionSupport version variable ({version}) must match \
+             the actual version of the interface ({cli})."
+        )));
+    }
+    Ok(Some(version))
+}
 
-    None
+/// The folded `@Descriptor` value; schema `{"value", kStringType, required}` as AOSP `CheckValid`.
+pub fn get_descriptor_from_annotation_list(
+    annotation_list: &[Annotation],
+) -> Result<Option<String>, AidlError> {
+    let Some(annotation) = annotation_list
+        .iter()
+        .find(|a| a.annotation == "@Descriptor")
+    else {
+        return Ok(None);
+    };
+    let fail = |message: String| make_invalid_operation_error(message, annotation.annotation_span);
+    let mut expr = None;
+    for param in &annotation.parameter_list {
+        if param.identifier != "value" {
+            return Err(fail(format!(
+                "Parameter {} not supported for annotation Descriptor.",
+                param.identifier
+            )));
+        }
+        expr = Some(&param.const_expr);
+    }
+    let expr = expr.ok_or_else(|| fail("Missing 'value' on @Descriptor.".into()))?;
+    let value = const_expr_as_string(expr).ok_or_else(|| {
+        fail("Invalid value for parameter value on annotation Descriptor.".into())
+    })?;
+    // AOSP `AidlInterface::GetDescriptor`: an empty override falls back to the canonical name.
+    Ok((!value.is_empty()).then_some(value))
 }
 
 pub fn get_backing_type(
@@ -1558,13 +1591,27 @@ pub fn get_backing_type(
     // parse "@Backing(type="byte")"
     for annotation in annotation_list {
         if annotation.annotation == "@Backing" {
+            // AOSP schema `{"type", kStringType, required}`: a missing `type` is no byte default.
+            let span = annotation.annotation_span.or(name_span);
+            if let Some(param) = annotation
+                .parameter_list
+                .iter()
+                .find(|p| p.identifier != "type")
+            {
+                return Err(make_invalid_operation_error(
+                    format!(
+                        "Parameter {} not supported for annotation Backing.",
+                        param.identifier
+                    ),
+                    span,
+                ));
+            }
             for param in &annotation.parameter_list {
                 if param.identifier == "type" {
                     let type_name: String =
                         param.const_expr.to_value_string().trim_matches('"').into();
 
-                    // AOSP allows only {byte, int, long} as enum backing types.
-                    // See aidl_language.cpp::AidlEnumDeclaration::Autofill().
+                    // AOSP `AidlEnumDeclaration::Autofill()`: only byte, int, long.
                     if !matches!(type_name.as_str(), "byte" | "int" | "long") {
                         return Err(make_invalid_backing_type_error(
                             type_name,
@@ -1579,6 +1626,10 @@ pub fn get_backing_type(
                     });
                 }
             }
+            return Err(make_invalid_operation_error(
+                "Missing 'type' on @Backing.".into(),
+                span,
+            ));
         }
     }
 
@@ -1591,7 +1642,6 @@ pub fn get_backing_type(
 }
 
 /// Builds an `InvalidBackingType` diagnostic from the active source context.
-/// Mirrors `make_parse_error` for the semantic-error family.
 fn make_invalid_backing_type_error(type_name: String, span: Option<(usize, usize)>) -> AidlError {
     let filename = CURRENT_SOURCE_NAME.with(|name| name.borrow().clone());
     let source = CURRENT_SOURCE_TEXT.with(|text| text.borrow().clone());
@@ -1623,13 +1673,7 @@ fn is_void_return(ty: &Type) -> bool {
     ty.array_types.is_empty() && ty.non_array_type.name == "void"
 }
 
-/// AOSP `aidl_language.cpp:1211` rejects oneway methods that return a
-/// value or carry `out`/`inout` parameters — oneway is fire-and-forget,
-/// so reply data has nowhere to go. Mirror that here so the diagnostic
-/// surfaces at parse time rather than as a confusing codegen / wire
-/// mismatch later. A method is "oneway" if either its own `oneway`
-/// keyword or its enclosing interface's `oneway` keyword is set
-/// (interface-level `oneway` propagates to every method).
+/// AOSP `aidl_language.cpp:1211`: oneway (own or interface-wide) bars returns and `out`/`inout`.
 fn validate_oneway_methods(interface: &InterfaceDecl) -> Result<(), AidlError> {
     let mut errors = Vec::new();
     for method in &interface.method_list {
@@ -1683,8 +1727,7 @@ fn parse_intvalue(arg_value: &str, span: (usize, usize)) -> Result<ConstExpr, Ai
         (arg_value, 10)
     };
 
-    // Strip the integer suffix. AOSP accepts u8 / u32 / u64 / l / L; check
-    // the multi-character unsigned suffixes before the single-char `l`/`L`.
+    // AOSP suffixes u8/u32/u64/l/L; the multi-char ones are checked before `l`/`L`.
     let mut is_u32 = false;
     let mut is_u64 = false;
     let value = if let Some(stripped) = value.strip_suffix("u64") {
@@ -1703,8 +1746,7 @@ fn parse_intvalue(arg_value: &str, span: (usize, usize)) -> Result<ConstExpr, Ai
         value
     };
 
-    // AOSP permits `_` digit separators (e.g. `1_000_000`, `0xFF_FF`);
-    // Rust's `from_str_radix` rejects them, so strip them before parsing.
+    // AOSP allows `_` separators (`0xFF_FF`); `from_str_radix` does not, so strip them.
     let cleaned;
     let value: &str = if value.contains('_') {
         cleaned = value.replace('_', "");
@@ -1800,8 +1842,7 @@ fn parse_intvalue(arg_value: &str, span: (usize, usize)) -> Result<ConstExpr, Ai
 fn parse_value(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr, AidlError> {
     match pair.as_rule() {
         Rule::qualified_name => Ok(ConstExpr::new(ValueType::Name(pair.as_str().into()))),
-        // A string literal inside an ordinary expression (`A + "y"`,
-        // `("y" + "z")`); shares validation with `parse_string_term`.
+        // A string inside an expression (`A + "y"`); `parse_c_str` validates it.
         Rule::C_STR => parse_c_str(pair),
         Rule::HEXVALUE | Rule::INTVALUE => {
             let span = pair.as_span();
@@ -1831,7 +1872,6 @@ fn parse_value(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr, AidlError
 }
 
 fn parse_factor(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr, AidlError> {
-    // println!("parse_factor {:?}", pair);
     match pair.as_rule() {
         Rule::expression => parse_expression(pair.into_inner()),
         Rule::unary => parse_unary(pair.into_inner()),
@@ -1869,10 +1909,7 @@ fn parse_expression(mut pairs: pest::iterators::Pairs<Rule>) -> Result<ConstExpr
     Ok(lhs)
 }
 
-// The string is emitted verbatim into a generated Rust `"..."`. Non-ASCII is
-// allowed (more lenient than AOSP `isValidLiteralChar`) because it round-trips
-// as a valid Rust literal; a control byte or backslash is not, and rsbinder
-// does not decode string escapes, so only those are rejected here.
+// Verbatim in Rust `"..."`: non-ASCII passes (AOSP `isValidLiteralChar` bars it); ctrl/`\` fail.
 fn parse_c_str(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr, AidlError> {
     let span = pair.as_span();
     let raw = pair.as_str();
@@ -1897,9 +1934,7 @@ fn parse_const_expr(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr, Aidl
             for pair in pair.into_inner() {
                 match pair.as_rule() {
                     Rule::const_expr => {
-                        // An empty `{}` parses to a `const_expr` with no
-                        // inner pair; reject it with a diagnostic rather
-                        // than `unwrap()`-panicking on user input.
+                        // An empty `{}` has no inner pair: diagnose, don't `unwrap()`.
                         let span = pair.as_span();
                         match pair.into_inner().next() {
                             Some(inner) => value_list.push(parse_const_expr(inner)?),
@@ -1933,12 +1968,7 @@ fn parse_const_expr(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr, Aidl
                     .chars()
                     .next()
                     .ok_or_else(|| make_parse_error("empty char escape", start, end))?;
-                // Map the supported C/AIDL escape sequences to their actual code
-                // points (e.g. `'\n'` becomes newline, not the literal 'n').
-                // rsbinder intentionally supports these (more lenient than AOSP,
-                // which only allows `'\0'`). An unrecognized escape is rejected:
-                // passing the post-backslash char through verbatim would give
-                // the wrong code point (`'\a'` -> 'a' = 97, not bell).
+                // Wider than AOSP (`'\0'` only); unknown escapes error: `'\a'` is not 'a'.
                 match esc {
                     'n' => '\n',
                     't' => '\t',
@@ -2002,19 +2032,26 @@ fn parse_parameter(pairs: pest::iterators::Pairs<Rule>) -> Result<Parameter, Aid
 }
 
 fn parse_parameter_list(pairs: pest::iterators::Pairs<Rule>) -> Result<Vec<Parameter>, AidlError> {
-    let mut list = Vec::new();
+    let mut list: Vec<Parameter> = Vec::new();
     for pair in pairs {
-        list.push(parse_parameter(pair.into_inner())?);
+        let span = pair.as_span();
+        let parameter = parse_parameter(pair.into_inner())?;
+        // AOSP `aidl_language_y.yy` `parameter_non_empty_list`.
+        if list.iter().any(|p| p.identifier == parameter.identifier) {
+            return Err(make_parse_error(
+                format!("Trying to redefine parameter {}.", parameter.identifier),
+                span.start(),
+                span.end(),
+            ));
+        }
+        list.push(parameter);
     }
 
     Ok(list)
 }
 
 fn parse_annotation(pairs: pest::iterators::Pairs<Rule>) -> Result<Annotation, AidlError> {
-    // `annotation_span` is set by the caller (`parse_annotation_list`) from the
-    // outer `annotation` rule's pair span so the diagnostic label naturally
-    // covers the whole `@Foo(...)` form, including parens that pest's child
-    // rules (ANNOTATION / const_expr / parameter_list) do not span.
+    // The caller sets `annotation_span` from the outer rule so it covers the parens too.
     let mut annotation = Annotation::default();
     for pair in pairs {
         match pair.as_rule() {
@@ -2025,7 +2062,15 @@ fn parse_annotation(pairs: pest::iterators::Pairs<Rule>) -> Result<Annotation, A
             Rule::const_expr => {
                 let span = pair.as_span();
                 match pair.into_inner().next() {
-                    Some(inner) => annotation.const_expr = Some(parse_const_expr(inner)?),
+                    Some(inner) => {
+                        let value = parse_const_expr(inner)?;
+                        // AOSP `aidl_language_y.yy`: `@A(expr)` is `@A(value = expr)`.
+                        annotation.parameter_list = vec![Parameter {
+                            identifier: "value".into(),
+                            const_expr: value.clone(),
+                        }];
+                        annotation.const_expr = Some(value);
+                    }
                     None => {
                         return Err(make_parse_error(
                             "empty `{}` is not a valid annotation argument",
@@ -2047,13 +2092,32 @@ fn parse_annotation(pairs: pest::iterators::Pairs<Rule>) -> Result<Annotation, A
     Ok(annotation)
 }
 
+/// AOSP `AidlAnnotatable::CheckValid`: of the known annotations only `@JavaPassthrough` repeats.
+fn reject_repeated_annotation(
+    annotation_list: &[Annotation],
+    annotation: &Annotation,
+) -> Result<(), AidlError> {
+    let name = annotation.annotation.trim_start_matches('@');
+    if KNOWN_ANNOTATIONS.contains(&annotation.annotation.as_str())
+        && name != "JavaPassthrough"
+        && annotation_list
+            .iter()
+            .any(|a| a.annotation == annotation.annotation)
+    {
+        return Err(make_invalid_operation_error(
+            format!("'{name}' is repeated, but not allowed."),
+            annotation.annotation_span,
+        ));
+    }
+    Ok(())
+}
+
 fn parse_annotation_list(
     pairs: pest::iterators::Pairs<Rule>,
 ) -> Result<Vec<Annotation>, AidlError> {
     let mut annotation_list = Vec::new();
     for pair in pairs {
-        // Capture the outer `annotation` rule's span (covers `@Foo(...)` or
-        // bare `@Foo`) before descending into the inner pairs.
+        // The outer `annotation` span covers `@Foo(...)` as well as bare `@Foo`.
         let span = pair.as_span();
         let mut annotation = parse_annotation(pair.into_inner())?;
         annotation.annotation_span = Some((span.start(), span.end()));
@@ -2066,9 +2130,24 @@ fn parse_annotation_list(
                     filename, annotation.annotation
                 )));
             });
+        } else {
+            reject_repeated_annotation(&annotation_list, &annotation)?;
+            // AOSP `ConstReferenceFinder`; the unfolded form makes it independent of parse order.
+            if let Some(reference) = annotation
+                .parameter_list
+                .iter()
+                .find_map(|p| const_reference(&p.const_expr))
+            {
+                return Err(make_invalid_operation_error(
+                    format!(
+                        "Value must be a constant expression but contains reference to {reference}."
+                    ),
+                    annotation.annotation_span,
+                ));
+            }
         }
 
-        // A misspelt derive would otherwise vanish and surface as a missing trait in the user's crate (AOSP: error).
+        // A misspelt derive errors (as AOSP), not a trait missing later in the user's crate.
         if annotation.annotation == "@RustDerive" {
             if let Some(param) = annotation.parameter_list.iter().find(|p| {
                 let name = p.identifier.as_str();
@@ -2079,6 +2158,24 @@ fn parse_annotation_list(
                         "unknown @RustDerive parameter '{}'; expected one of {}",
                         param.identifier,
                         RUST_DERIVE_SCHEMA.join(", ")
+                    ),
+                    annotation.annotation_span,
+                ));
+            }
+            // AOSP `CheckValid`: each value must pass `ValueString(boolean)`, i.e. bool or integer.
+            if let Some(param) = annotation.parameter_list.iter().find(|p| {
+                !matches!(
+                    p.const_expr.calculate().map(|c| c.value),
+                    Ok(ValueType::Bool(_)
+                        | ValueType::Byte(_)
+                        | ValueType::Int32(_)
+                        | ValueType::Int64(_))
+                )
+            }) {
+                return Err(make_invalid_operation_error(
+                    format!(
+                        "Invalid value for parameter {} on annotation RustDerive.",
+                        param.identifier
                     ),
                     annotation.annotation_span,
                 ));
@@ -2250,11 +2347,7 @@ fn parse_variable_decl(
             }
             Rule::const_expr => match pair.into_inner().next() {
                 Some(pair) => decl.const_expr = Some(parse_const_expr(pair)?),
-                // An explicit empty initializer (`const T[] X = {};` or
-                // `T[] f = {};`) is a valid empty array literal in AOSP.
-                // Mapping it to "no initializer" silently produced
-                // `Default::default()` — which is not a const expression for
-                // a `&[T]` constant (E0658/E0015 at the rustc stage).
+                // `= {}` is AOSP's empty array, not "no initializer" (no const `&[T]` default).
                 None => decl.const_expr = Some(ConstExpr::new(ValueType::Array(Vec::new()))),
             },
             _ => unreachable!(
@@ -2359,6 +2452,12 @@ fn parse_method_decl(pairs: pest::iterators::Pairs<Rule>) -> Result<MethodDecl, 
         }
     }
 
+    // AOSP `method_decl`: annotations after `oneway` join the list before it (method level).
+    for annotation in std::mem::take(&mut decl.r#type.annotation_list) {
+        reject_repeated_annotation(&decl.annotation_list, &annotation)?;
+        decl.annotation_list.push(annotation);
+    }
+
     Ok(decl)
 }
 
@@ -2415,6 +2514,7 @@ fn parse_interface_decl(
             Rule::qualified_name => {
                 let span = pair.as_span();
                 reject_unrepresentable_identifier(pair.as_str(), "interface name", &span)?;
+                reject_qualified_type_name(pair.as_str(), &span)?;
                 interface.name = pair.as_str().into();
                 interface.name_span = Some((span.start(), span.end()));
             }
@@ -2584,10 +2684,12 @@ fn parse_unstructured_parcelable(
 
 fn parse_parcelable_decl(
     annotation_list: Vec<Annotation>,
+    is_unstructured: bool,
     pairs: pest::iterators::Pairs<Rule>,
 ) -> Result<Declaration, AidlError> {
     let mut parcelable = ParcelableDecl {
         annotation_list,
+        is_unstructured,
         ..Default::default()
     };
 
@@ -2596,6 +2698,9 @@ fn parse_parcelable_decl(
             Rule::qualified_name => {
                 let span = pair.as_span();
                 reject_unrepresentable_identifier(pair.as_str(), "parcelable name", &span)?;
+                if !is_unstructured {
+                    reject_qualified_type_name(pair.as_str(), &span)?;
+                }
                 parcelable.name_span = Some((span.start(), span.end()));
                 parcelable.name = pair.as_str().into();
             }
@@ -2616,6 +2721,19 @@ fn parse_parcelable_decl(
 
             _ => unreachable!("Unexpected rule in parse_parcelable_decl(): {}", pair),
         }
+    }
+
+    // `rust_type` emits `pub mod <name>`, so a dotted name would be a Rust syntax error.
+    if !parcelable.rust_type.is_empty() && parcelable.name.contains('.') {
+        let (start, end) = parcelable.name_span.unwrap_or((0, 0));
+        return Err(make_parse_error(
+            format!(
+                "parcelable '{}' with rust_type can't have a qualified name; use `package`",
+                parcelable.name
+            ),
+            start,
+            end,
+        ));
     }
 
     Ok(Declaration::Parcelable(parcelable))
@@ -2696,6 +2814,7 @@ fn parse_enum_decl(
             Rule::qualified_name => {
                 let span = pair.as_span();
                 reject_unrepresentable_identifier(pair.as_str(), "enum name", &span)?;
+                reject_qualified_type_name(pair.as_str(), &span)?;
                 enum_decl.name = pair.as_str().into();
                 enum_decl.name_span = Some((span.start(), span.end()));
             }
@@ -2737,6 +2856,7 @@ fn parse_union_decl(
             Rule::qualified_name => {
                 let span = pair.as_span();
                 reject_unrepresentable_identifier(pair.as_str(), "union name", &span)?;
+                reject_qualified_type_name(pair.as_str(), &span)?;
                 union_decl.name = pair.as_str().into();
                 union_decl.name_span = Some((span.start(), span.end()));
             }
@@ -2771,6 +2891,7 @@ fn parse_decl(pairs: pest::iterators::Pairs<Rule>) -> Result<Vec<Declaration>, A
             Rule::parcelable_decl => {
                 declarations.push(parse_parcelable_decl(
                     annotation_list.clone(),
+                    pair.as_str().ends_with(';'),
                     pair.into_inner(),
                 )?);
             }
@@ -2813,11 +2934,7 @@ fn calculate_namespace(
             .insert(namespace.clone(), document_context.clone());
     });
 
-    // Implicit nested `Tag` enum for unions (AIDL semantics). The
-    // union codegen template already emits a `Tag` struct inside the
-    // union's module; this stub `EnumDecl` exists only so that other
-    // declarations can name-resolve `<Union>.Tag` as a user-defined
-    // type. See `EnumDecl::tag_of_union` for the codegen interplay.
+    // Stub `Tag` enum only so `<Union>.Tag` resolves; codegen: see `EnumDecl::tag_of_union`.
     if matches!(decl, Declaration::Union(_)) {
         let mut tag_ns = namespace.clone();
         tag_ns.push("Tag");
@@ -2842,25 +2959,13 @@ fn calculate_namespace(
     }
 }
 
-/// Maximum `()[]{}` nesting depth accepted before parsing.
-/// Orders of magnitude above any legitimate AIDL, well below the stack-
-/// overflow threshold of the recursive parser/walkers — see
-/// [`check_nesting_depth`].
+/// Max `()[]{}` depth: far above real AIDL, far below the recursive parser's stack overflow.
 const MAX_NESTING_DEPTH: usize = 256;
 
-// Much tighter than `MAX_NESTING_DEPTH`: `non_array_type`'s generic
-// alternatives re-parse the nested remainder per level, so cost is
-// exponential (~3.7x/level; depth 16 already ~1.7s on a debug build) rather
-// than merely stack-hungry. AOSP's deepest vendored generic is 3.
+// Generic re-parse is exponential (~3.7x/level), not just deep; AOSP's deepest vendored is 3.
 const MAX_GENERIC_DEPTH: usize = 12;
 
-/// Maximum number of operator tokens accepted in a single statement/element
-/// (reset at `; , ( ) [ ] { }`). A const expression made of a long operator
-/// chain — `~~~~…~5` or `1+1+…+1` — contains no brackets, so it slips past the
-/// bracket/angle guard yet still drives one parser/walker recursion per
-/// operator and overflows the stack. This bounds that chain length: far above
-/// any legitimate expression (a few dozen OR'd flags at most), far below the
-/// multi-thousand recursion depth that aborts the process.
+/// Operators per statement/element: a bracket-free `1+1+...` chain recurses once per operator.
 const MAX_OPERATOR_RUN: usize = 1024;
 
 #[derive(Debug, Clone, Copy)]
@@ -2880,23 +2985,19 @@ impl NestingLimit {
     }
 }
 
-// Pre-parse denial-of-service guard: the recursive parser and AST walkers
-// would overflow the stack (an uncatchable SIGABRT) on unbounded nesting or an
-// operator chain before `MAX_EXPR_DEPTH` applies. Returns the offset, which of
-// the three limits was hit, and its bound.
+// Pre-parse: deep nesting/operator chains overflow the stack (SIGABRT) before `MAX_EXPR_DEPTH`.
 fn check_nesting_depth(source: &str) -> Option<(usize, NestingLimit, usize)> {
     let bytes = source.as_bytes();
     let mut i = 0;
     let mut bracket_depth: usize = 0; // () [] {}
-                                      // Open `<` positions; only one a `>` closes counts as a generic (an unmatched one is `0 < 1`).
+                                      // Open `<`s; only a `>`-closed one is generic (`0 < 1`).
     let mut angle_open: Vec<usize> = Vec::new();
     let mut generic_depth: usize = 0;
     let mut op_run: usize = 0; // operator tokens in the current statement/element
     let next = |i: usize| bytes.get(i + 1).copied();
     while i < bytes.len() {
         match bytes[i] {
-            // Skip string / char literals (with escapes) so brackets in
-            // text are not counted.
+            // Skip string/char literals (with escapes): brackets in text don't count.
             q @ (b'"' | b'\'') => {
                 i += 1;
                 while i < bytes.len() {
@@ -2925,8 +3026,7 @@ fn check_nesting_depth(source: &str) -> Option<(usize, NestingLimit, usize)> {
                 i += 2;
                 continue;
             }
-            // A bracket / element / statement boundary begins a fresh
-            // sub-expression, so the operator run restarts here.
+            // A bracket/element/statement boundary restarts the operator run.
             b'(' | b'[' | b'{' => {
                 bracket_depth += 1;
                 op_run = 0;
@@ -2944,9 +3044,14 @@ fn check_nesting_depth(source: &str) -> Option<(usize, NestingLimit, usize)> {
                 i += 2;
                 continue;
             }
-            b'<' => angle_open.push(i),
-            // `>>` closes two open generics (`Map<int, List<int>>`); it is a
-            // shift operator only outside one.
+            b'<' => {
+                // A type argument starts with a name, an annotation or a comment; a digit cannot.
+                let next_tok = bytes[i + 1..].iter().find(|b| !b.is_ascii_whitespace());
+                if next_tok.is_some_and(|b| b.is_ascii_alphabetic() || b"_@/".contains(b)) {
+                    angle_open.push(i);
+                }
+            }
+            // `>>` closes two open generics (`Map<int, List<int>>`), else it is a shift.
             b'>' if next(i) == Some(b'>') => {
                 if angle_open.len() >= 2 {
                     generic_depth = generic_depth.max(angle_open.len());
@@ -2971,9 +3076,7 @@ fn check_nesting_depth(source: &str) -> Option<(usize, NestingLimit, usize)> {
                 angle_open.clear();
                 op_run = 0;
             }
-            // Unary / binary operator tokens. Each drives one
-            // parser/walker recursion level, so a long unbracketed chain
-            // would overflow the stack — bound it via `op_run`.
+            // Each operator is one recursion level; `op_run` bounds unbracketed chains.
             b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^' | b'!' | b'~' => op_run += 1,
             _ => {}
         }
@@ -2983,8 +3086,9 @@ fn check_nesting_depth(source: &str) -> Option<(usize, NestingLimit, usize)> {
         if generic_depth > MAX_GENERIC_DEPTH {
             return Some((i, NestingLimit::Generic, MAX_GENERIC_DEPTH));
         }
-        if angle_open.len() > MAX_NESTING_DEPTH {
-            return Some((i, NestingLimit::Generic, MAX_NESTING_DEPTH));
+        // An unclosed `<` costs the same exponential re-parse as a closed one.
+        if angle_open.len() > MAX_GENERIC_DEPTH {
+            return Some((i, NestingLimit::Generic, MAX_GENERIC_DEPTH));
         }
         if op_run > MAX_OPERATOR_RUN {
             return Some((i, NestingLimit::OperatorRun, MAX_OPERATOR_RUN));
@@ -2996,8 +3100,7 @@ fn check_nesting_depth(source: &str) -> Option<(usize, NestingLimit, usize)> {
 
 pub fn parse_document(ctx: &SourceContext) -> Result<Document, AidlError> {
     let _guard = SourceGuard::new(&ctx.filename, &ctx.source);
-    // DoS guard: reject pathologically nested input *before* handing it to
-    // the recursive pest parser, which would otherwise overflow the stack.
+    // Reject pathological nesting before the recursive pest parser overflows the stack.
     if let Some((offset, limit, max)) = check_nesting_depth(&ctx.source) {
         return Err(ParseError::nesting_too_deep(
             &ctx.filename,
@@ -3009,8 +3112,7 @@ pub fn parse_document(ctx: &SourceContext) -> Result<Document, AidlError> {
         .into());
     }
     reset_enum_resolution_state();
-    // Take any leftover warnings from a previous call so this document's
-    // warning set is scoped to its own parse.
+    // Drop leftovers from a previous call so the warnings are scoped to this parse.
     CURRENT_WARNINGS.with(|w| w.borrow_mut().clear());
     let mut document = Document::new();
 
@@ -3035,13 +3137,7 @@ pub fn parse_document(ctx: &SourceContext) -> Result<Document, AidlError> {
                                 Some(idx) => &import[(idx + 1)..],
                                 None => &import,
                             };
-                            // Two imports with the same simple name but
-                            // different fully-qualified names: the map is
-                            // keyed by simple name, so the later wins
-                            // silently and an unqualified reference would
-                            // resolve to the wrong type. AOSP errors on the
-                            // conflict; warn here (idempotent re-imports of
-                            // the same FQN stay silent).
+                            // Simple-name clash: AOSP errors, we warn (same FQN twice is fine).
                             if let Some(existing) = document.imports.get(key) {
                                 if existing != &import {
                                     CURRENT_WARNINGS.with(|w| {
@@ -3076,8 +3172,6 @@ pub fn parse_document(ctx: &SourceContext) -> Result<Document, AidlError> {
                     }
                 }
             }
-
-            // println!("{:?}", document);
         }
         Err(err) => {
             return Err(pest_error_to_diagnostic(err, &ctx.filename, &ctx.source).into());
@@ -3095,8 +3189,7 @@ pub fn parse_document(ctx: &SourceContext) -> Result<Document, AidlError> {
         calculate_namespace(decl, namespace.clone(), &document_context);
     }
 
-    // Drain any non-fatal diagnostics accumulated during this parse so
-    // they travel with the document (and don't leak into the next one).
+    // Move this parse's warnings into the document so they don't leak into the next.
     document.warnings = CURRENT_WARNINGS.with(|w| std::mem::take(&mut *w.borrow_mut()));
 
     Ok(document)
@@ -3182,8 +3275,7 @@ mod tests {
             ConstExpr::new(ValueType::Int64(28))
         );
 
-        // A negative left shift operand is an AOSP overflow diagnostic
-        // (OverflowGuard), so the old `1 + -3 * 2 << 2` form now errors.
+        // A negative left-shift operand is an AOSP overflow diagnostic (OverflowGuard).
         let mut res = AIDLParser::parse(Rule::expression, r##"1 + -3 * 2 << 2"##)?;
         let expr = parse_expression(res.next().unwrap().into_inner())?;
         assert!(expr.calculate().is_err());
@@ -3193,13 +3285,11 @@ mod tests {
 
     #[test]
     fn test_bitwise_precedence_matches_aosp() -> Result<(), Box<dyn Error>> {
-        // AOSP's yacc (aidl_language_y.yy) gives bitwise |/^/& LOWER
-        // precedence than ==/!= and relational operators (C-style). The same
-        // AIDL text must fold to the same constant on both toolchains.
+        // AOSP aidl_language_y.yy: bitwise |/^/& bind looser than ==/!= and relational ops.
         for (src, expected) in [
             ("1 & 2 == 2", 1),       // 1 & (2 == 2), not (1 & 2) == 2
             ("4 | 2 != 2", 4),       // 4 | (2 != 2), not (4 | 2) != 2
-            ("(1 & 2) == 2", 0),     // explicit parens keep the old grouping
+            ("(1 & 2) == 2", 0),     // explicit parens group first
             ("1 | 2 ^ 3 & 2", 1),    // | < ^ < & among themselves
             ("1 << 2 < 8", 1),       // shift still binds tighter than comparison
             ("1 == 1 && 2 == 2", 1), // && stays looser than bitwise/equality
@@ -3213,10 +3303,7 @@ mod tests {
 
     #[test]
     fn test_flat_interface_with_thousands_of_members_parses() -> Result<(), Box<dyn Error>> {
-        // The old right-recursive `interface_members` grammar recursed once
-        // per member and aborted the whole process with a stack overflow at a
-        // few thousand methods — flat input that `check_nesting_depth` (which
-        // only counts brackets/generics) cannot catch.
+        // Per-member recursion would overflow here; `check_nesting_depth` does not count members.
         let mut src = String::from("package test.pkg;\ninterface IBig {\n    const int K = 1;\n");
         for i in 0..5000 {
             src.push_str(&format!("    void method{i}();\n"));
@@ -3237,9 +3324,7 @@ mod tests {
 
     #[test]
     fn test_nesting_depth_guard_rejects_deep_input() {
-        // Deeply nested parens / generics would overflow the recursive
-        // parser; the pre-scan must flag them (returns the offending
-        // offset) before they reach pest.
+        // The pre-scan must flag deep parens/generics before they reach the recursive parser.
         let deep_parens = format!("{}1{}", "(".repeat(1000), ")".repeat(1000));
         assert!(check_nesting_depth(&deep_parens).is_some());
         let deep_generics = format!("{}int{}", "List<".repeat(1000), ">".repeat(1000));
@@ -3247,6 +3332,23 @@ mod tests {
         // A normal document (and shift/comparison operators) must not trip.
         assert!(check_nesting_depth("interface IFoo { void m(); }").is_none());
         assert!(check_nesting_depth("const int X = 1 << 8 >> 2; const int Y = 3;").is_none());
+    }
+
+    #[test]
+    fn test_nesting_depth_guard_rejects_unclosed_generics() {
+        let unclosed = format!(
+            "parcelable P {{ {}int x; }}",
+            "List<".repeat(MAX_GENERIC_DEPTH + 1)
+        );
+        assert!(matches!(
+            check_nesting_depth(&unclosed),
+            Some((_, NestingLimit::Generic, MAX_GENERIC_DEPTH))
+        ));
+        let at_limit = format!(
+            "parcelable P {{ {}int x; }}",
+            "List<".repeat(MAX_GENERIC_DEPTH)
+        );
+        assert!(check_nesting_depth(&at_limit).is_none());
     }
 
     #[test]
@@ -3267,8 +3369,7 @@ mod tests {
 
     #[test]
     fn test_floatvalue_without_decimal_point() {
-        // `5f`, `10f`, `1e10`, `1E5` must parse as floats — the PEG cannot
-        // backtrack leading digits, so each shape is spelled out explicitly.
+        // Each float shape is spelled out, since the PEG cannot backtrack leading digits.
         for s in ["5f", "10f", "1e10", "1E5", "3.14", ".5"] {
             assert!(
                 AIDLParser::parse(Rule::FLOATVALUE, s).is_ok(),
@@ -3281,8 +3382,7 @@ mod tests {
 
     #[test]
     fn test_logical_not_is_not_bitwise() -> Result<(), Box<dyn Error>> {
-        // `!5` is logical negation (false), not bitwise complement (-6);
-        // `!0` is true.
+        // `!5` is logical negation (false), not bitwise complement (-6); `!0` is true.
         let mut res = AIDLParser::parse(Rule::expression, "!5")?;
         let calc = parse_expression(res.next().unwrap().into_inner())?.calculate()?;
         assert_eq!(calc.value, ValueType::Bool(false));

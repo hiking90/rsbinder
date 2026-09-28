@@ -1,27 +1,46 @@
 // SPDX-License-Identifier: Apache-2.0
-//
-// Recognition-only annotation lock-ins.
-//
-// AOSP's Rust AIDL backend (`system/tools/aidl/generate_rust.cpp`)
-// silently ignores three annotations whose effects are either
-// constraint-only, automatically true in rsbinder, or Java-backend
-// specific. rsbinder-aidl matches the Rust backend's silent-ignore
-// behavior. These tests lock that in:
-//
-//   * `@FixedSize` (parcelable / union) — the wire format is the same as
-//     without. Note this is *recognition-only for codegen*, not for
-//     validation: `tests/test_aosp_placement_rules.rs` covers the AOSP
-//     `CanBeFixedSize` field check, which does reject contracts.
-//   * `@SensitiveData` (interface) — AOSP `generate_cpp.cpp:246` /
-//     `generate_rust.cpp:365` add `FLAG_CLEAR_BUF` to every method on
-//     the interface. rsbinder unconditionally emits `FLAG_CLEAR_BUF`
-//     for **every** generated method (see
-//     `rsbinder-aidl/src/generator.rs` `submit_transact` lines), so
-//     the on-the-wire effect AOSP wants is universal in our output.
-//   * `@PropagateAllowBlocking` (method) — emitted *only* by AOSP's
-//     Java backend (`generate_java_binder.cpp:816`); the C++ and Rust
-//     backends do not emit anything for it. rsbinder follows the Rust
-//     backend.
+
+//! Recognition-only annotation lock-ins.
+//!
+//! AOSP's Rust AIDL backend (`system/tools/aidl/generate_rust.cpp`)
+//! silently ignores three annotations whose effects are either
+//! constraint-only, automatically true in rsbinder, or Java-backend
+//! specific. rsbinder-aidl matches the Rust backend's silent-ignore
+//! behavior. These tests lock that in:
+//!
+//!   * `@FixedSize` (parcelable / union) — the wire format is the same as
+//!     without. Note this is *recognition-only for codegen*, not for
+//!     validation: `tests/test_aosp_placement_rules.rs` covers the AOSP
+//!     `CanBeFixedSize` field check, which does reject contracts.
+//!   * `@SensitiveData` (interface) — AOSP `generate_cpp.cpp:246` /
+//!     `generate_rust.cpp:365` add `FLAG_CLEAR_BUF` to every method on
+//!     the interface. rsbinder unconditionally emits `FLAG_CLEAR_BUF`
+//!     for **every** generated method (see
+//!     `rsbinder-aidl/src/generator.rs` `submit_transact` lines), so
+//!     the on-the-wire effect AOSP wants is universal in our output.
+//!   * `@PropagateAllowBlocking` (method) — emitted *only* by AOSP's
+//!     Java backend (`generate_java_binder.cpp:816`); the C++ and Rust
+//!     backends do not emit anything for it. rsbinder follows the Rust
+//!     backend.
+//!
+//! Per-section AOSP references:
+//!
+//!   * @FixedSize — AOSP `aidl_language.cpp` — applies to a structured
+//!     parcelable or union; no codegen effect. Its *field* constraint is
+//!     enforced separately (see `test_aosp_placement_rules.rs`); these
+//!     cases all satisfy it, so only the no-codegen-effect half is at
+//!     stake here.
+//!   * @SensitiveData — AOSP `aidl_language.cpp:140`:
+//!     `CONTEXT_TYPE_INTERFACE`, no parameters. AOSP `generate_cpp.cpp:246`
+//!     and `generate_rust.cpp:365` add `FLAG_CLEAR_BUF` to every method.
+//!     rsbinder unconditionally emits `FLAG_CLEAR_BUF` for every generated
+//!     method (see `generator.rs` `submit_transact` calls), so the wire
+//!     effect is identical with or without the annotation.
+//!   * @PropagateAllowBlocking — AOSP emits codegen for this *only* in the
+//!     Java backend (`generate_java_binder.cpp:816` calls
+//!     `_reply.setPropagateAllowBlocking()`); both `generate_cpp.cpp` and
+//!     `generate_rust.cpp` silently ignore it. rsbinder matches the Rust
+//!     backend.
 
 fn generate(input: &str) -> String {
     let ctx = rsbinder_aidl::SourceContext::new("test.aidl", input);
@@ -36,13 +55,7 @@ fn warnings_for(input: &str) -> Vec<String> {
     doc.warnings.iter().map(|w| w.message.clone()).collect()
 }
 
-// ---------------------------------------------------------------
-// @FixedSize — AOSP `aidl_language.cpp` — applies to a structured
-// parcelable or union; no codegen effect. Its *field* constraint is
-// enforced separately (see `test_aosp_placement_rules.rs`); these
-// cases all satisfy it, so only the no-codegen-effect half is at
-// stake here.
-// ---------------------------------------------------------------
+// ---- @FixedSize (AOSP references: module doc) ----
 
 #[test]
 fn fixed_size_parcelable_byte_identical() {
@@ -65,8 +78,7 @@ parcelable Foo {
 }
         "#,
     );
-    // Anchor the content too: "identical" degenerates into "identically
-    // empty" if parcelable codegen ever collapses.
+    // Anchor the content too: two empty outputs would also compare identical.
     assert!(plain.contains("pub struct Foo"), "{plain}");
     assert_eq!(
         plain, annotated,
@@ -120,14 +132,7 @@ parcelable Foo {
     );
 }
 
-// ---------------------------------------------------------------
-// @SensitiveData — AOSP `aidl_language.cpp:140`:
-// `CONTEXT_TYPE_INTERFACE`, no parameters. AOSP `generate_cpp.cpp:246`
-// and `generate_rust.cpp:365` add `FLAG_CLEAR_BUF` to every method.
-// rsbinder unconditionally emits `FLAG_CLEAR_BUF` for every generated
-// method (see `generator.rs` `submit_transact` calls), so the wire
-// effect is identical with or without the annotation.
-// ---------------------------------------------------------------
+// ---- @SensitiveData (AOSP references: module doc) ----
 
 #[test]
 fn sensitive_data_interface_byte_identical() {
@@ -159,11 +164,7 @@ interface IFoo {
 
 #[test]
 fn sensitive_data_already_universal_clear_buf() {
-    // Defensive regression: confirm rsbinder's *un-annotated* interface
-    // still emits `FLAG_CLEAR_BUF` for every transaction. If this ever
-    // becomes opt-in (so the un-annotated baseline drops the flag), the
-    // `@SensitiveData` lock-in above silently regresses and we need a
-    // real codegen branch.
+    // An opt-in FLAG_CLEAR_BUF would silently void the lock-in above: it needs a codegen branch.
     let out = generate(
         r#"
 package test;
@@ -202,13 +203,7 @@ interface IFoo {
     );
 }
 
-// ---------------------------------------------------------------
-// @PropagateAllowBlocking — AOSP emits codegen for this *only* in the
-// Java backend (`generate_java_binder.cpp:816` calls
-// `_reply.setPropagateAllowBlocking()`); both `generate_cpp.cpp` and
-// `generate_rust.cpp` silently ignore it. rsbinder matches the Rust
-// backend.
-// ---------------------------------------------------------------
+// ---- @PropagateAllowBlocking (AOSP references: module doc) ----
 
 #[test]
 fn propagate_allow_blocking_byte_identical() {

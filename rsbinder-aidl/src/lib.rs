@@ -48,12 +48,11 @@
 //!
 //! # Constants
 //!
-//! As of 0.10.0, constant names are emitted **verbatim** — `const int kFoo`
-//! becomes `r#kFoo`, with no case-normalization — and constant expressions
-//! are evaluated with AOSP-strict rules: integer overflow, lossy narrowing,
+//! Constant names are emitted **verbatim** — `const int kFoo` becomes
+//! `r#kFoo`, with no case-normalization — and constant expressions are
+//! evaluated with AOSP-strict rules: integer overflow, lossy narrowing,
 //! circular constant references, and invalid shift amounts are compile
-//! errors rather than being silently wrapped or truncated. See the project
-//! CHANGELOG for migration notes if upgrading from an earlier release.
+//! errors rather than being silently wrapped or truncated.
 //!
 //! # Validation
 //!
@@ -174,9 +173,7 @@ impl Namespace {
         curr_ns.drain(0..index_to_remove);
         target_ns.drain(0..index_to_remove);
 
-        // Escape any path segment that is a Rust keyword (an AIDL type used as
-        // a module here, e.g. a parcelable named `match`) so the reference
-        // compiles; non-keyword segments are unchanged.
+        // A segment may be a Rust keyword (e.g. a parcelable `match` used as a module): `r#` it.
         let target_path = target_ns
             .iter()
             .map(|seg| escape_rust_keyword(seg))
@@ -186,9 +183,7 @@ impl Namespace {
     }
 }
 
-// Framework-builtin primitives: backed by the rsbinder runtime, so an
-// `import` of one needs no resolvable `.aidl`. Everything else still
-// surfaces as `ResolutionError::ImportNotFound`.
+// Framework builtins backed by the rsbinder runtime: importing one needs no resolvable `.aidl`.
 pub(crate) fn is_builtin_aidl_type(fqcn: &str) -> bool {
     matches!(fqcn, "android.os.ParcelFileDescriptor")
 }
@@ -205,7 +200,7 @@ pub(crate) struct BuiltinDecl {
     pub source: &'static str,
 }
 
-/// AOSP FMQ types vendored from `android17-release` (unchanged since Android 11), plus rsbinder's.
+/// AOSP FMQ types vendored from `android17-release` (frozen V2, `common/fmq/aidl`), plus rsbinder's.
 pub(crate) const BUILTIN_DECLS: &[BuiltinDecl] = &[
     BuiltinDecl {
         fqcn: "android.hardware.common.NativeHandle",
@@ -273,14 +268,56 @@ fn import_candidates(includes: &[PathBuf], import: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-// AIDL permits names that are Rust keywords, so declarations and reference
-// paths must `r#`-escape them as AOSP's Rust backend does. `crate`/`self`/
-// `Self`/`super` cannot be raw identifiers at all and are rejected in the
-// parser (`reject_unrepresentable_identifier`), so they never reach here.
+/// AOSP `ImportResolver::FindImportFile`: `p.IOuter.Inner` may be declared in `p/IOuter.aidl`.
+fn enclosing_import_candidates(includes: &[PathBuf], import: &str) -> Vec<PathBuf> {
+    let mut parts: Vec<&str> = import.split('.').collect();
+    while parts.len() > 1 {
+        parts.pop();
+        let found = import_candidates(includes, &parts.join("."));
+        if !found.is_empty() {
+            return found;
+        }
+    }
+    Vec::new()
+}
+
+// A builtin's fqcn is never shortened: `p.IOuter` must not stand in for builtin `p.IOuter.T`.
+fn resolve_import(includes: &[PathBuf], import: &str) -> Vec<PathBuf> {
+    let candidates = import_candidates(includes, import);
+    if candidates.is_empty() && builtin_decl(import).is_none() {
+        return enclosing_import_candidates(includes, import);
+    }
+    candidates
+}
+
+// The AST drops import offsets; approximate by text search.
+fn import_span(path: &Path, import: &str) -> (NamedSource<String>, SourceSpan) {
+    let source_text = fs::read_to_string(path).unwrap_or_default();
+    let offset = source_text.find(import).unwrap_or(0);
+    let len = if offset > 0 { import.len() } else { 0 };
+    (
+        NamedSource::new(path.to_string_lossy().as_ref(), source_text),
+        SourceSpan::new(offset.into(), len),
+    )
+}
+
+fn ambiguous_import(path: &Path, import: &str, candidates: &[PathBuf]) -> AidlError {
+    let (src, span) = import_span(path, import);
+    AidlError::from(error::ResolutionError::AmbiguousImport {
+        import: import.to_owned(),
+        candidates: candidates
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+        src,
+        span,
+    })
+}
+
+// `r#`-escapes as AOSP does; `crate`/`self`/`Self`/`super` are rejected in the parser.
 pub(crate) fn escape_rust_keyword(ident: &str) -> std::borrow::Cow<'_, str> {
-    // Strict + reserved keywords through Rust 2024 (generated code is compiled
-    // in the consumer's edition), minus `crate`/`self`/`Self`/`super` (invalid
-    // as raw identifiers; never need escaping in our output).
+    // Strict + reserved keywords through Rust 2024: output compiles in the consumer's edition.
     const KEYWORDS: &[&str] = &[
         "as", "async", "await", "break", "const", "continue", "dyn", "else", "enum", "extern",
         "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut",
@@ -318,12 +355,7 @@ pub fn add_indent(step: usize, source: &str) -> String {
     content
 }
 
-/// Per-source frozen-API metadata, populated by [`Builder::version`] /
-/// [`Builder::hash`]. Mirrors AOSP `aidl --version N --hash <s>` semantics:
-/// the version int and hash string are echoed verbatim through the
-/// generated `getInterfaceVersion()` / `getInterfaceHash()` meta methods —
-/// the generator does not compute or validate either value (AIDL API
-/// snapshot freeze is a separate workflow).
+/// Per-source AOSP `aidl --version N --hash <s>`: echoed verbatim, never computed or validated.
 #[derive(Default, Clone, Debug)]
 struct VersionMeta {
     version: Option<i32>,
@@ -338,13 +370,9 @@ pub struct Builder {
     enabled_async: bool,
     is_crate: bool,
     trace: bool,
-    /// Per-source version/hash overrides. Keyed by the source path passed
-    /// to [`Builder::source`]. [`Builder::version`] and [`Builder::hash`]
-    /// apply to the most recently added source.
+    /// Per-source version/hash, keyed by the path passed to [`Builder::source`].
     version_meta: HashMap<PathBuf, VersionMeta>,
-    // Every `.aidl` that contributed to the output plus every directory
-    // walked: cargo scans directories recursively, so the two together
-    // trigger reruns on modifications and on additions/removals.
+    // Contributing `.aidl` files plus walked dirs: cargo rescans dirs, so additions rerun too.
     dependencies: Vec<PathBuf>,
     // Builtin declarations an import pulled in: parsed so references resolve, never generated.
     builtin_documents: Vec<parser::Document>,
@@ -396,10 +424,13 @@ impl Builder {
     /// for every interface declared in that source. Pair with
     /// [`Builder::hash`] to also emit `getInterfaceHash()`.
     ///
-    /// Panics if no source has been added yet or if `v <= 0` (matches
-    /// AOSP `aidl.cpp:615` which silently ignores non-positive versions —
-    /// surfacing it here as an explicit failure avoids the silent-no-op
-    /// trap that Tera's falsy-`0` semantics would otherwise create).
+    /// An interface annotated `@VersionSupport(version = N)` is versioned
+    /// without this call; with it, the two versions must match (AOSP
+    /// `AidlInterface::Version` / `VersionSpecificCheckValid`).
+    ///
+    /// Panics if no source has been added yet, if the preceding source is a
+    /// directory, or if `v <= 0` (AOSP `options.cpp` refuses `--version` ≤ 0
+    /// the same way).
     pub fn version(mut self, v: i32) -> Self {
         assert!(
             v > 0,
@@ -410,9 +441,7 @@ impl Builder {
             .last()
             .cloned()
             .expect("Builder::version() called before any source()");
-        // Version metadata is keyed by the exact file path; a directory
-        // source expands to individual files that would never match the key,
-        // silently dropping the version.
+        // Keyed by exact file path: a directory's files would never match, dropping the version.
         assert!(
             !last.is_dir(),
             "Builder::version() applies to a single .aidl file source, but the preceding \
@@ -428,9 +457,9 @@ impl Builder {
     /// does not validate it against the AIDL contents (AIDL API snapshot
     /// freeze is a separate workflow).
     ///
-    /// Panics if no source has been added yet or if `h` is empty (an empty
-    /// hash is falsy to Tera and would silently emit no `getInterfaceHash()`,
-    /// the same trap [`Builder::version`] guards against).
+    /// Panics if no source has been added yet, if the preceding source is a
+    /// directory, or if `h` is empty (an empty hash is falsy to Tera and would
+    /// silently emit no `getInterfaceHash()`).
     pub fn hash(mut self, h: impl Into<String>) -> Self {
         let last = self
             .sources
@@ -500,7 +529,9 @@ impl Builder {
         filename: &Path,
     ) -> Result<(String, parser::Document, parser::SourceContext), AidlError> {
         println!("Parsing: {filename:?}");
-        let source = fs::read_to_string(filename)?;
+        let source = fs::read_to_string(filename).map_err(|err| {
+            std::io::Error::new(err.kind(), format!("cannot read {filename:?}: {err}"))
+        })?;
         let name = filename
             .file_stem()
             .and_then(|s| s.to_str())
@@ -551,10 +582,7 @@ impl Builder {
                 mod_count = start;
 
                 for r#mod in &mod_list[start..] {
-                    // Lints against the package module itself — e.g.
-                    // `module_inception` when the `include!` site is a module
-                    // of the same name — need an outer attribute; each
-                    // generated leaf module carries its own inner allowances.
+                    // Outer attribute: lints on the package module itself (`module_inception`).
                     if mod_count == 0 {
                         content += "#[allow(clippy::all)]\n#[allow(unused_imports)]\n";
                     }
@@ -616,21 +644,14 @@ impl Builder {
     fn parse_sources(
         &mut self,
     ) -> Result<Vec<(String, parser::Document, parser::SourceContext)>, AidlError> {
-        // Reset here rather than in `Builder::new()`: parsing happens on
-        // `generate()`, so two builders constructed before either generates
-        // would otherwise let the first one's symbol table leak into the
-        // second.
+        // Reset here, not in `new()`: two builders built before either generates share the table.
         parser::reset();
         self.builtin_documents.clear();
         let mut sources = take(&mut self.sources);
         let mut seen = HashSet::new();
-        // `includes` keeps insertion order (user `include_dir()`s first,
-        // package-derived directories after) so the scan is deterministic;
-        // an import found under more than one directory is rejected as
-        // ambiguous, matching AOSP `import_resolver.cpp` ("Duplicate files
-        // found").
+        // User dirs, then package-derived; an import in two is ambiguous (AOSP import_resolver).
         let mut includes: Vec<PathBuf> = Vec::new();
-        // Canonical key: `./aidl` and `aidl` are one dir; `""` (source directly under its package path) means cwd.
+        // Canonical key: `./aidl` == `aidl`; `""` (source right under its package path) is cwd.
         fn name_the_cwd(dir: PathBuf) -> PathBuf {
             if dir.as_os_str().is_empty() {
                 PathBuf::from(".")
@@ -662,11 +683,13 @@ impl Builder {
 
         // Builtins wait for every source: an include dir may vendor a name a builtin imports.
         let mut pending_builtins: Vec<&'static BuiltinDecl> = Vec::new();
+        // (importing file, import, chosen file); rechecked once every include dir is known.
+        let mut resolved: Vec<(PathBuf, String, PathBuf)> = Vec::new();
+        // (importing file, import) not yet resolved; a later source may add its include dir.
+        let mut unresolved: Vec<(PathBuf, String)> = Vec::new();
         while !sources.is_empty() || !pending_builtins.is_empty() {
             for path in take(&mut sources) {
-                // `Path::is_dir()` follows symlinks, so a link cycle
-                // (`aidl/loop -> .`) yields endlessly deeper distinct path
-                // strings; canonicalising makes the dedup terminate.
+                // Canonicalise: a symlink cycle (`aidl/loop -> .`) yields endless new paths.
                 let key = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
                 if !seen.insert(key) {
                     continue;
@@ -689,67 +712,11 @@ impl Builder {
                             }
 
                             for import in doc.imports.values() {
-                                // Framework-builtin types have no standalone
-                                // `.aidl` source in AOSP (the AIDL toolchain
-                                // resolves them as primitives backed by the
-                                // runtime crate). Skip resolution so e.g.
-                                // `android/os/IAccessor.aidl`'s import of
-                                // `android.os.ParcelFileDescriptor` does not
-                                // demand a stub file alongside the vendored
-                                // AOSP sources.
+                                // AOSP has no `.aidl` for these (e.g. IAccessor's PFD).
                                 if is_builtin_aidl_type(import) {
                                     continue;
                                 }
-                                let mut candidates = import_candidates(&includes, import);
-
-                                // The exact byte offset of an import statement
-                                // is not preserved in the AST, so search the
-                                // source text for the import string to
-                                // approximate the diagnostic span.
-                                let import_span = || {
-                                    let source_text = fs::read_to_string(&path).unwrap_or_default();
-                                    let offset = source_text.find(import).unwrap_or(0);
-                                    let len = if offset > 0 { import.len() } else { 0 };
-                                    (
-                                        NamedSource::new(
-                                            path.to_string_lossy().as_ref(),
-                                            source_text,
-                                        ),
-                                        SourceSpan::new(offset.into(), len),
-                                    )
-                                };
-                                match candidates.len() {
-                                    1 => sources.push(candidates.pop().expect("len checked")),
-                                    0 => {
-                                        if let Some(builtin) = builtin_decl(import) {
-                                            pending_builtins.push(builtin);
-                                            continue;
-                                        }
-                                        let (src, span) = import_span();
-                                        errors.push(AidlError::from(
-                                            error::ResolutionError::ImportNotFound {
-                                                import: import.clone(),
-                                                src,
-                                                span,
-                                            },
-                                        ));
-                                    }
-                                    _ => {
-                                        let (src, span) = import_span();
-                                        errors.push(AidlError::from(
-                                            error::ResolutionError::AmbiguousImport {
-                                                import: import.clone(),
-                                                candidates: candidates
-                                                    .iter()
-                                                    .map(|p| p.display().to_string())
-                                                    .collect::<Vec<_>>()
-                                                    .join(", "),
-                                                src,
-                                                span,
-                                            },
-                                        ));
-                                    }
-                                }
+                                unresolved.push((path.clone(), import.clone()));
                             }
 
                             document_list.push((name, doc, ctx));
@@ -758,6 +725,12 @@ impl Builder {
                             errors.push(e);
                         }
                     }
+                } else if !path.is_dir() {
+                    // A mistyped `source()` path: report it with the other errors, not as read_dir.
+                    errors.push(AidlError::from(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("source {path:?} does not exist"),
+                    )));
                 } else {
                     self.dependencies.push(path.clone());
                     let entries = fs::read_dir(&path).map_err(|err| {
@@ -787,6 +760,26 @@ impl Builder {
             if !sources.is_empty() {
                 continue;
             }
+            // Resolve once the queued sources are parsed: AOSP's exact-file rank ignores order.
+            unresolved.retain(|(path, import)| {
+                let mut candidates = resolve_import(&includes, import);
+                match candidates.len() {
+                    0 => match builtin_decl(import) {
+                        Some(builtin) => pending_builtins.push(builtin),
+                        None => return true,
+                    },
+                    1 => {
+                        let chosen = candidates.pop().expect("len checked");
+                        sources.push(chosen.clone());
+                        resolved.push((path.clone(), import.clone(), chosen));
+                    }
+                    _ => errors.push(ambiguous_import(path, import, &candidates)),
+                }
+                false
+            });
+            if !sources.is_empty() {
+                continue;
+            }
             if let Some(builtin) = pending_builtins.pop() {
                 // Look again: every source since this import was met added its package dir.
                 let mut candidates = import_candidates(&includes, builtin.fqcn);
@@ -807,6 +800,27 @@ impl Builder {
                 {
                     errors.push(e);
                 }
+            }
+        }
+
+        for (path, import) in &unresolved {
+            let (src, span) = import_span(path, import);
+            errors.push(AidlError::from(error::ResolutionError::ImportNotFound {
+                import: import.clone(),
+                src,
+                span,
+            }));
+        }
+
+        // A dir added after an import resolved can make it ambiguous, in any `source()` order.
+        for (path, import, chosen) in &resolved {
+            let mut candidates = resolve_import(&includes, import);
+            if candidates.len() == 1 && candidates[0] != *chosen {
+                // A later dir's exact file outranks the enclosing file already compiled.
+                candidates.insert(0, chosen.clone());
+            }
+            if candidates.len() > 1 {
+                errors.push(ambiguous_import(path, import, &candidates));
             }
         }
 
@@ -834,7 +848,7 @@ impl Builder {
             }
         }
 
-        // If there are parse errors, report them immediately without semantic analysis (prevents cascading errors)
+        // Parse errors stop here: semantic analysis on them would only cascade.
         if let Some(err) = AidlError::collect(errors) {
             return Err(err);
         }
@@ -844,10 +858,7 @@ impl Builder {
 
     pub fn generate(mut self) -> Result<(), AidlError> {
         let documents = self.parse_sources()?;
-        // No documents means no `.source()` calls, or only directories with
-        // no `.aidl` files in them — almost certainly a build-script typo.
-        // Writing an empty output file would defer the failure to a confusing
-        // "unresolved import" at the include_aidl! site.
+        // An empty output would defer this build-script typo to an include_aidl! import error.
         if documents.is_empty() {
             return Err(AidlError::Config {
                 message: "no .aidl sources found: add Builder::source(<file-or-dir>) entries \
@@ -855,9 +866,7 @@ impl Builder {
                     .into(),
             });
         }
-        // `version()`/`hash()` metadata is keyed by the exact source path;
-        // an entry that matches no parsed file would silently emit an
-        // unversioned interface.
+        // A meta key matching no parsed file would silently emit an unversioned interface.
         for meta_path in self.version_meta.keys() {
             if !documents
                 .iter()
@@ -898,9 +907,7 @@ impl Builder {
         self.emit_rerun_if_changed();
         Self::emit_warnings(&documents);
 
-        // 1st pass: pre-register all enum symbols across all documents
-        // so that parcelable default values can resolve enum references
-        // regardless of file processing order.
+        // 1st pass: enums first, so defaults resolve enum references in any file order.
         for document in &self.builtin_documents {
             generator::Generator::pre_register_enums(document);
         }
@@ -913,13 +920,9 @@ impl Builder {
         let mut errors = Vec::new();
         for document in &documents {
             println!("Generating: {}", document.0);
-            // Re-establish the source context so that semantic errors generated
-            // during code generation can reference the correct file name and source text.
+            // Semantic errors raised during generation need this file's name and text.
             let _guard = parser::SourceGuard::new(&document.2.filename, &document.2.source);
-            // Look up per-source version/hash. Document filename matches
-            // the path passed to `.source()` (see `parse_file`), so a
-            // PathBuf key roundtrips. Imported sources picked up during
-            // resolution have no entry and fall through to `None`.
+            // Filename == the `.source()` path (see `parse_file`); imported sources get `None`.
             let meta = self
                 .version_meta
                 .get(&PathBuf::from(&document.2.filename))
@@ -969,8 +972,8 @@ impl Builder {
     /// sources + transitively resolved imports) or a directory that
     /// was walked during resolution (user-supplied `include_dir`s,
     /// [`Builder::source`] paths that resolved to a directory, and
-    /// the `<include>/<package-path>` directory inferred from each
-    /// parsed source's package declaration).
+    /// the include root inferred from each parsed source's package
+    /// declaration — its directory with the package segments stripped).
     ///
     /// This is the same set [`Builder::generate`] emits as
     /// `cargo:rerun-if-changed=` lines, exposed as a non-stdout API so
@@ -981,22 +984,14 @@ impl Builder {
         Ok(self.dedup_dependencies())
     }
 
-    /// Emit `cargo:rerun-if-changed=<path>` for every recorded
-    /// dependency. cargo disables its default "scan the build script
-    /// crate root" policy as soon as any `rerun-if-changed` line is
-    /// emitted, so this is the sole signal tying `.aidl` edits to
-    /// build-script reruns — `build.rs` itself remains auto-tracked by
-    /// cargo regardless.
+    /// Any `rerun-if-changed` disables cargo's default scan, so this is the only `.aidl` signal.
     fn emit_rerun_if_changed(&mut self) {
         for path in self.dedup_dependencies() {
             println!("cargo:rerun-if-changed={}", path.display());
         }
     }
 
-    /// Forward parser-emitted [`AidlWarning`](crate::error::AidlWarning)
-    /// diagnostics (e.g. unknown annotations) to cargo as
-    /// `cargo:warning=<msg>` lines so they surface in the build output
-    /// without aborting compilation.
+    /// Parser warnings become `cargo:warning=` lines: visible, non-fatal.
     fn emit_warnings(documents: &[(String, parser::Document, parser::SourceContext)]) {
         for (_name, doc, _ctx) in documents {
             for w in &doc.warnings {
@@ -1015,8 +1010,6 @@ impl Builder {
 
 #[cfg(test)]
 mod tests {
-    // use std::path::Path;
-    // use std::fs;
     use super::*;
 
     #[test]

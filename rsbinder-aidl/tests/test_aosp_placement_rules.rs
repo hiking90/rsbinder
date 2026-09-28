@@ -11,21 +11,46 @@
 //! format. So are the argument, return-type and union-member forms of
 //! `ParcelableHolder`. The `void` placements, the array/`List`/`@nullable`
 //! forms of `ParcelableHolder`, and the field-less `union` are not
-//! contract-level: they had no compiling Rust representation, so the check
+//! contract-level: they have no compiling Rust representation, so the check
 //! turns a rustc error in the generated crate into an AIDL diagnostic.
 //!
-//! Each rule cites the AOSP source it mirrors.
+//! Each rule cites the AOSP source it mirrors. Per section:
+//!
+//! - `void` placement — AOSP `aidl_language.cpp`:
+//!   `AidlTypeSpecifier::CheckValid` ("void type cannot be an array …"),
+//!   `AidlVariableDeclaration::CheckValid` ("declarations cannot be of void type"),
+//!   `AidlMethod::CheckValid` ("'void' is an invalid type for the parameter …").
+//! - `ParcelableHolder` placement — AOSP `aidl_language.cpp`:
+//!   `AidlTypeSpecifier::CheckValid` ("Arrays of ParcelableHolder are not supported",
+//!   "cannot be nullable"), `AidlMethod::CheckValid` ("ParcelableHolder cannot be a
+//!   return type"), `AidlUnionDecl::CheckValid` ("A union can't have a member of
+//!   ParcelableHolder"), `AidlArgument::CheckValid` ("ParcelableHolder cannot be an
+//!   argument type") — `aidl_typenames.cpp` `GetArgumentAspect` gives the holder an empty
+//!   direction set.
+//! - Field-less `union` — AOSP `aidl_language.cpp` `AidlUnionDecl::CheckValid`
+//!   ("The union '…' has no fields.").
+//! - `@FixedSize` — AOSP `aidl_language.cpp` `AidlParcelable::CheckValid` +
+//!   `aidl_typenames.cpp` `AidlTypenames::CanBeFixedSize`.
+//! - `@VintfStability` — AOSP enforces this compilation-wide via `--stability vintf`
+//!   (`aidl.cpp`); rsbinder enforces the reference closure that rule implies.
+//!   `@VintfStability` is scoped (`GetScopedAnnotation`), so a nested declaration
+//!   inherits it.
+//! - `@deprecated` javadoc — AOSP `comments.cpp` `FindDeprecated` + `generate_rust.cpp`
+//!   `GenerateDeprecated`.
+//! - The last section holds other AOSP rules rsbinder enforces; without each one the input
+//!   either diverges silently from AOSP or fails with a rustc error in the consumer's build.
+//!
+//! Constant types: AOSP `AidlConstantDeclaration::CheckValid` admits only `{String, byte,
+//! int, long, float, double}`. rsbinder keeps its `boolean`/`char`/array extensions but
+//! enforces the part that is not one — which is also what keeps a non-VINTF type out of a
+//! `@VintfStability` declaration through a constant, the one reference position the
+//! closure walk does not cover.
 
 use rsbinder_aidl::Builder;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// Every case goes through `Builder::generate`, not `parse_document` +
-/// `Generator` directly, because only `Builder::generate` resets the parser's
-/// thread-local declaration map. Driving the generator directly leaves each
-/// case's types registered, so two cases in this file that reuse a type name
-/// resolve against each other and the suite becomes order-dependent — which
-/// `--test-threads=1` (one thread, one thread-local) would expose.
+/// Only `Builder::generate` resets the thread-local decl map; else reused type names collide.
 fn run(input: &str) -> Result<String, String> {
     static SEQ: AtomicU32 = AtomicU32::new(0);
     let id = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -68,13 +93,7 @@ fn assert_error_contains(input: &str, needle: &str) {
     );
 }
 
-// ---------------------------------------------------------------------------
-// `void` placement — AOSP `aidl_language.cpp`:
-//   AidlTypeSpecifier::CheckValid       ("void type cannot be an array …")
-//   AidlVariableDeclaration::CheckValid ("declarations cannot be of void type")
-//   AidlMethod::CheckValid              ("'void' is an invalid type for the
-//                                        parameter …")
-// ---------------------------------------------------------------------------
+// ---- `void` placement (AOSP sources: module doc) ----
 
 #[test]
 fn void_parameter_is_rejected() {
@@ -131,9 +150,7 @@ interface IFoo {
 
 #[test]
 fn void_list_element_is_rejected() {
-    // A `List<T>` shares the array representation, so the `void[]` check above
-    // does not see this one. `Vec<()>` has no `DeserializeArray` counterpart:
-    // without the check the generated crate fails in rustc, not here.
+    // The `void[]` check misses `List<void>`; `Vec<()>` has no `DeserializeArray`, so rustc fails.
     assert_error_contains(
         r#"
 package test;
@@ -158,18 +175,7 @@ interface IFoo {
     assert!(out.contains("pub trait IFoo"), "{out}");
 }
 
-// ---------------------------------------------------------------------------
-// `ParcelableHolder` placement — AOSP `aidl_language.cpp`:
-//   AidlTypeSpecifier::CheckValid ("Arrays of ParcelableHolder are not
-//                                  supported", "cannot be nullable")
-//   AidlMethod::CheckValid        ("ParcelableHolder cannot be a return type")
-//   AidlUnionDecl::CheckValid     ("A union can't have a member of
-//                                  ParcelableHolder")
-//   AidlArgument::CheckValid      ("ParcelableHolder cannot be an argument
-//                                  type") — `aidl_typenames.cpp`
-//                                  `GetArgumentAspect` gives the holder an
-//                                  empty direction set.
-// ---------------------------------------------------------------------------
+// ---- `ParcelableHolder` placement (AOSP sources: module doc) ----
 
 #[test]
 fn parcelable_holder_array_is_rejected() {
@@ -186,8 +192,7 @@ parcelable Foo {
 
 #[test]
 fn parcelable_holder_list_element_is_rejected() {
-    // As with `List<void>`: the array check does not cover the `List` form,
-    // and `Vec<ParcelableHolder>` has no `SerializeArray` counterpart.
+    // As with `List<void>`: `Vec<ParcelableHolder>` has no `SerializeArray` counterpart.
     assert_error_contains(
         r#"
 package test;
@@ -254,8 +259,7 @@ interface IFoo {
 
 #[test]
 fn parcelable_holder_out_parameter_is_rejected() {
-    // AOSP refuses every direction, not just `in`: the aspect's direction set
-    // is empty, so the check fires before the direction is ever consulted.
+    // AOSP refuses every direction, not just `in`: the holder's direction set is empty.
     assert_error_contains(
         r#"
 package test;
@@ -269,8 +273,7 @@ interface IFoo {
 
 #[test]
 fn parcelable_holder_field_is_accepted() {
-    // The extension field of `ExtendableParcelable` — the whole point of the
-    // type — must keep working.
+    // The `ExtendableParcelable` extension field, the type's whole purpose, must keep working.
     let out = generate(
         r#"
 package test;
@@ -283,10 +286,7 @@ parcelable Foo {
     assert!(out.contains("ParcelableHolder"), "{out}");
 }
 
-// ---------------------------------------------------------------------------
-// Field-less `union` — AOSP `aidl_language.cpp` `AidlUnionDecl::CheckValid`
-// ("The union '…' has no fields.").
-// ---------------------------------------------------------------------------
+// ---- Field-less `union`: AOSP `aidl_language.cpp` `AidlUnionDecl::CheckValid` ----
 
 #[test]
 fn union_without_members_is_rejected() {
@@ -302,9 +302,7 @@ union Foo {
 
 #[test]
 fn union_with_only_constants_is_rejected() {
-    // A `const` is not a field: the rendered enum would be uninhabited, so
-    // `Default::default()` has nothing to return and the `write_to_parcel`
-    // match — whose scrutinee is `&Self` — has no arm.
+    // A `const` is no field: an uninhabited enum has no `Default` and no `write_to_parcel` arm.
     assert_error_contains(
         r#"
 package test;
@@ -349,10 +347,7 @@ union Foo {{
     }
 }
 
-// ---------------------------------------------------------------------------
-// `@FixedSize` — AOSP `aidl_language.cpp` `AidlParcelable::CheckValid` +
-// `aidl_typenames.cpp` `AidlTypenames::CanBeFixedSize`.
-// ---------------------------------------------------------------------------
+// ---- `@FixedSize`: AOSP `AidlParcelable::CheckValid` + `AidlTypenames::CanBeFixedSize` ----
 
 #[test]
 fn fixed_size_rejects_string_field() {
@@ -385,8 +380,7 @@ parcelable Foo {
 
 #[test]
 fn fixed_size_rejects_nullable_field() {
-    // `Inner` is fixed size on its own, so `@nullable` is the only violation
-    // here — the rule under test is the one that fires.
+    // `Inner` is fixed size on its own, so `@nullable` is the only violation here.
     assert_error_contains(
         r#"
 package test;
@@ -437,8 +431,7 @@ union Foo {
 
 #[test]
 fn fixed_size_accepts_primitives_enums_and_fixed_members() {
-    // Mirrors the AOSP `FixedSize.aidl` fixture: an enum, a fixed-size array,
-    // and a nested `@FixedSize` union are all fixed size.
+    // Mirrors AOSP `FixedSize.aidl`: enums, fixed arrays and nested `@FixedSize` unions are fixed.
     let out = generate(
         r#"
 package test;
@@ -465,8 +458,7 @@ parcelable Foo {
 
 #[test]
 fn fixed_size_is_not_inherited_by_nested_types() {
-    // AOSP reads `@FixedSize` with the plain `GetAnnotation`, not the scoped
-    // lookup `@VintfStability` uses, so the nested parcelable is unconstrained.
+    // AOSP reads `@FixedSize` via plain `GetAnnotation` (not scoped): nested types are free.
     let out = generate(
         r#"
 package test;
@@ -482,12 +474,7 @@ parcelable Foo {
     assert!(out.contains("pub struct Inner"), "{out}");
 }
 
-// ---------------------------------------------------------------------------
-// `@VintfStability` — AOSP enforces this compilation-wide via
-// `--stability vintf` (`aidl.cpp`); rsbinder enforces the reference closure
-// that rule implies. `@VintfStability` is scoped (`GetScopedAnnotation`), so a
-// nested declaration inherits it.
-// ---------------------------------------------------------------------------
+// ---- `@VintfStability` reference closure (AOSP sources: module doc) ----
 
 #[test]
 fn vintf_interface_rejects_non_vintf_parameter() {
@@ -593,8 +580,7 @@ interface IFoo {
 
 #[test]
 fn builtin_types_are_not_part_of_the_vintf_closure() {
-    // `ParcelableHolder` is what a VINTF extendable parcelable exists for; it
-    // is a builtin, not a user-defined type, so it never trips the closure.
+    // `ParcelableHolder` is a builtin, not a user-defined type, so it never trips the closure.
     let out = generate(
         r#"
 package test;
@@ -612,9 +598,7 @@ parcelable Foo {
 
 #[test]
 fn nested_type_inherits_vintf_stability() {
-    // AOSP `GetScopedAnnotation` walks to the enclosing type, so `Inner` is
-    // VINTF-stable without repeating the annotation — and must report that
-    // stability, which is what a `ParcelableHolder` records for it.
+    // AOSP `GetScopedAnnotation` makes `Inner` VINTF; its `ParcelableHolder` records that.
     let out = generate(
         r#"
 package test;
@@ -634,8 +618,7 @@ parcelable Foo {
         2,
         "both Foo and its nested Inner must report Vintf stability:\n{out}"
     );
-    // The wire-visible half: the holder inside `Inner` records the inherited
-    // stability as its own byte.
+    // Wire-visible half: the holder inside `Inner` records the inherited stability byte.
     assert_eq!(
         out.matches("ParcelableHolder::new(rsbinder::Stability::Vintf)")
             .count(),
@@ -644,10 +627,7 @@ parcelable Foo {
     );
 }
 
-// ---------------------------------------------------------------------------
-// `@deprecated` javadoc — AOSP `comments.cpp` `FindDeprecated` +
-// `generate_rust.cpp` `GenerateDeprecated`.
-// ---------------------------------------------------------------------------
+// ---- `@deprecated` javadoc (AOSP sources: module doc) ----
 
 #[test]
 fn deprecated_interface_and_method() {
@@ -749,8 +729,7 @@ union Foo {
 
 #[test]
 fn deprecated_survives_intervening_annotations() {
-    // The javadoc precedes the annotations, so the item's span start (which
-    // includes them) must still find it.
+    // The javadoc precedes the annotations, which the item's span start includes.
     let out = generate(
         r#"
 package test;
@@ -766,8 +745,7 @@ parcelable Foo {
 
 #[test]
 fn a_trailing_line_comment_detaches_the_javadoc() {
-    // AOSP `GetValidComment`: only the *last* comment of the run counts, and
-    // only when it is a block comment.
+    // AOSP `GetValidComment`: only the *last* comment of the run counts, and only a block one.
     let out = generate(
         r#"
 package test;
@@ -799,10 +777,7 @@ interface IFoo {
 
 #[test]
 fn a_deprecated_looking_string_constant_is_not_a_comment() {
-    // The comment scanner must skip string literals: a `/*` inside one is
-    // data, not a comment opener. Were it treated as an opener, it would
-    // swallow the real javadoc below it up to the first `*/` and the tag
-    // would be lost.
+    // The comment scanner skips strings: a `/*` there would swallow the javadoc up to `*/`.
     let out = generate(
         r#"
 package test;
@@ -835,10 +810,7 @@ interface IFoo {
 
 #[test]
 fn generated_modules_allow_deprecated_internally() {
-    // The generated proxy/dispatch plumbing names the deprecated method, so
-    // the module-scoped allow has to be there or the output cannot build
-    // under `-D warnings`. It stops at the module boundary, so a consumer
-    // still sees the deprecation.
+    // Plumbing names the method, so `-D warnings` needs a module allow; consumers still see it.
     let out = generate(
         r#"
 package test;
@@ -852,18 +824,11 @@ interface IFoo {
     assert!(out.contains("deprecated)]"), "{out}");
 }
 
-// ---------------------------------------------------------------------------
-// Rules AOSP enforces that rsbinder had not ported at all. Each of these was a
-// silent divergence rather than a gap in the checks above.
-// ---------------------------------------------------------------------------
+// ---- Other AOSP rules: silent divergence or consumer rustc error (see module doc) ----
 
 #[test]
 fn vintf_interface_declares_vintf_stability() {
-    // AOSP `generate_rust.cpp` emits `stability: …::Stability::Vintf` into
-    // `declare_binder_interface!` for a `@VintfStability` interface. Without
-    // it the binder registers with the default `System` stability, and a peer
-    // that requires VINTF refuses it — a wire-visible difference, not a
-    // cosmetic one.
+    // As AOSP `generate_rust.cpp`: without `Stability::Vintf` a VINTF peer refuses the binder.
     let out = generate(
         r#"
 package test;
@@ -894,10 +859,7 @@ interface IFoo {
 
 #[test]
 fn a_nested_type_resolves_against_a_grandparent_scope() {
-    // AOSP `AidlDefinedType::ResolveName` recurses through every enclosing
-    // scope. `C` is three levels deep and names `D`, which lives beside its
-    // grandparent `B` — legal AIDL that a two-level walk rejects as an
-    // unknown type.
+    // AOSP `AidlDefinedType::ResolveName` walks every scope up: `D` is beside grandparent `B`.
     let out = generate(
         r#"
 package test;
@@ -918,8 +880,7 @@ parcelable A {
 
 #[test]
 fn duplicate_method_name_is_rejected() {
-    // The second declaration would otherwise collapse into the first and take
-    // its transaction code with it, silently renumbering everything after it.
+    // A collapsed duplicate would take its transaction code along, renumbering all later ones.
     assert_error_contains(
         r#"
 package test;
@@ -1007,9 +968,7 @@ fn duplicate_names_the_rust_output_cannot_hold_are_rejected() {
 
 #[test]
 fn duplicate_argument_name_is_rejected() {
-    // Both arguments render as the same `_arg_a` binding, so leaving this to
-    // the consumer's build surfaces it as rustc E0415 instead of an AIDL
-    // diagnostic. AOSP `AidlMethod::CheckValid` keeps an `argument_names` set.
+    // Both render as `_arg_a` (rustc E0415); AOSP `AidlMethod::CheckValid` keeps `argument_names`.
     assert_error_contains(
         r#"
 package test;
@@ -1023,9 +982,7 @@ interface IFoo {
 
 #[test]
 fn a_generic_on_a_non_generic_type_is_rejected() {
-    // AOSP `AidlTypeSpecifier::CheckValid`: only `List`, `Map`, and a
-    // parameterizable user-defined type take type arguments. The generic was
-    // being dropped, so `String<int>` silently became a plain `String`.
+    // AOSP `AidlTypeSpecifier::CheckValid`: only `List`, `Map` and user generics take arguments.
     assert_error_contains(
         r#"
 package test;
@@ -1039,8 +996,7 @@ parcelable Foo {
 
 #[test]
 fn a_generic_user_defined_type_still_resolves() {
-    // The new gate must not touch a parameterizable parcelable — AOSP's
-    // `generic/Pair.aidl` fixture shape.
+    // The generic gate must pass a parameterizable parcelable (AOSP `generic/Pair.aidl` shape).
     let out = generate(
         r#"
 package test;
@@ -1057,11 +1013,7 @@ parcelable Uses {
 
 #[test]
 fn a_user_defined_constant_type_is_rejected() {
-    // AOSP `AidlConstantDeclaration::CheckValid` admits only `{String, byte,
-    // int, long, float, double}`. rsbinder keeps its `boolean`/`char`/array
-    // extensions but enforces the part that is not one — which is also what
-    // keeps a non-VINTF type out of a `@VintfStability` declaration through a
-    // constant, the one reference position the closure walk does not cover.
+    // See the module doc: "Constant types".
     assert_error_contains(
         r#"
 package test;
@@ -1092,8 +1044,7 @@ interface IFoo {
 
 #[test]
 fn primitive_string_and_array_constants_still_work() {
-    // rsbinder deliberately allows more constant types than AOSP — `boolean`,
-    // `char`, and constant arrays. The narrower check must not take those away.
+    // rsbinder deliberately allows `boolean`, `char` and constant arrays beyond AOSP; keep them.
     let out = generate(
         r#"
 package test;
@@ -1116,9 +1067,7 @@ interface IFoo {
 
 #[test]
 fn a_stable_api_parcelable_is_exempt_from_the_vintf_closure() {
-    // AOSP exempts a stable-API parcelable from the `--stability vintf` sweep
-    // (`IsStableApiParcelable`); for Rust that is `@RustOnlyStableParcelable`,
-    // whose type comes from `rust_type` and so has no declaration to annotate.
+    // AOSP `IsStableApiParcelable` exempts it; a `rust_type` parcelable has no decl to annotate.
     let out = generate(
         r#"
 package test;
@@ -1135,9 +1084,7 @@ interface IFoo {
 
 #[test]
 fn map_keeps_its_own_unsupported_diagnostic() {
-    // `Map` is generic, but it reaches the unknown-type path, and that message
-    // is the one the AOSP fixture sweep pins. The generic gate must not shadow
-    // it with "not a generic type", which would be actively misleading.
+    // The generic gate must not shadow the unknown-type message the AOSP fixture sweep pins.
     assert_error_contains(
         r#"
 package test;

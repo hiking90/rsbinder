@@ -27,17 +27,13 @@
 use rsbinder_aidl::Builder;
 use std::path::{Path, PathBuf};
 
-/// AOSP fixtures the rsbinder-aidl generator deliberately refuses.
-/// Adding an entry here requires a written rationale — the sweep
-/// reports unexpected drift either way (a listed entry that passes is
-/// just as serious as an unlisted entry that fails).
+/// AOSP fixtures the generator deliberately refuses; every entry needs a written rationale.
 struct ExpectedFailure {
     /// Path relative to `tests/aidl/`.
     relative_path: &'static str,
     /// Substring that must appear in the generator error message.
     reason_substr: &'static str,
-    /// Why this fixture is expected to fail (keep terse — link the
-    /// authoritative source).
+    /// Why this fixture is expected to fail (keep terse; link the authoritative source).
     #[allow(dead_code)]
     rationale: &'static str,
 }
@@ -74,6 +70,24 @@ const EXPECTED_FAILURES: &[ExpectedFailure] = &[
                     in this fixture tree. AOSP builds resolve it via the \
                     framework AIDL search path.",
     },
+    ExpectedFailure {
+        relative_path: "android/aidl/tests/permission/IProtectedInterface.aidl",
+        reason_substr: "uses a permission annotation but the method 'Method2' is also annotated",
+        rationale: "This vendored copy predates AOSP 3412ed66, which dropped the method-level \
+                    annotation: AOSP `AidlInterface::CheckValidPermissionAnnotations` rejects \
+                    an interface and a method that are both permission-annotated.",
+    },
+    ExpectedFailure {
+        relative_path: "android/aidl/tests/generic/Pair.aidl",
+        reason_substr: "is unstructured and names no `rust_type`",
+        rationale: "`parcelable Pair<A, B>;` is unstructured; AOSP `aidl.cpp` refuses \
+                    unstructured parcelables for the Rust backend.",
+    },
+    ExpectedFailure {
+        relative_path: "android/aidl/tests/generic/IFaz.aidl",
+        reason_substr: "is unstructured and names no `rust_type`",
+        rationale: "Imports the unstructured `generic/Pair.aidl`; the failure is inherited.",
+    },
 ];
 
 fn walk_aidl(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -96,6 +110,8 @@ fn aidl_root() -> PathBuf {
 
 fn sweep_out_dir() -> PathBuf {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("aidl_fixture_sweep");
+    // A previous run's file would otherwise satisfy the `[output missing]` check.
+    let _ = std::fs::remove_dir_all(&out);
     std::fs::create_dir_all(&out).unwrap();
     out
 }
@@ -103,8 +119,7 @@ fn sweep_out_dir() -> PathBuf {
 #[test]
 fn aidl_fixture_sweep() {
     let root = aidl_root();
-    // Sweep the whole vendored tree: narrowing to a subdirectory silently
-    // drops fixtures (`android/aidl/loggable/*` was covered nowhere).
+    // Sweep the whole vendored tree: a subdirectory root silently drops fixtures.
     let test_root = root.clone();
     assert!(
         test_root.is_dir(),
@@ -141,8 +156,7 @@ fn aidl_fixture_sweep() {
         let result = Builder::new()
             .source(path.clone())
             .include_dir(&root)
-            // `dest_dir` rather than mutating the process-wide `OUT_DIR`,
-            // which is not thread-safe under the test harness.
+            // Not `OUT_DIR`: mutating process-wide env is not thread-safe under the harness.
             .dest_dir(&out_dir)
             .output(output_name.clone())
             .generate();
@@ -195,8 +209,7 @@ fn aidl_fixture_sweep() {
                          (generated file: {generated_path:?})"
                     )),
                     Ok(_) => {
-                        // An empty-but-valid file parses fine, so anchor on the
-                        // declaration actually being emitted.
+                        // An empty file parses too; require the declaration itself.
                         let stem = path.file_stem().unwrap().to_string_lossy();
                         if !source.contains(&format!("pub mod {stem}"))
                             && !source.contains(&format!("pub mod r#{stem}"))
@@ -214,8 +227,7 @@ fn aidl_fixture_sweep() {
         }
     }
 
-    // Any allowlist entry the walk never encountered must be stale —
-    // the fixture was renamed or removed upstream.
+    // An allowlist entry the walk never met is stale (fixture renamed or removed upstream).
     for exp in EXPECTED_FAILURES {
         if !allowlist_hit.contains(exp.relative_path) {
             failures.push(format!(

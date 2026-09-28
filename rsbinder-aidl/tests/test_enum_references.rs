@@ -1,11 +1,18 @@
 // Copyright 2025 rsbinder Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-// Test cases for enum value references
-// Issue: https://github.com/hiking90/rsbinder/issues/43
-//
-// This reproduces the Android KeyMint Tag/TagType enum reference pattern
-// where Tag enum values are defined using references to TagType enum values
+//! Test cases for enum value references
+//! Issue: https://github.com/hiking90/rsbinder/issues/43
+//!
+//! This reproduces the Android KeyMint Tag/TagType enum reference pattern
+//! where Tag enum values are defined using references to TagType enum values
+//!
+//! Divergence from AOSP: `aidl_to_rust.cpp:89-93` silently re-targets `Bar.X` for a `Foo` field
+//! to `Foo::X` (suffix only), so a same-named member of another enum is substituted without a
+//! diagnostic. rsbinder rejects a field default drawn from a different enum in
+//! `validate_enum_value`, so the author gets an AIDL diagnostic instead of rustc E0308 on the
+//! wrong-type initializer (`super::Digest::Digest::NONE`; each enum is its own newtype).
+//! `test_cross_enum_default_mismatch_is_rejected` pins this.
 
 use similar::{ChangeTag, TextDiff};
 use std::error::Error;
@@ -30,8 +37,7 @@ fn aidl_generator(input: &str, expect: &str) -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn test_keymint_style_enum_reference_resolves() -> Result<(), Box<dyn Error>> {
-    // Cross-enum references at KeyMint scale: every `Tag` discriminant folds
-    // from a `TagType` member OR'd with an index.
+    // KeyMint scale: every `Tag` discriminant folds from a `TagType` member OR'd with an index.
     let input = r##"
         package android.hardware.security.keymint;
 
@@ -126,9 +132,7 @@ fn test_keymint_style_enum_reference_resolves() -> Result<(), Box<dyn Error>> {
     let gen = rsbinder_aidl::Generator::new(false, false);
     let out = gen.document(&document)?.1;
 
-    // Pin the folded discriminants, not just "a module was emitted": these
-    // are wire values, and a resolution regression that zeroed them would
-    // otherwise still satisfy a `contains("pub mod Tag")` check.
+    // Pin the folded wire values: zeroed discriminants would still emit `pub mod Tag`.
     for expected in [
         "r#ENUM = 268435456,",
         "r#ENUM_REP = 536870912,",
@@ -277,8 +281,7 @@ pub mod ExtendedFlags {
 
 #[test]
 fn test_enum_reference_in_interface_constants() -> Result<(), Box<dyn Error>> {
-    // Test case: interface constants that reference enum values
-    // This test focuses on verifying that enum references in interface constants are resolved correctly
+    // Interface constants that reference enum values must resolve.
     let input = r##"
         package test.enums;
         
@@ -382,8 +385,7 @@ pub mod Task {
 
 #[test]
 fn test_keymint_style_simple_reference() -> Result<(), Box<dyn Error>> {
-    // Simplified test case for KeyMint-style enum references
-    // This should work once the bug is fixed
+    // Simplified KeyMint-style enum references.
     aidl_generator(
         r##"
         package test.keymint;
@@ -539,10 +541,7 @@ pub mod CombinedFlags {
     Ok(())
 }
 
-// Issue: https://github.com/hiking90/rsbinder/issues/71
-// When multiple enums share the same constant name (e.g., UNKNOWN) and a parcelable
-// uses them as default values, the generator must resolve to the correct enum type.
-// The fix pre-registers all enum symbols before code generation begins.
+// Issue #71: enums sharing a member name (`UNKNOWN`) must each resolve as a default.
 #[test]
 fn test_multiple_enums_with_same_member_name() -> Result<(), Box<dyn Error>> {
     let gen = rsbinder_aidl::Generator::new(false, false);
@@ -612,7 +611,7 @@ fn test_multiple_enums_with_same_member_name() -> Result<(), Box<dyn Error>> {
     "#,
     ))?;
 
-    // 1st pass: pre-register all enum symbols (the fix for issue #71)
+    // 1st pass: pre-register all enum symbols (issue #71)
     let documents = vec![
         &fold_state_doc,
         &operation_context_doc, // parcelable processed before some enums
@@ -623,8 +622,7 @@ fn test_multiple_enums_with_same_member_name() -> Result<(), Box<dyn Error>> {
         rsbinder_aidl::Generator::pre_register_enums(doc);
     }
 
-    // 2nd pass: generate code for the parcelable
-    // First generate enum documents so DECLARATION_MAP is populated
+    // 2nd pass: enum documents first so DECLARATION_MAP is populated, then the parcelable.
     let _ = gen.document(&fold_state_doc)?;
     let _ = gen.document(&operation_reason_doc)?;
     let _ = gen.document(&wake_reason_doc)?;
@@ -672,14 +670,12 @@ fn test_multiple_enums_with_same_member_name() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-// Issue: https://github.com/hiking90/rsbinder/issues/68
-// Cross-package enum default values should resolve to correct module paths
+// Issue #68: a cross-package enum default must resolve to the right module path.
 #[test]
 fn test_cross_package_enum_default_value() -> Result<(), Box<dyn Error>> {
     let gen = rsbinder_aidl::Generator::new(false, false);
 
-    // 1. Parse and generate enum in a different package
-    //    (registers in DECLARATION_MAP + SYMBOL_TABLE)
+    // 1. Enum in another package (registers in DECLARATION_MAP + SYMBOL_TABLE)
     let enum_doc = rsbinder_aidl::parse_document(&rsbinder_aidl::SourceContext::new(
         "SubEnum.aidl",
         r#"
@@ -722,10 +718,7 @@ fn test_cross_package_enum_default_value() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-// Interface fields are wrapped in `Option<>` (AOSP `aidl_to_rust.cpp`
-// `TypeNeedsOption`): `Strong<_>` has no `Default`, so a bare field would not
-// compile. The non-null contract is enforced at unmarshal time, not by the
-// Rust type — same as AOSP's Rust backend.
+// AOSP `TypeNeedsOption`: `Strong` lacks `Default`, so `Option`; unmarshal enforces non-null.
 #[test]
 fn test_parcelable_non_null_interface_field_is_option() -> Result<(), Box<dyn Error>> {
     let gen = rsbinder_aidl::Generator::new(false, false);
@@ -765,15 +758,7 @@ fn test_parcelable_non_null_interface_field_is_option() -> Result<(), Box<dyn Er
     Ok(())
 }
 
-// A field default drawn from a different enum must be rejected at AIDL time
-// by `validate_enum_value`. Emitting it produces a wrong-type initializer
-// (`super::Digest::Digest::NONE`) that rustc may or may not catch, depending
-// on whether the two enums share a backing type.
-//
-// AOSP `aidl_to_rust.cpp:89-93` silently re-targets `Bar.X` for a `Foo`
-// field to `Foo::X` (using only the suffix). rsbinder is intentionally
-// stricter; real AIDL never writes this pattern, so this test also
-// documents the divergence rather than guarding a common case.
+// Stricter than AOSP on purpose; see the module doc: "Divergence from AOSP".
 #[test]
 fn test_cross_enum_default_mismatch_is_rejected() -> Result<(), Box<dyn Error>> {
     let gen = rsbinder_aidl::Generator::new(false, false);

@@ -67,41 +67,33 @@ fn main() {
         "parcelable Foo {\n    @nullable int val;\n}",
     );
 
-    // ── New: direction_span / name_span ──────────────────
+    // ── Labelled at a token (direction_span / name_span) ─
 
-    // 8) out primitive: direction_span improvement (points to the 'out' keyword)
+    // 8) out primitive: the label covers the 'out' keyword (direction_span)
     demo_builder(
         "out_primitive",
         "interface IFoo {\n    void foo(out int x);\n}",
     );
 
-    // 9) inout String: direction_span improvement (points to the 'inout' keyword)
+    // 9) inout String: the label covers the 'inout' keyword (direction_span)
     demo_builder(
         "inout_string",
         "interface IFoo {\n    void bar(inout String s);\n}",
     );
 
-    // 10) enum @Backing(type="List"): the dedicated InvalidBackingType
-    //     diagnostic (AOSP allowlist = byte/int/long) catches this before
-    //     it reaches the generic `List must have generic type` arm. The
-    //     label spans the whole `@Backing(...)` annotation so the user
-    //     sees the broken token directly.
+    // 10) @Backing(type="List"): InvalidBackingType (AOSP byte/int/long) fires before the List arm
     demo_builder(
         "enum_bad_backing",
         "package foo;\n@Backing(type=\"List\")\nenum MyEnum { V1 = 1, V2 = 2 }",
     );
 
-    // 11) enum @Backing(type="integer"): a common typo for "int" — the
-    //     same diagnostic guides the user toward the correct spelling
-    //     via the allowlist in the help text.
+    // 11) enum @Backing(type="integer"): typo for "int"; the help text lists the allowlist
     demo_builder(
         "enum_backing_typo",
         "package foo;\n@Backing(type=\"integer\")\nenum MyEnum { V1 = 1 }",
     );
 
-    // 12) Union member whose type is `List` without a generic: confirms
-    //     member-level errors point at the offending member type (not at
-    //     the union name) — the correct behaviour for union scopes.
+    // 12) Union member of bare `List`: the error points at the member type, not the union name
     demo_builder(
         "union_member_list_no_generic",
         "package foo;\nunion MyUnion {\n    List items;\n    int n;\n}",

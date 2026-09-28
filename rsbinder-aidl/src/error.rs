@@ -188,7 +188,7 @@ pub enum SemanticError {
     #[error("Interface '{interface}': method '{method}' has transaction code {code} exceeding u32 range")]
     #[diagnostic(
         code(aidl::transaction_code_overflow),
-        help("transaction codes must fit within u32 (0..=4294967295)")
+        help("transaction codes must be between 0 and 16777114 inclusive")
     )]
     TransactionCodeOverflow {
         interface: String,
@@ -200,7 +200,7 @@ pub enum SemanticError {
         span: SourceSpan,
     },
 
-    #[error("Interface '{interface}': method '{method}' has transaction code {code} in the reserved meta-method range")]
+    #[error("Interface '{interface}': method '{method}' has transaction code {code} outside the user range 0..=16777114")]
     #[diagnostic(
         code(aidl::transaction_code_reserved),
         help("user-defined transaction codes must be between 0 and 16777114 inclusive; the top 100 IDs are reserved for AIDL meta methods (getInterfaceVersion/Hash, ...)")
@@ -211,7 +211,7 @@ pub enum SemanticError {
         code: i64,
         #[source_code]
         src: NamedSource<String>,
-        #[label("reserved code here")]
+        #[label("code outside the user range here")]
         span: SourceSpan,
     },
 
@@ -485,7 +485,7 @@ pub fn pest_error_to_diagnostic<R: pest::RuleType>(
     }
 }
 
-/// Formats expected/unexpected token information from a pest parse error into a human-readable message.
+/// Renders a pest error's expected/unexpected tokens as a human-readable message.
 fn format_pest_expectations<R: std::fmt::Debug>(positives: &[R], negatives: &[R]) -> String {
     let mut parts = Vec::new();
 
@@ -610,56 +610,45 @@ mod tests {
         let _box_err: Box<dyn Error> = aidl_err.into();
     }
 
+    fn custom(message: &str) -> pest::error::ErrorVariant<()> {
+        pest::error::ErrorVariant::CustomError {
+            message: message.to_string(),
+        }
+    }
+
+    fn label_of(err: &ParseError) -> (usize, usize) {
+        use miette::Diagnostic;
+        let labels: Vec<_> = err.labels().expect("must have labels").collect();
+        (labels[0].inner().offset(), labels[0].inner().len())
+    }
+
     #[test]
     fn test_pest_error_to_diagnostic_pos() {
-        use miette::Diagnostic;
-        // Pos(42): source is long enough, so length == 1
         let source = "a".repeat(100);
-        let err = ParseError {
-            src: NamedSource::new("test.aidl", source.clone()),
-            span: span(42, 1),
-            message: "test".to_string(),
-            help: None,
-        };
-        let labels: Vec<_> = err.labels().expect("must have labels").collect();
-        assert_eq!(labels[0].inner().offset(), 42);
-        assert_eq!(labels[0].inner().len(), 1);
+        let pos = pest::Position::new(&source, 42).expect("in range");
+        let err = pest::error::Error::new_from_pos(custom("test"), pos);
+        let diag = pest_error_to_diagnostic(err, "test.aidl", &source);
+        assert_eq!(label_of(&diag), (42, 1));
+        assert_eq!(diag.message, "test");
     }
 
     #[test]
     fn test_pest_error_to_diagnostic_span() {
-        use miette::Diagnostic;
-        let err = ParseError {
-            src: NamedSource::new("test.aidl", "0123456789abcdefghij".to_string()),
-            span: span(10, 10),
-            message: "test".to_string(),
-            help: None,
-        };
-        let labels: Vec<_> = err.labels().expect("must have labels").collect();
-        assert_eq!(labels[0].inner().offset(), 10);
-        assert_eq!(labels[0].inner().len(), 10);
+        let source = "0123456789abcdefghij";
+        let span = pest::Span::new(source, 10, 20).expect("in range");
+        let err = pest::error::Error::new_from_span(custom("test"), span);
+        let diag = pest_error_to_diagnostic(err, "test.aidl", source);
+        assert_eq!(label_of(&diag), (10, 10));
     }
 
-    // pest EOF location → SourceSpan conversion (guards against out-of-range)
+    // An error at EOF must get a zero-length label, not one past the source.
     #[test]
     fn test_pest_error_to_diagnostic_eof() {
         let source = "abc";
-        // EOF: pos >= source.len() → length = 0
-        let (offset, length) = {
-            let pos = source.len();
-            let len = if pos >= source.len() { 0 } else { 1 };
-            (pos, len)
-        };
-        let err = ParseError {
-            src: NamedSource::new("test.aidl", source.to_string()),
-            span: span(offset, length),
-            message: "unexpected EOF".to_string(),
-            help: None,
-        };
-        use miette::Diagnostic;
-        let labels: Vec<_> = err.labels().expect("must have labels").collect();
-        assert_eq!(labels[0].inner().offset(), 3);
-        assert_eq!(labels[0].inner().len(), 0);
+        let pos = pest::Position::new(source, source.len()).expect("EOF is a position");
+        let err = pest::error::Error::new_from_pos(custom("unexpected EOF"), pos);
+        let diag = pest_error_to_diagnostic(err, "test.aidl", source);
+        assert_eq!(label_of(&diag), (3, 0));
     }
 
     #[test]

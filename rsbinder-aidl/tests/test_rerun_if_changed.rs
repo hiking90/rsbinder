@@ -82,9 +82,13 @@ interface IHelper {
 "#,
     );
 
+    // `root` is already package-derived; only a separate dir exercises `include_dir`.
+    let extra = root.join("extra");
+    fs::create_dir_all(&extra).unwrap();
+
     let deps = Builder::new()
         .source(&main_aidl)
-        .include_dir(root)
+        .include_dir(&extra)
         .collect_aidl_dependencies()
         .expect("collect_aidl_dependencies");
 
@@ -97,7 +101,7 @@ interface IHelper {
         "transitively resolved import not recorded: {deps:?}"
     );
     assert!(
-        contains_path(&deps, root),
+        contains_path(&deps, &extra),
         "include_dir not recorded: {deps:?}"
     );
 }
@@ -136,6 +140,11 @@ parcelable B {
     assert!(
         contains_path(&deps, root),
         "directory source not recorded as dir-level dependency: {deps:?}"
+    );
+    // `root` is also the package-derived include; only the walk records its subdirectory.
+    assert!(
+        contains_path(&deps, &root.join("com")),
+        "walked subdirectory not recorded: {deps:?}"
     );
     assert!(
         contains_path(&deps, &a),
@@ -176,10 +185,8 @@ interface IHelper {
     );
 
     let deps = Builder::new()
-        .source(&main_aidl)
-        // Same dir twice — must dedup to a single entry.
-        .include_dir(root)
-        .include_dir(root)
+        // The walk and the package-derived include both record `root`; the result has it once.
+        .source(root)
         .collect_aidl_dependencies()
         .expect("collect_aidl_dependencies");
 
@@ -190,17 +197,13 @@ interface IHelper {
     let occurrences = deps.iter().filter(|d| d.as_path() == root).count();
     assert_eq!(
         occurrences, 1,
-        "duplicate include_dir not deduped: {deps:?}"
+        "`root` recorded twice is not deduped: {deps:?}"
     );
 }
 
 #[test]
 fn package_derived_include_is_recorded() {
-    // When a source file's `package com.example;` matches its parent
-    // path `<root>/com/example/...`, parse_sources synthesises `<root>`
-    // as an additional include (so sibling imports resolve without the
-    // user calling `.include_dir()`). That synthesised include should
-    // be recorded for rerun-if-changed too.
+    // parse_sources adds `<root>` as an include when the package matches the path; record it too.
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
 
@@ -237,18 +240,14 @@ interface IHelper {
         contains_path(&deps, &helper_aidl),
         "import unresolvable without package-derived include: {deps:?}"
     );
-    // The synthesised include *directory* is a separate push from the file;
-    // without it cargo never reruns when a sibling .aidl is added, leaving
-    // stale generated code behind.
+    // Without the include *directory*, adding a sibling .aidl would never rerun the build.
     assert!(
         contains_path(&deps, root),
         "package-derived include dir not recorded for rerun: {deps:?}"
     );
 }
 
-/// An import that resolves under more than one include directory is rejected
-/// as ambiguous (AOSP `import_resolver.cpp` "Duplicate files found") — picking
-/// one silently could compile a stale copy of the type.
+/// An import under two include dirs is an error, as in AOSP `import_resolver.cpp`: no silent pick.
 #[test]
 fn ambiguous_import_across_include_dirs_is_diagnostic() {
     let tmp = TempDir::new().unwrap();
@@ -293,4 +292,115 @@ interface IMain {
         .include_dir(root.join("inc_a"))
         .collect_aidl_dependencies()
         .expect("single include dir must resolve");
+}
+
+/// A package-derived dir added after an import resolved still makes it ambiguous, in any order.
+#[test]
+fn ambiguous_import_does_not_depend_on_source_order() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    let dep = "package com.x; parcelable Dep { int x; }";
+    write_aidl(&root.join("a/com/x/Dep.aidl"), dep);
+    write_aidl(&root.join("b/com/x/Dep.aidl"), dep);
+    let ia = root.join("a/com/x/IA.aidl");
+    write_aidl(
+        &ia,
+        "package com.x; import com.x.Dep; interface IA { void f(in Dep d); }",
+    );
+    let ib = root.join("b/com/x/IB.aidl");
+    write_aidl(&ib, "package com.x; interface IB { void g(); }");
+
+    for (first, second) in [(&ia, &ib), (&ib, &ia)] {
+        let err = Builder::new()
+            .source(first)
+            .source(second)
+            .collect_aidl_dependencies()
+            .expect_err("`com.x.Dep` is under both `a` and `b`");
+        assert!(
+            format!("{err}").contains("multiple include directories"),
+            "{first:?} then {second:?}: {err}"
+        );
+    }
+}
+
+/// An import whose include dir comes from a later source still resolves, in any order.
+#[test]
+fn import_found_through_a_later_source_does_not_depend_on_order() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    let ia = root.join("x/com/a/IA.aidl");
+    write_aidl(
+        &ia,
+        "package com.a; import com.b.Dep; interface IA { void f(in Dep d); }",
+    );
+    let dep = root.join("y/com/b/Dep.aidl");
+    write_aidl(&dep, "package com.b; parcelable Dep { int x; }");
+
+    for (first, second) in [(&ia, &dep), (&dep, &ia)] {
+        Builder::new()
+            .source(first)
+            .source(second)
+            .collect_aidl_dependencies()
+            .unwrap_or_else(|e| panic!("{first:?} then {second:?}: {e:?}"));
+    }
+}
+
+/// AOSP `FindImportFile`: an exact file outranks an enclosing type, in any `source()` order.
+#[test]
+fn exact_import_file_outranks_an_enclosing_match_in_any_order() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    let foo = root.join("a/p/IFoo.aidl");
+    write_aidl(
+        &foo,
+        "package p; import p.IOuter.Inner; interface IFoo { void f(in Inner i); }",
+    );
+    write_aidl(
+        &root.join("a/p/IOuter.aidl"),
+        "package p; interface IOuter { parcelable Inner { int x; } }",
+    );
+    let bar = root.join("b/p/IBar.aidl");
+    write_aidl(&bar, "package p; interface IBar { void g(); }");
+    let exact = root.join("b/p/IOuter/Inner.aidl");
+    write_aidl(&exact, "package p.IOuter; parcelable Inner { int y; }");
+
+    for (first, second) in [(&foo, &bar), (&bar, &foo)] {
+        let deps = Builder::new()
+            .source(first)
+            .source(second)
+            .collect_aidl_dependencies()
+            .unwrap_or_else(|e| panic!("{first:?} then {second:?}: {e:?}"));
+        assert!(deps.contains(&exact), "{first:?} then {second:?}: {deps:?}");
+        assert!(
+            !deps.contains(&root.join("a/p/IOuter.aidl")),
+            "{first:?} then {second:?}: {deps:?}"
+        );
+    }
+}
+
+/// A mistyped `source()` path is reported by name, next to the other sources' errors.
+#[test]
+fn missing_source_is_reported_with_other_errors() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let bad = root.join("com/x/IBad.aidl");
+    write_aidl(
+        &bad,
+        "package com.x; import com.x.Missing; interface IBad { void f(); }",
+    );
+
+    let err = Builder::new()
+        .source(&bad)
+        .source(root.join("com/x/IHelo.aidl"))
+        .collect_aidl_dependencies()
+        .expect_err("a missing source is an error");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("does not exist"), "{msg}");
+    assert!(
+        msg.contains("com.x.Missing"),
+        "the earlier import error is kept: {msg}"
+    );
 }
