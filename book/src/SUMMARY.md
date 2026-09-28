@@ -20,6 +20,7 @@
     - [ParcelFileDescriptor](./parcel-file-descriptor.md)
     - [Shared Memory](./shared-memory.md)
     - [Error Handling](./error-handling.md)
+    - [Observability](./observability.md)
     - [Service Manager (HUB)](./service-manager.md)
 - [Storing Values (Data Serialization)](./data-serialization.md)
 - [RPC Transport (binder-over-socket)](./rpc-transport.md)

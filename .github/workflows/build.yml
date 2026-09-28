@@ -279,8 +279,12 @@ jobs:
         # (see the ledger on `linux-build`'s "Check test builds").
         run: |
           cargo test -p tests --features rpc --test rpc_generated_stub --test entry_rpc --test gateway_rpc --test codegen_shapes \
-            --test rpc_async --test rpc_calling_identity --test rpc_enforce_permission_deny
+            --test rpc_async --test rpc_calling_identity --test rpc_enforce_permission_deny \
+            --test work_source_rpc --test observer_rpc --test transaction_names
           cargo test -p tests --features rpc-tcp-debug --test rpc_generated_stub
+          # `aidl_spans` installs a global `tracing` subscriber, so it needs
+          # the `tracing` feature on top of `rpc`.
+          cargo test -p tests --features rpc,tracing --test aidl_spans
       - name: Interface macro (plan 2-19 — golden equivalence, UI, e2e, interop)
         # `rsbinder-macros` holds the contract this feature rests on: a trait
         # through the macro and the equivalent `.aidl` must generate the same

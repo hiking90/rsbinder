@@ -444,6 +444,13 @@ pub mod {{mod}} {
             {%- if is_vintf %}
             stability: {{crate}}::Stability::Vintf,
             {%- endif %}
+            {%- if function_names is iterable %}
+            function_names: [
+                {%- for function_name in function_names %}
+                "{{ function_name }}",
+                {%- endfor %}
+            ],
+            {%- endif %}
         }
     }
     impl {{ bp_name }} {
@@ -519,7 +526,12 @@ pub mod {{mod}} {
         {%- for member in fn_members %}
         fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::BinderResult<{{ member.return_type }}> {
             let _aidl_data = self.build_parcel_{{ member.identifier }}({{ member.func_call_params }})?;
+            {%- if function_names is iterable %}
+            let _aidl_reply = {{crate}}::observe::__trace_client("{{ namespace }}", "{{ member.identifier }}", transactions::r#{{ member.identifier }})
+                .in_scope(|| self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}{{crate}}::FLAG_ONEWAY | {% endif %}{{crate}}::FLAG_CLEAR_BUF | {{crate}}::FLAG_PRIVATE_LOCAL));
+            {%- else %}
             let _aidl_reply = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}{{crate}}::FLAG_ONEWAY | {% endif %}{{crate}}::FLAG_CLEAR_BUF | {{crate}}::FLAG_PRIVATE_LOCAL);
+            {%- endif %}
             {%- if member.func_call_params|length > 0 %}
             self.read_response_{{ member.identifier }}({{ member.func_call_params }}, _aidl_reply)
             {%- else %}
@@ -532,7 +544,12 @@ pub mod {{mod}} {
             let _aidl_version = self.cached_version.load(std::sync::atomic::Ordering::Relaxed);
             if _aidl_version != -1 { return Ok(_aidl_version); }
             let _aidl_data = self.build_parcel_getInterfaceVersion()?;
+            {%- if function_names is iterable %}
+            let _aidl_reply = {{crate}}::observe::__trace_client("{{ namespace }}", "getInterfaceVersion", transactions::r#getInterfaceVersion)
+                .in_scope(|| self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceVersion, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF));
+            {%- else %}
             let _aidl_reply = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceVersion, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF);
+            {%- endif %}
             self.read_response_getInterfaceVersion(_aidl_reply)
         }
         {%- endif %}
@@ -545,7 +562,12 @@ pub mod {{mod}} {
                 }
             }
             let _aidl_data = self.build_parcel_getInterfaceHash()?;
+            {%- if function_names is iterable %}
+            let _aidl_reply = {{crate}}::observe::__trace_client("{{ namespace }}", "getInterfaceHash", transactions::r#getInterfaceHash)
+                .in_scope(|| self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceHash, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF));
+            {%- else %}
             let _aidl_reply = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceHash, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF);
+            {%- endif %}
             self.read_response_getInterfaceHash(_aidl_reply)
         }
         {%- endif %}
@@ -559,8 +581,14 @@ pub mod {{mod}} {
                 Err(err) => return Box::pin(std::future::ready(Err(err.into()))),
             };
             let binder = self.binder.clone();
+            {%- if function_names is iterable %}
+            let _aidl_span = {{crate}}::observe::__trace_client("{{ namespace }}", "{{ member.identifier }}", transactions::r#{{ member.identifier }});
+            P::spawn(
+                move || _aidl_span.in_scope(|| binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}{{crate}}::FLAG_ONEWAY | {% endif %}{{crate}}::FLAG_CLEAR_BUF | {{crate}}::FLAG_PRIVATE_LOCAL)),
+            {%- else %}
             P::spawn(
                 move || binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}{{crate}}::FLAG_ONEWAY | {% endif %}{{crate}}::FLAG_CLEAR_BUF | {{crate}}::FLAG_PRIVATE_LOCAL),
+            {%- endif %}
                 move |_aidl_reply| async move {
                     {%- if member.func_call_params|length > 0 %}
                     self.read_response_{{ member.identifier }}({{ member.func_call_params }}, _aidl_reply)
@@ -580,8 +608,14 @@ pub mod {{mod}} {
                 Err(err) => return Box::pin(std::future::ready(Err(err.into()))),
             };
             let binder = self.binder.clone();
+            {%- if function_names is iterable %}
+            let _aidl_span = {{crate}}::observe::__trace_client("{{ namespace }}", "getInterfaceVersion", transactions::r#getInterfaceVersion);
+            P::spawn(
+                move || _aidl_span.in_scope(|| binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceVersion, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF)),
+            {%- else %}
             P::spawn(
                 move || binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceVersion, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF),
+            {%- endif %}
                 move |_aidl_reply| async move {
                     self.read_response_getInterfaceVersion(_aidl_reply)
                 }
@@ -601,8 +635,14 @@ pub mod {{mod}} {
                 Err(err) => return Box::pin(std::future::ready(Err(err.into()))),
             };
             let binder = self.binder.clone();
+            {%- if function_names is iterable %}
+            let _aidl_span = {{crate}}::observe::__trace_client("{{ namespace }}", "getInterfaceHash", transactions::r#getInterfaceHash);
+            P::spawn(
+                move || _aidl_span.in_scope(|| binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceHash, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF)),
+            {%- else %}
             P::spawn(
                 move || binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceHash, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF),
+            {%- endif %}
                 move |_aidl_reply| async move {
                     self.read_response_getInterfaceHash(_aidl_reply)
                 }
@@ -887,6 +927,65 @@ pub struct InterfaceRender {
     pub hash: Option<String>,
     /// Rendered `#[deprecated…]` attribute for the interface, or empty.
     pub deprecated: String,
+    /// Method names indexed by `transaction code - FIRST_CALL_TRANSACTION`,
+    /// `""` for an unused id; see [`function_names`]. `None` omits the
+    /// table (AOSP `aidl` without `--trace`).
+    pub function_names: Option<Vec<String>>,
+}
+
+/// The method-name table AOSP `aidl --trace` emits: one slot per method id
+/// from 0 up to the last id reached while no more than 10 ids in total have
+/// been skipped, each holding its method's name or `""`. Mirrors AOSP
+/// `GetFunctionNames` / `GetMaxId` (`system/tools/aidl/aidl_to_common.cpp`),
+/// so a sparse explicit numbering does not produce a table the size of its
+/// largest id. Ids above AOSP `kMaxUserSetMethodId` are the meta methods,
+/// which the runtime names without the table.
+pub fn function_names(fn_members: &[FnMembers]) -> Vec<String> {
+    const MAX_SKIP: u32 = 10;
+    const MAX_USER_SET_METHOD_ID: u32 = 16_777_114;
+
+    let mut next_implicit = 0;
+    let ids: Vec<(u32, &str)> = fn_members
+        .iter()
+        .map(|m| {
+            // Same numbering as the `transactions` module in the template.
+            let id = if m.has_explicit_code {
+                m.transaction_code
+            } else {
+                next_implicit += 1;
+                next_implicit - 1
+            };
+            (id, m.identifier.as_str())
+        })
+        .collect();
+
+    let mut sorted: Vec<u32> = ids.iter().map(|&(id, _)| id).collect();
+    sorted.sort_unstable();
+    let mut max_id: Option<u32> = None;
+    let mut skipped = 0;
+    for id in sorted {
+        if id > MAX_USER_SET_METHOD_ID {
+            break;
+        }
+        if let Some(last) = max_id {
+            skipped += id.saturating_sub(last + 1);
+            if skipped > MAX_SKIP {
+                break;
+            }
+        }
+        max_id = Some(id);
+    }
+
+    let Some(max_id) = max_id else {
+        return Vec::new();
+    };
+    let mut names = vec![String::new(); max_id as usize + 1];
+    for (id, name) in ids {
+        if id <= max_id {
+            names[id as usize] = name.to_string();
+        }
+    }
+    names
 }
 
 /// `crate_name` defaults to `"rsbinder"`, not the empty string a derived
@@ -910,6 +1009,7 @@ impl Default for InterfaceRender {
             version: None,
             hash: None,
             deprecated: String::new(),
+            function_names: None,
         }
     }
 }
@@ -1024,6 +1124,7 @@ pub fn render_interface(r: &InterfaceRender) -> Result<String, AidlError> {
     context.insert("version", &r.version);
     context.insert("hash", &r.hash);
     context.insert("deprecated", &r.deprecated);
+    context.insert("function_names", &r.function_names);
 
     template()
         .render("interface", &context)
@@ -1549,6 +1650,8 @@ pub struct Generator {
     /// or validate it. Independent of `version` — set either, both, or
     /// neither (matches AOSP's per-flag conditional).
     hash: Option<String>,
+    /// AOSP `aidl --trace`: emit each interface's method-name table.
+    trace: bool,
 }
 
 impl Generator {
@@ -1563,7 +1666,16 @@ impl Generator {
             is_crate,
             version: None,
             hash: None,
+            trace: false,
         }
+    }
+
+    /// Emit each interface's method-name table, which the runtime uses to
+    /// name transactions (`Remotable::transaction_name`). Mirrors AOSP
+    /// `aidl --trace`; the public entry point is `Builder::trace`.
+    pub fn with_trace(mut self, enable: bool) -> Self {
+        self.trace = enable;
+        self
     }
 
     // Mirrors AOSP `aidl --version N --hash <s>`; `None` suppresses the
@@ -1907,6 +2019,7 @@ impl Generator {
         let escaped_name = crate::escape_rust_keyword(&decl.name).into_owned();
         let stem = interface_stem(&decl.name);
 
+        let function_names = self.trace.then(|| function_names(&fn_members));
         let rendered = render_interface(&InterfaceRender {
             crate_name: self.get_crate_name().to_string(),
             module: escaped_name.clone(),
@@ -1926,6 +2039,7 @@ impl Generator {
             version: self.version,
             hash: self.hash.clone(),
             deprecated: deprecated_attr(decl.deprecated.as_ref()),
+            function_names,
         })?;
 
         Ok(add_indent(indent, rendered.trim()))

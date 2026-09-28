@@ -13,6 +13,59 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ## [Unreleased]
 
+### Added
+
+- **Work source API** (AOSP `IPCThreadState` / Java `Binder` work source):
+  `set_calling_work_source_uid`, `get_calling_work_source_uid`,
+  `clear_calling_work_source`, `restore_calling_work_source`,
+  `clear_propagate_work_source` and `should_propagate_work_source`, at the crate
+  root and in `thread_state`. The work source is now per-thread state, as in
+  AOSP: a client thread can set it outside any transaction and every outgoing
+  kernel binder call carries it in the request header, which previously always
+  said "unset" because the value could only be stored while a transaction was
+  being served. A handler sees what its caller sent; a received value is not
+  forwarded unless the handler sets it again, and the thread's own value comes
+  back when the handler returns. The RPC wire format has no work-source field
+  (AOSP's neither), so an RPC handler always reports the unset value; a value
+  set inside one still propagates to the kernel binder calls it makes, and the
+  RPC dispatch resets it per call so it cannot leak into the next call served
+  on that thread.
+- **Transaction names** (AOSP `aidl --trace`): `rsbinder_aidl::Builder::trace(true)`
+  emits a method-name table for every interface, and the generated service
+  answers the new `Remotable::transaction_name(code)` with the AIDL method name
+  (plus `getInterfaceVersion` / `getInterfaceHash`). The table follows AOSP's
+  layout — indexed by method id, cut off once more than ten ids are skipped —
+  and is off by default, as in AOSP. `transaction_name` has a default that
+  returns `None`, so hand-written `Remotable`s are unaffected. The wire format
+  does not change.
+  `declare_binder_interface!` takes an optional trailing `function_names: [..]`
+  argument to carry the table.
+- **Transaction observers** (`rsbinder::observe`): `set_observer` installs one
+  process-wide `TransactionObserver`, called on the serving thread before and
+  after every incoming transaction, on kernel binder and over RPC alike. Its
+  `TxnContext` carries the descriptor, code, method name (with
+  `Builder::trace`), one-way flag, caller uid/pid and transport; `on_reply` gets
+  the handler's result and its duration. A panic in the observer is logged and
+  does not change the transaction's result, and the observer may make binder
+  calls itself. With no observer installed a dispatch pays one atomic load.
+  Closest AOSP counterpart: Java `Binder.setObserver`; nothing on the wire
+  changes. `Transactable` gained a defaulted `transaction_name` so the
+  dispatcher can name the method.
+- **Provided observers**: `observe::LogObserver` (one `debug` line per
+  transaction, target `rsbinder::observe`) and `observe::StatsObserver`
+  (per-method call and transport-error counts, total/max handler time, a
+  power-of-two microsecond latency histogram, and the current and peak number
+  of transactions served at once, read through `snapshot()`).
+- **`tracing` feature** (off by default): AIDL spans named as AOSP names its
+  ATrace sections, `AIDL::rust::<descriptor>::<method>::server|client`, in the
+  `name` field of a `TRACE`-level span `aidl` (target `rsbinder::aidl`); a code
+  the name table does not cover is written `#<code>`, as in AOSP.
+  `observe::TracingObserver` opens the server span around each handler; proxies
+  generated with `Builder::trace(true)` open the client span around each
+  transaction, parented to the caller's current span for the async proxy as
+  well. Without the feature the generated hook is a plain call, and output
+  generated without `trace` does not change.
+
 ## [0.12.0] - 2026-09-19
 
 ### Migrating from 0.11.0

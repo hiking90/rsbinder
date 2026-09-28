@@ -428,6 +428,10 @@ impl<T: 'static + Remotable> IBinder for Inner<T> {
 }
 
 impl<T: Remotable> Transactable for Inner<T> {
+    fn transaction_name(&self, code: TransactionCode) -> Option<&'static str> {
+        T::transaction_name(code)
+    }
+
     fn transact(
         &self,
         code: TransactionCode,

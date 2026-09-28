@@ -16,6 +16,9 @@ rpc = ["rsbinder/rpc"]
 # Plan 2-19: the `#[rsbinder::interface]` half of `tests/macro_cross.rs`.
 macros = ["rsbinder/macros"]
 rpc-tcp-debug = ["rsbinder/rpc-tcp-debug", "rpc"]
+# Plan 10-9: AIDL spans (`tests/aidl_spans.rs`). `tracing` itself is for the
+# test's own subscriber.
+tracing = ["rsbinder/tracing", "dep:tracing"]
 
 [dependencies]
 rsbinder = { workspace = true, features = ["android_10_plus"] }
@@ -30,6 +33,7 @@ env_logger = { workspace = true }
 rustix = { workspace = true, features = ["pipe", "param"] }
 async-trait = { workspace = true }
 log.workspace = true
+tracing = { workspace = true, optional = true }
 
 # Mesh integration node: one binary, configured by argv into a kernel
 # and/or RPC role. Driven by `tests/mesh_rpc.rs` (+ `mesh_kernel.rs`).
@@ -50,6 +54,21 @@ required-features = ["rpc", "macros"]
 name = "data_serde"
 path = "tests/data_serde.rs"
 required-features = ["rpc", "macros"]
+
+[[test]]
+name = "work_source_rpc"
+path = "tests/work_source_rpc.rs"
+required-features = ["rpc"]
+
+[[test]]
+name = "observer_rpc"
+path = "tests/observer_rpc.rs"
+required-features = ["rpc"]
+
+[[test]]
+name = "aidl_spans"
+path = "tests/aidl_spans.rs"
+required-features = ["rpc", "tracing"]
 
 [build-dependencies]
 rsbinder-aidl = { workspace = true, features = ["async"] }

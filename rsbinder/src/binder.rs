@@ -533,6 +533,47 @@ pub trait Remotable: Send + Sync {
     /// Handle a request to invoke the dump transaction on this
     /// object.
     fn on_dump(&self, writer: &mut dyn std::io::Write, args: &[String]) -> Result<()>;
+
+    /// The AIDL method name for a transaction code, for tracing and
+    /// transaction observers. `None` when the code names no method or the
+    /// interface carries no name table.
+    ///
+    /// Interfaces generated with `rsbinder_aidl::Builder::trace(true)`
+    /// (AOSP `aidl --trace`) answer for their methods and for the
+    /// stable-AIDL meta methods `getInterfaceVersion` / `getInterfaceHash`.
+    /// Everything else, including hand-written `Remotable`s, keeps this
+    /// default. The name table costs one `&'static str` per method, which
+    /// is why it is opt-in, as in AOSP.
+    fn transaction_name(_code: TransactionCode) -> Option<&'static str>
+    where
+        Self: Sized,
+    {
+        None
+    }
+}
+
+/// Look up `code` in a generated method-name table (index = `code -
+/// FIRST_CALL_TRANSACTION`, `""` for an unused id). Mirrors AOSP
+/// `getMethodName` (`libs/binder/ndk/ibinder.cpp`), including the two
+/// meta methods it answers without a table entry; an unused id is `None`
+/// where AOSP returns the empty string.
+#[doc(hidden)]
+pub fn __transaction_name(
+    names: &'static [&'static str],
+    code: TransactionCode,
+) -> Option<&'static str> {
+    // AOSP `system/tools/aidl/include/aidl/transaction_ids.h`.
+    const GET_INTERFACE_VERSION: TransactionCode = FIRST_CALL_TRANSACTION + 16_777_214;
+    const GET_INTERFACE_HASH: TransactionCode = FIRST_CALL_TRANSACTION + 16_777_213;
+    match code {
+        GET_INTERFACE_VERSION => Some("getInterfaceVersion"),
+        GET_INTERFACE_HASH => Some("getInterfaceHash"),
+        _ => code
+            .checked_sub(FIRST_CALL_TRANSACTION)
+            .and_then(|index| names.get(index as usize))
+            .copied()
+            .filter(|name| !name.is_empty()),
+    }
 }
 
 /// A transactable object that can be used to process Binder commands.
@@ -570,6 +611,13 @@ pub trait Transactable: Send + Sync {
         reader: &mut Parcel,
         reply: &mut Parcel,
     ) -> Result<()>;
+
+    /// The method name for `code`, reported to transaction observers
+    /// ([`observe`](crate::observe)). A local binder built from a
+    /// [`Remotable`] forwards to [`Remotable::transaction_name`].
+    fn transaction_name(&self, _code: TransactionCode) -> Option<&'static str> {
+        None
+    }
 }
 
 /// Implemented by sync interfaces to specify what the associated async interface is.

@@ -1777,7 +1777,7 @@ impl Parcel {
         self.write(&(thread_state::get_strict_mode_policy() | STRICT_MODE_PENALTY_GATHER))?;
         self.update_work_source_request_header_pos();
         let work_source: i32 = if thread_state::should_propagate_work_source() {
-            thread_state::calling_work_source_uid() as _
+            thread_state::get_calling_work_source_uid() as _
         } else {
             thread_state::UNSET_WORK_SOURCE
         };
