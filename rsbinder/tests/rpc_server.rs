@@ -18,6 +18,13 @@
 //!   `fail_session` from `client_transact`'s reply-wait failure and the
 //!   session outlives its reply timeout, so the next call and the other
 //!   connection's call do not fail and no obituary fires.
+//! - `handshake_timeout_bounds_a_silent_peer`: make
+//!   `RpcClientConfig::handshake_deadline` ignore `timeout` and the `timeout`
+//!   case blocks on the silent peer; drop the session-timeout fallback from
+//!   `RpcSession::attach_parts` and the incoming attach blocks reading the
+//!   `"cci"` that never comes. The attach is an incoming one because an
+//!   outgoing attach reads nothing in its handshake, and its admission probe
+//!   already falls back to the session's timeout.
 //! - `max_connections_admission_bound`: deleting the `max_connections`
 //!   gate in `RpcServer::run` serves the third client at once, so its
 //!   bounded-timeout `get_root` succeeds and the test fails.
@@ -2872,8 +2879,9 @@ fn served_slot_never_taken_by_outside_transact() {
     assert_eq!(h.root.echo("after").unwrap(), "after");
 }
 
-/// `RpcClientConfig::handshake_timeout` bounds the connect handshake (`set_timeout` comes later).
+/// `timeout`, and the deprecated `handshake_timeout` in its place, bound a silent peer's handshake.
 #[test]
+#[allow(deprecated)] // The deprecated setter is still honored, so it is still checked.
 fn handshake_timeout_bounds_a_silent_peer() {
     let path = tmp_sock("hs_silent");
     // A raw listener that accepts and says nothing: the peer this deadline exists for.
@@ -2890,19 +2898,30 @@ fn handshake_timeout_bounds_a_silent_peer() {
     };
     wait_for_sock(&path);
 
-    // Channel deadline: an unbounded connect must fail the test, not hang the run.
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    let p = path.clone();
-    std::thread::spawn(move || {
-        let r = RpcSession::setup_client_android13plus_with_config(
-            RpcClientConfig::unix(&p, 2).handshake_timeout(Duration::from_millis(300)),
+    let via_timeout: fn(&std::path::Path) -> RpcClientConfig<'_> =
+        |p| RpcClientConfig::unix(p, 2).timeout(Duration::from_millis(300));
+    let via_handshake_timeout: fn(&std::path::Path) -> RpcClientConfig<'_> =
+        |p| RpcClientConfig::unix(p, 2).handshake_timeout(Duration::from_millis(300));
+    for (name, config) in [
+        ("timeout", via_timeout),
+        ("handshake_timeout", via_handshake_timeout),
+    ] {
+        // Channel deadline: an unbounded connect must fail the test, not hang the run.
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let p = path.clone();
+        std::thread::spawn(move || {
+            let r = RpcSession::setup_client_android13plus_with_config(config(&p));
+            let _ = tx.send(r.map(|_| ()));
+        });
+        let r = rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("{name} must bound the handshake; still blocked"));
+        assert_eq!(
+            r,
+            Err(StatusCode::TimedOut),
+            "{name}: a silent peer's handshake"
         );
-        let _ = tx.send(r.map(|_| ()));
-    });
-    let r = rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("the handshake deadline must bound the connect; still blocked");
-    assert!(r.is_err(), "a silent peer's handshake must not succeed");
+    }
 
     // A leftover handshake `SO_RCVTIMEO` would silently bound every later reply wait.
     let path2 = tmp_sock("hs_ok");
@@ -2922,6 +2941,26 @@ fn handshake_timeout_bounds_a_silent_peer() {
     // Longer than the handshake deadline: a leaked deadline fails here.
     assert_eq!(root.slow(500).map(|_| "ok"), Ok("ok"));
     client.close_session();
+
+    // A manual attach takes no `timeout` of its own: the session's bounds its handshake. An
+    // incoming attach reads the server's `"cci"`, which the silent peer never writes.
+    let founded =
+        RpcSession::setup_client_android13plus_with_config(RpcClientConfig::unix(&path2, 2))
+            .expect("connect");
+    founded.set_timeout(Some(Duration::from_millis(300)));
+    let sid = founded.get_session_id().expect("session id");
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let p = path.clone();
+    std::thread::spawn(move || {
+        let r = founded
+            .add_incoming_connection_with_config(RpcClientConfig::unix(&p, 2).session_id(&sid));
+        let _ = tx.send(r.map(|_| ()));
+        founded.close_session();
+    });
+    let r = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the session's timeout must bound an attach's handshake; still blocked");
+    assert_eq!(r, Err(StatusCode::TimedOut));
 
     drop(keep);
     std::mem::drop(acceptor);

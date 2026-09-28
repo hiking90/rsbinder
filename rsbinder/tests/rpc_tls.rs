@@ -946,7 +946,7 @@ fn entry_tls_incoming_connections_carry_callbacks() {
             o.tls_server_name = Some("localhost".to_string());
             o.incoming_connections = incoming;
             o.outgoing_connections = outgoing;
-            o.handshake_timeout = Some(Duration::from_secs(5));
+            o.timeout = Some(Duration::from_secs(5));
         })
     };
 
@@ -1013,7 +1013,7 @@ fn client_config_opens_incoming_connections_over_tls_on_unix() {
             Ok(Box::new(t) as Box<dyn RpcTransport>)
         })
         .incoming_connections(1)
-        .handshake_timeout(Duration::from_secs(5)),
+        .timeout(Duration::from_secs(5)),
     )
     .expect("setup over TLS-on-unix with an incoming connection");
 
@@ -1069,7 +1069,7 @@ fn client_config_tls_constructor_opens_a_fan_out_session() {
             2,
         )
         .outgoing_connections(2)
-        .handshake_timeout(Duration::from_secs(5)),
+        .timeout(Duration::from_secs(5)),
     )
     .expect("tls constructor");
     assert_eq!(session.negotiated_max_threads(), 2);
@@ -1101,7 +1101,7 @@ fn fd_mode_unix_over_tls_is_refused_at_setup() {
             2,
         )
         .fd_mode(FileDescriptorTransportMode::Unix)
-        .handshake_timeout(Duration::from_secs(5)),
+        .timeout(Duration::from_secs(5)),
     );
     assert_eq!(refused.err(), Some(StatusCode::BadValue));
 

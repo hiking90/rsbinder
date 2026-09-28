@@ -562,8 +562,9 @@ impl<'a> ClientSource<'a> {
             }),
             #[cfg(feature = "rpc-tcp-debug")]
             ClientSource::TcpDebug(addr) => Box::new(move || {
+                let tcp = tcp_connect(&addr, handshake_timeout).map_err(connect_status)?;
                 Ok(
-                    Box::new(super::transport::TcpDebugTransport::connect(addr)?)
+                    Box::new(super::transport::TcpDebugTransport::from_stream(tcp)?)
                         as Box<dyn RpcTransport>,
                 )
             }),
@@ -591,6 +592,28 @@ impl<'a> ClientSource<'a> {
     }
 }
 
+/// `connect(2)`, bounded by `deadline` when there is one.
+#[cfg(any(feature = "rpc-tcp-debug", feature = "rpc-tls"))]
+fn tcp_connect(
+    addr: &std::net::SocketAddr,
+    deadline: Option<Duration>,
+) -> std::io::Result<std::net::TcpStream> {
+    match deadline {
+        Some(d) => std::net::TcpStream::connect_timeout(addr, d),
+        None => std::net::TcpStream::connect(addr),
+    }
+}
+
+/// A failed connect's status; std's own `connect_timeout` expiry has no errno, so no `Unknown`.
+#[cfg(any(feature = "rpc-tcp-debug", feature = "rpc-tls"))]
+fn connect_status(e: std::io::Error) -> StatusCode {
+    if e.kind() == std::io::ErrorKind::TimedOut {
+        StatusCode::TimedOut
+    } else {
+        StatusCode::from(e)
+    }
+}
+
 /// TCP then TLS, each bounded by `handshake_timeout`; for `pinned` see [`RpcClientConfig::tls`].
 #[cfg(feature = "rpc-tls")]
 fn connect_tls(
@@ -601,18 +624,14 @@ fn connect_tls(
     config: &std::sync::Arc<rustls::ClientConfig>,
     handshake_timeout: Option<Duration>,
 ) -> Result<Box<dyn RpcTransport>> {
-    let tcp_connect = |addr: &std::net::SocketAddr| match handshake_timeout {
-        Some(d) => std::net::TcpStream::connect_timeout(addr, d),
-        None => std::net::TcpStream::connect(addr),
-    };
     let tcp = match *pinned {
-        Some(addr) => tcp_connect(&addr)?,
+        Some(addr) => tcp_connect(&addr, handshake_timeout).map_err(connect_status)?,
         None => {
             use std::net::ToSocketAddrs;
             let mut last = None;
             let mut sock = None;
             for addr in (host, port).to_socket_addrs()? {
-                match tcp_connect(&addr) {
+                match tcp_connect(&addr, handshake_timeout) {
                     Ok(t) => {
                         sock = Some((t, addr));
                         break;
@@ -626,7 +645,7 @@ fn connect_tls(
                     t
                 }
                 None => {
-                    return Err(StatusCode::from(last.unwrap_or_else(|| {
+                    return Err(connect_status(last.unwrap_or_else(|| {
                         std::io::Error::new(std::io::ErrorKind::NotFound, "no address resolved")
                     })))
                 }
@@ -894,49 +913,60 @@ impl<'a> RpcClientConfig<'a> {
         self
     }
 
-    /// Apply [`RpcSession::set_timeout`] to the founding session **as
-    /// soon as it exists**, so the deadline also bounds the round trips
-    /// this setup itself performs (`GET_MAX_THREADS` for a fan-out,
-    /// `GET_SESSION_ID` for any additional connection). Setting the
-    /// timeout on the returned session instead leaves those unbounded: a
-    /// peer that completes the handshake and then answers neither would
-    /// block the caller forever. Default `None` (no deadline). An expired
-    /// reply wait ends the session; see [`RpcSession::set_timeout`].
+    /// How long the server may go without answering before this end counts
+    /// it as broken — [`RpcSession::set_timeout`] on the session this
+    /// config founds, and a bound on every step that connects it (plan 2-24
+    /// D4, D6). Default `None` (no deadline anywhere).
     ///
-    /// This is a session-wide setting, so it belongs to the call that
-    /// *founds* a session and a [manual attach](Self#manual-attach)
-    /// refuses it. Change an existing session's deadline through
-    /// [`RpcSession::set_timeout`].
+    /// - **Connecting**: each step of each connection — the `founding`
+    ///   connect and every fan-out or incoming attach — is bounded by `d`:
+    ///   `connect(2)` for `tcp_debug` and `tls`, the TLS handshake, and the
+    ///   android-13+ handshake. A server that accepts the socket and then
+    ///   answers nothing (one at its connection cap leaves new connections
+    ///   in its listen backlog, where `connect(2)` succeeds) fails the setup
+    ///   call after `d` instead of hanging it. The r34 wire has no
+    ///   handshake, so there it bounds `connect(2)` only.
+    /// - **The session**: applied **as soon as it exists**, so it also
+    ///   bounds the round trips this setup performs (`GET_MAX_THREADS` for a
+    ///   fan-out, `GET_SESSION_ID` for any additional connection), and then
+    ///   every reply wait, send and liveness check as
+    ///   [`RpcSession::set_timeout`] describes. An expired reply wait ends
+    ///   the session.
+    ///
+    /// A zero duration is no deadline, as it is for `set_timeout`. This is a
+    /// session-wide setting, so it belongs to the call that *founds* a
+    /// session and a [manual attach](Self#manual-attach) refuses it: an
+    /// attach bounds its handshake by the session's own `set_timeout`.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
     }
 
-    /// Deadline for each **connection handshake** this config performs —
-    /// the founding connect and every fan-out / incoming attach. Unset
-    /// (the default) blocks forever, so a peer that accepts the socket
-    /// and then writes nothing hangs the setup call. With the `tls`
-    /// constructor it also bounds the `connect(2)` and the TLS handshake
-    /// that precede each android-13+ handshake.
-    ///
-    /// Distinct from [`timeout`](Self::timeout), which is the session's
-    /// *reply* deadline and cannot cover this phase: it is applied to the
-    /// session, and the handshake runs before the session exists. This is
-    /// the client-side counterpart of
-    /// [`RpcServer::set_handshake_timeout`](super::RpcServer::set_handshake_timeout).
+    /// Deadline for each **connection handshake** this config performs,
+    /// in place of [`timeout`](Self::timeout) for that phase.
     ///
     /// `Duration::ZERO` is not a deadline: the setup call this config is
     /// passed to refuses it with [`StatusCode::BadValue`] rather than
-    /// silently dropping the bound the caller asked for. Leave the option
-    /// unset to wait indefinitely on purpose.
+    /// silently dropping the bound the caller asked for.
+    #[deprecated(
+        since = "0.12.0",
+        note = "`timeout` bounds each handshake step too; set it instead (plan 2-24 D6)"
+    )]
     pub fn handshake_timeout(mut self, timeout: Duration) -> Self {
         self.handshake_timeout = Some(timeout);
         self
     }
 
+    /// The handshake bound: a deprecated `handshake_timeout` if set, else a nonzero `timeout`.
+    fn handshake_deadline(&self) -> Option<Duration> {
+        self.handshake_timeout
+            .or(self.timeout.filter(|d| !d.is_zero()))
+    }
+
     /// One connection, for a caller that drives the wire itself (the entry layer's r34 path).
     pub(crate) fn connect_once(self) -> Result<Box<dyn RpcTransport>> {
-        (self.source.into_connector(self.handshake_timeout))()
+        let deadline = self.handshake_deadline();
+        (self.source.into_connector(deadline))()
     }
 }
 
@@ -1221,7 +1251,8 @@ fn client_handshake_err(e: RpcError, requesting_new_session: bool) -> StatusCode
             RpcError::Timeout => log::error!(
                 "rsbinder RPC: the android-13+ handshake stalled and a read deadline armed on \
                  this connection elapsed — that deadline is the caller's own \
-                 (`RpcClientConfig::handshake_timeout` or `ClientOptions::handshake_timeout`, \
+                 (`RpcClientConfig::timeout` / `ClientOptions::timeout` or their deprecated \
+                 `handshake_timeout`, \
                  the 10s `RpcSession::from_preconnected_fd` arms, or one set on the transport \
                  directly), so it may simply be shorter than this peer's legitimate response \
                  time. A peer that should have answered well within it may be speaking the \
@@ -4389,6 +4420,7 @@ impl RpcSession {
 
     fn setup_client_android13plus(config: RpcClientConfig, what: &str) -> Result<RpcSession> {
         reject_zero_handshake_timeout(config.handshake_timeout, what)?;
+        let handshake_deadline = config.handshake_deadline();
         let RpcClientConfig {
             source,
             max_version,
@@ -4397,8 +4429,9 @@ impl RpcSession {
             incoming_connections: incoming,
             fd_mode: requested_fd_mode,
             timeout,
-            handshake_timeout,
+            handshake_timeout: _,
         } = config;
+        let handshake_timeout = handshake_deadline;
         let local = outgoing_connections.max(1);
         // Fan-out and incoming connections belong to the session owner, never to an attach.
         if (local > 1 || incoming > 0) && !requested_id.is_empty() {
@@ -4568,12 +4601,15 @@ impl RpcSession {
         if config.fd_mode.is_some_and(|mode| mode != fd_mode) {
             return Err(StatusCode::BadValue);
         }
+        // `timeout` is refused above: the session's own bounds the attach's handshake.
+        let session_timeout = *self.inner.shared.timeout.lock().expect("timeout poisoned");
+        let handshake_timeout = config.handshake_timeout.or(session_timeout);
         Ok(AttachParts {
-            connect: config.source.into_connector(config.handshake_timeout),
+            connect: config.source.into_connector(handshake_timeout),
             max_version: config.max_version,
             session_id: config.session_id,
             fd_mode,
-            handshake_timeout: config.handshake_timeout,
+            handshake_timeout,
         })
     }
 
@@ -5129,8 +5165,29 @@ mod tests {
         assert!(HandshakeDeadline::arm(&a, Some(Duration::from_millis(50))).is_ok());
     }
 
+    /// A connect's own deadline is `TimedOut` though std's error for it carries no errno.
+    #[cfg(any(feature = "rpc-tcp-debug", feature = "rpc-tls"))]
+    #[test]
+    fn a_connect_deadline_is_timed_out_not_unknown() {
+        let own_deadline = std::io::Error::from(std::io::ErrorKind::TimedOut);
+        assert_eq!(own_deadline.raw_os_error(), None, "the case under test");
+        assert_eq!(connect_status(own_deadline), StatusCode::TimedOut);
+        let etimedout = rustix::io::Errno::TIMEDOUT.raw_os_error();
+        assert_eq!(
+            connect_status(std::io::Error::from_raw_os_error(etimedout)),
+            StatusCode::TimedOut
+        );
+        let refused = rustix::io::Errno::CONNREFUSED.raw_os_error();
+        assert_eq!(
+            connect_status(std::io::Error::from_raw_os_error(refused)),
+            StatusCode::from(std::io::Error::from_raw_os_error(refused)),
+            "every other failure keeps its errno"
+        );
+    }
+
     /// The config entries report a zero handshake timeout as `BadValue`, before any connect.
     #[test]
+    #[allow(deprecated)] // The deprecated setter is still honored, so its zero is still refused.
     fn zero_handshake_timeout_is_bad_value_at_the_config_entries() {
         let path = std::path::Path::new("/nonexistent/rsb-zero-handshake.sock");
         assert_eq!(
