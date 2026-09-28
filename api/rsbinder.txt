@@ -3530,7 +3530,7 @@ impl core::marker::Send for rsbinder::Parcel
 impl core::marker::Sync for rsbinder::Parcel
 impl core::marker::Unpin for rsbinder::Parcel
 impl core::marker::UnsafeUnpin for rsbinder::Parcel
-impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::Parcel
+impl !core::panic::unwind_safe::RefUnwindSafe for rsbinder::Parcel
 impl !core::panic::unwind_safe::UnwindSafe for rsbinder::Parcel
 pub struct rsbinder::ParcelFileDescriptor(_)
 impl rsbinder::ParcelFileDescriptor

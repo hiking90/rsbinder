@@ -137,6 +137,10 @@ This changelog starts at 0.9.0. For earlier releases, see the
   set). `nss::GroupCache` and `config::Enforcer` hold a boxed resolver and are
   no longer `UnwindSafe` / `RefUnwindSafe`; wrap them in `AssertUnwindSafe`
   where `catch_unwind` needs it.
+- **`Parcel` is no longer `RefUnwindSafe` without the `rpc` feature**: a
+  kernel parcel now holds the binder proxies written into it (see *Fixed*).
+  With `rpc` it already was not. Wrap a `&Parcel` in `AssertUnwindSafe`
+  where `catch_unwind` needs it.
 
 ### Added
 

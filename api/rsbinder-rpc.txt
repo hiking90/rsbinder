@@ -4685,7 +4685,7 @@ pub fn rsbinder::Parcel::drop(&mut self)
 impl<const N: usize> core::convert::TryFrom<&mut rsbinder::Parcel> for [u8; N]
 pub type [u8; N]::Error = rsbinder::StatusCode
 pub fn [u8; N]::try_from(&mut rsbinder::Parcel) -> rsbinder::Result<Self>
-impl core::marker::Freeze for rsbinder::Parcel
+impl !core::marker::Freeze for rsbinder::Parcel
 impl core::marker::Send for rsbinder::Parcel
 impl core::marker::Sync for rsbinder::Parcel
 impl core::marker::Unpin for rsbinder::Parcel
