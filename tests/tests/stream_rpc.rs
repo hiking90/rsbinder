@@ -343,6 +343,60 @@ fn a_stream_of_a_thousand_items_crosses_a_session() {
     );
 }
 
+/// Plan 2-23 §3.3: 20000 one-item batches each way, so each side serves 20000 oneway `onBatch`
+/// calls. Their target `DEC_STRONG`s, 640 KB of frames, would fill the socket buffer of the
+/// connection they came in on, which the other end reads only while it waits for a reply.
+#[test]
+fn twenty_thousand_items_cross_each_way_without_a_stall() {
+    const N: i32 = 20_000;
+    let f = fixture("bulk", 1);
+
+    let (mut rx, endpoint) = f.default_receiver();
+    f.demo
+        .r#subscribe(&endpoint, N, 4, default_credits(), 0)
+        .expect("subscribe");
+    for want in 0..N {
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Some(item)) => assert_eq!(item, want),
+            other => panic!("download stalled after {want} items: {other:?}"),
+        }
+    }
+    assert!(
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("a clean end")
+            .is_none(),
+        "the terminator follows the last batch"
+    );
+
+    let token = rsbinder::stream::Token::new();
+    let ring_bytes = ReceiverPolicy::default().ring_bytes as i32;
+    let endpoint = f
+        .demo
+        .r#upload(&token.binder(), ring_bytes)
+        .expect("upload");
+    let policy = SinkPolicy {
+        send_timeout: Some(Duration::from_secs(10)),
+        ..sink_policy(4, default_credits())
+    };
+    let mut tx = Sink::<i32>::open_with(&endpoint, &policy).expect("open");
+    for item in 0..N {
+        tx.send(&item)
+            .unwrap_or_else(|e| panic!("upload stalled at item {item}: {e:?}"));
+    }
+    tx.end().expect("end");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !f.demo.r#uploadFinished().expect("uploadFinished") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the upload consumer never ended"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(f.demo.r#uploaded().expect("uploaded"), N);
+    assert!(f.demo.r#uploadOrdered().expect("uploadOrdered"));
+    assert_eq!(f.demo.r#uploadError().expect("uploadError"), 0);
+}
+
 /// The opening window travels in `onStart`; the consumer holds the producer to it.
 #[test]
 fn a_window_wider_than_the_consumer_accepts_is_refused_across_a_session() {

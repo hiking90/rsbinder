@@ -62,8 +62,9 @@ done
 [ -n "$CXX" ] || { echo "no NDK clang++ for $TRIPLE at API <= $sdk under $NDK" >&2; exit 2; }
 echo "==> target $TRIPLE, API $API (device SDK $sdk)"
 
-echo "==> verifying device $DEVICE is Android 16"
-[[ "$sdk" == "36" ]] || { echo "device $DEVICE is SDK $sdk, expected 36"; exit 1; }
+# Android 17 (SDK 37) speaks the android-16 RPC wire byte for byte.
+echo "==> verifying device $DEVICE is Android 16 or later"
+[[ "$sdk" -ge 36 ]] || { echo "device $DEVICE is SDK $sdk, expected >= 36"; exit 1; }
 
 echo "==> pulling libbinder_*.so so we can link against them"
 SYS="$REPO_ROOT/target/rpc_incoming_interop/sys"

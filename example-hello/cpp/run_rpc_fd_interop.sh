@@ -17,7 +17,17 @@
 #   ./run_rpc_fd_interop.sh [-s emulator-5554] [-t <abi>] [max-wire-version]
 #
 # The ABI defaults to the device's own; -t overrides it.
-# Exits 0 on FD_PASS; non-zero otherwise.
+# The launcher then runs the ParcelableHolder relay case (see its file
+# comment): `relay=ok` is expected only when both this max and the
+# device's libbinder reach v2, `relay=bad_type` otherwise. Last comes the
+# received-binder accounting case (plan 2-23): the server's node count
+# must return to its base, and logcat must hold no libbinder
+# over-decrement line. libbinder before android-16.0.0_r4 only logs an
+# unmatched DEC_STRONG, so a session that stays up proves nothing. On a
+# negotiated v2 the holder case's binder must be paid back as well.
+#
+# Exits 0 on FD_PASS, HOLDER_PASS and REF_PASS with a clean logcat;
+# non-zero otherwise.
 
 set -euo pipefail
 
@@ -66,13 +76,30 @@ done
 echo "==> target $TRIPLE, API $API (device SDK $sdk)"
 
 echo "==> pulling libbinder_*.so so we can link against them"
-adb -s "$DEVICE" pull /system/lib64/libbinder_ndk.so /tmp/libbinder_ndk.so >/dev/null
-adb -s "$DEVICE" pull /system/lib64/libbinder_rpc_unstable.so /tmp/libbinder_rpc_unstable.so >/dev/null
+LIBDIR="$REPO_ROOT/target/stage3-libs/$DEVICE"
+mkdir -p "$LIBDIR"
+adb -s "$DEVICE" pull /system/lib64/libbinder_ndk.so "$LIBDIR/libbinder_ndk.so" >/dev/null
+adb -s "$DEVICE" pull /system/lib64/libbinder_rpc_unstable.so "$LIBDIR/libbinder_rpc_unstable.so" >/dev/null
+
+# The holder relay succeeds only on a negotiated v2, and the SDK level does
+# not say whether libbinder speaks v2: android-16.0.0_r1..r3 are SDK 36 with
+# RPC max 1. This log string entered Parcel.cpp with v2 in android-16.0.0_r4.
+adb -s "$DEVICE" pull /system/lib64/libbinder.so "$LIBDIR/libbinder.so" >/dev/null
+DEVICE_RPC_MAX=1
+if grep -qaF 'object positions starting at protocol V2' "$LIBDIR/libbinder.so"; then
+    DEVICE_RPC_MAX=2
+fi
+if [[ "$MAX_VERSION" -ge 2 && "$DEVICE_RPC_MAX" -ge 2 ]]; then
+    EXPECT_RELAY=ok
+else
+    EXPECT_RELAY=bad_type
+fi
+echo "==> device libbinder RPC max v$DEVICE_RPC_MAX; holder relay expected: $EXPECT_RELAY"
 
 echo "==> building C++ launcher (NDK)"
 "$CXX" \
     -O2 -Wall -std=c++17 -static-libstdc++ \
-    -L /tmp \
+    -L "$LIBDIR" \
     -lbinder_ndk -lbinder_rpc_unstable -llog \
     "$CPP_DIR/rpc_fd_interop_launcher.cpp" \
     -o "$CPP_DIR/rpc_fd_interop_launcher"
@@ -95,6 +122,7 @@ trap cleanup EXIT
 
 echo "==> killing any old server + cleaning state"
 adb -s "$DEVICE" shell "pkill -9 -f rpc_fd_interop 2>/dev/null; rm -f $SOCK /data/local/tmp/rsfd.stderr; sleep 1" || true
+adb -s "$DEVICE" logcat -c
 
 echo "==> starting rsbinder server (background, max wire version $MAX_VERSION)"
 adb -s "$DEVICE" shell "nohup /data/local/tmp/rpc_fd_interop_server $SOCK $MAX_VERSION > /data/local/tmp/rsfd.stdout 2> /data/local/tmp/rsfd.stderr &" &
@@ -106,9 +134,39 @@ echo "$out"
 echo "==> server log"
 adb -s "$DEVICE" shell "cat /data/local/tmp/rsfd.stderr" | grep -v '^\[.*DEBUG' | tail -20 || true
 
-if grep -q '^FD_PASS' <<<"$out" && grep -q 'client-exit=0' <<<"$out"; then
+rc=1
+if grep -q '^FD_PASS' <<<"$out"; then
     echo "==> AC-11.3 PASS (device $DEVICE, SDK $sdk)"
-    exit 0
+    rc=0
+else
+    echo "==> AC-11.3 FAIL"
 fi
-echo "==> AC-11.3 FAIL"
-exit 1
+if grep -q '^HOLDER_PASS' <<<"$out" && grep -q "^HOLDER relay=$EXPECT_RELAY " <<<"$out" \
+        && grep -q 'client-exit=0$' <<<"$out"; then
+    echo "==> holder relay PASS (relay=$EXPECT_RELAY)"
+else
+    echo "==> holder relay FAIL (expected relay=$EXPECT_RELAY)"
+    rc=1
+fi
+# AOSP `processDecStrong` wording on every tag from android-13.0.0_r1.
+overdec=$(adb -s "$DEVICE" logcat -d | grep -E 'Record of sending binder|for dec strong' || true)
+if grep -q '^REF_PASS' <<<"$out" && [[ -z "$overdec" ]]; then
+    echo "==> received-binder accounting PASS"
+else
+    echo "==> received-binder accounting FAIL"
+    [[ -n "$overdec" ]] && echo "$overdec"
+    rc=1
+fi
+# On v2 the server enters every binder on receipt (plan 2-23 R3), so B, sent inside holder
+# bytes it never decodes, is paid back too and its node goes when the launcher drops B.
+if [[ "$EXPECT_RELAY" == ok ]]; then
+    base=$(sed -nE 's/^HOLDER .* base=([0-9]+) .*/\1/p' <<<"$out")
+    after=$(sed -nE 's/^HOLDER .* holder_after=([0-9]+).*/\1/p' <<<"$out")
+    if [[ -n "$base" && "$after" == "$base" ]]; then
+        echo "==> v2 unread-binder accounting PASS"
+    else
+        echo "==> v2 unread-binder accounting FAIL (base=$base holder_after=$after)"
+        rc=1
+    fi
+fi
+exit $rc
