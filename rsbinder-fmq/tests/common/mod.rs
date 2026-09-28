@@ -20,7 +20,7 @@
 use std::io::{IoSlice, IoSliceMut};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, OwnedFd};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -118,6 +118,36 @@ pub fn connect_with_retry(path: &PathBuf) -> UnixStream {
                 std::thread::sleep(Duration::from_millis(5))
             }
             Err(e) => panic!("connect {}: {e}", path.display()),
+        }
+    }
+}
+
+/// `accept`, failing the test when `child` exits first or does not connect within 30 s.
+pub fn accept_from(listener: &UnixListener, child: &mut Child) -> UnixStream {
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let started = Instant::now();
+    loop {
+        // Sampled before `accept`, so a peer that connected and then exited is still accepted.
+        let exited = child.try_wait().expect("try_wait");
+        match listener.accept() {
+            Ok((sock, _)) => {
+                sock.set_nonblocking(false).expect("blocking socket");
+                return sock;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if let Some(status) = exited {
+                    panic!("peer exited before connecting: {status}");
+                }
+                if started.elapsed() > Duration::from_secs(30) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("peer did not connect");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => panic!("accept: {e}"),
         }
     }
 }

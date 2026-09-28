@@ -274,7 +274,10 @@ fn write_blocking_returns_only_after_the_reader_frees_space() {
     });
     w.write_blocking(&[5, 6], NOT_FULL, NOT_EMPTY, Some(Duration::from_secs(5)))
         .unwrap();
-    assert!(started.elapsed() >= Duration::from_millis(100));
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_millis(100), "{elapsed:?}");
+    // Well under the 5 s timeout: the reader's wake ended the wait, not the retry after it.
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
     let mut r = reader.join().unwrap();
     let mut out = [0u8; 4];
     assert!(r.read(&mut out).unwrap());
@@ -310,26 +313,28 @@ fn a_timeout_past_the_clock_waits_without_a_deadline() {
         assert_eq!(out, [1]);
     }
 
-    // A write that really sleeps: `Duration::MAX` must not become a past deadline (`TimedOut`).
-    let mut w = MessageQueue::<u8>::create(2, true).unwrap();
-    let mut r = attach(&w);
-    w.write(&[1, 2]).unwrap();
-    let started = std::time::Instant::now();
-    let reader = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(50));
-        let mut out = [0u8];
-        r.read_blocking(&mut out, NOT_EMPTY, NOT_FULL, None)
+    // A write that really sleeps: neither timeout may become a past deadline (`TimedOut`).
+    for timeout in [Duration::MAX, Duration::from_secs(i64::MAX as u64)] {
+        let mut w = MessageQueue::<u8>::create(2, true).unwrap();
+        let mut r = attach(&w);
+        w.write(&[1, 2]).unwrap();
+        let started = std::time::Instant::now();
+        let reader = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let mut out = [0u8];
+            r.read_blocking(&mut out, NOT_EMPTY, NOT_FULL, None)
+                .unwrap();
+            out
+        });
+        w.write_blocking(&[3], NOT_FULL, NOT_EMPTY, Some(timeout))
             .unwrap();
-        out
-    });
-    w.write_blocking(&[3], NOT_FULL, NOT_EMPTY, Some(Duration::MAX))
-        .unwrap();
-    assert!(
-        started.elapsed() >= Duration::from_millis(40),
-        "{:?}",
-        started.elapsed()
-    );
-    assert_eq!(reader.join().unwrap(), [1]);
+        assert!(
+            started.elapsed() >= Duration::from_millis(40),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(reader.join().unwrap(), [1]);
+    }
 }
 
 #[test]
@@ -345,7 +350,9 @@ fn read_blocking_wakes_on_the_writers_notification() {
     let mut out = [0u32; 3];
     r.read_blocking(&mut out, NOT_EMPTY, NOT_FULL, Some(Duration::from_secs(5)))
         .unwrap();
-    assert!(started.elapsed() >= Duration::from_millis(100));
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_millis(100), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
     assert_eq!(out, [9, 8, 7]);
     writer.join().unwrap();
 
@@ -395,8 +402,11 @@ fn reader_waiting_for_several_elements_is_woken_by_each_write() {
         }
     });
     let mut out = [0u8; 3];
+    let started = Instant::now();
     r.read_blocking(&mut out, NOT_EMPTY, NOT_FULL, Some(Duration::from_secs(5)))
         .unwrap();
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
     assert_eq!(out, [0, 1, 2]);
     writer.join().unwrap();
 }
@@ -734,7 +744,7 @@ fn create_allocates_every_page_up_front_and_seals_the_fd() {
     assert!(!seals.intersects(SealFlags::WRITE | SealFlags::FUTURE_WRITE));
     // `F_SEAL_SEAL`: a receiver cannot add a seal that blocks the creator's writes.
     assert_eq!(
-        rustix::fs::fcntl_add_seals(&d.fds[0], SealFlags::FUTURE_WRITE).unwrap_err(),
+        rustix::fs::fcntl_add_seals(&d.fds[0], SealFlags::WRITE).unwrap_err(),
         rustix::io::Errno::PERM
     );
 }

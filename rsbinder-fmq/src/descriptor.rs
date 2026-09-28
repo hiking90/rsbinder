@@ -145,7 +145,9 @@ pub struct AttachPolicy {
     pub max_capacity: usize,
     /// Require every fd to be either a memfd with `F_SEAL_SHRINK` or an
     /// ashmem region, so the peer cannot shrink it under a live mapping
-    /// (a later access would raise `SIGBUS`).
+    /// (a later access would raise `SIGBUS`). An ashmem region can be
+    /// resized until its first `mmap`, so attaching re-reads its size after
+    /// mapping and refuses a region that no longer covers the grantors.
     pub require_seal: bool,
     /// Require the EventFlag word, without which no blocking operation
     /// exists.
@@ -230,7 +232,7 @@ pub(crate) fn validate(
         let size = match sizes[fd_index] {
             Some(s) => s,
             None => {
-                // Seal before size: a seal never comes off, so the size read after it is a floor.
+                // Seal first: a memfd seal is permanent; ashmem's size is re-checked once mapped.
                 let fd = desc.fds[fd_index].as_fd();
                 if policy.require_seal && !(shm::shrink_sealed(fd) || shm::is_ashmem_fd(fd)) {
                     return Err(Error::BadValue("fd is neither shrink-sealed nor ashmem"));
@@ -277,6 +279,20 @@ pub(crate) fn validate(
         event_flag: used.get(Descriptor::EVENT_FLAG_WORD).copied(),
         capacity,
     })
+}
+
+/// Ashmem's size is fixed only by its first `mmap`: re-check each grantor's end once mapped.
+pub(crate) fn recheck_ashmem_sizes(desc: &Descriptor, geo: &Geometry) -> Result<()> {
+    let grantors = [geo.read, geo.write, geo.data]
+        .into_iter()
+        .chain(geo.event_flag);
+    for g in grantors {
+        let fd = desc.fds[g.fd_index as usize].as_fd();
+        if shm::is_ashmem_fd(fd) && u64::from(g.offset) + g.extent > shm::ashmem_size(fd)? {
+            return Err(Error::BadValue("grantor extends past the end of its fd"));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

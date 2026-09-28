@@ -89,8 +89,8 @@ fn parent_creates_child_reads() {
     let path = common::sock_path("pc");
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path).expect("bind");
-    let child = spawn_child("parent_creates_child_reads", &path);
-    let (sock, _) = listener.accept().expect("accept");
+    let mut child = spawn_child("parent_creates_child_reads", &path);
+    let sock = common::accept_from(&listener, &mut child);
 
     let mut queue = MessageQueue::<u32>::create(CAPACITY, true).expect("create");
     common::send_descriptor(&sock, &queue.descriptor().expect("descriptor"));
@@ -140,8 +140,8 @@ fn child_creates_parent_reads() {
     let path = common::sock_path("cp");
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path).expect("bind");
-    let child = spawn_child("child_creates_parent_reads", &path);
-    let (mut sock, _) = listener.accept().expect("accept");
+    let mut child = spawn_child("child_creates_parent_reads", &path);
+    let mut sock = common::accept_from(&listener, &mut child);
 
     let desc = common::recv_descriptor(&sock);
     assert!(desc.has_event_flag());
@@ -191,8 +191,8 @@ fn wake_crosses_the_process_boundary() {
     let path = common::sock_path("wk");
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path).expect("bind");
-    let child = spawn_child("wake_crosses_the_process_boundary", &path);
-    let (mut sock, _) = listener.accept().expect("accept");
+    let mut child = spawn_child("wake_crosses_the_process_boundary", &path);
+    let mut sock = common::accept_from(&listener, &mut child);
 
     let queue = MessageQueue::<u8>::create(16, true).expect("create");
     common::send_descriptor(&sock, &queue.descriptor().expect("descriptor"));

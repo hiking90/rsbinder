@@ -85,13 +85,13 @@ fn s1_rsbinder_creates_libfmq_reads() {
     let path = common::sock_path("s1");
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path).unwrap();
-    let child = common::spawn(
+    let mut child = common::spawn(
         peer()
             .args(["attach", "read"])
             .arg(&path)
             .args([COUNT.to_string(), CAPACITY.to_string()]),
     );
-    let (mut sock, _) = listener.accept().unwrap();
+    let mut sock = common::accept_from(&listener, &mut child);
 
     let mut q = MessageQueue::<u32>::create(CAPACITY, true).unwrap();
     common::send_descriptor(&sock, &q.descriptor().unwrap());
@@ -112,13 +112,13 @@ fn s1_rsbinder_creates_libfmq_writes() {
     let path = common::sock_path("s1w");
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path).unwrap();
-    let child = common::spawn(
+    let mut child = common::spawn(
         peer()
             .args(["attach", "write"])
             .arg(&path)
             .args([COUNT.to_string(), CAPACITY.to_string()]),
     );
-    let (mut sock, _) = listener.accept().unwrap();
+    let mut sock = common::accept_from(&listener, &mut child);
 
     let mut q = MessageQueue::<u32>::create(CAPACITY, true).unwrap();
     common::send_descriptor(&sock, &q.descriptor().unwrap());
@@ -140,13 +140,13 @@ fn s2_libfmq_creates_rsbinder_reads() {
     let path = common::sock_path("s2");
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path).unwrap();
-    let child = common::spawn(
+    let mut child = common::spawn(
         peer()
             .args(["create", "write"])
             .arg(&path)
             .args([COUNT.to_string(), CAPACITY.to_string()]),
     );
-    let (mut sock, _) = listener.accept().unwrap();
+    let mut sock = common::accept_from(&listener, &mut child);
 
     let desc = common::recv_descriptor(&sock);
     let mine = MessageQueue::<u32>::create(CAPACITY, true)
@@ -180,13 +180,13 @@ fn s2_libfmq_creates_rsbinder_writes() {
     let path = common::sock_path("s2w");
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path).unwrap();
-    let child = common::spawn(
+    let mut child = common::spawn(
         peer()
             .args(["create", "read"])
             .arg(&path)
             .args([COUNT.to_string(), CAPACITY.to_string()]),
     );
-    let (mut sock, _) = listener.accept().unwrap();
+    let mut sock = common::accept_from(&listener, &mut child);
 
     let desc = common::recv_descriptor(&sock);
     let mut ack = [0u8];
@@ -199,7 +199,7 @@ fn s2_libfmq_creates_rsbinder_writes() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// Pins the single-fd grantor layout, so a libfmq layout change shows up as a diff, not a hang.
+/// Pins the Rust side's single-fd layout; libfmq's own is exercised only by the tests above.
 #[test]
 fn expected_single_fd_layout() {
     let d = MessageQueue::<u32>::create(64, true)

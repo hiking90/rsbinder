@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::descriptor::{
-    align_up, default_layout, validate, AttachPolicy, Descriptor, Flavor, Grantor,
+    align_up, default_layout, recheck_ashmem_sizes, validate, AttachPolicy, Descriptor, Flavor,
+    Grantor,
 };
 use crate::error::{Error, Result};
 use crate::event_flag::EventFlag;
@@ -142,10 +143,10 @@ impl<T: Element> MessageQueue<T> {
     /// (`AidlMQDescriptorShimBase.h`): read counter at 0, write counter at
     /// 8, data at 16, EventFlag word at the next multiple of 8.
     ///
-    /// `capacity` must be at least 1, and `16 + capacity * size_of::<T>()`,
-    /// rounded up to a multiple of 8, at most `i32::MAX`: libfmq's limit,
-    /// since the EventFlag word's offset lands there and the AIDL `offset`
-    /// field is an `int`. [`attach`](Self::attach) caps `extent` (a `long`
+    /// `capacity` must be at least 1, and `capacity * size_of::<T>()` at
+    /// most `i32::MAX` less the page size: libfmq's `mapGrantorDescr`
+    /// refuses a larger extent, and the EventFlag word's offset, an AIDL
+    /// `int`, lands past the ring. [`attach`](Self::attach) caps `extent` (a `long`
     /// in AIDL) at `i32::MAX` too, so that a ring fits a 32-bit `usize`.
     pub fn create(capacity: usize, event_flag: bool) -> Result<Self> {
         let quantum = size_of::<T>();
@@ -157,7 +158,7 @@ impl<T: Element> MessageQueue<T> {
         }
         let data_bytes = (capacity as u64)
             .checked_mul(quantum as u64)
-            .filter(|b| *b <= i32::MAX as u64)
+            .filter(|b| *b <= i32::MAX as u64 - rustix::param::page_size() as u64)
             .ok_or(Error::BadValue("queue too large"))?;
         let (grantors, total) = default_layout(data_bytes, event_flag);
         // libfmq's bound, with or without the EventFlag word.
@@ -231,6 +232,7 @@ impl<T: Element> MessageQueue<T> {
             )?)),
             None => None,
         };
+        recheck_ashmem_sizes(&desc, &geo)?;
         Ok(Self {
             read,
             write,

@@ -27,7 +27,9 @@
  *
  *   -EINVAL    a descriptor or argument that breaks a rule below
  *   -EBADMSG   counters the peer moved out of their invariant
- *   -EAGAIN    not enough room or data for the whole request, right now
+ *   -EAGAIN    not enough room or data for the whole request, right now;
+ *              a request above the capacity gets it every time, so a
+ *              wait-and-retry loop must bound n (or its wait) itself
  *   -ETIMEDOUT a wait whose deadline passed
  *   other      the failing system call's errno
  *
@@ -136,7 +138,9 @@ typedef struct rsbfmq_desc {
  * mapping without a bound hands the peer this process's address space.
  * require_seal demands that every fd be a memfd sealed F_SEAL_SHRINK or an
  * ashmem region, so the peer cannot shrink it under the mapping (the next
- * access would raise SIGBUS). require_event_flag demands the EventFlag word,
+ * access would raise SIGBUS); an ashmem region can be resized until its
+ * first mmap, so attaching re-reads its size after mapping and refuses one
+ * that no longer covers the grantors. require_event_flag demands the EventFlag word,
  * without which nothing can wait.
  */
 typedef struct rsbfmq_policy {
@@ -179,6 +183,10 @@ typedef struct rsbfmq_queue {
  * The elements a begin_write/begin_read covers: `first_len` before the
  * ring's end, `second_len` after its wrap (0 without one). Indices in
  * rsbfmq_regions_write/read run over both as one sequence.
+ *
+ * `first` and `second` point into memory the peer can rewrite at any
+ * moment: copy through rsbfmq_regions_read/write and interpret only the
+ * copy.
  */
 typedef struct rsbfmq_regions {
     uint8_t *first;
@@ -192,11 +200,7 @@ typedef struct rsbfmq_regions {
 /* Shared memory                                                       */
 /* ------------------------------------------------------------------ */
 
-/*
- * The ashmem device number, found the way libcutils finds it: Android 11+
- * duplicates the node as /dev/ashmem<boot_id>, older releases have
- * /dev/ashmem. 0 when there is neither (a Linux host).
- */
+/* The ashmem rdev as libcutils finds it: /dev/ashmem<boot_id>, then /dev/ashmem; 0 if neither. */
 static inline dev_t rsbfmq__ashmem_rdev(void) {
     char path[64] = "/dev/ashmem";
     struct stat st;
@@ -317,12 +321,7 @@ static inline void rsbfmq_close(rsbfmq_queue *q) {
     q->fd = -1;
 }
 
-/*
- * libfmq's initMemory/mapGrantorDescr checks, the policy's, and the i32::MAX
- * caps rsbinder-fmq applies (the AIDL offset is an int, and a ring must fit
- * a 32-bit size_t). The seal is checked before the size, since a seal never
- * comes off: the size read after it is a floor.
- */
+/* libfmq initMemory/mapGrantorDescr checks, the policy's, and i32::MAX offsets/extents. */
 static inline int rsbfmq__validate(const rsbfmq_desc *d, size_t quantum,
                                    const rsbfmq_policy *p, size_t *capacity) {
     static const uint64_t min_extent[4] = {8, 8, 1, 4};
@@ -365,7 +364,8 @@ static inline int rsbfmq__validate(const rsbfmq_desc *d, size_t quantum,
         } else {
             int fd = d->fds[g->fd_index];
             int r;
-            if (p->require_seal && !(rsbfmq_is_shrink_sealed(fd) || rsbfmq_is_ashmem(fd))) {
+            /* Seal first: a memfd seal is permanent; ashmem's size is re-checked once mapped. */
+            if (p->require_seal &&!(rsbfmq_is_shrink_sealed(fd) || rsbfmq_is_ashmem(fd))) {
                 return -EINVAL;
             }
             r = rsbfmq_region_size(fd, &size);
@@ -401,7 +401,8 @@ static inline int rsbfmq__validate(const rsbfmq_desc *d, size_t quantum,
 static inline int rsbfmq__open(rsbfmq_queue *q, const rsbfmq_desc *d, size_t quantum,
                                const rsbfmq_policy *p) {
     const rsbfmq_grantor *g = d->grantors;
-    size_t capacity;
+    size_t capacity, i;
+    uint64_t size;
     void *at;
     int r = rsbfmq__validate(d, quantum, p, &capacity);
     if (r != 0) {
@@ -426,6 +427,20 @@ static inline int rsbfmq__open(rsbfmq_queue *q, const rsbfmq_desc *d, size_t qua
             goto fail;
         }
         q->flag = (uint32_t *)at;
+    }
+    /* Ashmem's size is fixed only by its first mmap: re-check each grantor's end now. */
+    for (i = 0; i < d->ngrantors && i < 4; i++) {
+        int fd = d->fds[g[i].fd_index];
+        if (!rsbfmq_is_ashmem(fd)) {
+            continue;
+        }
+        if ((r = rsbfmq_region_size(fd, &size)) != 0) {
+            goto fail;
+        }
+        if ((uint64_t)g[i].offset + g[i].extent > size) {
+            r = -EINVAL;
+            goto fail;
+        }
     }
     q->quantum = quantum;
     q->capacity = capacity;
@@ -454,8 +469,9 @@ static inline int rsbfmq_attach(rsbfmq_queue *q, const rsbfmq_desc *d, size_t qu
  * (read counter at 0, write counter at 8, data at 16, the word at the next
  * multiple of 8). Every page is allocated now (fallocate), so the memory is
  * charged to this process rather than to whichever peer touches a page
- * first, and the fd is sealed GROW | SHRINK | SEAL. `16 + capacity *
- * quantum`, rounded up to 8, must not exceed INT32_MAX (libfmq's limit).
+ * first, and the fd is sealed GROW | SHRINK | SEAL. `capacity * quantum`
+ * must not exceed INT32_MAX less the page size (libfmq's mapGrantorDescr
+ * refuses a larger extent).
  *
  * memfd_create is called through syscall(): bionic's wrapper exists from
  * API 30, and the system call is on Android's app seccomp allowlist.
@@ -474,7 +490,8 @@ static inline int rsbfmq_create(rsbfmq_queue *q, size_t capacity, size_t quantum
         return -EINVAL;
     }
     data_bytes = (uint64_t)capacity * quantum;
-    if (rsbfmq__align8(16 + data_bytes) > (uint64_t)INT32_MAX) {
+    if (rsbfmq__align8(16 + data_bytes) > (uint64_t)INT32_MAX ||
+        data_bytes > (uint64_t)INT32_MAX - (uint64_t)sysconf(_SC_PAGESIZE)) {
         return -EINVAL;
     }
     sizes[0] = 8;
@@ -549,11 +566,7 @@ static inline int rsbfmq_descriptor(const rsbfmq_queue *q, rsbfmq_desc *d) {
 /* Counters and regions                                                */
 /* ------------------------------------------------------------------ */
 
-/*
- * Both counters, checked against a peer that writes them: read <= write, no
- * more in flight than the ring holds, no counter close enough to wrap, both
- * multiples of the element size. -EBADMSG otherwise.
- */
+/* Both counters, checked against a hostile peer (order, in-flight, wrap, alignment); -EBADMSG. */
 static inline int rsbfmq__positions(const rsbfmq_queue *q, uint64_t *read, uint64_t *write) {
     uint64_t w = __atomic_load_n(q->write, __ATOMIC_ACQUIRE);
     uint64_t r = __atomic_load_n(q->read, __ATOMIC_ACQUIRE);
@@ -604,7 +617,7 @@ static inline void rsbfmq__regions_at(const rsbfmq_queue *q, uint64_t position, 
     }
 }
 
-/* Reserve `n` elements to write; -EAGAIN when fewer are free. */
+/* Reserve `n` elements to write; -EAGAIN when fewer are free (always when n > capacity). */
 static inline int rsbfmq_begin_write(const rsbfmq_queue *q, size_t n, rsbfmq_regions *out) {
     uint64_t r, w;
     int e;
@@ -635,7 +648,7 @@ static inline int rsbfmq_commit_write(rsbfmq_queue *q, size_t n) {
     return 0;
 }
 
-/* The next `n` unread elements; -EAGAIN when fewer are available. */
+/* The next `n` unread elements; -EAGAIN when fewer are available (always when n > capacity). */
 static inline int rsbfmq_begin_read(const rsbfmq_queue *q, size_t n, rsbfmq_regions *out) {
     uint64_t r, w;
     int e;
@@ -669,8 +682,7 @@ static inline int rsbfmq_commit_read(rsbfmq_queue *q, size_t n) {
 /*
  * Copy `n` elements from `src` into the regions, starting at element
  * `start`. The copy sits between the counter's acquire load and release
- * store, as libfmq's memcpy does; nothing hands out a pointer the peer
- * could be rewriting while the caller interprets it.
+ * store, as libfmq's memcpy does.
  */
 static inline int rsbfmq_regions_write(const rsbfmq_regions *r, size_t start, const void *src,
                                        size_t n) {
@@ -741,15 +753,11 @@ static inline int rsbfmq_read(rsbfmq_queue *q, void *dst, size_t n) {
 /* EventFlag                                                           */
 /* ------------------------------------------------------------------ */
 
-/*
- * The futex system call taking this libc's struct timespec. A 32-bit build
- * whose time_t is 64 bits (glibc with _TIME_BITS=64) must use
- * futex_time64 (Linux 5.1+); everywhere else the two layouts agree.
- */
+/* futex; futex_time64 (Linux 5.1+) only for a deadline whose time_t is 64 bits on 32-bit. */
 static inline long rsbfmq__futex(uint32_t *word, int op, uint32_t val,
                                  const struct timespec *deadline, uint32_t bits) {
 #if defined(__NR_futex_time64) && !defined(__LP64__)
-    if (sizeof(deadline->tv_sec) == 8) {
+    if (deadline && sizeof(deadline->tv_sec) == 8) {
         return syscall(__NR_futex_time64, word, op, val, deadline, NULL, bits);
     }
 #endif

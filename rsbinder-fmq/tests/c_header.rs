@@ -121,13 +121,13 @@ fn start(
     let path = common::sock_path(tag);
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path).unwrap();
-    let child = common::spawn(
+    let mut child = common::spawn(
         peer()
             .args([origin, role])
             .arg(&path)
             .args([COUNT.to_string(), CAPACITY.to_string()]),
     );
-    let (sock, _) = listener.accept().unwrap();
+    let sock = common::accept_from(&listener, &mut child);
     (child, sock, path)
 }
 
@@ -213,8 +213,8 @@ fn probe(tag: &str, desc: &Descriptor, max_capacity: usize, damage: impl FnOnce(
     let path = common::sock_path(tag);
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path).unwrap();
-    let child = common::spawn(peer().arg("probe").arg(&path).arg(max_capacity.to_string()));
-    let (mut sock, _) = listener.accept().unwrap();
+    let mut child = common::spawn(peer().arg("probe").arg(&path).arg(max_capacity.to_string()));
+    let mut sock = common::accept_from(&listener, &mut child);
     common::send_descriptor(&sock, desc);
     let mut ack = [0u8];
     sock.read_exact(&mut ack).unwrap();
@@ -363,7 +363,7 @@ fn cxx_templates_round_trip() {
 
 #[test]
 fn layout_constant_matches() {
-    // The single-fd layout both sides must agree on (see `libfmq_host.rs`).
+    // The Rust side's single-fd layout; the C side's is exercised only by the peer tests.
     let (_q, d) = rust_queue();
     assert_eq!(
         d.grantors[3],
