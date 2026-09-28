@@ -430,6 +430,27 @@ jobs:
           [ -f rsb_hub.pid ] && sudo kill "$(cat rsb_hub.pid)" 2>/dev/null || true
           sleep 1
 
+      - name: Run the kernel acceptance scripts (tests/scripts/run_*_ac.sh, run_d8b_register.sh)
+        # Each starts its own rsb_hub and refuses to while another runs, so
+        # they follow the step above. The binaries they drive are from the
+        # workspace build at the top of this job.
+        run: |
+          rc=0
+          for s in tests/scripts/run_*_ac.sh example-hello/cpp/run_d8b_register.sh; do
+            echo "=== $s"
+            bash "$s" || { echo "::error::$s failed"; rc=1; }
+          done
+          exit $rc
+
+      - name: Run the vsock loopback tests (#[ignore]'d)
+        run: |
+          if ! sudo modprobe vsock_loopback 2>/dev/null || [ ! -e /dev/vsock ]; then
+            echo "::warning::vsock_loopback is unavailable on this runner kernel; rpc_vsock not run"
+            exit 0
+          fi
+          cargo test -p rsbinder --features rpc-vsock --test rpc_vsock -- --ignored
+          cargo test -p rsbinder --features rpc-tls,rpc-vsock --test rpc_tls -- --ignored --exact vsock_tls_loopback_e2e
+
       - name: Check kernel log for binder errors (issue #97 regression gate)
         # `always()` so that a failure inside the test loop does not skip
         # the issue-#97 regression gate. The sync-loop already captures a

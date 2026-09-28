@@ -15,8 +15,10 @@
 # `lazy=yes` column carries that half.
 #
 #   ANDROID_NDK_HOME=/opt/homebrew/share/android-ndk \
-#     cargo ndk -t aarch64-linux-android build -p example-hello --bins
+#     cargo ndk -t <aarch64|x86_64>-linux-android build -p example-hello --bins
 #   ./example-hello/cpp/run_lazy_service_stage3.sh [serial]
+#
+# The binaries are taken from the target matching the device's ABI.
 #
 # Needs a userdebug/google_apis AVD: `addService` from the shell domain is an
 # SELinux denial otherwise, so the script needs `adb root` + `setenforce 0`.
@@ -30,7 +32,10 @@ ADB=(adb)
 [ -n "$SERIAL" ] && ADB=(adb -s "$SERIAL")
 
 DEV=/data/local/tmp
-BIN=target/aarch64-linux-android/debug
+case "$("${ADB[@]}" shell getprop ro.product.cpu.abi 2>/dev/null | tr -d '\r')" in
+    x86_64) BIN=target/x86_64-linux-android/debug ;;
+    *)      BIN=target/aarch64-linux-android/debug ;;
+esac
 SERVICE=my.hello
 PASS=0; FAIL=0
 

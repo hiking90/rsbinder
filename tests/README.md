@@ -22,6 +22,10 @@ $ ./tests/scripts/run_hub_policy_ac.sh
 
 ## How to run the main suite
 
+`scripts/local_gate.sh kernel` runs everything below, the `#[ignore]`d
+kernel tests and every `tests/scripts/run_*_ac.sh` in one go (see
+`CONTRIBUTING.md`). By hand:
+
 * Run **rsb_hub** in a terminal. The suite invents service names at run time,
   so point it at the permissive test policy:
 ```
