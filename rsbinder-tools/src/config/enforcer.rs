@@ -39,14 +39,26 @@ impl Enforcer {
         }
     }
 
-    /// An enforcer over a bare policy, for tests that do not care about
-    /// declarations.
+    /// An enforcer over a bare policy, for tests that do not care about declarations.
     #[cfg(test)]
     fn from_policy(policy: super::policy::Policy) -> Self {
         Enforcer::enforcing(Config {
             policy,
             ..Config::default()
         })
+    }
+
+    /// An enforcer over a bare policy whose group lookups go through `groups`.
+    #[cfg(test)]
+    fn from_policy_with(policy: super::policy::Policy, groups: GroupCache) -> Self {
+        Enforcer {
+            config: RwLock::new(Arc::new(Config {
+                policy,
+                ..Config::default()
+            })),
+            allow_all: false,
+            groups,
+        }
     }
 
     /// An enforcer that permits everything — `--insecure-allow-all`.
@@ -85,6 +97,9 @@ impl Enforcer {
     }
 
     /// Resolve `uid` into the subject the evaluator matches against.
+    ///
+    /// This is the memoized view; [`check_uid`](Self::check_uid) is the
+    /// entry point that re-reads the groups on a deny.
     pub fn subject_for(&self, uid: u32) -> Subject {
         Subject {
             uid,
@@ -93,14 +108,32 @@ impl Enforcer {
     }
 
     /// May `uid` exercise `permission` on `name`?
+    ///
+    /// A deny that a group rule could have turned into an allow is judged
+    /// again after [`GroupCache::revalidate`], since the memoized groups
+    /// may be incomplete (see [`GroupCache`]); that re-read happens at most
+    /// once per [`GroupCache::MIN_REVALIDATE`] per uid.
     pub fn check_uid(&self, permission: Permission, name: &str, uid: u32) -> bool {
         if self.allow_all {
             return true;
         }
         let config = self.config();
-        config
-            .policy
-            .check(permission, name, &self.subject_for(uid))
+        let policy = &config.policy;
+        if policy.check(permission, name, &self.subject_for(uid)) {
+            return true;
+        }
+        if !policy.group_could_grant(permission, name) {
+            return false;
+        }
+        let gids = self.groups.revalidate(uid);
+        policy.check(
+            permission,
+            name,
+            &Subject {
+                uid,
+                gids: (*gids).clone(),
+            },
+        )
     }
 
     /// May `caller` exercise `permission` on `name`?
@@ -125,11 +158,7 @@ fn uid_of(caller: &Caller) -> Option<u32> {
         Caller::Kernel { uid, .. } => Some(*uid),
         #[cfg(feature = "rpc")]
         Caller::Rpc(rsbinder::rpc::PeerIdentity::Local { uid, .. }) => Some(*uid),
-        // Everything else has no uid to key on — a vsock cid is a routing
-        // address, a TLS certificate needs a mapping that does not exist
-        // here, an anonymous peer has no identity at all, and `Caller` is
-        // `#[non_exhaustive]` so a transport added later lands here too
-        // until this match is taught about it.
+        // No uid to key on; `Caller` is `#[non_exhaustive]`, so a new transport lands here too.
         _ => None,
     }
 }
@@ -179,8 +208,7 @@ mod tests {
         assert!(enforcer.check_uid(Permission::Find, "svc", 2000));
     }
 
-    /// A reload must not leave a permissive window: swapping in a
-    /// deny-all policy denies immediately.
+    /// A reload must not leave a permissive window: a deny-all swap denies at once.
     #[test]
     fn replace_with_deny_all_denies() {
         let enforcer = Enforcer::from_policy(policy_allowing_uid(1000));
@@ -199,8 +227,7 @@ mod tests {
         assert!(enforcer.check_caller(Permission::Add, "svc", &caller));
     }
 
-    /// An identity with no uid cannot be judged by a uid policy, so it is
-    /// refused rather than defaulted to anything.
+    /// A uid policy cannot judge an identity with no uid, so it is refused, not defaulted.
     #[cfg(feature = "rpc")]
     #[test]
     fn identities_without_a_uid_are_denied() {
@@ -219,5 +246,100 @@ mod tests {
                 pid: 4321
             })
         ));
+    }
+
+    fn policy_allowing_group(gid: u32) -> Policy {
+        Policy {
+            list: Subjects::set([], [gid]),
+            rules: vec![Rule {
+                pattern: NamePattern::Any,
+                add: Subjects::None,
+                find: Subjects::set([], [gid]),
+            }],
+        }
+    }
+
+    fn gids(gids: &[u32]) -> Option<std::collections::BTreeSet<u32>> {
+        Some(gids.iter().copied().collect())
+    }
+
+    fn calls(counter: &std::sync::atomic::AtomicUsize) -> usize {
+        counter.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A lookup that failed on first use must not deny the caller until SIGHUP.
+    #[test]
+    fn failed_first_lookup_is_revalidated_on_deny() {
+        let (groups, counter) = GroupCache::scripted(vec![None, gids(&[50])]);
+        let enforcer = Enforcer::from_policy_with(policy_allowing_group(50), groups);
+        assert!(!enforcer.check_uid(Permission::Find, "svc", 7));
+        assert_eq!(calls(&counter), 1);
+        enforcer.groups.age_entries(GroupCache::MIN_REVALIDATE);
+        assert!(enforcer.check_uid(Permission::Find, "svc", 7));
+        assert_eq!(calls(&counter), 2);
+    }
+
+    /// glibc returns a subset as a success when one backend is down; a deny re-reads it.
+    #[test]
+    fn partial_set_is_revalidated_on_deny() {
+        let (groups, counter) = GroupCache::scripted(vec![gids(&[100]), gids(&[100, 50])]);
+        let enforcer = Enforcer::from_policy_with(policy_allowing_group(50), groups);
+        assert!(!enforcer.check_uid(Permission::Find, "svc", 7));
+        enforcer.groups.age_entries(GroupCache::MIN_REVALIDATE);
+        assert!(enforcer.check_uid(Permission::Find, "svc", 7));
+        assert_eq!(calls(&counter), 2);
+    }
+
+    /// No group can change a uid-only verdict, so its deny costs no lookup.
+    #[test]
+    fn uid_only_rule_never_revalidates() {
+        let (groups, counter) = GroupCache::scripted(vec![gids(&[])]);
+        let enforcer = Enforcer::from_policy_with(policy_allowing_uid(1), groups);
+        assert!(!enforcer.check_uid(Permission::Find, "svc", 2));
+        enforcer.groups.age_entries(GroupCache::MIN_REVALIDATE);
+        for _ in 0..3 {
+            assert!(!enforcer.check_uid(Permission::Find, "svc", 2));
+        }
+        assert_eq!(calls(&counter), 1);
+    }
+
+    /// An allow never re-reads, however old the entry.
+    #[test]
+    fn allow_path_never_touches_the_resolver_again() {
+        let (groups, counter) = GroupCache::scripted(vec![gids(&[50])]);
+        let enforcer = Enforcer::from_policy_with(policy_allowing_group(50), groups);
+        assert!(enforcer.check_uid(Permission::Find, "svc", 7));
+        enforcer.groups.age_entries(GroupCache::MIN_REVALIDATE);
+        for _ in 0..10 {
+            assert!(enforcer.check_uid(Permission::Find, "svc", 7));
+        }
+        assert_eq!(calls(&counter), 1);
+    }
+
+    /// A re-read during an outage returns a subset; it must not take away a group already seen.
+    #[test]
+    fn a_subset_reread_does_not_revoke_a_cached_group() {
+        let policy = Policy {
+            list: Subjects::None,
+            rules: vec![
+                Rule {
+                    pattern: NamePattern::Exact("only70".into()),
+                    add: Subjects::None,
+                    find: Subjects::set([], [70]),
+                },
+                Rule {
+                    pattern: NamePattern::Any,
+                    add: Subjects::None,
+                    find: Subjects::set([], [50]),
+                },
+            ],
+        };
+        let (groups, counter) = GroupCache::scripted(vec![gids(&[100, 50]), gids(&[100])]);
+        let enforcer = Enforcer::from_policy_with(policy, groups);
+        assert!(enforcer.check_uid(Permission::Find, "svc", 7));
+        enforcer.groups.age_entries(GroupCache::MIN_REVALIDATE);
+        assert!(!enforcer.check_uid(Permission::Find, "only70", 7));
+        assert_eq!(calls(&counter), 2);
+        assert!(enforcer.check_uid(Permission::Find, "svc", 7));
     }
 }

@@ -527,7 +527,11 @@ A reload that fails to parse or resolve **keeps the policy already in
 force** and logs the error. Dropping to deny-all would take the machine's IPC
 down over a typo; falling back to permissive would be worse. The reload also
 drops the memoized uid → groups sets, so group-membership changes take effect
-with it.
+with it. A group *added* to a caller is also picked up without a reload — a
+call that a group rule denies re-reads the name service, at most once every
+15 s per uid. A *removed* group keeps granting until the reload: a re-read
+only adds groups, because an answer read while a backend (e.g. sssd) is down
+can lack some and looks the same as a complete one.
 
 ### Layers underneath
 
@@ -597,11 +601,16 @@ attempt. `exec` takes an argv list, never a shell string.
 
 > **The configuration is a trust boundary.** A `start` entry runs with
 > `rsb_hub`'s privileges, and any client allowed to look the name up can
-> trigger it. `rsb_hub` therefore refuses to start if its configuration
-> directory or any file in it is writable by anyone but its owner, or is
-> owned by someone other than root or `rsb_hub` itself — the same check
-> sudo, ssh and cron apply to their own configuration. Keep it `0644`
-> root-owned in a `0755` root-owned directory.
+> trigger it. `rsb_hub` therefore refuses to start if the configuration,
+> any file in it, or any directory on the way to them from `/` is writable
+> by anyone but its owner, or is owned by someone other than root or
+> `rsb_hub` itself — the same check sudo, ssh and cron apply to their own
+> configuration. Symlinks are followed, and the directories holding them
+> are held to the same rule; every inode is checked through the descriptor
+> it is then read from. A world-writable directory such as `/tmp` fails
+> even with the sticky bit. Keep it `0644` root-owned in a `0755`
+> root-owned directory; for an unprivileged run, under `$XDG_RUNTIME_DIR`
+> or `$HOME`.
 
 ## Linux vs. Android Differences
 

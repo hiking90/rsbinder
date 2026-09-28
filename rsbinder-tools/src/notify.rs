@@ -42,11 +42,12 @@ impl Notifier {
     /// it matters more here than in a typical daemon: `rsb_hub` starts
     /// declared services itself, and a child that inherited the variable
     /// could report *this* unit ready, or stopping, on its own schedule.
+    ///
+    /// Call before any other thread exists: it calls `std::env::remove_var`,
+    /// which races libc `getenv` in other threads.
     pub fn from_environment() -> Notifier {
         let socket = std::env::var_os(NOTIFY_SOCKET);
         if socket.is_some() {
-            // Safe in edition 2021, and this runs before any thread is
-            // spawned — see the call site in `rsb_hub`'s `main`.
             std::env::remove_var(NOTIFY_SOCKET);
         }
         Notifier::with_socket(socket)
@@ -79,12 +80,7 @@ impl Notifier {
         self.send(&format!("STATUS={status}\n"));
     }
 
-    /// Send one datagram, best effort.
-    ///
-    /// A failure here is logged and swallowed: readiness notification is
-    /// telemetry for the supervisor, and a service manager that refused to
-    /// serve because it could not describe itself would be trading a real
-    /// outage for a cosmetic one.
+    /// Best effort: failing to notify must not stop the hub from serving.
     fn send(&self, message: &str) {
         let Some(socket) = self.socket.as_deref() else {
             return;
@@ -99,18 +95,15 @@ impl Notifier {
     }
 }
 
-/// Send `message` to the `AF_UNIX` datagram socket `socket` names, in
-/// either of the two spellings `sd_notify(3)` accepts.
+/// `socket` is a path or an abstract name, the two spellings `sd_notify(3)` accepts.
 fn send_datagram(socket: &OsStr, message: &[u8]) -> std::io::Result<()> {
     let bytes = socket.as_bytes();
     let sock = UnixDatagram::unbound()?;
-    // `@name` and `\0name` are the same abstract socket; systemd documents
-    // the first and passes the second through unchanged.
+    // `@name` (documented) and `\0name` (passed through by systemd) are one abstract socket.
     if matches!(bytes.first(), Some(b'@') | Some(0)) {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
-            // `from_abstract_name` lives on an OS-specific extension trait,
-            // whose module differs between the two targets that have it.
+            // `SocketAddrExt` lives in a different OS module on each target.
             #[cfg(target_os = "android")]
             use std::os::android::net::SocketAddrExt;
             #[cfg(target_os = "linux")]
@@ -136,8 +129,7 @@ fn send_datagram(socket: &OsStr, message: &[u8]) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    /// A notifier with no socket must be inert — that is the shape every
-    /// non-systemd run takes, including every test in this repo.
+    /// Every non-systemd run, every test included, has no socket.
     #[test]
     fn without_a_socket_everything_is_a_no_op() {
         let n = Notifier::with_socket(None);
@@ -147,8 +139,7 @@ mod tests {
         n.status("ignored");
     }
 
-    /// The wire format is what systemd parses, so pin it end to end: bind a
-    /// real datagram socket and read back exactly what `ready` sent.
+    /// systemd parses these bytes, so read them back from a real socket.
     #[test]
     fn ready_sends_the_documented_datagram() {
         let dir = std::env::temp_dir().join(format!("rsb-notify-{}", std::process::id()));
@@ -179,9 +170,7 @@ mod tests {
         let _ = std::fs::remove_dir(&dir);
     }
 
-    /// systemd's own socket is usually abstract, and it is spelled with a
-    /// leading `@` in `$NOTIFY_SOCKET` — the branch the path form never
-    /// reaches, and the one that cannot be exercised anywhere but Linux.
+    /// systemd's socket is usually abstract (`@name`), a branch the path test never reaches.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn an_abstract_socket_name_is_understood() {

@@ -21,7 +21,8 @@ HUB=./target/debug/rsb_hub
 SVC=./target/debug/rsb_service
 DEMO=./target/debug/hello_callback_demo
 CLIENT=./target/debug/hello_client
-POLDIR=/tmp/rsb-lazy-policy
+# Not under /tmp: it is world-writable and rsb_hub refuses a configuration there.
+POLDIR="${XDG_RUNTIME_DIR:-${HOME:?}}/rsb-lazy-policy"
 HUBLOG=/tmp/rsb-lazy-hub.log
 DEMOLOG=/tmp/rsb-lazy-demo.log
 CLIENTLOG=/tmp/rsb-lazy-client.log

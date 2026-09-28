@@ -249,6 +249,26 @@ impl Policy {
             None => false,
         }
     }
+
+    /// Could a larger group set change the answer to
+    /// [`check(permission, name, _)`](Self::check)?
+    ///
+    /// True only when the governing subject set (the global `list` gate, or
+    /// the first rule covering `name`) grants to at least one group. An
+    /// `any` set has already allowed, and `none` or a uid-only set answers
+    /// the same whatever the groups are. `Enforcer` uses this to decide
+    /// whether a deny is worth a fresh name-service read.
+    pub fn group_could_grant(&self, permission: Permission, name: &str) -> bool {
+        let subjects = if permission == Permission::List {
+            &self.list
+        } else {
+            match self.rules.iter().find(|rule| rule.pattern.matches(name)) {
+                Some(rule) => rule.subjects_for(permission),
+                None => return false,
+            }
+        };
+        matches!(subjects, Subjects::Set { gids, .. } if !gids.is_empty())
+    }
 }
 
 /// Why a policy could not be built.
@@ -289,8 +309,7 @@ mod tests {
         assert!(NamePattern::parse("com.example.*")
             .unwrap()
             .matches("com.example.foo"));
-        // The prefix keeps the trailing dot, so a sibling namespace that
-        // merely *starts with* the same letters is not covered.
+        // The prefix keeps the trailing dot, so a sibling namespace is not covered.
         assert!(!NamePattern::parse("com.example.*")
             .unwrap()
             .matches("com.examplefoo"));
@@ -299,9 +318,7 @@ mod tests {
             .matches("com.example.foobar"));
     }
 
-    /// A leading/interior `*` matches nothing, so in a default-deny file it
-    /// silently hands the name to whatever rule comes next — the opposite
-    /// of what the author wrote. Reject at parse time.
+    /// A leading/interior `*` matches nothing and would hand the name to the next rule.
     #[test]
     fn pattern_rejects_non_trailing_wildcard() {
         assert_eq!(
@@ -324,8 +341,7 @@ mod tests {
         let s = Subjects::set([1000], [50]);
         assert!(s.allows(&subject(1000, &[])));
         assert!(s.allows(&subject(2000, &[50])));
-        // Group match works through a *supplementary* group, not just the
-        // primary one — the whole point of resolving with getgrouplist.
+        // A supplementary group matches too, not just the primary one (getgrouplist).
         assert!(s.allows(&subject(2000, &[99, 50])));
         assert!(!s.allows(&subject(2000, &[99])));
 
@@ -369,8 +385,7 @@ mod tests {
         assert!(!policy.check(Permission::Find, "svc", &anyone));
     }
 
-    /// First match wins: the specific rule decides, and the catch-all
-    /// behind it never gets a chance to widen it.
+    /// First match wins: the catch-all behind a specific rule never widens it.
     #[test]
     fn first_matching_rule_decides() {
         let policy = Policy {
@@ -389,8 +404,7 @@ mod tests {
             ],
         };
         let other = subject(2000, &[]);
-        // Covered by the first rule, which does not list uid 2000 — the
-        // permissive catch-all behind it must not rescue the call.
+        // The first rule covers it and omits uid 2000; the catch-all must not rescue it.
         assert!(!policy.check(Permission::Add, "com.example.foo", &other));
         // Not covered by the first rule, so the catch-all applies.
         assert!(policy.check(Permission::Add, "org.other.foo", &other));
@@ -409,5 +423,85 @@ mod tests {
         };
         assert!(policy.check(Permission::List, "ignored", &subject(1000, &[50])));
         assert!(!policy.check(Permission::List, "ignored", &subject(1000, &[])));
+    }
+
+    /// `GroupCache` relies on this: more groups never turn an allow into a deny.
+    #[test]
+    fn policy_is_monotone_in_gids() {
+        let group_sets: [&[u32]; 4] = [&[], &[50], &[50, 60], &[60]];
+        let variants = [
+            Subjects::None,
+            Subjects::Any,
+            Subjects::set([1], []),
+            Subjects::set([], [50]),
+            Subjects::set([1], [60]),
+        ];
+        let policy_for = |subjects: &Subjects| Policy {
+            list: subjects.clone(),
+            rules: vec![
+                Rule {
+                    pattern: NamePattern::parse("com.a.*").unwrap(),
+                    add: subjects.clone(),
+                    find: Subjects::set([2], []),
+                },
+                Rule {
+                    pattern: NamePattern::Any,
+                    add: Subjects::None,
+                    find: subjects.clone(),
+                },
+            ],
+        };
+        for subjects in &variants {
+            let policy = policy_for(subjects);
+            for uid in [1, 2, 3] {
+                for small in group_sets {
+                    for large in group_sets {
+                        if !small.iter().all(|g| large.contains(g)) {
+                            continue;
+                        }
+                        let (s, l) = (subject(uid, small), subject(uid, large));
+                        assert!(!subjects.allows(&s) || subjects.allows(&l));
+                        for (perm, name) in [
+                            (Permission::Add, "com.a.x"),
+                            (Permission::Find, "com.a.x"),
+                            (Permission::Find, "other"),
+                            (Permission::List, "ignored"),
+                        ] {
+                            assert!(
+                                !policy.check(perm, name, &s) || policy.check(perm, name, &l),
+                                "{subjects:?} {perm} {name} uid {uid}: {small:?} ⊆ {large:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn group_could_grant_matches_the_governing_rule() {
+        let mut policy = Policy {
+            list: Subjects::Any,
+            rules: vec![
+                Rule {
+                    pattern: NamePattern::parse("com.a.*").unwrap(),
+                    add: Subjects::None,
+                    find: Subjects::set([1], []),
+                },
+                Rule {
+                    pattern: NamePattern::Any,
+                    add: Subjects::None,
+                    find: Subjects::set([], [50]),
+                },
+            ],
+        };
+        // The first rule covers it and grants to no group; the catch-all's group is irrelevant.
+        assert!(!policy.group_could_grant(Permission::Find, "com.a.x"));
+        assert!(policy.group_could_grant(Permission::Find, "other"));
+        assert!(!policy.group_could_grant(Permission::Add, "other"));
+        assert!(!policy.group_could_grant(Permission::List, "other"));
+        policy.list = Subjects::set([], [50]);
+        assert!(policy.group_could_grant(Permission::List, "other"));
+        assert!(!Policy::deny_all().group_could_grant(Permission::Find, "other"));
     }
 }

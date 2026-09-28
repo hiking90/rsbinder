@@ -26,7 +26,8 @@ cd "$(dirname "$0")/../.." || exit 1
 HUB=./target/debug/rsb_hub
 SVC=./target/debug/rsb_service
 PROBE=./target/debug/ac61_probe
-POLDIR=/tmp/rsb61-policy
+# Not under /tmp: it is world-writable and rsb_hub refuses a configuration there (gated below).
+POLDIR="${XDG_RUNTIME_DIR:-${HOME:?}}/rsb61-policy"
 LOG=/tmp/rsb61-hub.log
 OUT=/tmp/rsb61-out
 PASS=0; FAIL=0
@@ -68,7 +69,7 @@ reject_out() { if grep -q "$1" "$OUT"; then bad "$2 (leaked '$1')"; else ok "$2"
 
 ######################################################################
 note "AC-6.1.1  no policy -> refuse to start"
-out=$($HUB --config /tmp/rsb61-nonexistent 2>&1); rc=$?
+out=$($HUB --config "$POLDIR-nonexistent" 2>&1); rc=$?
 [ "$rc" -eq 1 ] && ok "exits non-zero" || bad "exit $rc"
 echo "$out" | grep -q "cannot load its configuration" && ok "names the failure" || bad "message: $out"
 echo "$out" | grep -q '\[\[rule\]\]'                      && ok "shows a minimal example" || bad "no example"
@@ -337,6 +338,12 @@ out=$($HUB --config "$POLDIR" 2>&1); rc=$?
 chmod 755 "$POLDIR"
 [ "$rc" -eq 1 ] && ok "world-writable config refuses to start" || bad "exit $rc"
 echo "$out" | grep -q "world-writable" && ok "and says why" || bad "$out"
+
+note "config trust: a configuration under /tmp is refused, sticky or not"
+TMPCFG=$(mktemp -d /tmp/rsb61-tmpcfg.XXXXXX); cp "$POLDIR"/*.toml "$TMPCFG"/; chmod 755 "$TMPCFG"
+out=$($HUB --config "$TMPCFG" 2>&1); rc=$?; rm -rf "$TMPCFG"
+[ "$rc" -eq 1 ] && ok "/tmp config refuses to start" || bad "exit $rc"
+echo "$out" | grep -q '^  /tmp is world-writable' && ok "and names /tmp" || bad "$out"
 
 ######################################################################
 note "AC-6.1.7  SIGHUP reload"

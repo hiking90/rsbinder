@@ -73,8 +73,11 @@ $ rsb_hub --insecure-allow-all
 ```
 
 `rsb_hub` denies every request its policy does not allow, and refuses to start
-when it cannot load one. `SIGHUP` reloads the policy in place; a reload that
-fails keeps the policy already in force. See the
+when it cannot load one. The configuration and every directory above it, up to
+`/`, must be writable by nobody but their owner (root or the uid `rsb_hub` runs
+as), so a configuration under `/tmp` is refused; for an unprivileged run put it
+under `$XDG_RUNTIME_DIR` or `$HOME`. `SIGHUP` reloads the policy in place; a
+reload that fails keeps the policy already in force. See the
 [Service Manager chapter](https://hiking90.github.io/rsbinder/service-manager.html#access-control)
 for the file format.
 
@@ -107,7 +110,7 @@ on the same device exits 1 and says so; give it its own device
 - **Lifecycle Management**: dead services are reaped, and death notifications delivered
 - **Access Control**: per-name `add` / `find` / `list` policy keyed on caller uid and group, default-deny, reloadable with `SIGHUP`
 - **Service Declarations**: `[[service]]` entries answer `isDeclared` / `getDeclaredInstances` / `getConnectionInfo`, the Linux stand-in for VINTF manifests
-- **On-Demand Start**: a lookup that misses a declared service starts it, via systemd or a configured command
+- **On-Demand Start**: a lookup that misses a declared service starts it, via systemd or a configured command; an `exec` command's program (`argv[0]`) must be an absolute path, since it runs with `rsb_hub`'s privileges
 - **Notification System**: callbacks for service availability changes
 - **Dump Priorities**: `listServices` filters by the AOSP `DUMP_FLAG_PRIORITY_*` flags — a listing filter, not an access-control mechanism
 

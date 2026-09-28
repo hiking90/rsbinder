@@ -30,20 +30,13 @@ use rsbinder::{hub, ExceptionCode, ProcessState, SIBinder, Status, DEFAULT_BINDE
 mod exit {
     /// The question was answered, and the answer is yes.
     pub const OK: u8 = 0;
-    /// The question was answered, and the answer is no: not registered,
-    /// not declared, no connection info. `test`-style, so
-    /// `rsb_service check foo || start-foo` reads correctly.
+    /// Answered no; `test`-style so `rsb_service check foo || start-foo` reads right.
     pub const NO: u8 = 1;
-    /// The question could not be answered: no service manager, or its
-    /// policy denied the request.
+    /// Unanswerable: no service manager, or its policy denied the request.
     pub const ERR: u8 = 2;
 }
 
-/// Report a failed request, with a hint when the policy is the reason.
-///
-/// `rsb_hub` puts the denied permission, the name and the caller's uid in
-/// the status message, so the message is worth showing verbatim; the hint
-/// says where to change it.
+/// rsb_hub's denial message names the permission, name and uid; the hint adds where to fix it.
 fn report(what: &str, status: &Status) -> ExitCode {
     eprintln!("rsb_service: {what} failed: {status}");
     if status.exception_code() == ExceptionCode::Security {
@@ -57,10 +50,7 @@ fn report(what: &str, status: &Status) -> ExitCode {
     ExitCode::from(exit::ERR)
 }
 
-/// The `--priority` values, mapped to the `dumpPriority` bitmask
-/// `listServices` filters on. `all` is the default because an operator
-/// asking "what is registered" means all of it; AOSP's `service list`
-/// makes the same choice.
+/// `--priority` values as `listServices` bitmasks; `all` is the default, as in `service list`.
 fn dump_priority(spec: &str) -> Option<i32> {
     Some(match spec {
         "all" => hub::DUMP_FLAG_PRIORITY_ALL,
@@ -85,16 +75,7 @@ fn cmd_list(priority: i32) -> ExitCode {
     }
 }
 
-/// Non-blocking registration probe.
-///
-/// Uses `checkService`, never `getService`: a lookup that misses can start
-/// a declared service (`rsb_hub`'s stand-in for `ctl.interface_start`), and
-/// a tool whose job is to *report* state must not change it.
-///
-/// A caller the policy denies `find` sees "not registered" here, the same
-/// as for a name that truly is not registered. That is deliberate in the
-/// hub — an error would let a denied caller enumerate which names exist —
-/// so it is not something this tool can, or should, see through.
+/// `checkService`, not `getService`: a missed `getService` starts a declared service.
 fn cmd_check(name: &str) -> ExitCode {
     match hub::check_service(name) {
         Some(binder) => {
@@ -108,11 +89,7 @@ fn cmd_check(name: &str) -> ExitCode {
     }
 }
 
-/// ` (<descriptor>)` when the binder carries one, empty otherwise.
-///
-/// A proxy learns its descriptor when it is cast to an interface; one
-/// handed straight back by `checkService` has not been, so this is
-/// usually empty and must not be presented as "unknown interface".
+/// Empty only for a binder whose interface descriptor is empty.
 fn descriptor_suffix(binder: &SIBinder) -> String {
     let descriptor = binder.descriptor();
     if descriptor.is_empty() {
@@ -179,27 +156,18 @@ fn cmd_connection(name: &str) -> ExitCode {
     }
 }
 
-/// Send `DUMP_TRANSACTION` to a registered service and let it write to our
-/// stdout — Android's `dumpsys <service>`.
-///
-/// The service writes into a *duplicate* of stdout rather than stdout
-/// itself: the parcel takes ownership of the descriptor it carries, so
-/// handing over the real one would close this process's stdout when the
-/// transaction completes.
+/// `dumpsys <service>`: sends a dup of stdout, since the parcel closes the fd it carries.
 fn cmd_dump(name: &str, args: &[String]) -> ExitCode {
     let Some(binder) = hub::check_service(name) else {
         eprintln!("rsb_service: {name}: not registered (or not visible to this caller)");
         return ExitCode::from(exit::NO);
     };
     let Some(proxy) = binder.as_proxy() else {
-        // Only reachable if the name resolved to a binder living in this
-        // very process, which `rsb_service` never registers.
+        // Only a binder local to this process lacks a proxy; `rsb_service` registers none.
         eprintln!("rsb_service: {name}: not a remote binder, nothing to dump");
         return ExitCode::from(exit::ERR);
     };
-    // Anything already buffered has to reach the terminal before the
-    // service starts writing to the same file, or the output interleaves
-    // in the wrong order.
+    // Flush first, or buffered output interleaves with what the service writes.
     let _ = std::io::stdout().flush();
     let fd = match rustix::io::dup(std::io::stdout()) {
         Ok(fd) => fd,
@@ -223,10 +191,7 @@ fn cmd_dump(name: &str, args: &[String]) -> ExitCode {
     }
 }
 
-/// The whole command-line surface, built separately from [`main`] so the
-/// tests can hand it to `clap`'s own `debug_assert` — misdeclared
-/// positionals are a debug-time panic, which is a failing test here rather
-/// than a broken release binary.
+/// Separate from `main` so a test can run clap's `debug_assert` on it.
 fn cli() -> clap::Command {
     let name_arg = |help: &'static str| {
         clap::Arg::new("name")
@@ -329,13 +294,16 @@ fn main() -> ExitCode {
     let device = matches
         .get_one::<String>("device")
         .expect("device has a default value");
-    // 0 threads: `checkService` and friends are synchronous round trips
-    // answered on this thread, and `rsb_service` never receives an inbound
-    // transaction, so the kernel has no reason to ask for a worker.
+    // 0 threads: every call is a sync round trip and nothing inbound ever arrives.
     if let Err(e) = ProcessState::init(&format!("{DEFAULT_BINDERFS_PATH}/{device}"), 0) {
         eprintln!(
             "rsb_service: cannot open the binder device {DEFAULT_BINDERFS_PATH}/{device}: {e:?}"
         );
+        return ExitCode::from(exit::ERR);
+    }
+    // `check_service` maps a missing hub to None, which would read as exit 1, not 2.
+    if let Err(e) = hub::default() {
+        eprintln!("rsb_service: no service manager on {DEFAULT_BINDERFS_PATH}/{device}: {e}");
         return ExitCode::from(exit::ERR);
     }
 
@@ -382,10 +350,7 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
 
-    /// Every subcommand's arguments are well-formed. `clap` only checks
-    /// this in debug builds, and only when the offending subcommand is
-    /// actually invoked — a positional index collision in `dump` would
-    /// otherwise ship undetected by any test that never runs `dump`.
+    /// clap validates a subcommand only when it is invoked, so check all of them here.
     #[test]
     fn the_command_line_surface_is_well_formed() {
         cli().debug_assert();
@@ -400,13 +365,11 @@ mod tests {
         );
         assert_eq!(dump_priority("proto"), Some(hub::DUMP_FLAG_PROTO));
         assert_eq!(dump_priority("nonsense"), None);
-        // Case matters: accepting "ALL" silently would invite `--priority
-        // Default` to mean something else on a future flag.
+        // Case-sensitive, so a future flag cannot silently collide with `Default`.
         assert_eq!(dump_priority("All"), None);
     }
 
-    /// The exit codes are a documented interface (`--help` promises them),
-    /// so pin them.
+    /// `--help` documents these values, so they are an interface.
     #[test]
     fn exit_codes_are_yes_no_error() {
         assert_eq!((exit::OK, exit::NO, exit::ERR), (0, 1, 2));
