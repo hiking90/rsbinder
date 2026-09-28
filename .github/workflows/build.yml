@@ -409,7 +409,7 @@ jobs:
         # exercises a memfd on the shared-memory side that qemu-user
         # does not implement.
         run: |
-          cargo test -p rsbinder --no-default-features --lib parcel -- --skip shared_memory 2>&1 | tee /tmp/control_parcel.out
+          cargo test -p rsbinder --no-default-features --lib parcel -- --skip shared_memory --skip fmq:: 2>&1 | tee /tmp/control_parcel.out
           grep -qE 'test result: ok\. [1-9][0-9]* passed' /tmp/control_parcel.out
           cargo test -p rsbinder --no-default-features --lib blob:: 2>&1 | tee /tmp/control_blob.out
           grep -qE 'test result: ok\. [1-9][0-9]* passed' /tmp/control_blob.out
@@ -429,9 +429,12 @@ jobs:
         # build that reproduces them is cross-endian compatible by
         # construction — no networking, no peer.
         #
-        # `--skip shared_memory` drops two tests that create a memfd,
-        # which qemu-user does not implement. They are endianness-blind
-        # and covered by every other job.
+        # The bare `parcel` filter is a substring match, so it also pulls
+        # in tests named after parcels from modules that create a memfd,
+        # which qemu-user does not implement. `--skip` drops each such
+        # module (`shared_memory`, `fmq::`); they are endianness-blind
+        # and covered by every other job. The control step above runs the
+        # same filter, skips included.
         #
         # The fd-over-RPC body goldens are `#[cfg(feature = "rpc")]`, so
         # the `--no-default-features` run cannot see them even though
@@ -442,7 +445,7 @@ jobs:
         # against the same goldens on a big-endian host.)
         run: |
           cross test -p rsbinder --target s390x-unknown-linux-gnu \
-            --no-default-features --lib parcel -- --skip shared_memory 2>&1 | tee /tmp/be_parcel.out
+            --no-default-features --lib parcel -- --skip shared_memory --skip fmq:: 2>&1 | tee /tmp/be_parcel.out
           grep -qE 'test result: ok\. [1-9][0-9]* passed' /tmp/be_parcel.out
           cross test -p rsbinder --target s390x-unknown-linux-gnu \
             --features rpc,rpc-tcp-debug --lib file_descriptor:: 2>&1 | tee /tmp/be_fd.out
