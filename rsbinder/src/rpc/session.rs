@@ -3310,6 +3310,10 @@ impl RpcSessionInner {
             Err(RpcError::DeadlineMidFrame) => {
                 return ServeStep::Ended(EndReason::DeadlineMidFrame)
             }
+            // The kernel's `ETIMEDOUT`: a lost connection, not an idle eviction (`EndReason::Frame`).
+            Err(RpcError::Io(e)) if e.kind() == std::io::ErrorKind::TimedOut => {
+                return ServeStep::Ended(EndReason::Frame(StatusCode::DeadObject))
+            }
             Err(e) => return ServeStep::Ended(EndReason::Frame(e.into())),
         };
         // Ended locally with this frame in flight (a kernel may keep its queue past shutdown).
@@ -4141,15 +4145,18 @@ impl RpcSession {
     ///
     /// Calling this **declares that such a deadline is armed**: the
     /// returned [`SessionEnd`] reads a `TimedOut` over that first frame as
-    /// this end evicting an idle peer. With none armed the same code is
-    /// the kernel's `ETIMEDOUT` instead, and
-    /// [`serve_blocking`](RpcSession::serve_blocking) is the call that
-    /// reports it as the lost stream it is.
+    /// this end evicting an idle peer. With no deadline armed, call
+    /// [`serve_blocking`](RpcSession::serve_blocking), which does not count
+    /// a `TimedOut` it cannot explain as this end's decision. The kernel's
+    /// `ETIMEDOUT` is not a `TimedOut` on either call: it is a lost
+    /// connection, recorded as [`EndReason::Frame`]`(DeadObject)` with a
+    /// `Lost` stream, and `NotLocal` unless this end had already decided to
+    /// end the session.
     pub fn serve_blocking_clearing_deadline_after_first(&self) -> SessionEnd {
         self.serve_blocking_on_inner(Self::FOUNDING_SLOT_ID, true, true, false)
     }
 
-    /// Server entry; `armed` is false after `set_handshake_timeout(None)`: no `TimedOut` is ours.
+    /// Server entry; `armed` is false after `set_handshake_timeout(None)`: no deadline to evict by.
     pub(crate) fn serve_blocking_clearing_admission_deadline(&self, armed: bool) -> SessionEnd {
         self.serve_blocking_on_inner(Self::FOUNDING_SLOT_ID, true, armed, false)
     }
@@ -4177,7 +4184,7 @@ impl RpcSession {
         declared.fetch_add(1, Ordering::SeqCst);
         // Served by a session-owned thread and not counted in `live_conns`.
         let client_incoming = initiator && role == Some(SlotRole::Incoming);
-        // An armed deadline of ours makes a `TimedOut` idle eviction, not the kernel's `ETIMEDOUT`.
+        // Only an armed deadline of ours makes a `TimedOut` an idle eviction (`SessionEnd::new`).
         let baseline_deadline = self.inner.slot_baseline_read_deadline(slot_id).is_some();
         let (reason, deadline_armed) = {
             let mut first = clear_deadline_after_first;
@@ -5118,6 +5125,10 @@ mod tests {
     //!   shuts the socket down, so the queue is intact on both; the platform split (macOS
     //!   discards the queue on shutdown, Linux keeps it) is on the *correct* path, which is why
     //!   no end-of-stream reason is asserted.
+    //! * `the_kernels_etimedout_under_an_armed_deadline_is_not_an_eviction` gates both halves of
+    //!   the `ETIMEDOUT` split. Count `TimedOut` in `transport::is_timeout`, or drop the
+    //!   `Io(TimedOut)` arm of `serve_once_on_slot`'s receive, and the loop ends on
+    //!   `Frame(TimedOut)` with a deadline armed: an idle eviction, `Local` and `InSync`.
     //!
     //! # Test notes
     //!
@@ -5950,6 +5961,45 @@ mod tests {
             !session.inner.notices_connection_loss(),
             "the loop ended, so neither its count nor spawn_serve's may remain"
         );
+    }
+
+    /// The kernel's `ETIMEDOUT` under an armed first-frame deadline is a lost peer, not eviction.
+    #[test]
+    fn the_kernels_etimedout_under_an_armed_deadline_is_not_an_eviction() {
+        use crate::rpc::{EndedBy, StreamState};
+        // A socket whose peer's host stopped answering: TCP gave up, every read is `ETIMEDOUT`.
+        struct Etimedout;
+        impl std::io::Read for Etimedout {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                let etimedout = rustix::io::Errno::TIMEDOUT.raw_os_error();
+                Err(std::io::Error::from_raw_os_error(etimedout))
+            }
+        }
+        struct Gone;
+        impl RpcTransport for Gone {
+            fn send_frame(&self, _: &[u8]) -> RpcResult<()> {
+                Err(RpcError::EndOfStream)
+            }
+            // The stream backends' own framing reader, so its timeout split is what is tested.
+            fn recv_frame(&self) -> RpcResult<Vec<u8>> {
+                crate::rpc::transport::read_frame(&mut Etimedout)
+            }
+            fn peer_identity(&self) -> PeerIdentity {
+                PeerIdentity::Anonymous
+            }
+            fn describe(&self) -> &str {
+                "etimedout"
+            }
+            fn shutdown(&self) -> RpcResult<()> {
+                Ok(())
+            }
+        }
+
+        let session = RpcSession::new(Box::new(Gone), AddressSpace::Acceptor).expect("session");
+        let end = session.serve_blocking_clearing_deadline_after_first();
+        assert_eq!(end.reason, EndReason::Frame(StatusCode::DeadObject));
+        assert_eq!(end.by, EndedBy::NotLocal, "the peer's host went away");
+        assert_eq!(end.stream, StreamState::Lost);
     }
 
     /// `caps` answers from the founding connection, so a slot of another transport kind is refused.

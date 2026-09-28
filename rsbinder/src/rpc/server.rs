@@ -1452,7 +1452,7 @@ impl RpcServer {
                     return;
                 }
                 session
-                    // No deadline armed ⇒ a first-frame `TimedOut` is the kernel's, not ours.
+                    // No deadline armed ⇒ no first-frame `TimedOut` is an eviction of ours.
                     .serve_blocking_clearing_admission_deadline(handshake_timeout.is_some())
                     .log("RPC session ended");
             }

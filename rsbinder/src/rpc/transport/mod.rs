@@ -60,20 +60,26 @@
 //! `is_timeout` decides whether an I/O operation failed on a deadline this
 //! end armed: `SO_RCVTIMEO` for the framing readers, `SO_SNDTIMEO` for
 //! `write_all_reporting` and for `tls`'s teardown control flush. On the
-//! supported platforms both surface as `WouldBlock`. `TimedOut` is included
-//! because the `Read` adapters carry `RpcError::Timeout` across the
-//! `RpcError` ⇄ `io::Error` boundary with exactly that kind, and the framing
-//! readers sit on top of both. The cost is that a raw socket's own
-//! `ETIMEDOUT` (a peer whose host stopped answering, not a deadline of ours)
-//! is `TimedOut` too and cannot be told apart here; what is decided on that
-//! distinction (see [`SessionEnd::new`](super::SessionEnd)) is decided from
-//! whether a deadline was armed at all.
+//! supported platforms both surface as `EAGAIN` (`WouldBlock`), and the
+//! `Read`/`Write` adapters carry `RpcError::Timeout` across the
+//! `RpcError` ⇄ `io::Error` boundary with that same kind, so the framing
+//! readers see one kind whichever layer they sit on. `TimedOut` is not a
+//! deadline: it is the kernel's own `ETIMEDOUT`, TCP keepalive or
+//! retransmission giving up on a peer whose host stopped answering. That
+//! connection is gone, so the error stays [`RpcError::Io`], never a
+//! frame-synchronized `Timeout`. A transport of the caller's own follows the
+//! same split: `Timeout` only for a deadline of this end's that consumed
+//! nothing, any loss of the connection as another variant.
 //!
 //! # Mutation gates
 //!
 //! - `a_send_deadline_is_a_timeout_only_before_the_first_byte`: dropping the
 //!   `sent == 0` guard in `write_all_reporting` makes the second case report
 //!   `Timeout` as well, and a peer left half a frame keeps its slot.
+//! - `the_kernels_etimedout_is_a_lost_connection_not_a_deadline`: counting
+//!   `TimedOut` in `is_timeout` makes a send that failed before its
+//!   first byte and a read that consumed nothing report `Timeout`, and a
+//!   connection the kernel already dropped keeps its slot.
 
 use std::fmt;
 use std::io::{ErrorKind, Read, Write};
@@ -146,6 +152,9 @@ pub trait RpcTransport: Send + Sync {
     /// elapses with **nothing consumed** surfaces as
     /// [`RpcError::Timeout`] (the stream stays frame-synchronized); a
     /// deadline that elapses mid-frame is [`RpcError::DeadlineMidFrame`].
+    /// Neither variant is for anything but this deadline: a connection the
+    /// platform gave up on (the kernel's `ETIMEDOUT`) is lost, and reports
+    /// as [`RpcError::Io`] or an end of stream.
     fn set_read_timeout(&self, _timeout: Option<std::time::Duration>) -> RpcResult<()> {
         Ok(())
     }
@@ -517,9 +526,9 @@ fn read_header<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
     Ok(())
 }
 
-/// `WouldBlock` or `TimedOut`: a deadline this end armed; see module doc "Short reads and writes".
+/// A deadline this end armed (`WouldBlock`; `TimedOut` is the kernel's); see module doc.
 pub(crate) fn is_timeout(e: &std::io::Error) -> bool {
-    matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+    e.kind() == ErrorKind::WouldBlock
 }
 
 /// Socket `shutdown` result, absorbing macOS's `ENOTCONN` on a second call (trait: idempotent).
@@ -700,6 +709,38 @@ mod tests {
             "a deadline past the first byte left a partial frame on the wire"
         );
         assert!(write_all_reporting(&mut Stall(5), b"frame").is_ok());
+    }
+
+    /// `ETIMEDOUT` fails as `Io`, a read deadline as `Timeout`; see module doc "Mutation gates".
+    #[test]
+    fn the_kernels_etimedout_is_a_lost_connection_not_a_deadline() {
+        struct Fails(ErrorKind);
+        impl Read for Fails {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(self.0.into())
+            }
+        }
+        impl Write for Fails {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(self.0.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let lost =
+            |r: RpcResult<_>| matches!(r, Err(RpcError::Io(e)) if e.kind() == ErrorKind::TimedOut);
+
+        let mut dead = Fails(ErrorKind::TimedOut);
+        assert!(
+            lost(write_all_reporting(&mut dead, b"frame")),
+            "nothing went out, yet the connection is gone"
+        );
+        assert!(lost(read_frame(&mut dead).map(drop)));
+        assert!(matches!(
+            read_frame(&mut Fails(ErrorKind::WouldBlock)),
+            Err(RpcError::Timeout)
+        ));
     }
 
     #[test]

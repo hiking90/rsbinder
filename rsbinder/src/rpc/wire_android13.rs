@@ -143,8 +143,8 @@
 //! message for the fd reader): at zero, a clean close or an elapsed
 //! deadline stands as itself; above zero the stream position is lost —
 //! `Truncated` if the stream ended, `DeadlineMidFrame` if a read deadline
-//! cut it (whose deadline it was is not knowable there; see
-//! `transport::is_timeout`).
+//! of this end's cut it (the kernel's `ETIMEDOUT` is a lost connection, not
+//! a deadline; see `transport::is_timeout`).
 //!
 //! ## Address projection
 //!
@@ -810,7 +810,7 @@ fn read_exact_into<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
             Ok(k) => got += k,
             // A signal interrupted the read; retry like every other reader.
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            // Deadline (`TimedOut` via `RawTransportIo`, `WouldBlock` raw) → `Timeout`, not `Io`.
+            // Deadline (`WouldBlock`, raw or via `RawTransportIo`) → `Timeout`, not `Io`.
             Err(ref e) if super::transport::is_timeout(e) => {
                 return Err(classify_short_read(RpcError::Timeout, got))
             }

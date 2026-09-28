@@ -24,11 +24,11 @@
 //! | reason | `by` | `stream` |
 //! |---|---|---|
 //! | `EndOfStream` | local decision? | `InSync` |
-//! | `UncleanEndOfStream`, `Unreadable`, `Frame(_)` (a frame cut, undecodable, or a wire violation) | local decision? | `Lost` |
+//! | `UncleanEndOfStream`, `Unreadable`, `Frame(_)` (a frame cut, undecodable, a wire violation, or a connection the kernel gave up on) | local decision? | `Lost` |
 //! | `Frame(TimedOut)`, a deadline armed (idle eviction) | `Local` | `InSync` |
-//! | `Frame(TimedOut)`, no deadline armed (the kernel's `ETIMEDOUT`) | local decision? | `Lost` |
+//! | `Frame(TimedOut)`, no deadline armed | local decision? | `Lost` |
 //! | `DeadlineMidFrame`, a deadline armed (one of ours cut the frame) | `Local` | `Lost` |
-//! | `DeadlineMidFrame`, no deadline armed (the kernel's `ETIMEDOUT`) | local decision? | `Lost` |
+//! | `DeadlineMidFrame`, no deadline armed | local decision? | `Lost` |
 //! | `Interrupted` | `Local` | `InSync` |
 //! | `Retired`, `Dispatch(_)` | local decision? | `InSync` if this end decided, else `Lost` |
 //!
@@ -37,16 +37,15 @@
 //! only the ambiguous ends — a slot already gone, a dispatch that failed — are read in the
 //! light of who ended the session.
 //!
-//! The two timeout reasons need the armed-deadline input because by the time they reach the
-//! constructor the two kinds of timeout have become one. A socket read deadline arrives as
-//! `EAGAIN` and the kernel's `ETIMEDOUT` as itself, but every backend folds both into
-//! `RpcError::Timeout` / `RpcError::DeadlineMidFrame` (`transport::is_timeout`, which has to
-//! stay that wide: the `Read` adapters carry this end's own deadline with the `TimedOut`
-//! kind). So with a deadline armed a `TimedOut` between frames reads as this end evicting an
-//! idle peer — clean, local — and one inside a frame as this end's own cut; including a kernel
-//! `ETIMEDOUT` that happens to arrive while one is armed. With none armed either can only be
-//! the kernel's, a TCP/TLS peer whose host stopped answering, which is not this end's
-//! decision. The position is lost inside a frame whichever it was.
+//! The two timeout reasons come only from a read deadline. A socket read deadline expires as
+//! `EAGAIN`, which every backend reports as `RpcError::Timeout` / `RpcError::DeadlineMidFrame`;
+//! the kernel's own `ETIMEDOUT` (TCP keepalive or retransmission giving up on a peer whose
+//! host stopped answering) is a lost connection, stays `RpcError::Io`, and the loop records it
+//! as `Frame(DeadObject)` (`transport` module doc "Short reads and writes"). With a deadline armed
+//! a `TimedOut` between frames is this end evicting an idle peer — clean, local — and one
+//! inside a frame is this end's own cut. With none armed the loop knows of no deadline that
+//! explains it (one the caller set on the transport directly is not known to it), so the end
+//! is not taken as this end's decision. The position is lost inside a frame either way.
 //!
 //! [`RpcSession::serve_blocking`]: super::RpcSession::serve_blocking
 
@@ -83,9 +82,10 @@ pub enum StreamState {
     InSync,
     /// Not known to be intact — a frame stopped part-way or did not
     /// decode, a nested call lost the position, the stream ended
-    /// without its close signal, or a read timed out with none of this
-    /// end's deadlines armed (the kernel's `ETIMEDOUT`, a peer whose
-    /// host went away). Also the ends this loop cannot place — a slot
+    /// without its close signal, the connection was lost (the kernel's
+    /// `ETIMEDOUT`, a peer whose host went away), or a read timed out
+    /// with no deadline of this end's known to be armed. Also the ends
+    /// this loop cannot place — a slot
     /// already gone from the pool, a dispatch that failed — when this
     /// end had not decided to stop, since whatever retired the slot or
     /// failed the dispatch may have left a frame half-written. Nothing
@@ -119,10 +119,11 @@ pub enum EndReason {
     Interrupted,
     /// A read deadline elapsed part-way through a frame
     /// ([`RpcError::DeadlineMidFrame`](super::RpcError::DeadlineMidFrame)):
-    /// a lost position. Not by itself this end's decision — with none of
-    /// this end's deadlines armed it is the kernel's `ETIMEDOUT`, a peer
-    /// whose host went away, which is why [`SessionEnd::by`] is decided
-    /// with that knowledge.
+    /// a lost position. The deadline is one of this end's (the kernel's
+    /// `ETIMEDOUT` is a lost connection, [`Frame`](Self::Frame)), but
+    /// [`SessionEnd::by`] counts it as this end's decision only when the
+    /// loop knew one was armed: one the caller set on the transport
+    /// directly is not known to it.
     DeadlineMidFrame,
     /// A frame did not become a message this loop could act on; the code
     /// is what the read or the decoder produced (`TimedOut` for a deadline
@@ -133,9 +134,10 @@ pub enum EndReason {
     /// AOSP's `RpcState::processCommand` likewise ends the session for, as
     /// `Frame(BadType)`. That frame read and decoded cleanly, so it is the
     /// one case here whose stream position is not in fact lost.
-    /// `TimedOut` is not by itself this end's deadline: with none armed
-    /// it is the kernel's `ETIMEDOUT` — a TCP peer whose host went away
-    /// — which is why the axes are decided with that knowledge.
+    /// `TimedOut` is only ever a deadline of this end's. The kernel's
+    /// `ETIMEDOUT` — a TCP peer whose host went away — projects to
+    /// `TimedOut` for a caller (as libbinder's `-ETIMEDOUT` does), but it is
+    /// a lost connection, so the loop records it here as `DeadObject`.
     Frame(StatusCode),
     /// Dispatching a frame failed — the handler, or writing its reply.
     Dispatch(StatusCode),
@@ -274,14 +276,16 @@ mod tests {
             (Interrupted, false, false, Local, InSync, true),
             // A deadline this end armed cut the frame: local, position lost.
             (DeadlineMidFrame, false, true, Local, Lost, false),
-            // With none armed the same cut is the kernel's `ETIMEDOUT`, not this end's decision.
+            // With none known to be armed the same cut is not taken as this end's decision.
             (DeadlineMidFrame, false, false, NotLocal, Lost, false),
             (DeadlineMidFrame, true, false, Local, Lost, false),
             // A deadline this end armed elapsed between frames: idle eviction, clean and local.
             (Frame(TimedOut), false, true, Local, InSync, true),
-            // No deadline armed: the kernel's `ETIMEDOUT` (peer host gone); not local, stream lost.
+            // No deadline known to be armed explains it: not local, stream lost.
             (Frame(TimedOut), false, false, NotLocal, Lost, false),
             (Frame(TimedOut), true, false, Local, Lost, false),
+            // The kernel's `ETIMEDOUT` under an armed idle deadline: a lost peer, not an eviction.
+            (Frame(DeadObject), false, true, NotLocal, Lost, false),
             (Frame(NotEnoughData), false, false, NotLocal, Lost, false),
             (Frame(BadType), true, false, Local, Lost, false),
             (Dispatch(DeadObject), false, false, NotLocal, Lost, false),
