@@ -7,6 +7,32 @@
 //! ref cannot form a leak cycle through a service that stored a proxy
 //! of its own session. Hermetic (Unix socketpair), in-crate so the
 //! `Weak<RpcSessionInner>` leak probe is reachable.
+//!
+//! # Tests
+//!
+//! - `server_side_callback_cycle_reclaimed_on_client_disconnect`: the server
+//!   stores a proxy to a client callback, forming `server inner → local root
+//!   → Holder → callback proxy → Arc<server inner>`. When the client
+//!   disconnects, the server's serve-loop exit must clear its local objects
+//!   so the whole graph is reclaimed.
+//! - `explicit_shutdown_breaks_cycle_without_any_transaction`: a client that
+//!   neither serves nor transacts again is the cycle the runtime cannot
+//!   detect; without `RpcSession::close_session` the graph stays alive for
+//!   the process lifetime.
+//! - `client_side_callback_cycle_reclaimed_on_server_death`: the client has
+//!   no serve thread and stores the server root proxy inside a callback it
+//!   handed to the server, forming `client inner → local callback node →
+//!   Holder → root proxy → Arc<client inner>`. The server dies; the client's
+//!   next call fails, which must run the same death sequence (clear) so the
+//!   client graph is reclaimed once the user's own handles are gone.
+//! - `argument_proxy_dec_strong_follows_the_reply_on_the_serving_connection`:
+//!   the `DEC_STRONG` for a proxy a handler received as an argument goes out
+//!   after the reply and on the same connection, even when the session has
+//!   an idle callback slot (a real-libbinder peer's incoming connection) that
+//!   a free-slot scan would pick first. Sent there it races the reply on the
+//!   serving connection, and a peer that handles the DEC first frees the node
+//!   the reply names. Only the raw handshake helper can open a callback
+//!   connection, so the test is in-crate.
 
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
@@ -25,8 +51,7 @@ const TX_ECHO: TransactionCode = FIRST_CALL_TRANSACTION;
 const TX_SET_CB: TransactionCode = FIRST_CALL_TRANSACTION + 1;
 const TX_REPEAT: TransactionCode = FIRST_CALL_TRANSACTION + 2;
 
-/// A service that stores whatever binder it is handed — the shape that
-/// forms `session → local node → service → proxy → session`.
+/// Stores whatever binder it gets: the `session → local node → service → proxy → session` shape.
 #[derive(Default)]
 struct Holder {
     cb: Arc<Mutex<Option<SIBinder>>>,
@@ -113,8 +138,7 @@ fn set_cb(b: &SIBinder, cb: &SIBinder) -> Result<()> {
     }
 }
 
-/// (server session, client session, a dup of the server socket so the
-/// test can kill the server end from outside — "server died").
+/// (server, client, a dup of the server socket so the test can kill the server from outside).
 fn pair_with_root(root: SIBinder) -> (RpcSession, RpcSession, UnixStream) {
     let (a, b) = UnixStream::pair().expect("socketpair");
     let server_dup = a.try_clone().expect("dup");
@@ -137,9 +161,7 @@ fn wait_gone<T>(w: &Weak<T>) -> bool {
     false
 }
 
-/// D5: dropping the `RpcSession` handle does not kill proxies obtained
-/// from it — the proxy alone keeps the connection; the connection ends
-/// when the last proxy goes.
+/// Proxies outlive the dropped `RpcSession` handle; the connection ends with the last proxy.
 #[test]
 fn proxy_outlives_session_handle() {
     let (server, client, _dup) =
@@ -158,11 +180,7 @@ fn proxy_outlives_session_handle() {
     drop(server);
 }
 
-/// A.1 / test 2: the **server** stores a proxy to a client callback.
-/// With the strong proxy→session ref that is `server inner → local
-/// root → Holder → callback proxy → Arc<server inner>`. When the client
-/// disconnects, the server's serve-loop exit must clear its local
-/// objects so the whole graph is reclaimed.
+/// A server-stored client callback cycle is reclaimed on client disconnect; see module doc.
 #[test]
 fn server_side_callback_cycle_reclaimed_on_client_disconnect() {
     let (server, client, _dup) =
@@ -186,10 +204,7 @@ fn server_side_callback_cycle_reclaimed_on_client_disconnect() {
     );
 }
 
-/// The cycle case the runtime cannot detect on its own: a client that
-/// neither serves nor transacts again. `RpcSession::close_session` is the
-/// explicit break — without it the graph would stay alive for the
-/// process lifetime.
+/// `close_session` breaks the cycle of a client that neither serves nor transacts again.
 #[test]
 fn explicit_shutdown_breaks_cycle_without_any_transaction() {
     let (server, client, _dup) =
@@ -213,9 +228,7 @@ fn explicit_shutdown_breaks_cycle_without_any_transaction() {
     drop(client);
     drop(server);
 
-    // Asserted before the join: a regression leaves the client's transport
-    // open, so the peer's serve loop would never see EOF and `join` would
-    // hang instead of failing.
+    // Before the join: a transport left open would hang `join` (no EOF) instead of failing.
     assert!(
         wait_gone(&probe),
         "close_session() must release the peer's local objects and break the cycle"
@@ -223,12 +236,7 @@ fn explicit_shutdown_breaks_cycle_without_any_transaction() {
     let _ = jh.join().expect("serve thread");
 }
 
-/// A.1b / test 2b: the **client** has no serve thread and stores the
-/// server root proxy inside a callback it handed to the server:
-/// `client inner → local callback node → Holder → root proxy →
-/// Arc<client inner>`. The server dies; the client's next call fails,
-/// which must run the same death sequence (clear) so the client graph
-/// is reclaimed once the user's own handles are gone.
+/// A non-serving client's cycle is reclaimed once a call fails on server death; see module doc.
 #[test]
 fn client_side_callback_cycle_reclaimed_on_server_death() {
     let (server, client, server_dup) =
@@ -244,8 +252,7 @@ fn client_side_callback_cycle_reclaimed_on_server_death() {
     }));
     drop(slot);
     set_cb(&root, &cb).expect("server stored our callback");
-    // The server now holds a strong ref to `cb` (local node, strong=1).
-    // No serve thread on the client: death is detected lazily.
+    // The server holds `cb` strongly; no client serve thread, so death is detected lazily.
 
     // Server dies.
     server_dup
@@ -255,9 +262,7 @@ fn client_side_callback_cycle_reclaimed_on_server_death() {
     drop(server);
 
     drop(cb);
-    // `root` is a proxy and so strong on the session: the inner is alive
-    // here whether or not the cycle through the local node exists, which
-    // is why the test asserts only on the state after `root` is dropped.
+    // `root` holds the session strongly, cycle or not: assert only after `root` is dropped.
     drop(client);
     assert!(echo(&root, "x").is_err(), "peer is gone");
     drop(root);
@@ -267,13 +272,7 @@ fn client_side_callback_cycle_reclaimed_on_server_death() {
     );
 }
 
-/// The `DEC_STRONG` for a proxy a handler received as an argument goes
-/// out *after* the reply and on the *same* connection — even when the
-/// session has an idle callback slot (a real-libbinder peer's incoming
-/// connection) that a free-slot scan would pick first. Sent there it
-/// races the reply on the serving connection, and a peer that handles
-/// the DEC first frees the node the reply names. In-crate because only
-/// the raw handshake helper can open a callback connection.
+/// An argument proxy's `DEC_STRONG` follows the reply on the serving connection; see module doc.
 #[test]
 fn argument_proxy_dec_strong_follows_the_reply_on_the_serving_connection() {
     use crate::rpc::wire_android13::{client_connect_with_id, FD_MODE_NONE};
@@ -308,7 +307,15 @@ fn argument_proxy_dec_strong_follows_the_reply_on_the_serving_connection() {
     client_connect_with_id(&mut callback_conn, 2, true, FD_MODE_NONE, &sid)
         .expect("attach an incoming (callback) connection");
     // The callback slot is admitted asynchronously by the accept worker.
-    std::thread::sleep(Duration::from_millis(100));
+    let id: [u8; 32] = sid.as_slice().try_into().expect("32-byte session id");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while server.session_slot_count(&id) != Some(2) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "callback slot never admitted"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
 
     let root = client.get_root().expect("root");
     let cb: SIBinder = Interface::as_binder(&Binder::new(Holder::default()));
@@ -321,8 +328,7 @@ fn argument_proxy_dec_strong_follows_the_reply_on_the_serving_connection() {
         );
     }
 
-    // Nothing may have been sent on the callback connection: every DEC
-    // went out behind its reply on the serving connection.
+    // Nothing on the callback connection: every DEC went behind its reply on the serving one.
     callback_conn
         .set_read_timeout(Some(Duration::from_millis(300)))
         .expect("read timeout");

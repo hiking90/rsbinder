@@ -29,9 +29,7 @@ pub fn add_device(driver: &Path, name: &str) -> std::io::Result<(u32, u32)> {
 
     let cname = CString::new(name)?;
     let name_bytes = cname.as_bytes_with_nul();
-    // `zip` would otherwise silently truncate a name that does not fit,
-    // leaving the 256-byte field without a NUL terminator and handing the
-    // kernel a mis-named device. Fail loudly instead.
+    // `zip` would silently truncate an oversized name and drop its NUL; fail loudly instead.
     if name_bytes.len() > device.name.len() {
         log::error!(
             "Binder device name too long: {} bytes (max {})",
@@ -65,16 +63,12 @@ mod tests {
     use super::*;
     use std::os::fd::AsFd;
 
-    /// Stand-in for the `BINDER_CTL_ADD` ioctl that checks what `add_device`
-    /// put in the struct — a NUL-terminated copy of the name — and derives
-    /// the returned numbers from it, so a broken copy loop fails the test
-    /// instead of being masked by hard-coded values.
+    /// Fake `BINDER_CTL_ADD`: checks the NUL-terminated name and derives major/minor from it.
     pub(crate) fn binder_ctl_add<Fd: AsFd>(
         _fd: Fd,
         device: &mut binder::binderfs_device,
     ) -> std::result::Result<(), rustix::io::Errno> {
-        // `c_char` is `i8` on x86_64-linux (cast required) and `u8` on
-        // aarch64-android (cast redundant) — only the latter trips the lint.
+        // `c_char` is `i8` on x86_64-linux but `u8` on aarch64-android (cast redundant there).
         #[allow(clippy::unnecessary_cast)]
         let bytes: Vec<u8> = device.name.iter().map(|&c| c as u8).collect();
         let nul = bytes

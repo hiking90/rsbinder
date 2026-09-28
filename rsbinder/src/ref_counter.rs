@@ -1,62 +1,60 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+//! Strong reference counter for binder objects, following AOSP `RefBase`.
+//!
+//! # `INITIAL_STRONG_VALUE`
+//!
+//! Matches AOSP `RefBase.cpp` (`#define INITIAL_STRONG_VALUE (1<<28)`) exactly.
+//! The value must be positive so that the transient `fetch_add(1)` in `inc`
+//! (before the sentinel is subtracted) stays positive: a concurrent
+//! `attempt_inc` that observes the intermediate value must see a normal
+//! positive count, never a negative one. `i32::MAX` here would wrap to
+//! `i32::MIN` on that first increment and open a window where the count reads
+//! negative (spurious `attempt_inc` failure in release, `debug_assert` panic
+//! in debug). `1<<28` leaves ~2^28 headroom above and below.
+//!
+//! # Divergence from AOSP in `attempt_inc`
+//!
+//! When the weak-revive arm loses the race (the value its
+//! `fetch_add(1)` returns is neither 0 nor the sentinel), `attempt_inc` undoes
+//! **both** that strong bump and the weak ref (`dec_func`) and returns
+//! `false`; a bare `dec_func` would leak the `fetch_add(1)`. AOSP
+//! `RefBase::attemptIncStrong` keeps the ref and returns true there
+//! (its `OBJECT_LIFETIME_WEAK` arm).
+//!
+//! # Memory ordering
+//!
+//! `RefCounter` starts at `INITIAL_STRONG_VALUE`, as AOSP `BBinder` does: the first `inc`
+//! sees the sentinel, runs the first-ref callback and subtracts it. The orderings follow
+//! AOSP `RefBase`:
+//!
+//! - `inc`: `Relaxed` for the `fetch_add` and for the `fetch_sub` that removes
+//!   `INITIAL_STRONG_VALUE`. AOSP assumes `onFirstRef()` provides its own synchronization.
+//! - `dec`: `Release` on the `fetch_sub`, so all prior writes are visible, and an `Acquire`
+//!   fence only when the count reaches 0 and the object is destroyed. Only the final
+//!   decrement needs `Acquire`, so `AcqRel` on every decrement is not used. This is AOSP's
+//!   `RefBase::decStrong`.
+//! - `attempt_inc`: `Relaxed` for the load, `compare_exchange`, `fetch_add` and `fetch_sub`.
+//!   AOSP's `attemptIncStrong` assumes the calling code synchronizes at a higher level.
+
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::error::*;
 
-// Matches AOSP `RefBase.cpp` (`#define INITIAL_STRONG_VALUE (1<<28)`) exactly.
-// The value must be positive so that the transient `fetch_add(1)` in `inc`
-// (before the sentinel is subtracted) stays positive: a concurrent
-// `attempt_inc` that observes the intermediate value must see a normal
-// positive count, never a negative one. `i32::MAX` here would wrap to
-// `i32::MIN` on that first increment and open a window where the count reads
-// negative (spurious `attempt_inc` failure in release, `debug_assert` panic
-// in debug). `1<<28` leaves ~2^28 headroom above and below.
+// AOSP `RefBase.cpp` value; must stay positive with headroom (see module doc).
 pub(crate) const INITIAL_STRONG_VALUE: i32 = 1 << 28;
 
-/// Thread-safe reference counter used for binder objects.
-///
-/// This counter uses a special initial value (INITIAL_STRONG_VALUE) to defer
-/// the first increment operation. This matches Android's BBinder implementation
-/// and allows lazy initialization of binder objects.
-///
-/// # Memory Ordering Strategy
-///
-/// This implementation follows Android's RefBase memory ordering pattern exactly:
-///
-/// - **inc()**: Uses `Relaxed` for all atomic operations. The fetch_add and fetch_sub
-///   (when removing INITIAL_STRONG_VALUE) both use Relaxed ordering. Android assumes
-///   that onFirstRef() provides its own synchronization if needed.
-///
-/// - **dec()**: Uses `Release` for the fetch_sub to ensure all prior writes are visible,
-///   followed by an `Acquire` fence only when destroying the object (when count reaches 0).
-///   This two-step approach (Release on decrement + Acquire fence on destruction) is the
-///   classic reference counting pattern that provides better performance than using AcqRel
-///   on every decrement, since only the final decrement needs the Acquire synchronization.
-///   **This exactly matches Android's RefBase::decStrong implementation.**
-///
-/// - **attempt_inc()**: Uses `Relaxed` for all operations (load, compare_exchange, fetch_add,
-///   fetch_sub). Android's attemptIncStrong assumes synchronization happens at higher levels
-///   in the calling code.
-///
-/// # Safety
-/// This type is Send + Sync and safe to use across threads. The atomic operations
-/// with proper memory ordering ensure thread-safe reference counting without data races.
-/// This implementation is verified to match Android's proven RefBase pattern.
+/// Strong count starting at `INITIAL_STRONG_VALUE`; see module doc "Memory ordering".
 pub(crate) struct RefCounter {
     pub(crate) count: AtomicI32,
 }
 
 impl RefCounter {
     pub fn inc(&self, f: impl FnOnce() -> Result<()>) -> Result<()> {
-        // Relaxed is sufficient for the increment - we're just updating the count
-        // We don't need to synchronize with previous operations here
         let c = self.count.fetch_add(1, Ordering::Relaxed);
         if c == INITIAL_STRONG_VALUE {
-            // Relaxed matches AOSP RefBase: this only clears the sentinel
-            // bias on the first strong ref; any synchronization the
-            // first-ref initializer needs is provided by `f()` itself.
+            // Relaxed as in AOSP: `f()` supplies any sync the first-ref initializer needs.
             self.count
                 .fetch_sub(INITIAL_STRONG_VALUE, Ordering::Relaxed);
             f()?;
@@ -70,8 +68,7 @@ impl RefCounter {
         inc_func: impl FnOnce() -> bool,
         dec_func: impl FnOnce(),
     ) -> bool {
-        // Android uses Relaxed for all operations in attemptIncStrong.
-        // The assumption is that synchronization happens at a higher level.
+        // All Relaxed, as AOSP `attemptIncStrong`: callers synchronize at a higher level.
         let mut curr_count = self.count.load(Ordering::Relaxed);
         debug_assert!(curr_count >= 0, "attempt_increase called after underflow");
         while curr_count > 0 && curr_count != INITIAL_STRONG_VALUE {
@@ -113,11 +110,7 @@ impl RefCounter {
                 // Use Relaxed to match Android's implementation
                 curr_count = self.count.fetch_add(1, Ordering::Relaxed);
                 if curr_count != 0 && curr_count != INITIAL_STRONG_VALUE {
-                    // Lost the revive race. Undo BOTH the strong bump we just
-                    // made and the weak ref (`dec_func`); a bare `dec_func`
-                    // would leak the `fetch_add(1)` above. Diverges from AOSP
-                    // `RefBase::attemptIncStrong`, which keeps the ref and
-                    // returns true here (OBJECT_LIFETIME_WEAK arm).
+                    // Lost revive race: undo bump and weak ref (diverges from AOSP; module doc).
                     self.count.fetch_sub(1, Ordering::Relaxed);
                     dec_func();
                     return false;
@@ -134,13 +127,9 @@ impl RefCounter {
     }
 
     pub fn dec(&self, f: impl FnOnce() -> Result<()>) -> Result<()> {
-        // Use Release ordering to ensure all our writes are visible before the decrement.
-        // This matches Android's RefBase::decStrong implementation.
+        // Release so this thread's writes are visible before the decrement (AOSP `decStrong`).
         let c = self.count.fetch_sub(1, Ordering::Release);
-        // After the last `dec` the count is reset to INITIAL_STRONG_VALUE,
-        // so a double-dec is observed as `c == INITIAL_STRONG_VALUE`, not
-        // as `c < 1` — and once it happens the counter is wedged for good
-        // (never 0 again, `attempt_inc` always fast-succeeds).
+        // A double-dec reads the reset sentinel, not `c < 1`, and wedges the counter for good.
         debug_assert!(
             c >= 1 && c != INITIAL_STRONG_VALUE,
             "RefCounter::dec underflow (double decStrong), c = {c}"
@@ -156,22 +145,13 @@ impl RefCounter {
                 )
                 .is_ok()
         {
-            // Acquire fence to synchronize with all previous Release operations.
-            // This ensures we see all operations from threads that held references.
-            // This pattern matches Android's implementation:
-            // fetch_sub(Release) + atomic_thread_fence(Acquire) before destruction.
+            // Pairs with every Release decrement before destruction, as AOSP `decStrong` does.
             std::sync::atomic::fence(Ordering::Acquire);
 
-            // At this point we've acquired synchronization with all previous operations.
-            // Safe to destroy the object via f()
             f()?;
         }
         Ok(())
     }
-
-    // pub fn get(&self) -> i32 {
-    //     self.count.load(Ordering::Relaxed)
-    // }
 }
 
 impl Default for RefCounter {

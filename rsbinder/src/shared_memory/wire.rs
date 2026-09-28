@@ -27,6 +27,15 @@
 //! three cases. A `Bp*` resolves its remote geometry **once**, on
 //! first use, like AOSP `BpMemoryHeap::assertReallyMapped()` /
 //! `BpMemory::getMemory()`; it never re-transacts.
+//!
+//! # Tests
+//!
+//! - `heap_id_reply_layout_matches_aosp` parses the `HEAP_ID` reply
+//!   (fd · u64 size · i64 offset · u32 flags) field by field rather than
+//!   through `BpMemoryHeap`, so a field reorder fails it. It drives the
+//!   stub directly because the native dispatcher that checks the token
+//!   needs a kernel `ProcessState`; the proxy side is covered end-to-end
+//!   over RPC in `tests/rpc_shared_memory.rs` and over the kernel in `tests/`.
 
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -47,14 +56,10 @@ pub const HEAP_ID: TransactionCode = FIRST_CALL_TRANSACTION;
 /// `BnMemory::GET_MEMORY` (`IMemory.cpp:123-125`).
 pub const GET_MEMORY: TransactionCode = FIRST_CALL_TRANSACTION;
 
-/// Issue a token-only transaction to `binder` and return the reply.
-/// Remote binders use the transport-generic proxy path; a local
-/// `Binder<T>` is dispatched in-process.
+/// Token-only transaction: a remote binder via the proxy path, a local `Binder<T>` in-process.
 fn call(binder: &SIBinder, descriptor: &str, code: TransactionCode) -> Result<Parcel> {
     if let Some(remote) = binder.as_remote() {
-        // An RPC proxy writes the token from its stamped descriptor
-        // (what generated `from_binder` does); a kernel proxy already
-        // knows its descriptor from the driver.
+        // An RPC proxy writes the token from its stamped descriptor, as `from_binder` does.
         crate::binder::__rpc_stamp_descriptor(binder, descriptor);
         let data = remote.prepare_transact(true)?;
         return remote
@@ -62,9 +67,7 @@ fn call(binder: &SIBinder, descriptor: &str, code: TransactionCode) -> Result<Pa
             .ok_or(StatusCode::UnexpectedNull);
     }
     let local = binder.as_transactable().ok_or(StatusCode::BadType)?;
-    // A kernel-mode parcel's interface token goes through the
-    // thread-state (strict-mode/work-source header), which needs the
-    // kernel `ProcessState`; an RPC-only process has none.
+    // A kernel-mode interface token needs the kernel `ProcessState`; RPC-only has none.
     if !crate::process_state::ProcessState::is_initialized() {
         return Err(StatusCode::InvalidOperation);
     }
@@ -76,9 +79,7 @@ fn call(binder: &SIBinder, descriptor: &str, code: TransactionCode) -> Result<Pa
     Ok(reply)
 }
 
-// ---------------------------------------------------------------------
-// IMemoryHeap
-// ---------------------------------------------------------------------
+// --- IMemoryHeap ---
 
 /// Server stub for a heap: `android.utils.IMemoryHeap` over any
 /// [`IMemoryHeap`]. Wrap it with [`export_heap`] (or
@@ -122,15 +123,12 @@ impl<H: IMemoryHeap + 'static> Remotable for BnMemoryHeap<H> {
     }
 }
 
-/// Borrow the heap's raw fd for the reply
-/// (AOSP `reply->writeFileDescriptor(getHeapID())`, which dups).
+/// Borrow the heap fd for the reply (AOSP `reply->writeFileDescriptor(getHeapID())`, which dups).
 fn borrow_heap_fd<'a>(raw: i32) -> Result<std::os::fd::BorrowedFd<'a>> {
     if raw < 0 {
         return Err(StatusCode::BadValue);
     }
-    // SAFETY: `raw` is the live fd owned by the `IMemoryHeap` we are
-    // serving, which outlives this call (it is behind `Arc` in the Bn),
-    // and `write_raw_fd` only dups it.
+    // SAFETY: the served heap (`Arc` in the Bn) owns `raw` past this call; `write_raw_fd` dups it.
     Ok(unsafe { std::os::fd::BorrowedFd::borrow_raw(raw) })
 }
 
@@ -248,9 +246,7 @@ impl HeapCache {
         Arc::new(Self::default())
     }
 
-    /// Lock the table with dead entries pruned — every accessor goes
-    /// through here, so a heap binder is released as soon as the cache
-    /// is next touched, not only on the next insert.
+    /// Lock the table with dead entries pruned; every accessor goes through here.
     fn live(&self) -> std::sync::MutexGuard<'_, Vec<(SIBinder, Weak<BpMemoryHeap>)>> {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         entries.retain(|(_, w)| w.strong_count() > 0);
@@ -283,9 +279,7 @@ impl HeapCache {
     }
 }
 
-// ---------------------------------------------------------------------
-// IMemory
-// ---------------------------------------------------------------------
+// --- IMemory ---
 
 /// AOSP `MemoryBase`: an `(offset, size)` window onto a heap that is
 /// already published as a binder (see [`export_heap`]).
@@ -348,8 +342,7 @@ impl IMemory for MemoryBase {
     }
 }
 
-/// AOSP `BpMemory::getMemory` bounds rule (`IMemory.cpp:195-209`):
-/// `size <= heap && offset <= heap - size`.
+/// AOSP `BpMemory::getMemory` bounds rule (`IMemory.cpp:195-209`).
 fn check_window(heap_size: usize, offset: usize, size: usize) -> Result<()> {
     if size <= heap_size && offset <= heap_size - size {
         Ok(())
@@ -482,8 +475,7 @@ impl BpMemory {
     }
 }
 
-/// AOSP `BpMemory::getMemory` validation, including the ILP32
-/// round-trip check; a failing window becomes `(0, 0)`.
+/// AOSP `BpMemory::getMemory` validation plus ILP32 round-trip; a failing window becomes `(0, 0)`.
 fn clamp_window(heap_size: usize, offset64: i64, size64: u64) -> (usize, usize) {
     let ok = (|| {
         let size = usize::try_from(size64).ok()?;
@@ -509,8 +501,7 @@ impl IMemory for BpMemory {
     }
 }
 
-/// Placeholder heap reported by an unresolved [`BpMemory`] (AOSP
-/// returns a null `sp<IMemoryHeap>`; the trait cannot).
+/// Heap of an unresolved [`BpMemory`]; AOSP returns a null `sp<IMemoryHeap>`, the trait cannot.
 struct UnresolvedHeap;
 static UNRESOLVED: UnresolvedHeap = UnresolvedHeap;
 
@@ -544,12 +535,7 @@ mod tests {
         rustix::param::page_size()
     }
 
-    /// `HEAP_ID` reply layout = fd · u64 size · i64 offset · u32 flags,
-    /// parsed field-by-field rather than through `BpMemoryHeap` so a
-    /// reordering would be caught. The stub is driven directly (the
-    /// native dispatcher that checks the token needs a kernel
-    /// `ProcessState`); the proxy side is covered end-to-end over RPC
-    /// in `tests/rpc_fd.rs` and over the kernel in `tests/`.
+    /// `HEAP_ID` reply layout, parsed field by field; see module doc "Tests".
     #[test]
     fn heap_id_reply_layout_matches_aosp() {
         let heap = Arc::new(MemoryHeapBase::new(page() * 3, FLAG_READ_ONLY).unwrap());
@@ -609,8 +595,7 @@ mod tests {
         );
     }
 
-    /// The four AOSP `IMemory.cpp:195-209` rejection branches collapse
-    /// the window to `(0, 0)`.
+    /// The four AOSP `IMemory.cpp:195-209` rejection branches collapse the window to `(0, 0)`.
     #[test]
     fn clamp_window_matches_aosp_rules() {
         assert_eq!(clamp_window(4096, 0, 4096), (0, 4096));
@@ -628,9 +613,7 @@ mod tests {
         assert_eq!(bp.offset(), 0);
         assert_eq!(bp.memory().heap_id(), -1);
         assert!(bp.memory().base().is_none());
-        // Either the local dispatch path is unavailable (no kernel
-        // `ProcessState`: `InvalidOperation`) or the heap binder rejects
-        // `IMemory`'s token before dispatch (`BadType`). Never a panic.
+        // No kernel `ProcessState` (`InvalidOperation`) or token rejected (`BadType`); no panic.
         let err = bp.read_at(0, &mut [0u8; 1]).unwrap_err();
         assert!(
             matches!(err, StatusCode::InvalidOperation | StatusCode::BadType),

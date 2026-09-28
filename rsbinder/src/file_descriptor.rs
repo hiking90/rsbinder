@@ -22,6 +22,19 @@
 //! This module provides `ParcelFileDescriptor`, a wrapper around file descriptors
 //! that can be safely transmitted through binder IPC while maintaining proper
 //! ownership semantics and automatic cleanup.
+//!
+//! # Raw fd wire
+//!
+//! `write_raw_fd` / `read_raw_fd` are AOSP `Parcel::writeFileDescriptor` /
+//! `Parcel::readFileDescriptor`: the **bare** fd object with no not-null / comm
+//! markers — `BINDER_TYPE_FD` on the kernel path, the fd-table index on an RPC
+//! `Unix` fd-mode session (preceded by `TYPE_NATIVE_FILE_DESCRIPTOR`, with its
+//! position recorded, on the android-13+ v1+ profile; bare on R34/v0). Writing
+//! dups the fd (`F_DUPFD_CLOEXEC`); the caller keeps its own. Reading returns a dup of the parcel's object on the kernel path; on RPC it
+//! returns the ancillary-table entry itself, **consumed** (a second read of the same
+//! position is `BadValue`). `ParcelFileDescriptor` layers the AIDL markers on top of
+//! this; handwritten AOSP interfaces such as `android.utils.IMemoryHeap` use the raw
+//! form directly.
 
 use crate::error::{Result, StatusCode};
 use crate::{
@@ -88,9 +101,7 @@ impl ParcelFileDescriptor {
     /// Writing the whole payload before sending the read end works only
     /// while it fits the buffer.
     pub fn pipe() -> Result<(Self, Self)> {
-        // `pipe2(O_CLOEXEC)` where it exists; Apple has no pipe2, so the
-        // flag goes on afterwards — a window this process could only
-        // race with an `exec` on another thread.
+        // Apple has no pipe2: CLOEXEC goes on afterwards, racing only an `exec` on another thread.
         #[cfg(not(target_vendor = "apple"))]
         let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
         #[cfg(target_vendor = "apple")]
@@ -194,8 +205,7 @@ impl IntoRawFd for ParcelFileDescriptor {
 }
 
 impl PartialEq for ParcelFileDescriptor {
-    // Since ParcelFileDescriptors own the FD, if this function ever returns true (and it is used to
-    // compare two different objects), then it would imply that an FD is double-owned.
+    // Each PFD owns its fd, so `true` for two distinct objects means an fd is double-owned.
     fn eq(&self, other: &Self) -> bool {
         self.as_raw_fd() == other.as_raw_fd()
     }
@@ -207,11 +217,9 @@ impl Eq for ParcelFileDescriptor {}
 #[cfg_attr(not(feature = "rpc"), allow(dead_code))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RpcFdProfile {
-    /// R34 / v0: rsbinder-only bare ancillary index (AOSP
-    /// category-forbids fd-over-RPC there).
+    /// R34 / v0: rsbinder-only bare ancillary index (AOSP forbids fd-over-RPC there).
     V0,
-    /// android-13+ v1+: AOSP `TYPE_NATIVE_FILE_DESCRIPTOR` + index with
-    /// the object position recorded (plan/2-11).
+    /// android-13+ v1+: AOSP `TYPE_NATIVE_FILE_DESCRIPTOR` + index, position recorded (plan/2-11).
     V1Plus,
 }
 
@@ -233,42 +241,26 @@ fn rpc_fd_profile(parcel: &Parcel) -> Result<Option<RpcFdProfile>> {
     Err(StatusCode::FdsNotAllowed)
 }
 
-/// AOSP `Parcel::writeFileDescriptor` equivalent: the **bare** fd object
-/// with no not-null / comm markers — `BINDER_TYPE_FD` on the kernel
-/// path, the fd-table entry (`TYPE_NATIVE_FILE_DESCRIPTOR` + index, with
-/// the object position recorded) on an RPC `Unix` fd-mode session.
-/// The fd is dup'd (`F_DUPFD_CLOEXEC`); the caller keeps its own.
-///
-/// [`ParcelFileDescriptor`] layers the AIDL markers on top of this;
-/// handwritten AOSP interfaces such as `android.utils.IMemoryHeap`
-/// use this raw form directly.
+/// AOSP `Parcel::writeFileDescriptor`: bare fd object, fd dup'd; see module doc "Raw fd wire".
 pub(crate) fn write_raw_fd(parcel: &mut Parcel, fd: BorrowedFd<'_>) -> Result<()> {
     write_raw_owned_fd(parcel, dup_for_parcel(parcel, fd)?)
 }
 
-/// The `F_DUPFD_CLOEXEC` half of [`write_raw_fd`] and the fd-mode gate,
-/// separated so callers that prefix markers can dup *before* writing
-/// anything — a dup failure (`EMFILE`) or a rejected fd mode then
-/// leaves the parcel untouched.
+/// Fd-mode gate + dup, run before writing anything so a failure leaves the parcel untouched.
 fn dup_for_parcel(parcel: &Parcel, fd: BorrowedFd<'_>) -> Result<OwnedFd> {
     rpc_fd_profile(parcel)?;
     Ok(rustix::io::fcntl_dupfd_cloexec(fd, 0)?)
 }
 
-/// Body half of [`write_raw_fd`]: `dup` was produced by
-/// [`dup_for_parcel`] for this same parcel (so the fd mode is already
-/// accepted); ownership moves into the parcel's object table or RPC
-/// ancillary fd table only after the body bytes are written.
+/// Body of [`write_raw_fd`] for a [`dup_for_parcel`] fd; ownership moves only after the body.
 fn write_raw_owned_fd(parcel: &mut Parcel, dup: OwnedFd) -> Result<()> {
     #[cfg(feature = "rpc")]
     if let Some(profile) = rpc_fd_profile(parcel)? {
-        // Index the fd will get; push only once the body is in place so
-        // a failed write cannot leave a ghost entry in the table.
+        // Push only after the body is written, so a failed write leaves no ghost table entry.
         let idx = parcel.rpc_out_fds().len() as i32;
         match profile {
             RpcFdProfile::V1Plus => {
-                // AOSP `writeFileDescriptor` RPC branch: the recorded object
-                // position is the TYPE int32 offset (plan/2-11).
+                // AOSP `writeFileDescriptor`: the recorded position is the TYPE offset (plan/2-11).
                 let obj_pos = parcel.data_position();
                 parcel.write::<i32>(&crate::rpc::wire_android13::TYPE_NATIVE_FILE_DESCRIPTOR)?;
                 parcel.write::<i32>(&idx)?;
@@ -283,17 +275,12 @@ fn write_raw_owned_fd(parcel: &mut Parcel, dup: OwnedFd) -> Result<()> {
 
     let obj = flat_binder_object::new_with_fd(dup.as_raw_fd(), true);
     parcel.write_object(&obj, true)?;
-    // The dup has been sent, so the file descriptor is now owned by the Parcel.
-    // So, we need to forget the OwnedFd to avoid double-closing the file descriptor.
+    // The parcel now owns the fd; forget the OwnedFd to avoid a double close.
     let _ = dup.into_raw_fd();
     Ok(())
 }
 
-/// AOSP `Parcel::readFileDescriptor` equivalent of [`write_raw_fd`]:
-/// reads the bare fd object and returns an owned fd — a dup of the
-/// parcel's object on the kernel path; on RPC the ancillary-table entry
-/// itself, **consumed** (a second read of the same position is
-/// `BadValue`).
+/// AOSP `Parcel::readFileDescriptor`: RPC consumes the table entry; see module doc "Raw fd wire".
 pub(crate) fn read_raw_fd(parcel: &mut Parcel) -> Result<OwnedFd> {
     // Refuses a parcel whose fd mode forbids fds before any of it is read.
     let profile = rpc_fd_profile(parcel)?;
@@ -302,8 +289,7 @@ pub(crate) fn read_raw_fd(parcel: &mut Parcel) -> Result<OwnedFd> {
     #[cfg(feature = "rpc")]
     if let Some(profile) = profile {
         if profile == RpcFdProfile::V1Plus {
-            // AOSP readFileDescriptor: object-position miss ⇒ BAD_TYPE
-            // for v1 and v2 alike (plan/2-11).
+            // AOSP readFileDescriptor: object-position miss ⇒ BAD_TYPE, v1 and v2 (plan/2-11).
             let pos = parcel.data_position();
             if !parcel.rpc_object_position_present(pos) {
                 return Err(StatusCode::BadType);
@@ -323,9 +309,7 @@ pub(crate) fn read_raw_fd(parcel: &mut Parcel) -> Result<OwnedFd> {
     }
 
     let obj = parcel.read_object(true)?;
-    // `read_object` checks offset-table membership, not the type: a
-    // BINDER_TYPE_HANDLE placed here would otherwise be reinterpreted as
-    // an fd (AOSP readFileDescriptor also returns BAD_TYPE).
+    // `read_object` does not check the type; a HANDLE here is BAD_TYPE, as in AOSP.
     if obj.header_type() != crate::sys::BINDER_TYPE_FD {
         return Err(StatusCode::BadType);
     }
@@ -334,11 +318,7 @@ pub(crate) fn read_raw_fd(parcel: &mut Parcel) -> Result<OwnedFd> {
 
 impl Serialize for ParcelFileDescriptor {
     fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
-        // AIDL `ParcelFileDescriptor` body = not-null marker + hasComm +
-        // the raw fd object. Over RPC the v1+ (AOSP-faithful) shape keeps
-        // both markers (`AParcel_writeParcelFileDescriptor` = writeInt32(1)
-        // → writeInt32(0) hasComm → writeFileDescriptor); the R34/v0
-        // rsbinder-only shape is `[present|idx]`.
+        // `[1][hasComm=0][fd]` (`AParcel_writeParcelFileDescriptor`); R34/v0 RPC: `[1][idx]`.
         let dup = dup_for_parcel(parcel, self.0.as_fd())?;
         #[cfg(feature = "rpc")]
         if let Some(profile) = rpc_fd_profile(parcel)? {
@@ -370,17 +350,12 @@ impl SerializeOption for ParcelFileDescriptor {
 
 impl DeserializeOption for ParcelFileDescriptor {
     fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
-        // The leading `i32` is the not-null marker (`0` ⇒ `None`; AOSP
-        // null fd = `writeInt32(0)`, 4 B — profile-independent). The
-        // body mirrors `serialize`.
+        // Null fd = `writeInt32(0)` on every profile (AOSP); the body mirrors `serialize`.
         let present = parcel.read::<i32>()?;
         if present == crate::NULL_PARCELABLE_FLAG {
             return Ok(None);
         }
-        // AOSP `Parcel::readData(Parcelable*)`: anything but the not-null
-        // flag (`1`) is `UNEXPECTED_NULL`, not "present". The default
-        // `DeserializeOption` and `ParcelableHolder` already reject this;
-        // the fd path must not be the one lenient decoder.
+        // AOSP `Parcel::readData(Parcelable*)`: any marker but `1` is `UNEXPECTED_NULL`.
         if present != crate::NON_NULL_PARCELABLE_FLAG {
             return Err(StatusCode::UnexpectedNull);
         }
@@ -391,8 +366,7 @@ impl DeserializeOption for ParcelFileDescriptor {
         #[cfg(feature = "rpc")]
         if let Some(profile) = profile {
             if profile == RpcFdProfile::V1Plus {
-                // rsbinder has no comm channel: a non-zero hasComm is
-                // BadValue (real libbinder always writes 0 here).
+                // No comm channel here: non-zero hasComm is BadValue (libbinder always writes 0).
                 let has_comm = parcel.read::<i32>()?;
                 if has_comm != 0 {
                     return Err(StatusCode::BadValue);
@@ -401,16 +375,11 @@ impl DeserializeOption for ParcelFileDescriptor {
             return Ok(Some(ParcelFileDescriptor::new(read_raw_fd(parcel)?)));
         }
 
-        // AOSP `ParcelFileDescriptor.writeToParcel` (frameworks/base
-        // core/java/android/os/ParcelFileDescriptor.java): `writeInt(hasComm)`,
-        // then `writeFileDescriptor(mFd)`, then `writeFileDescriptor(mCommFd)`
-        // when `hasComm != 0` (a Java `createReliablePipe()` /
-        // `createReliableSocketPair()` PFD). Read the main fd object first,
-        // regardless of `hasComm`.
+        // Java PFD `writeToParcel`: `[hasComm][fd]`, plus `[commFd]` when hasComm != 0 (reliable).
         let has_comm = parcel.read::<i32>()?;
         let fd = read_raw_fd(parcel)?;
 
-        // Reliable-PFD comm socket: consume it and send `DETACHED` (AOSP `readParcelFileDescriptor`).
+        // Reliable-PFD comm socket: consume it, send `DETACHED` (AOSP `readParcelFileDescriptor`).
         if has_comm != 0 {
             let comm = parcel.read_object(true)?;
             if comm.header_type() != crate::sys::BINDER_TYPE_FD {
@@ -419,7 +388,7 @@ impl DeserializeOption for ParcelFileDescriptor {
             // Java PFD comm channel, not parcel wire: AOSP peeks this int BIG_ENDIAN.
             const DETACHED: i32 = 2;
             let notice = DETACHED.to_be_bytes();
-            // A sender that already closed its end (oneway + `close()`) must not fail the fd: AOSP only logs.
+            // A sender that already closed its end must not fail the fd: AOSP only logs.
             #[cfg(any(target_os = "linux", target_os = "android"))]
             let flags = rustix::net::SendFlags::NOSIGNAL;
             #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -465,8 +434,7 @@ pub fn __fuzz_rpc_fd_index(input: &[u8]) {
     let mut p = Parcel::from_vec(input.to_vec());
     p.set_for_rpc(true);
     p.set_rpc_fd_mode(crate::rpc::FileDescriptorTransportMode::Unix);
-    // No ancillary fds installed: every index must be rejected, not
-    // panic / leak.
+    // No ancillary fds installed: every index must be rejected, not panic / leak.
     let _ = <ParcelFileDescriptor as DeserializeOption>::deserialize_option(&mut p);
 }
 
@@ -482,16 +450,11 @@ pub fn __fuzz_rpc_fd_index(input: &[u8]) {
 #[doc(hidden)]
 pub fn __fuzz_rpc_fd_index_v1(input: &[u8]) {
     let mut p = fuzz_v1_parcel(input);
-    // No ancillary fds installed: every index must be rejected, not
-    // panic / leak.
+    // No ancillary fds installed: every index must be rejected, not panic / leak.
     let _ = <ParcelFileDescriptor as DeserializeOption>::deserialize_option(&mut p);
 }
 
-/// Shared by the v1+ fuzz entries: the first byte picks how many
-/// leading u32s form the (attacker-controlled) object-position table;
-/// the rest is the parcel body — so the fuzzer reaches both
-/// `binary_search` hit and miss, unsorted tables, and positions past
-/// the body.
+/// v1+ fuzz input: first byte = count of leading u32 hostile object positions; rest = body.
 #[cfg(all(feature = "rpc", feature = "fuzzing"))]
 fn fuzz_v1_parcel(input: &[u8]) -> Parcel {
     let (n_pos, rest) = match input.split_first() {
@@ -541,16 +504,14 @@ mod tests {
 
     use super::*;
 
-    /// Plan 10-3 AC-3.4. The adapters have to mean what `std::fs::File`'s
-    /// mean, because that is what a caller will assume of them.
+    /// Plan 10-3 AC-3.4: the adapters behave as `std::fs::File`'s do, which callers assume.
     #[test]
     fn a_pipe_reads_and_writes_like_a_file() {
         use std::io::{Read, Write};
 
         let (read_end, write_end) = ParcelFileDescriptor::pipe().expect("pipe");
 
-        // Both ends are close-on-exec, so neither leaks into a child
-        // this process execs while the fd is on its way to a parcel.
+        // Close-on-exec: no end leaks into a child exec'd while the fd is on its way to a parcel.
         for end in [&read_end, &write_end] {
             let flags = rustix::io::fcntl_getfd(end).expect("F_GETFD");
             assert!(
@@ -564,15 +525,13 @@ mod tests {
         (&read_end).read_exact(&mut buf).expect("read_exact");
         assert_eq!(&buf, b"hello");
 
-        // End of file is `Ok(0)`, as it is for a `File` — here it means
-        // every writing end is gone.
+        // End of file is `Ok(0)`, as for a `File`: every writing end is gone.
         drop(write_end);
         let mut rest = Vec::new();
         (&read_end).read_to_end(&mut rest).expect("read_to_end");
         assert!(rest.is_empty());
 
-        // And writing into a pipe nobody reads is `EPIPE`. `SIGPIPE` is
-        // ignored by the Rust runtime, so this returns rather than dies.
+        // Writing to a pipe nobody reads is `EPIPE`; the Rust runtime ignores `SIGPIPE`.
         let (read_end, write_end) = ParcelFileDescriptor::pipe().expect("pipe");
         drop(read_end);
         let err = (&write_end)
@@ -583,9 +542,7 @@ mod tests {
 
     #[test]
     fn test_parcel_file_descriptor() {
-        // A fd this test actually owns — not stdout (fd 1), which std and
-        // the test harness already own and which a failing assert would
-        // then close during unwind.
+        // Not stdout: std owns fd 1, and a failing assert would close it during unwind.
         let f = std::fs::File::open("/dev/null").expect("/dev/null");
         let raw = f.as_raw_fd();
         let pfd = ParcelFileDescriptor::from(f);
@@ -595,12 +552,10 @@ mod tests {
         let pfd = ParcelFileDescriptor::new(owned_fd);
         assert_eq!(pfd.into_raw_fd(), raw);
 
-        // SAFETY: `into_raw_fd` just relinquished ownership of `raw`, so
-        // nothing else in this process owns it; reclaim it here to close.
+        // SAFETY: `into_raw_fd` just gave up `raw`, so nothing else owns it.
         drop(unsafe { OwnedFd::from_raw_fd(raw) });
     }
 
-    // E9: From<File>/From<OwnedFd>, AsFd, and try_clone (dup) ergonomics.
     #[test]
     fn test_pfd_conversions_and_try_clone() {
         let f = std::fs::OpenOptions::new()
@@ -626,12 +581,7 @@ mod tests {
         let _pfd2: ParcelFileDescriptor = owned.into();
     }
 
-    // ---- AOSP-faithful FD-over-RPC Parcel body ----
-    //
-    // Device-free byte-exact goldens + strict-read mutant detection.
-    // The single-fd write side is asserted here; the full v1+↔v1+
-    // socket round-trip is the hermetic
-    // `rpc_fd::fd_v1plus_aosp_roundtrip_*`.
+    // FD-over-RPC body goldens + strict-read mutants; socket round-trip: `rpc_fd::fd_v1plus_*`.
 
     #[cfg(feature = "rpc")]
     fn dev_null_pfd() -> ParcelFileDescriptor {
@@ -652,9 +602,7 @@ mod tests {
         p
     }
 
-    /// v1+ (`record_fd_positions`) writes the AOSP-faithful
-    /// `[not-null=1][hasComm=0][TYPE=2][fdIndex=0]` (16 B) and records
-    /// the **TYPE int32 offset (= start+8)**, not the not-null marker.
+    /// v1+ writes AOSP `[1][hasComm=0][TYPE=2][idx=0]` (16 B), recording the TYPE offset (+8).
     #[cfg(feature = "rpc")]
     #[test]
     fn rpc_fd_v1_body_golden() {
@@ -673,8 +621,7 @@ mod tests {
         );
     }
 
-    /// R34 / v0 (no object table) keeps rsbinder's legacy
-    /// `[present=1][fdIndex=0]` (8 B) **byte-unchanged**, no position.
+    /// R34 / v0 writes the AOSP android-12 layout `[present=1][fdIndex=0]` (8 B), no position.
     #[cfg(feature = "rpc")]
     #[test]
     fn rpc_fd_r34_body_byte_unchanged() {
@@ -690,9 +637,7 @@ mod tests {
         );
     }
 
-    /// A null fd is `writeInt32(0)` (4 B), **no TYPE, no
-    /// position**, at *both* profiles (an easy reshape mistake is to
-    /// grow a position for null at v1+).
+    /// A null fd is `writeInt32(0)` at both profiles: no TYPE, and no position even at v1+.
     #[cfg(feature = "rpc")]
     #[test]
     fn rpc_fd_null_body_unchanged_both_profiles() {
@@ -724,9 +669,7 @@ mod tests {
         p
     }
 
-    /// Each malformed/forged v1+ body must be a clean
-    /// `Err`, never a panic or a mis-parse (the symmetric-illusion trap
-    /// is exactly why these are explicit).
+    /// Forged v1+ bodies are clean `Err`s; explicit, as a symmetric round trip cannot catch them.
     #[cfg(feature = "rpc")]
     #[test]
     fn rpc_fd_v1_strict_read_rejects_mutants() {
@@ -740,8 +683,7 @@ mod tests {
         };
         let de = <ParcelFileDescriptor as DeserializeOption>::deserialize_option;
 
-        // (1) legacy R34 `[present=1][idx]` fed to a v1+ reader: the
-        //     second i32 is misread as hasComm; idx=7 ⇒ hasComm!=0.
+        // (1) legacy R34 `[present=1][idx=7]` to a v1+ reader: idx is read as hasComm != 0.
         let mut legacy = Vec::new();
         legacy.extend_from_slice(&1i32.to_le_bytes());
         legacy.extend_from_slice(&7i32.to_le_bytes());
@@ -751,16 +693,14 @@ mod tests {
             "legacy [present|idx] vs v1+ reader (hasComm!=0)"
         );
 
-        // (2) position omitted from the object table ⇒ strict miss ⇒
-        //     BadType (AOSP fd: binary_search miss ⇒ BAD_TYPE).
+        // (2) position missing from the object table ⇒ BadType (AOSP: binary_search miss).
         assert_eq!(
             de(&mut v1_reader(&ok_body, vec![])).unwrap_err(),
             StatusCode::BadType,
             "unrecorded fd position rejected (strict v1+)"
         );
 
-        // (3) position recorded at +0 (not-null marker) instead of the
-        //     +8 TYPE offset — the obj_pos-captured-too-early mutant.
+        // (3) position at +0 (not-null marker), not the +8 TYPE offset: obj_pos taken too early.
         assert_eq!(
             de(&mut v1_reader(&ok_body, vec![0])).unwrap_err(),
             StatusCode::BadType,
@@ -776,8 +716,7 @@ mod tests {
             "TYPE != TYPE_NATIVE_FILE_DESCRIPTOR rejected"
         );
 
-        // (5) hasComm != 0 (documented divergence: rsbinder has no comm
-        //     channel — AOSP would read a second fd).
+        // (5) hasComm != 0: rsbinder has no comm channel (AOSP would read a second fd).
         let mut comm = ok_body.clone();
         comm[4..8].copy_from_slice(&1i32.to_le_bytes());
         assert_eq!(
@@ -786,10 +725,7 @@ mod tests {
             "hasComm != 0 rejected (AC-11.5)"
         );
 
-        // Sanity: the well-formed body passes the strict/type/hasComm
-        // gates and only then fails on the *absent in-fd* (BadValue
-        // from `rpc_take_in_fd`) — proving the gates above are what
-        // rejected (1)–(5), not an earlier accident.
+        // Well-formed body fails only at the absent in-fd, so the gates are what rejected (1)–(5).
         assert_eq!(
             de(&mut v1_reader(&ok_body, vec![8])).unwrap_err(),
             StatusCode::BadValue,

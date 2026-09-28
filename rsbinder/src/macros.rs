@@ -76,10 +76,8 @@ macro_rules! __declare_binder_interface {
                     {
                         fn as_sync(&self) -> &dyn $interface { &self._inner }
                         fn as_async(&self) -> &dyn $native_async {
-                            // Unreachable: the async `FromIBinder` cast gates on
-                            // `try_as_async()` (below) and refuses a sync-only
-                            // native, so no `dyn Async` handle ever reaches here.
-                            unreachable!("{} doesn't support async interface.", stringify!($interface))
+                            // Reachable: `Binder::<Bn*>::try_from`, then a generated `*Async` impl.
+                            panic!("{} was published sync-only; it has no async interface", stringify!($interface))
                         }
                         fn try_as_async(&self) -> ::core::option::Option<&dyn $native_async> { ::core::option::Option::None }
                     }
@@ -122,13 +120,7 @@ macro_rules! __declare_binder_interface {
                         ::core::option::Option::None => {
                             match $crate::Binder::<$native>::try_from(ibinder) {
                                 ::core::result::Result::Ok(native) => {
-                                    // A local binder can back the async view only if it
-                                    // was published as an async service. A sync-only
-                                    // service's adapter answers `None` here, so reject
-                                    // the cast now rather than panic in `as_async()` at
-                                    // the first method call (AOSP returns `BadType` too).
-                                    // `Strong::into_async` still turns this `Err` into a
-                                    // panic; `Strong::try_into_async` surfaces it.
+                                    // Sync-only native: BadType like AOSP, not `as_async()` panic.
                                     if native.0.try_as_async().is_some() {
                                         ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new(native)))
                                     } else {
@@ -160,15 +152,6 @@ macro_rules! __declare_binder_interface {
                     f.pad(stringify!($async_interface))
                 }
             }
-
-            // / Convert a &dyn $async_interface to Strong<dyn $async_interface>
-            // impl<P: $crate::BinderAsyncPool> std::borrow::ToOwned for dyn $async_interface<P> {
-            //     type Owned = $crate::Strong<dyn $async_interface<P>>;
-            //     fn to_owned(&self) -> Self::Owned {
-            //         self.as_binder().into_interface()
-            //             .expect(concat!("Error cloning interface ", stringify!($async_interface)))
-            //     }
-            // }
 
             impl<P: $crate::BinderAsyncPool> $crate::ToAsyncInterface<P> for dyn $interface {
                 type Target = dyn $async_interface<P>;
@@ -431,11 +414,9 @@ macro_rules! declare_binder_interface {
             }
 
             fn from_binder(binder: $crate::SIBinder) -> ::core::option::Option<Self> {
-                // Stamps the RPC wire's descriptor-less proxy in place; see
-                // `RpcProxy::stamp_descriptor`.
+                // Stamps a descriptor-less RPC proxy; see `rpc::proxy` module doc "Descriptor".
                 $crate::__rpc_stamp_descriptor(&binder, $descriptor);
-                // Self-referential for a fresh `RpcProxy` — see
-                // `RpcProxy::stamp_descriptor`'s type-safety note.
+                // Self-referential for a fresh `RpcProxy`: `rpc::proxy` module doc "Descriptor".
                 if binder.descriptor() != $descriptor {
                     return ::core::option::Option::None
                 }
@@ -579,9 +560,7 @@ macro_rules! impl_deserialize_for_parcelable {
                     use $crate::Parcelable;
                     self.read_from_parcel(parcel)
                 } else {
-                    // Any flag other than NON_NULL is UNEXPECTED_NULL, matching
-                    // AOSP C++ `Parcel::readData` and `DeserializeOption`'s
-                    // default path.
+                    // Other flags are UNEXPECTED_NULL, as in AOSP C++ `Parcel::readData`.
                     ::core::result::Result::Err($crate::StatusCode::UnexpectedNull.into())
                 }
             }
@@ -610,9 +589,7 @@ macro_rules! impl_deserialize_for_parcelable {
                     this.get_or_insert_with(Self::default)
                         .read_from_parcel(parcel)
                 } else {
-                    // Any flag other than NULL/NON_NULL is UNEXPECTED_NULL,
-                    // matching AOSP C++ `Parcel::readData` and
-                    // `DeserializeOption`'s default path.
+                    // Other flags are UNEXPECTED_NULL, as in AOSP C++ `Parcel::readData`.
                     ::core::result::Result::Err($crate::StatusCode::UnexpectedNull.into())
                 }
             }
@@ -651,7 +628,7 @@ macro_rules! declare_binder_enum {
             }
         }
 
-        // Bitwise ops matching AOSP `declare_binder_enum!` (frameworks/native/libs/binder/rust/src/binder.rs); additive, wire-compatible.
+        // Bitwise ops as in AOSP `declare_binder_enum!` (frameworks/native/libs/binder/rust).
         impl ::core::ops::BitOr for $enum {
             type Output = Self;
             fn bitor(self, rhs: Self) -> Self {
@@ -759,8 +736,7 @@ macro_rules! impl_service_specific_error {
     ($enum:ty) => {
         impl $crate::ServiceSpecificError for $enum {
             fn code(&self) -> i32 {
-                // `From`, not `as`: it is what refuses a `long` backing
-                // here rather than truncating it into the wire's i32.
+                // `From`, not `as`: refuses a `long` backing instead of truncating to i32.
                 i32::from(self.get())
             }
 
@@ -885,9 +861,7 @@ mod tests {
         }
     }
 
-    // A second, unrelated interface used only to exercise a wrong-type cast.
-    // Mirrors `IEcho` (adapter + async) so it is a fully-formed interface in
-    // both sync and async builds.
+    // Unrelated interface for the wrong-type cast; mirrors `IEcho` so it builds sync and async.
     pub trait IBye: Interface {
         #[allow(dead_code)]
         fn bye(&self) -> Result<()>;
@@ -951,9 +925,7 @@ mod tests {
         let _ = BnEcho::new_binder(EchoService {});
     }
 
-    // F6: a cross-interface cast must fail with `BadType` (not silently
-    // succeed), and the single diagnostic funnel in `native::try_from` is what
-    // names the expected vs. actual descriptor in the log.
+    // A cross-interface cast fails with `BadType`; `native::try_from` logs both descriptors.
     #[test]
     fn test_cast_mismatch_is_bad_type() {
         // `Into<SIBinder>` drops the interface type — no `.as_binder()`.
@@ -964,8 +936,7 @@ mod tests {
         assert!(<dyn IEcho as crate::FromIBinder>::try_from(echo.clone()).is_ok());
         assert!(<dyn IBye as crate::FromIBinder>::try_from(bye.clone()).is_ok());
 
-        // The wrong interface is rejected (symmetrically) as `BadType` — opaque
-        // in the value, but with expected/actual descriptors in the diagnostic.
+        // Rejected both ways as `BadType`; only the log names expected/actual descriptors.
         assert_eq!(
             <dyn IBye as crate::FromIBinder>::try_from(echo).unwrap_err(),
             crate::StatusCode::BadType,
@@ -976,8 +947,7 @@ mod tests {
         );
     }
 
-    // C1: `Strong::<dyn IFoo>::try_from(sib)` is the idiomatic cast spelling and
-    // must behave exactly like `FromIBinder::try_from` / `into_interface`.
+    // `Strong::<dyn IFoo>::try_from(sib)` must behave exactly like `FromIBinder::try_from`.
     #[test]
     fn test_strong_try_from() {
         let echo: crate::SIBinder = BnEcho::new_binder(EchoService {}).into();
@@ -992,10 +962,7 @@ mod tests {
         );
     }
 
-    // E4: link_to_death_arc accepts a concrete `Arc<R>` with no
-    // `as Arc<dyn DeathRecipient>` cast, on both `Strong<I>` and `SIBinder`.
-    // A native (local) binder rejects the link with InvalidOperation, which
-    // exercises the unsizing + delegation end-to-end.
+    // `link_to_death_arc` takes an uncast `Arc<R>`; a local binder answers InvalidOperation.
     #[test]
     fn test_link_to_death_arc_no_cast() {
         struct Rec;

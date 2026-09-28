@@ -41,6 +41,313 @@
 //! feature it is empty and `Some(RpcFields::default())` is exactly what
 //! `Parcel::new_data_only` needs — a parcel that has no session to marshal a
 //! binder or an fd through. `rpc` adds the state a session fills in.
+//!
+//! # RPC fields
+//!
+//! - `object_positions` is AOSP `RpcFields::mObjectPositions`: sorted byte
+//!   offsets of flattened RPC objects (binder at android-16 v2, FD at v1+),
+//!   produced by `write_binder` / the FD write while serializing and consumed
+//!   by the wire codec as the trailing `u32[]` object table. The kernel path
+//!   never touches it (kernel objects live in `Parcel::objects`); empty is
+//!   byte-identical to a wire with no object table. Recording inserts at the
+//!   `upper_bound` (AOSP `mObjectPositions.insert(upper_bound(...), dataPos)`
+//!   in `flattenBinder` / `writeFileDescriptor`), an O(1) push on the usual
+//!   ascending-write path. `rpc_record_object_position` is a no-op on a
+//!   kernel-backed parcel, so the kernel wire never grows an object table; the
+//!   caller decides whether to record (binder ⇒ v2 only, FD ⇒ v1+), mirroring
+//!   AOSP's per-call version gate. Lookup is AOSP `unflattenBinder`'s v2 strict
+//!   check, `std::binary_search(mObjectPositions, objectPos)`: a conformant
+//!   peer sends the table sorted, and a forged or unsorted table misses the
+//!   search, so the caller returns `BAD_VALUE`. An incoming table is installed
+//!   by `rpc_set_object_positions` (AOSP `rpcSetDataReference`). A recorded
+//!   offset is the position of the object's leading int32 (AOSP
+//!   `dataPos = mDataPos` before `writeInt32(TYPE_*)`), and the v2 codec frames
+//!   the table as `bodySize = fixed + parcelDataSize + 4·N`.
+//! - `record_fd_positions` is set by the session from its wire profile, next
+//!   to the FD mode: `true` only on the android-13+ v1+ profile. R34 has no
+//!   object table, so its FD-over-RPC wire is the AOSP android-12 layout. The session
+//!   records binder positions itself (it owns the profile); only the FD path
+//!   needs this parcel-side flag.
+//! - `fd_mode` defaults to `None`, which rejects an FD write — bit-identical
+//!   to a parcel that carries no FDs. Production sets both FD fields and the
+//!   hooks through `configure_rpc`; `set_rpc_fd_mode` and
+//!   `set_rpc_record_fd_positions` exist for a test or fuzz target without a
+//!   session. The per-message `rpc_set_in_fds` / `rpc_set_object_positions`
+//!   stay separate from `configure_rpc`: they carry wire payload, not the
+//!   session profile.
+//! - `fds_out` collects, in `Unix` fd-mode, the owned dups serialized into
+//!   this outgoing parcel; the session sends them out-of-band via
+//!   `SCM_RIGHTS`, and the parcel keeps ownership and closes them on drop,
+//!   after the send (the peer holds its own copies via the kernel). `fds_in`
+//!   holds the fds received with an incoming parcel, indexed by the in-body
+//!   fd-table index, each taken at most once.
+//! - `leaving_addrs` records the session addresses of local binders whose
+//!   `timesSent` was bumped (`RpcState::on_binder_leaving`) while flattened
+//!   into this outgoing parcel. The parcel owns those bumps while it is
+//!   `NotSent`: its `Drop` (and `set_for_rpc(false)`) hands them back through
+//!   `RpcParcelOps::cancel_leaving`, so a parcel written and never sent, or
+//!   refused before the send (`WouldBlock`, `DeadObject`, an encode failure),
+//!   leaks no node and can be sent again as is. The give-back sends nothing to the peer.
+//! - `send_state` is AOSP `RpcFields::mSendState`. `client_transact` and
+//!   `send_reply_parcel` claim the parcel (`NotSent` → `InFlight`) for one
+//!   send and, on success, mark it `Sent`, which hands `leaving_addrs` to the
+//!   peer's `DEC_STRONG`; a `Sent` or `InFlight` parcel is refused with
+//!   `InvalidOperation`, so one parcel is sent once. A parcel built from a
+//!   peer's bytes is `Received` (AOSP `RECEIVED`) and is refused the same
+//!   way. Both send paths first compare `RpcParcelOps::session_id` with their
+//!   own session (AOSP `validateParcel`, `BadType`), and `append_from` into a
+//!   session parcel takes a source of that session only. `Drop` settles unless the
+//!   parcel is `Sent`: an `InFlight` one at drop is a claim a panic left,
+//!   and no send completed. AOSP settles an unsent
+//!   parcel on destruction only at wire v2 (`mObjectPositions` holds binder
+//!   positions only there); rsbinder records `leaving_addrs` on every profile
+//!   and settles on all of them.
+//! - `pinned` holds the remote proxies flattened into this outgoing parcel
+//!   until it drops, so their `DEC_STRONG` cannot overtake the send that names
+//!   them (AOSP keeps argument refs until the reply is out). A binder, proxy or
+//!   local, is written only into a `NotSent` parcel.
+//! - `entered` is AOSP `RpcFields::mAcquiredEnteringBinders` (android-16.0.0_r4):
+//!   for a `Received` parcel, the address and binder each object position
+//!   entered, sorted by position and found by binary search. The first read of
+//!   a position enters it (`RpcSessionInner::read_binder`: one of our nodes is
+//!   paid back with `DEC_STRONG` 1 at once, a peer address resolves to its
+//!   deduped proxy) and records it. A later read of the position consumes the
+//!   same bytes and returns the recorded binder without entering again; an
+//!   address other than the recorded one is `BadValue`. At wire v2 the session
+//!   enters every binder position when the parcel arrives. Only a position
+//!   below `received_len`, the data length at receipt, is entered. A parcel
+//!   that is not `Received`, or a position past that length, only looks the
+//!   address up (one of our nodes, then a live proxy, else `BadValue`) and owes
+//!   nothing. The parcel holds what it entered until it drops, when an entered
+//!   proxy sends its `DEC_STRONG`; so a received parcel must not drop under the
+//!   `RpcState` lock, which that send re-takes.
+//!
+//! # Data-only parcels
+//!
+//! `Parcel::new_data_only` is the session-less RPC mode: the mode the RPC
+//! transport uses, without the session that would give a binder somewhere to
+//! go. With no ops attached and `fd_mode` at `None`, the RPC write paths reject
+//! a binder and an fd on their own, and `append_from` — the one path that
+//! copies another parcel's bytes wholesale — has its own write-time refusal.
+//! All of them refuse before anything is written, so there is no second check
+//! on the finished bytes to keep in step. It is not behind `rpc`: the
+//! refusals follow from the missing session, not from the transport. On the
+//! read side (`Parcel::from_slice`) data-only makes `read_object` an immediate
+//! `BadType`, so a forged `flat_binder_object` in the input cannot become a
+//! binder.
+//!
+//! `Parcel::is_self_contained` checks the kernel object table, the RPC object
+//! positions and the out-of-band fds. The kernel table is empty by
+//! construction on an RPC parcel, so checking it alone would hand out the
+//! bytes of a parcel carrying binders — bytes meaningless without the object
+//! table that travelled beside them.
+//!
+//! # `ParcelPod`
+//!
+//! `Parcel::write_aligned`, `write_array` and `read_array` reinterpret a `&T`
+//! / `&[T]` as raw bytes (and, on read, raw bytes as `T`). That is sound only
+//! for a type with no padding or otherwise-uninitialized bytes (those bytes
+//! would leak process memory to the peer, and reading them is UB) and for
+//! which every bit pattern is a valid value (a peer's bytes become a `T`
+//! without validation). The `T: ParcelPod` bound carries that obligation in
+//! the signature instead of leaving it to whichever caller instantiates the
+//! generic.
+//!
+//! Safety contract for an implementor: `#[repr(C)]` / `#[repr(transparent)]`
+//! or a primitive, no padding, and valid for every bit pattern of its size.
+//! For the bindgen binder-ABI structs every union member must also be written
+//! full-width by the constructor (`flat_binder_object::new_*` do; see the
+//! `*_full_width_init` tests in `binder_object.rs`).
+//!
+//! # Wire and native scalars
+//!
+//! `WireScalar` is the wire layer. The data-parcel wire is little-endian on
+//! every host, so a scalar is encoded with `to_le_bytes` rather than copied out
+//! of memory. On a little-endian host that is the identity, so the emitted
+//! bytes and the generated code are unchanged; a big-endian host pays a swap
+//! and gains a parcel its peers can read. `NativeScalar` is the kernel command
+//! stream — the `BC_*` / `BR_*` ioctl buffer the driver parses with native
+//! loads — and stays host-native, as do the UAPI structs (`ParcelPod`). Both
+//! traits exist because the two layers share one `Parcel` and the same 4-byte
+//! slots, so only the name at the call site says which contract is in force:
+//! a value going to the driver must not be byte-swapped, a value going to a
+//! peer must. `Bytes` is `[u8; size_of::<Self>()]` spelled as an associated
+//! type, because stable Rust cannot use an associated const as an array
+//! length in a trait signature.
+//!
+//! `Parcel::write_le` (L1) takes a value already widened to its wire type
+//! (`i8`/`u8`/`i16` → `i32`, `u16` → `u32`): writing the narrow value would
+//! emit one or two bytes and desync everything after it, which the
+//! `wire_golden` widening test pins. `Parcel::write_native` / `read_native`
+//! (L2) carry the command stream — `BC_*` codes, handles, cookies — and the
+//! command stream reaches them only through `command_stream::CommandStream`,
+//! whose private field exposes no L1 method: the type enforces the layer, not
+//! a list of spellings.
+//!
+//! # Array length checks
+//!
+//! `checked_array_layout` computes `(size, padded)` for `len` elements of
+//! `elem_size` bytes and returns `BadValue` when either would overflow
+//! `usize`. On 32-bit targets (armv7 Android, i686 Linux) a hostile
+//! `len * size_of::<D>()` could wrap to a small `size` that passes the later
+//! `padded > data_avail()` check and reaches `Vec::with_capacity(len)`, which
+//! aborts with a capacity-overflow panic — a remote DoS through parcel input.
+//! On 64-bit, any `i32` `len` times a realistic element size stays far below
+//! `usize::MAX`, so the result there equals unchecked arithmetic. The caller
+//! validates `len >= 1` first: `len == 0` would give `size == 0`,
+//! indistinguishable from a wrap to zero, and a `debug_assert!` rejects it.
+//!
+//! # Kernel receive buffers
+//!
+//! For an empty IPC parcel the binder driver still allocates a buffer and
+//! returns its user-space address, which must go back verbatim in
+//! `BC_FREE_BUFFER`. `ParcelData::from_raw_parts_mut` therefore keeps a
+//! non-null `data` with `len == 0` as a real slice and falls back to a
+//! dangling `&[]` only when `data` itself is null.
+//!
+//! That buffer is read-only in this process: `binder_mmap` refuses a
+//! mapping with `VM_WRITE`, and `ProcessState` maps it `PROT_READ`. So
+//! `ParcelData::Slice` holds a shared `&[T]`, and every `ParcelData` method
+//! that would write through it (`as_mut_slice`, `as_mut_ptr`, `reserve`,
+//! `set_len`, `push`) panics instead. Every write path reserves first, so a
+//! write into a received parcel stops at that panic.
+//!
+//! `ParcelData::set_len` grows in two places: the write paths, after
+//! initializing `old_len..end` themselves ("Buffer growth"), and
+//! `Parcel::set_data_size_driver_filled`, after the binder driver filled the
+//! spare capacity through `as_mut_ptr` — `talk_with_driver` calls it with
+//! `read_consumed`, the count the driver reports having written.
+//! `Parcel::set_data_size` only shrinks.
+//!
+//! # Kernel proxies
+//!
+//! A kernel parcel holds every proxy (`BINDER_TYPE_HANDLE`) written into it
+//! strong in `kernel_pinned` until it drops (AOSP `acquire_object`); a parcel
+//! the driver filled pins nothing. A handler that
+//! returns a proxy it received may drop every other strong ref to it before
+//! `BC_REPLY` is written; `BC_RELEASE` and `BC_FREE_BUFFER` queued ahead of the
+//! reply would then take the handle's last strong ref and the kernel would
+//! reject the reply. A binder of the process's own travels as
+//! `BINDER_TYPE_BINDER` and needs no pin.
+//!
+//! # Buffer growth
+//!
+//! Every write path (`write_aligned_data`, `write_array`, `write_array_char`,
+//! `append_from`) bounds its end position to `i32::MAX` before reserving: wire
+//! offsets are `int32`, so a larger position can only come from a misuse of the
+//! public `set_data_position`, and it is refused as `BadValue` rather than
+//! overflowed into a wild `reserve`/`write_bytes` (AOSP `Parcel::growData`
+//! returns `BAD_VALUE` for `len > INT32_MAX`).
+//!
+//! `reserve` allocates without initializing, and `set_len` then marks the bytes
+//! initialized, so every byte below the new length is written first:
+//!
+//! - the `len..pos` gap a forward `set_data_position` leaves is zero-filled
+//!   (AOSP `growData` zero-fills grown capacity the same way);
+//! - the 0-3 trailing pad bytes of an unaligned write are zeroed. The pad is
+//!   transmitted (it counts in `data_size`), and AOSP masks it to zero too.
+//!
+//! Skipping either is UB and sends uninitialized process memory to the peer.
+//!
+//! # `append_from`
+//!
+//! `Parcel::append_from` copies a byte range but never the table that made
+//! those bytes safe, so it refuses, before any byte is copied, each case where
+//! the bytes would change meaning in the destination:
+//!
+//! - RPC or data-only source into a kernel destination: `read_object`'s
+//!   null-meta shortcut accepts a null-pointer, null-cookie
+//!   `flat_binder_object` with no offset-table entry, so 24 bytes of payload
+//!   would become `BINDER_TYPE_HANDLE` handle 0, a live proxy to the context
+//!   manager. The opposite direction needs no gate: `read_object` is an
+//!   immediate `BadType` on an RPC-mode parcel.
+//! - A source with session hooks into a hook-less destination: the source can
+//!   carry an `RpcAddress` flattened into its body, and only the v2 wire
+//!   records where, so no table proves a range clean. The hook-less sink is
+//!   the one whose bytes get exported (`Parcel::as_bytes`).
+//! - Into a session destination, any source but a parcel of the same session:
+//!   a kernel parcel, a data-only one (`from_bytes`, a stream item) or another
+//!   session's. AOSP refuses the same pairs by `isForRpc()` and `mSession`
+//!   (`Parcel::appendFrom`, android-16.0.0_r4). Otherwise bytes no session
+//!   vouched for would reach the peer, which reads a `1` followed by an address
+//!   as a binder: its own node, or a proxy to one of ours that took no
+//!   reference, whose `DEC_STRONG` then frees a node another proxy still uses.
+//! - Kernel objects into an RPC-mode destination: it has no object table, so a
+//!   `flat_binder_object` would survive as payload carrying a process-local
+//!   handle or fd number, indistinguishable from data once copied.
+//!
+//! A copy within one session carries its objects, as AOSP `appendFrom` does
+//! from android-16.0.0_r4. Each source position inside the range moves to the
+//! destination, shifted by `start - offset`. At a binder the address is looked
+//! up and takes one more `timesSent` (`RpcParcelOps::acquire_copied`, AOSP
+//! `lookupAddress` + `onBinderLeaving`), recorded in `leaving_addrs` so the
+//! destination settles it like one it wrote; a proxy of the peer's is pinned,
+//! as `write_binder` pins it. The copy runs only at wire v2 (below), where a
+//! received source entered every binder position when it arrived and holds
+//! the proxy in its `entered` table ("RPC fields"), as does a
+//! `ParcelableHolder` payload cut from it, so a peer address from a received
+//! source finds a live proxy to pin whether or not the position was read. A
+//! peer address with no live proxy, from a source that neither received nor
+//! wrote it, is copied without a pin. All addresses of one copy
+//! go under one `RpcState` lock. An address that names no node of ours, or whose node
+//! answers with another address, refuses the copy with `BadValue`; AOSP shuts
+//! the session down there, rsbinder keeps it as `remote_proxy` does for an
+//! unknown address. At an fd the source's fd is dup'd into the destination's
+//! outgoing table and the in-body index is rewritten to that slot. The slot
+//! is the destination's table size before the push, because fds written
+//! before the append already hold the lower slots; AOSP android17-release
+//! writes `otherRpcFields->mFds.size() - 1`, the source's size, which
+//! names the right slot only when the destination had no fd and the range
+//! holds the source's last one.
+//!
+//! This needs binder positions, which only the v2 wire records. On r34 and
+//! android-13+ v0 and v1 a binder is a `1` and an address with nothing marking
+//! where, so no copy can find its binders to take their references, and no
+//! range can be proven binder-free. There every non-empty copy into a session
+//! parcel is `BadType`: the payload has to be decoded and written again. v1
+//! records fd positions, but the refusal is about binders and holds there too.
+//! Every step that can fail (the refusals, the fd dups, `acquire_copied`) runs
+//! before a byte is copied, so a refused copy leaves the destination as it was.
+//!
+//! `Parcel::sub_parcel` is the read-side counterpart, for `ParcelableHolder`:
+//! the payload becomes its own parcel with the source's mode and session
+//! profile (hooks, fd mode, fd-position flag), the positions inside the range
+//! shifted to its start, and each v1+ fd in range moved out of the source's
+//! received table into its own, with the index rewritten. It is `Received`
+//! exactly when the source is, and it gets a clone of each `entered` entry in
+//! range (a clone, so the source's own reads of those positions still find
+//! them). At v2 that is every binder in the payload. On r34, v0 and v1 the
+//! source entered none of them, so the sub-parcel enters each on its first
+//! read and keeps it for as long as the holder keeps the payload: a
+//! `get_parcelable` that fails after a binder and is retried reads the
+//! recorded binder instead of paying the receipt twice. A sub-parcel of a
+//! parcel that was not received only looks addresses up. C++
+//! `ParcelableHolder` has no counterpart to follow: it cannot receive a
+//! non-empty holder over RPC at all (android-17.0.0_r1 `ParcelableHolder.cpp:86-90`
+//! reads into a kernel parcel, whose `appendFrom` refuses an RPC source,
+//! `Parcel.cpp:607-611`). A copy of it sent later goes
+//! through `append_from` above. Kernel mode uses `append_from` itself. r34 and
+//! v0 fds carry no position, so they stay behind and reading one fails.
+//!
+//! Relocation scans the source's object table, as AOSP `Parcel.cpp::appendFrom`
+//! iterates `other`'s `mObjects`: the destination's table may be empty (a fresh
+//! `ParcelableHolder` parcel) and would drop every nested object. Each offset
+//! (AOSP `off = pos - offset + startPos`) is pushed into `objects` only after
+//! the object is acquired and, for an fd, dup'd and rewritten with the
+//! destination's own fd. When either step fails the offset is not committed,
+//! so `Drop` (`release_objects`) never releases the source's still-owned fd
+//! (double close) or a refcount it never took. AOSP gets the same result by
+//! never aborting its loop.
+//!
+//! # Binder-ABI structs
+//!
+//! `flat_binder_object`, `binder_transaction_data` and
+//! `binder_transaction_data_secctx` implement `ParcelPod`: bindgen `#[repr(C)]`
+//! structs of integers, pointers-as-integers and unions of those, with no
+//! padding (8-byte-multiple field groups), so every bit pattern is valid. Their
+//! union members are written full-width by the constructors in
+//! `binder_object.rs` and by `write_transaction_data` (`ptr: 0` before
+//! `.handle`).
 
 use std::default::Default;
 use std::vec::Vec;
@@ -54,70 +361,34 @@ use crate::{
     error::{Result, StatusCode},
     parcelable::*,
     sys::binder::{binder_size_t, flat_binder_object},
-    sys::{binder_uintptr_t, BINDER_TYPE_FD},
+    sys::{binder_uintptr_t, BINDER_TYPE_FD, BINDER_TYPE_HANDLE},
     thread_state,
 };
 
 const STRICT_MODE_PENALTY_GATHER: i32 = 1 << 31;
 
-/// Types whose bytes may be copied verbatim onto / off the wire.
-///
-/// `Parcel::write_aligned`, `write_array` and `read_array` reinterpret a
-/// `&T` / `&[T]` as raw bytes (and, on read, raw bytes as `T`). That is only
-/// sound for a type that has **no padding or otherwise-uninitialized
-/// bytes** (the bytes would leak process memory to the peer and reading them
-/// is UB) and for which **every bit pattern is a valid value** (a peer's
-/// bytes become a `T` without validation). A `T: Pod`-style bound carries
-/// that obligation in the signature instead of leaving it to whichever
-/// caller happens to instantiate the generic.
-///
-/// # Safety
-///
-/// Implementors must be `#[repr(C)]`/`#[repr(transparent)]` or a
-/// primitive, contain no padding, and be valid for every bit pattern of
-/// their size. For the bindgen binder-ABI structs this additionally means
-/// every union member must be written full-width by the constructor
-/// (`flat_binder_object::new_*` do; see the `*_full_width_init` tests in
-/// `binder_object.rs`).
+/// Implementors: no padding, every bit pattern valid; `# Safety` is module doc "`ParcelPod`".
+#[allow(clippy::missing_safety_doc)]
 pub(crate) unsafe trait ParcelPod: Copy {}
 
 macro_rules! impl_parcel_pod {
     ($($t:ty),* $(,)?) => { $(
-        // SAFETY: primitive integer/float types: no padding, every bit
-        // pattern valid.
+        // SAFETY: primitive integer/float types: no padding, every bit pattern valid.
         unsafe impl ParcelPod for $t {}
     )* };
 }
 impl_parcel_pod!(i8, u8, i16, u16, i32, u32, i64, u64, u128, f32, f64);
 
-/// A scalar whose *wire* representation is little-endian.
-///
-/// The data-parcel wire is defined little-endian on every host, so an
-/// L1 scalar is encoded with `to_le_bytes` rather than copied out of
-/// memory. On a little-endian host that is the identity, so the emitted
-/// bytes and the generated code are unchanged; a big-endian host pays a
-/// swap and gains a parcel its peers can read.
-///
-/// This is the *wire* layer only. The kernel command stream
-/// ([`Parcel::write_native`]) and the UAPI structs ([`ParcelPod`]) stay
-/// host-native — the driver parses those with native loads.
+/// A scalar whose *wire* form is little-endian; see module doc "Wire and native scalars".
 pub(crate) trait WireScalar: Copy {
-    /// `[u8; size_of::<Self>()]`, as a type: stable Rust cannot use an
-    /// associated const as an array length in a trait signature.
+    /// `[u8; size_of::<Self>()]`; a type because a const can't size an array in a trait signature.
     type Bytes: AsRef<[u8]>;
 
     fn to_wire(self) -> Self::Bytes;
     fn from_wire(bytes: &[u8]) -> Result<Self>;
 }
 
-/// A scalar of the *kernel command stream* — the `BC_*`/`BR_*` ioctl
-/// buffer, which the driver parses with native loads.
-///
-/// The mirror image of [`WireScalar`], and the reason both exist: the
-/// two layers use the same `Parcel` and the same 4-byte slots, so only
-/// the name at the call site says which contract is in force. A value
-/// crossing to the driver must not be byte-swapped; a value crossing to
-/// a peer must.
+/// Host-native `BC_*`/`BR_*` command-stream scalar; see module doc "Wire and native scalars".
 pub(crate) trait NativeScalar: Copy {
     type Bytes: AsRef<[u8]>;
 
@@ -154,12 +425,7 @@ macro_rules! impl_scalar_codecs {
 }
 impl_scalar_codecs!(i8, u8, i16, u16, i32, u32, i64, u64, u128, f32, f64);
 
-// SAFETY: bindgen `#[repr(C)]` binder-ABI structs whose fields are
-// integers / pointers-as-integers / unions of those, laid out with no
-// padding (8-byte-multiple field groups); every bit pattern is a valid
-// value. The union members are written full-width by their constructors
-// (`binder_object.rs`) and by `write_transaction_data` (`ptr: 0` before
-// `.handle`).
+// SAFETY: padding-free integer-only `#[repr(C)]` structs; see module doc "Binder-ABI structs".
 unsafe impl ParcelPod for flat_binder_object {}
 unsafe impl ParcelPod for crate::sys::binder_transaction_data {}
 unsafe impl ParcelPod for crate::sys::binder_transaction_data_secctx {}
@@ -169,29 +435,7 @@ pub(crate) fn pad_size(len: usize) -> usize {
     (len + 3) & (!3)
 }
 
-/// Compute `(size, padded)` for a wire-encoded array of `len` elements
-/// each of `elem_size` bytes, returning `BadValue` if either
-/// calculation would overflow `usize`.
-///
-/// Used by `Parcel::read_array` / `Parcel::read_array_char` to keep
-/// 32-bit targets (armv7 Android, i686 Linux) safe from a hostile
-/// `len * size_of::<D>()` wrap that the subsequent
-/// `padded > data_avail()` check would otherwise miss — the wrap-to-
-/// small `size` would let the call through to
-/// `Vec::with_capacity(len)` and abort with a capacity-overflow panic
-/// (i.e. a remote DoS via parcel input).
-///
-/// Caller must have validated `len >= 1` already; passing `len < 1`
-/// is a programming error (the result `size` would be `0` which is
-/// indistinguishable from a wrapped-to-zero overflow, so we reject
-/// it as `BadValue` via the `debug_assert!`).
-///
-/// On 64-bit `usize` no realistic `i32` `len` and `elem_size` (which
-/// for any Rust type is at most `isize::MAX = 2^63 - 1`) can make
-/// the multiplication overflow — the worst-case product is far
-/// below `usize::MAX`. The protection is purely 32-bit-target
-/// hardening; the 64-bit codepath is byte-identical to the unchecked
-/// arithmetic.
+/// Overflow-checked `(size, padded)` for `len >= 1` elements; see module doc "Array length checks".
 #[inline]
 pub(crate) fn checked_array_layout(len: i32, elem_size: usize) -> Result<(usize, usize)> {
     debug_assert!(
@@ -201,10 +445,20 @@ pub(crate) fn checked_array_layout(len: i32, elem_size: usize) -> Result<(usize,
     let size = (len as usize)
         .checked_mul(elem_size)
         .ok_or(StatusCode::BadValue)?;
-    // `pad_size` itself can overflow at `size + 3`, so go through
-    // `checked_add` rather than reusing it directly.
+    // `pad_size` would overflow at `size + 3`, hence `checked_add`.
     let padded = size.checked_add(3).ok_or(StatusCode::BadValue)? & !3;
     Ok((size, padded))
+}
+
+/// Byte cap of AOSP `Parcel::readOutVectorSizeWithCheck` for an `out`/`inout` array.
+const MAX_OUT_VEC_BYTES: usize = 1_000_000;
+
+// An out-vec length is not backed by parcel bytes, so it is capped by size, not `data_avail()`.
+fn check_out_vec_size<D>(len: usize) -> Result<()> {
+    match len.checked_mul(std::mem::size_of::<D>()) {
+        Some(bytes) if bytes < MAX_OUT_VEC_BYTES => Ok(()),
+        _ => Err(StatusCode::NoMemory),
+    }
 }
 
 pub(crate) trait CharType: Clone {
@@ -235,7 +489,7 @@ impl CharType for u16 {
 
 pub(crate) enum ParcelData<T: Clone + Default + 'static> {
     Vec(Vec<T>),
-    Slice(&'static mut [T]),
+    Slice(&'static [T]),
 }
 
 impl<T: Clone + Default> ParcelData<T> {
@@ -252,28 +506,15 @@ impl<T: Clone + Default> ParcelData<T> {
         ParcelData::Vec(data)
     }
 
-    /// # Safety
-    ///
-    /// If `data` is non-null, it must be valid for reads and writes of
-    /// `len` `T`-aligned elements, exclusively owned for the lifetime of
-    /// the returned `ParcelData::Slice` (until the surrounding `Parcel`
-    /// is dropped or its `free_buffer` runs). `data == null` with
-    /// `len == 0` is the only well-defined null case.
-    ///
-    /// For an empty IPC parcel the binder driver still allocates a buffer
-    /// and returns its user-space address; that address must be returned
-    /// verbatim in BC_FREE_BUFFER, so we cannot collapse `len == 0` to a
-    /// dangling `&mut []`. Only fall back to `&mut []` when `data` itself
-    /// is null.
+    /// # Safety: null only with `len == 0`; else aligned readable `len` `T`s, exclusive till freed.
+    // A non-null empty buffer stays a slice: see module doc "Kernel receive buffers".
     unsafe fn from_raw_parts_mut(data: *mut T, len: usize) -> Self {
         ParcelData::Slice(if data.is_null() {
             debug_assert_eq!(len, 0, "non-zero length with null data is invalid");
-            &mut []
+            &[]
         } else {
-            // SAFETY: caller upholds the `# Safety` contract — `data` is
-            // non-null, properly aligned, and valid for `len` elements
-            // exclusively owned for the parcel's lifetime.
-            unsafe { std::slice::from_raw_parts_mut(data, len) }
+            // SAFETY: non-null here; the `# Safety` contract covers reads, alignment, exclusivity.
+            unsafe { std::slice::from_raw_parts(data, len) }
         })
     }
 
@@ -285,21 +526,10 @@ impl<T: Clone + Default> ParcelData<T> {
     }
 
     fn as_mut_slice(&mut self) -> &mut [T] {
-        // The `Slice` variant already holds a `&'static mut [T]` —
-        // exclusive, mutable, and granted by the constructor
-        // (`from_raw_parts_mut`, only called on a kernel-supplied
-        // transaction buffer the driver explicitly allows the
-        // userspace to modify in place, e.g. for FD-cookie / handle
-        // patches inside `Parcel::append_from`). The previous
-        // `panic!()` arm was a latent crash: it would have fired on
-        // any `append_from` of a kernel-incoming parcel whose
-        // destination was Slice-backed, since `objects.as_mut_slice()`
-        // and `data.as_mut_slice()` flow through this method. Mirror
-        // the `as_slice` arm and just hand the slice back; the
-        // compiler reborrows it to the lifetime of `&mut self`.
+        // A `Slice` is a read-only kernel mapping: module doc "Kernel receive buffers".
         match self {
             ParcelData::Vec(v) => v.as_mut_slice(),
-            ParcelData::Slice(s) => s,
+            _ => panic!("&[u8] can't support as_mut_slice()."),
         }
     }
 
@@ -313,7 +543,7 @@ impl<T: Clone + Default> ParcelData<T> {
     fn as_mut_ptr(&mut self) -> *mut T {
         match self {
             ParcelData::Vec(ref mut v) => v.as_mut_ptr(),
-            ParcelData::Slice(s) => s.as_mut_ptr(),
+            _ => panic!("&[u8] can't support as_mut_ptr()."),
         }
     }
 
@@ -321,20 +551,10 @@ impl<T: Clone + Default> ParcelData<T> {
         self.as_slice().len()
     }
 
-    /// # Safety
-    ///
-    /// The caller must guarantee `len <= capacity()` **and** that bytes
-    /// `0..len` are initialized. Shrinking always satisfies the second
-    /// half; growing only does when something outside the `Vec` filled
-    /// the spare capacity through [`as_mut_ptr`](Parcel::as_mut_ptr) —
-    /// on this crate's paths, the binder driver writing the read buffer
-    /// in `talk_with_driver`.
+    /// # Safety: `len <= capacity()`, `0..len` initialized (module doc "Kernel receive buffers").
     unsafe fn set_len(&mut self, len: usize) {
         match self {
-            // SAFETY: the caller upholds `len <= capacity` and the
-            // initialization of `0..len` (see the method contract above).
-            // `u8` has no invalid bit patterns, so no per-element
-            // validity obligation remains.
+            // SAFETY: the caller upholds `len <= capacity` and that `0..len` is initialized.
             ParcelData::Vec(v) => unsafe { v.set_len(len) },
             _ => panic!("&[u8] can't support set_len()."),
         }
@@ -365,18 +585,10 @@ impl<T: Clone + Default> ParcelData<T> {
 pub(crate) type FnFreeBuffer =
     fn(Option<&Parcel>, binder_uintptr_t, usize, binder_uintptr_t, usize) -> Result<()>;
 
-/// RPC object-marshalling hooks attached to an RPC-mode `Parcel`
-/// (the rsbinder equivalent of android's `Parcel::mSession`/`RpcState`).
-///
-/// `parcel.rs` only knows this trait; the implementation lives in the
-/// `rpc` module's session/state. When a `Parcel` is in RPC mode the
-/// `SIBinder` (de)serializers route through these hooks instead of the
-/// kernel `flat_binder_object` path — the kernel path is byte-identical
-/// on a kernel-backed parcel.
+/// RPC-mode `SIBinder` (de)serialization hooks, implemented by `rpc` (AOSP `mSession`/`RpcState`).
 #[cfg(feature = "rpc")]
 pub(crate) trait RpcParcelOps: Send + Sync {
-    /// Marshal a possibly-null binder leaving this process: append the
-    /// r34 RPC object encoding (`i32` present flag + 32B address).
+    /// Append a possibly-null binder as the r34 RPC object (`i32` present flag + 32B address).
     fn write_binder(
         &self,
         binder: Option<&crate::binder::SIBinder>,
@@ -384,80 +596,135 @@ pub(crate) trait RpcParcelOps: Send + Sync {
     ) -> Result<()>;
     /// Unmarshal a binder entering this process from the RPC encoding.
     fn read_binder(&self, parcel: &mut Parcel) -> Result<Option<crate::binder::SIBinder>>;
+    /// Give back the `timesSent` bumps of a parcel dropped unsent (AOSP `cancelBinderLeaving`).
+    fn cancel_leaving(&self, addrs: &[crate::rpc::RpcAddress]);
+    /// The session's address (AOSP `RpcFields::mSession`); null for session-less test ops.
+    fn session_id(&self) -> *const ();
+    /// Whether the wire records binder positions (android-16 v2); `DeadObject` after session end.
+    fn records_binder_positions(&self) -> Result<bool>;
+    /// AOSP `appendFrom` `TYPE_BINDER` arm for each copied address (bytes after the type word).
+    fn acquire_copied(&self, objects: &[&[u8]]) -> Result<CopiedBinders>;
+}
+
+/// What [`RpcParcelOps::acquire_copied`] took: bumps the copy settles, proxies it pins.
+#[cfg(feature = "rpc")]
+#[derive(Default)]
+pub(crate) struct CopiedBinders {
+    /// Local nodes bumped once each, recorded in the destination's `leaving_addrs`.
+    pub(crate) leaving: Vec<crate::rpc::RpcAddress>,
+    /// Live proxies of the peer's addresses, held like `write_binder`'s pin.
+    pub(crate) pinned: Vec<crate::binder::SIBinder>,
+}
+
+/// A session `append_from` after its fallible steps: offsets are relative to the copied range.
+#[cfg(feature = "rpc")]
+struct StagedRpcCopy {
+    positions: Vec<usize>,
+    /// Offset of each fd's index word, and the dup that takes that slot.
+    fds: Vec<(usize, std::os::fd::OwnedFd)>,
+    binders: CopiedBinders,
+}
+
+/// AOSP `RpcFields::ObjectType::TYPE_BINDER`, the word at a recorded binder position.
+#[cfg(feature = "rpc")]
+const RPC_TYPE_BINDER: i32 = 1;
+
+/// The little-endian `i32` at `pos`, or `None` past the end of `bytes`.
+#[cfg(feature = "rpc")]
+fn le_i32_at(bytes: &[u8], pos: usize) -> Option<i32> {
+    let word = bytes.get(pos..pos.checked_add(4)?)?;
+    Some(i32::from_le_bytes(word.try_into().ok()?))
+}
+
+/// AOSP `RpcFields::mSendState`; see the module doc "RPC fields".
+#[cfg(feature = "rpc")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub(crate) enum RpcSendState {
+    NotSent = 0,
+    /// Claimed by one `client_transact` or `send_reply_parcel`; a second sender is refused.
+    InFlight = 1,
+    Sent = 2,
+    /// A peer's bytes (AOSP `RECEIVED`): refused as a send, local-binder or `append_from` sink.
+    Received = 3,
+}
+
+#[cfg(feature = "rpc")]
+impl RpcSendState {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::InFlight,
+            2 => Self::Sent,
+            3 => Self::Received,
+            _ => Self::NotSent,
+        }
+    }
 }
 
 /// All non-kernel serialization state of a [`Parcel`] (AOSP `RpcFields`); see the module doc.
 #[derive(Default)]
 struct RpcFields {
-    /// Object-marshalling hooks for RPC mode (android `mSession`
-    /// equivalent). `Some` only on an RPC-mode parcel that will carry
-    /// binders.
+    /// Object-marshalling hooks (AOSP `mSession`); `Some` only on a parcel that carries binders.
     #[cfg(feature = "rpc")]
     ops: Option<std::sync::Arc<dyn RpcParcelOps>>,
-    /// Negotiated FD-over-RPC mode. Default `None` ⇒ FD writes are
-    /// rejected, bit-identical to a parcel that carries no FDs.
+    /// Negotiated FD-over-RPC mode; the default `None` rejects FD writes.
     #[cfg(feature = "rpc")]
     fd_mode: crate::rpc::FileDescriptorTransportMode,
-    /// FDs collected while serializing this (outgoing) RPC parcel in
-    /// `Unix` fd-mode — sent out-of-band via `SCM_RIGHTS`.
+    /// Outgoing fds (`Unix` fd-mode), sent out-of-band via `SCM_RIGHTS`, closed on drop.
     #[cfg(feature = "rpc")]
     fds_out: Vec<std::os::fd::OwnedFd>,
-    /// FDs received out-of-band with this (incoming) RPC parcel,
-    /// indexed by the in-body fd-table index.
+    /// Incoming out-of-band fds, indexed by the in-body fd-table index.
     #[cfg(feature = "rpc")]
     fds_in: Vec<Option<std::os::fd::OwnedFd>>,
-    /// AOSP `RpcFields::mObjectPositions` — sorted byte offsets of
-    /// flattened RPC objects (binder at android-16 v2, FD at v1+),
-    /// produced by `write_binder` / FD-write while serializing an
-    /// RPC-mode parcel and consumed by the wire codec as the trailing
-    /// `u32[]` object table. The kernel path never touches it (kernel
-    /// objects live in [`Parcel::objects`]); empty ⇒ byte-identical to
-    /// a wire with no object table.
+    /// AOSP `mObjectPositions`: sorted RPC object offsets; see module doc "RPC fields".
     #[cfg(feature = "rpc")]
     object_positions: Vec<u32>,
-    /// Whether an FD flattened into this parcel records its position
-    /// in `object_positions`. The session sets this from its wire
-    /// profile alongside the FD mode: `true` only on the android-13+
-    /// v1+ profile (R34 has no object table). Binder positions are
-    /// recorded by the session directly (it owns the profile); only
-    /// the FD path needs this Parcel-side flag.
+    /// Whether a flattened FD records its position (android-13+ v1+ profile only).
     #[cfg(feature = "rpc")]
     record_fd_positions: bool,
-    /// Session addresses of local binders that bumped their `timesSent`
-    /// (`RpcState::on_binder_leaving`) while being flattened into this
-    /// outgoing parcel. If the send then fails, the session rolls each back
-    /// (`cancel_binder_leaving`) so the unreceived binder's node does not leak.
-    /// Write-only on the success path (the peer's DEC balances the bumps), so
-    /// the wire is byte-unchanged.
+    /// Local binders whose `timesSent` this parcel bumped; settled by `Drop` unless it was sent.
     #[cfg(feature = "rpc")]
     leaving_addrs: Vec<crate::rpc::RpcAddress>,
-    /// Remote proxies flattened into this outgoing parcel, held until the
-    /// parcel is dropped so their `DEC_STRONG` cannot overtake the send
-    /// that names them (AOSP keeps argument refs until the reply is out).
+    /// AOSP `mSendState`; `NotSent` owns `leaving_addrs`, `Sent` handed them to the peer.
+    #[cfg(feature = "rpc")]
+    send_state: std::sync::atomic::AtomicU8,
+    /// Remote proxies held until drop, so their `DEC_STRONG` cannot overtake this send.
     #[cfg(feature = "rpc")]
     pinned: Vec<crate::binder::SIBinder>,
+    /// AOSP `mAcquiredEnteringBinders`: what each object position entered, sorted by position.
+    #[cfg(feature = "rpc")]
+    entered: Vec<(u32, crate::rpc::RpcAddress, crate::binder::SIBinder)>,
+    /// Data length when marked `Received`; a binder past it did not arrive with the parcel.
+    #[cfg(feature = "rpc")]
+    received_len: usize,
 }
 
-/// The behaviour of the RPC serialization state lives here so that the
-/// `impl Parcel` accessors stay thin `Option`-lifting wrappers and the
-/// real logic is unit-cohesive on `RpcFields`. These are private to
-/// `parcel.rs`: callers always go through the matching `Parcel::rpc_*`
-/// method (which decides the kernel-mode no-op / default), keeping each
-/// `&mut self` borrow short enough to interleave with `Parcel::write`.
+/// Logic behind the `Parcel::rpc_*` accessors, which pick the kernel-mode no-op/default.
 #[cfg(feature = "rpc")]
 impl RpcFields {
-    /// Record an RPC object's start offset, keeping the table sorted
-    /// (AOSP `mObjectPositions.insert(upper_bound(...), dataPos)`).
-    /// `upper_bound` ⇒ O(1) push on the common ascending-write path.
+    fn send_state(&self) -> RpcSendState {
+        RpcSendState::from_u8(self.send_state.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// Unless `Sent`, hand the recorded bumps back once; `InFlight` here is a claim a panic left.
+    fn settle_unsent(&mut self) {
+        if self.send_state() == RpcSendState::Sent || self.leaving_addrs.is_empty() {
+            return;
+        }
+        let addrs = std::mem::take(&mut self.leaving_addrs);
+        if let Some(ops) = &self.ops {
+            ops.cancel_leaving(&addrs);
+        }
+    }
+
+    /// Sorted insert at the `upper_bound` (AOSP), an O(1) push on ascending writes.
     fn record_object_position(&mut self, pos: usize) {
         let pos = pos as u32;
         let at = self.object_positions.partition_point(|&p| p <= pos);
         self.object_positions.insert(at, pos);
     }
 
-    /// AOSP `unflattenBinder` v2 strict check: the position must be in
-    /// the (sorted) object table (`binary_search`). A forged/unsorted
-    /// table simply misses ⇒ caller returns `BAD_VALUE`.
+    /// AOSP `unflattenBinder` v2 strict check; a forged/unsorted table misses (`BAD_VALUE`).
     fn object_position_present(&self, pos: usize) -> bool {
         let Ok(pos) = u32::try_from(pos) else {
             return false;
@@ -465,8 +732,7 @@ impl RpcFields {
         self.object_positions.binary_search(&pos).is_ok()
     }
 
-    /// Stash an outgoing fd (already an owned dup); return its in-body
-    /// table index.
+    /// Stash an outgoing fd (already an owned dup); return its in-body table index.
     fn push_out_fd(&mut self, fd: std::os::fd::OwnedFd) -> i32 {
         let idx = self.fds_out.len() as i32;
         self.fds_out.push(fd);
@@ -482,12 +748,19 @@ impl RpcFields {
     fn take_in_fd(&mut self, index: usize) -> Option<std::os::fd::OwnedFd> {
         self.fds_in.get_mut(index).and_then(Option::take)
     }
+
+    /// The fd a copy dups for table `index`: a received table if there is one, else the outgoing.
+    fn source_fd(&self, index: usize) -> Option<std::os::fd::BorrowedFd<'_>> {
+        use std::os::fd::AsFd;
+        if self.fds_in.is_empty() {
+            self.fds_out.get(index).map(AsFd::as_fd)
+        } else {
+            self.fds_in.get(index)?.as_ref().map(AsFd::as_fd)
+        }
+    }
 }
 
-/// Maximum [`Parcel::sized_read`] nesting depth. Bounds recursion through
-/// self-referential parcelables so a hostile deeply-nested payload cannot
-/// overflow the worker-thread stack. Set far above any legitimate AIDL
-/// nesting; conforming traffic never reaches it.
+/// Max [`Parcel::sized_read`] nesting; stops a hostile nested payload before stack overflow.
 const MAX_NESTED_READ_DEPTH: usize = 1000;
 
 /// Parcel converts data into a byte stream (serialization), making it transferable.
@@ -519,29 +792,17 @@ pub struct Parcel {
     pub(crate) objects: ParcelData<binder_size_t>,
     pos: usize,
     next_object_hint: usize,
-    /// End offset of the innermost active [`Parcel::sized_read`] block;
-    /// `None` when not inside one (⇒ [`Parcel::has_more_data`] uses the
-    /// full buffer length). Lets a version-N reader stop at the parcelable
-    /// boundary written by a version-M (< N) peer instead of reading into
-    /// trailing bytes — the stable-AIDL forward-compatibility read path,
-    /// paired with the per-field `has_more_data()` guards emitted in
-    /// generated `read_from_parcel`.
+    /// End of the innermost [`Parcel::sized_read`] block, which bounds [`Parcel::has_more_data`].
     read_boundary: Option<usize>,
-    /// Current [`Parcel::sized_read`] nesting depth. A self-referential
-    /// parcelable (e.g. AIDL `RecursiveList`) recurses through `sized_read`
-    /// on read, so a hostile deeply-nested payload would overflow the
-    /// worker-thread stack (a hard `SIGABRT`, not a recoverable error).
-    /// Capped at [`MAX_NESTED_READ_DEPTH`]; see [`Parcel::sized_read`].
+    /// Current [`Parcel::sized_read`] depth, capped at [`MAX_NESTED_READ_DEPTH`].
     nested_read_depth: usize,
     request_header_present: bool,
     work_source_request_header_pos: usize,
     free_buffer: Option<FnFreeBuffer>,
-    /// RPC serialization state, or `None` for the kernel path
-    /// (byte-identical to the kernel wire, and what
-    /// [`Parcel::is_kernel_backed`] reports). Only object marshalling and the
-    /// object/FD lifetime branch on this; scalar/string/POD paths are
-    /// unaffected. See [`RpcFields`].
+    /// RPC state, `None` on the kernel path; only objects and FDs branch on it. See [`RpcFields`].
     rpc: Option<RpcFields>,
+    /// Kernel proxies written here, held strong until the parcel drops (AOSP `acquire_object`).
+    kernel_pinned: Vec<crate::binder::SIBinder>,
 }
 
 impl Default for Parcel {
@@ -569,13 +830,19 @@ impl Parcel {
             work_source_request_header_pos: 0,
             free_buffer: None,
             rpc: None,
+            kernel_pinned: Vec::new(),
         }
     }
 
     /// # Safety
-    /// - `data` must be valid for reads/writes of `length` bytes, or null if `length` is 0
-    /// - `objects` must be valid for reads/writes of `object_count` elements, or null if `object_count` is 0
+    /// - `data` must be valid for reads of `length` bytes, or null if `length` is 0
+    /// - `objects` must be valid for reads of `object_count` elements, or null if `object_count` is 0
+    /// - Neither pointer needs alignment. A 32-bit kernel places the offsets array at
+    ///   `ALIGN(data_size, sizeof(void *))`, 4 bytes, so `objects` may be misaligned for
+    ///   `binder_size_t` (`u64`); such an array is copied out instead of borrowed
     /// - The memory must remain valid until the Parcel is dropped or `free_buffer` is called
+    /// - Neither buffer may be accessed through any other pointer or reference, nor passed to
+    ///   another `from_ipc_parts` call, until the Parcel is dropped or `free_buffer` is called
     pub unsafe fn from_ipc_parts(
         data: *mut u8,
         length: usize,
@@ -590,8 +857,19 @@ impl Parcel {
         ) -> Result<()>,
     ) -> Self {
         Parcel {
-            data: ParcelData::from_raw_parts_mut(data, length),
-            objects: ParcelData::from_raw_parts_mut(objects, object_count),
+            // SAFETY: `# Safety`: `data` readable, unshared until freed; `u8` needs no alignment.
+            data: unsafe { ParcelData::from_raw_parts_mut(data, length) },
+            objects: if (objects as usize) % std::mem::align_of::<binder_size_t>() == 0 {
+                // SAFETY: `# Safety`: `objects` readable, unshared; alignment checked above.
+                unsafe { ParcelData::from_raw_parts_mut(objects, object_count) }
+            } else {
+                ParcelData::Vec(
+                    (0..object_count)
+                        // SAFETY: `# Safety` makes `object_count` elements readable; no alignment.
+                        .map(|i| unsafe { objects.add(i).read_unaligned() })
+                        .collect(),
+                )
+            },
             pos: 0,
             next_object_hint: 0,
             read_boundary: None,
@@ -600,6 +878,7 @@ impl Parcel {
             work_source_request_header_pos: 0,
             free_buffer: Some(free_buffer),
             rpc: None,
+            kernel_pinned: Vec::new(),
         }
     }
 
@@ -611,53 +890,29 @@ impl Parcel {
             next_object_hint: 0,
             read_boundary: None,
             nested_read_depth: 0,
-            // objects: ptr::null_mut(),
-            // object_count: 0,
             request_header_present: false,
             work_source_request_header_pos: 0,
             free_buffer: None,
             rpc: None,
+            kernel_pinned: Vec::new(),
         }
     }
 
-    /// A parcel that refuses binder objects and file descriptors, so the
-    /// bytes it produces carry no reference to anything in this process.
-    ///
-    /// It is the session-less RPC mode — the same mode the RPC transport
-    /// uses, without the session that would give a binder somewhere to
-    /// go. With no ops attached and `fd_mode` left at `None`, the RPC
-    /// write paths reject a binder and an fd on their own, and
-    /// `append_from` — the one path that copies another parcel's bytes
-    /// wholesale — carries its own write-time refusal for them. All of
-    /// them refuse before anything is written, which is why there is no
-    /// second check on the finished bytes to keep in step with them.
-    /// Not behind `rpc`: the refusals follow from the missing session, not from the transport.
+    /// A parcel that refuses binders and fds; see module doc "Data-only parcels".
     pub(crate) fn new_data_only() -> Self {
         let mut p = Parcel::new();
         p.set_for_rpc(true);
         p
     }
 
-    /// A data-only parcel over a copy of `bytes`, positioned at the start.
-    ///
-    /// Data-only matters on the read side too: it makes `read_object` an
-    /// immediate `BadType`, so a forged `flat_binder_object` in the input
-    /// cannot become a binder.
+    /// A data-only parcel over a copy of `bytes`; a forged object in it reads as `BadType`.
     pub(crate) fn from_slice(bytes: &[u8]) -> Self {
         let mut p = Parcel::from_vec(bytes.to_vec());
         p.set_for_rpc(true);
         p
     }
 
-    /// `true` when nothing in this parcel refers to something in this
-    /// process — no kernel object-table entry, no RPC object position, no
-    /// out-of-band fd. Only then do the bytes mean the same thing
-    /// anywhere else.
-    ///
-    /// All three have to be checked. The kernel object table is empty by
-    /// construction on an RPC parcel, so a check of that alone would hand
-    /// out the bytes of a parcel carrying binders — bytes that are
-    /// meaningless without the object table that travelled beside them.
+    /// No kernel object, RPC object position or out-of-band fd (all three: see module doc).
     pub(crate) fn is_self_contained(&self) -> bool {
         if self.objects.len() != 0 {
             return false;
@@ -669,9 +924,7 @@ impl Parcel {
         true
     }
 
-    /// The encoded bytes, or `Err(BadType)` if the parcel carries a
-    /// process-local reference ([`Parcel::is_self_contained`]). Cannot
-    /// fail on a parcel from [`Parcel::new_data_only`].
+    /// The bytes, or `BadType` unless [`Parcel::is_self_contained`] (always true if data-only).
     pub(crate) fn as_bytes(&self) -> Result<&[u8]> {
         if !self.is_self_contained() {
             return Err(StatusCode::BadType);
@@ -692,7 +945,7 @@ impl Parcel {
         self.data.as_ptr()
     }
 
-    /// `len`, not `data_size()` (= `max(len, pos)`): a forward `set_data_position` must not make the driver copy past the allocation.
+    /// `len`, not `data_size()` (`max(len, pos)`), which a forward seek pushes past the buffer.
     pub(crate) fn ipc_data_size(&self) -> usize {
         self.data.len()
     }
@@ -705,16 +958,17 @@ impl Parcel {
         self.pos >= self.data.len()
     }
 
-    /// Switch this parcel between the kernel and RPC serialization
-    /// modes. Default is kernel mode; only object
-    /// marshalling and the object/FD lifetime branch on this — scalar,
-    /// string and POD bytes are identical in both modes.
+    /// Switch between kernel (default) and RPC mode; scalar/string/POD bytes are identical in both.
     pub(crate) fn set_for_rpc(&mut self, yes: bool) {
         if yes {
-            // Idempotent: preserve any RpcFields already configured
-            // (e.g. via a prior `attach_rpc_ops`).
+            // Keep any `RpcFields` already configured, e.g. by an earlier `attach_rpc_ops`.
             self.rpc.get_or_insert_with(RpcFields::default);
         } else {
+            // The fields go away with the mode: an unsent parcel's bumps go back first.
+            #[cfg(feature = "rpc")]
+            if let Some(rpc) = self.rpc.as_mut() {
+                rpc.settle_unsent();
+            }
             self.rpc = None;
         }
     }
@@ -795,21 +1049,13 @@ impl Parcel {
         !self.is_kernel_backed()
     }
 
-    /// Attach the RPC object-marshalling hooks and enter RPC mode
-    /// (android `Parcel::markForRpc`/`mSession` equivalent).
+    /// Attach the RPC hooks and enter RPC mode (AOSP `Parcel::markForRpc`/`mSession`).
     #[cfg(feature = "rpc")]
     pub(crate) fn attach_rpc_ops(&mut self, ops: std::sync::Arc<dyn RpcParcelOps>) {
         self.rpc.get_or_insert_with(RpcFields::default).ops = Some(ops);
     }
 
-    /// Configure the session's RPC profile on this parcel in one call:
-    /// enter RPC mode + attach the object hooks, then stamp the
-    /// negotiated FD transport mode and position-recording flag.
-    /// Collapses the `attach_rpc_ops` + `set_rpc_fd_mode` +
-    /// `set_rpc_record_fd_positions` triple that every proxy/session
-    /// parcel-setup site otherwise repeats verbatim. The per-message
-    /// `rpc_set_in_fds` / `rpc_set_object_positions` stay separate —
-    /// they carry wire payload, not the session profile.
+    /// Enter RPC mode with the session profile: hooks, FD mode, FD-position recording.
     #[cfg(feature = "rpc")]
     pub(crate) fn configure_rpc(
         &mut self,
@@ -836,10 +1082,7 @@ impl Parcel {
 
     // ---- RPC object table (android-16 v2) --------------------------
 
-    /// The sorted object-position table (AOSP `mObjectPositions`),
-    /// consumed by the wire codec as a trailing `u32[]`. Always empty
-    /// on a kernel-backed parcel and when no RPC object was
-    /// flattened — i.e. byte-identical to a wire with no object table.
+    /// Sorted object positions (AOSP `mObjectPositions`); empty if kernel-backed or objectless.
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_object_positions(&self) -> &[u32] {
         self.rpc
@@ -847,10 +1090,7 @@ impl Parcel {
             .map_or(&[], |r| r.object_positions.as_slice())
     }
 
-    /// Install the object table that arrived with an incoming RPC
-    /// parcel (AOSP `rpcSetDataReference`'s `mObjectPositions` copy),
-    /// so the binder/FD deserializers can validate object positions.
-    /// No-op on a kernel-backed parcel.
+    /// Install an incoming object table (AOSP `rpcSetDataReference`); no-op if kernel-backed.
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_set_object_positions(&mut self, positions: Vec<u32>) {
         if let Some(rpc) = self.rpc.as_mut() {
@@ -858,9 +1098,7 @@ impl Parcel {
         }
     }
 
-    /// Record that flattening a local binder into this outgoing RPC parcel
-    /// bumped its `timesSent` for the address `addr`, so a later send failure
-    /// can roll the bump back. No-op kernel-side.
+    /// Record a `timesSent` bump for `addr`, settled by `Drop` unless it was sent; kernel: no-op.
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_record_leaving_addr(&mut self, addr: crate::rpc::RpcAddress) {
         if let Some(rpc) = self.rpc.as_mut() {
@@ -868,8 +1106,109 @@ impl Parcel {
         }
     }
 
-    /// Keep `binder` alive for this parcel's lifetime (see
-    /// `RpcFields::pinned`).
+    /// The session whose ops this parcel carries ([`RpcParcelOps::session_id`]); `None` if none.
+    #[cfg(feature = "rpc")]
+    pub(crate) fn rpc_session_id(&self) -> Option<*const ()> {
+        self.rpc.as_ref()?.ops.as_ref().map(|ops| ops.session_id())
+    }
+
+    /// Whether a binder may still be written for sending: kernel parcels always, RPC `NotSent`.
+    #[cfg(feature = "rpc")]
+    pub(crate) fn rpc_is_unsent(&self) -> bool {
+        self.rpc
+            .as_ref()
+            .is_none_or(|r| r.send_state() == RpcSendState::NotSent)
+    }
+
+    /// Mark a parcel built from a peer's bytes (AOSP `rpcSetDataReference`), so it is not resent.
+    #[cfg(feature = "rpc")]
+    pub(crate) fn rpc_mark_received(&mut self) {
+        let len = self.data.len();
+        if let Some(rpc) = self.rpc.as_mut() {
+            rpc.send_state.store(
+                RpcSendState::Received as u8,
+                std::sync::atomic::Ordering::Release,
+            );
+            rpc.received_len = len;
+        }
+    }
+
+    /// Whether a binder at `pos` arrived with this parcel, so a read enters it (module doc).
+    #[cfg(feature = "rpc")]
+    pub(crate) fn rpc_received_at(&self, pos: usize) -> bool {
+        self.rpc
+            .as_ref()
+            .is_some_and(|r| r.send_state() == RpcSendState::Received && pos < r.received_len)
+    }
+
+    /// What object position `pos` entered on an earlier read (AOSP `mAcquiredEnteringBinders`).
+    #[cfg(feature = "rpc")]
+    pub(crate) fn rpc_entered_at(
+        &self,
+        pos: usize,
+    ) -> Option<(crate::rpc::RpcAddress, crate::binder::SIBinder)> {
+        let rpc = self.rpc.as_ref()?;
+        let pos = u32::try_from(pos).ok()?;
+        let at = rpc.entered.binary_search_by_key(&pos, |e| e.0).ok()?;
+        let (_, addr, binder) = &rpc.entered[at];
+        Some((*addr, binder.clone()))
+    }
+
+    /// Record that position `pos` entered `binder` at `addr`; the parcel holds it until it drops.
+    #[cfg(feature = "rpc")]
+    pub(crate) fn rpc_record_entered(
+        &mut self,
+        pos: usize,
+        addr: crate::rpc::RpcAddress,
+        binder: crate::binder::SIBinder,
+    ) {
+        let (Some(rpc), Ok(pos)) = (self.rpc.as_mut(), u32::try_from(pos)) else {
+            return;
+        };
+        match rpc.entered.binary_search_by_key(&pos, |e| e.0) {
+            Ok(at) => rpc.entered[at] = (pos, addr, binder),
+            Err(at) => rpc.entered.insert(at, (pos, addr, binder)),
+        }
+    }
+
+    /// Claim this parcel for one send; `InvalidOperation` unless `NotSent`; kernel: always `Ok`.
+    #[cfg(feature = "rpc")]
+    pub(crate) fn rpc_begin_send(&self) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let Some(rpc) = self.rpc.as_ref() else {
+            return Ok(());
+        };
+        match rpc.send_state.compare_exchange(
+            RpcSendState::NotSent as u8,
+            RpcSendState::InFlight as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(state) => {
+                let state = RpcSendState::from_u8(state);
+                log::error!("RPC: a parcel is sent once; build a new request (state {state:?})");
+                Err(StatusCode::InvalidOperation)
+            }
+        }
+    }
+
+    /// Release the claim: `sent` hands `leaving_addrs` to the peer, `!sent` returns to `NotSent`.
+    #[cfg(feature = "rpc")]
+    pub(crate) fn rpc_end_send(&self, sent: bool) {
+        let Some(rpc) = self.rpc.as_ref() else {
+            return;
+        };
+        let next = if sent {
+            RpcSendState::Sent
+        } else {
+            RpcSendState::NotSent
+        };
+        rpc.send_state
+            .store(next as u8, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Keep `binder` alive for this parcel's lifetime (see `RpcFields::pinned`).
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_pin_binder(&mut self, binder: crate::binder::SIBinder) {
         if let Some(rpc) = self.rpc.as_mut() {
@@ -877,21 +1216,7 @@ impl Parcel {
         }
     }
 
-    /// The local-binder addresses whose `timesSent` this parcel bumped while
-    /// serializing (see [`Parcel::rpc_record_leaving_addr`]). Empty kernel-side
-    /// or when no local binder was flattened.
-    #[cfg(feature = "rpc")]
-    pub(crate) fn rpc_leaving_addrs(&self) -> &[crate::rpc::RpcAddress] {
-        self.rpc
-            .as_ref()
-            .map_or(&[], |r| r.leaving_addrs.as_slice())
-    }
-
-    /// AOSP `Parcel::unflattenBinder` v2 strict check: a binder may
-    /// only be read from a position that is in the object table
-    /// (`std::binary_search(mObjectPositions, objectPos)`). The table
-    /// arrives sorted from a conformant peer; an unsorted/forged table
-    /// simply fails the search ⇒ the caller returns `BAD_VALUE` (safe).
+    /// AOSP `unflattenBinder` v2: a binder is read only at a listed position (module doc).
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_object_position_present(&self, pos: usize) -> bool {
         self.rpc
@@ -899,17 +1224,7 @@ impl Parcel {
             .is_some_and(|r| r.object_position_present(pos))
     }
 
-    /// Record the start offset of an RPC object just flattened into
-    /// this parcel, keeping the table sorted (AOSP
-    /// `Parcel::flattenBinder`/`writeFileDescriptor`:
-    /// `mObjectPositions.insert(upper_bound(...), dataPos)`).
-    ///
-    /// **Refused on a kernel-backed parcel**: a stray call there
-    /// is a no-op, so the kernel wire can never grow an object table.
-    /// The producer only calls this from the RPC `write_binder` /
-    /// FD-write paths, and the caller decides *whether* to record
-    /// (binder ⇒ v2 only; FD ⇒ v1+), faithfully mirroring AOSP's
-    /// per-call version gate.
+    /// Record a flattened RPC object's offset; no-op if kernel-backed (module doc "RPC fields").
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_record_object_position(&mut self, pos: usize) {
         if let Some(rpc) = self.rpc.as_mut() {
@@ -919,12 +1234,7 @@ impl Parcel {
 
     // ---- FD-over-RPC (opt-in, Unix mode) ---------------------------
 
-    /// Set the negotiated FD-over-RPC mode for this parcel (default
-    /// `None` ⇒ FD write is rejected, bit-identical).
-    ///
-    /// Production builds a parcel through `configure_rpc` instead,
-    /// which sets mode and position-recording together; the two setters
-    /// exist for a test or fuzz target that wants one without a session.
+    /// Test/fuzz setter for the FD mode; production uses `configure_rpc`.
     #[cfg(all(feature = "rpc", any(test, feature = "fuzzing")))]
     pub(crate) fn set_rpc_fd_mode(&mut self, mode: crate::rpc::FileDescriptorTransportMode) {
         if let Some(rpc) = self.rpc.as_mut() {
@@ -938,10 +1248,7 @@ impl Parcel {
         self.rpc.as_ref().map_or(Default::default(), |r| r.fd_mode)
     }
 
-    /// Set by the session from its wire profile (alongside the FD
-    /// mode): record FD object positions only on the android-13+ v1+
-    /// profile. R34 stays `false` ⇒ the FD-over-RPC wire is
-    /// byte-unchanged.
+    /// Test/fuzz setter for FD-position recording; production uses `configure_rpc`.
     #[cfg(all(feature = "rpc", any(test, feature = "fuzzing")))]
     pub(crate) fn set_rpc_record_fd_positions(&mut self, yes: bool) {
         if let Some(rpc) = self.rpc.as_mut() {
@@ -955,26 +1262,17 @@ impl Parcel {
         self.rpc.as_ref().is_some_and(|r| r.record_fd_positions)
     }
 
-    /// Stash an outgoing fd (already an owned dup) and return its
-    /// in-body table index. Called by `ParcelFileDescriptor::serialize`
-    /// only in `Unix` fd-mode.
+    /// Stash an outgoing fd and return its index (`ParcelFileDescriptor`, `Unix` fd-mode).
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_push_out_fd(&mut self, fd: std::os::fd::OwnedFd) -> i32 {
-        // Only ever reached from the RPC `Unix` fd-write path (guarded
-        // by `is_kernel_backed()` upstream), so RPC mode is a hard
-        // precondition — a stray kernel-parcel call is a programming
-        // error, and returning a bogus index would be worse than a
-        // clear panic.
+        // Callers are RPC-only: a kernel parcel here is a bug; a panic beats a bogus index.
         self.rpc
             .as_mut()
             .expect("rpc_push_out_fd on kernel parcel")
             .push_out_fd(fd)
     }
 
-    /// Borrow the collected outgoing fds. The session sends them
-    /// out-of-band via `SCM_RIGHTS`; the parcel keeps ownership and
-    /// closes them on drop (after the send completes — the peer
-    /// already has its own dup'd copies via the kernel).
+    /// Outgoing fds for `SCM_RIGHTS`; the parcel keeps ownership and closes them on drop.
     #[cfg(feature = "rpc")]
     pub(crate) fn rpc_out_fds(&self) -> &[std::os::fd::OwnedFd] {
         self.rpc.as_ref().map_or(&[], |r| r.fds_out.as_slice())
@@ -994,7 +1292,7 @@ impl Parcel {
         self.rpc.as_mut().and_then(|r| r.take_in_fd(index))
     }
 
-    /// Shrink only: growing would claim uninitialized bytes (`set_data_size_driver_filled` is the one legitimate grow).
+    /// Shrink only; the one grow over initialized bytes is `set_data_size_driver_filled`.
     pub(crate) fn set_data_size(&mut self, new_len: usize) -> Result<()> {
         if new_len > self.data.len() {
             log::error!(
@@ -1003,9 +1301,7 @@ impl Parcel {
             );
             return Err(StatusCode::BadValue);
         }
-        // SAFETY: `new_len <= self.data.len() <= capacity`, and `0..new_len`
-        // is a prefix of the already-initialized region, so both halves of
-        // `ParcelData::set_len`'s contract hold.
+        // SAFETY: shrinking only, so `0..new_len` is an initialized prefix within capacity.
         unsafe { self.data.set_len(new_len) };
         if new_len < self.pos {
             self.pos = new_len;
@@ -1013,27 +1309,17 @@ impl Parcel {
         Ok(())
     }
 
-    /// Publish `new_len` bytes that were written into this parcel's spare
-    /// capacity from outside the `Vec` — i.e. by the binder driver filling
-    /// the read buffer it was handed via [`as_mut_ptr`](Self::as_mut_ptr).
-    ///
-    /// # Safety
-    ///
-    /// Bytes `0..new_len` must be initialized. `talk_with_driver` upholds
-    /// this by passing `read_consumed`, the count the driver reports having
-    /// written.
+    /// # Safety: bytes `0..new_len` initialized (the driver's `read_consumed`); see module doc.
     pub(crate) unsafe fn set_data_size_driver_filled(&mut self, new_len: usize) -> Result<()> {
         if new_len > self.data.capacity() {
-            // The driver claims to have written more than the buffer holds —
-            // a broken driver/buffer contract, not something to trust.
+            // A driver claiming more bytes than the buffer holds broke the contract.
             log::error!(
                 "set_data_size_driver_filled({new_len}) exceeds capacity {}",
                 self.data.capacity()
             );
             return Err(StatusCode::BadValue);
         }
-        // SAFETY: bounded by `capacity` just above, and the caller
-        // guarantees `0..new_len` was initialized by the driver.
+        // SAFETY: within capacity (checked above); the caller vouches `0..new_len` is initialized.
         unsafe { self.data.set_len(new_len) };
         if new_len < self.pos {
             self.pos = new_len;
@@ -1042,8 +1328,7 @@ impl Parcel {
     }
 
     pub(crate) fn close_file_descriptors(&self) {
-        // RPC-mode parcels never carry kernel FD objects (FD over RPC
-        // is rejected by default / opt-in via Unix mode); nothing to close here.
+        // RPC-mode parcels never carry kernel FD objects; nothing to close here.
         if self.rpc.is_some() {
             return;
         }
@@ -1177,9 +1462,7 @@ impl Parcel {
     }
 
     pub fn data_avail(&self) -> usize {
-        // `pos` can legitimately be moved past `len` (set_data_position is
-        // unbounded), so saturate instead of underflow-panicking: nothing
-        // is available once the cursor is at/after the end.
+        // `pos` may sit past `len` after a seek, so saturate: nothing is available there.
         let result = self.data.len().saturating_sub(self.pos);
         assert!(result < i32::MAX as _, "data too big: {result}");
 
@@ -1203,10 +1486,7 @@ impl Parcel {
     }
 
     pub(crate) fn read_object(&mut self, null_meta: bool) -> Result<flat_binder_object> {
-        // The kernel offset-table scan below is meaningless for an
-        // RPC-mode parcel (RPC carries `RpcAddress`, not
-        // `flat_binder_object`). Reaching here in RPC mode is a
-        // protocol error, not a silent mis-read.
+        // RPC parcels carry no `flat_binder_object`: an object read here is a protocol error.
         if self.rpc.is_some() {
             return Err(StatusCode::BadType);
         }
@@ -1295,10 +1575,7 @@ impl Parcel {
         }
         self.nested_read_depth += 1;
 
-        // Bound `has_more_data()` to this block while the closure runs, so a
-        // newer reader stops at a shorter (older-peer) parcelable's end
-        // rather than reading trailing bytes. Saved/restored to support
-        // nested parcelables.
+        // Bound `has_more_data()` to this block for the closure; restored after, for nesting.
         let prev_boundary = self.read_boundary;
         self.read_boundary = Some(end);
         let result = f(self);
@@ -1306,8 +1583,7 @@ impl Parcel {
         self.nested_read_depth -= 1;
         result?;
 
-        // Advance the data position to the actual end,
-        // in case the closure read less data than was available
+        // Skip to the block end even if the closure read less.
         self.set_data_position(end);
 
         Ok(())
@@ -1340,14 +1616,7 @@ impl Parcel {
             return Ok(Some(Vec::new()));
         }
 
-        // Checked arithmetic — protects 32-bit `usize` targets (armv7
-        // Android, i686 Linux) from a hostile `len * size_of::<D>()`
-        // wrapping past `usize::MAX`. Without these guards, a wrap-to-
-        // small `size` would sail past the `padded > data_avail()`
-        // check below and only fail later inside `Vec::with_capacity`
-        // (capacity-overflow panic = DoS). On 64-bit `usize` the
-        // multiplication is mathematically incapable of overflowing
-        // for any `i32` `len`, so the new path is identical there.
+        // Checked so a hostile `len` cannot wrap `size` on 32-bit; see `checked_array_layout`.
         let (size, padded) = checked_array_layout(len, std::mem::size_of::<D>())?;
 
         if padded > self.data_avail() {
@@ -1368,17 +1637,8 @@ impl Parcel {
             .get(pos..pos + size)
             .ok_or(StatusCode::NotEnoughData)?;
 
-        // SAFETY: We have verified bounds through data_slice.get()
-        // - data_slice is a valid slice of exactly `size` bytes
-        // - result has capacity for `len` elements
-        // - copy_nonoverlapping copies exactly `size` bytes
-        // - setting length to `len` is valid as we just initialized those elements
-        // - `D: ParcelPod` means every bit pattern the peer sent is a valid
-        //   `D`, so the copied bytes need no per-element validation — and
-        //   for the same reason they may be permuted as `u8` and read back
-        //   as `D` (the byte-order fix-up below, over the `size` bytes just
-        //   written through this very pointer)
         let mut result = Vec::with_capacity(len as usize);
+        // SAFETY: `data_slice` is `size` = `len` `D`s; `result` has capacity `len`; `D: ParcelPod`.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 data_slice.as_ptr(),
@@ -1387,13 +1647,7 @@ impl Parcel {
             );
             result.set_len(len as usize);
 
-            // The wire is little-endian, so on a little-endian host the
-            // bulk copy *is* the decode: both conditions below are
-            // compile-time constants (the width per monomorphization), so
-            // that build emits the memcpy alone. A big-endian host reverses
-            // each element in place — which also covers `f32`/`f64`, which
-            // have no `swap_bytes`. `size == len * size_of::<D>()` exactly
-            // (`checked_array_layout`), so no remainder.
+            // On LE hosts the memcpy is the decode; BE hosts reverse each element (f32/f64 too).
             if cfg!(target_endian = "big") && std::mem::size_of::<D>() > 1 {
                 let bytes = std::slice::from_raw_parts_mut(result.as_mut_ptr() as *mut u8, size);
                 for chunk in bytes.chunks_exact_mut(std::mem::size_of::<D>()) {
@@ -1422,12 +1676,7 @@ impl Parcel {
             return Ok(Some(Vec::new()));
         }
 
-        // See `read_array` — checked arithmetic guards 32-bit `usize`
-        // against a hostile `len` wrapping past `usize::MAX` before
-        // the `padded > data_avail()` check can catch it. Wire
-        // element size is always 4 (i32) for the char-array codecs,
-        // matching the `let size = len * 4` shape that lived here
-        // before this hardening.
+        // Checked as in `read_array`; a char-array element is always 4 wire bytes.
         let (size, padded) = checked_array_layout(len, std::mem::size_of::<i32>())?;
 
         if padded > self.data_avail() {
@@ -1440,11 +1689,7 @@ impl Parcel {
         }
 
         let pos = self.pos;
-        // The parcel's `Vec<u8>` has only 1-byte base alignment, so
-        // `align_to::<i32>()` would silently drop a mis-aligned prefix
-        // (data corruption, not UB). Copy each 4-byte element out by
-        // value instead — `size == len * 4` exactly (checked above), so
-        // `chunks_exact` yields exactly `len` elements with no remainder.
+        // The buffer is only 1-byte aligned, so copy by value; `align_to` would drop a prefix.
         let result = self.data.as_slice()[pos..pos + size]
             .chunks_exact(std::mem::size_of::<i32>())
             .map(|c| D::from(&i32::from_le_bytes([c[0], c[1], c[2], c[3]])))
@@ -1469,15 +1714,7 @@ impl Parcel {
 
         // usize in Rust may be 16-bit, so i32 may not fit
         let len = len.try_into().or(Err(StatusCode::BadValue))?;
-        // No `len <= data_avail()` cap here. Unlike an `in` array, an
-        // `out`/`inout` vec sends only its *length* in the parcel —
-        // the elements are produced by the callee, not read from the
-        // bytes that follow — so `len > data_avail()` is the normal,
-        // valid case. Capping it here would regress every out-array
-        // AIDL method on the live kernel binder. The unbounded-`len`
-        // OOM concern is real but must be bounded by a configured
-        // maximum, not by `data_avail()` (Android libbinder's
-        // `resizeOutVector` is likewise unbounded).
+        check_out_vec_size::<D>(len)?;
         out_vec.resize_with(len, Default::default);
 
         Ok(())
@@ -1500,8 +1737,7 @@ impl Parcel {
         } else {
             // usize in Rust may be 16-bit, so i32 may not fit
             let len = len.try_into().or(Err(StatusCode::BadValue))?;
-            // See `resize_out_vec`: an out-vec length is not backed by
-            // parcel data, so no `data_avail()` cap here.
+            check_out_vec_size::<D>(len)?;
             let mut vec = Vec::with_capacity(len);
             vec.resize_with(len, Default::default);
             *out_vec = Some(vec);
@@ -1526,8 +1762,7 @@ impl Parcel {
         parcelable: &[S],
     ) -> Result<()> {
         let len = parcelable.len();
-        // The wire length word is an `i32`; a slice too large to fit is a
-        // `BadValue`, not a silently truncated (possibly negative) count.
+        // The length word is an `i32`: an oversized slice is `BadValue`, not a truncated count.
         let len_i32: i32 = len.try_into().or(Err(StatusCode::BadValue))?;
         self.write::<i32>(&len_i32)?;
 
@@ -1539,29 +1774,16 @@ impl Parcel {
         let padded = pad_size(size);
         let pos = self.pos;
 
-        // See `write_aligned_data`: keep the end position within `i32::MAX`
-        // and reject rather than overflow the reserve/copy arithmetic.
+        // Bound `end` to `i32::MAX`; see module doc "Buffer growth".
         let end = pos
             .checked_add(padded)
             .filter(|&e| e <= i32::MAX as usize)
             .ok_or(StatusCode::BadValue)?;
 
         self.data.reserve(end.saturating_sub(self.data.len()));
-        // SAFETY: the `reserve` above guarantees the destination has at least
-        // `end` bytes of capacity, so `add(pos)` and the `size`-byte copy
-        // (size <= padded) stay in-bounds and the ranges do not overlap
-        // (distinct allocations). The 0-3 trailing pad bytes are then zeroed
-        // so that `set_len` exposes only initialized memory: `reserve`
-        // allocates but does not initialize, and the pad is transmitted (it is
-        // counted in `data_size`), so without this we would both hit UB and
-        // leak uninitialized process memory to the peer. AOSP masks the pad to
-        // zero as well. `set_len` only grows up to the just-reserved capacity
-        // over now-initialized `u8` bytes.
+        // SAFETY: `reserve` covers `pos..end`; gap, copy and pad writes initialize all of it.
         unsafe {
-            // Zero any `[len..pos]` gap left by a forward `set_data_position`
-            // before `set_len`, so an uninitialized hole is never exposed via
-            // `as_slice()` / transmitted to the peer (UB + info-leak). See
-            // `write_aligned_data` for the full rationale.
+            // Zero a forward-seek gap before `set_len`; see module doc "Buffer growth".
             let old_len = self.data.len();
             if pos > old_len {
                 std::ptr::write_bytes(self.data.as_mut_ptr().add(old_len), 0, pos - old_len);
@@ -1579,12 +1801,7 @@ impl Parcel {
             }
         }
 
-        // The copy above put host words on a little-endian wire, so a
-        // big-endian host owes each element a byte reversal. Doing it in
-        // place keeps one code path and covers `f32`/`f64`, which have no
-        // `swap_bytes`. Both conditions are compile-time constants (the
-        // width per monomorphization), so a little-endian build emits the
-        // memcpy alone — this loop is not in it.
+        // Big-endian hosts byte-reverse each element in place (covers f32/f64); LE compiles it out.
         if cfg!(target_endian = "big") && std::mem::size_of::<S>() > 1 {
             for chunk in
                 self.data.as_mut_slice()[pos..pos + size].chunks_exact_mut(std::mem::size_of::<S>())
@@ -1607,8 +1824,7 @@ impl Parcel {
         let size = len.checked_mul(4).ok_or(StatusCode::BadValue)?;
         let padded = pad_size(size);
 
-        // See `write_aligned_data`: keep the end position within `i32::MAX`
-        // and reject rather than overflow the reserve arithmetic.
+        // Bound `end` to `i32::MAX`; see module doc "Buffer growth".
         let end = self
             .pos
             .checked_add(padded)
@@ -1641,12 +1857,7 @@ impl Parcel {
         }
     }
 
-    /// Writes an L1 wire scalar: little-endian on every host.
-    ///
-    /// Callers must pass the value *already widened* to its wire type
-    /// (`i8`/`u8`/`i16` → `i32`, `u16` → `u32`). Reversing the narrow
-    /// value would emit one or two bytes and desync everything after
-    /// it — the `parcel::wire_golden` widening test pins that.
+    /// Writes an L1 wire scalar (LE), already widened to its wire type; see module doc.
     pub(crate) fn write_le<T: WireScalar>(&mut self, val: &T) -> Result<()> {
         self.write_aligned_data(val.to_wire().as_ref())
     }
@@ -1657,20 +1868,12 @@ impl Parcel {
         T::from_wire(data)
     }
 
-    /// Writes an L2 scalar: the *kernel command stream* (`BC_*` codes,
-    /// handles, cookies), which is an ioctl buffer the driver parses
-    /// with native loads — not wire. Host-native, deliberately.
-    ///
-    /// The command stream reaches this through
-    /// [`CommandStream`](crate::command_stream::CommandStream), whose
-    /// private field exposes no L1 method at all — the layer is enforced
-    /// by the type, not by a list of spellings.
+    /// Writes a host-native L2 command-stream scalar (`BC_*`, handles, cookies); see module doc.
     pub(crate) fn write_native<T: NativeScalar>(&mut self, val: &T) -> Result<()> {
         self.write_aligned_data(val.to_native().as_ref())
     }
 
-    /// Reads an L2 scalar written by the kernel driver. See
-    /// [`Parcel::write_native`].
+    /// Reads an L2 scalar written by the kernel driver. See [`Parcel::write_native`].
     pub(crate) fn read_native<T: NativeScalar>(&mut self) -> Result<T> {
         let data = self.read_aligned_data(std::mem::size_of::<T>())?;
         T::from_native(data)
@@ -1678,10 +1881,7 @@ impl Parcel {
 
     pub(crate) fn write_aligned<T: ParcelPod>(&mut self, val: &T) -> Result<()> {
         let unaligned = std::mem::size_of::<T>();
-        // SAFETY: `val` is a live `&T` for the borrow's duration and
-        // `T: ParcelPod` guarantees all `size_of::<T>()` bytes are
-        // initialized (no padding), so they are valid to read as `u8`. The
-        // slice does not outlive `val` (consumed synchronously below).
+        // SAFETY: `T: ParcelPod` has no padding, so every byte of the live `val` is initialized.
         let val_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(val as *const T as *const u8, unaligned) };
 
@@ -1693,33 +1893,16 @@ impl Parcel {
         let aligned = pad_size(unaligned);
         let pos = self.pos;
 
-        // A valid parcel never exceeds `i32::MAX` bytes (wire offsets are
-        // int32), so the end position must fit in that range. A larger `pos`
-        // can only come from moving the write cursor there via a misuse of
-        // the public `set_data_position`; reject it rather than overflow
-        // `pos + aligned` into a wild `reserve`/`write_bytes`. Mirrors AOSP
-        // `Parcel::growData` returning `BAD_VALUE` for `len > INT32_MAX`.
+        // Bound `end` to `i32::MAX` like AOSP `growData`; see module doc "Buffer growth".
         let end = pos
             .checked_add(aligned)
             .filter(|&e| e <= i32::MAX as usize)
             .ok_or(StatusCode::BadValue)?;
 
         self.data.reserve(end.saturating_sub(self.data.len()));
-        // SAFETY: the `reserve` above guarantees capacity for `add(pos)` and the
-        // `unaligned`-byte copy (unaligned <= aligned). Source `data` and the
-        // parcel buffer are distinct allocations (non-overlapping). The 0-3
-        // trailing pad bytes are zeroed before `set_len`: `reserve` does not
-        // initialize, and the pad is transmitted (counted in `data_size`), so
-        // leaving it uninitialized is both UB and an info-leak to the peer.
-        // AOSP masks the pad to zero too. `set_len` only grows up to the
-        // reserved capacity over now-initialized `u8`.
+        // SAFETY: `reserve` covers `pos..end`; gap, copy and pad writes initialize all of it.
         unsafe {
-            // If the write cursor sits past the current end (a forward
-            // `set_data_position`), the skipped `[len..pos]` bytes were never
-            // initialized; zero them before `set_len` marks the region
-            // initialized, otherwise `as_slice()` / `data_size()` would expose
-            // uninitialized heap to the peer (UB + info-leak). AOSP `growData`
-            // zero-fills grown capacity the same way.
+            // Zero a forward-seek gap before `set_len`; see module doc "Buffer growth".
             let old_len = self.data.len();
             if pos > old_len {
                 std::ptr::write_bytes(self.data.as_mut_ptr().add(old_len), 0, pos - old_len);
@@ -1746,12 +1929,25 @@ impl Parcel {
     }
 
     pub(crate) fn write_object(&mut self, obj: &flat_binder_object, null_meta: bool) -> Result<()> {
-        // RPC mode never carries `flat_binder_object`s: binders are
-        // marshalled as `RpcAddress` and FDs are rejected upstream.
-        // Write the bytes verbatim but never load the kernel offset
-        // table or take a kernel `acquire()` — RPC has its own
-        // refcount. The kernel path below is byte-identical on a
-        // kernel-backed parcel.
+        self.write_object_pinned(obj, null_meta, None)
+    }
+
+    // `obj` is `binder` flattened: a HANDLE pins that `Arc` instead of looking the handle up.
+    pub(crate) fn write_binder_object(
+        &mut self,
+        obj: &flat_binder_object,
+        binder: &crate::binder::SIBinder,
+    ) -> Result<()> {
+        self.write_object_pinned(obj, false, Some(binder))
+    }
+
+    fn write_object_pinned(
+        &mut self,
+        obj: &flat_binder_object,
+        null_meta: bool,
+        binder: Option<&crate::binder::SIBinder>,
+    ) -> Result<()> {
+        // RPC mode: no offset-table entry and no kernel `acquire()`; RPC keeps its own refcount.
         if self.rpc.is_some() {
             self.write_aligned(obj)?;
             return Ok(());
@@ -1761,10 +1957,28 @@ impl Parcel {
         self.write_aligned(obj)?;
 
         if null_meta || obj.pointer() != 0 {
+            // Pin first: `acquire` then hits the cached proxy instead of a temporary one.
+            match binder.filter(|_| obj.header_type() == BINDER_TYPE_HANDLE) {
+                Some(b) => {
+                    debug_assert_eq!(b.as_proxy().map(|p| p.handle()), Some(obj.handle()));
+                    self.kernel_pinned.push(b.clone());
+                }
+                None => self.pin_kernel_handle(obj)?,
+            }
             obj.acquire()?;
             self.objects.push(data_pos as _);
         }
 
+        Ok(())
+    }
+
+    // A proxy's strong ref must outlive the send; its own drop may queue BC_RELEASE before it.
+    fn pin_kernel_handle(&mut self, obj: &flat_binder_object) -> Result<()> {
+        if obj.header_type() == BINDER_TYPE_HANDLE {
+            let proxy = crate::process_state::ProcessState::as_self()
+                .strong_proxy_for_handle(obj.handle())?;
+            self.kernel_pinned.push(proxy);
+        }
         Ok(())
     }
 
@@ -1846,36 +2060,20 @@ impl Parcel {
             log::error!("Parcel::append_from: the size is too large: {size}");
             return Err(StatusCode::BadValue);
         }
-        // Bound against the backing slice length, not `data_size()` (which is
-        // `max(data.len(), pos)`): the copy below indexes `other.data[offset..
-        // offset + size]`, so a source parcel whose cursor was seeked past its
-        // data end (`pos > data.len()`) must be rejected here rather than pass
-        // this check and then panic on the slice index.
+        // Bound by `data.len()`, not `data_size()`: a seek past the end would panic the index.
         let other_len = other.data.len();
         if offset > other_len || size > other_len || (offset + size) > other_len {
             log::error!("Parcel::append_from: The given offset({offset}) and size({size}) exceed the data range of the parcel.");
             return Err(StatusCode::BadValue);
         }
 
-        // Refuse before the copy, mirror direction: `other`'s bytes were
-        // validated under `other`'s marshalling mode, and the table that made
-        // them safe is not copied with them. Into a kernel destination that is
-        // exploitable, because `read_object`'s null-meta shortcut waves a
-        // null-pointer, null-cookie `flat_binder_object` through with no
-        // offset-table entry — so 24 bytes of RPC or data-only payload become
-        // `BINDER_TYPE_HANDLE` handle 0, a live proxy to the context manager.
-        // The opposite direction needs no gate: `read_object` is an immediate
-        // `BadType` on an RPC-mode parcel, so nothing there can be laundered
-        // into an object.
+        // RPC bytes in a kernel parcel could forge handle 0; see module doc "append_from".
         if self.rpc.is_none() && other.rpc.is_some() {
             log::error!("Parcel::append_from: refusing RPC/data-only bytes into a kernel parcel");
             return Err(StatusCode::BadType);
         }
 
-        // Refuse before the copy: a source with session hooks can carry an
-        // `RpcAddress` flattened into its *body*, and only the v2 wire profile
-        // records where, so no table can prove a range clean. A hook-less sink
-        // is the one whose bytes get exported (`Parcel::as_bytes`).
+        // A session source may carry an `RpcAddress` in its body; see module doc "append_from".
         #[cfg(feature = "rpc")]
         if other.rpc.as_ref().is_some_and(|r| r.ops.is_some())
             && self.rpc.as_ref().is_none_or(|r| r.ops.is_none())
@@ -1884,17 +2082,62 @@ impl Parcel {
             return Err(StatusCode::BadType);
         }
 
+        // AOSP Parcel.cpp `appendFrom`: `isForRpc()` and `mSession` must match (module doc).
+        #[cfg(feature = "rpc")]
+        if let Some(ours) = self.rpc_session_id() {
+            if other.rpc_session_id() != Some(ours) {
+                log::error!(
+                    "Parcel::append_from: a session parcel takes bytes from its own session only"
+                );
+                return Err(StatusCode::BadType);
+            }
+        }
+
+        // Copied address bytes carry no bump: the source must own none, or two parcels settle one.
+        #[cfg(feature = "rpc")]
+        if other
+            .rpc
+            .as_ref()
+            .is_some_and(|r| !r.leaving_addrs.is_empty())
+        {
+            log::error!(
+                "Parcel::append_from: the source still owns binder reservations; append a \
+                 received or binder-free parcel"
+            );
+            return Err(StatusCode::BadType);
+        }
+
+        // AOSP Parcel.cpp `appendFrom`: "Can only build a Parcel when preparing to send it".
+        #[cfg(feature = "rpc")]
+        if self
+            .rpc
+            .as_ref()
+            .is_some_and(|r| r.send_state() != RpcSendState::NotSent)
+        {
+            log::error!("Parcel::append_from: the destination is being sent, sent or received");
+            return Err(StatusCode::BadType);
+        }
+
+        // Bound `end` to `i32::MAX` as `write_aligned_data` does, rather than overflow the reserve.
+        let end = self
+            .pos
+            .checked_add(size)
+            .filter(|&e| e <= i32::MAX as usize)
+            .ok_or(StatusCode::BadValue)?;
+
+        // Every fallible RPC step runs here, before a byte moves; see module doc "append_from".
+        #[cfg(feature = "rpc")]
+        let staged = match self.rpc.as_ref().and_then(|r| r.ops.clone()) {
+            Some(ops) => Some(self.stage_rpc_copy(&*ops, other, offset, size)?),
+            None => None,
+        };
+
         let start_pos = self.pos;
         let mut first_idx: i32 = -1;
         let mut last_idx: i32 = -2;
         {
             let object_size = std::mem::size_of::<flat_binder_object>() as u64;
-            // Scan the SOURCE parcel's object table (mirrors AOSP
-            // Parcel.cpp::appendFrom, which iterates `other`'s mObjects),
-            // not `self.objects`. The destination may be empty (e.g. a fresh
-            // ParcelableHolder parcel), in which case using `self.objects`
-            // would compute num_objects == 0 and silently drop every
-            // binder/FD object nested in the copied range.
+            // Scan the source's table as AOSP `appendFrom` does; the destination's may be empty.
             let objects = other.objects.as_slice();
 
             for (i, &off) in objects.iter().enumerate() {
@@ -1909,12 +2152,7 @@ impl Parcel {
 
         let num_objects = last_idx - first_idx + 1;
 
-        // Refuse before the copy: an RPC-mode destination has no object table,
-        // so a `flat_binder_object` appended into it would survive as 24 bytes
-        // of payload carrying a process-local handle or fd number, with
-        // nothing left to mark it as an object. After the copy that is
-        // indistinguishable from data, which is why this is a write-time
-        // refusal and not a check on the finished bytes.
+        // An RPC destination has no object table: a copied object would pass as plain data.
         if self.rpc.is_some() && num_objects > 0 {
             let src_data = other.data.as_slice();
             let src_objects = other.objects.as_slice();
@@ -1931,26 +2169,10 @@ impl Parcel {
             });
         }
 
-        // See `write_aligned_data`: bound the end position to `i32::MAX` and
-        // reject rather than overflow the reserve/copy arithmetic when the
-        // write cursor was moved to a nonsensical position.
-        let end = self
-            .pos
-            .checked_add(size)
-            .filter(|&e| e <= i32::MAX as usize)
-            .ok_or(StatusCode::BadValue)?;
-
         self.data.reserve(end.saturating_sub(self.data.len()));
-        // SAFETY: the source range `other.data[offset..offset + size]` is
-        // bounds-checked by the slice index above (panics if out of range),
-        // and the `reserve` above guarantees the destination has capacity for
-        // `add(self.pos)` plus `size` bytes. `other` and `self` are distinct
-        // parcels (non-overlapping). `set_len` only grows up to the reserved
-        // capacity over the `u8` bytes just copied.
+        // SAFETY: `reserve` covers `..end`, all initialized below; source is a checked slice.
         unsafe {
-            // Zero any `[len..pos]` gap from a forward `set_data_position`
-            // before `set_len` so an uninitialized hole is never exposed /
-            // transmitted (UB + info-leak). See `write_aligned_data`.
+            // Zero a forward-seek gap before `set_len`; see module doc "Buffer growth".
             let old_len = self.data.len();
             if self.pos > old_len {
                 std::ptr::write_bytes(self.data.as_mut_ptr().add(old_len), 0, self.pos - old_len);
@@ -1966,40 +2188,39 @@ impl Parcel {
         }
         self.set_data_position(end);
 
-        // Kernel-only: in RPC mode `num_objects > 0` already returned above,
-        // so this arm is only reached with nothing to relocate.
+        #[cfg(feature = "rpc")]
+        if let (Some(staged), Some(rpc)) = (staged, self.rpc.as_mut()) {
+            for rel in staged.positions {
+                rpc.record_object_position(start_pos + rel);
+            }
+            // The index names a slot of this parcel's own table (module doc "append_from").
+            for (rel, fd) in staged.fds {
+                let at = start_pos + rel;
+                let idx = rpc.push_out_fd(fd);
+                self.data.as_mut_slice()[at..at + 4].copy_from_slice(&idx.to_le_bytes());
+            }
+            rpc.leaving_addrs.extend(staged.binders.leaving);
+            rpc.pinned.extend(staged.binders.pinned);
+        }
+
+        // In RPC mode `num_objects > 0` returned above, so nothing is left to relocate.
         let skip_objects = self.rpc.is_some();
 
         if num_objects > 0 && !skip_objects {
             self.objects.reserve(num_objects as usize);
 
-            // Recompute each offset from the SOURCE table position
-            // (`other.objects`). AOSP: `off = pos - offset + startPos`.
-            //
-            // Commit the relocated offset into `self.objects` only AFTER the
-            // object is fully acquired and (for FDs) dup'd + rewritten with the
-            // destination's own fd. If `acquire()` or the FD dup fails, the
-            // offset is never committed, so this parcel's `Drop`
-            // (`release_objects`) only ever iterates fully-acquired entries.
-            // Committing first (as before) left a half-built entry that still
-            // held the SOURCE's fd/handle bytes; on the drop that follows the
-            // `?` it would `release()` the source's still-owned fd
-            // (double-close) or decrement a refcount that was never incremented
-            // (underflow). AOSP's `appendFrom` is double-close-safe because it
-            // never aborts the loop; this push-after-success ordering achieves
-            // the same invariant by construction.
+            // Push an offset only after acquire and FD dup succeed; see module doc "append_from".
             let src_objects = other.objects.as_slice();
             for i in first_idx..=last_idx {
                 let off = src_objects[i as usize] as usize - offset + start_pos;
                 let mut flat = read_flat_binder(self.data.as_slice(), off)?;
+                self.pin_kernel_handle(&flat)?;
                 flat.acquire()?;
                 if flat.header_type() == BINDER_TYPE_FD {
                     let newfd = match rustix::io::fcntl_dupfd_cloexec(flat.borrowed_fd(), 0) {
                         Ok(newfd) => newfd,
                         Err(e) => {
-                            // FD `acquire()` is a no-op, so nothing to undo; the
-                            // source's fd at `off` stays owned by the source
-                            // parcel (no double-close). Offset not committed.
+                            // FD `acquire()` is a no-op and `off` is uncommitted: nothing to undo.
                             return Err(std::io::Error::from(e).into());
                         }
                     };
@@ -2014,11 +2235,138 @@ impl Parcel {
         Ok(())
     }
 
+    /// AOSP `appendFrom` RPC arm up to the copy, for a session destination (module doc).
+    #[cfg(feature = "rpc")]
+    fn stage_rpc_copy(
+        &self,
+        ops: &dyn RpcParcelOps,
+        other: &Parcel,
+        offset: usize,
+        size: usize,
+    ) -> Result<StagedRpcCopy> {
+        // Without positions a copied binder cannot be found, so nothing proves a range binder-free.
+        if !ops.records_binder_positions()? {
+            log::error!(
+                "Parcel::append_from: this session's wire records no binder positions, so a \
+                 copied binder could not take its reference; decode the payload and write it"
+            );
+            return Err(StatusCode::BadType);
+        }
+        let range = &other.data.as_slice()[offset..offset + size];
+        let positions: Vec<usize> = other
+            .rpc_object_positions()
+            .iter()
+            .map(|&p| p as usize)
+            .filter(|&p| offset <= p && p < offset + size)
+            .map(|p| p - offset)
+            .collect();
+        let mut binders: Vec<&[u8]> = Vec::new();
+        let mut fds = Vec::new();
+        for &rel in &positions {
+            match le_i32_at(range, rel) {
+                Some(RPC_TYPE_BINDER) => binders.push(&range[rel + 4..]),
+                Some(crate::rpc::wire_android13::TYPE_NATIVE_FILE_DESCRIPTOR) => {
+                    if self.rpc_fd_mode() != crate::rpc::FileDescriptorTransportMode::Unix {
+                        return Err(StatusCode::FdsNotAllowed);
+                    }
+                    let fd = le_i32_at(range, rel + 4)
+                        .and_then(|idx| usize::try_from(idx).ok())
+                        .and_then(|idx| other.rpc.as_ref()?.source_fd(idx))
+                        .ok_or(StatusCode::BadValue)?;
+                    let dup = rustix::io::fcntl_dupfd_cloexec(fd, 0)
+                        .map_err(|e| StatusCode::from(std::io::Error::from(e)))?;
+                    fds.push((rel + 4, dup));
+                }
+                Some(_) => {
+                    log::error!("Parcel::append_from: an RPC object that is neither binder nor fd");
+                    return Err(StatusCode::InvalidOperation);
+                }
+                None => return Err(StatusCode::BadValue),
+            }
+        }
+        let binders = if binders.is_empty() {
+            CopiedBinders::default()
+        } else {
+            ops.acquire_copied(&binders)?
+        };
+        Ok(StagedRpcCopy {
+            positions,
+            fds,
+            binders,
+        })
+    }
+
+    /// `[offset, offset + size)` as its own parcel to read, with the objects in it (module doc).
+    pub(crate) fn sub_parcel(&mut self, offset: usize, size: usize) -> Result<Parcel> {
+        if self.rpc.is_none() {
+            let mut sub = Parcel::new();
+            sub.append_from(self, offset, size)?;
+            return Ok(sub);
+        }
+        let end = offset
+            .checked_add(size)
+            .filter(|&e| e <= self.data.len() && size <= i32::MAX as usize)
+            .ok_or_else(|| {
+                log::error!("Parcel::sub_parcel: {offset} + {size} exceeds the parcel");
+                StatusCode::BadValue
+            })?;
+        let mut sub = Parcel::from_vec(self.data.as_slice()[offset..end].to_vec());
+        sub.set_for_rpc(true);
+        #[cfg(feature = "rpc")]
+        self.carry_rpc_objects(&mut sub, offset, end);
+        Ok(sub)
+    }
+
+    /// Give `sub` this parcel's session profile and the objects in `[offset, end)`, shifted.
+    #[cfg(feature = "rpc")]
+    fn carry_rpc_objects(&mut self, sub: &mut Parcel, offset: usize, end: usize) {
+        let (Some(src), Some(dst)) = (self.rpc.as_mut(), sub.rpc.as_mut()) else {
+            return;
+        };
+        dst.ops = src.ops.clone();
+        dst.fd_mode = src.fd_mode;
+        dst.record_fd_positions = src.record_fd_positions;
+        // A payload that arrived is entered as it arrived; module doc "`append_from`".
+        if src.send_state() == RpcSendState::Received {
+            dst.send_state.store(
+                RpcSendState::Received as u8,
+                std::sync::atomic::Ordering::Release,
+            );
+            dst.received_len = end - offset;
+        }
+        // Cloned, not moved: the outer parcel's own reads of these positions must still hit.
+        for (pos, addr, binder) in &src.entered {
+            let pos = *pos as usize;
+            if offset <= pos && pos < end {
+                dst.entered
+                    .push(((pos - offset) as u32, *addr, binder.clone()));
+            }
+        }
+        let data = sub.data.as_mut_slice();
+        use crate::rpc::wire_android13::TYPE_NATIVE_FILE_DESCRIPTOR;
+        // Source order kept: a forged unsorted table must miss the same lookups here as there.
+        for i in 0..src.object_positions.len() {
+            let pos = src.object_positions[i] as usize;
+            if pos < offset || pos >= end {
+                continue;
+            }
+            let rel = pos - offset;
+            dst.object_positions.push(rel as u32);
+            let is_fd = src.record_fd_positions
+                && le_i32_at(data, rel) == Some(TYPE_NATIVE_FILE_DESCRIPTOR);
+            let Some(idx) = le_i32_at(data, rel + 4).filter(|_| is_fd) else {
+                continue;
+            };
+            // Moved, not dup'd: the outer parcel skips this range, and each fd is taken once.
+            let fd = usize::try_from(idx).ok().and_then(|i| src.take_in_fd(i));
+            let new_idx = dst.fds_in.len() as i32;
+            dst.fds_in.push(fd);
+            data[rel + 4..rel + 8].copy_from_slice(&new_idx.to_le_bytes());
+        }
+    }
+
     fn release_objects(&self) {
-        // An RPC-mode parcel must never run kernel `release()` /
-        // `decref_publish` — RPC objects have a different
-        // (DecStrong-based) lifetime. `self.objects` is empty in RPC
-        // mode anyway; this is defence-in-depth + intent.
+        // RPC objects live by DecStrong; kernel `release()` must never run on them.
         if self.rpc.is_some() {
             return;
         }
@@ -2043,9 +2391,7 @@ impl Drop for Parcel {
     fn drop(&mut self) {
         match self.free_buffer {
             Some(free_buffer) => {
-                // Never panic in Drop: a failure here may run during unwind,
-                // and a double-panic aborts the whole process — strictly
-                // worse than logging and leaking the kernel buffer.
+                // No panic in Drop: a double panic during unwind aborts the process; leak instead.
                 if let Err(e) = free_buffer(
                     Some(self),
                     self.data.as_ptr() as _,
@@ -2057,6 +2403,10 @@ impl Drop for Parcel {
                 }
             }
             None => {
+                #[cfg(feature = "rpc")]
+                if let Some(rpc) = self.rpc.as_mut() {
+                    rpc.settle_unsent();
+                }
                 self.release_objects();
             }
         }
@@ -2067,10 +2417,7 @@ impl std::fmt::Debug for Parcel {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         writeln!(f, "Parcel: pos {}, len {}", self.pos, self.data.len())?;
         if self.objects.len() > 0 {
-            // SAFETY: `self.objects` is a live `Vec<binder_size_t>`, so its
-            // `len * size_of::<binder_size_t>()` bytes are a valid contiguous
-            // region readable as `u8`. The slice is consumed synchronously by
-            // `pretty_hex` and does not outlive the borrow of `self.objects`.
+            // SAFETY: `objects`, a `Vec` or an adopted IPC slice, is readable as bytes for `&self`.
             let bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(
                     self.objects.as_ptr() as *const u8,
@@ -2187,49 +2534,26 @@ mod tests {
     use crate::*;
 
     #[test]
-    fn parcel_data_slice_as_mut_slice_round_trips() {
-        // The `Slice` variant carries a `&'static mut [T]` produced
-        // by `ParcelData::from_raw_parts_mut`, which is the
-        // kernel-buffer adoption path (`Parcel::from_ipc_parts`
-        // family). Pre-fix this method panicked unconditionally on
-        // that arm — a latent crash on `Parcel::append_from` of any
-        // kernel-incoming parcel whose destination was Slice-backed.
-        // This regression guard mirrors the `as_slice` symmetry: a
-        // write through `as_mut_slice` is observable on the next
-        // `as_slice` read.
-        //
-        // SAFETY: `Box::leak` hands ownership to the test binary's
-        // process-lifetime arena, so the pointer + length below
-        // satisfy `from_raw_parts_mut`'s "valid, exclusively-owned,
-        // `'static`" contract for the rest of the run.
+    #[should_panic(expected = "can't support as_mut_slice()")]
+    fn parcel_data_slice_refuses_as_mut_slice() {
+        // A `Slice` stands for the read-only kernel mapping: reads alias it, writes panic.
         let leaked: &'static mut [u8] = Box::leak(vec![0u8, 1, 2, 3].into_boxed_slice());
         let ptr = leaked.as_mut_ptr();
         let len = leaked.len();
+        // SAFETY: `Box::leak` yields a valid, exclusive, `'static` buffer of `len` bytes.
         let mut pd: super::ParcelData<u8> =
             unsafe { super::ParcelData::from_raw_parts_mut(ptr, len) };
 
-        let slice = pd.as_mut_slice();
-        assert_eq!(slice, &mut [0u8, 1, 2, 3][..]);
-        slice[0] = 99;
-        slice[3] = 200;
-
-        // Round-trip through the immutable view: writes survived,
-        // proving the returned `&mut [T]` actually aliases the
-        // underlying storage (not a copy).
-        assert_eq!(pd.as_slice(), &[99u8, 1, 2, 200][..]);
+        assert_eq!(pd.as_slice(), &[0u8, 1, 2, 3][..]);
+        assert_eq!(pd.as_ptr(), ptr as *const u8);
+        let _ = pd.as_mut_slice();
     }
 
     #[test]
     fn write_array_zeroes_trailing_pad() {
-        // A byte array whose length is not a multiple of 4 leaves 1-3
-        // trailing pad bytes inside the (4-byte aligned) parcel slot. That
-        // pad is part of the transmitted payload (it is counted in
-        // `data_size`), so it must be zeroed — matching AOSP — otherwise
-        // `reserve`+`set_len` would mark uninitialized/leftover memory as
-        // initialized (UB) and leak it to the peer.
+        // The 1-3 pad bytes are transmitted (in `data_size`), so they must be zero, as in AOSP.
         let mut parcel = Parcel::new();
-        // Poison the first 8 bytes with 0xFF so a missing zero-fill is
-        // observable as leftover bytes rather than incidental zeros.
+        // Poison with 0xFF so a missing zero-fill shows as leftover bytes, not incidental zeros.
         parcel.write(&(-1i32)).unwrap();
         parcel.write(&(-1i32)).unwrap();
         parcel.set_data_position(0);
@@ -2254,12 +2578,7 @@ mod tests {
 
     #[test]
     fn checked_array_layout_rejects_size_mul_overflow() {
-        // `i32::MAX × usize::MAX` overflows on every target — covers
-        // the 32-bit DoS surface the helper exists to seal. (The
-        // direct `Parcel::read_array` callers can't actually hit
-        // this on 64-bit since `size_of::<D>()` for any real Rust
-        // type is bounded by `isize::MAX`, but the helper itself is
-        // generic over `elem_size: usize`.)
+        // `i32::MAX × usize::MAX` overflows on every target, so this also runs on 64-bit hosts.
         assert_eq!(
             super::checked_array_layout(i32::MAX, usize::MAX),
             Err(StatusCode::BadValue)
@@ -2268,9 +2587,7 @@ mod tests {
 
     #[test]
     fn checked_array_layout_rejects_pad_overflow() {
-        // `size + 3` itself overflows `usize` when `size > usize::MAX - 3`.
-        // Hand-craft an `elem_size` that makes the multiplication land
-        // exactly at `usize::MAX` so `pad_size` is the failing arm.
+        // `size` lands at `usize::MAX`: the multiply passes and the `+ 3` pad step overflows.
         assert_eq!(
             super::checked_array_layout(1, usize::MAX),
             Err(StatusCode::BadValue)
@@ -2284,10 +2601,7 @@ mod tests {
 
     #[test]
     fn checked_array_layout_passes_i32_max_on_64_bit_and_rejects_it_on_32() {
-        // The helper is 32-bit hardening only, so `(i32::MAX, 4)` is the input
-        // that separates the two targets: on 64-bit it must stay a no-op —
-        // gating a valid length there would silently break every kernel/RPC
-        // array path — and on 32-bit it is exactly the overflow to refuse.
+        // `(i32::MAX, 4)` must pass on 64-bit (gating it breaks valid arrays) and fail on 32-bit.
         #[cfg(target_pointer_width = "64")]
         {
             let (size, padded) = super::checked_array_layout(i32::MAX, 4).unwrap();
@@ -2303,10 +2617,7 @@ mod tests {
 
     #[test]
     fn read_array_rejects_hostile_len_gracefully() {
-        // A parcel whose data only encodes the length — no actual
-        // array body — with a `len` far larger than `data_avail()`.
-        // Pre-hardening this could panic in `Vec::with_capacity` on
-        // 32-bit; post-hardening it returns `Err(_)` on every target.
+        // A bare length word far beyond `data_avail()` must be `Err`, never a capacity panic.
         let mut parcel = Parcel::new();
         parcel.write::<i32>(&1_000_000_000).unwrap();
         parcel.set_data_position(0);
@@ -2316,9 +2627,7 @@ mod tests {
 
     #[test]
     fn read_array_char_rejects_hostile_len_gracefully() {
-        // Same shape as `read_array_rejects_hostile_len_gracefully`
-        // but exercises the char-array variant — both call into
-        // `checked_array_layout`.
+        // Char-array twin of the test above; both go through `checked_array_layout`.
         let mut parcel = Parcel::new();
         parcel.write::<i32>(&1_000_000_000).unwrap();
         parcel.set_data_position(0);
@@ -2447,8 +2756,7 @@ mod tests {
         assert_eq!(reverse, res.unwrap());
     }
 
-    // E8: typed scalar helpers must round-trip and stay wire-identical to the
-    // generic read::<T>/write::<T> path they wrap.
+    // Typed scalar helpers round-trip and stay wire-identical to generic read::<T>/write::<T>.
     #[test]
     fn test_typed_scalar_helpers() -> Result<()> {
         let mut p = Parcel::new();
@@ -2480,18 +2788,7 @@ mod tests {
         Ok(())
     }
 
-    // Regression test for issue #97 (BC_FREE_BUFFER no match).
-    //
-    // When an IPC reply has data_size == 0 (e.g. a successful `void` AIDL
-    // method), the binder driver still allocates a buffer and returns its
-    // user-space address in `binder_transaction_data.data.ptr.buffer`. The
-    // receiver must echo that exact address back via `BC_FREE_BUFFER`. If
-    // `from_raw_parts_mut` collapsed the zero-length case to `&mut []` it
-    // would discard the kernel-supplied pointer and replace it with the
-    // empty-slice dangling pointer (0x1 for u8), causing the kernel to log
-    // `BC_FREE_BUFFER no match for buffer at offset ...001` on every empty
-    // reply. This test asserts the original pointer survives both the
-    // construction call and a Drop that funnels it back to free_buffer.
+    // Issue #97: an empty reply's kernel buffer address must reach BC_FREE_BUFFER unchanged.
     #[test]
     fn from_ipc_parts_preserves_data_pointer_when_length_is_zero() {
         use crate::sys::binder::binder_uintptr_t;
@@ -2515,9 +2812,7 @@ mod tests {
         let original = backing.as_mut_ptr();
 
         {
-            // SAFETY: `original` points to a valid allocation; `len == 0` exercises
-            // the regression path. `objects` is null with object_count == 0,
-            // exercising the preserved null guard.
+            // SAFETY: `original` is a live allocation; a null `objects` with count 0 is allowed.
             let parcel =
                 unsafe { Parcel::from_ipc_parts(original, 0, std::ptr::null_mut(), 0, capture) };
             assert_eq!(
@@ -2536,9 +2831,7 @@ mod tests {
 
     #[test]
     fn from_ipc_parts_with_null_data_uses_empty_slice() {
-        // Preserves the null-pointer guard from commit bae39ec: a null `data`
-        // with `len == 0` is allowed (used elsewhere) and must not invoke
-        // `slice::from_raw_parts_mut` with a null pointer.
+        // A null `data` with `len == 0` is valid and must never reach `slice::from_raw_parts`.
         fn noop(
             _: Option<&Parcel>,
             _: crate::sys::binder::binder_uintptr_t,
@@ -2549,9 +2842,7 @@ mod tests {
             Ok(())
         }
 
-        // SAFETY: both pointers are null with length 0 — the documented
-        // empty-parcel case for `from_ipc_parts`. No reads or writes
-        // happen against the null pointers in the rest of this test.
+        // SAFETY: both pointers are null with length 0, the documented empty `from_ipc_parts` case.
         let parcel = unsafe {
             Parcel::from_ipc_parts(std::ptr::null_mut(), 0, std::ptr::null_mut(), 0, noop)
         };
@@ -2560,17 +2851,44 @@ mod tests {
         drop(parcel);
     }
 
-    // `set_data_size` may only shrink: `capacity()` says nothing about
-    // initialization, so growing into spare capacity would be `Vec::set_len`
-    // UB. The driver-filled grow has its own `unsafe` entry point.
+    /// A 32-bit kernel's 4-aligned offsets array is copied out, never borrowed as `&[u64]`.
+    #[test]
+    fn from_ipc_parts_copies_a_misaligned_offsets_array() {
+        fn noop(
+            _: Option<&Parcel>,
+            _: crate::sys::binder::binder_uintptr_t,
+            _: usize,
+            _: crate::sys::binder::binder_uintptr_t,
+            _: usize,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        let mut backing = vec![0u64; 3];
+        let base = backing.as_mut_ptr() as *mut u8;
+        // SAFETY: 4 bytes into a 24-byte allocation; the 20 left hold two unaligned `u64`s.
+        let objects = unsafe { base.add(4) } as *mut crate::sys::binder::binder_size_t;
+        // SAFETY: both writes stay inside `backing`, and `write_unaligned` needs no alignment.
+        unsafe {
+            objects.write_unaligned(8);
+            objects.add(1).write_unaligned(24);
+        }
+        let mut data = [0u8; 32];
+        // SAFETY: `data` and the 2-element `objects` are live and untouched until the drop below.
+        let parcel = unsafe { Parcel::from_ipc_parts(data.as_mut_ptr(), 32, objects, 2, noop) };
+        assert!(matches!(parcel.objects, super::ParcelData::Vec(_)));
+        assert_eq!(parcel.objects.as_slice(), &[8, 24]);
+        drop(parcel);
+    }
+
+    // Growing into spare capacity would be `Vec::set_len` UB; only the unsafe driver path may grow.
     #[test]
     fn set_data_size_only_shrinks() {
         let mut parcel = Parcel::new();
         parcel.write(&0u64).expect("write u64");
         assert_eq!(parcel.data_size(), 8);
 
-        // Growing past the initialized length is refused, even though the
-        // capacity (256) would hold it.
+        // Growing past the initialized length is refused, even though the capacity would hold it.
         assert!(parcel.capacity() > 8);
         assert_eq!(parcel.set_data_size(9), Err(StatusCode::BadValue));
         assert_eq!(parcel.data_size(), 8);
@@ -2586,8 +2904,7 @@ mod tests {
     fn set_data_size_driver_filled_is_bounded_by_capacity() {
         let mut parcel = Parcel::new();
         let cap = parcel.capacity();
-        // Simulate the driver filling the spare capacity before publishing.
-        // SAFETY (test): we initialize every byte we then claim.
+        // SAFETY: like the driver, every byte of the capacity is written before it is claimed.
         unsafe {
             std::ptr::write_bytes(parcel.as_mut_ptr(), 0xAB, cap);
             assert!(parcel.set_data_size_driver_filled(cap).is_ok());
@@ -2600,9 +2917,7 @@ mod tests {
         assert!(parcel.data.as_slice().iter().all(|&b| b == 0xAB));
     }
 
-    // A forward `set_data_position` with no write behind it must not make
-    // the kernel-facing length exceed the bytes that actually exist — the
-    // driver would `copy_from_user` past our allocation otherwise.
+    // A bare forward seek must not push the kernel-facing length past the allocated bytes.
     #[test]
     fn ipc_data_size_never_exceeds_backing_buffer() {
         let mut parcel = Parcel::new();
@@ -2632,10 +2947,7 @@ mod tests {
         assert_eq!(parcel.data_position(), i32::MAX as usize);
     }
 
-    // Hardening regression: `data_avail` must saturate when the cursor
-    // has been moved past the end (`set_data_position` is unbounded).
-    // The pre-fix `len - pos` underflowed and panicked in debug builds
-    // on attacker-influenced positions.
+    // `data_avail` saturates, never underflows, once a seek puts the cursor past the end.
     #[test]
     fn data_avail_saturates_when_pos_past_end() {
         let mut parcel = Parcel::new();
@@ -2654,11 +2966,7 @@ mod tests {
         );
     }
 
-    /// Stable-AIDL forward-compat read path: a reader expecting more fields
-    /// than a shorter (older-peer) parcelable carries must leave the trailing
-    /// fields at their default — driven by `has_more_data()` respecting the
-    /// `sized_read` block boundary — and a reader expecting fewer fields than
-    /// a longer (newer-peer) parcelable must skip the extra bytes cleanly.
+    /// Stable-AIDL compat: missing trailing fields stay default, extra ones are skipped.
     #[test]
     fn sized_read_field_truncation_via_has_more_data() {
         // A "V1" writer emits a length-prefixed parcelable of two i32s.
@@ -2668,8 +2976,7 @@ mod tests {
             p.write(&22i32)
         })
         .expect("v1 write");
-        // Trailing sentinel after the parcelable (reply-trailer analogue) so
-        // an over-read past the block boundary would be detectable.
+        // Trailing sentinel after the parcelable exposes any over-read past the block boundary.
         wv1.write(&0x7777_7777i32).expect("sentinel");
 
         // A "V3" reader expects three i32s, each guarded by has_more_data.
@@ -2696,8 +3003,7 @@ mod tests {
         // The cursor is parked at the parcelable end → sentinel reads next.
         assert_eq!(wv1.read::<i32>().expect("sentinel"), 0x7777_7777);
 
-        // Reverse direction: a "V3" writer emits three i32s; a "V1" reader
-        // expecting two must skip the extra field and land on the sentinel.
+        // Reverse: a "V1" reader skips a "V3" writer's third i32 and lands on the sentinel.
         let mut wv3 = Parcel::new();
         wv3.sized_write(|p| {
             p.write(&1i32)?;
@@ -2729,16 +3035,10 @@ mod tests {
         );
     }
 
-    /// A self-referential parcelable (AIDL `RecursiveList`) recurses through
-    /// `sized_read` on read, so a hostile deeply-nested payload must be
-    /// rejected with `BadValue` at [`MAX_NESTED_READ_DEPTH`] rather than
-    /// recursing until the worker-thread stack overflows (a hard abort).
-    /// Also proves the depth counter is decremented on both the success and
-    /// error paths, so it never leaks across successive reads.
+    /// Nesting past [`MAX_NESTED_READ_DEPTH`] is `BadValue`; the depth never leaks across reads.
     #[test]
     fn sized_read_depth_is_bounded() {
-        // Mirrors a generated `RecursiveList` write: each node is a sized
-        // block holding a marker plus (optionally) the next node.
+        // Mirrors a generated `RecursiveList` write: a sized block of a marker plus the next node.
         fn write_nested(p: &mut Parcel, depth: usize) -> Result<()> {
             p.sized_write(|s| {
                 s.write(&(depth as i32))?;
@@ -2764,9 +3064,7 @@ mod tests {
         over.set_data_position(0);
         assert_eq!(read_nested(&mut over).unwrap_err(), StatusCode::BadValue);
 
-        // A legitimate shallow nesting still reads cleanly, twice — the second
-        // read only succeeds if the counter was restored on the way out of the
-        // first (and on the error unwind above).
+        // Reading twice proves the depth counter is restored on success and on the error above.
         let mut ok = Parcel::new();
         write_nested(&mut ok, 8).expect("write shallow");
         for _ in 0..2 {
@@ -2775,15 +3073,7 @@ mod tests {
         }
     }
 
-    /// The RPC object-position table is collected AOSP-faithfully: the
-    /// recorded offset is the position of the object's leading int32
-    /// (AOSP `dataPos = mDataPos` *before* `writeInt32(TYPE_*)`), the
-    /// table stays **sorted** (AOSP `mObjectPositions.insert(upper_bound(...),
-    /// dataPos)`) even when objects are recorded out of order, it is
-    /// refused on a kernel-backed parcel (kernel diff 0), and it
-    /// survives a v2 codec encode→decode with the AOSP `bodySize =
-    /// fixed + parcelDataSize + 4·N` framing. Single / multiple /
-    /// mixed (binder-shaped + FD-shaped) objects.
+    /// Object table per module doc "RPC fields": offsets, sort, kernel refusal, v2 round trip.
     #[cfg(feature = "rpc")]
     #[test]
     fn rpc_object_position_table_is_aosp_faithful_and_sorted() {
@@ -2804,13 +3094,7 @@ mod tests {
         p.set_for_rpc(true);
         p.set_rpc_record_fd_positions(true);
 
-        // Interface-token-like prefix, then a mix of objects and
-        // scalars. Each "object" mirrors the android-16 wire body:
-        //   binder: [i32 present=1][8B RpcWireAddress][i32 stability]
-        //   fd    : [i32 present=1][i32 ancillary-index]
-        // The position recorded is the offset of the leading int32,
-        // captured *before* it is written (AOSP `Parcel::flattenBinder`
-        // / `writeFileDescriptor`).
+        // A position is the leading i32's offset, taken before it is written (AOSP flattenBinder).
         p.write(&0xDEAD_BEEFu32).unwrap(); // token-ish
         p.write(&"iface".to_owned()).unwrap(); // a String arg
 
@@ -2852,8 +3136,7 @@ mod tests {
             "table strictly ascending"
         );
 
-        // AOSP `mObjectPositions.insert(upper_bound(...), dataPos)`:
-        // a late out-of-order record still lands sorted.
+        // AOSP inserts at `upper_bound`, so an out-of-order record still lands sorted.
         let mut q = Parcel::new();
         q.set_for_rpc(true);
         for pos in [40u32, 8, 24, 8, 0] {
@@ -2865,9 +3148,7 @@ mod tests {
             "upper_bound insert keeps the table sorted (dups allowed)"
         );
 
-        // The v2 strict-receive `binary_search` primitive
-        // (`Parcel::unflattenBinder`): a recorded position passes, an
-        // unrecorded one fails ⇒ `read_binder` returns BAD_VALUE.
+        // v2 strict receive (AOSP `unflattenBinder`): an unrecorded position ⇒ BAD_VALUE.
         for &good in &[0u32, 8, 24, 40] {
             assert!(q.rpc_object_position_present(good as usize), "pos {good}");
         }
@@ -2878,8 +3159,7 @@ mod tests {
             );
         }
 
-        // ---- v2 codec framing: positions survive encode→decode and
-        //      bodySize = 40 + parcelDataSize + 4·N (AOSP RpcState) ----
+        // ---- v2 codec: positions round-trip; bodySize = 40 + dataSize + 4·N (AOSP RpcState) ----
         let c = Android13PlusCodec::android16();
         let data = p.rpc_data_bytes().to_vec();
         let positions = p.rpc_object_positions().to_vec();
@@ -2908,28 +3188,28 @@ mod tests {
     }
 }
 
-/// Absolute little-endian byte goldens for the data-parcel wire.
-///
-/// Every assertion here is a **literal byte sequence**, never a round
-/// trip. A round trip re-reads with the same codec, so it passes on a
-/// big-endian host even when the bytes are wrong — which is exactly why
-/// the rest of the suite cannot see the wire layout at all (measured on
-/// qemu-user s390x: 36/36 green with a native-endian codec).
-///
-/// These goldens are therefore the *definition* of what a little-endian
-/// peer puts on the wire, and the `cross`/qemu s390x job runs them
-/// unchanged: a big-endian build that produces these bytes is
-/// cross-endian compatible by construction, no networking required.
-///
-/// Two things are deliberately absent. `flat_binder_object` and the
-/// kernel command stream are **not** wire — they are the kernel's own
-/// ABI and stay host-native; the one exception below pins that as a
-/// decision rather than an omission. Anything needing a live
-/// `ProcessState` (a non-null binder, a real fd) belongs in the
-/// kernel-host suite, not here — this module must stay hermetic so it
-/// can run under qemu.
 #[cfg(test)]
 mod wire_golden {
+    //! Absolute little-endian byte goldens for the data-parcel wire.
+    //!
+    //! Every assertion here is a **literal byte sequence**, never a round
+    //! trip. A round trip re-reads with the same codec, so it passes on a
+    //! big-endian host even when the bytes are wrong, and the rest of the
+    //! suite cannot see the wire layout at all.
+    //!
+    //! These goldens are therefore the *definition* of what a little-endian
+    //! peer puts on the wire, and the `cross`/qemu s390x job runs them
+    //! unchanged: a big-endian build that produces these bytes is
+    //! cross-endian compatible by construction, no networking required.
+    //!
+    //! Two things are deliberately absent. `flat_binder_object` and the
+    //! kernel command stream are **not** wire — they are the kernel's own
+    //! ABI and stay host-native; the one exception below pins that as a
+    //! decision rather than an omission. Anything needing a live
+    //! `ProcessState` (a non-null binder, a real fd) belongs in the
+    //! kernel-host suite, not here — this module must stay hermetic so it
+    //! can run under qemu.
+
     use super::*;
 
     /// The bytes a fresh kernel-mode parcel holds after writing `value`.
@@ -2973,10 +3253,7 @@ mod wire_golden {
 
     #[test]
     fn scalar_widening_matches_the_aidl_wire() {
-        // A lone `i8`/`u8`/`i16` widens to `i32` and `u16` to `u32`
-        // *before* the byte order applies. Reversing the un-widened
-        // value would emit one or two bytes and desync everything
-        // after it, so this is the trap a naive codec swap falls into.
+        // Scalars widen to 32 bits *before* the byte swap; swapping un-widened desyncs the rest.
         assert_eq!(enc(&-2i8), [0xFE, 0xFF, 0xFF, 0xFF]);
         assert_eq!(enc(&0xABu8), [0xAB, 0x00, 0x00, 0x00]);
         assert_eq!(enc(&-2i16), [0xFE, 0xFF, 0xFF, 0xFF]);
@@ -2985,8 +3262,7 @@ mod wire_golden {
 
     #[test]
     fn array_wire_is_absolute_little_endian() {
-        // Arrays invert the widening above: `i8`/`u8` are one byte per
-        // element, zero-padded to the 4-byte slot.
+        // Arrays invert the widening: `i8`/`u8` are one byte per element, zero-padded to 4 bytes.
         assert_eq!(
             enc(&[0xABu8, 0xCD, 0xEF][..]),
             [0x03, 0x00, 0x00, 0x00, 0xAB, 0xCD, 0xEF, 0x00]
@@ -3019,8 +3295,7 @@ mod wire_golden {
             [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x3F]
         );
 
-        // The length word is itself a wire `i32` — the byte range the
-        // pre-existing suite never asserted.
+        // The length word is itself a wire `i32`.
         assert_eq!(enc(&[0i32; 0][..]), [0x00, 0x00, 0x00, 0x00]);
         assert_eq!(enc(&None::<Vec<i32>>), [0xFF, 0xFF, 0xFF, 0xFF]);
     }
@@ -3032,9 +3307,7 @@ mod wire_golden {
             enc("AB"),
             [0x02, 0x00, 0x00, 0x00, 0x41, 0x00, 0x42, 0x00, 0x00, 0x00, 0x00, 0x00]
         );
-        // U+D55C is the only case here whose two bytes differ, so it is
-        // the one that catches a native-endian `u16` view; an ASCII-only
-        // corpus cannot.
+        // U+D55C's two bytes differ, so it catches a native-endian `u16` view; ASCII cannot.
         assert_eq!(enc("한"), [0x01, 0x00, 0x00, 0x00, 0x5C, 0xD5, 0x00, 0x00]);
         assert_eq!(enc(""), [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
         assert_eq!(enc(&None::<String>), [0xFF, 0xFF, 0xFF, 0xFF]);
@@ -3042,10 +3315,7 @@ mod wire_golden {
 
     #[test]
     fn stability_word_is_little_endian() {
-        // The category encoding itself is platform-dependent (android-12
-        // ships a different repr), so only the byte order is pinned —
-        // spelled out by shift so the expected order is readable. That is
-        // equal to `to_le_bytes` on every host and detects exactly as much.
+        // The category repr varies by platform (android-12), so only the byte order is pinned.
         let level = i32::from(crate::Stability::Vintf);
         assert_eq!(
             enc(&level),
@@ -3062,8 +3332,7 @@ mod wire_golden {
 
     #[test]
     fn a_parcel_of_mixed_fields_keeps_every_slot_aligned() {
-        // Each field's padding decides where the next one starts, so a
-        // per-type golden alone cannot catch a slot that moved.
+        // Each field's padding sets the next one's offset, which a per-type golden cannot catch.
         let mut parcel = Parcel::new();
         parcel.write(&-2i8).unwrap();
         parcel.write("한").unwrap();
@@ -3083,10 +3352,7 @@ mod wire_golden {
 
     #[test]
     fn the_command_stream_is_native_not_wire() {
-        // `BC_*` opcodes and handles go to the driver, which reads them
-        // with native loads. They share this `Parcel` and these 4-byte
-        // slots with the wire, so the accessor name is the only thing
-        // separating the two contracts — this is what it separates.
+        // The driver reads `BC_*` natively; only the accessor name picks native vs wire per slot.
         let cmd: u32 = crate::sys::binder::BC_ACQUIRE;
 
         let mut native = Parcel::new();
@@ -3097,9 +3363,7 @@ mod wire_golden {
         wire.write_le::<u32>(&cmd).unwrap();
         assert_eq!(wire.data.as_slice().to_vec(), cmd.to_le_bytes());
 
-        // The two agree on a little-endian host, which is precisely why
-        // a little-endian test run cannot tell the layers apart and this
-        // assertion has to reach a big-endian one to mean anything.
+        // Equal on a little-endian host; only a big-endian run can tell the two layers apart.
         if cfg!(target_endian = "big") {
             assert_ne!(native.data.as_slice(), wire.data.as_slice());
         }
@@ -3110,17 +3374,9 @@ mod wire_golden {
 
     #[test]
     fn null_binder_stays_a_native_island() {
-        // `flat_binder_object` is the kernel's UAPI struct, not wire: it
-        // is handed to the driver, which parses it with host-native
-        // loads. It must stay native even after the wire is fixed to
-        // little-endian, and this asserts that as a decision with a
-        // name — it goes red if someone "finishes the job" by swapping
-        // the object header too, which would break the kernel path on a
-        // big-endian host.
-        //
-        // The null object is the one that can be tested hermetically:
-        // `pointer() == 0` skips `acquire()`, so no `ProcessState`.
+        // `flat_binder_object` is driver-parsed UAPI: it stays host-native on a little-endian wire.
         let mut parcel = Parcel::new();
+        // A null binder skips `acquire()`, so the test needs no `ProcessState`.
         SerializeOption::serialize_option(None::<&crate::SIBinder>, &mut parcel).unwrap();
         let bytes = parcel.data.as_slice();
 
@@ -3162,8 +3418,7 @@ mod data_serde {
 
     #[test]
     fn the_bytes_are_the_ipc_bytes() {
-        // The point of reusing the IPC codec rather than inventing a
-        // format: what gets stored is what a peer would have received.
+        // Reusing the IPC codec means the stored bytes are exactly what a peer would receive.
         let value = -2i64;
         let mut kernel = Parcel::new();
         kernel.write(&value).unwrap();
@@ -3188,12 +3443,7 @@ mod data_serde {
 
     #[test]
     fn a_binder_field_is_refused_at_write_time() {
-        // Refused where the value is written, not audited afterwards:
-        // by the time bytes exist it is too late to tell a handle from a
-        // number. `ProcessState` is never initialized in this test
-        // process, and the kernel path would panic reaching for it —
-        // arriving at `BadType` instead is the whole point of the
-        // data-only mode.
+        // Refused at write time: even a null binder needs an object table this parcel lacks.
         let mut parcel = Parcel::new_data_only();
         let binder: Option<&crate::SIBinder> = None;
         assert_eq!(
@@ -3215,25 +3465,16 @@ mod data_serde {
             pfd.as_raw_fd() >= 0,
             "the caller's fd is untouched by the refusal"
         );
-        // The "before the dup" half is not asserted: an open-descriptor count is
-        // process-global, and sibling tests in this binary open and dup
-        // `/dev/null` in parallel, so it reports another test's fd as this one's
-        // leak. It was also vacuous where `/proc` is absent.
+        // No fd-count assertion: the count is process-global and sibling tests dup fds in parallel.
     }
 
     #[test]
     fn a_forged_object_in_the_input_never_becomes_a_binder() {
-        // Bytes that look like a `flat_binder_object` are just bytes:
-        // the decoder has no object table to resolve them against and
-        // says so, rather than fabricating a reference.
+        // Forged object bytes have no object table to resolve against, so no reference is made.
         let mut forged = Vec::new();
         forged.extend_from_slice(&crate::sys::BINDER_TYPE_BINDER.to_ne_bytes());
         forged.extend_from_slice(&[0u8; 20]);
-        // RPC mode short-circuits `read_object` before it reads a byte, so
-        // only a kernel parcel reaches the decoder. What it rejects there is
-        // the missing offset-table entry rather than the header bytes — the
-        // companion assertion pins a *different* failure for an input too
-        // short to be an object, so `BadType` is not simply constant.
+        // Kernel parcel only (RPC short-circuits); the 8-byte case shows BadType is not constant.
         assert_eq!(
             Parcel::from_vec(forged.clone()).read_object(true).err(),
             Some(StatusCode::BadType),
@@ -3244,8 +3485,7 @@ mod data_serde {
             Some(StatusCode::NotEnoughData),
             "too few bytes to be an object fails before the table lookup"
         );
-        // Data-only mode has no session to marshal a binder through, so the
-        // public decoder refuses regardless of what the bytes claim.
+        // Data-only mode has no session, so the public decoder refuses whatever the bytes claim.
         assert_eq!(
             from_bytes::<crate::SIBinder>(&forged),
             Err(StatusCode::BadType)
@@ -3256,9 +3496,7 @@ mod data_serde {
     #[cfg(feature = "rpc")]
     #[test]
     fn a_parcel_holding_a_reference_refuses_to_hand_out_its_bytes() {
-        // `objects` is always empty in RPC mode, so a guard that only
-        // looked there would hand out the bytes of a parcel whose
-        // meaning lives in a table that is not in them.
+        // RPC mode keeps `objects` empty, so the guard must consult the object positions too.
         let mut parcel = Parcel::new_data_only();
         parcel.write(&1i32).unwrap();
         assert!(parcel.as_bytes().is_ok());
@@ -3273,9 +3511,7 @@ mod data_serde {
 
     #[test]
     fn an_appended_object_table_is_refused_before_the_bytes_are_copied() {
-        // Nothing is opened or acquired: the refusal reads the object header
-        // only, and neither source object owns a reference (null pointer /
-        // `take_ownership: false`), so the source's drop has nothing to do.
+        // Neither source object owns a reference, so the source's drop has nothing to undo.
         for (object, expected) in [
             (
                 flat_binder_object::new_binder_with_flags(0),
@@ -3302,12 +3538,7 @@ mod data_serde {
     #[cfg(feature = "rpc")]
     #[test]
     fn a_holder_cut_from_a_session_parcel_cannot_be_exported() {
-        // The RPC binder encoding lives in the *body* (`[1i32][address]`),
-        // not in an object table, and `append_from` copies neither table
-        // with it — so all three `is_self_contained` checks are empty on
-        // the sink and the peer's session address would reach the file.
-        // Which body bytes are an object is knowable only on the v2 wire,
-        // so the refusal keys on the session rather than on a table.
+        // The binder lives in the body, which no copied table marks; the refusal keys on session.
         use crate::Parcelable;
 
         struct SessionOps;
@@ -3318,12 +3549,21 @@ mod data_serde {
             fn read_binder(&self, _p: &mut Parcel) -> Result<Option<crate::SIBinder>> {
                 Err(StatusCode::DeadObject)
             }
+            fn cancel_leaving(&self, _addrs: &[crate::rpc::RpcAddress]) {}
+            fn session_id(&self) -> *const () {
+                std::ptr::null()
+            }
+            fn records_binder_positions(&self) -> Result<bool> {
+                Ok(true)
+            }
+            fn acquire_copied(&self, _objects: &[&[u8]]) -> Result<CopiedBinders> {
+                Err(StatusCode::DeadObject)
+            }
         }
 
         const ADDR: [u8; 8] = *b"\xde\xad\xbe\xef\xfe\xed\xfa\xce";
 
-        // A holder as it arrives inside an RPC transaction: stability,
-        // payload length, then a flattened binder in the payload.
+        // A holder as it arrives in an RPC transaction: stability, length, then a flattened binder.
         let mut txn = Parcel::new();
         txn.set_for_rpc(true);
         txn.attach_rpc_ops(std::sync::Arc::new(SessionOps));
@@ -3337,9 +3577,10 @@ mod data_serde {
 
         let mut holder = crate::ParcelableHolder::new(crate::Stability::Local);
         holder.read_from_parcel(&mut txn).unwrap();
-        assert!(
-            txn.rpc_object_positions().len() == 1,
-            "the source records the position; the sub-parcel does not get it"
+        assert_eq!(
+            holder.with_payload_parcel(|p| p.map(|p| p.rpc_object_positions().to_vec())),
+            Some(vec![0]),
+            "the sub-parcel keeps the binder's position, shifted to its own start"
         );
 
         let exported = to_bytes(&holder);
@@ -3350,5 +3591,310 @@ mod data_serde {
             "the session address reached the exported bytes"
         );
         assert_eq!(exported.err(), Some(StatusCode::BadType));
+    }
+
+    /// `RpcParcelOps` that records every `cancel_leaving` call, standing in for a session.
+    #[cfg(feature = "rpc")]
+    #[derive(Default)]
+    struct RecordingOps(std::sync::Mutex<Vec<Vec<crate::rpc::RpcAddress>>>);
+    #[cfg(feature = "rpc")]
+    impl RpcParcelOps for RecordingOps {
+        fn write_binder(&self, _b: Option<&crate::SIBinder>, _p: &mut Parcel) -> Result<()> {
+            Err(StatusCode::DeadObject)
+        }
+        fn read_binder(&self, _p: &mut Parcel) -> Result<Option<crate::SIBinder>> {
+            Err(StatusCode::DeadObject)
+        }
+        fn cancel_leaving(&self, addrs: &[crate::rpc::RpcAddress]) {
+            self.0.lock().unwrap().push(addrs.to_vec());
+        }
+        fn session_id(&self) -> *const () {
+            (self as *const Self).cast()
+        }
+        fn records_binder_positions(&self) -> Result<bool> {
+            Ok(true)
+        }
+        fn acquire_copied(&self, _objects: &[&[u8]]) -> Result<CopiedBinders> {
+            Ok(CopiedBinders::default())
+        }
+    }
+
+    /// Inode of `fd`: which open file an fd table slot holds.
+    #[cfg(feature = "rpc")]
+    #[allow(clippy::unnecessary_cast)] // `st_ino` is not `u64` on every target.
+    fn inode_of(fd: impl std::os::fd::AsFd) -> u64 {
+        rustix::fs::fstat(fd).unwrap().st_ino as u64
+    }
+
+    /// AOSP `appendFrom` `isForRpc()`/`mSession` check: data-only bytes stay out of a session.
+    #[cfg(feature = "rpc")]
+    #[test]
+    fn append_from_refuses_a_session_less_source_into_a_session_parcel() {
+        let mut source = Parcel::new_data_only();
+        source.write(&1i32).unwrap();
+        let mut dest = parcel_with_reservations(std::sync::Arc::default(), 0);
+        assert_eq!(dest.append_all_from(&mut source), Err(StatusCode::BadType));
+        assert_eq!(dest.data_size(), 0, "refused before the copy");
+    }
+
+    #[cfg(feature = "rpc")]
+    #[test]
+    fn append_from_refuses_a_kernel_source_into_a_session_parcel() {
+        // No kernel object in range, so only the session check can refuse it.
+        let mut source = Parcel::new();
+        source.write(&1i32).unwrap();
+        let mut dest = parcel_with_reservations(std::sync::Arc::default(), 0);
+        assert_eq!(dest.append_all_from(&mut source), Err(StatusCode::BadType));
+        assert_eq!(dest.data_size(), 0, "refused before the copy");
+    }
+
+    /// AOSP `isForRpc()` mismatch the other way: neither RPC mode reaches a kernel parcel.
+    #[cfg(feature = "rpc")]
+    #[test]
+    fn append_from_refuses_an_rpc_source_into_a_kernel_parcel() {
+        let session = parcel_with_reservations(std::sync::Arc::default(), 0);
+        for mut source in [session, Parcel::new_data_only()] {
+            source.write(&1i32).unwrap();
+            let mut dest = Parcel::new();
+            assert_eq!(dest.append_all_from(&mut source), Err(StatusCode::BadType));
+            assert_eq!(dest.data_size(), 0, "refused before the copy");
+        }
+    }
+
+    /// A holder's sub-parcel keeps the positions and v1+ fds of its own range, shifted.
+    #[cfg(feature = "rpc")]
+    #[test]
+    fn holder_sub_parcel_positions_are_shifted_and_bounded() {
+        use crate::rpc::wire_android13::TYPE_NATIVE_FILE_DESCRIPTOR;
+        use crate::Parcelable;
+
+        let (outside, inside) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (outside_ino, inside_ino) = (inode_of(&outside), inode_of(&inside));
+
+        let mut txn = Parcel::new();
+        txn.configure_rpc(
+            std::sync::Arc::new(RecordingOps::default()),
+            crate::rpc::FileDescriptorTransportMode::Unix,
+            true,
+        );
+        let binder = |p: &mut Parcel| {
+            p.rpc_record_object_position(p.data_position());
+            p.write(&RPC_TYPE_BINDER).unwrap();
+            p.write_aligned_data(&[0xa5u8; 8]).unwrap();
+        };
+        let fd = |p: &mut Parcel, idx: i32| {
+            p.rpc_record_object_position(p.data_position());
+            p.write(&TYPE_NATIVE_FILE_DESCRIPTOR).unwrap();
+            p.write(&idx).unwrap();
+        };
+        binder(&mut txn); // 0: before the holder
+        txn.write(&0i32).unwrap(); // STABILITY_LOCAL
+        txn.write(&20i32).unwrap(); // payload length
+        fd(&mut txn, 1); // 20: first byte of the payload
+        binder(&mut txn); // 28
+        fd(&mut txn, 0); // 40: first byte after the payload
+        txn.rpc_set_in_fds(vec![outside.into(), inside.into()]);
+        txn.set_data_position(12);
+
+        let mut holder = crate::ParcelableHolder::new(crate::Stability::Local);
+        holder.read_from_parcel(&mut txn).unwrap();
+        assert_eq!(
+            txn.data_position(),
+            40,
+            "the outer read resumes after the payload"
+        );
+        holder.with_payload_parcel(|sub| {
+            let sub = sub.expect("an undecoded payload");
+            assert_eq!(sub.data_size(), 20);
+            assert_eq!(
+                sub.rpc_object_positions(),
+                &[0, 8],
+                "in range only, minus its start"
+            );
+            assert_eq!(
+                sub.rpc_fd_mode(),
+                crate::rpc::FileDescriptorTransportMode::Unix
+            );
+            assert!(sub.rpc_record_fd_positions());
+            assert_eq!(
+                le_i32_at(sub.rpc_data_bytes(), 4),
+                Some(0),
+                "the index names the sub-parcel's own table"
+            );
+            assert_eq!(sub.rpc_take_in_fd(0).map(inode_of), Some(inside_ino));
+        });
+        assert!(
+            txn.rpc_take_in_fd(1).is_none(),
+            "the payload's fd moved out"
+        );
+        assert_eq!(txn.rpc_take_in_fd(0).map(inode_of), Some(outside_ino));
+    }
+
+    /// A copied fd's index names the destination's own table, after the fds it already holds.
+    #[cfg(feature = "rpc")]
+    #[test]
+    fn append_from_rewrites_a_copied_fd_index_into_the_destination_table() {
+        use crate::ParcelFileDescriptor;
+
+        let ops = std::sync::Arc::new(RecordingOps::default());
+        let rpc_parcel = || {
+            let mut p = Parcel::new();
+            p.configure_rpc(
+                ops.clone(),
+                crate::rpc::FileDescriptorTransportMode::Unix,
+                true,
+            );
+            p
+        };
+        let (first, copied) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (first_ino, copied_ino) = (inode_of(&first), inode_of(&copied));
+
+        let mut source = rpc_parcel();
+        source.write(&ParcelFileDescriptor::new(copied)).unwrap();
+        let mut dest = rpc_parcel();
+        dest.write(&ParcelFileDescriptor::new(first)).unwrap();
+        let start = dest.data_position();
+        dest.append_all_from(&mut source).unwrap();
+
+        let shifted: Vec<u32> = source
+            .rpc_object_positions()
+            .iter()
+            .map(|&p| p + start as u32)
+            .collect();
+        assert_eq!(&dest.rpc_object_positions()[1..], &shifted[..]);
+        let copied_pos = shifted[0] as usize;
+        assert_eq!(le_i32_at(dest.rpc_data_bytes(), copied_pos + 4), Some(1));
+        let inodes: Vec<u64> = dest.rpc_out_fds().iter().map(inode_of).collect();
+        assert_eq!(inodes, vec![first_ino, copied_ino]);
+        assert_eq!(
+            source.rpc_out_fds().len(),
+            1,
+            "the source keeps its fd: the copy is a dup"
+        );
+    }
+
+    /// An RPC parcel bound to `ops` with `n` recorded `leaving_addrs`.
+    #[cfg(feature = "rpc")]
+    fn parcel_with_reservations(ops: std::sync::Arc<RecordingOps>, n: u64) -> Parcel {
+        use crate::rpc::{AddressSpace, RpcAddress};
+        let mut p = Parcel::new();
+        p.configure_rpc(ops, crate::rpc::FileDescriptorTransportMode::None, false);
+        let mut counter = 0u64;
+        for _ in 0..n {
+            p.rpc_record_leaving_addr(RpcAddress::unique(&mut counter, AddressSpace::Acceptor));
+        }
+        p
+    }
+
+    #[cfg(feature = "rpc")]
+    #[test]
+    fn unsent_rpc_parcel_settles_once_on_drop() {
+        let ops = std::sync::Arc::new(RecordingOps::default());
+        let p = parcel_with_reservations(ops.clone(), 2);
+        assert!(
+            ops.0.lock().unwrap().is_empty(),
+            "nothing settles before the drop"
+        );
+        drop(p);
+        {
+            let calls = ops.0.lock().unwrap();
+            assert_eq!(calls.len(), 1, "one `cancel_leaving` per dropped parcel");
+            assert_eq!(calls[0].len(), 2, "every recorded address is handed back");
+        }
+
+        // Leaving RPC mode discards the fields, so it settles the same way; drop finds nothing.
+        let mut p = parcel_with_reservations(ops.clone(), 1);
+        p.set_for_rpc(false);
+        assert_eq!(ops.0.lock().unwrap().len(), 2);
+        drop(p);
+        assert_eq!(
+            ops.0.lock().unwrap().len(),
+            2,
+            "no second settlement after `set_for_rpc`"
+        );
+    }
+
+    #[cfg(feature = "rpc")]
+    #[test]
+    fn sent_rpc_parcel_does_not_settle() {
+        let ops = std::sync::Arc::new(RecordingOps::default());
+        let p = parcel_with_reservations(ops.clone(), 1);
+        p.rpc_begin_send().unwrap();
+        p.rpc_end_send(true);
+        drop(p);
+        assert!(
+            ops.0.lock().unwrap().is_empty(),
+            "a `Sent` parcel's bumps belong to the peer's DEC_STRONG"
+        );
+    }
+
+    /// A claim a panic left behind (`InFlight` at drop) means no send completed: it settles.
+    #[cfg(feature = "rpc")]
+    #[test]
+    fn in_flight_rpc_parcel_settles_on_drop() {
+        let ops = std::sync::Arc::new(RecordingOps::default());
+        let p = parcel_with_reservations(ops.clone(), 1);
+        p.rpc_begin_send().unwrap();
+        drop(p);
+        assert_eq!(ops.0.lock().unwrap().len(), 1);
+    }
+
+    /// AOSP Parcel.cpp `appendFrom`: "Cannot append Parcels from different sessions".
+    #[cfg(feature = "rpc")]
+    #[test]
+    fn append_from_refuses_another_session() {
+        let mut source = parcel_with_reservations(std::sync::Arc::default(), 0);
+        source.write(&7i32).unwrap();
+        let mut dest = parcel_with_reservations(std::sync::Arc::default(), 0);
+        assert_eq!(dest.append_all_from(&mut source), Err(StatusCode::BadType));
+        assert!(
+            dest.as_bytes().unwrap().is_empty(),
+            "refused before the copy"
+        );
+    }
+
+    #[cfg(feature = "rpc")]
+    #[test]
+    fn kernel_parcel_ignores_send_state() {
+        let p = Parcel::new();
+        assert_eq!(p.rpc_begin_send(), Ok(()));
+        assert_eq!(
+            p.rpc_begin_send(),
+            Ok(()),
+            "no state to claim: every claim succeeds"
+        );
+        p.rpc_end_send(true);
+        p.rpc_end_send(false);
+        assert!(p.rpc.is_none(), "the calls do not create `RpcFields`");
+        drop(p);
+    }
+
+    #[cfg(feature = "rpc")]
+    #[test]
+    fn append_from_refuses_a_source_with_reservations() {
+        let ops = std::sync::Arc::new(RecordingOps::default());
+        let mut source = parcel_with_reservations(ops.clone(), 1);
+        source.write(&7i32).unwrap();
+        let mut dest = parcel_with_reservations(ops.clone(), 0);
+        assert_eq!(dest.append_all_from(&mut source), Err(StatusCode::BadType));
+        assert!(
+            dest.as_bytes().unwrap().is_empty(),
+            "refused before the copy"
+        );
+
+        // A source without reservations is fine until the destination has been sent.
+        let mut clean = parcel_with_reservations(ops.clone(), 0);
+        clean.write(&7i32).unwrap();
+        assert_eq!(dest.append_all_from(&mut clean), Ok(()));
+        dest.rpc_begin_send().unwrap();
+        dest.rpc_end_send(true);
+        assert_eq!(dest.append_all_from(&mut clean), Err(StatusCode::BadType));
+    }
+
+    #[test]
+    fn parcel_is_send_and_sync() {
+        // The send state is an atomic, not a `Cell`, so these auto traits survive.
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Parcel>();
     }
 }

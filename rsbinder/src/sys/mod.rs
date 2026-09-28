@@ -1,9 +1,32 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-// Lint allowances scoped to the bindgen output so `dead_code` stays live
-// for the hand-written wrappers below (an ioctl the crate never issues is
-// then visible).
+//! Binder kernel UAPI: bindgen output plus typed ioctl wrappers.
+//!
+//! # ioctl safety
+//!
+//! Shared SAFETY rationale for every `ioctl::ioctl(fd, ctl)` in `binder`:
+//! `rustix::ioctl::ioctl` is unsafe because it cannot verify that the
+//! opcode matches the argument type or that the request is valid for
+//! the fd. In each wrapper the opcode is built at compile time from
+//! the binder UAPI request number (`b'b'`, N) and the exact argument
+//! type via `ioctl::opcode::{read_write,write}::<T>`, the typed
+//! `Setter`/`Updater` holds a value/buffer of precisely that `T`, and
+//! the `Fd: AsFd` bound guarantees a valid borrowed fd for the call's
+//! duration. So the opcode <-> arg-type <-> fd precondition holds.
+//! Each block notes only its request.
+//!
+//! These three conditions cover every request whose argument is plain
+//! data. `BINDER_WRITE_READ` is the exception: `binder_write_read`
+//! carries two raw addresses, and the kernel reads `write_size` bytes
+//! from `write_buffer` and writes up to `read_size` bytes to
+//! `read_buffer`. The argument type cannot state that, so
+//! `binder::write_read` is an `unsafe fn` whose caller guarantees that
+//! `write_buffer` is readable for `write_size` bytes, `read_buffer` is
+//! writable for `read_size` bytes, and both stay allocated and
+//! unaliased by other writers until the ioctl returns.
+
+// Allowances scoped to the bindgen output: `dead_code` still flags unused wrappers below.
 #[allow(
     non_camel_case_types,
     non_upper_case_globals,
@@ -56,10 +79,7 @@ pub mod binder {
     pub const BR_ONEWAY_SPAM_SUSPECT: binder_driver_return_protocol =
         binder_driver_return_protocol_BR_ONEWAY_SPAM_SUSPECT;
 
-    // Freeze observer additions (Android 14+, kernel 6.5+). These BR
-    // constants are exposed so the RETURN_STRINGS table can decode them;
-    // dispatch is not yet wired, so the default arm still treats them as
-    // "Unknown BR_ return" and the kernel wire stays byte-unchanged.
+    // Freeze BRs (6.5+): `wait_for_response` handles PENDING_FROZEN; the rest log BAD COMMAND.
     pub const BR_TRANSACTION_PENDING_FROZEN: binder_driver_return_protocol =
         binder_driver_return_protocol_BR_TRANSACTION_PENDING_FROZEN;
     #[allow(dead_code)] // freeze dispatch not wired yet (see above)
@@ -88,8 +108,7 @@ pub mod binder {
         binder_driver_command_protocol_BC_INCREFS_DONE;
     pub const BC_ACQUIRE_DONE: binder_driver_command_protocol =
         binder_driver_command_protocol_BC_ACQUIRE_DONE;
-    // Names the driver defines but neither AOSP libbinder nor rsbinder ever
-    // sends; kept so the table matches the UAPI header.
+    // Defined by the driver, never sent by AOSP libbinder or rsbinder; kept to match the UAPI.
     #[allow(dead_code)]
     pub const BC_ATTEMPT_ACQUIRE: binder_driver_command_protocol =
         binder_driver_command_protocol_BC_ATTEMPT_ACQUIRE;
@@ -112,11 +131,7 @@ pub mod binder {
     pub const BC_REPLY_SG: binder_driver_command_protocol =
         binder_driver_command_protocol_BC_REPLY_SG;
 
-    // Freeze observer BC counterparts. The send path
-    // (`BC_REQUEST_FREEZE_NOTIFICATION` and friends) is not yet wired;
-    // these constants plus the `binder_handle_cookie` struct and
-    // `binder_frozen_state_info` payload are exposed so call sites can
-    // pattern-match on them once the dispatch arms land.
+    // Freeze BCs and their payload structs, exposed ahead of the unwired send path.
     #[allow(dead_code)] // freeze dispatch not wired yet (see above)
     pub const BC_REQUEST_FREEZE_NOTIFICATION: binder_driver_command_protocol =
         binder_driver_command_protocol_BC_REQUEST_FREEZE_NOTIFICATION;
@@ -130,24 +145,15 @@ pub mod binder {
     use rustix::{io, ioctl};
     use std::os::fd::AsFd;
 
-    // Shared SAFETY rationale for every `ioctl::ioctl(fd, ctl)` below:
-    // `rustix::ioctl::ioctl` is unsafe because it cannot verify that the
-    // opcode matches the argument type or that the request is valid for
-    // the fd. In each wrapper the opcode is built at compile time from
-    // the binder UAPI request number (`b'b'`, N) and the exact argument
-    // type via `ioctl::opcode::{read_write,write}::<T>`, the typed
-    // `Setter`/`Updater` holds a value/buffer of precisely that `T`, and
-    // the `Fd: AsFd` bound guarantees a valid borrowed fd for the call's
-    // duration. So the opcode <-> arg-type <-> fd precondition holds and
-    // no memory unsafety is possible. Each block notes only its request.
+    // Shared SAFETY rationale for every ioctl below: module doc, "ioctl safety".
 
-    // nix::ioctl_readwrite!(write_read, b'b', 1, binder_write_read);
-    pub(crate) fn write_read<Fd: AsFd>(
+    /// Safety: both buffer addresses must satisfy the module doc's `BINDER_WRITE_READ` contract.
+    pub(crate) unsafe fn write_read<Fd: AsFd>(
         fd: Fd,
         write_read: &mut binder_write_read,
     ) -> std::result::Result<(), io::Errno> {
         unsafe {
-            // SAFETY: see shared rationale above. Request: BINDER_WRITE_READ.
+            // SAFETY: shared rationale above; the buffer addresses are the caller's contract.
             let ctl = ioctl::Updater::<
                 { ioctl::opcode::read_write::<binder_write_read>(b'b', 1) },
                 _,
@@ -156,7 +162,6 @@ pub mod binder {
         }
     }
 
-    // nix::ioctl_write_ptr!(set_max_threads, b'b', 5, __u32);
     pub(crate) fn set_max_threads<Fd: AsFd>(
         fd: Fd,
         max_threads: u32,
@@ -169,7 +174,6 @@ pub mod binder {
         }
     }
 
-    // nix::ioctl_write_ptr!(set_context_mgr, b'b', 7, __s32);
     pub(crate) fn set_context_mgr<Fd: AsFd>(
         fd: Fd,
         pid: i32,
@@ -181,7 +185,6 @@ pub mod binder {
         }
     }
 
-    // nix::ioctl_readwrite!(version, b'b', 9, binder_version);
     pub(crate) fn version<Fd: AsFd>(
         fd: Fd,
         ver: &mut binder_version,
@@ -196,7 +199,6 @@ pub mod binder {
         }
     }
 
-    // nix::ioctl_write_ptr!(set_context_mgr_ext, b'b', 13, flat_binder_object);
     pub(crate) fn set_context_mgr_ext<Fd: AsFd>(
         fd: Fd,
         obj: flat_binder_object,
@@ -211,7 +213,6 @@ pub mod binder {
         }
     }
 
-    // nix::ioctl_write_ptr!(enable_oneway_spam_detection, b'b', 16, __u32);
     pub(crate) fn enable_oneway_spam_detection<Fd: AsFd>(
         fd: Fd,
         enable: __u32,
@@ -223,7 +224,6 @@ pub mod binder {
         }
     }
 
-    // nix::ioctl_readwrite!(binder_ctl_add, b'b', 1, binderfs_device);
     // `binderfs::add_device` substitutes a mock under `cfg(test)`.
     #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn binder_ctl_add<Fd: AsFd>(
@@ -240,7 +240,6 @@ pub mod binder {
         }
     }
 
-    // nix::ioctl_write_ptr!(set_idle_timeout, b'b', 3, __s64);
     // BINDER_SET_IDLE_TIMEOUT is a no-op in every shipping driver; kept for UAPI completeness.
     #[allow(dead_code)]
     pub(crate) fn set_idle_timeout<Fd: AsFd>(
@@ -254,7 +253,6 @@ pub mod binder {
         }
     }
 
-    // nix::ioctl_write_ptr!(set_idle_priority, b'b', 6, __s32);
     // BINDER_SET_IDLE_PRIORITY is a no-op in every shipping driver; kept for UAPI completeness.
     #[allow(dead_code)]
     pub(crate) fn set_idle_priority<Fd: AsFd>(
@@ -268,7 +266,6 @@ pub mod binder {
         }
     }
 
-    // nix::ioctl_write_ptr!(thread_exit, b'b', 8, __s32);
     pub(crate) fn thread_exit<Fd: AsFd>(fd: Fd, pid: i32) -> std::result::Result<(), io::Errno> {
         unsafe {
             // SAFETY: see shared rationale above. Request: BINDER_THREAD_EXIT.
@@ -277,7 +274,6 @@ pub mod binder {
         }
     }
 
-    // nix::ioctl_readwrite!(get_node_debug_info, b'b', 11, binder_node_debug_info);
     // debug-only ioctl; no crate path issues it yet.
     #[allow(dead_code)]
     pub(crate) fn get_node_debug_info<Fd: AsFd>(
@@ -294,7 +290,6 @@ pub mod binder {
         }
     }
 
-    // nix::ioctl_readwrite!(get_node_info_for_ref, b'b', 12, binder_node_info_for_ref);
     pub(crate) fn get_node_info_for_ref<Fd: AsFd>(
         fd: Fd,
         node_info: &mut binder_node_info_for_ref,
@@ -309,7 +304,6 @@ pub mod binder {
         }
     }
 
-    // nix::ioctl_write_ptr!(freeze, b'b', 14, binder_freeze_info);
     // plan 4-3 Phase B (freeze) will issue this; declared ahead so the opcode is pinned.
     #[allow(dead_code)]
     pub(crate) fn freeze<Fd: AsFd>(
@@ -326,7 +320,6 @@ pub mod binder {
         }
     }
 
-    // nix::ioctl_readwrite!(get_frozen_info, b'b', 15, binder_frozen_status_info);
     // plan 4-3 Phase B (freeze) will issue this; declared ahead so the opcode is pinned.
     #[allow(dead_code)]
     pub(crate) fn get_frozen_info<Fd: AsFd>(
@@ -343,10 +336,7 @@ pub mod binder {
         }
     }
 
-    // Android 12+ driver. The kernel returns 12
-    // bytes describing the last transaction failure on the current
-    // thread (id / command / errno). Older kernels respond `ENOTTY`;
-    // callers should treat that as "feature unavailable".
+    // Android 12+: 12 bytes (id/command/errno) on the thread's last failure; older: `ENOTTY`.
     pub(crate) fn get_extended_error<Fd: AsFd>(
         fd: Fd,
         ee: &mut binder_extended_error,

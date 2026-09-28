@@ -13,6 +13,16 @@
 //! * a non-UDS transport (`mem`) never passes fds (rejected
 //!   by type at send; zero fds reach the peer).
 //!
+//! # v1+ AOSP-faithful path
+//!
+//! `fd_v1plus_aosp_roundtrip_both_directions` runs the v1+ FD-over-RPC path end-to-end over a
+//! real UDS: FD mode negotiated in the `RpcConnectionHeader`, `SCM_RIGHTS` carried on the
+//! `aosp_framing` no-length-prefix wire, the `[not-null|hasComm|TYPE|fdIndex]` body, and
+//! strict object-position read, at v1 (android-14/15) **and** v2 (android-16). The fd travels
+//! both ways: as a transaction *argument* (client→server, the server inbound-args gate) and in
+//! the *reply* (server→client), valid + `O_CLOEXEC` at the receiver. This is the hermetic
+//! symmetric proof; the AOSP-faithfulness gate that decides is real-libbinder interop.
+//!
 //! Separate test binary; `#![cfg(feature = "rpc")]`.
 
 #![cfg(feature = "rpc")]
@@ -166,8 +176,7 @@ fn wait_sock(p: &std::path::Path) {
     panic!("socket never appeared");
 }
 
-/// Both peers opt in over UDS ⇒ fd passes both ways, valid +
-/// O_CLOEXEC at the receiver.
+/// Both peers opt in over UDS ⇒ fd passes both ways, valid + O_CLOEXEC at the receiver.
 #[test]
 fn fd_roundtrip_when_both_opt_in_over_uds() {
     let path = tmp_sock("ok");
@@ -194,8 +203,7 @@ fn fd_roundtrip_when_both_opt_in_over_uds() {
     let pfd = ParcelFileDescriptor::new(tf);
     assert_eq!(call_len_of(&root, &pfd).unwrap(), 16);
 
-    // reply direction: server hands back an fd; client reads it +
-    // checks it is O_CLOEXEC.
+    // reply direction: server hands back an fd; client reads it + checks it is O_CLOEXEC.
     let rp = rp_of(&root);
     let d = rp.build_request(DESC).unwrap();
     let mut r = rp.transact(TX_GIVE_FD, &d, 0).unwrap().unwrap();
@@ -222,8 +230,7 @@ fn fd_roundtrip_when_both_opt_in_over_uds() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// No opt-in (or one-sided) ⇒ fd write is the
-/// `FdsNotAllowed` reject, never a silent corruption or an error-less hang.
+/// No or one-sided opt-in ⇒ fd write is the `FdsNotAllowed` reject, never corruption or a hang.
 #[test]
 fn fd_rejected_without_mutual_opt_in() {
     // (a) server does NOT support Unix; client requests it.
@@ -257,10 +264,36 @@ fn fd_rejected_without_mutual_opt_in() {
     server.stop_accepting();
     let _ = bg.join();
     let _ = std::fs::remove_file(&path);
+
+    // (b) server supports Unix; the client never negotiates.
+    let path = tmp_sock("noopt_b");
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    server.set_supported_fd_modes(&[FdMode::Unix]);
+    server
+        .set_root(Interface::as_binder(&Binder::new(BnFd(Box::new(FdSvc)))))
+        .expect("set_root");
+    let bg = server.run_background();
+    wait_sock(&path);
+
+    let client = RpcSession::setup_unix_client(&path).expect("connect");
+    let root = client.get_root().unwrap();
+    let mut tf = tempfile();
+    tf.write_all(b"x").unwrap();
+    let pfd = ParcelFileDescriptor::new(tf);
+    assert_eq!(
+        call_len_of(&root, &pfd).unwrap_err(),
+        StatusCode::FdsNotAllowed,
+        "client didn't opt in → None mode, the same reject"
+    );
+
+    drop(root);
+    drop(client);
+    server.stop_accepting();
+    let _ = bg.join();
+    let _ = std::fs::remove_file(&path);
 }
 
-/// A non-UDS transport (`mem`) cannot pass fds — rejected by
-/// type at the transport, zero fds reach the peer.
+/// A non-UDS transport (`mem`) rejects fds by type at the transport; zero fds reach the peer.
 #[test]
 fn fd_rejected_on_non_uds_transport() {
     let (a, b) = MemTransport::pair();
@@ -275,9 +308,7 @@ fn fd_rejected_on_non_uds_transport() {
     });
 
     let client = RpcSession::new(Box::new(b), AddressSpace::Initiator).expect("RpcSession::new");
-    // Negotiation itself succeeds logically (both "support" Unix), but
-    // the mem transport's fd methods reject by type, so no fd is ever
-    // transferred and the call fails cleanly.
+    // Negotiation succeeds, but the mem transport's fd methods reject, so the call fails.
     let _ = client.negotiate_fd_transport(FdMode::Unix);
     let root = client.get_root().unwrap();
     let mut tf = tempfile();
@@ -297,17 +328,7 @@ fn fd_rejected_on_non_uds_transport() {
     let _ = h.join();
 }
 
-/// The **v1+ AOSP-faithful**
-/// FD-over-RPC path end-to-end over a real UDS — FD mode
-/// negotiated in the `RpcConnectionHeader`, `SCM_RIGHTS` carried on the
-/// `aosp_framing` no-length-prefix wire, the
-/// `[not-null|hasComm|TYPE|fdIndex]` body, and strict
-/// object-position read, at v1 (android-14/15) **and** v2
-/// (android-16). fd travels both ways: as a transaction *argument*
-/// (client→server, the server inbound-args gate) and in the *reply*
-/// (server→client), valid + `O_CLOEXEC` at the receiver. This is the
-/// hermetic symmetric proof; the non-negotiable AOSP-faithfulness gate
-/// is real-libbinder interop.
+/// v1 and v2 AOSP-framed fd round-trip, arg and reply; see module doc "v1+ AOSP-faithful path".
 #[test]
 fn fd_v1plus_aosp_roundtrip_both_directions() {
     for ver in [1u32, 2u32] {
@@ -321,8 +342,7 @@ fn fd_v1plus_aosp_roundtrip_both_directions() {
         let bg = server.run_background();
         wait_sock(&path);
 
-        // Client opts into android-13+ v`ver` AND Unix FD mode via the
-        // connection header (NOT the R34 GET_FD_MODE special-transact).
+        // FD mode rides the connection header, not the R34 GET_FD_MODE special-transact.
         let client = RpcSession::setup_unix_client_android13plus_fd(&path, ver, FdMode::Unix)
             .expect("android-13+ fd connect");
         assert_eq!(
@@ -332,8 +352,7 @@ fn fd_v1plus_aosp_roundtrip_both_directions() {
         );
         let root = client.get_root().expect("get_root");
 
-        // arg direction: client passes an fd; server reads its bytes
-        // (exercises the A2b server inbound-args gate at v1+).
+        // arg direction: client passes an fd; server reads it (inbound-args gate at v1+).
         let mut tf = tempfile();
         tf.write_all(b"hello-fd-payload-v").unwrap();
         tf.write_all(ver.to_string().as_bytes()).unwrap();
@@ -345,8 +364,7 @@ fn fd_v1plus_aosp_roundtrip_both_directions() {
             "v{ver}: server read the arg fd over the AOSP wire"
         );
 
-        // reply direction: server hands back an fd; client reads it +
-        // checks O_CLOEXEC.
+        // reply direction: server hands back an fd; client reads it + checks O_CLOEXEC.
         let rp = rp_of(&root);
         let d = rp.build_request(DESC).unwrap();
         let mut r = rp.transact(TX_GIVE_FD, &d, 0).unwrap().unwrap();

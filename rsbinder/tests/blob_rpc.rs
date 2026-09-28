@@ -52,9 +52,7 @@ impl Remotable for BlobSvc {
         match code {
             GET_BLOB => {
                 let len: i32 = reader.read()?;
-                // The service says nothing about the form: whether this
-                // goes inline or through a region is decided by the
-                // parcel it is writing into.
+                // Inline vs region is decided by the parcel written into, not the service.
                 reply.write_blob(&pattern(len as usize), false)
             }
             _ => Err(rsbinder::StatusCode::UnknownTransaction),
@@ -66,9 +64,7 @@ impl Remotable for BlobSvc {
     }
 }
 
-/// One bound server + a connector for it, as in `rpc_shared_memory.rs`:
-/// Linux/macOS get a filesystem socket, Android an abstract name (the
-/// `shell` domain cannot bind under `/data/local/tmp`).
+/// As in `rpc_shared_memory.rs`: Android binds an abstract name (`shell` can't in /data/local/tmp).
 struct Bound {
     server: Arc<RpcServer>,
     #[cfg(not(target_os = "android"))]
@@ -150,9 +146,7 @@ impl Bound {
 /// Ask for `len` bytes and return `(payload, went_inline)`.
 fn fetch(session: &RpcSession, len: usize) -> (Vec<u8>, bool) {
     let root = session.get_root().expect("get_root");
-    // A generated `from_binder` would do this; a hand-written client has
-    // to stamp the descriptor itself, or `prepare_transact` writes an
-    // interface token the server refuses with `BadType`.
+    // Hand-written client: without the stamp the server refuses the token with `BadType`.
     rsbinder::__rpc_stamp_descriptor(&root, DESCRIPTOR);
     let remote = root.as_remote().expect("an RPC root is a proxy");
     let mut data = remote.prepare_transact(true).expect("prepare_transact");
@@ -183,8 +177,7 @@ fn serve(tag: &str, fd_mode: bool) -> (Bound, thread::JoinHandle<()>, RpcSession
     (bound, bg, session)
 }
 
-/// AC-2.4: with fd passing negotiated, a payload over the limit arrives
-/// as a shared region — the fd crossed `SCM_RIGHTS` and was mapped here.
+/// AC-2.4: with fd passing, an over-limit payload arrives as a region mapped via `SCM_RIGHTS`.
 #[test]
 fn a_large_blob_crosses_a_unix_session_as_a_region() {
     let (bound, bg, session) = serve("fd", true);
@@ -204,10 +197,7 @@ fn a_large_blob_crosses_a_unix_session_as_a_region() {
     bound.finish(bg);
 }
 
-/// AC-2.5, e2e half: the same payload over a session with no fd mode
-/// arrives inline. Nothing in the service or the caller says so — the
-/// parcel knows it cannot carry an fd, which is AOSP's `!mAllowFds`
-/// branch.
+/// AC-2.5 (e2e): with no fd mode the parcel itself inlines the payload — AOSP's `!mAllowFds`.
 #[test]
 fn a_large_blob_falls_back_to_inline_without_fd_passing() {
     let (bound, bg, session) = serve("nofd", false);

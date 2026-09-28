@@ -19,7 +19,13 @@
 //! factory + `run_background` pattern as the UDS e2e suite. The
 //! underlying `VsockTransport::from_stream` / `VsockTransport::connect`
 //! are exercised (one through the server's accept loop, the other
-//! through the test's client construction).
+//! through the test's client construction). The round-trip test's client connects through
+//! `VsockTransport::connect` directly so its `PeerIdentity::Vsock` assertion reads what the
+//! wire reports.
+//!
+//! `RpcTransport::shutdown` waking a blocked `recv_frame` is the primitive that ends a
+//! client's incoming-connection threads and any user `serve_blocking` on session death;
+//! `vsock_shutdown_wakes_blocked_recv` pins it for vsock.
 
 #![cfg(all(feature = "rpc-vsock", target_os = "linux"))]
 
@@ -86,13 +92,7 @@ fn ping_via(root: &SIBinder, msg: &str) -> Result<String> {
     r.read::<String>()
 }
 
-/// Core round-trip over loopback vsock (`VMADDR_CID_LOCAL`) — server
-/// built with `RpcServer::setup_vsock_server`.
-///
-/// Server-side: the same factory + `run_background` shape used by the
-/// UDS e2e suite — backend swap is the only difference. Client-side:
-/// `VsockTransport::connect` so the `PeerIdentity::Vsock`
-/// assertion keeps its original wire-level reach.
+/// Loopback vsock round-trip through a `VsockTransport::connect` client; see module doc.
 #[test]
 #[ignore = "needs Linux vsock loopback (modprobe vsock_loopback) or a peer VM"]
 fn vsock_loopback_e2e() {
@@ -129,10 +129,7 @@ fn vsock_loopback_e2e() {
     let _ = bg.join();
 }
 
-/// Plan 2-20 (`RpcTransport::shutdown`): a thread blocked in `recv_frame`
-/// on a vsock connection returns once `shutdown()` is called on the same
-/// transport — the primitive that ends a client's incoming-connection
-/// threads and any user `serve_blocking` on session death.
+/// Plan 2-20: `shutdown()` on a vsock transport wakes a thread blocked in its `recv_frame`.
 #[test]
 #[ignore = "needs Linux vsock loopback (modprobe vsock_loopback) or a peer VM"]
 fn vsock_shutdown_wakes_blocked_recv() {
@@ -151,11 +148,7 @@ fn vsock_shutdown_wakes_blocked_recv() {
 
     let t: Arc<dyn RpcTransport> =
         Arc::new(VsockTransport::connect(VMADDR_CID_LOCAL, port).expect("client connect"));
-    // The reader reports through a channel, so "shutdown must wake it"
-    // is a `recv_timeout` that *fails* on regression. Asserting on
-    // `elapsed()` after `reader.join()` cannot: if `shutdown` stops
-    // waking the reader, the join never returns and the test hangs
-    // until the CI timeout instead of failing here.
+    // A channel, not `join()`: a reader `shutdown` fails to wake would hang the join, not fail.
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     let reader = {
         let t = Arc::clone(&t);
@@ -175,17 +168,14 @@ fn vsock_shutdown_wakes_blocked_recv() {
     );
     reader.join().expect("reader thread");
     server.stop_accepting();
-    // Join the workers before the accept loop, as the sibling test does:
-    // a worker still serving this client would otherwise outlive the test.
+    // Workers first: one still serving this client would otherwise outlive the test.
     server.join_workers();
     if let Err(p) = bg.join() {
-        eprintln!("WARNING: vsock accept loop panicked: {p:?}");
+        std::panic::resume_unwind(p);
     }
 }
 
-/// Plan 2-20 (`RpcSession::close_session` on a vsock session): a user
-/// `serve_blocking` thread ends, the death recipient fires, and the
-/// server sees the connection go — the whole teardown path over vsock.
+/// Plan 2-20: `close_session` ends `serve_blocking`, fires death, and the server sees the close.
 #[test]
 #[ignore = "needs Linux vsock loopback (modprobe vsock_loopback) or a peer VM"]
 fn vsock_session_shutdown_ends_serve_thread() {
@@ -236,10 +226,9 @@ fn vsock_session_shutdown_ends_serve_thread() {
     drop(client);
     server.stop_accepting();
     server.join_workers();
-    // Surface an accept-loop panic instead of discarding it — a future
-    // regression there would otherwise leave every test green.
+    // Surface an accept-loop panic; discarding it would leave every test green.
     if let Err(p) = bg.join() {
-        eprintln!("WARNING: vsock accept loop panicked: {p:?}");
+        std::panic::resume_unwind(p);
     }
 }
 

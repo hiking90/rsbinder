@@ -4,7 +4,7 @@
 //! `Android13PlusCodec` — the android-13+ *versioned* RPC wire, an
 //! **additive** [`super::wire::WireCodec`] impl behind the same trait
 //! as [`super::wire::R34Codec`].
-//! `R34Codec` is byte-unchanged; nothing here touches the kernel path.
+//! `R34Codec` stays the AOSP android-12 r34 layout; nothing here touches the kernel path.
 //!
 //! One codec, **version-keyed** — exactly AOSP's own design
 //! (`RpcWireReply::wireSize(protocolVersion)`):
@@ -106,6 +106,114 @@
 //! r34. Matching a real peer's `RpcState` node-id / `FOR_SERVER`
 //! address semantics is a separate refinement, as is the Parcel-body
 //! layer (AOSP `kCurrentRepr`).
+//!
+//! ## Raw framing
+//!
+//! The real android RPC wire has **no length prefix**: a peer writes the
+//! 16-byte `RpcWireHeader` (whose `bodySize` field decides the body
+//! length) followed by the body, and the handshake structs are written as
+//! raw fixed-size structs (AOSP `RpcState::rpcSend`/`rpcRec` —
+//! `interruptableWriteFully`/`ReadFully` of iovecs, no framing). This is
+//! distinct from rsbinder's own `RpcTransport` framing, which prepends a
+//! `u32` length (`transport::write_frame`) — that extra prefix is an
+//! rsbinder-ism a real android peer neither writes nor expects.
+//!
+//! The `*_aosp_message*` and handshake helpers operate directly on a byte
+//! stream (`Read + Write`), so they are wire-identical to a genuine
+//! android-13/14/15 RPC peer. They are the reusable primitives the opt-in
+//! `RpcSession` android-13+ profile wires in; nothing here touches the R34
+//! `RpcSession`/`RpcTransport` path (additive; R34 stays the AOSP android-12 layout).
+//!
+//! `read_aosp_message` and `read_aosp_message_with_fds` read header and
+//! body into one allocation: `bodySize` is peer-chosen up to
+//! `MAX_FRAME_LEN`, and a temporary body buffer would let a 16-byte header
+//! commit twice that before a single body byte arrives. Once the header is
+//! consumed, a deadline or a clean EOF at the start of the body is
+//! mid-message, so both readers classify it as `Truncated` or
+//! `DeadlineMidFrame`, never as a frame boundary.
+//!
+//! The fd reader enforces `MAX_FDS_PER_FRAME` across all the `recvmsg`s
+//! that read one message. The transport's own cap is per `recvmsg`, so
+//! without the accumulated check a hostile peer fragmenting a message
+//! across N `recvmsg`s of 64 fds each would collect 64·N fds and walk the
+//! process toward `RLIMIT_NOFILE`.
+//!
+//! A failed read is classified by `progress`, the amount the caller counts
+//! as already arrived (one call's bytes for `read_exact_into`, the whole
+//! message for the fd reader): at zero, a clean close or an elapsed
+//! deadline stands as itself; above zero the stream position is lost —
+//! `Truncated` if the stream ended, `DeadlineMidFrame` if a read deadline
+//! cut it (whose deadline it was is not knowable there; see
+//! `transport::is_timeout`).
+//!
+//! ## Address projection
+//!
+//! rsbinder's 32-byte `RpcAddress` is `counter:le_u64 @0..8 | role_tag @8`
+//! (`RpcAddress::unique`). `encode_addr` projects it onto the 8-byte
+//! `RpcWireAddress { options, address }` (unchanged v0↔v1): zero →
+//! `{0, 0}` (the special all-zero address; `CREATED` unset); otherwise
+//! `address` = low 32 bits of the counter and `options` =
+//! `CREATED | (FOR_SERVER if Acceptor-minted)`. The projection round-trips
+//! within rsbinder; matching a live peer's `RpcState` node-id semantics is
+//! a separate refinement.
+//!
+//! `encode_addr`/`decode_addr` are `pub(crate)` because the in-parcel
+//! binder encoding (`flattenBinder`/`unflattenBinder` RPC branch:
+//! `i32 present` + `writeUint64`) must use this same 8-byte
+//! `RpcWireAddress`: the session's `write_binder`/`read_binder` route
+//! through it for the android-13+ profile, since a real libbinder peer
+//! rejects r34's 32-byte in-parcel address.
+//!
+//! ## Object table
+//!
+//! Body layout (AOSP `RpcState::sendTransaction`/`reply`):
+//! `[fixed prefix][parcel data (parcelDataSize bytes)][object table (4·N bytes)]`,
+//! the table being a trailing LE `u32[]` (`objectTableSpan.toIovec()`), so
+//! `bodySize = fixed + parcelDataSize + 4·N`. v0 has no object table
+//! (`validateParcel` rejects v0 + non-empty positions); v1 and v2 frame the
+//! table identically. The receive side mirrors AOSP
+//! `parcelSpan.splitOff(parcelDataSize)` +
+//! `objectTableBytes->reinterpret<uint32_t>()`
+//! (`RpcState.cpp:840-866`/`1144-1176`) and validates only the lengths and
+//! the multiple-of-4 table size; strict v2 position-content validation
+//! (`binary_search`/range) is a separate step — a lenient decoder still
+//! interops.
+//!
+//! ## New session over an incoming connection
+//!
+//! AOSP `RpcServer.cpp` writes `RpcNewSessionResponse` for *any*
+//! `requestingNewSession` header (lines 494-506), *then* (lines 530-534)
+//! rejects an incoming-direction request ("Cannot create a new session
+//! with an incoming connection, would leak"). The client therefore sees
+//! the response on the wire before EOF; `server_accept` keeps that order.
+//!
+//! ## Test sockets
+//!
+//! The tests' `timed_socketpair` sets read/write deadlines on both ends.
+//! The exchanges complete in microseconds, so the deadline never trips in
+//! normal operation; it bounds a macOS EOF-wakeup race and any stray stall
+//! so the (default, 5×-soak) CI job cannot hang to its wall-clock timeout.
+//! On macOS a peer's `shutdown(SHUT_WR)` does not reliably wake a `recv`
+//! already parked in the kernel on an `AF_UNIX` socketpair (observed in
+//! about 1 of 50 full `rpc::` soak runs, the thread stuck in
+//! `read_to_end` → `recvfrom`), so `drain_leftover` stops at a clean EOF
+//! **or** at the deadline. Treating the deadline as end-of-stream is
+//! correct for the leftover-byte assertions: any real trailing byte was
+//! written during the handshake and is already in the socket buffer, so it
+//! comes back on the first `recv`; a timeout with nothing buffered means
+//! the peer sent nothing.
+//!
+//! # Mutation gates
+//!
+//! - `android13plus_attach_handshake_wire_byte_exact`: the attach handshake
+//!   (non-empty session id) matches AOSP `RpcSession::initAndAddConnection`
+//!   and `RpcServer::establishConnection` — no `RpcNewSessionResponse` on the
+//!   wire, and the "cci" direction follows the
+//!   `RPC_CONNECTION_OPTION_INCOMING` bit. The mutant where the server
+//!   writes `RpcNewSessionResponse` on attach and the client reads it would
+//!   pass a success-only assertion (both sides write and read 8 stale bytes
+//!   in lockstep); it surfaces here as leftover bytes after both sides shut
+//!   down their write halves.
 
 use std::io::{Read, Write};
 
@@ -192,10 +300,7 @@ pub fn is_supported_protocol_version(version: u32) -> bool {
     version <= SUPPORTED_MAX_VERSION || version == RPC_WIRE_PROTOCOL_VERSION_EXPERIMENTAL
 }
 
-/// `RpcWireReply::wireSize(protocolVersion)` (RpcWireFormat.h): v0 is
-/// just `i32 status` (4 B); v1+ (incl. v2 — byte-identical) adds
-/// `parcelDataSize + reserved[3]` (20 B). The Parcel data follows
-/// this fixed prefix.
+/// `RpcWireReply::wireSize(version)`: v0 = 4 B (`i32 status`), v1+ = 20 B; Parcel data follows.
 fn reply_fixed_len(version: u32) -> usize {
     if version == PROTOCOL_V0 {
         4
@@ -204,16 +309,12 @@ fn reply_fixed_len(version: u32) -> usize {
     }
 }
 
-/// `true` once the wire carries a trailing object table — i.e. v1+
-/// (`>= RPC_WIRE_PROTOCOL_VERSION_RPC_HEADER_FEATURE_EXPLICIT_PARCEL_SIZE`).
-/// v0 has no `parcelDataSize` and no object table at all. (v1 and v2
-/// are identical here — the v1↔v2 distinction is purely *which*
-/// objects the Parcel producer records.)
+/// v1+ (`>= ..._EXPLICIT_PARCEL_SIZE`) carries a trailing object table; v0 has none.
 fn has_object_table(version: u32) -> bool {
     version >= PROTOCOL_V1
 }
 
-// --- bounds-checked LE readers (local — keeps wire.rs byte-unchanged) -
+// --- bounds-checked LE readers (local, so wire.rs keeps the AOSP r34 layout) -
 
 fn rd_u32(buf: &[u8], off: usize) -> RpcResult<u32> {
     let end = off
@@ -297,14 +398,7 @@ impl Android13PlusCodec {
     }
 
     fn header(command: u32, body_size: usize) -> RpcResult<[u8; WIRE_HEADER_LEN]> {
-        // Encoder/decoder symmetry: the decoder rejects
-        // `body_size > MAX_FRAME_LEN` at every entry
-        // (see `decode_message`, `read_aosp_message`,
-        // `write_aosp_message`); without this guard the encoder would
-        // silently truncate a `body_size > u32::MAX` via `as u32` on
-        // 64-bit hosts, emitting a header whose `bodySize` disagrees
-        // with the actual payload — a peer reading per `bodySize`
-        // would misframe the next message.
+        // Match the decoder's cap: `as u32` would silently truncate and misframe the peer.
         if body_size > MAX_FRAME_LEN {
             return Err(RpcError::FrameTooLarge {
                 declared: body_size,
@@ -318,23 +412,7 @@ impl Android13PlusCodec {
         Ok(h)
     }
 
-    /// Project rsbinder's 32-byte [`RpcAddress`] onto the android-13+
-    /// 8-byte `RpcWireAddress { options, address }` (unchanged v0↔v1).
-    ///
-    /// rsbinder's address is `counter:le_u64 @0..8 | role_tag @8`
-    /// ([`RpcAddress::unique`]): zero → `{0, 0}` (the special all-zero
-    /// address; `CREATED` unset); else `address = low 32 bits of the
-    /// counter`, `options = CREATED | (FOR_SERVER if Acceptor-minted)`.
-    /// Documented + internally consistent (round-trips within
-    /// rsbinder); matching a live peer's `RpcState` node-id semantics
-    /// is a separate refinement.
-    ///
-    /// `pub(crate)` because the *in-parcel* binder encoding
-    /// (`flattenBinder` RPC branch: `i32 present` + `writeUint64`) must
-    /// use this same 8-byte `RpcWireAddress` — the session's
-    /// `write_binder`/`read_binder` route through it for the
-    /// android-13+ profile (a real libbinder peer rejects r34's 32-byte
-    /// in-parcel address).
+    /// 32-byte `RpcAddress` → 8-byte `RpcWireAddress`; see module doc "Address projection".
     pub(crate) fn encode_addr(addr: &RpcAddress) -> [u8; A13_ADDR_LEN] {
         let mut out = [0u8; A13_ADDR_LEN];
         if addr.is_zero() {
@@ -351,23 +429,15 @@ impl Android13PlusCodec {
         out
     }
 
-    /// Inverse of [`Android13PlusCodec::encode_addr`]; `pub(crate)` for
-    /// the in-parcel binder decode (`unflattenBinder` RPC branch).
+    /// Inverse of [`Self::encode_addr`], also for the in-parcel `unflattenBinder` RPC branch.
     pub(crate) fn decode_addr(buf: &[u8], off: usize) -> RpcResult<RpcAddress> {
         let options = rd_u32(buf, off)?;
         let address = rd_u32(buf, off + 4)?;
-        // AOSP `RpcState::onBinderEntering` rejects unknown option bits
-        // ("could cause this process to accidentally proxy transactions for
-        // that binder"). Normalizing them instead would fold distinct
-        // `RpcWireAddress` values onto one `RpcAddress`.
+        // Unknown option bits are refused, as AOSP `onBinderEntering` does; folding would alias.
         if options & !(ADDR_OPTION_CREATED | ADDR_OPTION_FOR_SERVER) != 0 {
             return Err(RpcError::Protocol("unknown RpcWireAddress option bit"));
         }
-        // The reserved zero address is `{options: 0, address: 0}` exactly.
-        // AOSP keys nodes by the whole `{options, address}` pair, so an
-        // address without `CREATED` is a distinct name that never matches
-        // a node; `RpcAddress` records only `FOR_SERVER`, so rather than
-        // fold such a name onto the `CREATED` one it is refused.
+        // Zero is `{0, 0}` exactly; AOSP keys nodes by the pair, so a CREATED-less name is refused.
         if options == 0 && address == 0 {
             return Ok(RpcAddress::zero());
         }
@@ -397,12 +467,7 @@ impl Android13PlusCodec {
         fd_mode: u8,
         session_id: &[u8],
     ) -> RpcResult<Vec<u8>> {
-        // Explicit `u16` bound on `sessionIdSize`. AOSP
-        // `RpcConnectionHeader.sessionIdSize` is a `uint16_t`; this is a
-        // `pub fn` and a caller passing a 64 KiB+ slice would otherwise
-        // wrap the on-wire size while the full body was still appended
-        // — a peer reading per `sessionIdSize` would misframe the
-        // following message.
+        // AOSP `sessionIdSize` is `u16`: a longer id would wrap it and misframe the peer.
         let id_size: u16 = session_id
             .len()
             .try_into()
@@ -444,9 +509,7 @@ impl Android13PlusCodec {
             .get(A13_CONN_HEADER_LEN..end)
             .ok_or(RpcError::Protocol("session id truncated"))?
             .to_vec();
-        // Strict length: reject trailing bytes past the declared session id,
-        // matching `decode_message` / `decode_session_preamble` — a lenient
-        // decoder would silently desync a caller that framed this header.
+        // Strict length, as `decode_message`: trailing bytes would desync a caller's framing.
         if buf.len() != end {
             return Err(RpcError::Protocol("RpcConnectionHeader length mismatch"));
         }
@@ -505,13 +568,7 @@ impl Android13PlusCodec {
     }
 }
 
-/// AOSP `RpcState::sendTransaction`/`reply`: append the parcel data
-/// then the object table as a trailing LE `u32[]` (`objectTableSpan
-/// .toIovec()`). The wire body is `[fixed prefix][parcel data
-/// (parcelDataSize bytes)][object table (4·N bytes)]`. v0 has no
-/// object table (`validateParcel` rejects v0 + non-empty positions);
-/// v1 and v2 are byte-identical here (the table is just a `u32[]`,
-/// version-agnostic).
+/// Appends parcel data, then the object table as LE `u32[]`; see module doc "Object table".
 fn encode_data_and_table(
     out: &mut Vec<u8>,
     version: u32,
@@ -520,9 +577,7 @@ fn encode_data_and_table(
 ) -> RpcResult<()> {
     if !has_object_table(version) {
         if !object_positions.is_empty() {
-            // AOSP `RpcState::validateParcel` (RpcState.cpp:1469):
-            // `protocolVersion < EXPLICIT_PARCEL_SIZE && !mObjectPositions
-            // .empty()` ⇒ BAD_VALUE.
+            // AOSP `validateParcel` (RpcState.cpp:1469): v0 + object positions ⇒ BAD_VALUE.
             return Err(RpcError::Protocol(
                 "v0 wire has no object table (objects need protocol version >= 1)",
             ));
@@ -537,32 +592,24 @@ fn encode_data_and_table(
     Ok(())
 }
 
-/// Inverse of [`encode_data_and_table`]: AOSP's `parcelSpan.splitOff(
-/// parcelDataSize)` + `objectTableBytes->reinterpret<uint32_t>()`
-/// (`RpcState.cpp:840-866`/`1144-1176`). `rest` is the body after the
-/// fixed prefix. This does **length + %4 validation only**; strict v2
-/// position-content validation (`binary_search`/range) is a separate
-/// step — a lenient decoder still interops.
+/// Inverse of [`encode_data_and_table`] on the post-prefix `rest`; checks lengths and %4 only.
 fn split_data_and_table(
     version: u32,
     rest: &[u8],
     parcel_data_size: usize,
 ) -> RpcResult<(Vec<u8>, Vec<u32>)> {
     if !has_object_table(version) {
-        // v0: no parcelDataSize, no object table — the whole `rest`
-        // is parcel data (bodySize authoritative).
+        // v0: no parcelDataSize or table; all of `rest` is parcel data (bodySize decides).
         return Ok((rest.to_vec(), Vec::new()));
     }
-    // `splitOff(parcelDataSize)` ⇒ nullopt (⇒ BAD_VALUE) if it runs
-    // past the available bytes.
+    // `splitOff(parcelDataSize)` past the available bytes ⇒ BAD_VALUE.
     if parcel_data_size > rest.len() {
         return Err(RpcError::Protocol(
             "parcelDataSize larger than available bytes",
         ));
     }
     let (data, table_bytes) = rest.split_at(parcel_data_size);
-    // `reinterpret<uint32_t>()` ⇒ nullopt (⇒ BAD_VALUE) if the object
-    // table byte length isn't a whole number of u32.
+    // `reinterpret<uint32_t>()` of a table that is not whole `u32`s ⇒ BAD_VALUE.
     if table_bytes.len() % 4 != 0 {
         return Err(RpcError::Protocol(
             "object table byte size not a multiple of 4",
@@ -577,10 +624,7 @@ fn split_data_and_table(
 
 impl WireCodec for Android13PlusCodec {
     fn encode_transact(&self, txn: &WireTransaction) -> RpcResult<Vec<u8>> {
-        // 40 B fixed at all versions; at v1+ the first reserved word
-        // carries parcelDataSize (size of the Parcel data following),
-        // then the object table is appended as a trailing LE u32[]
-        // (bodySize = 40 + parcelDataSize + 4·N). v0: no table.
+        // bodySize = 40 + parcelDataSize + 4·N (v1+ table; v0 has none).
         let table_bytes = if has_object_table(self.version) {
             4 * txn.object_positions.len()
         } else {
@@ -625,19 +669,18 @@ impl WireCodec for Android13PlusCodec {
         Ok(out)
     }
 
-    fn encode_dec_strong(&self, addr: &RpcAddress) -> Vec<u8> {
-        // RpcDecStrong { addr(8); u32 amount; u32 reserved } — 16 B,
-        // unchanged v0↔v1. rsbinder sends one decrement per drop.
-        // `A13_DEC_STRONG_LEN` is a const ≪ `MAX_FRAME_LEN`, so the
-        // frame-size guard inside `Self::header` is structurally satisfied.
+    fn encode_dec_strong(&self, addr: &RpcAddress, amount: u32) -> Vec<Vec<u8>> {
+        if amount == 0 {
+            return Vec::new();
+        }
         let header = Self::header(CMD_DEC_STRONG, A13_DEC_STRONG_LEN)
             .expect("DEC_STRONG body length is a const ≪ MAX_FRAME_LEN");
         let mut out = Vec::with_capacity(WIRE_HEADER_LEN + A13_DEC_STRONG_LEN);
         out.extend_from_slice(&header);
         out.extend_from_slice(&Self::encode_addr(addr)); // 8
-        out.extend_from_slice(&1u32.to_le_bytes()); // amount
+        out.extend_from_slice(&amount.to_le_bytes()); // amount
         out.extend_from_slice(&0u32.to_le_bytes()); // reserved
-        out
+        vec![out]
     }
 
     fn decode_message(&self, frame: &[u8]) -> RpcResult<WireMessage> {
@@ -669,11 +712,7 @@ impl WireCodec for Android13PlusCodec {
                 let code = rd_u32(body, A13_ADDR_LEN)?;
                 let flags = rd_u32(body, A13_ADDR_LEN + 4)?;
                 let async_number = rd_u64(body, A13_ADDR_LEN + 8)?;
-                // body[24..28] = parcelDataSize (v1+) / reserved (v0);
-                // body[28..40] = reserved[3]. At v1+ parcelDataSize is
-                // **authoritative** for the data/table split (AOSP
-                // `parcelSpan.splitOff(parcelDataSize)`); at v0 there is
-                // no table and the whole body tail is the parcel data.
+                // body[24..28]: parcelDataSize at v1+ (splits data/table), reserved at v0.
                 let parcel_data_size = rd_u32(body, A13_ADDR_LEN + 16)? as usize;
                 let (data, object_positions) = split_data_and_table(
                     self.version,
@@ -695,9 +734,7 @@ impl WireCodec for Android13PlusCodec {
                     return Err(RpcError::Protocol("RpcWireReply truncated"));
                 }
                 let status = rd_u32(body, 0)? as i32;
-                // v1+: parcelDataSize @4 is authoritative for the
-                // data/table split; reserved[3] @8..20. v0: 4 B fixed,
-                // no table.
+                // v1+: parcelDataSize @4 splits data/table. v0: 4 B fixed, no table.
                 let parcel_data_size = if has_object_table(self.version) {
                     rd_u32(body, 4)? as usize
                 } else {
@@ -716,10 +753,7 @@ impl WireCodec for Android13PlusCodec {
                     return Err(RpcError::Protocol("RpcDecStrong body != 16 bytes"));
                 }
                 let address = Self::decode_addr(body, 0)?;
-                // `RpcDecStrong.amount` @8: a compliant libbinder peer batches
-                // `timesRecd - target` decrements (AOSP `sendDecStrongToTarget`)
-                // into one command, so honor it rather than assuming 1 — else a
-                // batched drop under-decrements our local node and leaks it.
+                // libbinder batches decrements (`sendDecStrongToTarget`); assuming 1 leaks nodes.
                 let amount = rd_u32(body, A13_ADDR_LEN)?;
                 Ok(WireMessage::DecStrong(address, amount))
             }
@@ -728,56 +762,25 @@ impl WireCodec for Android13PlusCodec {
     }
 
     fn encode_session_preamble(&self, session_id: i32) -> Vec<u8> {
-        // Empty `session_id` ⇒ the `u16` sessionIdSize bound is
-        // structurally satisfied; the inner `expect` can never fire.
-        // android-13+ replaced the bare int32 preamble with the
-        // versioned RpcConnectionHeader. rsbinder only opens a new
-        // session here (session_id == RPC_SESSION_ID_NEW) and defaults
-        // to FD mode NONE; the richer handshake (RpcNewSessionResponse
-        // / "cci") uses the inherent methods.
+        // Always a new session with FD mode NONE; the full handshake uses the inherent methods.
         let _ = session_id;
         self.encode_connection_header(false, FD_MODE_NONE, &[])
             .expect("preamble passes empty session_id ⇒ u16 bound trivially satisfied")
     }
 
     fn decode_session_preamble(&self, buf: &[u8]) -> RpcResult<i32> {
-        // The version-bearing reply is RpcNewSessionResponse; return
-        // the negotiated protocol version (the meaningful preamble
-        // datum for android-13+; the trait's i32 slot is reinterpreted).
+        // The trait's i32 slot carries the negotiated version from RpcNewSessionResponse.
         Ok(self.decode_new_session_response(buf)? as i32)
     }
 }
 
-// ---------------------------------------------------------------------
-// AOSP-faithful framing + connection handshake
-//
-// The real android RPC wire has **no length prefix**: a peer writes the
-// 16-byte `RpcWireHeader` (whose `bodySize` field is authoritative)
-// followed by the body, and the handshake structs are written as raw
-// fixed-size structs (AOSP `RpcState::rpcSend`/`rpcRec` —
-// `interruptableWriteFully`/`ReadFully` of iovecs, no framing). This is
-// distinct from rsbinder's own `RpcTransport` framing, which prepends a
-// `u32` length (`transport::write_frame`) — that extra prefix is an
-// rsbinder-ism a real android peer neither writes nor expects.
-//
-// These helpers operate directly on a byte stream (`Read + Write`), so
-// they are wire-identical to a genuine android-13/14/15 RPC peer. They
-// are the reusable primitives the opt-in `RpcSession` android-13+
-// profile wires in; nothing here touches the existing R34
-// `RpcSession`/`RpcTransport` path (additive, R34 byte-unchanged).
-// ---------------------------------------------------------------------
+// --- AOSP-faithful framing + connection handshake (module doc "Raw framing") ---
 
 fn map_io(e: std::io::Error) -> RpcError {
     RpcError::from(e)
 }
 
-/// Classify a failed read by `progress`, the amount the **caller**
-/// counts as already arrived (this call's bytes for
-/// [`read_exact_into`], the whole message for the FD reader): at zero a
-/// clean close or an elapsed deadline stands as itself; above zero the
-/// stream position is lost — [`RpcError::Truncated`] if the stream ended,
-/// [`RpcError::DeadlineMidFrame`] if a read deadline cut it (whose it was
-/// is not knowable here; see `transport::is_timeout`).
+/// Classifies a failed read by the caller's `progress`; see module doc "Raw framing".
 fn classify_short_read(e: RpcError, progress: usize) -> RpcError {
     if progress > 0 && e.leaves_frame_boundary_intact() {
         if matches!(e, RpcError::Timeout) {
@@ -790,18 +793,14 @@ fn classify_short_read(e: RpcError, progress: usize) -> RpcError {
     }
 }
 
-/// Read exactly `n` bytes. Zero bytes before any progress ⇒ a clean
-/// [`RpcError::EndOfStream`]; a short read after partial progress ⇒
-/// [`RpcError::Truncated`].
+/// Reads exactly `n` bytes: `EndOfStream` before any byte, `Truncated` after partial progress.
 fn read_exact_raw<R: Read>(r: &mut R, n: usize) -> RpcResult<Vec<u8>> {
     let mut buf = vec![0u8; n];
     read_exact_into(r, &mut buf)?;
     Ok(buf)
 }
 
-/// Fill `buf` completely from `r`. Split from [`read_exact_raw`] so a
-/// message body can be read straight into its final buffer instead of
-/// through a second, equally large temporary.
+/// Fills `buf` from `r`, so a message body lands in its final buffer without a temporary.
 fn read_exact_into<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
     let n = buf.len();
     let mut got = 0;
@@ -811,11 +810,7 @@ fn read_exact_into<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
             Ok(k) => got += k,
             // A signal interrupted the read; retry like every other reader.
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            // A read deadline elapsed (`RawTransportIo` surfaces
-            // `recv_raw`'s `Timeout` as `ErrorKind::TimedOut`; a bare
-            // socket reader yields `WouldBlock`): honor the
-            // `set_read_timeout` contract rather than collapsing to a
-            // generic `Io` via `map_io`.
+            // Deadline (`TimedOut` via `RawTransportIo`, `WouldBlock` raw) → `Timeout`, not `Io`.
             Err(ref e) if super::transport::is_timeout(e) => {
                 return Err(classify_short_read(RpcError::Timeout, got))
             }
@@ -857,18 +852,11 @@ pub fn read_aosp_message<R: Read>(r: &mut R) -> RpcResult<Vec<u8>> {
             max: MAX_FRAME_LEN,
         });
     }
-    // One allocation for header + body: `bodySize` is peer-chosen (up to
-    // `MAX_FRAME_LEN`), and reading the body into a temporary first would
-    // let a 16-byte header commit twice that before a single body byte
-    // arrives.
+    // One allocation for header + body (module doc "Raw framing").
     let mut out = vec![0u8; WIRE_HEADER_LEN + body_size];
     out[..WIRE_HEADER_LEN].copy_from_slice(&header);
     if body_size > 0 {
-        // The header is already consumed, so a deadline or a clean EOF at the
-        // start of the body is mid-message, not frame-synchronized: pass the
-        // header as progress so a stream that ended becomes `Truncated` and
-        // a read deadline becomes `DeadlineMidFrame`, the same values the FD
-        // reader's `total_read` yields there.
+        // The header counts as progress: an EOF or deadline here is mid-message.
         read_exact_into(r, &mut out[WIRE_HEADER_LEN..])
             .map_err(|e| classify_short_read(e, WIRE_HEADER_LEN))?;
     }
@@ -914,11 +902,7 @@ pub fn read_aosp_message_with_fds(
 ) -> RpcResult<(Vec<u8>, Vec<std::os::fd::OwnedFd>)> {
     let mut fds: Vec<std::os::fd::OwnedFd> = Vec::new();
     let mut total_read = 0usize;
-    // Fill `dst` via `recvmsg`, accumulating any fds into `fds`.
-    // `total_read` tracks progress across header+body so a 0-byte recv
-    // distinguishes a clean pre-message close (EndOfStream) from a
-    // mid-message truncation (Truncated) — same contract as
-    // `read_exact_raw`, through the same `classify_short_read`.
+    // `total_read` spans header + body, so `classify_short_read` sees mid-message cuts.
     let mut fill = |dst: &mut [u8]| -> RpcResult<()> {
         let mut got = 0;
         while got < dst.len() {
@@ -927,14 +911,7 @@ pub fn read_aosp_message_with_fds(
                 Err(e) => return Err(classify_short_read(e, total_read)),
             };
             fds.append(&mut more);
-            // Enforce the per-message `MAX_FDS_PER_FRAME` cap *across*
-            // the multiple recvmsgs that read one message. The
-            // transport's per-call cap (`recv_raw_with_fds` rejects
-            // > 64 per single recvmsg) is per-recvmsg, not per-message
-            // — without this accumulator-side check, a hostile peer
-            // that fragments a message across N recvmsgs each carrying
-            // 64 fds would accumulate 64·N ancillary fds and walk the
-            // process toward `RLIMIT_NOFILE` (DoS bound).
+            // Per-message cap across all `recvmsg`s (module doc "Raw framing").
             if fds.len() > super::transport::unix::MAX_FDS_PER_FRAME {
                 return Err(RpcError::Protocol(
                     "RPC message exceeded MAX_FDS_PER_FRAME (ancillary fd budget)",
@@ -958,10 +935,7 @@ pub fn read_aosp_message_with_fds(
             max: MAX_FRAME_LEN,
         });
     }
-    // One allocation for header + body, read into in place: `bodySize`
-    // is peer-chosen up to `MAX_FRAME_LEN`, so a temporary body buffer
-    // would let a 16-byte header commit twice that (as `read_aosp_message`
-    // notes).
+    // One allocation for header + body (module doc "Raw framing").
     let mut out = vec![0u8; WIRE_HEADER_LEN + body_size];
     out[..WIRE_HEADER_LEN].copy_from_slice(&header);
     if body_size > 0 {
@@ -990,9 +964,7 @@ pub fn client_connect<S: Read + Write>(
     incoming: bool,
     fd_mode: u8,
 ) -> RpcResult<Android13PlusCodec> {
-    // Empty id ⇒ request a new session — byte-identical to a
-    // single-connection session (the `session_id` slot already
-    // existed).
+    // Empty id ⇒ request a new session.
     client_connect_with_id(stream, max_version, incoming, fd_mode, &[])
 }
 
@@ -1045,8 +1017,7 @@ pub fn client_connect_with_id<S: Read + Write>(
     write_all_raw(stream, &header)?;
     let requesting_new_session = session_id.is_empty();
     if incoming {
-        // attach + incoming (new + incoming is rejected server-side):
-        // client reads server-sent init okay.
+        // Attach + incoming (new + incoming is refused server-side): read the server's init.
         let init = read_exact_raw(stream, A13_CONN_INIT_LEN)?;
         hdr_codec.decode_connection_init(&init)?;
     } else {
@@ -1056,12 +1027,7 @@ pub fn client_connect_with_id<S: Read + Write>(
     if requesting_new_session {
         let resp = read_exact_raw(stream, A13_NEW_SESSION_RESP_LEN)?;
         let negotiated = hdr_codec.decode_new_session_response(&resp)?;
-        // AOSP `RpcSession::setProtocolVersionInternal`: a server may
-        // *downgrade* but never *upgrade* past the version the client
-        // advertised (`max_version` is the client's explicit cap). Accepting a
-        // higher version would let a non-compliant server pull, e.g., a
-        // v0-pinned client onto v1+ framing — opening the SCM_RIGHTS fd path
-        // the cap was meant to exclude.
+        // AOSP `setProtocolVersionInternal`: a server may downgrade, never exceed our cap.
         if negotiated > max_version {
             return Err(RpcError::Protocol(
                 "server upgraded the protocol version past the client cap",
@@ -1153,11 +1119,7 @@ pub fn server_accept_deferred_init<S: Read + Write>(
     } else {
         head[5]
     };
-    // Reject out-of-enum
-    // `RpcConnectionHeader.fileDescriptorTransportMode`. AOSP defines
-    // the field as an enum {NONE, UNIX, TRUSTY}; an unknown value is
-    // malformed input that must not flow to downstream consumers as a
-    // u8 caller has to re-validate.
+    // An out-of-enum fd mode is malformed input: refuse it here, not in every caller.
     if !matches!(fd_mode, FD_MODE_NONE | FD_MODE_UNIX | FD_MODE_TRUSTY) {
         return Err(RpcError::Protocol(
             "unknown RpcConnectionHeader.fileDescriptorTransportMode",
@@ -1167,9 +1129,7 @@ pub fn server_accept_deferred_init<S: Read + Write>(
     let negotiated = client_version.min(server_max_version);
     let codec = Android13PlusCodec::with_version(negotiated)?;
     let requesting_new_session = session_id.is_empty();
-    // AOSP order (`RpcServer.cpp` lines 488-507 then 530-534): for any
-    // `requesting_new_session` header the response is written first;
-    // the incoming-direction "would leak" reject happens *after*.
+    // AOSP order (`RpcServer.cpp` 488-507, then 530-534): response first, incoming refusal after.
     if requesting_new_session {
         write_all_raw(stream, &codec.encode_new_session_response(negotiated))?;
     }
@@ -1179,14 +1139,11 @@ pub fn server_accept_deferred_init<S: Read + Write>(
         ));
     }
     if !incoming {
-        // outgoing-from-client (both new and attach): server reads the
-        // client's init (`preJoinSetup` → `readConnectionInit`).
+        // Outgoing from the client (new or attach): read its init (`readConnectionInit`).
         let init = read_exact_raw(stream, A13_CONN_INIT_LEN)?;
         codec.decode_connection_init(&init)?;
     }
-    // attach + incoming: the server-driven init okay
-    // (`addOutgoingConnection(init=true)`) is the caller's, after
-    // admission — see `server_write_connection_init`.
+    // Attach + incoming: `server_write_connection_init` sends the init after admission.
     Ok((codec, fd_mode, session_id, incoming))
 }
 
@@ -1199,7 +1156,7 @@ fn write_all_raw<W: Write>(w: &mut W, buf: &[u8]) -> RpcResult<()> {
 /// Bridges a [`RpcTransport`](super::transport::RpcTransport) to
 /// `std::io::{Read, Write}` so the AOSP-faithful framing + handshake
 /// helpers above run over any transport with raw byte access
-/// (currently `unix`). EOF (`recv_raw` ⇒ `Ok(0)`) is preserved as
+/// (every built-in backend but the frame-only `mem`). EOF (`recv_raw` ⇒ `Ok(0)`) is preserved as
 /// `Read` returning `Ok(0)`, so `read_exact_raw` still yields the
 /// correct `EndOfStream`/`Truncated`. This is the bridge the opt-in
 /// android-13+ `RpcSession` profile uses; the R34 path never touches
@@ -1208,10 +1165,7 @@ pub struct RawTransportIo<'a>(pub &'a dyn super::transport::RpcTransport);
 
 impl Read for RawTransportIo<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        // `From<RpcError>` is kind-preserving (`Timeout` -> `TimedOut`,
-        // `EndOfStream` -> `BrokenPipe`), so on the other side of this
-        // boundary `map_io` recovers `EndOfStream` and the `is_timeout`
-        // arm recovers `Timeout`, instead of a stringified `Io(Other)`.
+        // Kind-preserving, so `map_io` and `is_timeout` recover the variant past this boundary.
         self.0.recv_raw(buf).map_err(std::io::Error::from)
     }
 }
@@ -1222,9 +1176,7 @@ impl Write for RawTransportIo<'_> {
         Ok(buf.len())
     }
     fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        // Kind-preserving, as on the read side: a peer that closed
-        // before our write must surface as `EndOfStream` (`DeadObject`),
-        // not as an unclassified `Io(Other)`.
+        // Kind-preserving: a closed peer surfaces as `EndOfStream` (`DeadObject`).
         self.0.send_raw(buf).map_err(std::io::Error::from)
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -1250,12 +1202,7 @@ mod tests {
         }
     }
 
-    /// A `UnixStream::pair()` with read/write deadlines on both ends.
-    /// The handshake/e2e exchanges below complete in microseconds, so
-    /// the deadline never trips in normal operation; it bounds a
-    /// macOS-specific EOF-wakeup race (see [`drain_leftover`]) and any
-    /// stray stall so the (default, 5×-soak) CI job can never hang to
-    /// its wall-clock timeout.
+    /// `UnixStream::pair()` with 10 s deadlines on both ends; see module doc "Test sockets".
     fn timed_socketpair() -> (
         std::os::unix::net::UnixStream,
         std::os::unix::net::UnixStream,
@@ -1271,22 +1218,7 @@ mod tests {
         (c, s)
     }
 
-    /// Drain everything the peer sent after the handshake, returning all
-    /// bytes read. Stops at a clean EOF (the peer's write-half shutdown —
-    /// the Linux fast path) **or** at the [`timed_socketpair`] read
-    /// deadline.
-    ///
-    /// The deadline arm is load-bearing on macOS: a peer's
-    /// `shutdown(SHUT_WR)` does *not* reliably wake a `recv` already
-    /// parked in the kernel on an `AF_UNIX` `socketpair` (reproduced
-    /// ~1-in-50 full `rpc::` soak runs locally — the stuck thread sits
-    /// forever in `read_to_end` → `recvfrom`), so a plain blocking
-    /// `read_to_end` can wait for an EOF that never arrives. Treating
-    /// the deadline as end-of-stream is correct for the leftover-byte
-    /// assertions here: any *real* trailing byte was written by the peer
-    /// during the handshake and is already in the socket buffer, so it
-    /// comes back on the first `recv`; a timeout with nothing buffered
-    /// genuinely means the peer sent nothing.
+    /// Bytes the peer sent after the handshake, up to EOF or the read deadline (macOS; module doc).
     fn drain_leftover(stream: &mut std::os::unix::net::UnixStream) -> Vec<u8> {
         use std::io::Read;
         let mut out = Vec::new();
@@ -1309,17 +1241,14 @@ mod tests {
         out
     }
 
-    /// Spec-conformance golden — byte-exact against AOSP
-    /// `RpcWireFormat.h` (v0 = android-13.0.0_r84, v1 =
-    /// android-15.0.0_r36 == android-14.0.0_r75). Device-free.
+    /// Byte-exact goldens vs AOSP `RpcWireFormat.h`; sources in module doc "Spec of record".
     #[test]
     fn android13plus_spec_golden_vectors() {
         // ---- v0 (android-13) ----
         let c0 = Android13PlusCodec::android13();
         assert_eq!(c0.version(), 0);
 
-        // TRANSACT(zero, GET_ROOT, no data): 16B header + 40B body, all
-        // zero (v0: bytes 24..40 are reserved[4] = 0).
+        // TRANSACT(zero, GET_ROOT, no data): 16 B header + 40 B body, all zero at v0.
         let enc = c0
             .encode_transact(&WireTransaction {
                 address: RpcAddress::zero(),
@@ -1395,7 +1324,7 @@ mod tests {
         for c in [c0, c1] {
             let mut ctr = 0u64;
             let a = RpcAddress::unique(&mut ctr, AddressSpace::Initiator);
-            let enc = c.encode_dec_strong(&a);
+            let enc = c.encode_dec_strong(&a, 1).remove(0);
             let mut want = Vec::new();
             want.extend_from_slice(&2u32.to_le_bytes()); // DEC_STRONG
             want.extend_from_slice(&16u32.to_le_bytes()); // bodySize
@@ -1439,10 +1368,7 @@ mod tests {
         let init = c1.encode_connection_init();
         assert_eq!(&init[0..4], b"cci\0");
         c1.decode_connection_init(&init).expect("\"cci\"");
-        // A profile mismatch first fails here (the header read clamps
-        // the peer's version instead of rejecting it), so both rejects
-        // have to name r34 — that string is the only thing the server's
-        // handshake log can show an operator.
+        // Both rejects must name r34: it is all the server's handshake log shows an operator.
         for bad in [&[0u8; 8][..], &[0u8; 2][..]] {
             let why = match c1.decode_connection_init(bad) {
                 Err(RpcError::Protocol(why)) => why,
@@ -1454,8 +1380,7 @@ mod tests {
             );
         }
 
-        // Version acceptance (AOSP rule @ android-16.0.0_r4, _NEXT = 3):
-        // accept 0,1,2,EXPERIMENTAL; reject 3 and above.
+        // AOSP rule @ android-16.0.0_r4 (_NEXT = 3): accept 0, 1, 2, EXPERIMENTAL; reject 3+.
         assert!(is_supported_protocol_version(0));
         assert!(is_supported_protocol_version(1));
         assert!(is_supported_protocol_version(2));
@@ -1472,9 +1397,7 @@ mod tests {
         assert_eq!(RPC_WIRE_PROTOCOL_VERSION_NEXT, 3);
     }
 
-    /// encode∘decode == identity, all versions (incl. android-16 v2),
-    /// both address spaces. v2 also round-trips a non-empty object
-    /// table (synthetic positions).
+    /// encode∘decode == identity for all versions and address spaces; v2 with an object table.
     #[test]
     fn android13plus_roundtrip_all_commands() {
         for c in [
@@ -1484,9 +1407,7 @@ mod tests {
         ] {
             for size in [0usize, 1, 17, 4096, 1 << 20] {
                 let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
-                // v1+ may carry an object table; synthesize sorted
-                // positions within the parcel data (v0 must stay empty
-                // — exercised separately by the negative test).
+                // v1+: sorted positions inside the data; v0 stays empty (negative test).
                 let positions: Vec<u32> = if c.version() >= PROTOCOL_V1 && size >= 8 {
                     vec![0, (size / 2) as u32, (size - 4) as u32]
                 } else {
@@ -1535,17 +1456,18 @@ mod tests {
             }
             let mut ctr = 9u64;
             let addr = RpcAddress::unique(&mut ctr, AddressSpace::Initiator);
-            match c.decode_message(&c.encode_dec_strong(&addr)).unwrap() {
+            let batched = c.encode_dec_strong(&addr, 7);
+            assert_eq!(batched.len(), 1, "one frame carries the whole amount");
+            match c.decode_message(&batched[0]).unwrap() {
                 WireMessage::DecStrong(a, amount) => {
                     assert_eq!(a, addr);
-                    assert_eq!(amount, 1, "rsbinder emits amount = 1 per DEC_STRONG");
+                    assert_eq!(amount, 7, "the encoder writes the amount it is given");
                 }
                 other => panic!("expected DecStrong, got {other:?}"),
             }
-            // A compliant peer may batch amount > 1 (AOSP `sendDecStrongToTarget`
-            // sends `timesRecd - target`). The decoder must read the field, not
-            // assume 1 — otherwise a batched drop under-decrements and leaks.
-            let mut framed = c.encode_dec_strong(&addr);
+            assert!(c.encode_dec_strong(&addr, 0).is_empty());
+            // A peer may batch amount > 1 (AOSP `sendDecStrongToTarget`); the field is read.
+            let mut framed = c.encode_dec_strong(&addr, 1).remove(0);
             let amt_off = WIRE_HEADER_LEN + A13_ADDR_LEN;
             framed[amt_off..amt_off + 4].copy_from_slice(&3u32.to_le_bytes());
             match c.decode_message(&framed).unwrap() {
@@ -1558,9 +1480,7 @@ mod tests {
         }
     }
 
-    /// Additive invariant: distinct from `R34Codec`; r34 byte-unchanged
-    /// (32B addr / 64B txn). v0 and v1 differ exactly in the reply
-    /// fixed size (4 vs 20).
+    /// Distinct from `R34Codec` (32 B addr / 64 B txn); v0 and v1 differ only in reply size 4/20.
     #[test]
     fn android13plus_distinct_and_r34_unchanged() {
         let t = WireTransaction {
@@ -1583,12 +1503,10 @@ mod tests {
         assert_eq!(v0.len(), WIRE_HEADER_LEN + 40);
         assert_eq!(v1.len(), WIRE_HEADER_LEN + 40);
         assert_ne!(v0, r34, "android-13+ must differ from r34");
-        // No-object parcel ⇒ v1 and v2 wire are byte-identical
-        // (the structural v1 no-regression invariant).
+        // No-object parcel ⇒ v1 and v2 wire are byte-identical.
         assert_eq!(v1, v2, "no-object v1 ≡ v2 (AC-8.2)");
 
-        // Reply: the load-bearing v0/v1 divergence (4B vs 20B fixed);
-        // v1 ≡ v2.
+        // Reply: the v0/v1 divergence (4 B vs 20 B fixed); v1 ≡ v2.
         let rep = WireReply {
             status: 0,
             data: vec![],
@@ -1682,19 +1600,12 @@ mod tests {
         assert!(matches!(c1.decode_message(&f), Err(RpcError::Protocol(_))));
     }
 
-    /// The full android-13+ RPC protocol (versioned connection
-    /// **handshake** + **AOSP-faithful framing** + `Android13PlusCodec`)
-    /// driven end-to-end over a **raw `UnixStream`** (no rsbinder
-    /// `RpcTransport` u32 prefix — wire-identical to a genuine
-    /// android-13/14/15 RPC peer). Proves all three protocol layers
-    /// interoperate, hermetically, over both v0 and v1 and across
-    /// version negotiation.
+    /// Handshake + raw framing + codec end-to-end over a raw `UnixStream`: v0, v1, negotiation.
     #[test]
     fn android13plus_live_protocol_e2e_over_raw_socket() {
         use std::thread;
 
-        // (client_max, server_max, expected_negotiated) — incl.
-        // android-16 v2 and v2↔v1 / v2↔v0 downgrade negotiation.
+        // (client_max, server_max, expected), incl. v2 and v2↔v1 / v2↔v0 downgrades.
         for (cmax, smax, expect) in [
             (0u32, 0u32, 0u32),
             (1, 1, 1),
@@ -1749,8 +1660,7 @@ mod tests {
             let codec = client_connect(&mut c, cmax, false, FD_MODE_NONE).expect("client_connect");
             assert_eq!(codec.version(), expect, "negotiated min({cmax},{smax})");
 
-            // GET_ROOT TRANSACT. Capture the exact wire bytes to prove
-            // AOSP-faithful framing (no u32 length prefix).
+            // GET_ROOT TRANSACT: exact wire bytes prove there is no u32 length prefix.
             let txn = WireTransaction {
                 address: RpcAddress::zero(),
                 code: 0,
@@ -1760,8 +1670,7 @@ mod tests {
                 ..Default::default()
             };
             let encoded = codec.encode_transact(&txn).unwrap();
-            // First 4 wire bytes are the RpcWireHeader.command
-            // (TRANSACT=0), NOT an rsbinder u32 frame length.
+            // First 4 bytes: RpcWireHeader.command (TRANSACT=0), not a frame length.
             assert_eq!(&encoded[0..4], &0u32.to_le_bytes());
             assert_eq!(
                 encoded.len(),
@@ -1782,17 +1691,14 @@ mod tests {
 
             let mut ctr = 7u64;
             let addr = RpcAddress::unique(&mut ctr, AddressSpace::Initiator);
-            write_aosp_message(&mut c, &codec.encode_dec_strong(&addr)).expect("write dec_strong");
+            write_aosp_message(&mut c, &codec.encode_dec_strong(&addr, 1)[0])
+                .expect("write dec_strong");
 
             assert_eq!(srv.join().expect("server thread"), expect);
         }
     }
 
-    /// The same full android-13+ protocol, but driven over a real
-    /// [`UnixTransport`](crate::rpc::transport::UnixTransport)
-    /// through the [`RawTransportIo`] bridge (not a bare `UnixStream`)
-    /// — i.e. over the actual `RpcTransport` abstraction the opt-in
-    /// `RpcSession` profile will use. v0 and v1.
+    /// The same protocol over a real `UnixTransport` through the `RawTransportIo` bridge, v0/v1.
     #[test]
     fn android13plus_e2e_over_unix_transport_bridge() {
         use crate::rpc::transport::UnixTransport;
@@ -1861,15 +1767,7 @@ mod tests {
         assert!(m.recv_raw(&mut [0u8; 4]).is_err());
     }
 
-    /// Attach handshake (non-empty session id) is byte-exact to AOSP
-    /// `RpcSession::initAndAddConnection` + `RpcServer::establish
-    /// Connection`: no `RpcNewSessionResponse` on the wire, "cci"
-    /// direction follows the `RPC_CONNECTION_OPTION_INCOMING` bit.
-    /// The mutant catch — server spuriously writing `RpcNewSession
-    /// Response` on attach + client spuriously reading it — would be
-    /// invisible to a success-only assertion (both sides write+read
-    /// 8 stale bytes in lockstep) but surfaces here as leftover bytes
-    /// after both shutdown their write halves.
+    /// Attach handshake is byte-exact to AOSP; see module doc "Mutation gates".
     #[test]
     fn android13plus_attach_handshake_wire_byte_exact() {
         use std::net::Shutdown;
@@ -1920,13 +1818,7 @@ mod tests {
         }
     }
 
-    /// AOSP-faithful: `RpcServer.cpp` writes `RpcNewSessionResponse`
-    /// for *any* `requestingNewSession` header (line 494-506), *then*
-    /// at line 530-534 rejects the incoming-direction request because
-    /// "Cannot create a new session with an incoming connection,
-    /// would leak". The client therefore sees the response on the
-    /// wire before EOF — this test pins both the rejection and the
-    /// wire order.
+    /// Pins rejection and wire order per module doc "New session over an incoming connection".
     #[test]
     fn android13plus_new_session_incoming_rejected() {
         use std::thread;
@@ -1962,10 +1854,7 @@ mod tests {
 
     // ===== android-16 RPC wire v2 ==================================
 
-    /// android-16.0.0_r4 version constants golden.
-    /// `RpcSession.h`: `RPC_WIRE_PROTOCOL_VERSION = 2`, `_NEXT = 3`,
-    /// `_EXPLICIT_PARCEL_SIZE = 1`, `_INCLUDES_BINDER_POSITIONS = 2`.
-    /// `setProtocolVersion` accepts {0,1,2,EXPERIMENTAL}, rejects ≥3.
+    /// android-16.0.0_r4 `RpcSession.h` constants; accepts {0,1,2,EXPERIMENTAL}, rejects ≥3.
     #[test]
     fn android16_v2_version_constants_golden() {
         assert_eq!(PROTOCOL_V0, 0);
@@ -1989,8 +1878,7 @@ mod tests {
             assert!(Android13PlusCodec::with_version(v).is_err());
         }
         assert_eq!(Android13PlusCodec::android16().version(), 2);
-        // `RpcWireReply::wireSize` is byte-identical v1≡v2 (4 vs 20 is
-        // strictly the v0-vs-v1+ split — no v2 framing change).
+        // `RpcWireReply::wireSize`: 4 vs 20 is the v0/v1+ split; v2 changes nothing.
         assert_eq!(reply_fixed_len(0), 4);
         assert_eq!(reply_fixed_len(1), 20);
         assert_eq!(reply_fixed_len(2), 20);
@@ -1999,11 +1887,7 @@ mod tests {
         assert!(has_object_table(2));
     }
 
-    /// A no-object parcel encodes **byte-identically** at v1 and v2
-    /// (TRANSACT *and* REPLY, several payload sizes). This is the
-    /// structural v1-no-regression guarantee: an empty object table is
-    /// 0 wire bytes ⇒ `bodySize` unchanged ⇒ a v2-capable rsbinder's
-    /// no-object traffic is wire-identical to its v1 traffic.
+    /// A no-object parcel encodes byte-identically at v1 and v2 (TRANSACT, REPLY, several sizes).
     #[test]
     fn android16_no_object_v1_eq_v2_byte_identical() {
         let v1 = Android13PlusCodec::android14_15();
@@ -2031,13 +1915,7 @@ mod tests {
         }
     }
 
-    /// Object-table framing golden vs AOSP
-    /// `RpcState.cpp`: `bodySize = fixed + parcelDataSize + 4·N`; the
-    /// table is the trailing LE `u32[]` after the parcel data;
-    /// `parcelDataSize` is the data length (unchanged); encode→decode
-    /// round-trips the positions; and the android-16 `splitOff` /
-    /// `reinterpret<uint32_t>` receive rules (parcelDataSize past the
-    /// body, or a table byte-size not a multiple of 4) are rejected.
+    /// Module doc "Object table" framing, round-trip, and rejection of the `splitOff` violations.
     #[test]
     fn android16_v2_object_table_framing_golden() {
         let c = Android13PlusCodec::android16();
@@ -2094,9 +1972,7 @@ mod tests {
             o => panic!("expected Reply, got {o:?}"),
         }
 
-        // android-16 `parcelSpan.splitOff(parcelDataSize)` ⇒ nullopt
-        // ⇒ BAD_VALUE: forge a TRANSACT whose parcelDataSize exceeds
-        // the available body tail.
+        // `splitOff(parcelDataSize)` ⇒ BAD_VALUE: parcelDataSize past the body tail.
         let mut bad = c
             .encode_transact(&WireTransaction {
                 address: RpcAddress::zero(),
@@ -2112,9 +1988,7 @@ mod tests {
         bad[pds_off..pds_off + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
         assert!(matches!(c.decode_message(&bad), Err(RpcError::Protocol(_))));
 
-        // `objectTableBytes->reinterpret<uint32_t>()` ⇒ nullopt if the
-        // table byte-size isn't a multiple of 4: parcelDataSize that
-        // leaves a 2-byte tail.
+        // `reinterpret<uint32_t>()` ⇒ BAD_VALUE: a table size that is not a multiple of 4.
         let mut bad = c
             .encode_transact(&WireTransaction {
                 address: RpcAddress::zero(),
@@ -2125,16 +1999,12 @@ mod tests {
                 object_positions: Vec::new(),
             })
             .unwrap();
-        // data.len()=6, no table ⇒ tail after pds is 0 (ok). Now claim
-        // parcelDataSize=4 ⇒ 2-byte trailing "table" ⇒ %4 != 0.
+        // data.len() = 6; claiming parcelDataSize = 4 leaves a 2-byte "table".
         bad[pds_off..pds_off + 4].copy_from_slice(&4u32.to_le_bytes());
         assert!(matches!(c.decode_message(&bad), Err(RpcError::Protocol(_))));
     }
 
-    /// `validateParcel` analogue: a v0 (android-13) or r34 wire can
-    /// carry **no** object table; a non-empty `object_positions`
-    /// on those is a protocol error, not a silently-dropped table
-    /// (AOSP `RpcState::validateParcel` ⇒ `BAD_VALUE`).
+    /// v0 and r34 carry no object table: positions there are an error (AOSP `validateParcel`).
     #[test]
     fn android16_v0_and_r34_reject_object_positions() {
         let t = WireTransaction {

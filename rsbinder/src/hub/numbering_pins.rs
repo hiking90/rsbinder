@@ -23,8 +23,7 @@ use sm_15::android::os::IServiceManager::transactions;
 
 #[test]
 fn transaction_codes_are_the_r6_numbering() {
-    // AOSP `android-15.0.0_r6`..`r36`, `libs/binder/aidl/android/os/
-    // IServiceManager.aidl` — declaration order is the numbering.
+    // `android-15.0.0_r6`..`r36` `IServiceManager.aidl`: declaration order is the numbering.
     assert_eq!(transactions::r#getService, FIRST_CALL_TRANSACTION);
     assert_eq!(transactions::r#getService2, FIRST_CALL_TRANSACTION + 1);
     assert_eq!(transactions::r#checkService, FIRST_CALL_TRANSACTION + 2);
@@ -66,16 +65,10 @@ fn transaction_codes_are_the_r6_numbering() {
     );
 }
 
-/// The probe in [`hub::default`](crate::hub::default) sends code 14 and
-/// reads the answer as "which interface is this". That only decides
-/// anything while 14 is the last method of the r6+ interface *and* one past
-/// the last method of the Android 14 interface — the two facts this asserts.
+/// The `hub::default` probe (code 14) needs r6+'s last method and one past Android 14's last.
 #[test]
 fn probe_code_14_separates_the_two_interfaces() {
-    // Pin the constant the probe actually sends, not a literal: a probe
-    // moved to 13 would hit `tryUnregisterService` on r6+ and
-    // `getServiceDebugInfo` on pre-r6 — answered on both, every Android
-    // 15 classified as r6+ — and a literal here would stay green.
+    // The constant the probe sends, not a literal, so a moved probe code turns this red.
     let probe = FIRST_CALL_TRANSACTION + super::ANDROID_15_PROBE_CODE;
     assert_eq!(
         transactions::r#getServiceDebugInfo,
@@ -90,9 +83,7 @@ fn probe_code_14_separates_the_two_interfaces() {
          gets an answer on both"
     );
 
-    // Every method the two share, from `checkService` on, moved up
-    // exactly one. This is what makes the wrong module fail *late* and
-    // opaquely rather than not at all.
+    // Shared methods from `checkService` on moved up one: why the wrong module fails late.
     assert_eq!(transactions::r#checkService, prev::r#checkService + 1);
     assert_eq!(transactions::r#addService, prev::r#addService + 1);
     assert_eq!(
@@ -103,7 +94,6 @@ fn probe_code_14_separates_the_two_interfaces() {
         transactions::r#tryUnregisterService,
         prev::r#tryUnregisterService + 1
     );
-    // `getService` is the one that did not move — the reason the
-    // `android_15` module routes every lookup through it.
+    // `getService` did not move: why the `android_15` module routes every lookup through it.
     assert_eq!(transactions::r#getService, prev::r#getService);
 }

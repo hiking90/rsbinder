@@ -62,7 +62,10 @@ impl SharedMemory {
     /// fd (see module doc) and mapping it read/write — or read-only
     /// when the fd is write-protected (`F_SEAL_WRITE` /
     /// `F_SEAL_FUTURE_WRITE` on Linux/Android — how `ASharedMemory_setProt`
-    /// enforces read-only on memfd — or an `O_RDONLY` fd on macOS).
+    /// enforces read-only on memfd —, a legacy `/dev/ashmem` fd whose
+    /// `ASHMEM_GET_PROT_MASK` lacks `PROT_WRITE` — how it enforces
+    /// read-only on ashmem, where the kernel refuses a writable mapping —
+    /// or an `O_RDONLY` fd on macOS).
     pub fn from_fd(fd: OwnedFd) -> Result<Self> {
         let size = region_size(&fd)?;
         let flags = if write_sealed(&fd) { FLAG_READ_ONLY } else { 0 };
@@ -218,9 +221,30 @@ fn ashmem_size(_fd: std::os::fd::BorrowedFd<'_>) -> Result<usize> {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn write_sealed<F: AsFd>(fd: F) -> bool {
     use rustix::fs::SealFlags;
+    // ashmem answers `F_GET_SEALS` with `EINVAL`; its read-only state is the prot mask.
+    if is_ashmem_fd(fd.as_fd()) {
+        return ashmem_write_protected(fd.as_fd());
+    }
     rustix::fs::fcntl_get_seals(fd)
         .map(|s| s.intersects(SealFlags::WRITE | SealFlags::FUTURE_WRITE))
         .unwrap_or(false)
+}
+
+/// libcutils `ashmem_get_prot_region` lacks `PROT_WRITE`; `false` when the ioctl fails.
+#[cfg(target_os = "android")]
+fn ashmem_write_protected(fd: std::os::fd::BorrowedFd<'_>) -> bool {
+    use std::os::fd::AsRawFd;
+    // `ASHMEM_GET_PROT_MASK` = `_IO(0x77, 6)`; the mask is the ioctl's return value.
+    const ASHMEM_GET_PROT_MASK: libc::c_ulong = 0x7706;
+    // SAFETY: caller checked `is_ashmem_fd`; no pointer argument (`0` fills the vararg).
+    let prot = unsafe { libc::ioctl(fd.as_raw_fd(), ASHMEM_GET_PROT_MASK as _, 0) };
+    prot >= 0 && prot & libc::PROT_WRITE == 0
+}
+
+/// No ashmem off Android: `is_ashmem_fd` is `false`, so this is never reached.
+#[cfg(target_os = "linux")]
+fn ashmem_write_protected(_fd: std::os::fd::BorrowedFd<'_>) -> bool {
+    false
 }
 
 #[cfg(target_os = "macos")]
@@ -266,8 +290,7 @@ mod tests {
         assert!(region_size(&a).is_err());
     }
 
-    /// In-process parcel round trip (kernel-mode parcel, no driver
-    /// needed for fd objects): wire form == bare `ParcelFileDescriptor`.
+    /// Kernel-mode parcel round trip (no driver needed): wire form == bare `ParcelFileDescriptor`.
     #[test]
     fn parcel_roundtrip_is_a_bare_fd() {
         let owner = SharedMemory::create(page()).unwrap();

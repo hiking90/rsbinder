@@ -56,8 +56,7 @@ impl BestFit {
         }
     }
 
-    /// Granules a chunk starting at `start` must skip to reach a page
-    /// boundary (AOSP `-cur->start & (pagesize/kMemoryAlign - 1)`).
+    /// Granules from `start` to a page boundary: AOSP `-cur->start & (pagesize/kMemoryAlign - 1)`.
     fn page_pad(&self, start: usize) -> usize {
         start.wrapping_neg() & (self.granules_per_page - 1)
     }
@@ -231,11 +230,7 @@ impl MemoryDealer {
             .unwrap_or_else(|e| e.into_inner())
             .alloc(size, page_aligned)
             .ok_or(StatusCode::NoMemory)?;
-        // The allocator reserves whole granules, but the `IMemory` window
-        // handed out is the caller's `size` (AOSP `MemoryDealer::allocate`
-        // does the same): rounding it up would expose up to
-        // `ALLOCATION_ALIGNMENT - 1` bytes of whatever a previous, freed
-        // allocation left in the tail of the granule.
+        // Window = caller's `size`, not the granule (as AOSP): the tail may hold freed bytes.
         let mem = MemoryBase::new(
             self.heap.clone() as Arc<dyn IMemoryHeap>,
             self.heap_binder.clone(),
@@ -365,9 +360,7 @@ impl IMemory for Allocation {
 
 impl Drop for Allocation {
     fn drop(&mut self) {
-        // Peers that still hold the exported binder keep reading the
-        // window; only the dealer's bookkeeping changes (AOSP does the
-        // same, optionally poisoning the bytes in debug builds).
+        // Peers holding the binder keep reading the window; only bookkeeping changes (as AOSP).
         if let Some(d) = self.dealer.upgrade() {
             d.deallocate(self.mem.offset());
         }
@@ -416,8 +409,7 @@ mod tests {
         let _keep2 = a.alloc(64, false).unwrap();
         a.dealloc(big);
         a.dealloc(small);
-        // Holes: [0,1024), [1088,1152) and the 832-byte tail. A 64-byte
-        // request must land in the 64-byte hole, not a bigger one.
+        // Holes: [0,1024), [1088,1152), the 832-byte tail; 64 bytes must take the 64-byte hole.
         assert_eq!(a.alloc(64, false), Some(1088));
     }
 

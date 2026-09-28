@@ -34,9 +34,7 @@ fn page() -> usize {
     rustix::param::page_size()
 }
 
-/// One bound server + a connector for it. Linux/macOS use a filesystem
-/// socket; Android uses an abstract name (the `shell` SELinux domain
-/// cannot bind filesystem sockets under `/data/local/tmp`).
+/// Server + connector; Android binds an abstract name (`shell` can't bind in /data/local/tmp).
 struct Bound {
     server: Arc<RpcServer>,
     #[cfg(not(target_os = "android"))]
@@ -215,8 +213,7 @@ fn read_only_heap_is_read_only_at_the_client() {
     let bp = BpMemory::new(client.get_root().unwrap());
     let heap = bp.resolve().unwrap();
     assert_eq!(heap.flags(), FLAG_READ_ONLY);
-    // Kernel-backed on every supported host: memfd F_SEAL_FUTURE_WRITE on
-    // Linux/Android, an O_RDONLY shm fd on macOS (plan 4-7b).
+    // Kernel-backed: memfd F_SEAL_FUTURE_WRITE on Linux/Android, O_RDONLY shm on macOS (4-7b).
     let seals = heap.map().unwrap().seals().expect("protections readable");
     assert_ne!(seals & rsbinder::shared_memory::SEAL_FUTURE_WRITE, 0);
     let mut b = [0u8; 2];
@@ -232,8 +229,7 @@ fn read_only_heap_is_read_only_at_the_client() {
     bound.finish(bg);
 }
 
-/// A direct `IMemoryHeap` root (no `IMemory` indirection) also works,
-/// and the heap proxy is usable through the trait surface.
+/// A bare `IMemoryHeap` root (no `IMemory`) maps, and its proxy works through the trait.
 #[test]
 fn bare_imemoryheap_root_maps() {
     let bound = Bound::new("heap");
@@ -263,9 +259,7 @@ fn bare_imemoryheap_root_maps() {
     bound.finish(bg);
 }
 
-/// Without mutual fd-mode opt-in the `HEAP_ID` reply cannot carry the
-/// fd: the server-side serialize fails and the client sees a clean
-/// error, never a panic or a bogus mapping.
+/// No mutual fd mode: `HEAP_ID`'s reply fails to serialize; the client errors (no panic, no map).
 #[test]
 fn heap_fd_rejected_without_fd_mode() {
     let bound = Bound::new("nofd");
@@ -293,8 +287,7 @@ fn heap_fd_rejected_without_fd_mode() {
     bound.finish(bg);
 }
 
-/// A tiny handwritten service handing out dealer allocations: code 1 →
-/// reply = one `IMemory` binder per call (index in the request).
+/// Hands out dealer allocations: code 1 replies one `IMemory` binder for the requested index.
 struct BnAllocs(Vec<rsbinder::shared_memory::Allocation>);
 impl Remotable for BnAllocs {
     fn descriptor() -> &'static str {
@@ -320,9 +313,7 @@ impl Remotable for BnAllocs {
     }
 }
 
-/// Plan 4-7a Phase D: three dealer allocations cross the session as
-/// three `IMemory` binders; with a `HeapCache` the client maps the heap
-/// once and reads each block at its own offset.
+/// Plan 4-7a Phase D: three `IMemory` allocations, one `HeapCache` mapping, each at its offset.
 #[test]
 fn dealer_allocations_share_one_mapping_through_heap_cache() {
     let bound = Bound::new("dealer");

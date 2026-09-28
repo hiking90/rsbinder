@@ -27,8 +27,7 @@ use rsbinder::{
 };
 
 const DESCRIPTOR: &str = "rsbinder.test.pipe.IPipe";
-/// Request: int32 byte count. Reply: the read end of a pipe the service
-/// is already filling.
+/// Request: int32 byte count. Reply: the read end of a pipe the service is already filling.
 const OPEN_STREAM: TransactionCode = FIRST_CALL_TRANSACTION;
 
 const PAYLOAD: usize = 4 * 1024 * 1024;
@@ -58,18 +57,12 @@ impl Remotable for PipeSvc {
                 let len: i32 = reader.read()?;
                 let len = len as usize;
                 let (read_end, write_end) = ParcelFileDescriptor::pipe()?;
-                // Fill it from another thread: the pipe buffer is far
-                // smaller than the payload, so writing here would block
-                // this handler until the caller drained it — and the
-                // caller has not even received the fd yet.
+                // Another thread: writing here blocks before the caller even has the fd.
                 thread::spawn(move || {
                     let mut written = 0usize;
                     while written < len {
                         let take = (64 * 1024).min(len - written);
-                        // Generated from the absolute offset, not from a
-                        // reused buffer: the pattern's period (251) does
-                        // not divide the chunk size, so a reused chunk
-                        // would not line up after the first one.
+                        // Absolute offset: period 251 does not divide the chunk size.
                         let piece: Vec<u8> = (written..written + take).map(byte_at).collect();
                         if (&write_end).write_all(&piece).is_err() {
                             return;
@@ -188,8 +181,7 @@ fn four_megabytes_cross_a_pipe_whose_fd_crossed_a_session() {
         reply.set_data_position(0);
         let read_end: ParcelFileDescriptor = reply.read().expect("read the pipe fd");
 
-        // Drain it here. The service is writing concurrently; neither
-        // side ever holds 4 MB.
+        // Drained while the service writes; the parcel and the pipe never hold the 4 MB.
         let mut got = Vec::with_capacity(PAYLOAD);
         let mut buf = vec![0u8; 64 * 1024];
         loop {
@@ -201,8 +193,7 @@ fn four_megabytes_cross_a_pipe_whose_fd_crossed_a_session() {
         }
 
         assert_eq!(got.len(), PAYLOAD, "the whole payload arrived");
-        // Spot-check rather than build a 4 MB expectation: the pattern
-        // is positional, so a shifted or duplicated chunk shows up here.
+        // The pattern is positional, so a shifted or duplicated chunk shows in a spot check.
         for i in [0usize, 1, 250, 251, 65_535, 65_536, PAYLOAD - 1] {
             assert_eq!(got[i], byte_at(i), "byte {i}");
         }

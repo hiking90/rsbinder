@@ -23,7 +23,7 @@ name: Integration Test
 #     fd lifetime, socket cleanup, process-level death — paths the
 #     in-process tests can hide) and (b) a soak loop over the same
 #     hermetic tests to race-mine macOS scheduler/timing flakes (e.g.
-#     AC-12.1 cv-wait `pool_exhausted_condvar_blocks_not_busy_loops`,
+#     AC-12.1 cv-wait `pool_exhausted_third_caller_waits_for_a_free_slot`,
 #     which slipped past a single-shot run in PR #133).
 
 on:
@@ -720,7 +720,7 @@ jobs:
   #   (b) Hermetic soak — re-run the same RPC test set that `macos-build`
   #       runs once per PR, this time N times in a loop, to race-mine
   #       macOS-specific scheduler/timing flakes. AC-12.1 cv-wait
-  #       (`pool_exhausted_condvar_blocks_not_busy_loops`) is the
+  #       (`pool_exhausted_third_caller_waits_for_a_free_slot`) is the
   #       canonical example: a single shot passed at merge time but
   #       flaked on PR #133 with ~221 ms scheduling slack vs the ~50-100 ms
   #       assumed by the bound. The soak is the gate that would have

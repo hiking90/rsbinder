@@ -13,6 +13,60 @@
 //! scanned: L2 is `src/command_stream.rs`'s `CommandStream`, whose
 //! private field leaves the L1 wire codec unreachable from the command
 //! stream's callers.
+//!
+//! # Refuted prose
+//!
+//! `prose_does_not_restate_refuted_shutdown_claims` rejects phrases the code contradicts,
+//! each of the kind a serve-loop rustdoc or the CHANGELOG tends to state: the serve loop's
+//! `Ok(())` is reached by a local `RpcSession::close_session` exactly as by a peer close, and
+//! what a transport `shutdown` does to bytes already received is platform- and
+//! backend-dependent (macOS discards the kernel queue, Linux keeps it, `mem` keeps it like
+//! Linux by design, a transport may hold a buffered leftover). The same claim tends to be restated
+//! in several places and corrected in one, so the test pins every `.rs` under `src/` plus
+//! `CHANGELOG.md`: a restatement trips the build rather than the next reviewer. Rephrase,
+//! don't route around — if a phrase is needed to state something *true*, narrow the phrase in
+//! the test.
+//!
+//! # `remove_slot` callers
+//!
+//! `RpcSessionInner::remove_slot` is private to `rpc/session.rs` and safe to call from more
+//! than one site because `find_conn` / `find_conn_pinned` return
+//! `Err(StatusCode::DeadObject)` (not an `expect` panic) when their reentrant slot lookup
+//! misses. `remove_slot_has_exactly_six_callers` pins the six sanctioned callers:
+//!
+//! - the slot's own `serve_blocking_on` exit;
+//! - `retire_after_failed_send`, the one rule every outbound frame's transport-level send
+//!   failure funnels through; it is what lets a serve-less client session reach death
+//!   detection (`remove_slot`'s empty-pool hook, Plan 2-17 A.1b);
+//! - `client_transact`'s two reply-wait slot-retiring paths: a reply wait that failed to arm,
+//!   read, decode or nested-dispatch, and the reply wait's refusal of a slot a nested call
+//!   marked unreadable;
+//! - the two attach rollbacks, which un-push a slot the peer can never use: an incoming
+//!   connection whose serve thread failed to spawn, and a callback slot whose
+//!   connection-init write never reached the client.
+//!
+//! The first three retire a slot whose peer is gone or whose stream is desynced, so it is
+//! never reused. A NEW caller MUST first re-audit that every slot-lookup path tolerates a
+//! missing slot; the bound guards against a lookup that assumes the slot is always present.
+//! The scan is
+//! `cfg`-blind (it reads every `.rs` under `src/`), so a `#[cfg(test)]` caller counts too:
+//! raise the number deliberately rather than route around it.
+//!
+//! # Byte order
+//!
+//! L1 (the parcel wire) is little-endian on every host while L2 (the `BC_*`/`BR_*` command
+//! stream) and L3 (the UAPI structs) are native, so
+//! `byte_order_primitives_and_pod_membership_stay_pinned` pins which files may spell a
+//! byte-order primitive — native, big-endian or little-endian — and which types `ParcelPod`
+//! admits to the raw-bytes view the three layers share.
+//!
+//! # `CommandStream`
+//!
+//! `CommandStream` (in `src/command_stream.rs`) keeps the L1 wire codec out of the L2 command
+//! stream by exposing no L1 method. Nothing in the language stops a 16th `fn` there from
+//! forwarding one, from handing `&mut self.0` back out, or from declaring a child module that
+//! reaches the private field from its own file, so `command_stream_exposes_no_new_forward`
+//! pins all three counts: they move only for a deliberate edit.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -26,8 +80,7 @@ fn count_call_sites(src_root: &Path, needle: &str) -> Vec<(PathBuf, usize)> {
             {
                 continue;
             }
-            // Match code only: a pin budgeted at exactly 0 would otherwise
-            // go red for someone naming the needle in a trailing comment.
+            // Code only: a 0-budget pin must not trip on a needle named in a trailing comment.
             let code = line.split("//").next().unwrap_or(line);
             if code.contains(needle) {
                 hits.push((path.to_path_buf(), i + 1));
@@ -50,16 +103,7 @@ fn visit<F: FnMut(&Path, &str)>(dir: &Path, f: &mut F) {
     }
 }
 
-/// Prose the code contradicts. Each phrase below was once written in a serve-loop
-/// rustdoc or the CHANGELOG and later shown false: the serve loop's `Ok(())` is
-/// reached by a local `RpcSession::close_session` exactly as by a peer close, and
-/// what a transport `shutdown` does to bytes already received is platform- and
-/// backend-dependent (macOS discards the kernel queue, Linux keeps it, `mem`
-/// discards logically, a transport may hold a buffered leftover). The same
-/// claim tends to be restated in several places and corrected in one, so this
-/// pins every `.rs` under `src/` plus `CHANGELOG.md`: a restatement trips the
-/// build rather than the next reviewer. Rephrase, don't route around — if a
-/// phrase is needed to state something *true*, narrow the phrase here.
+/// Rejects prose in `src/` and `CHANGELOG.md` the code contradicts; see module doc "Refuted prose".
 #[test]
 fn prose_does_not_restate_refuted_shutdown_claims() {
     const FORBIDDEN: &[&str] = &[
@@ -78,8 +122,7 @@ fn prose_does_not_restate_refuted_shutdown_claims() {
         eprintln!("skipping: sources not reachable at {}", src_root.display());
         return;
     }
-    // Line 0 marks a phrase that only appears once comment lines are joined —
-    // a wrapped rustdoc sentence evades a per-line scan otherwise.
+    // Line 0 = found only after joining lines (a phrase wrapped across rustdoc lines).
     let mut hits: Vec<(PathBuf, usize, &str)> = Vec::new();
     let mut scan = |path: &Path, content: &str| {
         for (i, line) in content.lines().enumerate() {
@@ -114,41 +157,17 @@ fn prose_does_not_restate_refuted_shutdown_claims() {
     );
 }
 
-/// `RpcSessionInner::remove_slot` is private to `rpc/session.rs` and safe to call from more
-/// than one site now that `find_conn` / `find_conn_pinned` return
-/// `Err(StatusCode::DeadObject)` (not `expect`-panic) when their reentrant
-/// slot lookup misses. The six sanctioned callers are the slot's own
-/// `serve_blocking_on` exit; `retire_after_failed_send`, the one rule every
-/// outbound frame's transport-level send failure funnels through;
-/// `client_transact`'s two reply-wait slot-retiring paths (a reply wait that
-/// failed to arm, read, decode or nested-dispatch, and the reply wait's
-/// refusal of a slot a nested call marked unreadable) — all retire a slot whose
-/// peer is gone / stream is desynced so it is never
-/// reused, and the send-failure one is what lets a serve-less client session
-/// reach death detection (`remove_slot`'s empty-pool hook, Plan 2-17 A.1b);
-/// and the two attach rollbacks, which un-push a slot the peer will never be
-/// able to use — an incoming connection whose serve thread failed to spawn,
-/// and a callback slot whose connection-init write never reached the client.
-/// A NEW caller MUST re-audit that every slot-lookup path tolerates a missing
-/// slot before being added — this bound guards against accidentally
-/// reintroducing a lookup that assumes the slot is always present. The scan is
-/// `cfg`-blind (it reads every `.rs` under `src/`), so a future `#[cfg(test)]`
-/// caller counts too: raise the number deliberately rather than route around
-/// it.
+/// Pins `remove_slot`'s six callers in `rpc/session.rs`; see module doc "`remove_slot` callers".
 #[test]
 fn remove_slot_has_exactly_six_callers() {
     let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    // `CARGO_MANIFEST_DIR` is baked in at compile time, so a binary copied
-    // elsewhere (a device push, for one) cannot see the sources. Skip loudly
-    // rather than fail: on a host build the directory always exists, so this
-    // never silently drops the guard where it is meant to run.
+    // A binary pushed to a device cannot see the baked-in sources; host builds always can.
     if !src_root.is_dir() {
         eprintln!("skipping: sources not reachable at {}", src_root.display());
         return;
     }
     let hits = count_call_sites(&src_root, ".remove_slot(");
-    // Pin the location too: a count-only bound would still pass if a
-    // sanctioned caller were deleted and an unaudited one added elsewhere.
+    // A count alone passes if a sanctioned caller is swapped for one elsewhere.
     assert!(
         hits.iter().all(|(p, _)| p.ends_with("rpc/session.rs")),
         "remove_slot callers must live in rpc/session.rs: {hits:#?}"
@@ -171,11 +190,7 @@ fn remove_slot_has_exactly_six_callers() {
     );
 }
 
-/// L1 (the parcel wire) is little-endian on every host while L2 (the
-/// `BC_*`/`BR_*` command stream) and L3 (the UAPI structs) are native, so
-/// pin which files may spell a byte-order primitive — native, big-endian
-/// or little-endian — and which types `ParcelPod` admits to the raw-bytes
-/// view the three layers share.
+/// Pins where byte-order primitives appear and `ParcelPod`'s members; see module doc "Byte order".
 #[test]
 fn byte_order_primitives_and_pod_membership_stay_pinned() {
     let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -186,8 +201,7 @@ fn byte_order_primitives_and_pod_membership_stay_pinned() {
 
     struct Pin {
         needle: &'static str,
-        /// Whether a hit outside `files` is itself a failure. True for a
-        /// primitive that has no business anywhere else in the crate.
+        /// True when a hit outside `files` fails too: the primitive belongs nowhere else.
         tree_wide: bool,
         files: &'static [(&'static str, usize)],
     }
@@ -197,19 +211,14 @@ fn byte_order_primitives_and_pod_membership_stay_pinned() {
             needle: "_ne_bytes",
             tree_wide: true,
             files: &[
-                // `NativeScalar`'s two methods, plus three tests that
-                // assert what stays native: the command stream, the null
-                // binder's object header, and the forged object header a
-                // data decode must refuse.
+                // `NativeScalar`'s two methods + three tests asserting what stays native.
                 ("parcel.rs", 5),
                 // fd/memfd bookkeeping, never parcel wire.
                 ("shared_memory/mod.rs", 4),
             ],
         },
         Pin {
-            // The one big-endian value in the tree: the Java reliable-PFD
-            // comm-socket status, which AOSP peeks BIG_ENDIAN. Not parcel
-            // wire — "correcting" it to LE would garble the status.
+            // Java reliable-PFD comm-socket status, which AOSP peeks BIG_ENDIAN; not parcel wire.
             needle: "_be_bytes",
             tree_wide: true,
             files: &[("file_descriptor.rs", 1)],
@@ -221,18 +230,13 @@ fn byte_order_primitives_and_pod_membership_stay_pinned() {
             files: &[("parcelable.rs", 1)],
         },
         Pin {
-            // L2 has no wire scalar. `CommandStream` exposes no L1 method,
-            // but it does hand out `as_mut_ptr`, and a value re-encoded with
-            // `from_le_bytes` reaches the driver byte-swapped even through
-            // `write_cmd`. Both spell `_le_bytes` in one of these two files.
+            // L2 is native: an LE re-encode reaches the driver byte-swapped even via `write_cmd`.
             needle: "_le_bytes",
             tree_wide: false,
             files: &[("thread_state.rs", 0), ("command_stream.rs", 0)],
         },
         Pin {
-            // The same re-encoding without a byte array: `cmd.to_le()`,
-            // `u32::from_le(..)`. `_le(` covers both, and an L1 `write_le(..)`
-            // called here would be the same mistake.
+            // The same re-encoding without a byte array: `to_le()`, `from_le(..)`, `write_le(..)`.
             needle: "_le(",
             tree_wide: false,
             files: &[("thread_state.rs", 0), ("command_stream.rs", 0)],
@@ -244,11 +248,7 @@ fn byte_order_primitives_and_pod_membership_stay_pinned() {
             files: &[("thread_state.rs", 0), ("command_stream.rs", 0)],
         },
         Pin {
-            // L3's membership list: the types `write_aligned` / `write_array`
-            // / `read_array` reinterpret as raw bytes. Adding one means
-            // re-auditing padding and bit-validity (see `ParcelPod`'s
-            // `# Safety`), so the macro definition plus the three explicit
-            // impls are budgeted; the argument list is pinned below.
+            // Raw-bytes types: a new one needs a padding/bit-validity audit (`ParcelPod`).
             needle: "unsafe impl ParcelPod for",
             tree_wide: true,
             files: &[("parcel.rs", 4)],
@@ -260,9 +260,7 @@ fn byte_order_primitives_and_pod_membership_stay_pinned() {
         let needle = pin.needle;
         let hits = count_call_sites(&src_root, needle);
         for (suffix, want) in pin.files {
-            // A pin budgeted at 0 goes silently green if its file moves —
-            // `ends_with` stops matching and `got == want == 0`. Pin the
-            // file's existence too.
+            // A 0-budget pin would pass silently if its file moved; pin existence too.
             if !src_root.join(suffix).is_file() {
                 failures.push(format!(
                     "`{needle}`: pinned file {suffix} no longer exists under src/"
@@ -289,8 +287,7 @@ fn byte_order_primitives_and_pod_membership_stay_pinned() {
         }
     }
 
-    // The pin above counts the `unsafe impl` sites; membership is decided by
-    // this argument list, which the macro definition hides from that count.
+    // Membership is this macro argument list, which the `unsafe impl` count cannot see.
     let parcel_rs = fs::read_to_string(src_root.join("parcel.rs")).unwrap();
     if !parcel_rs
         .contains("impl_parcel_pod!(i8, u8, i16, u16, i32, u32, i64, u64, u128, f32, f64);")
@@ -311,13 +308,7 @@ fn byte_order_primitives_and_pod_membership_stay_pinned() {
     );
 }
 
-/// `CommandStream` (in `src/command_stream.rs`) is what keeps the L1 wire
-/// codec out of the L2 command stream, and it does that by exposing no L1
-/// method.
-/// Nothing in the language stops a 16th `fn` here from forwarding one, from
-/// handing `&mut self.0` back out, or from declaring a child module that
-/// reaches the private field from its own file — so pin all three counts:
-/// they move only for a deliberate edit.
+/// Pins `CommandStream`'s `fn`, `self.0` and `mod` counts; see module doc "`CommandStream`".
 #[test]
 fn command_stream_exposes_no_new_forward() {
     let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

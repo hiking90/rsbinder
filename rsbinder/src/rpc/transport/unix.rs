@@ -9,6 +9,70 @@
 //!
 //! Provides connected-stream wrapping, a `socketpair` constructor for
 //! tests, and a `connect(path)` convenience.
+//!
+//! ## Peer identity
+//!
+//! Linux and Android read `SO_PEERCRED` (the peer's uid/pid). macOS and
+//! the BSDs read `getpeereid` (the peer's effective uid, vouched by the
+//! kernel at connect time) plus, on macOS only, `LOCAL_PEERPID` for the
+//! pid; other BSDs have no pid option and report `-1`, the
+//! [`PeerIdentity::Local`] "unavailable" value, while the `getpeereid` uid
+//! still decides. This is the true peer for an accepted cross-process
+//! socket and this process for a `socketpair` (both ends are us). A
+//! `getpeereid` failure is never reported as a forged `Local`: see the
+//! `ENOTCONN`/`EINVAL` rule below; any other errno yields
+//! [`PeerIdentity::Anonymous`] with a warning, since no peer ACL is possible.
+//!
+//! Android takes the Linux `SO_PEERCRED` arm: bionic has no `getpeereid`,
+//! and the BSD arm would pull in `libc::getpeereid` and break the
+//! aarch64-linux-android build. `SO_PEERCRED` is read through libc rather
+//! than `rustix::net::sockopt::socket_peercred`: rustix types the pid as
+//! `Pid(NonZeroI32)` without checking it, but the kernel reports `pid == 0`
+//! when the peer is not visible in our PID namespace (a container client on
+//! a bind-mounted host socket), and that invalid `NonZeroI32` is UB before
+//! the caller sees it.
+//!
+//! On macOS, `getpeereid` on a socket that is not `AF_UNIX` succeeds and
+//! reports uid 0 (measured on Darwin 25: a TCP socket yields `rc = 0,
+//! euid = 0`), so a foreign-family fd handed to `from_owned_fd` would mint
+//! a root identity; the BSD path checks the address family first and
+//! reports anything else as `Anonymous`. A `getpeereid` failure with
+//! `ENOTCONN`/`EINVAL` means there is no remote peer — an unconnected fd,
+//! or a socketpair on a BSD that does not populate peercred over the pipe
+//! path — so the self identity is the non-forged answer there and the
+//! hermetic socketpair test holds (defensive: a macOS socketpair does
+//! populate peercred, so that branch is not reached on macOS).
+//!
+//! ## fd passing
+//!
+//! `recv_frame_with_fds` never reads past the last byte of the frame in
+//! progress. `AF_UNIX` glues stream data across skbs and stops only after
+//! consuming the one that carried fds, so a `recvmsg` spilling into the
+//! next frame would attach that frame's `SCM_RIGHTS` fds to this one and
+//! leave the next frame with none. The android-13+ reader
+//! (`wire_android13::read_aosp_message_with_fds`) reads exact byte counts
+//! for the same reason.
+//!
+//! `shutdown` cuts the socket before taking `fd_recv_buf`: a reader parked
+//! in `recvmsg` holds that lock for the whole call and releases it only
+//! once it wakes, so locking first would deadlock against it. What that
+//! reader appends on waking was queued in the kernel before `shutdown` (the
+//! platform's business); what is left in the buffer after it returns is the
+//! prefix of a frame an error cut short, and `shutdown` clears it so a
+//! later reader does not decode the ended connection out of it.
+//!
+//! ## Tests
+//!
+//! - `unix_shutdown_drops_the_fd_mode_leftover` (plan 2-21): the reader never
+//!   reads past the frame in progress, so `fd_recv_buf` can only hold the
+//!   prefix an error left behind; a deadline part-way through a frame puts
+//!   one there. What the kernel still holds is pinned by
+//!   `rpc_transport_conformance`, not here.
+//! - `unix_mid_frame_deadline_is_our_own_cut` (plan 2-21): a read deadline
+//!   part-way through a frame is this end's own cut (`DeadlineMidFrame`),
+//!   told apart from a stream that ended mid-frame (`Truncated`); with
+//!   nothing consumed it stays the boundary `Timeout`. The framed reader and
+//!   the fd-mode reader classify the same way.
 
 use std::io::{Read, Write};
 #[cfg(target_os = "android")]
@@ -24,11 +88,7 @@ use std::path::Path;
 use super::{read_frame, write_frame, PeerIdentity, RpcTransport, MAX_FRAME_LEN};
 use crate::rpc::{RpcError, RpcResult};
 
-/// Max fds a single RPC frame may carry (DoS bound). Well under the
-/// kernel `SCM_MAX_FD` (253). `pub(crate)` so the wire codec layer
-/// (`wire_android13::read_aosp_message_with_fds`) can enforce the
-/// *per-message* cap when accumulating across the multiple `recvmsg`s
-/// that read one message body.
+/// Per-message fd cap (DoS bound, < `SCM_MAX_FD` 253); `wire_android13` applies it across recvmsgs.
 pub(crate) const MAX_FDS_PER_FRAME: usize = 64;
 
 /// A framed transport over a connected Unix domain socket.
@@ -36,10 +96,7 @@ pub struct UnixTransport {
     stream: UnixStream,
     peer: PeerIdentity,
     desc: String,
-    /// Buffered `recvmsg` leftover, used **only** by the
-    /// `recv_frame_with_fds` (SCM_RIGHTS) path so a connection in
-    /// `Unix` fd-mode never mixes `Read` and `recvmsg` on the same fd.
-    /// The default (no-fd) path is untouched (bit-identical).
+    /// `recvmsg` leftover of the fd-mode path only, so `Read` and `recvmsg` never mix on one fd.
     fd_recv_buf: std::sync::Mutex<Vec<u8>>,
 }
 
@@ -65,13 +122,10 @@ impl UnixTransport {
     /// Used by hermetic tests; no filesystem path involved.
     pub fn pair() -> RpcResult<(Self, Self)> {
         use rustix::net::{AddressFamily, SocketFlags, SocketType};
-        // Atomic wherever the platform has `SOCK_CLOEXEC`: between a bare
-        // `socketpair` and a follow-up `fcntl`, a `fork`+`exec` on another
-        // thread inherits both ends and the peer never sees EOF on drop.
+        // Atomic CLOEXEC: a `fork`+`exec` before a later `fcntl` would leak both ends (no EOF).
         #[cfg(not(target_vendor = "apple"))]
         let flags = SocketFlags::CLOEXEC;
-        // Apple has no `SOCK_CLOEXEC` (`SocketFlags::CLOEXEC` is
-        // `cfg(not(apple))` in rustix), so there the flag is set afterwards.
+        // Apple has no `SOCK_CLOEXEC`, so there the flag is set afterwards.
         #[cfg(target_vendor = "apple")]
         let flags = SocketFlags::empty();
         let (a, b) = rustix::net::socketpair(AddressFamily::UNIX, SocketType::STREAM, flags, None)
@@ -114,38 +168,17 @@ impl UnixTransport {
     }
 }
 
-/// Resolve the peer identity of a connected Unix socket.
-///
-/// * **Linux**: real `SO_PEERCRED` (the peer's actual uid/pid).
-/// * **macOS / BSD**: real `getpeereid` (peer effective uid) +
-///   `LOCAL_PEERPID` (peer pid on macOS). This is the **true peer** for
-///   an accepted cross-process socket, and *this process* for a
-///   `socketpair` (correct — both ends are us). A `getpeereid` failure
-///   is **never** reported as a forged `Local`: a same-process /
-///   unconnected errno (`ENOTCONN`/`EINVAL`) falls back to the self
-///   identity (still the correct answer there), any other error to
-///   [`PeerIdentity::Anonymous`] (no ACL possible — logged loudly).
+/// Peer identity of a connected Unix socket; see module doc "Peer identity".
 fn resolve_peer(stream: &UnixStream) -> PeerIdentity {
-    // Android's bionic has no `getpeereid`, but its kernel supports
-    // `SO_PEERCRED` exactly like Linux — so android takes the Linux
-    // arm (otherwise the `not(target_os="linux")` BSD arm would pull in
-    // `libc::getpeereid` and break the aarch64-linux-android build).
+    // Android has Linux `SO_PEERCRED` but no `getpeereid`, so it takes the Linux arm.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
+        // libc, not rustix `socket_peercred`: its `NonZeroI32` pid is UB for pid 0 (module doc).
         use std::os::fd::AsRawFd;
-        // Read `SO_PEERCRED` through libc rather than
-        // `rustix::net::sockopt::socket_peercred`: rustix types the pid as
-        // `Pid(NonZeroI32)` and does not check it, but the kernel reports
-        // `pid == 0` when the peer is not visible in our PID namespace
-        // (a container client on a bind-mounted host socket) — an invalid
-        // `NonZeroI32` there is UB before this function even sees it.
-        // SAFETY: `ucred` is three plain integers, for which all-zero is a
-        // valid value.
+        // SAFETY: `ucred` is three plain integers, for which all-zero is a valid value.
         let mut uc: libc::ucred = unsafe { std::mem::zeroed() };
         let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-        // SAFETY: `uc`/`len` are correctly typed and sized out-params for
-        // SO_PEERCRED on a connected socket fd that `stream` keeps open for
-        // the call; getsockopt retains nothing.
+        // SAFETY: `uc`/`len` are sized SO_PEERCRED out-params; `stream` keeps the fd open.
         let rc = unsafe {
             libc::getsockopt(
                 stream.as_raw_fd(),
@@ -156,8 +189,7 @@ fn resolve_peer(stream: &UnixStream) -> PeerIdentity {
             )
         };
         if rc != 0 {
-            // A socket without peer creds (rare) is anonymous, not a
-            // forged local identity.
+            // A socket without peer creds (rare) is anonymous, not a forged local identity.
             return PeerIdentity::Anonymous;
         }
         PeerIdentity::Local {
@@ -177,19 +209,13 @@ fn resolve_peer(stream: &UnixStream) -> PeerIdentity {
     }
 }
 
-/// macOS/BSD peer resolution — a failure-mode-driven fallback ladder.
-/// `getpeereid` is connect-time kernel-vouched (the BSD analogue of
-/// `SO_PEERCRED`).
+/// macOS/BSD peer resolution over `getpeereid`; see module doc "Peer identity".
 #[cfg(all(unix, not(target_os = "linux"), not(target_os = "android")))]
 fn resolve_peer_bsd(stream: &UnixStream) -> PeerIdentity {
     use std::os::fd::{AsFd, AsRawFd};
     let fd = stream.as_raw_fd();
 
-    // `getpeereid` on a socket that is not `AF_UNIX` **succeeds** on macOS
-    // and reports uid 0 (measured on Darwin 25: a TCP socket yields
-    // `rc = 0, euid = 0`). The `rc != 0` ladder below cannot catch that,
-    // so a foreign-family fd handed to `from_owned_fd` would mint a root
-    // identity. Check the family first; anything else is `Anonymous`.
+    // macOS `getpeereid` succeeds with uid 0 on a non-`AF_UNIX` fd: check the family first.
     match rustix::net::getsockname(stream.as_fd()) {
         Ok(local) if local.address_family() == rustix::net::AddressFamily::UNIX => {}
         Ok(_) => {
@@ -204,23 +230,14 @@ fn resolve_peer_bsd(stream: &UnixStream) -> PeerIdentity {
 
     let mut euid: libc::uid_t = 0;
     let mut egid: libc::gid_t = 0;
-    // SAFETY: `fd` is a valid socket fd owned by `stream` for the
-    // duration of this call; `euid`/`egid` are valid, initialized,
-    // correctly-typed out-params. `getpeereid` does not retain `fd`.
+    // SAFETY: `stream` keeps `fd` open; `euid`/`egid` are typed out-params, not retained.
     let rc = unsafe { libc::getpeereid(fd, &mut euid, &mut egid) };
     if rc != 0 {
         let errno = std::io::Error::last_os_error().raw_os_error();
         return match errno {
-            // No peer credentials: an unconnected fd, or a socketpair
-            // on a BSD that does not populate peercred over the pipe
-            // path. Either way it is the *same process* (there is no
-            // remote peer), so the self identity is the correct,
-            // non-forged answer and the hermetic socketpair test still
-            // holds on such platforms (defensive; on macOS a socketpair
-            // *does* populate peercred, so this branch is not reached).
+            // No remote peer (unconnected fd, BSD socketpair): self identity (module doc).
             Some(libc::ENOTCONN) | Some(libc::EINVAL) => super::mem::self_identity(),
-            // Any other error: NEVER a forged `Local`. No ACL is
-            // possible against an unknown peer — surface it loudly.
+            // Any other error: never a forged `Local`; no ACL is possible, so log loudly.
             _ => {
                 log::warn!(
                     "RPC unix peer-cred unavailable (getpeereid errno={errno:?}); \
@@ -236,16 +253,12 @@ fn resolve_peer_bsd(stream: &UnixStream) -> PeerIdentity {
     }
 }
 
-/// Peer pid via `LOCAL_PEERPID` (macOS 10.8+). Other BSDs have no such
-/// option, so the pid is reported as `-1` (the [`PeerIdentity::Local`]
-/// contract documents `-1` = unavailable) — the uid from `getpeereid`
-/// is still authoritative.
+/// Peer pid via `LOCAL_PEERPID` (macOS 10.8+); `-1` (unavailable) on failure.
 #[cfg(target_os = "macos")]
 fn peer_pid(fd: std::os::fd::RawFd) -> i32 {
     let mut pid: libc::pid_t = -1;
     let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
-    // SAFETY: valid socket `fd`; `pid` and `len` are valid,
-    // correctly-sized out-params for the `LOCAL_PEERPID` getsockopt.
+    // SAFETY: valid socket `fd`; `pid`/`len` are correctly-sized `LOCAL_PEERPID` out-params.
     let rc = unsafe {
         libc::getsockopt(
             fd,
@@ -274,8 +287,7 @@ fn peer_pid(_fd: std::os::fd::RawFd) -> i32 {
 
 impl RpcTransport for UnixTransport {
     fn send_frame(&self, buf: &[u8]) -> RpcResult<()> {
-        // `&UnixStream` implements Write, so a shared `&self` can send
-        // while another thread receives (full-duplex, no lock needed).
+        // `&UnixStream: Write`: a send runs beside a receiving thread with no lock.
         let mut w = &self.stream;
         write_frame(&mut w, buf)
     }
@@ -303,15 +315,9 @@ impl RpcTransport for UnixTransport {
         loop {
             return match r.read(buf) {
                 Ok(n) => Ok(n),
-                // A signal (no `SA_RESTART`) interrupted the blocking read.
-                // Retry, mirroring `recv_raw_with_fds` / the framed readers and
-                // AOSP `interruptableReadFully` — do not fail the message.
+                // EINTR: retry, as `recv_raw_with_fds` and AOSP `interruptableReadFully` do.
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                // A read deadline (`SO_RCVTIMEO` via `set_read_timeout`)
-                // elapsed. Surface it as `Timeout` rather than a generic `Io`
-                // so the android-13+ reader (`read_exact_raw`) can honor the
-                // `Timeout`/`Truncated` contract and a caller matching
-                // `Timeout`/`StatusCode::TimedOut` sees it.
+                // Deadline → `Timeout`: `read_exact_raw` splits `Timeout`/`DeadlineMidFrame`.
                 Err(e) if super::is_timeout(&e) => Err(RpcError::Timeout),
                 Err(e) => Err(RpcError::from(e)),
             };
@@ -334,11 +340,7 @@ impl RpcTransport for UnixTransport {
             return self.send_raw(buf);
         }
         if buf.is_empty() {
-            // The fds ride the first `sendmsg`; with no payload bytes the send
-            // loop below never runs, so the fds would be silently dropped while
-            // the method still returned `Ok`. The AOSP RPC wire never attaches
-            // fds to an empty frame (every frame carries a >= 16-byte header), so
-            // treat this as protocol misuse rather than lose the fds.
+            // No payload means no `sendmsg` to carry the fds; AOSP frames are never empty.
             return Err(RpcError::Protocol(
                 "cannot attach fds to an empty RPC frame",
             ));
@@ -357,10 +359,7 @@ impl RpcTransport for UnixTransport {
         while sent < buf.len() {
             let mut anc = SendAncillaryBuffer::new(&mut space);
             if sent == 0 {
-                // `cmsg_space!` sizes `space` for exactly these fds; if the
-                // push still fails (an unusually-aligned allocator), sending
-                // the frame without them would hand the peer a parcel whose
-                // fd table points at nothing.
+                // Sending without the fds would leave the parcel's fd table pointing at nothing.
                 if !anc.push(SendAncillaryMessage::ScmRights(fds)) {
                     return Err(RpcError::Protocol(
                         "failed to attach SCM_RIGHTS ancillary data",
@@ -376,9 +375,7 @@ impl RpcTransport for UnixTransport {
                 Ok(n) => n,
                 // EINTR is benign — retry the syscall.
                 Err(rustix::io::Errno::INTR) => continue,
-                // Same split `write_all_reporting` makes: a send deadline
-                // that expired before the first byte started no frame, so
-                // the stream is still frame-synchronized.
+                // As `write_all_reporting`: a deadline before any byte sent keeps frame sync.
                 Err(e) => {
                     let e = std::io::Error::from(e);
                     return Err(if sent == 0 && super::is_timeout(&e) {
@@ -427,10 +424,7 @@ impl RpcTransport for UnixTransport {
                 Err(rustix::io::Errno::INTR) => continue,
                 Err(e) => {
                     let io_err = std::io::Error::from(e);
-                    // A read deadline elapsed (EAGAIN/EWOULDBLOCK from
-                    // `SO_RCVTIMEO`): surface `Timeout` (the accumulating
-                    // reader downgrades to `Truncated` if it was already
-                    // mid-message), not a generic `Io`.
+                    // Deadline → `Timeout`; mid-message the reader makes it `DeadlineMidFrame`.
                     if super::is_timeout(&io_err) {
                         return Err(RpcError::Timeout);
                     }
@@ -438,12 +432,7 @@ impl RpcTransport for UnixTransport {
                 }
             }
         };
-        // The kernel sets `MSG_CTRUNC` when an SCM_RIGHTS batch did not fit
-        // the ancillary buffer: it installs as many fds as fit and silently
-        // drops the rest. Continuing would leave the parcel's fd object table
-        // referencing fds we never received, so fail the connection instead —
-        // matching AOSP `OS_unix_base.cpp` which rejects truncation with EPIPE
-        // rather than proceeding with a half-delivered message.
+        // `MSG_CTRUNC`: the kernel dropped surplus fds; fail, as AOSP `OS_unix_base.cpp` (EPIPE).
         if r.flags.contains(ReturnFlags::CTRUNC) {
             return Err(RpcError::Protocol(
                 "SCM_RIGHTS control message truncated (too many fds in one message)",
@@ -483,14 +472,9 @@ impl RpcTransport for UnixTransport {
     }
 
     fn shutdown(&self) -> RpcResult<()> {
-        // Socket first: a reader parked in `recvmsg` holds `fd_recv_buf`
-        // for the whole call and releases it only once it wakes, so taking
-        // the lock first deadlocks against it. What it appends on waking was
-        // queued in the kernel before this call (the platform's business);
-        // what is left in this buffer after it returns is ours — the prefix
-        // of a frame some error cut short — and a later reader must not
-        // decode the connection just ended out of it.
+        // Socket first: a reader parked in `recvmsg` holds `fd_recv_buf` until it wakes.
         let shut = self.stream.shutdown(std::net::Shutdown::Both);
+        // What remains is a cut frame's prefix; a later reader must not decode it.
         if let Ok(mut leftover) = self.fd_recv_buf.lock() {
             leftover.clear();
         }
@@ -535,10 +519,7 @@ impl RpcTransport for UnixTransport {
         while sent < framed.len() {
             let mut anc = SendAncillaryBuffer::new(&mut space);
             if sent == 0 {
-                // `cmsg_space!` sizes `space` for exactly these fds; if the
-                // push still fails (an unusually-aligned allocator), sending
-                // the frame without them would hand the peer a parcel whose
-                // fd table points at nothing.
+                // Sending without the fds would leave the parcel's fd table pointing at nothing.
                 if !anc.push(SendAncillaryMessage::ScmRights(fds)) {
                     return Err(RpcError::Protocol(
                         "failed to attach SCM_RIGHTS ancillary data",
@@ -578,8 +559,7 @@ impl RpcTransport for UnixTransport {
 
         let mut leftover = self.fd_recv_buf.lock().expect("fd recv buf poisoned");
         let mut fds: Vec<std::os::fd::OwnedFd> = Vec::new();
-        // Reused across iterations — a frame costs at least two `recvmsg`s
-        // (header, then body), and `RecvAncillaryBuffer::new` resets it.
+        // Reused: a frame costs two or more `recvmsg`s and `RecvAncillaryBuffer::new` resets it.
         let mut space =
             vec![MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_FDS_PER_FRAME))];
         loop {
@@ -598,26 +578,17 @@ impl RpcTransport for UnixTransport {
                 }
             }
             let mut tmp = [0u8; 8192];
-            // Never read past this frame's last byte. `AF_UNIX` glues
-            // stream data across skbs and only stops *after* consuming the
-            // one that carried fds, so a `recvmsg` spilling into the next
-            // frame would hand that frame's `SCM_RIGHTS` fds back attached
-            // to this one — and leave the next frame with none. The
-            // android-13+ reader (`read_aosp_message_with_fds`) is exact
-            // for the same reason.
+            // Never read past this frame: a spill takes the next frame's fds (module doc).
             let want = if leftover.len() < 4 {
                 4 - leftover.len()
             } else {
-                // Bounded by `MAX_FRAME_LEN` above, and short of `4 + len`
-                // (a complete frame returned already).
+                // Bounded by `MAX_FRAME_LEN` and short of `4 + len` (both checked above).
                 let len = u32::from_le_bytes(leftover[0..4].try_into().unwrap()) as usize;
                 4 + len - leftover.len()
             };
             let want = want.min(tmp.len());
             let mut anc = RecvAncillaryBuffer::new(&mut space);
-            // `RecvFlags::CMSG_CLOEXEC` (`MSG_CMSG_CLOEXEC`) is
-            // Linux-only; for portability set `FD_CLOEXEC` explicitly
-            // on each received fd.
+            // `MSG_CMSG_CLOEXEC` is Linux-only; `FD_CLOEXEC` is set on each fd below.
             let r = loop {
                 match rustix::net::recvmsg(
                     &self.stream,
@@ -629,9 +600,7 @@ impl RpcTransport for UnixTransport {
                     // EINTR retry.
                     Err(rustix::io::Errno::INTR) => continue,
                     Err(e) => {
-                        // Same contract as `read_header`/`read_body`: a
-                        // deadline with nothing consumed is a boundary
-                        // `Timeout`; mid-frame it is our own cut.
+                        // As `read_header`: idle deadline is `Timeout`, mid-frame our cut.
                         let io_err = std::io::Error::from(e);
                         if super::is_timeout(&io_err) {
                             return Err(if leftover.is_empty() && fds.is_empty() {
@@ -640,9 +609,7 @@ impl RpcTransport for UnixTransport {
                                 RpcError::DeadlineMidFrame
                             });
                         }
-                        // Likewise for a disconnect: past the first byte or
-                        // fd of a message the position is lost, so the kinds
-                        // folded into `EndOfStream` are a cut, not a boundary.
+                        // Past the first byte or fd, an `EndOfStream` is a cut.
                         return Err(match RpcError::from(io_err) {
                             RpcError::EndOfStream if !leftover.is_empty() || !fds.is_empty() => {
                                 RpcError::Truncated
@@ -652,11 +619,7 @@ impl RpcTransport for UnixTransport {
                     }
                 }
             };
-            // `MSG_CTRUNC` ⇒ the kernel dropped surplus fds that did not fit
-            // the ancillary buffer; the frame's fd indices would then point at
-            // fds we never received. Reject rather than proceed, matching AOSP
-            // `OS_unix_base.cpp` (EPIPE on truncation). Same guard as
-            // `recv_raw_with_fds`.
+            // `MSG_CTRUNC`: surplus fds were dropped; reject, as AOSP `OS_unix_base.cpp` (EPIPE).
             if r.flags.contains(ReturnFlags::CTRUNC) {
                 return Err(RpcError::Protocol(
                     "SCM_RIGHTS control message truncated (too many fds in one message)",
@@ -694,10 +657,7 @@ mod tests {
 
     #[test]
     fn unix_roundtrip_all_sizes() {
-        // 1 MiB + 1 crosses the u32 framing and exercises partial-read
-        // reassembly in `read_body`. A large payload can exceed the
-        // socket buffer, so send from a worker thread to avoid a
-        // same-thread write/read deadlock.
+        // A worker sends: 1 MiB + 1 exceeds the socket buffer and tests `read_body` reassembly.
         let (a, b) = UnixTransport::pair().expect("socketpair");
         let a = Arc::new(a);
         for size in [0usize, 1, 64 * 1024, 1 << 20, (1 << 20) + 1] {
@@ -715,9 +675,7 @@ mod tests {
     #[test]
     fn unix_peer_identity_is_this_process_for_socketpair() {
         let (a, _b) = UnixTransport::pair().expect("socketpair");
-        // Both ends of a socketpair live in this process. On Linux this
-        // exercises the real SO_PEERCRED syscall; elsewhere the
-        // documented best-effort. Either way it must be *this* process.
+        // Both ends live in this process; on Linux this is the real SO_PEERCRED syscall.
         let id = a.peer_identity();
         assert_eq!(
             id,
@@ -738,14 +696,7 @@ mod tests {
         assert!(matches!(a.recv_frame(), Err(RpcError::EndOfStream)));
     }
 
-    /// Plan 2-21 B-3 — `shutdown` drops the fd-mode leftover. The reader
-    /// never reads past the frame in progress, so what this buffer can
-    /// hold is the prefix an error left behind; a deadline part-way
-    /// through a frame is the cheapest way to put one there. That prefix
-    /// belongs to a connection that has ended and must not be the head of
-    /// what a later reader decodes. What the *kernel* still holds is the
-    /// platform's business and is pinned by `rpc_transport_conformance`,
-    /// not here.
+    /// `shutdown` drops the cut-frame prefix left in `fd_recv_buf`; see module doc "Tests".
     #[test]
     fn unix_shutdown_drops_the_fd_mode_leftover() {
         use std::io::Write;
@@ -772,11 +723,7 @@ mod tests {
         b.shutdown().expect("a second shutdown is Ok (idempotent)");
     }
 
-    /// Plan 2-21 D-6 — a read deadline that elapses part-way through a
-    /// frame is this end's own cut (`DeadlineMidFrame`), told apart from
-    /// a stream that ended mid-frame (`Truncated`); with nothing consumed
-    /// it stays the boundary `Timeout`. Both the framed reader and the
-    /// fd-mode reader classify the same way.
+    /// Both readers: a mid-frame deadline is `DeadlineMidFrame`, not `Truncated`; see module doc.
     #[test]
     fn unix_mid_frame_deadline_is_our_own_cut() {
         use std::io::Write;
@@ -803,17 +750,11 @@ mod tests {
         );
     }
 
-    /// Adopt one half of a `socketpair` via `from_owned_fd` and verify
-    /// it framed-roundtrips against the other
-    /// half (`from_stream`). Exercises the `IAccessor::addConnection`-
-    /// style "we hand the transport a connected fd, not a path" entry
-    /// point without touching the filesystem.
+    /// A `from_owned_fd` half (the `IAccessor::addConnection` entry) round-trips frames.
     #[test]
     fn unix_from_owned_fd_roundtrip() {
         use rustix::net::{AddressFamily, SocketFlags, SocketType};
 
-        // `rustix::net::socketpair` already returns `(OwnedFd, OwnedFd)`
-        // (rustix 1.1 `net/socketpair.rs`), so no rebind is needed.
         let (a, b) = rustix::net::socketpair(
             AddressFamily::UNIX,
             SocketType::STREAM,
@@ -836,11 +777,7 @@ mod tests {
 
     #[test]
     fn unix_partial_header_then_close_is_truncated() {
-        // The spec is deterministic — 2-of-4 header bytes consumed
-        // *then* EOF MUST surface as `Truncated` (see `read_header` in
-        // transport/mod.rs: `filled == 0` ⇒ `EndOfStream`, `filled > 0`
-        // ⇒ `Truncated`). The kernel does not coalesce these into an
-        // immediate EOF.
+        // 2-of-4 header bytes then EOF must be `Truncated` (`read_header`: `filled > 0`).
         let (a, b) = UnixTransport::pair().expect("socketpair");
         {
             use std::io::Write;

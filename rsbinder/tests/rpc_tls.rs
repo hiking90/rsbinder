@@ -4,12 +4,58 @@
 //! The TLS backend, exercised with the **core
 //! unchanged** — only the transport is swapped. Covers a valid cert
 //! handshake + AIDL round-trip + `Certificate` peer-id, an untrusted
-//! cert → handshake reject (**zero RPC payload**), and the absence of
-//! any plaintext network backend (enforced by type/absence, noted
-//! here).
+//! cert → handshake reject (**zero RPC payload**).
+//!
+//! Invariant kept by review, not by a test: the RPC public API has no
+//! plaintext-network constructor. `tcp_debug` is the only TCP path, it is
+//! `rpc-tcp-debug`-gated and hard-wired `Anonymous`, and `tls` is the only
+//! real-network transport.
 //!
 //! Separate test binary; `#![cfg(feature = "rpc-tls")]` so it only
 //! builds/runs with the feature (default test runs don't pay rustls).
+//!
+//! # Shutdown racing a send
+//!
+//! `tls_shutdown_racing_a_send_is_still_a_clean_close_for_the_peer` checks
+//! two promises that a shutdown which simply cut the socket would break.
+//! The peer's: `UncleanEndOfStream` is reserved for a stream somebody cut,
+//! so a deliberate close owes it `close_notify` — and only the thread
+//! holding `wlock` may put that on the wire, so `shutdown` waits for the
+//! send in flight rather than strand the alert. The sender's: `Ok` means
+//! the frame went out. A send that started after `shutdown` is refused, and
+//! the alert is queued only once the lock is held, so no frame can be
+//! encrypted behind it, where the peer, having read the alert, would
+//! discard it (RFC 8446 §6.1) after the sender was told `Ok`. The wait is
+//! bounded, so a peer that has stopped reading still cannot hold teardown.
+//!
+//! The window is a few instructions wide, so the test races it repeatedly
+//! instead of pinning one interleaving, and counts on both ends: every
+//! `Ok` the sender saw is a frame the peer received, and the end the peer
+//! reads is never an unclean one. A cut *mid-frame* would read as
+//! `Truncated`, and the frame it cut was reported failed, so the counts
+//! still agree — the assertion tolerates it without naming it.
+//!
+//! `entry_tls_requires_explicit_config` checks both sides because the
+//! server half has no compile-time signal at all
+//! (`serve(..).add(..).spawn()` looks complete on its own), which makes it
+//! the likelier mistake.
+//!
+//! # Mutation gates
+//!
+//! - `tls_concurrent_bidirectional_duplex`: the `RpcTransport` contract
+//!   requires a sender and a receiver thread on one transport at once. A
+//!   single mutex over all TLS I/O deadlocks here — a blocked `recv` holds
+//!   the lock the `send` needs; the split between `Mutex<Connection>` and
+//!   the separate `wlock` is what passes.
+//! - `tls_large_frame_over_64kib_roundtrips`: a single unchunked
+//!   `writer().write_all` of a payload above rustls's ~64 KiB sendable
+//!   plaintext buffer fails with `WriteZero`; `send_raw` must chunk the
+//!   plaintext and interleave encrypt-drain.
+//! - `setup_tcp_server_tls_e2e`: dropping the `tls_config` store in
+//!   `setup_tcp_server_tls` (or making `tls_snapshot()` return `None`)
+//!   sends the accepted `TcpStream` down the plain branch, which refuses it
+//!   ("plain-text TCP server is not exposed"); the worker exits without
+//!   serving and the client's TLS handshake fails or times out.
 
 #![cfg(feature = "rpc-tls")]
 
@@ -135,8 +181,7 @@ fn ping_via(root: &SIBinder, msg: &str) -> Result<String> {
     r.read::<String>()
 }
 
-/// Valid cert → handshake + the unchanged
-/// AIDL e2e over TLS; both ends see a `Certificate` peer identity.
+/// Valid cert: handshake + AIDL e2e over TLS; both ends see a `Certificate` peer identity.
 #[test]
 fn tls_valid_cert_e2e_and_peer_identity() {
     let srv_cfg = server_config(SRV_CRT, SRV_KEY);
@@ -198,11 +243,7 @@ fn tls_valid_cert_e2e_and_peer_identity() {
     server.join().unwrap();
 }
 
-/// TLS is decoupled from TCP — the same handshake +
-/// unchanged AIDL e2e runs over a **`UnixStream`** via
-/// [`TlsTransport::connect_stream`]/[`TlsTransport::accept_stream`]
-/// (not just `TcpStream`). Mirrors AOSP's socket-kind-orthogonal
-/// `RpcTransportCtx::newTransport(fd)`.
+/// TLS over a `UnixStream`, as AOSP `RpcTransportCtx::newTransport(fd)` is socket-kind-agnostic.
 #[test]
 fn tls_over_unix_socket_e2e() {
     let srv_cfg = server_config(SRV_CRT, SRV_KEY);
@@ -238,12 +279,7 @@ fn tls_over_unix_socket_e2e() {
     server.join().unwrap();
 }
 
-/// A TCP end without a TLS `close_notify` is not a clean close. On the
-/// one backend built for untrusted networks that is what a truncation
-/// attack looks like, so the transport reports it as
-/// [`RpcError::UncleanEndOfStream`] — not the `EndOfStream` a
-/// `close_notify` yields — even at a frame boundary, where the plain
-/// framing reader would otherwise see a clean end of stream.
+/// TCP end without `close_notify` = `UncleanEndOfStream` (truncation), even at a frame boundary.
 #[test]
 fn tls_eof_without_close_notify_is_unclean() {
     let srv_cfg = server_config(SRV_CRT, SRV_KEY);
@@ -263,9 +299,7 @@ fn tls_eof_without_close_notify_is_unclean() {
     }
 }
 
-/// The transport's own `shutdown()` sends `close_notify` before the
-/// socket shutdown, so a deliberate local close is the clean end on the
-/// peer — the unclean report above is reserved for a stream that was cut.
+/// `shutdown()` sends `close_notify` before the socket shutdown: the peer sees a clean end.
 #[test]
 fn tls_shutdown_is_a_clean_close_for_the_peer() {
     let srv_cfg = server_config(SRV_CRT, SRV_KEY);
@@ -284,11 +318,7 @@ fn tls_shutdown_is_a_clean_close_for_the_peer() {
     }
 }
 
-/// Plan 2-21 D-3 — our own `shutdown()` wakes our own reader with an end
-/// of stream that carries no `close_notify` from the peer. That is the
-/// shape of a cut, but it is ours: the transport reports the clean
-/// `EndOfStream`, not `UncleanEndOfStream`, so a session this end shut
-/// down ends its serve loop cleanly. A second `shutdown()` is `Ok`.
+/// Plan 2-21 D-3: our own `shutdown()` ends our reader with a clean `EndOfStream`; twice is `Ok`.
 #[test]
 fn tls_local_shutdown_is_a_clean_end_for_our_own_reader() {
     let srv_cfg = server_config(SRV_CRT, SRV_KEY);
@@ -296,12 +326,9 @@ fn tls_local_shutdown_is_a_clean_end_for_our_own_reader() {
     let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
     let server = thread::spawn(move || {
         let t = TlsTransport::accept_stream(Box::new(s_srv), srv_cfg).expect("server handshake");
-        // One frame proves the server's handshake I/O is over before the
-        // client shuts down — a client `SHUT_RD` while the server still has
-        // a post-handshake write pending fails that write with `EPIPE` on
-        // Linux. Then the server holds its end until the client has looked,
-        // so the only end the client sees is the one it made itself.
+        // Ends handshake I/O before the client's `SHUT_RD`, which would `EPIPE` a pending write.
         t.send_frame(b"hello").expect("send after handshake");
+        // Hold our end until the client has looked: the only end it sees is its own.
         let _ = done_rx.recv();
         drop(t);
     });
@@ -319,27 +346,7 @@ fn tls_local_shutdown_is_a_clean_end_for_our_own_reader() {
     server.join().unwrap();
 }
 
-/// A `shutdown()` racing this end's own in-flight send: the peer reads
-/// every frame that send was told went out, then a clean end.
-///
-/// Two promises, both of which a shutdown that simply cut the socket
-/// broke. The peer's: `UncleanEndOfStream` is reserved for a stream
-/// somebody cut, so a deliberate close owes it `close_notify` — and only
-/// the thread holding `wlock` may put that on the wire, so `shutdown` has
-/// to wait for the send in flight rather than strand the alert. The
-/// sender's: `Ok` means the frame went out. A send that started after
-/// `shutdown` is refused, and the alert is queued only once the lock is
-/// held, so no frame can be encrypted behind it — where the peer, having
-/// read the alert, would discard it (RFC 8446 §6.1) after the sender was
-/// told `Ok`. The wait is bounded, so a peer that has stopped reading
-/// still cannot hold teardown.
-///
-/// The window is a few instructions wide, so this races it repeatedly
-/// rather than pinning one interleaving, and counts on both ends: every
-/// `Ok` the sender saw is a frame the peer received, and the end the peer
-/// reads is never an unclean one. A cut *mid-frame* would read as
-/// `Truncated`, and the frame it cut was reported failed, so the counts
-/// still agree — the assertion tolerates it without naming it.
+/// The peer reads every frame a racing send saw `Ok`, then a clean end; see module doc.
 #[test]
 fn tls_shutdown_racing_a_send_is_still_a_clean_close_for_the_peer() {
     for round in 0..48u64 {
@@ -351,10 +358,7 @@ fn tls_shutdown_racing_a_send_is_still_a_clean_close_for_the_peer() {
                 TlsTransport::accept_stream(Box::new(s_srv), srv_cfg).expect("server handshake"),
             );
             t_tx.send(Arc::clone(&t)).expect("hand the transport over");
-            // Small frames so a send never parks in the socket write and
-            // the boundary between two of them comes round often — that
-            // boundary is what the shutdown has to hit. Count what this
-            // end was told went out.
+            // Small frames: no send parks, and the frame boundary the shutdown must hit recurs.
             let mut sent_ok = 0usize;
             while t.send_frame(b"tick").is_ok() {
                 sent_ok += 1;
@@ -365,8 +369,7 @@ fn tls_shutdown_racing_a_send_is_still_a_clean_close_for_the_peer() {
             TlsTransport::connect_stream(Box::new(s_cli), "localhost", client_config_trusting(CA))
                 .expect("client handshake");
         let server_t = t_rx.recv().expect("transport from the sender thread");
-        // Walk the delay across the rounds so the shutdown lands at a
-        // different point of the send loop each time.
+        // The delay walks across rounds so the shutdown lands at a different point each time.
         let closer = thread::spawn(move || {
             thread::sleep(std::time::Duration::from_micros(round * 40));
             server_t.shutdown().expect("shutdown");
@@ -394,9 +397,7 @@ fn tls_shutdown_racing_a_send_is_still_a_clean_close_for_the_peer() {
     }
 }
 
-/// The one-call TCP+TLS client
-/// constructor `RpcSession::setup_tcp_client_tls` — TCP-connect + TLS
-/// handshake + R34 session — interoperates with a TLS server end to end.
+/// `RpcSession::setup_tcp_client_tls` (TCP + TLS + r34 session) works against a TLS server.
 #[test]
 fn setup_tcp_client_tls_convenience_e2e() {
     let srv_cfg = server_config(SRV_CRT, SRV_KEY);
@@ -424,11 +425,7 @@ fn setup_tcp_client_tls_convenience_e2e() {
     server.join().unwrap();
 }
 
-/// Plan 2-17: the entry layer over `tls://` — `serve` binds the TLS
-/// listener with `ServeOptions::tls`, `Client::open_with` supplies the
-/// client config plus a `tls_server_name` that differs from the URI host
-/// (cert is for `localhost`, the socket is `127.0.0.1`). The `:0` port is
-/// resolved through the guard's `server()` escape hatch.
+/// Plan 2-17 `tls://`: `ServeOptions::tls`, and `open_with` naming `localhost` for `127.0.0.1`.
 #[test]
 fn entry_tls_serve_and_client() {
     let svc = Interface::as_binder(&Binder::new(BnPing(Box::new(PingSvc))));
@@ -448,8 +445,7 @@ fn entry_tls_serve_and_client() {
 
     let client = rsbinder::Client::open_with(&format!("tls://{addr}"), |o, _endpoint| {
         o.tls = Some(client_config_trusting(CA));
-        // The fixture cert is issued for `localhost`; the URI host is the
-        // dialed address. `tls_server_name` decouples the two.
+        // The fixture cert names `localhost`, not the dialed address in the URI.
         o.tls_server_name = Some("localhost".to_string());
     })
     .expect("Client::open_with tls://");
@@ -460,11 +456,7 @@ fn entry_tls_serve_and_client() {
     drop(client);
 }
 
-/// `tls://` without a config is refused on **both** sides before any
-/// socket work — the URI cannot carry trust anchors or a server identity,
-/// so the option is mandatory. The server half has no compile-time signal
-/// at all (`serve(..).add(..).spawn()` looks complete on its own), which
-/// makes it the likelier mistake.
+/// `tls://` without a config is refused on both sides before any socket work (URI has no trust).
 #[test]
 fn entry_tls_requires_explicit_config() {
     let err = rsbinder::Client::open("tls://127.0.0.1:1")
@@ -478,9 +470,7 @@ fn entry_tls_requires_explicit_config() {
     assert_eq!(err, StatusCode::BadValue);
 }
 
-/// `fd_modes` / `fd_mode` may only advertise Unix fd passing where the
-/// transport can actually carry `SCM_RIGHTS`; TLS cannot, so both sides
-/// reject it instead of agreeing a mode that fails later on the wire.
+/// Both sides refuse a Unix `fd_modes`/`fd_mode` over `tls://`: TLS cannot carry `SCM_RIGHTS`.
 #[test]
 fn entry_tls_rejects_unix_fd_mode() {
     use rsbinder::rpc::FileDescriptorTransportMode;
@@ -502,13 +492,7 @@ fn entry_tls_rejects_unix_fd_mode() {
     assert_eq!(err, StatusCode::BadValue);
 }
 
-/// Concurrency gate: a single `TlsTransport` must
-/// support a sender thread and a receiver thread **concurrently**
-/// ([`RpcTransport`] contract). The decomposed `Mutex<Connection>` +
-/// `try_lock` write-path makes this lock-free-duplex
-/// safe — a single-`Mutex<TlsIo>` would deadlock here (a
-/// blocked `recv` held the lock the `send` needed). Drives full
-/// bidirectional traffic on both ends and checks FIFO integrity.
+/// Full duplex on both ends of one `TlsTransport`, FIFO kept; see module doc "Mutation gates".
 #[test]
 fn tls_concurrent_bidirectional_duplex() {
     let srv_cfg = server_config(SRV_CRT, SRV_KEY);
@@ -524,9 +508,7 @@ fn tls_concurrent_bidirectional_duplex() {
 
     let n = 300usize;
 
-    // Each end runs a sender thread AND a receiver thread on the SAME
-    // transport object at once — the concurrent send+recv the contract
-    // requires. One sender per direction ⇒ FIFO, so content is checkable.
+    // Sender + receiver on the SAME transport; one sender per direction keeps FIFO checkable.
     let srv_s = Arc::clone(&srv);
     let srv_send = thread::spawn(move || {
         for i in 0..n {
@@ -564,10 +546,7 @@ fn tls_concurrent_bidirectional_duplex() {
     cli_send.join().unwrap();
 }
 
-/// A frame larger than rustls's ~64 KiB plaintext sendable buffer must still
-/// round-trip: `send_raw` chunks the plaintext and interleaves encrypt-drain
-/// (a single unchunked `writer().write_all` of such a payload fails with
-/// `WriteZero`).
+/// A frame above rustls's ~64 KiB sendable buffer round-trips; see module doc "Mutation gates".
 #[test]
 fn tls_large_frame_over_64kib_roundtrips() {
     let srv_cfg = server_config(SRV_CRT, SRV_KEY);
@@ -593,11 +572,44 @@ fn tls_large_frame_over_64kib_roundtrips() {
     assert_eq!(got, payload, "1 MiB frame must round-trip over TLS");
 }
 
-/// TLS rejects out-of-band file descriptors *by type*
-/// — `SCM_RIGHTS` cannot ride an encrypted byte stream, so `TlsTransport`
-/// keeps the trait's rejecting default for `send_*_with_fds` (no
-/// override). Matches AOSP, where `FileDescriptorTransportMode::Unix` is
-/// incompatible with TLS.
+/// Queued frames all arrive although one pump decrypts past rustls's 16 KiB plaintext cap.
+#[test]
+fn tls_queued_frames_past_the_plaintext_limit_all_arrive() {
+    let srv_cfg = server_config(SRV_CRT, SRV_KEY);
+    let (s_srv, s_cli) = UnixStream::pair().expect("unix socketpair");
+    let h = thread::spawn(move || {
+        TlsTransport::accept_stream(Box::new(s_srv), srv_cfg).expect("server handshake")
+    });
+    let cli =
+        TlsTransport::connect_stream(Box::new(s_cli), "localhost", client_config_trusting(CA))
+            .expect("client handshake");
+    let srv = h.join().unwrap();
+
+    let sizes = [16_400usize, 4_096, 16_384, 1, 40_000, 8_192, 16_383];
+    let frames: Vec<Vec<u8>> = sizes
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| vec![i as u8 + 1; n])
+        .collect();
+    // Queued before the first read; a thread, so a full socket buffer cannot hang the test.
+    let sent = frames.clone();
+    let sender = thread::spawn(move || {
+        for f in &sent {
+            srv.send_frame(f).expect("send");
+        }
+        srv
+    });
+    thread::sleep(Duration::from_millis(100));
+    for (i, f) in frames.iter().enumerate() {
+        let got = cli
+            .recv_frame()
+            .unwrap_or_else(|e| panic!("frame {i}: {e:?}"));
+        assert_eq!(&got, f, "frame {i}");
+    }
+    drop(sender.join().unwrap());
+}
+
+/// `TlsTransport` keeps the fd-rejecting trait default (as AOSP: `Unix` fd mode excludes TLS).
 #[test]
 fn tls_rejects_fd_passing_by_type() {
     use std::os::fd::AsFd;
@@ -628,9 +640,7 @@ fn tls_rejects_fd_passing_by_type() {
     let _ = server.join();
 }
 
-/// Security: a server cert NOT signed by the
-/// client's trusted CA must be rejected **at the handshake** — the
-/// client never obtains a session, so zero RPC payload is exchanged.
+/// A server cert not signed by the client's CA fails the handshake: no session, zero RPC bytes.
 #[test]
 fn tls_untrusted_cert_rejected_at_handshake() {
     // Server presents a self-signed rogue cert; client only trusts CA.
@@ -639,8 +649,7 @@ fn tls_untrusted_cert_rejected_at_handshake() {
     let addr = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
         if let Ok((tcp, _)) = listener.accept() {
-            // Server-side handshake may fail too (client aborts);
-            // either way no RPC layer is constructed.
+            // May fail too (the client aborts); either way no RPC layer is built.
             let _ = TlsTransport::accept(tcp, rogue_cfg);
         }
     });
@@ -654,32 +663,7 @@ fn tls_untrusted_cert_rejected_at_handshake() {
     let _ = server.join();
 }
 
-/// Documentation gate: there is **no** plaintext-network
-/// constructor in the RPC public API — `tcp_debug` is the only TCP
-/// path, it is `rpc-tcp-debug`-gated and hard-wired `Anonymous`, and
-/// `tls` is the only real-network transport. This is enforced by
-/// *absence/type*, not a runtime check; this test documents the
-/// invariant next to the TLS tests so a regression that adds a
-/// `setup_tcp_*`/plaintext-net constructor is caught in review.
-#[test]
-fn no_plaintext_network_backend_in_api() {
-    // If a plaintext network transport were ever added, this file
-    // would be the natural place to construct it — its continued
-    // absence is the gate. (Compile-time: nothing to call.)
-}
-
-/// TCP+TLS server e2e via `RpcServer::setup_tcp_server_tls`.
-/// The server is a real `RpcServer`:
-/// accept loop, worker-thread TLS handshake (so a slow-handshake peer
-/// never stalls accept), authorizer hook (post-handshake peer-id), and
-/// the rest of the `RpcServer` knob set all work unchanged.
-///
-/// **Mutant gate**: dropping the `*server.tls_config.lock() =
-/// Some(config)` line in `setup_tcp_server_tls` (or returning `None`
-/// from `tls_snapshot()`) leaves the worker wrapping the accepted
-/// TcpStream with the plain branch — `RawAccepted::Tcp(_)` then hits
-/// the "plain-text TCP server is not exposed" error, the worker exits
-/// without serving, the client's TLS handshake times out / errors.
+/// `setup_tcp_server_tls` e2e: accept loop + worker-side handshake; module doc "Mutation gates".
 #[test]
 fn setup_tcp_server_tls_e2e() {
     use rsbinder::rpc::RpcServer;
@@ -697,9 +681,7 @@ fn setup_tcp_server_tls_e2e() {
     assert!(server.path().is_none(), "TCP server has no fs path");
     let bg = server.run_background();
 
-    // Use the matching one-call client convenience constructor — the
-    // helper itself goes through `setup_tcp_client_tls`'s normal
-    // TCP-connect → TLS-handshake → R34 session path.
+    // One-call client: TCP connect → TLS handshake → R34 session.
     let client = RpcSession::setup_tcp_client_tls(addr, "localhost", client_config_trusting(CA))
         .expect("setup_tcp_client_tls");
     let root = client.get_root().expect("get_root over TCP+TLS server");
@@ -712,24 +694,7 @@ fn setup_tcp_server_tls_e2e() {
     let _ = bg.join();
 }
 
-/// vsock × TLS hermetic e2e, server built
-/// via `RpcServer::setup_vsock_server_tls`, client TLS-wraps a raw
-/// vsock stream with `TlsTransport::connect_stream`. The 1st-class
-/// Android AVF / Microdroid pVM scenario (vsock socket plane + TLS
-/// crypto plane), now end-to-end through the public `RpcServer` API.
-///
-/// **Environment gate** — `#[ignore]` so default `cargo test`
-/// (CI / macOS) never runs it. Loopback vsock requires the Linux
-/// `vsock_loopback` kernel module (`sudo modprobe vsock_loopback` on a
-/// host with no peer VM); a peer-VM environment skips the modprobe
-/// step. CI does not load kernel modules, so this is hermetic-by-
-/// `#[ignore]`; the canonical verification surface is the REMOTE_LINUX
-/// box per memory.
-///
-/// **Compile gate** — `target_os = "linux"` plus the `rpc-vsock` and
-/// `rpc-tls` features. macOS host compiles this file out of this test
-/// (the `rpc-tls` `#![cfg]` at the top of the file keeps the build
-/// graph clean elsewhere).
+/// vsock × TLS (AVF/Microdroid) via `setup_vsock_server_tls`; ignored: CI loads no kernel module.
 #[cfg(all(feature = "rpc-vsock", target_os = "linux"))]
 #[test]
 #[ignore = "needs Linux vsock loopback (modprobe vsock_loopback) or a peer VM"]
@@ -738,10 +703,8 @@ fn vsock_tls_loopback_e2e() {
     use rsbinder::rpc::RpcServer;
     use vsock::VMADDR_CID_LOCAL;
 
-    // Arbitrary unused port; mirrors `tests/rpc_vsock.rs` choice +
-    // bumped one digit so a left-behind no-TLS server (the other test)
-    // doesn't `EADDRINUSE` this one in a back-to-back run.
-    const TLS_TEST_PORT: u32 = 0x52_43;
+    // Outside `tests/rpc_vsock.rs`'s 0x5242..=0x5245, so running both cannot `EADDRINUSE`.
+    const TLS_TEST_PORT: u32 = 0x52_52;
 
     let srv_cfg = server_config(SRV_CRT, SRV_KEY);
     let server = RpcServer::setup_vsock_server_tls(VMADDR_CID_LOCAL, TLS_TEST_PORT, srv_cfg)
@@ -758,17 +721,7 @@ fn vsock_tls_loopback_e2e() {
     assert!(server.path().is_none(), "vsock+TLS server has no fs path");
     let bg = server.run_background();
 
-    // Client: vsock connect → TLS handshake over the raw vsock stream.
-    // No client-side `setup_vsock_client_tls` convenience function yet
-    // (a separate small follow-up); the underlying composition is one
-    // line per AOSP `RpcTransportCtx::newTransport(fd)` (socket-kind-
-    // orthogonal TLS).
-    //
-    // `VsockTransport::connect` returns an `RpcTransport` already, but
-    // here we need the raw `VsockStream` so the TLS handshake runs
-    // *over* it (not as the framing transport itself). Build the
-    // stream by hand — `vsock::VsockStream::connect` matches the
-    // existing `VsockTransport::connect` body.
+    // Raw `VsockStream`, not `VsockTransport`: TLS runs over it (AOSP `newTransport(fd)`).
     let vsock_stream =
         vsock::VsockStream::connect(&vsock::VsockAddr::new(VMADDR_CID_LOCAL, TLS_TEST_PORT))
             .expect("client vsock connect");
@@ -778,9 +731,7 @@ fn vsock_tls_loopback_e2e() {
         client_config_trusting(CA),
     )
     .expect("client TLS handshake over vsock");
-    // Over vsock+TLS: peer identity is the leaf-cert fingerprint
-    // (not `Vsock { cid }` — that's the `VsockTransport` plain identity,
-    // here the TLS layer overrides).
+    // The TLS layer overrides the plain `Vsock { cid }` identity with the leaf-cert fingerprint.
     match client_t.peer_identity() {
         PeerIdentity::Certificate(c) => assert_eq!(c.fingerprint().len(), 32),
         other => panic!("expected Certificate peer id over vsock+TLS, got {other}"),
@@ -791,10 +742,7 @@ fn vsock_tls_loopback_e2e() {
     assert_eq!(ping_via(&root, "vsock-tls").unwrap(), "pong:vsock-tls");
     assert_eq!(ping_via(&root, "").unwrap(), "pong:");
 
-    // Silence the `VsockTransport` import on Linux builds where it's
-    // not referenced (we only use it as a type-witness that the vsock
-    // client transport exists; the actual client builds the stream by
-    // hand to keep the TLS wrap explicit).
+    // Type witness only: the client above builds the stream by hand to keep TLS explicit.
     let _: fn(u32, u32) -> _ = VsockTransport::connect;
 
     drop(root);
@@ -803,11 +751,7 @@ fn vsock_tls_loopback_e2e() {
     let _ = bg.join();
 }
 
-/// UDS+TLS server e2e via `RpcServer::setup_unix_server_tls`.
-/// TLS is socket-kind-orthogonal (AOSP `RpcTransportCtx::newTransport(fd)`);
-/// the same TLS handshake runs over a UnixStream once `RpcServer` no
-/// longer pins the listener to UDS-without-TLS. Demonstrates the
-/// listener generalization carrying the TLS path through it.
+/// `RpcServer::setup_unix_server_tls` e2e: the TLS handshake runs over a UDS listener.
 #[test]
 fn setup_unix_server_tls_e2e() {
     use rsbinder::rpc::RpcServer;
@@ -846,9 +790,7 @@ fn setup_unix_server_tls_e2e() {
     }
     assert!(path.exists(), "UDS server socket must appear");
 
-    // Client: open the UDS by hand and run the TLS handshake on it
-    // via `TlsTransport::connect_stream` (the socket-kind-orthogonal
-    // client API). The R34 wire then carries the AIDL e2e.
+    // Client: TLS over a hand-opened UDS via the socket-kind-orthogonal `connect_stream`.
     let unix_client = UnixStream::connect(&path).expect("unix connect");
     let client_t = TlsTransport::connect_stream(
         Box::new(unix_client),

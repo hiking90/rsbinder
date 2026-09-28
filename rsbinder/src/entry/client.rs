@@ -184,9 +184,7 @@ enum Inner {
     Rpc(crate::rpc::RpcSession),
 }
 
-/// A setting that can arrive both as a [`ClientOptions`] field and as a
-/// URI query key: two different values are refused, like every other
-/// conflict in [`Client::open`].
+/// Merges a [`ClientOptions`] field with its URI key; differing values are `BadValue`.
 fn one_source<T: PartialEq + std::fmt::Debug>(
     what: &str,
     from_option: Option<T>,
@@ -291,10 +289,7 @@ fn rpc_connect(uri: &Uri, o: &ClientOptions) -> Result<crate::rpc::RpcSession> {
     };
     use crate::rpc::{AddressSpace, RpcSession};
 
-    // Before any connect: this value reaches a read deadline on every
-    // RPC endpoint and `TcpStream::connect_timeout` on `tls://`, and
-    // both reject a zero duration — refuse it here, where the option
-    // that carries it can still be named.
+    // Refuse zero here, where the option can be named; its downstream consumers reject it too.
     crate::rpc::session::reject_zero_handshake_timeout(
         o.handshake_timeout,
         "ClientOptions::handshake_timeout",
@@ -302,9 +297,7 @@ fn rpc_connect(uri: &Uri, o: &ClientOptions) -> Result<crate::rpc::RpcSession> {
     let versioned = uri.wire_max_version;
     let fan_out = o.outgoing_connections.unwrap_or(1).max(1);
     let incoming = o.incoming_connections.unwrap_or(0);
-    // Gate on `is_some()`, not on the value: `Some(0)`/`Some(1)` is still
-    // the caller asking for an option this endpoint may not have, and
-    // `ClientOptions` promises such an option is `BadValue`, never ignored.
+    // `is_some()`, not the value: a set option this endpoint lacks is `BadValue`, never ignored.
     let multi_conn = o.outgoing_connections.is_some() || o.incoming_connections.is_some();
     if versioned.is_none() && (o.session_id.is_some() || multi_conn) {
         log::error!(
@@ -314,12 +307,7 @@ fn rpc_connect(uri: &Uri, o: &ClientOptions) -> Result<crate::rpc::RpcSession> {
         );
         return Err(StatusCode::BadValue);
     }
-    // Same contract for the handshake deadline. The r34 wire has no
-    // connection handshake at all — the session exists as soon as the
-    // socket does, and what `open` does after that is bounded by
-    // `timeout` — so on a plain r34 endpoint there is nothing for this
-    // option to bound. `tls://` is the exception either way: its
-    // `connect(2)` and TLS handshake below are bounded by it.
+    // r34 has no handshake to bound (see `ClientOptions::handshake_timeout`); `tls://` does.
     if versioned.is_none()
         && o.handshake_timeout.is_some()
         && !matches!(uri.endpoint, Endpoint::Tls(..))
@@ -332,9 +320,7 @@ fn rpc_connect(uri: &Uri, o: &ClientOptions) -> Result<crate::rpc::RpcSession> {
         return Err(StatusCode::BadValue);
     }
 
-    // `ClientOptions::tls` is honored only for `tls://`; every other
-    // endpoint would otherwise connect in plaintext while the caller
-    // believes the link is encrypted.
+    // TLS only on `tls://`: elsewhere it would connect in plaintext the caller thinks encrypted.
     #[cfg(feature = "rpc-tls")]
     if !matches!(uri.endpoint, Endpoint::Tls(..))
         && (o.tls.is_some() || o.tls_server_name.is_some())
@@ -368,11 +354,9 @@ fn rpc_connect(uri: &Uri, o: &ClientOptions) -> Result<crate::rpc::RpcSession> {
     // r34 wire: no handshake, so the session is built on the connection itself.
     let session =
         RpcSession::new(cfg.connect_once()?, AddressSpace::Initiator).map_err(StatusCode::from)?;
-    // Before the negotiation below, not after `rpc_connect` returns: that
-    // transaction reads this value when it runs.
+    // Before the negotiation below: that transaction reads this value when it runs.
     session.set_timeout(o.timeout);
-    // FD mode is negotiated by a special transaction after connect
-    // (versioned profiles do it in the handshake).
+    // r34 negotiates the FD mode by a transaction after connect (versioned: in the handshake).
     if let Some(mode) = o.fd_mode {
         session.negotiate_fd_transport(mode)?;
     }
@@ -545,9 +529,7 @@ impl Client {
 mod tests {
     use super::*;
 
-    /// One rule for every setting that has both a `ClientOptions` field
-    /// and a URI key: agreeing or single values pass, a conflict is
-    /// refused rather than resolved in favor of either side.
+    /// Option vs URI key: agreeing or single values pass; a conflict is refused, not resolved.
     #[test]
     fn a_setting_given_twice_must_agree() {
         assert_eq!(one_source::<usize>("mmap_size", None, None), Ok(None));

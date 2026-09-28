@@ -91,13 +91,10 @@ pub use android::os::ICancellationSignal::{
     ICancellationSignalAsync, ICancellationSignalAsyncService,
 };
 
-/// Shared state behind a [`CancellationSignal`], its [`CancellationToken`]s,
-/// and the transport binder. Held by `Arc` from all three so a service
-/// that keeps only the transport alive still cancels the work.
+/// State shared by signal, tokens and transport, so a kept transport alone still cancels.
 struct Inner {
     canceled: AtomicBool,
-    /// Taken out before it is called, which is both how "at most once"
-    /// is enforced and how the lock is kept off the user's callback.
+    /// Taken out before the call: that makes it run at most once, outside the lock.
     on_cancel: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(feature = "tokio")]
     notify: tokio::sync::Notify,
@@ -114,9 +111,7 @@ impl Inner {
     }
 
     fn cancel(self: &Arc<Self>) {
-        // `swap` rather than `store`: a second cancel — from a retrying
-        // client, or from the service itself after the client already
-        // cancelled — must not run the callback again.
+        // `swap`, not `store`: a second cancel (retrying client, or the service) must not re-run.
         if self.canceled.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -127,8 +122,7 @@ impl Inner {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
-        // Outside the lock: this runs on a binder worker thread, and the
-        // callback is user code that may call back into this signal.
+        // Outside the lock: the user callback may call back into this signal.
         if let Some(listener) = listener {
             listener();
         }
@@ -136,8 +130,7 @@ impl Inner {
 
     fn set_on_cancel(self: &Arc<Self>, f: Box<dyn FnOnce() + Send>) {
         if self.canceled.load(Ordering::SeqCst) {
-            // Already cancelled: run it now rather than never, matching
-            // AOSP's `setOnCancelListener`.
+            // Already cancelled: run it now rather than never (AOSP `setOnCancelListener`).
             f();
             return;
         }
@@ -146,8 +139,7 @@ impl Inner {
             slot.replace(f)
         };
         drop(previous);
-        // Lost the race with `cancel()`: it took the slot before this
-        // one was in it, so nothing would ever run what was just stored.
+        // A racing `cancel()` may have emptied the slot before this store; run it here then.
         if self.canceled.load(Ordering::SeqCst) {
             let late = self
                 .on_cancel
@@ -161,9 +153,7 @@ impl Inner {
     }
 }
 
-/// The transport binder a service hands to its caller: an
-/// `android.os.ICancellationSignal` whose `cancel()` cancels the signal
-/// it was made from.
+/// The `android.os.ICancellationSignal` handed to the caller; `cancel()` cancels its signal.
 struct Transport(Arc<Inner>);
 
 impl Interface for Transport {}
@@ -295,9 +285,7 @@ impl CancellationToken {
     /// `tokio` feature does not enable that macro for you.
     #[cfg(feature = "tokio")]
     pub async fn canceled(&self) {
-        // Register before the check: `notify_waiters` only wakes waiters
-        // that already exist, so checking first would drop a cancel that
-        // lands in between.
+        // Register first: `notify_waiters` wakes only existing waiters, so a cancel could slip by.
         let notified = self.0.notify.notified();
         if self.is_canceled() {
             return;
@@ -351,8 +339,7 @@ pub fn cancel_remote(binder: &SIBinder) -> Result<()> {
     let expected = <BpCancellationSignal as crate::Proxy>::descriptor();
     let actual = binder.descriptor();
     if actual.is_empty() {
-        // An RPC proxy off the wire, with no interface yet. Send on it
-        // directly: a typed cast would stamp it permanently.
+        // RPC proxy with no interface yet: send directly, a typed cast would stamp it for good.
         #[cfg(feature = "rpc")]
         if let Some(rp) = (**binder).as_any().downcast_ref::<crate::rpc::RpcProxy>() {
             let data = rp.build_request(expected)?;
@@ -382,8 +369,7 @@ pub fn cancel_remote(binder: &SIBinder) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// Plan 10-5 AC-5.2. No transport here: the signal's own behavior is
-    /// what these pin, and it is the same whichever side cancels.
+    /// Plan 10-5 AC-5.2, without a transport: the behavior is the same whichever side cancels.
     #[test]
     fn a_listener_runs_once_and_late_registration_runs_now() {
         let signal = CancellationSignal::new();
@@ -398,23 +384,19 @@ mod tests {
         assert!(signal.is_canceled());
         assert!(runs.load(Ordering::SeqCst), "the listener must have run");
 
-        // A second cancel must not run it again — the listener was taken
-        // out of the slot, so a re-run would need a second one.
+        // A second cancel must not run it again: the listener was taken out of the slot.
         runs.store(false, Ordering::SeqCst);
         signal.cancel();
         assert!(!runs.load(Ordering::SeqCst), "the listener ran twice");
 
-        // Registering on an already-cancelled signal runs on this thread
-        // rather than never.
+        // Registering on an already-cancelled signal runs on this thread rather than never.
         let late = Arc::new(AtomicBool::new(false));
         let flag = late.clone();
         signal.set_on_cancel(move || flag.store(true, Ordering::SeqCst));
         assert!(late.load(Ordering::SeqCst));
     }
 
-    /// A clone and a token see one state, and the transport's `cancel()`
-    /// — what a remote caller's transaction ends up calling — is what
-    /// drives it.
+    /// The transport's `cancel()` (what a remote call reaches) drives the clone and token too.
     #[test]
     fn the_transport_cancels_the_signal_it_came_from() {
         let signal = CancellationSignal::new();
@@ -430,9 +412,7 @@ mod tests {
         assert!(token.is_canceled());
     }
 
-    /// The signal's state outlives the `CancellationSignal` itself, so a
-    /// service may hand out the transport, keep a token, and drop the
-    /// rest.
+    /// A service may hand out the transport, keep a token and drop the signal.
     #[test]
     fn a_dropped_signal_still_cancels_through_its_transport() {
         let signal = CancellationSignal::new();
@@ -444,11 +424,7 @@ mod tests {
         assert!(token.is_canceled());
     }
 
-    /// Plan 10-5 AC-5.3.
-    ///
-    /// Bounded with a channel rather than `tokio::time::timeout`: this
-    /// crate's `tokio` feature deliberately omits `tokio/time`, and an
-    /// unbounded wait would hang the suite instead of failing it.
+    /// Plan 10-5 AC-5.3; bounded by a channel, since the `tokio` feature omits `tokio/time`.
     #[cfg(feature = "tokio")]
     #[test]
     fn an_async_waiter_wakes_on_cancel_and_returns_at_once_afterwards() {
@@ -462,8 +438,7 @@ mod tests {
         let signal = CancellationSignal::new();
         let token = signal.token();
 
-        // The worker threads run this even while the test thread blocks
-        // below, so the wake is observed from outside the runtime.
+        // Worker threads run this while the test thread blocks, observing from outside.
         let (tx, rx) = mpsc::channel();
         rt.spawn({
             let token = token.clone();
@@ -472,15 +447,12 @@ mod tests {
                 let _ = tx.send(());
             }
         });
-        // No synchronization with the task reaching its await: the cancel
-        // almost always lands first, so what this pins is that a token
-        // already cancelled still wakes a waiter that arrives later.
+        // Unsynchronized: the cancel usually lands first, so this pins a late-arriving waiter.
         signal.cancel();
         rx.recv_timeout(Duration::from_secs(5))
             .expect("canceled() did not wake within 5s");
 
-        // Already cancelled, and no `notify_waiters` left to come: this
-        // can only return by way of the pre-check.
+        // No `notify_waiters` is left to come, so only the pre-check can return this.
         let (tx, rx) = mpsc::channel();
         rt.spawn(async move {
             token.canceled().await;

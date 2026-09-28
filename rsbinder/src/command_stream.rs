@@ -27,8 +27,7 @@ impl CommandStream {
         self.0.read_native()
     }
 
-    /// L3 UAPI struct, copied verbatim. Not generic: a `ParcelPod` bound
-    /// would also admit the scalars, whose `Deserialize` is L1.
+    /// L3 UAPI struct as is. Not generic: `ParcelPod` admits scalars, whose `Deserialize` is L1.
     pub(crate) fn write_transaction(&mut self, val: &binder_transaction_data) -> Result<()> {
         self.0.write_aligned(val)
     }
@@ -51,13 +50,9 @@ impl CommandStream {
         self.0.set_data_size(new_len)
     }
 
-    /// # Safety
-    ///
-    /// Same contract as [`Parcel::set_data_size_driver_filled`]: bytes
-    /// `0..new_len` must have been initialized by the driver.
+    /// # Safety: as [`Parcel::set_data_size_driver_filled`]; the driver filled bytes `0..new_len`.
     pub(crate) unsafe fn set_data_size_driver_filled(&mut self, new_len: usize) -> Result<()> {
-        // SAFETY: this forwards the callee's obligation to this function's
-        // own caller unchanged — see the `# Safety` section above.
+        // SAFETY: the callee's contract is forwarded unchanged to our caller (`# Safety` above).
         unsafe { self.0.set_data_size_driver_filled(new_len) }
     }
 

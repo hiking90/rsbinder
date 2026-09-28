@@ -23,7 +23,23 @@
 //! An fd-mode reader parked in `recvmsg` holds the leftover lock until the
 //! socket wakes it, so a `shutdown` that takes that lock first deadlocks
 //! against it. Every `shutdown` here runs under a deadline, so such a bug
-//! fails the test instead of hanging the runner.
+//! fails the test instead of hanging the runner. Reads get the same
+//! protection: `armed` sets a 5 s read deadline on both ends of every pair,
+//! because the reads here expect an end of stream that a regressed
+//! `shutdown` would never produce (the peer is still alive) and libtest has
+//! no per-test timeout. It is longer than every `recv_timeout` bound, so the
+//! assertion is still what reports the failure.
+//!
+//! Scenario E (our own send after our own shutdown) must fail as the end of
+//! stream. The trait says a shutdown makes this end's later sends fail; the
+//! session's send rule retires the slot only on `EndOfStream`/`Io`
+//! (session.rs module doc "Failed sends"), and reads `Ok` as "the frame
+//! went out". A backend that let a send
+//! through after its own shutdown would report `Ok` for a frame the peer
+//! never reads. A socket cut in both directions refuses at once with
+//! `EPIPE`, `mem` by design, and `tls` gates the send itself: its cut is
+//! deferred behind the close signal, and a frame accepted in between would
+//! be one the peer discards after reading the alert (RFC 8446 §6.1).
 //!
 //! Separate test binary, `#![cfg(feature = "rpc")]`.
 
@@ -38,8 +54,7 @@ use rsbinder::rpc::{RpcError, RpcTransport};
 
 type Shared = Arc<dyn RpcTransport>;
 
-/// What a reader finds after a local shutdown when a frame had already
-/// reached the local kernel queue (or channel).
+/// What a reader gets after a local shutdown when a frame was already queued locally.
 #[derive(Clone, Copy)]
 enum Queued {
     /// Delivered first, then the end of stream (Linux; `mem`).
@@ -57,14 +72,12 @@ fn socket_expectation() -> Queued {
     }
 }
 
-/// What the peer's *first* send after our shutdown does — measured, and
-/// three different answers.
+/// The peer's first send after our shutdown, as measured per backend and platform.
 #[derive(Clone, Copy)]
 enum PeerSend {
     /// Refused at once (`EPIPE`): Linux `AF_UNIX`, and `mem` by design.
     FailsAtOnce,
-    /// Accepted (and discarded, or reset on a later write): macOS
-    /// `AF_UNIX`, and TCP on both platforms.
+    /// Accepted (discarded, or reset on a later write): macOS `AF_UNIX`, and TCP everywhere.
     Accepted,
 }
 
@@ -76,9 +89,7 @@ fn unix_peer_send() -> PeerSend {
     }
 }
 
-/// `shutdown` on its own thread under a deadline: a shutdown that blocks
-/// — on a lock a parked reader holds, say — must fail the test, not hang
-/// the runner.
+/// `shutdown` on its own thread under a 2 s deadline, so a blocked shutdown fails, not hangs.
 fn shutdown_within(name: &str, t: &Shared) {
     let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(), RpcError>>(1);
     let t = Arc::clone(t);
@@ -134,9 +145,7 @@ fn queued_then_shutdown(
         matches!(peer_end, Err(RpcError::EndOfStream)),
         "{name}: the peer reads our shutdown as its end of stream, got {peer_end:?}"
     );
-    // Its first send afterwards is measured per backend and platform (the
-    // table in the module doc); if it changes, the table and the
-    // `shutdown` contract change with it.
+    // Measured per backend and platform: a change here changes the module-doc table too.
     let sent = peer.send_frame(b"x");
     match peer_send {
         PeerSend::FailsAtOnce => assert!(
@@ -150,8 +159,7 @@ fn queued_then_shutdown(
     }
 }
 
-/// Scenario B: a reader parked in `recv` is woken by a local shutdown and
-/// returns the end of stream — within a bound, on every backend.
+/// Scenario B: a local shutdown wakes a parked reader with the end of stream, within a bound.
 fn blocked_reader_is_woken(name: &str, local: &Shared, fd_mode: bool) {
     let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, RpcError>>(1);
     let (started_tx, started_rx) = std::sync::mpsc::sync_channel::<()>(1);
@@ -164,9 +172,7 @@ fn blocked_reader_is_woken(name: &str, local: &Shared, fd_mode: bool) {
     };
     started_rx.recv().expect("the reader thread started");
     std::thread::sleep(Duration::from_millis(50));
-    // The reader has to still be parked, or the end of stream asserted
-    // below is just a read of an already-shut connection and the wake-up
-    // this test exists for never runs.
+    // Still parked, or the end of stream below is a plain read and no wake-up is tested.
     assert!(
         matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
         "{name}: the reader must still be parked when we shut down"
@@ -181,17 +187,7 @@ fn blocked_reader_is_woken(name: &str, local: &Shared, fd_mode: bool) {
     reader.join().expect("reader thread");
 }
 
-/// Scenario E: this end's own first send after its own shutdown fails —
-/// as the end of stream, on every backend and platform.
-///
-/// The trait says a shutdown makes this end's later sends fail; the
-/// session's send rule reads every failure but `Timeout` as "retire the
-/// slot", and `Ok` as "the frame went out". A backend that let a send
-/// through after its own shutdown would report `Ok` for a frame the peer
-/// never reads — a socket cut in both directions refuses at once with
-/// `EPIPE`, `mem` by design, and `tls` gates the send itself: its cut is
-/// deferred behind the close signal, and a frame accepted in between would
-/// be one the peer discards after reading the alert (RFC 8446 §6.1).
+/// Scenario E: our own send after our own shutdown fails as `EndOfStream` (see module doc).
 fn our_send_after_our_shutdown_fails(name: &str, local: &Shared) {
     shutdown_within(name, local);
     let sent = local.send_frame(b"after");
@@ -201,12 +197,7 @@ fn our_send_after_our_shutdown_fails(name: &str, local: &Shared) {
     );
 }
 
-/// The suite's own read deadline, armed on both ends of every pair. The
-/// reads here expect an end of stream that a regressed `shutdown` would
-/// never produce — the peer is still alive — and libtest has no per-test
-/// timeout, so without this such a regression hangs the runner instead of
-/// failing the assertion. Longer than every `recv_timeout` bound below, so
-/// the assertion is still what reports the failure.
+/// Arms the suite's 5 s read deadline on both ends of the pair (see module doc).
 fn armed(pair: (Shared, Shared)) -> (Shared, Shared) {
     for t in [&pair.0, &pair.1] {
         t.set_read_timeout(Some(Duration::from_secs(5)))
@@ -307,8 +298,7 @@ mod tcp {
     #[test]
     fn tcp_debug_queued_frame_then_shutdown() {
         let (local, peer) = tcp_pair();
-        // TCP accepts the first write on both platforms and reports the
-        // reset on a later one.
+        // TCP accepts the first write on both platforms and reports the reset on a later one.
         queued_then_shutdown(
             "tcp_debug",
             &local,
@@ -351,8 +341,7 @@ mod tls {
             .expect("parse certs")
     }
 
-    /// Both handshakes complete before the pair is handed out, so no
-    /// post-handshake write is still pending when a test shuts an end down.
+    /// TLS pair with both handshakes done, so no post-handshake write is pending at shutdown.
     fn tls_pair() -> (Shared, Shared) {
         let (s_srv, s_cli) = UnixStream::pair().expect("unix socketpair");
         let srv_cfg = Arc::new(

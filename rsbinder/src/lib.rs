@@ -237,15 +237,12 @@
 //! * [Binder](https://source.android.com/docs/core/architecture/hidl/binder-ipc)
 //!
 
-// android-only: clippy false-positives here on thread_locals that already use,
-// or cannot use, a `const { .. }` initializer.
+// android-only clippy false positive on thread_locals that use or cannot use `const { .. }`.
 #![cfg_attr(target_os = "android", allow(clippy::missing_const_for_thread_local))]
 
 // Core binder functionality
 mod binder;
-// Async binder runtime support. Private: `BoxFuture`, `BinderAsyncPool`
-// and `BinderAsyncRuntime` are re-exported at the crate root, which is
-// the only path — see the re-export policy below.
+// Async runtime support; private, its items are re-exported at the crate root only.
 #[cfg(feature = "async")]
 mod binder_async;
 mod binder_object;
@@ -253,19 +250,16 @@ mod binder_object;
 pub mod binderfs;
 /// Helpers for a process bridging two transports (the gateway pattern)
 pub mod bridge;
-// `CommandStream`, the L2 ioctl buffer. Private, and its field is private
-// to the module: `thread_state` cannot reach the L1 codec through it.
+// `CommandStream` (L2 ioctl buffer); its private field keeps `thread_state` off the L1 codec.
 mod command_stream;
-// Error types. Private: `Result` and `StatusCode` are re-exported at the
-// crate root.
+// Error types; private, `Result` and `StatusCode` are re-exported at the crate root.
 mod error;
 // `ParcelFileDescriptor`, re-exported at the crate root.
 mod file_descriptor;
-// `LazyServiceRegistrar`; documented inside (an outer doc would re-resolve its links at the crate root, as at `entry`).
+// `LazyServiceRegistrar`; documented inside (plain comment, same reason as `entry`).
 pub mod lazy_service;
 mod macros;
-// Server-side binder construction: `Binder`, `BinderFeatures` and
-// `is_handling_transaction`, re-exported at the crate root.
+// Server-side binder construction, re-exported at the crate root.
 mod native;
 // Server-side transaction observers; no outer doc (it would break the inner `//!` links).
 pub mod observe;
@@ -290,15 +284,12 @@ mod ref_counter;
 /// stubs so a heap fd can travel over the kernel binder or
 /// Unix-socket RPC. See the module docs.
 pub mod shared_memory;
-// Status and exception handling: `BinderResult`, `ExceptionCode` and
-// `Status`, re-exported at the crate root.
+// Status and exception handling, re-exported at the crate root.
 mod status;
 mod sys;
 /// Thread-local binder state
 pub mod thread_state;
-// What the transport under a binder can do, summarized from the types
-// that already own each fact. Not under `rpc`: the kernel path answers
-// the same questions.
+// Transport capabilities; not under `rpc`: the kernel path answers the same questions.
 mod transport_caps;
 
 /// RPC transport (binder-over-socket) — a separate stack from the
@@ -314,16 +305,10 @@ pub mod hub;
 /// AOSP-faithful surface and fail-closed `check_permission` helper.
 pub mod permission_controller;
 
-// Large byte payloads in a parcel (AOSP `Parcel::writeBlob`): inline
-// when small, shared memory when large. Plain comment for the same
-// reason as `cancel` below.
+// Large parcel payloads (AOSP `Parcel::writeBlob`); plain comment, same reason as `cancel`.
 pub mod blob;
 
-// Cooperative cancellation (`android.os.ICancellationSignal`): a service
-// hands out a transport binder, the caller cancels through it. Kept as a
-// plain (non-doc) comment for the same reason as `entry` below: an outer
-// doc here merges with the module's inner `//!` docs and re-resolves
-// their intra-doc links at the crate root, breaking them.
+// Cooperative cancellation (`android.os.ICancellationSignal`); plain comment, as for `entry`.
 pub mod cancel;
 
 // Streaming with credit-based back-pressure; plain comment, same reason as `cancel` above.
@@ -339,10 +324,7 @@ pub use fmq::generated::android::hardware::common::NativeHandle::NativeHandle;
 /// Async runtime implementations
 #[cfg(feature = "async")]
 mod rt;
-// Unified entry API (Plan 2-17): `serve` / `connect` + URI over every
-// transport. Kept as a plain (non-doc) comment: an outer doc here would
-// merge with the module's inner `//!` docs and re-resolve their intra-doc
-// links at the crate root, breaking them.
+// Unified entry API (Plan 2-17); no outer doc: it would re-resolve inner `//!` links at root.
 pub mod entry;
 
 #[cfg(feature = "tokio")]
@@ -351,32 +333,16 @@ pub use entry::{
     connect, connect_binder, serve, Client, ClientOptions, Endpoint, ServeOptions, Server,
     ServerGuard,
 };
-// Generated `IFooAsyncService` impls carry this attribute. Re-exported so a
-// consumer of generated code needs no `async-trait` line of its own.
+// For generated `IFooAsyncService` impls, so consumers need no `async-trait` dependency.
 #[cfg(feature = "async")]
 #[doc(hidden)]
 pub use async_trait::async_trait as __async_trait;
 
-// The `.aidl`-free path (plan 2-19), behind the `macros` feature: declare an
-// interface as a Rust trait and its data types as ordinary structs and enums.
-// See the `rsbinder_macros` crate docs for the signature rules and for what
-// still needs `.aidl`. `Parcelable` is re-exported as both a trait and a
-// derive; they live in different namespaces, so the one name serves both.
-// `ServiceSpecificError` is re-exported as both a trait and a derive for the
-// same reason as `Parcelable`.
+// `.aidl`-free path (plan 2-19); a trait and its derive share one name across namespaces.
 #[cfg(feature = "macros")]
 pub use rsbinder_macros::{interface, BinderEnum, Parcelable, ServiceSpecificError};
 
-// Explicit re-exports: glob re-exports would silently leak every
-// newly-added `pub` item in these modules, defeating semver review.
-//
-// Nine of the modules below are private, and this block is the only way
-// in. They exported exactly what is re-exported here, so the module path
-// was a second name for each item and nothing else — including one that
-// was actively harmful: `status::Result` is `BinderResult`, but shares a
-// name with the root `Result`, which is a different type. A domain module
-// that carries items of its own (`hub`, `rpc`, `thread_state`, …) stays
-// public; those must still be reached via `rsbinder::<module>::<item>`.
+// Explicit re-exports: a glob would leak every new `pub` item past semver review.
 
 // From `binder` — core binder identity, transaction codes, traits.
 pub use binder::{
@@ -389,8 +355,7 @@ pub use binder::{
     SET_RPC_CLIENT_TRANSACTION, SHELL_COMMAND_TRANSACTION, START_RECORDING_TRANSACTION,
     STOP_RECORDING_TRANSACTION, SYSPROPS_TRANSACTION, TWEET_TRANSACTION,
 };
-// `declare_binder_interface!` expands to `$crate::__rpc_stamp_descriptor(...)`
-// in consumer crates, so this helper must stay reachable at the crate root.
+// `declare_binder_interface!` calls `$crate::__rpc_stamp_descriptor` from consumer crates.
 #[doc(hidden)]
 pub use binder::__rpc_stamp_descriptor;
 // Same reason: the `function_names` arm of `declare_binder_interface!`.
@@ -401,9 +366,7 @@ pub use binder::__transaction_name;
 pub use binder_async::{BinderAsyncPool, BinderAsyncRuntime, BoxFuture};
 pub use error::{Result, StatusCode};
 pub use file_descriptor::ParcelFileDescriptor;
-// Fuzz entry points for the `fuzz/` crate, which is outside the
-// workspace and so can only reach them through the crate root now that
-// `file_descriptor` is private.
+// Fuzz entry points: the out-of-workspace `fuzz/` crate reaches them only via the root.
 #[cfg(all(feature = "rpc", feature = "fuzzing"))]
 #[doc(hidden)]
 pub use file_descriptor::{__fuzz_rpc_fd_index, __fuzz_rpc_fd_index_v1, __fuzz_rpc_raw_fd};
@@ -411,9 +374,7 @@ pub use file_descriptor::{__fuzz_rpc_fd_index, __fuzz_rpc_fd_index_v1, __fuzz_rp
 // From `native` — server-side binder construction.
 pub use native::{is_handling_transaction, Binder, BinderFeatures};
 
-// From `thread_state` — calling identity (AOSP
-// `IPCThreadState::getCalling*`). Kernel-path only; the RPC stack has
-// its own `PeerIdentity` model under `rpc::PeerIdentity`.
+// Calling identity (AOSP `IPCThreadState::getCalling*`); an in-flight RPC dispatch answers first.
 pub use thread_state::{
     calling_caller, calling_caps, clear_calling_identity, clear_calling_work_source,
     clear_propagate_work_source, get_calling_pid, get_calling_sid, get_calling_uid,
@@ -441,13 +402,13 @@ pub use process_state::{
 // From `proxy` — client-side handle types.
 pub use proxy::{Proxy, ProxyHandle};
 
-// Explicit (not glob) so a newly-added `pub` item in `rt` can't silently leak
-// to the crate root without semver review — the policy stated above.
+// Explicit, not glob, so a new `pub` item in `rt` cannot leak past semver review.
 #[cfg(feature = "tokio")]
 pub use rt::{
     check_interface_async, death_signal, get_interface_async, wait_for_interface_async,
     DeathSignal, Tokio, TokioRuntime,
 };
+// `status` stays private: the root re-exports are the only path to these types.
 pub use status::{BinderResult, ExceptionCode, ServiceSpecificError, Status};
 pub use transport_caps::TransportCaps;
 

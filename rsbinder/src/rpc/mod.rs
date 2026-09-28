@@ -87,8 +87,22 @@
 //!
 //! Note this needs no kernel binder: the `Tokio` pool's
 //! "am-I-in-a-kernel-transaction?" guard short-circuits via
-//! `ProcessState::is_initialized()` so a pure-RPC process (e.g. on
-//! macOS) no longer panics on an uninitialized `ProcessState`.
+//! `ProcessState::is_initialized()`, so a pure-RPC process (e.g. on
+//! macOS) does not panic on an uninitialized `ProcessState`.
+//!
+//! # Frame-boundary reads
+//!
+//! A read that failed with [`RpcError::EndOfStream`](crate::rpc::RpcError::EndOfStream) ("no
+//! frame pending") or [`RpcError::Timeout`](crate::rpc::RpcError::Timeout) ("no frame boundary
+//! crossed") is documented to have left the stream at
+//! a frame boundary. Every other read failure lacks that guarantee — including ones that in
+//! fact consumed nothing — and is treated as a lost position. Two callers ask through the
+//! crate-private `RpcError::leaves_frame_boundary_intact`: the android-13+ reader, which
+//! promotes a mid-frame case to `Truncated` / `DeadlineMidFrame`, and `client_transact`'s reply
+//! wait, which decides whether an abandoned nested call left its `REPLY` inbound. The r34
+//! framing readers and the serve loop reimplement the same split inline — against the io
+//! error kind and the `RpcError` variants respectively — so a change to the set has to be
+//! made in all three places.
 
 pub mod address;
 pub mod end;
@@ -97,26 +111,19 @@ pub(crate) mod lifecycle;
 pub mod proxy;
 pub mod server;
 pub mod session;
-// Internal RPC machinery: the wire-codec layer and per-session refcount/async
-// state. Not part of the public API — the codec is selected internally (no user
-// injection point) and `RpcState` is private session bookkeeping. Keeping them
-// `pub(crate)` lets the protocol evolve without semver-breaking releases.
+// Codec and session bookkeeping are `pub(crate)` so the protocol can change without semver breaks.
 pub(crate) mod state;
 pub mod transport;
-// The wire modules implement the complete AOSP codec surface (both directions
-// of every message, all negotiated versions), fully exercised by their own
-// hermetic `mod tests`. Some encode/decode entry points are validated there but
-// not reached by the current live dispatch path; `dead_code` fired on them only
-// after the demotion from `pub`. Keep the complete, tested surface.
+// Both codec modules are tested in their own `mod tests`; some entry points are not live yet.
 #[allow(dead_code)]
 pub(crate) mod wire;
+#[allow(dead_code)]
+pub(crate) mod wire_android13;
 /// Fuzz entrypoints (`fuzz/fuzz_targets/rpc_{wire,address}_decode.rs`,
 /// `rpc_session_handshake.rs`); not part of the supported API.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub use wire::{__fuzz_decode_address, __fuzz_decode_wire, __fuzz_session_handshake};
-#[allow(dead_code)]
-pub(crate) mod wire_android13;
 
 pub use address::{AddressSpace, RpcAddress, SpecialTransaction, RPC_SESSION_ID_NEW};
 pub use end::{EndReason, EndedBy, SessionEnd, StreamState};
@@ -136,12 +143,7 @@ pub use rustls;
 
 use std::fmt;
 
-/// Reject a remote binder at registration time.
-///
-/// An RPC server / session can only publish objects this process owns. A proxy
-/// put here would either be handed back to its own peer or refused later, when
-/// the parcel is written (AOSP `RpcState::onBinderLeaving`); catching it at
-/// registration turns a confusing late failure into an immediate one.
+/// Refuses a proxy at registration, not late at write (AOSP `RpcState::onBinderLeaving`).
 pub(crate) fn refuse_remote(binder: &crate::SIBinder, what: &str) -> crate::Result<()> {
     if (**binder).is_remote() {
         log::error!("{what}: refusing a remote binder; wrap it in a local Bn* (gateway) instead");
@@ -277,18 +279,7 @@ impl std::error::Error for RpcError {
 }
 
 impl RpcError {
-    /// Whether a read that failed with this error is documented to have
-    /// left the stream at a frame boundary: [`EndOfStream`](Self::EndOfStream)
-    /// ("no frame pending") and [`Timeout`](Self::Timeout) ("no frame
-    /// boundary crossed"). Every other read failure lacks
-    /// that guarantee — including ones that in fact consumed nothing — and
-    /// is treated as a lost position. Two callers ask: the android-13+
-    /// reader, which promotes a mid-frame case to `Truncated` /
-    /// `DeadlineMidFrame`, and `client_transact`'s reply wait, which decides
-    /// whether an abandoned nested call left its `REPLY` inbound. The r34
-    /// framing readers and the serve loop reimplement the same split inline
-    /// — against the io error kind and the `RpcError` variants
-    /// respectively — so a change to the set here has to be made there too.
+    /// `EndOfStream` or `Timeout`: a failed read left a frame boundary; see "Frame-boundary reads".
     pub(crate) fn leaves_frame_boundary_intact(&self) -> bool {
         matches!(self, RpcError::EndOfStream | RpcError::Timeout)
     }
@@ -342,8 +333,14 @@ impl From<RpcError> for std::io::Error {
     /// folding it by kind would turn it back into `EndOfStream`, the very
     /// thing it exists to be told apart from — so it goes out as an
     /// `UnexpectedEof` carrying itself as the payload, which
-    /// `From<io::Error>` recovers first. The remaining variants have no
-    /// `io::ErrorKind` that means what they mean, so they stay `Other`.
+    /// `From<io::Error>` recovers first. `RpcError::DeadlineMidFrame` goes
+    /// out the same way, as `TimedOut` carrying itself, so the variant is at
+    /// least recoverable on the far side: by kind alone it would come back as
+    /// a boundary `Timeout`, the opposite of what it means. No reader takes
+    /// it yet (each checks `is_timeout` by kind before the downcast), and no
+    /// producer sends this variant across this boundary. The remaining
+    /// variants have no `io::ErrorKind` that means what they mean, so they
+    /// stay `Other`.
     fn from(e: RpcError) -> Self {
         match e {
             RpcError::Io(io) => io,
@@ -352,11 +349,7 @@ impl From<RpcError> for std::io::Error {
             e @ RpcError::UncleanEndOfStream => {
                 std::io::Error::new(std::io::ErrorKind::UnexpectedEof, e)
             }
-            // Same carriage, so the variant is at least recoverable on the
-            // far side: by kind alone it would come back as a boundary
-            // `Timeout`, the opposite of what it means. No reader takes it
-            // yet — each checks `is_timeout` by kind before the downcast —
-            // and no producer sends this variant across this boundary.
+            // Carries itself, or it would read back as a boundary `Timeout` (see the fn doc).
             e @ RpcError::DeadlineMidFrame => std::io::Error::new(std::io::ErrorKind::TimedOut, e),
             other => std::io::Error::other(format!("{other}")),
         }
@@ -391,7 +384,9 @@ impl From<RpcError> for crate::StatusCode {
 /// before touching the address bytes — `RpcAddress` decoding is covered
 /// by the `rpc_address_decode` target, not here.)
 /// Property: no panic / OOM / UB / unbounded pre-allocation on *any*
-/// input — every length is bounded by the bytes actually present.
+/// input — every array length is bounded by the bytes actually present,
+/// and every out-vec length by `MAX_OUT_VEC_BYTES` (AOSP `resizeOutVector`),
+/// which is a byte cap, not a presence check.
 /// Not part of the supported API surface.
 #[cfg(any(test, feature = "fuzzing"))]
 #[doc(hidden)]
@@ -401,14 +396,24 @@ pub fn __fuzz_decode_rpc_parcel(input: &[u8]) {
     use crate::parcel::{Parcel, RpcParcelOps};
     use std::sync::Arc;
 
-    // Binder hook with no live session: lets `read::<SIBinder>` be
-    // driven without a connection. It does not decode the address.
+    // Sessionless binder hook: drives `read::<SIBinder>` without a connection or address decode.
     struct NullOps;
     impl RpcParcelOps for NullOps {
         fn write_binder(&self, _b: Option<&SIBinder>, _p: &mut Parcel) -> Result<()> {
             Err(StatusCode::DeadObject)
         }
         fn read_binder(&self, _p: &mut Parcel) -> Result<Option<SIBinder>> {
+            Err(StatusCode::DeadObject)
+        }
+        // No session, so no node table to give anything back to.
+        fn cancel_leaving(&self, _addrs: &[crate::rpc::RpcAddress]) {}
+        fn session_id(&self) -> *const () {
+            std::ptr::null()
+        }
+        fn records_binder_positions(&self) -> Result<bool> {
+            Ok(false)
+        }
+        fn acquire_copied(&self, _objects: &[&[u8]]) -> Result<crate::parcel::CopiedBinders> {
             Err(StatusCode::DeadObject)
         }
     }
@@ -429,13 +434,8 @@ pub fn __fuzz_decode_rpc_parcel(input: &[u8]) {
     let _ = fresh(input).read::<Vec<String>>();
     let _ = fresh(input).read::<Option<SIBinder>>();
     let _ = fresh(input).read::<SIBinder>();
-    // NOTE: `resize_out_vec`/`resize_nullable_out_vec` are intentionally
-    // *not* fuzzed here — an out-vec length is not backed by parcel
-    // bytes (the callee fills it), so they are unbounded by design
-    // (upstream Android is identical); feeding an arbitrary length
-    // would just OOM the fuzzer without modelling a real wire input.
-    // The bounded `in`-array path (`deserialize_array`) above is the
-    // surface this target covers.
+    let _ = fresh(input).resize_out_vec::<i32>(&mut Vec::new());
+    let _ = fresh(input).resize_nullable_out_vec::<i64>(&mut None);
 }
 
 #[cfg(test)]
@@ -443,6 +443,27 @@ mod strong_session_tests;
 
 #[cfg(test)]
 mod tests {
+    //! # Mutation gates
+    //!
+    //! - `peer_closed_and_timeout_round_trip_through_io_error`: `RpcError -> io::Error` must
+    //!   preserve the `io::ErrorKind` for the two variants that have one meaning the same
+    //!   thing. `RawTransportIo` crosses that boundary on every android-13+ handshake and on
+    //!   every read and write of a non-fd session, so a variant that degrades to `Other` there
+    //!   comes back as `Io(Other)`: a peer that closes before our write has to report
+    //!   `StatusCode::DeadObject`, not `Unknown`. Which side of an exchange notices a
+    //!   disconnect first is a host- and timing-dependent race, so both directions have to
+    //!   classify alike. `EndOfStream` returns as the same variant; `Timeout` is only
+    //!   kind-preserving — it comes back as `Io(TimedOut)`. Mutant: mapping `EndOfStream`
+    //!   through `other => io::Error::other(...)` fails the round trip (and the timeout arm
+    //!   guards `read_exact_into`'s `is_timeout` path the same way).
+    //! - `rpc_parcel_hostile_array_len_is_bounded_not_oom`: a hostile array length in an
+    //!   RPC-mode parcel must fail with bounded pre-allocation and `Err`. Mutant: removing the
+    //!   `min(len, data_avail())` / `len > data_avail()` guards turns each case into a multi-GB
+    //!   allocation that aborts the test process. The out-vec cases have a different guard:
+    //!   `check_out_vec_size` (the `MAX_OUT_VEC_BYTES` cap); removing it makes them allocate
+    //!   instead of returning `NoMemory`. The `rpc_parcel_rpc_mode` fuzz target is the soak
+    //!   supplement.
+
     use super::*;
     use crate::StatusCode;
 
@@ -485,21 +506,7 @@ mod tests {
         );
     }
 
-    /// `RpcError -> io::Error` must preserve the `io::ErrorKind` for the
-    /// two variants that have one meaning the same thing.
-    /// `RawTransportIo` crosses that boundary on every android-13+
-    /// handshake and on every read and write of a non-fd session, so a
-    /// variant that degrades to `Other` there comes back
-    /// as `Io(Other)`: a peer that closes before our write has to report
-    /// `StatusCode::DeadObject`, not `Unknown`. Which side of an
-    /// exchange notices a disconnect first is a host- and timing-
-    /// dependent race, so both directions have to classify alike.
-    /// `EndOfStream` returns as the same variant; `Timeout` is only
-    /// kind-preserving — it comes back as `Io(TimedOut)`.
-    ///
-    /// **Mutant gate**: restoring `other => io::Error::other(...)` for
-    /// `EndOfStream` fails the round trip below (and the timeout arm
-    /// guards `read_exact_into`'s `is_timeout` path the same way).
+    /// `EndOfStream`/`Timeout` keep their `io::ErrorKind` via `io::Error`; see "Mutation gates".
     #[test]
     fn peer_closed_and_timeout_round_trip_through_io_error() {
         let io = std::io::Error::from(RpcError::EndOfStream);
@@ -517,15 +524,13 @@ mod tests {
             transport::is_timeout(&io),
             "read_exact_into's deadline arm keys on this kind"
         );
-        // Reverse: `From<io::Error>` folds only the disconnect kinds, so
-        // a timeout comes back as `Io(TimedOut)`, not `Timeout` itself.
+        // `From<io::Error>` folds only disconnect kinds: a timeout returns as `Io(TimedOut)`.
         assert!(
             matches!(RpcError::from(io), RpcError::Io(ref e) if transport::is_timeout(e)),
             "a timeout stays recognizable as one across the round trip"
         );
 
-        // An `Io` payload still round-trips unchanged, and a variant
-        // with no matching kind still degrades to `Other`.
+        // An `Io` payload round-trips unchanged; a variant with no matching kind is `Other`.
         let io = std::io::Error::from(RpcError::Io(std::io::Error::from(
             std::io::ErrorKind::PermissionDenied,
         )));
@@ -536,9 +541,7 @@ mod tests {
         );
     }
 
-    /// The cfg-gated `StatusCode::RpcError` must round-trip through the
-    /// three hand-written exhaustive matches (Display / i32 both ways)
-    /// without colliding with another code.
+    /// cfg-gated `StatusCode::RpcError` round-trips Display and i32 both ways, colliding with none.
     #[test]
     fn status_code_rpc_error_roundtrips() {
         let v: i32 = StatusCode::RpcError.into();
@@ -549,13 +552,7 @@ mod tests {
         assert_ne!(v, StatusCode::FailedTransaction.into());
     }
 
-    /// A hostile array length in an RPC-mode parcel must fail
-    /// gracefully (bounded pre-allocation + `Err`), never pre-allocate
-    /// gigabytes. Deterministic regression — reverting the
-    /// `min(len, data_avail())` / `len > data_avail()` guards turns each
-    /// of these into a multi-GB allocation that aborts the test
-    /// process. The `rpc_parcel_rpc_mode` fuzz target is the soak
-    /// supplement.
+    /// A hostile RPC-parcel array length errors with bounded pre-allocation, never multi-GB.
     #[test]
     fn rpc_parcel_hostile_array_len_is_bounded_not_oom() {
         use crate::parcel::Parcel;
@@ -579,12 +576,25 @@ mod tests {
         p.set_data_position(0);
         assert!(p.read::<Vec<i64>>().is_err());
 
-        // (`resize_out_vec`/`resize_nullable_out_vec` are deliberately
-        // not asserted here: an out-vec length is not backed by parcel
-        // data — the callee fills it — so they are unbounded by design,
-        // exactly like Android libbinder's `resizeOutVector`. Bounding
-        // them by `data_avail()` regressed the live kernel out-array
-        // path; see the note in `parcel.rs`.)
+        // Out-vec lengths are capped by byte size (AOSP 1 MB), not by `data_avail()`.
+        for (len, want) in [(i32::MAX, Err(StatusCode::NoMemory)), (4, Ok(()))] {
+            let mut p = Parcel::new();
+            p.set_for_rpc(true);
+            p.write(&len).unwrap();
+            p.set_data_position(0);
+            assert_eq!(p.resize_out_vec::<i32>(&mut Vec::new()), want);
+            p.set_data_position(0);
+            let mut out: Option<Vec<i64>> = None;
+            assert_eq!(p.resize_nullable_out_vec(&mut out), want);
+        }
+        let mut p = Parcel::new();
+        p.write(&249_999i32).unwrap();
+        p.write(&250_000i32).unwrap();
+        p.set_data_position(0);
+        let mut out = Vec::<i32>::new();
+        assert_eq!(p.resize_out_vec(&mut out), Ok(()));
+        assert_eq!(out.len(), 249_999);
+        assert_eq!(p.resize_out_vec(&mut out), Err(StatusCode::NoMemory));
 
         // The fuzz entrypoint must never panic on adversarial bytes.
         for pat in [

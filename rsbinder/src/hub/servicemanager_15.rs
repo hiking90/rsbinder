@@ -33,7 +33,7 @@ crate::hub::impl_sm_module_body! { @custom_check_service
         get_service(sm, name)
     }
 
-    /// `add_service` + `FLAG_IS_LAZY_SERVICE`; `r6`–`r19` predate the constant and store the bit inert.
+    /// `add_service` + `FLAG_IS_LAZY_SERVICE`; `r6`–`r19` predate the flag and store it inert.
     pub(crate) fn add_lazy_service(
         sm: &BpServiceManager,
         identifier: &str,

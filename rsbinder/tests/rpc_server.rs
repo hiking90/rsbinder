@@ -2,11 +2,180 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Multi-session `RpcServer`, real-process e2e, threads,
-//! `getRemoteMaxThreads` negotiation, oneway FIFO, nested callbacks,
+//! `getRemoteMaxThreads` negotiation, oneway delivery, nested callbacks,
 //! timeout, lifecycle, and the no-global gate.
 //!
 //! Separate test binary. Each test builds its own
 //! server + sessions ⇒ parallel-safe, no `--test-threads=1`.
+//!
+//! # Mutation gates
+//!
+//! One bullet per test whose mutant, or whose reason for an assertion,
+//! does not fit its one-line doc.
+//!
+//! - `max_connections_admission_bound`: deleting the `max_connections`
+//!   gate in `RpcServer::run` serves the third client at once, so its
+//!   bounded-timeout `get_root` succeeds and the test fails.
+//! - `silent_r34_peer_released_by_handshake_deadline`: clearing the read
+//!   deadline before the r34 serve loop leaves the silent c1 worker blocked
+//!   in `recv`; the single `max_connections` slot never frees and c2's
+//!   bounded `get_root` times out.
+//! - `tls_android13plus_nested_callback_e2e`: the nested server→client
+//!   callback needs full duplex on one `TlsTransport`. A single mutex over
+//!   the TLS stream, held by a blocked `recv`, deadlocks it; the split
+//!   `Mutex<Connection>` structure is what passes.
+//! - `multi_connection_shared_session`: client #1 (empty id) founds a
+//!   session and the server registers a `Weak<RpcSessionInner>`, with
+//!   `attached`/`rejected` at 0; `get_session_id()` returns the
+//!   server-minted id (the client half of AOSP `setupClient`); client #2
+//!   echoes it and attaches, so `c2.get_session_id() == sid1` (the id
+//!   lives in `SharedSession`, so this holds only if state is shared) and
+//!   `attached_count == 1`; client #3 sends an unknown id and is
+//!   rejected. Dropping #2 must not end the session: #1 keeps working
+//!   with the same id. The full-teardown side is
+//!   `rpc_death_recipient_fires_on_session_drop`. Mutant: make
+//!   `RpcServer::run_connection_in_worker`'s attach arm build a fresh
+//!   session with `RpcSession::from_android13plus(transport, codec,
+//!   client_fd_mode, fd_unix)`, as the empty-id arm does; #2 then gets its
+//!   own `SharedSession` and `c2.get_session_id() != sid1`.
+//! - `ac_12_f8_attach_unifies_to_single_inner`: one `RpcSessionInner` per
+//!   session. With one inner per accepted connection (sharing only
+//!   `SharedSession`), a `state.remote_proxies`-cached `RpcProxy` would hold
+//!   a `Weak` to the first worker's inner, and a later worker unmarshaling
+//!   the same client binder would `find_conn` its nested `proxy.transact`
+//!   inside that other worker's slot pool (cross-slot aliasing). An
+//!   id-echoing attach adds a slot to the founding inner, so
+//!   `session_slot_count(sid) == Some(2)`. Mutant: the attach arm in
+//!   `RpcServer::run_connection_in_worker` builds
+//!   `RpcSession::with_shared(transport, profile, Arc::clone(&inner.shared))`
+//!   — a fresh inner sharing only `SharedSession` — which leaves the
+//!   founding inner at `Some(1)`. `multi_connection_shared_session`
+//!   asserts the attach itself; this test adds the single-inner shape.
+//! - `ac_12_4_set_max_threads_caps_incoming_slots`: `set_max_threads(N)`
+//!   both advertises (`GetMaxThreads` returns `max_threads_value()`, so a
+//!   client's `negotiate(local_max)` records `min(local_max, cap)`, read
+//!   back through `negotiated_max_threads()`) and enforces (the attach arm
+//!   refuses an attach that would push `slot_count()` past it). Mutant,
+//!   advertise-only: the third attach succeeds, `session_slot_count(sid)`
+//!   reaches `Some(3)` and `rejected_unknown_id_count` stays at 0. The
+//!   `shutdown` gate is covered by
+//!   `shutdown_gate_e2e_rejects_attach_during_handshake_stall`.
+//! - `fan_out_creates_n_outgoing_slots_when_local_max_outgoing_is_n`:
+//!   skipping the `1..negotiated` fan-out loop body leaves the founding
+//!   inner at one slot, so `session_slot_count` is `Some(1)`, not `Some(N)`.
+//! - `local_max_outgoing_one_skips_fan_out_byte_identical_to_founding_only`:
+//!   the `negotiated_max_threads() == 0` witness catches a mutant that runs
+//!   `negotiate` on the single-connection path. Dropping the early return
+//!   `if local == 1 && incoming == 0 { return Ok(session); }` alone is not
+//!   caught: the fan-out closure skips `negotiate` when `local == 1`, and
+//!   the extra `GET_SESSION_ID` round trip it adds is not observed.
+//! - `attach_with_a_bogus_session_id_is_refused_at_attach_time`: the
+//!   outgoing attach wire has no server→client acknowledgement (the server
+//!   refuses by closing), so `add_outgoing_connection_with_config` confirms
+//!   with one `GET_SESSION_ID` round trip. A single-threaded client always
+//!   draws slot 1 first, so the test drives 4 threads to reach the attached
+//!   slot. Dropping `confirm_attach` returns `Ok(2)`/`Ok(3)` for the bogus
+//!   ids, so the `is_err()` asserts fail; the echo loop is the control that
+//!   a confirmed pool has no dead slot.
+//! - `attach_past_the_server_slot_cap_is_refused_at_attach_time`: no
+//!   client-side check can catch a valid id past the cap, and a caller that
+//!   skips `negotiate()` has no other way to learn it. Without
+//!   `confirm_attach` the over-cap attaches return `Ok(3)`/`Ok(4)` while the
+//!   server stays at 2 slots.
+//! - `shutdown_gate_e2e_rejects_attach_during_handshake_stall`: in
+//!   production the attach arm's `shutdown` check sees a sub-microsecond
+//!   window between an accepted late attach and a concurrent
+//!   `stop_accepting()`. The `__set_attach_shutdown_probe` barrier fires
+//!   after the codec check and before that check, so the test parks the
+//!   worker, calls `stop_accepting()`, and releases it into the reject
+//!   branch. Mutant: removing `if server.shutdown.load() { reject }` from
+//!   the attach arm lets the worker add the slot, so
+//!   `rejected_unknown_id_count` does not move, `session_slot_count`
+//!   reaches `Some(2)`, and the attach succeeds.
+//! - `shared_node_survives_sibling_proxy_drop`: two client sessions
+//!   attached to one server session (shared `RpcState`) each hold a proxy
+//!   to the same root. With AOSP `timesSent` accounting the
+//!   server counts each send (strong = 2), so dropping one proxy leaves the
+//!   node for the sibling, and it is freed only when both drop (proven at
+//!   the state level by `rpc::state::tests::times_sent_balance_frees_node`).
+//!   Mutant: revert the `timesSent` bump in `on_binder_leaving`; strong
+//!   stays 1, dropping `root1` frees the node and `root2.echo()` is
+//!   `DeadObject`.
+//! - `excess_receipt_no_leak_single_client`: `get_root()` twice makes
+//!   the server's strong count 2 while the client dedups to one proxy, so
+//!   the client owes one excess `DEC_STRONG` at the second receipt (AOSP
+//!   `flushExcessBinderRefs`) plus one at proxy drop. Mutant: `read_binder`
+//!   without the excess-DEC arm sends only the drop DEC, strong sticks at
+//!   1 and `live_session_node_count()` never returns to 0. This relies on
+//!   dedup: if each receipt minted a fresh proxy, 0 excess + 2 drops would
+//!   also balance and the test would pass vacuously, so an identity
+//!   assertion pins the dedup precondition.
+//! - `pool_distributes_concurrent_calls_across_outgoing_slots`: two
+//!   parallel `slow(150)` take ≈150 ms when the pool gives each thread its
+//!   own slot (AOSP `findConnection`), ≈300 ms when serialized. The test
+//!   asserts `< 380 ms`, which a serialized run also meets, so it does not
+//!   catch `find_conn` always returning slot 1 or ignoring `exclusive_tid`.
+//! - `pool_exhausted_third_caller_waits_for_a_free_slot`: 2 slots and 3
+//!   `slow(200)` ≈ 400 ms. Only the 380 ms lower bound discriminates: a
+//!   third caller that does not wait on `slot_cv` finishes in one wave.
+//!   The 700 ms upper bound catches a stall, not a serial run (≈600 ms).
+//! - `pool_nested_callback_pins_to_forced_slot_single_thread`: slot 1 is
+//!   parked under `slow(...)`, so `roundtrip(cb)` runs on slot 2 and its
+//!   nested callback must dispatch there (`find_conn`'s reentrant match is
+//!   keyed by `(session_ptr, slot_id)`). Only slot 2 unmarshals `cb`, so
+//!   this exercises the pin without the cross-slot aliasing that
+//!   `ac_12_f8_attach_unifies_to_single_inner` rules out.
+//! - `ac_12_2_extended_cross_slot_nested_callback_multi_thread`: with one
+//!   inner per connection the two workers' cached `RpcProxy`s would point
+//!   at different inners, and the second worker's nested `proxy.transact`
+//!   would `find_conn` in the first worker's pool and deadlock or
+//!   interleave. `set_timeout(3s)` turns that deadlock into a failure.
+//! - `pool_oneway_fifo_under_concurrent_twoway_multi_outgoing`: top-level
+//!   oneway `find_conn` does not pin to slot 1; per-object oneway order is
+//!   carried by the per-address `asyncNumber` on send and the `asyncTodo`
+//!   replay on receive (`rpc::state`). This test gates that no frame is
+//!   lost or corrupted (`count == 300`); the ordering mutants are gated by
+//!   the unit tests
+//!   `rpc::state::tests::out_of_order_enqueues_then_drains_in_priority_order`
+//!   and `send_async_number_is_per_address_monotonic`, and by the
+//!   STAGE3 live libbinder round-robin path.
+//! - `unix_accepted_peer_identity_is_the_client_not_self`: a non-Linux
+//!   `resolve_peer` returning `self_identity()` for every socket would make
+//!   a macOS/BSD server see itself as the peer; the forked child's pid
+//!   check fails on `pid == std::process::id()`. On Linux `SO_PEERCRED`
+//!   already reports the client.
+//! - `rpc_death_recipient_fires_on_session_drop`: the notified side runs a
+//!   serve loop (the AOSP incoming-thread requirement) and a link before it
+//!   starts is refused; an unlinked recipient must not fire, and a link
+//!   after death is `DeadObject`. Mutant: drop `send_session_obituaries()`
+//!   from `RpcSessionInner::on_session_dead`, or stub `RpcProxy::link_to_death` to
+//!   `InvalidOperation`; `binder_died` never arrives.
+//! - `rpc_death_signal_completes_on_session_drop`: adds the wake-up path
+//!   (sent on the session thread, awaited in another runtime) and the
+//!   already-dead case, which completes instead of erroring. Mutant:
+//!   `DeathSignal::poll` always `Pending`, or no `oneshot` send in
+//!   `binder_died`.
+//! - `authorizer_gate_rejects_before_any_rpc_byte`: deleting the authorizer
+//!   block in `RpcServer::run_connection_in_worker` lets the rejected
+//!   client's `get_root()` succeed.
+//! - `dec_strong_outside_handler_does_not_block_or_desync`: with no
+//!   `Outgoing` slot the `DEC_STRONG` is skipped (AOSP `WOULD_BLOCK`), not
+//!   written to the served slot, so the node is released at session end,
+//!   or promptly once the client opens an incoming connection (plan 2-20
+//!   Phase B). The test pins that safety property; no assertion depends on
+//!   the DEC going out.
+//! - `preconnected_inet_fd_handshakes_over_tcp_debug`: the android-13+
+//!   handshake starts with a raw write; a transport without
+//!   `send_raw`/`recv_raw` gets the trait default's `Protocol` refusal.
+//! - `terminate_ends_every_session_and_joins_workers`: only the android-13+
+//!   session has an id (the r34 one was never in the id registry), and it is
+//!   `Live(2)`; the test checks that `terminate` still returns and that
+//!   session dies whole instead of being skipped as "still live".
+//! - `losing_the_last_outgoing_slot_declares_death_with_incoming`: the
+//!   surviving callback slot keeps the pool non-empty, but nothing reads a
+//!   request written on it; without the last-outgoing check the session
+//!   stays `Live`, and every later transact answers `WouldBlock` with no
+//!   obituary and no `RpcState::clear`.
 
 #![cfg(feature = "rpc")]
 
@@ -34,24 +203,17 @@ trait IEcho2: Interface {
     fn bump(&self) -> Result<()>; // oneway
     fn count(&self) -> Result<i64>;
     fn slow(&self, ms: i32) -> Result<()>;
-    /// Server calls `cb.echo("ping")` and returns its result
-    /// (exercises a server→client nested callback).
+    /// Server calls `cb.echo("ping")` and returns `rt:` + its result (nested callback).
     fn roundtrip(&self, cb: &SIBinder) -> Result<String>;
-    /// Server stores `cb`; a test then drives it from **outside** any
-    /// handler (plan 2-20).
+    /// Server stores `cb` for a test to drive from outside any handler (plan 2-20).
     fn hold(&self, cb: &SIBinder) -> Result<()>;
 }
 
 struct EchoSvc {
     counter: Arc<AtomicI64>,
-    /// Optional self-handle so `roundtrip`'s callback can call back in
-    /// (depth-3): the client callback re-invokes the *server*.
+    /// Always `false`; `roundtrip` reads it only to silence the unused-field lint.
     deeper: bool,
-    /// Set on **entry** to `slow()` so a test can wait deterministically
-    /// for a parked thread to have actually claimed a server worker
-    /// (e.g. the slot-pin scope). Tests that don't care pass a
-    /// fresh `AtomicBool` and ignore it. Set is one-way (no reset) —
-    /// "at least one slow call entered" is the only signal needed.
+    /// Set (never reset) on entry to `slow()`: at least one slow call holds a server worker.
     slow_entered: Arc<AtomicBool>,
     /// Callback parked by `hold()` for out-of-handler use.
     held: Arc<Mutex<Option<SIBinder>>>,
@@ -181,10 +343,7 @@ fn make_service(counter: Arc<AtomicI64>) -> SIBinder {
     make_service_with_slow_signal(counter, Arc::new(AtomicBool::new(false)))
 }
 
-/// Build an `EchoSvc` whose `slow()` entry sets the supplied `AtomicBool`
-/// so a test can wait deterministically for a parked client thread to
-/// have actually claimed a server worker — instead of a sleep(N ms)
-/// heuristic that races scheduler jitter.
+/// `slow()` sets `slow_entered` on entry, so a test waits on a claimed worker, not a sleep.
 fn make_service_with_slow_signal(
     counter: Arc<AtomicI64>,
     slow_entered: Arc<AtomicBool>,
@@ -196,8 +355,7 @@ fn make_service_with_slow_signal(
         held: Arc::new(Mutex::new(None)),
     }))))
 }
-/// Build an `EchoSvc` whose `hold()` parks the callback in `held`, so a
-/// test can drive that proxy from a thread that is inside no handler.
+/// `hold()` parks the callback in `held`, for a test to drive from outside any handler.
 fn make_service_with_hold(counter: Arc<AtomicI64>, held: Arc<Mutex<Option<SIBinder>>>) -> SIBinder {
     Interface::as_binder(&Binder::new(BnEcho2(Box::new(EchoSvc {
         counter,
@@ -297,9 +455,7 @@ fn wait_for_sock(path: &std::path::Path) {
     panic!("server socket {path:?} never appeared");
 }
 
-/// Generic bounded polling helper (~2 s budget = 400 × 5 ms). Returns
-/// `true` when `f` first becomes true; the trailing `f()` is a final
-/// race-tightening check after the last sleep.
+/// Poll `f` for ~2 s (400 × 5 ms), plus one last check after the final sleep.
 fn poll_until(mut f: impl FnMut() -> bool) -> bool {
     for _ in 0..400 {
         if f() {
@@ -310,15 +466,16 @@ fn poll_until(mut f: impl FnMut() -> bool) -> bool {
     f()
 }
 
-/// **RAII test cleanup** — guarantees `stop_accepting` + `bg.join` +
-/// `terminate` + socket-file removal on **any** drop path, including
-/// an `assert!`/`unwrap`/`expect` panic mid-test. Without this an
-/// assertion failure leaks the background accept loop + every spawned
-/// `serve_blocking` worker into the test binary process for the
-/// remainder of the suite (each subsequent timing-sensitive
-/// test then runs against a contaminated scheduler). Construct **once**
-/// per test, right after `server.run_background()`, then let `Drop` do
-/// the rest.
+// Kills and reaps a server child on any exit, including a panic: its `server.run()` never returns.
+struct KillOnDrop(std::process::Child);
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Stops, joins, terminates and unlinks on any drop, a panic included; one per test.
 struct ServeCleanup {
     server: Arc<RpcServer>,
     bg: Option<std::thread::JoinHandle<()>>,
@@ -341,16 +498,7 @@ impl Drop for ServeCleanup {
     fn drop(&mut self) {
         self.server.stop_accepting();
         if let Some(h) = self.bg.take() {
-            // A panic in the background accept loop is a real SUT
-            // bug (`RpcServer::run()` is supposed to return cleanly).
-            // Discarding the join result would let a regression that
-            // introduces an `expect("...poisoned")` panic in the accept
-            // path pass every test green. Surface the payload to stderr —
-            // *not* via `resume_unwind`, because the test's own
-            // assertions may already be unwinding and the more useful
-            // signal is the first panic, not the cleanup-time
-            // double-panic. The stderr line is what makes the bg
-            // panic observable in CI logs.
+            // Print, not `resume_unwind`: the test may already be unwinding its own panic.
             if let Err(p) = h.join() {
                 let msg = p
                     .downcast_ref::<&'static str>()
@@ -363,9 +511,7 @@ impl Drop for ServeCleanup {
                 );
             }
         }
-        // `terminate`, not `join_workers`: a client a test left connected
-        // (or parked in another thread) would otherwise hang the whole
-        // binary here instead of failing that test.
+        // Not `join_workers`: a client a test left connected would hang the whole binary.
         self.server.terminate();
         if let Some(path) = &self.path {
             let _ = std::fs::remove_file(path);
@@ -390,11 +536,13 @@ fn real_process_e2e_and_negotiation() {
 
     let path = tmp_sock("e2e");
     let exe = std::env::current_exe().expect("current_exe");
-    let mut child = std::process::Command::new(exe)
-        .args(["--exact", "real_process_e2e_and_negotiation", "--nocapture"])
-        .env("RSB_RPC_SERVER", &path)
-        .spawn()
-        .expect("spawn server child");
+    let mut child = KillOnDrop(
+        std::process::Command::new(exe)
+            .args(["--exact", "real_process_e2e_and_negotiation", "--nocapture"])
+            .env("RSB_RPC_SERVER", &path)
+            .spawn()
+            .expect("spawn server child"),
+    );
     wait_for_sock(&path);
 
     {
@@ -423,8 +571,8 @@ fn real_process_e2e_and_negotiation() {
     }
 
     // Killing the client leaves the server able to exit cleanly.
-    child.kill().expect("kill server child");
-    child.wait().expect("reap server child");
+    child.0.kill().expect("kill server child");
+    child.0.wait().expect("reap server child");
     let _ = std::fs::remove_file(&path);
 }
 
@@ -440,16 +588,6 @@ fn real_process_abstract_unix_socket_e2e() {
             .expect("set_root");
         let _ = server.run();
         std::process::exit(0);
-    }
-
-    // Kill + reap the server child even when an assert below panics —
-    // its `server.run()` loop never exits on its own.
-    struct KillOnDrop(std::process::Child);
-    impl Drop for KillOnDrop {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
     }
 
     let name = format!("rsb_rpc_abs_proc_{}", std::process::id());
@@ -524,12 +662,7 @@ fn concurrent_calls_single_shared_session() {
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
-    // 8 client threads on the SAME session.
-    // ONE client session, its root proxy shared (Arc) across 8 threads
-    // — exactly how a generated `Bp*` stub is used concurrently
-    // (`SIBinder` is `Send`/`Sync`). Calls are internally serialized on the one
-    // connection (the documented model: parallelism = multiple
-    // connections), so wall time is also bounded well below a hang.
+    // 8 threads share one root proxy, as with a generated `Bp*` stub; calls serialize.
     let client = RpcSession::setup_unix_client(&path).expect("connect");
     let root = Arc::new(EchoProxy(client.get_root().expect("get_root")));
 
@@ -572,9 +705,7 @@ fn concurrent_clients_isolated_sessions() {
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
-    // 8 client threads, each its own connection (independent session +
-    // RpcState). Each does 200 calls and must see only its own
-    // echoes (no cross-session contamination, no deadlock).
+    // 8 threads, one session each: every thread must see only its own echoes.
     let mut handles = Vec::new();
     for t in 0..8 {
         let p = path.clone();
@@ -595,15 +726,7 @@ fn concurrent_clients_isolated_sessions() {
 
 // ---- opt-in server-side connection admission bound -----------
 
-/// `set_max_connections(N)` caps *concurrent* connection workers via
-/// reactor-free accept backpressure (excess clients wait in the kernel
-/// listen backlog, none dropped; a freed slot resumes accept). This is
-/// the reactor-free, Android-faithful resource bound — a genuine middle
-/// ground that the no-reactor design does NOT foreclose.
-///
-/// Mutant: deleting the `max_connections` gate in `RpcServer::run`
-/// makes the 3rd client served immediately ⇒ its bounded-timeout
-/// `get_root` would *succeed*, failing this test.
+/// `set_max_connections(2)` holds a third client in the backlog until a slot frees; see module doc.
 #[test]
 fn max_connections_admission_bound() {
     let path = tmp_sock("admit");
@@ -616,9 +739,7 @@ fn max_connections_admission_bound() {
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
-    // Two long-lived sessions occupy both worker slots: each get_root
-    // succeeds (proves served), then the session is *held* so its
-    // worker stays blocked in `serve_once`/recv.
+    // Two served, then held, sessions keep both workers blocked in recv.
     let c1 = RpcSession::setup_unix_client(&path).expect("connect c1");
     assert_eq!(
         EchoProxy(c1.get_root().expect("c1 get_root"))
@@ -634,10 +755,7 @@ fn max_connections_admission_bound() {
         "c2"
     );
 
-    // 3rd connects (into the kernel backlog — `connect()` succeeds
-    // without a server `accept()`), but the accept loop is gated at 2,
-    // so no worker ever serves it: a bounded-deadline `get_root` must
-    // time out, not succeed.
+    // c3 lands in the kernel backlog; accept is gated at 2, so its `get_root` must time out.
     let c3 = RpcSession::setup_unix_client(&path).expect("connect c3 (backlog)");
     c3.set_timeout(Some(Duration::from_millis(600)));
     assert!(
@@ -646,11 +764,7 @@ fn max_connections_admission_bound() {
     );
     drop(c3);
 
-    // Free a slot: dropping c1 closes its socket ⇒ the worker's recv
-    // hits EOF ⇒ `serve_blocking` returns ⇒ the JoinHandle finishes ⇒
-    // the next accept tick reaps it (`live_worker_count`) ⇒ accept
-    // resumes. A fresh 4th client is then served within a generous
-    // deadline.
+    // Dropping c1 ends its worker; the next accept tick reaps it and accept resumes.
     drop(c1);
     let c4 = RpcSession::setup_unix_client(&path).expect("connect c4");
     c4.set_timeout(Some(Duration::from_secs(5)));
@@ -667,15 +781,7 @@ fn max_connections_admission_bound() {
     // _cu handles teardown.
 }
 
-/// A connected-but-silent **r34** peer (the default profile, which has no
-/// separate handshake — first contact is the first serve-loop frame) must
-/// be torn down by the handshake/admission read deadline so it cannot pin
-/// its worker + admission slot forever.
-///
-/// Mutant: clearing the read deadline *before* the r34 serve loop leaves
-/// the silent c1 worker blocked in `recv` with no deadline ⇒ the single
-/// `max_connections` slot is never freed ⇒ c2's
-/// bounded `get_root` times out, failing this test.
+/// A silent r34 peer (no handshake before frame 1) loses its slot to the deadline; see module doc.
 #[test]
 fn silent_r34_peer_released_by_handshake_deadline() {
     let path = tmp_sock("silent_r34");
@@ -683,22 +789,17 @@ fn silent_r34_peer_released_by_handshake_deadline() {
     server
         .set_root(make_service(Arc::new(AtomicI64::new(0))))
         .expect("set_root");
-    // One slot so a pinned silent peer is directly observable, and a short
-    // deadline to keep the test fast + deterministic.
+    // One slot makes a pinned silent peer observable; a short deadline keeps it fast.
     server.set_max_connections(1);
     server.set_handshake_timeout(Some(Duration::from_millis(300)));
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
-    // c1 connects but sends nothing: r34 connect performs no wire, so this
-    // is the silent first-contact peer. It occupies the single worker slot.
+    // An r34 connect writes nothing, so c1 is a silent peer holding the only slot.
     let c1 = RpcSession::setup_unix_client(&path).expect("connect c1 (silent)");
 
-    // c2 connects into the backlog; it can only be served once c1's worker
-    // exits on the first-frame deadline and frees the slot. A deadline
-    // comfortably larger than the handshake timeout proves the slot is
-    // released (and not that c2 merely raced ahead).
+    // c2 waits in the backlog until c1's worker hits the first-frame deadline.
     let c2 = RpcSession::setup_unix_client(&path).expect("connect c2");
     c2.set_timeout(Some(Duration::from_secs(5)));
     assert_eq!(
@@ -714,7 +815,7 @@ fn silent_r34_peer_released_by_handshake_deadline() {
     // _cu handles teardown.
 }
 
-// ---- oneway FIFO + non-blocking send -------------------------------
+// ---- oneway delivery + non-blocking send ---------------------------
 
 #[test]
 fn oneway_fifo_and_nonblocking() {
@@ -736,12 +837,10 @@ fn oneway_fifo_and_nonblocking() {
     for _ in 0..n {
         root.bump().expect("oneway bump");
     }
-    // Oneway sends must not block on a per-call round trip — 2000 of
-    // them complete far faster than 2000 sync RTTs would.
+    // Oneway sends must not wait for a per-call round trip.
     let oneway_elapsed = t0.elapsed();
 
-    // A subsequent sync call observes all prior oneway calls in order
-    // (single connection ⇒ FIFO): the count has reached n.
+    // Polled, so this checks eventual delivery of every oneway call, not their order.
     let mut last = root.count().unwrap();
     for _ in 0..200 {
         if last == n {
@@ -750,7 +849,7 @@ fn oneway_fifo_and_nonblocking() {
         std::thread::sleep(Duration::from_millis(5));
         last = root.count().unwrap();
     }
-    assert_eq!(last, n, "all oneway calls processed in FIFO order");
+    assert_eq!(last, n, "all oneway calls eventually delivered");
     assert!(
         oneway_elapsed < Duration::from_secs(5),
         "oneway sends should not block per-call (took {oneway_elapsed:?})"
@@ -774,11 +873,7 @@ fn nested_callback_no_deadlock() {
     let client = RpcSession::setup_unix_client(&path).expect("connect");
     let root = EchoProxy(client.get_root().expect("get_root"));
 
-    // The client publishes its OWN IEcho2 object as a callback. The
-    // server calls back into it (`roundtrip` → cb.echo("ping")) while
-    // the client's `roundtrip` call is still in flight: the client's
-    // recv loop dispatches the nested inbound TRANSACT inline. Must
-    // not deadlock and must return the right value.
+    // The server calls `cb` mid-`roundtrip`; the client's recv loop dispatches it inline.
     let cb = make_service(Arc::new(AtomicI64::new(0)));
     let out = root.roundtrip(&cb).expect("nested roundtrip");
     assert_eq!(out, "rt:ping", "server→client nested callback result");
@@ -807,8 +902,7 @@ fn client_timeout_on_hung_server() {
     client.set_timeout(Some(Duration::from_millis(150)));
     let root = EchoProxy(client.get_root().expect("get_root"));
 
-    // Server sleeps 5s; client deadline is 150ms → deterministic
-    // Timeout, never an infinite wait.
+    // Server sleeps 5s; client deadline is 150ms → deterministic Timeout.
     let t0 = std::time::Instant::now();
     let err = root.slow(5000).expect_err("hung call must time out");
     assert_eq!(err, StatusCode::TimedOut, "got {err:?}");
@@ -821,19 +915,11 @@ fn client_timeout_on_hung_server() {
 
 // ---- opt-in android-13+ versioned-wire profile ---------------------
 
-/// The proven android-13+ connection handshake + AOSP-faithful
-/// framing + `Android13PlusCodec` (hermetic) driving a
-/// **live `RpcServer`/`RpcSession` dispatch path** end-to-end over a
-/// real `UnixTransport`, reusing the existing per-session `RpcState`,
-/// `client_transact`/`serve_blocking`, oneway-FIFO and nested-callback
-/// machinery unchanged. Covers v0 (android-13), v1 (android-14/15) and
-/// the `min(client_max, server_max)` version negotiation incl.
-/// mismatch. The default r34 path is untouched (its green suite is the
-/// no-regression gate).
+/// android-13+ wire over a live server on UDS: v0–v2, `min` negotiation, clamp of an unknown max.
 #[test]
 fn android13plus_profile_e2e() {
     // (server_max, client_max, expected negotiated version)
-    for (smax, cmax, expect) in [
+    for (i, (smax, cmax, expect)) in [
         (0u32, 0u32, 0u32), // v0 — android-13
         (1, 1, 1),          // v1 — android-14/15
         (1, 0, 0),          // mismatch ⇒ min = v0
@@ -842,8 +928,14 @@ fn android13plus_profile_e2e() {
         (2, 1, 1),          // v2↔v1 ⇒ min = v1
         (1, 2, 1),          // v1↔v2 ⇒ min = v1
         (2, 0, 0),          // v2↔v0 ⇒ min = v0
-    ] {
-        let path = tmp_sock(&format!("a13_{smax}_{cmax}"));
+        // An unsupported server max clamps to v2 (client EXPERIMENTAL).
+        (3, 0xF000_0000, 2),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // Row index, not the versions: `sun_path` is 104 bytes on macOS.
+        let path = tmp_sock(&format!("a13_{i}"));
         let counter = Arc::new(AtomicI64::new(0));
         let server = RpcServer::setup_unix_server(&path).expect("bind");
         server.set_android13plus(smax); // opt in to the versioned wire
@@ -855,8 +947,7 @@ fn android13plus_profile_e2e() {
         let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
         wait_for_sock(&path);
 
-        // Client opts into android-13+; the handshake negotiates
-        // min(cmax, smax) and uses AOSP framing (no u32 length prefix).
+        // Negotiates min(cmax, smax); AOSP framing has no u32 length prefix.
         let client =
             RpcSession::setup_unix_client_android13plus(&path, cmax).expect("android-13+ connect");
         assert_eq!(
@@ -881,9 +972,7 @@ fn android13plus_profile_e2e() {
             );
         }
 
-        // Oneway FIFO: 300 oneway bumps then a sync read observes them
-        // all in order (single connection ⇒ FIFO) — exercises the
-        // android-13+ TRANSACT(oneway)/no-reply path.
+        // Polled: every one of the 300 oneway bumps is eventually delivered (order not checked).
         let n = 300;
         for _ in 0..n {
             root.bump().expect("oneway bump");
@@ -896,11 +985,9 @@ fn android13plus_profile_e2e() {
             std::thread::sleep(Duration::from_millis(5));
             last = root.count().unwrap();
         }
-        assert_eq!(last, n, "oneway FIFO over android-13+ wire");
+        assert_eq!(last, n, "oneway calls all delivered over android-13+ wire");
 
-        // Nested server→client callback while a call is in flight:
-        // the client's recv loop dispatches the inbound TRANSACT inline
-        // over the same android-13+ connection. Must not deadlock.
+        // Nested callback: the client's recv loop dispatches the inbound TRANSACT inline.
         let cb = make_service(Arc::new(AtomicI64::new(0)));
         assert_eq!(root.roundtrip(&cb).expect("nested"), "rt:ping");
         for _ in 0..20 {
@@ -909,9 +996,7 @@ fn android13plus_profile_e2e() {
 
         drop(root);
         drop(client);
-        // _cu (per-iteration) handles teardown — `let _cu = ServeCleanup::new(...)`
-        // is dropped here as the for-loop body scope ends, in the same
-        // order the explicit shutdown/join/remove_file ran before.
+        // `_cu` tears this iteration's server down as the loop body ends.
     }
 }
 
@@ -998,15 +1083,7 @@ fn abstract_unix_socket_e2e() {
     assert_eq!(fan_root.echo("abstract-fan").unwrap(), "abstract-fan");
 }
 
-/// The decoupled `TlsTransport`
-/// (`Mutex<Connection>` + lock-free stream) driving
-/// the **android-13+ profile over TLS**, hermetic rsbinder↔rsbinder.
-/// Mirrors `android13plus_profile_e2e` (version negotiation v0/v1/v2 +
-/// mismatch, echo, 300-oneway FIFO, **nested server→client callback**)
-/// but the transport is TLS over TCP instead of a plain `UnixTransport`
-/// — the keystone gate that the decomposed structure achieves
-/// full-duplex (the nested callback) without the blocking-while-holding
-/// deadlock a single coupled `StreamOwned`-Mutex would cause.
+/// `android13plus_profile_e2e` over TLS/TCP, nested callback included; see module doc.
 #[cfg(feature = "rpc-tls")]
 #[test]
 fn tls_android13plus_nested_callback_e2e() {
@@ -1069,8 +1146,7 @@ fn tls_android13plus_nested_callback_e2e() {
             let _ = session.serve_blocking();
         });
 
-        // Exercises the convenience constructor (TCP-connect +
-        // TLS-handshake + android-13+ handshake in one call).
+        // Convenience constructor: TCP connect + TLS handshake + android-13+ handshake.
         let client = RpcSession::setup_tcp_client_tls_android13plus(
             addr,
             "localhost",
@@ -1094,7 +1170,7 @@ fn tls_android13plus_nested_callback_e2e() {
             );
         }
 
-        // Oneway FIFO over TLS+android-13+ wire.
+        // Oneway delivery over TLS+android-13+ wire (polled; order not checked).
         let n = 300;
         for _ in 0..n {
             root.bump().expect("oneway bump over TLS");
@@ -1107,11 +1183,9 @@ fn tls_android13plus_nested_callback_e2e() {
             std::thread::sleep(Duration::from_millis(5));
             last = root.count().unwrap();
         }
-        assert_eq!(last, n, "oneway FIFO over TLS android-13+ wire");
+        assert_eq!(last, n, "oneway calls all delivered over TLS+android-13+");
 
-        // The keystone: nested server→client callback over one TLS
-        // connection must not deadlock (full-duplex via the decomposed
-        // Mutex<Connection> + lock-free stream).
+        // A nested server→client callback over one TLS connection needs a full-duplex transport.
         let cb = make_service(Arc::new(AtomicI64::new(0)));
         assert_eq!(root.roundtrip(&cb).expect("nested over TLS"), "rt:ping");
         for _ in 0..20 {
@@ -1124,9 +1198,7 @@ fn tls_android13plus_nested_callback_e2e() {
     }
 }
 
-/// The default r34 profile must report **no** android-13+ wire version
-/// (the new accessor's R34 arm) — locks "opt-in only; default
-/// byte-unchanged".
+/// The default r34 profile reports no android-13+ wire version: the versioned wire is opt-in.
 #[test]
 fn r34_profile_reports_no_wire_version() {
     let path = tmp_sock("r34_ver");
@@ -1151,52 +1223,14 @@ fn r34_profile_reports_no_wire_version() {
     drop(client);
 }
 
-/// `transport` split out of
-/// `RpcSessionInner` into a shared `SharedSession` + server id-demux +
-/// partial-vs-full death-trigger.
-///
-/// Proves the **id-demux attach** is real (not dead plumbing):
-///  - client #1 — **empty** id ⇒ new session; server registers a
-///    `Weak` of its `SharedSession`; default flow unchanged
-///    (`attached/rejected == 0`, `session_registered >= 1`, full
-///    round-trip);
-///  - `get_session_id()` round-trips the server-minted 32-byte id
-///    (the client half of AOSP `setupClient`);
-///  - client #2 — **echoes that id** ⇒ server resolves the live
-///    session and **attaches** this connection to it: `c2` speaks the
-///    *same* `SharedSession` (`c2.get_session_id() == sid1` — the
-///    shared `rpc_session_id` lives in `SharedSession`, so this holds
-///    **iff** state is shared, not a fresh per-connection session),
-///    `attached_count == 1`, and `c2` is fully functional over the
-///    attached connection;
-///  - client #3 — an **unknown** 32-byte id ⇒ no live session ⇒
-///    rejected (`rejected_unknown_id == 1`);
-///  - **partial vs. full teardown**: dropping the *attached* #2
-///    must NOT tear the session down — #1 stays fully functional and
-///    still reports the same shared id (a spurious obituary / early
-///    teardown on a partial connection loss would break this). The
-///    complementary "fires exactly once on *full* teardown" side is
-///    the `rpc_death_recipient_fires_on_session_drop` (single-connection
-///    `live_conns 1→0`) in this same suite.
-///
-/// **Mutant gate**: make the found branch build a
-/// *fresh* session instead of attaching (`from_android13plus(.., None)`
-/// in `serve_connection`'s attach arm). Then #2 gets its own
-/// `SharedSession` ⇒ `c2.get_session_id() != sid1` ⇒ the shared-id
-/// assertion fails. That is what makes the demux load-bearing rather
-/// than dead plumbing.
+/// Id-demux: echoed id attaches, unknown id is refused, partial loss survives; see module doc.
 #[test]
-fn a0b_multi_connection_shared_session() {
+fn multi_connection_shared_session() {
     let path = tmp_sock("a0b");
     let counter = Arc::new(AtomicI64::new(0));
     let server = RpcServer::setup_unix_server(&path).expect("bind");
-    server.set_android13plus(1); // opt in to the versioned wire
-                                 // `set_max_threads` is the advertised
-                                 // *and* enforced per-session incoming-slot cap. This test exercises
-                                 // founding + one attached connection ⇒ explicit opt-in at 2 slots
-                                 // (default 1 ⇒ founding-only). AOSP-faithful: this is fundamentally
-                                 // a multi-conn scenario, so AOSP `setMaxIncomingThreads(2)` is its
-                                 // natural setup step.
+    server.set_android13plus(1);
+    // Founding + one attach need 2 slots (AOSP `setMaxIncomingThreads(2)`); the default is 1.
     server.set_max_threads(2);
     server
         .set_root(make_service(counter.clone()))
@@ -1219,8 +1253,7 @@ fn a0b_multi_connection_shared_session() {
     let sid1 = c1.get_session_id().expect("get_session_id #1");
     assert_eq!(sid1.len(), 32, "AOSP kSessionIdBytes");
 
-    // --- client #2: echo #1's id ⇒ server ATTACHES it to #1's
-    //     SharedSession (shared state/root/rpc_session_id).
+    // --- client #2: echo #1's id ⇒ server ATTACHES it to #1's SharedSession.
     let c2 = RpcSession::setup_client_android13plus_with_config(
         RpcClientConfig::unix(&path, 1).session_id(&sid1),
     )
@@ -1247,24 +1280,7 @@ fn a0b_multi_connection_shared_session() {
         &sid1[..],
         "bogus id differs from the minted one"
     );
-    // The reject lands past the handshake (the wire acknowledges an
-    // attach with nothing), so the attach confirmation round trip —
-    // `GET_SESSION_ID` on the fresh connection — is what makes the
-    // *constructor* fail instead of some later call on a dead
-    // connection.
-    // Strengthen the unknown-id reject assertion: a plain `is_err()`
-    // would also pass for an unrelated
-    // error (e.g. handshake itself failed). Lock the contract to the
-    // single status this reject produces: the server `drop(transport)`
-    // closes the socket, and a disconnect folds to `EndOfStream` and
-    // then `StatusCode::DeadObject` (see `rsbinder/src/rpc/mod.rs`,
-    // `From<io::Error> for RpcError`, kind-preserving in both
-    // directions per
-    // `rpc::tests::peer_closed_and_timeout_round_trip_through_io_error`).
-    // This path arms no deadline (`RpcClientConfig`'s
-    // `handshake_timeout` defaults to `None`), so a `TimedOut` or an
-    // unclassified `Unknown` here means a different bug — as does `Ok`,
-    // the true mutant: server honored the unknown id.
+    // Exactly `DeadObject` (socket close → `EndOfStream`); no deadline is armed, so no `TimedOut`.
     let err = RpcSession::setup_client_android13plus_with_config(
         RpcClientConfig::unix(&path, 1).session_id(&bogus),
     )
@@ -1281,85 +1297,33 @@ fn a0b_multi_connection_shared_session() {
     );
     assert_eq!(server.attached_count(), 1, "attach count stable");
 
-    // --- Sever **only** the ATTACHED connection #2 (a partial loss).
-    //     A proxy holds its session strongly (AOSP `sp<RpcSession>` in
-    //     `BpBinder`), so `root2` must go first: dropping `c2` alone
-    //     would leave connection #2 open through `root2`. The session
-    //     must survive: the founding connection #1 keeps working and
-    //     still reports the same shared id. A spurious obituary / early
-    //     teardown on a partial connection loss (live_conns mis-gated)
-    //     would make these DeadObject.
-    //
-    //     The liveness probe is `get_session_id` (a zero-address
-    //     special transact). It does not drop a sibling proxy here;
-    //     the sibling-proxy-drop path (AOSP `timesSent` /
-    //     `flushExcessBinderRefs`) is covered by
-    //     `f7_shared_node_survives_sibling_proxy_drop` +
-    //     `f7_excess_receipt_no_leak_single_client`. This test stays
-    //     focused on attach (shown above) + no premature teardown on
-    //     partial loss (shown here) so its mutant gate stays clean.
+    // Sever only #2; `root2` first, as a proxy holds its session (AOSP `sp<>` in `BpBinder`).
     drop(root2);
     drop(c2);
-    // **Deterministic** wait for the server's attached worker to
-    // exit (`serve_blocking_on` → `live_conns.fetch_sub`); a fixed
-    // sleep would race scheduler jitter under load.
-    // `session_live_conns` reads the live-conn ledger
-    // directly: after `c2` drop the attached worker observes the
-    // peer-close and `fetch_sub`s 2→1; once we see 1 the partial-loss
-    // path is fully reaped and the *next* liveness check
-    // (`get_session_id` below) probes a stable state.
+    // Poll the live-conn ledger to 1 (not a sleep), so the probe below sees a reaped state.
     let sid1_arr: [u8; 32] = sid1
         .as_slice()
         .try_into()
         .expect("32-byte session id (AOSP kSessionIdBytes)");
     assert!(
         poll_until(|| server.session_live_conns(&sid1_arr) == Some(1)),
-        "F4 partial-loss reap: server's attached worker must have \
+        "partial-loss reap: server's attached worker must have \
          decremented live_conns 2→1 within budget"
     );
     assert_eq!(
         c1.get_session_id().expect("get_session_id #1 post-partial"),
         sid1,
         "founding connection + shared session survive a partial \
-         (attached) connection loss — no spurious obituary/teardown (F4)"
+         (attached) connection loss — no spurious obituary/teardown"
     );
     assert_eq!(server.attached_count(), 1, "attach count stable post-drop");
 
     drop(root1);
     drop(c1);
-    // _cu's Drop handles stop_accepting/bg.join/terminate/remove_file —
-    // a panic above does not leak worker threads + socket file.
+    // `_cu`'s Drop tears down, so a panic above leaks no worker thread or socket file.
 }
 
-/// Server-side unification of `RpcSessionInner` into a single inner per
-/// session.
-///
-/// Without it the *server* built one
-/// `RpcSessionInner` per accepted connection (sharing only the
-/// `SharedSession`), so `state.remote_proxies`-cached `RpcProxy.weak:
-/// Weak<RpcSessionInner>` pointed to the *first* worker's inner. A
-/// later worker unmarshaling the same client binder hit the cache and
-/// inherited that other inner — its nested `proxy.transact`
-/// `find_conn`ed inside the other worker's slot pool, not its own:
-/// cross-slot aliasing. Collapsing N inners into 1 (slots
-/// in one pool) makes every cached `RpcProxy.weak` point to the only
-/// inner, and any server worker's nested `proxy.transact` `find_conn`s
-/// **inside its own pool**.
-///
-/// Witness via the *founding inner*'s slot count: an
-/// id-echoing attached connection adds a *slot* to that inner, so
-/// `session_slot_count(sid) == Some(2)`. The mutant (server attach arm
-/// builds `from_android13plus(.., Some(shared))` = a fresh inner sharing
-/// only `SharedSession`) leaves the founding
-/// inner with its single founding slot ⇒ `Some(1)` — the assertion
-/// fails. This is what makes the unification load-bearing rather than a
-/// no-op refactor.
-///
-/// `a0b_multi_connection_shared_session` asserts the *attach* itself
-/// (shared `SharedSession` id round-trip + `attached_count == 1` +
-/// partial-loss survival); this test layers the single-inner structural
-/// shape on top of that.
-
+/// An attach adds a slot to the founding inner (one inner per session); see module doc.
 #[test]
 fn ac_12_f8_attach_unifies_to_single_inner() {
     let path = tmp_sock("ac12f8");
@@ -1389,35 +1353,25 @@ fn ac_12_f8_attach_unifies_to_single_inner() {
         "founding-only ⇒ single slot in the founding inner"
     );
 
-    // Attached connection (#2): echo #1's id ⇒ the attach arm
-    // adds a *slot* to the founding inner (rather than building a
-    // fresh inner sharing only SharedSession — the mutant).
+    // Attached connection (#2): echoing #1's id adds a *slot* to the founding inner.
     let c2 = RpcSession::setup_client_android13plus_with_config(
         RpcClientConfig::unix(&path, 1).session_id(&sid),
     )
     .expect("a13+ #2 (attach)");
-    // Bound without the conventional `_` prefix — `root2` is moved into
-    // an explicit `drop(...)` below to trigger the partial-loss
-    // reap; an underscore-prefix would have read as "intentionally
-    // unused" and hidden that load-bearing drop.
+    // No `_` prefix: the explicit `drop(root2)` below triggers the partial-loss reap.
     let root2 = EchoProxy(c2.get_root().expect("get_root #2"));
     assert!(
         poll_until(|| server.attached_count() == 1),
-        "echo-id connection took the id-demux ATTACH path (A0b)"
+        "echo-id connection took the id-demux ATTACH path"
     );
-    // The attached connection is a *slot on the
-    // founding inner*, so the inner's slot pool now has 2 slots.
-    // The mutant — each connection has its own inner with one slot —
-    // would leave the founding inner at slot_count == 1.
+    // A *slot on the founding inner*: 2 slots; an inner per connection would stay at 1.
     assert!(
         poll_until(|| server.session_slot_count(&sid_arr) == Some(2)),
-        "Phase A4: attached connection adds a slot to the founding inner \
+        "attached connection adds a slot to the founding inner \
          (mutant: fresh-inner-on-attach leaves slot_count == 1)"
     );
 
-    // Partial-loss reaping (re-uses the existing live-conn ledger): drop
-    // the attached and verify the founding inner's slot pool shrinks back
-    // to 1, then the founding-only state survives.
+    // Partial loss: the pool shrinks back to 1 and the founding connection survives.
     drop(root2);
     drop(c2);
     assert!(
@@ -1427,35 +1381,11 @@ fn ac_12_f8_attach_unifies_to_single_inner() {
     assert_eq!(
         c1.get_session_id().expect("get_session_id #1 post-partial"),
         sid,
-        "founding still alive and on the same shared session (F4)"
+        "founding still alive and on the same shared session"
     );
 }
 
-/// `setMaxIncomingThreads` cap + negotiate reflection.
-/// `set_max_threads(N)` carries
-/// two meanings — advertise + enforce: the server attach arm refuses
-/// an id-echoing connection when adding it would push `slot_count() >
-/// max_threads_value()`. Default 1 ⇒ founding-only; multi-conn
-/// callers opt in via explicit `set_max_threads(N >= 2)`.
-///
-/// Mutant gate (advertise-only): cap check absent ⇒
-/// 3rd attach silently succeeds and `session_slot_count(sid) ==
-/// Some(3) > set_max_threads(2)` ⇒ the cap assertion fails (and the
-/// `rejected_unknown_id_count` witness stays at 0).
-///
-/// `GetMaxThreads` returns the same `max_threads_value()`
-/// (advertise == enforce), so a client's `negotiate(local_max)`
-/// records `min(local_max, server_cap)` — verified at the wire by
-/// querying `negotiated_max_threads()` after a single
-/// `GetMaxThreads` round-trip.
-///
-/// The `shutdown` gate is documented at the *code* level only — the
-/// attach arm shows `if server.shutdown.load() { reject }`. A
-/// deterministic e2e trigger needs an accept-pass / handshake-stall /
-/// late-shutdown race that the current test scaffolding does not bound;
-/// the *behavior* is already in code and falls inside the
-/// rejected_unknown_id observability.
-
+/// `set_max_threads(N)` (AOSP `setMaxIncomingThreads`) advertises and caps slots; see module doc.
 #[test]
 fn ac_12_4_set_max_threads_caps_incoming_slots() {
     let path = tmp_sock("ac124");
@@ -1489,12 +1419,7 @@ fn ac_12_4_set_max_threads_caps_incoming_slots() {
     );
     let rejected_before = server.rejected_unknown_id_count();
 
-    // 3rd attach with the same session id ⇒ would push slot_count to
-    // 3 > max_threads(2) ⇒ refused at the attach arm (cap). The reject
-    // is post-handshake, and the attach confirmation round trip
-    // (`GET_SESSION_ID` on the fresh connection) reports it from the
-    // constructor — a valid id refused by the cap is the case no
-    // client-side id check could catch.
+    // A valid id past the cap: only the attach's `GET_SESSION_ID` confirmation can see it.
     let err = RpcSession::setup_client_android13plus_with_config(
         RpcClientConfig::unix(&path, 1).session_id(&sid),
     )
@@ -1514,15 +1439,10 @@ fn ac_12_4_set_max_threads_caps_incoming_slots() {
         server.session_slot_count(&sid_arr),
         Some(2),
         "founding inner's slot pool stays at the cap (no overshoot — \
-         a B.1 mutant would have let this reach Some(3))"
+         without the cap check this reaches Some(3))"
     );
 
-    // negotiate reflects the server's advertised + enforced
-    // value. Client opts into local_max=4; server advertises 2 ⇒
-    // negotiated = min(4, 2) = 2. (Wire-level: a single GetMaxThreads
-    // round-trip.) The advertise == enforce equation is exactly
-    // what makes the cap observable to a well-behaved client *without*
-    // needing to learn `rejected_unknown_id_count` out-of-band.
+    // Advertise == enforce: `negotiate` shows a client the cap it is refused at.
     let negotiated = c1.negotiate(4).expect("negotiate");
     assert_eq!(
         negotiated, 2,
@@ -1535,26 +1455,14 @@ fn ac_12_4_set_max_threads_caps_incoming_slots() {
     );
 }
 
-/// AOSP `setupClient` fan-out automation, multi-conn path.
-/// `RpcClientConfig::outgoing_connections` does
-/// in one helper what the manual API requires three explicit steps for:
-/// founding connect → `negotiate(local)` → N-1 additional outgoing
-/// `add_outgoing_connection_with_config`. Witnesses that the helper's
-/// fan-out loop actually mints `N - 1` extras under the server's
-/// `set_max_threads(N)` cap.
-///
-/// **Mutant gate**: skipping the `1..negotiated` loop body (`for _ in
-/// 1..negotiated { … }` ⇒ `for _ in 0..0 { … }` or `unreachable!`)
-/// leaves the founding inner at a single slot ⇒ `session_slot_count`
-/// is `Some(1)` instead of `Some(N)` and this test fails.
+/// `outgoing_connections(N)` (AOSP `setupClient` fan-out) mints N-1 extra slots; see module doc.
 #[test]
-fn b2_fan_out_creates_n_outgoing_slots_when_local_max_outgoing_is_n() {
+fn fan_out_creates_n_outgoing_slots_when_local_max_outgoing_is_n() {
     let path = tmp_sock("b2fan");
     let counter = Arc::new(AtomicI64::new(0));
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
-    // N = 3 (founding + 2 fan-out attaches). Cap is server-side; the
-    // helper learns it via `negotiate` and mints exactly N - 1 extras.
+    // N = 3; the helper learns the cap via `negotiate` and mints exactly N - 1 extras.
     server.set_max_threads(3);
     server
         .set_root(make_service(counter.clone()))
@@ -1574,8 +1482,7 @@ fn b2_fan_out_creates_n_outgoing_slots_when_local_max_outgoing_is_n() {
         ),
         Err(StatusCode::BadValue)
     ));
-    // `negotiate` was the second step of the helper ⇒ negotiated value
-    // is recorded on the session and equals the fan-out pool size.
+    // The helper's `negotiate` recorded a value equal to the fan-out pool size.
     assert_eq!(
         client.negotiated_max_threads(),
         3,
@@ -1596,18 +1503,14 @@ fn b2_fan_out_creates_n_outgoing_slots_when_local_max_outgoing_is_n() {
         .try_into()
         .expect("32-byte session id (AOSP kSessionIdBytes)");
 
-    // Functional gate: the session built by the helper round-trips
-    // through every transport (default outgoing slot picker spreads
-    // calls across the pool).
+    // Single-threaded, so all six ride slot 1; the pool count below is the fan-out witness.
     let root = EchoProxy(client.get_root().expect("get_root"));
     for i in 0..6 {
         let msg = format!("b2-{i}");
         assert_eq!(root.echo(&msg).unwrap(), msg, "fan-out echo #{i}");
     }
 
-    // Mutant-gate witness: server-side, the founding `RpcSessionInner`'s
-    // slot pool holds *all* N connections (founding + N-1 attached).
-    // A mutant that skipped the fan-out leaves this at `Some(1)`.
+    // The founding inner's pool holds all N connections; a skipped fan-out leaves `Some(1)`.
     assert!(
         poll_until(|| server.session_slot_count(&sid_arr) == Some(3)),
         "founding inner's pool has 3 slots (founding + 2 fan-out attaches) — \
@@ -1625,24 +1528,14 @@ fn b2_fan_out_creates_n_outgoing_slots_when_local_max_outgoing_is_n() {
     );
 }
 
-/// Single-connection fast path. `local_max_outgoing ==
-/// 1` (and `0`, normalized) must skip the `GET_MAX_THREADS` round-trip
-/// and the fan-out loop entirely so the wire is bit-identical to the
-/// founding-only helper. A caller paying for the fan-out helper's
-/// convenience on a single-conn session must NOT pay an extra
-/// negotiation packet.
-///
-/// **Mutant gate**: dropping the `if local == 1 { return Ok(session); }`
-/// short-circuit makes the helper run `negotiate(1)` ⇒
-/// `negotiated_max_threads() == 1` instead of `0`.
+/// `outgoing_connections` 1 (or 0) skips `GET_MAX_THREADS` and fan-out; see module doc.
 #[test]
-fn b2_local_max_outgoing_one_skips_fan_out_byte_identical_to_founding_only() {
+fn local_max_outgoing_one_skips_fan_out_byte_identical_to_founding_only() {
     let path = tmp_sock("b2one");
     let counter = Arc::new(AtomicI64::new(0));
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
-    // Server is multi-conn-capable but the client opts out — fan-out
-    // must NOT run regardless.
+    // The server allows multi-conn, but the client opts out: fan-out must NOT run.
     server.set_max_threads(2);
     server
         .set_root(make_service(counter.clone()))
@@ -1655,18 +1548,16 @@ fn b2_local_max_outgoing_one_skips_fan_out_byte_identical_to_founding_only() {
         RpcClientConfig::unix(&path, 1).outgoing_connections(1),
     )
     .expect("setupClient (single-conn)");
-    // Negotiation skipped ⇒ session.negotiated_max_threads() stays at
-    // its default (0 = "not negotiated"). The byte-identical witness.
+    // Byte-identical witness: skipped negotiation leaves the default 0 ("not negotiated").
     assert_eq!(
         client.negotiated_max_threads(),
         0,
         "local_max_outgoing == 1 must skip GET_MAX_THREADS entirely \
-         (mutant: dropping the early-return would record 1 here)"
+         (mutant: a negotiate on the single-connection path records 1 here)"
     );
     let sid = client.get_session_id().expect("get_session_id");
     let sid_arr: [u8; 32] = sid.as_slice().try_into().expect("32-byte session id");
-    // Server side: exactly one slot (the founding). Mutant: extra
-    // outgoing attaches would push this past 1.
+    // Server side: exactly the founding slot; extra outgoing attaches would exceed 1.
     assert!(
         poll_until(|| server.session_slot_count(&sid_arr) == Some(1)),
         "founding-only session has exactly one slot on the server side"
@@ -1679,8 +1570,7 @@ fn b2_local_max_outgoing_one_skips_fan_out_byte_identical_to_founding_only() {
     let root = EchoProxy(client.get_root().expect("get_root"));
     assert_eq!(root.echo("b2-one").unwrap(), "b2-one");
 
-    // `local_max_outgoing == 0` is normalized to 1 (a session needs at
-    // least the founding connection). Same byte-identical behavior.
+    // `local_max_outgoing == 0` is normalized to 1 (the founding connection); same wire.
     let path2 = tmp_sock("b2zero");
     let server2 = RpcServer::setup_unix_server(&path2).expect("bind");
     server2.set_android13plus(1);
@@ -1702,19 +1592,7 @@ fn b2_local_max_outgoing_one_skips_fan_out_byte_identical_to_founding_only() {
     );
 }
 
-/// A **refused** outgoing attach must be an error at attach time, not
-/// an `Ok` slot the pool keeps. The outgoing attach wire has no
-/// server→client acknowledgement (the server refuses by closing), so
-/// `RpcSession::add_outgoing_connection_with_config` confirms
-/// admission with one `GET_SESSION_ID` round trip on the fresh
-/// connection.
-///
-/// Single-threaded clients always draw slot 1 first, so this drives 4
-/// threads to make the pool actually reach the attached slot.
-///
-/// **Mutant gate**: dropping the `confirm_attach` call restores
-/// `Ok(2)` for both bogus ids and re-corrupts the pool (the echo loop
-/// then fails ~1/4 of its calls).
+/// A refused outgoing attach is an error at attach time, not a kept slot; see module doc.
 #[test]
 fn attach_with_a_bogus_session_id_is_refused_at_attach_time() {
     let path = tmp_sock("badattach");
@@ -1732,8 +1610,7 @@ fn attach_with_a_bogus_session_id_is_refused_at_attach_time() {
     let sid = client.get_session_id().expect("get_session_id");
     let sid_arr: [u8; 32] = sid.as_slice().try_into().expect("32-byte session id");
 
-    // (a) The client-local `session_id()` accessor is NOT the
-    //     server-minted id — the exact confusion that started this.
+    // (a) The client-local `session_id()` is NOT the server-minted id.
     assert_ne!(
         client.session_id().as_slice(),
         sid.as_slice(),
@@ -1756,8 +1633,7 @@ fn attach_with_a_bogus_session_id_is_refused_at_attach_time() {
             .is_err(),
         "attaching with an unknown id must fail here, not later"
     );
-    // Neither reached the server's pool, and the founding connection is
-    // untouched.
+    // Neither reached the server's pool; the founding connection is untouched.
     assert_eq!(
         server.session_slot_count(&sid_arr),
         Some(1),
@@ -1768,8 +1644,7 @@ fn attach_with_a_bogus_session_id_is_refused_at_attach_time() {
         "server counted exactly the two unknown-id rejects"
     );
 
-    // (c) The control: the server-minted id attaches, and the pool is
-    //     clean — 200 calls across 4 threads, zero failures.
+    // (c) Control: the server-minted id attaches; 200 calls on 4 threads, zero failures.
     assert_eq!(
         client
             .add_outgoing_connection_with_config(RpcClientConfig::unix(&path, 1).session_id(&sid))
@@ -1792,14 +1667,7 @@ fn attach_with_a_bogus_session_id_is_refused_at_attach_time() {
     }
 }
 
-/// The same confirmation covers a refusal that is **nobody's mistake**:
-/// a perfectly valid session id attached past the server's
-/// `set_max_threads` outgoing-slot cap. No client-side id check could
-/// catch this one — only the round trip can — and a caller that skips
-/// `negotiate()` has no other way to learn the cap.
-///
-/// **Mutant gate**: without `confirm_attach` the over-cap attaches
-/// return `Ok(3)`/`Ok(4)` while the server stays at 2 slots.
+/// A valid id attached past the server's `set_max_threads` cap also fails at attach time.
 #[test]
 fn attach_past_the_server_slot_cap_is_refused_at_attach_time() {
     let path = tmp_sock("capattach");
@@ -1839,8 +1707,7 @@ fn attach_past_the_server_slot_cap_is_refused_at_attach_time() {
         Some(2),
         "the server never went past its cap"
     );
-    // The pool the client kept is exactly the pool the server has, so
-    // every call lands on a live slot.
+    // The client's pool matches the server's, so every call lands on a live slot.
     let root = EchoProxy(client.get_root().expect("get_root"));
     for i in 0..20 {
         let msg = format!("cap-{i}");
@@ -1848,11 +1715,7 @@ fn attach_past_the_server_slot_cap_is_refused_at_attach_time() {
     }
 }
 
-/// An attach cannot negotiate its own version, so a `max_version`
-/// below the session's negotiated one can never work — that is
-/// `BadType`, and the log names `wire_protocol_version()` as the value
-/// to pass. Complements the R34 case in
-/// `real_process_e2e_and_negotiation`.
+/// An attach cannot negotiate: `max_version` below the session's is `BadType`; its own works.
 #[test]
 fn attach_max_version_below_the_session_version_is_bad_type() {
     let path = tmp_sock("attachver");
@@ -1886,15 +1749,7 @@ fn attach_max_version_below_the_session_version_is_bad_type() {
     );
 }
 
-/// The r34-server / android-13+-client half of a wire-profile
-/// mismatch. The server is the default (r34) wire, so it reads the
-/// client's 16-byte `RpcConnectionHeader` as an r34 frame, fails to
-/// decode it and closes. The client must report `DeadObject`, not an
-/// unclassified `StatusCode::Unknown`.
-///
-/// The opposite direction (r34 client, android-13+ server) is covered
-/// by the `"cci"` reject string in
-/// `wire_android13::tests::android13plus_spec_golden_vectors`.
+/// r34 server, android-13+ client ⇒ `DeadObject`; reverse: `android13plus_spec_golden_vectors`.
 #[test]
 fn r34_server_reports_an_android13plus_client_as_a_dead_peer() {
     let path = tmp_sock("profmix");
@@ -1920,11 +1775,7 @@ fn r34_server_reports_an_android13plus_client_as_a_dead_peer() {
     }
 }
 
-/// A standalone attach *session*
-/// ([`RpcClientConfig::session_id`], and the
-/// `ClientOptions::session_id` path over it) is confirmed the same way:
-/// a refused attach is an error from the constructor, not a session
-/// whose every call fails somewhere else.
+/// A refused standalone attach session (`RpcClientConfig::session_id`) fails in the constructor.
 #[test]
 fn standalone_attach_session_with_a_bogus_id_fails_to_build() {
     let path = tmp_sock("standalone");
@@ -1947,8 +1798,7 @@ fn standalone_attach_session_with_a_bogus_id_fails_to_build() {
         .is_err(),
         "an unknown id must not yield a session object"
     );
-    // Control: the real id builds a usable second session handle on the
-    // same server-side session.
+    // Control: the real id builds a usable second handle on the same server-side session.
     let attached = RpcSession::setup_client_android13plus_with_config(
         RpcClientConfig::unix(&path, 1).session_id(&sid),
     )
@@ -1957,39 +1807,14 @@ fn standalone_attach_session_with_a_bogus_id_fails_to_build() {
     assert_eq!(root.echo("standalone").unwrap(), "standalone");
 }
 
-/// Shutdown-reject e2e. The android-13+ attach arm sits past a
-/// successful handshake but before the per-slot enqueue; in production
-/// the `shutdown.load()` gate at that point sees a *sub-microsecond*
-/// window between an accepted late attach and a concurrent
-/// `server.stop_accepting()`, so the branch is otherwise only observable by
-/// code inspection + the `rejected_unknown_id_count` counter.
-///
-/// The `__set_attach_shutdown_probe` `#[doc(hidden)]` test-only barrier
-/// makes the window deterministic: it
-/// fires after the codec check passes and *before* `shutdown.load()`,
-/// so the test can park the worker, flip `server.stop_accepting()`, then
-/// release the worker. The worker re-reads the now-true flag and
-/// takes the reject branch — exactly the production semantics, with
-/// no scheduler-luck dependency.
-///
-/// **Mutant gate**: removing the `if server.shutdown.load() {
-/// reject }` line at the outgoing-attach arm leaves the worker
-/// proceeding to `add_incoming_slot` after the barrier returns, so
-/// `rejected_unknown_id_count` does NOT increment (the assertion
-/// below fails) and the attach `get_root()` would succeed (also
-/// flagged). Reverting just the assertion-side checks would still
-/// fail the rejected-count delta — both arms catch the regression.
+/// An attach parked at the shutdown probe while `stop_accepting` runs is refused; see module doc.
 #[test]
 fn shutdown_gate_e2e_rejects_attach_during_handshake_stall() {
     let path = tmp_sock("shutgate");
     let counter = Arc::new(AtomicI64::new(0));
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
-    // 2 = founding + 1 attached. The cap is irrelevant to the
-    // shutdown gate (which fires *before* the cap check), but
-    // staying within it avoids confounding the reject-set: the only
-    // increment of `rejected_unknown_id` we want to observe is the
-    // shutdown-arm one.
+    // Within the cap, so the only `rejected_unknown_id` increment is the shutdown arm's.
     server.set_max_threads(2);
     server
         .set_root(make_service(counter.clone()))
@@ -1998,23 +1823,14 @@ fn shutdown_gate_e2e_rejects_attach_during_handshake_stall() {
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
-    // Founding session — kept alive (`c1` not dropped) so the
-    // registry still resolves `sid` when the attach worker hits the
-    // arm. Were c1 dropped here, the founding inner would die, the
-    // attach would hit the "unknown/stale" arm, and the shutdown
-    // gate would never be tested.
+    // Kept to function end: once `c1` drops the attach hits the unknown-id arm, not shutdown.
     let c1 = RpcSession::setup_unix_client_android13plus(&path, 1).expect("a13+ founding connect");
     let sid = c1.get_session_id().expect("get_session_id founding");
 
-    // Two channels form the barrier. The probe sends "handshake
-    // done" on the first call, then blocks on `release_rx`. The
-    // test waits for the signal, flips `shutdown`, then releases.
+    // Barrier: the probe signals, blocks on `release_rx`; the test flips `shutdown`, releases.
     let (hs_done_tx, hs_done_rx) = std::sync::mpsc::channel::<()>();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-    // Wrap `release_rx` in an `Option` so the *first* probe fire
-    // takes it; any later fire (no-op once the test is done) sees
-    // `None` and drops through. The whole closure must be `Fn`
-    // (not `FnOnce`), hence the `Mutex<Option<Receiver>>` shape.
+    // The probe is `Fn`: only its first fire takes the receiver, later ones fall through.
     let release_rx = Arc::new(std::sync::Mutex::new(Some(release_rx)));
     server.__set_attach_shutdown_probe({
         let release_rx = Arc::clone(&release_rx);
@@ -2028,16 +1844,11 @@ fn shutdown_gate_e2e_rejects_attach_during_handshake_stall() {
     });
     let rejected_before = server.rejected_unknown_id_count();
 
-    // Run the attach in a background thread — its `get_root` would
-    // block on the parked worker otherwise.
+    // Off-thread: the attach blocks on the parked worker.
     let attach_path = path.clone();
     let attach_sid = sid.clone();
     let attach_handle = std::thread::spawn(move || -> std::result::Result<(), StatusCode> {
-        // The reject lands past the handshake, where the attach
-        // confirmation round trip (`GET_SESSION_ID` on the fresh
-        // connection) now sees it — so the constructor itself fails.
-        // Folded into one result with the first call so the test still
-        // holds if a future reject arm moves to either side of it.
+        // The attach's `GET_SESSION_ID` confirmation sees the reject; either step may fail.
         let c2 = RpcSession::setup_client_android13plus_with_config(
             RpcClientConfig::unix(&attach_path, 1).session_id(&attach_sid),
         )?;
@@ -2053,8 +1864,7 @@ fn shutdown_gate_e2e_rejects_attach_during_handshake_stall() {
     // Flip shutdown *while* the worker is parked at the probe.
     server.stop_accepting();
 
-    // Release the worker — it re-reads `shutdown.load() == true`
-    // and takes the reject branch (drops the transport).
+    // The released worker re-reads `shutdown` and rejects (drops the transport).
     let _ = release_tx.send(());
 
     let attach_result = attach_handle
@@ -2072,37 +1882,18 @@ fn shutdown_gate_e2e_rejects_attach_during_handshake_stall() {
         "shutdown-reject increments the `rejected_unknown_id` observability counter \
          (mutant: removing `if server.shutdown.load() {{ reject }}` leaves this flat)"
     );
-    // Founding inner's slot pool stayed at 1 — the rejected attach
-    // never reached `add_incoming_slot` (otherwise this would be
-    // `Some(2)`, a second mutant-catch axis independent of the
-    // counter delta above).
+    // Independent of the counter: the rejected attach never reached `add_incoming_slot`.
     let sid_arr: [u8; 32] = sid.as_slice().try_into().expect("32-byte session id");
     assert_eq!(
         server.session_slot_count(&sid_arr),
         Some(1),
         "shutdown-rejected attach did not enqueue a slot (mutant: would reach Some(2))"
     );
-    // (`c1` lives to function exit by lexical scope — see its
-    // binding-site comment for why the founding inner must stay
-    // registered for the whole attach attempt.)
 }
 
-/// With a shared `RpcState` (id-demux), two **independent** client
-/// sessions each hold their own proxy to the *same* server root.
-/// Pinning the node's strong count at 1 by object-identity would make
-/// the first connection's proxy drop `DEC_STRONG` it to 0 and free the
-/// node ⇒ the sibling connection's proxy `DeadObject`. With AOSP
-/// `timesSent` accounting the server counts each send (strong = 2), so
-/// the first DEC only brings it to 1 and the sibling survives; the node
-/// is freed only when the *second* proxy drops too (no leak — proven
-/// deterministically at the state level by
-/// `rpc::state::tests::f7_timessent_balance_no_leak`).
-///
-/// **Mutant gate**: revert `on_binder_leaving`'s
-/// `timesSent` bump (strong stays 1). Then dropping `root1` frees the
-/// shared node and `root2.echo()` is `DeadObject` ⇒ this fails.
+/// Two attached clients' proxies to one root: the node outlives the first drop; see module doc.
 #[test]
-fn f7_shared_node_survives_sibling_proxy_drop() {
+fn shared_node_survives_sibling_proxy_drop() {
     let path = tmp_sock("f7");
     let counter = Arc::new(AtomicI64::new(0));
     let server = RpcServer::setup_unix_server(&path).expect("bind");
@@ -2116,8 +1907,7 @@ fn f7_shared_node_survives_sibling_proxy_drop() {
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
-    // c1: new session; c2: attach (echo c1's id) ⇒ both connections of
-    // ONE server SharedSession (shared RpcState).
+    // c2 echoes c1's id: both are connections of ONE server session (shared RpcState).
     let c1 = RpcSession::setup_unix_client_android13plus(&path, 1).expect("connect #1");
     let sid1 = c1.get_session_id().expect("session id");
     let c2 = RpcSession::setup_client_android13plus_with_config(
@@ -2129,40 +1919,31 @@ fn f7_shared_node_survives_sibling_proxy_drop() {
         "c2 attached to c1's shared session"
     );
 
-    // Each independent client session fetches the *same* server root ⇒
-    // server `write_binder(root)` twice ⇒ `on_binder_leaving` strong =
-    // 2 (timesSent), one proxy per client (no client-side excess).
+    // The root is sent twice ⇒ strong = 2 (timesSent), one proxy per client, no excess.
     let root1 = EchoProxy(c1.get_root().expect("get_root #1"));
     let root2 = EchoProxy(c2.get_root().expect("get_root #2"));
     assert_eq!(root1.echo("f7-1").unwrap(), "f7-1");
     assert_eq!(root2.echo("f7-2").unwrap(), "f7-2");
 
-    // Drop the connection-#1 proxy (c1 stays alive so `RpcProxy::drop`
-    // actually delivers the `DEC_STRONG` over c1). Then an ordered
-    // round-trip *on c1* guarantees c1's server worker has processed
-    // that DEC before we probe the sibling.
+    // c1 stays open to carry the DEC_STRONG; a round-trip on c1 orders it before the probe.
     drop(root1);
     let _ = c1
         .get_session_id()
         .expect("c1 still alive (ordering barrier)");
 
-    // The shared node must survive the sibling's DEC (strong
-    // 2→1). The mutant freed it (1→0) ⇒ DeadObject here.
+    // The shared node survives the sibling's DEC (strong 2→1).
     assert_eq!(
         root2.echo("f7-after-sibling-drop").unwrap(),
         "f7-after-sibling-drop",
-        "F7: a shared node must outlive one connection's proxy DEC"
+        "a shared node must outlive one connection's proxy DEC"
     );
 
-    // Dropping the second proxy frees the shared node (strong 1→0).
-    // Probed while both connections are still open (so the registry
-    // `Weak` upgrades): the AOSP `timesSent` books must net to **0**
-    // live nodes — no leak.
+    // Probed while both connections are open (the registry `Weak` upgrades): 0 live nodes.
     drop(root2);
     let _ = c2.get_session_id().expect("c2 ordering barrier");
     assert!(
         poll_until(|| server.live_session_node_count() == 0),
-        "F7 no-leak: shared root node freed after all proxies dropped"
+        "no leak: shared root node freed after all proxies dropped"
     );
 
     drop(c1);
@@ -2170,30 +1951,9 @@ fn f7_shared_node_survives_sibling_proxy_drop() {
     // _cu handles teardown.
 }
 
-/// Client `flushExcessBinderRefs` (the *other* mutant
-/// arm). A **single** client session that receives the *same* server
-/// binder more than once while its deduped proxy stays live owes the
-/// sender one excess `DEC_STRONG` per duplicate receipt (the server
-/// bumped `timesSent` on each send). Here `get_root()` twice ⇒ server
-/// `strong = 2`, client dedups to one proxy ⇒ it must send **1 excess
-/// DEC** at the 2nd receipt + **1** at proxy drop = 2 ⇒ node freed.
-///
-/// **Mutant gate strength**: this test gates the *client excess-DEC*
-/// mutant — `read_binder` reverting the `flushExcessBinderRefs` arm so
-/// only the proxy-drop DEC is sent ⇒ server `strong` stuck at 1 ⇒
-/// `live_session_node_count()` never returns to 0 ⇒ this fails.
-///
-/// **Precondition — dedup must hold.** The 2 = 1-excess + 1-drop
-/// arithmetic only catches the excess-DEC mutant if the proxy cache
-/// *deduplicates*: two `get_root()` calls return the **same**
-/// `RpcProxy`. If dedup is broken (an orthogonal future regression
-/// where each receipt mints a fresh proxy), the test would pass
-/// vacuously — 0 excess + 2 drops = 2 also balances. The explicit
-/// identity assertion below locks that precondition; the state-level
-/// companion `rpc::state::tests::f7_timessent_balance_no_leak` covers
-/// the corresponding `RpcState` invariant directly.
+/// A duplicate receipt of one binder sends an excess `DEC_STRONG` (AOSP `flushExcessBinderRefs`).
 #[test]
-fn f7_excess_receipt_no_leak_single_client() {
+fn excess_receipt_no_leak_single_client() {
     let path = tmp_sock("f7x");
     let counter = Arc::new(AtomicI64::new(0));
     let server = RpcServer::setup_unix_server(&path).expect("bind");
@@ -2206,32 +1966,25 @@ fn f7_excess_receipt_no_leak_single_client() {
     wait_for_sock(&path);
 
     let c = RpcSession::setup_unix_client_android13plus(&path, 1).expect("connect");
-    // Two receipts of the SAME server root while the proxy stays live:
-    // server `timesSent` = 2; the 2nd receipt is an *excess* on the
-    // client ⇒ it must send one `flushExcessBinderRefs` DEC now.
+    // The 2nd receipt is an excess: the client owes one `flushExcessBinderRefs` DEC now.
     let r1 = EchoProxy(c.get_root().expect("get_root #1"));
     let r2 = EchoProxy(c.get_root().expect("get_root #2"));
-    // **Dedup precondition** (see doc-comment): both wrappers must
-    // refer to the *same* underlying `RpcProxy`. Without dedup the
-    // 2 = 1-excess + 1-drop arithmetic collapses to 2 = 0-excess +
-    // 2-drops, and this test would pass vacuously under the
-    // excess-DEC mutant.
+    // Dedup precondition (module doc "Mutation gates"): without it the test passes vacuously.
     assert!(
         std::ptr::eq(r1.rp(), r2.rp()),
         "dedup precondition: both get_root() calls must return the \
-         same RpcProxy for the F7 excess-DEC mutant gate to be sound"
+         same RpcProxy for the excess-DEC mutant gate to be sound"
     );
     assert_eq!(r1.echo("f7x-1").unwrap(), "f7x-1");
     assert_eq!(r2.echo("f7x-2").unwrap(), "f7x-2");
 
-    // Drop both deduped clones (one `RpcProxy` ⇒ one drop DEC) and a
-    // round-trip barrier so the server has applied excess + drop DEC.
+    // One `RpcProxy` ⇒ one drop DEC; the round-trip orders it and the excess DEC first.
     drop(r1);
     drop(r2);
     let _ = c.get_session_id().expect("ordering barrier");
     assert!(
         poll_until(|| server.live_session_node_count() == 0),
-        "F7 flushExcessBinderRefs: 1 excess + 1 drop DEC = timesSent(2) \
+        "flushExcessBinderRefs: 1 excess + 1 drop DEC = timesSent(2) \
          ⇒ root node freed (no leak). Stuck >0 ⇒ client excess-DEC mutant."
     );
 
@@ -2239,35 +1992,13 @@ fn f7_excess_receipt_no_leak_single_client() {
     // _cu handles teardown.
 }
 
-/// Connection pool: with N outgoing slots in
-/// one `RpcSession`, concurrent `client_transact`s on different
-/// threads pick *different* slots (AOSP `findConnection` available-
-/// slot selection), so two server-side blocking handlers run **in
-/// parallel** — not serialized through one connection.
-///
-/// Wire-up: founding connection (slot 1) + one echoed-id outgoing
-/// (slot 2) via [`RpcSession::add_outgoing_connection_with_config`].
-/// The slots end up id-demuxed to the *same* `SharedSession`,
-/// so the test's two threads transact through different sockets but
-/// the same server session.
-///
-/// Timing-based observation: two parallel `slow(150)` calls take ~150
-/// ms when distributed (each blocks its own server worker) and ~300
-/// ms when serialized through one slot. Bound 250 ms is safely below
-/// 300 (mutant) and well above 150 (post-pool, +scheduling slack).
-///
-/// **Mutant gates (verified in separate runs)**: `find_conn` always
-/// returning slot 1 OR `find_conn`'s "first available" check ignoring
-/// `exclusive_tid` would re-serialize ⇒ elapsed > 250 ms.
-
+/// Two `slow(150)` on a 2-slot pool finish under 380 ms; see module doc "Mutation gates".
 #[test]
 fn pool_distributes_concurrent_calls_across_outgoing_slots() {
     let path = tmp_sock("a1pool");
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
-    // Founding + one attached outgoing-echo
-    // ⇒ 2 incoming slots at the server. Default cap = 1 would reject
-    // the attach, defeating the pool-distribution scenario.
+    // Founding + one attach = 2 incoming slots; the default cap of 1 would reject the attach.
     server.set_max_threads(2);
     server
         .set_root(make_service(Arc::new(AtomicI64::new(0))))
@@ -2283,9 +2014,7 @@ fn pool_distributes_concurrent_calls_across_outgoing_slots() {
         .expect("add outgoing slot");
     assert_ne!(slot2, 1, "second slot has a fresh id (founding == 1)");
 
-    // Two threads, each holds the same client `RpcSession` and calls
-    // `slow(150)` concurrently. With the pool, find_conn picks
-    // different slots → both server workers `sleep(150)` in parallel.
+    // With the pool, `find_conn` gives each thread its own slot, so both sleeps overlap.
     let root = Arc::new(EchoProxy(c.get_root().expect("get_root")));
     let t0 = std::time::Instant::now();
     let mut handles = Vec::new();
@@ -2299,12 +2028,7 @@ fn pool_distributes_concurrent_calls_across_outgoing_slots() {
         h.join().expect("thread");
     }
     let elapsed = t0.elapsed();
-    // Normal (parallel): ~150 ms + scheduling/RPC slack.
-    // Mutant (serialized): ~300 ms (= 2 × 150 ms sleep, sequential).
-    // The 380 ms bound preserves the parallel / serialized split — the
-    // mutant can't sleep less than 300 ms (literal `sleep(150)` × 2),
-    // and the bound stays above the parallel path's wake-from-sleep / RPC
-    // wrap overhead even under a loaded scheduler.
+    // Parallel ≈ 150 ms; serialized ≥ 300 ms; 380 absorbs a loaded scheduler's overhead.
     assert!(
         elapsed < Duration::from_millis(380),
         "AC-12.1: 2 concurrent slow(150) on a 2-slot pool must run in \
@@ -2317,23 +2041,13 @@ fn pool_distributes_concurrent_calls_across_outgoing_slots() {
     // _cu handles teardown.
 }
 
-/// Pool-exhausted condvar wait: `find_conn` *blocks*
-/// on `slot_cv` when no slot is available; **never** a busy try-loop.
-/// 2 outgoing slots + 3 concurrent `slow(120)`s ⇒ two run in parallel
-/// (~120 ms), the third waits on `slot_cv` for one to free, then
-/// runs (~120 ms) ⇒ total ≈ 240 ms. Busy-looping would still progress
-/// (~240 ms too) but burn 100 % CPU; a *broken* condvar (e.g., wait
-/// returning prematurely without re-check) would either deadlock or
-/// race-corrupt the wire. We assert the timing band and rely on the
-/// transact correctness as the secondary signal.
-
+/// Two slots, three callers: the third waits for a free slot (two waves); see module doc.
 #[test]
-fn pool_exhausted_condvar_blocks_not_busy_loops() {
+fn pool_exhausted_third_caller_waits_for_a_free_slot() {
     let path = tmp_sock("a1exh");
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
-    // 2 incoming slots (founding + attached); 3 client
-    // threads observe the cv-wait band.
+    // 2 incoming slots (founding + attached); 3 client threads observe the cv-wait band.
     server.set_max_threads(2);
     server
         .set_root(make_service(Arc::new(AtomicI64::new(0))))
@@ -2356,8 +2070,7 @@ fn pool_exhausted_condvar_blocks_not_busy_loops() {
         let r = Arc::clone(&root);
         handles.push(std::thread::spawn(move || {
             r.slow(200).expect("slow");
-            // After slow returns, also do an echo to prove the wire
-            // didn't corrupt across the slot release / re-pick.
+            // The wire must survive the slot release / re-pick.
             let msg = format!("exh-{i}");
             assert_eq!(r.echo(&msg).unwrap(), msg);
         }));
@@ -2366,24 +2079,7 @@ fn pool_exhausted_condvar_blocks_not_busy_loops() {
         h.join().expect("thread");
     }
     let elapsed = t0.elapsed();
-    // 2 slots, 3 callers ⇒ 2 waves: 200 + 200 = 400 ms minimum (no
-    // sub-200 timing because the 3rd MUST wait for a slot).
-    //
-    // Normal (2 parallel waves): ~400 ms + RPC/scheduling slack.
-    // Mutant (fully serial, 3 × 200): ~600 ms + slack.
-    //
-    // The mutant signature is the *200 ms gap* between waves and serial,
-    // which is preserved regardless of absolute slack (both arms pay the
-    // same scheduling/RPC overhead). So the bound floats with slack as
-    // long as it stays comfortably below `normal + 200 ms`.
-    //
-    // The 700 ms upper bound is sized for a loaded runner: it still
-    // clears the parallel path with ~200 ms of slack, while a serial
-    // mutant paying that same slack lands ~100 ms above it. Measurement
-    // history belongs in `plan/2-12-*.md`, not here.
-    //
-    // Lower bound 380 ms rejects anything that finished in *one* wave
-    // (i.e. a 3-slot pool or a non-blocking 3rd caller).
+    // Two waves ≈ 400 ms; < 380 is one wave (no wait); > 700 is a stall.
     assert!(
         elapsed >= Duration::from_millis(380) && elapsed < Duration::from_millis(700),
         "AC-12.1 cv-wait: 3 concurrent slow(200) on 2 slots should be \
@@ -2395,34 +2091,11 @@ fn pool_exhausted_condvar_blocks_not_busy_loops() {
     // _cu handles teardown.
 }
 
-/// Nested-callback slot pin (scoped): on
-/// a multi-outgoing client, when `client_transact` picks an outgoing
-/// slot, the nested server→client callback **arriving on that same
-/// socket** must dispatch on that slot — `find_conn`'s reentrant
-/// match is keyed by `(session_ptr, slot_id)`, not `session_ptr`
-/// alone. The test forces slot 2 by parking slot 1
-/// under a long-running `slow(...)`, then issues one `roundtrip(cb)`
-/// on slot 2.
-///
-/// An N-inner-per-connection hybrid carries a cross-slot
-/// proxy-cache aliasing hazard: two server workers concurrently
-/// unmarshalling the *same* client binder hit `state.remote_proxy`'s
-/// shared cache, so the second caller's nested `proxy.transact`
-/// re-routes through the *first* server inner's socket — wire
-/// interleave / deadlock. The server-side unification
-/// ("one `RpcSessionInner` per session, slots in one
-/// pool") rules that out: all server-side proxies live in one inner and
-/// `findConnection` does the slot-pin uniformly. The scoped
-/// single-thread test here exercises the slot-pin without triggering
-/// the aliasing (only slot 2 unmarshals the cb).
-
+/// A nested callback arriving on slot 2 dispatches on slot 2; see module doc "Mutation gates".
 #[test]
 fn pool_nested_callback_pins_to_forced_slot_single_thread() {
     let path = tmp_sock("a2pin");
-    // Deterministic "parker entered slow on the server" signal — set
-    // at the server-side `slow()` handler's entry. A fixed sleep after
-    // spawning the parker thread could elapse *before* the parker
-    // reached `find_conn`, putting both threads on slot 1 — a false pass.
+    // Not a sleep: one could end before the parker reaches `find_conn` (a false pass).
     let slow_entered = Arc::new(AtomicBool::new(false));
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
@@ -2451,17 +2124,12 @@ fn pool_nested_callback_pins_to_forced_slot_single_thread() {
 
     let root = Arc::new(EchoProxy(c.get_root().expect("get_root")));
 
-    // Park slot 1 under a long slow() so `find_conn` on the main
-    // thread can only pick slot 2.
+    // Park slot 1 under a long slow() so `find_conn` on this thread can only pick slot 2.
     let parked = Arc::clone(&root);
     let parker = std::thread::spawn(move || {
         let _ = parked.slow(800);
     });
-    // Deterministic wait: the server-side `slow` handler sets
-    // `slow_entered` on entry. Spinning on this atomic guarantees the
-    // parker has claimed *a* server worker (which, since the parker is
-    // the only outstanding transact at this point, used `find_conn`'s
-    // "first available" arm ⇒ slot 1).
+    // The only transact in flight, so the parker took `find_conn`'s first free slot: 1.
     assert!(
         poll_until(|| slow_entered.load(Ordering::SeqCst)),
         "parker failed to enter server-side slow() within budget"
@@ -2469,10 +2137,7 @@ fn pool_nested_callback_pins_to_forced_slot_single_thread() {
 
     let cb_counter = Arc::new(AtomicI64::new(0));
     let cb = make_service(cb_counter);
-    // roundtrip on slot 2: server unmarshals cb (first time → no
-    // alias), handler calls back on slot 2's socket, client's reply
-    // loop on slot 2 dispatches the callback inline (DRIVING-pinned
-    // to slot 2). Wrong slot pin would mis-route ⇒ error/deadlock.
+    // Slot 2's reply loop must dispatch the callback inline; a wrong pin errs or deadlocks.
     assert_eq!(
         root.roundtrip(&cb).expect("nested callback on slot 2"),
         "rt:ping"
@@ -2484,16 +2149,7 @@ fn pool_nested_callback_pins_to_forced_slot_single_thread() {
     // _cu handles teardown.
 }
 
-/// Two client threads make concurrent
-/// `roundtrip(cb)` calls; each server worker must see a *distinct*
-/// `RpcProxy`-backed nested send (one inner per
-/// session, slots in one pool). The N-inner / 1-shared
-/// hybrid mutant: the two workers' `state.remote_proxies` would hand out
-/// `RpcProxy`s whose `Weak<RpcSessionInner>` pointed to different
-/// inners; the 2nd worker's nested `proxy.transact` would `find_conn`
-/// against the 1st worker's slot pool and deadlock or interleave.
-/// `set_timeout(3s)` bounds that deadlock so the mutant surfaces as a
-/// test failure rather than CI hang.
+/// Two threads' concurrent `roundtrip(cb)`: each nested send stays in its own slot; see module doc.
 #[test]
 fn ac_12_2_extended_cross_slot_nested_callback_multi_thread() {
     let path = tmp_sock("a2ext");
@@ -2534,25 +2190,7 @@ fn ac_12_2_extended_cross_slot_nested_callback_multi_thread() {
     drop(c);
 }
 
-/// On a multi-outgoing client, oneway FIFO must hold under
-/// twoway interleave regardless of which slot each oneway rode.
-/// Top-level oneway `find_conn` does not pin to slot 1 — the
-/// per-`mNodeForAddress` `asyncNumber` send-side + receive-side
-/// `asyncTodo` priority replay
-/// ([state.rs](../src/rpc/state.rs)) carries the per-object oneway
-/// ordering invariant on both ends; a founding-slot pin would be a HOL
-/// throughput trade-off, not a correctness invariant.
-///
-/// What this test gates: 300 oneway bumps interleaved with concurrent
-/// twoway echoes across an outgoing slot pool of size 2 all arrive
-/// (`count == 300`) with no wire corruption between the oneway and
-/// twoway frames. The standing mutant gate is the
-/// asyncTodo deletion (covered as a unit gate at
-/// [`rpc::state::tests`](../src/rpc/state.rs)
-/// `phase_c_out_of_order_drains_in_order_via_async_todo`) plus
-/// the STAGE3 live libbinder round-robin path:
-/// [`rpc::state::tests::phase_c_out_of_order_enqueues_then_drains_in_priority_order`](../src/rpc/state.rs#L747)
-/// and `phase_c_send_async_number_is_per_address_monotonic`.
+/// 300 oneways interleaved with twoway echoes on a 2-slot pool all arrive; see module doc.
 #[test]
 fn pool_oneway_fifo_under_concurrent_twoway_multi_outgoing() {
     let path = tmp_sock("a3one");
@@ -2611,16 +2249,11 @@ fn pool_oneway_fifo_under_concurrent_twoway_multi_outgoing() {
 
 // ---- no globals anywhere in the RPC stack --------------------------
 
-// Source-scan: needs `env!("CARGO_MANIFEST_DIR")/src/rpc/*.rs` at
-// runtime, which is absent on a cross-compiled Android device.
+// Reads `src/rpc` at runtime, which a cross-compiled Android device lacks.
 #[cfg(not(target_os = "android"))]
 #[test]
 fn rpc_stack_has_no_globals() {
-    // Static gate: the RPC module must not
-    // introduce any process-global state. Scans src/rpc/*.rs for
-    // `static`/`OnceLock`/`lazy_static`. The one *intentional*
-    // exception is the tcp_debug one-time INSECURE-warning latch,
-    // which is not session/protocol state.
+    // src/rpc owns no process-global state; the exemptions below hold no session data.
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/rpc");
     let mut offenders = Vec::new();
     fn scan(dir: &std::path::Path, offenders: &mut Vec<String>) {
@@ -2640,9 +2273,7 @@ fn rpc_stack_has_no_globals() {
                 if l.starts_with("//") || l.starts_with("///") || l.starts_with("*") {
                     continue;
                 }
-                // `&'static str` return types legitimately contain the
-                // substring "static " — only a real `static` *item*
-                // (mutable/immutable process global) is an offender.
+                // Only a `static` *item* counts; `&'static str` also contains "static ".
                 let static_item = (l.contains("static ") || l.starts_with("static"))
                     && !l.contains("'static")
                     && !l.contains("static_assertions");
@@ -2651,26 +2282,15 @@ fn rpc_stack_has_no_globals() {
                     || l.contains("lazy_static")
                     || l.contains("OnceCell");
                 if has_global {
-                    // tcp_debug INSECURE_WARNED latch is the documented
-                    // non-state exception.
+                    // tcp_debug's INSECURE_WARNED latch is the documented exception.
                     if name == "tcp_debug.rs" && line.contains("INSECURE_WARNED") {
                         continue;
                     }
-                    // proxy.rs `descriptor: OnceLock<String>` (and its
-                    // import) is a *per-RpcProxy-instance* write-once
-                    // field — the typed-stub descriptor stamp,
-                    // owned per session, never a process global. A real
-                    // `static` here is still caught by `static_item`.
+                    // proxy.rs `OnceLock` is a per-`RpcProxy` descriptor stamp.
                     if name == "proxy.rs" && l.contains("OnceLock") && !static_item {
                         continue;
                     }
-                    // session.rs `DRIVING` is a `thread_local!`
-                    // recursion marker that lets a same-thread nested
-                    // call bypass the per-connection lock. It
-                    // is per-thread scratch, NOT session/protocol state
-                    // — it carries no node/address/refcount data; those
-                    // stay per-session in RpcState. Mirrors kernel
-                    // binder's thread-local IPCThreadState.
+                    // `DRIVING`: a per-thread nesting marker with no session data.
                     if name == "session.rs" && line.contains("DRIVING") {
                         continue;
                     }
@@ -2682,25 +2302,14 @@ fn rpc_stack_has_no_globals() {
     scan(&dir, &mut offenders);
     assert!(
         offenders.is_empty(),
-        "P6 violation — RPC stack must own all state per-session, found globals:\n{}",
+        "RPC stack must own all state per-session, found globals:\n{}",
         offenders.join("\n")
     );
 }
 
 // ---- accepted peer identity is the CLIENT --------------------------
 
-/// Defect-regression, **deterministic mutant gate**.
-///
-/// A real cross-process connection: a forked child connects, the
-/// parent `accept`s. `peer_identity()` on the accepted socket must be
-/// the **client's** pid, never the server's own. A non-Linux
-/// `resolve_peer` that returned `self_identity()` for
-/// *every* socket would make a macOS/BSD server see **itself** as the
-/// peer — an authoritative-looking forged identity.
-/// That mutant makes `pid == std::process::id()` (the parent)
-/// instead of `child.id()`, failing the assert. On Linux the real
-/// `SO_PEERCRED` already gave the client pid, so this is a permanent
-/// cross-platform regression gate.
+/// A forked client's accepted socket reports the child's pid, never the server's; see module doc.
 #[test]
 #[cfg(unix)]
 fn unix_accepted_peer_identity_is_the_client_not_self() {
@@ -2740,9 +2349,7 @@ fn unix_accepted_peer_identity_is_the_client_not_self() {
                 "AC-9.1: accepted peer must NOT be the server itself \
                  (the §0 forged-self defect)"
             );
-            // macOS LOCAL_PEERPID / Linux SO_PEERCRED ⇒ the exact
-            // client pid. (`-1` would mean a BSD without LOCAL_PEERPID
-            // — not this CI's macOS/Linux, so require the exact pid.)
+            // LOCAL_PEERPID / SO_PEERCRED give the exact pid (`-1` only on BSDs CI never runs).
             assert_eq!(
                 pid, child_pid,
                 "accepted peer pid must be the client child's pid"
@@ -2766,19 +2373,7 @@ impl rsbinder::DeathRecipient for DeathFlag {
     }
 }
 
-/// A `DeathRecipient` linked to an RPC proxy fires when the **session
-/// connection drops** (AOSP `RpcState::sendObituaries`). The peer that
-/// wants the notification runs a serve loop (the AOSP "incoming
-/// thread" requirement) and a link before it starts is refused; when the
-/// server process is killed the client's serve loop ends on `EndOfStream`
-/// and delivers the obituary. Also covers `unlink_to_death` (an unlinked
-/// recipient must NOT fire) and the post-death `link_to_death`→`DeadObject`
-/// contract.
-///
-/// Mutant: dropping the `send_session_obituaries()` call from
-/// `serve_blocking` (or making `RpcProxy::link_to_death` an
-/// `InvalidOperation` stub) makes `binder_died` never arrive ⇒ the
-/// `recv_timeout` below returns `Err` and the test fails.
+/// Server death fires a linked `DeathRecipient` (AOSP `RpcState::sendObituaries`); see module doc.
 #[test]
 fn rpc_death_recipient_fires_on_session_drop() {
     if let Ok(path) = std::env::var("RSB_RPC_DEATH_SERVER") {
@@ -2792,15 +2387,17 @@ fn rpc_death_recipient_fires_on_session_drop() {
 
     let path = tmp_sock("death");
     let exe = std::env::current_exe().expect("current_exe");
-    let mut child = std::process::Command::new(exe)
-        .args([
-            "--exact",
-            "rpc_death_recipient_fires_on_session_drop",
-            "--nocapture",
-        ])
-        .env("RSB_RPC_DEATH_SERVER", &path)
-        .spawn()
-        .expect("spawn server child");
+    let mut child = KillOnDrop(
+        std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "rpc_death_recipient_fires_on_session_drop",
+                "--nocapture",
+            ])
+            .env("RSB_RPC_DEATH_SERVER", &path)
+            .spawn()
+            .expect("spawn server child"),
+    );
     wait_for_sock(&path);
 
     let client = RpcSession::setup_unix_client(&path).expect("connect");
@@ -2835,10 +2432,9 @@ fn rpc_death_recipient_fires_on_session_drop() {
         "a second unlink of an already-removed recipient is NameNotFound"
     );
 
-    // Kill the server process ⇒ socket closes ⇒ client serve loop ends
-    // ⇒ obituary delivered.
-    child.kill().expect("kill server");
-    child.wait().expect("reap server");
+    // Kill the server ⇒ socket closes ⇒ client serve loop ends ⇒ obituary delivered.
+    child.0.kill().expect("kill server");
+    child.0.wait().expect("reap server");
 
     rx_dead
         .recv_timeout(Duration::from_secs(5))
@@ -2862,16 +2458,7 @@ fn rpc_death_recipient_fires_on_session_drop() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// The same obituary, taken as a future: `death_signal` completes when the
-/// session's connection drops (plan 11-1 AC-11-1.2, RPC leg). What this adds
-/// over the recipient test above is the wake-up path — the send happens on the
-/// session thread and has to reach a task parked in another runtime — plus the
-/// already-dead contract, which `death_signal` answers with a *completed*
-/// future rather than an error.
-///
-/// Mutant: making `DeathSignal::poll` return `Pending` unconditionally, or
-/// dropping the `oneshot` send from `binder_died`, leaves the `recv_timeout`
-/// below empty.
+/// `death_signal` completes on connection drop (plan 11-1 AC-11-1.2, RPC leg); see module doc.
 #[cfg(feature = "tokio")]
 #[test]
 fn rpc_death_signal_completes_on_session_drop() {
@@ -2886,15 +2473,17 @@ fn rpc_death_signal_completes_on_session_drop() {
 
     let path = tmp_sock("death_signal");
     let exe = std::env::current_exe().expect("current_exe");
-    let mut child = std::process::Command::new(exe)
-        .args([
-            "--exact",
-            "rpc_death_signal_completes_on_session_drop",
-            "--nocapture",
-        ])
-        .env("RSB_RPC_DEATH_SIGNAL_SERVER", &path)
-        .spawn()
-        .expect("spawn server child");
+    let mut child = KillOnDrop(
+        std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "rpc_death_signal_completes_on_session_drop",
+                "--nocapture",
+            ])
+            .env("RSB_RPC_DEATH_SIGNAL_SERVER", &path)
+            .spawn()
+            .expect("spawn server child"),
+    );
     wait_for_sock(&path);
 
     let client = RpcSession::setup_unix_client(&path).expect("connect");
@@ -2903,10 +2492,7 @@ fn rpc_death_signal_completes_on_session_drop() {
     let serve = client.spawn_serve().expect("spawn_serve");
     let signal = rsbinder::death_signal(&root).expect("death_signal on a live RPC proxy");
 
-    // Awaited from a runtime of its own, so the completion has to travel from
-    // the session thread through the `oneshot` waker. A current-thread runtime
-    // parked in `Runtime::block_on` is being driven, which is the condition
-    // the API documents.
+    // Own runtime: completion must cross from the session thread via the `oneshot` waker.
     let (tx_done, rx_done) = std::sync::mpsc::sync_channel::<()>(1);
     let awaiting = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -2916,8 +2502,8 @@ fn rpc_death_signal_completes_on_session_drop() {
         let _ = tx_done.try_send(());
     });
 
-    child.kill().expect("kill server");
-    child.wait().expect("reap server");
+    child.0.kill().expect("kill server");
+    child.0.wait().expect("reap server");
 
     rx_done
         .recv_timeout(Duration::from_secs(5))
@@ -2945,16 +2531,7 @@ fn rpc_death_signal_completes_on_session_drop() {
 
 // ---- opt-in authorization hook -------------------------------------
 
-/// The opt-in `set_authorizer` gate runs *before any RPC
-/// byte* and is backend-independent. A rejecting hook closes the
-/// connection (the peer's next op is `DeadObject`, zero payload); an
-/// accepting hook is transparent; unset is accept-all = a server
-/// without the hook (every other test in this suite, unmodified, is the
-/// additive-invariant evidence). The `PeerIdentity` the hook inspects
-/// is the *real* peer.
-///
-/// Mutant: deleting the `serve_connection` authorizer block makes the
-/// rejected client's `get_root()` succeed ⇒ the `is_err` assert fails.
+/// `set_authorizer`: a rejecting hook closes before any RPC byte, an accepting one is transparent.
 #[test]
 fn authorizer_gate_rejects_before_any_rpc_byte() {
     use rsbinder::rpc::PeerIdentity;
@@ -2999,34 +2576,24 @@ fn authorizer_gate_rejects_before_any_rpc_byte() {
 
 // ---- plan 2-20 Phase A: slot roles + fast-fail --------------------------
 
-/// Boot a server whose `hold()` parks the client callback in `held`, connect
-/// one r34 client, and hand the parked proxy back — the server side of a
-/// callback the server may later drive from outside any handler.
+/// A server holding one client's callback via `hold()`, for driving it from outside any handler.
 struct HeldSetup {
     client: RpcSession,
     root: EchoProxy,
-    /// The client's local callback object (an `EchoSvc` by default, so
-    /// `TX_ECHO` / `TX_BUMP` / `TX_SLOW` answer on it).
+    /// The client's local callback (`EchoSvc` by default: `TX_ECHO`/`TX_BUMP`/`TX_SLOW` answer).
     cb: SIBinder,
     /// `cb`'s `bump()` counter (oneway delivery check).
     cb_counter: Arc<AtomicI64>,
-    /// The server's proxy to `cb`, taken out of `held` (`Option` so a test
-    /// can `take()` it — a `Drop` type cannot be moved out of).
+    /// The server's proxy to `cb`; `Option` so a test can `take()` it out of this `Drop` type.
     server_cb: Option<SIBinder>,
     held: Arc<Mutex<Option<SIBinder>>>,
-    /// The server's root as a *local* binder (for handing back to the
-    /// client inside a callback).
+    /// The server's root as a local binder, to hand back to the client inside a callback.
     root_local: SIBinder,
     server: Arc<RpcServer>,
-    /// Last field on purpose: fields drop in declaration order, and
-    /// `ServeCleanup::drop` joins the worker serving `client`'s connection —
-    /// it can only return once `client` and the proxies are gone.
+    /// Must stay last: fields drop in order, and its join waits for `client` and the proxies.
     _cu: ServeCleanup,
 }
-/// `HeldSetup::drop` runs before its fields drop: stop the client's
-/// incoming-connection threads first, so the client ends the session on
-/// its own terms rather than having `ServeCleanup`'s `terminate` end it
-/// from the server side underneath those threads.
+/// Close the client's incoming threads first, before `ServeCleanup`'s `terminate` runs under them.
 impl Drop for HeldSetup {
     fn drop(&mut self) {
         self.client.close_session();
@@ -3079,9 +2646,7 @@ fn boot_held_cfg(tag: &str, cfg: HeldCfg) -> HeldSetup {
     } else {
         RpcSession::setup_unix_client(&path).expect("connect")
     };
-    // From here on a panic must still shut the session down: its incoming
-    // threads keep the session alive, and a setup failure would otherwise
-    // leak them into the rest of the suite.
+    // A setup panic must still close the session, or its incoming threads leak into the suite.
     struct ClientGuard(Option<RpcSession>);
     impl Drop for ClientGuard {
         fn drop(&mut self) {
@@ -3135,8 +2700,7 @@ fn drive_slow(cb: &SIBinder, ms: i32) -> Result<()> {
         .ok_or(StatusCode::UnexpectedNull)?;
     read_status(&mut r)
 }
-/// `TX_ROUNDTRIP` on a proxy, handing it `target`: the callee calls
-/// `target.echo("ping")` back (a nested call from inside the callback).
+/// `TX_ROUNDTRIP` on `cb` with `target`: the callee calls `target.echo("ping")` back.
 fn drive_roundtrip(cb: &SIBinder, target: &SIBinder) -> Result<String> {
     let rp = rpc_of(cb);
     let mut d = rp.build_request(DESC)?;
@@ -3168,19 +2732,12 @@ fn drive(cb: &SIBinder, oneway: bool) -> Result<()> {
     }
 }
 
-/// AC-20.1 — the client opened no incoming connection, so the server has no
-/// `Outgoing` slot: a call on the parked proxy from a thread inside no handler
-/// must fail **at once** (AOSP `WOULD_BLOCK`), not block until a deadline that
-/// was never set. The served slot is untouched: the client's next calls and a
-/// nested callback (`roundtrip`) still work.
+/// AC-20.1: no `Outgoing` slot ⇒ an out-of-handler call fails at once (`WOULD_BLOCK`), slot intact.
 #[test]
-fn a_outside_handler_call_without_outgoing_slot_fails_fast() {
+fn outside_handler_call_without_outgoing_slot_fails_fast() {
     let h = boot_held("a_fastfail");
     for oneway in [false, true] {
-        // The deadline has to bound the *wait*, not be measured after it:
-        // the regression this guards is an unbounded park in `find_conn`,
-        // and a server session has no reply deadline of its own, so an
-        // in-line call would hang the run instead of failing it.
+        // Off-thread: a server session has no reply deadline, so a `find_conn` park would hang.
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let cb = h.cb_proxy();
         let driver = std::thread::spawn(move || {
@@ -3191,9 +2748,7 @@ fn a_outside_handler_call_without_outgoing_slot_fails_fast() {
             Err(RecvTimeoutError::Timeout) => {
                 panic!("oneway={oneway}: must fail immediately, still blocked")
             }
-            // `drive` asserts on the reply payload, so a broken channel is
-            // its panic, not a block. Re-raise that instead of blaming a
-            // deadline it never reached.
+            // A broken channel is `drive`'s assertion panic, not a block: re-raise it.
             Err(RecvTimeoutError::Disconnected) => match driver.join() {
                 Err(p) => std::panic::resume_unwind(p),
                 Ok(()) => panic!("oneway={oneway}: the driving thread sent no result"),
@@ -3208,13 +2763,9 @@ fn a_outside_handler_call_without_outgoing_slot_fails_fast() {
     assert_eq!(h.root.roundtrip(&h.cb).unwrap(), "rt:ping");
 }
 
-/// AC-20.9 — the served slot is momentarily free between two messages of the
-/// worker's loop. An out-of-handler transact must never claim it there —
-/// it would write a transaction the idle client never reads — so every such
-/// attempt is refused while the client hammers the same connection, and the
-/// wire stays in sync.
+/// AC-20.9: an out-of-handler transact never claims the served slot between two messages.
 #[test]
-fn a_served_slot_never_taken_by_outside_transact() {
+fn served_slot_never_taken_by_outside_transact() {
     let h = boot_held("a_theft");
     let stop = Arc::new(AtomicBool::new(false));
     let progressed = Arc::new(AtomicBool::new(false));
@@ -3233,9 +2784,7 @@ fn a_served_slot_never_taken_by_outside_transact() {
             n
         })
     };
-    // Wait for the first echo before hammering: the loop below is all
-    // fast-fails, so on a loaded machine it can finish and set `stop`
-    // before this thread is ever scheduled, leaving `echoed == 0`.
+    // First echo first: the fast-fail loop could finish before the client thread runs.
     let spun_up = Instant::now();
     while !progressed.load(Ordering::SeqCst) {
         assert!(
@@ -3245,8 +2794,7 @@ fn a_served_slot_never_taken_by_outside_transact() {
         std::thread::yield_now();
     }
     for i in 0..200 {
-        // Bounded, for the same reason as `..._fails_fast`: a slot the
-        // outside call manages to claim would park here forever.
+        // Bounded: an outside call that claims the slot would park here forever.
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let cb = h.cb_proxy();
         std::thread::spawn(move || {
@@ -3258,30 +2806,22 @@ fn a_served_slot_never_taken_by_outside_transact() {
         }
     }
     stop.store(true, Ordering::SeqCst);
-    // Progress is already established by the spin-up gate above; the join
-    // is what surfaces a hammer-thread panic (a failed echo under
-    // contention).
+    // The join surfaces a hammer-thread panic (a failed echo under contention).
     hammer.join().expect("hammer thread");
     assert_eq!(h.root.echo("after").unwrap(), "after");
 }
 
-/// The android-13+ connect handshake must be bounded by
-/// `RpcClientConfig::handshake_timeout`. Without it a peer that accepts
-/// the socket and then writes nothing blocks the setup call forever —
-/// `RpcSession::set_timeout` cannot cover this phase, since it is applied to
-/// a session that does not exist yet.
+/// `RpcClientConfig::handshake_timeout` bounds the connect handshake (`set_timeout` comes later).
 #[test]
 fn handshake_timeout_bounds_a_silent_peer() {
     let path = tmp_sock("hs_silent");
-    // A raw listener, not an `RpcServer`: it accepts and then says nothing,
-    // which is exactly the peer this deadline exists for.
+    // A raw listener that accepts and says nothing: the peer this deadline exists for.
     let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
     let keep = Arc::new(Mutex::new(Vec::new()));
     let acceptor = {
         let keep = Arc::clone(&keep);
         std::thread::spawn(move || {
-            // Hold the accepted sockets open; dropping them would give the
-            // client an EOF and let it fail for the wrong reason.
+            // Held open: an EOF would let the client fail for the wrong reason.
             while let Ok((sock, _)) = listener.accept() {
                 keep.lock().unwrap().push(sock);
             }
@@ -3289,9 +2829,7 @@ fn handshake_timeout_bounds_a_silent_peer() {
     };
     wait_for_sock(&path);
 
-    // Off-thread with a deadline on the *channel*: without the fix this
-    // connect never returns, and measuring `elapsed()` afterwards would
-    // hang the run instead of failing it.
+    // Channel deadline: an unbounded connect must fail the test, not hang the run.
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     let p = path.clone();
     std::thread::spawn(move || {
@@ -3305,9 +2843,7 @@ fn handshake_timeout_bounds_a_silent_peer() {
         .expect("the handshake deadline must bound the connect; still blocked");
     assert!(r.is_err(), "a silent peer's handshake must not succeed");
 
-    // The deadline must not leak onto the socket of a session that *does*
-    // complete: `ReplyDeadlineGuard` restores only what it armed itself, so
-    // a leftover `SO_RCVTIMEO` would silently bound every later reply wait.
+    // A leftover handshake `SO_RCVTIMEO` would silently bound every later reply wait.
     let path2 = tmp_sock("hs_ok");
     let server = RpcServer::setup_unix_server(&path2).expect("bind");
     server.set_android13plus(2);
@@ -3331,15 +2867,9 @@ fn handshake_timeout_bounds_a_silent_peer() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// AC-20.10 — dropping the parked proxy from a thread inside no handler
-/// must neither block that thread nor desync the wire. With no `Outgoing`
-/// slot on this session the `DEC_STRONG` is skipped rather than written to
-/// the served slot (AOSP `WOULD_BLOCK`), so the node is released at session
-/// end — or promptly, once the client opens an incoming connection (plan
-/// 2-20 Phase B). What this gate pins is the safety property, not the
-/// delivery: neither assertion below depends on the DEC going out.
+/// AC-20.10: dropping the parked proxy outside a handler neither blocks nor desyncs (module doc).
 #[test]
-fn a_dec_strong_outside_handler_does_not_block_or_desync() {
+fn dec_strong_outside_handler_does_not_block_or_desync() {
     let h = boot_held("a_dec");
     assert_eq!(
         h.client.local_node_count(),
@@ -3370,11 +2900,9 @@ fn a_dec_strong_outside_handler_does_not_block_or_desync() {
 
 // ---- plan 2-20 Phase B/C: client incoming connections ------------------
 
-/// AC-20.2 — with one incoming connection the server reaches the client's
-/// callback from a thread inside no handler: twoway returns, oneway lands.
-/// Also with an outgoing fan-out alongside (AOSP `setupClient` order).
+/// AC-20.2: one incoming conn serves out-of-handler callbacks (twoway, oneway), fan-out too.
 #[test]
-fn b_outside_handler_callback_completes() {
+fn outside_handler_callback_completes() {
     for (fan_out, max_threads) in [(1, 1), (2, 2)] {
         let h = boot_held_cfg(
             &format!("b_complete{fan_out}"),
@@ -3411,10 +2939,9 @@ fn b_outside_handler_callback_completes() {
     }
 }
 
-/// AC-20.3 — many server threads at once: one incoming connection
-/// serialises them (all succeed); two run them in parallel.
+/// AC-20.3: concurrent server threads: one incoming conn serialises them, two run in parallel.
 #[test]
-fn b_outside_handler_parallel_callbacks() {
+fn outside_handler_parallel_callbacks() {
     let h = boot_held_cfg(
         "b_par1",
         HeldCfg {
@@ -3434,11 +2961,7 @@ fn b_outside_handler_parallel_callbacks() {
             assert_eq!(r, Ok(()));
         }
     }
-    // Serial on one slot: two 1000 ms calls take ≥ 2000 ms … The 400 ms
-    // between the parallel ceiling (1600 ms) and the serial floor (2000 ms)
-    // is the discrimination margin; the 600 ms between the parallel ceiling
-    // and the 1000 ms floor is the headroom this binary needs, since it runs
-    // its load tests concurrently.
+    // Serial ≥ 2000 ms vs parallel < 1600 ms: 400 ms margin, 600 ms concurrent-load headroom.
     let t0 = Instant::now();
     let a = {
         let cb = h.cb_proxy();
@@ -3484,11 +3007,9 @@ fn b_outside_handler_parallel_callbacks() {
     );
 }
 
-/// AC-20.4 — the callback's handler (on the client's incoming thread) calls
-/// the server back; that nested call re-enters the incoming slot and the
-/// server answers it from its own reply wait.
+/// AC-20.4: a callback handler's call back to the server re-enters the incoming slot.
 #[test]
-fn b_nested_call_from_callback_handler() {
+fn nested_call_from_callback_handler() {
     let h = boot_held_cfg(
         "b_nested",
         HeldCfg {
@@ -3506,9 +3027,7 @@ fn b_nested_call_from_callback_handler() {
     assert_eq!(h.root.echo("after").unwrap(), "after");
 }
 
-/// A callback whose handler calls back into the session it was dispatched
-/// from: a nested call from a *oneway* handler must not pin to the
-/// connection the oneway arrived on (AOSP `RpcConnection::allowNested`).
+/// Handler calls back in; from a oneway it must not pin (AOSP `RpcConnection::allowNested`).
 struct NestFromHandler {
     /// The client's proxy back to the server root.
     root: Mutex<Option<SIBinder>>,
@@ -3556,7 +3075,7 @@ impl Remotable for NestFromHandlerRef {
     }
 }
 #[test]
-fn b_nested_call_from_oneway_callback_handler() {
+fn nested_call_from_oneway_callback_handler() {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     let holder = Arc::new(NestFromHandler {
         root: Mutex::new(None),
@@ -3574,9 +3093,7 @@ fn b_nested_call_from_oneway_callback_handler() {
     );
     *holder.root.lock().unwrap() = Some(h.root.0.clone());
 
-    // Control: a TWOWAY callback from a plain server thread. The peer is
-    // parked in its reply wait on that connection, so the nested call may
-    // ride it.
+    // Control: TWOWAY; the peer's reply wait on that connection lets the nested call ride it.
     let cb_tw = h.cb_proxy();
     let tw = std::thread::spawn(move || drive(&cb_tw, false));
     assert_eq!(
@@ -3601,11 +3118,9 @@ fn b_nested_call_from_oneway_callback_handler() {
     assert_eq!(h.root.echo("after").unwrap(), "after");
 }
 
-/// Configuration rules: r34 has no session id (`BadType`); an attach
-/// (echoed id) gets neither fan-out nor incoming (`BadValue`); the manual
-/// attach helpers reject a config carrying the other option.
+/// r34 + session id ⇒ `BadType`; attach + fan-out or incoming ⇒ `BadValue`, helpers included.
 #[test]
-fn b_incoming_config_validation() {
+fn incoming_config_validation() {
     let h = boot_held_cfg(
         "b_cfg",
         HeldCfg {
@@ -3657,10 +3172,7 @@ fn b_incoming_config_validation() {
             .unwrap(),
         Ok(())
     );
-    // r34: no session id to echo. Address the r34 server, not the a13 one
-    // above — the profile check happens before `connect()` today, so the
-    // path is unused, but pointing it at the wrong server would silently
-    // start testing something else if that order ever changed.
+    // r34: no session id to echo. The path is unused (checked before `connect()`) but correct.
     let r34 = boot_held("b_cfg_r34");
     let r34_path = r34.server.path().expect("r34 server path").to_path_buf();
     assert!(matches!(
@@ -3721,13 +3233,11 @@ fn a_manual_attach_with_a_session_timeout() {
         .expect("the deprecated incoming attach still ignores it");
 }
 
-/// The server budgets callback slots at `2 * max_threads`: a third
-/// incoming connection on a default server is refused (and the partially
-/// built session is dropped), two are admitted.
+/// Callback slots cap at `2 * max_threads`: on a default server two are admitted, a third refused.
 // Pins the deprecated `RpcUnixClientConfig` wrapper's delegation to `RpcClientConfig`.
 #[allow(deprecated)]
 #[test]
-fn b_incoming_over_server_cap_is_refused() {
+fn incoming_over_server_cap_is_refused() {
     let h = boot_held_cfg(
         "b_cap",
         HeldCfg {
@@ -3748,9 +3258,7 @@ fn b_incoming_over_server_cap_is_refused() {
     let r = RpcSession::setup_unix_client_android13plus_with_config(
         rsbinder::rpc::RpcUnixClientConfig::path(&path, 2).incoming_connections(3),
     );
-    // The regression this guards against *admits* the third slot. Leaking
-    // that session would leave its incoming threads serving past the panic
-    // below, into the rest of the suite.
+    // If admitted, close it: its incoming threads would outlive the panic below.
     if let Ok(s) = &r {
         s.close_session();
     }
@@ -3762,10 +3270,9 @@ fn b_incoming_over_server_cap_is_refused() {
     );
 }
 
-/// The unified entry: `ClientOptions::incoming_connections` reaches the
-/// session; it needs the android-13+ profile.
+/// `ClientOptions::incoming_connections` reaches the session; it needs the android-13+ profile.
 #[test]
-fn b_entry_client_open_with_incoming() {
+fn entry_client_open_with_incoming() {
     let h = boot_held_cfg(
         "b_entry",
         HeldCfg {
@@ -3778,9 +3285,7 @@ fn b_entry_client_open_with_incoming() {
     let client = rsbinder::Client::open_with(&uri, |o, _| o.incoming_connections = Some(1))
         .expect("open with incoming");
     let session = client.session().expect("rpc session");
-    // Read first, close, then assert: a session with a live incoming
-    // thread that is never closed leaks that thread into the rest of the
-    // suite, so a failing assertion here must not skip the `close_session`.
+    // Close before asserting: an unclosed session leaks its incoming thread into the suite.
     let slots = session.__slot_count();
     let threads = session.__incoming_thread_count();
     session.close_session();
@@ -3793,12 +3298,9 @@ fn b_entry_client_open_with_incoming() {
     ));
 }
 
-/// AC-20.5 — a client with an incoming connection learns of the server's
-/// death from that connection dropping; one without cannot link a death
-/// recipient at all (AOSP `linkToDeath` without incoming threads), and its
-/// next failed call still ends the session.
+/// AC-20.5: incoming conn ⇒ eager death; none ⇒ no death link, and a failed call ends the session.
 #[test]
-fn c_server_death_is_eager_with_incoming() {
+fn server_death_is_eager_with_incoming() {
     if let Ok(path) = std::env::var("RSB_RPC_DEATH_A13_SERVER") {
         let server = RpcServer::setup_unix_server(&path).expect("bind");
         server.set_android13plus(2);
@@ -3808,23 +3310,13 @@ fn c_server_death_is_eager_with_incoming() {
         let _ = server.run(); // blocks until killed
         std::process::exit(0);
     }
-    // Kill + reap the server child even when an assert below panics — its
-    // `server.run()` loop never exits on its own, and `wait_for_sock`
-    // alone can panic before the explicit kill on a loaded machine.
-    struct KillOnDrop(std::process::Child);
-    impl Drop for KillOnDrop {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
     let path = tmp_sock("c_death");
     let exe = std::env::current_exe().expect("current_exe");
     let mut child = KillOnDrop(
         std::process::Command::new(exe)
             .args([
                 "--exact",
-                "c_server_death_is_eager_with_incoming",
+                "server_death_is_eager_with_incoming",
                 "--nocapture",
             ])
             .env("RSB_RPC_DEATH_A13_SERVER", &path)
@@ -3870,12 +3362,7 @@ fn c_server_death_is_eager_with_incoming() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// Plan 2-21 C-0 — a local `shutdown` ends the serve loop the same way
-/// wherever its worker is: parked in `recv`, or inside a handler whose
-/// reply then has nowhere to go. Both report `EndedBy::Local` with an
-/// intact stream, so `into_result` is `Ok(())`. It used to be `Ok(())`
-/// or `Err(DeadObject)` depending on which of the two the worker
-/// happened to be doing — a contract no rustdoc could state.
+/// Plan 2-21 C-0: local `shutdown` is `EndedBy::Local`, `Ok(())`, parked in `recv` or in a handler.
 #[test]
 fn local_shutdown_ends_the_serve_loop_the_same_way_parked_or_dispatching() {
     use rsbinder::rpc::transport::UnixTransport;
@@ -3927,11 +3414,7 @@ fn local_shutdown_ends_the_serve_loop_the_same_way_parked_or_dispatching() {
     }
 }
 
-/// Plan 2-21 B-4 — an `AF_INET` fd handed to `from_preconnected_fd` is
-/// wrapped in `TcpDebugTransport` and goes straight into the android-13+
-/// handshake, whose first byte is a raw write. Without that transport's
-/// `send_raw`/`recv_raw` the write hit the trait default's `Protocol`
-/// refusal — the omission that had already broken `vsock` once.
+/// Plan 2-21 B-4: an `AF_INET` fd in `from_preconnected_fd` handshakes via `TcpDebugTransport`.
 #[cfg(feature = "rpc-tcp-debug")]
 #[test]
 fn preconnected_inet_fd_handshakes_over_tcp_debug() {
@@ -3964,18 +3447,10 @@ fn preconnected_inet_fd_handshakes_over_tcp_debug() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// Plan 2-21 B-2 — `terminate` ends what `shutdown` only lets drain. An
-/// r34 client and an android-13+ client (the two minting paths — only
-/// the latter has a session id, so only it was ever in the id registry)
-/// stay connected; `terminate` still returns, wakes every worker out of
-/// `recv`, joins them, and the android-13+ session — driven by two
-/// workers, so `Live(2)` — dies whole instead of being skipped as
-/// "still live".
+/// Plan 2-21 B-2: `terminate` ends connected r34 and android-13+ sessions and joins the workers.
 #[test]
 fn terminate_ends_every_session_and_joins_workers() {
-    // r34 (the default profile): the minting path with no session id, so
-    // nothing in the id registry ever knew this session. A server speaks
-    // one profile, so the two paths need two servers.
+    // r34 mints no session id (absent from the id registry); one profile per server.
     let r34_path = tmp_sock("term34");
     let r34_server = RpcServer::setup_unix_server(&r34_path).expect("bind r34");
     r34_server
@@ -3987,8 +3462,7 @@ fn terminate_ends_every_session_and_joins_workers() {
     let r34_root = EchoProxy(r34.get_root().expect("root"));
     assert_eq!(r34_root.echo("r34").unwrap(), "r34");
 
-    // android-13+ with two outgoing connections: a `Live(2)` server
-    // session, which `close_session` must end although it is "still live".
+    // Two outgoing connections: a `Live(2)` session `terminate` must end although "still live".
     let a13_path = tmp_sock("term13");
     let a13_server = RpcServer::setup_unix_server(&a13_path).expect("bind a13");
     a13_server.set_android13plus(2);
@@ -4016,8 +3490,7 @@ fn terminate_ends_every_session_and_joins_workers() {
         a13_server.session_live_conns(&sid)
     );
 
-    // Off-thread with a channel deadline: a `terminate` that blocks on a
-    // connected client must fail the test, not hang the runner.
+    // Channel deadline: a `terminate` blocked on a connected client must fail, not hang.
     for (name, server) in [("r34", &r34_server), ("android-13+", &a13_server)] {
         let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
         let terminating = Arc::clone(server);
@@ -4035,8 +3508,7 @@ fn terminate_ends_every_session_and_joins_workers() {
     }
     r34_bg.join().expect("r34 accept loop");
     a13_bg.join().expect("android-13+ accept loop");
-    // Every worker exited (their `Arc<RpcServer>` clones are gone) and the
-    // android-13+ session is dead, not merely "still live".
+    // Every worker exited (its `Arc<RpcServer>` clone is gone); the a13 session is dead.
     for (name, server) in [("r34", &r34_server), ("android-13+", &a13_server)] {
         assert!(
             poll_until(|| Arc::strong_count(server) == 1),
@@ -4060,10 +3532,7 @@ fn terminate_ends_every_session_and_joins_workers() {
     let _ = std::fs::remove_file(&a13_path);
 }
 
-/// Plan 2-21 B-2 — a service that ends its own server calls `terminate`
-/// from inside a handler, on the very worker thread `terminate` would
-/// join. That handle is skipped; the worker exits when the handler
-/// returns, and nothing deadlocks.
+/// Plan 2-21 B-2: `terminate` from a handler skips its own worker's handle; no deadlock.
 #[test]
 fn terminate_from_a_handler_does_not_join_itself() {
     const STOP_DESC: &str = "rsbinder.test.IStopper";
@@ -4090,8 +3559,7 @@ fn terminate_from_a_handler_does_not_join_itself() {
 
     let path = tmp_sock("termre");
     let server = RpcServer::setup_unix_server(&path).expect("bind");
-    // The service holds the server until the call takes it, so the strong
-    // count below can reach 1 once the worker is gone.
+    // The call takes the server out of the service, so the strong count can reach 1.
     server
         .set_root(Interface::as_binder(&Binder::new(Stopper(Mutex::new(
             Some(Arc::clone(&server)),
@@ -4109,8 +3577,7 @@ fn terminate_from_a_handler_does_not_join_itself() {
             .downcast_ref::<RpcProxy>()
             .expect("RpcProxy");
         let d = rp.build_request(STOP_DESC).expect("request");
-        // The reply is written after the transport went down, so the call
-        // ends in an error — what matters is that it ends.
+        // Errors (the transport is down before the reply); what matters is that it ends.
         let _ = rp.transact(FIRST_CALL_TRANSACTION, &d, 0);
         let _ = tx.send(());
     });
@@ -4129,10 +3596,9 @@ fn terminate_from_a_handler_does_not_join_itself() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// AC-20.6 — `shutdown` ends and joins the incoming threads; the server
-/// sees the session go.
+/// AC-20.6: `shutdown` ends and joins the incoming threads; the server sees the session go.
 #[test]
-fn c_shutdown_joins_incoming_threads() {
+fn shutdown_joins_incoming_threads() {
     let h = boot_held_cfg(
         "c_join",
         HeldCfg {
@@ -4150,10 +3616,7 @@ fn c_shutdown_joins_incoming_threads() {
         .unwrap();
     assert_eq!(h.client.__incoming_thread_count(), 2);
     assert_eq!(h.client.__incoming_thread_live_count(), 2);
-    // Run `shutdown` off-thread with a deadline on the *channel*: a
-    // deadlocked shutdown must fail the test, not hang it until the CI
-    // timeout (which is what asserting on `elapsed()` after the call
-    // would do — that line is never reached).
+    // Channel deadline: a deadlocked shutdown must fail the test, not hang until CI timeout.
     let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
     let shutting = h.client.clone();
     let t = std::thread::spawn(move || {
@@ -4162,25 +3625,16 @@ fn c_shutdown_joins_incoming_threads() {
     });
     match rx.recv_timeout(Duration::from_secs(5)) {
         Ok(()) => {}
-        // A panicked `shutdown` breaks the channel too; falling through to
-        // the `join` below re-raises it with its own message rather than
-        // reporting a deadlock that did not happen.
+        // A panicked `shutdown` breaks the channel too; the `join` below re-raises it.
         Err(RecvTimeoutError::Disconnected) => {}
         Err(RecvTimeoutError::Timeout) => {
-            // Report the failure instead of hanging the runner: dropping `h`
-            // would run `HeldSetup::drop` → `ServeCleanup`'s `terminate`, which
-            // ends the same wedged session and joins the same workers — a
-            // regression that leaves the transports up would never return.
+            // Leak `h`: its drop runs `terminate`, which joins the same wedged workers.
             std::mem::forget(h);
             panic!("shutdown deadlocked");
         }
     }
     t.join().expect("shutdown thread");
-    // The observable half of "joins". `__incoming_thread_count` is
-    // `mem::take`n before the first `join()`, so it reads 0 either way;
-    // and the live count usually reaches 0 on its own, because
-    // `shutdown` wakes the threads (transport shutdown) before it joins
-    // them. Only the join counter separates joining from detaching.
+    // Only the join counter tells joining from detaching; the other two read 0 either way.
     assert_eq!(
         h.client.__incoming_thread_joined_count(),
         2,
@@ -4198,8 +3652,7 @@ fn c_shutdown_joins_incoming_threads() {
     assert!(matches!(h.root.echo("dead"), Err(StatusCode::DeadObject)));
 }
 
-/// A `DeathRecipient` that shuts the session down from inside `binder_died`
-/// — the cycle-breaking call the `RpcSession` docs point at.
+/// Shuts the session down inside `binder_died`: the cycle break the `RpcSession` docs name.
 struct ShutdownOnDeath(Mutex<Option<RpcSession>>, Arc<AtomicBool>);
 impl rsbinder::DeathRecipient for ShutdownOnDeath {
     fn binder_died(&self, _who: &rsbinder::WIBinder) {
@@ -4210,11 +3663,9 @@ impl rsbinder::DeathRecipient for ShutdownOnDeath {
     }
 }
 
-/// The obituary runs while the incoming threads are still parked in `recv`,
-/// so a `binder_died` that calls `shutdown` would join threads nothing has
-/// woken. Death must shut the transports down before it runs user code.
+/// Death shuts transports down before `binder_died`, so a `shutdown` there joins woken threads.
 #[test]
-fn c_shutdown_from_death_recipient_does_not_deadlock() {
+fn shutdown_from_death_recipient_does_not_deadlock() {
     let h = boot_held_cfg(
         "c_death_sd",
         HeldCfg {
@@ -4234,9 +3685,7 @@ fn c_shutdown_from_death_recipient_does_not_deadlock() {
         .link_to_death(Arc::downgrade(&recip) as _)
         .expect("link");
 
-    // Killing the server drives death on the client, which fires the
-    // obituary above. Deadline on the channel, not on `elapsed()` after
-    // the fact: a deadlock must fail this test, not hang the run.
+    // Channel deadline: a deadlock in the obituary's `shutdown` must fail, not hang the run.
     let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
     let victim = h.client.clone();
     let t = std::thread::spawn(move || {
@@ -4245,32 +3694,24 @@ fn c_shutdown_from_death_recipient_does_not_deadlock() {
     });
     match rx.recv_timeout(Duration::from_secs(10)) {
         Ok(()) => {}
-        // A panicked `shutdown` breaks the channel too; the `join` below
-        // re-raises it instead of reporting a deadlock that did not happen.
+        // A panicked `shutdown` breaks the channel too; the `join` below re-raises it.
         Err(RecvTimeoutError::Disconnected) => {}
         Err(RecvTimeoutError::Timeout) => {
-            // The session is wedged, so dropping the fixture would block in
-            // `ServeCleanup`'s `terminate` and turn this failure into a CI
-            // timeout. Leak it and report instead.
+            // Wedged: dropping the fixture would block in `ServeCleanup`'s `terminate`.
             std::mem::forget(h);
             panic!("shutdown from a death recipient deadlocked");
         }
     }
     t.join().expect("shutdown thread");
     assert_eq!(h.client.__incoming_thread_live_count(), 0);
-    // Without this the test passes on a regression that never fires the
-    // obituary at all: the outer `shutdown` would join the threads itself
-    // and every assertion above would still hold.
+    // Without the obituary the outer `shutdown` joins the threads and all else still holds.
     assert!(
         fired.load(Ordering::SeqCst),
         "the obituary never ran; this test would gate nothing"
     );
 }
 
-/// A callback whose handler shuts its own session down: the incoming
-/// thread that runs it is not joined by itself (no deadlock), and the
-/// server's call returns (`DeadObject` — the session the reply owed its
-/// answer to is gone by then) instead of hanging.
+/// Callback that shuts its own session down: no self-join, and the server's call gets `DeadObject`.
 struct ShutdownCb(Mutex<Option<RpcSession>>);
 impl Interface for ShutdownCb {}
 impl Remotable for ShutdownCb {
@@ -4291,7 +3732,7 @@ impl Remotable for ShutdownCb {
     }
 }
 #[test]
-fn c_shutdown_from_callback_handler_does_not_self_join() {
+fn shutdown_from_callback_handler_does_not_self_join() {
     let holder = Arc::new(ShutdownCb(Mutex::new(None)));
     let cb: SIBinder = Interface::as_binder(&Binder::new(ShutdownCbRef(Arc::clone(&holder))));
     let h = boot_held_cfg(
@@ -4305,8 +3746,7 @@ fn c_shutdown_from_callback_handler_does_not_self_join() {
     );
     *holder.0.lock().unwrap() = Some(h.client.clone());
     let server_cb = h.cb_proxy();
-    // Deadline on the channel, not on `elapsed()` after the join: a
-    // self-join deadlock must fail here rather than hang the run.
+    // Channel deadline: a self-join deadlock must fail here rather than hang the run.
     let (tx, rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
     let worker = std::thread::spawn(move || {
         let r = drive(&server_cb, false);
@@ -4317,26 +3757,20 @@ fn c_shutdown_from_callback_handler_does_not_self_join() {
         Err(RecvTimeoutError::Timeout) => {
             panic!("shutdown inside the handler deadlocked")
         }
-        // `drive` asserts on the reply, so a broken channel is the
-        // worker's panic. Re-raise that instead of reporting a deadlock
-        // that never happened.
+        // A broken channel is `drive`'s assertion panic: re-raise it, not a deadlock.
         Err(RecvTimeoutError::Disconnected) => match worker.join() {
             Err(p) => std::panic::resume_unwind(p),
             Ok(()) => panic!("the driving thread sent no result"),
         },
     };
-    // The handler tore its own session down before the reply could go
-    // out, so the call comes back `DeadObject` — the point is that it
-    // *comes back* rather than deadlocking on a self-join.
+    // The session died before the reply went out; the point is that the call *returns*.
     assert_eq!(
         r,
         Err(StatusCode::DeadObject),
         "the server's call must return once the handler's shutdown lands"
     );
     worker.join().expect("worker");
-    // The thread that ran the handler was left to finish on its own
-    // (joining itself would deadlock), so it ends slightly after
-    // `shutdown` returned — poll for it.
+    // The handler's thread is not self-joined, so it ends slightly after `shutdown`; poll.
     assert!(poll_until(|| h.client.__incoming_thread_live_count() == 0));
     assert_eq!(h.client.__incoming_thread_count(), 0);
     h.client.close_session();
@@ -4358,15 +3792,9 @@ impl Remotable for ShutdownCbRef {
     }
 }
 
-/// A client with `incoming_connections > 0` that loses its only
-/// `Outgoing` slot to a reply-deadline retirement must still declare the
-/// session dead: the surviving callback slot keeps the pool non-empty,
-/// but nothing reads a request written on it, so without the
-/// last-outgoing check the session stayed `Live` forever — every later
-/// transact answered `WouldBlock` with no obituary and no
-/// `RpcState::clear`.
+/// Losing the only `Outgoing` slot to a reply deadline declares death despite a callback slot.
 #[test]
-fn c_losing_the_last_outgoing_slot_declares_death_with_incoming() {
+fn losing_the_last_outgoing_slot_declares_death_with_incoming() {
     let h = boot_held_cfg(
         "c_lastout",
         HeldCfg {
@@ -4377,8 +3805,7 @@ fn c_losing_the_last_outgoing_slot_declares_death_with_incoming() {
         },
     );
     assert_eq!(h.client.__slot_count(), 2, "founding outgoing + callback");
-    // Deadline far below the handler's sleep: the reply arrives too late,
-    // which desyncs and retires the founding `Outgoing` slot.
+    // A reply past the deadline desyncs and retires the founding `Outgoing` slot.
     h.client.set_timeout(Some(Duration::from_millis(50)));
     assert_eq!(h.root.slow(400), Err(StatusCode::TimedOut));
     // Death, not a live session with only callback slots left.
@@ -4460,4 +3887,91 @@ fn dropping_a_unix_server_spares_a_successor_at_the_same_path() {
     );
     drop(second);
     assert!(!path.exists());
+}
+
+// ---- send state: a parcel owns its binder bumps until it is sent -----------
+
+/// A request refused with `WouldBlock` keeps its bump; the same parcel, resent, delivers a live node.
+#[test]
+fn resend_after_would_block_delivers_a_live_node() {
+    let held = Arc::new(Mutex::new(None));
+    let h = boot_held_cfg(
+        "resend_wb",
+        HeldCfg {
+            a13: true,
+            cb: Some(make_service_with_hold(
+                Arc::new(AtomicI64::new(0)),
+                Arc::clone(&held),
+            )),
+            ..Default::default()
+        },
+    );
+    let path = h.server.path().expect("unix path").to_path_buf();
+    let sid = h.client.get_session_id().expect("session id");
+    // The root the client holds is the server's only node so far.
+    let base = h.server.live_session_node_count();
+
+    let ctr = Arc::new(AtomicI64::new(0));
+    let svc = make_service(Arc::clone(&ctr));
+    let cb = h.cb_proxy();
+    let rp = rpc_of(&cb);
+    let mut d = rp.build_request(DESC).expect("build_request");
+    d.write(&svc).expect("write the server's local binder");
+    assert_eq!(
+        h.server.live_session_node_count(),
+        base + 1,
+        "the write took its bump"
+    );
+
+    // No outgoing slot on the server yet: `WouldBlock`, from outside any handler.
+    let first = std::thread::scope(|s| s.spawn(|| rp.transact(TX_HOLD_CB, &d, 0)).join().unwrap());
+    assert_eq!(first.err(), Some(StatusCode::WouldBlock));
+    assert_eq!(
+        h.server.live_session_node_count(),
+        base + 1,
+        "a request never sent keeps its bump; the same parcel is going out again"
+    );
+
+    h.client
+        .add_incoming_connection_with_config(RpcClientConfig::unix(&path, 2).session_id(&sid))
+        .expect("manual incoming attach");
+    let second = std::thread::scope(|s| s.spawn(|| rp.transact(TX_HOLD_CB, &d, 0)).join().unwrap());
+    assert!(
+        second.is_ok(),
+        "the same parcel is sent once the slot exists: {second:?}"
+    );
+    assert_eq!(
+        rp.transact(TX_HOLD_CB, &d, 0).err(),
+        Some(StatusCode::InvalidOperation),
+        "sent: a third attempt is refused"
+    );
+    // The client still holds its proxy, so a drop that settled the sent bump would free the node.
+    drop(d);
+    assert_eq!(
+        h.server.live_session_node_count(),
+        base + 1,
+        "a sent parcel settles nothing on drop"
+    );
+
+    // The client's proxy to `svc` names a live node: its calls run.
+    let client_view = EchoProxy(
+        held.lock()
+            .unwrap()
+            .clone()
+            .expect("the client parked the server's binder"),
+    );
+    assert_eq!(client_view.echo("live").as_deref(), Ok("live"));
+    client_view
+        .bump()
+        .expect("oneway on the client's outgoing slot");
+    assert_eq!(client_view.count(), Ok(1), "the oneway reached `svc`");
+    assert_eq!(ctr.load(Ordering::SeqCst), 1);
+
+    // Its DEC_STRONG releases the node the send handed over.
+    *held.lock().unwrap() = None;
+    drop(client_view);
+    assert!(
+        poll_until(|| h.server.live_session_node_count() == base),
+        "the node the resend delivered is released once by the peer's DEC_STRONG"
+    );
 }

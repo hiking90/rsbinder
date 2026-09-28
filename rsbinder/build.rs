@@ -1,21 +1,29 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+//! Generates the AIDL bindings the runtime crate vendors.
+//!
+//! The codegen's async support mirrors the runtime crate's own `async`
+//! feature (`CARGO_FEATURE_ASYNC`, set by cargo whenever the current
+//! package's `async` feature is active). The emitted `IServiceManager` /
+//! `IAccessor` traits would otherwise reference `crate::BoxFuture`, which
+//! `rsbinder/src/lib.rs` gates on `#[cfg(feature = "async")]`: a sync-only
+//! profile such as `--no-default-features --features rpc,rpc-tls,...` then
+//! fails `cargo doc` / `cargo check` with "cannot find type `BoxFuture` in
+//! the crate root", since rsbinder-aidl's own `async` feature (a build-dep)
+//! is always on.
+//!
+//! `IAccessor` is compiled on its own (plan 2-13): `IServiceManager.aidl`
+//! does not import it, so the `Service.accessor` union arm surfaces as an
+//! unbound `IBinder`, and the accessor-bridge resolve path
+//! (`hub::android_16::resolve_accessor`) needs the generated proxy to call
+//! `addConnection()` / `getInstanceName()`. `ParcelFileDescriptor` is already
+//! part of the runtime crate.
+
 use std::path::PathBuf;
 
 fn main() {
-    // Mirror the *runtime* crate's `async` feature in the codegen so
-    // the emitted `IServiceManager` / `IAccessor` traits don't reference
-    // `crate::BoxFuture` (which itself is `#[cfg(feature = "async")]`
-    // gated in `rsbinder/src/lib.rs`) when the runtime build has
-    // `async` disabled — e.g. a sync-only RPC profile such as
-    // `--no-default-features --features rpc,rpc-tls,...`. Without
-    // this, `cargo doc` / `cargo check` under that feature combo fails
-    // with "cannot find type `BoxFuture` in the crate root", since
-    // rsbinder-aidl's own `async` feature (a build-dep) is always on.
-    // `CARGO_FEATURE_ASYNC` is set by cargo whenever the *current
-    // package*'s `async` feature is active (Cargo Book §"Build
-    // Scripts" → "Environment Variables Cargo Sets").
+    // Codegen `async` follows the runtime crate's feature (see the module doc).
     let async_enabled = std::env::var_os("CARGO_FEATURE_ASYNC").is_some();
     let new_builder = || {
         rsbinder_aidl::Builder::new()
@@ -47,10 +55,7 @@ fn main() {
         .generate()
         .unwrap();
 
-    // Android 15 from `android-15.0.0_r6` on — the QPR numbering, with
-    // `getService2` inserted at index 1. Earlier Android 15 builds speak the
-    // Android 14 interface above; `hub::default` measures which one a device
-    // has. See `hub::servicemanager_15`.
+    // 15.0.0_r6+ (`getService2`): `hub::servicemanager_15`; r1–r5 use 14's; `hub::default` probes.
     new_builder()
         .source(PathBuf::from("aidl/15/android/os/IServiceManager.aidl"))
         .output(PathBuf::from("service_manager_15.rs"))
@@ -63,22 +68,14 @@ fn main() {
         .generate()
         .unwrap();
 
-    // 2-13 A0.1: `IServiceManager.aidl` does not import `IAccessor`, so
-    // the `Service.accessor` union arm surfaces as an unbound `IBinder`.
-    // Compile `IAccessor` separately so the accessor-bridge resolve path
-    // (`hub::android_16::resolve_accessor`) can call
-    // `addConnection()`/`getInstanceName()` via the generated proxy.
-    // `ParcelFileDescriptor` is already vendored in the rsbinder runtime.
+    // Not imported by `IServiceManager.aidl`, so compiled on its own (see the module doc).
     new_builder()
         .source(PathBuf::from("aidl/16/android/os/IAccessor.aidl"))
         .output(PathBuf::from("accessor_16.rs"))
         .generate()
         .unwrap();
 
-    // Client-side stub for system_server's
-    // PermissionManagerService. Single AIDL (interface is stable across
-    // android-{11..16}), so it lives outside the versioned IServiceManager
-    // trees under aidl/permission/.
+    // Client stub for PermissionManagerService; stable across android-{11..16}, so unversioned.
     new_builder()
         .source(PathBuf::from(
             "aidl/permission/android/os/IPermissionController.aidl",
@@ -87,11 +84,7 @@ fn main() {
         .generate()
         .unwrap();
 
-    // Plan 10-5: the AOSP cancellation idiom. One AIDL, unchanged since
-    // 2012, so it lives beside IPermissionController rather than in the
-    // versioned trees. rsbinder implements **both** sides of this one —
-    // a service hands out a transport (`cancel::CancellationSignal`) and
-    // a client cancels through the generated proxy.
+    // Plan 10-5: unchanged since 2012, so unversioned; rsbinder implements both sides of it.
     new_builder()
         .source(PathBuf::from(
             "aidl/cancel/android/os/ICancellationSignal.aidl",

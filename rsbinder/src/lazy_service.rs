@@ -103,9 +103,7 @@ use crate::{Interface, Strong};
 /// `setActiveServicesCallback`.
 pub type ActiveServicesCallback = Arc<dyn Fn(bool) -> bool + Send + Sync>;
 
-/// The service-manager calls the registrar makes. Behind a trait so the
-/// state machine is exercised without a binder device; the shipping
-/// implementation is [`HubRegistry`].
+/// Service-manager calls, a trait so tests run without a device; shipped as `HubRegistry`.
 trait Registry: Send + Sync {
     fn add_lazy_service(&self, name: &str, binder: &SIBinder) -> std::result::Result<(), Status>;
     fn register_client_callback(
@@ -147,38 +145,28 @@ impl Registry for HubRegistry {
     }
 }
 
-/// One registered (name → binder) pair plus the most recent client-side
-/// presence signal from `IClientCallback::onClients`.
+/// One registered name → binder pair plus its last `onClients` state.
 #[derive(Clone)]
 struct RegisteredService {
     /// Service name as registered with the service manager.
     name: String,
     /// The binder being lazily managed.
     binder: SIBinder,
-    /// Last-known client-side presence: `true` once we have seen at
-    /// least one `onClients(name, true)`, `false` after the matching
-    /// `onClients(name, false)`. AOSP `ServiceInfo::clients`
-    /// ([LazyServiceRegistrar.cpp:53](https://cs.android.com/android/platform/superproject/+/android-16.0.0_r4:frameworks/native/libs/binder/LazyServiceRegistrar.cpp;l=53)).
+    /// Last `onClients(name, _)` value; AOSP `ServiceInfo::clients` (LazyServiceRegistrar.cpp:53).
     has_clients: bool,
-    /// Registered with the service manager. `try_unregister` flips this to
-    /// `false` after a successful `tryUnregisterService`; `re_register`
-    /// flips it back.
+    /// Cleared by a successful `tryUnregisterService`, set again by `re_register`.
     registered: bool,
 }
 
-/// AOSP's `std::map` is ordered, and unregister order is observable — a
-/// `BTreeMap` keeps it deterministic.
+/// `BTreeMap`: unregister order is observable and AOSP's `std::map` is ordered.
 struct Inner {
     services: BTreeMap<String, RegisteredService>,
     /// AOSP `mNumConnectedServices`: how many services have clients.
     num_connected_services: usize,
-    /// AOSP `mPreviousHasClients`: the last value handed to the active
-    /// services callback, so it only fires on a change.
+    /// AOSP `mPreviousHasClients`: last value given to the active-services callback.
     previous_has_clients: Option<bool>,
     active_services_callback: Option<ActiveServicesCallback>,
-    /// The `IClientCallback` this registrar registered with the service
-    /// manager. Held for the lifetime of the registrar: the service manager
-    /// keeps only a proxy, so dropping this would kill every `onClients`.
+    /// Kept for the registrar's life: the SM holds only a proxy, so dropping it ends `onClients`.
     callback: Option<Strong<dyn IClientCallback>>,
 }
 
@@ -189,7 +177,7 @@ impl Inner {
     }
 }
 
-/// Registrar state; the `IClientCallback` bridge holds it as `Weak` (AOSP fuses both into one `sp<>`).
+/// Registrar state; the `IClientCallback` bridge holds it `Weak` (AOSP: one `sp<>` for both).
 struct Shared {
     /// Serializes SM round trips (AOSP `mMutex`); taken before `inner`, never while holding it.
     ops: Mutex<()>,
@@ -201,8 +189,7 @@ struct Shared {
     exited: AtomicBool,
 }
 
-/// The `IClientCallback` the registrar registers on a service's behalf.
-/// AOSP dispatches `onClients` on `ClientCounterCallbackImpl` itself.
+/// The registrar's `IClientCallback`; AOSP dispatches on `ClientCounterCallbackImpl` itself.
 struct ClientCounterCallback {
     shared: Weak<Shared>,
 }
@@ -211,8 +198,7 @@ impl Interface for ClientCounterCallback {}
 
 impl IClientCallback for ClientCounterCallback {
     fn onClients(&self, registered: &SIBinder, has_clients: bool) -> crate::BinderResult<()> {
-        // Not an error: the service manager may still hold the proxy
-        // after the last `LazyServiceRegistrar` handle is dropped.
+        // Not an error: the service manager may outlive the last `LazyServiceRegistrar` handle.
         if let Some(shared) = self.shared.upgrade() {
             shared.on_clients_binder(registered, has_clients);
         }
@@ -225,8 +211,7 @@ impl Shared {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// AOSP `assertRegisteredService` — the wire hands `onClients` a binder,
-    /// not a name.
+    /// AOSP `assertRegisteredService`: the wire hands `onClients` a binder, not a name.
     fn name_of(&self, binder: &SIBinder) -> Option<String> {
         self.lock()
             .services
@@ -253,8 +238,7 @@ impl Shared {
                 return false;
             };
             if entry.has_clients == has_clients {
-                // AOSP `LOG_ALWAYS_FATAL`s here; a re-registered name can
-                // legitimately repeat the state it carried forward.
+                // AOSP aborts; a re-registered name can legitimately repeat its carried state.
                 log::debug!("{name}: onClients({has_clients}) matched what we already believed");
             }
             entry.has_clients = has_clients;
@@ -275,13 +259,10 @@ impl Shared {
             log::info!("Shutdown prevented by force_persist override flag.");
             return;
         }
-        // Waits out a `register_service` or another thread's shutdown. AOSP
-        // is already holding the equivalent when it gets here.
+        // Waits out a `register_service` or another shutdown; AOSP already holds this here.
         let _ops = self.ops.lock().unwrap_or_else(|e| e.into_inner());
 
-        // AOSP `mPreviousHasClients`: fire only when the answer changes.
-        // Cloned out so the callback runs without the state lock — it is
-        // documented to call back into the registrar.
+        // Fire on change only (`mPreviousHasClients`), outside `inner`; `ops` stays held (rustdoc).
         let to_fire = {
             let mut inner = self.lock();
             let has_clients = inner.num_connected_services != 0;
@@ -300,8 +281,7 @@ impl Shared {
             None => false,
         };
 
-        // Re-read: the lock was released for the callback. Advisory — the
-        // service manager refuses an unregister while clients hold it.
+        // Advisory re-read: the service manager refuses an unregister while clients hold it.
         if !handled && self.lock().num_connected_services == 0 {
             self.try_shutdown();
         }
@@ -346,8 +326,7 @@ impl Shared {
                 .collect()
         };
 
-        // `try_unregister` is public, and a registrar with nothing in it
-        // must not report "every service is down, safe to exit".
+        // An empty registrar must not report "every service is down, safe to exit".
         if candidates.is_empty() {
             return false;
         }
@@ -368,16 +347,15 @@ impl Shared {
         true
     }
 
-    /// Put the entry back the way it was, for a `register_service` that
-    /// published it and then could not complete.
+    /// Undoes the entry of a `register_service` that published it and then failed.
     fn restore(&self, name: &str, previous: Option<RegisteredService>) {
         let mut inner = self.lock();
         match previous {
             Some(mut entry) => {
-                // Keep what changed under us: the service manager repeats neither `onClients` nor an unregister.
+                // Keep what changed under us: the service manager repeats neither event.
                 if let Some(current) = inner.services.get(name) {
                     entry.has_clients = current.has_clients;
-                    // Only a `false` written under us is real; `true` is this call's own optimistic publish.
+                    // Only a `false` written under us is real; `true` is our optimistic publish.
                     if !current.registered {
                         entry.registered = false;
                     }
@@ -389,9 +367,7 @@ impl Shared {
         inner.update_cache_client_count();
     }
 
-    /// AOSP `reRegisterLocked`. Note what it does *not* do: `has_clients` is
-    /// left alone, because the service manager's view of the clients did not
-    /// change just because we failed to unregister.
+    /// AOSP `reRegisterLocked`; keeps `has_clients`: a failed unregister changes no SM client view.
     fn re_register(&self) {
         let pending: Vec<(String, SIBinder)> = {
             let inner = self.lock();
@@ -411,8 +387,7 @@ impl Shared {
                         entry.registered = true;
                     }
                 }
-                // AOSP `LOG_ALWAYS_FATAL`s. Left `registered = false` so a
-                // later `re_register` can try again.
+                // AOSP aborts; `registered` stays false so a later `re_register` retries.
                 Err(e) => log::error!("Bad state: could not re-register {name} ({e:?})"),
             }
         }
@@ -532,11 +507,10 @@ impl LazyServiceRegistrar {
         binder: impl Into<SIBinder>,
     ) -> std::result::Result<(), Status> {
         let binder = binder.into();
-        // Held for the whole call, as AOSP holds `mMutex` across
-        // `registerServiceLocked`.
+        // Held for the whole call, as AOSP holds `mMutex` across `registerServiceLocked`.
         let _ops = self.shared.ops.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Published before the round trips: `onClients` can land on a pool thread while they are outstanding.
+        // Published before the round trips: `onClients` can land on a pool thread meanwhile.
         let previous = {
             let mut inner = self.shared.lock();
             let previous = inner.services.get(name).cloned();
@@ -552,8 +526,7 @@ impl LazyServiceRegistrar {
             inner.update_cache_client_count();
             previous
         };
-        // Everything below turns on whether the *name* is already tracked:
-        // the service manager keys client callbacks on the name alone.
+        // Keyed on the *name*: the service manager keys client callbacks on the name alone.
         let tracked = previous.is_some();
 
         log::info!(
@@ -571,7 +544,7 @@ impl LazyServiceRegistrar {
             return Err(e);
         }
 
-        // A second callback registration would double every later `onClients` (AOSP guards on `!reRegister`).
+        // A second callback would double every later `onClients` (AOSP guards on `!reRegister`).
         if !tracked {
             let callback = self.callback();
             if let Err(e) = self
@@ -695,6 +668,33 @@ impl Default for LazyServiceRegistrar {
 
 #[cfg(test)]
 mod tests {
+    //! The fakes follow the service manager's `onClients` contract: one notification per
+    //! change, never repeated. A client state the registrar drops, overwrites or invents is
+    //! therefore never corrected, and the process either never shuts down or shuts down under
+    //! a client. Several tests below pin exactly that.
+    //!
+    //! # Mutation gates
+    //!
+    //! - `re_registering_different_binder_does_not_register_a_second_callback`: the service
+    //!   manager keys callbacks by name and de-duplicates nothing (AOSP `ServiceManager.cpp`
+    //!   `mNameToClientCallback[name].push_back(cb)`), so a second registration makes it
+    //!   deliver every later `onClients` twice.
+    //! - `re_register_does_not_invent_clients`: AOSP `reRegisterLocked` touches only
+    //!   `registered`. Resetting `has_clients` either way hides the state the service manager
+    //!   just reported, so both directions are pinned: a service that came down without
+    //!   clients stays without, and one refused *because* it has clients keeps them.
+    //! - `a_notification_arriving_during_registration_is_not_dropped`: dropping the
+    //!   notification leaves the process believing it has clients with nothing to correct it.
+    //! - `one_client_callback_serves_the_whole_registrar`: the service manager holds only a
+    //!   proxy. A registrar that makes a fresh callback per registration, or lets the object
+    //!   drop, leaves it calling something that no longer routes: services registered, process
+    //!   never shutting down, nothing logged.
+    //! - `a_service_nobody_used_does_not_block_shutdown`: an unused name never draws an
+    //!   `onClients`, so assuming a client for it is never taken back.
+    //! - `registrations_do_not_overlap`: the round trips run outside the state lock, so without
+    //!   a lock of their own (`Shared::ops`) the loser's rollback can undo the winner's
+    //!   publish. AOSP gets this from `mMutex` spanning `registerServiceLocked`.
+
     use super::*;
     use crate::binder::Stability;
     use crate::native::Binder;
@@ -703,9 +703,7 @@ mod tests {
     use std::thread::JoinHandle;
     use std::time::Duration;
 
-    /// Spin until `f` holds. The notification a fake sends runs on its own
-    /// thread (`onClients` is `oneway`); the fake waits here for its
-    /// bookkeeping half to land, which needs no lock the round trip holds.
+    /// Waits for a fake's `onClients` thread; its bookkeeping takes no lock the round trip holds.
     fn spin_until(mut f: impl FnMut() -> bool) {
         for _ in 0..1_000_000 {
             if f() {
@@ -734,19 +732,13 @@ mod tests {
         Interface::as_binder(&b)
     }
 
-    /// A service manager that records what it was asked and can be told to
-    /// refuse an unregister — which is how a real one reports "this service
-    /// still has clients".
+    /// Records calls; refusing an unregister is how a real SM reports "still has clients".
     #[derive(Default)]
     struct FakeRegistry {
         calls: Mutex<Vec<String>>,
-        /// The binder each call carried, in order. The name alone would not
-        /// catch sending the service manager a stale binder — which is what
-        /// strands `onClients`, since the reply carries the binder back.
+        /// Binder per call: a stale binder strands `onClients`, which carries the binder back.
         binders: Mutex<Vec<(String, SIBinder)>>,
-        /// Every `IClientCallback` the registrar handed over. The service
-        /// manager keeps only a proxy, so the registrar has to keep the
-        /// object alive itself — one object for the whole registrar.
+        /// Every `IClientCallback` handed over; the registrar keeps one object alive itself.
         callbacks: Mutex<Vec<Strong<dyn IClientCallback>>>,
         refuse_unregister: Mutex<Vec<String>>,
     }
@@ -845,9 +837,7 @@ mod tests {
         assert_eq!(reg.registered_count(), 1);
     }
 
-    /// A re-register of the *same* binder is `addService` only — the service
-    /// manager still holds the client callback. AOSP `registerServiceLocked`
-    /// guards `registerClientCallback` on `!reRegister`.
+    /// Same binder: `addService` only, as AOSP guards `registerClientCallback` on `!reRegister`.
     #[test]
     fn re_registering_same_binder_does_not_re_register_the_callback() {
         let (reg, registry) = fixture();
@@ -857,10 +847,7 @@ mod tests {
         assert_eq!(registry.calls(), vec!["add:foo", "cb:foo", "add:foo"]);
     }
 
-    /// A re-register keeps the client state the service manager reported.
-    /// Overwriting it strands the process: the service manager says
-    /// `onClients` only on a change, so nothing would ever correct a
-    /// `has_clients` invented here.
+    /// `onClients` reports only changes, so an overwritten `has_clients` is never corrected.
     #[test]
     fn re_registering_same_binder_keeps_the_reported_client_state() {
         let (reg, _registry) = fixture();
@@ -878,18 +865,12 @@ mod tests {
             "a service with a client is not idle"
         );
 
-        // The proof it matters: the client leaving must still be the
-        // transition that shuts the process down.
+        // The client leaving must still be the transition that shuts the process down.
         reg.on_clients("keep", false);
         assert!(reg.shared.exited.load(Ordering::Acquire));
     }
 
-    /// A different binder under the same name replaces the entry but does
-    /// **not** register a second client callback. The service manager keys
-    /// callbacks by name and de-duplicates nothing (AOSP
-    /// `ServiceManager.cpp` `mNameToClientCallback[name].push_back(cb)`), so
-    /// a second registration would have it deliver every later `onClients`
-    /// twice.
+    /// The entry is replaced, the callback not re-registered; see `# Mutation gates`.
     #[test]
     fn re_registering_different_binder_does_not_register_a_second_callback() {
         let (reg, registry) = fixture();
@@ -903,9 +884,7 @@ mod tests {
             "the re-`addService` must carry the new binder"
         );
 
-        // The entry must still follow the new binder: `onClients` carries
-        // the binder the service manager currently holds, and it is looked
-        // up by identity.
+        // Follows the new binder: `onClients` carries the one the service manager holds now.
         let got = reg.binder_for("dup").unwrap();
         assert!(
             std::sync::Arc::ptr_eq(got.as_arc(), second.as_arc()),
@@ -918,8 +897,7 @@ mod tests {
         );
     }
 
-    /// The last client leaving takes the process down with it — AOSP
-    /// `tryShutdownLocked` → `exit(EXIT_SUCCESS)`.
+    /// AOSP `tryShutdownLocked` → `exit(EXIT_SUCCESS)`.
     #[test]
     fn last_client_leaving_unregisters_and_exits() {
         let (reg, registry) = fixture();
@@ -939,8 +917,7 @@ mod tests {
         assert_eq!(reg.registered_count(), 0);
     }
 
-    /// One service losing its clients while another still has them is not a
-    /// shutdown. AOSP gates on `mNumConnectedServices == 0`.
+    /// AOSP gates shutdown on `mNumConnectedServices == 0`.
     #[test]
     fn shutdown_waits_for_every_service() {
         let (reg, registry) = fixture();
@@ -962,8 +939,7 @@ mod tests {
         assert_eq!(reg.registered_count(), 0);
     }
 
-    /// A service manager that refuses an unregister — a client appeared
-    /// between the callback and the round trip — puts everything back.
+    /// A refusal (a client appeared before the round trip) puts every service back.
     #[test]
     fn a_refused_unregister_re_registers_and_does_not_exit() {
         let (reg, registry) = fixture();
@@ -979,8 +955,7 @@ mod tests {
         assert!(!reg.shared.exited.load(Ordering::Acquire), "no exit");
         assert_eq!(reg.registered_count(), 2, "`a` is put back");
         assert!(registry.calls().contains(&"unreg:a".to_string()));
-        // `a` came down, `b` refused, so `a` is re-added — and without a
-        // second client callback.
+        // `a` came down, `b` refused: `a` is re-added, without a second client callback.
         assert_eq!(
             registry.calls().iter().filter(|c| *c == "add:a").count(),
             2,
@@ -993,11 +968,7 @@ mod tests {
         );
     }
 
-    /// `re_register` leaves `has_clients` alone — AOSP `reRegisterLocked`
-    /// only touches `registered`. Resetting it either way would hide the
-    /// state the service manager just reported, so both directions are
-    /// pinned: a service that came down without clients stays without, and
-    /// one the service manager refused *because* it has clients keeps them.
+    /// `re_register` leaves `has_clients` alone in both directions; see `# Mutation gates`.
     #[test]
     fn re_register_does_not_invent_clients() {
         let (reg, _registry) = fixture();
@@ -1014,8 +985,7 @@ mod tests {
         assert_eq!(reg.registered_count(), 1);
         assert!(!reg.snapshot()[0].1, "has_clients stays false");
 
-        // The other direction: `b` is refused because it still has clients,
-        // so `a` comes down and goes back up while `b` keeps them.
+        // Reverse: `b` still has clients and is refused; `a` comes down and goes back up.
         let (reg, registry) = fixture();
         reg.register_service("a", fresh_binder()).unwrap();
         reg.register_service("b", fresh_binder()).unwrap();
@@ -1046,8 +1016,7 @@ mod tests {
         assert!(reg.snapshot()[0].2, "still registered");
     }
 
-    /// An active-services callback that returns `true` owns the decision;
-    /// the registrar does not unregister or exit behind its back.
+    /// A callback returning `true` owns the decision: no unregister, no exit.
     #[test]
     fn active_services_callback_can_take_over() {
         let (reg, registry) = fixture();
@@ -1069,8 +1038,7 @@ mod tests {
         assert_eq!(reg.registered_count(), 1);
     }
 
-    /// The callback fires only when the answer changes. AOSP
-    /// `mPreviousHasClients`.
+    /// AOSP `mPreviousHasClients`.
     #[test]
     fn active_services_callback_fires_only_on_change() {
         let (reg, _registry) = fixture();
@@ -1090,8 +1058,7 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), vec![false, true, false]);
     }
 
-    /// `on_clients` for an unknown service name returns `false` instead of
-    /// aborting. AOSP `LOG_ALWAYS_FATAL_IF`.
+    /// Returns `false` where AOSP `LOG_ALWAYS_FATAL_IF`s.
     #[test]
     fn on_clients_for_unknown_service_is_silent() {
         let (reg, _registry) = fixture();
@@ -1105,8 +1072,7 @@ mod tests {
         assert!(!reg.try_unregister());
     }
 
-    /// The `IClientCallback` bridge resolves the binder the wire gives it
-    /// back to the name it was registered under.
+    /// The bridge maps the binder the wire gives it back to its registered name.
     #[test]
     fn client_callback_routes_by_binder_identity() {
         let (reg, registry) = fixture();
@@ -1127,7 +1093,7 @@ mod tests {
         assert!(!reg.shared.exited.load(Ordering::Acquire));
     }
 
-    /// Dispatches `onClients` from inside `registerClientCallback` on its own thread, as the oneway wire does.
+    /// Sends `onClients` from `registerClientCallback` on its own thread, as the oneway wire does.
     #[derive(Default)]
     struct ReentrantRegistry {
         shared: Mutex<Option<Weak<Shared>>>,
@@ -1164,8 +1130,7 @@ mod tests {
             let (cb, b, want) = (callback.clone(), binder.clone(), self.report);
             *self.notifier.lock().unwrap() =
                 Some(std::thread::spawn(move || cb.onClients(&b, want).unwrap()));
-            // Return only once the notification has been recorded, so the
-            // assertion is about the round trip's own window.
+            // Return once the notification is recorded: the assertion targets this window.
             let name = name.to_string();
             spin_until(|| shared.lock().services.get(&name).map(|e| e.has_clients) == Some(want));
             Ok(())
@@ -1179,10 +1144,7 @@ mod tests {
         }
     }
 
-    /// An `onClients` that arrives *during* `register_service`'s own round
-    /// trips must still land. The service manager sends one per change and
-    /// never repeats it, so dropping this one strands the process: it would
-    /// go on believing it has clients with nothing left to correct it.
+    /// An `onClients` sent during `register_service`'s round trips lands; it is never resent.
     #[test]
     fn a_notification_arriving_during_registration_is_not_dropped() {
         let registry = Arc::new(ReentrantRegistry {
@@ -1201,12 +1163,7 @@ mod tests {
         );
     }
 
-    /// Every service gets the *same* `IClientCallback`, and the registrar
-    /// keeps it alive. The service manager holds only a proxy, so a
-    /// registrar that made a fresh callback per registration — or let the
-    /// object drop — would leave it calling something that no longer
-    /// routes: services registered, process never shutting down, nothing
-    /// logged.
+    /// All services share one `IClientCallback` the registrar keeps; see `# Mutation gates`.
     #[test]
     fn one_client_callback_serves_the_whole_registrar() {
         let (reg, registry) = fixture();
@@ -1231,10 +1188,7 @@ mod tests {
         assert!(reg.snapshot().iter().find(|s| s.0 == "a").unwrap().1);
     }
 
-    /// A service nobody ever looks up must not keep the process alive. The
-    /// service manager reports only changes, so an unused name never draws an
-    /// `onClients` at all — assuming a client for it would be an assumption
-    /// nothing ever takes back. AOSP `Service::clients` starts `false`.
+    /// An unused name draws no `onClients`; AOSP `Service::clients` starts `false`.
     #[test]
     fn a_service_nobody_used_does_not_block_shutdown() {
         let (reg, registry) = fixture();
@@ -1252,10 +1206,7 @@ mod tests {
         assert!(registry.calls().contains(&"unreg:never_used".to_string()));
     }
 
-    /// Two `register_service` calls never overlap. Their round trips are
-    /// outside the state lock, so without a lock of their own the loser's
-    /// rollback could undo the winner's publish. AOSP gets this from
-    /// `mMutex` spanning `registerServiceLocked`.
+    /// Two `register_service` calls never overlap; see `# Mutation gates`.
     #[test]
     fn registrations_do_not_overlap() {
         const CALLERS: usize = 4;
@@ -1270,8 +1221,7 @@ mod tests {
             fn add_lazy_service(&self, _: &str, _: &SIBinder) -> std::result::Result<(), Status> {
                 let depth = self.depth.fetch_add(1, Ordering::AcqRel) + 1;
                 self.max_depth.fetch_max(depth, Ordering::AcqRel);
-                // Hold the round trip open until every caller is in `register_service`, then give
-                // them time to enter: without the `ops` lock they would, and `max_depth` would show it.
+                // Hold the round trip open: without the `ops` lock `max_depth` would exceed 1.
                 spin_until(|| self.arrived.load(Ordering::Acquire) == CALLERS);
                 std::thread::sleep(Duration::from_millis(20));
                 self.max_depth
@@ -1317,9 +1267,7 @@ mod tests {
         );
     }
 
-    /// A `register_service` that fails after a notification landed must not
-    /// put the pre-call state back over it. The service manager reports only
-    /// changes, so the value it just sent would never come again.
+    /// A failed `register_service` keeps a notification that landed; the SM never resends it.
     #[test]
     fn a_failed_re_register_keeps_the_notification_that_raced_it() {
         #[derive(Default)]
@@ -1341,8 +1289,7 @@ mod tests {
                 let Some(shared) = shared.as_ref().and_then(Weak::upgrade) else {
                     return Ok(());
                 };
-                // The wire delivers this on a pool thread while the round
-                // trip is still open.
+                // The wire delivers this on a pool thread while the round trip is open.
                 let (s2, n2) = (shared.clone(), name.to_string());
                 *self.notifier.lock().unwrap() =
                     Some(std::thread::spawn(move || s2.on_clients(&n2, false)));
@@ -1427,8 +1374,7 @@ mod tests {
         assert_eq!(reg.registered_count(), 0);
     }
 
-    /// Clones share one set of registrations, as AOSP's handle shares its
-    /// `ClientCounterCallback`.
+    /// Clones share registrations, as AOSP's handle shares its `ClientCounterCallback`.
     #[test]
     fn clones_share_state() {
         let (reg, _registry) = fixture();

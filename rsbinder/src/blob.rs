@@ -73,8 +73,7 @@ pub const BLOB_ASHMEM_IMMUTABLE: i32 = 1;
 /// see. AOSP `BLOB_ASHMEM_MUTABLE`.
 pub const BLOB_ASHMEM_MUTABLE: i32 = 2;
 
-/// The name the shared region is created under, so it is recognizable in
-/// `/proc/<pid>/fd`. AOSP uses the same string.
+/// Shared region name, recognizable in `/proc/<pid>/fd`; AOSP uses the same string.
 const BLOB_REGION_NAME: &str = "Parcel Blob";
 
 /// A blob read out of a parcel: the bytes, or the mapping they live in.
@@ -135,9 +134,7 @@ impl Blob {
         match self {
             Blob::Inline(bytes) => Ok(bytes.clone()),
             Blob::Shared { heap, len, .. } => {
-                // Only a hand-assembled `Blob::Shared` can get here with
-                // `len` past the mapping; make it a `BadValue` rather than
-                // an OOM abort on the allocation below.
+                // Hand-built `Blob::Shared` with `len` past the map: BadValue, not an OOM abort.
                 if *len > heap.size() {
                     return Err(StatusCode::BadValue);
                 }
@@ -209,20 +206,17 @@ impl Parcel {
     ///
     /// The reader follows the tag, so it needs to know none of this.
     pub fn write_blob(&mut self, data: &[u8], mutable_copy: bool) -> Result<()> {
-        // AOSP rejects a length that does not fit an int32 before
-        // anything else; the wire carries it as one.
+        // AOSP rejects a non-int32 length first; the wire carries it as one.
         let len = i32::try_from(data.len()).map_err(|_| StatusCode::BadValue)?;
 
         let shared = data.len() > BLOB_INPLACE_LIMIT
             && self.allow_fds()
             && crate::shared_memory::is_supported();
-        // Build and fill the region before writing anything, so a
-        // failure here leaves the parcel as it was.
+        // Fill the region before writing, so a failure leaves the parcel unchanged.
         let heap = if shared {
             let flags = if mutable_copy { 0 } else { FLAG_READ_ONLY };
             let heap = MemoryHeapBase::new_named(data.len(), flags, BLOB_REGION_NAME)?;
-            // A pre-5.1 kernel creates the region without the write seal;
-            // the immutable tag must not go out over a writable region.
+            // Pre-5.1 kernels lack the write seal; never tag a writable region immutable.
             let write_sealed = heap
                 .seals()
                 .is_some_and(|s| s & (SEAL_WRITE | SEAL_FUTURE_WRITE) != 0);
@@ -233,8 +227,7 @@ impl Parcel {
         let Some(heap) = heap else {
             self.write::<i32>(&len)?;
             self.write::<i32>(&BLOB_INPLACE)?;
-            // `writeInplace`: the bytes with no length of their own,
-            // padded to the parcel's 4-byte grain.
+            // `writeInplace`: raw bytes, no own length, padded to 4 bytes.
             return self.write_aligned_data(data);
         };
         heap.write_at(0, data)?;
@@ -246,8 +239,7 @@ impl Parcel {
         } else {
             BLOB_ASHMEM_IMMUTABLE
         })?;
-        // The bare fd object AOSP's `writeFileDescriptor` writes — no
-        // AIDL not-null marker, which `ParcelFileDescriptor` would add.
+        // Bare fd as AOSP `writeFileDescriptor`: no `ParcelFileDescriptor` not-null marker.
         file_descriptor::write_raw_fd(self, std::os::fd::AsFd::as_fd(fd.as_ref()))
     }
 
@@ -299,9 +291,7 @@ impl Parcel {
         }
         let mutable = tag == BLOB_ASHMEM_MUTABLE;
         let fd = file_descriptor::read_raw_fd(self)?;
-        // Stricter than AOSP's `ashmem_valid(fd)`, which does not read
-        // seals: a regular file the peer can `ftruncate` would `SIGBUS`
-        // this process on first touch.
+        // Stricter than AOSP `ashmem_valid`: a peer-truncatable file would SIGBUS on first touch.
         let shrink_sealed =
             crate::shared_memory::heap::fd_seals(&fd).is_some_and(|s| s & SEAL_SHRINK != 0);
         if !shrink_sealed
@@ -310,15 +300,12 @@ impl Parcel {
             log::error!("read_blob: the blob fd is neither a sealed memfd nor ashmem");
             return Err(StatusCode::BadValue);
         }
-        // A zero-length shared blob cannot be mapped (and no writer
-        // produces one: that side goes inline).
+        // A zero-length region cannot be mapped; writers send empty blobs inline.
         if len == 0 {
             log::error!("read_blob: a shared blob of zero length has no region to map");
             return Err(StatusCode::BadValue);
         }
-        // `from_fd` makes AOSP's own check — the region must be at least
-        // as long as the payload — and refuses a zero-length fd that is
-        // not ashmem, which would `SIGBUS` this process on first touch.
+        // `from_fd` checks region >= payload (as AOSP) and refuses a 0-length non-ashmem fd.
         let flags = if mutable { 0 } else { FLAG_READ_ONLY };
         let heap = MappedHeap::from_fd(fd, len, 0, flags)?;
         Ok(Blob::Shared {
@@ -337,9 +324,7 @@ mod tests {
         (0..len).map(|i| (i % 251) as u8).collect()
     }
 
-    /// Whether `write_blob` on a fresh kernel parcel can take the shared
-    /// form here, by its own conditions other than the size: a backing
-    /// store, and for an immutable blob a kernel that write-seals.
+    /// Size aside, can `write_blob` go shared here: a backing store, and write seals if immutable.
     fn shared_form_available(mutable_copy: bool) -> bool {
         if !crate::shared_memory::is_supported() {
             return false;
@@ -351,8 +336,7 @@ mod tests {
                 .is_some_and(|s| s & (SEAL_WRITE | SEAL_FUTURE_WRITE) != 0)
     }
 
-    /// Plan 10-2 AC-2.1: the boundary is the whole decision, so it is
-    /// the thing to pin — one byte either side of it.
+    /// Plan 10-2 AC-2.1: the boundary is the whole decision; pin one byte either side of it.
     #[test]
     fn the_inplace_limit_decides_the_form() {
         for (len, want_inline) in [
@@ -364,8 +348,7 @@ mod tests {
         ] {
             let data = pattern(len);
             let mut parcel = Parcel::new();
-            // A fresh parcel is kernel-marshalled, so fds are allowed
-            // and only the size decides.
+            // A fresh parcel is kernel-marshalled: fds allowed, only the size decides.
             assert!(parcel.allow_fds());
             parcel.write_blob(&data, false).expect("write_blob");
             parcel.set_data_position(0);
@@ -383,8 +366,7 @@ mod tests {
         }
     }
 
-    /// The tag says which form the reader gets, and a mutable region is
-    /// the one the reader may write.
+    /// The tag says which form the reader gets; only a mutable region is reader-writable.
     #[test]
     fn a_mutable_blob_is_writable_and_an_immutable_one_is_not() {
         let data = pattern(BLOB_INPLACE_LIMIT + 4096);
@@ -413,15 +395,13 @@ mod tests {
         parcel.set_data_position(0);
         let blob = parcel.read_blob().expect("read_blob");
         assert!(!blob.is_mutable());
-        // Plan 10-2 AC-2.3: the region is mapped read-only, so the
-        // reader cannot write it even by mistake.
+        // Plan 10-2 AC-2.3: the region is mapped read-only.
         let heap = blob.mapped().expect("a large blob is shared");
         assert!(
             heap.write_at(0, b"edit").is_err(),
             "an immutable blob must not accept a write"
         );
-        // That flag is rsbinder's own bookkeeping; the seal is what stops
-        // a reader that maps the received fd itself.
+        // The flag is rsbinder bookkeeping; the seal stops a reader that maps the fd itself.
         assert_ne!(
             heap.seals().expect("seals") & (SEAL_WRITE | SEAL_FUTURE_WRITE),
             0,
@@ -445,10 +425,7 @@ mod tests {
         assert_eq!(blob.to_vec().expect("to_vec"), Vec::<u8>::new());
     }
 
-    /// Plan 10-2 AC-2.5: a parcel that cannot carry an fd writes the
-    /// payload inline whatever its size — AOSP's `!mAllowFds` branch —
-    /// and the data-only parcel behind `to_bytes` is exactly such a
-    /// parcel, so a blob survives a round trip through plain bytes.
+    /// Plan 10-2 AC-2.5: an fd-less parcel (AOSP `!mAllowFds`, `to_bytes`) inlines any size.
     #[test]
     fn a_parcel_that_cannot_carry_an_fd_writes_the_payload_inline() {
         let data = pattern(1024 * 1024);
@@ -457,16 +434,14 @@ mod tests {
 
         parcel.write_blob(&data, true).expect("write_blob");
         let bytes = parcel.into_bytes().expect("into_bytes");
-        // 1 MB inline, plus the length and the tag. Nothing was handed
-        // to a file descriptor, so the bytes carry the whole payload.
+        // 1 MB inline plus length and tag: no fd, so the bytes carry the whole payload.
         assert!(bytes.len() >= data.len() + 8);
 
         let mut parcel = Parcel::from_slice(&bytes);
         let blob = parcel.read_blob().expect("read_blob");
         assert_eq!(blob.inline().map(<[u8]>::len), Some(data.len()));
         assert_eq!(blob.to_vec().expect("to_vec"), data);
-        // `mutable_copy` asked for a shared region and could not have
-        // one; an inline blob is never mutable, and says so.
+        // `mutable_copy` could not get a shared region; an inline blob is never mutable.
         assert!(!blob.is_mutable());
     }
 

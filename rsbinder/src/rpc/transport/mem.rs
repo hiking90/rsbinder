@@ -16,6 +16,14 @@
 //! platform (macOS drops its queue) would certify that assumption on the
 //! developer's machine and let it break on the device.
 //!
+//! Each end's shutdown sets a flag shared with the peer. Once the queue is
+//! empty, `recv_frame` reports `EndOfStream`. A blocked `recv_frame` notices
+//! the flag within one poll tick; a sender into its own `rx` would wake it
+//! sooner, but would also keep the channel alive past the peer's drop and
+//! hide `EndOfStream`. `mem_shutdown_models_a_linux_socket` pins this, so a
+//! teardown bug a real transport would surface on the device is visible to
+//! every hermetic test.
+//!
 //! There is no global state — every test makes its own independent
 //! pair, so the RPC test suite is parallel-safe by construction.
 
@@ -38,17 +46,9 @@ pub struct MemTransport {
     peer: PeerIdentity,
     desc: &'static str,
     timeout: Mutex<Option<std::time::Duration>>,
-    /// Set by this end's [`shutdown`](RpcTransport::shutdown); shared with
-    /// the peer as its `peer_closed`. Frames already queued are still
-    /// delivered (the Linux model — see the module doc); once the queue is
-    /// empty `recv_frame` reports `EndOfStream`, and sends on either side
-    /// fail. A blocked `recv_frame` notices within one poll tick — a
-    /// sender into our own `rx` would have been a cleaner wake-up, but it
-    /// would also keep the channel alive past the peer's drop and hide
-    /// `EndOfStream`.
+    /// Set by this end's `shutdown`, shared as the peer's `peer_closed`; see module doc.
     closed: Arc<AtomicBool>,
-    /// The peer's `closed`: its shutdown is our end of stream and our
-    /// `EPIPE`, as a socket peer's `shutdown(Both)` would be.
+    /// The peer's `closed`: our end of stream and `EPIPE`, as a socket peer's `shutdown(Both)`.
     peer_closed: Arc<AtomicBool>,
 }
 
@@ -89,9 +89,7 @@ impl MemTransport {
     }
 }
 
-/// `PeerIdentity::Local` for the current process. Used by `mem` (and as
-/// the non-Linux best-effort for `unix`, where `SO_PEERCRED` is
-/// unavailable but a same-host/socketpair peer shares this identity).
+/// `PeerIdentity::Local` for this process: `mem`'s peer and `unix`'s BSD no-remote-peer answer.
 pub(crate) fn self_identity() -> PeerIdentity {
     PeerIdentity::Local {
         uid: rustix::process::getuid().as_raw(),
@@ -101,24 +99,18 @@ pub(crate) fn self_identity() -> PeerIdentity {
 
 impl RpcTransport for MemTransport {
     fn send_frame(&self, buf: &[u8]) -> RpcResult<()> {
-        // Same cap the stream backends enforce in `write_frame`, so the
-        // hermetic test transport cannot pass a frame every real one
-        // rejects.
+        // Same cap as `write_frame`, so this test transport passes no frame a real one rejects.
         if buf.len() > super::MAX_FRAME_LEN {
             return Err(RpcError::FrameTooLarge {
                 declared: buf.len(),
                 max: super::MAX_FRAME_LEN,
             });
         }
-        // A shutdown on either end makes a later send fail, as the socket
-        // backends' `shutdown(Both)` does on both sides (EPIPE) — callers
-        // rely on that to retire a slot whose handshake failed. Without it
-        // the frame would queue on an unbounded channel nobody reads.
+        // Fail after either end's shutdown, as EPIPE on a socket: failed-handshake retire needs it.
         if self.either_end_shut() {
             return Err(RpcError::EndOfStream);
         }
-        // A channel send only fails once the peer's receiver is
-        // dropped — i.e. the peer is gone. Lock-free (`Sender: Sync`).
+        // Fails only once the peer's receiver is dropped. Lock-free (`Sender: Sync`).
         self.tx
             .send(buf.to_vec())
             .map_err(|_| RpcError::EndOfStream)
@@ -127,14 +119,9 @@ impl RpcTransport for MemTransport {
     fn recv_frame(&self) -> RpcResult<Vec<u8>> {
         let timeout = *self.timeout.lock().expect("mem timeout poisoned");
         let rx = self.rx.lock().expect("mem rx poisoned");
-        // Block in short `recv_timeout` ticks so a local `shutdown` is
-        // noticed; a frame or the peer's drop (every sender gone) returns
-        // at once, never spinning.
+        // Short ticks so a local `shutdown` is noticed; a frame or peer drop returns at once.
         const TICK: std::time::Duration = std::time::Duration::from_millis(20);
-        // `checked_add`, not `+`: `Instant + Duration` panics on overflow,
-        // and `timeout` is caller-supplied. A duration that cannot be added
-        // to `now` is effectively infinite, which is what `None` already
-        // means here.
+        // `Instant + Duration` panics on overflow; an unaddable timeout means `None` (infinite).
         let deadline = timeout.and_then(|d| std::time::Instant::now().checked_add(d));
         loop {
             let wait = match deadline {
@@ -148,8 +135,7 @@ impl RpcTransport for MemTransport {
                 None => TICK,
             };
             match rx.recv_timeout(wait) {
-                // Queued before a shutdown on either end: still delivered,
-                // as a Linux socket delivers what it has queued.
+                // Queued before a shutdown: still delivered, as a Linux socket delivers it.
                 Ok(frame) => return Ok(frame),
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     return Err(RpcError::EndOfStream);
@@ -197,11 +183,7 @@ mod tests {
         }
     }
 
-    /// `RpcTransport::shutdown` on a Linux socket: what either side had
-    /// queued is still delivered, then the end of stream; later sends on
-    /// either side fail. `mem` models exactly that (module doc), so a
-    /// teardown bug that a real transport would surface on the device is
-    /// visible to every hermetic test.
+    /// `shutdown` behaves as on a Linux socket (module doc): queued frames, then end of stream.
     #[test]
     fn mem_shutdown_models_a_linux_socket() {
         let (a, b) = MemTransport::pair();
@@ -219,8 +201,7 @@ mod tests {
             matches!(a.send_frame(b"after"), Err(RpcError::EndOfStream)),
             "a send after shutdown must fail, not queue"
         );
-        // The peer: drains what we sent, then sees our shutdown as its
-        // end of stream, and its sends fail (EPIPE on a socket).
+        // The peer drains what we sent, then sees end of stream; its sends fail (socket: EPIPE).
         assert_eq!(b.recv_frame().expect("peer drains"), b"a->b before");
         assert!(matches!(b.recv_frame(), Err(RpcError::EndOfStream)));
         assert!(matches!(b.send_frame(b"x"), Err(RpcError::EndOfStream)));
@@ -247,8 +228,7 @@ mod tests {
         assert!(matches!(a.send_frame(b"x"), Err(RpcError::EndOfStream)));
     }
 
-    /// Bidirectional simultaneous traffic must not deadlock or
-    /// lose/reorder frames. Two threads cross-fire 10k frames each.
+    /// Two threads cross-fire 10k frames each without deadlock, loss or reordering.
     #[test]
     fn mem_bidirectional_concurrent_no_deadlock() {
         let (a, b) = MemTransport::pair();
@@ -285,8 +265,7 @@ mod tests {
         b_send.join().unwrap();
     }
 
-    /// A read timeout too large to add to `Instant::now()` must read as
-    /// "no deadline", not panic — `set_read_timeout` is public API.
+    /// A read timeout too large to add to `Instant::now()` means no deadline, not a panic.
     #[test]
     fn unaddable_read_timeout_does_not_panic() {
         let (a, b) = MemTransport::pair();

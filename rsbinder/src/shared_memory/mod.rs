@@ -25,13 +25,23 @@
 //! `rpc::FileDescriptorTransportMode::Unix` (the `rpc` feature)
 //! negotiated on both ends. TCP / vsock / TLS sessions cannot carry
 //! fds at all; writing a heap fd into such a parcel fails with
-//! `StatusCode::BadType` exactly as a plain
+//! `StatusCode::FdsNotAllowed` exactly as a plain
 //! [`ParcelFileDescriptor`](crate::ParcelFileDescriptor) does.
 //!
 //! Targets without a backing store (anything other than Linux,
-//! Android, macOS) compile the whole trait surface but every
-//! constructor returns `Err(StatusCode::InvalidOperation)`; check
+//! Android, macOS) compile the whole trait surface, but every
+//! `MemoryHeapBase` constructor returns
+//! `Err(StatusCode::InvalidOperation)`; the receiver side
+//! (`MappedHeap::from_fd`) still maps a received fd. Check
 //! [`is_supported`](crate::shared_memory::is_supported) to branch at runtime.
+//!
+//! # Mixed-size atomics
+//!
+//! The crate-private `Region` view splits a mapped shared region into its `usize`-aligned
+//! words and the `< WORD` trailing bytes. Every access is word-sized on the word part (partial
+//! words go through a CAS) and byte-sized on the tail: Rust's memory model makes overlapping
+//! atomic accesses of *different* sizes a data race when one is a write, so a byte-granular
+//! fast path would race the word path of another thread writing the same window.
 
 pub mod dealer;
 pub mod heap;
@@ -58,18 +68,14 @@ pub use wire::{
 /// ([IMemory.h:37-39](https://cs.android.com/android/platform/superproject/+/android-16.0.0_r4:frameworks/native/libs/binder/include/binder/IMemory.h;l=37)).
 /// Receivers map `PROT_READ` only. On Linux/Android the owner also
 /// applies `F_SEAL_FUTURE_WRITE` so the kernel refuses a writable
-/// mapping from a peer that ignores the flag; the owner's own mapping,
-/// created before the seal, stays writable.
+/// mapping from a peer that ignores the flag (Linux 5.1+; an older
+/// kernel lacks that seal, which `seals()` reports); the owner's own
+/// mapping, created before the seal, stays writable.
 pub const FLAG_READ_ONLY: u32 = 0x0000_0001;
 
 pub(crate) const WORD: usize = std::mem::size_of::<usize>();
 
-/// A mapped shared region, split into its `usize`-aligned words and the
-/// `< WORD` trailing bytes. Every access is word-sized on the word part
-/// (partial words go through a CAS) and byte-sized on the tail: Rust's
-/// memory model makes overlapping atomic accesses of *different* sizes a
-/// data race when one is a write, so a byte-granular fast path here would
-/// race the word path of another thread writing the same window.
+/// Mapped region as `usize` words + a `< WORD` tail; see module doc "Mixed-size atomics".
 #[derive(Clone, Copy)]
 pub(crate) struct Region<'a> {
     words: &'a [AtomicUsize],
@@ -113,8 +119,7 @@ impl<'a> Region<'a> {
         Ok(())
     }
 
-    /// Copy `src` in at `off` (relaxed stores; a partial word is merged
-    /// with a CAS so the neighbouring bytes of another writer survive).
+    /// Copy `src` in at `off` (relaxed stores; a partial word is CAS-merged to keep neighbours).
     pub(crate) fn store(&self, off: usize, src: &[u8]) -> Result<()> {
         self.check(off, src.len())?;
         let word_bytes = self.words.len() * WORD;
@@ -237,18 +242,17 @@ impl std::fmt::Debug for SharedBytes<'_> {
 /// Server-side representation of a heap. AOSP `IMemoryHeap` is keyed by
 /// the heap fd; this trait deliberately exposes the fd as a borrowed
 /// raw fd (`i32`) rather than an owned [`std::os::fd::OwnedFd`] so the
-/// transaction marshalling can dup the fd into a
-/// [`crate::ParcelFileDescriptor`] without taking ownership away from
-/// the heap object.
+/// transaction marshalling can write it into the reply as a bare fd object
+/// (AOSP `writeFileDescriptor`, which dups) without taking ownership away
+/// from the heap object.
 ///
-/// All methods return `&` borrows (heap geometry is immutable for the
-/// lifetime of the heap); the size and offset are captured at heap
-/// construction time and never mutate. Mutation surface is intentionally
-/// absent — heap resize is not in AOSP `IMemoryHeap` either
+/// Heap geometry is immutable for the lifetime of the heap: the size and
+/// offset are captured at heap construction time and never mutate.
+/// Mutation surface is intentionally absent — heap resize is not in AOSP `IMemoryHeap` either
 /// ([IMemory.h:41-45](https://cs.android.com/android/platform/superproject/+/android-16.0.0_r4:frameworks/native/libs/binder/include/binder/IMemory.h;l=41)).
 pub trait IMemoryHeap: Send + Sync {
     /// AOSP `getHeapID()`. Returns the fd-as-i32 for parcel marshalling
-    /// (wrapped in `ParcelFileDescriptor` on the wire).
+    /// (written as a bare fd object on the wire, AOSP `writeFileDescriptor`).
     fn heap_id(&self) -> i32;
     /// AOSP `getSize()`. Total byte length of the heap.
     fn size(&self) -> usize;
@@ -270,8 +274,8 @@ pub trait IMemoryHeap: Send + Sync {
 /// pair so that one large heap can host many small allocations (the
 /// AOSP `MemoryDealer` pattern).
 pub trait IMemory: Send + Sync {
-    /// AOSP `getMemory(offset*, size*)`. Returns the backing heap plus
-    /// the in-heap offset and size for this slice. `&self` borrow keeps
+    /// AOSP `getMemory(offset*, size*)`: the backing heap; the window is
+    /// [`offset`](Self::offset)/[`size`](Self::size). `&self` borrow keeps
     /// the heap alive for the duration of the returned reference.
     fn memory(&self) -> &dyn IMemoryHeap;
     /// AOSP `offset()`. Offset within the backing heap.
@@ -285,8 +289,7 @@ pub trait IMemory: Send + Sync {
 mod tests {
     use super::*;
 
-    /// `FLAG_READ_ONLY` matches AOSP `IMemoryHeap::READ_ONLY = 0x01`;
-    /// the `MemoryHeapBase.h` flags likewise.
+    /// `FLAG_READ_ONLY` matches AOSP `IMemoryHeap::READ_ONLY = 0x01`, the rest `MemoryHeapBase.h`.
     #[test]
     fn flags_match_aosp_constants() {
         assert_eq!(FLAG_READ_ONLY, 0x0000_0001);
@@ -296,8 +299,7 @@ mod tests {
         assert_eq!(FLAG_MEMFD_ALLOW_SEALING, 0x0000_0800);
     }
 
-    /// Unsupported targets signal "not implemented" rather than
-    /// panicking, so caller code can opt out gracefully.
+    /// Unsupported targets return `InvalidOperation` instead of panicking, so callers can opt out.
     #[test]
     fn constructor_matches_is_supported() {
         let r = MemoryHeapBase::new(4096, FLAG_READ_ONLY);
@@ -308,8 +310,7 @@ mod tests {
         }
     }
 
-    /// The trait surface itself is object-safe — we can hold an
-    /// `&dyn IMemoryHeap`.
+    /// `IMemoryHeap` is object-safe: a `&dyn IMemoryHeap` compiles.
     #[test]
     fn imemoryheap_is_object_safe() {
         struct Stub;

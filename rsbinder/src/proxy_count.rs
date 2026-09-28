@@ -17,8 +17,43 @@
 //!
 //! Defaults match AOSP: high=2500, low=2000, warning=2250. The watermark
 //! state is process-global and shared between callbacks; `Limit`/`Warning`
-//! are debounced (a uid only fires `Limit` once until it drops below `low`,
-//! and `Warning` once until it drops below `warning`).
+//! are debounced: a uid fires each at most once until its count falls to
+//! `low` or below, which clears both (see "Per-uid tracking").
+//!
+//! # Per-uid tracking
+//!
+//! Enabling it (`COUNT_BY_UID_ENABLED`) does **not** retroactively populate
+//! the uid map; only proxies created after the flip are tracked.
+//! `on_proxy_create` returns whether it incremented the uid map, and the
+//! proxy records that as `counted_by_uid` so its `on_proxy_drop` decrements
+//! the map iff its create did. Re-reading the live flag at drop instead
+//! would, after tracking is toggled off with proxies live, skip the matching
+//! decrement and permanently inflate the uid's count (and latch its
+//! watermark). AOSP decides per object the same way (`BpBinder::mTrackedUid`).
+//!
+//! `on_proxy_drop` clears **both** debounce flags together once the count
+//! falls to/below `low`, as AOSP `BpBinder.cpp` resets
+//! `LIMIT_REACHED_MASK | WARNING_REACHED_MASK` jointly at `count <= low`.
+//! Clearing them at separate thresholds (warning at `< warning`, limit at
+//! `< low`) would let `Warning` re-fire on a `low <-> warning` oscillation,
+//! which AOSP never does.
+//!
+//! # Callback deferral
+//!
+//! `ProcessState::slow_path_p3` creates a `CallbackDeferGuard` **before**
+//! taking the `handle_to_proxy` write lock and drops it **after** that lock
+//! is released (declaration order). While a guard is live, `on_proxy_create`
+//! queues watermark callbacks in a thread-local instead of firing them, so a
+//! user callback that re-enters the proxy cache (`get_service`, creating a
+//! proxy, …) cannot deadlock against the lock the creating thread still
+//! holds. Nested guards keep deferring until the outermost one drops. AOSP
+//! defers via `postTask`; this is the equivalent.
+//!
+//! Callbacks run under `catch_unwind` (`fire_callback`), the same panic
+//! isolation as `ProxyHandle::dispatch_obituary_callbacks`: they run from
+//! `CallbackDeferGuard::drop`, where a panic escaping during an unwind aborts
+//! the process, and a panic in the first of several queued callbacks would
+//! otherwise discard the rest.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -37,16 +72,18 @@ pub const DEFAULT_WARNING_WATERMARK: u64 = 2250;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProxyCountEvent {
     /// Per-uid count reached the warning watermark (between `warning`
-    /// and `high`). Fired at most once per uid until the count drops
-    /// below `warning`. AOSP `sWarningCallback`.
+    /// and `high`). Fired at most once per uid until the count falls to
+    /// `low`, which re-arms it together with `Limit`. AOSP `sWarningCallback`.
     Warning { uid: u32, count: u64 },
     /// Per-uid count reached the high watermark. Fired at most once per
-    /// uid until the count drops below `low`. The rsbinder analogue of
+    /// uid until the count falls to `low`. The rsbinder analogue of
     /// AOSP `sLimitCallback`, with two deliberate simplifications: AOSP
     /// re-fires every further `high` proxies while latched
     /// (`lastLimitCallbackAt`), this fires once; and both edges here
     /// compare the count *after* the update (AOSP compares before), so
-    /// the hysteresis band sits one proxy higher.
+    /// `Warning`/`Limit` fire one proxy earlier than AOSP (at the
+    /// `warning`/`high`-th proxy; AOSP at the next one) and re-arm one
+    /// proxy earlier (when the count falls to `low`; AOSP at `low - 1`).
     Limit { uid: u32, count: u64 },
 }
 
@@ -62,18 +99,10 @@ pub enum ProxyCountEvent {
 /// queued events from being delivered.
 pub type ProxyCountCallback = Arc<dyn Fn(ProxyCountEvent) + Send + Sync>;
 
-/// Process-global proxy count. Lock-free hot path: every
-/// [`ProxyHandle`](crate::proxy::ProxyHandle) constructor `fetch_add`s
-/// this and its `Drop` `fetch_sub`s. `Relaxed` ordering is sufficient
-/// because the count is a monotonic-ish statistic, not a synchronization
-/// primitive — readers see *some* recent value, not necessarily the
-/// per-thread latest.
+/// Process-global proxy count; `Relaxed` suffices, it is a statistic, not a sync primitive.
 static PROXY_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// Opt-in flag for per-uid tracking. Default `false` — the AOSP fast
-/// path is "tracking off, lock not touched, only the global counter
-/// moves." Setting this `true` does **not** retroactively populate the
-/// uid map; only proxies created after the flip are tracked.
+/// Per-uid tracking opt-in (default off); not retroactive, see module doc "Per-uid tracking".
 static COUNT_BY_UID_ENABLED: AtomicBool = AtomicBool::new(false);
 
 struct State {
@@ -87,11 +116,9 @@ struct State {
 #[derive(Default)]
 struct UidEntry {
     count: u64,
-    /// `Warning` already fired since the last time `count` dropped
-    /// below `warning`. Debounces repeat callbacks.
+    /// `Warning` fired since `count` last fell to `low` (debounce; module doc "Per-uid tracking").
     warning_fired: bool,
-    /// `Limit` already fired since the last time `count` dropped
-    /// below `low`. Debounces.
+    /// `Limit` fired since `count` last fell to `low` (debounce).
     limit_fired: bool,
 }
 
@@ -106,25 +133,14 @@ static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
 });
 
 thread_local! {
-    /// While set, `on_proxy_create` queues watermark callbacks instead of
-    /// firing them inline. Set by [`CallbackDeferGuard`] around the
-    /// proxy-cache create path so the callback never runs with the caller's
-    /// `ProcessState::handle_to_proxy` write lock still held.
+    /// Set by [`CallbackDeferGuard`]: `on_proxy_create` queues callbacks instead of firing.
     static CALLBACK_DEFER: Cell<bool> = const { Cell::new(false) };
-    /// Watermark callbacks queued while [`CALLBACK_DEFER`] was set, fired by
-    /// the outermost [`CallbackDeferGuard`] on drop (after the cache lock is
-    /// released).
+    /// Callbacks queued under [`CALLBACK_DEFER`]; the outermost guard's drop fires them.
     static PENDING_CALLBACKS: RefCell<Vec<(ProxyCountCallback, ProxyCountEvent)>> =
         const { RefCell::new(Vec::new()) };
 }
 
-/// RAII guard that defers watermark callbacks on the current thread until it
-/// drops. `ProcessState::slow_path_p3` creates it **before** taking the
-/// `handle_to_proxy` write lock and drops it **after** that lock is released
-/// (declaration order), so a user callback that re-enters the proxy cache
-/// (`get_service`, creating a proxy, …) cannot deadlock against the lock the
-/// creating thread still holds. Nested guards keep deferring until the
-/// outermost one drops. AOSP defers via `postTask`; this is the equivalent.
+/// Defers this thread's watermark callbacks until drop; see module doc "Callback deferral".
 pub(crate) struct CallbackDeferGuard {
     was_deferring: bool,
 }
@@ -143,9 +159,7 @@ impl Drop for CallbackDeferGuard {
             // A nested guard is still active — keep deferring.
             return;
         }
-        // Outermost guard: fire everything queued while deferral was active.
-        // `CALLBACK_DEFER` is already cleared, so a callback that creates a
-        // proxy fires its own watermark inline (the cache lock is released).
+        // Deferral is cleared first, so a callback that creates a proxy fires its own inline.
         let pending: Vec<_> = PENDING_CALLBACKS.with(|p| std::mem::take(&mut *p.borrow_mut()));
         for (cb, event) in pending {
             fire_callback(&cb, event);
@@ -153,11 +167,7 @@ impl Drop for CallbackDeferGuard {
     }
 }
 
-/// Invoke a user [`ProxyCountCallback`] with the same panic isolation the
-/// death-recipient path uses (`ProxyHandle::dispatch_obituary_callbacks`).
-/// This runs from `CallbackDeferGuard::drop` — a panic escaping a `Drop`
-/// during an unwind aborts the process, and a panic in the first of
-/// several queued callbacks would silently discard the rest.
+/// Run a user callback under `catch_unwind` (runs in `Drop`); module doc "Callback deferral".
 fn fire_callback(cb: &ProxyCountCallback, event: ProxyCountEvent) {
     if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(event))) {
         let msg = payload
@@ -171,10 +181,9 @@ fn fire_callback(cb: &ProxyCountCallback, event: ProxyCountEvent) {
 
 /// Snapshot of the process-global proxy count.
 ///
-/// Includes every live [`ProxyHandle`](crate::proxy::ProxyHandle) —
-/// kernel and (with `rpc` feature) RPC are NOT counted here unless they
-/// also route through `ProxyHandle`, matching the AOSP "BpBinder kernel
-/// proxies only" surface.
+/// Counts every live kernel [`ProxyHandle`](crate::proxy::ProxyHandle);
+/// RPC proxies (the `rpc` feature) are not counted, matching the AOSP
+/// "BpBinder kernel proxies only" surface.
 pub fn get_binder_proxy_count() -> u64 {
     PROXY_COUNT.load(Ordering::Relaxed)
 }
@@ -218,8 +227,12 @@ pub fn set_binder_proxy_count_watermarks(high: u64, low: u64, warning: u64) {
 /// Replaces any prior callback. AOSP
 /// `BpBinder::setBinderProxyCountEventCallback`.
 pub fn set_binder_proxy_count_event_callback(callback: Option<ProxyCountCallback>) {
-    let mut state = STATE.lock().expect("proxy_count state poisoned");
-    state.callback = callback;
+    let old = {
+        let mut state = STATE.lock().expect("proxy_count state poisoned");
+        std::mem::replace(&mut state.callback, callback)
+    };
+    // A proxy captured by the old callback re-enters `STATE` from its Drop.
+    drop(old);
 }
 
 /// Enable or disable per-uid proxy tracking. When `enabled` is `false`,
@@ -244,18 +257,7 @@ pub fn clear_count_by_uid() {
     state.per_uid.clear();
 }
 
-/// Internal hook called once per `ProxyHandle::new_acquired`. Bumps
-/// the global counter (lock-free) and, if per-uid tracking is enabled,
-/// updates the uid map under the state mutex.
-///
-/// Returns `true` iff the per-uid map was incremented (tracking was
-/// enabled at create time). The caller records this on the proxy so its
-/// `Drop` decrements the per-uid map iff this create did — binding the
-/// decision per-object (AOSP `mTrackedUid`) rather than re-reading the
-/// global flag, which would desync if tracking is toggled mid-flight.
-///
-/// Watermark callbacks fire after the mutex is dropped to support
-/// reentrant callback bodies (AOSP `postTask` discipline).
+/// `ProxyHandle::new_acquired` hook; `true` iff counted per uid (module doc "Per-uid tracking").
 pub(crate) fn on_proxy_create(uid: u32) -> bool {
     PROXY_COUNT.fetch_add(1, Ordering::Relaxed);
     if !COUNT_BY_UID_ENABLED.load(Ordering::Relaxed) {
@@ -287,9 +289,7 @@ pub(crate) fn on_proxy_create(uid: u32) -> bool {
         }
     };
     if let Some((cb, event)) = event {
-        // Defer to after the proxy-cache lock is released when a
-        // `CallbackDeferGuard` is active on this thread (the create path);
-        // otherwise fire inline (already outside the internal `STATE` mutex).
+        // Defer while a `CallbackDeferGuard` (proxy-cache lock held) is active on this thread.
         if CALLBACK_DEFER.with(|d| d.get()) {
             PENDING_CALLBACKS.with(|p| p.borrow_mut().push((cb, event)));
         } else {
@@ -299,23 +299,7 @@ pub(crate) fn on_proxy_create(uid: u32) -> bool {
     true
 }
 
-/// Internal hook called from `ProxyHandle::drop`. Decrements the
-/// global counter and, iff this proxy's `on_proxy_create` incremented the
-/// per-uid map (`counted_by_uid`), decrements that entry and clears **both**
-/// watermark debounce flags together once the count falls to/below `low`.
-/// Symmetric with [`on_proxy_create`].
-///
-/// `counted_by_uid` is captured per-proxy at create time rather than
-/// re-reading `COUNT_BY_UID_ENABLED` here: if tracking is toggled off while a
-/// proxy is live, re-reading the live flag would skip the matching decrement
-/// and permanently inflate the uid's count (and latch its watermark). AOSP
-/// avoids this by deciding per-object via `BpBinder::mTrackedUid`.
-///
-/// AOSP (`BpBinder.cpp`) resets `LIMIT_REACHED_MASK | WARNING_REACHED_MASK`
-/// jointly at `count <= low`. Clearing them at separate thresholds (warning
-/// at `< warning`, limit at `< low`) let the `Warning` callback re-fire on a
-/// `low <-> warning` oscillation, which AOSP never does — so we mirror the
-/// joint reset.
+/// `ProxyHandle::drop` hook; joint debounce reset at `<= low` (module doc "Per-uid tracking").
 pub(crate) fn on_proxy_drop(uid: u32, counted_by_uid: bool) {
     PROXY_COUNT.fetch_sub(1, Ordering::Relaxed);
     if !counted_by_uid {
@@ -354,12 +338,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
 
-    // `PROXY_COUNT` and the per-uid map are process-global. Every test here is
-    // `#[serial_test::serial(binder)]` so it shares the `binder` serial group
-    // with the proxy-creating `process_state` tests: on a real binder those
-    // create `ProxyHandle`s that bump the global count in parallel, which would
-    // otherwise pollute these exact-count assertions (a local mutex serialized
-    // only the proxy_count tests against each other, not against the creators).
+    // Group `binder`, not a local mutex: `process_state` tests bump these global counts too.
 
     #[test]
     #[serial_test::serial(binder)]
@@ -423,8 +402,7 @@ mod tests {
         set_binder_proxy_count_event_callback(Some(Arc::new(move |event| {
             f.lock().unwrap().push(event);
         })));
-        // Climb to high=5: warning fires at 4, limit at 5. Above 5 → no
-        // re-fire while debounce sticks.
+        // Warning fires at 4, limit at 5; the debounce blocks any re-fire above 5.
         for _ in 0..7 {
             on_proxy_create(1000);
         }
@@ -461,10 +439,7 @@ mod tests {
         reset_for_test();
         enable_count_by_uid(true);
         set_binder_proxy_count_watermarks(2, 1, 2);
-        // Callback re-enters `get_binder_proxy_count_for_uid`, which
-        // takes the state mutex. If the callback fired *under* the
-        // outer lock this would deadlock; the test passing proves the
-        // chokepoint deferred the callback after lock drop.
+        // The callback takes the state mutex, so firing it under the lock would deadlock.
         set_binder_proxy_count_event_callback(Some(Arc::new(|_event| {
             let _snapshot = get_binder_proxy_count_for_uid(1000);
         })));
@@ -472,6 +447,33 @@ mod tests {
         on_proxy_create(1000); // should not deadlock
         on_proxy_drop(1000, true);
         on_proxy_drop(1000, true);
+    }
+
+    #[test]
+    #[serial_test::serial(binder)]
+    fn replaced_callback_drops_outside_state_lock() {
+        struct DropsProxy;
+        impl Drop for DropsProxy {
+            fn drop(&mut self) {
+                on_proxy_drop(1000, true);
+            }
+        }
+        reset_for_test();
+        enable_count_by_uid(true);
+        on_proxy_create(1000);
+        let held = DropsProxy;
+        set_binder_proxy_count_event_callback(Some(Arc::new(move |_event| {
+            let _held = &held;
+        })));
+        // Worker + timeout: a same-thread `STATE` re-lock would hang rather than fail the test.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            set_binder_proxy_count_event_callback(None); // must not re-lock `STATE`
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("replacing the callback deadlocked on `STATE`");
+        assert_eq!(get_binder_proxy_count_for_uid(1000), 0);
     }
 
     #[test]
@@ -484,8 +486,7 @@ mod tests {
         assert_eq!(get_binder_proxy_count(), 2);
         clear_count_by_uid();
         assert_eq!(get_binder_proxy_counts_by_uid(), vec![]);
-        // Global counter is unaffected — it tracks live `ProxyHandle`s,
-        // not the per-uid statistic.
+        // The global counter tracks live `ProxyHandle`s, not the per-uid statistic.
         assert_eq!(get_binder_proxy_count(), 2);
         on_proxy_drop(1000, true);
         on_proxy_drop(2000, true);
@@ -494,11 +495,7 @@ mod tests {
     #[test]
     #[serial_test::serial(binder)]
     fn per_uid_count_survives_tracking_toggled_off_while_live() {
-        // Regression: `on_proxy_drop` must mirror what the proxy's
-        // `on_proxy_create` did (captured per-object), not re-read the live
-        // `COUNT_BY_UID_ENABLED`. Toggling tracking off while a counted proxy
-        // is alive previously skipped its decrement and permanently inflated
-        // the uid's count.
+        // A counted proxy dropped after tracking is toggled off still decrements its uid.
         reset_for_test();
 
         enable_count_by_uid(true);
@@ -515,9 +512,7 @@ mod tests {
         let c3 = on_proxy_create(1000);
         assert!(!c3);
 
-        // Drop all three using each proxy's captured decision. The two
-        // enabled-era proxies decrement the per-uid map even though tracking
-        // is now off; the disabled-era proxy does not touch it.
+        // Each drop uses its proxy's captured decision, not the live flag.
         on_proxy_drop(1000, c3); // disabled-era: no per-uid effect
         on_proxy_drop(1000, c2);
         on_proxy_drop(1000, c1);

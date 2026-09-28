@@ -6,6 +6,198 @@
 //! This module provides the client-side infrastructure for communicating with
 //! remote binder services, including proxy objects that represent remote services
 //! and handle transaction routing and lifecycle management.
+//!
+//! # Death notifications
+//!
+//! `ProxyHandle` follows C++ `BpBinder` (`BpBinder.cpp`) for the recipient
+//! list and the obituary:
+//!
+//! - `link_to_death` and `unlink_to_death` take the `recipients` write lock
+//!   before reading `obituary_sent`, as `BpBinder::linkToDeath` /
+//!   `unlinkToDeath` read `mObitsSent` inside `AutoMutex _l(mLock)`. Checking
+//!   the flag outside the lock would leave a window where `send_obituary`
+//!   sets the flag and drains the recipients between the check and the lock,
+//!   so a recipient registered after death would never fire.
+//! - `BC_REQUEST_DEATH_NOTIFICATION` is queued only when the list goes from
+//!   empty to non-empty, and `BC_CLEAR_DEATH_NOTIFICATION` only when an unlink
+//!   takes it from non-empty to empty; unlinking from an already-empty list
+//!   (the `NameNotFound` path) queues nothing for a subscription that was
+//!   never requested. A failed parcel write of either command propagates, as
+//!   it signals `out_parcel` corruption (rare, e.g. OOM) rather than a driver
+//!   round-trip problem. The following `flush_commands` result is ignored,
+//!   as C++ ignores `flushCommands`; propagating it would skip
+//!   `recipients.push` and leave the kernel with a subscription that no
+//!   recipient can service.
+//! - `link_to_death` rejects a recipient whose strong count is already zero
+//!   (`BadValue`) — a common mistake when the caller drops the
+//!   `Arc<dyn DeathRecipient>` before passing the weak, which `send_obituary`
+//!   would otherwise skip silently. The check runs before
+//!   `request_death_notification`, so a dead weak never consumes a kernel
+//!   subscription. It does not cover a recipient dropped after
+//!   `link_to_death` returns; that is ordinary `Weak` semantics.
+//! - `unlink_to_death` removes only the first matching entry
+//!   (order-preserving, C++ `removeAt(i)`); a `retain` would drop every
+//!   duplicate registration and silently remove the user's remaining
+//!   subscription.
+//!
+//! `send_obituary` mirrors `BpBinder::sendObituary`:
+//!
+//! 1. `obituary_sent` is read and set only under the `recipients` lock, so a
+//!    racing `link_to_death` cannot push a recipient into the just-drained
+//!    list, where it would never fire.
+//! 2. The list is detached under the lock and the callbacks run after the lock
+//!    is released, so a callback may re-enter `link_to_death` /
+//!    `unlink_to_death` on the same proxy without deadlocking.
+//! 3. A second `send_obituary` (e.g. a spurious double `BR_DEAD_BINDER`) sees
+//!    `obituary_sent` and returns, as C++'s `if (mObitsSent) return;`.
+//! 4. `BC_CLEAR_DEATH_NOTIFICATION` is queued before the list is taken, best
+//!    effort: `BR_DEAD_BINDER` is delivered once, so a queueing failure must
+//!    not abort the obituary, or the recipients would never hear of the death
+//!    and `obituary_sent` would never latch.
+//! 5. The `Release` store of `obituary_sent` publishes the teardown to the
+//!    lock-free `Acquire` loads in `submit_transact` and `dump` (C++
+//!    `mAlive = 0; ... mObitsSent = 1`, published by the mutex unlock). Those
+//!    loads fast-fail a call that would only get `BR_DEAD_REPLY`, as
+//!    `BpBinder::transact` checks `mAlive` outside `mLock`.
+//! 6. Callbacks run before the flush, so a transient ioctl failure cannot
+//!    swallow the obituary; a panicking recipient is caught and logged so it
+//!    cannot stop the worker thread or starve the remaining recipients. If the
+//!    flush fails, the command stays in `out_parcel` and is sent by
+//!    `release_obituary_pin`'s phase-2 flush in the same `BR_DEAD_BINDER` arm,
+//!    which preserves kernel ordering.
+//!
+//! # Reference counts
+//!
+//! The `IBinder` ref-count methods are no-ops on a proxy under the cache-pin
+//! model. Kernel strong refs are owned one per `Arc<ProxyHandle>` (acquired
+//! in `new_acquired`, released in `Drop`); kernel weak refs are owned by the
+//! process-wide cache pin in `ProcessState::handle_to_proxy`. User-side
+//! `SIBinder` / `WIBinder` clone and drop is a plain `Arc::clone` /
+//! `sync::Weak::clone` of the trait-object `Arc`, with no kernel command.
+//!
+//! The pin's `BC_INCREFS` keeps `binder_ref(handle).weak >= 1`, so the
+//! `BC_RELEASE` in `Drop` is safe regardless of concurrent lookups: the kernel
+//! slot is alive on entry. Once the strong count returns to 0, only a fresh
+//! wire delivery (e.g. servicemanager `checkService`) re-establishes a
+//! transactable strong ref, through slow-path case (b); an in-process
+//! `WIBinder::upgrade()` returns `DeadObject` instead.
+//!
+//! # Operations without meaning on a proxy
+//!
+//! `IBinder::attempt_inc_strong` is meaningless on a proxy: a caller either
+//! already holds an `Arc<ProxyHandle>` or wants weak-to-strong promotion,
+//! which `Weak<I>::upgrade()` provides. The trait is public and `SIBinder`
+//! derefs to it, so external code can still reach it; the proxy logs a
+//! warning and honours the "succeed" contract instead of asserting.
+//!
+//! `set_extension` is a server-side operation (a service publishes its
+//! extension for clients to find via `get_extension`). A proxy cannot inform
+//! the remote, and caching the binder locally would pin an unrelated
+//! `Arc<dyn IBinder>` for the parent's lifetime, so it returns
+//! `InvalidOperation` like the default trait impl.
+//!
+//! # Proxy construction
+//!
+//! `ProxyHandle::new_acquired` allocates the `Arc<ProxyHandle>` and sends one
+//! `BC_ACQUIRE`. Its caller must hold the `ProcessState::handle_to_proxy`
+//! write lock and must already have issued and flushed the cache pin
+//! (`BC_INCREFS`) for the handle (sub-case (a)), or verified that an existing
+//! cache entry's pin is still active (sub-case (b)). The pin keeps the
+//! `binder_ref` slot alive, so this `BC_ACQUIRE` cannot race a concurrent
+//! `BC_RELEASE` into a freed slot.
+//!
+//! # Proxy identity
+//!
+//! A handle id is unique only while its `binder_ref` slot lives; the kernel
+//! may recycle it for a different node afterwards. `ProxyHandle` therefore
+//! stores the process-wide generation counter snapshotted when its cache
+//! entry was created, and `(handle, generation)` identifies the *node*; that
+//! pair is what `WIBinder` equality and `ProxyHandle`'s `PartialEq` compare.
+//!
+//! The generation is stored on the proxy rather than looked up from the proxy
+//! cache on demand, because the obituary retires the cache entry *before*
+//! dispatching `binder_died`. A cache lookup would answer `None` for exactly
+//! the binders a death recipient needs to match: a `downgrade` taken inside
+//! the recipient would fall back to the `Native` variant, which compares
+//! unequal to the `Proxy` weak the obituary carries and to every weak taken
+//! while the binder was alive. A distinct allocation naming the same
+//! `(handle, generation)` (what a case-(b) re-creation produces) compares
+//! equal. See `SIBinder::downgrade`.
+//!
+//! # Proxy counting
+//!
+//! `tracked_uid` is the uid `crate::proxy_count`'s per-uid map charges this
+//! proxy to, captured at construction via `thread_state::get_calling_uid`
+//! (AOSP `IPCThreadState::getCallingUid()`): the sender uid of the
+//! `BR_TRANSACTION` being handled, or this process's own `getuid()` when no
+//! incoming transaction is on the stack.
+//!
+//! `count_acquired` is `true` iff construction reached
+//! `proxy_count::on_proxy_create`, so `Drop` owes a matching `on_proxy_drop`.
+//! It stays `false` only for test-only construction (`synthetic_proxy`); a
+//! failed `inc_strong_handle` returns before any `ProxyHandle` exists.
+//! `counted_by_uid` is `true` iff `on_proxy_create` incremented the per-uid
+//! map (tracking was enabled at construction). `Drop` decides from this field,
+//! not from the live `COUNT_BY_UID_ENABLED` flag, so disabling tracking while
+//! the proxy lives cannot desync the count (AOSP `BpBinder::mTrackedUid`).
+//! Both are plain `bool`: written once before the `Arc<ProxyHandle>` is
+//! shared and read only in `Drop` (`&mut self`); the `Arc` refcount's
+//! release/acquire supplies the happens-before.
+//!
+//! # `obituary_sent` ordering
+//!
+//! `send_obituary` sets `obituary_sent` once to publish "this proxy is dead".
+//! Its three readers use three orderings, and all three are correct: changing
+//! the `Relaxed` loads to `Acquire` adds a fence with no effect.
+//!
+//! | Call site | Lock state | Ordering | Why |
+//! |---|---|---|---|
+//! | `submit_transact`, `dump` | none (lock-free) | `Acquire` | Pairs with the `Release` store in `send_obituary` that publishes the recipients teardown. |
+//! | `link_to_death` / `unlink_to_death` | inside `recipients` write lock | `Relaxed` | The `RwLock` acquire/release orders it against `send_obituary`'s store. |
+//! | `send_obituary` | inside `recipients` write lock | `Relaxed` | Same; the store's `Release` serves the lock-free readers only. |
+//!
+//! # Extension cache
+//!
+//! The cached extension is held strongly or weakly depending on whether its
+//! handle aliases the parent proxy's own handle:
+//!
+//! - **Strong (common case)**: the extension is a different binder. The parent
+//!   holds an `SIBinder`, so the extension's `Arc<ProxyHandle>` lives as long
+//!   as the parent. A weak cache would let that `Arc` drop and be re-created
+//!   on every `get_extension`, producing a stream of `BC_RELEASE` /
+//!   `BC_ACQUIRE` pairs against the kernel `binder_ref`. Under stress the
+//!   `binder-linux` driver can lose the `binder_ref → binder_node`
+//!   association across that churn and answer the next transaction with
+//!   `BR_FAILED_REPLY` ("cannot find target node").
+//! - **Weak (self-cycle)**: the extension's handle equals the parent's (a
+//!   remote naming itself as its own extension). A strong cache would form an
+//!   `Arc<ProxyHandle>` cycle through the parent's own state and the parent
+//!   would never drop. The user must hold an external strong ref to the parent
+//!   for the extension to be reachable; `weak.upgrade()` then reuses that
+//!   `Arc` without cache-pin re-creation, so this case has no
+//!   `BC_RELEASE` / `BC_ACQUIRE` churn either.
+//! - **Longer cycles are not broken.** Only the self-cycle is detected
+//!   (`handle == parent.handle`). A remote that reports A's extension as B and
+//!   B's as A leaves two strong caches pointing at each other once both
+//!   `get_extension`s have run; neither `ProxyHandle` drops and neither
+//!   `BC_RELEASE` is sent. Extension graphs are remote-controlled, so this is
+//!   a known limit of the cache.
+//!
+//! The cache is not invalidated when the extension (not the parent) dies:
+//! `get_extension` keeps returning the dead `SIBinder`, whose calls fast-fail
+//! with `DeadObject`, and a freshly re-published extension stays invisible
+//! until the parent is dropped and re-acquired, as in C++ `BpBinder`.
+//!
+//! # Recipient panics
+//!
+//! `dispatch_obituary_callbacks` wraps each `binder_died` in `catch_unwind`, so
+//! one panicking recipient neither stops the worker thread nor starves later
+//! recipients. `AssertUnwindSafe` asserts that rsbinder does not repair user
+//! state across the unwind: the snapshot is already detached from
+//! `recipients` and `obituary_sent` already published, so rsbinder's own
+//! invariants are unaffected; the panicking recipient's own state is not
+//! guaranteed. With `panic = "abort"` the guard does nothing (documented on
+//! `DeathRecipient`).
 
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
@@ -18,44 +210,7 @@ use crate::{
     binder::*, binder_object::*, error::*, parcel::*, parcelable::DeserializeOption, thread_state,
 };
 
-/// Cache state for the extension binder object on the proxy side.
-///
-/// The payload is split into two variants because the right ref-count
-/// discipline depends on whether the extension's handle aliases the
-/// parent proxy's own handle:
-///
-///   * **Common case (`CachedExtension::Strong`)** — the extension is a
-///     different binder. We hold an `SIBinder` so the extension's
-///     `Arc<ProxyHandle>` is rooted by the parent proxy's cache for as
-///     long as the parent itself lives. A weak cache here would let the
-///     extension's `Arc<ProxyHandle>` drop and be resurrected on every
-///     `get_extension` cycle, producing a stream of `BC_RELEASE`/
-///     `BC_ACQUIRE` pairs against the kernel binder_ref. Under stress,
-///     the `binder-linux` driver has been observed to lose the
-///     `binder_ref → binder_node` association across that thrash and
-///     return `BR_FAILED_REPLY` ("cannot find target node") on the very
-///     next transaction. Stable strong caching avoids the thrash
-///     entirely.
-///
-///   * **Self-cycle case (`CachedExtension::Weak`)** — the extension's
-///     handle equals the parent's own handle (a remote naming itself as
-///     its own extension). A strong cache here would form a
-///     self-referencing `Arc<ProxyHandle>` cycle through the parent's
-///     own state and prevent the parent from ever being dropped. We
-///     fall back to `WIBinder` for this case only; the user must hold
-///     an external strong ref to the parent for the extension to be
-///     reachable, and `weak.upgrade()` always succeeds via the
-///     fast-path Arc reuse without invoking cache-pin resurrection — so
-///     there is no `BC_RELEASE`/`BC_ACQUIRE` thrash in this case
-///     either.
-///
-///   * **Longer cycles are not broken.** Only the self-cycle is detected
-///     (`handle == parent.handle`). A remote that reports A's extension
-///     as B and B's as A leaves two strong caches pointing at each other
-///     once both `get_extension`s have run; neither `ProxyHandle` then
-///     drops, and neither `BC_RELEASE` is ever sent. Extension graphs are
-///     remote-controlled, so treat this as a known limit of the cache
-///     rather than a guarantee.
+/// Proxy-side extension cache; strong vs weak rule in module doc "Extension cache".
 enum ExtensionCache {
     /// Remote query has not been performed yet.
     NotQueried,
@@ -66,8 +221,7 @@ enum ExtensionCache {
 enum CachedExtension {
     /// Common case: extension proxy distinct from the parent proxy.
     Strong(SIBinder),
-    /// Degenerate case: extension's handle aliases the parent's own
-    /// handle. Stored as weak to avoid an `Arc<ProxyHandle>` self-cycle.
+    /// The extension's handle aliases the parent's; weak avoids an `Arc<ProxyHandle>` self-cycle.
     Weak(WIBinder),
 }
 
@@ -80,79 +234,24 @@ enum CachedExtension {
 /// type — see `process_state::strong_proxy_for_handle_stability`.
 pub struct ProxyHandle {
     handle: u32,
-    /// Which kernel binder_node this handle id currently names.
-    ///
-    /// A handle id is only unique while the `binder_ref` slot lives; the
-    /// kernel may recycle it for a different node afterwards. The
-    /// process-wide generation counter, snapshotted when this proxy's
-    /// cache entry was created, distinguishes the two — so
-    /// `(handle, generation)` is a stable identity for the *node*, which
-    /// is what `WIBinder` equality compares on.
-    ///
-    /// Stored here rather than looked up from the proxy cache on demand.
-    /// The cache entry is retired when the obituary is delivered, so a
-    /// cache lookup answers `None` for exactly the binders whose identity
-    /// a death recipient most needs to match — see
-    /// [`crate::SIBinder::downgrade`].
+    /// Snapshotted cache generation; `(handle, generation)` names the node. See module doc.
     generation: u64,
     descriptor: String,
-    /// Uid attributed to this proxy at construction
-    /// time, used by [`crate::proxy_count`]'s per-uid map. Captured
-    /// via [`thread_state::get_calling_uid`], which mirrors
-    /// AOSP `IPCThreadState::getCallingUid()`: the kernel-delivered
-    /// sender uid inside a `BR_TRANSACTION`, or this process's own
-    /// `getuid()` when no incoming transaction is on the stack.
+    /// Uid charged in `proxy_count`'s per-uid map; see module doc "Proxy counting".
     tracked_uid: u32,
-    /// True iff this proxy's construction reached the
-    /// matching `proxy_count::on_proxy_create` call, so [`Drop`] knows
-    /// it owes a matching `on_proxy_drop`. Set on the success path of
-    /// `new_acquired`; left `false` by test-only construction helpers
-    /// (`synthetic_proxy`) and by the construction-failure path where
-    /// `inc_strong_handle` errored before the counter was bumped.
-    ///
-    /// Plain `bool`, not atomic: written once at construction (before the
-    /// `Arc<ProxyHandle>` is shared) and read only in `Drop` (`&mut self`);
-    /// the `Arc` refcount's release/acquire supplies the happens-before.
+    /// `Drop` owes `on_proxy_drop` iff this is set; see module doc "Proxy counting".
     count_acquired: bool,
-    /// True iff `on_proxy_create` incremented the per-uid tracking map for
-    /// this proxy (i.e. tracking was enabled at construction). `Drop` uses
-    /// this — not the live `COUNT_BY_UID_ENABLED` flag — to decide whether to
-    /// decrement the per-uid map, so toggling tracking off while the proxy is
-    /// live cannot desync the count (AOSP `BpBinder::mTrackedUid`). Plain
-    /// `bool` for the same reason as `count_acquired`.
+    /// Per-uid map was incremented at construction; `Drop` reads this, not the live flag.
     counted_by_uid: bool,
     stability: Stability,
-    /// Set once when `send_obituary` runs to publish "this proxy is
-    /// dead" to all observers.
-    ///
-    /// Three call sites read this flag with three different orderings.
-    /// All three are correct — a future reader who sees `Relaxed` and
-    /// "fixes" it to `Acquire` would add a fence with no benefit.
-    ///
-    /// | Call site                       | Lock state             | Ordering | Why                                                                            |
-    /// |---------------------------------|------------------------|----------|--------------------------------------------------------------------------------|
-    /// | `submit_transact`, `dump`       | none (lock-free)       | `Acquire`| Pairs with `Release` store in `send_obituary` to publish recipients teardown.  |
-    /// | `link_to_death`/`unlink_to_death`| inside `recipients` write lock | `Relaxed`| RwLock acquire/release supplies happens-before against `send_obituary`'s store.|
-    /// | `send_obituary`                 | inside `recipients` write lock | `Relaxed`| Same — the store's `Release` is for the *lock-free* readers, not the lock-protected ones. |
-    ///
-    /// In short: the `Acquire`/`Release` pair on `obituary_sent`
-    /// itself is what protects the **lock-free** `submit_transact` /
-    /// `dump` fast-fail paths. The lock-protected paths get their
-    /// happens-before from the surrounding `RwLock` and so the
-    /// atomic load can be `Relaxed` there.
+    /// Lock-free readers `Acquire`, locked readers `Relaxed`; see the module doc table.
     obituary_sent: AtomicBool,
     recipients: RwLock<Vec<sync::Weak<dyn DeathRecipient>>>,
     extension: RwLock<ExtensionCache>,
 }
 
 impl ProxyHandle {
-    /// Allocate a fresh `Arc<ProxyHandle>` and acquire one kernel strong ref
-    /// (`BC_ACQUIRE`). Caller must hold the `ProcessState::handle_to_proxy`
-    /// write lock and must have already issued+flushed the cache pin
-    /// (`BC_INCREFS`) for `handle` (sub-case (a)) or verified that an
-    /// existing cache entry's pin is still active (sub-case (b)) — the pin
-    /// keeps the `binder_ref` slot alive, so this `BC_ACQUIRE` cannot race
-    /// against a concurrent `BC_RELEASE` to a freed slot.
+    /// Sends `BC_ACQUIRE`; caller holds the proxy-cache lock and a live pin. See module doc.
     pub(crate) fn new_acquired(
         handle: u32,
         generation: u64,
@@ -161,11 +260,7 @@ impl ProxyHandle {
     ) -> Result<Arc<Self>> {
         // Outside a transaction this is this process's own uid, as in AOSP.
         let tracked_uid = thread_state::get_calling_uid();
-        // Bump the kernel ref FIRST. If this errors, the `Arc` we build
-        // below is dropped immediately, and `Drop::drop` must NOT call
-        // `proxy_count::on_proxy_drop` — otherwise we'd post a drop for
-        // a proxy that never reached `on_proxy_create`. The
-        // `count_acquired` guard below is how `Drop` knows.
+        // Kernel ref before `on_proxy_create`, so a failure owes no `on_proxy_drop`.
         thread_state::inc_strong_handle(handle)?;
         let counted_by_uid = crate::proxy_count::on_proxy_create(tracked_uid);
         Ok(Arc::new(Self {
@@ -187,10 +282,7 @@ impl ProxyHandle {
         self.handle
     }
 
-    /// The proxy-cache generation this handle was resolved under. See the
-    /// field docs: `(handle, generation)` identifies the kernel node, and
-    /// stays valid for this `ProxyHandle`'s whole life — including after
-    /// the obituary retires the cache entry.
+    /// Generation this handle was resolved under; valid even after the obituary retires the entry.
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
@@ -200,17 +292,7 @@ impl ProxyHandle {
         &self.descriptor
     }
 
-    /// Pick the right cache representation for an extension binder.
-    ///
-    /// Returns `CachedExtension::Weak` only when the extension is a
-    /// proxy whose handle aliases this proxy's own handle — the
-    /// self-cycle case where a strong cache would form an
-    /// `Arc<ProxyHandle>` cycle through the parent's own state.
-    /// Everything else (extension is a different proxy, extension is a
-    /// local binder, extension is a proxy with a different handle)
-    /// uses `Strong` so the extension's `Arc<ProxyHandle>` is rooted by
-    /// the parent's cache and we avoid the `BC_RELEASE`/`BC_ACQUIRE`
-    /// thrash documented on `ExtensionCache`.
+    /// `Weak` only for a proxy with this proxy's own handle; see module doc "Extension cache".
     fn classify_extension(&self, sib: &SIBinder) -> CachedExtension {
         if let Some(proxy) = (**sib).as_proxy() {
             if proxy.handle() == self.handle {
@@ -227,13 +309,7 @@ impl ProxyHandle {
         data: &Parcel,
         flags: TransactionFlags,
     ) -> Result<Option<Parcel>> {
-        // Fast-fail after obituary: avoid a futile kernel round trip
-        // that would only return BR_DEAD_REPLY. Mirrors C++
-        // `BpBinder::transact` (BpBinder.cpp:337) which checks `mAlive`
-        // outside `mLock` for the same reason. The Acquire load pairs
-        // with the Release store inside `send_obituary`'s recipients
-        // lock — observing `true` here implies a happens-before with
-        // the obituary teardown.
+        // Fast-fail after obituary, as C++ `BpBinder::transact`; pairs with `send_obituary`.
         if self.obituary_sent.load(Ordering::Acquire) {
             return Err(StatusCode::DeadObject);
         }
@@ -251,10 +327,7 @@ impl ProxyHandle {
     }
 }
 
-// The kernel proxy implements the generalized `RemoteProxy` trait by
-// delegating to its unchanged inherent methods, so existing generated
-// `Bp*` code (which still calls them via `as_proxy()`) and the kernel
-// proxy's runtime behavior are bit-identical by construction.
+// Delegates to the inherent methods, which generated `Bp*` code also calls via `as_proxy()`.
 impl RemoteProxy for ProxyHandle {
     fn prepare_transact(&self, write_header: bool) -> Result<Parcel> {
         ProxyHandle::prepare_transact(self, write_header)
@@ -271,47 +344,17 @@ impl RemoteProxy for ProxyHandle {
 
 impl ProxyHandle {
     pub(crate) fn send_obituary(&self, who: &WIBinder) -> Result<()> {
-        // Mirrors C++ `BpBinder::sendObituary` (BpBinder.cpp:489–528):
-        //   1. All `mObitsSent` reads/writes happen under `mLock`.
-        //   2. The `mObituaries` vector is detached under `mLock` and
-        //      `mLock.unlock()` is called BEFORE invoking
-        //      `reportOneDeath` callbacks, so a callback may safely
-        //      re-enter `linkToDeath`/`unlinkToDeath`.
-        //
-        // Without (1), a `link_to_death` racing with `send_obituary`
-        // could push a recipient into the just-drained vector and the
-        // recipient would never fire. Without (2), a callback that
-        // calls `unlink_to_death` on `self` would deadlock against the
-        // held recipients lock.
-        //
-        // Idempotency: a second `send_obituary` (e.g. spurious double
-        // BR_DEAD_BINDER) takes the lock, sees `obituary_sent == true`,
-        // and returns immediately — matching C++ line 500's
-        // `if (mObitsSent) return;`.
-        //
-        // Error handling: queue BC_CLEAR_DEATH_NOTIFICATION BEFORE
-        // `mem::take` so a queueing failure leaves recipients intact
-        // for retry. Callbacks fire BEFORE the IPC flush so a
-        // `flush_commands` error does not swallow the obituary —
-        // matches C++ which ignores `clearDeathNotification` /
-        // `flushCommands` return values entirely.
+        // Mirrors C++ `BpBinder::sendObituary`; see module doc "Death notifications".
         let recipients_snapshot: Vec<sync::Weak<dyn DeathRecipient>> = {
             let mut recipients = self.recipients.write().expect("Recipients lock poisoned");
 
-            // Lock-protected check + set, like C++ lines 500/515.
-            // `Relaxed` here is sufficient because the surrounding
-            // RwLock acquire/release supplies all the happens-before we
-            // need against other lock-protected sites.
+            // Checked and set under the lock (as C++), so `Relaxed` suffices.
             if self.obituary_sent.load(Ordering::Relaxed) {
                 return Ok(());
             }
 
             if !recipients.is_empty() {
-                // Queue BC_CLEAR before draining. This is best-effort, as
-                // in AOSP `BpBinder::sendObituary`: BR_DEAD_BINDER is
-                // delivered once, so failing here must not abort the
-                // obituary — the recipients would never hear of the death
-                // and `obituary_sent` would never latch.
+                // Best effort, as AOSP: a failure must not stop the once-only obituary.
                 if let Err(e) = thread_state::clear_death_notification(self.handle()) {
                     log::error!(
                         "clear_death_notification failed for handle {}: {e:?}; \
@@ -323,27 +366,16 @@ impl ProxyHandle {
 
             let snapshot = std::mem::take(&mut *recipients);
 
-            // `Release` so that lock-free `submit_transact` Acquire-loads
-            // observing `true` see all writes that happened-before
-            // (matching C++'s `mAlive = 0; ... mObitsSent = 1` pattern,
-            // where the mutex unlock publishes the writes).
+            // `Release` for the lock-free `submit_transact` / `dump` Acquire loads.
             self.obituary_sent.store(true, Ordering::Release);
 
             snapshot
         };
 
-        // Callbacks first — these are the user-visible contract.
-        // Dispatching before the flush below ensures a transient
-        // ioctl failure cannot swallow death notifications. Panics
-        // inside individual recipients are caught and logged so a
-        // single buggy recipient cannot terminate the binder worker
-        // thread or starve the remaining recipients.
+        // Callbacks before the flush, so an ioctl failure cannot swallow the obituary.
         self.dispatch_obituary_callbacks(&recipients_snapshot, who);
 
-        // Flush the queued BC_CLEAR_DEATH_NOTIFICATION outside the
-        // lock. If this fails, the command remains in out_parcel and
-        // will be sent by `release_obituary_pin`'s phase-2 flush in
-        // the same BR_DEAD_BINDER arm — kernel ordering is preserved.
+        // On failure the command stays queued for `release_obituary_pin`'s phase-2 flush.
         if !recipients_snapshot.is_empty() {
             thread_state::flush_commands()?;
         }
@@ -351,35 +383,14 @@ impl ProxyHandle {
         Ok(())
     }
 
-    /// Invoke `binder_died` on every live recipient in `snapshot`,
-    /// isolating panics so a single buggy recipient cannot abort the
-    /// binder worker thread or starve the remaining recipients.
-    ///
-    /// Guarantees:
-    /// - One recipient panicking does not prevent later recipients from
-    ///   receiving `binder_died`.
-    /// - The binder worker thread continues running after a recipient
-    ///   panic; the panic is logged and discarded.
-    ///
-    /// Not guaranteed: the panicking recipient's own internal state
-    /// consistency. `AssertUnwindSafe` is a deliberate assertion that
-    /// rsbinder does not attempt to repair user state across the
-    /// unwind boundary — `recipients_snapshot` was already detached
-    /// from `self.recipients` and `obituary_sent` was already
-    /// published before this call, so rsbinder's own invariants are
-    /// unaffected.
-    ///
-    /// `panic = "abort"` builds turn this guard into a no-op (the
-    /// process aborts on any panic, including from a buggy
-    /// recipient). Documented on the `DeathRecipient` trait.
+    /// `binder_died` on each live recipient, panics caught; see module doc "Recipient panics".
     fn dispatch_obituary_callbacks(
         &self,
         snapshot: &[sync::Weak<dyn DeathRecipient>],
         who: &WIBinder,
     ) {
         for weak in snapshot {
-            // Dead `Weak`s are dropped with the snapshot at scope end —
-            // the source vector was already cleared by `mem::take`.
+            // Dead `Weak`s drop with the snapshot; `mem::take` already cleared the source.
             let Some(recipient) = weak.upgrade() else {
                 continue;
             };
@@ -422,29 +433,16 @@ impl ProxyHandle {
     /// own. The call is synchronous, so it returns only after the remote
     /// has finished writing.
     pub fn dump<F: IntoRawFd>(&self, fd: F, args: &[String]) -> Result<()> {
-        // Fast-fail BEFORE consuming the fd. `submit_transact` would
-        // also short-circuit on `obituary_sent`, but by the time we
-        // reach it, `fd.into_raw_fd()` has already detached the raw fd
-        // from `F`'s RAII; an early `Err` from `submit_transact` would
-        // then leak the fd. Mirroring the `submit_transact` Acquire-load
-        // here lets `F` drop naturally (closing the fd) when the proxy
-        // is already dead.
+        // Fast-fail before consuming the fd, so a dead proxy lets `F` drop and close it.
         if self.obituary_sent.load(Ordering::Acquire) {
             return Err(StatusCode::DeadObject);
         }
         let mut send = Parcel::new();
         let raw = fd.into_raw_fd();
         let obj = flat_binder_object::new_with_fd(raw, true);
-        // Once the object is committed to the parcel the descriptor is the
-        // parcel's (`cookie = 1`), and `Parcel::drop` -> `release_objects`
-        // closes it on every path out of here — including a failed
-        // `submit_transact`. Before that commit nothing owns it but this
-        // local, so the one window that would leak is a `write_object`
-        // that fails part-way and never records the offset.
+        // Once written (`cookie = 1`) the parcel closes the fd; a failed write leaves it to us.
         if let Err(e) = send.write_object(&obj, true) {
-            // SAFETY: `raw` came from `F::into_raw_fd`, which transferred
-            // sole ownership here, and the failed `write_object` left no
-            // other owner — this is the only close.
+            // SAFETY: sole owner of `raw` (from `into_raw_fd`; write failed): the only close.
             drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) });
             return Err(e);
         }
@@ -483,24 +481,14 @@ impl Eq for ProxyHandle {}
 
 impl Drop for ProxyHandle {
     fn drop(&mut self) {
-        // The cache pin's BC_INCREFS keeps `binder_ref(handle).weak >= 1`,
-        // so this BC_RELEASE is safe regardless of concurrent lookups: the
-        // kernel slot is alive on entry. A future lookup that arrives after
-        // the strong count returns to 0 re-acquires a transactable strong
-        // ref only when a fresh wire delivery (e.g. servicemanager
-        // checkService) re-establishes kernel strong via slow-path case (b);
-        // a purely in-process `WIBinder::upgrade()` does not (it is weak and
-        // returns DeadObject once strong hits 0 — see `WIBinder::upgrade`).
+        // Safe: the cache pin's BC_INCREFS keeps the slot alive (module doc "Reference counts").
         if let Err(err) = thread_state::dec_strong_handle(self.handle) {
             log::error!(
                 "BC_RELEASE for handle {} failed during Drop: {err:?}",
                 self.handle
             );
         }
-        // Only post the drop if construction reached the matching
-        // `on_proxy_create`. Test-only `synthetic_proxy`
-        // and the `inc_strong_handle`-failure path leave the guard
-        // `false`, so the proxy_count globals never see a phantom drop.
+        // Only a proxy that reached `on_proxy_create` posts the drop (no phantom drops).
         if self.count_acquired {
             crate::proxy_count::on_proxy_drop(self.tracked_uid, self.counted_by_uid);
         }
@@ -509,19 +497,7 @@ impl Drop for ProxyHandle {
 
 impl IBinder for ProxyHandle {
     fn get_extension(&self) -> Result<Option<SIBinder>> {
-        // 1. Check cache (read lock). See `ExtensionCache` doc for why
-        //    the common case caches strong and only the self-cycle case
-        //    caches weak. Sub-cases:
-        //      - NotQueried: fall through to remote query.
-        //      - Queried(None): authoritatively no extension; return None.
-        //      - Queried(Some(Strong(s))): clone and return — no kernel
-        //        round trip, no Arc drop on the extension proxy.
-        //      - Queried(Some(Weak(w))): self-cycle case; upgrade the
-        //        weak (always succeeds while the user holds the parent).
-        //        If the parent itself is mid-Drop and the weak is
-        //        already dangling, fall through to a fresh remote query
-        //        — defensive, this branch should be unreachable in
-        //        normal use.
+        // 1. Cached answer; a weak (self-cycle) entry upgrades while the parent is held.
         {
             let cached = self.extension.read().expect("Extension lock poisoned");
             match &*cached {
@@ -544,17 +520,12 @@ impl IBinder for ProxyHandle {
         let ext: Option<SIBinder> = match self.submit_transact(EXTENSION_TRANSACTION, &data, 0) {
             Ok(Some(mut reply)) => DeserializeOption::deserialize_option(&mut reply)?,
             Ok(None) => None,
-            // A server predating extensions reports `UnknownTransaction`;
-            // treat that as "no extension". Every other error (notably
-            // `DeadObject`, and reply-corruption) propagates — matching AOSP
-            // `BpBinder::getExtension`, which returns the transact status
-            // rather than collapsing all failures to "none".
+            // `UnknownTransaction` (pre-extension server) = none; others propagate, as AOSP.
             Err(StatusCode::UnknownTransaction) => None,
             Err(e) => return Err(e),
         };
 
-        // 3. Classify and cache. Strong unless the extension's handle
-        //    aliases this proxy's own handle (see `ExtensionCache` doc).
+        // 3. Cache: strong unless the handle aliases this proxy's own (see `ExtensionCache`).
         let entry = ext.as_ref().map(|sib| self.classify_extension(sib));
         let mut cache = self.extension.write().expect("Extension lock poisoned");
         *cache = ExtensionCache::Queried(entry);
@@ -562,57 +533,23 @@ impl IBinder for ProxyHandle {
     }
 
     fn set_extension(&self, _extension: &SIBinder) -> Result<()> {
-        // `set_extension` is a server-side operation: a service
-        // publishes its extension binder for clients to discover via
-        // `get_extension()`. A client proxy has no way to inform the
-        // remote service, and the local strong cache would pin an
-        // unrelated `Arc<dyn IBinder>` for the parent's lifetime.
-        // Reject with `InvalidOperation`, matching the default trait
-        // impl in `binder.rs`. In-tree callers operate on native
-        // `Binder`, not `ProxyHandle`, so this reject is safe.
+        // Server-side operation: a proxy cannot inform the remote; same as the default impl.
         Err(StatusCode::InvalidOperation)
     }
 
     /// Register a death notification for this object.
     fn link_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()> {
-        // Acquire the lock FIRST, then check `obituary_sent` — same
-        // ordering as C++ `BpBinder::linkToDeath` (BpBinder.cpp:420
-        // `if (!mObitsSent)` runs inside `AutoMutex _l(mLock)`).
-        // Checking the flag outside the lock would leave a window where
-        // `send_obituary` sets the flag and drains recipients between
-        // our check and our `recipients.write()` acquisition, causing a
-        // recipient registered after death to never fire.
+        // Lock before checking `obituary_sent`; see module doc "Death notifications".
         let mut recipients = self.recipients.write().expect("Recipients lock poisoned");
         if self.obituary_sent.load(Ordering::Relaxed) {
             return Err(StatusCode::DeadObject);
         }
-        // Reject a recipient whose strong count is already zero — a
-        // common mistake when the caller drops the
-        // `Arc<dyn DeathRecipient>` before passing the weak. Without
-        // this check `send_obituary` would silently skip the
-        // recipient via `weak.upgrade() == None`, leaving the user
-        // with the false impression that they successfully
-        // registered. Placed before `request_death_notification` so
-        // a dead weak never consumes a kernel subscription. Does
-        // *not* protect against the recipient's `Arc` being dropped
-        // *between* `link_to_death` returning and `binder_died`
-        // firing — that's a legitimate use of `Weak` semantics.
+        // A dead weak would never fire: reject it before it takes a kernel subscription.
         if recipient.upgrade().is_none() {
             return Err(StatusCode::BadValue);
         }
         if recipients.is_empty() {
-            // Match C++ `BpBinder::linkToDeath` (BpBinder.cpp:415-434):
-            // queue `BC_REQUEST_DEATH_NOTIFICATION` and best-effort
-            // flush. The parcel-write of `BC_REQUEST_DEATH_NOTIFICATION`
-            // itself can fail (out_parcel corruption — rare, e.g. OOM)
-            // and propagates because that signals state corruption,
-            // not a driver round-trip issue. The subsequent
-            // `flush_commands` is intentionally **not** propagated —
-            // ignoring it (a) matches Android's symmetric behavior
-            // (C++ ignores `flushCommands`'s return value) and (b)
-            // closes the prior leak window where a flush failure
-            // skipped `recipients.push` and left the kernel with a
-            // subscription that no user-side recipient could service.
+            // As C++ `BpBinder::linkToDeath`: write errors propagate, flush errors are ignored.
             thread_state::request_death_notification(self.handle())?;
             let _ = thread_state::flush_commands();
         }
@@ -631,22 +568,12 @@ impl IBinder for ProxyHandle {
     /// — a user that registered the same recipient twice and unlinks
     /// once expects one callback to remain.
     fn unlink_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()> {
-        // Acquire the lock FIRST, then check `obituary_sent` — same
-        // ordering as C++ `BpBinder::unlinkToDeath` (BpBinder.cpp:456
-        // `if (mObitsSent)` runs inside `AutoMutex _l(mLock)`).
+        // Lock before checking `obituary_sent`, as C++ `BpBinder::unlinkToDeath`.
         let mut recipients = self.recipients.write().expect("Recipients lock poisoned");
         if self.obituary_sent.load(Ordering::Relaxed) {
             return Err(StatusCode::DeadObject);
         }
-        // Single-position removal (O(n), order-preserving). Matches
-        // C++ `removeAt(i)` semantics; a `retain` here would remove
-        // every duplicate registration of the same recipient and
-        // silently drop the user's remaining subscription. The
-        // `clear_death_notification` IPC fires only when this call
-        // actually transitions the list from non-empty to empty —
-        // unlinking from an already-empty list (NameNotFound path)
-        // must not queue a `BC_CLEAR_DEATH_NOTIFICATION` for a
-        // subscription that was never requested.
+        // First match only (C++ `removeAt(i)`); BC_CLEAR only on the non-empty→empty edge.
         let Some(i) = recipients
             .iter()
             .position(|r| sync::Weak::ptr_eq(r, &recipient))
@@ -655,10 +582,7 @@ impl IBinder for ProxyHandle {
         };
         recipients.remove(i);
         if recipients.is_empty() {
-            // Symmetric with `link_to_death`: queue
-            // `BC_CLEAR_DEATH_NOTIFICATION`, propagate parcel-write
-            // failure (state corruption), ignore `flush_commands`'s
-            // return value (best-effort, matches C++).
+            // Symmetric with `link_to_death`: write errors propagate, flush errors are ignored.
             thread_state::clear_death_notification(self.handle())?;
             let _ = thread_state::flush_commands();
         }
@@ -690,29 +614,14 @@ impl IBinder for ProxyHandle {
         true
     }
 
-    // Proxy ref-count methods are no-ops under the cache-pin model.
-    //
-    // Kernel strong refs are owned 1-per-`Arc<ProxyHandle>` (acquired in
-    // `new_acquired`, released in `Drop`). Kernel weak refs are owned by
-    // the process-wide cache pin in `ProcessState::handle_to_proxy`. User-
-    // side `SIBinder` and `WIBinder` clone/drop is pure `Arc::clone` /
-    // `sync::Weak::clone` of the trait-object Arc — no kernel commands.
+    // Ref-count methods are no-ops for a proxy; see module doc "Reference counts".
 
     fn inc_strong(&self, _strong: &SIBinder) -> Result<()> {
         Ok(())
     }
 
     fn attempt_inc_strong(&self) -> bool {
-        // Unreachable on a proxy: every legitimate caller of
-        // `IBinder::attempt_inc_strong` for a proxy either already holds
-        // an `Arc<ProxyHandle>` (so the question is moot) or wants
-        // "atomically promote a weak ref to a strong ref" semantics — now
-        // covered by `Weak<I>::upgrade()` (which uses Rust's
-        // `sync::Weak::upgrade` CAS).
-        // `IBinder` is a public trait and `SIBinder` derefs to it, so an
-        // external caller can reach this; it is meaningless for a proxy
-        // (the cache pin keeps the kernel slot alive), not a bug to
-        // assert on. Warn and honor the "succeed" contract.
+        // Meaningless for a proxy yet reachable via the public `IBinder`: warn, honor "succeed".
         log::warn!(
             "attempt_inc_strong called on a ProxyHandle (handle {}); \
              it is a no-op for proxies — use Weak<I>::upgrade",
@@ -748,21 +657,50 @@ pub trait Proxy: Sized + Interface {
 
 #[cfg(test)]
 mod tests {
+    //! Most tests build proxies with `synthetic_proxy` (no `BC_ACQUIRE`, never in the proxy
+    //! cache) and run without `ProcessState`: the fast-fail and position checks they cover
+    //! return before any IPC.
+    //!
+    //! # Mutation gates
+    //!
+    //! - `proxy_downgrade_keeps_its_identity_without_a_cache_entry`: `synthetic_proxy` has no
+    //!   cache entry, which is the state a death recipient's `downgrade` sees after the
+    //!   obituary retired the entry. A `downgrade` that falls back to the `Native` variant
+    //!   compares unequal to the obituary's `Proxy` weak; a second allocation with the same
+    //!   `(handle, generation)` must still compare equal.
+    //! - `test_unlink_to_death_removes_only_one_match`: the recipients vector is populated
+    //!   directly so `link_to_death`'s `request_death_notification` IPC is not needed. An
+    //!   unlink that removes every match (`Vec::retain`) drops the second registration.
+    //! - `test_unlink_to_death_unregistered_returns_name_not_found`: an unlink of a never
+    //!   registered recipient leaves the other registration intact. The "remove all matches"
+    //!   mutant passes here and is caught only by `test_unlink_to_death_removes_only_one_match`;
+    //!   this test covers the lookup path on its own.
+    //! - `test_get_extension_strong_cache_does_not_auto_invalidate_on_dead_extension`: locks
+    //!   in the non-invalidating cache described in the module doc "Extension cache"; an
+    //!   auto-invalidate change flips this assertion on purpose.
+    //! - `test_dump_fast_fails_and_drops_fd_when_obituary_sent`: `DropFlag` implements
+    //!   `IntoRawFd` and records its own `Drop`. A `dump` that calls `fd.into_raw_fd()` before
+    //!   the obituary check detaches the fd from RAII, the early `Err` leaks it, and `Drop`
+    //!   never fires.
+    //! - `test_dispatch_obituary_callbacks_isolates_panic`: the panicking recipient is first in
+    //!   the two-element snapshot. Without the `catch_unwind` guard the panic unwinds past the
+    //!   loop and the counting recipient is never called. The default hook prints the panic to
+    //!   stderr; cargo buffers it per test.
+    //! - `test_extension_cache_variant_holds_dual_modes`: `ExtensionCache::Queried` must admit
+    //!   both variants. A strong-only cache re-creates the self-referencing `Arc<ProxyHandle>`
+    //!   cycle; a weak-only cache re-creates the `BC_RELEASE` / `BC_ACQUIRE` churn that ends
+    //!   in `BR_FAILED_REPLY` ("cannot find target node") under stress.
+
     use super::*;
 
-    /// Construct a synthetic `ProxyHandle` with the given `obituary_sent`
-    /// initial value, skipping `new_acquired`'s `BC_ACQUIRE` (no
-    /// ProcessState/binderfs needed). Caller must `mem::forget` the
-    /// returned `Arc` to suppress `Drop`'s `BC_RELEASE`.
+    /// `ProxyHandle` without `BC_ACQUIRE`; the caller must `mem::forget` it to skip `BC_RELEASE`.
     fn synthetic_proxy(obituary_sent: bool) -> Arc<ProxyHandle> {
         Arc::new(ProxyHandle {
             handle: 1,
             generation: 1,
             descriptor: "test".to_string(),
             tracked_uid: 0,
-            // `count_acquired = false` means `Drop` skips
-            // `proxy_count::on_proxy_drop`, matching this constructor's
-            // skip of `new_acquired`'s `on_proxy_create`.
+            // `Drop` skips `on_proxy_drop`, as this skips `on_proxy_create`.
             count_acquired: false,
             counted_by_uid: false,
             stability: Stability::Local,
@@ -772,35 +710,20 @@ mod tests {
         })
     }
 
-    /// No-op `DeathRecipient` for tests that need a `Weak<dyn ...>` to
-    /// pass into `link_to_death` / `unlink_to_death`.
+    /// No-op recipient for building a `Weak<dyn DeathRecipient>`.
     struct NoopRecipient;
     impl DeathRecipient for NoopRecipient {
         fn binder_died(&self, _who: &WIBinder) {}
     }
 
-    /// Build a `(strong, weak)` recipient pair. The caller binds the
-    /// returned `Arc` for the test's duration; dropping it would
-    /// turn the returned `Weak` into a dangling reference that
-    /// `Weak::upgrade()` and the production-side liveness check
-    /// would treat as already-dead.
+    /// Keep the returned `Arc` alive: once it drops, `link_to_death` treats the `Weak` as dead.
     fn live_recipient_pair() -> (Arc<dyn DeathRecipient>, sync::Weak<dyn DeathRecipient>) {
         let arc: Arc<dyn DeathRecipient> = Arc::new(NoopRecipient);
         let weak = Arc::downgrade(&arc);
         (arc, weak)
     }
 
-    /// A proxy's weak identity must come from the proxy, not the cache.
-    ///
-    /// The obituary retires a handle's cache entry *before* dispatching
-    /// `binder_died`, so a `downgrade` taken inside a death recipient used
-    /// to fall back to the `Native` variant — which compares unequal to the
-    /// `Proxy` weak the obituary carries, and unequal to every weak taken
-    /// while the binder was alive. A recipient matching `who` against its
-    /// stored `SIBinder`s therefore matched nothing, every time.
-    ///
-    /// `synthetic_proxy` is never in the cache, so it stands in for exactly
-    /// that state: a live `Arc<ProxyHandle>` with no cache entry behind it.
+    /// A proxy's weak identity comes from the proxy, not the cache; see `# Mutation gates`.
     #[test]
     fn proxy_downgrade_keeps_its_identity_without_a_cache_entry() {
         let proxy = synthetic_proxy(false);
@@ -809,12 +732,7 @@ mod tests {
         let weak = SIBinder::downgrade(&strong);
         assert_eq!(weak, SIBinder::downgrade(&strong));
 
-        // The discriminator between the two identity models. `synthetic_proxy`
-        // hands back a *distinct allocation* naming the same
-        // `(handle, generation)` — which is also what a case-(b) resurrection
-        // produces. Proxy identity says these are the same binder; the
-        // `Native` fallback, comparing `Weak::ptr_eq` on the allocation, says
-        // they are not. Equality here is what proves the fallback is gone.
+        // Distinct allocation, same `(handle, generation)`: equal only under proxy identity.
         let resurrected = synthetic_proxy(false);
         assert!(
             !Arc::ptr_eq(&proxy, &resurrected),
@@ -843,8 +761,7 @@ mod tests {
         assert!(who == strong, "who == stored binder");
         assert!(strong == who, "and the operands commute");
 
-        // A different binder must not match. A native one is enough: the
-        // variants differ, which is the cheapest possible mismatch.
+        // A different binder must not match; a native one differs by variant already.
         struct Other;
         impl crate::Interface for Other {}
         impl crate::Remotable for Other {
@@ -888,11 +805,7 @@ mod tests {
         std::mem::forget(handle);
     }
 
-    /// `submit_transact` must short-circuit with `DeadObject` when
-    /// `obituary_sent` is true — matches C++ `BpBinder::transact`'s
-    /// `if (mAlive)` early-exit (BpBinder.cpp:337). The fast-fail path
-    /// touches no thread_state IPC, so this test runs without
-    /// ProcessState init.
+    /// `DeadObject` without IPC, as C++ `BpBinder::transact`'s `if (mAlive)` (BpBinder.cpp:337).
     #[test]
     fn test_submit_transact_fast_fails_when_obituary_sent() {
         let handle = synthetic_proxy(true);
@@ -905,10 +818,7 @@ mod tests {
         std::mem::forget(handle);
     }
 
-    /// `link_to_death` must reject after obituary — matches C++
-    /// `BpBinder::linkToDeath` (BpBinder.cpp:420). The lock-protected
-    /// check pattern means the rejection happens AFTER the recipients
-    /// write lock is acquired, but no IPC is reached.
+    /// Rejected under the recipients lock before any IPC, as `BpBinder::linkToDeath` (:420).
     #[test]
     fn test_link_to_death_returns_dead_object_after_obituary() {
         let handle = synthetic_proxy(true);
@@ -921,8 +831,7 @@ mod tests {
         std::mem::forget(handle);
     }
 
-    /// `unlink_to_death` must reject after obituary — matches C++
-    /// `BpBinder::unlinkToDeath` (BpBinder.cpp:456).
+    /// Matches C++ `BpBinder::unlinkToDeath` (BpBinder.cpp:456).
     #[test]
     fn test_unlink_to_death_returns_dead_object_after_obituary() {
         let handle = synthetic_proxy(true);
@@ -935,13 +844,7 @@ mod tests {
         std::mem::forget(handle);
     }
 
-    /// Registering the same recipient twice and unlinking once must
-    /// remove only one entry — the user's remaining registration is
-    /// silently lost if `unlink_to_death` removes every match. Mirrors C++
-    /// `BpBinder::unlinkToDeath` returning after a single
-    /// `mObituaries->removeAt(i)`. The recipients vector is
-    /// populated directly so the test does not require ProcessState
-    /// init for `link_to_death`'s `request_death_notification` IPC.
+    /// Twice registered, once unlinked leaves one entry, as C++ `mObituaries->removeAt(i)`.
     #[test]
     fn test_unlink_to_death_removes_only_one_match() {
         let proxy = synthetic_proxy(false);
@@ -969,11 +872,7 @@ mod tests {
         std::mem::forget(proxy);
     }
 
-    /// `unlink_to_death` on an empty recipients list must return
-    /// `NameNotFound` and must not queue a
-    /// `BC_CLEAR_DEATH_NOTIFICATION` to the kernel — there is no
-    /// subscription to clear. The position check happens before any
-    /// IPC, so this test runs without ProcessState init.
+    /// No `BC_CLEAR_DEATH_NOTIFICATION` is queued: there is no subscription to clear.
     #[test]
     fn test_unlink_to_death_empty_list_returns_name_not_found() {
         let proxy = synthetic_proxy(false);
@@ -991,17 +890,7 @@ mod tests {
         std::mem::forget(proxy);
     }
 
-    /// Locks down the documented staleness behavior of the strong
-    /// extension cache: when the *extension* (not the parent) is
-    /// obituary'd, the parent's `get_extension()` keeps returning
-    /// the cached (now dead) `SIBinder`. The cache is **not**
-    /// auto-invalidated. IPC through the dead extension fast-fails
-    /// with `DeadObject` via `submit_transact`'s obituary check, so
-    /// the dead reference is well-behaved — but a server that
-    /// re-publishes a fresh extension is invisible to the client
-    /// until the parent is dropped and re-acquired. Matches Android
-    /// C++ `BpBinder` semantics. A future "auto-invalidate" change
-    /// would deliberately flip this assertion.
+    /// A dead extension stays cached and fast-fails with `DeadObject`; see `# Mutation gates`.
     #[test]
     fn test_get_extension_strong_cache_does_not_auto_invalidate_on_dead_extension() {
         let ext_proxy = synthetic_proxy(true); // extension already obituary'd
@@ -1014,15 +903,13 @@ mod tests {
             *cache = ExtensionCache::Queried(Some(CachedExtension::Strong(ext_sibinder)));
         }
 
-        // get_extension returns the cached (dead) extension via the
-        // cache-hit path — no remote query attempted.
+        // A cache hit returns the cached (dead) extension without a remote query.
         let returned = parent
             .get_extension()
             .expect("get_extension")
             .expect("cache hit should return Some");
 
-        // The returned SIBinder is the same dead ProxyHandle. IPC
-        // through it must fast-fail.
+        // It is the same dead ProxyHandle, so IPC through it must fast-fail.
         let returned_proxy = (*returned).as_proxy().expect("extension is a proxy");
         assert_eq!(returned_proxy.handle(), ext_proxy.handle());
         let parcel = Parcel::new();
@@ -1034,10 +921,7 @@ mod tests {
             "calls through cached dead extension must fast-fail with DeadObject"
         );
 
-        // Cache must remain Strong — staleness is the documented
-        // contract. A regression to "auto-invalidate" would flip the
-        // variant to NotQueried (or remove the entry) and trip this
-        // assertion.
+        // Staleness is the contract: auto-invalidation would change the variant and trip this.
         let cache = parent.extension.read().expect("Extension lock poisoned");
         assert!(
             matches!(
@@ -1048,21 +932,13 @@ mod tests {
         );
         drop(cache);
 
-        // Drop order: `returned` first so its strong count decrement
-        // doesn't race with cache teardown. The cache still holds
-        // one strong via the parent — `parent` is then forgotten so
-        // the synthetic ProxyHandle's `BC_RELEASE` Drop never runs.
+        // Drop `returned` first; forget `parent` so the synthetic `BC_RELEASE` Drop never runs.
         drop(returned);
         std::mem::forget(parent);
         std::mem::forget(ext_proxy);
     }
 
-    /// `link_to_death` must reject a recipient whose strong count
-    /// is already zero with `BadValue`, **before** queuing
-    /// `BC_REQUEST_DEATH_NOTIFICATION`. Otherwise the kernel would
-    /// register a subscription that no user-side recipient can ever
-    /// service (silent registration of a dead recipient is a
-    /// misleading API). The recipients vec must remain unchanged.
+    /// `BadValue` before `BC_REQUEST_DEATH_NOTIFICATION`, leaving the recipients unchanged.
     #[test]
     fn test_link_to_death_rejects_already_dead_weak() {
         let proxy = synthetic_proxy(false); // obituary not sent
@@ -1088,13 +964,7 @@ mod tests {
         std::mem::forget(proxy);
     }
 
-    /// `ProxyHandle::set_extension` must reject with
-    /// `InvalidOperation` — the operation is server-side only and a
-    /// proxy has no way to inform the remote service. Silent
-    /// success would (a) leave the remote unaware of the new
-    /// extension and (b) pin an unrelated `Arc<dyn IBinder>` for the
-    /// parent's lifetime via the strong-cache common case. The cache
-    /// must remain `NotQueried` after the rejected call.
+    /// A proxy cannot tell the remote, so it refuses; the cache stays `NotQueried`.
     #[test]
     fn test_set_extension_on_proxy_rejects_with_invalid_operation() {
         let proxy = synthetic_proxy(false);
@@ -1106,9 +976,7 @@ mod tests {
             "expected InvalidOperation, got {result:?}"
         );
 
-        // Cache must not have been mutated. Constructing the
-        // synthetic proxy started in NotQueried; verify it stayed
-        // there.
+        // The cache must stay NotQueried, where the synthetic proxy started.
         let cache = proxy.extension.read().expect("Extension lock poisoned");
         assert!(
             matches!(*cache, ExtensionCache::NotQueried),
@@ -1118,14 +986,7 @@ mod tests {
         std::mem::forget(proxy);
     }
 
-    /// `dump` must fast-fail when the proxy is already obituary'd,
-    /// **before** calling `fd.into_raw_fd()` — otherwise the raw fd
-    /// is detached from `F`'s RAII and an early `Err` from
-    /// `submit_transact` leaks the fd. The synthetic `DropFlag`
-    /// implements `IntoRawFd` so the function's bound is satisfied,
-    /// but its `Drop` records observation; the assertion checks that
-    /// the fast-fail path leaves the fd to RAII (Drop fires) rather
-    /// than consuming it.
+    /// Fast-fails before `fd.into_raw_fd()`, so the fd drops; see `# Mutation gates`.
     #[test]
     fn test_dump_fast_fails_and_drops_fd_when_obituary_sent() {
         use std::os::fd::RawFd;
@@ -1135,10 +996,7 @@ mod tests {
         }
         impl std::os::fd::IntoRawFd for DropFlag {
             fn into_raw_fd(self) -> RawFd {
-                // In the real success path the kernel takes ownership
-                // of the raw fd, so suppress Drop. The fast-fail path
-                // must NOT reach this method — the test would silently
-                // miss the Drop assertion below if it did.
+                // Success path: the kernel owns the fd; the fast-fail path must not get here.
                 std::mem::forget(self);
                 -1
             }
@@ -1170,13 +1028,7 @@ mod tests {
         std::mem::forget(proxy);
     }
 
-    /// Unlinking a recipient that was never registered (while
-    /// another, different recipient *is* registered) must return
-    /// `NameNotFound` and leave the existing registration
-    /// untouched — `Vec::retain` would also do nothing in this case
-    /// but with the buggy "remove all matches" semantic, a future
-    /// regression that re-introduces it would fail this assertion
-    /// only via the registered-twice variant. Belt-and-suspenders.
+    /// Another recipient's registration survives; see `# Mutation gates`.
     #[test]
     fn test_unlink_to_death_unregistered_returns_name_not_found() {
         let proxy = synthetic_proxy(false);
@@ -1203,10 +1055,7 @@ mod tests {
         std::mem::forget(proxy);
     }
 
-    /// Minimal native `IBinder` impl used to build a `WIBinder` for
-    /// tests that need a `who` argument but don't care about the
-    /// binder's identity. `SIBinder::downgrade` takes the Native
-    /// branch for this type, so no `ProcessState` init is required.
+    /// Native `IBinder` for a `who` argument; its `downgrade` needs no `ProcessState`.
     struct MockBinder;
 
     impl IBinder for MockBinder {
@@ -1248,15 +1097,7 @@ mod tests {
         }
     }
 
-    /// A panicking recipient must not abort the binder worker thread
-    /// or starve subsequent recipients in the same `send_obituary`
-    /// snapshot. Drives `dispatch_obituary_callbacks` directly with a
-    /// two-element snapshot — the panicking entry is placed first so a
-    /// regression that drops the `catch_unwind` guard would unwind
-    /// past the loop and leave the counting recipient untouched, which
-    /// the assertion would then catch. Captured panic output is
-    /// printed to stderr by the default panic hook; cargo test buffers
-    /// it per-test so it only surfaces if this test itself fails.
+    /// A panicking recipient does not starve the next one; see `# Mutation gates`.
     #[test]
     fn test_dispatch_obituary_callbacks_isolates_panic() {
         use std::sync::Mutex;
@@ -1302,31 +1143,17 @@ mod tests {
         std::mem::forget(proxy);
     }
 
-    /// Verifies `ExtensionCache::Queried` admits both a strong-cache
-    /// variant (common case) and a weak-cache variant (self-cycle
-    /// case) at the type level. The discrimination protects against
-    /// regressing to either extreme — a strong-only cache would
-    /// reintroduce the self-referencing `Arc<ProxyHandle>` cycle, and
-    /// a weak-only cache would reintroduce the
-    /// `BC_RELEASE`/`BC_ACQUIRE` thrash that produced
-    /// `BR_FAILED_REPLY` ("cannot find target node") under stress.
+    /// `ExtensionCache::Queried` holds both variants; see `# Mutation gates`.
     #[test]
     fn test_extension_cache_variant_holds_dual_modes() {
-        // Compile-time check: the payload type matches the documented
-        // shape `Option<CachedExtension>`, and `CachedExtension` exposes
-        // both `Strong(SIBinder)` and `Weak(WIBinder)` constructors.
-        // Wrong inner types would fail the type-checked bindings; a
-        // missing variant would fail the `fn _exhaust` exhaustiveness
-        // check; a non-`Option` payload would fail the `_typed` binding.
+        // Compile-time check: payload is `Option<CachedExtension>`; `_exhaust` pins the variants.
         let none_cache = ExtensionCache::Queried(None);
         let ExtensionCache::Queried(payload) = &none_cache else {
             unreachable!("constructed Queried, must match Queried")
         };
         let _typed: &Option<CachedExtension> = payload;
 
-        // Exhaustiveness gate: this fn fails to compile if a future
-        // patch removes either variant (or adds a third without
-        // updating callers).
+        // Exhaustiveness gate: fails to compile if a variant is removed or a third added.
         fn _exhaust(entry: &CachedExtension) -> &'static str {
             match entry {
                 CachedExtension::Strong(_) => "strong",

@@ -90,10 +90,7 @@ pub trait PermissionAuthority: Send + Sync {
     fn check(&self, permission: &str, caller: &Caller) -> bool;
 }
 
-/// Process-wide injected authority. `None` ⇒ the built-in default
-/// ([`check_permission`] kernel-PMS / RPC-deny). Deployment policy, set
-/// once at startup; a `RwLock` (not `OnceLock`) so tests and dynamic
-/// reconfiguration can replace or [`clear_permission_authority`] it.
+/// Injected authority (`None` = default); a `RwLock`, not `OnceLock`, so it can be replaced.
 static AUTHORITY: RwLock<Option<Arc<dyn PermissionAuthority>>> = RwLock::new(None);
 
 /// Install the process-wide [`PermissionAuthority`]; subsequent
@@ -243,16 +240,13 @@ pub fn default() -> Result<Strong<dyn IPermissionController>> {
 /// without consulting it. With no authority installed (the default), the
 /// kernel→PMS / RPC→deny behavior applies unchanged.
 pub fn check_permission(reader: &Parcel, permission_name: &str) -> bool {
-    // Injected deployment policy owns the whole decision when present. The
-    // Arc is cloned out so the read lock is released before the (possibly
-    // re-entrant) policy runs.
+    // Clone the Arc out so the read lock is released before the (re-entrant) policy runs.
     let authority = AUTHORITY
         .read()
         .expect("permission authority poisoned")
         .clone();
     if let Some(authority) = authority {
-        // Pass the transport-tagged caller; no caller (not in a
-        // transaction) ⇒ fail closed.
+        // No caller (not in a transaction) ⇒ fail closed.
         return crate::calling_caller()
             .is_some_and(|caller| authority.check(permission_name, &caller));
     }
@@ -275,9 +269,7 @@ pub fn check_permission(reader: &Parcel, permission_name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// One-time `warn` the first time an `@EnforcePermission` method is denied
-/// because it was dispatched over RPC. Per-process, not per-interface —
-/// the message states the general rule, not a specific permission.
+/// Warn once per process (not per interface) when `@EnforcePermission` first denies over RPC.
 fn warn_enforce_permission_over_rpc() {
     use std::sync::Once;
     static WARNED: Once = Once::new();
@@ -294,47 +286,29 @@ fn warn_enforce_permission_over_rpc() {
 mod tests {
     use super::*;
 
-    /// What a Unix RPC session carries before it negotiates an fd mode —
-    /// the shape the simulated dispatches below stand in for. The value
-    /// is incidental to these tests, which are about the permission
-    /// decision, but the guard takes it.
+    /// A Unix RPC session's caps before fd-mode negotiation; incidental, but the guard takes it.
     #[cfg(feature = "rpc")]
     const UNIX_CAPS: crate::TransportCaps =
         crate::TransportCaps::TRUSTED_UID.union(crate::TransportCaps::SAME_HOST);
 
-    /// The generated trait must expose the AOSP wire descriptor
-    /// verbatim — `"android.os.IPermissionController"`.
-    /// A mismatch here would silently fail every cross-process call to
-    /// `system_server` because the kernel-side `check_interface` would
-    /// reject the inbound `writeInterfaceToken` prefix.
+    /// AOSP wire descriptor; on a mismatch `system_server` rejects every interface token.
     #[test]
     fn test_descriptor_matches_aosp_wire() {
-        // Pick any `Sized` impl — `descriptor()` is gated by
-        // `where Self: Sized`, but every concrete impl returns the
-        // same constant via the AOSP-required `META_INTERFACE` macro.
+        // `descriptor()` needs `Self: Sized`; every concrete impl returns the same constant.
         assert_eq!(
             <BpPermissionController as IPermissionController>::descriptor(),
             "android.os.IPermissionController"
         );
     }
 
-    /// `SERVICE_NAME` matches the AOSP-registered service
-    /// name (`servicemanager` `addService("permission", ...)` in
-    /// system_server). Any drift makes `default()` return
-    /// `NameNotFound` on every real Android device.
+    /// system_server's `addService("permission", ...)`; drift makes `default()` `NameNotFound`.
     #[test]
     fn test_service_name_matches_system_server_registration() {
         assert_eq!(SERVICE_NAME, "permission");
     }
 
-    /// Plan 2-16 Phase A unit-level proof: `check_permission` denies for
-    /// an RPC parcel **before** consulting PMS. A kernel parcel outside a
-    /// live transaction is denied at the `is_handling_transaction` gate
-    /// before PMS is ever consulted — the RPC arm is the transport gate
-    /// this asserts.
-    //
-    // `serial(authority)`: `AUTHORITY` is a process global, so this default
-    // test must not run concurrently with the authority-delegation test.
+    /// Plan 2-16 Phase A: an RPC parcel, or a kernel one outside a transaction, is denied pre-PMS.
+    // `serial(authority)`: `AUTHORITY` is process-global and the delegation test sets it.
     #[cfg(feature = "rpc")]
     #[serial_test::serial(authority)]
     #[test]
@@ -345,8 +319,7 @@ mod tests {
 
         let mut rpc_parcel = Parcel::new();
         rpc_parcel.set_for_rpc(true);
-        // Inside a (simulated) RPC transaction, so `is_handling_transaction()`
-        // is `true` and only the kernel-backing gate can produce the denial.
+        // In a simulated RPC transaction only the kernel-backing gate can produce the denial.
         let _g = RpcCallingGuard::install(
             Arc::new(PeerIdentity::Local { uid: 1000, pid: 7 }),
             UNIX_CAPS,
@@ -357,15 +330,11 @@ mod tests {
             "RPC parcel must fail-closed regardless of uid/PMS"
         );
 
-        // A kernel parcel passes the kernel-backing gate and is denied one
-        // step later, by `is_handling_transaction` — dropping the guard first
-        // keeps `default()` (and its `ProcessState`) out of reach.
+        // Dropping the guard first keeps `default()` (and its `ProcessState`) out of reach.
         drop(_g);
         let kernel_parcel = Parcel::new();
         assert!(kernel_parcel.is_kernel_backed());
-        // Pin the precondition the gate fires on: without it the denial
-        // below could equally come from `default()` failing, which stays
-        // `false` even if the gate were deleted.
+        // Without this the denial could come from `default()` failing, not from the gate.
         assert!(!crate::is_handling_transaction());
         assert!(
             !check_permission(&kernel_parcel, "android.permission.INTERNET"),
@@ -373,11 +342,7 @@ mod tests {
         );
     }
 
-    /// Plan 2-16 Phase C: an installed [`PermissionAuthority`] owns the
-    /// decision for every transport and receives the transport-tagged
-    /// [`Caller`]. Here a policy grants one permission to a specific
-    /// Unix-RPC uid — which the *default* path would unconditionally deny
-    /// over RPC — proving the slot can implement RPC authorization.
+    /// Plan 2-16 Phase C: an installed authority grants a Unix-RPC uid what the default denies.
     #[cfg(feature = "rpc")]
     #[serial_test::serial(authority)]
     #[test]
@@ -406,8 +371,7 @@ mod tests {
         let mut rpc_parcel = Parcel::new();
         rpc_parcel.set_for_rpc(true);
 
-        // Inside an RPC transaction from uid 1000: the authority grants the
-        // one permission it knows, and denies everything else.
+        // RPC uid 1000: the authority grants its one permission and denies everything else.
         {
             let _g = RpcCallingGuard::install(
                 Arc::new(PeerIdentity::Local { uid: 1000, pid: 7 }),

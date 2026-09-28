@@ -16,9 +16,64 @@
 //! module; the in-process `mem` backend frames implicitly (one channel
 //! message == one frame).
 //!
+//! The shared stream frame is `u32 little-endian length | <length> body
+//! bytes`, with no magic and no self-sync: the length alone delimits the
+//! frame and is bounded by `MAX_FRAME_LEN` before allocation. `write_frame`
+//! coalesces the length and the body into one buffer and one `write_all`,
+//! so a concurrent writer can never splice between them. The cross-thread
+//! correctness guarantee is slot occupancy (`session.rs` `ConnGuard`: a
+//! slot is held by one thread's `exclusive_tid`); the single write additionally keeps the lock-free
+//! small-frame paths (a `DEC_STRONG` from `RpcProxy::drop`) from ever
+//! emitting a half-frame.
+//!
 //! The trait is **synchronous / blocking** (matches android-12 r34's
 //! blocking-thread model). An `async` adapter can be layered *on top*
 //! without changing this trait.
+//!
+//! # Short reads and writes
+//!
+//! A frame header read that sees EOF before any byte is a clean
+//! [`RpcError::EndOfStream`]; a partial header then EOF is
+//! [`RpcError::Truncated`]. A transport that can tell an unclean end apart
+//! ([`RpcError::UncleanEndOfStream`], TLS with no `close_notify`) reports it
+//! as itself before any progress and as `Truncated` after: mid-frame, the
+//! stream position is what is lost. Once the header is committed, any short
+//! body read has lost the position too: `Truncated` if the stream ended,
+//! [`RpcError::DeadlineMidFrame`] if a read deadline cut it.
+//!
+//! `write_all_reporting` is `write_all` that tells a failure which put
+//! nothing on the wire apart from one that stopped part-way; `write_all`
+//! reports the same error either way. The session's send-failure rule needs
+//! the difference: a frame that stopped part-way left the peer a header it
+//! will complete out of whatever arrives next, so its connection must be
+//! retired, while a frame that never started left the stream
+//! frame-synchronized and its connection healthy. A send deadline
+//! (`SO_SNDTIMEO`) that expires before the first byte is therefore
+//! [`RpcError::Timeout`] (the value a read deadline that consumed nothing
+//! already yields), and every other failure, at any position, stays the
+//! transport error. The writer must report partial progress honestly, as a
+//! socket does. An adapter that hands the whole buffer to another
+//! all-or-nothing send does not, and classifies at its own level instead:
+//! `tls` never reports this, because a record its socket write dropped is
+//! gone from the sequence whether or not a byte of it went out.
+//!
+//! `is_timeout` decides whether an I/O operation failed on a deadline this
+//! end armed: `SO_RCVTIMEO` for the framing readers, `SO_SNDTIMEO` for
+//! `write_all_reporting` and for `tls`'s teardown control flush. On the
+//! supported platforms both surface as `WouldBlock`. `TimedOut` is included
+//! because the `Read` adapters carry `RpcError::Timeout` across the
+//! `RpcError` ⇄ `io::Error` boundary with exactly that kind, and the framing
+//! readers sit on top of both. The cost is that a raw socket's own
+//! `ETIMEDOUT` (a peer whose host stopped answering, not a deadline of ours)
+//! is `TimedOut` too and cannot be told apart here; what is decided on that
+//! distinction (see [`SessionEnd::new`](super::SessionEnd)) is decided from
+//! whether a deadline was armed at all.
+//!
+//! # Mutation gates
+//!
+//! - `a_send_deadline_is_a_timeout_only_before_the_first_byte`: dropping the
+//!   `sent == 0` guard in `write_all_reporting` makes the second case report
+//!   `Timeout` as well, and a peer left half a frame keeps its slot.
 
 use std::fmt;
 use std::io::{ErrorKind, Read, Write};
@@ -194,9 +249,7 @@ pub trait RpcTransport: Send + Sync {
         if fds.is_empty() {
             self.send_frame(buf)
         } else {
-            // The predicate and this default must not disagree: a `true`
-            // here would have the session advertise FD_PASSING for a
-            // send that always fails.
+            // A `true` predicate here would advertise FD_PASSING for a send that always fails.
             debug_assert!(!self.supports_fd_passing());
             Err(RpcError::Protocol(
                 "this transport cannot pass file descriptors (UDS only)",
@@ -217,11 +270,10 @@ pub trait RpcTransport: Send + Sync {
     /// framing itself via `wire_android13`. The default is
     /// **unsupported**: right for a frame-only backend (`mem`), and a
     /// silent trap for a byte-stream one — an android-13+ session over a
-    /// backend that forgot it fails at its first handshake byte (it
-    /// happened to `vsock`, then to `tcp_debug`). Every stream backend
-    /// (`unix`, `tcp_debug`, `vsock`, `tls`) must override both this and
-    /// [`recv_raw`](Self::recv_raw). The existing R34 path never calls
-    /// this — `send_frame`/`recv_frame` are byte-unchanged.
+    /// backend that does not override it fails at its first handshake
+    /// byte. Every stream backend (`unix`, `tcp_debug`, `vsock`, `tls`)
+    /// must override both this and [`recv_raw`](Self::recv_raw). The R34
+    /// path never calls this; it uses `send_frame`/`recv_frame`.
     fn send_raw(&self, _buf: &[u8]) -> RpcResult<()> {
         Err(RpcError::Protocol("this transport has no raw byte access"))
     }
@@ -394,12 +446,7 @@ impl fmt::Display for PeerIdentity {
     }
 }
 
-// --- Length-prefix framing shared by stream backends -----------------
-//
-// Wire shape: `u32 little-endian length | <length> body bytes`. No
-// magic / self-sync — the length is authoritative and bounded by
-// MAX_FRAME_LEN before allocation. The `mem` backend does not use this
-// (a channel message is already a frame).
+// --- Length-prefix framing shared by stream backends (module doc) ---
 
 /// Write one length-prefixed frame to a blocking stream.
 pub(crate) fn write_frame<W: Write>(w: &mut W, buf: &[u8]) -> RpcResult<()> {
@@ -409,14 +456,7 @@ pub(crate) fn write_frame<W: Write>(w: &mut W, buf: &[u8]) -> RpcResult<()> {
             max: MAX_FRAME_LEN,
         });
     }
-    // Length prefix + body coalesced into ONE buffer / ONE `write_all`
-    // so the 4-byte length and the body can never be spliced by a
-    // concurrent writer (the 3-`write_all` form let two threads
-    // interleave a frame irrecoverably). The cross-thread *correctness*
-    // guarantee is the per-session connection lock (session.rs
-    // `enter_connection`); this additionally keeps the lock-free
-    // small-frame paths (e.g. a `DEC_STRONG` from `RpcProxy::drop`)
-    // from ever emitting a half-frame.
+    // One buffer, one `write_all`: no writer can splice a frame (module doc).
     let mut framed = Vec::with_capacity(4 + buf.len());
     framed.extend_from_slice(&(buf.len() as u32).to_le_bytes());
     framed.extend_from_slice(buf);
@@ -425,24 +465,7 @@ pub(crate) fn write_frame<W: Write>(w: &mut W, buf: &[u8]) -> RpcResult<()> {
     Ok(())
 }
 
-/// `write_all`, but telling a failure that put **nothing** on the wire
-/// apart from one that stopped part-way.
-///
-/// `write_all` reports the same error either way, and the session's
-/// send-failure rule needs the difference: a frame that stopped part-way
-/// left the peer a header it will complete out of whatever arrives next,
-/// so its connection must be retired, while a frame that never started
-/// left the stream frame-synchronized and its connection healthy. A send
-/// deadline (`SO_SNDTIMEO`) that expires before the first byte is
-/// therefore [`RpcError::Timeout`] — the value a read deadline that
-/// consumed nothing already yields — and every other failure, at any
-/// position, stays the transport error.
-///
-/// `w` must report partial progress honestly, as a socket does. An
-/// adapter that hands the whole buffer to another all-or-nothing send does
-/// not, and classifies at its own level instead: `tls` never reports this,
-/// because a record its socket write dropped is gone from the sequence
-/// whether or not a byte of it went out.
+/// `write_all`, `Timeout` only before the first byte; see module doc "Short reads and writes".
 pub(crate) fn write_all_reporting<W: Write>(w: &mut W, buf: &[u8]) -> RpcResult<()> {
     let mut sent = 0;
     while sent < buf.len() {
@@ -457,12 +480,7 @@ pub(crate) fn write_all_reporting<W: Write>(w: &mut W, buf: &[u8]) -> RpcResult<
     Ok(())
 }
 
-/// Read exactly `buf.len()` bytes for a *frame header*. Zero bytes
-/// before any progress is a clean [`RpcError::EndOfStream`]; a partial
-/// header then EOF is [`RpcError::Truncated`]. A transport that can tell
-/// an unclean end apart ([`RpcError::UncleanEndOfStream`], TLS with no
-/// `close_notify`) reports it as itself before any progress and as
-/// `Truncated` after — mid-frame, the stream position is what is lost.
+/// Read exactly `buf.len()` header bytes; see module doc "Short reads and writes".
 fn read_header<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
     let mut filled = 0;
     while filled < buf.len() {
@@ -476,9 +494,7 @@ fn read_header<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
             }
             Ok(n) => filled += n,
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            // A read deadline that elapses with nothing consumed is a
-            // clean Timeout (stream still frame-synchronized); mid-
-            // header it is a desync → Truncated.
+            // Nothing consumed: clean Timeout (still frame-synchronized); mid-header: desync.
             Err(e) if is_timeout(&e) => {
                 return Err(if filled == 0 {
                     RpcError::Timeout
@@ -489,10 +505,7 @@ fn read_header<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
             Err(e) if e.kind() == ErrorKind::UnexpectedEof && filled > 0 => {
                 return Err(RpcError::Truncated);
             }
-            // Past the first byte the header is committed, so a disconnect
-            // has lost the position whichever kind it arrived as: the ones
-            // `From<io::Error>` folds into `EndOfStream` (a reset among
-            // them) do not mean "nothing was pending" here.
+            // Past the first byte any disconnect, even one folded to `EndOfStream`, lost position.
             Err(e) => {
                 return Err(match RpcError::from(e) {
                     RpcError::EndOfStream if filled > 0 => RpcError::Truncated,
@@ -504,25 +517,12 @@ fn read_header<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
     Ok(())
 }
 
-/// Whether an I/O operation failed on a deadline this end armed:
-/// `SO_RCVTIMEO` for the framing readers, `SO_SNDTIMEO` for
-/// [`write_all_reporting`] and for `tls`'s teardown control flush. On the
-/// supported platforms both surface as `WouldBlock`; `TimedOut` is here
-/// because the `Read`
-/// adapters carry [`RpcError::Timeout`] across the `RpcError` ⇄
-/// `io::Error` boundary with exactly that kind, and the framing readers
-/// sit on top of both. The cost is that a raw socket's own `ETIMEDOUT` —
-/// a peer whose host stopped answering, not a deadline of ours — is
-/// `TimedOut` too and cannot be told apart here; what is decided on that
-/// distinction (see [`SessionEnd::new`](super::SessionEnd)) is decided
-/// from whether a deadline was armed at all.
+/// `WouldBlock` or `TimedOut`: a deadline this end armed; see module doc "Short reads and writes".
 pub(crate) fn is_timeout(e: &std::io::Error) -> bool {
     matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
 
-/// The socket backends' `shutdown`: a second call raises `ENOTCONN` on
-/// macOS (Linux returns `Ok`), and the trait promises idempotence, so that
-/// one is absorbed. Anything else is the diagnostic the trait documents.
+/// Socket `shutdown` result, absorbing macOS's `ENOTCONN` on a second call (trait: idempotent).
 pub(crate) fn absorb_already_shut(r: std::io::Result<()>) -> RpcResult<()> {
     match r {
         Ok(()) => Ok(()),
@@ -531,10 +531,7 @@ pub(crate) fn absorb_already_shut(r: std::io::Result<()>) -> RpcResult<()> {
     }
 }
 
-/// Read exactly `buf.len()` body bytes. The header was already
-/// committed, so any short read has lost the stream position:
-/// [`RpcError::Truncated`] if the stream ended, [`RpcError::DeadlineMidFrame`]
-/// if a read deadline cut it ([`is_timeout`] cannot say whose — see its doc).
+/// Read exactly `buf.len()` body bytes; see module doc "Short reads and writes".
 fn read_body<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
     let mut filled = 0;
     while filled < buf.len() {
@@ -544,9 +541,7 @@ fn read_body<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(e) if is_timeout(&e) => return Err(RpcError::DeadlineMidFrame),
             Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Err(RpcError::Truncated),
-            // The header is already consumed, so every disconnect here is a
-            // cut frame — including the kinds `From<io::Error>` folds into
-            // `EndOfStream` (`ConnectionReset` from a peer killed mid-frame).
+            // Header consumed: any disconnect, even one folded to `EndOfStream`, is a cut frame.
             Err(e) => {
                 return Err(match RpcError::from(e) {
                     RpcError::EndOfStream => RpcError::Truncated,
@@ -611,8 +606,7 @@ mod tests {
         assert_eq!(read_frame(&mut cur).unwrap(), b"second");
     }
 
-    /// Deterministic adversarial cases — must reject without
-    /// allocating, panicking, or looping (mirrors the fuzz target).
+    /// Adversarial headers are rejected without allocating, panicking or looping (as the fuzzer).
     #[test]
     fn hostile_frame_headers_are_rejected_safely() {
         // Declared u32::MAX, no body: rejected pre-allocation.
@@ -659,8 +653,7 @@ mod tests {
 
     #[test]
     fn write_frame_rejects_oversize_payload() {
-        // `Trap` panics on any write: reaching it means the length guard
-        // did not fire.
+        // `Trap` panics on any write: reaching it means the length guard did not fire.
         struct Trap;
         impl Write for Trap {
             fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
@@ -677,14 +670,7 @@ mod tests {
         ));
     }
 
-    /// A send deadline is only frame-synchronized while nothing has gone
-    /// out, and that is the whole difference the session's send-failure
-    /// rule acts on: `Timeout` keeps the connection, a transport error
-    /// retires it.
-    ///
-    /// **Mutant gate**: dropping the `sent == 0` guard makes the second
-    /// case report `Timeout` as well, and a peer left half a frame keeps
-    /// its slot.
+    /// `Timeout` (connection kept) only while nothing went out; see module doc "Mutation gates".
     #[test]
     fn a_send_deadline_is_a_timeout_only_before_the_first_byte() {
         struct Stall(usize);

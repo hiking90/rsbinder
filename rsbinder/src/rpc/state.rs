@@ -9,29 +9,72 @@
 //! an address space and the RPC test suite is parallel-safe by
 //! construction (unlike the kernel binder singleton).
 //!
-//! Ref-count model (AOSP `RpcState` `BinderNode::timesSent` /
-//! `flushExcessBinderRefs`): a local
-//! object gets one address by *identity* (`Arc` pointer dedup, so the
-//! same object always marshals to the same address), but the entry's
-//! strong count is **`timesSent`**: it starts at 1 on the first send
-//! and is **incremented on every subsequent send** (each flatten to
-//! the peer is one reference the peer will eventually `DEC_STRONG`).
-//! Each inbound `DEC_STRONG` decrements it; the entry (and its strong
-//! `SIBinder`) is dropped at 0, so there is no leak.
+//! # Ref-count model
 //!
-//! The peer dedups one `RpcProxy` per address. To keep the books
-//! balanced when it *receives the same binder more than once* while a
-//! proxy is still live, it owes the sender one `DEC_STRONG` per excess
-//! receipt — the rsbinder equivalent of AOSP `flushExcessBinderRefs`
-//! ([`RpcState::remote_proxy`] reports the excess; the session sends
-//! the `DEC_STRONG` **outside** the state lock — see
-//! `RpcSessionInner::read_binder`). Net: exactly one `DEC_STRONG` per
-//! send ⇒ balanced ⇒ no leak whether the binder is sent N× to one
-//! peer (dedup + N−1 excess DECs + 1 drop DEC) **or** once to each of
-//! N independent peer connections sharing a session (N sends, N drop
-//! DECs). Pinning the count at 1 by identity would silently break the
-//! latter (the first connection's proxy drop frees the node ⇒ the
-//! sibling connection's proxy `DeadObject`).
+//! AOSP `RpcState::BinderNode` keeps two counts per address: `timesSent`,
+//! the sends of the address the peer still owes a `DEC_STRONG` for, and
+//! `timesRecd`, the receipts this end owes the peer. rsbinder keeps the same
+//! books this way:
+//!
+//! * **Sending a local object.** It gets one address by *identity* (`Arc`
+//!   pointer dedup, so the same object always marshals to the same address),
+//!   but the node's strong count is **`timesSent`**: +1 on every send
+//!   ([`RpcState::on_binder_leaving`]), −`amount` on every inbound
+//!   `DEC_STRONG`, and the node with its strong `SIBinder` is dropped at 0.
+//! * **Sending a proxy.** No count: the parcel pins the proxy until it drops,
+//!   so its own `DEC_STRONG` cannot overtake the send. AOSP bumps the proxy
+//!   node's `timesSent` here too; the `DEC_STRONG` an AOSP peer returns for it
+//!   names an address that is not one of our nodes, and
+//!   [`RpcState::dec_strong_local`] ignores it.
+//! * **Receiving a peer's address.** One `RpcProxy` per address
+//!   ([`RpcState::remote_proxy`]). Each receipt owes the sender one
+//!   `DEC_STRONG`: the receipt that mints the proxy is paid when the proxy
+//!   drops, and a receipt deduped onto a live proxy (`excess`) is paid at once
+//!   (AOSP `flushExcessBinderRefs`). The total equals AOSP's `timesRecd`.
+//! * **Receiving one of our own addresses.** The peer took a `timesSent` for
+//!   it when it sent it, so each receipt is paid with `DEC_STRONG` 1 at once
+//!   (AOSP `flushExcessBinderRefs` on a local binder). On the android-13+ wire
+//!   the target of an inbound transaction is a receipt too: AOSP
+//!   `transactInternal` calls `onBinderLeaving` on the target proxy
+//!   (android-13.0.0_r1 `RpcState.cpp:466`, android-17.0.0_r1 `:615`) and the
+//!   server's `processTransactInternal` enters it. Each transaction the oneway
+//!   gate or the twoway lookup resolves to a local node therefore owes one
+//!   `DEC_STRONG`, whatever happens to it next (run, parked and drained,
+//!   dropped as stale or as a duplicate, flushed on `Terminate`). The r34 wire
+//!   does not count targets.
+//! * **Where a receipt happens.** A received parcel enters each object position
+//!   at most once and keeps what it entered (AOSP `mAcquiredEnteringBinders`,
+//!   android-16.0.0_r4), so reading a position again owes nothing. At wire v2
+//!   every binder position is entered when the parcel arrives, read or not. A
+//!   parcel this end did not receive only looks an address up and owes nothing.
+//!   The `parcel` module doc "RPC fields" has the table; the session module doc
+//!   "Deferred `DEC_STRONG`" has the connection each `DEC_STRONG` goes out on.
+//!
+//! Net: exactly one `DEC_STRONG` per send, whether the binder is sent N× to
+//! one peer (dedup + N−1 excess DECs + 1 drop DEC) **or** once to each of N
+//! peer connections sharing a session (N sends, N drop DECs). Pinning the
+//! count at 1 by identity would break the latter: the first connection's
+//! proxy drop would free a node the sibling connection's proxy still names
+//! (`DeadObject`). Every `DEC_STRONG` goes out **outside** the state lock.
+//!
+//! # Oneway backlog
+//!
+//! AOSP `RpcState.cpp` `kArbitraryOnewayCallTerminateLevel`
+//! (`ASYNC_TODO_TERMINATE_LEVEL`): once that many out-of-order oneways are
+//! parked on one node, the peer is treated as hostile or buggy. The node's
+//! parked backlog is flushed (reclaiming its memory and held fds at once)
+//! and the delivering connection is torn down, rather than letting the
+//! per-node `async_todo` queue grow without bound (memory + fd exhaustion
+//! DoS). A node therefore holds at most that many parked entries at any
+//! instant.
+//!
+//! # Async-number wrap
+//!
+//! The per-node `async_number` is a `u64`, so a wrap means 2^64 oneways to
+//! one node — effectively unreachable. AOSP `nodeProgressAsyncNumber`
+//! returns `false` and tears the session down at overflow; rsbinder has no
+//! equivalent kill switch on the send or receive path, so it wraps, logs,
+//! and lets the peer surface the duplicate as a protocol error.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -43,9 +86,7 @@ use crate::binder::{IBinder, SIBinder};
 use super::address::{AddressSpace, RpcAddress};
 use super::wire::WireTransaction;
 
-/// Per-node `asyncTodo` queue entry. `Ord` by `async_number` so a
-/// `BinaryHeap<Reverse<AsyncTodo>>` gives min-heap top-is-smallest
-/// (AOSP `BinderNode::AsyncTodo` `operator<` uses the same trick).
+/// `asyncTodo` entry, `Ord` by `async_number` for a `Reverse` min-heap (AOSP `AsyncTodo`).
 struct AsyncTodo {
     async_number: u64,
     transaction: WireTransaction,
@@ -76,23 +117,27 @@ pub enum DropReason {
     /// `mNodeForAddress.find` miss — peer addressed a binder we have
     /// never published or have already released. Benign for oneway.
     UnknownAddress,
-    /// `wire_async < node.asyncNumber` — duplicate / replay / peer
-    /// bug; AOSP-divergent (AOSP terminates the session here).
+    /// `wire_async < node.asyncNumber` — duplicate / replay / peer bug.
+    /// AOSP parks every number other than the expected one
+    /// (android-17.0.0_r1 `RpcState.cpp:1099-1133`), so a stale one waits in
+    /// `asyncTodo` for the node's lifetime; rsbinder drops it at once. Either
+    /// way it was entered, so it still owes the peer one `DEC_STRONG` on the
+    /// android-13+ wire (module doc "Ref-count model").
     StaleAsyncNumber,
 }
 
-/// AOSP `RpcState.cpp` `kArbitraryOnewayCallTerminateLevel`: once this
-/// many out-of-order oneways are parked on a single node, the peer is
-/// treated as hostile/buggy — the node's parked backlog is flushed
-/// (reclaiming its memory + held fds at once) and the delivering
-/// connection is torn down, rather than letting the per-node
-/// `async_todo` queue grow without bound (memory + fd exhaustion DoS).
-/// This bounds a node to at most this many parked entries at any instant.
+/// What [`RpcState::advance_and_pop_async`] found once the node's counter advanced.
+#[derive(Debug, Default)]
+pub struct AsyncAdvance {
+    /// The parked entry now in order, to dispatch outside the state lock.
+    pub next: Option<(WireTransaction, Vec<OwnedFd>)>,
+    /// Parked entries below the new expected number, dropped without running.
+    pub purged: u32,
+}
+
+/// AOSP `kArbitraryOnewayCallTerminateLevel`: per-node parked cap; see module doc "Oneway backlog".
 const ASYNC_TODO_TERMINATE_LEVEL: usize = 10000;
-/// AOSP `kArbitraryOnewayCallWarnLevel` / `kArbitraryOnewayCallWarnPer`
-/// (both 1000): emit a warning at each multiple of this once the queue
-/// is this deep, so a building backlog is observable before the
-/// terminate watermark.
+/// AOSP `kArbitraryOnewayCallWarn{Level,Per}` (both 1000): warn at each multiple of this depth.
 const ASYNC_TODO_WARN_PER: usize = 1000;
 
 /// Outcome of [`RpcState::dispatch_async_or_enqueue`] for an inbound
@@ -106,7 +151,8 @@ pub enum AsyncDecision {
     Enqueued,
     Drop(DropReason),
     /// The per-node `async_todo` queue reached the terminate watermark
-    /// (count carried for logging); the backlog has already been flushed
+    /// (the count, arrival included, is logged and is the number of
+    /// `DEC_STRONG`s the flushed entries owe); the backlog has already been flushed
     /// here. The caller must tear the delivering connection down with
     /// `FAILED_TRANSACTION`. Unlike AOSP `shutdownAndWait` this is
     /// connection-level, not whole-session — but the flush above means
@@ -119,49 +165,50 @@ pub enum AsyncDecision {
 struct LocalNode {
     /// Strong ref keeps the local object alive while the peer holds it.
     binder: SIBinder,
-    /// `binder_ptr(&binder)` — the `local_by_ptr` key, kept so removal is
-    /// a map lookup rather than a scan of every node.
+    /// `binder_ptr(&binder)`: the `local_by_ptr` key, so removal needs no scan of every node.
     ptr: usize,
     /// RPC strong count the peer holds (0 ⇒ drop the node).
     strong: i64,
-    /// AOSP `BinderNode::asyncNumber` (server side) — per-node, not
-    /// session-global.
+    /// AOSP `BinderNode::asyncNumber` (server side); per node, not session-global.
     next_async_number: u64,
-    /// AOSP `BinderNode::asyncTodo` — min-heap (via `Reverse`) of
-    /// out-of-order inbound oneway transactions.
+    /// AOSP `BinderNode::asyncTodo`: min-heap (via `Reverse`) of out-of-order inbound oneways.
     async_todo: BinaryHeap<Reverse<AsyncTodo>>,
 }
 
 /// Per-session object/address table. Owned by `RpcSessionInner` behind
-/// a `Mutex`; never global (enforced by the `rpc_no_globals` grep
-/// gate).
+/// a `Mutex`; never global (enforced by the `rpc_stack_has_no_globals`
+/// gate). No `Parcel` drops under that lock: an unsent one's `Drop` re-takes it, and so
+/// does a received one's, whose entered proxies send their `DEC_STRONG` and
+/// `forget_remote_if` on drop.
+///
+/// # Send-side async numbers
+///
+/// The per-remote-address send counters (AOSP `BinderNode::asyncNumber`,
+/// client side) are dropped together with the proxy slot in
+/// `forget_remote_if`: the peer's `timesSent` also reaches 0 then, so its
+/// `BinderNode` is GC'd and the counter restart matches. The narrow race —
+/// a `DEC_STRONG` still in flight when a sibling connection re-resolves the
+/// same address — drops every oneway numbered below the peer's counter on
+/// the peer's `Drop(StaleAsyncNumber)` arm.
 pub struct RpcState {
     /// Objects we exposed to the peer, keyed by assigned address.
     local_nodes: HashMap<RpcAddress, LocalNode>,
-    /// Dedup: local object `Arc` identity → its assigned address, so
-    /// the same object always marshals to the same address.
+    /// Dedup: local object `Arc` identity → address, so one object always marshals to one address.
     local_by_ptr: HashMap<usize, RpcAddress>,
-    /// Remote proxies we hold, keyed by address. `Weak` so the table
-    /// does not keep them alive; lets us dedup one `RpcProxy` per
-    /// address and observe its last drop.
+    /// Remote proxies by address, `Weak`: dedups one `RpcProxy` per address and sees its last drop.
     remote_proxies: HashMap<RpcAddress, sync::Weak<dyn IBinder>>,
-    /// AOSP `BinderNode::asyncNumber` (client side). Entries are
-    /// dropped together with the proxy slot in `forget_remote_if`
-    /// (peer's `timesSent` also reaches 0 then, so its `BinderNode`
-    /// is GC'd and the counter restart matches). The narrow race —
-    /// DEC still in flight when a sibling connection re-resolves the
-    /// same address — degrades to a single best-effort oneway drop
-    /// on the peer's `Drop(StaleAsyncNumber)` arm.
+    /// AOSP `BinderNode::asyncNumber` (client side); see "Send-side async numbers" above.
     remote_send_async_counters: HashMap<RpcAddress, u64>,
     /// Monotonic address allocator (per-session).
     addr_counter: u64,
-    /// This endpoint's address subspace (initiator vs acceptor) so the
-    /// two peers on a connection never mint colliding addresses.
+    /// This endpoint's address subspace (initiator vs acceptor): the two peers never collide.
     space: AddressSpace,
+    /// Test: inbound `DEC_STRONG` (amount sum, command count) per address, ignored ones included.
+    #[cfg(test)]
+    dec_received: HashMap<RpcAddress, (u64, u64)>,
 }
 
-/// Stable identity for a local binder's allocation (data pointer of
-/// the trait-object `Arc`).
+/// Identity of a local binder's allocation: the data pointer of its trait-object `Arc`.
 fn binder_ptr(b: &SIBinder) -> usize {
     Arc::as_ptr(b.as_arc()) as *const () as usize
 }
@@ -176,6 +223,8 @@ impl RpcState {
             remote_send_async_counters: HashMap::new(),
             addr_counter: 0,
             space,
+            #[cfg(test)]
+            dec_received: HashMap::new(),
         }
     }
 
@@ -190,6 +239,14 @@ impl RpcState {
     /// dedups; see the module doc). Returning without bumping would let
     /// the first connection's DEC free a node still referenced over a
     /// sibling connection (`DeadObject`).
+    ///
+    /// Minting a new address fails with `FailedTransaction` once the counter
+    /// reaches `u32::MAX`: the android-13+ wire encodes only the low 32 bits
+    /// of the address counter (`encode_addr`), so past that two live nodes
+    /// would alias to one `RpcWireAddress` and mis-dispatch. This is a hard
+    /// stop rather than an alias, unlike the async-number wrap (an
+    /// ordering-only concern that only warns); ~2^32 live local objects per
+    /// session is unreachable in practice.
     pub fn on_binder_leaving(&mut self, binder: &SIBinder) -> crate::Result<RpcAddress> {
         let ptr = binder_ptr(binder);
         if let Some(&addr) = self.local_by_ptr.get(&ptr) {
@@ -198,11 +255,7 @@ impl RpcState {
             }
             return Ok(addr);
         }
-        // The android-13+ wire encodes only the low 32 bits of the address
-        // counter (`encode_addr`), so past `u32::MAX` two live nodes would
-        // alias to one `RpcWireAddress` and mis-dispatch. Hard-stop rather
-        // than alias (vs. the async-number wrap, an ordering-only concern that
-        // only warns); ~2^32 live local objects per session is unreachable.
+        // Refuse rather than alias a 32-bit wire address (see fn doc).
         if self.addr_counter >= u32::MAX as u64 {
             log::error!(
                 "RPC: local address counter exhausted (>= u32::MAX) on one session; \
@@ -233,14 +286,14 @@ impl RpcState {
     }
 
     /// Roll back one `on_binder_leaving` strong bump for `addr` when the
-    /// transaction that would have carried the binder fails to send (AOSP
-    /// `cancelBinderLeaving`). The peer never received the binder, so it will
-    /// never send the matching `DEC_STRONG`; without this the node (and the
-    /// strong `SIBinder` it pins) would leak for the rest of a multi-connection
-    /// session, which — unlike AOSP — rsbinder does not tear down on a send
-    /// failure. The bump and this rollback are a commutative ±1 on a count, so
-    /// this is safe even if another thread concurrently sends the same binder.
-    /// Drops the node once the count reaches 0, exactly like an inbound DEC.
+    /// parcel that took the bump is dropped unsent (AOSP `cancelBinderLeaving`).
+    /// The peer never received the binder, so it will never send the matching
+    /// `DEC_STRONG`; without this the node (and the strong `SIBinder` it pins)
+    /// would leak for the rest of a multi-connection session, which — unlike
+    /// AOSP — rsbinder does not tear down on a send failure. The bump and this
+    /// rollback are a commutative ±1 on a count, so this is safe even if
+    /// another thread concurrently sends the same binder. Drops the node once
+    /// the count reaches 0, exactly like an inbound DEC.
     ///
     /// Returns the node's strong ref if this removed it; the caller must drop
     /// it **outside** the state lock (see [`dec_strong_local`](Self::dec_strong_local)).
@@ -276,6 +329,12 @@ impl RpcState {
     /// lock (`forget_remote_if`) — dropping it in here deadlocks the session.
     #[must_use = "drop the returned SIBinder outside the RpcState lock"]
     pub fn dec_strong_local(&mut self, addr: &RpcAddress, amount: u32) -> Option<SIBinder> {
+        #[cfg(test)]
+        {
+            let seen = self.dec_received.entry(*addr).or_default();
+            seen.0 += u64::from(amount);
+            seen.1 += 1;
+        }
         if let Some(node) = self.local_nodes.get_mut(addr) {
             node.strong -= amount as i64;
             if node.strong <= 0 {
@@ -337,6 +396,14 @@ impl RpcState {
         Ok((sib, false))
     }
 
+    /// The live proxy for `addr`, if any, without minting one; drop it outside the state lock.
+    pub fn lookup_remote(&self, addr: &RpcAddress) -> Option<SIBinder> {
+        self.remote_proxies
+            .get(addr)?
+            .upgrade()
+            .map(SIBinder::from_arc)
+    }
+
     /// Forget the remote-proxy table entry for `addr`, but **only if
     /// the slot still points at the proxy `who`** (the dropping
     /// `RpcProxy`'s data address). Called from `RpcProxy::drop` after
@@ -351,18 +418,19 @@ impl RpcState {
     /// and breaking the "exactly one live proxy ⇒ exactly one
     /// `DEC_STRONG`" invariant. The identity check makes
     /// a stale `Drop` a no-op against a re-cached successor.
+    ///
+    /// On a match it also drops the per-address send-side `async_number`
+    /// counter. The proxy that owned the address is gone and its matching
+    /// `DEC_STRONG` is sent shortly; after it lands, the peer's `BinderNode`
+    /// either survives (`timesSent > 0` on the peer side — the next resolve
+    /// restarts from 0) or is GC'd (the counter is irrelevant). Either way
+    /// the book is closed for *this* proxy generation, and dropping it keeps
+    /// the map bounded by the live address set.
     pub fn forget_remote_if(&mut self, addr: &RpcAddress, who: *const ()) {
         if let Some(weak) = self.remote_proxies.get(addr) {
             if weak.as_ptr() as *const () == who {
                 self.remote_proxies.remove(addr);
-                // The proxy that owned this address is gone; the
-                // matching `DEC_STRONG` will be sent shortly. After it
-                // lands, the peer's `BinderNode` either survives (if
-                // `timesSent > 0` on the peer side — we re-resolve and
-                // restart from 0) or is GC'd (counter is irrelevant).
-                // Either way the per-address `async_number` book is
-                // closed for *this* proxy generation; drop it so the
-                // map stays bounded by the live address set.
+                // Close this generation's `async_number` book (see fn doc).
                 self.remote_send_async_counters.remove(addr);
             }
         }
@@ -373,13 +441,7 @@ impl RpcState {
         self.local_nodes.len()
     }
 
-    /// Strong snapshot of every cached remote proxy still alive, for
-    /// the session's connection-loss obituary sweep (AOSP
-    /// `RpcState::sendObituaries` gathers strong pointers under the
-    /// node lock, then the *caller* fires `binder_died` **after**
-    /// releasing the lock — so a recipient may re-enter
-    /// `unlink_to_death` without deadlocking). Dead `Weak`s are
-    /// skipped (their proxies are already gone).
+    /// Live proxies for the obituary sweep (AOSP `sendObituaries`); fire `binder_died` unlocked.
     pub(crate) fn remote_proxy_snapshot(&self) -> Vec<sync::Arc<dyn IBinder>> {
         self.remote_proxies
             .values()
@@ -391,12 +453,11 @@ impl RpcState {
     /// send-side `async_number` (AOSP `nodeProgressAsyncNumber` on the
     /// send path). Returns the value to stamp on the outgoing wire.
     /// Auto-creates the counter at `0` if unseen. Decoupled from
-    /// `remote_proxies` so the counter survives a proxy `Drop` + re-
-    /// resolve on a sibling connection: the
-    /// peer's `BinderNode` is still alive (`timesSent > 0` on any
-    /// active connection), and resetting our counter would replay
-    /// numbers the peer's `asyncTodo` already processed — stalling
-    /// the per-node monotonic-stream contract forever.
+    /// `remote_proxies` so the counter survives only a stale `Drop`
+    /// whose proxy was already re-cached (`forget_remote_if` checks
+    /// identity): the peer's `BinderNode` is still alive, and resetting
+    /// our counter would replay numbers the peer's `asyncTodo` already
+    /// processed.
     ///
     /// Overflow: u64 wrap means a session issued 2^64 oneways to one
     /// node, effectively unreachable; AOSP `nodeProgressAsyncNumber`
@@ -457,19 +518,10 @@ impl RpcState {
                 transaction: txn,
                 in_fds,
             }));
-            // AOSP RpcState.cpp lines 1109–1129: bound the out-of-order
-            // backlog so a peer that addresses a known node with
-            // ever-increasing future async numbers (while the expected
-            // one never arrives) cannot grow this heap — and the fds it
-            // owns — without limit.
+            // AOSP RpcState.cpp:1109–1129: bound the out-of-order backlog and the fds it owns.
             let num_pending = node.async_todo.len();
             if num_pending >= ASYNC_TODO_TERMINATE_LEVEL {
-                // Flush the abusive node's backlog now so its memory +
-                // any held fds are reclaimed immediately, independent of
-                // the caller's connection teardown. Without this, on a
-                // multi-connection session the heap would persist (and a
-                // reconnecting peer could re-accrete one entry per
-                // terminate); flushing keeps the bound tight.
+                // Flush now: frees memory/fds even if a multi-conn session survives this.
                 node.async_todo.clear();
                 return AsyncDecision::Terminate(num_pending);
             }
@@ -488,41 +540,55 @@ impl RpcState {
     /// the previously-returned [`AsyncDecision::Dispatch`], advance
     /// the per-node counter and pop the next eligible queued entry
     /// (if its `async_number` matches the now-advanced counter). The
-    /// caller calls this in a loop until it returns `None`, then
+    /// caller calls this in a loop until `next` is `None`, then
     /// stops draining. Each pop dispatches outside the state lock.
     ///
     /// AOSP `RpcState::processTransactInternal` lines 1247–1278 (the
     /// `goto processTransactInternalTailCall` loop).
-    pub fn advance_and_pop_async(
-        &mut self,
-        addr: RpcAddress,
-    ) -> Option<(WireTransaction, Vec<OwnedFd>)> {
-        let node = self.local_nodes.get_mut(&addr)?;
+    ///
+    /// Parked entries left below the new expected number (duplicates of a
+    /// number already run) are dropped and counted in
+    /// [`AsyncAdvance::purged`]: each was entered, so the caller still owes
+    /// the peer a `DEC_STRONG` for it. AOSP leaves such an entry parked,
+    /// unreachable, until the node goes.
+    pub fn advance_and_pop_async(&mut self, addr: RpcAddress) -> AsyncAdvance {
+        let mut out = AsyncAdvance::default();
+        let Some(node) = self.local_nodes.get_mut(&addr) else {
+            return out;
+        };
         node.next_async_number = node.next_async_number.wrapping_add(1);
         if node.next_async_number == 0 {
             warn_async_wrap(&addr);
         }
-        // Drop heap entries from a hostile/buggy peer that retried below
-        // the expected number (AOSP-divergent — AOSP terminates the
-        // session; we treat them as best-effort oneway loss).
         while let Some(Reverse(top)) = node.async_todo.peek() {
             if top.async_number >= node.next_async_number {
                 break;
             }
             node.async_todo.pop();
+            out.purged = out.purged.saturating_add(1);
         }
         if let Some(Reverse(top)) = node.async_todo.peek() {
             if top.async_number == node.next_async_number {
                 let Reverse(todo) = node.async_todo.pop().expect("peek-pop");
-                return Some((todo.transaction, todo.in_fds));
+                out.next = Some((todo.transaction, todo.in_fds));
             }
         }
-        None
+        out
     }
 
-    /// Test/diagnostic: depth of the `async_todo` queue for a given
-    /// local address (0 if no node). Used by unit tests to
-    /// assert the parking behavior + drain.
+    /// Test: `(amount sum, command count)` of `DEC_STRONG`s received for `addr`, local or not.
+    #[cfg(test)]
+    pub(crate) fn dec_received(&self, addr: &RpcAddress) -> (u64, u64) {
+        self.dec_received.get(addr).copied().unwrap_or_default()
+    }
+
+    /// Test: the address a local binder was sent under, if it has a node.
+    #[cfg(test)]
+    pub(crate) fn local_address_of(&self, binder: &SIBinder) -> Option<RpcAddress> {
+        self.local_by_ptr.get(&binder_ptr(binder)).copied()
+    }
+
+    /// Test: depth of the `async_todo` queue at local `addr` (0 if no node).
     #[cfg(test)]
     pub(crate) fn async_todo_len(&self, addr: &RpcAddress) -> usize {
         self.local_nodes
@@ -531,9 +597,7 @@ impl RpcState {
             .unwrap_or(0)
     }
 
-    /// Test/diagnostic: current `next_async_number` for a local node
-    /// (0 if no node) — used by unit tests to verify the
-    /// counter advances exactly per dispatched oneway.
+    /// Test: `next_async_number` of the local node at `addr` (0 if no node).
     #[cfg(test)]
     pub(crate) fn next_async_number(&self, addr: &RpcAddress) -> u64 {
         self.local_nodes
@@ -543,12 +607,7 @@ impl RpcState {
     }
 }
 
-/// Shared by send-side post-increment and receive-side advance: the
-/// per-node `async_number` is a `u64`, so wrap is "issued 2^64 oneways
-/// to one node" — effectively unreachable. AOSP's
-/// `nodeProgressAsyncNumber` returns `false` and tears down the
-/// session at overflow; rsbinder has no equivalent kill switch on this
-/// path, so we log + let the peer surface it as a duplicate.
+/// Logs an `async_number` wrap on either path; see module doc "Async-number wrap".
 fn warn_async_wrap(addr: &RpcAddress) {
     log::warn!(
         "RPC: per-address async_number wrapped at u64::MAX for {addr:?} — \
@@ -631,9 +690,7 @@ mod tests {
         assert!(st.dec_strong_local(&a, 1).is_none());
     }
 
-    /// A batched DEC_STRONG (`amount > 1`, as a compliant libbinder peer sends
-    /// on a deduped drop) must free a node sent multiple times in one command —
-    /// applying a fixed 1 would leak `amount - 1` refs.
+    /// One batched DEC_STRONG (`amount > 1`) frees a node sent that often; a fixed 1 would leak.
     #[test]
     fn dec_strong_honors_batched_amount() {
         let mut st = RpcState::new(AddressSpace::Acceptor);
@@ -649,9 +706,7 @@ mod tests {
         assert_eq!(st.local_node_count(), 0, "no leak on batched drop");
     }
 
-    /// A send failure rolls back exactly one `on_binder_leaving` bump; the
-    /// node survives while other sends still reference it and is removed only
-    /// when the last bump is cancelled (no leak, no double-free).
+    /// Each send failure rolls back one bump; the node is freed only when the last bump is undone.
     #[test]
     fn cancel_binder_leaving_rolls_back_one_bump() {
         let mut st = RpcState::new(AddressSpace::Acceptor);
@@ -673,13 +728,21 @@ mod tests {
         assert_eq!(st.local_node_count(), 0, "last bump cancelled → node freed");
         assert!(st.lookup_local(&a).is_none());
 
-        // Cancel on an unknown / already-freed address is safe.
-        let _ = st.cancel_binder_leaving(&a);
+        // A stale `leaving_addrs` entry (the peer's DEC came first) must not touch another node.
+        assert!(st.cancel_binder_leaving(&a).is_none());
+        assert_eq!(st.local_node_count(), 0, "a stale cancel changes nothing");
+        let other = SIBinder::new(Arc::new(Dummy)).unwrap();
+        let o = st.on_binder_leaving(&other).unwrap();
+        assert!(st.cancel_binder_leaving(&a).is_none());
+        assert_eq!(
+            st.local_node_count(),
+            1,
+            "a stale cancel leaves live nodes alone"
+        );
+        assert!(st.lookup_local(&o).is_some());
     }
 
-    /// A oneway send failure rolls back its reserved `async_number` only when
-    /// it was the last reservation; if another send already advanced past it,
-    /// rolling back would hand the same number out twice, so it must not.
+    /// A reserved `async_number` rolls back only if no later one was reserved (else issued twice).
     #[test]
     fn cancel_send_async_number_only_when_last_consumer() {
         let mut st = RpcState::new(AddressSpace::Acceptor);
@@ -704,12 +767,7 @@ mod tests {
         );
     }
 
-    /// The android-13+ wire encodes only the low 32 bits of the address
-    /// counter, so once it reaches `u32::MAX` two distinct live nodes would
-    /// alias to one `RpcWireAddress`. `on_binder_leaving` must refuse to
-    /// mint a *new* address past that bound (a hard error) rather than
-    /// silently aliasing — while still serving a resend of an already
-    /// registered object (no new mint).
+    /// At `u32::MAX` a new mint fails (the 32-bit wire address would alias); resends still work.
     #[test]
     fn address_counter_exhaustion_is_rejected_not_aliased() {
         let mut st = RpcState::new(AddressSpace::Acceptor);
@@ -724,12 +782,7 @@ mod tests {
         assert!(st.on_binder_leaving(&b1).is_ok());
     }
 
-    /// Two `RpcState` instances have **independent**
-    /// tables and counters. Addresses are only ever resolved
-    /// within their own session/connection, so the per-session counter
-    /// scheme (both sessions start at 1) is correct — a fresh session
-    /// simply does not know any address it never registered, and
-    /// mutating one session never touches another.
+    /// Two `RpcState`s share no table or counter: neither resolves nor mutates the other's nodes.
     #[test]
     fn two_states_are_isolated() {
         let mut s1 = RpcState::new(AddressSpace::Acceptor);
@@ -737,8 +790,7 @@ mod tests {
         let b1 = SIBinder::new(Arc::new(Dummy)).unwrap();
         let a1 = s1.on_binder_leaving(&b1).unwrap();
 
-        // s2 registered nothing → it does not resolve s1's address,
-        // even though a per-session counter could mint the same bytes.
+        // s2 registered nothing, so it cannot resolve s1's address even with equal bytes.
         assert!(
             s2.lookup_local(&a1).is_none(),
             "independent tables: a fresh session knows no foreign address"
@@ -752,20 +804,13 @@ mod tests {
         assert_eq!(s2.local_node_count(), 0);
     }
 
-    /// Regression: a stale `RpcProxy::drop` (its `Arc` hit
-    /// 0 before `Drop` ran, and a concurrent `read_binder` already
-    /// re-cached a fresh live proxy for the same address) must NOT
-    /// evict the successor. Deterministically reproduces the exact
-    /// drop / re-cache interleave at the `RpcState` level without
-    /// thread timing, then asserts identity-checked `forget_remote_if`
-    /// keeps "exactly one live proxy per address".
+    /// A stale `RpcProxy::drop` after a re-cache must not evict the successor proxy (no threads).
     #[test]
     fn stale_drop_does_not_split_remote_dedup() {
         let mut st = RpcState::new(AddressSpace::Acceptor);
         let addr = RpcAddress::from_wire_bytes([7u8; 32]); // RPC_ADDR_LEN
 
-        // P1 resolved for `addr`, then its last strong ref goes away
-        // (cached `Weak` now dead) — but P1's `Drop` has not yet run.
+        // P1's last strong ref goes (cached `Weak` dead) before P1's `Drop` has run.
         let sib1 = SIBinder::new(Arc::new(Dummy)).unwrap();
         let p1 = Arc::as_ptr(sib1.as_arc()) as *const ();
         let (got1, ex1) = st
@@ -775,8 +820,7 @@ mod tests {
         drop(got1);
         drop(sib1);
 
-        // Concurrent re-resolve: another `read_binder` for the SAME
-        // address sees the dead `Weak` and mints + re-caches P2.
+        // A concurrent `read_binder` for the same address sees the dead `Weak`, caches P2.
         let sib2 = SIBinder::new(Arc::new(Dummy)).unwrap();
         let (got2, ex2) = st
             .remote_proxy(addr, || sib2.clone())
@@ -784,15 +828,14 @@ mod tests {
         assert!(!ex2, "dead-Weak ⇒ re-mint, not an excess receipt");
         let p2 = Arc::as_ptr(got2.as_arc()) as *const ();
 
-        // P1's delayed `Drop` now runs `forget_remote_if(addr, P1)`.
-        // The old unconditional remove would evict the live P2 slot.
+        // P1's delayed `Drop` runs `forget_remote_if(addr, P1)`; the live P2 slot must stay.
         st.forget_remote_if(&addr, p1);
         let (again, ex_again) = st
             .remote_proxy(addr, || panic!("must dedup to P2, not re-make"))
             .expect("remote_proxy");
         assert!(
             Arc::ptr_eq(again.as_arc(), got2.as_arc()),
-            "stale P1 Drop must not split the per-address dedup (AC-2.5/P5)"
+            "stale P1 Drop must not split the per-address dedup"
         );
         assert!(
             ex_again,
@@ -819,14 +862,9 @@ mod tests {
         assert!(!ex3, "re-mint after forget is a fresh proxy — not excess");
     }
 
-    /// `forget_remote_if` also drops the per-address send counter so
-    /// `remote_send_async_counters` stays bounded by the live address
-    /// set. A fresh re-mint starts the counter back at 0 (matches
-    /// peer's `BinderNode` GC + recreate). The stale-Drop guard from
-    /// `stale_drop_does_not_split_remote_dedup` extends here: an
-    /// identity-mismatched `forget` must NOT evict the live counter.
+    /// A matching `forget_remote_if` resets the send counter to 0; a stale one leaves it intact.
     #[test]
-    fn phase_c_forget_remote_if_gcs_send_counter() {
+    fn forget_remote_if_gcs_send_counter() {
         let mut st = RpcState::new(AddressSpace::Acceptor);
         let addr = RpcAddress::from_wire_bytes([3u8; 32]);
 
@@ -838,8 +876,7 @@ mod tests {
         assert_eq!(st.next_send_async_number(addr), 0);
         assert_eq!(st.next_send_async_number(addr), 1);
 
-        // Stale-Drop pattern (P2 already re-cached): `forget_remote_if`
-        // is a no-op on identity mismatch, so the counter survives.
+        // Stale Drop (P2 re-cached): identity mismatch makes `forget_remote_if` a no-op.
         drop(got1);
         drop(sib1);
         let sib2 = SIBinder::new(Arc::new(Dummy)).unwrap();
@@ -854,8 +891,7 @@ mod tests {
             "stale forget must not evict the live counter"
         );
 
-        // Genuine `forget`: counter drops + next read auto-creates
-        // (back to 0).
+        // Genuine `forget`: the counter drops and the next read restarts at 0.
         drop(got2);
         drop(sib2);
         st.forget_remote_if(&addr, p2);
@@ -867,15 +903,10 @@ mod tests {
         );
     }
 
-    /// `timesSent` balance (state level): the AOSP
-    /// `timesSent`/`flushExcessBinderRefs` accounting nets to exactly
-    /// one `DEC_STRONG` per send, so the node is freed (no leak) in
-    /// both shapes the model must support.
+    /// `timesSent` nets one `DEC_STRONG` per send: N sends to one peer, or one send per connection.
     #[test]
-    fn f7_timessent_balance_no_leak() {
-        // (a) Same object sent N× to *one* peer that dedups to one
-        //     proxy: server strong = N (timesSent); peer owes N−1
-        //     excess DECs + 1 at proxy drop = N.
+    fn times_sent_balance_frees_node() {
+        // (a) N sends to one deduping peer: strong = N = (N−1 excess DECs) + 1 at proxy drop.
         let mut srv = RpcState::new(AddressSpace::Acceptor);
         let b = SIBinder::new(Arc::new(Dummy)).unwrap();
         let a = srv.on_binder_leaving(&b).unwrap();
@@ -883,8 +914,7 @@ mod tests {
         let a3 = srv.on_binder_leaving(&b).unwrap();
         assert_eq!((a, a), (a2, a3), "identity ⇒ same address on re-send");
         assert_eq!(srv.local_node_count(), 1, "one node, strong = timesSent");
-        // Peer side: 3 receipts of the same addr, proxy stays live ⇒
-        // receipts 2 and 3 are excess (2 flush DECs); proxy drop = 1.
+        // Peer: 3 receipts, proxy live ⇒ receipts 2 and 3 are excess DECs; proxy drop = 1.
         let mut peer = RpcState::new(AddressSpace::Initiator);
         let pb = SIBinder::new(Arc::new(Dummy)).unwrap();
         let (_p, e1) = peer.remote_proxy(a, || pb.clone()).expect("remote_proxy");
@@ -904,18 +934,14 @@ mod tests {
         );
         assert_eq!(srv.local_node_count(), 0, "no leak (AC-2.5)");
 
-        // (b) Same object sent once to each of 2 *independent* peer
-        //     connections sharing one server session: 2 sends ⇒ strong
-        //     2; each peer's lone proxy DECs once ⇒ 2. Pinning at 1
-        //     would free the node on the *first* DEC; the sibling must
-        //     survive until the 2nd.
+        // (b) One send per sibling connection ⇒ strong 2; the node must survive the 1st DEC.
         let mut s = RpcState::new(AddressSpace::Acceptor);
         let o = SIBinder::new(Arc::new(Dummy)).unwrap();
         let x = s.on_binder_leaving(&o).unwrap(); // conn #1 send
         let _ = s.on_binder_leaving(&o).unwrap(); // conn #2 send (timesSent ⇒ 2)
         assert!(
             s.dec_strong_local(&x, 1).is_none(),
-            "conn #1 proxy drop must NOT free a node conn #2 still holds (F7)"
+            "conn #1 proxy drop must NOT free a node conn #2 still holds"
         );
         assert!(s.lookup_local(&x).is_some(), "sibling still reachable");
         assert!(
@@ -936,13 +962,9 @@ mod tests {
         }
     }
 
-    /// Send side: per-remote-address counter
-    /// post-increments on every `next_send_async_number(addr)`, with
-    /// addresses tracked independently. Reset is impossible by design
-    /// (the peer's `BinderNode::asyncNumber` lives across our proxy
-    /// churn — see the field doc).
+    /// Send side: `next_send_async_number` post-increments per address, each one independently.
     #[test]
-    fn phase_c_send_async_number_is_per_address_monotonic() {
+    fn send_async_number_is_per_address_monotonic() {
         let mut st = RpcState::new(AddressSpace::Initiator);
         let a = RpcAddress::from_wire_bytes([1u8; 32]);
         let b = RpcAddress::from_wire_bytes([2u8; 32]);
@@ -957,12 +979,9 @@ mod tests {
         assert_eq!(st.next_send_async_number(b), 1);
     }
 
-    /// Receive side, in-order: wire `async_number`
-    /// matches the per-node `next_async_number` ⇒ dispatch
-    /// immediately. The advance + queue drain runs in a separate call
-    /// (the dispatch happens *outside* the state lock).
+    /// In-order `async_number` dispatches at once; the advance runs in `advance_and_pop_async`.
     #[test]
-    fn phase_c_in_order_dispatches_and_advances_counter() {
+    fn in_order_dispatches_and_advances_counter() {
         let mut st = RpcState::new(AddressSpace::Acceptor);
         let b = SIBinder::new(Arc::new(Dummy)).unwrap();
         let a = st.on_binder_leaving(&b).unwrap();
@@ -975,30 +994,21 @@ mod tests {
             }
             assert_eq!(st.async_todo_len(&a), 0, "in-order ⇒ never enqueued");
             assert!(
-                st.advance_and_pop_async(a).is_none(),
+                st.advance_and_pop_async(a).next.is_none(),
                 "queue empty ⇒ drain returns None"
             );
             assert_eq!(st.next_async_number(&a), i + 1);
         }
     }
 
-    /// Receive side, out-of-order: wire `async_number`
-    /// ahead of expected ⇒ parked. When the matching expected arrives,
-    /// dispatch advances the counter and the drain loop pops the
-    /// parked entries in priority order until a gap appears. This is
-    /// the AOSP `RpcState::processTransactInternal` enqueue + drain
-    /// behaviour, and the exact thing that makes libbinder's
-    /// round-robin `mOutgoing` oneway distribution preserve per-node
-    /// order on the rsbinder server.
+    /// Early `async_number`s park, then drain in order (AOSP `processTransactInternal` enqueue).
     #[test]
-    fn phase_c_out_of_order_enqueues_then_drains_in_priority_order() {
+    fn out_of_order_enqueues_then_drains_in_priority_order() {
         let mut st = RpcState::new(AddressSpace::Acceptor);
         let b = SIBinder::new(Arc::new(Dummy)).unwrap();
         let a = st.on_binder_leaving(&b).unwrap();
 
-        // Wire arrival: 2, 4, 1, 3, 0 (libbinder round-robin against
-        // 2 outgoing slots delivers this kind of interleave). Expected
-        // dispatch order: 0, 1, 2, 3, 4 (per-node monotonic).
+        // libbinder round-robin over 2 slots can arrive 2,4,1,3,0; dispatch must be 0..=4.
         for arrival_async in [2u64, 4, 1, 3, 0] {
             let txn = mk_txn(a, arrival_async);
             let decision = st.dispatch_async_or_enqueue(a, arrival_async, txn, vec![]);
@@ -1016,11 +1026,10 @@ mod tests {
                 );
             }
         }
-        // After dispatching 0, the queue must drain 1, 2, 3, 4 in
-        // strict order via advance_and_pop_async.
+        // After 0, `advance_and_pop_async` must drain 1, 2, 3, 4 in strict order.
         assert_eq!(st.async_todo_len(&a), 4, "1, 2, 3, 4 parked");
         let mut dispatched = vec![0u64];
-        while let Some((t, _)) = st.advance_and_pop_async(a) {
+        while let Some((t, _)) = st.advance_and_pop_async(a).next {
             dispatched.push(t.async_number);
         }
         assert_eq!(
@@ -1029,19 +1038,13 @@ mod tests {
             "per-node monotonic dispatch despite wire reorder"
         );
         assert_eq!(st.async_todo_len(&a), 0, "drained");
-        // After draining 4 (the last one), counter still advances
-        // once for the dispatch of 4 — so expected is now 5.
+        // The dispatch of 4 still advances the counter, so 5 is expected next.
         assert_eq!(st.next_async_number(&a), 5);
     }
 
-    /// A peer that parks out-of-order oneways while withholding the
-    /// expected `async_number` cannot grow a node's `async_todo` without
-    /// bound: at the AOSP terminate watermark the decision flips to
-    /// `Terminate` and the backlog is flushed (memory + any held fds
-    /// reclaimed), bounding the node to `ASYNC_TODO_TERMINATE_LEVEL`
-    /// entries at any instant.
+    /// Parking up to the terminate watermark yields `Terminate` and flushes the node's backlog.
     #[test]
-    fn phase_c_async_todo_terminate_caps_and_flushes_backlog() {
+    fn async_todo_terminate_caps_and_flushes_backlog() {
         let mut st = RpcState::new(AddressSpace::Acceptor);
         let b = SIBinder::new(Arc::new(Dummy)).unwrap();
         let a = st.on_binder_leaving(&b).unwrap();
@@ -1071,13 +1074,9 @@ mod tests {
         assert_eq!(st.async_todo_len(&a), 0, "backlog flushed on terminate");
     }
 
-    /// Unknown address: AOSP `RpcState` only enqueues if
-    /// `mNodeForAddress.find(addr)` succeeds; rsbinder must mirror
-    /// that or unknown-address oneway would leak into the queue
-    /// forever. Returns [`AsyncDecision::Drop`] so the caller logs +
-    /// drops (oneway is best-effort).
+    /// An unknown address drops the oneway instead of parking it (AOSP `mNodeForAddress.find`).
     #[test]
-    fn phase_c_unknown_address_drops_not_enqueues() {
+    fn unknown_address_drops_not_enqueues() {
         let mut st = RpcState::new(AddressSpace::Acceptor);
         let unknown = RpcAddress::from_wire_bytes([9u8; 32]);
         let txn = mk_txn(unknown, 0);
@@ -1085,21 +1084,15 @@ mod tests {
             st.dispatch_async_or_enqueue(unknown, 0, txn, vec![]),
             AsyncDecision::Drop(DropReason::UnknownAddress)
         ));
-        // `advance_and_pop_async` on an unknown address is a no-op
-        // (would otherwise underflow / spuriously advance a future
-        // node minted at the same address — but addresses are
-        // monotonic so the latter cannot happen).
-        assert!(st.advance_and_pop_async(unknown).is_none());
+        // `advance_and_pop_async` on an unknown address is a no-op.
+        let advance = st.advance_and_pop_async(unknown);
+        assert!(advance.next.is_none());
+        assert_eq!(advance.purged, 0);
     }
 
-    /// Stale receive: a `wire_async < next_async_number`
-    /// arrival (peer replay / buggy retry) returns
-    /// [`DropReason::StaleAsyncNumber`] without touching the queue;
-    /// any heap entry already below the expected number is drained on
-    /// the next `advance_and_pop_async` (so a hostile peer cannot OOM
-    /// us by spamming stale futures).
+    /// A stale `async_number` drops unqueued; parked entries below expected drain on advance.
     #[test]
-    fn phase_c_stale_arrival_drops_and_heap_drains_below_expected() {
+    fn stale_arrival_drops_and_heap_drains_below_expected() {
         let mut st = RpcState::new(AddressSpace::Acceptor);
         let b = SIBinder::new(Arc::new(Dummy)).unwrap();
         let a = st.on_binder_leaving(&b).unwrap();
@@ -1115,8 +1108,7 @@ mod tests {
         }
         assert_eq!(st.next_async_number(&a), 3);
 
-        // Now a stale arrival (1 < 3) reports the reason and does not
-        // enqueue.
+        // A stale arrival (1 < 3) reports the reason and does not enqueue.
         let txn = mk_txn(a, 1);
         assert!(matches!(
             st.dispatch_async_or_enqueue(a, 1, txn, vec![]),
@@ -1124,26 +1116,33 @@ mod tests {
         ));
         assert_eq!(st.async_todo_len(&a), 0);
 
-        // Heap stale-drain: inject a future arrival, advance past it,
-        // then verify the next pop sees the heap empty (the stale
-        // entry was reaped, not blocking).
-        let txn5 = mk_txn(a, 5);
-        let _ = st.dispatch_async_or_enqueue(a, 5, txn5, vec![]);
-        assert_eq!(st.async_todo_len(&a), 1);
-        // Dispatch a matching 3 + 4 to advance past 5's predecessor.
+        // Heap stale-drain: a duplicate 5 still parked once expected passes 5 is reaped.
+        for _ in 0..2 {
+            let _ = st.dispatch_async_or_enqueue(a, 5, mk_txn(a, 5), vec![]);
+        }
+        assert_eq!(st.async_todo_len(&a), 2);
+        // Dispatch a matching 3 + 4 to advance up to 5.
         let _ = st.dispatch_async_or_enqueue(a, 3, mk_txn(a, 3), vec![]);
         let _ = st.advance_and_pop_async(a); // expected → 4
         let _ = st.dispatch_async_or_enqueue(a, 4, mk_txn(a, 4), vec![]);
-        let _ = st.advance_and_pop_async(a); // expected → 5; pops the parked 5.
+        let popped = st.advance_and_pop_async(a); // expected → 5; pops one parked 5.
+        assert_eq!(popped.purged, 0);
+        assert_eq!(popped.next.map(|(t, _)| t.async_number), Some(5));
+        assert_eq!(st.async_todo_len(&a), 1, "the duplicate 5 stays parked");
+        // Advancing to 6 drains the duplicate below expected instead of leaving it on top.
+        let advance = st.advance_and_pop_async(a);
+        assert!(advance.next.is_none());
+        assert_eq!(
+            advance.purged, 1,
+            "the dropped duplicate is reported: it owes a DEC"
+        );
         assert_eq!(st.async_todo_len(&a), 0);
-        assert_eq!(st.next_async_number(&a), 5);
+        assert_eq!(st.next_async_number(&a), 6);
     }
 
-    /// Multi-node independence: each `LocalNode` has its
-    /// own `next_async_number` + `async_todo`, so a stalled queue on
-    /// node A must not block dispatch on node B.
+    /// Each `LocalNode` has its own counter and queue: a stalled node A does not block node B.
     #[test]
-    fn phase_c_per_node_independence() {
+    fn async_order_is_per_node() {
         let mut st = RpcState::new(AddressSpace::Acceptor);
         let b1 = SIBinder::new(Arc::new(Dummy)).unwrap();
         let b2 = SIBinder::new(Arc::new(Dummy)).unwrap();
@@ -1157,8 +1156,7 @@ mod tests {
             AsyncDecision::Enqueued
         ));
         assert_eq!(st.async_todo_len(&a1), 1);
-        // Node a2: independent counter at 0 ⇒ arrival 0 dispatches
-        // even though a1 is blocked.
+        // Node a2: independent counter at 0 ⇒ arrival 0 dispatches though a1 is blocked.
         let txn = mk_txn(a2, 0);
         match st.dispatch_async_or_enqueue(a2, 0, txn, vec![]) {
             AsyncDecision::Dispatch(t, _) => assert_eq!(t.async_number, 0),
@@ -1167,7 +1165,7 @@ mod tests {
         assert_eq!(st.async_todo_len(&a2), 0);
         // Counters are truly independent.
         assert_eq!(st.next_async_number(&a1), 0, "a1 not yet advanced");
-        assert!(st.advance_and_pop_async(a2).is_none());
+        assert!(st.advance_and_pop_async(a2).next.is_none());
         assert_eq!(st.next_async_number(&a2), 1);
     }
 }
