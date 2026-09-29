@@ -3925,6 +3925,27 @@ pub fn rsbinder::shared_memory::export_heap<H: rsbinder::shared_memory::IMemoryH
 pub const fn rsbinder::shared_memory::is_supported() -> bool
 pub fn rsbinder::shared_memory::region_size<F: std::os::fd::owned::AsFd>(F) -> rsbinder::Result<usize>
 pub mod rsbinder::stream
+#[non_exhaustive] pub enum rsbinder::stream::PingPolicy
+pub rsbinder::stream::PingPolicy::Inherit
+pub rsbinder::stream::PingPolicy::Off
+impl core::clone::Clone for rsbinder::stream::PingPolicy
+pub fn rsbinder::stream::PingPolicy::clone(&self) -> rsbinder::stream::PingPolicy
+impl core::cmp::Eq for rsbinder::stream::PingPolicy
+impl core::cmp::PartialEq for rsbinder::stream::PingPolicy
+pub fn rsbinder::stream::PingPolicy::eq(&self, &rsbinder::stream::PingPolicy) -> bool
+impl core::default::Default for rsbinder::stream::PingPolicy
+pub fn rsbinder::stream::PingPolicy::default() -> rsbinder::stream::PingPolicy
+impl core::fmt::Debug for rsbinder::stream::PingPolicy
+pub fn rsbinder::stream::PingPolicy::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for rsbinder::stream::PingPolicy
+impl core::marker::StructuralPartialEq for rsbinder::stream::PingPolicy
+impl core::marker::Freeze for rsbinder::stream::PingPolicy
+impl core::marker::Send for rsbinder::stream::PingPolicy
+impl core::marker::Sync for rsbinder::stream::PingPolicy
+impl core::marker::Unpin for rsbinder::stream::PingPolicy
+impl core::marker::UnsafeUnpin for rsbinder::stream::PingPolicy
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::stream::PingPolicy
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::stream::PingPolicy
 pub struct rsbinder::stream::Receiver<T>
 impl<T: rsbinder::Deserialize> rsbinder::stream::Receiver<T>
 pub fn rsbinder::stream::Receiver<T>::cancel(&self) -> rsbinder::Result<()>
@@ -3954,6 +3975,7 @@ impl<T> !core::panic::unwind_safe::UnwindSafe for rsbinder::stream::Receiver<T>
 pub struct rsbinder::stream::ReceiverPolicy
 pub rsbinder::stream::ReceiverPolicy::credit_window: u32
 pub rsbinder::stream::ReceiverPolicy::max_opening: u32
+pub rsbinder::stream::ReceiverPolicy::ping: rsbinder::stream::PingPolicy
 pub rsbinder::stream::ReceiverPolicy::ring_bytes: usize
 impl core::clone::Clone for rsbinder::stream::ReceiverPolicy
 pub fn rsbinder::stream::ReceiverPolicy::clone(&self) -> rsbinder::stream::ReceiverPolicy
@@ -4001,6 +4023,7 @@ pub struct rsbinder::stream::SinkPolicy
 pub rsbinder::stream::SinkPolicy::initial_credits: u32
 pub rsbinder::stream::SinkPolicy::max_batch_bytes: usize
 pub rsbinder::stream::SinkPolicy::max_ring_bytes: usize
+pub rsbinder::stream::SinkPolicy::ping: rsbinder::stream::PingPolicy
 pub rsbinder::stream::SinkPolicy::send_timeout: core::option::Option<core::time::Duration>
 impl core::clone::Clone for rsbinder::stream::SinkPolicy
 pub fn rsbinder::stream::SinkPolicy::clone(&self) -> rsbinder::stream::SinkPolicy

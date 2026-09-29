@@ -1623,6 +1623,11 @@ impl RpcParcelOps for SessionParcelOps {
 }
 
 impl RpcSessionInner {
+    /// The session's reply deadline as `set_timeout` left it (`None` = unbounded).
+    pub(crate) fn timeout(&self) -> Option<Duration> {
+        *self.shared.timeout.lock().expect("timeout poisoned")
+    }
+
     /// AOSP `ExclusiveConnection::find` for a twoway; order in module doc "Connection selection".
     fn find_conn(&self) -> Result<ConnGuard<'_>> {
         self.find_conn_impl(ConnUse::Client)

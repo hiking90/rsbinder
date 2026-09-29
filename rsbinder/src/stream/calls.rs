@@ -27,8 +27,85 @@ use super::generated::rsbinder::stream::IStreamSource::{
 #[cfg(feature = "tokio")]
 use super::pool::on_pool;
 use super::{
-    status_from_fields, truncated_terminator, unlink_death, watch_death, ReceiverPolicy, SinkPolicy,
+    status_from_fields, truncated_terminator, unlink_death, watch_death, PingPolicy,
+    ReceiverPolicy, SinkPolicy,
 };
+
+// ---- Pinging a quiet peer (plan 2-24 D9) ----
+
+/// Floor under a third of a tiny reply deadline, so a sub-3 ms deadline cannot spin the wait.
+#[cfg(feature = "rpc")]
+const MIN_PING_INTERVAL: Duration = Duration::from_millis(1);
+
+/// Whom a wait pings once it has gone `every` without a wake.
+struct Ping {
+    peer: SIBinder,
+    every: Duration,
+}
+
+impl Ping {
+    /// `None` when `policy` is off, `peer` is no RPC proxy, or its session has no deadline.
+    fn to(peer: &SIBinder, policy: PingPolicy) -> Option<Ping> {
+        if policy == PingPolicy::Off {
+            return None;
+        }
+        #[cfg(feature = "rpc")]
+        if let Some(proxy) = (**peer).as_any().downcast_ref::<crate::rpc::RpcProxy>() {
+            // Read per wait: a server sets a session's deadline only after the session exists.
+            let every = (proxy.session_timeout()? / 3).max(MIN_PING_INTERVAL);
+            return Some(Ping {
+                peer: peer.clone(),
+                every,
+            });
+        }
+        #[cfg(not(feature = "rpc"))]
+        let _ = peer;
+        None
+    }
+
+    /// Unanswered within the reply deadline, it ends the session, and the death link the stream.
+    fn send(&self) {
+        match self.peer.ping_binder() {
+            Ok(()) | Err(StatusCode::DeadObject) => {}
+            Err(e) => log::warn!("stream: pinging the peer failed: {e:?}"),
+        }
+    }
+}
+
+/// Wait on `cv` while `blocked`, until `deadline`; a wait lasting `ping.every` ends in a ping.
+///
+/// Returns after any of the three, the ping sent with no lock held; the caller looks again.
+fn park<S>(
+    mutex: &Mutex<S>,
+    cv: &Condvar,
+    blocked: impl Fn(&S) -> bool,
+    deadline: Option<Instant>,
+    ping: Option<&Ping>,
+) {
+    let quiet_until = ping.and_then(|ping| Instant::now().checked_add(ping.every));
+    // A caller's deadline that comes first ends the wait without a ping.
+    let pings = quiet_until.is_some_and(|quiet| deadline.is_none_or(|d| quiet <= d));
+    let wake_at = if pings { quiet_until } else { deadline };
+    let mut state = mutex.lock().unwrap_or_else(|e| e.into_inner());
+    while blocked(&state) {
+        let Some(at) = wake_at else {
+            state = cv.wait(state).unwrap_or_else(|e| e.into_inner());
+            continue;
+        };
+        let left = at.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            drop(state);
+            if let Some(ping) = ping.filter(|_| pings) {
+                ping.send();
+            }
+            return;
+        }
+        state = cv
+            .wait_timeout(state, left)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+    }
+}
 
 // ---- Shared credit state (producer side) ----
 
@@ -140,71 +217,74 @@ impl Credit {
         true
     }
 
+    /// No credit to take and nothing latched: what a credit wait waits out.
+    fn starved(state: &CreditState) -> bool {
+        Self::latch(state).is_ok() && state.available == 0
+    }
+
     /// Death ends the wait too: with nothing in flight, nothing else tells a parked producer.
-    fn wait_credit(&self, deadline: Option<Instant>) -> Result<()> {
-        let mut state = self.lock();
+    fn wait_credit(
+        &self,
+        deadline: Option<Instant>,
+        sink: &SIBinder,
+        ping: PingPolicy,
+    ) -> Result<()> {
         loop {
-            if let Some(answer) = Self::poll_credit(&mut state) {
+            if let Some(answer) = Self::poll_credit(&mut self.lock()) {
                 return answer;
             }
-            let Some(deadline) = deadline else {
-                state = self.wake.wait(state).unwrap_or_else(|e| e.into_inner());
-                continue;
-            };
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 return Err(StatusCode::TimedOut);
             }
-            state = self
-                .wake
-                .wait_timeout(state, left)
-                .unwrap_or_else(|e| e.into_inner())
-                .0;
+            let ping = Ping::to(sink, ping);
+            park(
+                &self.state,
+                &self.wake,
+                Self::starved,
+                deadline,
+                ping.as_ref(),
+            );
         }
     }
 
     /// [`wait_credit`](Self::wait_credit) that suspends the task instead of parking the thread.
     #[cfg(feature = "tokio")]
-    async fn wait_credit_async(self: &Arc<Self>, deadline: Option<Instant>) -> Result<()> {
-        let Some(deadline) = deadline else {
-            loop {
-                // Created first: a `Notified` sees every `notify_waiters` from its creation on.
-                let notified = self.notify.notified();
-                if let Some(answer) = Self::poll_credit(&mut self.lock()) {
-                    return answer;
-                }
+    async fn wait_credit_async(
+        self: &Arc<Self>,
+        deadline: Option<Instant>,
+        sink: &SIBinder,
+        ping: PingPolicy,
+    ) -> Result<()> {
+        loop {
+            // Created first: a `Notified` sees every `notify_waiters` from its creation on.
+            let notified = self.notify.notified();
+            if let Some(answer) = Self::poll_credit(&mut self.lock()) {
+                return answer;
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(StatusCode::TimedOut);
+            }
+            let ping = Ping::to(sink, ping);
+            if deadline.is_none() && ping.is_none() {
                 notified.await;
+                continue;
             }
-        };
-        if let Some(answer) = Self::poll_credit(&mut self.lock()) {
-            return answer;
-        }
-        // No `tokio/time` to suspend against, so the bounded wait is a condvar on the pool.
-        let pooled = on_pool(self.clone(), move |credit| {
-            credit.await_credit_until(deadline);
-            Ok(())
-        })
-        .await;
-        match Self::poll_credit(&mut self.lock()) {
-            Some(answer) => answer,
-            None => Err(pooled.err().unwrap_or(StatusCode::TimedOut)),
-        }
-    }
-
-    /// Block until there is credit, a latch or `deadline`, taking nothing: the caller takes it.
-    #[cfg(feature = "tokio")]
-    fn await_credit_until(&self, deadline: Instant) {
-        let mut state = self.lock();
-        while Self::latch(&state).is_ok() && state.available == 0 {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return;
+            // No `tokio/time` to suspend against, so a bounded wait is a condvar on the pool.
+            let pooled = on_pool(self.clone(), move |credit| {
+                park(
+                    &credit.state,
+                    &credit.wake,
+                    Self::starved,
+                    deadline,
+                    ping.as_ref(),
+                );
+                Ok(())
+            })
+            .await;
+            if let Err(e) = pooled {
+                // The pool never ran the wait, so nothing else ends it.
+                return Self::poll_credit(&mut self.lock()).unwrap_or(Err(e));
             }
-            state = self
-                .wake
-                .wait_timeout(state, left)
-                .unwrap_or_else(|e| e.into_inner())
-                .0;
         }
     }
 }
@@ -489,8 +569,9 @@ pub(super) struct Producer<T: ?Sized> {
     ledger: Arc<Ledger>,
     /// Lives as long as the producer; the consumer got its own reference in `onStart`.
     _source: SIBinder,
-    /// The consumer's sink, kept for the unlink in `Drop`.
+    /// The consumer's sink, kept for the unlink in `Drop` and pinged by a quiet credit wait.
     sink: SIBinder,
+    ping: PingPolicy,
     /// Holds the death link on the sink; the binder keeps only a `Weak`.
     death: Option<Arc<dyn crate::DeathRecipient>>,
     _item: PhantomData<fn(&T)>,
@@ -532,6 +613,7 @@ impl<T: Serialize + ?Sized> Producer<T> {
             ledger: Arc::new(Ledger::default()),
             _source: source,
             sink: sink.clone(),
+            ping: policy.ping,
             death,
             _item: PhantomData,
         })
@@ -548,7 +630,7 @@ impl<T: Serialize + ?Sized> Producer<T> {
         // As in `flush`, but a credit timeout takes this item back out: `TimedOut` = not queued.
         self.ledger.wait_idle();
         self.reported()?;
-        if let Err(e) = self.credit.wait_credit(deadline) {
+        if let Err(e) = self.credit.wait_credit(deadline, &self.sink, self.ping) {
             return self.unqueue_on_timeout(e, mark);
         }
         self.send_with_credit()
@@ -581,7 +663,7 @@ impl<T: Serialize + ?Sized> Producer<T> {
         // A batch a dropped future left on the pool goes out first, and its failure is this call's.
         self.ledger.wait_idle();
         self.reported()?;
-        self.credit.wait_credit(deadline)?;
+        self.credit.wait_credit(deadline, &self.sink, self.ping)?;
         self.send_with_credit()
     }
 
@@ -683,7 +765,11 @@ impl<T: Serialize + ?Sized> Producer<T> {
             // As in `send`.
             self.ledger.idle_async().await;
             self.reported()?;
-            if let Err(e) = self.credit.wait_credit_async(deadline).await {
+            let waited = self
+                .credit
+                .wait_credit_async(deadline, &self.sink, self.ping)
+                .await;
+            if let Err(e) = waited {
                 return self.unqueue_on_timeout(e, mark);
             }
             self.send_with_credit_async().await
@@ -699,7 +785,9 @@ impl<T: Serialize + ?Sized> Producer<T> {
         // As in `flush`.
         self.ledger.idle_async().await;
         self.reported()?;
-        self.credit.wait_credit_async(deadline).await?;
+        self.credit
+            .wait_credit_async(deadline, &self.sink, self.ping)
+            .await?;
         self.send_with_credit_async().await
     }
 
@@ -998,6 +1086,15 @@ impl StreamState {
     /// Empty queue, maybe-starved producer: a grant failing now has nothing to prompt a retry.
     fn still_last_chance(&self) -> bool {
         self.batches.is_empty() && self.producer_may_be_starved()
+    }
+
+    /// The consumer parks only with nothing queued, no end, and no grant to send.
+    fn must_wait(&self) -> bool {
+        if !self.batches.is_empty() || self.end.is_some() {
+            return false;
+        }
+        // No grant owed, or the last one failed and waits for a batch or the next call.
+        self.owed() == 0 || self.grant_failed
     }
 }
 
@@ -1306,6 +1403,7 @@ pub(super) struct Consumer<T> {
     finished: bool,
     /// This call has not yet retried a grant that failed; it gets one try.
     retry_armed: bool,
+    ping: PingPolicy,
 }
 
 impl<T: Deserialize> Consumer<T> {
@@ -1320,6 +1418,7 @@ impl<T: Deserialize> Consumer<T> {
             decoded: VecDeque::new(),
             finished: false,
             retry_armed: false,
+            ping: policy.ping,
         };
         (consumer, sink_binder)
     }
@@ -1339,16 +1438,27 @@ impl<T: Deserialize> Consumer<T> {
             if let Some(done) = self.advance(true) {
                 return done;
             }
-            // Under the lock, so a batch landing after `advance` looked is not slept through.
-            let mut state = self.stream.lock();
-            while self.must_wait(&state) {
-                state = self
-                    .stream
-                    .arrived
-                    .wait(state)
-                    .unwrap_or_else(|e| e.into_inner());
-            }
+            self.park(None);
         }
+    }
+
+    /// The producer's source, once `onStart` has named it, as a quiet wait's ping.
+    fn ping_target(&self) -> Option<Ping> {
+        let source = self.stream.lock().source_binder.clone()?;
+        Ping::to(&source, self.ping)
+    }
+
+    /// Wait for a batch, the end or a grant to send, up to `deadline` or one ping.
+    fn park(&self, deadline: Option<Instant>) {
+        let ping = self.ping_target();
+        // `must_wait` is read under the lock, so a batch landing after `advance` looked wakes it.
+        park(
+            &self.stream.state,
+            &self.stream.arrived,
+            StreamState::must_wait,
+            deadline,
+            ping.as_ref(),
+        );
     }
 
     pub(super) fn try_recv(&mut self) -> BinderResult<Option<T>> {
@@ -1371,27 +1481,7 @@ impl<T: Deserialize> Consumer<T> {
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 return Ok(None);
             }
-            let mut state = self.stream.lock();
-            while self.must_wait(&state) {
-                let Some(deadline) = deadline else {
-                    state = self
-                        .stream
-                        .arrived
-                        .wait(state)
-                        .unwrap_or_else(|e| e.into_inner());
-                    continue;
-                };
-                let left = match deadline.checked_duration_since(Instant::now()) {
-                    Some(left) if !left.is_zero() => left,
-                    _ => return Ok(None),
-                };
-                let (next, _) = self
-                    .stream
-                    .arrived
-                    .wait_timeout(state, left)
-                    .unwrap_or_else(|e| e.into_inner());
-                state = next;
-            }
+            self.park(deadline);
         }
     }
 
@@ -1405,7 +1495,26 @@ impl<T: Deserialize> Consumer<T> {
             if let Some(done) = self.advance_async().await {
                 return done;
             }
-            notified.await;
+            let Some(ping) = self.ping_target() else {
+                notified.await;
+                continue;
+            };
+            // No `tokio/time` to suspend against: the wait, and the ping ending it, use the pool.
+            let parked = on_pool(self.stream.clone(), move |stream| {
+                park(
+                    &stream.state,
+                    &stream.arrived,
+                    StreamState::must_wait,
+                    None,
+                    Some(&ping),
+                );
+                Ok(())
+            })
+            .await;
+            if parked.is_err() {
+                // No pool: wait unpinged rather than spin.
+                notified.await;
+            }
         }
     }
 
@@ -1495,14 +1604,6 @@ impl<T: Deserialize> Consumer<T> {
         // Overriding: the consumer is handed this error now, even if the producer's end is queued.
         let cancel = self.stream.fail(Status::from(e), true);
         (Some(Err(e.into())), cancel)
-    }
-
-    /// Park only with nothing queued, no end, and no grant to send (none owed, or the last failed).
-    fn must_wait(&self, state: &StreamState) -> bool {
-        if !state.batches.is_empty() || state.end.is_some() {
-            return false;
-        }
-        state.owed() == 0 || state.grant_failed
     }
 
     fn poll_queue(&self) -> Queued {

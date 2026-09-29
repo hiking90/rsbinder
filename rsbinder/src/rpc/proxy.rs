@@ -188,6 +188,11 @@ impl RpcProxy {
         self.session.caps()
     }
 
+    /// The reply deadline of this proxy's session, for a caller holding only the binder.
+    pub(crate) fn session_timeout(&self) -> Option<std::time::Duration> {
+        self.session.timeout()
+    }
+
     /// Send an outbound transaction to the remote object. Returns the
     /// reply parcel (`None` for oneway).
     ///

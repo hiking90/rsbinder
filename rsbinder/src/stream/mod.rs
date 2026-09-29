@@ -140,7 +140,9 @@
 //!   of the time neither side has a call in flight to fail on, so each
 //!   watches the other's binder: a producer parked for room reports
 //!   [`StatusCode::DeadObject`] from [`Sink::send`], a consumer parked
-//!   for an item yields it from [`Receiver::recv`].
+//!   for an item yields it from [`Receiver::recv`]. On RPC a peer can
+//!   vanish without the session noticing — behind a TCP relay — and a
+//!   waiting end pings it to find out ([`PingPolicy`]).
 //! * **Cancel.** [`Receiver::cancel`], and dropping a `Receiver`, release
 //!   a parked producer, whose next [`Sink::send`] reports
 //!   [`StatusCode::InvalidOperation`].
@@ -234,6 +236,10 @@ pub struct ReceiverPolicy {
     /// [`Sink::open`] is always taken by a consumer made with
     /// [`Receiver::new`].
     pub max_opening: u32,
+    /// RPC: whether a wait for an item that hears nothing from the
+    /// producer checks that it is still there. Default
+    /// [`PingPolicy::Inherit`].
+    pub ping: PingPolicy,
 }
 
 impl Default for ReceiverPolicy {
@@ -242,6 +248,7 @@ impl Default for ReceiverPolicy {
             ring_bytes: 64 * 1024,
             credit_window: 4,
             max_opening: 4,
+            ping: PingPolicy::default(),
         }
     }
 }
@@ -317,7 +324,14 @@ pub struct SinkPolicy {
     /// `None` does. On the RPC path a bounded `*_async` credit wait holds
     /// a blocking-pool thread while it lasts (this build has no timer to
     /// suspend the task against); an unbounded one suspends the task.
+    ///
+    /// Nor does it count a [ping](PingPolicy) made while waiting for
+    /// credit: a call whose consumer stops answering can return later than
+    /// `d`, by up to the session's reply deadline.
     pub send_timeout: Option<Duration>,
+    /// RPC: whether a wait for credit that hears nothing from the consumer
+    /// checks that it is still there. Default [`PingPolicy::Inherit`].
+    pub ping: PingPolicy,
 }
 
 impl Default for SinkPolicy {
@@ -327,8 +341,62 @@ impl Default for SinkPolicy {
             max_batch_bytes: 16 * 1024,
             initial_credits: 4,
             send_timeout: None,
+            ping: PingPolicy::default(),
         }
     }
+}
+
+/// Whether a stream on the RPC path checks that a peer it is waiting on
+/// is still there (plan 2-24 D9).
+///
+/// A stream learns that its peer is gone from the peer's death, and over
+/// RPC a death is the session ending, which takes the transport noticing
+/// that the connection is gone. Behind a relay that terminates TCP —
+/// `adb forward`, `ssh -L`, a port-forwarding proxy — the transport may
+/// never notice, because the relay keeps acknowledging; kernel keepalive
+/// reaches only the relay. Nor is there a call whose reply deadline could
+/// expire: back-pressure means a waiting stream has nothing in flight,
+/// and every `IStreamSink` and `IStreamSource` method is `oneway`. Such a
+/// stream would wait for good.
+///
+/// With pinging on, a wait that nothing has woken for a third of the
+/// session's reply deadline (`RpcSession::set_timeout`, or
+/// `RpcServer::set_reply_timeout` on a server) sends the peer a
+/// `PING_TRANSACTION` — the twoway every binder object answers,
+/// rsbinder's and libbinder's alike, so the peer implements nothing — and
+/// goes back to waiting once it is answered. The consumer pings the
+/// producer's `IStreamSource`, the producer the consumer's sink. A peer
+/// that does not answer within the reply deadline ends the session, as
+/// any unanswered call does, and the stream then ends with
+/// [`StatusCode::DeadObject`] through its death link: a peer that has
+/// vanished is noticed within about four thirds of the deadline. The ping
+/// is an ordinary call, so it also waits for a free outgoing connection;
+/// one refused for want of one is dropped, and the next quiet third tries
+/// again.
+///
+/// Only a wait pings: [`Receiver::recv`] and its variants waiting for an
+/// item, once the producer has introduced itself, and a [`Sink`] call
+/// waiting for credit. A stream whose items flow never pings, and an end
+/// that is not waiting on the stream checks nothing until it next waits.
+/// The ping is not counted against the caller's own bound —
+/// [`Receiver::recv_timeout`]'s `timeout`, [`SinkPolicy::send_timeout`] —
+/// so a call whose peer stops answering can return later than that bound,
+/// by up to the reply deadline. With the `tokio` feature, an `*_async`
+/// wait that may ping is made on the blocking pool and holds a thread
+/// there for as long as it lasts; this build has no timer to suspend a
+/// task against.
+///
+/// The ring path never pings: the kernel reports the peer's death itself.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PingPolicy {
+    /// Ping when the peer's session has a reply deadline, after a third of
+    /// it passes quietly. A session without one — the default — is never
+    /// pinged, and neither is a peer that is not an RPC proxy.
+    #[default]
+    Inherit,
+    /// Never ping.
+    Off,
 }
 
 /// A binder for a producer that has none of its own to hand over.
@@ -1174,7 +1242,8 @@ impl<T: Deserialize> Receiver<T> {
     /// grant [`try_recv`](Self::try_recv) describes is sent before that
     /// wait starts and is not counted against it, so this can return
     /// later than `timeout` by however long a grant takes; one that fails
-    /// is tried again by the next call, not within this one.
+    /// is tried again by the next call, not within this one. A
+    /// [ping](PingPolicy) made while waiting is not counted either.
     ///
     /// A `timeout` too long for an `Instant` to express — `Duration::MAX`
     /// — waits without a bound, and is [`recv`](Self::recv) in every
@@ -1397,6 +1466,7 @@ mod tests {
                 ring_bytes: 512,
                 credit_window: 1,
                 max_opening: 1,
+                ..ReceiverPolicy::default()
             },
         )
         .expect("a receiver");
