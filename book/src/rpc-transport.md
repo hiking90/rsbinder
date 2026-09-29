@@ -455,8 +455,10 @@ kernel binder for, with a few extras specific to socket transport:
   out-of-band over `SCM_RIGHTS` on Unix-domain sockets (android-14+
   wire required).
 - **Death notifications** — link a `DeathRecipient` on the proxy as
-  usual. A session whose socket disconnects fires every linked
-  recipient (the RPC analogue of "the remote process died").
+  usual. A session that ends — its peer closes, any one of its
+  connections fails, or a deadline expires (see [Timeouts](#timeouts)) —
+  fires every linked recipient (the RPC analogue of "the remote process
+  died").
 - **Async** — the same `into_async::<Tokio>()` adapter that wraps a
   blocking kernel-binder proxy works over RPC. See
   [Async Service](./async-service.md) — for RPC the only difference is
@@ -544,6 +546,21 @@ that has no incoming connection.
 
 ### How a connection ends
 
+A session ends as a whole, never one connection at a time. As in AOSP
+libbinder (`RpcState::handleRpcError`), a send or receive that fails on
+any of its connections shuts the session down: every connection
+closes, calls in flight on the others fail with `DeadObject` — whether
+the peer ran them is unknown — every linked death recipient fires, and
+every local object the peer held is released. A single connection
+cannot be resumed: the wire has no frame numbering or acknowledgement
+that would tell which `oneway` call or reference-count frame the lost
+connection took with it, and a session that carried on without them
+would leave an object's later `oneway` calls queued behind a number
+that never arrives. Reconnecting, fetching the root again and
+registering callbacks again are the application's. The one exception
+is a connection that fails while it is still being set up, before it
+carried a session frame: it is dropped alone.
+
 A serve loop — `RpcSession::serve_blocking` and its variants — returns
 `rpc::SessionEnd`, not `Result<()>`. It answers three questions a
 status code cannot hold at once:
@@ -577,6 +594,67 @@ frame arrives, or that it does not. The peer reads the end of stream on
 either platform; what differs is the peer's *next send* (Linux
 `AF_UNIX`: `EPIPE` at once; macOS: accepted and discarded; TCP: a reset
 on a later write).
+
+### Timeouts
+
+AOSP libbinder's RPC path has no timeouts: every socket wait is a
+`poll` without a bound, and only a session shutdown ends it. Every
+deadline below is an rsbinder addition, and each measures one thing.
+
+| Setting | What it bounds | On expiry |
+|---|---|---|
+| `RpcSession::set_timeout(d)`; `RpcClientConfig::timeout`, `ClientOptions::timeout`; on a server `RpcServer::set_reply_timeout`, `ServeOptions::reply_timeout`, applied to every session it makes | How long the peer may leave this end without an answer: a reply wait; a send that makes no progress (`SO_SNDTIMEO`, every transport); the peer's host not acknowledging (TCP keepalive and `TCP_USER_TIMEOUT`, TCP and TLS over TCP); on a client, each connect and handshake step | The session ends; the call that waited returns `TimedOut` |
+| The same `d`, for a free connection in the session's pool | A wait for a connection to send on; nothing has been sent yet | That call returns `WouldBlock`; the session goes on |
+| `RpcServer::set_handshake_timeout`, `ServeOptions::handshake_timeout` (default 10 s) | An accepted connection that sends nothing before its first contact | The connection is dropped |
+| `RpcServer::set_idle_timeout`, `ServeOptions::idle_timeout` | A session none of whose connections has carried a frame, either way, for the period | The session ends |
+
+**Set the session timeout above the slowest legitimate handler.** It
+is how long the peer may go without answering before it counts as
+broken, not a budget for one call: a call that times out takes the
+session with it, because the reply that is late may still come and
+nothing could tell it apart from the next one. A caller that wants to
+give up on one call and keep the session runs the call on another
+thread, or as a future, and stops waiting for it. There is no default:
+a library cannot know how long a handler may legitimately run, and
+neither kernel binder nor libbinder bounds it.
+
+**Keepalive is on for every TCP and TLS connection.** Without a session
+timeout the probes use the system's intervals (Linux: first probe after
+two hours of silence, then nine 75 s apart), so a session whose peer
+host vanished ends, and fires its death recipients, after about two
+hours instead of never. With `set_timeout(d)` the first probe goes
+after `d / 2` of silence and three more `d / 6` apart (each at least a
+second), and on Linux and Android `TCP_USER_TIMEOUT` = `d` bounds data
+sent and not acknowledged. The probes are between the two kernels and
+change no byte on the wire, so a libbinder peer needs nothing. Unix
+sockets and vsock have no such check.
+
+**A relay hides a break.** Keepalive reaches only the first TCP
+endpoint on the path. Behind a relay that terminates TCP — `adb
+forward`, `ssh -L`, a TLS terminator — the relay answers the probes,
+and a break past it shows only when a call waits for a reply and the
+session timeout expires. A stream that waits has no call outstanding,
+so it pings its peer instead ([Streaming](./streaming.md#a-peer-that-goes-silent)).
+
+**On a server the reply timeout is also the liveness bound.** A server
+that never calls its clients back has no reply to wait for, so the
+reply timeout reaches its clients only as keepalive and the send bound.
+A server that wants a vanished client's session cleaned up sooner than
+the system's keepalive sets `set_reply_timeout` for that.
+
+**The idle timeout is for untrusted peers.** A peer that finishes the
+handshake and then stays silent holds a worker thread and, under
+`set_max_connections`, an admission slot; keepalive does not catch it
+(its kernel answers) and neither does the reply timeout (it asks for
+nothing). The idle timeout is for a server that admits unauthenticated
+TCP or TLS peers and caps them; one that picks its peers with
+`set_authorizer` or TLS client authentication needs it less. A client
+that only waits for callbacks is idle by this measure.
+
+`RpcClientConfig::handshake_timeout` and
+`ClientOptions::handshake_timeout` are deprecated: the client timeout
+now bounds connecting. A value still set there takes precedence for the
+handshake.
 
 ## Bridging RPC and the service manager: the Accessor pattern
 
