@@ -21,7 +21,12 @@
 //!    outgoing (founding) connection instead — AOSP gates this with
 //!    `RpcConnection::allowNested`, and pinning it to the incoming
 //!    connection blocks until the session dies;
-//! 4. `RpcSession::close_session` ends the incoming thread cleanly.
+//! 4. `RpcSession::close_session` ends the incoming thread cleanly;
+//! 5. a reply deadline that expires ends the session on **both** ends
+//!    (plan 2-24 D2): the call returns `TimedOut`, the next one
+//!    `DeadObject`, this end's death recipient fires, and the server's
+//!    death link on a binder of ours fires as libbinder shuts its session
+//!    down (`RpcSession::shutdownAndWait` → `sendObituaries`).
 //!
 //! The argument picks the transport: a socket path, or `tcp:<host>:<port>`
 //! for inet (the `tcp-debug` feature). Over inet every connection comes
@@ -29,7 +34,7 @@
 //! opens them over `setupInetClient` — the case plan 10-7 Phase 0 opened.
 //!
 //! Exit code 0 = PASS; non-zero = the failing step.
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -42,6 +47,9 @@ const CB_DESC: &str = "rsbinder.test.IIncomingInteropCallback";
 const TX_ECHO: TransactionCode = FIRST_CALL_TRANSACTION;
 const TX_SCHEDULE_CALLBACK: TransactionCode = FIRST_CALL_TRANSACTION + 5;
 const TX_GET_SCHED: TransactionCode = FIRST_CALL_TRANSACTION + 6;
+const TX_WATCH: TransactionCode = FIRST_CALL_TRANSACTION + 7;
+const TX_SLOW: TransactionCode = FIRST_CALL_TRANSACTION + 8;
+const TX_GET_DIED: TransactionCode = FIRST_CALL_TRANSACTION + 9;
 const TX_CALLBACK_ECHO: TransactionCode = FIRST_CALL_TRANSACTION;
 const TX_CALLBACK_NOTIFY: TransactionCode = FIRST_CALL_TRANSACTION + 1;
 
@@ -115,6 +123,28 @@ impl Remotable for Cb {
     }
 }
 
+/// A binder of ours for the server to watch; it answers nothing.
+struct Watched;
+impl Interface for Watched {}
+impl Remotable for Watched {
+    fn descriptor() -> &'static str {
+        CB_DESC
+    }
+    fn on_transact(&self, _: TransactionCode, _: &mut Parcel, _: &mut Parcel) -> Result<()> {
+        Err(StatusCode::UnknownTransaction)
+    }
+    fn on_dump(&self, _w: &mut dyn std::io::Write, _a: &[String]) -> Result<()> {
+        Ok(())
+    }
+}
+
+struct Died(Arc<AtomicBool>);
+impl DeathRecipient for Died {
+    fn binder_died(&self, _who: &WIBinder) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 fn read_status(reply: &mut Parcel) -> Result<()> {
     let st: Status = reply.read()?;
     if st.is_ok() {
@@ -141,6 +171,116 @@ fn connect_inet(_addr: &str) -> Result<RpcSession> {
     Err(StatusCode::InvalidOperation)
 }
 
+// Two outgoing slots: the callback handler calls the server back while `main` holds one.
+fn connect(sock: &str) -> Result<RpcSession> {
+    match sock.strip_prefix("tcp:") {
+        Some(addr) => connect_inet(addr),
+        None => RpcSession::setup_client_android13plus_with_config(
+            RpcClientConfig::unix(std::path::Path::new(sock), 2)
+                .outgoing_connections(2)
+                .incoming_connections(1),
+        ),
+    }
+}
+
+fn fail(code: i32, what: String) -> ! {
+    eprintln!("[rsbinder-client] FAIL: {what}");
+    std::process::exit(code)
+}
+
+/// (5) A reply deadline that expires ends the session here and in libbinder (plan 2-24 D2).
+fn reply_deadline_ends_both_sessions(
+    sock: &str,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let session = connect(sock)?;
+    let root = session.get_root()?;
+    let rp = (*root)
+        .as_any()
+        .downcast_ref::<RpcProxy>()
+        .ok_or("root is not an RpcProxy")?;
+    let died = Arc::new(AtomicBool::new(false));
+    let recipient: Arc<dyn DeathRecipient> = Arc::new(Died(Arc::clone(&died)));
+    root.link_to_death(Arc::downgrade(&recipient))?;
+
+    // The server links to a binder of ours: its obituary says the server's session ended too.
+    let watched: SIBinder = Interface::as_binder(&Binder::new(Watched));
+    let mut d = rp.build_request(ROOT_DESC)?;
+    d.write(&watched)?;
+    let mut r = rp.transact(TX_WATCH, &d, 0)?.ok_or("watch: no reply")?;
+    read_status(&mut r)?;
+    let linked: i32 = r.read()?;
+    if linked != 0 {
+        fail(
+            16,
+            format!("the server could not link to our binder: {linked}"),
+        );
+    }
+
+    session.set_timeout(Some(Duration::from_secs(1)));
+    let mut d = rp.build_request(ROOT_DESC)?;
+    d.write(&3000i32)?;
+    let started = Instant::now();
+    match rp.transact(TX_SLOW, &d, 0) {
+        Err(StatusCode::TimedOut) => {}
+        other => fail(
+            17,
+            format!(
+                "a 3 s handler under a 1 s deadline: {:?}",
+                other.map(|_| ())
+            ),
+        ),
+    }
+    eprintln!(
+        "[rsbinder-client] (5) TX_SLOW timed out after {:?}",
+        started.elapsed()
+    );
+
+    let mut d = rp.build_request(ROOT_DESC)?;
+    d.write(&"after")?;
+    match rp.transact(TX_ECHO, &d, 0) {
+        Err(StatusCode::DeadObject) => {}
+        other => fail(
+            18,
+            format!("a call after the deadline: {:?}", other.map(|_| ())),
+        ),
+    }
+    if !died.load(Ordering::SeqCst) {
+        fail(19, "this end's death recipient did not fire".into());
+    }
+
+    // Asked on a session of its own: the ended one can no longer carry the question.
+    let probe = connect(sock)?;
+    let proot = probe.get_root()?;
+    let prp = (*proot)
+        .as_any()
+        .downcast_ref::<RpcProxy>()
+        .ok_or("root is not an RpcProxy")?;
+    let mut server_died = 0;
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(5) {
+        let d = prp.build_request(ROOT_DESC)?;
+        let mut r = prp
+            .transact(TX_GET_DIED, &d, 0)?
+            .ok_or("get_died: no reply")?;
+        read_status(&mut r)?;
+        server_died = r.read()?;
+        if server_died == 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    probe.close_session();
+    session.close_session();
+    if server_died != 1 {
+        fail(
+            20,
+            "libbinder's session outlived the deadline: no obituary for our binder".into(),
+        );
+    }
+    eprintln!("[rsbinder-client] (5) both sessions ended; libbinder sent the obituary");
+    Ok(())
+}
+
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("rsbinder::rpc=info"),
@@ -161,15 +301,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         std::process::exit(15);
     });
 
-    // Two outgoing slots: the callback handler calls the server back while `main` holds one.
-    let session = match sock.strip_prefix("tcp:") {
-        Some(addr) => connect_inet(addr)?,
-        None => RpcSession::setup_client_android13plus_with_config(
-            RpcClientConfig::unix(std::path::Path::new(&sock), 2)
-                .outgoing_connections(2)
-                .incoming_connections(1),
-        )?,
-    };
+    let session = connect(&sock)?;
     // Bound every reply wait from here on (the default is to block forever).
     session.set_timeout(Some(Duration::from_secs(10)));
     eprintln!(
@@ -283,6 +415,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         );
         std::process::exit(13);
     }
+    reply_deadline_ends_both_sessions(&sock)?;
     println!("PASS — plan 2-20 (e): rsbinder incoming connection ↔ real libbinder RpcServer");
     Ok(())
 }

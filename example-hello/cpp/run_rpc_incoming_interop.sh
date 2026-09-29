@@ -10,6 +10,11 @@
 # as libbinder's inet server speaks no TLS without certificates on both
 # sides).
 #
+# Each run ends with plan 2-24 D2: the client's 1 s reply deadline expires
+# on a 3 s handler, and both sessions end — the client's call returns
+# TimedOut, its next DeadObject, and libbinder's death link on a client
+# binder fires as it shuts its own session down.
+#
 # STATUS: see the bottom of this file / the plan (plans/2-20-*.md).
 #
 # Prereqs: as run_rpc_multiconn_interop.sh (Android 16 AVD, NDK, cargo ndk,
