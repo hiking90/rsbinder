@@ -151,6 +151,21 @@
 //! guard drops) before the transport moves into the pool, and `clear_handshake_timeouts`
 //! re-arms rather than clears the send side.
 //!
+//! # Idle
+//!
+//! A server's `set_idle_timeout` is judged per session, not per connection (plan 2-24 D8): a
+//! fan-out client that keeps one connection busy and leaves another quiet is not idle, and
+//! evicting it would end the whole session ("Session end"). Every frame any slot sends or
+//! receives stamps `last_activity` (`send_msg`, `recv_msg`), on a monotonic clock of the
+//! session's own. A serve slot's read deadline stays the idle value; when it expires between
+//! frames, the loop asks how much of the idle period is left since that stamp. With some left,
+//! it re-arms the slot's read deadline to exactly that and reads on, and puts the full value back
+//! after the next frame; with none left, the end stands as an idle eviction (`Local`, `InSync`),
+//! which ends the session. No timer thread is involved: each quiet slot wakes on its own
+//! deadline. An expiry part-way through a frame (`DeadlineMidFrame`) is a lost position either
+//! way and ends the session as before. The admission deadline on an r34 server's first frame is
+//! not an idle deadline and is not extended.
+//!
 //! # Attach confirmation
 //!
 //! An outgoing attach (a connection whose header echoes a server-minted `session_id`) gets no
@@ -351,8 +366,8 @@
 //! return at once:
 //!
 //! - `close` is this end's decision (`close_session`, `RpcServer::terminate`, a serve loop that
-//!   evicted an idle peer): it sets `ended_locally` first, so every loop it wakes reports
-//!   `EndedBy::Local`.
+//!   found the whole session idle, "Idle"): it sets `ended_locally` first, so every loop it
+//!   wakes reports `EndedBy::Local`.
 //! - `fail_session` is a fault: a transport failure on any send ("Failed sends"), any failure
 //!   of a reply wait after its request went out (a lost stream, an undecodable frame, an expired
 //!   reply deadline, a nested dispatch that could not reply), and any other serve loop end. It
@@ -376,7 +391,7 @@
 use std::cell::RefCell;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -1524,6 +1539,10 @@ pub(crate) struct SharedSession {
     serve_declared: AtomicUsize,
     /// This end's side: fixes the founding slot's role and the serve-slot teardown rules.
     space: AddressSpace,
+    /// Origin of `last_activity`, a monotonic clock of the session's own.
+    epoch: Instant,
+    /// Nanoseconds after `epoch` of the last frame any slot sent or received; module doc "Idle".
+    last_activity: AtomicU64,
 }
 
 impl SharedSession {
@@ -1886,6 +1905,46 @@ impl RpcSessionInner {
         }
     }
 
+    /// Idle expiry on `slot_id`: re-arm it to what the session has left; `false` if nothing is.
+    fn rearm_idle_left(&self, slot_id: u64) -> bool {
+        let Some(idle) = self.slot_baseline_read_deadline(slot_id) else {
+            return false;
+        };
+        let Some(left) = self.idle_left(idle) else {
+            return false;
+        };
+        let Some(transport) = self.slot_transport(slot_id) else {
+            return false;
+        };
+        // A sub-microsecond `SO_RCVTIMEO` would round to no deadline at all.
+        let left = left.max(Duration::from_millis(1));
+        match transport.set_read_timeout(Some(left)) {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("RPC: failed to re-arm a connection's idle deadline: {e:?}");
+                false
+            }
+        }
+    }
+
+    /// Put `slot_id`'s read deadline back to the full idle value after `rearm_idle_left`.
+    fn restore_idle_deadline(&self, slot_id: u64) {
+        if let Some(transport) = self.slot_transport(slot_id) {
+            if let Err(e) = transport.set_read_timeout(self.slot_baseline_read_deadline(slot_id)) {
+                log::warn!("RPC: failed to restore a connection's idle deadline: {e:?}");
+            }
+        }
+    }
+
+    /// `slot_id`'s transport while it is pooled.
+    fn slot_transport(&self, slot_id: u64) -> Option<Arc<dyn RpcTransport>> {
+        let st = self.conn_state.lock().expect("conn_state poisoned");
+        st.slots
+            .iter()
+            .find(|s| s.id == slot_id)
+            .map(|s| Arc::clone(&s.transport))
+    }
+
     /// Lift every slot's handshake deadlines: reads unbounded, sends back to the session's own.
     fn clear_handshake_timeouts(&self) {
         for t in self.slot_transports() {
@@ -2123,8 +2182,45 @@ impl RpcSessionInner {
         self.profile.records_fd_positions()
     }
 
-    /// Send one frame; only a `Unix`-mode connection carries fds (`SCM_RIGHTS`).
+    /// Send one frame and count it as the session's activity (module doc "Idle").
     fn send_msg(
+        &self,
+        transport: &dyn RpcTransport,
+        frame: &[u8],
+        fds: &[OwnedFd],
+    ) -> RpcResult<()> {
+        let sent = self.send_frame_msg(transport, frame, fds);
+        if sent.is_ok() {
+            self.note_activity();
+        }
+        sent
+    }
+
+    /// Receive one frame and count it as the session's activity (module doc "Idle").
+    fn recv_msg(&self, transport: &dyn RpcTransport) -> RpcResult<(Vec<u8>, Vec<OwnedFd>)> {
+        let received = self.recv_frame_msg(transport);
+        if received.is_ok() {
+            self.note_activity();
+        }
+        received
+    }
+
+    /// A frame just crossed one of the session's connections: now is its last activity.
+    fn note_activity(&self) {
+        let now = u64::try_from(self.shared.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        // `fetch_max`: a slower concurrent writer must not move the time back.
+        self.shared.last_activity.fetch_max(now, Ordering::Relaxed);
+    }
+
+    /// What is left of `idle` since the session's last frame; `None` once all of it passed.
+    fn idle_left(&self, idle: Duration) -> Option<Duration> {
+        let last = Duration::from_nanos(self.shared.last_activity.load(Ordering::Relaxed));
+        let quiet = self.shared.epoch.elapsed().saturating_sub(last);
+        idle.checked_sub(quiet).filter(|left| !left.is_zero())
+    }
+
+    /// Send one frame; only a `Unix`-mode connection carries fds (`SCM_RIGHTS`).
+    fn send_frame_msg(
         &self,
         transport: &dyn RpcTransport,
         frame: &[u8],
@@ -2153,7 +2249,7 @@ impl RpcSessionInner {
     }
 
     /// Receive one frame (+ `SCM_RIGHTS` fds in `Unix` mode, fixed before any RPC traffic).
-    fn recv_msg(&self, transport: &dyn RpcTransport) -> RpcResult<(Vec<u8>, Vec<OwnedFd>)> {
+    fn recv_frame_msg(&self, transport: &dyn RpcTransport) -> RpcResult<(Vec<u8>, Vec<OwnedFd>)> {
         if self.profile.aosp_framing() {
             // android-13+: header then `bodySize` bytes; `Unix` fds accrue across both `recvmsg`s.
             if self.fd_mode() == FileDescriptorTransportMode::Unix {
@@ -3448,6 +3544,8 @@ impl RpcSession {
             ended_locally: AtomicBool::new(false),
             serve_declared: AtomicUsize::new(0),
             space,
+            epoch: Instant::now(),
+            last_activity: AtomicU64::new(0),
         }))
     }
 
@@ -4101,6 +4199,8 @@ impl RpcSession {
         let (reason, deadline_armed) = {
             let mut first = clear_deadline_after_first;
             let mut deadline_armed = baseline_deadline || admission_deadline_armed;
+            // The idle deadline runs short of the full value: module doc "Idle".
+            let mut shortened = false;
             loop {
                 match self.inner.serve_once_on_slot(slot_id) {
                     ServeStep::Continue => {
@@ -4109,7 +4209,16 @@ impl RpcSession {
                             self.inner.clear_slot_read_timeout(slot_id);
                             first = false;
                             deadline_armed = false;
+                        } else if shortened {
+                            self.inner.restore_idle_deadline(slot_id);
+                            shortened = false;
                         }
+                    }
+                    // This connection idled; the session is idle only if no connection had a frame.
+                    ServeStep::Ended(EndReason::Frame(StatusCode::TimedOut))
+                        if baseline_deadline && !first && self.inner.rearm_idle_left(slot_id) =>
+                    {
+                        shortened = true;
                     }
                     ServeStep::Ended(reason) => break (reason, deadline_armed),
                 }

@@ -778,13 +778,25 @@ impl RpcServer {
     /// handshake it can then go silent and hold its worker — and, under
     /// [`set_max_connections`](Self::set_max_connections), an admission
     /// slot — indefinitely (a post-handshake Slowloris that starves the
-    /// accept loop). Setting a `Some(d)` idle timeout evicts such a peer
-    /// after `d` of silence, freeing the slot. Use it when the protocol
-    /// has regular traffic or idle eviction is acceptable; pair it with
-    /// `set_max_connections` for untrusted peers, since OS-level TCP
-    /// keepalive/timeouts are otherwise the only backstop. (Currently
-    /// honored on the android-13+ serve path; the r34 profile already
-    /// bounds its first frame via the handshake deadline.)
+    /// accept loop). Setting a `Some(d)` idle timeout ends such a peer's
+    /// session after `d` in which **none of its connections** carried a
+    /// frame in either direction, freeing the slot. The judgment is per
+    /// session, not per connection: a fan-out client that keeps one
+    /// connection busy and another quiet is not idle. (Currently honored
+    /// on the android-13+ serve path; the r34 profile already bounds its
+    /// first frame via the handshake deadline.)
+    ///
+    /// It is for a server that admits unauthenticated TCP or TLS peers and
+    /// caps them with `set_max_connections`: a peer that finishes the
+    /// handshake and then stays silent is what nothing else catches —
+    /// kernel keepalive does not, since the peer's kernel answers it, and
+    /// [`set_reply_timeout`](Self::set_reply_timeout) measures only waits
+    /// for an answer, which a client that sends nothing never causes. A
+    /// server that picks its peers with
+    /// [`set_authorizer`](Self::set_authorizer) or TLS client
+    /// authentication needs it less. It fits a protocol with regular
+    /// traffic; a client that only waits for callbacks is idle by this
+    /// measure.
     ///
     /// The serve phase arms this value on the **write** side too, so a peer
     /// that stops draining replies ends the session as well. The write half

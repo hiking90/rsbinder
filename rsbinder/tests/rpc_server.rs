@@ -18,6 +18,11 @@
 //!   `fail_session` from `client_transact`'s reply-wait failure and the
 //!   session outlives its reply timeout, so the next call and the other
 //!   connection's call do not fail and no obituary fires.
+//! - `a_session_with_one_busy_connection_is_not_idle`: make
+//!   `RpcSessionInner::rearm_idle_left` report nothing left and the quiet
+//!   fan-out connection's first idle expiry ends the session while the
+//!   founding connection is still busy. The last assertion is the other
+//!   half: a session whose connections all went quiet still ends.
 //! - `handshake_timeout_bounds_a_silent_peer`: make
 //!   `RpcClientConfig::handshake_deadline` ignore `timeout` and the `timeout`
 //!   case blocks on the silent peer; drop the session-timeout fallback from
@@ -927,6 +932,40 @@ fn client_timeout_on_hung_server() {
     // The late `REPLY` has no id to be told apart by, so the session ended (plan 2-24 D2).
     assert_eq!(root.echo("after"), Err(StatusCode::DeadObject));
     // _cu handles teardown.
+}
+
+/// Idle is judged per session: one busy connection keeps a quiet one's session up (plan 2-24 D8).
+#[test]
+fn a_session_with_one_busy_connection_is_not_idle() {
+    let path = tmp_sock("idlefan");
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    server.set_android13plus(1);
+    server.set_max_threads(2);
+    server.set_idle_timeout(Some(Duration::from_millis(400)));
+    server
+        .set_root(make_service(Arc::new(AtomicI64::new(0))))
+        .expect("set_root");
+    let bg = server.run_background();
+    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
+    wait_for_sock(&path);
+
+    let client = RpcSession::setup_client_android13plus_with_config(
+        RpcClientConfig::unix(&path, 1).outgoing_connections(2),
+    )
+    .expect("fan-out connect");
+    assert_eq!(client.__slot_count(), 2, "founding + one fan-out");
+    let root = EchoProxy(client.get_root().expect("get_root"));
+    // One thread's calls always take the first free connection; the fan-out one stays quiet
+    // for three idle periods, which a per-connection judgment would evict it for.
+    let busy_until = Instant::now() + Duration::from_millis(1_200);
+    while Instant::now() < busy_until {
+        assert_eq!(root.echo("busy").as_deref(), Ok("busy"));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // Both quiet now: past the idle period the session is gone.
+    std::thread::sleep(Duration::from_millis(1_000));
+    assert_eq!(root.echo("late"), Err(StatusCode::DeadObject));
+    client.close_session();
 }
 
 /// One connection's reply timeout ends a fan-out session: the other call dies, obituaries fire.
