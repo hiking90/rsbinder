@@ -6384,6 +6384,11 @@ mod tests {
             WireProfile::Android13Plus(Android13PlusCodec::with_version(PROTOCOL_V2).expect("v2")),
         )
         .expect("session");
+        // Armed before the session can end: macOS refuses `SO_RCVTIMEO` once the peer closed.
+        let mut founding_peer = UnixStream::from(founding_peer_fd);
+        founding_peer
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
 
         // The server's half of an incoming attach: read the header, admit, write `"cci"`.
         let (attach_fd, server_fd) = unix_socketpair_fd();
@@ -6414,10 +6419,6 @@ mod tests {
         assert_eq!(session.inner.slot_count(), 0, "the dead pool is empty");
         assert_eq!(session.inner.incoming_live.load(Ordering::SeqCst), 0);
         // The founding connection went down with the session: its peer reads end of stream.
-        let mut founding_peer = UnixStream::from(founding_peer_fd);
-        founding_peer
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("read timeout");
         let mut byte = [0u8; 1];
         assert_eq!(
             std::io::Read::read(&mut founding_peer, &mut byte).expect("read"),
@@ -6451,7 +6452,8 @@ mod tests {
         use super::super::transport::UnixTransport;
         use std::os::unix::net::UnixStream;
         let (attach_fd, server_fd) = unix_socketpair_fd();
-        let server = std::thread::spawn(move || server(UnixStream::from(server_fd)));
+        let server_side = armed_server_side(server_fd);
+        let server = std::thread::spawn(move || server(server_side));
         let attach = wrap(UnixTransport::from_stream(UnixStream::from(attach_fd)).expect("unix"));
         let added = session.add_incoming_connection_android13plus_transport(
             move || Ok(attach),
@@ -6464,10 +6466,17 @@ mod tests {
         added
     }
 
-    /// Blocks until the attaching client drops its end; panics if it keeps it for 10 s.
-    fn hold_until_client_closes(mut s: std::os::unix::net::UnixStream) {
+    /// The server half with a 10 s read timeout, armed while the client cannot have closed yet.
+    fn armed_server_side(server_fd: OwnedFd) -> std::os::unix::net::UnixStream {
+        let s = std::os::unix::net::UnixStream::from(server_fd);
+        // macOS refuses `SO_RCVTIMEO` (EINVAL) on a socket whose peer already closed.
         s.set_read_timeout(Some(Duration::from_secs(10)))
             .expect("read timeout");
+        s
+    }
+
+    /// Blocks until the attaching client drops its end; panics if it keeps it for 10 s.
+    fn hold_until_client_closes(mut s: std::os::unix::net::UnixStream) {
         let mut rest = Vec::new();
         if let Err(e) = std::io::Read::read_to_end(&mut s, &mut rest) {
             assert!(
@@ -6559,8 +6568,6 @@ mod tests {
 
     /// Reads nothing and asserts the client closed with no byte sent: no header, nothing held.
     fn expect_no_header(mut s: std::os::unix::net::UnixStream) {
-        s.set_read_timeout(Some(Duration::from_secs(10)))
-            .expect("read timeout");
         let mut rest = Vec::new();
         std::io::Read::read_to_end(&mut s, &mut rest).expect("the client closes");
         assert!(rest.is_empty(), "the client sent {} bytes", rest.len());
@@ -6765,7 +6772,8 @@ mod tests {
         use super::super::transport::UnixTransport;
         use std::os::unix::net::UnixStream;
         let (attach_fd, server_fd) = unix_socketpair_fd();
-        let server = std::thread::spawn(move || server(UnixStream::from(server_fd)));
+        let server_side = armed_server_side(server_fd);
+        let server = std::thread::spawn(move || server(server_side));
         let attach = wrap(UnixTransport::from_stream(UnixStream::from(attach_fd)).expect("unix"));
         let added = session.add_outgoing_connection_android13plus_transport(
             move || Ok(attach),
