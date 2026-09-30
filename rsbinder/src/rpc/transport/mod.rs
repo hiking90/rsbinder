@@ -80,8 +80,9 @@
 //!   frame of.
 //! - `the_kernels_etimedout_is_a_lost_connection_not_a_deadline`: counting
 //!   `TimedOut` in `is_timeout` makes a send that failed before its
-//!   first byte and a read that consumed nothing report `Timeout`, and a
-//!   connection the kernel already dropped keeps its slot.
+//!   first byte and a read that consumed nothing report `Timeout`: a serve
+//!   loop with an idle deadline armed reads the kernel's drop as its own
+//!   idle expiry (`Local`, `InSync`).
 
 use std::fmt;
 use std::io::{ErrorKind, Read, Write};
@@ -216,7 +217,9 @@ pub trait RpcTransport: Send + Sync {
     ///   ignored and the connection is reset at the first timer run that
     ///   finds a probe out and nothing received for `TCP_USER_TIMEOUT`: for
     ///   `Some(d)` about `d` after the host went silent, later by at most one
-    ///   interval since the check runs on the probe schedule. Without it the
+    ///   interval since the check runs on the probe schedule; for a `d` under
+    ///   a second, at `TCP_KEEPIDLE + TCP_KEEPINTVL` (2 s), since both floor
+    ///   at 1 s and the first run only sends a probe. Without it the
     ///   reset follows the `TCP_KEEPCNT`-th unanswered probe. The system
     ///   defaults (`include/net/tcp.h`) are 7200 s, 75 s and 9 probes, so a
     ///   `None` connection whose peer's host vanished ends after about two

@@ -102,7 +102,8 @@
 //! those records left rustls before the write, and a write stopped part-way
 //! (a send deadline on a full socket buffer) left the peer a truncated record
 //! it decrypts nothing after — so it surfaces as `UncleanEndOfStream`, never
-//! as a boundary-preserving error that would keep the connection in the pool.
+//! as a boundary-preserving error that the session would treat as a deadline
+//! of its own.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -586,7 +587,7 @@ impl RpcTransport for TlsTransport {
                     let deadline = matches!(&e, RpcError::Io(io) if super::is_timeout(io));
                     return Err(if deadline { RpcError::EndOfStream } else { e });
                 }
-                // Outbound half lost: a boundary-preserving error would keep this conn pooled.
+                // Outbound half lost: a boundary-preserving error would read as our own deadline.
                 log::warn!(
                     "TLS control flush failed, outbound half lost: {e} ({})",
                     self.desc

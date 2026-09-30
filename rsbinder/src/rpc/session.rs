@@ -114,9 +114,20 @@
 //!   any byte counts as a close, because a refusal can produce one: a server that refuses
 //!   ahead of the header (an authorizer, AOSP's `setConnectionFilter`) closes with the header
 //!   unread, which the kernel reports to the client as a reset. A reset on the path before the
-//!   first `"cci"` byte is indistinguishable from it and leaves the session up. The vector is
-//!   private to `SlotPool` (child module `slot_pool`), which removes slots only by
-//!   `unpush_retired`, `retire`'s, and `clear_at_session_end`, `on_session_dead`'s.
+//!   first `"cci"` byte is indistinguishable from it and leaves the session up. A client's
+//!   outgoing attach has no close exception: libbinder pools it once it has the whole header,
+//!   before it reads the client's `"cci"` (`RpcServer::establishConnection` →
+//!   `RpcSession::preJoinSetup`), and ends its session when that connection fails; from
+//!   `android-16.0.0_r3` it also ends its session when it refuses the attach at its
+//!   `setMaxThreads` cap (`RpcSession::join` → `shutdownAndWait`), which the client sees as a
+//!   close before any reply byte. A close cannot tell that server from one that refused and
+//!   kept its session (rsbinder, libbinder up to `android-16.0.0_r2`), so a failure before the
+//!   whole header went out leaves the session up and every later one ends it, a close
+//!   included. The attach's own inconsistencies (a `max_version` below the session's, a
+//!   transport unlike the founding one, the client-local `session_id()` as the id) are
+//!   refused before the header for that reason. The vector is private to `SlotPool` (child module
+//!   `slot_pool`), which removes slots only by `unpush_retired`, `retire`'s, and
+//!   `clear_at_session_end`, `on_session_dead`'s.
 //!
 //! # Failed sends
 //!
@@ -239,7 +250,9 @@
 //! that refuses (unknown or stale id, its `set_max_threads` cap spent, shutdown, a teardown
 //! race) can only close the socket, and the client would keep a dead slot until an unrelated
 //! call lands on it. So the attach sends one `GET_SESSION_ID`, which libbinder answers on any
-//! connection, and requires the reply to carry the id it echoed. The incoming (callback)
+//! connection, and requires the reply to carry the id it echoed. A failed probe is still a
+//! connection the server may hold, or a refusal that ended the server's session, so it ends
+//! the session, a close included ("Slot pool" "Leaving"). The incoming (callback)
 //! direction needs no probe: the server writes `"cci"` after admitting it (plan 2-20), so a
 //! client that fails once the server may hold it ends the session ("Slot pool" "Leaving").
 //!
@@ -432,13 +445,14 @@
 //! return at once:
 //!
 //! - `close` is this end's decision (`close_session`, `RpcServer::terminate`, a serve loop that
-//!   found the whole session idle, "Idle"): it sets `ended_locally` first, so every loop it
-//!   wakes reports `EndedBy::Local`.
+//!   found the whole session idle, "Idle", and a serve loop whose own armed read deadline cut
+//!   a frame, `DeadlineMidFrame`; the `end` module's table): it sets `ended_locally` first, so
+//!   every loop it wakes reports `EndedBy::Local`.
 //! - `fail_session` is a fault: a transport failure on any send ("Failed sends"), any failure
 //!   of a reply wait after its request went out (a lost stream, an undecodable frame, an expired
 //!   reply deadline, a nested dispatch that could not reply), any other serve loop end, and a
-//!   client's incoming attach that fails once the server may hold the connection ("Slot pool"
-//!   "Leaving"). It leaves `ended_locally` alone, so the loops it wakes report `NotLocal`.
+//!   client's attach, in either direction, that fails once the server may hold the connection
+//!   ("Slot pool" "Leaving"). It leaves `ended_locally` alone, so the loops it wakes report `NotLocal`.
 //!
 //! A serve loop's end ends the session whichever connection it served: its worker calls
 //! `close` when `SessionEnd::by` is `Local` and `fail_session` otherwise. The death sequence
@@ -1296,7 +1310,10 @@ fn confirm_attach(
 
 /// Explain a failed attach; both attach entries share it so the diagnosis cannot drift.
 fn log_attach_refused(e: &RpcError) {
-    if matches!(e, RpcError::Timeout | RpcError::Truncated) {
+    if matches!(
+        e,
+        RpcError::Timeout | RpcError::Truncated | RpcError::DeadlineMidFrame
+    ) {
         log::error!(
             "android-13+ RPC: the attach admission probe (GET_SESSION_ID) did not complete \
              ({e}) — a read deadline armed by this caller ends it this way too, so this is \
@@ -1325,12 +1342,12 @@ fn client_handshake_err(e: RpcError, requesting_new_session: bool) -> StatusCode
             ),
             RpcError::Truncated => log::error!(
                 "rsbinder RPC: the android-13+ handshake failed part-way through a response \
-                 ({e}) — the peer may be speaking the r34 (default) profile, or a read \
-                 deadline armed on this connection landed mid-frame. Connect without \
+                 ({e}) — the peer closed mid-frame; it may be speaking the r34 (default) \
+                 profile. Connect without \
                  `?profile=android13plus`, or enable the android-13+ wire on the server \
                  (`RpcServer::set_android13plus`)"
             ),
-            RpcError::Timeout => log::error!(
+            RpcError::Timeout | RpcError::DeadlineMidFrame => log::error!(
                 "rsbinder RPC: the android-13+ handshake stalled and a read deadline armed on \
                  this connection elapsed — that deadline is the caller's own \
                  (`RpcClientConfig::timeout` / `ClientOptions::timeout` or their deprecated \
@@ -4149,8 +4166,9 @@ impl RpcSession {
     /// [`add_incoming_connection_android13plus_with_config`](Self::add_incoming_connection_android13plus_with_config),
     /// [`setup_unix_client_android13plus_with_id`](Self::setup_unix_client_android13plus_with_id),
     /// `ClientOptions::session_id`) is therefore always wrong; those
-    /// entries refuse it (the peer never admits the connection, and the
-    /// refusal is reported — see `confirm_attach`), but the value
+    /// entries refuse it (an outgoing attach on this session before it
+    /// connects, the others when the peer never admits the connection,
+    /// and the refusal is reported — see `confirm_attach`), but the value
     /// itself is indistinguishable from any other 32 random bytes, so
     /// read the id you echo from `get_session_id()`.
     pub fn session_id(&self) -> [u8; 32] {
@@ -4346,9 +4364,11 @@ impl RpcSession {
     /// The thread ends when the session does; join the handle for its
     /// [`SessionEnd`]. Fails only if the thread cannot be created.
     ///
-    /// A session that has already ended — before the thread starts or
-    /// while its loop waits between frames — has nothing more to serve: the
-    /// thread ends with [`EndReason::SessionEnded`].
+    /// A session that had already ended when the thread starts, or when its
+    /// loop goes to take its connection between frames, ends the thread
+    /// with [`EndReason::SessionEnded`]. One that ends while the loop is
+    /// reading stops it with what the connection's shutdown gives that
+    /// read ([`EndReason::EndOfStream`] on a Unix socket).
     pub fn spawn_serve(&self) -> Result<std::thread::JoinHandle<SessionEnd>> {
         let declared = &self.inner.shared.serve_declared;
         // Nothing to serve: module doc "Session end".
@@ -4562,7 +4582,10 @@ impl RpcSession {
     /// of the session, the ones added later included, and from the moment
     /// this is called:
     ///
-    /// - **Sends**: `SO_SNDTIMEO`, so a send that makes no progress for `d`
+    /// - **Sends**: `SO_SNDTIMEO` on the bundled socket transports, and on a
+    ///   transport of your own only if it implements
+    ///   [`RpcTransport::set_write_timeout`] (with the no-op default a
+    ///   stalled send has no bound), so a send that makes no progress for `d`
     ///   because the peer stopped reading fails and ends the session. A
     ///   peer that reads slowly but steadily is not cut: the deadline
     ///   bounds each wait for socket buffer space, not the whole send.
@@ -4880,6 +4903,9 @@ impl RpcSession {
     /// cap spent, server shutting down — is an error **here**, never a
     /// dead slot that fails some unrelated call later. Stay within
     /// [`negotiate()`](Self::negotiate) connections to avoid the cap.
+    /// A failure ends the session unless the header never went out, a
+    /// refusal included, as in
+    /// [`add_outgoing_connection_with_config`](Self::add_outgoing_connection_with_config).
     ///
     /// The default single-connection sessions never call this ⇒ the
     /// pool stays at one slot ⇒ `find_conn` always selects that slot.
@@ -4918,6 +4944,30 @@ impl RpcSession {
 
     /// Client multi-outgoing using a [`RpcClientConfig`], which is held
     /// to the [manual attach](RpcClientConfig#manual-attach) rule.
+    ///
+    /// A libbinder server adds the connection to the session as soon as
+    /// it has read the whole connection header, before the rest of the
+    /// handshake and the `GET_SESSION_ID` probe that confirms the attach,
+    /// and ends the session when that connection fails. From
+    /// `android-16.0.0_r3` it also ends the session when it refuses the
+    /// attach at its `setMaxThreads` cap, which this end sees only as a
+    /// close; rsbinder and older libbinder refuse the same way and keep
+    /// theirs. So a failure ends the whole session, and returns its
+    /// error, unless the attach never got its whole header out: a check
+    /// before the header refused it (a `max_version` below the session's,
+    /// a transport unlike the founding connection's, or this session's
+    /// client-local [`session_id()`](Self::session_id) as the id), the
+    /// connect or the handshake deadline's setup failed, or the header
+    /// write failed.
+    ///
+    /// Every other failure ends the session: a close or reset before the
+    /// probe's reply, as a refused attach does (an id the server does not
+    /// know, its cap spent, its shutdown), an expired deadline or any
+    /// other error after the header, a reply cut part-way, and a reply
+    /// that does not confirm the id. Stay within
+    /// [`negotiate()`](Self::negotiate) connections and echo
+    /// [`get_session_id()`](Self::get_session_id) to keep an attach from
+    /// costing the session.
     pub fn add_outgoing_connection_with_config(&self, config: RpcClientConfig) -> Result<u64> {
         self.add_outgoing_connection_named(config, "RpcClientConfig::handshake_timeout")
     }
@@ -4988,40 +5038,84 @@ impl RpcSession {
             return Err(StatusCode::DeadObject);
         }
         let effective_max = max_version.min(session_version);
+        if effective_max != session_version {
+            // Refused before the header: libbinder pools an attach at any header version.
+            log::error!(
+                "android-13+ RPC: this attach asks for wire v{effective_max} but the session \
+                 runs v{session_version} — a caller-supplied `max_version` below the session's \
+                 negotiated version can never attach; pass `RpcSession::wire_protocol_version()`"
+            );
+            return Err(StatusCode::BadType);
+        }
+        // No server admits the client-local id; refused before a close could end the session.
+        if self.inner.shared.space() == AddressSpace::Initiator
+            && session_id == self.session_id().as_slice()
+        {
+            log::error!(
+                "android-13+ RPC: this attach echoes the client-local `RpcSession::session_id()`; \
+                 echo the server-minted id from `RpcSession::get_session_id()`"
+            );
+            return Err(StatusCode::BadValue);
+        }
         let hdr_fd_mode = if fd_mode == FileDescriptorTransportMode::Unix {
             FD_MODE_UNIX
         } else {
             FD_MODE_NONE
         };
         let t = connect()?;
+        // The pool would refuse it past the header, where a refusal ends the session.
+        if !self
+            .inner
+            .conn_state
+            .lock()
+            .expect("conn_state poisoned")
+            .admits(&*t)
+        {
+            return Err(StatusCode::BadType);
+        }
         let codec = {
             let _hs = HandshakeDeadline::arm(&*t, handshake_timeout).map_err(StatusCode::from)?;
             let mut io = RawTransportIo(&*t);
-            client_connect_with_id(&mut io, effective_max, false, hdr_fd_mode, session_id)
-                .map_err(StatusCode::from)?
+            // A failed header write leaves the server short of it, so none admitted.
+            let codec = client_write_connection_header(
+                &mut io,
+                effective_max,
+                false,
+                hdr_fd_mode,
+                session_id,
+            )
+            .map_err(StatusCode::from)?;
+            // libbinder pools the connection once it has the header, before it reads `"cci"`.
+            let init = std::io::Write::write_all(&mut io, &codec.encode_connection_init());
+            if let Err(e) = init {
+                return Err(self.end_past_outgoing_header(StatusCode::from(RpcError::from(e))));
+            }
+            codec
         };
-        if codec.version() != session_version {
-            // Negotiated below the founding version: a mixed-version pool is refused.
-            log::error!(
-                "android-13+ RPC: this attach negotiated wire v{} but the session runs v{} — \
-                 a caller-supplied `max_version` below the session's negotiated version can \
-                 never attach; pass `RpcSession::wire_protocol_version()`",
-                codec.version(),
-                session_version
-            );
-            return Err(StatusCode::BadType);
-        }
         {
             // Confirm admission before the slot joins; the probe falls back to `set_timeout`.
             let probe_deadline =
                 handshake_timeout.or(*self.inner.shared.timeout.lock().expect("timeout poisoned"));
-            let _hs = HandshakeDeadline::arm(&*t, probe_deadline).map_err(StatusCode::from)?;
+            let _hs = match HandshakeDeadline::arm(&*t, probe_deadline) {
+                Ok(hs) => hs,
+                Err(e) => return Err(self.end_past_outgoing_header(StatusCode::from(e))),
+            };
             if let Err(e) = confirm_attach(&*t, &codec, session_id) {
                 log_attach_refused(&e);
-                return Err(StatusCode::from(e));
+                return Err(self.end_past_outgoing_header(StatusCode::from(e)));
             }
         }
-        self.inner.add_outgoing_slot(t)
+        match self.inner.add_outgoing_slot(t) {
+            Ok(id) => Ok(id),
+            Err(e) => Err(self.end_past_outgoing_header(e)),
+        }
+    }
+
+    /// Past its header the server may hold the attach: only a session end tells it ("Leaving").
+    fn end_past_outgoing_header(&self, status: StatusCode) -> StatusCode {
+        log::error!("RPC: outgoing attach failed past its header ({status:?}); ending the session");
+        self.inner.fail_session();
+        status
     }
 
     /// Open one *additional* **incoming (callback) connection** to the
@@ -5034,8 +5128,8 @@ impl RpcSession {
     /// the connection as a slot it sends on. Returns the new slot id.
     ///
     /// Profile uniformity is enforced as for the outgoing attach
-    /// (R34 ⇒ `BadType`; a server that negotiates the attach below the
-    /// founding version ⇒ `BadType`). The server refusing the attach
+    /// (R34 ⇒ `BadType`; a `max_version` below the session's ⇒
+    /// `BadType`, refused before connecting). The server refusing the attach
     /// (its callback-slot budget, `2 * set_max_threads`, is spent)
     /// surfaces as a handshake error. A failure ends the session unless
     /// the header never went out or the connection closed before any
@@ -5068,8 +5162,9 @@ impl RpcSession {
     /// returns its error, unless the server cannot hold the connection.
     /// That is the case in exactly two ways:
     ///
-    /// - the attach never got its whole header out: a check before
-    ///   connecting refused it, the connect or the handshake deadline's
+    /// - the attach never got its whole header out: a check before the
+    ///   header refused it (a `max_version` below the session's, a
+    ///   transport unlike the founding connection's), the connect or the handshake deadline's
     ///   setup failed, or the header write failed (a server admits
     ///   nothing before the whole header);
     /// - the connection closed, a reset included, before any `"cci"` byte
@@ -5126,13 +5221,31 @@ impl RpcSession {
             return Err(StatusCode::DeadObject);
         }
         let effective_max = max_version.min(session_version);
+        // An attach sends `effective_max` unnegotiated; refused here, as past `"cci"` it would end.
+        if effective_max != session_version {
+            log::error!(
+                "android-13+ RPC: this incoming attach asks for wire v{effective_max} but the \
+                 session runs v{session_version}; pass `RpcSession::wire_protocol_version()`"
+            );
+            return Err(StatusCode::BadType);
+        }
         let hdr_fd_mode = if fd_mode == FileDescriptorTransportMode::Unix {
             FD_MODE_UNIX
         } else {
             FD_MODE_NONE
         };
         let t = connect()?;
-        let codec = {
+        // The pool would refuse it past `"cci"`, where a refusal ends the session.
+        if !self
+            .inner
+            .conn_state
+            .lock()
+            .expect("conn_state poisoned")
+            .admits(&*t)
+        {
+            return Err(StatusCode::BadType);
+        }
+        {
             // Cleared before the push: a lingering read deadline would break the serve loop.
             let _hs = HandshakeDeadline::arm(&*t, handshake_timeout).map_err(StatusCode::from)?;
             let mut io = RawTransportIo(&*t);
@@ -5148,15 +5261,6 @@ impl RpcSession {
             if let Err((e, received)) = client_read_connection_init(&mut io, &codec) {
                 return Err(self.fail_awaiting_cci(e, received));
             }
-            codec
-        };
-        if codec.version() != session_version {
-            log::error!(
-                "android-13+ RPC: this incoming attach runs wire v{} but the session runs v{}",
-                codec.version(),
-                session_version
-            );
-            return Err(self.fail_after_cci(StatusCode::BadType));
         }
         // Dropping `t` on refusal closes the socket, but the server already pooled it.
         let slot_id = match self.inner.add_slot_inner(t, SlotRole::Incoming) {
@@ -5235,22 +5339,24 @@ impl RpcSession {
     /// A `0` is treated as `1` — a session must have at least the
     /// founding connection to be useful (AOSP rejects 0 as a misuse).
     ///
-    /// **Profile uniformity** is enforced by the per-connection
-    /// [`add_outgoing_connection_android13plus`](RpcSession::add_outgoing_connection_android13plus)
-    /// (the founding session's negotiated wire version caps every
-    /// additional connection's `max_version`). A fan-out connection
-    /// that the server downgrades below the founding version surfaces
-    /// as `Err(BadType)` and the partially-built session is dropped.
-    /// Rust ownership ≡ AOSP `scope_guard`'s implicit cleanup.
+    /// **Profile uniformity**: every fan-out connection offers the
+    /// founding call's `max_version`, which the session's negotiated
+    /// version never exceeds, so a fan-out attach never fails the version
+    /// check of
+    /// [`add_outgoing_connection_android13plus`](RpcSession::add_outgoing_connection_android13plus).
+    /// A failed extra ends and closes the partially-built session (AOSP
+    /// `scope_guard` cleanup); the caller never gets a handle.
     ///
     /// **No retry / no progressive degradation**: a fan-out connect
     /// failure (e.g. the server's `set_max_threads` is tighter than
     /// `local_max_outgoing - 1` would imply, so the attach is refused
-    /// past the cap) surfaces as `Err`. A caller that wants a softer
-    /// fallback can use
+    /// past the cap) surfaces as `Err`. A
     /// [`setup_unix_client_android13plus`](RpcSession::setup_unix_client_android13plus) +
-    /// manual `add_outgoing_connection_android13plus` loop and tolerate
-    /// per-extra failures.
+    /// manual `add_outgoing_connection_android13plus` loop is no softer:
+    /// a failed extra ends the session once its header went out, a
+    /// refusal at the server's cap included (see
+    /// [`add_outgoing_connection_with_config`](RpcSession::add_outgoing_connection_with_config)),
+    /// so bound the loop by [`negotiate()`](RpcSession::negotiate).
     #[deprecated(
         since = "0.12.0",
         note = "use `setup_client_android13plus_with_config(RpcClientConfig::unix(path, v).outgoing_connections(n))`"
@@ -5501,8 +5607,9 @@ mod tests {
     //!   `park_hook` fires under the pool lock, so `fail_session` runs only once the loop waits.
     //! * `a_frame_being_sent_is_activity`: drop the `OpenCall` from `send_msg` and the serve
     //!   loop evicts while the oneway's write is parked for three periods; `open` also reads 0.
-    //!   The wait starts before the send (`serve_wait_hook`), and the parked transport holds the
-    //!   frame, so the only timing is the stall's length, a period longer than the mutant needs.
+    //!   The write is parked before the serve loop starts its wait (`serve_wait_hook`), so each
+    //!   expiry finds it open, and the parked transport holds the frame: the only timing is the
+    //!   stall's length, a period longer than the mutant needs.
     //! * `a_frame_being_received_is_activity`: drop the `io_gen` bump from either android-13+
     //!   reader in `recv_msg` (`CountedIo`, the fd closure) and `active_since` finds nothing
     //!   while the transport is parked after the header's first byte with no call open. The
@@ -5528,18 +5635,34 @@ mod tests {
     //! * `an_incoming_connection_whose_thread_fails_to_spawn_ends_the_session`: un-push the slot
     //!   instead of `fail_session` on the spawn failure and the session stays up while the
     //!   server holds that connection as a callback slot.
-    //! * `an_incoming_attach_on_another_version_after_cci_ends_the_session` and
-    //!   `an_incoming_attach_the_pool_refuses_after_cci_ends_the_session`: return the error
-    //!   without `fail_after_cci` on the version check or the `add_slot_inner` refusal and the
-    //!   session stays up. `an_incoming_attach_whose_deadline_expires_before_cci_ends_the_session`:
-    //!   count `Timeout` as a close in `fail_awaiting_cci` and it stays up too.
-    //!   `an_incoming_attach_cut_inside_cci_ends_the_session`: count `Truncated` as a close there
-    //!   and its EOF case stays up; drop the `received == 0` test and its no-`close_notify` case
-    //!   stays up. `an_incoming_attach_closed_before_cci_leaves_the_session_up` and
+    //! * `an_incoming_attach_below_the_session_version_never_connects`: move the version check
+    //!   after the connect and the connector panics.
+    //!   `an_incoming_attach_on_another_transport_kind_is_refused_before_its_header`: drop the
+    //!   `admits` check ahead of the header and the header goes out.
+    //!   `an_incoming_attach_whose_deadline_expires_before_cci_ends_the_session`:
+    //!   count `Timeout` as a close in `fail_awaiting_cci` and it stays up.
+    //!   `an_incoming_attach_cut_inside_cci_ends_the_session`: exempt `Truncated` outside the
+    //!   `received == 0` test and its EOF case stays up; drop the `received == 0` test and its
+    //!   no-`close_notify` case stays up. `an_incoming_attach_closed_before_cci_leaves_the_session_up` and
     //!   `an_incoming_attach_reset_before_cci_leaves_the_session_up` are the other half: drop
     //!   `EndOfStream` from the close arm and the session ends;
     //!   `an_incoming_attach_uncleanly_closed_before_cci_leaves_the_session_up` does the same for
     //!   `UncleanEndOfStream`.
+    //! * The outgoing attach, one test per class. `an_outgoing_attach_failing_past_its_header_ends_the_session`:
+    //!   return the error without `end_past_outgoing_header` on the `"cci"` write or on the
+    //!   probe's deadline arm and its case of that name stays up; so does its expiry case once
+    //!   the probe's failure skips it. `an_outgoing_attach_closed_before_the_reply_ends_the_session`:
+    //!   exempt a close (`EndOfStream`, `UncleanEndOfStream`) before any reply byte, at the read
+    //!   (EOF, no-`close_notify` cases), at the `"cci"` write or at the probe's write, and that
+    //!   case stays up. `an_outgoing_attach_cut_inside_the_reply_ends_the_session` and
+    //!   `an_outgoing_attach_refused_after_the_reply_ends_the_session`: return the probe's error
+    //!   as is and the session stays up. The other half:
+    //!   `an_outgoing_attach_whose_header_write_fails_leaves_the_session_up` ends the session
+    //!   once the header write goes through `end_past_outgoing_header`;
+    //!   `an_outgoing_attach_below_the_session_version_never_connects` and
+    //!   `an_outgoing_attach_echoing_the_client_local_id_never_connects` connect once their
+    //!   check moves after the connect; `an_outgoing_attach_on_another_transport_kind_is_refused_before_its_header`
+    //!   sends its header once the `admits` check ahead of it is dropped.
     //! * `an_idle_expiry_on_a_slot_the_session_dropped_is_not_an_eviction`: drop the loop's
     //!   `slot_role` arm ahead of the idle check and the loop reports `Frame(TimedOut)`, `Local`:
     //!   an idle eviction of a session another connection's fault ended. The transport's read
@@ -6379,6 +6502,9 @@ mod tests {
         fn describe(&self) -> &str {
             "no-close-notify"
         }
+        fn supports_fd_passing(&self) -> bool {
+            self.0.supports_fd_passing()
+        }
         fn set_read_timeout(&self, timeout: Option<Duration>) -> RpcResult<()> {
             self.0.set_read_timeout(timeout)
         }
@@ -6399,82 +6525,77 @@ mod tests {
         }
     }
 
-    /// The server admitted and sent `"cci"`; the client's own version check then refuses.
-    #[test]
-    fn an_incoming_attach_on_another_version_after_cci_ends_the_session() {
-        use crate::rpc::wire_android13::server_accept;
-        let (session, _founding_peer) = v2_initiator();
-        let added = incoming_attach_against(
-            &session,
-            PROTOCOL_V1,
-            Duration::from_secs(5),
-            |t| Box::new(t),
-            |mut s| {
-                server_accept(&mut s, PROTOCOL_V2).expect("server handshake");
-                hold_until_client_closes(s);
-            },
-        );
-        assert_eq!(added, Err(StatusCode::BadType));
-        assert!(
-            session.inner.shared.lifecycle.is_torn_down(),
-            "the server pooled the connection before its \"cci\", so the session must end"
-        );
-        assert_eq!(session.inner.slot_count(), 0, "the dead pool is empty");
+    /// A Unix connection that claims no fd passing: not the founding connection's kind.
+    struct NoFds(super::super::transport::UnixTransport);
+    impl RpcTransport for NoFds {
+        fn send_frame(&self, buf: &[u8]) -> RpcResult<()> {
+            self.0.send_frame(buf)
+        }
+        fn recv_frame(&self) -> RpcResult<Vec<u8>> {
+            self.0.recv_frame()
+        }
+        fn peer_identity(&self) -> PeerIdentity {
+            self.0.peer_identity()
+        }
+        fn describe(&self) -> &str {
+            "no-fds"
+        }
+        fn set_read_timeout(&self, timeout: Option<Duration>) -> RpcResult<()> {
+            self.0.set_read_timeout(timeout)
+        }
+        fn set_write_timeout(&self, timeout: Option<Duration>) -> RpcResult<()> {
+            self.0.set_write_timeout(timeout)
+        }
+        fn shutdown(&self) -> RpcResult<()> {
+            self.0.shutdown()
+        }
+        fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
+            self.0.send_raw(buf)
+        }
+        fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize> {
+            self.0.recv_raw(buf)
+        }
     }
 
-    /// The server sent `"cci"`; the client's pool then refuses the connection (`BadType`).
+    /// Reads nothing and asserts the client closed with no byte sent: no header, nothing held.
+    fn expect_no_header(mut s: std::os::unix::net::UnixStream) {
+        s.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        let mut rest = Vec::new();
+        std::io::Read::read_to_end(&mut s, &mut rest).expect("the client closes");
+        assert!(rest.is_empty(), "the client sent {} bytes", rest.len());
+    }
+
+    /// A `max_version` below the session's is refused before connecting, so nothing is held.
     #[test]
-    fn an_incoming_attach_the_pool_refuses_after_cci_ends_the_session() {
-        use super::super::transport::UnixTransport;
-        use crate::rpc::wire_android13::server_accept;
-        /// A Unix connection that claims no fd passing: not the founding connection's kind.
-        struct NoFds(UnixTransport);
-        impl RpcTransport for NoFds {
-            fn send_frame(&self, buf: &[u8]) -> RpcResult<()> {
-                self.0.send_frame(buf)
-            }
-            fn recv_frame(&self) -> RpcResult<Vec<u8>> {
-                self.0.recv_frame()
-            }
-            fn peer_identity(&self) -> PeerIdentity {
-                self.0.peer_identity()
-            }
-            fn describe(&self) -> &str {
-                "no-fds"
-            }
-            fn set_read_timeout(&self, timeout: Option<Duration>) -> RpcResult<()> {
-                self.0.set_read_timeout(timeout)
-            }
-            fn set_write_timeout(&self, timeout: Option<Duration>) -> RpcResult<()> {
-                self.0.set_write_timeout(timeout)
-            }
-            fn shutdown(&self) -> RpcResult<()> {
-                self.0.shutdown()
-            }
-            fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
-                self.0.send_raw(buf)
-            }
-            fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize> {
-                self.0.recv_raw(buf)
-            }
-        }
+    fn an_incoming_attach_below_the_session_version_never_connects() {
+        let (session, _founding_peer) = v2_initiator();
+        let added = session.add_incoming_connection_android13plus_transport(
+            || -> Result<Box<dyn RpcTransport>> { panic!("the attach must not connect") },
+            PROTOCOL_V1,
+            &[7u8; 32],
+            FileDescriptorTransportMode::None,
+            Some(Duration::from_secs(5)),
+        );
+        assert_eq!(added, Err(StatusCode::BadType));
+        assert!(!session.inner.shared.lifecycle.is_torn_down());
+        assert_eq!(session.inner.slot_count(), 1, "only the founding slot");
+    }
+
+    /// A transport unlike the founding one is refused before its header, so nothing is held.
+    #[test]
+    fn an_incoming_attach_on_another_transport_kind_is_refused_before_its_header() {
         let (session, _founding_peer) = v2_initiator();
         let added = incoming_attach_against(
             &session,
             PROTOCOL_V2,
             Duration::from_secs(5),
             |t| Box::new(NoFds(t)),
-            |mut s| {
-                server_accept(&mut s, PROTOCOL_V2).expect("server handshake");
-                hold_until_client_closes(s);
-            },
+            expect_no_header,
         );
         assert_eq!(added, Err(StatusCode::BadType));
-        assert!(
-            session.inner.shared.lifecycle.is_torn_down(),
-            "the server pooled the connection before its \"cci\", so the session must end"
-        );
-        assert_eq!(session.inner.slot_count(), 0, "the dead pool is empty");
+        assert!(!session.inner.shared.lifecycle.is_torn_down());
+        assert_eq!(session.inner.slot_count(), 1, "only the founding slot");
     }
 
     /// No `"cci"` within the handshake deadline: the server may have pooled the connection.
@@ -6602,14 +6723,17 @@ mod tests {
     /// A refusal ahead of the header (an authorizer) closes it unread: the client reads a reset.
     #[test]
     fn an_incoming_attach_reset_before_cci_leaves_the_session_up() {
-        use std::io::{Read, Write};
-        use std::os::unix::net::UnixStream;
-        // The premise: closing with unread bytes gives the peer `ECONNRESET`, not EOF.
-        let (mut writer, reader) = UnixStream::pair().expect("pair");
-        writer.write_all(b"header").expect("write");
-        drop(reader);
-        let premise = writer.read(&mut [0u8; 1]).map_err(|e| e.kind());
-        assert_eq!(premise, Err(std::io::ErrorKind::ConnectionReset));
+        // The premise: closing with unread bytes gives the peer `ECONNRESET`, not EOF (XNU: EOF).
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            use std::io::{Read, Write};
+            use std::os::unix::net::UnixStream;
+            let (mut writer, reader) = UnixStream::pair().expect("pair");
+            writer.write_all(b"header").expect("write");
+            drop(reader);
+            let premise = writer.read(&mut [0u8; 1]).map_err(|e| e.kind());
+            assert_eq!(premise, Err(std::io::ErrorKind::ConnectionReset));
+        }
 
         let (session, _founding_peer) = v2_initiator();
         let added = incoming_attach_against(
@@ -6629,6 +6753,301 @@ mod tests {
             "a reset before any \"cci\" byte may be a refusal, so the session goes on"
         );
         assert_eq!(session.inner.slot_count(), 1, "only the founding slot");
+    }
+
+    /// Runs an outgoing attach whose server half `server` drives by hand over a socketpair.
+    fn outgoing_attach_against(
+        session: &RpcSession,
+        deadline: Duration,
+        wrap: impl FnOnce(super::super::transport::UnixTransport) -> Box<dyn RpcTransport>,
+        server: impl FnOnce(std::os::unix::net::UnixStream) + Send + 'static,
+    ) -> Result<u64> {
+        use super::super::transport::UnixTransport;
+        use std::os::unix::net::UnixStream;
+        let (attach_fd, server_fd) = unix_socketpair_fd();
+        let server = std::thread::spawn(move || server(UnixStream::from(server_fd)));
+        let attach = wrap(UnixTransport::from_stream(UnixStream::from(attach_fd)).expect("unix"));
+        let added = session.add_outgoing_connection_android13plus_transport(
+            move || Ok(attach),
+            PROTOCOL_V2,
+            &[7u8; 32],
+            FileDescriptorTransportMode::None,
+            Some(deadline),
+        );
+        server.join().expect("server half");
+        added
+    }
+
+    /// Reads the client's header, its `"cci"` and its `GET_SESSION_ID` probe.
+    fn read_probe(s: &mut std::os::unix::net::UnixStream) -> Android13PlusCodec {
+        use crate::rpc::wire_android13::server_accept;
+        let (codec, ..) = server_accept(s, PROTOCOL_V2).expect("server handshake");
+        read_aosp_message(s).expect("probe");
+        codec
+    }
+
+    /// Answers the probe with `id`, as a server that added the attach to that session does.
+    fn answer_probe(s: &mut std::os::unix::net::UnixStream, id: &[u8]) {
+        let codec = read_probe(s);
+        let mut p = Parcel::new();
+        p.write(id).expect("id");
+        let reply = WireReply {
+            status: 0,
+            data: p.rpc_data_bytes().to_vec(),
+            object_positions: Vec::new(),
+        };
+        write_aosp_message(s, &codec.encode_reply(&reply).expect("encode")).expect("reply");
+    }
+
+    /// A Unix connection whose `send`th raw send or `arm`th read-deadline arm fails (0-based).
+    struct FailsAt {
+        t: super::super::transport::UnixTransport,
+        send: usize,
+        arm: usize,
+        sends: AtomicUsize,
+        arms: AtomicUsize,
+        /// The error the failing send returns.
+        err: fn() -> RpcError,
+    }
+    impl FailsAt {
+        fn new(t: super::super::transport::UnixTransport, send: usize, arm: usize) -> Self {
+            FailsAt {
+                t,
+                send,
+                arm,
+                sends: AtomicUsize::new(0),
+                arms: AtomicUsize::new(0),
+                err: Self::injected,
+            }
+        }
+        /// The failing send returns `err` instead of an injected `Io`.
+        fn failing_with(mut self, err: fn() -> RpcError) -> Self {
+            self.err = err;
+            self
+        }
+        fn injected() -> RpcError {
+            RpcError::Io(std::io::Error::other("injected"))
+        }
+    }
+    impl RpcTransport for FailsAt {
+        fn send_frame(&self, buf: &[u8]) -> RpcResult<()> {
+            self.t.send_frame(buf)
+        }
+        fn recv_frame(&self) -> RpcResult<Vec<u8>> {
+            self.t.recv_frame()
+        }
+        fn peer_identity(&self) -> PeerIdentity {
+            self.t.peer_identity()
+        }
+        fn describe(&self) -> &str {
+            "fails-at"
+        }
+        fn supports_fd_passing(&self) -> bool {
+            self.t.supports_fd_passing()
+        }
+        fn set_read_timeout(&self, timeout: Option<Duration>) -> RpcResult<()> {
+            if timeout.is_some() && self.arms.fetch_add(1, Ordering::SeqCst) == self.arm {
+                return Err(Self::injected());
+            }
+            self.t.set_read_timeout(timeout)
+        }
+        fn set_write_timeout(&self, timeout: Option<Duration>) -> RpcResult<()> {
+            self.t.set_write_timeout(timeout)
+        }
+        fn shutdown(&self) -> RpcResult<()> {
+            self.t.shutdown()
+        }
+        fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
+            if self.sends.fetch_add(1, Ordering::SeqCst) == self.send {
+                return Err((self.err)());
+            }
+            self.t.send_raw(buf)
+        }
+        fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize> {
+            self.t.recv_raw(buf)
+        }
+    }
+
+    /// Asserts the attach failed and ended the session, or failed and left it up.
+    fn assert_attach_outcome(session: &RpcSession, added: Result<u64>, ends: bool, why: &str) {
+        assert!(added.is_err(), "{why}: {added:?}");
+        assert_eq!(
+            session.inner.shared.lifecycle.is_torn_down(),
+            ends,
+            "{why}: the session must {}",
+            if ends { "end" } else { "go on" }
+        );
+        assert_eq!(
+            session.inner.slot_count(),
+            usize::from(!ends),
+            "{why}: pool size"
+        );
+    }
+
+    /// A `max_version` below the session's is refused before connecting, so nothing is held.
+    #[test]
+    fn an_outgoing_attach_below_the_session_version_never_connects() {
+        let (session, _founding_peer) = v2_initiator();
+        let added = session.add_outgoing_connection_android13plus_transport(
+            || -> Result<Box<dyn RpcTransport>> { panic!("the attach must not connect") },
+            PROTOCOL_V1,
+            &[7u8; 32],
+            FileDescriptorTransportMode::None,
+            Some(Duration::from_secs(5)),
+        );
+        assert_eq!(added, Err(StatusCode::BadType));
+        assert_attach_outcome(&session, added, false, "below the session version");
+    }
+
+    /// A header write that fails leaves the server short of it: no server holds the connection.
+    #[test]
+    fn an_outgoing_attach_whose_header_write_fails_leaves_the_session_up() {
+        let (session, _founding_peer) = v2_initiator();
+        let added = outgoing_attach_against(
+            &session,
+            Duration::from_secs(5),
+            |t| Box::new(FailsAt::new(t, 0, usize::MAX)),
+            hold_until_client_closes,
+        );
+        assert_attach_outcome(&session, added, false, "header write failed");
+    }
+
+    /// Past the header a server may hold it: a failed `"cci"`, a failed probe arm, an expiry.
+    #[test]
+    fn an_outgoing_attach_failing_past_its_header_ends_the_session() {
+        use super::super::transport::UnixTransport;
+        type Wrap = fn(UnixTransport) -> Box<dyn RpcTransport>;
+        // Arm 0 is the handshake's own deadline, arm 1 the probe's.
+        let cases: [(&str, Wrap, Duration); 3] = [
+            (
+                "\"cci\" write",
+                |t| Box::new(FailsAt::new(t, 1, usize::MAX)),
+                Duration::from_secs(5),
+            ),
+            (
+                "probe deadline arm",
+                |t| Box::new(FailsAt::new(t, usize::MAX, 1)),
+                Duration::from_secs(5),
+            ),
+            (
+                "probe deadline expiry",
+                |t| Box::new(t),
+                Duration::from_millis(200),
+            ),
+        ];
+        for (why, wrap, deadline) in cases {
+            let (session, _founding_peer) = v2_initiator();
+            let added = outgoing_attach_against(&session, deadline, wrap, |mut s| {
+                // Reads what the client sends and never answers, holding the connection open.
+                let _ = crate::rpc::wire_android13::server_accept(&mut s, PROTOCOL_V2);
+                hold_until_client_closes(s);
+            });
+            assert_attach_outcome(&session, added, true, why);
+        }
+    }
+
+    /// A close before any reply byte may be a refusal that ended the server's session too.
+    #[test]
+    fn an_outgoing_attach_closed_before_the_reply_ends_the_session() {
+        use super::super::transport::UnixTransport;
+        use std::os::unix::net::UnixStream;
+        type Wrap = fn(UnixTransport) -> Box<dyn RpcTransport>;
+        type Server = fn(UnixStream);
+        fn closes_after_the_probe(mut s: UnixStream) {
+            read_probe(&mut s);
+        }
+        fn holds_after_the_header(mut s: UnixStream) {
+            let _ = crate::rpc::wire_android13::server_accept(&mut s, PROTOCOL_V2);
+            hold_until_client_closes(s);
+        }
+        // Send 1 is the `"cci"` write, send 2 the probe's.
+        let cases: [(&str, Wrap, Server); 4] = [
+            ("EOF", |t| Box::new(t), closes_after_the_probe),
+            (
+                "no close_notify",
+                |t| Box::new(NoCloseNotify(t)),
+                closes_after_the_probe,
+            ),
+            (
+                "close at the \"cci\" write",
+                |t| Box::new(FailsAt::new(t, 1, usize::MAX).failing_with(|| RpcError::EndOfStream)),
+                holds_after_the_header,
+            ),
+            (
+                "close at the probe write",
+                |t| Box::new(FailsAt::new(t, 2, usize::MAX).failing_with(|| RpcError::EndOfStream)),
+                holds_after_the_header,
+            ),
+        ];
+        for (why, wrap, server) in cases {
+            let (session, _founding_peer) = v2_initiator();
+            let added = outgoing_attach_against(&session, Duration::from_secs(5), wrap, server);
+            assert_attach_outcome(&session, added, true, why);
+        }
+    }
+
+    /// A reply byte shows the server added the connection: a cut after it ends the session.
+    #[test]
+    fn an_outgoing_attach_cut_inside_the_reply_ends_the_session() {
+        use super::super::transport::UnixTransport;
+        type Wrap = fn(UnixTransport) -> Box<dyn RpcTransport>;
+        let wraps: [(&str, Wrap); 2] = [
+            ("EOF", |t| Box::new(t)),
+            ("no close_notify", |t| Box::new(NoCloseNotify(t))),
+        ];
+        for (why, wrap) in wraps {
+            let (session, _founding_peer) = v2_initiator();
+            let added = outgoing_attach_against(&session, Duration::from_secs(5), wrap, |mut s| {
+                read_probe(&mut s);
+                std::io::Write::write_all(&mut s, &[1u8]).expect("reply byte");
+            });
+            assert_attach_outcome(&session, added, true, why);
+        }
+    }
+
+    /// A reply naming another session ends it.
+    #[test]
+    fn an_outgoing_attach_refused_after_the_reply_ends_the_session() {
+        let (session, _founding_peer) = v2_initiator();
+        let added = outgoing_attach_against(
+            &session,
+            Duration::from_secs(5),
+            |t| Box::new(t),
+            |mut s| {
+                answer_probe(&mut s, &[8u8; 32]);
+                hold_until_client_closes(s);
+            },
+        );
+        assert_attach_outcome(&session, added, true, "another session's id");
+    }
+
+    /// A transport unlike the founding one is refused before its header, so nothing is held.
+    #[test]
+    fn an_outgoing_attach_on_another_transport_kind_is_refused_before_its_header() {
+        let (session, _founding_peer) = v2_initiator();
+        let added = outgoing_attach_against(
+            &session,
+            Duration::from_secs(5),
+            |t| Box::new(NoFds(t)),
+            expect_no_header,
+        );
+        assert_eq!(added, Err(StatusCode::BadType));
+        assert_attach_outcome(&session, added, false, "another transport kind");
+    }
+
+    /// The client-local id is never on the wire: refused before connecting, so nothing is held.
+    #[test]
+    fn an_outgoing_attach_echoing_the_client_local_id_never_connects() {
+        let (session, _founding_peer) = v2_initiator();
+        let added = session.add_outgoing_connection_android13plus_transport(
+            || -> Result<Box<dyn RpcTransport>> { panic!("the attach must not connect") },
+            PROTOCOL_V2,
+            &session.session_id(),
+            FileDescriptorTransportMode::None,
+            Some(Duration::from_secs(5)),
+        );
+        assert_eq!(added, Err(StatusCode::BadValue));
+        assert_attach_outcome(&session, added, false, "client-local id");
     }
 
     /// The teardown gate is read under `conn_state` with the cap: a dead session admits no slot.
@@ -7223,12 +7642,6 @@ mod tests {
         };
         let cb_slot = session.inner.add_slot_inner_capped(Box::new(transport), 8);
         cb_slot.expect("callback slot");
-        let (waiting_tx, waiting) = mpsc::channel();
-        *session.inner.shared.serve_wait_hook.lock().expect("hook") = Some(waiting_tx);
-        let ends = serve_all(&session, &slots);
-        waiting
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the serve loop must start its wait");
         let data = Parcel::new();
         let inner = Arc::clone(&session.inner);
         // A oneway off the serve slot, as a callback sent outside a handler: it opens no call.
@@ -7240,6 +7653,12 @@ mod tests {
         parked
             .recv_timeout(Duration::from_secs(10))
             .expect("the write must start");
+        let (waiting_tx, waiting) = mpsc::channel();
+        *session.inner.shared.serve_wait_hook.lock().expect("hook") = Some(waiting_tx);
+        let ends = serve_all(&session, &slots);
+        waiting
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the serve loop must start its wait");
         // The reader takes nothing for three periods: the serve slot's wait expires three times.
         std::thread::sleep(3 * idle);
         assert!(

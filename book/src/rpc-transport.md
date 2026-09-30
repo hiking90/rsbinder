@@ -285,7 +285,11 @@ are deprecated since 0.12.0 and will be removed in the release after it.
 > return 32 opaque bytes, so nothing but the method name distinguishes
 > them; an attach that echoes the wrong id (or one the server refuses for
 > any other reason, such as more connections than its `set_max_threads`
-> allows) fails at the attach call.
+> allows) fails at the attach call. On `add_outgoing_connection_with_config`
+> that failure also ends the session it was attaching to, unless the id is
+> this session's own `session_id()`, which is refused (`BadValue`) before
+> connecting (see [How a connection ends](#how-a-connection-ends)); stay
+> within `negotiate()` connections and echo `get_session_id()`.
 
 > **Security.** An abstract socket has **no filesystem permissions**:
 > any process in the same network namespace can connect (subject only to
@@ -558,12 +562,19 @@ connection took with it, and a session that carried on without them
 would leave an object's later `oneway` calls queued behind a number
 that never arrives. Reconnecting, fetching the root again and
 registering callbacks again are the application's. A connection whose
-handshake fails never joins the session, and one exception is dropped
-alone: a server's callback connection whose connection-init write
-fails, since no frame rode it and the client's attach fails with it.
-A client's callback connection whose serving thread cannot be started
-ends the session, since the server already holds it as a callback
-connection.
+handshake fails never joins the session. A server's callback
+connection whose connection-init write fails is dropped alone, since
+no frame rode it and the client's attach fails with it. A client's
+attach, in either direction, ends the session once the server may hold
+the connection: any failure after its header went out, except, for a
+callback attach, a close (a reset included) before the first byte of
+the server's `"cci"`; see `add_incoming_connection_with_config`. An
+outgoing attach has no such exception, because libbinder
+`android-16.0.0_r3` and later end their session when they refuse one
+at the `setMaxThreads` cap, and the close that refusal produces looks
+the same as any other; see `add_outgoing_connection_with_config`. A client's callback connection
+whose serving thread cannot be started ends the session too, since the
+server already holds it as a callback connection.
 
 A serve loop — `RpcSession::serve_blocking` and its variants — returns
 `rpc::SessionEnd`, not `Result<()>`. It answers three questions a
@@ -607,7 +618,7 @@ deadline below is an rsbinder addition, and each measures one thing.
 
 | Setting | What it bounds | On expiry |
 |---|---|---|
-| `RpcSession::set_timeout(d)`; `RpcClientConfig::timeout`, `ClientOptions::timeout`; on a server `RpcServer::set_reply_timeout`, `ServeOptions::reply_timeout`, applied to every session it makes | How long the peer may leave this end without an answer: a reply wait; a send that makes no progress (`SO_SNDTIMEO`, every transport); the peer's host not answering (the kernel's keepalive check, TCP and TLS over TCP); on a client, each connect and handshake step | The session ends; the call that waited returns `TimedOut` |
+| `RpcSession::set_timeout(d)`; `RpcClientConfig::timeout`, `ClientOptions::timeout`; on a server `RpcServer::set_reply_timeout`, `ServeOptions::reply_timeout`, applied to every session it makes | How long the peer may leave this end without an answer: a reply wait; a send that makes no progress (`SO_SNDTIMEO`, every bundled socket transport; a transport of your own only if it implements `RpcTransport::set_write_timeout`); the peer's host not answering (the kernel's keepalive check, TCP and TLS over TCP); on a client, each connect and handshake step | The session ends; the call that waited returns `TimedOut`. A connect or handshake step: the setup or attach call returns `TimedOut`, and an attach whose step expires after its header went out ends the session ([How a connection ends](#how-a-connection-ends)) |
 | The same `d`, for a free connection in the session's pool | A wait for a connection to send on; nothing has been sent yet | That call returns `WouldBlock`; the session goes on |
 | `RpcServer::set_handshake_timeout`, `ServeOptions::handshake_timeout` (default 10 s) | An accepted connection that sends nothing before its first contact | The connection is dropped |
 | `RpcServer::set_idle_timeout`, `ServeOptions::idle_timeout` | A session in which no byte crossed any connection and no call was open, judged per session ([`set_idle_timeout`](https://docs.rs/rsbinder/latest/rsbinder/rpc/struct.RpcServer.html#method.set_idle_timeout) states the timing and what counts) | The session ends |
@@ -622,15 +633,15 @@ thread, or as a future, and stops waiting for it. There is no default:
 a library cannot know how long a handler may legitimately run, and
 neither kernel binder nor libbinder bounds it.
 
-**Keepalive is on for every TCP and TLS connection.** Without a session
-timeout it runs at the system's intervals, so a session whose peer host
+**Keepalive is on for every TCP connection, TLS over TCP included.**
+Without a session timeout it runs at the system's intervals, so a session whose peer host
 vanished ends, and fires its death recipients, after hours instead of
 never; `set_timeout(d)` sizes the check to `d`. The values, and what
 Linux, Android and macOS each do with them, are stated once, in
 [`RpcTransport::set_liveness`](https://docs.rs/rsbinder/latest/rsbinder/rpc/transport/trait.RpcTransport.html#method.set_liveness).
 The probes are between the two kernels and change no byte on the wire,
-so a libbinder peer needs nothing. Unix sockets and vsock have no such
-check.
+so a libbinder peer needs nothing. Unix sockets and vsock, TLS over them
+included, have no such check.
 
 **A relay hides a break.** Keepalive reaches only the first TCP
 endpoint on the path. Behind a relay that terminates TCP — `adb

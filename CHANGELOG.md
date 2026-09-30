@@ -29,8 +29,10 @@ This changelog starts at 0.9.0. For earlier releases, see the
   Likewise `ClientOptions::driver` / `mmap_size` must agree with the URI's
   `?driver=` / `?mmap=`.
 - **An RPC session refuses a connection whose transport differs from its
-  founding one** (fd passing or local peer) with `BadType` at attach. Only
-  hand-assembled sessions (e.g. `RpcServer::serve_connection`) can hit this.
+  founding one** (fd passing or local peer) with `BadType` at attach. A manual
+  attach (`add_{outgoing,incoming}_connection_with_config`) over such a
+  transport is refused before its header goes out, so the session stays up; a
+  hand-assembled session (e.g. `RpcServer::serve_connection`) can hit it too.
 - **`StatusCode::from(ExceptionCode::ServiceSpecific)` is
   `ServiceSpecific(0)`, not `Ok`**, as in AOSP; `StatusCode::from(status)` for
   such a `Status` now yields `ServiceSpecific(0)`, not `FailedTransaction`.
@@ -97,21 +99,34 @@ This changelog starts at 0.9.0. For earlier releases, see the
   went out (a refused pre-check, a failed connect or header write) or whose
   connection closed, a reset included, before any byte of the server's `"cci"`
   arrived (a refused attach): those leave the session up.
+  A failed outgoing attach (`add_outgoing_connection_with_config`) ends the
+  session too, since a libbinder server holds the connection once it has the
+  header, except one whose header never went out (a refused pre-check, a
+  `max_version` below the session's, a transport unlike the founding
+  connection's, the client-local `session_id()` as the id, a failed connect or
+  header write). A refused attach ends it as well: libbinder
+  `android-16.0.0_r3` and later end their session when they refuse an attach
+  at the `setMaxThreads` cap, and the close that refusal produces cannot be
+  told from one that left the server's session up. Stay within `negotiate()`
+  connections and echo `get_session_id()`.
 - **An expired reply deadline ends the session** (`RpcSession::set_timeout`,
   `RpcServer::set_reply_timeout`, the `timeout` / `reply_timeout` options). The
   call still returns `TimedOut`; the session no longer survives it or skips the
   late reply. Set it above the slowest legitimate handler; to abandon one call
   and keep the session, run it on another thread and stop waiting. A wait for
   a free connection still fails only that call, with `WouldBlock`.
-- **The session timeout bounds more than the reply wait**: `SO_SNDTIMEO` on
-  every connection (a send that makes no progress for the period ends the
-  session; a steady slow reader is not cut), the kernel's keepalive check on
+- **The session timeout bounds more than the reply wait**: `SO_SNDTIMEO`
+  (a send that makes no progress for the period ends the session; a steady
+  slow reader is not cut) on every connection of a bundled socket transport,
+  and on a transport of your own only if it implements
+  `RpcTransport::set_write_timeout` (without it a stalled send has no
+  bound), the kernel's keepalive check on
   TCP and TLS over TCP (`RpcTransport::set_liveness` has the values and
   platform differences), and on a client each connect and
   handshake step. A send deadline that expires part-way through a frame
   returns `TimedOut` (0.11.0: `WouldBlock`, which means nothing was sent).
-- **TCP and TLS connections have keepalive on by default**, at the system's
-  intervals without a session timeout (hours), so a session
+- **TCP connections, TLS over TCP included, have keepalive on by default**, at
+  the system's intervals without a session timeout (hours), so a session
   whose peer host vanished ends and fires its death recipients. No wire byte
   changes.
 - **`RpcServer::set_idle_timeout` judges the session, not the connection**: a

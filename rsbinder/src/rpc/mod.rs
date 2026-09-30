@@ -96,10 +96,9 @@
 //! frame pending") or [`RpcError::Timeout`](crate::rpc::RpcError::Timeout) ("no frame boundary
 //! crossed") is documented to have left the stream at
 //! a frame boundary. Every other read failure lacks that guarantee — including ones that in
-//! fact consumed nothing — and is treated as a lost position. Two callers ask through the
+//! fact consumed nothing — and is treated as a lost position. One caller asks through the
 //! crate-private `RpcError::leaves_frame_boundary_intact`: the android-13+ reader, which
-//! promotes a mid-frame case to `Truncated` / `DeadlineMidFrame`, and `client_transact`'s reply
-//! wait, which decides whether an abandoned nested call left its `REPLY` inbound. The r34
+//! promotes a mid-frame case to `Truncated` / `DeadlineMidFrame`. The r34
 //! framing readers and the serve loop reimplement the same split inline — against the io
 //! error kind and the `RpcError` variants respectively — so a change to the set has to be
 //! made in all three places.
@@ -245,7 +244,9 @@ pub enum RpcError {
     /// A wait deadline elapsed with no frame boundary crossed: a read that
     /// consumed nothing (a reply or negotiation deadline), or a send that
     /// put nothing on the wire. The stream stays frame-synchronized either
-    /// way, which is what lets the connection keep serving. The deadline is
+    /// way, but a reply, negotiation or send deadline still ends the
+    /// session; only a serve loop's idle expiry between frames reads on
+    /// (when the session was not idle). The deadline is
     /// one of this end's (`SO_RCVTIMEO`/`SO_SNDTIMEO`, which expire as
     /// `EAGAIN`); the kernel's own `ETIMEDOUT` is a lost connection and
     /// arrives as [`Io`](Self::Io).

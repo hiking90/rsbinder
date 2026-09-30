@@ -16,8 +16,11 @@
 //! - `client_timeout_on_hung_server`,
 //!   `a_reply_timeout_on_one_connection_ends_the_fan_out_session`: drop the
 //!   `fail_session` from `client_transact`'s reply-wait failure and the
-//!   session outlives its reply timeout, so the next call and the other
-//!   connection's call do not fail and no obituary fires.
+//!   session outlives its reply timeout. In `client_timeout_on_hung_server`
+//!   the next call times out too (`TimedOut`, the server still inside
+//!   `slow`), so only the exact `DeadObject` assert catches it; in the
+//!   fan-out test the other connection's call returns `Ok` and no obituary
+//!   fires.
 //! - `a_session_with_one_busy_connection_is_not_idle`: make
 //!   `RpcSessionInner::active_since` report no activity and the quiet
 //!   fan-out connection's first idle expiry ends the session while the
@@ -105,14 +108,15 @@
 //!   refuses by closing), so `add_outgoing_connection_with_config` confirms
 //!   with one `GET_SESSION_ID` round trip. A single-threaded client always
 //!   draws slot 1 first, so the test drives 4 threads to reach the attached
-//!   slot. Dropping `confirm_attach` returns `Ok(2)`/`Ok(3)` for the bogus
-//!   ids, so the `is_err()` asserts fail; the echo loop is the control that
-//!   a confirmed pool has no dead slot.
+//!   slot. The client-local id is refused before connecting (`BadValue`);
+//!   dropping `confirm_attach` returns `Ok(3)` for the unknown id, so its
+//!   `is_err()` assert fails; the echo loop is the control that a confirmed
+//!   pool has no dead slot.
 //! - `attach_past_the_server_slot_cap_is_refused_at_attach_time`: no
 //!   client-side check can catch a valid id past the cap, and a caller that
 //!   skips `negotiate()` has no other way to learn it. Without
-//!   `confirm_attach` the over-cap attaches return `Ok(3)`/`Ok(4)` while the
-//!   server stays at 2 slots.
+//!   `confirm_attach` the over-cap attach returns `Ok(3)` while the server
+//!   stays at 2 slots.
 //! - `shutdown_gate_e2e_rejects_attach_during_handshake_stall`: in
 //!   production the attach arm's `shutdown` check sees a sub-microsecond
 //!   window between an accepted late attach and a concurrent
@@ -1812,35 +1816,20 @@ fn attach_with_a_bogus_session_id_is_refused_at_attach_time() {
         sid.as_slice(),
         "a client session's `session_id()` is a local value, never the peer's"
     );
-    assert!(
-        client
-            .add_outgoing_connection_with_config(
-                RpcClientConfig::unix(&path, 1).session_id(&client.session_id())
-            )
-            .is_err(),
-        "attaching with the client-local id must fail here, not later"
-    );
-    // (b) Plain garbage.
-    assert!(
-        client
-            .add_outgoing_connection_with_config(
-                RpcClientConfig::unix(&path, 1).session_id(&[0xABu8; 32])
-            )
-            .is_err(),
-        "attaching with an unknown id must fail here, not later"
-    );
-    // Neither reached the server's pool; the founding connection is untouched.
+    // Refused before connecting: the session goes on and the server never sees it.
+    assert!(matches!(
+        client.add_outgoing_connection_with_config(
+            RpcClientConfig::unix(&path, 1).session_id(&client.session_id())
+        ),
+        Err(StatusCode::BadValue)
+    ));
     assert_eq!(
         server.session_slot_count(&sid_arr),
         Some(1),
-        "both refused attaches left the server session at its founding slot"
-    );
-    assert!(
-        poll_until(|| server.rejected_unknown_id_count() == 2),
-        "server counted exactly the two unknown-id rejects"
+        "the refused attach left the server session at its founding slot"
     );
 
-    // (c) Control: the server-minted id attaches; 200 calls on 4 threads, zero failures.
+    // (b) Control: the server-minted id attaches; 200 calls on 4 threads, zero failures.
     assert_eq!(
         client
             .add_outgoing_connection_with_config(RpcClientConfig::unix(&path, 1).session_id(&sid))
@@ -1861,6 +1850,25 @@ fn attach_with_a_bogus_session_id_is_refused_at_attach_time() {
     for h in handles {
         h.join().expect("client thread");
     }
+
+    // (c) Plain garbage: a close past the header may be a refusal that ended the server's session.
+    assert!(
+        client
+            .add_outgoing_connection_with_config(
+                RpcClientConfig::unix(&path, 1).session_id(&[0xABu8; 32])
+            )
+            .is_err(),
+        "attaching with an unknown id must fail here, not later"
+    );
+    assert_eq!(
+        client.__slot_count(),
+        0,
+        "the refused attach ended the session"
+    );
+    assert!(
+        poll_until(|| server.rejected_unknown_id_count() == 1),
+        "server counted exactly the one unknown-id reject"
+    );
 }
 
 /// A valid id attached past the server's `set_max_threads` cap also fails at attach time.
@@ -1880,7 +1888,6 @@ fn attach_past_the_server_slot_cap_is_refused_at_attach_time() {
 
     let client = RpcSession::setup_unix_client_android13plus(&path, 1).expect("connect");
     let sid = client.get_session_id().expect("get_session_id");
-    let sid_arr: [u8; 32] = sid.as_slice().try_into().expect("32-byte session id");
 
     assert_eq!(
         client
@@ -1888,27 +1895,23 @@ fn attach_past_the_server_slot_cap_is_refused_at_attach_time() {
             .expect("first attach is under the cap"),
         2
     );
-    for n in 0..2 {
-        assert!(
-            client
-                .add_outgoing_connection_with_config(
-                    RpcClientConfig::unix(&path, 1).session_id(&sid)
-                )
-                .is_err(),
-            "attach #{n} past max_threads=2 must be refused at attach time"
-        );
-    }
-    assert_eq!(
-        server.session_slot_count(&sid_arr),
-        Some(2),
-        "the server never went past its cap"
+    assert!(
+        client
+            .add_outgoing_connection_with_config(RpcClientConfig::unix(&path, 1).session_id(&sid))
+            .is_err(),
+        "an attach past max_threads=2 must be refused at attach time"
     );
-    // The client's pool matches the server's, so every call lands on a live slot.
-    let root = EchoProxy(client.get_root().expect("get_root"));
-    for i in 0..20 {
-        let msg = format!("cap-{i}");
-        assert_eq!(root.echo(&msg).expect("echo after refused attaches"), msg);
-    }
+    // A monotonic counter: the slot count races the server's teardown of the ended session.
+    assert!(
+        poll_until(|| server.rejected_unknown_id_count() == 1),
+        "the server's cap arm refused the attach"
+    );
+    // libbinder `android-16.0.0_r3`+ ends its session at this refusal, so the client ends its own.
+    assert_eq!(
+        client.__slot_count(),
+        0,
+        "the refused attach ended the session"
+    );
 }
 
 /// An attach cannot negotiate: `max_version` below the session's is `BadType`; its own works.
