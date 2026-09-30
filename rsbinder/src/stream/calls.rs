@@ -7,6 +7,8 @@
 
 use std::collections::VecDeque;
 use std::marker::PhantomData;
+#[cfg(feature = "tokio")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -72,9 +74,7 @@ impl Ping {
     }
 }
 
-/// Wait on `cv` while `blocked`, until `deadline`; a wait lasting `ping.every` ends in a ping.
-///
-/// Returns after any of the three, the ping sent with no lock held; the caller looks again.
+/// Wait on `cv` while `blocked` until `deadline` or `ping.every`; the ping goes out unlocked.
 fn park<S>(
     mutex: &Mutex<S>,
     cv: &Condvar,
@@ -104,6 +104,40 @@ fn park<S>(
             .wait_timeout(state, left)
             .unwrap_or_else(|e| e.into_inner())
             .0;
+    }
+}
+
+/// Dropped with its future, it ends that future's pooled [`park`] before it can ping.
+#[cfg(feature = "tokio")]
+struct Abandon<'a, S> {
+    gone: Arc<AtomicBool>,
+    mutex: &'a Mutex<S>,
+    cv: &'a Condvar,
+}
+
+#[cfg(feature = "tokio")]
+impl<'a, S> Abandon<'a, S> {
+    fn new(mutex: &'a Mutex<S>, cv: &'a Condvar) -> Self {
+        Abandon {
+            gone: Arc::default(),
+            mutex,
+            cv,
+        }
+    }
+
+    /// Set once the future is dropped; the pooled wait's `blocked` reads it.
+    fn gone(&self) -> Arc<AtomicBool> {
+        self.gone.clone()
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl<S> Drop for Abandon<'_, S> {
+    fn drop(&mut self) {
+        self.gone.store(true, Ordering::Release);
+        // Locked once, so the store cannot fall between the wait's check and its sleep.
+        drop(self.mutex.lock().unwrap_or_else(|e| e.into_inner()));
+        self.cv.notify_all();
     }
 }
 
@@ -269,18 +303,21 @@ impl Credit {
                 notified.await;
                 continue;
             }
+            let abandon = Abandon::new(&self.state, &self.wake);
+            let gone = abandon.gone();
             // No `tokio/time` to suspend against, so a bounded wait is a condvar on the pool.
             let pooled = on_pool(self.clone(), move |credit| {
                 park(
                     &credit.state,
                     &credit.wake,
-                    Self::starved,
+                    |s| Self::starved(s) && !gone.load(Ordering::Acquire),
                     deadline,
                     ping.as_ref(),
                 );
                 Ok(())
             })
             .await;
+            drop(abandon);
             if let Err(e) = pooled {
                 // The pool never ran the wait, so nothing else ends it.
                 return Self::poll_credit(&mut self.lock()).unwrap_or(Err(e));
@@ -1065,6 +1102,9 @@ struct StreamState {
     granted: u64,
     /// Last grant failed; retry waits for a batch or the next consumer call instead of spinning.
     grant_failed: bool,
+    /// Told, under the lock, each time the consumer's wait is about to sleep.
+    #[cfg(test)]
+    parked: Option<std::sync::mpsc::Sender<()>>,
 }
 
 impl StreamState {
@@ -1321,6 +1361,10 @@ impl IStreamSink for SinkObject {
                 cancel_now = state.canceled;
             }
         }
+        if kept {
+            // A wait begun before now had nobody to ping; woken, it looks the source up.
+            self.0.wake();
+        }
         if !kept {
             // Nothing owns this link now; dropping the recipient would only make it inert.
             unlink_death(source, &death);
@@ -1443,6 +1487,7 @@ impl<T: Deserialize> Consumer<T> {
     }
 
     /// The producer's source, once `onStart` has named it, as a quiet wait's ping.
+    #[cfg(feature = "tokio")]
     fn ping_target(&self) -> Option<Ping> {
         let source = self.stream.lock().source_binder.clone()?;
         Ping::to(&source, self.ping)
@@ -1450,12 +1495,24 @@ impl<T: Deserialize> Consumer<T> {
 
     /// Wait for a batch, the end or a grant to send, up to `deadline` or one ping.
     fn park(&self, deadline: Option<Instant>) {
-        let ping = self.ping_target();
+        let source = self.stream.lock().source_binder.clone();
+        let ping = source
+            .as_ref()
+            .and_then(|source| Ping::to(source, self.ping));
+        // With no source yet there is nobody to ping, so its arrival ends the wait too.
+        let starting = source.is_none() && self.ping != PingPolicy::Off;
         // `must_wait` is read under the lock, so a batch landing after `advance` looked wakes it.
         park(
             &self.stream.state,
             &self.stream.arrived,
-            StreamState::must_wait,
+            |s: &StreamState| {
+                let blocked = s.must_wait() && !(starting && s.source_binder.is_some());
+                #[cfg(test)]
+                if let Some(parked) = s.parked.as_ref().filter(|_| blocked) {
+                    let _ = parked.send(());
+                }
+                blocked
+            },
             deadline,
             ping.as_ref(),
         );
@@ -1499,18 +1556,21 @@ impl<T: Deserialize> Consumer<T> {
                 notified.await;
                 continue;
             };
+            let abandon = Abandon::new(&stream.state, &stream.arrived);
+            let gone = abandon.gone();
             // No `tokio/time` to suspend against: the wait, and the ping ending it, use the pool.
             let parked = on_pool(self.stream.clone(), move |stream| {
                 park(
                     &stream.state,
                     &stream.arrived,
-                    StreamState::must_wait,
+                    |s| s.must_wait() && !gone.load(Ordering::Acquire),
                     None,
                     Some(&ping),
                 );
                 Ok(())
             })
             .await;
+            drop(abandon);
             if parked.is_err() {
                 // No pool: wait unpinged rather than spin.
                 notified.await;
@@ -2954,5 +3014,61 @@ mod tests {
         assert_eq!(first.expect("an item").expect("ok"), 1);
         assert!(second.expect("a report").is_err());
         assert_eq!(calls.canceled.load(Ordering::SeqCst), 1);
+    }
+
+    /// A wait begun before `onStart` ends when it lands, so the caller can look up whom to ping.
+    #[test]
+    fn a_wait_begun_before_the_producer_starts_ends_when_it_starts() {
+        let (rx, sink_binder) = Consumer::<i32>::new(&receiver_policy(4, 4));
+        let (parked_tx, parked) = mpsc::channel();
+        rx.stream.lock().parked = Some(parked_tx);
+        let (done, watch) = mpsc::channel();
+        thread::spawn(move || {
+            rx.park(None);
+            // Sent back alive: dropping the consumer cancels too.
+            let _ = done.send(rx);
+        });
+        // Signalled under the lock the wait only gives up by sleeping, so `onStart` comes after.
+        parked
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the wait never slept");
+        let source = BnStreamSource::new_binder(RefusingSource(Arc::default())).as_binder();
+        let sink: Strong<dyn IStreamSink> =
+            FromIBinder::try_from(sink_binder).expect("the consumer's own sink");
+        sink.r#onStart(&source, 4).expect("onStart");
+        let _rx = watch
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the producer's start must end a wait that had nobody to ping");
+    }
+
+    /// A dropped `send_async` ends its pooled credit wait, freeing the pool's only thread.
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn a_dropped_send_async_gives_back_the_thread_its_credit_wait_held() {
+        let (_rx, sink_binder) = Consumer::<i32>::new(&receiver_policy(1, 4));
+        let mut sink = Producer::<i32>::open(&sink_binder, &sink_policy(4, 1)).expect("open");
+        let (done, watch) = mpsc::channel();
+        thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .max_blocking_threads(1)
+                .build()
+                .expect("runtime");
+            let freed = runtime.block_on(async {
+                sink.send_async(&0, None).await.expect("the opening credit");
+                {
+                    // A deadline sends the wait to the pool; the first poll hands it over.
+                    let send = sink.send_async(&1, Some(Duration::from_secs(60)));
+                    let mut send = std::pin::pin!(send);
+                    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                    assert!(std::future::Future::poll(send.as_mut(), &mut cx).is_pending());
+                }
+                tokio::task::spawn_blocking(|| ()).await
+            });
+            let _ = done.send(freed.is_ok());
+        });
+        assert!(watch
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the abandoned credit wait still holds the pool's only thread"));
     }
 }

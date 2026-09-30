@@ -455,9 +455,7 @@ fn a_stream_of_a_thousand_items_crosses_a_session() {
     );
 }
 
-/// Plan 2-23 §3.3: 20000 one-item batches each way, so each side serves 20000 oneway `onBatch`
-/// calls. Their target `DEC_STRONG`s, 640 KB of frames, would fill the socket buffer of the
-/// connection they came in on, which the other end reads only while it waits for a reply.
+/// Plan 2-23 §3.3: 20000 one-item batches each way; their DEC_STRONGs must not stall a socket.
 #[test]
 fn twenty_thousand_items_cross_each_way_without_a_stall() {
     const N: i32 = 20_000;
@@ -813,6 +811,49 @@ fn an_async_consumer_notices_a_producer_gone_silent_behind_a_relay() {
         rsbinder::StatusCode::DeadObject
     );
     assert!(elapsed < NOTICED_WITHIN, "noticed after {elapsed:?}");
+}
+
+/// A dropped `recv_async` ends its pooled wait, freeing the pool's only thread before any ping.
+#[test]
+fn a_dropped_recv_async_gives_back_the_thread_its_wait_held() {
+    // A ping only every 20 s, so an abandoned wait would hold the thread past the bound below.
+    let f = fixture_with(
+        "abandon_rx",
+        1,
+        Setup {
+            client_timeout: Some(Duration::from_secs(60)),
+            ..Setup::default()
+        },
+    );
+    let (mut rx, endpoint) = f.default_receiver();
+    f.demo
+        .r#subscribe(&endpoint, i32::MAX, 4, default_credits(), 30_000_000)
+        .expect("subscribe");
+    assert!(rx.next().expect("item 0").is_ok());
+    // Pays the owed credit, so `recv_async` goes straight to its pooled wait.
+    assert!(rx.try_recv().expect("still running").is_none());
+
+    let (tx, done) = mpsc::channel();
+    thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime");
+        let freed = runtime.block_on(async {
+            {
+                let recv = rx.recv_async();
+                let mut recv = std::pin::pin!(recv);
+                let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(std::future::Future::poll(recv.as_mut(), &mut cx).is_pending());
+            }
+            tokio::task::spawn_blocking(|| ()).await
+        });
+        let _ = tx.send(freed.is_ok());
+    });
+    assert!(done
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the abandoned wait still holds the pool's only thread"));
 }
 
 /// The service's producer parked on credit, relay frozen; only the service has a deadline.
