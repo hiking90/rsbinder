@@ -813,7 +813,7 @@ fn an_async_consumer_notices_a_producer_gone_silent_behind_a_relay() {
     assert!(elapsed < NOTICED_WITHIN, "noticed after {elapsed:?}");
 }
 
-/// A dropped `recv_async` ends its pooled wait, freeing the pool's only thread before any ping.
+/// Dropped before its pooled wait sleeps, `recv_async` frees the pool's only thread, no ping.
 #[test]
 fn a_dropped_recv_async_gives_back_the_thread_its_wait_held() {
     // A ping only every 20 s, so an abandoned wait would hold the thread past the bound below.

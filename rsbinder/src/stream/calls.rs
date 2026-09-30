@@ -3041,7 +3041,7 @@ mod tests {
             .expect("the producer's start must end a wait that had nobody to ping");
     }
 
-    /// A dropped `send_async` ends its pooled credit wait, freeing the pool's only thread.
+    /// Dropped before its pooled wait sleeps, `send_async` still frees the pool's only thread.
     #[cfg(feature = "tokio")]
     #[test]
     fn a_dropped_send_async_gives_back_the_thread_its_credit_wait_held() {
@@ -3070,5 +3070,45 @@ mod tests {
         assert!(watch
             .recv_timeout(Duration::from_secs(10))
             .expect("the abandoned credit wait still holds the pool's only thread"));
+    }
+
+    /// An `Abandon` dropped while its `park` sleeps wakes that wait instead of leaving it asleep.
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn an_abandon_dropped_while_its_wait_sleeps_ends_the_wait() {
+        let (mutex, cv) = (Mutex::new(()), Condvar::new());
+        let abandon = Abandon::new(&mutex, &cv);
+        let gone = abandon.gone();
+        let (asleep_tx, asleep) = mpsc::channel();
+        thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                let started = Instant::now();
+                // Sent only once the check under the lock chose to sleep: the drop finds it asleep.
+                let blocked = |_: &()| {
+                    let blocked = !gone.load(Ordering::Acquire);
+                    if blocked {
+                        let _ = asleep_tx.send(());
+                    }
+                    blocked
+                };
+                park(
+                    &mutex,
+                    &cv,
+                    blocked,
+                    Some(started + Duration::from_secs(5)),
+                    None,
+                );
+                started.elapsed()
+            });
+            asleep
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the wait never went to sleep");
+            drop(abandon);
+            let slept = waiter.join().expect("the waiter");
+            assert!(
+                slept < Duration::from_secs(2),
+                "the abandoned wait slept on: {slept:?}"
+            );
+        });
     }
 }
