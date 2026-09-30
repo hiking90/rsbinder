@@ -109,8 +109,7 @@ void set_sched(std::string s) {
 
 AIBinder_Class* g_cb_clazz = nullptr;
 
-// A client binder watched for death (TX_WATCH): libbinder sends its obituary
-// when this end's session shuts down (`RpcSession::shutdownAndWait`).
+// A client binder watched (TX_WATCH): its obituary comes on `RpcSession::shutdownAndWait`.
 std::atomic<int> g_died{0};
 AIBinder* g_watched = nullptr;  // held strong: an obituary goes only to a live proxy
 AIBinder_DeathRecipient* g_recipient = nullptr;

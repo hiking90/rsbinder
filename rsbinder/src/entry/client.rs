@@ -63,14 +63,16 @@ pub struct ClientOptions {
     /// counts it as broken (`RpcSession::set_timeout`, plan 2-24 D4 and D6).
     ///
     /// - **Connecting**: it bounds each blocking step of connecting — one
-    ///   `connect(2)` per address the founding connection tries (`tcp://`,
-    ///   `tls://`), the TLS handshake, then each read and write of the
+    ///   `connect(2)` per address the founding connection tries (`tls://`),
+    ///   the TLS handshake, then each read and write of the
     ///   android-13+ handshake — on the founding connection and on every
     ///   fan-out or incoming attach. It is not a budget for the phase as a
     ///   whole, so `open` can take a multiple of it before returning; what
     ///   it guarantees is that no single step waits on a silent peer
-    ///   forever. Resolving the host name is the one step it cannot reach:
-    ///   that blocks in the platform's resolver.
+    ///   forever. Two steps are out of its reach: resolving the host name,
+    ///   which blocks in the platform's resolver, and on Linux and Android a
+    ///   `unix://` or `unix-abstract://` connect into a listener whose
+    ///   accept queue is full, which waits until the server accepts.
     /// - **The session**: applied as soon as the session exists, so it also
     ///   bounds the round trips `open` makes after that point (the r34
     ///   fd-mode negotiation, the `GET_MAX_THREADS` / `GET_SESSION_ID`
@@ -80,7 +82,10 @@ pub struct ClientOptions {
     ///
     /// `None` (default) waits forever, so a peer that accepts the socket
     /// and then writes nothing hangs `open`. Set it whenever the peer is
-    /// untrusted or merely unreliable.
+    /// untrusted or merely unreliable. `Some(Duration::ZERO)` is no
+    /// deadline either, as `RpcSession::set_timeout` treats it; unlike the
+    /// deprecated `handshake_timeout` (`rpc` feature), `open` does not
+    /// refuse it.
     pub timeout: Option<Duration>,
     /// RPC: deadline for the connection **handshake**, in place of
     /// [`timeout`](Self::timeout) for that phase. The r34 wire (no

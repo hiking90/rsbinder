@@ -64,15 +64,17 @@ use crate::StatusCode;
 pub enum EndedBy {
     /// This end decided to: an explicit
     /// [`RpcSession::close_session`](super::RpcSession::close_session) or
-    /// [`RpcServer::terminate`](super::RpcServer::terminate), or a
-    /// deadline this end armed and let expire — between frames (idle
+    /// [`RpcServer::terminate`](super::RpcServer::terminate), or a read
+    /// deadline a serve loop armed and let expire — between frames (idle
     /// eviction) or part-way through one. Every end observed after that
     /// decision is `Local`, whichever side's bytes reached the loop first.
     Local,
     /// Not this end's decision: the peer closed, went away, or the
     /// stream failed. Whether the *peer* chose it is not knowable at the
     /// transport — a close, a reset and a cut all arrive as an end of
-    /// stream — so this says only what it can.
+    /// stream — so this says only what it can. A reply or send deadline
+    /// of this end's that expires is a fault (the peer did not answer or
+    /// read) and reads `NotLocal` too.
     NotLocal,
 }
 
@@ -120,8 +122,8 @@ pub enum EndReason {
                 loop reports the session's end"
     )]
     Unreadable,
-    /// Never produced. A connection is no longer retired while its
-    /// session lives on; a loop whose slot is gone reports
+    /// Never produced. A fault on any connection ends the whole session;
+    /// a loop whose slot is gone reports
     /// [`SessionEnded`](Self::SessionEnded).
     #[deprecated(
         since = "0.12.0",
@@ -135,6 +137,14 @@ pub enum EndReason {
     /// [`SessionEnd::by`] and [`SessionEnd::stream`] follow that end: this
     /// end's decision reads `Local` and `InSync`, anything else `NotLocal`
     /// and `Lost`.
+    ///
+    /// [`serve_blocking_on`](super::RpcSession::serve_blocking_on) also
+    /// returns it at once for a `slot_id` that names no connection of the
+    /// session, and leaves the session as it was. The axes then follow
+    /// whether this end had closed the session: `Local` and `InSync` if it
+    /// had, `NotLocal` and `Lost` otherwise, so a live session's wrong id
+    /// reads as [`StatusCode::DeadObject`] through
+    /// [`SessionEnd::into_result`].
     SessionEnded,
     /// This end ended the session while the loop held a frame it had
     /// just read; the frame was not dispatched.

@@ -170,6 +170,13 @@ pub trait RpcTransport: Send + Sync {
     /// under [`set_max_connections`](super::server::RpcServer::set_max_connections),
     /// its admission slot) forever by stalling our blocking `write_all`
     /// once the kernel send buffer fills.
+    ///
+    /// A transport that keeps the default gives a stalled send no bound at
+    /// all. A server session counts a frame being written as activity
+    /// until the write returns
+    /// ([`set_idle_timeout`](super::server::RpcServer::set_idle_timeout)),
+    /// so its idle judgment cannot end a session stuck in such a send; a
+    /// transport handed to a server with an idle timeout implements this.
     fn set_write_timeout(&self, _timeout: Option<std::time::Duration>) -> RpcResult<()> {
         Ok(())
     }
@@ -179,28 +186,74 @@ pub trait RpcTransport: Send + Sync {
     /// [`set_timeout`](super::RpcSession::set_timeout), which calls this on
     /// every connection. The default is a no-op: `unix`, `vsock` and `mem`
     /// have no such check, and a caller's own transport gets the default
-    /// until it overrides this. `tcp_debug` and `tls` over TCP implement it:
+    /// until it overrides this. `tcp_debug` and `tls` over TCP implement it.
+    /// This is the one place the crate states the values and what the
+    /// kernel does with them; every other document points here.
     ///
-    /// - `SO_KEEPALIVE` is on whatever `timeout` is. With `None` the probe
-    ///   intervals are the operating system's defaults (Linux: first probe
-    ///   after 7200 s idle, then 9 probes 75 s apart), so a connection whose
-    ///   peer vanished ends in about two hours instead of never.
-    /// - With `Some(d)` the connection is declared dead once the peer's host
-    ///   has not acknowledged anything for about `d`: first probe after
-    ///   `d / 2` of silence, then three probes `d / 6` apart (each at least
-    ///   one second, the socket option's unit), and on Linux and Android
-    ///   `TCP_USER_TIMEOUT` = `d` bounds data sent and not acknowledged.
-    ///   macOS has no `TCP_USER_TIMEOUT`, so unacknowledged data there is
-    ///   bounded by the system's retransmission limit.
+    /// # What is set
     ///
-    /// A connection the kernel gives up on reads and writes as
-    /// `ETIMEDOUT` ([`RpcError::Io`]), which ends the session. Setting
-    /// `None` after `Some(d)` turns `TCP_USER_TIMEOUT` back to the system
-    /// default but leaves the probe intervals as `Some(d)` set them: no
-    /// socket option restores the system's interval defaults. The probes
-    /// reach only the first TCP endpoint on the path; a relay that ends TCP
-    /// (`adb forward`, `ssh -L`, a TLS terminator) answers them itself, so a
-    /// break behind it goes unnoticed here.
+    /// - `SO_KEEPALIVE` on, whatever `timeout` is.
+    /// - With `Some(d)`: `TCP_KEEPIDLE` = `d / 2` and `TCP_KEEPINTVL` =
+    ///   `d / 6`, each in whole seconds rounded down and then held to
+    ///   1..=32767 s (the options' unit, and Linux's `MAX_TCP_KEEPIDLE` /
+    ///   `MAX_TCP_KEEPINTVL`, past which `setsockopt` fails with `EINVAL`);
+    ///   `TCP_KEEPCNT` = 3; and on Linux and Android only, `TCP_USER_TIMEOUT`
+    ///   = `d` in milliseconds, held to 1..=`i32::MAX`.
+    /// - With `None`: on Linux and Android `TCP_USER_TIMEOUT` = 0, the
+    ///   kernel default. The probe options are not touched, so after an
+    ///   earlier `Some(d)` they keep that call's values: no socket option
+    ///   restores the system's defaults.
+    ///
+    /// # Linux and Android
+    ///
+    /// Read from `net/ipv4/tcp_timer.c` (kernel `android17-6.18`):
+    ///
+    /// - **A quiet connection** (nothing unacknowledged, nothing queued):
+    ///   `tcp_keepalive_timer` sends the first probe once nothing has come
+    ///   from the peer's host for `TCP_KEEPIDLE`, then one per
+    ///   `TCP_KEEPINTVL`; any segment from the peer, a probe's ACK included,
+    ///   restarts the count. With `TCP_USER_TIMEOUT` set, `TCP_KEEPCNT` is
+    ///   ignored and the connection is reset at the first timer run that
+    ///   finds a probe out and nothing received for `TCP_USER_TIMEOUT`: for
+    ///   `Some(d)` about `d` after the host went silent, later by at most one
+    ///   interval since the check runs on the probe schedule. Without it the
+    ///   reset follows the `TCP_KEEPCNT`-th unanswered probe. The system
+    ///   defaults (`include/net/tcp.h`) are 7200 s, 75 s and 9 probes, so a
+    ///   `None` connection whose peer's host vanished ends after about two
+    ///   hours.
+    /// - **Data sent and not acknowledged**: keepalive does not run while
+    ///   there is any (`tcp_keepalive_timer` skips a socket with packets out
+    ///   or a non-empty write queue); retransmission does. `tcp_write_timeout`
+    ///   ends the connection once `TCP_USER_TIMEOUT` has passed since the
+    ///   oldest unacknowledged segment first went out, and
+    ///   `tcp_clamp_rto_to_user_timeout` makes the last retransmission timer
+    ///   fire at that point. With `TCP_USER_TIMEOUT` = 0 the bound is
+    ///   `net.ipv4.tcp_retries2` (15 by default, about 925 s).
+    /// - **A zero receive window**: when the peer's host answers every probe
+    ///   but keeps its window closed while this end has data queued,
+    ///   `tcp_probe_timer` ends the connection once `TCP_USER_TIMEOUT` has
+    ///   passed since the first window probe; with 0 it never does.
+    ///
+    /// The end reads and writes as `ETIMEDOUT` (or an ICMP error the socket
+    /// recorded before, such as `EHOSTUNREACH`), an [`RpcError::Io`], which
+    /// ends the session.
+    ///
+    /// # macOS
+    ///
+    /// The same keepalive options are set (`TCP_KEEPALIVE` is the idle
+    /// option's name there) and no `TCP_USER_TIMEOUT`, which the platform
+    /// lacks. How the macOS kernel acts on them is not stated here, and
+    /// unacknowledged data is left to the system's retransmission limit, not
+    /// to `d`.
+    ///
+    /// # Limits
+    ///
+    /// The session's send deadline is separate: it sets `SO_SNDTIMEO` through
+    /// [`set_write_timeout`](Self::set_write_timeout), which bounds only a
+    /// send blocked on a full send buffer, never data already accepted into
+    /// it. The probes reach only the first TCP endpoint on the path; a relay
+    /// that ends TCP (`adb forward`, `ssh -L`, a TLS terminator) answers them
+    /// itself, so a break behind it goes unnoticed here.
     fn set_liveness(&self, _timeout: Option<std::time::Duration>) -> RpcResult<()> {
         Ok(())
     }
@@ -565,14 +618,18 @@ pub(crate) fn is_timeout(e: &std::io::Error) -> bool {
     e.kind() == ErrorKind::WouldBlock
 }
 
-/// Keepalive probes after the first: three tolerate two lost probe segments before a verdict.
+/// `TCP_KEEPCNT`; `RpcTransport::set_liveness` says where it decides the verdict.
 #[cfg(any(feature = "rpc-tcp-debug", feature = "rpc-tls"))]
 const KEEPALIVE_PROBES: u32 = 3;
 
-/// Idle before the first probe and the probe interval for `d`: `d/2 + 3·d/6` ≈ `d`, each ≥ 1 s.
+/// Linux `MAX_TCP_KEEPIDLE` = `MAX_TCP_KEEPINTVL` (`include/net/tcp.h`); more is `EINVAL`.
+#[cfg(any(feature = "rpc-tcp-debug", feature = "rpc-tls"))]
+const MAX_KEEPALIVE_SECS: u64 = 32767;
+
+/// `TCP_KEEPIDLE` and `TCP_KEEPINTVL` for `d`, as `RpcTransport::set_liveness` states them.
 #[cfg(any(feature = "rpc-tcp-debug", feature = "rpc-tls"))]
 fn keepalive_intervals(d: std::time::Duration) -> (std::time::Duration, std::time::Duration) {
-    let secs = |n: u64| std::time::Duration::from_secs(n.max(1));
+    let secs = |n: u64| std::time::Duration::from_secs(n.clamp(1, MAX_KEEPALIVE_SECS));
     (secs(d.as_secs() / 2), secs(d.as_secs() / 6))
 }
 
@@ -583,22 +640,31 @@ pub(crate) fn tcp_liveness(
     timeout: Option<std::time::Duration>,
 ) -> std::io::Result<()> {
     use rustix::net::sockopt;
-    sockopt::set_socket_keepalive(fd, true)?;
-    // 0 is the kernel default; a positive deadline is at least 1 ms, so it never reads as 0.
+    // Every option is tried after a failure too, so none is left at an earlier call's value.
+    let mut first_err: Option<std::io::Error> = None;
+    let mut apply = |r: rustix::io::Result<()>| {
+        if let Err(e) = r {
+            first_err.get_or_insert(e.into());
+        }
+    };
+    apply(sockopt::set_socket_keepalive(fd, true));
+    // 0 is the kernel default; a positive deadline is at least 1 ms; the kernel reads an `int`.
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    sockopt::set_tcp_user_timeout(
+    apply(sockopt::set_tcp_user_timeout(
         fd,
         timeout.map_or(0, |d| {
-            u32::try_from(d.as_millis()).unwrap_or(u32::MAX).max(1)
+            u32::try_from(d.as_millis())
+                .unwrap_or(u32::MAX)
+                .clamp(1, i32::MAX as u32)
         }),
-    )?;
+    ));
     if let Some(d) = timeout {
         let (idle, interval) = keepalive_intervals(d);
-        sockopt::set_tcp_keepidle(fd, idle)?;
-        sockopt::set_tcp_keepintvl(fd, interval)?;
-        sockopt::set_tcp_keepcnt(fd, KEEPALIVE_PROBES)?;
+        apply(sockopt::set_tcp_keepidle(fd, idle));
+        apply(sockopt::set_tcp_keepintvl(fd, interval));
+        apply(sockopt::set_tcp_keepcnt(fd, KEEPALIVE_PROBES));
     }
-    Ok(())
+    first_err.map_or(Ok(()), Err)
 }
 
 /// Socket `shutdown` result, absorbing macOS's `ENOTCONN` on a second call (trait: idempotent).
@@ -815,6 +881,17 @@ mod tests {
         assert_eq!(sockopt::tcp_keepintvl(fd).unwrap(), Duration::from_secs(1));
         #[cfg(any(target_os = "linux", target_os = "android"))]
         assert_eq!(user_timeout(), 1_500);
+
+        // Past the kernel's caps each value saturates, rather than failing and keeping the last.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let month = Duration::from_secs(30 * 24 * 3600);
+            tcp_liveness(fd, Some(month)).expect("30 days");
+            let cap = Duration::from_secs(MAX_KEEPALIVE_SECS);
+            assert_eq!(sockopt::tcp_keepidle(fd).unwrap(), cap);
+            assert_eq!(sockopt::tcp_keepintvl(fd).unwrap(), cap);
+            assert_eq!(user_timeout(), i32::MAX as u32);
+        }
 
         tcp_liveness(fd, None).expect("back to none");
         assert!(sockopt::socket_keepalive(fd).unwrap());

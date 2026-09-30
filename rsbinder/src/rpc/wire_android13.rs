@@ -802,19 +802,24 @@ fn read_exact_raw<R: Read>(r: &mut R, n: usize) -> RpcResult<Vec<u8>> {
 
 /// Fills `buf` from `r`, so a message body lands in its final buffer without a temporary.
 fn read_exact_into<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
+    read_exact_into_counted(r, buf).map_err(|(e, _)| e)
+}
+
+/// `read_exact_into` whose failure also carries how many bytes arrived before it.
+fn read_exact_into_counted<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<(), (RpcError, usize)> {
     let n = buf.len();
     let mut got = 0;
     while got < n {
         match r.read(&mut buf[got..]) {
-            Ok(0) => return Err(classify_short_read(RpcError::EndOfStream, got)),
+            Ok(0) => return Err((classify_short_read(RpcError::EndOfStream, got), got)),
             Ok(k) => got += k,
             // A signal interrupted the read; retry like every other reader.
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             // Deadline (`WouldBlock`, raw or via `RawTransportIo`) → `Timeout`, not `Io`.
             Err(ref e) if super::transport::is_timeout(e) => {
-                return Err(classify_short_read(RpcError::Timeout, got))
+                return Err((classify_short_read(RpcError::Timeout, got), got))
             }
-            Err(e) => return Err(classify_short_read(map_io(e), got)),
+            Err(e) => return Err((classify_short_read(map_io(e), got), got)),
         }
     }
     Ok(())
@@ -896,9 +901,10 @@ pub fn write_aosp_message_with_fds(
 /// `SCM_RIGHTS` with the first byte of the sender's `sendmsg`, i.e. on
 /// the header read). Clean EOF before any byte ⇒ [`RpcError::EndOfStream`];
 /// a short read after partial progress ⇒ [`RpcError::Truncated`]
-/// (mirrors [`read_aosp_message`]).
+/// (mirrors [`read_aosp_message`]). `recv` is one `recvmsg`
+/// (`RpcTransport::recv_raw_with_fds`).
 pub fn read_aosp_message_with_fds(
-    t: &dyn super::transport::RpcTransport,
+    mut recv: impl FnMut(&mut [u8]) -> RpcResult<(usize, Vec<std::os::fd::OwnedFd>)>,
 ) -> RpcResult<(Vec<u8>, Vec<std::os::fd::OwnedFd>)> {
     let mut fds: Vec<std::os::fd::OwnedFd> = Vec::new();
     let mut total_read = 0usize;
@@ -906,7 +912,7 @@ pub fn read_aosp_message_with_fds(
     let mut fill = |dst: &mut [u8]| -> RpcResult<()> {
         let mut got = 0;
         while got < dst.len() {
-            let (n, mut more) = match t.recv_raw_with_fds(&mut dst[got..]) {
+            let (n, mut more) = match recv(&mut dst[got..]) {
                 Ok(v) => v,
                 Err(e) => return Err(classify_short_read(e, total_read)),
             };
@@ -973,7 +979,7 @@ pub fn client_connect<S: Read + Write>(
 /// (AOSP `RpcSession::setupClient`: the first connection sends an empty
 /// id and reads the server-minted one; the remaining connections echo
 /// it). An **empty** `session_id` is byte-for-byte identical to
-/// [`client_connect`] (additive: the default path is unchanged).
+/// [`client_connect`].
 ///
 /// **Wire is the mirror of [`server_accept`] across the 4 (new vs.
 /// attach) × (outgoing vs. incoming) cells (AOSP `RpcSession.cpp`
@@ -1012,14 +1018,12 @@ pub fn client_connect_with_id<S: Read + Write>(
     fd_mode: u8,
     session_id: &[u8],
 ) -> RpcResult<Android13PlusCodec> {
-    let hdr_codec = Android13PlusCodec::with_version(max_version)?;
-    let header = hdr_codec.encode_connection_header(incoming, fd_mode, session_id)?;
-    write_all_raw(stream, &header)?;
+    let hdr_codec =
+        client_write_connection_header(stream, max_version, incoming, fd_mode, session_id)?;
     let requesting_new_session = session_id.is_empty();
     if incoming {
         // Attach + incoming (new + incoming is refused server-side): read the server's init.
-        let init = read_exact_raw(stream, A13_CONN_INIT_LEN)?;
-        hdr_codec.decode_connection_init(&init)?;
+        client_read_connection_init(stream, &hdr_codec).map_err(|(e, _)| e)?;
     } else {
         // outgoing (both new and attach): client writes init.
         write_all_raw(stream, &hdr_codec.encode_connection_init())?;
@@ -1042,6 +1046,32 @@ pub fn client_connect_with_id<S: Read + Write>(
         // Attach: no NewSessionResponse on the wire (AOSP same).
         Ok(hdr_codec)
     }
+}
+
+/// Writes the connection header: a failure here precedes any admission by the peer.
+pub(crate) fn client_write_connection_header<W: Write>(
+    stream: &mut W,
+    max_version: u32,
+    incoming: bool,
+    fd_mode: u8,
+    session_id: &[u8],
+) -> RpcResult<Android13PlusCodec> {
+    let hdr_codec = Android13PlusCodec::with_version(max_version)?;
+    let header = hdr_codec.encode_connection_header(incoming, fd_mode, session_id)?;
+    write_all_raw(stream, &header)?;
+    Ok(hdr_codec)
+}
+
+/// Reads the server's `"cci"`; a failure also carries how many of its bytes arrived first.
+pub(crate) fn client_read_connection_init<R: Read>(
+    stream: &mut R,
+    codec: &Android13PlusCodec,
+) -> Result<(), (RpcError, usize)> {
+    let mut init = [0u8; A13_CONN_INIT_LEN];
+    read_exact_into_counted(stream, &mut init)?;
+    codec
+        .decode_connection_init(&init)
+        .map_err(|e| (e, A13_CONN_INIT_LEN))
 }
 
 /// Server side of the android-13+ connection handshake.
@@ -2033,7 +2063,7 @@ mod tests {
             R34Codec.encode_reply(&r),
             Err(RpcError::Protocol(_))
         ));
-        // …and empty positions on v0/r34 still encode fine (unchanged).
+        // …and empty positions on v0/r34 encode fine.
         let t0 = txn(RpcAddress::zero(), vec![9, 9, 9, 9]);
         assert!(v0.encode_transact(&t0).is_ok());
         assert!(R34Codec.encode_transact(&t0).is_ok());

@@ -19,13 +19,25 @@
 //! runs the `in_ns_*` tests, each serving on a port of its own over loopback
 //! and dropping that port's packets both ways once its session is up. A host
 //! that refuses unprivileged user namespaces (Ubuntu 24.04's AppArmor
-//! default) or has no `unshare` or `nft` skips, saying so; run the outer
-//! test as root there. With `RSB_LINK_BREAK_REQUIRED` set (CI) it fails
+//! default) or has no `unshare`, `nft` or `ip` skips, saying so; run the
+//! outer test as root there. With `RSB_LINK_BREAK_REQUIRED` set (CI) it fails
 //! instead of skipping.
 //!
-//! Every case with a timeout uses 3 s: keepalive's first probe after 1 s of
-//! silence and three more 1 s apart (whole seconds, at least one), and
-//! `TCP_USER_TIMEOUT` = 3 s (`RpcTransport::set_liveness`).
+//! Every case with a timeout uses 3 s, and the kernel's verdict then comes
+//! near 3 s (`RpcTransport::set_liveness` has the values).
+//!
+//! Only the idle case proves the kernel acting: the same 3 s is the reply
+//! deadline and the send deadline, and the public API cannot set one without
+//! the other. `reply_deadline_ends_the_session_over_a_cut_link` separates the
+//! two by time instead. Its request goes out 2.4 s before the cut, so the reply
+//! deadline expires about 0.6 s after it. The kernel ends a connection only once
+//! 3 s have passed since the last segment it received, and at 3 s keepalive
+//! probes go out 1 s apart and are answered until the cut, so no verdict comes
+//! within 2 s of the cut. The case requires the end within 1.5 s: with the reply
+//! deadline off it fails, and with `tcp_liveness` a no-op it passes. It also
+//! checks that the teardown completes over a link that carries no byte after
+//! the cut, and fails, rather than passing on a live link, when the cut takes
+//! effect only after the reply deadline could have expired.
 
 #![cfg(all(target_os = "linux", feature = "rpc-tcp-debug", feature = "rpc-tls"))]
 
@@ -53,10 +65,14 @@ const REQUIRED: &str = "RSB_LINK_BREAK_REQUIRED";
 const CASES: usize = 10;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
-/// The first probe after 1 s and three 1 s apart end it near 4 s; margin for a loaded host.
+/// The kernel's verdict comes near `TIMEOUT` (`set_liveness`); the rest is for a loaded host.
 const NOTICED_WITHIN: Duration = Duration::from_secs(8);
 /// A peer that stops acknowledging ends nothing at once: no FIN or reset arrives.
 const NOT_BEFORE: Duration = Duration::from_millis(900);
+/// The reply case's head start before the cut: its deadline expires about 0.6 s after the cut.
+const CUT_AFTER: Duration = Duration::from_millis(2400);
+/// Under the kernel's earliest verdict: `TIMEOUT` after the last probe answered before the cut.
+const DEADLINE_WITHIN: Duration = Duration::from_millis(1500);
 
 const DESC: &str = "rsbinder.test.ILinkBreak";
 const TX_ECHO: TransactionCode = FIRST_CALL_TRANSACTION;
@@ -85,6 +101,9 @@ fn link_break_in_a_network_namespace() {
     if let Err(e) = Command::new("nft").arg("--version").output() {
         return refused(&format!("cannot run `nft`: {e}"));
     }
+    if let Err(e) = Command::new("ip").arg("-V").output() {
+        return refused(&format!("cannot run `ip`: {e}"));
+    }
     let exe = std::env::current_exe().expect("current_exe");
     let out = std::env::temp_dir().join(format!("rsb_link_break_{}.out", std::process::id()));
     let log = std::fs::File::create(&out).expect("create the child's output file");
@@ -107,7 +126,11 @@ fn link_break_in_a_network_namespace() {
         }
         if Instant::now() > deadline {
             let _ = child.kill();
-            panic!("the run in the namespace was still going after 120 s");
+            let _ = child.wait();
+            // The cases that finished are the only pointer to the one that hung.
+            let printed = std::fs::read_to_string(&out).unwrap_or_default();
+            let _ = std::fs::remove_file(&out);
+            panic!("the run in the namespace was still going after 120 s:\n{printed}");
         }
         thread::sleep(Duration::from_millis(100));
     };
@@ -233,6 +256,8 @@ impl Fixture {
                     .join(format!("rsb_link_{port}_{}.sock", std::process::id()));
                 let _ = std::fs::remove_file(&path);
                 let server = RpcServer::setup_unix_server(&path).expect("server");
+                // The accept thread's clone keeps `server` from dropping, so its file goes now.
+                let _ = std::fs::remove_file(&path);
                 server.set_android13plus(2);
                 server.set_root(root_obj).expect("set_root");
                 let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind");
@@ -319,7 +344,7 @@ impl Fixture {
 /// The control: a quiet session whose peer's host answers is never ended by the probes.
 fn healthy_idle_session_survives(link: Link, port: u16) {
     let f = Fixture::new(link, port, Some(TIMEOUT));
-    // Twice the probes' four seconds: every probe round has come and been answered.
+    // Past every probe round (about 3 s), each one answered.
     assert_eq!(
         f.died_within(NOTICED_WITHIN),
         None,
@@ -344,24 +369,37 @@ fn idle_session_ends_when_the_link_goes_silent(link: Link, port: u16) {
     assert_eq!(f.echo(&[1; 16], 0), Err(StatusCode::DeadObject));
 }
 
-/// A reply that cannot come ends the session within the timeout.
-fn reply_wait_ends_when_the_link_goes_silent(link: Link, port: u16) {
+/// The reply deadline ends the session over a cut link before the kernel's verdict can.
+fn reply_deadline_ends_the_session_over_a_cut_link(link: Link, port: u16) {
     let f = Arc::new(Fixture::new(link, port, Some(TIMEOUT)));
     let (tx, rx) = mpsc::channel();
     let waiting = f.clone();
+    let sent_at = Instant::now();
     thread::spawn(move || {
         let got = waiting.slow(30_000);
         let _ = tx.send((got, Instant::now()));
     });
-    // Let the request go out before the cut, so it is the reply that is lost.
-    thread::sleep(Duration::from_millis(300));
+    // The request goes out on a live link; its deadline then falls just after the cut.
+    thread::sleep(CUT_AFTER);
     cut(port);
     let cut_at = Instant::now();
+    // The wait starts after `sent_at`: a cut within `TIMEOUT` of it precedes the deadline.
+    let late = cut_at.saturating_duration_since(sent_at);
+    assert!(
+        late < TIMEOUT,
+        "cut {late:?} after the request: the deadline may have fired on a live link"
+    );
     let (got, at) = rx
         .recv_timeout(NOTICED_WITHIN)
         .expect("the reply wait outlived the silent link");
     assert!(got.is_err(), "a reply crossed a cut link: {got:?}");
-    assert!(at - cut_at <= NOTICED_WITHIN);
+    let after = at
+        .checked_duration_since(cut_at)
+        .expect("the call ended before the cut: the case ran on a live link");
+    assert!(
+        after < DEADLINE_WITHIN,
+        "ended {after:?} after the cut: by the kernel's verdict, not the reply deadline"
+    );
     assert!(
         f.died_within(Duration::from_secs(1)).is_some(),
         "the session outlived the call"
@@ -424,8 +462,8 @@ cases! {
     in_ns_tls_healthy_idle_session_survives => healthy_idle_session_survives(Link::Tls, 7102);
     in_ns_tcp_idle_session_ends => idle_session_ends_when_the_link_goes_silent(Link::Tcp, 7201);
     in_ns_tls_idle_session_ends => idle_session_ends_when_the_link_goes_silent(Link::Tls, 7202);
-    in_ns_tcp_reply_wait_ends => reply_wait_ends_when_the_link_goes_silent(Link::Tcp, 7301);
-    in_ns_tls_reply_wait_ends => reply_wait_ends_when_the_link_goes_silent(Link::Tls, 7302);
+    in_ns_tcp_reply_deadline_ends => reply_deadline_ends_the_session_over_a_cut_link(Link::Tcp, 7301);
+    in_ns_tls_reply_deadline_ends => reply_deadline_ends_the_session_over_a_cut_link(Link::Tls, 7302);
     in_ns_tcp_send_ends => send_ends_when_the_link_goes_silent(Link::Tcp, 7401);
     in_ns_tls_send_ends => send_ends_when_the_link_goes_silent(Link::Tls, 7402);
     in_ns_tcp_without_a_timeout_waits => without_a_timeout_the_session_waits(Link::Tcp, 7501);

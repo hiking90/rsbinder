@@ -90,7 +90,13 @@ This changelog starts at 0.9.0. For earlier releases, see the
   flight on the others return `DeadObject`, every death recipient fires, and
   every local object the peer held is released. 0.11.0 retired the failing
   connection and let a fan-out session go on. After a session ends, reconnect,
-  fetch the root and register callbacks again.
+  fetch the root and register callbacks again. A client's incoming connection
+  whose serve thread cannot be spawned ends the session too, since the server
+  already holds it as a callback connection.
+  So does every other failed incoming attach, except one whose header never
+  went out (a refused pre-check, a failed connect or header write) or whose
+  connection closed, a reset included, before any byte of the server's `"cci"`
+  arrived (a refused attach): those leave the session up.
 - **An expired reply deadline ends the session** (`RpcSession::set_timeout`,
   `RpcServer::set_reply_timeout`, the `timeout` / `reply_timeout` options). The
   call still returns `TimedOut`; the session no longer survives it or skips the
@@ -99,17 +105,20 @@ This changelog starts at 0.9.0. For earlier releases, see the
   a free connection still fails only that call, with `WouldBlock`.
 - **The session timeout bounds more than the reply wait**: `SO_SNDTIMEO` on
   every connection (a send that makes no progress for the period ends the
-  session; a steady slow reader is not cut), TCP keepalive and
-  `TCP_USER_TIMEOUT` on TCP and TLS over TCP, and on a client each connect and
+  session; a steady slow reader is not cut), the kernel's keepalive check on
+  TCP and TLS over TCP (`RpcTransport::set_liveness` has the values and
+  platform differences), and on a client each connect and
   handshake step. A send deadline that expires part-way through a frame
   returns `TimedOut` (0.11.0: `WouldBlock`, which means nothing was sent).
 - **TCP and TLS connections have keepalive on by default**, at the system's
-  intervals without a session timeout (Linux: about two hours), so a session
+  intervals without a session timeout (hours), so a session
   whose peer host vanished ends and fires its death recipients. No wire byte
   changes.
 - **`RpcServer::set_idle_timeout` judges the session, not the connection**: a
-  session ends once none of its connections has carried a frame for the
-  period, so a fan-out client with one quiet connection is not evicted.
+  session ends once no byte has crossed any of its connections and no call has
+  been open for the period, so a fan-out client with one quiet connection is
+  not evicted, and the eviction can come up to one period later than that; the
+  `set_idle_timeout` rustdoc states the rule.
 - **A kernel `ETIMEDOUT` on an RPC connection is a dead connection**, not a
   deadline of this end's (keepalive or `TCP_USER_TIMEOUT` gave up): the session
   ends, and a serve loop reports `NotLocal` / `Lost` instead of an idle

@@ -19,10 +19,22 @@
 //!   session outlives its reply timeout, so the next call and the other
 //!   connection's call do not fail and no obituary fires.
 //! - `a_session_with_one_busy_connection_is_not_idle`: make
-//!   `RpcSessionInner::rearm_idle_left` report nothing left and the quiet
+//!   `RpcSessionInner::active_since` report no activity and the quiet
 //!   fan-out connection's first idle expiry ends the session while the
 //!   founding connection is still busy. The last assertion is the other
 //!   half: a session whose connections all went quiet still ends.
+//! - `a_dispatch_longer_than_the_idle_period_is_not_idle`: drop the
+//!   `OpenCall` from `dispatch_transact` and the quiet connection's idle
+//!   expiry ends the session under the running handler (no byte moves for
+//!   three periods), so `slow` fails.
+//! - `a_handler_waiting_on_its_own_callback_is_not_idle`: make
+//!   `active_since` ignore `open` and the quiet connection's idle expiry
+//!   ends the session while the handler waits for the client's slow
+//!   callback, so `roundtrip` fails. The server's reply timeout is set so
+//!   that the callback's own wait is not the bound under test.
+//! - `a_client_that_only_waits_for_callbacks_is_idle`: make
+//!   `active_since` report activity always and the session outlives the
+//!   idle period, so the late call succeeds.
 //! - `handshake_timeout_bounds_a_silent_peer`: make
 //!   `RpcClientConfig::handshake_deadline` ignore `timeout` and the `timeout`
 //!   case blocks on the silent peer; drop the session-timeout fallback from
@@ -190,11 +202,16 @@
 //!   session has an id (the r34 one was never in the id registry), and it is
 //!   `Live(2)`; the test checks that `terminate` still returns and that
 //!   session dies whole instead of being skipped as "still live".
-//! - `losing_the_last_outgoing_slot_declares_death_with_incoming`: the
-//!   surviving callback slot keeps the pool non-empty, but nothing reads a
-//!   request written on it; without the last-outgoing check the session
-//!   stays `Live`, and every later transact answers `WouldBlock` with no
-//!   obituary and no `RpcState::clear`.
+//! - `a_reply_timeout_ends_a_session_with_a_callback_slot`: the callback
+//!   slot alone would keep the pool non-empty, but nothing reads a request
+//!   written on it. Drop the `fail_session` from `client_transact`'s
+//!   reply-wait failure and `__slot_count()` stays 2.
+//! - `a_callback_reply_slower_than_the_idle_period_is_not_idle`: drop the
+//!   `OpenCall` from `client_transact`'s twoway and the founding
+//!   connection's idle expiry ends the session under the callback, so it
+//!   fails with `DeadObject`. `a_nested_dispatch_in_a_callback_reply_wait_is_not_idle`
+//!   holds both sites open at once and fails when `active_since` ignores
+//!   `open`.
 
 #![cfg(feature = "rpc")]
 
@@ -955,8 +972,7 @@ fn a_session_with_one_busy_connection_is_not_idle() {
     .expect("fan-out connect");
     assert_eq!(client.__slot_count(), 2, "founding + one fan-out");
     let root = EchoProxy(client.get_root().expect("get_root"));
-    // One thread's calls always take the first free connection; the fan-out one stays quiet
-    // for three idle periods, which a per-connection judgment would evict it for.
+    // One thread's calls take the first free slot; the other idles for three periods, not evicted.
     let busy_until = Instant::now() + Duration::from_millis(1_200);
     while Instant::now() < busy_until {
         assert_eq!(root.echo("busy").as_deref(), Ok("busy"));
@@ -965,6 +981,79 @@ fn a_session_with_one_busy_connection_is_not_idle() {
     // Both quiet now: past the idle period the session is gone.
     std::thread::sleep(Duration::from_millis(1_000));
     assert_eq!(root.echo("late"), Err(StatusCode::DeadObject));
+    client.close_session();
+}
+
+/// A handler that outlasts the idle period on one connection keeps a quiet one's session up.
+#[test]
+fn a_dispatch_longer_than_the_idle_period_is_not_idle() {
+    let path = tmp_sock("idledisp");
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    server.set_android13plus(1);
+    server.set_max_threads(2);
+    server.set_idle_timeout(Some(Duration::from_millis(300)));
+    server
+        .set_root(make_service(Arc::new(AtomicI64::new(0))))
+        .expect("set_root");
+    let bg = server.run_background();
+    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
+    wait_for_sock(&path);
+
+    let client = RpcSession::setup_client_android13plus_with_config(
+        RpcClientConfig::unix(&path, 1).outgoing_connections(2),
+    )
+    .expect("fan-out connect");
+    let root = EchoProxy(client.get_root().expect("get_root"));
+    // No frame on either connection for three idle periods while the handler runs.
+    assert_eq!(root.slow(900), Ok(()));
+    assert_eq!(root.echo("after").as_deref(), Ok("after"));
+    client.close_session();
+}
+
+/// Client callback whose `TX_ECHO` answers after `ms`.
+struct SlowEcho {
+    ms: u64,
+}
+impl Interface for SlowEcho {}
+impl Remotable for SlowEcho {
+    fn descriptor() -> &'static str {
+        DESC
+    }
+    fn on_transact(&self, _c: TransactionCode, r: &mut Parcel, reply: &mut Parcel) -> Result<()> {
+        let a: String = r.read()?;
+        std::thread::sleep(Duration::from_millis(self.ms));
+        ok_str(reply, Ok(a))
+    }
+    fn on_dump(&self, _w: &mut dyn std::io::Write, _a: &[String]) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// A handler waiting on its own callback to the client keeps a quiet connection's session up.
+#[test]
+fn a_handler_waiting_on_its_own_callback_is_not_idle() {
+    let path = tmp_sock("idlehcb");
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    server.set_android13plus(1);
+    server.set_max_threads(2);
+    server.set_idle_timeout(Some(Duration::from_millis(300)));
+    server.set_reply_timeout(Some(Duration::from_secs(10)));
+    server
+        .set_root(make_service(Arc::new(AtomicI64::new(0))))
+        .expect("set_root");
+    let bg = server.run_background();
+    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
+    wait_for_sock(&path);
+
+    let client = RpcSession::setup_client_android13plus_with_config(
+        RpcClientConfig::unix(&path, 1).outgoing_connections(2),
+    )
+    .expect("fan-out connect");
+    let root = EchoProxy(client.get_root().expect("get_root"));
+    let cb: SIBinder = Interface::as_binder(&Binder::new(SlowEcho { ms: 900 }));
+    // The callback rides the handler's connection; no byte moves for three idle periods.
+    assert_eq!(root.roundtrip(&cb).as_deref(), Ok("rt:ping"));
+    assert_eq!(root.echo("after").as_deref(), Ok("after"));
     client.close_session();
 }
 
@@ -2715,6 +2804,8 @@ struct HeldCfg {
     max_threads: u32,
     /// Custom callback object; default an `EchoSvc`.
     cb: Option<SIBinder>,
+    /// The server's `set_idle_timeout`.
+    idle: Option<Duration>,
 }
 impl Default for HeldCfg {
     fn default() -> Self {
@@ -2724,6 +2815,7 @@ impl Default for HeldCfg {
             fan_out: 1,
             max_threads: 1,
             cb: None,
+            idle: None,
         }
     }
 }
@@ -2738,6 +2830,7 @@ fn boot_held_cfg(tag: &str, cfg: HeldCfg) -> HeldSetup {
         server.set_android13plus(2);
     }
     server.set_max_threads(cfg.max_threads);
+    server.set_idle_timeout(cfg.idle);
     let root_local = make_service_with_hold(Arc::new(AtomicI64::new(0)), Arc::clone(&held));
     server.set_root(root_local.clone()).expect("set_root");
     let bg = server.run_background();
@@ -2981,8 +3074,7 @@ fn handshake_timeout_bounds_a_silent_peer() {
     assert_eq!(root.slow(500).map(|_| "ok"), Ok("ok"));
     client.close_session();
 
-    // A manual attach takes no `timeout` of its own: the session's bounds its handshake. An
-    // incoming attach reads the server's `"cci"`, which the silent peer never writes.
+    // The session's timeout bounds an incoming attach, whose `"cci"` the silent peer never writes.
     let founded =
         RpcSession::setup_client_android13plus_with_config(RpcClientConfig::unix(&path2, 2))
             .expect("connect");
@@ -3163,6 +3255,99 @@ fn nested_call_from_callback_handler() {
         .join()
         .expect("worker");
     assert_eq!(got, Ok("rt:ping".to_string()));
+    assert_eq!(h.root.echo("after").unwrap(), "after");
+}
+
+/// A callback outside a handler whose reply outlasts the idle period keeps the session up.
+#[test]
+fn a_callback_reply_slower_than_the_idle_period_is_not_idle() {
+    let h = boot_held_cfg(
+        "b_idlecb",
+        HeldCfg {
+            a13: true,
+            incoming: 1,
+            idle: Some(Duration::from_millis(300)),
+            ..Default::default()
+        },
+    );
+    let cb = h.cb_proxy();
+    // No frame on any connection for three idle periods while the client's handler runs.
+    let got = std::thread::spawn(move || drive_slow(&cb, 900))
+        .join()
+        .expect("worker");
+    assert_eq!(got, Ok(()));
+    assert_eq!(h.root.echo("after").unwrap(), "after");
+}
+
+/// A client that only waits for callbacks is idle: its session ends (`set_idle_timeout` rustdoc).
+#[test]
+fn a_client_that_only_waits_for_callbacks_is_idle() {
+    let h = boot_held_cfg(
+        "b_idlewait",
+        HeldCfg {
+            a13: true,
+            incoming: 1,
+            idle: Some(Duration::from_millis(300)),
+            ..Default::default()
+        },
+    );
+    // Past two idle periods with the incoming connection open and nothing sent either way.
+    std::thread::sleep(Duration::from_millis(900));
+    assert_eq!(h.root.echo("late"), Err(StatusCode::DeadObject));
+}
+
+/// Callback whose `TX_ECHO` calls the server's `slow(ms)` back before it answers.
+struct SlowNest {
+    /// The client's proxy to the server root.
+    root: Arc<Mutex<Option<SIBinder>>>,
+    ms: i32,
+}
+impl Interface for SlowNest {}
+impl Remotable for SlowNest {
+    fn descriptor() -> &'static str {
+        DESC
+    }
+    fn on_transact(&self, _c: TransactionCode, r: &mut Parcel, reply: &mut Parcel) -> Result<()> {
+        let a: String = r.read()?;
+        let root = self.root.lock().unwrap().clone().expect("root installed");
+        match EchoProxy(root).slow(self.ms) {
+            Ok(()) => {
+                reply.write(&Status::from(StatusCode::Ok))?;
+                reply.write(&a)
+            }
+            Err(e) => reply.write(&Status::from(e)),
+        }
+    }
+    fn on_dump(&self, _w: &mut dyn std::io::Write, _a: &[String]) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// A nested call the server dispatches inside a callback's reply wait is activity too.
+#[test]
+fn a_nested_dispatch_in_a_callback_reply_wait_is_not_idle() {
+    let root = Arc::new(Mutex::new(None));
+    let cb: SIBinder = Interface::as_binder(&Binder::new(SlowNest {
+        root: Arc::clone(&root),
+        ms: 900,
+    }));
+    let h = boot_held_cfg(
+        "b_idlenest",
+        HeldCfg {
+            a13: true,
+            incoming: 1,
+            cb: Some(cb),
+            idle: Some(Duration::from_millis(300)),
+            ..Default::default()
+        },
+    );
+    *root.lock().unwrap() = Some(h.root.0.clone());
+    let cb = h.cb_proxy();
+    // The nested `slow(900)` rides the callback connection; the founding one stays quiet.
+    let got = std::thread::spawn(move || drive(&cb, false))
+        .join()
+        .expect("worker");
+    assert_eq!(got, Ok(()));
     assert_eq!(h.root.echo("after").unwrap(), "after");
 }
 
@@ -3931,9 +4116,9 @@ impl Remotable for ShutdownCbRef {
     }
 }
 
-/// Losing the only `Outgoing` slot to a reply deadline declares death despite a callback slot.
+/// A reply deadline ends a session that also holds a callback slot, that slot with it.
 #[test]
-fn losing_the_last_outgoing_slot_declares_death_with_incoming() {
+fn a_reply_timeout_ends_a_session_with_a_callback_slot() {
     let h = boot_held_cfg(
         "c_lastout",
         HeldCfg {
@@ -3944,14 +4129,14 @@ fn losing_the_last_outgoing_slot_declares_death_with_incoming() {
         },
     );
     assert_eq!(h.client.__slot_count(), 2, "founding outgoing + callback");
-    // A reply past the deadline desyncs and retires the founding `Outgoing` slot.
+    // The reply deadline ends the session, the callback slot with it.
     h.client.set_timeout(Some(Duration::from_millis(50)));
     assert_eq!(h.root.slow(400), Err(StatusCode::TimedOut));
     // Death, not a live session with only callback slots left.
     assert_eq!(
         h.client.__slot_count(),
         0,
-        "losing the last outgoing slot must run the death sequence"
+        "a reply timeout must run the death sequence"
     );
     assert_eq!(h.root.echo("after"), Err(StatusCode::DeadObject));
 }
@@ -4030,7 +4215,7 @@ fn dropping_a_unix_server_spares_a_successor_at_the_same_path() {
 
 // ---- send state: a parcel owns its binder bumps until it is sent -----------
 
-/// A request refused with `WouldBlock` keeps its bump; the same parcel, resent, delivers a live node.
+/// A request refused with `WouldBlock` keeps its bump; the same parcel resent delivers a live node.
 #[test]
 fn resend_after_would_block_delivers_a_live_node() {
     let held = Arc::new(Mutex::new(None));

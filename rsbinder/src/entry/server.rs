@@ -61,7 +61,8 @@ pub struct ServeOptions {
     /// through and the setter treats it as `None`.
     pub idle_timeout: Option<Duration>,
     /// RPC: `RpcServer::set_reply_timeout` — bounds the wait for a reply
-    /// to a callback this server issues to a client outside a handler.
+    /// to a callback this server issues to a client outside a handler of
+    /// that client's session (`set_reply_timeout` states which calls).
     /// The only bound on that wait, so set it on any server that issues
     /// callbacks to clients it does not control (see
     /// [`ClientOptions::incoming_connections`](super::ClientOptions::incoming_connections),

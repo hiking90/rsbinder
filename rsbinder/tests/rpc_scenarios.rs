@@ -19,8 +19,8 @@
 //! - `alwaysGiveMeTheSameBinder` /
 //!   `SameBinderEquality`           → `same_binder_returned_twice_is_equal`
 //! - `OnewayCallDoesNotWait`        → `oneway_call_does_not_wait_for_handler`
-//! - (rsbinder) a nested call that times out must not desync the
-//!   connection → `late_reply_of_a_timed_out_nested_call_is_skipped`
+//! - (rsbinder) a nested call that times out ends the session instead of
+//!   desyncing the connection → `a_nested_calls_reply_timeout_ends_the_session`
 //!
 //! # Mutation gates
 //!
@@ -28,9 +28,9 @@
 //!   out of scope before the reply is sent; the reply parcel pins it (`write_binder`) so its
 //!   `DEC_STRONG` follows the reply instead of overtaking it. Without the pin the client frees
 //!   the node before the address comes back and mints a fresh proxy for its own object.
-//! - `late_reply_of_a_timed_out_nested_call_is_skipped`: the nested call cannot retire the
-//!   slot (the outer frame owns it), so without the skip the late reply would be taken for the
-//!   outer call's reply.
+//! - `a_nested_calls_reply_timeout_ends_the_session`: drop the `fail_session` from
+//!   `client_transact`'s reply-wait failure and the session outlives the nested timeout, so
+//!   the outer call ends with `TimedOut`, not `DeadObject`.
 
 #![cfg(feature = "rpc")]
 
@@ -515,7 +515,7 @@ fn oneway_call_does_not_wait_for_handler() {
     );
 }
 
-/// A nested call's reply timeout ends the session: the nested call `TimedOut`, the rest `DeadObject`.
+/// A nested call's reply timeout ends the session: it gets `TimedOut`, the rest `DeadObject`.
 #[test]
 fn a_nested_calls_reply_timeout_ends_the_session() {
     let b = boot("stale");

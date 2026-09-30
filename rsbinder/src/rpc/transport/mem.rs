@@ -106,7 +106,7 @@ impl RpcTransport for MemTransport {
                 max: super::MAX_FRAME_LEN,
             });
         }
-        // Fail after either end's shutdown, as EPIPE on a socket: a failed-handshake un-push needs it.
+        // Fail after either end's shutdown (a socket's EPIPE): a failed-handshake un-push needs it.
         if self.either_end_shut() {
             return Err(RpcError::EndOfStream);
         }
