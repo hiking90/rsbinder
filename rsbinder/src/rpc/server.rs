@@ -65,7 +65,8 @@
 //!   exists so a peer that never sends its handshake cannot hold a
 //!   `max_connections` slot, or pin the server's `Arc`, forever.
 //! - **Serve deadlines.** After the android-13+ handshake the handshake
-//!   deadline is replaced by the idle timeout on both read and write —
+//!   deadline is replaced by the idle timeout on read, and on write by the
+//!   smaller of the idle and reply timeouts (`set_reply_timeout`) — both
 //!   `None` by default, so an established session may idle unbounded. A
 //!   callback slot (a client's incoming attach, which the server only
 //!   sends on) has no serve loop and arms only the write side.
@@ -85,8 +86,7 @@
 //! `RpcConnectionHeader.sessionId`:
 //!
 //! - **empty** (every single-connection client): a new session; its id is
-//!   registered here and never looked up on this path, so the default flow
-//!   is unchanged.
+//!   registered here and never looked up on this path.
 //! - **non-empty, live**: the connection attaches to that session.
 //!   `add_incoming_slot_capped` adds a slot onto the single founding inner,
 //!   so the `RpcProxy`s cached in `state.remote_proxies` point at the only
@@ -670,8 +670,8 @@ impl RpcServer {
     ///    incoming connections, on which this server *sends* — are
     ///    budgeted separately at `2 * n` per session; served slots do
     ///    not count against that budget. A callback slot has no read loop
-    ///    and lives until the whole session tears down (an outgoing attach
-    ///    is reclaimed by `remove_slot` on disconnect), so without that
+    ///    and lives until the whole session tears down, as every slot does
+    ///    (only an attach that never completed is un-pushed), so without that
     ///    budget a peer holding the session id could grow the slot pool —
     ///    and its held fds — without bound. AOSP opens symmetric incoming
     ///    and outgoing connections, each bounded by the negotiated
@@ -768,9 +768,9 @@ impl RpcServer {
             .expect("handshake_timeout poisoned") = timeout;
     }
 
-    /// Set (or disable) the **idle read deadline** applied to the
-    /// android-13+ serve loop *after* the handshake completes. Default
-    /// `None` ⇒ an established session may idle between requests unbounded
+    /// Set (or disable) the **idle timeout** of the android-13+ serve
+    /// path, applied *after* the handshake completes. Default `None` ⇒ an
+    /// established session may idle between requests unbounded
     /// (byte-identical to a server that never calls this).
     ///
     /// [`set_handshake_timeout`](Self::set_handshake_timeout) only bounds
@@ -778,34 +778,100 @@ impl RpcServer {
     /// handshake it can then go silent and hold its worker — and, under
     /// [`set_max_connections`](Self::set_max_connections), an admission
     /// slot — indefinitely (a post-handshake Slowloris that starves the
-    /// accept loop). Setting a `Some(d)` idle timeout evicts such a peer
-    /// after `d` of silence, freeing the slot. Use it when the protocol
-    /// has regular traffic or idle eviction is acceptable; pair it with
-    /// `set_max_connections` for untrusted peers, since OS-level TCP
-    /// keepalive/timeouts are otherwise the only backstop. (Currently
-    /// honored on the android-13+ serve path; the r34 profile already
-    /// bounds its first frame via the handshake deadline.)
+    /// accept loop).
+    ///
+    /// `Some(d)` ends a session, freeing its slot, only once for **at
+    /// least `d` and less than `2d`** no byte crossed any of its
+    /// connections in either direction and no call was open: no handler
+    /// running for the peer, and no call to the peer awaiting its reply.
+    /// The judgment is per session, not per connection: a fan-out client
+    /// that keeps one connection busy and another quiet is not idle. Each
+    /// serve connection waits for the peer's next frame under `d` and
+    /// checks the whole session when that wait expires, which is why an
+    /// eviction may come up to one more `d` after the session went quiet.
+    /// Bytes read count as each transport read completes; a frame being
+    /// written counts from its first byte until the write returns, however
+    /// slowly the peer takes it; a connection joining the session counts
+    /// as it joins, its handshake included. (Honored on the android-13+
+    /// serve path only; the r34 profile bounds its first frame via the
+    /// handshake deadline.)
+    ///
+    /// Two waits are bounded by a deadline directly rather than judged:
+    ///
+    /// - A gap longer than `d` **inside** a frame a serve connection reads
+    ///   between calls ends the session as a lost stream
+    ///   ([`EndReason::DeadlineMidFrame`](super::EndReason::DeadlineMidFrame)),
+    ///   the same rule as on a one-connection session.
+    /// - A twoway call on a session, made by a thread that is driving one
+    ///   of that session's serve connections — a handler, twoway or
+    ///   oneway, or anything else the serve loop runs on that thread, such
+    ///   as a local object's `Drop` that runs when the client's release
+    ///   drops the last reference to it — waits for its reply under
+    ///   [`set_reply_timeout`](Self::set_reply_timeout), or under `d` when
+    ///   that is `None`, and a frame read in that wait,
+    ///   nested calls' included, is bounded by the same deadline. Its
+    ///   expiry, between frames or inside one, is a reply timeout, which
+    ///   ends the session as a fault. A call from any other thread, work a
+    ///   handler hands to one included, waits under `set_reply_timeout`
+    ///   alone. A call on another session follows that session's own
+    ///   settings: a handler that calls back a *different* client (a
+    ///   fan-out to stored callbacks) drives none of that client's serve
+    ///   connections, so its wait there has `set_reply_timeout` alone.
+    ///
+    /// A peer that holds a call open, or trickles bytes, is not idle by
+    /// this measure: `set_reply_timeout` bounds how long it may keep a
+    /// callback of this server's waiting, and nothing here bounds a
+    /// trickle. A client that only waits for callbacks is idle: it moves
+    /// no byte and holds no call. So is a stream that waits outside a
+    /// handler without pinging its peer. A stream wait inside a handler
+    /// holds that handler's call open for as long as it lasts, so the
+    /// session is not idle, and only the wait's own deadline bounds it.
+    ///
+    /// It is for a server that admits unauthenticated TCP or TLS peers and
+    /// caps them with `set_max_connections`: a peer that finishes the
+    /// handshake and then stays silent is what nothing else catches —
+    /// kernel keepalive does not, since the peer's kernel answers it, and
+    /// [`set_reply_timeout`](Self::set_reply_timeout) measures only waits
+    /// for an answer, which a client that sends nothing never causes. A
+    /// server that picks its peers with
+    /// [`set_authorizer`](Self::set_authorizer) or TLS client
+    /// authentication needs it less. It fits a protocol with regular
+    /// traffic.
     ///
     /// The serve phase arms this value on the **write** side too, so a peer
-    /// that stops draining replies is evicted as well — but a consumer that
-    /// legitimately reads a large reply slower than `d` is also dropped
-    /// mid-send (the connection is torn down, not desynced). Size `d`
-    /// against the slowest acceptable consumer, not just the idle gap.
+    /// that stops draining replies ends the session as well. The write half
+    /// bounds each wait for socket buffer space, not a whole reply: a
+    /// consumer that reads a large reply slowly but steadily is not cut,
+    /// one that reads nothing for `d` is. With
+    /// [`set_reply_timeout`](Self::set_reply_timeout) also set, the smaller
+    /// of the two bounds the sends. The write half is the transport's
+    /// [`RpcTransport::set_write_timeout`]:
+    /// a transport that keeps that method's no-op default gives a stalled
+    /// send no bound, and since a frame being written is activity, a
+    /// session stuck in such a send never idles out.
     ///
     /// On callback connections (a client's incoming attaches, which this
     /// server only ever *sends* on) the **read** half is exempt: they
-    /// have no serve loop, and a sticky read deadline there would cut
-    /// short the server's own reply wait on a callback issued outside a
-    /// handler. The **write** half still applies, and bounds a callback
-    /// *send* to a peer that has stopped reading. The callback *reply*
-    /// wait is bounded separately by
-    /// [`set_reply_timeout`](Self::set_reply_timeout) — this deadline
-    /// cannot cover it, being a sticky read timeout armed before the send.
+    /// have no serve loop, and a read deadline there would cut short the
+    /// server's own reply wait on a callback made by a thread driving none
+    /// of that session's serve connections.
+    /// The **write** half still applies, and bounds a callback *send* to a
+    /// peer that has stopped reading. The reply wait of a callback made by
+    /// a thread driving none of that session's serve connections is
+    /// bounded by
+    /// [`set_reply_timeout`](Self::set_reply_timeout) alone; while it
+    /// lasts the call is open, so the session is not idle.
     ///
-    /// Read on every accepted android-13+ connection, and the value the last
-    /// of them read is the one a session restores its serve connections to after a
-    /// nested callback's reply deadline is lifted — one value per session,
-    /// not per connection. Call this *before* [`run`](Self::run) /
+    /// Read once per accepted android-13+ connection, after its handshake;
+    /// that one value arms the connection's socket. A serve connection — a
+    /// session's founding one, or an attach the session admits — also
+    /// stores it into its session; a callback connection or a refused
+    /// attach stores nothing. The value last stored is the one a session
+    /// uses as the default reply deadline of calls from its serve threads
+    /// (above) and restores its serve connections to after a reply
+    /// deadline — one value per session, not per connection. A change
+    /// made while the server runs applies to connections accepted after
+    /// it. Call this *before* [`run`](Self::run) /
     /// [`run_background`](Self::run_background): changing it while a
     /// multi-connection session is live leaves that session restoring the
     /// newest value on connections whose socket carries an older one.
@@ -823,34 +889,55 @@ impl RpcServer {
     /// Bound how long this server waits for a **reply to a callback** it
     /// issued to a client (`RpcSession::set_timeout` on every session this
     /// server builds). `None` (default) blocks forever on a callback
-    /// issued *outside* a handler — the case this setter exists for —
-    /// which is byte-identical to not calling this at all.
+    /// issued *outside* a handler of that client's session (below says
+    /// exactly which) — the case this setter exists for — which is
+    /// byte-identical to not calling this at all.
     ///
     /// This is the only bound on **that** wait. The idle deadline cannot
     /// serve there: callback connections are exempt from its *read* half
     /// (see [`set_idle_timeout`](Self::set_idle_timeout)), because
-    /// `SO_RCVTIMEO` is sticky and would cut short exactly this wait.
+    /// `SO_RCVTIMEO` is sticky and would cut short exactly this wait, and
+    /// the wait counts as a call in progress, so the session is not idle
+    /// while it lasts.
     ///
-    /// A callback issued from **inside** a handler is not on that path
-    /// and is not unbounded without this: it reuses the serve connection
-    /// it is answering on (the re-entrant nested-call pin), so its reply
-    /// wait already sits under whatever read deadline
-    /// [`set_idle_timeout`](Self::set_idle_timeout) armed there — a
-    /// handler slower than the idle deadline makes such a callback fail
-    /// with `StatusCode::TimedOut`. A value set here replaces that
-    /// deadline for the reply wait and the idle one is restored after.
-    /// Without a value here, a client that attaches an incoming connection,
-    /// accepts a callback and then never replies pins the sending worker
-    /// forever — and every later caller behind it, since they queue on the
-    /// same session's connection pool.
+    /// A callback made by a thread that is driving one of the same
+    /// session's serve connections — a handler, twoway or oneway, or
+    /// anything else that session's serve loop runs on that thread — is
+    /// not on that path. A twoway handler's callback reuses the serve
+    /// connection it is answering on (the re-entrant nested-call pin); a
+    /// oneway handler's leaves on a callback connection. Either way, with
+    /// no value here, on the android-13+ serve path, its reply wait is
+    /// bounded by [`set_idle_timeout`](Self::set_idle_timeout) — a client
+    /// handler slower than that makes the callback fail with
+    /// `StatusCode::TimedOut`, which ends the session. With neither value,
+    /// and on the r34 profile (which arms no idle deadline) with no value
+    /// here, nothing bounds it. A value set here is that wait's deadline
+    /// instead, and the connection's own read deadline (the idle deadline
+    /// on a serve connection, none on a callback one) is restored after.
+    /// Every other callback has this value as its only bound: one from a
+    /// thread driving none of that session's serve connections, work a
+    /// handler hands to another thread and a handler's callback to a
+    /// *different* client included. Without a value here, a client that
+    /// attaches an incoming connection, accepts such a callback and then
+    /// never replies pins the sending worker forever — and every later
+    /// caller behind it, since they queue on the same session's connection
+    /// pool.
     ///
     /// Set it on any server that issues callbacks to clients it does not
     /// control. Size it against the slowest legitimate handler, not the
-    /// round-trip: it bounds the peer's *think time*. It also bounds the
+    /// round-trip: it bounds the peer's *think time*, and its expiry ends
+    /// the whole session with that client, as
+    /// [`RpcSession::set_timeout`](super::RpcSession::set_timeout)
+    /// describes. It also bounds the
     /// wait for a free connection slot on the same session
     /// ([`RpcSession::set_timeout`](super::RpcSession::set_timeout)), so a
     /// callback behind a busy pool can take up to twice this value
     /// end-to-end.
+    ///
+    /// Being the session's `set_timeout`, it also bounds each wait for
+    /// socket buffer space on every connection of the session and, on TCP,
+    /// sizes the kernel's check that the client's host still answers
+    /// ([`RpcTransport::set_liveness`] has the values and platform limits).
     ///
     /// Read **once per session**, when the connection that founds it is
     /// accepted: call this *before* [`run`](Self::run) /
@@ -1098,9 +1185,9 @@ impl RpcServer {
     /// Deterministic teardown witness: live connection count of the
     /// session keyed by `id`. `None` ⇒ no live session with that id
     /// (fully torn down or never registered). Lets tests `poll_until`
-    /// for the server-side `serve_blocking_on` exit hook (which
-    /// transitions the typed `SessionLifecycle` `Live(n) → Live(n-1)`
-    /// or `Live(1) → Dying`) without a `sleep(N ms)`
+    /// for the server-side serve loop's exit, which ends the whole session
+    /// (the typed `SessionLifecycle` goes `Live(n) → Dying` whatever
+    /// `n`), without a `sleep(N ms)`
     /// heuristic that races scheduler jitter.
     pub fn session_live_conns(&self, id: &[u8; 32]) -> Option<usize> {
         // The public API keeps raw bytes; the id newtype is internal-only.
@@ -1217,19 +1304,17 @@ impl RpcServer {
         raw.into_transport()
     }
 
-    /// Swap the handshake deadline for the idle timeout (default none) on read and write.
-    fn arm_serve_timeouts(&self, transport: &dyn RpcTransport) {
-        let idle = *self.idle_timeout.lock().expect("idle_timeout poisoned");
+    /// Swap the handshake deadline for the idle timeout `idle` (read once per connection).
+    fn arm_serve_timeouts(transport: &dyn RpcTransport, idle: Option<std::time::Duration>) {
         if let Err(e) = transport.set_read_timeout(idle) {
             log::debug!("RPC: failed to set serve-phase read timeout: {e:?}");
         }
         // Mirror onto writes: a peer that idles and stops reading can't pin us on a reply.
-        self.arm_write_timeout(transport);
+        Self::arm_write_timeout(transport, idle);
     }
 
     /// Write half of `arm_serve_timeouts`, for callback slots that must leave reads unbounded.
-    fn arm_write_timeout(&self, transport: &dyn RpcTransport) {
-        let idle = *self.idle_timeout.lock().expect("idle_timeout poisoned");
+    fn arm_write_timeout(transport: &dyn RpcTransport, idle: Option<std::time::Duration>) {
         if let Err(e) = transport.set_write_timeout(idle) {
             log::debug!("RPC: failed to set serve-phase write timeout: {e:?}");
         }
@@ -1281,12 +1366,14 @@ impl RpcServer {
                             return;
                         }
                     };
+                // Read once: this socket's deadlines and the session baseline must be one value.
+                let idle = *server.idle_timeout.lock().expect("idle_timeout poisoned");
                 if incoming {
                     // Callback slot: no serve loop, so only the write deadline is armed.
                     if let Err(e) = transport.set_read_timeout(None) {
                         log::debug!("RPC: failed to clear callback-slot read timeout: {e:?}");
                     }
-                    server.arm_write_timeout(transport.as_ref());
+                    Self::arm_write_timeout(transport.as_ref(), idle);
                     // No read loop: clients call only on outgoing conns (AOSP `mOutgoing`).
                     match server.resolve_session(&client_id) {
                         Some(inner) => {
@@ -1339,7 +1426,7 @@ impl RpcServer {
                     return;
                 }
                 // Handshake done: swap the admission deadline for the serve-phase one.
-                server.arm_serve_timeouts(transport.as_ref());
+                Self::arm_serve_timeouts(transport.as_ref(), idle);
                 if client_id.is_empty() {
                     // New session: mint, register (a `Weak`, pruned on a later register), serve.
                     let session = match RpcSession::from_android13plus(
@@ -1361,8 +1448,6 @@ impl RpcServer {
                         return;
                     }
                     server.configure_session(&session);
-                    // Bind first: a temporary would hold our lock while taking the session's.
-                    let idle = *server.idle_timeout.lock().expect("idle_timeout poisoned");
                     // Callback reply deadlines restore to this, else idle eviction would end.
                     session.set_serve_read_deadline(idle);
                     session.serve_blocking().log("RPC session ended");
@@ -1391,10 +1476,6 @@ impl RpcServer {
                     // Cap, live-conn bump and push are one critical section (`set_max_threads`).
                     let cap = inner.max_threads_value() as usize;
                     let session = RpcSession::wrap_inner(inner);
-                    // Bind first, as `configure_session` does: no server lock under the session's.
-                    let idle = *server.idle_timeout.lock().expect("idle_timeout poisoned");
-                    // Baseline for reply-deadline restore and for telling our own idle eviction.
-                    session.set_serve_read_deadline(idle);
                     let slot_id = match session.add_incoming_slot_capped(transport, cap) {
                         Ok(id) => id,
                         Err(StatusCode::FailedTransaction) => {
@@ -1422,6 +1503,8 @@ impl RpcServer {
                             return;
                         }
                     };
+                    // Only an admitted attach sets the baseline; this re-arms the new slot too.
+                    session.set_serve_read_deadline(idle);
                     // Bump only once the slot reached the pool.
                     server.attached_count.fetch_add(1, Ordering::SeqCst);
                     session
@@ -1452,7 +1535,7 @@ impl RpcServer {
                     return;
                 }
                 session
-                    // No deadline armed ⇒ a first-frame `TimedOut` is the kernel's, not ours.
+                    // No deadline armed ⇒ no first-frame `TimedOut` is an eviction of ours.
                     .serve_blocking_clearing_admission_deadline(handshake_timeout.is_some())
                     .log("RPC session ended");
             }

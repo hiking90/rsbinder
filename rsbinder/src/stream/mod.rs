@@ -34,7 +34,8 @@
 //! ```
 //!
 //! An async service does the same from a task, where waiting for the
-//! consumer suspends the task instead of parking a thread:
+//! consumer does not hold an executor thread (see [Async](#async) for the
+//! waits that hold a blocking-pool thread instead):
 #![cfg_attr(
     feature = "tokio",
     doc = "[`Sink::send_async`] and [`Sink::end_async`]."
@@ -140,7 +141,10 @@
 //!   of the time neither side has a call in flight to fail on, so each
 //!   watches the other's binder: a producer parked for room reports
 //!   [`StatusCode::DeadObject`] from [`Sink::send`], a consumer parked
-//!   for an item yields it from [`Receiver::recv`].
+//!   for an item yields it from [`Receiver::recv`]. On RPC a peer can
+//!   vanish without the session noticing — behind a TCP relay — and a
+//!   waiting end whose session has a reply deadline pings it to find out
+//!   ([`PingPolicy`]).
 //! * **Cancel.** [`Receiver::cancel`], and dropping a `Receiver`, release
 //!   a parked producer, whose next [`Sink::send`] reports
 //!   [`StatusCode::InvalidOperation`].
@@ -157,8 +161,9 @@
 //! so a producer or consumer that has to wait does not hold an executor
 //! thread. A futex cannot be polled, so on the ring each wait holds one
 //! pool thread for as long as it lasts, the same cost as a thread of its
-//! own. **Poll them inside a Tokio runtime**: outside one the hand-off
-//! panics, as `tokio::task::spawn_blocking` does. A call from inside a
+//! own. On RPC a wait that is bounded or may [ping](PingPolicy) holds a
+//! pool thread the same way. **Poll them inside a Tokio runtime**:
+//! outside one the hand-off panics, as `tokio::task::spawn_blocking` does. A call from inside a
 //! transaction handler makes its wait on the calling thread instead and
 //! is exempt.
 
@@ -234,6 +239,10 @@ pub struct ReceiverPolicy {
     /// [`Sink::open`] is always taken by a consumer made with
     /// [`Receiver::new`].
     pub max_opening: u32,
+    /// RPC: whether a wait for an item that hears nothing from the
+    /// producer checks that it is still there. Default
+    /// [`PingPolicy::Inherit`].
+    pub ping: PingPolicy,
 }
 
 impl Default for ReceiverPolicy {
@@ -242,6 +251,7 @@ impl Default for ReceiverPolicy {
             ring_bytes: 64 * 1024,
             credit_window: 4,
             max_opening: 4,
+            ping: PingPolicy::default(),
         }
     }
 }
@@ -275,8 +285,9 @@ pub struct SinkPolicy {
     ///
     /// `None`, the default, waits for as long as it takes. A consumer that
     /// is alive but neither reads nor cancels then holds the producer's
-    /// thread for good — or, for an `*_async` call on the ring, a
-    /// blocking-pool thread — which a service streaming to an untrusted
+    /// thread for good — or, for an `*_async` call on the ring or one on
+    /// RPC that may [ping](PingPolicy), a blocking-pool thread — which a
+    /// service streaming to an untrusted
     /// client should not allow.
     ///
     /// `Some(d)` sets one deadline per call, `d` after a blocking method
@@ -316,8 +327,18 @@ pub struct SinkPolicy {
     /// too long for an `Instant` to express waits without a bound, as
     /// `None` does. On the RPC path a bounded `*_async` credit wait holds
     /// a blocking-pool thread while it lasts (this build has no timer to
-    /// suspend the task against); an unbounded one suspends the task.
+    /// suspend the task against); an unbounded one suspends the task,
+    /// unless it may [ping](PingPolicy), which holds a pool thread too.
+    ///
+    /// Nor does it count a [ping](PingPolicy) made while waiting for
+    /// credit: a call whose consumer stops answering can return later than
+    /// `d`, by up to the session's reply deadline. A `d` shorter than a
+    /// third of the reply deadline ends each wait before any ping, so a
+    /// producer that only makes such calls never checks the consumer.
     pub send_timeout: Option<Duration>,
+    /// RPC: whether a wait for credit that hears nothing from the consumer
+    /// checks that it is still there. Default [`PingPolicy::Inherit`].
+    pub ping: PingPolicy,
 }
 
 impl Default for SinkPolicy {
@@ -327,8 +348,64 @@ impl Default for SinkPolicy {
             max_batch_bytes: 16 * 1024,
             initial_credits: 4,
             send_timeout: None,
+            ping: PingPolicy::default(),
         }
     }
+}
+
+/// Whether a stream on the RPC path checks that a peer it is waiting on
+/// is still there (plan 2-24 D9).
+///
+/// A stream learns that its peer is gone from the peer's death, and over
+/// RPC a death is the session ending, which takes the transport noticing
+/// that the connection is gone. Behind a relay that terminates TCP —
+/// `adb forward`, `ssh -L`, a port-forwarding proxy — the transport may
+/// never notice, because the relay keeps acknowledging; kernel keepalive
+/// reaches only the relay. Nor is there a call whose reply deadline could
+/// expire: back-pressure means a waiting stream has nothing in flight,
+/// and every `IStreamSink` and `IStreamSource` method is `oneway`. Such a
+/// stream would wait for good.
+///
+/// With pinging on, a wait that nothing has woken for a third of the
+/// session's reply deadline (`RpcSession::set_timeout`, or
+/// `RpcServer::set_reply_timeout` on a server) sends the peer a
+/// `PING_TRANSACTION` — the twoway every binder object answers,
+/// rsbinder's and libbinder's alike, so the peer implements nothing — and
+/// goes back to waiting once it is answered. The consumer pings the
+/// producer's `IStreamSource`, the producer the consumer's sink. A peer
+/// that does not answer within the reply deadline ends the session, as
+/// any unanswered call does, and the stream then ends with
+/// [`StatusCode::DeadObject`] through its death link: a peer that has
+/// vanished is noticed within about four thirds of the deadline. The ping
+/// is an ordinary call, so it also waits for a free outgoing connection;
+/// one refused for want of one is dropped, and the next quiet third tries
+/// again.
+///
+/// Only a wait pings: [`Receiver::recv`] and its variants waiting for an
+/// item, once the producer has introduced itself, and a [`Sink`] call
+/// waiting for credit. A stream whose items flow never pings, and an end
+/// that is not waiting on the stream checks nothing until it next waits.
+/// A wait whose own bound is shorter than a third of the reply deadline
+/// ends without pinging, so a loop of such calls never checks the peer.
+/// The ping is not counted against the caller's own bound —
+/// [`Receiver::recv_timeout`]'s `timeout`, [`SinkPolicy::send_timeout`] —
+/// so a call whose peer stops answering can return later than that bound,
+/// by up to the reply deadline. With the `tokio` feature, an `*_async`
+/// wait that may ping is made on the blocking pool and holds a thread
+/// there for as long as it lasts; this build has no timer to suspend a
+/// task against.
+///
+/// The ring path never pings: the kernel reports the peer's death itself.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PingPolicy {
+    /// Ping when the peer's session has a reply deadline, after a third of
+    /// it passes quietly. A session without one — the default — is never
+    /// pinged, and neither is a peer that is not an RPC proxy.
+    #[default]
+    Inherit,
+    /// Never ping.
+    Off,
 }
 
 /// A binder for a producer that has none of its own to hand over.
@@ -678,8 +755,7 @@ impl<T: Serialize + ?Sized> Sink<T> {
     ///   this item completed (RPC): the item was not written or queued,
     ///   and the stream stays usable. On the RPC path a batch send the
     ///   session timed out returns it too (the last entry); that batch did
-    ///   not arrive either, so sending the item again never duplicates it,
-    ///   but its items are counted lost.
+    ///   not arrive, its items are counted lost, and the session has ended.
     /// - [`StatusCode::InvalidOperation`] once the consumer has
     ///   cancelled. Nothing further will be delivered, so stop.
     /// - [`StatusCode::DeadObject`] when the consumer's process is gone.
@@ -699,15 +775,20 @@ impl<T: Serialize + ?Sized> Sink<T> {
     ///   batch's items are lost, and [`end`](Self::end) tells the consumer
     ///   how many, so the stream ends as failed either way. What follows
     ///   depends on whether the batch arrived:
-    ///   - It did not — a dead session, a refused transaction
-    ///     ([`StatusCode::FailedTransaction`]), an expired send deadline
-    ///     ([`StatusCode::TimedOut`]), or a call refused before anything
-    ///     was sent for want of a free connection
+    ///   - It did not, and the session is up — a refused transaction
+    ///     ([`StatusCode::FailedTransaction`]), or a call refused before
+    ///     anything was sent for want of a free connection
     ///     ([`StatusCode::WouldBlock`]). Its credit comes back and the
     ///     stream stays usable. When the failed batch was an earlier one,
     ///     this call's item was queued after it and is still pending; it
     ///     goes out with the next flush. [`pending`](Self::pending) tells
     ///     the two cases apart.
+    ///   - It did not, and the session has ended — a dead session
+    ///     ([`StatusCode::DeadObject`]), or a send the session's deadline
+    ///     or the kernel's keepalive check stopped
+    ///     ([`StatusCode::TimedOut`]). Its credit comes back, but the
+    ///     session's end marks the consumer dead, so later calls return
+    ///     [`StatusCode::DeadObject`].
     ///   - Unknown — any other failure. How much credit is left is then
     ///     unknown too, and the consumer ends a stream on a batch sent
     ///     without credit, so nothing more is sent: this and every later
@@ -855,9 +936,11 @@ impl<T: Serialize + ?Sized> Sink<T> {
     ///
     /// Same contract, with the wait moved off the executor thread: on the
     /// ring a record that finds no room is written from the blocking
-    /// pool, on the RPC path waiting for credit suspends the task and the
-    /// batch is sent from the pool, the way every generated async proxy
-    /// sends ([`Tokio`](crate::Tokio)).
+    /// pool; on the RPC path the credit wait follows the
+    /// [module docs](self#async) — a wait that is bounded or may ping
+    /// holds a pool thread, any other suspends the task — and the batch is
+    /// sent from the pool, the way every generated async proxy sends
+    /// ([`Tokio`](crate::Tokio)).
     ///
     /// The item is encoded **when this is called**, not when the future
     /// is first polled, so the future does not borrow `item` and stays
@@ -1170,11 +1253,18 @@ impl<T: Deserialize> Receiver<T> {
     /// `Ok(None)` when `timeout` elapses with the stream still running.
     /// A timeout leaves the stream usable — call again.
     ///
-    /// `timeout` bounds the wait for an item only. On the RPC path the
-    /// grant [`try_recv`](Self::try_recv) describes is sent before that
-    /// wait starts and is not counted against it, so this can return
-    /// later than `timeout` by however long a grant takes; one that fails
-    /// is tried again by the next call, not within this one.
+    /// `timeout` starts when the call does. On the RPC path the grant
+    /// [`try_recv`](Self::try_recv) describes is sent within `timeout`:
+    /// the time it takes shortens the wait for an item, and a grant that
+    /// outlasts `timeout` makes this return late by the difference. One
+    /// that fails is sent again at most once within this call, the next
+    /// time the wait wakes — a ping's return included — with nothing
+    /// queued, and that retry can make this return late the same way;
+    /// past it, the next call tries the grant again. A
+    /// [ping](PingPolicy) made while waiting is not counted against
+    /// `timeout`, and a
+    /// `timeout` shorter than a third of the reply deadline ends the wait
+    /// before any ping, so a loop of such calls never checks the producer.
     ///
     /// A `timeout` too long for an `Instant` to express — `Duration::MAX`
     /// — waits without a bound, and is [`recv`](Self::recv) in every
@@ -1188,9 +1278,11 @@ impl<T: Deserialize> Receiver<T> {
 
     /// [`recv`](Self::recv) for an async consumer.
     ///
-    /// Same result as `recv`, with the wait made from the blocking pool
-    /// instead of on the executor thread: a futex wait on the ring, a
-    /// credit grant on the RPC path. No `Stream` trait is implemented and
+    /// Same result as `recv`, without blocking the executor thread. The
+    /// blocking pool runs a futex wait on the ring; on the RPC path it
+    /// runs a credit grant and a wait for an item that may
+    /// [ping](PingPolicy), and any other wait suspends the task
+    /// ([module docs](self#async)). No `Stream` trait is implemented and
     /// none is in the public signature: that would bind rsbinder's API
     /// to a `futures-core` major version. Adapt it where you need one.
     ///
@@ -1397,6 +1489,7 @@ mod tests {
                 ring_bytes: 512,
                 credit_window: 1,
                 max_opening: 1,
+                ..ReceiverPolicy::default()
             },
         )
         .expect("a receiver");

@@ -30,7 +30,7 @@
 //! stream_probe upload  <name> <count> <ringBytes>
 //! stream_probe vanish  <name> <sendN>
 //! stream_probe status  <name>
-//! stream_probe serve-rpc <socketPath>          (feature `rpc`)
+//! stream_probe serve-rpc <socketPath> [replyTimeoutMs]   (feature `rpc`)
 //! ```
 //!
 //! Every mode but `serve` and `serve-rpc` prints one `RESULT` line;
@@ -40,7 +40,8 @@
 //!
 //! `serve-rpc` is the same service as the root of an `RpcServer` on a
 //! Unix socket, for a libbinder `RpcSession` client to stream against
-//! (`example-hello/cpp/run_stream_rpc_interop.sh`).
+//! (`example-hello/cpp/run_stream_rpc_interop.sh`). `replyTimeoutMs` sets
+//! every session's reply deadline, which also arms the stream ping.
 
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
@@ -230,9 +231,11 @@ fn serve(name: &str) -> Result<()> {
 
 /// The service as an RPC root: a libbinder client asks for the root object, not a name.
 #[cfg(feature = "rpc")]
-fn serve_rpc(path: &str) -> Result<()> {
+fn serve_rpc(path: &str, reply_timeout: Option<Duration>) -> Result<()> {
     let server = rsbinder::rpc::RpcServer::setup_unix_server(path)?;
     server.set_android13plus(2);
+    // Every session's deadline, and so the period of the producer's pings (plan 2-24 D9).
+    server.set_reply_timeout(reply_timeout);
     // Batches, grants and cancels are oneway calls from the client; a few threads take them.
     server.set_max_threads(4);
     server.set_root(BnStreamDemo::new_binder(DemoSvc::default()).as_binder())?;
@@ -567,7 +570,7 @@ fn main() {
              \x20      stream_probe upload <name> <count> <ringBytes>\n\
              \x20      stream_probe vanish <name> <sendN>\n\
              \x20      stream_probe status <name>\n\
-             \x20      stream_probe serve-rpc <socketPath>"
+             \x20      stream_probe serve-rpc <socketPath> [replyTimeoutMs]"
         );
         std::process::exit(2)
     };
@@ -593,7 +596,9 @@ fn main() {
         (Some("vanish"), 4) => vanish(&args[2], num(3)),
         (Some("status"), 3) => status(&args[2]),
         #[cfg(feature = "rpc")]
-        (Some("serve-rpc"), 3) => serve_rpc(&args[2]),
+        (Some("serve-rpc"), 3) => serve_rpc(&args[2], None),
+        #[cfg(feature = "rpc")]
+        (Some("serve-rpc"), 4) => serve_rpc(&args[2], Some(Duration::from_millis(size(3) as u64))),
         _ => usage(),
     };
     if let Err(e) = r {

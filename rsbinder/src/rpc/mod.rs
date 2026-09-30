@@ -96,10 +96,9 @@
 //! frame pending") or [`RpcError::Timeout`](crate::rpc::RpcError::Timeout) ("no frame boundary
 //! crossed") is documented to have left the stream at
 //! a frame boundary. Every other read failure lacks that guarantee — including ones that in
-//! fact consumed nothing — and is treated as a lost position. Two callers ask through the
+//! fact consumed nothing — and is treated as a lost position. One caller asks through the
 //! crate-private `RpcError::leaves_frame_boundary_intact`: the android-13+ reader, which
-//! promotes a mid-frame case to `Truncated` / `DeadlineMidFrame`, and `client_transact`'s reply
-//! wait, which decides whether an abandoned nested call left its `REPLY` inbound. The r34
+//! promotes a mid-frame case to `Truncated` / `DeadlineMidFrame`. The r34
 //! framing readers and the serve loop reimplement the same split inline — against the io
 //! error kind and the `RpcError` variants respectively — so a change to the set has to be
 //! made in all three places.
@@ -185,7 +184,8 @@ pub enum RpcError {
     /// [`Truncated`](Self::Truncated), never this. A *send* that
     /// disconnects past its first byte is this variant with the position
     /// lost — no writer can report how much of the frame went out — which
-    /// is why the session's send-failure rule retires a slot on it.
+    /// is one reason the session's send-failure rule ends the session on
+    /// it.
     /// Projects to [`StatusCode::DeadObject`](crate::StatusCode).
     EndOfStream,
     /// The stream ended without the transport's own close signal — a TLS
@@ -212,13 +212,11 @@ pub enum RpcError {
     /// mid-body, or declared more than it sent).
     Truncated,
     /// A read deadline elapsed part-way through a frame. The stream
-    /// position is as lost as after [`Truncated`](Self::Truncated). Whose
-    /// deadline it was is not knowable here: a read deadline of this end's
-    /// (a reply deadline, a server's idle timeout) and the kernel's own
-    /// `ETIMEDOUT` from a peer whose host went away arrive as the same
-    /// io error kind and are not told apart. Attribution is
-    /// [`SessionEnd::by`], which is decided with the knowledge of whether
-    /// a deadline of this end's was armed at all.
+    /// position is as lost as after [`Truncated`](Self::Truncated). The
+    /// deadline is one of this end's (a reply deadline, a server's idle
+    /// timeout): a socket read deadline expires as `EAGAIN`, while the
+    /// kernel's own `ETIMEDOUT` is a lost connection and arrives as
+    /// [`Io`](Self::Io).
     /// Projects to [`StatusCode::TimedOut`](crate::StatusCode).
     DeadlineMidFrame,
     /// A declared frame length exceeds [`transport::MAX_FRAME_LEN`].
@@ -230,17 +228,28 @@ pub enum RpcError {
         max: usize,
     },
     /// An underlying transport I/O error that is not a clean close.
+    /// The kernel's `ETIMEDOUT` (`io::ErrorKind::TimedOut`: a `connect` that
+    /// ran out of SYN retries, or TCP keepalive or retransmission giving up on
+    /// a peer whose host stopped answering) is one: a lost connection, not a
+    /// deadline of this end's. It projects through its errno, as every kind
+    /// does, to [`StatusCode::TimedOut`](crate::StatusCode) — the status
+    /// libbinder returns for the call that hit it (AOSP `RpcState.cpp`
+    /// `handleRpcError` converts only `-ECONNRESET`, and `RpcSession.cpp`
+    /// `singleSocketConnection` returns `-connErrno`). A serve loop records
+    /// it as a lost connection, not an idle eviction
+    /// ([`EndReason::Frame`]).
     Io(std::io::Error),
     /// A protocol-level violation (used by the wire codec).
     Protocol(&'static str),
     /// A wait deadline elapsed with no frame boundary crossed: a read that
     /// consumed nothing (a reply or negotiation deadline), or a send that
     /// put nothing on the wire. The stream stays frame-synchronized either
-    /// way, which is what lets the connection keep serving. Whose deadline
-    /// it was is not knowable here — one of this end's and the kernel's own
-    /// `ETIMEDOUT` arrive as the same io error kind; attribution is
-    /// [`SessionEnd::by`], decided with the knowledge of whether a deadline
-    /// of this end's was armed at all.
+    /// way, but a reply, negotiation or send deadline still ends the
+    /// session; only a serve loop's idle expiry between frames reads on
+    /// (when the session was not idle). The deadline is
+    /// one of this end's (`SO_RCVTIMEO`/`SO_SNDTIMEO`, which expire as
+    /// `EAGAIN`); the kernel's own `ETIMEDOUT` is a lost connection and
+    /// arrives as [`Io`](Self::Io).
     /// Projects to [`StatusCode::TimedOut`](crate::StatusCode).
     Timeout,
 }
@@ -326,17 +335,21 @@ impl From<RpcError> for std::io::Error {
     /// android-13+ session stays `StatusCode::DeadObject` rather than
     /// degrading to an unclassified `Io(Other)` (`StatusCode::Unknown`)
     /// — the status a caller's dead-peer check keys on.
-    /// [`RpcError::Timeout`] projects onto `TimedOut`
-    /// — kind-preserving rather than variant-preserving, since
-    /// `From<io::Error>` folds that kind into `Io(TimedOut)`.
+    /// [`RpcError::Timeout`] projects onto `WouldBlock`, the kind an
+    /// expired socket deadline (`EAGAIN`) has, so the framing readers above
+    /// an adapter see this end's deadline exactly as they see it on a raw
+    /// socket. It is kind-preserving rather than variant-preserving, since
+    /// `From<io::Error>` folds that kind into `Io(WouldBlock)`. `TimedOut`
+    /// is not used for it: that kind is the kernel's `ETIMEDOUT`, a lost
+    /// connection (`transport` module doc "Short reads and writes").
     /// [`RpcError::UncleanEndOfStream`] must survive the round trip —
     /// folding it by kind would turn it back into `EndOfStream`, the very
     /// thing it exists to be told apart from — so it goes out as an
     /// `UnexpectedEof` carrying itself as the payload, which
     /// `From<io::Error>` recovers first. `RpcError::DeadlineMidFrame` goes
-    /// out the same way, as `TimedOut` carrying itself, so the variant is at
-    /// least recoverable on the far side: by kind alone it would come back as
-    /// a boundary `Timeout`, the opposite of what it means. No reader takes
+    /// out the same way, as `WouldBlock` carrying itself, so the variant is
+    /// at least recoverable on the far side: by kind alone it would come back
+    /// as a boundary `Timeout`, the opposite of what it means. No reader takes
     /// it yet (each checks `is_timeout` by kind before the downcast), and no
     /// producer sends this variant across this boundary. The remaining
     /// variants have no `io::ErrorKind` that means what they mean, so they
@@ -345,12 +358,14 @@ impl From<RpcError> for std::io::Error {
         match e {
             RpcError::Io(io) => io,
             RpcError::EndOfStream => std::io::ErrorKind::BrokenPipe.into(),
-            RpcError::Timeout => std::io::ErrorKind::TimedOut.into(),
+            RpcError::Timeout => std::io::ErrorKind::WouldBlock.into(),
             e @ RpcError::UncleanEndOfStream => {
                 std::io::Error::new(std::io::ErrorKind::UnexpectedEof, e)
             }
             // Carries itself, or it would read back as a boundary `Timeout` (see the fn doc).
-            e @ RpcError::DeadlineMidFrame => std::io::Error::new(std::io::ErrorKind::TimedOut, e),
+            e @ RpcError::DeadlineMidFrame => {
+                std::io::Error::new(std::io::ErrorKind::WouldBlock, e)
+            }
             other => std::io::Error::other(format!("{other}")),
         }
     }
@@ -453,7 +468,7 @@ mod tests {
     //!   `StatusCode::DeadObject`, not `Unknown`. Which side of an exchange notices a
     //!   disconnect first is a host- and timing-dependent race, so both directions have to
     //!   classify alike. `EndOfStream` returns as the same variant; `Timeout` is only
-    //!   kind-preserving — it comes back as `Io(TimedOut)`. Mutant: mapping `EndOfStream`
+    //!   kind-preserving — it comes back as `Io(WouldBlock)`. Mutant: mapping `EndOfStream`
     //!   through `other => io::Error::other(...)` fails the round trip (and the timeout arm
     //!   guards `read_exact_into`'s `is_timeout` path the same way).
     //! - `rpc_parcel_hostile_array_len_is_bounded_not_oom`: a hostile array length in an
@@ -504,6 +519,13 @@ mod tests {
             StatusCode::from(RpcError::Protocol("bad")),
             StatusCode::RpcError
         );
+        // The kernel's `ETIMEDOUT` projects through its errno, as libbinder's `-ETIMEDOUT` does.
+        let etimedout = rustix::io::Errno::TIMEDOUT.raw_os_error();
+        assert_eq!(
+            StatusCode::from(RpcError::Io(std::io::Error::from_raw_os_error(etimedout))),
+            StatusCode::TimedOut
+        );
+        assert_eq!(StatusCode::from(RpcError::Timeout), StatusCode::TimedOut);
     }
 
     /// `EndOfStream`/`Timeout` keep their `io::ErrorKind` via `io::Error`; see "Mutation gates".
@@ -519,12 +541,12 @@ mod tests {
         );
 
         let io = std::io::Error::from(RpcError::Timeout);
-        assert_eq!(io.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(io.kind(), std::io::ErrorKind::WouldBlock);
         assert!(
             transport::is_timeout(&io),
             "read_exact_into's deadline arm keys on this kind"
         );
-        // `From<io::Error>` folds only disconnect kinds: a timeout returns as `Io(TimedOut)`.
+        // `From<io::Error>` folds only disconnect kinds: a timeout returns as `Io(WouldBlock)`.
         assert!(
             matches!(RpcError::from(io), RpcError::Io(ref e) if transport::is_timeout(e)),
             "a timeout stays recognizable as one across the round trip"

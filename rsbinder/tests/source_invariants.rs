@@ -6,7 +6,7 @@
 //! flips the test red until the audit named in the invariant is
 //! performed.
 //!
-//! Four remain: refuted prose, `remove_slot`'s callers, the files a
+//! Four remain: refuted prose, the one slot un-push, the files a
 //! byte-order primitive may appear in plus the `ParcelPod` membership
 //! list, and the method surface of `CommandStream` — each a closed set,
 //! not an enumeration of ways to get it wrong. The call sites of the layer split are not
@@ -27,30 +27,36 @@
 //! don't route around — if a phrase is needed to state something *true*, narrow the phrase in
 //! the test.
 //!
-//! # `remove_slot` callers
+//! # The slot un-push
 //!
-//! `RpcSessionInner::remove_slot` is private to `rpc/session.rs` and safe to call from more
-//! than one site because `find_conn` / `find_conn_pinned` return
-//! `Err(StatusCode::DeadObject)` (not an `expect` panic) when their reentrant slot lookup
-//! misses. `remove_slot_has_exactly_six_callers` pins the six sanctioned callers:
+//! A slot leaves the pool only with the whole session (`on_session_dead`, `session` module doc
+//! "Session end"), with one exception (`session` module doc "Slot pool" "Leaving"): a
+//! server's callback slot whose connection-init write never reached the client.
+//! `SlotClaim::retire` is the one un-push: it takes the slot out of the pool while this thread
+//! still claims it, so no other sender can pick it and end the session on its failure.
 //!
-//! - the slot's own `serve_blocking_on` exit;
-//! - `retire_after_failed_send`, the one rule every outbound frame's transport-level send
-//!   failure funnels through; it is what lets a serve-less client session reach death
-//!   detection (`remove_slot`'s empty-pool hook, Plan 2-17 A.1b);
-//! - `client_transact`'s two reply-wait slot-retiring paths: a reply wait that failed to arm,
-//!   read, decode or nested-dispatch, and the reply wait's refusal of a slot a nested call
-//!   marked unreadable;
-//! - the two attach rollbacks, which un-push a slot the peer can never use: an incoming
-//!   connection whose serve thread failed to spawn, and a callback slot whose
-//!   connection-init write never reached the client.
+//! The compiler holds most of this. The slot vector is the private field of `SlotPool`, in
+//! `rpc/session.rs`'s child module `slot_pool`, whose API pushes, iterates and indexes and
+//! removes only through `unpush_retired` and `clear_at_session_end`. Only that module builds a
+//! `ConnSlot` or a `SlotPool`, so a pooled slot cannot be overwritten with a new one. A whole
+//! pool can: `ConnState::slots` is assignable, so the pool of a second `ConnState` would replace
+//! it. What the compiler cannot see is who calls the two removals and that constructor.
+//! `slot_unpush_has_exactly_one_path` pins one call site each, matched as a whole word so a path
+//! call counts: `unpush_retired` in `retire`, `clear_at_session_end` in `on_session_dead`,
+//! `retire` itself in `add_callback_slot_and_init`, and `ConnState::new` in `with_shared`. It
+//! also pins the module's surface — its `fn` count, one `Vec<ConnSlot>` (the field), no child
+//! module, no `derive` (a `Default` would let `mem::take` empty a pool), `SlotPool`'s field
+//! and `ConnSlot`'s `_pooled` private — so a method that hands the vector out or removes a slot
+//! another way is a deliberate edit here. Swapping the pools of two live sessions is not
+//! checked.
 //!
-//! The first three retire a slot whose peer is gone or whose stream is desynced, so it is
-//! never reused. A NEW caller MUST first re-audit that every slot-lookup path tolerates a
-//! missing slot; the bound guards against a lookup that assumes the slot is always present.
-//! The scan is
-//! `cfg`-blind (it reads every `.rs` under `src/`), so a `#[cfg(test)]` caller counts too:
-//! raise the number deliberately rather than route around it.
+//! A NEW un-push of a slot the peer holds as a working connection, or one that carried a
+//! frame, brings back the partial session that plan 2-24 removed: the peer's books count
+//! frames on it (a oneway number, a `DEC_STRONG`, a reply) that the session would then go on
+//! without, or the peer sends on it and ends the session later. It MUST end the session instead
+//! (`fail_session`). The scan reads `rpc/session.rs` and each out-of-file child module it
+//! declares (that list is pinned too), whatever their `cfg`, so a `#[cfg(test)]` caller counts
+//! as well: change the test deliberately rather than route around it.
 //!
 //! # Byte order
 //!
@@ -157,37 +163,146 @@ fn prose_does_not_restate_refuted_shutdown_claims() {
     );
 }
 
-/// Pins `remove_slot`'s six callers in `rpc/session.rs`; see module doc "`remove_slot` callers".
+/// Pins the slot pool's removal call sites and surface; see module doc "The slot un-push".
 #[test]
-fn remove_slot_has_exactly_six_callers() {
+fn slot_unpush_has_exactly_one_path() {
     let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     // A binary pushed to a device cannot see the baked-in sources; host builds always can.
     if !src_root.is_dir() {
         eprintln!("skipping: sources not reachable at {}", src_root.display());
         return;
     }
-    let hits = count_call_sites(&src_root, ".remove_slot(");
-    // A count alone passes if a sanctioned caller is swapped for one elsewhere.
+    // Only `session.rs` and its out-of-file child modules see the private pool and `SlotClaim`.
+    let rpc_dir = src_root.join("rpc");
+    let session_src = fs::read_to_string(rpc_dir.join("session.rs")).expect("rpc/session.rs");
+    let lines: Vec<&str> = session_src.lines().map(code_only).collect();
+    let mut failures = Vec::new();
+    let children = out_of_file_children(&lines);
+    if children != ["ref_accounting_tests.rs"] {
+        failures.push(format!("`session`'s out-of-file children: {children:?}"));
+    }
+    let child_srcs: Vec<(String, String)> = children
+        .into_iter()
+        .map(|rel| {
+            let src = fs::read_to_string(rpc_dir.join(&rel)).unwrap_or_default();
+            (rel, src)
+        })
+        .collect();
+    for (word, home) in [
+        ("unpush_retired", "fn retire("),
+        ("clear_at_session_end", "fn on_session_dead("),
+        ("retire", "fn add_callback_slot_and_init("),
+        ("ConnState::new", "fn with_shared("),
+    ] {
+        for (rel, src) in &child_srcs {
+            let child: Vec<&str> = src.lines().map(code_only).collect();
+            let sites = word_sites(&child, word);
+            if !sites.is_empty() {
+                failures.push(format!("`{word}` in child `{rel}` at lines {sites:?}"));
+            }
+        }
+        match word_sites(&lines, word).as_slice() {
+            [line] => {
+                let enclosing = enclosing_fn(&lines, *line);
+                if !enclosing.is_some_and(|l| l.contains(home)) {
+                    failures.push(format!("`{word}` at line {line} is in {enclosing:?}"));
+                }
+            }
+            sites => failures.push(format!("`{word}` has call sites at lines {sites:?}")),
+        }
+    }
+    match lines.iter().position(|l| l.starts_with("mod slot_pool {")) {
+        None => failures.push("`mod slot_pool {` is gone".to_string()),
+        Some(start) => {
+            let len = lines[start..].iter().position(|l| *l == "}");
+            let body = &lines[start..=start + len.expect("`slot_pool`'s closing brace")];
+            for (needle, want) in [
+                ("fn ", 10),
+                ("Vec<ConnSlot>", 1),
+                ("mod ", 1),
+                ("#[derive", 0),
+                ("pub(super) struct SlotPool(Vec<ConnSlot>);", 1),
+            ] {
+                let got = body.iter().filter(|l| l.contains(needle)).count();
+                if got != want {
+                    failures.push(format!("`{needle}` in `slot_pool`: {got}, not {want}"));
+                }
+            }
+            // The private field and the one literal that fills it: a `pub` on it drops one.
+            let pooled = body
+                .iter()
+                .filter(|l| l.trim_start().starts_with("_pooled: (),"));
+            if pooled.count() != 2 {
+                failures.push("`_pooled` is no longer private to `slot_pool`".to_string());
+            }
+        }
+    }
     assert!(
-        hits.iter().all(|(p, _)| p.ends_with("rpc/session.rs")),
-        "remove_slot callers must live in rpc/session.rs: {hits:#?}"
+        failures.is_empty(),
+        "the slot pool's removals or surface moved: {failures:#?}\n\
+         INVARIANT: the one slot un-push is SlotClaim::retire, called only \
+         for a callback slot whose connection-init write failed; every \
+         other slot leaves the pool only with the session (fail_session / \
+         close). See this test's doc."
     );
-    assert_eq!(
-        hits.len(),
-        6,
-        "RpcSessionInner::remove_slot must have exactly six callers. \
-         Found {} call sites: {:#?}\n\
-         INVARIANT: only serve_blocking_on's exit path, \
-         retire_after_failed_send, client_transact's failed-reply-wait / \
-         unreadable-slot retirements, the \
-         incoming-connection attach's spawn-failure rollback, and the \
-         callback attach's init-write-failure rollback may call remove_slot — \
-         find_conn / find_conn_pinned must return DeadObject (not panic) \
-         on a missing slot. A new caller MUST audit every slot-lookup \
-         path before being added.",
-        hits.len(),
-        hits,
-    );
+}
+
+/// Files of the `mod x;` items in `rpc/session.rs`'s `lines`, relative to `rpc/`.
+fn out_of_file_children(lines: &[&str]) -> Vec<String> {
+    let mut children = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let Some(item) = line.trim().strip_suffix(';') else {
+            continue;
+        };
+        let public = item
+            .split_once(" mod ")
+            .filter(|(vis, _)| vis.starts_with("pub"));
+        let Some(name) = item.strip_prefix("mod ").or(public.map(|(_, n)| n)) else {
+            continue;
+        };
+        let path = lines[..i]
+            .iter()
+            .rev()
+            .map(|l| l.trim())
+            .take_while(|l| l.starts_with("#["))
+            .find_map(|l| l.strip_prefix("#[path = \"")?.strip_suffix("\"]"));
+        children.push(path.map_or_else(|| format!("session/{name}.rs"), str::to_string));
+    }
+    children
+}
+
+/// `line` without its comment, or empty for a comment line.
+fn code_only(line: &str) -> &str {
+    match line.trim_start().starts_with("//") {
+        true => "",
+        false => line.split("//").next().unwrap_or(line),
+    }
+}
+
+/// 1-based lines holding `word` as a whole identifier, once per use; its `fn` definition is not.
+fn word_sites(lines: &[&str], word: &str) -> Vec<usize> {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    let mut sites = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        for (at, _) in line.match_indices(word) {
+            let before = &line[..at];
+            let after = &line[at + word.len()..];
+            let whole = !before.ends_with(ident) && !after.starts_with(ident);
+            if whole && !before.ends_with("fn ") {
+                sites.push(i + 1);
+            }
+        }
+    }
+    sites
+}
+
+/// The nearest `fn` line at or above 1-based `line`.
+fn enclosing_fn<'a>(lines: &[&'a str], line: usize) -> Option<&'a str> {
+    lines[..line]
+        .iter()
+        .rev()
+        .map(|l| l.trim_start())
+        .find(|l| l.starts_with("fn ") || (l.starts_with("pub") && l.contains(" fn ")))
 }
 
 /// Pins where byte-order primitives appear and `ParcelPod`'s members; see module doc "Byte order".

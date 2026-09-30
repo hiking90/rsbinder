@@ -179,6 +179,12 @@ impl RpcTransport for TcpDebugTransport {
         Ok(())
     }
 
+    fn set_liveness(&self, timeout: Option<std::time::Duration>) -> RpcResult<()> {
+        use std::os::fd::AsFd;
+        super::tcp_liveness(self.stream.as_fd(), timeout)?;
+        Ok(())
+    }
+
     fn shutdown(&self) -> RpcResult<()> {
         super::absorb_already_shut(self.stream.shutdown(std::net::Shutdown::Both))
     }

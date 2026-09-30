@@ -189,6 +189,9 @@ tier_hermetic() {
         --test blob_rpc --test pipe_rpc --test parcel_alloc
     run "rsbinder tls targets" tpass cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug \
         --test rpc_tls --test rpc_transport_conformance
+    # Skips (and still passes) where unprivileged user namespaces are off; CI sets REQUIRED.
+    run "rpc_link_break (network namespace)" tpass cargo test -p rsbinder \
+        --features rpc-tls,rpc-tcp-debug --test rpc_link_break
     run "rpc_server: tls nested callback" tpass cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug \
         --test rpc_server -- --exact tls_android13plus_nested_callback_e2e
     run "rpc_server: preconnected inet fd" tpass cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug \

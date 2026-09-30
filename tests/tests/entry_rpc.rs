@@ -262,6 +262,7 @@ fn entry_options_apply_to_rpc_server() {
 /// it is refused whatever its value — `ClientOptions` promises an option
 /// that does not apply is `BadValue`, never ignored.
 #[test]
+#[allow(deprecated)] // The deprecated field is still honored, so its zero is still refused.
 fn entry_zero_handshake_timeout_is_refused() {
     let sock13 = SockPath::new("zerohs13");
     let _guard13 = rsbinder::serve(&sock13.uri("?profile=android13plus"))
@@ -283,6 +284,13 @@ fn entry_zero_handshake_timeout_is_refused() {
     })
     .and_then(|c| c.binder("svc"));
     assert!(ok.is_ok(), "a positive deadline still connects");
+
+    // `timeout`'s zero is no deadline at all, as `RpcSession::set_timeout` treats it.
+    let zero = rsbinder::Client::open_with(&sock13.uri("?profile=android13plus"), |o, _| {
+        o.timeout = Some(std::time::Duration::ZERO)
+    })
+    .and_then(|c| c.binder("svc"));
+    assert!(zero.is_ok(), "a zero timeout connects with no deadline");
 
     // The r34 wire has no handshake phase, so the option is refused there
     // whatever its value.

@@ -61,6 +61,10 @@ constexpr const char* kCallbackDescriptor = "rsbinder.test.IIncomingInteropCallb
 constexpr transaction_code_t TX_ECHO = FIRST_CALL_TRANSACTION + 0;
 constexpr transaction_code_t TX_SCHEDULE_CALLBACK = FIRST_CALL_TRANSACTION + 5;
 constexpr transaction_code_t TX_GET_SCHED = FIRST_CALL_TRANSACTION + 6;
+// Plan 2-24 D2: the client's reply deadline expiring ends this end's session too.
+constexpr transaction_code_t TX_WATCH = FIRST_CALL_TRANSACTION + 7;
+constexpr transaction_code_t TX_SLOW = FIRST_CALL_TRANSACTION + 8;
+constexpr transaction_code_t TX_GET_DIED = FIRST_CALL_TRANSACTION + 9;
 constexpr transaction_code_t TX_CALLBACK_ECHO = FIRST_CALL_TRANSACTION + 0;
 constexpr transaction_code_t TX_CALLBACK_NOTIFY = FIRST_CALL_TRANSACTION + 1; // oneway
 
@@ -104,6 +108,16 @@ void set_sched(std::string s) {
 }
 
 AIBinder_Class* g_cb_clazz = nullptr;
+
+// A client binder watched (TX_WATCH): its obituary comes on `RpcSession::shutdownAndWait`.
+std::atomic<int> g_died{0};
+AIBinder* g_watched = nullptr;  // held strong: an obituary goes only to a live proxy
+AIBinder_DeathRecipient* g_recipient = nullptr;
+
+void on_watched_died(void* /*cookie*/) {
+    fprintf(stderr, "[cpp-server] the watched client binder died: this session ended\n");
+    g_died.store(1);
+}
 
 binder_status_t cb_stub_on_transact(AIBinder*, transaction_code_t, const AParcel*, AParcel*) {
     // Never called: the class only gives the *proxy* its descriptor.
@@ -218,6 +232,33 @@ binder_status_t root_on_transact(AIBinder* /*binder*/, transaction_code_t code,
             binder_status_t st0 = AParcel_writeInt32(out, 0);
             if (st0 != STATUS_OK) return st0;
             return AParcel_writeString(out, s.data(), (int32_t)s.size());
+        }
+        case TX_WATCH: {
+            AIBinder* b = nullptr;
+            binder_status_t rc = AParcel_readStrongBinder(in, &b);
+            if (rc != STATUS_OK || !b) return rc != STATUS_OK ? rc : STATUS_BAD_VALUE;
+            g_died.store(0);
+            if (!g_recipient) g_recipient = AIBinder_DeathRecipient_new(on_watched_died);
+            binder_status_t linked = AIBinder_linkToDeath(b, g_recipient, nullptr);
+            if (g_watched) AIBinder_decStrong(g_watched);
+            g_watched = b;
+            fprintf(stderr, "[cpp-server] TX_WATCH linkToDeath: %d\n", linked);
+            binder_status_t st0 = AParcel_writeInt32(out, 0);
+            if (st0 != STATUS_OK) return st0;
+            return AParcel_writeInt32(out, linked);
+        }
+        case TX_SLOW: {
+            int32_t ms = 0;
+            binder_status_t rc = AParcel_readInt32(in, &ms);
+            if (rc != STATUS_OK) return rc;
+            fprintf(stderr, "[cpp-server] TX_SLOW: answering in %d ms\n", ms);
+            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+            return AParcel_writeInt32(out, 0);
+        }
+        case TX_GET_DIED: {
+            binder_status_t st0 = AParcel_writeInt32(out, 0);
+            if (st0 != STATUS_OK) return st0;
+            return AParcel_writeInt32(out, g_died.load());
         }
         default:
             return STATUS_UNKNOWN_TRANSACTION;

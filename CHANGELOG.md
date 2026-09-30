@@ -29,8 +29,10 @@ This changelog starts at 0.9.0. For earlier releases, see the
   Likewise `ClientOptions::driver` / `mmap_size` must agree with the URI's
   `?driver=` / `?mmap=`.
 - **An RPC session refuses a connection whose transport differs from its
-  founding one** (fd passing or local peer) with `BadType` at attach. Only
-  hand-assembled sessions (e.g. `RpcServer::serve_connection`) can hit this.
+  founding one** (fd passing or local peer) with `BadType` at attach. A manual
+  attach (`add_{outgoing,incoming}_connection_with_config`) over such a
+  transport is refused before its header goes out, so the session stays up; a
+  hand-assembled session (e.g. `RpcServer::serve_connection`) can hit it too.
 - **`StatusCode::from(ExceptionCode::ServiceSpecific)` is
   `ServiceSpecific(0)`, not `Ok`**, as in AOSP; `StatusCode::from(status)` for
   such a `Status` now yields `ServiceSpecific(0)`, not `FailedTransaction`.
@@ -84,6 +86,58 @@ This changelog starts at 0.9.0. For earlier releases, see the
 - **A `oneway` call made inside an RPC handler needs a connection this end
   opened** (see *Fixed*); without one it is `WouldBlock`, so a server's oneway
   callback needs the client's incoming connections. Twoway is unchanged.
+- **An RPC session ends as a whole when any of its connections fails** (AOSP
+  `RpcState::handleRpcError`). A send or receive failure, a cut frame or an
+  expired deadline on one connection shuts every connection down: calls in
+  flight on the others return `DeadObject`, every death recipient fires, and
+  every local object the peer held is released. 0.11.0 retired the failing
+  connection and let a fan-out session go on. After a session ends, reconnect,
+  fetch the root and register callbacks again. A client's incoming connection
+  whose serve thread cannot be spawned ends the session too, since the server
+  already holds it as a callback connection.
+  So does every other failed incoming attach, except one whose header never
+  went out (a refused pre-check, a failed connect or header write) or whose
+  connection closed, a reset included, before any byte of the server's `"cci"`
+  arrived (a refused attach): those leave the session up.
+  A failed outgoing attach (`add_outgoing_connection_with_config`) ends the
+  session too, since a libbinder server holds the connection once it has the
+  header, except one whose header never went out (a refused pre-check, a
+  `max_version` below the session's, a transport unlike the founding
+  connection's, the client-local `session_id()` as the id, a failed connect or
+  header write). A refused attach ends it as well: libbinder
+  `android-16.0.0_r3` and later end their session when they refuse an attach
+  at the `setMaxThreads` cap, and the close that refusal produces cannot be
+  told from one that left the server's session up. Stay within `negotiate()`
+  connections and echo `get_session_id()`.
+- **An expired reply deadline ends the session** (`RpcSession::set_timeout`,
+  `RpcServer::set_reply_timeout`, the `timeout` / `reply_timeout` options). The
+  call still returns `TimedOut`; the session no longer survives it or skips the
+  late reply. Set it above the slowest legitimate handler; to abandon one call
+  and keep the session, run it on another thread and stop waiting. A wait for
+  a free connection still fails only that call, with `WouldBlock`.
+- **The session timeout bounds more than the reply wait**: `SO_SNDTIMEO`
+  (a send that makes no progress for the period ends the session; a steady
+  slow reader is not cut) on every connection of a bundled socket transport,
+  and on a transport of your own only if it implements
+  `RpcTransport::set_write_timeout` (without it a stalled send has no
+  bound), the kernel's keepalive check on
+  TCP and TLS over TCP (`RpcTransport::set_liveness` has the values and
+  platform differences), and on a client each connect and
+  handshake step. A send deadline that expires part-way through a frame
+  returns `TimedOut` (0.11.0: `WouldBlock`, which means nothing was sent).
+- **TCP connections, TLS over TCP included, have keepalive on by default**, at
+  the system's intervals without a session timeout (hours), so a session
+  whose peer host vanished ends and fires its death recipients. No wire byte
+  changes.
+- **`RpcServer::set_idle_timeout` judges the session, not the connection**: a
+  session ends once no byte has crossed any of its connections and no call has
+  been open for the period, so a fan-out client with one quiet connection is
+  not evicted, and the eviction can come up to one period later than that; the
+  `set_idle_timeout` rustdoc states the rule.
+- **A kernel `ETIMEDOUT` on an RPC connection is a dead connection**, not a
+  deadline of this end's (keepalive or `TCP_USER_TIMEOUT` gave up): the session
+  ends, and a serve loop reports `NotLocal` / `Lost` instead of an idle
+  eviction.
 - **`RpcServer::setup_unix_server` removes only a stale socket**: a regular
   file is refused with `AlreadyExists`, a listening socket with `EADDRINUSE`.
   Drop removes the socket file only while it is still the one bound.
@@ -176,7 +230,16 @@ This changelog starts at 0.9.0. For earlier releases, see the
   Kernel binder uses an FMQ ring the consumer allocates; RPC uses the
   `oneway` `IStreamSink` / `IStreamSource` with credits. Configured through
   `SinkPolicy` (incl. `send_timeout`) and `ReceiverPolicy`; async variants
-  with `tokio`. See the Streaming chapter of the book.
+  with `tokio`. On RPC a waiting end pings a peer it has not heard from for a
+  third of the session's reply deadline (`PingPolicy`, twoway
+  `PING_TRANSACTION`), which catches a peer lost behind a TCP relay. See the
+  Streaming chapter of the book.
+- **`rpc::EndReason::SessionEnded`**: a serve loop found its session already
+  ended — by another connection's fault, a reply deadline or `close_session`.
+- **`RpcTransport::set_liveness` and `TlsStream::set_liveness`**: the kernel's
+  peer-liveness check (keepalive, `TCP_USER_TIMEOUT`) sized to the session
+  timeout. The default is a no-op; `tcp_debug` and TLS over `TcpStream`
+  implement it, and a custom transport overrides it to take part.
 - **Work source API**: `set_calling_work_source_uid`,
   `get_calling_work_source_uid`, `clear_calling_work_source`,
   `restore_calling_work_source`, `clear_propagate_work_source` and
@@ -291,6 +354,13 @@ The behavior changes an existing program can observe are listed under
 - **`RpcSession::add_outgoing_connection_android13plus`** and both
   **`add_{outgoing,incoming}_connection_android13plus_with_config`** →
   `add_{outgoing,incoming}_connection_with_config`.
+- **`RpcClientConfig::handshake_timeout`** and
+  **`ClientOptions::handshake_timeout`** → `timeout`, which now bounds each
+  connect and handshake step. A value still set takes precedence for the
+  handshake.
+- **`rpc::EndReason::Unreadable`** and **`EndReason::Retired`** are no longer
+  produced: a connection fault ends the whole session, and a serve loop reports
+  `SessionEnded`.
 
 The deprecated items still work and delegate to the new ones; they are removed
 in the release after 0.12.0. The single-connection one-liners
@@ -299,6 +369,8 @@ in the release after 0.12.0. The single-connection one-liners
 
 ### Fixed
 
+- **RPC: a TLS or `tcp_debug` connect that hits its own deadline returns
+  `TimedOut`**, not `Unknown` (std's error for it carries no errno).
 - **RPC: dropping a proxy right after a oneway on it no longer aborts a
   libbinder peer.** The proxy's `DEC_STRONG` could go out on another
   connection than the oneway and be handled first; the peer then freed its

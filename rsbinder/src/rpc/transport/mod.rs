@@ -43,16 +43,17 @@
 //!
 //! `write_all_reporting` is `write_all` that tells a failure which put
 //! nothing on the wire apart from one that stopped part-way; `write_all`
-//! reports the same error either way. The session's send-failure rule needs
-//! the difference: a frame that stopped part-way left the peer a header it
-//! will complete out of whatever arrives next, so its connection must be
-//! retired, while a frame that never started left the stream
-//! frame-synchronized and its connection healthy. A send deadline
+//! reports the same error either way. A frame that stopped part-way left the
+//! peer a header it will complete out of whatever arrives next, while a frame
+//! that never started left the stream frame-synchronized. A send deadline
 //! (`SO_SNDTIMEO`) that expires before the first byte is therefore
 //! [`RpcError::Timeout`] (the value a read deadline that consumed nothing
 //! already yields), and every other failure, at any position, stays the
-//! transport error. The writer must report partial progress honestly, as a
-//! socket does. An adapter that hands the whole buffer to another
+//! transport error. The session ends on both (its "Failed sends" rule: the
+//! peer did not read for the whole deadline either way); the variant keeps
+//! saying which position the stream was left in. The writer must report
+//! partial progress honestly, as a socket does. An adapter that hands the
+//! whole buffer to another
 //! all-or-nothing send does not, and classifies at its own level instead:
 //! `tls` never reports this, because a record its socket write dropped is
 //! gone from the sequence whether or not a byte of it went out.
@@ -60,20 +61,28 @@
 //! `is_timeout` decides whether an I/O operation failed on a deadline this
 //! end armed: `SO_RCVTIMEO` for the framing readers, `SO_SNDTIMEO` for
 //! `write_all_reporting` and for `tls`'s teardown control flush. On the
-//! supported platforms both surface as `WouldBlock`. `TimedOut` is included
-//! because the `Read` adapters carry `RpcError::Timeout` across the
-//! `RpcError` ⇄ `io::Error` boundary with exactly that kind, and the framing
-//! readers sit on top of both. The cost is that a raw socket's own
-//! `ETIMEDOUT` (a peer whose host stopped answering, not a deadline of ours)
-//! is `TimedOut` too and cannot be told apart here; what is decided on that
-//! distinction (see [`SessionEnd::new`](super::SessionEnd)) is decided from
-//! whether a deadline was armed at all.
+//! supported platforms both surface as `EAGAIN` (`WouldBlock`), and the
+//! `Read`/`Write` adapters carry `RpcError::Timeout` across the
+//! `RpcError` ⇄ `io::Error` boundary with that same kind, so the framing
+//! readers see one kind whichever layer they sit on. `TimedOut` is not a
+//! deadline: it is the kernel's own `ETIMEDOUT`, TCP keepalive or
+//! retransmission giving up on a peer whose host stopped answering. That
+//! connection is gone, so the error stays [`RpcError::Io`], never a
+//! frame-synchronized `Timeout`. A transport of the caller's own follows the
+//! same split: `Timeout` only for a deadline of this end's that consumed
+//! nothing, any loss of the connection as another variant.
 //!
 //! # Mutation gates
 //!
 //! - `a_send_deadline_is_a_timeout_only_before_the_first_byte`: dropping the
 //!   `sent == 0` guard in `write_all_reporting` makes the second case report
-//!   `Timeout` as well, and a peer left half a frame keeps its slot.
+//!   `Timeout` as well, a frame-synchronized stream the peer was left half a
+//!   frame of.
+//! - `the_kernels_etimedout_is_a_lost_connection_not_a_deadline`: counting
+//!   `TimedOut` in `is_timeout` makes a send that failed before its
+//!   first byte and a read that consumed nothing report `Timeout`: a serve
+//!   loop with an idle deadline armed reads the kernel's drop as its own
+//!   idle expiry (`Local`, `InSync`).
 
 use std::fmt;
 use std::io::{ErrorKind, Read, Write};
@@ -146,6 +155,9 @@ pub trait RpcTransport: Send + Sync {
     /// elapses with **nothing consumed** surfaces as
     /// [`RpcError::Timeout`] (the stream stays frame-synchronized); a
     /// deadline that elapses mid-frame is [`RpcError::DeadlineMidFrame`].
+    /// Neither variant is for anything but this deadline: a connection the
+    /// platform gave up on (the kernel's `ETIMEDOUT`) is lost, and reports
+    /// as [`RpcError::Io`] or an end of stream.
     fn set_read_timeout(&self, _timeout: Option<std::time::Duration>) -> RpcResult<()> {
         Ok(())
     }
@@ -159,7 +171,93 @@ pub trait RpcTransport: Send + Sync {
     /// under [`set_max_connections`](super::server::RpcServer::set_max_connections),
     /// its admission slot) forever by stalling our blocking `write_all`
     /// once the kernel send buffer fills.
+    ///
+    /// A transport that keeps the default gives a stalled send no bound at
+    /// all. A server session counts a frame being written as activity
+    /// until the write returns
+    /// ([`set_idle_timeout`](super::server::RpcServer::set_idle_timeout)),
+    /// so its idle judgment cannot end a session stuck in such a send; a
+    /// transport handed to a server with an idle timeout implements this.
     fn set_write_timeout(&self, _timeout: Option<std::time::Duration>) -> RpcResult<()> {
+        Ok(())
+    }
+
+    /// Arm the kernel's own check that the peer's host still answers, sized
+    /// to `timeout` — the session's
+    /// [`set_timeout`](super::RpcSession::set_timeout), which calls this on
+    /// every connection. The default is a no-op: `unix`, `vsock` and `mem`
+    /// have no such check, and a caller's own transport gets the default
+    /// until it overrides this. `tcp_debug` and `tls` over TCP implement it.
+    /// This is the one place the crate states the values and what the
+    /// kernel does with them; every other document points here.
+    ///
+    /// # What is set
+    ///
+    /// - `SO_KEEPALIVE` on, whatever `timeout` is.
+    /// - With `Some(d)`: `TCP_KEEPIDLE` = `d / 2` and `TCP_KEEPINTVL` =
+    ///   `d / 6`, each in whole seconds rounded down and then held to
+    ///   1..=32767 s (the options' unit, and Linux's `MAX_TCP_KEEPIDLE` /
+    ///   `MAX_TCP_KEEPINTVL`, past which `setsockopt` fails with `EINVAL`);
+    ///   `TCP_KEEPCNT` = 3; and on Linux and Android only, `TCP_USER_TIMEOUT`
+    ///   = `d` in milliseconds, held to 1..=`i32::MAX`.
+    /// - With `None`: on Linux and Android `TCP_USER_TIMEOUT` = 0, the
+    ///   kernel default. The probe options are not touched, so after an
+    ///   earlier `Some(d)` they keep that call's values: no socket option
+    ///   restores the system's defaults.
+    ///
+    /// # Linux and Android
+    ///
+    /// Read from `net/ipv4/tcp_timer.c` (kernel `android17-6.18`):
+    ///
+    /// - **A quiet connection** (nothing unacknowledged, nothing queued):
+    ///   `tcp_keepalive_timer` sends the first probe once nothing has come
+    ///   from the peer's host for `TCP_KEEPIDLE`, then one per
+    ///   `TCP_KEEPINTVL`; any segment from the peer, a probe's ACK included,
+    ///   restarts the count. With `TCP_USER_TIMEOUT` set, `TCP_KEEPCNT` is
+    ///   ignored and the connection is reset at the first timer run that
+    ///   finds a probe out and nothing received for `TCP_USER_TIMEOUT`: for
+    ///   `Some(d)` about `d` after the host went silent, later by at most one
+    ///   interval since the check runs on the probe schedule; for a `d` under
+    ///   a second, at `TCP_KEEPIDLE + TCP_KEEPINTVL` (2 s), since both floor
+    ///   at 1 s and the first run only sends a probe. Without it the
+    ///   reset follows the `TCP_KEEPCNT`-th unanswered probe. The system
+    ///   defaults (`include/net/tcp.h`) are 7200 s, 75 s and 9 probes, so a
+    ///   `None` connection whose peer's host vanished ends after about two
+    ///   hours.
+    /// - **Data sent and not acknowledged**: keepalive does not run while
+    ///   there is any (`tcp_keepalive_timer` skips a socket with packets out
+    ///   or a non-empty write queue); retransmission does. `tcp_write_timeout`
+    ///   ends the connection once `TCP_USER_TIMEOUT` has passed since the
+    ///   oldest unacknowledged segment first went out, and
+    ///   `tcp_clamp_rto_to_user_timeout` makes the last retransmission timer
+    ///   fire at that point. With `TCP_USER_TIMEOUT` = 0 the bound is
+    ///   `net.ipv4.tcp_retries2` (15 by default, about 925 s).
+    /// - **A zero receive window**: when the peer's host answers every probe
+    ///   but keeps its window closed while this end has data queued,
+    ///   `tcp_probe_timer` ends the connection once `TCP_USER_TIMEOUT` has
+    ///   passed since the first window probe; with 0 it never does.
+    ///
+    /// The end reads and writes as `ETIMEDOUT` (or an ICMP error the socket
+    /// recorded before, such as `EHOSTUNREACH`), an [`RpcError::Io`], which
+    /// ends the session.
+    ///
+    /// # macOS
+    ///
+    /// The same keepalive options are set (`TCP_KEEPALIVE` is the idle
+    /// option's name there) and no `TCP_USER_TIMEOUT`, which the platform
+    /// lacks. How the macOS kernel acts on them is not stated here, and
+    /// unacknowledged data is left to the system's retransmission limit, not
+    /// to `d`.
+    ///
+    /// # Limits
+    ///
+    /// The session's send deadline is separate: it sets `SO_SNDTIMEO` through
+    /// [`set_write_timeout`](Self::set_write_timeout), which bounds only a
+    /// send blocked on a full send buffer, never data already accepted into
+    /// it. The probes reach only the first TCP endpoint on the path; a relay
+    /// that ends TCP (`adb forward`, `ssh -L`, a TLS terminator) answers them
+    /// itself, so a break behind it goes unnoticed here.
+    fn set_liveness(&self, _timeout: Option<std::time::Duration>) -> RpcResult<()> {
         Ok(())
     }
 
@@ -172,7 +270,7 @@ pub trait RpcTransport: Send + Sync {
     /// either way.)
     /// This is how a session ends its
     /// connections — `RpcSession::close_session`, `RpcServer::terminate`, a
-    /// slot retired after a lost stream. Required, with no default on
+    /// fault on any of its connections. Required, with no default on
     /// purpose: a transport that silently did nothing here would leave a
     /// serve loop or an incoming-connection thread parked in `recv`
     /// forever, and `RpcSession::close_session` would hang on the join. The
@@ -189,7 +287,8 @@ pub trait RpcTransport: Send + Sync {
     ///   transport's own buffer may survive (`tls`'s decrypted plaintext)
     ///   or be cleared (`unix` fd-mode clears its leftover here). A caller
     ///   that must not read what is buffered keeps that decision in
-    ///   session state — the slot's `unreadable` mark — not here. `mem`
+    ///   session state — the session's end empties the slot pool — not
+    ///   here. `mem`
     ///   models the Linux behaviour, so a hermetic test exercises the case
     ///   that hides bugs.
     /// - **A reader woken by this returns the end of stream** —
@@ -517,9 +616,58 @@ fn read_header<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
     Ok(())
 }
 
-/// `WouldBlock` or `TimedOut`: a deadline this end armed; see module doc "Short reads and writes".
+/// A deadline this end armed (`WouldBlock`; `TimedOut` is the kernel's); see module doc.
 pub(crate) fn is_timeout(e: &std::io::Error) -> bool {
-    matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+    e.kind() == ErrorKind::WouldBlock
+}
+
+/// `TCP_KEEPCNT`; `RpcTransport::set_liveness` says where it decides the verdict.
+#[cfg(any(feature = "rpc-tcp-debug", feature = "rpc-tls"))]
+const KEEPALIVE_PROBES: u32 = 3;
+
+/// Linux `MAX_TCP_KEEPIDLE` = `MAX_TCP_KEEPINTVL` (`include/net/tcp.h`); more is `EINVAL`.
+#[cfg(any(feature = "rpc-tcp-debug", feature = "rpc-tls"))]
+const MAX_KEEPALIVE_SECS: u64 = 32767;
+
+/// `TCP_KEEPIDLE` and `TCP_KEEPINTVL` for `d`, as `RpcTransport::set_liveness` states them.
+#[cfg(any(feature = "rpc-tcp-debug", feature = "rpc-tls"))]
+fn keepalive_intervals(d: std::time::Duration) -> (std::time::Duration, std::time::Duration) {
+    let secs = |n: u64| std::time::Duration::from_secs(n.clamp(1, MAX_KEEPALIVE_SECS));
+    (secs(d.as_secs() / 2), secs(d.as_secs() / 6))
+}
+
+/// `RpcTransport::set_liveness` for a TCP socket: see that method's doc for the values.
+#[cfg(any(feature = "rpc-tcp-debug", feature = "rpc-tls"))]
+pub(crate) fn tcp_liveness(
+    fd: std::os::fd::BorrowedFd<'_>,
+    timeout: Option<std::time::Duration>,
+) -> std::io::Result<()> {
+    use rustix::net::sockopt;
+    // Every option is tried after a failure too, so none is left at an earlier call's value.
+    let mut first_err: Option<std::io::Error> = None;
+    let mut apply = |r: rustix::io::Result<()>| {
+        if let Err(e) = r {
+            first_err.get_or_insert(e.into());
+        }
+    };
+    apply(sockopt::set_socket_keepalive(fd, true));
+    // 0 is the kernel default; a positive deadline is at least 1 ms; the kernel reads an `int`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    apply(sockopt::set_tcp_user_timeout(
+        fd,
+        timeout.map_or(0, |d| {
+            u32::try_from(d.as_millis())
+                .unwrap_or(u32::MAX)
+                .clamp(1, i32::MAX as u32)
+        }),
+    ));
+    if let Some(d) = timeout {
+        let (idle, interval) = keepalive_intervals(d);
+        apply(sockopt::set_tcp_keepidle(fd, idle));
+        apply(sockopt::set_tcp_keepintvl(fd, interval));
+        apply(sockopt::set_tcp_keepcnt(fd, KEEPALIVE_PROBES));
+    }
+    first_err.map_or(Ok(()), Err)
 }
 
 /// Socket `shutdown` result, absorbing macOS's `ENOTCONN` on a second call (trait: idempotent).
@@ -670,7 +818,7 @@ mod tests {
         ));
     }
 
-    /// `Timeout` (connection kept) only while nothing went out; see module doc "Mutation gates".
+    /// `Timeout` (stream in step) only while nothing went out; see module doc "Mutation gates".
     #[test]
     fn a_send_deadline_is_a_timeout_only_before_the_first_byte() {
         struct Stall(usize);
@@ -700,6 +848,94 @@ mod tests {
             "a deadline past the first byte left a partial frame on the wire"
         );
         assert!(write_all_reporting(&mut Stall(5), b"frame").is_ok());
+    }
+
+    /// `tcp_liveness`'s socket options, read back with `getsockopt`.
+    #[cfg(any(feature = "rpc-tcp-debug", feature = "rpc-tls"))]
+    #[test]
+    fn tcp_liveness_sizes_keepalive_to_the_timeout() {
+        use rustix::net::sockopt;
+        use std::os::fd::AsFd;
+        use std::time::Duration;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let stream = std::net::TcpStream::connect(listener.local_addr().unwrap()).expect("connect");
+        let fd = stream.as_fd();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let user_timeout = || sockopt::tcp_user_timeout(fd).expect("TCP_USER_TIMEOUT");
+
+        tcp_liveness(fd, None).expect("no timeout");
+        assert!(
+            sockopt::socket_keepalive(fd).unwrap(),
+            "keepalive is on with no timeout"
+        );
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert_eq!(user_timeout(), 0, "the kernel default");
+
+        tcp_liveness(fd, Some(Duration::from_secs(12))).expect("12 s");
+        assert_eq!(sockopt::tcp_keepidle(fd).unwrap(), Duration::from_secs(6));
+        assert_eq!(sockopt::tcp_keepintvl(fd).unwrap(), Duration::from_secs(2));
+        assert_eq!(sockopt::tcp_keepcnt(fd).unwrap(), KEEPALIVE_PROBES);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert_eq!(user_timeout(), 12_000);
+
+        // Under two seconds the intervals floor at the socket option's one-second unit.
+        tcp_liveness(fd, Some(Duration::from_millis(1500))).expect("1.5 s");
+        assert_eq!(sockopt::tcp_keepidle(fd).unwrap(), Duration::from_secs(1));
+        assert_eq!(sockopt::tcp_keepintvl(fd).unwrap(), Duration::from_secs(1));
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert_eq!(user_timeout(), 1_500);
+
+        // Past the kernel's caps each value saturates, rather than failing and keeping the last.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let month = Duration::from_secs(30 * 24 * 3600);
+            tcp_liveness(fd, Some(month)).expect("30 days");
+            let cap = Duration::from_secs(MAX_KEEPALIVE_SECS);
+            assert_eq!(sockopt::tcp_keepidle(fd).unwrap(), cap);
+            assert_eq!(sockopt::tcp_keepintvl(fd).unwrap(), cap);
+            assert_eq!(user_timeout(), i32::MAX as u32);
+        }
+
+        tcp_liveness(fd, None).expect("back to none");
+        assert!(sockopt::socket_keepalive(fd).unwrap());
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert_eq!(
+            user_timeout(),
+            0,
+            "None turns TCP_USER_TIMEOUT back to the default"
+        );
+    }
+
+    /// `ETIMEDOUT` fails as `Io`, a read deadline as `Timeout`; see module doc "Mutation gates".
+    #[test]
+    fn the_kernels_etimedout_is_a_lost_connection_not_a_deadline() {
+        struct Fails(ErrorKind);
+        impl Read for Fails {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(self.0.into())
+            }
+        }
+        impl Write for Fails {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(self.0.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let lost =
+            |r: RpcResult<_>| matches!(r, Err(RpcError::Io(e)) if e.kind() == ErrorKind::TimedOut);
+
+        let mut dead = Fails(ErrorKind::TimedOut);
+        assert!(
+            lost(write_all_reporting(&mut dead, b"frame")),
+            "nothing went out, yet the connection is gone"
+        );
+        assert!(lost(read_frame(&mut dead).map(drop)));
+        assert!(matches!(
+            read_frame(&mut Fails(ErrorKind::WouldBlock)),
+            Err(RpcError::Timeout)
+        ));
     }
 
     #[test]

@@ -447,8 +447,9 @@ Wrapping a non-idempotent call in a timeout and treating expiry as "it did not h
 therefore wrong. The blocking thread stays occupied until the reply arrives, so repeated
 timeouts against an unresponsive server fill the `spawn_blocking` pool (512 threads by
 default). Cap it with `Builder::max_blocking_threads`, and bound the wait at the source:
-over RPC, `RpcServer::set_reply_timeout` and the session read deadline. Kernel binder has
-no such bound.
+over RPC, the session timeout (`RpcSession::set_timeout` or `ClientOptions::timeout`,
+`RpcServer::set_reply_timeout` on a server), whose expiry ends the whole session — see
+[Timeouts](./rpc-transport.md#timeouts). Kernel binder has no such bound.
 
 ### A call made inside a handler runs inline
 

@@ -212,6 +212,7 @@ ignored. `Receiver::new` and `Sink::open` take the defaults.
 | `SinkPolicy::send_timeout` | both | `None` | How long one `send`/`send_all`/`flush`/`end` call (or `*_async` future, from its first poll) may wait for ring room or credit before it returns `TimedOut`; the item is not written or queued and the stream stays usable. `Some(Duration::ZERO)` never waits. It does not bound the RPC session's own send deadline |
 | `ReceiverPolicy::credit_window` | RPC | 4 | The consumer's grant threshold: a grant leaves once half of it is owed |
 | `ReceiverPolicy::max_opening` | RPC | 4 | The widest opening window the consumer accepts |
+| `SinkPolicy::ping`, `ReceiverPolicy::ping` | RPC | `Inherit` | Whether a wait that hears nothing from the other end pings it; see [a peer that goes silent](#a-peer-that-goes-silent) |
 
 **On the ring** the ring's size is everything: the producer can be ahead of the
 consumer by at most `ring_bytes` of records, and it waits for room beyond
@@ -338,6 +339,36 @@ already received — is the end the stream reports, not `DeadObject`. Once the
 producer knows the consumer is dead, every `send` returns `DeadObject` at once
 without taking the item, on both paths, and so does `end`.
 
+### A peer that goes silent
+
+Over RPC the session has to notice the loss first. It does when a connection
+fails, when the peer's host stops acknowledging (TCP keepalive — see
+[Timeouts](./rpc-transport.md#timeouts)), or when a reply is overdue, and a
+waiting stream has no reply outstanding: every stream method is `oneway`.
+Behind a relay that terminates TCP (`adb forward`, `ssh -L`) a peer can vanish
+with none of the three happening, and the stream would wait for good; vsock
+has no keepalive either.
+
+So a waiting end pings. When a `recv`, or a producer's wait for credit, has
+been woken by nothing for a third of the session's reply deadline, it sends
+the other end a `PING_TRANSACTION` — the twoway every binder object answers,
+so a C++ or NDK peer needs no code for it — and waits again once it is
+answered. The consumer pings the producer's `IStreamSource` once `onStart` has
+named it, the producer pings the sink. An unanswered ping ends the session
+through the reply deadline, like any unanswered call, and the stream then ends
+with `DeadObject` through its death link: a peer that vanished is noticed
+within about four thirds of the deadline. A stream whose items flow never
+pings.
+
+The deadline is the session's: `RpcSession::set_timeout` or
+`ClientOptions::timeout` on a client, `RpcServer::set_reply_timeout` or
+`ServeOptions::reply_timeout` on a server. A session without one — the
+default — never pings, and `PingPolicy::Off` in either policy turns it off for
+that end. The ping is not counted against `recv_timeout` or `send_timeout`, so
+a call whose peer stops answering returns later than its own bound, by up to
+the deadline. An `*_async` wait that may ping waits on the blocking pool (see
+below).
+
 ## Async
 
 Both ends have `tokio` counterparts, behind the default `tokio` feature. Each
@@ -360,7 +391,9 @@ while let Some(line) = lines.recv_async().await {
 
 The producer uses `send_async`, `flush_async`, `end_async` and `end_with_async`
 from a task. Waiting for the consumer suspends the task instead of parking a
-thread:
+thread — except a wait that may [ping](#a-peer-that-goes-silent) or has a
+`send_timeout`, which holds a pool thread while it lasts, as does a
+`recv_async` that may ping: there is no timer to suspend a task against.
 
 ```rust
 let mut sink = Sink::<LogLine>::open(endpoint)?;
@@ -417,8 +450,8 @@ incoming connections has to be ended explicitly, with
 `client.session().unwrap().close_session()`: its serving threads keep it
 alive after every handle is dropped.
 
-One more thing to size: the consumer's grants go out on the session's *outgoing*
-connections, and a grant waits for a free one. A client that keeps its only
+One more thing to size: the consumer's grants, and both ends' pings, go out on
+the session's *outgoing* connections, and each waits for a free one. A client that keeps its only
 outgoing connection busy with a long `twoway` call delays its own grants for that
 long; give such a client a second one with `outgoing_connections`.
 

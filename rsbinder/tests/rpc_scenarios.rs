@@ -19,8 +19,8 @@
 //! - `alwaysGiveMeTheSameBinder` /
 //!   `SameBinderEquality`           → `same_binder_returned_twice_is_equal`
 //! - `OnewayCallDoesNotWait`        → `oneway_call_does_not_wait_for_handler`
-//! - (rsbinder) a nested call that times out must not desync the
-//!   connection → `late_reply_of_a_timed_out_nested_call_is_skipped`
+//! - (rsbinder) a nested call that times out ends the session instead of
+//!   desyncing the connection → `a_nested_calls_reply_timeout_ends_the_session`
 //!
 //! # Mutation gates
 //!
@@ -28,9 +28,9 @@
 //!   out of scope before the reply is sent; the reply parcel pins it (`write_binder`) so its
 //!   `DEC_STRONG` follows the reply instead of overtaking it. Without the pin the client frees
 //!   the node before the address comes back and mints a fresh proxy for its own object.
-//! - `late_reply_of_a_timed_out_nested_call_is_skipped`: the nested call cannot retire the
-//!   slot (the outer frame owns it), so without the skip the late reply would be taken for the
-//!   outer call's reply.
+//! - `a_nested_calls_reply_timeout_ends_the_session`: drop the `fail_session` from
+//!   `client_transact`'s reply-wait failure and the session outlives the nested timeout, so
+//!   the outer call ends with `TimedOut`, not `DeadObject`.
 
 #![cfg(feature = "rpc")]
 
@@ -515,12 +515,11 @@ fn oneway_call_does_not_wait_for_handler() {
     );
 }
 
-/// A timed-out nested call's late reply is skipped; outer reply and connection stay intact.
+/// A nested call's reply timeout ends the session: it gets `TimedOut`, the rest `DeadObject`.
 #[test]
-fn late_reply_of_a_timed_out_nested_call_is_skipped() {
+fn a_nested_calls_reply_timeout_ends_the_session() {
     let b = boot("stale");
-    // Deadline re-arms after the nested timeout: needs `timeout < slow_ms < 2 * timeout`.
-    b.client.set_timeout(Some(Duration::from_millis(1000)));
+    b.client.set_timeout(Some(Duration::from_millis(500)));
     let nested = Arc::new(Mutex::new(Vec::new()));
     let cb: SIBinder = Interface::as_binder(&Binder::new(BnNestingCallback {
         target: ScenarioProxy(b.proxy.0.clone()),
@@ -528,20 +527,17 @@ fn late_reply_of_a_timed_out_nested_call_is_skipped() {
         nested: Arc::clone(&nested),
     }));
 
-    let got = b
-        .proxy
-        .call_cb(&cb, "hello")
-        .expect("outer call survives the nested call's timeout");
-    assert_eq!(got, "cb:hello");
+    // The handler's reply finds the session gone, so the outer call ends with it.
+    let outer = b.proxy.call_cb(&cb, "hello");
+    assert_eq!(outer, Err(StatusCode::DeadObject));
     assert_eq!(
         nested.lock().unwrap().as_slice(),
         &[Err(StatusCode::TimedOut)],
-        "the nested call timed out exactly once"
+        "the nested call gets its own deadline's code"
     );
     assert_eq!(
-        b.proxy
-            .big_echo(b"again")
-            .expect("connection still in sync"),
-        b"again"
+        b.proxy.big_echo(b"again"),
+        Err(StatusCode::DeadObject),
+        "the session is over, not resynchronized"
     );
 }

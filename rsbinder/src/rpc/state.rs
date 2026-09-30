@@ -582,8 +582,10 @@ impl RpcState {
     /// transaction that consumed it fails to send. The peer's receive-side
     /// counter expects a contiguous sequence, so a consumed-but-never-sent
     /// number leaves a permanent gap that parks every later oneway to `addr`
-    /// in the peer's `async_todo` (rsbinder, unlike AOSP, does not tear the
-    /// session down on a send failure). Unlike the strong-count rollback this
+    /// in the peer's `async_todo`. A transport failure ends the session
+    /// anyway (`session` module doc "Failed sends", as AOSP), so the rollback
+    /// matters for a send refused before any byte — a codec error — after
+    /// which the session goes on. Unlike the strong-count rollback this
     /// is an *ordering* sequence, so only roll back when we were the last
     /// consumer (`counter == consumed + 1`); if another thread already reserved
     /// the next number, rolling back would hand it out twice, so we leave the

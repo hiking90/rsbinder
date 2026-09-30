@@ -283,6 +283,15 @@ jobs:
           cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_tls --test rpc_transport_conformance
           t cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_server -- --exact tls_android13plus_nested_callback_e2e
           t cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_server -- --exact preconnected_inet_fd_handshakes_over_tcp_debug
+      - name: TCP links cut inside a network namespace (plan 2-24 §5.2)
+        # `rpc_link_break` reruns itself under `unshare -rn` and drops a
+        # port's packets with `nft`, so that keepalive and TCP_USER_TIMEOUT
+        # really fire. Ubuntu 24.04 keeps unprivileged user namespaces behind
+        # an AppArmor switch; REQUIRED turns a skip into a failure here.
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          command -v nft >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq nftables; }
+          RSB_LINK_BREAK_REQUIRED=1 cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_link_break -- --nocapture
       - name: RPC accessor (hermetic, requires android_16 — gap-fill)
         # `rpc_accessor.rs` is `#![cfg(all(feature = "rpc", feature =
         # "android_16"))]`; without `android_16` the file compiles to

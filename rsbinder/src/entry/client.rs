@@ -38,11 +38,11 @@ pub struct ClientOptions {
     /// Setting this `> 0` makes the resulting [`Client`] one that must be
     /// shut down explicitly (`client.session().unwrap().close_session()`):
     /// the serving threads keep the session alive, so dropping every
-    /// handle reclaims nothing. It also makes the loss of the last such
-    /// connection this session's death — including a connection the
-    /// server retires on its own reply timeout, which closes the
-    /// founding connection and fires `binder_died` on every proxy while
-    /// the peer is still up. See
+    /// handle reclaims nothing. Like every connection of the session, the
+    /// loss of one ends the whole session — including the server's own
+    /// reply timeout elapsing on a slow callback handler, which closes the
+    /// founding connection and fires `binder_died` on every proxy although
+    /// the handler was only slow. See
     // The target only exists with `rpc`, so only link it then.
     #[cfg_attr(
         feature = "rpc",
@@ -59,52 +59,45 @@ pub struct ClientOptions {
     /// [`Endpoint::supports_fd_passing`].
     #[cfg(feature = "rpc")]
     pub fd_mode: Option<crate::rpc::FileDescriptorTransportMode>,
-    /// RPC: reply deadline (`RpcSession::set_timeout`). Applied to the
-    /// session as soon as it exists, so besides the calls made
-    /// afterwards it bounds the round trips `open` makes *after* that
-    /// point: the r34 fd-mode negotiation, and the `GET_MAX_THREADS` /
-    /// `GET_SESSION_ID` exchanges a multi-connection setup needs.
+    /// RPC: how long the server may go without answering before this end
+    /// counts it as broken (`RpcSession::set_timeout`, plan 2-24 D4 and D6).
     ///
-    /// It does **not** bound the connection handshake, which runs before
-    /// the session exists — use
-    // The target only exists with `rpc`, so only link it then.
-    #[cfg_attr(
-        feature = "rpc",
-        doc = "[`handshake_timeout`](Self::handshake_timeout) for that phase."
-    )]
-    #[cfg_attr(
-        not(feature = "rpc"),
-        doc = "`handshake_timeout` (`rpc` feature) for that phase."
-    )]
-    pub timeout: Option<Duration>,
-    /// RPC: deadline for the connection **handshake** — the phase
-    /// [`timeout`](Self::timeout) cannot reach, because it runs before the
-    /// session exists. Covers `tls://`'s `connect(2)` and TLS handshake,
-    /// and the android-13+ session handshake, on the founding connection
-    /// and on every fan-out or incoming attach. The r34 wire (no
-    /// `?profile=`) has no such phase at all, so on a plain r34 endpoint
-    /// the option does not apply and `open` refuses it with
-    /// [`StatusCode::BadValue`](crate::StatusCode::BadValue) rather than
-    /// ignore it.
+    /// - **Connecting**: it bounds each blocking step of connecting — one
+    ///   `connect(2)` per address the founding connection tries (`tls://`),
+    ///   the TLS handshake, then each read and write of the
+    ///   android-13+ handshake — on the founding connection and on every
+    ///   fan-out or incoming attach. It is not a budget for the phase as a
+    ///   whole, so `open` can take a multiple of it before returning; what
+    ///   it guarantees is that no single step waits on a silent peer
+    ///   forever. Two steps are out of its reach: resolving the host name,
+    ///   which blocks in the platform's resolver, and on Linux and Android a
+    ///   `unix://` or `unix-abstract://` connect into a listener whose
+    ///   accept queue is full, which waits until the server accepts.
+    /// - **The session**: applied as soon as the session exists, so it also
+    ///   bounds the round trips `open` makes after that point (the r34
+    ///   fd-mode negotiation, the `GET_MAX_THREADS` / `GET_SESSION_ID`
+    ///   exchanges a multi-connection setup needs), and then every reply
+    ///   wait, send and liveness check. An expired reply wait ends the
+    ///   session.
     ///
-    /// It bounds each blocking step of that phase — one `connect(2)` per
-    /// address the founding connection tries, then each handshake read and
-    /// write — and is not a budget for the phase as a whole, so `open` can take a
-    /// multiple of it before returning. What it guarantees is that no
-    /// single step waits on a silent peer forever. Resolving the host name
-    /// is the one step it cannot reach: that blocks in the platform's
-    /// resolver, which takes no deadline from here.
-    ///
-    /// `None` (default) blocks forever, so a peer that accepts the socket
+    /// `None` (default) waits forever, so a peer that accepts the socket
     /// and then writes nothing hangs `open`. Set it whenever the peer is
-    /// untrusted or merely unreliable. This is the client-side counterpart
-    /// of [`ServeOptions::handshake_timeout`](super::ServeOptions::handshake_timeout).
-    ///
-    /// `Some(Duration::ZERO)` is not a deadline and `open` refuses it with
-    /// [`StatusCode::BadValue`](crate::StatusCode::BadValue) rather than
-    /// silently dropping the bound; use `None` to wait indefinitely on
-    /// purpose.
+    /// untrusted or merely unreliable. `Some(Duration::ZERO)` is no
+    /// deadline either, as `RpcSession::set_timeout` treats it; unlike the
+    /// deprecated `handshake_timeout` (`rpc` feature), `open` does not
+    /// refuse it.
+    pub timeout: Option<Duration>,
+    /// RPC: deadline for the connection **handshake**, in place of
+    /// [`timeout`](Self::timeout) for that phase. The r34 wire (no
+    /// `?profile=`) has no handshake, so on a plain r34 endpoint other than
+    /// `tls://` `open` refuses it with
+    /// [`StatusCode::BadValue`](crate::StatusCode::BadValue), and it
+    /// refuses `Some(Duration::ZERO)` the same way.
     #[cfg(feature = "rpc")]
+    #[deprecated(
+        since = "0.12.0",
+        note = "`timeout` bounds each connect and handshake step too; set it instead (plan 2-24 D6)"
+    )]
     pub handshake_timeout: Option<Duration>,
     /// Kernel: `?driver=` equivalent. The device is fixed process-wide by
     /// whoever initializes `ProcessState` first, so a *different* path here
@@ -160,6 +153,7 @@ impl std::fmt::Debug for Client {
 }
 
 impl std::fmt::Debug for ClientOptions {
+    #[allow(deprecated)] // Shows `handshake_timeout` while it is still honored.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut d = f.debug_struct("ClientOptions");
         #[cfg(feature = "rpc-tls")]
@@ -202,6 +196,7 @@ fn one_source<T: PartialEq + std::fmt::Debug>(
     }
 }
 
+#[allow(deprecated)] // Refuses `handshake_timeout` where it does not apply, while it is honored.
 pub(super) fn new_client(uri: Uri, o: ClientOptions) -> Result<Client> {
     if uri.service.is_some() {
         log::error!(
@@ -281,6 +276,7 @@ pub(super) fn new_client(uri: Uri, o: ClientOptions) -> Result<Client> {
 }
 
 #[cfg(feature = "rpc")]
+#[allow(deprecated)] // Forwards `handshake_timeout` to the config's own deprecated setter.
 fn rpc_connect(uri: &Uri, o: &ClientOptions) -> Result<crate::rpc::RpcSession> {
     #[cfg(feature = "rpc-tls")]
     let reject_option = |what: &str, endpoint: &Endpoint| {

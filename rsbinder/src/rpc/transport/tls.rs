@@ -90,17 +90,20 @@
 //! rather than a `std` `Mutex` because it needs this bounded acquire.
 //!
 //! On the read side, a `flush_control` failure after `shut` is set reads as
-//! the end of stream: `shutdown` breaks the write half on purpose, and the
-//! trait promises a reader it wakes sees the end, never a distinct "shut
-//! down locally" error. The bounded `close_notify` write can also expire
-//! between setting the flag and the cut; with no deadline of ours armed that
-//! timeout would read as the kernel's and end the session as a lost stream,
-//! so it too becomes `EndOfStream`. Without `shut`, a failed control flush
-//! means the outbound half is lost — those records left rustls before the
-//! write, and a write stopped part-way (a send deadline on a full socket
-//! buffer) left the peer a truncated record it decrypts nothing after — so
-//! it surfaces as `UncleanEndOfStream`, never as a boundary-preserving error
-//! that would keep the connection in the pool.
+//! the end of stream when the shutdown explains it: `shutdown` breaks the
+//! write half on purpose (`EPIPE`), and the trait promises a reader it wakes
+//! sees the end, never a distinct "shut down locally" error. The bounded
+//! `close_notify` write can also expire (`EAGAIN`) between setting the flag
+//! and the cut; left as it is, the loop would take that `Timeout` for its own
+//! read deadline — an idle eviction with one armed, a lost stream without —
+//! so it too becomes `EndOfStream`. A failure the shutdown does not explain
+//! — a connection the kernel gave up on (`ETIMEDOUT`) — stays a lost stream.
+//! Without `shut`, a failed control flush means the outbound half is lost —
+//! those records left rustls before the write, and a write stopped part-way
+//! (a send deadline on a full socket buffer) left the peer a truncated record
+//! it decrypts nothing after — so it surfaces as `UncleanEndOfStream`, never
+//! as a boundary-preserving error that the session would treat as a deadline
+//! of its own.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -208,6 +211,13 @@ pub trait TlsStream: Send + Sync {
     /// Shut the underlying stream down in both directions (wakes a
     /// blocked `read`).
     fn shutdown_stream(&self) -> std::io::Result<()>;
+    /// The stream's own peer-liveness check, as
+    /// [`RpcTransport::set_liveness`] describes it. The default is a
+    /// no-op; `TcpStream` implements it, since keepalive and
+    /// `TCP_USER_TIMEOUT` are TCP options.
+    fn set_liveness(&self, _t: Option<Duration>) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 // std streams implement `Read`/`Write` for `&Stream`, so `&self` forwards with no lock.
@@ -229,6 +239,10 @@ impl TlsStream for TcpStream {
     }
     fn shutdown_stream(&self) -> std::io::Result<()> {
         TcpStream::shutdown(self, std::net::Shutdown::Both)
+    }
+    fn set_liveness(&self, t: Option<Duration>) -> std::io::Result<()> {
+        use std::os::fd::AsFd;
+        super::tcp_liveness(self.as_fd(), t)
     }
 }
 
@@ -573,7 +587,7 @@ impl RpcTransport for TlsTransport {
                     let deadline = matches!(&e, RpcError::Io(io) if super::is_timeout(io));
                     return Err(if deadline { RpcError::EndOfStream } else { e });
                 }
-                // Outbound half lost: a boundary-preserving error would keep this conn pooled.
+                // Outbound half lost: a boundary-preserving error would read as our own deadline.
                 log::warn!(
                     "TLS control flush failed, outbound half lost: {e} ({})",
                     self.desc
@@ -600,6 +614,11 @@ impl RpcTransport for TlsTransport {
 
     fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> RpcResult<()> {
         self.stream.set_write_timeout(timeout)?;
+        Ok(())
+    }
+
+    fn set_liveness(&self, timeout: Option<std::time::Duration>) -> RpcResult<()> {
+        self.stream.set_liveness(timeout)?;
         Ok(())
     }
 
@@ -636,8 +655,8 @@ impl Read for RawIo<'_> {
             Ok(n) => Ok(n),
             // Keep the io kind so `read_header` handles timeouts and clean close as R34 does.
             Err(RpcError::Io(e)) => Err(e),
-            // Keep `TimedOut` so `read_header`'s `is_timeout` fires (`DeadlineMidFrame` split).
-            Err(RpcError::Timeout) => Err(std::io::ErrorKind::TimedOut.into()),
+            // `EAGAIN`'s kind, so `read_header`'s `is_timeout` fires (`DeadlineMidFrame` split).
+            Err(RpcError::Timeout) => Err(std::io::ErrorKind::WouldBlock.into()),
             Err(RpcError::EndOfStream) => Ok(0),
             // Carried as the payload so `From<io::Error>` hands it back past `read_header`.
             Err(e @ RpcError::UncleanEndOfStream) => Err(std::io::Error::from(e)),

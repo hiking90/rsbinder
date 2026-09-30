@@ -23,6 +23,14 @@
 #       sends 20000 items on the credit rsbinder grants
 #   R7  upload: the C++ producer is killed; the service's receiver ends
 #       with DeadObject
+#   R8a stream ping (plan 2-24 D9), server reply deadline 1 s: the producer
+#       parked for credit pings the C++ sink every third of it, libbinder
+#       answers `PING_TRANSACTION`, and the producer is still parked after
+#       five seconds
+#   R8b the same with the C++ consumer stopped (SIGSTOP): its socket still
+#       takes the ping, nothing answers, the session ends on the deadline
+#       and the producer ends with DeadObject. Without the ping it would
+#       wait for good, so R8b is what shows R8a's pings were sent
 #
 # Prereqs:
 #   * a booted AVD (AOSP `default` or google_apis, rootable), SDK >= 34
@@ -153,9 +161,9 @@ cleanup() {
 trap cleanup EXIT
 stop_all
 
-start_server() {
+start_server() {   # [replyTimeoutMs]
     "${ADB[@]}" shell "rm -f $RS_LOG $SOCK" >/dev/null 2>&1 || true
-    "${ADB[@]}" shell "$DEV_DIR/stream_probe serve-rpc $SOCK > $RS_LOG 2>&1" &
+    "${ADB[@]}" shell "$DEV_DIR/stream_probe serve-rpc $SOCK ${1:-} > $RS_LOG 2>&1" &
     for _ in $(seq 1 20); do
         if "${ADB[@]}" shell "grep -c '^SERVING' $RS_LOG 2>/dev/null" | tr -d '\r' | grep -qv '^0$'; then
             return 0
@@ -227,6 +235,43 @@ if start_server; then
     judge "$(killed_run orphan stream_probe | grep -v '^READY')" \
         "RESULT orphan [1-9][0-9]* linked=1 died=1 ended=0 stalled=0" \
         "R4 download: the rsbinder server killed; the C++ consumer's death link on the source fired"
+fi
+
+# `hang 4` in the background until READY: the producer is then parked for credit.
+start_hang() {
+    local out="$WORK/hang.out"
+    rm -f "$out"
+    { $CALL_TIMEOUT "${ADB[@]}" shell "$DEV_DIR/stream_rpc_interop $SOCK hang 4 2>&1" || true; } > "$out" &
+    HANG_PID=$!
+    for _ in $(seq 1 20); do grep -q '^READY' "$out" 2>/dev/null && break; sleep 0.5; done
+}
+end_hang() {
+    "${ADB[@]}" shell "kill -9 \$(pidof stream_rpc_interop)" >/dev/null 2>&1 || true
+    wait "$HANG_PID" || true
+}
+
+# The service's counters are per process, so each case gets a server of its own.
+PING_MS=1000
+echo
+echo "=== the stream ping against a libbinder peer (reply deadline $PING_MS ms)"
+stop_all
+if start_server "$PING_MS"; then
+    start_hang
+    # Past four thirds of the deadline three times over: an unanswered ping would have ended it.
+    sleep 5
+    judge "$(run status)" \
+        "RESULT status sent=[0-9]+ finished=0 error=0 .*" \
+        "R8a ping: libbinder answers the parked producer's pings; the stream is alive after 5 s"
+    end_hang
+fi
+stop_all
+if start_server "$PING_MS"; then
+    start_hang
+    "${ADB[@]}" shell "kill -STOP \$(pidof stream_rpc_interop)" >/dev/null 2>&1 || true
+    judge "$(status_until finished 1)" \
+        "RESULT status sent=[0-9]+ finished=1 error=-32 .*" \
+        "R8b ping: a stopped C++ consumer leaves the ping unanswered; the producer ended with DeadObject"
+    end_hang
 fi
 
 echo
