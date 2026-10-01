@@ -200,7 +200,8 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 - **Generic parcelables** (`rsbinder-aidl`): `parcelable Foo<T, U> { … }`
   generates `pub struct Foo<T, U>` with a `_phantom_T: PhantomData` field per
-  parameter, as AOSP does. Parameter requirements
+  parameter, as AOSP does; its `Default` and `Debug` put no bound on the
+  parameters (AOSP derives `Debug`, which requires `T: Debug`). Parameter requirements
   (`MQDescriptor<@FixedSize T, Flavor>`) are checked at each use site; shapes
   with no Rust or AOSP form (a field typed as a parameter, a generic `union`,
   reserved names, …) are rejected. `impl_{serialize,deserialize}_for_parcelable!`
@@ -225,8 +226,15 @@ This changelog starts at 0.9.0. For earlier releases, see the
   `rsbs_*`), with C++ templates for the NDK `MQDescriptor` and
   `StreamEndpoint`.
 - **Streaming with back-pressure** (`rsbinder::stream`): `Sink<T>` and
-  `Receiver<T>`. `Receiver::new(&peer)` yields a `StreamEndpoint` passed in
-  the call that opens the stream; the service calls `Sink::open(&endpoint)`.
+  `Receiver<T>`. `Receiver::new(&peer)` yields a `StreamEndpoint<T>` passed
+  in the call that opens the stream; the service calls `Sink::open(&endpoint)`.
+  The `.aidl` names the item type as the endpoint's type argument
+  (`in StreamEndpoint<LogLine>`), so a consumer or producer of another type
+  does not compile; the argument is not on the wire, and
+  `StreamEndpoint::cast` lets a Rust end use a type of its own that encodes
+  alike (a handler holding `&StreamEndpoint<T>` casts
+  `endpoint.try_clone()?`). `Sink::open_borrowed` opens a sink of the item
+  type's borrowed form — `Sink<str>` from a `StreamEndpoint<String>`.
   Kernel binder uses an FMQ ring the consumer allocates; RPC uses the
   `oneway` `IStreamSink` / `IStreamSource` with credits. Configured through
   `SinkPolicy` (incl. `send_timeout`) and `ReceiverPolicy`; async variants

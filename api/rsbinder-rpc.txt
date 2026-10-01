@@ -3950,14 +3950,14 @@ pub struct rsbinder::stream::Receiver<T>
 impl<T: rsbinder::Deserialize> rsbinder::stream::Receiver<T>
 pub fn rsbinder::stream::Receiver<T>::cancel(&self) -> rsbinder::Result<()>
 pub fn rsbinder::stream::Receiver<T>::end_status(&self) -> core::option::Option<rsbinder::Status>
-pub fn rsbinder::stream::Receiver<T>::endpoint(&self) -> rsbinder::Result<rsbinder::stream::StreamEndpoint>
+pub fn rsbinder::stream::Receiver<T>::endpoint(&self) -> rsbinder::Result<rsbinder::stream::StreamEndpoint<T>>
 pub fn rsbinder::stream::Receiver<T>::is_finished(&self) -> bool
-pub fn rsbinder::stream::Receiver<T>::new(&rsbinder::SIBinder) -> rsbinder::Result<(Self, rsbinder::stream::StreamEndpoint)>
+pub fn rsbinder::stream::Receiver<T>::new(&rsbinder::SIBinder) -> rsbinder::Result<(Self, rsbinder::stream::StreamEndpoint<T>)>
 pub fn rsbinder::stream::Receiver<T>::recv(&mut self) -> core::option::Option<rsbinder::BinderResult<T>>
 pub async fn rsbinder::stream::Receiver<T>::recv_async(&mut self) -> core::option::Option<rsbinder::BinderResult<T>>
 pub fn rsbinder::stream::Receiver<T>::recv_timeout(&mut self, core::time::Duration) -> rsbinder::BinderResult<core::option::Option<T>>
 pub fn rsbinder::stream::Receiver<T>::try_recv(&mut self) -> rsbinder::BinderResult<core::option::Option<T>>
-pub fn rsbinder::stream::Receiver<T>::with_policy(&rsbinder::SIBinder, &rsbinder::stream::ReceiverPolicy) -> rsbinder::Result<(Self, rsbinder::stream::StreamEndpoint)>
+pub fn rsbinder::stream::Receiver<T>::with_policy(&rsbinder::SIBinder, &rsbinder::stream::ReceiverPolicy) -> rsbinder::Result<(Self, rsbinder::stream::StreamEndpoint<T>)>
 impl<T: rsbinder::Deserialize> core::iter::traits::iterator::Iterator for rsbinder::stream::Receiver<T>
 pub type rsbinder::stream::Receiver<T>::Item = core::result::Result<T, rsbinder::Status>
 pub fn rsbinder::stream::Receiver<T>::next(&mut self) -> core::option::Option<Self::Item>
@@ -4005,11 +4005,13 @@ pub fn rsbinder::stream::Sink<T>::end_with(self, &rsbinder::Status) -> rsbinder:
 pub async fn rsbinder::stream::Sink<T>::end_with_async(self, &rsbinder::Status) -> rsbinder::Result<()>
 pub fn rsbinder::stream::Sink<T>::flush(&mut self) -> rsbinder::Result<()>
 pub async fn rsbinder::stream::Sink<T>::flush_async(&mut self) -> rsbinder::Result<()>
-pub fn rsbinder::stream::Sink<T>::open(&rsbinder::stream::StreamEndpoint) -> rsbinder::Result<Self>
-pub fn rsbinder::stream::Sink<T>::open_with(&rsbinder::stream::StreamEndpoint, &rsbinder::stream::SinkPolicy) -> rsbinder::Result<Self>
+pub fn rsbinder::stream::Sink<T>::open_borrowed<E: core::borrow::Borrow<T>>(&rsbinder::stream::StreamEndpoint<E>, &rsbinder::stream::SinkPolicy) -> rsbinder::Result<Self>
 pub fn rsbinder::stream::Sink<T>::send(&mut self, &T) -> rsbinder::Result<()>
 pub fn rsbinder::stream::Sink<T>::send_all<'a, I>(&mut self, I) -> rsbinder::Result<()> where I: core::iter::traits::collect::IntoIterator<Item = &'a T>, T: 'a
 pub fn rsbinder::stream::Sink<T>::send_async(&mut self, &T) -> impl core::future::future::Future<Output = rsbinder::Result<()>> + core::marker::Send + '_
+impl<T: rsbinder::Serialize> rsbinder::stream::Sink<T>
+pub fn rsbinder::stream::Sink<T>::open(&rsbinder::stream::StreamEndpoint<T>) -> rsbinder::Result<Self>
+pub fn rsbinder::stream::Sink<T>::open_with(&rsbinder::stream::StreamEndpoint<T>, &rsbinder::stream::SinkPolicy) -> rsbinder::Result<Self>
 impl<T: ?core::marker::Sized> core::fmt::Debug for rsbinder::stream::Sink<T>
 pub fn rsbinder::stream::Sink<T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<T> core::marker::Freeze for rsbinder::stream::Sink<T> where T: ?core::marker::Sized
@@ -4042,40 +4044,44 @@ impl core::marker::Unpin for rsbinder::stream::SinkPolicy
 impl core::marker::UnsafeUnpin for rsbinder::stream::SinkPolicy
 impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::stream::SinkPolicy
 impl core::panic::unwind_safe::UnwindSafe for rsbinder::stream::SinkPolicy
-pub struct rsbinder::stream::StreamEndpoint
+pub struct rsbinder::stream::StreamEndpoint<T>
+pub rsbinder::stream::StreamEndpoint::_phantom_T: core::marker::PhantomData<T>
 pub rsbinder::stream::StreamEndpoint::ring: core::option::Option<rsbinder::fmq::MQDescriptor<i8, rsbinder::fmq::SynchronizedReadWrite>>
 pub rsbinder::stream::StreamEndpoint::sink: core::option::Option<rsbinder::SIBinder>
-impl core::default::Default for rsbinder::stream::StreamEndpoint
-pub fn rsbinder::stream::StreamEndpoint::default() -> Self
-impl core::fmt::Debug for rsbinder::stream::StreamEndpoint
-pub fn rsbinder::stream::StreamEndpoint::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl rsbinder::Deserialize for rsbinder::stream::StreamEndpoint
-pub fn rsbinder::stream::StreamEndpoint::deserialize(&mut rsbinder::Parcel) -> rsbinder::Result<Self>
-pub fn rsbinder::stream::StreamEndpoint::deserialize_from(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
-impl rsbinder::DeserializeArray for rsbinder::stream::StreamEndpoint
-pub fn rsbinder::stream::StreamEndpoint::deserialize_array(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<alloc::vec::Vec<Self>>>
-impl rsbinder::DeserializeOption for rsbinder::stream::StreamEndpoint
-pub fn rsbinder::stream::StreamEndpoint::deserialize_option(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<Self>>
-pub fn rsbinder::stream::StreamEndpoint::deserialize_option_from(&mut core::option::Option<Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
-impl rsbinder::Parcelable for rsbinder::stream::StreamEndpoint
-pub fn rsbinder::stream::StreamEndpoint::read_from_parcel(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
-pub fn rsbinder::stream::StreamEndpoint::write_to_parcel(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
-impl rsbinder::ParcelableMetadata for rsbinder::stream::StreamEndpoint
-pub fn rsbinder::stream::StreamEndpoint::descriptor() -> &'static str
-pub fn rsbinder::stream::StreamEndpoint::stability(&self) -> rsbinder::Stability
-impl rsbinder::Serialize for rsbinder::stream::StreamEndpoint
-pub fn rsbinder::stream::StreamEndpoint::serialize(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
-impl rsbinder::SerializeArray for rsbinder::stream::StreamEndpoint
-pub fn rsbinder::stream::StreamEndpoint::serialize_array(&[Self], &mut rsbinder::Parcel) -> rsbinder::Result<()>
-impl rsbinder::SerializeOption for rsbinder::stream::StreamEndpoint
-pub fn rsbinder::stream::StreamEndpoint::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
-impl core::marker::Freeze for rsbinder::stream::StreamEndpoint
-impl core::marker::Send for rsbinder::stream::StreamEndpoint
-impl core::marker::Sync for rsbinder::stream::StreamEndpoint
-impl core::marker::Unpin for rsbinder::stream::StreamEndpoint
-impl core::marker::UnsafeUnpin for rsbinder::stream::StreamEndpoint
-impl !core::panic::unwind_safe::RefUnwindSafe for rsbinder::stream::StreamEndpoint
-impl !core::panic::unwind_safe::UnwindSafe for rsbinder::stream::StreamEndpoint
+impl<T> rsbinder::stream::StreamEndpoint<T>
+pub fn rsbinder::stream::StreamEndpoint<T>::cast<U>(self) -> rsbinder::stream::StreamEndpoint<U>
+pub fn rsbinder::stream::StreamEndpoint<T>::try_clone(&self) -> rsbinder::Result<Self>
+impl<T> core::default::Default for rsbinder::stream::StreamEndpoint<T>
+pub fn rsbinder::stream::StreamEndpoint<T>::default() -> Self
+impl<T> core::fmt::Debug for rsbinder::stream::StreamEndpoint<T>
+pub fn rsbinder::stream::StreamEndpoint<T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<T> rsbinder::Deserialize for rsbinder::stream::StreamEndpoint<T>
+pub fn rsbinder::stream::StreamEndpoint<T>::deserialize(&mut rsbinder::Parcel) -> rsbinder::Result<Self>
+pub fn rsbinder::stream::StreamEndpoint<T>::deserialize_from(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl<T> rsbinder::DeserializeArray for rsbinder::stream::StreamEndpoint<T>
+pub fn rsbinder::stream::StreamEndpoint<T>::deserialize_array(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<alloc::vec::Vec<Self>>>
+impl<T> rsbinder::DeserializeOption for rsbinder::stream::StreamEndpoint<T>
+pub fn rsbinder::stream::StreamEndpoint<T>::deserialize_option(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<Self>>
+pub fn rsbinder::stream::StreamEndpoint<T>::deserialize_option_from(&mut core::option::Option<Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl<T> rsbinder::Parcelable for rsbinder::stream::StreamEndpoint<T>
+pub fn rsbinder::stream::StreamEndpoint<T>::read_from_parcel(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::stream::StreamEndpoint<T>::write_to_parcel(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl<T> rsbinder::ParcelableMetadata for rsbinder::stream::StreamEndpoint<T>
+pub fn rsbinder::stream::StreamEndpoint<T>::descriptor() -> &'static str
+pub fn rsbinder::stream::StreamEndpoint<T>::stability(&self) -> rsbinder::Stability
+impl<T> rsbinder::Serialize for rsbinder::stream::StreamEndpoint<T>
+pub fn rsbinder::stream::StreamEndpoint<T>::serialize(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl<T> rsbinder::SerializeArray for rsbinder::stream::StreamEndpoint<T>
+pub fn rsbinder::stream::StreamEndpoint<T>::serialize_array(&[Self], &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl<T> rsbinder::SerializeOption for rsbinder::stream::StreamEndpoint<T>
+pub fn rsbinder::stream::StreamEndpoint<T>::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl<T> core::marker::Freeze for rsbinder::stream::StreamEndpoint<T>
+impl<T> core::marker::Send for rsbinder::stream::StreamEndpoint<T> where T: core::marker::Send
+impl<T> core::marker::Sync for rsbinder::stream::StreamEndpoint<T> where T: core::marker::Sync
+impl<T> core::marker::Unpin for rsbinder::stream::StreamEndpoint<T> where T: core::marker::Unpin
+impl<T> core::marker::UnsafeUnpin for rsbinder::stream::StreamEndpoint<T>
+impl<T> !core::panic::unwind_safe::RefUnwindSafe for rsbinder::stream::StreamEndpoint<T>
+impl<T> !core::panic::unwind_safe::UnwindSafe for rsbinder::stream::StreamEndpoint<T>
 pub struct rsbinder::stream::Token
 impl rsbinder::stream::Token
 pub fn rsbinder::stream::Token::binder(&self) -> rsbinder::SIBinder
@@ -5336,9 +5342,6 @@ pub fn rsbinder::hub::android_16::android::os::ServiceWithMetadata::ServiceWithM
 impl rsbinder::Deserialize for rsbinder::shared_memory::shared::SharedMemory
 pub fn rsbinder::shared_memory::shared::SharedMemory::deserialize(&mut rsbinder::Parcel) -> rsbinder::Result<Self>
 pub fn rsbinder::shared_memory::shared::SharedMemory::deserialize_from(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
-impl rsbinder::Deserialize for rsbinder::stream::StreamEndpoint
-pub fn rsbinder::stream::StreamEndpoint::deserialize(&mut rsbinder::Parcel) -> rsbinder::Result<Self>
-pub fn rsbinder::stream::StreamEndpoint::deserialize_from(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::Deserialize for u128
 pub fn u128::deserialize(&mut rsbinder::Parcel) -> rsbinder::Result<Self>
 pub fn u128::deserialize_from(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
@@ -5372,6 +5375,9 @@ pub fn core::option::Option<T>::deserialize_from(&mut self, &mut rsbinder::Parce
 impl<T: rsbinder::FromIBinder + ?core::marker::Sized> rsbinder::Deserialize for rsbinder::Strong<T>
 pub fn rsbinder::Strong<T>::deserialize(&mut rsbinder::Parcel) -> rsbinder::Result<Self>
 pub fn rsbinder::Strong<T>::deserialize_from(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl<T> rsbinder::Deserialize for rsbinder::stream::StreamEndpoint<T>
+pub fn rsbinder::stream::StreamEndpoint<T>::deserialize(&mut rsbinder::Parcel) -> rsbinder::Result<Self>
+pub fn rsbinder::stream::StreamEndpoint<T>::deserialize_from(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 pub trait rsbinder::DeserializeArray: rsbinder::Deserialize
 pub fn rsbinder::DeserializeArray::deserialize_array(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<alloc::vec::Vec<Self>>>
 impl rsbinder::DeserializeArray for alloc::string::String
@@ -5412,8 +5418,6 @@ impl rsbinder::DeserializeArray for rsbinder::hub::android_16::android::os::Serv
 pub fn rsbinder::hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInfo::deserialize_array(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<alloc::vec::Vec<Self>>>
 impl rsbinder::DeserializeArray for rsbinder::hub::android_16::android::os::ServiceWithMetadata::ServiceWithMetadata
 pub fn rsbinder::hub::android_16::android::os::ServiceWithMetadata::ServiceWithMetadata::deserialize_array(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<alloc::vec::Vec<Self>>>
-impl rsbinder::DeserializeArray for rsbinder::stream::StreamEndpoint
-pub fn rsbinder::stream::StreamEndpoint::deserialize_array(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<alloc::vec::Vec<Self>>>
 impl rsbinder::DeserializeArray for u128
 pub fn u128::deserialize_array(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<alloc::vec::Vec<Self>>>
 impl rsbinder::DeserializeArray for u16
@@ -5432,6 +5436,8 @@ impl<T: rsbinder::DeserializeOption> rsbinder::DeserializeArray for core::option
 pub fn core::option::Option<T>::deserialize_array(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<alloc::vec::Vec<Self>>>
 impl<T: rsbinder::FromIBinder + ?core::marker::Sized> rsbinder::DeserializeArray for rsbinder::Strong<T>
 pub fn rsbinder::Strong<T>::deserialize_array(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<alloc::vec::Vec<Self>>>
+impl<T> rsbinder::DeserializeArray for rsbinder::stream::StreamEndpoint<T>
+pub fn rsbinder::stream::StreamEndpoint<T>::deserialize_array(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<alloc::vec::Vec<Self>>>
 pub trait rsbinder::DeserializeOption: rsbinder::Deserialize
 pub fn rsbinder::DeserializeOption::deserialize_option(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<Self>>
 pub fn rsbinder::DeserializeOption::deserialize_option_from(&mut core::option::Option<Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
@@ -5483,9 +5489,6 @@ pub fn rsbinder::hub::android_16::android::os::ServiceWithMetadata::ServiceWithM
 impl rsbinder::DeserializeOption for rsbinder::shared_memory::shared::SharedMemory
 pub fn rsbinder::shared_memory::shared::SharedMemory::deserialize_option(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<Self>>
 pub fn rsbinder::shared_memory::shared::SharedMemory::deserialize_option_from(&mut core::option::Option<Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
-impl rsbinder::DeserializeOption for rsbinder::stream::StreamEndpoint
-pub fn rsbinder::stream::StreamEndpoint::deserialize_option(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<Self>>
-pub fn rsbinder::stream::StreamEndpoint::deserialize_option_from(&mut core::option::Option<Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::DeserializeOption for u128
 pub fn u128::deserialize_option(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<Self>>
 pub fn u128::deserialize_option_from(&mut core::option::Option<Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
@@ -5516,6 +5519,9 @@ pub fn alloc::boxed::Box<T>::deserialize_option_from(&mut core::option::Option<S
 impl<T: rsbinder::FromIBinder + ?core::marker::Sized> rsbinder::DeserializeOption for rsbinder::Strong<T>
 pub fn rsbinder::Strong<T>::deserialize_option(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<Self>>
 pub fn rsbinder::Strong<T>::deserialize_option_from(&mut core::option::Option<Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl<T> rsbinder::DeserializeOption for rsbinder::stream::StreamEndpoint<T>
+pub fn rsbinder::stream::StreamEndpoint<T>::deserialize_option(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<Self>>
+pub fn rsbinder::stream::StreamEndpoint<T>::deserialize_option_from(&mut core::option::Option<Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 pub trait rsbinder::FromIBinder: rsbinder::Interface
 pub fn rsbinder::FromIBinder::try_from(rsbinder::SIBinder) -> rsbinder::Result<rsbinder::Strong<Self>>
 impl rsbinder::FromIBinder for dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal
@@ -5663,12 +5669,12 @@ pub fn rsbinder::hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInf
 impl rsbinder::Parcelable for rsbinder::hub::android_16::android::os::ServiceWithMetadata::ServiceWithMetadata
 pub fn rsbinder::hub::android_16::android::os::ServiceWithMetadata::ServiceWithMetadata::read_from_parcel(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 pub fn rsbinder::hub::android_16::android::os::ServiceWithMetadata::ServiceWithMetadata::write_to_parcel(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
-impl rsbinder::Parcelable for rsbinder::stream::StreamEndpoint
-pub fn rsbinder::stream::StreamEndpoint::read_from_parcel(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
-pub fn rsbinder::stream::StreamEndpoint::write_to_parcel(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl<T, Flavor> rsbinder::Parcelable for rsbinder::fmq::MQDescriptor<T, Flavor>
 pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::read_from_parcel(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::write_to_parcel(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl<T> rsbinder::Parcelable for rsbinder::stream::StreamEndpoint<T>
+pub fn rsbinder::stream::StreamEndpoint<T>::read_from_parcel(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+pub fn rsbinder::stream::StreamEndpoint<T>::write_to_parcel(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 pub trait rsbinder::ParcelableMetadata
 pub fn rsbinder::ParcelableMetadata::descriptor() -> &'static str
 pub fn rsbinder::ParcelableMetadata::stability(&self) -> rsbinder::Stability
@@ -5690,12 +5696,12 @@ pub fn rsbinder::hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInf
 impl rsbinder::ParcelableMetadata for rsbinder::hub::android_16::android::os::ServiceWithMetadata::ServiceWithMetadata
 pub fn rsbinder::hub::android_16::android::os::ServiceWithMetadata::ServiceWithMetadata::descriptor() -> &'static str
 pub fn rsbinder::hub::android_16::android::os::ServiceWithMetadata::ServiceWithMetadata::stability(&self) -> rsbinder::Stability
-impl rsbinder::ParcelableMetadata for rsbinder::stream::StreamEndpoint
-pub fn rsbinder::stream::StreamEndpoint::descriptor() -> &'static str
-pub fn rsbinder::stream::StreamEndpoint::stability(&self) -> rsbinder::Stability
 impl<T, Flavor> rsbinder::ParcelableMetadata for rsbinder::fmq::MQDescriptor<T, Flavor>
 pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::descriptor() -> &'static str
 pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::stability(&self) -> rsbinder::Stability
+impl<T> rsbinder::ParcelableMetadata for rsbinder::stream::StreamEndpoint<T>
+pub fn rsbinder::stream::StreamEndpoint<T>::descriptor() -> &'static str
+pub fn rsbinder::stream::StreamEndpoint<T>::stability(&self) -> rsbinder::Stability
 pub trait rsbinder::Proxy: core::marker::Sized + rsbinder::Interface
 pub fn rsbinder::Proxy::descriptor() -> &'static str
 pub fn rsbinder::Proxy::from_binder(rsbinder::SIBinder) -> core::option::Option<Self>
@@ -5833,8 +5839,6 @@ impl rsbinder::Serialize for rsbinder::hub::android_16::android::os::ServiceWith
 pub fn rsbinder::hub::android_16::android::os::ServiceWithMetadata::ServiceWithMetadata::serialize(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::Serialize for rsbinder::shared_memory::shared::SharedMemory
 pub fn rsbinder::shared_memory::shared::SharedMemory::serialize(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
-impl rsbinder::Serialize for rsbinder::stream::StreamEndpoint
-pub fn rsbinder::stream::StreamEndpoint::serialize(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::Serialize for str
 pub fn str::serialize(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::Serialize for u128
@@ -5873,6 +5877,8 @@ impl<T: rsbinder::SerializeArray> rsbinder::Serialize for alloc::vec::Vec<T>
 pub fn alloc::vec::Vec<T>::serialize(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl<T: rsbinder::SerializeOption> rsbinder::Serialize for core::option::Option<T>
 pub fn core::option::Option<T>::serialize(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl<T> rsbinder::Serialize for rsbinder::stream::StreamEndpoint<T>
+pub fn rsbinder::stream::StreamEndpoint<T>::serialize(&self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 pub trait rsbinder::SerializeArray: rsbinder::Serialize + core::marker::Sized
 pub fn rsbinder::SerializeArray::serialize_array(&[Self], &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::SerializeArray for &str
@@ -5915,8 +5921,6 @@ impl rsbinder::SerializeArray for rsbinder::hub::android_16::android::os::Servic
 pub fn rsbinder::hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInfo::serialize_array(&[Self], &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::SerializeArray for rsbinder::hub::android_16::android::os::ServiceWithMetadata::ServiceWithMetadata
 pub fn rsbinder::hub::android_16::android::os::ServiceWithMetadata::ServiceWithMetadata::serialize_array(&[Self], &mut rsbinder::Parcel) -> rsbinder::Result<()>
-impl rsbinder::SerializeArray for rsbinder::stream::StreamEndpoint
-pub fn rsbinder::stream::StreamEndpoint::serialize_array(&[Self], &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::SerializeArray for u128
 pub fn u128::serialize_array(&[Self], &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::SerializeArray for u16
@@ -5935,6 +5939,8 @@ impl<T: rsbinder::SerializeArray, const N: usize> rsbinder::SerializeArray for [
 pub fn [T; N]::serialize_array(&[Self], &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl<T: rsbinder::SerializeOption> rsbinder::SerializeArray for core::option::Option<T>
 pub fn core::option::Option<T>::serialize_array(&[Self], &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl<T> rsbinder::SerializeArray for rsbinder::stream::StreamEndpoint<T>
+pub fn rsbinder::stream::StreamEndpoint<T>::serialize_array(&[Self], &mut rsbinder::Parcel) -> rsbinder::Result<()>
 pub trait rsbinder::SerializeOption: rsbinder::Serialize
 pub fn rsbinder::SerializeOption::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::SerializeOption for (dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal + '_)
@@ -5981,8 +5987,6 @@ impl rsbinder::SerializeOption for rsbinder::hub::android_16::android::os::Servi
 pub fn rsbinder::hub::android_16::android::os::ServiceWithMetadata::ServiceWithMetadata::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::SerializeOption for rsbinder::shared_memory::shared::SharedMemory
 pub fn rsbinder::shared_memory::shared::SharedMemory::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
-impl rsbinder::SerializeOption for rsbinder::stream::StreamEndpoint
-pub fn rsbinder::stream::StreamEndpoint::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::SerializeOption for str
 pub fn str::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl rsbinder::SerializeOption for u128
@@ -6019,6 +6023,8 @@ impl<T: rsbinder::SerializeOption + ?core::marker::Sized> rsbinder::SerializeOpt
 pub fn &T::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl<T: rsbinder::SerializeOption> rsbinder::SerializeOption for alloc::boxed::Box<T>
 pub fn alloc::boxed::Box<T>::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
+impl<T> rsbinder::SerializeOption for rsbinder::stream::StreamEndpoint<T>
+pub fn rsbinder::stream::StreamEndpoint<T>::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 pub trait rsbinder::ServiceSpecificError: core::marker::Sized
 pub fn rsbinder::ServiceSpecificError::code(&self) -> i32
 pub fn rsbinder::ServiceSpecificError::from_code(i32) -> core::option::Option<Self>

@@ -33,7 +33,8 @@
 #include <android/binder_manager.h>
 #include <android/binder_process.h>
 
-using aidl::rsbinder::stream::StreamEndpoint;
+// IStreamDemo's streams carry `int`.
+using StreamEndpoint = aidl::rsbinder::stream::StreamEndpoint<int32_t>;
 using aidl::streamdemo::IStreamDemo;
 
 namespace {

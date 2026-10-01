@@ -87,7 +87,7 @@ impl DemoSvc {
     /// Own thread on purpose: the handler returns at once and pushing is outside any transaction.
     fn spawn(
         &self,
-        endpoint: &StreamEndpoint,
+        endpoint: &StreamEndpoint<i32>,
         count: i32,
         policy: &SinkPolicy,
         delay: Duration,
@@ -97,7 +97,7 @@ impl DemoSvc {
             ping: self.ping,
             ..policy.clone()
         };
-        let mut producer = Sink::<i32>::open_with(endpoint, &policy)?;
+        let mut producer = Sink::open_with(endpoint, &policy)?;
         let sent = self.sent.clone();
         let finished = self.finished.clone();
         let last_error = self.last_error.clone();
@@ -132,7 +132,7 @@ impl DemoSvc {
 impl IStreamDemo for DemoSvc {
     fn r#subscribe(
         &self,
-        endpoint: &StreamEndpoint,
+        endpoint: &StreamEndpoint<i32>,
         count: i32,
         max_batch_bytes: i32,
         initial_credits: i32,
@@ -149,7 +149,7 @@ impl IStreamDemo for DemoSvc {
 
     fn r#subscribeAsync(
         &self,
-        endpoint: &StreamEndpoint,
+        endpoint: &StreamEndpoint<i32>,
         count: i32,
         max_batch_bytes: i32,
         initial_credits: i32,
@@ -158,7 +158,7 @@ impl IStreamDemo for DemoSvc {
             ping: self.ping,
             ..sink_policy(max_batch_bytes, initial_credits)
         };
-        let mut producer = Sink::<i32>::open_with(endpoint, &policy)?;
+        let mut producer = Sink::open_with(endpoint, &policy)?;
         let sent = self.sent.clone();
         let finished = self.finished.clone();
         let last_error = self.last_error.clone();
@@ -181,7 +181,7 @@ impl IStreamDemo for DemoSvc {
 
     fn r#subscribeFailing(
         &self,
-        endpoint: &StreamEndpoint,
+        endpoint: &StreamEndpoint<i32>,
         count: i32,
         code: i32,
         message: &str,
@@ -211,7 +211,7 @@ impl IStreamDemo for DemoSvc {
     }
 
     // Upload is exercised by the kernel half (`stream_probe`); this keeps the fixture whole.
-    fn r#upload(&self, producer: &SIBinder, ring_bytes: i32) -> BinderResult<StreamEndpoint> {
+    fn r#upload(&self, producer: &SIBinder, ring_bytes: i32) -> BinderResult<StreamEndpoint<i32>> {
         let (mut rx, endpoint) = Receiver::<i32>::with_policy(
             producer,
             &ReceiverPolicy {
@@ -357,7 +357,11 @@ impl Drop for Relay {
 
 impl Fixture {
     /// Against an RPC proxy, so the endpoint carries only the sink.
-    fn receiver(&self, credit_window: u32, max_opening: u32) -> (Receiver<i32>, StreamEndpoint) {
+    fn receiver(
+        &self,
+        credit_window: u32,
+        max_opening: u32,
+    ) -> (Receiver<i32>, StreamEndpoint<i32>) {
         Receiver::<i32>::with_policy(
             &self.demo.as_binder(),
             &ReceiverPolicy {
@@ -369,7 +373,7 @@ impl Fixture {
         .expect("a receiver against a live session")
     }
 
-    fn default_receiver(&self) -> (Receiver<i32>, StreamEndpoint) {
+    fn default_receiver(&self) -> (Receiver<i32>, StreamEndpoint<i32>) {
         Receiver::<i32>::new(&self.demo.as_binder()).expect("a receiver against a live session")
     }
 

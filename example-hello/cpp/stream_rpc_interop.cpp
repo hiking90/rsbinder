@@ -69,7 +69,8 @@ using aidl::rsbinder::stream::BnStreamSink;
 using aidl::rsbinder::stream::BnStreamSource;
 using aidl::rsbinder::stream::IStreamSink;
 using aidl::rsbinder::stream::IStreamSource;
-using aidl::rsbinder::stream::StreamEndpoint;
+// IStreamDemo's streams carry `int`.
+using StreamEndpoint = aidl::rsbinder::stream::StreamEndpoint<int32_t>;
 using aidl::streamdemo::IStreamDemo;
 using ndk::ScopedAStatus;
 using ndk::SpAIBinder;

@@ -130,7 +130,9 @@ pub mod {{mod}} {
     {%- endif %}
     pub const r#{{ member.0 }}: {{ member.1 }} = {{ member.2 }};
     {%- endfor %}
+    {%- if type_params|length == 0 %}
     #[derive(Debug)]
+    {%- endif %}
     {%- if derive|length > 0 %}
     #[derive({{ derive }})]
     {%- endif %}
@@ -160,6 +162,17 @@ pub mod {{mod}} {
             }
         }
     }
+    {%- if type_params|length > 0 %}
+    impl{{generics}} core::fmt::Debug for {{name}}{{generics}} {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("{{name}}")
+            {%- for member in members %}
+                .field("{{ member.identifier }}", &self.r#{{ member.identifier }})
+            {%- endfor %}
+                .finish()
+        }
+    }
+    {%- endif %}
     impl{{generics}} {{crate}}::Parcelable for {{name}}{{generics}} {
         fn write_to_parcel(&self, _parcel: &mut {{crate}}::Parcel) -> {{crate}}::Result<()> {
             _parcel.sized_write(|_sub_parcel| {
