@@ -1950,6 +1950,8 @@ mod tests {
     impl IStreamSource for RefusingSource {
         fn r#request(&self, total: i64) -> BinderResult<()> {
             self.0.attempts.fetch_add(1, Ordering::SeqCst);
+            // Its replacement `try_update` is newer than the MSRV.
+            #[allow(deprecated)]
             let refused = self
                 .0
                 .refuse

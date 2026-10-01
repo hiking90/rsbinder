@@ -167,6 +167,8 @@ impl TransactionObserver for StatsObserver {
         elapsed: Duration,
     ) {
         // Saturate: the trait is public, so a caller may send an unpaired reply.
+        // Its replacement `try_update` is newer than the MSRV.
+        #[allow(deprecated)]
         let _ = self
             .in_flight
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
