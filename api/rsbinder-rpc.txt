@@ -466,6 +466,8 @@ pub type rsbinder::fmq::MQDescriptor<T, F>::Error = rsbinder::StatusCode
 pub fn rsbinder::fmq::MQDescriptor<T, F>::try_from(rsbinder_fmq::descriptor::Descriptor) -> core::result::Result<Self, rsbinder::StatusCode>
 impl<T, Flavor> core::default::Default for rsbinder::fmq::MQDescriptor<T, Flavor>
 pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::default() -> Self
+impl<T, Flavor> core::fmt::Debug for rsbinder::fmq::MQDescriptor<T, Flavor>
+pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<T, Flavor> rsbinder::Deserialize for rsbinder::fmq::MQDescriptor<T, Flavor>
 pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::deserialize(&mut rsbinder::Parcel) -> rsbinder::Result<Self>
 pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::deserialize_from(&mut self, &mut rsbinder::Parcel) -> rsbinder::Result<()>
@@ -486,8 +488,6 @@ impl<T, Flavor> rsbinder::SerializeArray for rsbinder::fmq::MQDescriptor<T, Flav
 pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::serialize_array(&[Self], &mut rsbinder::Parcel) -> rsbinder::Result<()>
 impl<T, Flavor> rsbinder::SerializeOption for rsbinder::fmq::MQDescriptor<T, Flavor>
 pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::serialize_option(core::option::Option<&Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
-impl<T: core::fmt::Debug, Flavor: core::fmt::Debug> core::fmt::Debug for rsbinder::fmq::MQDescriptor<T, Flavor>
-pub fn rsbinder::fmq::MQDescriptor<T, Flavor>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<T, Flavor> core::marker::Freeze for rsbinder::fmq::MQDescriptor<T, Flavor>
 impl<T, Flavor> core::marker::Send for rsbinder::fmq::MQDescriptor<T, Flavor> where T: core::marker::Send, Flavor: core::marker::Send
 impl<T, Flavor> core::marker::Sync for rsbinder::fmq::MQDescriptor<T, Flavor> where T: core::marker::Sync, Flavor: core::marker::Sync
