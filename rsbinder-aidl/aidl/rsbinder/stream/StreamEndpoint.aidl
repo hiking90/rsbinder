@@ -26,8 +26,17 @@ import android.hardware.common.fmq.SynchronizedReadWrite;
  * called in a download, the binder the producer passed in an upload.
  * Back-pressure leaves most of a stream with no call in flight that could
  * fail, so nothing else tells a waiting end that its peer is gone.
+ *
+ * `T` is the stream's item type, named where the endpoint is used —
+ * `void subscribe(in StreamEndpoint<LogLine> endpoint)` — so that both
+ * ends and a reader of the interface know what the items are. It is not
+ * written to the parcel: the endpoint is the same bytes whatever `T` is,
+ * and the items travel on the ring or the sink below, each one encoded
+ * as the generated code writes an `in` argument of type `T`. rsbinder-aidl
+ * refuses an array or a `List` as `T` (AOSP's aidl accepts either); wrap
+ * one in a parcelable.
  */
-parcelable StreamEndpoint {
+parcelable StreamEndpoint<T> {
     /**
      * Kernel binder only: the ring the producer writes records into and
      * the consumer reads them out of — a synchronized Fast Message Queue

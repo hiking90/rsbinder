@@ -60,7 +60,6 @@ fn generic_parcelable_emits_phantom_fields() {
         r#"
 pub mod GenericStructuredParcelable {
     #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
-    #[derive(Debug)]
     pub struct GenericStructuredParcelable<T, U, B> {
         pub r#a: i32,
         pub r#b: i32,
@@ -77,6 +76,14 @@ pub mod GenericStructuredParcelable {
                 _phantom_U: core::marker::PhantomData,
                 _phantom_B: core::marker::PhantomData,
             }
+        }
+    }
+    impl<T, U, B> core::fmt::Debug for GenericStructuredParcelable<T, U, B> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("GenericStructuredParcelable")
+                .field("a", &self.r#a)
+                .field("b", &self.r#b)
+                .finish()
         }
     }
     impl<T, U, B> rsbinder::Parcelable for GenericStructuredParcelable<T, U, B> {
@@ -585,6 +592,71 @@ fn builtin_fmq_types_map_to_the_runtime_crate() {
     let msg = format!("{err:?}");
     assert!(
         msg.contains("type 'String' used as type parameter 'T' of 'MQDescriptor' must be annotated with @FixedSize"),
+        "{msg}"
+    );
+}
+
+/// `StreamEndpoint<T>` names the stream's item type at the use site; bare, it is refused.
+#[test]
+fn builtin_stream_endpoint_carries_its_item_type() {
+    let dir = scratch_dir("builtin_stream");
+    let src = dir.join("streamdemo").join("ILog.aidl");
+    std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+    std::fs::write(
+        &src,
+        r#"
+        package streamdemo;
+        import rsbinder.stream.StreamEndpoint;
+        parcelable LogLine { long timestampMs; String text; }
+        interface ILog {
+            void tail(in StreamEndpoint<LogLine> endpoint, String tag);
+            StreamEndpoint<String> upload(IBinder producer);
+        }
+        "#,
+    )
+    .unwrap();
+    let out = dir.join("out.rs");
+    Builder::new()
+        .source(&src)
+        .output(&out)
+        .dest_dir(&dir)
+        .generate()
+        .unwrap();
+    let generated = std::fs::read_to_string(&out).unwrap();
+    for expected in [
+        "_arg_endpoint: &rsbinder::stream::StreamEndpoint<super::LogLine::LogLine>",
+        "rsbinder::BinderResult<rsbinder::stream::StreamEndpoint<String>>",
+    ] {
+        assert!(
+            generated.contains(expected),
+            "missing `{expected}` in:\n{generated}"
+        );
+    }
+    assert!(
+        !generated.contains("pub mod StreamEndpoint"),
+        "the builtin must not be generated:\n{generated}"
+    );
+
+    std::fs::write(
+        &src,
+        r#"
+        package streamdemo;
+        import rsbinder.stream.StreamEndpoint;
+        interface ILog {
+            void tail(in StreamEndpoint endpoint);
+        }
+        "#,
+    )
+    .unwrap();
+    let err = Builder::new()
+        .source(&src)
+        .output(&out)
+        .dest_dir(&dir)
+        .generate()
+        .unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("'StreamEndpoint' must have 1 type parameters, but got 0"),
         "{msg}"
     );
 }

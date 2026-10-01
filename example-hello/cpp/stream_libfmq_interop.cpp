@@ -46,7 +46,8 @@
 #include <unistd.h>
 
 using aidl::android::hardware::common::fmq::SynchronizedReadWrite;
-using aidl::rsbinder::stream::StreamEndpoint;
+// IStreamDemo's streams carry `int`.
+using StreamEndpoint = aidl::rsbinder::stream::StreamEndpoint<int32_t>;
 using aidl::streamdemo::IStreamDemo;
 using android::AidlMessageQueue;
 using android::hardware::EventFlag;

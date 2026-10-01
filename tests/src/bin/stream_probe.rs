@@ -73,7 +73,7 @@ impl Interface for DemoSvc {}
 impl IStreamDemo for DemoSvc {
     fn r#subscribe(
         &self,
-        endpoint: &StreamEndpoint,
+        endpoint: &StreamEndpoint<i32>,
         count: i32,
         max_batch_bytes: i32,
         initial_credits: i32,
@@ -84,7 +84,7 @@ impl IStreamDemo for DemoSvc {
             initial_credits: initial_credits as u32,
             ..SinkPolicy::default()
         };
-        let mut producer = Sink::<i32>::open_with(endpoint, &policy)?;
+        let mut producer = Sink::open_with(endpoint, &policy)?;
         // Per stream, so a client polling `finished` does not see the previous stream's.
         self.finished.store(false, Ordering::SeqCst);
         self.last_error.store(0, Ordering::SeqCst);
@@ -121,7 +121,7 @@ impl IStreamDemo for DemoSvc {
     // The async producer is the RPC half's; this probe is for what only the driver shows.
     fn r#subscribeAsync(
         &self,
-        _endpoint: &StreamEndpoint,
+        _endpoint: &StreamEndpoint<i32>,
         _count: i32,
         _max_batch_bytes: i32,
         _initial_credits: i32,
@@ -132,12 +132,12 @@ impl IStreamDemo for DemoSvc {
     /// `count` items, then the failure: the end record `run_stream_interop.sh` parses in C.
     fn r#subscribeFailing(
         &self,
-        endpoint: &StreamEndpoint,
+        endpoint: &StreamEndpoint<i32>,
         count: i32,
         code: i32,
         message: &str,
     ) -> BinderResult<()> {
-        let mut producer = Sink::<i32>::open(endpoint)?;
+        let mut producer = Sink::open(endpoint)?;
         let status = Status::new_service_specific_error(code, Some(message.to_string()));
         thread::spawn(move || {
             let sent = (0..count).try_for_each(|item| producer.send(&item));
@@ -165,7 +165,7 @@ impl IStreamDemo for DemoSvc {
     }
 
     /// The service consumes: the receiver is made in the handler and read on its own thread.
-    fn r#upload(&self, producer: &SIBinder, ring_bytes: i32) -> BinderResult<StreamEndpoint> {
+    fn r#upload(&self, producer: &SIBinder, ring_bytes: i32) -> BinderResult<StreamEndpoint<i32>> {
         let (mut rx, endpoint) = Receiver::<i32>::with_policy(
             producer,
             &ReceiverPolicy {
@@ -263,7 +263,7 @@ fn connect(name: &str) -> Result<Strong<dyn IStreamDemo>> {
 fn receiver_for(
     demo: &Strong<dyn IStreamDemo>,
     ring_bytes: usize,
-) -> Result<(Receiver<i32>, StreamEndpoint)> {
+) -> Result<(Receiver<i32>, StreamEndpoint<i32>)> {
     Receiver::with_policy(
         &demo.as_binder(),
         &ReceiverPolicy {
@@ -276,7 +276,7 @@ fn receiver_for(
 /// The RPC-path arguments at the producer's defaults; a ring does not read them.
 fn subscribe(
     demo: &Strong<dyn IStreamDemo>,
-    endpoint: &StreamEndpoint,
+    endpoint: &StreamEndpoint<i32>,
     count: i32,
     delay_micros: i32,
 ) -> Result<()> {

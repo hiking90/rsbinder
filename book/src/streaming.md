@@ -26,9 +26,10 @@ The RPC side has one [requirement on the client](#over-rpc).
 ## A minimal stream
 
 The method that starts a stream takes the consumer's endpoint —
-`rsbinder.stream.StreamEndpoint`, a parcelable shipped in
+`rsbinder.stream.StreamEndpoint<T>`, a parcelable shipped in
 `rsbinder/aidl/stream/` that `rsbinder-aidl` resolves without a copy of the
-file — and returns nothing. Everything else travels over the stream itself:
+file — and returns nothing. The type argument is the item type. Everything
+else travels over the stream itself:
 
 ```aidl
 package demo;
@@ -41,21 +42,21 @@ parcelable LogLine {
 }
 
 interface ILogService {
-    void tail(in StreamEndpoint endpoint, String tag);
+    void tail(in StreamEndpoint<LogLine> endpoint, String tag);
 }
 ```
 
 The service opens a sink on the endpoint and writes from a thread of its own.
-`send` blocks once the consumer has fallen behind, which is the back-pressure —
-and the reason the producer does not run on the binder thread that took the
-call:
+The endpoint's type argument makes it a `Sink<LogLine>`. `send` blocks once the
+consumer has fallen behind, which is the back-pressure — and the reason the
+producer does not run on the binder thread that took the call:
 
 ```rust
 use rsbinder::stream::{Sink, StreamEndpoint};
 
 impl ILogService for LogService {
-    fn r#tail(&self, endpoint: &StreamEndpoint, tag: &str) -> rsbinder::BinderResult<()> {
-        let mut sink = Sink::<LogLine>::open(endpoint)?;
+    fn r#tail(&self, endpoint: &StreamEndpoint<LogLine>, tag: &str) -> rsbinder::BinderResult<()> {
+        let mut sink = Sink::open(endpoint)?;
         let lines = self.open(tag);
         std::thread::spawn(move || {
             for line in lines {
@@ -106,14 +107,14 @@ purpose), the service makes the receiver against it in the handler and returns
 the endpoint, and the client opens its sink on the returned value:
 
 ```aidl
-StreamEndpoint upload(IBinder producer);
+StreamEndpoint<Chunk> upload(IBinder producer);
 ```
 
 ```rust
 // Client
 let token = rsbinder::stream::Token::new();
 let endpoint = service.r#upload(&token.binder())?;
-let mut sink = Sink::<Chunk>::open(&endpoint)?;
+let mut sink = Sink::open(&endpoint)?; // a Sink<Chunk>
 // ... keep `token` alive for as long as the stream runs.
 ```
 
@@ -124,11 +125,37 @@ consumer needs one more `twoway` call to hand it over.
 
 `Receiver<T>` is an `Iterator<Item = BinderResult<T>>` that ends when the
 producer does; `recv`, `try_recv` and `recv_timeout` are the same thing one item
-at a time, differing only in how long they wait for one. The two ends need not
-share a Rust type — items are encoded with the codec
-[`to_bytes`](./data-serialization.md) uses, so they only have to agree on the
-wire. For the same reason **an item may hold neither a binder nor a file
-descriptor**; `send` refuses one that does.
+at a time, differing only in how long they wait for one. Items are encoded with
+the codec [`to_bytes`](./data-serialization.md) uses, so **an item may hold
+neither a binder nor a file descriptor**; `send` refuses one that does.
+
+### The item type is checked at compile time
+
+The type argument is where the `.aidl` states what the items are, and both ends
+are held to it: the generated method takes a `StreamEndpoint<LogLine>`, only a
+`Receiver<LogLine>` makes one, and `Sink::open` on it is a `Sink<LogLine>`. A
+consumer that reads the stream as some other type, or a service that writes
+one, does not compile.
+
+That matters most for the mismatches nothing else would catch. The items carry
+no type tag, only their encoding, so the consumer ends the stream with an error
+only when decoding happens to notice — an item's bytes running out
+(`NotEnoughData`) or left over (`BadValue`), a null marker where a value is
+required (`UnexpectedNull`). A mismatch it does not notice — `int` read as
+`float`, two parcelables with the same fields — decodes as the wrong value.
+
+The type argument is not on the wire: the endpoint is the same bytes whatever
+it names, so a C++ peer built from the same `.aidl` (where it is
+`StreamEndpoint<LogLine>` too, a class template) interoperates. For the same
+reason a Rust end may read or write a type of its own that encodes like the
+declared one; `StreamEndpoint::cast::<U>()` says so explicitly, and nothing then
+checks that the two agree. A service handler receives `&StreamEndpoint<T>`, so
+it casts a copy: `Sink::<U>::open(&endpoint.try_clone()?.cast())`. A producer
+holding borrowed items needs no cast: `Sink::<str>::open_borrowed` takes a
+`StreamEndpoint<String>` and sends `&str` lines without a `String` for each.
+
+`rsbinder-aidl` refuses an array or a `List` as `T` (AOSP's `aidl` accepts
+either); wrap one in a parcelable.
 
 ## What is on the wire
 
@@ -396,7 +423,7 @@ thread — except a wait that may [ping](#a-peer-that-goes-silent) or has a
 `recv_async` that may ping: there is no timer to suspend a task against.
 
 ```rust
-let mut sink = Sink::<LogLine>::open(endpoint)?;
+let mut sink = Sink::open(endpoint)?;
 tokio::spawn(async move {
     while let Some(line) = source.next().await {
         if sink.send_async(&line).await.is_err() {
@@ -518,6 +545,12 @@ and `hardware/interfaces/common/aidl/aidl_api/android.hardware.common/1`),
 which has the same wire. Which wire you have to
 speak is decided by the endpoint you receive or make: a `ring` on kernel
 binder, a `sink` alone over RPC.
+
+The generated `StreamEndpoint` is a class template, and the service's methods
+take the instance the `.aidl` names — `StreamEndpoint<LogLine>`, or
+`StreamEndpoint<int32_t>` for `StreamEndpoint<int>`. The C++ compiler checks
+that much. It does not check the items: they are bytes a peer encodes and
+decodes itself, so reading them as the type argument names is up to the peer.
 
 **Over kernel binder** the contract is the ring, and `StreamEndpoint.aidl` is
 its specification: attach the `MQDescriptor` with `libfmq`

@@ -516,7 +516,7 @@ static inline void rsbs_consumer_close(rsbs_consumer *c) {
 #include <utility>
 
 /*
- * The ring of an NDK-backend rsbinder.stream.StreamEndpoint, as a view for
+ * The ring of an NDK-backend rsbinder.stream.StreamEndpoint<T>, any T, as a view for
  * rsbs_producer_attach. -EINVAL when it has none: the consumer is on an RPC
  * session, whose stream is the IStreamSink/IStreamSource calls instead.
  */

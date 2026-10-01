@@ -26,7 +26,7 @@
 //! negotiated on both ends. TCP / vsock / TLS sessions cannot carry
 //! fds at all; writing a heap fd into such a parcel fails with
 //! `StatusCode::FdsNotAllowed` exactly as a plain
-//! [`ParcelFileDescriptor`](crate::ParcelFileDescriptor) does.
+//! [`ParcelFileDescriptor`] does.
 //!
 //! Targets without a backing store (anything other than Linux,
 //! Android, macOS) compile the whole trait surface, but every

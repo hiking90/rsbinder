@@ -16,10 +16,11 @@
 //! # #[derive(Default)] struct Row;
 //! # impl Serialize for Row { fn serialize(&self, _p: &mut Parcel) -> Result<()> { Ok(()) } }
 //! # fn rows() -> Vec<Row> { Vec::new() }
-//! # fn in_a_handler(endpoint: &StreamEndpoint) -> Result<()> {
+//! # fn in_a_handler(endpoint: &StreamEndpoint<Row>) -> Result<()> {
 //! // Service: called with the consumer's endpoint. The method itself
-//! // has nothing to return — the stream carries everything.
-//! let mut sink = Sink::<Row>::open(endpoint)?;
+//! // has nothing to return — the stream carries everything. The
+//! // endpoint's type argument makes this a `Sink<Row>`.
+//! let mut sink = Sink::open(endpoint)?;
 //! std::thread::spawn(move || {
 //!     for row in rows() {
 //!         // Blocks here once the consumer has fallen behind.
@@ -50,7 +51,7 @@
 //! # use rsbinder::stream::{Receiver, StreamEndpoint};
 //! # #[derive(Default)] struct Row;
 //! # impl Deserialize for Row { fn deserialize(_p: &mut Parcel) -> Result<Self> { Ok(Row) } }
-//! # fn subscribe(_service: &SIBinder, _endpoint: &StreamEndpoint) -> Result<()> { unimplemented!() }
+//! # fn subscribe(_service: &SIBinder, _endpoint: &StreamEndpoint<Row>) -> Result<()> { unimplemented!() }
 //! # fn consume(service: &SIBinder) -> Result<()> {
 //! // Consumer: make the receiver against the service, pass its
 //! // endpoint, read.
@@ -66,7 +67,7 @@
 //! # The endpoint, and the call that opens a stream
 //!
 //! [`StreamEndpoint`] is an ordinary AIDL parcelable,
-//! `rsbinder.stream.StreamEndpoint` (`rsbinder/aidl/stream/`), that a
+//! `rsbinder.stream.StreamEndpoint<T>` (`rsbinder/aidl/stream/`), that a
 //! service's own `.aidl` takes as an argument or returns. `rsbinder-aidl`
 //! resolves an `import rsbinder.stream.StreamEndpoint;` to this type, so
 //! no copy of the file is needed. One `twoway` call opens the stream, and
@@ -74,8 +75,16 @@
 //!
 //! | The client is… | The call | Death links |
 //! |---|---|---|
-//! | the consumer (a download) | `void subscribe(in StreamEndpoint endpoint)` | `Receiver::new(&service)`; the producer links to `endpoint.sink` |
-//! | the producer (an upload) | `StreamEndpoint upload(IBinder producer)` | `Receiver::new(&producer)` in the handler; the producer links to `endpoint.sink` |
+//! | the consumer (a download) | `void subscribe(in StreamEndpoint<Row> endpoint)` | `Receiver::new(&service)`; the producer links to `endpoint.sink` |
+//! | the producer (an upload) | `StreamEndpoint<Row> upload(IBinder producer)` | `Receiver::new(&producer)` in the handler; the producer links to `endpoint.sink` |
+//!
+//! The type argument is the item type, and it is where the `.aidl` states
+//! it: the generated method takes a `StreamEndpoint<Row>`, only a
+//! `Receiver<Row>` makes one, and [`Sink::open`] on it is a `Sink<Row>`,
+//! so both ends are held to the declaration at compile time. It is not on
+//! the wire, so a C++ peer compiled from the same `.aidl` interoperates
+//! whatever it names, and [`StreamEndpoint::cast`] lets a Rust end use a
+//! type of its own that encodes the same way.
 //!
 //! [`Receiver::new`] takes the **peer**: a binder in the producer's
 //! process. In a download that is the service about to be called; in an
@@ -129,8 +138,7 @@
 //! * **Items carry no binder and no file descriptor.** An item is bytes
 //!   in parcel encoding with no object table, so one holding either is
 //!   refused at [`send`](Sink::send) — see [`crate::to_bytes`], which
-//!   uses the same parcel mode. The consumer's `T` need only agree on the
-//!   wire, not be the same Rust type.
+//!   uses the same parcel mode.
 //! * **The stream ends with a status.** [`Sink::end`] ends it clean;
 //!   [`Sink::end_with`] carries a `Status`, so a service-specific failure
 //!   reaches the consumer with its code and message intact, as the error
@@ -189,6 +197,82 @@ mod pool;
 mod ring;
 
 pub use generated::rsbinder::stream::StreamEndpoint::StreamEndpoint;
+
+impl<T> StreamEndpoint<T> {
+    /// The same endpoint with `U` as its item type.
+    ///
+    /// The type argument is the `.aidl`'s statement of what the items are,
+    /// and [`Receiver::new`] and [`Sink::open`] hold both ends to it. It
+    /// is not on the wire — the endpoint is the same bytes whatever the
+    /// item type — so a Rust type other than the generated one, encoding
+    /// the same way, can stand in on either end: `cast` the endpoint the
+    /// generated code handed over, or the one a receiver made before
+    /// passing it on. A generated handler receives the endpoint by
+    /// reference (`&StreamEndpoint<T>`); there, cast a copy:
+    /// `endpoint.try_clone()?.cast::<U>()` (see [`try_clone`](Self::try_clone)).
+    ///
+    /// Nothing checks that the two encode alike. A mismatch the consumer's
+    /// decoding notices ends the stream there with that error — among
+    /// others [`StatusCode::NotEnoughData`] when an item's bytes run out,
+    /// [`StatusCode::BadValue`] when some are left over,
+    /// [`StatusCode::UnexpectedNull`] for a null marker where a value is
+    /// required. One it does not notice — `i32` read as `f32`, two
+    /// parcelables with the same fields — is read as the wrong value.
+    ///
+    /// Without `cast`, an endpoint opens a sink of its own item type only:
+    ///
+    /// ```compile_fail,E0308
+    /// # use rsbinder::stream::{Receiver, Sink, Token};
+    /// # fn f() -> rsbinder::Result<()> {
+    /// let (_rx, endpoint) = Receiver::<i32>::new(&Token::new().binder())?;
+    /// let _sink = Sink::<i64>::open(&endpoint)?; // expected `StreamEndpoint<i64>`
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn cast<U>(self) -> StreamEndpoint<U> {
+        StreamEndpoint {
+            ring: self.ring,
+            sink: self.sink,
+            _phantom_T: PhantomData,
+        }
+    }
+
+    /// A second endpoint for the same stream: the same sink binder and, on
+    /// the kernel path, fresh duplicates of the ring's file descriptors.
+    ///
+    /// The generated server trait hands a handler `&StreamEndpoint<T>`,
+    /// which [`Sink::open`] takes as it is; `try_clone` is for a handler
+    /// that needs an endpoint of its own — to [`cast`](Self::cast) it to
+    /// another item type, or to keep it past the call.
+    ///
+    /// # Errors
+    ///
+    /// [`StatusCode::BadValue`] for a ring descriptor that does not
+    /// describe a synchronized ring, which [`Sink::open`] refuses too;
+    /// whatever duplicating a file descriptor fails with.
+    pub fn try_clone(&self) -> Result<Self> {
+        let ring = match &self.ring {
+            Some(ring) => Some(crate::fmq::Descriptor::try_from(ring)?.try_into()?),
+            None => None,
+        };
+        Ok(StreamEndpoint {
+            ring,
+            sink: self.sink.clone(),
+            _phantom_T: PhantomData,
+        })
+    }
+
+    fn with(
+        ring: Option<crate::fmq::MQDescriptor<i8, crate::fmq::SynchronizedReadWrite>>,
+        sink: SIBinder,
+    ) -> Self {
+        StreamEndpoint {
+            ring,
+            sink: Some(sink),
+            _phantom_T: PhantomData,
+        }
+    }
+}
 
 /// Bytes at the end of a ring that item records never occupy, so that the
 /// end record — at most this long, its message cut to fit — always has
@@ -641,9 +725,14 @@ enum SinkInner<T: ?Sized> {
 /// The producer's handle on a stream: write items in, they reach the
 /// consumer in order.
 ///
-/// Made by [`Sink::open`] from the endpoint the consumer supplied. Values
-/// of `T` are encoded with the same codec as [`crate::to_bytes`], so the
-/// consumer's `T` need only agree on the wire, not be the same Rust type.
+/// Made by [`Sink::open`] from the endpoint the consumer supplied, whose
+/// type argument is `T`: a `StreamEndpoint<LogLine>` opens a
+/// `Sink<LogLine>`. Values of `T` are encoded with the same codec as
+/// [`crate::to_bytes`], so the consumer's item type need only agree on
+/// the wire, not be the same Rust type — [`StreamEndpoint::cast`] says so
+/// where the two differ. [`open_borrowed`](Self::open_borrowed) opens a
+/// sink of the item type's borrowed form, a `Sink<str>` from a
+/// `StreamEndpoint<String>`.
 ///
 /// Every method that produces takes `&mut self`, so one thread or task at
 /// a time sends. Moving the sink to a worker thread after opening it is
@@ -677,7 +766,7 @@ pub struct Sink<T: ?Sized> {
     send_timeout: Option<Duration>,
 }
 
-impl<T: Serialize + ?Sized> Sink<T> {
+impl<T: Serialize> Sink<T> {
     /// Take the consumer's endpoint and start a stream, with the default
     /// [`SinkPolicy`].
     ///
@@ -702,7 +791,7 @@ impl<T: Serialize + ?Sized> Sink<T> {
     /// - Whatever watching the consumer for death, or the RPC path's
     ///   `onStart`, fails with — [`StatusCode::DeadObject`] for a consumer
     ///   that is already gone.
-    pub fn open(endpoint: &StreamEndpoint) -> Result<Self> {
+    pub fn open(endpoint: &StreamEndpoint<T>) -> Result<Self> {
         Self::open_with(endpoint, &SinkPolicy::default())
     }
 
@@ -716,7 +805,42 @@ impl<T: Serialize + ?Sized> Sink<T> {
     /// consumer refuses is not an error here — `onStart` is `oneway` —
     /// but a cancel, which [`send`](Self::send) reports when it next has
     /// a batch to send; the reason is on the consumer's side.
-    pub fn open_with(endpoint: &StreamEndpoint, policy: &SinkPolicy) -> Result<Self> {
+    pub fn open_with(endpoint: &StreamEndpoint<T>, policy: &SinkPolicy) -> Result<Self> {
+        Self::open_borrowed(endpoint, policy)
+    }
+}
+
+impl<T: Serialize + ?Sized> Sink<T> {
+    /// [`open_with`](Self::open_with) for a sink that sends a borrowed form
+    /// of the endpoint's item type: a `Sink<str>` from a
+    /// `StreamEndpoint<String>`, so that a producer holding `&str` lines
+    /// sends them without allocating a `String` for each.
+    ///
+    /// `E: Borrow<T>` is the whole check, so the borrowed form must encode
+    /// as the owned one does. It does for the pairs the standard library
+    /// provides that an item type can have — `String`/`str`, `Vec<U>`/`[U]`,
+    /// `Box<U>`/`U` — and a type of the caller's own that implements
+    /// `Borrow` with a different encoding fails at the consumer, as
+    /// [`StreamEndpoint::cast`] describes.
+    ///
+    /// ```no_run
+    /// # use rsbinder::stream::{Sink, SinkPolicy, StreamEndpoint};
+    /// # fn handler(endpoint: &StreamEndpoint<String>, text: &str) -> rsbinder::Result<()> {
+    /// let mut sink = Sink::<str>::open_borrowed(endpoint, &SinkPolicy::default())?;
+    /// for line in text.lines() {
+    ///     sink.send(line)?;
+    /// }
+    /// sink.end()
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Everything [`open_with`](Self::open_with) returns.
+    pub fn open_borrowed<E: std::borrow::Borrow<T>>(
+        endpoint: &StreamEndpoint<E>,
+        policy: &SinkPolicy,
+    ) -> Result<Self> {
         let Some(sink) = endpoint.sink.as_ref() else {
             log::error!("Sink::open: the endpoint has no sink");
             return Err(StatusCode::BadValue);
@@ -1149,7 +1273,8 @@ impl<T: Deserialize> Receiver<T> {
     /// not watched at all.
     ///
     /// Pass the endpoint to the method that starts the stream — declared
-    /// in `.aidl` as `rsbinder.stream.StreamEndpoint`.
+    /// in `.aidl` as `rsbinder.stream.StreamEndpoint<T>`, so the method's
+    /// signature fixes the item type of the receiver that can call it.
     ///
     /// # Errors
     ///
@@ -1162,12 +1287,15 @@ impl<T: Deserialize> Receiver<T> {
     /// ([`ClientOptions::incoming_connections`](crate::ClientOptions::incoming_connections)),
     /// which a stream over RPC needs in either direction: nothing would
     /// read the producer's batches, nor notice that end dying.
-    pub fn new(peer: &SIBinder) -> Result<(Self, StreamEndpoint)> {
+    pub fn new(peer: &SIBinder) -> Result<(Self, StreamEndpoint<T>)> {
         Self::with_policy(peer, &ReceiverPolicy::default())
     }
 
     /// [`new`](Self::new) with the policy set explicitly.
-    pub fn with_policy(peer: &SIBinder, policy: &ReceiverPolicy) -> Result<(Self, StreamEndpoint)> {
+    pub fn with_policy(
+        peer: &SIBinder,
+        policy: &ReceiverPolicy,
+    ) -> Result<(Self, StreamEndpoint<T>)> {
         let (inner, ring, sink, death) = if over_ring(peer) {
             let (consumer, ring, sink) = ring::Consumer::new(policy)?;
             let death = watch_death(peer, consumer.death_recipient())?;
@@ -1177,10 +1305,7 @@ impl<T: Deserialize> Receiver<T> {
             let death = watch_death(peer, consumer.death_recipient())?;
             (ReceiverInner::Calls(consumer), None, sink, death)
         };
-        let endpoint = StreamEndpoint {
-            ring,
-            sink: Some(sink),
-        };
+        let endpoint = StreamEndpoint::with(ring, sink);
         let receiver = Receiver {
             inner,
             peer: peer.clone(),
@@ -1193,15 +1318,12 @@ impl<T: Deserialize> Receiver<T> {
     /// The endpoint again, for a caller that did not keep the one
     /// [`new`](Self::new) returned. A ring endpoint carries fresh
     /// duplicates of the ring's file descriptor.
-    pub fn endpoint(&self) -> Result<StreamEndpoint> {
+    pub fn endpoint(&self) -> Result<StreamEndpoint<T>> {
         let (ring, sink) = match &self.inner {
             ReceiverInner::Calls(c) => (None, c.sink_binder()),
             ReceiverInner::Ring(c) => (Some(c.ring()?), c.sink_binder()),
         };
-        Ok(StreamEndpoint {
-            ring,
-            sink: Some(sink),
-        })
+        Ok(StreamEndpoint::with(ring, sink))
     }
 
     /// The next item, blocking until one arrives.
@@ -1427,6 +1549,76 @@ mod tests {
         assert_eq!(got, sent);
         assert!(rx.is_finished());
         assert!(rx.end_status().expect("a terminator arrived").is_ok());
+    }
+
+    /// A consumer's own type, encoded as the declared `i32`, stands in through `cast`.
+    #[test]
+    fn a_cast_endpoint_carries_a_type_that_encodes_alike() {
+        #[derive(Debug, PartialEq)]
+        struct Celsius(i32);
+        impl Deserialize for Celsius {
+            fn deserialize(parcel: &mut Parcel) -> Result<Self> {
+                parcel.read::<i32>().map(Celsius)
+            }
+        }
+        let peer = Token::new().binder();
+        let (mut rx, endpoint) = Receiver::<Celsius>::new(&peer).expect("a receiver");
+        let endpoint: StreamEndpoint<i32> = endpoint.cast();
+        let mut sink = Sink::open(&endpoint).expect("open");
+        sink.send_all([20, 21].iter()).expect("send_all");
+        sink.end().expect("end");
+
+        let got: Vec<Celsius> = (&mut rx).map(|item| item.expect("item")).collect();
+        assert_eq!(got, [Celsius(20), Celsius(21)]);
+    }
+
+    /// A handler holds only `&StreamEndpoint<T>`; its own type goes through a cast copy.
+    #[test]
+    fn a_borrowed_endpoint_casts_through_try_clone() {
+        struct Celsius(i32);
+        impl Serialize for Celsius {
+            fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
+                parcel.write(&self.0)
+            }
+        }
+        fn handler(endpoint: &StreamEndpoint<i32>) -> Result<Sink<Celsius>> {
+            Sink::open(&endpoint.try_clone()?.cast())
+        }
+        let peer = Token::new().binder();
+        let (mut rx, endpoint) = Receiver::<i32>::new(&peer).expect("a receiver");
+        let mut sink = handler(&endpoint).expect("open");
+        drop(endpoint);
+        sink.send_all([Celsius(20), Celsius(21)].iter())
+            .expect("send_all");
+        sink.end().expect("end");
+
+        let got: Vec<i32> = (&mut rx).map(|item| item.expect("item")).collect();
+        assert_eq!(got, [20, 21]);
+    }
+
+    /// A `StreamEndpoint<String>` producer sends `&str` without an owned `String` per item.
+    #[test]
+    fn a_borrowed_item_type_opens_through_open_borrowed() {
+        let peer = Token::new().binder();
+        let (mut rx, endpoint) = Receiver::<String>::new(&peer).expect("a receiver");
+        let mut sink = Sink::<str>::open_borrowed(&endpoint, &SinkPolicy::default()).expect("open");
+        drop(endpoint);
+        for line in "one\ntwo".lines() {
+            sink.send(line).expect("send");
+        }
+        sink.end().expect("end");
+
+        let got: Vec<String> = (&mut rx).map(|item| item.expect("item")).collect();
+        assert_eq!(got, ["one", "two"]);
+    }
+
+    /// The generated `Debug` puts no bound on the item type.
+    #[test]
+    fn an_endpoint_formats_whatever_its_item_type() {
+        struct Opaque;
+        let printed = format!("{:?}", StreamEndpoint::<Opaque>::default());
+        assert!(printed.starts_with("StreamEndpoint"), "{printed}");
+        assert!(!printed.contains("_phantom"), "{printed}");
     }
 
     /// The service's failure arrives after the call that started the stream already succeeded.
@@ -1710,10 +1902,7 @@ mod tests {
             max_opening: 4,
             ..ReceiverPolicy::default()
         });
-        let endpoint = StreamEndpoint {
-            ring: None,
-            sink: Some(sink_binder),
-        };
+        let endpoint = StreamEndpoint::with(None, sink_binder);
         let policy = SinkPolicy {
             initial_credits: 1,
             ..policy

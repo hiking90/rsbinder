@@ -132,8 +132,8 @@ tweaks; wire formats are already locked.
   [Generic Parcelables](./aidl-parcelable.md#generic-parcelables).
 - **Streaming (new in 0.12.0)** — the `stream` module: `Sink`, `Receiver`,
   and the three AIDL files in `rsbinder/aidl/stream/`: the
-  `rsbinder.stream.StreamEndpoint` parcelable (the ring's record layout and
-  EventFlag bits on the kernel path) and the two interfaces `IStreamSink` /
+  `rsbinder.stream.StreamEndpoint<T>` parcelable (`T` the item type; the ring's
+  record layout and EventFlag bits on the kernel path) and the two interfaces `IStreamSink` /
   `IStreamSource` (the RPC path). The contract is rsbinder's own rather than
   AOSP's, written as ordinary AIDL so a C++ or NDK peer can be either end (a
   Java peer is out of scope: AOSP has no Java FMQ). Validated

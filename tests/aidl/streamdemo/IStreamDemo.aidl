@@ -6,7 +6,8 @@
 //
 // `rsbinder.stream.StreamEndpoint` resolves to `rsbinder::stream::
 // StreamEndpoint` — rsbinder-aidl ships the declaration — so the service
-// opens a `Sink` on exactly what the caller's `Receiver` made. Which
+// opens a `Sink` on exactly what the caller's `Receiver` made, and the
+// type argument makes both of them `int` streams. Which
 // transport the stream runs on is decided by the caller's peer: over
 // kernel binder the endpoint carries a ring, over an RPC session only the
 // sink. The `subscribe*` methods return nothing: the stream's own
@@ -23,17 +24,17 @@ interface IStreamDemo {
     // `initialCredits` of them) and are ignored on a ring. `delayMicros`
     // paces the producer, which is how a test decides whether a consumer
     // that dies finds it holding room or parked waiting for some.
-    void subscribe(in StreamEndpoint endpoint, int count, int maxBatchBytes,
+    void subscribe(in StreamEndpoint<int> endpoint, int count, int maxBatchBytes,
                    int initialCredits, int delayMicros);
 
     // `subscribe`, with the producer running as a task on the service's
     // async runtime instead of a thread of its own.
-    void subscribeAsync(in StreamEndpoint endpoint, int count, int maxBatchBytes,
+    void subscribeAsync(in StreamEndpoint<int> endpoint, int count, int maxBatchBytes,
                         int initialCredits);
 
     // Stream `count` integers and then end with a service-specific
     // failure carrying `code` and `message`.
-    void subscribeFailing(in StreamEndpoint endpoint, int count, int code, String message);
+    void subscribeFailing(in StreamEndpoint<int> endpoint, int count, int code, String message);
 
     // How many items the producer has handed to the stream so far.
     int sent();
@@ -58,7 +59,7 @@ interface IStreamDemo {
     // here and charged to the service. The service takes the whole
     // stream on a thread of its own; the `upload*` getters report what
     // it saw.
-    StreamEndpoint upload(IBinder producer, int ringBytes);
+    StreamEndpoint<int> upload(IBinder producer, int ringBytes);
 
     // How many items the upload consumer has taken so far.
     int uploaded();
