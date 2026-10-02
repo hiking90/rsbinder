@@ -20,6 +20,11 @@
 //! `vsock` is not here: it needs a VM peer (its own tests are `#[ignore]`),
 //! and its behaviour is inferred from `vsock(7)`, not measured.
 //!
+//! `peer_closed` is pinned the same way: `Some(false)` while the peer is open
+//! even with a frame unread, then `Some(true)` once it closes — on Linux for
+//! every socket backend, elsewhere for Unix-domain ones (tls here runs over a
+//! unix pair) and `None` for `tcp_debug`; `mem` keeps the trait's `None`.
+//!
 //! An fd-mode reader parked in `recvmsg` holds the reader lock until the
 //! socket wakes it, so a `shutdown` that takes that lock first deadlocks
 //! against it. Every `shutdown` here runs under a deadline, so such a bug
@@ -206,6 +211,43 @@ fn armed(pair: (Shared, Shared)) -> (Shared, Shared) {
     pair
 }
 
+/// What `peer_closed` reports once the peer is gone: `POLLRDHUP` on Linux/Android, `POLLHUP` for
+/// an `AF_UNIX` socket elsewhere, and nothing a poll can read for a TCP FIN elsewhere.
+fn closed_expectation(unix_domain: bool) -> Option<bool> {
+    if cfg!(any(target_os = "linux", target_os = "android")) || unix_domain {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// `peer_closed` is `false` while the peer is open, unread bytes or not, and then `closed`.
+fn peer_closed_tracks_the_peer(name: &str, local: &Shared, peer: Shared, closed: Option<bool>) {
+    let open = closed.map(|_| false);
+    assert_eq!(local.peer_closed(), open, "{name}: peer open");
+    peer.send_frame(b"unread").expect("peer send");
+    // A FIN on loopback lands asynchronously on some stacks; give the flags time to settle.
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(
+        local.peer_closed(),
+        open,
+        "{name}: an unread frame is not a close"
+    );
+    drop(peer);
+    let mut got = local.peer_closed();
+    for _ in 0..200 {
+        if got == closed {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        got = local.peer_closed();
+    }
+    assert_eq!(
+        got, closed,
+        "{name}: peer closed, with a frame still unread"
+    );
+}
+
 fn unix_pair() -> (Shared, Shared) {
     let (a, b) = UnixTransport::pair().expect("socketpair");
     armed((Arc::new(a), Arc::new(b)))
@@ -258,6 +300,19 @@ fn unix_fd_mode_blocked_reader_is_woken() {
 fn unix_our_send_after_our_shutdown_fails() {
     let (local, _peer) = unix_pair();
     our_send_after_our_shutdown_fails("unix", &local);
+}
+
+#[test]
+fn unix_peer_closed_tracks_the_peer() {
+    let (local, peer) = unix_pair();
+    peer_closed_tracks_the_peer("unix", &local, peer, closed_expectation(true));
+}
+
+/// `mem` keeps the trait default: it cannot tell, so it never claims the peer is open.
+#[test]
+fn mem_peer_closed_is_unknown() {
+    let (local, peer) = mem_pair();
+    peer_closed_tracks_the_peer("mem", &local, peer, None);
 }
 
 #[test]
@@ -319,6 +374,12 @@ mod tcp {
     fn tcp_debug_our_send_after_our_shutdown_fails() {
         let (local, _peer) = tcp_pair();
         our_send_after_our_shutdown_fails("tcp_debug", &local);
+    }
+
+    #[test]
+    fn tcp_debug_peer_closed_tracks_the_peer() {
+        let (local, peer) = tcp_pair();
+        peer_closed_tracks_the_peer("tcp_debug", &local, peer, closed_expectation(false));
     }
 }
 
@@ -395,5 +456,12 @@ mod tls {
     fn tls_our_send_after_our_shutdown_fails() {
         let (local, _peer) = tls_pair();
         our_send_after_our_shutdown_fails("tls", &local);
+    }
+
+    /// The socket's close decides, so an unread record (here a whole frame) changes nothing.
+    #[test]
+    fn tls_peer_closed_tracks_the_peer() {
+        let (local, peer) = tls_pair();
+        peer_closed_tracks_the_peer("tls", &local, peer, closed_expectation(true));
     }
 }

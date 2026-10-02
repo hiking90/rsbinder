@@ -133,4 +133,9 @@ impl RpcTransport for VsockTransport {
     fn shutdown(&self) -> RpcResult<()> {
         super::absorb_already_shut(self.stream.shutdown(std::net::Shutdown::Both))
     }
+
+    fn peer_closed(&self) -> Option<bool> {
+        use std::os::fd::AsFd;
+        super::socket_peer_closed(self.stream.as_fd(), super::SocketKind::TcpOrVsock)
+    }
 }
