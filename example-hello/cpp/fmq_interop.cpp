@@ -4,7 +4,8 @@
 // Plan 12-fmq F2 STAGE3 — `fmqinterop.IFmqPeer` on AOSP's own stack:
 // libbinder_ndk carries the `MQDescriptor`, libfmq (`AidlMessageQueue`,
 // the device's libfmq.so) runs the ring, libcutils makes the shared
-// memory (ashmem on this device, memfd with `sys.use_memfd=true`). The
+// memory (ashmem, or memfd with `sys.use_memfd=true` and by default on an
+// Android 17 device — see `LIBCUTILS_KIND` in run_fmq_interop.sh). The
 // other end is rsbinder (`tests/src/fmq_peer.rs` through `fmq_probe`),
 // and either side can be the service.
 //
