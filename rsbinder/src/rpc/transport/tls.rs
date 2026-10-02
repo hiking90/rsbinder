@@ -218,6 +218,13 @@ pub trait TlsStream: Send + Sync {
     fn set_liveness(&self, _t: Option<Duration>) -> std::io::Result<()> {
         Ok(())
     }
+    /// Whether the peer has closed the stream, as
+    /// [`RpcTransport::peer_closed`] describes it; `TlsTransport` answers
+    /// with this. The default is `None` (unknown); the bundled streams
+    /// implement it.
+    fn peer_closed(&self) -> Option<bool> {
+        None
+    }
 }
 
 // std streams implement `Read`/`Write` for `&Stream`, so `&self` forwards with no lock.
@@ -244,6 +251,10 @@ impl TlsStream for TcpStream {
         use std::os::fd::AsFd;
         super::tcp_liveness(self.as_fd(), t)
     }
+    fn peer_closed(&self) -> Option<bool> {
+        use std::os::fd::AsFd;
+        super::socket_peer_closed(self.as_fd(), super::SocketKind::TcpOrVsock)
+    }
 }
 
 impl TlsStream for UnixStream {
@@ -264,6 +275,10 @@ impl TlsStream for UnixStream {
     }
     fn shutdown_stream(&self) -> std::io::Result<()> {
         UnixStream::shutdown(self, std::net::Shutdown::Both)
+    }
+    fn peer_closed(&self) -> Option<bool> {
+        use std::os::fd::AsFd;
+        super::socket_peer_closed(self.as_fd(), super::SocketKind::UnixDomain)
     }
 }
 
@@ -286,6 +301,10 @@ impl TlsStream for vsock::VsockStream {
     }
     fn shutdown_stream(&self) -> std::io::Result<()> {
         vsock::VsockStream::shutdown(self, std::net::Shutdown::Both)
+    }
+    fn peer_closed(&self) -> Option<bool> {
+        use std::os::fd::AsFd;
+        super::socket_peer_closed(self.as_fd(), super::SocketKind::TcpOrVsock)
     }
 }
 
@@ -620,6 +639,11 @@ impl RpcTransport for TlsTransport {
     fn set_liveness(&self, timeout: Option<std::time::Duration>) -> RpcResult<()> {
         self.stream.set_liveness(timeout)?;
         Ok(())
+    }
+
+    // The socket's FIN, not `close_notify`: a buffered alert is still an unread byte.
+    fn peer_closed(&self) -> Option<bool> {
+        self.stream.peer_closed()
     }
 
     fn shutdown(&self) -> RpcResult<()> {

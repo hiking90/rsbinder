@@ -264,6 +264,29 @@ pub trait RpcTransport: Send + Sync {
         Ok(())
     }
 
+    /// Whether the peer has closed this connection, judged from the socket
+    /// without reading it: `Some(true)` closed, `Some(false)` open as far as
+    /// this end's kernel knows, `None` when the transport cannot tell. `None`
+    /// is the default and means "unknown", never "open".
+    ///
+    /// A session with no incoming connection and no serve loop reads its
+    /// connection only during a call, so a peer that left between calls goes
+    /// unnoticed until the next one fails. The reconnect helper asks this
+    /// before running a call on such a session: a closed peer found here means
+    /// nothing has been sent yet, so the call can go to a new session instead.
+    ///
+    /// Bytes waiting to be read do not count either way. The bundled socket
+    /// transports answer on Linux and Android from `POLLRDHUP` (the peer's FIN
+    /// or reset, even behind unread data), and on Apple platforms from
+    /// `POLLHUP`, which XNU sets on the same events for TCP and on a peer's
+    /// close for Unix-domain sockets. On other systems Unix-domain sockets
+    /// answer from `POLLHUP` and TCP is `None`: what their `poll` reports for
+    /// a FIN has not been measured. A custom transport overrides this to take
+    /// part.
+    fn peer_closed(&self) -> Option<bool> {
+        None
+    }
+
     /// Shut the connection down in both directions: wake a reader blocked
     /// in [`recv_frame`](Self::recv_frame) / [`recv_raw`](Self::recv_raw)
     /// and make this end's later sends fail. (The *peer's* sends are the
@@ -636,6 +659,53 @@ const KEEPALIVE_PROBES: u32 = 3;
 /// Linux `MAX_TCP_KEEPIDLE` = `MAX_TCP_KEEPINTVL` (`include/net/tcp.h`); more is `EINVAL`.
 #[cfg(any(feature = "rpc-tcp-debug", feature = "rpc-tls"))]
 const MAX_KEEPALIVE_SECS: u64 = 32767;
+
+/// Which socket family [`socket_peer_closed`] polls: the flag a peer's close sets differs.
+#[derive(Clone, Copy)]
+pub(crate) enum SocketKind {
+    UnixDomain,
+    // TCP and vsock: only their transports' features use it.
+    #[cfg_attr(
+        not(any(feature = "rpc-tcp-debug", feature = "rpc-tls", feature = "rpc-vsock")),
+        allow(dead_code)
+    )]
+    TcpOrVsock,
+}
+
+/// `RpcTransport::peer_closed` for a stream socket; see that method's doc for the flags.
+pub(crate) fn socket_peer_closed(
+    fd: std::os::fd::BorrowedFd<'_>,
+    kind: SocketKind,
+) -> Option<bool> {
+    use rustix::event::{poll, PollFd, PollFlags, Timespec};
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let (ask, closed) = {
+        let _ = kind;
+        (
+            PollFlags::RDHUP,
+            PollFlags::RDHUP | PollFlags::HUP | PollFlags::ERR,
+        )
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let (ask, closed) = match kind {
+        // XNU reports `POLLHUP` only from a read filter, which it registers only when asked.
+        SocketKind::UnixDomain => (PollFlags::HUP, PollFlags::HUP | PollFlags::ERR),
+        // XNU sets `POLLHUP` on a TCP FIN or reset as well; other systems are unmeasured.
+        #[cfg(target_vendor = "apple")]
+        SocketKind::TcpOrVsock => (PollFlags::HUP, PollFlags::HUP | PollFlags::ERR),
+        #[cfg(not(target_vendor = "apple"))]
+        SocketKind::TcpOrVsock => return None,
+    };
+    let mut fds = [PollFd::from_borrowed_fd(fd, ask)];
+    let now = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    match poll(&mut fds, Some(&now)) {
+        Ok(_) => Some(fds[0].revents().intersects(closed)),
+        Err(_) => None,
+    }
+}
 
 /// `TCP_KEEPIDLE` and `TCP_KEEPINTVL` for `d`, as `RpcTransport::set_liveness` states them.
 #[cfg(any(feature = "rpc-tcp-debug", feature = "rpc-tls"))]

@@ -183,6 +183,9 @@ jobs:
         #   * tests/tests/fmq_binder.rs — `#[ignore]`d: an FMQ descriptor
         #     across the kernel binder between two rsbinder processes, so
         #     /dev/binder plus a live rsb_hub. integration-test.yml owns it.
+        #   * tests/tests/reconnect_kernel.rs, tests/tests/reconnect_hub_restart.rs
+        #     — `#[ignore]`d: /dev/binder plus a live rsb_hub, and the second
+        #     restarts the context manager itself. integration-test.yml owns both.
         #   * rsbinder-fmq/tests/libfmq_host.rs — `#[ignore]`d: needs the C++
         #     peer built from the AOSP checkout
         #     (`rsbinder-fmq/tests/cpp/build_host_peer.sh`). Run by hand.
@@ -317,7 +320,7 @@ jobs:
           cargo test -p tests --features rpc --test rpc_generated_stub --test entry_rpc --test gateway_rpc --test codegen_shapes \
             --test rpc_async --test rpc_calling_identity --test rpc_enforce_permission_deny \
             --test work_source_rpc --test observer_rpc --test transaction_names \
-            --test transport_caps --test cancel_rpc --test stream_rpc
+            --test transport_caps --test cancel_rpc --test stream_rpc --test reconnect_rpc
           cargo test -p tests --features rpc-tcp-debug --test rpc_generated_stub
           # `aidl_spans` installs a global `tracing` subscriber, so it needs
           # the `tracing` feature on top of `rpc`.
@@ -497,6 +500,11 @@ jobs:
           t cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_server -- --exact tls_android13plus_nested_callback_e2e
           t cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_server -- --exact preconnected_inet_fd_handshakes_over_tcp_debug
           cargo test -p rsbinder --features rpc,android_16 --test rpc_accessor
+      - name: Reconnecting over RPC (tests crate — plan 10-10b)
+        # Before each call on the default `unix://…#name` session the helper
+        # asks `RpcTransport::peer_closed`, which polls `POLLHUP` here and
+        # `POLLRDHUP` on Linux; this step is the run that covers the XNU half.
+        run: cargo test -p tests --features rpc --test reconnect_rpc
       - name: AIDL compiler tests (hermetic — plan 3 AC-3.4)
         # See the matching step in `linux-build` — plan 3 AC-3.4
         # requires the sweep + allowlist gate to run on both Linux and

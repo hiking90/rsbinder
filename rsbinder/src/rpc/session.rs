@@ -2654,6 +2654,19 @@ impl RpcSessionInner {
             .count()
     }
 
+    /// `RpcSession::peer_closed`: the transports copied out, then polled outside the lock.
+    pub(crate) fn peer_closed(&self) -> bool {
+        let transports: Vec<Arc<dyn RpcTransport>> = self
+            .conn_state
+            .lock()
+            .expect("conn_state poisoned")
+            .slots
+            .iter()
+            .map(|s| Arc::clone(&s.transport))
+            .collect();
+        transports.iter().any(|t| t.peer_closed() == Some(true))
+    }
+
     /// Shut every slot down so a `recv`-blocked thread sees `EndOfStream`; unlocked syscalls.
     fn shutdown_all_transports(&self) {
         let transports: Vec<Arc<dyn RpcTransport>> = self
@@ -4571,6 +4584,42 @@ impl RpcSession {
             }
             self.inner.incoming_joined.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    /// Whether this session has ended: every connection is shut, its
+    /// proxies return [`StatusCode::DeadObject`] without I/O, and its death
+    /// recipients have fired or are firing. Once `true` it stays `true`.
+    ///
+    /// A session ends as a whole on any connection's failure, an expired
+    /// reply deadline, the peer closing, or
+    /// [`close_session`](Self::close_session) ([module doc](self#session-end)).
+    /// The call that ended it may itself have returned `TimedOut` or a
+    /// decode error rather than `DeadObject`, so after a failed call this —
+    /// not the status code — tells whether to reconnect. A handler can also
+    /// return `DeadObject` from a live session, which this tells apart.
+    ///
+    /// This reads state; it does not probe the connection. A session whose
+    /// peer has gone while this end has not read from or written to it since
+    /// (no incoming connection, no serve loop, no call) still reads `false`.
+    /// It reads `true` from the moment the session starts ending, before its
+    /// recipients have all run.
+    pub fn is_ended(&self) -> bool {
+        self.inner.shared.lifecycle.is_torn_down()
+    }
+
+    /// Whether a lost connection ends this session as it happens (so `link_to_death` is allowed).
+    pub(crate) fn notices_connection_loss(&self) -> bool {
+        self.inner.notices_connection_loss()
+    }
+
+    /// Whether any connection's peer has closed, by `RpcTransport::peer_closed`; reads nothing.
+    pub(crate) fn peer_closed(&self) -> bool {
+        self.inner.peer_closed()
+    }
+
+    /// End the session as a connection fault does ("Session end"), from outside the module.
+    pub(crate) fn fail(&self) {
+        self.inner.fail_session();
     }
 
     /// Set the client reply/handshake wait deadline. `None`

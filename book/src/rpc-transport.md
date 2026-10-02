@@ -561,7 +561,8 @@ that would tell which `oneway` call or reference-count frame the lost
 connection took with it, and a session that carried on without them
 would leave an object's later `oneway` calls queued behind a number
 that never arrives. Reconnecting, fetching the root again and
-registering callbacks again are the application's. A connection whose
+registering callbacks again are the application's;
+[`Reconnecting`](./reconnecting.md) does all three. A connection whose
 handshake fails never joins the session. A server's callback
 connection whose connection-init write fails is dropped alone, since
 no frame rode it and the client's attach fails with it. A client's

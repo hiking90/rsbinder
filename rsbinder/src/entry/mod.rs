@@ -42,6 +42,7 @@ pub mod uri;
 mod client;
 mod server;
 
+pub(crate) use client::{open_staged, OpenStage};
 pub use client::{Client, ClientOptions};
 #[cfg(feature = "rpc")]
 pub use server::Authorizer;

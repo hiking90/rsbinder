@@ -201,7 +201,7 @@ tier_hermetic() {
         --test entry_rpc --test gateway_rpc --test codegen_shapes --test rpc_async \
         --test rpc_calling_identity --test rpc_enforce_permission_deny --test work_source_rpc \
         --test observer_rpc --test transaction_names --test transport_caps --test cancel_rpc \
-        --test stream_rpc
+        --test stream_rpc --test reconnect_rpc
     run "tests: rpc_generated_stub (tcp-debug)" tpass cargo test -p tests --features rpc-tcp-debug --test rpc_generated_stub
     run "tests: aidl_spans" tpass cargo test -p tests --features rpc,tracing --test aidl_spans
     run "rsbinder-macros" tpass cargo test -p rsbinder-macros
@@ -319,6 +319,8 @@ tier_kernel() {
     run "async_wait + entry_kernel_options" tpass cargo test -p tests --features rpc \
         --test async_wait --test entry_kernel_options -- --ignored --test-threads=1
     run "fmq_binder" tpass cargo test -p tests --test fmq_binder -- --ignored
+    run "reconnect_kernel" tpass cargo test -p tests --features rpc \
+        --test reconnect_kernel -- --ignored --test-threads=1
     local t
     for t in test_death_recipient test_wibinder_upgrade_after_obituary \
         test_death_recipient_panic_does_not_starve_others \
@@ -336,6 +338,9 @@ tier_kernel() {
         run "$(basename "$s" .sh)" bash "$s"
     done
     run "run_d8b_register" bash example-hello/cpp/run_d8b_register.sh
+    # Starts and kills its own rsb_hub, so it too runs with the shared one stopped.
+    run "reconnect_hub_restart" tpass cargo test -p tests --features rpc \
+        --test reconnect_hub_restart -- --ignored
 
     if [ -e /dev/vsock ] && grep -q '^vsock_loopback ' /proc/modules 2>/dev/null; then
         run "rpc_vsock (loopback)" tpass cargo test -p rsbinder --features rpc-vsock --test rpc_vsock -- --ignored
@@ -381,6 +386,7 @@ STAGE3=(
     "rpc_fd_interop|34|-|"
     "rpc_incoming_interop|36|-|"
     "rpc_multiconn_interop|36|-|"
+    "rpc_reconnect_interop|36|-|"
     "stream_interop|33|-|aosp"
     "stream_rpc_interop|34|-|aosp"
     "stream_ac|33|-|"

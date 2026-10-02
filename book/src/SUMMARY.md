@@ -21,6 +21,7 @@
     - [Shared Memory](./shared-memory.md)
     - [Streaming](./streaming.md)
     - [Error Handling](./error-handling.md)
+    - [Reconnecting to a Service](./reconnecting.md)
     - [Observability](./observability.md)
     - [Service Manager (HUB)](./service-manager.md)
 - [Storing Values (Data Serialization)](./data-serialization.md)

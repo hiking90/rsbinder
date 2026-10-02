@@ -326,6 +326,9 @@ pub use fmq::generated::android::hardware::common::NativeHandle::NativeHandle;
 mod rt;
 // Unified entry API (Plan 2-17); no outer doc: it would re-resolve inner `//!` links at root.
 pub mod entry;
+// Reconnect helper (Plan 10-10b); no outer doc, for the same reason.
+pub mod reconnect;
+pub use reconnect::Reconnecting;
 
 #[cfg(feature = "tokio")]
 pub use entry::connect_async;

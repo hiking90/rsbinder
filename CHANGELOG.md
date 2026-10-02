@@ -92,7 +92,8 @@ This changelog starts at 0.9.0. For earlier releases, see the
   flight on the others return `DeadObject`, every death recipient fires, and
   every local object the peer held is released. 0.11.0 retired the failing
   connection and let a fan-out session go on. After a session ends, reconnect,
-  fetch the root and register callbacks again. A client's incoming connection
+  fetch the root and register callbacks again — `rsbinder::Reconnecting` (see
+  *Added*) does this for one service. A client's incoming connection
   whose serve thread cannot be spawned ends the session too, since the server
   already holds it as a callback connection.
   So does every other failed incoming attach, except one whose header never
@@ -198,6 +199,24 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Added
 
+- **`rsbinder::Reconnecting`** (`rsbinder::reconnect`): a handle to one
+  service, named by a URI, that looks it up again when its process dies or
+  its RPC session ends, runs an `on_connect` hook (register callbacks there)
+  and hands the new proxy to callers. Calls go through `with`, which runs the
+  closure once and never resends it; a call waits only for a reconnect
+  attempt in progress (`ReconnectPolicy::call_wait`). `build` fails only on
+  what a retry cannot fix, so a client may start before its server;
+  `wait_connected` and, with `tokio`, `connected().await` wait for a
+  connection. Kernel binder and every RPC transport; works with the root
+  object of a libbinder `RpcServer`. See the book's "Reconnecting to a
+  Service".
+- **`RpcSession::is_ended`**: whether a session has ended. After a failed
+  call this, not the status code, says whether to reconnect.
+- **`RpcTransport::peer_closed` and `TlsStream::peer_closed`**: whether the
+  peer closed the connection, from a zero-timeout poll that reads nothing
+  (`POLLRDHUP` on Linux and Android; `POLLHUP` on Apple platforms, and for
+  Unix-domain sockets elsewhere). Defaults to `None` (unknown); the bundled
+  socket transports implement it.
 - **Generic parcelables** (`rsbinder-aidl`): `parcelable Foo<T, U> { … }`
   generates `pub struct Foo<T, U>` with a `_phantom_T: PhantomData` field per
   parameter, as AOSP does; its `Default` and `Debug` put no bound on the

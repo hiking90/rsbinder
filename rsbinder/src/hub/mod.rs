@@ -1365,44 +1365,54 @@ impl ServiceManager {
         name: &str,
         callback: &crate::Strong<dyn IServiceCallback>,
     ) -> Result<()> {
+        self.register_for_notifications_status(name, callback)
+            .map_err(StatusCode::from)
+    }
+
+    /// `register_for_notifications` keeping the `Status`, whose refusal exception it would lose.
+    pub(crate) fn register_for_notifications_status(
+        &self,
+        name: &str,
+        callback: &crate::Strong<dyn IServiceCallback>,
+    ) -> std::result::Result<(), Status> {
         match self {
             #[cfg(all(target_os = "android", feature = "android_10"))]
             ServiceManager::Android10(_) => {
                 log::error!("register_for_notifications: not supported on Android 10");
-                Err(StatusCode::UnknownTransaction)
+                Err(StatusCode::UnknownTransaction.into())
             }
             #[cfg(all(target_os = "android", feature = "android_11"))]
-            ServiceManager::Android11(sm) => android_11::register_for_notifications(
+            ServiceManager::Android11(sm) => android_11::IServiceManager::registerForNotifications(
                 sm,
                 name,
                 &wrap_callback!(android_11, callback),
             ),
             #[cfg(all(target_os = "android", feature = "android_12"))]
-            ServiceManager::Android12(sm) => android_12::register_for_notifications(
+            ServiceManager::Android12(sm) => android_12::IServiceManager::registerForNotifications(
                 sm,
                 name,
                 &wrap_callback!(android_12, callback),
             ),
             #[cfg(all(target_os = "android", feature = "android_13"))]
-            ServiceManager::Android13(sm) => android_13::register_for_notifications(
+            ServiceManager::Android13(sm) => android_13::IServiceManager::registerForNotifications(
                 sm,
                 name,
                 &wrap_callback!(android_13, callback),
             ),
             #[cfg(all(target_os = "android", feature = "android_14"))]
-            ServiceManager::Android14(sm) => android_14::register_for_notifications(
+            ServiceManager::Android14(sm) => android_14::IServiceManager::registerForNotifications(
                 sm,
                 name,
                 &wrap_callback!(android_14, callback),
             ),
             #[cfg(all(target_os = "android", feature = "android_15"))]
-            ServiceManager::Android15(sm) => android_15::register_for_notifications(
+            ServiceManager::Android15(sm) => android_15::IServiceManager::registerForNotifications(
                 sm,
                 name,
                 &wrap_callback!(android_15, callback),
             ),
             ServiceManager::Android16(sm) => {
-                android_16::register_for_notifications(sm, name, callback)
+                android_16::IServiceManager::registerForNotifications(sm, name, callback)
             }
         }
     }
@@ -1747,6 +1757,8 @@ impl ServiceManager {
     pub fn wait_for_service(&self, name: &str) -> Option<SIBinder> {
         // Private state is never cancelled, so this is AOSP's `while(true)`.
         self.wait_for_service_cancellable(name, Arc::new(WaiterState::default()))
+            .map_err(|end| end.log(name))
+            .ok()
     }
 
     /// `wait_for_service` that `state.cancel()` ends at once; see its rustdoc "Cancellation".
@@ -1754,32 +1766,26 @@ impl ServiceManager {
         &self,
         name: &str,
         state: Arc<WaiterState>,
-    ) -> Option<SIBinder> {
+    ) -> std::result::Result<SIBinder, WaitEnd> {
         // Fast path; a transport error means SM unreachable (AOSP `realGetService` → nullptr).
-        match self.try_get_service(name) {
-            Ok(Some(binder)) => return Some(binder),
-            Ok(None) => {}
-            Err(err) => {
-                log::warn!("wait_for_service: lookup for {name} failed ({err:?})");
-                return None;
-            }
+        if let Some(binder) = self.try_get_service(name).map_err(WaitEnd::Transient)? {
+            return Ok(binder);
         }
 
         // Cancelled during the fast path: leave the service manager's callback list untouched.
         if state.is_cancelled() {
-            return None;
+            return Err(WaitEnd::Cancelled);
         }
 
         let callback = BnServiceCallback::new_binder(Waiter(state.clone()));
 
-        if let Err(err) = self.register_for_notifications(name, &callback) {
+        if let Err(status) = self.register_for_notifications_status(name, &callback) {
             #[cfg(all(target_os = "android", feature = "android_10"))]
             if matches!(self, ServiceManager::Android10(_)) {
                 return self.poll_for_service(name, &state);
             }
             // AOSP `waitForService`: a refused registration (bad name, SELinux) ends the wait.
-            log::warn!("wait_for_service: registerForNotifications({name}) failed ({err:?})");
-            return None;
+            return Err(WaitEnd::from_registration(status));
         }
         // Always unregister, even on early return / panic (AOSP's `Defer`).
         let _unregister = UnregisterOnDrop {
@@ -1799,11 +1805,11 @@ impl ServiceManager {
                     })
                     .unwrap_or_else(|e| e.into_inner());
                 if let Some(binder) = guard.binder.as_ref() {
-                    return Some(binder.clone());
+                    return Ok(binder.clone());
                 }
                 // The caller gave up. `UnregisterOnDrop` fires on the way out.
                 if guard.cancelled {
-                    return None;
+                    return Err(WaitEnd::Cancelled);
                 }
             }
             // Every ~10s: a missing service stays visible without flooding the log.
@@ -1812,13 +1818,8 @@ impl ServiceManager {
             }
             waited_secs += 1;
             // Lazy-service race: re-poll each tick (AOSP `realGetService`); stop if SM is gone.
-            match self.try_get_service(name) {
-                Ok(Some(binder)) => return Some(binder),
-                Ok(None) => {}
-                Err(err) => {
-                    log::warn!("wait_for_service: lookup for {name} failed ({err:?})");
-                    return None;
-                }
+            if let Some(binder) = self.try_get_service(name).map_err(WaitEnd::Transient)? {
+                return Ok(binder);
             }
         }
     }
@@ -1837,15 +1838,14 @@ impl ServiceManager {
 
     /// Android 10 only: 1s polls until the service appears or the wait is cancelled.
     #[cfg(all(target_os = "android", feature = "android_10"))]
-    fn poll_for_service(&self, name: &str, state: &WaiterState) -> Option<SIBinder> {
+    fn poll_for_service(
+        &self,
+        name: &str,
+        state: &WaiterState,
+    ) -> std::result::Result<SIBinder, WaitEnd> {
         loop {
-            match self.try_get_service(name) {
-                Ok(Some(binder)) => return Some(binder),
-                Ok(None) => {}
-                Err(err) => {
-                    log::warn!("poll_for_service: lookup for {name} failed ({err:?}); giving up");
-                    return None;
-                }
+            if let Some(binder) = self.try_get_service(name).map_err(WaitEnd::Transient)? {
+                return Ok(binder);
             }
             let guard = state.inner.lock().unwrap_or_else(|e| e.into_inner());
             let (guard, _) = state
@@ -1853,8 +1853,41 @@ impl ServiceManager {
                 .wait_timeout_while(guard, std::time::Duration::from_secs(1), |st| !st.cancelled)
                 .unwrap_or_else(|e| e.into_inner());
             if guard.cancelled {
-                return None;
+                return Err(WaitEnd::Cancelled);
             }
+        }
+    }
+}
+
+/// Why [`ServiceManager::wait_for_service_cancellable`] returned without a binder.
+#[derive(Debug)]
+pub(crate) enum WaitEnd {
+    /// A lookup or registration failed in a way waiting again can fix (plan 10-10b §3.10).
+    Transient(StatusCode),
+    /// The service manager refused `registerForNotifications` (bad name, SELinux `find`).
+    Refused(Status),
+    Cancelled,
+}
+
+impl WaitEnd {
+    /// Only `EX_SECURITY` and `EX_ILLEGAL_ARGUMENT` repeat on retry (plan 10-10b §3.10).
+    pub(crate) fn from_registration(status: Status) -> Self {
+        match status.exception_code() {
+            ExceptionCode::Security | ExceptionCode::IllegalArgument => WaitEnd::Refused(status),
+            _ => WaitEnd::Transient(status.into()),
+        }
+    }
+
+    /// The public waits' give-up: log why, as `wait_for_service` always has.
+    pub(crate) fn log(self, name: &str) {
+        match self {
+            WaitEnd::Transient(code) => {
+                log::warn!("wait_for_service: lookup for {name} failed ({code:?})")
+            }
+            WaitEnd::Refused(status) => {
+                log::warn!("wait_for_service: registerForNotifications({name}) failed ({status})")
+            }
+            WaitEnd::Cancelled => {}
         }
     }
 }
@@ -1874,8 +1907,7 @@ struct WaiterInner {
 }
 
 impl WaiterState {
-    /// Ends the wait with `None` (idempotent, sticky); only the async drop guard calls it.
-    #[cfg(feature = "tokio")]
+    /// Ends the wait with `Cancelled` (idempotent, sticky): the async drop guard, a closing helper.
     pub(crate) fn cancel(&self) {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         guard.cancelled = true;
@@ -2165,4 +2197,27 @@ pub fn try_get_service_debug_info() -> std::result::Result<Vec<ServiceDebugInfo>
 #[inline]
 pub fn get_service_debug_info() -> Result<Vec<ServiceDebugInfo>> {
     default()?.get_service_debug_info()
+}
+
+#[cfg(test)]
+mod wait_end_tests {
+    use super::*;
+
+    /// AOSP `registerForNotifications` refusals: SELinux and a bad name repeat, the rest do not.
+    #[test]
+    fn only_security_and_illegal_argument_refuse() {
+        for refused in [ExceptionCode::Security, ExceptionCode::IllegalArgument] {
+            let end = WaitEnd::from_registration(refused.into());
+            assert!(matches!(end, WaitEnd::Refused(_)), "{refused:?}: {end:?}");
+        }
+        // rsb_hub's per-name cap and AOSP's failed callback link are `IllegalState`.
+        let end = WaitEnd::from_registration(ExceptionCode::IllegalState.into());
+        assert!(matches!(end, WaitEnd::Transient(_)), "{end:?}");
+        // A service manager gone between the lookup and the registration.
+        let end = WaitEnd::from_registration(StatusCode::DeadObject.into());
+        assert!(
+            matches!(end, WaitEnd::Transient(StatusCode::DeadObject)),
+            "{end:?}"
+        );
+    }
 }

@@ -156,6 +156,11 @@ impl RpcProxy {
         self.addr
     }
 
+    /// The session this proxy calls over; the reconnect helper watches it.
+    pub(crate) fn session(&self) -> super::RpcSession {
+        super::RpcSession::wrap_inner(self.session.clone())
+    }
+
     /// Stamp `descriptor` in place, first write wins; `true` if this call wrote it. See module doc.
     pub(crate) fn stamp_descriptor(&self, descriptor: &str) -> bool {
         self.descriptor.set(descriptor.to_string()).is_ok()
