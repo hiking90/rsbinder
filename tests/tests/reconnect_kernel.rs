@@ -10,7 +10,9 @@
 //! ```
 //!
 //! The service each test kills and restarts is `reconnect_service`, under a
-//! name of its own, so the shared `test_service` is never touched.
+//! name of its own, so the shared `test_service` is never touched. On a
+//! device, push it next to the test binary and point `RSB_RECONNECT_SERVICE`
+//! at it.
 
 #![cfg(any(target_os = "linux", target_os = "android"))]
 #![allow(non_snake_case)]
@@ -33,11 +35,17 @@ fn service_name(tag: &str) -> String {
     format!("rsb.test.reconnect.{tag}.{}", std::process::id())
 }
 
+/// The service binary; `RSB_RECONNECT_SERVICE` overrides the build path (on a device).
+fn service_bin() -> std::ffi::OsString {
+    std::env::var_os("RSB_RECONNECT_SERVICE")
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_reconnect_service").into())
+}
+
 /// `reconnect_service NAME TAG`, returned once it printed `ready` (registered).
 struct Service(Child);
 impl Service {
     fn start(name: &str, tag: &str) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_reconnect_service"))
+        let mut child = Command::new(service_bin())
             .args([name, tag])
             .stdout(Stdio::piped())
             .spawn()
