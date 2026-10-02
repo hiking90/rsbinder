@@ -22,8 +22,12 @@
 //! interleave because a connection has one writer at a time: every send,
 //! a `DEC_STRONG` from `RpcProxy::drop` included, goes out on a slot its
 //! thread holds (`session.rs` `ConnGuard`, `exclusive_tid`), so a frame
-//! written in more than one call stays whole. `write_frame` still coalesces
-//! the length and the body into one `write_all`.
+//! written in more than one call stays whole. `unix` and `tcp_debug` send
+//! the length and the body as two slices of one `sendmsg`
+//! (`unix::send_frame_vectored`). `tls` and `vsock` coalesce them into one
+//! `write_all` (`write_frame`): over `tls` two writes would let a
+//! `close_notify` from `shutdown` land between them, and `vsock` has no
+//! vectored send path here.
 //!
 //! The trait is **synchronous / blocking** (matches android-12 r34's
 //! blocking-thread model). An `async` adapter can be layered *on top*
@@ -547,6 +551,11 @@ impl fmt::Display for PeerIdentity {
 // --- Length-prefix framing shared by stream backends (module doc) ---
 
 /// Write one length-prefixed frame to a blocking stream.
+#[cfg(any(
+    test,
+    feature = "rpc-tls",
+    all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android"))
+))]
 pub(crate) fn write_frame<W: Write>(w: &mut W, buf: &[u8]) -> RpcResult<()> {
     if buf.len() > MAX_FRAME_LEN {
         return Err(RpcError::FrameTooLarge {

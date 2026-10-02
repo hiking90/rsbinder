@@ -355,6 +355,12 @@ This changelog starts at 0.9.0. For earlier releases, see the
   `to_bytes` hands back the parcel's own buffer when that is at most twice
   the value's size. A stream batch decodes from the bytes it received without
   copying them. No wire or signature change.
+- **RPC (r34 framing over Unix sockets, and `tcp_debug`): frames move with
+  fewer copies.** A frame goes out as its length and its body in one
+  `sendmsg`, without first joining them into a new buffer. A connection in fd
+  mode reads each frame's header and then its body straight into the frame,
+  where it used to read through an 8 KiB scratch buffer zeroed before every
+  read and copy the frame out of it. No wire change.
 - **rsbinder-tools (`rsb_hub`):** a policy check no longer copies the
   caller's group set, and the `listServices`, `dump`, `getDeclaredInstances`
   and `getServiceDebugInfo` filters read the caller once per request.

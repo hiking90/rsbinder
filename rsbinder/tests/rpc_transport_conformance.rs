@@ -20,7 +20,7 @@
 //! `vsock` is not here: it needs a VM peer (its own tests are `#[ignore]`),
 //! and its behaviour is inferred from `vsock(7)`, not measured.
 //!
-//! An fd-mode reader parked in `recvmsg` holds the leftover lock until the
+//! An fd-mode reader parked in `recvmsg` holds the reader lock until the
 //! socket wakes it, so a `shutdown` that takes that lock first deadlocks
 //! against it. Every `shutdown` here runs under a deadline, so such a bug
 //! fails the test instead of hanging the runner. Reads get the same
