@@ -93,7 +93,7 @@ LIBCUTILS_KIND=ashmem
 if [[ "$sdk" -ge 37 ]]; then
     vendor_api=$("${ADB[@]}" shell getprop ro.vendor.api_level | tr -d '\r')
     memfd_class=$("${ADB[@]}" shell \
-        'test -e /sys/fs/selinux/policy_capabilities/memfd_class && echo yes' | tr -d '\r')
+        'test -e /sys/fs/selinux/policy_capabilities/memfd_class && echo yes || true' | tr -d '\r')
     if [[ "$memfd_class" == yes && "${vendor_api:-0}" -ge 202604 ]]; then
         LIBCUTILS_KIND=memfd:sealed
     fi
@@ -274,7 +274,9 @@ echo "=== (c) as (b1), libcutils making memfd instead of ashmem"
 # "no ashmem-memfd compat support". Then the case is not reachable here.
 if [[ "$LIBCUTILS_KIND" == memfd:sealed ]]; then
     printf '  SKIP  %s\n' "(c) libcutils already makes memfd here without the property; (b1) covered it"
-elif "${ADB[@]}" shell setprop sys.use_memfd true && start_cpp_server; then
+elif ! "${ADB[@]}" shell setprop sys.use_memfd true; then
+    bad "(c) setprop sys.use_memfd true failed"
+elif start_cpp_server; then
     out=$(run "$DEV_DIR/fmq_probe client $CPP_SVC server-queue $COUNT $CAPACITY")
     echo "$out" | sed 's/^/      /'
     if echo "$out" | grep -qx "RESULT server-queue $COUNT kind=memfd:sealed capacity=$CAPACITY in=ok out=ok"; then
