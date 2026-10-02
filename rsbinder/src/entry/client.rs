@@ -196,8 +196,41 @@ fn one_source<T: PartialEq + std::fmt::Debug>(
     }
 }
 
-#[allow(deprecated)] // Refuses `handshake_timeout` where it does not apply, while it is honored.
 pub(super) fn new_client(uri: Uri, o: ClientOptions) -> Result<Client> {
+    open_staged(uri, o).map_err(|(_, code)| code)
+}
+
+/// Where [`open_staged`] failed. `Setup` does no I/O, so the same inputs fail the same way
+/// again; `Connect` is the transport, a peer or the service manager, which may recover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenStage {
+    Setup,
+    // Opening the kernel endpoint does no transport I/O; only RPC connects.
+    #[cfg_attr(not(feature = "rpc"), allow(dead_code))]
+    Connect,
+}
+
+/// [`new_client`] reporting which stage failed; the reconnect helper retries only `Connect`.
+pub(crate) fn open_staged(
+    uri: Uri,
+    o: ClientOptions,
+) -> std::result::Result<Client, (OpenStage, StatusCode)> {
+    let setup = |code| (OpenStage::Setup, code);
+    #[cfg(feature = "rpc")]
+    if !matches!(uri.endpoint, Endpoint::Kernel { .. }) {
+        let cfg = rpc_setup(&uri, &o).map_err(setup)?;
+        let session = rpc_connect(cfg, &uri, &o).map_err(|code| (OpenStage::Connect, code))?;
+        return Ok(Client {
+            endpoint: uri.endpoint.clone(),
+            inner: Inner::Rpc(session),
+        });
+    }
+    kernel_open(uri, o).map_err(setup)
+}
+
+/// The kernel endpoint and every option check; RPC endpoints end here without the `rpc` feature.
+#[allow(deprecated)] // Refuses `handshake_timeout` where it does not apply, while it is honored.
+fn kernel_open(uri: Uri, o: ClientOptions) -> Result<Client> {
     if uri.service.is_some() {
         log::error!(
             "rsbinder::Client::open: a `#service` fragment is not allowed here (use connect)"
@@ -243,7 +276,7 @@ pub(super) fn new_client(uri: Uri, o: ClientOptions) -> Result<Client> {
                 inner: Inner::Kernel,
             })
         }
-        #[cfg(not(feature = "rpc"))]
+        // RPC endpoints reach here only without the `rpc` feature (`open_staged`).
         _ => {
             log::error!(
                 "rsbinder::Client::open: {:?} needs the `rpc` feature",
@@ -251,39 +284,41 @@ pub(super) fn new_client(uri: Uri, o: ClientOptions) -> Result<Client> {
             );
             Err(StatusCode::InvalidOperation)
         }
-        #[cfg(feature = "rpc")]
-        _ => {
-            if o.driver.is_some() || o.mmap_size.is_some() {
-                return Err(reject("driver/mmap_size"));
-            }
-            if o.fd_mode == Some(crate::rpc::FileDescriptorTransportMode::Unix)
-                && !uri.endpoint.supports_fd_passing()
-            {
-                log::error!(
-                    "rsbinder::Client::open: option `fd_mode` cannot request Unix fd passing \
-                     on {:?} — only Unix-domain sockets carry SCM_RIGHTS",
-                    uri.endpoint
-                );
-                return Err(StatusCode::BadValue);
-            }
-            let session = rpc_connect(&uri, &o)?;
-            Ok(Client {
-                endpoint: uri.endpoint.clone(),
-                inner: Inner::Rpc(session),
-            })
-        }
     }
 }
 
+/// Every check an RPC open makes before any I/O, and the config it then connects with.
 #[cfg(feature = "rpc")]
 #[allow(deprecated)] // Forwards `handshake_timeout` to the config's own deprecated setter.
-fn rpc_connect(uri: &Uri, o: &ClientOptions) -> Result<crate::rpc::RpcSession> {
+fn rpc_setup<'a>(uri: &'a Uri, o: &'a ClientOptions) -> Result<crate::rpc::RpcClientConfig<'a>> {
+    if uri.service.is_some() {
+        log::error!(
+            "rsbinder::Client::open: a `#service` fragment is not allowed here (use connect)"
+        );
+        return Err(StatusCode::BadValue);
+    }
+    if o.driver.is_some() || o.mmap_size.is_some() {
+        log::error!(
+            "rsbinder::Client::open: option `driver/mmap_size` does not apply to {:?}",
+            uri.endpoint
+        );
+        return Err(StatusCode::BadValue);
+    }
+    if o.fd_mode == Some(crate::rpc::FileDescriptorTransportMode::Unix)
+        && !uri.endpoint.supports_fd_passing()
+    {
+        log::error!(
+            "rsbinder::Client::open: option `fd_mode` cannot request Unix fd passing \
+             on {:?} — only Unix-domain sockets carry SCM_RIGHTS",
+            uri.endpoint
+        );
+        return Err(StatusCode::BadValue);
+    }
     #[cfg(feature = "rpc-tls")]
     let reject_option = |what: &str, endpoint: &Endpoint| {
         log::error!("rsbinder::Client::open: option `{what}` does not apply to {endpoint:?}");
         StatusCode::BadValue
     };
-    use crate::rpc::{AddressSpace, RpcSession};
 
     // Refuse zero here, where the option can be named; its downstream consumers reject it too.
     crate::rpc::session::reject_zero_handshake_timeout(
@@ -336,15 +371,33 @@ fn rpc_connect(uri: &Uri, o: &ClientOptions) -> Result<crate::rpc::RpcSession> {
     }
     // Forwarded, not dropped: the session layer refuses what it cannot honor (never ignored).
     if let Some(id) = o.session_id.as_deref() {
+        // The session layer's own pre-connect refusal, made here so it counts as setup.
+        if fan_out > 1 || incoming > 0 {
+            log::error!(
+                "rsbinder::Client::open: session_id joins an existing session, which cannot \
+                 also open outgoing_connections/incoming_connections"
+            );
+            return Err(StatusCode::BadValue);
+        }
         cfg = cfg.session_id(id);
     }
+    Ok(cfg
+        .outgoing_connections(fan_out)
+        .incoming_connections(incoming))
+}
 
-    if versioned.is_some() {
+/// The I/O half of an RPC open: connect, handshake, and on r34 the fd-mode transaction.
+#[cfg(feature = "rpc")]
+fn rpc_connect(
+    cfg: crate::rpc::RpcClientConfig<'_>,
+    uri: &Uri,
+    o: &ClientOptions,
+) -> Result<crate::rpc::RpcSession> {
+    use crate::rpc::{AddressSpace, RpcSession};
+
+    if uri.wire_max_version.is_some() {
         // One connection each, as AOSP `setupClient` calls `connectAndInit`, on every transport.
-        return RpcSession::setup_client_android13plus_with_config(
-            cfg.outgoing_connections(fan_out)
-                .incoming_connections(incoming),
-        );
+        return RpcSession::setup_client_android13plus_with_config(cfg);
     }
 
     // r34 wire: no handshake, so the session is built on the connection itself.
@@ -524,6 +577,37 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refusal that does no I/O is `Setup`; a socket that is not there yet is `Connect`.
+    #[cfg(feature = "rpc")]
+    #[test]
+    fn open_reports_the_stage_that_failed() {
+        let open = |uri: &str, f: fn(&mut ClientOptions)| {
+            let mut o = ClientOptions::default();
+            f(&mut o);
+            open_staged(super::super::uri::parse(uri).unwrap(), o).map(|_| ())
+        };
+        let missing = "unix:///nonexistent/rsbinder-open-stage.sock";
+
+        assert_eq!(
+            open(missing, |o| o.incoming_connections = Some(1)),
+            Err((OpenStage::Setup, StatusCode::BadValue)),
+            "multi-connection options need ?profile=android13plus"
+        );
+        assert_eq!(
+            open(&format!("{missing}?profile=android13plus"), |o| {
+                o.session_id = Some(vec![1; 32]);
+                o.incoming_connections = Some(1);
+            }),
+            Err((OpenStage::Setup, StatusCode::BadValue)),
+            "a session_id joins a session, so it cannot open more connections"
+        );
+        assert_eq!(
+            open(missing, |_| {}),
+            Err((OpenStage::Connect, StatusCode::NameNotFound)),
+            "ENOENT on connect is the transport, not the configuration"
+        );
+    }
 
     /// Option vs URI key: agreeing or single values pass; a conflict is refused, not resolved.
     #[test]
