@@ -472,7 +472,7 @@
 use std::cell::RefCell;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -1771,8 +1771,8 @@ pub(crate) struct SharedSession {
     timeout: Mutex<Option<Duration>>,
     /// Server `set_idle_timeout` in ns (0: none): serve slots' read baseline, every send bound.
     serve_read_deadline: AtomicU64,
-    /// Negotiated FD-over-RPC mode; the default `None` refuses every fd.
-    fd_mode: Mutex<crate::rpc::FileDescriptorTransportMode>,
+    /// Negotiated FD-over-RPC mode as its AOSP wire value (`fd_mode()`); `None` refuses every fd.
+    fd_mode: AtomicU8,
     /// Server role: whether `GET_FD_MODE` advertises `Unix` fd support (default false).
     fd_unix_supported: AtomicBool,
     /// `GET_SESSION_ID`'s random id: AOSP `kSessionIdBytes == 32`, libbinder refuses other sizes.
@@ -1806,6 +1806,22 @@ pub(crate) struct SharedSession {
 }
 
 impl SharedSession {
+    /// The negotiated fd mode; read by every send and receive, so an atomic, not a lock.
+    fn fd_mode(&self) -> FileDescriptorTransportMode {
+        match self.fd_mode.load(Ordering::Acquire) {
+            FD_MODE_UNIX => FileDescriptorTransportMode::Unix,
+            _ => FileDescriptorTransportMode::None,
+        }
+    }
+
+    fn set_fd_mode(&self, mode: FileDescriptorTransportMode) {
+        let bits = match mode {
+            FileDescriptorTransportMode::None => FD_MODE_NONE,
+            FileDescriptorTransportMode::Unix => FD_MODE_UNIX,
+        };
+        self.fd_mode.store(bits, Ordering::Release);
+    }
+
     /// Live local nodes; the `timesSent` books net to 0 once every proxy drops (leak check).
     pub(crate) fn local_node_count(&self) -> usize {
         self.state
@@ -1873,7 +1889,9 @@ pub(crate) struct RpcSessionInner {
     slot_cv: Condvar,
     /// Wire profile, fixed per session as in AOSP; an attach on another version is refused.
     profile: WireProfile,
-    self_weak: Mutex<Weak<RpcSessionInner>>,
+    self_weak: Weak<RpcSessionInner>,
+    /// What `parcel_ops` hands every parcel of this session, built once with the inner.
+    parcel_ops: Arc<SessionParcelOps>,
     /// The reaper's queue; its drop ends the reaper. See module doc "Deferred `DEC_STRONG`".
     dec_strong_tx: mpsc::Sender<(RpcAddress, u32)>,
     /// Session-wide state (nodes, root, id, lifecycle): the leak and teardown books in one place.
@@ -2271,9 +2289,7 @@ impl RpcSessionInner {
     }
 
     pub(crate) fn parcel_ops(&self) -> Arc<dyn RpcParcelOps> {
-        Arc::new(SessionParcelOps(
-            self.self_weak.lock().expect("self_weak").clone(),
-        ))
+        self.parcel_ops.clone()
     }
 
     /// Push a slot; `live_conns` is the caller's; module doc "Slot pool" has the refusals.
@@ -2457,7 +2473,7 @@ impl RpcSessionInner {
     }
 
     pub(crate) fn fd_mode(&self) -> FileDescriptorTransportMode {
-        *self.shared.fd_mode.lock().expect("fd_mode poisoned")
+        self.shared.fd_mode()
     }
 
     /// Whether this session's parcels record fd positions: android-13+ v1+ only, never R34.
@@ -2521,7 +2537,7 @@ impl RpcSessionInner {
     }
 
     fn self_weak(&self) -> Weak<RpcSessionInner> {
-        self.self_weak.lock().expect("self_weak").clone()
+        self.self_weak.clone()
     }
 
     /// `SharedSession::local_node_count`, for `RpcServer::live_session_node_count` (leak check).
@@ -3718,7 +3734,7 @@ impl RpcSessionInner {
                 )?;
                 self.send_reply(0, reply.rpc_data_bytes(), &[], &[])?;
                 // Switch AFTER the reply is on the wire (None-mode).
-                *self.shared.fd_mode.lock().expect("fd_mode poisoned") = agreed;
+                self.shared.set_fd_mode(agreed);
                 Ok(())
             }
             None => self.send_reply(StatusCode::UnknownTransaction.into(), &[], &[], &[]),
@@ -3814,7 +3830,7 @@ impl RpcSession {
             negotiated: AtomicU32::new(0),
             timeout: Mutex::new(None),
             serve_read_deadline: AtomicU64::new(0),
-            fd_mode: Mutex::new(FileDescriptorTransportMode::None),
+            fd_mode: AtomicU8::new(FD_MODE_NONE),
             fd_unix_supported: AtomicBool::new(false),
             rpc_session_id: gen_rpc_session_id()?,
             lifecycle: SessionLifecycle::new(),
@@ -3850,18 +3866,18 @@ impl RpcSession {
         let founding: Arc<dyn RpcTransport> = Arc::from(transport);
         let armed = Arc::clone(&founding);
         let (dec_strong_tx, dec_strong_rx) = mpsc::channel();
-        let inner = Arc::new(RpcSessionInner {
+        let inner = Arc::new_cyclic(|weak: &Weak<RpcSessionInner>| RpcSessionInner {
             conn_state: Mutex::new(ConnState::new(founding, founding_role, traits)),
             slot_cv: Condvar::new(),
             profile,
-            self_weak: Mutex::new(Weak::new()),
+            self_weak: weak.clone(),
+            parcel_ops: Arc::new(SessionParcelOps(weak.clone())),
             shared,
             dec_strong_tx,
             incoming_threads: Mutex::new(Vec::new()),
             incoming_live: AtomicUsize::new(0),
             incoming_joined: AtomicUsize::new(0),
         });
-        *inner.self_weak.lock().expect("self_weak") = Arc::downgrade(&inner);
         inner.arm_liveness(&*armed);
         // Detached reaper for deferred DEC_STRONG; exits when the inner drops its sender.
         let weak_for_reaper = Arc::downgrade(&inner);
@@ -3971,12 +3987,10 @@ impl RpcSession {
         let shared = Self::fresh_shared(AddressSpace::Acceptor)?;
         let session = Self::with_shared(transport, WireProfile::Android13Plus(codec), shared);
         if server_fd_unix && client_fd_mode == FD_MODE_UNIX && negotiated >= PROTOCOL_V1 {
-            *session
+            session
                 .inner
                 .shared
-                .fd_mode
-                .lock()
-                .expect("fd_mode poisoned") = FileDescriptorTransportMode::Unix;
+                .set_fd_mode(FileDescriptorTransportMode::Unix);
         }
         Ok(session)
     }
@@ -4084,12 +4098,10 @@ impl RpcSession {
         .map_err(StatusCode::from)?;
         // v0 forbids fd-over-RPC: stay `None` below v1 (a fd write is AOSP's `BAD_TYPE`).
         if want_unix && negotiated >= PROTOCOL_V1 {
-            *session
+            session
                 .inner
                 .shared
-                .fd_mode
-                .lock()
-                .expect("fd_mode poisoned") = FileDescriptorTransportMode::Unix;
+                .set_fd_mode(FileDescriptorTransportMode::Unix);
         }
         Ok(session)
     }
@@ -4245,7 +4257,7 @@ impl RpcSession {
             FileDescriptorTransportMode::None
         };
         // Switch AFTER the reply has been fully read in None-mode.
-        *self.inner.shared.fd_mode.lock().expect("fd_mode poisoned") = agreed;
+        self.inner.shared.set_fd_mode(agreed);
         Ok(agreed)
     }
 
@@ -5695,6 +5707,17 @@ mod tests {
     //!   open file description and so its status flags (fcntl(2)).
     use super::*;
     use std::os::fd::{AsFd, OwnedFd};
+
+    /// `RpcSession`'s auto traits are public API (`api/rsbinder-rpc.txt`); a field of
+    /// `RpcSessionInner` that is not `RefUnwindSafe` (an `Arc<dyn Trait>`) silently drops two.
+    #[test]
+    fn rpc_session_keeps_its_auto_traits() {
+        fn assert_traits<
+            T: Send + Sync + Unpin + std::panic::RefUnwindSafe + std::panic::UnwindSafe,
+        >() {
+        }
+        assert_traits::<RpcSession>();
+    }
 
     /// The peer drops every connection, so both TLS handshakes fail; only TCP connects are tested.
     #[cfg(feature = "rpc-tls")]
