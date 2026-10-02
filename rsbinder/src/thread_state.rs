@@ -1203,7 +1203,7 @@ fn dispatch_transact_caught(
                 .unwrap_or("<non-string panic payload>");
             error!("Transactable::transact panicked for code {code}: {msg}");
             // Discard the partial reply so the client never parses half-formed data.
-            *reply = Parcel::new();
+            *reply = Parcel::with_capacity(0);
             Err(StatusCode::Unknown)
         }
     }
@@ -1294,7 +1294,13 @@ fn execute_command(cmd: i32) -> Result<()> {
                 #[cfg(feature = "rpc")]
                 let _rpc_suspended = RpcCallingGuard::suspend();
 
-                let mut reply = Parcel::new();
+                // A oneway reply is never sent: no buffer unless the handler writes into it.
+                let mut reply =
+                    if tr_secctx.transaction_data.flags & transaction_flags_TF_ONE_WAY != 0 {
+                        Parcel::with_capacity(0)
+                    } else {
+                        Parcel::new()
+                    };
 
                 let result = {
                     // SAFETY: kernel txn to a local binder; `target.ptr` is the active arm.
@@ -1884,12 +1890,12 @@ pub(crate) fn check_interface(reader: &mut Parcel, descriptor: &str) -> Result<b
         }
     }
 
-    let parcel_interface: String = reader.read()?;
-    if parcel_interface.eq(descriptor) {
-        Ok(true)
-    } else {
-        log::error!("check_interface() expected '{descriptor}' but read '{parcel_interface}'");
-        Ok(false)
+    match crate::parcelable::read_string16_matches(reader, descriptor)? {
+        Ok(()) => Ok(true),
+        Err(parcel_interface) => {
+            log::error!("check_interface() expected '{descriptor}' but read '{parcel_interface}'");
+            Ok(false)
+        }
     }
 }
 

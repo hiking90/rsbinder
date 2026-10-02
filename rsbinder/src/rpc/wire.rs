@@ -76,6 +76,48 @@ pub struct WireReply {
     pub object_positions: Vec<u32>,
 }
 
+/// A transaction to encode, borrowing its payload: [`WireTransaction`] without the copies.
+#[derive(Debug, Clone, Copy)]
+pub struct WireTransactionRef<'a> {
+    pub address: &'a RpcAddress,
+    pub code: u32,
+    pub flags: u32,
+    pub async_number: u64,
+    pub data: &'a [u8],
+    pub object_positions: &'a [u32],
+}
+
+/// A reply to encode, borrowing its payload: [`WireReply`] without the copies.
+#[derive(Debug, Clone, Copy)]
+pub struct WireReplyRef<'a> {
+    pub status: i32,
+    pub data: &'a [u8],
+    pub object_positions: &'a [u32],
+}
+
+impl<'a> From<&'a WireTransaction> for WireTransactionRef<'a> {
+    fn from(txn: &'a WireTransaction) -> Self {
+        WireTransactionRef {
+            address: &txn.address,
+            code: txn.code,
+            flags: txn.flags,
+            async_number: txn.async_number,
+            data: &txn.data,
+            object_positions: &txn.object_positions,
+        }
+    }
+}
+
+impl<'a> From<&'a WireReply> for WireReplyRef<'a> {
+    fn from(reply: &'a WireReply) -> Self {
+        WireReplyRef {
+            status: reply.status,
+            data: &reply.data,
+            object_positions: &reply.object_positions,
+        }
+    }
+}
+
 impl Default for WireTransaction {
     fn default() -> Self {
         Self {
@@ -110,10 +152,18 @@ pub trait WireCodec: Send + Sync {
     /// optional object table). Fails (`validateParcel`) if the codec's
     /// wire version has no object table but `txn.object_positions` is
     /// non-empty.
-    fn encode_transact(&self, txn: &WireTransaction) -> RpcResult<Vec<u8>>;
+    fn encode_transact_ref(&self, txn: WireTransactionRef<'_>) -> RpcResult<Vec<u8>>;
     /// Encode a complete `REPLY` message. Same object-table version
-    /// rule as [`WireCodec::encode_transact`].
-    fn encode_reply(&self, reply: &WireReply) -> RpcResult<Vec<u8>>;
+    /// rule as [`WireCodec::encode_transact_ref`].
+    fn encode_reply_ref(&self, reply: WireReplyRef<'_>) -> RpcResult<Vec<u8>>;
+    /// [`WireCodec::encode_transact_ref`] of an owned transaction.
+    fn encode_transact(&self, txn: &WireTransaction) -> RpcResult<Vec<u8>> {
+        self.encode_transact_ref(txn.into())
+    }
+    /// [`WireCodec::encode_reply_ref`] of an owned reply.
+    fn encode_reply(&self, reply: &WireReply) -> RpcResult<Vec<u8>> {
+        self.encode_reply_ref(reply.into())
+    }
     /// Encode the `DEC_STRONG` frames that release `amount` references to
     /// `addr`, in send order. A wire with an `amount` field (android-13+
     /// `RpcDecStrong`) returns one frame; r34 has none, so it returns
@@ -187,7 +237,7 @@ fn rd_addr(buf: &[u8], off: usize) -> RpcResult<RpcAddress> {
 }
 
 impl WireCodec for R34Codec {
-    fn encode_transact(&self, txn: &WireTransaction) -> RpcResult<Vec<u8>> {
+    fn encode_transact_ref(&self, txn: WireTransactionRef<'_>) -> RpcResult<Vec<u8>> {
         // r34 has no object table: reject one rather than drop it and desync (`validateParcel`).
         if !txn.object_positions.is_empty() {
             return Err(RpcError::Protocol(
@@ -202,11 +252,11 @@ impl WireCodec for R34Codec {
         out.extend_from_slice(&txn.flags.to_le_bytes()); // 4
         out.extend_from_slice(&txn.async_number.to_le_bytes()); // 8
         out.extend_from_slice(&[0u8; 16]); // reserved[4]
-        out.extend_from_slice(&txn.data); // data[]
+        out.extend_from_slice(txn.data); // data[]
         Ok(out)
     }
 
-    fn encode_reply(&self, reply: &WireReply) -> RpcResult<Vec<u8>> {
+    fn encode_reply_ref(&self, reply: WireReplyRef<'_>) -> RpcResult<Vec<u8>> {
         if !reply.object_positions.is_empty() {
             return Err(RpcError::Protocol(
                 "r34 wire has no object table (object_positions must be empty)",
@@ -216,7 +266,7 @@ impl WireCodec for R34Codec {
         let mut out = Vec::with_capacity(WIRE_HEADER_LEN + body_len);
         out.extend_from_slice(&Self::header(CMD_REPLY, body_len)?);
         out.extend_from_slice(&reply.status.to_le_bytes());
-        out.extend_from_slice(&reply.data);
+        out.extend_from_slice(reply.data);
         Ok(out)
     }
 
@@ -310,12 +360,14 @@ impl WireCodec for R34Codec {
     }
 }
 
-/// Decode-only entrypoint for the `rpc_wire_decode` fuzz target.
+/// Decode-only entrypoint for the `rpc_wire_decode` fuzz target: the r34 decoder and the
+/// android-13+ v1 decoder, whose `parcelDataSize`/object-table split r34 does not have.
 /// Not part of the supported API surface.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub fn __fuzz_decode_wire(input: &[u8]) {
     let _ = R34Codec.decode_message(input);
+    let _ = super::wire_android13::Android13PlusCodec::android14_15().decode_message(input);
 }
 
 /// Decode-only entrypoint for the `rpc_session_handshake` fuzz target:

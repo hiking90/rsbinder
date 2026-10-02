@@ -22,10 +22,10 @@
 //! * For real networks use the `tls` backend instead.
 
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::{read_frame, write_frame, PeerIdentity, RpcTransport};
+use super::{read_frame, unix::send_frame_vectored, PeerIdentity, RpcTransport};
 use crate::rpc::RpcResult;
 
 /// Set on the first `TcpDebugTransport` construction; gates the one-time warning, read by tests.
@@ -119,8 +119,7 @@ impl TcpDebugTransport {
 
 impl RpcTransport for TcpDebugTransport {
     fn send_frame(&self, buf: &[u8]) -> RpcResult<()> {
-        let mut w = &self.stream;
-        write_frame(&mut w, buf)
+        send_frame_vectored(self.stream.as_fd(), buf, &[])
     }
 
     fn recv_frame(&self) -> RpcResult<Vec<u8>> {

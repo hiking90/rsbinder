@@ -114,21 +114,20 @@ impl Remotable for BnFd {
     }
 }
 
+/// Unlinked temp file named by a counter (macOS `SystemTime` is µs); collisions fail `create_new`.
 fn tempfile() -> std::fs::File {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let mut p = std::env::temp_dir();
     p.push(format!(
         "rsb_fd_{}_{}.tmp",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     let f = std::fs::OpenOptions::new()
-        .create(true)
+        .create_new(true)
         .read(true)
         .write(true)
-        .truncate(true)
         .open(&p)
         .expect("tempfile");
     let _ = std::fs::remove_file(&p); // unlinked; fd keeps it alive

@@ -530,8 +530,18 @@ impl ServiceManager {
 
     /// No caller = startup self-registration only; hub threads must not get a bypass (6-1 D10).
     fn allows(&self, permission: Permission, name: &str) -> bool {
-        match rsbinder::calling_caller() {
-            Some(caller) => self.enforcer.check_caller(permission, name, &caller),
+        self.allows_as(rsbinder::calling_caller().as_ref(), permission, name)
+    }
+
+    /// [`Self::allows`] for a caller read once: a per-name filter would otherwise re-read it per name.
+    fn allows_as(
+        &self,
+        caller: Option<&rsbinder::Caller>,
+        permission: Permission,
+        name: &str,
+    ) -> bool {
+        match caller {
+            Some(caller) => self.enforcer.check_caller(permission, name, caller),
             None => permission == Permission::Add && name == SELF_SERVICE_NAME,
         }
     }
@@ -722,8 +732,9 @@ impl ServiceManager {
         awaited.retain(|(name, _, _)| dump_filter_matches(&filter, name));
 
         let before = rows.len() + awaited.len();
-        rows.retain(|row| self.allows(Permission::Find, &row.name));
-        awaited.retain(|(name, _, _)| self.allows(Permission::Find, name));
+        let caller = rsbinder::calling_caller();
+        rows.retain(|row| self.allows_as(caller.as_ref(), Permission::Find, &row.name));
+        awaited.retain(|(name, _, _)| self.allows_as(caller.as_ref(), Permission::Find, name));
         let hidden = before - rows.len() - awaited.len();
 
         let config = self.enforcer.config();
@@ -1002,9 +1013,10 @@ impl IServiceManager for ServiceManager {
                 .collect()
         };
 
+        let caller = rsbinder::calling_caller();
         Ok(candidates
             .into_iter()
-            .filter(|name| self.allows(Permission::Find, name))
+            .filter(|name| self.allows_as(caller.as_ref(), Permission::Find, name))
             .collect())
     }
 
@@ -1104,9 +1116,16 @@ impl IServiceManager for ServiceManager {
         let declarations = &self.enforcer.config().declarations;
         let all = declarations.instances_of(arg_iface);
         let declared = all.len();
+        let caller = rsbinder::calling_caller();
         let allowed: Vec<String> = all
             .into_iter()
-            .filter(|instance| self.allows(Permission::Find, &format!("{arg_iface}/{instance}")))
+            .filter(|instance| {
+                self.allows_as(
+                    caller.as_ref(),
+                    Permission::Find,
+                    &format!("{arg_iface}/{instance}"),
+                )
+            })
             .collect();
         // AOSP `ServiceManager.cpp:748`: all filtered out is a denial, not "none declared".
         if allowed.is_empty() && declared != 0 {
@@ -1342,9 +1361,10 @@ impl IServiceManager for ServiceManager {
                 .collect()
         };
 
+        let caller = rsbinder::calling_caller();
         Ok(snapshot
             .into_iter()
-            .filter(|(name, _)| self.allows(Permission::Find, name))
+            .filter(|(name, _)| self.allows_as(caller.as_ref(), Permission::Find, name))
             .map(|(name, debugPid)| {
                 hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInfo { name, debugPid }
             })

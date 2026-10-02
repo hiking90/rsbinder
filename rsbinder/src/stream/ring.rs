@@ -1143,7 +1143,7 @@ impl<T: Deserialize> Consumer<T> {
                 "a record of {len} bytes with {available} bytes in the ring"
             ));
         }
-        buf.clear();
+        // No `clear()`: `read_at` overwrites all `len` bytes, so only a grown tail is zeroed.
         buf.resize(len, 0);
         queue
             .begin_read(HEADER + len)

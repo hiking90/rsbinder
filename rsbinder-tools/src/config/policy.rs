@@ -106,11 +106,16 @@ impl Subjects {
 
     /// Does `subject` fall in this set?
     pub fn allows(&self, subject: &Subject) -> bool {
+        self.allows_parts(subject.uid, &subject.gids)
+    }
+
+    /// [`allows`](Self::allows) for a subject held as parts, so a borrowed group set needs no copy.
+    pub(crate) fn allows_parts(&self, uid: u32, member_of: &BTreeSet<u32>) -> bool {
         match self {
             Subjects::None => false,
             Subjects::Any => true,
             Subjects::Set { uids, gids } => {
-                uids.contains(&subject.uid) || subject.gids.iter().any(|g| gids.contains(g))
+                uids.contains(&uid) || member_of.iter().any(|g| gids.contains(g))
             }
         }
     }
@@ -241,11 +246,22 @@ impl Policy {
     /// No matching rule ⇒ deny. `name` is ignored for
     /// [`Permission::List`], which is answered by the global gate.
     pub fn check(&self, permission: Permission, name: &str, subject: &Subject) -> bool {
+        self.check_parts(permission, name, subject.uid, &subject.gids)
+    }
+
+    /// [`check`](Self::check) for a subject held as parts, so a borrowed group set needs no copy.
+    pub(crate) fn check_parts(
+        &self,
+        permission: Permission,
+        name: &str,
+        uid: u32,
+        gids: &BTreeSet<u32>,
+    ) -> bool {
         if permission == Permission::List {
-            return self.list.allows(subject);
+            return self.list.allows_parts(uid, gids);
         }
         match self.rules.iter().find(|rule| rule.pattern.matches(name)) {
-            Some(rule) => rule.subjects_for(permission).allows(subject),
+            Some(rule) => rule.subjects_for(permission).allows_parts(uid, gids),
             None => false,
         }
     }

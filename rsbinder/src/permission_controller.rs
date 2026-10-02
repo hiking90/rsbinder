@@ -36,6 +36,13 @@
 //! succeeds and `check_permission` returns that service's answer
 //! verbatim — `true` included.
 //!
+//! The lookup is not repeated per check. A controller that answered once
+//! is kept and asked directly until a call to it fails, as AOSP libbinder
+//! keeps `gPermissionController`. Until then, re-registering `"permission"`
+//! under another binder or restarting the service manager does not change
+//! which process answers, and the kept strong reference counts as a client
+//! of the registered service, so its `tryUnregisterService` is refused.
+//!
 //! With nothing registered under that name, the `ProcessState` panic is
 //! the one outcome that is not a `false`.
 //! Reaching it takes a kernel-marshalling parcel *and* an in-flight
@@ -58,7 +65,7 @@ pub use android::os::IPermissionController::{
     IPermissionControllerAsync, IPermissionControllerAsyncService,
 };
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use crate::error::Result;
 use crate::{hub, Caller, FromIBinder, Parcel, Strong};
@@ -220,6 +227,14 @@ pub fn default() -> Result<Strong<dyn IPermissionController>> {
 /// PermissionManagerService — see Android `checkPermission` callers in
 /// `frameworks/native/services/` for the same pattern.
 ///
+/// The controller that answered the last check is kept process-wide and
+/// asked directly next time, as AOSP libbinder's `checkPermission` keeps
+/// `gPermissionController`, so a check costs one IPC instead of a service
+/// manager lookup plus one. When the kept controller fails (its process
+/// restarted), it is dropped and the same check goes once to a fresh
+/// lookup. Unlike AOSP, a missing service is not waited for: the check
+/// denies at once.
+///
 /// # Panics
 ///
 /// Panics if the [`default()`] lookup is reached in a process where
@@ -260,13 +275,44 @@ pub fn check_permission(reader: &Parcel, permission_name: &str) -> bool {
     if !crate::is_handling_transaction() {
         return false;
     }
-    let calling_pid = crate::get_calling_pid();
-    let calling_uid = crate::get_calling_uid();
-    let Ok(pc) = default() else {
+    let calling_pid = crate::get_calling_pid() as i32;
+    let calling_uid = crate::get_calling_uid() as i32;
+    ask_controller(&CONTROLLER, default, |pc| {
+        pc.checkPermission(permission_name, calling_pid, calling_uid)
+    })
+}
+
+type ControllerSlot = Mutex<Option<Arc<Strong<dyn IPermissionController>>>>;
+
+/// AOSP `gPermissionController`; see [`check_permission`].
+static CONTROLLER: ControllerSlot = Mutex::new(None);
+
+/// The lock is never held across an IPC.
+fn ask_controller(
+    slot: &ControllerSlot,
+    lookup: impl FnOnce() -> Result<Strong<dyn IPermissionController>>,
+    ask: impl Fn(&Strong<dyn IPermissionController>) -> crate::BinderResult<bool>,
+) -> bool {
+    let lock = || slot.lock().unwrap_or_else(PoisonError::into_inner);
+    let cached = lock().clone();
+    if let Some(pc) = cached {
+        if let Ok(granted) = ask(&pc) {
+            return granted;
+        }
+        let mut slot = lock();
+        // Another thread may already have installed a fresh one; keep that.
+        if slot.as_ref().is_some_and(|c| Arc::ptr_eq(c, &pc)) {
+            *slot = None;
+        }
+    }
+    let Ok(pc) = lookup() else {
         return false;
     };
-    pc.checkPermission(permission_name, calling_pid as i32, calling_uid as i32)
-        .unwrap_or(false)
+    let Ok(granted) = ask(&pc) else {
+        return false;
+    };
+    *lock() = Some(Arc::new(pc));
+    granted
 }
 
 /// Warn once per process (not per interface) when `@EnforcePermission` first denies over RPC.
@@ -305,6 +351,91 @@ mod tests {
     #[test]
     fn test_service_name_matches_system_server_registration() {
         assert_eq!(SERVICE_NAME, "permission");
+    }
+
+    /// Answers `checkPermission` with `grant`, or fails as a dead binder once `dead` is set.
+    struct FakeController {
+        grant: bool,
+        dead: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::Interface for FakeController {}
+
+    impl IPermissionController for FakeController {
+        fn checkPermission(&self, _: &str, _: i32, _: i32) -> crate::BinderResult<bool> {
+            if self.dead.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::StatusCode::DeadObject.into());
+            }
+            Ok(self.grant)
+        }
+        fn noteOp(&self, _: &str, _: i32, _: &str) -> crate::BinderResult<i32> {
+            Ok(0)
+        }
+        fn getPackagesForUid(&self, _: i32) -> crate::BinderResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        fn isRuntimePermission(&self, _: &str) -> crate::BinderResult<bool> {
+            Ok(false)
+        }
+        fn getPackageUid(&self, _: &str, _: i32) -> crate::BinderResult<i32> {
+            Ok(0)
+        }
+    }
+
+    fn fake(
+        grant: bool,
+    ) -> (
+        Strong<dyn IPermissionController>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pc = BnPermissionController::new_binder(FakeController {
+            grant,
+            dead: dead.clone(),
+        });
+        (pc, dead)
+    }
+
+    /// Kept until it fails, then replaced by a lookup in the same call; failures are not cached.
+    #[test]
+    fn the_controller_is_cached_until_it_fails() {
+        let ask = |pc: &Strong<dyn IPermissionController>| pc.checkPermission("p", 1, 2);
+        let slot: ControllerSlot = Mutex::new(None);
+
+        let (first, first_dead) = fake(true);
+        assert!(ask_controller(&slot, || Ok(first), ask));
+        assert!(
+            ask_controller(&slot, || panic!("a cached controller needs no lookup"), ask),
+            "the cached controller answers"
+        );
+
+        // `system_server` restarted: the cached proxy is dead, a lookup finds the new one.
+        first_dead.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (second, _second_dead) = fake(false);
+        let second_binder = second.as_binder();
+        assert!(
+            !ask_controller(&slot, || Ok(second), ask),
+            "the fresh controller's answer, not a failure's deny"
+        );
+        let cached = slot
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the fresh controller is cached");
+        assert!(cached.as_binder() == second_binder);
+
+        // A fresh controller that fails is not cached, and the check denies.
+        let slot: ControllerSlot = Mutex::new(None);
+        let (broken, broken_dead) = fake(true);
+        broken_dead.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(!ask_controller(&slot, || Ok(broken), ask));
+        assert!(slot.lock().unwrap().is_none());
+        // No controller at all denies.
+        assert!(!ask_controller(
+            &slot,
+            || Err(crate::StatusCode::NameNotFound),
+            ask
+        ));
     }
 
     /// Plan 2-16 Phase A: an RPC parcel, or a kernel one outside a transaction, is denied pre-PMS.

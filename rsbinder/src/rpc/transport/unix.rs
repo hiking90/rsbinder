@@ -45,39 +45,53 @@
 //!
 //! ## fd passing
 //!
-//! `recv_frame_with_fds` never reads past the last byte of the frame in
-//! progress. `AF_UNIX` glues stream data across skbs and stops only after
-//! consuming the one that carried fds, so a `recvmsg` spilling into the
-//! next frame would attach that frame's `SCM_RIGHTS` fds to this one and
-//! leave the next frame with none. The android-13+ reader
-//! (`wire_android13::read_aosp_message_with_fds`) reads exact byte counts
-//! for the same reason.
+//! `recv_frame_with_fds` reads exact byte counts — the 4-byte header, then
+//! the body straight into the frame's own buffer — so it never reads past
+//! the last byte of the frame in progress. `AF_UNIX` on Linux glues stream
+//! data across skbs and stops only after consuming the one that carried
+//! fds, so a `recvmsg` spilling into the next frame would attach that
+//! frame's `SCM_RIGHTS` fds to this one and leave the next frame with none.
+//! The android-13+ reader (`wire_android13::read_aosp_message_with_fds`)
+//! reads exact byte counts for the same reason.
 //!
-//! `shutdown` cuts the socket before taking `fd_recv_buf`: a reader parked
-//! in `recvmsg` holds that lock for the whole call and releases it only
-//! once it wakes, so locking first would deadlock against it. What that
-//! reader appends on waking was queued in the kernel before `shutdown` (the
-//! platform's business); what is left in the buffer after it returns is the
-//! prefix of a frame an error cut short, and `shutdown` clears it so a
-//! later reader does not decode the ended connection out of it.
+//! The reader keeps no bytes between frames: what an error cut short goes
+//! with the error, which ends the session (`DeadlineMidFrame`, `Truncated`).
+//! It holds `fd_recv_lock` for a whole frame, so two readers on one socket
+//! cannot split a frame's fds between them. `shutdown` does not take that
+//! lock: a reader parked in `recvmsg` holds it until the shutdown wakes it.
+//!
+//! The sender (`send_frame_vectored`) passes the length and the body as two
+//! slices of one `sendmsg`, so the body is not copied into a joined buffer,
+//! and attaches the fds to the first `sendmsg` only. It does not use std's
+//! `write_vectored`: that is `writev`, which takes no `MSG_NOSIGNAL`. Apple
+//! has no `MSG_NOSIGNAL` at all, so there `from_stream` sets `SO_NOSIGPIPE`
+//! on the socket; std sets it only on sockets std itself creates, not on a
+//! `socketpair` from `pair` or an fd adopted by `from_owned_fd`.
 //!
 //! ## Tests
 //!
-//! - `unix_shutdown_drops_the_fd_mode_leftover` (plan 2-21): the reader never
-//!   reads past the frame in progress, so `fd_recv_buf` can only hold the
-//!   prefix an error left behind; a deadline part-way through a frame puts
-//!   one there. What the kernel still holds is pinned by
-//!   `rpc_transport_conformance`, not here.
+//! - `fd_mode_frames_queued_back_to_back_keep_their_own_fds`: a frame that
+//!   takes several reads, with the next frame already queued, gets only its
+//!   own fds. A reader that reads past the frame fails it on the Linux and
+//!   Android kernels; on macOS the test passes either way (measured), so
+//!   the macOS gate alone does not cover it.
+//! - `unix_fd_mode_cut_frame_leaves_nothing_behind` (plan 2-21): after a
+//!   deadline cuts a frame and `shutdown` runs, the reader reports the end
+//!   of stream, not a frame decoded from the cut one. What the kernel still
+//!   holds is pinned by `rpc_transport_conformance`, not here.
 //! - `unix_mid_frame_deadline_is_our_own_cut` (plan 2-21): a read deadline
 //!   part-way through a frame is this end's own cut (`DeadlineMidFrame`),
 //!   told apart from a stream that ended mid-frame (`Truncated`); with
 //!   nothing consumed it stays the boundary `Timeout`. The framed reader and
 //!   the fd-mode reader classify the same way.
+//! - `an_fd_send_to_a_closed_peer_is_an_error_not_a_signal`: the test
+//!   harness ignores `SIGPIPE`, so the sends run in a child process that
+//!   restores `SIG_DFL`; a `SIGPIPE` there kills the child and fails the test.
 
 use std::io::{Read, Write};
 #[cfg(target_os = "android")]
 use std::os::android::net::SocketAddrExt;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 #[cfg(target_os = "linux")]
 use std::os::linux::net::SocketAddrExt;
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -85,25 +99,91 @@ use std::os::unix::net::SocketAddr as UnixSocketAddr;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-use super::{read_frame, write_frame, PeerIdentity, RpcTransport, MAX_FRAME_LEN};
+use super::{read_frame, PeerIdentity, RpcTransport, MAX_FRAME_LEN};
 use crate::rpc::{RpcError, RpcResult};
 
 /// Per-message fd cap (DoS bound, < `SCM_MAX_FD` 253); `wire_android13` applies it across recvmsgs.
 pub(crate) const MAX_FDS_PER_FRAME: usize = 64;
+
+/// A send to a closed peer is `EPIPE`, not `SIGPIPE`; Apple uses `SO_NOSIGPIPE` (module doc).
+#[cfg(not(target_vendor = "apple"))]
+const SEND_FLAGS: rustix::net::SendFlags = rustix::net::SendFlags::NOSIGNAL;
+#[cfg(target_vendor = "apple")]
+const SEND_FLAGS: rustix::net::SendFlags = rustix::net::SendFlags::empty();
+
+/// Ancillary space for one `sendmsg`/`recvmsg` of a frame: `MAX_FDS_PER_FRAME` fds.
+const FD_SPACE: usize = rustix::cmsg_space!(ScmRights(MAX_FDS_PER_FRAME));
+
+/// One length-prefixed frame (module doc "fd passing"); rejects oversize or too many fds first.
+pub(crate) fn send_frame_vectored(
+    sock: std::os::fd::BorrowedFd<'_>,
+    buf: &[u8],
+    fds: &[std::os::fd::BorrowedFd<'_>],
+) -> RpcResult<()> {
+    use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage};
+    use std::io::IoSlice;
+    use std::mem::MaybeUninit;
+
+    if fds.len() > MAX_FDS_PER_FRAME {
+        return Err(RpcError::Protocol("too many fds in one RPC frame"));
+    }
+    if buf.len() > MAX_FRAME_LEN {
+        return Err(RpcError::FrameTooLarge {
+            declared: buf.len(),
+            max: MAX_FRAME_LEN,
+        });
+    }
+    let header = (buf.len() as u32).to_le_bytes();
+    let mut slices = [IoSlice::new(&header), IoSlice::new(buf)];
+    let mut rest: &mut [IoSlice<'_>] = &mut slices;
+    let total = header.len() + buf.len();
+    let mut space = [MaybeUninit::uninit(); FD_SPACE];
+    let mut sent = 0;
+    while sent < total {
+        let mut anc = SendAncillaryBuffer::new(&mut space);
+        // Sending without the fds would leave the parcel's fd table pointing at nothing.
+        if sent == 0 && !fds.is_empty() && !anc.push(SendAncillaryMessage::ScmRights(fds)) {
+            return Err(RpcError::Protocol(
+                "failed to attach SCM_RIGHTS ancillary data",
+            ));
+        }
+        match rustix::net::sendmsg(sock, rest, &mut anc, SEND_FLAGS) {
+            Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into()),
+            Ok(n) => {
+                sent += n;
+                IoSlice::advance_slices(&mut rest, n);
+            }
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) => return Err(std::io::Error::from(e).into()),
+        }
+    }
+    Ok(())
+}
 
 /// A framed transport over a connected Unix domain socket.
 pub struct UnixTransport {
     stream: UnixStream,
     peer: PeerIdentity,
     desc: String,
-    /// `recvmsg` leftover of the fd-mode path only, so `Read` and `recvmsg` never mix on one fd.
-    fd_recv_buf: std::sync::Mutex<Vec<u8>>,
+    /// Held by the fd-mode reader for a whole frame; it keeps no bytes between frames.
+    fd_recv_lock: std::sync::Mutex<()>,
 }
 
 impl UnixTransport {
     /// Wrap an already-connected `UnixStream`. Peer identity is
     /// resolved once, here, from the socket.
+    ///
+    /// On Apple platforms a socket already shut down in both directions
+    /// (its peer closed before the wrap) fails here with
+    /// [`RpcError::EndOfStream`]: XNU refuses the `SO_NOSIGPIPE` this sets,
+    /// and no I/O on such a socket could succeed anyway.
     pub fn from_stream(stream: UnixStream) -> RpcResult<Self> {
+        // No `MSG_NOSIGNAL` on Apple (module doc "fd passing"); EINVAL = both directions shut.
+        #[cfg(target_vendor = "apple")]
+        rustix::net::sockopt::set_socket_nosigpipe(&stream, true).map_err(|e| match e {
+            rustix::io::Errno::INVAL => RpcError::EndOfStream,
+            e => std::io::Error::from(e).into(),
+        })?;
         let peer = resolve_peer(&stream);
         let desc = match stream.peer_addr() {
             Ok(a) => format!("unix:{a:?}"),
@@ -113,7 +193,7 @@ impl UnixTransport {
             stream,
             peer,
             desc,
-            fd_recv_buf: std::sync::Mutex::new(Vec::new()),
+            fd_recv_lock: std::sync::Mutex::new(()),
         })
     }
 
@@ -287,9 +367,8 @@ fn peer_pid(_fd: std::os::fd::RawFd) -> i32 {
 
 impl RpcTransport for UnixTransport {
     fn send_frame(&self, buf: &[u8]) -> RpcResult<()> {
-        // `&UnixStream: Write`: a send runs beside a receiving thread with no lock.
-        let mut w = &self.stream;
-        write_frame(&mut w, buf)
+        // A send runs beside a receiving thread with no lock.
+        send_frame_vectored(self.stream.as_fd(), buf, &[])
     }
 
     fn recv_frame(&self) -> RpcResult<Vec<u8>> {
@@ -332,7 +411,7 @@ impl RpcTransport for UnixTransport {
     /// `sentFds |= ret > 0`); the rest (rare — fd transactions are
     /// tiny) follow without ancillary.
     fn send_raw_with_fds(&self, buf: &[u8], fds: &[std::os::fd::BorrowedFd<'_>]) -> RpcResult<()> {
-        use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
+        use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage};
         use std::io::IoSlice;
         use std::mem::MaybeUninit;
 
@@ -370,7 +449,7 @@ impl RpcTransport for UnixTransport {
                 &self.stream,
                 &[IoSlice::new(&buf[sent..])],
                 &mut anc,
-                SendFlags::empty(),
+                SEND_FLAGS,
             ) {
                 Ok(n) => n,
                 // EINTR is benign — retry the syscall.
@@ -472,13 +551,8 @@ impl RpcTransport for UnixTransport {
     }
 
     fn shutdown(&self) -> RpcResult<()> {
-        // Socket first: a reader parked in `recvmsg` holds `fd_recv_buf` until it wakes.
-        let shut = self.stream.shutdown(std::net::Shutdown::Both);
-        // What remains is a cut frame's prefix; a later reader must not decode it.
-        if let Ok(mut leftover) = self.fd_recv_buf.lock() {
-            leftover.clear();
-        }
-        super::absorb_already_shut(shut)
+        // No `fd_recv_lock`: a reader parked in `recvmsg` holds it until this call wakes it.
+        super::absorb_already_shut(self.stream.shutdown(std::net::Shutdown::Both))
     }
 
     fn supports_fd_passing(&self) -> bool {
@@ -494,55 +568,7 @@ impl RpcTransport for UnixTransport {
         buf: &[u8],
         fds: &[std::os::fd::BorrowedFd<'_>],
     ) -> RpcResult<()> {
-        use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
-        use std::io::IoSlice;
-        use std::mem::MaybeUninit;
-
-        if fds.is_empty() {
-            return self.send_frame(buf);
-        }
-        if fds.len() > MAX_FDS_PER_FRAME {
-            return Err(RpcError::Protocol("too many fds in one RPC frame"));
-        }
-        if buf.len() > MAX_FRAME_LEN {
-            return Err(RpcError::FrameTooLarge {
-                declared: buf.len(),
-                max: MAX_FRAME_LEN,
-            });
-        }
-        let mut framed = Vec::with_capacity(4 + buf.len());
-        framed.extend_from_slice(&(buf.len() as u32).to_le_bytes());
-        framed.extend_from_slice(buf);
-
-        let mut space = vec![MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(fds.len()))];
-        let mut sent = 0;
-        while sent < framed.len() {
-            let mut anc = SendAncillaryBuffer::new(&mut space);
-            if sent == 0 {
-                // Sending without the fds would leave the parcel's fd table pointing at nothing.
-                if !anc.push(SendAncillaryMessage::ScmRights(fds)) {
-                    return Err(RpcError::Protocol(
-                        "failed to attach SCM_RIGHTS ancillary data",
-                    ));
-                }
-            }
-            let n = match rustix::net::sendmsg(
-                &self.stream,
-                &[IoSlice::new(&framed[sent..])],
-                &mut anc,
-                SendFlags::empty(),
-            ) {
-                Ok(n) => n,
-                // EINTR retry, symmetric with read_header.
-                Err(rustix::io::Errno::INTR) => continue,
-                Err(e) => return Err(std::io::Error::from(e).into()),
-            };
-            if n == 0 {
-                return Err(RpcError::EndOfStream);
-            }
-            sent += n;
-        }
-        Ok(())
+        send_frame_vectored(self.stream.as_fd(), buf, fds)
     }
 
     /// Receive one length-prefixed frame plus any `SCM_RIGHTS` fds.
@@ -553,99 +579,107 @@ impl RpcTransport for UnixTransport {
     /// fd-mode use this for *every* frame, so `recvmsg` and `Read` are never
     /// mixed on one fd.
     fn recv_frame_with_fds(&self) -> RpcResult<(Vec<u8>, Vec<std::os::fd::OwnedFd>)> {
-        use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags};
-        use std::io::IoSliceMut;
         use std::mem::MaybeUninit;
 
-        let mut leftover = self.fd_recv_buf.lock().expect("fd recv buf poisoned");
+        // Whole frames under the lock: interleaved readers would hand one frame's fds to another.
+        let _reader = self
+            .fd_recv_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut fds: Vec<std::os::fd::OwnedFd> = Vec::new();
         // Reused: a frame costs two or more `recvmsg`s and `RecvAncillaryBuffer::new` resets it.
-        let mut space =
-            vec![MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_FDS_PER_FRAME))];
-        loop {
-            if leftover.len() >= 4 {
-                let len = u32::from_le_bytes(leftover[0..4].try_into().unwrap()) as usize;
-                if len > MAX_FRAME_LEN {
-                    return Err(RpcError::FrameTooLarge {
-                        declared: len,
-                        max: MAX_FRAME_LEN,
-                    });
-                }
-                if leftover.len() >= 4 + len {
-                    let frame = leftover[4..4 + len].to_vec();
-                    leftover.drain(0..4 + len);
-                    return Ok((frame, fds));
-                }
-            }
-            let mut tmp = [0u8; 8192];
-            // Never read past this frame: a spill takes the next frame's fds (module doc).
-            let want = if leftover.len() < 4 {
-                4 - leftover.len()
-            } else {
-                // Bounded by `MAX_FRAME_LEN` and short of `4 + len` (both checked above).
-                let len = u32::from_le_bytes(leftover[0..4].try_into().unwrap()) as usize;
-                4 + len - leftover.len()
-            };
-            let want = want.min(tmp.len());
-            let mut anc = RecvAncillaryBuffer::new(&mut space);
-            // `MSG_CMSG_CLOEXEC` is Linux-only; `FD_CLOEXEC` is set on each fd below.
-            let r = loop {
-                match rustix::net::recvmsg(
-                    &self.stream,
-                    &mut [IoSliceMut::new(&mut tmp[..want])],
-                    &mut anc,
-                    RecvFlags::empty(),
-                ) {
-                    Ok(r) => break r,
-                    // EINTR retry.
-                    Err(rustix::io::Errno::INTR) => continue,
-                    Err(e) => {
-                        // As `read_header`: idle deadline is `Timeout`, mid-frame our cut.
-                        let io_err = std::io::Error::from(e);
-                        if super::is_timeout(&io_err) {
-                            return Err(if leftover.is_empty() && fds.is_empty() {
-                                RpcError::Timeout
-                            } else {
-                                RpcError::DeadlineMidFrame
-                            });
-                        }
-                        // Past the first byte or fd, an `EndOfStream` is a cut.
-                        return Err(match RpcError::from(io_err) {
-                            RpcError::EndOfStream if !leftover.is_empty() || !fds.is_empty() => {
-                                RpcError::Truncated
-                            }
-                            other => other,
+        let mut space = [MaybeUninit::uninit(); FD_SPACE];
+        // Exact counts, header then body: never read past this frame (module doc).
+        let mut header = [0u8; 4];
+        let mut filled = 0;
+        while filled < header.len() {
+            filled += self.recv_fd_part(&mut header[filled..], &mut space, &mut fds, filled > 0)?;
+        }
+        let len = u32::from_le_bytes(header) as usize;
+        if len > MAX_FRAME_LEN {
+            // Reject *before* allocating `len` bytes.
+            return Err(RpcError::FrameTooLarge {
+                declared: len,
+                max: MAX_FRAME_LEN,
+            });
+        }
+        let mut frame = vec![0u8; len];
+        let mut filled = 0;
+        while filled < len {
+            filled += self.recv_fd_part(&mut frame[filled..], &mut space, &mut fds, true)?;
+        }
+        Ok((frame, fds))
+    }
+}
+
+impl UnixTransport {
+    /// One `recvmsg` into non-empty `buf`; `started`: a byte was read, so an end or deadline cuts.
+    fn recv_fd_part(
+        &self,
+        buf: &mut [u8],
+        space: &mut [std::mem::MaybeUninit<u8>],
+        fds: &mut Vec<OwnedFd>,
+        started: bool,
+    ) -> RpcResult<usize> {
+        use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags};
+        use std::io::IoSliceMut;
+
+        let consumed = started || !fds.is_empty();
+        let mut anc = RecvAncillaryBuffer::new(space);
+        // `MSG_CMSG_CLOEXEC` is Linux-only; `FD_CLOEXEC` is set on each fd below.
+        let r = loop {
+            match rustix::net::recvmsg(
+                &self.stream,
+                &mut [IoSliceMut::new(buf)],
+                &mut anc,
+                RecvFlags::empty(),
+            ) {
+                Ok(r) => break r,
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(e) => {
+                    // As `read_header`: idle deadline is `Timeout`, mid-frame our cut.
+                    let io_err = std::io::Error::from(e);
+                    if super::is_timeout(&io_err) {
+                        return Err(if consumed {
+                            RpcError::DeadlineMidFrame
+                        } else {
+                            RpcError::Timeout
                         });
                     }
+                    // Past the first byte or fd, an `EndOfStream` is a cut.
+                    return Err(match RpcError::from(io_err) {
+                        RpcError::EndOfStream if consumed => RpcError::Truncated,
+                        other => other,
+                    });
                 }
-            };
-            // `MSG_CTRUNC`: surplus fds were dropped; reject, as AOSP `OS_unix_base.cpp` (EPIPE).
-            if r.flags.contains(ReturnFlags::CTRUNC) {
-                return Err(RpcError::Protocol(
-                    "SCM_RIGHTS control message truncated (too many fds in one message)",
-                ));
             }
-            for msg in anc.drain() {
-                if let RecvAncillaryMessage::ScmRights(iter) = msg {
-                    for fd in iter {
-                        rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)
-                            .map_err(std::io::Error::from)?;
-                        fds.push(fd);
-                        if fds.len() > MAX_FDS_PER_FRAME {
-                            return Err(RpcError::Protocol("too many fds in one RPC frame"));
-                        }
+        };
+        // `MSG_CTRUNC`: surplus fds were dropped; reject, as AOSP `OS_unix_base.cpp` (EPIPE).
+        if r.flags.contains(ReturnFlags::CTRUNC) {
+            return Err(RpcError::Protocol(
+                "SCM_RIGHTS control message truncated (too many fds in one message)",
+            ));
+        }
+        for msg in anc.drain() {
+            if let RecvAncillaryMessage::ScmRights(iter) = msg {
+                for fd in iter {
+                    rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)
+                        .map_err(std::io::Error::from)?;
+                    fds.push(fd);
+                    if fds.len() > MAX_FDS_PER_FRAME {
+                        return Err(RpcError::Protocol("too many fds in one RPC frame"));
                     }
                 }
             }
-            if r.bytes == 0 {
-                return Err(if leftover.is_empty() && fds.is_empty() {
-                    RpcError::EndOfStream
-                } else {
-                    RpcError::Truncated
-                });
-            }
-            leftover.extend_from_slice(&tmp[..r.bytes]);
         }
+        if r.bytes == 0 {
+            return Err(if consumed || !fds.is_empty() {
+                RpcError::Truncated
+            } else {
+                RpcError::EndOfStream
+            });
+        }
+        Ok(r.bytes)
     }
 }
 
@@ -672,6 +706,107 @@ mod tests {
         }
     }
 
+    /// The fd-mode pair round-trips every size with its fd, including an empty body (header only).
+    #[test]
+    fn fd_mode_roundtrip_all_sizes() {
+        use std::os::fd::AsFd;
+        let (a, b) = UnixTransport::pair().expect("socketpair");
+        let a = Arc::new(a);
+        for size in [0usize, 1, 8191, 8192, 8193, 64 * 1024, (1 << 20) + 1] {
+            let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let sender = {
+                let a = a.clone();
+                let p = payload.clone();
+                std::thread::spawn(move || {
+                    let (fd, _keep) = UnixStream::pair().expect("an fd to pass");
+                    a.send_frame_with_fds(&p, &[fd.as_fd()]).unwrap()
+                })
+            };
+            let (got, fds) = b.recv_frame_with_fds().expect("recv");
+            assert_eq!(got, payload, "size {size}");
+            assert_eq!(fds.len(), 1, "size {size}");
+            sender.join().unwrap();
+        }
+    }
+
+    /// Each queued fd-mode frame gets exactly its own fds (module doc "fd passing" and "Tests").
+    #[test]
+    fn fd_mode_frames_queued_back_to_back_keep_their_own_fds() {
+        use rustix::net::sockopt;
+        use std::os::fd::AsFd;
+
+        let (a, b) = UnixTransport::pair().expect("socketpair");
+        // Both frames queue before the first read, so the reader sees them back to back.
+        sockopt::set_socket_send_buffer_size(&a.stream, 1 << 20).expect("SO_SNDBUF");
+        sockopt::set_socket_recv_buffer_size(&b.stream, 1 << 20).expect("SO_RCVBUF");
+        a.set_write_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("a full buffer fails the test instead of hanging it");
+        let inode = |fd: std::os::fd::BorrowedFd<'_>| {
+            let st = rustix::fs::fstat(fd).expect("fstat");
+            (st.st_dev, st.st_ino)
+        };
+        let (first_fd, _keep1) = UnixStream::pair().expect("fd for the first frame");
+        let (second_fd, _keep2) = UnixStream::pair().expect("fd for the second frame");
+        let first: Vec<u8> = (0..20 * 1024).map(|i| (i % 251) as u8).collect();
+        let second = b"second frame".to_vec();
+        a.send_frame_with_fds(&first, &[first_fd.as_fd()])
+            .expect("send the first frame");
+        a.send_frame_with_fds(&second, &[second_fd.as_fd()])
+            .expect("send the second frame");
+
+        for (payload, sent) in [(&first, &first_fd), (&second, &second_fd)] {
+            let (got, fds) = b.recv_frame_with_fds().expect("recv");
+            assert_eq!(&got, payload, "frame of {} bytes", payload.len());
+            let got_inodes: Vec<_> = fds.iter().map(|fd| inode(fd.as_fd())).collect();
+            assert_eq!(
+                got_inodes,
+                [inode(sent.as_fd())],
+                "the {}-byte frame must carry its own fd and no other",
+                payload.len()
+            );
+        }
+    }
+
+    /// Not on s390x: CI runs it under qemu-user with no binfmt entry, so the child cannot start.
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        not(target_arch = "s390x")
+    ))]
+    #[test]
+    fn an_fd_send_to_a_closed_peer_is_an_error_not_a_signal() {
+        use std::os::fd::AsFd;
+        use std::os::unix::process::ExitStatusExt;
+        const CHILD: &str = "RSB_UNIX_SIGPIPE_CHILD";
+        const NAME: &str =
+            "rpc::transport::unix::tests::an_fd_send_to_a_closed_peer_is_an_error_not_a_signal";
+
+        if std::env::var_os(CHILD).is_some() {
+            // SAFETY: restores the default disposition; this child runs no other test.
+            unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+            let (a, b) = UnixTransport::pair().expect("socketpair");
+            drop(b);
+            let file = std::fs::File::open("/dev/null").expect("/dev/null");
+            let fds = [file.as_fd()];
+            assert!(a.send_frame_with_fds(b"frame", &fds).is_err());
+            assert!(a.send_raw_with_fds(b"raw", &fds).is_err());
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+            .args(["--exact", NAME, "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .expect("spawn the child");
+        assert_eq!(out.status.signal(), None, "a send raised a signal");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // Zero tests run would also exit 0: the filter must have found this test.
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "{:?}\n{stdout}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     #[test]
     fn unix_peer_identity_is_this_process_for_socketpair() {
         let (a, _b) = UnixTransport::pair().expect("socketpair");
@@ -696,9 +831,9 @@ mod tests {
         assert!(matches!(a.recv_frame(), Err(RpcError::EndOfStream)));
     }
 
-    /// `shutdown` drops the cut-frame prefix left in `fd_recv_buf`; see module doc "Tests".
+    /// A frame a deadline cut leaves nothing for a later read; see module doc "Tests".
     #[test]
-    fn unix_shutdown_drops_the_fd_mode_leftover() {
+    fn unix_fd_mode_cut_frame_leaves_nothing_behind() {
         use std::io::Write;
         let (a, b) = UnixTransport::pair().expect("socketpair");
         b.set_read_timeout(Some(std::time::Duration::from_millis(50)))
@@ -711,14 +846,11 @@ mod tests {
             b.recv_frame_with_fds(),
             Err(RpcError::DeadlineMidFrame)
         ));
-        assert!(
-            !b.fd_recv_buf.lock().unwrap().is_empty(),
-            "the prefix of the cut frame is buffered"
-        );
         b.shutdown().expect("shutdown");
+        let after = b.recv_frame_with_fds();
         assert!(
-            b.fd_recv_buf.lock().unwrap().is_empty(),
-            "shutdown must drop what this end had buffered"
+            matches!(after, Err(RpcError::EndOfStream)),
+            "the cut frame must not come back after shutdown, got {after:?}"
         );
         b.shutdown().expect("a second shutdown is Ok (idempotent)");
     }

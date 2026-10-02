@@ -119,21 +119,14 @@ impl Enforcer {
         }
         let config = self.config();
         let policy = &config.policy;
-        if policy.check(permission, name, &self.subject_for(uid)) {
+        // Judged against the memoized set in place; `subject_for` would copy it.
+        if policy.check_parts(permission, name, uid, &self.groups.gids_for(uid)) {
             return true;
         }
         if !policy.group_could_grant(permission, name) {
             return false;
         }
-        let gids = self.groups.revalidate(uid);
-        policy.check(
-            permission,
-            name,
-            &Subject {
-                uid,
-                gids: (*gids).clone(),
-            },
-        )
+        policy.check_parts(permission, name, uid, &self.groups.revalidate(uid))
     }
 
     /// May `caller` exercise `permission` on `name`?

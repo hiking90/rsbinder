@@ -5,14 +5,20 @@
 #
 #   (a) rsbinder serves `fmqinterop.IFmqPeer`; the C++ client takes the
 #       descriptor of a queue rsbinder made (memfd), hands rsbinder one
-#       libfmq made (ashmem), moves 5000 items each way over each, and
-#       damages the counters of one to record rsbinder's answer.
+#       libfmq made (libcutils' region), moves 5000 items each way over
+#       each, and damages the counters of one to record rsbinder's answer.
 #   (b) the C++ peer serves; `fmq_probe client` does the same from the
-#       rsbinder side — the queue it receives is libfmq's ashmem region
-#       (plan §6.2 S2, no seals), the one it makes is a sealed memfd, and
+#       rsbinder side — the queue it receives is libcutils' region (ashmem:
+#       plan §6.2 S2, no seals), the one it makes is a sealed memfd, and
 #       the three damages record libfmq's answers (S4).
 #   (c) (b)'s first case again with `sys.use_memfd=true`, so libcutils
 #       makes a memfd sealed GROW|SHRINK and rsbinder attaches to that.
+#
+# Which region libcutils makes depends on the device (see LIBCUTILS_KIND
+# below): ashmem up to Android 16, a sealed memfd on an Android 17 device
+# that meets the VSR memfd requirements. There no native binary can get
+# ashmem from libcutils, so the ashmem path of (a2')/(b1) is covered only
+# on an SDK <= 36 device, and (c) is skipped as identical to (b1).
 #
 # The C++ half is built from the two `.aidl` files in tests/aidl/fmqinterop
 # plus the frozen V1 `android.hardware.common{,.fmq}` API from the AOSP
@@ -75,6 +81,24 @@ done
 echo "==> checking device $DEVICE"
 sdk=$("${ADB[@]}" shell getprop ro.build.version.sdk | tr -d '\r')
 [[ "$sdk" -ge 33 ]] || { echo "device $DEVICE is SDK $sdk, expected >= 33"; exit 1; }
+
+# The region libcutils makes for a queue, predicted from the device rather
+# than read back from either peer. Android 17 `ashmem-dev.cpp` (`__use_memfd`)
+# picks memfd when the kernel has the `memfd_class` sepolicy capability and
+# `ro.vendor.api_level` >= 202604; its third condition, target SDK >= 37,
+# holds for any executable on such a device, because the linker gives an
+# executable the platform's API level (bionic `linker_config.cpp`), not the
+# one it was built for. Before 17, memfd needs `sys.use_memfd=true` — (c).
+LIBCUTILS_KIND=ashmem
+if [[ "$sdk" -ge 37 ]]; then
+    vendor_api=$("${ADB[@]}" shell getprop ro.vendor.api_level | tr -d '\r')
+    memfd_class=$("${ADB[@]}" shell \
+        'test -e /sys/fs/selinux/policy_capabilities/memfd_class && echo yes || true' | tr -d '\r')
+    if [[ "$memfd_class" == yes && "${vendor_api:-0}" -ge 202604 ]]; then
+        LIBCUTILS_KIND=memfd:sealed
+    fi
+fi
+echo "==> libcutils makes $LIBCUTILS_KIND regions on this device"
 
 case "${ABI:-$("${ADB[@]}" shell getprop ro.product.cpu.abi | tr -d '\r')}" in
     arm64-v8a|aarch64) TRIPLE=aarch64-linux-android ;;
@@ -203,7 +227,7 @@ if wait_for_line "$RS_LOG" "SERVING $RS_SVC"; then
         && ok "(a1) libfmq attached to rsbinder's memfd queue; $COUNT items each way" \
         || bad "(a1) server-queue"
     echo "$out" | grep -qx "RESULT client-queue $COUNT adopted=$CAPACITY in=ok out=ok" \
-        && ok "(a2) rsbinder adopted libfmq's ashmem queue; $COUNT items each way" \
+        && ok "(a2) rsbinder adopted libfmq's $LIBCUTILS_KIND queue; $COUNT items each way" \
         || bad "(a2) client-queue"
     # rsbinder's contract: `Corrupted` on every operation over a damaged ring.
     for what in read-ahead over-capacity unaligned; do
@@ -211,9 +235,9 @@ if wait_for_line "$RS_LOG" "SERVING $RS_SVC"; then
             && ok "(a3) rsbinder refused the ring libfmq's side damaged ($what)" \
             || bad "(a3) $what"
     done
-    "${ADB[@]}" shell "grep -q 'adopted a $CAPACITY-item queue (ashmem)' $RS_LOG" \
-        && ok "(a2') the queue libfmq made reached rsbinder as an ashmem region" \
-        || { bad "(a2') rsbinder did not see ashmem"; "${ADB[@]}" shell cat "$RS_LOG"; }
+    "${ADB[@]}" shell "grep -q 'adopted a $CAPACITY-item queue ($LIBCUTILS_KIND)' $RS_LOG" \
+        && ok "(a2') the queue libfmq made reached rsbinder as $LIBCUTILS_KIND" \
+        || { bad "(a2') rsbinder did not see $LIBCUTILS_KIND"; "${ADB[@]}" shell cat "$RS_LOG"; }
 else
     bad "the rsbinder service did not start"
     "${ADB[@]}" shell cat "$RS_LOG"
@@ -225,9 +249,9 @@ echo "=== (b) libfmq + libbinder_ndk serves, rsbinder is the client"
 if start_cpp_server; then
     out=$(run "$DEV_DIR/fmq_probe client $CPP_SVC all $COUNT $CAPACITY")
     echo "$out" | sed 's/^/      /'
-    echo "$out" | grep -qx "RESULT server-queue $COUNT kind=ashmem capacity=$CAPACITY in=ok out=ok" \
-        && ok "(b1) rsbinder attached to libfmq's ashmem queue (S2, no seals); $COUNT items each way" \
-        || bad "(b1) server-queue"
+    echo "$out" | grep -qx "RESULT server-queue $COUNT kind=$LIBCUTILS_KIND capacity=$CAPACITY in=ok out=ok" \
+        && ok "(b1) rsbinder attached to libfmq's $LIBCUTILS_KIND queue; $COUNT items each way" \
+        || bad "(b1) server-queue (expected kind=$LIBCUTILS_KIND)"
     echo "$out" | grep -qx "RESULT client-queue $COUNT adopted=$CAPACITY in=ok out=ok" \
         && ok "(b2) libfmq adopted rsbinder's memfd queue; $COUNT items each way" \
         || bad "(b2) client-queue"
@@ -248,8 +272,11 @@ echo "=== (c) as (b1), libcutils making memfd instead of ashmem"
 # `ASHMEM_GET_SIZE` (Android 16 `ashmem-dev.cpp`, `__has_memfd_support`);
 # the GKI the API 36 emulator boots does not, and logs
 # "no ashmem-memfd compat support". Then the case is not reachable here.
-"${ADB[@]}" shell setprop sys.use_memfd true
-if start_cpp_server; then
+if [[ "$LIBCUTILS_KIND" == memfd:sealed ]]; then
+    printf '  SKIP  %s\n' "(c) libcutils already makes memfd here without the property; (b1) covered it"
+elif ! "${ADB[@]}" shell setprop sys.use_memfd true; then
+    bad "(c) setprop sys.use_memfd true failed"
+elif start_cpp_server; then
     out=$(run "$DEV_DIR/fmq_probe client $CPP_SVC server-queue $COUNT $CAPACITY")
     echo "$out" | sed 's/^/      /'
     if echo "$out" | grep -qx "RESULT server-queue $COUNT kind=memfd:sealed capacity=$CAPACITY in=ok out=ok"; then
