@@ -406,7 +406,10 @@ in the release after 0.12.0. The single-connection one-liners
   `SIGPIPE`.** The `sendmsg` calls that carry fds passed no flags, so on
   Linux and Android such a send killed a process whose runtime does not
   ignore `SIGPIPE` (a C or JNI host); they now pass `MSG_NOSIGNAL`, as std's
-  own `send` does.
+  own `send` does. On Apple platforms, which have no `MSG_NOSIGNAL` flag in
+  rustix, `UnixTransport::from_stream` now sets `SO_NOSIGPIPE` on every
+  socket it wraps, including a `pair()` socketpair and an fd adopted by
+  `from_owned_fd`, where std had not set it.
 - **RPC: a TLS or `tcp_debug` connect that hits its own deadline returns
   `TimedOut`**, not `Unknown` (std's error for it carries no errno).
 - **RPC: dropping a proxy right after a oneway on it no longer aborts a

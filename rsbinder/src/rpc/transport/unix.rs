@@ -60,6 +60,14 @@
 //! cannot split a frame's fds between them. `shutdown` does not take that
 //! lock: a reader parked in `recvmsg` holds it until the shutdown wakes it.
 //!
+//! The sender (`send_frame_vectored`) passes the length and the body as two
+//! slices of one `sendmsg`, so the body is not copied into a joined buffer,
+//! and attaches the fds to the first `sendmsg` only. It does not use std's
+//! `write_vectored`: that is `writev`, which takes no `MSG_NOSIGNAL`. Apple
+//! has no `MSG_NOSIGNAL` at all, so there `from_stream` sets `SO_NOSIGPIPE`
+//! on the socket; std sets it only on sockets std itself creates, not on a
+//! `socketpair` from `pair` or an fd adopted by `from_owned_fd`.
+//!
 //! ## Tests
 //!
 //! - `fd_mode_frames_queued_back_to_back_keep_their_own_fds`: a frame that
@@ -76,6 +84,9 @@
 //!   told apart from a stream that ended mid-frame (`Truncated`); with
 //!   nothing consumed it stays the boundary `Timeout`. The framed reader and
 //!   the fd-mode reader classify the same way.
+//! - `an_fd_send_to_a_closed_peer_is_an_error_not_a_signal`: the test
+//!   harness ignores `SIGPIPE`, so the sends run in a child process that
+//!   restores `SIG_DFL`; a `SIGPIPE` there kills the child and fails the test.
 
 use std::io::{Read, Write};
 #[cfg(target_os = "android")]
@@ -94,20 +105,16 @@ use crate::rpc::{RpcError, RpcResult};
 /// Per-message fd cap (DoS bound, < `SCM_MAX_FD` 253); `wire_android13` applies it across recvmsgs.
 pub(crate) const MAX_FDS_PER_FRAME: usize = 64;
 
-/// `sendmsg` flags: a send to a closed peer is `EPIPE`, not `SIGPIPE`, as std's own `send`.
-/// Apple has no `MSG_NOSIGNAL`; std sets `SO_NOSIGPIPE` on the sockets it creates there instead.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+/// A send to a closed peer is `EPIPE`, not `SIGPIPE`; Apple uses `SO_NOSIGPIPE` (module doc).
+#[cfg(not(target_vendor = "apple"))]
 const SEND_FLAGS: rustix::net::SendFlags = rustix::net::SendFlags::NOSIGNAL;
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(target_vendor = "apple")]
 const SEND_FLAGS: rustix::net::SendFlags = rustix::net::SendFlags::empty();
 
 /// Ancillary space for one `sendmsg`/`recvmsg` of a frame: `MAX_FDS_PER_FRAME` fds.
 const FD_SPACE: usize = rustix::cmsg_space!(ScmRights(MAX_FDS_PER_FRAME));
 
-/// One length-prefixed frame by `sendmsg` from two slices, the length and `buf`, so the body is
-/// not copied into a joined buffer; `fds` ride the first call. Fails as `write_frame` does, and
-/// rejects an oversize frame or too many fds before any byte. Stream sockets only (`unix`,
-/// `tcp_debug`): std's `write_vectored` is `writev`, which has no `MSG_NOSIGNAL`.
+/// One length-prefixed frame (module doc "fd passing"); rejects oversize or too many fds first.
 pub(crate) fn send_frame_vectored(
     sock: std::os::fd::BorrowedFd<'_>,
     buf: &[u8],
@@ -166,6 +173,9 @@ impl UnixTransport {
     /// Wrap an already-connected `UnixStream`. Peer identity is
     /// resolved once, here, from the socket.
     pub fn from_stream(stream: UnixStream) -> RpcResult<Self> {
+        // No `MSG_NOSIGNAL` on Apple (module doc "fd passing").
+        #[cfg(target_vendor = "apple")]
+        rustix::net::sockopt::set_socket_nosigpipe(&stream, true).map_err(std::io::Error::from)?;
         let peer = resolve_peer(&stream);
         let desc = match stream.peer_addr() {
             Ok(a) => format!("unix:{a:?}"),
@@ -595,8 +605,7 @@ impl RpcTransport for UnixTransport {
 }
 
 impl UnixTransport {
-    /// One `recvmsg` of the fd-mode reader into `buf` (non-empty), its fds appended to `fds`.
-    /// `started`: a byte of this frame was already read, so an end or a deadline cuts it.
+    /// One `recvmsg` into non-empty `buf`; `started`: a byte was read, so an end or deadline cuts.
     fn recv_fd_part(
         &self,
         buf: &mut [u8],
@@ -712,9 +721,7 @@ mod tests {
         }
     }
 
-    /// Each fd-mode frame gets exactly the fds sent with it, with the next frame already queued:
-    /// a read of the first frame's tail that spills into the second takes the second's fds
-    /// (module doc "fd passing"). The first frame spans several reads of the fd-mode reader.
+    /// Each queued fd-mode frame gets exactly its own fds (module doc "fd passing" and "Tests").
     #[test]
     fn fd_mode_frames_queued_back_to_back_keep_their_own_fds() {
         use rustix::net::sockopt;
@@ -752,8 +759,6 @@ mod tests {
         }
     }
 
-    /// An fd send to a closed peer fails with `EPIPE`: a `SIGPIPE` would kill a host whose runtime
-    /// does not ignore it. The harness ignores it, so the sends run in a child at `SIG_DFL`.
     /// Not on s390x: CI runs it under qemu-user with no binfmt entry, so the child cannot start.
     #[cfg(all(
         any(target_os = "linux", target_os = "android"),
