@@ -14,8 +14,9 @@
 //! ```ignore
 //! use rsbinder::Reconnecting;
 //!
+//! let listener = listener.clone();
 //! let hello = Reconnecting::<dyn IHello>::builder("unix:///run/hello.sock#hello")
-//!     .on_connect(|conn| {
+//!     .on_connect(move |conn| {
 //!         // Every (re)connection, before the new proxy is handed out.
 //!         conn.proxy().register_listener(&listener)?;
 //!         Ok(())
@@ -71,8 +72,10 @@
 //!
 //! [`on_connect`]: ReconnectBuilder::on_connect
 
+use std::any::Any;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
@@ -243,7 +246,13 @@ impl<T: FromIBinder + ?Sized + 'static> ReconnectBuilder<T> {
     /// An `Err` fails that attempt: a [`ConnectError::retry`] (what `?`
     /// makes) backs off and reconnects, a [`ConnectError::stop`] closes the
     /// helper. A call into this same helper from inside the hook does not
-    /// wait (`with` returns `DeadObject`, `wait_connected` `WouldBlock`).
+    /// wait (`with` returns `DeadObject`, `wait_connected` and `connected`
+    /// `WouldBlock`).
+    ///
+    /// A panic in the hook or in [`options`](Self::options) comes out of
+    /// `build` as the panic; on the reconnect thread it closes the helper
+    /// with [`StatusCode::Unknown`] as its
+    /// [`last_error`](Reconnecting::last_error).
     pub fn on_connect(
         mut self,
         f: impl Fn(&Connection<'_, T>) -> std::result::Result<(), ConnectError> + Send + Sync + 'static,
@@ -262,12 +271,14 @@ impl<T: FromIBinder + ?Sized + 'static> ReconnectBuilder<T> {
     ///
     /// `Err` only for what another attempt cannot change: a malformed URI,
     /// options that do not apply to it, a missing feature, a kernel URI
-    /// without a service name, a kernel service of another interface
-    /// ([`StatusCode::BadType`]; an RPC cast does not ask the server, so
-    /// there the first call reports it), a name the service manager refuses
-    /// to watch ([`StatusCode::BadValue`] for an invalid name,
-    /// [`StatusCode::PermissionDenied`] for an SELinux `find` denial), or
-    /// [`ConnectError::stop`] from `on_connect`.
+    /// without a service name, no binder device for a kernel URI
+    /// ([`StatusCode::NoInit`]), a kernel service of another interface
+    /// ([`StatusCode::BadType`]; a cast to another interface over RPC is
+    /// reported by the first call), an RPC name lookup on a server without
+    /// a directory of names, such as a libbinder root (`BadType`), a name
+    /// the service manager refuses to watch ([`StatusCode::BadValue`] for an
+    /// invalid name, [`StatusCode::PermissionDenied`] for an SELinux `find`
+    /// denial), or [`ConnectError::stop`] from `on_connect`.
     ///
     /// Anything else — the server not up yet, the name not registered yet —
     /// returns a helper that keeps connecting in the background, so a
@@ -393,7 +404,8 @@ impl<T: FromIBinder + ?Sized + 'static> Reconnecting<T> {
     /// takes, without blocking the executor. Wrap it in
     /// `tokio::time::timeout` for a bound. The closing error once the helper
     /// is closed (`DeadObject` if there was none); `WouldBlock` inside a
-    /// binder transaction. Dropping the future stops the wait, not the
+    /// binder transaction or `on_connect`, where waiting could block the
+    /// reconnect itself. Dropping the future stops the wait, not the
     /// reconnect.
     #[cfg(feature = "tokio")]
     pub async fn connected(&self) -> Result<Strong<T>> {
@@ -409,6 +421,10 @@ impl<T: FromIBinder + ?Sized + 'static> Reconnecting<T> {
                     return Err(code.unwrap_or(StatusCode::DeadObject))
                 }
                 Err(_) => {}
+            }
+            // Inside `on_connect` the publish this awaits would come from this very thread.
+            if self.shared.on_reconnect_thread(&self.shared.lock()) {
+                return Err(StatusCode::WouldBlock);
             }
             // The sender lives in `Shared`, which `self` keeps alive.
             let _ = published.changed().await;
@@ -577,9 +593,7 @@ impl<T: FromIBinder + ?Sized + 'static> State<T> {
     }
 }
 
-/// Lock rule (plan 10-10b K4): under `state`, memory only — no binder call, no session end,
-/// no user code, no proxy or session drop. A death recipient takes the lock, and an RPC one
-/// runs on whatever thread ended the session, a caller inside `with` included.
+/// Lock rule K4 (plan 10-10b §1): memory only under `state`; death recipients take it.
 struct Shared<T: FromIBinder + ?Sized + 'static> {
     cfg: Config<T>,
     state: Mutex<State<T>>,
@@ -801,8 +815,7 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
         }
     }
 
-    /// Publish `conn` unless closed or dead meanwhile; `Some` is the failure to back off from.
-    /// `thread`: the reconnect thread publishing, which then ends.
+    /// Publish `conn` unless closed or dead; `Some` = back off. `thread`: the thread then ends.
     fn finish_success(self: &Arc<Self>, conn: Conn<T>, thread: bool) -> Option<Failure> {
         let mut st = self.lock();
         if st.phase == Phase::Closed {
@@ -869,7 +882,7 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
         h.write_u32(failures);
         let pct = 100 - j + u128::from(h.finish()) % (2 * j + 1);
         let nanos = base.as_nanos() * pct / 100;
-        Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+        Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX)).min(p.max)
     }
 
     /// Unlink and end what a dropped connection holds; never under the lock.
@@ -908,7 +921,10 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
     fn attempt(self: &Arc<Self>, id: u64, mode: Mode) -> std::result::Result<Conn<T>, Failure> {
         let mut options = ClientOptions::default();
         if let Some(f) = &self.cfg.options {
-            f(&mut options, &self.cfg.uri.endpoint);
+            let ran = catch_unwind(AssertUnwindSafe(|| f(&mut options, &self.cfg.uri.endpoint)));
+            if let Err(payload) = ran {
+                return Err(self.user_panic(mode, payload));
+            }
         }
         let client =
             open_staged(self.cfg.uri.clone(), options).map_err(|(stage, code)| Failure {
@@ -932,7 +948,9 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
             .as_any()
             .downcast_ref::<crate::rpc::RpcProxy>()
             .map(|p| p.session());
-        let watch = if !binder.is_remote() {
+        // Defensive (`manager` gets handle >= 1): a handle-0 link latches `hub::default()` dead.
+        let watch = if !binder.is_remote() || (*binder).as_proxy().is_some_and(|p| p.handle() == 0)
+        {
             Watch::Never
         } else {
             #[cfg(feature = "rpc")]
@@ -992,13 +1010,18 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
                 #[cfg(feature = "rpc")]
                 session: conn_parts.session.as_ref(),
             };
-            if let Err(e) = hook(&c) {
-                drop(proxy);
-                self.end_parts(conn_parts);
-                return Err(Failure {
+            let failed = match catch_unwind(AssertUnwindSafe(|| hook(&c))) {
+                Ok(Ok(())) => None,
+                Ok(Err(e)) => Some(Ok(Failure {
                     code: e.code,
                     permanent: e.stop,
-                });
+                })),
+                Err(payload) => Some(Err(payload)),
+            };
+            if let Some(failed) = failed {
+                drop(proxy);
+                self.end_parts(conn_parts);
+                return Err(failed.unwrap_or_else(|payload| self.user_panic(mode, payload)));
             }
         }
         Ok(Conn {
@@ -1011,6 +1034,18 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
             #[cfg(feature = "rpc")]
             session: conn_parts.session,
         })
+    }
+
+    /// A user closure panicked: `build`'s caller gets the panic, the reconnect thread closes.
+    fn user_panic(&self, mode: Mode, payload: Box<dyn Any + Send>) -> Failure {
+        if mode == Mode::Build {
+            resume_unwind(payload);
+        }
+        log::error!(
+            "Reconnecting: a user closure panicked for {}; closing",
+            self.cfg
+        );
+        Failure::permanent(StatusCode::Unknown)
     }
 
     /// Undo a failed attempt's link and session (plan 10-10b K6).
@@ -1046,6 +1081,11 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
         let sm = crate::hub::default().map_err(Failure::transient)?;
         if let Some(b) = sm.try_get_service(name).map_err(Failure::transient)? {
             return Ok(b);
+        }
+        // Android 10 has no registration to probe; the thread's wait polls instead.
+        #[cfg(all(target_os = "android", feature = "android_10"))]
+        if mode == Mode::Build && matches!(*sm, crate::hub::ServiceManager::Android10(_)) {
+            return Err(Failure::transient(StatusCode::NameNotFound));
         }
         if mode == Mode::Build {
             // `getService` answers a denied name as an absent one; a registration tells them apart.
@@ -1099,7 +1139,8 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
                         Wait::Connected(_) if !may_wait => return Err(AcquireError::WouldBlock),
                         Wait::Attempt if !may_wait => return Err(AcquireError::NoConnection),
                         Wait::Attempt => match st.attempting {
-                            Some(t0) if t0.elapsed() < call_wait => Some(started + call_wait),
+                            // An unrepresentable deadline waits without one.
+                            Some(t0) if t0.elapsed() < call_wait => started.checked_add(call_wait),
                             _ => return Err(AcquireError::NoConnection),
                         },
                         Wait::Connected(deadline) => deadline,
@@ -1135,8 +1176,10 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
                     drop(st);
                     #[cfg(feature = "rpc")]
                     if self.ended_before_call(&snap) {
+                        let attempt = snap.attempt;
+                        drop(snap);
                         st = self.lock();
-                        self.mark_stale(&mut st, snap.attempt);
+                        self.mark_stale(&mut st, attempt);
                         continue;
                     }
                     return Ok(snap);
@@ -1190,7 +1233,7 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
     }
 
     fn wait_connected(self: &Arc<Self>, timeout: Option<Duration>) -> Result<Strong<T>> {
-        let deadline = timeout.map(|t| Instant::now() + t);
+        let deadline = timeout.and_then(|t| Instant::now().checked_add(t));
         self.acquire(Wait::Connected(deadline))
             .map(|s| s.proxy)
             .map_err(|e| match e {

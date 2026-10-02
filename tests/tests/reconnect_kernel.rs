@@ -80,8 +80,7 @@ fn kernel(name: &str) -> String {
     format!("binder://{name}")
 }
 
-/// AC-10b.3: a killed and restarted service is picked up again by its death
-/// notification alone, `on_connect` runs once per connection.
+/// AC-10b.3: a restarted service is reconnected by its death notification alone.
 #[test]
 #[ignore = "needs /dev/binderfs/binder and a running rsb_hub"]
 fn a_restarted_service_is_reconnected_without_a_call() {
@@ -109,8 +108,7 @@ fn a_restarted_service_is_reconnected_without_a_call() {
     assert_eq!(connects.load(Ordering::SeqCst), 2);
 }
 
-/// AC-10b.7b: built before the service registers, then connected by the
-/// registration notification.
+/// AC-10b.7b: built before the service registers, then connected on its registration.
 #[test]
 #[ignore = "needs /dev/binderfs/binder and a running rsb_hub"]
 fn a_helper_built_before_its_service_connects_on_registration() {
@@ -136,8 +134,7 @@ fn an_invalid_name_is_a_build_error() {
     assert_eq!(r, Some(StatusCode::BadValue));
 }
 
-/// AC-10b.7c: a service in this process comes back as a local binder, which
-/// cannot die on its own, so nothing is watched.
+/// AC-10b.7c: a service in this process is a local binder, so nothing is watched.
 #[test]
 #[ignore = "needs /dev/binderfs/binder and a running rsb_hub"]
 fn a_local_service_is_used_without_watching() {
@@ -168,9 +165,7 @@ fn a_local_service_is_used_without_watching() {
     assert_eq!(h.generation(), 1);
 }
 
-/// AC-10b.9 (kernel): dropping a helper that waits for a registration leaves
-/// no callback with the service manager. rsb_hub caps callbacks per name at
-/// 256, so filling the cap after the drop shows that none was left behind.
+/// AC-10b.9 (kernel): a dropped waiting helper leaves no callback (rsb_hub caps 256 a name).
 #[test]
 #[ignore = "needs /dev/binderfs/binder and a running rsb_hub"]
 fn dropping_a_waiting_helper_unregisters_its_callback() {

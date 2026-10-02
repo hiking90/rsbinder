@@ -183,6 +183,9 @@ jobs:
         #   * tests/tests/fmq_binder.rs — `#[ignore]`d: an FMQ descriptor
         #     across the kernel binder between two rsbinder processes, so
         #     /dev/binder plus a live rsb_hub. integration-test.yml owns it.
+        #   * tests/tests/reconnect_kernel.rs, tests/tests/reconnect_hub_restart.rs
+        #     — `#[ignore]`d: /dev/binder plus a live rsb_hub, and the second
+        #     restarts the context manager itself. integration-test.yml owns both.
         #   * rsbinder-fmq/tests/libfmq_host.rs — `#[ignore]`d: needs the C++
         #     peer built from the AOSP checkout
         #     (`rsbinder-fmq/tests/cpp/build_host_peer.sh`). Run by hand.

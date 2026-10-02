@@ -125,8 +125,7 @@ fn reconnects_after_a_restart_noticed_by_death_notification() {
     assert_eq!(echo(&h, "y").unwrap(), "b:y");
 }
 
-/// AC-10b.1 (b): the default r34 profile cannot notice the restart; the next call finds the
-/// closed socket before sending, and runs once on the new connection.
+/// AC-10b.1 (b): r34 misses the restart; the next call sees the closed socket and runs anew.
 #[test]
 fn first_call_after_an_unnoticed_restart_runs_on_the_new_connection() {
     let sock = Sock::new("r34");
@@ -206,9 +205,7 @@ fn build_refuses_what_a_retry_cannot_fix() {
         .build()
         .err();
     assert_eq!(r, Some(StatusCode::BadValue));
-    // An RPC cast stamps the descriptor without asking the server, so another interface (the
-    // root of an rsbinder server is its directory) shows at the first call, and the session —
-    // which is fine — is kept.
+    // An RPC cast does not ask the server, so a root of another interface fails at the call.
     let h = Reconnecting::<dyn IRpcSmoke>::builder(&sock.uri("", ""))
         .build()
         .expect("the cast does not check the interface");
@@ -249,8 +246,7 @@ fn on_connect_stops_only_when_asked() {
     assert_eq!(tries.load(Ordering::SeqCst), 3);
 }
 
-/// A call that ends its session with `TimedOut` (an expired reply deadline) starts the
-/// reconnect by itself: the status is not the signal, the session's end is.
+/// A call ending its session with `TimedOut` reconnects: the session's end is the signal.
 #[test]
 fn a_call_that_ends_the_session_reconnects_without_another_call() {
     let sock = Sock::new("deadline");

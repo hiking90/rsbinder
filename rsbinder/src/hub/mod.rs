@@ -1369,8 +1369,7 @@ impl ServiceManager {
             .map_err(StatusCode::from)
     }
 
-    /// [`register_for_notifications`](Self::register_for_notifications) keeping the `Status`:
-    /// a refusal's exception (`EX_SECURITY`, `EX_ILLEGAL_ARGUMENT`) is lost in `StatusCode`.
+    /// `register_for_notifications` keeping the `Status`, whose refusal exception it would lose.
     pub(crate) fn register_for_notifications_status(
         &self,
         name: &str,
@@ -1863,8 +1862,7 @@ impl ServiceManager {
 /// Why [`ServiceManager::wait_for_service_cancellable`] returned without a binder.
 #[derive(Debug)]
 pub(crate) enum WaitEnd {
-    /// A lookup or a registration's transport failed: no service manager (`BR_DEAD_REPLY`), or
-    /// the name still maps to a binder whose process died. Waiting again can succeed.
+    /// A lookup or registration failed in a way waiting again can fix (plan 10-10b §3.10).
     Transient(StatusCode),
     /// The service manager refused `registerForNotifications` (bad name, SELinux `find`).
     Refused(Status),
@@ -1872,8 +1870,7 @@ pub(crate) enum WaitEnd {
 }
 
 impl WaitEnd {
-    /// Only `EX_SECURITY` and `EX_ILLEGAL_ARGUMENT` repeat on retry; `EX_ILLEGAL_STATE` (a
-    /// callback the SM could not link, rsb_hub's per-name cap) and transport errors do not.
+    /// Only `EX_SECURITY` and `EX_ILLEGAL_ARGUMENT` repeat on retry (plan 10-10b §3.10).
     pub(crate) fn from_registration(status: Status) -> Self {
         match status.exception_code() {
             ExceptionCode::Security | ExceptionCode::IllegalArgument => WaitEnd::Refused(status),

@@ -201,7 +201,7 @@ tier_hermetic() {
         --test entry_rpc --test gateway_rpc --test codegen_shapes --test rpc_async \
         --test rpc_calling_identity --test rpc_enforce_permission_deny --test work_source_rpc \
         --test observer_rpc --test transaction_names --test transport_caps --test cancel_rpc \
-        --test stream_rpc
+        --test stream_rpc --test reconnect_rpc
     run "tests: rpc_generated_stub (tcp-debug)" tpass cargo test -p tests --features rpc-tcp-debug --test rpc_generated_stub
     run "tests: aidl_spans" tpass cargo test -p tests --features rpc,tracing --test aidl_spans
     run "rsbinder-macros" tpass cargo test -p rsbinder-macros

@@ -10,8 +10,9 @@ service.
 ```rust,ignore
 use rsbinder::Reconnecting;
 
+let listener = listener.clone();
 let hello = Reconnecting::<dyn IHello>::builder("unix:///run/hello.sock#hello")
-    .on_connect(|conn| {
+    .on_connect(move |conn| {
         // Every (re)connection, before callers get the new proxy.
         conn.proxy().register_listener(&listener)?;
         Ok(())
@@ -40,7 +41,7 @@ How it notices depends on what the lookup returned:
 |---|---|
 | a kernel binder proxy | its death notification, at once |
 | RPC, the session has incoming connections or a serve loop | its death notification, as the session ends |
-| RPC otherwise — the default `unix://…#name` | the next call, before it is sent: the socket shows the peer closed |
+| RPC otherwise — the default `unix://…#name` | the next call: before it is sent where the socket reports the close (Unix sockets; TCP on Linux/Android), otherwise after that call fails |
 | a service in the same process | never: it cannot die on its own |
 
 It never decides from a status code. The call that ended a session can
@@ -67,7 +68,10 @@ waiting, for async code that must not block.
 
 `build()` tries once without waiting. It fails only for what another
 attempt cannot change — a malformed URI, options that do not fit it, a
-missing feature, a name the service manager refuses to watch, or
+missing feature, no binder device for a kernel URI (`NoInit`), a kernel
+service of another interface (`BadType`), an RPC name lookup on a server
+without a directory of names (`BadType`), a name the service manager
+refuses to watch, or
 `ConnectError::stop` from `on_connect`. A server that is not up yet is not
 an error: the helper connects in the background, so a client may start
 first. Set `ClientOptions::timeout` through `options(...)` if the server
