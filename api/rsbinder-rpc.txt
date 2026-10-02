@@ -2664,6 +2664,7 @@ pub fn rsbinder::rpc::session::RpcSession::fd_transport_mode(&self) -> rsbinder:
 pub fn rsbinder::rpc::session::RpcSession::from_preconnected_fd(std::os::fd::owned::OwnedFd, u32) -> rsbinder::Result<rsbinder::rpc::session::RpcSession>
 pub fn rsbinder::rpc::session::RpcSession::get_root(&self) -> rsbinder::Result<rsbinder::SIBinder>
 pub fn rsbinder::rpc::session::RpcSession::get_session_id(&self) -> rsbinder::Result<alloc::vec::Vec<u8>>
+pub fn rsbinder::rpc::session::RpcSession::is_ended(&self) -> bool
 pub fn rsbinder::rpc::session::RpcSession::local_node_count(&self) -> usize
 pub fn rsbinder::rpc::session::RpcSession::negotiate(&self, u32) -> rsbinder::Result<u32>
 pub fn rsbinder::rpc::session::RpcSession::negotiate_fd_transport(&self, rsbinder::rpc::fd_mode::FileDescriptorTransportMode) -> rsbinder::Result<rsbinder::rpc::fd_mode::FileDescriptorTransportMode>
@@ -3221,6 +3222,7 @@ pub fn rsbinder::rpc::session::RpcSession::fd_transport_mode(&self) -> rsbinder:
 pub fn rsbinder::rpc::session::RpcSession::from_preconnected_fd(std::os::fd::owned::OwnedFd, u32) -> rsbinder::Result<rsbinder::rpc::session::RpcSession>
 pub fn rsbinder::rpc::session::RpcSession::get_root(&self) -> rsbinder::Result<rsbinder::SIBinder>
 pub fn rsbinder::rpc::session::RpcSession::get_session_id(&self) -> rsbinder::Result<alloc::vec::Vec<u8>>
+pub fn rsbinder::rpc::session::RpcSession::is_ended(&self) -> bool
 pub fn rsbinder::rpc::session::RpcSession::local_node_count(&self) -> usize
 pub fn rsbinder::rpc::session::RpcSession::negotiate(&self, u32) -> rsbinder::Result<u32>
 pub fn rsbinder::rpc::session::RpcSession::negotiate_fd_transport(&self, rsbinder::rpc::fd_mode::FileDescriptorTransportMode) -> rsbinder::Result<rsbinder::rpc::fd_mode::FileDescriptorTransportMode>

@@ -4573,6 +4573,27 @@ impl RpcSession {
         }
     }
 
+    /// Whether this session has ended: every connection is shut, its
+    /// proxies return [`StatusCode::DeadObject`] without I/O, and its death
+    /// recipients have fired or are firing. Once `true` it stays `true`.
+    ///
+    /// A session ends as a whole on any connection's failure, an expired
+    /// reply deadline, the peer closing, or
+    /// [`close_session`](Self::close_session) ([module doc](self#session-end)).
+    /// The call that ended it may itself have returned `TimedOut` or a
+    /// decode error rather than `DeadObject`, so after a failed call this —
+    /// not the status code — tells whether to reconnect. A handler can also
+    /// return `DeadObject` from a live session, which this tells apart.
+    ///
+    /// This reads state; it does not probe the connection. A session whose
+    /// peer has gone while this end has not read from or written to it since
+    /// (no incoming connection, no serve loop, no call) still reads `false`.
+    /// It reads `true` from the moment the session starts ending, before its
+    /// recipients have all run.
+    pub fn is_ended(&self) -> bool {
+        self.inner.shared.lifecycle.is_torn_down()
+    }
+
     /// Set the client reply/handshake wait deadline. `None`
     /// (default) blocks forever.
     ///

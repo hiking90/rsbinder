@@ -454,6 +454,31 @@ impl MemPair {
         self.client.close_session();
         self.serve.take().expect("serve thread").join().unwrap();
     }
+    /// Joins the serve thread of a session already ended from the server side.
+    fn serve_thread_join(mut self) {
+        self.serve.take().expect("serve thread").join().unwrap();
+    }
+}
+
+/// `is_ended` reads the session's state: set by an end on either side once this end sees it.
+#[test]
+fn is_ended_follows_the_session_not_the_peer() {
+    let p = MemPair::new();
+    assert!(!p.client.is_ended() && !p.server.is_ended());
+
+    // The peer ends; this client has no serve loop, so it learns only from its next call.
+    p.server.close_session();
+    assert!(p.server.is_ended());
+    assert!(!p.client.is_ended(), "no I/O since the peer closed");
+    let rp = rpc_of(&p.root);
+    let d = rp.build_request(ISMOKE_DESC).unwrap();
+    assert!(rp.transact(TX_ECHO, &d, 0).is_err());
+    assert!(
+        p.client.is_ended(),
+        "the failed call ended the client's session"
+    );
+
+    p.serve_thread_join();
 }
 
 /// A local binder written after `close_session` is refused at the write; nothing is inserted.
