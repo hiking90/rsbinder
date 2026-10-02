@@ -172,10 +172,18 @@ pub struct UnixTransport {
 impl UnixTransport {
     /// Wrap an already-connected `UnixStream`. Peer identity is
     /// resolved once, here, from the socket.
+    ///
+    /// On Apple platforms a socket already shut down in both directions
+    /// (its peer closed before the wrap) fails here with
+    /// [`RpcError::EndOfStream`]: XNU refuses the `SO_NOSIGPIPE` this sets,
+    /// and no I/O on such a socket could succeed anyway.
     pub fn from_stream(stream: UnixStream) -> RpcResult<Self> {
-        // No `MSG_NOSIGNAL` on Apple (module doc "fd passing").
+        // No `MSG_NOSIGNAL` on Apple (module doc "fd passing"); EINVAL = both directions shut.
         #[cfg(target_vendor = "apple")]
-        rustix::net::sockopt::set_socket_nosigpipe(&stream, true).map_err(std::io::Error::from)?;
+        rustix::net::sockopt::set_socket_nosigpipe(&stream, true).map_err(|e| match e {
+            rustix::io::Errno::INVAL => RpcError::EndOfStream,
+            e => std::io::Error::from(e).into(),
+        })?;
         let peer = resolve_peer(&stream);
         let desc = match stream.peer_addr() {
             Ok(a) => format!("unix:{a:?}"),
