@@ -910,7 +910,12 @@ impl Parcel {
 
     /// A data-only parcel over a copy of `bytes`; a forged object in it reads as `BadType`.
     pub(crate) fn from_slice(bytes: &[u8]) -> Self {
-        let mut p = Parcel::from_vec(bytes.to_vec());
+        Parcel::data_only_from_vec(bytes.to_vec())
+    }
+
+    /// [`Parcel::from_slice`] adopting `bytes` instead of copying them.
+    pub(crate) fn data_only_from_vec(bytes: Vec<u8>) -> Self {
+        let mut p = Parcel::from_vec(bytes);
         p.set_for_rpc(true);
         p
     }
@@ -935,9 +940,19 @@ impl Parcel {
         Ok(self.data.as_slice())
     }
 
-    /// [`Parcel::as_bytes`], taking ownership.
+    /// [`Parcel::as_bytes`], taking ownership: an owned buffer moves out, a kernel one is copied.
     pub(crate) fn into_bytes(self) -> Result<Vec<u8>> {
-        self.as_bytes().map(<[u8]>::to_vec)
+        let mut this = self;
+        // The gate runs first: on a refusal `Drop` still finds the objects it must release.
+        this.as_bytes()?;
+        match &mut this.data {
+            ParcelData::Vec(bytes) => {
+                debug_assert!(this.free_buffer.is_none(), "an owned buffer is never freed");
+                Ok(std::mem::take(bytes))
+            }
+            // `Drop` hands this pointer to `BC_FREE_BUFFER`, so it stays.
+            ParcelData::Slice(bytes) => Ok(bytes.to_vec()),
+        }
     }
 
     pub(crate) fn as_mut_ptr(&mut self) -> *mut u8 {
@@ -2500,7 +2515,13 @@ impl<const N: usize> TryFrom<&mut Parcel> for [u8; N] {
 pub fn to_bytes<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
     let mut parcel = Parcel::new_data_only();
     parcel.write(value)?;
-    parcel.into_bytes()
+    let bytes = parcel.into_bytes()?;
+    // The parcel starts at 256 bytes, so a small value would keep them all: copy it out exactly,
+    // as before. A `shrink_to_fit` costs more than that copy for a small value (realloc moves it).
+    if bytes.capacity() > 2 * bytes.len() {
+        return Ok(bytes.as_slice().to_vec());
+    }
+    Ok(bytes)
 }
 
 /// Decodes one value from bytes written by [`to_bytes`].
@@ -3493,6 +3514,47 @@ mod data_serde {
             from_bytes::<crate::SIBinder>(&forged),
             Err(StatusCode::BadType)
         );
+        // The adopting constructor a stream batch decodes through is just as data-only.
+        assert_eq!(
+            Parcel::data_only_from_vec(forged).read::<crate::SIBinder>(),
+            Err(StatusCode::BadType)
+        );
+    }
+
+    #[test]
+    fn owned_bytes_move_out_instead_of_being_copied() {
+        let mut parcel = Parcel::new_data_only();
+        parcel.write(&vec![7u8; 1000]).unwrap();
+        let (ptr, len) = (parcel.as_bytes().unwrap().as_ptr(), parcel.data_size());
+        let bytes = parcel.into_bytes().unwrap();
+        assert_eq!(
+            (bytes.as_ptr(), bytes.len()),
+            (ptr, len),
+            "the buffer itself"
+        );
+
+        let adopted = Parcel::data_only_from_vec(bytes);
+        assert_eq!(
+            adopted.as_bytes().unwrap().as_ptr(),
+            ptr,
+            "adopted, not copied"
+        );
+    }
+
+    #[test]
+    fn stored_bytes_keep_at_most_twice_their_length() {
+        for bytes in [
+            to_bytes(&42i32).unwrap(),
+            to_bytes("short").unwrap(),
+            to_bytes(&vec![0u8; 100_000]).unwrap(),
+        ] {
+            assert!(
+                bytes.capacity() <= 2 * bytes.len(),
+                "{} bytes held in {}",
+                bytes.len(),
+                bytes.capacity()
+            );
+        }
     }
 
     // An object position is RPC state; without the feature no parcel can acquire one.
@@ -3510,6 +3572,8 @@ mod data_serde {
             Some(StatusCode::BadType),
             "an object position makes the bytes incomplete"
         );
+        // Taking ownership checks first too, so the refused parcel still drops whole.
+        assert_eq!(parcel.into_bytes().err(), Some(StatusCode::BadType));
     }
 
     #[test]

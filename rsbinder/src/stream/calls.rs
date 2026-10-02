@@ -922,14 +922,16 @@ impl<T: Serialize + ?Sized> Producer<T> {
         self.credit.lock().available
     }
 
-    /// Rebuilt, as `Parcel` has no truncate and moving the cursor back would not shorten it.
+    /// Cut the batch back to `len` bytes (no-op past its end), cursor at the new end.
     fn truncate_batch(&mut self, len: usize) -> Result<()> {
-        let batch = std::mem::replace(&mut self.batch, Parcel::new_data_only());
-        let mut bytes = batch.into_bytes()?;
-        bytes.truncate(len);
-        let mut rebuilt = Parcel::from_slice(&bytes);
-        rebuilt.set_data_position(bytes.len());
-        self.batch = rebuilt;
+        // A batch that took an object or an fd would lose its table entry with the bytes.
+        if !self.batch.is_self_contained() {
+            return Err(StatusCode::BadType);
+        }
+        let len = len.min(self.batch.ipc_data_size());
+        self.batch.set_data_size(len)?;
+        // A refused write can leave the cursor short of its bytes; `set_data_size` only lowers it.
+        self.batch.set_data_position(len);
         Ok(())
     }
 }
@@ -1387,6 +1389,8 @@ impl IStreamSink for SinkObject {
             return Err(status);
         }
         {
+            // Copied before the lock, which the consumer takes for every item it reads.
+            let batch = items.to_vec();
             let mut state = self.0.lock();
             // Past the terminator or the receiver nothing is read; dropping beats an unread queue.
             if state.end.is_some() || state.closed {
@@ -1396,7 +1400,7 @@ impl IStreamSink for SinkObject {
                 state.received += 1;
                 // Something arrived, so a grant is worth trying again.
                 state.grant_failed = false;
-                state.batches.push_back((items.to_vec(), count));
+                state.batches.push_back((batch, count));
                 drop(state);
                 self.0.wake();
                 return Ok(());
@@ -1677,7 +1681,7 @@ impl<T: Deserialize> Consumer<T> {
 
     /// Decode a batch and count it as owed; the caller grants.
     fn take_batch(&mut self, (bytes, count): (Vec<u8>, i32)) -> Result<()> {
-        match self.decode_batch(&bytes, count) {
+        match self.decode_batch(bytes, count) {
             Ok(()) => {
                 self.stream.lock().drained += 1;
                 Ok(())
@@ -1690,8 +1694,8 @@ impl<T: Deserialize> Consumer<T> {
         }
     }
 
-    fn decode_batch(&mut self, bytes: &[u8], count: i32) -> Result<()> {
-        let mut parcel = Parcel::from_slice(bytes);
+    fn decode_batch(&mut self, bytes: Vec<u8>, count: i32) -> Result<()> {
+        let mut parcel = Parcel::data_only_from_vec(bytes);
         for decoded in 0..count {
             // `count` is off the wire: unchecked, an empty batch claiming `i32::MAX` items spins.
             if parcel.data_avail() == 0 {
@@ -2382,6 +2386,59 @@ mod tests {
             rx.end_status().expect("a terminator arrived").is_ok(),
             "a stream that ran out ends with no exception"
         );
+    }
+
+    /// Writes its value twice, but refuses itself after the first copy when `refuse` is set.
+    #[derive(Debug, PartialEq)]
+    struct HalfWritten {
+        value: i32,
+        refuse: bool,
+    }
+
+    impl Serialize for HalfWritten {
+        fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
+            parcel.write(&self.value)?;
+            if self.refuse {
+                return Err(StatusCode::BadValue);
+            }
+            parcel.write(&self.value)
+        }
+    }
+
+    impl Deserialize for HalfWritten {
+        fn deserialize(parcel: &mut Parcel) -> Result<Self> {
+            let value: i32 = parcel.read()?;
+            if parcel.read::<i32>()? != value {
+                return Err(StatusCode::BadValue);
+            }
+            Ok(HalfWritten {
+                value,
+                refuse: false,
+            })
+        }
+    }
+
+    /// The refused item's bytes are cut from the batch; the items around it arrive whole.
+    #[test]
+    fn an_item_refused_part_way_leaves_its_neighbours_intact() {
+        let item = |value, refuse| HalfWritten { value, refuse };
+        let (mut sink, mut rx) = default_pair::<HalfWritten>();
+        sink.send(&item(1, false), None).expect("send");
+        assert_eq!(
+            sink.send(&item(2, true), None).err(),
+            Some(StatusCode::BadValue)
+        );
+        sink.send(&item(3, false), None).expect("send");
+        assert_eq!(sink.pending(), 2, "the refused item is not counted");
+        sink.terminate(None, ExceptionCode::None as i32, 0, None)
+            .expect("end");
+
+        let mut got = Vec::new();
+        while let Some(received) = rx.recv() {
+            got.push(received.expect("item"));
+        }
+        assert_eq!(got, vec![item(1, false), item(3, false)]);
+        assert!(rx.end_status().expect("a terminator arrived").is_ok());
     }
 
     /// Plan 10-7 AC-7.2: 4-byte batches, one opening credit; item 2 waits for the first drain.
