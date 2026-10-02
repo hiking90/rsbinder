@@ -21,9 +21,10 @@
 //! and its behaviour is inferred from `vsock(7)`, not measured.
 //!
 //! `peer_closed` is pinned the same way: `Some(false)` while the peer is open
-//! even with a frame unread, then `Some(true)` once it closes — on Linux for
-//! every socket backend, elsewhere for Unix-domain ones (tls here runs over a
-//! unix pair) and `None` for `tcp_debug`; `mem` keeps the trait's `None`.
+//! even with a frame unread, then `Some(true)` once it closes — on Linux and
+//! macOS for every socket backend, elsewhere for Unix-domain ones (tls here
+//! runs over a unix pair) and `None` for `tcp_debug`; `mem` keeps the trait's
+//! `None`.
 //!
 //! An fd-mode reader parked in `recvmsg` holds the reader lock until the
 //! socket wakes it, so a `shutdown` that takes that lock first deadlocks
@@ -211,9 +212,14 @@ fn armed(pair: (Shared, Shared)) -> (Shared, Shared) {
     pair
 }
 
-/// `peer_closed` once the peer is gone: TCP off Linux/Android is `None`, not measured there yet.
+/// `peer_closed` once the peer is gone: TCP off Linux/Android/Apple is `None`, not measured there.
 fn closed_expectation(unix_domain: bool) -> Option<bool> {
-    if cfg!(any(target_os = "linux", target_os = "android")) || unix_domain {
+    if cfg!(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple"
+    )) || unix_domain
+    {
         Some(true)
     } else {
         None

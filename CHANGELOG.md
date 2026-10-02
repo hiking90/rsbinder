@@ -214,9 +214,9 @@ This changelog starts at 0.9.0. For earlier releases, see the
   call this, not the status code, says whether to reconnect.
 - **`RpcTransport::peer_closed` and `TlsStream::peer_closed`**: whether the
   peer closed the connection, from a zero-timeout poll that reads nothing
-  (`POLLRDHUP` on Linux and Android; `POLLHUP` for Unix-domain sockets
-  elsewhere). Defaults to `None` (unknown); the bundled socket transports
-  implement it.
+  (`POLLRDHUP` on Linux and Android; `POLLHUP` on Apple platforms, and for
+  Unix-domain sockets elsewhere). Defaults to `None` (unknown); the bundled
+  socket transports implement it.
 - **Generic parcelables** (`rsbinder-aidl`): `parcelable Foo<T, U> { … }`
   generates `pub struct Foo<T, U>` with a `_phantom_T: PhantomData` field per
   parameter, as AOSP does; its `Default` and `Debug` put no bound on the
