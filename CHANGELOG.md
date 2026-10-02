@@ -354,7 +354,9 @@ This changelog starts at 0.9.0. For earlier releases, see the
   frame from the parcel's bytes instead of copying them into it first.
   `to_bytes` hands back the parcel's own buffer when that is at most twice
   the value's size. A stream batch decodes from the bytes it received without
-  copying them. No wire or signature change.
+  copying them. An android-13+ RPC message's 16-byte header is read into a
+  stack buffer instead of a heap allocation of its own. No wire or signature
+  change.
 - **RPC (r34 framing over Unix sockets, and `tcp_debug`): frames move with
   fewer copies.** A frame goes out as its length and its body in one
   `sendmsg`, without first joining them into a new buffer. A connection in fd

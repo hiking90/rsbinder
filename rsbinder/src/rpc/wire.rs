@@ -360,12 +360,14 @@ impl WireCodec for R34Codec {
     }
 }
 
-/// Decode-only entrypoint for the `rpc_wire_decode` fuzz target.
+/// Decode-only entrypoint for the `rpc_wire_decode` fuzz target: the r34 decoder and the
+/// android-13+ v1 decoder, whose `parcelDataSize`/object-table split r34 does not have.
 /// Not part of the supported API surface.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub fn __fuzz_decode_wire(input: &[u8]) {
     let _ = R34Codec.decode_message(input);
+    let _ = super::wire_android13::Android13PlusCodec::android14_15().decode_message(input);
 }
 
 /// Decode-only entrypoint for the `rpc_session_handshake` fuzz target:

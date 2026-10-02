@@ -851,7 +851,8 @@ pub fn write_aosp_message<W: Write>(w: &mut W, msg: &[u8]) -> RpcResult<()> {
 /// `[header | body]`, exactly what [`Android13PlusCodec::decode_message`]
 /// expects.
 pub fn read_aosp_message<R: Read>(r: &mut R) -> RpcResult<Vec<u8>> {
-    let header = read_exact_raw(r, WIRE_HEADER_LEN)?;
+    let mut header = [0u8; WIRE_HEADER_LEN];
+    read_exact_into(r, &mut header)?;
     let body_size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
     if body_size > MAX_FRAME_LEN {
         return Err(RpcError::FrameTooLarge {
