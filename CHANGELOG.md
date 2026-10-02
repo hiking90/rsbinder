@@ -373,7 +373,12 @@ This changelog starts at 0.9.0. For earlier releases, see the
   frame from the parcel's bytes instead of copying them into it first.
   `to_bytes` hands back the parcel's own buffer when that is at most twice
   the value's size. A stream batch decodes from the bytes it received without
-  copying them. An android-13+ RPC message's 16-byte header is read into a
+  copying them. Over a kernel-binder ring, a stream producer encodes each item
+  into a buffer it keeps from item to item, and the consumer decodes it in the
+  buffer it read the record into, where each side used to allocate per item.
+  An item `send_async` hands to the pool on a full ring takes that buffer
+  with it, so the producer allocates a new one for the next item.
+  An android-13+ RPC message's 16-byte header is read into a
   stack buffer instead of a heap allocation of its own. No wire or signature
   change.
 - **RPC (r34 framing over Unix sockets, and `tcp_debug`): frames move with

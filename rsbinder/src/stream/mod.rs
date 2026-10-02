@@ -613,21 +613,25 @@ fn call_deadline(timeout: Option<Duration>) -> Option<Instant> {
     timeout.and_then(|timeout| Instant::now().checked_add(timeout))
 }
 
-/// One item as record or batch bytes, via the `to_bytes` codec (which refuses a binder or an fd).
-fn encode_item<T: Serialize + ?Sized>(item: &T) -> Result<Vec<u8>> {
-    let mut parcel = Parcel::new_data_only();
-    parcel.write(item)?;
-    parcel.into_bytes()
+/// One item as record bytes in `scratch`, emptied first; a data-only parcel refuses a binder or an fd.
+fn encode_item<T: Serialize + ?Sized>(scratch: &mut Parcel, item: &T) -> Result<()> {
+    scratch.set_data_size(0)?;
+    scratch.write(item)
 }
 
-/// One item from all of `bytes`; leftovers mean the two ends' `T` disagree on the wire.
-fn decode_item<T: Deserialize>(bytes: &[u8]) -> Result<T> {
-    let mut parcel = Parcel::from_slice(bytes);
-    let item = parcel.read::<T>()?;
-    if parcel.data_avail() != 0 {
+/// One item from all of `buf`, read in place; `buf` keeps its allocation for the next record.
+fn decode_item<T: Deserialize>(buf: &mut Vec<u8>) -> Result<T> {
+    let mut parcel = Parcel::data_only_from_vec(std::mem::take(buf));
+    let item = parcel.read::<T>();
+    let left = parcel.data_avail();
+    // Data-only, so self-contained: the Vec moves back.
+    if let Ok(bytes) = parcel.into_bytes() {
+        *buf = bytes;
+    }
+    let item = item?;
+    if left != 0 {
         log::error!(
-            "stream: {} bytes left after one item; the two ends disagree on the item type",
-            parcel.data_avail()
+            "stream: {left} bytes left after one item; the two ends disagree on the item type"
         );
         return Err(StatusCode::BadValue);
     }
@@ -1521,6 +1525,31 @@ mod tests {
         let (rx, endpoint) = Receiver::<T>::new(&peer).expect("a receiver");
         let sink = Sink::<T>::open(&endpoint).expect("open");
         (sink, rx)
+    }
+
+    #[test]
+    fn a_reused_buffer_is_neither_lost_nor_left_with_the_last_item() {
+        let mut scratch = Parcel::new_data_only();
+        encode_item(&mut scratch, &vec![9u8; 300]).expect("encode");
+        encode_item(&mut scratch, &7i32).expect("encode over it");
+        let mut buf = scratch.as_bytes().expect("bytes").to_vec();
+        assert_eq!(buf.len(), 4, "nothing of the earlier item is left");
+        let at = buf.as_ptr();
+        assert_eq!(decode_item::<i32>(&mut buf), Ok(7));
+        assert_eq!(buf.as_ptr(), at, "decode_item hands the buffer back");
+        // A short read is refused, and the buffer still comes back.
+        assert_eq!(
+            decode_item::<i64>(&mut buf).err(),
+            Some(StatusCode::NotEnoughData)
+        );
+        assert_eq!(buf.as_ptr(), at, "handed back after a short read");
+        buf.extend_from_slice(&[0; 4]);
+        let at = buf.as_ptr();
+        assert_eq!(
+            decode_item::<i32>(&mut buf).err(),
+            Some(StatusCode::BadValue)
+        );
+        assert_eq!(buf.as_ptr(), at, "handed back after leftover bytes");
     }
 
     #[test]
