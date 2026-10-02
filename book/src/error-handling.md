@@ -282,6 +282,11 @@ if let Err(ref status) = result {
 }
 ```
 
+`DeadObject` alone does not prove the service died — a live handler can
+return it too — and over RPC the call that ended a session can return
+`TimedOut` instead. [`Reconnecting`](./reconnecting.md) watches the service
+and reconnects for you.
+
 ## Converting Between Error Types
 
 rsbinder provides `From` implementations that make conversions between
@@ -318,7 +323,7 @@ service methods, where `.into()` converts a `StatusCode` into the expected
 
 - **Expect `DeadObject` in a long-running client.** A service can restart.
   `link_to_death` tells you when, so you can reconnect instead of failing
-  every subsequent call.
+  every subsequent call — or let [`Reconnecting`](./reconnecting.md) do it.
 
 - **`Status` implements `Display` and `std::error::Error`,** so it works with
   `?` in a function returning `Box<dyn Error>` and prints usefully in a log.
