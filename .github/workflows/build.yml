@@ -317,7 +317,7 @@ jobs:
           cargo test -p tests --features rpc --test rpc_generated_stub --test entry_rpc --test gateway_rpc --test codegen_shapes \
             --test rpc_async --test rpc_calling_identity --test rpc_enforce_permission_deny \
             --test work_source_rpc --test observer_rpc --test transaction_names \
-            --test transport_caps --test cancel_rpc --test stream_rpc
+            --test transport_caps --test cancel_rpc --test stream_rpc --test reconnect_rpc
           cargo test -p tests --features rpc-tcp-debug --test rpc_generated_stub
           # `aidl_spans` installs a global `tracing` subscriber, so it needs
           # the `tracing` feature on top of `rpc`.

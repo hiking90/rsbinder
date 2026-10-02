@@ -76,6 +76,23 @@ name = "reconnect_rpc"
 path = "tests/reconnect_rpc.rs"
 required-features = ["rpc"]
 
+# Plan 10-10b kernel tests: a service the tests kill and restart, so the
+# shared `test_service` is never touched.
+[[bin]]
+name = "reconnect_service"
+path = "src/bin/reconnect_service.rs"
+required-features = ["rpc"]
+
+[[test]]
+name = "reconnect_kernel"
+path = "tests/reconnect_kernel.rs"
+required-features = ["rpc"]
+
+[[test]]
+name = "reconnect_hub_restart"
+path = "tests/reconnect_hub_restart.rs"
+required-features = ["rpc"]
+
 [[test]]
 name = "aidl_spans"
 path = "tests/aidl_spans.rs"

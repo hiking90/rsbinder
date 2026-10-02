@@ -288,6 +288,19 @@ jobs:
             exit 1
           }
 
+      - name: Run reconnect_kernel (Reconnecting over kernel binder, #[ignore]'d)
+        run: |
+          # Plan 10-10b. Each test kills and restarts a `reconnect_service`
+          # of its own name, so the shared test_service is not involved;
+          # needs /dev/binder and the permissive rsb_hub. The service
+          # manager's own restart is `reconnect_hub_restart`, after the
+          # shared rsb_hub is stopped.
+          RUST_BACKTRACE=1 cargo test -p tests --features rpc --test reconnect_kernel -- --ignored --test-threads=1 || {
+            echo "::error::reconnect_kernel failed"
+            cp -f rsb_hub.log artifacts/reconnect-kernel-rsb_hub.log 2>/dev/null || true
+            exit 1
+          }
+
       - name: Run fmq_binder (an FMQ descriptor across the kernel binder, #[ignore]'d)
         run: |
           # Plan 12-fmq F2. `fmq_probe serve` in a child process makes and
@@ -441,6 +454,11 @@ jobs:
             bash "$s" || { echo "::error::$s failed"; rc=1; }
           done
           exit $rc
+
+      - name: Run reconnect_hub_restart (Reconnecting across an rsb_hub restart, #[ignore]'d)
+        # Starts and kills its own rsb_hub and refuses to while another
+        # runs, so it follows "Stop background services".
+        run: RUST_BACKTRACE=1 cargo test -p tests --features rpc --test reconnect_hub_restart -- --ignored
 
       - name: Run the vsock loopback tests (#[ignore]'d)
         run: |
