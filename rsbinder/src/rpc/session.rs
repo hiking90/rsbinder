@@ -488,7 +488,9 @@ use super::address::{AddressSpace, RpcAddress, SpecialTransaction, RPC_ADDR_LEN}
 use super::proxy::RpcProxy;
 use super::state::RpcState;
 use super::transport::{PeerIdentity, RpcTransport};
-use super::wire::{R34Codec, WireCodec, WireMessage, WireReply, WireTransaction};
+use super::wire::{
+    R34Codec, WireCodec, WireMessage, WireReply, WireReplyRef, WireTransaction, WireTransactionRef,
+};
 use super::wire_android13::{
     client_connect_with_id, client_read_connection_init, client_write_connection_header,
     read_aosp_message, read_aosp_message_with_fds, server_accept_deferred_init, write_aosp_message,
@@ -3082,14 +3084,15 @@ impl RpcSessionInner {
                 0
             }
         };
-        let txn = WireTransaction {
-            address: addr,
+        // Borrowed: the encoder copies the payload into the frame once.
+        let txn = WireTransactionRef {
+            address: &addr,
             code,
             flags,
             async_number,
-            data: data.rpc_data_bytes().to_vec(),
+            data: data.rpc_data_bytes(),
             // Binder (v2) / FD (v1+) positions from serialization; empty on R34 / v0.
-            object_positions: data.rpc_object_positions().to_vec(),
+            object_positions: data.rpc_object_positions(),
         };
         // The attempt owns the async number and target send; returns a release the send let go.
         let rollback = || {
@@ -3104,7 +3107,7 @@ impl RpcSessionInner {
                 0
             }
         };
-        let frame = match self.profile.codec().encode_transact(&txn) {
+        let frame = match self.profile.codec().encode_transact_ref(txn) {
             Ok(frame) => frame,
             Err(e) => {
                 let held = rollback();
@@ -3277,10 +3280,10 @@ impl RpcSessionInner {
         let frame = self
             .profile
             .codec()
-            .encode_reply(&WireReply {
+            .encode_reply_ref(WireReplyRef {
                 status,
-                data: data.to_vec(),
-                object_positions: object_positions.to_vec(),
+                data,
+                object_positions,
             })
             .map_err(ReplyNotSent::refused)?;
         // `ConnUse::Reply` pins the request's slot whatever its role: the peer waits only there.

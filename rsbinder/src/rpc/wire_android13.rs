@@ -219,7 +219,9 @@ use std::io::{Read, Write};
 
 use super::address::RpcAddress;
 use super::transport::MAX_FRAME_LEN;
-use super::wire::{WireCodec, WireMessage, WireReply, WireTransaction};
+use super::wire::{
+    WireCodec, WireMessage, WireReply, WireReplyRef, WireTransaction, WireTransactionRef,
+};
 use super::{RpcError, RpcResult};
 
 /// `RpcWireHeader` size (unchanged r34 / v0 / v1).
@@ -623,7 +625,7 @@ fn split_data_and_table(
 }
 
 impl WireCodec for Android13PlusCodec {
-    fn encode_transact(&self, txn: &WireTransaction) -> RpcResult<Vec<u8>> {
+    fn encode_transact_ref(&self, txn: WireTransactionRef<'_>) -> RpcResult<Vec<u8>> {
         // bodySize = 40 + parcelDataSize + 4·N (v1+ table; v0 has none).
         let table_bytes = if has_object_table(self.version) {
             4 * txn.object_positions.len()
@@ -634,7 +636,7 @@ impl WireCodec for Android13PlusCodec {
         let header = Self::header(CMD_TRANSACT, body_len)?;
         let mut out = Vec::with_capacity(WIRE_HEADER_LEN + body_len);
         out.extend_from_slice(&header);
-        out.extend_from_slice(&Self::encode_addr(&txn.address)); // 8
+        out.extend_from_slice(&Self::encode_addr(txn.address)); // 8
         out.extend_from_slice(&txn.code.to_le_bytes()); // 4
         out.extend_from_slice(&txn.flags.to_le_bytes()); // 4
         out.extend_from_slice(&txn.async_number.to_le_bytes()); // 8
@@ -645,11 +647,11 @@ impl WireCodec for Android13PlusCodec {
         };
         out.extend_from_slice(&parcel_size.to_le_bytes()); // 4 (v0: reserved)
         out.extend_from_slice(&[0u8; 12]); // reserved[3]
-        encode_data_and_table(&mut out, self.version, &txn.data, &txn.object_positions)?;
+        encode_data_and_table(&mut out, self.version, txn.data, txn.object_positions)?;
         Ok(out)
     }
 
-    fn encode_reply(&self, reply: &WireReply) -> RpcResult<Vec<u8>> {
+    fn encode_reply_ref(&self, reply: WireReplyRef<'_>) -> RpcResult<Vec<u8>> {
         let fixed = reply_fixed_len(self.version);
         let table_bytes = if has_object_table(self.version) {
             4 * reply.object_positions.len()
@@ -665,7 +667,7 @@ impl WireCodec for Android13PlusCodec {
             out.extend_from_slice(&(reply.data.len() as u32).to_le_bytes()); // parcelDataSize
             out.extend_from_slice(&[0u8; 12]); // reserved[3]
         }
-        encode_data_and_table(&mut out, self.version, &reply.data, &reply.object_positions)?;
+        encode_data_and_table(&mut out, self.version, reply.data, reply.object_positions)?;
         Ok(out)
     }
 
