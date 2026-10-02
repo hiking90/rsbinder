@@ -200,8 +200,7 @@ pub(super) fn new_client(uri: Uri, o: ClientOptions) -> Result<Client> {
     open_staged(uri, o).map_err(|(_, code)| code)
 }
 
-/// Where [`open_staged`] failed. `Setup` does no I/O, so the same inputs fail the same way
-/// again; `Connect` is the transport, a peer or the service manager, which may recover.
+/// Where [`open_staged`] failed: `Setup` does no I/O and fails again; `Connect` may recover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OpenStage {
     Setup,
@@ -371,8 +370,16 @@ fn rpc_setup<'a>(uri: &'a Uri, o: &'a ClientOptions) -> Result<crate::rpc::RpcCl
     }
     // Forwarded, not dropped: the session layer refuses what it cannot honor (never ignored).
     if let Some(id) = o.session_id.as_deref() {
-        // The session layer's own pre-connect refusal, made here so it counts as setup.
-        if fan_out > 1 || incoming > 0 {
+        // The session layer's own pre-connect refusals, made here so they count as setup.
+        if !(id.is_empty() || id.len() == 32) {
+            log::error!(
+                "rsbinder::Client::open: session_id must be empty or 32 bytes (AOSP \
+                 kSessionIdBytes), not {}",
+                id.len()
+            );
+            return Err(StatusCode::BadValue);
+        }
+        if !id.is_empty() && (fan_out > 1 || incoming > 0) {
             log::error!(
                 "rsbinder::Client::open: session_id joins an existing session, which cannot \
                  also open outgoing_connections/incoming_connections"
@@ -420,12 +427,27 @@ fn client_config<'a>(
     max_version: u32,
 ) -> Result<crate::rpc::RpcClientConfig<'a>> {
     use crate::rpc::RpcClientConfig;
+    let unix_addr_refused = |e: std::io::Error| {
+        log::error!("rsbinder::Client::open: {endpoint:?} is not a Unix socket address: {e}");
+        StatusCode::from(e)
+    };
     match endpoint {
         Endpoint::Kernel { .. } => unreachable!("kernel handled by caller"),
-        Endpoint::Unix(path) => Ok(RpcClientConfig::unix(path, max_version)),
+        Endpoint::Unix(path) => {
+            // `UnixStream::connect`'s refusal (same code), made before connecting.
+            std::os::unix::net::SocketAddr::from_pathname(path).map_err(unix_addr_refused)?;
+            Ok(RpcClientConfig::unix(path, max_version))
+        }
         Endpoint::UnixAbstract(name) => {
             #[cfg(any(target_os = "linux", target_os = "android"))]
             {
+                #[cfg(target_os = "android")]
+                use std::os::android::net::SocketAddrExt;
+                #[cfg(target_os = "linux")]
+                use std::os::linux::net::SocketAddrExt;
+                // `UnixTransport::connect_abstract`'s refusal (same code), made before connecting.
+                std::os::unix::net::SocketAddr::from_abstract_name(name)
+                    .map_err(unix_addr_refused)?;
                 Ok(RpcClientConfig::unix_abstract(name, max_version))
             }
             #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -460,6 +482,11 @@ fn client_config<'a>(
                     StatusCode::BadValue
                 })?;
                 let name = o.tls_server_name.as_deref().unwrap_or(host);
+                // `TlsTransport::connect_stream`'s refusal (same code), made before connecting.
+                if rustls::pki_types::ServerName::try_from(name.to_string()).is_err() {
+                    log::error!("rsbinder::Client::open: invalid TLS server name {name:?}");
+                    return Err(StatusCode::RpcError);
+                }
                 Ok(RpcClientConfig::tls(host, *port, name, tls, max_version))
             }
             #[cfg(not(feature = "rpc-tls"))]
