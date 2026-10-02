@@ -278,9 +278,10 @@ pub trait RpcTransport: Send + Sync {
     /// Bytes waiting to be read do not count either way. The bundled socket
     /// transports answer on Linux and Android from `POLLRDHUP` (the peer's FIN
     /// or reset, even behind unread data), and for Unix-domain sockets
-    /// elsewhere from `POLLHUP`. TCP elsewhere is `None`: a FIN there closes
-    /// only the receive side, which sets no flag a poll reports. A custom
-    /// transport overrides this to take part.
+    /// elsewhere from `POLLHUP`. TCP elsewhere is `None` until measured: XNU
+    /// likely reports a FIN as `POLLHUP` as it does for Unix-domain sockets,
+    /// but no macOS run has confirmed it. A custom transport overrides this
+    /// to take part.
     fn peer_closed(&self) -> Option<bool> {
         None
     }
@@ -684,10 +685,11 @@ pub(crate) fn socket_peer_closed(
             PollFlags::RDHUP | PollFlags::HUP | PollFlags::ERR,
         )
     };
-    // An `AF_UNIX` close shuts the peer both ways (`POLLHUP`); a TCP FIN only the read side.
+    // TCP stays unknown here until a macOS run shows its FIN as `POLLHUP` too.
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let (ask, closed) = match kind {
-        SocketKind::UnixDomain => (PollFlags::empty(), PollFlags::HUP | PollFlags::ERR),
+        // XNU reports `POLLHUP` only from a read filter, which it registers only when asked.
+        SocketKind::UnixDomain => (PollFlags::HUP, PollFlags::HUP | PollFlags::ERR),
         SocketKind::TcpOrVsock => return None,
     };
     let mut fds = [PollFd::from_borrowed_fd(fd, ask)];

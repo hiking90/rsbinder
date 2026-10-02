@@ -2654,7 +2654,6 @@ impl RpcSessionInner {
             .count()
     }
 
-    /// Shut every slot down so a `recv`-blocked thread sees `EndOfStream`; unlocked syscalls.
     /// `RpcSession::peer_closed`: the transports copied out, then polled outside the lock.
     pub(crate) fn peer_closed(&self) -> bool {
         let transports: Vec<Arc<dyn RpcTransport>> = self
@@ -2668,6 +2667,7 @@ impl RpcSessionInner {
         transports.iter().any(|t| t.peer_closed() == Some(true))
     }
 
+    /// Shut every slot down so a `recv`-blocked thread sees `EndOfStream`; unlocked syscalls.
     fn shutdown_all_transports(&self) {
         let transports: Vec<Arc<dyn RpcTransport>> = self
             .conn_state

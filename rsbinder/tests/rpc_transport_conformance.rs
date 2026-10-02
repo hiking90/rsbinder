@@ -211,8 +211,7 @@ fn armed(pair: (Shared, Shared)) -> (Shared, Shared) {
     pair
 }
 
-/// What `peer_closed` reports once the peer is gone: `POLLRDHUP` on Linux/Android, `POLLHUP` for
-/// an `AF_UNIX` socket elsewhere, and nothing a poll can read for a TCP FIN elsewhere.
+/// `peer_closed` once the peer is gone: TCP off Linux/Android is `None`, not measured there yet.
 fn closed_expectation(unix_domain: bool) -> Option<bool> {
     if cfg!(any(target_os = "linux", target_os = "android")) || unix_domain {
         Some(true)
