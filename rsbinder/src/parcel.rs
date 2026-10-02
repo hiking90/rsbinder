@@ -2516,8 +2516,7 @@ pub fn to_bytes<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
     let mut parcel = Parcel::new_data_only();
     parcel.write(value)?;
     let bytes = parcel.into_bytes()?;
-    // The parcel starts at 256 bytes, so a small value would keep them all: copy it out exactly,
-    // as before. A `shrink_to_fit` costs more than that copy for a small value (realloc moves it).
+    // A small value keeps the 256-byte parcel buffer; copying beats a moving `shrink_to_fit`.
     if bytes.capacity() > 2 * bytes.len() {
         return Ok(bytes.as_slice().to_vec());
     }

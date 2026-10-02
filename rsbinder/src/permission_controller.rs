@@ -36,6 +36,13 @@
 //! succeeds and `check_permission` returns that service's answer
 //! verbatim — `true` included.
 //!
+//! The lookup is not repeated per check. A controller that answered once
+//! is kept and asked directly until a call to it fails, as AOSP libbinder
+//! keeps `gPermissionController`. Until then, re-registering `"permission"`
+//! under another binder or restarting the service manager does not change
+//! which process answers, and the kept strong reference counts as a client
+//! of the registered service, so its `tryUnregisterService` is refused.
+//!
 //! With nothing registered under that name, the `ProcessState` panic is
 //! the one outcome that is not a `false`.
 //! Reaching it takes a kernel-marshalling parcel *and* an in-flight
@@ -277,13 +284,10 @@ pub fn check_permission(reader: &Parcel, permission_name: &str) -> bool {
 
 type ControllerSlot = Mutex<Option<Arc<Strong<dyn IPermissionController>>>>;
 
-/// The controller the last successful [`check_permission`] asked, as AOSP libbinder's
-/// `checkPermission` keeps `gPermissionController`, so a check is one IPC, not a lookup and one.
+/// AOSP `gPermissionController`; see [`check_permission`].
 static CONTROLLER: ControllerSlot = Mutex::new(None);
 
-/// `ask` of the controller in `slot`, else of a fresh `lookup`. A cached one that fails is
-/// dropped and the question goes once to a fresh lookup (`system_server` may have restarted).
-/// Only a controller that answered is cached; the lock is never held across an IPC.
+/// The lock is never held across an IPC.
 fn ask_controller(
     slot: &ControllerSlot,
     lookup: impl FnOnce() -> Result<Strong<dyn IPermissionController>>,
@@ -392,8 +396,7 @@ mod tests {
         (pc, dead)
     }
 
-    /// The controller that answered is kept and asked again without a lookup; one that fails is
-    /// replaced by a fresh lookup asked in the same call; a failed answer is never cached.
+    /// Kept until it fails, then replaced by a lookup in the same call; failures are not cached.
     #[test]
     fn the_controller_is_cached_until_it_fails() {
         let ask = |pc: &Strong<dyn IPermissionController>| pc.checkPermission("p", 1, 2);

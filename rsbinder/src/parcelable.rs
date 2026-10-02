@@ -444,10 +444,7 @@ fn decode_string16_units(bytes: &[u8]) -> Result<String> {
     Ok(text)
 }
 
-/// Reads a non-null `String16` and compares it with `expected` in place: `Ok(Err(got))` on a mismatch.
-///
-/// Null is `UnexpectedNull` and a mismatch that is not valid UTF-16 is `BadValue`, as a `String`
-/// read would report them; the cursor ends where that read would leave it.
+/// Non-null `String16` vs `expected` in place: `Ok(Err(got))` on mismatch, else as a `String` read.
 pub(crate) fn read_string16_matches(
     parcel: &mut Parcel,
     expected: &str,

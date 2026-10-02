@@ -114,9 +114,7 @@ impl Remotable for BnFd {
     }
 }
 
-/// A fresh unlinked file. The name takes a per-process counter, not the clock: macOS
-/// `SystemTime` ticks in microseconds, so two tests running in parallel got the same path and
-/// read each other's bytes. `create_new` makes any other collision an error, not a shared file.
+/// Unlinked temp file named by a counter (macOS `SystemTime` is µs); collisions fail `create_new`.
 fn tempfile() -> std::fs::File {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);

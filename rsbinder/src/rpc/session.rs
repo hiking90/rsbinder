@@ -3541,8 +3541,7 @@ impl RpcSessionInner {
                 self.send_reply(StatusCode::BadValue.into(), &[], &[], &[])
             };
         }
-        // A oneway reply is never sent: no buffer unless the handler writes into it. RPC mode
-        // either way, so a binder the handler writes still takes and gives back its bump.
+        // A oneway reply is never sent: no buffer unless the handler writes into it.
         let mut reply = if oneway {
             Parcel::with_capacity(0)
         } else {
@@ -5708,8 +5707,7 @@ mod tests {
     use super::*;
     use std::os::fd::{AsFd, OwnedFd};
 
-    /// `RpcSession`'s auto traits are public API (`api/rsbinder-rpc.txt`); a field of
-    /// `RpcSessionInner` that is not `RefUnwindSafe` (an `Arc<dyn Trait>`) silently drops two.
+    /// Auto traits are public API (`api/rsbinder-rpc.txt`); a non-`RefUnwindSafe` field drops two.
     #[test]
     fn rpc_session_keeps_its_auto_traits() {
         fn assert_traits<
