@@ -374,7 +374,7 @@ impl<T: FromIBinder + ?Sized + 'static> Reconnecting<T> {
 
     /// The current proxy, without waiting: `DeadObject` while there is no
     /// connection (a reconnect is started if none is under way). For async
-    /// code, which must not block here.
+    /// code, which must not block here; `connected` (`tokio`) waits.
     pub fn current(&self) -> Result<Strong<T>> {
         self.shared.current()
     }
@@ -386,6 +386,33 @@ impl<T: FromIBinder + ?Sized + 'static> Reconnecting<T> {
     /// where waiting could block the reconnect itself.
     pub fn wait_connected(&self, timeout: Option<Duration>) -> Result<Strong<T>> {
         self.shared.wait_connected(timeout)
+    }
+
+    /// The async [`wait_connected`](Self::wait_connected) without a
+    /// deadline: resolves once connected, across as many attempts as it
+    /// takes, without blocking the executor. Wrap it in
+    /// `tokio::time::timeout` for a bound. The closing error once the helper
+    /// is closed (`DeadObject` if there was none); `WouldBlock` inside a
+    /// binder transaction. Dropping the future stops the wait, not the
+    /// reconnect.
+    #[cfg(feature = "tokio")]
+    pub async fn connected(&self) -> Result<Strong<T>> {
+        if crate::is_handling_transaction() {
+            return Err(StatusCode::WouldBlock);
+        }
+        // Subscribed before looking, so a publish in between still wakes `changed`.
+        let mut published = self.shared.watch.subscribe();
+        loop {
+            match self.shared.acquire(Wait::Never) {
+                Ok(snap) => return Ok(snap.proxy),
+                Err(AcquireError::Closed(code)) => {
+                    return Err(code.unwrap_or(StatusCode::DeadObject))
+                }
+                Err(_) => {}
+            }
+            // The sender lives in `Shared`, which `self` keeps alive.
+            let _ = published.changed().await;
+        }
     }
 
     /// How many connections this helper has made: 1 after the first, then

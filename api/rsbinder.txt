@@ -2269,6 +2269,7 @@ pub struct rsbinder::reconnect::Reconnecting<T: rsbinder::FromIBinder + ?core::m
 impl<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static> rsbinder::reconnect::Reconnecting<T>
 pub fn rsbinder::reconnect::Reconnecting<T>::builder(&str) -> rsbinder::reconnect::ReconnectBuilder<T>
 pub fn rsbinder::reconnect::Reconnecting<T>::close(self)
+pub async fn rsbinder::reconnect::Reconnecting<T>::connected(&self) -> rsbinder::Result<rsbinder::Strong<T>>
 pub fn rsbinder::reconnect::Reconnecting<T>::current(&self) -> rsbinder::Result<rsbinder::Strong<T>>
 pub fn rsbinder::reconnect::Reconnecting<T>::downgrade(&self) -> rsbinder::reconnect::WeakReconnecting<T>
 pub fn rsbinder::reconnect::Reconnecting<T>::generation(&self) -> u64
@@ -3828,6 +3829,7 @@ pub struct rsbinder::Reconnecting<T: rsbinder::FromIBinder + ?core::marker::Size
 impl<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static> rsbinder::reconnect::Reconnecting<T>
 pub fn rsbinder::reconnect::Reconnecting<T>::builder(&str) -> rsbinder::reconnect::ReconnectBuilder<T>
 pub fn rsbinder::reconnect::Reconnecting<T>::close(self)
+pub async fn rsbinder::reconnect::Reconnecting<T>::connected(&self) -> rsbinder::Result<rsbinder::Strong<T>>
 pub fn rsbinder::reconnect::Reconnecting<T>::current(&self) -> rsbinder::Result<rsbinder::Strong<T>>
 pub fn rsbinder::reconnect::Reconnecting<T>::downgrade(&self) -> rsbinder::reconnect::WeakReconnecting<T>
 pub fn rsbinder::reconnect::Reconnecting<T>::generation(&self) -> u64

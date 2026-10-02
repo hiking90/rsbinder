@@ -350,6 +350,46 @@ fn drop_does_not_wait_for_a_stuck_attempt() {
     silent.join().unwrap();
 }
 
+/// `connected().await` waits across attempts without a blocked thread, and ends on close.
+#[test]
+fn connected_resolves_once_the_server_is_up() {
+    let sock = Sock::new("async");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let h = Reconnecting::<dyn IRpcSmoke>::builder(&sock.uri("", "#smoke"))
+        .build()
+        .expect("build");
+    let uri = sock.uri("", "");
+    let late = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        rsbinder::serve(&uri)
+            .expect("serve")
+            .add("smoke", BnRpcSmoke::new_binder(Svc { tag: "a" }))
+            .expect("add")
+            .spawn()
+            .expect("spawn")
+    });
+    let p = rt
+        .block_on(async { tokio::time::timeout(Duration::from_secs(5), h.connected()).await })
+        .expect("within the bound")
+        .expect("connected");
+    assert_eq!(p.r#echo("x").unwrap(), "a:x");
+    let _guard = late.join().unwrap();
+
+    let mut policy = ReconnectPolicy::default();
+    policy.max_attempts = Some(1);
+    let doomed =
+        Reconnecting::<dyn IRpcSmoke>::builder(&Sock::new("async_doomed").uri("", "#smoke"))
+            .policy(policy)
+            .build()
+            .expect("build");
+    let r = rt
+        .block_on(async { tokio::time::timeout(Duration::from_secs(5), doomed.connected()).await });
+    assert!(r.expect("a closing helper wakes the waiter").is_err());
+}
+
 /// `Strong` of the async-free interface is what `current` hands out.
 #[test]
 fn current_hands_out_the_proxy_without_waiting() {
