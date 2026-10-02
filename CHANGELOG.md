@@ -363,6 +363,12 @@ This changelog starts at 0.9.0. For earlier releases, see the
   mode reads each frame's header and then its body straight into the frame,
   where it used to read through an 8 KiB scratch buffer zeroed before every
   read and copy the frame out of it. No wire change.
+- **`@EnforcePermission` over kernel binder costs one IPC per check, not
+  two.** `check_permission` keeps the `IPermissionController` that answered
+  last, as AOSP libbinder keeps `gPermissionController`, instead of looking
+  `"permission"` up in the service manager on every guarded call. A kept
+  controller that fails is dropped and the check goes once to a fresh
+  lookup, so a `system_server` restart does not deny the next check.
 - **rsbinder-tools (`rsb_hub`):** a policy check no longer copies the
   caller's group set, and the `listServices`, `dump`, `getDeclaredInstances`
   and `getServiceDebugInfo` filters read the caller once per request.
