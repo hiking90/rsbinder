@@ -18,13 +18,12 @@
 //!
 //! The shared stream frame is `u32 little-endian length | <length> body
 //! bytes`, with no magic and no self-sync: the length alone delimits the
-//! frame and is bounded by `MAX_FRAME_LEN` before allocation. `write_frame`
-//! coalesces the length and the body into one buffer and one `write_all`,
-//! so a concurrent writer can never splice between them. The cross-thread
-//! correctness guarantee is slot occupancy (`session.rs` `ConnGuard`: a
-//! slot is held by one thread's `exclusive_tid`); the single write additionally keeps the lock-free
-//! small-frame paths (a `DEC_STRONG` from `RpcProxy::drop`) from ever
-//! emitting a half-frame.
+//! frame and is bounded by `MAX_FRAME_LEN` before allocation. Frames do not
+//! interleave because a connection has one writer at a time: every send,
+//! a `DEC_STRONG` from `RpcProxy::drop` included, goes out on a slot its
+//! thread holds (`session.rs` `ConnGuard`, `exclusive_tid`), so a frame
+//! written in more than one call stays whole. `write_frame` still coalesces
+//! the length and the body into one `write_all`.
 //!
 //! The trait is **synchronous / blocking** (matches android-12 r34's
 //! blocking-thread model). An `async` adapter can be layered *on top*
@@ -555,7 +554,7 @@ pub(crate) fn write_frame<W: Write>(w: &mut W, buf: &[u8]) -> RpcResult<()> {
             max: MAX_FRAME_LEN,
         });
     }
-    // One buffer, one `write_all`: no writer can splice a frame (module doc).
+    // One buffer, one `write_all`; the slot's single writer keeps the frame whole (module doc).
     let mut framed = Vec::with_capacity(4 + buf.len());
     framed.extend_from_slice(&(buf.len() as u32).to_le_bytes());
     framed.extend_from_slice(buf);

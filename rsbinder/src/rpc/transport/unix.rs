@@ -91,6 +91,13 @@ use crate::rpc::{RpcError, RpcResult};
 /// Per-message fd cap (DoS bound, < `SCM_MAX_FD` 253); `wire_android13` applies it across recvmsgs.
 pub(crate) const MAX_FDS_PER_FRAME: usize = 64;
 
+/// `sendmsg` flags: a send to a closed peer is `EPIPE`, not `SIGPIPE`, as std's own `send`.
+/// Apple has no `MSG_NOSIGNAL`; std sets `SO_NOSIGPIPE` on the sockets it creates there instead.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const SEND_FLAGS: rustix::net::SendFlags = rustix::net::SendFlags::NOSIGNAL;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const SEND_FLAGS: rustix::net::SendFlags = rustix::net::SendFlags::empty();
+
 /// A framed transport over a connected Unix domain socket.
 pub struct UnixTransport {
     stream: UnixStream,
@@ -332,7 +339,7 @@ impl RpcTransport for UnixTransport {
     /// `sentFds |= ret > 0`); the rest (rare — fd transactions are
     /// tiny) follow without ancillary.
     fn send_raw_with_fds(&self, buf: &[u8], fds: &[std::os::fd::BorrowedFd<'_>]) -> RpcResult<()> {
-        use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
+        use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage};
         use std::io::IoSlice;
         use std::mem::MaybeUninit;
 
@@ -370,7 +377,7 @@ impl RpcTransport for UnixTransport {
                 &self.stream,
                 &[IoSlice::new(&buf[sent..])],
                 &mut anc,
-                SendFlags::empty(),
+                SEND_FLAGS,
             ) {
                 Ok(n) => n,
                 // EINTR is benign — retry the syscall.
@@ -494,7 +501,7 @@ impl RpcTransport for UnixTransport {
         buf: &[u8],
         fds: &[std::os::fd::BorrowedFd<'_>],
     ) -> RpcResult<()> {
-        use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
+        use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage};
         use std::io::IoSlice;
         use std::mem::MaybeUninit;
 
@@ -530,7 +537,7 @@ impl RpcTransport for UnixTransport {
                 &self.stream,
                 &[IoSlice::new(&framed[sent..])],
                 &mut anc,
-                SendFlags::empty(),
+                SEND_FLAGS,
             ) {
                 Ok(n) => n,
                 // EINTR retry, symmetric with read_header.
@@ -670,6 +677,48 @@ mod tests {
             assert_eq!(b.recv_frame().expect("recv"), payload, "size {size}");
             sender.join().unwrap();
         }
+    }
+
+    /// An fd send to a closed peer fails with `EPIPE`: a `SIGPIPE` would kill a host whose runtime
+    /// does not ignore it. The harness ignores it, so the sends run in a child at `SIG_DFL`.
+    /// Not on s390x: CI runs it under qemu-user with no binfmt entry, so the child cannot start.
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        not(target_arch = "s390x")
+    ))]
+    #[test]
+    fn an_fd_send_to_a_closed_peer_is_an_error_not_a_signal() {
+        use std::os::fd::AsFd;
+        use std::os::unix::process::ExitStatusExt;
+        const CHILD: &str = "RSB_UNIX_SIGPIPE_CHILD";
+        const NAME: &str =
+            "rpc::transport::unix::tests::an_fd_send_to_a_closed_peer_is_an_error_not_a_signal";
+
+        if std::env::var_os(CHILD).is_some() {
+            // SAFETY: restores the default disposition; this child runs no other test.
+            unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+            let (a, b) = UnixTransport::pair().expect("socketpair");
+            drop(b);
+            let file = std::fs::File::open("/dev/null").expect("/dev/null");
+            let fds = [file.as_fd()];
+            assert!(a.send_frame_with_fds(b"frame", &fds).is_err());
+            assert!(a.send_raw_with_fds(b"raw", &fds).is_err());
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+            .args(["--exact", NAME, "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .expect("spawn the child");
+        assert_eq!(out.status.signal(), None, "a send raised a signal");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // Zero tests run would also exit 0: the filter must have found this test.
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "{:?}\n{stdout}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     #[test]
