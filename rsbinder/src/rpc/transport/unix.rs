@@ -679,6 +679,46 @@ mod tests {
         }
     }
 
+    /// Each fd-mode frame gets exactly the fds sent with it, with the next frame already queued:
+    /// a read of the first frame's tail that spills into the second takes the second's fds
+    /// (module doc "fd passing"). The first frame spans several reads of the fd-mode reader.
+    #[test]
+    fn fd_mode_frames_queued_back_to_back_keep_their_own_fds() {
+        use rustix::net::sockopt;
+        use std::os::fd::AsFd;
+
+        let (a, b) = UnixTransport::pair().expect("socketpair");
+        // Both frames queue before the first read, so the reader sees them back to back.
+        sockopt::set_socket_send_buffer_size(&a.stream, 1 << 20).expect("SO_SNDBUF");
+        sockopt::set_socket_recv_buffer_size(&b.stream, 1 << 20).expect("SO_RCVBUF");
+        a.set_write_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("a full buffer fails the test instead of hanging it");
+        let inode = |fd: std::os::fd::BorrowedFd<'_>| {
+            let st = rustix::fs::fstat(fd).expect("fstat");
+            (st.st_dev, st.st_ino)
+        };
+        let (first_fd, _keep1) = UnixStream::pair().expect("fd for the first frame");
+        let (second_fd, _keep2) = UnixStream::pair().expect("fd for the second frame");
+        let first: Vec<u8> = (0..20 * 1024).map(|i| (i % 251) as u8).collect();
+        let second = b"second frame".to_vec();
+        a.send_frame_with_fds(&first, &[first_fd.as_fd()])
+            .expect("send the first frame");
+        a.send_frame_with_fds(&second, &[second_fd.as_fd()])
+            .expect("send the second frame");
+
+        for (payload, sent) in [(&first, &first_fd), (&second, &second_fd)] {
+            let (got, fds) = b.recv_frame_with_fds().expect("recv");
+            assert_eq!(&got, payload, "frame of {} bytes", payload.len());
+            let got_inodes: Vec<_> = fds.iter().map(|fd| inode(fd.as_fd())).collect();
+            assert_eq!(
+                got_inodes,
+                [inode(sent.as_fd())],
+                "the {}-byte frame must carry its own fd and no other",
+                payload.len()
+            );
+        }
+    }
+
     /// An fd send to a closed peer fails with `EPIPE`: a `SIGPIPE` would kill a host whose runtime
     /// does not ignore it. The harness ignores it, so the sends run in a child at `SIG_DFL`.
     /// Not on s390x: CI runs it under qemu-user with no binfmt entry, so the child cannot start.
