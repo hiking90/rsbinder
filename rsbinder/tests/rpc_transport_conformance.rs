@@ -17,6 +17,12 @@
 //! | tcp_debug | as above | end of stream | reads end of stream; its first send is **accepted on both** — TCP reports the reset on a later write | fails at once, `EndOfStream` | `Ok` |
 //! | mem | the frame, then end of stream (models Linux unix) | end of stream (≤ one 20 ms tick) | reads end of stream; its sends fail at once | fails at once, `EndOfStream` | `Ok` |
 //!
+//! "Queued" means in our receive queue before the shutdown, and for
+//! `tcp_debug` the scenario waits until it is: XNU's loopback delivers a
+//! segment after the sender's `send` returns, and one that lands after our
+//! shutdown draws a RST, so the peer's first send fails (`EPIPE`) where the
+//! table says it is accepted.
+//!
 //! `vsock` is not here: it needs a VM peer (its own tests are `#[ignore]`),
 //! and its behaviour is inferred from `vsock(7)`, not measured.
 //!
@@ -128,8 +134,22 @@ fn queued_then_shutdown(
     queued: Queued,
     peer_send: PeerSend,
 ) {
+    queued_then_shutdown_after(name, local, peer, fd_mode, queued, peer_send, || {});
+}
+
+/// [`queued_then_shutdown`], with `arrived` returning once the frame is in our receive queue.
+fn queued_then_shutdown_after(
+    name: &str,
+    local: &Shared,
+    peer: &Shared,
+    fd_mode: bool,
+    queued: Queued,
+    peer_send: PeerSend,
+    arrived: impl FnOnce(),
+) {
     peer.send_frame(b"queued")
         .expect("peer sends into our queue");
+    arrived();
     shutdown_within(name, local);
     if let Queued::Delivered = queued {
         assert_eq!(
@@ -349,23 +369,45 @@ fn mem_our_send_after_our_shutdown_fails() {
 mod tcp {
     use super::*;
     use rsbinder::rpc::transport::TcpDebugTransport;
+    use std::net::TcpStream;
 
     fn tcp_pair() -> (Shared, Shared) {
         let (client, server) = TcpDebugTransport::pair_loopback().expect("loopback pair");
         armed((Arc::new(client), Arc::new(server)))
     }
 
+    /// [`tcp_pair`], plus a second handle on the local socket to see what it has received.
+    fn tcp_pair_with_local_view() -> (Shared, Shared, TcpStream) {
+        let listener = TcpDebugTransport::bind_loopback().expect("bind loopback");
+        let client =
+            TcpStream::connect(listener.local_addr().expect("listener address")).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        let view = client.try_clone().expect("clone the local socket");
+        let (local, peer) = armed((
+            Arc::new(TcpDebugTransport::from_stream(client).expect("wrap the client")),
+            Arc::new(TcpDebugTransport::from_stream(server).expect("wrap the server")),
+        ));
+        (local, peer, view)
+    }
+
     #[test]
     fn tcp_debug_queued_frame_then_shutdown() {
-        let (local, peer) = tcp_pair();
+        let (local, peer, view) = tcp_pair_with_local_view();
         // TCP accepts the first write on both platforms and reports the reset on a later one.
-        queued_then_shutdown(
+        queued_then_shutdown_after(
             "tcp_debug",
             &local,
             &peer,
             false,
             socket_expectation(),
             PeerSend::Accepted,
+            // Blocks under the 5 s deadline `armed` set on this socket.
+            || {
+                let n = view
+                    .peek(&mut [0u8; 1])
+                    .expect("the queued frame reaches our socket");
+                assert!(n > 0, "tcp_debug: the queued frame, not an end of stream");
+            },
         );
     }
 
