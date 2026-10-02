@@ -1874,7 +1874,7 @@ pub(crate) enum WaitEnd {
 impl WaitEnd {
     /// Only `EX_SECURITY` and `EX_ILLEGAL_ARGUMENT` repeat on retry; `EX_ILLEGAL_STATE` (a
     /// callback the SM could not link, rsb_hub's per-name cap) and transport errors do not.
-    fn from_registration(status: Status) -> Self {
+    pub(crate) fn from_registration(status: Status) -> Self {
         match status.exception_code() {
             ExceptionCode::Security | ExceptionCode::IllegalArgument => WaitEnd::Refused(status),
             _ => WaitEnd::Transient(status.into()),
@@ -1910,8 +1910,7 @@ struct WaiterInner {
 }
 
 impl WaiterState {
-    /// Ends the wait with `None` (idempotent, sticky); only the async drop guard calls it.
-    #[cfg(feature = "tokio")]
+    /// Ends the wait with `Cancelled` (idempotent, sticky): the async drop guard, a closing helper.
     pub(crate) fn cancel(&self) {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         guard.cancelled = true;

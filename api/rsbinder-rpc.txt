@@ -2360,6 +2360,112 @@ pub fn rsbinder::proxy_count::is_count_by_uid_enabled() -> bool
 pub fn rsbinder::proxy_count::set_binder_proxy_count_event_callback(core::option::Option<rsbinder::proxy_count::ProxyCountCallback>)
 pub fn rsbinder::proxy_count::set_binder_proxy_count_watermarks(u64, u64, u64)
 pub type rsbinder::proxy_count::ProxyCountCallback = alloc::sync::Arc<(dyn core::ops::function::Fn(rsbinder::proxy_count::ProxyCountEvent) + core::marker::Send + core::marker::Sync)>
+pub mod rsbinder::reconnect
+pub struct rsbinder::reconnect::ConnectError
+impl rsbinder::reconnect::ConnectError
+pub fn rsbinder::reconnect::ConnectError::code(&self) -> rsbinder::StatusCode
+pub fn rsbinder::reconnect::ConnectError::is_stop(&self) -> bool
+pub fn rsbinder::reconnect::ConnectError::retry(rsbinder::StatusCode) -> Self
+pub fn rsbinder::reconnect::ConnectError::stop(rsbinder::StatusCode) -> Self
+impl core::clone::Clone for rsbinder::reconnect::ConnectError
+pub fn rsbinder::reconnect::ConnectError::clone(&self) -> rsbinder::reconnect::ConnectError
+impl core::cmp::Eq for rsbinder::reconnect::ConnectError
+impl core::cmp::PartialEq for rsbinder::reconnect::ConnectError
+pub fn rsbinder::reconnect::ConnectError::eq(&self, &rsbinder::reconnect::ConnectError) -> bool
+impl core::convert::From<rsbinder::Status> for rsbinder::reconnect::ConnectError
+pub fn rsbinder::reconnect::ConnectError::from(rsbinder::Status) -> Self
+impl core::convert::From<rsbinder::StatusCode> for rsbinder::reconnect::ConnectError
+pub fn rsbinder::reconnect::ConnectError::from(rsbinder::StatusCode) -> Self
+impl core::fmt::Debug for rsbinder::reconnect::ConnectError
+pub fn rsbinder::reconnect::ConnectError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for rsbinder::reconnect::ConnectError
+impl core::marker::StructuralPartialEq for rsbinder::reconnect::ConnectError
+impl core::marker::Freeze for rsbinder::reconnect::ConnectError
+impl core::marker::Send for rsbinder::reconnect::ConnectError
+impl core::marker::Sync for rsbinder::reconnect::ConnectError
+impl core::marker::Unpin for rsbinder::reconnect::ConnectError
+impl core::marker::UnsafeUnpin for rsbinder::reconnect::ConnectError
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::reconnect::ConnectError
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::reconnect::ConnectError
+pub struct rsbinder::reconnect::Connection<'a, T: rsbinder::FromIBinder + ?core::marker::Sized>
+impl<T: rsbinder::FromIBinder + ?core::marker::Sized> rsbinder::reconnect::Connection<'_, T>
+pub fn rsbinder::reconnect::Connection<'_, T>::generation(&self) -> u64
+pub fn rsbinder::reconnect::Connection<'_, T>::proxy(&self) -> &rsbinder::Strong<T>
+pub fn rsbinder::reconnect::Connection<'_, T>::session(&self) -> core::option::Option<&rsbinder::rpc::session::RpcSession>
+impl<'a, T> core::marker::Freeze for rsbinder::reconnect::Connection<'a, T> where T: ?core::marker::Sized
+impl<'a, T> core::marker::Send for rsbinder::reconnect::Connection<'a, T> where T: ?core::marker::Sized
+impl<'a, T> core::marker::Sync for rsbinder::reconnect::Connection<'a, T> where T: ?core::marker::Sized
+impl<'a, T> core::marker::Unpin for rsbinder::reconnect::Connection<'a, T> where T: ?core::marker::Sized
+impl<'a, T> core::marker::UnsafeUnpin for rsbinder::reconnect::Connection<'a, T> where T: ?core::marker::Sized
+impl<'a, T> core::panic::unwind_safe::RefUnwindSafe for rsbinder::reconnect::Connection<'a, T> where T: core::panic::unwind_safe::RefUnwindSafe + ?core::marker::Sized
+impl<'a, T> core::panic::unwind_safe::UnwindSafe for rsbinder::reconnect::Connection<'a, T> where T: core::panic::unwind_safe::RefUnwindSafe + ?core::marker::Sized
+pub struct rsbinder::reconnect::ReconnectBuilder<T: rsbinder::FromIBinder + ?core::marker::Sized>
+impl<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static> rsbinder::reconnect::ReconnectBuilder<T>
+pub fn rsbinder::reconnect::ReconnectBuilder<T>::build(self) -> rsbinder::Result<rsbinder::reconnect::Reconnecting<T>>
+pub fn rsbinder::reconnect::ReconnectBuilder<T>::on_connect(self, impl core::ops::function::Fn(&rsbinder::reconnect::Connection<'_, T>) -> core::result::Result<(), rsbinder::reconnect::ConnectError> + core::marker::Send + core::marker::Sync + 'static) -> Self
+pub fn rsbinder::reconnect::ReconnectBuilder<T>::options(self, impl core::ops::function::Fn(&mut rsbinder::ClientOptions, &rsbinder::entry::uri::Endpoint) + core::marker::Send + core::marker::Sync + 'static) -> Self
+pub fn rsbinder::reconnect::ReconnectBuilder<T>::policy(self, rsbinder::reconnect::ReconnectPolicy) -> Self
+impl<T> core::marker::Freeze for rsbinder::reconnect::ReconnectBuilder<T> where T: ?core::marker::Sized
+impl<T> core::marker::Send for rsbinder::reconnect::ReconnectBuilder<T> where T: ?core::marker::Sized
+impl<T> core::marker::Sync for rsbinder::reconnect::ReconnectBuilder<T> where T: ?core::marker::Sized
+impl<T> core::marker::Unpin for rsbinder::reconnect::ReconnectBuilder<T> where T: ?core::marker::Sized
+impl<T> core::marker::UnsafeUnpin for rsbinder::reconnect::ReconnectBuilder<T> where T: ?core::marker::Sized
+impl<T> !core::panic::unwind_safe::RefUnwindSafe for rsbinder::reconnect::ReconnectBuilder<T>
+impl<T> !core::panic::unwind_safe::UnwindSafe for rsbinder::reconnect::ReconnectBuilder<T>
+#[non_exhaustive] pub struct rsbinder::reconnect::ReconnectPolicy
+pub rsbinder::reconnect::ReconnectPolicy::call_wait: core::time::Duration
+pub rsbinder::reconnect::ReconnectPolicy::initial: core::time::Duration
+pub rsbinder::reconnect::ReconnectPolicy::jitter_percent: u8
+pub rsbinder::reconnect::ReconnectPolicy::max: core::time::Duration
+pub rsbinder::reconnect::ReconnectPolicy::max_attempts: core::option::Option<u32>
+pub rsbinder::reconnect::ReconnectPolicy::multiplier: u32
+impl core::clone::Clone for rsbinder::reconnect::ReconnectPolicy
+pub fn rsbinder::reconnect::ReconnectPolicy::clone(&self) -> rsbinder::reconnect::ReconnectPolicy
+impl core::default::Default for rsbinder::reconnect::ReconnectPolicy
+pub fn rsbinder::reconnect::ReconnectPolicy::default() -> Self
+impl core::fmt::Debug for rsbinder::reconnect::ReconnectPolicy
+pub fn rsbinder::reconnect::ReconnectPolicy::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for rsbinder::reconnect::ReconnectPolicy
+impl core::marker::Send for rsbinder::reconnect::ReconnectPolicy
+impl core::marker::Sync for rsbinder::reconnect::ReconnectPolicy
+impl core::marker::Unpin for rsbinder::reconnect::ReconnectPolicy
+impl core::marker::UnsafeUnpin for rsbinder::reconnect::ReconnectPolicy
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::reconnect::ReconnectPolicy
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::reconnect::ReconnectPolicy
+pub struct rsbinder::reconnect::Reconnecting<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static>
+impl<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static> rsbinder::reconnect::Reconnecting<T>
+pub fn rsbinder::reconnect::Reconnecting<T>::builder(&str) -> rsbinder::reconnect::ReconnectBuilder<T>
+pub fn rsbinder::reconnect::Reconnecting<T>::close(self)
+pub fn rsbinder::reconnect::Reconnecting<T>::current(&self) -> rsbinder::Result<rsbinder::Strong<T>>
+pub fn rsbinder::reconnect::Reconnecting<T>::downgrade(&self) -> rsbinder::reconnect::WeakReconnecting<T>
+pub fn rsbinder::reconnect::Reconnecting<T>::generation(&self) -> u64
+pub fn rsbinder::reconnect::Reconnecting<T>::is_closed(&self) -> bool
+pub fn rsbinder::reconnect::Reconnecting<T>::last_error(&self) -> core::option::Option<rsbinder::StatusCode>
+pub fn rsbinder::reconnect::Reconnecting<T>::wait_connected(&self, core::option::Option<core::time::Duration>) -> rsbinder::Result<rsbinder::Strong<T>>
+pub fn rsbinder::reconnect::Reconnecting<T>::with<R, E: core::convert::From<rsbinder::StatusCode>>(&self, impl core::ops::function::FnOnce(&rsbinder::Strong<T>) -> core::result::Result<R, E>) -> core::result::Result<R, E>
+impl<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static> core::ops::drop::Drop for rsbinder::reconnect::Reconnecting<T>
+pub fn rsbinder::reconnect::Reconnecting<T>::drop(&mut self)
+impl<T> core::marker::Freeze for rsbinder::reconnect::Reconnecting<T> where T: ?core::marker::Sized
+impl<T> core::marker::Send for rsbinder::reconnect::Reconnecting<T> where T: ?core::marker::Sized
+impl<T> core::marker::Sync for rsbinder::reconnect::Reconnecting<T> where T: ?core::marker::Sized
+impl<T> core::marker::Unpin for rsbinder::reconnect::Reconnecting<T> where T: ?core::marker::Sized
+impl<T> core::marker::UnsafeUnpin for rsbinder::reconnect::Reconnecting<T> where T: ?core::marker::Sized
+impl<T> !core::panic::unwind_safe::RefUnwindSafe for rsbinder::reconnect::Reconnecting<T>
+impl<T> !core::panic::unwind_safe::UnwindSafe for rsbinder::reconnect::Reconnecting<T>
+pub struct rsbinder::reconnect::WeakReconnecting<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static>
+impl<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static> rsbinder::reconnect::WeakReconnecting<T>
+pub fn rsbinder::reconnect::WeakReconnecting<T>::current(&self) -> rsbinder::Result<rsbinder::Strong<T>>
+pub fn rsbinder::reconnect::WeakReconnecting<T>::generation(&self) -> core::option::Option<u64>
+pub fn rsbinder::reconnect::WeakReconnecting<T>::with<R, E: core::convert::From<rsbinder::StatusCode>>(&self, impl core::ops::function::FnOnce(&rsbinder::Strong<T>) -> core::result::Result<R, E>) -> core::result::Result<R, E>
+impl<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static> core::clone::Clone for rsbinder::reconnect::WeakReconnecting<T>
+pub fn rsbinder::reconnect::WeakReconnecting<T>::clone(&self) -> Self
+impl<T> core::marker::Freeze for rsbinder::reconnect::WeakReconnecting<T> where T: ?core::marker::Sized
+impl<T> core::marker::Send for rsbinder::reconnect::WeakReconnecting<T> where T: ?core::marker::Sized
+impl<T> core::marker::Sync for rsbinder::reconnect::WeakReconnecting<T> where T: ?core::marker::Sized
+impl<T> core::marker::Unpin for rsbinder::reconnect::WeakReconnecting<T> where T: ?core::marker::Sized
+impl<T> core::marker::UnsafeUnpin for rsbinder::reconnect::WeakReconnecting<T> where T: ?core::marker::Sized
+impl<T> !core::panic::unwind_safe::RefUnwindSafe for rsbinder::reconnect::WeakReconnecting<T>
+impl<T> !core::panic::unwind_safe::UnwindSafe for rsbinder::reconnect::WeakReconnecting<T>
 pub mod rsbinder::rpc
 pub mod rsbinder::rpc::address
 pub enum rsbinder::rpc::address::AddressSpace
@@ -4380,6 +4486,8 @@ impl core::convert::From<rsbinder::StatusCode> for rsbinder::ExceptionCode
 pub fn rsbinder::ExceptionCode::from(rsbinder::StatusCode) -> Self
 impl core::convert::From<rsbinder::StatusCode> for rsbinder::Status
 pub fn rsbinder::Status::from(rsbinder::StatusCode) -> Self
+impl core::convert::From<rsbinder::StatusCode> for rsbinder::reconnect::ConnectError
+pub fn rsbinder::reconnect::ConnectError::from(rsbinder::StatusCode) -> Self
 impl core::convert::From<rsbinder::rpc::RpcError> for rsbinder::StatusCode
 pub fn rsbinder::StatusCode::from(rsbinder::rpc::RpcError) -> Self
 impl core::convert::From<rsbinder_fmq::error::Error> for rsbinder::StatusCode
@@ -4898,6 +5006,26 @@ impl core::marker::Unpin for rsbinder::ProxyHandle
 impl core::marker::UnsafeUnpin for rsbinder::ProxyHandle
 impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::ProxyHandle
 impl core::panic::unwind_safe::UnwindSafe for rsbinder::ProxyHandle
+pub struct rsbinder::Reconnecting<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static>
+impl<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static> rsbinder::reconnect::Reconnecting<T>
+pub fn rsbinder::reconnect::Reconnecting<T>::builder(&str) -> rsbinder::reconnect::ReconnectBuilder<T>
+pub fn rsbinder::reconnect::Reconnecting<T>::close(self)
+pub fn rsbinder::reconnect::Reconnecting<T>::current(&self) -> rsbinder::Result<rsbinder::Strong<T>>
+pub fn rsbinder::reconnect::Reconnecting<T>::downgrade(&self) -> rsbinder::reconnect::WeakReconnecting<T>
+pub fn rsbinder::reconnect::Reconnecting<T>::generation(&self) -> u64
+pub fn rsbinder::reconnect::Reconnecting<T>::is_closed(&self) -> bool
+pub fn rsbinder::reconnect::Reconnecting<T>::last_error(&self) -> core::option::Option<rsbinder::StatusCode>
+pub fn rsbinder::reconnect::Reconnecting<T>::wait_connected(&self, core::option::Option<core::time::Duration>) -> rsbinder::Result<rsbinder::Strong<T>>
+pub fn rsbinder::reconnect::Reconnecting<T>::with<R, E: core::convert::From<rsbinder::StatusCode>>(&self, impl core::ops::function::FnOnce(&rsbinder::Strong<T>) -> core::result::Result<R, E>) -> core::result::Result<R, E>
+impl<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static> core::ops::drop::Drop for rsbinder::reconnect::Reconnecting<T>
+pub fn rsbinder::reconnect::Reconnecting<T>::drop(&mut self)
+impl<T> core::marker::Freeze for rsbinder::reconnect::Reconnecting<T> where T: ?core::marker::Sized
+impl<T> core::marker::Send for rsbinder::reconnect::Reconnecting<T> where T: ?core::marker::Sized
+impl<T> core::marker::Sync for rsbinder::reconnect::Reconnecting<T> where T: ?core::marker::Sized
+impl<T> core::marker::Unpin for rsbinder::reconnect::Reconnecting<T> where T: ?core::marker::Sized
+impl<T> core::marker::UnsafeUnpin for rsbinder::reconnect::Reconnecting<T> where T: ?core::marker::Sized
+impl<T> !core::panic::unwind_safe::RefUnwindSafe for rsbinder::reconnect::Reconnecting<T>
+impl<T> !core::panic::unwind_safe::UnwindSafe for rsbinder::reconnect::Reconnecting<T>
 pub struct rsbinder::SIBinder
 impl rsbinder::SIBinder
 pub fn rsbinder::SIBinder::downgrade(&Self) -> rsbinder::WIBinder
@@ -5027,6 +5155,8 @@ impl core::convert::From<rsbinder::ExceptionCode> for rsbinder::Status
 pub fn rsbinder::Status::from(rsbinder::ExceptionCode) -> Self
 impl core::convert::From<rsbinder::Status> for rsbinder::StatusCode
 pub fn rsbinder::StatusCode::from(rsbinder::Status) -> Self
+impl core::convert::From<rsbinder::Status> for rsbinder::reconnect::ConnectError
+pub fn rsbinder::reconnect::ConnectError::from(rsbinder::Status) -> Self
 impl core::convert::From<rsbinder::StatusCode> for rsbinder::Status
 pub fn rsbinder::Status::from(rsbinder::StatusCode) -> Self
 impl core::convert::From<std::io::error::Error> for rsbinder::Status

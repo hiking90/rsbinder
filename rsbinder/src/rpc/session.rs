@@ -2655,6 +2655,19 @@ impl RpcSessionInner {
     }
 
     /// Shut every slot down so a `recv`-blocked thread sees `EndOfStream`; unlocked syscalls.
+    /// `RpcSession::peer_closed`: the transports copied out, then polled outside the lock.
+    pub(crate) fn peer_closed(&self) -> bool {
+        let transports: Vec<Arc<dyn RpcTransport>> = self
+            .conn_state
+            .lock()
+            .expect("conn_state poisoned")
+            .slots
+            .iter()
+            .map(|s| Arc::clone(&s.transport))
+            .collect();
+        transports.iter().any(|t| t.peer_closed() == Some(true))
+    }
+
     fn shutdown_all_transports(&self) {
         let transports: Vec<Arc<dyn RpcTransport>> = self
             .conn_state
@@ -4592,6 +4605,21 @@ impl RpcSession {
     /// recipients have all run.
     pub fn is_ended(&self) -> bool {
         self.inner.shared.lifecycle.is_torn_down()
+    }
+
+    /// Whether a lost connection ends this session as it happens (so `link_to_death` is allowed).
+    pub(crate) fn notices_connection_loss(&self) -> bool {
+        self.inner.notices_connection_loss()
+    }
+
+    /// Whether any connection's peer has closed, by `RpcTransport::peer_closed`; reads nothing.
+    pub(crate) fn peer_closed(&self) -> bool {
+        self.inner.peer_closed()
+    }
+
+    /// End the session as a connection fault does ("Session end"), from outside the module.
+    pub(crate) fn fail(&self) {
+        self.inner.fail_session();
     }
 
     /// Set the client reply/handshake wait deadline. `None`

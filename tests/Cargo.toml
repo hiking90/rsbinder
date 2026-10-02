@@ -72,6 +72,11 @@ path = "tests/stream_rpc.rs"
 required-features = ["rpc"]
 
 [[test]]
+name = "reconnect_rpc"
+path = "tests/reconnect_rpc.rs"
+required-features = ["rpc"]
+
+[[test]]
 name = "aidl_spans"
 path = "tests/aidl_spans.rs"
 required-features = ["rpc", "tracing"]
