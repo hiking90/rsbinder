@@ -3522,7 +3522,13 @@ impl RpcSessionInner {
                 self.send_reply(StatusCode::BadValue.into(), &[], &[], &[])
             };
         }
-        let mut reply = Parcel::new();
+        // A oneway reply is never sent: no buffer unless the handler writes into it. RPC mode
+        // either way, so a binder the handler writes still takes and gives back its bump.
+        let mut reply = if oneway {
+            Parcel::with_capacity(0)
+        } else {
+            Parcel::new()
+        };
         reply.configure_rpc(
             self.parcel_ops(),
             self.fd_mode(),
