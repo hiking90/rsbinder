@@ -347,6 +347,17 @@ This changelog starts at 0.9.0. For earlier releases, see the
   `Policy::group_could_grant`. An `_r` lookup's errno is now always a failure
   on glibc/BSD (`ENOENT`, `ESRCH`, `EBADF`, `EPERM` used to read as
   not-found, so a missing `/etc/passwd` looked like an unknown user).
+- **Fewer copies and allocations per transaction.** A `String16` is written
+  and read without an intermediate `Vec<u16>`, and the interface token is
+  compared in place (kernel `check_interface` and the RPC token). A oneway
+  transaction no longer allocates a reply buffer. An RPC send encodes the
+  frame from the parcel's bytes instead of copying them into it first.
+  `to_bytes` hands back the parcel's own buffer when that is at most twice
+  the value's size. A stream batch decodes from the bytes it received without
+  copying them. No wire or signature change.
+- **rsbinder-tools (`rsb_hub`):** a policy check no longer copies the
+  caller's group set, and the `listServices`, `dump`, `getDeclaredInstances`
+  and `getServiceDebugInfo` filters read the caller once per request.
 
 The behavior changes an existing program can observe are listed under
 *Migrating from 0.11.0* above.
@@ -377,6 +388,11 @@ in the release after 0.12.0. The single-connection one-liners
 
 ### Fixed
 
+- **RPC (Unix, fd passing): a send to a peer that has closed is an error, not
+  `SIGPIPE`.** The `sendmsg` calls that carry fds passed no flags, so on
+  Linux and Android such a send killed a process whose runtime does not
+  ignore `SIGPIPE` (a C or JNI host); they now pass `MSG_NOSIGNAL`, as std's
+  own `send` does.
 - **RPC: a TLS or `tcp_debug` connect that hits its own deadline returns
   `TimedOut`**, not `Unknown` (std's error for it carries no errno).
 - **RPC: dropping a proxy right after a oneway on it no longer aborts a
