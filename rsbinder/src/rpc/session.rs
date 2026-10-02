@@ -1114,12 +1114,10 @@ pub(crate) fn write_rpc_interface_token(p: &mut Parcel, descriptor: &str) -> Res
 
 /// Read and check the RPC interface token: a bare `String16` descriptor (module doc).
 fn consume_rpc_interface_token(reader: &mut Parcel, expected: &str) -> Result<()> {
-    let got: String = reader.read()?;
-    if got != expected {
+    crate::parcelable::read_string16_matches(reader, expected)?.map_err(|got| {
         log::error!("RPC interface token mismatch: expected '{expected}', got '{got}'");
-        return Err(StatusCode::BadType);
-    }
-    Ok(())
+        StatusCode::BadType
+    })
 }
 
 fn write_addr(p: &mut Parcel, addr: &RpcAddress) -> Result<()> {

@@ -1884,12 +1884,12 @@ pub(crate) fn check_interface(reader: &mut Parcel, descriptor: &str) -> Result<b
         }
     }
 
-    let parcel_interface: String = reader.read()?;
-    if parcel_interface.eq(descriptor) {
-        Ok(true)
-    } else {
-        log::error!("check_interface() expected '{descriptor}' but read '{parcel_interface}'");
-        Ok(false)
+    match crate::parcelable::read_string16_matches(reader, descriptor)? {
+        Ok(()) => Ok(true),
+        Err(parcel_interface) => {
+            log::error!("check_interface() expected '{descriptor}' but read '{parcel_interface}'");
+            Ok(false)
+        }
     }
 }
 

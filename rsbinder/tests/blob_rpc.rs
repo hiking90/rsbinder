@@ -213,3 +213,25 @@ fn a_large_blob_falls_back_to_inline_without_fd_passing() {
     session.close_session();
     bound.finish(bg);
 }
+
+/// A token other than the service's descriptor is a `BadType` status; the session serves on.
+#[test]
+fn a_wrong_interface_token_is_refused_and_the_session_serves_on() {
+    let (bound, bg, session) = serve("token", false);
+
+    // Not yet stamped, the root's requests carry an empty token.
+    let root = session.get_root().expect("get_root");
+    let remote = root.as_remote().expect("an RPC root is a proxy");
+    let mut data = remote.prepare_transact(true).expect("prepare_transact");
+    data.write(&16i32).expect("write len");
+    assert_eq!(
+        remote.submit_transact(GET_BLOB, &data, 0).err(),
+        Some(rsbinder::StatusCode::BadType)
+    );
+
+    // `fetch` stamps the descriptor: the same session answers.
+    assert_eq!(fetch(&session, 16).0, pattern(16));
+
+    session.close_session();
+    bound.finish(bg);
+}

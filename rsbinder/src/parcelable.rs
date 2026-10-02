@@ -309,31 +309,26 @@ impl SerializeOption for str {
             None => parcel.write::<i32>(&-1),
 
             Some(text) => {
-                let mut utf16 = Vec::with_capacity(text.len() + 2); // Room for NUL and padding.
-                utf16.extend(text.encode_utf16());
-
-                let len = utf16.len();
-
-                utf16.push(0);
-
-                parcel.write::<i32>(&(len as i32))?;
-
-                // Pre-swap units to LE so the byte view below is the wire form; LE builds omit it.
-                if cfg!(target_endian = "big") {
-                    for unit in utf16.iter_mut() {
-                        *unit = unit.swap_bytes();
-                    }
+                // The UTF-8 length bounds the UTF-16 unit count, so a shorter text fits the stack.
+                const STACK_UNITS: usize = 128;
+                let mut stack = [0u8; 2 * STACK_UNITS];
+                let mut heap;
+                // Zeroed, room for every unit plus the NUL.
+                let buf: &mut [u8] = if text.len() < STACK_UNITS {
+                    &mut stack[..2 * (text.len() + 1)]
+                } else {
+                    heap = vec![0u8; 2 * (text.len() + 1)];
+                    &mut heap
+                };
+                let mut units = 0;
+                for (unit, dst) in text.encode_utf16().zip(buf.chunks_exact_mut(2)) {
+                    dst.copy_from_slice(&unit.to_le_bytes());
+                    units += 1;
                 }
 
-                // SAFETY: the view covers exactly `utf16`'s bytes and ends with this call.
-                parcel.write_aligned_data(unsafe {
-                    std::slice::from_raw_parts(
-                        utf16.as_ptr() as *const u8,
-                        utf16.len() * std::mem::size_of::<u16>(),
-                    )
-                })?;
-
-                Ok(())
+                parcel.write::<i32>(&(units as i32))?;
+                // The units and the NUL unit after them, still zero.
+                parcel.write_aligned_data(&buf[..2 * (units + 1)])
             }
         }
     }
@@ -412,33 +407,65 @@ impl SerializeOption for String {
     }
 }
 
+/// A `String16`'s unit bytes, NUL excluded; `None` for null (`-1` only, other negatives are errors).
+pub(crate) fn read_string16_units(parcel: &mut Parcel) -> Result<Option<&[u8]>> {
+    let len = parcel.read::<i32>()?;
+
+    if len == -1 {
+        return Ok(None);
+    }
+    if !(0..i32::MAX).contains(&len) {
+        return Err(StatusCode::UnexpectedNull);
+    }
+
+    // `len + 1` units incl. NUL, checked so a hostile `len` cannot wrap on 32-bit targets.
+    let (byte_count, _) = crate::parcel::checked_array_layout(len + 1, std::mem::size_of::<u16>())?;
+    // Bounds-checked against the parcel before anything is allocated for it.
+    let data = parcel.read_aligned_data(byte_count)?;
+    Ok(Some(&data[..byte_count - std::mem::size_of::<u16>()]))
+}
+
+/// The units of `String16` bytes; a `&[u16]` view of the 1-byte-aligned buffer would be UB.
+fn string16_units(bytes: &[u8]) -> impl Iterator<Item = u16> + '_ {
+    bytes
+        .chunks_exact(std::mem::size_of::<u16>())
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+}
+
+/// Decodes `String16` unit bytes; an unpaired surrogate is `BadValue`.
+fn decode_string16_units(bytes: &[u8]) -> Result<String> {
+    let mut text = String::with_capacity(bytes.len() / std::mem::size_of::<u16>());
+    for c in char::decode_utf16(string16_units(bytes)) {
+        text.push(c.map_err(|e| {
+            log::error!("Deserialize for Option<String16>: {e}");
+            StatusCode::BadValue
+        })?);
+    }
+    Ok(text)
+}
+
+/// Reads a non-null `String16` and compares it with `expected` in place: `Ok(Err(got))` on a mismatch.
+///
+/// Null is `UnexpectedNull` and a mismatch that is not valid UTF-16 is `BadValue`, as a `String`
+/// read would report them; the cursor ends where that read would leave it.
+pub(crate) fn read_string16_matches(
+    parcel: &mut Parcel,
+    expected: &str,
+) -> Result<std::result::Result<(), String>> {
+    let units = read_string16_units(parcel)?.ok_or(StatusCode::UnexpectedNull)?;
+    // Unequal lengths are unequal: `Iterator::eq` checks both ends.
+    if string16_units(units).eq(expected.encode_utf16()) {
+        Ok(Ok(()))
+    } else {
+        decode_string16_units(units).map(Err)
+    }
+}
+
 impl DeserializeOption for String {
     fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
-        let len = parcel.read::<i32>()?;
-
-        if len == -1 {
-            return Ok(None);
-        }
-
-        if (0..i32::MAX).contains(&len) {
-            // `len + 1` units incl. NUL, checked so a hostile `len` cannot wrap on 32-bit targets.
-            let (byte_count, _) =
-                crate::parcel::checked_array_layout(len + 1, std::mem::size_of::<u16>())?;
-            let data = parcel.read_aligned_data(byte_count)?;
-            // A `&[u16]` view of the 1-byte-aligned buffer would be UB, so copy into a `Vec<u16>`.
-            let u16_data: Vec<u16> = data[..len as usize * std::mem::size_of::<u16>()]
-                .chunks_exact(std::mem::size_of::<u16>())
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .collect();
-            let res = String::from_utf16(&u16_data).map_err(|e| {
-                log::error!("Deserialize for Option<String16>: {e}");
-                StatusCode::BadValue
-            })?;
-
-            return Ok(Some(res));
-        }
-
-        Err(StatusCode::UnexpectedNull)
+        read_string16_units(parcel)?
+            .map(decode_string16_units)
+            .transpose()
     }
 }
 
@@ -920,6 +947,115 @@ mod tests {
         p.set_data_position(0);
         let got: String = p.read::<String>().unwrap();
         assert_eq!(got, s);
+    }
+
+    /// `len`, the LE units, a NUL unit, zero padding to 4: built without the encoder under test.
+    fn string16_wire(s: &str) -> Vec<u8> {
+        let units: Vec<u16> = s.encode_utf16().collect();
+        let mut wire = (units.len() as i32).to_le_bytes().to_vec();
+        for unit in units.iter().chain(&[0u16]) {
+            wire.extend_from_slice(&unit.to_le_bytes());
+        }
+        while wire.len() % 4 != 0 {
+            wire.push(0);
+        }
+        wire
+    }
+
+    fn string16_samples() -> Vec<String> {
+        let mut samples = Vec::new();
+        // Both sides of the encoder's stack/heap split, with 1-, 3- and 4-byte UTF-8 (BMP, pairs).
+        for n in [0usize, 1, 2, 42, 126, 127, 128, 129, 300] {
+            samples.push("a".repeat(n));
+            samples.push("\u{20AC}".repeat(n));
+            samples.push("\u{1F600}".repeat(n));
+            samples.push(format!("{}\u{1F600}", "b".repeat(n)));
+        }
+        samples
+    }
+
+    #[test]
+    fn string16_wire_is_the_unit_encoding_across_the_stack_bound() {
+        for s in string16_samples() {
+            let mut p = Parcel::new();
+            p.write(&s).unwrap();
+            p.write(&7i32).unwrap();
+            let mut want = string16_wire(&s);
+            want.extend_from_slice(&7i32.to_le_bytes());
+            assert_eq!(p.as_bytes().unwrap(), &want[..], "{} UTF-8 bytes", s.len());
+
+            p.set_data_position(0);
+            assert_eq!(p.read::<String>().unwrap(), s);
+            assert_eq!(
+                p.read::<i32>().unwrap(),
+                7,
+                "cursor after {} UTF-8 bytes",
+                s.len()
+            );
+        }
+    }
+
+    #[test]
+    fn string16_compare_matches_a_read_and_leaves_the_same_cursor() {
+        for s in string16_samples() {
+            let mut p = Parcel::new();
+            p.write(&s).unwrap();
+            p.write(&7i32).unwrap();
+
+            p.set_data_position(0);
+            assert_eq!(read_string16_matches(&mut p, &s), Ok(Ok(())));
+            assert_eq!(p.read::<i32>().unwrap(), 7);
+
+            // Longer, shorter and same-length-different expectations all report what was read.
+            let longer = format!("{s}x");
+            let mut shorter = s.clone();
+            let mut same_len = s.clone();
+            let mut others = vec![longer];
+            if shorter.pop().is_some() {
+                others.push(shorter);
+                same_len.pop();
+                same_len.push('z');
+                others.push(same_len);
+            }
+            for other in others {
+                p.set_data_position(0);
+                assert_eq!(read_string16_matches(&mut p, &other), Ok(Err(s.clone())));
+                assert_eq!(p.read::<i32>().unwrap(), 7);
+            }
+        }
+    }
+
+    #[test]
+    fn string16_compare_reports_null_and_invalid_units_as_a_read_does() {
+        let mut p = Parcel::new();
+        p.write(&-1i32).unwrap();
+        p.set_data_position(0);
+        assert_eq!(
+            read_string16_matches(&mut p, ""),
+            Err(StatusCode::UnexpectedNull)
+        );
+
+        // One unpaired high surrogate, then its NUL.
+        for expected in ["x", ""] {
+            let mut p = Parcel::new();
+            p.write(&1i32).unwrap();
+            p.write(&0xD800u16).unwrap();
+            p.write(&0u16).unwrap();
+            p.set_data_position(0);
+            assert_eq!(
+                read_string16_matches(&mut p, expected),
+                Err(StatusCode::BadValue)
+            );
+            p.set_data_position(0);
+            assert_eq!(p.read::<String>(), Err(StatusCode::BadValue));
+        }
+
+        for len in [-2, i32::MAX - 1, i32::MAX] {
+            let mut p = Parcel::new();
+            p.write::<i32>(&len).unwrap();
+            p.set_data_position(0);
+            assert!(read_string16_matches(&mut p, "x").is_err(), "len {len}");
+        }
     }
 
     /// Generic `deserialize_array` default: -1 is null, 0 is empty, other negatives are rejected.
