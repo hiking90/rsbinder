@@ -123,14 +123,14 @@ union Union {
 
 Key points about union definitions:
 
-- **The first field is the default.** When a union is default-constructed, it takes the value of the first field. In this example, the default is `ns` initialized to an empty array `{}`.
+- **The first field is the default.** When a union is default-constructed, it takes the value of the first field. In this example, the default is `ns` initialized to an empty array `{}`. A first field without an initializer takes its type's Rust `Default`, as in AOSP's Rust backend; for an enum that is the backing value `0`, not the first enumerator.
 - **Fields can have different types**, including primitives, strings, arrays, other AIDL types, and even binder references.
 - **Constants can be defined** inside unions, independent of the union's variants.
 - **`@RustDerive`** is recommended so the generated Rust type supports `Clone` and `PartialEq`.
 
 ### Using Unions in Rust
 
-The AIDL union generates a Rust enum. Because AIDL types are organized into modules, the union type and its enum variants live inside a module named after the union. Variants are accessed as `Union::Union::VariantName(...)`:
+The AIDL union generates a Rust enum. Because AIDL types are organized into modules, the union type and its enum variants live inside a module named after the union. Variants are accessed as `Union::Union::VariantName(...)`. A variant's name is its field's name with only the first letter uppercased, as in AOSP's Rust backend: `ns` becomes `Ns`, `nullable_iface` becomes `Nullable_iface`, and `URL` stays `URL`. Two fields whose names differ only in the first letter's case (`foo` and `Foo`) are therefore rejected, as AOSP rejects them.
 
 ```rust
 // Default value is the first field
@@ -154,7 +154,7 @@ let u = Union::Union::S(Union::S1.to_string());
 
 ### Union Tags
 
-Each union has an associated `Tag` type that identifies which variant is currently active. (Like AIDL enums, it is generated as a newtype struct whose variants are exposed as associated constants such as `Union::Tag::n`.) Tags are useful when you need to inspect or communicate which field a union holds without extracting the value itself.
+Each union has an associated `Tag` type that identifies which variant is currently active. (Like AIDL enums, it is generated as a newtype struct whose variants are exposed as associated constants such as `Union::Tag::n`. It is backed by `i32`, or by `i8` in a `@FixedSize` union, as in AOSP.) Tags are useful when you need to inspect or communicate which field a union holds without extracting the value itself.
 
 ```rust
 let result = service.GetUnionTags(&[

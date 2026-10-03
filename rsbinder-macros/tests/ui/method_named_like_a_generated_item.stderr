@@ -1,0 +1,5 @@
+error: method `dump` collides with an item of the generated Rust trait
+ --> tests/ui/method_named_like_a_generated_item.rs:5:8
+  |
+5 |     fn dump(&self) -> rsbinder::BinderResult<String>;
+  |        ^^^^

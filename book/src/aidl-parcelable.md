@@ -299,8 +299,12 @@ The generator rejects, with a diagnostic naming the reason:
   types can't have nested types"); a field could only reach it by a path the
   parameter's name would capture;
 - a parameter named like something the generated Rust spells unqualified: a
-  keyword, `String`, `Vec`, `Option`, a primitive, the `rsbinder` crate, or
-  the parcelable itself (`parcelable R<R>`);
+  keyword, `String`, `Vec`, `Option`, `Box`, `Default`, `core`, `std`, a
+  primitive, the `rsbinder` crate, or the parcelable itself
+  (`parcelable R<R>`). A nested type named `Vec`, `Box`, `Option`, `String`,
+  `Default`, `std` or `rsbinder` is not refused and breaks the generated file
+  instead (see
+  [What the compiler rejects](./aidl-guide.md#what-the-compiler-rejects));
 - an array, a `List` or `void` as a type argument;
 - an annotation on a type argument (`Q<@nullable Elem>`) — as in AOSP,
   `@nullable` belongs to the whole field: `@nullable Q<Elem>`.

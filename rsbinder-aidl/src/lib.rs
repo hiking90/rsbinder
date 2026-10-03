@@ -79,6 +79,13 @@
 //! `boolean`, `char` and constant arrays are deliberate rsbinder extensions,
 //! as `List<int>` is.
 //!
+//! Not checked: a nested type named `Vec`, `Box`, `Option`, `String`,
+//! `Default`, `std` or `rsbinder`. The generated code spells those names
+//! without a path next to the nested type's module, so the name resolves to
+//! the nested type and the generated file fails with a rustc error instead of
+//! an AIDL diagnostic; give the nested type another name. A generic
+//! parcelable's type parameter with such a name is refused.
+//!
 //! # Deprecation
 //!
 //! A `/** @deprecated note */` javadoc block above a declaration, method,
@@ -119,7 +126,7 @@ pub mod render {
     pub use crate::generator::{
         deprecated_attr, function_names, interface_stem, render_enum, render_interface,
         render_parcelable, ConstMember, EnumMember, EnumRender, FnMembers, InterfaceRender,
-        ParcelableMember, ParcelableRender, TransactionWrite,
+        ParcelableMember, ParcelableRender, TransactionWrite, RESERVED_NAME_PREFIX,
     };
 }
 pub use parser::parse_document;

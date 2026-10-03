@@ -1,7 +1,6 @@
 use rsbinder::ServiceSpecificError;
 
-// A binder status carries the code as an i32, so an i64 repr has no wire
-// form: the derive refuses it here rather than truncating it there.
+// A status carries an i32: an i64 repr is refused, not truncated.
 #[derive(ServiceSpecificError)]
 #[repr(i64)]
 pub enum LookupError {

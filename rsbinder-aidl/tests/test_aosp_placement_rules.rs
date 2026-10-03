@@ -330,20 +330,42 @@ union Foo {
 
 #[test]
 fn union_field_whose_variant_is_not_a_rust_identifier_is_rejected() {
-    // The variant is the field's UpperCamel form; none of these is a valid identifier.
-    for (field, variant) in [("SELF", "Self"), ("self_", "Self"), ("_1", "1"), ("__", "")] {
-        assert_error_contains(
-            &format!(
-                r#"
+    // `Self` and `_` are no Rust variant even as `r#`; the parser refuses both field names.
+    for field in ["self", "_"] {
+        let input = format!("package test;\nunion Foo {{\n    int {field};\n    long other;\n}}\n");
+        assert!(run(&input).is_err(), "field '{field}' must be rejected");
+    }
+}
+
+#[test]
+fn union_variant_capitalizes_only_the_first_letter() {
+    // AOSP `GetCapitalizedName` (aidl_language.cpp:998-1003): the rest of the name is kept.
+    let out = generate(
+        r#"
 package test;
-union Foo {{
-    int {field};
-    long other;
-}}
-        "#
-            ),
-            &format!("union 'Foo': field '{field}' maps to the Rust variant '{variant}'"),
-        );
+union Foo {
+    int nullable_iface;
+    int URL;
+    int SELF;
+    int self_;
+    int _1;
+    int __;
+    int my_field;
+    int myField;
+}
+        "#,
+    );
+    for variant in [
+        "r#Nullable_iface(i32)",
+        "r#URL(i32)",
+        "r#SELF(i32)",
+        "r#Self_(i32)",
+        "r#_1(i32)",
+        "r#__(i32)",
+        "r#My_field(i32)",
+        "r#MyField(i32)",
+    ] {
+        assert!(out.contains(variant), "expected `{variant}`, got:\n{out}");
     }
 }
 
@@ -744,19 +766,33 @@ parcelable Foo {
 }
 
 #[test]
-fn a_trailing_line_comment_detaches_the_javadoc() {
-    // AOSP `GetValidComment`: only the *last* comment of the run counts, and only a block one.
+fn every_comment_before_the_item_is_searched() {
+    // AOSP android-14.0.0_r50+ `FindDeprecated`: the first `@deprecated` block of the run wins.
     let out = generate(
         r#"
 package test;
-/** @deprecated ignored */
+/** @deprecated kept */
 // a line comment after the javadoc
 interface IFoo {
-    void go();
+    /** @deprecated old */ // note
+    void a();
+    /** @deprecated first */ /** @deprecated second */
+    void b();
+    /** plain doc */ /** @deprecated later */
+    void c();
+    void d(); // trailing note on d
+    void e();
 }
         "#,
     );
-    assert!(!out.contains("#[deprecated"), "{out}");
+    for note in ["kept", "old", "first", "later"] {
+        assert!(
+            out.contains(&format!("#[deprecated = \"{note}\"]")),
+            "{note}: {out}"
+        );
+    }
+    assert!(!out.contains("second"), "{out}");
+    assert_eq!(out.matches("#[deprecated").count(), 4, "{out}");
 }
 
 #[test]

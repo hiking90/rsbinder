@@ -149,3 +149,11 @@ and loses the length word `.aidl` writes for an out vector. Path qualification
 body lands in a module one level below where you wrote the macro and reaches
 your scope through `use super::*;`, so `super::X` names *that* module — a
 signature meaning the parent has to say `crate::X`.
+
+**Names starting with `__Rsb` are reserved.** The async half declares its type
+parameters and a helper struct (`__RsbPool`, `__RsbService`, `__RsbRuntime`,
+`__RsbAsyncWrapper`) in the scope the signatures resolve in. The macro refuses a
+trait or a bare signature path starting with `__Rsb`; reach such a type through
+`crate::…`. `.aidl` refuses type declaration names with the same prefix. The
+same glob import means a `mod rsbinder` or `use … as rsbinder` in your module
+is what the generated `rsbinder::` paths resolve to.

@@ -140,6 +140,57 @@ fn reject_parenthesized(args: &PathArguments) -> syn::Result<()> {
     Ok(())
 }
 
+/// A signature type naming `__Rsb*` bare would resolve to an item the generated code declares.
+pub fn reject_reserved_names(ty: &Type) -> syn::Result<()> {
+    match unwrap_group(ty) {
+        Type::Reference(r) => reject_reserved_names(&r.elem),
+        Type::Slice(s) => reject_reserved_names(&s.elem),
+        Type::Array(a) => reject_reserved_names(&a.elem),
+        Type::TraitObject(t) => t.bounds.iter().try_for_each(|bound| match bound {
+            syn::TypeParamBound::Trait(b) => reject_reserved_path(&b.path),
+            _ => Ok(()),
+        }),
+        Type::Path(p) => reject_reserved_path(&p.path),
+        _ => Ok(()),
+    }
+}
+
+fn reject_reserved_path(path: &syn::Path) -> syn::Result<()> {
+    if let Some(first) = path
+        .segments
+        .first()
+        .filter(|_| path.leading_colon.is_none())
+    {
+        reject_reserved_ident(&first.ident)?;
+    }
+    path.segments
+        .iter()
+        .try_for_each(|seg| match &seg.arguments {
+            PathArguments::AngleBracketed(args) => args.args.iter().try_for_each(|arg| match arg {
+                GenericArgument::Type(t) => reject_reserved_names(t),
+                _ => Ok(()),
+            }),
+            _ => Ok(()),
+        })
+}
+
+/// The template's own names share the signatures' scope (`RESERVED_NAME_PREFIX`).
+pub(crate) fn reject_reserved_ident(ident: &syn::Ident) -> syn::Result<()> {
+    let name = ident.to_string();
+    let prefix = rsbinder_aidl::render::RESERVED_NAME_PREFIX;
+    if crate::strip_raw(&name).starts_with(prefix) {
+        return Err(syn::Error::new_spanned(
+            ident,
+            format!(
+                "names starting with `{prefix}` are reserved for the code \
+                 #[rsbinder::interface] generates; rename the item or reach it by a path \
+                 that does not start with it (`crate::…`)"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// `self::` names the generated module (one level deeper); `Self` makes the trait non-`dyn`.
 fn reject_self_path(p: &syn::TypePath) -> syn::Result<()> {
     if p.path.leading_colon.is_none() && p.path.segments.first().is_some_and(|s| s.ident == "self")
@@ -649,9 +700,9 @@ pub fn out_default(ty: &Type) -> syn::Result<Option<String>> {
     if !oversized {
         return Ok(None);
     }
-    let mut init = "Default::default()".to_string();
+    let mut init = "::core::default::Default::default()".to_string();
     for _ in 0..dims {
-        init = format!("std::array::from_fn(|_| {init})");
+        init = format!("::core::array::from_fn(|_| {init})");
     }
     Ok(Some(init))
 }
@@ -880,8 +931,6 @@ pub fn check_array_elements(ty: &Type, direction: &str) -> syn::Result<()> {
     if !is_array {
         return Ok(());
     }
-    // A return is `Direction::None`, which `list_type_decl`/`make_fixed_array` render as `in`.
-    let in_like = matches!(direction, "in" | "return");
     let field = direction == "field";
     let (article, label) = match direction {
         "return" => ("a", "returned".to_string()),
@@ -891,14 +940,8 @@ pub fn check_array_elements(ty: &Type, direction: &str) -> syn::Result<()> {
     // Whether `.aidl` wraps each element: `nullable_element`, or `make_fixed_array`'s slots.
     let wraps = if field {
         nullable.is_some() || (fixed && lacks_default(option_inner(elem).unwrap_or(elem)))
-    } else if nullable.is_some() {
-        !(in_like && fixed)
     } else {
-        match direction {
-            "out" => true,
-            "inout" => fixed,
-            _ => false,
-        }
+        nullable.is_some() || direction == "out"
     };
     let Some(under) = option_inner(elem) else {
         if wraps && (is_string(elem) || lacks_default(elem)) {
@@ -929,25 +972,13 @@ pub fn check_array_elements(ty: &Type, direction: &str) -> syn::Result<()> {
     if wraps && (nullable.is_some() || lacks_default(under)) {
         return Ok(());
     }
-    // Only reachable as `in_like && fixed`, the one `@nullable` array that stays bare.
-    if nullable.is_some() {
-        return Err(syn::Error::new_spanned(
-            ty,
-            format!(
-                "a `@nullable` fixed-size {label} array keeps its elements bare — it is the one \
-                 `@nullable` array `.aidl` leaves alone, rendering `@nullable T[N]` as \
-                 `Option<&[T; N]>` (`Option<[T; N]>` for a return); drop the element `Option`"
-            ),
-        ));
-    }
     Err(syn::Error::new_spanned(
         ty,
         format!(
             "{article} {label} array cannot have `Option<_>` elements — `.aidl` gives an element \
-             its own `Option` in a `@nullable` array (except a fixed-size `in` or returned one, \
-             which keeps them bare) and where the slot has no value to start from (an `out` \
-             binder or fd array, a fixed-size `#[inout]` one, or a fixed-size parcelable field \
-             array of a binder or fd); this array is neither, so drop the element `Option`"
+             its own `Option` in a `@nullable` array and where the slot has no value to start \
+             from (an `out` binder or fd array, or a fixed-size parcelable field array of a \
+             binder or fd); this array is neither, so drop the element `Option`"
         ),
     ))
 }
@@ -962,11 +993,8 @@ pub fn check_out_capable(ty: &Type, direction: &str) -> syn::Result<()> {
     } else if is_string(named) {
         "`String`"
     } else {
-        // A fixed-size `inout` array declares each slot the way an `out` one does.
-        let fixed = matches!(inner, Type::Array(_));
-        if (direction == "out" || (direction == "inout" && fixed))
-            && out_array_elem(inner).is_some_and(lacks_default)
-        {
+        // Only `out` starts slots empty; `inout` reads them in, fixed-size or not.
+        if direction == "out" && out_array_elem(inner).is_some_and(lacks_default) {
             return Err(syn::Error::new_spanned(
                 ty,
                 format!(

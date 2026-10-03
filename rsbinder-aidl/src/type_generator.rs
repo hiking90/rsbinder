@@ -40,7 +40,7 @@ fn make_type_error(message: impl Into<String>, span: Option<(usize, usize)>) -> 
 }
 
 thread_local! {
-    // Thread-local like the parser.rs compiler state; only `Generator::new` sets it.
+    // Thread-local like the parser.rs compiler state; only `Generator::declarations` sets it.
     static IS_CRATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -933,17 +933,15 @@ impl TypeGenerator {
                 type_name
             }
         } else {
-            match self.direction {
-                Direction::Out | Direction::Inout => {
-                    if !Self::can_be_defaulted(&array_info.value_type, is_struct) {
-                        format!("Option<{type_name}>")
-                    } else if self.is_nullable {
-                        Self::nullable_element(&array_info.value_type, &type_name)
-                    } else {
-                        type_name
-                    }
-                }
-                _ => type_name,
+            // AOSP `RustNameOf` (aidl_to_rust.cpp:253-276): only `out` elements need `Default`.
+            if matches!(self.direction, Direction::Out)
+                && !Self::can_be_defaulted(&array_info.value_type, is_struct)
+            {
+                format!("Option<{type_name}>")
+            } else if self.is_nullable {
+                Self::nullable_element(&array_info.value_type, &type_name)
+            } else {
+                type_name
             }
         };
 
@@ -1322,11 +1320,13 @@ impl TypeGenerator {
     pub fn transaction_decl(&self, reader: &str) -> String {
         self.check_identifier();
 
+        // Absolute: `#[rsbinder::interface]` renders this under its parent's glob import.
+        const OUT_DEFAULT: &str = "::core::default::Default::default()";
         let (mutable, init) = match self.direction {
             Direction::Out => (
                 "mut ",
-                self.fixed_array_default()
-                    .unwrap_or_else(|| "Default::default()".to_owned()),
+                self.fixed_array_init(OUT_DEFAULT, "::core::array::from_fn")
+                    .unwrap_or_else(|| OUT_DEFAULT.to_owned()),
             ),
             Direction::Inout => ("mut ", format!("{reader}.read()?")),
             _ => ("", format!("{reader}.read()?")),
@@ -1341,6 +1341,11 @@ impl TypeGenerator {
 
     /// `std::array::from_fn` init for a non-nullable array with a dim > 32 (no `Default` impl).
     fn fixed_array_default(&self) -> Option<String> {
+        self.fixed_array_init("Default::default()", "std::array::from_fn")
+    }
+
+    /// `from_fn` once per dimension around `leaf`, spelled by the caller.
+    fn fixed_array_init(&self, leaf: &str, from_fn: &str) -> Option<String> {
         if self.is_nullable {
             return None;
         }
@@ -1348,36 +1353,16 @@ impl TypeGenerator {
         if !info.is_fixed() || info.sizes.iter().all(|&n| n <= 32) {
             return None;
         }
-        let mut init = "Default::default()".to_string();
+        let mut init = leaf.to_string();
         for _ in 0..info.sizes.len() {
-            init = format!("std::array::from_fn(|_| {init})");
+            init = format!("{from_fn}(|_| {init})");
         }
         Some(init)
     }
 
     pub fn default_value(&self) -> String {
-        if let Some(init) = self.fixed_array_default() {
-            return init;
-        }
-        match &self.value_type {
-            ValueType::UserDefined(name) => {
-                match lookup_decl_from_name(name, crate::Namespace::AIDL) {
-                    Some(lookup_decl) => match lookup_decl.decl {
-                        Declaration::Enum(enum_decl) => {
-                            let first = enum_decl.enumerator_list.first().unwrap();
-                            format!(
-                                "{}::{}",
-                                self.make_user_defined_type_name(name, false),
-                                crate::escape_rust_keyword(&first.identifier)
-                            )
-                        }
-                        _ => "Default::default()".to_owned(),
-                    },
-                    None => "Default::default()".to_owned(),
-                }
-            }
-            _ => "Default::default()".to_owned(),
-        }
+        self.fixed_array_default()
+            .unwrap_or_else(|| "Default::default()".to_owned())
     }
 
     fn enum_lookup(&self) -> Option<LookupDecl> {

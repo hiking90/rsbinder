@@ -6,8 +6,6 @@ use std::collections::{HashMap, HashSet};
 
 use crate::error::{pest_error_to_diagnostic, AidlError, ParseError};
 
-use convert_case::{Case, Casing};
-
 use pest::Parser;
 #[derive(pest_derive::Parser)]
 #[grammar = "aidl.pest"]
@@ -149,7 +147,7 @@ pub fn current_source_text() -> String {
 struct CommentSpan {
     start: usize,
     end: usize,
-    /// AOSP reads javadoc tags from block comments only; a trailing `//` detaches the run.
+    /// AOSP reads javadoc tags from block comments only.
     is_block: bool,
 }
 
@@ -205,32 +203,29 @@ fn scan_comments(source: &str) -> Vec<CommentSpan> {
     spans
 }
 
-/// The `@deprecated` note attached to the item starting at byte offset
-/// `start`, or `None` when it is not deprecated. `Some("")` is a bare
-/// `@deprecated` with no note.
-///
-/// Mirrors AOSP `comments.cpp`: only the **last** comment of the run
-/// immediately preceding the item counts, and only when it is a block
-/// comment — so a trailing `//` line detaches the javadoc above it, exactly
-/// as in AOSP. `start` must be the item's first character *including* its
-/// annotations, since the comment precedes those.
+/// First `@deprecated` block in the comment run before `start` (AOSP FindDeprecated, 14.0.0_r50+).
 pub fn deprecated_at(start: usize) -> Option<String> {
-    let span = CURRENT_COMMENTS.with(|spans| {
+    CURRENT_COMMENTS.with(|spans| {
         let spans = spans.borrow();
-        let idx = spans.partition_point(|c| c.end <= start);
-        idx.checked_sub(1).map(|i| spans[i])
-    })?;
-    if !span.is_block {
-        return None;
-    }
-    CURRENT_SOURCE_TEXT.with(|text| {
-        let text = text.borrow();
-        // Anything but whitespace in between means the comment belongs to an earlier item.
-        let gap = text.get(span.end..start)?;
-        if !gap.chars().all(char::is_whitespace) {
-            return None;
-        }
-        find_deprecated(text.get(span.start..span.end)?)
+        CURRENT_SOURCE_TEXT.with(|text| {
+            let text = text.borrow();
+            let end = spans.partition_point(|c| c.end <= start);
+            // Walk back while only whitespace separates a comment from what follows it.
+            let mut first = end;
+            let mut next_start = start;
+            while let Some(span) = first.checked_sub(1).map(|i| spans[i]) {
+                let gap = text.get(span.end..next_start)?;
+                if !gap.chars().all(char::is_whitespace) {
+                    break;
+                }
+                first -= 1;
+                next_start = span.start;
+            }
+            spans[first..end]
+                .iter()
+                .filter(|span| span.is_block)
+                .find_map(|span| find_deprecated(text.get(span.start..span.end)?))
+        })
     })
 }
 
@@ -855,6 +850,27 @@ fn reject_qualified_type_name(name: &str, span: &pest::Span<'_>) -> Result<(), A
     ))
 }
 
+// The interface template declares `__Rsb*` names where signatures resolve (`RESERVED_NAME_PREFIX`).
+fn reject_reserved_type_name(
+    name: &str,
+    role: &str,
+    span: &pest::Span<'_>,
+) -> Result<(), AidlError> {
+    let simple = name.rsplit('.').next().unwrap_or(name);
+    if !simple.starts_with(crate::generator::RESERVED_NAME_PREFIX) {
+        return Ok(());
+    }
+    Err(make_parse_error(
+        format!(
+            "{role} '{simple}' starts with '{}', which is reserved for names the generated \
+             code declares",
+            crate::generator::RESERVED_NAME_PREFIX
+        ),
+        span.start(),
+        span.end(),
+    ))
+}
+
 // `self`/`Self`/`super`/`crate`/`_` cannot be raw identifiers, so no generated name can carry them.
 fn reject_unrepresentable_identifier(
     ident: &str,
@@ -1056,8 +1072,13 @@ impl VariableDecl {
         self.identifier.to_owned()
     }
 
+    /// Union variant: first letter uppercased (AOSP GetCapitalizedName, aidl_language.cpp:998).
     pub fn union_identifier(&self) -> String {
-        self.identifier.to_case(Case::UpperCamel)
+        let mut name = self.identifier.clone();
+        if let Some(first) = name.get_mut(..1) {
+            first.make_ascii_uppercase();
+        }
+        name
     }
 
     pub fn member_init(&self) -> String {
@@ -1755,8 +1776,8 @@ fn parse_intvalue(arg_value: &str, span: (usize, usize)) -> Result<ConstExpr, Ai
         value
     };
 
-    // Explicit u32 / u64 suffixes pin the target size regardless of radix.
-    if is_u32 {
+    // AOSP ParseIntegral: u32/u64 pin the size for decimal only; hex ignores them below.
+    if is_u32 && radix == 10 {
         let parsed_value = u32::from_str_radix(value, radix).map_err(|err| {
             make_parse_error(
                 format!("invalid u32 literal '{arg_value}': {err}"),
@@ -1766,7 +1787,7 @@ fn parse_intvalue(arg_value: &str, span: (usize, usize)) -> Result<ConstExpr, Ai
         })?;
         return Ok(ConstExpr::new(ValueType::Int32(parsed_value as i32 as _)));
     }
-    if is_u64 {
+    if is_u64 && radix == 10 {
         let parsed_value = u64::from_str_radix(value, radix).map_err(|err| {
             make_parse_error(
                 format!("invalid u64 literal '{arg_value}': {err}"),
@@ -2514,6 +2535,7 @@ fn parse_interface_decl(
             Rule::qualified_name => {
                 let span = pair.as_span();
                 reject_unrepresentable_identifier(pair.as_str(), "interface name", &span)?;
+                reject_reserved_type_name(pair.as_str(), "interface name", &span)?;
                 reject_qualified_type_name(pair.as_str(), &span)?;
                 interface.name = pair.as_str().into();
                 interface.name_span = Some((span.start(), span.end()));
@@ -2698,6 +2720,7 @@ fn parse_parcelable_decl(
             Rule::qualified_name => {
                 let span = pair.as_span();
                 reject_unrepresentable_identifier(pair.as_str(), "parcelable name", &span)?;
+                reject_reserved_type_name(pair.as_str(), "parcelable name", &span)?;
                 if !is_unstructured {
                     reject_qualified_type_name(pair.as_str(), &span)?;
                 }
@@ -2814,6 +2837,7 @@ fn parse_enum_decl(
             Rule::qualified_name => {
                 let span = pair.as_span();
                 reject_unrepresentable_identifier(pair.as_str(), "enum name", &span)?;
+                reject_reserved_type_name(pair.as_str(), "enum name", &span)?;
                 reject_qualified_type_name(pair.as_str(), &span)?;
                 enum_decl.name = pair.as_str().into();
                 enum_decl.name_span = Some((span.start(), span.end()));
@@ -2856,6 +2880,7 @@ fn parse_union_decl(
             Rule::qualified_name => {
                 let span = pair.as_span();
                 reject_unrepresentable_identifier(pair.as_str(), "union name", &span)?;
+                reject_reserved_type_name(pair.as_str(), "union name", &span)?;
                 reject_qualified_type_name(pair.as_str(), &span)?;
                 union_decl.name = pair.as_str().into();
                 union_decl.name_span = Some((span.start(), span.end()));
@@ -2979,7 +3004,11 @@ impl NestingLimit {
     pub fn describe(self) -> &'static str {
         match self {
             NestingLimit::Bracket => "brackets are nested too deeply",
-            NestingLimit::Generic => "generic types are nested too deeply",
+            // The scan cannot tell `a < b` from an unclosed `List<b` until a `>` or `;`.
+            NestingLimit::Generic => {
+                "generic types are nested too deeply, or one statement has too many `<` \
+                 before a name (a comparison counts)"
+            }
             NestingLimit::OperatorRun => "too many operators in one expression",
         }
     }
@@ -3364,6 +3393,25 @@ mod tests {
         );
         assert_eq!(parse_intvalue("10u32", (0, 0))?.value, ValueType::Int32(10));
         assert_eq!(parse_intvalue("10u64", (0, 0))?.value, ValueType::Int64(10));
+        Ok(())
+    }
+
+    #[test]
+    fn test_hex_unsigned_suffix_follows_aosp_parse_integral() -> Result<(), Box<dyn Error>> {
+        // AOSP ParseIntegral: hex tries u32 (as INT32) then u64 unless suffixed u8 or l/L.
+        assert_eq!(
+            parse_intvalue("0xFFFFFFFFu64", (0, 0))?.value,
+            ValueType::Int32(-1)
+        );
+        assert_eq!(parse_intvalue("0x1u64", (0, 0))?.value, ValueType::Int32(1));
+        assert_eq!(
+            parse_intvalue("0x1FFFFFFFFu32", (0, 0))?.value,
+            ValueType::Int64(0x1FFFFFFFF)
+        );
+        assert_eq!(
+            parse_intvalue("0xFFFFFFFFL", (0, 0))?.value,
+            ValueType::Int64(0xFFFFFFFF)
+        );
         Ok(())
     }
 

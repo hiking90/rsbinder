@@ -347,19 +347,15 @@ fn fixed_elem(shape: &Shape, place: Place, user_is_enum: bool, elem: &str) -> St
             (shape.nullable && shape.kind.is_aidl_nullable(user_is_enum))
                 || !shape.kind.can_be_defaulted()
         }
-        Place::Out | Place::Inout => {
-            if !shape.kind.can_be_defaulted() {
-                true
+        // Only `out` elements need `Default`; `@nullable` wraps in every other place.
+        Place::Out if !shape.kind.can_be_defaulted() => true,
+        _ => {
+            return if shape.nullable {
+                nullable_element(shape, user_is_enum, elem)
             } else {
-                return if shape.nullable {
-                    nullable_element(shape, user_is_enum, elem)
-                } else {
-                    elem.to_string()
-                };
-            }
+                elem.to_string()
+            };
         }
-        // `in` and a return leave a fixed array's elements alone.
-        _ => false,
     };
     if wrapped {
         format!("Option<{elem}>")

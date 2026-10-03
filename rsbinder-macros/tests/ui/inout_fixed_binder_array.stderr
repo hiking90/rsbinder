@@ -1,5 +1,5 @@
-error: an `inout` array of this type needs `Option<_>` elements — the callee has no value to start each one from, so that is what `.aidl` renders
+error: an `inout` array cannot have `Option<_>` elements — `.aidl` gives an element its own `Option` in a `@nullable` array and where the slot has no value to start from (an `out` binder or fd array, or a fixed-size parcelable field array of a binder or fd); this array is neither, so drop the element `Option`
  --> tests/ui/inout_fixed_binder_array.rs:5:29
   |
-5 |     fn f(&self, #[inout] v: &mut [rsbinder::ParcelFileDescriptor; 3])
-  |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+5 |     fn f(&self, #[inout] v: &mut [Option<rsbinder::ParcelFileDescriptor>; 3])
+  |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

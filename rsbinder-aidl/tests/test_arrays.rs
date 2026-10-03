@@ -41,27 +41,27 @@ parcelable StructuredParcelable {
         r##"
 pub mod ITestService {
     #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
-    pub trait ITestService: rsbinder::Interface + Send {
+    pub trait ITestService: rsbinder::Interface + ::core::marker::Send {
         fn descriptor() -> &'static str where Self: Sized { "android.aidl.fixedsizearray.ITestService" }
         fn r#ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>) -> rsbinder::BinderResult<Vec<bool>>;
         fn r#RepeatNullableIntArray(&self, _arg_input: Option<&[i32]>) -> rsbinder::BinderResult<Option<Vec<i32>>>;
         fn r#FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable) -> rsbinder::BinderResult<()>;
-        fn getDefaultImpl() -> Option<ITestServiceDefaultRef> where Self: Sized {
+        fn getDefaultImpl() -> ::core::option::Option<ITestServiceDefaultRef> where Self: Sized {
             DEFAULT_IMPL.get().cloned()
         }
         fn setDefaultImpl(d: ITestServiceDefaultRef) -> ITestServiceDefaultRef where Self: Sized {
             DEFAULT_IMPL.get_or_init(|| d).clone()
         }
     }
-    pub trait ITestServiceDefault: Send + Sync {
+    pub trait ITestServiceDefault: ::core::marker::Send + ::core::marker::Sync {
         fn r#ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>) -> rsbinder::BinderResult<Vec<bool>> {
-            Err(rsbinder::StatusCode::UnknownTransaction.into())
+            ::core::result::Result::Err(rsbinder::StatusCode::UnknownTransaction.into())
         }
         fn r#RepeatNullableIntArray(&self, _arg_input: Option<&[i32]>) -> rsbinder::BinderResult<Option<Vec<i32>>> {
-            Err(rsbinder::StatusCode::UnknownTransaction.into())
+            ::core::result::Result::Err(rsbinder::StatusCode::UnknownTransaction.into())
         }
         fn r#FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable) -> rsbinder::BinderResult<()> {
-            Err(rsbinder::StatusCode::UnknownTransaction.into())
+            ::core::result::Result::Err(rsbinder::StatusCode::UnknownTransaction.into())
         }
     }
     pub(crate) mod transactions {
@@ -69,8 +69,8 @@ pub mod ITestService {
         pub(crate) const r#RepeatNullableIntArray: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 1;
         pub(crate) const r#FillOutStructuredParcelable: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 2;
     }
-    pub type ITestServiceDefaultRef = std::sync::Arc<dyn ITestServiceDefault>;
-    static DEFAULT_IMPL: std::sync::OnceLock<ITestServiceDefaultRef> = std::sync::OnceLock::new();
+    pub type ITestServiceDefaultRef = ::std::sync::Arc<dyn ITestServiceDefault>;
+    static DEFAULT_IMPL: ::std::sync::OnceLock<ITestServiceDefaultRef> = ::std::sync::OnceLock::new();
     rsbinder::declare_binder_interface! {
         ITestService["android.aidl.fixedsizearray.ITestService"] {
             native: {
@@ -83,55 +83,55 @@ pub mod ITestService {
         fn build_parcel_ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>) -> rsbinder::Result<rsbinder::Parcel> {
             let mut data = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.prepare_transact(true)?;
             data.write(_arg_input)?;
-            data.write_slice_size(Some(_arg_repeated))?;
-            Ok(data)
+            data.write_slice_size(::core::option::Option::Some(_arg_repeated))?;
+            ::core::result::Result::Ok(data)
         }
-        fn read_response_ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>, _aidl_reply: rsbinder::Result<Option<rsbinder::Parcel>>) -> rsbinder::BinderResult<Vec<bool>> {
-            if let Err(rsbinder::StatusCode::UnknownTransaction) = _aidl_reply {
-                if let Some(_aidl_default_impl) = <Self as ITestService>::getDefaultImpl() {
+        fn read_response_ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>, _aidl_reply: rsbinder::Result<::core::option::Option<rsbinder::Parcel>>) -> rsbinder::BinderResult<Vec<bool>> {
+            if let ::core::result::Result::Err(rsbinder::StatusCode::UnknownTransaction) = _aidl_reply {
+                if let ::core::option::Option::Some(_aidl_default_impl) = <Self as ITestService>::getDefaultImpl() {
                   return _aidl_default_impl.r#ReverseBoolean(_arg_input, _arg_repeated);
                 }
             }
             let mut _aidl_reply = _aidl_reply?.ok_or(rsbinder::StatusCode::UnexpectedNull)?;
             let _status = _aidl_reply.read::<rsbinder::Status>()?;
-            if !_status.is_ok() { return Err(_status); }
+            if !_status.is_ok() { return ::core::result::Result::Err(_status); }
             let _aidl_return: Vec<bool> = _aidl_reply.read()?;
             _aidl_reply.read_onto(_arg_repeated)?;
-            Ok(_aidl_return)
+            ::core::result::Result::Ok(_aidl_return)
         }
         fn build_parcel_RepeatNullableIntArray(&self, _arg_input: Option<&[i32]>) -> rsbinder::Result<rsbinder::Parcel> {
             let mut data = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.prepare_transact(true)?;
             data.write(&_arg_input)?;
-            Ok(data)
+            ::core::result::Result::Ok(data)
         }
-        fn read_response_RepeatNullableIntArray(&self, _arg_input: Option<&[i32]>, _aidl_reply: rsbinder::Result<Option<rsbinder::Parcel>>) -> rsbinder::BinderResult<Option<Vec<i32>>> {
-            if let Err(rsbinder::StatusCode::UnknownTransaction) = _aidl_reply {
-                if let Some(_aidl_default_impl) = <Self as ITestService>::getDefaultImpl() {
+        fn read_response_RepeatNullableIntArray(&self, _arg_input: Option<&[i32]>, _aidl_reply: rsbinder::Result<::core::option::Option<rsbinder::Parcel>>) -> rsbinder::BinderResult<Option<Vec<i32>>> {
+            if let ::core::result::Result::Err(rsbinder::StatusCode::UnknownTransaction) = _aidl_reply {
+                if let ::core::option::Option::Some(_aidl_default_impl) = <Self as ITestService>::getDefaultImpl() {
                   return _aidl_default_impl.r#RepeatNullableIntArray(_arg_input);
                 }
             }
             let mut _aidl_reply = _aidl_reply?.ok_or(rsbinder::StatusCode::UnexpectedNull)?;
             let _status = _aidl_reply.read::<rsbinder::Status>()?;
-            if !_status.is_ok() { return Err(_status); }
+            if !_status.is_ok() { return ::core::result::Result::Err(_status); }
             let _aidl_return: Option<Vec<i32>> = _aidl_reply.read()?;
-            Ok(_aidl_return)
+            ::core::result::Result::Ok(_aidl_return)
         }
         fn build_parcel_FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable) -> rsbinder::Result<rsbinder::Parcel> {
             let mut data = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.prepare_transact(true)?;
             data.write(_arg_parcel)?;
-            Ok(data)
+            ::core::result::Result::Ok(data)
         }
-        fn read_response_FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable, _aidl_reply: rsbinder::Result<Option<rsbinder::Parcel>>) -> rsbinder::BinderResult<()> {
-            if let Err(rsbinder::StatusCode::UnknownTransaction) = _aidl_reply {
-                if let Some(_aidl_default_impl) = <Self as ITestService>::getDefaultImpl() {
+        fn read_response_FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable, _aidl_reply: rsbinder::Result<::core::option::Option<rsbinder::Parcel>>) -> rsbinder::BinderResult<()> {
+            if let ::core::result::Result::Err(rsbinder::StatusCode::UnknownTransaction) = _aidl_reply {
+                if let ::core::option::Option::Some(_aidl_default_impl) = <Self as ITestService>::getDefaultImpl() {
                   return _aidl_default_impl.r#FillOutStructuredParcelable(_arg_parcel);
                 }
             }
             let mut _aidl_reply = _aidl_reply?.ok_or(rsbinder::StatusCode::UnexpectedNull)?;
             let _status = _aidl_reply.read::<rsbinder::Status>()?;
-            if !_status.is_ok() { return Err(_status); }
+            if !_status.is_ok() { return ::core::result::Result::Err(_status); }
             _aidl_reply.read_onto(_arg_parcel)?;
-            Ok(())
+            ::core::result::Result::Ok(())
         }
     }
     impl ITestService for BpTestService {
@@ -184,50 +184,50 @@ pub mod ITestService {
         match _code {
             transactions::r#ReverseBoolean => {
                 let _arg_input: Vec<bool> = _reader.read()?;
-                let mut _arg_repeated: Vec<bool> = Default::default();
+                let mut _arg_repeated: Vec<bool> = ::core::default::Default::default();
                 _reader.resize_out_vec(&mut _arg_repeated)?;
                 let _aidl_return = _service.r#ReverseBoolean(&_arg_input, &mut _arg_repeated);
                 match &_aidl_return {
-                    Ok(_aidl_return) => {
+                    ::core::result::Result::Ok(_aidl_return) => {
                         _reply.write(&rsbinder::Status::from(rsbinder::StatusCode::Ok))?;
                         _reply.write(_aidl_return)?;
                         _reply.write(&_arg_repeated)?;
                     }
-                    Err(_aidl_status) => {
+                    ::core::result::Result::Err(_aidl_status) => {
                         _reply.write(_aidl_status)?;
                     }
                 }
-                Ok(())
+                ::core::result::Result::Ok(())
             }
             transactions::r#RepeatNullableIntArray => {
                 let _arg_input: Option<Vec<i32>> = _reader.read()?;
                 let _aidl_return = _service.r#RepeatNullableIntArray(_arg_input.as_deref());
                 match &_aidl_return {
-                    Ok(_aidl_return) => {
+                    ::core::result::Result::Ok(_aidl_return) => {
                         _reply.write(&rsbinder::Status::from(rsbinder::StatusCode::Ok))?;
                         _reply.write(_aidl_return)?;
                     }
-                    Err(_aidl_status) => {
+                    ::core::result::Result::Err(_aidl_status) => {
                         _reply.write(_aidl_status)?;
                     }
                 }
-                Ok(())
+                ::core::result::Result::Ok(())
             }
             transactions::r#FillOutStructuredParcelable => {
                 let mut _arg_parcel: super::StructuredParcelable::StructuredParcelable = _reader.read()?;
                 let _aidl_return = _service.r#FillOutStructuredParcelable(&mut _arg_parcel);
                 match &_aidl_return {
-                    Ok(_aidl_return) => {
+                    ::core::result::Result::Ok(_aidl_return) => {
                         _reply.write(&rsbinder::Status::from(rsbinder::StatusCode::Ok))?;
                         _reply.write(&_arg_parcel)?;
                     }
-                    Err(_aidl_status) => {
+                    ::core::result::Result::Err(_aidl_status) => {
                         _reply.write(_aidl_status)?;
                     }
                 }
-                Ok(())
+                ::core::result::Result::Ok(())
             }
-            _ => Err(rsbinder::StatusCode::UnknownTransaction),
+            _ => ::core::result::Result::Err(rsbinder::StatusCode::UnknownTransaction),
         }
     }
 }
@@ -248,14 +248,14 @@ pub mod StructuredParcelable {
         fn write_to_parcel(&self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
             _parcel.sized_write(|_sub_parcel| {
                 _sub_parcel.write(&self.r#value)?;
-                Ok(())
+                ::core::result::Result::Ok(())
             })
         }
         fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
             _parcel.sized_read(|_sub_parcel| {
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#value = _sub_parcel.read()?;
-                Ok(())
+                ::core::result::Result::Ok(())
             })
         }
     }
@@ -325,20 +325,20 @@ pub mod FixedSizeArrayExample {
                 _sub_parcel.write(&self.r#stringNullableMatrix)?;
                 _sub_parcel.write(&self.r#byteEnumNullableMatrix)?;
                 _sub_parcel.write(&self.r#interfaceNullableMatrix)?;
-                Ok(())
+                ::core::result::Result::Ok(())
             })
         }
         fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
             _parcel.sized_read(|_sub_parcel| {
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#int2x3 = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#stringNullableMatrix = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#byteEnumNullableMatrix = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#interfaceNullableMatrix = _sub_parcel.read()?;
-                Ok(())
+                ::core::result::Result::Ok(())
             })
         }
     }
@@ -349,26 +349,26 @@ pub mod FixedSizeArrayExample {
     }
     pub mod IRepeatFixedSizeArray {
         #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
-        pub trait IRepeatFixedSizeArray: rsbinder::Interface + Send {
+        pub trait IRepeatFixedSizeArray: rsbinder::Interface + ::core::marker::Send {
             fn descriptor() -> &'static str where Self: Sized { "android.aidl.fixedsizearray.FixedSizeArrayExample.IRepeatFixedSizeArray" }
             fn r#Repeat2dParcelables(&self, _arg_input: &[[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &mut [[super::IntParcelable::IntParcelable; 3]; 2]) -> rsbinder::BinderResult<[[super::IntParcelable::IntParcelable; 3]; 2]>;
-            fn getDefaultImpl() -> Option<IRepeatFixedSizeArrayDefaultRef> where Self: Sized {
+            fn getDefaultImpl() -> ::core::option::Option<IRepeatFixedSizeArrayDefaultRef> where Self: Sized {
                 DEFAULT_IMPL.get().cloned()
             }
             fn setDefaultImpl(d: IRepeatFixedSizeArrayDefaultRef) -> IRepeatFixedSizeArrayDefaultRef where Self: Sized {
                 DEFAULT_IMPL.get_or_init(|| d).clone()
             }
         }
-        pub trait IRepeatFixedSizeArrayDefault: Send + Sync {
+        pub trait IRepeatFixedSizeArrayDefault: ::core::marker::Send + ::core::marker::Sync {
             fn r#Repeat2dParcelables(&self, _arg_input: &[[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &mut [[super::IntParcelable::IntParcelable; 3]; 2]) -> rsbinder::BinderResult<[[super::IntParcelable::IntParcelable; 3]; 2]> {
-                Err(rsbinder::StatusCode::UnknownTransaction.into())
+                ::core::result::Result::Err(rsbinder::StatusCode::UnknownTransaction.into())
             }
         }
         pub(crate) mod transactions {
             pub(crate) const r#Repeat2dParcelables: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 0;
         }
-        pub type IRepeatFixedSizeArrayDefaultRef = std::sync::Arc<dyn IRepeatFixedSizeArrayDefault>;
-        static DEFAULT_IMPL: std::sync::OnceLock<IRepeatFixedSizeArrayDefaultRef> = std::sync::OnceLock::new();
+        pub type IRepeatFixedSizeArrayDefaultRef = ::std::sync::Arc<dyn IRepeatFixedSizeArrayDefault>;
+        static DEFAULT_IMPL: ::std::sync::OnceLock<IRepeatFixedSizeArrayDefaultRef> = ::std::sync::OnceLock::new();
         rsbinder::declare_binder_interface! {
             IRepeatFixedSizeArray["android.aidl.fixedsizearray.FixedSizeArrayExample.IRepeatFixedSizeArray"] {
                 native: {
@@ -381,20 +381,20 @@ pub mod FixedSizeArrayExample {
             fn build_parcel_Repeat2dParcelables(&self, _arg_input: &[[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &mut [[super::IntParcelable::IntParcelable; 3]; 2]) -> rsbinder::Result<rsbinder::Parcel> {
                 let mut data = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.prepare_transact(true)?;
                 data.write(_arg_input)?;
-                Ok(data)
+                ::core::result::Result::Ok(data)
             }
-            fn read_response_Repeat2dParcelables(&self, _arg_input: &[[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &mut [[super::IntParcelable::IntParcelable; 3]; 2], _aidl_reply: rsbinder::Result<Option<rsbinder::Parcel>>) -> rsbinder::BinderResult<[[super::IntParcelable::IntParcelable; 3]; 2]> {
-                if let Err(rsbinder::StatusCode::UnknownTransaction) = _aidl_reply {
-                    if let Some(_aidl_default_impl) = <Self as IRepeatFixedSizeArray>::getDefaultImpl() {
+            fn read_response_Repeat2dParcelables(&self, _arg_input: &[[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &mut [[super::IntParcelable::IntParcelable; 3]; 2], _aidl_reply: rsbinder::Result<::core::option::Option<rsbinder::Parcel>>) -> rsbinder::BinderResult<[[super::IntParcelable::IntParcelable; 3]; 2]> {
+                if let ::core::result::Result::Err(rsbinder::StatusCode::UnknownTransaction) = _aidl_reply {
+                    if let ::core::option::Option::Some(_aidl_default_impl) = <Self as IRepeatFixedSizeArray>::getDefaultImpl() {
                       return _aidl_default_impl.r#Repeat2dParcelables(_arg_input, _arg_repeated);
                     }
                 }
                 let mut _aidl_reply = _aidl_reply?.ok_or(rsbinder::StatusCode::UnexpectedNull)?;
                 let _status = _aidl_reply.read::<rsbinder::Status>()?;
-                if !_status.is_ok() { return Err(_status); }
+                if !_status.is_ok() { return ::core::result::Result::Err(_status); }
                 let _aidl_return: [[super::IntParcelable::IntParcelable; 3]; 2] = _aidl_reply.read()?;
                 _aidl_reply.read_onto(_arg_repeated)?;
-                Ok(_aidl_return)
+                ::core::result::Result::Ok(_aidl_return)
             }
         }
         impl IRepeatFixedSizeArray for BpRepeatFixedSizeArray {
@@ -425,21 +425,21 @@ pub mod FixedSizeArrayExample {
             match _code {
                 transactions::r#Repeat2dParcelables => {
                     let _arg_input: [[super::IntParcelable::IntParcelable; 3]; 2] = _reader.read()?;
-                    let mut _arg_repeated: [[super::IntParcelable::IntParcelable; 3]; 2] = Default::default();
+                    let mut _arg_repeated: [[super::IntParcelable::IntParcelable; 3]; 2] = ::core::default::Default::default();
                     let _aidl_return = _service.r#Repeat2dParcelables(&_arg_input, &mut _arg_repeated);
                     match &_aidl_return {
-                        Ok(_aidl_return) => {
+                        ::core::result::Result::Ok(_aidl_return) => {
                             _reply.write(&rsbinder::Status::from(rsbinder::StatusCode::Ok))?;
                             _reply.write(_aidl_return)?;
                             _reply.write(&_arg_repeated)?;
                         }
-                        Err(_aidl_status) => {
+                        ::core::result::Result::Err(_aidl_status) => {
                             _reply.write(_aidl_status)?;
                         }
                     }
-                    Ok(())
+                    ::core::result::Result::Ok(())
                 }
-                _ => Err(rsbinder::StatusCode::UnknownTransaction),
+                _ => ::core::result::Result::Err(rsbinder::StatusCode::UnknownTransaction),
             }
         }
     }
@@ -469,14 +469,14 @@ pub mod FixedSizeArrayExample {
             fn write_to_parcel(&self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
                 _parcel.sized_write(|_sub_parcel| {
                     _sub_parcel.write(&self.r#value)?;
-                    Ok(())
+                    ::core::result::Result::Ok(())
                 })
             }
             fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
                 _parcel.sized_read(|_sub_parcel| {
-                    if !_sub_parcel.has_more_data() { return Ok(()); }
+                    if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                     self.r#value = _sub_parcel.read()?;
-                    Ok(())
+                    ::core::result::Result::Ok(())
                 })
             }
         }
@@ -488,21 +488,21 @@ pub mod FixedSizeArrayExample {
     }
     pub mod IEmptyInterface {
         #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
-        pub trait IEmptyInterface: rsbinder::Interface + Send {
+        pub trait IEmptyInterface: rsbinder::Interface + ::core::marker::Send {
             fn descriptor() -> &'static str where Self: Sized { "android.aidl.fixedsizearray.FixedSizeArrayExample.IEmptyInterface" }
-            fn getDefaultImpl() -> Option<IEmptyInterfaceDefaultRef> where Self: Sized {
+            fn getDefaultImpl() -> ::core::option::Option<IEmptyInterfaceDefaultRef> where Self: Sized {
                 DEFAULT_IMPL.get().cloned()
             }
             fn setDefaultImpl(d: IEmptyInterfaceDefaultRef) -> IEmptyInterfaceDefaultRef where Self: Sized {
                 DEFAULT_IMPL.get_or_init(|| d).clone()
             }
         }
-        pub trait IEmptyInterfaceDefault: Send + Sync {
+        pub trait IEmptyInterfaceDefault: ::core::marker::Send + ::core::marker::Sync {
         }
         pub(crate) mod transactions {
         }
-        pub type IEmptyInterfaceDefaultRef = std::sync::Arc<dyn IEmptyInterfaceDefault>;
-        static DEFAULT_IMPL: std::sync::OnceLock<IEmptyInterfaceDefaultRef> = std::sync::OnceLock::new();
+        pub type IEmptyInterfaceDefaultRef = ::std::sync::Arc<dyn IEmptyInterfaceDefault>;
+        static DEFAULT_IMPL: ::std::sync::OnceLock<IEmptyInterfaceDefaultRef> = ::std::sync::OnceLock::new();
         rsbinder::declare_binder_interface! {
             IEmptyInterface["android.aidl.fixedsizearray.FixedSizeArrayExample.IEmptyInterface"] {
                 native: {
@@ -528,7 +528,7 @@ pub mod FixedSizeArrayExample {
         fn on_transact(
             _service: &dyn IEmptyInterface, _code: rsbinder::TransactionCode, _reader: &mut rsbinder::Parcel, _reply: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
             match _code {
-                _ => Err(rsbinder::StatusCode::UnknownTransaction),
+                _ => ::core::result::Result::Err(rsbinder::StatusCode::UnknownTransaction),
             }
         }
     }

@@ -7,7 +7,7 @@ pub trait IBad {
 
 #[interface]
 pub trait IAlsoBad {
-    fn f(&self, v: Option<&[Option<rsbinder::ParcelFileDescriptor>; 3]>)
+    fn f(&self, v: Option<&[rsbinder::ParcelFileDescriptor; 3]>)
         -> rsbinder::BinderResult<()>;
 }
 

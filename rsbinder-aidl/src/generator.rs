@@ -33,7 +33,7 @@ pub mod {{mod}} {
 
 const UNION_TEMPLATE: &str = r#"
 pub mod {{mod}} {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, non_camel_case_types, dead_code, deprecated)]
     #[derive(Debug)]
     {%- if derive|length > 0 %}
     #[derive({{ derive }})]
@@ -107,7 +107,7 @@ pub mod {{mod}} {
         {%- endif %}
     }
     {{crate}}::declare_binder_enum! {
-        Tag : [i32; {{ members|length }}] {
+        Tag : [{{ tag_backing }}; {{ members|length }}] {
     {%- set counter = 0 %}
     {%- for member in members %}
             r#{{ member.2 }} = {{ counter }},
@@ -183,23 +183,23 @@ pub mod {{mod}} {
                 _sub_parcel.write(&self.r#{{ member.identifier }})?;
                 {%- endif %}
                 {%- endfor %}
-                Ok(())
+                ::core::result::Result::Ok(())
             })
         }
         fn read_from_parcel(&mut self, _parcel: &mut {{crate}}::Parcel) -> {{crate}}::Result<()> {
             _parcel.sized_read(|_sub_parcel| {
                 {%- for member in members %}
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 {%- if member.is_holder %}
                 _sub_parcel.read_onto(&mut self.r#{{ member.identifier }})?;
                 {%- else %}
                 self.r#{{ member.identifier }} = _sub_parcel.read()?;
                 {%- if member.needs_unexpected_null %}
-                if self.r#{{ member.identifier }}.is_none() { return Err({{crate}}::StatusCode::UnexpectedNull); }
+                if self.r#{{ member.identifier }}.is_none() { return ::core::result::Result::Err({{crate}}::StatusCode::UnexpectedNull); }
                 {%- endif %}
                 {%- endif %}
                 {%- endfor %}
-                Ok(())
+                ::core::result::Result::Ok(())
             })
         }
     }
@@ -241,7 +241,7 @@ pub mod {{mod}} {
     {%- if deprecated %}
     {{ deprecated }}
     {%- endif %}
-    pub trait {{name}}: {{crate}}::Interface + Send {
+    pub trait {{name}}: {{crate}}::Interface + ::core::marker::Send {
         fn descriptor() -> &'static str where Self: Sized { "{{ namespace }}" }
         {%- for member in fn_members %}
         {%- if member.deprecated %}
@@ -250,18 +250,17 @@ pub mod {{mod}} {
         fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::BinderResult<{{ member.return_type }}>;
         {%- endfor %}
         {%- if version is number %}
-        // Server-side default returns the module's VERSION constant.
-        // `{{bp_name}}` overrides this with a cache+transact pattern.
+        // Local default; `{{bp_name}}` overrides it with a cached transact.
         fn r#getInterfaceVersion(&self) -> {{crate}}::BinderResult<i32> {
-            Ok(VERSION)
+            ::core::result::Result::Ok(VERSION)
         }
         {%- endif %}
         {%- if hash %}
-        fn r#getInterfaceHash(&self) -> {{crate}}::BinderResult<String> {
-            Ok(HASH.into())
+        fn r#getInterfaceHash(&self) -> {{crate}}::BinderResult<::std::string::String> {
+            ::core::result::Result::Ok(HASH.into())
         }
         {%- endif %}
-        fn getDefaultImpl() -> Option<{{ name }}DefaultRef> where Self: Sized {
+        fn getDefaultImpl() -> ::core::option::Option<{{ name }}DefaultRef> where Self: Sized {
             DEFAULT_IMPL.get().cloned()
         }
         fn setDefaultImpl(d: {{ name }}DefaultRef) -> {{ name }}DefaultRef where Self: Sized {
@@ -269,19 +268,19 @@ pub mod {{mod}} {
         }
     }
     {%- if enabled_async %}
-    /// Asynchronous **client** view of `{{name}}` (`.await`-able methods).
-    ///
-    /// `P` selects the async pool that drives the underlying blocking transact;
-    /// with the default `tokio` feature use `rsbinder::Tokio`. Obtain a handle by
-    /// upgrading a sync proxy with `Strong::into_async::<rsbinder::Tokio>()`, or
-    /// directly via `rsbinder::get_interface_async::<dyn {{name}}Async<rsbinder::Tokio>>(name).await`.
-    /// A `type {{name}}AsyncTokio = dyn {{name}}Async<rsbinder::Tokio>;` alias is a
-    /// handy way to avoid repeating the `<P>` turbofish. Requires the `async` (and,
-    /// for `Tokio`, `tokio`) feature.
     {%- if deprecated %}
     {{ deprecated }}
     {%- endif %}
-    pub trait {{name}}Async<P>: {{crate}}::Interface + Send {
+    /// Asynchronous **client** view of `{{name}}` (`.await`-able methods).
+    ///
+    /// The type parameter selects the async pool that drives the underlying blocking
+    /// transact; with the default `tokio` feature use `rsbinder::Tokio`. Obtain a handle by
+    /// upgrading a sync proxy with `Strong::into_async::<rsbinder::Tokio>()`, or
+    /// directly via `rsbinder::get_interface_async::<dyn {{name}}Async<rsbinder::Tokio>>(name).await`.
+    /// A `type {{name}}AsyncTokio = dyn {{name}}Async<rsbinder::Tokio>;` alias is a
+    /// handy way to avoid repeating the turbofish. Requires the `async` (and,
+    /// for `Tokio`, `tokio`) feature.
+    pub trait {{name}}Async<__RsbPool>: {{crate}}::Interface + ::core::marker::Send {
         fn descriptor() -> &'static str where Self: Sized { "{{ namespace }}" }
         {%- for member in fn_members %}
         {%- if member.deprecated %}
@@ -290,16 +289,14 @@ pub mod {{mod}} {
         fn r#{{ member.identifier }}<'a>({{ member.args_async }}) -> {{crate}}::BoxFuture<'a, {{crate}}::BinderResult<{{ member.return_type }}>>;
         {%- endfor %}
         {%- if version is number %}
-        // Default returns the module's VERSION constant (correct for a local
-        // service); `{{bp_name}}` overrides it with the cache+transact pattern.
-        // Mirrors AOSP's versioned-interface Rust backend.
+        // Local default; `{{bp_name}}` overrides it with a cached transact (AOSP Rust backend).
         fn r#getInterfaceVersion<'a>(&'a self) -> {{crate}}::BoxFuture<'a, {{crate}}::BinderResult<i32>> {
-            Box::pin(std::future::ready(Ok(VERSION)))
+            ::std::boxed::Box::pin(::std::future::ready(::core::result::Result::Ok(VERSION)))
         }
         {%- endif %}
         {%- if hash %}
-        fn r#getInterfaceHash<'a>(&'a self) -> {{crate}}::BoxFuture<'a, {{crate}}::BinderResult<String>> {
-            Box::pin(std::future::ready(Ok(HASH.into())))
+        fn r#getInterfaceHash<'a>(&'a self) -> {{crate}}::BoxFuture<'a, {{crate}}::BinderResult<::std::string::String>> {
+            ::std::boxed::Box::pin(::std::future::ready(::core::result::Result::Ok(HASH.into())))
         }
         {%- endif %}
     }
@@ -310,7 +307,7 @@ pub mod {{mod}} {
     {{ deprecated }}
     {%- endif %}
     #[{{crate}}::__async_trait]
-    pub trait {{name}}AsyncService: {{crate}}::Interface + Send {
+    pub trait {{name}}AsyncService: {{crate}}::Interface + ::core::marker::Send {
         fn descriptor() -> &'static str where Self: Sized { "{{ namespace }}" }
         {%- for member in fn_members %}
         {%- if member.deprecated %}
@@ -329,7 +326,7 @@ pub mod {{mod}} {
         /// completion with `rt.block_on(..)`. The returned handle is typed as the
         /// **sync** `Strong<dyn {{name}}>` because a binder is transport-neutral:
         /// the async-ness lives in the server impl, not the handle. Clients still
-        /// reach it as either `{{name}}` or `{{name}}Async<P>`.
+        /// reach it as either `{{name}}` or `{{name}}Async<_>`.
         ///
         /// Calling the returned sync handle *in-process from async code* routes
         /// every method through `rt.block_on(..)`, which re-enters the runtime.
@@ -338,12 +335,12 @@ pub mod {{mod}} {
         /// states the contract every implementation has to honor; with the
         /// `tokio` feature, `rsbinder::TokioRuntime` documents both answers for
         /// the Tokio case. On a path that calls repeatedly, convert the handle
-        /// once with `into_async::<P>()` and await it instead: that route
+        /// once with `into_async::<P>()` for a pool `P` and await it instead: that route
         /// dispatches to the async service directly and never enters `block_on`.
-        pub fn new_async_binder<T, R>(inner: T, rt: R) -> {{crate}}::Strong<dyn {{name}}>
+        pub fn new_async_binder<__RsbService, __RsbRuntime>(inner: __RsbService, rt: __RsbRuntime) -> {{crate}}::Strong<dyn {{name}}>
         where
-            T: {{name}}AsyncService + Sync + Send + 'static,
-            R: {{crate}}::BinderAsyncRuntime + Send + Sync + 'static,
+            __RsbService: {{name}}AsyncService + ::core::marker::Sync + ::core::marker::Send + 'static,
+            __RsbRuntime: {{crate}}::BinderAsyncRuntime + ::core::marker::Send + ::core::marker::Sync + 'static,
         {
             Self::new_async_binder_with_features(inner, rt, {{crate}}::BinderFeatures::default())
         }
@@ -353,27 +350,27 @@ pub mod {{mod}} {
         /// counterpart to the sync `new_binder_with_features`; without it an
         /// async service could not request those features. See
         /// `rsbinder::BinderFeatures`.
-        pub fn new_async_binder_with_features<T, R>(
-            inner: T,
-            rt: R,
+        pub fn new_async_binder_with_features<__RsbService, __RsbRuntime>(
+            inner: __RsbService,
+            rt: __RsbRuntime,
             features: {{crate}}::BinderFeatures,
         ) -> {{crate}}::Strong<dyn {{name}}>
         where
-            T: {{name}}AsyncService + Sync + Send + 'static,
-            R: {{crate}}::BinderAsyncRuntime + Send + Sync + 'static,
+            __RsbService: {{name}}AsyncService + ::core::marker::Sync + ::core::marker::Send + 'static,
+            __RsbRuntime: {{crate}}::BinderAsyncRuntime + ::core::marker::Send + ::core::marker::Sync + 'static,
         {
-            struct Wrapper<T, R> {
-                _inner: T,
-                _rt: R,
+            struct __RsbAsyncWrapper<__RsbService, __RsbRuntime> {
+                _inner: __RsbService,
+                _rt: __RsbRuntime,
             }
-            impl<T, R> {{crate}}::Interface for Wrapper<T, R> where T: {{crate}}::Interface, R: Send + Sync {
+            impl<__RsbService, __RsbRuntime> {{crate}}::Interface for __RsbAsyncWrapper<__RsbService, __RsbRuntime> where __RsbService: {{crate}}::Interface, __RsbRuntime: ::core::marker::Send + ::core::marker::Sync {
                 fn as_binder(&self) -> {{crate}}::SIBinder { self._inner.as_binder() }
-                fn dump(&self, _writer: &mut dyn std::io::Write, _args: &[String]) -> {{crate}}::Result<()> { self._inner.dump(_writer, _args) }
+                fn dump(&self, _writer: &mut dyn ::std::io::Write, _args: &[::std::string::String]) -> {{crate}}::Result<()> { self._inner.dump(_writer, _args) }
             }
-            impl<T, R> {{bn_name}}Adapter for Wrapper<T, R>
+            impl<__RsbService, __RsbRuntime> {{bn_name}}Adapter for __RsbAsyncWrapper<__RsbService, __RsbRuntime>
             where
-                T: {{name}}AsyncService + Sync + Send + 'static,
-                R: {{crate}}::BinderAsyncRuntime + Send + Sync + 'static,
+                __RsbService: {{name}}AsyncService + ::core::marker::Sync + ::core::marker::Send + 'static,
+                __RsbRuntime: {{crate}}::BinderAsyncRuntime + ::core::marker::Send + ::core::marker::Sync + 'static,
             {
                 fn as_sync(&self) -> &dyn {{name}} {
                     self
@@ -381,14 +378,14 @@ pub mod {{mod}} {
                 fn as_async(&self) -> &dyn {{name}}AsyncService {
                     &self._inner
                 }
-                fn try_as_async(&self) -> Option<&dyn {{name}}AsyncService> {
-                    Some(&self._inner)
+                fn try_as_async(&self) -> ::core::option::Option<&dyn {{name}}AsyncService> {
+                    ::core::option::Option::Some(&self._inner)
                 }
             }
-            impl<T, R> {{name}} for Wrapper<T, R>
+            impl<__RsbService, __RsbRuntime> {{name}} for __RsbAsyncWrapper<__RsbService, __RsbRuntime>
             where
-                T: {{name}}AsyncService + Sync + Send + 'static,
-                R: {{crate}}::BinderAsyncRuntime + Send + Sync + 'static,
+                __RsbService: {{name}}AsyncService + ::core::marker::Sync + ::core::marker::Send + 'static,
+                __RsbRuntime: {{crate}}::BinderAsyncRuntime + ::core::marker::Send + ::core::marker::Sync + 'static,
             {
                 {%- for member in fn_members %}
                 fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::BinderResult<{{ member.return_type }}> {
@@ -396,20 +393,20 @@ pub mod {{mod}} {
                 }
                 {%- endfor %}
             }
-            let wrapped = Wrapper { _inner: inner, _rt: rt };
+            let wrapped = __RsbAsyncWrapper { _inner: inner, _rt: rt };
             {%- if is_vintf %}
-            let binder = {{crate}}::Binder::new_with_stability_and_features({{bn_name}}(Box::new(wrapped)), {{crate}}::Stability::Vintf, features);
+            let binder = {{crate}}::Binder::new_with_stability_and_features({{bn_name}}(::std::boxed::Box::new(wrapped)), {{crate}}::Stability::Vintf, features);
             {%- else %}
-            let binder = {{crate}}::Binder::new_with_stability_and_features({{bn_name}}(Box::new(wrapped)), {{crate}}::Stability::default(), features);
+            let binder = {{crate}}::Binder::new_with_stability_and_features({{bn_name}}(::std::boxed::Box::new(wrapped)), {{crate}}::Stability::default(), features);
             {%- endif %}
-            {{crate}}::Strong::new(Box::new(binder))
+            {{crate}}::Strong::new(::std::boxed::Box::new(binder))
         }
     }
     {%- endif %}
-    pub trait {{ name }}Default: Send + Sync {
+    pub trait {{ name }}Default: ::core::marker::Send + ::core::marker::Sync {
         {%- for member in fn_members %}
         fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::BinderResult<{{ member.return_type }}> {
-            Err({{crate}}::StatusCode::UnknownTransaction.into())
+            ::core::result::Result::Err({{crate}}::StatusCode::UnknownTransaction.into())
         }
         {%- endfor %}
     }
@@ -424,17 +421,15 @@ pub mod {{mod}} {
         {%- endif %}
         {%- endfor %}
         {%- if version is number %}
-        // AOSP stable-AIDL meta transactions; offsets match
-        // `system/tools/aidl/include/aidl/transaction_ids.h`:
-        // kLastCallTransaction (0x00ffffff) - kFirstCallTransaction (1).
+        // AOSP transaction_ids.h kFirstMetaMethodId (version) and kFirstMetaMethodId - 1 (hash).
         pub(crate) const r#getInterfaceVersion: {{crate}}::TransactionCode = {{crate}}::FIRST_CALL_TRANSACTION + 16777214;
         {%- endif %}
         {%- if hash %}
         pub(crate) const r#getInterfaceHash: {{crate}}::TransactionCode = {{crate}}::FIRST_CALL_TRANSACTION + 16777213;
         {%- endif %}
     }
-    pub type {{ name }}DefaultRef = std::sync::Arc<dyn {{ name }}Default>;
-    static DEFAULT_IMPL: std::sync::OnceLock<{{ name }}DefaultRef> = std::sync::OnceLock::new();
+    pub type {{ name }}DefaultRef = ::std::sync::Arc<dyn {{ name }}Default>;
+    static DEFAULT_IMPL: ::std::sync::OnceLock<{{ name }}DefaultRef> = ::std::sync::OnceLock::new();
     {{crate}}::declare_binder_interface! {
         {{ name }}["{{ namespace }}"] {
             native: {
@@ -447,10 +442,10 @@ pub mod {{mod}} {
             {%- if version is number or hash %}
             proxy: {{ bp_name }} {
                 {%- if version is number %}
-                cached_version: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1){% if hash %},{% endif %}
+                cached_version: ::std::sync::atomic::AtomicI32 = ::std::sync::atomic::AtomicI32::new(-1){% if hash %},{% endif %}
                 {%- endif %}
                 {%- if hash %}
-                cached_hash: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None)
+                cached_hash: ::std::sync::Mutex<::core::option::Option<::std::string::String>> = ::std::sync::Mutex::new(::core::option::Option::None)
                 {%- endif %}
             },
             {%- else %}
@@ -482,21 +477,21 @@ pub mod {{mod}} {
             {%- else %}
             let data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_transact(true)?;
             {%- endif %}
-            Ok(data)
+            ::core::result::Result::Ok(data)
         }
-        fn read_response_{{ member.identifier }}({{ member.args }}, _aidl_reply: {{crate}}::Result<Option<{{crate}}::Parcel>>) -> {{crate}}::BinderResult<{{ member.return_type }}> {
+        fn read_response_{{ member.identifier }}({{ member.args }}, _aidl_reply: {{crate}}::Result<::core::option::Option<{{crate}}::Parcel>>) -> {{crate}}::BinderResult<{{ member.return_type }}> {
             {%- if oneway or member.oneway %}
             _aidl_reply?; // propagate transport errors (e.g. dead object); oneway has no reply body
-            Ok(())
+            ::core::result::Result::Ok(())
             {%- else %}
-            if let Err({{crate}}::StatusCode::UnknownTransaction) = _aidl_reply {
-                if let Some(_aidl_default_impl) = <Self as {{name}}>::getDefaultImpl() {
+            if let ::core::result::Result::Err({{crate}}::StatusCode::UnknownTransaction) = _aidl_reply {
+                if let ::core::option::Option::Some(_aidl_default_impl) = <Self as {{name}}>::getDefaultImpl() {
                   return _aidl_default_impl.r#{{ member.identifier }}({{ member.func_call_params }});
                 }
             }
             let mut _aidl_reply = _aidl_reply?.ok_or({{crate}}::StatusCode::UnexpectedNull)?;
             let _status = _aidl_reply.read::<{{crate}}::Status>()?;
-            if !_status.is_ok() { return Err(_status); }
+            if !_status.is_ok() { return ::core::result::Result::Err(_status); }
             {%- if member.return_type != "()" %}
             let _aidl_return: {{ member.return_type }} = _aidl_reply.read()?;
             {%- endif %}
@@ -504,9 +499,9 @@ pub mod {{mod}} {
             _aidl_reply.read_onto({{ arg }})?;
             {%- endfor %}
             {%- if member.return_type != "()" %}
-            Ok(_aidl_return)
+            ::core::result::Result::Ok(_aidl_return)
             {%- else %}
-            Ok(())
+            ::core::result::Result::Ok(())
             {%- endif %}
             {%- endif %}
         }
@@ -514,29 +509,29 @@ pub mod {{mod}} {
         {%- if version is number %}
         fn build_parcel_getInterfaceVersion(&self) -> {{crate}}::Result<{{crate}}::Parcel> {
             let data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_transact(true)?;
-            Ok(data)
+            ::core::result::Result::Ok(data)
         }
-        fn read_response_getInterfaceVersion(&self, _aidl_reply: {{crate}}::Result<Option<{{crate}}::Parcel>>) -> {{crate}}::BinderResult<i32> {
+        fn read_response_getInterfaceVersion(&self, _aidl_reply: {{crate}}::Result<::core::option::Option<{{crate}}::Parcel>>) -> {{crate}}::BinderResult<i32> {
             let mut _aidl_reply = _aidl_reply?.ok_or({{crate}}::StatusCode::UnexpectedNull)?;
             let _status = _aidl_reply.read::<{{crate}}::Status>()?;
-            if !_status.is_ok() { return Err(_status); }
+            if !_status.is_ok() { return ::core::result::Result::Err(_status); }
             let _aidl_return: i32 = _aidl_reply.read()?;
-            self.cached_version.store(_aidl_return, std::sync::atomic::Ordering::Relaxed);
-            Ok(_aidl_return)
+            self.cached_version.store(_aidl_return, ::std::sync::atomic::Ordering::Relaxed);
+            ::core::result::Result::Ok(_aidl_return)
         }
         {%- endif %}
         {%- if hash %}
         fn build_parcel_getInterfaceHash(&self) -> {{crate}}::Result<{{crate}}::Parcel> {
             let data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_transact(true)?;
-            Ok(data)
+            ::core::result::Result::Ok(data)
         }
-        fn read_response_getInterfaceHash(&self, _aidl_reply: {{crate}}::Result<Option<{{crate}}::Parcel>>) -> {{crate}}::BinderResult<String> {
+        fn read_response_getInterfaceHash(&self, _aidl_reply: {{crate}}::Result<::core::option::Option<{{crate}}::Parcel>>) -> {{crate}}::BinderResult<::std::string::String> {
             let mut _aidl_reply = _aidl_reply?.ok_or({{crate}}::StatusCode::UnexpectedNull)?;
             let _status = _aidl_reply.read::<{{crate}}::Status>()?;
-            if !_status.is_ok() { return Err(_status); }
-            let _aidl_return: String = _aidl_reply.read()?;
-            *self.cached_hash.lock().unwrap() = Some(_aidl_return.clone());
-            Ok(_aidl_return)
+            if !_status.is_ok() { return ::core::result::Result::Err(_status); }
+            let _aidl_return: ::std::string::String = _aidl_reply.read()?;
+            *self.cached_hash.lock().unwrap() = ::core::option::Option::Some(_aidl_return.clone());
+            ::core::result::Result::Ok(_aidl_return)
         }
         {%- endif %}
     }
@@ -559,8 +554,8 @@ pub mod {{mod}} {
         {%- endfor %}
         {%- if version is number %}
         fn r#getInterfaceVersion(&self) -> {{crate}}::BinderResult<i32> {
-            let _aidl_version = self.cached_version.load(std::sync::atomic::Ordering::Relaxed);
-            if _aidl_version != -1 { return Ok(_aidl_version); }
+            let _aidl_version = self.cached_version.load(::std::sync::atomic::Ordering::Relaxed);
+            if _aidl_version != -1 { return ::core::result::Result::Ok(_aidl_version); }
             let _aidl_data = self.build_parcel_getInterfaceVersion()?;
             {%- if function_names is iterable %}
             let _aidl_reply = {{crate}}::observe::__trace_client("{{ namespace }}", "getInterfaceVersion", transactions::r#getInterfaceVersion)
@@ -572,11 +567,11 @@ pub mod {{mod}} {
         }
         {%- endif %}
         {%- if hash %}
-        fn r#getInterfaceHash(&self) -> {{crate}}::BinderResult<String> {
+        fn r#getInterfaceHash(&self) -> {{crate}}::BinderResult<::std::string::String> {
             {
                 let _aidl_hash_lock = self.cached_hash.lock().unwrap();
-                if let Some(ref _aidl_hash) = *_aidl_hash_lock {
-                    return Ok(_aidl_hash.clone());
+                if let ::core::option::Option::Some(ref _aidl_hash) = *_aidl_hash_lock {
+                    return ::core::result::Result::Ok(_aidl_hash.clone());
                 }
             }
             let _aidl_data = self.build_parcel_getInterfaceHash()?;
@@ -591,20 +586,20 @@ pub mod {{mod}} {
         {%- endif %}
     }
     {%- if enabled_async %}
-    impl<P: {{crate}}::BinderAsyncPool> {{name}}Async<P> for {{ bp_name }} {
+    impl<__RsbPool: {{crate}}::BinderAsyncPool> {{name}}Async<__RsbPool> for {{ bp_name }} {
         {%- for member in fn_members %}
         fn r#{{ member.identifier }}<'a>({{ member.args_async }}) -> {{crate}}::BoxFuture<'a, {{crate}}::BinderResult<{{ member.return_type }}>> {
             let _aidl_data = match self.build_parcel_{{ member.identifier }}({{ member.func_call_params }}) {
-                Ok(_aidl_data) => _aidl_data,
-                Err(err) => return Box::pin(std::future::ready(Err(err.into()))),
+                ::core::result::Result::Ok(_aidl_data) => _aidl_data,
+                ::core::result::Result::Err(err) => return ::std::boxed::Box::pin(::std::future::ready(::core::result::Result::Err(err.into()))),
             };
             let binder = self.binder.clone();
             {%- if function_names is iterable %}
             let _aidl_span = {{crate}}::observe::__trace_client("{{ namespace }}", "{{ member.identifier }}", transactions::r#{{ member.identifier }});
-            P::spawn(
+            __RsbPool::spawn(
                 move || _aidl_span.in_scope(|| binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}{{crate}}::FLAG_ONEWAY | {% endif %}{{crate}}::FLAG_CLEAR_BUF | {{crate}}::FLAG_PRIVATE_LOCAL)),
             {%- else %}
-            P::spawn(
+            __RsbPool::spawn(
                 move || binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}{{crate}}::FLAG_ONEWAY | {% endif %}{{crate}}::FLAG_CLEAR_BUF | {{crate}}::FLAG_PRIVATE_LOCAL),
             {%- endif %}
                 move |_aidl_reply| async move {
@@ -619,19 +614,19 @@ pub mod {{mod}} {
         {%- endfor %}
         {%- if version is number %}
         fn r#getInterfaceVersion<'a>(&'a self) -> {{crate}}::BoxFuture<'a, {{crate}}::BinderResult<i32>> {
-            let _aidl_version = self.cached_version.load(std::sync::atomic::Ordering::Relaxed);
-            if _aidl_version != -1 { return Box::pin(std::future::ready(Ok(_aidl_version))); }
+            let _aidl_version = self.cached_version.load(::std::sync::atomic::Ordering::Relaxed);
+            if _aidl_version != -1 { return ::std::boxed::Box::pin(::std::future::ready(::core::result::Result::Ok(_aidl_version))); }
             let _aidl_data = match self.build_parcel_getInterfaceVersion() {
-                Ok(_aidl_data) => _aidl_data,
-                Err(err) => return Box::pin(std::future::ready(Err(err.into()))),
+                ::core::result::Result::Ok(_aidl_data) => _aidl_data,
+                ::core::result::Result::Err(err) => return ::std::boxed::Box::pin(::std::future::ready(::core::result::Result::Err(err.into()))),
             };
             let binder = self.binder.clone();
             {%- if function_names is iterable %}
             let _aidl_span = {{crate}}::observe::__trace_client("{{ namespace }}", "getInterfaceVersion", transactions::r#getInterfaceVersion);
-            P::spawn(
+            __RsbPool::spawn(
                 move || _aidl_span.in_scope(|| binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceVersion, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF)),
             {%- else %}
-            P::spawn(
+            __RsbPool::spawn(
                 move || binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceVersion, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF),
             {%- endif %}
                 move |_aidl_reply| async move {
@@ -641,24 +636,24 @@ pub mod {{mod}} {
         }
         {%- endif %}
         {%- if hash %}
-        fn r#getInterfaceHash<'a>(&'a self) -> {{crate}}::BoxFuture<'a, {{crate}}::BinderResult<String>> {
+        fn r#getInterfaceHash<'a>(&'a self) -> {{crate}}::BoxFuture<'a, {{crate}}::BinderResult<::std::string::String>> {
             {
                 let _aidl_hash_lock = self.cached_hash.lock().unwrap();
-                if let Some(ref _aidl_hash) = *_aidl_hash_lock {
-                    return Box::pin(std::future::ready(Ok(_aidl_hash.clone())));
+                if let ::core::option::Option::Some(ref _aidl_hash) = *_aidl_hash_lock {
+                    return ::std::boxed::Box::pin(::std::future::ready(::core::result::Result::Ok(_aidl_hash.clone())));
                 }
             }
             let _aidl_data = match self.build_parcel_getInterfaceHash() {
-                Ok(_aidl_data) => _aidl_data,
-                Err(err) => return Box::pin(std::future::ready(Err(err.into()))),
+                ::core::result::Result::Ok(_aidl_data) => _aidl_data,
+                ::core::result::Result::Err(err) => return ::std::boxed::Box::pin(::std::future::ready(::core::result::Result::Err(err.into()))),
             };
             let binder = self.binder.clone();
             {%- if function_names is iterable %}
             let _aidl_span = {{crate}}::observe::__trace_client("{{ namespace }}", "getInterfaceHash", transactions::r#getInterfaceHash);
-            P::spawn(
+            __RsbPool::spawn(
                 move || _aidl_span.in_scope(|| binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceHash, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF)),
             {%- else %}
-            P::spawn(
+            __RsbPool::spawn(
                 move || binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceHash, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF),
             {%- endif %}
                 move |_aidl_reply| async move {
@@ -668,7 +663,7 @@ pub mod {{mod}} {
         }
         {%- endif %}
     }
-    impl<P: {{crate}}::BinderAsyncPool> {{name}}Async<P> for {{crate}}::Binder<{{bn_name}}>
+    impl<__RsbPool: {{crate}}::BinderAsyncPool> {{name}}Async<__RsbPool> for {{crate}}::Binder<{{bn_name}}>
     {
         {%- for member in fn_members %}
         fn r#{{ member.identifier }}<'a>({{ member.args_async }}) -> {{crate}}::BoxFuture<'a, {{crate}}::BinderResult<{{ member.return_type }}>> {
@@ -698,7 +693,7 @@ pub mod {{mod}} {
         }
         {%- endif %}
         {%- if hash %}
-        fn r#getInterfaceHash(&self) -> {{crate}}::BinderResult<String> {
+        fn r#getInterfaceHash(&self) -> {{crate}}::BinderResult<::std::string::String> {
             {%- if enabled_async %}
             self.0.as_sync().r#getInterfaceHash()
             {%- else %}
@@ -720,15 +715,13 @@ pub mod {{mod}} {
         }
         {%- endfor %}
         {%- if version is number %}
-        // Report the *upstream* version, not this module's constant: a gateway
-        // speaks for the service it fronts. The trait's default body would
-        // silently answer with `VERSION` if this override were dropped.
+        // Upstream's version, not VERSION: a gateway speaks for the service it fronts.
         fn r#getInterfaceVersion(&self) -> {{crate}}::BinderResult<i32> {
             (**self).r#getInterfaceVersion()
         }
         {%- endif %}
         {%- if hash %}
-        fn r#getInterfaceHash(&self) -> {{crate}}::BinderResult<String> {
+        fn r#getInterfaceHash(&self) -> {{crate}}::BinderResult<::std::string::String> {
             (**self).r#getInterfaceHash()
         }
         {%- endif %}
@@ -747,14 +740,14 @@ pub mod {{mod}} {
                 let _aidl_return = _service.r#{{ member.identifier }}({{ member.transaction_params }});
             {%- if not oneway and not member.oneway %}
                 match &_aidl_return {
-                    Ok(_aidl_return) => {
+                    ::core::result::Result::Ok(_aidl_return) => {
                         _reply.write(&{{crate}}::Status::from({{crate}}::StatusCode::Ok))?;
                         {%- if member.transaction_has_return %}
                         _reply.write(_aidl_return)?;
                         {%- endif %}
                         {%- for arg in member.transaction_write %}
                         {%- if arg.needs_null_guard %}
-                        if {{ arg.identifier }}.iter(){% for _i in range(end=arg.null_guard_flatten) %}.flatten(){% endfor %}.any(Option::is_none) { return Err({{crate}}::StatusCode::UnexpectedNull); }
+                        if {{ arg.identifier }}.iter(){% for _i in range(end=arg.null_guard_flatten) %}.flatten(){% endfor %}.any(::core::option::Option::is_none) { return ::core::result::Result::Err({{crate}}::StatusCode::UnexpectedNull); }
                         {%- endif %}
                         {%- if arg.needs_unwrap %}
                         let {{ arg.identifier }} = {{ arg.identifier }}.as_ref().ok_or({{crate}}::StatusCode::UnexpectedNull)?;
@@ -762,45 +755,45 @@ pub mod {{mod}} {
                         _reply.write(&{{ arg.identifier }})?;
                         {%- endfor %}
                     }
-                    Err(_aidl_status) => {
+                    ::core::result::Result::Err(_aidl_status) => {
                         _reply.write(_aidl_status)?;
                     }
                 }
             {%- endif %}
-                Ok(())
+                ::core::result::Result::Ok(())
             }
         {%- endfor %}
         {%- if version is number %}
             transactions::r#getInterfaceVersion => {
                 let _aidl_return = _service.r#getInterfaceVersion();
                 match &_aidl_return {
-                    Ok(_aidl_return) => {
+                    ::core::result::Result::Ok(_aidl_return) => {
                         _reply.write(&{{crate}}::Status::from({{crate}}::StatusCode::Ok))?;
                         _reply.write(_aidl_return)?;
                     }
-                    Err(_aidl_status) => {
+                    ::core::result::Result::Err(_aidl_status) => {
                         _reply.write(_aidl_status)?;
                     }
                 }
-                Ok(())
+                ::core::result::Result::Ok(())
             }
         {%- endif %}
         {%- if hash %}
             transactions::r#getInterfaceHash => {
                 let _aidl_return = _service.r#getInterfaceHash();
                 match &_aidl_return {
-                    Ok(_aidl_return) => {
+                    ::core::result::Result::Ok(_aidl_return) => {
                         _reply.write(&{{crate}}::Status::from({{crate}}::StatusCode::Ok))?;
                         _reply.write(_aidl_return)?;
                     }
-                    Err(_aidl_status) => {
+                    ::core::result::Result::Err(_aidl_status) => {
                         _reply.write(_aidl_status)?;
                     }
                 }
-                Ok(())
+                ::core::result::Result::Ok(())
             }
         {%- endif %}
-            _ => Err({{crate}}::StatusCode::UnknownTransaction),
+            _ => ::core::result::Result::Err({{crate}}::StatusCode::UnknownTransaction),
         }
     }
     {%- if nested|length>0 %}
@@ -925,6 +918,16 @@ pub fn interface_stem(name: &str) -> &str {
         name
     }
 }
+
+/// Prefix of the names the interface template declares next to user types.
+///
+/// The `async` half declares type parameters (`__RsbPool`, `__RsbService`,
+/// `__RsbRuntime`) and a local struct (`__RsbAsyncWrapper`) in scopes where
+/// method signatures are written. A user type spelled with the same name in a
+/// signature would resolve to the generated item, so every front-end refuses
+/// such names: `rsbinder-aidl` for type declaration names, `#[rsbinder::interface]`
+/// for the trait name and the first segment of every signature path.
+pub const RESERVED_NAME_PREFIX: &str = "__Rsb";
 
 /// Inputs for [`render_interface`] — the interface template's full context.
 ///
@@ -1428,7 +1431,7 @@ fn make_fn_member(
                 ));
             } else {
                 write_funcs.push(format!(
-                    "data.write_slice_size(Some({}))?;",
+                    "data.write_slice_size(::core::option::Option::Some({}))?;",
                     generator.identifier
                 ));
             }
@@ -1683,8 +1686,6 @@ pub struct Generator {
 
 impl Generator {
     pub fn new(enabled_async: bool, is_crate: bool) -> Self {
-        // Templates read `self.is_crate`, type paths a thread-local: set here so both agree.
-        crate::type_generator::set_crate_support(is_crate);
         Self {
             enabled_async,
             is_crate,
@@ -1780,6 +1781,8 @@ impl Generator {
         decls: &Vec<parser::Declaration>,
         indent: usize,
     ) -> Result<String, AidlError> {
+        // Templates read `self.is_crate`, type paths a thread-local: set per call so both agree.
+        crate::type_generator::set_crate_support(self.is_crate);
         let mut content = String::new();
 
         for decl in decls {
@@ -2047,6 +2050,26 @@ impl Generator {
                 .map(|expr| render_enforce_permission_check(&expr, self.get_crate_name()));
         let iface_permission_annotated = is_permission_annotated(&decl.annotation_list);
         let version = parser::interface_version(&decl.annotation_list, self.version)?;
+        let stem = interface_stem(&decl.name);
+        for constant in decl.constant_list.iter() {
+            // Module-level values (`Bn*` is a tuple struct); a same-named `pub const` is E0428.
+            let generated = match constant.identifier.as_str() {
+                "DEFAULT_IMPL" | "on_transact" => true,
+                "VERSION" => version.is_some(),
+                "HASH" => self.hash.is_some(),
+                name => name == format!("Bn{stem}"),
+            };
+            if generated {
+                return Err(Generator::decl_error(
+                    format!(
+                        "interface '{}': constant '{}' collides with an item of the generated \
+                         Rust module",
+                        decl.name, constant.identifier
+                    ),
+                    constant.r#type.to_generator()?.type_span(),
+                ));
+            }
+        }
         let mut method_names = std::collections::HashSet::new();
         for method in decl.method_list.iter() {
             // AOSP `AidlInterface::CheckValid`: duplicates would merge, losing a transaction code.
@@ -2116,6 +2139,39 @@ impl Generator {
         }
 
         Self::ensure_nested_names(Some(&decl.name), &decl.members)?;
+        // Type-namespace items the template and `declare_binder_interface!` put beside nested mods.
+        let mut generated_types = vec![
+            "transactions".to_owned(),
+            format!("Bn{stem}"),
+            format!("Bp{stem}"),
+            format!("{}Default", decl.name),
+            format!("{}DefaultRef", decl.name),
+        ];
+        if self.enabled_async {
+            generated_types.push(format!("Bn{stem}Adapter"));
+            generated_types.push(format!("{}Async", decl.name));
+            generated_types.push(format!("{}AsyncService", decl.name));
+        }
+        for member in &decl.members {
+            let span = match member {
+                parser::Declaration::Interface(d) => d.name_span,
+                parser::Declaration::Parcelable(d) => d.name_span,
+                parser::Declaration::Enum(d) => d.name_span,
+                parser::Declaration::Union(d) => d.name_span,
+                parser::Declaration::Variable(_) => continue,
+            };
+            if generated_types.iter().any(|g| g == member.name()) {
+                return Err(Generator::decl_error(
+                    format!(
+                        "interface '{}': nested type '{}' collides with an item of the \
+                         generated Rust module",
+                        decl.name,
+                        member.name()
+                    ),
+                    span,
+                ));
+            }
+        }
         let nested = &self.declarations(&decl.members, indent + 1)?;
 
         let namespace = parser::get_descriptor_from_annotation_list(&decl.annotation_list)?
@@ -2123,7 +2179,6 @@ impl Generator {
 
         // AIDL allows keyword names; `Bn`/`Bp`-prefixed names are never keywords.
         let escaped_name = crate::escape_rust_keyword(&decl.name).into_owned();
-        let stem = interface_stem(&decl.name);
 
         let function_names = self.trace.then(|| function_names(&fn_members));
         let rendered = render_interface(&InterfaceRender {
@@ -2495,6 +2550,17 @@ pub mod {mod} {{
                     decl.name_span,
                 ));
             }
+            // `declare_binder_enum!` defines `fn get`/`fn enum_values` in the same impl: E0201.
+            if matches!(enumerator.identifier.as_str(), "get" | "enum_values") {
+                return Err(Self::decl_error(
+                    format!(
+                        "enum '{}': enumerator '{}' collides with an associated item of the \
+                         generated Rust type; rename it",
+                        decl.name, enumerator.identifier
+                    ),
+                    decl.name_span,
+                ));
+            }
             if let Some(expr) =
                 parser::enum_member_const_expr_from_lookup(&lookup_decl, &enumerator.identifier)
             {
@@ -2617,6 +2683,17 @@ pub mod {mod} {{
                             generator.type_span(),
                         ));
                     }
+                    // The implicit `Tag` is a tuple struct, so its constructor shares this name.
+                    if var.identifier == "Tag" {
+                        return Err(Self::decl_error(
+                            format!(
+                                "union '{}': a constant cannot be named 'Tag', which Rust \
+                                 reserves for the implicit union tag type; rename it",
+                                decl.name
+                            ),
+                            generator.type_span(),
+                        ));
+                    }
                     Self::ensure_constant_type(&generator, &decl.name, &var.identifier)?;
                 }
                 if !var.constant {
@@ -2689,28 +2766,39 @@ pub mod {mod} {{
                 decl.name_span,
             ));
         }
+        // AOSP `UnionTagGenerater` backs this `Tag` with `byte`; enum `CheckValid` bounds it.
+        if is_fixed_size && members.len() > i8::MAX as usize + 1 {
+            return Err(Self::decl_error(
+                format!(
+                    "@FixedSize union '{}' has {} fields; its byte-backed 'Tag' holds at most 128",
+                    decl.name,
+                    members.len()
+                ),
+                decl.name_span,
+            ));
+        }
 
         let mut seen_variants: std::collections::HashMap<&str, &str> =
             std::collections::HashMap::new();
         for (variant, _, field, _, _, _) in &members {
-            // UpperCamel makes `SELF`/`self_` into `Self` and `_1` into `1`; `r#` rescues neither.
-            let usable = variant.chars().next().is_some_and(|c| !c.is_ascii_digit())
-                && variant.as_str() != "Self";
-            if !usable {
+            // AOSP CheckValidForGetterNames (aidl_language.cpp:1418-1428); parser drops `self`/`_`.
+            if let Some(previous) = seen_variants.insert(variant, field) {
                 return Err(Self::decl_error(
                     format!(
-                        "union '{}': field '{field}' maps to the Rust variant '{variant}', which is \
-                         not a valid identifier; rename it",
+                        "union '{}': fields '{previous}' and '{field}' both map to the Rust \
+                         variant '{variant}' after capitalizing the first letter; rename one \
+                         of them",
                         decl.name
                     ),
                     decl.name_span,
                 ));
             }
-            if let Some(previous) = seen_variants.insert(variant, field) {
+            // `declare_binder_enum!` puts `fn get`/`fn enum_values` in the `Tag` impl: E0201.
+            if matches!(field.as_str(), "get" | "enum_values") {
                 return Err(Self::decl_error(
                     format!(
-                        "union '{}': fields '{previous}' and '{field}' both map to the Rust \
-                         variant '{variant}'; rename one of them",
+                        "union '{}': field '{field}' collides with an associated item of the \
+                         implicit 'Tag'; rename it",
                         decl.name
                     ),
                     decl.name_span,
@@ -2718,6 +2806,30 @@ pub mod {mod} {{
             }
         }
 
+        // AOSP UnionTagGenerater injects a nested `Tag`; CheckValidWithMembers rejects clashes.
+        if decl.name == "Tag" {
+            return Err(Self::decl_error(
+                "nested type 'Tag' has the same name as its parent (every union declares an \
+                 implicit 'Tag')",
+                decl.name_span,
+            ));
+        }
+        if let Some(clash) = declarations.iter().find(|d| d.name() == "Tag") {
+            let span = match clash {
+                parser::Declaration::Interface(d) => d.name_span,
+                parser::Declaration::Parcelable(d) => d.name_span,
+                parser::Declaration::Enum(d) => d.name_span,
+                parser::Declaration::Union(d) => d.name_span,
+                parser::Declaration::Variable(_) => decl.name_span,
+            };
+            return Err(Self::decl_error(
+                format!(
+                    "union '{}' has a duplicate nested type 'Tag' (the implicit union tag)",
+                    decl.name
+                ),
+                span,
+            ));
+        }
         Self::ensure_nested_names(Some(&decl.name), &declarations)?;
         let nested = &self.declarations(&declarations, indent + 1)?;
         let namespace = parser::get_descriptor_from_annotation_list(&decl.annotation_list)?
@@ -2731,6 +2843,8 @@ pub mod {mod} {{
         context.insert("derive", &parser::rust_derive_list(&decl.annotation_list));
         context.insert("namespace", &namespace);
         context.insert("members", &members);
+        // AOSP parser.cpp `UnionTagGenerater`: `@FixedSize` union tag is `@Backing(type="byte")`.
+        context.insert("tag_backing", if is_fixed_size { "i8" } else { "i32" });
         context.insert("const_members", &constant_members);
         context.insert("nested", &nested.trim());
         context.insert("is_vintf", &is_vintf);

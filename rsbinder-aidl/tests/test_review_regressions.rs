@@ -65,6 +65,26 @@ fn enum_autoincrement_overflow_is_rejected() {
     assert!(out.contains("r#N2 = 1,"), "got: {out}");
 }
 
+/// A `@FixedSize` union's `Tag` is `byte`-backed, so a 129th field is a diagnostic, not `Tag(128)`.
+#[test]
+fn fixed_size_union_tag_overflow_is_rejected() {
+    let union_of = |n: usize| {
+        let fields: String = (0..n).map(|i| format!("int f{i}; ")).collect();
+        format!("package a; @FixedSize union U {{ {fields}}}")
+    };
+    let src = union_of(129);
+    let ctx = rsbinder_aidl::SourceContext::new("test.aidl", &src);
+    let document = rsbinder_aidl::parse_document(&ctx).expect("parse");
+    let err = rsbinder_aidl::Generator::new(false, false)
+        .document(&document)
+        .expect_err("129 fields overflow an i8 tag");
+    assert!(format!("{err:?}").contains("at most 128"), "got: {err:?}");
+
+    assert!(generate_ok(&union_of(128)), "128 fields fit");
+    let plain = union_of(129).replace("@FixedSize ", "");
+    assert!(generate_ok(&plain), "an int-backed tag has room");
+}
+
 /// `{}` where no aggregate is valid is a diagnostic, not an `unwrap()` panic; `int[] x = {}` is ok.
 #[test]
 fn empty_brace_initializer_is_rejected_not_panicked() {
@@ -190,7 +210,10 @@ fn parcelable_non_nullable_binder_field_read_is_null_strict() {
     .expect("must generate");
     let packed = out.replace([' ', '\n'], "");
     assert!(
-        packed.contains("ifself.r#b.is_none(){returnErr(rsbinder::StatusCode::UnexpectedNull);}"),
+        packed.contains(
+            "ifself.r#b.is_none(){return::core::result::Result::Err(\
+             rsbinder::StatusCode::UnexpectedNull);}"
+        ),
         "non-nullable parcelable field read must reject null (got: {packed})"
     );
     assert!(
@@ -597,7 +620,9 @@ fn out_argument_without_default_is_optional() {
         "got:\n{out}"
     );
     assert!(
-        out.contains("let mut _arg_b: Option<rsbinder::SIBinder> = Default::default();"),
+        out.contains(
+            "let mut _arg_b: Option<rsbinder::SIBinder> = ::core::default::Default::default();"
+        ),
         "got:\n{out}"
     );
 }
@@ -667,14 +692,12 @@ fn enum_discriminant_must_fit_its_backing_type() {
     ));
 }
 
-/// Two field names mapping to one UpperCamel variant would be `E0428`, so it is a diagnostic.
+/// Two fields with one capitalized name would be `E0428`; AOSP `CheckValidForGetterNames` too.
 #[test]
 fn colliding_union_variant_names_are_a_diagnostic() {
-    assert!(!generate_ok(
-        "package a; union U { int my_field; int myField; }"
-    ));
+    assert!(!generate_ok("package a; union U { int foo; int Foo; }"));
     assert!(generate_ok(
-        "package a; union U { int my_field; int other; }"
+        "package a; union U { int my_field; int myField; }"
     ));
 }
 
@@ -906,6 +929,37 @@ fn unrepresentable_keywords_are_rejected_in_package_and_qualified_names() {
     ));
 }
 
+/// A type named with the template's reserved prefix would resolve to a generated item.
+#[test]
+fn type_names_with_the_reserved_prefix_are_rejected() {
+    for (src, role) in [
+        (
+            "package a; interface __RsbPool { void p(); }",
+            "interface name",
+        ),
+        (
+            "package a; interface I { parcelable __RsbAsyncWrapper { int x; } void p(); }",
+            "parcelable name",
+        ),
+        ("package a; enum __RsbService { A }", "enum name"),
+        ("package a; union __RsbRuntime { int x; }", "union name"),
+    ] {
+        let ctx = rsbinder_aidl::SourceContext::new("test.aidl", src);
+        let err = rsbinder_aidl::parse_document(&ctx).expect_err(src);
+        let rsbinder_aidl::AidlError::Parse(pe) = &err else {
+            panic!("expected a ParseError for {src:?}, got: {err:?}");
+        };
+        assert!(
+            pe.message.contains(role) && pe.message.contains("reserved"),
+            "expected the reserved-prefix diagnostic for {src:?}, got: {}",
+            pe.message
+        );
+    }
+    assert!(generate_ok(
+        "package a; interface I { parcelable Wrapper { int x; } void p(in Wrapper w); }"
+    ));
+}
+
 /// Lint allowances are inner attributes: a package-less document has no outer module to hold them.
 #[test]
 fn every_generated_module_carries_the_lint_allowances() {
@@ -960,7 +1014,8 @@ fn non_nullable_out_arguments_reject_an_unset_value() {
     )
     .expect("must generate");
     assert_eq!(
-        fds.matches("iter().any(Option::is_none)").count(),
+        fds.matches("iter().any(::core::option::Option::is_none)")
+            .count(),
         2,
         "both fixed and variable out fd arrays are guarded, got:\n{fds}"
     );
@@ -981,6 +1036,50 @@ fn nullable_fixed_array_follows_the_vector_element_rule() {
     ] {
         assert!(out.contains(expected), "expected `{expected}`, got:\n{out}");
     }
+}
+
+/// AOSP `RustNameOf` (aidl_to_rust.cpp:273) wraps `@nullable` elements in `in` and return too.
+#[test]
+fn nullable_fixed_array_wraps_elements_in_every_place() {
+    let out = generate_str(
+        "package a; interface I { @nullable String[3] r(); @nullable int[3] ri(); \
+         void f(in @nullable String[3] s, in @nullable ParcelFileDescriptor[2][2] p, \
+         in @nullable int[3] i, inout @nullable IBinder[3] b); }",
+    )
+    .expect("must generate");
+    for expected in [
+        "fn r#r(&self) -> rsbinder::BinderResult<Option<[Option<String>; 3]>>",
+        "fn r#ri(&self) -> rsbinder::BinderResult<Option<[i32; 3]>>",
+        "_arg_s: Option<&[Option<String>; 3]>",
+        "_arg_p: Option<&[[Option<rsbinder::ParcelFileDescriptor>; 2]; 2]>",
+        "_arg_i: Option<&[i32; 3]>",
+        "_arg_b: &mut Option<[Option<rsbinder::SIBinder>; 3]>",
+    ] {
+        assert!(out.contains(expected), "expected `{expected}`, got:\n{out}");
+    }
+}
+
+/// AOSP INOUT elements are `VALUE` (aidl_to_rust.cpp:253-271): no `Default`, so no `Option`.
+#[test]
+fn inout_fixed_array_keeps_elements_bare() {
+    let out = generate_str(
+        "package a; interface I { void f(inout ParcelFileDescriptor[3] p, \
+         inout IBinder[2][2] b, out ParcelFileDescriptor[3] q); }",
+    )
+    .expect("must generate");
+    for expected in [
+        "_arg_p: &mut [rsbinder::ParcelFileDescriptor; 3]",
+        "_arg_b: &mut [[rsbinder::SIBinder; 2]; 2]",
+        "_arg_q: &mut [Option<rsbinder::ParcelFileDescriptor>; 3]",
+    ] {
+        assert!(out.contains(expected), "expected `{expected}`, got:\n{out}");
+    }
+    assert_eq!(
+        out.matches("iter().any(::core::option::Option::is_none)")
+            .count(),
+        1,
+        "only the `out` fd array is guarded, got:\n{out}"
+    );
 }
 
 /// A `@nullable String` array constant's type has the element `Option` its initializer emits.
@@ -1027,6 +1126,26 @@ fn comparison_operators_do_not_trip_the_generic_guard() {
     };
     assert!(
         pe.message.contains("generic types are nested too deeply"),
+        "got: {}",
+        pe.message
+    );
+}
+
+/// Name comparisons count toward the open-`<` cap; the diagnostic has to say so.
+#[test]
+fn many_name_comparisons_name_the_comparison_in_the_diagnostic() {
+    let src = format!(
+        "package a; interface I {{ const int A = 1; const boolean X = {}A < A; void f(); }}",
+        "A < A || ".repeat(12)
+    );
+    let ctx = rsbinder_aidl::SourceContext::new("t.aidl", &src);
+    let err = rsbinder_aidl::parse_document(&ctx).expect_err("13 open `<` trip the cap");
+    let rsbinder_aidl::AidlError::Parse(pe) = &err else {
+        panic!("expected a ParseError, got: {err:?}");
+    };
+    assert!(
+        pe.message
+            .contains("too many `<` before a name (a comparison counts)"),
         "got: {}",
         pe.message
     );
@@ -1211,14 +1330,14 @@ fn out_fd_array_null_guard_flattens_nested_dimensions() {
     let one = generate_str("package a; interface I { void f(out ParcelFileDescriptor[2] fds); }")
         .expect("1-D generates");
     assert!(
-        one.contains("fds.iter().any(Option::is_none)"),
+        one.contains("fds.iter().any(::core::option::Option::is_none)"),
         "the 1-D guard stays: {one}"
     );
     let two =
         generate_str("package a; interface I { void f(out ParcelFileDescriptor[2][3] fds); }")
             .expect("2-D generates");
     assert!(
-        two.contains("fds.iter().flatten().any(Option::is_none)"),
+        two.contains("fds.iter().flatten().any(::core::option::Option::is_none)"),
         "a 2-D array is guarded through one flatten: {two}"
     );
 }

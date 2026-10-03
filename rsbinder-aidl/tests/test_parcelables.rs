@@ -129,14 +129,14 @@ pub mod VintfExtendableParcelable {
         fn write_to_parcel(&self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
             _parcel.sized_write(|_sub_parcel| {
                 _sub_parcel.write(&self.r#ext)?;
-                Ok(())
+                ::core::result::Result::Ok(())
             })
         }
         fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
             _parcel.sized_read(|_sub_parcel| {
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 _sub_parcel.read_onto(&mut self.r#ext)?;
-                Ok(())
+                ::core::result::Result::Ok(())
             })
         }
     }
@@ -177,14 +177,14 @@ pub mod VintfParcelable {
         fn write_to_parcel(&self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
             _parcel.sized_write(|_sub_parcel| {
                 _sub_parcel.write(&self.r#a)?;
-                Ok(())
+                ::core::result::Result::Ok(())
             })
         }
         fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
             _parcel.sized_read(|_sub_parcel| {
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#a = _sub_parcel.read()?;
-                Ok(())
+                ::core::result::Result::Ok(())
             })
         }
     }
@@ -236,12 +236,12 @@ pub mod IServiceManager {
     impl rsbinder::Parcelable for IServiceManager {
         fn write_to_parcel(&self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
             _parcel.sized_write(|_sub_parcel| {
-                Ok(())
+                ::core::result::Result::Ok(())
             })
         }
         fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
             _parcel.sized_read(|_sub_parcel| {
-                Ok(())
+                ::core::result::Result::Ok(())
             })
         }
     }
@@ -298,16 +298,16 @@ pub mod ConnectionInfo {
             _parcel.sized_write(|_sub_parcel| {
                 _sub_parcel.write(&self.r#ipAddress)?;
                 _sub_parcel.write(&self.r#port)?;
-                Ok(())
+                ::core::result::Result::Ok(())
             })
         }
         fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
             _parcel.sized_read(|_sub_parcel| {
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#ipAddress = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#port = _sub_parcel.read()?;
-                Ok(())
+                ::core::result::Result::Ok(())
             })
         }
     }
@@ -688,122 +688,122 @@ pub mod StructuredParcelable {
                 _sub_parcel.write(&self.r#u)?;
                 _sub_parcel.write(&self.r#shouldBeConstS1)?;
                 _sub_parcel.write(&self.r#defaultWithFoo)?;
-                Ok(())
+                ::core::result::Result::Ok(())
             })
         }
         fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
             _parcel.sized_read(|_sub_parcel| {
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#shouldContainThreeFs = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#f = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#shouldBeJerry = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#shouldBeByteBar = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#shouldBeIntBar = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#shouldBeLongBar = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#shouldContainTwoByteFoos = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#shouldContainTwoIntFoos = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#shouldContainTwoLongFoos = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#stringDefaultsToFoo = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#byteDefaultsToFour = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#intDefaultsToFive = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#longDefaultsToNegativeSeven = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#booleanDefaultsToTrue = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#charDefaultsToC = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#floatDefaultsToPi = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#doubleWithDefault = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#arrayDefaultsTo123 = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#arrayDefaultsToEmpty = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#boolDefault = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#byteDefault = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#intDefault = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#longDefault = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#floatDefault = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#doubleDefault = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#checkDoubleFromFloat = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#checkStringArray1 = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#checkStringArray2 = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#int32_min = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#int32_max = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#int64_max = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#hexInt32_neg_1 = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#ibinder = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#empty = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#int8_1 = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#int32_1 = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#int64_1 = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#hexInt32_pos_1 = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#hexInt64_pos_1 = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#const_exprs_1 = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#const_exprs_2 = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#const_exprs_3 = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#const_exprs_4 = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#const_exprs_5 = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#const_exprs_6 = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#const_exprs_7 = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#const_exprs_8 = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#const_exprs_9 = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#const_exprs_10 = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#addString1 = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#addString2 = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#shouldSetBit0AndBit2 = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#u = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#shouldBeConstS1 = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#defaultWithFoo = _sub_parcel.read()?;
-                Ok(())
+                ::core::result::Result::Ok(())
             })
         }
     }
@@ -827,12 +827,12 @@ pub mod StructuredParcelable {
         impl rsbinder::Parcelable for Empty {
             fn write_to_parcel(&self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
                 _parcel.sized_write(|_sub_parcel| {
-                    Ok(())
+                    ::core::result::Result::Ok(())
                 })
             }
             fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
                 _parcel.sized_read(|_sub_parcel| {
-                    Ok(())
+                    ::core::result::Result::Ok(())
                 })
             }
         }
@@ -893,7 +893,7 @@ pub mod LongEnum {
     }
 }
 pub mod Union {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, non_camel_case_types, dead_code, deprecated)]
     #[derive(Debug)]
     #[derive(Clone,PartialEq)]
     pub enum r#Union {
