@@ -14,7 +14,7 @@ use crate::{add_indent, parser, Namespace};
 // `deprecated` allow: plumbing names the item; module-scoped, so outside consumers still warn.
 const ENUM_TEMPLATE: &str = r##"
 pub mod {{mod}} {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, deprecated)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, deprecated, reason = "rsbinder-aidl generated code")]
     {{crate}}::declare_binder_enum! {
         {%- if deprecated %}
         {{ deprecated }}
@@ -33,7 +33,7 @@ pub mod {{mod}} {
 
 const UNION_TEMPLATE: &str = r#"
 pub mod {{mod}} {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, non_camel_case_types, dead_code, deprecated)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, non_camel_case_types, dead_code, deprecated, reason = "rsbinder-aidl generated code")]
     #[derive(Debug)]
     {%- if derive|length > 0 %}
     #[derive({{ derive }})]
@@ -123,7 +123,7 @@ pub mod {{mod}} {
 
 const PARCELABLE_TEMPLATE: &str = r#"
 pub mod {{mod}} {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated, reason = "rsbinder-aidl generated code")]
     {%- for member in const_members %}
     {%- if member.3 %}
     {{ member.3 }}
@@ -219,7 +219,7 @@ pub mod {{mod}} {
 
 const INTERFACE_TEMPLATE: &str = r#"
 pub mod {{mod}} {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated, reason = "rsbinder-aidl generated code")]
     {%- for member in const_members %}
     {%- if member.3 %}
     {{ member.3 }}
@@ -530,7 +530,7 @@ pub mod {{mod}} {
             let _status = _aidl_reply.read::<{{crate}}::Status>()?;
             if !_status.is_ok() { return ::core::result::Result::Err(_status); }
             let _aidl_return: ::std::string::String = _aidl_reply.read()?;
-            *self.cached_hash.lock().unwrap() = ::core::option::Option::Some(_aidl_return.clone());
+            *self.cached_hash.lock().expect("cached_hash poisoned") = ::core::option::Option::Some(_aidl_return.clone());
             ::core::result::Result::Ok(_aidl_return)
         }
         {%- endif %}
@@ -569,7 +569,7 @@ pub mod {{mod}} {
         {%- if hash %}
         fn r#getInterfaceHash(&self) -> {{crate}}::BinderResult<::std::string::String> {
             {
-                let _aidl_hash_lock = self.cached_hash.lock().unwrap();
+                let _aidl_hash_lock = self.cached_hash.lock().expect("cached_hash poisoned");
                 if let ::core::option::Option::Some(ref _aidl_hash) = *_aidl_hash_lock {
                     return ::core::result::Result::Ok(_aidl_hash.clone());
                 }
@@ -638,7 +638,7 @@ pub mod {{mod}} {
         {%- if hash %}
         fn r#getInterfaceHash<'a>(&'a self) -> {{crate}}::BoxFuture<'a, {{crate}}::BinderResult<::std::string::String>> {
             {
-                let _aidl_hash_lock = self.cached_hash.lock().unwrap();
+                let _aidl_hash_lock = self.cached_hash.lock().expect("cached_hash poisoned");
                 if let ::core::option::Option::Some(ref _aidl_hash) = *_aidl_hash_lock {
                     return ::std::boxed::Box::pin(::std::future::ready(::core::result::Result::Ok(_aidl_hash.clone())));
                 }
@@ -2199,7 +2199,7 @@ impl Generator {
             let escaped = crate::escape_rust_keyword(&decl.name);
             let rendered = format!(r#"
 pub mod {mod} {{
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated, reason = "rsbinder-aidl generated code")]
     pub type {name} = {rust_type};
 }}
 "#, mod = escaped, name = escaped, rust_type = decl.rust_type);

@@ -42,7 +42,7 @@ parcelable ArrayOfInterfaces {
         "##,
         r##"
 pub mod ArrayOfInterfaces {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated, reason = "rsbinder-aidl generated code")]
     #[derive(Debug)]
     pub struct ArrayOfInterfaces {
     }
@@ -70,7 +70,7 @@ pub mod ArrayOfInterfaces {
         fn descriptor() -> &'static str { "ArrayOfInterfaces" }
     }
     pub mod IEmptyInterface {
-        #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
+        #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated, reason = "rsbinder-aidl generated code")]
         pub trait IEmptyInterface: rsbinder::Interface + ::core::marker::Send {
             fn descriptor() -> &'static str where Self: Sized { "ArrayOfInterfaces.IEmptyInterface" }
             fn getDefaultImpl() -> ::core::option::Option<IEmptyInterfaceDefaultRef> where Self: Sized {
@@ -116,7 +116,7 @@ pub mod ArrayOfInterfaces {
         }
     }
     pub mod IMyInterface {
-        #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
+        #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated, reason = "rsbinder-aidl generated code")]
         pub trait IMyInterface: rsbinder::Interface + ::core::marker::Send {
             fn descriptor() -> &'static str where Self: Sized { "ArrayOfInterfaces.IMyInterface" }
             fn r#methodWithInterfaces(&self, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: ::core::option::Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut ::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut ::std::vec::Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: ::core::option::Option<&[::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::BinderResult<::core::option::Option<::std::vec::Vec<::core::option::Option<::std::string::String>>>>;
