@@ -34,7 +34,9 @@
 //! `kernel_refs > 0`. Either way it is an integrity error, reported as
 //! `DeadObject`.
 
-use crate::{binder::*, error::*, parcel::Parcel, process_state::*, sys::*};
+use crate::{
+    binder::*, binder_object::FlatBinderObject, error::*, parcel::Parcel, process_state::*, sys::*,
+};
 
 /// Core trait for types that can be serialized to and from parcels.
 ///
@@ -355,44 +357,6 @@ impl Serialize for str {
 
 impl SerializeArray for &str {}
 
-macro_rules! parcelable_struct {
-    {
-        $(
-            impl $trait:ident for $ty:ty;
-        )*
-    } => {
-        $(impl_parcelable_struct!{$trait, $ty})*
-    };
-}
-
-macro_rules! impl_parcelable_struct {
-    {Serialize, $ty:ty} => {
-        impl Serialize for $ty {
-            fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
-                parcel.write_aligned(self)
-            }
-        }
-    };
-
-    {Deserialize, $ty:ty} => {
-        impl Deserialize for $ty {
-            fn deserialize(parcel: &mut Parcel) -> Result<Self> {
-                const SIZE: usize = std::mem::size_of::<$ty>();
-                // SAFETY: `$ty` is a POD binder-ABI struct (see below): any `[u8; SIZE]` is valid.
-                Ok(unsafe { std::mem::transmute::<[u8; SIZE], $ty>(parcel.try_into()?) })
-            }
-        }
-    };
-}
-
-parcelable_struct! {
-    impl Serialize for binder_transaction_data_secctx;
-    impl Deserialize for binder_transaction_data_secctx;
-
-    impl Serialize for binder_transaction_data;
-    impl Deserialize for binder_transaction_data;
-}
-
 impl Serialize for String {
     fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
         self.as_str().serialize(parcel)
@@ -479,13 +443,13 @@ impl Deserialize for String {
 
 impl DeserializeArray for String {}
 
-impl Deserialize for flat_binder_object {
+impl Deserialize for FlatBinderObject {
     fn deserialize(parcel: &mut Parcel) -> Result<Self> {
         parcel.read_object(false)
     }
 }
 
-impl Serialize for flat_binder_object {
+impl Serialize for FlatBinderObject {
     fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
         parcel.write_object(self, false)?;
         Ok(())
@@ -531,7 +495,7 @@ impl SerializeOption for SIBinder {
             }
 
             None => {
-                parcel.write::<flat_binder_object>(&flat_binder_object::default())?;
+                parcel.write::<FlatBinderObject>(&FlatBinderObject::default())?;
                 if crate::sdk_at_least(30) {
                     parcel.write::<i32>(&Stability::Local.into())?;
                 }
@@ -568,7 +532,7 @@ impl DeserializeOption for SIBinder {
             return Err(StatusCode::BadType);
         }
 
-        let flat: flat_binder_object = parcel.read()?;
+        let flat: FlatBinderObject = parcel.read()?;
         let stability: i32 = if crate::sdk_at_least(30) {
             parcel.read()?
         } else {

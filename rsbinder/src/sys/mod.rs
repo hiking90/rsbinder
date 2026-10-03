@@ -18,13 +18,28 @@
 //!
 //! These three conditions cover every request whose argument is plain
 //! data. `BINDER_WRITE_READ` is the exception: `binder_write_read`
-//! carries two raw addresses, and the kernel reads `write_size` bytes
-//! from `write_buffer` and writes up to `read_size` bytes to
-//! `read_buffer`. The argument type cannot state that, so
-//! `binder::write_read` is an `unsafe fn` whose caller guarantees that
-//! `write_buffer` is readable for `write_size` bytes, `read_buffer` is
-//! writable for `read_size` bytes, and both stay allocated and
-//! unaliased by other writers until the ioctl returns.
+//! carries two raw addresses, and the kernel reads from `write_buffer`
+//! and writes into `read_buffer`.
+//!
+//! `binder::write_read` takes the two buffers as slices and sets the
+//! addresses and sizes itself, so the borrows keep both allocated and
+//! unaliased for the call. It refuses a consumed count past its buffer
+//! or a read count that is not a whole 4-byte word, and rounds the read
+//! buffer down to whole words. `binder_thread_read`
+//! (`drivers/android/binder.c`) starts at `read_buffer + read_consumed`,
+//! writes `BR_NOOP` there before any room check when `read_consumed` is
+//! 0, and its later room check (`end - ptr` against an unsigned size)
+//! passes once `ptr` is past `end`; every write after that is a whole
+//! word. With these checks the driver writes only inside `read`.
+//!
+//! The slices cannot vouch for the commands in `write`. A
+//! `BC_FREE_BUFFER` naming a receive buffer that a live `Parcel` still
+//! reads lets the driver hand that buffer to the next transaction and
+//! overwrite it under the parcel's `&[u8]`. So `write_read` stays an
+//! `unsafe fn`: its caller guarantees that `write` frees no buffer a
+//! live `Parcel` reads. The command stream queues `BC_FREE_BUFFER` only
+//! from `thread_state::free_buffer`, called when a parcel drops or for a
+//! status reply no parcel ever wrapped.
 
 // Allowances scoped to the bindgen output: `dead_code` still flags unused wrappers below.
 #[allow(
@@ -147,17 +162,31 @@ pub mod binder {
 
     // Shared SAFETY rationale for every ioctl below: module doc, "ioctl safety".
 
-    /// Safety: both buffer addresses must satisfy the module doc's `BINDER_WRITE_READ` contract.
+    /// Safety: `write` frees no buffer a live `Parcel` reads (module doc `BINDER_WRITE_READ`).
     pub(crate) unsafe fn write_read<Fd: AsFd>(
         fd: Fd,
-        write_read: &mut binder_write_read,
+        write: &[u8],
+        read: &mut [u8],
+        progress: &mut binder_write_read,
     ) -> std::result::Result<(), io::Errno> {
+        let words = read.len() & !3;
+        let read = &mut read[..words];
+        if progress.write_consumed > write.len() as binder_size_t
+            || progress.read_consumed > read.len() as binder_size_t
+            || progress.read_consumed % 4 != 0
+        {
+            return Err(io::Errno::INVAL);
+        }
+        progress.write_size = write.len() as binder_size_t;
+        progress.write_buffer = write.as_ptr() as binder_uintptr_t;
+        progress.read_size = read.len() as binder_size_t;
+        progress.read_buffer = read.as_mut_ptr() as binder_uintptr_t;
         unsafe {
-            // SAFETY: shared rationale above; the buffer addresses are the caller's contract.
+            // SAFETY: shared rationale above; buffers checked here, commands the caller's contract.
             let ctl = ioctl::Updater::<
                 { ioctl::opcode::read_write::<binder_write_read>(b'b', 1) },
                 _,
-            >::new(write_read);
+            >::new(progress);
             ioctl::ioctl(fd, ctl)
         }
     }
@@ -348,6 +377,55 @@ pub mod binder {
                 _,
             >::new(ee);
             ioctl::ioctl(fd, ctl)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn progress(write_consumed: u64, read_consumed: u64) -> binder_write_read {
+            binder_write_read {
+                write_size: 0,
+                write_consumed,
+                write_buffer: 0,
+                read_size: 0,
+                read_consumed,
+                read_buffer: 0,
+            }
+        }
+
+        // /dev/null: a refused count never reaches the ioctl; an accepted one gets ENOTTY.
+        fn call(write: &[u8], read: &mut [u8], bwr: &mut binder_write_read) -> io::Errno {
+            let null = std::fs::File::open("/dev/null").expect("/dev/null");
+            // SAFETY: `write` holds no command the driver could act on; the fd is not binder.
+            unsafe { write_read(&null, write, read, bwr) }.expect_err("not a binder fd")
+        }
+
+        #[test]
+        fn write_read_refuses_a_consumed_count_outside_its_buffer() {
+            let mut read = [0u8; 8];
+            assert_eq!(
+                call(&[0; 4], &mut read, &mut progress(5, 0)),
+                io::Errno::INVAL
+            );
+            assert_eq!(call(&[], &mut read, &mut progress(0, 12)), io::Errno::INVAL);
+            assert_eq!(call(&[], &mut read, &mut progress(0, 2)), io::Errno::INVAL);
+            assert_ne!(
+                call(&[0; 4], &mut read, &mut progress(4, 8)),
+                io::Errno::INVAL
+            );
+        }
+
+        #[test]
+        fn write_read_lends_the_read_buffer_in_whole_words() {
+            let mut read = [0u8; 7];
+            let mut bwr = progress(0, 0);
+            call(&[0; 4], &mut read, &mut bwr);
+            assert_eq!((bwr.write_size, bwr.read_size), (4, 4));
+            // Under a word: no read at all, so the driver's unchecked `BR_NOOP` never lands.
+            call(&[], &mut read[..3], &mut bwr);
+            assert_eq!(bwr.read_size, 0);
         }
     }
 }

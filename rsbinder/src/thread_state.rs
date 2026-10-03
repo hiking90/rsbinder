@@ -85,14 +85,16 @@
 //! - **`dispatch_transact_caught`** is called with no `THREAD_STATE` or
 //!   `BINDER_DEREFS` borrow held: `Transactable::transact` is user code that
 //!   may make nested binder calls into this module.
-//! - **`talk_with_driver`** holds an immutable `THREAD_STATE` borrow across the
-//!   `BINDER_WRITE_READ` ioctl to read `driver`. This is sound only because
-//!   the ioctl does not re-enter Rust on the same thread (the kernel queues
-//!   incoming work and returns). EINTR / signal-safety / cancellation handling
-//!   or any same-thread Rust callback added at this point breaks that
-//!   property and turns the borrow into an R1 violation; the fix then is to
-//!   clone the `Arc<File>` out under a short borrow and pass it by value
-//!   across the syscall.
+//! - **`talk_with_driver`** holds a mutable `THREAD_STATE` borrow across the
+//!   `BINDER_WRITE_READ` ioctl: the ioctl reads `out_parcel`'s bytes and
+//!   fills `in_parcel`'s buffer, both lent as slices out of that borrow. This
+//!   is sound only because the ioctl does not re-enter Rust on the same
+//!   thread (the kernel queues incoming work and returns). EINTR /
+//!   signal-safety / cancellation handling or any same-thread Rust callback
+//!   added at this point breaks that property and turns the borrow into an
+//!   R1 violation; the fix then is to move both buffers and a clone of the
+//!   `Arc<File>` out under a short borrow, and put the buffers back after the
+//!   syscall.
 //!
 //! # RPC calling context
 //!
@@ -260,7 +262,13 @@ use std::fs::File;
 use std::sync::{atomic::Ordering, Arc};
 
 use crate::{
-    binder::*, command_stream::CommandStream, error::*, parcel::*, process_state::*, sys::*,
+    binder::*,
+    command_stream::CommandStream,
+    error::*,
+    parcel::*,
+    process_state::*,
+    sys::*,
+    transaction_data::{TransactionData, TransactionDataSecctx},
 };
 
 // R1 (module doc): no borrow of these cells across a call that may re-borrow them.
@@ -583,10 +591,7 @@ struct TransactionState {
 }
 
 impl TransactionState {
-    fn from_transaction_data(
-        data: &binder::binder_transaction_data,
-        calling_sid: Option<CString>,
-    ) -> Self {
+    fn from_transaction_data(data: &TransactionData, calling_sid: Option<CString>) -> Self {
         TransactionState {
             calling_pid: data.sender_pid,
             calling_sid,
@@ -802,46 +807,20 @@ impl ThreadState {
             command_to_str(cmd),
             data
         );
-        // ptr is initialized by zero because ptr(64) and handle(32) size is different.
-        let mut target = binder_transaction_data__bindgen_ty_1 { ptr: 0 };
-        target.handle = handle;
-
-        let tr = if *status == StatusCode::Ok.into() {
-            binder_transaction_data {
-                target,
-                cookie: 0,
-                code,
-                flags,
-                sender_pid: 0,
-                sender_euid: 0,
-                data_size: data.ipc_data_size() as _,
-                offsets_size: (data.objects.len() * std::mem::size_of::<binder_size_t>()) as _,
-                data: binder_transaction_data__bindgen_ty_2 {
-                    ptr: binder_transaction_data__bindgen_ty_2__bindgen_ty_1 {
-                        buffer: data.as_ptr() as _,
-                        offsets: data.objects.as_ptr() as _,
-                    },
-                },
-            }
+        let mut tr = TransactionData::default();
+        tr.set_target_handle(handle);
+        tr.code = code;
+        if *status == StatusCode::Ok.into() {
+            tr.data_size = data.ipc_data_size() as _;
+            tr.offsets_size = (data.objects.len() * std::mem::size_of::<binder_size_t>()) as _;
+            tr.buffer = data.as_ptr() as _;
+            tr.offsets = data.objects.as_ptr() as _;
         } else {
             flags |= binder::transaction_flags_TF_STATUS_CODE;
-            binder_transaction_data {
-                target,
-                cookie: 0,
-                code,
-                flags,
-                sender_pid: 0,
-                sender_euid: 0,
-                data_size: std::mem::size_of::<i32>() as _,
-                offsets_size: 0,
-                data: binder_transaction_data__bindgen_ty_2 {
-                    ptr: binder_transaction_data__bindgen_ty_2__bindgen_ty_1 {
-                        buffer: status as *const i32 as _,
-                        offsets: 0,
-                    },
-                },
-            }
-        };
+            tr.data_size = std::mem::size_of::<i32>() as _;
+            tr.buffer = status as *const i32 as _;
+        }
+        tr.flags = flags;
 
         let start = self.out_parcel.data_size();
         self.out_parcel.write_cmd::<u32>(&cmd)?;
@@ -1150,8 +1129,7 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
                 }
                 binder::BR_REPLY => {
                     let tr = thread_state.borrow_mut().in_parcel.read_transaction()?;
-                    // SAFETY: a kernel BR_REPLY populates the `data.ptr` union arm.
-                    let (buffer, offsets) = unsafe { (tr.data.ptr.buffer, tr.data.ptr.offsets) };
+                    let (buffer, offsets) = (tr.buffer, tr.offsets);
                     if let UntilResponse::Reply = until {
                         if (tr.flags & transaction_flags_TF_STATUS_CODE) == 0 {
                             // SAFETY: the driver's BR_REPLY buffer, unshared until `free_buffer`.
@@ -1285,7 +1263,7 @@ fn dispatch_transact_caught(
 fn dispatch_kernel_observed(
     binder: &SIBinder,
     transactable: &dyn Transactable,
-    tr: &binder::binder_transaction_data,
+    tr: &TransactionData,
     reader: &mut Parcel,
     reply: &mut Parcel,
 ) -> Result<()> {
@@ -1328,21 +1306,20 @@ fn execute_command(cmd: i32) -> Result<()> {
                     if cmd == binder::BR_TRANSACTION_SEC_CTX {
                         thread_state.in_parcel.read_transaction_secctx()?
                     } else {
-                        binder::binder_transaction_data_secctx {
+                        TransactionDataSecctx {
                             transaction_data: thread_state.in_parcel.read_transaction()?,
                             secctx: 0,
                         }
                     }
                 };
 
+                let tr = &tr_secctx.transaction_data;
                 // SAFETY: the driver's BR_TRANSACTION buffer (`data.ptr`), unshared until freed.
                 let mut reader = unsafe {
-                    let tr = &tr_secctx.transaction_data;
-
                     Parcel::from_driver_buffer(
-                        tr.data.ptr.buffer as _,
+                        tr.buffer as _,
                         tr.data_size as _,
-                        tr.data.ptr.offsets as _,
+                        tr.offsets as _,
                         (tr.offsets_size as usize) / std::mem::size_of::<binder::binder_size_t>(),
                         free_buffer,
                     )
@@ -1378,8 +1355,7 @@ fn execute_command(cmd: i32) -> Result<()> {
                     };
 
                 let result = {
-                    // SAFETY: kernel txn to a local binder; `target.ptr` is the active arm.
-                    let target_ptr = unsafe { tr_secctx.transaction_data.target.ptr };
+                    let target_ptr = tr.target_ptr();
                     if target_ptr != 0 {
                         // A `publish_native` id; ref balance: module doc "Dispatch notes".
                         let id = target_ptr;
@@ -1470,8 +1446,7 @@ fn execute_command(cmd: i32) -> Result<()> {
                             let mut log = format!(
                                 "oneway function results for code {} on binder at {:X}",
                                 tr_secctx.transaction_data.code,
-                                // SAFETY: kernel txn; `target.ptr` is the active arm.
-                                unsafe { tr_secctx.transaction_data.target.ptr }
+                                tr_secctx.transaction_data.target_ptr()
                             );
                             log += &format!(" will be dropped but finished with status {err}");
 
@@ -1674,70 +1649,75 @@ fn command_ending_at(out: &mut CommandStream, end: usize) -> Option<u32> {
     None
 }
 
+/// A `binder_write_read` with no progress; `binder::write_read` fills in the buffers.
+fn empty_write_read() -> binder::binder_write_read {
+    binder::binder_write_read {
+        write_size: 0,
+        write_consumed: 0,
+        write_buffer: 0,
+        read_size: 0,
+        read_consumed: 0,
+        read_buffer: 0,
+    }
+}
+
 /// One driver round trip; see module doc "R1 at specific call sites" for its ioctl borrow.
 fn talk_with_driver(do_receive: bool) -> Result<()> {
     THREAD_STATE.with(|thread_state| -> Result<()> {
-        let mut bwr = {
-            let mut thread_state = thread_state.borrow_mut();
-            let need_read = thread_state.in_parcel.is_empty();
-            let out_avail = if !do_receive || need_read {
-                thread_state.out_parcel.data_size()
-            } else {
-                0
-            };
-
-            let read_size = if do_receive && need_read {
-                thread_state.in_parcel.capacity()
-            } else {
-                0
-            };
-
-            binder::binder_write_read {
-                write_size: out_avail as _,
-                write_consumed: 0,
-                write_buffer: thread_state.out_parcel.as_mut_ptr() as _,
-                read_size: read_size as _,
-                read_consumed: 0,
-                read_buffer: thread_state.in_parcel.as_mut_ptr() as _,
-            }
+        let mut thread_state = thread_state.borrow_mut();
+        let thread_state = &mut *thread_state;
+        let need_read = thread_state.in_parcel.is_empty();
+        let receive = do_receive && need_read;
+        let write: &[u8] = if !do_receive || need_read {
+            thread_state.out_parcel.as_bytes()?
+        } else {
+            &[]
         };
 
-        if bwr.write_size == 0 && bwr.read_size == 0 {
+        if write.is_empty() && !receive {
             return Ok(());
         }
 
-        if bwr.write_size != 0 {
-            log::trace!(
-                "Sending command to driver:\n{:?}",
-                thread_state.borrow().out_parcel
-            );
-            log::trace!(
-                "Size of receive buffer: {}, need_read: {}, do_receive: {}",
-                bwr.read_size,
-                thread_state.borrow().in_parcel.is_empty(),
-                do_receive
-            );
+        if !write.is_empty() {
+            log::trace!("Sending command to driver:\n{:?}", thread_state.out_parcel);
+            log::trace!("need_read: {need_read}, do_receive: {do_receive}");
         }
 
-        ensure_thread_exit_guard(&thread_state.borrow().driver);
+        ensure_thread_exit_guard(&thread_state.driver);
 
-        loop {
-            // SAFETY: `bwr` points at `out_parcel` (`data_size`) and `in_parcel` (`capacity`).
-            let res = unsafe { binder::write_read(&thread_state.borrow().driver, &mut bwr) };
-            match res {
-                Ok(_) => break,
-                Err(errno) if errno != rustix::io::Errno::INTR => {
-                    // A bad command fails the whole ioctl, so caller bugs surface here, not below.
-                    let detail = describe_refused_command(
-                        &mut thread_state.borrow_mut().out_parcel,
-                        bwr.write_consumed as _,
-                        false,
-                    );
-                    log::error!("binder::write_read() error : {errno}; {detail}");
-                    return Err(StatusCode::from(errno));
-                }
-                _ => {}
+        // Zeroed and lent only when empty: unread commands in `in_parcel` stay put otherwise.
+        let read: &mut [u8] = if receive {
+            thread_state.in_parcel.driver_read_buffer()
+        } else {
+            &mut []
+        };
+        let mut bwr = empty_write_read();
+        let res = loop {
+            // SAFETY: `out_parcel` frees buffers only through `free_buffer` (`sys` module doc).
+            match unsafe { binder::write_read(&thread_state.driver, write, read, &mut bwr) } {
+                Err(rustix::io::Errno::INTR) => {}
+                res => break res,
             }
+        };
+
+        if receive {
+            let filled = if res.is_ok() {
+                bwr.read_consumed as _
+            } else {
+                0
+            };
+            thread_state.in_parcel.driver_read_done(filled)?;
+        }
+
+        if let Err(errno) = res {
+            // A bad command fails the whole ioctl, so caller bugs surface here, not below.
+            let detail = describe_refused_command(
+                &mut thread_state.out_parcel,
+                bwr.write_consumed as _,
+                false,
+            );
+            log::error!("binder::write_read() error : {errno}; {detail}");
+            return Err(StatusCode::from(errno));
         }
 
         log::trace!(
@@ -1748,47 +1728,34 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
             bwr.read_size
         );
 
-        // Process write and read results in a single borrow_mut scope
-        {
-            let mut thread_state = thread_state.borrow_mut();
-
-            if bwr.write_consumed > 0 {
-                if bwr.write_consumed < thread_state.out_parcel.data_size() as _ {
-                    let detail = describe_refused_command(
-                        &mut thread_state.out_parcel,
-                        bwr.write_consumed as _,
-                        true,
-                    );
-                    // stderr, not `log`: a consumer with no logger would otherwise die mute.
-                    eprintln!(
-                        "rsbinder FATAL: driver did not consume the write buffer — {detail}\n\
-                         The remainder was never seen by the kernel, so the reference\n\
-                         counts and buffer ownership this process believes in are no\n\
-                         longer the kernel's. Queued commands:\n{:?}",
-                        thread_state.out_parcel
-                    );
-                    // Abort like AOSP: a caught panic would resume on the desynced stream.
-                    std::process::abort();
-                }
-                thread_state.out_parcel.set_data_size(0)?;
-                thread_state.out_flush_epoch += 1;
-            }
-
-            if bwr.read_consumed > 0 {
-                // SAFETY: the driver just filled `0..read_consumed` through `read_buffer`.
-                unsafe {
-                    thread_state
-                        .in_parcel
-                        .set_data_size_driver_filled(bwr.read_consumed as _)?;
-                }
-                thread_state.in_parcel.set_data_position(0);
-
-                log::trace!(
-                    "Received commands from driver:\n{:?}",
-                    thread_state.in_parcel
+        if bwr.write_consumed > 0 {
+            if bwr.write_consumed < thread_state.out_parcel.data_size() as _ {
+                let detail = describe_refused_command(
+                    &mut thread_state.out_parcel,
+                    bwr.write_consumed as _,
+                    true,
                 );
+                // stderr, not `log`: a consumer with no logger would otherwise die mute.
+                eprintln!(
+                    "rsbinder FATAL: driver did not consume the write buffer — {detail}\n\
+                     The remainder was never seen by the kernel, so the reference\n\
+                     counts and buffer ownership this process believes in are no\n\
+                     longer the kernel's. Queued commands:\n{:?}",
+                    thread_state.out_parcel
+                );
+                // Abort like AOSP: a caught panic would resume on the desynced stream.
+                std::process::abort();
             }
-        } // thread_state is dropped here
+            thread_state.out_parcel.set_data_size(0)?;
+            thread_state.out_flush_epoch += 1;
+        }
+
+        if bwr.read_consumed > 0 {
+            log::trace!(
+                "Received commands from driver:\n{:?}",
+                thread_state.in_parcel
+            );
+        }
 
         Ok(())
     })
@@ -1843,17 +1810,11 @@ fn write_without_thread_state<T: NativeScalar>(cmd: u32, arg: T) -> Result<()> {
     out.write_cmd::<u32>(&cmd)?;
     out.write_cmd::<T>(&arg)?;
     let driver = ProcessState::as_self().driver();
-    let mut bwr = binder::binder_write_read {
-        write_size: out.data_size() as _,
-        write_consumed: 0,
-        write_buffer: out.as_mut_ptr() as _,
-        read_size: 0,
-        read_consumed: 0,
-        read_buffer: 0,
-    };
+    let write = out.as_bytes()?;
+    let mut bwr = empty_write_read();
     loop {
-        // SAFETY: `write_buffer` is the live local `out` (`data_size` bytes); nothing is read.
-        match unsafe { binder::write_read(&*driver, &mut bwr) } {
+        // SAFETY: one command; a `BC_FREE_BUFFER` here comes from `free_buffer` (`sys` module doc).
+        match unsafe { binder::write_read(&*driver, write, &mut [], &mut bwr) } {
             Ok(()) => break,
             Err(errno) if errno == rustix::io::Errno::INTR => {}
             Err(errno) => {
@@ -3075,8 +3036,7 @@ mod tests {
             }
         }
         let binder = Interface::as_binder(&crate::native::Binder::new(Named));
-        // SAFETY: `binder_transaction_data` is plain C data; all-zero is a valid value.
-        let tr: binder::binder_transaction_data = unsafe { std::mem::zeroed() };
+        let tr = TransactionData::default();
         let replied = |status| {
             let (mut reader, mut reply) = (Parcel::new(), Parcel::new());
             dispatch_kernel_observed(&binder, &Fails(status), &tr, &mut reader, &mut reply)
@@ -3554,22 +3514,14 @@ mod tests {
 
         let mut buffer = [0u8; 8];
         let mut offsets = [0 as binder_size_t; 1];
-        let tr = binder_transaction_data {
-            target: binder_transaction_data__bindgen_ty_1 { ptr: id },
-            cookie: 0,
-            code: 1,
-            flags: binder::transaction_flags_TF_ONE_WAY,
-            sender_pid: 9999,
-            sender_euid: 1000,
-            data_size: 0,
-            offsets_size: 0,
-            data: binder_transaction_data__bindgen_ty_2 {
-                ptr: binder_transaction_data__bindgen_ty_2__bindgen_ty_1 {
-                    buffer: buffer.as_mut_ptr() as _,
-                    offsets: offsets.as_mut_ptr() as _,
-                },
-            },
-        };
+        let mut tr = TransactionData::default();
+        tr.set_target_ptr(id);
+        tr.code = 1;
+        tr.flags = binder::transaction_flags_TF_ONE_WAY;
+        tr.sender_pid = 9999;
+        tr.sender_euid = 1000;
+        tr.buffer = buffer.as_mut_ptr() as _;
+        tr.offsets = offsets.as_mut_ptr() as _;
 
         let (was_looper, mark) = THREAD_STATE.with(|ts| {
             let mut ts = ts.borrow_mut();
@@ -3635,8 +3587,7 @@ mod tests {
     fn calling_sid_outlives_the_transaction_buffer() {
         ProcessState::init_default().expect("init_default");
         let mut buffer = b"u:r:system_server:s0\0".to_vec();
-        // SAFETY: plain-old-data kernel struct; all-zero is a valid value.
-        let mut data: binder::binder_transaction_data = unsafe { std::mem::zeroed() };
+        let mut data = TransactionData::default();
         data.sender_euid = 1000;
         let start = buffer.as_ptr() as usize;
         let sid = copy_c_string(start, start + buffer.len());
@@ -4011,9 +3962,7 @@ mod tests {
         out.write_cmd::<u32>(&binder::BC_INCREFS).unwrap();
         out.write_cmd::<u32>(&7u32).unwrap();
         out.write_cmd::<u32>(&binder::BC_TRANSACTION).unwrap();
-        // SAFETY: `binder_transaction_data` is plain C data; all-zero is a valid value.
-        out.write_transaction(&unsafe { std::mem::zeroed() })
-            .unwrap();
+        out.write_transaction(&TransactionData::default()).unwrap();
         let second = out.data_size();
         out.write_cmd::<u32>(&binder::BC_FREE_BUFFER).unwrap();
         out.write_cmd::<binder_uintptr_t>(&0).unwrap();

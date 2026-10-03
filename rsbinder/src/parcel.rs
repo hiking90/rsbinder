@@ -147,20 +147,17 @@
 //!
 //! # `ParcelPod`
 //!
-//! `Parcel::write_aligned`, `write_array` and `read_array` reinterpret a `&T`
-//! / `&[T]` as raw bytes (and, on read, raw bytes as `T`). That is sound only
-//! for a type with no padding or otherwise-uninitialized bytes (those bytes
-//! would leak process memory to the peer, and reading them is UB) and for
-//! which every bit pattern is a valid value (a peer's bytes become a `T`
-//! without validation). The `T: ParcelPod` bound carries that obligation in
-//! the signature instead of leaving it to whichever caller instantiates the
-//! generic.
+//! `Parcel::write_array` and `read_array` reinterpret a `&[T]` as raw bytes
+//! (and, on read, raw bytes as `T`). That is sound only for a type with no
+//! padding or otherwise-uninitialized bytes (those bytes would leak process
+//! memory to the peer, and reading them is UB) and for which every bit pattern
+//! is a valid value (a peer's bytes become a `T` without validation). The
+//! `T: ParcelPod` bound carries that obligation in the signature instead of
+//! leaving it to whichever caller instantiates the generic.
 //!
-//! Safety contract for an implementor: `#[repr(C)]` / `#[repr(transparent)]`
-//! or a primitive, no padding, and valid for every bit pattern of its size.
-//! For the bindgen binder-ABI structs every union member must also be written
-//! full-width by the constructor (`flat_binder_object::new_*` do; see the
-//! `*_full_width_init` tests in `binder_object.rs`).
+//! Safety contract for an implementor: a primitive integer or float, so no
+//! padding and valid for every bit pattern of its size. The UAPI structs are
+//! not members: they go through field-by-field codecs ("Binder-ABI structs").
 //!
 //! # Wire and native scalars
 //!
@@ -170,7 +167,7 @@
 //! bytes and the generated code are unchanged; a big-endian host pays a swap
 //! and gains a parcel its peers can read. `NativeScalar` is the kernel command
 //! stream — the `BC_*` / `BR_*` ioctl buffer the driver parses with native
-//! loads — and stays host-native, as do the UAPI structs (`ParcelPod`). Both
+//! loads — and stays host-native, as do the UAPI structs' codecs. Both
 //! traits exist because the two layers share one `Parcel` and the same 4-byte
 //! slots, so only the name at the call site says which contract is in force:
 //! a value going to the driver must not be byte-swapped, a value going to a
@@ -211,16 +208,17 @@
 //! That buffer is read-only in this process: `binder_mmap` refuses a
 //! mapping with `VM_WRITE`, and `ProcessState` maps it `PROT_READ`. So
 //! `ParcelData::Slice` holds a shared `&[T]`, and every `ParcelData` method
-//! that would write through it (`as_mut_slice`, `as_mut_ptr`, `reserve`,
-//! `set_len`, `push`) panics instead. Every write path reserves first, so a
-//! write into a received parcel stops at that panic.
+//! that would write through it (`as_mut_slice`, `reserve`, `resize`,
+//! `truncate`, `write_at`, `push`) panics instead. Every write path goes
+//! through `write_at`, so a write into a received parcel stops at that panic.
 //!
-//! `ParcelData::set_len` grows in two places: the write paths, after
-//! initializing `old_len..end` themselves ("Buffer growth"), and
-//! `Parcel::set_data_size_driver_filled`, after the binder driver filled the
-//! spare capacity through `as_mut_ptr` — `talk_with_driver` calls it with
-//! `read_consumed`, the count the driver reports having written.
-//! `Parcel::set_data_size` only shrinks.
+//! The command stream the driver fills is an owned `Vec`, never spare
+//! capacity: `Parcel::driver_read_buffer` zero-fills the buffer up to its
+//! capacity and lends it as `&mut [u8]`, and `Parcel::driver_read_done` then
+//! truncates it to `read_consumed`, the count the driver reports having
+//! written. Every byte the driver may write is initialized before the ioctl,
+//! so the length never has to be set by hand. `Parcel::set_data_size` only
+//! shrinks, through `truncate`.
 //!
 //! # Kernel proxies
 //!
@@ -298,21 +296,23 @@
 //! # Buffer growth
 //!
 //! Every write path (`write_aligned_data`, `write_array`, `write_array_char`,
-//! `append_from`) bounds its end position to `i32::MAX` before reserving: wire
+//! `append_from`) bounds its end position to `i32::MAX` before writing: wire
 //! offsets are `int32`, so a larger position can only come from a misuse of the
 //! public `set_data_position`, and it is refused as `BadValue` rather than
-//! overflowed into a wild `reserve`/`write_bytes` (AOSP `Parcel::growData`
+//! overflowed into a wild allocation (AOSP `Parcel::growData`
 //! returns `BAD_VALUE` for `len > INT32_MAX`).
 //!
-//! `reserve` allocates without initializing, and `set_len` then marks the bytes
-//! initialized, so every byte below the new length is written first:
+//! The bytes themselves go through `ParcelData::write_at`, which grows the
+//! buffer only with safe `Vec` calls and fixes the content of the two ranges a
+//! write does not supply:
 //!
 //! - the `len..pos` gap a forward `set_data_position` leaves is zero-filled
 //!   (AOSP `growData` zero-fills grown capacity the same way);
 //! - the 0-3 trailing pad bytes of an unaligned write are zeroed. The pad is
 //!   transmitted (it counts in `data_size`), and AOSP masks it to zero too.
 //!
-//! Skipping either is UB and sends uninitialized process memory to the peer.
+//! An existing byte inside `pos..end` is overwritten, a missing one appended,
+//! so a write in the middle of a parcel copies each byte once.
 //!
 //! # `append_from`
 //!
@@ -406,13 +406,13 @@
 //!
 //! # Binder-ABI structs
 //!
-//! `flat_binder_object`, `binder_transaction_data` and
-//! `binder_transaction_data_secctx` implement `ParcelPod`: bindgen `#[repr(C)]`
-//! structs of integers, pointers-as-integers and unions of those, with no
-//! padding (8-byte-multiple field groups), so every bit pattern is valid. Their
-//! union members are written full-width by the constructors in
-//! `binder_object.rs` and by `write_transaction_data` (`ptr: 0` before
-//! `.handle`).
+//! The UAPI structs the driver parses are never viewed as raw bytes. Each has
+//! a Rust struct with no union and a field-by-field host-native codec:
+//! `flat_binder_object` is `FlatBinderObject` (`binder_object.rs`), and
+//! `binder_transaction_data` / `binder_transaction_data_secctx` are
+//! `TransactionData` / `TransactionDataSecctx` (`transaction_data.rs`). A union
+//! is held as its bytes, so no arm can be left uninitialized and no read picks
+//! the wrong arm.
 
 use std::default::Default;
 use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
@@ -422,10 +422,10 @@ use pretty_hex::*;
 
 use crate::{
     binder,
-    binder_object::{read_flat_binder, write_flat_binder},
+    binder_object::{read_flat_binder, write_flat_binder, FlatBinderObject},
     error::{Result, StatusCode},
     parcelable::*,
-    sys::binder::{binder_size_t, flat_binder_object},
+    sys::binder::binder_size_t,
     sys::{binder_uintptr_t, BINDER_TYPE_FD, BINDER_TYPE_HANDLE},
     thread_state,
 };
@@ -489,11 +489,6 @@ macro_rules! impl_scalar_codecs {
     )* };
 }
 impl_scalar_codecs!(i8, u8, i16, u16, i32, u32, i64, u64, u128, f32, f64);
-
-// SAFETY: padding-free integer-only `#[repr(C)]` structs; see module doc "Binder-ABI structs".
-unsafe impl ParcelPod for flat_binder_object {}
-unsafe impl ParcelPod for crate::sys::binder_transaction_data {}
-unsafe impl ParcelPod for crate::sys::binder_transaction_data_secctx {}
 
 #[inline]
 pub(crate) fn pad_size(len: usize) -> usize {
@@ -605,23 +600,14 @@ impl<T: Clone + Default> ParcelData<T> {
         }
     }
 
-    fn as_mut_ptr(&mut self) -> *mut T {
-        match self {
-            ParcelData::Vec(ref mut v) => v.as_mut_ptr(),
-            _ => panic!("&[u8] can't support as_mut_ptr()."),
-        }
-    }
-
     pub(crate) fn len(&self) -> usize {
         self.as_slice().len()
     }
 
-    /// # Safety: `len <= capacity()`, `0..len` initialized (module doc "Kernel receive buffers").
-    unsafe fn set_len(&mut self, len: usize) {
+    fn resize(&mut self, len: usize) {
         match self {
-            // SAFETY: the caller upholds `len <= capacity` and that `0..len` is initialized.
-            ParcelData::Vec(v) => unsafe { v.set_len(len) },
-            _ => panic!("&[u8] can't support set_len()."),
+            ParcelData::Vec(v) => v.resize(len, T::default()),
+            _ => panic!("&[u8] can't support resize()."),
         }
     }
 
@@ -643,6 +629,35 @@ impl<T: Clone + Default> ParcelData<T> {
         match self {
             ParcelData::Vec(v) => v.push(other),
             _ => panic!("push() is only available for ParcelData::Vec."),
+        }
+    }
+
+    fn truncate(&mut self, len: usize) {
+        match self {
+            ParcelData::Vec(v) => v.truncate(len),
+            _ => panic!("&[u8] can't support truncate()."),
+        }
+    }
+}
+
+impl ParcelData<u8> {
+    /// Writes `bytes` then `pad` zeros at `pos`, zero-filling a `len..pos` gap ("Buffer growth").
+    fn write_at(&mut self, pos: usize, bytes: &[u8], pad: usize) {
+        let ParcelData::Vec(v) = self else {
+            panic!("&[u8] can't support write_at().");
+        };
+        if pos > v.len() {
+            v.resize(pos, 0);
+        }
+        let end = pos + bytes.len();
+        let overwrite = v.len().min(end) - pos;
+        v[pos..pos + overwrite].copy_from_slice(&bytes[..overwrite]);
+        v.extend_from_slice(&bytes[overwrite..]);
+        let pad_end = end + pad;
+        let fill_to = v.len().min(pad_end);
+        v[end..fill_to].fill(0);
+        if v.len() < pad_end {
+            v.resize(pad_end, 0);
         }
     }
 }
@@ -977,7 +992,7 @@ impl Parcel {
         // SAFETY: the caller upholds the `from_ipc_parts` memory conditions this needs.
         let mut parcel =
             unsafe { Parcel::over_ipc_buffer(data, length, objects, object_count, free_buffer) };
-        let size = std::mem::size_of::<flat_binder_object>() as u64;
+        let size = FlatBinderObject::SIZE as u64;
         let mut fds: Vec<(u64, RawFd)> = Vec::new();
         for &off in parcel.objects.as_slice() {
             // A copy, never a reference into the 4-byte-aligned buffer (`read_flat_binder`).
@@ -1115,10 +1130,6 @@ impl Parcel {
         }
     }
 
-    pub(crate) fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.data.as_mut_ptr()
-    }
-
     pub(crate) fn as_ptr(&self) -> *const u8 {
         self.data.as_ptr()
     }
@@ -1128,6 +1139,7 @@ impl Parcel {
         self.data.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn capacity(&self) -> usize {
         self.data.capacity()
     }
@@ -1485,7 +1497,7 @@ impl Parcel {
         self.rpc.as_mut().and_then(|r| r.take_in_fd(index))
     }
 
-    /// Shrink only, never through a recorded object; the one grow is `set_data_size_driver_filled`.
+    /// Shrink only, never through a recorded object; the driver grows it via `driver_read_buffer`.
     pub(crate) fn set_data_size(&mut self, new_len: usize) -> Result<()> {
         if new_len > self.data.len() {
             log::error!(
@@ -1498,35 +1510,39 @@ impl Parcel {
             log::error!("set_data_size({new_len}) would cut a recorded object");
             return Err(StatusCode::InvalidOperation);
         }
-        // SAFETY: shrinking only, so `0..new_len` is an initialized prefix within capacity.
-        unsafe { self.data.set_len(new_len) };
+        self.data.truncate(new_len);
         if new_len < self.pos {
             self.pos = new_len;
         }
         Ok(())
     }
 
-    /// # Safety: bytes `0..new_len` initialized (the driver's `read_consumed`); see module doc.
-    pub(crate) unsafe fn set_data_size_driver_filled(&mut self, new_len: usize) -> Result<()> {
-        if new_len > self.data.capacity() {
+    /// The capacity, zero past `data_size`, for the driver to fill ("Kernel receive buffers").
+    pub(crate) fn driver_read_buffer(&mut self) -> &mut [u8] {
+        let capacity = self.data.capacity();
+        self.data.resize(capacity);
+        self.data.as_mut_slice()
+    }
+
+    /// Keeps the `0..filled` bytes the driver wrote into `driver_read_buffer`; reads from 0.
+    pub(crate) fn driver_read_done(&mut self, filled: usize) -> Result<()> {
+        self.pos = 0;
+        if filled > self.data.len() {
             // A driver claiming more bytes than the buffer holds broke the contract.
             log::error!(
-                "set_data_size_driver_filled({new_len}) exceeds capacity {}",
-                self.data.capacity()
+                "driver_read_done({filled}) exceeds the buffer {}",
+                self.data.len()
             );
+            self.data.truncate(0);
             return Err(StatusCode::BadValue);
         }
-        // SAFETY: within capacity (checked above); the caller vouches `0..new_len` is initialized.
-        unsafe { self.data.set_len(new_len) };
-        if new_len < self.pos {
-            self.pos = new_len;
-        }
+        self.data.truncate(filled);
         Ok(())
     }
 
     /// End of the furthest recorded object, kernel or RPC; 0 if there is none.
     fn recorded_objects_end(&self) -> u64 {
-        let size = std::mem::size_of::<flat_binder_object>() as u64;
+        let size = FlatBinderObject::SIZE as u64;
         let kernel = self.objects.as_slice().iter().map(|&off| off + size).max();
         #[cfg(feature = "rpc")]
         let rpc = self.rpc_object_positions().iter().map(|&p| {
@@ -1678,14 +1694,14 @@ impl Parcel {
         }
     }
 
-    pub(crate) fn read_object(&mut self, null_meta: bool) -> Result<flat_binder_object> {
+    pub(crate) fn read_object(&mut self, null_meta: bool) -> Result<FlatBinderObject> {
         // RPC parcels carry no `flat_binder_object`: an object read here is a protocol error.
         if self.rpc.is_some() {
             return Err(StatusCode::BadType);
         }
 
         let data_pos = self.pos as u64;
-        let size = std::mem::size_of::<flat_binder_object>();
+        let size = FlatBinderObject::SIZE;
 
         let obj = read_flat_binder(self.read_aligned_data(size)?, 0)?;
 
@@ -1974,26 +1990,9 @@ impl Parcel {
             .ok_or(StatusCode::BadValue)?;
         self.check_object_overlap(end)?;
 
-        self.data.reserve(end.saturating_sub(self.data.len()));
-        // SAFETY: `reserve` covers `pos..end`; gap, copy and pad writes initialize all of it.
-        unsafe {
-            // Zero a forward-seek gap before `set_len`; see module doc "Buffer growth".
-            let old_len = self.data.len();
-            if pos > old_len {
-                std::ptr::write_bytes(self.data.as_mut_ptr().add(old_len), 0, pos - old_len);
-            }
-            std::ptr::copy_nonoverlapping::<u8>(
-                parcelable.as_ptr() as _,
-                self.data.as_mut_ptr().add(pos),
-                size,
-            );
-            if padded > size {
-                std::ptr::write_bytes(self.data.as_mut_ptr().add(pos + size), 0, padded - size);
-            }
-            if self.data.len() < end {
-                self.data.set_len(end);
-            }
-        }
+        // SAFETY: `S: ParcelPod` has no padding, so every byte of `parcelable` is initialized.
+        let bytes: &[u8] = unsafe { std::slice::from_raw_parts(parcelable.as_ptr().cast(), size) };
+        self.data.write_at(pos, bytes, padded - size);
 
         // Big-endian hosts byte-reverse each element in place (covers f32/f64); LE compiles it out.
         if cfg!(target_endian = "big") && std::mem::size_of::<S>() > 1 {
@@ -2073,15 +2072,6 @@ impl Parcel {
         T::from_native(data)
     }
 
-    pub(crate) fn write_aligned<T: ParcelPod>(&mut self, val: &T) -> Result<()> {
-        let unaligned = std::mem::size_of::<T>();
-        // SAFETY: `T: ParcelPod` has no padding, so every byte of the live `val` is initialized.
-        let val_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(val as *const T as *const u8, unaligned) };
-
-        self.write_aligned_data(val_bytes)
-    }
-
     pub(crate) fn write_aligned_data(&mut self, data: &[u8]) -> Result<()> {
         let unaligned = data.len();
         let aligned = pad_size(unaligned);
@@ -2094,30 +2084,7 @@ impl Parcel {
             .ok_or(StatusCode::BadValue)?;
         self.check_object_overlap(end)?;
 
-        self.data.reserve(end.saturating_sub(self.data.len()));
-        // SAFETY: `reserve` covers `pos..end`; gap, copy and pad writes initialize all of it.
-        unsafe {
-            // Zero a forward-seek gap before `set_len`; see module doc "Buffer growth".
-            let old_len = self.data.len();
-            if pos > old_len {
-                std::ptr::write_bytes(self.data.as_mut_ptr().add(old_len), 0, pos - old_len);
-            }
-            std::ptr::copy_nonoverlapping::<u8>(
-                data.as_ptr(),
-                self.data.as_mut_ptr().add(pos),
-                unaligned,
-            );
-            if aligned > unaligned {
-                std::ptr::write_bytes(
-                    self.data.as_mut_ptr().add(pos + unaligned),
-                    0,
-                    aligned - unaligned,
-                );
-            }
-            if end > self.data.len() {
-                self.data.set_len(end);
-            }
-        }
+        self.data.write_at(pos, data, aligned - unaligned);
 
         self.set_data_position(end);
         Ok(())
@@ -2132,7 +2099,7 @@ impl Parcel {
         if pos >= self.objects_end {
             return Ok(());
         }
-        let size = std::mem::size_of::<flat_binder_object>() as u64;
+        let size = FlatBinderObject::SIZE as u64;
         let end = end as u64;
         if let Some(off) = self
             .objects
@@ -2177,19 +2144,19 @@ impl Parcel {
     }
 
     fn record_object(&mut self, off: usize) {
-        let end = off as u64 + std::mem::size_of::<flat_binder_object>() as u64;
+        let end = off as u64 + FlatBinderObject::SIZE as u64;
         self.objects_end = self.objects_end.max(end);
         self.objects.push(off as _);
     }
 
-    pub(crate) fn write_object(&mut self, obj: &flat_binder_object, null_meta: bool) -> Result<()> {
+    pub(crate) fn write_object(&mut self, obj: &FlatBinderObject, null_meta: bool) -> Result<()> {
         self.write_object_pinned(obj, null_meta, None)
     }
 
     // `obj` is `binder` flattened: a HANDLE pins that `Arc` instead of looking the handle up.
     pub(crate) fn write_binder_object(
         &mut self,
-        obj: &flat_binder_object,
+        obj: &FlatBinderObject,
         binder: &crate::binder::SIBinder,
     ) -> Result<()> {
         self.write_object_pinned(obj, false, Some(binder))
@@ -2197,7 +2164,7 @@ impl Parcel {
 
     fn write_object_pinned(
         &mut self,
-        obj: &flat_binder_object,
+        obj: &FlatBinderObject,
         null_meta: bool,
         binder: Option<&crate::binder::SIBinder>,
     ) -> Result<()> {
@@ -2208,12 +2175,12 @@ impl Parcel {
         }
         // RPC mode: no offset-table entry and no kernel `acquire()`; RPC keeps its own refcount.
         if self.rpc.is_some() {
-            self.write_aligned(obj)?;
+            self.write_aligned_data(&obj.to_bytes())?;
             return Ok(());
         }
 
         let data_pos = self.pos;
-        self.write_aligned(obj)?;
+        self.write_aligned_data(&obj.to_bytes())?;
 
         if null_meta || obj.pointer() != 0 {
             // Pin first: `acquire` then hits the cached proxy instead of a temporary one.
@@ -2238,8 +2205,8 @@ impl Parcel {
             return Err(StatusCode::BadType);
         }
         let at = self.pos;
-        let obj = flat_binder_object::new_with_fd(std::os::fd::AsRawFd::as_raw_fd(&fd), true);
-        self.write_aligned(&obj)?;
+        let obj = FlatBinderObject::new_with_fd(std::os::fd::AsRawFd::as_raw_fd(&fd), true);
+        self.write_aligned_data(&obj.to_bytes())?;
         self.record_object(at);
         let at = at as u64;
         let i = self.kernel_fds.partition_point(|&(off, _)| off < at);
@@ -2293,7 +2260,7 @@ impl Parcel {
     }
 
     // A proxy's strong ref must outlive the send; its own drop may queue BC_RELEASE before it.
-    fn pin_kernel_handle(&mut self, obj: &flat_binder_object) -> Result<()> {
+    fn pin_kernel_handle(&mut self, obj: &FlatBinderObject) -> Result<()> {
         if obj.header_type() == BINDER_TYPE_HANDLE {
             let proxy = crate::process_state::ProcessState::as_self()
                 .strong_proxy_for_handle(obj.handle())?;
@@ -2438,7 +2405,7 @@ impl Parcel {
             return Err(StatusCode::BadType);
         }
 
-        // Bound `end` to `i32::MAX` as `write_aligned_data` does, rather than overflow the reserve.
+        // Bound `end` to `i32::MAX` as `write_aligned_data` does; see module doc "Buffer growth".
         let end = self
             .pos
             .checked_add(size)
@@ -2456,7 +2423,7 @@ impl Parcel {
         let start_pos = self.pos;
         let mut first_idx: i32 = -1;
         let mut last_idx: i32 = -2;
-        let object_size = std::mem::size_of::<flat_binder_object>() as u64;
+        let object_size = FlatBinderObject::SIZE as u64;
         {
             // Scan the source's table as AOSP `appendFrom` does; the destination's may be empty.
             let objects = other.objects.as_slice();
@@ -2490,23 +2457,8 @@ impl Parcel {
             });
         }
 
-        self.data.reserve(end.saturating_sub(self.data.len()));
-        // SAFETY: `reserve` covers `..end`, all initialized below; source is a checked slice.
-        unsafe {
-            // Zero a forward-seek gap before `set_len`; see module doc "Buffer growth".
-            let old_len = self.data.len();
-            if self.pos > old_len {
-                std::ptr::write_bytes(self.data.as_mut_ptr().add(old_len), 0, self.pos - old_len);
-            }
-            std::ptr::copy_nonoverlapping::<u8>(
-                other.data.as_slice()[offset..offset + size].as_ptr(),
-                self.data.as_mut_ptr().add(self.pos),
-                size,
-            );
-            if end > self.data.len() {
-                self.data.set_len(end);
-            }
-        }
+        self.data
+            .write_at(self.pos, &other.data.as_slice()[offset..offset + size], 0);
         self.set_data_position(end);
 
         #[cfg(feature = "rpc")]
@@ -2744,13 +2696,12 @@ impl std::fmt::Debug for Parcel {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         writeln!(f, "Parcel: pos {}, len {}", self.pos, self.data.len())?;
         if self.objects.len() > 0 {
-            // SAFETY: `objects`, a `Vec` or an adopted IPC slice, is readable as bytes for `&self`.
-            let bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    self.objects.as_ptr() as *const u8,
-                    self.objects.len() * std::mem::size_of::<binder_size_t>(),
-                )
-            };
+            let bytes: Vec<u8> = self
+                .objects
+                .as_slice()
+                .iter()
+                .flat_map(|off| off.to_ne_bytes())
+                .collect();
             writeln!(
                 f,
                 "Object count {}\n{}",
@@ -2896,6 +2847,30 @@ mod tests {
 
         let bytes = parcel.data.as_slice();
         assert_eq!(&bytes[4..8], &[0xAB, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn write_at_covers_gap_overwrite_append_and_pad() {
+        let mut pd = super::ParcelData::from_vec(vec![0xFFu8; 6]);
+        // Straddles the end: two bytes overwritten, one appended, pad over nothing old.
+        pd.write_at(4, &[1, 2, 3], 1);
+        assert_eq!(pd.as_slice(), &[0xFF, 0xFF, 0xFF, 0xFF, 1, 2, 3, 0]);
+        // Inside the buffer: the pad zeroes an existing byte and the length stays.
+        pd.write_at(0, &[7], 2);
+        assert_eq!(pd.as_slice(), &[7, 0, 0, 0xFF, 1, 2, 3, 0]);
+        // Past the end: the gap is zero-filled before the bytes.
+        pd.write_at(10, &[9], 0);
+        assert_eq!(pd.as_slice(), &[7, 0, 0, 0xFF, 1, 2, 3, 0, 0, 0, 9]);
+    }
+
+    #[test]
+    #[should_panic(expected = "can't support write_at()")]
+    fn parcel_data_slice_refuses_write_at() {
+        let leaked: &'static mut [u8] = Box::leak(vec![0u8; 4].into_boxed_slice());
+        // SAFETY: `Box::leak` yields a valid, exclusive, `'static` buffer of 4 bytes.
+        let mut pd: super::ParcelData<u8> =
+            unsafe { super::ParcelData::from_raw_parts_mut(leaked.as_mut_ptr(), 4) };
+        pd.write_at(0, &[1], 0);
     }
 
     #[test]
@@ -3213,7 +3188,7 @@ mod tests {
         drop(parcel);
     }
 
-    // Growing into spare capacity would be `Vec::set_len` UB; only the unsafe driver path may grow.
+    // Only `driver_read_buffer` grows the length, and only after zero-filling what it adds.
     #[test]
     fn set_data_size_only_shrinks() {
         let mut parcel = Parcel::new();
@@ -3233,20 +3208,32 @@ mod tests {
     }
 
     #[test]
-    fn set_data_size_driver_filled_is_bounded_by_capacity() {
+    fn driver_read_buffer_lends_the_zeroed_capacity_and_keeps_what_was_filled() {
         let mut parcel = Parcel::new();
+        parcel.write(&-1i32).expect("write i32");
         let cap = parcel.capacity();
-        // SAFETY: like the driver, every byte of the capacity is written before it is claimed.
-        unsafe {
-            std::ptr::write_bytes(parcel.as_mut_ptr(), 0xAB, cap);
-            assert!(parcel.set_data_size_driver_filled(cap).is_ok());
-            assert_eq!(
-                parcel.set_data_size_driver_filled(cap + 1),
-                Err(StatusCode::BadValue)
-            );
-        }
-        assert_eq!(parcel.data_size(), cap);
-        assert!(parcel.data.as_slice().iter().all(|&b| b == 0xAB));
+
+        let buf = parcel.driver_read_buffer();
+        assert_eq!(buf.len(), cap);
+        assert!(
+            buf[4..].iter().all(|&b| b == 0),
+            "the added bytes are zeroed"
+        );
+        buf[..8].fill(0xAB);
+        assert!(parcel.driver_read_done(8).is_ok());
+        assert_eq!(parcel.data.as_slice(), &[0xAB; 8]);
+        assert_eq!(parcel.data_position(), 0);
+        assert_eq!(
+            parcel.capacity(),
+            cap,
+            "lending the buffer does not reallocate it"
+        );
+
+        // A count past the lent buffer is refused and leaves the parcel empty.
+        let len = parcel.driver_read_buffer().len();
+        assert_eq!(parcel.driver_read_done(len + 1), Err(StatusCode::BadValue));
+        assert_eq!(parcel.data_size(), 0);
+        assert!(parcel.is_empty());
     }
 
     // A bare forward seek must not push the kernel-facing length past the allocated bytes.
@@ -3616,7 +3603,7 @@ mod tests {
 
     // ---- kernel fds: a non-blocking pipe read is EOF once every write-end copy is closed ----
 
-    use super::{binder_size_t, binder_uintptr_t, flat_binder_object};
+    use super::{binder_size_t, binder_uintptr_t, FlatBinderObject};
     use std::os::fd::{AsRawFd, OwnedFd};
 
     fn pipe_probe() -> (OwnedFd, OwnedFd) {
@@ -3644,8 +3631,8 @@ mod tests {
 
     /// One FD object at offset 0 naming `fd`, as a driver buffer or `from_ipc_parts` caller has it.
     fn fd_object_buffer(fd: i32) -> Vec<u8> {
-        let mut data = vec![0u8; std::mem::size_of::<flat_binder_object>()];
-        let obj = flat_binder_object::new_with_fd(fd, true);
+        let mut data = vec![0u8; FlatBinderObject::SIZE];
+        let obj = FlatBinderObject::new_with_fd(fd, true);
         super::write_flat_binder(&mut data, 0, &obj).unwrap();
         data
     }
@@ -3711,7 +3698,7 @@ mod tests {
     fn write_object_refuses_an_fd_object() {
         let file = std::fs::File::open("/dev/null").unwrap();
         let mut p = Parcel::new();
-        let obj = flat_binder_object::new_with_fd(file.as_raw_fd(), true);
+        let obj = FlatBinderObject::new_with_fd(file.as_raw_fd(), true);
         assert_eq!(p.write_object(&obj, true), Err(StatusCode::BadType));
         assert_eq!((p.data_size(), p.objects.len()), (0, 0));
         drop(p);
@@ -4105,7 +4092,7 @@ mod wire_golden {
         SerializeOption::serialize_option(None::<&crate::SIBinder>, &mut parcel).unwrap();
         let bytes = parcel.data.as_slice();
 
-        let obj_len = std::mem::size_of::<flat_binder_object>();
+        let obj_len = FlatBinderObject::SIZE;
         assert_eq!(
             bytes[..4],
             crate::sys::BINDER_TYPE_BINDER.to_ne_bytes()[..],
@@ -4289,7 +4276,7 @@ mod data_serde {
                 let dup = std::os::fd::OwnedFd::from(std::fs::File::open("/dev/null").unwrap());
                 source.write_kernel_fd(dup).unwrap();
             } else {
-                let object = flat_binder_object::new_binder_with_flags(0);
+                let object = FlatBinderObject::new_binder_with_flags(0);
                 source.write_object(&object, true).unwrap();
             }
 

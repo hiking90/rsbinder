@@ -13,13 +13,13 @@
 //!
 //! Hermetic: `mem`/`unix` transports only, and deliberately **never**
 //! initializes `ProcessState` — the kernel-parcel checks must fire
-//! before `flat_binder_object::from` calls `ProcessState::as_self()`,
+//! before `FlatBinderObject::from` calls `ProcessState::as_self()`,
 //! so a pure-RPC process (macOS, or any Linux process that never opened
 //! `/dev/binder`) gets the rejection rather than a panic.
 //!
 //! # Mutation gates
 //!
-//! - `kernel_parcel_refuses_rpc_proxy`: `From<&SIBinder> for flat_binder_object` calls
+//! - `kernel_parcel_refuses_rpc_proxy`: `From<&SIBinder> for FlatBinderObject` calls
 //!   `ProcessState::as_self()`, which panics in a process that never initialized it. Moving
 //!   the check after that conversion turns this test red on macOS.
 //! - `rpc_parcel_refuses_kernel_proxy`: without the check the kernel proxy is registered as a

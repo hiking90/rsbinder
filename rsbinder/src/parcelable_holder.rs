@@ -509,7 +509,7 @@ mod tests {
             .write(&BinderCarrier::descriptor().to_string())
             .unwrap();
         payload
-            .write(&crate::binder_object::flat_binder_object::new_handle(0, 0))
+            .write(&crate::binder_object::FlatBinderObject::new_handle(0, 0))
             .unwrap();
         payload.write(&0i32).unwrap();
         let payload = payload.into_bytes().unwrap();
@@ -537,7 +537,7 @@ mod tests {
             .write(&"rsbinder.test.BinderCarrier".to_string())
             .unwrap();
         payload
-            .write(&crate::binder_object::flat_binder_object::new_handle(0, 0))
+            .write(&crate::binder_object::FlatBinderObject::new_handle(0, 0))
             .unwrap();
         payload.write(&0i32).unwrap();
         let payload = payload.into_bytes().unwrap();

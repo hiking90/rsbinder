@@ -7,7 +7,7 @@
 use crate::{
     error::Result,
     parcel::{NativeScalar, Parcel},
-    sys::{binder_transaction_data, binder_transaction_data_secctx},
+    transaction_data::{TransactionData, TransactionDataSecctx},
 };
 
 pub(crate) struct CommandStream(Parcel);
@@ -27,19 +27,21 @@ impl CommandStream {
         self.0.read_native()
     }
 
-    /// L3 UAPI struct as is. Not generic: `ParcelPod` admits scalars, whose `Deserialize` is L1.
-    pub(crate) fn write_transaction(&mut self, val: &binder_transaction_data) -> Result<()> {
-        self.0.write_aligned(val)
+    /// L3 UAPI struct, in its own host-native codec (`transaction_data.rs`).
+    pub(crate) fn write_transaction(&mut self, val: &TransactionData) -> Result<()> {
+        self.0.write_aligned_data(&val.to_bytes())
     }
 
     /// L3 UAPI struct, as laid out by the driver.
-    pub(crate) fn read_transaction(&mut self) -> Result<binder_transaction_data> {
-        self.0.read()
+    pub(crate) fn read_transaction(&mut self) -> Result<TransactionData> {
+        let bytes = self.0.read_aligned_data(TransactionData::SIZE)?;
+        Ok(TransactionData::from_bytes(bytes.try_into().unwrap()))
     }
 
     /// L3 UAPI struct, as laid out by the driver.
-    pub(crate) fn read_transaction_secctx(&mut self) -> Result<binder_transaction_data_secctx> {
-        self.0.read()
+    pub(crate) fn read_transaction_secctx(&mut self) -> Result<TransactionDataSecctx> {
+        let bytes = self.0.read_aligned_data(TransactionDataSecctx::SIZE)?;
+        Ok(TransactionDataSecctx::from_bytes(bytes.try_into().unwrap()))
     }
 
     pub(crate) fn data_size(&self) -> usize {
@@ -50,18 +52,23 @@ impl CommandStream {
         self.0.set_data_size(new_len)
     }
 
-    /// # Safety: as [`Parcel::set_data_size_driver_filled`]; the driver filled bytes `0..new_len`.
-    pub(crate) unsafe fn set_data_size_driver_filled(&mut self, new_len: usize) -> Result<()> {
-        // SAFETY: the callee's contract is forwarded unchanged to our caller (`# Safety` above).
-        unsafe { self.0.set_data_size_driver_filled(new_len) }
+    /// The queued commands, the bytes `BINDER_WRITE_READ` sends.
+    pub(crate) fn as_bytes(&self) -> Result<&[u8]> {
+        self.0.as_bytes()
+    }
+
+    /// The zeroed buffer `BINDER_WRITE_READ` fills; see [`Parcel::driver_read_buffer`].
+    pub(crate) fn driver_read_buffer(&mut self) -> &mut [u8] {
+        self.0.driver_read_buffer()
+    }
+
+    /// Keeps the `0..filled` bytes the driver wrote; see [`Parcel::driver_read_done`].
+    pub(crate) fn driver_read_done(&mut self, filled: usize) -> Result<()> {
+        self.0.driver_read_done(filled)
     }
 
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
-    }
-
-    pub(crate) fn capacity(&self) -> usize {
-        self.0.capacity()
     }
 
     pub(crate) fn data_position(&self) -> usize {
@@ -70,11 +77,6 @@ impl CommandStream {
 
     pub(crate) fn set_data_position(&mut self, pos: usize) {
         self.0.set_data_position(pos)
-    }
-
-    /// The buffer the `BINDER_WRITE_READ` ioctl reads from / writes into.
-    pub(crate) fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.0.as_mut_ptr()
     }
 }
 

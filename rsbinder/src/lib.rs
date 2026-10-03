@@ -289,6 +289,7 @@ mod status;
 mod sys;
 /// Thread-local binder state
 pub mod thread_state;
+mod transaction_data;
 // Transport capabilities; not under `rpc`: the kernel path answers the same questions.
 mod transport_caps;
 

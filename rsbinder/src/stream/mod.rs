@@ -1098,10 +1098,12 @@ impl<T: Serialize + ?Sized> Sink<T> {
         item: &T,
     ) -> impl std::future::Future<Output = Result<()>> + Send + '_ {
         let timeout = self.send_timeout;
-        match &mut self.inner {
+        // Built here, outside the returned future: each `send_async` encodes `item` when called.
+        let send = match &mut self.inner {
             SinkInner::Calls(p) => pool::Either::A(p.send_async(item, timeout)),
             SinkInner::Ring(p) => pool::Either::B(p.send_async(item, timeout)),
-        }
+        };
+        send.run()
     }
 
     /// [`flush`](Self::flush) for a producer running as a task.

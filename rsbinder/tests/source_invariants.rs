@@ -65,7 +65,8 @@
 //! stream) and L3 (the UAPI structs) are native, so
 //! `byte_order_primitives_and_pod_membership_stay_pinned` pins which files may spell a
 //! byte-order primitive — native, big-endian or little-endian — and which types `ParcelPod`
-//! admits to the raw-bytes view the three layers share.
+//! admits to the raw-bytes view of `read_array`/`write_array` (the primitives only; the L3
+//! structs have field-by-field codecs in `binder_object.rs` and `transaction_data.rs`).
 //!
 //! # `CommandStream`
 //!
@@ -86,8 +87,8 @@
 //! the first two in `src/`, by file and enclosing `fn`, test code included,
 //! and allows none of the closes (any `io::close` or `libc::close` path,
 //! `use rustix::io::close` included). The two in `parcel.rs` are the driver-buffer
-//! adoption and the `from_ipc_parts` read; the rest take a number that does
-//! not come from a parcel (a vsock stream's own `into_raw_fd`, and a test's).
+//! adoption and the `from_ipc_parts` read; the third is a test taking back the
+//! number its own `into_raw_fd` released, which does not come from a parcel.
 //! A new site — a second adoption, or a close of an fd named by the
 //! bytes — must be argued for here.
 
@@ -343,11 +344,14 @@ fn byte_order_primitives_and_pod_membership_stay_pinned() {
             needle: "_ne_bytes",
             tree_wide: true,
             files: &[
-                // `NativeScalar`'s two methods + tests asserting what stays native (3) or
-                // hand-writing an L3 fd object (2).
-                ("parcel.rs", 7),
-                // Tests pinning where the L3 union's `handle` lies on either byte order.
-                ("binder_object.rs", 3),
+                // `NativeScalar`'s two methods + `Debug`'s offset-table dump (1) + tests
+                // asserting what stays native (3) or hand-writing an L3 fd object (2).
+                ("parcel.rs", 8),
+                // `FlatBinderObject`'s L3 codec and union accessors (10) + tests pinning its
+                // layout and where the union's `handle` lies on either byte order (6).
+                ("binder_object.rs", 16),
+                // `TransactionData`'s L3 codec and `target` accessors (15) + layout tests (8).
+                ("transaction_data.rs", 23),
                 // fd/memfd bookkeeping, never parcel wire.
                 ("shared_memory/mod.rs", 4),
             ],
@@ -359,10 +363,10 @@ fn byte_order_primitives_and_pod_membership_stay_pinned() {
             files: &[("file_descriptor.rs", 1)],
         },
         Pin {
-            // The `parcelable_struct!` arm: L3 structs in, L3 structs out.
+            // None anywhere: the L3 structs have field-by-field codecs, not a raw-bytes view.
             needle: "transmute::<[u8",
             tree_wide: true,
-            files: &[("parcelable.rs", 1)],
+            files: &[("parcelable.rs", 0)],
         },
         Pin {
             // L2 is native: an LE re-encode reaches the driver byte-swapped even via `write_cmd`.
@@ -383,10 +387,11 @@ fn byte_order_primitives_and_pod_membership_stay_pinned() {
             files: &[("thread_state.rs", 0), ("command_stream.rs", 0)],
         },
         Pin {
-            // Raw-bytes types: a new one needs a padding/bit-validity audit (`ParcelPod`).
+            // Raw-bytes types: the primitives' macro arm only; a new one needs a padding and
+            // bit-validity audit (`ParcelPod`).
             needle: "unsafe impl ParcelPod for",
             tree_wide: true,
-            files: &[("parcel.rs", 4)],
+            files: &[("parcel.rs", 1)],
         },
     ];
 
@@ -457,8 +462,6 @@ fn raw_fd_numbers_become_fds_only_at_the_pinned_sites() {
         ("parcel.rs", "pub(crate) unsafe fn from_driver_buffer("),
         // A `from_ipc_parts` caller keeps each FD object's fd open (its `# Safety`).
         ("parcel.rs", "fn kernel_fd_at("),
-        // A vsock stream's own `into_raw_fd`.
-        ("hub/accessor_register.rs", "fn connect_vsock_owned_fd("),
         // A test taking back the fd `into_raw_fd` released.
         ("file_descriptor.rs", "fn test_parcel_file_descriptor("),
     ];
