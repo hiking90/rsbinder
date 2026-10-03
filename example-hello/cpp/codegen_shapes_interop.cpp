@@ -17,6 +17,13 @@
 //   2. `in/out @nullable int[3]` — [4,5,6] comes back [6,5,4]; null stays null.
 //   3. `out IBinder` (non-nullable) — filled, it round-trips; left unset, the
 //      call must fail observably rather than deliver a null binder.
+//   5. `@FixedSize` union `Tag[]` — a byte[] (`AParcel_{write,read}ByteArray`).
+//   6. A service's `Status::from(StatusCode::UnexpectedNull)` — the transact
+//      status STATUS_UNEXPECTED_NULL, as AOSP `Status::fromStatusT`, not an
+//      EX_NULL_POINTER status header.
+//   7. A service's `DeadObject` — replied as STATUS_FAILED_TRANSACTION; a
+//      DEAD_OBJECT reply would make `BpBinder::transact` mark this live proxy
+//      dead, so `AIBinder_isAlive` and a second call on it are checked.
 //
 // NDK-only: no AOSP checkout, no headers or libraries pulled off the device.
 // The three `AServiceManager_*` entry points are platform-only (libbinder_ndk
@@ -46,6 +53,9 @@ constexpr const char* kServiceName = "rsbinder.test.shapes";
 constexpr transaction_code_t kTxTakeOutBinder = FIRST_CALL_TRANSACTION;
 constexpr transaction_code_t kTxRoundNullableVec = FIRST_CALL_TRANSACTION + 1;
 constexpr transaction_code_t kTxRoundNullableFixed = FIRST_CALL_TRANSACTION + 2;
+constexpr transaction_code_t kTxReverseTags = FIRST_CALL_TRANSACTION + 4;
+constexpr transaction_code_t kTxFailUnexpectedNull = FIRST_CALL_TRANSACTION + 5;
+constexpr transaction_code_t kTxFailDeadObject = FIRST_CALL_TRANSACTION + 6;
 
 int failures = 0;
 
@@ -307,6 +317,92 @@ void test_legacy_layout_is_not_accepted(AIBinder* binder) {
           "the legacy layout does not decode to the same values as the AOSP one");
 }
 
+struct I8Array {
+    std::vector<int8_t> data;
+    bool is_null = false;
+};
+
+bool i8_allocator(void* arrayData, int32_t length, int8_t** outBuffer) {
+    auto* dst = static_cast<I8Array*>(arrayData);
+    if (length < 0) {
+        dst->is_null = true;
+        *outBuffer = nullptr;
+        return true;
+    }
+    dst->is_null = false;
+    dst->data.assign(static_cast<size_t>(length), 0);
+    *outBuffer = dst->data.empty() ? nullptr : dst->data.data();
+    return true;
+}
+
+struct I8Args {
+    const int8_t* data;
+    int32_t length;
+};
+
+bool write_i8_array(AParcel* p, void* ctx) {
+    auto* a = static_cast<I8Args*>(ctx);
+    binder_status_t st = AParcel_writeByteArray(p, a->data, a->length);
+    if (st != STATUS_OK) fprintf(stderr, "  writeByteArray failed: %d\n", st);
+    return st == STATUS_OK;
+}
+
+void test_fixed_union_tags(AIBinder* binder) {
+    printf("[5] @FixedSize union Tag[] is a byte[]\n");
+    const int8_t sent[] = {0, 1, 1};  // a, b, b
+    I8Args args{sent, 3};
+    Reply reply;
+    if (!transact(binder, kTxReverseTags, write_i8_array, &args, &reply)) {
+        check(false, "transact");
+        return;
+    }
+    printf("    (transact=%d exception=%d)\n", reply.transact_status, reply.exception);
+    check(reply.ok(), "the service reads the byte[] (an int[] reader would underrun)");
+    if (!reply.ok()) return;
+    I8Array got;
+    binder_status_t st = AParcel_readByteArray(reply.parcel, &got, i8_allocator);
+    check(st == STATUS_OK, "libbinder_ndk parses the returned byte array");
+    if (st != STATUS_OK) return;
+    const std::vector<int8_t> want{1, 1, 0};
+    check(!got.is_null && got.data == want, "[a,b,b] -> [b,b,a]");
+    if (got.data != want) {
+        fprintf(stderr, "  got %zu elements:", got.data.size());
+        for (int8_t v : got.data) fprintf(stderr, " %d", v);
+        fprintf(stderr, "\n");
+    }
+}
+
+void test_unexpected_null_status(AIBinder* binder) {
+    printf("[6] Status::from(UnexpectedNull) is EX_TRANSACTION_FAILED\n");
+    Reply reply;
+    if (!transact(binder, kTxFailUnexpectedNull, nullptr, nullptr, &reply)) {
+        check(false, "transact");
+        return;
+    }
+    printf("    (transact=%d exception=%d)\n", reply.transact_status, reply.exception);
+    check(reply.transact_status == STATUS_UNEXPECTED_NULL,
+          "it surfaces as the transact status STATUS_UNEXPECTED_NULL, not EX_NULL_POINTER");
+}
+
+// Runs last: under a DEAD_OBJECT reply this proxy is dead for every later call.
+void test_dead_object_reply(AIBinder* binder) {
+    printf("[7] a service's DeadObject is replied as FAILED_TRANSACTION\n");
+    Reply reply;
+    if (!transact(binder, kTxFailDeadObject, nullptr, nullptr, &reply)) {
+        check(false, "transact");
+        return;
+    }
+    printf("    (transact=%d exception=%d)\n", reply.transact_status, reply.exception);
+    check(reply.transact_status == STATUS_FAILED_TRANSACTION,
+          "it surfaces as STATUS_FAILED_TRANSACTION");
+    check(AIBinder_isAlive(binder), "the proxy is still alive");
+    const int32_t sent[] = {1, 2, 3};
+    VecArgs args{sent, 3};
+    Reply again;
+    check(transact(binder, kTxRoundNullableVec, write_i32_array, &args, &again) && again.ok(),
+          "a later call on the same proxy succeeds");
+}
+
 // This process serves nothing; the class exists only so `associateClass`
 // can match the descriptor and `prepareTransaction` write the AIDL header.
 void* on_create(void*) { return nullptr; }
@@ -352,6 +448,9 @@ int main() {
     test_nullable_fixed(binder);
     test_out_binder(binder);
     test_legacy_layout_is_not_accepted(binder);
+    test_fixed_union_tags(binder);
+    test_unexpected_null_status(binder);
+    test_dead_object_reply(binder);
 
     AIBinder_decStrong(binder);
     if (failures == 0) {

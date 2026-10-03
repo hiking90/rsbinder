@@ -16,4 +16,19 @@ interface ICodegenShapes {
     // A non-nullable `inout` array of a type with no `Default` is `Vec<T>`,
     // read from the parcel fully populated.
     void roundInoutBinders(inout IBinder[] v);
+
+    // A `@FixedSize` union's `Tag` is byte-backed (AOSP parser.cpp
+    // `UnionTagGenerater`), so `Tag[]` travels as a `byte[]`.
+    @FixedSize union FixedTagged { int a; long b; }
+    FixedTagged.Tag[] reverseTags(in FixedTagged.Tag[] tags);
+
+    // The service returns `Status::from(StatusCode::UnexpectedNull)`; AOSP
+    // `Status::fromStatusT` makes that EX_TRANSACTION_FAILED, i.e. the
+    // transact status, not an EX_NULL_POINTER header.
+    void failUnexpectedNull();
+
+    // The service returns `DeadObject`; it is replied as FAILED_TRANSACTION,
+    // because a DEAD_OBJECT reply makes AOSP `BpBinder::transact` mark the
+    // live binder dead.
+    void failDeadObject();
 }
