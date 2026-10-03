@@ -3,13 +3,14 @@
 
 //! Opt-in FD-over-RPC (`FileDescriptorTransportMode`).
 //!
-//! * default (no opt-in) is the `FdsNotAllowed` reject (`BadType` before
-//!   0.11.0).
+//! * default (no opt-in) is the `FdsNotAllowed` reject (AOSP
+//!   `FileDescriptorTransportMode::NONE`).
 //! * both peers opt in over UDS ⇒ fd travels via
 //!   `SCM_RIGHTS`, valid + `O_CLOEXEC` at the receiver; works in
 //!   *both* directions (arg and reply).
-//! * one-sided opt-in falls back to `None` (reject, not an
-//!   error).
+//! * on the r34 wire, one-sided opt-in falls back to `None` (reject, not
+//!   an error); on the android-13+ wire, a server refuses a client that
+//!   requests `Unix` without its own opt-in (AOSP "Rejecting connection").
 //! * a non-UDS transport (`mem`) never passes fds (rejected
 //!   by type at send; zero fds reach the peer).
 //!
@@ -286,6 +287,56 @@ fn fd_rejected_without_mutual_opt_in() {
     );
 
     drop(root);
+    drop(client);
+    server.stop_accepting();
+    let _ = bg.join();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// android-13+: a server refuses a new session whose fd mode it does not support (AOSP).
+#[test]
+fn a13_server_refuses_a_client_requesting_an_unsupported_fd_mode() {
+    use rsbinder::rpc::transport::UnixTransport;
+    use rsbinder::rpc::RpcClientConfig;
+
+    // (a) socketpair: the accept entry without `server_fd_unix`.
+    let (a, b) = UnixTransport::pair().expect("socketpair");
+    let accept = thread::spawn(move || -> Result<()> {
+        let server = RpcSession::accept_android13plus_fd(Box::new(a), 1, false)?;
+        server.set_root(Interface::as_binder(&Binder::new(BnFd(Box::new(FdSvc)))))?;
+        let _ = server.serve_blocking();
+        Ok(())
+    });
+    // The handshake response precedes the refusal, so the connect itself succeeds.
+    let client = RpcSession::connect_android13plus_fd(Box::new(b), 1, FdMode::Unix)
+        .expect("handshake completes before the refusal");
+    assert_eq!(
+        client.get_root().err(),
+        Some(StatusCode::DeadObject),
+        "the server closed the connection it refused"
+    );
+    assert!(accept.join().expect("accept thread").is_err());
+
+    // (b) `RpcServer` without `set_supported_fd_modes`; a client asking for no fd mode is served.
+    let path = tmp_sock("a13noopt");
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    server.set_android13plus(1);
+    server
+        .set_root(Interface::as_binder(&Binder::new(BnFd(Box::new(FdSvc)))))
+        .expect("set_root");
+    let bg = server.run_background();
+    wait_sock(&path);
+
+    let client = RpcSession::setup_client_android13plus_with_config(
+        RpcClientConfig::unix(&path, 1).fd_mode(FdMode::Unix),
+    )
+    .expect("handshake completes before the refusal");
+    assert_eq!(client.get_root().err(), Some(StatusCode::DeadObject));
+    let plain = RpcSession::setup_client_android13plus_with_config(RpcClientConfig::unix(&path, 1))
+        .expect("connect without an fd mode");
+    plain.get_root().expect("no fd mode requested, so served");
+
+    drop(plain);
     drop(client);
     server.stop_accepting();
     let _ = bg.join();

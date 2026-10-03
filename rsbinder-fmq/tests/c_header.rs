@@ -241,6 +241,12 @@ fn region_end(d: &Descriptor) -> u32 {
     u32::try_from(size).unwrap()
 }
 
+// The ring through a `dup` of the one fd: same file, so overlap is judged across the two indices.
+fn dup_data_fd(d: &mut Descriptor) {
+    d.fds.push(d.fds[0].try_clone().unwrap());
+    d.grantors[2].fd_index = 1;
+}
+
 /// The descriptor checks `validate` makes, answered `-EINVAL` by the header.
 #[test]
 fn c_refuses_what_rust_refuses() {
@@ -250,9 +256,17 @@ fn c_refuses_what_rust_refuses() {
     let out = probe("ok", &desc, CAPACITY, || {});
     assert!(out.contains("attach=0"), "a valid descriptor: {out}");
 
+    let (_q, mut desc) = rust_queue();
+    dup_data_fd(&mut desc);
+    let out = probe("dup", &desc, CAPACITY, || {});
+    assert!(
+        out.contains("attach=0"),
+        "the default layout through a dup: {out}"
+    );
+
     // Each edit breaks one rule: a moved word stays clear of the ring, in the fd but for past-end.
     type Case = (&'static str, fn(&mut Descriptor), usize);
-    let cases: [Case; 8] = [
+    let cases: [Case; 9] = [
         ("misaligned", |d| d.grantors[3].offset += 4, CAPACITY),
         ("no-word", |d| d.grantors.truncate(3), CAPACITY),
         (
@@ -261,6 +275,14 @@ fn c_refuses_what_rust_refuses() {
             CAPACITY,
         ),
         ("overlap", |d| d.grantors[1].offset = 0, CAPACITY),
+        (
+            "overlap-dup",
+            |d| {
+                dup_data_fd(d);
+                d.grantors[2].offset = 0;
+            },
+            CAPACITY,
+        ),
         ("fd-index", |d| d.grantors[3].fd_index = 1, CAPACITY),
         ("min-extent", |d| d.grantors[0].extent = 4, CAPACITY),
         ("quantum", |d| d.quantum = 8, CAPACITY),

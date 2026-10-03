@@ -3218,29 +3218,7 @@ fn test_set_extension_on_remote_proxy_rejects() {
     );
 }
 
-/// Item 4: `dump` on an obituary'd proxy must return `DeadObject`
-/// and the caller's fd must end up closed.
-///
-/// Scope of this integration test: it verifies the **user-visible
-/// contract** (DeadObject return + fd no longer open) end-to-end
-/// against a real obituary'd proxy. It does **not** distinguish
-/// between Item 4's specific fast-fail path (which closes the fd
-/// via `File::Drop` *before* any parcel work) and the pre-existing
-/// `Parcel::Drop` cleanup path (which would close via
-/// `release_objects` *after* `into_raw_fd` and the parcel write,
-/// were Item 4's check ever removed and `submit_transact`'s own
-/// fast-fail relied upon instead). Both layers result in the same
-/// observable EOF on the read end.
-///
-/// The unit test
-/// `test_dump_fast_fails_and_drops_fd_when_obituary_sent` in
-/// `rsbinder/src/proxy.rs` covers Item 4's specific path with a
-/// synthetic `IntoRawFd` type whose `Drop` is observable separately
-/// from `into_raw_fd` — that test catches a regression that
-/// reverts Item 4's check while leaving `submit_transact`'s
-/// PR-#104 fast-fail in place. This integration test catches the
-/// broader regression where neither layer closes the fd
-/// (e.g. both fast-fail checks reverted).
+/// `dump` on a proxy the kernel reported dead returns `DeadObject` and closes the caller's fd.
 #[test]
 #[ignore]
 fn test_dump_fast_fails_on_dead_proxy_closes_fd() {
@@ -3289,10 +3267,7 @@ fn test_dump_fast_fails_on_dead_proxy_closes_fd() {
         "dump on obituary'd proxy must fast-fail with DeadObject (got {result:?})"
     );
 
-    // `dump` dropped its `F` parameter without calling `into_raw_fd`,
-    // so File::Drop closed the fd. Reading from the other end must
-    // EOF — pipe semantics guarantee EOF on read once all write ends
-    // are closed.
+    // `dump` dropped its `F` parameter, closing the only write end, so the read end sees EOF.
     let mut tail = [0u8; 16];
     let n = dump_read
         .read(&mut tail)

@@ -59,8 +59,11 @@ impl RpcAddress {
     /// not just one endpoint. The counter is session-owned (no global);
     /// the value is never `zero()` (counter ≥ 1).
     ///
-    /// A consequence: a peer-supplied address carrying *our* role tag is one this end would
-    /// have minted itself, so it must already be in the local table, never a fresh remote.
+    /// A consequence: a peer-supplied address of exactly this shape with *our* role tag
+    /// (checked by the crate-internal `minted_by`) is one this end would have minted itself, so
+    /// it must already be in the local table, never a fresh remote. The shape, not the tag alone, decides: an
+    /// android-12 r34 libbinder peer fills all 32 bytes at random (`RpcAddress::unique`), so its
+    /// byte 8 equals our tag one time in 256.
     pub fn unique(counter: &mut u64, space: AddressSpace) -> Self {
         *counter = counter.wrapping_add(1);
         let mut bytes = [0u8; RPC_ADDR_LEN];
@@ -69,9 +72,9 @@ impl RpcAddress {
         RpcAddress { bytes }
     }
 
-    /// The role tag byte naming the subspace that minted this address; see [`Self::unique`].
-    pub(crate) fn space_tag(&self) -> u8 {
-        self.bytes[8]
+    /// `true` iff [`Self::unique`] with `space` produces this shape: role tag, zero tail.
+    pub(crate) fn minted_by(&self, space: AddressSpace) -> bool {
+        self.bytes[8] == space.tag() && self.bytes[9..].iter().all(|&b| b == 0)
     }
 
     /// Borrow the raw 32 wire bytes (crate-internal — wire codec only).
@@ -132,9 +135,12 @@ pub enum SpecialTransaction {
     GetMaxThreads = 1,
     /// Obtain the server-assigned session id.
     GetSessionId = 2,
-    /// Negotiate the FD-over-RPC mode. **Not r34** — an
-    /// rsbinder/android-13+ extension sent *only* when a client opts
-    /// into FD passing, so the default (`None`) path stays r34-faithful.
+    /// Negotiate the FD-over-RPC mode. An rsbinder extension on the r34
+    /// wire only (AOSP r34 has no fd mode), sent *only* when a client
+    /// calls `RpcSession::negotiate_fd_transport`. android-13+ fixes the
+    /// mode in the connection header: an android-13+ client never sends
+    /// this code, and an android-13+ server answers it
+    /// `UNKNOWN_TRANSACTION`, as AOSP libbinder does.
     GetFdMode = 3,
 }
 
@@ -210,7 +216,7 @@ mod tests {
             SpecialTransaction::from_code(2),
             Some(SpecialTransaction::GetSessionId)
         );
-        // 0..=2 are r34's; 3 (`GetFdMode`) is an rsbinder extension, sent only on FD opt-in.
+        // 0..=2 are r34's; 3 (`GetFdMode`) is an rsbinder extension, sent only on r34 FD opt-in.
         assert_eq!(
             SpecialTransaction::from_code(3),
             Some(SpecialTransaction::GetFdMode)

@@ -226,9 +226,12 @@ cargo run -p example-hello --features rpc --bin shm_service rpc &
 cargo run -p example-hello --features rpc --bin shm_client rpc
 ```
 
-Over RPC both ends must opt into fd passing, before any fd-bearing call.
-Through the entry API it is an option on the connect; on a session you
-built yourself it is `RpcSession::negotiate_fd_transport`:
+Over RPC both ends must opt into fd passing before connecting. Through the
+entry API it is an option on the connect; on an android-14+ session you
+built yourself it is `RpcClientConfig::fd_mode` on the client and
+`RpcServer::set_supported_fd_modes` on the server, since the connection
+header fixes the mode. Only an r34 session negotiates it afterwards, with
+`RpcSession::negotiate_fd_transport`:
 
 ```rust
 // service

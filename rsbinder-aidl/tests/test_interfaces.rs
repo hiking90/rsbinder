@@ -55,12 +55,12 @@ pub mod ArrayOfInterfaces {
     impl rsbinder::Parcelable for ArrayOfInterfaces {
         fn write_to_parcel(&self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
             _parcel.sized_write(|_sub_parcel| {
-                Ok(())
+                ::core::result::Result::Ok(())
             })
         }
         fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
             _parcel.sized_read(|_sub_parcel| {
-                Ok(())
+                ::core::result::Result::Ok(())
             })
         }
     }
@@ -71,21 +71,21 @@ pub mod ArrayOfInterfaces {
     }
     pub mod IEmptyInterface {
         #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
-        pub trait IEmptyInterface: rsbinder::Interface + Send {
+        pub trait IEmptyInterface: rsbinder::Interface + ::core::marker::Send {
             fn descriptor() -> &'static str where Self: Sized { "ArrayOfInterfaces.IEmptyInterface" }
-            fn getDefaultImpl() -> Option<IEmptyInterfaceDefaultRef> where Self: Sized {
+            fn getDefaultImpl() -> ::core::option::Option<IEmptyInterfaceDefaultRef> where Self: Sized {
                 DEFAULT_IMPL.get().cloned()
             }
             fn setDefaultImpl(d: IEmptyInterfaceDefaultRef) -> IEmptyInterfaceDefaultRef where Self: Sized {
                 DEFAULT_IMPL.get_or_init(|| d).clone()
             }
         }
-        pub trait IEmptyInterfaceDefault: Send + Sync {
+        pub trait IEmptyInterfaceDefault: ::core::marker::Send + ::core::marker::Sync {
         }
         pub(crate) mod transactions {
         }
-        pub type IEmptyInterfaceDefaultRef = std::sync::Arc<dyn IEmptyInterfaceDefault>;
-        static DEFAULT_IMPL: std::sync::OnceLock<IEmptyInterfaceDefaultRef> = std::sync::OnceLock::new();
+        pub type IEmptyInterfaceDefaultRef = ::std::sync::Arc<dyn IEmptyInterfaceDefault>;
+        static DEFAULT_IMPL: ::std::sync::OnceLock<IEmptyInterfaceDefaultRef> = ::std::sync::OnceLock::new();
         rsbinder::declare_binder_interface! {
             IEmptyInterface["ArrayOfInterfaces.IEmptyInterface"] {
                 native: {
@@ -111,32 +111,32 @@ pub mod ArrayOfInterfaces {
         fn on_transact(
             _service: &dyn IEmptyInterface, _code: rsbinder::TransactionCode, _reader: &mut rsbinder::Parcel, _reply: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
             match _code {
-                _ => Err(rsbinder::StatusCode::UnknownTransaction),
+                _ => ::core::result::Result::Err(rsbinder::StatusCode::UnknownTransaction),
             }
         }
     }
     pub mod IMyInterface {
         #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
-        pub trait IMyInterface: rsbinder::Interface + Send {
+        pub trait IMyInterface: rsbinder::Interface + ::core::marker::Send {
             fn descriptor() -> &'static str where Self: Sized { "ArrayOfInterfaces.IMyInterface" }
             fn r#methodWithInterfaces(&self, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: Option<&[Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::BinderResult<Option<Vec<Option<String>>>>;
-            fn getDefaultImpl() -> Option<IMyInterfaceDefaultRef> where Self: Sized {
+            fn getDefaultImpl() -> ::core::option::Option<IMyInterfaceDefaultRef> where Self: Sized {
                 DEFAULT_IMPL.get().cloned()
             }
             fn setDefaultImpl(d: IMyInterfaceDefaultRef) -> IMyInterfaceDefaultRef where Self: Sized {
                 DEFAULT_IMPL.get_or_init(|| d).clone()
             }
         }
-        pub trait IMyInterfaceDefault: Send + Sync {
+        pub trait IMyInterfaceDefault: ::core::marker::Send + ::core::marker::Sync {
             fn r#methodWithInterfaces(&self, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: Option<&[Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::BinderResult<Option<Vec<Option<String>>>> {
-                Err(rsbinder::StatusCode::UnknownTransaction.into())
+                ::core::result::Result::Err(rsbinder::StatusCode::UnknownTransaction.into())
             }
         }
         pub(crate) mod transactions {
             pub(crate) const r#methodWithInterfaces: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 0;
         }
-        pub type IMyInterfaceDefaultRef = std::sync::Arc<dyn IMyInterfaceDefault>;
-        static DEFAULT_IMPL: std::sync::OnceLock<IMyInterfaceDefaultRef> = std::sync::OnceLock::new();
+        pub type IMyInterfaceDefaultRef = ::std::sync::Arc<dyn IMyInterfaceDefault>;
+        static DEFAULT_IMPL: ::std::sync::OnceLock<IMyInterfaceDefaultRef> = ::std::sync::OnceLock::new();
         rsbinder::declare_binder_interface! {
             IMyInterface["ArrayOfInterfaces.IMyInterface"] {
                 native: {
@@ -151,28 +151,28 @@ pub mod ArrayOfInterfaces {
                 data.write(_arg_iface)?;
                 data.write(&_arg_nullable_iface)?;
                 data.write(_arg_iface_array_in)?;
-                data.write_slice_size(Some(_arg_iface_array_out))?;
+                data.write_slice_size(::core::option::Option::Some(_arg_iface_array_out))?;
                 data.write(_arg_iface_array_inout)?;
                 data.write(&_arg_nullable_iface_array_in)?;
                 data.write_slice_size(_arg_nullable_iface_array_out.as_deref())?;
                 data.write(_arg_nullable_iface_array_inout)?;
-                Ok(data)
+                ::core::result::Result::Ok(data)
             }
-            fn read_response_methodWithInterfaces(&self, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: Option<&[Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _aidl_reply: rsbinder::Result<Option<rsbinder::Parcel>>) -> rsbinder::BinderResult<Option<Vec<Option<String>>>> {
-                if let Err(rsbinder::StatusCode::UnknownTransaction) = _aidl_reply {
-                    if let Some(_aidl_default_impl) = <Self as IMyInterface>::getDefaultImpl() {
+            fn read_response_methodWithInterfaces(&self, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: Option<&[Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _aidl_reply: rsbinder::Result<::core::option::Option<rsbinder::Parcel>>) -> rsbinder::BinderResult<Option<Vec<Option<String>>>> {
+                if let ::core::result::Result::Err(rsbinder::StatusCode::UnknownTransaction) = _aidl_reply {
+                    if let ::core::option::Option::Some(_aidl_default_impl) = <Self as IMyInterface>::getDefaultImpl() {
                       return _aidl_default_impl.r#methodWithInterfaces(_arg_iface, _arg_nullable_iface, _arg_iface_array_in, _arg_iface_array_out, _arg_iface_array_inout, _arg_nullable_iface_array_in, _arg_nullable_iface_array_out, _arg_nullable_iface_array_inout);
                     }
                 }
                 let mut _aidl_reply = _aidl_reply?.ok_or(rsbinder::StatusCode::UnexpectedNull)?;
                 let _status = _aidl_reply.read::<rsbinder::Status>()?;
-                if !_status.is_ok() { return Err(_status); }
+                if !_status.is_ok() { return ::core::result::Result::Err(_status); }
                 let _aidl_return: Option<Vec<Option<String>>> = _aidl_reply.read()?;
                 _aidl_reply.read_onto(_arg_iface_array_out)?;
                 _aidl_reply.read_onto(_arg_iface_array_inout)?;
                 _aidl_reply.read_onto(_arg_nullable_iface_array_out)?;
                 _aidl_reply.read_onto(_arg_nullable_iface_array_inout)?;
-                Ok(_aidl_return)
+                ::core::result::Result::Ok(_aidl_return)
             }
         }
         impl IMyInterface for BpMyInterface {
@@ -205,16 +205,16 @@ pub mod ArrayOfInterfaces {
                     let _arg_iface: rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface> = _reader.read()?;
                     let _arg_nullable_iface: Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>> = _reader.read()?;
                     let _arg_iface_array_in: Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>> = _reader.read()?;
-                    let mut _arg_iface_array_out: Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>> = Default::default();
+                    let mut _arg_iface_array_out: Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>> = ::core::default::Default::default();
                     _reader.resize_out_vec(&mut _arg_iface_array_out)?;
                     let mut _arg_iface_array_inout: Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>> = _reader.read()?;
                     let _arg_nullable_iface_array_in: Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>> = _reader.read()?;
-                    let mut _arg_nullable_iface_array_out: Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>> = Default::default();
+                    let mut _arg_nullable_iface_array_out: Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>> = ::core::default::Default::default();
                     _reader.resize_nullable_out_vec(&mut _arg_nullable_iface_array_out)?;
                     let mut _arg_nullable_iface_array_inout: Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>> = _reader.read()?;
                     let _aidl_return = _service.r#methodWithInterfaces(&_arg_iface, _arg_nullable_iface.as_ref(), &_arg_iface_array_in, &mut _arg_iface_array_out, &mut _arg_iface_array_inout, _arg_nullable_iface_array_in.as_deref(), &mut _arg_nullable_iface_array_out, &mut _arg_nullable_iface_array_inout);
                     match &_aidl_return {
-                        Ok(_aidl_return) => {
+                        ::core::result::Result::Ok(_aidl_return) => {
                             _reply.write(&rsbinder::Status::from(rsbinder::StatusCode::Ok))?;
                             _reply.write(_aidl_return)?;
                             _reply.write(&_arg_iface_array_out)?;
@@ -222,13 +222,13 @@ pub mod ArrayOfInterfaces {
                             _reply.write(&_arg_nullable_iface_array_out)?;
                             _reply.write(&_arg_nullable_iface_array_inout)?;
                         }
-                        Err(_aidl_status) => {
+                        ::core::result::Result::Err(_aidl_status) => {
                             _reply.write(_aidl_status)?;
                         }
                     }
-                    Ok(())
+                    ::core::result::Result::Ok(())
                 }
-                _ => Err(rsbinder::StatusCode::UnknownTransaction),
+                _ => ::core::result::Result::Err(rsbinder::StatusCode::UnknownTransaction),
             }
         }
     }
@@ -315,7 +315,8 @@ interface IMixed {
 }
 
 #[test]
-fn test_implicit_transaction_codes_unchanged() -> Result<(), Box<dyn Error>> {
+fn test_implicit_transaction_codes_count_from_zero_in_declaration_order(
+) -> Result<(), Box<dyn Error>> {
     let input = r#"
 interface IImplicit {
     void method1();
@@ -596,5 +597,57 @@ parcelable Node {
 }
         "##,
         "closes a reference cycle",
+    );
+}
+
+/// Each name is already an item of the generated interface module: rustc E0428 downstream.
+#[test]
+fn names_clashing_with_generated_interface_items_are_rejected() {
+    for input in [
+        "interface IFoo { const int DEFAULT_IMPL = 1; void m(); }",
+        "interface IFoo { const int on_transact = 1; void m(); }",
+        "interface IFoo { const int BnFoo = 1; void m(); }",
+        "@VersionSupport(version = 1) interface IFoo { const int VERSION = 1; void m(); }",
+        "interface IFoo { parcelable transactions { int a; } void m(); }",
+        "interface IFoo { parcelable BnFoo { int a; } void m(); }",
+        "interface IFoo { parcelable BpFoo { int a; } void m(); }",
+        "interface IFoo { parcelable IFooDefault { int a; } void m(); }",
+        "interface IFoo { parcelable IFooDefaultRef { int a; } void m(); }",
+    ] {
+        let ctx = rsbinder_aidl::SourceContext::new("test.aidl", input);
+        let document = rsbinder_aidl::parse_document(&ctx).expect(input);
+        let err = rsbinder_aidl::Generator::new(false, false)
+            .document(&document)
+            .expect_err(input)
+            .to_string();
+        assert!(
+            err.contains("collides with an item of the generated"),
+            "{input}: {err}"
+        );
+    }
+    // Without `@VersionSupport` no `VERSION` is emitted, so the name is free.
+    aidl_generator_contains(
+        "interface IFoo { const int VERSION = 1; void m(); }",
+        "pub const r#VERSION: i32 = 1;",
+    )
+    .unwrap();
+}
+
+/// The async traits exist only when async generation is on.
+#[test]
+fn names_clashing_with_generated_async_items_are_rejected() {
+    let input = "interface IFoo { parcelable IFooAsync { int a; } void m(); }";
+    let ctx = rsbinder_aidl::SourceContext::new("test.aidl", input);
+    let document = rsbinder_aidl::parse_document(&ctx).expect(input);
+    rsbinder_aidl::Generator::new(false, false)
+        .document(&document)
+        .expect("no async items without async");
+    let err = rsbinder_aidl::Generator::new(true, false)
+        .document(&document)
+        .expect_err(input)
+        .to_string();
+    assert!(
+        err.contains("collides with an item of the generated"),
+        "{err}"
     );
 }

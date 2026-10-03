@@ -88,7 +88,12 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             per-service policy on top; see its --config option.")
         .get_matches();
 
-    env_logger::init();
+    // add_device logs EEXIST as an error; the match below reports it as a rerun instead.
+    env_logger::Builder::new()
+        .filter_level(log::LevelFilter::Error)
+        .filter_module("rsbinder::binderfs", log::LevelFilter::Off)
+        .parse_default_env()
+        .init();
 
     // Validate every argument before the mount below, so a rejection leaves nothing behind.
     let mode = match app.get_one::<String>("mode") {
@@ -188,7 +193,10 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
             log_ok(&format!("Device {device_name} already exists"));
         }
-        Err(err) => log_err(&format!("Failed to allocate new binder device\n{err}")),
+        Err(err) => log_err(&format!(
+            "Failed to allocate new binder device via {}\n{err}",
+            control_path.display()
+        )),
     }
 
     let device_path = binderfs_path.join(device_name);
@@ -238,10 +246,17 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             symlink_path.display()
         )),
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            log_ok(&format!(
-                "Symlink {} already exists",
-                symlink_path.display()
-            ));
+            match std::fs::read_link(&symlink_path) {
+                Ok(t) if t == symlink_target => log_ok(&format!(
+                    "Symlink {} already exists",
+                    symlink_path.display()
+                )),
+                _ => eprintln!(
+                    "[WARN] {} exists and is not a symlink to {}; left unchanged",
+                    symlink_path.display(),
+                    symlink_target.display()
+                ),
+            }
         }
         Err(err) => log_err(&format!(
             "Failed to create a symlink from {} to {}\n{}",

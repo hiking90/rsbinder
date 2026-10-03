@@ -37,6 +37,14 @@
 //!   after a reply on the same connection. A held release goes out as late as
 //!   the payment is read: a payment written where this end reads only inside a
 //!   reply wait waits for the next twoway there, or for the session's end.
+//! * **A send that never left.** A parcel dropped unsent rolls its
+//!   `on_binder_leaving` bump back ([`RpcState::cancel_binder_leaving`], AOSP
+//!   `cancelBinderLeaving`): the peer never received the binder, so it never
+//!   sends the matching `DEC_STRONG`. A transport failure ends the session (as
+//!   AOSP), so the rollback matters for a send refused before any byte went
+//!   out, after which the session goes on. Bump and rollback are a commutative
+//!   ±1, safe against a concurrent send of the same binder, and the node drops
+//!   at 0 as on an inbound `DEC_STRONG`, outside the state lock.
 //! * **Receiving a peer's address.** One `RpcProxy` per address
 //!   ([`RpcState::remote_proxy`]). Each receipt owes the sender one
 //!   `DEC_STRONG`: the receipt that mints the proxy is paid when the proxy
@@ -74,7 +82,7 @@
 //! (`ASYNC_TODO_TERMINATE_LEVEL`): once that many out-of-order oneways are
 //! parked on one node, the peer is treated as hostile or buggy. The node's
 //! parked backlog is flushed (reclaiming its memory and held fds at once)
-//! and the delivering connection is torn down, rather than letting the
+//! and the session ends (as AOSP `shutdownAndWait`), rather than letting the
 //! per-node `async_todo` queue grow without bound (memory + fd exhaustion
 //! DoS). A node therefore holds at most that many parked entries at any
 //! instant.
@@ -83,9 +91,17 @@
 //!
 //! The per-node `async_number` is a `u64`, so a wrap means 2^64 oneways to
 //! one node — effectively unreachable. AOSP `nodeProgressAsyncNumber`
-//! returns `false` and tears the session down at overflow; rsbinder has no
-//! equivalent kill switch on the send or receive path, so it wraps, logs,
-//! and lets the peer surface the duplicate as a protocol error.
+//! returns `false` and tears the session down at overflow; rsbinder wraps
+//! and logs instead of ending the session, since 2^64 oneways to one node
+//! is unreachable, and lets the peer surface the duplicate as a protocol
+//! error.
+//!
+//! The send-side counters ([`RpcState::next_send_async_number`], AOSP
+//! `nodeProgressAsyncNumber` on the send path) live apart from
+//! `remote_proxies`, so a counter survives a stale proxy `Drop` whose
+//! address was already re-cached (`forget_remote_if` checks identity): the
+//! peer's node is still alive, and a reset counter would replay numbers its
+//! `asyncTodo` already processed.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -161,14 +177,7 @@ pub enum AsyncDecision {
     Dispatch(WireTransaction, Vec<OwnedFd>),
     Enqueued,
     Drop(DropReason),
-    /// The per-node `async_todo` queue reached the terminate watermark
-    /// (the count, arrival included, is logged and is the number of
-    /// `DEC_STRONG`s the flushed entries owe); the backlog has already been flushed
-    /// here. The caller must tear the delivering connection down with
-    /// `FAILED_TRANSACTION`. Unlike AOSP `shutdownAndWait` this is
-    /// connection-level, not whole-session — but the flush above means
-    /// the backlog is reclaimed regardless of how many connections the
-    /// session has.
+    /// Watermark hit and the backlog flushed (count = DECs owed); module doc "Oneway backlog".
     Terminate(usize),
 }
 
@@ -310,18 +319,7 @@ impl RpcState {
         self.local_nodes.get(addr).map(|n| n.binder.clone())
     }
 
-    /// Roll back one `on_binder_leaving` strong bump for `addr` when the
-    /// parcel that took the bump is dropped unsent (AOSP `cancelBinderLeaving`).
-    /// The peer never received the binder, so it will never send the matching
-    /// `DEC_STRONG`; without this the node (and the strong `SIBinder` it pins)
-    /// would leak for the rest of a multi-connection session, which — unlike
-    /// AOSP — rsbinder does not tear down on a send failure. The bump and this
-    /// rollback are a commutative ±1 on a count, so this is safe even if
-    /// another thread concurrently sends the same binder. Drops the node once
-    /// the count reaches 0, exactly like an inbound DEC.
-    ///
-    /// Returns the node's strong ref if this removed it; the caller must drop
-    /// it **outside** the state lock (see [`dec_strong_local`](Self::dec_strong_local)).
+    /// Undo an unsent parcel's `on_binder_leaving` bump; module doc "A send that never left".
     #[must_use = "drop the returned SIBinder outside the RpcState lock"]
     pub fn cancel_binder_leaving(&mut self, addr: &RpcAddress) -> Option<SIBinder> {
         if let Some(node) = self.local_nodes.get_mut(addr) {
@@ -423,7 +421,7 @@ impl RpcState {
                 return Ok((SIBinder::from_arc(arc), true));
             }
         }
-        if addr.space_tag() == self.space.tag() {
+        if addr.minted_by(self.space) {
             log::error!("RPC: peer sent an unknown address from our own subspace: {addr:?}");
             return Err(crate::StatusCode::BadValue);
         }
@@ -552,22 +550,7 @@ impl RpcState {
             .collect()
     }
 
-    /// Post-increment the per-remote-address
-    /// send-side `async_number` (AOSP `nodeProgressAsyncNumber` on the
-    /// send path). Returns the value to stamp on the outgoing wire.
-    /// Auto-creates the counter at `0` if unseen. Decoupled from
-    /// `remote_proxies` so the counter survives only a stale `Drop`
-    /// whose proxy was already re-cached (`forget_remote_if` checks
-    /// identity): the peer's `BinderNode` is still alive, and resetting
-    /// our counter would replay numbers the peer's `asyncTodo` already
-    /// processed.
-    ///
-    /// Overflow: u64 wrap means a session issued 2^64 oneways to one
-    /// node, effectively unreachable; AOSP `nodeProgressAsyncNumber`
-    /// returns `false` and tears down the session at overflow. We
-    /// match by wrapping + logging (rsbinder has no `shutdownAndWait`
-    /// equivalent on this path; the peer will surface as a protocol
-    /// error on the duplicate).
+    /// Post-increment `addr`'s send-side oneway number (from 0); module doc "Async-number wrap".
     pub fn next_send_async_number(&mut self, addr: RpcAddress) -> u64 {
         let counter = self.remote_send_async_counters.entry(addr).or_insert(0);
         let n = *counter;
@@ -626,7 +609,7 @@ impl RpcState {
             // AOSP RpcState.cpp:1109–1129: bound the out-of-order backlog and the fds it owns.
             let num_pending = node.async_todo.len();
             if num_pending >= ASYNC_TODO_TERMINATE_LEVEL {
-                // Flush now: frees memory/fds even if a multi-conn session survives this.
+                // Free the backlog's memory/fds now, before session end reaches `clear_local`.
                 node.async_todo.clear();
                 return AsyncDecision::Terminate(num_pending);
             }
@@ -907,6 +890,29 @@ mod tests {
         let _ = s1.dec_strong_local(&a1, 1);
         assert_eq!(s1.local_node_count(), 0);
         assert_eq!(s2.local_node_count(), 0);
+    }
+
+    /// An r34-random address whose byte 8 is our tag is a remote; our own shape is refused.
+    #[test]
+    fn own_subspace_refusal_is_by_minted_shape() {
+        for space in [AddressSpace::Initiator, AddressSpace::Acceptor] {
+            let mut st = RpcState::new(space);
+            let mut r34 = [0x5au8; 32];
+            r34[8] = space.tag();
+            let sib = SIBinder::new(Arc::new(Dummy)).unwrap();
+            let (_p, excess) = st
+                .remote_proxy(RpcAddress::from_wire_bytes(r34), || sib.clone())
+                .expect("an android-12 r34 random address is a remote, whatever byte 8 holds");
+            assert!(!excess);
+
+            let mut ctr = 0u64;
+            let ours = RpcAddress::unique(&mut ctr, space);
+            assert_eq!(
+                st.remote_proxy(ours, || panic!("must not mint")).err(),
+                Some(crate::StatusCode::BadValue),
+                "an unknown address of our own minted shape is forged"
+            );
+        }
     }
 
     /// A stale `RpcProxy::drop` after a re-cache must not evict the successor proxy (no threads).

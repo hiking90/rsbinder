@@ -74,21 +74,23 @@ pub const FLAG_PRIVATE_LOCAL: TransactionFlags = 0;
 /// `FLAG_PRIVATE_VENDOR` (`0x10000000`, AOSP `IBinder.h`) — unconditional,
 /// unlike [`FLAG_PRIVATE_LOCAL`]. Marks a transaction as vendor-private.
 pub const FLAG_PRIVATE_VENDOR: TransactionFlags = 0x10000000;
-/// `TF_UPDATE_TXN` (0x40). Set together with
-/// [`FLAG_ONEWAY`] on a `transact()` to ask the Android 12+ driver to
-/// replace any pending async transaction with the same `(target, code)`
-/// instead of queueing both. Use for idempotent updates (notification
-/// state, location sample) where only the freshest value matters; the
-/// driver rejects `TF_UPDATE_TXN` without `TF_ONE_WAY` (EINVAL).
+/// `TF_UPDATE_TXN` (0x40). Set together with [`FLAG_ONEWAY`] on a
+/// `transact()`. While the target process is frozen, the Android 12+
+/// driver replaces a queued oneway transaction from the same sender to the
+/// same node with the same `code` and flags instead of queueing both
+/// (`binder.c` `binder_can_update_transaction`); a target that is not
+/// frozen receives every transaction. Use for idempotent updates where
+/// only the freshest value matters. Without [`FLAG_ONEWAY`] the driver
+/// ignores the flag and returns no error.
 pub const FLAG_UPDATE_TXN: TransactionFlags = sys::transaction_flags_TF_UPDATE_TXN;
-/// `TF_COLLECT_NOTED_APP_OPS` (0x80). Strictly a
-/// libbinder-level flag — the kernel binder driver itself never reads
-/// it. Asks the server runtime to prepend a noted-AppOps blob (under
-/// `EX_HAS_NOTED_APPOPS_REPLY_HEADER = -127`) to the reply parcel; the
-/// client side transparently skips the header during exception decode
-/// (see `Status::deserialize`).
-pub const FLAG_COLLECT_NOTED_APP_OPS: TransactionFlags =
-    sys::transaction_flags_TF_COLLECT_NOTED_APP_OPS;
+/// `FLAG_COLLECT_NOTED_APP_OPS` (`0x2`, AOSP `IBinder.java`). A userspace
+/// flag: the driver passes `flags` through, and Java
+/// `Binder.execTransactInternal` collects noted app-ops only when this bit
+/// is set; the reply parcel can then lead with a noted-AppOps blob (under
+/// `EX_HAS_NOTED_APPOPS_REPLY_HEADER = -127`), which the client side
+/// skips during exception decode (see `Status::deserialize`). No `TF_*` bit of the kernel UAPI
+/// (`include/uapi/linux/android/binder.h`) uses `0x2`.
+pub const FLAG_COLLECT_NOTED_APP_OPS: TransactionFlags = 0x2;
 
 const fn b_pack_chars(c1: char, c2: char, c3: char, c4: char) -> u32 {
     ((c1 as u32) << 24) | ((c2 as u32) << 16) | ((c3 as u32) << 8) | (c4 as u32)
@@ -518,6 +520,9 @@ pub trait Remotable: Send + Sync {
     /// Handle and reply to a request to invoke a transaction on this object.
     ///
     /// `reply` may be [`None`] if the sender does not expect a reply.
+    /// An `Err` is the reply status a remote caller receives, except that
+    /// `DeadObject` is sent as `FailedTransaction` ([`Transactable`]
+    /// "Handler errors").
     fn on_transact(
         &self,
         code: TransactionCode,
@@ -527,6 +532,10 @@ pub trait Remotable: Send + Sync {
 
     /// Handle a request to invoke the dump transaction on this
     /// object.
+    ///
+    /// An `Err` is the reply status, as for [`on_transact`](Self::on_transact):
+    /// `?` on a write to a pipe whose reader exited (`EPIPE`, so `DeadObject`)
+    /// reaches the caller as `FailedTransaction`, which leaves its proxy alive.
     fn on_dump(&self, writer: &mut dyn std::io::Write, args: &[String]) -> Result<()>;
 
     /// The AIDL method name for a transaction code, for tracing and
@@ -599,6 +608,25 @@ pub fn __transaction_name(
 /// use `panic = "abort"` abort the whole process on any panic,
 /// including from `transact`, and the per-transaction isolation
 /// degrades to the abort behavior.
+///
+/// # Handler errors
+///
+/// An `Err` from `transact` becomes the reply status a remote caller
+/// receives, over the kernel binder and over RPC alike, with one
+/// substitution: `Err(StatusCode::DeadObject)` is sent as
+/// `StatusCode::FailedTransaction`. An AOSP `BpBinder` that receives
+/// `DEAD_OBJECT` as a reply status sets `mAlive = 0`
+/// (`BpBinder::transact`, android17-release), and from then on returns
+/// `DEAD_OBJECT` for every call on that proxy without sending it, so one
+/// handler error would cut the caller off from a service that is still
+/// running. `DeadObject` reaches a handler as an ordinary value: `?` on a
+/// nested call to a dead binder, or on a `std::io::Error` of kind
+/// `BrokenPipe` (`EPIPE`, which is `DEAD_OBJECT`), such as an `on_dump`
+/// writing to a pipe whose reader exited. `FailedTransaction` fails the
+/// one call and leaves the proxy alive. This covers a `Status` with
+/// `ExceptionCode::TransactionFailed` too, which a generated stub sends
+/// as the reply status, not in the reply parcel. A local (in-process)
+/// call is not a reply and returns the handler's `Err` unchanged.
 pub trait Transactable: Send + Sync {
     fn transact(
         &self,
@@ -612,6 +640,17 @@ pub trait Transactable: Send + Sync {
     /// [`Remotable`] forwards to [`Remotable::transaction_name`].
     fn transaction_name(&self, _code: TransactionCode) -> Option<&'static str> {
         None
+    }
+}
+
+/// The reply status for a handler's `Err`; see [`Transactable`] "Handler errors".
+pub(crate) fn handler_reply_status(err: StatusCode) -> StatusCode {
+    match err {
+        StatusCode::DeadObject => {
+            log::debug!("a handler returned DeadObject; replying FailedTransaction");
+            StatusCode::FailedTransaction
+        }
+        other => other,
     }
 }
 

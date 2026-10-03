@@ -311,7 +311,7 @@ pub trait RpcTransport: Send + Sync {
     ///   its receive queue across a local shutdown — Linux: a reader gets
     ///   the queued bytes, then end of stream — or drop it (macOS). A
     ///   transport's own buffer may survive (`tls`'s decrypted plaintext)
-    ///   or be cleared (`unix` fd-mode clears its leftover here). A caller
+    ///   or be cleared. A caller
     ///   that must not read what is buffered keeps that decision in
     ///   session state — the session's end empties the slot pool — not
     ///   here. `mem`

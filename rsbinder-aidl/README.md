@@ -9,6 +9,7 @@ rsbinder = "0.12"
 
 [build-dependencies]
 rsbinder-aidl = { version = "0.12", features = ["async"] }
+miette = "7"
 ```
 
 Create a build.rs file:
@@ -59,6 +60,7 @@ rsbinder = { version = "0.12", default-features = false }
 
 [build-dependencies]
 rsbinder-aidl = "0.12"
+miette = "7"
 ```
 
 ## Error Reporting
@@ -68,17 +70,22 @@ When an AIDL file contains a syntax or semantic error, the compiler reports the 
 line number, source snippet, and a helpful message:
 
 ```
-  × AIDL Parse Error [aidl::parse_error]
-  ╭─[hello.aidl:5:12]
-4 │ interface IHello {
-5 │     void 123bad();
-  ·          ^^^^^^ expected identifier
-6 │ }
-  ╰────
-  help: method names must start with a letter or underscore
+aidl::parse_error
+
+  × AIDL syntax error
+   ╭─[hello.aidl:5:10]
+ 4 │ interface IHello {
+ 5 │     void 123bad();
+   ·          ┬
+   ·          ╰── expected generic_type1, generic_type2, generic_type3, array_type, identifier
+ 6 │ }
+   ╰────
 ```
 
-To enable fancy (colored, Unicode) output in a binary, call `miette::set_hook()` at startup:
+The output is graphical (Unicode) by default, and colored when stderr is a terminal that supports
+color: `rsbinder-aidl` enables miette's `fancy` feature, so `miette::Report` needs no setup. To
+change the theme, width, or other options in a binary, call `miette::set_hook()` at startup with
+configured `MietteHandlerOpts`:
 ```rust
 fn main() -> miette::Result<()> {
     miette::set_hook(Box::new(|_| {

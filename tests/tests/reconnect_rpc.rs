@@ -30,7 +30,7 @@ impl Interface for Svc {}
 impl IRpcSmoke for Svc {
     fn r#echo(&self, s: &str) -> rsbinder::BinderResult<String> {
         if s == "dead" {
-            // A live handler relaying DeadObject: the session is fine.
+            // A live handler returning DeadObject (sent as FailedTransaction): the session is fine.
             return Err(StatusCode::DeadObject.into());
         }
         if s == "slow" {
@@ -272,7 +272,7 @@ fn a_relayed_dead_object_does_not_reconnect() {
         .build()
         .expect("build");
     let err = echo(&h, "dead").unwrap_err();
-    assert_eq!(err.transaction_error(), StatusCode::DeadObject);
+    assert_eq!(err.transaction_error(), StatusCode::FailedTransaction);
     assert_eq!(echo(&h, "x").unwrap(), "a:x");
     assert_eq!(h.generation(), 1, "still the first connection");
 }

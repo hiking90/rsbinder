@@ -43,6 +43,7 @@ $ sudo rsb_device binder --group binder --mode 0660
 2. **Filesystem Mount**: Executes `mount -t binder binder /dev/binderfs` to mount binderfs
 3. **Device Creation**: Uses kernel ioctl interface to create `/dev/binderfs/<device_name>`
 4. **Ownership and permissions**: Applies `--group` (unchanged by default) and `--mode` (default `0600`)
+5. **Symlink**: Links `/dev/<device_name>` to `/dev/binderfs/<device_name>`; if `/dev/<device_name>` already exists as anything else, it is left unchanged and a warning is printed
 
 ### Why the device is root-only by default
 Binder has no in-kernel access control of its own, so the device node is the
@@ -64,8 +65,8 @@ The service manager for Linux — the counterpart of Android's `servicemanager`.
 
 ### Usage
 ```bash
-# With an access-control policy (a file, or a directory of *.toml files;
-# defaults to /etc/rsbinder/hub.d)
+# With an access-control policy (a file, or a directory of *.toml files,
+# names starting with "." ignored; defaults to /etc/rsbinder/hub.d)
 $ rsb_hub --config /etc/rsbinder/hub.d
 
 # With no access control at all -- development and test only
@@ -75,9 +76,16 @@ $ rsb_hub --insecure-allow-all
 `rsb_hub` denies every request its policy does not allow, and refuses to start
 when it cannot load one. The configuration and every directory above it, up to
 `/`, must be writable by nobody but their owner (root or the uid `rsb_hub` runs
-as), so a configuration under `/tmp` is refused; for an unprivileged run put it
-under `$XDG_RUNTIME_DIR` or `$HOME`. `SIGHUP` reloads the policy in place; a
-reload that fails keeps the policy already in force. See the
+as), and so must every `exec` program it names and the directories above that
+program; a configuration or program under `/tmp` is refused. For an
+unprivileged run put them under `$XDG_RUNTIME_DIR` or `$HOME`. The program is
+checked at load and again right before each start, which is refused and logged
+if the program fails it then. `SIGHUP` reloads the policy in place; a
+reload that fails keeps the policy already in force. A reload judges requests
+made after it: a `registerForNotifications` callback registered before it keeps
+receiving the name's binder, because `find` is checked when the callback is
+registered, as in AOSP `servicemanager`. Restart `rsb_hub` or the client to
+revoke one. See the
 [Service Manager chapter](https://hiking90.github.io/rsbinder/service-manager.html#access-control)
 for the file format.
 
@@ -102,15 +110,16 @@ WantedBy=multi-user.target
 
 A binder device has exactly one service manager. Starting a second `rsb_hub`
 on the same device exits 1 and says so; give it its own device
-(`rsb_device other && rsb_hub --device other`) to run an independent one.
+(`sudo rsb_device other --group binder --mode 0660 && rsb_hub --device other`)
+to run an independent one.
 
 ### Features
 
 - **Service Registration / Discovery**: services register under a unique name; clients look them up by it
 - **Lifecycle Management**: dead services are reaped, and death notifications delivered
-- **Access Control**: per-name `add` / `find` / `list` policy keyed on caller uid and group, default-deny, reloadable with `SIGHUP`
+- **Access Control**: per-name `add` / `find` policy plus a global `list` gate (`[global] list`), keyed on caller uid and group, default-deny, reloadable with `SIGHUP`
 - **Service Declarations**: `[[service]]` entries answer `isDeclared` / `getDeclaredInstances` / `getConnectionInfo`, the Linux stand-in for VINTF manifests
-- **On-Demand Start**: a lookup that misses a declared service starts it, via systemd or a configured command; an `exec` command's program (`argv[0]`) must be an absolute path, since it runs with `rsb_hub`'s privileges
+- **On-Demand Start**: a `getService` that misses a declared service starts it (`checkService`, and so `rsb_service check`, never does), via systemd or a configured command; an `exec` command's program (`argv[0]`) runs with `rsb_hub`'s privileges, so it must be an absolute path and pass the configuration's own ownership and mode check when the configuration is loaded and again right before each start
 - **Notification System**: callbacks for service availability changes
 - **Dump Priorities**: `listServices` filters by the AOSP `DUMP_FLAG_PRIORITY_*` flags — a listing filter, not an access-control mechanism
 
@@ -153,11 +162,12 @@ the question could not be answered -- no service manager, or its policy denied
 it. So `rsb_service check foo || start-foo` reads the way it looks.
 
 `rsb_service` is an ordinary binder client, so `rsb_hub`'s policy applies to it
-like anything else: `list`, `info` and `dump` need `list`, and every name they
-report is filtered by `find`. A denial is reported as a denial rather than as
-an empty result -- except for `check`, where the hub answers a denied lookup
-exactly as it answers an unregistered name, by design, so that a denied caller
-cannot use it to enumerate which names exist.
+like anything else: `list` and `info` need `list`, and every name they report
+is filtered by `find`; `dump <name>` needs `find` on `<name>`, and for `manager`
+also `list`. A denial is reported as a denial rather than as an empty result --
+except for `check` and the lookup `dump` starts with, where the hub answers a
+denied `find` exactly as it answers an unregistered name, by design, so that a
+denied caller cannot use it to enumerate which names exist.
 
 `dump <name>` works on any service, not just the hub: it sends
 `DUMP_TRANSACTION` and prints whatever the service writes, which for an

@@ -220,8 +220,11 @@ impl ParcelableHolder {
     /// by `T::descriptor()`.
     ///
     /// Returns one of the following:
-    /// * `Err(_)` in case of error
-    /// * `Ok(None)` if the holder is empty or the descriptor does not match
+    /// * `Err(StatusCode::BadValue)` if a parcelable already decoded or
+    ///   set holds a different descriptor (AOSP `getParcelable`)
+    /// * `Err(_)` in case of any other error
+    /// * `Ok(None)` if the holder is empty, or holds an undecoded payload
+    ///   whose descriptor does not match
     /// * `Ok(Some(_))` if the object holds a parcelable of type `T`
     ///   with the correct descriptor
     pub fn get_parcelable<T>(&self) -> Result<Option<Arc<T>>>

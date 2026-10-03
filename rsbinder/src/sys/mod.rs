@@ -336,7 +336,7 @@ pub mod binder {
         }
     }
 
-    // Android 12+: 12 bytes (id/command/errno) on the thread's last failure; older: `ENOTTY`.
+    // 12 bytes (id/command/errno) of the thread's last failure; a driver without it: `EINVAL`.
     pub(crate) fn get_extended_error<Fd: AsFd>(
         fd: Fd,
         ee: &mut binder_extended_error,

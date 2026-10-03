@@ -19,8 +19,17 @@ pub struct ClientOptions {
     pub tls: Option<std::sync::Arc<crate::rpc::rustls::ClientConfig>>,
     #[cfg(feature = "rpc-tls")]
     pub tls_server_name: Option<String>,
-    /// RPC (android13plus profile): join an existing server session by
-    /// its 32-byte id instead of opening a new one.
+    /// RPC (android13plus profile): a non-empty id is refused with
+    /// [`StatusCode::BadValue`]. It would open a second client session
+    /// on a server session that another client session founded, with
+    /// its own oneway numbering, binder addresses and lifetime (AOSP has
+    /// no public entry for this either). Add a connection to a session
+    /// with `RpcSession::add_outgoing_connection_with_config` on that
+    /// session. Empty or `None` opens a new session.
+    #[deprecated(
+        since = "0.12.0",
+        note = "a non-empty id is refused with BadValue: open a new session, then add connections with `RpcSession::add_outgoing_connection_with_config` on it"
+    )]
     pub session_id: Option<Vec<u8>>,
     /// RPC (android13plus profile, every RPC transport): number of
     /// outgoing connections to open (AOSP `setupClient` fan-out).
@@ -368,25 +377,14 @@ fn rpc_setup<'a>(uri: &'a Uri, o: &'a ClientOptions) -> Result<crate::rpc::RpcCl
     if let Some(t) = o.handshake_timeout {
         cfg = cfg.handshake_timeout(t);
     }
-    // Forwarded, not dropped: the session layer refuses what it cannot honor (never ignored).
-    if let Some(id) = o.session_id.as_deref() {
-        // The session layer's own pre-connect refusals, made here so they count as setup.
-        if !(id.is_empty() || id.len() == 32) {
-            log::error!(
-                "rsbinder::Client::open: session_id must be empty or 32 bytes (AOSP \
-                 kSessionIdBytes), not {}",
-                id.len()
-            );
-            return Err(StatusCode::BadValue);
-        }
-        if !id.is_empty() && (fan_out > 1 || incoming > 0) {
-            log::error!(
-                "rsbinder::Client::open: session_id joins an existing session, which cannot \
-                 also open outgoing_connections/incoming_connections"
-            );
-            return Err(StatusCode::BadValue);
-        }
-        cfg = cfg.session_id(id);
+    // The session layer's own pre-connect refusal, made here so it counts as setup.
+    if o.session_id.as_deref().is_some_and(|id| !id.is_empty()) {
+        log::error!(
+            "rsbinder::Client::open: session_id would open a second client session on a server \
+             session another one founded; add the connection with \
+             `RpcSession::add_outgoing_connection_with_config` on that session instead"
+        );
+        return Err(StatusCode::BadValue);
     }
     Ok(cfg
         .outgoing_connections(fan_out)
@@ -608,6 +606,7 @@ mod tests {
     /// A refusal that does no I/O is `Setup`; a socket that is not there yet is `Connect`.
     #[cfg(feature = "rpc")]
     #[test]
+    #[allow(deprecated)] // Sets `session_id` to pin its refusal.
     fn open_reports_the_stage_that_failed() {
         let open = |uri: &str, f: fn(&mut ClientOptions)| {
             let mut o = ClientOptions::default();
@@ -624,10 +623,9 @@ mod tests {
         assert_eq!(
             open(&format!("{missing}?profile=android13plus"), |o| {
                 o.session_id = Some(vec![1; 32]);
-                o.incoming_connections = Some(1);
             }),
             Err((OpenStage::Setup, StatusCode::BadValue)),
-            "a session_id joins a session, so it cannot open more connections"
+            "a session_id would open a second client session on one server session"
         );
         assert_eq!(
             open(missing, |_| {}),

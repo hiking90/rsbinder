@@ -12,9 +12,8 @@
 //! address, not an ACL basis**: the hypervisor, not the cid value, is
 //! the trust boundary; the cid is logged for diagnostics.
 //!
-//! Additive: this file + the feature + the `PeerIdentity::Vsock`
-//! variant are the only change — the core is untouched and runs
-//! unmodified with the transport swapped.
+//! The wire and state engine has no vsock-specific code; this backend
+//! is compiled in only with the `rpc-vsock` feature.
 //!
 //! Tests are Linux+VM and `#[ignore]` by default (need a peer VM or
 //! `VMADDR_CID_LOCAL`).
@@ -51,6 +50,11 @@ impl VsockTransport {
     /// `vsock` provides `From<OwnedFd> for VsockStream` (safe ownership
     /// transfer, mirroring std's `UnixStream::from(OwnedFd)`); the caller
     /// is responsible for asserting the fd's address family.
+    ///
+    /// The fd must be in blocking mode: a read on an `O_NONBLOCK` fd that
+    /// finds no data returns `RpcError::Timeout` at once. An Accessor fd
+    /// arrives non-blocking; [`crate::rpc::RpcSession::from_preconnected_fd`]
+    /// clears the flag, this does not.
     pub fn from_owned_fd(fd: OwnedFd) -> RpcResult<Self> {
         Self::from_stream(VsockStream::from(fd))
     }

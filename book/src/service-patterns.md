@@ -159,12 +159,19 @@ The method receives a writer and a list of string arguments:
 impl Interface for MyService {
     fn dump(&self, writer: &mut dyn std::io::Write, args: &[String]) -> Result<()> {
         for arg in args {
-            writeln!(writer, "{arg}").unwrap();
+            writeln!(writer, "{arg}")?;
         }
         Ok(())
     }
 }
 ```
+
+An `Err` from `dump()` is the reply status the caller receives. A write to a
+pipe whose reader has exited fails with `EPIPE`, which `?` converts to
+`StatusCode::DeadObject`; rsbinder sends a handler's `DeadObject` as
+`FailedTransaction`, because an AOSP `BpBinder` that receives `DEAD_OBJECT`
+marks the proxy dead and fails every later call on it. The same substitution
+applies to every method a service implements.
 
 On the client side, you can invoke `dump()` on a remote service through its proxy.
 The output is written to a file descriptor (typically a pipe):

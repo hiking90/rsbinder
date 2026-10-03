@@ -1,35 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Recognition-only annotation lock-ins.
+//! Annotation codegen lock-ins.
 //!
-//! AOSP's Rust AIDL backend (`system/tools/aidl/generate_rust.cpp`)
-//! silently ignores three annotations whose effects are either
-//! constraint-only, automatically true in rsbinder, or Java-backend
-//! specific. rsbinder-aidl matches the Rust backend's silent-ignore
-//! behavior. These tests lock that in:
+//! `@SensitiveData` and `@PropagateAllowBlocking` do not change the
+//! generated code, and `@FixedSize` changes it only in a union's implicit
+//! `Tag`, which it backs by `byte` instead of `int`. AOSP's Rust output
+//! (`system/tools/aidl/generate_rust.cpp`) differs in the same places.
+//! These tests lock that in. `@FixedSize`'s field constraint is a
+//! validation rule, not codegen, and `tests/test_aosp_placement_rules.rs`
+//! covers it; every input here satisfies it.
 //!
-//!   * `@FixedSize` (parcelable / union) — the wire format is the same as
-//!     without. Note this is *recognition-only for codegen*, not for
-//!     validation: `tests/test_aosp_placement_rules.rs` covers the AOSP
-//!     `CanBeFixedSize` field check, which does reject contracts.
-//!   * `@SensitiveData` (interface) — AOSP `generate_cpp.cpp:246` /
-//!     `generate_rust.cpp:365` add `FLAG_CLEAR_BUF` to every method on
-//!     the interface. rsbinder unconditionally emits `FLAG_CLEAR_BUF`
-//!     for **every** generated method (see
-//!     `rsbinder-aidl/src/generator.rs` `submit_transact` lines), so
-//!     the on-the-wire effect AOSP wants is universal in our output.
-//!   * `@PropagateAllowBlocking` (method) — emitted *only* by AOSP's
-//!     Java backend (`generate_java_binder.cpp:816`); the C++ and Rust
-//!     backends do not emit anything for it. rsbinder follows the Rust
-//!     backend.
-//!
-//! Per-section AOSP references:
+//! Per-annotation AOSP references:
 //!
 //!   * @FixedSize — AOSP `aidl_language.cpp` — applies to a structured
-//!     parcelable or union; no codegen effect. Its *field* constraint is
-//!     enforced separately (see `test_aosp_placement_rules.rs`); these
-//!     cases all satisfy it, so only the no-codegen-effect half is at
-//!     stake here.
+//!     parcelable or union. The `byte`-backed `Tag` comes from the parser
+//!     (`parser.cpp` `UnionTagGenerater`), so every AOSP backend has it, and
+//!     a `Tag[]` goes on the wire as `byte[]`.
 //!   * @SensitiveData — AOSP `aidl_language.cpp:140`:
 //!     `CONTEXT_TYPE_INTERFACE`, no parameters. AOSP `generate_cpp.cpp:246`
 //!     and `generate_rust.cpp:365` add `FLAG_CLEAR_BUF` to every method.
@@ -87,7 +73,7 @@ parcelable Foo {
 }
 
 #[test]
-fn fixed_size_union_byte_identical() {
+fn fixed_size_union_changes_only_tag_backing() {
     let plain = generate(
         r#"
 package test;
@@ -108,7 +94,12 @@ union FooUnion {
         "#,
     );
     assert!(plain.contains("pub enum r#FooUnion"), "{plain}");
-    assert_eq!(plain, annotated, "@FixedSize must not change union codegen");
+    // AOSP `UnionTagGenerater`: the only difference is the `byte`-backed `Tag`.
+    assert_eq!(
+        plain.replace("Tag : [i32; 2]", "Tag : [i8; 2]"),
+        annotated,
+        "@FixedSize must change only the union Tag backing"
+    );
 }
 
 #[test]

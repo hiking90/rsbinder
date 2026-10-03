@@ -444,6 +444,10 @@ jobs:
           cross test -p rsbinder --target s390x-unknown-linux-gnu \
             --no-default-features --lib parcel -- --skip shared_memory --skip fmq:: 2>&1 | tee /tmp/be_parcel.out
           grep -qE 'test result: ok\. [1-9][0-9]* passed' /tmp/be_parcel.out
+          # Kernel objects are in host byte order: `handle` must land in the union's first bytes.
+          cross test -p rsbinder --target s390x-unknown-linux-gnu \
+            --no-default-features --lib binder_object:: 2>&1 | tee /tmp/be_object.out
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' /tmp/be_object.out
           cross test -p rsbinder --target s390x-unknown-linux-gnu \
             --features rpc,rpc-tcp-debug --lib file_descriptor:: 2>&1 | tee /tmp/be_fd.out
           grep -qE 'test result: ok\. [1-9][0-9]* passed' /tmp/be_fd.out
@@ -547,9 +551,10 @@ jobs:
     - uses: Swatinem/rust-cache@v2
       with:
         key: ${{ matrix.target }}-${{ env.rust_min }} # Add rust_min to cache key as it's specific now
+    # -p 29: the oldest supported Android; cargo-ndk's default (21) lacks e.g. process_vm_readv.
     - name: Build for Android (${{ matrix.target }})
-      run: cargo ndk -t ${{ matrix.target }} build --release
+      run: cargo ndk -t ${{ matrix.target }} -p 29 build --release
     - name: Check test builds for Android (${{ matrix.target }})
       run: |
-        cargo ndk -t ${{ matrix.target }} test --no-run
+        cargo ndk -t ${{ matrix.target }} -p 29 test --no-run
 

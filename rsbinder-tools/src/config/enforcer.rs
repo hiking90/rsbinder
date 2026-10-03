@@ -85,6 +85,11 @@ impl Enforcer {
 
     /// Swap in a freshly loaded configuration and drop the memoized group
     /// sets, so a reload also picks up group-membership changes.
+    ///
+    /// Only checks made after the swap see the new configuration. A grant
+    /// already acted on is not revisited: `rsb_hub` checks `find` when a
+    /// `registerForNotifications` callback is registered, not each time it
+    /// fires, as AOSP `ServiceManager::dispatchRegistrationCallbacks` does.
     pub fn replace(&self, config: Config) {
         *self.config.write().expect("config lock poisoned") = Arc::new(config);
         self.groups.clear();

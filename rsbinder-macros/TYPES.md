@@ -29,13 +29,13 @@ The spelling the AIDL compiler produces for each kind of type, by position. One 
 | `String[]` | `&[String]` | `&mut Vec<String>` | `&mut Vec<String>` | `Vec<String>` | `Vec<String>` |
 | `@nullable String[]` | `Option<&[Option<String>]>` | `&mut Option<Vec<Option<String>>>` | `&mut Option<Vec<Option<String>>>` | `Option<Vec<Option<String>>>` | `Option<Vec<Option<String>>>` |
 | `String[N]` | `&[String; N]` | `&mut [String; N]` | `&mut [String; N]` | `[String; N]` | `[String; N]` |
-| `@nullable String[N]` | `Option<&[String; N]>` | `&mut Option<[Option<String>; N]>` | `&mut Option<[Option<String>; N]>` | `Option<[String; N]>` | `Option<[Option<String>; N]>` |
+| `@nullable String[N]` | `Option<&[Option<String>; N]>` | `&mut Option<[Option<String>; N]>` | `&mut Option<[Option<String>; N]>` | `Option<[Option<String>; N]>` | `Option<[Option<String>; N]>` |
 | `Cfg` | `&Cfg` | `&mut Cfg` | `&mut Cfg` | `Cfg` | `Cfg` |
 | `@nullable Cfg` | `Option<&Cfg>` | `&mut Option<Cfg>` | `&mut Option<Cfg>` | `Option<Cfg>` | `Option<Cfg>` |
 | `Cfg[]` | `&[Cfg]` | `&mut Vec<Cfg>` | `&mut Vec<Cfg>` | `Vec<Cfg>` | `Vec<Cfg>` |
 | `@nullable Cfg[]` | `Option<&[Option<Cfg>]>` | `&mut Option<Vec<Option<Cfg>>>` | `&mut Option<Vec<Option<Cfg>>>` | `Option<Vec<Option<Cfg>>>` | `Option<Vec<Option<Cfg>>>` |
 | `Cfg[N]` | `&[Cfg; N]` | `&mut [Cfg; N]` | `&mut [Cfg; N]` | `[Cfg; N]` | `[Cfg; N]` |
-| `@nullable Cfg[N]` | `Option<&[Cfg; N]>` | `&mut Option<[Option<Cfg>; N]>` | `&mut Option<[Option<Cfg>; N]>` | `Option<[Cfg; N]>` | `Option<[Option<Cfg>; N]>` |
+| `@nullable Cfg[N]` | `Option<&[Option<Cfg>; N]>` | `&mut Option<[Option<Cfg>; N]>` | `&mut Option<[Option<Cfg>; N]>` | `Option<[Option<Cfg>; N]>` | `Option<[Option<Cfg>; N]>` |
 | `Mode` | `Mode` | — | — | `Mode` | `Mode` |
 | `Mode[]` | `&[Mode]` | `&mut Vec<Mode>` | `&mut Vec<Mode>` | `Vec<Mode>` | `Vec<Mode>` |
 | `@nullable Mode[]` | `Option<&[Mode]>` | `&mut Option<Vec<Mode>>` | `&mut Option<Vec<Mode>>` | `Option<Vec<Mode>>` | `Option<Vec<Mode>>` |
@@ -45,17 +45,17 @@ The spelling the AIDL compiler produces for each kind of type, by position. One 
 | `@nullable ParcelFileDescriptor` | `Option<&rsbinder::ParcelFileDescriptor>` | `&mut Option<rsbinder::ParcelFileDescriptor>` | `&mut Option<rsbinder::ParcelFileDescriptor>` | `Option<rsbinder::ParcelFileDescriptor>` | `Option<rsbinder::ParcelFileDescriptor>` |
 | `ParcelFileDescriptor[]` | `&[rsbinder::ParcelFileDescriptor]` | `&mut Vec<Option<rsbinder::ParcelFileDescriptor>>` | `&mut Vec<rsbinder::ParcelFileDescriptor>` | `Vec<rsbinder::ParcelFileDescriptor>` | `Vec<rsbinder::ParcelFileDescriptor>` |
 | `@nullable ParcelFileDescriptor[]` | `Option<&[Option<rsbinder::ParcelFileDescriptor>]>` | `&mut Option<Vec<Option<rsbinder::ParcelFileDescriptor>>>` | `&mut Option<Vec<Option<rsbinder::ParcelFileDescriptor>>>` | `Option<Vec<Option<rsbinder::ParcelFileDescriptor>>>` | `Option<Vec<Option<rsbinder::ParcelFileDescriptor>>>` |
-| `ParcelFileDescriptor[N]` | `&[rsbinder::ParcelFileDescriptor; N]` | `&mut [Option<rsbinder::ParcelFileDescriptor>; N]` | `&mut [Option<rsbinder::ParcelFileDescriptor>; N]` | `[rsbinder::ParcelFileDescriptor; N]` | `[Option<rsbinder::ParcelFileDescriptor>; N]` |
-| `@nullable ParcelFileDescriptor[N]` | `Option<&[rsbinder::ParcelFileDescriptor; N]>` | `&mut Option<[Option<rsbinder::ParcelFileDescriptor>; N]>` | `&mut Option<[Option<rsbinder::ParcelFileDescriptor>; N]>` | `Option<[rsbinder::ParcelFileDescriptor; N]>` | `Option<[Option<rsbinder::ParcelFileDescriptor>; N]>` |
+| `ParcelFileDescriptor[N]` | `&[rsbinder::ParcelFileDescriptor; N]` | `&mut [Option<rsbinder::ParcelFileDescriptor>; N]` | `&mut [rsbinder::ParcelFileDescriptor; N]` | `[rsbinder::ParcelFileDescriptor; N]` | `[Option<rsbinder::ParcelFileDescriptor>; N]` |
+| `@nullable ParcelFileDescriptor[N]` | `Option<&[Option<rsbinder::ParcelFileDescriptor>; N]>` | `&mut Option<[Option<rsbinder::ParcelFileDescriptor>; N]>` | `&mut Option<[Option<rsbinder::ParcelFileDescriptor>; N]>` | `Option<[Option<rsbinder::ParcelFileDescriptor>; N]>` | `Option<[Option<rsbinder::ParcelFileDescriptor>; N]>` |
 | `IFoo` | `&rsbinder::Strong<dyn IFoo>` | `&mut Option<rsbinder::Strong<dyn IFoo>>` | `&mut rsbinder::Strong<dyn IFoo>` | `rsbinder::Strong<dyn IFoo>` | `Option<rsbinder::Strong<dyn IFoo>>` |
 | `@nullable IFoo` | `Option<&rsbinder::Strong<dyn IFoo>>` | `&mut Option<rsbinder::Strong<dyn IFoo>>` | `&mut Option<rsbinder::Strong<dyn IFoo>>` | `Option<rsbinder::Strong<dyn IFoo>>` | `Option<rsbinder::Strong<dyn IFoo>>` |
 | `IFoo[]` | `&[rsbinder::Strong<dyn IFoo>]` | `&mut Vec<Option<rsbinder::Strong<dyn IFoo>>>` | `&mut Vec<rsbinder::Strong<dyn IFoo>>` | `Vec<rsbinder::Strong<dyn IFoo>>` | `Vec<rsbinder::Strong<dyn IFoo>>` |
 | `@nullable IFoo[]` | `Option<&[Option<rsbinder::Strong<dyn IFoo>>]>` | `&mut Option<Vec<Option<rsbinder::Strong<dyn IFoo>>>>` | `&mut Option<Vec<Option<rsbinder::Strong<dyn IFoo>>>>` | `Option<Vec<Option<rsbinder::Strong<dyn IFoo>>>>` | `Option<Vec<Option<rsbinder::Strong<dyn IFoo>>>>` |
-| `IFoo[N]` | `&[rsbinder::Strong<dyn IFoo>; N]` | `&mut [Option<rsbinder::Strong<dyn IFoo>>; N]` | `&mut [Option<rsbinder::Strong<dyn IFoo>>; N]` | `[rsbinder::Strong<dyn IFoo>; N]` | `[Option<rsbinder::Strong<dyn IFoo>>; N]` |
-| `@nullable IFoo[N]` | `Option<&[rsbinder::Strong<dyn IFoo>; N]>` | `&mut Option<[Option<rsbinder::Strong<dyn IFoo>>; N]>` | `&mut Option<[Option<rsbinder::Strong<dyn IFoo>>; N]>` | `Option<[rsbinder::Strong<dyn IFoo>; N]>` | `Option<[Option<rsbinder::Strong<dyn IFoo>>; N]>` |
+| `IFoo[N]` | `&[rsbinder::Strong<dyn IFoo>; N]` | `&mut [Option<rsbinder::Strong<dyn IFoo>>; N]` | `&mut [rsbinder::Strong<dyn IFoo>; N]` | `[rsbinder::Strong<dyn IFoo>; N]` | `[Option<rsbinder::Strong<dyn IFoo>>; N]` |
+| `@nullable IFoo[N]` | `Option<&[Option<rsbinder::Strong<dyn IFoo>>; N]>` | `&mut Option<[Option<rsbinder::Strong<dyn IFoo>>; N]>` | `&mut Option<[Option<rsbinder::Strong<dyn IFoo>>; N]>` | `Option<[Option<rsbinder::Strong<dyn IFoo>>; N]>` | `Option<[Option<rsbinder::Strong<dyn IFoo>>; N]>` |
 | `IBinder` | `&rsbinder::SIBinder` | `&mut Option<rsbinder::SIBinder>` | `&mut rsbinder::SIBinder` | `rsbinder::SIBinder` | `Option<rsbinder::SIBinder>` |
 | `@nullable IBinder` | `Option<&rsbinder::SIBinder>` | `&mut Option<rsbinder::SIBinder>` | `&mut Option<rsbinder::SIBinder>` | `Option<rsbinder::SIBinder>` | `Option<rsbinder::SIBinder>` |
 | `IBinder[]` | `&[rsbinder::SIBinder]` | `&mut Vec<Option<rsbinder::SIBinder>>` | `&mut Vec<rsbinder::SIBinder>` | `Vec<rsbinder::SIBinder>` | `Vec<rsbinder::SIBinder>` |
 | `@nullable IBinder[]` | `Option<&[Option<rsbinder::SIBinder>]>` | `&mut Option<Vec<Option<rsbinder::SIBinder>>>` | `&mut Option<Vec<Option<rsbinder::SIBinder>>>` | `Option<Vec<Option<rsbinder::SIBinder>>>` | `Option<Vec<Option<rsbinder::SIBinder>>>` |
-| `IBinder[N]` | `&[rsbinder::SIBinder; N]` | `&mut [Option<rsbinder::SIBinder>; N]` | `&mut [Option<rsbinder::SIBinder>; N]` | `[rsbinder::SIBinder; N]` | `[Option<rsbinder::SIBinder>; N]` |
-| `@nullable IBinder[N]` | `Option<&[rsbinder::SIBinder; N]>` | `&mut Option<[Option<rsbinder::SIBinder>; N]>` | `&mut Option<[Option<rsbinder::SIBinder>; N]>` | `Option<[rsbinder::SIBinder; N]>` | `Option<[Option<rsbinder::SIBinder>; N]>` |
+| `IBinder[N]` | `&[rsbinder::SIBinder; N]` | `&mut [Option<rsbinder::SIBinder>; N]` | `&mut [rsbinder::SIBinder; N]` | `[rsbinder::SIBinder; N]` | `[Option<rsbinder::SIBinder>; N]` |
+| `@nullable IBinder[N]` | `Option<&[Option<rsbinder::SIBinder>; N]>` | `&mut Option<[Option<rsbinder::SIBinder>; N]>` | `&mut Option<[Option<rsbinder::SIBinder>; N]>` | `Option<[Option<rsbinder::SIBinder>; N]>` | `Option<[Option<rsbinder::SIBinder>; N]>` |

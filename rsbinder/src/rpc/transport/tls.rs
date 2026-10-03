@@ -201,6 +201,14 @@ pub trait TlsStream: Send + Sync {
     /// layer). One underlying `read`; may be short.
     fn read(&self, buf: &mut [u8]) -> std::io::Result<usize>;
     /// Write up to `buf.len()` bytes; may be short.
+    ///
+    /// A write to a closed peer must fail with `EPIPE`, not raise
+    /// `SIGPIPE`. The bundled `TcpStream`/`UnixStream`/`vsock` impls send
+    /// with `MSG_NOSIGNAL` on Linux and Android. Apple has no
+    /// `MSG_NOSIGNAL` and relies on the socket's `SO_NOSIGPIPE`: std sets
+    /// it on the sockets its `connect` creates and `RpcServer` sets it on
+    /// the streams it accepts. On a stream from any other source (your own
+    /// `accept`, `UnixStream::pair`, a raw fd) the caller sets it.
     fn write(&self, buf: &[u8]) -> std::io::Result<usize>;
     /// Flush the underlying stream.
     fn flush(&self) -> std::io::Result<()>;
@@ -262,7 +270,8 @@ impl TlsStream for UnixStream {
         (&mut &*self).read(buf)
     }
     fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
-        (&mut &*self).write(buf)
+        // Not std's `write`: on the MSRV std that is `write(2)`, which raises `SIGPIPE`.
+        rustix::net::send(self, buf, super::unix::SEND_FLAGS).map_err(std::io::Error::from)
     }
     fn flush(&self) -> std::io::Result<()> {
         (&mut &*self).flush()

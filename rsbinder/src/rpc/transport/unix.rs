@@ -107,12 +107,32 @@ pub(crate) const MAX_FDS_PER_FRAME: usize = 64;
 
 /// A send to a closed peer is `EPIPE`, not `SIGPIPE`; Apple uses `SO_NOSIGPIPE` (module doc).
 #[cfg(not(target_vendor = "apple"))]
-const SEND_FLAGS: rustix::net::SendFlags = rustix::net::SendFlags::NOSIGNAL;
+pub(super) const SEND_FLAGS: rustix::net::SendFlags = rustix::net::SendFlags::NOSIGNAL;
 #[cfg(target_vendor = "apple")]
-const SEND_FLAGS: rustix::net::SendFlags = rustix::net::SendFlags::empty();
+pub(super) const SEND_FLAGS: rustix::net::SendFlags = rustix::net::SendFlags::empty();
+
+/// Received fds are `O_CLOEXEC` atomically, as AOSP `OS_unix_base.cpp`; Apple sets it after.
+#[cfg(not(target_vendor = "apple"))]
+const RECV_FLAGS: rustix::net::RecvFlags = rustix::net::RecvFlags::CMSG_CLOEXEC;
+#[cfg(target_vendor = "apple")]
+const RECV_FLAGS: rustix::net::RecvFlags = rustix::net::RecvFlags::empty();
 
 /// Ancillary space for one `sendmsg`/`recvmsg` of a frame: `MAX_FDS_PER_FRAME` fds.
 const FD_SPACE: usize = rustix::cmsg_space!(ScmRights(MAX_FDS_PER_FRAME));
+
+/// Unframed bytes via `send(2)` with `SEND_FLAGS`, classified as `write_all_reporting`.
+pub(crate) fn send_raw_nosignal(sock: std::os::fd::BorrowedFd<'_>, buf: &[u8]) -> RpcResult<()> {
+    struct NoSignal<'a>(std::os::fd::BorrowedFd<'a>);
+    impl Write for NoSignal<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            rustix::net::send(self.0, buf, SEND_FLAGS).map_err(std::io::Error::from)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    super::write_all_reporting(&mut NoSignal(sock), buf)
+}
 
 /// One length-prefixed frame (module doc "fd passing"); rejects oversize or too many fds first.
 pub(crate) fn send_frame_vectored(
@@ -229,6 +249,11 @@ impl UnixTransport {
     /// same way over the same fd. The caller is responsible for
     /// asserting the fd's address family (`AF_UNIX`); see
     /// [`crate::rpc::RpcSession::from_preconnected_fd`].
+    ///
+    /// The fd must be in blocking mode: a read on an `O_NONBLOCK` fd that
+    /// finds no data returns [`RpcError::Timeout`] at once. An Accessor fd
+    /// arrives non-blocking; [`crate::rpc::RpcSession::from_preconnected_fd`]
+    /// clears the flag, this does not.
     pub fn from_owned_fd(fd: OwnedFd) -> RpcResult<Self> {
         Self::from_stream(UnixStream::from(fd))
     }
@@ -377,13 +402,10 @@ impl RpcTransport for UnixTransport {
     }
 
     /// Raw, unframed write (android-13+ profile — the real android RPC
-    /// wire has no length prefix). `&UnixStream: Write`, so a shared
-    /// `&self` stays full-duplex (same as `send_frame`).
+    /// wire has no length prefix). `send(2)` with `SEND_FLAGS` (no `SIGPIPE`)
+    /// needs only `&self`, so it stays full-duplex (same as `send_frame`).
     fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
-        let mut w = &self.stream;
-        super::write_all_reporting(&mut w, buf)?;
-        w.flush().map_err(RpcError::from)?;
-        Ok(())
+        send_raw_nosignal(self.stream.as_fd(), buf)
     }
 
     /// Raw, unframed read (one `read`; `Ok(0)` = peer closed). The
@@ -475,15 +497,13 @@ impl RpcTransport for UnixTransport {
     /// Raw, **unframed** read (one `recvmsg`) + any `SCM_RIGHTS` fds.
     /// Pairs with
     /// [`UnixTransport::send_raw_with_fds`]; received fds are
-    /// `O_CLOEXEC` (set explicitly — `MSG_CMSG_CLOEXEC` is Linux-only).
-    /// `Ok((0, _))` ⇒ peer closed. Unlike
-    /// [`UnixTransport::recv_frame_with_fds`] there is **no** leftover
-    /// buffer: the android-13+ message reader (`read_aosp_message
-    /// _with_fds`) drives exact header/body byte counts and accumulates
-    /// fds across those `recvmsg`s (AOSP
+    /// `O_CLOEXEC` (`MSG_CMSG_CLOEXEC`; on Apple, set after `recvmsg`).
+    /// `Ok((0, _))` ⇒ peer closed. The android-13+ message reader
+    /// (`read_aosp_message_with_fds`) drives exact header/body byte counts
+    /// and accumulates fds across those `recvmsg`s (AOSP
     /// `RpcTransportRaw::interruptableReadFully`).
     fn recv_raw_with_fds(&self, buf: &mut [u8]) -> RpcResult<(usize, Vec<std::os::fd::OwnedFd>)> {
-        use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags};
+        use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, ReturnFlags};
         use std::io::IoSliceMut;
         use std::mem::MaybeUninit;
 
@@ -496,7 +516,7 @@ impl RpcTransport for UnixTransport {
                 &self.stream,
                 &mut [IoSliceMut::new(buf)],
                 &mut anc,
-                RecvFlags::empty(),
+                RECV_FLAGS,
             ) {
                 Ok(r) => break r,
                 // EINTR retry, symmetric with read_header.
@@ -520,6 +540,7 @@ impl RpcTransport for UnixTransport {
         for msg in anc.drain() {
             if let RecvAncillaryMessage::ScmRights(iter) = msg {
                 for fd in iter {
+                    #[cfg(target_vendor = "apple")]
                     rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)
                         .map_err(std::io::Error::from)?;
                     fds.push(fd);
@@ -577,9 +598,8 @@ impl RpcTransport for UnixTransport {
     }
 
     /// Receive one length-prefixed frame plus any `SCM_RIGHTS` fds.
-    /// Received fds are made `O_CLOEXEC` explicitly via `fcntl_setfd`
-    /// (`recvmsg` runs with `RecvFlags::empty()`; `MSG_CMSG_CLOEXEC` is
-    /// Linux-only, so the portable path sets the flag after receipt — same as
+    /// Received fds are `O_CLOEXEC` (`MSG_CMSG_CLOEXEC`; on Apple, which
+    /// lacks it, `fcntl_setfd` after receipt — same as
     /// [`recv_raw_with_fds`](Self::recv_raw_with_fds)). Connections in `Unix`
     /// fd-mode use this for *every* frame, so `recvmsg` and `Read` are never
     /// mixed on one fd.
@@ -626,18 +646,17 @@ impl UnixTransport {
         fds: &mut Vec<OwnedFd>,
         started: bool,
     ) -> RpcResult<usize> {
-        use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags};
+        use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, ReturnFlags};
         use std::io::IoSliceMut;
 
         let consumed = started || !fds.is_empty();
         let mut anc = RecvAncillaryBuffer::new(space);
-        // `MSG_CMSG_CLOEXEC` is Linux-only; `FD_CLOEXEC` is set on each fd below.
         let r = loop {
             match rustix::net::recvmsg(
                 &self.stream,
                 &mut [IoSliceMut::new(buf)],
                 &mut anc,
-                RecvFlags::empty(),
+                RECV_FLAGS,
             ) {
                 Ok(r) => break r,
                 Err(rustix::io::Errno::INTR) => continue,
@@ -668,6 +687,7 @@ impl UnixTransport {
         for msg in anc.drain() {
             if let RecvAncillaryMessage::ScmRights(iter) = msg {
                 for fd in iter {
+                    #[cfg(target_vendor = "apple")]
                     rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)
                         .map_err(std::io::Error::from)?;
                     fds.push(fd);
@@ -794,6 +814,13 @@ mod tests {
             let fds = [file.as_fd()];
             assert!(a.send_frame_with_fds(b"frame", &fds).is_err());
             assert!(a.send_raw_with_fds(b"raw", &fds).is_err());
+            assert!(a.send_raw(b"raw").is_err());
+            #[cfg(feature = "rpc-tls")]
+            {
+                let (s, peer) = UnixStream::pair().expect("socketpair");
+                drop(peer);
+                assert!(crate::rpc::transport::TlsStream::write(&s, b"tls record").is_err());
+            }
             return;
         }
         let out = std::process::Command::new(std::env::current_exe().expect("current_exe"))

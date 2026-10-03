@@ -53,8 +53,8 @@ pub mod rsbinder::cancel::android::os
 pub mod rsbinder::cancel::android::os::ICancellationSignal
 pub struct rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal(_)
 impl rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal
-pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::new_async_binder<T, R>(T, R) -> rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal> where T: rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsyncService + core::marker::Sync + core::marker::Send + 'static, R: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
-pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::new_async_binder_with_features<T, R>(T, R, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal> where T: rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsyncService + core::marker::Sync + core::marker::Send + 'static, R: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::new_async_binder<__RsbService, __RsbRuntime>(__RsbService, __RsbRuntime) -> rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal> where __RsbService: rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsyncService + core::marker::Sync + core::marker::Send + 'static, __RsbRuntime: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::new_async_binder_with_features<__RsbService, __RsbRuntime>(__RsbService, __RsbRuntime, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal> where __RsbService: rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsyncService + core::marker::Sync + core::marker::Send + 'static, __RsbRuntime: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
 impl rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::new_binder<T: rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal + core::marker::Sync + core::marker::Send + 'static>(T) -> rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal>
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::new_binder_with_features<T: rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal + core::marker::Sync + core::marker::Send + 'static>(T, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal>
@@ -82,7 +82,7 @@ pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal:
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::getDefaultImpl() -> core::option::Option<rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef> where Self: core::marker::Sized
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::setDefaultImpl(rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef) -> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef where Self: core::marker::Sized
-impl<P: rsbinder::BinderAsyncPool> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<P> for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
+impl<__RsbPool: rsbinder::BinderAsyncPool> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<__RsbPool> for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::cancel<'a>(&'a self) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::descriptor() -> &'static str where Self: core::marker::Sized
 impl core::marker::Freeze for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
@@ -116,13 +116,13 @@ pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal:
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::getDefaultImpl() -> core::option::Option<rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef> where Self: core::marker::Sized
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::setDefaultImpl(rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef) -> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef where Self: core::marker::Sized
-pub trait rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<P>: rsbinder::Interface + core::marker::Send
+pub trait rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<__RsbPool>: rsbinder::Interface + core::marker::Send
 pub fn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync::cancel<'a>(&'a self) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
 pub fn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync::descriptor() -> &'static str where Self: core::marker::Sized
-impl<P: rsbinder::BinderAsyncPool> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<P> for rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>
+impl<__RsbPool: rsbinder::BinderAsyncPool> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<__RsbPool> for rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>
 pub fn rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>::cancel<'a>(&'a self) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
 pub fn rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>::descriptor() -> &'static str where Self: core::marker::Sized
-impl<P: rsbinder::BinderAsyncPool> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<P> for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
+impl<__RsbPool: rsbinder::BinderAsyncPool> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<__RsbPool> for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::cancel<'a>(&'a self) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::descriptor() -> &'static str where Self: core::marker::Sized
 pub trait rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsyncService: rsbinder::Interface + core::marker::Send
@@ -133,8 +133,8 @@ pub fn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDe
 pub type rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef = alloc::sync::Arc<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefault>
 pub struct rsbinder::cancel::BnCancellationSignal(_)
 impl rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal
-pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::new_async_binder<T, R>(T, R) -> rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal> where T: rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsyncService + core::marker::Sync + core::marker::Send + 'static, R: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
-pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::new_async_binder_with_features<T, R>(T, R, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal> where T: rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsyncService + core::marker::Sync + core::marker::Send + 'static, R: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::new_async_binder<__RsbService, __RsbRuntime>(__RsbService, __RsbRuntime) -> rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal> where __RsbService: rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsyncService + core::marker::Sync + core::marker::Send + 'static, __RsbRuntime: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::new_async_binder_with_features<__RsbService, __RsbRuntime>(__RsbService, __RsbRuntime, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal> where __RsbService: rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsyncService + core::marker::Sync + core::marker::Send + 'static, __RsbRuntime: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
 impl rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::new_binder<T: rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal + core::marker::Sync + core::marker::Send + 'static>(T) -> rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal>
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal::new_binder_with_features<T: rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal + core::marker::Sync + core::marker::Send + 'static>(T, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal>
@@ -162,7 +162,7 @@ pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal:
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::getDefaultImpl() -> core::option::Option<rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef> where Self: core::marker::Sized
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::setDefaultImpl(rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef) -> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef where Self: core::marker::Sized
-impl<P: rsbinder::BinderAsyncPool> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<P> for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
+impl<__RsbPool: rsbinder::BinderAsyncPool> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<__RsbPool> for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::cancel<'a>(&'a self) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::descriptor() -> &'static str where Self: core::marker::Sized
 impl core::marker::Freeze for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
@@ -228,13 +228,13 @@ pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal:
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::getDefaultImpl() -> core::option::Option<rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef> where Self: core::marker::Sized
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::setDefaultImpl(rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef) -> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalDefaultRef where Self: core::marker::Sized
-pub trait rsbinder::cancel::ICancellationSignalAsync<P>: rsbinder::Interface + core::marker::Send
+pub trait rsbinder::cancel::ICancellationSignalAsync<__RsbPool>: rsbinder::Interface + core::marker::Send
 pub fn rsbinder::cancel::ICancellationSignalAsync::cancel<'a>(&'a self) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
 pub fn rsbinder::cancel::ICancellationSignalAsync::descriptor() -> &'static str where Self: core::marker::Sized
-impl<P: rsbinder::BinderAsyncPool> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<P> for rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>
+impl<__RsbPool: rsbinder::BinderAsyncPool> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<__RsbPool> for rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>
 pub fn rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>::cancel<'a>(&'a self) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
 pub fn rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>::descriptor() -> &'static str where Self: core::marker::Sized
-impl<P: rsbinder::BinderAsyncPool> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<P> for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
+impl<__RsbPool: rsbinder::BinderAsyncPool> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<__RsbPool> for rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::cancel<'a>(&'a self) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
 pub fn rsbinder::cancel::android::os::ICancellationSignal::BpCancellationSignal::descriptor() -> &'static str where Self: core::marker::Sized
 pub trait rsbinder::cancel::ICancellationSignalAsyncService: rsbinder::Interface + core::marker::Send
@@ -653,8 +653,8 @@ impl core::panic::unwind_safe::UnwindSafe for rsbinder::hub::android_16::android
 pub mod rsbinder::hub::android_16::android::os::IClientCallback
 pub struct rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback(_)
 impl rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback
-pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::new_async_binder<T, R>(T, R) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback> where T: rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsyncService + core::marker::Sync + core::marker::Send + 'static, R: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
-pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::new_async_binder_with_features<T, R>(T, R, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback> where T: rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsyncService + core::marker::Sync + core::marker::Send + 'static, R: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::new_async_binder<__RsbService, __RsbRuntime>(__RsbService, __RsbRuntime) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback> where __RsbService: rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsyncService + core::marker::Sync + core::marker::Send + 'static, __RsbRuntime: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::new_async_binder_with_features<__RsbService, __RsbRuntime>(__RsbService, __RsbRuntime, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback> where __RsbService: rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsyncService + core::marker::Sync + core::marker::Send + 'static, __RsbRuntime: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
 impl rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::new_binder<T: rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback + core::marker::Sync + core::marker::Send + 'static>(T) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback>
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::new_binder_with_features<T: rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback + core::marker::Sync + core::marker::Send + 'static>(T, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback>
@@ -682,7 +682,7 @@ pub fn rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback::getDefaultImpl() -> core::option::Option<rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefaultRef> where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback::onClients(&self, &rsbinder::SIBinder, bool) -> rsbinder::BinderResult<()>
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback::setDefaultImpl(rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefaultRef) -> rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefaultRef where Self: core::marker::Sized
-impl<P: rsbinder::BinderAsyncPool> rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsync<P> for rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback
+impl<__RsbPool: rsbinder::BinderAsyncPool> rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsync<__RsbPool> for rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback::onClients<'a>(&'a self, &'a rsbinder::SIBinder, bool) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
 impl core::marker::Freeze for rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback
@@ -716,13 +716,13 @@ pub fn rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback::getDefaultImpl() -> core::option::Option<rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefaultRef> where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback::onClients(&self, &rsbinder::SIBinder, bool) -> rsbinder::BinderResult<()>
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback::setDefaultImpl(rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefaultRef) -> rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefaultRef where Self: core::marker::Sized
-pub trait rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsync<P>: rsbinder::Interface + core::marker::Send
+pub trait rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsync<__RsbPool>: rsbinder::Interface + core::marker::Send
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsync::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsync::onClients<'a>(&'a self, &'a rsbinder::SIBinder, bool) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
-impl<P: rsbinder::BinderAsyncPool> rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsync<P> for rsbinder::Binder<rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback>
+impl<__RsbPool: rsbinder::BinderAsyncPool> rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsync<__RsbPool> for rsbinder::Binder<rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback>
 pub fn rsbinder::Binder<rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback>::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::Binder<rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback>::onClients<'a>(&'a self, &'a rsbinder::SIBinder, bool) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
-impl<P: rsbinder::BinderAsyncPool> rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsync<P> for rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback
+impl<__RsbPool: rsbinder::BinderAsyncPool> rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsync<__RsbPool> for rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback::onClients<'a>(&'a self, &'a rsbinder::SIBinder, bool) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
 pub trait rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsyncService: rsbinder::Interface + core::marker::Send
@@ -734,8 +734,8 @@ pub type rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbac
 pub mod rsbinder::hub::android_16::android::os::IServiceCallback
 pub struct rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback(_)
 impl rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback
-pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::new_async_binder<T, R>(T, R) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback> where T: rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsyncService + core::marker::Sync + core::marker::Send + 'static, R: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
-pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::new_async_binder_with_features<T, R>(T, R, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback> where T: rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsyncService + core::marker::Sync + core::marker::Send + 'static, R: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::new_async_binder<__RsbService, __RsbRuntime>(__RsbService, __RsbRuntime) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback> where __RsbService: rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsyncService + core::marker::Sync + core::marker::Send + 'static, __RsbRuntime: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::new_async_binder_with_features<__RsbService, __RsbRuntime>(__RsbService, __RsbRuntime, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback> where __RsbService: rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsyncService + core::marker::Sync + core::marker::Send + 'static, __RsbRuntime: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
 impl rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::new_binder<T: rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback + core::marker::Sync + core::marker::Send + 'static>(T) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::new_binder_with_features<T: rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback + core::marker::Sync + core::marker::Send + 'static>(T, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>
@@ -763,7 +763,7 @@ pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BpServiceCallba
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BpServiceCallback::getDefaultImpl() -> core::option::Option<rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefaultRef> where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BpServiceCallback::onRegistration(&self, &str, &rsbinder::SIBinder) -> rsbinder::BinderResult<()>
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BpServiceCallback::setDefaultImpl(rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefaultRef) -> rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefaultRef where Self: core::marker::Sized
-impl<P: rsbinder::BinderAsyncPool> rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsync<P> for rsbinder::hub::android_16::android::os::IServiceCallback::BpServiceCallback
+impl<__RsbPool: rsbinder::BinderAsyncPool> rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsync<__RsbPool> for rsbinder::hub::android_16::android::os::IServiceCallback::BpServiceCallback
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BpServiceCallback::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BpServiceCallback::onRegistration<'a>(&'a self, &'a str, &'a rsbinder::SIBinder) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
 impl core::marker::Freeze for rsbinder::hub::android_16::android::os::IServiceCallback::BpServiceCallback
@@ -797,13 +797,13 @@ pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BpServiceCallba
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BpServiceCallback::getDefaultImpl() -> core::option::Option<rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefaultRef> where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BpServiceCallback::onRegistration(&self, &str, &rsbinder::SIBinder) -> rsbinder::BinderResult<()>
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BpServiceCallback::setDefaultImpl(rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefaultRef) -> rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefaultRef where Self: core::marker::Sized
-pub trait rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsync<P>: rsbinder::Interface + core::marker::Send
+pub trait rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsync<__RsbPool>: rsbinder::Interface + core::marker::Send
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsync::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsync::onRegistration<'a>(&'a self, &'a str, &'a rsbinder::SIBinder) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
-impl<P: rsbinder::BinderAsyncPool> rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsync<P> for rsbinder::Binder<rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback>
+impl<__RsbPool: rsbinder::BinderAsyncPool> rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsync<__RsbPool> for rsbinder::Binder<rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback>
 pub fn rsbinder::Binder<rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback>::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::Binder<rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback>::onRegistration<'a>(&'a self, &'a str, &'a rsbinder::SIBinder) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
-impl<P: rsbinder::BinderAsyncPool> rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsync<P> for rsbinder::hub::android_16::android::os::IServiceCallback::BpServiceCallback
+impl<__RsbPool: rsbinder::BinderAsyncPool> rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsync<__RsbPool> for rsbinder::hub::android_16::android::os::IServiceCallback::BpServiceCallback
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BpServiceCallback::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BpServiceCallback::onRegistration<'a>(&'a self, &'a str, &'a rsbinder::SIBinder) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
 pub trait rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsyncService: rsbinder::Interface + core::marker::Send
@@ -815,8 +815,8 @@ pub type rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallb
 pub mod rsbinder::hub::android_16::android::os::IServiceManager
 pub struct rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager(_)
 impl rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager
-pub fn rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager::new_async_binder<T, R>(T, R) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager> where T: rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsyncService + core::marker::Sync + core::marker::Send + 'static, R: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
-pub fn rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager::new_async_binder_with_features<T, R>(T, R, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager> where T: rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsyncService + core::marker::Sync + core::marker::Send + 'static, R: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager::new_async_binder<__RsbService, __RsbRuntime>(__RsbService, __RsbRuntime) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager> where __RsbService: rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsyncService + core::marker::Sync + core::marker::Send + 'static, __RsbRuntime: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager::new_async_binder_with_features<__RsbService, __RsbRuntime>(__RsbService, __RsbRuntime, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager> where __RsbService: rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsyncService + core::marker::Sync + core::marker::Send + 'static, __RsbRuntime: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
 impl rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager::new_binder<T: rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager + core::marker::Sync + core::marker::Send + 'static>(T) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager>
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager::new_binder_with_features<T: rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager + core::marker::Sync + core::marker::Send + 'static>(T, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager>
@@ -859,7 +859,7 @@ pub fn rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager::tryUnregisterService(&self, &str, &rsbinder::SIBinder) -> rsbinder::BinderResult<()>
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager::unregisterForNotifications(&self, &str, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::BinderResult<()>
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager::updatableViaApex(&self, &str) -> rsbinder::BinderResult<core::option::Option<alloc::string::String>>
-impl<P: rsbinder::BinderAsyncPool> rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsync<P> for rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager
+impl<__RsbPool: rsbinder::BinderAsyncPool> rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsync<__RsbPool> for rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager::addService<'a>(&'a self, &'a str, &'a rsbinder::SIBinder, bool, i32) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager::checkService<'a>(&'a self, &'a str) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<core::option::Option<rsbinder::SIBinder>>>
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager::checkService2<'a>(&'a self, &'a str) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<rsbinder::hub::android_16::android::os::Service::Service>>
@@ -975,7 +975,7 @@ pub fn rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager::tryUnregisterService(&self, &str, &rsbinder::SIBinder) -> rsbinder::BinderResult<()>
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager::unregisterForNotifications(&self, &str, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::BinderResult<()>
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager::updatableViaApex(&self, &str) -> rsbinder::BinderResult<core::option::Option<alloc::string::String>>
-pub trait rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsync<P>: rsbinder::Interface + core::marker::Send
+pub trait rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsync<__RsbPool>: rsbinder::Interface + core::marker::Send
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsync::addService<'a>(&'a self, &'a str, &'a rsbinder::SIBinder, bool, i32) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsync::checkService<'a>(&'a self, &'a str) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<core::option::Option<rsbinder::SIBinder>>>
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsync::checkService2<'a>(&'a self, &'a str) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<rsbinder::hub::android_16::android::os::Service::Service>>
@@ -993,7 +993,7 @@ pub fn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerA
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsync::tryUnregisterService<'a>(&'a self, &'a str, &'a rsbinder::SIBinder) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsync::unregisterForNotifications<'a>(&'a self, &'a str, &'a rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsync::updatableViaApex<'a>(&'a self, &'a str) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<core::option::Option<alloc::string::String>>>
-impl<P: rsbinder::BinderAsyncPool> rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsync<P> for rsbinder::Binder<rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager>
+impl<__RsbPool: rsbinder::BinderAsyncPool> rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsync<__RsbPool> for rsbinder::Binder<rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager>
 pub fn rsbinder::Binder<rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager>::addService<'a>(&'a self, &'a str, &'a rsbinder::SIBinder, bool, i32) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
 pub fn rsbinder::Binder<rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager>::checkService<'a>(&'a self, &'a str) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<core::option::Option<rsbinder::SIBinder>>>
 pub fn rsbinder::Binder<rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager>::checkService2<'a>(&'a self, &'a str) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<rsbinder::hub::android_16::android::os::Service::Service>>
@@ -1011,7 +1011,7 @@ pub fn rsbinder::Binder<rsbinder::hub::android_16::android::os::IServiceManager:
 pub fn rsbinder::Binder<rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager>::tryUnregisterService<'a>(&'a self, &'a str, &'a rsbinder::SIBinder) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
 pub fn rsbinder::Binder<rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager>::unregisterForNotifications<'a>(&'a self, &'a str, &'a rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
 pub fn rsbinder::Binder<rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager>::updatableViaApex<'a>(&'a self, &'a str) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<core::option::Option<alloc::string::String>>>
-impl<P: rsbinder::BinderAsyncPool> rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsync<P> for rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager
+impl<__RsbPool: rsbinder::BinderAsyncPool> rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsync<__RsbPool> for rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager::addService<'a>(&'a self, &'a str, &'a rsbinder::SIBinder, bool, i32) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager::checkService<'a>(&'a self, &'a str) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<core::option::Option<rsbinder::SIBinder>>>
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager::checkService2<'a>(&'a self, &'a str) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<rsbinder::hub::android_16::android::os::Service::Service>>
@@ -1276,8 +1276,8 @@ impl !core::panic::unwind_safe::RefUnwindSafe for rsbinder::hub::android_16::Acc
 impl !core::panic::unwind_safe::UnwindSafe for rsbinder::hub::android_16::AccessorProviderHandle
 pub struct rsbinder::hub::android_16::BnAccessor(_)
 impl rsbinder::hub::android_16::BnAccessor
-pub fn rsbinder::hub::android_16::BnAccessor::new_async_binder<T, R>(T, R) -> rsbinder::Strong<dyn rsbinder::hub::android_16::IAccessor> where T: rsbinder::hub::android_16::IAccessorAsyncService + core::marker::Sync + core::marker::Send + 'static, R: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
-pub fn rsbinder::hub::android_16::BnAccessor::new_async_binder_with_features<T, R>(T, R, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::hub::android_16::IAccessor> where T: rsbinder::hub::android_16::IAccessorAsyncService + core::marker::Sync + core::marker::Send + 'static, R: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::hub::android_16::BnAccessor::new_async_binder<__RsbService, __RsbRuntime>(__RsbService, __RsbRuntime) -> rsbinder::Strong<dyn rsbinder::hub::android_16::IAccessor> where __RsbService: rsbinder::hub::android_16::IAccessorAsyncService + core::marker::Sync + core::marker::Send + 'static, __RsbRuntime: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::hub::android_16::BnAccessor::new_async_binder_with_features<__RsbService, __RsbRuntime>(__RsbService, __RsbRuntime, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::hub::android_16::IAccessor> where __RsbService: rsbinder::hub::android_16::IAccessorAsyncService + core::marker::Sync + core::marker::Send + 'static, __RsbRuntime: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
 impl rsbinder::hub::android_16::BnAccessor
 pub fn rsbinder::hub::android_16::BnAccessor::new_binder<T: rsbinder::hub::android_16::IAccessor + core::marker::Sync + core::marker::Send + 'static>(T) -> rsbinder::Strong<dyn rsbinder::hub::android_16::IAccessor>
 pub fn rsbinder::hub::android_16::BnAccessor::new_binder_with_features<T: rsbinder::hub::android_16::IAccessor + core::marker::Sync + core::marker::Send + 'static>(T, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::hub::android_16::IAccessor>
@@ -1295,8 +1295,8 @@ impl !core::panic::unwind_safe::RefUnwindSafe for rsbinder::hub::android_16::BnA
 impl !core::panic::unwind_safe::UnwindSafe for rsbinder::hub::android_16::BnAccessor
 pub struct rsbinder::hub::android_16::BnClientCallback(_)
 impl rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback
-pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::new_async_binder<T, R>(T, R) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback> where T: rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsyncService + core::marker::Sync + core::marker::Send + 'static, R: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
-pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::new_async_binder_with_features<T, R>(T, R, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback> where T: rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsyncService + core::marker::Sync + core::marker::Send + 'static, R: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::new_async_binder<__RsbService, __RsbRuntime>(__RsbService, __RsbRuntime) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback> where __RsbService: rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsyncService + core::marker::Sync + core::marker::Send + 'static, __RsbRuntime: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::new_async_binder_with_features<__RsbService, __RsbRuntime>(__RsbService, __RsbRuntime, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback> where __RsbService: rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsyncService + core::marker::Sync + core::marker::Send + 'static, __RsbRuntime: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
 impl rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::new_binder<T: rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback + core::marker::Sync + core::marker::Send + 'static>(T) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback>
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::new_binder_with_features<T: rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback + core::marker::Sync + core::marker::Send + 'static>(T, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback>
@@ -1314,8 +1314,8 @@ impl !core::panic::unwind_safe::RefUnwindSafe for rsbinder::hub::android_16::and
 impl !core::panic::unwind_safe::UnwindSafe for rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback
 pub struct rsbinder::hub::android_16::BnServiceCallback(_)
 impl rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback
-pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::new_async_binder<T, R>(T, R) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback> where T: rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsyncService + core::marker::Sync + core::marker::Send + 'static, R: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
-pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::new_async_binder_with_features<T, R>(T, R, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback> where T: rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsyncService + core::marker::Sync + core::marker::Send + 'static, R: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::new_async_binder<__RsbService, __RsbRuntime>(__RsbService, __RsbRuntime) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback> where __RsbService: rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsyncService + core::marker::Sync + core::marker::Send + 'static, __RsbRuntime: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::new_async_binder_with_features<__RsbService, __RsbRuntime>(__RsbService, __RsbRuntime, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback> where __RsbService: rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsyncService + core::marker::Sync + core::marker::Send + 'static, __RsbRuntime: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
 impl rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::new_binder<T: rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback + core::marker::Sync + core::marker::Send + 'static>(T) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::new_binder_with_features<T: rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback + core::marker::Sync + core::marker::Send + 'static>(T, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>
@@ -1333,8 +1333,8 @@ impl !core::panic::unwind_safe::RefUnwindSafe for rsbinder::hub::android_16::and
 impl !core::panic::unwind_safe::UnwindSafe for rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback
 pub struct rsbinder::hub::android_16::BnServiceManager(_)
 impl rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager
-pub fn rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager::new_async_binder<T, R>(T, R) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager> where T: rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsyncService + core::marker::Sync + core::marker::Send + 'static, R: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
-pub fn rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager::new_async_binder_with_features<T, R>(T, R, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager> where T: rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsyncService + core::marker::Sync + core::marker::Send + 'static, R: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager::new_async_binder<__RsbService, __RsbRuntime>(__RsbService, __RsbRuntime) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager> where __RsbService: rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsyncService + core::marker::Sync + core::marker::Send + 'static, __RsbRuntime: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager::new_async_binder_with_features<__RsbService, __RsbRuntime>(__RsbService, __RsbRuntime, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager> where __RsbService: rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsyncService + core::marker::Sync + core::marker::Send + 'static, __RsbRuntime: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
 impl rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager::new_binder<T: rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager + core::marker::Sync + core::marker::Send + 'static>(T) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager>
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager::new_binder_with_features<T: rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager + core::marker::Sync + core::marker::Send + 'static>(T, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager>
@@ -1397,7 +1397,7 @@ pub fn rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager::tryUnregisterService(&self, &str, &rsbinder::SIBinder) -> rsbinder::BinderResult<()>
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager::unregisterForNotifications(&self, &str, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::BinderResult<()>
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager::updatableViaApex(&self, &str) -> rsbinder::BinderResult<core::option::Option<alloc::string::String>>
-impl<P: rsbinder::BinderAsyncPool> rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsync<P> for rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager
+impl<__RsbPool: rsbinder::BinderAsyncPool> rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsync<__RsbPool> for rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager::addService<'a>(&'a self, &'a str, &'a rsbinder::SIBinder, bool, i32) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager::checkService<'a>(&'a self, &'a str) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<core::option::Option<rsbinder::SIBinder>>>
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager::checkService2<'a>(&'a self, &'a str) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<rsbinder::hub::android_16::android::os::Service::Service>>
@@ -1734,8 +1734,8 @@ impl !core::panic::unwind_safe::RefUnwindSafe for rsbinder::hub::ServiceManager
 impl !core::panic::unwind_safe::UnwindSafe for rsbinder::hub::ServiceManager
 pub struct rsbinder::hub::BnClientCallback(_)
 impl rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback
-pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::new_async_binder<T, R>(T, R) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback> where T: rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsyncService + core::marker::Sync + core::marker::Send + 'static, R: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
-pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::new_async_binder_with_features<T, R>(T, R, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback> where T: rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsyncService + core::marker::Sync + core::marker::Send + 'static, R: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::new_async_binder<__RsbService, __RsbRuntime>(__RsbService, __RsbRuntime) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback> where __RsbService: rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsyncService + core::marker::Sync + core::marker::Send + 'static, __RsbRuntime: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::new_async_binder_with_features<__RsbService, __RsbRuntime>(__RsbService, __RsbRuntime, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback> where __RsbService: rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsyncService + core::marker::Sync + core::marker::Send + 'static, __RsbRuntime: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
 impl rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::new_binder<T: rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback + core::marker::Sync + core::marker::Send + 'static>(T) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback>
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback::new_binder_with_features<T: rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback + core::marker::Sync + core::marker::Send + 'static>(T, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback>
@@ -1753,8 +1753,8 @@ impl !core::panic::unwind_safe::RefUnwindSafe for rsbinder::hub::android_16::and
 impl !core::panic::unwind_safe::UnwindSafe for rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback
 pub struct rsbinder::hub::BnServiceCallback(_)
 impl rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback
-pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::new_async_binder<T, R>(T, R) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback> where T: rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsyncService + core::marker::Sync + core::marker::Send + 'static, R: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
-pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::new_async_binder_with_features<T, R>(T, R, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback> where T: rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsyncService + core::marker::Sync + core::marker::Send + 'static, R: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::new_async_binder<__RsbService, __RsbRuntime>(__RsbService, __RsbRuntime) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback> where __RsbService: rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsyncService + core::marker::Sync + core::marker::Send + 'static, __RsbRuntime: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::new_async_binder_with_features<__RsbService, __RsbRuntime>(__RsbService, __RsbRuntime, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback> where __RsbService: rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsyncService + core::marker::Sync + core::marker::Send + 'static, __RsbRuntime: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
 impl rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::new_binder<T: rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback + core::marker::Sync + core::marker::Send + 'static>(T) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback::new_binder_with_features<T: rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback + core::marker::Sync + core::marker::Send + 'static>(T, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>
@@ -2075,8 +2075,8 @@ pub mod rsbinder::permission_controller::android::os
 pub mod rsbinder::permission_controller::android::os::IPermissionController
 pub struct rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController(_)
 impl rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController
-pub fn rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController::new_async_binder<T, R>(T, R) -> rsbinder::Strong<dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionController> where T: rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsyncService + core::marker::Sync + core::marker::Send + 'static, R: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
-pub fn rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController::new_async_binder_with_features<T, R>(T, R, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionController> where T: rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsyncService + core::marker::Sync + core::marker::Send + 'static, R: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController::new_async_binder<__RsbService, __RsbRuntime>(__RsbService, __RsbRuntime) -> rsbinder::Strong<dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionController> where __RsbService: rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsyncService + core::marker::Sync + core::marker::Send + 'static, __RsbRuntime: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController::new_async_binder_with_features<__RsbService, __RsbRuntime>(__RsbService, __RsbRuntime, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionController> where __RsbService: rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsyncService + core::marker::Sync + core::marker::Send + 'static, __RsbRuntime: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
 impl rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController::new_binder<T: rsbinder::permission_controller::android::os::IPermissionController::IPermissionController + core::marker::Sync + core::marker::Send + 'static>(T) -> rsbinder::Strong<dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionController>
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController::new_binder_with_features<T: rsbinder::permission_controller::android::os::IPermissionController::IPermissionController + core::marker::Sync + core::marker::Send + 'static>(T, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionController>
@@ -2108,7 +2108,7 @@ pub fn rsbinder::permission_controller::android::os::IPermissionController::BpPe
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BpPermissionController::isRuntimePermission(&self, &str) -> rsbinder::BinderResult<bool>
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BpPermissionController::noteOp(&self, &str, i32, &str) -> rsbinder::BinderResult<i32>
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BpPermissionController::setDefaultImpl(rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerDefaultRef) -> rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerDefaultRef where Self: core::marker::Sized
-impl<P: rsbinder::BinderAsyncPool> rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync<P> for rsbinder::permission_controller::android::os::IPermissionController::BpPermissionController
+impl<__RsbPool: rsbinder::BinderAsyncPool> rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync<__RsbPool> for rsbinder::permission_controller::android::os::IPermissionController::BpPermissionController
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BpPermissionController::checkPermission<'a>(&'a self, &'a str, i32, i32) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<bool>>
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BpPermissionController::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BpPermissionController::getPackageUid<'a>(&'a self, &'a str, i32) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<i32>>
@@ -2162,21 +2162,21 @@ pub fn rsbinder::permission_controller::android::os::IPermissionController::BpPe
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BpPermissionController::isRuntimePermission(&self, &str) -> rsbinder::BinderResult<bool>
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BpPermissionController::noteOp(&self, &str, i32, &str) -> rsbinder::BinderResult<i32>
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BpPermissionController::setDefaultImpl(rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerDefaultRef) -> rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerDefaultRef where Self: core::marker::Sized
-pub trait rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync<P>: rsbinder::Interface + core::marker::Send
+pub trait rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync<__RsbPool>: rsbinder::Interface + core::marker::Send
 pub fn rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync::checkPermission<'a>(&'a self, &'a str, i32, i32) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<bool>>
 pub fn rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync::getPackageUid<'a>(&'a self, &'a str, i32) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<i32>>
 pub fn rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync::getPackagesForUid<'a>(&'a self, i32) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<alloc::vec::Vec<alloc::string::String>>>
 pub fn rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync::isRuntimePermission<'a>(&'a self, &'a str) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<bool>>
 pub fn rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync::noteOp<'a>(&'a self, &'a str, i32, &'a str) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<i32>>
-impl<P: rsbinder::BinderAsyncPool> rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync<P> for rsbinder::Binder<rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController>
+impl<__RsbPool: rsbinder::BinderAsyncPool> rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync<__RsbPool> for rsbinder::Binder<rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController>
 pub fn rsbinder::Binder<rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController>::checkPermission<'a>(&'a self, &'a str, i32, i32) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<bool>>
 pub fn rsbinder::Binder<rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController>::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::Binder<rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController>::getPackageUid<'a>(&'a self, &'a str, i32) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<i32>>
 pub fn rsbinder::Binder<rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController>::getPackagesForUid<'a>(&'a self, i32) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<alloc::vec::Vec<alloc::string::String>>>
 pub fn rsbinder::Binder<rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController>::isRuntimePermission<'a>(&'a self, &'a str) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<bool>>
 pub fn rsbinder::Binder<rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController>::noteOp<'a>(&'a self, &'a str, i32, &'a str) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<i32>>
-impl<P: rsbinder::BinderAsyncPool> rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync<P> for rsbinder::permission_controller::android::os::IPermissionController::BpPermissionController
+impl<__RsbPool: rsbinder::BinderAsyncPool> rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync<__RsbPool> for rsbinder::permission_controller::android::os::IPermissionController::BpPermissionController
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BpPermissionController::checkPermission<'a>(&'a self, &'a str, i32, i32) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<bool>>
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BpPermissionController::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BpPermissionController::getPackageUid<'a>(&'a self, &'a str, i32) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<i32>>
@@ -2199,8 +2199,8 @@ pub fn rsbinder::permission_controller::android::os::IPermissionController::IPer
 pub type rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerDefaultRef = alloc::sync::Arc<dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerDefault>
 pub struct rsbinder::permission_controller::BnPermissionController(_)
 impl rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController
-pub fn rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController::new_async_binder<T, R>(T, R) -> rsbinder::Strong<dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionController> where T: rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsyncService + core::marker::Sync + core::marker::Send + 'static, R: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
-pub fn rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController::new_async_binder_with_features<T, R>(T, R, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionController> where T: rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsyncService + core::marker::Sync + core::marker::Send + 'static, R: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController::new_async_binder<__RsbService, __RsbRuntime>(__RsbService, __RsbRuntime) -> rsbinder::Strong<dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionController> where __RsbService: rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsyncService + core::marker::Sync + core::marker::Send + 'static, __RsbRuntime: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController::new_async_binder_with_features<__RsbService, __RsbRuntime>(__RsbService, __RsbRuntime, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionController> where __RsbService: rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsyncService + core::marker::Sync + core::marker::Send + 'static, __RsbRuntime: rsbinder::BinderAsyncRuntime + core::marker::Send + core::marker::Sync + 'static
 impl rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController::new_binder<T: rsbinder::permission_controller::android::os::IPermissionController::IPermissionController + core::marker::Sync + core::marker::Send + 'static>(T) -> rsbinder::Strong<dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionController>
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController::new_binder_with_features<T: rsbinder::permission_controller::android::os::IPermissionController::IPermissionController + core::marker::Sync + core::marker::Send + 'static>(T, rsbinder::BinderFeatures) -> rsbinder::Strong<dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionController>
@@ -2232,7 +2232,7 @@ pub fn rsbinder::permission_controller::android::os::IPermissionController::BpPe
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BpPermissionController::isRuntimePermission(&self, &str) -> rsbinder::BinderResult<bool>
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BpPermissionController::noteOp(&self, &str, i32, &str) -> rsbinder::BinderResult<i32>
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BpPermissionController::setDefaultImpl(rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerDefaultRef) -> rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerDefaultRef where Self: core::marker::Sized
-impl<P: rsbinder::BinderAsyncPool> rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync<P> for rsbinder::permission_controller::android::os::IPermissionController::BpPermissionController
+impl<__RsbPool: rsbinder::BinderAsyncPool> rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync<__RsbPool> for rsbinder::permission_controller::android::os::IPermissionController::BpPermissionController
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BpPermissionController::checkPermission<'a>(&'a self, &'a str, i32, i32) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<bool>>
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BpPermissionController::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BpPermissionController::getPackageUid<'a>(&'a self, &'a str, i32) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<i32>>
@@ -2283,21 +2283,21 @@ pub fn rsbinder::permission_controller::android::os::IPermissionController::BpPe
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BpPermissionController::isRuntimePermission(&self, &str) -> rsbinder::BinderResult<bool>
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BpPermissionController::noteOp(&self, &str, i32, &str) -> rsbinder::BinderResult<i32>
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BpPermissionController::setDefaultImpl(rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerDefaultRef) -> rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerDefaultRef where Self: core::marker::Sized
-pub trait rsbinder::permission_controller::IPermissionControllerAsync<P>: rsbinder::Interface + core::marker::Send
+pub trait rsbinder::permission_controller::IPermissionControllerAsync<__RsbPool>: rsbinder::Interface + core::marker::Send
 pub fn rsbinder::permission_controller::IPermissionControllerAsync::checkPermission<'a>(&'a self, &'a str, i32, i32) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<bool>>
 pub fn rsbinder::permission_controller::IPermissionControllerAsync::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::permission_controller::IPermissionControllerAsync::getPackageUid<'a>(&'a self, &'a str, i32) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<i32>>
 pub fn rsbinder::permission_controller::IPermissionControllerAsync::getPackagesForUid<'a>(&'a self, i32) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<alloc::vec::Vec<alloc::string::String>>>
 pub fn rsbinder::permission_controller::IPermissionControllerAsync::isRuntimePermission<'a>(&'a self, &'a str) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<bool>>
 pub fn rsbinder::permission_controller::IPermissionControllerAsync::noteOp<'a>(&'a self, &'a str, i32, &'a str) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<i32>>
-impl<P: rsbinder::BinderAsyncPool> rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync<P> for rsbinder::Binder<rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController>
+impl<__RsbPool: rsbinder::BinderAsyncPool> rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync<__RsbPool> for rsbinder::Binder<rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController>
 pub fn rsbinder::Binder<rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController>::checkPermission<'a>(&'a self, &'a str, i32, i32) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<bool>>
 pub fn rsbinder::Binder<rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController>::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::Binder<rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController>::getPackageUid<'a>(&'a self, &'a str, i32) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<i32>>
 pub fn rsbinder::Binder<rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController>::getPackagesForUid<'a>(&'a self, i32) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<alloc::vec::Vec<alloc::string::String>>>
 pub fn rsbinder::Binder<rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController>::isRuntimePermission<'a>(&'a self, &'a str) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<bool>>
 pub fn rsbinder::Binder<rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController>::noteOp<'a>(&'a self, &'a str, i32, &'a str) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<i32>>
-impl<P: rsbinder::BinderAsyncPool> rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync<P> for rsbinder::permission_controller::android::os::IPermissionController::BpPermissionController
+impl<__RsbPool: rsbinder::BinderAsyncPool> rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync<__RsbPool> for rsbinder::permission_controller::android::os::IPermissionController::BpPermissionController
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BpPermissionController::checkPermission<'a>(&'a self, &'a str, i32, i32) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<bool>>
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BpPermissionController::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::permission_controller::android::os::IPermissionController::BpPermissionController::getPackageUid<'a>(&'a self, &'a str, i32) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<i32>>
@@ -3530,6 +3530,7 @@ pub fn rsbinder::shared_memory::heap::MappedHeap::fmt(&self, &mut core::fmt::For
 impl rsbinder::shared_memory::IMemoryHeap for rsbinder::shared_memory::heap::MappedHeap
 pub fn rsbinder::shared_memory::heap::MappedHeap::base(&self) -> core::option::Option<rsbinder::shared_memory::SharedBytes<'_>>
 pub fn rsbinder::shared_memory::heap::MappedHeap::flags(&self) -> u32
+pub fn rsbinder::shared_memory::heap::MappedHeap::heap_fd(&self) -> core::option::Option<std::os::fd::owned::BorrowedFd<'_>>
 pub fn rsbinder::shared_memory::heap::MappedHeap::heap_id(&self) -> i32
 pub fn rsbinder::shared_memory::heap::MappedHeap::offset(&self) -> usize
 pub fn rsbinder::shared_memory::heap::MappedHeap::size(&self) -> usize
@@ -3557,6 +3558,7 @@ pub fn rsbinder::shared_memory::heap::MemoryHeapBase::fmt(&self, &mut core::fmt:
 impl rsbinder::shared_memory::IMemoryHeap for rsbinder::shared_memory::heap::MemoryHeapBase
 pub fn rsbinder::shared_memory::heap::MemoryHeapBase::base(&self) -> core::option::Option<rsbinder::shared_memory::SharedBytes<'_>>
 pub fn rsbinder::shared_memory::heap::MemoryHeapBase::flags(&self) -> u32
+pub fn rsbinder::shared_memory::heap::MemoryHeapBase::heap_fd(&self) -> core::option::Option<std::os::fd::owned::BorrowedFd<'_>>
 pub fn rsbinder::shared_memory::heap::MemoryHeapBase::heap_id(&self) -> i32
 pub fn rsbinder::shared_memory::heap::MemoryHeapBase::offset(&self) -> usize
 pub fn rsbinder::shared_memory::heap::MemoryHeapBase::size(&self) -> usize
@@ -3676,6 +3678,7 @@ pub fn rsbinder::shared_memory::wire::BpMemoryHeap::fmt(&self, &mut core::fmt::F
 impl rsbinder::shared_memory::IMemoryHeap for rsbinder::shared_memory::wire::BpMemoryHeap
 pub fn rsbinder::shared_memory::wire::BpMemoryHeap::base(&self) -> core::option::Option<rsbinder::shared_memory::SharedBytes<'_>>
 pub fn rsbinder::shared_memory::wire::BpMemoryHeap::flags(&self) -> u32
+pub fn rsbinder::shared_memory::wire::BpMemoryHeap::heap_fd(&self) -> core::option::Option<std::os::fd::owned::BorrowedFd<'_>>
 pub fn rsbinder::shared_memory::wire::BpMemoryHeap::heap_id(&self) -> i32
 pub fn rsbinder::shared_memory::wire::BpMemoryHeap::offset(&self) -> usize
 pub fn rsbinder::shared_memory::wire::BpMemoryHeap::size(&self) -> usize
@@ -3809,6 +3812,7 @@ pub fn rsbinder::shared_memory::wire::BpMemoryHeap::fmt(&self, &mut core::fmt::F
 impl rsbinder::shared_memory::IMemoryHeap for rsbinder::shared_memory::wire::BpMemoryHeap
 pub fn rsbinder::shared_memory::wire::BpMemoryHeap::base(&self) -> core::option::Option<rsbinder::shared_memory::SharedBytes<'_>>
 pub fn rsbinder::shared_memory::wire::BpMemoryHeap::flags(&self) -> u32
+pub fn rsbinder::shared_memory::wire::BpMemoryHeap::heap_fd(&self) -> core::option::Option<std::os::fd::owned::BorrowedFd<'_>>
 pub fn rsbinder::shared_memory::wire::BpMemoryHeap::heap_id(&self) -> i32
 pub fn rsbinder::shared_memory::wire::BpMemoryHeap::offset(&self) -> usize
 pub fn rsbinder::shared_memory::wire::BpMemoryHeap::size(&self) -> usize
@@ -3852,6 +3856,7 @@ pub fn rsbinder::shared_memory::heap::MappedHeap::fmt(&self, &mut core::fmt::For
 impl rsbinder::shared_memory::IMemoryHeap for rsbinder::shared_memory::heap::MappedHeap
 pub fn rsbinder::shared_memory::heap::MappedHeap::base(&self) -> core::option::Option<rsbinder::shared_memory::SharedBytes<'_>>
 pub fn rsbinder::shared_memory::heap::MappedHeap::flags(&self) -> u32
+pub fn rsbinder::shared_memory::heap::MappedHeap::heap_fd(&self) -> core::option::Option<std::os::fd::owned::BorrowedFd<'_>>
 pub fn rsbinder::shared_memory::heap::MappedHeap::heap_id(&self) -> i32
 pub fn rsbinder::shared_memory::heap::MappedHeap::offset(&self) -> usize
 pub fn rsbinder::shared_memory::heap::MappedHeap::size(&self) -> usize
@@ -3917,6 +3922,7 @@ pub fn rsbinder::shared_memory::heap::MemoryHeapBase::fmt(&self, &mut core::fmt:
 impl rsbinder::shared_memory::IMemoryHeap for rsbinder::shared_memory::heap::MemoryHeapBase
 pub fn rsbinder::shared_memory::heap::MemoryHeapBase::base(&self) -> core::option::Option<rsbinder::shared_memory::SharedBytes<'_>>
 pub fn rsbinder::shared_memory::heap::MemoryHeapBase::flags(&self) -> u32
+pub fn rsbinder::shared_memory::heap::MemoryHeapBase::heap_fd(&self) -> core::option::Option<std::os::fd::owned::BorrowedFd<'_>>
 pub fn rsbinder::shared_memory::heap::MemoryHeapBase::heap_id(&self) -> i32
 pub fn rsbinder::shared_memory::heap::MemoryHeapBase::offset(&self) -> usize
 pub fn rsbinder::shared_memory::heap::MemoryHeapBase::size(&self) -> usize
@@ -4017,24 +4023,28 @@ pub fn rsbinder::shared_memory::wire::MemoryBase::size(&self) -> usize
 pub trait rsbinder::shared_memory::IMemoryHeap: core::marker::Send + core::marker::Sync
 pub fn rsbinder::shared_memory::IMemoryHeap::base(&self) -> core::option::Option<rsbinder::shared_memory::SharedBytes<'_>>
 pub fn rsbinder::shared_memory::IMemoryHeap::flags(&self) -> u32
+pub fn rsbinder::shared_memory::IMemoryHeap::heap_fd(&self) -> core::option::Option<std::os::fd::owned::BorrowedFd<'_>>
 pub fn rsbinder::shared_memory::IMemoryHeap::heap_id(&self) -> i32
 pub fn rsbinder::shared_memory::IMemoryHeap::offset(&self) -> usize
 pub fn rsbinder::shared_memory::IMemoryHeap::size(&self) -> usize
 impl rsbinder::shared_memory::IMemoryHeap for rsbinder::shared_memory::heap::MappedHeap
 pub fn rsbinder::shared_memory::heap::MappedHeap::base(&self) -> core::option::Option<rsbinder::shared_memory::SharedBytes<'_>>
 pub fn rsbinder::shared_memory::heap::MappedHeap::flags(&self) -> u32
+pub fn rsbinder::shared_memory::heap::MappedHeap::heap_fd(&self) -> core::option::Option<std::os::fd::owned::BorrowedFd<'_>>
 pub fn rsbinder::shared_memory::heap::MappedHeap::heap_id(&self) -> i32
 pub fn rsbinder::shared_memory::heap::MappedHeap::offset(&self) -> usize
 pub fn rsbinder::shared_memory::heap::MappedHeap::size(&self) -> usize
 impl rsbinder::shared_memory::IMemoryHeap for rsbinder::shared_memory::heap::MemoryHeapBase
 pub fn rsbinder::shared_memory::heap::MemoryHeapBase::base(&self) -> core::option::Option<rsbinder::shared_memory::SharedBytes<'_>>
 pub fn rsbinder::shared_memory::heap::MemoryHeapBase::flags(&self) -> u32
+pub fn rsbinder::shared_memory::heap::MemoryHeapBase::heap_fd(&self) -> core::option::Option<std::os::fd::owned::BorrowedFd<'_>>
 pub fn rsbinder::shared_memory::heap::MemoryHeapBase::heap_id(&self) -> i32
 pub fn rsbinder::shared_memory::heap::MemoryHeapBase::offset(&self) -> usize
 pub fn rsbinder::shared_memory::heap::MemoryHeapBase::size(&self) -> usize
 impl rsbinder::shared_memory::IMemoryHeap for rsbinder::shared_memory::wire::BpMemoryHeap
 pub fn rsbinder::shared_memory::wire::BpMemoryHeap::base(&self) -> core::option::Option<rsbinder::shared_memory::SharedBytes<'_>>
 pub fn rsbinder::shared_memory::wire::BpMemoryHeap::flags(&self) -> u32
+pub fn rsbinder::shared_memory::wire::BpMemoryHeap::heap_fd(&self) -> core::option::Option<std::os::fd::owned::BorrowedFd<'_>>
 pub fn rsbinder::shared_memory::wire::BpMemoryHeap::heap_id(&self) -> i32
 pub fn rsbinder::shared_memory::wire::BpMemoryHeap::offset(&self) -> usize
 pub fn rsbinder::shared_memory::wire::BpMemoryHeap::size(&self) -> usize
@@ -4595,16 +4605,24 @@ pub fn rsbinder::Binder<rsbinder::permission_controller::android::os::IPermissio
 impl<B: rsbinder::Remotable + 'static> core::convert::TryFrom<rsbinder::SIBinder> for rsbinder::Binder<B>
 pub type rsbinder::Binder<B>::Error = rsbinder::StatusCode
 pub fn rsbinder::Binder<B>::try_from(rsbinder::SIBinder) -> rsbinder::Result<Self>
-impl<P: rsbinder::BinderAsyncPool> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<P> for rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>
+impl<T: 'static + rsbinder::Remotable> core::ops::deref::Deref for rsbinder::Binder<T>
+pub type rsbinder::Binder<T>::Target = T
+pub fn rsbinder::Binder<T>::deref(&self) -> &Self::Target
+impl<T: 'static + rsbinder::Remotable> rsbinder::Interface for rsbinder::Binder<T>
+pub fn rsbinder::Binder<T>::as_binder(&self) -> rsbinder::SIBinder
+pub fn rsbinder::Binder<T>::dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
+impl<T: rsbinder::Remotable> core::clone::Clone for rsbinder::Binder<T>
+pub fn rsbinder::Binder<T>::clone(&self) -> Self
+impl<__RsbPool: rsbinder::BinderAsyncPool> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<__RsbPool> for rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>
 pub fn rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>::cancel<'a>(&'a self) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
 pub fn rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>::descriptor() -> &'static str where Self: core::marker::Sized
-impl<P: rsbinder::BinderAsyncPool> rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsync<P> for rsbinder::Binder<rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback>
+impl<__RsbPool: rsbinder::BinderAsyncPool> rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsync<__RsbPool> for rsbinder::Binder<rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback>
 pub fn rsbinder::Binder<rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback>::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::Binder<rsbinder::hub::android_16::android::os::IClientCallback::BnClientCallback>::onClients<'a>(&'a self, &'a rsbinder::SIBinder, bool) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
-impl<P: rsbinder::BinderAsyncPool> rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsync<P> for rsbinder::Binder<rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback>
+impl<__RsbPool: rsbinder::BinderAsyncPool> rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsync<__RsbPool> for rsbinder::Binder<rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback>
 pub fn rsbinder::Binder<rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback>::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::Binder<rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback>::onRegistration<'a>(&'a self, &'a str, &'a rsbinder::SIBinder) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
-impl<P: rsbinder::BinderAsyncPool> rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsync<P> for rsbinder::Binder<rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager>
+impl<__RsbPool: rsbinder::BinderAsyncPool> rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsync<__RsbPool> for rsbinder::Binder<rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager>
 pub fn rsbinder::Binder<rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager>::addService<'a>(&'a self, &'a str, &'a rsbinder::SIBinder, bool, i32) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
 pub fn rsbinder::Binder<rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager>::checkService<'a>(&'a self, &'a str) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<core::option::Option<rsbinder::SIBinder>>>
 pub fn rsbinder::Binder<rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager>::checkService2<'a>(&'a self, &'a str) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<rsbinder::hub::android_16::android::os::Service::Service>>
@@ -4622,21 +4640,13 @@ pub fn rsbinder::Binder<rsbinder::hub::android_16::android::os::IServiceManager:
 pub fn rsbinder::Binder<rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager>::tryUnregisterService<'a>(&'a self, &'a str, &'a rsbinder::SIBinder) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
 pub fn rsbinder::Binder<rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager>::unregisterForNotifications<'a>(&'a self, &'a str, &'a rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
 pub fn rsbinder::Binder<rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager>::updatableViaApex<'a>(&'a self, &'a str) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<core::option::Option<alloc::string::String>>>
-impl<P: rsbinder::BinderAsyncPool> rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync<P> for rsbinder::Binder<rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController>
+impl<__RsbPool: rsbinder::BinderAsyncPool> rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync<__RsbPool> for rsbinder::Binder<rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController>
 pub fn rsbinder::Binder<rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController>::checkPermission<'a>(&'a self, &'a str, i32, i32) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<bool>>
 pub fn rsbinder::Binder<rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController>::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::Binder<rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController>::getPackageUid<'a>(&'a self, &'a str, i32) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<i32>>
 pub fn rsbinder::Binder<rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController>::getPackagesForUid<'a>(&'a self, i32) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<alloc::vec::Vec<alloc::string::String>>>
 pub fn rsbinder::Binder<rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController>::isRuntimePermission<'a>(&'a self, &'a str) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<bool>>
 pub fn rsbinder::Binder<rsbinder::permission_controller::android::os::IPermissionController::BnPermissionController>::noteOp<'a>(&'a self, &'a str, i32, &'a str) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<i32>>
-impl<T: 'static + rsbinder::Remotable> core::ops::deref::Deref for rsbinder::Binder<T>
-pub type rsbinder::Binder<T>::Target = T
-pub fn rsbinder::Binder<T>::deref(&self) -> &Self::Target
-impl<T: 'static + rsbinder::Remotable> rsbinder::Interface for rsbinder::Binder<T>
-pub fn rsbinder::Binder<T>::as_binder(&self) -> rsbinder::SIBinder
-pub fn rsbinder::Binder<T>::dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
-impl<T: rsbinder::Remotable> core::clone::Clone for rsbinder::Binder<T>
-pub fn rsbinder::Binder<T>::clone(&self) -> Self
 impl<T> core::marker::Freeze for rsbinder::Binder<T>
 impl<T> core::marker::Send for rsbinder::Binder<T>
 impl<T> core::marker::Sync for rsbinder::Binder<T>
@@ -4966,7 +4976,7 @@ pub fn rsbinder::ProxyHandle::handle(&self) -> u32
 pub fn rsbinder::ProxyHandle::prepare_transact(&self, bool) -> rsbinder::Result<rsbinder::Parcel>
 pub fn rsbinder::ProxyHandle::submit_transact(&self, rsbinder::TransactionCode, &rsbinder::Parcel, rsbinder::TransactionFlags) -> rsbinder::Result<core::option::Option<rsbinder::Parcel>>
 impl rsbinder::ProxyHandle
-pub fn rsbinder::ProxyHandle::dump<F: std::os::fd::raw::IntoRawFd>(&self, F, &[alloc::string::String]) -> rsbinder::Result<()>
+pub fn rsbinder::ProxyHandle::dump<F: core::convert::Into<std::os::fd::owned::OwnedFd>>(&self, F, &[alloc::string::String]) -> rsbinder::Result<()>
 impl core::cmp::Eq for rsbinder::ProxyHandle
 impl core::cmp::PartialEq for rsbinder::ProxyHandle
 pub fn rsbinder::ProxyHandle::eq(&self, &Self) -> bool

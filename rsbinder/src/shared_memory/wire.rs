@@ -59,9 +59,22 @@ pub const GET_MEMORY: TransactionCode = FIRST_CALL_TRANSACTION;
 /// Token-only transaction: a remote binder via the proxy path, a local `Binder<T>` in-process.
 fn call(binder: &SIBinder, descriptor: &str, code: TransactionCode) -> Result<Parcel> {
     if let Some(remote) = binder.as_remote() {
-        // An RPC proxy writes the token from its stamped descriptor, as `from_binder` does.
-        crate::binder::__rpc_stamp_descriptor(binder, descriptor);
-        let data = remote.prepare_transact(true)?;
+        // A known other interface is refused: the token must be `descriptor`, as AOSP writes it.
+        let actual = binder.descriptor();
+        if !actual.is_empty() && actual != descriptor {
+            log::error!("shared memory: not an {descriptor}: {actual}");
+            return Err(StatusCode::BadType);
+        }
+        // An unstamped RPC proxy stays unstamped; see `cancel_remote`.
+        #[cfg(feature = "rpc")]
+        if let Some(rp) = (**binder).as_any().downcast_ref::<crate::rpc::RpcProxy>() {
+            let data = rp.build_request(descriptor)?;
+            return rp
+                .transact(code, &data, crate::FLAG_CLEAR_BUF)?
+                .ok_or(StatusCode::UnexpectedNull);
+        }
+        let mut data = Parcel::new();
+        data.write_interface_token(descriptor)?;
         return remote
             .submit_transact(code, &data, crate::FLAG_CLEAR_BUF)?
             .ok_or(StatusCode::UnexpectedNull);
@@ -109,7 +122,8 @@ impl<H: IMemoryHeap + 'static> Remotable for BnMemoryHeap<H> {
         match code {
             HEAP_ID => {
                 let heap = &*self.0;
-                crate::file_descriptor::write_raw_fd(reply, borrow_heap_fd(heap.heap_id())?)?;
+                let fd = heap.heap_fd().ok_or(StatusCode::BadValue)?;
+                crate::file_descriptor::write_raw_fd(reply, fd)?;
                 reply.write_u64(heap.size() as u64)?;
                 reply.write_i64(heap.offset() as i64)?;
                 reply.write_u32(heap.flags())
@@ -121,15 +135,6 @@ impl<H: IMemoryHeap + 'static> Remotable for BnMemoryHeap<H> {
     fn on_dump(&self, _writer: &mut dyn std::io::Write, _args: &[String]) -> Result<()> {
         Ok(())
     }
-}
-
-/// Borrow the heap fd for the reply (AOSP `reply->writeFileDescriptor(getHeapID())`, which dups).
-fn borrow_heap_fd<'a>(raw: i32) -> Result<std::os::fd::BorrowedFd<'a>> {
-    if raw < 0 {
-        return Err(StatusCode::BadValue);
-    }
-    // SAFETY: the served heap (`Arc` in the Bn) owns `raw` past this call; `write_raw_fd` dups it.
-    Ok(unsafe { std::os::fd::BorrowedFd::borrow_raw(raw) })
 }
 
 /// Publish `heap` as an `android.utils.IMemoryHeap` binder.
@@ -197,8 +202,8 @@ impl BpMemoryHeap {
 }
 
 impl IMemoryHeap for BpMemoryHeap {
-    fn heap_id(&self) -> i32 {
-        self.mapped.get().map_or(-1, |m| m.heap_id())
+    fn heap_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        self.mapped.get().and_then(|m| m.heap_fd())
     }
     fn size(&self) -> usize {
         self.mapped.get().map_or(0, |m| m.size())
@@ -506,8 +511,8 @@ struct UnresolvedHeap;
 static UNRESOLVED: UnresolvedHeap = UnresolvedHeap;
 
 impl IMemoryHeap for UnresolvedHeap {
-    fn heap_id(&self) -> i32 {
-        -1
+    fn heap_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        None
     }
     fn size(&self) -> usize {
         0
@@ -560,6 +565,61 @@ mod tests {
         assert_eq!(&b, b"layout");
     }
 
+    /// `HEAP_ID` sends a dup of `heap_fd`, whatever `heap_id` says, and `BadValue` without one.
+    #[test]
+    fn heap_id_reply_is_built_from_heap_fd_only() {
+        use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+
+        struct Lying {
+            heap: MemoryHeapBase,
+            other: std::fs::File,
+        }
+        impl IMemoryHeap for Lying {
+            fn heap_fd(&self) -> Option<BorrowedFd<'_>> {
+                self.heap.heap_fd()
+            }
+            fn heap_id(&self) -> i32 {
+                self.other.as_raw_fd()
+            }
+            fn size(&self) -> usize {
+                self.heap.size()
+            }
+            fn flags(&self) -> u32 {
+                0
+            }
+            fn offset(&self) -> usize {
+                0
+            }
+            fn base(&self) -> Option<crate::shared_memory::SharedBytes<'_>> {
+                None
+            }
+        }
+        let ino = |fd: BorrowedFd<'_>| rustix::fs::fstat(fd).unwrap().st_ino;
+        let lying = Arc::new(Lying {
+            heap: MemoryHeapBase::new(page(), 0).unwrap(),
+            other: std::fs::File::open("/dev/null").unwrap(),
+        });
+        let mut reply = Parcel::new();
+        BnMemoryHeap(lying.clone())
+            .on_transact(HEAP_ID, &mut Parcel::new(), &mut reply)
+            .unwrap();
+        reply.set_data_position(0);
+        let fd = crate::file_descriptor::read_raw_fd(&mut reply).unwrap();
+        assert_eq!(
+            ino(fd.as_fd()),
+            ino(lying.heap.as_fd()),
+            "not the heap's fd"
+        );
+
+        let unmapped = BnMemoryHeap(Arc::new(BpMemoryHeap::new(export_heap(lying))));
+        assert_eq!(
+            unmapped
+                .on_transact(HEAP_ID, &mut Parcel::new(), &mut Parcel::new())
+                .unwrap_err(),
+            StatusCode::BadValue
+        );
+    }
+
     #[test]
     fn unknown_code_is_rejected() {
         let bn = BnMemoryHeap(Arc::new(MemoryHeapBase::new(1, 0).unwrap()));
@@ -604,6 +664,90 @@ mod tests {
         assert_eq!(clamp_window(4096, -1, 16), (0, 0)); // o < 0
         assert_eq!(clamp_window(4096, 4000, 97), (0, 0)); // o > heap - s
         assert_eq!(clamp_window(4096, 0, u64::MAX), (0, 0)); // ILP32-style overflow
+    }
+
+    /// A heap binder that is really another interface never runs that interface's code 1.
+    #[cfg(feature = "rpc")]
+    #[test]
+    fn call_refuses_a_binder_of_another_interface() {
+        use crate::rpc::transport::MemTransport;
+        use crate::rpc::{AddressSpace, RpcSession};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Foo(Arc<AtomicBool>);
+        impl Remotable for Foo {
+            fn descriptor() -> &'static str {
+                "x.y.IFoo"
+            }
+            fn on_transact(
+                &self,
+                code: TransactionCode,
+                _: &mut Parcel,
+                _: &mut Parcel,
+            ) -> Result<()> {
+                if code == FIRST_CALL_TRANSACTION {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+                Ok(())
+            }
+            fn on_dump(&self, _: &mut dyn std::io::Write, _: &[String]) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        // Each case gets its own session, so its root proxy starts unstamped.
+        let with_root = |case: &dyn Fn(SIBinder)| {
+            let hit = Arc::new(AtomicBool::new(false));
+            let (a, b) = MemTransport::pair();
+            let server = RpcSession::new(Box::new(a), AddressSpace::Acceptor).unwrap();
+            server
+                .set_root(Interface::as_binder(&Binder::new(Foo(hit.clone()))))
+                .unwrap();
+            let handle = std::thread::spawn(move || {
+                let _ = server.serve_blocking();
+            });
+            {
+                let client = RpcSession::new(Box::new(b), AddressSpace::Initiator).unwrap();
+                case(client.get_root().unwrap());
+            }
+            handle.join().unwrap();
+            assert!(!hit.load(Ordering::SeqCst), "x.y.IFoo code 1 ran");
+        };
+        // Stamped as another interface: refused before anything is sent.
+        with_root(&|root| {
+            crate::binder::__rpc_stamp_descriptor(&root, "x.y.IFoo");
+            assert_eq!(
+                BpMemoryHeap::new(root.clone()).map().unwrap_err(),
+                StatusCode::BadType
+            );
+            assert_eq!(
+                BpMemory::new(root).resolve().unwrap_err(),
+                StatusCode::BadType
+            );
+        });
+        // Unstamped: sent with the IMemoryHeap token, and the proxy is left unstamped.
+        with_root(&|root| {
+            assert!(BpMemoryHeap::new(root.clone()).map().is_err());
+            assert_eq!(root.descriptor(), "");
+        });
+        // A real heap root would answer, so `BadType` here can only be the client's refusal.
+        let (a, b) = MemTransport::pair();
+        let server = RpcSession::new(Box::new(a), AddressSpace::Acceptor).unwrap();
+        let heap = export_heap(Arc::new(MemoryHeapBase::new(page(), 0).unwrap()));
+        server.set_root(heap).unwrap();
+        let handle = std::thread::spawn(move || {
+            let _ = server.serve_blocking();
+        });
+        {
+            let client = RpcSession::new(Box::new(b), AddressSpace::Initiator).unwrap();
+            let root = client.get_root().unwrap();
+            crate::binder::__rpc_stamp_descriptor(&root, "x.y.IFoo");
+            assert_eq!(
+                BpMemoryHeap::new(root).map().unwrap_err(),
+                StatusCode::BadType
+            );
+        }
+        handle.join().unwrap();
     }
 
     #[test]

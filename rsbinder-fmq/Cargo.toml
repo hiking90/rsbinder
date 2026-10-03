@@ -34,6 +34,5 @@ libc = { workspace = true }
 
 [dev-dependencies]
 # `net` is for the two-process test, which hands the queue's fd to a child
-# over a unix socket (`SCM_RIGHTS`) — the transport the plan assigns to F1,
-# before any binder wiring exists.
+# over a unix socket (`SCM_RIGHTS`), independent of binder (`plans/12-fmq.md`).
 rustix = { workspace = true, features = ["net"] }

@@ -91,16 +91,16 @@ pub mod GenericStructuredParcelable {
             _parcel.sized_write(|_sub_parcel| {
                 _sub_parcel.write(&self.r#a)?;
                 _sub_parcel.write(&self.r#b)?;
-                Ok(())
+                ::core::result::Result::Ok(())
             })
         }
         fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
             _parcel.sized_read(|_sub_parcel| {
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#a = _sub_parcel.read()?;
-                if !_sub_parcel.has_more_data() { return Ok(()); }
+                if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                 self.r#b = _sub_parcel.read()?;
-                Ok(())
+                ::core::result::Result::Ok(())
             })
         }
     }

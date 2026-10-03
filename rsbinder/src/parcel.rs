@@ -233,6 +233,68 @@
 //! reject the reply. A binder of the process's own travels as
 //! `BINDER_TYPE_BINDER` and needs no pin.
 //!
+//! # Kernel fds
+//!
+//! A kernel parcel holds the file descriptor of every `BINDER_TYPE_FD` object
+//! it will close as an `OwnedFd` in `kernel_fds`, keyed by the object's offset
+//! and sorted by it. The object bytes carry the same fd number, which the
+//! driver translates for the peer, but nothing closes an fd rebuilt from those
+//! bytes: `Drop` closes the table's entries. A write that changed the bytes
+//! could therefore send another fd number, never close an fd the parcel does
+//! not own. `Drop` takes the table with `mem::take` first, so each entry
+//! closes once, and before `BC_FREE_BUFFER`, as AOSP `Parcel::freeDataNoInit`
+//! closes the fds before calling `mOwner`.
+//!
+//! An entry comes from one of three places:
+//!
+//! - `write_kernel_fd` takes an owned dup (a `ParcelFileDescriptor`, a blob,
+//!   an `IMemoryHeap` reply, `ProxyHandle::dump`) and writes the bytes of AOSP
+//!   `writeFileDescriptor(fd, takeOwnership = true)`: `flags = 0`, the
+//!   full-width union, `cookie = 1`. `write_object` refuses an FD object, so
+//!   no other write records one. A refused write drops, and so closes, the dup.
+//! - `append_from` dups each copied FD object's fd from the source's entry
+//!   (for a `from_ipc_parts` source, the handle in the source's own bytes)
+//!   into the destination's table and rewrites the copy with the dup's number.
+//!   It reads each object from the source, never from the copy, which a
+//!   rewrite of an overlapping object before it may have changed.
+//! - `from_driver_buffer` adopts the fds of a buffer the driver delivered
+//!   with `BR_TRANSACTION` or `BR_REPLY`. The driver installed a new fd for
+//!   each `BINDER_TYPE_FD` object in the offsets array
+//!   (`binder_apply_fd_fixups`, android17-6.18 `binder.c`) and leaves closing
+//!   it to the receiver (`binder_transaction_buffer_release`, `BINDER_TYPE_FD`
+//!   arm), so each is adopted once; this is the one place a raw fd number
+//!   becomes an `OwnedFd`. Its caller vouches for the driver-buffer contract:
+//!   the `from_ipc_parts` memory conditions hold, and the buffer is one the
+//!   driver handed this process with `BR_TRANSACTION` or `BR_REPLY` (not a
+//!   `TF_STATUS_CODE` reply), with `objects` its offsets array, not yet freed
+//!   and wrapped by no other `Parcel`; so each FD object's fd is one the
+//!   driver installed and nothing in this process owns yet. A PTR or FDA
+//!   object is skipped: an FDA's fds live in a PTR buffer, which AOSP
+//!   `closeFileDescriptors` does not close either.
+//!   A `TF_STATUS_CODE` reply is freed without adopting anything, as AOSP
+//!   frees it through `freeBuffer`, which closes nothing; so is a `BR_REPLY`
+//!   the thread did not wait for, where AOSP aborts
+//!   (`IPCThreadState::waitForResponse`, "Unexpected BR_REPLY").
+//!
+//! A read of an FD object returns a dup of the entry at its offset, made
+//! here: a read takes `&mut self`, so a borrow could not outlive the next
+//! read. The public `from_ipc_parts` adopts nothing. Its `# Safety` makes the
+//! caller keep each FD object's fd open while the parcel lives, so a read
+//! there dups the handle in the bytes, which a received buffer cannot change
+//! (`ParcelData::Slice`), and the parcel closes none of those fds.
+//! `kernel_fd_at` reads that handle itself, from the parcel's own `Slice` at
+//! an offset in `objects`, and borrows it only if the object there is an FD
+//! object: no caller can hand it a number from other bytes.
+//!
+//! The mode does not change under recorded state: `set_for_rpc` refuses a
+//! parcel that holds bytes or a buffer it did not allocate, since what one
+//! mode recorded the other would not release. AOSP `markForRpc` aborts on a
+//! parcel whose own buffer is allocated and accepts a received one.
+//! `set_data_size` refuses to cut a recorded object, where AOSP
+//! `continueWrite` releases it. The overlap check of the write paths stays:
+//! it keeps the bytes the driver reads, and the binder and handle reference
+//! counts `release_objects` reads from them, in step with the table.
+//!
 //! # Buffer growth
 //!
 //! Every write path (`write_aligned_data`, `write_array`, `write_array_char`,
@@ -336,11 +398,11 @@
 //! iterates `other`'s `mObjects`: the destination's table may be empty (a fresh
 //! `ParcelableHolder` parcel) and would drop every nested object. Each offset
 //! (AOSP `off = pos - offset + startPos`) is pushed into `objects` only after
-//! the object is acquired and, for an fd, dup'd and rewritten with the
-//! destination's own fd. When either step fails the offset is not committed,
-//! so `Drop` (`release_objects`) never releases the source's still-owned fd
-//! (double close) or a refcount it never took. AOSP gets the same result by
-//! never aborting its loop.
+//! the object is acquired and, for an fd, dup'd into the destination's
+//! `kernel_fds` and rewritten with the dup's number ("Kernel fds"). When
+//! either step fails the offset is not committed, so `Drop`
+//! (`release_objects`) never releases a refcount it never took. AOSP gets the
+//! same result by never aborting its loop.
 //!
 //! # Binder-ABI structs
 //!
@@ -353,10 +415,10 @@
 //! `.handle`).
 
 use std::default::Default;
+use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
 use std::vec::Vec;
 
 use pretty_hex::*;
-use rustix::fd::IntoRawFd;
 
 use crate::{
     binder,
@@ -639,6 +701,20 @@ fn le_i32_at(bytes: &[u8], pos: usize) -> Option<i32> {
     Some(i32::from_le_bytes(word.try_into().ok()?))
 }
 
+/// The largest RPC object, a binder: its type word and an android-13 address.
+#[cfg(feature = "rpc")]
+const RPC_BINDER_SIZE: usize = 4 + crate::rpc::wire_android13::A13_ADDR_LEN;
+
+/// AOSP `getRpcObjectSize` at `off`; an unknown or unreadable type takes the largest size.
+#[cfg(feature = "rpc")]
+fn rpc_object_size(bytes: &[u8], off: usize) -> usize {
+    match le_i32_at(bytes, off) {
+        Some(0) => 4,
+        Some(crate::rpc::wire_android13::TYPE_NATIVE_FILE_DESCRIPTOR) => 8,
+        _ => RPC_BINDER_SIZE,
+    }
+}
+
 /// AOSP `RpcFields::mSendState`; see the module doc "RPC fields".
 #[cfg(feature = "rpc")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -793,6 +869,8 @@ const MAX_NESTED_READ_DEPTH: usize = 1000;
 pub struct Parcel {
     data: ParcelData<u8>,
     pub(crate) objects: ParcelData<binder_size_t>,
+    /// Highest end of a recorded `objects` entry; a write starting at or past it overlaps none.
+    objects_end: u64,
     pos: usize,
     next_object_hint: usize,
     /// End of the innermost [`Parcel::sized_read`] block, which bounds [`Parcel::has_more_data`].
@@ -806,6 +884,10 @@ pub struct Parcel {
     rpc: Option<RpcFields>,
     /// Kernel proxies written here, held strong until the parcel drops (AOSP `acquire_object`).
     kernel_pinned: Vec<crate::binder::SIBinder>,
+    /// The fds `Drop` closes, by FD object offset, sorted; module doc "Kernel fds".
+    kernel_fds: Vec<(u64, OwnedFd)>,
+    /// Set by `from_ipc_parts`: each FD object's handle is the caller's, open while this lives.
+    fd_handles_borrowed: bool,
 }
 
 impl Default for Parcel {
@@ -825,6 +907,7 @@ impl Parcel {
         Parcel {
             data: ParcelData::with_capacity(capacity),
             objects: ParcelData::new(),
+            objects_end: 0,
             pos: 0,
             next_object_hint: 0,
             read_boundary: None,
@@ -834,9 +917,23 @@ impl Parcel {
             free_buffer: None,
             rpc: None,
             kernel_pinned: Vec::new(),
+            kernel_fds: Vec::new(),
+            fd_handles_borrowed: false,
         }
     }
 
+    /// A parcel over a received binder buffer, read in place and handed to
+    /// `free_buffer` when the parcel drops.
+    ///
+    /// The parcel closes none of the file descriptors the buffer names. A
+    /// `BINDER_TYPE_FD` object read from it (a `ParcelFileDescriptor`, a blob
+    /// carried in shared memory) is a duplicate of the fd in that object's
+    /// handle field, so that fd has to stay open while the parcel lives;
+    /// closing it afterwards stays with the caller, who owns it. rsbinder's
+    /// own receive path does not go through this function: it takes ownership
+    /// of the fds the binder driver installed and closes them when the parcel
+    /// drops.
+    ///
     /// # Safety
     /// - `data` must be valid for reads of `length` bytes, or null if `length` is 0
     /// - `objects` must be valid for reads of `object_count` elements, or null if `object_count` is 0
@@ -846,6 +943,9 @@ impl Parcel {
     /// - The memory must remain valid until the Parcel is dropped or `free_buffer` is called
     /// - Neither buffer may be accessed through any other pointer or reference, nor passed to
     ///   another `from_ipc_parts` call, until the Parcel is dropped or `free_buffer` is called
+    /// - The handle of every `BINDER_TYPE_FD` object at an offset in `objects` must be an
+    ///   open file descriptor, and must stay open (closed by no one) until the Parcel is
+    ///   dropped: reading the object duplicates that fd
     pub unsafe fn from_ipc_parts(
         data: *mut u8,
         length: usize,
@@ -858,6 +958,60 @@ impl Parcel {
             binder_uintptr_t,
             usize,
         ) -> Result<()>,
+    ) -> Self {
+        // SAFETY: the caller upholds this `# Safety`, which includes `over_ipc_buffer`'s.
+        let mut parcel =
+            unsafe { Parcel::over_ipc_buffer(data, length, objects, object_count, free_buffer) };
+        parcel.fd_handles_borrowed = true;
+        parcel
+    }
+
+    /// # Safety: the driver-buffer contract of module doc "Kernel fds"; adopts each FD object's fd.
+    pub(crate) unsafe fn from_driver_buffer(
+        data: *mut u8,
+        length: usize,
+        objects: *mut binder_size_t,
+        object_count: usize,
+        free_buffer: FnFreeBuffer,
+    ) -> Self {
+        // SAFETY: the caller upholds the `from_ipc_parts` memory conditions this needs.
+        let mut parcel =
+            unsafe { Parcel::over_ipc_buffer(data, length, objects, object_count, free_buffer) };
+        let size = std::mem::size_of::<flat_binder_object>() as u64;
+        let mut fds: Vec<(u64, RawFd)> = Vec::new();
+        for &off in parcel.objects.as_slice() {
+            // A copy, never a reference into the 4-byte-aligned buffer (`read_flat_binder`).
+            match read_flat_binder(parcel.data.as_slice(), off as usize) {
+                Ok(obj) if obj.header_type() == BINDER_TYPE_FD => {
+                    fds.push((off, obj.handle() as RawFd))
+                }
+                Ok(_) => {}
+                Err(_) => log::error!("Parcel: driver object at {off} is out of the buffer"),
+            }
+        }
+        fds.sort_unstable_by_key(|&(off, _)| off);
+        let mut end = 0u64;
+        for (off, raw) in fds {
+            // The driver validated the table; an overlap or negative fd would not be its.
+            if off < end || raw < 0 {
+                log::error!("Parcel: driver fd object at {off} (fd {raw}) not adopted");
+                continue;
+            }
+            end = off + size;
+            // SAFETY: driver-installed, unowned fd (doc "Kernel fds"); disjoint, so adopted once.
+            let fd = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(raw) };
+            parcel.kernel_fds.push((off, fd));
+        }
+        parcel
+    }
+
+    /// # Safety: the memory conditions of [`Parcel::from_ipc_parts`]; adopts and borrows no fd.
+    unsafe fn over_ipc_buffer(
+        data: *mut u8,
+        length: usize,
+        objects: *mut binder_size_t,
+        object_count: usize,
+        free_buffer: FnFreeBuffer,
     ) -> Self {
         Parcel {
             // SAFETY: `# Safety`: `data` readable, unshared until freed; `u8` needs no alignment.
@@ -873,6 +1027,8 @@ impl Parcel {
                         .collect(),
                 )
             },
+            // Not tracked for a kernel-filled table: every write runs the full overlap scan.
+            objects_end: u64::MAX,
             pos: 0,
             next_object_hint: 0,
             read_boundary: None,
@@ -882,6 +1038,8 @@ impl Parcel {
             free_buffer: Some(free_buffer),
             rpc: None,
             kernel_pinned: Vec::new(),
+            kernel_fds: Vec::new(),
+            fd_handles_borrowed: false,
         }
     }
 
@@ -889,6 +1047,7 @@ impl Parcel {
         Parcel {
             data: ParcelData::from_vec(data),
             objects: ParcelData::new(),
+            objects_end: 0,
             pos: 0,
             next_object_hint: 0,
             read_boundary: None,
@@ -898,14 +1057,14 @@ impl Parcel {
             free_buffer: None,
             rpc: None,
             kernel_pinned: Vec::new(),
+            kernel_fds: Vec::new(),
+            fd_handles_borrowed: false,
         }
     }
 
     /// A parcel that refuses binders and fds; see module doc "Data-only parcels".
     pub(crate) fn new_data_only() -> Self {
-        let mut p = Parcel::new();
-        p.set_for_rpc(true);
-        p
+        Parcel::data_only_from_vec(Vec::with_capacity(256))
     }
 
     /// A data-only parcel over a copy of `bytes`; a forged object in it reads as `BadType`.
@@ -916,7 +1075,8 @@ impl Parcel {
     /// [`Parcel::from_slice`] adopting `bytes` instead of copying them.
     pub(crate) fn data_only_from_vec(bytes: Vec<u8>) -> Self {
         let mut p = Parcel::from_vec(bytes);
-        p.set_for_rpc(true);
+        // Born in RPC mode: `set_for_rpc` refuses a parcel that already holds bytes.
+        p.rpc = Some(RpcFields::default());
         p
     }
 
@@ -976,8 +1136,15 @@ impl Parcel {
         self.pos >= self.data.len()
     }
 
-    /// Switch between kernel (default) and RPC mode; scalar/string/POD bytes are identical in both.
-    pub(crate) fn set_for_rpc(&mut self, yes: bool) {
+    /// Switch an empty parcel between kernel and RPC mode; module doc "Kernel fds".
+    #[cfg(any(test, all(feature = "rpc", feature = "test-util")))]
+    pub(crate) fn set_for_rpc(&mut self, yes: bool) -> Result<()> {
+        // AOSP `markForRpc`: what one mode recorded the other would not release.
+        if self.data.len() != 0 || self.free_buffer.is_some() {
+            log::error!("Parcel::set_for_rpc: the mode is set before anything is written");
+            return Err(StatusCode::InvalidOperation);
+        }
+        debug_assert!(self.objects.len() == 0 && self.kernel_fds.is_empty());
         if yes {
             // Keep any `RpcFields` already configured, e.g. by an earlier `attach_rpc_ops`.
             self.rpc.get_or_insert_with(RpcFields::default);
@@ -989,14 +1156,22 @@ impl Parcel {
             }
             self.rpc = None;
         }
+        Ok(())
     }
 
     /// Test-only door to [`Parcel::set_for_rpc`], for a test in another
     /// crate that needs a session-less RPC-mode parcel. Production code
     /// reaches this mode through `Parcel::configure_rpc`.
+    ///
+    /// Call it on a parcel nothing has been written to. A parcel that holds
+    /// bytes, or one built over a received buffer, is refused with
+    /// `InvalidOperation` and keeps its mode: an object recorded in one mode
+    /// is released only by that mode's `Drop`, so switching it would leak a
+    /// reference. AOSP `Parcel::markForRpc` aborts on a parcel whose own
+    /// buffer is allocated, and accepts a received one, which this refuses too.
     #[cfg(all(feature = "rpc", feature = "test-util"))]
     #[doc(hidden)]
-    pub fn __set_for_rpc(&mut self, yes: bool) {
+    pub fn __set_for_rpc(&mut self, yes: bool) -> Result<()> {
         self.set_for_rpc(yes)
     }
 
@@ -1310,7 +1485,7 @@ impl Parcel {
         self.rpc.as_mut().and_then(|r| r.take_in_fd(index))
     }
 
-    /// Shrink only; the one grow over initialized bytes is `set_data_size_driver_filled`.
+    /// Shrink only, never through a recorded object; the one grow is `set_data_size_driver_filled`.
     pub(crate) fn set_data_size(&mut self, new_len: usize) -> Result<()> {
         if new_len > self.data.len() {
             log::error!(
@@ -1318,6 +1493,10 @@ impl Parcel {
                 self.data.len()
             );
             return Err(StatusCode::BadValue);
+        }
+        if self.recorded_objects_end() > new_len as u64 {
+            log::error!("set_data_size({new_len}) would cut a recorded object");
+            return Err(StatusCode::InvalidOperation);
         }
         // SAFETY: shrinking only, so `0..new_len` is an initialized prefix within capacity.
         unsafe { self.data.set_len(new_len) };
@@ -1345,22 +1524,18 @@ impl Parcel {
         Ok(())
     }
 
-    pub(crate) fn close_file_descriptors(&self) {
-        // RPC-mode parcels never carry kernel FD objects; nothing to close here.
-        if self.rpc.is_some() {
-            return;
-        }
-
-        for offset in self.objects.as_slice() {
-            let Ok(obj) = read_flat_binder(self.data.as_slice(), *offset as usize) else {
-                log::error!("Parcel: unable to read object at offset {offset}");
-                continue;
-            };
-            if obj.header_type() == BINDER_TYPE_FD {
-                // Close the file descriptor
-                obj.owned_fd();
-            }
-        }
+    /// End of the furthest recorded object, kernel or RPC; 0 if there is none.
+    fn recorded_objects_end(&self) -> u64 {
+        let size = std::mem::size_of::<flat_binder_object>() as u64;
+        let kernel = self.objects.as_slice().iter().map(|&off| off + size).max();
+        #[cfg(feature = "rpc")]
+        let rpc = self.rpc_object_positions().iter().map(|&p| {
+            let p = p as usize;
+            (p + rpc_object_size(self.data.as_slice(), p)) as u64
+        });
+        #[cfg(not(feature = "rpc"))]
+        let rpc = std::iter::empty();
+        kernel.into_iter().chain(rpc).max().unwrap_or(0)
     }
 
     /// Move the read/write cursor. AOSP `Parcel::setDataPosition`.
@@ -1797,6 +1972,7 @@ impl Parcel {
             .checked_add(padded)
             .filter(|&e| e <= i32::MAX as usize)
             .ok_or(StatusCode::BadValue)?;
+        self.check_object_overlap(end)?;
 
         self.data.reserve(end.saturating_sub(self.data.len()));
         // SAFETY: `reserve` covers `pos..end`; gap, copy and pad writes initialize all of it.
@@ -1916,6 +2092,7 @@ impl Parcel {
             .checked_add(aligned)
             .filter(|&e| e <= i32::MAX as usize)
             .ok_or(StatusCode::BadValue)?;
+        self.check_object_overlap(end)?;
 
         self.data.reserve(end.saturating_sub(self.data.len()));
         // SAFETY: `reserve` covers `pos..end`; gap, copy and pad writes initialize all of it.
@@ -1946,6 +2123,65 @@ impl Parcel {
         Ok(())
     }
 
+    /// AOSP `validateReadData`: a write touching a recorded object is `PermissionDenied`.
+    fn check_object_overlap(&self, end: usize) -> Result<()> {
+        if self.rpc.is_some() {
+            return self.check_rpc_object_overlap(end);
+        }
+        let pos = self.pos as u64;
+        if pos >= self.objects_end {
+            return Ok(());
+        }
+        let size = std::mem::size_of::<flat_binder_object>() as u64;
+        let end = end as u64;
+        if let Some(off) = self
+            .objects
+            .as_slice()
+            .iter()
+            .find(|&&off| pos < off + size && off < end)
+        {
+            log::error!("Parcel: a write of [{pos}, {end}) overlaps the object at {off}");
+            return Err(StatusCode::PermissionDenied);
+        }
+        Ok(())
+    }
+
+    /// AOSP `validateRpcReadData`: sizes each position near `[pos, end)` by its type word.
+    #[cfg(feature = "rpc")]
+    fn check_rpc_object_overlap(&self, end: usize) -> Result<()> {
+        let Some(rpc) = self.rpc.as_ref() else {
+            return Ok(());
+        };
+        let pos = self.pos;
+        let low = pos.saturating_sub(RPC_BINDER_SIZE - 1);
+        let start = rpc
+            .object_positions
+            .partition_point(|&p| (p as usize) < low);
+        for &off in &rpc.object_positions[start..] {
+            let off = off as usize;
+            if off >= end {
+                break;
+            }
+            let size = rpc_object_size(self.data.as_slice(), off);
+            if pos < off + size {
+                log::error!("Parcel: a write of [{pos}, {end}) overlaps the RPC object at {off}");
+                return Err(StatusCode::PermissionDenied);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "rpc"))]
+    fn check_rpc_object_overlap(&self, _end: usize) -> Result<()> {
+        Ok(())
+    }
+
+    fn record_object(&mut self, off: usize) {
+        let end = off as u64 + std::mem::size_of::<flat_binder_object>() as u64;
+        self.objects_end = self.objects_end.max(end);
+        self.objects.push(off as _);
+    }
+
     pub(crate) fn write_object(&mut self, obj: &flat_binder_object, null_meta: bool) -> Result<()> {
         self.write_object_pinned(obj, null_meta, None)
     }
@@ -1965,6 +2201,11 @@ impl Parcel {
         null_meta: bool,
         binder: Option<&crate::binder::SIBinder>,
     ) -> Result<()> {
+        // An FD object is recorded only with the fd it owns: module doc "Kernel fds".
+        if obj.header_type() == BINDER_TYPE_FD {
+            log::error!("Parcel::write_object: an fd goes through `write_kernel_fd`");
+            return Err(StatusCode::BadType);
+        }
         // RPC mode: no offset-table entry and no kernel `acquire()`; RPC keeps its own refcount.
         if self.rpc.is_some() {
             self.write_aligned(obj)?;
@@ -1984,10 +2225,71 @@ impl Parcel {
                 None => self.pin_kernel_handle(obj)?,
             }
             obj.acquire()?;
-            self.objects.push(data_pos as _);
+            self.record_object(data_pos);
         }
 
         Ok(())
+    }
+
+    /// AOSP `writeFileDescriptor(fd, true)`; the parcel owns `fd` (module doc "Kernel fds").
+    pub(crate) fn write_kernel_fd(&mut self, fd: OwnedFd) -> Result<()> {
+        // RPC carries an fd as a table index; `file_descriptor` routes it there first.
+        if self.rpc.is_some() {
+            return Err(StatusCode::BadType);
+        }
+        let at = self.pos;
+        let obj = flat_binder_object::new_with_fd(std::os::fd::AsRawFd::as_raw_fd(&fd), true);
+        self.write_aligned(&obj)?;
+        self.record_object(at);
+        let at = at as u64;
+        let i = self.kernel_fds.partition_point(|&(off, _)| off < at);
+        self.kernel_fds.insert(i, (at, fd));
+        Ok(())
+    }
+
+    /// Run `f` on the fd of the FD object at the cursor (AOSP `readFileDescriptor`).
+    pub(crate) fn read_kernel_fd_with<R>(
+        &mut self,
+        f: impl FnOnce(BorrowedFd<'_>) -> R,
+    ) -> Result<R> {
+        let at = self.pos as u64;
+        let obj = self.read_object(true)?;
+        // `read_object` does not check the type; a HANDLE here is BAD_TYPE, as in AOSP.
+        if obj.header_type() != BINDER_TYPE_FD {
+            return Err(StatusCode::BadType);
+        }
+        Ok(f(self.kernel_fd_at(at)?))
+    }
+
+    /// A dup of the fd of the FD object at the cursor; the parcel keeps its own.
+    pub(crate) fn read_kernel_fd_dup(&mut self) -> Result<OwnedFd> {
+        Ok(self.read_kernel_fd_with(|fd| rustix::io::fcntl_dupfd_cloexec(fd, 0))??)
+    }
+
+    /// The fd of this parcel's FD object at `at`: the table's entry, or a `from_ipc_parts` handle.
+    fn kernel_fd_at(&self, at: u64) -> Result<BorrowedFd<'_>> {
+        if let Ok(i) = self.kernel_fds.binary_search_by_key(&at, |&(off, _)| off) {
+            return Ok(std::os::fd::AsFd::as_fd(&self.kernel_fds[i].1));
+        }
+        // Only the caller's buffer, which no `Parcel` method writes (`as_mut_slice` panics).
+        let bytes = match self.data {
+            ParcelData::Slice(bytes) if self.fd_handles_borrowed => bytes,
+            _ => {
+                log::error!("Parcel: the fd object at {at} has no fd this parcel holds");
+                return Err(StatusCode::BadType);
+            }
+        };
+        let obj = usize::try_from(at)
+            .map_err(|_| StatusCode::BadType)
+            .and_then(|off| read_flat_binder(bytes, off))?;
+        let raw = obj.handle() as RawFd;
+        if obj.header_type() != BINDER_TYPE_FD || raw < 0 || !self.objects.as_slice().contains(&at)
+        {
+            log::error!("Parcel: no fd object at {at} in the objects table");
+            return Err(StatusCode::BadType);
+        }
+        // SAFETY: an FD object in `from_ipc_parts` bytes, open past `&self` per its `# Safety`.
+        Ok(unsafe { BorrowedFd::borrow_raw(raw) })
     }
 
     // A proxy's strong ref must outlive the send; its own drop may queue BC_RELEASE before it.
@@ -2142,6 +2444,7 @@ impl Parcel {
             .checked_add(size)
             .filter(|&e| e <= i32::MAX as usize)
             .ok_or(StatusCode::BadValue)?;
+        self.check_object_overlap(end)?;
 
         // Every fallible RPC step runs here, before a byte moves; see module doc "append_from".
         #[cfg(feature = "rpc")]
@@ -2153,8 +2456,8 @@ impl Parcel {
         let start_pos = self.pos;
         let mut first_idx: i32 = -1;
         let mut last_idx: i32 = -2;
+        let object_size = std::mem::size_of::<flat_binder_object>() as u64;
         {
-            let object_size = std::mem::size_of::<flat_binder_object>() as u64;
             // Scan the source's table as AOSP `appendFrom` does; the destination's may be empty.
             let objects = other.objects.as_slice();
 
@@ -2230,23 +2533,27 @@ impl Parcel {
             // Push an offset only after acquire and FD dup succeed; see module doc "append_from".
             let src_objects = other.objects.as_slice();
             for i in first_idx..=last_idx {
-                let off = src_objects[i as usize] as usize - offset + start_pos;
-                let mut flat = read_flat_binder(self.data.as_slice(), off)?;
+                let src = src_objects[i as usize];
+                // An unsorted table can hold an out-of-range object between `first` and `last`.
+                if src < offset as u64 || src + object_size > (offset + size) as u64 {
+                    continue;
+                }
+                let off = src as usize - offset + start_pos;
+                // The source's bytes: an overlapping object rewritten below changes the copy's.
+                let mut flat = read_flat_binder(other.data.as_slice(), src as usize)?;
                 self.pin_kernel_handle(&flat)?;
                 flat.acquire()?;
                 if flat.header_type() == BINDER_TYPE_FD {
-                    let newfd = match rustix::io::fcntl_dupfd_cloexec(flat.borrowed_fd(), 0) {
-                        Ok(newfd) => newfd,
-                        Err(e) => {
-                            // FD `acquire()` is a no-op and `off` is uncommitted: nothing to undo.
-                            return Err(std::io::Error::from(e).into());
-                        }
-                    };
-                    flat.set_handle(newfd.into_raw_fd() as _);
+                    // `off` is uncommitted until the push below, so a failed dup leaves no entry.
+                    let newfd = rustix::io::fcntl_dupfd_cloexec(other.kernel_fd_at(src)?, 0)?;
+                    flat.set_handle(std::os::fd::AsRawFd::as_raw_fd(&newfd) as _);
                     flat.set_cookie(1);
                     write_flat_binder(self.data.as_mut_slice(), off, &flat)?;
+                    let at = off as u64;
+                    let i = self.kernel_fds.partition_point(|&(o, _)| o < at);
+                    self.kernel_fds.insert(i, (at, newfd));
                 }
-                self.objects.push(off as _);
+                self.record_object(off);
             }
         }
 
@@ -2328,8 +2635,8 @@ impl Parcel {
                 log::error!("Parcel::sub_parcel: {offset} + {size} exceeds the parcel");
                 StatusCode::BadValue
             })?;
-        let mut sub = Parcel::from_vec(self.data.as_slice()[offset..end].to_vec());
-        sub.set_for_rpc(true);
+        #[cfg_attr(not(feature = "rpc"), allow(unused_mut))]
+        let mut sub = Parcel::data_only_from_vec(self.data.as_slice()[offset..end].to_vec());
         #[cfg(feature = "rpc")]
         self.carry_rpc_objects(&mut sub, offset, end);
         Ok(sub)
@@ -2407,6 +2714,8 @@ impl Parcel {
 
 impl Drop for Parcel {
     fn drop(&mut self) {
+        // Close the owned fds once, before `BC_FREE_BUFFER` (AOSP `freeDataNoInit` order).
+        drop(std::mem::take(&mut self.kernel_fds));
         match self.free_buffer {
             Some(free_buffer) => {
                 // No panic in Drop: a double panic during unwind aborts the process; leak instead.
@@ -3114,7 +3423,7 @@ mod tests {
 
         // ---- RPC parcel: AOSP-faithful flatten sequence ----
         let mut p = Parcel::new();
-        p.set_for_rpc(true);
+        p.set_for_rpc(true).unwrap();
         p.set_rpc_record_fd_positions(true);
 
         // A position is the leading i32's offset, taken before it is written (AOSP flattenBinder).
@@ -3136,7 +3445,8 @@ mod tests {
         // fd #1
         let pos = p.data_position();
         expect.push(pos as u32);
-        p.write(&1i32).unwrap(); // present
+        p.write(&crate::rpc::wire_android13::TYPE_NATIVE_FILE_DESCRIPTOR)
+            .unwrap();
         p.write(&0i32).unwrap(); // ancillary index
         p.rpc_record_object_position(pos);
 
@@ -3161,7 +3471,7 @@ mod tests {
 
         // AOSP inserts at `upper_bound`, so an out-of-order record still lands sorted.
         let mut q = Parcel::new();
-        q.set_for_rpc(true);
+        q.set_for_rpc(true).unwrap();
         for pos in [40u32, 8, 24, 8, 0] {
             q.rpc_record_object_position(pos as usize);
         }
@@ -3208,6 +3518,398 @@ mod tests {
             }
             o => panic!("expected Transact, got {o:?}"),
         }
+    }
+
+    /// AOSP `validateReadData`: no write rewrites a recorded object, so drop closes only its fd.
+    #[test]
+    fn a_write_over_a_recorded_object_is_refused() {
+        use std::os::fd::AsRawFd;
+        let victim = std::fs::File::open("/dev/null").unwrap();
+        let pfd = ParcelFileDescriptor::new(std::fs::File::open("/dev/null").unwrap());
+        let mut p = Parcel::new();
+        p.write(&pfd).unwrap();
+        // `[1][hasComm=0]`, then the FD object at 8; its handle field sits at 16.
+        assert_eq!(p.objects.as_slice(), &[8]);
+
+        p.set_data_position(16);
+        assert_eq!(
+            p.write(&victim.as_raw_fd()),
+            Err(StatusCode::PermissionDenied)
+        );
+        p.set_data_position(4);
+        assert_eq!(p.write_array(&[0i32]), Err(StatusCode::PermissionDenied));
+        let mut src = Parcel::new();
+        src.write(&0i64).unwrap();
+        p.set_data_position(24);
+        assert_eq!(
+            p.append_all_from(&mut src),
+            Err(StatusCode::PermissionDenied)
+        );
+        p.set_data_position(0);
+        assert_eq!(p.write(&pfd), Err(StatusCode::PermissionDenied));
+        assert_eq!(
+            p.objects.as_slice(),
+            &[8],
+            "the offset is not recorded twice"
+        );
+
+        p.set_data_position(32);
+        p.write(&7i32).unwrap();
+        drop(p);
+        assert!(
+            still_open(victim),
+            "dropping the parcel closed an fd it never owned"
+        );
+    }
+
+    /// AOSP `validateRpcReadData`: no write rewrites a recorded RPC fd index or binder address.
+    #[cfg(feature = "rpc")]
+    #[test]
+    fn a_write_over_a_recorded_rpc_object_is_refused() {
+        let mut p = Parcel::new_data_only();
+        p.set_rpc_fd_mode(crate::rpc::FileDescriptorTransportMode::Unix);
+        p.set_rpc_record_fd_positions(true);
+        let pfd = ParcelFileDescriptor::new(std::fs::File::open("/dev/null").unwrap());
+        p.write(&pfd).unwrap();
+        // The v2 binder `write_binder` leaves: type, address, recorded, then the stability word.
+        let binder_at = p.data_position();
+        p.write(&super::RPC_TYPE_BINDER).unwrap();
+        p.write_aligned_data(&[0xa5u8; 8]).unwrap();
+        p.rpc_record_object_position(binder_at);
+        p.write(&0x0Ci32).unwrap();
+        // `[1][hasComm=0]`, then the fd object `[TYPE][index]` at 8.
+        assert_eq!(p.rpc_object_positions(), &[8, binder_at as u32]);
+        let before = p.rpc_data_bytes().to_vec();
+
+        p.set_data_position(12);
+        assert_eq!(p.write(&1i32), Err(StatusCode::PermissionDenied));
+        p.set_data_position(binder_at + 8);
+        assert_eq!(p.write(&0i32), Err(StatusCode::PermissionDenied));
+        p.set_data_position(4);
+        assert_eq!(p.write_array(&[0i32]), Err(StatusCode::PermissionDenied));
+        let mut src = Parcel::new_data_only();
+        src.write(&0i64).unwrap();
+        p.set_data_position(binder_at + 4);
+        assert_eq!(
+            p.append_all_from(&mut src),
+            Err(StatusCode::PermissionDenied)
+        );
+        // `write_array` wrote its length word over `hasComm` before the refusal; objects held.
+        assert_eq!(p.rpc_data_bytes()[8..], before[8..]);
+
+        p.set_data_position(binder_at + 12);
+        p.write(&0x0Ci32).unwrap();
+    }
+
+    #[test]
+    fn sub_parcel_skips_an_out_of_range_object_of_an_unsorted_table() {
+        let pfd = ParcelFileDescriptor::new(std::fs::File::open("/dev/null").unwrap());
+        let mut p = Parcel::new();
+        for at in [100, 0, 200] {
+            p.set_data_position(at);
+            p.write(&pfd).unwrap();
+        }
+        assert_eq!(p.objects.as_slice(), &[108, 8, 208]);
+        let sub = p.sub_parcel(68, 164).unwrap();
+        assert_eq!(sub.objects.as_slice(), &[40, 140]);
+    }
+
+    // ---- kernel fds: a non-blocking pipe read is EOF once every write-end copy is closed ----
+
+    use super::{binder_size_t, binder_uintptr_t, flat_binder_object};
+    use std::os::fd::{AsRawFd, OwnedFd};
+
+    fn pipe_probe() -> (OwnedFd, OwnedFd) {
+        let (r, w) = ParcelFileDescriptor::pipe().unwrap();
+        rustix::fs::fcntl_setfl(&r, rustix::fs::OFlags::NONBLOCK).unwrap();
+        (r.into(), w.into())
+    }
+
+    fn writers_gone(read_end: &OwnedFd) -> bool {
+        match rustix::io::read(read_end, &mut [0u8; 1]) {
+            Ok(0) => true,
+            Err(rustix::io::Errno::AGAIN) => false,
+            other => panic!("unexpected pipe read: {other:?}"),
+        }
+    }
+
+    /// `true` if `file`'s fd is still open; forgets `file` otherwise, so its drop cannot abort.
+    fn still_open(file: std::fs::File) -> bool {
+        let open = rustix::io::fcntl_getfd(&file).is_ok();
+        if !open {
+            std::mem::forget(file);
+        }
+        open
+    }
+
+    /// One FD object at offset 0 naming `fd`, as a driver buffer or `from_ipc_parts` caller has it.
+    fn fd_object_buffer(fd: i32) -> Vec<u8> {
+        let mut data = vec![0u8; std::mem::size_of::<flat_binder_object>()];
+        let obj = flat_binder_object::new_with_fd(fd, true);
+        super::write_flat_binder(&mut data, 0, &obj).unwrap();
+        data
+    }
+
+    #[test]
+    fn a_written_fd_is_closed_by_drop_and_only_then() {
+        let (r, w) = pipe_probe();
+        let mut p = Parcel::new();
+        p.write(&ParcelFileDescriptor::new(w)).unwrap();
+        assert!(!writers_gone(&r), "the parcel holds its dup until it drops");
+        drop(p);
+        assert!(writers_gone(&r), "drop closed the dup");
+    }
+
+    #[test]
+    fn overwritten_fd_bytes_do_not_choose_what_drop_closes() {
+        let victim = std::fs::File::open("/dev/null").unwrap();
+        let (r, w) = pipe_probe();
+        let mut p = Parcel::new();
+        p.write(&ParcelFileDescriptor::new(w)).unwrap();
+        assert_eq!(p.objects.as_slice(), &[8]);
+        // What a write path that skipped the overlap check would leave behind.
+        let mut obj = super::read_flat_binder(p.data.as_slice(), 8).unwrap();
+        obj.set_handle(victim.as_raw_fd() as u32);
+        super::write_flat_binder(p.data.as_mut_slice(), 8, &obj).unwrap();
+        drop(p);
+        assert!(writers_gone(&r), "drop closed the fd the parcel owns");
+        assert!(still_open(victim), "drop closed the fd its bytes named");
+    }
+
+    #[test]
+    fn a_read_fd_is_a_dup_that_outlives_the_parcel() {
+        let (r, w) = pipe_probe();
+        let mut p = Parcel::new();
+        p.write(&ParcelFileDescriptor::new(w)).unwrap();
+        p.set_data_position(0);
+        let read: ParcelFileDescriptor = p.read().unwrap();
+        let table_fd = p.kernel_fds[0].1.as_raw_fd();
+        assert_ne!(read.as_raw_fd(), table_fd, "a dup, not the parcel's fd");
+        drop(p);
+        assert!(!writers_gone(&r), "the read dup keeps the pipe open");
+        drop(read);
+        assert!(writers_gone(&r));
+    }
+
+    #[test]
+    fn an_appended_fd_outlives_its_source() {
+        let (r, w) = pipe_probe();
+        let mut src = Parcel::new();
+        src.write(&ParcelFileDescriptor::new(w)).unwrap();
+        let mut dst = Parcel::new();
+        dst.append_all_from(&mut src).unwrap();
+        drop(src);
+        assert!(!writers_gone(&r), "the destination holds its own dup");
+        dst.set_data_position(0);
+        drop(dst.read::<ParcelFileDescriptor>().unwrap());
+        assert!(!writers_gone(&r));
+        drop(dst);
+        assert!(writers_gone(&r), "the destination closed its dup");
+    }
+
+    #[test]
+    fn write_object_refuses_an_fd_object() {
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let mut p = Parcel::new();
+        let obj = flat_binder_object::new_with_fd(file.as_raw_fd(), true);
+        assert_eq!(p.write_object(&obj, true), Err(StatusCode::BadType));
+        assert_eq!((p.data_size(), p.objects.len()), (0, 0));
+        drop(p);
+        assert!(still_open(file));
+    }
+
+    #[test]
+    fn a_refused_fd_write_closes_its_dup_once() {
+        let (r, w) = pipe_probe();
+        let (r2, w2) = pipe_probe();
+        let mut p = Parcel::new();
+        p.write(&ParcelFileDescriptor::new(w)).unwrap();
+        p.set_data_position(8);
+        assert_eq!(p.write_kernel_fd(w2), Err(StatusCode::PermissionDenied));
+        assert!(writers_gone(&r2), "the refused fd was closed");
+        assert_eq!(p.kernel_fds.len(), 1);
+        drop(p);
+        assert!(writers_gone(&r));
+    }
+
+    thread_local! {
+        static FREE_PROBE: std::cell::RefCell<Option<(OwnedFd, Option<bool>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// A `free_buffer` that records whether the probe pipe was already closed when it ran.
+    fn probe_free(
+        _: Option<&Parcel>,
+        _: binder_uintptr_t,
+        _: usize,
+        _: binder_uintptr_t,
+        _: usize,
+    ) -> Result<()> {
+        FREE_PROBE.with_borrow_mut(|probe| {
+            let (r, seen) = probe.as_mut().expect("probe installed");
+            *seen = Some(writers_gone(r));
+        });
+        Ok(())
+    }
+
+    #[test]
+    fn a_driver_buffer_adopts_each_fd_once_and_closes_it_before_the_free() {
+        let (r, w) = pipe_probe();
+        let probe = rustix::io::fcntl_dupfd_cloexec(&r, 0).unwrap();
+        FREE_PROBE.with_borrow_mut(|p| *p = Some((probe, None)));
+        // The driver installed `w` for the receiver; from here only the buffer names it.
+        let mut data = fd_object_buffer(std::os::fd::IntoRawFd::into_raw_fd(w));
+        // A repeated offset, which the driver never sends, must not adopt the fd twice.
+        let mut objects: Vec<binder_size_t> = vec![0, 0];
+        // SAFETY: buffers outlive `p`, untouched otherwise; only this buffer owns the fd at 0.
+        let mut p = unsafe {
+            Parcel::from_driver_buffer(
+                data.as_mut_ptr(),
+                data.len(),
+                objects.as_mut_ptr(),
+                2,
+                probe_free,
+            )
+        };
+        assert_eq!(p.kernel_fds.len(), 1);
+        drop(p.read_kernel_fd_dup().unwrap());
+        assert!(!writers_gone(&r), "adopted, not closed by a read");
+        drop(p);
+        assert!(writers_gone(&r), "drop closed the adopted fd");
+        let seen = FREE_PROBE.with_borrow_mut(|p| p.take().unwrap().1);
+        assert_eq!(seen, Some(true), "the fd was closed before free_buffer ran");
+    }
+
+    #[test]
+    fn public_from_ipc_parts_reads_its_fds_and_adopts_none() {
+        fn noop(
+            _: Option<&Parcel>,
+            _: binder_uintptr_t,
+            _: usize,
+            _: binder_uintptr_t,
+            _: usize,
+        ) -> Result<()> {
+            Ok(())
+        }
+        let (r, w) = pipe_probe();
+        // Leaked on a failed assert: a parcel that adopted `w` closed it; a 2nd close aborts.
+        let w = std::mem::ManuallyDrop::new(w);
+        let mut data = fd_object_buffer(w.as_raw_fd());
+        let mut objects: Vec<binder_size_t> = vec![0];
+        // SAFETY: both buffers and `w` outlive the parcel, and nothing else touches the buffers.
+        let mut p = unsafe {
+            Parcel::from_ipc_parts(data.as_mut_ptr(), data.len(), objects.as_mut_ptr(), 1, noop)
+        };
+        let read = p
+            .read_kernel_fd_dup()
+            .expect("the caller's fd reads as a dup");
+        assert!(p.kernel_fds.is_empty());
+        drop(p);
+        drop(read);
+        assert!(!writers_gone(&r), "the parcel closed the caller's fd");
+        drop(std::mem::ManuallyDrop::into_inner(w));
+        assert!(writers_gone(&r));
+    }
+
+    /// `append_from` dups the fd the source's bytes name, also where a rewrite overlaps them.
+    #[test]
+    fn append_from_dups_the_fd_the_source_bytes_name() {
+        fn noop(
+            _: Option<&Parcel>,
+            _: binder_uintptr_t,
+            _: usize,
+            _: binder_uintptr_t,
+            _: usize,
+        ) -> Result<()> {
+            Ok(())
+        }
+        let ino = |fd: &OwnedFd| rustix::fs::fstat(fd).unwrap().st_ino;
+        let (_ra, a) = pipe_probe();
+        let (_rb, b) = pipe_probe();
+        // Object 1 starts in object 0's handle (12) or cookie (16), which the first dup rewrites.
+        for second in [12usize, 16] {
+            let mut data = fd_object_buffer(a.as_raw_fd());
+            data.resize(40, 0);
+            // A kernel object is in host byte order, unlike parcel data.
+            data[second..second + 4].copy_from_slice(&super::BINDER_TYPE_FD.to_ne_bytes());
+            data[second + 4..second + 8].fill(0);
+            data[second + 8..second + 12].copy_from_slice(&b.as_raw_fd().to_ne_bytes());
+            let mut objects: Vec<binder_size_t> = vec![0, second as binder_size_t];
+            // SAFETY: buffers outlive `src`, untouched otherwise; its fds `a`, `b` outlive it too.
+            let mut src = unsafe {
+                Parcel::from_ipc_parts(data.as_mut_ptr(), data.len(), objects.as_mut_ptr(), 2, noop)
+            };
+            let mut dst = Parcel::new();
+            dst.append_all_from(&mut src).unwrap();
+            let offsets: Vec<u64> = dst.kernel_fds.iter().map(|&(off, _)| off).collect();
+            assert_eq!(offsets, [0, second as u64], "object 1 at {second}");
+            assert_eq!(ino(&dst.kernel_fds[0].1), ino(&a), "object 0 at {second}");
+            assert_eq!(ino(&dst.kernel_fds[1].1), ino(&b), "object 1 at {second}");
+        }
+    }
+
+    #[test]
+    fn the_mode_of_a_written_or_received_parcel_cannot_change() {
+        let victim = std::fs::File::open("/dev/null").unwrap();
+        let (r, w) = pipe_probe();
+        let mut p = Parcel::new();
+        p.write(&ParcelFileDescriptor::new(w)).unwrap();
+        assert_eq!(p.set_for_rpc(true), Err(StatusCode::InvalidOperation));
+        assert!(p.is_kernel_backed());
+        // The rest of the mode-switch overwrite: still a kernel parcel, so still refused.
+        p.set_data_position(16);
+        assert_eq!(
+            p.write(&victim.as_raw_fd()),
+            Err(StatusCode::PermissionDenied)
+        );
+        drop(p);
+        assert!(writers_gone(&r));
+        assert!(still_open(victim));
+
+        // A received buffer keeps its mode even when empty (its fds stay the kernel's to close).
+        fn noop(
+            _: Option<&Parcel>,
+            _: binder_uintptr_t,
+            _: usize,
+            _: binder_uintptr_t,
+            _: usize,
+        ) -> Result<()> {
+            Ok(())
+        }
+        // SAFETY: null pointers with zero lengths, the documented empty case.
+        let mut received = unsafe {
+            Parcel::from_ipc_parts(std::ptr::null_mut(), 0, std::ptr::null_mut(), 0, noop)
+        };
+        assert_eq!(
+            received.set_for_rpc(true),
+            Err(StatusCode::InvalidOperation)
+        );
+
+        // An empty parcel still switches both ways.
+        let mut empty = Parcel::new();
+        assert_eq!(empty.set_for_rpc(true), Ok(()));
+        assert_eq!(empty.set_for_rpc(false), Ok(()));
+    }
+
+    #[test]
+    fn a_shrink_through_a_recorded_object_is_refused() {
+        let (r, w) = pipe_probe();
+        let mut p = Parcel::new();
+        p.write(&ParcelFileDescriptor::new(w)).unwrap();
+        p.write(&7i32).unwrap();
+        // The FD object spans [8, 32).
+        for cut in [0, 8, 31] {
+            assert_eq!(p.set_data_size(cut), Err(StatusCode::InvalidOperation));
+        }
+        assert_eq!(p.data_size(), 36);
+        assert!(!writers_gone(&r));
+        assert_eq!(
+            p.set_data_size(32),
+            Ok(()),
+            "a cut past every object is a shrink"
+        );
+        drop(p);
+        assert!(writers_gone(&r));
     }
 }
 
@@ -3577,19 +4279,19 @@ mod data_serde {
 
     #[test]
     fn an_appended_object_table_is_refused_before_the_bytes_are_copied() {
-        // Neither source object owns a reference, so the source's drop has nothing to undo.
-        for (object, expected) in [
-            (
-                flat_binder_object::new_binder_with_flags(0),
-                StatusCode::BadType,
-            ),
-            (
-                flat_binder_object::new_with_fd(0, false),
-                StatusCode::FdsNotAllowed,
-            ),
+        // The null binder owns no reference; the fd source closes its own dup on drop.
+        for (is_fd, expected) in [
+            (false, StatusCode::BadType),
+            (true, StatusCode::FdsNotAllowed),
         ] {
             let mut source = Parcel::new();
-            source.write_object(&object, true).unwrap();
+            if is_fd {
+                let dup = std::os::fd::OwnedFd::from(std::fs::File::open("/dev/null").unwrap());
+                source.write_kernel_fd(dup).unwrap();
+            } else {
+                let object = flat_binder_object::new_binder_with_flags(0);
+                source.write_object(&object, true).unwrap();
+            }
 
             let mut sink = Parcel::new_data_only();
             assert_eq!(sink.append_all_from(&mut source), Err(expected));
@@ -3631,7 +4333,7 @@ mod data_serde {
 
         // A holder as it arrives in an RPC transaction: stability, length, then a flattened binder.
         let mut txn = Parcel::new();
-        txn.set_for_rpc(true);
+        txn.set_for_rpc(true).unwrap();
         txn.attach_rpc_ops(std::sync::Arc::new(SessionOps));
         txn.write(&0i32).unwrap(); // STABILITY_LOCAL
         txn.write(&12i32).unwrap(); // payload length
@@ -3744,14 +4446,16 @@ mod data_serde {
             true,
         );
         let binder = |p: &mut Parcel| {
-            p.rpc_record_object_position(p.data_position());
+            let at = p.data_position();
             p.write(&RPC_TYPE_BINDER).unwrap();
             p.write_aligned_data(&[0xa5u8; 8]).unwrap();
+            p.rpc_record_object_position(at);
         };
         let fd = |p: &mut Parcel, idx: i32| {
-            p.rpc_record_object_position(p.data_position());
+            let at = p.data_position();
             p.write(&TYPE_NATIVE_FILE_DESCRIPTOR).unwrap();
             p.write(&idx).unwrap();
+            p.rpc_record_object_position(at);
         };
         binder(&mut txn); // 0: before the holder
         txn.write(&0i32).unwrap(); // STABILITY_LOCAL
@@ -3870,7 +4574,7 @@ mod data_serde {
 
         // Leaving RPC mode discards the fields, so it settles the same way; drop finds nothing.
         let mut p = parcel_with_reservations(ops.clone(), 1);
-        p.set_for_rpc(false);
+        p.set_for_rpc(false).unwrap();
         assert_eq!(ops.0.lock().unwrap().len(), 2);
         drop(p);
         assert_eq!(

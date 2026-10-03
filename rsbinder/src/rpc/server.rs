@@ -266,6 +266,17 @@ impl RawAccepted {
         tls_config: Option<Arc<rustls::ServerConfig>>,
     ) -> RpcResult<Box<dyn RpcTransport>> {
         if let Some(cfg) = tls_config {
+            // No `MSG_NOSIGNAL` on Apple; std sets `SO_NOSIGPIPE` only on sockets it creates.
+            #[cfg(target_vendor = "apple")]
+            {
+                use std::os::fd::AsFd;
+                let fd = match &self {
+                    RawAccepted::Unix(s) => s.as_fd(),
+                    RawAccepted::Tcp(s) => s.as_fd(),
+                };
+                rustix::net::sockopt::set_socket_nosigpipe(fd, true)
+                    .map_err(std::io::Error::from)?;
+            }
             let stream: Box<dyn TlsStream> = match self {
                 RawAccepted::Unix(s) => Box::new(s),
                 #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
@@ -411,20 +422,42 @@ fn remove_stale_socket(path: &Path) -> Result<()> {
         );
         return Err(StatusCode::AlreadyExists);
     }
-    match UnixStream::connect(path) {
-        Ok(_) => {
+    remove_if_stale(path)
+}
+
+/// XNU refuses a live listener with a full backlog as it does a stale socket: keep it, as AOSP.
+#[cfg(target_vendor = "apple")]
+fn remove_if_stale(path: &Path) -> Result<()> {
+    log::error!(
+        "RpcServer::setup_unix_server: a socket exists at {path:?}; Apple platforms never \
+         remove it (delete it once no server listens on it)"
+    );
+    Err(StatusCode::from(rustix::io::Errno::ADDRINUSE))
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn remove_if_stale(path: &Path) -> Result<()> {
+    use rustix::io::Errno;
+    use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+    use std::io::ErrorKind;
+    // Non-blocking: Linux parks a blocking connect to a live server with a full backlog.
+    let flags = SocketFlags::CLOEXEC | SocketFlags::NONBLOCK;
+    let probe = rustix::net::socket_with(AddressFamily::UNIX, SocketType::STREAM, flags, None)
+        .map_err(std::io::Error::from)?;
+    let addr = SocketAddrUnix::new(path).map_err(std::io::Error::from)?;
+    match rustix::net::connect(&probe, &addr) {
+        // `EAGAIN`: a listener whose backlog is full (Linux `unix_stream_connect`).
+        Ok(()) | Err(Errno::AGAIN) | Err(Errno::INPROGRESS) => {
             log::error!("RpcServer::setup_unix_server: another server is listening on {path:?}");
-            Err(StatusCode::from(rustix::io::Errno::ADDRINUSE))
+            Err(StatusCode::from(Errno::ADDRINUSE))
         }
-        Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
-            std::fs::remove_file(path).or_else(|e| match e.kind() {
-                ErrorKind::NotFound => Ok(()),
-                _ => Err(StatusCode::from(e)),
-            })
-        }
+        Err(Errno::CONNREFUSED) => std::fs::remove_file(path).or_else(|e| match e.kind() {
+            ErrorKind::NotFound => Ok(()),
+            _ => Err(StatusCode::from(e)),
+        }),
         Err(e) => {
             log::error!("RpcServer::setup_unix_server: cannot probe {path:?}: {e}");
-            Err(e.into())
+            Err(std::io::Error::from(e).into())
         }
     }
 }
@@ -452,7 +485,18 @@ impl RpcServer {
     ///
     /// AOSP `RpcServer::setupUnixDomainServer` never removes anything and
     /// fails on every existing path; the stale-socket case is kept so a
-    /// restart after a crash needs no manual cleanup.
+    /// restart after a crash needs no manual cleanup. The probe, the
+    /// removal and the bind are separate steps, so two servers started at
+    /// once on the same stale path can both succeed, the later removal
+    /// leaving the earlier server listening on a path no client reaches.
+    /// Start one server per path.
+    ///
+    /// **Apple platforms** keep AOSP's behavior instead: any socket at
+    /// `path` is refused with `StatusCode::Errno(-EADDRINUSE)` and never
+    /// removed, so delete a crashed server's socket before restarting.
+    /// XNU refuses a connect to a live listener whose backlog is full with
+    /// the same `ECONNREFUSED` a stale socket gives, so the probe would
+    /// remove a running server's path there.
     ///
     /// Dropping the server removes the socket file only while it is still
     /// the one this server bound (same device and inode), so a server that
@@ -622,6 +666,12 @@ impl RpcServer {
 
     /// Publish the single root object (android `setRootObject`).
     ///
+    /// The root is copied into each session once, when it is accepted; AOSP
+    /// instead reads `getRootObject()` on every `GET_ROOT` (`RpcState.cpp`).
+    /// A session accepted before this call keeps the root it was given, so
+    /// call it before [`run`](Self::run) / [`run_background`](Self::run_background).
+    /// A later [`add_service`](Self::add_service) replaces it with the service directory.
+    ///
     /// Refuses a **remote** binder with [`StatusCode::InvalidOperation`] — see
     /// [`add_service`](Self::add_service) for why.
     pub fn set_root(&self, binder: SIBinder) -> Result<()> {
@@ -630,11 +680,13 @@ impl RpcServer {
         Ok(())
     }
 
-    /// Register a named service. The first call installs a built-in
-    /// `ServiceDirectory` as the root; that directory shares this server's
-    /// service map, so every later call is an O(1) insert seen through the
-    /// same root — no rebuild or root swap. Clients reach it via
-    /// [`RpcSession::get_service`].
+    /// Register a named service. Every call installs the built-in
+    /// `ServiceDirectory` as the root, replacing a root set by
+    /// [`set_root`](Self::set_root); the directory shares this server's
+    /// service map, so the insert itself needs no rebuild. Clients reach it via
+    /// [`RpcSession::get_service`]. The *first* call installs a root, which,
+    /// as with [`set_root`](Self::set_root), a session accepted before it
+    /// does not see: make that first call before `run` / `run_background`.
     ///
     /// Refuses a **remote** binder with [`StatusCode::InvalidOperation`]:
     /// publishing a proxy here can never work. A proxy of *this* session would
@@ -1027,6 +1079,16 @@ impl RpcServer {
     /// Default: only `None` (the categorical reject). Pass
     /// `&[FileDescriptorTransportMode::Unix]` to opt in to UDS
     /// `SCM_RIGHTS` fd passing for clients that also opt in.
+    ///
+    /// On the android-13+ wire ([`set_android13plus`](Self::set_android13plus))
+    /// a client that requests a mode this server does not support is
+    /// refused when it founds its session: the connection is closed after
+    /// the handshake response, so the client's first call fails (AOSP
+    /// `RpcServer.cpp` "Rejecting connection: FileDescriptorTransportMode
+    /// is not supported"). Passing `Unix` keeps accepting clients that
+    /// request no fd mode, where AOSP would refuse them. The r34 wire
+    /// negotiates the mode by `GET_FD_MODE` instead and agrees `None`
+    /// rather than refusing.
     pub fn set_supported_fd_modes(&self, modes: &[crate::rpc::FileDescriptorTransportMode]) {
         let unix = modes.contains(&crate::rpc::FileDescriptorTransportMode::Unix);
         self.fd_unix_supported.store(unix, Ordering::SeqCst);
@@ -1138,23 +1200,23 @@ impl RpcServer {
             .and_then(std::sync::Weak::upgrade)
     }
 
-    /// Observability counters.
-    /// Respectively: new-session ids registered; **id-demux attaches**
-    /// (a 2nd+ connection bound to a pre-existing shared session);
-    /// **id-carrying connections refused for any reason** — an
-    /// unknown/stale id, a codec-version mismatch with the founding
-    /// session, an attach arriving after `shutdown`, or an attach past
-    /// the incoming/callback slot cap. The last one therefore counts
-    /// more than stale ids: a well-behaved client whose
-    /// `incoming_connections` exceeds this server's callback budget also
-    /// raises it. All zero on the default (empty-id) flow ⇒ a
-    /// no-regression witness.
+    /// Observability counter: new-session ids registered. Every android-13+
+    /// session counts here, including the default (empty-id) flow.
     pub fn session_registered_count(&self) -> usize {
         self.session_registered.load(Ordering::SeqCst)
     }
+    /// Observability counter: **id-demux attaches** (a 2nd+ connection bound
+    /// to a pre-existing shared session). Stays zero on the empty-id flow.
     pub fn attached_count(&self) -> usize {
         self.attached_count.load(Ordering::SeqCst)
     }
+    /// Observability counter: **id-carrying connections refused for any
+    /// reason** — an unknown/stale id, a codec-version mismatch with the
+    /// founding session, an attach arriving after `shutdown`, or an attach
+    /// past the incoming/callback slot cap. It therefore counts more than
+    /// stale ids: a well-behaved client whose `incoming_connections` exceeds
+    /// this server's callback budget also raises it. Stays zero on the
+    /// empty-id flow.
     pub fn rejected_unknown_id_count(&self) -> usize {
         self.rejected_unknown_id.load(Ordering::SeqCst)
     }
@@ -1354,7 +1416,7 @@ impl RpcServer {
             .expect("wire_max_version poisoned");
         match a13_max {
             Some(max) => {
-                // A client's `Unix` fd mode is honored only if `set_supported_fd_modes` opted in.
+                // A new session requesting `Unix` without `set_supported_fd_modes` is refused.
                 let fd_unix = server.fd_unix_supported.load(Ordering::SeqCst);
                 // Handshake apart from build: branch on the client's session id and direction.
                 let (transport, codec, client_fd_mode, client_id, incoming) =
@@ -1672,9 +1734,8 @@ impl RpcServer {
     ///
     /// **A worker that has no session yet is not reachable that way, and
     /// this call waits for it.** Ending a session shuts the transports of
-    /// *its* slots down, and a connection still in the handshake — or, on
-    /// the r34 path, waiting for its first frame — has neither: its
-    /// transport is a local of the worker thread. What bounds such a
+    /// *its* slots down, and a connection still in the handshake has
+    /// neither: its transport is a local of the worker thread. What bounds such a
     /// worker is [`set_handshake_timeout`](Self::set_handshake_timeout),
     /// so this call is bounded by that deadline; with it set to `None`
     /// nothing bounds it, and a peer that connects and then says nothing

@@ -124,7 +124,7 @@ pub mod ByteEnum {
     }
 }
 pub mod Union {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, non_camel_case_types, dead_code, deprecated)]
     #[derive(Debug)]
     #[derive(Clone,PartialEq)]
     pub enum r#Union {
@@ -359,26 +359,26 @@ pub mod ByteEnum {
 }
 pub mod ITestService {
     #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
-    pub trait ITestService: rsbinder::Interface + Send {
+    pub trait ITestService: rsbinder::Interface + ::core::marker::Send {
         fn descriptor() -> &'static str where Self: Sized { "ITestService" }
         fn r#RepeatByteEnum(&self, _arg_token: super::ByteEnum::ByteEnum) -> rsbinder::BinderResult<super::ByteEnum::ByteEnum>;
-        fn getDefaultImpl() -> Option<ITestServiceDefaultRef> where Self: Sized {
+        fn getDefaultImpl() -> ::core::option::Option<ITestServiceDefaultRef> where Self: Sized {
             DEFAULT_IMPL.get().cloned()
         }
         fn setDefaultImpl(d: ITestServiceDefaultRef) -> ITestServiceDefaultRef where Self: Sized {
             DEFAULT_IMPL.get_or_init(|| d).clone()
         }
     }
-    pub trait ITestServiceDefault: Send + Sync {
+    pub trait ITestServiceDefault: ::core::marker::Send + ::core::marker::Sync {
         fn r#RepeatByteEnum(&self, _arg_token: super::ByteEnum::ByteEnum) -> rsbinder::BinderResult<super::ByteEnum::ByteEnum> {
-            Err(rsbinder::StatusCode::UnknownTransaction.into())
+            ::core::result::Result::Err(rsbinder::StatusCode::UnknownTransaction.into())
         }
     }
     pub(crate) mod transactions {
         pub(crate) const r#RepeatByteEnum: rsbinder::TransactionCode = rsbinder::FIRST_CALL_TRANSACTION + 0;
     }
-    pub type ITestServiceDefaultRef = std::sync::Arc<dyn ITestServiceDefault>;
-    static DEFAULT_IMPL: std::sync::OnceLock<ITestServiceDefaultRef> = std::sync::OnceLock::new();
+    pub type ITestServiceDefaultRef = ::std::sync::Arc<dyn ITestServiceDefault>;
+    static DEFAULT_IMPL: ::std::sync::OnceLock<ITestServiceDefaultRef> = ::std::sync::OnceLock::new();
     rsbinder::declare_binder_interface! {
         ITestService["ITestService"] {
             native: {
@@ -391,19 +391,19 @@ pub mod ITestService {
         fn build_parcel_RepeatByteEnum(&self, _arg_token: super::ByteEnum::ByteEnum) -> rsbinder::Result<rsbinder::Parcel> {
             let mut data = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.prepare_transact(true)?;
             data.write(&_arg_token)?;
-            Ok(data)
+            ::core::result::Result::Ok(data)
         }
-        fn read_response_RepeatByteEnum(&self, _arg_token: super::ByteEnum::ByteEnum, _aidl_reply: rsbinder::Result<Option<rsbinder::Parcel>>) -> rsbinder::BinderResult<super::ByteEnum::ByteEnum> {
-            if let Err(rsbinder::StatusCode::UnknownTransaction) = _aidl_reply {
-                if let Some(_aidl_default_impl) = <Self as ITestService>::getDefaultImpl() {
+        fn read_response_RepeatByteEnum(&self, _arg_token: super::ByteEnum::ByteEnum, _aidl_reply: rsbinder::Result<::core::option::Option<rsbinder::Parcel>>) -> rsbinder::BinderResult<super::ByteEnum::ByteEnum> {
+            if let ::core::result::Result::Err(rsbinder::StatusCode::UnknownTransaction) = _aidl_reply {
+                if let ::core::option::Option::Some(_aidl_default_impl) = <Self as ITestService>::getDefaultImpl() {
                   return _aidl_default_impl.r#RepeatByteEnum(_arg_token);
                 }
             }
             let mut _aidl_reply = _aidl_reply?.ok_or(rsbinder::StatusCode::UnexpectedNull)?;
             let _status = _aidl_reply.read::<rsbinder::Status>()?;
-            if !_status.is_ok() { return Err(_status); }
+            if !_status.is_ok() { return ::core::result::Result::Err(_status); }
             let _aidl_return: super::ByteEnum::ByteEnum = _aidl_reply.read()?;
-            Ok(_aidl_return)
+            ::core::result::Result::Ok(_aidl_return)
         }
     }
     impl ITestService for BpTestService {
@@ -436,17 +436,17 @@ pub mod ITestService {
                 let _arg_token: super::ByteEnum::ByteEnum = _reader.read()?;
                 let _aidl_return = _service.r#RepeatByteEnum(_arg_token);
                 match &_aidl_return {
-                    Ok(_aidl_return) => {
+                    ::core::result::Result::Ok(_aidl_return) => {
                         _reply.write(&rsbinder::Status::from(rsbinder::StatusCode::Ok))?;
                         _reply.write(_aidl_return)?;
                     }
-                    Err(_aidl_status) => {
+                    ::core::result::Result::Err(_aidl_status) => {
                         _reply.write(_aidl_status)?;
                     }
                 }
-                Ok(())
+                ::core::result::Result::Ok(())
             }
-            _ => Err(rsbinder::StatusCode::UnknownTransaction),
+            _ => ::core::result::Result::Err(rsbinder::StatusCode::UnknownTransaction),
         }
     }
 }
@@ -476,14 +476,14 @@ fn test_union_with_nested_enum() -> Result<(), Box<dyn Error>> {
         "#,
         r#"
 pub mod NestedUnion {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, non_camel_case_types, dead_code, deprecated)]
     #[derive(Debug)]
     pub enum r#NestedUnion {
         r#InnerField(Inner::Inner),
     }
     impl Default for r#NestedUnion {
         fn default() -> Self {
-            Self::InnerField(Inner::Inner::VALUE)
+            Self::InnerField(Default::default())
         }
     }
     impl rsbinder::Parcelable for r#NestedUnion {
@@ -533,6 +533,92 @@ pub mod NestedUnion {
     Ok(())
 }
 
+fn generate_rust(input: &str) -> Result<String, Box<dyn Error>> {
+    let ctx = rsbinder_aidl::SourceContext::new("test.aidl", input);
+    let document = rsbinder_aidl::parse_document(&ctx)?;
+    let gen = rsbinder_aidl::Generator::new(false, false);
+    Ok(gen.document(&document)?.1)
+}
+
+// AOSP GenerateParcelDefault(AidlUnionDecl): uninitialized first field is `Default::default()`.
+#[test]
+fn test_union_enum_first_field_defaults_to_zero() -> Result<(), Box<dyn Error>> {
+    let res = generate_rust(
+        r#"
+        package p;
+        @Backing(type="int")
+        enum E { A = 5, B = 6 }
+        union U { E e; int x; }
+        "#,
+    )?;
+    assert!(res.contains("Self::E(Default::default())"), "{res}");
+    Ok(())
+}
+
+#[test]
+fn test_union_tag_first_field_generates() -> Result<(), Box<dyn Error>> {
+    let res = generate_rust(
+        r#"
+        package p;
+        parcelable T {
+            union A { int x; String y; }
+            union B { A.Tag t; int z; }
+        }
+        "#,
+    )?;
+    assert!(res.contains("Self::T(Default::default())"), "{res}");
+    Ok(())
+}
+
+// AOSP parser.cpp `UnionTagGenerater`: the backing decides the `U.Tag[]` wire (byte[] vs int[]).
+#[test]
+fn test_fixed_size_union_tag_is_byte_backed() -> Result<(), Box<dyn Error>> {
+    let fixed = generate_rust("package p;\n@FixedSize union U { int a; long b; }")?;
+    assert!(fixed.contains("Tag : [i8; 2]"), "{fixed}");
+    let plain = generate_rust("package p;\nunion U { int a; long b; }")?;
+    assert!(plain.contains("Tag : [i32; 2]"), "{plain}");
+    Ok(())
+}
+
+#[test]
+fn test_union_names_clashing_with_implicit_tag_are_rejected() {
+    // Each would otherwise be rustc E0428 against the generated `Tag` struct.
+    for (input, needle) in [
+        (
+            "package p;\nunion U { int a; enum Tag { X } }",
+            "union 'U' has a duplicate nested type 'Tag'",
+        ),
+        (
+            "package p;\nunion Tag { int a; }",
+            "nested type 'Tag' has the same name as its parent",
+        ),
+        (
+            "package p;\nunion U { int a; const int Tag = 1; }",
+            "union 'U': a constant cannot be named 'Tag'",
+        ),
+    ] {
+        let err = generate_rust(input).expect_err(input).to_string();
+        assert!(err.contains(needle), "{input}: {err}");
+    }
+}
+
+#[test]
+fn test_names_clashing_with_binder_enum_items_are_rejected() {
+    // `declare_binder_enum!` defines `get`/`enum_values` beside each value: rustc E0201.
+    for input in [
+        "package p;\nunion Op { int get; int set; }",
+        "package p;\nunion Op { int enum_values; int set; }",
+        "package p;\nenum E { get, set }",
+        "package p;\nenum E { enum_values }",
+    ] {
+        let err = generate_rust(input).expect_err(input).to_string();
+        assert!(
+            err.contains("collides with an associated item"),
+            "{input}: {err}"
+        );
+    }
+}
+
 #[test]
 fn test_union_with_nested_parcelable() -> Result<(), Box<dyn Error>> {
     aidl_generator(
@@ -549,7 +635,7 @@ fn test_union_with_nested_parcelable() -> Result<(), Box<dyn Error>> {
         "#,
         r#"
 pub mod OuterUnion {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, non_camel_case_types, dead_code, deprecated)]
     #[derive(Debug)]
     pub enum r#OuterUnion {
         r#SimpleField(i32),
@@ -621,16 +707,16 @@ pub mod OuterUnion {
                 _parcel.sized_write(|_sub_parcel| {
                     _sub_parcel.write(&self.r#value)?;
                     _sub_parcel.write(&self.r#name)?;
-                    Ok(())
+                    ::core::result::Result::Ok(())
                 })
             }
             fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
                 _parcel.sized_read(|_sub_parcel| {
-                    if !_sub_parcel.has_more_data() { return Ok(()); }
+                    if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                     self.r#value = _sub_parcel.read()?;
-                    if !_sub_parcel.has_more_data() { return Ok(()); }
+                    if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                     self.r#name = _sub_parcel.read()?;
-                    Ok(())
+                    ::core::result::Result::Ok(())
                 })
             }
         }
@@ -670,7 +756,7 @@ fn test_union_with_multiple_nested_types() -> Result<(), Box<dyn Error>> {
         "#,
         r#"
 pub mod MultiNestedUnion {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, non_camel_case_types, dead_code, deprecated)]
     #[derive(Debug)]
     pub enum r#MultiNestedUnion {
         r#RawValue(i32),
@@ -749,14 +835,14 @@ pub mod MultiNestedUnion {
             fn write_to_parcel(&self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
                 _parcel.sized_write(|_sub_parcel| {
                     _sub_parcel.write(&self.r#id)?;
-                    Ok(())
+                    ::core::result::Result::Ok(())
                 })
             }
             fn read_from_parcel(&mut self, _parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
                 _parcel.sized_read(|_sub_parcel| {
-                    if !_sub_parcel.has_more_data() { return Ok(()); }
+                    if !_sub_parcel.has_more_data() { return ::core::result::Result::Ok(()); }
                     self.r#id = _sub_parcel.read()?;
-                    Ok(())
+                    ::core::result::Result::Ok(())
                 })
             }
         }

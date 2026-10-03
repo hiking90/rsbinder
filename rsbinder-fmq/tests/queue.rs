@@ -234,7 +234,7 @@ fn write_and_read_are_all_or_nothing() {
 }
 
 #[test]
-fn commit_beyond_what_was_begun_is_refused() {
+fn commit_beyond_free_space_or_available_elements_is_refused() {
     let mut w = MessageQueue::<u8>::create(4, false).unwrap();
     let mut r = attach(&w);
     assert_eq!(
@@ -566,6 +566,21 @@ fn attach_rejects_overlapping_regions() {
     );
 }
 
+/// A `dup` of the queue's fd names the same file, so a ring on it may not cover the counters.
+#[test]
+fn attach_rejects_overlapping_regions_on_a_duplicated_fd() {
+    let (_q, mut d) = fresh_desc(16, true);
+    d.fds.push(d.fds[0].try_clone().unwrap());
+    d.grantors[2].fd_index = 1;
+    // Where the default layout puts it, through the dup: no overlap.
+    MessageQueue::<u32>::attach(&d, &policy(16, true)).unwrap();
+    d.grantors[2].offset = 0;
+    assert_eq!(
+        bad(MessageQueue::<u32>::attach(&d, &policy(16, true))),
+        "grantor regions overlap"
+    );
+}
+
 #[test]
 fn attach_rejects_the_unsynchronized_flavor() {
     let (_q, mut d) = fresh_desc(16, true);
@@ -763,7 +778,7 @@ fn create_rejects_impossible_sizes() {
         MessageQueue::<u8>::create(i32::MAX as usize + 1, true).unwrap_err(),
         Error::BadValue("queue too large")
     );
-    // 16 + data is `i32::MAX`; libfmq rounds it up to 8 and refuses it.
+    // Past the `i32::MAX - page_size` bound.
     assert_eq!(
         MessageQueue::<u8>::create(i32::MAX as usize - 16, false).unwrap_err(),
         Error::BadValue("queue too large")
@@ -861,4 +876,80 @@ fn send_but_not_sync() {
     is_send::<Descriptor>();
     is_sync::<Descriptor>();
     // `!Sync` is checked by the `compile_fail` doctest on `MessageQueue`.
+}
+
+// ---- Ring memory is reached only through atomics --------------------------
+
+/// A plain access to ring memory cannot be observed through a real mapping: the source is read.
+#[test]
+fn ring_code_makes_no_plain_copy_of_ring_memory() {
+    // Code only: comment and doc lines may name the very calls this test forbids.
+    let source = |file: &str| {
+        let path = format!("{}/src/{file}", env!("CARGO_MANIFEST_DIR"));
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        text.lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    const PLAIN_ACCESSES: [&str; 17] = [
+        "copy_nonoverlapping",
+        "ptr::copy",
+        "copy_from_slice",
+        "clone_from_slice",
+        "copy_within",
+        ".copy_to",
+        "read_volatile",
+        "write_volatile",
+        "read_unaligned",
+        "write_unaligned",
+        "ptr::read",
+        "ptr::write",
+        ".read(",
+        ".write(",
+        "as_ref(",
+        "as_mut(",
+        "from_ptr_range",
+    ];
+    // The queue's own `read`/`write` calls, and the counter's `&AtomicU64`.
+    const ALLOWED: [&str; 3] = [
+        "if self.write(items)? {",
+        "if self.read(out)? {",
+        "unsafe { self.ptr.as_ref() }",
+    ];
+    for file in ["queue.rs", "ring.rs"] {
+        let text = source(file);
+        for line in text.lines().filter(|l| !ALLOWED.contains(&l.trim())) {
+            for pattern in PLAIN_ACCESSES {
+                assert!(!line.contains(pattern), "{file} uses `{pattern}`: {line}");
+            }
+        }
+    }
+    // `queue.rs` builds no slice at all; `ring.rs` builds atomics or views of a caller's slice.
+    assert!(!source("queue.rs").contains("from_raw_parts"));
+    let ring = source("ring.rs");
+    let calls: Vec<&str> = ring
+        .match_indices("from_raw_parts")
+        .map(|(at, _)| {
+            let args = &ring[at..];
+            let mut depth = 0;
+            let end = args
+                .char_indices()
+                .find_map(|(i, c)| {
+                    match c {
+                        '(' => depth += 1,
+                        ')' if depth == 1 => return Some(i),
+                        ')' => depth -= 1,
+                        _ => {}
+                    }
+                    None
+                })
+                .expect("a closed call");
+            &args[..end]
+        })
+        .collect();
+    assert_eq!(calls.len(), 5, "{calls:#?}");
+    for call in calls {
+        assert!(call.contains("Atomic") || call.contains("(user."), "{call}");
+    }
 }

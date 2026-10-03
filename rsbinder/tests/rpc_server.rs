@@ -59,19 +59,33 @@
 //! - `multi_connection_shared_session`: client #1 (empty id) founds a
 //!   session and the server registers a `Weak<RpcSessionInner>`, with
 //!   `attached`/`rejected` at 0; `get_session_id()` returns the
-//!   server-minted id (the client half of AOSP `setupClient`); client #2
-//!   echoes it and attaches, so `c2.get_session_id() == sid1` (the id
-//!   lives in `SharedSession`, so this holds only if state is shared) and
-//!   `attached_count == 1`; client #3 sends an unknown id and is
-//!   rejected. Dropping #2 ends the shared session, and #1 fails with
-//!   `DeadObject` (plan 2-24 D1); `ac_12_f8_attach_unifies_to_single_inner`
-//!   checks the same through the pool. Mutant for both: drop the
-//!   `fail_session` a serve loop's end calls
+//!   server-minted id (the client half of AOSP `setupClient`); connection
+//!   #2 of the same client session echoes it and attaches, which the
+//!   attach's `GET_SESSION_ID` confirmation reads back as `sid1` (the id
+//!   lives in `SharedSession`, so this holds only if state is shared), and
+//!   `attached_count == 1`; a raw attach header with an unknown id is
+//!   rejected (an `RpcSession` refuses any id but its own before sending
+//!   one, see `an_attach_with_another_sessions_id_is_refused_before_connecting`). Severing #2 (`shutdown` on a kept clone of its socket) ends
+//!   the shared session, and #1 fails with `DeadObject` (plan 2-24 D1);
+//!   `ac_12_f8_attach_unifies_to_single_inner` checks the same through the
+//!   pool. Mutant for both: drop the `fail_session` a serve loop's end calls
 //!   (`RpcSession::serve_blocking_on_inner`), and #1 keeps working. Mutant: make
 //!   `RpcServer::run_connection_in_worker`'s attach arm build a fresh
 //!   session with `RpcSession::from_android13plus(transport, codec,
-//!   client_fd_mode, fd_unix)`, as the empty-id arm does; #2 then gets its
-//!   own `SharedSession` and `c2.get_session_id() != sid1`.
+//!   client_fd_mode, fd_unix)`, as the empty-id arm does; #2's confirmation
+//!   then reads another id and the attach fails.
+//! - `a_new_session_setup_refuses_a_session_id`: a session id on an entry
+//!   that builds a new client `RpcSession` would put two client states on
+//!   one server session (separate oneway numbering, binder addresses and
+//!   lifetimes), so every such entry returns `BadValue` before any
+//!   handshake. Mutant: let `refuse_id_on_new_session` pass a non-empty
+//!   id, and the setup call drops the id, founds a new session and returns
+//!   `Ok`.
+//! - `an_attach_with_another_sessions_id_is_refused_before_connecting`: the
+//!   same split through the attach calls, from a second founding session
+//!   echoing the first one's server-minted id. Mutant: make
+//!   `RpcSession::refuse_foreign_attach_id` return `Ok(())` always, and the
+//!   outgoing attach joins `c1`'s server session and returns `Ok(2)`.
 //! - `ac_12_f8_attach_unifies_to_single_inner`: one `RpcSessionInner` per
 //!   session. With one inner per accepted connection (sharing only
 //!   `SharedSession`), a `state.remote_proxies`-cached `RpcProxy` would hold
@@ -108,10 +122,11 @@
 //!   refuses by closing), so `add_outgoing_connection_with_config` confirms
 //!   with one `GET_SESSION_ID` round trip. A single-threaded client always
 //!   draws slot 1 first, so the test drives 4 threads to reach the attached
-//!   slot. The client-local id is refused before connecting (`BadValue`);
-//!   dropping `confirm_attach` returns `Ok(3)` for the unknown id, so its
-//!   `is_err()` assert fails; the echo loop is the control that a confirmed
-//!   pool has no dead slot.
+//!   slot. The client-local id and an unknown id are both refused before
+//!   connecting (`BadValue`), leaving the session up; the echo loop is the
+//!   control that a confirmed pool has no dead slot. The `confirm_attach`
+//!   mutant is caught by
+//!   `attach_past_the_server_slot_cap_is_refused_at_attach_time`.
 //! - `attach_past_the_server_slot_cap_is_refused_at_attach_time`: no
 //!   client-side check can catch a valid id past the cap, and a caller that
 //!   skips `negotiate()` has no other way to learn it. Without
@@ -126,16 +141,9 @@
 //!   branch. Mutant: removing `if server.shutdown.load() { reject }` from
 //!   the attach arm lets the worker add the slot, so
 //!   `rejected_unknown_id_count` does not move, `session_slot_count`
-//!   reaches `Some(2)`, and the attach succeeds.
-//! - `shared_node_survives_sibling_proxy_drop`: two client sessions
-//!   attached to one server session (shared `RpcState`) each hold a proxy
-//!   to the same root. With AOSP `timesSent` accounting the
-//!   server counts each send (strong = 2), so dropping one proxy leaves the
-//!   node for the sibling, and it is freed only when both drop (proven at
-//!   the state level by `rpc::state::tests::times_sent_balance_frees_node`).
-//!   Mutant: revert the `timesSent` bump in `on_binder_leaving`; strong
-//!   stays 1, dropping `root1` frees the node and `root2.echo()` is
-//!   `DeadObject`.
+//!   reaches `Some(2)`, and the raw attach stays open. The attach is a raw
+//!   header because the founding session's own refused attach would end
+//!   that session.
 //! - `excess_receipt_no_leak_single_client`: `get_root()` twice makes
 //!   the server's strong count 2 while the client dedups to one proxy, so
 //!   the client owes one excess `DEC_STRONG` at the second receipt (AOSP
@@ -147,13 +155,15 @@
 //!   assertion pins the dedup precondition.
 //! - `pool_distributes_concurrent_calls_across_outgoing_slots`: two
 //!   parallel `slow(150)` take ≈150 ms when the pool gives each thread its
-//!   own slot (AOSP `findConnection`), ≈300 ms when serialized. The test
-//!   asserts `< 380 ms`, which a serialized run also meets, so it does not
-//!   catch `find_conn` always returning slot 1 or ignoring `exclusive_tid`.
+//!   own slot (AOSP `findConnection`), ≈300 ms when serialized. The
+//!   `< 380 ms` bound passes a serialized run too; the handler's count of
+//!   calls in flight at once (must reach 2) catches `find_conn` always
+//!   returning slot 1 or ignoring `exclusive_tid`.
 //! - `pool_exhausted_third_caller_waits_for_a_free_slot`: 2 slots and 3
-//!   `slow(200)` ≈ 400 ms. Only the 380 ms lower bound discriminates: a
-//!   third caller that does not wait on `slot_cv` finishes in one wave.
-//!   The 700 ms upper bound catches a stall, not a serial run (≈600 ms).
+//!   `slow(200)` ≈ 400 ms. A third caller that does not wait on `slot_cv`
+//!   gets `WouldBlock` and fails its `slow` `expect`; the in-flight count
+//!   (must reach 2) catches a serial run (≈600 ms), which the 700 ms upper
+//!   bound passes; the time band only catches a stall.
 //! - `pool_nested_callback_pins_to_forced_slot_single_thread`: slot 1 is
 //!   parked under `slow(...)`, so `roundtrip(cb)` runs on slot 2 and its
 //!   nested callback must dispatch there (`find_conn`'s reentrant match is
@@ -219,7 +229,7 @@
 
 #![cfg(feature = "rpc")]
 
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -257,6 +267,8 @@ struct EchoSvc {
     slow_entered: Arc<AtomicBool>,
     /// Callback parked by `hold()` for out-of-handler use.
     held: Arc<Mutex<Option<SIBinder>>>,
+    /// `[in flight, most seen at once]` for `slow()`: overlap measured, not timed.
+    slow_overlap: Arc<[AtomicUsize; 2]>,
 }
 impl Interface for EchoSvc {}
 impl IEcho2 for EchoSvc {
@@ -272,7 +284,13 @@ impl IEcho2 for EchoSvc {
     }
     fn slow(&self, ms: i32) -> Result<()> {
         self.slow_entered.store(true, Ordering::SeqCst);
+        let [in_flight, max_seen] = &*self.slow_overlap;
+        max_seen.fetch_max(
+            in_flight.fetch_add(1, Ordering::SeqCst) + 1,
+            Ordering::SeqCst,
+        );
         std::thread::sleep(Duration::from_millis(ms.max(0) as u64));
+        in_flight.fetch_sub(1, Ordering::SeqCst);
         Ok(())
     }
     fn roundtrip(&self, cb: &SIBinder) -> Result<String> {
@@ -393,6 +411,17 @@ fn make_service_with_slow_signal(
         deeper: false,
         slow_entered,
         held: Arc::new(Mutex::new(None)),
+        slow_overlap: Arc::default(),
+    }))))
+}
+/// `slow()` records into `overlap` how many calls ran at once (`[in flight, most seen]`).
+fn make_service_with_slow_overlap(overlap: Arc<[AtomicUsize; 2]>) -> SIBinder {
+    Interface::as_binder(&Binder::new(BnEcho2(Box::new(EchoSvc {
+        counter: Arc::new(AtomicI64::new(0)),
+        deeper: false,
+        slow_entered: Arc::new(AtomicBool::new(false)),
+        held: Arc::new(Mutex::new(None)),
+        slow_overlap: overlap,
     }))))
 }
 /// `hold()` parks the callback in `held`, for a test to drive from outside any handler.
@@ -402,6 +431,7 @@ fn make_service_with_hold(counter: Arc<AtomicI64>, held: Arc<Mutex<Option<SIBind
         deeper: false,
         slow_entered: Arc::new(AtomicBool::new(false)),
         held,
+        slow_overlap: Arc::default(),
     }))))
 }
 
@@ -482,6 +512,44 @@ fn tmp_sock(tag: &str) -> std::path::PathBuf {
             .as_nanos()
     ));
     p
+}
+
+/// Send a v1 outgoing attach header with `id` from no `RpcSession`; true if the server closes it.
+fn raw_attach_is_refused(path: &std::path::Path, id: &[u8]) -> bool {
+    use std::io::{Read, Write};
+    let mut s = std::os::unix::net::UnixStream::connect(path).expect("raw attach connect");
+    // `RpcConnectionHeader` v1: version, options, fd mode, reserved[8], sessionIdSize; `"cci"`.
+    let mut msg = 1u32.to_le_bytes().to_vec();
+    msg.extend_from_slice(&[0u8; 10]);
+    msg.extend_from_slice(&u16::try_from(id.len()).expect("id size").to_le_bytes());
+    msg.extend_from_slice(id);
+    msg.extend_from_slice(b"cci\0\0\0\0\0");
+    let _ = s.write_all(&msg);
+    s.set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("read timeout");
+    // An admitted attach waits for a request; a refused one is closed.
+    match s.read(&mut [0u8; 1]) {
+        Ok(0) => true,
+        Err(e) => e.kind() == std::io::ErrorKind::ConnectionReset,
+        Ok(_) => false,
+    }
+}
+
+/// An attach config whose connection's socket is also kept in `kept`, so a test can sever it.
+fn attach_keeping_socket<'a>(
+    path: &'a std::path::Path,
+    max_version: u32,
+    session_id: &'a [u8],
+    kept: &'a Mutex<Vec<std::os::unix::net::UnixStream>>,
+) -> RpcClientConfig<'a> {
+    RpcClientConfig::new(max_version, move || {
+        let stream = std::os::unix::net::UnixStream::connect(path)?;
+        kept.lock().unwrap().push(stream.try_clone()?);
+        let t = rsbinder::rpc::transport::UnixTransport::from_owned_fd(stream.into())
+            .map_err(StatusCode::from)?;
+        Ok(Box::new(t) as Box<dyn rsbinder::rpc::RpcTransport>)
+    })
+    .session_id(session_id)
 }
 
 /// Wait until a server socket file exists (bounded).
@@ -659,12 +727,15 @@ fn real_process_abstract_unix_socket_e2e() {
     assert_eq!(client.wire_protocol_version(), Some(2));
     assert_eq!(client.negotiate(8).expect("negotiate"), 3);
     let sid = client.get_session_id().expect("get_session_id");
-    let attached = RpcSession::setup_client_android13plus_with_config(
-        RpcClientConfig::unix_abstract(name.as_bytes(), 2).session_id(&sid),
-    )
-    .expect("attach abstract child session");
-    assert_eq!(attached.get_session_id().expect("attached id"), sid);
-    let root = EchoProxy(attached.get_root().expect("attached get_root"));
+    assert_eq!(
+        client
+            .add_outgoing_connection_with_config(
+                RpcClientConfig::unix_abstract(name.as_bytes(), 2).session_id(&sid),
+            )
+            .expect("attach to the abstract child session"),
+        2
+    );
+    let root = EchoProxy(client.get_root().expect("get_root"));
     assert_eq!(root.echo("abstract-process").unwrap(), "abstract-process");
 
     let fan = RpcSession::setup_client_android13plus_with_config(
@@ -672,6 +743,7 @@ fn real_process_abstract_unix_socket_e2e() {
     )
     .expect("abstract child fan-out");
     assert_eq!(fan.negotiated_max_threads(), 3);
+    assert_eq!(fan.__slot_count(), 3, "founding + 2 fan-out outgoing slots");
     let root = Arc::new(EchoProxy(fan.get_root().expect("fan get_root")));
     let t0 = std::time::Instant::now();
     let handles: Vec<_> = (0..3)
@@ -706,10 +778,11 @@ fn concurrent_calls_single_shared_session() {
     let client = RpcSession::setup_unix_client(&path).expect("connect");
     let root = Arc::new(EchoProxy(client.get_root().expect("get_root")));
 
-    let t0 = std::time::Instant::now();
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<()>(8);
     let mut handles = Vec::new();
     for t in 0..8 {
         let root = Arc::clone(&root);
+        let done_tx = done_tx.clone();
         handles.push(std::thread::spawn(move || {
             for i in 0..200 {
                 let msg = format!("shared-t{t}-i{i}");
@@ -719,16 +792,25 @@ fn concurrent_calls_single_shared_session() {
                     "reply cross-delivered / wire corrupted on shared session"
                 );
             }
+            let _ = done_tx.send(());
         }));
+    }
+    drop(done_tx);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    for _ in 0..8 {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match done_rx.recv_timeout(left) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("shared-session concurrency must make progress, not deadlock")
+            }
+            // A client thread panicked: its `join` below reports why.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
     }
     for h in handles {
         h.join().expect("client thread");
     }
-    assert!(
-        t0.elapsed() < Duration::from_secs(30),
-        "shared-session concurrency must make progress, not deadlock ({:?})",
-        t0.elapsed()
-    );
     // _cu handles teardown.
 }
 
@@ -1250,14 +1332,14 @@ fn abstract_unix_socket_e2e() {
 
     let sid = client.get_session_id().expect("get_session_id");
     let sid_arr: [u8; 32] = sid.as_slice().try_into().expect("32-byte session id");
-    let attached = RpcSession::setup_client_android13plus_with_config(
-        RpcClientConfig::unix_abstract(&a13_name, 2).session_id(&sid),
-    )
-    .expect("attach abstract android13plus");
-    assert_eq!(attached.get_session_id().expect("attached id"), sid);
+    client
+        .add_outgoing_connection_with_config(
+            RpcClientConfig::unix_abstract(&a13_name, 2).session_id(&sid),
+        )
+        .expect("attach abstract android13plus");
     assert!(
         poll_until(|| server.session_slot_count(&sid_arr) == Some(2)),
-        "abstract with_id attach shares the founding session"
+        "an abstract attach joins the founding session"
     );
 
     let fan_name = format!("rsb_rpc_abs_fan_{}", std::process::id()).into_bytes();
@@ -1459,53 +1541,34 @@ fn multi_connection_shared_session() {
     let sid1 = c1.get_session_id().expect("get_session_id #1");
     assert_eq!(sid1.len(), 32, "AOSP kSessionIdBytes");
 
-    // --- client #2: echo #1's id ⇒ server ATTACHES it to #1's SharedSession.
-    let c2 = RpcSession::setup_client_android13plus_with_config(
-        RpcClientConfig::unix(&path, 1).session_id(&sid1),
-    )
-    .expect("a13+ connect #2 (attach)");
-    let sid2 = c2.get_session_id().expect("get_session_id #2");
-    assert_eq!(
-        sid2, sid1,
-        "attached connection speaks the SAME SharedSession \
-         (mutant — fresh-session-on-found — flips this)"
-    );
+    // --- connection #2: echoes #1's id ⇒ ATTACHED to #1's SharedSession; see module doc.
+    let kept = Mutex::new(Vec::new());
+    c1.add_outgoing_connection_with_config(attach_keeping_socket(&path, 1, &sid1, &kept))
+        .expect("a13+ connection #2 (attach)");
     assert!(
         poll_until(|| server.attached_count() == 1),
         "echoed-id connection took the id-demux ATTACH path"
     );
     assert_eq!(server.rejected_unknown_id_count(), 0, "no false reject");
-    // The attached connection is fully functional.
-    let root2 = EchoProxy(c2.get_root().expect("get_root #2"));
-    assert_eq!(root2.echo("a0b-2").unwrap(), "a0b-2");
 
-    // --- client #3: an unknown 32-byte id ⇒ no live session ⇒ reject.
+    // --- an unknown id ⇒ reject; raw, since an `RpcSession` refuses any id but its own.
     let bogus = [0xABu8; 32];
     assert_ne!(
         &bogus[..],
         &sid1[..],
         "bogus id differs from the minted one"
     );
-    // Exactly `DeadObject` (socket close → `EndOfStream`); no deadline is armed, so no `TimedOut`.
-    let err = RpcSession::setup_client_android13plus_with_config(
-        RpcClientConfig::unix(&path, 1).session_id(&bogus),
-    )
-    .err()
-    .expect("unknown id rejected");
-    assert_eq!(
-        err,
-        StatusCode::DeadObject,
-        "unknown id reject must surface as DeadObject (the EndOfStream path)"
-    );
+    assert!(raw_attach_is_refused(&path, &bogus), "unknown id rejected");
     assert!(
         poll_until(|| server.rejected_unknown_id_count() == 1),
         "unknown id ⇒ rejected as UNKNOWN"
     );
     assert_eq!(server.attached_count(), 1, "attach count stable");
 
-    // Sever only #2; `root2` first, as a proxy holds its session (AOSP `sp<>` in `BpBinder`).
-    drop(root2);
-    drop(c2);
+    // Sever only #2.
+    kept.lock().unwrap()[0]
+        .shutdown(std::net::Shutdown::Both)
+        .expect("sever connection #2");
     // One connection's loss ends the shared session (plan 2-24 D1, AOSP `handleRpcError`).
     let sid1_arr: [u8; 32] = sid1
         .as_slice()
@@ -1558,12 +1621,9 @@ fn ac_12_f8_attach_unifies_to_single_inner() {
     );
 
     // Attached connection (#2): echoing #1's id adds a *slot* to the founding inner.
-    let c2 = RpcSession::setup_client_android13plus_with_config(
-        RpcClientConfig::unix(&path, 1).session_id(&sid),
-    )
-    .expect("a13+ #2 (attach)");
-    // No `_` prefix: the explicit `drop(root2)` below ends connection #2.
-    let root2 = EchoProxy(c2.get_root().expect("get_root #2"));
+    let kept = Mutex::new(Vec::new());
+    c1.add_outgoing_connection_with_config(attach_keeping_socket(&path, 1, &sid, &kept))
+        .expect("a13+ #2 (attach)");
     assert!(
         poll_until(|| server.attached_count() == 1),
         "echo-id connection took the id-demux ATTACH path"
@@ -1576,8 +1636,9 @@ fn ac_12_f8_attach_unifies_to_single_inner() {
     );
 
     // One connection's end ends the one inner: its pool empties, the founding slot with it.
-    drop(root2);
-    drop(c2);
+    kept.lock().unwrap()[0]
+        .shutdown(std::net::Shutdown::Both)
+        .expect("sever connection #2");
     assert!(
         poll_until(|| matches!(server.session_slot_count(&sid_arr), None | Some(0))),
         "the session's end empties the founding inner's pool"
@@ -1608,28 +1669,18 @@ fn ac_12_4_set_max_threads_caps_incoming_slots() {
         .as_slice()
         .try_into()
         .expect("32-byte session id (AOSP kSessionIdBytes)");
-    let c2 = RpcSession::setup_client_android13plus_with_config(
-        RpcClientConfig::unix(&path, 1).session_id(&sid),
-    )
-    .expect("a13+ #2 (attach within cap)");
-    let _r2 = EchoProxy(c2.get_root().expect("get_root #2"));
+    c1.add_outgoing_connection_with_config(RpcClientConfig::unix(&path, 1).session_id(&sid))
+        .expect("a13+ #2 (attach within cap)");
     assert!(
         poll_until(|| server.session_slot_count(&sid_arr) == Some(2)),
         "2 slots after founding + attached (cap = 2)"
     );
     let rejected_before = server.rejected_unknown_id_count();
 
-    // A valid id past the cap: only the attach's `GET_SESSION_ID` confirmation can see it.
-    let err = RpcSession::setup_client_android13plus_with_config(
-        RpcClientConfig::unix(&path, 1).session_id(&sid),
-    )
-    .err()
-    .expect("3rd attach must be rejected by the per-session cap");
-    assert_eq!(
-        err,
-        StatusCode::DeadObject,
-        "cap-reject surfaces as the same status as the unknown-id reject \
-         (post-handshake socket close)"
+    // A valid id past the cap, sent raw: #1's own attach would end #1's session at the refusal.
+    assert!(
+        raw_attach_is_refused(&path, &sid),
+        "3rd attach must be rejected by the per-session cap"
     );
     assert!(
         poll_until(|| server.rejected_unknown_id_count() == rejected_before + 1),
@@ -1851,24 +1902,65 @@ fn attach_with_a_bogus_session_id_is_refused_at_attach_time() {
         h.join().expect("client thread");
     }
 
-    // (c) Plain garbage: a close past the header may be a refusal that ended the server's session.
-    assert!(
-        client
-            .add_outgoing_connection_with_config(
-                RpcClientConfig::unix(&path, 1).session_id(&[0xABu8; 32])
-            )
-            .is_err(),
+    // (c) Plain garbage is not this session's id either: refused before connecting.
+    assert_eq!(
+        client.add_outgoing_connection_with_config(
+            RpcClientConfig::unix(&path, 1).session_id(&[0xABu8; 32])
+        ),
+        Err(StatusCode::BadValue),
         "attaching with an unknown id must fail here, not later"
     );
     assert_eq!(
         client.__slot_count(),
+        2,
+        "the refused attach left the session up"
+    );
+    assert_eq!(
+        server.rejected_unknown_id_count(),
         0,
-        "the refused attach ended the session"
+        "the server never saw it"
     );
-    assert!(
-        poll_until(|| server.rejected_unknown_id_count() == 1),
-        "server counted exactly the one unknown-id reject"
+}
+
+/// An attach naming another session's server id is `BadValue` before connecting; see module doc.
+#[test]
+fn an_attach_with_another_sessions_id_is_refused_before_connecting() {
+    let path = tmp_sock("foreignid");
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    server.set_android13plus(1);
+    // Room for the attach, so only the client-side check can refuse it.
+    server.set_max_threads(2);
+    server
+        .set_root(make_service(Arc::new(AtomicI64::new(0))))
+        .expect("set_root");
+    let bg = server.run_background();
+    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
+    wait_for_sock(&path);
+
+    let c1 = RpcSession::setup_unix_client_android13plus(&path, 1).expect("connect #1");
+    let sid1 = c1.get_session_id().expect("get_session_id #1");
+    let sid1_arr: [u8; 32] = sid1.as_slice().try_into().expect("32-byte session id");
+    // `c3` never read its own id: the check fetches it rather than trust the caller's.
+    let c3 = RpcSession::setup_unix_client_android13plus(&path, 1).expect("connect #3");
+    assert_eq!(
+        c3.add_outgoing_connection_with_config(RpcClientConfig::unix(&path, 1).session_id(&sid1)),
+        Err(StatusCode::BadValue),
+        "c3's connection must not join c1's server session"
     );
+    assert_eq!(
+        c3.add_incoming_connection_with_config(RpcClientConfig::unix(&path, 1).session_id(&sid1)),
+        Err(StatusCode::BadValue)
+    );
+    assert_eq!(
+        server.attached_count(),
+        0,
+        "no refused attach reached the server"
+    );
+    assert_eq!(server.session_slot_count(&sid1_arr), Some(1));
+    let root3 = EchoProxy(c3.get_root().expect("c3 goes on"));
+    assert_eq!(root3.echo("own session").unwrap(), "own session");
+    let root1 = EchoProxy(c1.get_root().expect("c1 goes on"));
+    assert_eq!(root1.echo("other session").unwrap(), "other session");
 }
 
 /// A valid id attached past the server's `set_max_threads` cap also fails at attach time.
@@ -1974,10 +2066,11 @@ fn r34_server_reports_an_android13plus_client_as_a_dead_peer() {
     }
 }
 
-/// A refused standalone attach session (`RpcClientConfig::session_id`) fails in the constructor.
+/// A session id on an entry that builds a new `RpcSession` is `BadValue`; see module doc.
 #[test]
-fn standalone_attach_session_with_a_bogus_id_fails_to_build() {
-    let path = tmp_sock("standalone");
+#[allow(deprecated)] // Pins the deprecated id-taking entries' refusal too.
+fn a_new_session_setup_refuses_a_session_id() {
+    let path = tmp_sock("newid");
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
     server.set_max_threads(3);
@@ -1990,20 +2083,45 @@ fn standalone_attach_session_with_a_bogus_id_fails_to_build() {
 
     let founding = RpcSession::setup_unix_client_android13plus(&path, 1).expect("connect");
     let sid = founding.get_session_id().expect("get_session_id");
-    assert!(
+    let sid_arr: [u8; 32] = sid.as_slice().try_into().expect("32-byte session id");
+    assert_eq!(
         RpcSession::setup_client_android13plus_with_config(
-            RpcClientConfig::unix(&path, 1).session_id(&[0xCDu8; 32])
+            RpcClientConfig::unix(&path, 1).session_id(&sid)
         )
-        .is_err(),
-        "an unknown id must not yield a session object"
+        .err(),
+        Some(StatusCode::BadValue),
+        "the server-minted id must not build a second client session on the server's session"
     );
-    // Control: the real id builds a usable second handle on the same server-side session.
-    let attached = RpcSession::setup_client_android13plus_with_config(
-        RpcClientConfig::unix(&path, 1).session_id(&sid),
-    )
-    .expect("attach session with the server-minted id");
-    let root = EchoProxy(attached.get_root().expect("get_root"));
-    assert_eq!(root.echo("standalone").unwrap(), "standalone");
+    assert_eq!(
+        RpcSession::setup_unix_client_android13plus_with_id(&path, 1, &sid).err(),
+        Some(StatusCode::BadValue)
+    );
+    let t = rsbinder::rpc::transport::UnixTransport::connect(&path).expect("connect");
+    assert_eq!(
+        RpcSession::connect_android13plus_fd_with_id(
+            Box::new(t),
+            1,
+            rsbinder::rpc::FileDescriptorTransportMode::None,
+            &sid
+        )
+        .err(),
+        Some(StatusCode::BadValue)
+    );
+    assert_eq!(
+        server.attached_count(),
+        0,
+        "no refused entry reached the server"
+    );
+    assert_eq!(server.session_slot_count(&sid_arr), Some(1));
+    // Control: a connection is added to a session through that session.
+    assert_eq!(
+        founding
+            .add_outgoing_connection_with_config(RpcClientConfig::unix(&path, 1).session_id(&sid))
+            .expect("attach with the server-minted id"),
+        2
+    );
+    let root = EchoProxy(founding.get_root().expect("get_root"));
+    assert_eq!(root.echo("one session").unwrap(), "one session");
 }
 
 /// An attach parked at the shutdown probe while `stop_accepting` runs is refused; see module doc.
@@ -2046,14 +2164,9 @@ fn shutdown_gate_e2e_rejects_attach_during_handshake_stall() {
     // Off-thread: the attach blocks on the parked worker.
     let attach_path = path.clone();
     let attach_sid = sid.clone();
-    let attach_handle = std::thread::spawn(move || -> std::result::Result<(), StatusCode> {
-        // The attach's `GET_SESSION_ID` confirmation sees the reject; either step may fail.
-        let c2 = RpcSession::setup_client_android13plus_with_config(
-            RpcClientConfig::unix(&attach_path, 1).session_id(&attach_sid),
-        )?;
-        c2.set_timeout(Some(Duration::from_secs(3)));
-        c2.get_root().map(|_| ())
-    });
+    // Raw: #1's own attach would end #1's session at the refusal, leaving nothing to count.
+    let attach_handle =
+        std::thread::spawn(move || raw_attach_is_refused(&attach_path, &attach_sid));
 
     // Wait for the attach worker to reach the barrier.
     hs_done_rx
@@ -2066,15 +2179,11 @@ fn shutdown_gate_e2e_rejects_attach_during_handshake_stall() {
     // The released worker re-reads `shutdown` and rejects (drops the transport).
     let _ = release_tx.send(());
 
-    let attach_result = attach_handle
-        .join()
-        .expect("attach thread should not panic");
-    let err = attach_result.expect_err("attach during shutdown must be rejected (mutant: success)");
-    assert_eq!(
-        err,
-        StatusCode::DeadObject,
-        "shutdown-reject surfaces as the same status as the cap/unknown-id reject \
-         (post-handshake socket close)"
+    assert!(
+        attach_handle
+            .join()
+            .expect("attach thread should not panic"),
+        "attach during shutdown must be rejected (mutant: success)"
     );
     assert!(
         poll_until(|| server.rejected_unknown_id_count() == rejected_before + 1),
@@ -2088,66 +2197,6 @@ fn shutdown_gate_e2e_rejects_attach_during_handshake_stall() {
         Some(1),
         "shutdown-rejected attach did not enqueue a slot (mutant: would reach Some(2))"
     );
-}
-
-/// Two attached clients' proxies to one root: the node outlives the first drop; see module doc.
-#[test]
-fn shared_node_survives_sibling_proxy_drop() {
-    let path = tmp_sock("f7");
-    let counter = Arc::new(AtomicI64::new(0));
-    let server = RpcServer::setup_unix_server(&path).expect("bind");
-    server.set_android13plus(1);
-    // Opt into 2 incoming slots (founding + attached).
-    server.set_max_threads(2);
-    server
-        .set_root(make_service(counter.clone()))
-        .expect("set_root");
-    let bg = server.run_background();
-    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
-    wait_for_sock(&path);
-
-    // c2 echoes c1's id: both are connections of ONE server session (shared RpcState).
-    let c1 = RpcSession::setup_unix_client_android13plus(&path, 1).expect("connect #1");
-    let sid1 = c1.get_session_id().expect("session id");
-    let c2 = RpcSession::setup_client_android13plus_with_config(
-        RpcClientConfig::unix(&path, 1).session_id(&sid1),
-    )
-    .expect("connect #2 (attach)");
-    assert!(
-        poll_until(|| server.attached_count() == 1),
-        "c2 attached to c1's shared session"
-    );
-
-    // The root is sent twice ⇒ strong = 2 (timesSent), one proxy per client, no excess.
-    let root1 = EchoProxy(c1.get_root().expect("get_root #1"));
-    let root2 = EchoProxy(c2.get_root().expect("get_root #2"));
-    assert_eq!(root1.echo("f7-1").unwrap(), "f7-1");
-    assert_eq!(root2.echo("f7-2").unwrap(), "f7-2");
-
-    // c1 stays open to carry the DEC_STRONG; a round-trip on c1 orders it before the probe.
-    drop(root1);
-    let _ = c1
-        .get_session_id()
-        .expect("c1 still alive (ordering barrier)");
-
-    // The shared node survives the sibling's DEC (strong 2→1).
-    assert_eq!(
-        root2.echo("f7-after-sibling-drop").unwrap(),
-        "f7-after-sibling-drop",
-        "a shared node must outlive one connection's proxy DEC"
-    );
-
-    // Probed while both connections are open (the registry `Weak` upgrades): 0 live nodes.
-    drop(root2);
-    let _ = c2.get_session_id().expect("c2 ordering barrier");
-    assert!(
-        poll_until(|| server.live_session_node_count() == 0),
-        "no leak: shared root node freed after all proxies dropped"
-    );
-
-    drop(c1);
-    drop(c2);
-    // _cu handles teardown.
 }
 
 /// A duplicate receipt of one binder sends an excess `DEC_STRONG` (AOSP `flushExcessBinderRefs`).
@@ -2191,7 +2240,7 @@ fn excess_receipt_no_leak_single_client() {
     // _cu handles teardown.
 }
 
-/// Two `slow(150)` on a 2-slot pool finish under 380 ms; see module doc "Mutation gates".
+/// Two `slow(150)` on a 2-slot pool run at once; see module doc "Mutation gates".
 #[test]
 fn pool_distributes_concurrent_calls_across_outgoing_slots() {
     let path = tmp_sock("a1pool");
@@ -2199,8 +2248,9 @@ fn pool_distributes_concurrent_calls_across_outgoing_slots() {
     server.set_android13plus(1);
     // Founding + one attach = 2 incoming slots; the default cap of 1 would reject the attach.
     server.set_max_threads(2);
+    let overlap: Arc<[AtomicUsize; 2]> = Arc::default();
     server
-        .set_root(make_service(Arc::new(AtomicI64::new(0))))
+        .set_root(make_service_with_slow_overlap(Arc::clone(&overlap)))
         .expect("set_root");
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
@@ -2227,12 +2277,17 @@ fn pool_distributes_concurrent_calls_across_outgoing_slots() {
         h.join().expect("thread");
     }
     let elapsed = t0.elapsed();
-    // Parallel ≈ 150 ms; serialized ≥ 300 ms; 380 absorbs a loaded scheduler's overhead.
+    assert_eq!(
+        overlap[1].load(Ordering::SeqCst),
+        2,
+        "AC-12.1: 2 concurrent slow(150) on a 2-slot pool must overlap; \
+         a serialized path never has more than one in flight"
+    );
+    // Parallel ≈ 150 ms; the bound catches a stall, the overlap count above a serial run.
     assert!(
         elapsed < Duration::from_millis(380),
         "AC-12.1: 2 concurrent slow(150) on a 2-slot pool must run in \
-         parallel (≈150 ms), got {elapsed:?}. Pre-pool / serialized \
-         path would be ≈300 ms + overhead — that's the mutant signature."
+         parallel (≈150 ms), got {elapsed:?}."
     );
 
     drop(root);
@@ -2248,8 +2303,9 @@ fn pool_exhausted_third_caller_waits_for_a_free_slot() {
     server.set_android13plus(1);
     // 2 incoming slots (founding + attached); 3 client threads observe the cv-wait band.
     server.set_max_threads(2);
+    let overlap: Arc<[AtomicUsize; 2]> = Arc::default();
     server
-        .set_root(make_service(Arc::new(AtomicI64::new(0))))
+        .set_root(make_service_with_slow_overlap(Arc::clone(&overlap)))
         .expect("set_root");
     let bg = server.run_background();
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
@@ -2278,12 +2334,58 @@ fn pool_exhausted_third_caller_waits_for_a_free_slot() {
         h.join().expect("thread");
     }
     let elapsed = t0.elapsed();
-    // Two waves ≈ 400 ms; < 380 is one wave (no wait); > 700 is a stall.
+    assert_eq!(
+        overlap[1].load(Ordering::SeqCst),
+        2,
+        "AC-12.1: the first wave runs 2 at once on 2 slots; a serial mutant has 1"
+    );
+    // Two waves ≈ 400 ms; > 700 is a stall.
     assert!(
         elapsed >= Duration::from_millis(380) && elapsed < Duration::from_millis(700),
         "AC-12.1 cv-wait: 3 concurrent slow(200) on 2 slots should be \
-         2 parallel waves ≈ 400 ms (got {elapsed:?}); mutant (serial) is ≈600 ms"
+         2 parallel waves ≈ 400 ms (got {elapsed:?})"
     );
+
+    drop(root);
+    drop(c);
+    // _cu handles teardown.
+}
+
+/// `set_timeout(Some(Duration::MAX))`: the pool-exhausted wait must not overflow, but wait.
+#[test]
+fn pool_exhausted_wait_with_unrepresentable_deadline_waits_for_the_slot() {
+    let path = tmp_sock("a1max");
+    let slow_entered = Arc::new(AtomicBool::new(false));
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    server.set_android13plus(1);
+    server
+        .set_root(make_service_with_slow_signal(
+            Arc::new(AtomicI64::new(0)),
+            Arc::clone(&slow_entered),
+        ))
+        .expect("set_root");
+    let bg = server.run_background();
+    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
+    wait_for_sock(&path);
+
+    // One `Outgoing` slot: while the parker drives it, the next caller reaches the (4) wait.
+    let c = RpcSession::setup_unix_client_android13plus(&path, 1).expect("connect");
+    c.set_timeout(Some(Duration::MAX));
+    let root = Arc::new(EchoProxy(c.get_root().expect("get_root")));
+
+    let parked = Arc::clone(&root);
+    let parker = std::thread::spawn(move || parked.slow(300).expect("parker slow"));
+    assert!(
+        poll_until(|| slow_entered.load(Ordering::SeqCst)),
+        "parker failed to enter server-side slow() within budget"
+    );
+
+    assert_eq!(
+        root.echo("max-deadline")
+            .expect("waits for the parker's slot"),
+        "max-deadline"
+    );
+    parker.join().expect("parker thread");
 
     drop(root);
     drop(c);
@@ -4187,8 +4289,52 @@ fn a_unix_server_refuses_a_path_another_server_listens_on() {
     assert!(!path.exists(), "the first server removes its own socket");
 }
 
+/// A live listener with a full backlog is refused at once, not waited on (Linux `EAGAIN`).
+#[test]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn a_unix_server_refuses_a_live_listener_with_a_full_backlog() {
+    use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+    let path = tmp_sock("fullq");
+    let addr = SocketAddrUnix::new(&path).expect("addr");
+    let listener = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+    rustix::net::bind(&listener, &addr).expect("bind");
+    rustix::net::listen(&listener, 0).expect("listen");
+    // Never accepted: queue clients until the kernel reports the backlog full.
+    let mut queued = Vec::new();
+    loop {
+        let flags = SocketFlags::NONBLOCK | SocketFlags::CLOEXEC;
+        let c =
+            rustix::net::socket_with(AddressFamily::UNIX, SocketType::STREAM, flags, None).unwrap();
+        match rustix::net::connect(&c, &addr) {
+            Ok(()) => queued.push(c),
+            Err(rustix::io::Errno::AGAIN) => break,
+            Err(e) => panic!("filling the backlog: {e}"),
+        }
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let probe_path = path.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(RpcServer::setup_unix_server(&probe_path).err());
+    });
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("setup_unix_server must not wait for the backlog to drain"),
+        Some(StatusCode::Errno(
+            -(rustix::io::Errno::ADDRINUSE.raw_os_error())
+        ))
+    );
+    assert!(
+        path.exists(),
+        "the live listener's socket must be untouched"
+    );
+    drop(queued);
+    drop(listener);
+    let _ = std::fs::remove_file(&path);
+}
+
 /// A socket nobody listens on is what a crashed server leaves; it is replaced.
 #[test]
+#[cfg(not(target_vendor = "apple"))]
 fn a_unix_server_replaces_a_stale_socket() {
     let path = tmp_sock("stale");
     drop(std::os::unix::net::UnixListener::bind(&path).expect("bind"));
@@ -4196,6 +4342,23 @@ fn a_unix_server_replaces_a_stale_socket() {
     let server = RpcServer::setup_unix_server(&path).expect("a stale socket is replaced");
     drop(server);
     assert!(!path.exists());
+}
+
+/// Apple keeps every socket at the path (AOSP): XNU refuses a full backlog as it does a stale one.
+#[test]
+#[cfg(target_vendor = "apple")]
+fn a_unix_server_keeps_an_existing_socket_on_apple() {
+    let path = tmp_sock("stale_apple");
+    drop(std::os::unix::net::UnixListener::bind(&path).expect("bind"));
+    let left = file_id(&path);
+    assert_eq!(
+        RpcServer::setup_unix_server(&path).err(),
+        Some(StatusCode::Errno(
+            -(rustix::io::Errno::ADDRINUSE.raw_os_error())
+        ))
+    );
+    assert_eq!(file_id(&path), left, "the socket file must be untouched");
+    let _ = std::fs::remove_file(&path);
 }
 
 /// Dropping a server whose path was taken over since does not delete the successor's socket.

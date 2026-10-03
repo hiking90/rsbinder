@@ -251,7 +251,7 @@ mod tests {
                 quote! { struct Bad { tags: Option<Vec<String>> } },
                 "a nullable parcelable field array",
             ),
-            // A fixed-size `in` array keeps them bare; a field's does not.
+            // Fixed-size or not, a nullable field array wraps its elements.
             (
                 quote! { struct Bad { slots: Option<[String; 3]> } },
                 "a nullable parcelable field array",

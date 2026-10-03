@@ -124,7 +124,7 @@
 //!   kept its session (rsbinder, libbinder up to `android-16.0.0_r2`), so a failure before the
 //!   whole header went out leaves the session up and every later one ends it, a close
 //!   included. The attach's own inconsistencies (a `max_version` below the session's, a
-//!   transport unlike the founding one, the client-local `session_id()` as the id) are
+//!   transport unlike the founding one, an id other than the session's server-minted one) are
 //!   refused before the header for that reason. The vector is private to `SlotPool` (child module
 //!   `slot_pool`), which removes slots only by `unpush_retired`, `retire`'s, and
 //!   `clear_at_session_end`, `on_session_dead`'s.
@@ -255,6 +255,12 @@
 //! the session, a close included ("Slot pool" "Leaving"). The incoming (callback)
 //! direction needs no probe: the server writes `"cci"` after admitting it (plan 2-20), so a
 //! client that fails once the server may hold it ends the session ("Slot pool" "Leaving").
+//!
+//! Both directions echo only the session's own server-minted id, which the client keeps from
+//! its first `get_session_id` (AOSP `setupClient` attaches with its own `mId`). Any other id is
+//! `BadValue` before the connect: another session's id would add this session's connection
+//! to a server session it did not found, splitting one server session across two client
+//! states with separate oneway numbering, binder addresses and lifetimes.
 //!
 //! # One inner per session
 //!
@@ -799,10 +805,9 @@ struct AttachParts<'a> {
 /// single-connection [`RpcSession::connect_android13plus`] on the first
 /// transport, byte for byte.
 ///
-/// `session_id` is mutually exclusive with both `outgoing_connections > 1`
-/// and `incoming_connections > 0` (attaching joins a session someone else
-/// owns; growing the pool is the owner's business) — the consuming setup
-/// call rejects the combination with `BadValue`.
+/// `session_id` belongs to the manual attach calls below; the setup call
+/// refuses a non-empty one with `BadValue` (see
+/// [`session_id`](Self::session_id)).
 ///
 /// # Manual attach
 ///
@@ -815,7 +820,10 @@ struct AttachParts<'a> {
 /// settings were fixed when it was founded. A config that asks for more
 /// than one connection or sets something session-wide is
 /// [`StatusCode::BadValue`]; `fd_mode` may restate the mode the session
-/// negotiated and nothing else.
+/// negotiated and nothing else. `session_id` must be that session's own
+/// server-minted id ([`RpcSession::get_session_id`]); any other id is
+/// `BadValue` too, because attaching a connection to another server
+/// session would split one server session across two client states.
 pub struct RpcClientConfig<'a> {
     source: ClientSource<'a>,
     max_version: u32,
@@ -939,9 +947,23 @@ impl<'a> RpcClientConfig<'a> {
         Self::with_source(ClientSource::Custom(Box::new(connect)), max_version)
     }
 
-    /// Attach to an existing server session by echoing its 32-byte id
-    /// (AOSP `RpcSession::setupClient` follow-up connections). Empty
-    /// (the default) requests a brand-new session.
+    /// The server-minted 32-byte session id a manual attach echoes
+    /// ([`add_outgoing_connection_with_config`](RpcSession::add_outgoing_connection_with_config),
+    /// [`add_incoming_connection_with_config`](RpcSession::add_incoming_connection_with_config),
+    /// which require it): AOSP `RpcSession::setupClient` follow-up
+    /// connections, read from
+    /// [`get_session_id`](RpcSession::get_session_id) on the session they
+    /// join. Default empty. The attach calls refuse any other id with
+    /// [`StatusCode::BadValue`] before connecting, for the same reason as
+    /// below.
+    ///
+    /// [`RpcSession::setup_client_android13plus_with_config`] refuses a
+    /// non-empty id with [`StatusCode::BadValue`]: it builds a new
+    /// `RpcSession`, which would then share one server session with the
+    /// `RpcSession` that founded it while keeping its own oneway
+    /// numbering, binder addresses and lifetime (see
+    /// [`connect_android13plus_fd_with_id`](RpcSession::connect_android13plus_fd_with_id)).
+    /// AOSP has no public entry that does this.
     pub fn session_id(mut self, session_id: &'a [u8]) -> Self {
         self.session_id = session_id;
         self
@@ -985,9 +1007,7 @@ impl<'a> RpcClientConfig<'a> {
     /// no-op, and an incoming thread that exits without a session
     /// shutdown aborts the process.)
     ///
-    /// Requires the android-13+ profile (a session id), so it cannot be
-    /// combined with [`session_id`](Self::session_id) (attaching to a
-    /// session you do not own). Bounded on the server by twice its
+    /// Requires the android-13+ profile (a session id). Bounded on the server by twice its
     /// `RpcServer::set_max_threads` value. Default 0. The threads end
     /// when the server closes the session or on
     /// [`RpcSession::close_session`]; dropping the `RpcSession` handle alone
@@ -1308,7 +1328,7 @@ fn confirm_attach(
     }
 }
 
-/// Explain a failed attach; both attach entries share it so the diagnosis cannot drift.
+/// Explain a failed outgoing attach probe; module doc "Attach confirmation".
 fn log_attach_refused(e: &RpcError) {
     if matches!(
         e,
@@ -1322,33 +1342,44 @@ fn log_attach_refused(e: &RpcError) {
         return;
     }
     log::error!(
-        "android-13+ RPC: the peer refused this attach ({e}) — the session id is unknown or \
-         stale, the peer's outgoing-slot cap (`set_max_threads`) is spent, or it is shutting \
-         down. The id must be the server-minted one from `RpcSession::get_session_id()` (NOT \
-         `session_id()`, which is a client-local value), and the connection count must stay \
-         within `RpcSession::negotiate()`"
+        "android-13+ RPC: the peer refused this attach ({e}) — it no longer knows this \
+         session, its outgoing-slot cap (`set_max_threads`) is spent, or it is shutting down. \
+         Keep the connection count within `RpcSession::negotiate()`"
     );
 }
 
-/// Map a client handshake failure to `StatusCode`; a new session first logs the likely r34 cause.
-fn client_handshake_err(e: RpcError, requesting_new_session: bool) -> StatusCode {
-    if requesting_new_session {
-        match &e {
-            RpcError::EndOfStream => log::error!(
-                "rsbinder RPC: the android-13+ handshake failed at the transport ({e}) after \
+/// Refuse an id on an entry that builds a new `RpcSession`; see `RpcClientConfig::session_id`.
+fn refuse_id_on_new_session(session_id: &[u8], what: &str) -> Result<()> {
+    if session_id.is_empty() {
+        return Ok(());
+    }
+    log::error!(
+        "{what}: a session id would build a second client RpcSession on a server session \
+         another RpcSession founded, with its own oneway numbering, binder addresses and \
+         lifetime; add the connection with `add_outgoing_connection_with_config` on that \
+         RpcSession instead"
+    );
+    Err(StatusCode::BadValue)
+}
+
+/// Map a new-session client handshake failure to `StatusCode`, first logging the likely r34 cause.
+fn client_handshake_err(e: RpcError) -> StatusCode {
+    match &e {
+        RpcError::EndOfStream => log::error!(
+            "rsbinder RPC: the android-13+ handshake failed at the transport ({e}) after \
                  the peer accepted the connection — it may be speaking the r34 (default) \
                  profile. Connect without `?profile=android13plus`, or enable the android-13+ \
                  wire on the server (`RpcServer::set_android13plus`)"
-            ),
-            RpcError::Truncated => log::error!(
-                "rsbinder RPC: the android-13+ handshake failed part-way through a response \
+        ),
+        RpcError::Truncated => log::error!(
+            "rsbinder RPC: the android-13+ handshake failed part-way through a response \
                  ({e}) — the peer closed mid-frame; it may be speaking the r34 (default) \
                  profile. Connect without \
                  `?profile=android13plus`, or enable the android-13+ wire on the server \
                  (`RpcServer::set_android13plus`)"
-            ),
-            RpcError::Timeout | RpcError::DeadlineMidFrame => log::error!(
-                "rsbinder RPC: the android-13+ handshake stalled and a read deadline armed on \
+        ),
+        RpcError::Timeout | RpcError::DeadlineMidFrame => log::error!(
+            "rsbinder RPC: the android-13+ handshake stalled and a read deadline armed on \
                  this connection elapsed — that deadline is the caller's own \
                  (`RpcClientConfig::timeout` / `ClientOptions::timeout` or their deprecated \
                  `handshake_timeout`, \
@@ -1356,15 +1387,14 @@ fn client_handshake_err(e: RpcError, requesting_new_session: bool) -> StatusCode
                  directly), so it may simply be shorter than this peer's legitimate response \
                  time. A peer that should have answered well within it may be speaking the \
                  r34 (default) profile instead"
-            ),
-            // The returned status drops the reason string; this log is the only description.
-            RpcError::Protocol(_) => log::error!(
-                "rsbinder RPC: the android-13+ handshake failed ({e}) — either the peer's \
+        ),
+        // The returned status drops the reason string; this log is the only description.
+        RpcError::Protocol(_) => log::error!(
+            "rsbinder RPC: the android-13+ handshake failed ({e}) — either the peer's \
                  answer violated the wire or the caller offered a `max_version` this build \
                  does not implement"
-            ),
-            _ => {}
-        }
+        ),
+        _ => {}
     }
     StatusCode::from(e)
 }
@@ -1777,6 +1807,8 @@ pub(crate) struct SharedSession {
     fd_unix_supported: AtomicBool,
     /// `GET_SESSION_ID`'s random id: AOSP `kSessionIdBytes == 32`, libbinder refuses other sizes.
     rpc_session_id: RpcSessionId,
+    /// Client role: the server-minted id from the first `get_session_id`; attaches must echo it.
+    server_session_id: Mutex<Option<Vec<u8>>>,
     /// `Live(n)`/`Dying`/`Dead`; `Dying` reads as torn down before the obituaries (module doc).
     lifecycle: SessionLifecycle,
     /// Set by `close` before the shutdown, so every later loop end is `EndedBy::Local`; sticky.
@@ -1955,7 +1987,7 @@ impl RpcSessionInner {
     /// Shared body of the `find_conn` family; see module doc "Connection selection".
     fn find_conn_impl(&self, use_: ConnUse) -> Result<ConnGuard<'_>> {
         // The scan is `Outgoing`-only for every use: module doc "Connection selection".
-        let mut wait_until: Option<Instant> = None;
+        let mut wait_until: Option<Option<Instant>> = None;
         let tid = current_tid();
         let sess_ptr = self as *const RpcSessionInner as usize;
         // (1) Reentrant pin, innermost first; a serve-driven slot also needs `allow_nested`.
@@ -2043,10 +2075,13 @@ impl RpcSessionInner {
             }
             // (4) Pool exhausted: wait under the session deadline; only the peer frees serve slots.
             let deadline = *self.shared.timeout.lock().expect("timeout poisoned");
-            st = match deadline {
-                Some(d) => {
-                    // Absolute: unrelated `slot_cv` wakes would re-arm a per-wake deadline.
-                    let at = *wait_until.get_or_insert_with(|| Instant::now() + d);
+            // Absolute: unrelated `slot_cv` wakes would re-arm a per-wake deadline.
+            let at = deadline.and_then(|d| {
+                // `None` inside: past what an `Instant` holds, so wait without a deadline.
+                *wait_until.get_or_insert_with(|| Instant::now().checked_add(d))
+            });
+            st = match (deadline, at) {
+                (Some(d), Some(at)) => {
                     let remaining = at.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         log::warn!(
@@ -2062,7 +2097,7 @@ impl RpcSessionInner {
                         .expect("slot_cv poisoned")
                         .0
                 }
-                None => self.slot_cv.wait(st).expect("slot_cv poisoned"),
+                _ => self.slot_cv.wait(st).expect("slot_cv poisoned"),
             };
         }
     }
@@ -2974,7 +3009,7 @@ impl RpcSessionInner {
                     return Err(StatusCode::BadValue);
                 }
                 took.leaving.push(leaving);
-            } else if addr.is_zero() || addr.space_tag() == self.shared.space.tag() {
+            } else if addr.is_zero() || addr.minted_by(self.shared.space) {
                 log::error!("RPC: a copied binder names no node of this session: {addr:?}");
                 return Err(StatusCode::BadValue);
             } else if let Some(proxy) = st.lookup_remote(addr) {
@@ -3620,7 +3655,7 @@ impl RpcSessionInner {
         match result {
             Ok(()) => self.send_reply_parcel(&reply),
             // The error reply discards `reply`, which drops unsent and gives its bumps back.
-            Err(e) => self.send_reply(e.into(), &[], &[], &[]),
+            Err(e) => self.send_reply(crate::binder::handler_reply_status(e).into(), &[], &[], &[]),
         }
     }
 
@@ -3706,6 +3741,10 @@ impl RpcSessionInner {
                 reply.write(&self.shared.rpc_session_id.as_bytes()[..])?;
                 self.send_reply(0, reply.rpc_data_bytes(), &[], &[])
             }
+            // android-13+ fixes the mode in the header (AOSP); a flip races other slots' reads.
+            Some(SpecialTransaction::GetFdMode) if self.profile.wire_version().is_some() => {
+                self.send_reply(StatusCode::UnknownTransaction.into(), &[], &[], &[])
+            }
             Some(SpecialTransaction::GetFdMode) => {
                 // `Unix` is never renegotiated: a flip to `None` drops in-flight fds, desyncs R34.
                 if self.fd_mode() == FileDescriptorTransportMode::Unix {
@@ -3723,15 +3762,7 @@ impl RpcSessionInner {
                         false
                     }
                 };
-                // FD is v1+, as in the handshake; r34 negotiates fds only here.
-                let fd_version_ok = match self.profile.wire_version() {
-                    None => true,
-                    Some(v) => v >= PROTOCOL_V1,
-                };
-                let agreed = if want_unix
-                    && fd_version_ok
-                    && self.shared.fd_unix_supported.load(Ordering::SeqCst)
-                {
+                let agreed = if want_unix && self.shared.fd_unix_supported.load(Ordering::SeqCst) {
                     FileDescriptorTransportMode::Unix
                 } else {
                     FileDescriptorTransportMode::None
@@ -3845,6 +3876,7 @@ impl RpcSession {
             fd_mode: AtomicU8::new(FD_MODE_NONE),
             fd_unix_supported: AtomicBool::new(false),
             rpc_session_id: gen_rpc_session_id()?,
+            server_session_id: Mutex::new(None),
             lifecycle: SessionLifecycle::new(),
             ended_locally: AtomicBool::new(false),
             serve_declared: AtomicUsize::new(0),
@@ -3995,6 +4027,17 @@ impl RpcSession {
         client_fd_mode: u8,
         server_fd_unix: bool,
     ) -> RpcResult<RpcSession> {
+        // AOSP `RpcServer.cpp` "Rejecting connection": a mode the server does not support.
+        if !(client_fd_mode == FD_MODE_NONE || (client_fd_mode == FD_MODE_UNIX && server_fd_unix)) {
+            log::error!(
+                "android-13+ RPC: rejecting connection: FileDescriptorTransportMode \
+                 {client_fd_mode} is not supported (Unix needs \
+                 `RpcServer::set_supported_fd_modes`)"
+            );
+            return Err(RpcError::Protocol(
+                "client requested an unsupported FileDescriptorTransportMode",
+            ));
+        }
         let negotiated = codec.version();
         let shared = Self::fresh_shared(AddressSpace::Acceptor)?;
         let session = Self::with_shared(transport, WireProfile::Android13Plus(codec), shared);
@@ -4039,45 +4082,57 @@ impl RpcSession {
     /// AOSP-faithful), switches the session to `Unix`.
     /// `FileDescriptorTransportMode::None` is exactly
     /// [`RpcSession::connect_android13plus`] (byte-identical no-FD path).
+    ///
+    /// A server that does not support the requested mode closes the
+    /// connection after the handshake (AOSP `RpcServer.cpp` "Rejecting
+    /// connection: FileDescriptorTransportMode is not supported"; an
+    /// rsbinder server supports `Unix` only after
+    /// [`RpcServer::set_supported_fd_modes`](super::RpcServer::set_supported_fd_modes)),
+    /// so the first call on the returned session fails.
     pub fn connect_android13plus_fd(
         transport: Box<dyn RpcTransport>,
         max_version: u32,
         fd_mode: FileDescriptorTransportMode,
     ) -> Result<RpcSession> {
-        // Empty id ⇒ request a new session.
-        Self::connect_android13plus_fd_with_id(transport, max_version, fd_mode, &[])
+        Self::connect_android13plus_fd_hs(transport, max_version, fd_mode, None)
     }
 
-    /// Identical to
-    /// `connect_android13plus_fd` but echoes a server-minted 32-byte
-    /// `session_id` in the `RpcConnectionHeader` (AOSP
-    /// `RpcSession::setupClient`: the first connection sends an empty id
-    /// and reads the server-minted one via
-    /// [`RpcSession::get_session_id`], the remaining connections echo
-    /// it). An **empty** `session_id` is byte-for-byte identical to
-    /// `connect_android13plus_fd`. This wires + exercises the id round-trip and the
-    /// server's accept-decision routing.
+    /// [`connect_android13plus_fd`](Self::connect_android13plus_fd) for an
+    /// empty `session_id`; any other id is [`StatusCode::BadValue`].
+    ///
+    /// A non-empty id would build a second client `RpcSession` on a
+    /// server session that another `RpcSession` founded. The two keep
+    /// separate oneway numbering, binder addresses and lifetimes against
+    /// one server-side session: the server drops one side's oneway calls
+    /// as stale, can dispatch a call meant for one side's binder to the
+    /// other side's binder at the same address, and ends the shared
+    /// session when either side's connection closes. AOSP has no public
+    /// entry for this either: `RpcSession::setupClient` is private, and
+    /// the follow-up connections that echo the id are opened by the same
+    /// `RpcSession`. Add a connection to a session with
+    /// [`add_outgoing_connection_with_config`](Self::add_outgoing_connection_with_config)
+    /// on that session.
+    #[deprecated(
+        since = "0.12.0",
+        note = "a non-empty id is refused with BadValue: use `connect_android13plus_fd` for a new session, then `add_outgoing_connection_with_config` with `RpcClientConfig::session_id` on that session to add a connection"
+    )]
     pub fn connect_android13plus_fd_with_id(
         transport: Box<dyn RpcTransport>,
         max_version: u32,
         fd_mode: FileDescriptorTransportMode,
         session_id: &[u8],
     ) -> Result<RpcSession> {
-        Self::connect_android13plus_fd_with_id_hs(transport, max_version, fd_mode, session_id, None)
+        refuse_id_on_new_session(session_id, "RpcSession::connect_android13plus_fd_with_id")?;
+        Self::connect_android13plus_fd_hs(transport, max_version, fd_mode, None)
     }
 
-    /// `connect_android13plus_fd_with_id` with a handshake-read deadline; `None` blocks forever.
-    pub(crate) fn connect_android13plus_fd_with_id_hs(
+    /// `connect_android13plus_fd` with a handshake-read deadline; `None` blocks forever.
+    pub(crate) fn connect_android13plus_fd_hs(
         transport: Box<dyn RpcTransport>,
         max_version: u32,
         fd_mode: FileDescriptorTransportMode,
-        session_id: &[u8],
         handshake_timeout: Option<Duration>,
     ) -> Result<RpcSession> {
-        // AOSP `kSessionIdBytes == 32`; a 64 KiB+ id would wrap the header's `as u16` length.
-        if !(session_id.is_empty() || session_id.len() == 32) {
-            return Err(StatusCode::BadValue);
-        }
         let want_unix = fd_mode == FileDescriptorTransportMode::Unix;
         let hdr_fd_mode = if want_unix {
             FD_MODE_UNIX
@@ -4089,18 +4144,10 @@ impl RpcSession {
             let _hs = HandshakeDeadline::arm(transport.as_ref(), handshake_timeout)
                 .map_err(StatusCode::from)?;
             let mut io = RawTransportIo(transport.as_ref());
-            client_connect_with_id(&mut io, max_version, false, hdr_fd_mode, session_id)
-                .map_err(|e| client_handshake_err(e, session_id.is_empty()))?
+            // An empty id requests a new session.
+            client_connect_with_id(&mut io, max_version, false, hdr_fd_mode, &[])
+                .map_err(client_handshake_err)?
         };
-        if !session_id.is_empty() {
-            // An attach gets no `RpcNewSessionResponse`: confirm admission (`confirm_attach`).
-            let _hs = HandshakeDeadline::arm(transport.as_ref(), handshake_timeout)
-                .map_err(StatusCode::from)?;
-            if let Err(e) = confirm_attach(transport.as_ref(), &codec, session_id) {
-                log_attach_refused(&e);
-                return Err(StatusCode::from(e));
-            }
-        }
         let negotiated = codec.version();
         let session = RpcSession::with_profile(
             transport,
@@ -4123,9 +4170,9 @@ impl RpcSession {
     /// (negotiates `min(server_max_version, client_max)`), then returns
     /// an [`AddressSpace::Acceptor`] session speaking the negotiated
     /// version. Called by [`super::RpcServer`] on its worker thread (the
-    /// handshake is blocking I/O on the accepted socket). Keeps the
-    /// no-FD scope (the client's FD-mode byte is read for wire fidelity
-    /// but not acted on — use [`RpcSession::accept_android13plus_fd`]).
+    /// handshake is blocking I/O on the accepted socket). Supports no fd
+    /// mode: a client that requests one is refused, as in
+    /// [`RpcSession::accept_android13plus_fd`] with `server_fd_unix == false`.
     pub fn accept_android13plus(
         transport: Box<dyn RpcTransport>,
         server_max_version: u32,
@@ -4140,19 +4187,18 @@ impl RpcSession {
     /// client asked for `Unix`, this server opted in (`server_fd_unix`,
     /// [`super::RpcServer::set_supported_fd_modes`]), **and** the
     /// negotiated wire is v1+ (v0 forbids fd), switches the session to
-    /// `Unix`. Lenient: a client/server FD-mode mismatch degrades to
-    /// `None` (the fd write then `BAD_TYPE`-rejects) rather than AOSP's
-    /// hard session-reject. `server_fd_unix == false` is exactly
-    /// [`RpcSession::accept_android13plus`] (byte-identical no-FD path).
+    /// `Unix`. A client that requests a mode this server does not support
+    /// (`Unix` without `server_fd_unix`, or `Trusty`) is refused with an
+    /// error after the handshake response has gone out, so the client
+    /// sees the close on its first call — AOSP `RpcServer.cpp` "Rejecting
+    /// connection: FileDescriptorTransportMode is not supported".
+    /// `server_fd_unix == false` is exactly
+    /// [`RpcSession::accept_android13plus`].
     ///
-    /// This is a thin convenience wrapper over
-    /// `android13plus_accept_handshake`
-    /// then `from_android13plus` with
-    /// `shared = None` (the client-supplied id is ignored). The
-    /// multi-connection id-demux (new vs. attach) lives in
-    /// [`super::RpcServer::serve_connection`], which calls the split
-    /// handshake/build helpers directly; existing single-connection
-    /// callers keep the byte-identical shape here.
+    /// This is a thin wrapper over `android13plus_accept_handshake` then
+    /// `from_android13plus`, which always builds a fresh session (the
+    /// client-supplied id is ignored). The id-demux (new vs. attach) lives
+    /// in [`super::RpcServer::serve_connection`].
     pub fn accept_android13plus_fd(
         transport: Box<dyn RpcTransport>,
         server_max_version: u32,
@@ -4193,15 +4239,12 @@ impl RpcSession {
     /// that only [`RpcSession::get_session_id`] (one round trip, AOSP
     /// `RpcSession::setupClient` → `readId()`) can tell you. Passing
     /// this accessor's value to an attach API
-    /// ([`add_outgoing_connection_android13plus`](Self::add_outgoing_connection_android13plus),
-    /// [`add_incoming_connection_android13plus_with_config`](Self::add_incoming_connection_android13plus_with_config),
-    /// [`setup_unix_client_android13plus_with_id`](Self::setup_unix_client_android13plus_with_id),
-    /// `ClientOptions::session_id`) is therefore always wrong; those
-    /// entries refuse it (an outgoing attach on this session before it
-    /// connects, the others when the peer never admits the connection,
-    /// and the refusal is reported — see `confirm_attach`), but the value
-    /// itself is indistinguishable from any other 32 random bytes, so
-    /// read the id you echo from `get_session_id()`.
+    /// ([`add_outgoing_connection_with_config`](Self::add_outgoing_connection_with_config),
+    /// [`add_incoming_connection_with_config`](Self::add_incoming_connection_with_config))
+    /// is therefore always wrong; those entries refuse it with
+    /// [`StatusCode::BadValue`] before connecting, as they refuse every id
+    /// other than this session's server-minted one. Read the id you echo
+    /// from `get_session_id()`.
     pub fn session_id(&self) -> [u8; 32] {
         *self.inner.shared.rpc_session_id.as_bytes()
     }
@@ -4210,10 +4253,14 @@ impl RpcSession {
     /// session id via the `GET_SESSION_ID` special transact. AOSP
     /// `RpcSession::setupClient` reads this on the first connection and
     /// echoes it on the remaining ones
-    /// ([`RpcSession::setup_unix_client_android13plus_with_id`]). The
+    /// ([`add_outgoing_connection_with_config`](Self::add_outgoing_connection_with_config)). The
     /// server already replies it (real-peer-validated:
     /// `writeByteVector(mId)` == the AIDL `byte[]` path); this is the
     /// missing *client* half.
+    ///
+    /// A client session keeps the first id it reads: an attach on it
+    /// must echo exactly that id (AOSP attaches with its own `mId`), and
+    /// one that has not read it yet makes this round trip itself.
     pub fn get_session_id(&self) -> Result<Vec<u8>> {
         let data = Parcel::new();
         let mut reply = self
@@ -4226,14 +4273,66 @@ impl RpcSession {
             )?
             .ok_or(StatusCode::UnexpectedNull)?;
         // Keep the read error: BadValue/BadType on a malformed vector differs from a null reply.
-        reply.read::<Vec<u8>>()
+        let id = reply.read::<Vec<u8>>()?;
+        if self.inner.shared.space() == AddressSpace::Initiator {
+            let mut kept = self.server_id_lock();
+            if kept.is_none() {
+                *kept = Some(id.clone());
+            }
+        }
+        Ok(id)
+    }
+
+    fn server_id_lock(&self) -> std::sync::MutexGuard<'_, Option<Vec<u8>>> {
+        self.inner
+            .shared
+            .server_session_id
+            .lock()
+            .expect("server_session_id poisoned")
+    }
+
+    /// The id an attach on this session must echo: the server-minted one (cached) for a client.
+    fn own_attach_id(&self) -> Result<Vec<u8>> {
+        if self.inner.shared.space() != AddressSpace::Initiator {
+            return Ok(self.session_id().to_vec());
+        }
+        let kept = self.server_id_lock().clone();
+        match kept {
+            Some(id) => Ok(id),
+            None => self.get_session_id(),
+        }
+    }
+
+    /// Refuse an attach id other than this session's own: it would join another server session.
+    fn refuse_foreign_attach_id(&self, session_id: &[u8]) -> Result<()> {
+        if session_id == self.own_attach_id()?.as_slice() {
+            return Ok(());
+        }
+        if session_id == self.session_id().as_slice() {
+            log::error!(
+                "android-13+ RPC: this attach echoes the client-local `RpcSession::session_id()`; \
+                 echo the server-minted id from `RpcSession::get_session_id()`"
+            );
+        } else {
+            log::error!(
+                "android-13+ RPC: this attach names a server session other than this \
+                 RpcSession's own; two client states on one server session would keep separate \
+                 oneway numbering, binder addresses and lifetimes. Echo this session's \
+                 `RpcSession::get_session_id()`"
+            );
+        }
+        Err(StatusCode::BadValue)
     }
 
     /// Server role: advertise that this endpoint will accept the
     /// `Unix` FD-over-RPC mode on `GET_FD_MODE`. Default
     /// is *not* advertised, so the categorical FD reject is the default
-    /// everywhere. Has no effect on a non-UDS transport (the transport
-    /// fd methods reject by type regardless).
+    /// everywhere. On a non-UDS transport `Unix` may still be agreed, but
+    /// every fd send then fails (the transport fd methods reject by type).
+    ///
+    /// No effect on an android-13+ session: its mode is fixed by the
+    /// connection header at the handshake
+    /// ([`RpcServer::set_supported_fd_modes`](super::server::RpcServer::set_supported_fd_modes)).
     pub fn set_supported_fd_modes(&self, modes: &[FileDescriptorTransportMode]) {
         let unix = modes.contains(&FileDescriptorTransportMode::Unix);
         self.inner
@@ -4243,26 +4342,59 @@ impl RpcSession {
     }
 
     /// Client role: negotiate the FD-over-RPC mode.
-    /// Sends exactly one `GET_FD_MODE` packet; the agreed mode is
+    /// On r34, sends exactly one `GET_FD_MODE` packet; the agreed mode is
     /// `Unix` iff *both* peers opted in, else `None` (never an error).
     /// Must be called before any FD-bearing call, like
     /// [`RpcSession::negotiate`].
+    ///
+    /// r34 only. An android-13+ session fixes the mode in its connection
+    /// header ([`RpcClientConfig::fd_mode`]), as AOSP does
+    /// (`RpcSession::setFileDescriptorTransportMode` aborts once setup has
+    /// started), and other connections of the session may already be
+    /// reading under that mode. There this sends nothing: it returns the
+    /// current mode, or [`StatusCode::InvalidOperation`] when `want` is
+    /// `Unix` and the header did not agree `Unix` — request it with
+    /// [`RpcClientConfig::fd_mode`] before connecting, at wire v1+ (a v0
+    /// session carries no fd mode, so offer `max_version >= 1` to a v1+
+    /// server). An android-13+ server answers `GET_FD_MODE` with
+    /// `UNKNOWN_TRANSACTION`, as AOSP libbinder does.
     pub fn negotiate_fd_transport(
         &self,
         want: FileDescriptorTransportMode,
     ) -> Result<FileDescriptorTransportMode> {
+        if let Some(version) = self.inner.profile.wire_version() {
+            let current = self.inner.fd_mode();
+            if want == FileDescriptorTransportMode::Unix && current != want {
+                if version < PROTOCOL_V1 {
+                    log::error!(
+                        "RpcSession::negotiate_fd_transport: wire v0 (android-13) carries no fd \
+                         mode; offer `max_version >= 1` to a v1+ server and request Unix with \
+                         `RpcClientConfig::fd_mode`"
+                    );
+                } else {
+                    log::error!(
+                        "RpcSession::negotiate_fd_transport: an android-13+ session fixes the \
+                         fd mode in its connection header ({current:?}); request Unix with \
+                         `RpcClientConfig::fd_mode` before connecting"
+                    );
+                }
+                return Err(StatusCode::InvalidOperation);
+            }
+            return Ok(current);
+        }
         let want_unix = want == FileDescriptorTransportMode::Unix;
         let mut req = Parcel::new();
         req.write(&(if want_unix { 1i32 } else { 0i32 }))?;
-        let mut reply = self
-            .inner
-            .client_transact(
-                RpcAddress::zero(),
-                SpecialTransaction::GetFdMode.code(),
-                &req,
-                0,
-            )?
-            .ok_or(StatusCode::UnexpectedNull)?;
+        let mut reply = match self.inner.client_transact(
+            RpcAddress::zero(),
+            SpecialTransaction::GetFdMode.code(),
+            &req,
+            0,
+        ) {
+            // AOSP r34 libbinder has no `GET_FD_MODE` and carries no fds.
+            Err(StatusCode::UnknownTransaction) => return Ok(FileDescriptorTransportMode::None),
+            r => r?.ok_or(StatusCode::UnexpectedNull)?,
+        };
         let agreed = if reply.read::<i32>()? == 1 {
             FileDescriptorTransportMode::Unix
         } else {
@@ -4811,22 +4943,17 @@ impl RpcSession {
         RpcSession::connect_android13plus(Box::new(t), max_version)
     }
 
-    /// Client: connect to a Unix-domain
-    /// android-13+ RPC server **echoing a server-minted 32-byte
-    /// `session_id`**. Flow (AOSP `RpcSession::setupClient`): connect
-    /// the first session with `setup_unix_client_android13plus`
-    /// (empty id ⇒ new session), read its id with
-    /// [`RpcSession::get_session_id`], then open the remaining
-    /// connections here echoing that id. An **empty** `session_id` is
-    /// byte-identical to `setup_unix_client_android13plus`.
-    ///
-    /// A non-empty id makes this an *attach*, and the server's
-    /// admission is confirmed before the session is returned (see
-    /// `confirm_attach`) — a refused attach is an error here, not a
-    /// session whose every call fails.
+    /// Client: connect to a Unix-domain android-13+ RPC server. An
+    /// **empty** `session_id` is byte-identical to
+    /// `setup_unix_client_android13plus`; any other id is
+    /// [`StatusCode::BadValue`], for the reason
+    /// [`connect_android13plus_fd_with_id`](Self::connect_android13plus_fd_with_id)
+    /// gives. To add a connection to a session, call
+    /// [`add_outgoing_connection_with_config`](Self::add_outgoing_connection_with_config)
+    /// on that session.
     #[deprecated(
         since = "0.12.0",
-        note = "use `setup_client_android13plus_with_config(RpcClientConfig::unix(path, v).session_id(id))`"
+        note = "a non-empty id is refused with BadValue: use `setup_client_android13plus_with_config(RpcClientConfig::unix(path, v))` for a new session, then `add_outgoing_connection_with_config(RpcClientConfig::unix(path, v).session_id(id))` on that session to add a connection"
     )]
     #[allow(deprecated)]
     pub fn setup_unix_client_android13plus_with_id(
@@ -4850,6 +4977,7 @@ impl RpcSession {
     ) -> Result<RpcSession> {
         Self::setup_client_android13plus(
             config.into_generic(),
+            "RpcSession::setup_unix_client_android13plus_with_config",
             "RpcUnixClientConfig::handshake_timeout",
         )
     }
@@ -4859,10 +4987,19 @@ impl RpcSession {
     /// (callback) connections each come from one call to the config's
     /// `connect`. See [`RpcClientConfig`].
     pub fn setup_client_android13plus_with_config(config: RpcClientConfig) -> Result<RpcSession> {
-        Self::setup_client_android13plus(config, "RpcClientConfig::handshake_timeout")
+        Self::setup_client_android13plus(
+            config,
+            "RpcSession::setup_client_android13plus_with_config",
+            "RpcClientConfig::handshake_timeout",
+        )
     }
 
-    fn setup_client_android13plus(config: RpcClientConfig, what: &str) -> Result<RpcSession> {
+    /// `entry` names the public call for logs; `what` the caller's own handshake-timeout setter.
+    fn setup_client_android13plus(
+        config: RpcClientConfig,
+        entry: &str,
+        what: &str,
+    ) -> Result<RpcSession> {
         reject_zero_handshake_timeout(config.handshake_timeout, what)?;
         let handshake_deadline = config.handshake_deadline();
         let RpcClientConfig {
@@ -4877,10 +5014,7 @@ impl RpcSession {
         } = config;
         let handshake_timeout = handshake_deadline;
         let local = outgoing_connections.max(1);
-        // Fan-out and incoming connections belong to the session owner, never to an attach.
-        if (local > 1 || incoming > 0) && !requested_id.is_empty() {
-            return Err(StatusCode::BadValue);
-        }
+        refuse_id_on_new_session(requested_id, entry)?;
 
         let mut connect = source.into_connector(handshake_timeout);
         let founding = connect()?;
@@ -4893,11 +5027,10 @@ impl RpcSession {
             );
             return Err(StatusCode::BadValue);
         }
-        let session = RpcSession::connect_android13plus_fd_with_id_hs(
+        let session = RpcSession::connect_android13plus_fd_hs(
             founding,
             max_version,
             requested_fd_mode.unwrap_or(FileDescriptorTransportMode::None),
-            requested_id,
             handshake_timeout,
         )?;
         // Before `negotiate`/`get_session_id` below: their round trips read it.
@@ -4952,7 +5085,8 @@ impl RpcSession {
     /// `RpcSession::setupClient` opens N outgoing; `findConnection`
     /// distributes outgoing calls across them). Returns the
     /// new slot id. `session_id` MUST be this session's server-minted
-    /// id (`get_session_id()` on the founding connection) — the server
+    /// id (`get_session_id()` on the founding connection), any other id
+    /// is [`StatusCode::BadValue`] before connecting — the server
     /// id-demuxes the echo onto the same `SharedSession`, so
     /// state/root/proxies are shared with the founding connection.
     /// Profile uniformity is enforced: the additional connection's
@@ -5022,8 +5156,10 @@ impl RpcSession {
     /// theirs. So a failure ends the whole session, and returns its
     /// error, unless the attach never got its whole header out: a check
     /// before the header refused it (a `max_version` below the session's,
-    /// a transport unlike the founding connection's, or this session's
-    /// client-local [`session_id()`](Self::session_id) as the id), the
+    /// a transport unlike the founding connection's, or an id other than
+    /// this session's [`get_session_id()`](Self::get_session_id), such as
+    /// the client-local [`session_id()`](Self::session_id) or another
+    /// session's id, which is [`StatusCode::BadValue`]), the
     /// connect or the handshake deadline's setup failed, or the header
     /// write failed.
     ///
@@ -5114,16 +5250,8 @@ impl RpcSession {
             );
             return Err(StatusCode::BadType);
         }
-        // No server admits the client-local id; refused before a close could end the session.
-        if self.inner.shared.space() == AddressSpace::Initiator
-            && session_id == self.session_id().as_slice()
-        {
-            log::error!(
-                "android-13+ RPC: this attach echoes the client-local `RpcSession::session_id()`; \
-                 echo the server-minted id from `RpcSession::get_session_id()`"
-            );
-            return Err(StatusCode::BadValue);
-        }
+        // Refused before the header, where a server's close would end the session.
+        self.refuse_foreign_attach_id(session_id)?;
         let hdr_fd_mode = if fd_mode == FileDescriptorTransportMode::Unix {
             FD_MODE_UNIX
         } else {
@@ -5231,7 +5359,9 @@ impl RpcSession {
     ///
     /// - the attach never got its whole header out: a check before the
     ///   header refused it (a `max_version` below the session's, a
-    ///   transport unlike the founding connection's), the connect or the handshake deadline's
+    ///   transport unlike the founding connection's, an id other than this
+    ///   session's [`get_session_id()`](Self::get_session_id), which is
+    ///   [`StatusCode::BadValue`]), the connect or the handshake deadline's
     ///   setup failed, or the header write failed (a server admits
     ///   nothing before the whole header);
     /// - the connection closed, a reset included, before any `"cci"` byte
@@ -5296,6 +5426,7 @@ impl RpcSession {
             );
             return Err(StatusCode::BadType);
         }
+        self.refuse_foreign_attach_id(session_id)?;
         let hdr_fd_mode = if fd_mode == FileDescriptorTransportMode::Unix {
             FD_MODE_UNIX
         } else {
@@ -5353,7 +5484,26 @@ impl RpcSession {
                     .lock()
                     .expect("incoming_threads poisoned")
                     .push((slot_id, handle));
-                Ok(slot_id)
+                if !self.inner.shared.lifecycle.is_torn_down() {
+                    return Ok(slot_id);
+                }
+                // Ended meanwhile: a `close_session` that took the list first never joins this one.
+                let mine = {
+                    let mut threads = self
+                        .inner
+                        .incoming_threads
+                        .lock()
+                        .expect("incoming_threads poisoned");
+                    let at = threads.iter().position(|(id, _)| *id == slot_id);
+                    at.map(|i| threads.remove(i).1)
+                };
+                if let Some(handle) = mine {
+                    if handle.join().is_err() {
+                        log::warn!("RPC: incoming connection {slot_id} thread panicked");
+                    }
+                    self.inner.incoming_joined.fetch_add(1, Ordering::SeqCst);
+                }
+                Err(StatusCode::DeadObject)
             }
             Err(e) => {
                 log::error!("RPC: incoming connection thread spawn failed ({e})");
@@ -6461,6 +6611,7 @@ mod tests {
             WireProfile::Android13Plus(Android13PlusCodec::with_version(PROTOCOL_V2).expect("v2")),
         )
         .expect("session");
+        seed_server_id(&session);
         // Armed before the session can end: macOS refuses `SO_RCVTIMEO` once the peer closed.
         let mut founding_peer = UnixStream::from(founding_peer_fd);
         founding_peer
@@ -6515,7 +6666,13 @@ mod tests {
             WireProfile::Android13Plus(Android13PlusCodec::with_version(PROTOCOL_V2).expect("v2")),
         )
         .expect("session");
+        seed_server_id(&session);
         (session, UnixStream::from(founding_peer_fd))
+    }
+
+    /// Stands in for `get_session_id`: these tests' attaches echo `[7; 32]`.
+    fn seed_server_id(session: &RpcSession) {
+        *session.server_id_lock() = Some(vec![7u8; 32]);
     }
 
     /// Runs an incoming attach whose server half `server` drives by hand over a socketpair.
@@ -6749,6 +6906,106 @@ mod tests {
         );
         session.close_session();
         let _end = serving.join().expect("server loop");
+    }
+
+    /// android-13+ fixes the fd mode in the header: `GET_FD_MODE` is refused, the mode unchanged.
+    #[test]
+    fn an_android13plus_server_refuses_get_fd_mode() {
+        use super::super::transport::UnixTransport;
+        let (a, b) = UnixTransport::pair().expect("socketpair");
+        let v1 = || WireProfile::Android13Plus(Android13PlusCodec::android14_15());
+        let server = RpcSession::with_profile(Box::new(a), AddressSpace::Acceptor, v1())
+            .expect("server session");
+        server.set_supported_fd_modes(&[FileDescriptorTransportMode::Unix]);
+        let server_inner = Arc::clone(&server.inner);
+        let serving = std::thread::spawn(move || server.serve_blocking());
+        let client = RpcSession::with_profile(Box::new(b), AddressSpace::Initiator, v1())
+            .expect("client session");
+        client.set_timeout(Some(Duration::from_secs(5)));
+        let mut req = Parcel::new();
+        req.write(&1i32).expect("want Unix");
+        let reply = client.inner.client_transact(
+            RpcAddress::zero(),
+            SpecialTransaction::GetFdMode.code(),
+            &req,
+            0,
+        );
+        assert_eq!(reply.err(), Some(StatusCode::UnknownTransaction));
+        assert_eq!(server_inner.fd_mode(), FileDescriptorTransportMode::None);
+        // `Unix` the header did not agree is refused, not reported as a `None` fallback.
+        assert_eq!(
+            client.negotiate_fd_transport(FileDescriptorTransportMode::Unix),
+            Err(StatusCode::InvalidOperation)
+        );
+        client.close_session();
+        let _end = serving.join().expect("server loop");
+    }
+
+    /// android-13+ `negotiate_fd_transport` sends nothing: a peer that never answers sees no byte.
+    #[test]
+    fn android13plus_negotiate_fd_transport_sends_nothing() {
+        use super::super::transport::UnixTransport;
+        use std::io::Read;
+        let (ours, mut peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let v1 = WireProfile::Android13Plus(Android13PlusCodec::android14_15());
+        let t = UnixTransport::from_stream(ours).expect("transport");
+        let client = RpcSession::with_profile(Box::new(t), AddressSpace::Initiator, v1)
+            .expect("client session");
+        client.set_timeout(Some(Duration::from_millis(200)));
+        assert_eq!(
+            client.negotiate_fd_transport(FileDescriptorTransportMode::None),
+            Ok(FileDescriptorTransportMode::None)
+        );
+        assert_eq!(
+            client.negotiate_fd_transport(FileDescriptorTransportMode::Unix),
+            Err(StatusCode::InvalidOperation)
+        );
+        assert_eq!(
+            client.fd_transport_mode(),
+            FileDescriptorTransportMode::None
+        );
+        peer.set_nonblocking(true).expect("nonblocking");
+        let pending = peer.read(&mut [0u8; 1]);
+        assert!(
+            matches!(&pending, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "{pending:?}"
+        );
+        client.close_session();
+    }
+
+    /// An r34 peer without the extension (AOSP libbinder) answers `UNKNOWN_TRANSACTION`: `None`.
+    #[test]
+    fn r34_get_fd_mode_unknown_to_the_peer_negotiates_none() {
+        use super::super::transport::UnixTransport;
+        let (a, peer) = UnixTransport::pair().expect("socketpair");
+        let client = RpcSession::new(Box::new(a), AddressSpace::Initiator).expect("session");
+        client.set_timeout(Some(Duration::from_secs(5)));
+        let answering = std::thread::spawn(move || {
+            let frame = peer.recv_frame().expect("GET_FD_MODE");
+            match R34Codec.decode_message(&frame).expect("decode") {
+                WireMessage::Transact(t) => {
+                    assert_eq!(t.code, SpecialTransaction::GetFdMode.code())
+                }
+                other => panic!("expected GET_FD_MODE, got {other:?}"),
+            }
+            let reply = WireReply {
+                status: StatusCode::UnknownTransaction.into(),
+                ..WireReply::default()
+            };
+            let reply = R34Codec.encode_reply(&reply).expect("encode");
+            peer.send_frame(&reply).expect("reply");
+            peer
+        });
+        assert_eq!(
+            client.negotiate_fd_transport(FileDescriptorTransportMode::Unix),
+            Ok(FileDescriptorTransportMode::None)
+        );
+        assert_eq!(
+            client.fd_transport_mode(),
+            FileDescriptorTransportMode::None
+        );
+        let _peer = answering.join().expect("peer");
+        client.close_session();
     }
 
     /// A `"cci"` byte shows the server pooled the connection: a cut after it ends the session.
@@ -7133,6 +7390,30 @@ mod tests {
         );
         assert_eq!(added, Err(StatusCode::BadValue));
         assert_attach_outcome(&session, added, false, "client-local id");
+    }
+
+    /// An attach naming another server session's id never connects, outgoing or incoming.
+    #[test]
+    fn an_attach_naming_another_server_session_never_connects() {
+        let (session, _founding_peer) = v2_initiator();
+        let added = session.add_outgoing_connection_android13plus_transport(
+            || -> Result<Box<dyn RpcTransport>> { panic!("the attach must not connect") },
+            PROTOCOL_V2,
+            &[9u8; 32],
+            FileDescriptorTransportMode::None,
+            Some(Duration::from_secs(5)),
+        );
+        assert_eq!(added, Err(StatusCode::BadValue));
+        assert_attach_outcome(&session, added, false, "foreign id, outgoing");
+        let added = session.add_incoming_connection_android13plus_transport(
+            || -> Result<Box<dyn RpcTransport>> { panic!("the attach must not connect") },
+            PROTOCOL_V2,
+            &[9u8; 32],
+            FileDescriptorTransportMode::None,
+            Some(Duration::from_secs(5)),
+        );
+        assert_eq!(added, Err(StatusCode::BadValue));
+        assert_attach_outcome(&session, added, false, "foreign id, incoming");
     }
 
     /// The teardown gate is read under `conn_state` with the cap: a dead session admits no slot.

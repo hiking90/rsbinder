@@ -15,8 +15,10 @@
 //! # Compatibility scope
 //!
 //! * **Flavor**: `SynchronizedReadWrite` — one reader, one writer, a full
-//!   ring refuses the write. The unsynchronized flavor is modelled in
-//!   [`Flavor`] but cannot be attached.
+//!   ring refuses the write. Keeping to one reader and one writer is the
+//!   callers' protocol, as in libfmq; nothing detects a second one (see
+//!   [`MessageQueue`]). The unsynchronized flavor is modelled in [`Flavor`]
+//!   but cannot be attached.
 //! * **Layout**: grantor 0 = read counter (`u64`, bytes consumed), 1 = write
 //!   counter (`u64`, bytes produced), 2 = the ring, 3 = the EventFlag word
 //!   (`u32`, optional). Offsets are multiples of 8. Counters never wrap; a
@@ -49,6 +51,14 @@
 //! sizes and seals it does not, and every operation re-checks the counters
 //! before trusting them. What is copied out of the ring is the only thing a
 //! reader interprets.
+//!
+//! Every access this crate makes to the shared memory — counters, ring and
+//! EventFlag word — is a Rust atomic, so a change made from outside (the
+//! peer, another handle on the same memory, C code, `rsbinder`'s
+//! `SharedMemory` mapping the same fd) is another thread's store in Rust's
+//! memory model. Breaking the protocol that way gives [`Error::Corrupted`]
+//! or wrong elements, not undefined behavior; nothing detects it. See
+//! "Soundness" on [`Regions`].
 
 #![warn(missing_docs)]
 
@@ -56,6 +66,7 @@ mod descriptor;
 mod error;
 mod event_flag;
 mod queue;
+mod ring;
 pub mod shm;
 mod sys;
 

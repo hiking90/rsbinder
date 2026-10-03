@@ -10,11 +10,10 @@
 //! These run on more than one thread — `rsb_hub` resolves callers' groups
 //! on its one binder thread while a SIGHUP reload resolves policy names on
 //! its signal thread, and a hub built with the `rpc` feature serves from
-//! several binder threads — so every lookup here must be reentrant. On
-//! glibc and the BSDs that means the `_r` forms, because the plain ones
-//! return a pointer into a shared static buffer a concurrent caller would
-//! overwrite mid-use. Android is the exception, and [`gid_for_group`]
-//! explains why.
+//! several binder threads — so every lookup here must be reentrant, which
+//! means the `_r` forms: on glibc and the BSDs the plain ones return a
+//! pointer into a shared static buffer a concurrent caller would overwrite
+//! mid-use.
 
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::CString;
@@ -127,12 +126,6 @@ pub fn gid_for_group(spec: &str) -> Result<u32, NssError> {
         return Ok(gid);
     }
     let cname = cstring("group", spec)?;
-    lookup_gid(&cname, spec)
-}
-
-/// `getgrnam_r`, growing the buffer until libc stops asking for more.
-#[cfg(not(target_os = "android"))]
-fn lookup_gid(cname: &std::ffi::CStr, spec: &str) -> Result<u32, NssError> {
     let mut buf = vec![0u8; 1024];
     loop {
         // SAFETY: `group` holds only integers and raw pointers; all-zero is a valid value.
@@ -164,35 +157,6 @@ fn lookup_gid(cname: &std::ffi::CStr, spec: &str) -> Result<u32, NssError> {
                 message: std::io::Error::from_raw_os_error(rc).to_string(),
             }),
         };
-    }
-}
-
-/// `getgrnam_r` fails to link below API 24; bionic's `getgrnam` is reentrant (per-thread buffer).
-#[cfg(target_os = "android")]
-fn lookup_gid(cname: &std::ffi::CStr, spec: &str) -> Result<u32, NssError> {
-    // Null is not-found (bionic sets ENOENT) or failure; clear errno so a stale value is not read.
-    // SAFETY: `__errno()` returns this thread's errno slot, valid to write.
-    unsafe { *libc::__errno() = 0 };
-    // SAFETY: `cname` is live and NUL-terminated; result is this thread's buffer, never stored.
-    let grp = unsafe { libc::getgrnam(cname.as_ptr()) };
-    // errno means something only on a miss; 0 there (nothing set) classifies as not-found.
-    let rc = if grp.is_null() {
-        std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
-    } else {
-        0
-    };
-    match classify(rc, !grp.is_null()) {
-        // SAFETY: non-null, points into this thread's bionic group buffer, untouched since.
-        Lookup::Found => Ok(unsafe { (*grp).gr_gid }),
-        Lookup::NotFound => Err(NssError::NotFound {
-            kind: "group",
-            name: spec.to_owned(),
-        }),
-        Lookup::Failed(rc) => Err(NssError::Failed {
-            call: "getgrnam",
-            name: spec.to_owned(),
-            message: std::io::Error::from_raw_os_error(rc).to_string(),
-        }),
     }
 }
 
@@ -528,6 +492,17 @@ mod tests {
             uid_for_user("ro\0ot"),
             Err(NssError::InvalidName { kind: "user", .. })
         ));
+    }
+
+    /// gid 0 is `root` in glibc `/etc/group` and bionic (`AID_ROOT`), `wheel` on macOS (no `root`).
+    #[test]
+    fn group_name_resolves() {
+        let gid0 = if cfg!(target_vendor = "apple") {
+            "wheel"
+        } else {
+            "root"
+        };
+        assert_eq!(gid_for_group(gid0), Ok(0));
     }
 
     #[test]

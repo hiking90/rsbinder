@@ -266,7 +266,7 @@ A `@FixedSize` parcelable or union may only contain:
 
 and may not contain `String`, `IBinder`, `ParcelFileDescriptor`, `ParcelableHolder`, an interface, a variable-length array (`T[]`), a `List<T>`, or a `@nullable` type. `@FixedSize` is not inherited by nested declarations.
 
-rsbinder-aidl rejects a field that breaks these rules, porting AOSP's `CanBeFixedSize`. The annotation does not change the generated layout or wire format.
+rsbinder-aidl rejects a field that breaks these rules, porting AOSP's `CanBeFixedSize`. The annotation changes the generated code in one place: a `@FixedSize` union's implicit `Tag` is backed by `byte` (`Tag(pub i8)`) instead of `int`, as AOSP's `UnionTagGenerater` declares it, so a `Tag[]` goes on the wire as `byte[]`, and such a union may have at most 128 fields. The layout and wire format of every field are otherwise unchanged.
 
 ### Relationship with @RustDerive(Copy=true)
 
@@ -324,8 +324,8 @@ exist so every method can declare its permission posture).
 | `@utf8InCpp` | String | No effect in Rust (strings are always UTF-8) |
 | `@Descriptor` | interface | Overrides the wire descriptor string |
 | `@VintfStability` | parcelable, interface, type parameter | Stamps `Stability::Vintf`; every referenced type must be VINTF-stable (checked). On a type parameter (`Foo<@VintfStability T>`): the argument must be a `@VintfStability` declaration |
-| `@FixedSize` | parcelable, union, type parameter | Fields checked to be fixed-size; no layout change (`Copy` comes from `@RustDerive(Copy=true)`). On a type parameter (`MQDescriptor<@FixedSize T, Flavor>`): the argument must itself be fixed-size |
-| `@deprecated` (javadoc) | any declaration, method, field, constant, enumerator | Emits `#[deprecated]` / `#[deprecated = "note"]` |
+| `@FixedSize` | parcelable, union, type parameter | Fields checked to be fixed-size; no field layout change, but a union's `Tag` is `i8`-backed (`Copy` comes from `@RustDerive(Copy=true)`). On a type parameter (`MQDescriptor<@FixedSize T, Flavor>`): the argument must itself be fixed-size |
+| `@deprecated` (javadoc) | any declaration, method, field, constant, enumerator | Emits `#[deprecated]` / `#[deprecated = "note"]` from the first `/** … @deprecated … */` among the comments before the item (AOSP `FindDeprecated`, `android-14.0.0_r50`+). A comment written between the item's annotations, type and name is not read |
 | `@EnforcePermission` | interface method | Generates a `PermissionManagerService` check (kernel-only; denied over RPC) |
 
 When writing AIDL files for rsbinder, the most commonly used annotations are `@RustDerive` (for ergonomic Rust types), `@Backing` (for enums), and `@nullable` (for optional values). The remaining annotations are important for interoperability with Android or for specific use cases like recursive types and interface migration.

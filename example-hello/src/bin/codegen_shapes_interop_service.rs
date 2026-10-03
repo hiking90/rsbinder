@@ -13,7 +13,7 @@
 use env_logger::Env;
 use rsbinder::*;
 
-use example_hello::shapes::{BnCodegenShapes, ICodegenShapes, SERVICE_NAME};
+use example_hello::shapes::{BnCodegenShapes, FixedTagged, ICodegenShapes, SERVICE_NAME};
 
 struct Shapes;
 
@@ -53,6 +53,21 @@ impl ICodegenShapes for Shapes {
     fn r#roundInoutBinders(&self, v: &mut Vec<SIBinder>) -> rsbinder::BinderResult<()> {
         v.reverse();
         Ok(())
+    }
+
+    fn r#reverseTags(
+        &self,
+        tags: &[FixedTagged::Tag],
+    ) -> rsbinder::BinderResult<Vec<FixedTagged::Tag>> {
+        Ok(tags.iter().rev().copied().collect())
+    }
+
+    fn r#failUnexpectedNull(&self) -> rsbinder::BinderResult<()> {
+        Err(StatusCode::UnexpectedNull.into())
+    }
+
+    fn r#failDeadObject(&self) -> rsbinder::BinderResult<()> {
+        Err(StatusCode::DeadObject.into())
     }
 }
 

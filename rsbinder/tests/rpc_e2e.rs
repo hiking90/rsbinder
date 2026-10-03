@@ -360,18 +360,15 @@ fn rpc_call_via_generalized_remote_proxy_trait() {
 
     let client = RpcSession::new(Box::new(b), AddressSpace::Initiator).expect("RpcSession::new");
     let root = client.get_root().expect("get_root");
+    rsbinder::__rpc_stamp_descriptor(&root, ISMOKE_DESC);
 
     // `as_proxy()` is kernel-only; `as_remote()` also resolves an RPC binder.
     let remote = (*root)
         .as_remote()
         .expect("AC-6: an RpcProxy must be reachable as &dyn RemoteProxy");
 
-    // Unstamped `get_root` proxy: the real call uses a `build_request` parcel instead.
-    let _ = remote
-        .prepare_transact(true)
-        .expect("prepare_transact callable");
-    let rp = rpc_of(&root);
-    let mut d = rp.build_request(ISMOKE_DESC).unwrap();
+    // The trait's parcel carries the interface token the server checks.
+    let mut d = remote.prepare_transact(true).expect("prepare_transact");
     d.write(&"via-remote-proxy").unwrap();
     let mut reply = RemoteProxy::submit_transact(remote, TX_ECHO, &d, 0)
         .expect("submit_transact via &dyn RemoteProxy")
@@ -663,7 +660,7 @@ fn rpc_mode_parcel_rejects_file_descriptor() {
     use std::fs::File;
 
     let mut p = Parcel::new();
-    p.__set_for_rpc(true);
+    p.__set_for_rpc(true).unwrap();
     let pfd = ParcelFileDescriptor::new(File::open("/dev/null").expect("/dev/null"));
     let err = p
         .write(&pfd)
@@ -687,7 +684,7 @@ fn rpc_transact_refuses_a_parcel_built_for_no_session() {
     let p = MemPair::new();
     let rp = rpc_of(&p.root);
     let mut data_only = Parcel::new();
-    data_only.__set_for_rpc(true);
+    data_only.__set_for_rpc(true).unwrap();
     for mut d in [Parcel::new(), data_only] {
         d.write(&ISMOKE_DESC).unwrap();
         d.write(&"x").unwrap();

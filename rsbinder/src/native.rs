@@ -50,7 +50,9 @@
 //!
 //! `BinderFeatures::flat_flags` encodes the `flat_binder_object.flags` word.
 //! `FLAT_BINDER_FLAG_ACCEPTS_FDS` is always set: rsbinder accepts file
-//! descriptors unconditionally in its native binder protocol. Bit layout
+//! descriptors unconditionally in its native binder protocol.
+//! `FLAT_BINDER_FLAG_TXN_SECURITY_CTX` is set for `set_requesting_sid` only
+//! where `process_state::selinux_available` holds. Bit layout
 //! (cross-checked against `kernel/include/uapi/linux/android/binder.h`):
 //!
 //! ```text
@@ -99,8 +101,7 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fs::File;
 use std::mem::ManuallyDrop;
-use std::ops::{Deref, DerefMut};
-use std::os::fd::FromRawFd;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
@@ -138,6 +139,17 @@ pub struct BinderFeatures {
     /// the kernel dispatches via `BR_TRANSACTION_SEC_CTX` and the
     /// transaction handler can read the caller's context through
     /// [`crate::thread_state::CallingContext::default`]`.sid`.
+    ///
+    /// Honoured only where SELinux is available: on Android, or on a Linux
+    /// host where `/sys/fs/selinux/enforce` exists — the same check that
+    /// decides whether [`get_calling_sid`](crate::thread_state::get_calling_sid)
+    /// returns the context. Elsewhere the binder is published without
+    /// `FLAT_BINDER_FLAG_TXN_SECURITY_CTX` and the calling sid is `None`.
+    /// The driver fails a transaction to a binder that requests the context
+    /// when no LSM can produce one (`BR_FAILED_REPLY`, android17-6.18
+    /// `binder_transaction`), and only an SELinux context ends in a NUL
+    /// rsbinder can find its end by, so sending the flag elsewhere would
+    /// only fail calls or yield a context rsbinder discards.
     ///
     /// Default: `false`. Has a per-transaction cost (kernel must
     /// serialize `secctx`), so opt in only on services that perform
@@ -187,8 +199,13 @@ pub struct BinderFeatures {
 impl BinderFeatures {
     /// Encodes the `flat_binder_object.flags` word; bit layout in module doc "Flat-binder flags".
     pub(crate) fn flat_flags(self) -> u32 {
+        self.flat_flags_with(crate::process_state::selinux_available())
+    }
+
+    /// [`Self::flat_flags`]; `TXN_SECURITY_CTX` only with `selinux` (see `set_requesting_sid`).
+    fn flat_flags_with(self, selinux: bool) -> u32 {
         let mut f = crate::sys::FLAT_BINDER_FLAG_ACCEPTS_FDS;
-        if self.set_requesting_sid {
+        if self.set_requesting_sid && selinux {
             f |= crate::sys::FLAT_BINDER_FLAG_TXN_SECURITY_CTX;
         }
         if let Some(priority) = self.min_priority {
@@ -267,12 +284,8 @@ impl<T: Remotable> Inner<T> {
         match code {
             INTERFACE_TRANSACTION => reply.write(T::descriptor()),
             DUMP_TRANSACTION => {
-                let obj = _reader.read_object(true)?;
-                if obj.header_type() != crate::sys::BINDER_TYPE_FD {
-                    return Err(StatusCode::BadType);
-                }
-
-                let fd = obj.handle();
+                // AOSP `readFileDescriptor`, kernel or RPC; a kernel parcel closes its own fd.
+                let mut file = File::from(crate::file_descriptor::read_raw_fd(_reader)?);
 
                 let argc = _reader.read::<i32>()?;
                 let mut argv = Vec::new();
@@ -280,10 +293,7 @@ impl<T: Remotable> Inner<T> {
                     argv.push(_reader.read::<String>()?);
                 }
 
-                // SAFETY: `_reader` owns and closes the fd; ManuallyDrop avoids a double close.
-                let mut file = unsafe { ManuallyDrop::new(File::from_raw_fd(fd as _)) };
-
-                self.remotable.on_dump(file.deref_mut(), argv.as_slice())
+                self.remotable.on_dump(&mut file, argv.as_slice())
             }
             SHELL_COMMAND_TRANSACTION => {
                 log::error!("SHELL_COMMAND_TRANSACTION is not supported.");
@@ -728,16 +738,28 @@ mod feature_flags_tests {
         assert_eq!(flags & FLAT_BINDER_FLAG_TXN_SECURITY_CTX, 0);
     }
 
+    /// `TXN_SECURITY_CTX` is requested only where SELinux is available.
     #[test]
-    fn requesting_sid_sets_txn_security_ctx() {
+    fn requesting_sid_sets_txn_security_ctx_only_with_selinux() {
         let features = BinderFeatures {
             set_requesting_sid: true,
             ..Default::default()
         };
+        let with = features.flat_flags_with(true);
+        assert_ne!(with & FLAT_BINDER_FLAG_TXN_SECURITY_CTX, 0);
+        assert_ne!(with & FLAT_BINDER_FLAG_ACCEPTS_FDS, 0);
+        let without = features.flat_flags_with(false);
+        assert_eq!(
+            without, FLAT_BINDER_FLAG_ACCEPTS_FDS,
+            "no SELinux, no secctx request"
+        );
+
         let b = Binder::new_with_features(DummyRemotable, features);
         let flags = b.inner.local_binder_flags();
-        assert_ne!(flags & FLAT_BINDER_FLAG_TXN_SECURITY_CTX, 0);
-        assert_ne!(flags & FLAT_BINDER_FLAG_ACCEPTS_FDS, 0);
+        assert_eq!(
+            flags & FLAT_BINDER_FLAG_TXN_SECURITY_CTX != 0,
+            crate::process_state::selinux_available()
+        );
     }
 
     // BinderFeatures sched policy / priority / inherit_rt encoding into flat_binder_object.flags.
@@ -1017,5 +1039,87 @@ mod stability_mutation_tests {
             StatusCode::InvalidOperation,
             "mutation after parceled-flip must fail"
         );
+    }
+}
+
+#[cfg(all(test, feature = "rpc"))]
+mod rpc_dispatch_tests {
+    use super::*;
+    use crate::rpc::transport::MemTransport;
+    use crate::rpc::{AddressSpace, RpcProxy, RpcSession};
+
+    /// Fails code `FIRST_CALL_TRANSACTION + n` with the `n`th status; `on_dump` writes "dumped".
+    struct Svc;
+    const FAILS_WITH: [StatusCode; 2] = [StatusCode::DeadObject, StatusCode::PermissionDenied];
+    impl Remotable for Svc {
+        fn descriptor() -> &'static str {
+            "x.y.ISvc"
+        }
+        fn on_transact(&self, code: TransactionCode, _: &mut Parcel, _: &mut Parcel) -> Result<()> {
+            let n = code.wrapping_sub(FIRST_CALL_TRANSACTION) as usize;
+            Err(FAILS_WITH
+                .get(n)
+                .copied()
+                .unwrap_or(StatusCode::UnknownTransaction))
+        }
+        fn on_dump(&self, writer: &mut dyn std::io::Write, _: &[String]) -> Result<()> {
+            writer.write_all(b"dumped")?;
+            Ok(())
+        }
+    }
+
+    /// The RPC reply status of a handler's `DeadObject` is `FailedTransaction`; others pass.
+    #[test]
+    fn an_rpc_handler_dead_object_is_not_replied_as_dead_object() {
+        let (a, b) = MemTransport::pair();
+        let server = RpcSession::new(Box::new(a), AddressSpace::Acceptor).unwrap();
+        server
+            .set_root(Interface::as_binder(&Binder::new(Svc)))
+            .unwrap();
+        let handle = std::thread::spawn(move || {
+            let _ = server.serve_blocking();
+        });
+        {
+            let client = RpcSession::new(Box::new(b), AddressSpace::Initiator).unwrap();
+            let root = client.get_root().unwrap();
+            let rp = (*root).as_any().downcast_ref::<RpcProxy>().unwrap();
+            let call = |code| {
+                let data = rp.build_request(Svc::descriptor()).unwrap();
+                rp.transact(code, &data, 0).map(|_| ())
+            };
+            assert_eq!(
+                call(FIRST_CALL_TRANSACTION),
+                Err(StatusCode::FailedTransaction)
+            );
+            assert_eq!(
+                call(FIRST_CALL_TRANSACTION + 1),
+                Err(StatusCode::PermissionDenied)
+            );
+        }
+        handle.join().unwrap();
+    }
+
+    /// An RPC `DUMP_TRANSACTION` takes its fd from the session's table (AOSP `readFileDescriptor`).
+    #[test]
+    fn an_rpc_dump_writes_to_the_fd_it_carries() {
+        use std::io::Read;
+
+        let (read_end, write_end) = rustix::pipe::pipe().unwrap();
+        // R34/v0 `Unix` body: fd index 0, then argc 0.
+        let mut bytes = 0i32.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        let mut data = Parcel::data_only_from_vec(bytes);
+        data.set_rpc_fd_mode(crate::rpc::FileDescriptorTransportMode::Unix);
+        data.rpc_set_in_fds(vec![write_end]);
+
+        let binder = Interface::as_binder(&Binder::new(Svc));
+        let mut reply = Parcel::new();
+        binder
+            .rpc_transact(DUMP_TRANSACTION, &mut data, &mut reply)
+            .unwrap();
+        drop(data);
+        let mut got = Vec::new();
+        File::from(read_end).read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"dumped");
     }
 }

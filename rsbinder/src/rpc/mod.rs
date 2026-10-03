@@ -434,8 +434,7 @@ pub fn __fuzz_decode_rpc_parcel(input: &[u8]) {
     }
 
     fn fresh(input: &[u8]) -> Parcel {
-        let mut p = Parcel::from_vec(input.to_vec());
-        p.set_for_rpc(true);
+        let mut p = Parcel::data_only_from_vec(input.to_vec());
         p.attach_rpc_ops(Arc::new(NullOps));
         p.set_data_position(0);
         p
@@ -581,7 +580,7 @@ mod tests {
 
         // Generic `Vec<T>` array path, body empty after the length.
         let mut p = Parcel::new();
-        p.set_for_rpc(true);
+        p.set_for_rpc(true).unwrap();
         p.write(&i32::MAX).unwrap();
         p.set_data_position(0);
         assert!(
@@ -591,7 +590,7 @@ mod tests {
 
         // A little data present (data_avail() > 0 but << len).
         let mut p = Parcel::new();
-        p.set_for_rpc(true);
+        p.set_for_rpc(true).unwrap();
         p.write(&i32::MAX).unwrap();
         p.write(&7i32).unwrap();
         p.write(&8i32).unwrap();
@@ -601,7 +600,7 @@ mod tests {
         // Out-vec lengths are capped by byte size (AOSP 1 MB), not by `data_avail()`.
         for (len, want) in [(i32::MAX, Err(StatusCode::NoMemory)), (4, Ok(()))] {
             let mut p = Parcel::new();
-            p.set_for_rpc(true);
+            p.set_for_rpc(true).unwrap();
             p.write(&len).unwrap();
             p.set_data_position(0);
             assert_eq!(p.resize_out_vec::<i32>(&mut Vec::new()), want);

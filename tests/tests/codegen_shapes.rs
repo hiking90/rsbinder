@@ -20,7 +20,7 @@ use rsbinder::{ExceptionCode, FromIBinder, Interface, SIBinder};
 
 include!(concat!(env!("OUT_DIR"), "/codegen_shapes.rs"));
 
-use shapes::ICodegenShapes::{BnCodegenShapes, ICodegenShapes};
+use shapes::ICodegenShapes::{BnCodegenShapes, FixedTagged, ICodegenShapes};
 
 struct ShapesSvc;
 impl Interface for ShapesSvc {}
@@ -58,6 +58,21 @@ impl ICodegenShapes for ShapesSvc {
         v.reverse();
         Ok(())
     }
+
+    fn r#reverseTags(
+        &self,
+        tags: &[FixedTagged::Tag],
+    ) -> rsbinder::BinderResult<Vec<FixedTagged::Tag>> {
+        Ok(tags.iter().rev().copied().collect())
+    }
+
+    fn r#failUnexpectedNull(&self) -> rsbinder::BinderResult<()> {
+        Err(rsbinder::StatusCode::UnexpectedNull.into())
+    }
+
+    fn r#failDeadObject(&self) -> rsbinder::BinderResult<()> {
+        Err(rsbinder::StatusCode::DeadObject.into())
+    }
 }
 
 fn root() -> SIBinder {
@@ -93,7 +108,12 @@ fn run(server_t: Box<dyn RpcTransport>, client_t: Box<dyn RpcTransport>) {
             .expect_err("an unset non-nullable out binder must fail the transaction");
         assert_eq!(
             err.exception_code(),
-            ExceptionCode::NullPointer,
+            ExceptionCode::TransactionFailed,
+            "got: {err:?}"
+        );
+        assert_eq!(
+            err.transaction_error(),
+            rsbinder::StatusCode::UnexpectedNull,
             "got: {err:?}"
         );
 
@@ -130,6 +150,47 @@ fn run(server_t: Box<dyn RpcTransport>, client_t: Box<dyn RpcTransport>) {
             .expect("inout binder array");
         // The service reversed it: the callee's mutation, not the input, comes back.
         assert_eq!(v, vec![other, sib.clone()], "the reversed array comes back");
+
+        let tags = [
+            FixedTagged::Tag::a,
+            FixedTagged::Tag::b,
+            FixedTagged::Tag::b,
+        ];
+        let got = shapes
+            .r#reverseTags(&tags)
+            .expect("a FixedSize union Tag[]");
+        assert_eq!(
+            got,
+            [
+                FixedTagged::Tag::b,
+                FixedTagged::Tag::b,
+                FixedTagged::Tag::a
+            ]
+        );
+
+        let err = shapes
+            .r#failUnexpectedNull()
+            .expect_err("the service fails it");
+        assert_eq!(
+            err.exception_code(),
+            ExceptionCode::TransactionFailed,
+            "got: {err:?}"
+        );
+        assert_eq!(
+            err.transaction_error(),
+            rsbinder::StatusCode::UnexpectedNull,
+            "got: {err:?}"
+        );
+
+        let err = shapes.r#failDeadObject().expect_err("the service fails it");
+        assert_eq!(
+            err.transaction_error(),
+            rsbinder::StatusCode::FailedTransaction,
+            "a handler's DeadObject is replied as FailedTransaction; got: {err:?}"
+        );
+        shapes
+            .r#reverseTags(&[])
+            .expect("the session survives a handler's DeadObject");
     }
 
     handle.join().expect("server thread");
