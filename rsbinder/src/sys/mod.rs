@@ -55,11 +55,9 @@ pub mod binder {
     pub use crate::sys::*;
 
     /// `binder_transaction_data.sender_pid`'s type, under its libc name.
-    #[allow(non_camel_case_types)]
-    pub type pid_t = __kernel_pid_t;
+    pub use crate::sys::__kernel_pid_t as pid_t;
     /// `binder_transaction_data.sender_euid`'s type, under its libc name.
-    #[allow(non_camel_case_types)]
-    pub type uid_t = __kernel_uid32_t;
+    pub use crate::sys::__kernel_uid32_t as uid_t;
 
     use rustix::{io, ioctl};
     use std::os::fd::AsFd;
@@ -158,7 +156,7 @@ pub mod binder {
     }
 
     // `binderfs::add_device` substitutes a mock under `cfg(test)`.
-    #[cfg_attr(test, allow(dead_code))]
+    #[cfg(not(test))]
     pub(crate) fn binder_ctl_add<Fd: AsFd>(
         fd: Fd,
         device: &mut binderfs_device,

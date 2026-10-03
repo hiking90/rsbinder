@@ -515,7 +515,13 @@ enum Android15Numbering {
 }
 
 /// Side-effect-free: past the end pre-r6, `getServiceDebugInfo()` on r6+ (`numbering_pins`).
-#[allow(dead_code)] // only issued on android; pinned everywhere
+#[cfg(any(
+    test,
+    all(
+        target_os = "android",
+        any(feature = "android_14", feature = "android_15")
+    )
+))]
 pub(crate) const ANDROID_15_PROBE_CODE: TransactionCode = 14;
 
 /// Tells the two Android 15 numberings apart with one [`ANDROID_15_PROBE_CODE`] transaction.

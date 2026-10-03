@@ -38,7 +38,7 @@
 //! `RpcSessionInner.state` holds only a `Weak` (it dedups without keeping proxies alive), so
 //! dropping `inner` is what fires `RpcProxy::drop`.
 //!
-//! Its `session` field is belt and braces. `RpcProxy` holds a *strong*
+//! Its `_session` field is belt and braces. `RpcProxy` holds a *strong*
 //! `Arc<RpcSessionInner>` (as AOSP `sp<RpcSession>`), so `inner` alone already keeps the
 //! session — and its connection — alive until the proxy's `DEC_STRONG` has gone out; the
 //! handle only makes that visible in the type. Field order is not load-bearing.
@@ -83,13 +83,15 @@ pub(crate) struct AccessorRoot {
     /// The `get_root` binder; it keeps the proxy alive (the session cache holds only a `Weak`).
     inner: SIBinder,
     /// Redundant with `inner`'s strong session ref; it states the lifetime in the type.
-    #[allow(dead_code)]
-    session: RpcSession,
+    _session: RpcSession,
 }
 
 impl AccessorRoot {
     fn into_sibinder(inner: SIBinder, session: RpcSession) -> Result<SIBinder> {
-        SIBinder::new(Arc::new(AccessorRoot { inner, session }))
+        SIBinder::new(Arc::new(AccessorRoot {
+            inner,
+            _session: session,
+        }))
     }
 
     fn inner_binder(&self) -> &dyn IBinder {
