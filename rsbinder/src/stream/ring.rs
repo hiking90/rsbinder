@@ -22,6 +22,7 @@ use rsbinder_fmq::{AttachPolicy, Descriptor, EventFlag, MessageQueue, NOT_EMPTY,
 use crate::binder::Interface;
 use crate::error::{Result, StatusCode};
 use crate::fmq::{MQDescriptor, SynchronizedReadWrite};
+use crate::parcel::Parcel;
 use crate::parcelable::{Deserialize, Serialize};
 use crate::status::{BinderResult, ExceptionCode, Status};
 use crate::SIBinder;
@@ -464,6 +465,8 @@ impl Drop for Unhanded<'_> {
 pub(super) struct Producer<T: ?Sized> {
     shared: Arc<Shared>,
     transit: Arc<Transit>,
+    /// Reused encoding buffer, new after a refusal or a pool hand-off; boxed: `Parcel` is `!Freeze`.
+    scratch: Box<Parcel>,
     /// Set once the end record is in, so `Drop` does not write a second.
     ended: bool,
     /// The consumer's sink, kept for the unlink in `Drop`.
@@ -502,6 +505,7 @@ impl<T: Serialize + ?Sized> Producer<T> {
         Ok(Producer {
             shared,
             transit: Arc::new(Transit::default()),
+            scratch: Box::new(Parcel::new_data_only()),
             ended: false,
             sink: sink.clone(),
             death,
@@ -509,21 +513,27 @@ impl<T: Serialize + ?Sized> Producer<T> {
         })
     }
 
-    /// Encode `item` and check it against the ring. Nothing is written.
-    fn encode(&self, item: &T) -> Result<Vec<u8>> {
+    /// Encode `item` into `scratch` and check it against the ring. Nothing is written.
+    fn encode(&mut self, item: &T) -> Result<()> {
         self.usable()?;
-        let bytes = encode_item(item)?;
-        if bytes.len() > self.max_item_bytes() {
-            log::error!(
-                "stream: an item of {} bytes does not fit a ring of {} bytes, whose largest item \
-                 is {} bytes",
-                bytes.len(),
-                self.shared.capacity,
-                self.max_item_bytes()
-            );
-            return Err(StatusCode::BadValue);
+        let encoded = encode_item(&mut self.scratch, item).and_then(|()| {
+            let len = self.scratch.ipc_data_size();
+            if len > self.max_item_bytes() {
+                log::error!(
+                    "stream: an item of {len} bytes does not fit a ring of {} bytes, whose \
+                     largest item is {} bytes",
+                    self.shared.capacity,
+                    self.max_item_bytes()
+                );
+                return Err(StatusCode::BadValue);
+            }
+            Ok(())
+        });
+        if encoded.is_err() {
+            // Drops a refused item's partial bytes, and the allocation an oversize one grew.
+            *self.scratch = Parcel::new_data_only();
         }
-        Ok(bytes)
+        encoded
     }
 
     /// Write an item record; `Ok(false)` only for `Wait::Never` and a full ring.
@@ -543,13 +553,13 @@ impl<T: Serialize + ?Sized> Producer<T> {
     }
 
     pub(super) fn send(&mut self, item: &T, deadline: Option<Instant>) -> Result<()> {
-        let bytes = self.encode(item)?;
+        self.encode(item)?;
         // A pool record goes in first, and its unreported failure is returned before any write.
         if !self.transit.wait_idle_until(deadline) {
             return Err(StatusCode::TimedOut);
         }
         self.reported()?;
-        self.write_item(&bytes, Wait::from_deadline(deadline))
+        self.write_item(self.scratch.as_bytes()?, Wait::from_deadline(deadline))
             .map(|_| ())
     }
 
@@ -593,19 +603,22 @@ impl<T: Serialize + ?Sized> Producer<T> {
         let staged = self.encode(item);
         async move {
             let deadline = super::call_deadline(timeout);
-            let bytes = staged?;
+            staged?;
             let unhanded = Unhanded(&self.transit);
             // Needs no deadline of its own: an orphan's deadline is no later than this call's.
             self.transit.idle_async().await;
             std::mem::forget(unhanded);
             self.reported()?;
             // Room now means no pool: the copy is the whole cost.
-            if self.write_item(&bytes, Wait::Never)? {
+            if self.write_item(self.scratch.as_bytes()?, Wait::Never)? {
                 return Ok(());
             }
             if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
                 return Err(StatusCode::TimedOut);
             }
+            // The pool task outlives this borrow, so the record takes the bytes with it.
+            let bytes =
+                std::mem::replace(&mut *self.scratch, Parcel::new_data_only()).into_bytes()?;
             let wait = Wait::from_deadline(deadline);
             let record =
                 RecordInTransit::new(self.shared.clone(), self.transit.clone(), bytes, wait);
@@ -1097,7 +1110,7 @@ impl<T: Deserialize> Consumer<T> {
             // What was recorded is the end, as the empty-ring branch reports it.
             return Step::End(end.clone().unwrap_or(status));
         }
-        match decode_item::<T>(&self.buf) {
+        match decode_item::<T>(&mut self.buf) {
             Ok(item) => Step::Item(item),
             Err(e) => self.fail(Status::from(e)),
         }
@@ -1291,6 +1304,10 @@ mod tests {
         // A `Vec<u8>` encodes as a length and the bytes, padded to four.
         let too_big = vec![0u8; 1024 - END_RESERVE];
         assert_eq!(tx.send(&too_big, None).err(), Some(StatusCode::BadValue));
+        assert!(
+            tx.scratch.capacity() < too_big.len(),
+            "the scratch does not keep what the refused item grew"
+        );
         let fits = vec![7u8; 700];
         tx.send(&fits, None).expect("an item within the limit");
         end(tx).expect("end");
