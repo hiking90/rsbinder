@@ -51,10 +51,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rsbinder::hub::android_16::{
-    self as a16, accessor_error_name, resolve_accessor, BnAccessor, IAccessor,
-    ERROR_CONNECTION_INFO_NOT_FOUND, ERROR_FAILED_TO_CONNECT_EACCES,
-    ERROR_FAILED_TO_CONNECT_TO_SOCKET, ERROR_FAILED_TO_CREATE_SOCKET,
-    ERROR_UNSUPPORTED_SOCKET_FAMILY,
+    accessor_error_name, resolve_accessor, BnAccessor, IAccessor, ERROR_CONNECTION_INFO_NOT_FOUND,
+    ERROR_FAILED_TO_CONNECT_EACCES, ERROR_FAILED_TO_CONNECT_TO_SOCKET,
+    ERROR_FAILED_TO_CREATE_SOCKET, ERROR_UNSUPPORTED_SOCKET_FAMILY,
 };
 use rsbinder::rpc::{RpcProxy, RpcServer};
 use rsbinder::{
@@ -339,10 +338,10 @@ fn accessor_instance_name_mismatch_rejects() {
     );
 }
 
-// ---- mutant 2: addConnection ServiceSpecificError decode ------------
+// ---- mutant 2: addConnection ServiceSpecificError reject ------------
 
 #[test]
-fn accessor_add_connection_service_specific_error_rejects_and_logs() {
+fn accessor_add_connection_service_specific_error_rejects() {
     let server = EchoServerGuard::start("sserror");
     for &code in &[
         ERROR_CONNECTION_INFO_NOT_FOUND,
@@ -364,12 +363,6 @@ fn accessor_add_connection_service_specific_error_rejects_and_logs() {
             "ERROR={code} must reject"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        // The symbolic name is what the operator-facing log line shows.
-        let name = accessor_error_name(code);
-        assert!(
-            name.starts_with("ERROR_"),
-            "unknown symbol for {code}: {name}"
-        );
     }
 }
 
@@ -378,6 +371,8 @@ fn accessor_add_connection_service_specific_error_rejects_and_logs() {
 #[test]
 fn accessor_root_keeps_session_alive_then_terminates_on_drop() {
     let server = EchoServerGuard::start("lifetime");
+    // The guard and the accept thread; each serving worker holds one more.
+    let idle_refs = Arc::strong_count(&server.server);
     let addconn_calls = Arc::new(AtomicU32::new(0));
     let accessor = make_mock_accessor(MockAccessor {
         server_path: server.path.clone(),
@@ -401,10 +396,16 @@ fn accessor_root_keeps_session_alive_then_terminates_on_drop() {
         server.server.live_session_node_count() >= 1,
         "the root node is live"
     );
+    assert!(
+        Arc::strong_count(&server.server) > idle_refs,
+        "a worker serves the session"
+    );
     drop(clone);
-    // The last reference closes the session, so the server's side releases its nodes.
+    // The last reference closes the session's connections, so every worker exits.
     let deadline = Instant::now() + Duration::from_secs(5);
-    while server.server.live_session_node_count() != 0 {
+    while Arc::strong_count(&server.server) != idle_refs
+        || server.server.live_session_node_count() != 0
+    {
         assert!(
             Instant::now() < deadline,
             "the session outlived its last root reference"
@@ -545,11 +546,31 @@ fn resolve_via_process_local_keys_strictly_by_instance_name() {
 fn accessor_error_name_unknown_codes_safe() {
     // Non-ServiceSpecific statuses read as `0`, so another `ERROR_*=0` would mask failures.
     assert_eq!(accessor_error_name(0), "ERROR_CONNECTION_INFO_NOT_FOUND");
+    // Each name is what `resolve_accessor`'s operator-facing log line shows.
+    for (code, name) in [
+        (
+            ERROR_CONNECTION_INFO_NOT_FOUND,
+            "ERROR_CONNECTION_INFO_NOT_FOUND",
+        ),
+        (
+            ERROR_FAILED_TO_CREATE_SOCKET,
+            "ERROR_FAILED_TO_CREATE_SOCKET",
+        ),
+        (
+            ERROR_FAILED_TO_CONNECT_TO_SOCKET,
+            "ERROR_FAILED_TO_CONNECT_TO_SOCKET",
+        ),
+        (
+            ERROR_FAILED_TO_CONNECT_EACCES,
+            "ERROR_FAILED_TO_CONNECT_EACCES",
+        ),
+        (
+            ERROR_UNSUPPORTED_SOCKET_FAMILY,
+            "ERROR_UNSUPPORTED_SOCKET_FAMILY",
+        ),
+    ] {
+        assert_eq!(accessor_error_name(code), name, "code {code}");
+    }
     assert_eq!(accessor_error_name(42), "unknown");
     assert_eq!(accessor_error_name(-1), "unknown");
-    // The `hub::android_16` re-export matches the module-local one.
-    assert_eq!(
-        a16::accessor_error_name(0),
-        "ERROR_CONNECTION_INFO_NOT_FOUND"
-    );
 }

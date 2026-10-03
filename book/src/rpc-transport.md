@@ -259,10 +259,8 @@ For the android-13+ client there is also a builder,
 consumed by `RpcSession::setup_client_android13plus_with_config`. It has
 one constructor per transport — `unix`, `unix_abstract`, `vsock`, `tls`,
 `tcp_debug`, and `new` for a connect function of your own — and the same
-knobs on all of them: attaching to an existing session by echoing its
-32-byte id, an outgoing-connection fan-out, incoming (callback)
-connections, and the fd transport mode (session-id attach and fan-out are
-mutually exclusive):
+knobs on all of them: an outgoing-connection fan-out, incoming (callback)
+connections, and the fd transport mode:
 
 ```rust
 use rsbinder::rpc::{FileDescriptorTransportMode, RpcClientConfig, RpcSession};
@@ -278,18 +276,37 @@ The Unix-only predecessor `RpcUnixClientConfig`, and the
 `setup_unix_client_android13plus_{with_config,with_id,fan_out}` helpers,
 are deprecated since 0.12.0 and will be removed in the release after it.
 
-> **The id you echo must come from `RpcSession::get_session_id()`** — one
-> round trip that asks the server for it. `RpcSession::session_id()` is a
-> *different* method: on a client session it returns a client-local value
-> that the server has never seen, so echoing it is always wrong. Both
-> return 32 opaque bytes, so nothing but the method name distinguishes
-> them; an attach that echoes the wrong id (or one the server refuses for
-> any other reason, such as more connections than its `set_max_threads`
-> allows) fails at the attach call. On `add_outgoing_connection_with_config`
-> that failure also ends the session it was attaching to, unless the id is
-> this session's own `session_id()`, which is refused (`BadValue`) before
-> connecting (see [How a connection ends](#how-a-connection-ends)); stay
-> within `negotiate()` connections and echo `get_session_id()`.
+The builder's `session_id` knob is for the manual attach calls,
+`add_outgoing_connection_with_config` and
+`add_incoming_connection_with_config`, which add one connection to a
+session you already hold. Every entry that builds a new `RpcSession` —
+`setup_client_android13plus_with_config`, the deprecated
+`setup_unix_client_android13plus_with_id` and
+`connect_android13plus_fd_with_id`, and the entry API's deprecated
+`ClientOptions::session_id` — refuses a non-empty id with `BadValue`. A
+second client `RpcSession` on one server session would keep its own oneway
+numbering, binder addresses and lifetime: the server would drop one side's
+oneway calls as out of order, could dispatch a call meant for one side's
+binder to the other side's binder at the same address, and would end the
+shared session when either side closed. AOSP has no public entry for this
+either: `RpcSession::setupClient` is private, and the connections that
+echo the id belong to the session that read it. For the same reason a
+manual attach accepts only the id of the session it is called on: any
+other id, such as one read from another `RpcSession`, is `BadValue`
+before connecting.
+
+> **The id you echo must come from `RpcSession::get_session_id()`** on the
+> session you attach to — one round trip that asks the server for it, kept
+> by the session. `RpcSession::session_id()` is a *different* method: on a
+> client session it returns a client-local value that the server has never
+> seen. Both return 32 opaque bytes, so nothing but the method name
+> distinguishes them; the attach calls refuse every id but the session's
+> own with `BadValue` before connecting. An attach the server refuses (for
+> example, more connections than its `set_max_threads` allows) fails at the
+> attach call, and on `add_outgoing_connection_with_config` that failure
+> also ends the session it was attaching to (see
+> [How a connection ends](#how-a-connection-ends)); stay within
+> `negotiate()` connections.
 
 > **Security.** An abstract socket has **no filesystem permissions**:
 > any process in the same network namespace can connect (subject only to
@@ -453,11 +470,21 @@ kernel binder for, with a few extras specific to socket transport:
   a handler always works; a `oneway` call, or a call from *any other*
   server thread, needs the client to open an incoming connection — see
   [Callbacks outside a handler](#callbacks-outside-a-handler).
-- **`ParcelFileDescriptor`** — opt in with
-  `RpcSession::negotiate_fd_transport` and
-  `RpcServer::set_supported_fd_modes`. File descriptors ride
-  out-of-band over `SCM_RIGHTS` on Unix-domain sockets (android-14+
-  wire required).
+- **`ParcelFileDescriptor`** — opt in on both ends: the server with
+  `RpcServer::set_supported_fd_modes`, the client with
+  `RpcClientConfig::fd_mode` (the `fd_mode` connect option of the entry
+  API). On the android-14+ wire the mode rides the connection header and
+  is fixed for the session's lifetime, as in AOSP. A server that has not
+  opted in refuses a client that requests `Unix`, as AOSP does: it closes
+  the connection after the handshake, so the client's first call fails
+  with `DeadObject`. On that wire
+  `RpcSession::negotiate_fd_transport` sends nothing, and asking it for a
+  `Unix` mode the header did not agree is `StatusCode::InvalidOperation`.
+  An android-13 (v0) header carries no fd mode, so such a session passes
+  no fds. `negotiate_fd_transport` negotiates only on the r34 wire, which
+  has no fd mode in AOSP, as an rsbinder-only exchange after connect;
+  against AOSP r34 libbinder it returns `None`. File descriptors ride
+  out-of-band over `SCM_RIGHTS` on Unix-domain sockets.
 - **Death notifications** — link a `DeathRecipient` on the proxy as
   usual. A session that ends — its peer closes, any one of its
   connections fails, or a deadline expires (see [Timeouts](#timeouts)) —

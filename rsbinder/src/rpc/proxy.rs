@@ -259,9 +259,7 @@ impl crate::binder::RemoteProxy for RpcProxy {
 
 impl Drop for RpcProxy {
     fn drop(&mut self) {
-        // Never waits on a slot in a user `Drop`: see session module doc "Deferred `DEC_STRONG`".
-        // Identity-checked: must not evict a successor re-cached by a racing `read_binder`.
-        // Held while the peer has not paid back a send of this address (`state` "Ref-count model").
+        // Identity-checked; never waits on a slot (session doc "Deferred `DEC_STRONG`").
         self.session
             .release_proxy(self.addr, self as *const RpcProxy as *const ());
     }

@@ -153,14 +153,17 @@ rsbinder does not wrap that: its `tokio` feature deliberately does not pull
 
 `ParcelFileDescriptor` also crosses the socket-based
 [RPC transport](./rpc-transport.md) (the `rpc` Cargo feature). Unlike
-kernel binder, FD passing over RPC is **opt-in and negotiated per
-connection**: the server declares the modes it accepts with
-`RpcServer::set_supported_fd_modes`, and the client requests one with
-`RpcSession::negotiate_fd_transport` (or the `fd_mode` knob on the
-`RpcClientConfig` builder). Descriptors then travel out-of-band via
-`SCM_RIGHTS`, which requires a Unix-domain socket and the android-14+
-wire version. Service and client code using `ParcelFileDescriptor` is
-otherwise unchanged. See
+kernel binder, FD passing over RPC is **opt-in on both ends and fixed
+per session**: the server declares the modes it accepts with
+`RpcServer::set_supported_fd_modes`, and the client requests one before
+connecting with the `fd_mode` knob on the `RpcClientConfig` builder (the
+`fd_mode` connect option of the entry API). On the android-14+ wire the
+mode rides the connection header, as in AOSP; an android-13 (v0) session
+passes no fds. On the r34 wire, between two rsbinder peers only,
+`RpcSession::negotiate_fd_transport` agrees the mode after connecting.
+Descriptors then travel out-of-band via `SCM_RIGHTS`, which requires a
+Unix-domain socket. Service and client code using `ParcelFileDescriptor`
+is otherwise unchanged. See
 [RPC Transport](./rpc-transport.md#capabilities) for details.
 
 ## Tips

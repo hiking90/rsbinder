@@ -76,7 +76,7 @@
 //! * `RpcConnectionHeader` (still 16 B): a reserved byte becomes
 //!   `u8 fileDescriptorTransportMode` (`NONE=0/UNIX=1/TRUSTY=2`) —
 //!   FD mode is negotiated *in the connection header* at v1, not via
-//!   the separate `GET_FD_MODE` special transact rsbinder uses.
+//!   the separate `GET_FD_MODE` special transact rsbinder uses (r34 only).
 //!
 //! ## v1 → v2 (android-16)
 //!
@@ -461,8 +461,7 @@ impl Android13PlusCodec {
     /// `RpcConnectionHeader` (16 B) + `session_id` bytes
     /// (empty ⇒ request a new session). `fd_mode` is written into the
     /// v1 `fileDescriptorTransportMode` byte; at v0 that byte is part
-    /// of `reserved` (so `fd_mode` is ignored — v0 negotiates FD mode
-    /// via the separate `GET_FD_MODE` transact).
+    /// of `reserved` (so `fd_mode` is ignored — v0 carries no fd mode).
     pub fn encode_connection_header(
         &self,
         incoming: bool,

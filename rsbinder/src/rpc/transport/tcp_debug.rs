@@ -57,6 +57,12 @@ impl TcpDebugTransport {
     /// Wrap an accepted/connected `TcpStream` (sets `TCP_NODELAY`).
     pub fn from_stream(stream: TcpStream) -> RpcResult<Self> {
         warn_once();
+        // No `MSG_NOSIGNAL` on Apple, as `UnixTransport::from_stream`; EINVAL: both ways shut.
+        #[cfg(target_vendor = "apple")]
+        rustix::net::sockopt::set_socket_nosigpipe(&stream, true).map_err(|e| match e {
+            rustix::io::Errno::INVAL => crate::rpc::RpcError::EndOfStream,
+            e => std::io::Error::from(e).into(),
+        })?;
         // `RpcError: From<std::io::Error>` — `?` converts directly.
         stream.set_nodelay(true)?;
         let desc = match stream.peer_addr() {
@@ -70,6 +76,11 @@ impl TcpDebugTransport {
     /// fd-adopt path, `AF_INET` family).
     /// `std`'s `From<OwnedFd> for TcpStream` is stable cross-platform;
     /// the caller is responsible for asserting the fd's address family.
+    ///
+    /// The fd must be in blocking mode: a read on an `O_NONBLOCK` fd that
+    /// finds no data returns `RpcError::Timeout` at once. An Accessor fd
+    /// arrives non-blocking; [`crate::rpc::RpcSession::from_preconnected_fd`]
+    /// clears the flag, this does not.
     pub fn from_owned_fd(fd: OwnedFd) -> RpcResult<Self> {
         Self::from_stream(TcpStream::from(fd))
     }
