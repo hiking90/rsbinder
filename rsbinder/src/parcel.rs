@@ -145,19 +145,15 @@
 //! bytes of a parcel carrying binders — bytes meaningless without the object
 //! table that travelled beside them.
 //!
-//! # `ParcelPod`
+//! # Array codecs
 //!
-//! `Parcel::write_array` and `read_array` reinterpret a `&[T]` as raw bytes
-//! (and, on read, raw bytes as `T`). That is sound only for a type with no
-//! padding or otherwise-uninitialized bytes (those bytes would leak process
-//! memory to the peer, and reading them is UB) and for which every bit pattern
-//! is a valid value (a peer's bytes become a `T` without validation). The
-//! `T: ParcelPod` bound carries that obligation in the signature instead of
-//! leaving it to whichever caller instantiates the generic.
-//!
-//! Safety contract for an implementor: a primitive integer or float, so no
-//! padding and valid for every bit pattern of its size. The UAPI structs are
-//! not members: they go through field-by-field codecs ("Binder-ABI structs").
+//! `Parcel::write_array` and `read_array` encode element by element through
+//! `WireScalar` (`to_le_bytes` / `from_le_bytes`) rather than reinterpreting
+//! a `&[T]` as bytes, so no element type needs a padding or bit-validity
+//! argument, and a big-endian host swaps in the same pass. An append extends
+//! the buffer with the encoded bytes; a write over existing bytes zero-fills
+//! the slot first. A read reserves the element count, then extends: `collect`
+//! and a zeroed `Vec` decoded in place measured slower on small arrays.
 //!
 //! # Wire and native scalars
 //!
@@ -432,18 +428,6 @@ use crate::{
 
 const STRICT_MODE_PENALTY_GATHER: i32 = 1 << 31;
 
-/// Implementors: no padding, every bit pattern valid; `# Safety` is module doc "`ParcelPod`".
-#[allow(clippy::missing_safety_doc)]
-pub(crate) unsafe trait ParcelPod: Copy {}
-
-macro_rules! impl_parcel_pod {
-    ($($t:ty),* $(,)?) => { $(
-        // SAFETY: primitive integer/float types: no padding, every bit pattern valid.
-        unsafe impl ParcelPod for $t {}
-    )* };
-}
-impl_parcel_pod!(i8, u8, i16, u16, i32, u32, i64, u64, u128, f32, f64);
-
 /// A scalar whose *wire* form is little-endian; see module doc "Wire and native scalars".
 pub(crate) trait WireScalar: Copy {
     /// `[u8; size_of::<Self>()]`; a type because a const can't size an array in a trait signature.
@@ -451,6 +435,12 @@ pub(crate) trait WireScalar: Copy {
 
     fn to_wire(self) -> Self::Bytes;
     fn from_wire(bytes: &[u8]) -> Result<Self>;
+    /// One value per whole `size_of::<Self>()` chunk of `bytes`; a short tail is ignored.
+    fn vec_from_wire(bytes: &[u8]) -> Vec<Self>;
+    /// Encodes `src` into the leading `size_of_val(src)` bytes of `dst`.
+    fn encode_wire(src: &[Self], dst: &mut [u8]);
+    /// Appends `src` encoded to `out`.
+    fn append_wire(out: &mut Vec<u8>, src: &[Self]);
 }
 
 /// Host-native `BC_*`/`BR_*` command-stream scalar; see module doc "Wire and native scalars".
@@ -472,6 +462,27 @@ macro_rules! impl_scalar_codecs {
 
             fn from_wire(bytes: &[u8]) -> Result<Self> {
                 Ok(<$t>::from_le_bytes(bytes.try_into()?))
+            }
+
+            fn vec_from_wire(bytes: &[u8]) -> Vec<Self> {
+                let chunks = bytes.chunks_exact(std::mem::size_of::<$t>());
+                let mut out = Vec::with_capacity(chunks.len());
+                out.extend(chunks.map(|c| {
+                    let mut b = [0u8; std::mem::size_of::<$t>()];
+                    b.copy_from_slice(c);
+                    <$t>::from_le_bytes(b)
+                }));
+                out
+            }
+
+            fn encode_wire(src: &[Self], dst: &mut [u8]) {
+                for (d, v) in dst.chunks_exact_mut(std::mem::size_of::<$t>()).zip(src) {
+                    d.copy_from_slice(&v.to_le_bytes());
+                }
+            }
+
+            fn append_wire(out: &mut Vec<u8>, src: &[Self]) {
+                out.extend(src.iter().flat_map(|v| v.to_le_bytes()));
             }
         }
 
@@ -641,6 +652,22 @@ impl<T: Clone + Default> ParcelData<T> {
 }
 
 impl ParcelData<u8> {
+    /// [`Self::write_at`] for an encoded `src`; appending skips the zero-fill an overwrite needs.
+    fn write_wire_at<S: WireScalar>(&mut self, pos: usize, src: &[S], pad: usize) {
+        let size = std::mem::size_of_val(src);
+        match self {
+            ParcelData::Vec(v) if pos == v.len() => {
+                v.reserve(size + pad);
+                S::append_wire(v, src);
+                v.resize(pos + size + pad, 0);
+            }
+            _ => {
+                self.write_at(pos, &[], size + pad);
+                S::encode_wire(src, &mut self.as_mut_slice()[pos..pos + size]);
+            }
+        }
+    }
+
     /// Writes `bytes` then `pad` zeros at `pos`, zero-filling a `len..pos` gap ("Buffer growth").
     fn write_at(&mut self, pos: usize, bytes: &[u8], pad: usize) {
         let ParcelData::Vec(v) = self else {
@@ -1810,9 +1837,7 @@ impl Parcel {
         self.pos < end
     }
 
-    pub(crate) fn read_array<D: Deserialize + ParcelPod + WireScalar>(
-        &mut self,
-    ) -> Result<Option<Vec<D>>> {
+    pub(crate) fn read_array<D: Deserialize + WireScalar>(&mut self) -> Result<Option<Vec<D>>> {
         let len: i32 = self.read()?;
         if len < -1 {
             log::error!("Parcel: bad array length: {len}");
@@ -1838,32 +1863,12 @@ impl Parcel {
         }
 
         let pos = self.pos;
-
-        // Safer approach: bounds-checked access using slice
         let data_slice = self
             .data
             .as_slice()
             .get(pos..pos + size)
             .ok_or(StatusCode::NotEnoughData)?;
-
-        let mut result = Vec::with_capacity(len as usize);
-        // SAFETY: `data_slice` is `size` = `len` `D`s; `result` has capacity `len`; `D: ParcelPod`.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                data_slice.as_ptr(),
-                result.as_mut_ptr() as *mut u8,
-                size,
-            );
-            result.set_len(len as usize);
-
-            // On LE hosts the memcpy is the decode; BE hosts reverse each element (f32/f64 too).
-            if cfg!(target_endian = "big") && std::mem::size_of::<D>() > 1 {
-                let bytes = std::slice::from_raw_parts_mut(result.as_mut_ptr() as *mut u8, size);
-                for chunk in bytes.chunks_exact_mut(std::mem::size_of::<D>()) {
-                    chunk.reverse();
-                }
-            }
-        }
+        let result = D::vec_from_wire(data_slice);
 
         self.set_data_position(pos + padded);
 
@@ -1966,7 +1971,7 @@ impl Parcel {
         parcelable.serialize(self)
     }
 
-    pub(crate) fn write_array<S: Serialize + ParcelPod + WireScalar>(
+    pub(crate) fn write_array<S: Serialize + WireScalar>(
         &mut self,
         parcelable: &[S],
     ) -> Result<()> {
@@ -1990,18 +1995,7 @@ impl Parcel {
             .ok_or(StatusCode::BadValue)?;
         self.check_object_overlap(end)?;
 
-        // SAFETY: `S: ParcelPod` has no padding, so every byte of `parcelable` is initialized.
-        let bytes: &[u8] = unsafe { std::slice::from_raw_parts(parcelable.as_ptr().cast(), size) };
-        self.data.write_at(pos, bytes, padded - size);
-
-        // Big-endian hosts byte-reverse each element in place (covers f32/f64); LE compiles it out.
-        if cfg!(target_endian = "big") && std::mem::size_of::<S>() > 1 {
-            for chunk in
-                self.data.as_mut_slice()[pos..pos + size].chunks_exact_mut(std::mem::size_of::<S>())
-            {
-                chunk.reverse();
-            }
-        }
+        self.data.write_wire_at(pos, parcelable, padded - size);
 
         self.set_data_position(end);
 
@@ -2861,6 +2855,26 @@ mod tests {
         // Past the end: the gap is zero-filled before the bytes.
         pd.write_at(10, &[9], 0);
         assert_eq!(pd.as_slice(), &[7, 0, 0, 0xFF, 1, 2, 3, 0, 0, 0, 9]);
+    }
+
+    /// Both branches of `write_wire_at` emit LE bytes and zero the pad, on any host.
+    #[test]
+    fn write_wire_at_encodes_le_when_appending_and_overwriting() {
+        let mut pd = super::ParcelData::from_vec(vec![0xFFu8; 2]);
+        pd.write_wire_at(2, &[0x0102_0304u32], 2);
+        assert_eq!(pd.as_slice(), &[0xFF, 0xFF, 4, 3, 2, 1, 0, 0]);
+        // Straddles the end: overwrites three bytes, appends the rest.
+        pd.write_wire_at(5, &[0x0A0Bu16, 0x0C0D], 1);
+        assert_eq!(
+            pd.as_slice(),
+            &[0xFF, 0xFF, 4, 3, 2, 0x0B, 0x0A, 0x0D, 0x0C, 0]
+        );
+        // Inside the buffer: the length stays.
+        pd.write_wire_at(0, &[-2i8], 1);
+        assert_eq!(
+            pd.as_slice(),
+            &[0xFE, 0, 4, 3, 2, 0x0B, 0x0A, 0x0D, 0x0C, 0]
+        );
     }
 
     #[test]

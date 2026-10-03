@@ -7,8 +7,8 @@
 //! performed.
 //!
 //! Five remain: refuted prose, the one slot un-push, the files a
-//! byte-order primitive may appear in plus the `ParcelPod` membership
-//! list, the method surface of `CommandStream`, and the places a raw fd
+//! byte-order primitive may appear in, the method surface of
+//! `CommandStream`, and the places a raw fd
 //! number becomes an fd — each a closed set, not an enumeration of ways
 //! to get it wrong. The call sites of the layer split are not
 //! scanned: L2 is `src/command_stream.rs`'s `CommandStream`, whose
@@ -62,11 +62,8 @@
 //! # Byte order
 //!
 //! L1 (the parcel wire) is little-endian on every host while L2 (the `BC_*`/`BR_*` command
-//! stream) and L3 (the UAPI structs) are native, so
-//! `byte_order_primitives_and_pod_membership_stay_pinned` pins which files may spell a
-//! byte-order primitive — native, big-endian or little-endian — and which types `ParcelPod`
-//! admits to the raw-bytes view of `read_array`/`write_array` (the primitives only; the L3
-//! structs have field-by-field codecs in `binder_object.rs` and `transaction_data.rs`).
+//! stream) and L3 (the UAPI structs) are native, so `byte_order_primitives_stay_pinned`
+//! pins which files may spell a byte-order primitive — native, big-endian or little-endian.
 //!
 //! # `CommandStream`
 //!
@@ -323,9 +320,9 @@ fn enclosing_fn<'a>(lines: &[&'a str], line: usize) -> Option<&'a str> {
         .find(|l| l.starts_with("fn ") || (l.starts_with("pub") && l.contains(" fn ")))
 }
 
-/// Pins where byte-order primitives appear and `ParcelPod`'s members; see module doc "Byte order".
+/// Pins where byte-order primitives appear; see module doc "Byte order".
 #[test]
-fn byte_order_primitives_and_pod_membership_stay_pinned() {
+fn byte_order_primitives_stay_pinned() {
     let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     if !src_root.is_dir() {
         eprintln!("skipping: sources not reachable at {}", src_root.display());
@@ -386,13 +383,6 @@ fn byte_order_primitives_and_pod_membership_stay_pinned() {
             tree_wide: false,
             files: &[("thread_state.rs", 0), ("command_stream.rs", 0)],
         },
-        Pin {
-            // Raw-bytes types: the primitives' macro arm only; a new one needs a padding and
-            // bit-validity audit (`ParcelPod`).
-            needle: "unsafe impl ParcelPod for",
-            tree_wide: true,
-            files: &[("parcel.rs", 1)],
-        },
     ];
 
     let mut failures = Vec::new();
@@ -427,23 +417,9 @@ fn byte_order_primitives_and_pod_membership_stay_pinned() {
         }
     }
 
-    // Membership is this macro argument list, which the `unsafe impl` count cannot see.
-    let parcel_rs = fs::read_to_string(src_root.join("parcel.rs")).unwrap();
-    if !parcel_rs
-        .contains("impl_parcel_pod!(i8, u8, i16, u16, i32, u32, i64, u64, u128, f32, f64);")
-    {
-        failures.push(
-            "the `impl_parcel_pod!` argument list changed — re-audit padding and \
-             bit-validity before raising it (`usize`/`isize` are pointer-width, \
-             so their bytes are not the same width on every host)"
-                .to_string(),
-        );
-    }
-
     assert!(
         failures.is_empty(),
-        "a pinned byte-order primitive or the `ParcelPod` membership list \
-         moved — see this test's doc:\n{}",
+        "a pinned byte-order primitive moved — see this test's doc:\n{}",
         failures.join("\n")
     );
 }
