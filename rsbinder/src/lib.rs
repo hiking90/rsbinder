@@ -246,6 +246,10 @@
         reason = "android-only false positive, even on thread_locals already using `const { .. }`"
     )
 )]
+// Library code returns errors; tests may unwrap (plan 13).
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+// Every allow outside tests says why (plan 13-1).
+#![cfg_attr(not(test), deny(clippy::allow_attributes_without_reason))]
 
 // Core binder functionality
 mod binder;

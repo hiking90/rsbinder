@@ -125,6 +125,10 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Run clippy (rsbinder, no default features)
+        # Lints the `cfg(not(feature = ..))` code the step above never compiles. No
+        # `-D warnings`: only the crate's deny-level lints (plans/13) fail it.
+        run: cargo clippy -p rsbinder --lib --no-default-features
       - name: Check rustdoc
         # docs.rs builds `rsbinder` with `all-features`, so a link that only
         # resolves with `rpc` on still ships — but anyone running `cargo doc`
@@ -492,9 +496,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.rust_min }}
+          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Workspace check (all features)
-        run: cargo check --workspace --all-features
+      - name: Workspace clippy (all features)
+        # Clippy, not check, so `cfg(target_os = "macos")` code meets the crates' deny-level
+        # lints (plans/13). No `-D warnings`: other macOS-only warnings do not fail the job.
+        run: cargo clippy --workspace --all-features
         env:
           RUSTFLAGS: ""
       - name: rsbinder-tools build (rsb_device + rsb_hub compile-only)

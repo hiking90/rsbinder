@@ -52,6 +52,27 @@ Linux/Android-only.
 - Wire-format-affecting changes need a STAGE3 (real-`libbinder` interop)
   result documented in the PR
 
+## Error handling
+
+Library code (each lib crate outside `#[cfg(test)]`) does not call
+`unwrap()`; tests may. Where a value is taken out of an `Option` or
+`Result`:
+
+- A failure that can come from outside (the kernel, an RPC peer, AIDL
+  source, a file, a caller's argument) is returned as an `Err`.
+- If reshaping the code makes the `Option`/`Result` disappear at no cost
+  (`first_chunk` on a checked slice, a match pattern instead of a guard
+  plus `expect`), reshape it.
+- `expect()` is for what cannot be recovered: lock poison, an internal
+  invariant the types cannot express, a documented caller contract. The
+  message names the broken premise (`"conn_state poisoned"`).
+
+Every `allow` outside tests carries `reason = ".."`; one the code needs
+in every build is an `#[expect]`. Both rules are enforced by
+`#![cfg_attr(not(test), deny(clippy::unwrap_used))]` and
+`#![cfg_attr(not(test), deny(clippy::allow_attributes_without_reason))]`
+at each lib crate root; a new lib crate adds the same two lines.
+
 ## Comment & docstring policy
 
 This project deliberately splits the comment convention by audience.

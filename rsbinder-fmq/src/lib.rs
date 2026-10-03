@@ -61,6 +61,10 @@
 //! "Soundness" on [`Regions`].
 
 #![warn(missing_docs)]
+// Library code returns errors; tests may unwrap (plan 13).
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+// Every allow outside tests says why (plan 13-1).
+#![cfg_attr(not(test), deny(clippy::allow_attributes_without_reason))]
 
 mod descriptor;
 mod error;
