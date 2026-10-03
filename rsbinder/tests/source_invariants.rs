@@ -6,10 +6,11 @@
 //! flips the test red until the audit named in the invariant is
 //! performed.
 //!
-//! Four remain: refuted prose, the one slot un-push, the files a
+//! Five remain: refuted prose, the one slot un-push, the files a
 //! byte-order primitive may appear in plus the `ParcelPod` membership
-//! list, and the method surface of `CommandStream` — each a closed set,
-//! not an enumeration of ways to get it wrong. The call sites of the layer split are not
+//! list, the method surface of `CommandStream`, and the places a raw fd
+//! number becomes an fd — each a closed set, not an enumeration of ways
+//! to get it wrong. The call sites of the layer split are not
 //! scanned: L2 is `src/command_stream.rs`'s `CommandStream`, whose
 //! private field leaves the L1 wire codec unreachable from the command
 //! stream's callers.
@@ -73,6 +74,22 @@
 //! forwarding one, from handing `&mut self.0` back out, or from declaring a child module that
 //! reaches the private field from its own file, so `command_stream_exposes_no_new_forward`
 //! pins all three counts: they move only for a deliberate edit.
+//!
+//! # Raw fd numbers
+//!
+//! A kernel parcel closes the fds it holds as `OwnedFd`s, never an fd rebuilt
+//! from the object bytes (`parcel` module doc "Kernel fds"). That holds only
+//! while no other code turns a number read from those bytes into an fd, or
+//! closes it, which the type system cannot see: `from_raw_fd`, `borrow_raw`,
+//! rustix's `io::close` and `libc::close` take any `i32`.
+//! `raw_fd_numbers_become_fds_only_at_the_pinned_sites` lists every call of
+//! the first two in `src/`, by file and enclosing `fn`, test code included,
+//! and allows none of the closes (any `io::close` or `libc::close` path,
+//! `use rustix::io::close` included). The two in `parcel.rs` are the driver-buffer
+//! adoption and the `from_ipc_parts` read; the rest take a number that does
+//! not come from a parcel (a vsock stream's own `into_raw_fd`, and a test's).
+//! A new site — a second adoption, or a close of an fd named by the
+//! bytes — must be argued for here.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -420,6 +437,59 @@ fn byte_order_primitives_and_pod_membership_stay_pinned() {
         "a pinned byte-order primitive or the `ParcelPod` membership list \
          moved — see this test's doc:\n{}",
         failures.join("\n")
+    );
+}
+
+/// Pins every `from_raw_fd` / `borrow_raw` call in `src/`, allows no raw close; module doc.
+#[test]
+fn raw_fd_numbers_become_fds_only_at_the_pinned_sites() {
+    let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    if !src_root.is_dir() {
+        eprintln!("skipping: sources not reachable at {}", src_root.display());
+        return;
+    }
+    // (file under `src/`, enclosing `fn` line prefix), one entry per call.
+    const PINNED: &[(&str, &str)] = &[
+        // The one adoption: the fds the binder driver installed for a received buffer.
+        ("parcel.rs", "pub(crate) unsafe fn from_driver_buffer("),
+        // A `from_ipc_parts` caller keeps each FD object's fd open (its `# Safety`).
+        ("parcel.rs", "fn kernel_fd_at("),
+        // A vsock stream's own `into_raw_fd`.
+        ("hub/accessor_register.rs", "fn connect_vsock_owned_fd("),
+        // A test taking back the fd `into_raw_fd` released.
+        ("file_descriptor.rs", "fn test_parcel_file_descriptor("),
+    ];
+    let mut found: Vec<(String, String)> = Vec::new();
+    visit(&src_root, &mut |path, content| {
+        let lines: Vec<&str> = content.lines().map(code_only).collect();
+        let rel = path.strip_prefix(&src_root).unwrap().to_string_lossy();
+        let rel = rel.replace('\\', "/");
+        for (i, line) in lines.iter().enumerate() {
+            // A close is never pinned, so each one is reported as unpinned.
+            let calls = ["from_raw_fd(", "borrow_raw(", "io::close", "libc::close"]
+                .iter()
+                .map(|needle| line.matches(needle).count())
+                .sum::<usize>();
+            let enclosing = enclosing_fn(&lines, i + 1).unwrap_or("<no fn>");
+            for _ in 0..calls {
+                found.push((rel.clone(), enclosing.to_string()));
+            }
+        }
+    });
+    let mut missing = Vec::new();
+    for (file, prefix) in PINNED {
+        match found
+            .iter()
+            .position(|(p, f)| p == file && f.starts_with(prefix))
+        {
+            Some(at) => drop(found.swap_remove(at)),
+            None => missing.push(format!("{file}: {prefix}")),
+        }
+    }
+    assert!(
+        found.is_empty() && missing.is_empty(),
+        "a raw fd number becomes an fd somewhere new, or a pinned site moved — see this \
+         test's doc.\nunpinned: {found:#?}\nmissing: {missing:#?}"
     );
 }
 

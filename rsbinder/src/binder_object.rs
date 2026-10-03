@@ -20,8 +20,9 @@
 //!   Between the two, `Parcel::write_aligned` can leave the entry unacquired
 //!   (`publish_count = 0`, `kernel_refs = 0`, still holding `Inner<T>`): by a
 //!   panic (typically OOM), or by `Err(BadValue)` when the write would end
-//!   past `i32::MAX` (reachable through `set_data_position`). That entry is
-//!   not reclaimed.
+//!   past `i32::MAX` or `Err(PermissionDenied)` when it would overlap a
+//!   recorded object (both reachable through `set_data_position`). That entry
+//!   is not reclaimed.
 //! - Every `Parcel::write_object` / `Parcel::append_from` call pairs one
 //!   `acquire` with exactly one `release` from `Parcel::release_objects`, driven
 //!   by `Parcel::Drop` for caller-owned outgoing parcels. Driver-mmapped
@@ -76,8 +77,6 @@
 //! assert the AOSP bytes directly.
 
 use std::sync::Arc;
-
-use rustix::fd::{BorrowedFd, FromRawFd, OwnedFd};
 
 pub(crate) use crate::sys::binder::flat_binder_object;
 use crate::{binder::*, error::*, process_state, sys::*};
@@ -148,16 +147,6 @@ impl flat_binder_object {
         unsafe { self.__bindgen_anon_1.handle }
     }
 
-    pub(crate) fn borrowed_fd(&self) -> BorrowedFd<'_> {
-        // SAFETY: caller: a BINDER_TYPE_FD object whose parcel keeps the fd open for `&self`.
-        unsafe { BorrowedFd::borrow_raw(self.handle() as _) }
-    }
-
-    pub(crate) fn owned_fd(&self) -> OwnedFd {
-        // SAFETY: caller: an fd-owning BINDER_TYPE_FD object, taken once (no double close).
-        unsafe { OwnedFd::from_raw_fd(self.handle() as _) }
-    }
-
     pub(crate) fn set_handle(&mut self, handle: u32) {
         self.__bindgen_anon_1.handle = handle
     }
@@ -215,14 +204,8 @@ impl flat_binder_object {
             BINDER_TYPE_HANDLE => process_state::ProcessState::as_self()
                 .strong_proxy_for_handle(self.handle())?
                 .decrease(),
-            BINDER_TYPE_FD => {
-                if self.cookie != 0 {
-                    // Get owned fd and close it.
-                    self.owned_fd();
-                }
-
-                Ok(())
-            }
+            // The parcel's `kernel_fds` owns and closes the fd, never these bytes.
+            BINDER_TYPE_FD => Ok(()),
             _ => {
                 log::error!("Invalid object type {:08x}", self.hdr.type_);
                 Err(StatusCode::InvalidOperation)

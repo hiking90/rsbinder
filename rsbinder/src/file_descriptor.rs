@@ -38,8 +38,8 @@
 
 use crate::error::{Result, StatusCode};
 use crate::{
-    binder_object::flat_binder_object, Deserialize, DeserializeArray, DeserializeOption, Parcel,
-    Serialize, SerializeArray, SerializeOption,
+    Deserialize, DeserializeArray, DeserializeOption, Parcel, Serialize, SerializeArray,
+    SerializeOption,
 };
 
 use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, OwnedFd, RawFd};
@@ -273,11 +273,7 @@ fn write_raw_owned_fd(parcel: &mut Parcel, dup: OwnedFd) -> Result<()> {
         return Ok(());
     }
 
-    let obj = flat_binder_object::new_with_fd(dup.as_raw_fd(), true);
-    parcel.write_object(&obj, true)?;
-    // The parcel now owns the fd; forget the OwnedFd to avoid a double close.
-    let _ = dup.into_raw_fd();
-    Ok(())
+    parcel.write_kernel_fd(dup)
 }
 
 /// AOSP `Parcel::readFileDescriptor`: RPC consumes the table entry; see module doc "Raw fd wire".
@@ -308,12 +304,7 @@ pub(crate) fn read_raw_fd(parcel: &mut Parcel) -> Result<OwnedFd> {
             .ok_or(StatusCode::BadValue);
     }
 
-    let obj = parcel.read_object(true)?;
-    // `read_object` does not check the type; a HANDLE here is BAD_TYPE, as in AOSP.
-    if obj.header_type() != crate::sys::BINDER_TYPE_FD {
-        return Err(StatusCode::BadType);
-    }
-    Ok(rustix::io::fcntl_dupfd_cloexec(obj.borrowed_fd(), 0)?)
+    parcel.read_kernel_fd_dup()
 }
 
 impl Serialize for ParcelFileDescriptor {
@@ -381,35 +372,36 @@ impl DeserializeOption for ParcelFileDescriptor {
 
         // Reliable-PFD comm socket: consume it, send `DETACHED` (AOSP `readParcelFileDescriptor`).
         if has_comm != 0 {
-            let comm = parcel.read_object(true)?;
-            if comm.header_type() != crate::sys::BINDER_TYPE_FD {
-                return Err(StatusCode::BadType);
-            }
-            // Java PFD comm channel, not parcel wire: AOSP peeks this int BIG_ENDIAN.
-            const DETACHED: i32 = 2;
-            let notice = DETACHED.to_be_bytes();
-            // A sender that already closed its end must not fail the fd: AOSP only logs.
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            let flags = rustix::net::SendFlags::NOSIGNAL;
-            #[cfg(not(any(target_os = "linux", target_os = "android")))]
-            let flags = rustix::net::SendFlags::empty();
-            loop {
-                match rustix::net::send(comm.borrowed_fd(), &notice, flags) {
-                    Ok(n) if n == notice.len() => break,
-                    Ok(n) => {
-                        log::error!("short write of the DETACHED status to the comm fd: {n} bytes");
-                        break;
-                    }
-                    Err(rustix::io::Errno::INTR) => continue,
-                    Err(e) => {
-                        log::error!("failed to write the DETACHED status to the comm fd: {e}");
-                        break;
-                    }
-                }
-            }
+            parcel.read_kernel_fd_with(send_detached)?;
         }
 
         Ok(Some(ParcelFileDescriptor::new(fd)))
+    }
+}
+
+/// Tell a reliable PFD's sender on `comm_fd` that this end detached; failures are only logged.
+fn send_detached(comm_fd: BorrowedFd<'_>) {
+    // Java PFD comm channel, not parcel wire: AOSP peeks this int BIG_ENDIAN.
+    const DETACHED: i32 = 2;
+    let notice = DETACHED.to_be_bytes();
+    // A sender that already closed its end must not fail the fd: AOSP only logs.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let flags = rustix::net::SendFlags::NOSIGNAL;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let flags = rustix::net::SendFlags::empty();
+    loop {
+        match rustix::net::send(comm_fd, &notice, flags) {
+            Ok(n) if n == notice.len() => break,
+            Ok(n) => {
+                log::error!("short write of the DETACHED status to the comm fd: {n} bytes");
+                break;
+            }
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) => {
+                log::error!("failed to write the DETACHED status to the comm fd: {e}");
+                break;
+            }
+        }
     }
 }
 
@@ -431,8 +423,7 @@ impl DeserializeArray for ParcelFileDescriptor {}
 #[cfg(all(feature = "rpc", feature = "fuzzing"))]
 #[doc(hidden)]
 pub fn __fuzz_rpc_fd_index(input: &[u8]) {
-    let mut p = Parcel::from_vec(input.to_vec());
-    p.set_for_rpc(true);
+    let mut p = Parcel::data_only_from_vec(input.to_vec());
     p.set_rpc_fd_mode(crate::rpc::FileDescriptorTransportMode::Unix);
     // No ancillary fds installed: every index must be rejected, not panic / leak.
     let _ = <ParcelFileDescriptor as DeserializeOption>::deserialize_option(&mut p);
@@ -466,8 +457,7 @@ fn fuzz_v1_parcel(input: &[u8]) -> Parcel {
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
-    let mut p = Parcel::from_vec(rest[take..].to_vec());
-    p.set_for_rpc(true);
+    let mut p = Parcel::data_only_from_vec(rest[take..].to_vec());
     p.set_rpc_fd_mode(crate::rpc::FileDescriptorTransportMode::Unix);
     p.set_rpc_record_fd_positions(true); // v1+ AOSP body + strict read
     p.rpc_set_object_positions(positions);
@@ -488,8 +478,7 @@ pub fn __fuzz_rpc_raw_fd(input: &[u8]) {
         return;
     };
     let mut p = if profile % 2 == 0 {
-        let mut p = Parcel::from_vec(rest.to_vec());
-        p.set_for_rpc(true);
+        let mut p = Parcel::data_only_from_vec(rest.to_vec());
         p.set_rpc_fd_mode(crate::rpc::FileDescriptorTransportMode::Unix);
         p
     } else {
@@ -596,7 +585,7 @@ mod tests {
     fn rpc_parcel(record_fd_positions: bool) -> Parcel {
         use crate::rpc::FileDescriptorTransportMode as M;
         let mut p = Parcel::new();
-        p.set_for_rpc(true);
+        p.set_for_rpc(true).unwrap();
         p.set_rpc_fd_mode(M::Unix);
         p.set_rpc_record_fd_positions(record_fd_positions);
         p
@@ -660,8 +649,7 @@ mod tests {
     #[cfg(feature = "rpc")]
     fn v1_reader(body: &[u8], positions: Vec<u32>) -> Parcel {
         use crate::rpc::FileDescriptorTransportMode as M;
-        let mut p = Parcel::from_vec(body.to_vec());
-        p.set_for_rpc(true);
+        let mut p = Parcel::data_only_from_vec(body.to_vec());
         p.set_rpc_fd_mode(M::Unix);
         p.set_rpc_record_fd_positions(true);
         p.rpc_set_object_positions(positions);

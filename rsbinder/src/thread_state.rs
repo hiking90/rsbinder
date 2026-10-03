@@ -234,18 +234,27 @@
 //!   skips `pin_release` and the slot leaks; the next ioctl on this thread
 //!   fails anyway.
 //! - **Refused commands.** A `BINDER_WRITE_READ` that fails or stops short
-//!   reports `write_consumed`, the offset the driver gave up at, so the
-//!   command starting there is the one it rejected. `describe_refused_command`
-//!   names it because the usual causes are caller bugs the errno alone cannot
-//!   tell apart: a refcount underflow from an over-released proxy
-//!   (`BC_RELEASE` / `BC_DECREFS`), or a `BC_FREE_BUFFER` for a buffer already
-//!   returned.
+//!   reports `write_consumed`, and which command that offset names depends on
+//!   how the driver stopped (android17-6.18 `binder_thread_write`). A command
+//!   the driver rejects with an error returns before `consumed` is updated, so
+//!   the command starting at `write_consumed` is the rejected one. A short
+//!   write without an error comes from a command that set the thread's
+//!   `return_error` (a failed `BC_TRANSACTION` / `BC_REPLY`, or a
+//!   `BC_REQUEST_DEATH_NOTIFICATION` whose allocation failed): the driver
+//!   advances `consumed` past it and then leaves the loop, so the failed
+//!   command is the one *ending* at `write_consumed`. `describe_refused_command`
+//!   finds that one by walking the stream from offset 0, `4 + _IOC_SIZE(cmd)`
+//!   bytes per command (every `BC_*` code is `_IOW`-encoded with its payload
+//!   size). It names the command because the usual causes are caller bugs the
+//!   errno alone cannot tell apart: a refcount underflow from an over-released
+//!   proxy (`BC_RELEASE` / `BC_DECREFS`), or a `BC_FREE_BUFFER` for a buffer
+//!   already returned.
 
 use log::error;
 use std::backtrace::Backtrace;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::fmt::Debug;
 use std::fs::File;
 use std::sync::{atomic::Ordering, Arc};
@@ -394,7 +403,8 @@ fn rpc_calling() -> Option<(binder::uid_t, binder::pid_t)> {
 #[non_exhaustive]
 pub enum Caller {
     /// A kernel-binder caller. `sid` is the SELinux context when the
-    /// target binder requested it (`BinderFeatures::set_requesting_sid`).
+    /// target binder requested it (`BinderFeatures::set_requesting_sid`,
+    /// or the context manager on a SELinux host; see [`get_calling_sid`]).
     Kernel {
         /// Caller effective uid (kernel `sender_euid`).
         uid: binder::uid_t,
@@ -431,18 +441,10 @@ pub fn calling_caller() -> Option<Caller> {
     }
     THREAD_STATE.with(|thread_state| {
         let thread_state = thread_state.borrow();
-        thread_state.transaction.as_ref().map(|tr| {
-            let sid = if tr.calling_sid.is_null() {
-                None
-            } else {
-                // SAFETY: non-null = live NUL-terminated kernel sid (nulled on free).
-                Some(unsafe { CStr::from_ptr(tr.calling_sid as _).to_owned() })
-            };
-            Caller::Kernel {
-                uid: tr.calling_uid,
-                pid: tr.calling_pid,
-                sid,
-            }
+        thread_state.transaction.as_ref().map(|tr| Caller::Kernel {
+            uid: tr.calling_uid,
+            pid: tr.calling_pid,
+            sid: tr.calling_sid.clone(),
         })
     })
 }
@@ -569,10 +571,11 @@ fn command_to_str(cmd: std::os::raw::c_uint) -> &'static str {
 const WORK_SOURCE_PROPAGATED_BIT_INDEX: i64 = 32;
 pub(crate) const UNSET_WORK_SOURCE: i32 = -1;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct TransactionState {
     calling_pid: binder::pid_t,
-    calling_sid: *const u8,
+    /// Copied on receipt: a handler may free the transaction buffer before it reads the sid.
+    calling_sid: Option<CString>,
     calling_uid: binder::uid_t,
     last_transaction_binder_flags: u32,
     /// AOSP `mHasExplicitIdentity`: set by `clear_calling_identity`, reset per `BR_TRANSACTION`.
@@ -580,15 +583,82 @@ struct TransactionState {
 }
 
 impl TransactionState {
-    fn from_transaction_data(data: &binder::binder_transaction_data_secctx) -> Self {
+    fn from_transaction_data(
+        data: &binder::binder_transaction_data,
+        calling_sid: Option<CString>,
+    ) -> Self {
         TransactionState {
-            calling_pid: data.transaction_data.sender_pid,
-            calling_sid: data.secctx as _,
-            calling_uid: data.transaction_data.sender_euid,
-            last_transaction_binder_flags: data.transaction_data.flags,
+            calling_pid: data.sender_pid,
+            calling_sid,
+            calling_uid: data.sender_euid,
+            last_transaction_binder_flags: data.flags,
             has_explicit_identity: false,
         }
     }
+}
+
+/// The calling sid of a `BR_TRANSACTION_SEC_CTX` whose `secctx` is this; see [`get_calling_sid`].
+fn calling_sid_at(secctx: binder::binder_uintptr_t) -> Option<CString> {
+    let addr = usize::try_from(secctx).ok().filter(|&addr| addr != 0)?;
+    sid_at(
+        addr,
+        selinux_available(),
+        ProcessState::as_self().mapped_range(),
+    )
+}
+
+/// Only SELinux counts the NUL in `len`: process_state.rs "Context manager security context".
+fn sid_at(addr: usize, selinux: bool, mapped: std::ops::Range<usize>) -> Option<CString> {
+    if !selinux {
+        return None;
+    }
+    if !mapped.contains(&addr) {
+        log::error!("BR_TRANSACTION_SEC_CTX: secctx {addr:#x} is outside the receive mapping");
+        return None;
+    }
+    copy_c_string(addr, mapped.end)
+}
+
+/// `addr` up to a NUL before `end`, copied by the kernel: an unreadable page is `None`, no fault.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn copy_c_string(addr: usize, end: usize) -> Option<CString> {
+    let page = rustix::param::page_size();
+    let pid = rustix::process::getpid().as_raw_nonzero().get();
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut at = addr;
+    while at < end {
+        let want = (page - at % page).min(end - at);
+        bytes.reserve(want);
+        let filled = bytes.len();
+        let local = libc::iovec {
+            iov_base: bytes.spare_capacity_mut().as_mut_ptr().cast(),
+            iov_len: want,
+        };
+        let remote = libc::iovec {
+            iov_base: at as *mut libc::c_void,
+            iov_len: want,
+        };
+        // SAFETY: `local` is `want` reserved spare bytes; only the kernel reads `remote`.
+        let got = unsafe { libc::process_vm_readv(pid, &local, 1, &remote, 1, 0) };
+        let got = usize::try_from(got).ok().filter(|&got| got <= want)?;
+        // SAFETY: the kernel initialized the first `got` (<= `want`) bytes of the spare capacity.
+        unsafe { bytes.set_len(filled + got) };
+        if let Some(nul) = bytes[filled..].iter().position(|&byte| byte == 0) {
+            bytes.truncate(filled + nul);
+            return CString::new(bytes).ok();
+        }
+        if got < want {
+            return None;
+        }
+        at += want;
+    }
+    None
+}
+
+/// No kernel binder here, so no `BR_TRANSACTION_SEC_CTX` reaches this.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn copy_c_string(_addr: usize, _end: usize) -> Option<CString> {
+    None
 }
 
 /// AOSP `packCallingIdentity` layout; see module doc "Calling-identity token".
@@ -708,7 +778,7 @@ impl ThreadState {
     }
 
     pub(crate) fn last_transaction_binder_flags(&self) -> u32 {
-        match self.transaction {
+        match &self.transaction {
             Some(tr) => tr.last_transaction_binder_flags,
             None => 0,
         }
@@ -1049,6 +1119,7 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
                         thread_state
                             .borrow()
                             .transaction
+                            .as_ref()
                             .map_or(0, |state| state.calling_pid)
                     );
                     return Err(StatusCode::FailedTransaction);
@@ -1059,6 +1130,7 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
                         thread_state
                             .borrow()
                             .transaction
+                            .as_ref()
                             .map_or(0, |state| state.calling_pid)
                     );
                     return Err(StatusCode::FailedTransaction);
@@ -1082,9 +1154,9 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
                     let (buffer, offsets) = unsafe { (tr.data.ptr.buffer, tr.data.ptr.offsets) };
                     if let UntilResponse::Reply = until {
                         if (tr.flags & transaction_flags_TF_STATUS_CODE) == 0 {
-                            // SAFETY: sized driver buffer, unshared until `free_buffer`.
+                            // SAFETY: the driver's BR_REPLY buffer, unshared until `free_buffer`.
                             let reply = unsafe {
-                                Parcel::from_ipc_parts(
+                                Parcel::from_driver_buffer(
                                     buffer as _,
                                     tr.data_size as _,
                                     offsets as _,
@@ -1209,7 +1281,7 @@ fn dispatch_transact_caught(
     }
 }
 
-/// [`dispatch_transact_caught`] between the observer's calls, no `THREAD_STATE` borrow held.
+/// [`dispatch_transact_caught`] between the observer's calls, no borrow held; `DeadObject` mapped.
 fn dispatch_kernel_observed(
     binder: &SIBinder,
     transactable: &dyn Transactable,
@@ -1231,6 +1303,7 @@ fn dispatch_kernel_observed(
         },
         || dispatch_transact_caught(transactable, code, reader, reply),
     )
+    .map_err(handler_reply_status)
 }
 
 fn execute_command(cmd: i32) -> Result<()> {
@@ -1262,11 +1335,11 @@ fn execute_command(cmd: i32) -> Result<()> {
                     }
                 };
 
-                // SAFETY: kernel-filled `data.ptr` arm; sized, unshared until `free_buffer`.
+                // SAFETY: the driver's BR_TRANSACTION buffer (`data.ptr`), unshared until freed.
                 let mut reader = unsafe {
                     let tr = &tr_secctx.transaction_data;
 
-                    Parcel::from_ipc_parts(
+                    Parcel::from_driver_buffer(
                         tr.data.ptr.buffer as _,
                         tr.data_size as _,
                         tr.data.ptr.offsets as _,
@@ -1279,11 +1352,13 @@ fn execute_command(cmd: i32) -> Result<()> {
 
                 let (transaction_old, strict_mode_policy_old) = {
                     let mut thread_state = thread_state.borrow_mut();
-                    let transaction_old = thread_state.transaction;
+                    let transaction_old = thread_state.transaction.take();
                     let strict_mode_policy_old = thread_state.strict_mode_policy;
 
-                    thread_state.transaction =
-                        Some(TransactionState::from_transaction_data(&tr_secctx));
+                    thread_state.transaction = Some(TransactionState::from_transaction_data(
+                        &tr_secctx.transaction_data,
+                        calling_sid_at(tr_secctx.secctx),
+                    ));
 
                     (transaction_old, strict_mode_policy_old)
                 };
@@ -1367,10 +1442,6 @@ fn execute_command(cmd: i32) -> Result<()> {
                 };
                 // Freed before the reply, as AOSP `executeCommand` does (b/238777741).
                 drop(reader);
-                // `calling_sid` points into the freed buffer; a death recipient must not read it.
-                if let Some(tr) = thread_state.borrow_mut().transaction.as_mut() {
-                    tr.calling_sid = std::ptr::null();
-                }
                 let flags = tr_secctx.transaction_data.flags;
                 // Outside the catch so the panic arm can rewind; see module doc "Dispatch notes".
                 let queued_at = thread_state.borrow().unflushed_mark();
@@ -1565,20 +1636,42 @@ fn execute_command(cmd: i32) -> Result<()> {
     })
 }
 
-/// Names the command at `stopped_at` (`write_consumed`); see module doc "Refused commands".
-fn describe_refused_command(out: &mut CommandStream, stopped_at: usize) -> String {
+/// Names the refused command from `stopped_at` (`write_consumed`); module doc "Refused commands".
+fn describe_refused_command(out: &mut CommandStream, stopped_at: usize, short: bool) -> String {
     let total = out.data_size();
     if stopped_at >= total {
         return format!("consumed {stopped_at} of {total}");
     }
     let saved = out.data_position();
+    let name = |cmd: u32| format!("{} ({cmd:#x})", command_to_str(cmd));
     out.set_data_position(stopped_at);
-    let named = match out.read_cmd::<u32>() {
-        Ok(cmd) => format!("{} ({cmd:#x})", command_to_str(cmd)),
+    let next = match out.read_cmd::<u32>() {
+        Ok(cmd) => name(cmd),
         Err(e) => format!("<unreadable: {e}>"),
     };
+    let detail = if short {
+        let failed = command_ending_at(out, stopped_at)
+            .map_or_else(|| format!("<no command ends at {stopped_at}>"), name);
+        format!("driver set its return_error at {failed}; stopped before {next}")
+    } else {
+        format!("driver stopped at {next}")
+    };
     out.set_data_position(saved);
-    format!("consumed {stopped_at} of {total}; driver stopped at {named}")
+    format!("consumed {stopped_at} of {total}; {detail}")
+}
+
+/// The command whose payload ends at `end`, walking `4 + _IOC_SIZE(cmd)` bytes from offset 0.
+fn command_ending_at(out: &mut CommandStream, end: usize) -> Option<u32> {
+    let mut at = 0;
+    while at < end {
+        out.set_data_position(at);
+        let cmd = out.read_cmd::<u32>().ok()?;
+        at += 4 + ((cmd >> _IOC_SIZESHIFT) & _IOC_SIZEMASK) as usize;
+        if at == end {
+            return Some(cmd);
+        }
+    }
+    None
 }
 
 /// One driver round trip; see module doc "R1 at specific call sites" for its ioctl borrow.
@@ -1638,6 +1731,7 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
                     let detail = describe_refused_command(
                         &mut thread_state.borrow_mut().out_parcel,
                         bwr.write_consumed as _,
+                        false,
                     );
                     log::error!("binder::write_read() error : {errno}; {detail}");
                     return Err(StatusCode::from(errno));
@@ -1663,6 +1757,7 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
                     let detail = describe_refused_command(
                         &mut thread_state.out_parcel,
                         bwr.write_consumed as _,
+                        true,
                     );
                     // stderr, not `log`: a consumer with no logger would otherwise die mute.
                     eprintln!(
@@ -1972,17 +2067,14 @@ fn discard_unflushed_commands(
     }
 }
 
+// A parcel's fds are closed by its `Drop` before this runs (parcel module doc "Kernel fds").
 fn free_buffer(
-    parcel: Option<&Parcel>,
+    _: Option<&Parcel>,
     data: binder_uintptr_t,
     _: usize,
     _: binder_uintptr_t,
     _: usize,
 ) -> Result<()> {
-    if let Some(parcel) = parcel {
-        parcel.close_file_descriptors()
-    }
-
     let queued = THREAD_STATE.try_with(|thread_state| -> Result<()> {
         let mut thread_state = thread_state.borrow_mut();
         thread_state
@@ -2180,19 +2272,11 @@ impl std::default::Default for CallingContext {
         THREAD_STATE.with(|thread_state| -> CallingContext {
             let thread_state = thread_state.borrow();
             match thread_state.transaction.as_ref() {
-                Some(transaction) => {
-                    let calling_sid = if !transaction.calling_sid.is_null() {
-                        // SAFETY: non-null = live NUL-terminated kernel sid (nulled on free).
-                        unsafe { Some(CStr::from_ptr(transaction.calling_sid as _).to_owned()) }
-                    } else {
-                        None
-                    };
-                    CallingContext {
-                        pid: transaction.calling_pid,
-                        uid: transaction.calling_uid,
-                        sid: calling_sid,
-                    }
-                }
+                Some(transaction) => CallingContext {
+                    pid: transaction.calling_pid,
+                    uid: transaction.calling_uid,
+                    sid: transaction.calling_sid.clone(),
+                },
                 None => {
                     log::debug!("CallingContext::new() called outside of transaction");
                     CallingContext {
@@ -2218,12 +2302,47 @@ pub(crate) fn is_handling_transaction() -> bool {
 /// SELinux security context of the caller for the current in-flight
 /// `BR_TRANSACTION`, when present.
 ///
-/// `Some` is only ever returned while the current thread is dispatching a
-/// transaction targeting a binder constructed with
-/// `BinderFeatures { set_requesting_sid: true, .. }`. The kernel then
-/// delivers the request via `BR_TRANSACTION_SEC_CTX` and rsbinder copies
+/// `Some` is only ever returned on a host where SELinux is available
+/// (Android, or Linux with a mounted selinuxfs), while the current thread is
+/// dispatching a transaction targeting a binder constructed with
+/// `BinderFeatures { set_requesting_sid: true, .. }`, or targeting the
+/// context manager registered by
+/// [`ProcessState::become_context_manager`](crate::ProcessState::become_context_manager),
+/// which on such a host registers it with `FLAT_BINDER_FLAG_TXN_SECURITY_CTX`.
+/// The kernel then delivers the request via `BR_TRANSACTION_SEC_CTX` and rsbinder copies
 /// the null-terminated SELinux context (e.g. `u:r:system_server:s0`) into
 /// the returned `CString`.
+///
+/// The driver copies the context's `len` bytes to the end of the transaction
+/// buffer, pads them to 8 bytes without writing the padding, and delivers
+/// neither `len` nor where the buffer ends (`binder_transaction`,
+/// android17-6.18 `binder.c`). SELinux counts the NUL in `len`
+/// (`context_struct_to_string`), so its context ends at the first NUL. Smack
+/// (`smack_to_secctx`) and AppArmor (`apparmor_label_to_secctx`) do not, so
+/// their label is followed by stale padding and then by whatever the buffer
+/// area holds next, and its end cannot be found. rsbinder therefore keeps a
+/// context only where SELinux is available, the same check
+/// `become_context_manager` makes, and returns `None` elsewhere.
+///
+/// The copy is made by `process_vm_readv(2)` on the process's own pid, never
+/// by a load from the receive mapping: the driver installs pages only for
+/// the transaction's buffer, which the receiver cannot size, and a load from
+/// a page it has not installed raises `SIGBUS` (`binder_vm_fault`). For the
+/// syscall such a page ends the copy with `EFAULT`, and the sid is `None`.
+/// The copy is made when the transaction arrives, before the handler runs,
+/// and only for a binder that requested the context. It costs a `getpid(2)`
+/// and one `process_vm_readv` for each page the context touches (two when it
+/// crosses a page boundary); the first read takes the bytes from the context
+/// to the end of its page, so it copies at most one page (16 KiB on a
+/// 16 KiB-page device) into a buffer of that size.
+///
+/// `process_vm_readv` must be allowed by the process's seccomp filter.
+/// bionic's `SECCOMP_*.TXT` lists (android17-release) do not block it. A
+/// filter that answers it with an errno (`SECCOMP_RET_ERRNO`) makes the sid
+/// `None`. A filter that kills on it (`SECCOMP_RET_KILL_THREAD`/`_PROCESS`)
+/// terminates the thread or the process on the first `BR_TRANSACTION_SEC_CTX`,
+/// and one that traps (`SECCOMP_RET_TRAP`) raises `SIGSYS` there, whose
+/// default action terminates the process.
 ///
 /// Returns `None` when:
 /// - The thread is not currently dispatching a binder transaction.
@@ -2231,12 +2350,19 @@ pub(crate) fn is_handling_transaction() -> bool {
 ///   binder did not request the security context).
 /// - The transaction came over the RPC transport (RPC has its own
 ///   `PeerIdentity` model — see `rsbinder::rpc::PeerIdentity`).
+/// - SELinux is not available (for example a Smack or AppArmor host). A
+///   binder built with `set_requesting_sid` then does not request the context.
+/// - The copy failed: `process_vm_readv` returned an error (a seccomp
+///   filter's `SECCOMP_RET_ERRNO` included), or
+///   no NUL came before an unreadable page or the end of the receive mapping.
 ///
 /// Equivalent to AOSP `IPCThreadState::getCallingSid()` (libbinder
 /// `frameworks/native/libs/binder/IPCThreadState.cpp`) and Android Rust
 /// `libbinder_rs::ThreadState::with_calling_sid` (rsbinder returns an
-/// owned `CString` instead of taking a `&CStr` callback — the kernel
-/// pointer is lazily copied at every call, so leaking is not possible).
+/// owned `CString` instead of taking a `&CStr` callback — the context is
+/// copied out of the transaction buffer when the transaction arrives, and
+/// each call returns a clone of that copy, so it stays valid after the
+/// buffer is freed).
 ///
 pub fn get_calling_sid() -> Option<CString> {
     // RPC has no SELinux context; return early without forcing `THREAD_STATE`.
@@ -2245,12 +2371,7 @@ pub fn get_calling_sid() -> Option<CString> {
     }
     THREAD_STATE.with(|thread_state| {
         let thread_state = thread_state.borrow();
-        let transaction = thread_state.transaction.as_ref()?;
-        if transaction.calling_sid.is_null() {
-            return None;
-        }
-        // SAFETY: non-null = kernel NUL-terminated sid, valid until BC_FREE_BUFFER nulls it.
-        Some(unsafe { CStr::from_ptr(transaction.calling_sid as _).to_owned() })
+        thread_state.transaction.as_ref()?.calling_sid.clone()
     })
 }
 
@@ -2398,7 +2519,7 @@ pub fn clear_calling_identity() -> i64 {
         // AOSP `clearCaller()`: own uid/pid, SID dropped ("expensive to lookup").
         tr.calling_uid = rustix::process::getuid().as_raw();
         tr.calling_pid = rustix::process::getpid().as_raw_nonzero().get() as _;
-        tr.calling_sid = std::ptr::null();
+        tr.calling_sid = None;
         tr.has_explicit_identity = true;
         token
     })
@@ -2441,7 +2562,7 @@ pub fn restore_calling_identity(token: i64) {
         tr.calling_uid = unpack_calling_uid(token);
         tr.calling_pid = unpack_calling_pid(token);
         tr.has_explicit_identity = unpack_has_explicit_identity(token);
-        tr.calling_sid = std::ptr::null();
+        tr.calling_sid = None;
     })
 }
 
@@ -2469,15 +2590,15 @@ pub fn get_current_scheduler_policy() -> Result<i32> {
     // SAFETY: no pointer arguments; pid 0 (the calling thread) is always valid.
     let raw = unsafe { libc::sched_getscheduler(0) };
     if raw < 0 {
-        // POSIX sets errno on -1; the fallback is EINVAL because `0` would read as success.
-        let errno = std::io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(libc::EINVAL);
-        return Err(StatusCode::from(rustix::io::Errno::from_raw_os_error(
-            errno,
-        )));
+        return Err(last_os_error_status());
     }
     Ok(raw)
+}
+
+/// `errno` as a status; `0` (unset) is `Unknown`: rustix's `from_raw_os_error(0)` panics.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn last_os_error_status() -> StatusCode {
+    StatusCode::from(std::io::Error::last_os_error())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -2487,7 +2608,7 @@ pub fn get_current_scheduler_policy() -> Result<i32> {
 
 /// Last transaction failure detail reported by the kernel binder driver
 /// for the current thread, as returned by `BINDER_GET_EXTENDED_ERROR`
-/// (Android 12 / Linux 5.14+).
+/// (in AOSP libbinder from Android 14; kernel support varies).
 ///
 /// Stable Rust mirror of the kernel's `struct binder_extended_error`
 /// (`include/uapi/linux/android/binder.h:302-306` in AOSP /
@@ -2495,9 +2616,10 @@ pub fn get_current_scheduler_policy() -> Result<i32> {
 /// for retrieval semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ExtendedError {
-    /// Monotonically increasing per-thread counter. Each fresh failure
-    /// observed by the driver bumps this; `0` means no failure has yet
-    /// been recorded on this thread.
+    /// Debug id of the last transaction or reply this thread sent. The driver sets
+    /// `(id, BR_OK, 0)` when a transaction starts and the failure detail
+    /// when it fails; reading resets it to `(0, BR_OK, 0)`, so `command ==
+    /// BR_OK` means no failure is recorded.
     pub id: u32,
     /// The BR_ return code that surfaced the failure
     /// (typically `BR_FAILED_REPLY`).
@@ -2510,10 +2632,13 @@ pub struct ExtendedError {
 /// Retrieve the kernel-side detail of the most recent transaction
 /// failure on the current thread.
 ///
-/// AOSP equivalent: `IPCThreadState::getExtendedError()`
-/// ([IPCThreadState.cpp](https://cs.android.com/android/platform/superproject/main/+/main:frameworks/native/libs/binder/IPCThreadState.cpp)).
-/// The ioctl was added in Android 12 (S, SDK 31, Linux 5.14+); older
-/// drivers respond `ENOTTY`, surfaced here as
+/// AOSP has no public getter: the private `IPCThreadState::logExtendedError()`
+/// ([IPCThreadState.cpp](https://cs.android.com/android/platform/superproject/main/+/main:frameworks/native/libs/binder/IPCThreadState.cpp))
+/// reads and logs it after every failed `waitForResponse`, gated on the
+/// driver feature file `extended_error`. libbinder and the bionic UAPI header
+/// carry the ioctl from `android-14.0.0_r1`; kernel support on older devices
+/// varies. A driver without it answers an unknown command with `EINVAL` (`binder_ioctl`'s
+/// `default:` arm), surfaced here as
 /// `Err(StatusCode::InvalidOperation)` so callers can fall back to the
 /// bare `StatusCode::FailedTransaction` signal from a failed `transact`.
 ///
@@ -2541,8 +2666,8 @@ pub fn get_extended_error() -> Result<ExtendedError> {
     let mut ee = binder::binder_extended_error::default();
     let driver = ProcessState::as_self().driver();
     crate::sys::binder::get_extended_error(driver.as_ref(), &mut ee).map_err(|errno| {
-        if errno == rustix::io::Errno::NOTTY {
-            // Pre-Android-12 driver — feature unavailable.
+        if errno == rustix::io::Errno::INVAL || errno == rustix::io::Errno::NOTTY {
+            // Unknown cmd: `binder_ioctl` says `EINVAL`; the supported ioctl fails only `EFAULT`.
             StatusCode::InvalidOperation
         } else {
             StatusCode::from(errno)
@@ -2612,6 +2737,11 @@ mod tests {
     //!   driver round trip) with an empty buffer; `free_buffer` would queue a `BC_FREE_BUFFER`
     //!   for a pointer the driver does not own, so the thread is marked a looper for the call
     //!   (suppressing the flush) and those bytes are discarded afterwards.
+    //! - `a_sid_copy_stops_at_a_page_it_cannot_read`: a `PROT_NONE` page stands in for one the
+    //!   driver has not installed (`SIGSEGV` there, `SIGBUS` from `binder_vm_fault`). Copying the
+    //!   sid with a load instead of `process_vm_readv` faults on it; the body runs in a child test
+    //!   process (`in_child_process`), so the fault fails this test, not the whole binary.
+    //!   `a_sid_copy_crosses_pages_and_keeps_to_its_bound` pins the bound and the SELinux gate.
 
     use super::*;
 
@@ -2916,6 +3046,49 @@ mod tests {
         let mut reply = Parcel::new();
         let err = dispatch_transact_caught(&ErrTransactable, 1, &mut reader, &mut reply);
         assert!(matches!(err, Err(StatusCode::PermissionDenied)));
+    }
+
+    /// A handler's `DeadObject` is replied as `FailedTransaction`, others as they are.
+    #[test]
+    fn a_handler_dead_object_is_not_replied_as_dead_object() {
+        struct Fails(StatusCode);
+        impl Transactable for Fails {
+            fn transact(&self, _: TransactionCode, _: &mut Parcel, _: &mut Parcel) -> Result<()> {
+                Err(self.0)
+            }
+        }
+        struct Named;
+        impl Remotable for Named {
+            fn descriptor() -> &'static str {
+                "x.y.INamed"
+            }
+            fn on_transact(
+                &self,
+                _: TransactionCode,
+                _: &mut Parcel,
+                _: &mut Parcel,
+            ) -> Result<()> {
+                Ok(())
+            }
+            fn on_dump(&self, _: &mut dyn std::io::Write, _: &[String]) -> Result<()> {
+                Ok(())
+            }
+        }
+        let binder = Interface::as_binder(&crate::native::Binder::new(Named));
+        // SAFETY: `binder_transaction_data` is plain C data; all-zero is a valid value.
+        let tr: binder::binder_transaction_data = unsafe { std::mem::zeroed() };
+        let replied = |status| {
+            let (mut reader, mut reply) = (Parcel::new(), Parcel::new());
+            dispatch_kernel_observed(&binder, &Fails(status), &tr, &mut reader, &mut reply)
+        };
+        assert_eq!(
+            replied(StatusCode::DeadObject),
+            Err(StatusCode::FailedTransaction)
+        );
+        assert_eq!(
+            replied(StatusCode::PermissionDenied),
+            Err(StatusCode::PermissionDenied)
+        );
     }
 
     /// Phase order, no short-circuit and error priority; see `# Mutation gates`.
@@ -3235,7 +3408,7 @@ mod tests {
         fn install(
             calling_uid: binder::uid_t,
             calling_pid: binder::pid_t,
-            calling_sid: *const u8,
+            calling_sid: Option<CString>,
         ) -> Self {
             let new_state = TransactionState {
                 calling_pid,
@@ -3278,14 +3451,14 @@ mod tests {
         assert_eq!(get_calling_uid(), own_uid());
     }
 
-    /// Getters return the kernel-delivered values; the SID is a lazy `CString` copy of secctx.
+    /// Getters return the kernel-delivered values; the SID is a `CString` copy of secctx.
     #[test]
     #[cfg(target_os = "linux")]
     #[serial_test::serial(binder)]
     fn test_get_calling_inside_transaction_extracts_fields() {
         ProcessState::init_default().expect("init_default");
         let sid_cstring = std::ffi::CString::new("u:r:system_server:s0").unwrap();
-        let _guard = FakeTransactionGuard::install(1000, 9999, sid_cstring.as_ptr() as *const u8);
+        let _guard = FakeTransactionGuard::install(1000, 9999, Some(sid_cstring));
 
         assert!(is_handling_transaction());
         assert_eq!(get_calling_uid(), 1000);
@@ -3294,7 +3467,7 @@ mod tests {
         let sid = get_calling_sid().expect("SID present when secctx pointer non-null");
         assert_eq!(sid.to_str().unwrap(), "u:r:system_server:s0");
 
-        // Each call copies into a fresh CString; the kernel mmap keeps owning the pointer.
+        // Each call returns a fresh CString; the transaction state keeps its own copy.
         let sid2 = get_calling_sid().expect("second call also returns Some");
         assert_eq!(sid, sid2);
         assert!(!std::ptr::eq(sid.as_ptr(), sid2.as_ptr()));
@@ -3449,10 +3622,172 @@ mod tests {
     #[serial_test::serial(binder)]
     fn test_get_calling_sid_null_secctx_returns_none() {
         ProcessState::init_default().expect("init_default");
-        let _guard = FakeTransactionGuard::install(1000, 9999, std::ptr::null());
+        let _guard = FakeTransactionGuard::install(1000, 9999, None);
         assert!(is_handling_transaction());
         assert_eq!(get_calling_uid(), 1000);
         assert!(get_calling_sid().is_none());
+    }
+
+    /// A handler may free the transaction buffer first (`mem::take(reader)`); the sid survives it.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[serial_test::serial(binder)]
+    fn calling_sid_outlives_the_transaction_buffer() {
+        ProcessState::init_default().expect("init_default");
+        let mut buffer = b"u:r:system_server:s0\0".to_vec();
+        // SAFETY: plain-old-data kernel struct; all-zero is a valid value.
+        let mut data: binder::binder_transaction_data = unsafe { std::mem::zeroed() };
+        data.sender_euid = 1000;
+        let start = buffer.as_ptr() as usize;
+        let sid = copy_c_string(start, start + buffer.len());
+        let state = TransactionState::from_transaction_data(&data, sid);
+        buffer.fill(b'X');
+        drop(buffer);
+        let previous = THREAD_STATE.with(|ts| ts.borrow_mut().transaction.replace(state));
+
+        let sid = get_calling_sid();
+        let caller = calling_caller();
+        let context = CallingContext::default();
+        THREAD_STATE.with(|ts| ts.borrow_mut().transaction = previous);
+
+        let expected = CString::new("u:r:system_server:s0").unwrap();
+        assert_eq!(sid.as_ref(), Some(&expected));
+        match caller {
+            Some(Caller::Kernel { uid, sid, .. }) => {
+                assert_eq!((uid, sid.as_ref()), (1000, Some(&expected)));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(context.sid.as_ref(), Some(&expected));
+    }
+
+    /// Anonymous pages laid out as a receive mapping; `PROT_NONE` ones model uninstalled pages.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    struct Pages {
+        ptr: *mut std::ffi::c_void,
+        len: usize,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    impl Pages {
+        /// `count` pages holding `writes` (offset, bytes); the pages in `none` become `PROT_NONE`.
+        fn new(count: usize, writes: &[(usize, &[u8])], none: &[usize]) -> Self {
+            use rustix::mm::{MapFlags, MprotectFlags, ProtFlags};
+            let page = rustix::param::page_size();
+            let len = count * page;
+            let prot = ProtFlags::READ | ProtFlags::WRITE;
+            // SAFETY: a new private anonymous mapping, at an address the kernel picks.
+            let ptr = unsafe {
+                rustix::mm::mmap_anonymous(std::ptr::null_mut(), len, prot, MapFlags::PRIVATE)
+            }
+            .unwrap();
+            // SAFETY: the read-write mapping just created; nothing else refers to it meanwhile.
+            let bytes = unsafe { std::slice::from_raw_parts_mut(ptr.cast::<u8>(), len) };
+            for &(at, data) in writes {
+                bytes[at..at + data.len()].copy_from_slice(data);
+            }
+            for &i in none {
+                assert!(i < count);
+                // SAFETY: page `i` lies in the mapping, and no reference into it is live.
+                unsafe {
+                    rustix::mm::mprotect(ptr.byte_add(i * page), page, MprotectFlags::empty())
+                }
+                .unwrap();
+            }
+            Pages { ptr, len }
+        }
+
+        fn range(&self) -> std::ops::Range<usize> {
+            self.ptr as usize..self.ptr as usize + self.len
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    impl Drop for Pages {
+        fn drop(&mut self) {
+            // SAFETY: the mapping `new` created, unmapped once; no reference into it remains.
+            unsafe { rustix::mm::munmap(self.ptr, self.len) }.unwrap();
+        }
+    }
+
+    /// Runs this test's `body` in a child test process, so a fault fails the test, not the binary.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn in_child_process(test: &str, body: fn()) {
+        use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
+        const CHILD: &str = "RSBINDER_THREAD_STATE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let maximum = getrlimit(Resource::Core).maximum;
+            // A crash here is the regression under test; it should not leave a core file.
+            let _ = setrlimit(
+                Resource::Core,
+                Rlimit {
+                    current: Some(0),
+                    maximum,
+                },
+            );
+            body();
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([test, "--exact", "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "child {test}: {:?}\n{stdout}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    /// A label with no NUL before an uninstalled page (`binder_vm_fault`: `SIGBUS`) is no sid.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn a_sid_copy_stops_at_a_page_it_cannot_read() {
+        in_child_process(
+            "thread_state::tests::a_sid_copy_stops_at_a_page_it_cannot_read",
+            || {
+                let page = rustix::param::page_size();
+                let label = b"unconfined (enforce)";
+                // The label ends the first page; a NUL waits right after the unreadable one.
+                let pages = Pages::new(3, &[(page - label.len(), label), (2 * page, b"\0")], &[1]);
+                let mapped = pages.range();
+                let addr = mapped.start + page - label.len();
+                assert_eq!(copy_c_string(addr, mapped.end), None);
+                assert_eq!(sid_at(addr, true, mapped), None);
+            },
+        );
+    }
+
+    /// The copy crosses readable pages, stops at its bound, and runs only on SELinux.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn a_sid_copy_crosses_pages_and_keeps_to_its_bound() {
+        let page = rustix::param::page_size();
+        let context = b"u:r:system_server:s0\0";
+        let expected = Some(CString::new("u:r:system_server:s0").unwrap());
+        // Eight bytes in the first page, the rest and the NUL in the second.
+        let pages = Pages::new(2, &[(page - 8, context)], &[]);
+        let mapped = pages.range();
+        let addr = mapped.start + page - 8;
+        let nul = addr + context.len() - 1;
+
+        assert_eq!(copy_c_string(addr, mapped.end), expected);
+        assert_eq!(copy_c_string(addr, nul), None, "the NUL lies at the bound");
+        assert_eq!(copy_c_string(addr, addr), None);
+        assert_eq!(sid_at(addr, true, mapped.clone()), expected);
+        assert_eq!(
+            sid_at(addr, false, mapped.clone()),
+            None,
+            "a Smack or AppArmor host"
+        );
+        assert_eq!(
+            sid_at(mapped.end, true, mapped),
+            None,
+            "outside the receive mapping"
+        );
     }
 
     /// `(has_explicit, pid sign)` quadrants of AOSP `static_assert`s (IPCThreadState.cpp:530-560).
@@ -3491,7 +3826,7 @@ mod tests {
     #[serial_test::serial(binder)]
     fn test_clear_and_restore_calling_identity_round_trip() {
         ProcessState::init_default().expect("init_default");
-        let _guard = FakeTransactionGuard::install(1000, 9999, std::ptr::null());
+        let _guard = FakeTransactionGuard::install(1000, 9999, None);
         assert_eq!(get_calling_uid(), 1000);
         assert_eq!(get_calling_pid(), 9999);
         assert!(!has_explicit_identity());
@@ -3634,7 +3969,7 @@ mod tests {
         let total = out.data_size();
 
         out.set_data_position(4);
-        let msg = describe_refused_command(&mut out, second);
+        let msg = describe_refused_command(&mut out, second, false);
         assert!(msg.contains("BC_FREE_BUFFER"), "{msg}");
         assert!(
             msg.contains(&format!("consumed {second} of {total}")),
@@ -3647,9 +3982,55 @@ mod tests {
         );
 
         assert_eq!(
-            describe_refused_command(&mut out, total),
+            describe_refused_command(&mut out, total, false),
             format!("consumed {total} of {total}"),
             "a fully consumed buffer has no command to blame"
         );
+    }
+
+    /// An unset `errno` (0) reads as `Unknown`, without the panic of `from_raw_os_error(0)`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn an_unset_errno_is_unknown_not_a_panic() {
+        #[cfg(target_os = "android")]
+        use libc::__errno as errno_location;
+        #[cfg(target_os = "linux")]
+        use libc::__errno_location as errno_location;
+        // SAFETY: the calling thread's own `errno` slot, written with no other access in flight.
+        unsafe { *errno_location() = 0 };
+        assert_eq!(last_os_error_status(), StatusCode::Unknown);
+        // SAFETY: as above.
+        unsafe { *errno_location() = libc::EPERM };
+        assert_eq!(last_os_error_status(), StatusCode::PermissionDenied);
+    }
+
+    /// A short write stops after the command that set `return_error`; the walk names that one.
+    #[test]
+    fn a_short_write_names_the_command_before_the_offset() {
+        let mut out = CommandStream::new();
+        out.write_cmd::<u32>(&binder::BC_INCREFS).unwrap();
+        out.write_cmd::<u32>(&7u32).unwrap();
+        out.write_cmd::<u32>(&binder::BC_TRANSACTION).unwrap();
+        // SAFETY: `binder_transaction_data` is plain C data; all-zero is a valid value.
+        out.write_transaction(&unsafe { std::mem::zeroed() })
+            .unwrap();
+        let second = out.data_size();
+        out.write_cmd::<u32>(&binder::BC_FREE_BUFFER).unwrap();
+        out.write_cmd::<binder_uintptr_t>(&0).unwrap();
+
+        out.set_data_position(4);
+        let msg = describe_refused_command(&mut out, second, true);
+        assert!(
+            msg.contains("return_error at BC_TRANSACTION"),
+            "the command that failed: {msg}"
+        );
+        assert!(msg.contains("stopped before BC_FREE_BUFFER"), "{msg}");
+        assert_eq!(
+            out.data_position(),
+            4,
+            "the walk restores the read position"
+        );
+        let msg = describe_refused_command(&mut out, second - 4, true);
+        assert!(msg.contains("<no command ends at"), "{msg}");
     }
 }

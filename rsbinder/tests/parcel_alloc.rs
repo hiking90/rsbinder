@@ -92,8 +92,8 @@ fn a_parcel_carrying_an_fd_allocates_no_pin_list() {
         p
     };
     drop(write());
-    // Data buffer + objects table (one FD offset); an eager pin list would make it 3.
-    assert_eq!(count(write), 2);
+    // Data + objects table + `kernel_fds` (one fd); an eager pin list would make it 4.
+    assert_eq!(count(write), 3);
 }
 
 #[test]

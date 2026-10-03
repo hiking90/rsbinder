@@ -202,13 +202,11 @@
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::mem::ManuallyDrop;
-use std::os::fd::{FromRawFd, IntoRawFd};
+use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{self, Arc, RwLock};
 
-use crate::{
-    binder::*, binder_object::*, error::*, parcel::*, parcelable::DeserializeOption, thread_state,
-};
+use crate::{binder::*, error::*, parcel::*, parcelable::DeserializeOption, thread_state};
 
 /// Proxy-side extension cache; strong vs weak rule in module doc "Extension cache".
 enum ExtensionCache {
@@ -420,8 +418,10 @@ impl ProxyHandle {
     /// the caller needs to keep writing to the same file. (A deliberate
     /// divergence from AOSP `BpBinder::dump`, which calls
     /// `writeFileDescriptor(fd)` with `takeOwnership = false` and leaves
-    /// the caller's fd open — the `IntoRawFd` signature here makes the
-    /// transfer explicit instead.) The transaction is sent with
+    /// the caller's fd open — the `Into<OwnedFd>` bound here makes the
+    /// transfer explicit instead: a `File`, an `OwnedFd`, a `ChildStdin`
+    /// and the other owning std types pass their fd, which closes exactly
+    /// once whichever way the call ends.) The transaction is sent with
     /// `FLAG_CLEAR_BUF` where AOSP passes `0`: the kernel then zeroes the
     /// transaction buffer after the callee is done, harmless to the peer
     /// and cheap insurance for a dump that may carry sensitive state. The remote's handler is
@@ -432,20 +432,14 @@ impl ProxyHandle {
     /// `args` reach the handler verbatim; their meaning is the service's
     /// own. The call is synchronous, so it returns only after the remote
     /// has finished writing.
-    pub fn dump<F: IntoRawFd>(&self, fd: F, args: &[String]) -> Result<()> {
-        // Fast-fail before consuming the fd, so a dead proxy lets `F` drop and close it.
+    pub fn dump<F: Into<OwnedFd>>(&self, fd: F, args: &[String]) -> Result<()> {
+        // A dead proxy drops `fd` here, which closes it.
         if self.obituary_sent.load(Ordering::Acquire) {
             return Err(StatusCode::DeadObject);
         }
         let mut send = Parcel::new();
-        let raw = fd.into_raw_fd();
-        let obj = flat_binder_object::new_with_fd(raw, true);
-        // Once written (`cookie = 1`) the parcel closes the fd; a failed write leaves it to us.
-        if let Err(e) = send.write_object(&obj, true) {
-            // SAFETY: sole owner of `raw` (from `into_raw_fd`; write failed): the only close.
-            drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) });
-            return Err(e);
-        }
+        // The parcel owns the fd from here and closes it on drop; a refused write closes it now.
+        send.write_kernel_fd(fd.into())?;
 
         send.write::<i32>(&(args.len() as i32))?;
         for arg in args {
@@ -678,10 +672,9 @@ mod tests {
     //! - `test_get_extension_strong_cache_does_not_auto_invalidate_on_dead_extension`: locks
     //!   in the non-invalidating cache described in the module doc "Extension cache"; an
     //!   auto-invalidate change flips this assertion on purpose.
-    //! - `test_dump_fast_fails_and_drops_fd_when_obituary_sent`: `DropFlag` implements
-    //!   `IntoRawFd` and records its own `Drop`. A `dump` that calls `fd.into_raw_fd()` before
-    //!   the obituary check detaches the fd from RAII, the early `Err` leaks it, and `Drop`
-    //!   never fires.
+    //! - `test_dump_fast_fails_and_closes_fd_when_obituary_sent`: `dump` takes a pipe's write
+    //!   end and the test reads the read end. A fast-fail path that keeps the fd from dropping
+    //!   (a `mem::forget`, a detach into a raw fd) leaves the read `EAGAIN` instead of EOF.
     //! - `test_dispatch_obituary_callbacks_isolates_panic`: the panicking recipient is first in
     //!   the two-element snapshot. Without the `catch_unwind` guard the panic unwinds past the
     //!   loop and the counting recipient is never called. The default hook prints the panic to
@@ -986,43 +979,25 @@ mod tests {
         std::mem::forget(proxy);
     }
 
-    /// Fast-fails before `fd.into_raw_fd()`, so the fd drops; see `# Mutation gates`.
+    /// A dead proxy refuses the dump and closes the fd it was given; see `# Mutation gates`.
     #[test]
-    fn test_dump_fast_fails_and_drops_fd_when_obituary_sent() {
-        use std::os::fd::RawFd;
-
-        struct DropFlag {
-            dropped: Arc<AtomicBool>,
-        }
-        impl std::os::fd::IntoRawFd for DropFlag {
-            fn into_raw_fd(self) -> RawFd {
-                // Success path: the kernel owns the fd; the fast-fail path must not get here.
-                std::mem::forget(self);
-                -1
-            }
-        }
-        impl Drop for DropFlag {
-            fn drop(&mut self) {
-                self.dropped.store(true, Ordering::SeqCst);
-            }
-        }
+    fn test_dump_fast_fails_and_closes_fd_when_obituary_sent() {
+        let (r, w) = crate::ParcelFileDescriptor::pipe().expect("pipe");
+        let r: OwnedFd = r.into();
+        rustix::fs::fcntl_setfl(&r, rustix::fs::OFlags::NONBLOCK).expect("non-blocking");
 
         let proxy = synthetic_proxy(true); // obituary_sent
-        let dropped = Arc::new(AtomicBool::new(false));
-        let result = proxy.dump(
-            DropFlag {
-                dropped: dropped.clone(),
-            },
-            &[],
-        );
+        let result = proxy.dump(w, &[]);
 
         assert!(
             matches!(result, Err(StatusCode::DeadObject)),
             "expected DeadObject fast-fail, got {result:?}"
         );
-        assert!(
-            dropped.load(Ordering::SeqCst),
-            "DropFlag's Drop must fire — fast-fail path must not call into_raw_fd"
+        // EOF, not `EAGAIN`: no copy of the write end is left open.
+        assert_eq!(
+            rustix::io::read(&r, &mut [0u8; 1]),
+            Ok(0),
+            "the fast-fail path must close the fd `dump` took"
         );
 
         std::mem::forget(proxy);

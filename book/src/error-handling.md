@@ -282,9 +282,10 @@ if let Err(ref status) = result {
 }
 ```
 
-`DeadObject` alone does not prove the service died — a live handler can
-return it too — and over RPC the call that ended a session can return
-`TimedOut` instead. [`Reconnecting`](./reconnecting.md) watches the service
+`DeadObject` alone does not prove the service died — a live handler of an
+in-process service, or of a service not built on rsbinder, can return it too
+(rsbinder sends its own remote handlers' `DeadObject` as `FailedTransaction`)
+— and over RPC the call that ended a session can return `TimedOut` instead. [`Reconnecting`](./reconnecting.md) watches the service
 and reconnects for you.
 
 ## Converting Between Error Types

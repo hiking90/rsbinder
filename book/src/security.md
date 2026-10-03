@@ -49,6 +49,13 @@ context, so it reads this process, not the caller: do the check on the
 dispatching thread and pass the result along. An in-process call to a
 local service reads the same way — this process calling itself.
 
+`get_calling_sid()` is `Some` only for a binder built with
+`BinderFeatures::set_requesting_sid` (or the context manager), and only where
+SELinux is available: on Android, or on a Linux host with
+`/sys/fs/selinux/enforce`. Elsewhere rsbinder does not ask the kernel for the
+context at all — a kernel with no LSM that can produce one fails every
+transaction to a binder that asks — and the sid is `None`.
+
 ### Fail-closed values, never fabricated ones
 
 `get_calling_uid()` returns a real uid only where the transport carries

@@ -449,7 +449,7 @@ mod tests {
         use std::sync::Arc;
 
         let mut rpc_parcel = Parcel::new();
-        rpc_parcel.set_for_rpc(true);
+        rpc_parcel.set_for_rpc(true).unwrap();
         // In a simulated RPC transaction only the kernel-backing gate can produce the denial.
         let _g = RpcCallingGuard::install(
             Arc::new(PeerIdentity::Local { uid: 1000, pid: 7 }),
@@ -500,7 +500,7 @@ mod tests {
         }));
 
         let mut rpc_parcel = Parcel::new();
-        rpc_parcel.set_for_rpc(true);
+        rpc_parcel.set_for_rpc(true).unwrap();
 
         // RPC uid 1000: the authority grants its one permission and denies everything else.
         {

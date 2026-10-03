@@ -12,12 +12,16 @@
 //! `munmap(ptr, size)` in `ProcessState::drop` — which is why `MemoryMap` is
 //! `Send + Sync`. The region is the kernel-delivered transaction-buffer area
 //! and *is* read as Rust data elsewhere (`thread_state` reads inbound
-//! `BR_TRANSACTION`/`BR_REPLY` buffers and `calling_sid` out of it), but that
-//! access goes through the kernel pointers in the transaction, not `ptr`, and
-//! is synchronized by the driver's buffer-lifetime protocol (a buffer stays
-//! valid until `BC_FREE_BUFFER`). Because the mapping lives for the
-//! singleton's whole lifetime (an init-race loser never serviced a
-//! transaction), no such read is outstanding at drop.
+//! `BR_TRANSACTION`/`BR_REPLY` buffers out of it), but that access goes
+//! through the kernel pointers in the transaction, not `ptr`, and is
+//! synchronized by the driver's buffer-lifetime protocol (a buffer stays
+//! valid until `BC_FREE_BUFFER`). The `secctx` of a `BR_TRANSACTION_SEC_CTX`
+//! is not read that way: the kernel does not tell the receiver how long it
+//! is, so `thread_state` copies it with `process_vm_readv` on its own pid,
+//! never with a load, no further than the end of `mapped_range` (which reads
+//! `ptr` only as an address). Because the mapping lives for the singleton's
+//! whole lifetime (an init-race loser never serviced a transaction), no such
+//! read is outstanding at drop.
 //!
 //! The size floor is one page: the granularity `mmap(2)` works in and the
 //! smallest mapping the driver serves a buffer from (measured: a 4096-byte
@@ -176,7 +180,8 @@
 //! `Parcel::write_object` → `flat_binder_object::acquire` right after brings
 //! it to 1. The only leak path is a `Parcel::write_aligned` failure between
 //! `From<&SIBinder>` returning and that `acquire()`: a panic (typically OOM),
-//! or `Err(BadValue)` when the write would end past `i32::MAX`.
+//! `Err(BadValue)` when the write would end past `i32::MAX`, or
+//! `Err(PermissionDenied)` when it would overlap a recorded object.
 //!
 //! `incref_publish` returns `false` for an unknown id. Every `acquire` follows
 //! a `From<&SIBinder>` that just inserted the entry, or is an `append_from`
@@ -254,6 +259,11 @@
 //! would fail. Android always has SELinux; on Linux a mounted selinuxfs is the
 //! signal, the same check libselinux's `is_selinux_enabled()` makes.
 //!
+//! The same check decides whether `thread_state` keeps a delivered context at
+//! all. The kernel copies only the context's `len` bytes, and of the LSMs that
+//! produce one only SELinux counts the NUL in `len`; Smack and AppArmor do
+//! not, so the bytes after their label belong to other data in the buffer.
+//!
 //! # Tests
 //!
 //! - `test_strong_proxy_under_same_thread_dead_binder_no_deadlock`: the
@@ -320,7 +330,7 @@ enum SlowPathReady {
     CaseB { descriptor: String, generation: u64 },
 }
 
-/// Restores the thread's [`CallRestriction`] on drop, so P2's `ping_binder(0)` cannot leak it.
+/// Restores the thread's [`CallRestriction`] on drop, so P2's internal IPC cannot leak it.
 struct RestoreCallRestriction(CallRestriction);
 
 impl Drop for RestoreCallRestriction {
@@ -406,6 +416,10 @@ pub(crate) struct PublishedNative {
 /// calls. AOSP `IPCThreadState::CallRestriction`. Set with
 /// [`ProcessState::set_call_restriction`] or
 /// [`ServeOptions::call_restriction`](crate::ServeOptions).
+///
+/// rsbinder's own first-sight interface lookup for a new handle (and the
+/// handle-0 ping on SDK >= 30) runs with the restriction lifted, so it
+/// neither logs nor panics and can block on that peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CallRestriction {
@@ -491,12 +505,26 @@ impl ProcessState {
         Self::instance().get().is_some()
     }
 
+    /// Set the [`CallRestriction`] for blocking outgoing calls.
+    ///
+    /// Each thread copies the process value when it first touches binder,
+    /// so this applies to the calling thread and to threads that make their
+    /// first binder call afterwards. Other threads that already made a
+    /// binder call, including thread-pool threads already running, keep
+    /// their value. Call it before [`start_thread_pool`](Self::start_thread_pool)
+    /// and before other threads use binder. AOSP
+    /// `ProcessState::setCallRestriction` aborts when the calling thread
+    /// already has an `IPCThreadState`; rsbinder updates that thread instead.
     pub fn set_call_restriction(&self, call_restriction: CallRestriction) {
-        let mut self_call_restriction = self
-            .call_restriction
-            .write()
-            .expect("Call restriction lock poisoned");
-        *self_call_restriction = call_restriction;
+        {
+            let mut self_call_restriction = self
+                .call_restriction
+                .write()
+                .expect("Call restriction lock poisoned");
+            *self_call_restriction = call_restriction;
+        }
+        // After the write guard drops: a first-time `ThreadState::new` reads this lock.
+        thread_state::set_call_restriction(call_restriction);
     }
 
     pub(crate) fn call_restriction(&self) -> CallRestriction {
@@ -818,10 +846,10 @@ impl ProcessState {
         #[cfg(test)]
         slow_path_p2_test_hook(handle);
 
+        // P2's ping and `query_interface` are internal IPC, so the caller's restriction is lifted.
+        let _restore = RestoreCallRestriction(thread_state::call_restriction());
+        thread_state::set_call_restriction(CallRestriction::None);
         if handle == 0 && crate::sdk_at_least(30) {
-            // RAII restore: a ping failure can't leak CallRestriction::None into later calls.
-            let _restore = RestoreCallRestriction(thread_state::call_restriction());
-            thread_state::set_call_restriction(CallRestriction::None);
             if let Err(err) = thread_state::ping_binder(handle) {
                 if matches!(plan, SlowPathPlan::CaseA) {
                     undo_case_a_pin(handle);
@@ -1169,6 +1197,13 @@ impl ProcessState {
         self.mmap.read().unwrap_or_else(|e| e.into_inner()).size
     }
 
+    /// Addresses of the receive mapping; bounds the `calling_sid` copy ("Receive mapping").
+    pub(crate) fn mapped_range(&self) -> std::ops::Range<usize> {
+        let mmap = self.mmap.read().unwrap_or_else(|e| e.into_inner());
+        let start = mmap.ptr as usize;
+        start..start + mmap.size
+    }
+
     /// Start the binder thread pool: spawn one worker now and **enable
     /// kernel-driven spawning** for the rest of the process's life.
     ///
@@ -1324,8 +1359,11 @@ fn open_driver(
 }
 
 /// Kernel can attach SELinux contexts; see module doc "Context manager security context".
-fn selinux_available() -> bool {
-    cfg!(target_os = "android") || std::path::Path::new("/sys/fs/selinux/enforce").exists()
+pub(crate) fn selinux_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        cfg!(target_os = "android") || std::path::Path::new("/sys/fs/selinux/enforce").exists()
+    })
 }
 
 impl Drop for ProcessState {
@@ -1581,6 +1619,32 @@ mod tests {
         let process = ProcessState::init_default().expect("init_default");
         process.disable_background_scheduling(true);
         assert!(process.background_scheduling_disabled());
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        ignore = "requires /dev/binder"
+    )]
+    #[serial_test::serial(binder)]
+    fn set_call_restriction_reaches_a_thread_that_already_used_binder() {
+        let process = ProcessState::init_default().expect("init_default");
+        let prev = process.call_restriction();
+        // Creates this thread's `THREAD_STATE`, which copies the process value.
+        assert_eq!(thread_state::call_restriction(), prev);
+
+        process.set_call_restriction(CallRestriction::ErrorIfNotOneway);
+        assert_eq!(
+            process.call_restriction(),
+            CallRestriction::ErrorIfNotOneway
+        );
+        assert_eq!(
+            thread_state::call_restriction(),
+            CallRestriction::ErrorIfNotOneway
+        );
+
+        process.set_call_restriction(prev);
+        assert_eq!(thread_state::call_restriction(), prev);
     }
 
     #[test]

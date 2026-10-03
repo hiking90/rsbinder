@@ -531,8 +531,8 @@ impl AsFd for MemoryHeapBase {
 }
 
 impl IMemoryHeap for MemoryHeapBase {
-    fn heap_id(&self) -> i32 {
-        self.0.impl_heap_id()
+    fn heap_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        Some(self.0.export_fd().as_fd())
     }
     fn size(&self) -> usize {
         self.0.size
@@ -575,8 +575,9 @@ impl MappedHeap {
     /// Map `size` bytes at `offset` of `fd`. `offset` must be
     /// page-aligned and `size` non-zero (`BadValue` otherwise). The range
     /// must fit inside the fd's `st_size`; the one fd kind that reports
-    /// `0` yet backs a region — a legacy `/dev/ashmem` fd — is trusted
-    /// only after it is verified to *be* ashmem. Any other zero-length
+    /// `0` yet backs a region — a legacy `/dev/ashmem` fd — is measured
+    /// with `ASHMEM_GET_SIZE` instead, only after it is verified to *be*
+    /// ashmem, and the range must fit that size. Any other zero-length
     /// fd (a memfd the sender never `ftruncate`d, say) is refused
     /// because an `st_size` of `0` on a non-ashmem fd carries no usable
     /// size information.
@@ -602,6 +603,10 @@ impl MappedHeap {
         if st_size <= 0 {
             if !super::shared::is_ashmem_fd(fd.as_fd()) {
                 log::error!("shared memory fd has no backing size and is not ashmem");
+                return Err(StatusCode::BadValue);
+            }
+            // ashmem `mmap` ignores the offset; a range past the region SIGBUSes on first touch.
+            if end > super::shared::region_size(fd.as_fd())? {
                 return Err(StatusCode::BadValue);
             }
         } else if (end as u64) > st_size as u64 {
@@ -703,8 +708,8 @@ impl AsFd for MappedHeap {
 }
 
 impl IMemoryHeap for MappedHeap {
-    fn heap_id(&self) -> i32 {
-        self.0.impl_heap_id()
+    fn heap_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        Some(self.0.export_fd().as_fd())
     }
     fn size(&self) -> usize {
         self.0.size

@@ -1962,21 +1962,9 @@ pub const BINDER_TYPE_PTR: _bindgen_ty_1 = 1886661253;
 pub type _bindgen_ty_1 = ::std::os::raw::c_uint;
 pub const FLAT_BINDER_FLAG_PRIORITY_MASK: _bindgen_ty_2 = 255;
 pub const FLAT_BINDER_FLAG_ACCEPTS_FDS: _bindgen_ty_2 = 256;
-/// Post-shift mask for the 2-bit scheduler-policy
-/// field embedded in `flat_binder_object.flags` (bits 9-10, value
-/// `0x600`). Mirrors AOSP `FLAT_BINDER_FLAG_SCHED_POLICY_MASK` in
-/// `kernel/include/uapi/linux/android/binder.h`. Pair with
-/// `FLAT_BINDER_FLAG_SCHED_POLICY_VALUE_MASK` (pre-shift `0x3`) defined
-/// next to the encoder in `binder_object.rs`.
+/// UAPI post-shift sched-policy mask (bits 9-10); pre-shift mask is in `binder_object.rs`.
 pub const FLAT_BINDER_FLAG_SCHED_POLICY_MASK: _bindgen_ty_2 = 0x600;
-/// `FLAT_BINDER_FLAG_INHERIT_RT` (bit 11, `0x800`).
-/// When set on a `BBinder` advertised over kernel binder, the driver
-/// applies the caller's SCHED_FIFO / SCHED_RR scheduling class to the
-/// thread that services the resulting transaction; without the bit, the
-/// receiver runs at min(caller, declared) priority, which is the right
-/// default for non-RT services. Required by framework AIDL services
-/// (audio/camera HAL) that advertise themselves with `INHERIT_RT` set —
-/// without this bit rsbinder cannot mirror their RT-priority interop.
+/// UAPI bit 11: the driver gives the serving thread the caller's RT scheduling class.
 pub const FLAT_BINDER_FLAG_INHERIT_RT: _bindgen_ty_2 = 0x800;
 #[doc = " @FLAT_BINDER_FLAG_TXN_SECURITY_CTX: request security contexts"]
 #[doc = ""]
@@ -2890,25 +2878,7 @@ fn bindgen_test_layout_binder_node_info_for_ref() {
     }
     test_field_reserved3();
 }
-/// Detailed cause of the most recent kernel-side transaction failure
-/// for the current thread, returned by `BINDER_GET_EXTENDED_ERROR`
-/// (`_IOWR('b', 17, struct binder_extended_error)`).
-///
-/// Wire layout matches Android `kernel/include/uapi/linux/android/binder.h:302-306`
-/// (also `external/kernel-headers/original/uapi/linux/android/binder.h:302-306`
-/// in the AOSP tree). Available on Android 12 (S, SDK 31) and newer
-/// kernels; older drivers respond to the ioctl with `ENOTTY` and the
-/// caller falls back to the bare `StatusCode::FailedTransaction` signal
-/// from the BR_FAILED_REPLY arm.
-///
-/// Field semantics (per kernel `binder.c::binder_inner_proc_unlock`):
-///   * `id` — monotonically increasing counter; lets the caller detect
-///     "is this the same failure I already observed?" without racing
-///     with the next failure on the same fd.
-///   * `command` — the BR_ return code that originally surfaced the
-///     failure (typically `BR_FAILED_REPLY`).
-///   * `param` — negated errno (`-EINVAL`, `-EBADF`, …) or another
-///     driver-specific code; `0` when no detail is available.
+/// UAPI `binder_extended_error` (`_IOWR('b', 17)`); public mirror: `crate::ExtendedError`.
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Default)]
 pub struct binder_extended_error {
@@ -3100,28 +3070,8 @@ pub const transaction_flags_TF_ROOT_OBJECT: transaction_flags = 4;
 pub const transaction_flags_TF_STATUS_CODE: transaction_flags = 8;
 pub const transaction_flags_TF_ACCEPT_FDS: transaction_flags = 16;
 pub const transaction_flags_TF_CLEAR_BUF: transaction_flags = 32;
-/// Android 12 (Linux 5.14) and newer driver:
-/// `TF_UPDATE_TXN` (0x40). Set on a oneway `BC_TRANSACTION{,_SG}`
-/// alongside `TF_ONE_WAY`; the driver replaces any pending async
-/// transaction with the same `(target_node, code)` key instead of
-/// queueing both, deduplicating async notification floods. Without
-/// `TF_ONE_WAY` the driver rejects the request with `EINVAL`.
-///
-/// Kernel UAPI reference:
-/// `external/kernel-headers/original/uapi/linux/android/binder.h:346`.
+/// Replaces a queued twin oneway txn only while the target is frozen; ignored without `TF_ONE_WAY`.
 pub const transaction_flags_TF_UPDATE_TXN: transaction_flags = 64;
-/// `TF_COLLECT_NOTED_APP_OPS` (0x80). Strictly a
-/// libbinder-level flag (the kernel binder driver does not consume it):
-/// instructs the runtime to prepend an `EX_HAS_NOTED_APPOPS_REPLY_HEADER`
-/// (= -127) blob to the reply parcel, listing every `noteOp(...)`
-/// AppOpsManager call observed while servicing the transaction. The
-/// receiving proxy must read past the header before decoding the user's
-/// reply payload — see `Parcel::read_exception_code` /
-/// `Status::from_parcel` for the rsbinder side.
-///
-/// AOSP libbinder reference:
-/// `frameworks/native/libs/binder/Parcel.cpp::readExceptionCode`.
-pub const transaction_flags_TF_COLLECT_NOTED_APP_OPS: transaction_flags = 128;
 pub type transaction_flags = ::std::os::raw::c_uint;
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -3881,22 +3831,7 @@ pub const binder_driver_command_protocol_BC_TRANSACTION_SG: binder_driver_comman
     1078485777;
 pub const binder_driver_command_protocol_BC_REPLY_SG: binder_driver_command_protocol = 1078485778;
 
-// Freeze observer BR/BC additions (Android 14+).
-// Manually inserted because the upstream bindgen run for this tree
-// predates the kernel's freeze-observer protocol; the values below
-// are recomputed from the kernel UAPI macros
-// (`external/kernel-headers/original/uapi/linux/android/binder.h:520-633`,
-// AOSP `android-16.0.0_r4`):
-//
-//   `_IO('r', N)`            = `(0 << 30) | (N) | ('r' << 8)`
-//   `_IOR('r', N, T)`        = `(2 << 30) | (sizeof(T) << 16) | (N) | ('r' << 8)`
-//   `_IOW('c', N, T)`        = `(1 << 30) | (sizeof(T) << 16) | (N) | ('c' << 8)`
-//
-// `binder_uintptr_t` is `u64` (8 bytes) and `binder_frozen_state_info`
-// is 16 bytes (u64 cookie + 2x u32). `binder_handle_cookie` is
-// `#[repr(C, packed)]` and 12 bytes (4+8). These constants are
-// declared but no executor path consumes them yet, so the kernel wire
-// remains byte-identical until the BR/BC dispatch arms are wired.
+// Freeze BR/BC from the android-16.0.0_r4 UAPI, added by hand: this bindgen run predates them.
 pub const binder_driver_return_protocol_BR_TRANSACTION_PENDING_FROZEN:
     binder_driver_return_protocol = 29204;
 pub const binder_driver_return_protocol_BR_FROZEN_BINDER: binder_driver_return_protocol =
@@ -3911,11 +3846,7 @@ pub const binder_driver_command_protocol_BC_CLEAR_FREEZE_NOTIFICATION:
 pub const binder_driver_command_protocol_BC_FREEZE_NOTIFICATION_DONE:
     binder_driver_command_protocol = 1074291477;
 
-/// UAPI struct delivered with `BR_FROZEN_BINDER`
-/// (`_IOR('r', 21, struct binder_frozen_state_info)`). 16 bytes:
-/// `cookie` (`binder_uintptr_t` = `u64`) + `is_frozen` (`u32`) +
-/// `reserved` (`u32`). Layout matches kernel
-/// `external/kernel-headers/original/uapi/linux/android/binder.h:287-291`.
+/// UAPI payload of `BR_FROZEN_BINDER` (`_IOR('r', 21)`), 16 bytes.
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Default)]
 pub struct binder_frozen_state_info {

@@ -65,7 +65,7 @@ pub enum ExceptionCode {
     /// (`frameworks/native/libs/binder/include/binder/Status.h:71`).
     ///
     /// Set by a server that received the transaction with
-    /// `TF_COLLECT_NOTED_APP_OPS` (see [`crate::FLAG_COLLECT_NOTED_APP_OPS`]).
+    /// [`crate::FLAG_COLLECT_NOTED_APP_OPS`] (`0x2`, AOSP `IBinder.java`).
     /// rsbinder's [`Status::deserialize`] transparently skips the header
     /// and reads the next i32 as the actual exception code — clients
     /// observe the same `Status` they would have without the header.
@@ -421,7 +421,6 @@ impl From<StatusCode> for ExceptionCode {
     fn from(status: StatusCode) -> Self {
         match status {
             StatusCode::Ok => ExceptionCode::None,
-            StatusCode::UnexpectedNull => ExceptionCode::NullPointer,
             StatusCode::ServiceSpecific(_) => ExceptionCode::ServiceSpecific,
             _ => ExceptionCode::TransactionFailed,
         }
@@ -480,7 +479,8 @@ impl Serialize for Status {
         parcel.write::<i32>(&0)?; // Empty remote stack trace header
 
         if self.exception == ExceptionCode::ServiceSpecific {
-            parcel.write::<i32>(&(self.code.into()))?;
+            // AOSP `mErrorCode`: any `int32`, not a `status_t`, so no sign rule applies.
+            parcel.write::<i32>(&self.service_specific_error())?;
         } else if self.exception == ExceptionCode::Parcelable {
             parcel.write::<i32>(&0)?;
         }
@@ -607,6 +607,18 @@ mod tests {
         assert_eq!(status.transaction_error(), StatusCode::Unknown);
 
         Ok(())
+    }
+
+    /// AOSP `Status::setFromStatusT`: every non-OK `status_t` is `EX_TRANSACTION_FAILED`.
+    #[test]
+    fn unexpected_null_is_a_transaction_error_not_an_exception() {
+        let status = Status::from(StatusCode::UnexpectedNull);
+        assert_eq!(status.exception_code(), ExceptionCode::TransactionFailed);
+        assert_eq!(status.transaction_error(), StatusCode::UnexpectedNull);
+        // The reply carries it as the transact status, not as a `-4` exception header.
+        let mut parcel = Parcel::new();
+        assert_eq!(parcel.write(&status), Err(StatusCode::UnexpectedNull));
+        assert_eq!(parcel.data_size(), 0);
     }
 
     crate::declare_binder_enum! {
@@ -919,7 +931,7 @@ mod tests {
         assert_eq!(status.exception_code(), ExceptionCode::Security);
     }
 
-    // ---- TF_UPDATE_TXN / TF_COLLECT_NOTED_APP_OPS flag values ----
+    // ---- FLAG_UPDATE_TXN / FLAG_COLLECT_NOTED_APP_OPS flag values ----
 
     /// `FLAG_UPDATE_TXN` = AOSP `TF_UPDATE_TXN` 0x40 (UAPI `binder.h:346`), a kernel-checked bit.
     #[test]
@@ -931,13 +943,13 @@ mod tests {
         );
     }
 
-    /// `FLAG_COLLECT_NOTED_APP_OPS = 0x80` matches AOSP's userspace libbinder convention.
+    /// AOSP `IBinder.java` value `0x2`; `0x80` is the android17-6.18 `TF_DEFER_COMPLETE`.
     #[test]
     fn flag_collect_noted_app_ops_matches_aosp_userspace() {
         assert_eq!(
             crate::FLAG_COLLECT_NOTED_APP_OPS,
-            0x80,
-            "FLAG_COLLECT_NOTED_APP_OPS must be 0x80 (AOSP userspace)"
+            0x2,
+            "FLAG_COLLECT_NOTED_APP_OPS must be 0x2 (AOSP IBinder.java)"
         );
     }
 

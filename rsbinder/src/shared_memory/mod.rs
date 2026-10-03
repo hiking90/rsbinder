@@ -48,6 +48,7 @@ pub mod heap;
 pub mod shared;
 pub mod wire;
 
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use crate::error::{Result, StatusCode};
@@ -240,20 +241,36 @@ impl std::fmt::Debug for SharedBytes<'_> {
 }
 
 /// Server-side representation of a heap. AOSP `IMemoryHeap` is keyed by
-/// the heap fd; this trait deliberately exposes the fd as a borrowed
-/// raw fd (`i32`) rather than an owned [`std::os::fd::OwnedFd`] so the
-/// transaction marshalling can write it into the reply as a bare fd object
-/// (AOSP `writeFileDescriptor`, which dups) without taking ownership away
-/// from the heap object.
+/// the heap fd; this trait exposes it as a [`BorrowedFd`] rather than an
+/// owned [`std::os::fd::OwnedFd`] so the transaction marshalling can write
+/// it into the reply as a bare fd object (AOSP `writeFileDescriptor`, which
+/// dups) without taking ownership away from the heap object.
+///
+/// The fd is a [`BorrowedFd`], not a raw number, because a peer's
+/// `HEAP_ID` request makes [`BnMemoryHeap`] dup it into the reply: the
+/// borrow is what guarantees the fd is open and belongs to the heap for as
+/// long as `&self` lives. A raw number from a safe trait method could name
+/// any fd of the process (stdin, or one already closed), and a remote
+/// request would then send it to the peer.
 ///
 /// Heap geometry is immutable for the lifetime of the heap: the size and
 /// offset are captured at heap construction time and never mutate.
 /// Mutation surface is intentionally absent — heap resize is not in AOSP `IMemoryHeap` either
 /// ([IMemory.h:41-45](https://cs.android.com/android/platform/superproject/+/android-16.0.0_r4:frameworks/native/libs/binder/include/binder/IMemory.h;l=41)).
 pub trait IMemoryHeap: Send + Sync {
-    /// AOSP `getHeapID()`. Returns the fd-as-i32 for parcel marshalling
-    /// (written as a bare fd object on the wire, AOSP `writeFileDescriptor`).
-    fn heap_id(&self) -> i32;
+    /// The heap fd, as AOSP `getHeapID()` names it; `None` while the heap
+    /// has none (an unmapped [`BpMemoryHeap`]).
+    ///
+    /// [`BnMemoryHeap`] answers `HEAP_ID` with a dup of this fd, written as
+    /// a bare fd object (AOSP `writeFileDescriptor`), and with `BadValue`
+    /// when it is `None`.
+    fn heap_fd(&self) -> Option<BorrowedFd<'_>>;
+    /// AOSP `getHeapID()`: the number of [`heap_fd`](Self::heap_fd), or
+    /// `-1` without one. Informational only: the `HEAP_ID` reply is built
+    /// from [`heap_fd`](Self::heap_fd), never from this number.
+    fn heap_id(&self) -> i32 {
+        self.heap_fd().map_or(-1, |fd| fd.as_raw_fd())
+    }
     /// AOSP `getSize()`. Total byte length of the heap.
     fn size(&self) -> usize;
     /// AOSP `getFlags()`. Bitmask of `FLAG_READ_ONLY` etc.
@@ -310,13 +327,13 @@ mod tests {
         }
     }
 
-    /// `IMemoryHeap` is object-safe: a `&dyn IMemoryHeap` compiles.
+    /// `IMemoryHeap` is object-safe (`&dyn` compiles); `heap_id` derives from `heap_fd`.
     #[test]
     fn imemoryheap_is_object_safe() {
-        struct Stub;
+        struct Stub(Option<std::fs::File>);
         impl IMemoryHeap for Stub {
-            fn heap_id(&self) -> i32 {
-                42
+            fn heap_fd(&self) -> Option<BorrowedFd<'_>> {
+                self.0.as_ref().map(std::os::fd::AsFd::as_fd)
             }
             fn size(&self) -> usize {
                 0
@@ -331,7 +348,10 @@ mod tests {
                 None
             }
         }
-        let h: &dyn IMemoryHeap = &Stub;
-        assert_eq!(h.heap_id(), 42);
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let raw = file.as_raw_fd();
+        let h: &dyn IMemoryHeap = &Stub(Some(file));
+        assert_eq!(h.heap_id(), raw);
+        assert_eq!(Stub(None).heap_id(), -1);
     }
 }

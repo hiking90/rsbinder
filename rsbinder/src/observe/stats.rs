@@ -166,8 +166,7 @@ impl TransactionObserver for StatsObserver {
         result: &Result<()>,
         elapsed: Duration,
     ) {
-        // Saturate: the trait is public, so a caller may send an unpaired reply.
-        // Its replacement `try_update` is newer than the MSRV.
+        // Saturates on an unpaired reply (public trait); `try_update` is newer than the MSRV.
         #[allow(deprecated)]
         let _ = self
             .in_flight
