@@ -6,6 +6,20 @@
 //! `sys.rs` is unmodified bindgen output; `generate.sh` regenerates it from
 //! the verbatim kernel headers under `include/` and states the options.
 //!
+//! # UAPI items not used yet
+//!
+//! The bindings keep every item of the two headers, including ones no
+//! rsbinder path uses, so that the crate matches the UAPI:
+//!
+//! - `BR_FROZEN_BINDER`, `BR_CLEAR_FREEZE_NOTIFICATION_DONE`,
+//!   `BC_REQUEST_FREEZE_NOTIFICATION`, `BC_CLEAR_FREEZE_NOTIFICATION`,
+//!   `BC_FREEZE_NOTIFICATION_DONE`: freeze notifications, not dispatched
+//!   until plan 4-3 Phase B wires them.
+//! - `BC_ATTEMPT_ACQUIRE`, `BC_TRANSACTION_SG`, `BC_REPLY_SG`: defined by
+//!   the driver and sent by neither AOSP libbinder nor rsbinder.
+//! - The `set_idle_timeout`, `set_idle_priority`, `get_node_debug_info`,
+//!   `freeze` and `get_frozen_info` wrappers below, each with its reason.
+//!
 //! # ioctl safety
 //!
 //! Shared SAFETY rationale for every `ioctl::ioctl(fd, ctl)` in `binder`:
@@ -44,8 +58,11 @@
 //! from `thread_state::free_buffer`, called when a parcel drops or for a
 //! status reply no parcel ever wrapped.
 
-// Allowances scoped to the bindgen output: `dead_code` still flags unused wrappers below.
-#[allow(non_camel_case_types, non_upper_case_globals, dead_code)]
+#[allow(
+    non_camel_case_types,
+    dead_code,
+    reason = "bindgen output: C type names, and UAPI items not used yet (module doc)"
+)]
 mod raw {
     include!("sys.rs");
 }
@@ -171,8 +188,10 @@ pub mod binder {
         }
     }
 
-    // BINDER_SET_IDLE_TIMEOUT is a no-op in every shipping driver; kept for UAPI completeness.
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "BINDER_SET_IDLE_TIMEOUT is a no-op in every shipping driver; kept for the UAPI"
+    )]
     pub(crate) fn set_idle_timeout<Fd: AsFd>(
         fd: Fd,
         timeout: i64,
@@ -184,8 +203,10 @@ pub mod binder {
         }
     }
 
-    // BINDER_SET_IDLE_PRIORITY is a no-op in every shipping driver; kept for UAPI completeness.
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "BINDER_SET_IDLE_PRIORITY is a no-op in every shipping driver; kept for the UAPI"
+    )]
     pub(crate) fn set_idle_priority<Fd: AsFd>(
         fd: Fd,
         priority: i32,
@@ -205,8 +226,7 @@ pub mod binder {
         }
     }
 
-    // debug-only ioctl; no crate path issues it yet.
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "debug-only ioctl; no crate path issues it yet")]
     pub(crate) fn get_node_debug_info<Fd: AsFd>(
         fd: Fd,
         node_debug_info: &mut binder_node_debug_info,
@@ -235,8 +255,10 @@ pub mod binder {
         }
     }
 
-    // plan 4-3 Phase B (freeze) will issue this; declared ahead so the opcode is pinned.
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "plan 4-3 Phase B (freeze) will issue this; declared ahead so the opcode is pinned"
+    )]
     pub(crate) fn freeze<Fd: AsFd>(
         fd: Fd,
         info: binder_freeze_info,
@@ -251,8 +273,10 @@ pub mod binder {
         }
     }
 
-    // plan 4-3 Phase B (freeze) will issue this; declared ahead so the opcode is pinned.
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "plan 4-3 Phase B (freeze) will issue this; declared ahead so the opcode is pinned"
+    )]
     pub(crate) fn get_frozen_info<Fd: AsFd>(
         fd: Fd,
         frozen_info: &mut binder_frozen_status_info,

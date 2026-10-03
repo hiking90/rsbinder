@@ -162,7 +162,10 @@ impl std::fmt::Debug for Client {
 }
 
 impl std::fmt::Debug for ClientOptions {
-    #[allow(deprecated)] // Shows `handshake_timeout` while it is still honored.
+    #[expect(
+        deprecated,
+        reason = "shows `handshake_timeout` while it is still honored"
+    )]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut d = f.debug_struct("ClientOptions");
         #[cfg(feature = "rpc-tls")]
@@ -237,7 +240,10 @@ pub(crate) fn open_staged(
 }
 
 /// The kernel endpoint and every option check; RPC endpoints end here without the `rpc` feature.
-#[allow(deprecated)] // Refuses `handshake_timeout` where it does not apply, while it is honored.
+#[expect(
+    deprecated,
+    reason = "refuses `handshake_timeout` where it does not apply, while it is honored"
+)]
 fn kernel_open(uri: Uri, o: ClientOptions) -> Result<Client> {
     if uri.service.is_some() {
         log::error!(
@@ -297,7 +303,10 @@ fn kernel_open(uri: Uri, o: ClientOptions) -> Result<Client> {
 
 /// Every check an RPC open makes before any I/O, and the config it then connects with.
 #[cfg(feature = "rpc")]
-#[allow(deprecated)] // Forwards `handshake_timeout` to the config's own deprecated setter.
+#[expect(
+    deprecated,
+    reason = "forwards `handshake_timeout` to the config's own deprecated setter"
+)]
 fn rpc_setup<'a>(uri: &'a Uri, o: &'a ClientOptions) -> Result<crate::rpc::RpcClientConfig<'a>> {
     if uri.service.is_some() {
         log::error!(

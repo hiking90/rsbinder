@@ -197,7 +197,10 @@ pub struct SessionEnd {
 
 impl SessionEnd {
     /// Derives both axes from the reason, a local decision and an armed deadline; see module doc.
-    #[allow(deprecated)] // Maps the never-produced variants too: the match stays exhaustive.
+    #[expect(
+        deprecated,
+        reason = "maps the never-produced variants too: the match stays exhaustive"
+    )]
     pub(crate) fn new(reason: EndReason, ended_locally: bool, deadline_armed: bool) -> Self {
         use EndReason::*;
         use StreamState::*;

@@ -148,7 +148,10 @@ pub(crate) fn open_root(path: &Path) -> std::io::Result<OwnedFd> {
 }
 
 /// `st_mode` is `u16` on darwin and `u32` elsewhere; the check wants the wider one.
-#[allow(clippy::useless_conversion)]
+#[allow(
+    clippy::useless_conversion,
+    reason = "`st_mode` is already `u32` off darwin"
+)]
 fn mode_bits(st: &Stat) -> u32 {
     u32::from(st.st_mode)
 }

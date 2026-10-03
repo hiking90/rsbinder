@@ -535,7 +535,10 @@ pub struct RpcUnixClientConfig<'a> {
     handshake_timeout: Option<Duration>,
 }
 
-#[allow(deprecated)]
+#[expect(
+    deprecated,
+    reason = "implements the deprecated config while it is honored"
+)]
 impl<'a> RpcUnixClientConfig<'a> {
     fn new(addr: RpcUnixAddr<'a>, max_version: u32) -> Self {
         Self {
@@ -4970,7 +4973,7 @@ impl RpcSession {
         since = "0.12.0",
         note = "use `setup_client_android13plus_with_config` with `RpcClientConfig::unix`/`unix_abstract`"
     )]
-    #[allow(deprecated)]
+    #[expect(deprecated, reason = "takes the deprecated `RpcUnixClientConfig`")]
     pub fn setup_unix_client_android13plus_with_config(
         config: RpcUnixClientConfig,
     ) -> Result<RpcSession> {
@@ -5131,7 +5134,7 @@ impl RpcSession {
         since = "0.12.0",
         note = "use `add_outgoing_connection_with_config` with a `RpcClientConfig`"
     )]
-    #[allow(deprecated)]
+    #[expect(deprecated, reason = "takes the deprecated `RpcUnixClientConfig`")]
     pub fn add_outgoing_connection_android13plus_with_config(
         &self,
         config: RpcUnixClientConfig,
@@ -5333,7 +5336,7 @@ impl RpcSession {
         since = "0.12.0",
         note = "use `add_incoming_connection_with_config` with a `RpcClientConfig`"
     )]
-    #[allow(deprecated)]
+    #[expect(deprecated, reason = "takes the deprecated `RpcUnixClientConfig`")]
     pub fn add_incoming_connection_android13plus_with_config(
         &self,
         config: RpcUnixClientConfig,

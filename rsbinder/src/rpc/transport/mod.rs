@@ -664,10 +664,12 @@ const MAX_KEEPALIVE_SECS: u64 = 32767;
 #[derive(Clone, Copy)]
 pub(crate) enum SocketKind {
     UnixDomain,
-    // TCP and vsock: only their transports' features use it.
     #[cfg_attr(
         not(any(feature = "rpc-tcp-debug", feature = "rpc-tls", feature = "rpc-vsock")),
-        allow(dead_code)
+        allow(
+            dead_code,
+            reason = "TCP and vsock: only their transports' features use it"
+        )
     )]
     TcpOrVsock,
 }
