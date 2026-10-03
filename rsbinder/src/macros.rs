@@ -883,7 +883,6 @@ mod tests {
         }
     }
 
-    #[allow(dead_code)]
     impl IBye for Binder<BnBye> {
         #[cfg(feature = "async")]
         fn bye(&self) -> Result<()> {

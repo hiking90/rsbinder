@@ -122,7 +122,6 @@ use crate::binder::{DeathRecipient, FromIBinder, Interface, SIBinder, Strong, WI
 /// [`purge_dead`]: Self::purge_dead
 pub struct Rewrap<I: FromIBinder + ?Sized> {
     // `Box<dyn Fn>`, not a fn pointer, so a capturing closure is accepted too.
-    #[allow(clippy::type_complexity)]
     make_local: Box<dyn Fn(Strong<I>) -> Strong<I> + Send + Sync>,
     // `Arc` so a `Reaper` can hold a `Weak` to just the map: free of `I`, out of any cycle.
     entries: Arc<Mutex<HashMap<usize, Entry>>>,

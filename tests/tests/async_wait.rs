@@ -33,7 +33,6 @@
 //! substitute — see plan 11-1 §8.5.
 
 #![cfg(any(target_os = "linux", target_os = "android"))]
-#![allow(non_snake_case)]
 
 use std::time::{Duration, Instant};
 

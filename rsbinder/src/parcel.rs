@@ -4390,7 +4390,6 @@ mod data_serde {
 
     /// Inode of `fd`: which open file an fd table slot holds.
     #[cfg(feature = "rpc")]
-    #[allow(clippy::unnecessary_cast)] // `st_ino` is not `u64` on every target.
     fn inode_of(fd: impl std::os::fd::AsFd) -> u64 {
         rustix::fs::fstat(fd).unwrap().st_ino as u64
     }

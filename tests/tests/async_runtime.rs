@@ -25,8 +25,6 @@
 //! or the RPC transport: the same `TokioRuntime` adapter is on the path
 //! either way.
 
-#![allow(non_snake_case)]
-
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;

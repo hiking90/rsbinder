@@ -22,7 +22,6 @@
 //! binder — runs on macOS. Separate `#![cfg(feature = "rpc")]` binary.
 
 #![cfg(feature = "rpc")]
-#![allow(non_snake_case)]
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};

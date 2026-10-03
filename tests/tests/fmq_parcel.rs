@@ -8,8 +8,6 @@
 //! `rsbinder::NativeHandle` for imports this crate has no `.aidl` for, and
 //! a `Tagged<Tag>` of its own whose parameter is a phantom.
 
-#![allow(non_snake_case)]
-
 use rsbinder::fmq::{MQDescriptor, SynchronizedReadWrite};
 use rsbinder::{Interface, NativeHandle, Parcel, Parcelable};
 

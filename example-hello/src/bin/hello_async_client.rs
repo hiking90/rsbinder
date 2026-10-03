@@ -1,6 +1,5 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
-#![allow(non_snake_case)]
 
 //! Async counterpart of `hello_client`: obtains the proxy and calls it with
 //! `.await`. Works against either `hello_async_service` or the sync
