@@ -23,28 +23,16 @@
 //! on the server side, including the `Binder` wrapper for native service objects
 //! and transaction handling utilities.
 //!
-//! # Local-binder cast soundness
+//! # Local-binder cast
 //!
 //! `Binder::<B>::try_from(SIBinder)` recovers the local binder behind a
 //! type-erased handle (the Rust counterpart of C++ `IBinder::localBinder`) by
-//! reinterpreting the trait-object `Arc`'s data pointer as `Inner<B>`. The
-//! cast is layout-correct only because of three facts:
-//!
-//! - `as_any().downcast_ref::<Inner<B>>()` succeeds. On its own this proves
-//!   only that `as_any()` returns *an* `Inner<B>`: an external `IBinder` impl
-//!   that delegates `as_any()` and `descriptor()` to a wrapped inner object
-//!   passes it while its `Arc` points at the wrapper allocation.
-//! - `as_any()` returned the `Arc`'s own data pointer. Without this check the
-//!   reinterpret, and the refcount operations on it, would be UB; a mismatch
-//!   fails the cast with `BadValue`.
-//! - `Inner<T>` is crate-private and never embedded by value in another type,
-//!   so an `Inner<B>` at an `Arc`'s data address is that `Arc`'s own pointee.
-//!   A wrapper with an `Inner<B>` first field could otherwise pass both checks.
-//!
-//! Refcount: cloning the trait-object `Arc` and consuming it with
-//! `Arc::into_raw` leaks one strong reference; `Arc::from_raw` on the cast
-//! pointer reclaims it as `Arc<Inner<B>>`, so the total strong count is
-//! conserved once `ibinder` drops.
+//! upcasting a clone of the `Arc<dyn IBinder>` to `Arc<dyn Any + Send + Sync>`
+//! and calling `Arc::downcast::<Inner<B>>`. The `TypeId` it compares comes
+//! from the trait object's vtable, i.e. the allocation's concrete type, never
+//! from `IBinder::as_any`: an external `IBinder` impl that delegates
+//! `as_any()` and `descriptor()` to a wrapped `Binder<B>` fails the cast with
+//! `BadValue` instead of being reinterpreted as `Inner<B>`.
 //!
 //! # Flat-binder flags
 //!
@@ -669,31 +657,19 @@ impl<B: Remotable + 'static> TryFrom<SIBinder> for Binder<B> {
             return Err(StatusCode::BadType);
         }
 
-        if let Some(inner_ref) = ibinder.as_any().downcast_ref::<Inner<B>>() {
-            // A delegating `as_any()` must not pass: see module doc "Local-binder cast soundness".
-            let data_ptr = Arc::as_ptr(ibinder.as_arc()) as *const u8;
-            let any_ptr = inner_ref as *const Inner<B> as *const u8;
-            if !std::ptr::eq(data_ptr, any_ptr) {
+        // Two bindings: upcasting `Arc::clone`'s result in one expression fails to infer (E0308).
+        let arc: Arc<dyn IBinder> = Arc::clone(ibinder.as_arc());
+        let any: Arc<dyn Any + Send + Sync> = arc;
+        match any.downcast::<Inner<B>>() {
+            Ok(inner) => Ok(Self { inner }),
+            Err(_) => {
+                // Descriptor matched: a remote proxy, another `Remotable`, or a delegating wrapper.
                 log::error!(
-                    "binder cast to `{}`: as_any() is not the Arc's own data (delegating IBinder impl?)",
+                    "cast to local Binder<{}> failed: not a local binder (remote proxy or different Remotable)",
                     B::descriptor()
                 );
-                return Err(StatusCode::BadValue);
+                Err(StatusCode::BadValue)
             }
-            let arc_dyn = Arc::clone(ibinder.as_arc());
-            let raw_dyn = Arc::into_raw(arc_dyn);
-            let inner_raw = raw_dyn as *const Inner<B>;
-            // SAFETY: the Arc's own `Inner<B>` (module doc); from_raw reclaims the into_raw ref.
-            let inner = unsafe { Arc::from_raw(inner_raw) };
-
-            Ok(Self { inner })
-        } else {
-            // Descriptor matched, so log it once: a remote proxy or another `Remotable` type.
-            log::error!(
-                "cast to local Binder<{}> failed: not a local binder (remote proxy or different Remotable)",
-                B::descriptor()
-            );
-            Err(StatusCode::BadValue)
         }
     }
 }
@@ -949,6 +925,73 @@ mod stability_mutation_tests {
         si.force_downgrade_to_vendor_stability().unwrap();
         assert_eq!(si.stability(), Stability::Vendor);
         assert!(!si.was_parceled());
+    }
+
+    /// The cast hands back the same allocation and leaves the strong count where it was.
+    #[test]
+    fn local_cast_shares_the_allocation() {
+        let b = Binder::new(DummyRemotable);
+        let si = crate::Interface::as_binder(&b);
+        let before = Arc::strong_count(si.as_arc());
+        let cast = Binder::<DummyRemotable>::try_from(si.clone()).expect("local binder");
+        assert!(Arc::ptr_eq(&cast.inner, &b.inner));
+        drop(cast);
+        assert_eq!(Arc::strong_count(si.as_arc()), before);
+    }
+
+    /// Wraps a local binder and forwards `as_any()`/`descriptor()` to it.
+    struct Delegating(SIBinder);
+
+    impl IBinder for Delegating {
+        fn link_to_death(&self, r: Weak<dyn DeathRecipient>) -> Result<()> {
+            self.0.link_to_death(r)
+        }
+        fn unlink_to_death(&self, r: Weak<dyn DeathRecipient>) -> Result<()> {
+            self.0.unlink_to_death(r)
+        }
+        fn ping_binder(&self) -> Result<()> {
+            self.0.ping_binder()
+        }
+        fn as_any(&self) -> &dyn Any {
+            self.0.as_any()
+        }
+        fn as_transactable(&self) -> Option<&dyn Transactable> {
+            self.0.as_transactable()
+        }
+        fn descriptor(&self) -> &str {
+            self.0.descriptor()
+        }
+        fn is_remote(&self) -> bool {
+            false
+        }
+        fn inc_strong(&self, _: &SIBinder) -> Result<()> {
+            Ok(())
+        }
+        fn attempt_inc_strong(&self) -> bool {
+            true
+        }
+        fn dec_strong(&self, _: Option<ManuallyDrop<SIBinder>>) -> Result<()> {
+            Ok(())
+        }
+        fn inc_weak(&self, _: &WIBinder) -> Result<()> {
+            Ok(())
+        }
+        fn dec_weak(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The `TypeId` comes from the allocation, so a forwarding `as_any()` cannot pass the cast.
+    #[test]
+    fn a_wrapper_delegating_as_any_is_not_a_local_binder() {
+        let b = Binder::new(DummyRemotable);
+        let wrapper = Delegating(crate::Interface::as_binder(&b));
+        assert!(wrapper.as_any().is::<Inner<DummyRemotable>>());
+        let si = SIBinder::new(Arc::new(wrapper)).expect("SIBinder::new");
+        assert_eq!(
+            Binder::<DummyRemotable>::try_from(si).err(),
+            Some(StatusCode::BadValue)
+        );
     }
 
     /// Constructing with `Vintf` matches `mark_vintf` and stays mutable until parceled.

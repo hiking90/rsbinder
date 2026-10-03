@@ -18,7 +18,7 @@ not supported on either stack.
 
 ## Before you start
 
-- [ ] Rust 1.85 or later
+- [ ] Rust 1.86 or later
 - [ ] For kernel binder: a kernel with binder support, or an Android
       device/emulator
 - [ ] For kernel binder on Linux: a device node created with `rsb_device`, and
