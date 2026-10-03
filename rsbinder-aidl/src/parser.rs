@@ -1908,10 +1908,16 @@ fn validate_oneway_methods(interface: &InterfaceDecl) -> Result<(), AidlError> {
     }
 }
 
+/// Next child of a pair whose arity `aidl.pest` fixes; `None` is a grammar/parser mismatch.
+#[track_caller]
+fn child<'i>(pairs: &mut pest::iterators::Pairs<'i, Rule>) -> pest::iterators::Pair<'i, Rule> {
+    pairs.next().expect("aidl.pest fixes this rule's children")
+}
+
 fn parse_unary(mut pairs: pest::iterators::Pairs<Rule>) -> Result<(ConstExpr, usize), AidlError> {
-    let op = pairs.next().unwrap();
+    let op = child(&mut pairs);
     let operator = op.as_str().to_owned();
-    let (factor, depth) = parse_factor(pairs.next().unwrap().into_inner().next().unwrap())?;
+    let (factor, depth) = parse_factor(child(&mut child(&mut pairs).into_inner()))?;
     let depth = bound_expr_depth(depth + 1, &op)?;
     Ok((ConstExpr::new_unary(&operator, factor), depth))
 }
@@ -2091,7 +2097,7 @@ fn parse_factor(pair: pest::iterators::Pair<Rule>) -> Result<(ConstExpr, usize),
     match pair.as_rule() {
         Rule::expression => parse_expression_with_depth(pair.into_inner()),
         Rule::unary => parse_unary(pair.into_inner()),
-        Rule::value => Ok((parse_value(pair.into_inner().next().unwrap())?, 0)),
+        Rule::value => Ok((parse_value(child(&mut pair.into_inner()))?, 0)),
         _ => unreachable!("Unexpected rule in parse_factor(): {}", pair),
     }
 }
@@ -2109,7 +2115,7 @@ fn parse_expression_term(
         | Rule::arith
         | Rule::logical_or
         | Rule::logical_and => parse_expression_with_depth(pair.into_inner()),
-        Rule::factor => parse_factor(pair.into_inner().next().unwrap()),
+        Rule::factor => parse_factor(child(&mut pair.into_inner())),
         _ => unreachable!("Unexpected rule in Rule::parse_expression_into: {}", pair),
     }
 }
@@ -2121,11 +2127,11 @@ fn parse_expression(pairs: pest::iterators::Pairs<Rule>) -> Result<ConstExpr, Ai
 fn parse_expression_with_depth(
     mut pairs: pest::iterators::Pairs<Rule>,
 ) -> Result<(ConstExpr, usize), AidlError> {
-    let (mut lhs, mut depth) = parse_expression_term(pairs.next().unwrap())?;
+    let (mut lhs, mut depth) = parse_expression_term(child(&mut pairs))?;
 
     while let Some(pair) = pairs.next() {
         let op = pair.as_str().to_owned();
-        let (rhs, rhs_depth) = parse_expression_term(pairs.next().unwrap())?;
+        let (rhs, rhs_depth) = parse_expression_term(child(&mut pairs))?;
         depth = bound_expr_depth(depth.max(rhs_depth) + 1, &pair)?;
 
         lhs = ConstExpr::new_expr(lhs, &op, rhs)
@@ -2491,9 +2497,9 @@ fn parse_non_array_type(pairs: pest::iterators::Pairs<Rule>) -> Result<NonArrayT
             Rule::generic_type1 => {
                 let mut pairs = pair.into_inner();
                 let generic = Generic::Type1 {
-                    type_args1: parse_type_args(pairs.next().unwrap().into_inner())?,
-                    non_array_type: parse_split_non_array_type(pairs.next().unwrap().into_inner())?,
-                    type_args2: parse_type_args(pairs.next().unwrap().into_inner())?,
+                    type_args1: parse_type_args(child(&mut pairs).into_inner())?,
+                    non_array_type: parse_split_non_array_type(child(&mut pairs).into_inner())?,
+                    type_args2: parse_type_args(child(&mut pairs).into_inner())?,
                 };
 
                 non_array_type.generic = Some(Box::new(generic));
@@ -2502,8 +2508,8 @@ fn parse_non_array_type(pairs: pest::iterators::Pairs<Rule>) -> Result<NonArrayT
             Rule::generic_type2 => {
                 let mut pairs = pair.into_inner();
                 let generic = Generic::Type2 {
-                    non_array_type: parse_split_non_array_type(pairs.next().unwrap().into_inner())?,
-                    type_args: parse_type_args(pairs.next().unwrap().into_inner())?,
+                    non_array_type: parse_split_non_array_type(child(&mut pairs).into_inner())?,
+                    type_args: parse_type_args(child(&mut pairs).into_inner())?,
                 };
 
                 non_array_type.generic = Some(Box::new(generic));
@@ -2511,7 +2517,7 @@ fn parse_non_array_type(pairs: pest::iterators::Pairs<Rule>) -> Result<NonArrayT
             Rule::generic_type3 => {
                 let mut pairs = pair.into_inner();
                 let generic = Generic::Type3 {
-                    type_args: parse_type_args(pairs.next().unwrap().into_inner())?,
+                    type_args: parse_type_args(child(&mut pairs).into_inner())?,
                 };
 
                 non_array_type.generic = Some(Box::new(generic));
@@ -2902,10 +2908,8 @@ fn parse_unstructured_parcelable(
         RustType,
     }
 
-    let (first, second) = pairs
-        .next()
-        .zip(pairs.next())
-        .expect("Incomplete rule in parse_unstructured_parcelable()");
+    let first = child(&mut pairs);
+    let second = child(&mut pairs);
 
     let header = match first.as_rule() {
         Rule::CPP_HEADER => HeaderType::CppHeader,
@@ -3399,7 +3403,7 @@ pub fn parse_document(ctx: &SourceContext) -> Result<Document, AidlError> {
             for pair in pairs {
                 match pair.as_rule() {
                     Rule::package => {
-                        let name = pair.into_inner().next().unwrap();
+                        let name = child(&mut pair.into_inner());
                         reject_unrepresentable_identifier(
                             name.as_str(),
                             "package segment",
