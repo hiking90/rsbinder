@@ -9,7 +9,7 @@
 //! Ignored unless `RSBINDER_FMQ_LIBFMQ_PEER` names the peer binary:
 //!
 //! ```text
-//! RSBINDER_FMQ_LIBFMQ_PEER=target/libfmq-host/libfmq_peer \
+//! RSBINDER_FMQ_LIBFMQ_PEER=$PWD/target/libfmq-host/libfmq_peer \
 //!     cargo test -p rsbinder-fmq --test libfmq_host -- --ignored
 //! ```
 

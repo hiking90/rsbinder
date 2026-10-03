@@ -10,11 +10,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::descriptor::{
-    align_up, default_layout, recheck_ashmem_sizes, validate, AttachPolicy, Descriptor, Flavor,
-    Grantor,
+    default_layout, recheck_ashmem_sizes, validate, AttachPolicy, Descriptor, Flavor, Grantor,
 };
 use crate::error::{Error, Result};
 use crate::event_flag::EventFlag;
+use crate::ring::{self, Run};
 use crate::sys::{self, Mapping};
 
 /// A type that can be an element of a [`MessageQueue`].
@@ -85,11 +85,23 @@ struct Ring {
 /// # One handle, one side
 ///
 /// A `MessageQueue` is `Send` but not `Sync`: every operation that moves a
-/// counter or touches the ring takes `&mut self`, and the flavor's rule
-/// that there is one reader and one writer is the caller's to keep. Two
-/// handles on the same queue in one process (one from [`create`](Self::create), one from
-/// [`attach`](Self::attach)) are fine as long as one only writes and the
-/// other only reads.
+/// counter or touches the ring takes `&mut self`. The flavor allows one
+/// writer and one reader, and keeping to that is the callers' protocol, as
+/// it is with libfmq: two handles on the same queue in one process (one
+/// from [`create`](Self::create), one from [`attach`](Self::attach)) are
+/// fine as long as one only writes and the other only reads.
+///
+/// Nothing detects a second writer or a second reader, whether it is
+/// another handle in this process or the peer. It does to this queue what
+/// it does to libfmq's: the counters fail their check
+/// ([`Corrupted`](Error::Corrupted)) or a reader copies out wrong elements.
+/// It is not undefined behavior, since every access to the shared memory is
+/// atomic (see "Soundness" on [`Regions`]).
+///
+/// The unsynchronized flavor is not attachable: libfmq lets any number of
+/// its readers copy while the writer may overwrite the same bytes, and
+/// detects the overwrite afterwards (`MessageQueueBase.h`); this crate
+/// implements no such detection.
 ///
 /// ```compile_fail,E0277
 /// fn is_sync<T: Sync>() {}
@@ -128,7 +140,7 @@ pub struct MessageQueue<T: Element> {
     _element: PhantomData<T>,
 }
 
-// SAFETY: pointers into owned `Mapping`s (`Send`), reached only via atomics and `Regions` copies.
+// SAFETY: pointers into owned `Mapping`s (`Send`), reached only via atomics (`Counter`, `Run`).
 unsafe impl<T: Element> Send for MessageQueue<T> {}
 
 impl<T: Element> MessageQueue<T> {
@@ -161,10 +173,6 @@ impl<T: Element> MessageQueue<T> {
             .filter(|b| *b <= i32::MAX as u64 - rustix::param::page_size() as u64)
             .ok_or(Error::BadValue("queue too large"))?;
         let (grantors, total) = default_layout(data_bytes, event_flag);
-        // libfmq's bound, with or without the EventFlag word.
-        if align_up(16 + data_bytes) > i32::MAX as u64 {
-            return Err(Error::BadValue("queue too large"));
-        }
         let fd = sys::create_shared(total)?;
         let desc = Descriptor {
             fds: vec![fd],
@@ -194,9 +202,17 @@ impl<T: Element> MessageQueue<T> {
     /// there too); a two-fd one may exceed the `extent` cap, and an
     /// unsynchronized one is refused.
     ///
-    /// The counters are left as they are. A queue is attached once per
-    /// side; attaching a second handle to read while the first writes is
-    /// the caller's responsibility to keep to one reader and one writer.
+    /// The counters are left as they are.
+    ///
+    /// Grantors whose bytes overlap are refused: two at the same fd index,
+    /// or on two fds that are not ashmem and name the same file (equal
+    /// `st_dev` and `st_ino`, as a `dup` of one fd does). This is a
+    /// consistency check on the descriptor, not a safety boundary. Ashmem
+    /// fds are compared by index only (every ashmem fd has the device
+    /// node's inode), and memory reached by any other path is not compared
+    /// at all; an overlap that passes makes the counters fail their check
+    /// or the elements wrong, not undefined behavior (see "One handle, one
+    /// side").
     pub fn attach(desc: &Descriptor, policy: &AttachPolicy) -> Result<Self> {
         Self::open(desc.try_clone()?, policy)
     }
@@ -307,8 +323,8 @@ impl<T: Element> MessageQueue<T> {
         let offset = (position % self.ring.bytes as u64) as usize;
         let contiguous = (self.ring.bytes - offset) / q;
         debug_assert_eq!(offset % q, 0);
-        // SAFETY: `offset < bytes` stays in the ring; alignment: see "Soundness" on `Regions`.
-        let first = unsafe { self.ring.base.as_ptr().add(offset) }.cast::<T>();
+        // SAFETY: `offset < bytes`, so the pointer stays in the ring's mapping.
+        let first = unsafe { self.ring.base.as_ptr().add(offset) };
         let (first_len, second_len) = if n > contiguous {
             (contiguous, n - contiguous)
         } else {
@@ -317,7 +333,7 @@ impl<T: Element> MessageQueue<T> {
         Regions {
             first: NonNull::new(first).expect("ring pointer is non-null"),
             first_len,
-            second: self.ring.base.cast::<T>(),
+            second: self.ring.base,
             second_len,
             _borrow: PhantomData,
         }
@@ -529,21 +545,49 @@ impl<T: Element> std::fmt::Debug for MessageQueue<T> {
 ///
 /// # Soundness
 ///
-/// Both runs of a copy lie inside the ring (the index range is checked
-/// against [`len`](Self::len)) and are aligned for `T`: every offset is a
-/// multiple of `size_of::<T>()` from an 8-aligned ring base, and
-/// `align_of::<T>() <= 8`. The caller's slice cannot overlap them, since
-/// nothing hands out a reference into the ring. The peer reads written
-/// elements only after [`commit_write`](MessageQueue::commit_write)'s
-/// `Release` store, which the copy cannot move past (libfmq's `write` is the
-/// same `memcpy`); a read copies after the `Acquire` load of the write
-/// counter. A peer that rewrites the elements anyway leaves some bit pattern
-/// in the destination, and every one is a `T` (the [`Element`] contract): a
-/// wrong value, not an invalid one.
+/// Both runs of a copy lie inside the ring: the index range is checked
+/// against [`len`](Self::len). The ring stays mapped while a `Regions`
+/// borrows its queue. Every access to ring bytes is a relaxed
+/// atomic load or store — `AtomicU8` up to the first `usize` boundary,
+/// `AtomicUsize` words after it, `AtomicU8` for the bytes left over — and
+/// the caller's slice is ordinary memory on the other side of the copy.
+/// Nothing hands out a reference into the ring.
+///
+/// A change made to the ring from outside — the peer process, another
+/// handle in this process (a second writer, or a descriptor whose grantors
+/// overlap), C code, or `rsbinder`'s `SharedMemory` on the same fd — is
+/// another thread's relaxed store in Rust's memory model. A copy that runs
+/// at the same time is a race between atomics, not a data race: the bytes
+/// copied out are some mix of old and new, every such pattern is a `T`
+/// (the [`Element`] contract), and the outcome is a wrong element or, when
+/// the counters were changed too, [`Corrupted`](Error::Corrupted). It is
+/// never undefined behavior. `rsbinder::shared_memory` treats a shared
+/// mapping the same way.
+///
+/// Rust's model makes unordered atomic accesses of different sizes to the
+/// same bytes a data race. Copies through one mapping never run at the same
+/// time: a `Regions` is neither `Send` nor `Sync` and borrows a
+/// `&mut MessageQueue`, which is not `Sync`.
+///
+/// ```compile_fail,E0277
+/// fn is_send<T: Send>() {}
+/// is_send::<rsbinder_fmq::Regions<'static, u8>>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// fn is_sync<T: Sync>() {}
+/// is_sync::<rsbinder_fmq::Regions<'static, u8>>();
+/// ```
+///
+/// When the protocol is kept, the reader copies elements only after the
+/// `Acquire` load of the write counter, which
+/// [`commit_write`](MessageQueue::commit_write) stored with `Release` after
+/// the writer's copy, so the reader sees every byte the writer copied
+/// (libfmq's `write` is a `memcpy` followed by the same store).
 pub struct Regions<'a, T: Element> {
-    first: NonNull<T>,
+    first: NonNull<u8>,
     first_len: usize,
-    second: NonNull<T>,
+    second: NonNull<u8>,
     second_len: usize,
     _borrow: PhantomData<&'a mut [T]>,
 }
@@ -569,19 +613,20 @@ impl<T: Element> Regions<'_, T> {
         self.second_len
     }
 
-    /// The ring runs `start..start + n` covers, before and after the wrap, as `(pointer, length)`.
-    fn runs(&self, start: usize, n: usize) -> [(*mut T, usize); 2] {
+    /// The ring runs elements `start..start + n` cover, before and after the wrap, as atomics.
+    fn runs(&self, start: usize, n: usize) -> [Run<'_>; 2] {
+        let q = size_of::<T>();
         let head = self.first_len.saturating_sub(start).min(n);
-        // SAFETY: callers check `start + n <= len()`, so each offset is at most its part's length.
+        // SAFETY: `start + n <= len()` (callers) keeps both runs in the ring; see "Soundness".
         unsafe {
+            let first = self.first.as_ptr().add(start.min(self.first_len) * q);
+            let second = self
+                .second
+                .as_ptr()
+                .add(start.saturating_sub(self.first_len) * q);
             [
-                (self.first.as_ptr().add(start.min(self.first_len)), head),
-                (
-                    self.second
-                        .as_ptr()
-                        .add(start.saturating_sub(self.first_len)),
-                    n - head,
-                ),
+                Run::new(NonNull::new_unchecked(first), head * q),
+                Run::new(NonNull::new_unchecked(second), (n - head) * q),
             ]
         }
     }
@@ -595,12 +640,10 @@ impl<T: Element> Regions<'_, T> {
         {
             return Err(Error::BadValue("write past the reserved elements"));
         }
-        let [(head, head_len), (tail, tail_len)] = self.runs(start, src.len());
-        // SAFETY: in the ring (checked above), aligned, unaliased; see "Soundness" on `Regions`.
-        unsafe {
-            std::ptr::copy_nonoverlapping(src.as_ptr(), head, head_len);
-            std::ptr::copy_nonoverlapping(src.as_ptr().add(head_len), tail, tail_len);
-        }
+        let [head, tail] = self.runs(start, src.len());
+        let (to_head, to_tail) = ring::bytes_of(src).split_at(head.len());
+        head.store(to_head);
+        tail.store(to_tail);
         Ok(())
     }
 
@@ -613,12 +656,10 @@ impl<T: Element> Regions<'_, T> {
         {
             return Err(Error::BadValue("read past the available elements"));
         }
-        let [(head, head_len), (tail, tail_len)] = self.runs(start, dst.len());
-        // SAFETY: as in `write_at`; a racing peer leaves a wrong `T`, never an invalid one.
-        unsafe {
-            std::ptr::copy_nonoverlapping(head, dst.as_mut_ptr(), head_len);
-            std::ptr::copy_nonoverlapping(tail, dst.as_mut_ptr().add(head_len), tail_len);
-        }
+        let [head, tail] = self.runs(start, dst.len());
+        let (to_head, to_tail) = ring::bytes_of_mut(dst).split_at_mut(head.len());
+        head.load(to_head);
+        tail.load(to_tail);
         Ok(())
     }
 }

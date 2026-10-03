@@ -583,7 +583,9 @@ Two header-only C11 files do that part instead:
 `rsbinder-fmq/c/rsbinder_fmq.h` is the ring (attach with the same checks
 rsbinder makes, create a sealed memfd, the counters, the EventFlag futex), and
 `contrib/ndk/rsbinder_stream.h` is the record layer on it (`rsbs_send`,
-`rsbs_end`, `rsbs_recv`, `rsbs_cancel`). For death, create the
+`rsbs_end`, `rsbs_recv`, `rsbs_cancel`). The NDK compiles them with no extra
+flag; on a 32-bit glibc host they need `-D_FILE_OFFSET_BITS=64`, without which
+the queue header stops with `#error`. For death, create the
 `AIBinder_DeathRecipient` with `rsbs_on_binder_died`, set
 `rsbs_on_unlinked` as its `onUnlinked` (API 33), and link with the stream's
 `rsbs_*_death_cookie`: libbinder can still be running the death callback after

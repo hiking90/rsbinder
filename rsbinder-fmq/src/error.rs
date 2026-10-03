@@ -60,6 +60,13 @@ impl From<rustix::io::Errno> for Error {
     }
 }
 
+/// `e`'s errno when it is in 1..4096 (rustix linux_raw panics outside it), else `EIO`.
+pub(crate) fn errno_of(e: &std::io::Error) -> rustix::io::Errno {
+    e.raw_os_error()
+        .filter(|code| (1..4096).contains(code))
+        .map_or(rustix::io::Errno::IO, rustix::io::Errno::from_raw_os_error)
+}
+
 impl From<Error> for std::io::Error {
     fn from(e: Error) -> Self {
         use std::io::ErrorKind;

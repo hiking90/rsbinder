@@ -21,9 +21,16 @@
  * the end convert to and from the NDK backend's generated type.
  *
  * Build: C11 or C++11 and later, GCC or Clang (the `__atomic` builtins),
- * Linux or Android. On glibc define _GNU_SOURCE before the first system
- * header (or compile with -std=gnu11): fallocate and the seal constants are
- * GNU extensions there. Every function returns 0 or a negative errno:
+ * Linux or Android. On glibc and musl define _GNU_SOURCE before the first
+ * system header (or compile with -std=gnu11): fallocate and the seal
+ * constants are GNU extensions there. off_t must be 64 bits: 64-bit glibc,
+ * x32, musl and bionic's 64-bit ABIs always have it; 32-bit glibc needs
+ * -D_FILE_OFFSET_BITS=64, or the header stops with #error (a 32-bit off_t
+ * cannot size the largest queues, and its fstat fails with EOVERFLOW on a
+ * region past 2 GiB). 32-bit bionic builds without the flag too: its
+ * struct stat has a 64-bit st_size, and rsbfmq_create refuses (-EINVAL) a
+ * queue whose memfd would round up to 2 GiB. Every function returns 0 or a
+ * negative errno:
  *
  *   -EINVAL    a descriptor or argument that breaks a rule below
  *   -EBADMSG   counters the peer moved out of their invariant
@@ -47,6 +54,14 @@
 
 #if defined(__GLIBC__) && !defined(__USE_GNU)
 #error "rsbinder_fmq.h: define _GNU_SOURCE before including any system header"
+#endif
+
+/* For glibc's bits/typesizes.h: __OFF_T_MATCHES_OFF64_T marks an ABI whose off_t is 64 bits. */
+#include <sys/types.h>
+
+#if defined(__GLIBC__) && !defined(__LP64__) && !defined(__USE_FILE_OFFSET64) && \
+    !defined(__OFF_T_MATCHES_OFF64_T)
+#error "rsbinder_fmq.h: on 32-bit glibc compile with -D_FILE_OFFSET_BITS=64 (64-bit off_t)"
 #endif
 
 #include <fcntl.h>
@@ -273,6 +288,37 @@ static inline int rsbfmq_region_size(int fd, uint64_t *size) {
     return 0;
 }
 
+/*
+ * The object a grantor's bytes live in, for the overlap check: every dup of
+ * a file shares (st_dev, st_ino), while every ashmem fd has the device
+ * node's inode, so ashmem goes by fd index (as in rsbinder-fmq).
+ */
+typedef struct rsbfmq__object {
+    int ashmem;
+    uint64_t dev;
+    uint64_t ino; /* the fd index for ashmem */
+} rsbfmq__object;
+
+static inline int rsbfmq__object_of(int fd, uint32_t index, rsbfmq__object *o) {
+    struct stat st;
+    memset(o, 0, sizeof *o);
+    if (rsbfmq_is_ashmem(fd)) {
+        o->ashmem = 1;
+        o->ino = index;
+        return 0;
+    }
+    if (fstat(fd, &st) != 0) {
+        return -errno;
+    }
+    o->dev = (uint64_t)st.st_dev;
+    o->ino = (uint64_t)st.st_ino;
+    return 0;
+}
+
+static inline int rsbfmq__same_object(const rsbfmq__object *a, const rsbfmq__object *b) {
+    return a->ashmem == b->ashmem && a->dev == b->dev && a->ino == b->ino;
+}
+
 /* ------------------------------------------------------------------ */
 /* Attach and create                                                   */
 /* ------------------------------------------------------------------ */
@@ -326,6 +372,7 @@ static inline int rsbfmq__validate(const rsbfmq_desc *d, size_t quantum,
                                    const rsbfmq_policy *p, size_t *capacity) {
     static const uint64_t min_extent[4] = {8, 8, 1, 4};
     uint64_t sizes[4] = {0, 0, 0, 0};
+    rsbfmq__object objects[4];
     size_t n, used, i, j;
     if (d->flags != RSBFMQ_SYNCHRONIZED_READ_WRITE) {
         return -EINVAL;
@@ -361,6 +408,7 @@ static inline int rsbfmq__validate(const rsbfmq_desc *d, size_t quantum,
         }
         if (j < i) {
             size = sizes[j];
+            objects[i] = objects[j];
         } else {
             int fd = d->fds[g->fd_index];
             int r;
@@ -369,6 +417,10 @@ static inline int rsbfmq__validate(const rsbfmq_desc *d, size_t quantum,
                 return -EINVAL;
             }
             r = rsbfmq_region_size(fd, &size);
+            if (r != 0) {
+                return r;
+            }
+            r = rsbfmq__object_of(fd, g->fd_index, &objects[i]);
             if (r != 0) {
                 return r;
             }
@@ -389,8 +441,8 @@ static inline int rsbfmq__validate(const rsbfmq_desc *d, size_t quantum,
         for (j = i + 1; j < used; j++) {
             const rsbfmq_grantor *a = &d->grantors[i];
             const rsbfmq_grantor *b = &d->grantors[j];
-            if (a->fd_index == b->fd_index && a->offset < b->offset + b->extent &&
-                b->offset < a->offset + a->extent) {
+            if (rsbfmq__same_object(&objects[i], &objects[j]) &&
+                a->offset < b->offset + b->extent && b->offset < a->offset + a->extent) {
                 return -EINVAL;
             }
         }
@@ -509,13 +561,16 @@ static inline int rsbfmq_create(rsbfmq_queue *q, size_t capacity, size_t quantum
     q->nlayout = count;
     page = (uint64_t)sysconf(_SC_PAGESIZE);
     total = (end + page - 1) & ~(page - 1);
+    /* `total` may reach 2^31; only 32-bit bionic built without _FILE_OFFSET_BITS=64 gets here. */
+    if (sizeof(off_t) < 8 && total > (uint64_t)INT32_MAX) {
+        return -EINVAL;
+    }
 
     fd = (int)syscall(__NR_memfd_create, "rsbinder-fmq", MFD_CLOEXEC | MFD_ALLOW_SEALING);
     if (fd < 0) {
         return -errno;
     }
-    /* The 64-bit variants: `total` may reach 2^31, past a 32-bit off_t. */
-    if (ftruncate64(fd, (off64_t)total) != 0 || fallocate64(fd, 0, 0, (off64_t)total) != 0 ||
+    if (ftruncate(fd, (off_t)total) != 0 || fallocate(fd, 0, 0, (off_t)total) != 0 ||
         fcntl(fd, F_ADD_SEALS, F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL) != 0) {
         r = -errno;
         close(fd);

@@ -73,10 +73,7 @@ pub fn ashmem_size(fd: BorrowedFd<'_>) -> Result<u64> {
     // SAFETY: `fd` is a verified ashmem fd; the request takes no pointer (`0` fills the vararg).
     let r = unsafe { libc::ioctl(fd.as_raw_fd(), ASHMEM_GET_SIZE as _, 0) };
     if r < 0 {
-        return Err(rustix::io::Errno::from_raw_os_error(
-            std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-        )
-        .into());
+        return Err(crate::error::errno_of(&std::io::Error::last_os_error()).into());
     }
     Ok(r as u64)
 }

@@ -126,10 +126,7 @@ impl Descriptor {
 }
 
 fn io_to_errno(e: std::io::Error) -> Error {
-    match e.raw_os_error() {
-        Some(code) => Error::Os(rustix::io::Errno::from_raw_os_error(code)),
-        None => Error::Os(rustix::io::Errno::IO),
-    }
+    Error::Os(crate::error::errno_of(&e))
 }
 
 /// What a receiver demands of a descriptor before mapping it. libfmq's own
@@ -190,6 +187,29 @@ pub(crate) struct Geometry {
     pub capacity: usize,
 }
 
+/// What the grantor overlap check compares; a consistency check, not a safety boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Object {
+    /// A non-ashmem fd's file: every `dup` of one fd shares `st_dev` and `st_ino`.
+    File { dev: u64, ino: u64 },
+    /// An ashmem fd, by index: every ashmem fd has the device node's inode.
+    Ashmem(usize),
+}
+
+impl Object {
+    #[allow(clippy::unnecessary_cast)] // `st_dev`/`st_ino` widths differ by target
+    fn of(fd: std::os::fd::BorrowedFd<'_>, index: usize) -> Result<Self> {
+        if shm::is_ashmem_fd(fd) {
+            return Ok(Object::Ashmem(index));
+        }
+        let st = rustix::fs::fstat(fd)?;
+        Ok(Object::File {
+            dev: st.st_dev as u64,
+            ino: st.st_ino as u64,
+        })
+    }
+}
+
 /// libfmq's `initMemory`/`mapGrantorDescr` checks, the policy's, and `i32::MAX` offsets/extents.
 pub(crate) fn validate(
     desc: &Descriptor,
@@ -212,7 +232,7 @@ pub(crate) fn validate(
     let used = &desc.grantors[..n.min(Descriptor::EVENT_FLAG_WORD + 1)];
 
     const MIN_EXTENT: [u64; 4] = [8, 8, 1, 4];
-    let mut sizes: Vec<Option<u64>> = vec![None; desc.fds.len()];
+    let mut sizes: Vec<Option<(u64, Object)>> = vec![None; desc.fds.len()];
     for (i, g) in used.iter().enumerate() {
         let fd_index = g.fd_index as usize;
         if fd_index >= desc.fds.len() {
@@ -230,7 +250,7 @@ pub(crate) fn validate(
             ));
         }
         let size = match sizes[fd_index] {
-            Some(s) => s,
+            Some((s, _)) => s,
             None => {
                 // Seal first: a memfd seal is permanent; ashmem's size is re-checked once mapped.
                 let fd = desc.fds[fd_index].as_fd();
@@ -238,7 +258,7 @@ pub(crate) fn validate(
                     return Err(Error::BadValue("fd is neither shrink-sealed nor ashmem"));
                 }
                 let s = shm::region_size(fd)?;
-                sizes[fd_index] = Some(s);
+                sizes[fd_index] = Some((s, Object::of(fd, fd_index)?));
                 s
             }
         };
@@ -259,9 +279,11 @@ pub(crate) fn validate(
         ));
     }
 
+    // Every used grantor's fd was visited above, so its object is known.
+    let object = |g: &Grantor| sizes[g.fd_index as usize].map(|(_, o)| o);
     for (a, ga) in used.iter().enumerate() {
         for gb in &used[a + 1..] {
-            if ga.fd_index != gb.fd_index {
+            if object(ga) != object(gb) {
                 continue;
             }
             let (a0, a1) = (u64::from(ga.offset), u64::from(ga.offset) + ga.extent);
@@ -340,6 +362,27 @@ mod tests {
         let (g, total) = default_layout(64, false);
         assert_eq!(g.len(), 3);
         assert_eq!(total, 80);
+    }
+
+    #[test]
+    fn an_io_error_without_a_valid_errno_maps_to_eio() {
+        // linux_raw panics on these and libc keeps them; both backends must give `EIO`.
+        for code in [0, -1, 4096, i32::MAX] {
+            assert_eq!(
+                io_to_errno(std::io::Error::from_raw_os_error(code)),
+                Error::Os(rustix::io::Errno::IO),
+                "{code}"
+            );
+        }
+        assert_eq!(
+            io_to_errno(std::io::Error::other("no code")),
+            Error::Os(rustix::io::Errno::IO)
+        );
+        let emfile = rustix::io::Errno::MFILE.raw_os_error();
+        assert_eq!(
+            io_to_errno(std::io::Error::from_raw_os_error(emfile)),
+            Error::Os(rustix::io::Errno::MFILE)
+        );
     }
 
     #[test]
