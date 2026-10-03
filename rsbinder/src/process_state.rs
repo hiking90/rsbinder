@@ -277,6 +277,7 @@
 //!   keeps the cache `Weak` upgradeable, so P1 would return at case (c)
 //!   without firing the hook (a vacuous pass).
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fs::File;
 use std::os::raw::c_void;
@@ -1146,14 +1147,14 @@ impl ProcessState {
                 .published_natives
                 .write()
                 .expect("Published natives lock poisoned");
-            let needs_remove = map
-                .get(&id)
-                .map(|e| e.publish_count == 0 && e.kernel_refs == 0 && e.pending_reservations == 0)
-                .unwrap_or(false);
-            if !needs_remove {
+            let Entry::Occupied(slot) = map.entry(id) else {
+                return;
+            };
+            let e = slot.get();
+            if e.publish_count != 0 || e.kernel_refs != 0 || e.pending_reservations != 0 {
                 return;
             }
-            map.remove(&id).expect("just observed Some")
+            slot.remove()
         };
         // dec_weak (no side effect) before the drop that may run `Inner<T>::drop`; no BR_* left.
         let arc_for_weak = Arc::clone(entry.binder_pin.as_arc());

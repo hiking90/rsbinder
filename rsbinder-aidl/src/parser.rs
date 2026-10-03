@@ -441,9 +441,10 @@ pub fn lookup_decl_from_name(name: &str, style: &str) -> Option<LookupDecl> {
 
     // A union `Tag` sits in `mod <Union>`: use the union's ns (`<Union>::Tag`, not `Tag::Tag`).
     let effective_ns = match &decl {
-        Declaration::Enum(e) if e.tag_of_union.is_some() => {
-            e.tag_of_union.clone().expect("checked Some above")
-        }
+        Declaration::Enum(EnumDecl {
+            tag_of_union: Some(tag),
+            ..
+        }) => tag.clone(),
         _ => ns,
     };
 
