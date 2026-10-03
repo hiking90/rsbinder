@@ -64,9 +64,9 @@ pub type TransactionCode = u32;
 pub type TransactionFlags = u32;
 
 /// Corresponds to TF_ONE_WAY -- an asynchronous call.
-pub const FLAG_ONEWAY: TransactionFlags = sys::transaction_flags_TF_ONE_WAY;
+pub const FLAG_ONEWAY: TransactionFlags = sys::TF_ONE_WAY;
 /// Corresponds to TF_CLEAR_BUF -- clear transaction buffers after call is made.
-pub const FLAG_CLEAR_BUF: TransactionFlags = sys::transaction_flags_TF_CLEAR_BUF;
+pub const FLAG_CLEAR_BUF: TransactionFlags = sys::TF_CLEAR_BUF;
 /// `FLAG_PRIVATE_LOCAL` — the vendor flag on a VNDK build, `0` otherwise
 /// (AOSP `IBinder.h`). rsbinder targets the system side, so it is `0`; this is
 /// the flag the AIDL codegen emits on outgoing transactions.
@@ -82,7 +82,7 @@ pub const FLAG_PRIVATE_VENDOR: TransactionFlags = 0x10000000;
 /// frozen receives every transaction. Use for idempotent updates where
 /// only the freshest value matters. Without [`FLAG_ONEWAY`] the driver
 /// ignores the flag and returns no error.
-pub const FLAG_UPDATE_TXN: TransactionFlags = sys::transaction_flags_TF_UPDATE_TXN;
+pub const FLAG_UPDATE_TXN: TransactionFlags = sys::TF_UPDATE_TXN;
 /// `FLAG_COLLECT_NOTED_APP_OPS` (`0x2`, AOSP `IBinder.java`). A userspace
 /// flag: the driver passes `flags` through, and Java
 /// `Binder.execTransactInternal` collects noted app-ops only when this bit

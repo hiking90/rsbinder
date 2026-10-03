@@ -816,7 +816,7 @@ impl ThreadState {
             tr.buffer = data.as_ptr() as _;
             tr.offsets = data.objects.as_ptr() as _;
         } else {
-            flags |= binder::transaction_flags_TF_STATUS_CODE;
+            flags |= binder::TF_STATUS_CODE;
             tr.data_size = std::mem::size_of::<i32>() as _;
             tr.buffer = status as *const i32 as _;
         }
@@ -1131,7 +1131,7 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
                     let tr = thread_state.borrow_mut().in_parcel.read_transaction()?;
                     let (buffer, offsets) = (tr.buffer, tr.offsets);
                     if let UntilResponse::Reply = until {
-                        if (tr.flags & transaction_flags_TF_STATUS_CODE) == 0 {
+                        if (tr.flags & TF_STATUS_CODE) == 0 {
                             // SAFETY: the driver's BR_REPLY buffer, unshared until `free_buffer`.
                             let reply = unsafe {
                                 Parcel::from_driver_buffer(
@@ -1274,7 +1274,7 @@ fn dispatch_kernel_observed(
             descriptor: binder.descriptor(),
             code,
             method: transactable.transaction_name(code),
-            is_oneway: tr.flags & transaction_flags_TF_ONE_WAY != 0,
+            is_oneway: tr.flags & TF_ONE_WAY != 0,
             calling_uid: tr.sender_euid,
             calling_pid: tr.sender_pid,
             transport: crate::TransportCaps::KERNEL,
@@ -1347,12 +1347,11 @@ fn execute_command(cmd: i32) -> Result<()> {
                 let _rpc_suspended = RpcCallingGuard::suspend();
 
                 // A oneway reply is never sent: no buffer unless the handler writes into it.
-                let mut reply =
-                    if tr_secctx.transaction_data.flags & transaction_flags_TF_ONE_WAY != 0 {
-                        Parcel::with_capacity(0)
-                    } else {
-                        Parcel::new()
-                    };
+                let mut reply = if tr_secctx.transaction_data.flags & TF_ONE_WAY != 0 {
+                    Parcel::with_capacity(0)
+                } else {
+                    Parcel::new()
+                };
 
                 let result = {
                     let target_ptr = tr.target_ptr();
@@ -1423,8 +1422,8 @@ fn execute_command(cmd: i32) -> Result<()> {
                 let queued_at = thread_state.borrow().unflushed_mark();
                 let reply_result =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
-                        if (flags & transaction_flags_TF_ONE_WAY) == 0 {
-                            let flags = flags & transaction_flags_TF_CLEAR_BUF;
+                        if (flags & TF_ONE_WAY) == 0 {
+                            let flags = flags & TF_CLEAR_BUF;
                             let status: i32 = match result {
                                 Ok(_) => StatusCode::Ok.into(),
                                 Err(err) => err.into(),
@@ -1961,10 +1960,10 @@ pub(crate) fn transact(
     data: &Parcel,
     mut flags: u32,
 ) -> Result<Option<Parcel>> {
-    flags |= transaction_flags_TF_ACCEPT_FDS;
+    flags |= TF_ACCEPT_FDS;
 
     // Checked before queuing, unlike AOSP: see module doc "Dispatch notes".
-    if (flags & transaction_flags_TF_ONE_WAY) == 0 {
+    if (flags & TF_ONE_WAY) == 0 {
         match call_restriction() {
             CallRestriction::ErrorIfNotOneway => {
                 error!("Process making non-oneway call (code: {code}) but is restricted.")
@@ -1991,7 +1990,7 @@ pub(crate) fn transact(
         Ok(queued_at)
     })?;
 
-    let waited = if (flags & transaction_flags_TF_ONE_WAY) == 0 {
+    let waited = if (flags & TF_ONE_WAY) == 0 {
         wait_for_response(UntilResponse::Reply)
     } else {
         wait_for_response(UntilResponse::TransactionComplete)
@@ -2624,7 +2623,11 @@ pub fn get_extended_error() -> Result<ExtendedError> {
     if !ProcessState::is_initialized() {
         return Err(StatusCode::InvalidOperation);
     }
-    let mut ee = binder::binder_extended_error::default();
+    let mut ee = binder::binder_extended_error {
+        id: 0,
+        command: 0,
+        param: 0,
+    };
     let driver = ProcessState::as_self().driver();
     crate::sys::binder::get_extended_error(driver.as_ref(), &mut ee).map_err(|errno| {
         if errno == rustix::io::Errno::INVAL || errno == rustix::io::Errno::NOTTY {
@@ -3517,7 +3520,7 @@ mod tests {
         let mut tr = TransactionData::default();
         tr.set_target_ptr(id);
         tr.code = 1;
-        tr.flags = binder::transaction_flags_TF_ONE_WAY;
+        tr.flags = binder::TF_ONE_WAY;
         tr.sender_pid = 9999;
         tr.sender_euid = 1000;
         tr.buffer = buffer.as_mut_ptr() as _;

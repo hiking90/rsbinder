@@ -3,6 +3,9 @@
 
 //! Binder kernel UAPI: bindgen output plus typed ioctl wrappers.
 //!
+//! `sys.rs` is unmodified bindgen output; `generate.sh` regenerates it from
+//! the verbatim kernel headers under `include/` and states the options.
+//!
 //! # ioctl safety
 //!
 //! Shared SAFETY rationale for every `ioctl::ioctl(fd, ctl)` in `binder`:
@@ -42,15 +45,7 @@
 //! status reply no parcel ever wrapped.
 
 // Allowances scoped to the bindgen output: `dead_code` still flags unused wrappers below.
-#[allow(
-    non_camel_case_types,
-    non_upper_case_globals,
-    dead_code,
-    non_snake_case,
-    unused_qualifications,
-    clippy::unreadable_literal,
-    clippy::missing_safety_doc
-)]
+#[allow(non_camel_case_types, non_upper_case_globals, dead_code)]
 mod raw {
     include!("sys.rs");
 }
@@ -59,103 +54,12 @@ pub use raw::*;
 pub mod binder {
     pub use crate::sys::*;
 
-    pub const BR_ERROR: binder_driver_return_protocol = binder_driver_return_protocol_BR_ERROR;
-    pub const BR_OK: binder_driver_return_protocol = binder_driver_return_protocol_BR_OK;
-    pub const BR_TRANSACTION_SEC_CTX: binder_driver_return_protocol =
-        binder_driver_return_protocol_BR_TRANSACTION_SEC_CTX;
-    pub const BR_TRANSACTION: binder_driver_return_protocol =
-        binder_driver_return_protocol_BR_TRANSACTION;
-    pub const BR_REPLY: binder_driver_return_protocol = binder_driver_return_protocol_BR_REPLY;
-    pub const BR_ACQUIRE_RESULT: binder_driver_return_protocol =
-        binder_driver_return_protocol_BR_ACQUIRE_RESULT;
-    pub const BR_DEAD_REPLY: binder_driver_return_protocol =
-        binder_driver_return_protocol_BR_DEAD_REPLY;
-    pub const BR_TRANSACTION_COMPLETE: binder_driver_return_protocol =
-        binder_driver_return_protocol_BR_TRANSACTION_COMPLETE;
-    pub const BR_INCREFS: binder_driver_return_protocol = binder_driver_return_protocol_BR_INCREFS;
-    pub const BR_ACQUIRE: binder_driver_return_protocol = binder_driver_return_protocol_BR_ACQUIRE;
-    pub const BR_RELEASE: binder_driver_return_protocol = binder_driver_return_protocol_BR_RELEASE;
-    pub const BR_DECREFS: binder_driver_return_protocol = binder_driver_return_protocol_BR_DECREFS;
-    pub const BR_ATTEMPT_ACQUIRE: binder_driver_return_protocol =
-        binder_driver_return_protocol_BR_ATTEMPT_ACQUIRE;
-    pub const BR_NOOP: binder_driver_return_protocol = binder_driver_return_protocol_BR_NOOP;
-    pub const BR_SPAWN_LOOPER: binder_driver_return_protocol =
-        binder_driver_return_protocol_BR_SPAWN_LOOPER;
-    pub const BR_FINISHED: binder_driver_return_protocol =
-        binder_driver_return_protocol_BR_FINISHED;
-    pub const BR_DEAD_BINDER: binder_driver_return_protocol =
-        binder_driver_return_protocol_BR_DEAD_BINDER;
-    pub const BR_CLEAR_DEATH_NOTIFICATION_DONE: binder_driver_return_protocol =
-        binder_driver_return_protocol_BR_CLEAR_DEATH_NOTIFICATION_DONE;
-    pub const BR_FAILED_REPLY: binder_driver_return_protocol =
-        binder_driver_return_protocol_BR_FAILED_REPLY;
-    pub const BR_FROZEN_REPLY: binder_driver_return_protocol =
-        binder_driver_return_protocol_BR_FROZEN_REPLY;
-    pub const BR_ONEWAY_SPAM_SUSPECT: binder_driver_return_protocol =
-        binder_driver_return_protocol_BR_ONEWAY_SPAM_SUSPECT;
-
-    // Freeze BRs (6.5+): `wait_for_response` handles PENDING_FROZEN; the rest log BAD COMMAND.
-    pub const BR_TRANSACTION_PENDING_FROZEN: binder_driver_return_protocol =
-        binder_driver_return_protocol_BR_TRANSACTION_PENDING_FROZEN;
-    #[allow(dead_code)] // freeze dispatch not wired yet (see above)
-    pub const BR_FROZEN_BINDER: binder_driver_return_protocol =
-        binder_driver_return_protocol_BR_FROZEN_BINDER;
-    #[allow(dead_code)] // freeze dispatch not wired yet (see above)
-    pub const BR_CLEAR_FREEZE_NOTIFICATION_DONE: binder_driver_return_protocol =
-        binder_driver_return_protocol_BR_CLEAR_FREEZE_NOTIFICATION_DONE;
-
-    pub const BC_TRANSACTION: binder_driver_command_protocol =
-        binder_driver_command_protocol_BC_TRANSACTION;
-    pub const BC_REPLY: binder_driver_command_protocol = binder_driver_command_protocol_BC_REPLY;
-    pub const BC_ACQUIRE_RESULT: binder_driver_command_protocol =
-        binder_driver_command_protocol_BC_ACQUIRE_RESULT;
-    pub const BC_FREE_BUFFER: binder_driver_command_protocol =
-        binder_driver_command_protocol_BC_FREE_BUFFER;
-    pub const BC_INCREFS: binder_driver_command_protocol =
-        binder_driver_command_protocol_BC_INCREFS;
-    pub const BC_ACQUIRE: binder_driver_command_protocol =
-        binder_driver_command_protocol_BC_ACQUIRE;
-    pub const BC_RELEASE: binder_driver_command_protocol =
-        binder_driver_command_protocol_BC_RELEASE;
-    pub const BC_DECREFS: binder_driver_command_protocol =
-        binder_driver_command_protocol_BC_DECREFS;
-    pub const BC_INCREFS_DONE: binder_driver_command_protocol =
-        binder_driver_command_protocol_BC_INCREFS_DONE;
-    pub const BC_ACQUIRE_DONE: binder_driver_command_protocol =
-        binder_driver_command_protocol_BC_ACQUIRE_DONE;
-    // Defined by the driver, never sent by AOSP libbinder or rsbinder; kept to match the UAPI.
-    #[allow(dead_code)]
-    pub const BC_ATTEMPT_ACQUIRE: binder_driver_command_protocol =
-        binder_driver_command_protocol_BC_ATTEMPT_ACQUIRE;
-    pub const BC_REGISTER_LOOPER: binder_driver_command_protocol =
-        binder_driver_command_protocol_BC_REGISTER_LOOPER;
-    pub const BC_ENTER_LOOPER: binder_driver_command_protocol =
-        binder_driver_command_protocol_BC_ENTER_LOOPER;
-    pub const BC_EXIT_LOOPER: binder_driver_command_protocol =
-        binder_driver_command_protocol_BC_EXIT_LOOPER;
-    pub const BC_REQUEST_DEATH_NOTIFICATION: binder_driver_command_protocol =
-        binder_driver_command_protocol_BC_REQUEST_DEATH_NOTIFICATION;
-    pub const BC_CLEAR_DEATH_NOTIFICATION: binder_driver_command_protocol =
-        binder_driver_command_protocol_BC_CLEAR_DEATH_NOTIFICATION;
-    pub const BC_DEAD_BINDER_DONE: binder_driver_command_protocol =
-        binder_driver_command_protocol_BC_DEAD_BINDER_DONE;
-    #[allow(dead_code)] // never sent, see BC_ATTEMPT_ACQUIRE
-    pub const BC_TRANSACTION_SG: binder_driver_command_protocol =
-        binder_driver_command_protocol_BC_TRANSACTION_SG;
-    #[allow(dead_code)] // never sent, see BC_ATTEMPT_ACQUIRE
-    pub const BC_REPLY_SG: binder_driver_command_protocol =
-        binder_driver_command_protocol_BC_REPLY_SG;
-
-    // Freeze BCs and their payload structs, exposed ahead of the unwired send path.
-    #[allow(dead_code)] // freeze dispatch not wired yet (see above)
-    pub const BC_REQUEST_FREEZE_NOTIFICATION: binder_driver_command_protocol =
-        binder_driver_command_protocol_BC_REQUEST_FREEZE_NOTIFICATION;
-    #[allow(dead_code)] // freeze dispatch not wired yet (see above)
-    pub const BC_CLEAR_FREEZE_NOTIFICATION: binder_driver_command_protocol =
-        binder_driver_command_protocol_BC_CLEAR_FREEZE_NOTIFICATION;
-    #[allow(dead_code)] // freeze dispatch not wired yet (see above)
-    pub const BC_FREEZE_NOTIFICATION_DONE: binder_driver_command_protocol =
-        binder_driver_command_protocol_BC_FREEZE_NOTIFICATION_DONE;
+    /// `binder_transaction_data.sender_pid`'s type, under its libc name.
+    #[allow(non_camel_case_types)]
+    pub type pid_t = __kernel_pid_t;
+    /// `binder_transaction_data.sender_euid`'s type, under its libc name.
+    #[allow(non_camel_case_types)]
+    pub type uid_t = __kernel_uid32_t;
 
     use rustix::{io, ioctl};
     use std::os::fd::AsFd;
@@ -277,7 +181,7 @@ pub mod binder {
     ) -> std::result::Result<(), io::Errno> {
         unsafe {
             // SAFETY: see shared rationale above. Request: BINDER_SET_IDLE_TIMEOUT.
-            let ctl = ioctl::Setter::<{ ioctl::opcode::write::<__s64>(b'b', 3) }, _>::new(timeout);
+            let ctl = ioctl::Setter::<{ ioctl::opcode::write::<i64>(b'b', 3) }, _>::new(timeout);
             ioctl::ioctl(fd, ctl)
         }
     }
