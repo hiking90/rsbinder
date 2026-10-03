@@ -777,10 +777,9 @@ impl Builder {
             if is_builtin_aidl_type(import) {
                 continue;
             }
-            let mut candidates = import_candidates(includes, import);
-            match candidates.len() {
-                1 => sources.push(candidates.pop().expect("len checked")),
-                0 => {
+            match <[PathBuf; 1]>::try_from(import_candidates(includes, import)) {
+                Ok([only]) => sources.push(only),
+                Err(none) if none.is_empty() => {
                     let dependency = builtin_decl(import).ok_or_else(|| AidlError::Config {
                         message: format!(
                             "builtin '{}' imports '{import}', which is not a builtin",
@@ -789,7 +788,7 @@ impl Builder {
                     })?;
                     pending.push(dependency);
                 }
-                _ => return Err(ambiguous_builtin_copy(import, &candidates)),
+                Err(candidates) => return Err(ambiguous_builtin_copy(import, &candidates)),
             }
         }
         self.builtin_documents.push(doc);
@@ -922,18 +921,16 @@ impl Builder {
             }
             // Resolve once the queued sources are parsed: AOSP's exact-file rank ignores order.
             unresolved.retain(|(path, import)| {
-                let mut candidates = resolve_import(&includes, import);
-                match candidates.len() {
-                    0 => match builtin_decl(import) {
-                        Some(builtin) => pending_builtins.push(builtin),
-                        None => return true,
-                    },
-                    1 => {
-                        let chosen = candidates.pop().expect("len checked");
+                match <[PathBuf; 1]>::try_from(resolve_import(&includes, import)) {
+                    Ok([chosen]) => {
                         sources.push(chosen.clone());
                         resolved.push((path.clone(), import.clone(), chosen));
                     }
-                    _ => errors.push(ambiguous_import(path, import, &candidates)),
+                    Err(none) if none.is_empty() => match builtin_decl(import) {
+                        Some(builtin) => pending_builtins.push(builtin),
+                        None => return true,
+                    },
+                    Err(candidates) => errors.push(ambiguous_import(path, import, &candidates)),
                 }
                 false
             });
@@ -942,14 +939,13 @@ impl Builder {
             }
             if let Some(builtin) = pending_builtins.pop() {
                 // Look again: every source since this import was met added its package dir.
-                let mut candidates = import_candidates(&includes, builtin.fqcn);
-                match candidates.len() {
-                    0 => {}
-                    1 => {
-                        sources.push(candidates.pop().expect("len checked"));
+                match <[PathBuf; 1]>::try_from(import_candidates(&includes, builtin.fqcn)) {
+                    Ok([only]) => {
+                        sources.push(only);
                         continue;
                     }
-                    _ => {
+                    Err(none) if none.is_empty() => {}
+                    Err(candidates) => {
                         errors.push(ambiguous_builtin_copy(builtin.fqcn, &candidates));
                         continue;
                     }

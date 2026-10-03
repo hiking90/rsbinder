@@ -307,14 +307,10 @@ fn nullable_element(shape: &Shape, user_is_enum: bool, elem: &str) -> String {
 
 /// `[[E; 3]; 2]` from sizes `[2, 3]`, as `make_fixed_array` folds them.
 fn nest(value: &str, sizes: &[String]) -> String {
-    let last = sizes.last().expect("a fixed array has at least one size");
     sizes
         .iter()
         .rev()
-        .skip(1)
-        .fold(format!("[{value}; {last}]"), |acc, size| {
-            format!("[{acc}; {size}]")
-        })
+        .fold(value.to_string(), |acc, size| format!("[{acc}; {size}]"))
 }
 
 /// The element slot of a fixed-size array (`make_fixed_array`'s `value_str`).

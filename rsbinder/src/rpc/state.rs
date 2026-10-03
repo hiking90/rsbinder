@@ -104,6 +104,7 @@
 //! `asyncTodo` already processed.
 
 use std::cmp::Reverse;
+use std::collections::binary_heap::PeekMut;
 use std::collections::{BinaryHeap, HashMap};
 use std::os::fd::OwnedFd;
 use std::sync::{self, Arc};
@@ -655,9 +656,9 @@ impl RpcState {
             node.async_todo.pop();
             out.purged = out.purged.saturating_add(1);
         }
-        if let Some(Reverse(top)) = node.async_todo.peek() {
-            if top.async_number == node.next_async_number {
-                let Reverse(todo) = node.async_todo.pop().expect("peek-pop");
+        if let Some(top) = node.async_todo.peek_mut() {
+            if top.0.async_number == node.next_async_number {
+                let Reverse(todo) = PeekMut::pop(top);
                 out.next = Some((todo.transaction, todo.in_fds));
             }
         }
