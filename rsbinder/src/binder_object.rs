@@ -161,12 +161,11 @@ impl FlatBinderObject {
 
     /// The object in 24 host-native bytes; any bytes are a value.
     pub(crate) fn from_bytes(bytes: &[u8; Self::SIZE]) -> Self {
-        // Fixed ranges of a 24-byte array, so every `try_into` succeeds.
         FlatBinderObject {
-            type_: u32::from_ne_bytes(bytes[0..4].try_into().unwrap()),
-            flags: u32::from_ne_bytes(bytes[4..8].try_into().unwrap()),
-            object: bytes[8..16].try_into().unwrap(),
-            cookie: binder_uintptr_t::from_ne_bytes(bytes[16..24].try_into().unwrap()),
+            type_: u32::from_ne_bytes(bytes_at(bytes, 0)),
+            flags: u32::from_ne_bytes(bytes_at(bytes, 4)),
+            object: bytes_at(bytes, 8),
+            cookie: binder_uintptr_t::from_ne_bytes(bytes_at(bytes, 16)),
         }
     }
 
@@ -312,9 +311,17 @@ impl From<&SIBinder> for FlatBinderObject {
 /// Copy a flat_binder_object out of `data` at `offset`, which needs no alignment.
 pub(crate) fn read_flat_binder(data: &[u8], offset: usize) -> Result<FlatBinderObject> {
     let bytes = data
-        .get(offset..offset + FlatBinderObject::SIZE)
+        .get(offset..)
+        .and_then(<[u8]>::first_chunk::<{ FlatBinderObject::SIZE }>)
         .ok_or(StatusCode::NotEnoughData)?;
-    Ok(FlatBinderObject::from_bytes(bytes.try_into().unwrap()))
+    Ok(FlatBinderObject::from_bytes(bytes))
+}
+
+/// The `N` bytes at `at`, for a codec reading fixed offsets of a fixed-size array.
+pub(crate) fn bytes_at<const N: usize>(bytes: &[u8], at: usize) -> [u8; N] {
+    let mut field = [0; N];
+    field.copy_from_slice(&bytes[at..at + N]);
+    field
 }
 
 /// Writes a flat_binder_object into `data` at `offset`, which needs no alignment.

@@ -20,6 +20,7 @@
 //! bytes; the driver reads and writes only that arm (the 8-byte `buf` arm is
 //! unused by AOSP and by the driver).
 
+use crate::binder_object::bytes_at;
 use crate::sys::binder::{
     binder_size_t, binder_transaction_data, binder_transaction_data_secctx, binder_uintptr_t,
     pid_t, uid_t,
@@ -96,11 +97,10 @@ impl TransactionData {
 
     /// The transaction in 64 host-native bytes; any bytes are a value.
     pub(crate) fn from_bytes(bytes: &[u8; Self::SIZE]) -> Self {
-        // Fixed ranges of a 64-byte array, so every `try_into` succeeds.
-        let u32_at = |at: usize| u32::from_ne_bytes(bytes[at..at + 4].try_into().unwrap());
-        let u64_at = |at: usize| u64::from_ne_bytes(bytes[at..at + 8].try_into().unwrap());
+        let u32_at = |at: usize| u32::from_ne_bytes(bytes_at(bytes, at));
+        let u64_at = |at: usize| u64::from_ne_bytes(bytes_at(bytes, at));
         TransactionData {
-            target: bytes[0..8].try_into().unwrap(),
+            target: bytes_at(bytes, 0),
             cookie: u64_at(8),
             code: u32_at(16),
             flags: u32_at(20),
@@ -128,10 +128,9 @@ impl TransactionDataSecctx {
 
     /// The transaction and context address in 72 host-native bytes.
     pub(crate) fn from_bytes(bytes: &[u8; Self::SIZE]) -> Self {
-        let (tr, secctx) = bytes.split_at(TransactionData::SIZE);
         TransactionDataSecctx {
-            transaction_data: TransactionData::from_bytes(tr.try_into().unwrap()),
-            secctx: binder_uintptr_t::from_ne_bytes(secctx.try_into().unwrap()),
+            transaction_data: TransactionData::from_bytes(&bytes_at(bytes, 0)),
+            secctx: binder_uintptr_t::from_ne_bytes(bytes_at(bytes, TransactionData::SIZE)),
         }
     }
 }

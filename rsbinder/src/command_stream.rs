@@ -5,6 +5,7 @@
 //! the private field makes the L1 wire codec unreachable from here.
 
 use crate::{
+    binder_object::bytes_at,
     error::Result,
     parcel::{NativeScalar, Parcel},
     transaction_data::{TransactionData, TransactionDataSecctx},
@@ -35,13 +36,13 @@ impl CommandStream {
     /// L3 UAPI struct, as laid out by the driver.
     pub(crate) fn read_transaction(&mut self) -> Result<TransactionData> {
         let bytes = self.0.read_aligned_data(TransactionData::SIZE)?;
-        Ok(TransactionData::from_bytes(bytes.try_into().unwrap()))
+        Ok(TransactionData::from_bytes(&bytes_at(bytes, 0)))
     }
 
     /// L3 UAPI struct, as laid out by the driver.
     pub(crate) fn read_transaction_secctx(&mut self) -> Result<TransactionDataSecctx> {
         let bytes = self.0.read_aligned_data(TransactionDataSecctx::SIZE)?;
-        Ok(TransactionDataSecctx::from_bytes(bytes.try_into().unwrap()))
+        Ok(TransactionDataSecctx::from_bytes(&bytes_at(bytes, 0)))
     }
 
     pub(crate) fn data_size(&self) -> usize {
