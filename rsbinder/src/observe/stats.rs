@@ -167,10 +167,18 @@ impl TransactionObserver for StatsObserver {
         elapsed: Duration,
     ) {
         // Saturates on an unpaired reply (public trait); `try_update` is newer than the MSRV.
-        #[allow(deprecated)]
-        let _ = self
-            .in_flight
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+        let mut n = self.in_flight.load(Ordering::Relaxed);
+        while let Some(next) = n.checked_sub(1) {
+            match self.in_flight.compare_exchange_weak(
+                n,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(current) => n = current,
+            }
+        }
 
         let mut methods = self.methods.lock().unwrap_or_else(PoisonError::into_inner);
         let codes = match methods.get_mut(ctx.descriptor) {

@@ -742,8 +742,7 @@ impl Stability {
 const BINDER_WIRE_FORMAT_VERSION: i32 = 1;
 
 /// android-12 `Category::repr()` for a raw `Level`; see `Stability` doc "Wire encoding".
-// Only reachable in the `target_os = "android"` encode branch (and unit tests).
-#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+#[cfg(any(target_os = "android", test))]
 const fn android12_category_repr(level: i32) -> i32 {
     (level << 24) | BINDER_WIRE_FORMAT_VERSION
 }

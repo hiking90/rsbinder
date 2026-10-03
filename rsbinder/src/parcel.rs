@@ -2581,10 +2581,13 @@ impl Parcel {
                 log::error!("Parcel::sub_parcel: {offset} + {size} exceeds the parcel");
                 StatusCode::BadValue
             })?;
-        #[cfg_attr(not(feature = "rpc"), allow(unused_mut))]
-        let mut sub = Parcel::data_only_from_vec(self.data.as_slice()[offset..end].to_vec());
+        let sub = Parcel::data_only_from_vec(self.data.as_slice()[offset..end].to_vec());
         #[cfg(feature = "rpc")]
-        self.carry_rpc_objects(&mut sub, offset, end);
+        let sub = {
+            let mut sub = sub;
+            self.carry_rpc_objects(&mut sub, offset, end);
+            sub
+        };
         Ok(sub)
     }
 

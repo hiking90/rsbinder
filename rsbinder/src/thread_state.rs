@@ -1054,9 +1054,6 @@ pub(crate) fn _setup_polling() -> Result<()> {
 enum UntilResponse {
     Reply,
     TransactionComplete,
-    /// Unreachable (no `BC_ATTEMPT_ACQUIRE` under the cache pin); keeps the match exhaustive.
-    #[allow(dead_code)]
-    AcquireResult,
 }
 
 fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
@@ -1115,15 +1112,9 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
                     return Err(StatusCode::FailedTransaction);
                 }
                 binder::BR_ACQUIRE_RESULT => {
-                    let result = thread_state.borrow_mut().in_parcel.read_cmd::<i32>()?;
-                    if let UntilResponse::AcquireResult = until {
-                        let res = if result != 0 {
-                            Ok(None)
-                        } else {
-                            Err(StatusCode::InvalidOperation)
-                        };
-                        return res;
-                    } else if cfg!(debug_assertions) {
+                    // Answers `BC_ATTEMPT_ACQUIRE`, which this crate never sends.
+                    thread_state.borrow_mut().in_parcel.read_cmd::<i32>()?;
+                    if cfg!(debug_assertions) {
                         panic!("Unexpected BR_ACQUIRE_RESULT");
                     }
                 }

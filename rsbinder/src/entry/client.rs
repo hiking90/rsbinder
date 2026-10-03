@@ -214,7 +214,7 @@ pub(super) fn new_client(uri: Uri, o: ClientOptions) -> Result<Client> {
 pub(crate) enum OpenStage {
     Setup,
     // Opening the kernel endpoint does no transport I/O; only RPC connects.
-    #[cfg_attr(not(feature = "rpc"), allow(dead_code))]
+    #[cfg(feature = "rpc")]
     Connect,
 }
 
