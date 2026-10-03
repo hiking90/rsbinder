@@ -161,6 +161,7 @@ pub trait WireCodec: Send + Sync {
         self.encode_transact_ref(txn.into())
     }
     /// [`WireCodec::encode_reply_ref`] of an owned reply.
+    #[cfg(test)]
     fn encode_reply(&self, reply: &WireReply) -> RpcResult<Vec<u8>> {
         self.encode_reply_ref(reply.into())
     }
@@ -175,6 +176,7 @@ pub trait WireCodec: Send + Sync {
     /// Encode the bare `int32` session-id preamble (no header).
     fn encode_session_preamble(&self, session_id: i32) -> Vec<u8>;
     /// Decode the bare `int32` session-id preamble.
+    #[cfg(any(test, feature = "fuzzing"))]
     fn decode_session_preamble(&self, buf: &[u8]) -> RpcResult<i32>;
 }
 
@@ -353,6 +355,7 @@ impl WireCodec for R34Codec {
         session_id.to_le_bytes().to_vec()
     }
 
+    #[cfg(any(test, feature = "fuzzing"))]
     fn decode_session_preamble(&self, buf: &[u8]) -> RpcResult<i32> {
         // Exactly a bare `int32`: any other length is malformed and would desync the next recv.
         let arr: [u8; 4] = buf
