@@ -28,7 +28,6 @@
 //! ```
 
 #![cfg(all(feature = "rpc", any(target_os = "linux", target_os = "android")))]
-#![allow(non_snake_case)]
 
 use rsbinder::{Interface, Strong};
 

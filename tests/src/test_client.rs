@@ -1,4 +1,4 @@
-#![allow(non_snake_case, dead_code, unused_imports, unused_macros, deprecated)]
+#![allow(dead_code, unused_imports, unused_macros)]
 
 use env_logger::Env;
 
@@ -898,7 +898,6 @@ fn test_utf8_string() {
 }
 
 #[allow(clippy::approx_constant)]
-#[allow(clippy::float_cmp)]
 #[test]
 #[cfg_attr(
     not(any(target_os = "linux", target_os = "android")),

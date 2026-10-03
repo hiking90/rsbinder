@@ -11,7 +11,6 @@
 //! `.aidl`-generated types and back.
 
 #![cfg(all(feature = "rpc", feature = "macros"))]
-#![allow(non_snake_case)]
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

@@ -8,7 +8,6 @@
 //! Separate test binary, `#![cfg(feature = "rpc")]`.
 
 #![cfg(feature = "rpc")]
-#![allow(non_snake_case)]
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};

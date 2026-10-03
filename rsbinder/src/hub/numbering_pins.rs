@@ -9,11 +9,9 @@
 //! plus a feature no automated build turns on.
 
 mod sm_14 {
-    #![allow(dead_code)]
     include!(concat!(env!("OUT_DIR"), "/service_manager_14.rs"));
 }
 mod sm_15 {
-    #![allow(dead_code)]
     include!(concat!(env!("OUT_DIR"), "/service_manager_15.rs"));
 }
 

@@ -5406,7 +5406,6 @@ impl RpcSession {
         since = "0.12.0",
         note = "a non-empty id is refused with BadValue: use `setup_client_android13plus_with_config(RpcClientConfig::unix(path, v))` for a new session, then `add_outgoing_connection_with_config(RpcClientConfig::unix(path, v).session_id(id))` on that session to add a connection"
     )]
-    #[allow(deprecated)]
     pub fn setup_unix_client_android13plus_with_id(
         path: impl AsRef<std::path::Path>,
         max_version: u32,

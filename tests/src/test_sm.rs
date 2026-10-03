@@ -1,4 +1,4 @@
-#![allow(non_snake_case, dead_code, unused_imports, unused_macros, deprecated)]
+#![allow(dead_code, unused_imports)]
 
 use env_logger::Env;
 
