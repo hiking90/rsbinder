@@ -182,6 +182,10 @@
 
 // Generated; `type_matrix::the_reference_table_matches_the_rules` fails when it falls behind.
 #![doc = include_str!("../TYPES.md")]
+// Library code returns errors; tests may unwrap (plan 13).
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+// Every allow outside tests says why (plan 13-1).
+#![cfg_attr(not(test), deny(clippy::allow_attributes_without_reason))]
 
 use proc_macro::TokenStream;
 use quote::quote;

@@ -95,6 +95,11 @@
 //! Compatibility notes, supported AIDL constructs, and diagnostics examples
 //! live in the repository README and <https://hiking90.github.io/rsbinder/>.
 
+// Library code returns errors; tests may unwrap (plan 13).
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+// Every allow outside tests says why (plan 13-1).
+#![cfg_attr(not(test), deny(clippy::allow_attributes_without_reason))]
+
 use miette::{NamedSource, SourceSpan};
 use std::collections::{HashMap, HashSet};
 use std::fs;
