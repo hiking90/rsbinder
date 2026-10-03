@@ -34,7 +34,7 @@ the device's SDK level, so an Android 16 emulator runs the most of them;
 Android cross-compile via [`cargo-ndk`](https://github.com/bbqsrc/cargo-ndk):
 
 ```
-cargo ndk -t aarch64-linux-android test --no-run -p rsbinder --features rpc,android_16
+cargo ndk -t aarch64-linux-android -p 29 test --no-run -p rsbinder --features rpc,android_16
 adb push target/aarch64-linux-android/debug/deps/<binary> /data/local/tmp/
 adb shell 'chmod 755 /data/local/tmp/<binary> && cd /data/local/tmp && TMPDIR=/data/local/tmp ./<binary>'
 ```

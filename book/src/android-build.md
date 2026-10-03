@@ -98,14 +98,18 @@ $ rustup target add i686-linux-android
 
 ```bash
 # Build for ARM64 (most common for modern Android devices)
-$ cargo ndk -t aarch64-linux-android build --release
+$ cargo ndk -t aarch64-linux-android -p 29 build --release
 
 # Build for x86_64 (emulator)
-$ cargo ndk -t x86_64-linux-android build --release
+$ cargo ndk -t x86_64-linux-android -p 29 build --release
 
 # Build all targets
-$ cargo ndk -t aarch64-linux-android -t x86_64-linux-android build --release
+$ cargo ndk -t aarch64-linux-android -t x86_64-linux-android -p 29 build --release
 ```
+
+rsbinder supports API 29 (Android 10) and newer, so link with `-p 29` or higher (up to
+your app's `minSdkVersion`). Without `-p` cargo-ndk links for API 21, whose libc lacks
+functions rsbinder calls (`process_vm_readv`), and the link fails with an undefined symbol.
 
 ### Using envsetup.sh Helper Scripts
 
@@ -198,7 +202,7 @@ $ avdmanager create avd -n test_device -k "system-images;android-34;google_apis;
 $ emulator -avd test_device
 
 # Build for emulator target
-$ cargo ndk -t x86_64-linux-android build --release
+$ cargo ndk -t x86_64-linux-android -p 29 build --release
 ```
 
 ## Troubleshooting

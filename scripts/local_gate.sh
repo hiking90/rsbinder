@@ -234,8 +234,8 @@ tier_hermetic() {
     if have cargo-ndk && [ -n "${ANDROID_NDK_HOME:-}" ]; then
         local t
         for t in x86_64-linux-android aarch64-linux-android; do
-            run "android build $t" cargo ndk -t "$t" build --release
-            run "android test build $t" cargo ndk -t "$t" test --no-run
+            run "android build $t" cargo ndk -t "$t" -p 29 build --release
+            run "android test build $t" cargo ndk -t "$t" -p 29 test --no-run
         done
     else
         skip "android builds" "needs cargo-ndk and ANDROID_NDK_HOME"
@@ -514,7 +514,7 @@ tier_stage3() {
     done
 
     if grep -qx lazy_service_stage3 <<<"$(printf '%s\n' "${queue[@]}")"; then
-        run "cargo ndk build example-hello ($triple)" cargo ndk -t "$triple" build -p example-hello --bins
+        run "cargo ndk build example-hello ($triple)" cargo ndk -t "$triple" -p 29 build -p example-hello --bins
     fi
     if grep -qx stream_ac <<<"$(printf '%s\n' "${queue[@]}")"; then
         run "cargo ndk build stream_probe ($triple)" cargo ndk -t "$triple" -p "$((sdk < 35 ? sdk : 35))" \

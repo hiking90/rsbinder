@@ -110,9 +110,9 @@ echo "==> [2/9] compiling imemory_interop.cpp against AOSP headers + device libb
 
 echo "==> [3/9] cross-compiling rsbinder test_service + shm_probe + tests binary"
 ( cd "$REPO_ROOT" && ANDROID_NDK_HOME="$NDK" \
-    cargo ndk -t "$TRIPLE" build -p tests --bin test_service --bin shm_probe >/dev/null 2>&1 )
+    cargo ndk -t "$TRIPLE" -p "$API" build -p tests --bin test_service --bin shm_probe >/dev/null 2>&1 )
 TESTBIN=$( cd "$REPO_ROOT" && ANDROID_NDK_HOME="$NDK" \
-    cargo ndk -t "$TRIPLE" test --no-run -p tests 2>&1 \
+    cargo ndk -t "$TRIPLE" -p "$API" test --no-run -p tests 2>&1 \
     | grep -E "Executable unittests src/lib.rs" | sed -E 's/.*\((.*)\)/\1/' )
 
 echo "==> [4/9] pushing"
