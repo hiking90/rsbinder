@@ -352,23 +352,17 @@ fn has_object_table(version: u32) -> bool {
 // --- bounds-checked LE readers (local, so wire.rs keeps the AOSP r34 layout) -
 
 fn rd_u32(buf: &[u8], off: usize) -> RpcResult<u32> {
-    let end = off
-        .checked_add(4)
-        .ok_or(RpcError::Protocol("offset overflow"))?;
-    let s = buf
-        .get(off..end)
-        .ok_or(RpcError::Protocol("truncated u32"))?;
-    Ok(u32::from_le_bytes(s.try_into().unwrap()))
+    buf.get(off..)
+        .and_then(<[u8]>::first_chunk)
+        .map(|b| u32::from_le_bytes(*b))
+        .ok_or(RpcError::Protocol("truncated u32"))
 }
 
 fn rd_u64(buf: &[u8], off: usize) -> RpcResult<u64> {
-    let end = off
-        .checked_add(8)
-        .ok_or(RpcError::Protocol("offset overflow"))?;
-    let s = buf
-        .get(off..end)
-        .ok_or(RpcError::Protocol("truncated u64"))?;
-    Ok(u64::from_le_bytes(s.try_into().unwrap()))
+    buf.get(off..)
+        .and_then(<[u8]>::first_chunk)
+        .map(|b| u64::from_le_bytes(*b))
+        .ok_or(RpcError::Protocol("truncated u64"))
 }
 
 /// The android-13+ versioned RPC wire codec (additive).

@@ -230,13 +230,10 @@ pub(crate) fn split_frame(frame: &[u8]) -> RpcResult<(u32, &[u8])> {
 
 /// Read a little-endian `u32` at `off`, bounds-checked.
 fn rd_u32(buf: &[u8], off: usize) -> RpcResult<u32> {
-    let end = off
-        .checked_add(4)
-        .ok_or(RpcError::Protocol("offset overflow"))?;
-    let slice = buf
-        .get(off..end)
-        .ok_or(RpcError::Protocol("truncated u32"))?;
-    Ok(u32::from_le_bytes(slice.try_into().unwrap()))
+    buf.get(off..)
+        .and_then(<[u8]>::first_chunk)
+        .map(|b| u32::from_le_bytes(*b))
+        .ok_or(RpcError::Protocol("truncated u32"))
 }
 
 fn rd_i32(buf: &[u8], off: usize) -> RpcResult<i32> {
@@ -244,25 +241,17 @@ fn rd_i32(buf: &[u8], off: usize) -> RpcResult<i32> {
 }
 
 fn rd_u64(buf: &[u8], off: usize) -> RpcResult<u64> {
-    let end = off
-        .checked_add(8)
-        .ok_or(RpcError::Protocol("offset overflow"))?;
-    let slice = buf
-        .get(off..end)
-        .ok_or(RpcError::Protocol("truncated u64"))?;
-    Ok(u64::from_le_bytes(slice.try_into().unwrap()))
+    buf.get(off..)
+        .and_then(<[u8]>::first_chunk)
+        .map(|b| u64::from_le_bytes(*b))
+        .ok_or(RpcError::Protocol("truncated u64"))
 }
 
 fn rd_addr(buf: &[u8], off: usize) -> RpcResult<RpcAddress> {
-    let end = off
-        .checked_add(RPC_ADDR_LEN)
-        .ok_or(RpcError::Protocol("offset overflow"))?;
-    let slice = buf
-        .get(off..end)
-        .ok_or(RpcError::Protocol("truncated address"))?;
-    let mut bytes = [0u8; RPC_ADDR_LEN];
-    bytes.copy_from_slice(slice);
-    Ok(RpcAddress::from_wire_bytes(bytes))
+    buf.get(off..)
+        .and_then(<[u8]>::first_chunk::<RPC_ADDR_LEN>)
+        .map(|b| RpcAddress::from_wire_bytes(*b))
+        .ok_or(RpcError::Protocol("truncated address"))
 }
 
 impl WireCodec for R34Codec {
