@@ -142,6 +142,7 @@ big_endian() {
         "${s390[@]}" --no-default-features --lib parcel --no-run &&
         file target/s390x-unknown-linux-gnu/debug/deps/rsbinder-* | grep 'MSB.*IBM S/390' &&
         tpass "${s390[@]}" --no-default-features --lib parcel -- --skip shared_memory --skip fmq:: &&
+        tpass "${s390[@]}" --no-default-features --lib binder_object:: &&
         tpass "${s390[@]}" --features rpc,rpc-tcp-debug --lib file_descriptor:: &&
         tpass "${s390[@]}" --features rpc,rpc-tcp-debug --lib parcel:: -- --skip shared_memory &&
         tpass "${s390[@]}" --features rpc,rpc-tcp-debug --lib rpc::

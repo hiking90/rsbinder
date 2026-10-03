@@ -741,6 +741,13 @@ after 0.12.0. The single-connection one-liners
   Over kernel binder, `on_dump` writes to a duplicate of the received fd,
   closed when `on_dump` returns. A parcel built by the public
   `from_ipc_parts` closes none of the fds it names, as in 0.11.0.
+- **Kernel binder on a big-endian host: a written fd or handle object names
+  it.** The object stored the value through the union's 8-byte `binder`
+  member, which puts it where the 4-byte `handle` lies only on a
+  little-endian host; on a big-endian one the driver read handle or fd `0`.
+  The union is now zeroed and the value written to `handle`, as AOSP
+  `obj.binder = 0; obj.handle = ...;` does. Little-endian bytes are
+  unchanged.
   `append_from` reads each object it copies from the source, not from the
   copy: with a `from_ipc_parts` source whose objects overlap, 0.11.0 dup'd
   the fd number its own rewrite of the previous object had left in the copy.

@@ -3830,9 +3830,10 @@ mod tests {
         for second in [12usize, 16] {
             let mut data = fd_object_buffer(a.as_raw_fd());
             data.resize(40, 0);
-            data[second..second + 4].copy_from_slice(&super::BINDER_TYPE_FD.to_le_bytes());
+            // A kernel object is in host byte order, unlike parcel data.
+            data[second..second + 4].copy_from_slice(&super::BINDER_TYPE_FD.to_ne_bytes());
             data[second + 4..second + 8].fill(0);
-            data[second + 8..second + 12].copy_from_slice(&b.as_raw_fd().to_le_bytes());
+            data[second + 8..second + 12].copy_from_slice(&b.as_raw_fd().to_ne_bytes());
             let mut objects: Vec<binder_size_t> = vec![0, second as binder_size_t];
             // SAFETY: buffers outlive `src`, untouched otherwise; its fds `a`, `b` outlive it too.
             let mut src = unsafe {

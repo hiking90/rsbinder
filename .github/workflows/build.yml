@@ -444,6 +444,10 @@ jobs:
           cross test -p rsbinder --target s390x-unknown-linux-gnu \
             --no-default-features --lib parcel -- --skip shared_memory --skip fmq:: 2>&1 | tee /tmp/be_parcel.out
           grep -qE 'test result: ok\. [1-9][0-9]* passed' /tmp/be_parcel.out
+          # Kernel objects are in host byte order: `handle` must land in the union's first bytes.
+          cross test -p rsbinder --target s390x-unknown-linux-gnu \
+            --no-default-features --lib binder_object:: 2>&1 | tee /tmp/be_object.out
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' /tmp/be_object.out
           cross test -p rsbinder --target s390x-unknown-linux-gnu \
             --features rpc,rpc-tcp-debug --lib file_descriptor:: 2>&1 | tee /tmp/be_fd.out
           grep -qE 'test result: ok\. [1-9][0-9]* passed' /tmp/be_fd.out

@@ -58,10 +58,13 @@
 //!
 //! # Union initialisation
 //!
-//! `new_handle` and `new_with_fd` write the 8-byte `binder` field, not the u32
-//! `handle`, so the upper bytes are zero. This mirrors AOSP
-//! `obj.binder = 0; obj.handle = ...;` and keeps uninitialised stack off the
-//! wire, since `write_object` copies the whole 24-byte struct. `new_with_fd`
+//! `new_handle` and `new_with_fd` zero the 8-byte `binder` field, then write
+//! the u32 `handle` over its first four bytes, as AOSP does
+//! (`obj.binder = 0; obj.handle = ...;`). The zeroing keeps uninitialised stack
+//! off the wire, since `write_object` copies the whole 24-byte struct. Writing
+//! the value through `binder` instead (`binder: handle as u64`) puts it where
+//! `handle` lies only on a little-endian host; on a big-endian one the handle
+//! reads as 0. `new_with_fd`
 //! also writes `flags = 0` as AOSP `Parcel::writeFileDescriptor` (kernel arm)
 //! does; the kernel ignores the field for FD objects (it rewrites the object
 //! on delivery), but the bytes match AOSP exactly.
@@ -97,18 +100,18 @@ impl Default for flat_binder_object {
 
 impl flat_binder_object {
     pub(crate) fn new_with_fd(fd: i32, take_ownership: bool) -> Self {
-        flat_binder_object {
+        let mut obj = flat_binder_object {
             hdr: binder_object_header {
                 type_: BINDER_TYPE_FD,
             },
             // AOSP `writeFileDescriptor` bypasses `flattenBinder`: no schedBits, no ACCEPTS_FDS.
             flags: 0,
-            // Full 8-byte init zeroes the upper half: see module doc "Union initialisation".
-            __bindgen_anon_1: flat_binder_object__bindgen_ty_1 {
-                binder: (fd as u32) as u64,
-            },
+            // Zeroed, then `handle` set: see module doc "Union initialisation".
+            __bindgen_anon_1: flat_binder_object__bindgen_ty_1 { binder: 0 },
             cookie: if take_ownership { 1 } else { 0 },
-        }
+        };
+        obj.set_handle(fd as u32);
+        obj
     }
 
     /// Creates a new flat_binder_object for a binder with the specified flags.
@@ -125,17 +128,17 @@ impl flat_binder_object {
 
     /// Creates a new flat_binder_object for a remote handle (`BINDER_TYPE_HANDLE`).
     pub(crate) fn new_handle(handle: u32, flags: u32) -> Self {
-        flat_binder_object {
+        let mut obj = flat_binder_object {
             hdr: binder_object_header {
                 type_: BINDER_TYPE_HANDLE,
             },
             flags,
-            // Full 8-byte init zeroes the upper half: see module doc "Union initialisation".
-            __bindgen_anon_1: flat_binder_object__bindgen_ty_1 {
-                binder: handle as u64,
-            },
+            // Zeroed, then `handle` set: see module doc "Union initialisation".
+            __bindgen_anon_1: flat_binder_object__bindgen_ty_1 { binder: 0 },
             cookie: 0,
-        }
+        };
+        obj.set_handle(handle);
+        obj
     }
 
     pub(crate) fn header_type(&self) -> u32 {
@@ -293,6 +296,13 @@ pub(crate) fn write_flat_binder(
 mod tests {
     use super::*;
 
+    /// The 8 union bytes AOSP `obj.binder = 0; obj.handle = h;` leaves: `h`, then four zeros.
+    fn handle_bytes(h: u32) -> [u8; 8] {
+        let mut b = [0u8; 8];
+        b[..4].copy_from_slice(&h.to_ne_bytes());
+        b
+    }
+
     /// `new_with_fd` writes AOSP's `flags = 0` and a zeroed union upper half; see module doc.
     #[test]
     fn new_with_fd_flags_zero_and_full_width_init() {
@@ -307,11 +317,11 @@ mod tests {
             "FD object flags must be 0 (AOSP Parcel::writeFileDescriptor)"
         );
 
-        // The full 8-byte union must equal `fd` with a zeroed upper half (no uninit leak).
+        // The fd in `handle`'s bytes and the rest zero (no uninit leak), on either byte order.
         assert_eq!(
-            obj.pointer(),
-            fd as u32 as u64,
-            "upper 32 bits of the union must be zero (uninit-leak UB regression)"
+            obj.pointer().to_ne_bytes(),
+            handle_bytes(fd as u32),
+            "the union must hold the fd as `handle` with zeroed upper bytes"
         );
         assert_eq!(
             obj.handle(),
@@ -332,9 +342,9 @@ mod tests {
             "must be a HANDLE object"
         );
         assert_eq!(
-            obj.pointer(),
-            handle as u64,
-            "upper 32 bits of the union must be zero (uninit-leak UB regression)"
+            obj.pointer().to_ne_bytes(),
+            handle_bytes(handle),
+            "the union must hold `handle` with zeroed upper bytes"
         );
         assert_eq!(
             obj.handle(),

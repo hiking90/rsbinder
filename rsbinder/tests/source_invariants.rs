@@ -343,8 +343,11 @@ fn byte_order_primitives_and_pod_membership_stay_pinned() {
             needle: "_ne_bytes",
             tree_wide: true,
             files: &[
-                // `NativeScalar`'s two methods + three tests asserting what stays native.
-                ("parcel.rs", 5),
+                // `NativeScalar`'s two methods + tests asserting what stays native (3) or
+                // hand-writing an L3 fd object (2).
+                ("parcel.rs", 7),
+                // Tests pinning where the L3 union's `handle` lies on either byte order.
+                ("binder_object.rs", 3),
                 // fd/memfd bookkeeping, never parcel wire.
                 ("shared_memory/mod.rs", 4),
             ],
