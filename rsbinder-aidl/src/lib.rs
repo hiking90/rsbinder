@@ -591,7 +591,7 @@ impl Builder {
                 for r#mod in &mod_list[start..] {
                     // Outer attribute: lints on the package module itself (`module_inception`).
                     if mod_count == 0 {
-                        content += "#[allow(clippy::all)]\n#[allow(unused_imports)]\n";
+                        content += "#[allow(clippy::all, reason = \"rsbinder-aidl generated code\")]\n#[allow(unused_imports, reason = \"rsbinder-aidl generated code\")]\n";
                     }
                     content += &indent_space(mod_count);
                     content += &format!("pub mod {} {{\n", escape_rust_keyword(r#mod));

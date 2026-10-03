@@ -1422,6 +1422,7 @@ fn test_calling_v2_api_triggers_error() {
 // field truncation, unknown enumerator, unknown union field, and unknown
 // transaction across the version boundary. The forward-compat field
 // truncation relies on the per-field `has_more_data()` read guards.
+#[deny(clippy::unwrap_used)] // generated code ships into user lib crates (plans/13-no-unwrap-in-lib.md)
 mod trunk_v2_gen {
     include!(concat!(env!("OUT_DIR"), "/trunk_v2.rs"));
 }

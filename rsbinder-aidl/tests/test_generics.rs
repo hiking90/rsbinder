@@ -59,7 +59,7 @@ fn generic_parcelable_emits_phantom_fields() {
         "#,
         r#"
 pub mod GenericStructuredParcelable {
-    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
+    #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated, reason = "rsbinder-aidl generated code")]
     pub struct GenericStructuredParcelable<T, U, B> {
         pub r#a: i32,
         pub r#b: i32,
