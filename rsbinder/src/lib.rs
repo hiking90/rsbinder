@@ -239,8 +239,13 @@
 //! * [Binder](https://source.android.com/docs/core/architecture/hidl/binder-ipc)
 //!
 
-// android-only clippy false positive on thread_locals that use or cannot use `const { .. }`.
-#![cfg_attr(target_os = "android", allow(clippy::missing_const_for_thread_local))]
+#![cfg_attr(
+    target_os = "android",
+    allow(
+        clippy::missing_const_for_thread_local,
+        reason = "android-only false positive, even on thread_locals already using `const { .. }`"
+    )
+)]
 
 // Core binder functionality
 mod binder;

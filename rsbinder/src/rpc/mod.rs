@@ -127,7 +127,10 @@ pub use end::{EndReason, EndedBy, SessionEnd, StreamState};
 pub use fd_mode::FileDescriptorTransportMode;
 pub use proxy::RpcProxy;
 pub use server::RpcServer;
-#[allow(deprecated)]
+#[expect(
+    deprecated,
+    reason = "re-exports the deprecated config while it is honored"
+)]
 pub use session::RpcUnixClientConfig;
 pub use session::{RpcClientConfig, RpcSession};
 pub use transport::{CertId, PeerIdentity, RpcTransport};
