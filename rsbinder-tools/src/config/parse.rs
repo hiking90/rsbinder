@@ -31,7 +31,8 @@
 //! connection = { ip = "127.0.0.1", port = 8080 }
 //! ```
 //!
-//! A directory is read as every `*.toml` in it, sorted by file name, and
+//! A directory is read as every `*.toml` in it whose name does not start
+//! with `.` (editor lock and backup files), sorted by file name, and
 //! the rules are concatenated in that order — so `10-`/`20-` prefixes
 //! control precedence the way they do in any other `.d` directory.
 //! Because the evaluator stops at the **first** matching rule
@@ -154,6 +155,14 @@ pub enum ConfigError {
         /// The instance whose `exec` is empty.
         name: String,
     },
+    /// A `systemd` activation with no unit to start.
+    #[error("{path}: service {name:?}: `systemd` unit must not be empty")]
+    EmptyUnit {
+        /// The offending file.
+        path: PathBuf,
+        /// The instance whose `systemd` unit is empty.
+        name: String,
+    },
     /// An `exec` whose program is not an absolute path. A relative one would
     /// be resolved through rsb_hub's `PATH` or working directory, and run
     /// with rsb_hub's privileges.
@@ -165,6 +174,51 @@ pub enum ConfigError {
         name: String,
         /// The program as written.
         program: String,
+    },
+    /// An `exec` program that someone other than root or this process can
+    /// replace: the program, a directory on the way to it from `/`, or a
+    /// symlink's directory fails the check [`Untrusted`](Self::Untrusted)
+    /// applies to the configuration. The program runs with rsb_hub's
+    /// privileges, so it is held to the same rule as the file that names it.
+    ///
+    /// Checked when the configuration is loaded, and again by
+    /// [`SystemRunner`](super::SystemRunner) right before each start, which
+    /// refuses a start whose program now fails (a SIGHUP reload that fails
+    /// keeps the previous declarations). On Linux and Android only `x` is
+    /// needed on the program, not `r`; on other OSes, which have no `O_PATH`,
+    /// the check opens the program for reading, so it needs `r` as well. The
+    /// start executes the path after its check, so a
+    /// replacement made between the two is not caught; a path that passed
+    /// can only be replaced by root or by rsb_hub's own uid.
+    #[error(
+        "{path}: service {name:?}: `exec` program {program:?} is not trusted: \
+         {offender} is {problem}"
+    )]
+    UntrustedExec {
+        /// The configuration file naming the program.
+        path: PathBuf,
+        /// The instance whose `exec` is untrusted.
+        name: String,
+        /// The program as written.
+        program: String,
+        /// The path that failed the check: the program or a directory above it.
+        offender: PathBuf,
+        /// What is wrong with it.
+        problem: super::trust::TrustProblem,
+    },
+    /// An `exec` program whose trust could not be checked: it does not
+    /// exist, or a component on the way to it cannot be opened. Refused
+    /// rather than skipped, as an unopenable configuration entry is.
+    #[error("{path}: service {name:?}: cannot check `exec` program {program:?}: {source}")]
+    ExecIo {
+        /// The configuration file naming the program.
+        path: PathBuf,
+        /// The instance whose `exec` could not be checked.
+        name: String,
+        /// The program as written.
+        program: String,
+        /// The underlying I/O error.
+        source: std::io::Error,
     },
     /// A `[[service]]` name that is not `interface/instance` with both halves
     /// non-empty, or that `addService` would refuse (see
@@ -233,7 +287,8 @@ struct RawActivation {
 #[serde(deny_unknown_fields)]
 struct RawConnection {
     ip: String,
-    port: i32,
+    // A port no client could dial (0, negative, above 65535) fails the load, not the dial.
+    port: std::num::NonZeroU16,
 }
 
 impl RawService {
@@ -250,7 +305,15 @@ impl RawService {
             Some(RawActivation {
                 systemd: Some(unit),
                 exec: None,
-            }) => Some(Activation::Systemd(unit)),
+            }) => {
+                if unit.is_empty() {
+                    return Err(ConfigError::EmptyUnit {
+                        path: path.to_owned(),
+                        name: self.name,
+                    });
+                }
+                Some(Activation::Systemd(unit))
+            }
             Some(RawActivation {
                 systemd: None,
                 exec: Some(argv),
@@ -283,7 +346,7 @@ impl RawService {
             activation,
             connection: self.connection.map(|c| ConnectionInfo {
                 ip: c.ip,
-                port: c.port,
+                port: c.port.get().into(),
             }),
         })
     }
@@ -435,9 +498,35 @@ fn check_trusted(
         path: bad.path,
         problem: bad.problem,
     };
-    super::trust::check_from(root, start, rel, our_uid)
+    super::trust::check_from(root, start, rel, our_uid, super::trust::Use::Read)
         .map_err(io)?
         .map_err(untrusted)
+}
+
+/// Walk an `exec` program from `root` as the configuration itself is walked.
+fn check_exec(
+    root: At<'_>,
+    file: &Path,
+    name: &str,
+    program: &str,
+    our_uid: u32,
+) -> Result<(), ConfigError> {
+    match super::trust::check_program(root, Path::new(program), our_uid) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(bad)) => Err(ConfigError::UntrustedExec {
+            path: file.to_owned(),
+            name: name.to_owned(),
+            program: program.to_owned(),
+            offender: bad.path,
+            problem: bad.problem,
+        }),
+        Err(source) => Err(ConfigError::ExecIo {
+            path: file.to_owned(),
+            name: name.to_owned(),
+            program: program.to_owned(),
+            source,
+        }),
+    }
 }
 
 /// Read the checked inode through the descriptor that was checked.
@@ -454,7 +543,7 @@ fn read_trusted(entry: Trusted) -> Result<String, ConfigError> {
     Ok(text)
 }
 
-/// Every regular `*.toml` in the held directory `dir`, sorted by file name.
+/// Every regular, non-hidden `*.toml` in the held directory `dir`, sorted by file name.
 fn policy_files(root: At<'_>, dir: &Trusted, our_uid: u32) -> Result<Vec<Trusted>, ConfigError> {
     use std::os::unix::ffi::OsStringExt;
     let io = |source: rustix::io::Errno| ConfigError::Io {
@@ -464,9 +553,11 @@ fn policy_files(root: At<'_>, dir: &Trusted, our_uid: u32) -> Result<Vec<Trusted
     let mut names = Vec::new();
     for entry in rustix::fs::Dir::read_from(&dir.fd).map_err(io)? {
         let name = std::ffi::OsString::from_vec(entry.map_err(io)?.file_name().to_bytes().to_vec());
-        if Path::new(&name)
-            .extension()
-            .is_some_and(|ext| ext == "toml")
+        // Skip hidden names: emacs leaves a dangling `.#x.toml` symlink while editing.
+        if !name.as_encoded_bytes().starts_with(b".")
+            && Path::new(&name)
+                .extension()
+                .is_some_and(|ext| ext == "toml")
         {
             names.push(name);
         }
@@ -494,8 +585,15 @@ pub struct Config {
 
 /// Load the configuration from a single file or from a directory of `*.toml`.
 ///
+/// In a directory, files whose name starts with `.` are ignored.
+///
+/// An `exec` program is walked from `/` like the configuration and must pass
+/// the same ownership and mode check; see [`ConfigError::UntrustedExec`] for
+/// what that check does not cover.
+///
 /// Fails rather than degrading: an unreadable path, an empty directory, a
-/// malformed file, or an unresolvable user/group all return an error, and
+/// malformed file, an untrusted or missing `exec` program, or an
+/// unresolvable user/group all return an error, and
 /// `rsb_hub` refuses to start on any of them. There is no partial policy —
 /// a policy that silently dropped the rule it could not parse would be a
 /// policy that fails open.
@@ -564,6 +662,9 @@ fn load_at(
         }
         config.policy.rules.extend(contents.rules);
         for (name, declaration) in contents.services {
+            if let Some(Activation::Exec(argv)) = &declaration.activation {
+                check_exec(root, &file, &name, &argv[0], our_uid)?;
+            }
             if let Some(first) = service_origin.get(&name) {
                 return Err(ConfigError::DuplicateService {
                     name,
@@ -886,6 +987,33 @@ mod tests {
         let empty =
             parse_services("[[service]]\nname = \"a/b\"\nstart = { exec = [] }\n").unwrap_err();
         assert!(matches!(empty, ConfigError::EmptyExec { .. }), "{empty:?}");
+
+        let no_unit = parse_services("[[service]]\nname = \"a/b\"\nstart = { systemd = \"\" }\n")
+            .unwrap_err();
+        assert!(
+            matches!(no_unit, ConfigError::EmptyUnit { .. }),
+            "{no_unit:?}"
+        );
+    }
+
+    #[test]
+    fn an_undialable_connection_port_is_rejected() {
+        for port in ["0", "-1", "65536", "70000"] {
+            let text = format!(
+                "[[service]]\nname = \"a/b\"\nconnection = {{ ip = \"127.0.0.1\", port = {port} }}\n"
+            );
+            let err = parse_services(&text).unwrap_err();
+            assert!(matches!(err, ConfigError::Toml { .. }), "{port}: {err:?}");
+        }
+        let top =
+            "[[service]]\nname = \"a/b\"\nconnection = { ip = \"127.0.0.1\", port = 65535 }\n";
+        assert_eq!(
+            parse_services(top)
+                .unwrap()
+                .connection_info("a/b")
+                .map(|c| c.port),
+            Some(65535)
+        );
     }
 
     /// A relative program would be looked up through rsb_hub's `PATH` or cwd, as root.
@@ -899,6 +1027,87 @@ mod tests {
                 "{err:?}"
             );
         }
+    }
+
+    /// The program runs with rsb_hub's privileges, so it gets the configuration's own check.
+    #[test]
+    fn an_exec_program_others_can_replace_is_refused() {
+        let dir = ConfigDir::new(
+            "cfg-exec",
+            &[(
+                "10.toml",
+                "[[service]]\nname = \"a/b\"\nstart = { exec = [\"/bin/svc\", \"-v\"] }\n",
+            )],
+        );
+        let bin = dir.dir("bin");
+        let svc = dir.file("bin/svc", "#!/bin/sh\n");
+        chmod(&svc, 0o755);
+        assert!(dir.load().is_ok());
+
+        chmod(&bin, 0o775);
+        match dir.load().unwrap_err() {
+            ConfigError::UntrustedExec {
+                offender, problem, ..
+            } => {
+                assert_eq!(offender, bin);
+                assert_eq!(problem, crate::config::TrustProblem::GroupWritable);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        chmod(&bin, 0o755);
+        chmod(&svc, 0o777);
+        match dir.load().unwrap_err() {
+            ConfigError::UntrustedExec {
+                offender, problem, ..
+            } => {
+                assert_eq!(offender, svc);
+                assert_eq!(problem, crate::config::TrustProblem::WorldWritable);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Exec needs `x` only, so a mode-0111 program loads; root reads it anyway, so skip as root.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn an_execute_only_exec_program_is_accepted() {
+        if rustix::process::geteuid().is_root() {
+            eprintln!("skipped: root reads a mode-0111 file, so nothing is tested");
+            return;
+        }
+        let dir = ConfigDir::new(
+            "cfg-exec-xonly",
+            &[(
+                "10.toml",
+                "[[service]]\nname = \"a/b\"\nstart = { exec = [\"/bin/svc\"] }\n",
+            )],
+        );
+        dir.dir("bin");
+        let svc = dir.file("bin/svc", "#!/bin/sh\n");
+        chmod(&svc, 0o111);
+        if let Err(err) = dir.load() {
+            panic!("{err:?}");
+        }
+    }
+
+    /// A missing program cannot be checked; its directory may let anyone create it later.
+    #[test]
+    fn a_missing_exec_program_is_refused() {
+        let dir = ConfigDir::new(
+            "cfg-exec-missing",
+            &[(
+                "10.toml",
+                "[[service]]\nname = \"a/b\"\nstart = { exec = [\"/bin/absent\"] }\n",
+            )],
+        );
+        dir.dir("bin");
+        let err = dir.load().unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::ExecIo { source, .. }
+                if source.kind() == std::io::ErrorKind::NotFound),
+            "{err:?}"
+        );
     }
 
     /// No implicit `default` instance: `getDeclaredInstances` and `isDeclared` must agree.
@@ -1104,6 +1313,21 @@ mod tests {
         .unwrap();
 
         let policy = dir.load().expect("the FIFO is skipped").policy;
+        assert_eq!(policy.rules.len(), 1);
+    }
+
+    #[test]
+    fn hidden_toml_names_are_skipped() {
+        let dir = ConfigDir::new(
+            "cfg-hidden",
+            &[
+                ("10-a.toml", "[[rule]]\nname = \"*\"\nfind = \"any\"\n"),
+                (".10-a.toml", "[[rule]]\nname = \"x\"\nfind = \"any\"\n"),
+            ],
+        );
+        std::os::unix::fs::symlink("user@host.1:1", dir.cfg().join(".#10-a.toml")).unwrap();
+
+        let policy = dir.load().expect("hidden names are skipped").policy;
         assert_eq!(policy.rules.len(), 1);
     }
 

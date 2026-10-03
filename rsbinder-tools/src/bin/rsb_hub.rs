@@ -533,7 +533,7 @@ impl ServiceManager {
         self.allows_as(rsbinder::calling_caller().as_ref(), permission, name)
     }
 
-    /// [`Self::allows`] for a caller read once: a per-name filter would otherwise re-read it per name.
+    /// [`Self::allows`] with the caller read once, not re-read per name by a filter.
     fn allows_as(
         &self,
         caller: Option<&rsbinder::Caller>,
@@ -768,13 +768,16 @@ impl Interface for ServiceManager {
             );
             return Err(StatusCode::PermissionDenied);
         }
-        let snapshot = self.dump_snapshot(args.to_vec());
-        render_dump(writer, &snapshot).map_err(|e| {
-            log::error!("dump: writing to the caller's fd failed: {e}");
-            e.raw_os_error()
-                .map_or(StatusCode::Unknown, StatusCode::Errno)
-        })
+        write_dump(writer, &self.dump_snapshot(args.to_vec()))
     }
+}
+
+/// [`render_dump`]; a write failure is only logged: AOSP `BpBinder` reads `DEAD_OBJECT` as death.
+fn write_dump(writer: &mut dyn std::io::Write, snapshot: &DumpSnapshot) -> rsbinder::Result<()> {
+    if let Err(e) = render_dump(writer, snapshot) {
+        log::error!("dump: writing to the caller's fd failed: {e}");
+    }
+    Ok(())
 }
 
 /// A registered service, as `getService2`/`checkService2` need to see it.
@@ -1438,9 +1441,9 @@ fn exit_without_config(path: &Path, err: &config::ConfigError) -> ! {
     eprintln!("    name = \"com.example.IFoo/default\"");
     eprintln!("    start = {{ systemd = \"example-foo.service\" }}");
     eprintln!();
-    eprintln!("Neither it nor any directory above it may be writable by anyone but its owner");
-    eprintln!("(so not under /tmp): a start entry runs with rsb_hub's privileges when a lookup");
-    eprintln!("misses.");
+    eprintln!("It and every directory above it must be owned by root or by rsb_hub's user, and");
+    eprintln!("writable by no one else (so not under /tmp): a start entry runs with rsb_hub's");
+    eprintln!("privileges when a lookup misses.");
     eprintln!();
     eprintln!("Point rsb_hub at a different path with --config <PATH>, or pass");
     eprintln!("--insecure-allow-all to run with no access control (development only).");
@@ -1716,7 +1719,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         eprintln!("    rsb_service --device {device_name} check manager");
         eprintln!();
         eprintln!("To run a second, independent service manager, give it its own device:");
-        eprintln!("    sudo rsb_device other && rsb_hub --device other");
+        eprintln!("    sudo rsb_device other --group binder --mode 0660 && rsb_hub --device other");
         std::process::exit(1);
     }
 
@@ -1937,7 +1940,7 @@ mod tests {
         assert_eq!(FLAG_IS_LAZY_SERVICE & DUMP_FLAG_PRIORITY_ALL, 0);
     }
 
-    /// The self-registration bypass in [`ServiceManager::allows`] rests on this premise.
+    /// Only the pre-`ProcessState::init` branch; AC-6.1.8 (`run_hub_policy_ac.sh`) runs the other.
     #[test]
     fn calling_caller_is_none_outside_a_transaction() {
         assert!(
@@ -2055,6 +2058,25 @@ mod tests {
             declarations: 0,
             filter: Vec::new(),
             hidden: 0,
+        }
+    }
+
+    /// A broken caller fd answers OK: `DEAD_OBJECT` (`-EPIPE`) would mark rsb_hub dead in AOSP.
+    #[test]
+    fn a_dump_to_a_broken_fd_answers_ok() {
+        struct Broken(rustix::io::Errno);
+        impl std::io::Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from_raw_os_error(self.0.raw_os_error()))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        use rustix::io::Errno;
+        for errno in [Errno::PIPE, Errno::IO, Errno::NOSPC, Errno::BADF] {
+            let reply = write_dump(&mut Broken(errno), &empty_snapshot());
+            assert_eq!(reply, Ok(()), "{errno:?}");
         }
     }
 

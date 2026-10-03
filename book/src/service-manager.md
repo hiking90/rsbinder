@@ -116,8 +116,9 @@ Exit status is the answer: `0` yes, `1` no, `2` the question could not be
 answered (no service manager, or its policy denied it), so
 `rsb_service check foo || start-foo` reads the way it looks. `rsb_service` is
 an ordinary binder client, so the HUB's policy applies to it like anything
-else — `list`, `info` and `dump` need `list`, and every name they report is
-filtered by `find`.
+else — `list` and `info` need `list`, and every name they report is
+filtered by `find`; `dump <name>` needs `find` on `<name>`, and for
+`manager` also `list`.
 
 ## Registering a Service
 
@@ -480,8 +481,9 @@ enumerate at all, and each name it would learn about must be one it may
 
 `rsb_hub --config <PATH>` takes a `.toml` file or a directory of them
 (default: `/etc/rsbinder/hub.d`). A directory is read as every `*.toml` in
-it, sorted by file name — so `10-`/`20-` prefixes control precedence the way
-they do in any other `.d` directory.
+it whose name does not start with `.` (editor lock and backup files), sorted
+by file name — so `10-`/`20-` prefixes control precedence the way they do in
+any other `.d` directory.
 
 ```toml
 # /etc/rsbinder/hub.d/10-example.toml
@@ -595,9 +597,14 @@ Linux; see the Android 15 `r6`+ note above).
 The start runs on its own thread and `rsb_hub` does not wait for it — what
 tells the client the service is up is the registration notification it is
 already waiting on, which is why `wait_for_interface` is the natural call
-here. At most one start attempt per name is outstanding at a time, so a
-client polling a service that cannot come up does not spawn a copy per
-attempt. `exec` takes an argv list, never a shell string.
+here. At most one start per name and per activation is outstanding at a
+time — names that share one `exec` argv or one `systemd` unit share it, as
+init runs one service for several interfaces, and a name whose `start` a
+reload changed is not started again while its old start is outstanding — so
+a client polling a service that cannot come up does not spawn a copy per
+attempt. An `exec` start stays
+outstanding for the process's lifetime. `exec` takes an argv list, never a
+shell string.
 
 > **The configuration is a trust boundary.** A `start` entry runs with
 > `rsb_hub`'s privileges, and any client allowed to look the name up can
@@ -611,6 +618,20 @@ attempt. `exec` takes an argv list, never a shell string.
 > even with the sticky bit. Keep it `0644` root-owned in a `0755`
 > root-owned directory; for an unprivileged run, under `$XDG_RUNTIME_DIR`
 > or `$HOME`.
+>
+> Every `exec` program (`argv[0]`) is held to the same rule: the program
+> and every directory on the way to it from `/`. A program that fails the
+> check, or does not exist, fails the load like an untrusted configuration
+> file does. On Linux and Android the program needs execute permission
+> only; `rsb_hub` does not have to be able to read it. Other OSes have no
+> `O_PATH`, so there the check opens the program for reading and the
+> program needs read permission as well. The check runs when the configuration is
+> loaded and again right before each start: a start whose program fails it
+> then is refused and logged, which also covers a program that a failed
+> `SIGHUP` reload judged untrusted while the previous policy stays in
+> force. The start executes the path after that check, so a replacement
+> made between the two is not caught; a path that passed can be replaced
+> only by root or by `rsb_hub`'s own uid.
 
 ## Linux vs. Android Differences
 

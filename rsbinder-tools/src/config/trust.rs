@@ -11,8 +11,13 @@
 //! that group can use to grant themselves registration.
 //!
 //! So the ownership and mode of the configuration are checked before it is
-//! read, and a failure stops the process. This is the same discipline sudo,
-//! ssh and cron apply to their own configuration, for the same reason.
+//! read, and a failure stops the process; a failed SIGHUP reload keeps the
+//! policy already in force. Every `exec` program the configuration names is
+//! checked when it is loaded, with the same outcome, and again right before
+//! each start, where a failure refuses that start: a program the check
+//! passed at load is not run once a later change makes it fail. This is the
+//! same discipline sudo, ssh and cron apply to their own configuration, for
+//! the same reason.
 //!
 //! The attacker is a non-root uid that can write some component on the
 //! lookup path — a directory above the configuration, a symlink on the way,
@@ -127,6 +132,15 @@ const INTERMEDIATE: OFlags = OFlags::PATH;
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 const INTERMEDIATE: OFlags = OFlags::RDONLY;
 
+/// What the fd a walk ends on is for, which decides how its last component is opened.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Use {
+    /// Read or listed: the configuration file or directory.
+    Read,
+    /// Only `fstat`ed, so `O_PATH` where there is one: an `exec` program may lack `r`.
+    Stat,
+}
+
 /// Open the directory a walk starts from.
 pub(crate) fn open_root(path: &Path) -> std::io::Result<OwnedFd> {
     let flags = INTERMEDIATE | OFlags::DIRECTORY | OFlags::CLOEXEC;
@@ -182,6 +196,7 @@ pub(crate) fn check_from(
     start: At<'_>,
     rel: &Path,
     our_uid: u32,
+    last: Use,
 ) -> std::io::Result<Result<Trusted, Untrusted>> {
     let mut walk = Walk {
         root,
@@ -200,8 +215,8 @@ pub(crate) fn check_from(
     push_reversed(&mut walk.todo, rel);
     let mut readable = false;
     while let Some(name) = walk.todo.pop() {
-        // The last component is read or listed through this fd, which an `O_PATH` fd cannot be.
-        let access = if walk.todo.is_empty() {
+        // A last component that is read or listed cannot be an `O_PATH` fd.
+        let access = if walk.todo.is_empty() && last == Use::Read {
             OFlags::RDONLY
         } else {
             INTERMEDIATE
@@ -239,7 +254,7 @@ pub(crate) fn check_from(
         walk.cur = child;
         st = child_st;
     }
-    if !readable {
+    if last == Use::Read && !readable {
         // Ended on the start or a symlink's directory (`/`, `.`): `.` reopens that inode readable.
         let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
         walk.cur = openat(&walk.cur, ".", flags, Mode::empty())?;
@@ -250,6 +265,16 @@ pub(crate) fn check_from(
         kind: FileType::from_raw_mode(st.st_mode),
         shown: walk.shown,
     }))
+}
+
+/// Walk the absolute `exec` program from `root`, the check the configuration itself gets.
+pub(crate) fn check_program(
+    root: At<'_>,
+    program: &Path,
+    our_uid: u32,
+) -> std::io::Result<Result<(), Untrusted>> {
+    let rel = program.strip_prefix("/").unwrap_or(program);
+    Ok(check_from(root, root, rel, our_uid, Use::Stat)?.map(drop))
 }
 
 #[cfg(test)]
@@ -363,7 +388,7 @@ mod tests {
 
         fn check(&self, rel: &str) -> std::io::Result<Result<Trusted, Untrusted>> {
             let us = rustix::process::getuid().as_raw();
-            check_from(self.at(), self.at(), Path::new(rel), us)
+            check_from(self.at(), self.at(), Path::new(rel), us, Use::Read)
         }
 
         fn trusted(&self, rel: &str) -> Trusted {
