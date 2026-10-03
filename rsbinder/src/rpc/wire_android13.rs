@@ -272,6 +272,7 @@ pub const SUPPORTED_MAX_VERSION: u32 = PROTOCOL_V2;
 /// `RPC_WIRE_PROTOCOL_VERSION_NEXT` (android-16.0.0_r4) — the first
 /// version rsbinder cannot speak; `setProtocolVersion` rejects
 /// `>= _NEXT` (unless `_EXPERIMENTAL`).
+#[cfg(test)]
 pub const RPC_WIRE_PROTOCOL_VERSION_NEXT: u32 = 3;
 /// `RPC_WIRE_PROTOCOL_VERSION_EXPERIMENTAL`.
 pub const RPC_WIRE_PROTOCOL_VERSION_EXPERIMENTAL: u32 = 0xF000_0000;
@@ -356,6 +357,7 @@ impl Android13PlusCodec {
     }
 
     /// v1 — android-14 and android-15 (identical wire).
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn android14_15() -> Self {
         Self {
             version: PROTOCOL_V1,
@@ -365,6 +367,7 @@ impl Android13PlusCodec {
     /// v2 — android-16. Framing byte-identical to v1; differs only in
     /// that the Parcel producer also records binder positions in the
     /// object table.
+    #[cfg(test)]
     pub fn android16() -> Self {
         Self {
             version: PROTOCOL_V2,
@@ -483,6 +486,7 @@ impl Android13PlusCodec {
 
     /// Parse an `RpcConnectionHeader`; returns `(version, options,
     /// fd_mode, session_id)`. `fd_mode` is `0` for a v0 header.
+    #[cfg(test)]
     pub fn decode_connection_header(&self, buf: &[u8]) -> RpcResult<(u32, u8, u8, Vec<u8>)> {
         if buf.len() < A13_CONN_HEADER_LEN {
             return Err(RpcError::Protocol("RpcConnectionHeader truncated"));
@@ -756,6 +760,7 @@ impl WireCodec for Android13PlusCodec {
         }
     }
 
+    #[cfg(test)]
     fn encode_session_preamble(&self, session_id: i32) -> Vec<u8> {
         // Always a new session with FD mode NONE; the full handshake uses the inherent methods.
         let _ = session_id;
@@ -763,6 +768,7 @@ impl WireCodec for Android13PlusCodec {
             .expect("preamble passes empty session_id ⇒ u16 bound trivially satisfied")
     }
 
+    #[cfg(any(test, feature = "fuzzing"))]
     fn decode_session_preamble(&self, buf: &[u8]) -> RpcResult<i32> {
         // The trait's i32 slot carries the negotiated version from RpcNewSessionResponse.
         Ok(self.decode_new_session_response(buf)? as i32)
@@ -960,6 +966,7 @@ pub fn read_aosp_message_with_fds(
 ///    AOSP reads this *after* sending `"cci"` (`setupClient` order).
 ///
 /// Returns the [`Android13PlusCodec`] for the **negotiated** version.
+#[cfg(test)]
 pub fn client_connect<S: Read + Write>(
     stream: &mut S,
     max_version: u32,
@@ -970,14 +977,14 @@ pub fn client_connect<S: Read + Write>(
     client_connect_with_id(stream, max_version, incoming, fd_mode, &[])
 }
 
-/// Like [`client_connect`] but echoes a server-minted 32-byte
+/// Like `client_connect` but echoes a server-minted 32-byte
 /// `session_id` in the `RpcConnectionHeader`
 /// (AOSP `RpcSession::setupClient`: the first connection sends an empty
 /// id and reads the server-minted one; the remaining connections echo
 /// it). An **empty** `session_id` is byte-for-byte identical to
-/// [`client_connect`].
+/// `client_connect`.
 ///
-/// **Wire is the mirror of [`server_accept`] across the 4 (new vs.
+/// **Wire is the mirror of `server_accept` across the 4 (new vs.
 /// attach) × (outgoing vs. incoming) cells (AOSP `RpcSession.cpp`
 /// `initAndAddConnection` + `setupClient` + `addOutgoing/Incoming
 /// Connection`):**
@@ -1097,6 +1104,7 @@ pub(crate) fn client_read_connection_init<R: Read>(
 ///
 /// Returns the negotiated [`Android13PlusCodec`] plus the client's
 /// requested FD mode, session-id, and incoming flag.
+#[cfg(test)]
 pub fn server_accept<S: Read + Write>(
     stream: &mut S,
     server_max_version: u32,
@@ -1110,7 +1118,7 @@ pub fn server_accept<S: Read + Write>(
 
 /// The server's `"cci"` for an **incoming** (callback) attach —
 /// `addOutgoingConnection(init=true)` → `sendConnectionInit`. Split out
-/// of [`server_accept`] so the server can admit the connection (its
+/// of `server_accept` so the server can admit the connection (its
 /// callback-slot budget) *before* telling the client the attach is
 /// good: a client whose attach is refused then reads EOF instead of
 /// `"cci"` and gets an error, rather than a connection that is silently
@@ -1122,7 +1130,7 @@ pub fn server_write_connection_init<S: Write>(
     write_all_raw(stream, &codec.encode_connection_init())
 }
 
-/// [`server_accept`] minus the incoming-direction `"cci"` write, which
+/// `server_accept` minus the incoming-direction `"cci"` write, which
 /// the caller owes via [`server_write_connection_init`] once it has
 /// admitted the connection.
 pub fn server_accept_deferred_init<S: Read + Write>(
