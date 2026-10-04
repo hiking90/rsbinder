@@ -599,29 +599,29 @@ impl RpcState {
         let Some(node) = self.local_nodes.get_mut(&addr) else {
             return AsyncDecision::Drop(DropReason::UnknownAddress);
         };
-        if wire_async == node.next_async_number {
-            AsyncDecision::Dispatch(txn, in_fds)
-        } else if wire_async > node.next_async_number {
-            node.async_todo.push(Reverse(AsyncTodo {
-                async_number: wire_async,
-                transaction: txn,
-                in_fds,
-            }));
-            // AOSP RpcState.cpp:1109–1129: bound the out-of-order backlog and the fds it owns.
-            let num_pending = node.async_todo.len();
-            if num_pending >= ASYNC_TODO_TERMINATE_LEVEL {
-                // Free the backlog's memory/fds now, before session end reaches `clear_local`.
-                node.async_todo.clear();
-                return AsyncDecision::Terminate(num_pending);
+        match wire_async.cmp(&node.next_async_number) {
+            std::cmp::Ordering::Equal => AsyncDecision::Dispatch(txn, in_fds),
+            std::cmp::Ordering::Greater => {
+                node.async_todo.push(Reverse(AsyncTodo {
+                    async_number: wire_async,
+                    transaction: txn,
+                    in_fds,
+                }));
+                // AOSP RpcState.cpp:1109–1129: bound the out-of-order backlog and the fds it owns.
+                let num_pending = node.async_todo.len();
+                if num_pending >= ASYNC_TODO_TERMINATE_LEVEL {
+                    // Free the backlog's memory/fds now, before session end reaches `clear_local`.
+                    node.async_todo.clear();
+                    return AsyncDecision::Terminate(num_pending);
+                }
+                if num_pending % ASYNC_TODO_WARN_PER == 0 {
+                    log::warn!(
+                        "RPC: {num_pending} pending out-of-order oneway transactions on {addr:?}"
+                    );
+                }
+                AsyncDecision::Enqueued
             }
-            if num_pending % ASYNC_TODO_WARN_PER == 0 {
-                log::warn!(
-                    "RPC: {num_pending} pending out-of-order oneway transactions on {addr:?}"
-                );
-            }
-            AsyncDecision::Enqueued
-        } else {
-            AsyncDecision::Drop(DropReason::StaleAsyncNumber)
+            std::cmp::Ordering::Less => AsyncDecision::Drop(DropReason::StaleAsyncNumber),
         }
     }
 
