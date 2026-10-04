@@ -404,7 +404,6 @@ pub mod android_15 {
 
 #[cfg(feature = "rpc")]
 pub(crate) mod accessor_16;
-/// Register side of the accessor bridge, companion to [`accessor_16`] (same `rpc` gate).
 #[cfg(feature = "rpc")]
 pub(crate) mod accessor_register;
 mod servicemanager_16;

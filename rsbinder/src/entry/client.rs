@@ -100,7 +100,7 @@ pub struct ClientOptions {
     /// [`timeout`](Self::timeout) for that phase. The r34 wire (no
     /// `?profile=`) has no handshake, so on a plain r34 endpoint other than
     /// `tls://` `open` refuses it with
-    /// [`StatusCode::BadValue`](crate::StatusCode::BadValue), and it
+    /// [`StatusCode::BadValue`], and it
     /// refuses `Some(Duration::ZERO)` the same way.
     #[cfg(feature = "rpc")]
     #[deprecated(
@@ -110,7 +110,7 @@ pub struct ClientOptions {
     pub handshake_timeout: Option<Duration>,
     /// Kernel: `?driver=` equivalent. The device is fixed process-wide by
     /// whoever initializes `ProcessState` first, so a *different* path here
-    /// is [`StatusCode::BadValue`](crate::StatusCode::BadValue) at
+    /// is [`StatusCode::BadValue`] at
     /// [`open`](Client::open) — see
     /// [`ServeOptions::threads`](super::ServeOptions::threads) for the same
     /// rule on the server side.
@@ -123,7 +123,7 @@ pub struct ClientOptions {
     /// this one takes effect — [`open`](Client::open) reads it before it
     /// initializes `ProcessState`. A *different* size than the one
     /// already in force is
-    /// [`StatusCode::BadValue`](crate::StatusCode::BadValue), as with
+    /// [`StatusCode::BadValue`], as with
     /// [`driver`](Self::driver).
     pub mmap_size: Option<usize>,
 }

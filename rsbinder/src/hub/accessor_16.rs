@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The `IAccessor` bridge that turns the
-//! `Service::Accessor` arm of [`hub::android_16::get_service`]
+//! `Service::Accessor` arm of [`hub::android_16::get_service`](crate::hub::android_16::get_service)
 //! /[`check_service`](super::servicemanager_16) into a usable RPC root
 //! binder.
 //!
