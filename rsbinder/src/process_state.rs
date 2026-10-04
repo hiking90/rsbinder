@@ -2003,7 +2003,7 @@ mod tests {
         assert_eq!(process.max_threads, DEFAULT_MAX_BINDER_THREADS);
         assert_eq!(
             process.driver_name,
-            PathBuf::from(crate::DEFAULT_BINDER_PATH)
+            PathBuf::from(ProcessState::default_driver_path())
         );
     }
 

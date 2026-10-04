@@ -1792,7 +1792,7 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
 
         ensure_thread_exit_guard(&thread_state.driver);
 
-        // Zeroed and lent only when empty: unread commands in `in_parcel` stay put otherwise.
+        // Lent only when empty: unread commands in `in_parcel` stay put otherwise.
         let read: &mut [u8] = if receive {
             thread_state.in_parcel.driver_read_buffer()
         } else {
@@ -2199,9 +2199,10 @@ fn free_buffer(
 }
 
 pub(crate) fn query_interface(handle: u32) -> Result<String> {
-    #[cfg(all(target_os = "android", feature = "android_10"))]
+    // Android 10's C service manager answers no INTERFACE_TRANSACTION (AOSP `svcmgr_handler`).
+    #[cfg(target_os = "android")]
     if handle == 0 && !crate::sdk_at_least(30) {
-        return Ok(crate::hub::android_10::SERVICE_MANAGER_DESCRIPTOR.to_owned());
+        return Ok("android.os.IServiceManager".to_owned());
     }
 
     let data = Parcel::new();
@@ -3070,12 +3071,15 @@ mod tests {
         assert_eq!(binder::BC_FREEZE_NOTIFICATION_DONE, 1074291477);
     }
 
-    /// u64 cookie + u32 is_frozen + u32 reserved = 16 bytes, align 8; no arm reads it yet.
+    /// u64 cookie + u32 is_frozen + u32 reserved = 16 bytes, aligned as `u64` (4 on i686, as in C).
     #[test]
     fn binder_frozen_state_info_layout() {
         use crate::sys::binder_frozen_state_info;
         assert_eq!(std::mem::size_of::<binder_frozen_state_info>(), 16);
-        assert_eq!(std::mem::align_of::<binder_frozen_state_info>(), 8);
+        assert_eq!(
+            std::mem::align_of::<binder_frozen_state_info>(),
+            std::mem::align_of::<u64>()
+        );
     }
 
     #[test]

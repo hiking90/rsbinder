@@ -34,6 +34,15 @@ fn service_name(tag: &str) -> String {
     format!("rsb.test.reconnect.{tag}.{}", std::process::id())
 }
 
+/// Android 10's C service manager takes no registrations; a test that watches through one skips.
+fn registrations_supported() -> bool {
+    let supported = rsbinder::sdk_at_least(30);
+    if !supported {
+        println!("skipped: Android 10's service manager has no registerForNotifications");
+    }
+    supported
+}
+
 /// The service binary; `RSB_RECONNECT_SERVICE` overrides the build path (on a device).
 fn service_bin() -> std::ffi::OsString {
     std::env::var_os("RSB_RECONNECT_SERVICE")
@@ -127,6 +136,9 @@ fn a_helper_built_before_its_service_connects_on_registration() {
 #[test]
 #[ignore = "needs /dev/binderfs/binder and a running rsb_hub"]
 fn an_invalid_name_is_a_build_error() {
+    if !registrations_supported() {
+        return;
+    }
     let r = Reconnecting::<dyn IRpcSmoke>::builder(kernel("not a valid name"))
         .build()
         .err();
@@ -174,6 +186,9 @@ fn dropping_a_waiting_helper_unregisters_its_callback() {
         fn onRegistration(&self, _: &str, _: &SIBinder) -> rsbinder::BinderResult<()> {
             Ok(())
         }
+    }
+    if !registrations_supported() {
+        return;
     }
     let name = service_name("dropwait");
     let h = Reconnecting::<dyn IRpcSmoke>::builder(kernel(&name))

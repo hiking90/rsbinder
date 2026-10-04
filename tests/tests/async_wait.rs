@@ -47,6 +47,15 @@ fn service_name(tag: &str) -> String {
     format!("rsb.test.asyncwait.{tag}.{}", std::process::id())
 }
 
+/// Android 10's C service manager takes no registrations; a test that watches through one skips.
+fn registrations_supported() -> bool {
+    let supported = rsbinder::sdk_at_least(30);
+    if !supported {
+        println!("skipped: Android 10's service manager has no registerForNotifications");
+    }
+    supported
+}
+
 struct Svc;
 impl Interface for Svc {}
 
@@ -104,6 +113,9 @@ fn registration_notifies_this_client_and_the_wait_resolves() {
         }
     }
 
+    if !registrations_supported() {
+        return;
+    }
     ProcessState::init_default().expect("ProcessState::init_default");
     ProcessState::start_thread_pool();
 
@@ -386,6 +398,9 @@ fn a_dropped_wait_leaves_no_callback_registered() {
     /// `rsb_hub`'s `MAX_CALLBACKS_PER_NAME`.
     const CAP: usize = 256;
 
+    if !registrations_supported() {
+        return;
+    }
     ProcessState::init_default().expect("ProcessState::init_default");
     ProcessState::start_thread_pool();
 

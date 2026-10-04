@@ -2225,3 +2225,25 @@ mod wait_end_tests {
         );
     }
 }
+
+#[cfg(all(test, target_os = "android"))]
+mod android_10_tests {
+    use super::*;
+
+    /// Android 10: handle 0 resolves on any build; the hub needs the `android_10` feature.
+    #[test]
+    #[serial_test::serial(binder)]
+    fn android_10_hands_out_its_service_manager_only_with_its_feature() {
+        if crate::get_android_sdk_version() != sdk_versions::ANDROID_10 {
+            return;
+        }
+        ProcessState::init_default().expect("init_default");
+        assert!(ProcessState::as_self().context_object().is_ok());
+        let sm = default();
+        if cfg!(feature = "android_10") {
+            assert!(sm.is_ok(), "{:?}", sm.err());
+        } else {
+            assert_eq!(sm.err(), Some(StatusCode::InvalidOperation));
+        }
+    }
+}

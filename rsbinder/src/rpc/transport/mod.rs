@@ -1289,7 +1289,9 @@ mod tests {
             let cap = Duration::from_secs(MAX_KEEPALIVE_SECS);
             assert_eq!(sockopt::tcp_keepidle(fd).unwrap(), cap);
             assert_eq!(sockopt::tcp_keepintvl(fd).unwrap(), cap);
-            assert_eq!(user_timeout(), i32::MAX as u32);
+            // A kernel keeping it in jiffies (4.14, HZ >= 100) reads back up to one 10 ms tick more.
+            let (max, got) = (i32::MAX as u32, user_timeout());
+            assert!((max..=max + 10).contains(&got), "{got}");
         }
 
         tcp_liveness(fd, None).expect("back to none");
