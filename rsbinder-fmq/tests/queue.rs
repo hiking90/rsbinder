@@ -884,9 +884,13 @@ fn send_but_not_sync() {
 #[test]
 fn ring_code_makes_no_plain_copy_of_ring_memory() {
     // Code only: comment and doc lines may name the very calls this test forbids.
+    // Embedded at build time, so the test also runs where the source tree is absent (a device).
     let source = |file: &str| {
-        let path = format!("{}/src/{file}", env!("CARGO_MANIFEST_DIR"));
-        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let text = match file {
+            "queue.rs" => include_str!("../src/queue.rs"),
+            "ring.rs" => include_str!("../src/ring.rs"),
+            _ => panic!("{file} is not embedded"),
+        };
         text.lines()
             .filter(|line| !line.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
