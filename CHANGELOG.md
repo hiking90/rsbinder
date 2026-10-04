@@ -300,10 +300,11 @@ change bytes between peers: upgrade both ends together.
   (`String16`, oneway replies, RPC sends, stream items). No wire change.
 - **`@EnforcePermission` over kernel binder costs one IPC per check, not two**:
   the `IPermissionController` is kept, as AOSP keeps `gPermissionController`.
-- **`rsbinder-aidl` generated code passes `clippy::unwrap_used` and
-  `clippy::allow_attributes_without_reason`**: the `Builder::hash()` cache lock
-  uses `expect` (poison still panics), and every generated `allow` carries a
-  `reason`. Behavior is unchanged.
+- **`rsbinder-aidl` generated code passes `clippy::unwrap_used`,
+  `clippy::expect_used` and `clippy::allow_attributes_without_reason`**: a
+  `Builder::hash()` proxy keeps the remote hash in a `OnceLock` instead of a
+  `Mutex` locked with `unwrap()`, and every generated `allow` carries a
+  `reason`. The hash a proxy returns is unchanged.
 
 ### Deprecated
 
