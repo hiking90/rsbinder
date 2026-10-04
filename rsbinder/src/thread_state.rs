@@ -2700,10 +2700,12 @@ mod tests {
 
     use super::*;
 
+    #[cfg(any(feature = "rpc", target_os = "linux"))]
     fn own_uid() -> binder::uid_t {
         rustix::process::getuid().as_raw()
     }
 
+    #[cfg(any(feature = "rpc", target_os = "linux"))]
     fn own_pid() -> binder::pid_t {
         rustix::process::getpid().as_raw_nonzero().get() as binder::pid_t
     }

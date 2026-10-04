@@ -95,6 +95,13 @@
 //! Compatibility notes, supported AIDL constructs, and diagnostics examples
 //! live in the repository README and <https://hiking90.github.io/rsbinder/>.
 
+#![cfg_attr(
+    target_os = "android",
+    allow(
+        clippy::missing_const_for_thread_local,
+        reason = "android-only false positive, even on thread_locals already using `const { .. }`"
+    )
+)]
 // Library code returns errors; tests may unwrap (plan 13).
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 // Every allow outside tests says why (plan 13-1).
