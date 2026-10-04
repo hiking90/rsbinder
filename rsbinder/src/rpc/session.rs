@@ -2256,7 +2256,7 @@ impl RpcSessionInner {
         self.find_conn_impl(ConnUse::Client)
     }
 
-    /// [`find_conn`] for a oneway transaction ([`ConnUse::ClientAsync`]).
+    /// [`find_conn`](Self::find_conn) for a oneway transaction ([`ConnUse::ClientAsync`]).
     fn find_conn_async(&self) -> Result<ConnGuard<'_>> {
         self.find_conn_impl(ConnUse::ClientAsync)
     }

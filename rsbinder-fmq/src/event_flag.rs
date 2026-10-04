@@ -117,7 +117,7 @@ impl EventFlag {
 
     /// Wait until any bit of `bits` is set, clear those bits and return them.
     /// Returns at once when some already are. `timeout == None` waits
-    /// indefinitely; otherwise [`Error::TimedOut`](crate::Error::TimedOut)
+    /// indefinitely; otherwise [`Error::TimedOut`]
     /// once it elapses. `bits == 0` is rejected.
     pub fn wait(&self, bits: u32, timeout: Option<Duration>) -> Result<u32> {
         self.wait_until(bits, sys::deadline_after(timeout)?)

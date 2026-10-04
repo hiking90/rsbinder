@@ -1273,7 +1273,7 @@ impl Parcel {
     /// where it cannot hand over a shared-memory fd. It does not gate
     /// anything on its own: writing an fd into a parcel that answers
     /// `false` still fails with
-    /// [`StatusCode::FdsNotAllowed`](crate::StatusCode::FdsNotAllowed)
+    /// [`StatusCode::FdsNotAllowed`]
     /// at the one place that enforces it.
     pub fn allow_fds(&self) -> bool {
         if self.is_kernel_backed() {
