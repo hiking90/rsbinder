@@ -49,19 +49,10 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "rsbinder.test.acc".to_string());
     eprintln!("[rsbinder-client] STAGE3 instance={instance}");
 
-    // Step 1: open the kernel binder driver. Required for any kernel-
-    // binder traffic (Bp* proxies, servicemanager).
+    // Step 1: open the kernel binder driver.
     ProcessState::init_default()?;
 
-    // Step 2 + 3: ask the kernel servicemanager for the service. With
-    // no VINTF `<accessor>` entry for this name (the stock emulator
-    // doesn't allow VINTF write), servicemanager returns the regular
-    // `serviceWithMetadata` arm whose `.service` IS the IAccessor
-    // binder (the launcher registers `ABinderRpc_Accessor_asBinder` via
-    // `AServiceManager_addService`). The bridge under test
-    // (`accessor_16::resolve_accessor`) is independent of which arm
-    // delivered the IAccessor — its job is to turn an IAccessor proxy
-    // into an RPC root.
+    // Steps 2-3: no VINTF `<accessor>` here, so `serviceWithMetadata.service` is the IAccessor.
     let sm = hub::default()?;
     let swm = match &*sm {
         hub::ServiceManager::Android16(inner) => hub::android_16::get_service(inner, &instance)
@@ -77,11 +68,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         (*accessor_binder).descriptor()
     );
 
-    // Step 4: drive the bridge end-to-end. `resolve_accessor` does:
-    //   BpAccessor::getInstanceName() → equality check vs `instance`,
-    //   BpAccessor::addConnection() → ParcelFileDescriptor,
-    //   RpcSession::from_preconnected_fd(fd, max=2) → v2 handshake,
-    //   session.get_root().
+    // Step 4: name check, `addConnection` fd, v2 handshake on it, then `get_root`.
     let swm2 = hub::android_16::resolve_accessor(&instance, accessor_binder)
         .ok_or("resolve_accessor returned None — bridge failed (check launcher log + dmesg)")?;
     assert!(
@@ -93,10 +80,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .ok_or("bridge ServiceWithMetadata.service is None — get_root() yielded null")?;
     eprintln!("[rsbinder-client] RPC root acquired via bridge");
 
-    // Step 5a: TX_ECHO("hello-stage3") — exercises Parcel body bytes
-    // (rsbinder writes, real-libbinder reads, real-libbinder writes
-    // reply, rsbinder reads). Asserts byte-faithfulness of the v2 wire
-    // through the bridge.
+    // Step 5a: TX_ECHO carries a request body each way across the bridge.
     let req_str = "hello-stage3";
     let echoed: String = {
         let rp = (*root)
@@ -120,10 +104,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         "TX_ECHO round-trip mismatch: real libbinder peer reply diverged from input"
     );
 
-    // Step 5b: TX_GIVE_MARKER — no arg, fixed server-side string. A
-    // matching reply proves the reply Parcel body is byte-correct
-    // (Status header + writeString16 / read) against the real peer,
-    // even with zero-byte request body.
+    // Step 5b: TX_GIVE_MARKER, an empty request; the fixed reply string checks the reply body.
     const EXPECTED_MARKER: &str = "stage3-from-real-libbinder";
     let marker: String = {
         let rp = (*root)

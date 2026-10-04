@@ -168,7 +168,7 @@ impl std::fmt::Debug for Client {
 impl std::fmt::Debug for ClientOptions {
     #[expect(
         deprecated,
-        reason = "shows `handshake_timeout` while it is still honored"
+        reason = "shows `session_id` and `handshake_timeout` while they are still read"
     )]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut d = f.debug_struct("ClientOptions");
@@ -248,7 +248,7 @@ pub(crate) fn open_staged(
 /// The kernel endpoint and every option check; RPC endpoints end here without the `rpc` feature.
 #[expect(
     deprecated,
-    reason = "refuses `handshake_timeout` where it does not apply, while it is honored"
+    reason = "refuses `session_id` and `handshake_timeout` where they do not apply"
 )]
 fn kernel_open(uri: Uri, o: ClientOptions) -> Result<Client> {
     if uri.service.is_some() {
