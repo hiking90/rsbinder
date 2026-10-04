@@ -3190,8 +3190,10 @@ mod tests {
 
         let mut backing = vec![0u64; 3];
         let base = backing.as_mut_ptr() as *mut u8;
-        // SAFETY: 4 bytes into a 24-byte allocation; the 20 left hold two unaligned `u64`s.
-        let objects = unsafe { base.add(4) } as *mut crate::sys::binder::binder_size_t;
+        // Half the alignment: 4 bytes where `u64` aligns to 8, 2 on i686 where it aligns to 4.
+        let skew = std::mem::align_of::<crate::sys::binder::binder_size_t>() / 2;
+        // SAFETY: at most 4 bytes into a 24-byte allocation; the rest holds two unaligned `u64`s.
+        let objects = unsafe { base.add(skew) } as *mut crate::sys::binder::binder_size_t;
         // SAFETY: both writes stay inside `backing`, and `write_unaligned` needs no alignment.
         unsafe {
             objects.write_unaligned(8);

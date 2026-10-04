@@ -729,6 +729,14 @@ after 0.12.0. The single-connection one-liners
 
 ### Fixed
 
+- **On Android 10 a build without the `android_10` feature names the missing
+  feature.** `ProcessState::context_object` (and `strong_proxy_for_handle(0)`)
+  asked Android 10's C service manager for its interface descriptor, which it
+  does not answer, and failed with `PermissionDenied`, so `hub::default`
+  reported the service manager as unreachable. The descriptor is now known
+  without asking on every Android 10 build, and `hub::default` fails with
+  `InvalidOperation` and a log naming the `android_10` feature, as for the
+  other SDKs.
 - **`FLAG_COLLECT_NOTED_APP_OPS` is `0x2`**, the value of AOSP
   `IBinder.java`, which Java `Binder.execTransactInternal` tests. It was
   `0x80`, which a Java service ignored and which the android17-6.18 kernel
