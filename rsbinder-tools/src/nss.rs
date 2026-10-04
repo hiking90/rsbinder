@@ -170,7 +170,10 @@ type GroupListId = libc::c_int;
 const GETGROUPLIST_REPORTS_NEED: bool = cfg!(any(target_os = "linux", target_os = "android"));
 
 /// The cast is redundant on Linux (`u32`) but not on BSDs (`int`); a fn scopes the `allow` to it.
-#[allow(clippy::unnecessary_cast)]
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "the group id is already `u32` on Linux"
+)]
 fn gid_of(id: GroupListId) -> u32 {
     id as u32
 }

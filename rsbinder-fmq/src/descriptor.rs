@@ -197,7 +197,6 @@ enum Object {
 }
 
 impl Object {
-    #[allow(clippy::unnecessary_cast)] // `st_dev`/`st_ino` widths differ by target
     fn of(fd: std::os::fd::BorrowedFd<'_>, index: usize) -> Result<Self> {
         if shm::is_ashmem_fd(fd) {
             return Ok(Object::Ashmem(index));

@@ -278,7 +278,9 @@ impl<T: FromIBinder + ?Sized + 'static> ReconnectBuilder<T> {
     /// a directory of names, such as a libbinder root (`BadType`), a name
     /// the service manager refuses to watch ([`StatusCode::BadValue`] for an
     /// invalid name, [`StatusCode::PermissionDenied`] for an SELinux `find`
-    /// denial), or [`ConnectError::stop`] from `on_connect`.
+    /// denial; Android 10's service manager watches no name, so there the
+    /// helper polls and neither is a build error), or [`ConnectError::stop`]
+    /// from `on_connect`.
     ///
     /// Anything else — the server not up yet, the name not registered yet —
     /// returns a helper that keeps connecting in the background, so a

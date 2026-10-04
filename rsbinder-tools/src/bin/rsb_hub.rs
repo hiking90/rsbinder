@@ -1,6 +1,6 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
-#![allow(non_snake_case)]
+#![expect(non_snake_case, reason = "AIDL parameter names (`allowIsolated`, ..)")]
 
 use env_logger::Env;
 use hub::android_16::{

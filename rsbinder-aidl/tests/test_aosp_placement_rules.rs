@@ -857,7 +857,7 @@ interface IFoo {
         "#,
     );
     assert!(out.contains(r#"#[deprecated = "gone"]"#), "{out}");
-    assert!(out.contains("deprecated)]"), "{out}");
+    assert!(out.contains(", deprecated, reason = "), "{out}");
 }
 
 // ---- Other AOSP rules: silent divergence or consumer rustc error (see module doc) ----

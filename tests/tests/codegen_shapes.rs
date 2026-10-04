@@ -10,7 +10,6 @@
 //! `Bp*` proxy are both reused unmodified — the point is the wire.
 
 #![cfg(feature = "rpc")]
-#![allow(non_snake_case)]
 
 use std::thread;
 

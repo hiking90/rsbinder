@@ -6,8 +6,6 @@
 //! test can kill and restart it and tell the instances apart. Prints
 //! `ready` once registered.
 
-#![allow(non_snake_case)]
-
 use rsbinder::{hub, Interface, ProcessState, Status};
 
 include!(concat!(env!("OUT_DIR"), "/rpc_smoke.rs"));

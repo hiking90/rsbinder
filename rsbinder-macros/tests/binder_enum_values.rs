@@ -198,7 +198,6 @@ fn a_user_type_named_like_a_prelude_item_reaches_the_signature() {
 }
 
 /// The fixed-size array shapes AOSP renders compile through the generated proxy and stub.
-#[allow(dead_code)]
 mod fixed_array_shapes {
     #[rsbinder::interface]
     pub trait IFixed {

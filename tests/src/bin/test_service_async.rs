@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#![allow(non_snake_case, hidden_glob_reexports)]
+#![allow(hidden_glob_reexports)]
 
 use env_logger::Env;
 pub use rsbinder::*;

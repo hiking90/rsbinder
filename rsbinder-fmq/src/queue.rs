@@ -324,14 +324,14 @@ impl<T: Element> MessageQueue<T> {
         let contiguous = (self.ring.bytes - offset) / q;
         debug_assert_eq!(offset % q, 0);
         // SAFETY: `offset < bytes`, so the pointer stays in the ring's mapping.
-        let first = unsafe { self.ring.base.as_ptr().add(offset) };
+        let first = unsafe { self.ring.base.add(offset) };
         let (first_len, second_len) = if n > contiguous {
             (contiguous, n - contiguous)
         } else {
             (n, 0)
         };
         Regions {
-            first: NonNull::new(first).expect("ring pointer is non-null"),
+            first,
             first_len,
             second: self.ring.base,
             second_len,

@@ -23,7 +23,6 @@
 //! its own server and socket path, so they are parallel-safe.
 
 #![cfg(feature = "rpc")]
-#![allow(non_snake_case)]
 
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};

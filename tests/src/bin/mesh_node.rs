@@ -35,8 +35,6 @@
 //!   --blob <n>             payload byte-array length
 //! ```
 
-#![allow(non_snake_case)]
-
 use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};

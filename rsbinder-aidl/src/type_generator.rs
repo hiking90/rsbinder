@@ -564,7 +564,13 @@ impl TypeGenerator {
         let curr_ns = current_namespace();
         let ns = curr_ns.relative_mod(&lookup_decl.ns);
         // AIDL allows Rust keywords as names; `relative_mod` already escaped the module path.
-        let simple = crate::escape_rust_keyword(lookup_decl.name.ns.last().unwrap());
+        let simple = crate::escape_rust_keyword(
+            lookup_decl
+                .name
+                .ns
+                .last()
+                .expect("a resolved declaration has a name"),
+        );
         let is_interface = matches!(lookup_decl.decl, Declaration::Interface(_));
         // Only `@nullable` boxes: `Option` ends `Default` recursion; `ensure_sized` rejects others.
         let needs_box = allow_box
@@ -945,10 +951,11 @@ impl TypeGenerator {
             }
         };
 
-        array_info.sizes.iter().rev().skip(1).fold(
-            format!("[{}; {}]", value_str, array_info.sizes.last().unwrap()),
-            |acc, size| format!("[{acc}; {size}]"),
-        )
+        array_info
+            .sizes
+            .iter()
+            .rev()
+            .fold(value_str, |acc, size| format!("[{acc}; {size}]"))
     }
 
     fn list_type_decl_fixed(&self, array_info: &ArrayInfo, is_struct: bool) -> String {

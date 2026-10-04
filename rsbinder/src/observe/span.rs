@@ -13,9 +13,10 @@
 //! string is only formatted when a subscriber has enabled the span.
 
 use crate::binder::TransactionCode;
+#[cfg(any(feature = "tracing", test))]
 use std::fmt;
 
-#[cfg_attr(not(feature = "tracing"), allow(dead_code))]
+#[cfg(any(feature = "tracing", test))]
 pub(crate) struct AidlSpanName<'a> {
     pub(crate) descriptor: &'a str,
     pub(crate) method: Option<&'a str>,
@@ -23,6 +24,7 @@ pub(crate) struct AidlSpanName<'a> {
     pub(crate) server: bool,
 }
 
+#[cfg(any(feature = "tracing", test))]
 impl fmt::Display for AidlSpanName<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "AIDL::rust::{}::", self.descriptor)?;

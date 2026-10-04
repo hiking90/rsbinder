@@ -161,6 +161,7 @@ pub trait WireCodec: Send + Sync {
         self.encode_transact_ref(txn.into())
     }
     /// [`WireCodec::encode_reply_ref`] of an owned reply.
+    #[cfg(test)]
     fn encode_reply(&self, reply: &WireReply) -> RpcResult<Vec<u8>> {
         self.encode_reply_ref(reply.into())
     }
@@ -173,8 +174,10 @@ pub trait WireCodec: Send + Sync {
     /// Decode one complete wire message (header + body).
     fn decode_message(&self, frame: &[u8]) -> RpcResult<WireMessage>;
     /// Encode the bare `int32` session-id preamble (no header).
+    #[cfg(test)]
     fn encode_session_preamble(&self, session_id: i32) -> Vec<u8>;
     /// Decode the bare `int32` session-id preamble.
+    #[cfg(any(test, feature = "fuzzing"))]
     fn decode_session_preamble(&self, buf: &[u8]) -> RpcResult<i32>;
 }
 
@@ -201,13 +204,10 @@ impl R34Codec {
 
 /// Read a little-endian `u32` at `off`, bounds-checked.
 fn rd_u32(buf: &[u8], off: usize) -> RpcResult<u32> {
-    let end = off
-        .checked_add(4)
-        .ok_or(RpcError::Protocol("offset overflow"))?;
-    let slice = buf
-        .get(off..end)
-        .ok_or(RpcError::Protocol("truncated u32"))?;
-    Ok(u32::from_le_bytes(slice.try_into().unwrap()))
+    buf.get(off..)
+        .and_then(<[u8]>::first_chunk)
+        .map(|b| u32::from_le_bytes(*b))
+        .ok_or(RpcError::Protocol("truncated u32"))
 }
 
 fn rd_i32(buf: &[u8], off: usize) -> RpcResult<i32> {
@@ -215,25 +215,17 @@ fn rd_i32(buf: &[u8], off: usize) -> RpcResult<i32> {
 }
 
 fn rd_u64(buf: &[u8], off: usize) -> RpcResult<u64> {
-    let end = off
-        .checked_add(8)
-        .ok_or(RpcError::Protocol("offset overflow"))?;
-    let slice = buf
-        .get(off..end)
-        .ok_or(RpcError::Protocol("truncated u64"))?;
-    Ok(u64::from_le_bytes(slice.try_into().unwrap()))
+    buf.get(off..)
+        .and_then(<[u8]>::first_chunk)
+        .map(|b| u64::from_le_bytes(*b))
+        .ok_or(RpcError::Protocol("truncated u64"))
 }
 
 fn rd_addr(buf: &[u8], off: usize) -> RpcResult<RpcAddress> {
-    let end = off
-        .checked_add(RPC_ADDR_LEN)
-        .ok_or(RpcError::Protocol("offset overflow"))?;
-    let slice = buf
-        .get(off..end)
-        .ok_or(RpcError::Protocol("truncated address"))?;
-    let mut bytes = [0u8; RPC_ADDR_LEN];
-    bytes.copy_from_slice(slice);
-    Ok(RpcAddress::from_wire_bytes(bytes))
+    buf.get(off..)
+        .and_then(<[u8]>::first_chunk::<RPC_ADDR_LEN>)
+        .map(|b| RpcAddress::from_wire_bytes(*b))
+        .ok_or(RpcError::Protocol("truncated address"))
 }
 
 impl WireCodec for R34Codec {
@@ -347,10 +339,12 @@ impl WireCodec for R34Codec {
         }
     }
 
+    #[cfg(test)]
     fn encode_session_preamble(&self, session_id: i32) -> Vec<u8> {
         session_id.to_le_bytes().to_vec()
     }
 
+    #[cfg(any(test, feature = "fuzzing"))]
     fn decode_session_preamble(&self, buf: &[u8]) -> RpcResult<i32> {
         // Exactly a bare `int32`: any other length is malformed and would desync the next recv.
         let arr: [u8; 4] = buf

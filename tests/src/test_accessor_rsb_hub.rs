@@ -17,7 +17,7 @@
 //!      `Service::Accessor(Some(binder))` — distinct from the regular
 //!      `ServiceWithMetadata` wrap.
 //!   3. The consume-side accessor arm in
-//!      [`rsbinder::hub::servicemanager_16::resolve_accessor_arm`]
+//!      `rsbinder::hub::servicemanager_16::resolve_accessor_arm`
 //!      transparently calls `IAccessor::addConnection` → adopts
 //!      the returned fd → runs the android-13+ handshake → returns
 //!      the RPC root binder.
@@ -31,38 +31,24 @@
 //! `example-hello/cpp/run_d8b_register.sh` starts both, runs this
 //! test with `cargo test ... -- --ignored`, and cleans up.
 
-// `tests/` enables rsbinder via the cumulative `android_10_plus` feature
-// (`tests/Cargo.toml`), so `hub::android_16` and the consume-side
-// accessor arm are always available here. The own `rpc` feature of
-// `tests/` (re-exporting `rsbinder/rpc`) is the only gate we need at
-// the test level; the `target_os = "linux"` gate matches the kernel-
-// binder + rsb_hub dependency.
+// `android_10_plus` (tests/Cargo.toml) always brings `hub::android_16`; only rpc and rsb_hub gate.
 #![cfg(all(target_os = "linux", feature = "rpc"))]
 #![allow(dead_code)]
 
 use env_logger::Env;
 use rsbinder::*;
 
-/// Service-manager instance name the server bin registers under. The
-/// orchestration script passes the same string as `argv[1]` to the
-/// server bin. Distinct from the STAGE3 emulator instance to
-/// avoid collisions when both harnesses share a binder driver.
+/// The server bin's `argv[1]`; distinct from the STAGE3 emulator instance on a shared driver.
 const INSTANCE: &str = "rsbinder.test.d8b.accessor";
 
-/// RPC root interface descriptor — must match the
-/// `rpc_accessor_register_interop_server` binary's `ROOT_DESC` constant
-/// so the `writeInterfaceToken` rsbinder's `RpcProxy::build_request`
-/// emits is the shape the server's `Remotable::on_transact` expects.
+/// Equals the server bin's `ROOT_DESC`, so its `on_transact` accepts our interface token.
 const ROOT_DESC: &str = "rsbinder.test.accessor.IInterop";
 
 /// `TX_ECHO` writes a String request and reads `Status + String` reply.
 const TX_ECHO: TransactionCode = FIRST_CALL_TRANSACTION;
 /// `TX_GIVE_MARKER` takes no args and reads `Status + String` reply.
 const TX_GIVE_MARKER: TransactionCode = FIRST_CALL_TRANSACTION + 1;
-/// Server-side hardcoded marker — must match the server bin's `MARKER`
-/// constant. Byte-equality on this proves the Parcel reply body
-/// (Status header + `writeString16` encoding) survived the consume-side
-/// accessor bridge intact.
+/// Equals the server bin's `MARKER`; byte equality shows the reply body crossed the bridge intact.
 const SERVER_MARKER: &str = "stage3-from-rsbinder";
 
 fn init_test() {
@@ -76,11 +62,7 @@ fn init_test() {
 fn d8b_cross_process_accessor_via_rsb_hub() -> Result<()> {
     init_test();
 
-    // 1. Discover via rsb_hub.
-    //    Under the hood: kernel-binder `getService2(INSTANCE)`
-    //                    → rsb_hub returns `Service::Accessor(Some(_))`
-    //                    → consume-side `resolve_accessor_arm` bridges to RPC
-    //                    → returns the RPC root binder.
+    // 1. Discover via rsb_hub (module doc steps 2-3).
     let root = hub::try_get_service(INSTANCE)
         .expect("service manager")
         .unwrap_or_else(|| {
@@ -91,18 +73,13 @@ fn d8b_cross_process_accessor_via_rsb_hub() -> Result<()> {
             )
         });
 
-    // The accessor arm wraps the consumed RPC connection in an
-    // `RpcProxy`; downcasting is the canonical way to use the
-    // `build_request`/`transact` helpers without going through a
-    // generated AIDL stub.
+    // The accessor arm yields an `RpcProxy`; downcasting reaches `build_request` without a stub.
     let rp = (*root)
         .as_any()
         .downcast_ref::<rsbinder::rpc::RpcProxy>()
         .expect("root binder is not an RpcProxy — accessor arm did not bridge correctly");
 
-    // 2. TX_GIVE_MARKER — no request body. The reply body is
-    //    `Status::Ok` (`writeStatusHeader`) + `writeString16(MARKER)`.
-    //    Asserts the consume-side decodes both correctly.
+    // 2. TX_GIVE_MARKER: no request body; the reply is `Status::Ok` + `writeString16(MARKER)`.
     let marker_reply = {
         let data = rp.build_request(ROOT_DESC)?;
         rp.transact(TX_GIVE_MARKER, &data, 0)?
@@ -117,9 +94,7 @@ fn d8b_cross_process_accessor_via_rsb_hub() -> Result<()> {
         "TX_GIVE_MARKER mismatch — server marker String body diverged across the accessor bridge"
     );
 
-    // 3. TX_ECHO — String request, `Status::Ok` + String reply. Pulls
-    //    the *request* Parcel body through the bridge too (server reads
-    //    what we write), closing the round-trip wire-byte loop.
+    // 3. TX_ECHO: the request body crosses the bridge too, and comes back in the reply.
     let req = "hello-d8b";
     let echo_reply = {
         let mut data = rp.build_request(ROOT_DESC)?;

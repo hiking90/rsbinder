@@ -214,7 +214,13 @@ impl PartialEq for ParcelFileDescriptor {
 impl Eq for ParcelFileDescriptor {}
 
 /// The RPC fd body a parcel carries; only `rpc` builds construct it (hence the `allow`).
-#[cfg_attr(not(feature = "rpc"), allow(dead_code))]
+#[cfg_attr(
+    not(feature = "rpc"),
+    allow(
+        dead_code,
+        reason = "the fd paths name the type in every build; only `rpc` builds construct it"
+    )
+)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RpcFdProfile {
     /// R34 / v0: rsbinder-only bare ancillary index (AOSP forbids fd-over-RPC there).

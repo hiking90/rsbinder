@@ -14,7 +14,6 @@
 //! bound, and the gateway spelling compiles and forwards on this path as well.
 
 #![cfg(all(feature = "macros", feature = "rpc"))]
-#![allow(non_snake_case)]
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

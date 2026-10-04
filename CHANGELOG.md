@@ -678,6 +678,16 @@ This changelog starts at 0.9.0. For earlier releases, see the
   service for several interfaces). An `exec` start is outstanding for the
   process's lifetime, a `systemd` one until `systemctl --no-block start`
   returns. In 0.11.0 each name started its own.
+- **rsbinder-aidl generated code passes `clippy::unwrap_used`,
+  `clippy::expect_used` and `clippy::allow_attributes_without_reason`.** The
+  proxy of an interface built with `Builder::hash()` keeps the remote hash in
+  a `std::sync::OnceLock<String>` instead of a `Mutex<Option<String>>`
+  locked with `unwrap()`, so the generated code takes no lock and has no
+  `unwrap`/`expect`. Every `allow` in a generated module, in the
+  `declare_binder_interface!` / `declare_binder_enum!` expansions and in
+  `#[derive(Parcelable)]` output on a deprecated item, carries a `reason`. A
+  crate that denies any of these lints can now include the generated code.
+  Output text changes accordingly; the hash a proxy returns does not.
 
 The behavior changes an existing program can observe are listed under
 *Migrating from 0.11.0* above.
@@ -719,6 +729,14 @@ after 0.12.0. The single-connection one-liners
 
 ### Fixed
 
+- **On Android 10 a build without the `android_10` feature names the missing
+  feature.** `ProcessState::context_object` (and `strong_proxy_for_handle(0)`)
+  asked Android 10's C service manager for its interface descriptor, which it
+  does not answer, and failed with `PermissionDenied`, so `hub::default`
+  reported the service manager as unreachable. The descriptor is now known
+  without asking on every Android 10 build, and `hub::default` fails with
+  `InvalidOperation` and a log naming the `android_10` feature, as for the
+  other SDKs.
 - **`FLAG_COLLECT_NOTED_APP_OPS` is `0x2`**, the value of AOSP
   `IBinder.java`, which Java `Binder.execTransactInternal` tests. It was
   `0x80`, which a Java service ignored and which the android17-6.18 kernel

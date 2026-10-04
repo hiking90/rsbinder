@@ -498,7 +498,7 @@ impl BinderAsyncPool for Tokio {
 /// [`spawn_blocking`](tokio::task::spawn_blocking) is deliberately not in that
 /// set: the blocking pool runs independently of the scheduler, so awaiting one
 /// completes here too. That is why an *outbound* call through
-/// [`BinderAsyncPool`](crate::BinderAsyncPool) — which is `spawn_blocking` —
+/// [`BinderAsyncPool`] — which is `spawn_blocking` —
 /// works from a handler this adapter is driving on a current-thread handle,
 /// even though a `tokio::spawn`ed task in the same place would not.
 ///

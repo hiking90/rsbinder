@@ -441,9 +441,10 @@ pub fn lookup_decl_from_name(name: &str, style: &str) -> Option<LookupDecl> {
 
     // A union `Tag` sits in `mod <Union>`: use the union's ns (`<Union>::Tag`, not `Tag::Tag`).
     let effective_ns = match &decl {
-        Declaration::Enum(e) if e.tag_of_union.is_some() => {
-            e.tag_of_union.clone().expect("checked Some above")
-        }
+        Declaration::Enum(EnumDecl {
+            tag_of_union: Some(tag),
+            ..
+        }) => tag.clone(),
         _ => ns,
     };
 
@@ -641,7 +642,7 @@ fn make_const_expr(const_expr: Option<&ConstExpr>, lookup_decl: &LookupDecl) -> 
 }
 
 fn lookup_name_from_decl(decl: &Declaration, lookup_decl: &LookupDecl) -> Option<ConstExpr> {
-    let lookup_ident = lookup_decl.name.ns.last().unwrap().to_owned();
+    let lookup_ident = lookup_decl.name.ns.last()?.to_owned();
     match decl {
         Declaration::Variable(decl) => {
             // AOSP resolves a reference against constants only, never a field default.
@@ -1732,9 +1733,15 @@ fn validate_oneway_methods(interface: &InterfaceDecl) -> Result<(), AidlError> {
     }
 }
 
+/// Next child of a pair whose arity `aidl.pest` fixes; `None` is a grammar/parser mismatch.
+#[track_caller]
+fn child<'i>(pairs: &mut pest::iterators::Pairs<'i, Rule>) -> pest::iterators::Pair<'i, Rule> {
+    pairs.next().expect("aidl.pest fixes this rule's children")
+}
+
 fn parse_unary(mut pairs: pest::iterators::Pairs<Rule>) -> Result<ConstExpr, AidlError> {
-    let operator = pairs.next().unwrap().as_str().to_owned();
-    let factor = parse_factor(pairs.next().unwrap().into_inner().next().unwrap())?;
+    let operator = child(&mut pairs).as_str().to_owned();
+    let factor = parse_factor(child(&mut child(&mut pairs).into_inner()))?;
     Ok(ConstExpr::new_unary(&operator, factor))
 }
 
@@ -1896,7 +1903,7 @@ fn parse_factor(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr, AidlErro
     match pair.as_rule() {
         Rule::expression => parse_expression(pair.into_inner()),
         Rule::unary => parse_unary(pair.into_inner()),
-        Rule::value => parse_value(pair.into_inner().next().unwrap()),
+        Rule::value => parse_value(child(&mut pair.into_inner())),
         _ => unreachable!("Unexpected rule in parse_factor(): {}", pair),
     }
 }
@@ -1912,17 +1919,17 @@ fn parse_expression_term(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr,
         | Rule::arith
         | Rule::logical_or
         | Rule::logical_and => parse_expression(pair.into_inner()),
-        Rule::factor => parse_factor(pair.into_inner().next().unwrap()),
+        Rule::factor => parse_factor(child(&mut pair.into_inner())),
         _ => unreachable!("Unexpected rule in Rule::parse_expression_into: {}", pair),
     }
 }
 
 fn parse_expression(mut pairs: pest::iterators::Pairs<Rule>) -> Result<ConstExpr, AidlError> {
-    let mut lhs = parse_expression_term(pairs.next().unwrap())?;
+    let mut lhs = parse_expression_term(child(&mut pairs))?;
 
     while let Some(pair) = pairs.next() {
         let op = pair.as_str().to_owned();
-        let rhs = parse_expression_term(pairs.next().unwrap())?;
+        let rhs = parse_expression_term(child(&mut pairs))?;
 
         lhs = ConstExpr::new_expr(lhs, &op, rhs)
     }
@@ -2259,9 +2266,9 @@ fn parse_non_array_type(pairs: pest::iterators::Pairs<Rule>) -> Result<NonArrayT
             Rule::generic_type1 => {
                 let mut pairs = pair.into_inner();
                 let generic = Generic::Type1 {
-                    type_args1: parse_type_args(pairs.next().unwrap().into_inner())?,
-                    non_array_type: parse_split_non_array_type(pairs.next().unwrap().into_inner())?,
-                    type_args2: parse_type_args(pairs.next().unwrap().into_inner())?,
+                    type_args1: parse_type_args(child(&mut pairs).into_inner())?,
+                    non_array_type: parse_split_non_array_type(child(&mut pairs).into_inner())?,
+                    type_args2: parse_type_args(child(&mut pairs).into_inner())?,
                 };
 
                 non_array_type.generic = Some(Box::new(generic));
@@ -2270,8 +2277,8 @@ fn parse_non_array_type(pairs: pest::iterators::Pairs<Rule>) -> Result<NonArrayT
             Rule::generic_type2 => {
                 let mut pairs = pair.into_inner();
                 let generic = Generic::Type2 {
-                    non_array_type: parse_split_non_array_type(pairs.next().unwrap().into_inner())?,
-                    type_args: parse_type_args(pairs.next().unwrap().into_inner())?,
+                    non_array_type: parse_split_non_array_type(child(&mut pairs).into_inner())?,
+                    type_args: parse_type_args(child(&mut pairs).into_inner())?,
                 };
 
                 non_array_type.generic = Some(Box::new(generic));
@@ -2279,7 +2286,7 @@ fn parse_non_array_type(pairs: pest::iterators::Pairs<Rule>) -> Result<NonArrayT
             Rule::generic_type3 => {
                 let mut pairs = pair.into_inner();
                 let generic = Generic::Type3 {
-                    type_args: parse_type_args(pairs.next().unwrap().into_inner())?,
+                    type_args: parse_type_args(child(&mut pairs).into_inner())?,
                 };
 
                 non_array_type.generic = Some(Box::new(generic));
@@ -2670,10 +2677,8 @@ fn parse_unstructured_parcelable(
         RustType,
     }
 
-    let (first, second) = pairs
-        .next()
-        .zip(pairs.next())
-        .expect("Incomplete rule in parse_unstructured_parcelable()");
+    let first = child(&mut pairs);
+    let second = child(&mut pairs);
 
     let header = match first.as_rule() {
         Rule::CPP_HEADER => HeaderType::CppHeader,
@@ -3150,7 +3155,7 @@ pub fn parse_document(ctx: &SourceContext) -> Result<Document, AidlError> {
             for pair in pairs {
                 match pair.as_rule() {
                     Rule::package => {
-                        let name = pair.into_inner().next().unwrap();
+                        let name = child(&mut pair.into_inner());
                         reject_unrepresentable_identifier(
                             name.as_str(),
                             "package segment",

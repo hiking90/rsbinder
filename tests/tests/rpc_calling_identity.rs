@@ -21,7 +21,6 @@
 //! own session pair → parallel-safe.
 
 #![cfg(feature = "rpc")]
-#![allow(non_snake_case)]
 
 use std::thread;
 

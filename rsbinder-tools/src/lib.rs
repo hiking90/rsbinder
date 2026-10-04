@@ -9,6 +9,11 @@
 //! declarations, on-demand activation) and its readiness notification
 //! ([`notify`]). See `plans/6-rsb-hub-linux.md`.
 
+// Library code returns errors; tests may unwrap (plan 13).
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+// Every allow outside tests says why (plan 13-1).
+#![cfg_attr(not(test), deny(clippy::allow_attributes_without_reason))]
+
 pub mod config;
 pub mod notify;
 pub mod nss;

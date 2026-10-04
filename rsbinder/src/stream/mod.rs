@@ -875,7 +875,7 @@ impl<T: Serialize + ?Sized> Sink<T> {
     ///
     /// On the ring an error always means this item was not written,
     /// whichever write failed — this call's, or a record a dropped
-    /// [`send_async`](Self::send_async) left on the pool, whose failure
+    /// `send_async` left on the pool, whose failure
     /// the next call reports before writing anything.
     ///
     /// - [`StatusCode::TimedOut`] when [`SinkPolicy::send_timeout`]
@@ -898,7 +898,7 @@ impl<T: Serialize + ?Sized> Sink<T> {
     ///   it.
     /// - Anything else is a batch send on the RPC path failing: the one
     ///   this call made when the pending batch reached its threshold, or
-    ///   one a dropped `send_async` or [`flush_async`](Self::flush_async)
+    ///   one a dropped `send_async` or `flush_async`
     ///   left on the pool, whose failure the next call reports. The failed
     ///   batch's items are lost, and [`end`](Self::end) tells the consumer
     ///   how many, so the stream ends as failed either way. What follows
