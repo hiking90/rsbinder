@@ -58,7 +58,7 @@
 //! from `thread_state::free_buffer`, called when a parcel drops or for a
 //! status reply no parcel ever wrapped.
 
-#[allow(
+#[expect(
     non_camel_case_types,
     dead_code,
     reason = "bindgen output: C type names, and UAPI items not used yet (module doc)"

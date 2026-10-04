@@ -341,11 +341,9 @@ fn byte_order_primitives_stay_pinned() {
             needle: "_ne_bytes",
             tree_wide: true,
             files: &[
-                // `NativeScalar`'s two methods + `Debug`'s offset-table dump (1) + tests
-                // asserting what stays native (3) or hand-writing an L3 fd object (2).
+                // `NativeScalar` (2) + `Debug` dump (1) + tests: what stays native (3), L3 fd (2).
                 ("parcel.rs", 8),
-                // `FlatBinderObject`'s L3 codec and union accessors (10) + tests pinning its
-                // layout and where the union's `handle` lies on either byte order (6).
+                // `FlatBinderObject` L3 codec, union accessors (10) + layout/byte-order tests (6).
                 ("binder_object.rs", 16),
                 // `TransactionData`'s L3 codec and `target` accessors (15) + layout tests (8).
                 ("transaction_data.rs", 23),

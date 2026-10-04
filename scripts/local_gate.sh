@@ -238,6 +238,7 @@ tier_hermetic() {
         for t in x86_64-linux-android aarch64-linux-android; do
             run "android build $t" cargo ndk -t "$t" -p 29 build --release
             run "android test build $t" cargo ndk -t "$t" -p 29 test --no-run
+            run "android clippy $t" cargo ndk -t "$t" -p 29 clippy --workspace --all-features
         done
     else
         skip "android builds" "needs cargo-ndk and ANDROID_NDK_HOME"

@@ -17,7 +17,7 @@
 //!      `Service::Accessor(Some(binder))` — distinct from the regular
 //!      `ServiceWithMetadata` wrap.
 //!   3. The consume-side accessor arm in
-//!      [`rsbinder::hub::servicemanager_16::resolve_accessor_arm`]
+//!      `rsbinder::hub::servicemanager_16::resolve_accessor_arm`
 //!      transparently calls `IAccessor::addConnection` → adopts
 //!      the returned fd → runs the android-13+ handshake → returns
 //!      the RPC root binder.
