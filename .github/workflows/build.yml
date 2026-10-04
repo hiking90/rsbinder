@@ -568,6 +568,7 @@ jobs:
       with:
         toolchain: ${{ env.rust_min }}
         targets: ${{ matrix.target }}
+        components: clippy
         override: true # Ensure this toolchain overrides the previous one for subsequent steps
     - uses: Swatinem/rust-cache@v2
       with:
@@ -578,4 +579,8 @@ jobs:
     - name: Check test builds for Android (${{ matrix.target }})
       run: |
         cargo ndk -t ${{ matrix.target }} --platform 29 test --no-run
+    - name: Clippy for Android (${{ matrix.target }})
+      # Lints the `cfg(target_os = "android")` code no Linux step compiles. No `-D warnings`:
+      # only the crates' deny-level lints (plans/13) fail it.
+      run: cargo ndk -t ${{ matrix.target }} --platform 29 clippy --workspace --all-features
 
