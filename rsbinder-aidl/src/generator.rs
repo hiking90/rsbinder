@@ -445,7 +445,7 @@ pub mod {{mod}} {
                 cached_version: ::std::sync::atomic::AtomicI32 = ::std::sync::atomic::AtomicI32::new(-1){% if hash %},{% endif %}
                 {%- endif %}
                 {%- if hash %}
-                cached_hash: ::std::sync::Mutex<::core::option::Option<::std::string::String>> = ::std::sync::Mutex::new(::core::option::Option::None)
+                cached_hash: ::std::sync::OnceLock<::std::string::String> = ::std::sync::OnceLock::new()
                 {%- endif %}
             },
             {%- else %}
@@ -530,7 +530,7 @@ pub mod {{mod}} {
             let _status = _aidl_reply.read::<{{crate}}::Status>()?;
             if !_status.is_ok() { return ::core::result::Result::Err(_status); }
             let _aidl_return: ::std::string::String = _aidl_reply.read()?;
-            *self.cached_hash.lock().expect("cached_hash poisoned") = ::core::option::Option::Some(_aidl_return.clone());
+            let _ = self.cached_hash.set(_aidl_return.clone());
             ::core::result::Result::Ok(_aidl_return)
         }
         {%- endif %}
@@ -568,11 +568,8 @@ pub mod {{mod}} {
         {%- endif %}
         {%- if hash %}
         fn r#getInterfaceHash(&self) -> {{crate}}::BinderResult<::std::string::String> {
-            {
-                let _aidl_hash_lock = self.cached_hash.lock().expect("cached_hash poisoned");
-                if let ::core::option::Option::Some(ref _aidl_hash) = *_aidl_hash_lock {
-                    return ::core::result::Result::Ok(_aidl_hash.clone());
-                }
+            if let ::core::option::Option::Some(_aidl_hash) = self.cached_hash.get() {
+                return ::core::result::Result::Ok(_aidl_hash.clone());
             }
             let _aidl_data = self.build_parcel_getInterfaceHash()?;
             {%- if function_names is iterable %}
@@ -637,11 +634,8 @@ pub mod {{mod}} {
         {%- endif %}
         {%- if hash %}
         fn r#getInterfaceHash<'a>(&'a self) -> {{crate}}::BoxFuture<'a, {{crate}}::BinderResult<::std::string::String>> {
-            {
-                let _aidl_hash_lock = self.cached_hash.lock().expect("cached_hash poisoned");
-                if let ::core::option::Option::Some(ref _aidl_hash) = *_aidl_hash_lock {
-                    return ::std::boxed::Box::pin(::std::future::ready(::core::result::Result::Ok(_aidl_hash.clone())));
-                }
+            if let ::core::option::Option::Some(_aidl_hash) = self.cached_hash.get() {
+                return ::std::boxed::Box::pin(::std::future::ready(::core::result::Result::Ok(_aidl_hash.clone())));
             }
             let _aidl_data = match self.build_parcel_getInterfaceHash() {
                 ::core::result::Result::Ok(_aidl_data) => _aidl_data,

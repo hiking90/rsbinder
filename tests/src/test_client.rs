@@ -1421,7 +1421,7 @@ fn test_calling_v2_api_triggers_error() {
 // field truncation, unknown enumerator, unknown union field, and unknown
 // transaction across the version boundary. The forward-compat field
 // truncation relies on the per-field `has_more_data()` read guards.
-#[deny(clippy::unwrap_used)] // generated code ships into user lib crates (plans/13-no-unwrap-in-lib.md)
+#[deny(clippy::unwrap_used, clippy::expect_used)] // generated code ships into user lib crates (plans/13-no-unwrap-in-lib.md)
 mod trunk_v2_gen {
     include!(concat!(env!("OUT_DIR"), "/trunk_v2.rs"));
 }
@@ -1542,6 +1542,8 @@ fn test_trunk_stable_hash() {
         assert_eq!(TrunkV2::VERSION, 2);
         assert_eq!(TrunkV2::HASH, "notfrozen");
     }
+    // A later call answers from the proxy's cache with the same value.
+    assert_eq!(service.getInterfaceHash(), hash);
 }
 
 struct MyCallback {

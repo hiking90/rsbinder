@@ -678,15 +678,16 @@ This changelog starts at 0.9.0. For earlier releases, see the
   service for several interfaces). An `exec` start is outstanding for the
   process's lifetime, a `systemd` one until `systemctl --no-block start`
   returns. In 0.11.0 each name started its own.
-- **rsbinder-aidl generated code passes `clippy::unwrap_used` and
-  `clippy::allow_attributes_without_reason`.** An interface built with
-  `Builder::hash()` locks its hash cache with `expect("cached_hash poisoned")`
-  instead of `unwrap()` (a poisoned lock still panics), and every `allow` in a
-  generated module, in the `declare_binder_interface!` /
-  `declare_binder_enum!` expansions and in `#[derive(Parcelable)]` output on a
-  deprecated item, carries a `reason`. A crate that denies
-  either lint can now include the generated code. Output text changes
-  accordingly; behavior does not.
+- **rsbinder-aidl generated code passes `clippy::unwrap_used`,
+  `clippy::expect_used` and `clippy::allow_attributes_without_reason`.** The
+  proxy of an interface built with `Builder::hash()` keeps the remote hash in
+  a `std::sync::OnceLock<String>` instead of a `Mutex<Option<String>>`
+  locked with `unwrap()`, so the generated code takes no lock and has no
+  `unwrap`/`expect`. Every `allow` in a generated module, in the
+  `declare_binder_interface!` / `declare_binder_enum!` expansions and in
+  `#[derive(Parcelable)]` output on a deprecated item, carries a `reason`. A
+  crate that denies any of these lints can now include the generated code.
+  Output text changes accordingly; the hash a proxy returns does not.
 
 The behavior changes an existing program can observe are listed under
 *Migrating from 0.11.0* above.
