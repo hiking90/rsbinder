@@ -19,9 +19,7 @@
 //! current thread and that rule lives there.
 
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
 
 use crate::error::Result;
 
@@ -86,26 +84,22 @@ where
     })
 }
 
-/// One of two futures with the same output, for an `impl Future` method with two transports.
+/// One of two futures with the same output, awaited by [`Either::run`].
 pub(super) enum Either<A, B> {
     A(A),
     B(B),
 }
 
-impl<A, B, O> Future for Either<A, B>
+impl<A, B, O> Either<A, B>
 where
     A: Future<Output = O>,
     B: Future<Output = O>,
 {
-    type Output = O;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<O> {
-        // SAFETY: structural pinning; no variant moves out, no `Drop` impl, `Unpin` is automatic.
-        unsafe {
-            match self.get_unchecked_mut() {
-                Either::A(a) => Pin::new_unchecked(a).poll(cx),
-                Either::B(b) => Pin::new_unchecked(b).poll(cx),
-            }
+    /// Awaits the held future; the `async fn` state machine does the pinning.
+    pub(super) async fn run(self) -> O {
+        match self {
+            Either::A(a) => a.await,
+            Either::B(b) => b.await,
         }
     }
 }

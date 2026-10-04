@@ -280,8 +280,11 @@ fn resolve_peer(stream: &UnixStream) -> PeerIdentity {
     {
         // libc, not rustix `socket_peercred`: its `NonZeroI32` pid is UB for pid 0 (module doc).
         use std::os::fd::AsRawFd;
-        // SAFETY: `ucred` is three plain integers, for which all-zero is a valid value.
-        let mut uc: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut uc = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
         let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
         // SAFETY: `uc`/`len` are sized SO_PEERCRED out-params; `stream` keeps the fd open.
         let rc = unsafe {

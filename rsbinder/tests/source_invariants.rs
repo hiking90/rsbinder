@@ -7,8 +7,8 @@
 //! performed.
 //!
 //! Five remain: refuted prose, the one slot un-push, the files a
-//! byte-order primitive may appear in plus the `ParcelPod` membership
-//! list, the method surface of `CommandStream`, and the places a raw fd
+//! byte-order primitive may appear in, the method surface of
+//! `CommandStream`, and the places a raw fd
 //! number becomes an fd — each a closed set, not an enumeration of ways
 //! to get it wrong. The call sites of the layer split are not
 //! scanned: L2 is `src/command_stream.rs`'s `CommandStream`, whose
@@ -62,10 +62,8 @@
 //! # Byte order
 //!
 //! L1 (the parcel wire) is little-endian on every host while L2 (the `BC_*`/`BR_*` command
-//! stream) and L3 (the UAPI structs) are native, so
-//! `byte_order_primitives_and_pod_membership_stay_pinned` pins which files may spell a
-//! byte-order primitive — native, big-endian or little-endian — and which types `ParcelPod`
-//! admits to the raw-bytes view the three layers share.
+//! stream) and L3 (the UAPI structs) are native, so `byte_order_primitives_stay_pinned`
+//! pins which files may spell a byte-order primitive — native, big-endian or little-endian.
 //!
 //! # `CommandStream`
 //!
@@ -86,8 +84,8 @@
 //! the first two in `src/`, by file and enclosing `fn`, test code included,
 //! and allows none of the closes (any `io::close` or `libc::close` path,
 //! `use rustix::io::close` included). The two in `parcel.rs` are the driver-buffer
-//! adoption and the `from_ipc_parts` read; the rest take a number that does
-//! not come from a parcel (a vsock stream's own `into_raw_fd`, and a test's).
+//! adoption and the `from_ipc_parts` read; the third is a test taking back the
+//! number its own `into_raw_fd` released, which does not come from a parcel.
 //! A new site — a second adoption, or a close of an fd named by the
 //! bytes — must be argued for here.
 
@@ -322,9 +320,9 @@ fn enclosing_fn<'a>(lines: &[&'a str], line: usize) -> Option<&'a str> {
         .find(|l| l.starts_with("fn ") || (l.starts_with("pub") && l.contains(" fn ")))
 }
 
-/// Pins where byte-order primitives appear and `ParcelPod`'s members; see module doc "Byte order".
+/// Pins where byte-order primitives appear; see module doc "Byte order".
 #[test]
-fn byte_order_primitives_and_pod_membership_stay_pinned() {
+fn byte_order_primitives_stay_pinned() {
     let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     if !src_root.is_dir() {
         eprintln!("skipping: sources not reachable at {}", src_root.display());
@@ -343,11 +341,14 @@ fn byte_order_primitives_and_pod_membership_stay_pinned() {
             needle: "_ne_bytes",
             tree_wide: true,
             files: &[
-                // `NativeScalar`'s two methods + tests asserting what stays native (3) or
-                // hand-writing an L3 fd object (2).
-                ("parcel.rs", 7),
-                // Tests pinning where the L3 union's `handle` lies on either byte order.
-                ("binder_object.rs", 3),
+                // `NativeScalar`'s two methods + `Debug`'s offset-table dump (1) + tests
+                // asserting what stays native (3) or hand-writing an L3 fd object (2).
+                ("parcel.rs", 8),
+                // `FlatBinderObject`'s L3 codec and union accessors (10) + tests pinning its
+                // layout and where the union's `handle` lies on either byte order (6).
+                ("binder_object.rs", 16),
+                // `TransactionData`'s L3 codec and `target` accessors (15) + layout tests (8).
+                ("transaction_data.rs", 23),
                 // fd/memfd bookkeeping, never parcel wire.
                 ("shared_memory/mod.rs", 4),
             ],
@@ -359,10 +360,10 @@ fn byte_order_primitives_and_pod_membership_stay_pinned() {
             files: &[("file_descriptor.rs", 1)],
         },
         Pin {
-            // The `parcelable_struct!` arm: L3 structs in, L3 structs out.
+            // None anywhere: the L3 structs have field-by-field codecs, not a raw-bytes view.
             needle: "transmute::<[u8",
             tree_wide: true,
-            files: &[("parcelable.rs", 1)],
+            files: &[("parcelable.rs", 0)],
         },
         Pin {
             // L2 is native: an LE re-encode reaches the driver byte-swapped even via `write_cmd`.
@@ -381,12 +382,6 @@ fn byte_order_primitives_and_pod_membership_stay_pinned() {
             needle: "swap_bytes",
             tree_wide: false,
             files: &[("thread_state.rs", 0), ("command_stream.rs", 0)],
-        },
-        Pin {
-            // Raw-bytes types: a new one needs a padding/bit-validity audit (`ParcelPod`).
-            needle: "unsafe impl ParcelPod for",
-            tree_wide: true,
-            files: &[("parcel.rs", 4)],
         },
     ];
 
@@ -422,23 +417,9 @@ fn byte_order_primitives_and_pod_membership_stay_pinned() {
         }
     }
 
-    // Membership is this macro argument list, which the `unsafe impl` count cannot see.
-    let parcel_rs = fs::read_to_string(src_root.join("parcel.rs")).unwrap();
-    if !parcel_rs
-        .contains("impl_parcel_pod!(i8, u8, i16, u16, i32, u32, i64, u64, u128, f32, f64);")
-    {
-        failures.push(
-            "the `impl_parcel_pod!` argument list changed — re-audit padding and \
-             bit-validity before raising it (`usize`/`isize` are pointer-width, \
-             so their bytes are not the same width on every host)"
-                .to_string(),
-        );
-    }
-
     assert!(
         failures.is_empty(),
-        "a pinned byte-order primitive or the `ParcelPod` membership list \
-         moved — see this test's doc:\n{}",
+        "a pinned byte-order primitive moved — see this test's doc:\n{}",
         failures.join("\n")
     );
 }
@@ -457,8 +438,6 @@ fn raw_fd_numbers_become_fds_only_at_the_pinned_sites() {
         ("parcel.rs", "pub(crate) unsafe fn from_driver_buffer("),
         // A `from_ipc_parts` caller keeps each FD object's fd open (its `# Safety`).
         ("parcel.rs", "fn kernel_fd_at("),
-        // A vsock stream's own `into_raw_fd`.
-        ("hub/accessor_register.rs", "fn connect_vsock_owned_fd("),
         // A test taking back the fd `into_raw_fd` released.
         ("file_descriptor.rs", "fn test_parcel_file_descriptor("),
     ];

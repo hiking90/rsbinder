@@ -17,7 +17,7 @@
 //!
 //! - `publish_native` creates the entry with `publish_count = 0`; the
 //!   `Parcel::write_object` → `acquire` that immediately follows brings it to 1.
-//!   Between the two, `Parcel::write_aligned` can leave the entry unacquired
+//!   Between the two, `Parcel::write_aligned_data` can leave the entry unacquired
 //!   (`publish_count = 0`, `kernel_refs = 0`, still holding `Inner<T>`): by a
 //!   panic (typically OOM), or by `Err(BadValue)` when the write would end
 //!   past `i32::MAX` or `Err(PermissionDenied)` when it would overlap a
@@ -56,58 +56,71 @@
 //! `FLAT_BINDER_FLAG_SCHED_POLICY_VALUE_MASK` so it does not collide with the
 //! AOSP post-shift name.
 //!
-//! # Union initialisation
+//! # Layout and the union
 //!
-//! `new_handle` and `new_with_fd` zero the 8-byte `binder` field, then write
-//! the u32 `handle` over its first four bytes, as AOSP does
-//! (`obj.binder = 0; obj.handle = ...;`). The zeroing keeps uninitialised stack
-//! off the wire, since `write_object` copies the whole 24-byte struct. Writing
-//! the value through `binder` instead (`binder: handle as u64`) puts it where
-//! `handle` lies only on a little-endian host; on a big-endian one the handle
-//! reads as 0. `new_with_fd`
-//! also writes `flags = 0` as AOSP `Parcel::writeFileDescriptor` (kernel arm)
-//! does; the kernel ignores the field for FD objects (it rewrites the object
-//! on delivery), but the bytes match AOSP exactly.
+//! `FlatBinderObject` is the UAPI `struct flat_binder_object` held as plain
+//! fields, host-native (the driver parses it): the `__u32` header type, the
+//! `__u32` flags, the 8-byte `binder`/`handle` union, and the 8-byte cookie,
+//! at offsets 0, 4, 8 and 16 of 24 bytes. `to_bytes`/`from_bytes` copy those
+//! fields, and compile-time asserts tie the offsets to the bindgen struct.
 //!
-//! Writing only the u32 `handle` variant would leave the upper half
-//! uninitialised, an uninitialised read plus a 4-byte stack leak to the peer.
-//! For FD objects, a value such as `0x7F | ACCEPTS_FDS` (`0x17F`) breaks
-//! nothing functionally but diverges from AOSP, whose `writeFileDescriptor`
-//! bypasses `flattenBinder` and so writes no sched bits or `ACCEPTS_FDS`. An
-//! rsbinder↔rsbinder round trip cannot catch either, since both sides ignore
-//! those bytes, so `new_with_fd_flags_zero_and_full_width_init` and
-//! `new_handle_full_width_init` (which covers the `From<&SIBinder>` proxy arm)
-//! assert the AOSP bytes directly.
+//! The union is kept as its 8 bytes. `binder` is all of them; `handle` is the
+//! first four, so `set_handle` zeroes the eight and then writes the `u32` over
+//! the first four, as AOSP does (`obj.binder = 0; obj.handle = ...;`). That
+//! puts the handle where the driver reads it on either byte order, and the
+//! upper four bytes go out as zeros rather than stale data.
+//!
+//! `new_with_fd` also writes `flags = 0` as AOSP `Parcel::writeFileDescriptor`
+//! (kernel arm) does; the kernel ignores the field for FD objects (it rewrites
+//! the object on delivery), but the bytes match AOSP exactly. A value such as
+//! `0x7F | ACCEPTS_FDS` (`0x17F`) breaks nothing functionally but diverges from
+//! AOSP, whose `writeFileDescriptor` bypasses `flattenBinder` and so writes no
+//! sched bits or `ACCEPTS_FDS`. An rsbinder↔rsbinder round trip cannot catch
+//! that or a misplaced handle, since both sides agree with themselves, so
+//! `new_with_fd_flags_zero_and_full_width_init` and `new_handle_full_width_init`
+//! (which covers the `From<&SIBinder>` proxy arm) assert the AOSP bytes
+//! directly.
 
 use std::sync::Arc;
 
-pub(crate) use crate::sys::binder::flat_binder_object;
+use crate::sys::binder::{flat_binder_object, flat_binder_object__bindgen_ty_1};
 use crate::{binder::*, error::*, process_state, sys::*};
 
-impl Default for flat_binder_object {
-    /// Every field set explicitly: a safe alternative to `std::mem::zeroed()`.
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    assert!(size_of::<flat_binder_object>() == FlatBinderObject::SIZE);
+    assert!(offset_of!(flat_binder_object, flags) == 4);
+    assert!(offset_of!(flat_binder_object, __bindgen_anon_1) == 8);
+    assert!(size_of::<flat_binder_object__bindgen_ty_1>() == 8);
+    assert!(offset_of!(flat_binder_object, cookie) == 16);
+};
+
+/// UAPI `struct flat_binder_object`, host-native; see module doc "Layout and the union".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FlatBinderObject {
+    type_: u32,
+    pub(crate) flags: u32,
+    /// The `binder`/`handle` union as its bytes: `handle` is the first four.
+    object: [u8; 8],
+    pub(crate) cookie: binder_uintptr_t,
+}
+
+impl Default for FlatBinderObject {
     fn default() -> Self {
-        flat_binder_object {
-            hdr: binder_object_header {
-                type_: BINDER_TYPE_BINDER,
-            },
-            flags: 0,
-            __bindgen_anon_1: flat_binder_object__bindgen_ty_1 { binder: 0 },
-            cookie: 0,
-        }
+        Self::new_binder_with_flags(0)
     }
 }
 
-impl flat_binder_object {
+impl FlatBinderObject {
+    /// `sizeof(struct flat_binder_object)`.
+    pub(crate) const SIZE: usize = 24;
+
     pub(crate) fn new_with_fd(fd: i32, take_ownership: bool) -> Self {
-        let mut obj = flat_binder_object {
-            hdr: binder_object_header {
-                type_: BINDER_TYPE_FD,
-            },
+        let mut obj = FlatBinderObject {
+            type_: BINDER_TYPE_FD,
             // AOSP `writeFileDescriptor` bypasses `flattenBinder`: no schedBits, no ACCEPTS_FDS.
             flags: 0,
-            // Zeroed, then `handle` set: see module doc "Union initialisation".
-            __bindgen_anon_1: flat_binder_object__bindgen_ty_1 { binder: 0 },
+            object: [0; 8],
             cookie: if take_ownership { 1 } else { 0 },
         };
         obj.set_handle(fd as u32);
@@ -116,47 +129,79 @@ impl flat_binder_object {
 
     /// Creates a new flat_binder_object for a binder with the specified flags.
     pub(crate) fn new_binder_with_flags(flags: u32) -> Self {
-        flat_binder_object {
-            hdr: binder_object_header {
-                type_: BINDER_TYPE_BINDER,
-            },
+        FlatBinderObject {
+            type_: BINDER_TYPE_BINDER,
             flags,
-            __bindgen_anon_1: flat_binder_object__bindgen_ty_1 { binder: 0 },
+            object: [0; 8],
             cookie: 0,
         }
     }
 
     /// Creates a new flat_binder_object for a remote handle (`BINDER_TYPE_HANDLE`).
     pub(crate) fn new_handle(handle: u32, flags: u32) -> Self {
-        let mut obj = flat_binder_object {
-            hdr: binder_object_header {
-                type_: BINDER_TYPE_HANDLE,
-            },
+        let mut obj = FlatBinderObject {
+            type_: BINDER_TYPE_HANDLE,
             flags,
-            // Zeroed, then `handle` set: see module doc "Union initialisation".
-            __bindgen_anon_1: flat_binder_object__bindgen_ty_1 { binder: 0 },
+            object: [0; 8],
             cookie: 0,
         };
         obj.set_handle(handle);
         obj
     }
 
+    /// The 24 bytes the driver parses, host-native.
+    pub(crate) fn to_bytes(self) -> [u8; Self::SIZE] {
+        let mut bytes = [0; Self::SIZE];
+        bytes[0..4].copy_from_slice(&self.type_.to_ne_bytes());
+        bytes[4..8].copy_from_slice(&self.flags.to_ne_bytes());
+        bytes[8..16].copy_from_slice(&self.object);
+        bytes[16..24].copy_from_slice(&self.cookie.to_ne_bytes());
+        bytes
+    }
+
+    /// The object in 24 host-native bytes; any bytes are a value.
+    pub(crate) fn from_bytes(bytes: &[u8; Self::SIZE]) -> Self {
+        FlatBinderObject {
+            type_: u32::from_ne_bytes(bytes_at(bytes, 0)),
+            flags: u32::from_ne_bytes(bytes_at(bytes, 4)),
+            object: bytes_at(bytes, 8),
+            cookie: binder_uintptr_t::from_ne_bytes(bytes_at(bytes, 16)),
+        }
+    }
+
+    /// The bindgen struct, for an ioctl that takes one (`BINDER_SET_CONTEXT_MGR_EXT`).
+    pub(crate) fn to_uapi(self) -> flat_binder_object {
+        flat_binder_object {
+            hdr: binder_object_header { type_: self.type_ },
+            flags: self.flags,
+            // `binder` is all eight bytes, so this writes the union exactly as held.
+            __bindgen_anon_1: flat_binder_object__bindgen_ty_1 {
+                binder: self.pointer(),
+            },
+            cookie: self.cookie,
+        }
+    }
+
     pub(crate) fn header_type(&self) -> u32 {
-        self.hdr.type_
+        self.type_
     }
 
     pub(crate) fn handle(&self) -> u32 {
-        // SAFETY: integer union, every bit pattern valid; caller picks `.handle` by `hdr.type`.
-        unsafe { self.__bindgen_anon_1.handle }
+        let [h0, h1, h2, h3, ..] = self.object;
+        u32::from_ne_bytes([h0, h1, h2, h3])
     }
 
     pub(crate) fn set_handle(&mut self, handle: u32) {
-        self.__bindgen_anon_1.handle = handle
+        self.object = [0; 8];
+        self.object[..4].copy_from_slice(&handle.to_ne_bytes());
     }
 
     pub(crate) fn pointer(&self) -> binder_uintptr_t {
-        // SAFETY: integer union read (see `handle`); meaningful only for (WEAK_)BINDER objects.
-        unsafe { self.__bindgen_anon_1.binder }
+        binder_uintptr_t::from_ne_bytes(self.object)
+    }
+
+    fn set_pointer(&mut self, pointer: binder_uintptr_t) {
+        self.object = pointer.to_ne_bytes();
     }
 
     pub(crate) fn set_cookie(&mut self, cookie: binder_uintptr_t) {
@@ -164,7 +209,7 @@ impl flat_binder_object {
     }
 
     pub(crate) fn acquire(&self) -> Result<()> {
-        match self.hdr.type_ {
+        match self.type_ {
             BINDER_TYPE_BINDER => {
                 // publish_count += 1, paired 1:1 with `release`; module doc "Native binder ids".
                 if self.pointer() != 0 {
@@ -185,14 +230,14 @@ impl flat_binder_object {
                 Ok(())
             }
             _ => {
-                log::error!("Invalid object type {:08x}", self.hdr.type_);
+                log::error!("Invalid object type {:08x}", self.type_);
                 Err(StatusCode::InvalidOperation)
             }
         }
     }
 
     pub(crate) fn release(&self) -> Result<()> {
-        match self.hdr.type_ {
+        match self.type_ {
             BINDER_TYPE_BINDER => {
                 // publish_count -= 1; teardown rule: see module doc "Native binder ids".
                 if self.pointer() != 0 {
@@ -210,7 +255,7 @@ impl flat_binder_object {
             // The parcel's `kernel_fds` owns and closes the fd, never these bytes.
             BINDER_TYPE_FD => Ok(()),
             _ => {
-                log::error!("Invalid object type {:08x}", self.hdr.type_);
+                log::error!("Invalid object type {:08x}", self.type_);
                 Err(StatusCode::InvalidOperation)
             }
         }
@@ -228,7 +273,7 @@ fn sched_policy_mask(policy: u32, priority: u32) -> u32 {
             << FLAT_BINDER_FLAG_SCHED_POLICY_SHIFT)
 }
 
-impl From<&SIBinder> for flat_binder_object {
+impl From<&SIBinder> for FlatBinderObject {
     fn from(binder: &SIBinder) -> Self {
         let sched_bits = if !process_state::ProcessState::as_self().background_scheduling_disabled()
         {
@@ -239,7 +284,7 @@ impl From<&SIBinder> for flat_binder_object {
 
         if let Some(proxy) = binder.as_proxy() {
             // AOSP-correct `sched_bits`, not 0: see module doc "Scheduler bits". Do not "fix".
-            flat_binder_object::new_handle(proxy.handle(), sched_bits)
+            FlatBinderObject::new_handle(proxy.handle(), sched_bits)
         } else {
             // Native binder: wire id from the sidecar table; see module doc "Native binder ids".
             let id =
@@ -255,40 +300,40 @@ impl From<&SIBinder> for flat_binder_object {
                 sched_bits
             };
 
-            flat_binder_object {
-                hdr: binder_object_header {
-                    type_: BINDER_TYPE_BINDER,
-                },
-                flags: (local & !sched_mask) | effective_sched,
-                __bindgen_anon_1: flat_binder_object__bindgen_ty_1 { binder: id },
-                cookie: 0,
-            }
+            let mut obj =
+                FlatBinderObject::new_binder_with_flags((local & !sched_mask) | effective_sched);
+            obj.set_pointer(id);
+            obj
         }
     }
 }
 
-/// Copy a flat_binder_object out of `data` with `read_unaligned` (parcels are 4-byte aligned).
-pub(crate) fn read_flat_binder(data: &[u8], offset: usize) -> Result<flat_binder_object> {
-    let size = std::mem::size_of::<flat_binder_object>();
+/// Copy a flat_binder_object out of `data` at `offset`, which needs no alignment.
+pub(crate) fn read_flat_binder(data: &[u8], offset: usize) -> Result<FlatBinderObject> {
     let bytes = data
-        .get(offset..offset + size)
+        .get(offset..)
+        .and_then(<[u8]>::first_chunk::<{ FlatBinderObject::SIZE }>)
         .ok_or(StatusCode::NotEnoughData)?;
-    // SAFETY: `bytes` is exactly one object long; `#[repr(C)]` POD, any bit pattern valid.
-    Ok(unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const flat_binder_object) })
+    Ok(FlatBinderObject::from_bytes(bytes))
 }
 
-/// Writes a flat_binder_object to a potentially unaligned buffer position.
+/// The `N` bytes at `at`, for a codec reading fixed offsets of a fixed-size array.
+pub(crate) fn bytes_at<const N: usize>(bytes: &[u8], at: usize) -> [u8; N] {
+    let mut field = [0; N];
+    field.copy_from_slice(&bytes[at..at + N]);
+    field
+}
+
+/// Writes a flat_binder_object into `data` at `offset`, which needs no alignment.
 pub(crate) fn write_flat_binder(
     data: &mut [u8],
     offset: usize,
-    obj: &flat_binder_object,
+    obj: &FlatBinderObject,
 ) -> Result<()> {
-    let size = std::mem::size_of::<flat_binder_object>();
     let bytes = data
-        .get_mut(offset..offset + size)
+        .get_mut(offset..offset + FlatBinderObject::SIZE)
         .ok_or(StatusCode::NotEnoughData)?;
-    // SAFETY: `bytes` is exactly one object long; `write_unaligned` covers the parcel alignment.
-    unsafe { std::ptr::write_unaligned(bytes.as_mut_ptr() as *mut flat_binder_object, *obj) };
+    bytes.copy_from_slice(&obj.to_bytes());
     Ok(())
 }
 
@@ -307,7 +352,7 @@ mod tests {
     #[test]
     fn new_with_fd_flags_zero_and_full_width_init() {
         let fd: i32 = 7;
-        let obj = flat_binder_object::new_with_fd(fd, false);
+        let obj = FlatBinderObject::new_with_fd(fd, false);
 
         assert_eq!(obj.header_type(), BINDER_TYPE_FD, "must be a FD object");
 
@@ -334,7 +379,7 @@ mod tests {
     #[test]
     fn new_handle_full_width_init() {
         let handle: u32 = 0xDEAD_BEEF;
-        let obj = flat_binder_object::new_handle(handle, 0);
+        let obj = FlatBinderObject::new_handle(handle, 0);
 
         assert_eq!(
             obj.header_type(),
@@ -355,7 +400,21 @@ mod tests {
 
     #[test]
     fn new_with_fd_cookie_tracks_take_ownership() {
-        assert_eq!(flat_binder_object::new_with_fd(3, true).cookie, 1);
-        assert_eq!(flat_binder_object::new_with_fd(3, false).cookie, 0);
+        assert_eq!(FlatBinderObject::new_with_fd(3, true).cookie, 1);
+        assert_eq!(FlatBinderObject::new_with_fd(3, false).cookie, 0);
+    }
+
+    /// The bytes are the UAPI layout on either byte order, and they read back as the object.
+    #[test]
+    fn to_bytes_is_the_uapi_layout_and_round_trips() {
+        let mut obj = FlatBinderObject::new_handle(0xDEAD_BEEF, 0x17F);
+        obj.set_cookie(0x0102_0304_0506_0708);
+        let bytes = obj.to_bytes();
+        assert_eq!(bytes[0..4], BINDER_TYPE_HANDLE.to_ne_bytes());
+        assert_eq!(bytes[4..8], 0x17Fu32.to_ne_bytes());
+        assert_eq!(bytes[8..16], handle_bytes(0xDEAD_BEEF));
+        assert_eq!(bytes[16..24], 0x0102_0304_0506_0708u64.to_ne_bytes());
+        assert_eq!(FlatBinderObject::from_bytes(&bytes), obj);
+        assert_eq!(read_flat_binder(&bytes, 0), Ok(obj));
     }
 }

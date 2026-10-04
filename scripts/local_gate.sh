@@ -168,10 +168,10 @@ tier_hermetic() {
     run "clippy (workspace, all features)" cargo clippy --all-targets --all-features -- -D warnings
     run "rustdoc (all features)" env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
     run "rustdoc (default features)" env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-    if toolchain 1.85; then
-        run "MSRV 1.85 check (all features)" env RUSTFLAGS= cargo +1.85 check --workspace --all-features
+    if toolchain 1.86; then
+        run "MSRV 1.86 check (all features)" env RUSTFLAGS= cargo +1.86 check --workspace --all-features
     else
-        skip "MSRV 1.85 check" "rustup toolchain install 1.85"
+        skip "MSRV 1.86 check" "rustup toolchain install 1.86"
     fi
     run "test builds (workspace)" cargo test --workspace --no-run
     run "rsbinder-aidl" tpass cargo test -p rsbinder-aidl

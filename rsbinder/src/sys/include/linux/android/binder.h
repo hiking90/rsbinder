@@ -18,13 +18,11 @@
  *
  */
 
-#ifndef _LINUX_BINDER_H
-#define _LINUX_BINDER_H
+#ifndef _UAPI_LINUX_BINDER_H
+#define _UAPI_LINUX_BINDER_H
 
 #include <linux/types.h>
 #include <linux/ioctl.h>
-
-#include "binderfs.h"
 
 #define B_PACK_CHARS(c1, c2, c3, c4) \
 	((((c1)<<24)) | (((c2)<<16)) | (((c3)<<8)) | (c4))
@@ -40,9 +38,57 @@ enum {
 	BINDER_TYPE_PTR		= B_PACK_CHARS('p', 't', '*', B_TYPE_LARGE),
 };
 
-enum {
+/**
+ * enum flat_binder_object_shifts: shift values for flat_binder_object_flags
+ * @FLAT_BINDER_FLAG_SCHED_POLICY_SHIFT: shift for getting scheduler policy.
+ *
+ */
+enum flat_binder_object_shifts {
+	FLAT_BINDER_FLAG_SCHED_POLICY_SHIFT = 9,
+};
+
+/**
+ * enum flat_binder_object_flags - flags for use in flat_binder_object.flags
+ */
+enum flat_binder_object_flags {
+	/**
+	 * @FLAT_BINDER_FLAG_PRIORITY_MASK: bit-mask for min scheduler priority
+	 *
+	 * These bits can be used to set the minimum scheduler priority
+	 * at which transactions into this node should run. Valid values
+	 * in these bits depend on the scheduler policy encoded in
+	 * @FLAT_BINDER_FLAG_SCHED_POLICY_MASK.
+	 *
+	 * For SCHED_NORMAL/SCHED_BATCH, the valid range is between [-20..19]
+	 * For SCHED_FIFO/SCHED_RR, the value can run between [1..99]
+	 */
 	FLAT_BINDER_FLAG_PRIORITY_MASK = 0xff,
+	/**
+	 * @FLAT_BINDER_FLAG_ACCEPTS_FDS: whether the node accepts fds.
+	 */
 	FLAT_BINDER_FLAG_ACCEPTS_FDS = 0x100,
+
+	/**
+	 * @FLAT_BINDER_FLAG_SCHED_POLICY_MASK: bit-mask for scheduling policy
+	 *
+	 * These two bits can be used to set the min scheduling policy at which
+	 * transactions on this node should run. These match the UAPI
+	 * scheduler policy values, eg:
+	 * 00b: SCHED_NORMAL
+	 * 01b: SCHED_FIFO
+	 * 10b: SCHED_RR
+	 * 11b: SCHED_BATCH
+	 */
+	FLAT_BINDER_FLAG_SCHED_POLICY_MASK =
+		3U << FLAT_BINDER_FLAG_SCHED_POLICY_SHIFT,
+
+	/**
+	 * @FLAT_BINDER_FLAG_INHERIT_RT: whether the node inherits RT policy
+	 *
+	 * Only when set, calls into this node will inherit a real-time
+	 * scheduling policy from the caller (for synchronous transactions).
+	 */
+	FLAT_BINDER_FLAG_INHERIT_RT = 0x800,
 
 	/**
 	 * @FLAT_BINDER_FLAG_TXN_SECURITY_CTX: request security contexts
@@ -238,19 +284,43 @@ struct binder_frozen_status_info {
 	__u32            async_recv;
 };
 
-#define BINDER_WRITE_READ		_IOWR('b', 1, struct binder_write_read)
-#define BINDER_SET_IDLE_TIMEOUT		_IOW('b', 3, __s64)
-#define BINDER_SET_MAX_THREADS		_IOW('b', 5, __u32)
-#define BINDER_SET_IDLE_PRIORITY	_IOW('b', 6, __s32)
-#define BINDER_SET_CONTEXT_MGR		_IOW('b', 7, __s32)
-#define BINDER_THREAD_EXIT		_IOW('b', 8, __s32)
-#define BINDER_VERSION			_IOWR('b', 9, struct binder_version)
-#define BINDER_GET_NODE_DEBUG_INFO	_IOWR('b', 11, struct binder_node_debug_info)
-#define BINDER_GET_NODE_INFO_FOR_REF	_IOWR('b', 12, struct binder_node_info_for_ref)
-#define BINDER_SET_CONTEXT_MGR_EXT	_IOW('b', 13, struct flat_binder_object)
-#define BINDER_FREEZE			_IOW('b', 14, struct binder_freeze_info)
-#define BINDER_GET_FROZEN_INFO		_IOWR('b', 15, struct binder_frozen_status_info)
-#define BINDER_ENABLE_ONEWAY_SPAM_DETECTION	_IOW('b', 16, __u32)
+struct binder_frozen_state_info {
+	binder_uintptr_t cookie;
+	__u32            is_frozen;
+	__u32            reserved;
+};
+
+/* struct binder_extened_error - extended error information
+ * @id:		identifier for the failed operation
+ * @command:	command as defined by binder_driver_return_protocol
+ * @param:	parameter holding a negative errno value
+ *
+ * Used with BINDER_GET_EXTENDED_ERROR. This extends the error information
+ * returned by the driver upon a failed operation. Userspace can pull this
+ * data to properly handle specific error scenarios.
+ */
+struct binder_extended_error {
+	__u32	id;
+	__u32	command;
+	__s32	param;
+};
+
+enum {
+	BINDER_WRITE_READ		= _IOWR('b', 1, struct binder_write_read),
+	BINDER_SET_IDLE_TIMEOUT		= _IOW('b', 3, __s64),
+	BINDER_SET_MAX_THREADS		= _IOW('b', 5, __u32),
+	BINDER_SET_IDLE_PRIORITY	= _IOW('b', 6, __s32),
+	BINDER_SET_CONTEXT_MGR		= _IOW('b', 7, __s32),
+	BINDER_THREAD_EXIT		= _IOW('b', 8, __s32),
+	BINDER_VERSION			= _IOWR('b', 9, struct binder_version),
+	BINDER_GET_NODE_DEBUG_INFO	= _IOWR('b', 11, struct binder_node_debug_info),
+	BINDER_GET_NODE_INFO_FOR_REF	= _IOWR('b', 12, struct binder_node_info_for_ref),
+	BINDER_SET_CONTEXT_MGR_EXT	= _IOW('b', 13, struct flat_binder_object),
+	BINDER_FREEZE			= _IOW('b', 14, struct binder_freeze_info),
+	BINDER_GET_FROZEN_INFO		= _IOWR('b', 15, struct binder_frozen_status_info),
+	BINDER_ENABLE_ONEWAY_SPAM_DETECTION	= _IOW('b', 16, __u32),
+	BINDER_GET_EXTENDED_ERROR	= _IOWR('b', 17, struct binder_extended_error),
+};
 
 /*
  * NOTE: Two special error codes you should check for when calling
@@ -273,6 +343,8 @@ enum transaction_flags {
 	TF_STATUS_CODE	= 0x08,	/* contents are a 32-bit status code */
 	TF_ACCEPT_FDS	= 0x10,	/* allow replies with file descriptors */
 	TF_CLEAR_BUF	= 0x20,	/* clear buffer on txn complete */
+	TF_UPDATE_TXN	= 0x40,	/* update the outdated pending async txn */
+	TF_DEFER_COMPLETE = 0x80,	/* defer transaction complete to userspace */
 };
 
 struct binder_transaction_data {
@@ -290,8 +362,8 @@ struct binder_transaction_data {
 
 	/* General information about the transaction. */
 	__u32	        flags;
-	pid_t		sender_pid;
-	uid_t		sender_euid;
+	__kernel_pid_t	sender_pid;
+	__kernel_uid32_t	sender_euid;
 	binder_size_t	data_size;	/* number of bytes of data */
 	binder_size_t	offsets_size;	/* number of bytes of offsets */
 
@@ -328,7 +400,7 @@ struct binder_ptr_cookie {
 struct binder_handle_cookie {
 	__u32 handle;
 	binder_uintptr_t cookie;
-} __attribute__((packed));
+} __packed;
 
 struct binder_pri_desc {
 	__s32 priority;
@@ -435,7 +507,7 @@ enum binder_driver_return_protocol {
 
 	BR_FROZEN_REPLY = _IO('r', 18),
 	/*
-	 * The target of the last transaction (either a bcTRANSACTION or
+	 * The target of the last sync transaction (either a bcTRANSACTION or
 	 * a bcATTEMPT_ACQUIRE) is frozen.  No parameters.
 	 */
 
@@ -444,6 +516,22 @@ enum binder_driver_return_protocol {
 	 * Current process sent too many oneway calls to target, and the last
 	 * asynchronous transaction makes the allocated async buffer size exceed
 	 * detection threshold.  No parameters.
+	 */
+
+	BR_TRANSACTION_PENDING_FROZEN = _IO('r', 20),
+	/*
+	 * The target of the last async transaction is frozen.  No parameters.
+	 */
+
+	BR_FROZEN_BINDER = _IOR('r', 21, struct binder_frozen_state_info),
+	/*
+	 * The cookie and a boolean (is_frozen) that indicates whether the process
+	 * transitioned into a frozen or an unfrozen state.
+	 */
+
+	BR_CLEAR_FREEZE_NOTIFICATION_DONE = _IOR('r', 22, binder_uintptr_t),
+	/*
+	 * void *: cookie
 	 */
 };
 
@@ -528,7 +616,26 @@ enum binder_driver_command_protocol {
 	/*
 	 * binder_transaction_data_sg: the sent command.
 	 */
+
+	BC_REQUEST_FREEZE_NOTIFICATION =
+			_IOW('c', 19, struct binder_handle_cookie),
+	/*
+	 * int: handle
+	 * void *: cookie
+	 */
+
+	BC_CLEAR_FREEZE_NOTIFICATION = _IOW('c', 20,
+					    struct binder_handle_cookie),
+	/*
+	 * int: handle
+	 * void *: cookie
+	 */
+
+	BC_FREEZE_NOTIFICATION_DONE = _IOW('c', 21, binder_uintptr_t),
+	/*
+	 * void *: cookie
+	 */
 };
 
-#endif /* _LINUX_BINDER_H */
+#endif /* _UAPI_LINUX_BINDER_H */
 

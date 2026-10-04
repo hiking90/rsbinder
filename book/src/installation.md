@@ -3,10 +3,10 @@
 ## Prerequisites
 
 ### Rust Version Requirements
-**rsbinder** requires Rust 1.85 or later. Ensure you have the latest stable Rust toolchain:
+**rsbinder** requires Rust 1.86 or later. Ensure you have the latest stable Rust toolchain:
 ```bash
 $ rustup update stable
-$ rustc --version  # Should be 1.85+
+$ rustc --version  # Should be 1.86+
 ```
 
 ## Enable binder for Linux

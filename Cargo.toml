@@ -23,7 +23,7 @@ authors = ["Jeff Kim <hiking90@gmail.com>"]
 homepage = "https://hiking90.github.io/rsbinder/"
 repository = "https://github.com/hiking90/rsbinder"
 documentation = "https://docs.rs/rsbinder"
-rust-version = "1.85"
+rust-version = "1.86"
 
 keywords = ["android", "binder", "aidl", "linux"]
 
@@ -57,7 +57,7 @@ thiserror = "2"
 # (and the `futures` dep) — every gated test is a sync `#[test]`.
 #
 # Held at 3.x: 4.0 declares `rust-version = 1.93.1`, above this workspace's
-# 1.85, and the `rust_min` CI job builds dev-dependencies.
+# 1.86, and the `rust_min` CI job builds dev-dependencies.
 serial_test = { version = "3", default-features = false }
 # `rsbinder`'s optional `tracing` feature (AIDL transaction spans). No
 # `attributes`: nothing here uses `#[instrument]`, and it would add a

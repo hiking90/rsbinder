@@ -147,7 +147,7 @@
 //! "alive" level (>= 1) so `attempt_inc_*` succeeds: `SIBinder::from_arc`'s
 //! `inc_strong` sets that at creation and `SIBinder::Drop`'s
 //! `dec_strong(None)` releases it at removal. `publish_count` follows
-//! `flat_binder_object::acquire` / `release`, called from
+//! `FlatBinderObject::acquire` / `release`, called from
 //! `Parcel::write_object`, `Parcel::append_from` and `Parcel::release_objects`.
 //! `kernel_refs` rises on `BR_INCREFS` / `BR_ACQUIRE` and falls on
 //! `BR_RELEASE` / `BR_DECREFS`, deferred through `pending_*_derefs` and
@@ -166,7 +166,7 @@
 //! the one where a clone's whole `acquire`..`release` lifetime nests inside a
 //! single dedup's `publish_native`..`acquire` gap; that gap is two adjacent
 //! statements with no blocking call. Closing it fully would need an "is-dedup"
-//! flag threaded into `flat_binder_object::acquire`, a `binder_object.rs`
+//! flag threaded into `FlatBinderObject::acquire`, a `binder_object.rs`
 //! protocol change.
 //!
 //! `publish_native` takes one write lock for dedup and insert and dedups by
@@ -177,8 +177,8 @@
 //! and `RefCounter.weak` 0→1 through an explicit `inc_weak`; that table-held
 //! +1 keeps both counts above zero, so user-side increments and decrements
 //! never reach the count→0 closure path. `publish_count` starts at 0 and the
-//! `Parcel::write_object` → `flat_binder_object::acquire` right after brings
-//! it to 1. The only leak path is a `Parcel::write_aligned` failure between
+//! `Parcel::write_object` → `FlatBinderObject::acquire` right after brings
+//! it to 1. The only leak path is a `Parcel::write_aligned_data` failure between
 //! `From<&SIBinder>` returning and that `acquire()`: a panic (typically OOM),
 //! `Err(BadValue)` when the write would end past `i32::MAX`, or
 //! `Err(PermissionDenied)` when it would overlap a recorded object.
@@ -752,7 +752,7 @@ impl ProcessState {
         if selinux_available() {
             flags |= binder::FLAT_BINDER_FLAG_TXN_SECURITY_CTX;
         }
-        let obj = binder::flat_binder_object::new_binder_with_flags(flags);
+        let obj = crate::binder_object::FlatBinderObject::new_binder_with_flags(flags).to_uapi();
 
         if binder::set_context_mgr_ext(&self.driver, obj).is_err() {
             if let Err(e) = binder::set_context_mgr(&self.driver, 0) {
@@ -1081,7 +1081,7 @@ impl ProcessState {
                         entry.publish_count > 0,
                         "decref_publish on id {id} with publish_count == 0 \
                          (unpaired release; check From<&SIBinder> ↔ \
-                         flat_binder_object::release pairing)"
+                         FlatBinderObject::release pairing)"
                     );
                     entry.publish_count = entry.publish_count.saturating_sub(1);
                     entry.publish_count == 0

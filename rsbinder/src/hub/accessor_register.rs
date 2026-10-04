@@ -253,14 +253,9 @@ fn connect_vsock_owned_fd(
     cid: u32,
     port: u32,
 ) -> std::result::Result<OwnedFd, AccessorConnectError> {
-    use std::os::fd::IntoRawFd;
     use vsock::{VsockAddr, VsockStream};
     match VsockStream::connect(&VsockAddr::new(cid, port)) {
-        Ok(stream) => {
-            let raw = stream.into_raw_fd();
-            // SAFETY: `raw` is fresh from `into_raw_fd`, so this `OwnedFd` is its sole owner.
-            Ok(unsafe { OwnedFd::from_raw_fd(raw) })
-        }
+        Ok(stream) => Ok(OwnedFd::from(stream)),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             Err(AccessorConnectError::ConnectFailedEacces)
         }
@@ -295,9 +290,6 @@ fn connect_inet_owned_fd(
 ) -> std::result::Result<OwnedFd, AccessorConnectError> {
     Err(AccessorConnectError::UnsupportedFamily)
 }
-
-#[cfg(feature = "rpc-vsock")]
-use std::os::fd::FromRawFd;
 
 // --- `LocalAccessor` (`BnAccessor` impl) -------
 

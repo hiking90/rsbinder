@@ -17,6 +17,12 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Migrating from 0.11.0
 
+- **Minimum supported Rust version is now 1.86** (was 1.85). The local-binder
+  cast `Binder::<B>::try_from(SIBinder)` (behind `FromIBinder::try_from` and
+  `SIBinder::into_interface`) now downcasts the `Arc` through trait upcasting
+  instead of reinterpreting a raw pointer, which needs 1.86. Results are
+  unchanged: a remote proxy, another `Remotable` type, or an `IBinder` wrapper
+  that forwards `as_any()` to a local binder still fails with `BadValue`.
 - **`Endpoint::Kernel` gained an `mmap_size` field** (see *Added*). It is not
   `#[non_exhaustive]`, so a struct literal or a `match` arm naming every field
   no longer compiles; add `mmap_size: None` for the previous behavior. Matching
