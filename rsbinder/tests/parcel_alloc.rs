@@ -18,6 +18,14 @@
 //! a running `rsb_hub` and `test_service` (see `tests/README.md`), so it is
 //! `#[ignore]`d: `cargo test -p rsbinder --test parcel_alloc -- --ignored`.
 
+#![cfg_attr(
+    target_os = "android",
+    allow(
+        clippy::missing_const_for_thread_local,
+        reason = "android-only false positive, even on thread_locals already using `const { .. }`"
+    )
+)]
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
