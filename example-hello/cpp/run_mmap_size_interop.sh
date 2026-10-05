@@ -79,7 +79,7 @@ echo "==> building the C++ client (NDK)"
 
 echo "==> cross-compiling the rsbinder service (mmap_probe)"
 ( cd "$REPO_ROOT" && ANDROID_NDK_HOME="$NDK" \
-    cargo ndk -t "$TRIPLE" -p "$API" build --release -p tests --bin mmap_probe )
+    cargo ndk -t "$TRIPLE" --platform "$API" build --release -p tests --bin mmap_probe )
 
 echo "==> pushing artifacts"
 "${ADB[@]}" root >/dev/null 2>&1 || true

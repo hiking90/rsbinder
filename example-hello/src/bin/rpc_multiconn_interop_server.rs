@@ -10,7 +10,7 @@
 //!
 //! ```text
 //! ANDROID_NDK_HOME=/opt/homebrew/share/android-ndk \
-//!     cargo ndk -t arm64-v8a -p 36 build -p example-hello \
+//!     cargo ndk -t arm64-v8a --platform 36 build -p example-hello \
 //!         --features rpc --bin rpc_multiconn_interop_server
 //! adb -s emulator-5556 push <bin> /data/local/tmp/rsmc_srv
 //! adb -s emulator-5556 shell /data/local/tmp/rsmc_srv \

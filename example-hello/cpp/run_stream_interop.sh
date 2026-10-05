@@ -155,7 +155,7 @@ echo "==> building the libfmq peer (NDK clang, AOSP libfmq sources, device libbi
 
 echo "==> cross-compiling the rsbinder half"
 ( cd "$REPO_ROOT" && ANDROID_NDK_HOME="$NDK" \
-    cargo ndk -t "$TRIPLE" -p "$API" build --release -p tests --bin stream_probe )
+    cargo ndk -t "$TRIPLE" --platform "$API" build --release -p tests --bin stream_probe )
 
 echo "==> pushing artifacts"
 "${ADB[@]}" root >/dev/null 2>&1 || true

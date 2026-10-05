@@ -37,7 +37,7 @@
 # On an Android device or emulator, against the platform's own
 # servicemanager and its driver:
 #
-#   cargo ndk -t x86_64-linux-android -p 35 build -p tests --bin stream_probe
+#   cargo ndk -t x86_64-linux-android --platform 35 build -p tests --bin stream_probe
 #   ./tests/scripts/run_stream_ac.sh --adb [-s <serial>] [--target <triple>]
 #
 # Needs a userdebug image: `adb root` for the cases that register a

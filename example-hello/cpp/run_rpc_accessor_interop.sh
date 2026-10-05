@@ -76,7 +76,7 @@ echo "==> building C++ launcher (NDK)"
 
 echo "==> cross-compiling rsbinder client"
 ( cd "$REPO_ROOT" && ANDROID_NDK_HOME="$NDK" \
-    cargo ndk -t "$TRIPLE" -p "$API" build --release -p example-hello \
+    cargo ndk -t "$TRIPLE" --platform "$API" build --release -p example-hello \
         --features rpc,android_16 \
         --bin rpc_accessor_interop_client )
 

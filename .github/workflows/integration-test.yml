@@ -548,8 +548,10 @@ jobs:
         # test binary was "not executable" on it and never ran.
         targets: x86_64-linux-android
 
+    # Pinned like build.yml. The API level is passed as `--platform`, which 3
+    # and 4 both accept; 4 reads a bare `-p` as cargo's package flag.
     - name: Install cargo-ndk
-      run: cargo install cargo-ndk
+      run: cargo install cargo-ndk --version "^3.0"
 
     - name: Enable KVM group perms
       run: |

@@ -66,7 +66,7 @@ echo "==> [1/5] building the C++ client (NDK only)"
     -o "$CPP_DIR/codegen_shapes_interop"
 
 echo "==> [2/5] cross-building the rsbinder service"
-(cd "$TOP_DIR" && cargo ndk -t "$TRIPLE" -p "$API" build \
+(cd "$TOP_DIR" && cargo ndk -t "$TRIPLE" --platform "$API" build \
     --bin codegen_shapes_interop_service >/dev/null)
 
 echo "==> [3/5] pushing to $REMOTE"

@@ -151,9 +151,9 @@ $ cargo run --bin hello_client
 ### Cross compile to Android device
 Please follow the [cargo-ndk](https://github.com/bbqsrc/cargo-ndk) guide, linking for API 29 (Android 10, the oldest supported platform) or newer:
 ```
-$ cargo ndk -t aarch64-linux-android -p 29 build --release
+$ cargo ndk -t aarch64-linux-android --platform 29 build --release
 ```
-Without `-p`, cargo-ndk links for API 21 and the build fails with an undefined libc symbol. See [Android Build](book/src/android-build.md).
+Without `--platform`, cargo-ndk links for API 21 and the build fails with an undefined libc symbol. See [Android Build](book/src/android-build.md).
 
 ## Compatibility Goal with Android Binder
 

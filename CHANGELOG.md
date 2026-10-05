@@ -450,9 +450,9 @@ This changelog starts at 0.9.0. For earlier releases, see the
   the driver for the caller's context. Under Smack or AppArmor 0.11.0 returned
   the label, read on to the next NUL byte.
 - **Android builds must link for API 29 (Android 10, the oldest supported
-  platform) or newer: pass `-p 29` to `cargo ndk`.** rsbinder now calls
-  bionic's `process_vm_readv`, which cargo-ndk's default API 21 does not
-  export, so a build without `-p` fails with `undefined symbol:
+  platform) or newer: pass `--platform 29` to `cargo ndk`.** rsbinder now
+  calls bionic's `process_vm_readv`, which cargo-ndk's default API 21 does
+  not export, so a build without it fails with `undefined symbol:
   process_vm_readv`. 0.11.0 linked at API 21.
 
 ### Added

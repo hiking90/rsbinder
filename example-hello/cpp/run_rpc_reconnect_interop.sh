@@ -75,7 +75,7 @@ OUT="$REPO_ROOT/target/rpc_reconnect_interop"
 
 echo "==> cross-compiling rsbinder client"
 ( cd "$REPO_ROOT" && ANDROID_NDK_HOME="$NDK" \
-    cargo ndk -t "$TRIPLE" -p "$API" build --release -p example-hello \
+    cargo ndk -t "$TRIPLE" --platform "$API" build --release -p example-hello \
         --features rpc --bin rpc_reconnect_interop_client )
 
 echo "==> pushing binaries"

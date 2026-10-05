@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! ANDROID_NDK_HOME=/opt/homebrew/share/android-ndk \
-//!     cargo ndk -t arm64-v8a -p 36 build -p example-hello \
+//!     cargo ndk -t arm64-v8a --platform 36 build -p example-hello \
 //!         --features rpc,android_16 --bin rpc_accessor_interop_client
 //! adb -s emulator-5556 push <bin> /data/local/tmp/rsacc_client
 //! adb -s emulator-5556 shell /data/local/tmp/rsacc_client \

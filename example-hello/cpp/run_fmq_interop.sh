@@ -165,7 +165,7 @@ echo "==> building the C++ half (NDK clang, AOSP libfmq sources, device libbinde
 
 echo "==> cross-compiling the rsbinder half"
 ( cd "$REPO_ROOT" && ANDROID_NDK_HOME="$NDK" \
-    cargo ndk -t "$TRIPLE" -p "$API" build --release -p tests --bin fmq_probe )
+    cargo ndk -t "$TRIPLE" --platform "$API" build --release -p tests --bin fmq_probe )
 
 echo "==> pushing artifacts"
 "${ADB[@]}" root >/dev/null 2>&1 || true
