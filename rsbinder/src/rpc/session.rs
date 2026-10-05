@@ -1776,6 +1776,20 @@ impl Drop for OpenCall<'_> {
     }
 }
 
+/// Activity this session's sockets do not see: a stream ring whose items cross shared memory
+/// (plan 10-7c B7). Counts like a read on a session with an idle timeout, else nothing.
+#[derive(Clone)]
+pub(crate) struct SessionActivity(Arc<SharedSession>);
+
+impl SessionActivity {
+    /// One lock-free load where no idle timeout is set (every client session, most servers).
+    pub(crate) fn bump(&self) {
+        if self.0.serve_read_deadline.load(Ordering::Relaxed) != 0 {
+            self.0.io_gen.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// `RawTransportIo` that bumps `io_gen` on each read that moved bytes (module doc "Idle").
 struct CountedIo<'a>(RawTransportIo<'a>, &'a AtomicU64);
 
@@ -2607,6 +2621,11 @@ impl RpcSessionInner {
             .iter()
             .filter(|s| s.role == callback_role)
             .count()
+    }
+
+    /// A handle that counts a stream ring's traffic toward this session's idle check.
+    pub(crate) fn ring_activity(&self) -> SessionActivity {
+        SessionActivity(self.shared.clone())
     }
 
     /// This session's `TransportCaps` now; `RpcSession::caps` states what each bit means here.

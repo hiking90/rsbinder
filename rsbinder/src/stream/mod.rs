@@ -1440,7 +1440,7 @@ impl<T: Deserialize> Receiver<T> {
     ) -> Result<(Self, StreamEndpoint<T>)> {
         let (inner, ring, sink, death) = if over_ring(peer, policy) {
             let (consumer, ring, sink) = ring::Consumer::new(policy)?;
-            consumer.ping_peer(peer, policy.ping);
+            consumer.set_peer(peer, policy.ping);
             let death = watch_death(peer, consumer.death_recipient())?;
             (ReceiverInner::Ring(consumer), Some(ring), sink, death)
         } else {

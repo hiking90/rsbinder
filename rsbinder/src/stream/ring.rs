@@ -125,6 +125,9 @@ struct Shared {
     end: Mutex<Option<Status>>,
     /// The other end's binder and whether a quiet wait pings it; only an RPC proxy is pinged.
     ping: std::sync::OnceLock<(SIBinder, PingPolicy)>,
+    /// Over RPC, the session's idle check, which sees none of the ring's traffic (plan 10-7c B7).
+    #[cfg(feature = "rpc")]
+    activity: std::sync::OnceLock<crate::rpc::session::SessionActivity>,
 }
 
 impl Shared {
@@ -138,6 +141,8 @@ impl Shared {
             abandoned: AtomicBool::new(false),
             end: Mutex::new(None),
             ping: std::sync::OnceLock::new(),
+            #[cfg(feature = "rpc")]
+            activity: std::sync::OnceLock::new(),
         }
     }
 
@@ -145,10 +150,31 @@ impl Shared {
         self.queue.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The other end's binder: pinged under `policy` when quiet, and over RPC the session whose
+    /// idle check the ring's traffic counts toward.
+    fn set_other_end(&self, other: &SIBinder, policy: PingPolicy) {
+        let _ = self.ping.set((other.clone(), policy));
+        #[cfg(feature = "rpc")]
+        if let Some(proxy) = (**other).as_any().downcast_ref::<crate::rpc::RpcProxy>() {
+            let _ = self.activity.set(proxy.session_activity());
+        }
+    }
+
+    /// Count as activity on an RPC session with an idle timeout: a ring that flows is not idle
+    /// for lack of socket traffic, and a wait shorter than the timeout keeps it so.
+    fn bump_activity(&self) {
+        #[cfg(feature = "rpc")]
+        if let Some(activity) = self.activity.get() {
+            activity.bump();
+        }
+    }
+
     /// Wait on `mask` until `deadline`. Over an RPC session whose reply deadline is set, a third
     /// of it gone quiet pings the peer first and returns `Ok(0)` for the caller to look again;
     /// an unanswered ping ends the session, and the death link the wait (plan 2-24 D9).
     fn park(&self, mask: u32, deadline: Option<Instant>) -> rsbinder_fmq::Result<u32> {
+        // A wait shorter than the idle timeout keeps a slow stream alive; a stalled one is idle.
+        self.bump_activity();
         let ping = self
             .ping
             .get()
@@ -232,6 +258,7 @@ impl Shared {
                 if reserved {
                     queue.commit_write_cached(n).map_err(WriteFailure::broken)?;
                     drop(queue);
+                    self.bump_activity();
                     // Committed is delivered: libfmq's `writeBlocking` ignores a failed wake too.
                     if let Err(e) = wake_after_commit(&self.flag, NOT_EMPTY) {
                         log::error!("stream: the wake after a committed record failed: {e:?}");
@@ -622,7 +649,7 @@ impl<T: Serialize + ?Sized> Producer<T> {
         // `require_event_flag` above makes this `Some`.
         let flag = queue.event_flag().ok_or(StatusCode::InvalidOperation)?;
         let shared = Shared::new(queue, flag, capacity);
-        let _ = shared.ping.set((sink.clone(), policy.ping));
+        shared.set_other_end(sink, policy.ping);
         let shared = Arc::new(shared);
         let death = watch_death(sink, ProducerDeath(shared.clone()))?;
         Ok(Producer {
@@ -1120,9 +1147,9 @@ impl<T: Deserialize> Consumer<T> {
         self.sink_binder.clone()
     }
 
-    /// The producer's binder, which a quiet wait pings over RPC under `policy`.
-    pub(super) fn ping_peer(&self, peer: &SIBinder, policy: PingPolicy) {
-        let _ = self.shared.ping.set((peer.clone(), policy));
+    /// The producer's binder: pinged over RPC under `policy`, and its session's idle check fed.
+    pub(super) fn set_peer(&self, peer: &SIBinder, policy: PingPolicy) {
+        self.shared.set_other_end(peer, policy);
     }
 
     /// A recipient for the producer's death.
@@ -1344,6 +1371,7 @@ impl<T: Deserialize> Consumer<T> {
             .and_then(|()| queue.commit_read(available).map_err(StatusCode::from))
             .map_err(|e| format!("the ring's counters: {e:?}"))?;
         drop(queue);
+        self.shared.bump_activity();
         self.at = 0;
         self.filled = available;
         // The one point room is made; `StreamEndpoint.aidl` lets a multi-record read wake once.

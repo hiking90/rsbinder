@@ -295,6 +295,7 @@ struct Setup {
     /// Negotiate the `Unix` fd mode, so the session passes file descriptors.
     fd_unix: bool,
     upload_ring_use: RingUse,
+    server_idle: Option<Duration>,
 }
 
 /// A unix relay that stops forwarding with connections left open, as a silent `adb forward` does.
@@ -449,6 +450,7 @@ fn fixture_with(tag: &str, incoming: u32, setup: Setup) -> Fixture {
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(2);
     server.set_reply_timeout(setup.server_reply_timeout);
+    server.set_idle_timeout(setup.server_idle);
     if setup.fd_unix {
         server.set_supported_fd_modes(&[FileDescriptorTransportMode::Unix]);
     }
@@ -1267,4 +1269,182 @@ fn a_closed_session_ends_an_rpc_ring_stream_on_both_sides() {
     eventually("the producer must see the consumer's death", || {
         f.svc.last_error.load(Ordering::SeqCst) == dead
     });
+}
+
+// ---- AC-C13: a ring stream and the server's idle timeout ----
+//
+// Ring only: on calls a producer's items wait in its batch until it fills, flushes or ends, so
+// "flowing" there depends on the batch size, which these tests do not pick for that path.
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod idle {
+    use super::*;
+
+    /// The server's idle timeout: a session with no activity for between this and twice it ends.
+    const IDLE: Duration = Duration::from_millis(200);
+
+    /// A ring-capable session whose server has an idle timeout and takes uploads on a ring.
+    fn idle_fixture(tag: &str, idle: Duration, server_reply_timeout: Option<Duration>) -> Fixture {
+        fixture_with(
+            tag,
+            1,
+            Setup {
+                fd_unix: true,
+                upload_ring_use: RingUse::AlsoUnixRpc,
+                server_idle: Some(idle),
+                server_reply_timeout,
+                ..Setup::default()
+            },
+        )
+    }
+
+    /// The server produces `count` items `gap` apart; the items, or how the stream failed.
+    fn spaced_download(f: &Fixture, count: i32, gap: Duration) -> Result<Vec<i32>, Status> {
+        let (mut rx, endpoint) =
+            Receiver::<i32>::with_policy(&f.demo.as_binder(), &opted_in()).expect("a receiver");
+        assert_eq!(rx.uses_ring(), RING);
+        f.demo
+            .r#subscribe(
+                &endpoint,
+                count,
+                64,
+                default_credits(),
+                gap.as_micros() as i32,
+            )
+            .expect("subscribe");
+        let mut got = Vec::new();
+        loop {
+            match rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(Some(item)) => got.push(item),
+                Ok(None) if rx.is_finished() => return Ok(got),
+                Ok(None) => panic!("no item for 10 s after {}", got.len()),
+                Err(status) => return Err(status),
+            }
+        }
+    }
+
+    /// The client produces `count` items `gap` apart into the server's ring; the server's verdict.
+    fn spaced_upload(f: &Fixture, count: i32, gap: Duration) -> (i32, i32) {
+        let token = Token::new();
+        let endpoint = f.demo.r#upload(&token.binder(), 64 * 1024).expect("upload");
+        assert_eq!(endpoint.ring.is_some(), RING);
+        let mut sink = Sink::<i32>::open(&endpoint).expect("open");
+        for item in 0..count {
+            if sink.send(&item).is_err() {
+                break;
+            }
+            thread::sleep(gap);
+        }
+        let _ = sink.end();
+        eventually("the server's receiver must finish", || {
+            f.svc.upload_finished.load(Ordering::SeqCst)
+        });
+        (
+            f.svc.uploaded.load(Ordering::SeqCst),
+            f.svc.upload_error.load(Ordering::SeqCst),
+        )
+    }
+
+    /// AC-C13 (1): items that keep flowing on the ring are activity, though no byte crosses the
+    /// socket, whichever end the server is.
+    #[test]
+    fn a_flowing_ring_stream_outlives_the_servers_idle_timeout() {
+        let f = idle_fixture("idle_flow_dl", IDLE, None);
+        let started = Instant::now();
+        let got = spaced_download(&f, 2500, Duration::from_millis(1)).expect("a clean end");
+        assert_eq!(got, (0..2500).collect::<Vec<_>>());
+        assert!(started.elapsed() > 4 * IDLE, "ran {:?}", started.elapsed());
+
+        let f = idle_fixture("idle_flow_up", IDLE, None);
+        assert_eq!(spaced_upload(&f, 2500, Duration::from_millis(1)), (2500, 0));
+    }
+
+    /// AC-C13 (2): a stream slower than a record now and then, but faster than the timeout, stays.
+    #[test]
+    fn a_slow_ring_stream_inside_the_idle_timeout_stays_alive() {
+        let idle = Duration::from_secs(1);
+        let f = idle_fixture("idle_slow_dl", idle, None);
+        let got = spaced_download(&f, 8, Duration::from_millis(300)).expect("a clean end");
+        assert_eq!(got, (0..8).collect::<Vec<_>>());
+
+        let f = idle_fixture("idle_slow_up", idle, None);
+        assert_eq!(spaced_upload(&f, 8, Duration::from_millis(300)), (8, 0));
+    }
+
+    /// AC-C13 (3): a stalled ring stream is idle, so the server's timeout still ends it — a client
+    /// cannot hold a server's thread by opening a ring and going quiet.
+    #[test]
+    fn a_stalled_ring_stream_is_ended_by_the_idle_timeout() {
+        let dead = i32::from(rsbinder::StatusCode::DeadObject);
+
+        // The server produces into a small ring nobody reads, and parks.
+        let f = idle_fixture("idle_stall_dl", IDLE, None);
+        let (rx, endpoint) = Receiver::<i32>::with_policy(
+            &f.demo.as_binder(),
+            &ReceiverPolicy {
+                ring_use: RingUse::AlsoUnixRpc,
+                ring_bytes: 4096,
+                credit_window: 1,
+                ..ReceiverPolicy::default()
+            },
+        )
+        .expect("a receiver");
+        f.demo
+            .r#subscribe(&endpoint, 1_000_000, 4, 1, 0)
+            .expect("subscribe");
+        assert_eq!(producer_outcome(&f, Duration::from_secs(5)), Some(dead));
+        drop(rx);
+
+        // The server consumes from a client that wrote one item and stopped.
+        let f = idle_fixture("idle_stall_up", IDLE, None);
+        let token = Token::new();
+        let endpoint = f.demo.r#upload(&token.binder(), 64 * 1024).expect("upload");
+        let mut sink = Sink::<i32>::open(&endpoint).expect("open");
+        sink.send(&0).expect("send");
+        eventually("the idle session must end the server's receiver", || {
+            f.svc.upload_finished.load(Ordering::SeqCst)
+        });
+        assert_eq!(f.svc.upload_error.load(Ordering::SeqCst), dead);
+        drop(sink);
+    }
+
+    /// AC-C13 (4): with pinging on (a server reply deadline), a stalled ring stream is not idle:
+    /// each ping is a call.
+    #[test]
+    fn a_stalled_ring_stream_that_pings_survives_the_idle_timeout() {
+        let reply = Some(Duration::from_millis(300));
+
+        let f = idle_fixture("idle_ping_dl", IDLE, reply);
+        let (rx, endpoint) = Receiver::<i32>::with_policy(
+            &f.demo.as_binder(),
+            &ReceiverPolicy {
+                ring_use: RingUse::AlsoUnixRpc,
+                ring_bytes: 4096,
+                credit_window: 1,
+                ..ReceiverPolicy::default()
+            },
+        )
+        .expect("a receiver");
+        f.demo
+            .r#subscribe(&endpoint, 1_000_000, 4, 1, 0)
+            .expect("subscribe");
+        assert_eq!(producer_outcome(&f, Duration::from_millis(1500)), None);
+        drop(rx);
+
+        let f = idle_fixture("idle_ping_up", IDLE, reply);
+        let token = Token::new();
+        let endpoint = f.demo.r#upload(&token.binder(), 64 * 1024).expect("upload");
+        let mut sink = Sink::<i32>::open(&endpoint).expect("open");
+        sink.send(&0).expect("send");
+        thread::sleep(Duration::from_millis(1500));
+        assert!(
+            !f.svc.upload_finished.load(Ordering::SeqCst),
+            "the server's receiver pings the client and stays"
+        );
+        sink.end().expect("end");
+        eventually("the upload ends once the client ends it", || {
+            f.svc.upload_finished.load(Ordering::SeqCst)
+        });
+        assert_eq!(f.svc.upload_error.load(Ordering::SeqCst), 0);
+    }
 }
