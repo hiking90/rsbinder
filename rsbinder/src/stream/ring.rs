@@ -227,6 +227,8 @@ struct Transit {
     state: Mutex<TransitState>,
     /// Written under `state`'s lock; read without it on the fast path.
     in_transit: std::sync::atomic::AtomicBool,
+    /// `unreported` or `broken` was ever set; never cleared, so while it is down neither is.
+    flagged: std::sync::atomic::AtomicBool,
     idle: Condvar,
     #[cfg(feature = "tokio")]
     notify: tokio::sync::Notify,
@@ -261,6 +263,13 @@ impl Transit {
 
     fn mark_broken(&self, e: StatusCode) {
         self.lock().broken.get_or_insert(e);
+        self.flagged.store(true, Ordering::SeqCst);
+    }
+
+    /// Nothing to wait out and nothing ever left to report: the owner may skip the lock.
+    fn quiet(&self) -> bool {
+        // `settle` raises `flagged` before it lowers `in_transit`, so this order sees both.
+        !self.in_transit.load(Ordering::SeqCst) && !self.flagged.load(Ordering::SeqCst)
     }
 
     /// The token is done: leave `failure` for the next call; `lost` = its item did not go in.
@@ -276,6 +285,7 @@ impl Transit {
                 if broken {
                     state.broken.get_or_insert(e);
                 }
+                self.flagged.store(true, Ordering::SeqCst);
             }
             self.in_transit.store(false, Ordering::SeqCst);
         }
@@ -555,10 +565,12 @@ impl<T: Serialize + ?Sized> Producer<T> {
     pub(super) fn send(&mut self, item: &T, deadline: Option<Instant>) -> Result<()> {
         self.encode(item)?;
         // A pool record goes in first, and its unreported failure is returned before any write.
-        if !self.transit.wait_idle_until(deadline) {
-            return Err(StatusCode::TimedOut);
+        if !self.transit.quiet() {
+            if !self.transit.wait_idle_until(deadline) {
+                return Err(StatusCode::TimedOut);
+            }
+            self.reported()?;
         }
-        self.reported()?;
         self.write_item(self.scratch.as_bytes()?, Wait::from_deadline(deadline))
             .map(|_| ())
     }
@@ -654,6 +666,9 @@ impl<T: ?Sized> Producer<T> {
 
     /// The error that broke the ring, if one has.
     fn usable(&self) -> Result<()> {
+        if !self.transit.flagged.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         self.transit.broken().map_or(Ok(()), Err)
     }
 
@@ -2123,6 +2138,56 @@ mod tests {
             producer.join().expect("producer").err(),
             Some(StatusCode::TimedOut),
             "`end` reports the failure the record left"
+        );
+        runtime.shutdown_timeout(Duration::from_secs(5));
+    }
+
+    /// What a dropped `send_async` left is returned by the next `send`, though the ring has room.
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn a_failure_a_dropped_send_async_left_is_returned_by_the_next_send() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .expect("runtime");
+        let (mut tx, mut rx) = pair::<i32>(512);
+        let fill = item_records(512) as i32;
+        for item in 0..fill {
+            tx.send(&item, None).expect("fills the ring");
+        }
+        runtime.block_on(async {
+            let mut pending = std::pin::pin!(tx.send_async(&-1, Some(Duration::from_millis(50))));
+            let polled = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(pending.as_mut().poll(cx).is_pending())
+            })
+            .await;
+            assert!(polled, "no room, so the record went to the pool");
+        });
+        assert!(tx
+            .transit
+            .wait_idle_until(Some(Instant::now() + Duration::from_secs(5))));
+        assert!(
+            !tx.transit.quiet(),
+            "the settled failure keeps `send` off the fast path"
+        );
+        assert_eq!(rx.recv().expect("item").expect("ok"), 0);
+        assert_eq!(
+            tx.send(&fill, None).err(),
+            Some(StatusCode::TimedOut),
+            "the failure is reported before a write that now fits"
+        );
+        tx.send(&fill, None).expect("reported once");
+        end(tx).expect("the end fits the reserve");
+        for expected in 1..=fill {
+            assert_eq!(rx.recv().expect("item").expect("ok"), expected);
+        }
+        let ended = rx.recv().expect("the end").expect_err("not a clean end");
+        assert!(
+            ended
+                .message()
+                .unwrap_or_default()
+                .contains("1 queued item"),
+            "the timed-out record is still counted: {ended:?}"
         );
         runtime.shutdown_timeout(Duration::from_secs(5));
     }
