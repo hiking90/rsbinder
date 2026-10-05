@@ -520,11 +520,13 @@ above. A session missing any of these — vsock, TCP, TLS, no fd mode, no incomi
 connection — gets calls, and a `log::debug!` line names what was missing;
 `uses_ring` tells which one a stream got. The ring needs Linux or Android.
 
-Which to choose is a matter of item size. Measured on x86-64, a ring moves
-items of a kilobyte or more several times faster than calls, while calls are
-faster for small items (`i32`, 64-byte records), where the ring's per-record
-work outweighs a batched call. On an arm64 Android emulator the ring was as
-fast as calls for `i32` and faster above.
+Which to choose is a matter of item size. Measured on x86-64 over a Unix
+session, calls with 16 KiB batches were faster for items up to 128 bytes
+(2.6 times for `i32`, 1.6 times at 64 bytes, 1.2 times at 128), where the ring's
+per-record work outweighs a batched call; from 192 bytes on the ring was faster,
+1.5 times at 256 bytes, 3 times at a kilobyte and over 4 times at 16 KiB. From
+128 bytes on the ring also used less CPU. On an arm64 Android emulator the ring
+was as fast as calls for `i32` and faster above.
 
 The producer has to implement the ring over RPC; rsbinder's does, and nothing
 changes on its side. A producer written to the RPC-only contract refuses the

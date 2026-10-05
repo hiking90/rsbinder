@@ -393,9 +393,10 @@ pub struct ReceiverPolicy {
     /// Whether an RPC peer may get a ring. Default
     /// [`RingUse::KernelOnly`].
     ///
-    /// The ring is several times faster for items of a kilobyte and more,
-    /// and costs a memfd and a mapping on each side to set up; over an RPC
-    /// session the calls path is faster for small items on x86-64.
+    /// The ring costs a memfd and a mapping on each side to set up. Over an
+    /// RPC session on x86-64 the calls path is faster for items up to about
+    /// 128 bytes and the ring above that, several times so from a kilobyte;
+    /// see the book's "A ring over a Unix session" for the measurements.
     pub ring_use: RingUse,
 }
 
