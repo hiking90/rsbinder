@@ -497,6 +497,14 @@ This changelog starts at 0.9.0. For earlier releases, see the
   (sealed memfd), `descriptor()`, `attach` with an `AttachPolicy`,
   `write_blocking` / `read_blocking` and `EventFlag`. Synchronized flavor
   only; Linux and Android. Validated against libfmq on an Android emulator.
+  For a writer that keeps to the one-writer rule,
+  `begin_write_cached` / `commit_write_cached` take the write position from
+  the writer's own view and reload the read counter only when the view shows
+  no room (each reload checked); a peer that rewrites the write counter is no
+  longer detected by that writer. `EventFlag::wake_lazy` skips the write to
+  the word when the bits already stand; `wait` fences after consuming its
+  bits so a lazy waker's counter store is seen (loom model in
+  `tests/loom_event_flag.rs`).
   Every access to the shared memory — counters, ring and EventFlag word — is
   a Rust atomic (ring copies are relaxed `AtomicU8` / `AtomicUsize` loads and
   stores), so a second writer or reader, whether the peer, another handle in
@@ -525,7 +533,11 @@ This changelog starts at 0.9.0. For earlier releases, see the
   `endpoint.try_clone()?`). `Sink::open_borrowed` opens a sink of the item
   type's borrowed form — `Sink<str>` from a `StreamEndpoint<String>`.
   Kernel binder uses an FMQ ring the consumer allocates; RPC uses the
-  `oneway` `IStreamSink` / `IStreamSource` with credits. Configured through
+  `oneway` `IStreamSink` / `IStreamSource` with credits. On the ring the
+  consumer copies every committed record out at once and frees the space
+  with one wake, and both ends look at the ring for up to 20 µs before
+  parking on its futex (not on a single core, never on an async executor
+  thread); each `send` still puts its item in the ring. Configured through
   `SinkPolicy` (incl. `send_timeout`) and `ReceiverPolicy`; async variants
   with `tokio`. On RPC a waiting end pings a peer it has not heard from for a
   third of the session's reply deadline (`PingPolicy`, twoway
@@ -650,8 +662,8 @@ This changelog starts at 0.9.0. For earlier releases, see the
   `to_bytes` hands back the parcel's own buffer when that is at most twice
   the value's size. A stream batch decodes from the bytes it received without
   copying them. Over a kernel-binder ring, a stream producer encodes each item
-  into a buffer it keeps from item to item, and the consumer decodes it in the
-  buffer it read the record into, where each side used to allocate per item.
+  into a buffer it keeps from item to item, and the consumer decodes every
+  item through one parcel it keeps, where each side used to allocate per item.
   An item `send_async` hands to the pool on a full ring takes that buffer
   with it, so the producer allocates a new one for the next item.
   An android-13+ RPC message's 16-byte header is read into a

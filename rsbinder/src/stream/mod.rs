@@ -110,6 +110,12 @@
 //! after the opening call no call goes from consumer to producer at all.
 //! A full ring parks the producer on the ring's futex until the consumer
 //! reads; an empty ring parks the consumer until the producer writes.
+//! Before parking, a blocking call looks at the ring for up to 20 µs
+//! (not on a single-core machine, and never on an async executor thread),
+//! since a park costs a futex wake on the other side. The consumer copies
+//! every record the producer has committed out of the ring at once and
+//! frees the space with one wake. Each [`send`](Sink::send) still puts
+//! its item in the ring before it returns.
 //! The ring's size is the whole of the flow control
 //! ([`ReceiverPolicy::ring_bytes`]), and it bounds the largest item:
 //! `ring_bytes - `[`END_RESERVE`]` - 4`. The layout is in
@@ -297,6 +303,11 @@ pub struct ReceiverPolicy {
     /// Default 64 KiB: sixteen pages, the same in-flight bound as four
     /// 16 KiB batches on the RPC path. A producer accepts a ring up to
     /// [`SinkPolicy::max_ring_bytes`].
+    ///
+    /// Once the ring holds a few of the largest items, a larger one mainly
+    /// lets the producer run further ahead: both ends look at the ring
+    /// briefly before parking, so they rarely wait on each other. A ring
+    /// that holds only one or two such items makes them alternate.
     pub ring_bytes: usize,
     /// RPC: how many drained batches the consumer lets go unpaid before
     /// it grants. A grant leaves once half this window is owed — or the

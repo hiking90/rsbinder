@@ -171,7 +171,10 @@ shrinking and charged to its own process — and the producer maps. Each item
 is one record written in place: a 4-byte header (kind bit plus payload
 length) followed by the item's parcel bytes. A full ring parks the producer on
 the ring's futex until the consumer reads; an empty ring parks the consumer
-until the producer writes. **After the opening call no binder call carries
+until the producer writes. Before parking, a blocking call looks at the ring
+for up to 20 µs (not on a single-core machine, never on an async executor
+thread), and the consumer copies every record the producer has committed out
+at once and frees the space with one wake. **After the opening call no binder call carries
 anything in either direction**: the end of the stream is the last record, and
 a cancel is a bit in the ring's EventFlag word. The `sink` binder is still in
 the endpoint, but the producer only links to it for death.
@@ -249,7 +252,10 @@ record always has room; the largest item is therefore
 ring. The memory is allocated up front and charged to the consumer's process.
 The default of 64 KiB is sixteen pages, the same in-flight bound as four
 16 KiB batches on the RPC path; the producer's `max_ring_bytes` protects its
-own address space against a consumer that describes a ring of any size.
+own address space against a consumer that describes a ring of any size. Once
+the ring holds a few of the largest items, a larger ring mainly lets the
+producer run further ahead; one that holds only one or two makes the two ends
+take turns.
 
 **Over RPC** credit is counted in `onBatch` calls. The producer opens with a
 window of credit, spends one per batch, and waits when it has none; the
@@ -568,7 +574,8 @@ the details in `StreamEndpoint.aidl`:
   may already have written.
 - Wake the other side after every read and every write, as `libfmq` itself
   does, not only on a full-to-not-full change: a waiter may need room for more
-  than one record.
+  than one record. A read that takes several records at once may wake once
+  for all of them, as rsbinder's consumer does.
 - As the producer, load `getEventFlagWord()` before each item record and stop
   on `CANCEL` (`libfmq` has no peek), and remember a cancel your wait returned:
   the wait consumes the bit.
