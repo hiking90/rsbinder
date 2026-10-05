@@ -1461,34 +1461,36 @@ mod two_process {
     struct Server {
         child: Child,
         _stdout: BufReader<ChildStdout>,
-        path: PathBuf,
     }
 
     impl Server {
         fn kill(&mut self) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            // A child under another uid (`su`, plan 10-7c B6) refuses the signal; waiting
+            // for it then would never return.
+            if self.child.kill().is_ok() {
+                let _ = self.child.wait();
+            }
         }
     }
 
     impl Drop for Server {
         fn drop(&mut self) {
             self.kill();
-            let _ = std::fs::remove_file(&self.path);
         }
     }
 
     /// The child server and a client session to it that can carry a ring.
+    ///
+    /// An abstract socket: no file whose SELinux label a client in another domain must be
+    /// allowed to write (plan 10-7c B6).
     fn serve(tag: &str) -> (Server, RpcSession, Strong<dyn IStreamDemo>) {
-        let mut path = std::env::temp_dir();
-        path.push(format!("rsb_stream_2p_{tag}_{}.sock", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let name = format!("rsb_stream_2p_{tag}_{}", std::process::id());
         // `STREAM_PROBE_BIN` on a device, where the build-time path does not exist.
         let probe = std::env::var("STREAM_PROBE_BIN")
             .unwrap_or_else(|_| env!("CARGO_BIN_EXE_stream_probe").to_string());
         let mut child = Command::new(probe)
             .arg("serve-rpc-ring")
-            .arg(&path)
+            .arg(format!("@{name}"))
             .stdout(Stdio::piped())
             .spawn()
             .expect("spawn stream_probe");
@@ -1500,10 +1502,9 @@ mod two_process {
         let server = Server {
             child,
             _stdout: stdout,
-            path,
         };
         let client = RpcSession::setup_client_android13plus_with_config(
-            RpcClientConfig::unix(&server.path, 2)
+            RpcClientConfig::unix_abstract(name.as_bytes(), 2)
                 .incoming_connections(1)
                 .fd_mode(FileDescriptorTransportMode::Unix),
         )

@@ -45,7 +45,9 @@
 //! every session's reply deadline, which also arms the stream ping.
 //! `serve-rpc-ring` also takes the `Unix` fd mode and gives an upload a
 //! ring, for `tests/stream_rpc.rs` to run a ring over RPC between two
-//! processes (plan 10-7c AC-C5).
+//! processes (plan 10-7c AC-C5). A `socketPath` of `@name` is the abstract
+//! socket `name` (Linux, Android): no file for SELinux to check, so a client
+//! in another domain can reach it.
 
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
@@ -240,6 +242,12 @@ fn serve(name: &str) -> Result<()> {
 /// `ring`: also take the `Unix` fd mode and give uploads a ring (plan 10-7c Phase B).
 #[cfg(feature = "rpc")]
 fn serve_rpc(path: &str, reply_timeout: Option<Duration>, ring: bool) -> Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let server = match path.strip_prefix('@') {
+        Some(name) => rsbinder::rpc::RpcServer::setup_unix_server_abstract(name.as_bytes())?,
+        None => rsbinder::rpc::RpcServer::setup_unix_server(path)?,
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let server = rsbinder::rpc::RpcServer::setup_unix_server(path)?;
     server.set_android13plus(2);
     // Every session's deadline, and so the period of the producer's pings (plan 2-24 D9).
