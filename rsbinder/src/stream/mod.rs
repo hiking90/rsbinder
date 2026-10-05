@@ -621,6 +621,45 @@ fn peer_caps(binder: &SIBinder) -> crate::TransportCaps {
     crate::TransportCaps::KERNEL
 }
 
+/// Floor under a third of a tiny reply deadline, so a sub-3 ms deadline cannot spin the wait.
+#[cfg(feature = "rpc")]
+const MIN_PING_INTERVAL: Duration = Duration::from_millis(1);
+
+/// Whom a wait pings once it has gone `every` without a wake (plan 2-24 D9).
+struct Ping {
+    peer: SIBinder,
+    every: Duration,
+}
+
+impl Ping {
+    /// `None` when `policy` is off, `peer` is no RPC proxy, or its session has no deadline.
+    fn to(peer: &SIBinder, policy: PingPolicy) -> Option<Ping> {
+        if policy == PingPolicy::Off {
+            return None;
+        }
+        #[cfg(feature = "rpc")]
+        if let Some(proxy) = (**peer).as_any().downcast_ref::<crate::rpc::RpcProxy>() {
+            // Read per wait: a server sets a session's deadline only after the session exists.
+            let every = (proxy.session_timeout()? / 3).max(MIN_PING_INTERVAL);
+            return Some(Ping {
+                peer: peer.clone(),
+                every,
+            });
+        }
+        #[cfg(not(feature = "rpc"))]
+        let _ = peer;
+        None
+    }
+
+    /// Unanswered within the reply deadline, it ends the session, and the death link the stream.
+    fn send(&self) {
+        match self.peer.ping_binder() {
+            Ok(()) | Err(StatusCode::DeadObject) => {}
+            Err(e) => log::warn!("stream: pinging the peer failed: {e:?}"),
+        }
+    }
+}
+
 /// A ring needs one kernel driver (or process) for both ends plus OS shared memory and futex.
 fn over_ring(peer: &SIBinder) -> bool {
     cfg!(any(target_os = "linux", target_os = "android"))
