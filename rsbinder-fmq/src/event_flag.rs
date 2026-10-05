@@ -109,10 +109,14 @@ impl EventFlag {
     ///
     /// A libfmq waiter (C++) has no fence between its `fetch_and` and its
     /// counter loads, so the C++ memory model alone does not promise the
-    /// pattern with it. The hardware does on x86 and x86-64, where the
-    /// locked RMW is a full barrier, and on AArch64, where the RMW's release
-    /// store is not reordered with a later acquire load. Other targets are
-    /// not checked; use [`wake`](Self::wake) where such a waiter may run.
+    /// pattern with it. The code compilers emit for that waiter does, on the
+    /// targets checked: x86 and x86-64 (the locked RMW is a full barrier),
+    /// AArch64 (the RMW's release store is not reordered with a later
+    /// acquire load), 32-bit ARM (`dmb ish` after the `ldrex`/`strex` loop)
+    /// and RISC-V 64 (`amoand.w.aqrl`, sequentially consistent). Other
+    /// targets are not checked; POWER's mapping (`hwsync; lwarx/stwcx.;
+    /// isync`) does not order the RMW's store before a later load. Use
+    /// [`wake`](Self::wake) where such a waiter may run.
     pub fn wake_lazy(&self, bits: u32) -> Result<()> {
         fence(Ordering::SeqCst);
         if bits != 0 && self.word().load(Ordering::Relaxed) & bits == bits {

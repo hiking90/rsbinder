@@ -77,7 +77,9 @@ fn wake_after_commit(flag: &EventFlag, bits: u32) -> rsbinder_fmq::Result<()> {
     if cfg!(any(
         target_arch = "x86_64",
         target_arch = "x86",
-        target_arch = "aarch64"
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "riscv64"
     )) {
         flag.wake_lazy(bits)
     } else {
