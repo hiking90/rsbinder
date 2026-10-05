@@ -899,19 +899,41 @@ impl crate::DeathRecipient for ConsumerDeath {
     }
 }
 
-/// A ring endpoint's sink binder, a death link only; RPC-contract calls are logged and dropped.
-struct RingSink;
+/// A ring endpoint's sink binder, a death link only. A producer that sends items by the RPC
+/// contract instead ends the stream, rather than have them vanish.
+struct RingSink(Weak<Shared>);
+
+impl RingSink {
+    /// End with `EX_ILLEGAL_STATE` (records already in the ring still come first) and stop the producer.
+    fn refuse(&self, call: &str) {
+        log::error!(
+            "stream: {call} on a ring endpoint; the producer ignored the ring, ending the stream"
+        );
+        let Some(shared) = self.0.upgrade() else {
+            return;
+        };
+        let message =
+            format!("the producer called {call} on a ring endpoint; items go in the ring");
+        shared.set_end(
+            Status::from((ExceptionCode::IllegalState, message.as_str())),
+            false,
+        );
+        let _ = shared.flag.wake(CANCEL);
+        // The consumer's own mask, so a `recv` parked on an empty ring sees the end.
+        let _ = shared.flag.wake(NOT_EMPTY);
+    }
+}
 
 impl Interface for RingSink {}
 
 impl IStreamSink for RingSink {
     fn r#onStart(&self, _source: &SIBinder, _credits: i32) -> BinderResult<()> {
-        log::warn!("stream: ignoring onStart on a ring endpoint; the items travel on the ring");
+        self.refuse("onStart");
         Ok(())
     }
 
     fn r#onBatch(&self, _items: &[u8], _count: i32) -> BinderResult<()> {
-        log::warn!("stream: ignoring onBatch on a ring endpoint; the items travel on the ring");
+        self.refuse("onBatch");
         Ok(())
     }
 
@@ -1037,7 +1059,7 @@ impl<T: Deserialize> Consumer<T> {
         // `create(_, true)` makes the word.
         let flag = queue.event_flag().ok_or(StatusCode::InvalidOperation)?;
         let shared = Arc::new(Shared::new(queue, flag, capacity));
-        let sink_binder = BnStreamSink::new_binder(RingSink).as_binder();
+        let sink_binder = BnStreamSink::new_binder(RingSink(Arc::downgrade(&shared))).as_binder();
         let consumer = Consumer {
             shared,
             transit: Arc::new(Transit::default()),
@@ -1878,6 +1900,47 @@ mod tests {
             }
         }
         assert_eq!(producer.join().expect("producer"), expected);
+    }
+
+    /// Plan 10-7c AC-C14: an RPC-contract call on a ring endpoint's sink ends the stream after
+    /// what is already in the ring, as `EX_ILLEGAL_STATE`, and stops the producer.
+    #[test]
+    fn a_calls_contract_call_on_a_ring_sink_ends_the_stream() {
+        for call in ["onStart", "onBatch"] {
+            let (mut tx, mut rx) = pair::<i32>(512);
+            tx.send(&1, None).expect("send");
+            let sink = <dyn IStreamSink as crate::FromIBinder>::try_from(rx.sink_binder())
+                .expect("the endpoint's sink");
+            match call {
+                "onStart" => sink.r#onStart(&rx.sink_binder(), 1),
+                _ => sink.r#onBatch(&[0; 4], 1),
+            }
+            .expect("a oneway call is not refused");
+            assert!(tx.is_canceled(), "{call}: the producer is told to stop");
+            assert_eq!(tx.send(&2, None).err(), Some(StatusCode::InvalidOperation));
+            assert_eq!(
+                rx.recv().expect("item").expect("ok"),
+                1,
+                "{call}: the ring first"
+            );
+            let ended = rx.recv().expect("the end").expect_err("not a clean end");
+            assert_eq!(
+                ended.exception_code(),
+                ExceptionCode::IllegalState,
+                "{call}"
+            );
+            assert!(
+                ended.message().unwrap_or_default().contains(call),
+                "{call}: {ended:?}"
+            );
+            // The producer's own end record does not turn it into a clean end.
+            end(tx).expect("end after cancel");
+            assert!(rx.recv().is_none());
+            assert_eq!(
+                rx.end_status().expect("ended").exception_code(),
+                ExceptionCode::IllegalState
+            );
+        }
     }
 
     /// A producer that writes one item and stops: the wait for a batch gives up at once.
