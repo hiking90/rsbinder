@@ -553,8 +553,8 @@ jobs:
         key: ${{ matrix.target }}-${{ env.rust_min }} # Add rust_min to cache key as it's specific now
     # --platform 29: the oldest supported Android; cargo-ndk's default (21) lacks process_vm_readv.
     - name: Build for Android (${{ matrix.target }})
-      run: cargo ndk -t ${{ matrix.target }} --platform 29build --release
+      run: cargo ndk -t ${{ matrix.target }} --platform 29 build --release
     - name: Check test builds for Android (${{ matrix.target }})
       run: |
-        cargo ndk -t ${{ matrix.target }} --platform 29test --no-run
+        cargo ndk -t ${{ matrix.target }} --platform 29 test --no-run
 
