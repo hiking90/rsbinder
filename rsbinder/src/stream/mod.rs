@@ -537,8 +537,9 @@ impl Default for SinkPolicy {
 /// again.
 ///
 /// Only a wait pings: [`Receiver::recv`] and its variants waiting for an
-/// item, once the producer has introduced itself, and a [`Sink`] call
-/// waiting for credit. A stream whose items flow never pings, and an end
+/// item — on calls once the producer has introduced itself, on a ring the
+/// binder the receiver was made against — and a [`Sink`] call waiting for
+/// credit or for room in a ring. A stream whose items flow never pings, and an end
 /// that is not waiting on the stream checks nothing until it next waits.
 /// A wait whose own bound is shorter than a third of the reply deadline
 /// ends without pinging, so a loop of such calls never checks the peer.
@@ -550,7 +551,9 @@ impl Default for SinkPolicy {
 /// there for as long as it lasts; this build has no timer to suspend a
 /// task against.
 ///
-/// The ring path never pings: the kernel reports the peer's death itself.
+/// A ring over kernel binder never pings: the kernel reports the peer's
+/// death itself. A ring over an RPC session ([`RingUse::AlsoUnixRpc`])
+/// pings as the calls path does, since its death link is the session too.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PingPolicy {
@@ -1437,6 +1440,7 @@ impl<T: Deserialize> Receiver<T> {
     ) -> Result<(Self, StreamEndpoint<T>)> {
         let (inner, ring, sink, death) = if over_ring(peer, policy) {
             let (consumer, ring, sink) = ring::Consumer::new(policy)?;
+            consumer.ping_peer(peer, policy.ping);
             let death = watch_death(peer, consumer.death_recipient())?;
             (ReceiverInner::Ring(consumer), Some(ring), sink, death)
         } else {

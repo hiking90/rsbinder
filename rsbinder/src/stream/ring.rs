@@ -32,7 +32,7 @@ use super::generated::rsbinder::stream::IStreamSink::{BnStreamSink, IStreamSink}
 use super::pool::on_pool;
 use super::{
     decode_item, dropped_terminator, encode_item, status_from_fields, truncated_terminator,
-    unlink_death, watch_death, ReceiverPolicy, SinkPolicy, END_RESERVE,
+    unlink_death, watch_death, Ping, PingPolicy, ReceiverPolicy, SinkPolicy, END_RESERVE,
 };
 
 /// The descriptor type the endpoint carries: a ring of bytes.
@@ -123,6 +123,8 @@ struct Shared {
     abandoned: AtomicBool,
     /// Consumer: how the stream ended, once it has.
     end: Mutex<Option<Status>>,
+    /// The other end's binder and whether a quiet wait pings it; only an RPC proxy is pinged.
+    ping: std::sync::OnceLock<(SIBinder, PingPolicy)>,
 }
 
 impl Shared {
@@ -135,11 +137,38 @@ impl Shared {
             canceled: AtomicBool::new(false),
             abandoned: AtomicBool::new(false),
             end: Mutex::new(None),
+            ping: std::sync::OnceLock::new(),
         }
     }
 
     fn queue(&self) -> std::sync::MutexGuard<'_, MessageQueue<u8>> {
         self.queue.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Wait on `mask` until `deadline`. Over an RPC session whose reply deadline is set, a third
+    /// of it gone quiet pings the peer first and returns `Ok(0)` for the caller to look again;
+    /// an unanswered ping ends the session, and the death link the wait (plan 2-24 D9).
+    fn park(&self, mask: u32, deadline: Option<Instant>) -> rsbinder_fmq::Result<u32> {
+        let ping = self
+            .ping
+            .get()
+            .and_then(|(peer, policy)| Ping::to(peer, *policy));
+        let quiet_until = ping
+            .as_ref()
+            .and_then(|ping| Instant::now().checked_add(ping.every));
+        // A caller's deadline that comes first ends the wait without a ping.
+        let pings = quiet_until.is_some_and(|quiet| deadline.is_none_or(|d| quiet <= d));
+        let wake_at = if pings { quiet_until } else { deadline };
+        let timeout = wake_at.map(|at| at.saturating_duration_since(Instant::now()));
+        match self.flag.wait(mask, timeout) {
+            Err(rsbinder_fmq::Error::TimedOut) if pings => {
+                if let Some(ping) = &ping {
+                    ping.send();
+                }
+                Ok(0)
+            }
+            seen => seen,
+        }
     }
 
     fn end(&self) -> Option<Status> {
@@ -210,21 +239,20 @@ impl Shared {
                     return Ok(true);
                 }
             }
-            let (timeout, deadline) = match wait {
+            let deadline = match wait {
                 Wait::Never => return Ok(false),
-                Wait::Forever => (None, None),
+                Wait::Forever => None,
                 Wait::Until(deadline) => {
-                    let left = deadline.saturating_duration_since(Instant::now());
-                    if left.is_zero() {
+                    if deadline <= Instant::now() {
                         return Err(WriteFailure::TimedOut);
                     }
-                    (Some(left), Some(deadline))
+                    Some(deadline)
                 }
             };
             if !woke && self.turns_within(n, limit, is_end, spin_budget(deadline)) {
                 continue;
             }
-            let seen = match self.flag.wait(NOT_FULL | CANCEL, timeout) {
+            let seen = match self.park(NOT_FULL | CANCEL, deadline) {
                 Ok(seen) => {
                     woke = true;
                     seen
@@ -593,7 +621,9 @@ impl<T: Serialize + ?Sized> Producer<T> {
         }
         // `require_event_flag` above makes this `Some`.
         let flag = queue.event_flag().ok_or(StatusCode::InvalidOperation)?;
-        let shared = Arc::new(Shared::new(queue, flag, capacity));
+        let shared = Shared::new(queue, flag, capacity);
+        let _ = shared.ping.set((sink.clone(), policy.ping));
+        let shared = Arc::new(shared);
         let death = watch_death(sink, ProducerDeath(shared.clone()))?;
         Ok(Producer {
             shared,
@@ -973,7 +1003,8 @@ impl WaitInTransit {
         if self.shared.fills_within(spin_budget(None)) {
             return;
         }
-        if let Err(e) = self.shared.flag.wait(NOT_EMPTY, None) {
+        // A ping's `Ok(0)` settles too; the consumer then looks and, finding nothing, waits again.
+        if let Err(e) = self.shared.park(NOT_EMPTY, None) {
             self.failure = Some(StatusCode::from(e));
         }
     }
@@ -1089,6 +1120,11 @@ impl<T: Deserialize> Consumer<T> {
         self.sink_binder.clone()
     }
 
+    /// The producer's binder, which a quiet wait pings over RPC under `policy`.
+    pub(super) fn ping_peer(&self, peer: &SIBinder, policy: PingPolicy) {
+        let _ = self.shared.ping.set((peer.clone(), policy));
+    }
+
     /// A recipient for the producer's death.
     pub(super) fn death_recipient(&self) -> ConsumerDeath {
         ConsumerDeath(Arc::downgrade(&self.shared))
@@ -1154,17 +1190,10 @@ impl<T: Deserialize> Consumer<T> {
             if let Some(hook) = self.about_to_park.as_mut() {
                 hook();
             }
-            let timeout = match deadline {
-                Some(deadline) => {
-                    let left = deadline.saturating_duration_since(Instant::now());
-                    if left.is_zero() {
-                        return None;
-                    }
-                    Some(left)
-                }
-                None => None,
-            };
-            match self.shared.flag.wait(NOT_EMPTY, timeout) {
+            if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+                return None;
+            }
+            match self.shared.park(NOT_EMPTY, deadline) {
                 Ok(_) => woke = true,
                 Err(rsbinder_fmq::Error::TimedOut) => return None,
                 Err(e) => {

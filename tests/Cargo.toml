@@ -30,8 +30,9 @@ rsbinder = { workspace = true, features = ["android_10_plus"] }
 # its runtime by hand).
 tokio = { workspace = true, features = ["rt-multi-thread", "time", "macros"] }
 env_logger = { workspace = true }
-# `mm`: `src/fmq_peer.rs` maps a queue's fd to damage its counters.
-rustix = { workspace = true, features = ["pipe", "param", "mm"] }
+# `mm`: `src/fmq_peer.rs` maps a queue's fd to damage its counters. `net`: the
+# relay in `tests/stream_rpc.rs` carries `SCM_RIGHTS` across, as a ring's memfd needs.
+rustix = { workspace = true, features = ["pipe", "param", "mm", "net"] }
 async-trait = { workspace = true }
 log.workspace = true
 tracing = { workspace = true, optional = true }

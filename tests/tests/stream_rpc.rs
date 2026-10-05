@@ -25,7 +25,6 @@
 #![cfg(feature = "rpc")]
 #![allow(non_snake_case)]
 
-use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -335,19 +334,61 @@ impl Relay {
         Relay { path, frozen }
     }
 
-    /// Frozen, it holds what it has read and reads no more; the socket stays open.
-    fn pump(mut from: UnixStream, mut to: UnixStream, frozen: Arc<AtomicBool>) {
+    /// Frozen, it holds what it has read and reads no more; the socket stays open. File
+    /// descriptors go across with the bytes they came with, so a ring's memfd crosses too.
+    fn pump(from: UnixStream, to: UnixStream, frozen: Arc<AtomicBool>) {
+        use rustix::net::{
+            RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
+            SendAncillaryMessage, SendFlags,
+        };
+        use std::io::{IoSlice, IoSliceMut};
+        use std::mem::MaybeUninit;
+        use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+
         let mut buf = [0u8; 16 * 1024];
-        loop {
-            let n = match from.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
+        let mut in_space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(64))];
+        let mut out_space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(64))];
+        'pump: loop {
+            let mut anc = RecvAncillaryBuffer::new(&mut in_space);
+            let n = match rustix::net::recvmsg(
+                &from,
+                &mut [IoSliceMut::new(&mut buf)],
+                &mut anc,
+                RecvFlags::empty(),
+            ) {
+                Ok(r) if r.bytes > 0 => r.bytes,
+                Err(rustix::io::Errno::INTR) => continue,
+                _ => break,
             };
+            let fds: Vec<OwnedFd> = anc
+                .drain()
+                .filter_map(|msg| match msg {
+                    RecvAncillaryMessage::ScmRights(fds) => Some(fds),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
             while frozen.load(Ordering::SeqCst) {
                 thread::sleep(Duration::from_millis(10));
             }
-            if to.write_all(&buf[..n]).is_err() {
-                break;
+            let fds: Vec<BorrowedFd<'_>> = fds.iter().map(|fd| fd.as_fd()).collect();
+            let mut sent = 0;
+            while sent < n {
+                let mut anc = SendAncillaryBuffer::new(&mut out_space);
+                if sent == 0 && !fds.is_empty() {
+                    assert!(anc.push(SendAncillaryMessage::ScmRights(&fds)));
+                }
+                match rustix::net::sendmsg(
+                    &to,
+                    &[IoSlice::new(&buf[sent..n])],
+                    &mut anc,
+                    SendFlags::empty(),
+                ) {
+                    Ok(0) => break 'pump,
+                    Ok(k) => sent += k,
+                    Err(rustix::io::Errno::INTR) => {}
+                    Err(_) => break 'pump,
+                }
             }
         }
         let _ = to.shutdown(std::net::Shutdown::Write);
@@ -1072,6 +1113,126 @@ fn an_opted_in_upload_runs_on_a_ring_whose_memfd_keeps_its_seals() {
     assert_eq!(f.svc.uploaded.load(Ordering::SeqCst), 1000);
     assert!(f.svc.upload_ordered.load(Ordering::SeqCst));
     assert_eq!(f.svc.upload_error.load(Ordering::SeqCst), 0);
+}
+
+/// An opted-in download through a relay, the producer idle between items, then the relay frozen.
+/// The ring's items never cross the relay, so only a ping can tell the producer is gone.
+fn frozen_ring_download(tag: &str, ping: PingPolicy) -> (Fixture, Receiver<i32>) {
+    let f = fixture_with(
+        tag,
+        1,
+        Setup {
+            relay: true,
+            fd_unix: true,
+            client_timeout: Some(DEADLINE),
+            ..Setup::default()
+        },
+    );
+    let (mut rx, endpoint) = Receiver::<i32>::with_policy(
+        &f.demo.as_binder(),
+        &ReceiverPolicy {
+            ring_use: RingUse::AlsoUnixRpc,
+            max_opening: 1_000_000,
+            ping,
+            ..ReceiverPolicy::default()
+        },
+    )
+    .expect("a receiver");
+    assert_eq!(rx.uses_ring(), RING, "the memfd crossed the relay");
+    // 30 s per item and spare credit: after item 0 neither end does anything on its own.
+    f.demo
+        .r#subscribe(&endpoint, i32::MAX, 4, 1_000_000, 30_000_000)
+        .expect("subscribe");
+    assert!(rx.next().expect("item 0").is_ok());
+    // Off a ring this pays the owed credit, so the wait below has no grant to send.
+    assert!(rx.try_recv().expect("still running").is_none());
+    f.freeze();
+    (f, rx)
+}
+
+/// AC-C6, consumer: a ring consumer waiting on a producer gone silent pings it, and the
+/// unanswered ping ends the stream.
+#[test]
+fn a_waiting_ring_consumer_notices_a_producer_gone_silent_behind_a_relay() {
+    let (_f, mut rx) = frozen_ring_download("ring_ping_rx", PingPolicy::Inherit);
+    let started = Instant::now();
+    let failure = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect_err("the ping goes unanswered and the session ends");
+    assert_eq!(
+        failure.transaction_error(),
+        rsbinder::StatusCode::DeadObject
+    );
+    assert!(
+        started.elapsed() < NOTICED_WITHIN,
+        "noticed after {:?}",
+        started.elapsed()
+    );
+}
+
+/// AC-C6 baseline: without the ping the same ring consumer keeps waiting.
+#[test]
+fn without_a_ping_a_ring_consumer_waits_on_a_producer_gone_silent() {
+    let (_f, mut rx) = frozen_ring_download("ring_noping_rx", PingPolicy::Off);
+    assert_eq!(rx.recv_timeout(NOTICED_WITHIN).expect("no error"), None);
+    assert!(!rx.is_finished());
+}
+
+/// An opted-in download whose consumer reads nothing: the producer fills a small ring and parks
+/// on it (off Linux, on credit), then the relay is frozen.
+fn parked_ring_producer(tag: &str, ping: PingPolicy) -> Fixture {
+    let f = fixture_with(
+        tag,
+        1,
+        Setup {
+            relay: true,
+            fd_unix: true,
+            server_reply_timeout: Some(DEADLINE),
+            producer_ping: ping,
+            ..Setup::default()
+        },
+    );
+    let (rx, endpoint) = Receiver::<i32>::with_policy(
+        &f.demo.as_binder(),
+        &ReceiverPolicy {
+            ring_use: RingUse::AlsoUnixRpc,
+            ring_bytes: 4096,
+            credit_window: 1,
+            ..ReceiverPolicy::default()
+        },
+    )
+    .expect("a receiver");
+    assert_eq!(rx.uses_ring(), RING);
+    f.demo
+        .r#subscribe(&endpoint, 1_000_000, 4, 1, 0)
+        .expect("subscribe");
+    // On the ring: (4096 - 256) / 8 records, then the producer parks for room.
+    let parked_at = if RING { (4096 - 256) / 8 } else { 1 };
+    eventually("the producer must fill what it may", || {
+        f.svc.sent.load(Ordering::SeqCst) >= parked_at
+    });
+    f.freeze();
+    // Kept alive but unread: dropping it would cancel the producer.
+    std::mem::forget(rx);
+    f
+}
+
+/// AC-C6, producer: a producer parked on a full ring pings the consumer's sink, and the
+/// unanswered ping ends it.
+#[test]
+fn a_ring_producer_parked_for_room_notices_a_consumer_gone_silent_behind_a_relay() {
+    let f = parked_ring_producer("ring_ping_tx", PingPolicy::Inherit);
+    assert_eq!(
+        producer_outcome(&f, NOTICED_WITHIN),
+        Some(i32::from(rsbinder::StatusCode::DeadObject))
+    );
+}
+
+/// AC-C6 baseline: without the ping the parked ring producer keeps waiting.
+#[test]
+fn without_a_ping_a_ring_producer_waits_on_a_consumer_gone_silent() {
+    let f = parked_ring_producer("ring_noping_tx", PingPolicy::Off);
+    assert_eq!(producer_outcome(&f, NOTICED_WITHIN), None);
 }
 
 /// AC-C5: a session that ends ends an RPC ring stream on both sides; the consumer first gets
