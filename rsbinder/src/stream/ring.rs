@@ -13,7 +13,7 @@
 //! record and the EventFlag bits, which a C++ peer implements against.
 
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -53,6 +53,8 @@ const END_MESSAGE_MAX: usize = END_RESERVE - HEADER - END_FIELDS;
 
 /// How long a side looks at the ring before it parks; a park costs a wake syscall on each side.
 const SPIN: Duration = Duration::from_micros(20);
+/// Full spins in a row that found nothing, after which a side parks without spinning.
+const WASTED_SPINS: u32 = 4;
 /// Looks between clock reads while spinning.
 const SPIN_CLOCK_EVERY: u32 = 32;
 /// Committed bytes a refill waits for while the producer is still adding: reading right behind
@@ -106,6 +108,46 @@ fn spin_until(budget: Duration, mut done: impl FnMut() -> bool) -> bool {
     }
 }
 
+/// One side's spin, turned off while its waits outlast it (plan 10-7c D13).
+///
+/// On a stream whose items come further apart than `SPIN`, every spin finds nothing and the
+/// side parks anyway, so each wait costs `SPIN` of CPU for no syscall saved. After
+/// `WASTED_SPINS` such spins in a row the side parks at once, until a park ends within `SPIN`:
+/// a wait a spin would have caught.
+#[derive(Default)]
+struct SpinGauge {
+    wasted: AtomicU32,
+}
+
+impl SpinGauge {
+    fn budget(&self, deadline: Option<Instant>) -> Duration {
+        if self.wasted.load(Ordering::Relaxed) >= WASTED_SPINS {
+            Duration::ZERO
+        } else {
+            spin_budget(deadline)
+        }
+    }
+
+    /// A spin of `budget` ended, `found` or not. One a near deadline cut short says nothing.
+    fn spun(&self, budget: Duration, found: bool) {
+        if found {
+            self.wasted.store(0, Ordering::Relaxed);
+        } else if budget >= SPIN {
+            let wasted = self.wasted.load(Ordering::Relaxed);
+            self.wasted.store(
+                wasted.saturating_add(1).min(WASTED_SPINS),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    fn parked(&self, took: Duration) {
+        if took < SPIN {
+            self.wasted.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
 // --- The ring, as both ends and the pool see it ---
 
 /// One end's ring handle, shared with its pool task and the death recipient that wakes it.
@@ -128,6 +170,7 @@ struct Shared {
     /// Over RPC, the session's idle check, which sees none of the ring's traffic (plan 10-7c B7).
     #[cfg(feature = "rpc")]
     activity: std::sync::OnceLock<crate::rpc::session::SessionActivity>,
+    spin: SpinGauge,
 }
 
 impl Shared {
@@ -143,6 +186,7 @@ impl Shared {
             ping: std::sync::OnceLock::new(),
             #[cfg(feature = "rpc")]
             activity: std::sync::OnceLock::new(),
+            spin: SpinGauge::default(),
         }
     }
 
@@ -185,8 +229,14 @@ impl Shared {
         // A caller's deadline that comes first ends the wait without a ping.
         let pings = quiet_until.is_some_and(|quiet| deadline.is_none_or(|d| quiet <= d));
         let wake_at = if pings { quiet_until } else { deadline };
-        let timeout = wake_at.map(|at| at.saturating_duration_since(Instant::now()));
-        match self.flag.wait(mask, timeout) {
+        let parked_at = Instant::now();
+        let timeout = wake_at.map(|at| at.saturating_duration_since(parked_at));
+        let seen = self.flag.wait(mask, timeout);
+        // Only a wake: a timeout that came soon says nothing about when the peer acts.
+        if seen.is_ok() {
+            self.spin.parked(parked_at.elapsed());
+        }
+        match seen {
             Err(rsbinder_fmq::Error::TimedOut) if pings => {
                 if let Some(ping) = &ping {
                     ping.send();
@@ -276,7 +326,7 @@ impl Shared {
                     Some(deadline)
                 }
             };
-            if !woke && self.turns_within(n, limit, is_end, spin_budget(deadline)) {
+            if !woke && self.turns_within(n, limit, is_end, deadline) {
                 continue;
             }
             let seen = match self.park(NOT_FULL | CANCEL, deadline) {
@@ -296,24 +346,36 @@ impl Shared {
         }
     }
 
-    /// Look for room, a death or a stop for up to `budget` before parking; the loop top tells which.
-    fn turns_within(&self, n: usize, limit: usize, is_end: bool, budget: Duration) -> bool {
+    /// Look for room, a death or a stop for a spin before parking; the loop top tells which.
+    fn turns_within(
+        &self,
+        n: usize,
+        limit: usize,
+        is_end: bool,
+        deadline: Option<Instant>,
+    ) -> bool {
+        let budget = self.spin.budget(deadline);
         let mut queue = self.queue();
-        spin_until(budget, || {
+        let found = spin_until(budget, || {
             self.dead.load(Ordering::Relaxed)
                 || (!is_end
                     && (self.flag.peek() & CANCEL != 0 || self.abandoned.load(Ordering::Relaxed)))
                 // A broken counter ends the spin too; the loop top reports it.
                 || !matches!(queue.begin_write_cached(n, limit), Ok(None))
-        })
+        });
+        self.spin.spun(budget, found);
+        found
     }
 
-    /// Look for a record or a death for up to `budget` before parking, leaving the flag word alone.
-    fn fills_within(&self, budget: Duration) -> bool {
+    /// Look for a record or a death for a spin before parking, leaving the flag word alone.
+    fn fills_within(&self, deadline: Option<Instant>) -> bool {
+        let budget = self.spin.budget(deadline);
         let queue = self.queue();
-        spin_until(budget, || {
+        let found = spin_until(budget, || {
             self.dead.load(Ordering::Relaxed) || !matches!(queue.available_to_read(), Ok(0))
-        })
+        });
+        self.spin.spun(budget, found);
+        found
     }
 }
 
@@ -1027,7 +1089,7 @@ impl WaitInTransit {
     fn wait(mut self) {
         // On the pool, so the executor thread never spins. A record seen here leaves `NOT_EMPTY`
         // as the producer set it; the consumer's next wait returns once at most for it.
-        if self.shared.fills_within(spin_budget(None)) {
+        if self.shared.fills_within(None) {
             return;
         }
         // A ping's `Ok(0)` settles too; the consumer then looks and, finding nothing, waits again.
@@ -1210,7 +1272,7 @@ impl<T: Deserialize> Consumer<T> {
             if matches!(wait, Wait::Never) {
                 return None;
             }
-            if !woke && self.shared.fills_within(spin_budget(deadline)) {
+            if !woke && self.shared.fills_within(deadline) {
                 continue;
             }
             #[cfg(test)]
@@ -2017,6 +2079,69 @@ mod tests {
                 "item {item} took {took:?}"
             );
         }
+    }
+
+    /// Plan 10-7c D13: full spins that find nothing turn the spin off; a find or a quick wake
+    /// turns it back on; a spin a deadline cut short and a slow wake change nothing.
+    #[test]
+    fn the_spin_turns_off_after_wasted_spins_and_back_on_after_a_quick_wake() {
+        if spin_budget(None) < SPIN {
+            return; // One core: no spin to turn off.
+        }
+        let gauge = SpinGauge::default();
+        for _ in 0..WASTED_SPINS - 1 {
+            gauge.spun(SPIN, false);
+        }
+        gauge.spun(SPIN / 2, false);
+        gauge.parked(Duration::from_millis(1));
+        assert_eq!(
+            gauge.budget(None),
+            SPIN,
+            "one wasted full spin short of the limit"
+        );
+        gauge.spun(SPIN, false);
+        assert_eq!(gauge.budget(None), Duration::ZERO);
+        gauge.spun(Duration::ZERO, false);
+        gauge.parked(Duration::from_millis(1));
+        assert_eq!(
+            gauge.budget(None),
+            Duration::ZERO,
+            "a slow wake keeps it off"
+        );
+        gauge.parked(Duration::from_micros(1));
+        assert_eq!(gauge.budget(None), SPIN, "a wake a spin would have caught");
+        for _ in 0..WASTED_SPINS - 1 {
+            gauge.spun(SPIN, false);
+        }
+        gauge.spun(SPIN, true);
+        gauge.spun(SPIN, false);
+        assert_eq!(gauge.budget(None), SPIN, "a find starts the count over");
+    }
+
+    /// Plan 10-7c D13: items further apart than a spin turn the consumer's spin off.
+    #[test]
+    fn a_sparse_stream_stops_the_consumer_spinning() {
+        if spin_budget(None) < SPIN {
+            return;
+        }
+        let (mut tx, mut rx) = pair::<i32>(64 * 1024);
+        let producer = thread::spawn(move || {
+            for item in 0..50 {
+                thread::sleep(Duration::from_millis(1));
+                tx.send(&item, None).expect("send");
+            }
+            end(tx).expect("end");
+        });
+        let mut turned_off = false;
+        while let Some(item) = rx.recv() {
+            item.expect("item");
+            turned_off |= rx.shared.spin.budget(None).is_zero();
+        }
+        producer.join().expect("producer");
+        assert!(
+            turned_off,
+            "50 waits of a millisecond never turned the spin off"
+        );
     }
 
     /// Plan 10-7b AC-7b.6: an oversized header ends as `EX_ILLEGAL_STATE` and sets `CANCEL`.
