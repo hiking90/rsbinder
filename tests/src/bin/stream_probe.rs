@@ -31,6 +31,7 @@
 //! stream_probe vanish  <name> <sendN>
 //! stream_probe status  <name>
 //! stream_probe serve-rpc <socketPath> [replyTimeoutMs]   (feature `rpc`)
+//! stream_probe serve-rpc-ring <socketPath>               (feature `rpc`)
 //! ```
 //!
 //! Every mode but `serve` and `serve-rpc` prints one `RESULT` line;
@@ -42,6 +43,9 @@
 //! Unix socket, for a libbinder `RpcSession` client to stream against
 //! (`example-hello/cpp/run_stream_rpc_interop.sh`). `replyTimeoutMs` sets
 //! every session's reply deadline, which also arms the stream ping.
+//! `serve-rpc-ring` also takes the `Unix` fd mode and gives an upload a
+//! ring, for `tests/stream_rpc.rs` to run a ring over RPC between two
+//! processes (plan 10-7c AC-C5).
 
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
@@ -49,7 +53,7 @@ use std::thread;
 use std::time::Duration;
 
 use rsbinder::stream::{
-    Receiver, ReceiverPolicy, Sink, SinkPolicy, StreamEndpoint, Token, END_RESERVE,
+    Receiver, ReceiverPolicy, RingUse, Sink, SinkPolicy, StreamEndpoint, Token, END_RESERVE,
 };
 use rsbinder::*;
 
@@ -59,6 +63,8 @@ use streamdemo::IStreamDemo::{BnStreamDemo, IStreamDemo};
 
 #[derive(Default)]
 struct DemoSvc {
+    /// Whether an upload's receiver may take a ring from an RPC client (`serve-rpc-ring`).
+    upload_ring_use: RingUse,
     sent: Arc<AtomicI32>,
     finished: Arc<AtomicBool>,
     last_error: Arc<AtomicI32>,
@@ -170,6 +176,7 @@ impl IStreamDemo for DemoSvc {
             producer,
             &ReceiverPolicy {
                 ring_bytes: ring_bytes.max(0) as usize,
+                ring_use: self.upload_ring_use,
                 ..ReceiverPolicy::default()
             },
         )?;
@@ -230,15 +237,21 @@ fn serve(name: &str) -> Result<()> {
 }
 
 /// The service as an RPC root: a libbinder client asks for the root object, not a name.
+/// `ring`: also take the `Unix` fd mode and give uploads a ring (plan 10-7c Phase B).
 #[cfg(feature = "rpc")]
-fn serve_rpc(path: &str, reply_timeout: Option<Duration>) -> Result<()> {
+fn serve_rpc(path: &str, reply_timeout: Option<Duration>, ring: bool) -> Result<()> {
     let server = rsbinder::rpc::RpcServer::setup_unix_server(path)?;
     server.set_android13plus(2);
     // Every session's deadline, and so the period of the producer's pings (plan 2-24 D9).
     server.set_reply_timeout(reply_timeout);
     // Batches, grants and cancels are oneway calls from the client; a few threads take them.
     server.set_max_threads(4);
-    server.set_root(BnStreamDemo::new_binder(DemoSvc::default()).as_binder())?;
+    let mut svc = DemoSvc::default();
+    if ring {
+        server.set_supported_fd_modes(&[rsbinder::rpc::FileDescriptorTransportMode::Unix]);
+        svc.upload_ring_use = RingUse::AlsoUnixRpc;
+    }
+    server.set_root(BnStreamDemo::new_binder(svc).as_binder())?;
     println!("SERVING {path}");
     use std::io::Write;
     std::io::stdout().flush().ok();
@@ -577,7 +590,8 @@ fn main() {
              \x20      stream_probe upload <name> <count> <ringBytes>\n\
              \x20      stream_probe vanish <name> <sendN>\n\
              \x20      stream_probe status <name>\n\
-             \x20      stream_probe serve-rpc <socketPath> [replyTimeoutMs]"
+             \x20      stream_probe serve-rpc <socketPath> [replyTimeoutMs]\n\
+             \x20      stream_probe serve-rpc-ring <socketPath>"
         );
         std::process::exit(2)
     };
@@ -603,9 +617,13 @@ fn main() {
         (Some("vanish"), 4) => vanish(&args[2], num(3)),
         (Some("status"), 3) => status(&args[2]),
         #[cfg(feature = "rpc")]
-        (Some("serve-rpc"), 3) => serve_rpc(&args[2], None),
+        (Some("serve-rpc"), 3) => serve_rpc(&args[2], None, false),
         #[cfg(feature = "rpc")]
-        (Some("serve-rpc"), 4) => serve_rpc(&args[2], Some(Duration::from_millis(size(3) as u64))),
+        (Some("serve-rpc"), 4) => {
+            serve_rpc(&args[2], Some(Duration::from_millis(size(3) as u64)), false)
+        }
+        #[cfg(feature = "rpc")]
+        (Some("serve-rpc-ring"), 3) => serve_rpc(&args[2], None, true),
         _ => usage(),
     };
     if let Err(e) = r {

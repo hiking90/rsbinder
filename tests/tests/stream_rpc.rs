@@ -1448,3 +1448,160 @@ mod idle {
         assert_eq!(f.svc.upload_error.load(Ordering::SeqCst), 0);
     }
 }
+
+// ---- AC-C5: a ring over RPC between two processes ----
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod two_process {
+    use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::process::{Child, ChildStdout, Command, Stdio};
+
+    /// `stream_probe serve-rpc-ring` in a process of its own; killed and reaped on drop.
+    struct Server {
+        child: Child,
+        _stdout: BufReader<ChildStdout>,
+        path: PathBuf,
+    }
+
+    impl Server {
+        fn kill(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.kill();
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// The child server and a client session to it that can carry a ring.
+    fn serve(tag: &str) -> (Server, RpcSession, Strong<dyn IStreamDemo>) {
+        let mut path = std::env::temp_dir();
+        path.push(format!("rsb_stream_2p_{tag}_{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        // `STREAM_PROBE_BIN` on a device, where the build-time path does not exist.
+        let probe = std::env::var("STREAM_PROBE_BIN")
+            .unwrap_or_else(|_| env!("CARGO_BIN_EXE_stream_probe").to_string());
+        let mut child = Command::new(probe)
+            .arg("serve-rpc-ring")
+            .arg(&path)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn stream_probe");
+        // Kept open: the child's stdout must not become a broken pipe.
+        let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
+        let mut line = String::new();
+        stdout.read_line(&mut line).expect("the child's first line");
+        assert!(line.starts_with("SERVING"), "stream_probe said {line:?}");
+        let server = Server {
+            child,
+            _stdout: stdout,
+            path,
+        };
+        let client = RpcSession::setup_client_android13plus_with_config(
+            RpcClientConfig::unix(&server.path, 2)
+                .incoming_connections(1)
+                .fd_mode(FileDescriptorTransportMode::Unix),
+        )
+        .expect("connect");
+        let demo = <dyn IStreamDemo as FromIBinder>::try_from(client.get_root().expect("root"))
+            .expect("cast the root to IStreamDemo");
+        (server, client, demo)
+    }
+
+    /// A ring over RPC both ways between two processes: the memfd crosses in an argument
+    /// (download) and in a reply (upload), and each side maps what the other allocated.
+    #[test]
+    fn a_ring_over_rpc_crosses_two_processes() {
+        let (_server, _client, demo) = serve("cross");
+
+        let (mut rx, endpoint) =
+            Receiver::<i32>::with_policy(&demo.as_binder(), &opted_in()).expect("a receiver");
+        assert!(rx.uses_ring());
+        demo.r#subscribe(&endpoint, 200_000, 64, default_credits(), 0)
+            .expect("subscribe");
+        let mut expected = 0;
+        for item in &mut rx {
+            assert_eq!(item.expect("item"), expected);
+            expected += 1;
+        }
+        assert_eq!(expected, 200_000);
+        assert!(rx.end_status().expect("ended").is_ok());
+
+        let token = Token::new();
+        let endpoint = demo.r#upload(&token.binder(), 64 * 1024).expect("upload");
+        assert!(endpoint.ring.is_some(), "the child's receiver took a ring");
+        let mut sink = Sink::<i32>::open(&endpoint).expect("open the child's ring");
+        for item in 0..50_000 {
+            sink.send(&item).expect("send");
+        }
+        sink.end().expect("end");
+        eventually("the child's receiver must finish", || {
+            demo.r#uploadFinished().expect("uploadFinished")
+        });
+        assert_eq!(demo.r#uploaded().expect("uploaded"), 50_000);
+        assert!(demo.r#uploadOrdered().expect("uploadOrdered"));
+        assert_eq!(demo.r#uploadError().expect("uploadError"), 0);
+    }
+
+    /// The producer's process dies: the consumer gets what was in the ring, then `DeadObject`.
+    #[test]
+    fn a_killed_rpc_ring_producer_ends_the_consumer_after_its_records() {
+        let (mut server, _client, demo) = serve("producer_dies");
+        let (mut rx, endpoint) =
+            Receiver::<i32>::with_policy(&demo.as_binder(), &opted_in()).expect("a receiver");
+        assert!(rx.uses_ring());
+        demo.r#subscribe(&endpoint, i32::MAX, 64, default_credits(), 1000)
+            .expect("subscribe");
+        for expected in 0..10 {
+            assert_eq!(rx.recv().expect("item").expect("ok"), expected);
+        }
+        server.kill();
+        let mut expected = 10;
+        let failure = loop {
+            match rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(Some(item)) => {
+                    assert_eq!(item, expected, "records before the death come in order");
+                    expected += 1;
+                }
+                Ok(None) if rx.is_finished() => panic!("a clean end the producer never sent"),
+                Ok(None) => panic!("the dead producer left the consumer waiting"),
+                Err(status) => break status,
+            }
+        };
+        assert_eq!(
+            failure.transaction_error(),
+            rsbinder::StatusCode::DeadObject
+        );
+    }
+
+    /// The consumer's process dies: the producer's next write after the death fails, even one
+    /// that would fit the ring.
+    #[test]
+    fn a_killed_rpc_ring_consumer_ends_the_producer() {
+        let (mut server, _client, demo) = serve("consumer_dies");
+        let token = Token::new();
+        let endpoint = demo.r#upload(&token.binder(), 4096).expect("upload");
+        assert!(endpoint.ring.is_some());
+        let mut sink = Sink::<i32>::open(&endpoint).expect("open the child's ring");
+        for item in 0..100 {
+            sink.send(&item).expect("send");
+        }
+        server.kill();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let failure = loop {
+            assert!(
+                Instant::now() < deadline,
+                "the producer never saw the death"
+            );
+            if let Err(e) = sink.send(&0) {
+                break e;
+            }
+        };
+        assert_eq!(failure, rsbinder::StatusCode::DeadObject);
+    }
+}
