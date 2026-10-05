@@ -54,7 +54,9 @@ const END_MESSAGE_MAX: usize = END_RESERVE - HEADER - END_FIELDS;
 /// How long a side looks at the ring before it parks; a park costs a wake syscall on each side.
 const SPIN: Duration = Duration::from_micros(20);
 /// Full spins in a row that found nothing, after which a side parks without spinning.
-const WASTED_SPINS: u32 = 4;
+const WASTED_SPINS: u32 = 16;
+/// While a side parks without spinning, every this many waits spin in full to see if they pay.
+const PROBE_EVERY: u32 = 8;
 /// Looks between clock reads while spinning.
 const SPIN_CLOCK_EVERY: u32 = 32;
 /// Committed bytes a refill waits for while the producer is still adding: reading right behind
@@ -112,26 +114,39 @@ fn spin_until(budget: Duration, mut done: impl FnMut() -> bool) -> bool {
 ///
 /// On a stream whose items come further apart than `SPIN`, every spin finds nothing and the
 /// side parks anyway, so each wait costs `SPIN` of CPU for no syscall saved. After
-/// `WASTED_SPINS` such spins in a row the side parks at once, until a park ends within `SPIN`:
-/// a wait a spin would have caught.
+/// `WASTED_SPINS` such spins in a row the side parks at once, until a park ends within `SPIN`
+/// (a wait a spin would have caught) or one of the full spins it still makes every
+/// `PROBE_EVERY` waits finds something. The probes are what turn it back on where a wake alone
+/// takes longer than `SPIN`, as on an arm64 emulator.
 #[derive(Default)]
 struct SpinGauge {
     wasted: AtomicU32,
+    /// Waits parked without a spin since the last probe.
+    skipped: AtomicU32,
 }
 
 impl SpinGauge {
+    /// This wait's spin; counts the wait while the spin is off.
     fn budget(&self, deadline: Option<Instant>) -> Duration {
-        if self.wasted.load(Ordering::Relaxed) >= WASTED_SPINS {
-            Duration::ZERO
-        } else {
-            spin_budget(deadline)
+        if self.is_off() {
+            let skipped = self.skipped.load(Ordering::Relaxed) + 1;
+            if skipped < PROBE_EVERY {
+                self.skipped.store(skipped, Ordering::Relaxed);
+                return Duration::ZERO;
+            }
+            self.skipped.store(0, Ordering::Relaxed);
         }
+        spin_budget(deadline)
+    }
+
+    fn is_off(&self) -> bool {
+        self.wasted.load(Ordering::Relaxed) >= WASTED_SPINS
     }
 
     /// A spin of `budget` ended, `found` or not. One a near deadline cut short says nothing.
     fn spun(&self, budget: Duration, found: bool) {
         if found {
-            self.wasted.store(0, Ordering::Relaxed);
+            self.turn_on();
         } else if budget >= SPIN {
             let wasted = self.wasted.load(Ordering::Relaxed);
             self.wasted.store(
@@ -143,8 +158,13 @@ impl SpinGauge {
 
     fn parked(&self, took: Duration) {
         if took < SPIN {
-            self.wasted.store(0, Ordering::Relaxed);
+            self.turn_on();
         }
+    }
+
+    fn turn_on(&self) {
+        self.wasted.store(0, Ordering::Relaxed);
+        self.skipped.store(0, Ordering::Relaxed);
     }
 }
 
@@ -2118,6 +2138,35 @@ mod tests {
         assert_eq!(gauge.budget(None), SPIN, "a find starts the count over");
     }
 
+    /// Plan 10-7c D13: with the spin off, every `PROBE_EVERY`th wait spins in full; a probe that
+    /// finds turns it back on without a quick wake, which an emulator's wakes never are.
+    #[test]
+    fn a_spin_turned_off_is_probed_and_a_probe_that_finds_turns_it_on() {
+        if spin_budget(None) < SPIN {
+            return;
+        }
+        let gauge = SpinGauge::default();
+        for _ in 0..WASTED_SPINS {
+            gauge.spun(SPIN, false);
+        }
+        for round in 0..2 {
+            for wait in 1..PROBE_EVERY {
+                let budget = gauge.budget(None);
+                assert_eq!(budget, Duration::ZERO, "round {round}, wait {wait}");
+                gauge.spun(budget, false);
+                gauge.parked(Duration::from_millis(1));
+            }
+            assert_eq!(gauge.budget(None), SPIN, "round {round}: the probe");
+            if round == 0 {
+                gauge.spun(SPIN, false);
+                assert!(gauge.is_off(), "a probe that finds nothing keeps it off");
+            }
+        }
+        gauge.spun(SPIN, true);
+        assert!(!gauge.is_off());
+        assert_eq!(gauge.budget(None), SPIN);
+    }
+
     /// Plan 10-7c D13: items further apart than a spin turn the consumer's spin off.
     #[test]
     fn a_sparse_stream_stops_the_consumer_spinning() {
@@ -2135,7 +2184,7 @@ mod tests {
         let mut turned_off = false;
         while let Some(item) = rx.recv() {
             item.expect("item");
-            turned_off |= rx.shared.spin.budget(None).is_zero();
+            turned_off |= rx.shared.spin.is_off();
         }
         producer.join().expect("producer");
         assert!(

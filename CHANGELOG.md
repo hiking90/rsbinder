@@ -539,9 +539,10 @@ This changelog starts at 0.9.0. For earlier releases, see the
   twice `ring_bytes`, and the consumer's copy buffer grows to at most the
   ring's size), and both ends look at the ring for up to 20 µs before
   parking on its futex (not on a single core, never on an async executor
-  thread; an end whose last four looks all found nothing parks at once until
-  a wait ends within 20 µs, so a stream whose items come further apart does
-  not pay the look on every item); each `send` still puts its item in the
+  thread; an end whose last sixteen looks all found nothing parks at once,
+  looking in full on one wait in eight, until such a look finds something or
+  a wait ends within 20 µs, so a stream whose items come further apart pays
+  the look on one item in eight); each `send` still puts its item in the
   ring. Configured through
   `SinkPolicy` (incl. `send_timeout`) and `ReceiverPolicy`; async variants
   with `tokio`. On RPC a waiting end pings a peer it has not heard from for a
