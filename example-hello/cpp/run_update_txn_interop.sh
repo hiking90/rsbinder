@@ -74,7 +74,7 @@ echo "==> verifying device $DEVICE is Android 12+ (needs BINDER_GET_EXTENDED_ERR
 
 echo "==> cross-compiling rsbinder STAGE3 binaries"
 ( cd "$REPO_ROOT" && ANDROID_NDK_HOME="$NDK" \
-    cargo ndk -t "$TRIPLE" -p "$API" build --release -p example-hello \
+    cargo ndk -t "$TRIPLE" --platform "$API" build --release -p example-hello \
         --bin update_txn_interop_service --bin update_txn_interop_client )
 
 echo "==> pushing binaries"

@@ -77,7 +77,7 @@ mode=$(adb -s "$DEVICE" shell getenforce | tr -d '\r')
 
 echo "==> cross-compiling rsbinder STAGE3 binaries"
 ( cd "$REPO_ROOT" && ANDROID_NDK_HOME="$NDK" \
-    cargo ndk -t "$TRIPLE" -p "$API" build --release -p example-hello \
+    cargo ndk -t "$TRIPLE" --platform "$API" build --release -p example-hello \
         --bin enforce_permission_interop_service --bin enforce_permission_interop_client )
 
 echo "==> pushing binaries"

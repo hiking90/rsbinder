@@ -73,7 +73,7 @@ required-features = ["rpc"]
 
 # Subplan 2-13 D.8 STAGE3 — rsbinder side of the IAccessor bridge
 # real-libbinder interop. Cross-compile with
-#   cargo ndk -t arm64-v8a -p 36 build -p example-hello \
+#   cargo ndk -t arm64-v8a --platform 36 build -p example-hello \
 #       --features rpc,android_16 --bin rpc_accessor_interop_client
 # and run on the android-16 emulator alongside the C++ launcher
 # (`cpp/rpc_accessor_interop_launcher.cpp`). See cpp/run_rpc_accessor_interop.sh.
@@ -86,7 +86,7 @@ required-features = ["rpc", "android_16"]
 # rsbinder vends an IAccessor via `LocalAccessor` + `RpcServer`; a real
 # libbinder C client calls `addConnection()` over kernel binder, then
 # drives an RPC root over the preconnected fd. Cross-compile with
-#   cargo ndk -t arm64-v8a -p 36 build -p example-hello \
+#   cargo ndk -t arm64-v8a --platform 36 build -p example-hello \
 #       --features rpc,android_16 --bin rpc_accessor_register_interop_server
 # and run on the android-16 emulator alongside the C++ launcher
 # (`cpp/rpc_accessor_register_interop_launcher.cpp`). See
@@ -100,7 +100,7 @@ required-features = ["rpc", "android_16"]
 # cpp/rpc_multiconn_interop_launcher (a real libbinder client built
 # with `ARpcSession_setMaxOutgoingConnections(2) + setMaxIncoming
 # Threads(1)`). Cross-compile with
-#   cargo ndk -t arm64-v8a -p 36 build -p example-hello \
+#   cargo ndk -t arm64-v8a --platform 36 build -p example-hello \
 #       --features rpc --bin rpc_multiconn_interop_server
 # and run on the android-16 emulator alongside
 # cpp/run_rpc_multiconn_interop.sh. AC-12.6 (a) twoway + (b) oneway both PASS post-

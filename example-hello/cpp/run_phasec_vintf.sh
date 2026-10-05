@@ -141,7 +141,7 @@ echo "==> [4/8] building phasec_vintf_client (NDK)"
 
 echo "==> [5/8] cross-compiling rsbinder accessor server"
 ( cd "$REPO_ROOT" && ANDROID_NDK_HOME="$NDK_HOME" \
-    cargo ndk -t "$TRIPLE" -p "$API" build --release -p example-hello \
+    cargo ndk -t "$TRIPLE" --platform "$API" build --release -p example-hello \
         --features rpc,android_16 \
         --bin rpc_accessor_register_interop_server )
 
