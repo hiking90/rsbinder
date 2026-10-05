@@ -32,8 +32,12 @@ LOG=/tmp/rsb61-hub.log
 OUT=/tmp/rsb61-out
 PASS=0; FAIL=0
 MY_UID=$(id -u)
-IN_GROUP=${IN_GROUP:-kvm}    # a supplementary group this user really is in
+# A supplementary group of this user, read from NSS (getgrouplist) as rsb_hub reads it.
+IN_GROUP=${IN_GROUP:-$(id -Gn "$(id -un)" | tr ' ' '\n' | grep -vxF "$(id -gn)" | head -1)}
 OUT_GROUP=${OUT_GROUP:-root}  # a real group this user really is not in
+if [ -z "$IN_GROUP" ]; then
+    echo "$(id -un) has no supplementary group for AC-6.1.6a; set IN_GROUP" >&2; exit 1
+fi
 
 note() { printf '\n=== %s\n' "$*"; }
 ok()   { PASS=$((PASS+1)); printf '  PASS  %s\n' "$*"; }
