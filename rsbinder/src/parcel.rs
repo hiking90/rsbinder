@@ -1122,6 +1122,25 @@ impl Parcel {
         p
     }
 
+    /// A data-only parcel's bytes replaced by exactly `bytes`, read from the start; the
+    /// allocation is kept, so one parcel decodes record after record.
+    pub(crate) fn refill_data_only(&mut self, bytes: &[u8]) {
+        debug_assert!(self.rpc.is_some() && self.is_self_contained(), "data-only");
+        match &mut self.data {
+            ParcelData::Vec(v) => {
+                v.clear();
+                v.extend_from_slice(bytes);
+            }
+            // A data-only parcel owns its bytes; adopt a copy rather than panic.
+            ParcelData::Slice(_) => self.data = ParcelData::Vec(bytes.to_vec()),
+        }
+        self.pos = 0;
+        self.next_object_hint = 0;
+        // Both are restored when a nested read returns, unless a `Deserialize` impl panicked.
+        self.read_boundary = None;
+        self.nested_read_depth = 0;
+    }
+
     /// No kernel object, RPC object position or out-of-band fd (all three: see module doc).
     pub(crate) fn is_self_contained(&self) -> bool {
         if self.objects.len() != 0 {

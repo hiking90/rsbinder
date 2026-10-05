@@ -934,8 +934,8 @@ pub(super) struct Consumer<T> {
     batch: Vec<u8>,
     at: usize,
     filled: usize,
-    /// Scratch for the payload `decode_item` takes.
-    buf: Vec<u8>,
+    /// One data-only parcel every item decodes through; boxed: `Parcel` is `!Freeze`.
+    decoder: Box<Parcel>,
     /// Test hook, run at the last point before a call commits to sleeping.
     #[cfg(test)]
     about_to_park: Option<Box<dyn FnMut() + Send>>,
@@ -978,7 +978,7 @@ impl<T: Deserialize> Consumer<T> {
             batch: Vec::new(),
             at: 0,
             filled: 0,
-            buf: Vec::new(),
+            decoder: Box::new(Parcel::new_data_only()),
             #[cfg(test)]
             about_to_park: None,
             #[cfg(test)]
@@ -1158,9 +1158,7 @@ impl<T: Deserialize> Consumer<T> {
             // What was recorded is the end, as the empty-ring branch reports it.
             return Step::End(end.clone().unwrap_or(status));
         }
-        self.buf.clear();
-        self.buf.extend_from_slice(&self.batch[payload]);
-        match decode_item::<T>(&mut self.buf) {
+        match decode_item::<T>(&mut self.decoder, &self.batch[payload]) {
             Ok(item) => Step::Item(item),
             Err(e) => self.fail(Status::from(e)),
         }

@@ -619,16 +619,11 @@ fn encode_item<T: Serialize + ?Sized>(scratch: &mut Parcel, item: &T) -> Result<
     scratch.write(item)
 }
 
-/// One item from all of `buf`, read in place; `buf` keeps its allocation for the next record.
-fn decode_item<T: Deserialize>(buf: &mut Vec<u8>) -> Result<T> {
-    let mut parcel = Parcel::data_only_from_vec(std::mem::take(buf));
-    let item = parcel.read::<T>();
+/// One item from all of `bytes`, read through `parcel`, a data-only parcel kept for every record.
+fn decode_item<T: Deserialize>(parcel: &mut Parcel, bytes: &[u8]) -> Result<T> {
+    parcel.refill_data_only(bytes);
+    let item = parcel.read::<T>()?;
     let left = parcel.data_avail();
-    // Data-only, so self-contained: the Vec moves back.
-    if let Ok(bytes) = parcel.into_bytes() {
-        *buf = bytes;
-    }
-    let item = item?;
     if left != 0 {
         log::error!(
             "stream: {left} bytes left after one item; the two ends disagree on the item type"
@@ -1530,28 +1525,38 @@ mod tests {
     }
 
     #[test]
-    fn a_reused_buffer_is_neither_lost_nor_left_with_the_last_item() {
+    fn a_reused_parcel_is_neither_lost_nor_left_with_the_last_item() {
         let mut scratch = Parcel::new_data_only();
         encode_item(&mut scratch, &vec![9u8; 300]).expect("encode");
+        let long = scratch.as_bytes().expect("bytes").to_vec();
         encode_item(&mut scratch, &7i32).expect("encode over it");
-        let mut buf = scratch.as_bytes().expect("bytes").to_vec();
-        assert_eq!(buf.len(), 4, "nothing of the earlier item is left");
-        let at = buf.as_ptr();
-        assert_eq!(decode_item::<i32>(&mut buf), Ok(7));
-        assert_eq!(buf.as_ptr(), at, "decode_item hands the buffer back");
-        // A short read is refused, and the buffer still comes back.
+        let short = scratch.as_bytes().expect("bytes").to_vec();
+        assert_eq!(short.len(), 4, "nothing of the earlier item is left");
+
+        let mut parcel = Parcel::new_data_only();
         assert_eq!(
-            decode_item::<i64>(&mut buf).err(),
+            decode_item::<Vec<u8>>(&mut parcel, &long),
+            Ok(vec![9u8; 300])
+        );
+        let grown = parcel.capacity();
+        // The long record's bytes stay allocated but are no part of the next.
+        assert_eq!(decode_item::<i32>(&mut parcel, &short), Ok(7));
+        assert_eq!(parcel.capacity(), grown, "the allocation is kept");
+        assert_eq!(
+            decode_item::<i64>(&mut parcel, &short).err(),
             Some(StatusCode::NotEnoughData)
         );
-        assert_eq!(buf.as_ptr(), at, "handed back after a short read");
-        buf.extend_from_slice(&[0; 4]);
-        let at = buf.as_ptr();
+        let mut leftover = short.clone();
+        leftover.extend_from_slice(&[0; 4]);
         assert_eq!(
-            decode_item::<i32>(&mut buf).err(),
+            decode_item::<i32>(&mut parcel, &leftover).err(),
             Some(StatusCode::BadValue)
         );
-        assert_eq!(buf.as_ptr(), at, "handed back after leftover bytes");
+        assert_eq!(
+            decode_item::<i32>(&mut parcel, &short),
+            Ok(7),
+            "a refused record leaves the parcel usable"
+        );
     }
 
     #[test]
