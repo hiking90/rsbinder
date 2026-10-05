@@ -235,8 +235,8 @@ tier_hermetic() {
     if have cargo-ndk && [ -n "${ANDROID_NDK_HOME:-}" ]; then
         local t
         for t in x86_64-linux-android aarch64-linux-android; do
-            run "android build $t" cargo ndk -t "$t" --platform 29build --release
-            run "android test build $t" cargo ndk -t "$t" --platform 29test --no-run
+            run "android build $t" cargo ndk -t "$t" --platform 29 build --release
+            run "android test build $t" cargo ndk -t "$t" --platform 29 test --no-run
         done
     else
         skip "android builds" "needs cargo-ndk and ANDROID_NDK_HOME"
