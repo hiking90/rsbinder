@@ -111,10 +111,12 @@
 //! A full ring parks the producer on the ring's futex until the consumer
 //! reads; an empty ring parks the consumer until the producer writes.
 //! Before parking, a blocking call looks at the ring for up to 20 µs
-//! (not on a single-core machine, never on an async executor thread, and
-//! only on every eighth wait of a side whose recent looks all came up
-//! empty, until a look finds something or a wait shows one would have),
-//! since a park costs a futex wake on the other side. The consumer copies
+//! (not on a single-core machine, never on an async executor thread, not
+//! past a first short round while half the process's cores' worth of
+//! threads already look, and only on every eighth wait of a side whose
+//! recent looks all came up empty, until a look finds something or a wait
+//! shows one would have), since a park costs a futex wake on the other
+//! side. The consumer copies
 //! every record the producer has committed out of the ring at once and
 //! frees the space with one wake. Each [`send`](Sink::send) still puts
 //! its item in the ring before it returns.

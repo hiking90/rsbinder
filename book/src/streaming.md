@@ -174,8 +174,12 @@ length) followed by the item's parcel bytes. A full ring parks the producer on
 the ring's futex until the consumer reads; an empty ring parks the consumer
 until the producer writes. Before parking, a blocking call looks at the ring
 for up to 20 µs (not on a single-core machine, never on an async executor
-thread), and the consumer copies every record the producer has committed out
-at once and frees the space with one wake. **After the opening call no binder call carries
+thread, not past a first short round while threads for half the cores already
+look, and only on every eighth wait of a side whose last 64 looks found
+nothing), and the consumer copies every record the producer has committed out
+at once and frees the space with one wake. A look costs CPU while it lasts: it
+pays where the other end is about to act, and is turned down where items come
+further apart than the look or more threads look than the cores can run. **After the opening call no binder call carries
 anything in either direction**: the end of the stream is the last record, and
 a cancel is a bit in the ring's EventFlag word. The `sink` binder is still in
 the endpoint, but the producer only links to it for death.

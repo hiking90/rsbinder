@@ -4,7 +4,7 @@
 //! The kernel path: records on an FMQ ring; layout, end reserve and EventFlag bits in StreamEndpoint.aidl.
 
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -45,7 +45,7 @@ const END_MESSAGE_MAX: usize = END_RESERVE - HEADER - END_FIELDS;
 /// How long a side looks at the ring before it parks; a park costs a wake syscall on each side.
 const SPIN: Duration = Duration::from_micros(20);
 /// Full spins in a row that found nothing, after which a side parks without spinning.
-const WASTED_SPINS: u32 = 16;
+const WASTED_SPINS: u32 = 64;
 /// While a side parks without spinning, every this many waits spin in full to see if they pay.
 const PROBE_EVERY: u32 = 8;
 /// Looks between clock reads while spinning.
@@ -80,21 +80,57 @@ fn wake_after_commit(flag: &EventFlag, bits: u32) -> rsbinder_fmq::Result<()> {
     }
 }
 
-/// Look until `done` holds or `budget` passes: whether it held. The caller has just looked once.
-fn spin_until(budget: Duration, mut done: impl FnMut() -> bool) -> bool {
-    if budget.is_zero() {
-        return false;
+/// One of this process's concurrent spins: a spin pays only while its peer runs, so half the cores.
+struct SpinSlot;
+
+static SPINNERS: AtomicUsize = AtomicUsize::new(0);
+
+impl SpinSlot {
+    fn take() -> Option<SpinSlot> {
+        static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let max = *MAX.get_or_init(|| {
+            std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1))
+        });
+        if SPINNERS.fetch_add(1, Ordering::Relaxed) >= max {
+            SPINNERS.fetch_sub(1, Ordering::Relaxed);
+            return None;
+        }
+        Some(SpinSlot)
     }
+}
+
+impl Drop for SpinSlot {
+    fn drop(&mut self) {
+        SPINNERS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Look until `done` holds or `budget` passes: whether it held, and the budget spun (zero when
+/// no slot was free). The caller has just looked once.
+fn spin_until(budget: Duration, mut done: impl FnMut() -> bool) -> (bool, Duration) {
+    if budget.is_zero() {
+        return (false, budget);
+    }
+    // A first round touches nothing shared; on a busy ring most spins end in it.
+    for _ in 0..SPIN_CLOCK_EVERY {
+        std::hint::spin_loop();
+        if done() {
+            return (true, budget);
+        }
+    }
+    let Some(_slot) = SpinSlot::take() else {
+        return (false, Duration::ZERO);
+    };
     let start = Instant::now();
     loop {
         for _ in 0..SPIN_CLOCK_EVERY {
             std::hint::spin_loop();
             if done() {
-                return true;
+                return (true, budget);
             }
         }
         if start.elapsed() >= budget {
-            return false;
+            return (false, budget);
         }
     }
 }
@@ -356,14 +392,14 @@ impl Shared {
     ) -> bool {
         let budget = self.spin.budget(deadline);
         let mut queue = self.queue();
-        let found = spin_until(budget, || {
+        let (found, spun) = spin_until(budget, || {
             self.dead.load(Ordering::Relaxed)
                 || (!is_end
                     && (self.flag.peek() & CANCEL != 0 || self.abandoned.load(Ordering::Relaxed)))
                 // A broken counter ends the spin too; the loop top reports it.
                 || !matches!(queue.begin_write_cached(n, limit), Ok(None))
         });
-        self.spin.spun(budget, found);
+        self.spin.spun(spun, found);
         found
     }
 
@@ -371,10 +407,10 @@ impl Shared {
     fn fills_within(&self, deadline: Option<Instant>) -> bool {
         let budget = self.spin.budget(deadline);
         let queue = self.queue();
-        let found = spin_until(budget, || {
+        let (found, spun) = spin_until(budget, || {
             self.dead.load(Ordering::Relaxed) || !matches!(queue.available_to_read(), Ok(0))
         });
-        self.spin.spun(budget, found);
+        self.spin.spun(spun, found);
         found
     }
 }
@@ -2072,6 +2108,25 @@ mod tests {
         }
     }
 
+    /// With every spin slot taken, a spin ends after its first round and reports no spin.
+    #[test]
+    fn a_spin_with_no_free_slot_reports_no_spin() {
+        if spin_budget(None) < SPIN {
+            return;
+        }
+        // Other tests' waits only skip their spins meanwhile.
+        SPINNERS.fetch_add(1 << 20, Ordering::Relaxed);
+        let unspun = spin_until(SPIN, || false);
+        let mut looks = 0;
+        let caught = spin_until(SPIN, || {
+            looks += 1;
+            looks == 3
+        });
+        SPINNERS.fetch_sub(1 << 20, Ordering::Relaxed);
+        assert_eq!(unspun, (false, Duration::ZERO));
+        assert_eq!(caught, (true, SPIN), "the first round needs no slot");
+    }
+
     /// Plan 10-7c D13: a spin a deadline cut short and a slow wake change nothing.
     #[test]
     fn the_spin_turns_off_after_wasted_spins_and_back_on_after_a_quick_wake() {
@@ -2150,7 +2205,8 @@ mod tests {
         }
         let (mut tx, mut rx) = pair::<i32>(64 * 1024);
         let producer = thread::spawn(move || {
-            for item in 0..50 {
+            // Past WASTED_SPINS with room for waits other tests' spins leave unspun.
+            for item in 0..200 {
                 thread::sleep(Duration::from_millis(1));
                 tx.send(&item, None).expect("send");
             }
@@ -2164,7 +2220,7 @@ mod tests {
         producer.join().expect("producer");
         assert!(
             turned_off,
-            "50 waits of a millisecond never turned the spin off"
+            "200 waits of a millisecond never turned the spin off"
         );
     }
 

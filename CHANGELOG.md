@@ -537,13 +537,15 @@ This changelog starts at 0.9.0. For earlier releases, see the
   consumer copies every committed record out at once and frees the space
   with one wake (so the producer runs ahead of what `recv` returned by under
   twice `ring_bytes`, and the consumer's copy buffer grows to at most the
-  ring's size, plus a decode buffer kept at the largest item's size), and both ends look at the ring for up to 20 µs before
-  parking on its futex (not on a single core, never on an async executor
-  thread; an end whose last sixteen looks all found nothing parks at once,
-  looking in full on one wait in eight, until such a look finds something or
-  a wait ends within 20 µs, so a stream whose items come further apart pays
-  the look on one item in eight); each `send` still puts its item in the
-  ring. Configured through
+  ring's size, plus a decode buffer kept at the largest item's size), and
+  both ends look at the ring for up to 20 µs before parking on its futex
+  (not on a single core, never on an async executor thread; no more than
+  half the cores' worth of threads in a process look past a first short
+  round at once; an end whose last 64 looks all found nothing looks in full
+  on one wait in eight, until such a look finds something or a wait it
+  parked for without looking ends within 20 µs, so a stream whose items come
+  further apart pays the look on one item in eight); each `send` still puts
+  its item in the ring. Configured through
   `SinkPolicy` (incl. `send_timeout`) and `ReceiverPolicy`; async variants
   with `tokio`. On RPC a waiting end pings a peer it has not heard from for a
   third of the session's reply deadline (`PingPolicy`, twoway
