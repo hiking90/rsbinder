@@ -71,6 +71,25 @@ fn spin_budget(deadline: Option<Instant>) -> Duration {
     }
 }
 
+/// Look until `done` holds or `budget` passes: whether it held. The caller has just looked once.
+fn spin_until(budget: Duration, mut done: impl FnMut() -> bool) -> bool {
+    if budget.is_zero() {
+        return false;
+    }
+    let start = Instant::now();
+    loop {
+        for _ in 0..SPIN_CLOCK_EVERY {
+            std::hint::spin_loop();
+            if done() {
+                return true;
+            }
+        }
+        if start.elapsed() >= budget {
+            return false;
+        }
+    }
+}
+
 // --- The ring, as both ends and the pool see it ---
 
 /// One end's ring handle, shared with its pool task and the death recipient that wakes it.
@@ -133,6 +152,8 @@ impl Shared {
             self.capacity - END_RESERVE
         };
         let n = HEADER + payload.len();
+        // The last wait returned: a bit the consumer left set ends a wait at once, so no second spin.
+        let mut woke = false;
         loop {
             if self.dead.load(Ordering::SeqCst) {
                 return Err(WriteFailure::Dead);
@@ -173,19 +194,25 @@ impl Shared {
                     return Ok(true);
                 }
             }
-            let timeout = match wait {
+            let (timeout, deadline) = match wait {
                 Wait::Never => return Ok(false),
-                Wait::Forever => None,
+                Wait::Forever => (None, None),
                 Wait::Until(deadline) => {
                     let left = deadline.saturating_duration_since(Instant::now());
                     if left.is_zero() {
                         return Err(WriteFailure::TimedOut);
                     }
-                    Some(left)
+                    (Some(left), Some(deadline))
                 }
             };
+            if !woke && self.turns_within(n, limit, is_end, spin_budget(deadline)) {
+                continue;
+            }
             let seen = match self.flag.wait(NOT_FULL | CANCEL, timeout) {
-                Ok(seen) => seen,
+                Ok(seen) => {
+                    woke = true;
+                    seen
+                }
                 Err(rsbinder_fmq::Error::TimedOut) => return Err(WriteFailure::TimedOut),
                 Err(e) => return Err(WriteFailure::broken(e)),
             };
@@ -196,6 +223,26 @@ impl Shared {
                 }
             }
         }
+    }
+
+    /// Look for room, a death or a stop for up to `budget` before parking; the loop top tells which.
+    fn turns_within(&self, n: usize, limit: usize, is_end: bool, budget: Duration) -> bool {
+        let mut queue = self.queue();
+        spin_until(budget, || {
+            self.dead.load(Ordering::Relaxed)
+                || (!is_end
+                    && (self.flag.peek() & CANCEL != 0 || self.abandoned.load(Ordering::Relaxed)))
+                // A broken counter ends the spin too; the loop top reports it.
+                || !matches!(queue.begin_write_cached(n, limit), Ok(None))
+        })
+    }
+
+    /// Look for a record or a death for up to `budget` before parking, leaving the flag word alone.
+    fn fills_within(&self, budget: Duration) -> bool {
+        let queue = self.queue();
+        spin_until(budget, || {
+            self.dead.load(Ordering::Relaxed) || !matches!(queue.available_to_read(), Ok(0))
+        })
     }
 }
 
@@ -883,6 +930,11 @@ impl WaitInTransit {
     }
 
     fn wait(mut self) {
+        // On the pool, so the executor thread never spins. A record seen here leaves `NOT_EMPTY`
+        // as the producer set it; the consumer's next wait returns once at most for it.
+        if self.shared.fills_within(spin_budget(None)) {
+            return;
+        }
         if let Err(e) = self.shared.flag.wait(NOT_EMPTY, None) {
             self.failure = Some(StatusCode::from(e));
         }
@@ -1026,13 +1078,15 @@ impl<T: Deserialize> Consumer<T> {
         if self.finished {
             return None;
         }
+        let deadline = match wait {
+            Wait::Until(deadline) => Some(deadline),
+            Wait::Never | Wait::Forever => None,
+        };
+        // The last wait returned: a bit the producer left set ends a wait at once, so no second spin.
+        let mut woke = false;
         loop {
             // Join before looking, like the producer: an orphan takes each wake until it settles.
             if !matches!(wait, Wait::Never) && self.transit.in_transit() {
-                let deadline = match wait {
-                    Wait::Until(deadline) => Some(deadline),
-                    _ => None,
-                };
                 if !self.transit.wait_idle_until(deadline) {
                     return None;
                 }
@@ -1041,11 +1095,6 @@ impl<T: Deserialize> Consumer<T> {
                 }
                 continue;
             }
-            let deadline = match wait {
-                Wait::Never => None,
-                Wait::Until(deadline) => Some(deadline),
-                Wait::Forever => None,
-            };
             // Only a call that may wait: `try_recv` and `recv_async`'s look take what is there.
             if !matches!(wait, Wait::Never) && self.at == self.filled {
                 self.let_a_batch_build(deadline);
@@ -1057,6 +1106,9 @@ impl<T: Deserialize> Consumer<T> {
             }
             if matches!(wait, Wait::Never) {
                 return None;
+            }
+            if !woke && self.shared.fills_within(spin_budget(deadline)) {
+                continue;
             }
             #[cfg(test)]
             if let Some(hook) = self.about_to_park.as_mut() {
@@ -1073,7 +1125,7 @@ impl<T: Deserialize> Consumer<T> {
                 None => None,
             };
             match self.shared.flag.wait(NOT_EMPTY, timeout) {
-                Ok(_) => {}
+                Ok(_) => woke = true,
                 Err(rsbinder_fmq::Error::TimedOut) => return None,
                 Err(e) => {
                     self.fail(Status::from(StatusCode::from(e)));
@@ -1915,7 +1967,8 @@ mod tests {
         );
     }
 
-    /// A live `recv_async` wait consumes its wake for good and leaves `NOT_EMPTY` clear.
+    /// A `recv_async` wait that parked consumes its wake for good and leaves `NOT_EMPTY` clear;
+    /// one that saw the record while spinning leaves the bit as the producer set it.
     #[cfg(feature = "tokio")]
     #[test]
     fn a_finished_recv_async_wait_leaves_the_futex_clear() {
@@ -1924,20 +1977,29 @@ mod tests {
             .build()
             .expect("runtime");
         let (mut tx, mut rx) = pair::<i32>(512);
-        let got = runtime.block_on(async {
-            let mut pending = std::pin::pin!(rx.recv_async());
-            // One poll: nothing to read, so the wait goes to the pool.
-            let polled = std::future::poll_fn(|cx| {
-                std::task::Poll::Ready(pending.as_mut().poll(cx).is_pending())
-            })
-            .await;
-            assert!(polled);
-            tx.send(&7, None).expect("send");
-            pending.await
-        });
-        assert_eq!(got.expect("an item").expect("ok"), 7);
-        assert_eq!(rx.shared.flag.peek() & NOT_EMPTY, 0, "the wake is consumed");
-        assert_eq!(rx.try_recv().expect("no error"), None);
+        for (item, parked) in [(7, true), (8, false)] {
+            let got = runtime.block_on(async {
+                let mut pending = std::pin::pin!(rx.recv_async());
+                // One poll: nothing to read, so the wait goes to the pool.
+                let polled = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(pending.as_mut().poll(cx).is_pending())
+                })
+                .await;
+                assert!(polled);
+                if parked {
+                    // Far past the spin: the pool thread is asleep on the futex.
+                    thread::sleep(Duration::from_millis(100));
+                }
+                tx.send(&item, None).expect("send");
+                pending.await
+            });
+            assert_eq!(got.expect("an item").expect("ok"), item);
+            assert!(!rx.transit.in_transit(), "the pool's wait has settled");
+            if parked {
+                assert_eq!(rx.shared.flag.peek() & NOT_EMPTY, 0, "the wake is consumed");
+            }
+            assert_eq!(rx.try_recv().expect("no error"), None);
+        }
     }
 
     /// A `recv_async` dropped mid-wait leaves an orphan; the next call joins it and loses no wake.
