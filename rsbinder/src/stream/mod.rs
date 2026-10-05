@@ -1914,15 +1914,18 @@ mod tests {
         let (sent, _, sink) = bounded(sink, |sink| sink.send(&-1));
         assert_eq!(sent.err(), Some(StatusCode::TimedOut));
 
-        // Room for two records, then three to send: the third times out, the first two stay.
+        // One read moves every record into the consumer's batch; refill to leave room for two.
         assert_eq!(rx.try_recv().expect("no error"), Some(0));
-        assert_eq!(rx.try_recv().expect("no error"), Some(1));
-        let extra = [fill, fill + 1, fill + 2];
+        let refill: Vec<i32> = (fill..2 * fill - 2).collect();
+        let (sent, _, sink) = bounded(sink, move |sink| sink.send_all(refill.iter()));
+        sent.expect("room for these");
+        // Three to send: the third times out, the first two stay.
+        let extra = [2 * fill - 2, 2 * fill - 1, 2 * fill];
         let (sent, _, sink) = bounded(sink, move |sink| sink.send_all(extra.iter()));
         assert_eq!(sent.err(), Some(StatusCode::TimedOut));
         sink.end().expect("end");
         let rest: Vec<i32> = (&mut rx).map(|item| item.expect("ok")).collect();
-        assert_eq!(rest, (2..fill + 2).collect::<Vec<_>>());
+        assert_eq!(rest, (1..2 * fill).collect::<Vec<_>>());
         assert!(rx.end_status().expect("ended").is_ok());
     }
 

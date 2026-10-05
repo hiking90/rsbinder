@@ -51,6 +51,26 @@ const END_FIELDS: usize = 8;
 /// Bytes of message an end record can carry within the reserve.
 const END_MESSAGE_MAX: usize = END_RESERVE - HEADER - END_FIELDS;
 
+/// How long a side looks at the ring before it parks; a park costs a wake syscall on each side.
+const SPIN: Duration = Duration::from_micros(20);
+/// Looks between clock reads while spinning.
+const SPIN_CLOCK_EVERY: u32 = 32;
+/// Committed bytes a refill waits for while the producer is still adding: reading right behind
+/// it takes the cache line it is writing, once per record.
+const MIN_BATCH: usize = 4096;
+
+/// The spin for a wait ending at `deadline`; none on one core, where spinning holds up the peer.
+fn spin_budget(deadline: Option<Instant>) -> Duration {
+    static MULTICORE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let multicore =
+        *MULTICORE.get_or_init(|| std::thread::available_parallelism().is_ok_and(|n| n.get() > 1));
+    match deadline {
+        _ if !multicore => Duration::ZERO,
+        Some(deadline) => SPIN.min(deadline.saturating_duration_since(Instant::now())),
+        None => SPIN,
+    }
+}
+
 // --- The ring, as both ends and the pool see it ---
 
 /// One end's ring handle, shared with its pool task and the death recipient that wakes it.
@@ -909,7 +929,12 @@ pub(super) struct Consumer<T> {
     /// The end was reported; later calls read as finished.
     finished: bool,
     sink_binder: SIBinder,
-    /// Scratch: a record is copied out of the ring before anything interprets it.
+    /// Records copied out of the ring in one go, before anything interprets them; grows up to
+    /// the ring's size. `batch[at..filled]` is not parsed yet.
+    batch: Vec<u8>,
+    at: usize,
+    filled: usize,
+    /// Scratch for the payload `decode_item` takes.
     buf: Vec<u8>,
     /// Test hook, run at the last point before a call commits to sleeping.
     #[cfg(test)]
@@ -950,6 +975,9 @@ impl<T: Deserialize> Consumer<T> {
             transit: Arc::new(Transit::default()),
             finished: false,
             sink_binder: sink_binder.clone(),
+            batch: Vec::new(),
+            at: 0,
+            filled: 0,
             buf: Vec::new(),
             #[cfg(test)]
             about_to_park: None,
@@ -1013,16 +1041,23 @@ impl<T: Deserialize> Consumer<T> {
                 }
                 continue;
             }
+            let deadline = match wait {
+                Wait::Never => None,
+                Wait::Until(deadline) => Some(deadline),
+                Wait::Forever => None,
+            };
+            // Only a call that may wait: `try_recv` and `recv_async`'s look take what is there.
+            if !matches!(wait, Wait::Never) && self.at == self.filled {
+                self.let_a_batch_build(deadline);
+            }
             match self.step() {
                 Step::Item(item) => return Some(Ok(item)),
                 Step::End(status) => return self.finish(status),
                 Step::Nothing => {}
             }
-            let deadline = match wait {
-                Wait::Never => return None,
-                Wait::Until(deadline) => Some(deadline),
-                Wait::Forever => None,
-            };
+            if matches!(wait, Wait::Never) {
+                return None;
+            }
             #[cfg(test)]
             if let Some(hook) = self.about_to_park.as_mut() {
                 hook();
@@ -1087,12 +1122,12 @@ impl<T: Deserialize> Consumer<T> {
         }
     }
 
-    /// One record, if there is one: copied out, then interpreted.
+    /// One record, if there is one: copied out, then interpreted. Never waits.
     fn step(&mut self) -> Step<T> {
         // Before the look: a death noticed after it may follow an end record the look missed.
         let ended = self.shared.end();
-        let is_end = match self.read_record() {
-            Ok(Some(is_end)) => is_end,
+        let (is_end, payload) = match self.read_record() {
+            Ok(Some(record)) => record,
             Ok(None) => {
                 #[cfg(test)]
                 if let Some(hook) = self.after_empty_look.as_mut() {
@@ -1106,10 +1141,8 @@ impl<T: Deserialize> Consumer<T> {
             }
             Err(what) => return self.corrupted(what),
         };
-        // Wake on every read, as libfmq does: a producer may wait for room for several records.
-        let _ = self.shared.flag.wake(NOT_FULL);
         if is_end {
-            let status = end_status(&self.buf);
+            let status = end_status(&self.batch[payload]);
             // The producer's last word outranks only a death notice; one lock, so none slips in.
             let mut end = self.shared.end.lock().unwrap_or_else(|e| e.into_inner());
             let outranks = end
@@ -1125,64 +1158,105 @@ impl<T: Deserialize> Consumer<T> {
             // What was recorded is the end, as the empty-ring branch reports it.
             return Step::End(end.clone().unwrap_or(status));
         }
+        self.buf.clear();
+        self.buf.extend_from_slice(&self.batch[payload]);
         match decode_item::<T>(&mut self.buf) {
             Ok(item) => Step::Item(item),
             Err(e) => self.fail(Status::from(e)),
         }
     }
 
-    /// Copy the next record into `buf`: `Some(is_end)`, `None` if empty, `Err` on a broken ring.
-    fn read_record(&mut self) -> std::result::Result<Option<bool>, String> {
-        // Split so the guard on `shared` and the write to `buf` coexist.
-        let Consumer { shared, buf, .. } = self;
-        let mut queue = shared.queue();
-        let available = queue
-            .available_to_read()
-            .map_err(|e| format!("the ring's counters: {e}"))?;
-        if available == 0 {
+    /// The next record from `batch`, refilled when used up: `Some((is_end, payload range))`,
+    /// `None` when both are empty, `Err` on a broken ring.
+    fn read_record(
+        &mut self,
+    ) -> std::result::Result<Option<(bool, std::ops::Range<usize>)>, String> {
+        if self.at == self.filled && !self.refill()? {
             return Ok(None);
         }
-        if available < HEADER {
+        let rest = &self.batch[self.at..self.filled];
+        if rest.len() < HEADER {
             return Err("a partial record header".to_string());
         }
-        let mut header = [0u8; HEADER];
-        queue
-            .begin_read(HEADER)
-            .map_err(StatusCode::from)
-            .and_then(|regions| match regions {
-                Some(regions) => regions.read_at(0, &mut header).map_err(StatusCode::from),
-                None => Err(StatusCode::BadValue),
-            })
-            .map_err(|e| format!("the ring's counters: {e:?}"))?;
-        let header = u32::from_le_bytes(header);
+        let header = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
         let is_end = header & KIND_END != 0;
         let len = (header & LEN_MASK) as usize;
         let most = if is_end {
-            shared.capacity - HEADER
+            self.shared.capacity - HEADER
         } else {
-            shared.capacity - END_RESERVE - HEADER
+            self.shared.capacity - END_RESERVE - HEADER
         };
         if len > most || (is_end && len < END_FIELDS) {
             return Err(format!("a record header claiming {len} bytes"));
         }
-        if available < HEADER + len {
+        if rest.len() < HEADER + len {
             // A record is committed whole, so a short count means the counters lie.
             return Err(format!(
-                "a record of {len} bytes with {available} bytes in the ring"
+                "a record of {len} bytes with {} bytes committed",
+                rest.len()
             ));
         }
-        // No `clear()`: `read_at` overwrites all `len` bytes, so only a grown tail is zeroed.
-        buf.resize(len, 0);
+        let payload = self.at + HEADER..self.at + HEADER + len;
+        self.at = payload.end;
+        Ok(Some((is_end, payload)))
+    }
+
+    /// Copy every committed byte out of the ring, free it and wake once: `false` if there were none.
+    fn refill(&mut self) -> std::result::Result<bool, String> {
+        let mut queue = self.shared.queue();
+        let available = queue
+            .available_to_read()
+            .map_err(|e| format!("the ring's counters: {e}"))?;
+        if available == 0 {
+            return Ok(false);
+        }
+        // Grows only, so a refill zeroes nothing it will overwrite anyway.
+        if self.batch.len() < available {
+            self.batch.resize(available, 0);
+        }
+        let batch = &mut self.batch[..available];
         queue
-            .begin_read(HEADER + len)
+            .begin_read(available)
             .map_err(StatusCode::from)
             .and_then(|regions| match regions {
-                Some(regions) => regions.read_at(HEADER, buf).map_err(StatusCode::from),
+                Some(regions) => regions.read_at(0, batch).map_err(StatusCode::from),
                 None => Err(StatusCode::BadValue),
             })
-            .and_then(|()| queue.commit_read(HEADER + len).map_err(StatusCode::from))
+            .and_then(|()| queue.commit_read(available).map_err(StatusCode::from))
             .map_err(|e| format!("the ring's counters: {e:?}"))?;
-        Ok(Some(is_end))
+        drop(queue);
+        self.at = 0;
+        self.filled = available;
+        // The one point room is made; `StreamEndpoint.aidl` lets a multi-record read wake once.
+        let _ = self.shared.flag.wake(NOT_FULL);
+        Ok(true)
+    }
+
+    /// Before a refill, while the producer keeps adding: let up to `MIN_BATCH` bytes build up,
+    /// for at most the spin budget. Stops as soon as a round of looks sees no growth.
+    fn let_a_batch_build(&self, deadline: Option<Instant>) {
+        let budget = spin_budget(deadline);
+        if budget.is_zero() {
+            return;
+        }
+        let queue = self.shared.queue();
+        // A broken counter is left for the refill to report.
+        let Ok(mut seen) = queue.available_to_read() else {
+            return;
+        };
+        if seen == 0 || seen >= MIN_BATCH {
+            return;
+        }
+        let start = Instant::now();
+        loop {
+            for _ in 0..SPIN_CLOCK_EVERY {
+                std::hint::spin_loop();
+            }
+            match queue.available_to_read() {
+                Ok(now) if now > seen && now < MIN_BATCH && start.elapsed() < budget => seen = now,
+                _ => return,
+            }
+        }
     }
 
     /// The ring broke its contract: end with `EX_ILLEGAL_STATE` and stop the producer.
@@ -1585,6 +1659,129 @@ mod tests {
         );
     }
 
+    /// A writer handle outside the producer's checks, which is what a hostile peer amounts to.
+    fn raw_writer(ring: &Ring) -> MessageQueue<u8> {
+        let policy = AttachPolicy {
+            max_capacity: 512,
+            require_seal: true,
+            require_event_flag: true,
+        };
+        MessageQueue::<u8>::attach(&Descriptor::try_from(ring).expect("desc"), &policy)
+            .expect("attach")
+    }
+
+    /// One refill takes every committed record and wakes once; records written later follow.
+    #[test]
+    fn a_refill_takes_every_committed_record_and_wakes_once() {
+        let (mut tx, mut rx) = pair::<i32>(512);
+        for item in 0..3 {
+            tx.send(&item, None).expect("send");
+        }
+        assert_eq!(rx.try_recv().expect("no error"), Some(0));
+        assert_eq!(
+            rx.shared.queue().available_to_read().expect("counters"),
+            0,
+            "the refill freed all three records"
+        );
+        let flag = &rx.shared.flag;
+        assert_eq!(flag.wait(NOT_FULL, Some(Duration::ZERO)), Ok(NOT_FULL));
+        assert_eq!(rx.try_recv().expect("no error"), Some(1));
+        assert_eq!(
+            rx.shared.flag.peek() & NOT_FULL,
+            0,
+            "a record from the batch frees nothing, so wakes nobody"
+        );
+        for item in 3..5 {
+            tx.send(&item, None).expect("send");
+        }
+        for expected in 2..5 {
+            assert_eq!(rx.try_recv().expect("no error"), Some(expected));
+        }
+        assert_eq!(rx.try_recv().expect("no error"), None);
+    }
+
+    /// An end record inside the batch comes after the items before it, and only then.
+    #[test]
+    fn an_end_record_inside_the_batch_follows_the_items_before_it() {
+        let (mut tx, mut rx) = pair::<i32>(512);
+        tx.send(&1, None).expect("send");
+        tx.send(&2, None).expect("send");
+        end(tx).expect("end");
+        assert_eq!(rx.try_recv().expect("no error"), Some(1));
+        assert!(!rx.is_finished(), "the end is in the batch, not reached");
+        assert_eq!(rx.try_recv().expect("no error"), Some(2));
+        assert_eq!(rx.try_recv().expect("no error"), None);
+        assert!(rx.is_finished());
+        assert!(rx.end_status().expect("ended").is_ok());
+    }
+
+    /// Records copied out before a death notice are still delivered, then the death is the end.
+    #[test]
+    fn a_death_noticed_after_a_refill_ends_the_stream_after_the_batch() {
+        let (mut tx, mut rx) = pair::<i32>(512);
+        for item in 1..=3 {
+            tx.send(&item, None).expect("send");
+        }
+        assert_eq!(rx.try_recv().expect("no error"), Some(1));
+        let death = rx.death_recipient();
+        crate::DeathRecipient::binder_died(&death, &SIBinder::downgrade(&tx.sink));
+        assert_eq!(rx.recv().expect("item").expect("ok"), 2);
+        assert_eq!(rx.recv().expect("item").expect("ok"), 3);
+        let ended = rx.recv().expect("the end").expect_err("an error");
+        assert_eq!(ended.transaction_error(), StatusCode::DeadObject);
+    }
+
+    /// A bad header behind a good record: the item first, then `EX_ILLEGAL_STATE` and `CANCEL`.
+    #[test]
+    fn a_bad_header_inside_the_batch_ends_the_stream_after_the_items_before_it() {
+        let (mut rx, ring, _sink) = Consumer::<i32>::new(&receiver_policy(512)).expect("a ring");
+        let mut raw = raw_writer(&ring);
+        let mut records = item_header(4).to_le_bytes().to_vec();
+        records.extend_from_slice(&7i32.to_le_bytes());
+        records.extend_from_slice(&item_header(512).to_le_bytes());
+        records.extend_from_slice(&[0; 4]);
+        assert!(raw.write(&records).expect("write"));
+
+        assert_eq!(rx.try_recv().expect("no error"), Some(7));
+        let failure = rx.try_recv().expect_err("the stream must end");
+        assert_eq!(failure.exception_code(), ExceptionCode::IllegalState);
+        assert!(rx.shared.flag.peek() & CANCEL != 0);
+        assert!(rx.try_recv().expect("over").is_none());
+    }
+
+    /// A record is committed whole: a header committed without its payload is a broken ring.
+    #[test]
+    fn a_record_committed_in_two_parts_ends_the_stream() {
+        let (mut rx, ring, _sink) = Consumer::<i32>::new(&receiver_policy(512)).expect("a ring");
+        let mut raw = raw_writer(&ring);
+        assert!(raw.write(&item_header(4).to_le_bytes()).expect("write"));
+        let failure = rx.try_recv().expect_err("the stream must end");
+        assert_eq!(failure.exception_code(), ExceptionCode::IllegalState);
+        assert!(
+            failure.message().unwrap_or_default().contains("committed"),
+            "{failure:?}"
+        );
+    }
+
+    /// A producer that writes one item and stops: the wait for a batch gives up at once.
+    #[test]
+    fn a_lone_item_is_not_held_back_for_a_batch() {
+        let (mut tx, mut rx) = pair::<i32>(64 * 1024);
+        for item in 0..20 {
+            tx.send(&item, None).expect("send");
+            let started = Instant::now();
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(5)).expect("no error"),
+                Some(item)
+            );
+            let took = started.elapsed();
+            assert!(
+                took < SPIN + Duration::from_millis(5),
+                "item {item} took {took:?}"
+            );
+        }
+    }
+
     /// Plan 10-7b AC-7b.6: an oversized header ends as `EX_ILLEGAL_STATE` and sets `CANCEL`.
     #[test]
     fn a_record_header_the_ring_cannot_hold_ends_the_stream() {
@@ -1937,19 +2134,27 @@ mod tests {
         });
         assert_eq!(tx.pending(), 1);
 
-        // Reading one record makes room: the orphan goes in first.
+        // One read moves every record into the consumer's batch: the orphan goes in first.
         assert_eq!(rx.recv().expect("item").expect("ok"), 0);
         let (done, watch) = mpsc::channel();
         let producer = thread::spawn(move || {
-            let next = tx.send(&(fill + 1), None);
-            let _ = done.send(next);
+            for item in fill + 1..=2 * fill {
+                let _ = done.send(tx.send(&item, None));
+            }
             tx
         });
+        // The orphan holds one record's room, so the last of these finds the ring full.
+        for _ in 1..fill {
+            watch
+                .recv_timeout(Duration::from_secs(5))
+                .expect("room")
+                .expect("send");
+        }
         assert!(
             watch.recv_timeout(Duration::from_millis(300)).is_err(),
             "the ring is full again, so the next send parks"
         );
-        for expected in 1..fill {
+        for expected in 1..2 * fill {
             assert_eq!(rx.recv().expect("item").expect("ok"), expected);
         }
         watch
@@ -1957,8 +2162,7 @@ mod tests {
             .expect("released")
             .expect("send");
         let mut tx = producer.join().expect("producer");
-        assert_eq!(rx.recv().expect("item").expect("ok"), fill);
-        assert_eq!(rx.recv().expect("item").expect("ok"), fill + 1);
+        assert_eq!(rx.recv().expect("item").expect("ok"), 2 * fill);
 
         // A record on the pool, the ring full, then the producer dropped: `Drop` must not wait.
         for item in 0..fill {
