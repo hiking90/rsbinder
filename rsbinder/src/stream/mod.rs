@@ -117,7 +117,10 @@
 //! frees the space with one wake. Each [`send`](Sink::send) still puts
 //! its item in the ring before it returns.
 //! The ring's size is the whole of the flow control
-//! ([`ReceiverPolicy::ring_bytes`]), and it bounds the largest item:
+//! ([`ReceiverPolicy::ring_bytes`]): the producer runs ahead of what
+//! [`recv`](Receiver::recv) has returned by at most the ring plus the
+//! records the consumer has copied out and not yet returned, together
+//! under twice the ring. The size also bounds the largest item:
 //! `ring_bytes - `[`END_RESERVE`]` - 4`. The layout is in
 //! `StreamEndpoint.aidl`; a C++ peer using `libfmq` implements against
 //! it.
@@ -294,14 +297,19 @@ pub const END_RESERVE: usize = 256;
 /// credit window on the RPC path. The peer decides which applies.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReceiverPolicy {
-    /// Kernel binder: bytes of ring the consumer allocates, and so the
-    /// most the producer can run ahead by. Must exceed [`END_RESERVE`]` + 4`;
-    /// the largest item is `ring_bytes - END_RESERVE - 4`, so a stream of
-    /// large items needs a larger ring. The memory is allocated up front
-    /// and charged to the consumer's process.
+    /// Kernel binder: bytes of ring the consumer allocates. Must exceed
+    /// [`END_RESERVE`]` + 4`; the largest item is
+    /// `ring_bytes - END_RESERVE - 4`, so a stream of large items needs a
+    /// larger ring. The memory is allocated up front and charged to the
+    /// consumer's process, and so is a buffer of up to the same size that
+    /// the consumer copies records into before it returns them.
     ///
-    /// Default 64 KiB: sixteen pages, the same in-flight bound as four
-    /// 16 KiB batches on the RPC path. A producer accepts a ring up to
+    /// The producer runs ahead of what the consumer has returned by at most
+    /// what the ring holds plus what that buffer still holds: under twice
+    /// `ring_bytes`. A refill takes every record in the ring at once and
+    /// frees the ring for the producer right away.
+    ///
+    /// Default 64 KiB: sixteen pages. A producer accepts a ring up to
     /// [`SinkPolicy::max_ring_bytes`].
     ///
     /// Once the ring holds a few of the largest items, a larger one mainly

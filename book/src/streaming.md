@@ -235,7 +235,7 @@ ignored. `Receiver::new` and `Sink::open` take the defaults.
 
 | Policy field | Transport | Default | What it sets |
 |---|---|---|---|
-| `ReceiverPolicy::ring_bytes` | kernel | 64 KiB | The ring the consumer allocates — the whole of the flow control, and the bound on the largest item |
+| `ReceiverPolicy::ring_bytes` | kernel | 64 KiB | The ring the consumer allocates — the whole of the flow control (the producer runs ahead by under twice it), and the bound on the largest item |
 | `SinkPolicy::max_ring_bytes` | kernel | 4 MiB | The largest ring the producer maps; a bigger one is refused at `Sink::open` |
 | `SinkPolicy::max_batch_bytes` | RPC | 16 KiB | The byte threshold at which a pending batch is sent |
 | `SinkPolicy::initial_credits` | RPC | 4 | The window the producer opens with — its ceiling on batches in flight |
@@ -244,14 +244,16 @@ ignored. `Receiver::new` and `Sink::open` take the defaults.
 | `ReceiverPolicy::max_opening` | RPC | 4 | The widest opening window the consumer accepts |
 | `SinkPolicy::ping`, `ReceiverPolicy::ping` | RPC | `Inherit` | Whether a wait that hears nothing from the other end pings it; see [a peer that goes silent](#a-peer-that-goes-silent) |
 
-**On the ring** the ring's size is everything: the producer can be ahead of the
-consumer by at most `ring_bytes` of records, and it waits for room beyond
-that. The last `END_RESERVE` (256) bytes are never given to items, so the end
+**On the ring** the ring's size is everything: the producer waits for room once
+the ring is full. The consumer copies every record in the ring out at once and
+frees the ring right away, so the producer can be ahead of what `recv` has
+returned by the ring plus the records the consumer has copied out and not yet
+returned — under twice `ring_bytes`, and the consumer's copy buffer grows to
+at most the ring's size. The last `END_RESERVE` (256) bytes are never given to items, so the end
 record always has room; the largest item is therefore
 `ring_bytes - END_RESERVE - 4`, and a stream of large items needs a larger
 ring. The memory is allocated up front and charged to the consumer's process.
-The default of 64 KiB is sixteen pages, the same in-flight bound as four
-16 KiB batches on the RPC path; the producer's `max_ring_bytes` protects its
+The default of 64 KiB is sixteen pages; the producer's `max_ring_bytes` protects its
 own address space against a consumer that describes a ring of any size. Once
 the ring holds a few of the largest items, a larger ring mainly lets the
 producer run further ahead; one that holds only one or two makes the two ends

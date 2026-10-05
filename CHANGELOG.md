@@ -535,7 +535,9 @@ This changelog starts at 0.9.0. For earlier releases, see the
   Kernel binder uses an FMQ ring the consumer allocates; RPC uses the
   `oneway` `IStreamSink` / `IStreamSource` with credits. On the ring the
   consumer copies every committed record out at once and frees the space
-  with one wake, and both ends look at the ring for up to 20 µs before
+  with one wake (so the producer runs ahead of what `recv` returned by under
+  twice `ring_bytes`, and the consumer's copy buffer grows to at most the
+  ring's size), and both ends look at the ring for up to 20 µs before
   parking on its futex (not on a single core, never on an async executor
   thread); each `send` still puts its item in the ring. Configured through
   `SinkPolicy` (incl. `send_timeout`) and `ReceiverPolicy`; async variants

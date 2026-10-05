@@ -335,7 +335,7 @@ fn consume(name: &str, count: i32, ring_bytes: usize) -> Result<()> {
     Ok(())
 }
 
-/// Take `take` items, check the producer parks at ring capacity, then read the rest.
+/// Take `take` items, check the producer parks once the ring is full, then read the rest.
 fn pause(name: &str, count: i32, ring_bytes: usize, take: i32) -> Result<()> {
     let demo = connect(name)?;
     let (mut rx, endpoint) = receiver_for(&demo, ring_bytes)?;
@@ -371,12 +371,19 @@ fn pause(name: &str, count: i32, ring_bytes: usize, take: i32) -> Result<()> {
         }
         thread::sleep(Duration::from_millis(20));
     }
-    // Read again: an overshoot past `full` means the ring admitted more than it holds.
+    // Past `full` by at most what the consumer copied out with its last refill and has not
+    // returned yet (under one ring), and no further: the ring is full and the producer parked.
+    thread::sleep(Duration::from_millis(200));
+    sent = demo.r#sent().map_err(|e| e.transaction_error())?;
+    thread::sleep(Duration::from_millis(200));
     let again = demo.r#sent().map_err(|e| e.transaction_error())?;
     let finished = demo.r#finished().map_err(|e| e.transaction_error())?;
-    let parked = sent == full && again == full && !finished;
+    let most = full + ring_items(ring_bytes);
+    let parked = (full..most).contains(&sent) && again == sent && !finished;
     if !parked {
-        eprintln!("stream_probe: sent={sent} again={again} finished={finished} full={full}");
+        eprintln!(
+            "stream_probe: sent={sent} again={again} finished={finished} full={full} most={most}"
+        );
     }
 
     let (rest, rest_ordered, ended) = drain(&mut rx, take);
