@@ -71,6 +71,20 @@ fn spin_budget(deadline: Option<Instant>) -> Duration {
     }
 }
 
+/// The wake after a commit: no write to the word while the bit stands, where the hardware keeps
+/// that ordering with a libfmq waiter too (`EventFlag::wake_lazy`); a plain wake elsewhere.
+fn wake_after_commit(flag: &EventFlag, bits: u32) -> rsbinder_fmq::Result<()> {
+    if cfg!(any(
+        target_arch = "x86_64",
+        target_arch = "x86",
+        target_arch = "aarch64"
+    )) {
+        flag.wake_lazy(bits)
+    } else {
+        flag.wake(bits)
+    }
+}
+
 /// Look until `done` holds or `budget` passes: whether it held. The caller has just looked once.
 fn spin_until(budget: Duration, mut done: impl FnMut() -> bool) -> bool {
     if budget.is_zero() {
@@ -188,7 +202,7 @@ impl Shared {
                     queue.commit_write_cached(n).map_err(WriteFailure::broken)?;
                     drop(queue);
                     // Committed is delivered: libfmq's `writeBlocking` ignores a failed wake too.
-                    if let Err(e) = self.flag.wake(NOT_EMPTY) {
+                    if let Err(e) = wake_after_commit(&self.flag, NOT_EMPTY) {
                         log::error!("stream: the wake after a committed record failed: {e:?}");
                     }
                     return Ok(true);
@@ -1278,7 +1292,7 @@ impl<T: Deserialize> Consumer<T> {
         self.at = 0;
         self.filled = available;
         // The one point room is made; `StreamEndpoint.aidl` lets a multi-record read wake once.
-        let _ = self.shared.flag.wake(NOT_FULL);
+        let _ = wake_after_commit(&self.shared.flag, NOT_FULL);
         Ok(true)
     }
 
@@ -1811,6 +1825,55 @@ mod tests {
             failure.message().unwrap_or_default().contains("committed"),
             "{failure:?}"
         );
+    }
+
+    /// Both sides park over and over (bursts, pauses, a ring that fills): no wake is lost.
+    /// `RSB_RING_STRESS_ROUNDS` lengthens it for a stress run on a weakly ordered machine.
+    #[test]
+    fn a_stream_that_keeps_parking_loses_no_wake() {
+        let rounds: i32 = std::env::var("RSB_RING_STRESS_ROUNDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
+        // A pause around the spin budget, so a side may park or catch the other while spinning.
+        let pause = |round: i32| {
+            let until = Instant::now() + SPIN * (round % 4) as u32 / 2;
+            while Instant::now() < until {
+                std::hint::spin_loop();
+            }
+        };
+        let (mut tx, mut rx) = pair::<i32>(512);
+        let producer = thread::spawn(move || {
+            let mut item = 0;
+            for round in 0..rounds {
+                // Up to twice what the ring holds, so the producer parks on a full ring too.
+                for _ in 0..1 + round % 64 {
+                    tx.send(&item, None).expect("send");
+                    item += 1;
+                }
+                pause(round);
+            }
+            end(tx).expect("end");
+            item
+        });
+        let mut expected = 0;
+        let mut round = 0;
+        loop {
+            match rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(Some(item)) => {
+                    assert_eq!(item, expected);
+                    expected += 1;
+                    if expected % 37 == 0 {
+                        round += 1;
+                        pause(round);
+                    }
+                }
+                Ok(None) if rx.is_finished() => break,
+                Ok(None) => panic!("no record for 10 s after item {expected}: a lost wake"),
+                Err(status) => panic!("{status:?}"),
+            }
+        }
+        assert_eq!(producer.join().expect("producer"), expected);
     }
 
     /// A producer that writes one item and stops: the wait for a batch gives up at once.

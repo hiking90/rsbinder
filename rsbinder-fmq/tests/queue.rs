@@ -942,6 +942,32 @@ fn wake_merges_into_a_deferred_wake_and_wait_consumes_only_its_mask() {
 }
 
 #[test]
+fn a_lazy_wake_sets_a_clear_bit_and_leaves_a_standing_one() {
+    let q = MessageQueue::<u8>::create(8, true).unwrap();
+    let flag = q.event_flag().unwrap();
+    let waker = flag.clone();
+    let t = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(60));
+        waker.wake_lazy(NOT_EMPTY).unwrap();
+        waker
+    });
+    assert_eq!(
+        flag.wait(NOT_EMPTY, Some(Duration::from_secs(5))).unwrap(),
+        NOT_EMPTY,
+        "a clear bit is set and the sleeper woken"
+    );
+    let waker = t.join().unwrap();
+    flag.wake(NOT_FULL).unwrap();
+    waker.wake_lazy(NOT_FULL).unwrap();
+    assert_eq!(flag.peek(), NOT_FULL);
+    // Not every bit stands, so the rest is set.
+    waker.wake_lazy(NOT_FULL | NOT_EMPTY).unwrap();
+    assert_eq!(flag.peek(), NOT_FULL | NOT_EMPTY);
+    waker.wake_lazy(0).unwrap();
+    assert_eq!(flag.peek(), NOT_FULL | NOT_EMPTY);
+}
+
+#[test]
 fn a_waiter_sees_only_the_bits_of_its_own_mask() {
     let q = MessageQueue::<u8>::create(8, true).unwrap();
     let flag = q.event_flag().unwrap();
