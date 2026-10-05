@@ -33,8 +33,10 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rsbinder::rpc::{RpcClientConfig, RpcServer, RpcSession};
-use rsbinder::stream::{PingPolicy, Receiver, ReceiverPolicy, Sink, SinkPolicy, StreamEndpoint};
+use rsbinder::rpc::{FileDescriptorTransportMode, RpcClientConfig, RpcServer, RpcSession};
+use rsbinder::stream::{
+    PingPolicy, Receiver, ReceiverPolicy, RingUse, Sink, SinkPolicy, StreamEndpoint, Token,
+};
 use rsbinder::{
     BinderResult, ExceptionCode, FromIBinder, Interface, SIBinder, Status, Strong, TransportCaps,
 };
@@ -53,6 +55,8 @@ fn default_credits() -> i32 {
 struct DemoSvc {
     /// What the service's producers ping with.
     ping: PingPolicy,
+    /// Whether the service's upload receiver may take a ring from an RPC client.
+    upload_ring_use: RingUse,
     sent: Arc<AtomicI32>,
     finished: Arc<AtomicBool>,
     last_error: Arc<AtomicI32>,
@@ -210,12 +214,12 @@ impl IStreamDemo for DemoSvc {
         Ok(self.last_error.load(Ordering::SeqCst))
     }
 
-    // Upload is exercised by the kernel half (`stream_probe`); this keeps the fixture whole.
     fn r#upload(&self, producer: &SIBinder, ring_bytes: i32) -> BinderResult<StreamEndpoint<i32>> {
         let (mut rx, endpoint) = Receiver::<i32>::with_policy(
             producer,
             &ReceiverPolicy {
                 ring_bytes: ring_bytes.max(0) as usize,
+                ring_use: self.upload_ring_use,
                 ..ReceiverPolicy::default()
             },
         )?;
@@ -289,6 +293,9 @@ struct Setup {
     client_timeout: Option<Duration>,
     server_reply_timeout: Option<Duration>,
     producer_ping: PingPolicy,
+    /// Negotiate the `Unix` fd mode, so the session passes file descriptors.
+    fd_unix: bool,
+    upload_ring_use: RingUse,
 }
 
 /// A unix relay that stops forwarding with connections left open, as a silent `adb forward` does.
@@ -395,11 +402,15 @@ fn fixture_with(tag: &str, incoming: u32, setup: Setup) -> Fixture {
 
     let svc = DemoSvc {
         ping: setup.producer_ping,
+        upload_ring_use: setup.upload_ring_use,
         ..DemoSvc::default()
     };
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(2);
     server.set_reply_timeout(setup.server_reply_timeout);
+    if setup.fd_unix {
+        server.set_supported_fd_modes(&[FileDescriptorTransportMode::Unix]);
+    }
     server
         .set_root(BnStreamDemo::new_binder(svc.clone()).as_binder())
         .expect("set_root");
@@ -410,10 +421,11 @@ fn fixture_with(tag: &str, incoming: u32, setup: Setup) -> Fixture {
         .as_ref()
         .map_or(path.as_path(), |relay| relay.path.as_path());
     // `setup_unix_server` already bound the listener, so connecting now cannot race the thread.
-    let client = RpcSession::setup_client_android13plus_with_config(
-        RpcClientConfig::unix(dial, 2).incoming_connections(incoming),
-    )
-    .expect("connect");
+    let mut config = RpcClientConfig::unix(dial, 2).incoming_connections(incoming);
+    if setup.fd_unix {
+        config = config.fd_mode(FileDescriptorTransportMode::Unix);
+    }
+    let client = RpcSession::setup_client_android13plus_with_config(config).expect("connect");
     client.set_timeout(setup.client_timeout);
     let demo = <dyn IStreamDemo as FromIBinder>::try_from(client.get_root().expect("get_root"))
         .expect("cast the root to IStreamDemo");
@@ -929,4 +941,169 @@ fn an_async_producer_notices_a_consumer_gone_silent_behind_a_relay() {
 fn without_a_ping_a_producer_waits_on_a_consumer_gone_silent() {
     let f = parked_producer("noping_tx", PingPolicy::Off, false);
     assert_eq!(producer_outcome(&f, NOTICED_WITHIN), None);
+}
+
+// ---- Plan 10-7c Phase B: a ring over a Unix session ----
+
+/// Where the ring exists; elsewhere an opted-in consumer runs on calls and the same tests check that.
+const RING: bool = cfg!(any(target_os = "linux", target_os = "android"));
+
+/// A session that can carry a ring: a Unix socket on this host, `Unix` fds, one incoming connection.
+fn ring_fixture(tag: &str, upload_ring_use: RingUse) -> Fixture {
+    fixture_with(
+        tag,
+        1,
+        Setup {
+            fd_unix: true,
+            upload_ring_use,
+            ..Setup::default()
+        },
+    )
+}
+
+fn opted_in() -> ReceiverPolicy {
+    ReceiverPolicy {
+        ring_use: RingUse::AlsoUnixRpc,
+        ..ReceiverPolicy::default()
+    }
+}
+
+/// Poll `done` for up to 5 s.
+fn eventually(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !done() {
+        assert!(Instant::now() < deadline, "{what}");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// AC-C1 (AC-C3 off Linux): an opted-in download over a Unix session runs on a ring.
+#[test]
+fn an_opted_in_download_runs_on_a_ring_over_a_unix_session() {
+    let f = ring_fixture("ring_down", RingUse::KernelOnly);
+    let caps = f.client.caps();
+    assert!(
+        caps.contains(
+            TransportCaps::FD_PASSING | TransportCaps::SAME_HOST | TransportCaps::CALLBACKS
+        ),
+        "{caps}"
+    );
+    let (mut rx, endpoint) =
+        Receiver::<i32>::with_policy(&f.demo.as_binder(), &opted_in()).expect("a receiver");
+    assert_eq!(endpoint.ring.is_some(), RING);
+    assert_eq!(rx.uses_ring(), RING);
+    f.demo
+        .r#subscribe(&endpoint, 1000, 64, default_credits(), 0)
+        .expect("subscribe");
+    let got: Vec<i32> = (&mut rx).map(|item| item.expect("item")).collect();
+    assert_eq!(got, (0..1000).collect::<Vec<_>>());
+    assert!(rx.end_status().expect("ended").is_ok());
+}
+
+/// AC-C2: without the opt-in a session that could carry a ring still gets calls.
+#[test]
+fn a_consumer_that_does_not_opt_in_gets_calls_on_a_ring_capable_session() {
+    let f = ring_fixture("ring_off", RingUse::KernelOnly);
+    let (rx, endpoint) = f.default_receiver();
+    assert!(endpoint.ring.is_none());
+    assert!(!rx.uses_ring());
+}
+
+/// AC-C3: an opt-in on a session that passes no fds falls back to calls and still streams.
+#[test]
+fn an_opted_in_consumer_without_fd_passing_gets_calls() {
+    let f = fixture("ring_nofd", 1);
+    assert!(!f.client.caps().contains(TransportCaps::FD_PASSING));
+    let (mut rx, endpoint) =
+        Receiver::<i32>::with_policy(&f.demo.as_binder(), &opted_in()).expect("a receiver");
+    assert!(endpoint.ring.is_none());
+    assert!(!rx.uses_ring());
+    f.demo
+        .r#subscribe(&endpoint, 100, 64, default_credits(), 0)
+        .expect("subscribe");
+    let got: Vec<i32> = (&mut rx).map(|item| item.expect("item")).collect();
+    assert_eq!(got, (0..100).collect::<Vec<_>>());
+}
+
+/// AC-C4: without incoming connections the opt-in changes nothing; the stream is refused as before.
+#[test]
+fn an_opted_in_consumer_without_callbacks_is_refused_as_before() {
+    let f = fixture_with(
+        "ring_nocb",
+        0,
+        Setup {
+            fd_unix: true,
+            ..Setup::default()
+        },
+    );
+    assert!(!f.client.caps().contains(TransportCaps::CALLBACKS));
+    assert_eq!(
+        Receiver::<i32>::with_policy(&f.demo.as_binder(), &opted_in()).err(),
+        Some(rsbinder::StatusCode::InvalidOperation)
+    );
+}
+
+/// AC-C8 and AC-C7: an opted-in upload runs on the service's ring, whose memfd crosses the
+/// socket with its seals, so the client's producer maps it.
+#[test]
+fn an_opted_in_upload_runs_on_a_ring_whose_memfd_keeps_its_seals() {
+    let f = ring_fixture("ring_up", RingUse::AlsoUnixRpc);
+    let token = Token::new();
+    let endpoint = f.demo.r#upload(&token.binder(), 64 * 1024).expect("upload");
+    assert_eq!(endpoint.ring.is_some(), RING);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::fd::AsFd;
+        let ring = endpoint.ring.as_ref().expect("a ring");
+        let desc = rsbinder::fmq::Descriptor::try_from(ring).expect("a descriptor");
+        assert!(
+            rsbinder::fmq::shm::shrink_sealed(desc.fds[0].as_fd()),
+            "the memfd keeps F_SEAL_SHRINK across SCM_RIGHTS"
+        );
+    }
+    let mut sink = Sink::<i32>::open(&endpoint).expect("open the service's ring");
+    for item in 0..1000 {
+        sink.send(&item).expect("send");
+    }
+    sink.end().expect("end");
+    eventually("the service's receiver must finish", || {
+        f.svc.upload_finished.load(Ordering::SeqCst)
+    });
+    assert_eq!(f.svc.uploaded.load(Ordering::SeqCst), 1000);
+    assert!(f.svc.upload_ordered.load(Ordering::SeqCst));
+    assert_eq!(f.svc.upload_error.load(Ordering::SeqCst), 0);
+}
+
+/// AC-C5: a session that ends ends an RPC ring stream on both sides; the consumer first gets
+/// what was in the ring.
+#[test]
+fn a_closed_session_ends_an_rpc_ring_stream_on_both_sides() {
+    let f = ring_fixture("ring_dead", RingUse::KernelOnly);
+    let (mut rx, endpoint) =
+        Receiver::<i32>::with_policy(&f.demo.as_binder(), &opted_in()).expect("a receiver");
+    assert_eq!(rx.uses_ring(), RING);
+    // 20 ms an item: the producer is between items, not parked, when the session goes.
+    f.demo
+        .r#subscribe(&endpoint, i32::MAX, 64, default_credits(), 20_000)
+        .expect("subscribe");
+    assert_eq!(rx.recv().expect("item 0").expect("ok"), 0);
+
+    f.client.close_session();
+
+    let failure = loop {
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Some(_)) => continue,
+            Ok(None) if rx.is_finished() => panic!("a clean end the producer never sent"),
+            Ok(None) => panic!("the lost session left the consumer waiting"),
+            Err(status) => break status,
+        }
+    };
+    assert_eq!(
+        failure.transaction_error(),
+        rsbinder::StatusCode::DeadObject
+    );
+    let dead = i32::from(rsbinder::StatusCode::DeadObject);
+    eventually("the producer must see the consumer's death", || {
+        f.svc.last_error.load(Ordering::SeqCst) == dead
+    });
 }

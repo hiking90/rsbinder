@@ -139,8 +139,12 @@
 //!
 //! Which one a stream gets is the consumer's peer: a kernel proxy makes a
 //! ring, and so does a local object on Linux and Android; an RPC proxy
-//! makes a sink-only endpoint, and so does a local object elsewhere.
-//! [`Sink::open`] follows whichever the endpoint carries.
+//! makes a sink-only endpoint, and so does a local object elsewhere. A
+//! consumer may opt an RPC peer into the ring
+//! ([`ReceiverPolicy::ring_use`], [`RingUse::AlsoUnixRpc`]) when the
+//! session is a Unix socket on the same host that passes file descriptors
+//! and carries calls both ways; [`Receiver::uses_ring`] tells which one a
+//! stream got. [`Sink::open`] follows whichever the endpoint carries.
 //!
 //! # What the two have in common
 //!
@@ -293,11 +297,51 @@ impl<T> StreamEndpoint<T> {
 /// `ring_bytes - END_RESERVE - 4`.
 pub const END_RESERVE: usize = 256;
 
+/// Where a [`Receiver`] puts its stream on a ring: the peer has to be able
+/// to map the consumer's memory and be woken through it (plan 10-7c).
+///
+/// The ring needs Linux or Android (an OS shared-memory fd and futex). A
+/// stream that does not get one runs on the RPC path's calls instead, and
+/// [`Receiver::uses_ring`] tells which it got.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RingUse {
+    /// A ring when the peer is a kernel binder proxy or a local object;
+    /// calls when it is an RPC proxy. The default.
+    #[default]
+    KernelOnly,
+    /// Also a ring over an RPC session whose transport can hand the ring
+    /// over and wake through it: a session that
+    /// [passes file descriptors](crate::TransportCaps::FD_PASSING) (a
+    /// Unix-domain socket that negotiated the `Unix` fd mode), on the
+    /// [same host](crate::TransportCaps::SAME_HOST), with
+    /// [calls both ways](crate::TransportCaps::CALLBACKS). A session
+    /// lacking any of these gets calls, and a `log::debug!` line names
+    /// what it lacks.
+    ///
+    /// The producer must implement the ring over RPC. rsbinder's does. A
+    /// producer written to the RPC-only contract refuses the endpoint, and
+    /// how that shows depends on the direction:
+    ///
+    /// * **Download** (the producer is the service being called): its
+    ///   refusal is the error of the call that opens the stream.
+    /// * **Upload** (the producer is the caller): the call that opens the
+    ///   stream has already succeeded, and no call is left to report the
+    ///   refusal on. The consumer learns of it only when the producer's
+    ///   process dies, or from its own
+    ///   [`recv_timeout`](Receiver::recv_timeout).
+    ///
+    /// A producer that ignores the ring and sends batches ends the stream
+    /// with `EX_ILLEGAL_STATE`.
+    AlsoUnixRpc,
+}
+
 /// What a [`Receiver`] is made with: the ring on the kernel path, the
-/// credit window on the RPC path. The peer decides which applies.
+/// credit window on the RPC path. The peer decides which applies, and
+/// [`ring_use`](Self::ring_use) whether an RPC peer may get a ring too.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReceiverPolicy {
-    /// Kernel binder: bytes of ring the consumer allocates. Must exceed
+    /// Ring: bytes of ring the consumer allocates. Must exceed
     /// [`END_RESERVE`]` + 4`; the largest item is
     /// `ring_bytes - END_RESERVE - 4`, so a stream of large items needs a
     /// larger ring. The memory is allocated up front and charged to the
@@ -346,6 +390,13 @@ pub struct ReceiverPolicy {
     /// producer checks that it is still there. Default
     /// [`PingPolicy::Inherit`].
     pub ping: PingPolicy,
+    /// Whether an RPC peer may get a ring. Default
+    /// [`RingUse::KernelOnly`].
+    ///
+    /// The ring is several times faster for items of a kilobyte and more,
+    /// and costs a memfd and a mapping on each side to set up; over an RPC
+    /// session the calls path is faster for small items on x86-64.
+    pub ring_use: RingUse,
 }
 
 impl Default for ReceiverPolicy {
@@ -355,6 +406,7 @@ impl Default for ReceiverPolicy {
             credit_window: 4,
             max_opening: 4,
             ping: PingPolicy::default(),
+            ring_use: RingUse::default(),
         }
     }
 }
@@ -363,7 +415,7 @@ impl Default for ReceiverPolicy {
 /// path, how it batches on the RPC path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SinkPolicy {
-    /// Kernel binder: the largest ring this producer maps. The ring is
+    /// Ring: the largest ring this producer maps. The ring is
     /// the consumer's memory, and a hostile consumer could describe one
     /// of any size; this is the producer's address space at stake.
     ///
@@ -660,10 +712,36 @@ impl Ping {
     }
 }
 
-/// A ring needs one kernel driver (or process) for both ends plus OS shared memory and futex.
-fn over_ring(peer: &SIBinder) -> bool {
-    cfg!(any(target_os = "linux", target_os = "android"))
-        && peer_caps(peer).contains(crate::TransportCaps::KERNEL_KNOBS)
+/// What an RPC session needs to carry a ring: hand over its fd, map it, and call both ways.
+const RING_OVER_RPC: crate::TransportCaps = crate::TransportCaps::SAME_HOST
+    .union(crate::TransportCaps::FD_PASSING)
+    .union(crate::TransportCaps::CALLBACKS);
+
+/// A ring needs OS shared memory and futex, and a peer that can map it: kernel binder or a
+/// local object always, an RPC session when `policy` opts in and the session can.
+fn over_ring(peer: &SIBinder, policy: &ReceiverPolicy) -> bool {
+    let opted_in = policy.ring_use == RingUse::AlsoUnixRpc;
+    if !cfg!(any(target_os = "linux", target_os = "android")) {
+        if opted_in {
+            log::debug!("stream: RingUse::AlsoUnixRpc, but this platform has no ring; using calls");
+        }
+        return false;
+    }
+    let caps = peer_caps(peer);
+    if caps.contains(crate::TransportCaps::KERNEL_KNOBS) {
+        return true;
+    }
+    if !opted_in {
+        return false;
+    }
+    if caps.contains(RING_OVER_RPC) {
+        return true;
+    }
+    log::debug!(
+        "stream: RingUse::AlsoUnixRpc, but the peer's session lacks {}; using calls",
+        RING_OVER_RPC.difference(caps)
+    );
+    false
 }
 
 /// The deadline one `Sink` call's waits share; `None` = no bound, also past what `Instant` holds.
@@ -1325,7 +1403,9 @@ impl<T: Deserialize> Receiver<T> {
     /// [module docs](self#the-endpoint-and-the-call-that-opens-a-stream)).
     /// It picks the transport: a kernel proxy makes a ring endpoint, and so
     /// does a local object on Linux and Android; an RPC proxy makes a
-    /// sink-only one, and so does a local object elsewhere. And it is
+    /// sink-only one, unless the policy opts in ([`RingUse::AlsoUnixRpc`])
+    /// and the session can carry a ring; a local object elsewhere makes a
+    /// sink-only one too. And it is
     /// watched for death, so a producer that dies releases a consumer
     /// blocked in [`recv`](Self::recv); a `peer` that is not in the
     /// producer's process leaves that death unseen, and a local object is
@@ -1355,7 +1435,7 @@ impl<T: Deserialize> Receiver<T> {
         peer: &SIBinder,
         policy: &ReceiverPolicy,
     ) -> Result<(Self, StreamEndpoint<T>)> {
-        let (inner, ring, sink, death) = if over_ring(peer) {
+        let (inner, ring, sink, death) = if over_ring(peer, policy) {
             let (consumer, ring, sink) = ring::Consumer::new(policy)?;
             let death = watch_death(peer, consumer.death_recipient())?;
             (ReceiverInner::Ring(consumer), Some(ring), sink, death)
@@ -1482,6 +1562,13 @@ impl<T: Deserialize> Receiver<T> {
             ReceiverInner::Calls(c) => c.recv_async().await,
             ReceiverInner::Ring(c) => c.recv_async().await,
         }
+    }
+
+    /// Whether this stream runs on a ring, as opposed to the RPC path's
+    /// calls. Fixed when the receiver is made: see [`RingUse`] for what
+    /// decides it.
+    pub fn uses_ring(&self) -> bool {
+        matches!(self.inner, ReceiverInner::Ring(_))
     }
 
     /// Whether the stream is over — the terminator arrived and every
