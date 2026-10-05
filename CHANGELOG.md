@@ -543,8 +543,15 @@ This changelog starts at 0.9.0. For earlier releases, see the
   `SinkPolicy` (incl. `send_timeout`) and `ReceiverPolicy`; async variants
   with `tokio`. On RPC a waiting end pings a peer it has not heard from for a
   third of the session's reply deadline (`PingPolicy`, twoway
-  `PING_TRANSACTION`), which catches a peer lost behind a TCP relay. See the
-  Streaming chapter of the book.
+  `PING_TRANSACTION`), which catches a peer lost behind a TCP relay. A
+  consumer may put an RPC stream on a ring too (`ReceiverPolicy::ring_use =
+  RingUse::AlsoUnixRpc`) when the session is a Unix socket on the same host
+  that passes fds and has incoming connections; otherwise it runs on calls,
+  and `Receiver::uses_ring` tells which. Such a ring pings like the calls path
+  and counts its traffic toward the server's idle timeout. A ring endpoint's
+  sink that receives `onStart` or `onBatch` ends the stream with
+  `EX_ILLEGAL_STATE` rather than drop the items. See the Streaming chapter of
+  the book.
 - **`rpc::EndReason::SessionEnded`**: a serve loop found its session already
   ended — by another connection's fault, a reply deadline or `close_session`.
 - **`RpcTransport::set_liveness` and `TlsStream::set_liveness`**: the kernel's
