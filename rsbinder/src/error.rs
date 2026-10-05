@@ -287,9 +287,7 @@ macro_rules! wire_codes {
 
         #[cfg(test)]
         fn named_wire_codes() -> Vec<(StatusCode, i32)> {
-            let mut codes = Vec::new();
-            $($(#[$attr])* codes.push((StatusCode::$variant, $name));)+
-            codes
+            Vec::from([$($(#[$attr])* (StatusCode::$variant, $name),)+])
         }
     };
 }
