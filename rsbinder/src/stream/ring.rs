@@ -1096,7 +1096,8 @@ impl<T: Deserialize> Consumer<T> {
             Wait::Until(deadline) => Some(deadline),
             Wait::Never | Wait::Forever => None,
         };
-        // The last wait returned: a bit the producer left set ends a wait at once, so no second spin.
+        // A wait has returned: no second spin (a bit the producer left set ends a wait at once),
+        // and no wait for a batch.
         let mut woke = false;
         loop {
             // Join before looking, like the producer: an orphan takes each wake until it settles.
@@ -1110,7 +1111,8 @@ impl<T: Deserialize> Consumer<T> {
                 continue;
             }
             // Only a call that may wait: `try_recv` and `recv_async`'s look take what is there.
-            if !matches!(wait, Wait::Never) && self.at == self.filled {
+            // Not after a park either: the producer was not writing right ahead of this side.
+            if !matches!(wait, Wait::Never) && !woke && self.at == self.filled {
                 self.let_a_batch_build(deadline);
             }
             match self.step() {
