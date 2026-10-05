@@ -520,6 +520,13 @@ above. A session missing any of these — vsock, TCP, TLS, no fd mode, no incomi
 connection — gets calls, and a `log::debug!` line names what was missing;
 `uses_ring` tells which one a stream got. The ring needs Linux or Android.
 
+Across SELinux domains the ring needs what it needs over binder — `fd use` and
+`memfd_file { getattr read write map }` on the consumer's domain, see
+[A minimal stream](#a-minimal-stream) — plus what the session
+needs: `unix_stream_socket connectto` on the server's domain, and for a socket
+bound to a path, `sock_file write` on that file's type. An abstract socket
+(`RpcServer::setup_unix_server_abstract`) has no file to check.
+
 Which to choose is a matter of item size. Measured on x86-64 over a Unix
 session, calls with 16 KiB batches were faster for items up to 128 bytes
 (2.6 times for `i32`, 1.6 times at 64 bytes, 1.2 times at 128), where the ring's
