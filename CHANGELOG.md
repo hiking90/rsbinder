@@ -537,7 +537,7 @@ This changelog starts at 0.9.0. For earlier releases, see the
   consumer copies every committed record out at once and frees the space
   with one wake (so the producer runs ahead of what `recv` returned by under
   twice `ring_bytes`, and the consumer's copy buffer grows to at most the
-  ring's size), and both ends look at the ring for up to 20 µs before
+  ring's size, plus a decode buffer kept at the largest item's size), and both ends look at the ring for up to 20 µs before
   parking on its futex (not on a single core, never on an async executor
   thread; an end whose last sixteen looks all found nothing parks at once,
   looking in full on one wait in eight, until such a look finds something or

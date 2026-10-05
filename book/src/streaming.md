@@ -232,27 +232,29 @@ connection on the session, see [Over RPC](#over-rpc).
 Flow control is set on each side when the stream is made:
 `Receiver::with_policy(&peer, &ReceiverPolicy { .. })` on the consumer and
 `Sink::open_with(&endpoint, &SinkPolicy { .. })` on the producer. Each policy
-has fields for both transports; the ones for the transport not in use are
-ignored. `Receiver::new` and `Sink::open` take the defaults.
+has fields for both paths; the ones for the path not in use are
+ignored. A ring over a Unix session takes the ring fields and `ping`; the
+credit and batch fields do not apply to it. `Receiver::new` and `Sink::open`
+take the defaults.
 
-| Policy field | Transport | Default | What it sets |
+| Policy field | Path | Default | What it sets |
 |---|---|---|---|
 | `ReceiverPolicy::ring_bytes` | ring | 64 KiB | The ring the consumer allocates — the whole of the flow control (the producer runs ahead by under twice it), and the bound on the largest item |
 | `SinkPolicy::max_ring_bytes` | ring | 4 MiB | The largest ring the producer maps; a bigger one is refused at `Sink::open` |
-| `ReceiverPolicy::ring_use` | RPC | `KernelOnly` | Whether an RPC peer may get a ring; see [A ring over a Unix session](#a-ring-over-a-unix-session) |
-| `SinkPolicy::max_batch_bytes` | RPC | 16 KiB | The byte threshold at which a pending batch is sent |
-| `SinkPolicy::initial_credits` | RPC | 4 | The window the producer opens with — its ceiling on batches in flight |
+| `ReceiverPolicy::ring_use` | RPC session | `KernelOnly` | Whether an RPC peer may get a ring; see [A ring over a Unix session](#a-ring-over-a-unix-session) |
+| `SinkPolicy::max_batch_bytes` | calls | 16 KiB | The byte threshold at which a pending batch is sent |
+| `SinkPolicy::initial_credits` | calls | 4 | The window the producer opens with — its ceiling on batches in flight |
 | `SinkPolicy::send_timeout` | both | `None` | How long one `send`/`send_all`/`flush`/`end` call (or `*_async` future, from its first poll) may wait for ring room or credit before it returns `TimedOut`; the item is not written or queued and the stream stays usable. `Some(Duration::ZERO)` never waits. It does not bound the RPC session's own send deadline |
-| `ReceiverPolicy::credit_window` | RPC | 4 | The consumer's grant threshold: a grant leaves once half of it is owed |
-| `ReceiverPolicy::max_opening` | RPC | 4 | The widest opening window the consumer accepts |
-| `SinkPolicy::ping`, `ReceiverPolicy::ping` | RPC | `Inherit` | Whether a wait that hears nothing from the other end pings it; see [a peer that goes silent](#a-peer-that-goes-silent) |
+| `ReceiverPolicy::credit_window` | calls | 4 | The consumer's grant threshold: a grant leaves once half of it is owed |
+| `ReceiverPolicy::max_opening` | calls | 4 | The widest opening window the consumer accepts |
+| `SinkPolicy::ping`, `ReceiverPolicy::ping` | RPC session | `Inherit` | Whether a wait that hears nothing from the other end pings it; see [a peer that goes silent](#a-peer-that-goes-silent) |
 
 **On the ring** the ring's size is everything: the producer waits for room once
 the ring is full. The consumer copies every record in the ring out at once and
 frees the ring right away, so the producer can be ahead of what `recv` has
 returned by the ring plus the records the consumer has copied out and not yet
 returned — under twice `ring_bytes`, and the consumer's copy buffer grows to
-at most the ring's size. The last `END_RESERVE` (256) bytes are never given to items, so the end
+at most the ring's size, plus a decode buffer kept at the largest item's size. The last `END_RESERVE` (256) bytes are never given to items, so the end
 record always has room; the largest item is therefore
 `ring_bytes - END_RESERVE - 4`, and a stream of large items needs a larger
 ring. The memory is allocated up front and charged to the consumer's process.
@@ -431,10 +433,11 @@ while let Some(line) = lines.recv_async().await {
 ```
 
 The producer uses `send_async`, `flush_async`, `end_async` and `end_with_async`
-from a task. Waiting for the consumer suspends the task instead of parking a
-thread — except a wait that may [ping](#a-peer-that-goes-silent) or has a
-`send_timeout`, which holds a pool thread while it lasts, as does a
-`recv_async` that may ping: there is no timer to suspend a task against.
+from a task. On calls, waiting for the consumer suspends the task instead of
+parking a thread — except a wait that may [ping](#a-peer-that-goes-silent) or
+has a `send_timeout`, which holds a pool thread while it lasts, as does a
+`recv_async` that may ping: there is no timer to suspend a task against. On the
+ring every such wait holds a pool thread, as above.
 
 ```rust
 let mut sink = Sink::open(endpoint)?;
@@ -544,10 +547,14 @@ producer's death or its own `recv_timeout`. A producer that ignores the ring and
 sends batches ends the stream with `EX_ILLEGAL_STATE`.
 
 The items do not cross the socket, so to the session a flowing ring looks quiet.
-Each end therefore counts its own ring traffic toward the server's idle check
-(`RpcServer::set_idle_timeout`): a stream whose items keep coming, or come
-more often than the timeout, keeps the session alive. A stalled one does not, as
-on calls, unless it pings.
+The server's end therefore counts its ring traffic toward the session's idle
+check (`RpcServer::set_idle_timeout`); a client has no idle check to feed. A
+stream whose items keep coming, or come more often than the timeout, keeps the
+session alive. Each wait on the ring that parks counts too, so a server-side end
+that keeps waiting with a `recv_timeout` or `send_timeout` longer than the ring's
+spin (20 µs) and shorter than the idle timeout keeps the session alive with no
+item moving, where on calls it would not. A stalled one whose
+waits outlast the timeout does not, as on calls, unless it pings.
 
 ## State, not a sequence: use a `oneway` callback
 

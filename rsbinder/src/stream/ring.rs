@@ -1,16 +1,7 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! The kernel path: records on a Fast Message Queue ring.
-//!
-//! The consumer makes the ring (`rsbinder-fmq`, one memfd, sealed and
-//! allocated up front) and describes it in the endpoint; the producer
-//! attaches. From then on no binder call carries an item: the producer
-//! writes one record per item and waits on the ring's EventFlag when
-//! the ring is full, the consumer reads records and waits when it is
-//! empty. The two binders in play are only watched for death. See
-//! `StreamEndpoint.aidl` for the record layout, the reserve for the end
-//! record and the EventFlag bits, which a C++ peer implements against.
+//! The kernel path: records on an FMQ ring; layout, end reserve and EventFlag bits in StreamEndpoint.aidl.
 
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -59,8 +50,7 @@ const WASTED_SPINS: u32 = 16;
 const PROBE_EVERY: u32 = 8;
 /// Looks between clock reads while spinning.
 const SPIN_CLOCK_EVERY: u32 = 32;
-/// Committed bytes a refill waits for while the producer is still adding: reading right behind
-/// it takes the cache line it is writing, once per record.
+/// Bytes a refill lets build while the producer adds: reading right behind it steals its line.
 const MIN_BATCH: usize = 4096;
 
 /// The spin for a wait ending at `deadline`; none on one core, where spinning holds up the peer.
@@ -75,8 +65,7 @@ fn spin_budget(deadline: Option<Instant>) -> Duration {
     }
 }
 
-/// The wake after a commit: no write to the word while the bit stands, where the hardware keeps
-/// that ordering with a libfmq waiter too (`EventFlag::wake_lazy`); a plain wake elsewhere.
+/// `EventFlag::wake_lazy` where the hardware also orders it against a libfmq waiter, else `wake`.
 fn wake_after_commit(flag: &EventFlag, bits: u32) -> rsbinder_fmq::Result<()> {
     if cfg!(any(
         target_arch = "x86_64",
@@ -110,14 +99,7 @@ fn spin_until(budget: Duration, mut done: impl FnMut() -> bool) -> bool {
     }
 }
 
-/// One side's spin, turned off while its waits outlast it (plan 10-7c D13).
-///
-/// On a stream whose items come further apart than `SPIN`, every spin finds nothing and the
-/// side parks anyway, so each wait costs `SPIN` of CPU for no syscall saved. After
-/// `WASTED_SPINS` such spins in a row the side parks at once, until a park ends within `SPIN`
-/// (a wait a spin would have caught) or one of the full spins it still makes every
-/// `PROBE_EVERY` waits finds something. The probes are what turn it back on where a wake alone
-/// takes longer than `SPIN`, as on an arm64 emulator.
+/// One side's spin, off after `WASTED_SPINS` misses until a quick wake or probe (plan 10-7c D13).
 #[derive(Default)]
 struct SpinGauge {
     wasted: AtomicU32,
@@ -156,8 +138,9 @@ impl SpinGauge {
         }
     }
 
+    /// Only a park no spin preceded: after a full spin, a quick wake is that spin's miss.
     fn parked(&self, took: Duration) {
-        if took < SPIN {
+        if self.is_off() && self.skipped.load(Ordering::Relaxed) > 0 && took < SPIN {
             self.turn_on();
         }
     }
@@ -214,8 +197,7 @@ impl Shared {
         self.queue.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The other end's binder: pinged under `policy` when quiet, and over RPC the session whose
-    /// idle check the ring's traffic counts toward.
+    /// Pinged under `policy` when quiet; over RPC, the session the ring's traffic counts on.
     fn set_other_end(&self, other: &SIBinder, policy: PingPolicy) {
         let _ = self.ping.set((other.clone(), policy));
         #[cfg(feature = "rpc")]
@@ -224,8 +206,7 @@ impl Shared {
         }
     }
 
-    /// Count as activity on an RPC session with an idle timeout: a ring that flows is not idle
-    /// for lack of socket traffic, and a wait shorter than the timeout keeps it so.
+    /// Ring traffic crosses no socket, so count it on a server session that has an idle timeout.
     fn bump_activity(&self) {
         #[cfg(feature = "rpc")]
         if let Some(activity) = self.activity.get() {
@@ -233,9 +214,7 @@ impl Shared {
         }
     }
 
-    /// Wait on `mask` until `deadline`. Over an RPC session whose reply deadline is set, a third
-    /// of it gone quiet pings the peer first and returns `Ok(0)` for the caller to look again;
-    /// an unanswered ping ends the session, and the death link the wait (plan 2-24 D9).
+    /// Wait on `mask` until `deadline`; a quiet RPC session's ping returns `Ok(0)` (plan 2-24 D9).
     fn park(&self, mask: u32, deadline: Option<Instant>) -> rsbinder_fmq::Result<u32> {
         // A wait shorter than the idle timeout keeps a slow stream alive; a stalled one is idle.
         self.bump_activity();
@@ -249,11 +228,12 @@ impl Shared {
         // A caller's deadline that comes first ends the wait without a ping.
         let pings = quiet_until.is_some_and(|quiet| deadline.is_none_or(|d| quiet <= d));
         let wake_at = if pings { quiet_until } else { deadline };
+        let standing = self.flag.peek() & mask != 0;
         let parked_at = Instant::now();
         let timeout = wake_at.map(|at| at.saturating_duration_since(parked_at));
         let seen = self.flag.wait(mask, timeout);
-        // Only a wake: a timeout that came soon says nothing about when the peer acts.
-        if seen.is_ok() {
+        // Only a wake that slept: a soon timeout or a bit a lazy wake left says nothing.
+        if seen.is_ok() && !standing {
             self.spin.parked(parked_at.elapsed());
         }
         match seen {
@@ -1038,8 +1018,7 @@ impl crate::DeathRecipient for ConsumerDeath {
     }
 }
 
-/// A ring endpoint's sink binder, a death link only. A producer that sends items by the RPC
-/// contract instead ends the stream, rather than have them vanish.
+/// A ring endpoint's sink binder, a death link only.
 struct RingSink(Weak<Shared>);
 
 impl RingSink {
@@ -1107,8 +1086,7 @@ impl WaitInTransit {
     }
 
     fn wait(mut self) {
-        // On the pool, so the executor thread never spins. A record seen here leaves `NOT_EMPTY`
-        // as the producer set it; the consumer's next wait returns once at most for it.
+        // On the pool, so the executor thread never spins.
         if self.shared.fills_within(None) {
             return;
         }
@@ -1159,8 +1137,7 @@ pub(super) struct Consumer<T> {
     /// The end was reported; later calls read as finished.
     finished: bool,
     sink_binder: SIBinder,
-    /// Records copied out of the ring in one go, before anything interprets them; grows up to
-    /// the ring's size. `batch[at..filled]` is not parsed yet.
+    /// Records copied out of the ring in one go, up to its size; `batch[at..filled]` is unparsed.
     batch: Vec<u8>,
     at: usize,
     filled: usize,
@@ -1265,8 +1242,7 @@ impl<T: Deserialize> Consumer<T> {
             Wait::Until(deadline) => Some(deadline),
             Wait::Never | Wait::Forever => None,
         };
-        // A wait has returned: no second spin (a bit the producer left set ends a wait at once),
-        // and no wait for a batch.
+        // A wait returned: no second spin (a bit left set ends a wait at once), no batch wait.
         let mut woke = false;
         loop {
             // Join before looking, like the producer: an orphan takes each wake until it settles.
@@ -1279,8 +1255,7 @@ impl<T: Deserialize> Consumer<T> {
                 }
                 continue;
             }
-            // Only a call that may wait: `try_recv` and `recv_async`'s look take what is there.
-            // Not after a park either: the producer was not writing right ahead of this side.
+            // Only a call that may wait, and not after a park: the producer was not just writing.
             if !matches!(wait, Wait::Never) && !woke && self.at == self.filled {
                 self.let_a_batch_build(deadline);
             }
@@ -1394,8 +1369,7 @@ impl<T: Deserialize> Consumer<T> {
         }
     }
 
-    /// The next record from `batch`, refilled when used up: `Some((is_end, payload range))`,
-    /// `None` when both are empty, `Err` on a broken ring.
+    /// The next `(is_end, payload range)` from `batch`, refilled when used up; `None` when empty.
     fn read_record(
         &mut self,
     ) -> std::result::Result<Option<(bool, std::ops::Range<usize>)>, String> {
@@ -1461,8 +1435,7 @@ impl<T: Deserialize> Consumer<T> {
         Ok(true)
     }
 
-    /// Before a refill, while the producer keeps adding: let up to `MIN_BATCH` bytes build up,
-    /// for at most the spin budget. Stops as soon as a round of looks sees no growth.
+    /// Let up to `MIN_BATCH` bytes build while the producer adds, within the spin budget.
     fn let_a_batch_build(&self, deadline: Option<Instant>) {
         let budget = spin_budget(deadline);
         if budget.is_zero() {
@@ -1992,7 +1965,6 @@ mod tests {
         );
     }
 
-    /// Both sides park over and over (bursts, pauses, a ring that fills): no wake is lost.
     /// `RSB_RING_STRESS_ROUNDS` lengthens it for a stress run on a weakly ordered machine.
     #[test]
     fn a_stream_that_keeps_parking_loses_no_wake() {
@@ -2041,8 +2013,7 @@ mod tests {
         assert_eq!(producer.join().expect("producer"), expected);
     }
 
-    /// Plan 10-7c AC-C14: an RPC-contract call on a ring endpoint's sink ends the stream after
-    /// what is already in the ring, as `EX_ILLEGAL_STATE`, and stops the producer.
+    /// Plan 10-7c AC-C14: `EX_ILLEGAL_STATE` after the ring's records, and the producer stops.
     #[test]
     fn a_calls_contract_call_on_a_ring_sink_ends_the_stream() {
         for call in ["onStart", "onBatch"] {
@@ -2101,8 +2072,7 @@ mod tests {
         }
     }
 
-    /// Plan 10-7c D13: full spins that find nothing turn the spin off; a find or a quick wake
-    /// turns it back on; a spin a deadline cut short and a slow wake change nothing.
+    /// Plan 10-7c D13: a spin a deadline cut short and a slow wake change nothing.
     #[test]
     fn the_spin_turns_off_after_wasted_spins_and_back_on_after_a_quick_wake() {
         if spin_budget(None) < SPIN {
@@ -2120,7 +2090,12 @@ mod tests {
             "one wasted full spin short of the limit"
         );
         gauge.spun(SPIN, false);
-        assert_eq!(gauge.budget(None), Duration::ZERO);
+        gauge.parked(Duration::from_micros(1));
+        assert_eq!(
+            gauge.budget(None),
+            Duration::ZERO,
+            "a quick wake after a wasted full spin keeps it off"
+        );
         gauge.spun(Duration::ZERO, false);
         gauge.parked(Duration::from_millis(1));
         assert_eq!(
@@ -2138,8 +2113,7 @@ mod tests {
         assert_eq!(gauge.budget(None), SPIN, "a find starts the count over");
     }
 
-    /// Plan 10-7c D13: with the spin off, every `PROBE_EVERY`th wait spins in full; a probe that
-    /// finds turns it back on without a quick wake, which an emulator's wakes never are.
+    /// Plan 10-7c D13: no quick wake needed, which an emulator's wakes never are.
     #[test]
     fn a_spin_turned_off_is_probed_and_a_probe_that_finds_turns_it_on() {
         if spin_budget(None) < SPIN {
@@ -2159,6 +2133,7 @@ mod tests {
             assert_eq!(gauge.budget(None), SPIN, "round {round}: the probe");
             if round == 0 {
                 gauge.spun(SPIN, false);
+                gauge.parked(Duration::from_micros(1));
                 assert!(gauge.is_off(), "a probe that finds nothing keeps it off");
             }
         }
@@ -2328,8 +2303,7 @@ mod tests {
         );
     }
 
-    /// A `recv_async` wait that parked consumes its wake for good and leaves `NOT_EMPTY` clear;
-    /// one that saw the record while spinning leaves the bit as the producer set it.
+    /// A parked `recv_async` consumes its wake (`NOT_EMPTY` clear); a spinning one leaves the bit.
     #[cfg(feature = "tokio")]
     #[test]
     fn a_finished_recv_async_wait_leaves_the_futex_clear() {

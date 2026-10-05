@@ -844,9 +844,10 @@ impl RpcServer {
     /// Bytes read count as each transport read completes; a frame being
     /// written counts from its first byte until the write returns, however
     /// slowly the peer takes it; a connection joining the session counts
-    /// as it joins, its handshake included. (Honored on the android-13+
-    /// serve path only; the r34 profile bounds its first frame via the
-    /// handshake deadline.)
+    /// as it joins, its handshake included. On a stream ring, the records
+    /// this server's end writes or takes out and its waits that park count
+    /// as they happen. (Honored on the android-13+ serve path only; the
+    /// r34 profile bounds its first frame via the handshake deadline.)
     ///
     /// Two waits are bounded by a deadline directly rather than judged:
     ///
@@ -875,9 +876,14 @@ impl RpcServer {
     /// callback of this server's waiting, and nothing here bounds a
     /// trickle. A client that only waits for callbacks is idle: it moves
     /// no byte and holds no call. So is a stream that waits outside a
-    /// handler without pinging its peer. A stream wait inside a handler
-    /// holds that handler's call open for as long as it lasts, so the
-    /// session is not idle, and only the wait's own deadline bounds it.
+    /// handler without pinging its peer, unless this server's end runs on
+    /// a ring: there each of its waits that parks counts (one the ring's
+    /// short spin did not satisfy, or any once that spin has turned itself
+    /// off), so such waits shorter than `d`, repeated, keep the session
+    /// with no item moving (a client end's waits do not). A stream wait
+    /// inside a handler holds that handler's call open for as long as it
+    /// lasts, so the session is not idle, and only the wait's own deadline
+    /// bounds it.
     ///
     /// It is for a server that admits unauthenticated TCP or TLS peers and
     /// caps them with `set_max_connections`: a peer that finishes the

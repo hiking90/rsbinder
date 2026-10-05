@@ -335,8 +335,7 @@ impl Relay {
         Relay { path, frozen }
     }
 
-    /// Frozen, it holds what it has read and reads no more; the socket stays open. File
-    /// descriptors go across with the bytes they came with, so a ring's memfd crosses too.
+    /// Frozen, it holds what it has read and reads no more; fds cross with their bytes (a memfd).
     fn pump(from: UnixStream, to: UnixStream, frozen: Arc<AtomicBool>) {
         use rustix::net::{
             RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
@@ -1011,6 +1010,26 @@ fn opted_in() -> ReceiverPolicy {
     }
 }
 
+/// Every item to a clean end, each within 10 s: a stall fails rather than hangs.
+fn collect_within(rx: &mut Receiver<i32>) -> Vec<i32> {
+    let mut got = Vec::new();
+    loop {
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Some(item)) => got.push(item),
+            Ok(None) if rx.is_finished() => return got,
+            other => panic!("stalled after {} items: {other:?}", got.len()),
+        }
+    }
+}
+
+/// A send that waits for room or credit fails after 10 s rather than hangs.
+fn bounded_sink() -> SinkPolicy {
+    SinkPolicy {
+        send_timeout: Some(Duration::from_secs(10)),
+        ..SinkPolicy::default()
+    }
+}
+
 /// Poll `done` for up to 5 s.
 fn eventually(what: &str, mut done: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -1038,7 +1057,7 @@ fn an_opted_in_download_runs_on_a_ring_over_a_unix_session() {
     f.demo
         .r#subscribe(&endpoint, 1000, 64, default_credits(), 0)
         .expect("subscribe");
-    let got: Vec<i32> = (&mut rx).map(|item| item.expect("item")).collect();
+    let got = collect_within(&mut rx);
     assert_eq!(got, (0..1000).collect::<Vec<_>>());
     assert!(rx.end_status().expect("ended").is_ok());
 }
@@ -1064,7 +1083,7 @@ fn an_opted_in_consumer_without_fd_passing_gets_calls() {
     f.demo
         .r#subscribe(&endpoint, 100, 64, default_credits(), 0)
         .expect("subscribe");
-    let got: Vec<i32> = (&mut rx).map(|item| item.expect("item")).collect();
+    let got = collect_within(&mut rx);
     assert_eq!(got, (0..100).collect::<Vec<_>>());
 }
 
@@ -1086,8 +1105,7 @@ fn an_opted_in_consumer_without_callbacks_is_refused_as_before() {
     );
 }
 
-/// AC-C8 and AC-C7: an opted-in upload runs on the service's ring, whose memfd crosses the
-/// socket with its seals, so the client's producer maps it.
+/// AC-C8 and AC-C7: an opted-in upload runs on the service's ring; its memfd keeps its seals.
 #[test]
 fn an_opted_in_upload_runs_on_a_ring_whose_memfd_keeps_its_seals() {
     let f = ring_fixture("ring_up", RingUse::AlsoUnixRpc);
@@ -1104,7 +1122,8 @@ fn an_opted_in_upload_runs_on_a_ring_whose_memfd_keeps_its_seals() {
             "the memfd keeps F_SEAL_SHRINK across SCM_RIGHTS"
         );
     }
-    let mut sink = Sink::<i32>::open(&endpoint).expect("open the service's ring");
+    let mut sink =
+        Sink::<i32>::open_with(&endpoint, &bounded_sink()).expect("open the service's ring");
     for item in 0..1000 {
         sink.send(&item).expect("send");
     }
@@ -1118,7 +1137,6 @@ fn an_opted_in_upload_runs_on_a_ring_whose_memfd_keeps_its_seals() {
 }
 
 /// An opted-in download through a relay, the producer idle between items, then the relay frozen.
-/// The ring's items never cross the relay, so only a ping can tell the producer is gone.
 fn frozen_ring_download(tag: &str, ping: PingPolicy) -> (Fixture, Receiver<i32>) {
     let f = fixture_with(
         tag,
@@ -1152,8 +1170,7 @@ fn frozen_ring_download(tag: &str, ping: PingPolicy) -> (Fixture, Receiver<i32>)
     (f, rx)
 }
 
-/// AC-C6, consumer: a ring consumer waiting on a producer gone silent pings it, and the
-/// unanswered ping ends the stream.
+/// AC-C6, consumer: a waiting ring consumer pings a silent producer; no answer ends the stream.
 #[test]
 fn a_waiting_ring_consumer_notices_a_producer_gone_silent_behind_a_relay() {
     let (_f, mut rx) = frozen_ring_download("ring_ping_rx", PingPolicy::Inherit);
@@ -1180,8 +1197,7 @@ fn without_a_ping_a_ring_consumer_waits_on_a_producer_gone_silent() {
     assert!(!rx.is_finished());
 }
 
-/// An opted-in download whose consumer reads nothing: the producer fills a small ring and parks
-/// on it (off Linux, on credit), then the relay is frozen.
+/// An opted-in download read by nobody: the producer parks (off Linux, on credit), then a freeze.
 fn parked_ring_producer(tag: &str, ping: PingPolicy) -> Fixture {
     let f = fixture_with(
         tag,
@@ -1219,8 +1235,7 @@ fn parked_ring_producer(tag: &str, ping: PingPolicy) -> Fixture {
     f
 }
 
-/// AC-C6, producer: a producer parked on a full ring pings the consumer's sink, and the
-/// unanswered ping ends it.
+/// AC-C6, producer: one parked on a full ring pings the consumer's sink; no answer ends it.
 #[test]
 fn a_ring_producer_parked_for_room_notices_a_consumer_gone_silent_behind_a_relay() {
     let f = parked_ring_producer("ring_ping_tx", PingPolicy::Inherit);
@@ -1237,8 +1252,7 @@ fn without_a_ping_a_ring_producer_waits_on_a_consumer_gone_silent() {
     assert_eq!(producer_outcome(&f, NOTICED_WITHIN), None);
 }
 
-/// AC-C5: a session that ends ends an RPC ring stream on both sides; the consumer first gets
-/// what was in the ring.
+/// AC-C5: a closed session ends an RPC ring stream both ways, after what was in the ring.
 #[test]
 fn a_closed_session_ends_an_rpc_ring_stream_on_both_sides() {
     let f = ring_fixture("ring_dead", RingUse::KernelOnly);
@@ -1249,7 +1263,10 @@ fn a_closed_session_ends_an_rpc_ring_stream_on_both_sides() {
     f.demo
         .r#subscribe(&endpoint, i32::MAX, 64, default_credits(), 20_000)
         .expect("subscribe");
-    assert_eq!(rx.recv().expect("item 0").expect("ok"), 0);
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(10)).expect("ok"),
+        Some(0)
+    );
 
     f.client.close_session();
 
@@ -1271,10 +1288,7 @@ fn a_closed_session_ends_an_rpc_ring_stream_on_both_sides() {
     });
 }
 
-// ---- AC-C13: a ring stream and the server's idle timeout ----
-//
-// Ring only: on calls a producer's items wait in its batch until it fills, flushes or ends, so
-// "flowing" there depends on the batch size, which these tests do not pick for that path.
+// ---- AC-C13: a ring stream and the server's idle timeout (ring only: calls batch items) ----
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod idle {
@@ -1345,8 +1359,7 @@ mod idle {
         )
     }
 
-    /// AC-C13 (1): items that keep flowing on the ring are activity, though no byte crosses the
-    /// socket, whichever end the server is.
+    /// AC-C13 (1): items flowing on the ring are activity, though no byte crosses the socket.
     #[test]
     fn a_flowing_ring_stream_outlives_the_servers_idle_timeout() {
         let f = idle_fixture("idle_flow_dl", IDLE, None);
@@ -1371,8 +1384,7 @@ mod idle {
         assert_eq!(spaced_upload(&f, 8, Duration::from_millis(300)), (8, 0));
     }
 
-    /// AC-C13 (3): a stalled ring stream is idle, so the server's timeout still ends it — a client
-    /// cannot hold a server's thread by opening a ring and going quiet.
+    /// AC-C13 (3): a client cannot hold a server's thread by opening a ring and going quiet.
     #[test]
     fn a_stalled_ring_stream_is_ended_by_the_idle_timeout() {
         let dead = i32::from(rsbinder::StatusCode::DeadObject);
@@ -1389,6 +1401,7 @@ mod idle {
             },
         )
         .expect("a receiver");
+        assert_eq!(rx.uses_ring(), RING);
         f.demo
             .r#subscribe(&endpoint, 1_000_000, 4, 1, 0)
             .expect("subscribe");
@@ -1399,6 +1412,7 @@ mod idle {
         let f = idle_fixture("idle_stall_up", IDLE, None);
         let token = Token::new();
         let endpoint = f.demo.r#upload(&token.binder(), 64 * 1024).expect("upload");
+        assert_eq!(endpoint.ring.is_some(), RING);
         let mut sink = Sink::<i32>::open(&endpoint).expect("open");
         sink.send(&0).expect("send");
         eventually("the idle session must end the server's receiver", || {
@@ -1408,8 +1422,7 @@ mod idle {
         drop(sink);
     }
 
-    /// AC-C13 (4): with pinging on (a server reply deadline), a stalled ring stream is not idle:
-    /// each ping is a call.
+    /// AC-C13 (4): a stalled ring stream that pings is not idle: each ping ends a wait, and each re-park counts.
     #[test]
     fn a_stalled_ring_stream_that_pings_survives_the_idle_timeout() {
         let reply = Some(Duration::from_millis(300));
@@ -1425,6 +1438,7 @@ mod idle {
             },
         )
         .expect("a receiver");
+        assert_eq!(rx.uses_ring(), RING);
         f.demo
             .r#subscribe(&endpoint, 1_000_000, 4, 1, 0)
             .expect("subscribe");
@@ -1434,6 +1448,7 @@ mod idle {
         let f = idle_fixture("idle_ping_up", IDLE, reply);
         let token = Token::new();
         let endpoint = f.demo.r#upload(&token.binder(), 64 * 1024).expect("upload");
+        assert_eq!(endpoint.ring.is_some(), RING);
         let mut sink = Sink::<i32>::open(&endpoint).expect("open");
         sink.send(&0).expect("send");
         thread::sleep(Duration::from_millis(1500));
@@ -1465,8 +1480,7 @@ mod two_process {
 
     impl Server {
         fn kill(&mut self) {
-            // A child under another uid (`su`, plan 10-7c B6) refuses the signal; waiting
-            // for it then would never return.
+            // A child under another uid (`su`, plan 10-7c B6) refuses the kill; a wait would hang.
             if self.child.kill().is_ok() {
                 let _ = self.child.wait();
             }
@@ -1479,10 +1493,7 @@ mod two_process {
         }
     }
 
-    /// The child server and a client session to it that can carry a ring.
-    ///
-    /// An abstract socket: no file whose SELinux label a client in another domain must be
-    /// allowed to write (plan 10-7c B6).
+    /// An abstract socket: no file for a client in another domain to be allowed to write.
     fn serve(tag: &str) -> (Server, RpcSession, Strong<dyn IStreamDemo>) {
         let name = format!("rsb_stream_2p_{tag}_{}", std::process::id());
         // `STREAM_PROBE_BIN` on a device, where the build-time path does not exist.
@@ -1514,8 +1525,7 @@ mod two_process {
         (server, client, demo)
     }
 
-    /// A ring over RPC both ways between two processes: the memfd crosses in an argument
-    /// (download) and in a reply (upload), and each side maps what the other allocated.
+    /// A ring over RPC both ways between two processes: the memfd crosses in an argument and a reply.
     #[test]
     fn a_ring_over_rpc_crosses_two_processes() {
         let (_server, _client, demo) = serve("cross");
@@ -1525,18 +1535,17 @@ mod two_process {
         assert!(rx.uses_ring());
         demo.r#subscribe(&endpoint, 200_000, 64, default_credits(), 0)
             .expect("subscribe");
-        let mut expected = 0;
-        for item in &mut rx {
-            assert_eq!(item.expect("item"), expected);
-            expected += 1;
-        }
-        assert_eq!(expected, 200_000);
+        assert!(
+            collect_within(&mut rx).into_iter().eq(0..200_000),
+            "200 000 items in order"
+        );
         assert!(rx.end_status().expect("ended").is_ok());
 
         let token = Token::new();
         let endpoint = demo.r#upload(&token.binder(), 64 * 1024).expect("upload");
         assert!(endpoint.ring.is_some(), "the child's receiver took a ring");
-        let mut sink = Sink::<i32>::open(&endpoint).expect("open the child's ring");
+        let mut sink =
+            Sink::<i32>::open_with(&endpoint, &bounded_sink()).expect("open the child's ring");
         for item in 0..50_000 {
             sink.send(&item).expect("send");
         }
@@ -1559,7 +1568,10 @@ mod two_process {
         demo.r#subscribe(&endpoint, i32::MAX, 64, default_credits(), 1000)
             .expect("subscribe");
         for expected in 0..10 {
-            assert_eq!(rx.recv().expect("item").expect("ok"), expected);
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(10)).expect("ok"),
+                Some(expected)
+            );
         }
         server.kill();
         let mut expected = 10;
@@ -1580,15 +1592,15 @@ mod two_process {
         );
     }
 
-    /// The consumer's process dies: the producer's next write after the death fails, even one
-    /// that would fit the ring.
+    /// The consumer's process dies: the producer's writes fail with `DeadObject` once it sees that.
     #[test]
     fn a_killed_rpc_ring_consumer_ends_the_producer() {
         let (mut server, _client, demo) = serve("consumer_dies");
         let token = Token::new();
         let endpoint = demo.r#upload(&token.binder(), 4096).expect("upload");
         assert!(endpoint.ring.is_some());
-        let mut sink = Sink::<i32>::open(&endpoint).expect("open the child's ring");
+        let mut sink =
+            Sink::<i32>::open_with(&endpoint, &bounded_sink()).expect("open the child's ring");
         for item in 0..100 {
             sink.send(&item).expect("send");
         }

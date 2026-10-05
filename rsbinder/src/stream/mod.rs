@@ -111,7 +111,9 @@
 //! A full ring parks the producer on the ring's futex until the consumer
 //! reads; an empty ring parks the consumer until the producer writes.
 //! Before parking, a blocking call looks at the ring for up to 20 µs
-//! (not on a single-core machine, and never on an async executor thread),
+//! (not on a single-core machine, never on an async executor thread, and
+//! only on every eighth wait of a side whose recent looks all came up
+//! empty, until a look finds something or a wait shows one would have),
 //! since a park costs a futex wake on the other side. The consumer copies
 //! every record the producer has committed out of the ring at once and
 //! frees the space with one wake. Each [`send`](Sink::send) still puts
@@ -346,7 +348,8 @@ pub struct ReceiverPolicy {
     /// `ring_bytes - END_RESERVE - 4`, so a stream of large items needs a
     /// larger ring. The memory is allocated up front and charged to the
     /// consumer's process, and so is a buffer of up to the same size that
-    /// the consumer copies records into before it returns them.
+    /// the consumer copies records into before it returns them, and one
+    /// each item is decoded through, kept at the largest item's size.
     ///
     /// The producer runs ahead of what the consumer has returned by at most
     /// what the ring holds plus what that buffer still holds: under twice
@@ -721,8 +724,7 @@ const RING_OVER_RPC: crate::TransportCaps = crate::TransportCaps::SAME_HOST
     .union(crate::TransportCaps::FD_PASSING)
     .union(crate::TransportCaps::CALLBACKS);
 
-/// A ring needs OS shared memory and futex, and a peer that can map it: kernel binder or a
-/// local object always, an RPC session when `policy` opts in and the session can.
+/// Kernel binder or a local object always; an RPC session only when opted in and capable.
 fn over_ring(peer: &SIBinder, policy: &ReceiverPolicy) -> bool {
     let opted_in = policy.ring_use == RingUse::AlsoUnixRpc;
     if !cfg!(any(target_os = "linux", target_os = "android")) {

@@ -43,11 +43,7 @@
 //! Unix socket, for a libbinder `RpcSession` client to stream against
 //! (`example-hello/cpp/run_stream_rpc_interop.sh`). `replyTimeoutMs` sets
 //! every session's reply deadline, which also arms the stream ping.
-//! `serve-rpc-ring` also takes the `Unix` fd mode and gives an upload a
-//! ring, for `tests/stream_rpc.rs` to run a ring over RPC between two
-//! processes (plan 10-7c AC-C5). A `socketPath` of `@name` is the abstract
-//! socket `name` (Linux, Android): no file for SELinux to check, so a client
-//! in another domain can reach it.
+//! `serve-rpc-ring` adds ring uploads; `@name` is an abstract socket, so SELinux checks no file.
 
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
@@ -238,8 +234,7 @@ fn serve(name: &str) -> Result<()> {
     server.run()
 }
 
-/// The service as an RPC root: a libbinder client asks for the root object, not a name.
-/// `ring`: also take the `Unix` fd mode and give uploads a ring (plan 10-7c Phase B).
+/// The service as an RPC root; `ring` adds the `Unix` fd mode and ring uploads (plan 10-7c).
 #[cfg(feature = "rpc")]
 fn serve_rpc(path: &str, reply_timeout: Option<Duration>, ring: bool) -> Result<()> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -392,8 +387,7 @@ fn pause(name: &str, count: i32, ring_bytes: usize, take: i32) -> Result<()> {
         }
         thread::sleep(Duration::from_millis(20));
     }
-    // Past `full` by at most what the consumer copied out with its last refill and has not
-    // returned yet (under one ring), and no further: the ring is full and the producer parked.
+    // Parked on a full ring: past `full` by under a ring (the consumer's last refill), then flat.
     thread::sleep(Duration::from_millis(200));
     sent = demo.r#sent().map_err(|e| e.transaction_error())?;
     thread::sleep(Duration::from_millis(200));

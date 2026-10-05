@@ -1122,8 +1122,7 @@ impl Parcel {
         p
     }
 
-    /// A data-only parcel's bytes replaced by exactly `bytes`, read from the start; the
-    /// allocation is kept, so one parcel decodes record after record.
+    /// Replace a data-only parcel's bytes, keeping the allocation for the next record.
     pub(crate) fn refill_data_only(&mut self, bytes: &[u8]) {
         debug_assert!(self.rpc.is_some() && self.is_self_contained(), "data-only");
         match &mut self.data {

@@ -1,26 +1,7 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Loom model of `EventFlag::wake_lazy` against a waiter.
-//!
-//! Gated on `cfg(loom)`; empty in normal builds. Run with:
-//!
-//! ```text
-//! RUSTFLAGS="--cfg loom" cargo test -p rsbinder-fmq --test loom_event_flag --release
-//! ```
-//!
-//! This re-implements the protocol with `loom::sync` types; it does not run
-//! the crate's code (the word lives in an mmap and the futex is a syscall).
-//! Each step names the function in `src/event_flag.rs` it stands for. The
-//! futex is a mutex and a condvar: the kernel checks the word and queues the
-//! waiter under the hash-bucket lock that `FUTEX_WAKE` also takes, which is
-//! the ordering a mutex gives.
-//!
-//! The question: a waker that stores the counter and then finds the bit
-//! still standing skips its wake. Can the waiter then sleep on a counter it
-//! read before that store? The bit starts set (a wake the waiter has not
-//! consumed), the only state in which the waker skips. A lost wake shows as
-//! a deadlock, which loom reports by panicking.
+//! Loom model of `EventFlag::wake_lazy`, re-implemented (mmap word, futex); run: see Cargo.toml.
 
 #![cfg(loom)]
 

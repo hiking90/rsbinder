@@ -389,7 +389,9 @@ impl<T: Element> MessageQueue<T> {
     /// counter is loaded again only when the last value seen leaves no room
     /// for `n`. A write that fits by that value loads no counter at all,
     /// where `begin_write` and `commit_write` load both counters each, and
-    /// does not touch the cache line the reader writes.
+    /// does not load the counter the reader writes. The commit's store still
+    /// writes the reader's cache line: libfmq's layout puts both counters in
+    /// the first 16 bytes.
     ///
     /// A reloaded read counter is checked against the view: it may not move
     /// backwards, pass the write counter, put more than the ring in flight
