@@ -255,6 +255,102 @@ fn commit_beyond_free_space_or_available_elements_is_refused() {
     assert_eq!(r.available_to_read().unwrap(), 0);
 }
 
+// ---- The cached writer -----------------------------------------------------
+
+/// Write `items` as the cached writer; `false` when they do not fit within `limit`.
+fn write_cached(w: &mut MessageQueue<u32>, items: &[u32], limit: usize) -> bool {
+    match w.begin_write_cached(items.len(), limit).unwrap() {
+        Some(mut regions) => regions.write_at(0, items).unwrap(),
+        None => return false,
+    }
+    w.commit_write_cached(items.len()).unwrap();
+    true
+}
+
+#[test]
+fn a_cached_writer_full_by_its_view_reloads_the_read_counter() {
+    let mut w = MessageQueue::<u32>::create(8, false).unwrap();
+    let mut r = attach(&w);
+    assert!(write_cached(&mut w, &[1, 2, 3, 4, 5, 6, 7, 8], 8));
+    assert!(
+        !write_cached(&mut w, &[9], 8),
+        "full, and the reload agrees"
+    );
+    let mut out = [0u32; 3];
+    assert!(r.read(&mut out).unwrap());
+    assert!(
+        write_cached(&mut w, &[9, 10, 11], 8),
+        "the reload saw the read"
+    );
+    assert!(!write_cached(&mut w, &[12], 8));
+
+    // `limit` keeps room the writer will not use for these elements.
+    let mut out = [0u32; 8];
+    assert!(r.read(&mut out).unwrap());
+    assert_eq!(out, [4, 5, 6, 7, 8, 9, 10, 11]);
+    assert!(write_cached(&mut w, &[1, 2, 3, 4, 5, 6], 6));
+    assert!(!write_cached(&mut w, &[7], 6));
+    assert!(
+        write_cached(&mut w, &[7, 8], 8),
+        "the rest is there for a wider limit"
+    );
+    assert!(
+        !write_cached(&mut w, &[1], 100),
+        "a limit past the capacity is the capacity"
+    );
+}
+
+#[test]
+fn a_plain_commit_drops_the_cached_view() {
+    let mut w = MessageQueue::<u32>::create(8, false).unwrap();
+    let mut r = attach(&w);
+    assert!(write_cached(&mut w, &[1], 8));
+    assert!(w.write(&[2]).unwrap());
+    // A stale view would write this over `2`.
+    assert!(write_cached(&mut w, &[3], 8));
+    let mut out = [0u32; 3];
+    assert!(r.read(&mut out).unwrap());
+    assert_eq!(out, [1, 2, 3]);
+
+    let mut fresh = MessageQueue::<u32>::create(8, false).unwrap();
+    assert_eq!(
+        fresh.commit_write_cached(1).unwrap_err(),
+        Error::BadValue("commit with no cached view")
+    );
+    assert!(fresh.begin_write_cached(2, 8).unwrap().is_some());
+    assert_eq!(
+        fresh.commit_write_cached(9).unwrap_err(),
+        Error::BadValue("commit exceeds the space that was free")
+    );
+}
+
+#[test]
+fn a_cached_writer_checks_the_read_counter_it_reloads() {
+    let (mut w, d) = fresh_desc(4, false);
+    let raw = Counters::map(&d);
+    assert!(write_cached(&mut w, &[1, 2, 3, 4], 4));
+    // A reader took two: the view is (8, 16) after the reload.
+    raw.set(8, 16);
+    assert!(write_cached(&mut w, &[5, 6], 4));
+
+    for (read, what) in [
+        (4, "read counter moved backwards"),
+        (28, "read counter ahead of the write counter"),
+        (10, "counter not a multiple of the element size"),
+    ] {
+        raw.set(read, 24);
+        assert_eq!(
+            w.begin_write_cached(1, 4).unwrap_err(),
+            Error::Corrupted(what),
+            "read counter {read}"
+        );
+    }
+    // The writer reads its own position back from the view, not from the peer.
+    raw.set(16, 0);
+    assert!(write_cached(&mut w, &[7], 4));
+    assert_eq!(raw.counter(1).load(Ordering::SeqCst), 28);
+}
+
 // ---- AC-12.3: blocking ---------------------------------------------------
 
 #[test]

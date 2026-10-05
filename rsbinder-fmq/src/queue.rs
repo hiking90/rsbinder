@@ -136,6 +136,8 @@ pub struct MessageQueue<T: Element> {
     flag: Option<EventFlag>,
     desc: Descriptor,
     capacity: usize,
+    /// (read, write) as the cached writer last saw them; `None` until a cached write loads them.
+    writer_view: Option<(u64, u64)>,
     _not_sync: PhantomData<Cell<()>>,
     _element: PhantomData<T>,
 }
@@ -256,6 +258,7 @@ impl<T: Element> MessageQueue<T> {
             flag,
             desc,
             capacity: geo.capacity,
+            writer_view: None,
             _not_sync: PhantomData,
             _element: PhantomData,
         })
@@ -358,7 +361,11 @@ impl<T: Element> MessageQueue<T> {
     /// Publish `n` elements written into the regions
     /// [`begin_write`](Self::begin_write) returned. `n` must not exceed the
     /// space free at this moment.
+    ///
+    /// Drops the view [`begin_write_cached`](Self::begin_write_cached)
+    /// keeps, so a cached write after this one loads both counters again.
     pub fn commit_write(&mut self, n: usize) -> Result<()> {
+        self.writer_view = None;
         let (read, write) = self.positions()?;
         let q = size_of::<T>() as u64;
         let free = self.capacity as u64 - (write - read) / q;
@@ -368,6 +375,94 @@ impl<T: Element> MessageQueue<T> {
         self.write
             .get()
             .store(write + n as u64 * q, Ordering::Release);
+        Ok(())
+    }
+
+    /// [`begin_write`](Self::begin_write) for a writer that relies on being
+    /// the queue's only one, keeping at most `limit` elements in flight once
+    /// these `n` are in (`limit` is capped at the capacity). `None` when they
+    /// do not fit.
+    ///
+    /// The write counter is this handle's own: it is loaded on the first
+    /// call, then taken from what
+    /// [`commit_write_cached`](Self::commit_write_cached) stored. The read
+    /// counter is loaded again only when the last value seen leaves no room
+    /// for `n`. A write that fits by that value loads no counter at all,
+    /// where `begin_write` and `commit_write` load both counters each, and
+    /// does not touch the cache line the reader writes.
+    ///
+    /// A reloaded read counter is checked against the view: it may not move
+    /// backwards, pass the write counter, put more than the ring in flight
+    /// or leave a partial element, each of which is
+    /// [`Corrupted`](Error::Corrupted). What this gives up is detecting a
+    /// peer that rewrites the *write* counter: the writer never reads it
+    /// back. The writer's own accesses do not depend on that counter (it
+    /// writes at its own position, inside the ring), so the breach shows on
+    /// the reader's side, as the counters failing its check or wrong
+    /// elements (see "One handle, one side").
+    ///
+    /// [`commit_write`](Self::commit_write), and so [`write`](Self::write)
+    /// and [`write_blocking`](Self::write_blocking), drops the view; the
+    /// next cached call loads both counters again.
+    pub fn begin_write_cached(&mut self, n: usize, limit: usize) -> Result<Option<Regions<'_, T>>> {
+        let limit = limit.min(self.capacity);
+        if n > limit {
+            return Ok(None);
+        }
+        let (read, write) = match self.writer_view {
+            Some(view) => view,
+            None => {
+                let view = self.positions()?;
+                self.writer_view = Some(view);
+                view
+            }
+        };
+        let q = size_of::<T>() as u64;
+        let fits = |read: u64| ((write - read) / q) as usize + n <= limit;
+        if !fits(read) {
+            let fresh = self.read.get().load(Ordering::Acquire);
+            if fresh < read {
+                return Err(Error::Corrupted("read counter moved backwards"));
+            }
+            if fresh > write {
+                return Err(Error::Corrupted("read counter ahead of the write counter"));
+            }
+            if write - fresh > self.ring.bytes as u64 {
+                return Err(Error::Corrupted("more bytes in flight than the ring holds"));
+            }
+            if fresh % q != 0 {
+                return Err(Error::Corrupted(
+                    "counter not a multiple of the element size",
+                ));
+            }
+            self.writer_view = Some((fresh, write));
+            if !fits(fresh) {
+                return Ok(None);
+            }
+        }
+        Ok(Some(self.regions_at(write, n)))
+    }
+
+    /// Publish `n` elements written into the regions
+    /// [`begin_write_cached`](Self::begin_write_cached) returned, and keep
+    /// the new write position as the view. `BadValue` when no cached call
+    /// made a view, or when `n` exceeds the space free by it.
+    pub fn commit_write_cached(&mut self, n: usize) -> Result<()> {
+        let (read, write) = self
+            .writer_view
+            .ok_or(Error::BadValue("commit with no cached view"))?;
+        let q = size_of::<T>() as u64;
+        let free = self.capacity as u64 - (write - read) / q;
+        if n as u64 > free {
+            return Err(Error::BadValue("commit exceeds the space that was free"));
+        }
+        let next = write + n as u64 * q;
+        // `positions` refused a start this close; reaching it takes 2^64 bytes.
+        if next > u64::MAX - self.ring.bytes as u64 {
+            return Err(Error::Corrupted("counter too close to wrapping"));
+        }
+        self.write.get().store(next, Ordering::Release);
+        self.writer_view = Some((read, next));
         Ok(())
     }
 

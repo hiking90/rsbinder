@@ -127,24 +127,24 @@ impl Shared {
             }
             {
                 let mut queue = self.queue();
-                // On the writer's side this is the bytes in flight, counters checked.
-                let in_flight = queue.available_to_read().map_err(WriteFailure::broken)?;
-                if in_flight + n <= limit {
-                    {
-                        let Some(mut regions) =
-                            queue.begin_write(n).map_err(WriteFailure::broken)?
-                        else {
-                            // The counters said it fits; the peer moved them since.
-                            return Err(WriteFailure::Broken(StatusCode::BadValue));
-                        };
+                // The only writer: the reader's counter is reloaded only when it shows no room.
+                let reserved = match queue
+                    .begin_write_cached(n, limit)
+                    .map_err(WriteFailure::broken)?
+                {
+                    Some(mut regions) => {
                         regions
                             .write_at(0, &header.to_le_bytes())
                             .map_err(WriteFailure::broken)?;
                         regions
                             .write_at(HEADER, payload)
                             .map_err(WriteFailure::broken)?;
+                        true
                     }
-                    queue.commit_write(n).map_err(WriteFailure::broken)?;
+                    None => false,
+                };
+                if reserved {
+                    queue.commit_write_cached(n).map_err(WriteFailure::broken)?;
                     drop(queue);
                     // Committed is delivered: libfmq's `writeBlocking` ignores a failed wake too.
                     if let Err(e) = self.flag.wake(NOT_EMPTY) {
