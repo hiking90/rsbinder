@@ -446,7 +446,8 @@ jobs:
       - name: Run the kernel acceptance scripts (tests/scripts/run_*_ac.sh, run_d8b_register.sh)
         # Each starts its own rsb_hub and refuses to while another runs, so
         # they follow the step above. The binaries they drive are from the
-        # workspace build at the top of this job.
+        # workspace build at the top of this job. A device-only script must
+        # not match `run_*_ac.sh` (name it `run_*_stage3.sh`).
         run: |
           rc=0
           for s in tests/scripts/run_*_ac.sh example-hello/cpp/run_d8b_register.sh; do

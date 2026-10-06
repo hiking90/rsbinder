@@ -15,10 +15,11 @@
 #
 #   cargo ndk -t arm64-v8a --platform 35 test -p tests --features rpc --test stream_rpc --no-run
 #   cargo ndk -t arm64-v8a --platform 35 build -p tests --features rpc --bin stream_probe
-#   ./tests/scripts/run_stream_rpc_selinux_ac.sh [-s <serial>] [--target <triple>]
+#   ./tests/scripts/run_stream_rpc_selinux_stage3.sh [-s <serial>] [--target <triple>]
 #
 # Needs a userdebug image (`adb root`, `su`). Leaves the SELinux mode as
-# it found it.
+# it found it. Device-only, so not named `run_*_ac.sh`: that glob is the
+# host kernel gate in integration-test.yml and scripts/local_gate.sh.
 set -u
 
 cd "$(dirname "$0")/../.." || exit 1
