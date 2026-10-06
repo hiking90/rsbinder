@@ -877,10 +877,10 @@ impl RpcServer {
     /// trickle. A client that only waits for callbacks is idle: it moves
     /// no byte and holds no call. So is a stream that waits outside a
     /// handler without pinging its peer, unless this server's end runs on
-    /// a ring: there each of its waits that parks counts (one the ring's
-    /// short spin did not satisfy, or any once that spin has turned itself
-    /// off), so such waits shorter than `d`, repeated, keep the session
-    /// with no item moving (a client end's waits do not). A stream wait
+    /// a ring: there each of its waits that parks counts (a wait longer than
+    /// the ring's short spin always parks), so such waits shorter than `d`,
+    /// repeated, keep the session with no item moving (a client end's waits
+    /// do not). A stream wait
     /// inside a handler holds that handler's call open for as long as it
     /// lasts, so the session is not idle, and only the wait's own deadline
     /// bounds it.

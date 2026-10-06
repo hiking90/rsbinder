@@ -552,8 +552,8 @@ This changelog starts at 0.9.0. For earlier releases, see the
   `PING_TRANSACTION`), which catches a peer lost behind a TCP relay. A
   consumer may put an RPC stream on a ring too (`ReceiverPolicy::ring_use =
   RingUse::AlsoUnixRpc`) when the session is a Unix socket on the same host
-  that passes fds and has incoming connections; otherwise it runs on calls,
-  and `Receiver::uses_ring` tells which. Such a ring pings like the calls path
+  that passes fds; otherwise it runs on calls, and `Receiver::uses_ring` tells
+  which. A session without incoming connections refuses a stream either way. Such a ring pings like the calls path
   and counts its traffic toward the server's idle timeout. A ring endpoint's
   sink that receives `onStart` or `onBatch` ends the stream with
   `EX_ILLEGAL_STATE` rather than drop the items. See the Streaming chapter of

@@ -1,7 +1,7 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! The kernel path: records on an FMQ ring; layout, end reserve and EventFlag bits in StreamEndpoint.aidl.
+//! The ring path (kernel binder, or an opted-in Unix RPC session): records on an FMQ ring.
 
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};

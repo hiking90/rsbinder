@@ -240,8 +240,8 @@
 //! does not ping moves no byte. Outside a handler it holds no call either, so it is idle;
 //! inside one, the handler's `OpenCall` stays held for the whole wait, so the session is not
 //! idle and only the wait's own deadline bounds it. On a ring each wait that parks is activity
-//! (one the ring's spin did not satisfy, or any once `SpinGauge` has turned the spin off), so
-//! such waits shorter than `d`, repeated, keep a stalled ring stream's session from idling. No
+//! (a wait longer than the ring's short spin always parks), so such waits shorter than `d`,
+//! repeated, keep a stalled ring stream's session from idling. No
 //! timer thread is involved: each quiet slot wakes on its own deadline. The admission deadline
 //! on an r34 server's first frame is not an idle deadline and is not extended.
 //!

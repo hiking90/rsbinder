@@ -319,9 +319,11 @@ pub enum RingUse {
     /// [passes file descriptors](crate::TransportCaps::FD_PASSING) (a
     /// Unix-domain socket that negotiated the `Unix` fd mode), on the
     /// [same host](crate::TransportCaps::SAME_HOST), with
-    /// [calls both ways](crate::TransportCaps::CALLBACKS). A session
-    /// lacking any of these gets calls, and a `log::debug!` line names
-    /// what it lacks.
+    /// [calls both ways](crate::TransportCaps::CALLBACKS). A session that
+    /// does not pass file descriptors or is on another host gets calls, and
+    /// a `log::debug!` line names what it lacks. One without calls both ways
+    /// refuses the stream with `InvalidOperation`, opted in or not, as it
+    /// does on calls.
     ///
     /// The producer must implement the ring over RPC. rsbinder's does. A
     /// producer written to the RPC-only contract refuses the endpoint, and
@@ -366,7 +368,7 @@ pub struct ReceiverPolicy {
     /// briefly before parking, so they rarely wait on each other. A ring
     /// that holds only one or two such items makes them alternate.
     pub ring_bytes: usize,
-    /// RPC: how many drained batches the consumer lets go unpaid before
+    /// Calls: how many drained batches the consumer lets go unpaid before
     /// it grants. A grant leaves once half this window is owed — or the
     /// producer's whole opening window, if that is less — and whatever is
     /// owed leaves before the consumer waits. A larger window means fewer
@@ -377,7 +379,7 @@ pub struct ReceiverPolicy {
     /// that is the producer's opening window, which stays the ceiling
     /// because a grant only pays for a batch already drained.
     pub credit_window: u32,
-    /// RPC: the widest opening window this consumer accepts. The producer
+    /// Calls: the widest opening window this consumer accepts. The producer
     /// states its window when it introduces itself, and the consumer
     /// holds it to that plus what it has granted since — a batch beyond
     /// it ends the stream with `EX_ILLEGAL_STATE` rather than being
@@ -391,9 +393,9 @@ pub struct ReceiverPolicy {
     /// [`Sink::open`] is always taken by a consumer made with
     /// [`Receiver::new`].
     pub max_opening: u32,
-    /// RPC: whether a wait for an item that hears nothing from the
-    /// producer checks that it is still there. Default
-    /// [`PingPolicy::Inherit`].
+    /// RPC session: whether a wait for an item, on calls or a ring, that
+    /// hears nothing from the producer checks that it is still there.
+    /// Default [`PingPolicy::Inherit`].
     pub ping: PingPolicy,
     /// Whether an RPC peer may get a ring. Default
     /// [`RingUse::KernelOnly`].
@@ -429,11 +431,11 @@ pub struct SinkPolicy {
     /// [`ProcessState::init_with_mmap_size`](crate::ProcessState::init_with_mmap_size)
     /// puts on the binder mapping itself.
     pub max_ring_bytes: usize,
-    /// RPC: the most bytes one batch carries before it is sent. A
+    /// Calls: the most bytes one batch carries before it is sent. A
     /// threshold, not a cap — an item larger than it still goes out, with
     /// the batch it was added to. Default 16 KiB.
     pub max_batch_bytes: usize,
-    /// RPC: batches the producer may send before the consumer grants
+    /// Calls: batches the producer may send before the consumer grants
     /// anything, so that a short stream finishes without a credit round
     /// trip. Stated to the consumer, which ends the stream at once when
     /// it is more than [`ReceiverPolicy::max_opening`]. At least one: the
@@ -497,8 +499,9 @@ pub struct SinkPolicy {
     /// third of the reply deadline ends each wait before any ping, so a
     /// producer that only makes such calls never checks the consumer.
     pub send_timeout: Option<Duration>,
-    /// RPC: whether a wait for credit that hears nothing from the consumer
-    /// checks that it is still there. Default [`PingPolicy::Inherit`].
+    /// RPC session: whether a wait for credit, or for room in a ring, that
+    /// hears nothing from the consumer checks that it is still there.
+    /// Default [`PingPolicy::Inherit`].
     pub ping: PingPolicy,
 }
 
@@ -726,12 +729,13 @@ const RING_OVER_RPC: crate::TransportCaps = crate::TransportCaps::SAME_HOST
     .union(crate::TransportCaps::FD_PASSING)
     .union(crate::TransportCaps::CALLBACKS);
 
-/// Kernel binder or a local object always; an RPC session only when opted in and capable.
+/// Linux/Android only: kernel binder or a local object always; an RPC session when opted in and
+/// capable.
 fn over_ring(peer: &SIBinder, policy: &ReceiverPolicy) -> bool {
     let opted_in = policy.ring_use == RingUse::AlsoUnixRpc;
     if !cfg!(any(target_os = "linux", target_os = "android")) {
         if opted_in {
-            log::debug!("stream: RingUse::AlsoUnixRpc, but this platform has no ring; using calls");
+            log::debug!("stream: RingUse::AlsoUnixRpc, but this platform has no ring");
         }
         return false;
     }
@@ -746,7 +750,7 @@ fn over_ring(peer: &SIBinder, policy: &ReceiverPolicy) -> bool {
         return true;
     }
     log::debug!(
-        "stream: RingUse::AlsoUnixRpc, but the peer's session lacks {}; using calls",
+        "stream: RingUse::AlsoUnixRpc, but the peer's session lacks {}; no ring",
         RING_OVER_RPC.difference(caps)
     );
     false

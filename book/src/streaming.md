@@ -523,9 +523,11 @@ session has to pass fds both ways: the client opens with
 `ClientOptions::fd_mode = Some(FileDescriptorTransportMode::Unix)` and the
 server allows it (`ServeOptions::fd_modes` or
 `RpcServer::set_supported_fd_modes`). It also needs the incoming connection
-above. A session missing any of these — vsock, TCP, TLS, no fd mode, no incoming
-connection — gets calls, and a `log::debug!` line names what was missing;
-`uses_ring` tells which one a stream got. The ring needs Linux or Android.
+above. A session that cannot pass the fd — vsock, TCP, TLS, no fd mode — gets
+calls, and a `log::debug!` line names what was missing; `uses_ring` tells which
+one a stream got. A session with no incoming connection refuses the stream with
+`InvalidOperation`, opted in or not, as it does on calls. The ring needs Linux or
+Android.
 
 Across SELinux domains the ring needs what it needs over binder — `fd use` and
 `memfd_file { getattr read write map }` on the consumer's domain, see

@@ -34,7 +34,7 @@
 //! stream_probe serve-rpc-ring <socketPath>               (feature `rpc`)
 //! ```
 //!
-//! Every mode but `serve` and `serve-rpc` prints one `RESULT` line;
+//! Every mode but `serve`, `serve-rpc` and `serve-rpc-ring` prints one `RESULT` line;
 //! `tests/scripts/run_stream_ac.sh` drives them. The `subscribe` call's
 //! batch and credit arguments only shape the RPC path, so the probe
 //! passes the producer's defaults and lets the ring do the pacing.
@@ -43,7 +43,8 @@
 //! Unix socket, for a libbinder `RpcSession` client to stream against
 //! (`example-hello/cpp/run_stream_rpc_interop.sh`). `replyTimeoutMs` sets
 //! every session's reply deadline, which also arms the stream ping.
-//! `serve-rpc-ring` adds ring uploads; `@name` is an abstract socket, so SELinux checks no file.
+//! `serve-rpc-ring` also takes the `Unix` fd mode, so rings run both ways, and gives uploads a
+//! ring; `@name` is an abstract socket, so SELinux checks no file.
 
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
