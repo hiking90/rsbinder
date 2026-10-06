@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{fence, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -88,6 +88,43 @@ impl EventFlag {
         Ok(())
     }
 
+    /// [`wake`](Self::wake) for a waker that has just stored what the
+    /// waiter checks (a counter, after a commit): when every bit of `bits`
+    /// already stands, return without writing the word.
+    ///
+    /// A standing bit means the waiter has not cleared it yet, and a waiter
+    /// clears its bits before it sleeps, so it will see this one and not
+    /// sleep. Skipping the `fetch_or` keeps the word's cache line off this
+    /// core while the bit stands, which is most of the time once the waiter
+    /// stops parking.
+    ///
+    /// The ordering is the store→load pattern on both sides. This side
+    /// stores the counter, then `fence(SeqCst)`, then loads the word; a
+    /// waiter clears the word with a `SeqCst` `fetch_and`, then, before it
+    /// returns, `fence(SeqCst)` ([`wait`](Self::wait) does this), then loads
+    /// the counter. The two fences make at least one side see the other's
+    /// store: either this load sees the bit cleared and wakes, or the
+    /// waiter sees the counter and does not sleep. `tests/loom_event_flag.rs`
+    /// checks that model, and that it loses a wake without either fence.
+    ///
+    /// A libfmq waiter (C++) has no fence between its `fetch_and` and its
+    /// counter loads, so the C++ memory model alone does not promise the
+    /// pattern with it. The code compilers emit for that waiter does, on the
+    /// targets checked: x86 and x86-64 (the locked RMW is a full barrier),
+    /// AArch64 (the RMW's release store is not reordered with a later
+    /// acquire load), 32-bit ARM (`dmb ish` after the `ldrex`/`strex` loop)
+    /// and RISC-V 64 (`amoand.w.aqrl`, sequentially consistent). Other
+    /// targets are not checked; POWER's mapping (`hwsync; lwarx/stwcx.;
+    /// isync`) does not order the RMW's store before a later load. Use
+    /// [`wake`](Self::wake) where such a waiter may run.
+    pub fn wake_lazy(&self, bits: u32) -> Result<()> {
+        fence(Ordering::SeqCst);
+        if bits != 0 && self.word().load(Ordering::Relaxed) & bits == bits {
+            return Ok(());
+        }
+        self.wake(bits)
+    }
+
     /// Wait until any bit of `bits` is set, clear those bits and return them.
     /// Returns at once when some already are. `timeout == None` waits
     /// indefinitely; otherwise [`Error::TimedOut`](crate::Error::TimedOut)
@@ -105,6 +142,8 @@ impl EventFlag {
             let old = self.word().fetch_and(!bits, Ordering::SeqCst);
             let set = old & bits;
             if set != 0 {
+                // Pairs with `wake_lazy`'s fence: the caller's next counter load sees its store.
+                fence(Ordering::SeqCst);
                 return Ok(set);
             }
             // Sleep only if the word is unchanged since the clear: a wake in between is kept.

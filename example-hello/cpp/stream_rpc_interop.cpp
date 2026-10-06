@@ -8,12 +8,14 @@
 // implements the consumer and producer ends from the `.aidl` files
 // rsbinder ships, compiled by the platform's `aidl --lang=ndk`.
 //
-// Over RPC there is no ring: the endpoint carries only the sink, and the
-// items travel as `oneway IStreamSink.onBatch` calls paced by credit
-// granted through `oneway IStreamSource.request`. A download sends
+// This client implements the calls path only: the endpoint carries only the
+// sink, and the items travel as `oneway IStreamSink.onBatch` calls paced by
+// credit granted through `oneway IStreamSource.request`. A download sends
 // rsbinder's batches over libbinder's incoming connections and this side's
 // grants over its outgoing ones; an upload does the reverse. A death is
-// the session going away.
+// the session going away. `upload-fds` asks for the `Unix` fd mode, so an
+// rsbinder consumer that opted in hands it a ring, which it refuses:
+// it prints `RESULT ERROR ring-over-rpc` and exits (plan 10-7c AC-C10).
 //
 //   stream_rpc_interop <sock> download <count> <maxBatchBytes> <credits>
 //   stream_rpc_interop <sock> failing <count> <code> <message>
@@ -21,6 +23,7 @@
 //   stream_rpc_interop <sock> orphan              the server is killed
 //   stream_rpc_interop <sock> hang <credits>      takes the opening window, grants nothing
 //   stream_rpc_interop <sock> upload <count> <credits> <batchItems>
+//   stream_rpc_interop <sock> upload-fds <count> <credits> <batchItems>
 //   stream_rpc_interop <sock> vanish              uploads until it is killed
 //   stream_rpc_interop <sock> status              the service's counters, on a new session
 //
@@ -57,8 +60,11 @@
 extern "C" {
 // --- libbinder_rpc_unstable.so (AOSP binder_rpc_unstable.hpp) ---
 struct ARpcSession;
+enum class ARpcSession_FileDescriptorTransportMode { None, Unix, Trusty };
 ARpcSession *ARpcSession_new();
 void ARpcSession_setMaxIncomingThreads(ARpcSession *session, size_t threads);
+void ARpcSession_setFileDescriptorTransportMode(ARpcSession *session,
+                                                ARpcSession_FileDescriptorTransportMode mode);
 // `ARpcSession_setupUnixDomainClient` takes an init-created socket name under
 // /dev/socket, so a path in /data/local/tmp goes through the preconnected form.
 AIBinder *ARpcSession_setupPreconnectedClient(ARpcSession *session, int (*requestFd)(void *param),
@@ -100,9 +106,15 @@ void keep_param(void *) {}
 // A session with incoming connections: the peer calls this side's sink or
 // source from a thread of its own, and libbinder links an RPC death only
 // with an incoming thread to deliver it. Never freed: the proxies need it.
-std::shared_ptr<IStreamDemo> connect(const char *path) {
+// `unix_fds`: ask for the `Unix` fd mode, which lets an rsbinder consumer that opted in
+// (RingUse::AlsoUnixRpc) hand this side a ring.
+std::shared_ptr<IStreamDemo> connect(const char *path, bool unix_fds = false) {
     ARpcSession *session = ARpcSession_new();
     ARpcSession_setMaxIncomingThreads(session, 2);
+    if (unix_fds) {
+        ARpcSession_setFileDescriptorTransportMode(session,
+                                                   ARpcSession_FileDescriptorTransportMode::Unix);
+    }
     SpAIBinder root(ARpcSession_setupPreconnectedClient(session, connect_socket,
                                                         const_cast<char *>(path), keep_param));
     if (root.get() == nullptr) {
@@ -445,12 +457,13 @@ struct Upload {
     std::shared_ptr<IStreamSink> sink;
     std::shared_ptr<Source> source;
 
-    Upload(const std::shared_ptr<IStreamDemo> &demo, int32_t credits) {
+    // `ring_bytes` matters only to a consumer that makes a ring; on calls it is not read.
+    Upload(const std::shared_ptr<IStreamDemo> &demo, int32_t credits, int32_t ring_bytes = 0) {
         source = ndk::SharedRefBase::make<Source>(credits);
         // The service's Receiver watches this binder; the source is a binder of this process too.
         token = source->asBinder();
         StreamEndpoint endpoint;
-        check(demo->upload(token, 0, &endpoint), "upload");
+        check(demo->upload(token, ring_bytes, &endpoint), "upload");
         if (endpoint.ring) {
             printf("RESULT ERROR ring-over-rpc\n");
             exit(1);
@@ -492,10 +505,11 @@ int32_t uploaded_so_far(const std::shared_ptr<IStreamDemo> &demo) {
     return n;
 }
 
-int upload(const char *sock, int32_t count, int32_t credits, int32_t per_batch) {
-    auto demo = connect(sock);
+int upload(const char *sock, int32_t count, int32_t credits, int32_t per_batch,
+           bool unix_fds = false) {
+    auto demo = connect(sock, unix_fds);
     int32_t before = uploaded_so_far(demo);
-    Upload u(demo, credits);
+    Upload u(demo, credits, unix_fds ? 64 * 1024 : 0);
     int32_t sent = u.produce(count, per_batch);
     ScopedAStatus st = sent == count ? u.sink->onEnd(0, 0, std::nullopt)
                                      : u.sink->onEnd(kExIllegalState, 0, "stopped early");
@@ -560,6 +574,7 @@ int main(int argc, char **argv) {
     if (c == "orphan" && argc == 3) return orphan(sock);
     if (c == "hang" && argc == 4) return hang(sock, n(3));
     if (c == "upload" && argc == 6) return upload(sock, n(3), n(4), n(5));
+    if (c == "upload-fds" && argc == 6) return upload(sock, n(3), n(4), n(5), true);
     if (c == "vanish" && argc == 3) return vanish(sock);
     if (c == "status" && argc == 3) return status(sock);
     fprintf(stderr, "bad arguments for %s\n", c.c_str());

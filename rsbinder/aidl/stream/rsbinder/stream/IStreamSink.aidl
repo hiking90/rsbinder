@@ -9,10 +9,12 @@ package rsbinder.stream;
  * The consumer end of a stream over an RPC session: the producer calls
  * this to deliver items and to say the stream is over.
  *
- * This interface is the RPC path only. A StreamEndpoint made against a
- * kernel binder peer carries a ring, the items travel on it, and this
- * object — still the endpoint's `sink` — is only linked to for death;
- * no method here is called. StreamEndpoint.aidl has the ring's layout.
+ * This interface is the calls path only. A StreamEndpoint that carries a
+ * ring — always against a kernel binder peer, and on a Unix RPC session
+ * when the consumer opts in — has the items travel on it, and this
+ * object, still the endpoint's `sink`, is only linked to for death; a
+ * producer that calls `onStart` or `onBatch` on it ends the stream.
+ * StreamEndpoint.aidl has the ring's layout.
  *
  * rsbinder distributes this file so a C++ or NDK peer can take part
  * without rsbinder on its side. Every method is `oneway`, which is what

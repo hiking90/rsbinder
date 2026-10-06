@@ -25,7 +25,6 @@
 #![cfg(feature = "rpc")]
 #![allow(non_snake_case)]
 
-use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -33,8 +32,10 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rsbinder::rpc::{RpcClientConfig, RpcServer, RpcSession};
-use rsbinder::stream::{PingPolicy, Receiver, ReceiverPolicy, Sink, SinkPolicy, StreamEndpoint};
+use rsbinder::rpc::{FileDescriptorTransportMode, RpcClientConfig, RpcServer, RpcSession};
+use rsbinder::stream::{
+    PingPolicy, Receiver, ReceiverPolicy, RingUse, Sink, SinkPolicy, StreamEndpoint, Token,
+};
 use rsbinder::{
     BinderResult, ExceptionCode, FromIBinder, Interface, SIBinder, Status, Strong, TransportCaps,
 };
@@ -53,6 +54,8 @@ fn default_credits() -> i32 {
 struct DemoSvc {
     /// What the service's producers ping with.
     ping: PingPolicy,
+    /// Whether the service's upload receiver may take a ring from an RPC client.
+    upload_ring_use: RingUse,
     sent: Arc<AtomicI32>,
     finished: Arc<AtomicBool>,
     last_error: Arc<AtomicI32>,
@@ -210,12 +213,12 @@ impl IStreamDemo for DemoSvc {
         Ok(self.last_error.load(Ordering::SeqCst))
     }
 
-    // Upload is exercised by the kernel half (`stream_probe`); this keeps the fixture whole.
     fn r#upload(&self, producer: &SIBinder, ring_bytes: i32) -> BinderResult<StreamEndpoint<i32>> {
         let (mut rx, endpoint) = Receiver::<i32>::with_policy(
             producer,
             &ReceiverPolicy {
                 ring_bytes: ring_bytes.max(0) as usize,
+                ring_use: self.upload_ring_use,
                 ..ReceiverPolicy::default()
             },
         )?;
@@ -289,6 +292,10 @@ struct Setup {
     client_timeout: Option<Duration>,
     server_reply_timeout: Option<Duration>,
     producer_ping: PingPolicy,
+    /// Negotiate the `Unix` fd mode, so the session passes file descriptors.
+    fd_unix: bool,
+    upload_ring_use: RingUse,
+    server_idle: Option<Duration>,
 }
 
 /// A unix relay that stops forwarding with connections left open, as a silent `adb forward` does.
@@ -328,19 +335,60 @@ impl Relay {
         Relay { path, frozen }
     }
 
-    /// Frozen, it holds what it has read and reads no more; the socket stays open.
-    fn pump(mut from: UnixStream, mut to: UnixStream, frozen: Arc<AtomicBool>) {
+    /// Frozen, it holds what it has read and reads no more; fds cross with their bytes (a memfd).
+    fn pump(from: UnixStream, to: UnixStream, frozen: Arc<AtomicBool>) {
+        use rustix::net::{
+            RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
+            SendAncillaryMessage, SendFlags,
+        };
+        use std::io::{IoSlice, IoSliceMut};
+        use std::mem::MaybeUninit;
+        use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+
         let mut buf = [0u8; 16 * 1024];
-        loop {
-            let n = match from.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
+        let mut in_space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(64))];
+        let mut out_space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(64))];
+        'pump: loop {
+            let mut anc = RecvAncillaryBuffer::new(&mut in_space);
+            let n = match rustix::net::recvmsg(
+                &from,
+                &mut [IoSliceMut::new(&mut buf)],
+                &mut anc,
+                RecvFlags::empty(),
+            ) {
+                Ok(r) if r.bytes > 0 => r.bytes,
+                Err(rustix::io::Errno::INTR) => continue,
+                _ => break,
             };
+            let fds: Vec<OwnedFd> = anc
+                .drain()
+                .filter_map(|msg| match msg {
+                    RecvAncillaryMessage::ScmRights(fds) => Some(fds),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
             while frozen.load(Ordering::SeqCst) {
                 thread::sleep(Duration::from_millis(10));
             }
-            if to.write_all(&buf[..n]).is_err() {
-                break;
+            let fds: Vec<BorrowedFd<'_>> = fds.iter().map(|fd| fd.as_fd()).collect();
+            let mut sent = 0;
+            while sent < n {
+                let mut anc = SendAncillaryBuffer::new(&mut out_space);
+                if sent == 0 && !fds.is_empty() {
+                    assert!(anc.push(SendAncillaryMessage::ScmRights(&fds)));
+                }
+                match rustix::net::sendmsg(
+                    &to,
+                    &[IoSlice::new(&buf[sent..n])],
+                    &mut anc,
+                    SendFlags::empty(),
+                ) {
+                    Ok(0) => break 'pump,
+                    Ok(k) => sent += k,
+                    Err(rustix::io::Errno::INTR) => {}
+                    Err(_) => break 'pump,
+                }
             }
         }
         let _ = to.shutdown(std::net::Shutdown::Write);
@@ -395,11 +443,16 @@ fn fixture_with(tag: &str, incoming: u32, setup: Setup) -> Fixture {
 
     let svc = DemoSvc {
         ping: setup.producer_ping,
+        upload_ring_use: setup.upload_ring_use,
         ..DemoSvc::default()
     };
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(2);
     server.set_reply_timeout(setup.server_reply_timeout);
+    server.set_idle_timeout(setup.server_idle);
+    if setup.fd_unix {
+        server.set_supported_fd_modes(&[FileDescriptorTransportMode::Unix]);
+    }
     server
         .set_root(BnStreamDemo::new_binder(svc.clone()).as_binder())
         .expect("set_root");
@@ -410,10 +463,11 @@ fn fixture_with(tag: &str, incoming: u32, setup: Setup) -> Fixture {
         .as_ref()
         .map_or(path.as_path(), |relay| relay.path.as_path());
     // `setup_unix_server` already bound the listener, so connecting now cannot race the thread.
-    let client = RpcSession::setup_client_android13plus_with_config(
-        RpcClientConfig::unix(dial, 2).incoming_connections(incoming),
-    )
-    .expect("connect");
+    let mut config = RpcClientConfig::unix(dial, 2).incoming_connections(incoming);
+    if setup.fd_unix {
+        config = config.fd_mode(FileDescriptorTransportMode::Unix);
+    }
+    let client = RpcSession::setup_client_android13plus_with_config(config).expect("connect");
     client.set_timeout(setup.client_timeout);
     let demo = <dyn IStreamDemo as FromIBinder>::try_from(client.get_root().expect("get_root"))
         .expect("cast the root to IStreamDemo");
@@ -929,4 +983,638 @@ fn an_async_producer_notices_a_consumer_gone_silent_behind_a_relay() {
 fn without_a_ping_a_producer_waits_on_a_consumer_gone_silent() {
     let f = parked_producer("noping_tx", PingPolicy::Off, false);
     assert_eq!(producer_outcome(&f, NOTICED_WITHIN), None);
+}
+
+// ---- Plan 10-7c Phase B: a ring over a Unix session ----
+
+/// Where the ring exists; elsewhere an opted-in consumer runs on calls and the same tests check that.
+const RING: bool = cfg!(any(target_os = "linux", target_os = "android"));
+
+/// A session that can carry a ring: a Unix socket on this host, `Unix` fds, one incoming connection.
+fn ring_fixture(tag: &str, upload_ring_use: RingUse) -> Fixture {
+    fixture_with(
+        tag,
+        1,
+        Setup {
+            fd_unix: true,
+            upload_ring_use,
+            ..Setup::default()
+        },
+    )
+}
+
+fn opted_in() -> ReceiverPolicy {
+    ReceiverPolicy {
+        ring_use: RingUse::AlsoUnixRpc,
+        ..ReceiverPolicy::default()
+    }
+}
+
+/// Every item to a clean end, each within 10 s: a stall fails rather than hangs.
+fn collect_within(rx: &mut Receiver<i32>) -> Vec<i32> {
+    let mut got = Vec::new();
+    loop {
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Some(item)) => got.push(item),
+            Ok(None) if rx.is_finished() => return got,
+            other => panic!("stalled after {} items: {other:?}", got.len()),
+        }
+    }
+}
+
+/// A send that waits for room or credit fails after 10 s rather than hangs.
+fn bounded_sink() -> SinkPolicy {
+    SinkPolicy {
+        send_timeout: Some(Duration::from_secs(10)),
+        ..SinkPolicy::default()
+    }
+}
+
+/// Poll `done` for up to 5 s.
+fn eventually(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !done() {
+        assert!(Instant::now() < deadline, "{what}");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// AC-C1 (AC-C3 off Linux): an opted-in download over a Unix session runs on a ring.
+#[test]
+fn an_opted_in_download_runs_on_a_ring_over_a_unix_session() {
+    let f = ring_fixture("ring_down", RingUse::KernelOnly);
+    let caps = f.client.caps();
+    assert!(
+        caps.contains(
+            TransportCaps::FD_PASSING | TransportCaps::SAME_HOST | TransportCaps::CALLBACKS
+        ),
+        "{caps}"
+    );
+    let (mut rx, endpoint) =
+        Receiver::<i32>::with_policy(&f.demo.as_binder(), &opted_in()).expect("a receiver");
+    assert_eq!(endpoint.ring.is_some(), RING);
+    assert_eq!(rx.uses_ring(), RING);
+    f.demo
+        .r#subscribe(&endpoint, 1000, 64, default_credits(), 0)
+        .expect("subscribe");
+    let got = collect_within(&mut rx);
+    assert_eq!(got, (0..1000).collect::<Vec<_>>());
+    assert!(rx.end_status().expect("ended").is_ok());
+}
+
+/// AC-C2: without the opt-in a session that could carry a ring still gets calls.
+#[test]
+fn a_consumer_that_does_not_opt_in_gets_calls_on_a_ring_capable_session() {
+    let f = ring_fixture("ring_off", RingUse::KernelOnly);
+    let (rx, endpoint) = f.default_receiver();
+    assert!(endpoint.ring.is_none());
+    assert!(!rx.uses_ring());
+}
+
+/// AC-C3: an opt-in on a session that passes no fds falls back to calls and still streams.
+#[test]
+fn an_opted_in_consumer_without_fd_passing_gets_calls() {
+    let f = fixture("ring_nofd", 1);
+    assert!(!f.client.caps().contains(TransportCaps::FD_PASSING));
+    let (mut rx, endpoint) =
+        Receiver::<i32>::with_policy(&f.demo.as_binder(), &opted_in()).expect("a receiver");
+    assert!(endpoint.ring.is_none());
+    assert!(!rx.uses_ring());
+    f.demo
+        .r#subscribe(&endpoint, 100, 64, default_credits(), 0)
+        .expect("subscribe");
+    let got = collect_within(&mut rx);
+    assert_eq!(got, (0..100).collect::<Vec<_>>());
+}
+
+/// AC-C4: without incoming connections the opt-in changes nothing; the stream is refused as before.
+#[test]
+fn an_opted_in_consumer_without_callbacks_is_refused_as_before() {
+    let f = fixture_with(
+        "ring_nocb",
+        0,
+        Setup {
+            fd_unix: true,
+            ..Setup::default()
+        },
+    );
+    assert!(!f.client.caps().contains(TransportCaps::CALLBACKS));
+    assert_eq!(
+        Receiver::<i32>::with_policy(&f.demo.as_binder(), &opted_in()).err(),
+        Some(rsbinder::StatusCode::InvalidOperation)
+    );
+}
+
+/// AC-C8 and AC-C7: an opted-in upload runs on the service's ring; its memfd keeps its seals.
+#[test]
+fn an_opted_in_upload_runs_on_a_ring_whose_memfd_keeps_its_seals() {
+    let f = ring_fixture("ring_up", RingUse::AlsoUnixRpc);
+    let token = Token::new();
+    let endpoint = f.demo.r#upload(&token.binder(), 64 * 1024).expect("upload");
+    assert_eq!(endpoint.ring.is_some(), RING);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::fd::AsFd;
+        let ring = endpoint.ring.as_ref().expect("a ring");
+        let desc = rsbinder::fmq::Descriptor::try_from(ring).expect("a descriptor");
+        assert!(
+            rsbinder::fmq::shm::shrink_sealed(desc.fds[0].as_fd()),
+            "the memfd keeps F_SEAL_SHRINK across SCM_RIGHTS"
+        );
+    }
+    let mut sink =
+        Sink::<i32>::open_with(&endpoint, &bounded_sink()).expect("open the service's ring");
+    for item in 0..1000 {
+        sink.send(&item).expect("send");
+    }
+    sink.end().expect("end");
+    eventually("the service's receiver must finish", || {
+        f.svc.upload_finished.load(Ordering::SeqCst)
+    });
+    assert_eq!(f.svc.uploaded.load(Ordering::SeqCst), 1000);
+    assert!(f.svc.upload_ordered.load(Ordering::SeqCst));
+    assert_eq!(f.svc.upload_error.load(Ordering::SeqCst), 0);
+}
+
+/// An opted-in download through a relay, the producer idle between items, then the relay frozen.
+fn frozen_ring_download(tag: &str, ping: PingPolicy) -> (Fixture, Receiver<i32>) {
+    let f = fixture_with(
+        tag,
+        1,
+        Setup {
+            relay: true,
+            fd_unix: true,
+            client_timeout: Some(DEADLINE),
+            ..Setup::default()
+        },
+    );
+    let (mut rx, endpoint) = Receiver::<i32>::with_policy(
+        &f.demo.as_binder(),
+        &ReceiverPolicy {
+            ring_use: RingUse::AlsoUnixRpc,
+            max_opening: 1_000_000,
+            ping,
+            ..ReceiverPolicy::default()
+        },
+    )
+    .expect("a receiver");
+    assert_eq!(rx.uses_ring(), RING, "the memfd crossed the relay");
+    // 30 s per item and spare credit: after item 0 neither end does anything on its own.
+    f.demo
+        .r#subscribe(&endpoint, i32::MAX, 4, 1_000_000, 30_000_000)
+        .expect("subscribe");
+    assert!(rx.next().expect("item 0").is_ok());
+    // Off a ring this pays the owed credit, so the wait below has no grant to send.
+    assert!(rx.try_recv().expect("still running").is_none());
+    f.freeze();
+    (f, rx)
+}
+
+/// AC-C6, consumer: a waiting ring consumer pings a silent producer; no answer ends the stream.
+#[test]
+fn a_waiting_ring_consumer_notices_a_producer_gone_silent_behind_a_relay() {
+    let (_f, mut rx) = frozen_ring_download("ring_ping_rx", PingPolicy::Inherit);
+    let started = Instant::now();
+    let failure = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect_err("the ping goes unanswered and the session ends");
+    assert_eq!(
+        failure.transaction_error(),
+        rsbinder::StatusCode::DeadObject
+    );
+    assert!(
+        started.elapsed() < NOTICED_WITHIN,
+        "noticed after {:?}",
+        started.elapsed()
+    );
+}
+
+/// AC-C6 baseline: without the ping the same ring consumer keeps waiting.
+#[test]
+fn without_a_ping_a_ring_consumer_waits_on_a_producer_gone_silent() {
+    let (_f, mut rx) = frozen_ring_download("ring_noping_rx", PingPolicy::Off);
+    assert_eq!(rx.recv_timeout(NOTICED_WITHIN).expect("no error"), None);
+    assert!(!rx.is_finished());
+}
+
+/// An opted-in download read by nobody: the producer parks (off Linux, on credit), then a freeze.
+fn parked_ring_producer(tag: &str, ping: PingPolicy) -> Fixture {
+    let f = fixture_with(
+        tag,
+        1,
+        Setup {
+            relay: true,
+            fd_unix: true,
+            server_reply_timeout: Some(DEADLINE),
+            producer_ping: ping,
+            ..Setup::default()
+        },
+    );
+    let (rx, endpoint) = Receiver::<i32>::with_policy(
+        &f.demo.as_binder(),
+        &ReceiverPolicy {
+            ring_use: RingUse::AlsoUnixRpc,
+            ring_bytes: 4096,
+            credit_window: 1,
+            ..ReceiverPolicy::default()
+        },
+    )
+    .expect("a receiver");
+    assert_eq!(rx.uses_ring(), RING);
+    f.demo
+        .r#subscribe(&endpoint, 1_000_000, 4, 1, 0)
+        .expect("subscribe");
+    // On the ring: (4096 - 256) / 8 records, then the producer parks for room.
+    let parked_at = if RING { (4096 - 256) / 8 } else { 1 };
+    eventually("the producer must fill what it may", || {
+        f.svc.sent.load(Ordering::SeqCst) >= parked_at
+    });
+    f.freeze();
+    // Kept alive but unread: dropping it would cancel the producer.
+    std::mem::forget(rx);
+    f
+}
+
+/// AC-C6, producer: one parked on a full ring pings the consumer's sink; no answer ends it.
+#[test]
+fn a_ring_producer_parked_for_room_notices_a_consumer_gone_silent_behind_a_relay() {
+    let f = parked_ring_producer("ring_ping_tx", PingPolicy::Inherit);
+    assert_eq!(
+        producer_outcome(&f, NOTICED_WITHIN),
+        Some(i32::from(rsbinder::StatusCode::DeadObject))
+    );
+}
+
+/// AC-C6 baseline: without the ping the parked ring producer keeps waiting.
+#[test]
+fn without_a_ping_a_ring_producer_waits_on_a_consumer_gone_silent() {
+    let f = parked_ring_producer("ring_noping_tx", PingPolicy::Off);
+    assert_eq!(producer_outcome(&f, NOTICED_WITHIN), None);
+}
+
+/// AC-C5: a closed session ends an RPC ring stream both ways, after what was in the ring.
+#[test]
+fn a_closed_session_ends_an_rpc_ring_stream_on_both_sides() {
+    let f = ring_fixture("ring_dead", RingUse::KernelOnly);
+    let (mut rx, endpoint) =
+        Receiver::<i32>::with_policy(&f.demo.as_binder(), &opted_in()).expect("a receiver");
+    assert_eq!(rx.uses_ring(), RING);
+    // 20 ms an item: the producer is between items, not parked, when the session goes.
+    f.demo
+        .r#subscribe(&endpoint, i32::MAX, 64, default_credits(), 20_000)
+        .expect("subscribe");
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(10)).expect("ok"),
+        Some(0)
+    );
+
+    f.client.close_session();
+
+    let failure = loop {
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Some(_)) => continue,
+            Ok(None) if rx.is_finished() => panic!("a clean end the producer never sent"),
+            Ok(None) => panic!("the lost session left the consumer waiting"),
+            Err(status) => break status,
+        }
+    };
+    assert_eq!(
+        failure.transaction_error(),
+        rsbinder::StatusCode::DeadObject
+    );
+    let dead = i32::from(rsbinder::StatusCode::DeadObject);
+    eventually("the producer must see the consumer's death", || {
+        f.svc.last_error.load(Ordering::SeqCst) == dead
+    });
+}
+
+// ---- AC-C13: a ring stream and the server's idle timeout (ring only: calls batch items) ----
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod idle {
+    use super::*;
+
+    /// The server's idle timeout: a session with no activity for between this and twice it ends.
+    const IDLE: Duration = Duration::from_millis(200);
+
+    /// A ring-capable session whose server has an idle timeout and takes uploads on a ring.
+    fn idle_fixture(tag: &str, idle: Duration, server_reply_timeout: Option<Duration>) -> Fixture {
+        fixture_with(
+            tag,
+            1,
+            Setup {
+                fd_unix: true,
+                upload_ring_use: RingUse::AlsoUnixRpc,
+                server_idle: Some(idle),
+                server_reply_timeout,
+                ..Setup::default()
+            },
+        )
+    }
+
+    /// The server produces `count` items `gap` apart; the items, or how the stream failed.
+    fn spaced_download(f: &Fixture, count: i32, gap: Duration) -> Result<Vec<i32>, Status> {
+        let (mut rx, endpoint) =
+            Receiver::<i32>::with_policy(&f.demo.as_binder(), &opted_in()).expect("a receiver");
+        assert_eq!(rx.uses_ring(), RING);
+        f.demo
+            .r#subscribe(
+                &endpoint,
+                count,
+                64,
+                default_credits(),
+                gap.as_micros() as i32,
+            )
+            .expect("subscribe");
+        let mut got = Vec::new();
+        loop {
+            match rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(Some(item)) => got.push(item),
+                Ok(None) if rx.is_finished() => return Ok(got),
+                Ok(None) => panic!("no item for 10 s after {}", got.len()),
+                Err(status) => return Err(status),
+            }
+        }
+    }
+
+    /// The client produces `count` items `gap` apart into the server's ring; the server's verdict.
+    fn spaced_upload(f: &Fixture, count: i32, gap: Duration) -> (i32, i32) {
+        let token = Token::new();
+        let endpoint = f.demo.r#upload(&token.binder(), 64 * 1024).expect("upload");
+        assert_eq!(endpoint.ring.is_some(), RING);
+        let mut sink = Sink::<i32>::open(&endpoint).expect("open");
+        for item in 0..count {
+            if sink.send(&item).is_err() {
+                break;
+            }
+            thread::sleep(gap);
+        }
+        let _ = sink.end();
+        eventually("the server's receiver must finish", || {
+            f.svc.upload_finished.load(Ordering::SeqCst)
+        });
+        (
+            f.svc.uploaded.load(Ordering::SeqCst),
+            f.svc.upload_error.load(Ordering::SeqCst),
+        )
+    }
+
+    /// AC-C13 (1): items flowing on the ring are activity, though no byte crosses the socket.
+    #[test]
+    fn a_flowing_ring_stream_outlives_the_servers_idle_timeout() {
+        let f = idle_fixture("idle_flow_dl", IDLE, None);
+        let started = Instant::now();
+        let got = spaced_download(&f, 2500, Duration::from_millis(1)).expect("a clean end");
+        assert_eq!(got, (0..2500).collect::<Vec<_>>());
+        assert!(started.elapsed() > 4 * IDLE, "ran {:?}", started.elapsed());
+
+        let f = idle_fixture("idle_flow_up", IDLE, None);
+        assert_eq!(spaced_upload(&f, 2500, Duration::from_millis(1)), (2500, 0));
+    }
+
+    /// AC-C13 (2): a stream slower than a record now and then, but faster than the timeout, stays.
+    #[test]
+    fn a_slow_ring_stream_inside_the_idle_timeout_stays_alive() {
+        let idle = Duration::from_secs(1);
+        let f = idle_fixture("idle_slow_dl", idle, None);
+        let got = spaced_download(&f, 8, Duration::from_millis(300)).expect("a clean end");
+        assert_eq!(got, (0..8).collect::<Vec<_>>());
+
+        let f = idle_fixture("idle_slow_up", idle, None);
+        assert_eq!(spaced_upload(&f, 8, Duration::from_millis(300)), (8, 0));
+    }
+
+    /// AC-C13 (3): a client cannot hold a server's thread by opening a ring and going quiet.
+    #[test]
+    fn a_stalled_ring_stream_is_ended_by_the_idle_timeout() {
+        let dead = i32::from(rsbinder::StatusCode::DeadObject);
+
+        // The server produces into a small ring nobody reads, and parks.
+        let f = idle_fixture("idle_stall_dl", IDLE, None);
+        let (rx, endpoint) = Receiver::<i32>::with_policy(
+            &f.demo.as_binder(),
+            &ReceiverPolicy {
+                ring_use: RingUse::AlsoUnixRpc,
+                ring_bytes: 4096,
+                credit_window: 1,
+                ..ReceiverPolicy::default()
+            },
+        )
+        .expect("a receiver");
+        assert_eq!(rx.uses_ring(), RING);
+        f.demo
+            .r#subscribe(&endpoint, 1_000_000, 4, 1, 0)
+            .expect("subscribe");
+        assert_eq!(producer_outcome(&f, Duration::from_secs(5)), Some(dead));
+        drop(rx);
+
+        // The server consumes from a client that wrote one item and stopped.
+        let f = idle_fixture("idle_stall_up", IDLE, None);
+        let token = Token::new();
+        let endpoint = f.demo.r#upload(&token.binder(), 64 * 1024).expect("upload");
+        assert_eq!(endpoint.ring.is_some(), RING);
+        let mut sink = Sink::<i32>::open(&endpoint).expect("open");
+        sink.send(&0).expect("send");
+        eventually("the idle session must end the server's receiver", || {
+            f.svc.upload_finished.load(Ordering::SeqCst)
+        });
+        assert_eq!(f.svc.upload_error.load(Ordering::SeqCst), dead);
+        drop(sink);
+    }
+
+    /// AC-C13 (4): a stalled ring stream that pings is not idle: each ping ends a wait, and each re-park counts.
+    #[test]
+    fn a_stalled_ring_stream_that_pings_survives_the_idle_timeout() {
+        let reply = Some(Duration::from_millis(300));
+
+        let f = idle_fixture("idle_ping_dl", IDLE, reply);
+        let (rx, endpoint) = Receiver::<i32>::with_policy(
+            &f.demo.as_binder(),
+            &ReceiverPolicy {
+                ring_use: RingUse::AlsoUnixRpc,
+                ring_bytes: 4096,
+                credit_window: 1,
+                ..ReceiverPolicy::default()
+            },
+        )
+        .expect("a receiver");
+        assert_eq!(rx.uses_ring(), RING);
+        f.demo
+            .r#subscribe(&endpoint, 1_000_000, 4, 1, 0)
+            .expect("subscribe");
+        assert_eq!(producer_outcome(&f, Duration::from_millis(1500)), None);
+        drop(rx);
+
+        let f = idle_fixture("idle_ping_up", IDLE, reply);
+        let token = Token::new();
+        let endpoint = f.demo.r#upload(&token.binder(), 64 * 1024).expect("upload");
+        assert_eq!(endpoint.ring.is_some(), RING);
+        let mut sink = Sink::<i32>::open(&endpoint).expect("open");
+        sink.send(&0).expect("send");
+        thread::sleep(Duration::from_millis(1500));
+        assert!(
+            !f.svc.upload_finished.load(Ordering::SeqCst),
+            "the server's receiver pings the client and stays"
+        );
+        sink.end().expect("end");
+        eventually("the upload ends once the client ends it", || {
+            f.svc.upload_finished.load(Ordering::SeqCst)
+        });
+        assert_eq!(f.svc.upload_error.load(Ordering::SeqCst), 0);
+    }
+}
+
+// ---- AC-C5: a ring over RPC between two processes ----
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod two_process {
+    use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::process::{Child, ChildStdout, Command, Stdio};
+
+    /// `stream_probe serve-rpc-ring` in a process of its own; killed and reaped on drop.
+    struct Server {
+        child: Child,
+        _stdout: BufReader<ChildStdout>,
+    }
+
+    impl Server {
+        fn kill(&mut self) {
+            // A child under another uid (`su`, plan 10-7c B6) refuses the kill; a wait would hang.
+            if self.child.kill().is_ok() {
+                let _ = self.child.wait();
+            }
+        }
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.kill();
+        }
+    }
+
+    /// An abstract socket: no file for a client in another domain to be allowed to write.
+    fn serve(tag: &str) -> (Server, RpcSession, Strong<dyn IStreamDemo>) {
+        let name = format!("rsb_stream_2p_{tag}_{}", std::process::id());
+        // `STREAM_PROBE_BIN` on a device, where the build-time path does not exist.
+        let probe = std::env::var("STREAM_PROBE_BIN")
+            .unwrap_or_else(|_| env!("CARGO_BIN_EXE_stream_probe").to_string());
+        let mut child = Command::new(probe)
+            .arg("serve-rpc-ring")
+            .arg(format!("@{name}"))
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn stream_probe");
+        // Kept open: the child's stdout must not become a broken pipe.
+        let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
+        let mut line = String::new();
+        stdout.read_line(&mut line).expect("the child's first line");
+        assert!(line.starts_with("SERVING"), "stream_probe said {line:?}");
+        let server = Server {
+            child,
+            _stdout: stdout,
+        };
+        let client = RpcSession::setup_client_android13plus_with_config(
+            RpcClientConfig::unix_abstract(name.as_bytes(), 2)
+                .incoming_connections(1)
+                .fd_mode(FileDescriptorTransportMode::Unix),
+        )
+        .expect("connect");
+        let demo = <dyn IStreamDemo as FromIBinder>::try_from(client.get_root().expect("root"))
+            .expect("cast the root to IStreamDemo");
+        (server, client, demo)
+    }
+
+    /// A ring over RPC both ways between two processes: the memfd crosses in an argument and a reply.
+    #[test]
+    fn a_ring_over_rpc_crosses_two_processes() {
+        let (_server, _client, demo) = serve("cross");
+
+        let (mut rx, endpoint) =
+            Receiver::<i32>::with_policy(&demo.as_binder(), &opted_in()).expect("a receiver");
+        assert!(rx.uses_ring());
+        demo.r#subscribe(&endpoint, 200_000, 64, default_credits(), 0)
+            .expect("subscribe");
+        assert!(
+            collect_within(&mut rx).into_iter().eq(0..200_000),
+            "200 000 items in order"
+        );
+        assert!(rx.end_status().expect("ended").is_ok());
+
+        let token = Token::new();
+        let endpoint = demo.r#upload(&token.binder(), 64 * 1024).expect("upload");
+        assert!(endpoint.ring.is_some(), "the child's receiver took a ring");
+        let mut sink =
+            Sink::<i32>::open_with(&endpoint, &bounded_sink()).expect("open the child's ring");
+        for item in 0..50_000 {
+            sink.send(&item).expect("send");
+        }
+        sink.end().expect("end");
+        eventually("the child's receiver must finish", || {
+            demo.r#uploadFinished().expect("uploadFinished")
+        });
+        assert_eq!(demo.r#uploaded().expect("uploaded"), 50_000);
+        assert!(demo.r#uploadOrdered().expect("uploadOrdered"));
+        assert_eq!(demo.r#uploadError().expect("uploadError"), 0);
+    }
+
+    /// The producer's process dies: the consumer gets what was in the ring, then `DeadObject`.
+    #[test]
+    fn a_killed_rpc_ring_producer_ends_the_consumer_after_its_records() {
+        let (mut server, _client, demo) = serve("producer_dies");
+        let (mut rx, endpoint) =
+            Receiver::<i32>::with_policy(&demo.as_binder(), &opted_in()).expect("a receiver");
+        assert!(rx.uses_ring());
+        demo.r#subscribe(&endpoint, i32::MAX, 64, default_credits(), 1000)
+            .expect("subscribe");
+        for expected in 0..10 {
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(10)).expect("ok"),
+                Some(expected)
+            );
+        }
+        server.kill();
+        let mut expected = 10;
+        let failure = loop {
+            match rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(Some(item)) => {
+                    assert_eq!(item, expected, "records before the death come in order");
+                    expected += 1;
+                }
+                Ok(None) if rx.is_finished() => panic!("a clean end the producer never sent"),
+                Ok(None) => panic!("the dead producer left the consumer waiting"),
+                Err(status) => break status,
+            }
+        };
+        assert_eq!(
+            failure.transaction_error(),
+            rsbinder::StatusCode::DeadObject
+        );
+    }
+
+    /// The consumer's process dies: the producer's writes fail with `DeadObject` once it sees that.
+    #[test]
+    fn a_killed_rpc_ring_consumer_ends_the_producer() {
+        let (mut server, _client, demo) = serve("consumer_dies");
+        let token = Token::new();
+        let endpoint = demo.r#upload(&token.binder(), 4096).expect("upload");
+        assert!(endpoint.ring.is_some());
+        let mut sink =
+            Sink::<i32>::open_with(&endpoint, &bounded_sink()).expect("open the child's ring");
+        for item in 0..100 {
+            sink.send(&item).expect("send");
+        }
+        server.kill();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let failure = loop {
+            assert!(
+                Instant::now() < deadline,
+                "the producer never saw the death"
+            );
+            if let Err(e) = sink.send(&0) {
+                break e;
+            }
+        };
+        assert_eq!(failure, rsbinder::StatusCode::DeadObject);
+    }
 }

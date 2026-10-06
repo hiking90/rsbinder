@@ -2906,6 +2906,27 @@ impl core::marker::Unpin for rsbinder::stream::PingPolicy
 impl core::marker::UnsafeUnpin for rsbinder::stream::PingPolicy
 impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::stream::PingPolicy
 impl core::panic::unwind_safe::UnwindSafe for rsbinder::stream::PingPolicy
+#[non_exhaustive] pub enum rsbinder::stream::RingUse
+pub rsbinder::stream::RingUse::AlsoUnixRpc
+pub rsbinder::stream::RingUse::KernelOnly
+impl core::clone::Clone for rsbinder::stream::RingUse
+pub fn rsbinder::stream::RingUse::clone(&self) -> rsbinder::stream::RingUse
+impl core::cmp::Eq for rsbinder::stream::RingUse
+impl core::cmp::PartialEq for rsbinder::stream::RingUse
+pub fn rsbinder::stream::RingUse::eq(&self, &rsbinder::stream::RingUse) -> bool
+impl core::default::Default for rsbinder::stream::RingUse
+pub fn rsbinder::stream::RingUse::default() -> rsbinder::stream::RingUse
+impl core::fmt::Debug for rsbinder::stream::RingUse
+pub fn rsbinder::stream::RingUse::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for rsbinder::stream::RingUse
+impl core::marker::StructuralPartialEq for rsbinder::stream::RingUse
+impl core::marker::Freeze for rsbinder::stream::RingUse
+impl core::marker::Send for rsbinder::stream::RingUse
+impl core::marker::Sync for rsbinder::stream::RingUse
+impl core::marker::Unpin for rsbinder::stream::RingUse
+impl core::marker::UnsafeUnpin for rsbinder::stream::RingUse
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::stream::RingUse
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::stream::RingUse
 pub struct rsbinder::stream::Receiver<T>
 impl<T: rsbinder::Deserialize> rsbinder::stream::Receiver<T>
 pub fn rsbinder::stream::Receiver<T>::cancel(&self) -> rsbinder::Result<()>
@@ -2917,6 +2938,7 @@ pub fn rsbinder::stream::Receiver<T>::recv(&mut self) -> core::option::Option<rs
 pub async fn rsbinder::stream::Receiver<T>::recv_async(&mut self) -> core::option::Option<rsbinder::BinderResult<T>>
 pub fn rsbinder::stream::Receiver<T>::recv_timeout(&mut self, core::time::Duration) -> rsbinder::BinderResult<core::option::Option<T>>
 pub fn rsbinder::stream::Receiver<T>::try_recv(&mut self) -> rsbinder::BinderResult<core::option::Option<T>>
+pub fn rsbinder::stream::Receiver<T>::uses_ring(&self) -> bool
 pub fn rsbinder::stream::Receiver<T>::with_policy(&rsbinder::SIBinder, &rsbinder::stream::ReceiverPolicy) -> rsbinder::Result<(Self, rsbinder::stream::StreamEndpoint<T>)>
 impl<T: rsbinder::Deserialize> core::iter::traits::iterator::Iterator for rsbinder::stream::Receiver<T>
 pub type rsbinder::stream::Receiver<T>::Item = core::result::Result<T, rsbinder::Status>
@@ -2937,6 +2959,7 @@ pub rsbinder::stream::ReceiverPolicy::credit_window: u32
 pub rsbinder::stream::ReceiverPolicy::max_opening: u32
 pub rsbinder::stream::ReceiverPolicy::ping: rsbinder::stream::PingPolicy
 pub rsbinder::stream::ReceiverPolicy::ring_bytes: usize
+pub rsbinder::stream::ReceiverPolicy::ring_use: rsbinder::stream::RingUse
 impl core::clone::Clone for rsbinder::stream::ReceiverPolicy
 pub fn rsbinder::stream::ReceiverPolicy::clone(&self) -> rsbinder::stream::ReceiverPolicy
 impl core::cmp::Eq for rsbinder::stream::ReceiverPolicy

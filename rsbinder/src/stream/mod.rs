@@ -110,8 +110,21 @@
 //! after the opening call no call goes from consumer to producer at all.
 //! A full ring parks the producer on the ring's futex until the consumer
 //! reads; an empty ring parks the consumer until the producer writes.
+//! Before parking, a blocking call looks at the ring for up to 20 µs
+//! (not on a single-core machine, never on an async executor thread, not
+//! past a first short round while half the process's cores' worth of
+//! threads already look, and only on every eighth wait of a side whose
+//! recent looks all came up empty, until a look finds something or a wait
+//! shows one would have), since a park costs a futex wake on the other
+//! side. The consumer copies
+//! every record the producer has committed out of the ring at once and
+//! frees the space with one wake. Each [`send`](Sink::send) still puts
+//! its item in the ring before it returns.
 //! The ring's size is the whole of the flow control
-//! ([`ReceiverPolicy::ring_bytes`]), and it bounds the largest item:
+//! ([`ReceiverPolicy::ring_bytes`]): the producer runs ahead of what
+//! [`recv`](Receiver::recv) has returned by at most the ring plus the
+//! records the consumer has copied out and not yet returned, together
+//! under twice the ring. The size also bounds the largest item:
 //! `ring_bytes - `[`END_RESERVE`]` - 4`. The layout is in
 //! `StreamEndpoint.aidl`; a C++ peer using `libfmq` implements against
 //! it.
@@ -130,8 +143,12 @@
 //!
 //! Which one a stream gets is the consumer's peer: a kernel proxy makes a
 //! ring, and so does a local object on Linux and Android; an RPC proxy
-//! makes a sink-only endpoint, and so does a local object elsewhere.
-//! [`Sink::open`] follows whichever the endpoint carries.
+//! makes a sink-only endpoint, and so does a local object elsewhere. A
+//! consumer may opt an RPC peer into the ring
+//! ([`ReceiverPolicy::ring_use`], [`RingUse::AlsoUnixRpc`]) when the
+//! session is a Unix socket on the same host that passes file descriptors
+//! and carries calls both ways; [`Receiver::uses_ring`] tells which one a
+//! stream got. [`Sink::open`] follows whichever the endpoint carries.
 //!
 //! # What the two have in common
 //!
@@ -284,21 +301,74 @@ impl<T> StreamEndpoint<T> {
 /// `ring_bytes - END_RESERVE - 4`.
 pub const END_RESERVE: usize = 256;
 
+/// Where a [`Receiver`] puts its stream on a ring: the peer has to be able
+/// to map the consumer's memory and be woken through it (plan 10-7c).
+///
+/// The ring needs Linux or Android (an OS shared-memory fd and futex). A
+/// stream that does not get one runs on the RPC path's calls instead, and
+/// [`Receiver::uses_ring`] tells which it got.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RingUse {
+    /// A ring when the peer is a kernel binder proxy or a local object;
+    /// calls when it is an RPC proxy. The default.
+    #[default]
+    KernelOnly,
+    /// Also a ring over an RPC session whose transport can hand the ring
+    /// over and wake through it: a session that
+    /// [passes file descriptors](crate::TransportCaps::FD_PASSING) (a
+    /// Unix-domain socket that negotiated the `Unix` fd mode), on the
+    /// [same host](crate::TransportCaps::SAME_HOST), with
+    /// [calls both ways](crate::TransportCaps::CALLBACKS). A session that
+    /// does not pass file descriptors or is on another host gets calls, and
+    /// a `log::debug!` line names what it lacks. One without calls both ways
+    /// refuses the stream with `InvalidOperation`, opted in or not, as it
+    /// does on calls.
+    ///
+    /// The producer must implement the ring over RPC. rsbinder's does. A
+    /// producer written to the RPC-only contract refuses the endpoint, and
+    /// how that shows depends on the direction:
+    ///
+    /// * **Download** (the producer is the service being called): its
+    ///   refusal is the error of the call that opens the stream.
+    /// * **Upload** (the producer is the caller): the call that opens the
+    ///   stream has already succeeded, and no call is left to report the
+    ///   refusal on. The consumer learns of it only when the producer's
+    ///   process dies, or from its own
+    ///   [`recv_timeout`](Receiver::recv_timeout).
+    ///
+    /// A producer that ignores the ring and sends batches ends the stream
+    /// with `EX_ILLEGAL_STATE`.
+    AlsoUnixRpc,
+}
+
 /// What a [`Receiver`] is made with: the ring on the kernel path, the
-/// credit window on the RPC path. The peer decides which applies.
+/// credit window on the RPC path. The peer decides which applies, and
+/// [`ring_use`](Self::ring_use) whether an RPC peer may get a ring too.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReceiverPolicy {
-    /// Kernel binder: bytes of ring the consumer allocates, and so the
-    /// most the producer can run ahead by. Must exceed [`END_RESERVE`]` + 4`;
-    /// the largest item is `ring_bytes - END_RESERVE - 4`, so a stream of
-    /// large items needs a larger ring. The memory is allocated up front
-    /// and charged to the consumer's process.
+    /// Ring: bytes of ring the consumer allocates. Must exceed
+    /// [`END_RESERVE`]` + 4`; the largest item is
+    /// `ring_bytes - END_RESERVE - 4`, so a stream of large items needs a
+    /// larger ring. The memory is allocated up front and charged to the
+    /// consumer's process, and so is a buffer of up to the same size that
+    /// the consumer copies records into before it returns them, and one
+    /// each item is decoded through, kept at the largest item's size.
     ///
-    /// Default 64 KiB: sixteen pages, the same in-flight bound as four
-    /// 16 KiB batches on the RPC path. A producer accepts a ring up to
+    /// The producer runs ahead of what the consumer has returned by at most
+    /// what the ring holds plus what that buffer still holds: under twice
+    /// `ring_bytes`. A refill takes every record in the ring at once and
+    /// frees the ring for the producer right away.
+    ///
+    /// Default 64 KiB: sixteen pages. A producer accepts a ring up to
     /// [`SinkPolicy::max_ring_bytes`].
+    ///
+    /// Once the ring holds a few of the largest items, a larger one mainly
+    /// lets the producer run further ahead: both ends look at the ring
+    /// briefly before parking, so they rarely wait on each other. A ring
+    /// that holds only one or two such items makes them alternate.
     pub ring_bytes: usize,
-    /// RPC: how many drained batches the consumer lets go unpaid before
+    /// Calls: how many drained batches the consumer lets go unpaid before
     /// it grants. A grant leaves once half this window is owed — or the
     /// producer's whole opening window, if that is less — and whatever is
     /// owed leaves before the consumer waits. A larger window means fewer
@@ -309,7 +379,7 @@ pub struct ReceiverPolicy {
     /// that is the producer's opening window, which stays the ceiling
     /// because a grant only pays for a batch already drained.
     pub credit_window: u32,
-    /// RPC: the widest opening window this consumer accepts. The producer
+    /// Calls: the widest opening window this consumer accepts. The producer
     /// states its window when it introduces itself, and the consumer
     /// holds it to that plus what it has granted since — a batch beyond
     /// it ends the stream with `EX_ILLEGAL_STATE` rather than being
@@ -323,10 +393,18 @@ pub struct ReceiverPolicy {
     /// [`Sink::open`] is always taken by a consumer made with
     /// [`Receiver::new`].
     pub max_opening: u32,
-    /// RPC: whether a wait for an item that hears nothing from the
-    /// producer checks that it is still there. Default
-    /// [`PingPolicy::Inherit`].
+    /// RPC session: whether a wait for an item, on calls or a ring, that
+    /// hears nothing from the producer checks that it is still there.
+    /// Default [`PingPolicy::Inherit`].
     pub ping: PingPolicy,
+    /// Whether an RPC peer may get a ring. Default
+    /// [`RingUse::KernelOnly`].
+    ///
+    /// The ring costs a memfd and a mapping on each side to set up. Over an
+    /// RPC session on x86-64 the calls path is faster for items up to about
+    /// 128 bytes and the ring above that, several times so from a kilobyte;
+    /// see the book's "A ring over a Unix session" for the measurements.
+    pub ring_use: RingUse,
 }
 
 impl Default for ReceiverPolicy {
@@ -336,6 +414,7 @@ impl Default for ReceiverPolicy {
             credit_window: 4,
             max_opening: 4,
             ping: PingPolicy::default(),
+            ring_use: RingUse::default(),
         }
     }
 }
@@ -344,7 +423,7 @@ impl Default for ReceiverPolicy {
 /// path, how it batches on the RPC path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SinkPolicy {
-    /// Kernel binder: the largest ring this producer maps. The ring is
+    /// Ring: the largest ring this producer maps. The ring is
     /// the consumer's memory, and a hostile consumer could describe one
     /// of any size; this is the producer's address space at stake.
     ///
@@ -352,11 +431,11 @@ pub struct SinkPolicy {
     /// [`ProcessState::init_with_mmap_size`](crate::ProcessState::init_with_mmap_size)
     /// puts on the binder mapping itself.
     pub max_ring_bytes: usize,
-    /// RPC: the most bytes one batch carries before it is sent. A
+    /// Calls: the most bytes one batch carries before it is sent. A
     /// threshold, not a cap — an item larger than it still goes out, with
     /// the batch it was added to. Default 16 KiB.
     pub max_batch_bytes: usize,
-    /// RPC: batches the producer may send before the consumer grants
+    /// Calls: batches the producer may send before the consumer grants
     /// anything, so that a short stream finishes without a credit round
     /// trip. Stated to the consumer, which ends the stream at once when
     /// it is more than [`ReceiverPolicy::max_opening`]. At least one: the
@@ -420,8 +499,9 @@ pub struct SinkPolicy {
     /// third of the reply deadline ends each wait before any ping, so a
     /// producer that only makes such calls never checks the consumer.
     pub send_timeout: Option<Duration>,
-    /// RPC: whether a wait for credit that hears nothing from the consumer
-    /// checks that it is still there. Default [`PingPolicy::Inherit`].
+    /// RPC session: whether a wait for credit, or for room in a ring, that
+    /// hears nothing from the consumer checks that it is still there.
+    /// Default [`PingPolicy::Inherit`].
     pub ping: PingPolicy,
 }
 
@@ -466,8 +546,9 @@ impl Default for SinkPolicy {
 /// again.
 ///
 /// Only a wait pings: [`Receiver::recv`] and its variants waiting for an
-/// item, once the producer has introduced itself, and a [`Sink`] call
-/// waiting for credit. A stream whose items flow never pings, and an end
+/// item — on calls once the producer has introduced itself, on a ring the
+/// binder the receiver was made against — and a [`Sink`] call waiting for
+/// credit or for room in a ring. A stream whose items flow never pings, and an end
 /// that is not waiting on the stream checks nothing until it next waits.
 /// A wait whose own bound is shorter than a third of the reply deadline
 /// ends without pinging, so a loop of such calls never checks the peer.
@@ -479,7 +560,9 @@ impl Default for SinkPolicy {
 /// there for as long as it lasts; this build has no timer to suspend a
 /// task against.
 ///
-/// The ring path never pings: the kernel reports the peer's death itself.
+/// A ring over kernel binder never pings: the kernel reports the peer's
+/// death itself. A ring over an RPC session ([`RingUse::AlsoUnixRpc`])
+/// pings as the calls path does, since its death link is the session too.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PingPolicy {
@@ -602,10 +685,75 @@ fn peer_caps(binder: &SIBinder) -> crate::TransportCaps {
     crate::TransportCaps::KERNEL
 }
 
-/// A ring needs one kernel driver (or process) for both ends plus OS shared memory and futex.
-fn over_ring(peer: &SIBinder) -> bool {
-    cfg!(any(target_os = "linux", target_os = "android"))
-        && peer_caps(peer).contains(crate::TransportCaps::KERNEL_KNOBS)
+/// Floor under a third of a tiny reply deadline, so a sub-3 ms deadline cannot spin the wait.
+#[cfg(feature = "rpc")]
+const MIN_PING_INTERVAL: Duration = Duration::from_millis(1);
+
+/// Whom a wait pings once it has gone `every` without a wake (plan 2-24 D9).
+struct Ping {
+    peer: SIBinder,
+    every: Duration,
+}
+
+impl Ping {
+    /// `None` when `policy` is off, `peer` is no RPC proxy, or its session has no deadline.
+    fn to(peer: &SIBinder, policy: PingPolicy) -> Option<Ping> {
+        if policy == PingPolicy::Off {
+            return None;
+        }
+        #[cfg(feature = "rpc")]
+        if let Some(proxy) = (**peer).as_any().downcast_ref::<crate::rpc::RpcProxy>() {
+            // Read per wait: a server sets a session's deadline only after the session exists.
+            let every = (proxy.session_timeout()? / 3).max(MIN_PING_INTERVAL);
+            return Some(Ping {
+                peer: peer.clone(),
+                every,
+            });
+        }
+        #[cfg(not(feature = "rpc"))]
+        let _ = peer;
+        None
+    }
+
+    /// Unanswered within the reply deadline, it ends the session, and the death link the stream.
+    fn send(&self) {
+        match self.peer.ping_binder() {
+            Ok(()) | Err(StatusCode::DeadObject) => {}
+            Err(e) => log::warn!("stream: pinging the peer failed: {e:?}"),
+        }
+    }
+}
+
+/// What an RPC session needs to carry a ring: hand over its fd, map it, and call both ways.
+const RING_OVER_RPC: crate::TransportCaps = crate::TransportCaps::SAME_HOST
+    .union(crate::TransportCaps::FD_PASSING)
+    .union(crate::TransportCaps::CALLBACKS);
+
+/// Linux/Android only: kernel binder or a local object always; an RPC session when opted in and
+/// capable.
+fn over_ring(peer: &SIBinder, policy: &ReceiverPolicy) -> bool {
+    let opted_in = policy.ring_use == RingUse::AlsoUnixRpc;
+    if !cfg!(any(target_os = "linux", target_os = "android")) {
+        if opted_in {
+            log::debug!("stream: RingUse::AlsoUnixRpc, but this platform has no ring");
+        }
+        return false;
+    }
+    let caps = peer_caps(peer);
+    if caps.contains(crate::TransportCaps::KERNEL_KNOBS) {
+        return true;
+    }
+    if !opted_in {
+        return false;
+    }
+    if caps.contains(RING_OVER_RPC) {
+        return true;
+    }
+    log::debug!(
+        "stream: RingUse::AlsoUnixRpc, but the peer's session lacks {}; no ring",
+        RING_OVER_RPC.difference(caps)
+    );
+    false
 }
 
 /// The deadline one `Sink` call's waits share; `None` = no bound, also past what `Instant` holds.
@@ -619,16 +767,11 @@ fn encode_item<T: Serialize + ?Sized>(scratch: &mut Parcel, item: &T) -> Result<
     scratch.write(item)
 }
 
-/// One item from all of `buf`, read in place; `buf` keeps its allocation for the next record.
-fn decode_item<T: Deserialize>(buf: &mut Vec<u8>) -> Result<T> {
-    let mut parcel = Parcel::data_only_from_vec(std::mem::take(buf));
-    let item = parcel.read::<T>();
+/// One item from all of `bytes`, read through `parcel`, a data-only parcel kept for every record.
+fn decode_item<T: Deserialize>(parcel: &mut Parcel, bytes: &[u8]) -> Result<T> {
+    parcel.refill_data_only(bytes);
+    let item = parcel.read::<T>()?;
     let left = parcel.data_avail();
-    // Data-only, so self-contained: the Vec moves back.
-    if let Ok(bytes) = parcel.into_bytes() {
-        *buf = bytes;
-    }
-    let item = item?;
     if left != 0 {
         log::error!(
             "stream: {left} bytes left after one item; the two ends disagree on the item type"
@@ -1272,7 +1415,9 @@ impl<T: Deserialize> Receiver<T> {
     /// [module docs](self#the-endpoint-and-the-call-that-opens-a-stream)).
     /// It picks the transport: a kernel proxy makes a ring endpoint, and so
     /// does a local object on Linux and Android; an RPC proxy makes a
-    /// sink-only one, and so does a local object elsewhere. And it is
+    /// sink-only one, unless the policy opts in ([`RingUse::AlsoUnixRpc`])
+    /// and the session can carry a ring; a local object elsewhere makes a
+    /// sink-only one too. And it is
     /// watched for death, so a producer that dies releases a consumer
     /// blocked in [`recv`](Self::recv); a `peer` that is not in the
     /// producer's process leaves that death unseen, and a local object is
@@ -1302,8 +1447,9 @@ impl<T: Deserialize> Receiver<T> {
         peer: &SIBinder,
         policy: &ReceiverPolicy,
     ) -> Result<(Self, StreamEndpoint<T>)> {
-        let (inner, ring, sink, death) = if over_ring(peer) {
+        let (inner, ring, sink, death) = if over_ring(peer, policy) {
             let (consumer, ring, sink) = ring::Consumer::new(policy)?;
+            consumer.set_peer(peer, policy.ping);
             let death = watch_death(peer, consumer.death_recipient())?;
             (ReceiverInner::Ring(consumer), Some(ring), sink, death)
         } else {
@@ -1431,6 +1577,13 @@ impl<T: Deserialize> Receiver<T> {
         }
     }
 
+    /// Whether this stream runs on a ring, as opposed to the RPC path's
+    /// calls. Fixed when the receiver is made: see [`RingUse`] for what
+    /// decides it.
+    pub fn uses_ring(&self) -> bool {
+        matches!(self.inner, ReceiverInner::Ring(_))
+    }
+
     /// Whether the stream is over — the terminator arrived and every
     /// item before it has been handed out.
     pub fn is_finished(&self) -> bool {
@@ -1530,28 +1683,38 @@ mod tests {
     }
 
     #[test]
-    fn a_reused_buffer_is_neither_lost_nor_left_with_the_last_item() {
+    fn a_reused_parcel_is_neither_lost_nor_left_with_the_last_item() {
         let mut scratch = Parcel::new_data_only();
         encode_item(&mut scratch, &vec![9u8; 300]).expect("encode");
+        let long = scratch.as_bytes().expect("bytes").to_vec();
         encode_item(&mut scratch, &7i32).expect("encode over it");
-        let mut buf = scratch.as_bytes().expect("bytes").to_vec();
-        assert_eq!(buf.len(), 4, "nothing of the earlier item is left");
-        let at = buf.as_ptr();
-        assert_eq!(decode_item::<i32>(&mut buf), Ok(7));
-        assert_eq!(buf.as_ptr(), at, "decode_item hands the buffer back");
-        // A short read is refused, and the buffer still comes back.
+        let short = scratch.as_bytes().expect("bytes").to_vec();
+        assert_eq!(short.len(), 4, "nothing of the earlier item is left");
+
+        let mut parcel = Parcel::new_data_only();
         assert_eq!(
-            decode_item::<i64>(&mut buf).err(),
+            decode_item::<Vec<u8>>(&mut parcel, &long),
+            Ok(vec![9u8; 300])
+        );
+        let grown = parcel.capacity();
+        // The long record's bytes stay allocated but are no part of the next.
+        assert_eq!(decode_item::<i32>(&mut parcel, &short), Ok(7));
+        assert_eq!(parcel.capacity(), grown, "the allocation is kept");
+        assert_eq!(
+            decode_item::<i64>(&mut parcel, &short).err(),
             Some(StatusCode::NotEnoughData)
         );
-        assert_eq!(buf.as_ptr(), at, "handed back after a short read");
-        buf.extend_from_slice(&[0; 4]);
-        let at = buf.as_ptr();
+        let mut leftover = short.clone();
+        leftover.extend_from_slice(&[0; 4]);
         assert_eq!(
-            decode_item::<i32>(&mut buf).err(),
+            decode_item::<i32>(&mut parcel, &leftover).err(),
             Some(StatusCode::BadValue)
         );
-        assert_eq!(buf.as_ptr(), at, "handed back after leftover bytes");
+        assert_eq!(
+            decode_item::<i32>(&mut parcel, &short),
+            Ok(7),
+            "a refused record leaves the parcel usable"
+        );
     }
 
     #[test]
@@ -1914,15 +2077,18 @@ mod tests {
         let (sent, _, sink) = bounded(sink, |sink| sink.send(&-1));
         assert_eq!(sent.err(), Some(StatusCode::TimedOut));
 
-        // Room for two records, then three to send: the third times out, the first two stay.
+        // One read moves every record into the consumer's batch; refill to leave room for two.
         assert_eq!(rx.try_recv().expect("no error"), Some(0));
-        assert_eq!(rx.try_recv().expect("no error"), Some(1));
-        let extra = [fill, fill + 1, fill + 2];
+        let refill: Vec<i32> = (fill..2 * fill - 2).collect();
+        let (sent, _, sink) = bounded(sink, move |sink| sink.send_all(refill.iter()));
+        sent.expect("room for these");
+        // Three to send: the third times out, the first two stay.
+        let extra = [2 * fill - 2, 2 * fill - 1, 2 * fill];
         let (sent, _, sink) = bounded(sink, move |sink| sink.send_all(extra.iter()));
         assert_eq!(sent.err(), Some(StatusCode::TimedOut));
         sink.end().expect("end");
         let rest: Vec<i32> = (&mut rx).map(|item| item.expect("ok")).collect();
-        assert_eq!(rest, (2..fill + 2).collect::<Vec<_>>());
+        assert_eq!(rest, (1..2 * fill).collect::<Vec<_>>());
         assert!(rx.end_status().expect("ended").is_ok());
     }
 

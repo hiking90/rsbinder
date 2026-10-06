@@ -13,6 +13,9 @@ keywords = ["android", "fmq", "shared-memory", "ipc", "linux"]
 [package.metadata.docs.rs]
 all-features = true
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
 [dependencies]
 # `time` is for the absolute `CLOCK_MONOTONIC` deadline a futex wait takes;
 # `param` for the page size the mappings are aligned to. Both compile on every
@@ -36,3 +39,9 @@ libc = { workspace = true }
 # `net` is for the two-process test, which hands the queue's fd to a child
 # over a unix socket (`SCM_RIGHTS`), independent of binder (`plans/12-fmq.md`).
 rustix = { workspace = true, features = ["net"] }
+
+# loom is only used by tests gated on `--cfg loom`. Run with:
+#   RUSTFLAGS="--cfg loom" cargo test -p rsbinder-fmq --test loom_event_flag --release
+# Without the cfg the gated file compiles to an empty crate.
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"

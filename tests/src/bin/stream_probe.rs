@@ -31,9 +31,10 @@
 //! stream_probe vanish  <name> <sendN>
 //! stream_probe status  <name>
 //! stream_probe serve-rpc <socketPath> [replyTimeoutMs]   (feature `rpc`)
+//! stream_probe serve-rpc-ring <socketPath>               (feature `rpc`)
 //! ```
 //!
-//! Every mode but `serve` and `serve-rpc` prints one `RESULT` line;
+//! Every mode but `serve`, `serve-rpc` and `serve-rpc-ring` prints one `RESULT` line;
 //! `tests/scripts/run_stream_ac.sh` drives them. The `subscribe` call's
 //! batch and credit arguments only shape the RPC path, so the probe
 //! passes the producer's defaults and lets the ring do the pacing.
@@ -42,6 +43,8 @@
 //! Unix socket, for a libbinder `RpcSession` client to stream against
 //! (`example-hello/cpp/run_stream_rpc_interop.sh`). `replyTimeoutMs` sets
 //! every session's reply deadline, which also arms the stream ping.
+//! `serve-rpc-ring` also takes the `Unix` fd mode, so rings run both ways, and gives uploads a
+//! ring; `@name` is an abstract socket, so SELinux checks no file.
 
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
@@ -49,7 +52,7 @@ use std::thread;
 use std::time::Duration;
 
 use rsbinder::stream::{
-    Receiver, ReceiverPolicy, Sink, SinkPolicy, StreamEndpoint, Token, END_RESERVE,
+    Receiver, ReceiverPolicy, RingUse, Sink, SinkPolicy, StreamEndpoint, Token, END_RESERVE,
 };
 use rsbinder::*;
 
@@ -59,6 +62,8 @@ use streamdemo::IStreamDemo::{BnStreamDemo, IStreamDemo};
 
 #[derive(Default)]
 struct DemoSvc {
+    /// Whether an upload's receiver may take a ring from an RPC client (`serve-rpc-ring`).
+    upload_ring_use: RingUse,
     sent: Arc<AtomicI32>,
     finished: Arc<AtomicBool>,
     last_error: Arc<AtomicI32>,
@@ -170,6 +175,7 @@ impl IStreamDemo for DemoSvc {
             producer,
             &ReceiverPolicy {
                 ring_bytes: ring_bytes.max(0) as usize,
+                ring_use: self.upload_ring_use,
                 ..ReceiverPolicy::default()
             },
         )?;
@@ -229,16 +235,27 @@ fn serve(name: &str) -> Result<()> {
     server.run()
 }
 
-/// The service as an RPC root: a libbinder client asks for the root object, not a name.
+/// The service as an RPC root; `ring` adds the `Unix` fd mode and ring uploads (plan 10-7c).
 #[cfg(feature = "rpc")]
-fn serve_rpc(path: &str, reply_timeout: Option<Duration>) -> Result<()> {
+fn serve_rpc(path: &str, reply_timeout: Option<Duration>, ring: bool) -> Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let server = match path.strip_prefix('@') {
+        Some(name) => rsbinder::rpc::RpcServer::setup_unix_server_abstract(name.as_bytes())?,
+        None => rsbinder::rpc::RpcServer::setup_unix_server(path)?,
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let server = rsbinder::rpc::RpcServer::setup_unix_server(path)?;
     server.set_android13plus(2);
     // Every session's deadline, and so the period of the producer's pings (plan 2-24 D9).
     server.set_reply_timeout(reply_timeout);
     // Batches, grants and cancels are oneway calls from the client; a few threads take them.
     server.set_max_threads(4);
-    server.set_root(BnStreamDemo::new_binder(DemoSvc::default()).as_binder())?;
+    let mut svc = DemoSvc::default();
+    if ring {
+        server.set_supported_fd_modes(&[rsbinder::rpc::FileDescriptorTransportMode::Unix]);
+        svc.upload_ring_use = RingUse::AlsoUnixRpc;
+    }
+    server.set_root(BnStreamDemo::new_binder(svc).as_binder())?;
     println!("SERVING {path}");
     use std::io::Write;
     std::io::stdout().flush().ok();
@@ -335,7 +352,7 @@ fn consume(name: &str, count: i32, ring_bytes: usize) -> Result<()> {
     Ok(())
 }
 
-/// Take `take` items, check the producer parks at ring capacity, then read the rest.
+/// Take `take` items, check the producer parks once the ring is full, then read the rest.
 fn pause(name: &str, count: i32, ring_bytes: usize, take: i32) -> Result<()> {
     let demo = connect(name)?;
     let (mut rx, endpoint) = receiver_for(&demo, ring_bytes)?;
@@ -371,12 +388,18 @@ fn pause(name: &str, count: i32, ring_bytes: usize, take: i32) -> Result<()> {
         }
         thread::sleep(Duration::from_millis(20));
     }
-    // Read again: an overshoot past `full` means the ring admitted more than it holds.
+    // Parked on a full ring: past `full` by under a ring (the consumer's last refill), then flat.
+    thread::sleep(Duration::from_millis(200));
+    sent = demo.r#sent().map_err(|e| e.transaction_error())?;
+    thread::sleep(Duration::from_millis(200));
     let again = demo.r#sent().map_err(|e| e.transaction_error())?;
     let finished = demo.r#finished().map_err(|e| e.transaction_error())?;
-    let parked = sent == full && again == full && !finished;
+    let most = full + ring_items(ring_bytes);
+    let parked = (full..most).contains(&sent) && again == sent && !finished;
     if !parked {
-        eprintln!("stream_probe: sent={sent} again={again} finished={finished} full={full}");
+        eprintln!(
+            "stream_probe: sent={sent} again={again} finished={finished} full={full} most={most}"
+        );
     }
 
     let (rest, rest_ordered, ended) = drain(&mut rx, take);
@@ -570,7 +593,8 @@ fn main() {
              \x20      stream_probe upload <name> <count> <ringBytes>\n\
              \x20      stream_probe vanish <name> <sendN>\n\
              \x20      stream_probe status <name>\n\
-             \x20      stream_probe serve-rpc <socketPath> [replyTimeoutMs]"
+             \x20      stream_probe serve-rpc <socketPath> [replyTimeoutMs]\n\
+             \x20      stream_probe serve-rpc-ring <socketPath>"
         );
         std::process::exit(2)
     };
@@ -596,9 +620,13 @@ fn main() {
         (Some("vanish"), 4) => vanish(&args[2], num(3)),
         (Some("status"), 3) => status(&args[2]),
         #[cfg(feature = "rpc")]
-        (Some("serve-rpc"), 3) => serve_rpc(&args[2], None),
+        (Some("serve-rpc"), 3) => serve_rpc(&args[2], None, false),
         #[cfg(feature = "rpc")]
-        (Some("serve-rpc"), 4) => serve_rpc(&args[2], Some(Duration::from_millis(size(3) as u64))),
+        (Some("serve-rpc"), 4) => {
+            serve_rpc(&args[2], Some(Duration::from_millis(size(3) as u64)), false)
+        }
+        #[cfg(feature = "rpc")]
+        (Some("serve-rpc-ring"), 3) => serve_rpc(&args[2], None, true),
         _ => usage(),
     };
     if let Err(e) = r {

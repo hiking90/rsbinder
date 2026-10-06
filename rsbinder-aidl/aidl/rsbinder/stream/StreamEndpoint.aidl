@@ -18,8 +18,12 @@ import android.hardware.common.fmq.SynchronizedReadWrite;
  * two ends share, and the consumer decides when it makes the endpoint:
  * it makes a ring when the binder it holds in the producer's process is a
  * kernel binder object, and leaves `ring` absent when that binder is an
- * RPC proxy. The producer follows the endpoint: a present `ring` is the
- * kernel path, an absent one the RPC path (IStreamSink.aidl).
+ * RPC proxy — unless the consumer opts in and the RPC session is a Unix
+ * socket on the same host that passes file descriptors and carries calls
+ * both ways, when it makes a ring there too. The producer follows the
+ * endpoint: a present `ring` is the ring path, an absent one the calls
+ * path (IStreamSink.aidl). A producer on an RPC session that does not
+ * implement the ring refuses an endpoint that carries one.
  *
  * Each end links to the other's binder for death: the producer to `sink`,
  * the consumer to a binder in the producer's process — the service it
@@ -38,11 +42,14 @@ import android.hardware.common.fmq.SynchronizedReadWrite;
  */
 parcelable StreamEndpoint<T> {
     /**
-     * Kernel binder only: the ring the producer writes records into and
-     * the consumer reads them out of — a synchronized Fast Message Queue
-     * of `byte` (`int8_t`, quantum 1) with an EventFlag word, allocated by
-     * the consumer. Absent when the two ends are on an RPC session, which
-     * carries no shared memory.
+     * The ring the producer writes records into and the consumer reads
+     * them out of — a synchronized Fast Message Queue of `byte` (`int8_t`,
+     * quantum 1) with an EventFlag word, allocated by the consumer.
+     * Present on kernel binder; on an RPC session only when the consumer
+     * opted in and the session is a Unix socket on the same host, where
+     * the memfd crosses as an `SCM_RIGHTS` fd and a peer's death is the
+     * session ending. Absent otherwise: an RPC session in general carries
+     * no shared memory.
      *
      * A record is a 4-byte little-endian header followed by its payload.
      * The header's top bit is the kind — 0 for an item, 1 for the end of
@@ -138,10 +145,12 @@ parcelable StreamEndpoint<T> {
     @nullable MQDescriptor<byte, SynchronizedReadWrite> ring;
 
     /**
-     * The consumer's IStreamSink. On both transports the producer links
-     * to its death. Over an RPC session the producer also calls it —
-     * `onStart`, then batches, then `onEnd` — and it is the whole of the
-     * stream; over kernel binder no method on it is called.
+     * The consumer's IStreamSink. On both paths the producer links to its
+     * death. With no `ring` the producer also calls it — `onStart`, then
+     * batches, then `onEnd` — and it is the whole of the stream. With a
+     * `ring` no method on it is called; a producer that calls `onStart` or
+     * `onBatch` on it ends the stream with `EX_ILLEGAL_STATE`, after the
+     * records already in the ring.
      */
     IBinder sink;
 }

@@ -31,6 +31,10 @@
 #       takes the ping, nothing answers, the session ends on the deadline
 #       and the producer ends with DeadObject. Without the ping it would
 #       wait for good, so R8b is what shows R8a's pings were sent
+#   R9  upload against `stream_probe serve-rpc-ring`, whose receiver opts in
+#       to a ring (plan 10-7c AC-C10): the C++ producer asks for `Unix` fds,
+#       gets a ring endpoint, refuses it and exits; the rsbinder receiver
+#       ends with DeadObject
 #
 # Prereqs:
 #   * a booted AVD (AOSP `default` or google_apis, rootable), SDK >= 34
@@ -161,9 +165,10 @@ cleanup() {
 trap cleanup EXIT
 stop_all
 
-start_server() {   # [replyTimeoutMs]
+SERVE_MODE=serve-rpc
+start_server() {   # [replyTimeoutMs]; `SERVE_MODE=serve-rpc-ring` takes none
     "${ADB[@]}" shell "rm -f $RS_LOG $SOCK" >/dev/null 2>&1 || true
-    "${ADB[@]}" shell "$DEV_DIR/stream_probe serve-rpc $SOCK ${1:-} > $RS_LOG 2>&1" &
+    "${ADB[@]}" shell "$DEV_DIR/stream_probe $SERVE_MODE $SOCK ${1:-} > $RS_LOG 2>&1" &
     for _ in $(seq 1 20); do
         if "${ADB[@]}" shell "grep -c '^SERVING' $RS_LOG 2>/dev/null" | tr -d '\r' | grep -qv '^0$'; then
             return 0
@@ -273,6 +278,21 @@ if start_server "$PING_MS"; then
         "R8b ping: a stopped C++ consumer leaves the ping unanswered; the producer ended with DeadObject"
     end_hang
 fi
+
+# Plan 10-7c AC-C10: the rsbinder consumer opts in to a ring and the C++ producer, which
+# implements only calls, asks for `Unix` fds. The opening call has already succeeded when the
+# producer refuses, so the consumer learns of it from the producer's process going away.
+stop_all
+SERVE_MODE=serve-rpc-ring
+if start_server; then
+    judge "$(run upload-fds 100 4 16)" \
+        "RESULT ERROR ring-over-rpc" \
+        "R9a upload: an opted-in rsbinder consumer handed the C++ producer a ring, which it refused"
+    judge "$(status_until up_finished 1)" \
+        "RESULT status .* up_finished=1 up_error=-32" \
+        "R9b upload: the refusing producer exited; the rsbinder receiver ended with DeadObject"
+fi
+SERVE_MODE=serve-rpc
 
 echo
 echo "PASS $PASS  FAIL $FAIL"

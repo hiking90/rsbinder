@@ -87,8 +87,9 @@ for line in &mut lines {
 
 The peer decides two things: which transport the stream runs on (a kernel
 proxy makes a ring endpoint, and so does a local object on Linux and Android;
-an RPC proxy makes a sink-only one, and so does a local object elsewhere) and
-whom the consumer watches for death. Because the opening call is `twoway`,
+an RPC proxy makes a sink-only one unless the consumer opts in to a ring — see
+[A ring over a Unix session](#a-ring-over-a-unix-session) — and so does a local
+object elsewhere) and whom the consumer watches for death. Because the opening call is `twoway`,
 a refusal — the transport cannot carry the stream, the ring is larger than the
 producer accepts, SELinux denies the mapping — comes back as that call's error.
 
@@ -171,7 +172,14 @@ shrinking and charged to its own process — and the producer maps. Each item
 is one record written in place: a 4-byte header (kind bit plus payload
 length) followed by the item's parcel bytes. A full ring parks the producer on
 the ring's futex until the consumer reads; an empty ring parks the consumer
-until the producer writes. **After the opening call no binder call carries
+until the producer writes. Before parking, a blocking call looks at the ring
+for up to 20 µs (not on a single-core machine, never on an async executor
+thread, not past a first short round while threads for half the cores already
+look, and only on every eighth wait of a side whose last 64 looks found
+nothing), and the consumer copies every record the producer has committed out
+at once and frees the space with one wake. A look costs CPU while it lasts: it
+pays where the other end is about to act, and is turned down where items come
+further apart than the look or more threads look than the cores can run. **After the opening call no binder call carries
 anything in either direction**: the end of the stream is the last record, and
 a cancel is a bit in the ring's EventFlag word. The `sink` binder is still in
 the endpoint, but the producer only links to it for death.
@@ -182,8 +190,9 @@ The record layout, the end reserve and the three EventFlag bits (`NOT_FULL`,
 
 ### RPC: two `oneway` interfaces
 
-An RPC session carries no shared memory, so the endpoint carries only the
-consumer's `sink`, and the stream is two ordinary AIDL interfaces, shipped
+By default an RPC session carries no shared memory, so the endpoint carries
+only the consumer's `sink` (a consumer may opt in to a ring on a Unix session,
+[below](#a-ring-over-a-unix-session)), and the stream is two ordinary AIDL interfaces, shipped
 beside the parcelable in `rsbinder/aidl/stream/`:
 
 ```aidl
@@ -227,29 +236,37 @@ connection on the session, see [Over RPC](#over-rpc).
 Flow control is set on each side when the stream is made:
 `Receiver::with_policy(&peer, &ReceiverPolicy { .. })` on the consumer and
 `Sink::open_with(&endpoint, &SinkPolicy { .. })` on the producer. Each policy
-has fields for both transports; the ones for the transport not in use are
-ignored. `Receiver::new` and `Sink::open` take the defaults.
+has fields for both paths; the ones for the path not in use are
+ignored. A ring over a Unix session takes the ring fields and `ping`; the
+credit and batch fields do not apply to it. `Receiver::new` and `Sink::open`
+take the defaults.
 
-| Policy field | Transport | Default | What it sets |
+| Policy field | Path | Default | What it sets |
 |---|---|---|---|
-| `ReceiverPolicy::ring_bytes` | kernel | 64 KiB | The ring the consumer allocates — the whole of the flow control, and the bound on the largest item |
-| `SinkPolicy::max_ring_bytes` | kernel | 4 MiB | The largest ring the producer maps; a bigger one is refused at `Sink::open` |
-| `SinkPolicy::max_batch_bytes` | RPC | 16 KiB | The byte threshold at which a pending batch is sent |
-| `SinkPolicy::initial_credits` | RPC | 4 | The window the producer opens with — its ceiling on batches in flight |
+| `ReceiverPolicy::ring_bytes` | ring | 64 KiB | The ring the consumer allocates — the whole of the flow control (the producer runs ahead by under twice it), and the bound on the largest item |
+| `SinkPolicy::max_ring_bytes` | ring | 4 MiB | The largest ring the producer maps; a bigger one is refused at `Sink::open` |
+| `ReceiverPolicy::ring_use` | RPC session | `KernelOnly` | Whether an RPC peer may get a ring; see [A ring over a Unix session](#a-ring-over-a-unix-session) |
+| `SinkPolicy::max_batch_bytes` | calls | 16 KiB | The byte threshold at which a pending batch is sent |
+| `SinkPolicy::initial_credits` | calls | 4 | The window the producer opens with — its ceiling on batches in flight |
 | `SinkPolicy::send_timeout` | both | `None` | How long one `send`/`send_all`/`flush`/`end` call (or `*_async` future, from its first poll) may wait for ring room or credit before it returns `TimedOut`; the item is not written or queued and the stream stays usable. `Some(Duration::ZERO)` never waits. It does not bound the RPC session's own send deadline |
-| `ReceiverPolicy::credit_window` | RPC | 4 | The consumer's grant threshold: a grant leaves once half of it is owed |
-| `ReceiverPolicy::max_opening` | RPC | 4 | The widest opening window the consumer accepts |
-| `SinkPolicy::ping`, `ReceiverPolicy::ping` | RPC | `Inherit` | Whether a wait that hears nothing from the other end pings it; see [a peer that goes silent](#a-peer-that-goes-silent) |
+| `ReceiverPolicy::credit_window` | calls | 4 | The consumer's grant threshold: a grant leaves once half of it is owed |
+| `ReceiverPolicy::max_opening` | calls | 4 | The widest opening window the consumer accepts |
+| `SinkPolicy::ping`, `ReceiverPolicy::ping` | RPC session | `Inherit` | Whether a wait that hears nothing from the other end pings it; see [a peer that goes silent](#a-peer-that-goes-silent) |
 
-**On the ring** the ring's size is everything: the producer can be ahead of the
-consumer by at most `ring_bytes` of records, and it waits for room beyond
-that. The last `END_RESERVE` (256) bytes are never given to items, so the end
+**On the ring** the ring's size is everything: the producer waits for room once
+the ring is full. The consumer copies every record in the ring out at once and
+frees the ring right away, so the producer can be ahead of what `recv` has
+returned by the ring plus the records the consumer has copied out and not yet
+returned — under twice `ring_bytes`, and the consumer's copy buffer grows to
+at most the ring's size, plus a decode buffer kept at the largest item's size. The last `END_RESERVE` (256) bytes are never given to items, so the end
 record always has room; the largest item is therefore
 `ring_bytes - END_RESERVE - 4`, and a stream of large items needs a larger
 ring. The memory is allocated up front and charged to the consumer's process.
-The default of 64 KiB is sixteen pages, the same in-flight bound as four
-16 KiB batches on the RPC path; the producer's `max_ring_bytes` protects its
-own address space against a consumer that describes a ring of any size.
+The default of 64 KiB is sixteen pages; the producer's `max_ring_bytes` protects its
+own address space against a consumer that describes a ring of any size. Once
+the ring holds a few of the largest items, a larger ring mainly lets the
+producer run further ahead; one that holds only one or two makes the two ends
+take turns.
 
 **Over RPC** credit is counted in `onBatch` calls. The producer opens with a
 window of credit, spends one per batch, and waits when it has none; the
@@ -381,7 +398,10 @@ been woken by nothing for a third of the session's reply deadline, it sends
 the other end a `PING_TRANSACTION` — the twoway every binder object answers,
 so a C++ or NDK peer needs no code for it — and waits again once it is
 answered. The consumer pings the producer's `IStreamSource` once `onStart` has
-named it, the producer pings the sink. An unanswered ping ends the session
+named it, the producer pings the sink. A ring over a Unix session pings the
+same way (its consumer pings the binder it was made against), as does a
+producer parked on a full one; a ring over kernel binder never pings, since
+the kernel reports a death itself. An unanswered ping ends the session
 through the reply deadline, like any unanswered call, and the stream then ends
 with `DeadObject` through its death link: a peer that vanished is noticed
 within about four thirds of the deadline. A stream whose items flow never
@@ -417,10 +437,11 @@ while let Some(line) = lines.recv_async().await {
 ```
 
 The producer uses `send_async`, `flush_async`, `end_async` and `end_with_async`
-from a task. Waiting for the consumer suspends the task instead of parking a
-thread — except a wait that may [ping](#a-peer-that-goes-silent) or has a
-`send_timeout`, which holds a pool thread while it lasts, as does a
-`recv_async` that may ping: there is no timer to suspend a task against.
+from a task. On calls, waiting for the consumer suspends the task instead of
+parking a thread — except a wait that may [ping](#a-peer-that-goes-silent) or
+has a `send_timeout`, which holds a pool thread while it lasts, as does a
+`recv_async` that may ping: there is no timer to suspend a task against. On the
+ring every such wait holds a pool thread, as above.
 
 ```rust
 let mut sink = Sink::open(endpoint)?;
@@ -481,6 +502,65 @@ One more thing to size: the consumer's grants, and both ends' pings, go out on
 the session's *outgoing* connections, and each waits for a free one. A client that keeps its only
 outgoing connection busy with a long `twoway` call delays its own grants for that
 long; give such a client a second one with `outgoing_connections`.
+
+### A ring over a Unix session
+
+When both ends are on one host and talk over a Unix socket, the consumer can
+have the stream run on a ring instead of calls:
+
+```rust
+use rsbinder::stream::{Receiver, ReceiverPolicy, RingUse};
+
+let policy = ReceiverPolicy { ring_use: RingUse::AlsoUnixRpc, ..Default::default() };
+let (mut rx, endpoint) = Receiver::<LogLine>::with_policy(&service.as_binder(), &policy)?;
+if !rx.uses_ring() {
+    // The session could not carry one; the stream runs on calls as usual.
+}
+```
+
+The ring's memfd crosses the socket as an `SCM_RIGHTS` file descriptor, so the
+session has to pass fds both ways: the client opens with
+`ClientOptions::fd_mode = Some(FileDescriptorTransportMode::Unix)` and the
+server allows it (`ServeOptions::fd_modes` or
+`RpcServer::set_supported_fd_modes`). It also needs the incoming connection
+above. A session that cannot pass the fd — vsock, TCP, TLS, no fd mode — gets
+calls, and a `log::debug!` line names what was missing; `uses_ring` tells which
+one a stream got. A session with no incoming connection refuses the stream with
+`InvalidOperation`, opted in or not, as it does on calls. The ring needs Linux or
+Android.
+
+Across SELinux domains the ring needs what it needs over binder — `fd use` and
+`memfd_file { getattr read write map }` on the consumer's domain, see
+[A minimal stream](#a-minimal-stream) — plus what the session
+needs: `unix_stream_socket connectto` on the server's domain, and for a socket
+bound to a path, `sock_file write` on that file's type. An abstract socket
+(`RpcServer::setup_unix_server_abstract`) has no file to check.
+
+Which to choose is a matter of item size. Measured on x86-64 over a Unix
+session, calls with 16 KiB batches were faster for items up to 128 bytes
+(2.6 times for `i32`, 1.6 times at 64 bytes, 1.2 times at 128), where the ring's
+per-record work outweighs a batched call; from 192 bytes on the ring was faster,
+1.5 times at 256 bytes, 3 times at a kilobyte and over 4 times at 16 KiB. From
+128 bytes on the ring also used less CPU. On an arm64 Android emulator the ring
+was as fast as calls for `i32` and faster above.
+
+The producer has to implement the ring over RPC; rsbinder's does, and nothing
+changes on its side. A producer written to the RPC-only contract refuses the
+endpoint, and how that shows depends on the direction: in a download its
+refusal is the error of the opening call; in an upload the opening call has
+already returned the endpoint, so the consumer learns of it only from the
+producer's death or its own `recv_timeout`. A producer that ignores the ring and
+sends batches ends the stream with `EX_ILLEGAL_STATE`.
+
+The items do not cross the socket, so to the session a flowing ring looks quiet.
+The server's end therefore counts its ring traffic toward the session's idle
+check (`RpcServer::set_idle_timeout`); a client has no idle check to feed. A
+stream whose items keep coming, or come more often than the timeout, keeps the
+session alive. Each wait on the ring that parks counts too, so a server-side end
+that keeps waiting with a `recv_timeout` or `send_timeout` longer than the ring's
+spin (20 µs) and shorter than the idle timeout keeps the session alive with no
+item moving, where on calls it would not. A stalled one whose
+waits outlast the timeout does not, as on calls, unless it pings.
 
 ## State, not a sequence: use a `oneway` callback
 
@@ -568,7 +648,8 @@ the details in `StreamEndpoint.aidl`:
   may already have written.
 - Wake the other side after every read and every write, as `libfmq` itself
   does, not only on a full-to-not-full change: a waiter may need room for more
-  than one record.
+  than one record. A read that takes several records at once may wake once
+  for all of them, as rsbinder's consumer does.
 - As the producer, load `getEventFlagWord()` before each item record and stop
   on `CANCEL` (`libfmq` has no peek), and remember a cancel your wait returned:
   the wait consumes the bit.

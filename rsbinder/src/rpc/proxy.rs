@@ -193,6 +193,11 @@ impl RpcProxy {
         self.session.caps()
     }
 
+    /// This proxy's session's activity counter, for traffic that does not cross its sockets.
+    pub(crate) fn session_activity(&self) -> super::session::SessionActivity {
+        self.session.ring_activity()
+    }
+
     /// The reply deadline of this proxy's session, for a caller holding only the binder.
     pub(crate) fn session_timeout(&self) -> Option<std::time::Duration> {
         self.session.timeout()

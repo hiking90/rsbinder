@@ -10,8 +10,10 @@
 #       in an argument for a download, in a reply for an upload — and the
 #       producer maps what the consumer allocated and sealed
 #       (AC-7b.1, AC-7b.4 upload);
-#   (2) the ring is the whole of the flow control: a producer stops at
-#       the ring's capacity and moves again on the consumer's futex wake,
+#   (2) the ring is the whole of the flow control: a producer stops once
+#       the ring is full (past what the consumer took by under one more
+#       ring, the records its last refill copied out) and moves again on
+#       the consumer's futex wake,
 #       and nothing but the opening call goes through the receiver's
 #       binder mapping, so a page of it carries twelve streams
 #       (AC-7b.2, AC-7b.3);
@@ -223,7 +225,7 @@ else
     bad "the bulk service did not start"
 fi
 
-note "AC-7b.2  a consumer that stops reading stops the producer at the ring's capacity"
+note "AC-7b.2  a consumer that stops reading stops the producer once the ring is full"
 if start rsb107b.pause > /dev/null; then
     # A 4096-byte ring holds (4096 - 256) / 8 = 480 eight-byte records.
     # The consumer takes 100 items and stops; the producer must come to
@@ -232,7 +234,7 @@ if start rsb107b.pause > /dev/null; then
     # service's counter for that value.
     probe 120 pause rsb107b.pause 20000 4096 100 > "$OUT" 2>/tmp/rsb107b-pause.err
     if grep -qx 'RESULT pause 20000 true parked=true ok' "$OUT"; then
-        ok "the producer stopped at 100 + 480 and finished after the consumer resumed"
+        ok "the producer stopped between 100 + 480 and 100 + 960 and finished after the consumer resumed"
     else
         bad "got '$(cat "$OUT")' (want 'RESULT pause 20000 true parked=true ok')"
     fi

@@ -223,7 +223,8 @@
 //!   moved bytes, on any slot. A connection joining a server session counts too:
 //!   `add_incoming_slot_capped` bumps it as a serve connection joins, and
 //!   `add_callback_slot_and_init` once its `"cci"` is written, so the handshake bytes (read
-//!   before the push, outside the funnel) are not quiet time.
+//!   before the push, outside the funnel) are not quiet time. A stream ring's commits, refills
+//!   and each of its waits that parks bump it too (`SessionActivity`, plan 10-7c B7).
 //!
 //! A serve slot's read deadline is always the full `d`. The loop records `io_gen` as each wait
 //! for the next frame begins. On an expiry between frames `active_since` loads `open` first
@@ -238,9 +239,11 @@
 //! a frame read in that wait is bounded by the same deadline. A server-side stream wait that
 //! does not ping moves no byte. Outside a handler it holds no call either, so it is idle;
 //! inside one, the handler's `OpenCall` stays held for the whole wait, so the session is not
-//! idle and only the wait's own deadline bounds it. No timer thread is involved: each quiet
-//! slot wakes on its own deadline. The admission deadline on an r34 server's first frame is not
-//! an idle deadline and is not extended.
+//! idle and only the wait's own deadline bounds it. On a ring each wait that parks is activity
+//! (a wait longer than the ring's short spin always parks), so such waits shorter than `d`,
+//! repeated, keep a stalled ring stream's session from idling. No
+//! timer thread is involved: each quiet slot wakes on its own deadline. The admission deadline
+//! on an r34 server's first frame is not an idle deadline and is not extended.
 //!
 //! # Attach confirmation
 //!
@@ -1776,6 +1779,19 @@ impl Drop for OpenCall<'_> {
     }
 }
 
+/// Stream ring traffic the sockets do not see; counts only with an idle timeout (plan 10-7c B7).
+#[derive(Clone)]
+pub(crate) struct SessionActivity(Arc<SharedSession>);
+
+impl SessionActivity {
+    /// One lock-free load where no idle timeout is set (every client session, most servers).
+    pub(crate) fn bump(&self) {
+        if self.0.serve_read_deadline.load(Ordering::Relaxed) != 0 {
+            self.0.io_gen.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// `RawTransportIo` that bumps `io_gen` on each read that moved bytes (module doc "Idle").
 struct CountedIo<'a>(RawTransportIo<'a>, &'a AtomicU64);
 
@@ -2607,6 +2623,11 @@ impl RpcSessionInner {
             .iter()
             .filter(|s| s.role == callback_role)
             .count()
+    }
+
+    /// A handle that counts a stream ring's traffic toward this session's idle check.
+    pub(crate) fn ring_activity(&self) -> SessionActivity {
+        SessionActivity(self.shared.clone())
     }
 
     /// This session's `TransportCaps` now; `RpcSession::caps` states what each bit means here.
