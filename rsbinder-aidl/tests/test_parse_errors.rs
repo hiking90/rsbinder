@@ -64,6 +64,42 @@ fn test_keyword_as_identifier() {
     assert!(matches!(&err, AidlError::Parse(_)));
 }
 
+// AOSP's flex lexer takes the longest token: a keyword is a whole word, and always a keyword.
+#[test]
+fn keywords_are_whole_words() {
+    for input in [
+        "interfaceIFoo { void f(); }",
+        "enumE { A }",
+        "unionU { int a; }",
+        "parcelableP { int x; }",
+        "packagep; parcelable P { int x; }",
+        "package p; importp.Q; parcelable P { int x; }",
+        "interface IFoo { constint X = 1; }",
+        "oneway oneway interface IFoo { void f(); }",
+        // Not an identifier wherever it stands (`aidl_language_y.yy` `identifier`).
+        "parcelable P { int in; }",
+        "parcelable P { int package; }",
+        "parcelable P { int import; }",
+        "interface IFoo { void f(int out); }",
+        "enum E { inout }",
+    ] {
+        let ctx = SourceContext::new("test.aidl", input);
+        assert!(parse_document(&ctx).is_err(), "accepted: {input}");
+    }
+    for input in [
+        "interface IFoo { void f(in/*c*/ int[] a, out//c\n int[] b); }",
+        "parcelable P { int inner; int outer; int interfaces; int enumerated; int constant; }",
+        "parcelable P { int cpp_header; int rust_type; boolean b = true; }",
+        "oneway interface IFoo { void f(); }",
+        "package p;import p.Q;parcelable P { Q q; }",
+    ] {
+        let ctx = SourceContext::new("test.aidl", input);
+        if let Err(e) = parse_document(&ctx) {
+            panic!("rejected: {input}: {e}");
+        }
+    }
+}
+
 // Unclosed brace
 #[test]
 fn test_unclosed_brace() {
