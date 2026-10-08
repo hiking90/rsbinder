@@ -525,7 +525,13 @@ impl TlsTransport {
                 let mut c = self.conn.lock().expect("tls conn poisoned");
                 let n = c.writer().write(&buf[off..])?;
                 if n == 0 {
-                    return Err(RpcError::Protocol("rustls accepted no plaintext"));
+                    const MSG: &str = "rustls accepted no plaintext";
+                    // Past the first chunk the peer holds part of a frame: end the session.
+                    return Err(if off == 0 {
+                        RpcError::Protocol(MSG)
+                    } else {
+                        RpcError::Io(std::io::Error::other(MSG))
+                    });
                 }
                 off += n;
                 cipher.clear();
