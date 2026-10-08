@@ -1,8 +1,7 @@
 // Copyright 2025 rsbinder Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Parse diagnostics: AIDL syntax errors must return `Err` with a usable
-//! span and message, never panic.
+//! Syntax errors return `Err` with a usable span and message, never panic.
 
 use miette::Diagnostic;
 use rsbinder_aidl::{parse_document, AidlError, SourceContext};
@@ -183,6 +182,44 @@ fn test_char_constant_unknown_escape_rejected() {
             parse_document(&ctx).is_ok(),
             "supported char literal must still parse: {src}"
         );
+    }
+}
+
+/// Comparison chains and bracket-split runs hit the operator cap instead of overflowing the stack.
+#[test]
+fn operator_runs_through_comparisons_and_brackets_are_rejected() {
+    // 200 bracket levels (under the bracket cap) of 50 operators each: one path of 10000.
+    let level = format!("({}", "1+".repeat(50));
+    let nested = format!("{}1{}", level.repeat(200), ")".repeat(200));
+    for expr in [
+        format!("{}1", "1 == ".repeat(200_000)),
+        format!("{}1", "1 != ".repeat(200_000)),
+        format!("{}1", "1 < ".repeat(200_000)),
+        format!("{}1", "1 <= ".repeat(200_000)),
+        format!("{}1", "1 > ".repeat(200_000)),
+        format!("{}1", "1 >= ".repeat(200_000)),
+        format!("{}1", "(1)+".repeat(200_000)),
+        nested,
+        format!("{}A", "A < A > ".repeat(100_000)),
+        format!("{}A", "A<A<A>>".repeat(100_000)),
+    ] {
+        let src = format!("parcelable P {{ const int X = {expr}; }}");
+        // Default test-thread stack: a build script's main thread is no smaller.
+        let result = std::thread::spawn(move || {
+            parse_document(&SourceContext::new("test.aidl", &src)).map(|_| ())
+        })
+        .join()
+        .expect("parsing must not panic");
+        let err = result.expect_err("an unbounded operator run must be refused");
+        let AidlError::Parse(pe) = &err else {
+            panic!("expected a ParseError, got: {err:?}");
+        };
+        assert!(
+            pe.message.contains("too many operators in one expression"),
+            "got: {}",
+            pe.message
+        );
+        assert!(pe.help().is_some(), "nesting diagnostic must carry help");
     }
 }
 

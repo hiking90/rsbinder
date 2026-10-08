@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Regression tests for codegen defects.
-//! Each case is parseable input that must surface as a recoverable error (or
-//! compute without panicking) rather than aborting the AIDL compiler — the
-//! project's "no panic on user input" invariant.
+//! Codegen regressions: parseable input must end in a diagnostic, never a panic.
 
 /// Returns `true` only when BOTH parsing and code generation succeed.
 fn generate_ok(input: &str) -> bool {
@@ -40,13 +37,453 @@ fn list_of_array_is_rejected_not_panicked() {
 /// The constant cycle guard must see through binary operators, or the recursion overflows.
 #[test]
 fn cyclic_constants_do_not_overflow() {
-    // Reaching the end of this call without aborting is the assertion.
-    let _ = generate_ok("interface ICycle { const int A = B + 1; const int B = A + 1; }");
+    // The message, not just failure: the depth cap would also end an undetected cycle.
+    assert!(
+        generate_err("interface ICycle { const int A = B + 1; const int B = A + 1; }")
+            .contains("circular reference"),
+        "a cycle through `+` must be a diagnostic"
+    );
 
     assert!(
         generate_ok("interface IOk { const int A = 1; const int B = A + 1; const int C = A + B; }"),
         "non-cyclic constant chain must still resolve"
     );
+}
+
+/// A constant referenced twice per link is evaluated once, not 2^depth times.
+#[test]
+fn doubly_referenced_constant_chain_folds_in_linear_time() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let mut src = String::from("interface IChain { const int C0 = 1;");
+    for i in 1..=40 {
+        src.push_str(&format!(" const int C{i} = C{} | C{};", i - 1, i - 1));
+    }
+    src.push_str(" }");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(generate_str(&src));
+    });
+    match rx.recv_timeout(Duration::from_secs(20)) {
+        Ok(out) => {
+            let out = out.expect("must generate");
+            assert!(out.contains("pub const r#C40: i32 = 1;"), "got:\n{out}");
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("fold thread panicked; see its output above")
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // The fold thread keeps the CPU; `abort` skips libtest's capture flush.
+            use std::io::Write;
+            let _ = std::io::stderr()
+                .write_all(b"constant chain test: folding is exponential again; aborting\n");
+            std::process::abort();
+        }
+    }
+}
+
+/// One unresolvable first value must not make a `prev + 1` enum chain refold 2^n times.
+#[test]
+fn enum_chain_behind_an_unresolvable_value_is_diagnosed_in_polynomial_time() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let mut src = String::from("package p; enum E { A0 = Z");
+    for i in 1..=20 {
+        src.push_str(&format!(", A{i} = A{} + 1", i - 1));
+    }
+    src.push_str(" }");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let ctx = rsbinder_aidl::SourceContext::new("test.aidl", &src);
+        let result = rsbinder_aidl::parse_document(&ctx)
+            .and_then(|doc| rsbinder_aidl::Generator::new(false, false).document(&doc));
+        let _ = tx.send(result.map(|_| ()).map_err(|e| format!("{e:?}")));
+    });
+    match rx.recv_timeout(Duration::from_secs(20)) {
+        Ok(result) => {
+            let err = result.expect_err("an unresolvable enum value must be a diagnostic");
+            assert!(err.contains("'Z'"), "got: {err}");
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("enum resolution thread panicked; see its output above")
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // The resolution thread keeps the CPU; `abort` skips libtest's capture flush.
+            use std::io::Write;
+            let _ = std::io::stderr()
+                .write_all(b"enum chain test: resolution is exponential again; aborting\n");
+            std::process::abort();
+        }
+    }
+}
+
+/// A member's value is folded in its own enum, whichever caller reaches it first.
+#[test]
+fn enum_member_value_does_not_depend_on_the_first_caller() {
+    // AOSP: E.A1 = E.A0 = F.B = 7, so C1 = 14. `A0` in E.A1 is E.A0, never the caller G's A0 (100).
+    let out = generate_str(
+        "package p; enum G { A0 = 100, C1 = F.B + E.A1 } enum F { B0 = E.A1, B = 7 } \
+         enum E { A0 = F.B, A1 = A0 }",
+    )
+    .expect("must generate");
+    assert!(out.contains("r#C1 = 14,"), "got:\n{out}");
+}
+
+/// An unresolved member's raw value names its own enum; a caller elsewhere must not refold it.
+#[test]
+fn enum_member_reference_folds_in_the_referenced_enum_scope() {
+    // AOSP: Ec.X0 = Ka.KK = 7, Ec.X = Jb.J = Ka.P = 7; Jb's own X0 (50) must not leak in.
+    let out = generate_str(
+        "package p; enum Z0 { Q = Ka.KK } enum Ka { P = Jb.J, KK = 7 } \
+         enum Jb { X0 = 50, J = Ec.X } enum Ec { X0 = Ka.KK, X = X0 }",
+    )
+    .expect("must generate");
+    assert!(out.contains("r#J = 7,"), "got:\n{out}");
+    assert!(out.contains("r#P = 7,"), "got:\n{out}");
+    // A true cycle has no value (AOSP "Found a circular reference"), not the referencer's X0.
+    assert!(
+        generate_str("package p; enum Jb { X0 = 50, J = Ec.X } enum Ec { X0 = Jb.J, X = X0 }")
+            .is_none()
+    );
+}
+
+/// A member referring to a later member must not refold the members before it (2^n on valid input).
+#[test]
+fn enum_members_referring_forward_resolve_in_polynomial_time() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let n = 30;
+    let mut later = String::from("package p; enum E { A0 = B");
+    let mut last = format!("package p; enum F {{ A0 = A{n}");
+    let mut cyclic = String::from("package p; enum G { A0 = Z");
+    for i in 1..=n {
+        later.push_str(&format!(", A{i} = A{} + B", i - 1));
+        if i < n {
+            last.push_str(&format!(", A{i} = A{}", i - 1));
+        }
+        cyclic.push_str(&format!(", A{i} = A{} + I.X", i - 1));
+    }
+    later.push_str(", B = 1 }");
+    last.push_str(&format!(", A{n} = 5 }}"));
+    cyclic.push_str(&format!(" }} interface I {{ const int X = G.A{n}; }}"));
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .stack_size(8 << 20)
+        .spawn(move || {
+            let _ = tx.send([later, last, cyclic].map(|src| {
+                let ctx = rsbinder_aidl::SourceContext::new("test.aidl", &src);
+                rsbinder_aidl::parse_document(&ctx)
+                    .and_then(|doc| rsbinder_aidl::Generator::new(false, false).document(&doc))
+                    .map(|(_, rust)| rust)
+                    .map_err(|e| format!("{e:?}"))
+            }));
+        })
+        .unwrap();
+    match rx.recv_timeout(Duration::from_secs(20)) {
+        Ok([later, last, cyclic]) => {
+            let later = later.expect("forward references must generate");
+            assert!(
+                later.contains(&format!("r#A{n} = {},", n + 1)),
+                "got:\n{later}"
+            );
+            let last = last.expect("forward references must generate");
+            assert!(last.contains("r#A0 = 5,"), "got:\n{last}");
+            let err = cyclic.expect_err("an unresolvable enum value must be a diagnostic");
+            assert!(err.contains("'Z'"), "got: {err}");
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("enum resolution thread panicked; see its output above")
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // The resolution thread keeps the CPU; `abort` skips libtest's capture flush.
+            use std::io::Write;
+            let _ = std::io::stderr()
+                .write_all(b"enum forward-reference test: resolution is exponential; aborting\n");
+            std::process::abort();
+        }
+    }
+}
+
+/// Array constants chained through nested literals end in a diagnostic, not an unbounded tree.
+#[test]
+fn memoised_array_constants_cannot_nest_past_the_depth_cap() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let nest = |inner: &str| format!("{}{inner}{}", "{".repeat(200), "}".repeat(200));
+    let mut src = String::from("interface I { const int[] A0 = {1};");
+    for k in 1..=50 {
+        src.push_str(&format!(
+            " const int[] A{k} = {};",
+            nest(&format!("A{}", k - 1))
+        ));
+    }
+    let all: Vec<String> = (1..=50).map(|k| format!("A{k}")).collect();
+    src.push_str(&format!(" const int[] X = {{{}}}; }}", all.join(", ")));
+
+    let (tx, rx) = mpsc::channel();
+    // 2 MiB: an unbounded value tree overflows here long before it would on a build script's 8 MiB.
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || {
+            let ctx = rsbinder_aidl::SourceContext::new("test.aidl", &src);
+            let result = rsbinder_aidl::parse_document(&ctx)
+                .and_then(|doc| rsbinder_aidl::Generator::new(false, false).document(&doc));
+            let _ = tx.send(result.map(|_| ()).map_err(|e| format!("{e:?}")));
+        })
+        .unwrap();
+    match rx.recv_timeout(Duration::from_secs(20)) {
+        // Any diagnostic will do; the guard is that nothing aborts.
+        Ok(result) => assert!(
+            result.is_err(),
+            "chained nested arrays must be a diagnostic"
+        ),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("array fold thread panicked; see its output above")
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            panic!("folding chained array constants did not finish")
+        }
+    }
+}
+
+/// A constant repeated across array elements is a repeat, not a cycle.
+#[test]
+fn constant_repeated_in_an_array_literal_is_not_a_cycle() {
+    for src in [
+        "interface I { const int A = 1; const int[] ARR = {A, A}; }",
+        "interface I { const int A = 1; const int[] ARR = {A, -A}; }",
+        "parcelable P { const int A = 1; int[] arr = {A, A}; }",
+    ] {
+        assert!(generate_ok(src), "{src}");
+    }
+}
+
+/// Releasing a resolved name from the cycle path must not hide a self-reference.
+#[test]
+fn self_referencing_array_constant_is_still_a_cycle() {
+    assert!(
+        generate_err("interface I { const int[] A = {A}; }").contains("circular reference"),
+        "a self-reference through an array is still a cycle"
+    );
+}
+
+/// Generates each source on a thread with a `stack_size` stack and fails the test after 20 s.
+fn generate_bounded(
+    what: &str,
+    stack_size: usize,
+    srcs: Vec<String>,
+) -> Vec<Result<String, String>> {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .stack_size(stack_size)
+        .spawn(move || {
+            let results = srcs
+                .iter()
+                .map(|src| {
+                    let ctx = rsbinder_aidl::SourceContext::new("test.aidl", src);
+                    rsbinder_aidl::parse_document(&ctx)
+                        .and_then(|doc| rsbinder_aidl::Generator::new(false, false).document(&doc))
+                        .map(|(_, rust)| rust)
+                        .map_err(|e| format!("{e:?}"))
+                })
+                .collect::<Vec<_>>();
+            let _ = tx.send(results);
+        })
+        .unwrap();
+    match rx.recv_timeout(Duration::from_secs(20)) {
+        Ok(results) => results,
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("{what}: generation thread panicked; see its output above")
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            panic!("{what}: resolution did not finish in 20 s (superlinear again?)")
+        }
+    }
+}
+
+/// A chain through other enums/interfaces resolves iteratively: no stack per link, no depth reset.
+#[test]
+fn constant_chains_across_owners_resolve_without_stack_growth() {
+    let n = 2000;
+    let mut enums = String::from("package p;");
+    let mut ifaces = String::from("package p;");
+    let mut local = String::from("package p; interface L { const long C0 = 1;");
+    for i in 0..n {
+        enums.push_str(&format!(" enum E{i} {{ A = E{}.A }}", i + 1));
+        ifaces.push_str(&format!(
+            " interface I{i} {{ const int X = I{}.X; }}",
+            i + 1
+        ));
+        local.push_str(&format!(" const long C{} = C{i} + 1;", i + 1));
+    }
+    enums.push_str(&format!(" enum E{n} {{ A = 3 }}"));
+    ifaces.push_str(&format!(" interface I{n} {{ const int X = 3; }}"));
+    local.push_str(" }");
+    // 2 MiB, a quarter of a build script's main thread: the depth must not grow with `n`.
+    let [enums, ifaces, local] = <[_; 3]>::try_from(generate_bounded(
+        "owner chain",
+        2 << 20,
+        vec![enums, ifaces, local],
+    ))
+    .unwrap();
+    let enums = enums.expect("an enum chain is valid AIDL");
+    assert_eq!(
+        enums.matches("r#A = 3,").count(),
+        n + 1,
+        "every link is E{n}.A"
+    );
+    let ifaces = ifaces.expect("an interface chain is valid AIDL");
+    assert_eq!(ifaces.matches("pub const r#X: i32 = 3;").count(), n + 1);
+    let local = local.expect("a long chain in one interface is valid AIDL");
+    assert!(
+        local.contains(&format!("pub const r#C{n}: i64 = {};", n + 1)),
+        "got:\n{local}"
+    );
+}
+
+/// A cycle of any length is reported as one, from a bounded stack.
+#[test]
+fn long_constant_cycles_are_diagnosed_as_cycles() {
+    let n = 2000;
+    let mut enums = String::from("package p;");
+    for i in 0..n {
+        enums.push_str(&format!(" enum E{i} {{ A = E{}.A }}", (i + 1) % n));
+    }
+    let [enums] = <[_; 1]>::try_from(generate_bounded("long cycle", 2 << 20, vec![enums])).unwrap();
+    let err = enums.expect_err("a cycle has no value");
+    assert!(err.contains("circular reference"), "got: {err}");
+}
+
+/// An unresolvable first value behind back references is one diagnostic, in linear time.
+#[test]
+fn unresolvable_enum_chain_with_back_references_is_diagnosed_in_linear_time() {
+    let n = 1000;
+    let mut src = String::from("package p; enum E { A0 = Z");
+    for i in 1..=n {
+        src.push_str(&format!(", A{i} = A{} + B", i - 1));
+    }
+    src.push_str(", B = 1 }");
+    let [result] = <[_; 1]>::try_from(generate_bounded("typo chain", 2 << 20, vec![src])).unwrap();
+    let err = result.expect_err("an unresolvable enum value must be a diagnostic");
+    assert!(err.contains("'Z'"), "got: {err}");
+}
+
+/// Every interface folds a constant once, so a diamond across interfaces is linear.
+#[test]
+fn cross_interface_diamond_folds_in_linear_time() {
+    let n = 1000;
+    let mut src = String::from("package p; interface I0 { const int X = 1; }");
+    for i in 1..=n {
+        src.push_str(&format!(
+            " interface I{i} {{ const int X = I{}.X | I{}.X; }}",
+            i - 1,
+            i - 1
+        ));
+    }
+    let [result] = <[_; 1]>::try_from(generate_bounded("diamond", 8 << 20, vec![src])).unwrap();
+    let out = result.expect("a diamond is valid AIDL");
+    assert_eq!(out.matches("pub const r#X: i32 = 1;").count(), n + 1);
+}
+
+/// A nested array constant is not copied into another literal, so `{A, A}` cannot double per link.
+#[test]
+fn doubled_array_constant_chain_is_rejected_before_it_grows() {
+    // Short on purpose: a regression must fail on the message, not allocate 2^n first.
+    let mut include = String::from("package p; interface I { const int[] A0 = {1};");
+    for i in 1..=12 {
+        include.push_str(&format!(" const int[] A{i} = {{A{}, A{}}};", i - 1, i - 1));
+    }
+    include.push_str(" }");
+    // Include-only `I`: the constants' own rank errors are not generated, the copy is refused.
+    let err = generate_with_include(&include, "package p; parcelable P { int[2] f = I.A12; }")
+        .expect_err("a nested array constant is not an element");
+    assert!(err.contains("holds arrays"), "got: {err}");
+    // A flat array constant still fills one dimension of a fixed-size default.
+    let out =
+        generate_str("package p; parcelable P { const int[] A = {1, 2}; int[2][2] f = {A, A}; }")
+            .expect("a flat array constant may fill a row");
+    assert!(out.contains("[[1,2,],[1,2,],]"), "got:\n{out}");
+}
+
+/// Generates `src` with `include` parsed but not generated, like a `Builder` include-only file.
+fn generate_with_include(include: &str, src: &str) -> Result<String, String> {
+    generate_with_includes(&[include], src)
+}
+
+/// [`generate_with_include`] with several include-only files, parsed in order.
+fn generate_with_includes(includes: &[&str], src: &str) -> Result<String, String> {
+    let includes: Vec<String> = includes.iter().map(|s| s.to_string()).collect();
+    let src = src.to_owned();
+    // Own thread: the declaration map is thread-local and would leak into later tests.
+    std::thread::spawn(move || {
+        for (i, include) in includes.iter().enumerate() {
+            let name = format!("I{i}.aidl");
+            rsbinder_aidl::parse_document(&rsbinder_aidl::SourceContext::new(&name, include))
+                .expect("parse include");
+        }
+        let doc = rsbinder_aidl::parse_document(&rsbinder_aidl::SourceContext::new("S.aidl", &src))
+            .expect("parse source");
+        rsbinder_aidl::Generator::new(false, false)
+            .document(&doc)
+            .map(|(_, rust)| rust)
+            .map_err(|e| format!("{e:?}"))
+    })
+    .join()
+    .expect("generation panicked")
+}
+
+/// An owner's unresolved name never reaches the referencer, whose scope may hold that name.
+#[test]
+fn unresolved_owner_constant_never_folds_in_the_referencer_scope() {
+    // AOSP: `Y` is unknown in I ("Can't find Y in I"); P's own Y = 5 must not stand in for it.
+    let err = generate_with_include(
+        "package p; interface I { const int X = Y; }",
+        "package p; parcelable P { const int Y = 5; int f = I.X; }",
+    )
+    .expect_err("I.X has no value");
+    assert!(err.contains("'Y'"), "got: {err}");
+    // A cycle in I has no value either; E's own Y = 7 must not stand in for it.
+    let err = generate_with_include(
+        "package p; interface I { const int X = Y; const int Y = X; }",
+        "package p; enum E { Y = 7, A = I.X }",
+    )
+    .expect_err("I.X is on a cycle");
+    assert!(err.contains("circular reference"), "got: {err}");
+}
+
+/// An enum member names the enum's own member first; a cycle there is a cycle, not the next scope.
+#[test]
+fn cyclic_enum_member_is_not_an_enclosing_interface_constant() {
+    for src in [
+        "package p; interface IFoo { const int K = 5; enum E { K = K } }",
+        "package p; interface IOuter { const int A = 50; enum E { A = B, B = A } }",
+    ] {
+        assert!(generate_err(src).contains("circular reference"), "{src}");
+    }
+    // Off a cycle the member still wins over the interface constant (AOSP scope: the enum).
+    let out = generate_str("package p; interface I { const int A = 50; enum E { A = 1, B = A } }")
+        .expect("must generate");
+    assert!(out.contains("r#B = 1,"), "got:\n{out}");
+}
+
+/// A cycle through other enums names the cycle (AOSP "Found a circular reference"), not a typo.
+#[test]
+fn cycles_across_enums_are_reported_as_cycles() {
+    for src in [
+        "package p; enum Jb { J = Ec.X } enum Ec { X = Jb.J }",
+        "package p; enum A { X = B.Y } enum B { Y = C.Z } enum C { Z = A.X }",
+    ] {
+        let err = generate_err(src);
+        assert!(err.contains("circular reference"), "{src}: {err}");
+    }
 }
 
 /// AOSP `previous + 1` auto-increment: past `i64::MAX` it is an overflow diagnostic, not a wrap.
@@ -325,7 +762,7 @@ fn const_string_array_renders_as_str_slice() {
 fn enum_discriminant_referencing_interface_constant_auto_increments() {
     let ctx = rsbinder_aidl::SourceContext::new(
         "t.aidl",
-        "package test.e;\ninterface IFoo { const int X = 5; enum E { A = X, B } }",
+        "package test.e;\ninterface IFoo { const int X = 5; enum E { A = IFoo.X, B } }",
     );
     let doc = rsbinder_aidl::parse_document(&ctx).expect("must parse");
     // Same two-pass flow as Builder::generate.
@@ -467,7 +904,7 @@ fn trailing_line_comment_without_newline_parses() {
 
 // ---- Codegen/API shape defects ----
 
-/// An unqualified constant resolves in its own or an enclosing scope, never a same-named other.
+/// AOSP `AidlConstantReference::Resolve`: an unqualified constant resolves in its own type only.
 #[test]
 fn unqualified_constant_does_not_leak_across_declarations() {
     let out = generate_str(
@@ -478,10 +915,20 @@ fn unqualified_constant_does_not_leak_across_declarations() {
     .expect("must generate");
     assert!(out.contains("pub const r#B: i32 = 2;"), "got:\n{out}");
 
-    // A nested declaration must still see its enclosing scope's constant.
-    let nested =
-        generate_str("package test.e;\ninterface IFoo { const int X = 5; enum E { A = X, B } }")
-            .expect("must generate");
+    // AOSP: "Can't find X in E"; the enclosing type's constant needs its qualifier.
+    for src in [
+        "package test.e;\ninterface IFoo { const int X = 5; enum E { A = X, B } }",
+        "package test.e;\nparcelable P { const int X = 5; parcelable Q { int f = X; } }",
+    ] {
+        assert!(
+            !generate_ok(src),
+            "bare enclosing constant must be rejected: {src}"
+        );
+    }
+    let nested = generate_str(
+        "package test.e;\ninterface IFoo { const int X = 5; enum E { A = IFoo.X, B } }",
+    )
+    .expect("must generate");
     assert!(nested.contains("r#A = 5,"), "got:\n{nested}");
     assert!(nested.contains("r#B = 6,"), "got:\n{nested}");
 }
@@ -610,21 +1057,22 @@ fn keyword_package_segment_is_escaped() {
     assert!(out.contains("pub mod r#impl {"), "got:\n{out}");
 }
 
-/// A `Default`-less `out` type is `Option<T>` (AOSP `aidl_to_rust.cpp::RustNameOf`); `inout` isn't.
+/// A `Default`-less `out` array element is `Option<T>` (AOSP `aidl_to_rust.cpp::RustNameOf`).
 #[test]
 fn out_argument_without_default_is_optional() {
     let out =
-        generate_str("package a; interface I { void m(out IBinder b); }").expect("must generate");
+        generate_str("package a; interface I { void m(out IBinder[] b); }").expect("must generate");
     assert!(
-        out.contains("_arg_b: &mut Option<rsbinder::SIBinder>"),
+        out.contains("_arg_b: &mut Vec<Option<rsbinder::SIBinder>>"),
         "got:\n{out}"
     );
     assert!(
         out.contains(
-            "let mut _arg_b: Option<rsbinder::SIBinder> = ::core::default::Default::default();"
+            "let mut _arg_b: Vec<Option<rsbinder::SIBinder>> = ::core::default::Default::default();"
         ),
         "got:\n{out}"
     );
+    assert!(generate_str("package a; interface I { void m(out IBinder b); }").is_none());
 }
 
 /// The server passes `&mut` its `inout` local straight in, so it must match the trait signature.
@@ -786,7 +1234,10 @@ fn symlink_cycle_in_a_source_directory_terminates() {
 
     match rx.recv_timeout(Duration::from_secs(20)) {
         Ok(ok) => assert!(ok, "generation over a symlinked directory must succeed"),
-        Err(_) => {
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("generation thread panicked; see its output above")
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
             // Still walking; `abort` skips libtest's capture flush, so write stderr directly.
             use std::io::Write;
             let _ = std::io::stderr()
@@ -865,12 +1316,12 @@ fn fixed_size_string_array_constant_is_a_str_array() {
     );
 }
 
-/// An enum reference folds at its `@Backing` width; naming an `int` enum member does not widen.
+/// An enum reference folds at its member value's width (AOSP); an `int` member does not widen.
 #[test]
-fn enum_reference_promotes_at_its_backing_width() {
+fn enum_reference_promotes_at_its_value_width() {
     let out = generate_str(
         "package a; @Backing(type=\"int\") enum F { BIT = 1 } \
-         @Backing(type=\"long\") enum L { BIT = 1 } \
+         @Backing(type=\"long\") enum L { BIT = 1L } \
          interface I { const int SIGN = F.BIT << 31; const long WIDE = L.BIT << 40; void p(); }",
     )
     .expect("must generate");
@@ -994,21 +1445,9 @@ fn every_generated_module_carries_the_lint_allowances() {
     );
 }
 
-/// An unset non-nullable `Option` out argument (fd arrays too) fails the call, never writes null.
+/// An unset element of a non-nullable `out` fd array fails the call, never writes null.
 #[test]
 fn non_nullable_out_arguments_reject_an_unset_value() {
-    let out =
-        generate_str("package a; interface I { void f(out IBinder b, out @nullable IBinder n); }")
-            .expect("must generate");
-    assert!(
-        out.contains("let _arg_b = _arg_b.as_ref().ok_or(rsbinder::StatusCode::UnexpectedNull)?;"),
-        "got:\n{out}"
-    );
-    assert!(
-        !out.contains("let _arg_n = _arg_n"),
-        "@nullable must stay nullable, got:\n{out}"
-    );
-
     let fds = generate_str(
         "package a; interface I { void f(out ParcelFileDescriptor[3] p, out ParcelFileDescriptor[] q); }",
     )
@@ -1250,6 +1689,28 @@ fn empty_interface_hash_is_rejected() {
     let _ = rsbinder_aidl::Builder::new().source("I.aidl").hash("");
 }
 
+/// `Builder::hash` takes any non-empty text; `"` and `\` must not end the emitted literal early.
+#[test]
+fn interface_hash_is_emitted_as_an_escaped_literal() {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("hash_escape");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("I.aidl");
+    std::fs::write(&src, "interface I { void f(); }").unwrap();
+    rsbinder_aidl::Builder::new()
+        .source(&src)
+        .hash("a\"b\\")
+        .dest_dir(&dir)
+        .output(std::path::PathBuf::from("out.rs"))
+        .generate()
+        .expect("generates");
+    let out = std::fs::read_to_string(dir.join("out.rs")).unwrap();
+    assert!(
+        out.contains(r#"pub const HASH: &str = "a\"b\\";"#),
+        "got:\n{out}"
+    );
+}
+
 /// `import a.IFoo;` makes `IFoo.BAR` mean `a.IFoo.BAR`; only a second package exercises it.
 #[test]
 fn imported_interface_constant_resolves_across_packages() {
@@ -1477,6 +1938,27 @@ fn nested_declaration_constants_are_not_members_of_the_outer() {
         out.contains("pub const r#Y: i32 = 2;"),
         "`Outer.Y` folds against `Outer.BASE`, not `Inner.BASE`: {out}"
     );
+}
+
+/// An unqualified name is the nested declaration's own constant (AOSP `Resolve`).
+#[test]
+fn nested_parcelable_constant_shadows_the_enclosing_interface_constant() {
+    for (decl, expected) in [
+        (
+            "parcelable Inner { const int X = 2; int y = X; }",
+            "r#y: 2,",
+        ),
+        (
+            "union Inner { const int X = 2; int y = X; String s; }",
+            "Self::Y(2)",
+        ),
+    ] {
+        let out = generate_str(&format!(
+            "package p; interface IOuter {{ const int X = 1; {decl} void f(); }}"
+        ))
+        .expect("generates");
+        assert!(out.contains(expected), "{decl}: {out}");
+    }
 }
 
 /// In a `c`→`a`→`b`→`a` diamond every constant folds in its owner's scope, even re-entrantly.
@@ -1779,4 +2261,274 @@ fn nested_type_import_resolves_to_the_enclosing_file() {
         out.contains("BinderResult<super::IOuter::Inner::Inner>"),
         "`Inner` names the nested type: {out}"
     );
+}
+
+/// AOSP `AidlConstantReference`: `P.X` is constant `X` of type `P`, even beside a nested type `X`.
+#[test]
+fn qualified_constant_is_looked_up_in_its_qualifier() {
+    for (src, pin) in [
+        (
+            "package p; parcelable P { const int X = 1; parcelable X { const int X = 2; } int f = P.X; }",
+            "r#f: 1,",
+        ),
+        (
+            "package p; parcelable P { const int X = 1; parcelable X { int y; } int f = P.X; }",
+            "r#f: 1,",
+        ),
+        (
+            "package p; interface I { const int Kind = 3; enum Kind { A } const int Y = I.Kind; }",
+            "pub const r#Y: i32 = 3;",
+        ),
+        (
+            "package p; interface I { const int Kind = 3; enum Kind { A, B } const int Y = I.Kind.B; }",
+            "pub const r#Y: i32 = 1;",
+        ),
+    ] {
+        let out = generate_str(src).unwrap_or_else(|| panic!("generates: {src}"));
+        assert!(out.contains(pin), "{src}: missing `{pin}`:\n{out}");
+    }
+    // Unqualified, AOSP searches the current type only; the nested `X`'s constant is not `P`'s.
+    assert!(
+        !generate_ok("package p; parcelable P { parcelable X { const int X = 2; } int f = X; }"),
+        "`X` must not be the nested type's own constant"
+    );
+}
+
+/// AOSP resolves a qualifier as a type or fails ("Failed to resolve"); no suffix of it is tried.
+#[test]
+fn qualified_constant_with_an_unknown_qualifier_is_rejected() {
+    for src in [
+        "package p; interface I { const int X = 4; } interface J { const int Y = wrong.p.I.X; }",
+        "interface I { const int X = 4; } interface J { const int Y = Typo.I.X; }",
+        "parcelable A { parcelable B { int z; } } interface B { const int X = 1; } \
+         interface J { const int Y = A.B.X; }",
+    ] {
+        assert!(!generate_ok(src), "must not fold: {src}");
+    }
+    let out = generate_str(
+        "package p; interface I { const int X = 4; } interface J { const int Y = p.I.X; }",
+    )
+    .expect("a fully-qualified owner resolves");
+    assert!(out.contains("pub const r#Y: i32 = 4;"), "{out}");
+}
+
+/// AOSP `ResolveName`: once a scope binds a qualifier's head, the rest resolves there only.
+#[test]
+fn bound_qualifier_head_is_not_retried_in_outer_scopes() {
+    for src in [
+        "package p; parcelable X { const int C = 1; } interface J { const int Y = X.X.C; }",
+        "package p; enum E { A, B } interface J { const int Y = E.E.A; }",
+        "package p; enum E { A, B } parcelable Q { E e = E.E.B; }",
+        "package p; parcelable X { parcelable Y { parcelable Z { const int C = 1; } } } \
+         parcelable A { parcelable X { int g; } const int K = X.Y.Z.C; }",
+        "package p; parcelable X { int a; } parcelable P { X.X f; }",
+        "package p; parcelable X { parcelable Y { int a; } } \
+         parcelable A { parcelable X { int g; } X.Y f; }",
+    ] {
+        assert!(!generate_ok(src), "must not resolve: {src}");
+    }
+    let out = generate_str(
+        "package p; parcelable X { parcelable Y { parcelable Z { const int C = 1; } } } \
+         parcelable A { parcelable X { int g; } const int K = p.X.Y.Z.C; X g; }",
+    )
+    .expect("a fully-qualified name and the inner `X` both resolve");
+    assert!(out.contains("pub const r#K: i32 = 1;"), "{out}");
+    assert!(
+        out.contains("pub r#g: X::X,"),
+        "the field names the nested `A.X`: {out}"
+    );
+}
+
+/// AOSP's own `ResolveName` example: a nested type, then an import, then the document top level.
+#[test]
+fn type_names_bind_in_aosp_scope_order() {
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("scope_order");
+    let _ = std::fs::remove_dir_all(&root);
+    let (x, y) = (root.join("aidl/x"), root.join("aidl/y"));
+    std::fs::create_dir_all(&x).unwrap();
+    std::fs::create_dir_all(&y).unwrap();
+    std::fs::write(y.join("Baz.aidl"), "package y; enum Baz { Y }").unwrap();
+    std::fs::write(
+        x.join("Foo.aidl"),
+        "package x; import y.Baz; parcelable Foo { \
+         parcelable Bar { enum Baz { X } Baz t1; } Baz t2; Bar.Baz t3; }",
+    )
+    .unwrap();
+    rsbinder_aidl::Builder::new()
+        .source(root.join("aidl"))
+        .dest_dir(root.join("out"))
+        .output("gen.rs")
+        .generate()
+        .expect("generates");
+    let out = std::fs::read_to_string(root.join("out/gen.rs")).unwrap();
+    for pin in [
+        "pub r#t1: Baz::Baz,",
+        "pub r#t2: super::super::y::Baz::Baz,",
+        "pub r#t3: Bar::Baz::Baz,",
+    ] {
+        assert!(out.contains(pin), "missing `{pin}`:\n{out}");
+    }
+}
+
+/// AOSP `AidlUnaryConstExpression::evaluate`: a reference is negated at its member's own type.
+#[test]
+fn unary_operator_on_an_enum_reference_keeps_the_member_type() {
+    let out = generate_str("enum E { A = true } interface I { const int K = -E.A; }")
+        .expect("`-true` stays true");
+    assert!(out.contains("pub const r#K: i32 = 1;"), "{out}");
+    for (src, want) in [
+        (
+            "enum E { A = true } interface I { const int K = ~E.A; }",
+            "'~' to a boolean",
+        ),
+        (
+            "enum E { A = 128u8 } interface I { const int K = -E.A; }",
+            "cannot negate -128",
+        ),
+    ] {
+        let err = generate_err(src);
+        assert!(err.contains(want), "{src}: {err}");
+    }
+}
+
+/// AOSP `AidlConstantReference::evaluate` keeps the member value's type, not the `@Backing` one.
+#[test]
+fn long_backed_enum_member_keeps_its_literal_int_type() {
+    for (src, want) in [
+        (
+            "@Backing(type=\"long\") enum E { A = 2147483647, B }",
+            "overflows ('+' on int)",
+        ),
+        (
+            "@Backing(type=\"long\") enum E { A = 2147483647, B = A + 1 }",
+            "overflows",
+        ),
+        (
+            "@Backing(type=\"long\") enum L { BIT = 1 } interface I { const long W = L.BIT << 40; }",
+            "operand width 32 bits",
+        ),
+    ] {
+        let err = generate_err(src);
+        assert!(err.contains(want), "{src}: {err}");
+    }
+    let out = generate_str(
+        "@Backing(type=\"long\") enum E { A = 2147483648, B, C = A + 1 } \
+         @Backing(type=\"long\") enum L { BIT = 1L } \
+         interface I { const long W = L.BIT << 40; const long Z = E.A << 1; }",
+    )
+    .expect("a long-typed member folds at long width");
+    for pin in [
+        "r#B = 2147483649,",
+        "r#C = 2147483649,",
+        "pub const r#W: i64 = 1099511627776;",
+        "pub const r#Z: i64 = 4294967296;",
+    ] {
+        assert!(out.contains(pin), "missing `{pin}`:\n{out}");
+    }
+}
+
+/// AOSP `AidlDocument::ResolveName`: imports first, even over a package-less top-level type.
+#[test]
+fn an_import_outranks_a_package_less_top_level_type() {
+    let out = generate_with_includes(
+        &[
+            "parcelable Foo { int x; } interface I { const int X = 1; }",
+            "package a; parcelable Foo { String s; } interface I { const int X = 2; }",
+        ],
+        "import a.Foo; import a.I; parcelable P { Foo f; const int Y = I.X; }",
+    )
+    .expect("generates");
+    for pin in ["pub r#f: super::a::Foo::Foo,", "pub const r#Y: i32 = 2;"] {
+        assert!(out.contains(pin), "missing `{pin}`:\n{out}");
+    }
+}
+
+/// Another file's type in the same package is rsbinder's extension: AOSP's own lookups outrank it.
+#[test]
+fn same_package_extension_ranks_after_every_aosp_lookup() {
+    let other_file = "package p; parcelable Foo { int x; }";
+    let package_less = "parcelable Foo { String s; }";
+    for (includes, src, pin) in [
+        // Nothing else names `Foo`: the extension finds `p.Foo`.
+        (
+            &[other_file][..],
+            "package p; parcelable P { Foo f; }",
+            "pub r#f: super::Foo::Foo,",
+        ),
+        // AOSP takes `Foo` as written, the package-less type.
+        (
+            &[other_file, package_less][..],
+            "package p; parcelable P { Foo f; }",
+            "pub r#f: super::super::Foo::Foo,",
+        ),
+        // This document's own top-level type outranks the name as written.
+        (
+            &[package_less][..],
+            "package p; parcelable Foo { int y; } parcelable P { Foo f; }",
+            "pub r#f: super::Foo::Foo,",
+        ),
+    ] {
+        let out = generate_with_includes(includes, src).expect("generates");
+        assert!(out.contains(pin), "{src}: missing `{pin}`:\n{out}");
+    }
+}
+
+/// An enum reference's resolved name is looked up as is, never bound again in the field's scope.
+#[test]
+fn resolved_enum_name_is_not_rebound_by_a_nested_type() {
+    // `q.r.E` re-bound in `P` would take `q` as the nested `P.q` and fail.
+    let out = generate_str(
+        "package q.r; enum E { A, B } parcelable P { parcelable q { int z; } E e = E.B; }",
+    )
+    .expect("generates");
+    assert!(out.contains("r#e: super::E::E::B,"), "{out}");
+}
+
+/// AOSP `UnionTagGenerater`: a union's `Tag` has one enumerator per field, in field order.
+#[test]
+fn union_tag_members_resolve() {
+    let out = generate_str(
+        "package p; union U { int a; String b; const int C = 7; } \
+         parcelable P { U.Tag t = U.Tag.b; const int K = U.Tag.b; }",
+    )
+    .expect("`U.Tag.b` resolves");
+    for pin in ["pub const r#K: i32 = 1;", "r#t: super::U::Tag::b,"] {
+        assert!(out.contains(pin), "missing `{pin}`:\n{out}");
+    }
+    // A constant is not a field, so it has no tag.
+    assert!(!generate_ok(
+        "package p; union U { int a; const int C = 7; } parcelable P { const int K = U.Tag.C; }"
+    ));
+}
+
+/// Another union's `Tag` as a default is rejected, and the diagnostic names both `Tag`s.
+#[test]
+fn foreign_union_tag_default_names_the_tags() {
+    let ctx = rsbinder_aidl::SourceContext::new(
+        "test.aidl",
+        "package p; union U { int a; } union V { int a; } parcelable P { U.Tag t = V.Tag.a; }",
+    );
+    let document = rsbinder_aidl::parse_document(&ctx).expect("parses");
+    let err = rsbinder_aidl::Generator::new(false, false)
+        .document(&document)
+        .expect_err("`V.Tag.a` is not a `U.Tag`")
+        .to_string();
+    assert!(
+        err.contains("p.V.Tag.a does not match target enum p.U.Tag"),
+        "got: {err}"
+    );
+}
+
+/// AOSP resolves a field default's bare name in the field's own type, never in its enum type.
+#[test]
+fn bare_enum_default_is_not_looked_up_in_the_field_enum() {
+    for src in [
+        "package p; enum E { A, B } parcelable P { E e = B; }",
+        "package p; enum E { A, B } parcelable P { E[] e = {A, B}; }",
+    ] {
+        assert!(!generate_ok(src), "must not resolve: {src}");
+    }
+    assert!(generate_ok(
+        "package p; enum E { A, B } parcelable P { E e = E.B; E[] es = {E.A, E.B}; }"
+    ));
 }

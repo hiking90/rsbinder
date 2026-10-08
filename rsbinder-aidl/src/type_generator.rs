@@ -30,6 +30,22 @@ fn diagnostic_source(span: Option<(usize, usize)>) -> (NamedSource<String>, Sour
     )
 }
 
+/// AOSP `FormatDirections` (`aidl_language.cpp:1072`): `in`, `in or inout`, `in, out, or inout`.
+fn format_directions(directions: &[&str]) -> String {
+    match directions {
+        [] => String::new(),
+        [one] => (*one).to_owned(),
+        [a, b] => format!("{a} or {b}"),
+        [init @ .., last] => format!("{}, or {last}", init.join(", ")),
+    }
+}
+
+fn format_directions_quoted(directions: &[&str]) -> String {
+    let quoted: Vec<String> = directions.iter().map(|d| format!("'{d}'")).collect();
+    let quoted: Vec<&str> = quoted.iter().map(String::as_str).collect();
+    format_directions(&quoted)
+}
+
 fn make_type_error(message: impl Into<String>, span: Option<(usize, usize)>) -> AidlError {
     let (src, span) = diagnostic_source(span);
     AidlError::from(SemanticError::InvalidOperation {
@@ -37,6 +53,16 @@ fn make_type_error(message: impl Into<String>, span: Option<(usize, usize)>) -> 
         src,
         span,
     })
+}
+
+/// AIDL name of a `Reference`'s enum: `enum_type`, or `<Union>.Tag` for a union's `Tag`.
+fn enum_aidl_name(enum_type: &str, enum_name: &str) -> String {
+    match parser::lookup_decl_from_canonical(enum_type) {
+        Some(found) if matches!(found.decl, Declaration::Union(_)) => {
+            format!("{enum_type}.{enum_name}")
+        }
+        _ => enum_type.to_owned(),
+    }
 }
 
 thread_local! {
@@ -332,10 +358,7 @@ impl TypeGenerator {
     pub fn ensure_resolvable(&self) -> Result<(), AidlError> {
         let check = |value_type: &ValueType| -> Result<Option<LookupDecl>, AidlError> {
             if let ValueType::UserDefined(name) = value_type {
-                // Lookup falls back to the current decl on a miss, so compare the simple name.
-                let requested = name.rsplit('.').next().unwrap_or(name.as_str());
-                let resolved = lookup_decl_from_name(name, crate::Namespace::AIDL)
-                    .filter(|lookup_decl| lookup_decl.decl.name() == requested);
+                let resolved = lookup_decl_from_name(name, crate::Namespace::AIDL);
                 if resolved.is_none() {
                     let (src, span) = diagnostic_source(self.type_span);
                     return Err(AidlError::from(ResolutionError::UnknownType {
@@ -853,45 +876,118 @@ impl TypeGenerator {
         self
     }
 
+    /// AOSP `GetArgumentAspect` (aidl_typenames.cpp:332): (type name, permitted directions).
+    fn argument_aspect(&self) -> Option<(&'static str, &'static [&'static str])> {
+        const ALL: &[&str] = &["in", "out", "inout"];
+        const IN: &[&str] = &["in"];
+        Some(match &self.value_type {
+            ValueType::Array(_) => match self.array_types.first() {
+                Some(info) if info.is_list => ("List", ALL),
+                _ => ("array", ALL),
+            },
+            // Not default-constructible, so no `out`.
+            ValueType::FileDescriptor => ("ParcelFileDescriptor", &["in", "inout"]),
+            ValueType::Holder => return None,
+            ValueType::IBinder => ("IBinder", IN),
+            ValueType::Void => ("void", IN),
+            ValueType::Bool(_) => ("boolean", IN),
+            ValueType::Byte(_) => ("byte", IN),
+            ValueType::Char(_) => ("char", IN),
+            ValueType::Int32(_) => ("int", IN),
+            ValueType::Int64(_) => ("long", IN),
+            ValueType::Float(_) => ("float", IN),
+            ValueType::Double(_) => ("double", IN),
+            ValueType::String(_) => ("String", IN),
+            ValueType::UserDefined(name) => {
+                let is_immutable = |annotations: &[Annotation]| {
+                    annotations
+                        .iter()
+                        .any(|a| a.annotation == "@JavaOnlyImmutable")
+                };
+                let found = lookup_decl_from_name(name, crate::Namespace::AIDL)?;
+                match found.decl {
+                    Declaration::Parcelable(decl) if is_immutable(&decl.annotation_list) => {
+                        ("@JavaOnlyImmutable", IN)
+                    }
+                    Declaration::Union(decl) if is_immutable(&decl.annotation_list) => {
+                        ("@JavaOnlyImmutable", IN)
+                    }
+                    Declaration::Parcelable(_) | Declaration::Union(_) => ("parcelable/union", ALL),
+                    Declaration::Interface(_) => ("interface", IN),
+                    Declaration::Enum(_) => ("enum", IN),
+                    Declaration::Variable(_) => return None,
+                }
+            }
+            _ => return None,
+        })
+    }
+
+    /// Sets an argument's direction, checked as AOSP `AidlArgument::CheckValid`.
     pub fn direction_at(
         mut self,
         direction: &Direction,
         direction_span: Option<(usize, usize)>,
+        arg: &str,
     ) -> Result<Self, AidlError> {
-        if matches!(direction, Direction::Out | Direction::Inout)
-            && (Self::is_primitive(&self.value_type)
-                || matches!(self.value_type, ValueType::String(_)))
-        {
-            let direction_str = match direction {
-                Direction::Out => "out",
-                Direction::Inout => "inout",
-                Direction::In | Direction::None => {
-                    unreachable!("direction guarded by matches! above")
+        if let Some((type_kind, allowed)) = self.argument_aspect() {
+            let given = match direction {
+                Direction::None => None,
+                Direction::In => Some("in"),
+                Direction::Out => Some("out"),
+                Direction::Inout => Some("inout"),
+            };
+            let allowed_text = format_directions(allowed);
+            match given {
+                None if allowed != ["in"] => {
+                    let (src, span) = diagnostic_source(self.type_span);
+                    return Err(AidlError::from(SemanticError::DirectionNotSpecified {
+                        arg: arg.to_owned(),
+                        type_kind: type_kind.to_owned(),
+                        help: Some(format!(
+                            "declare it as {} before the type",
+                            format_directions_quoted(allowed)
+                        )),
+                        allowed: allowed_text,
+                        src,
+                        span,
+                    }));
                 }
-            };
-            let type_kind = if matches!(self.value_type, ValueType::String(_)) {
-                "String"
-            } else {
-                "a primitive type"
-            };
-            let (src, span) = diagnostic_source(direction_span.or(self.type_span));
-            return Err(AidlError::from(SemanticError::DirectionPrimitive {
-                direction: direction_str.to_string(),
-                type_kind: type_kind.to_string(),
-                help: Some(format!(
-                    "remove '{direction_str}', or change the parameter type to a non-primitive type \
-                     (parcelable, interface, List, etc.)"
-                )),
-                src,
-                span,
-            }));
+                Some(dir) if !allowed.contains(&dir) => {
+                    let help = if allowed == ["in"] {
+                        format!(
+                            "remove '{dir}'; to pass a value back, return it, or use an array, \
+                             which can be an in, out, or inout parameter"
+                        )
+                    } else {
+                        let others: Vec<&str> =
+                            allowed.iter().copied().filter(|d| *d != "in").collect();
+                        format!(
+                            "remove '{dir}', or declare it as {}",
+                            format_directions_quoted(&others)
+                        )
+                    };
+                    let (src, span) = diagnostic_source(direction_span.or(self.type_span));
+                    return Err(AidlError::from(SemanticError::InvalidDirection {
+                        arg: arg.to_owned(),
+                        direction: dir.to_owned(),
+                        type_kind: type_kind.to_owned(),
+                        allowed: allowed_text,
+                        help: Some(help),
+                        src,
+                        span,
+                    }));
+                }
+                _ => {}
+            }
         }
         self.direction = direction.clone();
         Ok(self)
     }
 
-    pub fn direction(self, direction: &Direction) -> Result<Self, AidlError> {
-        self.direction_at(direction, None)
+    /// Sets the direction unchecked, for code generation; arguments go through `direction_at`.
+    pub fn direction(mut self, direction: &Direction) -> Result<Self, AidlError> {
+        self.direction = direction.clone();
+        Ok(self)
     }
 
     // Switch to array type.
@@ -1378,51 +1474,35 @@ impl TypeGenerator {
         }
     }
 
-    fn resolve_enum_reference_for_target(expr: &ConstExpr, target_enum: &str) -> ConstExpr {
-        match &expr.value {
-            ValueType::Name(name) => {
-                parser::name_to_enum_member_const_expr(name, Some(target_enum))
-                    .unwrap_or_else(|| expr.clone())
-            }
-            ValueType::Array(values) => ConstExpr::new(ValueType::Array(
-                values
-                    .iter()
-                    .map(|value| Self::resolve_enum_reference_for_target(value, target_enum))
-                    .collect(),
-            )),
-            ValueType::Expr { lhs, operator, rhs } => ConstExpr::new(ValueType::Expr {
-                lhs: Box::new(Self::resolve_enum_reference_for_target(lhs, target_enum)),
-                operator: operator.clone(),
-                rhs: Box::new(Self::resolve_enum_reference_for_target(rhs, target_enum)),
-            }),
-            ValueType::Unary { operator, expr } => ConstExpr::new(ValueType::Unary {
-                operator: operator.clone(),
-                expr: Box::new(Self::resolve_enum_reference_for_target(expr, target_enum)),
-            }),
-            _ => expr.clone(),
-        }
-    }
-
     fn validate_enum_value(
         &self,
         expr: &ConstExpr,
         target_lookup: &LookupDecl,
     ) -> Result<ConstExpr, AidlError> {
         let target_enum = target_lookup.ns.to_string(crate::Namespace::AIDL);
-        let resolved = Self::resolve_enum_reference_for_target(expr, &target_enum);
-        let calculated = resolved
+        // `ns` of a union's `Tag` is the union's; diagnostics name the `Tag` itself.
+        let target_name = || match &target_lookup.decl {
+            Declaration::Enum(e) if e.tag_of_union.is_some() => format!("{target_enum}.{}", e.name),
+            _ => target_enum.clone(),
+        };
+        let calculated = expr
             .calculate()
             .map_err(|e| make_type_error(e.message, self.type_span))?;
 
         match &calculated.value {
-            ValueType::Reference { enum_type, .. } => {
+            ValueType::Reference {
+                enum_type,
+                enum_name,
+                member_name,
+                ..
+            } => {
                 // Member names repeat across enums; the default must belong to the field's enum.
                 if enum_type != &target_enum {
                     return Err(make_type_error(
                         format!(
-                            "enum default value {} does not match target enum {}",
-                            calculated.to_value_string(),
-                            target_enum
+                            "enum default value {}.{member_name} does not match target enum {}",
+                            enum_aidl_name(enum_type, enum_name),
+                            target_name(),
                         ),
                         self.type_span,
                     ));
@@ -1433,7 +1513,8 @@ impl TypeGenerator {
             ValueType::Name(name) => Err(make_type_error(
                 format!(
                     "unresolved enum default value {} for target enum {}",
-                    name, target_enum
+                    name,
+                    target_name()
                 ),
                 self.type_span,
             )),
@@ -1441,7 +1522,7 @@ impl TypeGenerator {
                 format!(
                     "enum default value {} is not a member of target enum {}",
                     calculated.to_value_string(),
-                    target_enum
+                    target_name()
                 ),
                 self.type_span,
             )),
@@ -1468,9 +1549,7 @@ impl TypeGenerator {
         is_fixed_array: bool,
         is_nullable: bool,
     ) -> Result<String, AidlError> {
-        let target_enum = target_lookup.ns.to_string(crate::Namespace::AIDL);
-        let resolved = Self::resolve_enum_reference_for_target(expr, &target_enum);
-        let calculated = resolved
+        let calculated = expr
             .calculate()
             .map_err(|e| make_type_error(e.message, self.type_span))?;
 
@@ -1637,13 +1716,13 @@ impl TypeGenerator {
                     self.type_span,
                 ));
             }
-            ValueType::Reference {
-                enum_type, value, ..
-            } => parser::enum_reference_promoted(enum_type, *value)
-                .convert_to(&self.value_type)
-                .map_err(|e| make_type_error(e.message, self.type_span))?
-                .value
-                .to_init(scalar_param),
+            ValueType::Reference { value, kind, .. } => {
+                ConstExpr::new(ValueType::promoted_reference(*value, *kind))
+                    .convert_to(&self.value_type)
+                    .map_err(|e| make_type_error(e.message, self.type_span))?
+                    .value
+                    .to_init(scalar_param)
+            }
             // Laxer than AOSP `ValueString` for char/float/double targets; non-enum types error.
             _ => calculated
                 .convert_to(&self.value_type)

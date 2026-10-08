@@ -35,7 +35,7 @@
 use crate::error::ConstExprError;
 use crate::parser;
 
-// Bounds `calculate_with_visited` recursion so untrusted `.aidl` nesting cannot overflow the stack.
+// Bounds `calculate_at_depth` recursion so untrusted `.aidl` nesting cannot overflow the stack.
 const MAX_EXPR_DEPTH: usize = 256;
 
 macro_rules! arithmetic_bit_op {
@@ -224,14 +224,58 @@ pub enum ValueType {
     UserDefined(String),
     Reference {
         // Full AIDL enum type. Short enum names can collide across packages.
+        // A union's `Tag` carries the union's name here (its module); `enum_name` is `Tag`.
         enum_type: String,
         enum_name: String,
         member_name: String,
         value: i64,
+        // AOSP `AidlConstantReference` copies the member value's `final_type_`, not `@Backing`.
+        kind: RefKind,
     },
 }
 
+/// The AOSP `final_type_` an enum member's value carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefKind {
+    Bool,
+    Int8,
+    Int32,
+    Int64,
+}
+
+impl RefKind {
+    /// The kind of a folded member value; `None` for a non-integral one.
+    pub(crate) fn of(value: &ValueType) -> Option<RefKind> {
+        Some(match value {
+            ValueType::Bool(_) => RefKind::Bool,
+            ValueType::Byte(_) => RefKind::Int8,
+            ValueType::Int32(_) => RefKind::Int32,
+            ValueType::Int64(_) => RefKind::Int64,
+            ValueType::Reference { kind, .. } => *kind,
+            _ => return None,
+        })
+    }
+}
+
 impl ValueType {
+    /// AOSP `IntegralPromotion` of an enum reference's value: `long` stays, anything else is `int`.
+    pub(crate) fn promoted_reference(value: i64, kind: RefKind) -> ValueType {
+        match i32::try_from(value) {
+            Ok(value) if kind != RefKind::Int64 => ValueType::Int32(value),
+            _ => ValueType::Int64(value),
+        }
+    }
+
+    /// An enum reference's value at its own type, as AOSP unary operators see it.
+    fn typed_reference(value: i64, kind: RefKind) -> ValueType {
+        match kind {
+            RefKind::Bool => ValueType::Bool(value != 0),
+            RefKind::Int8 => ValueType::Byte(value as i8),
+            RefKind::Int32 => ValueType::Int32(value as i32),
+            RefKind::Int64 => ValueType::Int64(value),
+        }
+    }
+
     #[cfg(test)]
     fn new_expr(lhs: ValueType, operator: &str, rhs: ValueType) -> ValueType {
         ValueType::Expr {
@@ -298,11 +342,9 @@ impl ValueType {
             ValueType::Bool(_) => Err(ConstExprError::new(
                 "can't apply unary operator '~' to a boolean",
             )),
-            ValueType::Reference {
-                enum_type, value, ..
-            } => parser::enum_reference_promoted(enum_type, *value)
-                .value
-                .unary_not(),
+            ValueType::Reference { value, kind, .. } => {
+                ValueType::typed_reference(*value, *kind).unary_not()
+            }
             ValueType::Expr { .. } | ValueType::Unary { .. } => {
                 let expr = self.calculate()?;
                 expr.value.unary_not()
@@ -320,11 +362,9 @@ impl ValueType {
                 let expr = self.calculate()?;
                 expr.value.logical_not()
             }
-            ValueType::Reference {
-                enum_type, value, ..
-            } => parser::enum_reference_promoted(enum_type, *value)
-                .value
-                .logical_not(),
+            ValueType::Reference { value, kind, .. } => {
+                ValueType::typed_reference(*value, *kind).logical_not()
+            }
             _ => {
                 let b = !self.to_bool()?;
                 Ok(ConstExpr::new(match self {
@@ -356,11 +396,9 @@ impl ValueType {
             // AOSP `OverflowGuard<bool>`: `-true` stays true, `-false` negates the minimum.
             ValueType::Bool(true) => Ok(ConstExpr::new(ValueType::Bool(true))),
             ValueType::Bool(false) => Err(overflow(false)),
-            ValueType::Reference {
-                enum_type, value, ..
-            } => parser::enum_reference_promoted(enum_type, *value)
-                .value
-                .unary_minus(),
+            ValueType::Reference { value, kind, .. } => {
+                ValueType::typed_reference(*value, *kind).unary_minus()
+            }
             ValueType::Byte(v) => Ok(ConstExpr::new(ValueType::Byte(
                 v.checked_neg().ok_or_else(|| overflow(*v))?,
             ))),
@@ -396,26 +434,8 @@ impl ValueType {
             ValueType::Float(v) | ValueType::Double(v) => Ok(*v != 0.),
             ValueType::Reference { value, .. } => Ok(*value != 0),
             ValueType::Array(_) => Err(ConstExprError::new("to_bool() for Array is not supported")),
-            ValueType::Name(name) => {
-                let expr = parser::name_to_const_expr(name);
-                match expr {
-                    Some(expr) => {
-                        let calculated = expr.calculate()?;
-                        if let ValueType::Name(n) = calculated.value {
-                            // Still a name ⇒ unresolvable reference; AOSP rejects it.
-                            Err(ConstExprError::new(format!(
-                                "cannot resolve constant reference '{n}'"
-                            )))
-                        } else {
-                            calculated.to_bool()
-                        }
-                    }
-                    // Typo or missing import: AOSP rejects it, so no fabricated `false`.
-                    None => Err(ConstExprError::new(format!(
-                        "cannot resolve constant reference '{name}'"
-                    ))),
-                }
-            }
+            // Typo or missing import: AOSP rejects it, so no fabricated `false`.
+            ValueType::Name(name) => resolve_name(name)?.to_bool(),
             ValueType::Expr { .. } | ValueType::Unary { .. } => {
                 let expr = self.calculate()?;
                 expr.to_bool()
@@ -440,26 +460,7 @@ impl ValueType {
             ValueType::Float(v) | ValueType::Double(v) => Ok(*v as _),
             ValueType::Reference { value, .. } => Ok(*value as _),
             ValueType::Array(_) => Err(ConstExprError::new("to_f64() for Array is not supported")),
-            ValueType::Name(name) => {
-                let expr = parser::name_to_const_expr(name);
-                match expr {
-                    Some(expr) => {
-                        let calculated = expr.calculate()?;
-                        if let ValueType::Name(n) = calculated.value {
-                            // See `to_bool`: dead-end resolution ⇒ diagnostic.
-                            Err(ConstExprError::new(format!(
-                                "cannot resolve constant reference '{n}'"
-                            )))
-                        } else {
-                            calculated.to_f64()
-                        }
-                    }
-                    // See `to_bool`: unresolvable reference ⇒ diagnostic, not 0.
-                    None => Err(ConstExprError::new(format!(
-                        "cannot resolve constant reference '{name}'"
-                    ))),
-                }
-            }
+            ValueType::Name(name) => resolve_name(name)?.to_f64(),
             ValueType::Expr { .. } | ValueType::Unary { .. } => {
                 let expr = self.calculate()?;
                 expr.to_f64()
@@ -485,26 +486,7 @@ impl ValueType {
             ValueType::Array(_) => Err(ConstExprError::new(format!(
                 "to_i64() for Array is not supported: {self:?}"
             ))),
-            ValueType::Name(name) => {
-                let expr = parser::name_to_const_expr(name);
-                match expr {
-                    Some(expr) => {
-                        let calculated = expr.calculate()?;
-                        if let ValueType::Name(n) = calculated.value {
-                            // See `to_bool`: dead-end resolution ⇒ diagnostic.
-                            Err(ConstExprError::new(format!(
-                                "cannot resolve constant reference '{n}'"
-                            )))
-                        } else {
-                            calculated.to_i64()
-                        }
-                    }
-                    // See `to_bool`: unresolvable reference ⇒ diagnostic, not 0.
-                    None => Err(ConstExprError::new(format!(
-                        "cannot resolve constant reference '{name}'"
-                    ))),
-                }
-            }
+            ValueType::Name(name) => resolve_name(name)?.to_i64(),
             ValueType::Reference { value, .. } => Ok(*value),
             ValueType::Expr { .. } | ValueType::Unary { .. } => {
                 let expr = self.calculate()?;
@@ -581,6 +563,7 @@ impl ValueType {
                 enum_name,
                 member_name,
                 value,
+                ..
             } => {
                 if param.is_const {
                     // For constants, always use numeric values
@@ -588,8 +571,8 @@ impl ValueType {
                 } else {
                     let enum_name = crate::escape_rust_keyword(enum_name);
                     let member_name = crate::escape_rust_keyword(member_name);
-                    // Use proper namespace resolution for cross-package enum references
-                    match parser::lookup_decl_from_name(enum_type, crate::Namespace::AIDL) {
+                    // `enum_type` is the enum's resolved name: look it up as is, never re-bind it.
+                    match parser::lookup_decl_from_canonical(enum_type) {
                         Some(lookup_decl) => {
                             if let Some(path) = parser::builtin_rust_path(&lookup_decl.ns) {
                                 return format!(
@@ -712,16 +695,10 @@ impl ValueType {
         lhs: &ConstExpr,
         operator: &str,
         rhs: &ConstExpr,
-        visited: &mut std::collections::HashSet<String>,
         depth: usize,
     ) -> Result<ConstExpr, ConstExprError> {
-        // Per-operand clone of `visited`: catches `A = B + 1; B = A + 1` but not `X = C + C`.
-        let lhs = lhs
-            .value
-            .calculate_with_visited(&mut visited.clone(), depth + 1)?;
-        let rhs = rhs
-            .value
-            .calculate_with_visited(&mut visited.clone(), depth + 1)?;
+        let lhs = lhs.value.calculate_at_depth(depth + 1)?;
+        let rhs = rhs.value.calculate_at_depth(depth + 1)?;
         // AOSP `AreCompatibleOperandTypes` has no CHARACTER case: every binary operator rejects it.
         if matches!(lhs.value, ValueType::Char(_)) || matches!(rhs.value, ValueType::Char(_)) {
             return Err(ConstExprError::new(format!(
@@ -895,16 +872,42 @@ impl ValueType {
         }
     }
 
+    /// Folds in the current scope; a name yields its referent's final value, never its expression.
     pub fn calculate(&self) -> Result<ConstExpr, ConstExprError> {
-        self.calculate_with_visited(&mut std::collections::HashSet::new(), 0)
+        self.calculate_at_depth(0)
     }
 
-    fn calculate_with_visited(
-        &self,
-        visited: &mut std::collections::HashSet<String>,
-        depth: usize,
-    ) -> Result<ConstExpr, ConstExprError> {
-        // `visited` breaks name cycles only; deep nesting from untrusted input needs a depth cap.
+    /// Names a fold of this expression looks up, in evaluation order.
+    pub(crate) fn referenced_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        // Explicit stack: the tree is untrusted and may be deep.
+        let mut pending = vec![self];
+        while let Some(value) = pending.pop() {
+            match value {
+                ValueType::Name(name) => names.push(name.clone()),
+                ValueType::Unary { expr, .. } => pending.push(&expr.value),
+                ValueType::Expr { lhs, rhs, .. } => {
+                    pending.push(&rhs.value);
+                    pending.push(&lhs.value);
+                }
+                ValueType::Array(items) => pending.extend(items.iter().rev().map(|i| &i.value)),
+                _ => {}
+            }
+        }
+        names
+    }
+
+    /// The first name a folded value still holds, i.e. one its scope could not resolve.
+    pub(crate) fn unresolved_name(&self) -> Option<&str> {
+        match self {
+            ValueType::Name(name) => Some(name),
+            ValueType::Array(items) => items.iter().find_map(|item| item.value.unresolved_name()),
+            _ => None,
+        }
+    }
+
+    fn calculate_at_depth(&self, depth: usize) -> Result<ConstExpr, ConstExprError> {
+        // Deep nesting from untrusted input needs a cap; names never add depth (see `calculate`).
         if depth > MAX_EXPR_DEPTH {
             return Err(ConstExprError::new(
                 "constant expression nested too deeply (exceeded recursion limit)",
@@ -912,7 +915,7 @@ impl ValueType {
         }
         match self {
             ValueType::Unary { operator, expr } => {
-                let expr = expr.value.calculate_with_visited(visited, depth + 1)?;
+                let expr = expr.value.calculate_at_depth(depth + 1)?;
                 // AOSP `IsCompatibleType`: no CHARACTER/ARRAY case; FLOATING takes only `+`, `-`.
                 let is_float = matches!(expr.value, ValueType::Float(_) | ValueType::Double(_));
                 let is_other = matches!(expr.value, ValueType::Char(_) | ValueType::Array(_));
@@ -938,31 +941,32 @@ impl ValueType {
                 }
             }
             ValueType::Expr { lhs, operator, rhs } => {
-                ValueType::calc_expr(lhs, operator, rhs, visited, depth)
+                ValueType::calc_expr(lhs, operator, rhs, depth)
             }
             ValueType::Array(v) => {
                 let mut array = Vec::new();
 
                 for value in v {
-                    array.push(value.value.calculate_with_visited(visited, depth + 1)?);
+                    let element = value.value.calculate_at_depth(depth + 1)?;
+                    // Copying a nested array lets `{A, A}` chains double the value per link.
+                    if let (ValueType::Name(name), ValueType::Array(items)) =
+                        (&value.value, &element.value)
+                    {
+                        if items.iter().any(|i| matches!(i.value, ValueType::Array(_))) {
+                            return Err(ConstExprError::new(format!(
+                                "array constant '{name}' holds arrays, so it cannot be an \
+                                 element of an array literal"
+                            )));
+                        }
+                    }
+                    array.push(element);
                 }
 
                 Ok(ConstExpr::new(ValueType::Array(array)))
             }
             ValueType::Name(name) => {
-                if visited.contains(name) {
-                    // A reference cycle has no value; AOSP rejects it at build time.
-                    Err(ConstExprError::new(format!(
-                        "circular reference detected while resolving constant '{name}'"
-                    )))
-                } else {
-                    visited.insert(name.clone());
-                    let expr = parser::name_to_const_expr(name);
-                    match expr {
-                        Some(expr) => expr.value.calculate_with_visited(visited, depth + 1),
-                        None => Ok(ConstExpr::new(self.clone())),
-                    }
-                }
+                Ok(parser::name_to_const_expr(name)?
+                    .unwrap_or_else(|| ConstExpr::new(self.clone())))
             }
             ValueType::Reference { .. } => Ok(ConstExpr::new(self.clone())),
             _ => Ok(ConstExpr::new(self.clone())),
@@ -1013,6 +1017,12 @@ impl PartialOrd for ValueType {
     }
 }
 
+// A resolved value never holds a `Name` (see `parser::fold_symbol_expr`), so this cannot loop.
+fn resolve_name(name: &str) -> Result<ConstExpr, ConstExprError> {
+    parser::name_to_const_expr(name)?
+        .ok_or_else(|| ConstExprError::new(format!("cannot resolve constant reference '{name}'")))
+}
+
 // rustc denies these raw in a literal (`text_direction_codepoint_in_literal`); escape them.
 fn is_bidi_control(c: char) -> bool {
     matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
@@ -1034,13 +1044,8 @@ fn type_conversion(lhs: ValueType, rhs: ValueType) -> ValueType {
 
 fn integral_promotion(value_type: ValueType) -> ValueType {
     // Enum refs promote to their integer (AOSP `AidlConstantReference`); `order()` ranks them top.
-    if let ValueType::Reference {
-        ref enum_type,
-        value,
-        ..
-    } = value_type
-    {
-        return parser::enum_reference_promoted(enum_type, value).value;
+    if let ValueType::Reference { value, kind, .. } = value_type {
+        return ValueType::promoted_reference(value, kind);
     }
     let i32_order = ValueType::Int32(0).order();
     let value_order = value_type.order();

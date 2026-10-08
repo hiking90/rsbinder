@@ -236,7 +236,7 @@ pub mod {{mod}} {
     /// `getInterfaceHash()`. Matches AOSP `aidl --hash <s>`; the generator
     /// does not validate it against the AIDL contents (freeze workflow's
     /// responsibility).
-    pub const HASH: &str = "{{ hash }}";
+    pub const HASH: &str = {{ hash }};
     {%- endif %}
     {%- if deprecated %}
     {{ deprecated }}
@@ -1157,7 +1157,14 @@ pub fn render_interface(r: &InterfaceRender) -> Result<String, AidlError> {
     context.insert("is_vintf", &r.is_vintf);
     // `version`/`hash` are independent: each emits only if set, as AOSP's per-flag conditional.
     context.insert("version", &r.version);
-    context.insert("hash", &r.hash);
+    // Quoted here: `Builder::hash` accepts any non-empty text, `"` and `\` included.
+    context.insert(
+        "hash",
+        &r.hash
+            .as_deref()
+            .filter(|h| !h.is_empty())
+            .map(quote_rust_string),
+    );
     context.insert("deprecated", &r.deprecated);
     context.insert("function_names", &r.function_names);
 
@@ -1726,44 +1733,13 @@ impl Generator {
         context
     }
 
-    /// Pre-register all enum member symbols from a document into the symbol table.
-    /// This ensures enum symbols are available before any code generation begins,
-    /// preventing incorrect resolution when multiple enums share the same member names.
+    /// Does nothing; kept for API compatibility.
     ///
-    /// Interface constants are registered first: an enum discriminant may
-    /// reference a sibling constant (`const int X = 5; enum E { A = X, B }`),
-    /// and resolving enums before the constants exist would poison the enum
-    /// value cache with unresolved expressions.
-    pub fn pre_register_enums(document: &parser::Document) {
-        parser::set_current_document(document);
-        Self::pre_register_enum_decls(&document.decls);
-    }
-
-    fn pre_register_enum_decls(decls: &[parser::Declaration]) {
-        for decl in decls {
-            match decl {
-                parser::Declaration::Enum(enum_decl) => {
-                    let _ns = parser::NamespaceGuard::new(&enum_decl.namespace);
-                    Self::register_enum_members(enum_decl);
-                }
-                parser::Declaration::Parcelable(d) => Self::pre_register_enum_decls(&d.members),
-                parser::Declaration::Interface(d) => {
-                    for constant in &d.constant_list {
-                        if let Some(expr) = &constant.const_expr {
-                            parser::register_symbol(
-                                &constant.identifier,
-                                expr.clone(),
-                                Some(&d.namespace.to_string(Namespace::AIDL)),
-                            );
-                        }
-                    }
-                    Self::pre_register_enum_decls(&d.members)
-                }
-                parser::Declaration::Union(d) => Self::pre_register_enum_decls(&d.members),
-                _ => {}
-            }
-        }
-    }
+    /// Constants and enum members are resolved on first use from the parsed
+    /// declarations, each in its own declaring scope, so a value does not
+    /// depend on which document is generated first and nothing has to be
+    /// registered in advance.
+    pub fn pre_register_enums(_document: &parser::Document) {}
 
     pub fn document(&self, document: &parser::Document) -> Result<(String, String), AidlError> {
         parser::set_current_document(document);
@@ -2002,18 +1978,6 @@ impl Generator {
         let mut const_members = Vec::new();
         let mut fn_members = Vec::new();
 
-        // First pass: register all interface constants for resolution
-        for constant in decl.constant_list.iter() {
-            if let Some(const_expr) = &constant.const_expr {
-                parser::register_symbol(
-                    &constant.identifier,
-                    const_expr.clone(),
-                    Some(&decl.namespace.to_string(Namespace::AIDL)),
-                );
-            }
-        }
-
-        // Second pass: process constants with resolved values
         let mut constant_names = std::collections::HashSet::new();
         for constant in decl.constant_list.iter() {
             let generator = constant.r#type.to_generator()?;
@@ -2491,24 +2455,6 @@ pub mod {mod} {{
         Ok(())
     }
 
-    fn register_enum_members(decl: &parser::EnumDecl) {
-        let enum_type = decl.namespace.to_string(Namespace::AIDL);
-        let lookup_decl = parser::LookupDecl {
-            decl: parser::Declaration::Enum(decl.clone()),
-            ns: decl.namespace.clone(),
-            name: Namespace::new(&enum_type, Namespace::AIDL),
-        };
-
-        for enumerator in &decl.enumerator_list {
-            let member_name = &enumerator.identifier;
-            if let Some(expr) =
-                parser::enum_member_const_expr_from_lookup(&lookup_decl, member_name)
-            {
-                parser::register_symbol(member_name, expr, Some(&enum_type));
-            }
-        }
-    }
-
     fn decl_enum(&self, decl: &parser::EnumDecl, indent: usize) -> Result<String, AidlError> {
         if parser::has_annotation(
             &decl.annotation_list,
@@ -2528,16 +2474,12 @@ pub mod {mod} {{
 
         let mut members = Vec::new();
 
-        // First pass: register all enum members with their names for resolution
-        Self::register_enum_members(decl);
-
         let lookup_decl = parser::LookupDecl {
             decl: parser::Declaration::Enum(decl.clone()),
             ns: decl.namespace.clone(),
             name: Namespace::new(&decl.namespace.to_string(Namespace::AIDL), Namespace::AIDL),
         };
 
-        // Second pass: render the values resolved by the shared enum member path.
         let mut enumerator_names = std::collections::HashSet::new();
         for enumerator in &decl.enumerator_list {
             // Not an AOSP check: two same-named constants in `declare_binder_enum!` do not compile.
@@ -2561,51 +2503,49 @@ pub mod {mod} {{
                     decl.name_span,
                 ));
             }
-            if let Some(expr) =
-                parser::enum_member_const_expr_from_lookup(&lookup_decl, &enumerator.identifier)
-            {
-                let diag = |detail: String| {
-                    parser::make_invalid_operation_error(
-                        format!(
-                            "enum '{}' member '{}' has an invalid discriminant: {detail}",
-                            decl.name, enumerator.identifier
-                        ),
-                        decl.name_span,
-                    )
-                };
-                let calculated = expr.calculate().map_err(|e| diag(e.message))?;
-                // Integral only (bool too, AOSP `AreCompatibleOperandTypes`); `to_i64` takes float.
-                let value = match &calculated.value {
-                    ValueType::Byte(_)
-                    | ValueType::Int32(_)
-                    | ValueType::Int64(_)
-                    | ValueType::Bool(_)
-                    | ValueType::Reference { .. }
-                    | ValueType::Name(_) => calculated.to_i64().map_err(|e| diag(e.message))?,
-                    other => {
-                        return Err(diag(format!(
-                            "non-integral value ({})",
-                            other.to_value_string()
-                        )))
-                    }
-                };
-                // As AOSP: reject out-of-range here, not in the generated crate.
-                let (min, max, backing) = match generator.value_type {
-                    ValueType::Byte(_) => (i8::MIN as i64, i8::MAX as i64, "byte"),
-                    ValueType::Int32(_) => (i32::MIN as i64, i32::MAX as i64, "int"),
-                    _ => (i64::MIN, i64::MAX, "long"),
-                };
-                if value < min || value > max {
-                    return Err(diag(format!(
-                        "{value} does not fit the '{backing}' backing type ({min}..={max})"
-                    )));
+            let diag = |detail: String| {
+                parser::make_invalid_operation_error(
+                    format!(
+                        "enum '{}' member '{}' has an invalid discriminant: {detail}",
+                        decl.name, enumerator.identifier
+                    ),
+                    decl.name_span,
+                )
+            };
+            let calculated = parser::enum_member_value(&lookup_decl, &enumerator.identifier)
+                .map_err(|e| diag(e.message))?;
+            // Integral only (bool too, AOSP `AreCompatibleOperandTypes`); `to_i64` takes float.
+            let value = match &calculated.value {
+                ValueType::Byte(_)
+                | ValueType::Int32(_)
+                | ValueType::Int64(_)
+                | ValueType::Bool(_)
+                | ValueType::Reference { .. } => {
+                    calculated.to_i64().map_err(|e| diag(e.message))?
                 }
-                members.push((
-                    enumerator.identifier.to_owned(),
-                    value,
-                    deprecated_attr(enumerator.deprecated.as_ref()),
-                ));
+                other => {
+                    return Err(diag(format!(
+                        "non-integral value ({})",
+                        other.to_value_string()
+                    )))
+                }
+            };
+            // As AOSP: reject out-of-range here, not in the generated crate.
+            let (min, max, backing) = match generator.value_type {
+                ValueType::Byte(_) => (i8::MIN as i64, i8::MAX as i64, "byte"),
+                ValueType::Int32(_) => (i32::MIN as i64, i32::MAX as i64, "int"),
+                _ => (i64::MIN, i64::MAX, "long"),
+            };
+            if value < min || value > max {
+                return Err(diag(format!(
+                    "{value} does not fit the '{backing}' backing type ({min}..={max})"
+                )));
             }
+            members.push((
+                enumerator.identifier.to_owned(),
+                value,
+                deprecated_attr(enumerator.deprecated.as_ref()),
+            ));
         }
 
         // The template `r#`-escapes the enum name but not the module name.

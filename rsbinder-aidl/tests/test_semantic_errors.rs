@@ -1,8 +1,7 @@
 // Copyright 2025 rsbinder Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Semantic diagnostics: transaction code errors, import resolution errors,
-//! and multi-file error aggregation.
+//! Semantic diagnostics: transaction codes, import resolution, multi-file aggregation.
 
 use miette::Diagnostic;
 use rsbinder_aidl::error::SemanticError;
@@ -226,6 +225,33 @@ fn test_import_not_found_includes_help() {
     );
 }
 
+// The "imported here" label lands on the import, not an earlier longer name sharing its prefix
+#[test]
+fn test_import_not_found_label_matches_the_whole_name() {
+    let tmp = scratch_dir("import_label_whole_name");
+    let aidl_path = tmp.join("Bar.aidl");
+    let text = "import p.IFooBar;\nimport p.IFoo;\nparcelable Bar {}";
+    std::fs::write(&aidl_path, text).unwrap();
+
+    let err = rsbinder_aidl::Builder::new()
+        .source(&aidl_path)
+        .output(&tmp)
+        .generate()
+        .expect_err("both imports are missing");
+    let AidlError::Multiple { errors } = &err else {
+        panic!("two failing imports must aggregate into Multiple, got: {err:?}");
+    };
+    let short = errors
+        .iter()
+        .find(|e| e.to_string() == "import 'p.IFoo' not found")
+        .unwrap_or_else(|| panic!("no p.IFoo error: {err:?}"));
+    let label = short
+        .labels()
+        .and_then(|mut labels| labels.next())
+        .expect("ImportNotFound carries a label");
+    assert_eq!(label.offset(), text.find("p.IFoo;").unwrap(), "{err:?}");
+}
+
 // Multiple file errors collected
 #[test]
 fn test_multiple_file_errors_collected() {
@@ -349,7 +375,7 @@ fn test_out_primitive_span_points_to_out_keyword() {
     let input = "interface IFoo {\n    void foo(out int x);\n}";
     let err = expect_generation_error(input, "test.aidl");
     if let AidlError::Semantic(se) = &err {
-        if let SemanticError::DirectionPrimitive {
+        if let SemanticError::InvalidDirection {
             span,
             direction,
             type_kind,
@@ -366,13 +392,13 @@ fn test_out_primitive_span_points_to_out_keyword() {
                 "span should point to 'out' keyword, got: '{spanned_text}'"
             );
             assert_eq!(direction, "out");
-            assert_eq!(type_kind, "a primitive type");
+            assert_eq!(type_kind, "int");
             assert!(
                 help.as_deref().unwrap_or("").contains("remove 'out'"),
                 "help should suggest removing the 'out' keyword, got: {help:?}"
             );
         } else {
-            panic!("Expected DirectionPrimitive, got: {err}");
+            panic!("Expected InvalidDirection, got: {err}");
         }
     } else {
         panic!("Expected Semantic error, got: {err}");
@@ -385,7 +411,7 @@ fn test_inout_string_span_points_to_inout_keyword() {
     let input = "interface IFoo {\n    void bar(inout String s);\n}";
     let err = expect_generation_error(input, "test.aidl");
     if let AidlError::Semantic(se) = &err {
-        if let SemanticError::DirectionPrimitive {
+        if let SemanticError::InvalidDirection {
             span,
             direction,
             type_kind,
@@ -408,10 +434,235 @@ fn test_inout_string_span_points_to_inout_keyword() {
                 "help should suggest removing the 'inout' keyword, got: {help:?}"
             );
         } else {
-            panic!("Expected DirectionPrimitive, got: {err}");
+            panic!("Expected InvalidDirection, got: {err}");
         }
     } else {
         panic!("Expected Semantic error, got: {err}");
+    }
+}
+
+// ── argument directions (AOSP `GetArgumentAspect` + `AidlArgument::CheckValid`) ─
+
+/// Types the argument matrix below names, nested so one document resolves them.
+const DIRECTION_DECLS: &str = "\
+    parcelable P { int x; }
+    parcelable G<T> { int x; }
+    union U { int a; String b; }
+    @JavaOnlyImmutable parcelable Imm { int x; }
+    @FixedSize parcelable F { int x; }
+    enum E { A, B }
+    interface ICb { void ping(); }
+";
+
+fn generate_method(method: &str) -> Result<(), AidlError> {
+    let input = format!("package test;\ninterface IFoo {{\n{DIRECTION_DECLS}    {method}\n}}");
+    let ctx = SourceContext::new("test.aidl", &input);
+    let doc = parse_document(&ctx).unwrap_or_else(|e| panic!("{method}: parse failed: {e}"));
+    Generator::new(false, false).document(&doc).map(|_| ())
+}
+
+fn semantic(err: &AidlError) -> &SemanticError {
+    match err {
+        AidlError::Semantic(se) => se,
+        other => panic!("Expected Semantic error, got: {other}"),
+    }
+}
+
+/// AOSP `aidl_unittest.cpp:220`, `:4356`, `:5032` (directions outside the type's aspect).
+#[test]
+fn test_direction_outside_the_types_aspect_is_rejected() {
+    let cases = [
+        ("void f(out int a);", "out", "int", "in"),
+        ("void f(inout String a);", "inout", "String", "in"),
+        ("void f(out IBinder a);", "out", "IBinder", "in"),
+        ("void f(inout IBinder a);", "inout", "IBinder", "in"),
+        ("void f(out @nullable IBinder a);", "out", "IBinder", "in"),
+        ("void f(out ICb a);", "out", "interface", "in"),
+        ("void f(inout @nullable ICb a);", "inout", "interface", "in"),
+        ("void f(out E a);", "out", "enum", "in"),
+        ("void f(inout E a);", "inout", "enum", "in"),
+        (
+            "void f(out ParcelFileDescriptor a);",
+            "out",
+            "ParcelFileDescriptor",
+            "in or inout",
+        ),
+        (
+            "void f(out @nullable ParcelFileDescriptor a);",
+            "out",
+            "ParcelFileDescriptor",
+            "in or inout",
+        ),
+        ("void f(out Imm a);", "out", "@JavaOnlyImmutable", "in"),
+        ("void f(inout Imm a);", "inout", "@JavaOnlyImmutable", "in"),
+    ];
+    for (method, want_dir, want_kind, want_allowed) in cases {
+        let err = generate_method(method).expect_err(method);
+        match semantic(&err) {
+            SemanticError::InvalidDirection {
+                arg,
+                direction,
+                type_kind,
+                allowed,
+                help,
+                ..
+            } => {
+                assert_eq!(arg, "a", "{method}");
+                assert_eq!(direction, want_dir, "{method}");
+                assert_eq!(type_kind, want_kind, "{method}");
+                assert_eq!(allowed, want_allowed, "{method}");
+                let help = help.as_deref().unwrap_or("");
+                assert!(
+                    help.contains(&format!("remove '{want_dir}'")),
+                    "{method}: {help}"
+                );
+            }
+            other => panic!("{method}: expected InvalidDirection, got: {other}"),
+        }
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "invalid direction: 'a' can't be an {want_dir} parameter because {want_kind} \
+                 can only be an {want_allowed} parameter"
+            ),
+            "{method}"
+        );
+    }
+}
+
+#[test]
+fn test_out_parcel_file_descriptor_help_offers_inout() {
+    let err = generate_method("void f(out ParcelFileDescriptor a);").unwrap_err();
+    let help = err.help().map(|h| h.to_string()).unwrap_or_default();
+    assert_eq!(help, "remove 'out', or declare it as 'inout'");
+}
+
+/// AOSP resolves types before `AidlArgument::CheckValid`, so an unknown type is reported as such.
+#[test]
+fn test_unknown_argument_type_wins_over_its_direction() {
+    for method in [
+        "void f(out Foo a);",
+        "void f(inout Foo a);",
+        "void f(out IFoo.Missing a);",
+    ] {
+        let err = generate_method(method).expect_err(method);
+        assert!(
+            matches!(&err, AidlError::Resolution(e)
+                if matches!(**e, rsbinder_aidl::error::ResolutionError::UnknownType { .. })),
+            "{method}: expected UnknownType, got: {err}"
+        );
+    }
+}
+
+/// AOSP `aidl_unittest.cpp:4367` `RejectsArgumentDirectionNotSpecified`.
+#[test]
+fn test_omitted_direction_is_rejected_unless_in_is_the_only_one() {
+    let cases = [
+        ("void f(int[] a);", "array", "in, out, or inout"),
+        ("void f(int[3] a);", "array", "in, out, or inout"),
+        (
+            "void f(@nullable String[] a);",
+            "array",
+            "in, out, or inout",
+        ),
+        ("void f(IBinder[] a);", "array", "in, out, or inout"),
+        ("void f(ICb[] a);", "array", "in, out, or inout"),
+        ("void f(List<String> a);", "List", "in, out, or inout"),
+        ("void f(P a);", "parcelable/union", "in, out, or inout"),
+        (
+            "void f(@nullable P a);",
+            "parcelable/union",
+            "in, out, or inout",
+        ),
+        ("void f(G<int> a);", "parcelable/union", "in, out, or inout"),
+        ("void f(U a);", "parcelable/union", "in, out, or inout"),
+        ("void f(F a);", "parcelable/union", "in, out, or inout"),
+        (
+            "void f(ParcelFileDescriptor a);",
+            "ParcelFileDescriptor",
+            "in or inout",
+        ),
+    ];
+    for (method, want_kind, want_allowed) in cases {
+        let err = generate_method(method).expect_err(method);
+        match semantic(&err) {
+            SemanticError::DirectionNotSpecified {
+                arg,
+                type_kind,
+                allowed,
+                ..
+            } => {
+                assert_eq!(arg, "a", "{method}");
+                assert_eq!(type_kind, want_kind, "{method}");
+                assert_eq!(allowed, want_allowed, "{method}");
+            }
+            other => panic!("{method}: expected DirectionNotSpecified, got: {other}"),
+        }
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "missing direction: the direction of 'a' is not specified; {want_kind} can be \
+                 an {want_allowed} parameter"
+            ),
+            "{method}"
+        );
+    }
+
+    let input = "package test;\ninterface IFoo {\n    void f(int[] a);\n}";
+    let err = expect_generation_error(input, "test.aidl");
+    let SemanticError::DirectionNotSpecified { span, help, .. } = semantic(&err) else {
+        panic!("expected DirectionNotSpecified, got: {err}");
+    };
+    assert_eq!(&input[span.offset()..span.offset() + span.len()], "int");
+    assert_eq!(
+        help.as_deref(),
+        Some("declare it as 'in', 'out', or 'inout' before the type")
+    );
+}
+
+/// AOSP `aidl_unittest.cpp:215`, `ITestService.aidl:231`, `ArrayOfInterfaces.aidl:29`.
+#[test]
+fn test_directions_inside_the_types_aspect_are_accepted() {
+    for method in [
+        "void f(int a, in int b, String c, in String d);",
+        "void f(IBinder a, in @nullable IBinder b, ICb c, in ICb d, E e, in E g);",
+        "void f(in ParcelFileDescriptor a, inout ParcelFileDescriptor b);",
+        "void f(inout @nullable ParcelFileDescriptor a);",
+        "void f(in Imm a, Imm b);",
+        "void f(in int[] a, out int[] b, inout int[] c);",
+        "void f(out int[3] a, inout int[2][3] b);",
+        "void f(out IBinder[] a, inout @nullable IBinder[] b);",
+        "void f(out ICb[] a, inout @nullable ICb[] b);",
+        "void f(out ParcelFileDescriptor[] a);",
+        "void f(out E[] a);",
+        "void f(in List<String> a, out List<String> b, inout List<IBinder> c);",
+        "void f(in P a, out P b, inout @nullable P c);",
+        "void f(out G<int> a, inout U b, out F c);",
+        "IBinder f(in IBinder a);",
+    ] {
+        if let Err(e) = generate_method(method) {
+            panic!("{method}: expected success, got: {e:?}");
+        }
+    }
+}
+
+/// AOSP `aidl_language.cpp:1236`: a oneway method refuses `out`/`inout` for every type.
+#[test]
+fn test_oneway_method_refuses_out_even_for_arrays() {
+    for method in ["oneway void f(out int[] a);", "oneway void f(inout P a);"] {
+        let input = format!("package test;\ninterface IFoo {{\n{DIRECTION_DECLS}    {method}\n}}");
+        let ctx = SourceContext::new("test.aidl", &input);
+        let err = match parse_document(&ctx) {
+            Err(e) => e,
+            Ok(doc) => Generator::new(false, false)
+                .document(&doc)
+                .map(|_| ())
+                .expect_err(method),
+        };
+        assert!(
+            format!("{err:?}").contains("oneway method 'f' cannot have"),
+            "{method}: {err:?}"
+        );
     }
 }
 
@@ -569,4 +820,43 @@ fn test_same_type_in_two_files_is_a_redefinition() {
         message.contains("'test.A'") && message.contains("first") && message.contains("second"),
         "got: {message}"
     );
+}
+
+/// AOSP `AddDocument` recurses into nested types: a nested and a top-level `a.b.c` collide.
+#[test]
+fn test_nested_and_top_level_type_of_one_name_is_a_redefinition() {
+    for (name, nested, top_level, qualified) in [
+        (
+            "redefinition_nested",
+            (
+                "a/b.aidl",
+                "package a;\nparcelable b { parcelable c { int x; } }",
+            ),
+            ("a/b/c.aidl", "package a.b;\nparcelable c { int y; }"),
+            "'a.b.c'",
+        ),
+        (
+            "redefinition_union_tag",
+            ("a/U.aidl", "package a;\nunion U { int x; }"),
+            ("a/U/Tag.aidl", "package a.U;\nparcelable Tag { int y; }"),
+            "'a.U.Tag'",
+        ),
+    ] {
+        let tmp = scratch_dir(name);
+        let mut builder = rsbinder_aidl::Builder::new().output(&tmp);
+        for (dir, (path, text)) in [("first", nested), ("second", top_level)] {
+            let file = tmp.join(dir).join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, text).unwrap();
+            builder = builder.source(file);
+        }
+        let err = builder
+            .generate()
+            .expect_err("one qualified name declared twice must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("type {qualified} is defined in both")),
+            "got: {message}"
+        );
+    }
 }
