@@ -573,8 +573,8 @@ This changelog starts at 0.9.0. For earlier releases, see the
   no room (each reload checked); a peer that rewrites the write counter is no
   longer detected by that writer. `EventFlag::wake_lazy` skips the write to
   the word when the bits already stand; `wait` fences after consuming its
-  bits so a lazy waker's counter store is seen (loom model in
-  `tests/loom_event_flag.rs`).
+  bits so a lazy waker's counter store is seen (a loom test runs both against
+  a modeled word: `src/event_flag/loom_tests.rs`).
   Every access to the shared memory — counters, ring and EventFlag word — is
   a Rust atomic (ring copies are relaxed `AtomicU8` / `AtomicUsize` loads and
   stores), so a second writer or reader, whether the peer, another handle in
@@ -831,14 +831,23 @@ after 0.12.0. The single-connection one-liners
 
 ### Fixed
 
-- **`rsbinder-aidl`: an AIDL item named `Ok`, `Err`, `Some`, `None` or
-  `Default` no longer breaks the generated code.** Such a constant or nested
-  type is an item of the generated module and shadows the std prelude there,
-  so a union's `read_from_parcel`, an `@EnforcePermission` check, a field
-  default or an `impl Default` failed to compile (E0618, E0404, E0425). The
-  generated code now names these by path (`::core::result::Result::Ok`,
-  `::core::default::Default`, …). A nested type named `Option`, `Vec`, `Box`
-  or `String` still shadows the field types that use those names.
+- **`rsbinder-aidl`: an AIDL item named `Ok`, `Err`, `Some`, `None`,
+  `Default`, `Option`, `Vec`, `Box` or `String` no longer breaks the generated
+  code.** Such a constant or nested type is an item of the generated module and
+  shadows the std prelude there, so a union's `read_from_parcel`, an
+  `@EnforcePermission` check, a field default, an `impl Default`, or any field
+  or signature of those std types failed to compile (E0618, E0404, E0425,
+  E0573). The generated code now names these by path
+  (`::core::result::Result::Ok`, `::std::vec::Vec`, …; AOSP's Rust backend
+  paths `Vec`/`Box`/`String` the same way). `#[rsbinder::interface]` prints a
+  bare `Option`/`Vec`/`Box`/`String` with the same paths. One case remains: a
+  type named `Box` nested in an interface still breaks the async service
+  trait, whose `async-trait` expansion names `Box` bare.
+- **RPC on the android-12 (r34) wire: releasing many references to one binder
+  no longer allocates a frame per reference.** The r34 `DEC_STRONG` has no
+  amount field, so `amount` frames go out, but they were built as `amount`
+  copies up front; the amount sums what the peer's messages carried, so the
+  peer sized the allocation. One frame is now built and sent `amount` times.
 - **`rsbinder-aidl`: a bidirectional control character (U+202A–U+202E,
   U+2066–U+2069) no longer reaches a generated string literal raw**, where
   rustc's deny-by-default `text_direction_codepoint_in_literal` failed the
