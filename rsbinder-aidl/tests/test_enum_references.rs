@@ -13,6 +13,13 @@
 //! `validate_enum_value`, so the author gets an AIDL diagnostic instead of rustc E0308 on the
 //! wrong-type initializer (`super::Digest::Digest::NONE`; each enum is its own newtype).
 //! `test_cross_enum_default_mismatch_is_rejected` pins this.
+//!
+//! The same suffix rule turns a constant into an enumerator: AOSP accepts `E e = B;` when the
+//! enclosing parcelable has `const int B`, because `AidlConstantValue::ValueString`
+//! (`aidl_const_expressions.cpp:647-659`) only checks that the value is a reference, then emits
+//! `E::B` — another value, or a missing name. AOSP's own test for this rule is
+//! `EnumDefaultShouldBeEnumerators` (`aidl_unittest.cpp:5647`), so rsbinder keeps rejecting it;
+//! `test_constant_as_enum_default_is_rejected` pins this.
 
 use similar::{ChangeTag, TextDiff};
 use std::error::Error;
@@ -813,5 +820,32 @@ fn test_cross_enum_default_mismatch_is_rejected() -> Result<(), Box<dyn Error>> 
         msg
     );
 
+    Ok(())
+}
+
+// Stricter than AOSP on purpose; see the module doc: "Divergence from AOSP".
+#[test]
+fn test_constant_as_enum_default_is_rejected() -> Result<(), Box<dyn Error>> {
+    // E also has a `B` with another value: AOSP would emit `E::B` (= 5) for the constant 1.
+    let ctx = rsbinder_aidl::SourceContext::new(
+        "test.aidl",
+        r#"
+        package p;
+        enum E { A = 4, B = 5 }
+        parcelable P {
+            const int B = 1;
+            E e = B;
+        }
+    "#,
+    );
+    let document = rsbinder_aidl::parse_document(&ctx)?;
+    let err = rsbinder_aidl::Generator::new(false, false)
+        .document(&document)
+        .expect_err("a constant is not an enumerator");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("enum default value 1 is not a member of target enum p.E"),
+        "{msg}"
+    );
     Ok(())
 }
