@@ -469,14 +469,16 @@ fn read_blocking_wakes_on_the_writers_notification() {
 #[test]
 fn blocking_rejects_a_request_the_queue_can_never_satisfy() {
     let mut q = MessageQueue::<u8>::create(2, true).unwrap();
+    // Bounded, so a lost capacity check fails as `TimedOut` instead of hanging.
+    let bound = Some(Duration::from_secs(5));
     assert_eq!(
-        q.write_blocking(&[0; 3], NOT_FULL, NOT_EMPTY, None)
+        q.write_blocking(&[0; 3], NOT_FULL, NOT_EMPTY, bound)
             .unwrap_err(),
         Error::BadValue("more items than the queue holds")
     );
     let mut out = [0u8; 3];
     assert_eq!(
-        q.read_blocking(&mut out, NOT_EMPTY, NOT_FULL, None)
+        q.read_blocking(&mut out, NOT_EMPTY, NOT_FULL, bound)
             .unwrap_err(),
         Error::BadValue("more items than the queue holds")
     );
@@ -801,7 +803,7 @@ fn corrupted_counters_are_reported_on_every_operation() {
         Error::Corrupted("more bytes in flight than the ring holds")
     );
     assert_eq!(
-        w.write_blocking(&[1], NOT_FULL, NOT_EMPTY, None)
+        w.write_blocking(&[1], NOT_FULL, NOT_EMPTY, Some(Duration::from_secs(5)))
             .unwrap_err(),
         Error::Corrupted("more bytes in flight than the ring holds")
     );
@@ -932,7 +934,11 @@ fn wake_merges_into_a_deferred_wake_and_wait_consumes_only_its_mask() {
     );
     // A mask covering both returns both.
     flag.wake(NOT_EMPTY).unwrap();
-    assert_eq!(flag.wait(NOT_EMPTY | 0x4, None).unwrap(), NOT_EMPTY | 0x4);
+    assert_eq!(
+        flag.wait(NOT_EMPTY | 0x4, Some(Duration::from_secs(5)))
+            .unwrap(),
+        NOT_EMPTY | 0x4
+    );
     assert_eq!(flag.peek(), 0);
     assert_eq!(
         flag.wait(0, None).unwrap_err(),
@@ -1000,7 +1006,7 @@ fn send_but_not_sync() {
 
 // ---- Ring memory is reached only through atomics --------------------------
 
-/// A plain access to ring memory cannot be observed through a real mapping: the source is read.
+/// A spelling scan of the source; Miri on `racing_copies_are_atomic_accesses` checks semantics.
 #[test]
 fn ring_code_makes_no_plain_copy_of_ring_memory() {
     // Code only: comment and doc lines may name the very calls this test forbids.
@@ -1012,7 +1018,7 @@ fn ring_code_makes_no_plain_copy_of_ring_memory() {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    const PLAIN_ACCESSES: [&str; 17] = [
+    const PLAIN_ACCESSES: [&str; 25] = [
         "copy_nonoverlapping",
         "ptr::copy",
         "copy_from_slice",
@@ -1030,12 +1036,30 @@ fn ring_code_makes_no_plain_copy_of_ring_memory() {
         "as_ref(",
         "as_mut(",
         "from_ptr_range",
+        // `*x.as_ptr() = ..` is a plain access to an atomic's bytes.
+        "as_ptr()",
+        // So is a deref of a reference turned raw pointer by any other route.
+        "as *const",
+        "as *mut",
+        "cast_mut",
+        "from_ref",
+        "from_mut",
+        "addr_of",
+        "&raw ",
     ];
-    // The queue's own `read`/`write` calls, and the counter's `&AtomicU64`.
-    const ALLOWED: [&str; 3] = [
+    // The queue's own `read`/`write` calls, the counter's `&AtomicU64`, and pointer arithmetic.
+    const ALLOWED: [&str; 11] = [
         "if self.write(items)? {",
         "if self.read(out)? {",
         "unsafe { self.ptr.as_ref() }",
+        "debug_assert_eq!(ptr.as_ptr() as usize % std::mem::align_of::<AtomicU64>(), 0);",
+        "let first = unsafe { self.ring.base.as_ptr().add(offset) };",
+        "let first = self.first.as_ptr().add(start.min(self.first_len) * q);",
+        ".as_ptr()",
+        "let head_len = ((WORD - at.as_ptr() as usize % WORD) % WORD).min(len);",
+        "let at = at.as_ptr();",
+        "unsafe { std::slice::from_raw_parts(user.as_ptr().cast(), std::mem::size_of_val(user)) }",
+        "unsafe { Run::new(NonNull::new_unchecked(at.as_ptr().add(offset)), len) }",
     ];
     for file in ["queue.rs", "ring.rs"] {
         let text = source(file);

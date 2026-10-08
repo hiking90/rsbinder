@@ -14,8 +14,13 @@ pub enum Error {
     /// Android are supported; elsewhere the crate compiles and every
     /// constructor returns this.
     Unsupported,
-    /// A descriptor, policy or argument failed a check made before any
-    /// shared memory was touched.
+    /// A descriptor, policy or argument failed a check; the failing call
+    /// moved no counter, though a `write` may already have copied items into
+    /// free ring space, which no reader sees without a commit. A commit given
+    /// a correct `n` fails this way only when another party moved this side's
+    /// counter, or the peer moved its own backwards, between begin and
+    /// commit: a protocol breach this check cannot tell apart from a wrong
+    /// `n`.
     BadValue(&'static str),
     /// The counters in shared memory violate the ring's invariant. The peer
     /// either has a defect or is hostile; the queue is unusable from here on.

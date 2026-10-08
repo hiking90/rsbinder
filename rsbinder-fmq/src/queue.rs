@@ -648,12 +648,15 @@ impl<T: Element> std::fmt::Debug for MessageQueue<T> {
 /// atomic load or store — `AtomicU8` up to the first `usize` boundary,
 /// `AtomicUsize` words after it, `AtomicU8` for the bytes left over — and
 /// the caller's slice is ordinary memory on the other side of the copy.
-/// Nothing hands out a reference into the ring.
+/// Nothing hands out a reference into the ring. The split depends only on
+/// where a run starts, which is any byte for `u8` elements, so nothing
+/// relies on the ring base's alignment.
 ///
 /// A change made to the ring from outside — the peer process, another
-/// handle in this process (a second writer, or a descriptor whose grantors
-/// overlap), C code, or `rsbinder`'s `SharedMemory` on the same fd — is
-/// another thread's relaxed store in Rust's memory model. A copy that runs
+/// handle in this process (each handle `mmap`s the memory itself: a second
+/// writer, or a descriptor whose grantors overlap), C code, or `rsbinder`'s
+/// `SharedMemory` on the same fd — is another thread's relaxed store in
+/// Rust's memory model. A copy that runs
 /// at the same time is a race between atomics, not a data race: the bytes
 /// copied out are some mix of old and new, every such pattern is a `T`
 /// (the [`Element`] contract), and the outcome is a wrong element or, when
@@ -662,8 +665,9 @@ impl<T: Element> std::fmt::Debug for MessageQueue<T> {
 /// mapping the same way.
 ///
 /// Rust's model makes unordered atomic accesses of different sizes to the
-/// same bytes a data race. Copies through one mapping never run at the same
-/// time: a `Regions` is neither `Send` nor `Sync` and borrows a
+/// same bytes a data race, and two copies from different starts split the
+/// same bytes into different sizes. Copies through one mapping never run at
+/// the same time: a `Regions` is neither `Send` nor `Sync` and borrows a
 /// `&mut MessageQueue`, which is not `Sync`.
 ///
 /// ```compile_fail,E0277

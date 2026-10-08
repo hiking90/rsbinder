@@ -5,9 +5,9 @@
 #
 #   AOSP=~/Workspace/aosp tests/cpp/build_host_peer.sh
 #
-# Needs the sparse checkout described in CLAUDE.md: system/libfmq (full),
-# system/core (libcutils, libutils), system/libbase and system/logging
-# (headers). Output goes under the workspace `target/` directory.
+# Needs system/libfmq (full), system/core (libcutils, libutils), system/libbase and
+# system/logging (headers) under $AOSP: a full tree, or one clone per project.
+# Output goes under the workspace `target/` directory.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,7 +20,7 @@ FMQ="$AOSP/system/libfmq"
 for d in "$FMQ/include" "$FMQ/base" "$AOSP/system/core/libcutils/include" \
          "$AOSP/system/core/libutils/include" "$AOSP/system/libbase/include" \
          "$AOSP/system/logging/liblog/include"; do
-    [ -d "$d" ] || { echo "missing $d (see CLAUDE.md, Local AOSP Reference Checkout)" >&2; exit 2; }
+    [ -d "$d" ] || { echo "missing $d (see the header of tests/cpp/build_host_peer.sh)" >&2; exit 2; }
 done
 
 mkdir -p "$OUT"
