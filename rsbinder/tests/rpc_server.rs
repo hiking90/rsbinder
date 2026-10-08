@@ -749,15 +749,17 @@ fn real_process_abstract_unix_socket_e2e() {
     let handles: Vec<_> = (0..3)
         .map(|_| {
             let root = Arc::clone(&root);
-            std::thread::spawn(move || root.slow(150).expect("slow round-trip"))
+            std::thread::spawn(move || root.slow(300).expect("slow round-trip"))
         })
         .collect();
     for h in handles {
         h.join().expect("thread");
     }
+    // 3 slots ~300 ms, 2 slots ~600 ms, serial ~900 ms.
+    let elapsed = t0.elapsed();
     assert!(
-        t0.elapsed() < Duration::from_millis(420),
-        "abstract fan-out across process must run 3 slow calls in parallel"
+        elapsed < Duration::from_millis(550),
+        "abstract fan-out across process must run 3 slow calls in parallel, took {elapsed:?}"
     );
 }
 
