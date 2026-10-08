@@ -78,14 +78,7 @@ impl EventFlag {
     /// Set `bits` and wake every waiter whose mask intersects the ones that
     /// were clear. `bits == 0` is a no-op.
     pub fn wake(&self, bits: u32) -> Result<()> {
-        if bits == 0 {
-            return Ok(());
-        }
-        let old = self.word().fetch_or(bits, Ordering::SeqCst);
-        if !old & bits != 0 {
-            sys::futex_wake(self.word(), bits)?;
-        }
-        Ok(())
+        wake(self.word(), bits)
     }
 
     /// [`wake`](Self::wake) for a waker that has just stored what the
@@ -104,8 +97,9 @@ impl EventFlag {
     /// returns, `fence(SeqCst)` ([`wait`](Self::wait) does this), then loads
     /// the counter. The two fences make at least one side see the other's
     /// store: either this load sees the bit cleared and wakes, or the
-    /// waiter sees the counter and does not sleep. `tests/loom_event_flag.rs`
-    /// checks that model, and that it loses a wake without either fence.
+    /// waiter sees the counter and does not sleep. A loom test
+    /// (`src/event_flag/loom_tests.rs`) runs this code and `wait` against a
+    /// modeled word, and checks that a wake is lost without either fence.
     ///
     /// A libfmq waiter (C++) has no fence between its `fetch_and` and its
     /// counter loads, so the C++ memory model alone does not promise the
@@ -118,11 +112,7 @@ impl EventFlag {
     /// isync`) does not order the RMW's store before a later load. Use
     /// [`wake`](Self::wake) where such a waiter may run.
     pub fn wake_lazy(&self, bits: u32) -> Result<()> {
-        fence(Ordering::SeqCst);
-        if bits != 0 && self.word().load(Ordering::Relaxed) & bits == bits {
-            return Ok(());
-        }
-        self.wake(bits)
+        wake_lazy(self.word(), bits)
     }
 
     /// Wait until any bit of `bits` is set, clear those bits and return them.
@@ -135,20 +125,7 @@ impl EventFlag {
 
     /// [`wait`](Self::wait) against an absolute deadline, so a retry loop keeps one deadline.
     pub(crate) fn wait_until(&self, bits: u32, deadline: Option<Timespec>) -> Result<u32> {
-        if bits == 0 {
-            return Err(Error::BadValue("empty bit mask"));
-        }
-        loop {
-            let old = self.word().fetch_and(!bits, Ordering::SeqCst);
-            let set = old & bits;
-            if set != 0 {
-                // Pairs with `wake_lazy`'s fence: the caller's next counter load sees its store.
-                fence(Ordering::SeqCst);
-                return Ok(set);
-            }
-            // Sleep only if the word is unchanged since the clear: a wake in between is kept.
-            sys::futex_wait(self.word(), old & !bits, bits, deadline.as_ref())?;
-        }
+        wait_until(self.word(), bits, deadline.as_ref())
     }
 
     /// The word as it is now, without clearing anything.
@@ -156,6 +133,84 @@ impl EventFlag {
         self.word().load(Ordering::SeqCst)
     }
 }
+
+/// Word and futex access for the protocol below, which picks every ordering; loom models it.
+pub(crate) trait FlagWord {
+    fn fetch_or(&self, bits: u32, order: Ordering) -> u32;
+    fn fetch_and(&self, bits: u32, order: Ordering) -> u32;
+    fn load(&self, order: Ordering) -> u32;
+    fn fence(&self, order: Ordering);
+    /// Sleep while the word holds `expected`, until a wake on `bits` or `deadline`.
+    fn futex_wait(&self, expected: u32, bits: u32, deadline: Option<&Timespec>) -> Result<()>;
+    fn futex_wake(&self, bits: u32) -> Result<()>;
+}
+
+impl FlagWord for AtomicU32 {
+    fn fetch_or(&self, bits: u32, order: Ordering) -> u32 {
+        AtomicU32::fetch_or(self, bits, order)
+    }
+    fn fetch_and(&self, bits: u32, order: Ordering) -> u32 {
+        AtomicU32::fetch_and(self, bits, order)
+    }
+    fn load(&self, order: Ordering) -> u32 {
+        AtomicU32::load(self, order)
+    }
+    fn fence(&self, order: Ordering) {
+        fence(order);
+    }
+    fn futex_wait(&self, expected: u32, bits: u32, deadline: Option<&Timespec>) -> Result<()> {
+        sys::futex_wait(self, expected, bits, deadline)
+    }
+    fn futex_wake(&self, bits: u32) -> Result<()> {
+        sys::futex_wake(self, bits)
+    }
+}
+
+/// [`EventFlag::wake`].
+pub(crate) fn wake<W: FlagWord + ?Sized>(word: &W, bits: u32) -> Result<()> {
+    if bits == 0 {
+        return Ok(());
+    }
+    let old = word.fetch_or(bits, Ordering::SeqCst);
+    if !old & bits != 0 {
+        word.futex_wake(bits)?;
+    }
+    Ok(())
+}
+
+/// [`EventFlag::wake_lazy`].
+pub(crate) fn wake_lazy<W: FlagWord + ?Sized>(word: &W, bits: u32) -> Result<()> {
+    word.fence(Ordering::SeqCst);
+    if bits != 0 && word.load(Ordering::Relaxed) & bits == bits {
+        return Ok(());
+    }
+    wake(word, bits)
+}
+
+/// [`EventFlag::wait_until`].
+pub(crate) fn wait_until<W: FlagWord + ?Sized>(
+    word: &W,
+    bits: u32,
+    deadline: Option<&Timespec>,
+) -> Result<u32> {
+    if bits == 0 {
+        return Err(Error::BadValue("empty bit mask"));
+    }
+    loop {
+        let old = word.fetch_and(!bits, Ordering::SeqCst);
+        let set = old & bits;
+        if set != 0 {
+            // Pairs with `wake_lazy`'s fence: the caller's next counter load sees its store.
+            word.fence(Ordering::SeqCst);
+            return Ok(set);
+        }
+        // Sleep only if the word is unchanged since the clear: a wake in between is kept.
+        word.futex_wait(old & !bits, bits, deadline)?;
+    }
+}
+
+#[cfg(all(test, loom))]
+mod loom_tests;
 
 impl std::fmt::Debug for EventFlag {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

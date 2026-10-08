@@ -185,6 +185,9 @@ tier_hermetic() {
     run "tests: prelude_shadow" tpass cargo test -p tests --test prelude_shadow
     linux_run "tests: c_stream_header" tpass cargo test -p tests --test c_stream_header
     run "rsbinder-fmq" tpass cargo test -p rsbinder-fmq
+    # CI does not run loom; a target dir of its own, since the cfg rebuilds every dependency.
+    run "rsbinder-fmq loom (EventFlag)" tpass env CARGO_TARGET_DIR=target/loom \
+        RUSTFLAGS="--cfg loom" cargo test -p rsbinder-fmq --lib --release loom
     run "rsbinder-tools" tpass cargo test -p rsbinder-tools
 
     run "rpc build matrix" rpc_build_matrix

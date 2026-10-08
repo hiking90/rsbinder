@@ -40,8 +40,10 @@ libc = { workspace = true }
 # over a unix socket (`SCM_RIGHTS`), independent of binder (`plans/12-fmq.md`).
 rustix = { workspace = true, features = ["net"] }
 
-# loom is only used by tests gated on `--cfg loom`. Run with:
-#   RUSTFLAGS="--cfg loom" cargo test -p rsbinder-fmq --test loom_event_flag --release
-# Without the cfg the gated file compiles to an empty crate.
+# loom is only used by the unit tests gated on `--cfg loom` (`src/event_flag/loom_tests.rs`).
+# Run with (a target dir of its own: the cfg rebuilds every dependency):
+#   CARGO_TARGET_DIR=target/loom RUSTFLAGS="--cfg loom" \
+#       cargo test -p rsbinder-fmq --lib --release loom
+# Without the cfg the module is not compiled.
 [target.'cfg(loom)'.dev-dependencies]
 loom = "0.7"
