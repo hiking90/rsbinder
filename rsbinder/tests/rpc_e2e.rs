@@ -1142,3 +1142,193 @@ fn a_reply_refused_before_its_first_byte_goes_back_as_a_status() {
     }
     assert!(wrong.is_empty(), "(wire, code, (status, ping)): {wrong:?}");
 }
+
+// ---- a oneway-only client past the server's DEC_STRONG hold ----
+
+/// Socket buffers this small fill within a few hundred `DEC_STRONG` frames on any platform.
+const SMALL_SOCKET_BUFFER: usize = 4096;
+
+/// Fills both directions of a macOS loopback TCP connection past the hold (20 000 did not).
+const PAST_THE_HOLD: usize = 40_000;
+
+/// A run that drains takes about a second; one that does not never ends.
+const FLOOD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+fn small_buffers<F: std::os::fd::AsFd>(s: F) -> F {
+    rustix::net::sockopt::set_socket_send_buffer_size(&s, SMALL_SOCKET_BUFFER).expect("SO_SNDBUF");
+    rustix::net::sockopt::set_socket_recv_buffer_size(&s, SMALL_SOCKET_BUFFER).expect("SO_RCVBUF");
+    s
+}
+
+/// The server's end, then the client's.
+type Ends = (Box<dyn RpcTransport>, Box<dyn RpcTransport>);
+
+fn small_unix_ends() -> Ends {
+    let (a, b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+    (
+        Box::new(UnixTransport::from_stream(small_buffers(a)).expect("server end")),
+        Box::new(UnixTransport::from_stream(small_buffers(b)).expect("client end")),
+    )
+}
+
+fn new_child() -> SIBinder {
+    Interface::as_binder(&Binder::new(BnChild(Box::new(ChildSvc {
+        name: String::new(),
+    }))))
+}
+
+/// Oneways with new binders past the server's hold drain ("Draining sends"); a twoway frees all.
+fn oneway_flood_past_the_hold(name: &str, ends: Ends, wire: Wire, fd: FdMode) {
+    let (a, b) = ends;
+    let (server, client) = match wire {
+        Wire::R34 => (
+            RpcSession::new(a, AddressSpace::Acceptor).expect("server"),
+            RpcSession::new(b, AddressSpace::Initiator).expect("client"),
+        ),
+        Wire::A13(v) => {
+            let unix = fd == FdMode::Unix;
+            let accept = thread::spawn(move || {
+                RpcSession::accept_android13plus_fd(a, v, unix).expect("accept")
+            });
+            let client = RpcSession::connect_android13plus_fd(b, v, fd).expect("connect");
+            (accept.join().expect("accept thread"), client)
+        }
+    };
+    server.set_root(make_root()).expect("set_root");
+    let server_for_thread = server.clone();
+    let serve = thread::spawn(move || {
+        let _ = server_for_thread.serve_blocking();
+    });
+    let root = client.get_root().expect("get_root");
+
+    let n = RpcSession::__held_dec_strong_limit() + PAST_THE_HOLD;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let flood = {
+        let root = root.clone();
+        thread::spawn(move || {
+            let rp = rpc_of(&root);
+            let sent = (0..n).try_for_each(|_| {
+                let mut d = rp.build_request(ISMOKE_DESC)?;
+                d.write(&new_child())?;
+                rp.transact(TX_PASS_BINDER, &d, rsbinder::FLAG_ONEWAY)
+                    .map(drop)
+            });
+            let _ = tx.send(sent);
+        })
+    };
+    let outcome = rx.recv_timeout(FLOOD_DEADLINE);
+    if outcome.is_err() {
+        // Wakes both blocked writers, so the threads can be joined.
+        client.close_session();
+        server.close_session();
+    }
+    flood.join().expect("flood thread");
+    assert!(
+        matches!(outcome, Ok(Ok(()))),
+        "{name}: {n} oneways did not go out within {FLOOD_DEADLINE:?}: {outcome:?}"
+    );
+
+    assert_eq!(SmokeProxy(root.clone()).echo("flush").unwrap(), "flush");
+    assert!(
+        poll_until(|| client.local_node_count() == 0),
+        "{name}: children the server dropped and the client still holds: {}",
+        client.local_node_count()
+    );
+    drop(root);
+    client.close_session();
+    serve.join().expect("serve thread");
+}
+
+#[test]
+fn a_oneway_only_client_drains_past_the_hold_r34_unix() {
+    oneway_flood_past_the_hold("r34 unix", small_unix_ends(), Wire::R34, FdMode::None);
+}
+
+#[test]
+fn a_oneway_only_client_drains_past_the_hold_android13plus_unix() {
+    // `Unix` fd mode: the send goes through the `SCM_RIGHTS`-capable path.
+    oneway_flood_past_the_hold("a13 unix", small_unix_ends(), Wire::A13(2), FdMode::Unix);
+}
+
+#[cfg(feature = "rpc-tcp-debug")]
+#[test]
+fn a_oneway_only_client_drains_past_the_hold_android13plus_tcp_debug() {
+    use rsbinder::rpc::transport::TcpDebugTransport;
+    use rustix::net::{AddressFamily, SocketType};
+    // Sized before the handshake, which fixes the window scale; the accepted socket inherits.
+    let listener = small_buffers(TcpDebugTransport::bind_loopback().expect("bind loopback"));
+    let sock = small_buffers(
+        rustix::net::socket(AddressFamily::INET, SocketType::STREAM, None).expect("socket"),
+    );
+    rustix::net::connect(&sock, &listener.local_addr().expect("address")).expect("connect");
+    let client = std::net::TcpStream::from(sock);
+    let (server, _) = listener.accept().expect("accept");
+    let ends: Ends = (
+        Box::new(TcpDebugTransport::from_stream(small_buffers(server)).expect("server end")),
+        Box::new(TcpDebugTransport::from_stream(small_buffers(client)).expect("client end")),
+    );
+    oneway_flood_past_the_hold("a13 tcp_debug", ends, Wire::A13(2), FdMode::None);
+}
+
+#[cfg(feature = "rpc-tls")]
+mod tls_flood {
+    use super::*;
+    use rsbinder::rpc::rustls::pki_types::pem::PemObject;
+    use rsbinder::rpc::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use rsbinder::rpc::rustls::{ClientConfig, RootCertStore, ServerConfig};
+    use rsbinder::rpc::transport::TlsTransport;
+    use std::sync::Arc;
+
+    const CA: &str = include_str!("tls_fixtures/ca.crt");
+    const SRV_CRT: &str = include_str!("tls_fixtures/srv.crt");
+    const SRV_KEY: &str = include_str!("tls_fixtures/srv.key");
+
+    fn certs(pem: &str) -> Vec<CertificateDer<'static>> {
+        CertificateDer::pem_slice_iter(pem.as_bytes())
+            .collect::<std::result::Result<_, _>>()
+            .expect("parse certs")
+    }
+
+    /// TLS over a small-buffered unix socketpair, both handshakes done.
+    fn small_tls_ends() -> Ends {
+        let (s_srv, s_cli) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let (s_srv, s_cli) = (small_buffers(s_srv), small_buffers(s_cli));
+        let srv_cfg = Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    certs(SRV_CRT),
+                    PrivateKeyDer::from_pem_slice(SRV_KEY.as_bytes()).expect("key"),
+                )
+                .expect("server config"),
+        );
+        let server = thread::spawn(move || {
+            TlsTransport::accept_stream(Box::new(s_srv), srv_cfg).expect("server handshake")
+        });
+        let mut roots = RootCertStore::empty();
+        for c in certs(CA) {
+            roots.add(c).expect("add ca");
+        }
+        let cli_cfg = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let client = TlsTransport::connect_stream(Box::new(s_cli), "localhost", cli_cfg)
+            .expect("client handshake");
+        (
+            Box::new(server.join().expect("server thread")),
+            Box::new(client),
+        )
+    }
+
+    #[test]
+    fn a_oneway_only_client_drains_past_the_hold_android13plus_tls() {
+        oneway_flood_past_the_hold("a13 tls", small_tls_ends(), Wire::A13(2), FdMode::None);
+    }
+
+    #[test]
+    fn a_oneway_only_client_drains_past_the_hold_r34_tls() {
+        oneway_flood_past_the_hold("r34 tls", small_tls_ends(), Wire::R34, FdMode::None);
+    }
+}

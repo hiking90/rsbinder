@@ -2575,9 +2575,9 @@ fn rpc_stack_has_no_globals() {
                     continue;
                 }
                 // Only a `static` *item* counts; `&'static str` also contains "static ".
-                let static_item = (l.contains("static ") || l.starts_with("static"))
-                    && !l.contains("'static")
-                    && !l.contains("static_assertions");
+                let code = l.replace("'static", "");
+                let static_item = (code.contains("static ") || code.starts_with("static"))
+                    && !code.contains("static_assertions");
                 let has_global = static_item
                     || l.contains("OnceLock")
                     || l.contains("lazy_static")
@@ -2593,6 +2593,10 @@ fn rpc_stack_has_no_globals() {
                     }
                     // `DRIVING`: a per-thread nesting marker with no session data.
                     if name == "session.rs" && line.contains("DRIVING") {
+                        continue;
+                    }
+                    // `ARMED_READ`: this thread's live deadline guards, emptied as they drop.
+                    if name == "session.rs" && line.contains("ARMED_READ") {
                         continue;
                     }
                     offenders.push(format!("{name}:{}: {}", lineno + 1, line.trim()));

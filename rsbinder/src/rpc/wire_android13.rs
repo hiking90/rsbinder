@@ -245,6 +245,25 @@ const CMD_TRANSACT: u32 = 0;
 const CMD_REPLY: u32 = 1;
 const CMD_DEC_STRONG: u32 = 2;
 
+/// AOSP `processCommand(CONTROL_ONLY)` judged on the header alone: `None` admits the message.
+pub(crate) fn control_only_refusal(header: &[u8]) -> Option<(crate::StatusCode, &'static str)> {
+    use crate::StatusCode;
+    let command = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+    let body_size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+    match command {
+        // android-17.0.0_r1 `RpcState.cpp:973-978`.
+        CMD_TRANSACT => Some((StatusCode::BadType, "a TRANSACT")),
+        // `processDecStrong`, `RpcState.cpp:1395-1400`.
+        CMD_DEC_STRONG if body_size != A13_DEC_STRONG_LEN => {
+            Some((StatusCode::BadValue, "a DEC_STRONG of the wrong size"))
+        }
+        CMD_DEC_STRONG => None,
+        // No `REPLY` case there: the unknown-command arm, `RpcState.cpp:986-996`.
+        CMD_REPLY => Some((StatusCode::DeadObject, "a REPLY")),
+        _ => Some((StatusCode::DeadObject, "an unknown command")),
+    }
+}
+
 /// `RPC_WIRE_ADDRESS_OPTION_*` (RpcWireFormat.h).
 const ADDR_OPTION_CREATED: u32 = 1 << 0;
 const ADDR_OPTION_FOR_SERVER: u32 = 1 << 1;
@@ -850,8 +869,17 @@ pub fn write_aosp_message<W: Write>(w: &mut W, msg: &[u8]) -> RpcResult<()> {
 /// `[header | body]`, exactly what [`Android13PlusCodec::decode_message`]
 /// expects.
 pub fn read_aosp_message<R: Read>(r: &mut R) -> RpcResult<Vec<u8>> {
+    read_aosp_message_gated(r, |_| Ok(()))
+}
+
+/// [`read_aosp_message`] that lets `gate` refuse the header before any body byte is read.
+pub(crate) fn read_aosp_message_gated<R: Read>(
+    r: &mut R,
+    gate: impl FnOnce(&[u8]) -> RpcResult<()>,
+) -> RpcResult<Vec<u8>> {
     let mut header = [0u8; WIRE_HEADER_LEN];
     read_exact_into(r, &mut header)?;
+    gate(&header)?;
     let body_size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
     if body_size > MAX_FRAME_LEN {
         return Err(RpcError::FrameTooLarge {
@@ -877,10 +905,12 @@ pub fn read_aosp_message<R: Read>(r: &mut R) -> RpcResult<Vec<u8>> {
 /// `sendmsg` (AOSP `RpcTransportRaw`). With `fds` empty this is exactly
 /// [`write_aosp_message`] on the transport's raw channel (byte-identical
 /// to the no-FD android-13+ path).
+/// With `drain`, the send reads while it waits (`RpcTransport::send_raw_draining`).
 pub fn write_aosp_message_with_fds(
     t: &dyn super::transport::RpcTransport,
     msg: &[u8],
     fds: &[std::os::fd::BorrowedFd<'_>],
+    drain: Option<&mut dyn FnMut() -> RpcResult<()>>,
 ) -> RpcResult<()> {
     if msg.len() < WIRE_HEADER_LEN {
         return Err(RpcError::Protocol("message shorter than RpcWireHeader"));
@@ -891,7 +921,10 @@ pub fn write_aosp_message_with_fds(
             max: MAX_FRAME_LEN,
         });
     }
-    t.send_raw_with_fds(msg, fds)
+    match drain {
+        Some(drain) => t.send_raw_draining(msg, fds, drain),
+        None => t.send_raw_with_fds(msg, fds),
+    }
 }
 
 /// [`read_aosp_message`] + the `SCM_RIGHTS` fds delivered with it.
@@ -905,8 +938,10 @@ pub fn write_aosp_message_with_fds(
 /// a short read after partial progress ⇒ [`RpcError::Truncated`]
 /// (mirrors [`read_aosp_message`]). `recv` is one `recvmsg`
 /// (`RpcTransport::recv_raw_with_fds`).
+/// `gate` may refuse the header before any body byte is read.
 pub fn read_aosp_message_with_fds(
     mut recv: impl FnMut(&mut [u8]) -> RpcResult<(usize, Vec<std::os::fd::OwnedFd>)>,
+    gate: impl FnOnce(&[u8]) -> RpcResult<()>,
 ) -> RpcResult<(Vec<u8>, Vec<std::os::fd::OwnedFd>)> {
     let mut fds: Vec<std::os::fd::OwnedFd> = Vec::new();
     let mut total_read = 0usize;
@@ -936,6 +971,7 @@ pub fn read_aosp_message_with_fds(
 
     let mut header = [0u8; WIRE_HEADER_LEN];
     fill(&mut header)?;
+    gate(&header)?;
     let body_size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
     if body_size > MAX_FRAME_LEN {
         return Err(RpcError::FrameTooLarge {

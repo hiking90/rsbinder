@@ -444,6 +444,96 @@ pub trait RpcTransport: Send + Sync {
     fn recv_raw_with_fds(&self, buf: &mut [u8]) -> RpcResult<(usize, Vec<std::os::fd::OwnedFd>)> {
         Ok((self.recv_raw(buf)?, Vec::new()))
     }
+
+    /// [`send_raw_with_fds`](Self::send_raw_with_fds) for a transaction,
+    /// reading the connection while the send waits for room.
+    ///
+    /// A peer can write a `DEC_STRONG` on a connection that this end only
+    /// sends on. AOSP `RpcSession::ExclusiveConnection::find` does so when
+    /// no other connection is free (android-17.0.0_r1
+    /// `RpcSession.cpp:933-942`), and an rsbinder server does so for a
+    /// oneway's `DEC_STRONG`s once it holds its limit of them. If this end
+    /// does not read there, the peer's send buffer fills, the peer's serve
+    /// loop stops in that write and reads nothing more, and this send then
+    /// blocks too. AOSP's transaction write therefore reads instead of only
+    /// waiting: each time the write would block it runs
+    /// `drainCommands(CONTROL_ONLY)`, which handles the `DEC_STRONG`s
+    /// waiting on the connection (`RpcState::transactAddress`,
+    /// android-17.0.0_r1 `RpcState.cpp:703-748`).
+    ///
+    /// An implementation calls `drain` whenever the send cannot go on and
+    /// bytes from the peer are waiting, or the peer has closed. `drain` reads
+    /// one message whole, waiting for the rest of it if needed, and the send
+    /// is retried after it. An error from `drain` ends the send with that
+    /// error. A send deadline ([`set_write_timeout`](Self::set_write_timeout))
+    /// still bounds each wait in which no byte goes out, with the errors a
+    /// blocking send gives. A failure on the read side, the transport's own
+    /// or `drain`'s, is never reported as [`RpcError::Protocol`] or
+    /// [`RpcError::FrameTooLarge`]: those two mean nothing was sent, and the
+    /// session keeps a connection whose send failed with them.
+    ///
+    /// The default is `send_raw_with_fds`, which never calls `drain`; a
+    /// transport that keeps it can stall as described above.
+    ///
+    /// `unix`, `tcp_debug` and `vsock` send without blocking; when the send
+    /// buffer is full they wait in `poll` for room or input and hand input
+    /// to `drain`. `SO_SNDTIMEO` bounds each such wait as it bounds a
+    /// blocking send. XNU ignores `MSG_DONTWAIT` on a send (a unix-socket
+    /// `sendmsg` with it blocks), so on Apple platforms the socket is made
+    /// `O_NONBLOCK` for that one call and its flags are restored after it.
+    ///
+    /// `tls` writes each chunk's ciphertext to `TlsStream::socket` without
+    /// blocking, under the same write lock as its other sends. When the
+    /// socket is full it reads whatever the socket holds without blocking,
+    /// and once rustls has plaintext (or the peer has closed) it calls
+    /// `drain`. The control records that read queues go out with the next
+    /// chunk, so records stay in sequence order. With no input it `poll`s
+    /// for room or input. A stream whose `socket` is `None` sends without
+    /// reading.
+    fn send_raw_draining(
+        &self,
+        buf: &[u8],
+        fds: &[std::os::fd::BorrowedFd<'_>],
+        drain: &mut dyn FnMut() -> RpcResult<()>,
+    ) -> RpcResult<()> {
+        let _ = drain;
+        self.send_raw_with_fds(buf, fds)
+    }
+
+    /// [`send_raw_draining`](Self::send_raw_draining) for the length-framed
+    /// r34 profile: [`send_frame_with_fds`](Self::send_frame_with_fds) that
+    /// calls `drain` as that method describes. The default is
+    /// `send_frame_with_fds`, which never calls `drain`.
+    fn send_frame_draining(
+        &self,
+        buf: &[u8],
+        fds: &[std::os::fd::BorrowedFd<'_>],
+        drain: &mut dyn FnMut() -> RpcResult<()>,
+    ) -> RpcResult<()> {
+        let _ = drain;
+        self.send_frame_with_fds(buf, fds)
+    }
+}
+
+/// A draining send's read-side failure, kept out of the two "nothing was sent" variants.
+pub(crate) fn read_side_failure(e: RpcError) -> RpcError {
+    match e {
+        RpcError::Protocol(_) | RpcError::FrameTooLarge { .. } => {
+            RpcError::Io(std::io::Error::other(e.to_string()))
+        }
+        e => e,
+    }
+}
+
+/// The length prefix of the shared stream frame, refusing a body past `MAX_FRAME_LEN`.
+pub(crate) fn frame_header(buf: &[u8]) -> RpcResult<[u8; 4]> {
+    if buf.len() > MAX_FRAME_LEN {
+        return Err(RpcError::FrameTooLarge {
+            declared: buf.len(),
+            max: MAX_FRAME_LEN,
+        });
+    }
+    Ok((buf.len() as u32).to_le_bytes())
 }
 
 /// Identity of the peer on the other end of a [`RpcTransport`].

@@ -25,7 +25,8 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::{read_frame, unix::send_frame_vectored, PeerIdentity, RpcTransport};
+use super::unix::{send_draining, send_frame_vectored};
+use super::{read_frame, PeerIdentity, RpcTransport};
 use crate::rpc::RpcResult;
 
 /// Set on the first `TcpDebugTransport` construction; gates the one-time warning, read by tests.
@@ -131,6 +132,42 @@ impl TcpDebugTransport {
 impl RpcTransport for TcpDebugTransport {
     fn send_frame(&self, buf: &[u8]) -> RpcResult<()> {
         send_frame_vectored(self.stream.as_fd(), buf, &[])
+    }
+
+    // No fd passing: `fds` reaches only the trait's refusing default.
+    fn send_raw_draining(
+        &self,
+        buf: &[u8],
+        fds: &[std::os::fd::BorrowedFd<'_>],
+        drain: &mut dyn FnMut() -> RpcResult<()>,
+    ) -> RpcResult<()> {
+        if !fds.is_empty() {
+            return self.send_raw_with_fds(buf, fds);
+        }
+        send_draining(
+            self.stream.as_fd(),
+            &mut [std::io::IoSlice::new(buf)],
+            &[],
+            drain,
+        )
+    }
+
+    fn send_frame_draining(
+        &self,
+        buf: &[u8],
+        fds: &[std::os::fd::BorrowedFd<'_>],
+        drain: &mut dyn FnMut() -> RpcResult<()>,
+    ) -> RpcResult<()> {
+        if !fds.is_empty() {
+            return self.send_frame_with_fds(buf, fds);
+        }
+        let header = super::frame_header(buf)?;
+        send_draining(
+            self.stream.as_fd(),
+            &mut [std::io::IoSlice::new(&header), std::io::IoSlice::new(buf)],
+            &[],
+            drain,
+        )
     }
 
     fn recv_frame(&self) -> RpcResult<Vec<u8>> {

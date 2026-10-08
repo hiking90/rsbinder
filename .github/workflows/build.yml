@@ -286,6 +286,7 @@ jobs:
           cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_tls --test rpc_transport_conformance
           t cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_server -- --exact tls_android13plus_nested_callback_e2e
           t cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_server -- --exact preconnected_inet_fd_handshakes_over_tcp_debug
+          t cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_e2e -- drains_past_the_hold_android13plus_tcp_debug tls_flood::
       - name: TCP links cut inside a network namespace (plan 2-24 §5.2)
         # `rpc_link_break` reruns itself under `unshare -rn` and drops a
         # port's packets with `nft`, so that keepalive and TCP_USER_TIMEOUT
@@ -503,6 +504,7 @@ jobs:
           cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_tls --test rpc_transport_conformance
           t cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_server -- --exact tls_android13plus_nested_callback_e2e
           t cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_server -- --exact preconnected_inet_fd_handshakes_over_tcp_debug
+          t cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_e2e -- drains_past_the_hold_android13plus_tcp_debug tls_flood::
           cargo test -p rsbinder --features rpc,android_16 --test rpc_accessor
       - name: Reconnecting over RPC (tests crate — plan 10-10b)
         # Before each call on the default `unix://…#name` session the helper
