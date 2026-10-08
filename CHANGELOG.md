@@ -705,7 +705,12 @@ This changelog starts at 0.9.0. For earlier releases, see the
   Any argument name is accepted.
 - **`@deprecated` support.** `rsbinder-aidl` emits a `/** @deprecated note */`
   javadoc as `#[deprecated = "note"]` (AOSP `FindDeprecated` rules), and
-  `rsbinder-macros` carries `#[deprecated]` through as AIDL `@deprecated`
+  searches the same comments AOSP merges into the declaration: those before
+  each annotation and the keyword (or `oneway`), and for a member before its
+  type and, for a method, its name — so `@VintfStability /** @deprecated */
+  parcelable P` is deprecated, while a comment before a field's name or
+  between `oneway` and `interface` is not. `rsbinder-macros` carries
+  `#[deprecated]` through as AIDL `@deprecated`
   (`since` / `note = …` are refused). `render::deprecated_attr` is public.
 - **`rsbinder-macros`: the signature checks cover every out/inout and `in`
   array shape `.aidl` renders.**
