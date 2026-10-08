@@ -2188,14 +2188,11 @@ fn test_hub() {
 ///     as the `recv_timeout` firing — a bounded test failure, not an
 ///     indefinite hang.
 ///  2. **Single-Arc convergence.** Every concurrent slow-path
-///     winner/loser must end up sharing one cached proxy identity
-///     (the race-resolution table's whole purpose).
+///     winner/loser must end up sharing one cached proxy identity.
 ///
 /// The rsbinder-crate unit tests cover the same logic with a
 /// `cfg(test)` hook; this one adds coverage over a real kernel binder
-/// path and runs inside the integration-test.yml 100-iteration loop,
-/// so it also accumulates cross-iteration cache state (case (b)
-/// resurrection).
+/// path and runs inside the integration-test.yml 100-iteration loop.
 #[test]
 #[cfg_attr(
     not(any(target_os = "linux", target_os = "android")),
@@ -2255,17 +2252,7 @@ fn test_concurrent_service_resolution_slow_path_no_deadlock() {
 /// }
 /// ```
 ///
-/// Under the cache-pin model introduced by this PR, `dec_weak()` is a
-/// no-op on proxies — kernel weak refs are owned by the process-wide
-/// cache pin, not by user-side `WIBinder` clones. The test now
-/// vacuously demonstrates that lookup-after-zero is structurally safe:
-/// the cache `Weak<ProxyHandle>` may dangle, but the cache pin keeps
-/// `binder_ref(handle).weak >= 1`, so resurrection (slow-path case (b))
-/// reuses the cached descriptor and issues a fresh `BC_ACQUIRE` against
-/// a still-alive kernel slot. The `dec_weak()` calls below are kept as
-/// non-functional historical markers — if a future change accidentally
-/// re-introduces a code path where `dec_weak` is non-trivial on
-/// proxies, this test will exercise it.
+/// `dec_weak()` below is a no-op on proxies (the cache pin owns the kernel weak ref); a marker.
 #[test]
 #[cfg_attr(
     not(any(target_os = "linux", target_os = "android")),
@@ -2616,31 +2603,10 @@ fn test_kernel_strong_ref_count_one_per_proxy_handle() {
     );
 }
 
-/// Race reproducer for slow-path case (b).
-///
-/// Without the cache-pin model, under aggressive concurrency the cache
-/// could hand out a fresh `ProxyHandle` whose handle had been freed
-/// by a racing `BC_RELEASE`, surfacing as `DeadObject` / `BadType` /
-/// wrong descriptor. Under the cache-pin model the cache pin keeps
-/// the kernel slot alive across `strong = 0` windows, so every
-/// resurrection (case b) succeeds and yields the original descriptor.
-///
-/// Stress strategy:
-///
-/// - **High thread count** (N=16): two threads per typical CI vCPU
-///   on a 2-vCPU runner, ample preemption pressure.
-/// - **Real transactions** (every iteration): each iteration runs an
-///   actual `RepeatString` transaction. If a race surfaced as a
-///   freed-but-cached handle, the kernel would reject the transaction
-///   with `DeadObject`, surfacing as a panic on the `expect("RepeatString
-///   must succeed")` instead of a silent descriptor-only check.
-/// - **Arc-identity invariant** (every iteration): two back-to-back
-///   lookups must yield the same `ProxyHandle` allocation while at
-///   least one Strong is alive. This catches a regression where the
-///   resurrection path accidentally allocates a fresh `ProxyHandle`
-///   while another thread still holds one.
-/// - **Immediate drop** drives the cache `Weak` to dangling between
-///   iterations, so subsequent lookups exercise case (b).
+/// `ITestService` node registered for the reproducer alone. Must match `test_service.rs`.
+const CACHE_PIN_SERVICE_NAME: &str = "rsbinder.test.cache_pin";
+
+/// Per round, one thread's last proxy or `WIBinder` drop races 15 threads' lookups (cases (a)/(b)).
 #[test]
 #[cfg_attr(
     not(any(target_os = "linux", target_os = "android")),
@@ -2649,79 +2615,93 @@ fn test_kernel_strong_ref_count_one_per_proxy_handle() {
 fn test_cache_pin_race_reproducer_no_descriptor_mismatch() {
     init_test();
 
-    // Pre-resolve once to ensure the service is registered and a cache
-    // entry exists; subsequent threads will mostly hit the read fast
-    // path or case (b).
-    let _seed = get_test_service();
+    // Fails fast if the service is missing; dropped so the workers start with no live proxy.
+    drop(
+        hub::try_get_service(CACHE_PIN_SERVICE_NAME)
+            .expect("service manager")
+            .unwrap_or_else(|| panic!("{CACHE_PIN_SERVICE_NAME} is not registered")),
+    );
 
     const N: usize = 16;
     const K: usize = 100;
     let expected = <BpTestService as ITestService::ITestService>::descriptor().to_string();
+    let barrier = Arc::new(std::sync::Barrier::new(N));
     let mut handles = Vec::with_capacity(N);
-    for _ in 0..N {
+    for t in 0..N {
         let expected = expected.clone();
+        let barrier = barrier.clone();
         handles.push(std::thread::spawn(move || {
+            // Failures and panics are collected, so no thread leaves the others at the barrier.
+            let mut failures = Vec::new();
+            let mut held_proxy: Option<SIBinder> = None;
+            let mut held_weak: Option<WIBinder> = None;
             for i in 0..K {
-                let svc: rsbinder::Strong<dyn ITestService::ITestService> = hub::try_get_interface(
-                    <BpTestService as ITestService::ITestService>::descriptor(),
-                )
-                .expect("service manager")
-                .expect("the test service must be registered");
-                let binder1 = svc.as_binder();
-                let actual = binder1.descriptor().to_string();
-                assert_eq!(
-                    actual, expected,
-                    "iteration {i}: descriptor mismatch; got '{actual}' expected '{expected}'"
-                );
-
-                // Arc-identity invariant: a second lookup MUST return
-                // the same ProxyHandle while `svc` (and hence its
-                // Arc<ProxyHandle>) is alive. Production cache stores
-                // sync::Weak<ProxyHandle> exactly so that two
-                // concurrent lookups yielding live Arcs share the
-                // same allocation.
-                let svc2: rsbinder::Strong<dyn ITestService::ITestService> =
-                    hub::try_get_interface(
-                        <BpTestService as ITestService::ITestService>::descriptor(),
-                    )
-                    .expect("service manager")
-                    .expect("the test service must be registered (second lookup)");
-                assert_eq!(
-                    svc.as_binder(),
-                    svc2.as_binder(),
-                    "iteration {i}: Arc-identity invariant broken — two concurrent \
-                     lookups yielded different ProxyHandle allocations while both \
-                     Strong<ITestService> were alive"
-                );
-                drop(svc2);
-
-                // Real transaction — if the handle were freed-but-cached
-                // (the race this PR closes), the kernel would reject
-                // and `expect` would panic.
-                let echoed = svc
-                    .RepeatString("rsbinder-cache-pin")
-                    .expect("RepeatString must succeed across resurrections");
-                assert_eq!(echoed, "rsbinder-cache-pin");
-
-                // Immediate drop drives the cache `Weak` to dangling
-                // before the next iteration in this thread (and
-                // potentially before another thread's lookup).
+                barrier.wait();
+                let round = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if held_proxy.is_some() || held_weak.is_some() {
+                        // Sweeps the drop across the others' servicemanager round trip.
+                        std::thread::sleep(std::time::Duration::from_micros((i % 8) as u64 * 25));
+                        drop(held_proxy.take());
+                        drop(held_weak.take());
+                    }
+                    cache_pin_race_round(i, &expected)
+                }))
+                .unwrap_or_else(|payload| {
+                    let msg = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_default();
+                    Err(format!("iteration {i}: panicked: {msg}"))
+                });
+                match round {
+                    Ok(binder) if (i + 1) % N == t && i % 2 == 0 => held_proxy = Some(binder),
+                    Ok(binder) if (i + 1) % N == t => {
+                        held_weak = Some(SIBinder::downgrade(&binder));
+                    }
+                    Ok(_) => {}
+                    Err(e) => failures.push(e),
+                }
             }
+            failures
         }));
     }
-    for h in handles {
-        h.join().expect("worker thread must not panic");
+    let failures: Vec<String> = handles
+        .into_iter()
+        .flat_map(|h| h.join().expect("worker thread must not panic"))
+        .collect();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// One reproducer round: lookup, descriptor, a second lookup's identity, a real transaction.
+fn cache_pin_race_round(i: usize, expected: &str) -> std::result::Result<SIBinder, String> {
+    type Svc = rsbinder::Strong<dyn ITestService::ITestService>;
+    let lookup = || -> std::result::Result<Svc, String> {
+        hub::try_get_interface(CACHE_PIN_SERVICE_NAME)
+            .map_err(|e| format!("iteration {i}: service manager: {e:?}"))?
+            .ok_or_else(|| format!("iteration {i}: {CACHE_PIN_SERVICE_NAME} is not registered"))
+    };
+    let svc = lookup()?;
+    let binder = svc.as_binder();
+    let actual = binder.descriptor();
+    if actual != expected {
+        return Err(format!(
+            "iteration {i}: descriptor '{actual}', expected '{expected}'"
+        ));
+    }
+    if lookup()?.as_binder() != binder {
+        return Err(format!(
+            "iteration {i}: two live lookups gave different ProxyHandles"
+        ));
+    }
+    // A freed-but-cached handle fails this transaction.
+    match svc.RepeatString("rsbinder-cache-pin") {
+        Ok(echoed) if echoed == "rsbinder-cache-pin" => Ok(binder),
+        other => Err(format!("iteration {i}: RepeatString gave {other:?}")),
     }
 }
 
-/// Barrier-coordinated case (b) variant.
-///
-/// Tighter than the bulk reproducer: explicitly drives the cache
-/// `Weak` to dangling between rounds, then re-resolves to force
-/// case (b). Each round resurrects from the cached descriptor (no
-/// new INTERFACE_TRANSACTION, no new BC_INCREFS). Verifies the
-/// resurrection succeeds and yields a binder with the original
-/// descriptor.
+/// Sequential case (b): a `WIBinder` kept from round 0 holds the pin, so each round revives it.
 #[test]
 #[cfg_attr(
     not(any(target_os = "linux", target_os = "android")),
@@ -2730,6 +2710,7 @@ fn test_cache_pin_race_reproducer_no_descriptor_mismatch() {
 fn test_cache_pin_case_b_resurrection_round_trip() {
     init_test();
     let canonical = <BpTestService as ITestService::ITestService>::descriptor().to_string();
+    let mut kept: Option<WIBinder> = None;
 
     for round in 0..50 {
         let svc: rsbinder::Strong<dyn ITestService::ITestService> =
@@ -2744,8 +2725,14 @@ fn test_cache_pin_case_b_resurrection_round_trip() {
         svc.as_binder()
             .ping_binder()
             .expect("ping after resurrection must succeed");
-        // Drop forces the cache `Weak` to dangling; next round hits
-        // case (b) (entry present, dead Arc).
+        match &kept {
+            Some(weak) => assert!(
+                *weak == svc.as_binder(),
+                "round {round}: a kept WIBinder must name the resurrected proxy"
+            ),
+            None => kept = Some(SIBinder::downgrade(&svc.as_binder())),
+        }
+        // `kept` holds the pin, so the next round is case (b) unless another test holds a proxy.
         drop(svc);
     }
 }
@@ -2846,9 +2833,7 @@ fn test_weak_partial_eq_handle_identity_across_resurrection() {
     let weak1: WIBinder = SIBinder::downgrade(&svc1.as_binder());
     drop(svc1);
 
-    // Resurrect and downgrade again — fresh Arc<ProxyHandle>, but the
-    // cache entry's generation is preserved (same kernel slot), so the
-    // new WIBinder snapshots the same generation.
+    // A fresh Arc<ProxyHandle>, but `weak1`'s pin keeps the entry, so the generation is the same.
     let svc2 = get_test_service();
     let weak2: WIBinder = SIBinder::downgrade(&svc2.as_binder());
 

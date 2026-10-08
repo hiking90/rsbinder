@@ -40,14 +40,14 @@
 //! runs three phases so no IPC happens with `handle_to_proxy` locked:
 //!
 //! - **P1** — short write-lock window. Decides the sub-case and, for case
-//!   (a) (entry absent), issues `BC_INCREFS` + `flush_commands` so the cache
+//!   (a), issues `BC_INCREFS` + `flush_commands` so the cache
 //!   pin is live in the kernel before any IPC enters. The write lock is
 //!   taken even though P1 only reads, so two concurrent slow paths cannot
 //!   both observe "absent" and produce two case-(a) commits with distinct
-//!   generations; a second one collapses onto P3's `(CaseA, Some(_))` race
-//!   arm instead. Pinning under the lock also means P3's `BC_ACQUIRE` never
-//!   races a freed `binder_ref` slot. `flush_commands` inside the lock is
-//!   sound because it is a write-only ioctl (`talk_with_driver(false)`,
+//!   generations while the first lives; the second's P3 returns the first's proxy (re-check
+//!   (c)) or, while a `WIBinder` holds the first's pin, revives on it. Pinning under the lock
+//!   also means P3's `BC_ACQUIRE` never races a freed `binder_ref` slot. `flush_commands` inside
+//!   the lock is sound because it is a write-only ioctl (`talk_with_driver(false)`,
 //!   `read_size = 0`): no `BR_*` — `BR_DEAD_BINDER` included — is
 //!   dispatched, and re-entrant `send_obituary_for_handle` paths only
 //!   originate from `BR_DEAD_BINDER`.
@@ -56,69 +56,45 @@
 //!   `BR_DEAD_BINDER` → `send_obituary_for_handle` on the same thread can
 //!   take it without deadlocking against `std::sync::RwLock`'s
 //!   non-reentrant write lock.
-//! - **P3** — write lock re-acquired. Re-checks case (c) and the case
-//!   (a)→(b) cross-thread race, undoes any spare pin, and commits the entry.
+//! - **P3** — write lock re-acquired. Re-checks case (c) and the cross-thread
+//!   race, and commits the entry.
 //!
 //! Sub-cases decided in P1:
 //!
-//! - **(a)** entry absent. P1 pins, and this thread owns the pin until P3
-//!   moves it into the new entry or undoes it (`undo_case_a_pin`).
-//! - **(b)** entry present but its `weak` dangles. The entry keeps owning its
-//!   pin; P1 snapshots descriptor and generation, P2 skips `query_interface`
+//! - **(a)** entry absent, or its pin already in `Drop` (AOSP `attemptIncWeak` fails). P1 pins.
+//! - **(b)** entry present with no live proxy but a live pin. P1 upgrades the pin and holds it
+//!   to P3 for its `BC_ACQUIRE`; P2 skips `query_interface`
 //!   (the descriptor is immutable for the `binder_ref` slot's lifetime), and
-//!   P3 resurrects under the same generation if the snapshot still matches.
+//!   P3 resurrects under the pin's generation (AOSP `force_set`).
 //! - **(c)** another thread inserted or upgraded the entry between the
 //!   fast-path miss and P1; the live entry is returned.
 //!
-//! `commit_new_acquired` undoes the pin on a `new_acquired` failure only when
-//! this thread owns it (`owns_case_a_pin`): case (b) and the cross-thread
-//! `(CaseA, Some(_))` race pass `false`, because the existing entry owns that
-//! pin. The pin undo itself is best-effort: if its `BC_DECREFS` or flush
-//! fails, the failure is logged and the pin leaks until obituary or process
-//! teardown, since returning the secondary error would mask the original one.
+//! Every exit that does not commit this thread's case-(a) pin drops it with
+//! no lock held, and its `Drop` releases it (module doc "Proxy cache entry");
+//! the slow path has no separate undo step.
 //!
 //! The P2 lock release matters because the catch-all arm of
 //! `wait_for_response` dispatches `BR_DEAD_BINDER` to `execute_command`, which
 //! calls `send_obituary_for_handle` and takes the same write lock.
 //!
-//! P3 covers a race in which another thread T2 ran a complete case (a) during
-//! this thread's P2 IPC and then dropped its `Arc`: the plan is `CaseA`, yet
-//! the slot is again "present + dangling weak", so there is one spare
-//! `BC_INCREFS` pin (this thread's) on top of T2's entry-owned pin. P3 undoes
-//! the spare pin and adopts T2's descriptor and generation, restoring one pin
-//! per entry. The companion `(CaseB, None)` arm — the entry vanished mid-flight
-//! through an obituary — returns `DeadObject` rather than sending `BC_ACQUIRE`
-//! against a freed `binder_ref` slot; it is the one window where the
-//! precondition "`BC_ACQUIRE` requires a live pin" could otherwise break.
-//!
-//! P3 race resolution (P2 output × cache state at P3):
-//!
-//! | ready  | cached at P3 | action                                              |
-//! |--------|--------------|-----------------------------------------------------|
-//! | (any)  | live entry   | drop this thread's work; if CaseA, undo its pin     |
-//! | CaseA  | None         | standard commit; new generation                     |
-//! | CaseA  | Some(_)      | undo this thread's pin; commit with cached desc/gen |
-//! | CaseB  | None         | DeadObject (cache pin gone — BC_ACQUIRE unsafe)     |
-//! | CaseB  | Some, gen=   | resurrect under same generation                     |
-//! | CaseB  | Some, gen≠   | adopt new entry's desc/gen                          |
+//! P3 covers a race in which another thread T2 ran a complete case (a) during this thread's P2
+//! IPC and then dropped its `Arc` while a `WIBinder` kept its pin: the plan is `CaseA`, yet the
+//! entry names T2's live pin, which P3 adopts, releasing this thread's pin. A `CaseB` whose
+//! entry an obituary removed re-runs from P1 as case (a); its `query_interface` gets `DeadObject`.
 //!
 //! # Proxy cache entry
 //!
-//! A `CacheEntry`'s `weak` lets the process build a fresh `Arc<ProxyHandle>`
-//! after the previous one dropped, reusing the cached `descriptor` instead of
-//! issuing a new `INTERFACE_TRANSACTION`. The kernel weak ref (`BC_INCREFS`)
-//! that keeps `binder_ref(handle)` alive while the user-side strong count is 0
-//! is not a field: the entry's presence in `handle_to_proxy` owns it. The pin
-//! is acquired exactly once on case-(a) insertion and released exactly once on
-//! obituary teardown.
+//! A case-(a) `BC_INCREFS` is a `HandlePin` (AOSP `BpBinder`'s weak lifetime) held by the entry's
+//! proxies and `WIBinder`s; its last drop expunges the entry, then `pin_ledger` sends `BC_DECREFS`
+//! once no clear of the handle's death subscription is in flight.
 //!
 //! `generation` comes from the process-wide monotonic `next_generation`,
-//! bumped once per case-(a) insertion (u64, so wrap-around is not a concern).
+//! taken once per case-(a) pin (u64, so wrap-around is not a concern).
 //! A proxy `WIBinder` records the generation seen at `SIBinder::downgrade`, so
 //! its `PartialEq` identity `(handle, generation)` is stable across case-(b)
 //! re-lookups (a fresh `Arc<ProxyHandle>` is a new allocation) and a recycled
 //! handle id naming a different `binder_node` is distinguishable. Case (b)
-//! keeps the entry's generation — same kernel slot, and a fresh wire-delivered
+//! keeps the pin's generation — same kernel slot, and a fresh wire-delivered
 //! strong ref makes it transactable again; only case (a) allocates one.
 //!
 //! A case-(b) re-lookup through `strong_proxy_for_handle_stability` is driven
@@ -204,10 +180,9 @@
 //! # Obituary teardown
 //!
 //! Phase 1, `send_obituary_for_handle`, removes the cache entry under the
-//! write lock and notifies death recipients. Phase 2, `release_obituary_pin`,
-//! releases the cache pin with `BC_DECREFS`; `thread_state::execute_command`'s
-//! `BR_DEAD_BINDER` arm calls it after queueing `BC_DEAD_BINDER_DONE` in this
-//! thread's out-parcel.
+//! write lock (an rsbinder addition: a later delivery then gets `DeadObject` as case (a)) and
+//! notifies death recipients; the pin stays with its holders. Phase 2, `finish_obituary`, flushes
+//! the `BC_DEAD_BINDER_DONE` that `execute_command`'s `BR_DEAD_BINDER` arm queued after phase 1.
 //!
 //! Phase 1 can run on the thread that issued the originating transaction,
 //! including one inside `strong_proxy_for_handle_stability`; its
@@ -216,13 +191,6 @@
 //! `THREAD_STATE` or `BINDER_DEREFS` borrow held: `send_obituary` runs user
 //! `DeathRecipient::binder_died` callbacks, which can issue nested binder
 //! calls (R1; see the `thread_state` module doc).
-//!
-//! Phase 2's first `flush_commands()` commits `BC_DEAD_BINDER_DONE` and any
-//! `BC_RELEASE` queued on this thread before `BC_DECREFS` reaches the kernel.
-//! It does not drain other threads' out-parcels: a `BC_RELEASE` from a `Drop`
-//! on another thread can still arrive after the `BC_DECREFS`, and the kernel
-//! rejects it with `-EINVAL` and a dmesg line. Closing that window would take
-//! cross-thread synchronization of every out-parcel flush, which is not done.
 //!
 //! # Published-native `kernel_refs` drift
 //!
@@ -282,36 +250,66 @@ use std::fs::File;
 use std::os::raw::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{self, Arc, OnceLock, RwLock};
+use std::sync::{self, Arc, Mutex, OnceLock, RwLock};
 use std::thread;
 
 use crate::{binder::*, error::*, proxy::*, sys::binder, thread_state};
 
-/// Best-effort undo of a case (a) pin; see module doc "Proxy cache slow path".
-fn undo_case_a_pin(handle: u32) {
-    if let Err(err) = thread_state::dec_weak_handle(handle) {
-        log::warn!(
-            "Best-effort BC_DECREFS for handle {handle} failed during \
-             case (a) cleanup: {err:?}; kernel binder_ref pin may leak \
-             until obituary"
-        );
-        return;
+/// A handle's shared `BC_INCREFS`; `Drop` write-locks `handle_to_proxy`, so never drop under it.
+pub(crate) struct HandlePin {
+    handle: u32,
+    generation: u64,
+}
+
+impl HandlePin {
+    /// Caller has issued and flushed the `BC_INCREFS` this pin releases.
+    fn new(handle: u32, generation: u64) -> Arc<Self> {
+        Arc::new(Self { handle, generation })
     }
-    if let Err(err) = thread_state::flush_commands() {
-        log::warn!(
-            "Best-effort flush after BC_DECREFS for handle {handle} \
-             failed during case (a) cleanup: {err:?}; kernel binder_ref \
-             pin may leak until obituary"
-        );
+
+    /// Test-only: a pin with no `BC_INCREFS` behind it; the caller must never let it drop.
+    #[cfg(test)]
+    pub(crate) fn synthetic(handle: u32, generation: u64) -> Arc<Self> {
+        Self::new(handle, generation)
+    }
+
+    pub(crate) fn handle(&self) -> u32 {
+        self.handle
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+impl Drop for HandlePin {
+    /// AOSP `~BpBinder`: `expungeHandle` then `decWeakHandle` (`BpBinder.cpp:833-834`).
+    fn drop(&mut self) {
+        let Some(this) = ProcessState::instance().get() else {
+            return;
+        };
+        {
+            let mut handle_to_proxy = this
+                .handle_to_proxy
+                .write()
+                .expect("Handle to proxy lock poisoned");
+            expunge_locked(&mut handle_to_proxy, self.handle, self);
+        }
+        let count = {
+            let mut ledger = this.pin_ledger_lock();
+            ledger.hold(self.handle);
+            ledger.take_releasable(self.handle)
+        };
+        release_pins(self.handle, count);
     }
 }
 
 /// P1's case decision, consumed by P2/P3; see module doc "Proxy cache slow path".
 enum SlowPathPlan {
-    /// Case (a): this thread owns the P1 pin until P3 moves it into the entry or undoes it.
-    CaseA,
-    /// Case (b): the entry owns the pin; P2 reuses this snapshot instead of `query_interface`.
-    CaseB { descriptor: String, generation: u64 },
+    /// Case (a): this thread's fresh pin; dropping it unused releases its `BC_INCREFS`.
+    CaseA { pin: Arc<HandlePin> },
+    /// Case (b): the entry's pin, held through P3 so its `BC_INCREFS` stays; P2 makes no query.
+    CaseB { pin: Arc<HandlePin> },
 }
 
 /// Outcome of P1: a live entry (slow path done) or a [`SlowPathPlan`] for P2/P3.
@@ -322,12 +320,15 @@ enum SlowPathDecision {
     NeedIpc(SlowPathPlan),
 }
 
-/// P2 output; each case carries its descriptor, so P3 never `expect`s an `Option<String>`.
+/// P2 output; each case carries its pin and descriptor into P3.
 enum SlowPathReady {
     /// Case (a): descriptor freshly obtained by P2's `query_interface`.
-    CaseA { descriptor: String },
-    /// Case (b): descriptor and generation snapshotted by P1; P2 made no IPC.
-    CaseB { descriptor: String, generation: u64 },
+    CaseA {
+        pin: Arc<HandlePin>,
+        descriptor: String,
+    },
+    /// Case (b): only held, not read; P3 commits on the entry's live pin, this one or newer.
+    CaseB { _pin: Arc<HandlePin> },
 }
 
 /// Restores the thread's [`CallRestriction`] on drop, so P2's internal IPC cannot leak it.
@@ -364,40 +365,98 @@ fn slow_path_p2_test_hook(handle: u32) {
     }
 }
 
-/// P3 `BC_ACQUIRE` + insert, caller holds the write lock; `owns_case_a_pin`: see module doc.
+/// P3 `BC_ACQUIRE` on a live `pin` + insert; caller holds the write lock (module doc).
 fn commit_new_acquired(
     handle_to_proxy: &mut HashMap<u32, CacheEntry>,
-    handle: u32,
+    pin: &Arc<HandlePin>,
     descriptor: String,
-    generation: u64,
     stability: Stability,
-    owns_case_a_pin: bool,
 ) -> Result<SIBinder> {
-    let arc = match ProxyHandle::new_acquired(handle, generation, descriptor.clone(), stability) {
-        Ok(arc) => arc,
-        Err(err) => {
-            if owns_case_a_pin {
-                undo_case_a_pin(handle);
-            }
-            return Err(err);
-        }
-    };
+    let arc = ProxyHandle::new_acquired(pin, descriptor.clone(), stability)?;
     handle_to_proxy.insert(
-        handle,
+        pin.handle(),
         CacheEntry {
             weak: Arc::downgrade(&arc),
+            pin: Arc::downgrade(pin),
             descriptor,
-            generation,
         },
     );
     Ok(SIBinder::from_arc(arc as Arc<dyn IBinder>))
 }
 
-/// Per-handle proxy cache entry; its presence owns the pin (module doc "Proxy cache entry").
+/// Per-handle proxy cache entry; see module doc "Proxy cache entry".
 pub(crate) struct CacheEntry {
     pub(crate) weak: sync::Weak<ProxyHandle>,
+    /// Upgrading it under the lock is AOSP `attemptIncWeak`; never drop the result there.
+    pub(crate) pin: sync::Weak<HandlePin>,
     pub(crate) descriptor: String,
-    pub(crate) generation: u64,
+}
+
+/// Removes `handle`'s entry iff it still names `pin`; `true` if removed.
+fn expunge_locked(
+    handle_to_proxy: &mut HashMap<u32, CacheEntry>,
+    handle: u32,
+    pin: *const HandlePin,
+) -> bool {
+    // A newer pin may have replaced it, as AOSP `expungeHandle` checks `e->binder == binder`.
+    let ours = handle_to_proxy
+        .get(&handle)
+        .is_some_and(|entry| std::ptr::eq(entry.pin.as_ptr(), pin));
+    if ours {
+        handle_to_proxy.remove(&handle);
+    }
+    ours
+}
+
+/// Per-handle dropped pins, held while death-notification clears are in flight.
+#[derive(Default)]
+struct PinLedger(HashMap<u32, LedgerSlot>);
+
+#[derive(Default)]
+struct LedgerSlot {
+    /// `BC_CLEAR_DEATH_NOTIFICATION`s queued whose `BR_CLEAR_DEATH_NOTIFICATION_DONE` is pending.
+    clears_in_flight: u32,
+    /// Dropped `HandlePin`s whose `BC_DECREFS` has not been sent.
+    held_pins: u32,
+}
+
+impl PinLedger {
+    fn note_clear(&mut self, handle: u32) {
+        let slot = self.0.entry(handle).or_default();
+        slot.clears_in_flight = slot.clears_in_flight.saturating_add(1);
+    }
+
+    fn hold(&mut self, handle: u32) {
+        let slot = self.0.entry(handle).or_default();
+        slot.held_pins = slot.held_pins.saturating_add(1);
+    }
+
+    /// Pins to release now: every held one, once no clear is in flight.
+    fn take_releasable(&mut self, handle: u32) -> u32 {
+        match self.0.get(&handle) {
+            Some(slot) if slot.clears_in_flight == 0 => {
+                self.0.remove(&handle).map_or(0, |slot| slot.held_pins)
+            }
+            _ => 0,
+        }
+    }
+
+    fn clear_done(&mut self, handle: u32) -> u32 {
+        match self.0.get_mut(&handle) {
+            Some(slot) if slot.clears_in_flight > 0 => slot.clears_in_flight -= 1,
+            _ => log::warn!("BR_CLEAR_DEATH_NOTIFICATION_DONE for handle {handle} with no clear"),
+        }
+        self.take_releasable(handle)
+    }
+}
+
+/// `BC_DECREFS` for `count` pins; call with no lock held (module doc "Proxy cache entry").
+fn release_pins(handle: u32, count: u32) {
+    for _ in 0..count {
+        if let Err(err) = thread_state::dec_weak_handle(handle) {
+            log::error!("BC_DECREFS for handle {handle} failed: {err:?}; its binder_ref leaks");
+        }
+    }
 }
 
 /// Sidecar entry for a published native, keyed by a u64 id; see module doc "Published natives".
@@ -463,8 +522,10 @@ pub struct ProcessState {
     mmap: RwLock<MemoryMap>,
     context_manager: RwLock<Option<SIBinder>>,
     handle_to_proxy: RwLock<HashMap<u32, CacheEntry>>,
-    /// Source of `CacheEntry::generation`, bumped once per case-(a) insertion (fresh pin).
+    /// Source of `HandlePin::generation`, bumped once per case-(a) pin.
     next_generation: AtomicU64,
+    /// Leaf lock; never held across a command. See module doc "Proxy cache entry".
+    pin_ledger: Mutex<PinLedger>,
     /// Published natives by the u64 id in `flat_binder_object.binder`; see `PublishedNative`.
     published_natives: RwLock<HashMap<u64, PublishedNative>>,
     /// Monotonic u64 id allocator for `published_natives`.
@@ -604,6 +665,7 @@ impl ProcessState {
             context_manager: RwLock::new(None),
             handle_to_proxy: RwLock::new(HashMap::new()),
             next_generation: AtomicU64::new(1),
+            pin_ledger: Mutex::new(PinLedger::default()),
             published_natives: RwLock::new(HashMap::new()),
             next_native_id: AtomicU64::new(1),
             disable_background_scheduling: AtomicBool::new(false),
@@ -799,12 +861,16 @@ impl ProcessState {
         }
 
         // Slow path in three lock-decoupled phases: see module doc "Proxy cache slow path".
-        let plan = match self.slow_path_p1(handle)? {
-            SlowPathDecision::Cached(arc) => return Ok(arc),
-            SlowPathDecision::NeedIpc(plan) => plan,
-        };
-        let ready = self.slow_path_p2(handle, plan)?;
-        self.slow_path_p3(handle, stability, ready)
+        loop {
+            let plan = match self.slow_path_p1(handle)? {
+                SlowPathDecision::Cached(arc) => return Ok(arc),
+                SlowPathDecision::NeedIpc(plan) => plan,
+            };
+            let ready = self.slow_path_p2(handle, plan)?;
+            if let Some(binder) = self.slow_path_p3(handle, stability, ready)? {
+                return Ok(binder);
+            }
+        }
     }
 
     /// P1, under the write lock: decide the sub-case; case (a) pins (`BC_INCREFS` + flush).
@@ -815,17 +881,16 @@ impl ProcessState {
             .write()
             .expect("Handle to proxy lock poisoned");
 
-        // Case (c): another thread inserted/upgraded since the read-fast-path miss.
-        if let Some(arc) = handle_to_proxy.get(&handle).and_then(|e| e.weak.upgrade()) {
-            return Ok(SlowPathDecision::Cached(SIBinder::from_arc(arc)));
-        }
-
-        // Case (b): weak dead; the first-insertion pin still backs P3's BC_ACQUIRE.
         if let Some(entry) = handle_to_proxy.get(&handle) {
-            return Ok(SlowPathDecision::NeedIpc(SlowPathPlan::CaseB {
-                descriptor: entry.descriptor.clone(),
-                generation: entry.generation,
-            }));
+            // Case (c): another thread inserted/upgraded since the read-fast-path miss.
+            if let Some(arc) = entry.weak.upgrade() {
+                return Ok(SlowPathDecision::Cached(SIBinder::from_arc(arc)));
+            }
+            // Case (b): a `WIBinder` keeps the pin; it backs P3's BC_ACQUIRE (`attemptIncWeak`).
+            if let Some(pin) = entry.pin.upgrade() {
+                return Ok(SlowPathDecision::NeedIpc(SlowPathPlan::CaseB { pin }));
+            }
+            // The pin is in its `Drop`, which leaves a replacing entry alone: case (a).
         }
 
         // Case (a): pin under the lock; see module doc "Proxy cache slow path" for why.
@@ -837,7 +902,10 @@ impl ProcessState {
             );
             return Err(StatusCode::DeadObject);
         }
-        Ok(SlowPathDecision::NeedIpc(SlowPathPlan::CaseA))
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        Ok(SlowPathDecision::NeedIpc(SlowPathPlan::CaseA {
+            pin: HandlePin::new(handle, generation),
+        }))
     }
 
     /// P2, lock released: `ping_binder(0)` (sdk >= 30), then CaseA's `query_interface`.
@@ -849,153 +917,86 @@ impl ProcessState {
         // P2's ping and `query_interface` are internal IPC, so the caller's restriction is lifted.
         let _restore = RestoreCallRestriction(thread_state::call_restriction());
         thread_state::set_call_restriction(CallRestriction::None);
+        // An error drops `plan` here, unlocked; a case-(a) pin's `Drop` then releases it.
         if handle == 0 && crate::sdk_at_least(30) {
-            if let Err(err) = thread_state::ping_binder(handle) {
-                if matches!(plan, SlowPathPlan::CaseA) {
-                    undo_case_a_pin(handle);
-                }
-                return Err(err);
-            }
+            thread_state::ping_binder(handle)?;
         }
         match plan {
-            SlowPathPlan::CaseA => match thread_state::query_interface(handle) {
-                Ok(descriptor) => Ok(SlowPathReady::CaseA { descriptor }),
-                Err(err) => {
-                    undo_case_a_pin(handle);
-                    Err(err)
-                }
-            },
-            SlowPathPlan::CaseB {
-                descriptor,
-                generation,
-            } => Ok(SlowPathReady::CaseB {
-                descriptor,
-                generation,
+            SlowPathPlan::CaseA { pin } => Ok(SlowPathReady::CaseA {
+                descriptor: thread_state::query_interface(handle)?,
+                pin,
             }),
+            SlowPathPlan::CaseB { pin } => Ok(SlowPathReady::CaseB { _pin: pin }),
         }
     }
 
-    /// P3: re-check races from P2 and commit; see the table in module doc "Proxy cache slow path".
+    /// P3: re-check races from P2 and commit; `None` re-runs P1.
     fn slow_path_p3(
         &self,
         handle: u32,
         stability: Stability,
         ready: SlowPathReady,
-    ) -> Result<SIBinder> {
+    ) -> Result<Option<SIBinder>> {
         // Declared first so it drops after the lock: watermark callbacks may re-enter the cache.
         let _proxy_count_defer = crate::proxy_count::CallbackDeferGuard::new();
+        // Declared before the guard (and `ready` is a parameter) so every pin drops after the lock.
+        let entry_pin: Option<Arc<HandlePin>>;
         let mut handle_to_proxy = self
             .handle_to_proxy
             .write()
             .expect("Handle to proxy lock poisoned");
 
+        let entry = handle_to_proxy.get(&handle);
         // Re-check (c): a concurrent slow path completed during our P2; ours is redundant.
-        if let Some(arc) = handle_to_proxy.get(&handle).and_then(|e| e.weak.upgrade()) {
-            if matches!(ready, SlowPathReady::CaseA { .. }) {
-                undo_case_a_pin(handle);
-            }
-            return Ok(SIBinder::from_arc(arc));
+        if let Some(arc) = entry.and_then(|e| e.weak.upgrade()) {
+            return Ok(Some(SIBinder::from_arc(arc)));
         }
+        let entry_descriptor = entry.map(|e| e.descriptor.clone());
+        entry_pin = entry.and_then(|e| e.pin.upgrade());
 
-        let cached = handle_to_proxy
-            .get(&handle)
-            .map(|e| (e.descriptor.clone(), e.generation));
-
-        match (ready, cached) {
-            (SlowPathReady::CaseA { descriptor }, None) => {
-                // Standard case (a): fresh entry, fresh generation.
-                let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-                commit_new_acquired(
-                    &mut handle_to_proxy,
-                    handle,
-                    descriptor,
-                    generation,
-                    stability,
-                    true,
-                )
-            }
-            (SlowPathReady::CaseA { .. }, Some((cached_desc, cached_gen))) => {
-                // T2 ran a case (a) during our P2 (module doc, P3 race): undo our spare pin.
-                undo_case_a_pin(handle);
-                commit_new_acquired(
-                    &mut handle_to_proxy,
-                    handle,
-                    cached_desc,
-                    cached_gen,
-                    stability,
-                    false,
-                )
-            }
-            (
-                SlowPathReady::CaseB {
-                    descriptor,
-                    generation,
-                },
-                Some((_, cached_gen)),
-            ) if cached_gen == generation => {
-                // Same entry, same generation: the first-insertion pin is still active.
-                commit_new_acquired(
-                    &mut handle_to_proxy,
-                    handle,
-                    descriptor,
-                    generation,
-                    stability,
-                    false,
-                )
-            }
-            (SlowPathReady::CaseB { .. }, Some((cached_desc, cached_gen))) => {
-                // An obituary plus a new case (a) replaced the entry during P2; follow it.
-                commit_new_acquired(
-                    &mut handle_to_proxy,
-                    handle,
-                    cached_desc,
-                    cached_gen,
-                    stability,
-                    false,
-                )
-            }
-            (SlowPathReady::CaseB { .. }, None) => {
-                // Obituary may have freed the pin; callers re-resolve as after BR_DEAD_BINDER.
-                Err(StatusCode::DeadObject)
-            }
-        }
+        let (pin, descriptor) = match (&ready, &entry_pin, entry_descriptor) {
+            // Case (b), or another thread's commit during P2: revive the entry on its live pin.
+            (_, Some(pin), Some(descriptor)) => (pin, descriptor),
+            // Standard case (a), replacing an entry whose pin is in its `Drop`, if any.
+            (SlowPathReady::CaseA { pin, descriptor }, _, _) => (pin, descriptor.clone()),
+            // An obituary removed the entry, or replaced it with a dying pin: redo P1.
+            (SlowPathReady::CaseB { .. }, _, _) => return Ok(None),
+        };
+        commit_new_acquired(&mut handle_to_proxy, pin, descriptor, stability).map(Some)
     }
 
-    /// Test-only: the cache entry's generation for `handle` (production reads the `ProxyHandle`).
+    /// Test-only: the generation of `handle`'s entry while its pin lives.
     #[cfg(test)]
     pub(crate) fn cache_generation_for(&self, handle: u32) -> Option<u64> {
-        self.handle_to_proxy
+        // The upgraded pin drops after the lock (module doc "Proxy cache entry").
+        let pin = self
+            .handle_to_proxy
             .read()
             .expect("Handle to proxy lock poisoned")
             .get(&handle)
-            .map(|e| e.generation)
+            .and_then(|e| e.pin.upgrade());
+        pin.map(|pin| pin.generation())
     }
 
     /// Obituary phase 1; R1: call with no `THREAD_STATE`/`BINDER_DEREFS` borrow (module doc).
     pub(crate) fn send_obituary_for_handle(&self, handle: u32) -> Result<()> {
-        // `downgrade` reads identity off the `ProxyHandle`; reading first only secures a live Arc.
-        let arc = {
-            let handle_to_proxy = self
-                .handle_to_proxy
-                .read()
-                .expect("Handle to proxy lock poisoned");
-            // Recipients exist only on a live proxy (`link_to_death` needs the Arc).
-            handle_to_proxy
-                .get(&handle)
-                .and_then(|entry| entry.weak.upgrade())
-        };
-        let who = arc.as_ref().map(|arc| {
-            let sibinder = SIBinder::from_arc(arc.clone() as Arc<dyn IBinder>);
-            SIBinder::downgrade(&sibinder)
-        });
-
-        let existed = {
+        // Upgrade and remove under one lock: a P3 commit in between would lose its obituary.
+        let removed = {
             let mut handle_to_proxy = self
                 .handle_to_proxy
                 .write()
                 .expect("Handle to proxy lock poisoned");
-            handle_to_proxy.remove(&handle).is_some()
+            // Recipients live only on a live proxy; the pin stays with its holders (module doc).
+            handle_to_proxy
+                .remove(&handle)
+                .map(|entry| entry.weak.upgrade())
         };
+        let existed = removed.is_some();
+        let arc = removed.flatten();
+        let who = arc.as_ref().map(|arc| {
+            let sibinder = SIBinder::from_arc(arc.clone() as Arc<dyn IBinder>);
+            SIBinder::downgrade(&sibinder)
+        });
 
         // Runs user callbacks, so no lock held; idempotent, so a racing double obituary is fine.
         match (arc, who) {
@@ -1009,12 +1010,26 @@ impl ProcessState {
         Ok(())
     }
 
-    /// Obituary phase 2: `BC_DECREFS` the pin after `BC_DEAD_BINDER_DONE`; see module doc.
-    pub(crate) fn release_obituary_pin(&self, handle: u32) -> Result<()> {
-        thread_state::flush_commands()?;
-        thread_state::dec_weak_handle(handle)?;
-        thread_state::flush_commands()?;
-        Ok(())
+    /// Obituary phase 2: flush `BC_DEAD_BINDER_DONE` and `send_obituary`'s clear; see module doc.
+    pub(crate) fn finish_obituary(&self) -> Result<()> {
+        thread_state::flush_commands()
+    }
+
+    fn pin_ledger_lock(&self) -> sync::MutexGuard<'_, PinLedger> {
+        self.pin_ledger.lock().expect("Pin ledger lock poisoned")
+    }
+
+    /// Counts a `BC_CLEAR_DEATH_NOTIFICATION` about to go out; `handle`'s pins wait for its done.
+    pub(crate) fn note_death_clear(handle: u32) {
+        if let Some(this) = Self::instance().get() {
+            this.pin_ledger_lock().note_clear(handle);
+        }
+    }
+
+    /// `BR_CLEAR_DEATH_NOTIFICATION_DONE`; R1: call with no `THREAD_STATE` borrow held.
+    pub(crate) fn death_clear_done(&self, handle: u32) {
+        let count = self.pin_ledger_lock().clear_done(handle);
+        release_pins(handle, count);
     }
 
     /// Publish a native (dedup by `Arc::ptr_eq`) and return its id; see module doc.
@@ -1389,6 +1404,69 @@ mod tests {
         assert_eq!(DEFAULT_MAX_BINDER_THREADS, 15);
     }
 
+    /// A removed entry's pin is released at once with no clear in flight, else at the last done.
+    #[test]
+    fn pin_ledger_releases_after_the_last_clear_completes() {
+        let mut ledger = PinLedger::default();
+
+        // Never linked: the drop's pin goes out immediately.
+        ledger.hold(7);
+        assert_eq!(ledger.take_releasable(7), 1);
+        assert!(ledger.0.is_empty(), "a released handle leaves no slot");
+
+        // Linked: the drop's clear holds the pin until its done.
+        ledger.note_clear(7);
+        ledger.hold(7);
+        assert_eq!(ledger.take_releasable(7), 0);
+        // A second clear (an earlier unlink) still in flight keeps it held.
+        ledger.note_clear(7);
+        assert_eq!(ledger.clear_done(7), 0);
+        assert_eq!(ledger.clear_done(7), 1);
+        assert!(ledger.0.is_empty());
+
+        // Handles are independent; a stray done releases nothing it does not hold.
+        ledger.note_clear(1);
+        ledger.hold(1);
+        ledger.hold(2);
+        assert_eq!(ledger.take_releasable(2), 1);
+        assert_eq!(ledger.clear_done(3), 0);
+        assert_eq!(ledger.clear_done(1), 1);
+        assert!(ledger.0.is_empty());
+    }
+
+    /// A pin's drop removes only an entry naming that pin (AOSP `expungeHandle`'s check).
+    #[test]
+    fn expunge_removes_only_the_dropping_pins_entry() {
+        // Only addresses are compared, so no `HandlePin` (and no `BC_DECREFS`) is needed.
+        let pin: sync::Weak<HandlePin> = sync::Weak::new();
+        let ours = pin.as_ptr();
+        let entry = || CacheEntry {
+            weak: sync::Weak::new(),
+            pin: pin.clone(),
+            descriptor: String::new(),
+        };
+        let other = std::ptr::NonNull::<HandlePin>::dangling()
+            .as_ptr()
+            .cast_const();
+        assert!(!std::ptr::eq(ours, other));
+
+        let mut map = HashMap::new();
+        assert!(
+            !expunge_locked(&mut map, 5, ours),
+            "absent: nothing to remove"
+        );
+
+        map.insert(5, entry());
+        assert!(
+            !expunge_locked(&mut map, 5, other),
+            "a newer pin's entry: keep it"
+        );
+        assert!(map.contains_key(&5));
+
+        assert!(expunge_locked(&mut map, 5, ours));
+        assert!(!map.contains_key(&5));
+    }
+
     /// Plan 10-1 AC-1.1; driver-free, since the size is decided before the driver opens.
     #[test]
     fn a_receive_mapping_size_is_range_checked_then_page_rounded() {
@@ -1508,7 +1586,7 @@ mod tests {
         );
     }
 
-    /// N threads resurrect a dangling handle-0 entry via case (b): one `Arc`, generation kept.
+    /// Case (b) revives one `Arc` and the generation while a `WIBinder` lives; then case (a).
     #[test]
     #[cfg_attr(
         not(any(target_os = "linux", target_os = "android")),
@@ -1517,42 +1595,70 @@ mod tests {
     #[serial_test::serial(binder)]
     fn test_concurrent_strong_proxy_case_b_resurrection() {
         let _ = ProcessState::init_default();
-        // Force a cache entry to exist for handle 0.
+        let lookup_from_8_threads = || -> SIBinder {
+            let handles: Vec<_> = (0..8)
+                .map(|_| std::thread::spawn(|| ProcessState::as_self().strong_proxy_for_handle(0)))
+                .collect();
+            let arcs: Vec<SIBinder> = handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .expect("thread panic")
+                        .expect("strong_proxy failed")
+                })
+                .collect();
+            for a in &arcs[1..] {
+                assert_eq!(&arcs[0], a, "concurrent lookups must produce a single Arc");
+            }
+            arcs[0].clone()
+        };
+
         let initial = ProcessState::as_self()
             .strong_proxy_for_handle(0)
             .expect("initial strong_proxy failed");
         let initial_gen = ProcessState::as_self()
             .cache_generation_for(0)
             .expect("entry must exist for handle 0");
-        // Drop all strong refs to make `weak` dangling.
+        let weak = SIBinder::downgrade(&initial);
+        // A clean process holds no other handle-0 `Arc`, so this is the last proxy.
         drop(initial);
-        // Let other handle-0 Arc holders (e.g. `context_manager`) settle; a clean process has none.
-        std::thread::yield_now();
+        assert!(
+            weak.upgrade().is_err(),
+            "WIBinder::upgrade never resurrects"
+        );
+        assert_eq!(
+            ProcessState::as_self().cache_generation_for(0),
+            Some(initial_gen),
+            "a live WIBinder keeps the entry, as a wp<BpBinder> keeps its cache slot"
+        );
 
-        let handles: Vec<_> = (0..8)
-            .map(|_| std::thread::spawn(|| ProcessState::as_self().strong_proxy_for_handle(0)))
-            .collect();
-        let arcs: Vec<SIBinder> = handles
-            .into_iter()
-            .map(|h| {
-                h.join()
-                    .expect("thread panic")
-                    .expect("strong_proxy failed")
-            })
-            .collect();
-        let first = &arcs[0];
-        for a in &arcs[1..] {
-            assert_eq!(
-                first, a,
-                "concurrent case (b) resurrection must produce a single Arc"
-            );
-        }
-        // Case (b) keeps the entry's generation; a fresh case (a) would allocate a new one.
+        let resurrected = lookup_from_8_threads();
         assert_eq!(
             ProcessState::as_self().cache_generation_for(0),
             Some(initial_gen),
             "case (b) resurrection must preserve the entry's generation"
         );
+        assert!(
+            weak == resurrected,
+            "the WIBinder names the resurrected proxy"
+        );
+
+        drop(resurrected);
+        drop(weak);
+        assert_eq!(
+            ProcessState::as_self().cache_generation_for(0),
+            None,
+            "the last proxy and WIBinder gone, the pin's drop removes the entry"
+        );
+        let rebuilt = lookup_from_8_threads();
+        let rebuilt_gen = ProcessState::as_self()
+            .cache_generation_for(0)
+            .expect("the lookups must have installed an entry for handle 0");
+        assert_ne!(
+            rebuilt_gen, initial_gen,
+            "a fresh case (a) takes a new generation"
+        );
+        drop(rebuilt);
     }
 
     /// A same-thread obituary between P1 and P2 takes the lock, no deadlock; module doc "Tests".
@@ -1565,7 +1671,7 @@ mod tests {
     fn test_strong_proxy_under_same_thread_dead_binder_no_deadlock() {
         let process = ProcessState::init_default().expect("init_default");
 
-        // Seed and drop handle 0 so the lookup takes case (b), which issues no fresh BC_INCREFS.
+        // Seed and drop handle 0; the lookup then runs P1-P3 as case (a).
         let seed = process
             .strong_proxy_for_handle(0)
             .expect("seed strong_proxy_for_handle(0) must succeed");
@@ -1601,7 +1707,7 @@ mod tests {
              cache Weak upgradeable. Test passed vacuously."
         );
 
-        // Guards the deadlock only: (CaseB, None) gives DeadObject, a parallel resurrection Ok.
+        // Guards the deadlock only; an obituary on a live handle 0 may still fail the lookup.
         match result {
             Ok(_arc) => {}
             Err(StatusCode::DeadObject) => {}

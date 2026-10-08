@@ -817,6 +817,10 @@ impl DeathRecipient for MyDeathRecipient {
 const SHM_SERVICE_NAME: &str = "rsbinder.test.shm";
 const SHM_PATTERN: &[u8] = b"kernel-shm-from-server";
 
+/// A second `ITestService` node that only the cache-pin race reproducer looks up.
+/// Must match the literal in `test_client.rs`.
+const CACHE_PIN_SERVICE_NAME: &str = "rsbinder.test.cache_pin";
+
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
@@ -837,6 +841,11 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .expect("Could not set extension");
 
     hub::add_service(service_name, service.as_binder()).expect("Could not register service");
+
+    // Its own node, so no other test's proxy keeps the reproducer's handle pinned.
+    let cache_pin_service = BnTestService::new_binder(TestService::default());
+    hub::add_service(CACHE_PIN_SERVICE_NAME, cache_pin_service.as_binder())
+        .expect("Could not register cache-pin service");
 
     log::warn!("Intentional error output for testing purposes.");
     log::warn!("This message indicates an expected failure case.");

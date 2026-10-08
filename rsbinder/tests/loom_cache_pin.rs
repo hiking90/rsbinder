@@ -1,104 +1,14 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Loom proof-of-concept for the cache-pin model's kernel ref-count
-//! invariants.
+//! Loom re-implementation (not the production code) of the proxy cache's kernel ref protocol.
 //!
 //! This file is **gated on `cfg(loom)`** and is empty in normal builds.
 //! Run with:
 //!
 //! ```text
-//! RUSTFLAGS="--cfg loom" cargo test --test loom_cache_pin --release
+//! RUSTFLAGS="--cfg loom" cargo test -p rsbinder --test loom_cache_pin --release
 //! ```
-//!
-//! ## What this PoC does and does NOT validate
-//!
-//! **WARNING — read this before treating loom passes as production
-//! correctness evidence.** This is a Path-B simplified model, not an
-//! integration loom test. It re-implements a stripped-down version of
-//! the cache-pin state machine using `loom::sync::*`, then verifies
-//! invariants on that re-implementation. It does **not** loom-check
-//! the actual `process_state.rs` / `proxy.rs` / `thread_state.rs`
-//! code paths.
-//!
-//! Concretely:
-//!
-//! - Loom 0.7 does not model `Arc::Weak` / `Arc::downgrade`.
-//!   Production `CacheEntry { weak: sync::Weak<ProxyHandle>, .. }`
-//!   cannot be loom-modeled directly, so the PoC's cache is
-//!   `RwLock<HashMap<u32, ()>>` — pin presence only, no Arc sharing.
-//!   The model encodes the pin ordering; it does not exercise a
-//!   pin-release race (per-thread out-parcel buffering, kernel
-//!   BC_ACQUIRE seeing a freed slot).
-//! - Production race detection lives in the **integration test
-//!   matrix** (`tests/src/test_client.rs::test_cache_pin_race_*`)
-//!   running 100 iterations × sync+async on real binderfs in CI.
-//!   Loom passing here is a *complementary* signal, not a substitute.
-//!
-//! ### Invariants this PoC checks
-//!
-//! - **I1 (cache contains h ⟹ binder_ref(h).weak ≥ 1)** — holds by
-//!   construction in this model, not by interleaving: `BC_INCREFS` and
-//!   the pin insert run under one write lock, and no path removes a pin
-//!   (`bc_decrefs` is unused; the production releases — the obituary
-//!   path and `undo_case_a_pin` — are not modeled). The `saw_acquire_to_freed_slot`
-//!   check is therefore 0 on every interleaving and would stay 0 even
-//!   if a pin-release race existed in production.
-//! - **No double-pin** — case (b) (cache present) reuses the pin and
-//!   does not issue a second `BC_INCREFS` for the same handle.
-//! - **Paired `BC_ACQUIRE` / `BC_RELEASE`** — every
-//!   `Arc<MockProxyHandle>` allocation Drops exactly once, and
-//!   Drop's `BC_RELEASE` always lands on a live slot.
-//!
-//! ### Run-end assertions
-//!
-//! `cache_pin_holds_under_concurrent_lookup_and_drop` runs two worker
-//! threads that each do one lookup-then-drop. Even with one operation per
-//! thread the state space is large, because each `loom::sync::*` operation
-//! is a preemption point. At the end of each interleaving it asserts:
-//!
-//! 1. The kernel never saw `BC_ACQUIRE` against a freed slot
-//!    (`saw_acquire_to_freed_slot == 0`): **I1**.
-//! 2. `bc_increfs_count == 1`: the pin is issued once across the run. Case
-//!    (a) fires for the first thread only; the second finds the pin either
-//!    on the read-lock fast path or on the write-lock double-check.
-//! 3. `bc_acquire_count == bc_release_count`: paired.
-//! 4. Final kernel state `(strong = 0, weak = 1)`: the cache pin is still
-//!    held; there is no obituary in this model.
-//!
-//! ### Why N=2 worker threads
-//!
-//! This PoC uses
-//! N=2 because the simplified single-handle model already saturates
-//! the relevant interleaving space at N=2: a third thread on the
-//! same handle cannot reach a qualitatively new interleaving — it
-//! just adds redundant copies of the existing two-thread
-//! interleavings (since the only operations are `lookup` and
-//! `drop`, which are commutative across threads at the cache-pin
-//! level). N=3 would be load-bearing for a Path-A integration that
-//! also models cross-thread out-parcel buffering, where a third
-//! thread can land BC_RELEASE between two others' commands. That
-//! integration is the proper place for N=3.
-//!
-//! ### Out of scope (would require Path-A integration)
-//!
-//! - **Arc-identity preservation** across concurrent lookups
-//!   (production guarantees `Arc::ptr_eq` between two `SIBinder`s
-//!   acquired for the same handle while any strong ref is alive).
-//!   The integration test
-//!   `test_cache_pin_race_reproducer_no_descriptor_mismatch`
-//!   exercises this property on real binderfs.
-//! - **Per-thread out-parcel buffering** effects on cross-thread
-//!   `BC_*` ordering. Production wires `BC_*` through
-//!   `thread_state.rs` which buffers per thread; loom would need to
-//!   model that buffer too.
-//! - **Obituary teardown timing** (`BR_DEAD_BINDER` →
-//!   `BC_DEAD_BINDER_DONE` → `BC_DECREFS` ordering).
-//!
-//! Path-A integration would swap rsbinder's own sync primitives
-//! (process_state.rs cache RwLock, thread_state.rs THREAD_STATE
-//! thread-local, etc.) via cfg(loom) and add a `KernelCommander`
-//! trait abstraction over the ioctl path. That refactor is not done.
 
 #![cfg(loom)]
 
@@ -106,7 +16,7 @@ use loom::sync::atomic::{AtomicU32, Ordering};
 use loom::sync::{Arc, Mutex, RwLock};
 use std::collections::HashMap;
 
-/// Mock `binder_ref` table (handle → (strong, weak)); `bc_acquire` on `(0, 0)` is a freed slot.
+/// Mock `binder_ref` table: handle → (strong, weak).
 #[derive(Default)]
 struct MockKernel {
     refs: Mutex<HashMap<u32, (u32, u32)>>,
@@ -114,223 +24,387 @@ struct MockKernel {
     bc_release_count: AtomicU32,
     bc_increfs_count: AtomicU32,
     bc_decrefs_count: AtomicU32,
-    /// Count of `bc_acquire` calls that hit a freed slot (an I1 violation).
-    saw_acquire_to_freed_slot: AtomicU32,
+    /// `BC_ACQUIRE` on a `(0, 0)` slot, or a `BC_RELEASE`/`BC_DECREFS` underflow.
+    violations: AtomicU32,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct DeadObject;
-
 impl MockKernel {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    fn bc_acquire(&self, h: u32) -> Result<(), DeadObject> {
+    fn bc_acquire(&self, h: u32) {
         self.bc_acquire_count.fetch_add(1, Ordering::Relaxed);
         let mut refs = self.refs.lock().unwrap();
         let entry = refs.entry(h).or_insert((0, 0));
-        if entry.0 == 0 && entry.1 == 0 {
-            self.saw_acquire_to_freed_slot
-                .fetch_add(1, Ordering::Relaxed);
-            return Err(DeadObject);
+        if *entry == (0, 0) {
+            self.violations.fetch_add(1, Ordering::Relaxed);
         }
         entry.0 += 1;
-        Ok(())
     }
 
-    fn bc_release(&self, h: u32) -> Result<(), DeadObject> {
+    fn bc_release(&self, h: u32) {
         self.bc_release_count.fetch_add(1, Ordering::Relaxed);
         let mut refs = self.refs.lock().unwrap();
-        let entry = refs.get_mut(&h).ok_or(DeadObject)?;
-        if entry.0 == 0 {
-            return Err(DeadObject);
+        match refs.get_mut(&h) {
+            Some(entry) if entry.0 > 0 => entry.0 -= 1,
+            _ => {
+                self.violations.fetch_add(1, Ordering::Relaxed);
+            }
         }
-        entry.0 -= 1;
-        Ok(())
     }
 
-    fn bc_increfs(&self, h: u32) -> Result<(), DeadObject> {
+    fn bc_increfs(&self, h: u32) {
         self.bc_increfs_count.fetch_add(1, Ordering::Relaxed);
-        let mut refs = self.refs.lock().unwrap();
-        let entry = refs.entry(h).or_insert((0, 0));
-        entry.1 += 1;
-        Ok(())
+        self.refs.lock().unwrap().entry(h).or_insert((0, 0)).1 += 1;
     }
 
-    #[allow(dead_code)]
-    fn bc_decrefs(&self, h: u32) -> Result<(), DeadObject> {
+    fn bc_decrefs(&self, h: u32) {
         self.bc_decrefs_count.fetch_add(1, Ordering::Relaxed);
         let mut refs = self.refs.lock().unwrap();
-        let entry = refs.get_mut(&h).ok_or(DeadObject)?;
-        if entry.1 == 0 {
-            return Err(DeadObject);
+        match refs.get_mut(&h) {
+            Some(entry) if entry.1 > 0 => entry.1 -= 1,
+            _ => {
+                self.violations.fetch_add(1, Ordering::Relaxed);
+            }
         }
-        entry.1 -= 1;
-        Ok(())
     }
 
     fn ref_state(&self, h: u32) -> (u32, u32) {
-        let refs = self.refs.lock().unwrap();
-        refs.get(&h).copied().unwrap_or((0, 0))
+        self.refs.lock().unwrap().get(&h).copied().unwrap_or((0, 0))
+    }
+
+    fn count(counter: &AtomicU32) -> u32 {
+        counter.load(Ordering::Relaxed)
     }
 }
 
-/// Mock `ProxyHandle`: drop sends `BC_RELEASE`; one `Arc` per lookup (no identity sharing).
-struct MockProxyHandle {
-    handle: u32,
-    kernel: Arc<MockKernel>,
-}
+/// An `Arc` strong count; loom 0.7 has no `Weak` to upgrade.
+struct Refs(AtomicU32);
 
-impl Drop for MockProxyHandle {
-    fn drop(&mut self) {
-        // Cache pin keeps weak ≥ 1, so the slot is alive (asserted at the end of the model).
-        let _ = self.kernel.bc_release(self.handle);
+impl Refs {
+    fn one() -> Self {
+        Self(AtomicU32::new(1))
+    }
+
+    /// `Weak::upgrade`: increment unless already 0.
+    fn try_upgrade(&self) -> bool {
+        let mut n = self.0.load(Ordering::Relaxed);
+        while n != 0 {
+            match self
+                .0
+                .compare_exchange(n, n + 1, Ordering::Acquire, Ordering::Relaxed)
+            {
+                Ok(_) => return true,
+                Err(current) => n = current,
+            }
+        }
+        false
+    }
+
+    /// `Arc::clone` from a reference the caller holds.
+    fn add(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `true` when this dropped the last reference.
+    fn release(&self) -> bool {
+        self.0.fetch_sub(1, Ordering::AcqRel) == 1
     }
 }
 
-/// Pin presence only; encodes the pin ordering, not a pin-release race (module doc, I1).
-type Cache = RwLock<HashMap<u32, ()>>;
-
-/// `strong_proxy_for_handle_stability` order: (a) `BC_INCREFS` + `BC_ACQUIRE`, (b) `BC_ACQUIRE`.
-fn strong_proxy_for_handle(
-    cache: &Cache,
-    kernel: &Arc<MockKernel>,
+struct Pin {
     handle: u32,
-) -> Result<Arc<MockProxyHandle>, DeadObject> {
-    // Read-lock fast path: pin already exists.
-    let pin_already_held = {
-        let read = cache.read().unwrap();
-        read.contains_key(&handle)
-    };
+    generation: u32,
+    refs: Refs,
+}
 
-    if !pin_already_held {
-        // Slow path: write lock, double-check, then issue the BC_INCREFS pin.
-        let mut write = cache.write().unwrap();
-        if let std::collections::hash_map::Entry::Vacant(slot) = write.entry(handle) {
-            kernel.bc_increfs(handle)?;
-            slot.insert(());
+struct Proxy {
+    pin: Arc<Pin>,
+    refs: Refs,
+}
+
+/// `CacheEntry`; the `Arc`s only keep memory, liveness is each `refs`.
+struct Entry {
+    proxy: Arc<Proxy>,
+    pin: Arc<Pin>,
+}
+
+struct Process {
+    cache: RwLock<HashMap<u32, Entry>>,
+    kernel: MockKernel,
+    next_generation: AtomicU32,
+}
+
+/// A user `SIBinder` of a proxy.
+struct StrongRef {
+    process: Arc<Process>,
+    proxy: Arc<Proxy>,
+}
+
+/// A pin reference: a proxy `WIBinder`, or a pin the slow path holds.
+struct PinRef {
+    process: Arc<Process>,
+    pin: Arc<Pin>,
+}
+
+enum Plan {
+    CaseA {
+        pin: PinRef,
+    },
+    /// Only held, as production's `SlowPathReady::CaseB`.
+    CaseB {
+        _pin: PinRef,
+    },
+}
+
+impl Process {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            cache: RwLock::new(HashMap::new()),
+            kernel: MockKernel::default(),
+            next_generation: AtomicU32::new(1),
+        })
+    }
+
+    /// `HandlePin::drop` when this was the last holder.
+    fn release_pin(&self, pin: &Arc<Pin>) {
+        if !pin.refs.release() {
+            return;
+        }
+        {
+            let mut cache = self.cache.write().unwrap();
+            if cache
+                .get(&pin.handle)
+                .is_some_and(|e| Arc::ptr_eq(&e.pin, pin))
+            {
+                cache.remove(&pin.handle);
+            }
+        }
+        self.kernel.bc_decrefs(pin.handle);
+    }
+}
+
+/// Methods on the shared process (loom's `Arc` is not a method receiver).
+trait SharedProcess {
+    fn pin_ref(&self, pin: &Arc<Pin>) -> PinRef;
+    fn strong(&self, proxy: &Arc<Proxy>) -> StrongRef;
+    fn lookup(&self, handle: u32) -> StrongRef;
+}
+
+impl SharedProcess for Arc<Process> {
+    /// Wraps a reference to `pin` the caller has already counted in `refs`.
+    fn pin_ref(&self, pin: &Arc<Pin>) -> PinRef {
+        PinRef {
+            process: Arc::clone(self),
+            pin: Arc::clone(pin),
         }
     }
 
-    // The pin keeps weak >= 1; a DeadObject here breaks I1 (`MockKernel::bc_acquire` records it).
-    kernel.bc_acquire(handle)?;
+    /// Wraps a reference to `proxy` the caller has already counted in `refs`.
+    fn strong(&self, proxy: &Arc<Proxy>) -> StrongRef {
+        StrongRef {
+            process: Arc::clone(self),
+            proxy: Arc::clone(proxy),
+        }
+    }
 
-    Ok(Arc::new(MockProxyHandle {
-        handle,
-        kernel: Arc::clone(kernel),
-    }))
+    /// `strong_proxy_for_handle_stability`.
+    fn lookup(&self, handle: u32) -> StrongRef {
+        {
+            let cache = self.cache.read().unwrap();
+            if let Some(e) = cache.get(&handle) {
+                if e.proxy.refs.try_upgrade() {
+                    return self.strong(&e.proxy);
+                }
+            }
+        }
+        loop {
+            // P1. A plan's pin is moved out, never dropped under the lock.
+            let plan = {
+                let cache = self.cache.write().unwrap();
+                match cache.get(&handle) {
+                    Some(e) if e.proxy.refs.try_upgrade() => return self.strong(&e.proxy),
+                    Some(e) if e.pin.refs.try_upgrade() => Plan::CaseB {
+                        _pin: self.pin_ref(&e.pin),
+                    },
+                    _ => {
+                        self.kernel.bc_increfs(handle);
+                        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+                        let pin = Arc::new(Pin {
+                            handle,
+                            generation,
+                            refs: Refs::one(),
+                        });
+                        Plan::CaseA {
+                            pin: self.pin_ref(&pin),
+                        }
+                    }
+                }
+            };
+            // P2 holds no lock; P3 below. `plan` and `entry_pin` drop after the guard.
+            let entry_pin: Option<PinRef>;
+            let mut cache = self.cache.write().unwrap();
+            if let Some(e) = cache.get(&handle) {
+                if e.proxy.refs.try_upgrade() {
+                    return self.strong(&e.proxy);
+                }
+            }
+            entry_pin = match cache.get(&handle) {
+                Some(e) if e.pin.refs.try_upgrade() => Some(self.pin_ref(&e.pin)),
+                _ => None,
+            };
+            let pin = match (&entry_pin, &plan) {
+                (Some(entry), _) => Arc::clone(&entry.pin),
+                (None, Plan::CaseA { pin: ours }) => Arc::clone(&ours.pin),
+                (None, Plan::CaseB { .. }) => {
+                    drop(cache);
+                    continue;
+                }
+            };
+            self.kernel.bc_acquire(handle);
+            pin.refs.add();
+            let proxy = Arc::new(Proxy {
+                pin: Arc::clone(&pin),
+                refs: Refs::one(),
+            });
+            cache.insert(
+                handle,
+                Entry {
+                    proxy: Arc::clone(&proxy),
+                    pin,
+                },
+            );
+            drop(cache);
+            return self.strong(&proxy);
+        }
+    }
 }
 
-/// Two threads each look up then drop; see module doc "Run-end assertions".
+impl StrongRef {
+    fn generation(&self) -> u32 {
+        self.proxy.pin.generation
+    }
+
+    /// `SIBinder::downgrade`: the `WIBinder` holds the pin.
+    fn downgrade(&self) -> PinRef {
+        self.proxy.pin.refs.add();
+        self.process.pin_ref(&self.proxy.pin)
+    }
+}
+
+impl Drop for StrongRef {
+    /// `ProxyHandle::drop` (`BC_RELEASE`), then its pin field's drop.
+    fn drop(&mut self) {
+        if self.proxy.refs.release() {
+            self.process.kernel.bc_release(self.proxy.pin.handle);
+            self.process.release_pin(&self.proxy.pin);
+        }
+    }
+}
+
+impl Drop for PinRef {
+    fn drop(&mut self) {
+        self.process.release_pin(&self.pin);
+    }
+}
+
+/// `loom::model` with a preemption bound of 4 unless `LOOM_MAX_PREEMPTIONS` sets one.
+fn model(f: impl Fn() + Sync + Send + 'static) {
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound.get_or_insert(4);
+    builder.check(f);
+}
+
+/// Settled-state checks once every proxy and `WIBinder` is gone.
+fn assert_released(process: &Process, handle: u32) {
+    let kernel = &process.kernel;
+    assert_eq!(MockKernel::count(&kernel.violations), 0, "I1 violation");
+    assert_eq!(kernel.ref_state(handle), (0, 0), "the last holder releases");
+    assert!(
+        process.cache.read().unwrap().is_empty(),
+        "the last holder's drop removes the entry"
+    );
+    assert_eq!(
+        MockKernel::count(&kernel.bc_increfs_count),
+        MockKernel::count(&kernel.bc_decrefs_count),
+        "every pin is released once"
+    );
+    assert_eq!(
+        MockKernel::count(&kernel.bc_acquire_count),
+        MockKernel::count(&kernel.bc_release_count),
+        "every proxy is released once"
+    );
+}
+
+/// Two threads each look up then drop, racing each other's last proxy and pin drops.
 #[test]
-fn cache_pin_holds_under_concurrent_lookup_and_drop() {
+fn concurrent_lookup_and_drop_releases_on_last_holder() {
     const HANDLE: u32 = 42;
 
-    loom::model(|| {
-        let kernel = Arc::new(MockKernel::new());
-        let cache: Arc<Cache> = Arc::new(RwLock::new(HashMap::new()));
+    model(|| {
+        let process = Process::new();
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let process = Arc::clone(&process);
+                loom::thread::spawn(move || drop(process.lookup(HANDLE)))
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
 
-        let kernel_t1 = Arc::clone(&kernel);
-        let cache_t1 = Arc::clone(&cache);
-        let t1 = loom::thread::spawn(move || {
-            let arc = strong_proxy_for_handle(&cache_t1, &kernel_t1, HANDLE)
-                .expect("T1 lookup must succeed");
-            drop(arc);
-        });
-
-        let kernel_t2 = Arc::clone(&kernel);
-        let cache_t2 = Arc::clone(&cache);
-        let t2 = loom::thread::spawn(move || {
-            let arc = strong_proxy_for_handle(&cache_t2, &kernel_t2, HANDLE)
-                .expect("T2 lookup must succeed");
-            drop(arc);
-        });
-
-        t1.join().unwrap();
-        t2.join().unwrap();
-
-        // Settled state: every thread joined, every BC_* committed.
-        assert_eq!(
-            kernel.saw_acquire_to_freed_slot.load(Ordering::Relaxed),
-            0,
-            "I1 violation: BC_ACQUIRE issued against freed kernel slot"
-        );
-
-        let (strong, weak) = kernel.ref_state(HANDLE);
-        assert_eq!(
-            strong, 0,
-            "after both threads' Arcs dropped, kernel strong must be 0; got {strong}"
-        );
-        assert_eq!(
-            weak, 1,
-            "cache pin must keep kernel weak == 1 (I1); got {weak}"
-        );
-
-        let increfs = kernel.bc_increfs_count.load(Ordering::Relaxed);
-        let decrefs = kernel.bc_decrefs_count.load(Ordering::Relaxed);
-        let acquire = kernel.bc_acquire_count.load(Ordering::Relaxed);
-        let release = kernel.bc_release_count.load(Ordering::Relaxed);
-        assert_eq!(
-            increfs, 1,
-            "cache pin must be issued exactly once per handle; got increfs={increfs}"
-        );
-        assert_eq!(
-            decrefs, 0,
-            "no obituary in this model; got decrefs={decrefs}"
-        );
-        assert_eq!(
-            acquire, 2,
-            "two lookups → two BC_ACQUIREs; got acquire={acquire}"
-        );
-        assert_eq!(
-            release, 2,
-            "two Arc Drops → two BC_RELEASEs; got release={release}"
-        );
+        assert_released(&process, HANDLE);
+        let increfs = MockKernel::count(&process.kernel.bc_increfs_count);
+        // A second pin: both P1s ran before a commit (the spare is released), or after a release.
+        assert!((1..=2).contains(&increfs), "got increfs={increfs}");
+        // One BC_ACQUIRE when the second lookup shared the first's live proxy (case (c)).
+        let acquire = MockKernel::count(&process.kernel.bc_acquire_count);
+        assert!((1..=2).contains(&acquire), "got acquire={acquire}");
     });
 }
 
-/// T1 pins and drops, then T2 takes case (b) with no live `Arc`: pin held, `BC_ACQUIRE` only.
+/// A `WIBinder` keeps the pin for case (b); with none left, the next lookup pins afresh.
 #[test]
-fn case_b_path_reuses_existing_pin() {
+fn weak_ref_keeps_the_pin_for_case_b() {
     const HANDLE: u32 = 7;
 
-    loom::model(|| {
-        let kernel = Arc::new(MockKernel::new());
-        let cache: Arc<Cache> = Arc::new(RwLock::new(HashMap::new()));
+    model(|| {
+        let process = Process::new();
+        let kernel = &process.kernel;
 
-        // T1 (main thread): establish pin, drop Arc.
-        let arc1 =
-            strong_proxy_for_handle(&cache, &kernel, HANDLE).expect("first lookup must succeed");
-        drop(arc1);
+        // No holder left: the last drop releases the pin and the entry.
+        let first = process.lookup(HANDLE);
+        let first_generation = first.generation();
+        drop(first);
+        assert_eq!(kernel.ref_state(HANDLE), (0, 0));
+        assert_eq!(MockKernel::count(&kernel.bc_decrefs_count), 1);
 
-        // After T1's drop, kernel state: strong=0, weak=1 (pin alive).
-        let (s_mid, w_mid) = kernel.ref_state(HANDLE);
-        assert_eq!(s_mid, 0, "post-drop strong must be 0");
-        assert_eq!(w_mid, 1, "pin keeps weak == 1 across lookup-then-drop");
+        // Case (a) again: a fresh BC_INCREFS under a new generation.
+        let second = process.lookup(HANDLE);
+        let kept_generation = second.generation();
+        assert_ne!(kept_generation, first_generation);
+        assert_eq!(MockKernel::count(&kernel.bc_increfs_count), 2);
 
-        // T2: pin cached, so BC_ACQUIRE only; the pin keeps the slot alive for it.
-        let kernel_t2 = Arc::clone(&kernel);
-        let cache_t2 = Arc::clone(&cache);
-        let t2 = loom::thread::spawn(move || {
-            let arc = strong_proxy_for_handle(&cache_t2, &kernel_t2, HANDLE)
-                .expect("case-b lookup must succeed under pin");
-            drop(arc);
-        });
-        t2.join().unwrap();
+        // A held WIBinder keeps the pin and the entry: case (b), same generation.
+        let weak = second.downgrade();
+        drop(second);
+        assert_eq!(kernel.ref_state(HANDLE), (0, 1));
+        let third = process.lookup(HANDLE);
+        assert_eq!(third.generation(), kept_generation);
+        assert_eq!(MockKernel::count(&kernel.bc_increfs_count), 2);
+        drop(third);
 
-        assert_eq!(
-            kernel.saw_acquire_to_freed_slot.load(Ordering::Relaxed),
-            0,
-            "I1 violation: case-b BC_ACQUIRE saw freed slot"
-        );
-        assert_eq!(
-            kernel.bc_increfs_count.load(Ordering::Relaxed),
-            1,
-            "case (b) must NOT issue a second BC_INCREFS"
-        );
-        let (strong, weak) = kernel.ref_state(HANDLE);
-        assert_eq!(strong, 0);
-        assert_eq!(weak, 1, "pin survives case-b resurrection");
+        // A lookup racing the WIBinder's drop: case (b) if it upgrades the pin first.
+        let racer = {
+            let process = Arc::clone(&process);
+            loom::thread::spawn(move || process.lookup(HANDLE).generation())
+        };
+        drop(weak);
+        let raced_generation = racer.join().unwrap();
+
+        assert_released(&process, HANDLE);
+        let increfs = MockKernel::count(&kernel.bc_increfs_count);
+        if raced_generation == kept_generation {
+            assert_eq!(increfs, 2, "case (b) reuses the live pin");
+        } else {
+            assert_eq!(increfs, 3, "case (a) after the pin's release pins afresh");
+        }
     });
 }

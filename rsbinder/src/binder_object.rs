@@ -222,9 +222,8 @@ impl FlatBinderObject {
 
                 Ok(())
             }
-            BINDER_TYPE_HANDLE => process_state::ProcessState::as_self()
-                .strong_proxy_for_handle(self.handle())?
-                .increase(),
+            // The parcel's `kernel_pinned` is AOSP `acquire_object`'s incStrong; no lookup here.
+            BINDER_TYPE_HANDLE => Ok(()),
             BINDER_TYPE_FD => {
                 // Notion to do.
                 Ok(())
@@ -249,9 +248,8 @@ impl FlatBinderObject {
                 }
                 Ok(())
             }
-            BINDER_TYPE_HANDLE => process_state::ProcessState::as_self()
-                .strong_proxy_for_handle(self.handle())?
-                .decrease(),
+            // `kernel_pinned` drops after this; a lookup would rebuild a proxy an obituary removed.
+            BINDER_TYPE_HANDLE => Ok(()),
             // The parcel's `kernel_fds` owns and closes the fd, never these bytes.
             BINDER_TYPE_FD => Ok(()),
             _ => {
@@ -396,6 +394,14 @@ mod tests {
             handle,
             "handle variant must round-trip the handle"
         );
+    }
+
+    /// A HANDLE's ref is the parcel's `kernel_pinned`; acquire/release must not look the handle up.
+    #[test]
+    fn handle_acquire_release_do_not_touch_process_state() {
+        let obj = FlatBinderObject::new_handle(0xDEAD_BEEF, 0);
+        assert_eq!(obj.acquire(), Ok(()));
+        assert_eq!(obj.release(), Ok(()));
     }
 
     #[test]

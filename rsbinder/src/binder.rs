@@ -835,12 +835,14 @@ impl SIBinder {
 
     /// Construct a weak reference to this binder.
     ///
-    /// Pure `Arc::downgrade` — no kernel command, no trait dispatch.
+    /// No kernel command, no trait dispatch.
     ///
     /// For proxies, the resulting `WIBinder` is genuinely weak: it
     /// snapshots `(handle, stability, generation)` for identity
-    /// (`PartialEq`) but upgrades only while some `Arc<ProxyHandle>`
-    /// for the handle is still alive (kernel strong count > 0). Once
+    /// (`PartialEq`), and holds the handle's cache entry the way a
+    /// `wp<BpBinder>` does (see [`WIBinder`]), but upgrades only while
+    /// some `Arc<ProxyHandle>` for the handle is still alive (kernel
+    /// strong count > 0). Once
     /// the last user `Strong` drops — sending `BC_RELEASE` and driving
     /// the kernel strong count to 0 — `upgrade()` returns
     /// `Err(DeadObject)`, matching Android `wp<BpBinder>::promote()`:
@@ -873,6 +875,7 @@ impl SIBinder {
                     stability: proxy_handle.stability(),
                     generation: proxy_handle.generation(),
                     weak,
+                    pin: Arc::clone(proxy_handle.pin()),
                 },
             }
         } else {
@@ -1007,20 +1010,17 @@ impl Eq for SIBinder {}
 /// depend on whether the underlying binder is a proxy (remote) or a
 /// native (local) one:
 ///
-/// **Proxy.** `upgrade()` is genuinely weak: it succeeds iff some
-/// `Arc<ProxyHandle>` for this handle is still alive in the process,
-/// which is exactly the condition under which the kernel strong count
-/// is still > 0.
-///   - If some `Arc<ProxyHandle>` is still alive, `upgrade()` returns
+/// **Proxy.** `upgrade()` is genuinely weak: it succeeds iff the
+/// `Arc<ProxyHandle>` this `WIBinder` was downgraded from is still alive,
+/// which keeps the kernel strong count above 0.
+///   - If that `Arc<ProxyHandle>` is still alive, `upgrade()` returns
 ///     it directly (a shared strong reference; no kernel command).
 ///   - Otherwise (every user-side `Strong` has been dropped, so the
 ///     last `BC_RELEASE` drove the kernel strong count to 0)
 ///     `upgrade()` returns `Err(DeadObject)`. It does **not** try to
 ///     re-acquire the handle: once strong has reached 0, a fresh
 ///     `BC_ACQUIRE` followed by a transaction is rejected by the
-///     kernel with `BR_FAILED_REPLY` (the `BC_INCREFS` cache pin keeps
-///     the `binder_ref` slot from being freed, but does not make a
-///     strong-0 ref transactable again). Obtaining a fresh,
+///     kernel with `BR_FAILED_REPLY`. Obtaining a fresh,
 ///     transactable proxy requires re-resolving the handle through a
 ///     new wire delivery (e.g. by name through the service manager).
 ///
@@ -1029,6 +1029,16 @@ impl Eq for SIBinder {}
 /// routes through `IPCThreadState::attemptIncStrongHandle`, which
 /// returns `INVALID_OPERATION` and refuses the promote — AOSP never
 /// revives a strong ref from weak-only on a binder handle.
+///
+/// A proxy `WIBinder` keeps the handle's proxy-cache entry and its kernel
+/// weak ref (`BC_INCREFS`), as a `wp<BpBinder>` keeps the `BpBinder` and
+/// its cache slot (`BpBinder.cpp:280`, `:833-834`). While it lives, the
+/// handle number cannot be given to another node, and a re-resolve of the
+/// handle revives the same `(handle, generation)`, so it compares equal to
+/// the new proxy. That proxy is a new `Arc<ProxyHandle>`, though, so this
+/// `WIBinder`'s `upgrade()` still returns `Err(DeadObject)`; AOSP revives the
+/// same `BpBinder`, so its `wp::promote()` would succeed. Dropping the last
+/// such reference once no proxy is left queues `BC_DECREFS`.
 ///
 /// **Native.** `upgrade()` succeeds iff some `Arc<dyn IBinder>` to the
 /// inner binder is still alive in the process. This is plain
@@ -1045,6 +1055,8 @@ pub(crate) enum WIBinderInner {
         stability: Stability,
         generation: u64,
         weak: sync::Weak<dyn IBinder>,
+        /// Keeps the cache entry and its `BC_INCREFS`, as a `wp<BpBinder>` keeps the `BpBinder`.
+        pin: Arc<crate::process_state::HandlePin>,
     },
     /// Native weak reference. Plain `sync::Weak`.
     Native(sync::Weak<dyn IBinder>),
@@ -1056,9 +1068,10 @@ impl WIBinder {
     /// A native weak reference upgrades while some `Arc<dyn IBinder>` to the
     /// binder is alive.
     ///
-    /// A proxy weak reference is genuinely weak: it upgrades only while some
-    /// `Arc<ProxyHandle>` for the handle is alive in the process, i.e. while
-    /// the kernel strong count is above 0. This mirrors Android
+    /// A proxy weak reference is genuinely weak: it upgrades only while the
+    /// `Arc<ProxyHandle>` it was downgraded from is alive, which keeps the
+    /// kernel strong count above 0; a proxy built by a later re-resolve is a
+    /// different allocation and is not reached. This mirrors Android
     /// `wp<BpBinder>::promote()`: `BpBinder` is `OBJECT_LIFETIME_WEAK`, so
     /// promoting a weak reference with strong == 0 goes through
     /// `IPCThreadState::attemptIncStrongHandle`, which returns
@@ -1069,11 +1082,11 @@ impl WIBinder {
     /// A strong-0 handle is never re-acquired. Once the last user `Strong`
     /// drops and its `BC_RELEASE` drives the kernel strong count to 0, a
     /// re-`BC_ACQUIRE` (0→1) followed by a transaction is rejected by the
-    /// kernel with `BR_FAILED_REPLY`: the `BC_INCREFS` cache pin keeps the
-    /// `binder_ref` slot from being freed but does not make a strong-0
-    /// reference transactable. A transactable strong reference requires a
-    /// fresh wire delivery of the handle, e.g. re-resolving the service by
-    /// name through the service manager.
+    /// kernel with `BR_FAILED_REPLY`: the `BC_INCREFS` cache pin this
+    /// `WIBinder` holds keeps the `binder_ref` slot from being freed but does
+    /// not make a strong-0 reference transactable. A transactable strong
+    /// reference requires a fresh wire delivery of the handle, e.g.
+    /// re-resolving the service by name through the service manager.
     pub fn upgrade(&self) -> Result<SIBinder> {
         match &self.inner {
             WIBinderInner::Native(weak) => weak
@@ -1103,6 +1116,7 @@ impl Debug for WIBinder {
                 stability,
                 generation,
                 weak,
+                ..
             } => f
                 .debug_struct("WIBinder::Proxy")
                 .field("handle", handle)
@@ -1123,11 +1137,13 @@ impl Clone for WIBinder {
                 stability,
                 generation,
                 weak,
+                pin,
             } => WIBinderInner::Proxy {
                 handle: *handle,
                 stability: *stability,
                 generation: *generation,
                 weak: sync::Weak::clone(weak),
+                pin: Arc::clone(pin),
             },
         };
         Self { inner }
