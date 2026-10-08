@@ -722,13 +722,23 @@ This changelog starts at 0.9.0. For earlier releases, see the
   In 0.11.0 they stayed until the remote died, so a process that looked up
   many short-lived remote objects kept a cache entry and a kernel weak
   reference for each. A live `WIBinder` keeps the entry, so re-receiving the
-  handle reuses its generation and descriptor and the new proxy compares
-  equal to that `WIBinder`; the proxy is still a new allocation, so that
-  `WIBinder`'s `upgrade()` keeps returning `Err(DeadObject)` (AOSP revives
-  the same `BpBinder`, so its `wp::promote()` succeeds). Once nothing holds
+  handle reuses its generation and descriptor, the new proxy compares
+  equal to that `WIBinder`, and that `WIBinder`'s `upgrade()` returns the new
+  proxy, as AOSP `wp::promote()` succeeds once `getStrongProxyForHandle` has
+  revived the same `BpBinder`. Until a re-delivery, `upgrade()` returns
+  `Err(DeadObject)` as before: it never re-acquires a strong-0 handle, which
+  the binder driver refuses. Once nothing holds
   the entry, the next lookup builds a proxy under a new generation (one
   `INTERFACE_TRANSACTION`, as a new `BpBinder` does). The last strong drop clears a registered death
   notification before `BC_RELEASE`, as AOSP `onLastStrongRef` does.
+- **`proxy_count` counts a kernel proxy over AOSP's `BpBinder` lifetime.**
+  `get_binder_proxy_count()` and the per-uid counts now count a handle from
+  its first proxy until its last proxy *and* its last `WIBinder` are gone. In
+  0.11.0 a handle only a `WIBinder` kept was not counted, re-receiving it
+  counted it again, and the per-uid map charged the uid of whichever call
+  re-received it; now that uid is the one seen when the handle was first
+  counted (AOSP `mTrackedUid`). Watermark callbacks follow the same count. No
+  signature change.
 - **`to_bytes` / `from_bytes` no longer require the `rpc` feature.** Binders
   (`BadType`) and file descriptors (`FdsNotAllowed`) are still refused on
   write and read, and `Parcel::allow_fds` is `false` on such a parcel. No wire
