@@ -726,6 +726,13 @@ This changelog starts at 0.9.0. For earlier releases, see the
   rule that `[[service]]` names are checked against. `config::Config` and
   `config::FileContents`, which `load` and `parse_file` return, are now
   re-exported.
+- **`rsbinder-aidl` warns when a type name works only without AOSP's
+  rules.** A name that resolves only because another file declares it in the
+  same package, with no `import`, still compiles, and `Builder::generate`
+  now prints a `cargo:warning=` naming the `import` to add: AOSP's `aidl`
+  (`AidlDocument::ResolveName`) rejects the name, so the same `.aidl` fails
+  in an Android build. The `example-hello` settings files gained the imports
+  they lacked.
 
 ### Changed
 
