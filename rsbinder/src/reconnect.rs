@@ -394,7 +394,13 @@ impl<T: FromIBinder + ?Sized + 'static> Reconnecting<T> {
     /// `timeout` (`None`: no limit). `TimedOut` when it runs out; the
     /// closing error once the helper is closed (`DeadObject` if there was
     /// none). `WouldBlock` inside a binder transaction or `on_connect`,
-    /// where waiting could block the reconnect itself.
+    /// where waiting could block the reconnect itself. Outside those, when
+    /// the reconnect thread cannot be spawned, `Unknown` at once rather than
+    /// a wait nothing would end, whatever the spawn's errno, as AOSP
+    /// libutils `Thread::run` returns `UNKNOWN_ERROR` when it cannot create
+    /// its thread (`Threads.cpp`, which `ProcessState::spawnPooledThread`
+    /// relies on). [`last_error`](Self::last_error) is then `Unknown` too,
+    /// and the next call tries to spawn the thread again.
     pub fn wait_connected(&self, timeout: Option<Duration>) -> Result<Strong<T>> {
         self.shared.wait_connected(timeout)
     }
@@ -405,8 +411,9 @@ impl<T: FromIBinder + ?Sized + 'static> Reconnecting<T> {
     /// `tokio::time::timeout` for a bound. The closing error once the helper
     /// is closed (`DeadObject` if there was none); `WouldBlock` inside a
     /// binder transaction or `on_connect`, where waiting could block the
-    /// reconnect itself. Dropping the future stops the wait, not the
-    /// reconnect.
+    /// reconnect itself. Outside those, a reconnect thread that cannot be
+    /// spawned resolves it to `Unknown`, as in `wait_connected`. Dropping the
+    /// future stops the wait, not the reconnect.
     #[cfg(feature = "tokio")]
     pub async fn connected(&self) -> Result<Strong<T>> {
         if crate::is_handling_transaction() {
@@ -420,6 +427,7 @@ impl<T: FromIBinder + ?Sized + 'static> Reconnecting<T> {
                 Err(AcquireError::Closed(code)) => {
                     return Err(code.unwrap_or(StatusCode::DeadObject))
                 }
+                Err(AcquireError::NoThread) => return Err(StatusCode::Unknown),
                 Err(_) => {}
             }
             // Inside `on_connect` the publish this awaits would come from this very thread.
@@ -672,6 +680,8 @@ enum AcquireError {
     Closed(Option<StatusCode>),
     WouldBlock,
     TimedOut,
+    /// The reconnect thread could not be spawned, so nothing would end a wait.
+    NoThread,
 }
 
 impl AcquireError {
@@ -682,6 +692,19 @@ impl AcquireError {
             _ => StatusCode::DeadObject,
         }
     }
+}
+
+fn spawn_reconnect_thread(body: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
+    #[cfg(test)]
+    if tests::FAIL_SPAWN.with(|fail| fail.get()) {
+        return Err(std::io::Error::from_raw_os_error(
+            rustix::io::Errno::AGAIN.raw_os_error(),
+        ));
+    }
+    std::thread::Builder::new()
+        .name("rsbinder-reconnect".into())
+        .spawn(body)
+        .map(drop)
 }
 
 impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
@@ -721,16 +744,14 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
         // The first attempt starts at once, so a call arriving now waits for it.
         st.attempting = Some(Instant::now());
         let shared = Arc::clone(self);
-        let spawned = std::thread::Builder::new()
-            .name("rsbinder-reconnect".into())
-            .spawn(move || shared.run());
-        if let Err(e) = spawned {
+        if let Err(e) = spawn_reconnect_thread(move || shared.run()) {
             log::error!(
                 "Reconnecting: cannot start the reconnect thread ({e}); a later call retries"
             );
             st.thread_alive = false;
             st.attempting = None;
-            st.last_error = Some(e.into());
+            // As AOSP `Thread::run`: `UNKNOWN_ERROR` whatever the errno (`wait_connected` rustdoc).
+            st.last_error = Some(StatusCode::Unknown);
         }
     }
 
@@ -1134,9 +1155,16 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
                 Phase::Closed => return Err(AcquireError::Closed(st.last_error)),
                 Phase::Stale => {
                     self.ensure_thread(&mut st);
+                    // Before `NoThread`: in a transaction a wait is `WouldBlock`, as `connected`.
+                    if matches!(wait, Wait::Connected(_)) && !may_wait {
+                        return Err(AcquireError::WouldBlock);
+                    }
+                    // Stale with no thread only after a failed spawn: no notify would end a wait.
+                    if !st.thread_alive {
+                        return Err(AcquireError::NoThread);
+                    }
                     let deadline = match wait {
                         Wait::Never => return Err(AcquireError::NoConnection),
-                        Wait::Connected(_) if !may_wait => return Err(AcquireError::WouldBlock),
                         Wait::Attempt if !may_wait => return Err(AcquireError::NoConnection),
                         Wait::Attempt => match st.attempting {
                             // An unrepresentable deadline waits without one.
@@ -1241,6 +1269,7 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
                 AcquireError::WouldBlock => StatusCode::WouldBlock,
                 AcquireError::TimedOut => StatusCode::TimedOut,
                 AcquireError::NoConnection => StatusCode::DeadObject,
+                AcquireError::NoThread => StatusCode::Unknown,
             })
     }
 }
@@ -1295,5 +1324,73 @@ impl crate::Interface for Unwatched {}
 impl crate::hub::IServiceCallback for Unwatched {
     fn onRegistration(&self, _name: &str, _service: &SIBinder) -> crate::status::BinderResult<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Makes `spawn_reconnect_thread` fail on this thread, as `EAGAIN` would.
+        pub(super) static FAIL_SPAWN: Cell<bool> = const { Cell::new(false) };
+    }
+
+    struct Unreachable;
+
+    impl crate::Interface for Unreachable {}
+
+    impl FromIBinder for Unreachable {
+        fn try_from(_: SIBinder) -> Result<Strong<Self>> {
+            Err(StatusCode::BadType)
+        }
+    }
+
+    /// A helper as `build` leaves it after a transient failure: `Stale`, no thread yet.
+    fn stale_helper() -> Reconnecting<Unreachable> {
+        let name = "rsbinder-reconnect-spawn-test";
+        Reconnecting {
+            shared: Arc::new(Shared {
+                cfg: Config {
+                    uri: uri::parse(&format!("binder://{name}")).expect("a kernel URI"),
+                    lookup: Lookup::Name(name.into()),
+                    options: None,
+                    on_connect: None,
+                    policy: ReconnectPolicy::default(),
+                },
+                state: Mutex::new(State::new()),
+                cv: Condvar::new(),
+                #[cfg(feature = "tokio")]
+                watch: tokio::sync::watch::channel(()).0,
+            }),
+        }
+    }
+
+    /// No reconnect thread means no notify: every wait returns the spawn error instead of parking.
+    #[test]
+    fn a_reconnect_thread_that_cannot_spawn_ends_every_wait() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            FAIL_SPAWN.with(|fail| fail.set(true));
+            let h = stale_helper();
+            let waited = h.wait_connected(None).err();
+            let current = h.current().err();
+            #[cfg(feature = "tokio")]
+            let connected = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime")
+                .block_on(h.connected())
+                .err();
+            #[cfg(not(feature = "tokio"))]
+            let connected = waited;
+            let _ = tx.send((waited, current, connected));
+        });
+        let (waited, current, connected) = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a wait with no reconnect thread must not park");
+        assert_eq!(waited, Some(StatusCode::Unknown));
+        assert_eq!(current, Some(StatusCode::DeadObject));
+        assert_eq!(connected, Some(StatusCode::Unknown));
     }
 }

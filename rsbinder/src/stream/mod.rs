@@ -729,8 +729,7 @@ const RING_OVER_RPC: crate::TransportCaps = crate::TransportCaps::SAME_HOST
     .union(crate::TransportCaps::FD_PASSING)
     .union(crate::TransportCaps::CALLBACKS);
 
-/// Linux/Android only: kernel binder or a local object always; an RPC session when opted in and
-/// capable.
+/// Linux/Android: kernel/local peers get a ring; RPC peers only when opted in and capable.
 fn over_ring(peer: &SIBinder, policy: &ReceiverPolicy) -> bool {
     let opted_in = policy.ring_use == RingUse::AlsoUnixRpc;
     if !cfg!(any(target_os = "linux", target_os = "android")) {

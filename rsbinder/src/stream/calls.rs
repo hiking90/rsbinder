@@ -627,7 +627,7 @@ impl<T: Serialize + ?Sized> Producer<T> {
         }
         // As in `flush`, but a credit timeout takes this item back out: `TimedOut` = not queued.
         self.ledger.wait_idle();
-        self.reported()?;
+        self.reported_before_send(mark)?;
         if let Err(e) = self.credit.wait_credit(deadline, &self.sink, self.ping) {
             return self.unqueue_on_timeout(e, mark);
         }
@@ -680,6 +680,16 @@ impl<T: Serialize + ?Sized> Producer<T> {
             self.count -= 1;
         }
         Err(e)
+    }
+
+    /// `reported` for the item queued at `mark`, taken back out if nothing will send it.
+    fn reported_before_send(&mut self, mark: usize) -> Result<()> {
+        let reported = self.reported();
+        if reported.is_err() && self.ledger.broken().is_some() {
+            self.truncate_batch(mark)?;
+            self.count -= 1;
+        }
+        reported
     }
 
     /// The last batch's failure, reported once; a broken stream reports it on every call.
@@ -762,7 +772,7 @@ impl<T: Serialize + ?Sized> Producer<T> {
             }
             // As in `send`.
             self.ledger.idle_async().await;
-            self.reported()?;
+            self.reported_before_send(mark)?;
             let waited = self
                 .credit
                 .wait_credit_async(deadline, &self.sink, self.ping)
@@ -2113,6 +2123,30 @@ mod tests {
             message.unwrap_or_default().contains("2 queued item"),
             "the two items of the batch that may or may not have arrived"
         );
+    }
+
+    /// A pool batch that breaks the stream while `send` waits behind it: that item is not queued.
+    #[test]
+    fn a_send_behind_a_batch_that_breaks_the_stream_queues_nothing() {
+        let recorded = Arc::new(Recorded::default());
+        let sink_binder = BnStreamSink::new_binder(RefusingSink(recorded.clone())).as_binder();
+        let mut sink = Producer::<i32>::open(&sink_binder, &sink_policy(8, 4)).expect("open");
+        sink.send(&0, None).expect("queued");
+
+        // What a dropped `send_async` leaves on the pool, settling as Unknown.
+        assert!(sink.credit.try_credit());
+        let mut in_transit = BatchInTransit::new(sink.credit.clone(), sink.ledger.clone(), 2);
+        in_transit.outcome = Outcome::Unknown(StatusCode::Unknown);
+        let settle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            drop(in_transit);
+        });
+
+        // Reaches the threshold, so it waits for the pool batch before sending its own.
+        assert_eq!(sink.send(&1, None).err(), Some(StatusCode::Unknown));
+        settle.join().expect("settle");
+        assert_eq!(sink.pending(), 1, "only the item queued before the failure");
+        assert_eq!(recorded.batches.load(Ordering::SeqCst), 0);
     }
 
     /// A grant's total counts once however it goes; a refusal nothing will retry ends the stream.

@@ -26,6 +26,8 @@ use rsbinder::{Parcel, ParcelFileDescriptor};
 struct Counting;
 
 thread_local! {
+    // Already `const`; clippy misreads the Android `thread_local!` expansion.
+    #[allow(clippy::missing_const_for_thread_local)]
     static ALLOCS: Cell<usize> = const { Cell::new(0) };
 }
 

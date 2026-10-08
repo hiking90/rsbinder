@@ -66,6 +66,26 @@ impl SharedMemory {
     /// `ASHMEM_GET_PROT_MASK` lacks `PROT_WRITE` — how it enforces
     /// read-only on ashmem, where the kernel refuses a writable mapping —
     /// or an `O_RDONLY` fd on macOS).
+    ///
+    /// The fd is not required to be shrink-sealed, so a sender that
+    /// `ftruncate`s it after this call makes the next
+    /// [`read_at`](Self::read_at) / [`write_at`](Self::write_at) in this
+    /// process die with `SIGBUS`. The [`Deserialize`] impls call this
+    /// function, so a parcel-received `SharedMemory` carries the same risk.
+    /// It is not refused because the memfd path of libcutils
+    /// `ashmem_create_region` adds `F_SEAL_SHRINK` only in builds that
+    /// carry the security fix "Add seal if ashmem-dev is backed by memfd"
+    /// (`android-14.0.0_r22`–`r27` and `r29` on; backports are in later
+    /// tags of the 11–14 `android-platform-*` and `android-security-*`
+    /// series, in no `android-11`/`12`/`13` release tag); a build without
+    /// it running with memfd sends unsealed fds. A receiver that does not
+    /// trust its sender takes the fd as a `ParcelFileDescriptor` and maps it with
+    /// [`MappedHeap::from_fd_strict`] and [`region_size`].
+    /// `from_fd_strict` refuses a legacy `/dev/ashmem` fd, so it refuses
+    /// every ashmem sender (libcutils' choice unless `sys.use_memfd` is set
+    /// or, from Android 17, the device and app meet its memfd
+    /// requirements); an ashmem region cannot be resized once mapped, so this
+    /// function alone already rules out the `SIGBUS` for such a sender.
     pub fn from_fd(fd: OwnedFd) -> Result<Self> {
         let size = region_size(&fd)?;
         let flags = if write_sealed(&fd) { FLAG_READ_ONLY } else { 0 };

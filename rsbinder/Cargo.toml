@@ -67,13 +67,7 @@ rpc-vsock = ["rpc", "dep:vsock"]
 # channels. Zero cost when off (optional deps). rsbinder never
 # invents crypto — it delegates entirely to rustls (plan §5).
 rpc-tls = ["rpc", "dep:rustls", "dep:sha2"]
-# `rpc-experimental-multiconn` retired 2026-05-28: AC-12.6 (a) twoway
-# + (b) oneway PASS lifted multi-connection-per-session
-# (`RpcServer::set_max_threads(N >= 2)`) out of EXPERIMENTAL. The
-# slot-cap clamp is gone — `set_max_threads(N)` is now the true cap on
-# every build, with the AOSP-faithful `setMaxIncomingThreads` semantic.
-# See `plan/2-12-multi-connection-per-session.md` §8 (Phase D wire
-# fix) + §9 (Phase C asyncTodo).
+# Multi-connection sessions need no feature: `RpcServer::set_max_threads(N)` caps the slots.
 # Entry points the `fuzz/` crate calls to reach a decoder directly. They
 # are `#[doc(hidden)]`, but `doc(hidden)` hides an item from the docs, not
 # from the ABI — the surface golden and `cargo-semver-checks` both still
