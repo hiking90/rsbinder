@@ -90,7 +90,11 @@ This changelog starts at 0.9.0. For earlier releases, see the
   deprecation element**; pass `String::new()` to keep the previous output. The
   `#[non_exhaustive]` render structs' new `deprecated` field needs no change.
 - **`error::SemanticError` is now `#[non_exhaustive]`** and gained
-  `FixedSizeNonFixedField` and `VintfStabilityLeak`; add a `_ => …` arm.
+  `FixedSizeNonFixedField`, `VintfStabilityLeak` and `DirectionNotSpecified`;
+  add a `_ => …` arm. `DirectionPrimitive` is replaced by `InvalidDirection`,
+  which covers every refused direction and adds the argument name and the
+  permitted directions; its `type_kind` is the AIDL type (`int`, `String`),
+  not `"a primitive type"`.
 - **A declaration nested in a `@VintfStability` type is now VINTF-stable** (see
   *Fixed*): a `ParcelableHolder` records VINTF stability for it, and
   `ParcelableHolder::set_parcelable` returns `BadValue` for a payload without
@@ -146,6 +150,72 @@ This changelog starts at 0.9.0. For earlier releases, see the
   other shapes such as `BinderResult<T, E>`, `()` or `&mut [T]` arguments,
   duplicate names, receiver attributes, an empty `descriptor`, and on
   `#[derive(Parcelable)]` a bare binder or fd field.
+- **`#[rsbinder::interface]` refuses an `out` or `#[inout]` binder object and
+  an `out` `ParcelFileDescriptor`**, `Option` or not, as AOSP `aidl` does
+  (`GetArgumentAspect`: `IBinder` and an interface go `in` only, a fd `in` or
+  `inout`). `&mut Option<rsbinder::SIBinder>`, `&mut Option<Strong<dyn IFoo>>`
+  and `&mut Option<ParcelFileDescriptor>` compiled in 0.11.0 and had no
+  Android `.aidl` counterpart. Return the object instead, pass the fd
+  `#[inout]`, or use an array, which takes every direction (`out`:
+  `&mut Vec<Option<_>>`, `#[inout]`: `&mut Vec<_>`).
+- **`rsbinder-aidl` checks argument directions as AOSP `aidl` does**
+  (`GetArgumentAspect`, `AidlArgument::CheckValid`); 0.11.0 generated code for
+  all of the following. Refused: `out` or `inout` on an `IBinder`, an
+  interface or an enum (`in` only, `@nullable` or not) and on a
+  `@JavaOnlyImmutable` parcelable or union; `out ParcelFileDescriptor` (`in`
+  or `inout` only); and an omitted direction on a type that takes more than
+  `in` — any array (fixed-size too, whatever the element), `List`, a
+  parcelable or union (generic too) and `ParcelFileDescriptor`. Write `in`
+  where the direction was omitted; the generated Rust does not change. For an
+  `out` binder, interface or enum, return it, or use an array (`out IBinder[]`
+  is `&mut Vec<Option<SIBinder>>`, and an element left `None` goes back as a
+  null binder); for an `out` fd, use `inout`. An `out` or `inout` primitive or
+  `String` stays refused, now as `SemanticError::InvalidDirection`.
+- **`#[rsbinder::interface]` and `.aidl` refuse AOSP's reserved method
+  signatures** — `asBinder()`, `getInterfaceHash()` and
+  `getInterfaceVersion()` with no argument, and `getTransactionName(int)` — as
+  AOSP `aidl` does (`AidlInterface::CheckValid`). Rename such a method; its
+  transaction code, set by declaration order, does not change.
+- **`#[rsbinder::interface]` refuses two interfaces in one module whose names
+  share a stem** — `IFoo` and `Foo` both name `BnFoo`/`BpFoo` (AOSP
+  `ClassName` drops a leading `I` before an uppercase letter). This failed
+  with E0659 only once `BnFoo` or `BpFoo` was used; it now fails at the
+  second declaration with E0428 on `__rsbinder_one_interface_per_stem_Foo`.
+  Move one of the interfaces to another module or rename it.
+- **`rsbinder-aidl`: an enum reference in a constant expression takes the type
+  of the enumerator's value, not the enum's `@Backing` width**, as AOSP
+  `AidlConstantReference::evaluate` copies the referenced value's type
+  (`@Backing` only bounds the value, `AidlEnumerator::CheckValid`). 0.11.0
+  widened to `@Backing`, so in a `long`-backed enum `BIT = 1` then
+  `BIT << 40`, and an implicit member after `2147483647`, folded; both are
+  now `int` overflows. Write the literal at the width you need (`BIT = 1L`).
+  A unary operator applies at that type too: with `A = true`, `-E.A` is
+  `true` and `~E.A` is an error; with `A = 128u8`, `-E.A` overflows `byte`.
+- **`rsbinder-aidl` binds a dotted name as AOSP `ResolveName` does**, for
+  constant references and type names alike: the first segment is looked up
+  in the enclosing types (innermost first), then the imports, then the
+  document's own top-level types, and the rest of the name must exist inside
+  what it found; a first segment found nowhere makes the name fully
+  qualified. A type of the same package declared in another file without an
+  import (an rsbinder extension; AOSP rejects it) is tried only after that,
+  so it never outranks an import or a fully-qualified name. In a
+  package-less file an import now outranks a package-less type of the same
+  simple name. So `Q.X` looks for
+  `X` in the type `Q` names and nowhere else. 0.11.0 also tried shorter
+  suffixes of a wrong qualifier (`wrong.p.I.X` folded `p.I.X`), kept
+  searching outer scopes after an inner type took the first segment
+  (`X.Y.Z.C` beside a nested `X` folded the top-level one), accepted a
+  qualifier that repeats a type's name (`X.X.C`, `E.E.A`, a field of type
+  `X.X`), let an unqualified `X` find a constant inside a nested type also
+  named `X`, and could fold `P.X` to a nested type's constant instead of
+  `P`'s. These names are now errors and `P.X` folds to `P`'s constant. Name
+  a shadowed outer type fully qualified (`p.X.Y`).
+- **`rsbinder-aidl` looks an unqualified constant up in the current type
+  only**, as AOSP `AidlConstantReference::Resolve` does. 0.11.0 also searched
+  enclosing interfaces, so `interface I { const int K = 5; enum E { A = K } }`
+  built with rsbinder but fails in AOSP `aidl` ("Can't find K in E"). Qualify
+  the reference: `A = I.K`. This includes a field default of enum type:
+  `E e = B;` is an error (AOSP "Can't find B in P"); write `E.B`.
 - **`rsbinder-aidl` and `#[rsbinder::interface]` reserve the `__Rsb` name
   prefix** (see *Fixed*). An `.aidl` interface, parcelable, enum or union
   whose name starts with it, an interface trait so named, and a signature
@@ -625,18 +695,20 @@ This changelog starts at 0.9.0. For earlier releases, see the
   reference from a `@VintfStability` type (a `@RustOnlyStableParcelable` is
   exempt); misplaced `ParcelableHolder` or `void`; an empty `union`; a
   `@FixedSize` union with more than 128 fields; duplicate names of any kind,
-  including a type defined in two input files and union fields whose names
+  including a type defined in two input files (a nested type or a union's
+  implicit `Tag` counts, so nested `a.b.c` beside a top-level `a.b.c` is
+  refused) and union fields whose names
   differ only in the first letter's case; a type argument on a non-generic
   type; a `const` not of a primitive, `String` or array of those; a
-  non-decimal transaction code (`1_0`, `10L`). Any argument name is accepted.
+  non-decimal transaction code (`1_0`, `10L`); an argument direction the type
+  does not permit, or none where it permits more than `in` (see *Migrating*).
+  Any argument name is accepted.
 - **`@deprecated` support.** `rsbinder-aidl` emits a `/** @deprecated note */`
   javadoc as `#[deprecated = "note"]` (AOSP `FindDeprecated` rules), and
   `rsbinder-macros` carries `#[deprecated]` through as AIDL `@deprecated`
   (`since` / `note = …` are refused). `render::deprecated_attr` is public.
-- **`rsbinder-macros`: `#[nonnull]`** on an `out` binder or fd means
-  `out IFoo` (a `None` left behind is `UNEXPECTED_NULL`); without it,
-  `&mut Option<_>` means `out @nullable`. The signature checks now cover
-  every out/inout and `in` array shape `.aidl` renders.
+- **`rsbinder-macros`: the signature checks cover every out/inout and `in`
+  array shape `.aidl` renders.**
 - **rsbinder-tools: `config::is_valid_service_name`**, the `addService` name
   rule that `[[service]]` names are checked against. `config::Config` and
   `config::FileContents`, which `load` and `parse_file` return, are now
@@ -644,6 +716,19 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Changed
 
+- **A kernel proxy's cache entry and its `BC_INCREFS` reference are released
+  when the last `SIBinder` and the last `WIBinder` for the handle are gone**,
+  as AOSP releases them in `~BpBinder` (`expungeHandle` + `decWeakHandle`).
+  In 0.11.0 they stayed until the remote died, so a process that looked up
+  many short-lived remote objects kept a cache entry and a kernel weak
+  reference for each. A live `WIBinder` keeps the entry, so re-receiving the
+  handle reuses its generation and descriptor and the new proxy compares
+  equal to that `WIBinder`; the proxy is still a new allocation, so that
+  `WIBinder`'s `upgrade()` keeps returning `Err(DeadObject)` (AOSP revives
+  the same `BpBinder`, so its `wp::promote()` succeeds). Once nothing holds
+  the entry, the next lookup builds a proxy under a new generation (one
+  `INTERFACE_TRANSACTION`, as a new `BpBinder` does). The last strong drop clears a registered death
+  notification before `BC_RELEASE`, as AOSP `onLastStrongRef` does.
 - **`to_bytes` / `from_bytes` no longer require the `rpc` feature.** Binders
   (`BadType`) and file descriptors (`FdsNotAllowed`) are still refused on
   write and read, and `Parcel::allow_fds` is `false` on such a parcel. No wire
@@ -746,6 +831,21 @@ after 0.12.0. The single-connection one-liners
 
 ### Fixed
 
+- **RPC on macOS: a call or send whose peer closed while it waited (with
+  `set_timeout` set) returned `BadValue` instead of `DeadObject`.** XNU
+  refuses `SO_RCVTIMEO` on a socket shut in both directions; the deadline is
+  now skipped on a closed peer and the call ends with `DeadObject`.
+- **RPC: a transaction made inside a reply wait on the same connection**,
+  such as one from a `Drop` that a `DEC_STRONG` released, no longer clears
+  the outer call's `set_timeout` reply deadline. Each deadline guard now
+  restores the deadline it replaced.
+- **RPC `unix` transport: `send_raw_draining` and `send_raw_with_fds` no
+  longer count the 16-byte `RpcWireHeader` against `MAX_FRAME_LEN`**, so a
+  `MAX_FRAME_LEN` body is accepted as on the other transports.
+- **`rsbinder-aidl`: a union's implicit `Tag` has its enumerators**, one per
+  field in order (AOSP `UnionTagGenerater`), so `U.Tag.b` resolves as a field
+  default and in a constant expression (`const int K = U.Tag.b;` is `1`); it
+  was "unresolved".
 - **`FLAG_COLLECT_NOTED_APP_OPS` is `0x2`**, the value of AOSP
   `IBinder.java`, which Java `Binder.execTransactInternal` tests. It was
   `0x80`, which a Java service ignored and which the android17-6.18 kernel
@@ -924,11 +1024,25 @@ after 0.12.0. The single-connection one-liners
   request read back before it was sent, cost the peer an extra `DEC_STRONG`:
   libbinder 16_r4+ ends the session, other peers free the node early
   (`DeadObject`). A proxy written into a received parcel is `InvalidOperation`.
-- **RPC: a peer that only sends oneways can no longer stall a server.** A
-  `DEC_STRONG` raised while serving a oneway went out on that connection, which
-  an rsbinder sender reads only while waiting for a reply; enough of them
-  blocked both ends. It now goes to a connection the peer serves, or waits for
-  the next reply on that one.
+- **RPC: a client that only sends oneways no longer deadlocks with its
+  server.** A server writes the `DEC_STRONG`s raised while serving a oneway on
+  that connection when no other is free (libbinder at once, as AOSP
+  `ExclusiveConnection::find` does). rsbinder read that connection only while
+  waiting for a reply, so enough of them blocked both ends. A transaction's
+  send now reads `DEC_STRONG`s off its connection while it waits for room, as
+  AOSP's `drainCommands` does; any other command read there ends the session
+  (`BadType` for a request), judged on the android-13+ wire from its header
+  alone, and those reads are bounded by the session's send deadline
+  (`set_timeout`, or a server's idle timeout). A send that fails ends the
+  session before anything else is written on its connection. An rsbinder
+  server also holds such `DEC_STRONG`s, up to 10 000 addresses per
+  connection, until its next reply there, or sends them on a connection the
+  client serves; past that it writes them as libbinder does, which a client
+  that never drains (libbinder 16_r4+ with incoming threads, android-12
+  libbinder, rsbinder before this release) can still block on. A custom
+  `RpcTransport` drains by implementing the new `send_raw_draining` and
+  `send_frame_draining` (the defaults send without reading), and a custom
+  `TlsStream` by returning its socket from the new `socket`.
 - **An RPC parcel dropped without being sent releases its local binders'
   `timesSent` reservations** (AOSP `mSendState`); a request refused before the
   send (`WouldBlock`, `DeadObject`) keeps them, so the documented retry with
