@@ -161,6 +161,8 @@ fn main() {
         .source(PathBuf::from("aidl/prelude_shadow/ShadowUnion.aidl"))
         .source(PathBuf::from("aidl/prelude_shadow/ShadowParcelable.aidl"))
         .source(PathBuf::from("aidl/prelude_shadow/IShadow.aidl"))
+        .source(PathBuf::from("aidl/prelude_shadow/ShadowTypes.aidl"))
+        .source(PathBuf::from("aidl/prelude_shadow/IShadowTypes.aidl"))
         .output(PathBuf::from("prelude_shadow.rs"))
         .generate()
         .unwrap();

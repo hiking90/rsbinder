@@ -3,6 +3,7 @@
 
 //! `syn::Type` printed as `TypeGenerator::type_declaration` does: the golden gate compares text.
 
+use rsbinder_aidl::render::{BOX, OPTION, STRING, VEC};
 use syn::{GenericArgument, PathArguments, Type};
 
 /// The expanding macro, so an unsupported-type error names the one the user wrote.
@@ -102,7 +103,7 @@ pub fn as_written_in(ty: &Type, ctx: Ctx) -> syn::Result<String> {
                 if i > 0 || p.path.leading_colon.is_some() {
                     out.push_str("::");
                 }
-                out.push_str(&seg.ident.to_string());
+                out.push_str(&segment_name(&p.path, seg));
                 reject_parenthesized(&seg.arguments)?;
                 if let PathArguments::AngleBracketed(args) = &seg.arguments {
                     let mut rendered = Vec::new();
@@ -127,6 +128,20 @@ pub fn as_written_in(ty: &Type, ctx: Ctx) -> syn::Result<String> {
         }
         other => return Err(syn::Error::new_spanned(other, ctx.unsupported())),
     })
+}
+
+/// A segment as printed: a bare `Option`/`Vec`/`Box`/`String` gets `rsbinder-aidl`'s path,
+/// since the checks here already read those names as std's.
+fn segment_name(path: &syn::Path, seg: &syn::PathSegment) -> String {
+    let bare = path.leading_colon.is_none() && path.segments.len() == 1;
+    let std = match seg.ident.to_string().as_str() {
+        "Option" if bare => OPTION,
+        "Vec" if bare => VEC,
+        "Box" if bare => BOX,
+        "String" if bare => STRING,
+        _ => return seg.ident.to_string(),
+    };
+    std.to_string()
 }
 
 /// The printers walk only `<..>` arguments, so `Fn(i32)` would render as a bare `Fn`.
@@ -220,8 +235,8 @@ pub fn owned(ty: &Type) -> syn::Result<String> {
     let ty = unwrap_group(ty);
     Ok(match ty {
         Type::Reference(r) => match unwrap_group(&r.elem) {
-            Type::Path(p) if p.path.is_ident("str") => "String".to_string(),
-            Type::Slice(s) => format!("Vec<{}>", owned(&s.elem)?),
+            Type::Path(p) if p.path.is_ident("str") => STRING.to_string(),
+            Type::Slice(s) => format!("{VEC}<{}>", owned(&s.elem)?),
             inner => owned(inner)?,
         },
         Type::Path(p) => {
@@ -237,7 +252,7 @@ pub fn owned(ty: &Type) -> syn::Result<String> {
                 if i > 0 || p.path.leading_colon.is_some() {
                     out.push_str("::");
                 }
-                out.push_str(&seg.ident.to_string());
+                out.push_str(&segment_name(&p.path, seg));
                 reject_parenthesized(&seg.arguments)?;
                 if let PathArguments::AngleBracketed(args) = &seg.arguments {
                     let mut rendered = Vec::new();
@@ -260,7 +275,7 @@ pub fn owned(ty: &Type) -> syn::Result<String> {
             }
             out
         }
-        Type::Slice(s) => format!("Vec<{}>", owned(&s.elem)?),
+        Type::Slice(s) => format!("{VEC}<{}>", owned(&s.elem)?),
         other => as_written(other)?,
     })
 }

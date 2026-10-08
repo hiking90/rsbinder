@@ -940,7 +940,10 @@ fn java_only_immutable_keeps_its_fields() {
         "package im;\n@JavaOnlyImmutable parcelable Bar { String s = \"bar\"; int n = 7; }",
     )
     .expect("must generate");
-    assert!(out.contains("pub r#s: String"), "got:\n{out}");
+    assert!(
+        out.contains("pub r#s: ::std::string::String"),
+        "got:\n{out}"
+    );
     assert!(out.contains("pub r#n: i32"), "got:\n{out}");
 
     let u = generate_str("package im;\n@JavaOnlyImmutable union U { int num; String s; }")
@@ -1063,12 +1066,12 @@ fn out_argument_without_default_is_optional() {
     let out =
         generate_str("package a; interface I { void m(out IBinder[] b); }").expect("must generate");
     assert!(
-        out.contains("_arg_b: &mut Vec<Option<rsbinder::SIBinder>>"),
+        out.contains("_arg_b: &mut ::std::vec::Vec<::core::option::Option<rsbinder::SIBinder>>"),
         "got:\n{out}"
     );
     assert!(
         out.contains(
-            "let mut _arg_b: Vec<Option<rsbinder::SIBinder>> = ::core::default::Default::default();"
+            "let mut _arg_b: ::std::vec::Vec<::core::option::Option<rsbinder::SIBinder>> = ::core::default::Default::default();"
         ),
         "got:\n{out}"
     );
@@ -1081,19 +1084,19 @@ fn inout_array_signature_matches_server_local() {
     for (src, ty) in [
         (
             "package a; interface I { void m(inout ParcelFileDescriptor[] p); }",
-            "Vec<rsbinder::ParcelFileDescriptor>",
+            "::std::vec::Vec<rsbinder::ParcelFileDescriptor>",
         ),
         (
             "package a; interface I { void m(inout IBinder[] p); }",
-            "Vec<rsbinder::SIBinder>",
+            "::std::vec::Vec<rsbinder::SIBinder>",
         ),
         (
             "package a; interface I { void m(inout @nullable int[] p); }",
-            "Option<Vec<i32>>",
+            "::core::option::Option<::std::vec::Vec<i32>>",
         ),
         (
             "package a; interface I { void m(inout @nullable String[] p); }",
-            "Option<Vec<Option<String>>>",
+            "::core::option::Option<::std::vec::Vec<::core::option::Option<::std::string::String>>>",
         ),
     ] {
         let out = generate_str(src).expect("must generate");
@@ -1469,9 +1472,9 @@ fn nullable_fixed_array_follows_the_vector_element_rule() {
     )
     .expect("must generate");
     for expected in [
-        "_arg_i: &mut Option<[i32; 3]>",
-        "_arg_e: &mut Option<[super::E::E; 3]>",
-        "_arg_s: &mut Option<[Option<String>; 3]>",
+        "_arg_i: &mut ::core::option::Option<[i32; 3]>",
+        "_arg_e: &mut ::core::option::Option<[super::E::E; 3]>",
+        "_arg_s: &mut ::core::option::Option<[::core::option::Option<::std::string::String>; 3]>",
     ] {
         assert!(out.contains(expected), "expected `{expected}`, got:\n{out}");
     }
@@ -1487,12 +1490,12 @@ fn nullable_fixed_array_wraps_elements_in_every_place() {
     )
     .expect("must generate");
     for expected in [
-        "fn r#r(&self) -> rsbinder::BinderResult<Option<[Option<String>; 3]>>",
-        "fn r#ri(&self) -> rsbinder::BinderResult<Option<[i32; 3]>>",
-        "_arg_s: Option<&[Option<String>; 3]>",
-        "_arg_p: Option<&[[Option<rsbinder::ParcelFileDescriptor>; 2]; 2]>",
-        "_arg_i: Option<&[i32; 3]>",
-        "_arg_b: &mut Option<[Option<rsbinder::SIBinder>; 3]>",
+        "fn r#r(&self) -> rsbinder::BinderResult<::core::option::Option<[::core::option::Option<::std::string::String>; 3]>>",
+        "fn r#ri(&self) -> rsbinder::BinderResult<::core::option::Option<[i32; 3]>>",
+        "_arg_s: ::core::option::Option<&[::core::option::Option<::std::string::String>; 3]>",
+        "_arg_p: ::core::option::Option<&[[::core::option::Option<rsbinder::ParcelFileDescriptor>; 2]; 2]>",
+        "_arg_i: ::core::option::Option<&[i32; 3]>",
+        "_arg_b: &mut ::core::option::Option<[::core::option::Option<rsbinder::SIBinder>; 3]>",
     ] {
         assert!(out.contains(expected), "expected `{expected}`, got:\n{out}");
     }
@@ -1509,7 +1512,7 @@ fn inout_fixed_array_keeps_elements_bare() {
     for expected in [
         "_arg_p: &mut [rsbinder::ParcelFileDescriptor; 3]",
         "_arg_b: &mut [[rsbinder::SIBinder; 2]; 2]",
-        "_arg_q: &mut [Option<rsbinder::ParcelFileDescriptor>; 3]",
+        "_arg_q: &mut [::core::option::Option<rsbinder::ParcelFileDescriptor>; 3]",
     ] {
         assert!(out.contains(expected), "expected `{expected}`, got:\n{out}");
     }
@@ -1531,14 +1534,14 @@ fn nullable_string_array_constant_type_matches_its_initializer() {
     .expect("must generate");
     assert!(
         out.contains(
-            "pub const r#X: Option<[Option<&str>; 2]> = ::core::option::Option::Some([\
+            "pub const r#X: ::core::option::Option<[::core::option::Option<&str>; 2]> = ::core::option::Option::Some([\
              ::core::option::Option::Some(\"a\"),::core::option::Option::Some(\"b\"),]);"
         ),
         "got:\n{out}"
     );
     assert!(
         out.contains(
-            "pub const r#Y: Option<&[Option<&str>]> = ::core::option::Option::Some(&[\
+            "pub const r#Y: ::core::option::Option<&[::core::option::Option<&str>]> = ::core::option::Option::Some(&[\
              ::core::option::Option::Some(\"a\"),]);"
         ),
         "got:\n{out}"

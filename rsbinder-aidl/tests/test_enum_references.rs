@@ -343,7 +343,7 @@ pub mod Task {
     #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
     #[derive(Debug)]
     pub struct Task {
-        pub r#name: String,
+        pub r#name: ::std::string::String,
         pub r#priority: i32,
     }
     impl ::core::default::Default for Task {
@@ -743,7 +743,7 @@ fn test_parcelable_non_null_interface_field_is_option() -> Result<(), Box<dyn Er
 
     let holder_field = output.lines().find(|l| l.contains("r#op:")).unwrap_or("");
     assert!(
-        holder_field.contains("Option<rsbinder::Strong<dyn super::IFoo::IFoo>>"),
+        holder_field.contains("::core::option::Option<rsbinder::Strong<dyn super::IFoo::IFoo>>"),
         "non-null interface field must be Option<Strong<dyn _>>, got: {}",
         holder_field
     );

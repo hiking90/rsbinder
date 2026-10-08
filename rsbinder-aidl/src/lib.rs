@@ -128,6 +128,7 @@ pub mod render {
         render_parcelable, ConstMember, EnumMember, EnumRender, FnMembers, InterfaceRender,
         ParcelableMember, ParcelableRender, TransactionWrite, RESERVED_NAME_PREFIX,
     };
+    pub use crate::type_generator::{BOX, OPTION, STRING, VEC};
 }
 pub use parser::parse_document;
 pub use parser::SourceContext;

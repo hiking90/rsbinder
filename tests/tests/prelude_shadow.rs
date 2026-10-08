@@ -1,9 +1,10 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! AIDL names that are also std prelude items (`Ok`, `Err`, `Some`, `None`, `Default`)
-//! become items of the generated module and shadow the prelude there. The generated
-//! code must name the prelude items by path, or this file does not compile.
+//! AIDL names that are also std prelude items (`Ok`, `Err`, `Some`, `None`, `Default`,
+//! `Option`, `Vec`, `Box`, `String`) become items of the generated module and shadow the
+//! prelude there. The generated code must name the prelude items by path, or this file
+//! does not compile.
 
 #![allow(non_snake_case)]
 
@@ -13,6 +14,7 @@ include!(concat!(env!("OUT_DIR"), "/prelude_shadow.rs"));
 
 use preludeshadow::IShadow;
 use preludeshadow::ShadowParcelable::{self, ShadowParcelable as Shadow};
+use preludeshadow::ShadowTypes::ShadowTypes;
 use preludeshadow::ShadowUnion::{self, ShadowUnion as Union};
 
 fn round_trip<T>(value: &T) -> T
@@ -60,6 +62,30 @@ fn parcelable_with_a_nested_default_type_round_trips() {
     assert_eq!(back.text, "text");
     assert_eq!(back.nested.x, 7);
     assert_eq!(back.values, Some(vec![1, 2]));
+}
+
+/// Nested `Option`/`Vec`/`Box`/`String` types beside fields of the std types.
+#[test]
+fn parcelable_with_nested_std_named_types_round_trips() {
+    let mut value = ShadowTypes {
+        values: vec![1, 2, 3],
+        text: "text".into(),
+        maybe: Some("maybe".into()),
+        ..Default::default()
+    };
+    value.option.x = 5;
+    value.next = Some(Box::new(ShadowTypes {
+        values: vec![4],
+        ..Default::default()
+    }));
+    let back = round_trip(&value);
+    assert_eq!(back.values, [1, 2, 3]);
+    assert_eq!(
+        (back.text.as_str(), back.maybe.as_deref()),
+        ("text", Some("maybe"))
+    );
+    assert_eq!(back.option.x, 5);
+    assert_eq!(back.next.expect("next").values, [4]);
 }
 
 #[test]

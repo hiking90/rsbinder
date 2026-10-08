@@ -128,12 +128,12 @@ pub mod Union {
     #[derive(Debug)]
     #[derive(Clone,PartialEq)]
     pub enum r#Union {
-        r#Ns(Vec<i32>),
+        r#Ns(::std::vec::Vec<i32>),
         r#N(i32),
         r#M(i32),
-        r#S(String),
-        r#Ibinder(Option<rsbinder::SIBinder>),
-        r#Ss(Vec<String>),
+        r#S(::std::string::String),
+        r#Ibinder(::core::option::Option<rsbinder::SIBinder>),
+        r#Ss(::std::vec::Vec<::std::string::String>),
         r#Be(super::ByteEnum::ByteEnum),
     }
     pub const r#S1: &str = "a string constant in union";
@@ -179,7 +179,7 @@ pub mod Union {
             let tag: i32 = parcel.read()?;
             match tag {
                 0 => {
-                    let value: Vec<i32> = parcel.read()?;
+                    let value: ::std::vec::Vec<i32> = parcel.read()?;
                     *self = Self::r#Ns(value);
                     ::core::result::Result::Ok(())
                 }
@@ -194,17 +194,17 @@ pub mod Union {
                     ::core::result::Result::Ok(())
                 }
                 3 => {
-                    let value: String = parcel.read()?;
+                    let value: ::std::string::String = parcel.read()?;
                     *self = Self::r#S(value);
                     ::core::result::Result::Ok(())
                 }
                 4 => {
-                    let value: Option<rsbinder::SIBinder> = parcel.read()?;
+                    let value: ::core::option::Option<rsbinder::SIBinder> = parcel.read()?;
                     *self = Self::r#Ibinder(value);
                     ::core::result::Result::Ok(())
                 }
                 5 => {
-                    let value: Vec<String> = parcel.read()?;
+                    let value: ::std::vec::Vec<::std::string::String> = parcel.read()?;
                     *self = Self::r#Ss(value);
                     ::core::result::Result::Ok(())
                 }
@@ -698,7 +698,7 @@ pub mod OuterUnion {
         #[derive(Debug)]
         pub struct InnerData {
             pub r#value: i32,
-            pub r#name: String,
+            pub r#name: ::std::string::String,
         }
         impl ::core::default::Default for InnerData {
             fn default() -> Self {

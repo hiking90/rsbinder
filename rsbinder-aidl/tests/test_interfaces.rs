@@ -119,7 +119,7 @@ pub mod ArrayOfInterfaces {
         #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
         pub trait IMyInterface: rsbinder::Interface + ::core::marker::Send {
             fn descriptor() -> &'static str where Self: Sized { "ArrayOfInterfaces.IMyInterface" }
-            fn r#methodWithInterfaces(&self, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: Option<&[Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::BinderResult<Option<Vec<Option<String>>>>;
+            fn r#methodWithInterfaces(&self, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: ::core::option::Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut ::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut ::std::vec::Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: ::core::option::Option<&[::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::BinderResult<::core::option::Option<::std::vec::Vec<::core::option::Option<::std::string::String>>>>;
             fn getDefaultImpl() -> ::core::option::Option<IMyInterfaceDefaultRef> where Self: Sized {
                 DEFAULT_IMPL.get().cloned()
             }
@@ -128,7 +128,7 @@ pub mod ArrayOfInterfaces {
             }
         }
         pub trait IMyInterfaceDefault: ::core::marker::Send + ::core::marker::Sync {
-            fn r#methodWithInterfaces(&self, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: Option<&[Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::BinderResult<Option<Vec<Option<String>>>> {
+            fn r#methodWithInterfaces(&self, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: ::core::option::Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut ::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut ::std::vec::Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: ::core::option::Option<&[::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::BinderResult<::core::option::Option<::std::vec::Vec<::core::option::Option<::std::string::String>>>> {
                 ::core::result::Result::Err(rsbinder::StatusCode::UnknownTransaction.into())
             }
         }
@@ -146,7 +146,7 @@ pub mod ArrayOfInterfaces {
             }
         }
         impl BpMyInterface {
-            fn build_parcel_methodWithInterfaces(&self, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: Option<&[Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::Result<rsbinder::Parcel> {
+            fn build_parcel_methodWithInterfaces(&self, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: ::core::option::Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut ::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut ::std::vec::Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: ::core::option::Option<&[::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::Result<rsbinder::Parcel> {
                 let mut data = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.prepare_transact(true)?;
                 data.write(_arg_iface)?;
                 data.write(&_arg_nullable_iface)?;
@@ -158,7 +158,7 @@ pub mod ArrayOfInterfaces {
                 data.write(_arg_nullable_iface_array_inout)?;
                 ::core::result::Result::Ok(data)
             }
-            fn read_response_methodWithInterfaces(&self, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: Option<&[Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _aidl_reply: rsbinder::Result<::core::option::Option<rsbinder::Parcel>>) -> rsbinder::BinderResult<Option<Vec<Option<String>>>> {
+            fn read_response_methodWithInterfaces(&self, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: ::core::option::Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut ::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut ::std::vec::Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: ::core::option::Option<&[::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _aidl_reply: rsbinder::Result<::core::option::Option<rsbinder::Parcel>>) -> rsbinder::BinderResult<::core::option::Option<::std::vec::Vec<::core::option::Option<::std::string::String>>>> {
                 if let ::core::result::Result::Err(rsbinder::StatusCode::UnknownTransaction) = _aidl_reply {
                     if let ::core::option::Option::Some(_aidl_default_impl) = <Self as IMyInterface>::getDefaultImpl() {
                       return _aidl_default_impl.r#methodWithInterfaces(_arg_iface, _arg_nullable_iface, _arg_iface_array_in, _arg_iface_array_out, _arg_iface_array_inout, _arg_nullable_iface_array_in, _arg_nullable_iface_array_out, _arg_nullable_iface_array_inout);
@@ -167,7 +167,7 @@ pub mod ArrayOfInterfaces {
                 let mut _aidl_reply = _aidl_reply?.ok_or(rsbinder::StatusCode::UnexpectedNull)?;
                 let _status = _aidl_reply.read::<rsbinder::Status>()?;
                 if !_status.is_ok() { return ::core::result::Result::Err(_status); }
-                let _aidl_return: Option<Vec<Option<String>>> = _aidl_reply.read()?;
+                let _aidl_return: ::core::option::Option<::std::vec::Vec<::core::option::Option<::std::string::String>>> = _aidl_reply.read()?;
                 _aidl_reply.read_onto(_arg_iface_array_out)?;
                 _aidl_reply.read_onto(_arg_iface_array_inout)?;
                 _aidl_reply.read_onto(_arg_nullable_iface_array_out)?;
@@ -176,14 +176,14 @@ pub mod ArrayOfInterfaces {
             }
         }
         impl IMyInterface for BpMyInterface {
-            fn r#methodWithInterfaces(&self, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: Option<&[Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::BinderResult<Option<Vec<Option<String>>>> {
+            fn r#methodWithInterfaces(&self, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: ::core::option::Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut ::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut ::std::vec::Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: ::core::option::Option<&[::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::BinderResult<::core::option::Option<::std::vec::Vec<::core::option::Option<::std::string::String>>>> {
                 let _aidl_data = self.build_parcel_methodWithInterfaces(_arg_iface, _arg_nullable_iface, _arg_iface_array_in, _arg_iface_array_out, _arg_iface_array_inout, _arg_nullable_iface_array_in, _arg_nullable_iface_array_out, _arg_nullable_iface_array_inout)?;
                 let _aidl_reply = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#methodWithInterfaces, &_aidl_data, rsbinder::FLAG_CLEAR_BUF | rsbinder::FLAG_PRIVATE_LOCAL);
                 self.read_response_methodWithInterfaces(_arg_iface, _arg_nullable_iface, _arg_iface_array_in, _arg_iface_array_out, _arg_iface_array_inout, _arg_nullable_iface_array_in, _arg_nullable_iface_array_out, _arg_nullable_iface_array_inout, _aidl_reply)
             }
         }
         impl IMyInterface for rsbinder::Binder<BnMyInterface> {
-            fn r#methodWithInterfaces(&self, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: Option<&[Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::BinderResult<Option<Vec<Option<String>>>> {
+            fn r#methodWithInterfaces(&self, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: ::core::option::Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut ::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut ::std::vec::Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: ::core::option::Option<&[::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::BinderResult<::core::option::Option<::std::vec::Vec<::core::option::Option<::std::string::String>>>> {
                 self.0.r#methodWithInterfaces(_arg_iface, _arg_nullable_iface, _arg_iface_array_in, _arg_iface_array_out, _arg_iface_array_inout, _arg_nullable_iface_array_in, _arg_nullable_iface_array_out, _arg_nullable_iface_array_inout)
             }
         }
@@ -194,7 +194,7 @@ pub mod ArrayOfInterfaces {
         /// Binder-typed arguments still have to be re-wrapped by hand; a proxy
         /// forwarded as-is is refused at the stack boundary.
         impl IMyInterface for rsbinder::Strong<dyn IMyInterface> {
-            fn r#methodWithInterfaces(&self, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: Option<&[Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::BinderResult<Option<Vec<Option<String>>>> {
+            fn r#methodWithInterfaces(&self, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: ::core::option::Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut ::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut ::std::vec::Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: ::core::option::Option<&[::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::BinderResult<::core::option::Option<::std::vec::Vec<::core::option::Option<::std::string::String>>>> {
                 (**self).r#methodWithInterfaces(_arg_iface, _arg_nullable_iface, _arg_iface_array_in, _arg_iface_array_out, _arg_iface_array_inout, _arg_nullable_iface_array_in, _arg_nullable_iface_array_out, _arg_nullable_iface_array_inout)
             }
         }
@@ -203,15 +203,15 @@ pub mod ArrayOfInterfaces {
             match _code {
                 transactions::r#methodWithInterfaces => {
                     let _arg_iface: rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface> = _reader.read()?;
-                    let _arg_nullable_iface: Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>> = _reader.read()?;
-                    let _arg_iface_array_in: Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>> = _reader.read()?;
-                    let mut _arg_iface_array_out: Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>> = ::core::default::Default::default();
+                    let _arg_nullable_iface: ::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>> = _reader.read()?;
+                    let _arg_iface_array_in: ::std::vec::Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>> = _reader.read()?;
+                    let mut _arg_iface_array_out: ::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>> = ::core::default::Default::default();
                     _reader.resize_out_vec(&mut _arg_iface_array_out)?;
-                    let mut _arg_iface_array_inout: Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>> = _reader.read()?;
-                    let _arg_nullable_iface_array_in: Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>> = _reader.read()?;
-                    let mut _arg_nullable_iface_array_out: Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>> = ::core::default::Default::default();
+                    let mut _arg_iface_array_inout: ::std::vec::Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>> = _reader.read()?;
+                    let _arg_nullable_iface_array_in: ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>> = _reader.read()?;
+                    let mut _arg_nullable_iface_array_out: ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>> = ::core::default::Default::default();
                     _reader.resize_nullable_out_vec(&mut _arg_nullable_iface_array_out)?;
-                    let mut _arg_nullable_iface_array_inout: Option<Vec<Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>> = _reader.read()?;
+                    let mut _arg_nullable_iface_array_inout: ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>> = _reader.read()?;
                     let _aidl_return = _service.r#methodWithInterfaces(&_arg_iface, _arg_nullable_iface.as_ref(), &_arg_iface_array_in, &mut _arg_iface_array_out, &mut _arg_iface_array_inout, _arg_nullable_iface_array_in.as_deref(), &mut _arg_nullable_iface_array_out, &mut _arg_nullable_iface_array_inout);
                     match &_aidl_return {
                         ::core::result::Result::Ok(_aidl_return) => {
@@ -371,11 +371,11 @@ interface ISelfRef {
         "a non-nullable interface parameter stays a bare Strong:\n{out}"
     );
     assert!(
-        out.contains("Option<rsbinder::Strong<dyn ISelfRef>>"),
+        out.contains("::core::option::Option<rsbinder::Strong<dyn ISelfRef>>"),
         "@nullable must still be an Option:\n{out}"
     );
     assert!(
-        out.contains("Vec<rsbinder::Strong<dyn ISelfRef>>"),
+        out.contains("::std::vec::Vec<rsbinder::Strong<dyn ISelfRef>>"),
         "arrays must still be Vec:\n{out}"
     );
     // `Box<…>` parses fine: the assertion above is the guard, this rules out other breakage.
@@ -400,7 +400,10 @@ parcelable Node {
         .document(&document)?
         .1;
 
-    assert!(out.contains("Option<Box<Node>>"), "{out}");
+    assert!(
+        out.contains("::core::option::Option<::std::boxed::Box<Node>>"),
+        "{out}"
+    );
     syn::parse_file(&out).map_err(|e| format!("generated code does not parse: {e}\n{out}"))?;
     Ok(())
 }
@@ -426,8 +429,14 @@ parcelable Leaf {
         .document(&document)?
         .1;
 
-    assert!(out.contains("Option<Box<super::Leaf::Leaf>>"), "{out}");
-    assert!(out.contains("Option<Box<super::Branch::Branch>>"), "{out}");
+    assert!(
+        out.contains("::core::option::Option<::std::boxed::Box<super::Leaf::Leaf>>"),
+        "{out}"
+    );
+    assert!(
+        out.contains("::core::option::Option<::std::boxed::Box<super::Branch::Branch>>"),
+        "{out}"
+    );
     syn::parse_file(&out).map_err(|e| format!("generated code does not parse: {e}\n{out}"))?;
     Ok(())
 }
@@ -528,8 +537,11 @@ parcelable Node {
         !out.contains("Box<"),
         "a Vec already breaks the cycle:\n{out}"
     );
-    assert!(out.contains("Vec<super::Node::Node>"), "{out}");
-    assert!(out.contains("Option<super::Tree::Tree>"), "{out}");
+    assert!(out.contains("::std::vec::Vec<super::Node::Node>"), "{out}");
+    assert!(
+        out.contains("::core::option::Option<super::Tree::Tree>"),
+        "{out}"
+    );
     syn::parse_file(&out).map_err(|e| format!("generated code does not parse: {e}\n{out}"))?;
     Ok(())
 }

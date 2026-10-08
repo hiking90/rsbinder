@@ -282,7 +282,7 @@ pub mod ConnectionInfo {
     #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
     #[derive(Debug)]
     pub struct ConnectionInfo {
-        pub r#ipAddress: String,
+        pub r#ipAddress: ::std::string::String,
         pub r#port: i32,
     }
     impl ::core::default::Default for ConnectionInfo {
@@ -513,16 +513,16 @@ pub mod StructuredParcelable {
     pub const r#BIT2: i32 = 4;
     #[derive(Debug)]
     pub struct StructuredParcelable {
-        pub r#shouldContainThreeFs: Vec<i32>,
+        pub r#shouldContainThreeFs: ::std::vec::Vec<i32>,
         pub r#f: i32,
-        pub r#shouldBeJerry: String,
+        pub r#shouldBeJerry: ::std::string::String,
         pub r#shouldBeByteBar: super::ByteEnum::ByteEnum,
         pub r#shouldBeIntBar: super::IntEnum::IntEnum,
         pub r#shouldBeLongBar: super::LongEnum::LongEnum,
-        pub r#shouldContainTwoByteFoos: Vec<super::ByteEnum::ByteEnum>,
-        pub r#shouldContainTwoIntFoos: Vec<super::IntEnum::IntEnum>,
-        pub r#shouldContainTwoLongFoos: Vec<super::LongEnum::LongEnum>,
-        pub r#stringDefaultsToFoo: String,
+        pub r#shouldContainTwoByteFoos: ::std::vec::Vec<super::ByteEnum::ByteEnum>,
+        pub r#shouldContainTwoIntFoos: ::std::vec::Vec<super::IntEnum::IntEnum>,
+        pub r#shouldContainTwoLongFoos: ::std::vec::Vec<super::LongEnum::LongEnum>,
+        pub r#stringDefaultsToFoo: ::std::string::String,
         pub r#byteDefaultsToFour: i8,
         pub r#intDefaultsToFive: i32,
         pub r#longDefaultsToNegativeSeven: i64,
@@ -530,8 +530,8 @@ pub mod StructuredParcelable {
         pub r#charDefaultsToC: u16,
         pub r#floatDefaultsToPi: f32,
         pub r#doubleWithDefault: f64,
-        pub r#arrayDefaultsTo123: Vec<i32>,
-        pub r#arrayDefaultsToEmpty: Vec<i32>,
+        pub r#arrayDefaultsTo123: ::std::vec::Vec<i32>,
+        pub r#arrayDefaultsToEmpty: ::std::vec::Vec<i32>,
         pub r#boolDefault: bool,
         pub r#byteDefault: i8,
         pub r#intDefault: i32,
@@ -539,17 +539,17 @@ pub mod StructuredParcelable {
         pub r#floatDefault: f32,
         pub r#doubleDefault: f64,
         pub r#checkDoubleFromFloat: f64,
-        pub r#checkStringArray1: Vec<String>,
-        pub r#checkStringArray2: Vec<String>,
+        pub r#checkStringArray1: ::std::vec::Vec<::std::string::String>,
+        pub r#checkStringArray2: ::std::vec::Vec<::std::string::String>,
         pub r#int32_min: i32,
         pub r#int32_max: i32,
         pub r#int64_max: i64,
         pub r#hexInt32_neg_1: i32,
-        pub r#ibinder: Option<rsbinder::SIBinder>,
+        pub r#ibinder: ::core::option::Option<rsbinder::SIBinder>,
         pub r#empty: Empty::Empty,
-        pub r#int8_1: Vec<u8>,
-        pub r#int32_1: Vec<i32>,
-        pub r#int64_1: Vec<i64>,
+        pub r#int8_1: ::std::vec::Vec<u8>,
+        pub r#int32_1: ::std::vec::Vec<i32>,
+        pub r#int64_1: ::std::vec::Vec<i64>,
         pub r#hexInt32_pos_1: i32,
         pub r#hexInt64_pos_1: i32,
         pub r#const_exprs_1: super::ConstantExpressionEnum::ConstantExpressionEnum,
@@ -562,11 +562,11 @@ pub mod StructuredParcelable {
         pub r#const_exprs_8: super::ConstantExpressionEnum::ConstantExpressionEnum,
         pub r#const_exprs_9: super::ConstantExpressionEnum::ConstantExpressionEnum,
         pub r#const_exprs_10: super::ConstantExpressionEnum::ConstantExpressionEnum,
-        pub r#addString1: String,
-        pub r#addString2: String,
+        pub r#addString1: ::std::string::String,
+        pub r#addString2: ::std::string::String,
         pub r#shouldSetBit0AndBit2: i32,
-        pub r#u: Option<super::Union::Union>,
-        pub r#shouldBeConstS1: Option<super::Union::Union>,
+        pub r#u: ::core::option::Option<super::Union::Union>,
+        pub r#shouldBeConstS1: ::core::option::Option<super::Union::Union>,
         pub r#defaultWithFoo: super::IntEnum::IntEnum,
     }
     impl ::core::default::Default for StructuredParcelable {
@@ -897,12 +897,12 @@ pub mod Union {
     #[derive(Debug)]
     #[derive(Clone,PartialEq)]
     pub enum r#Union {
-        r#Ns(Vec<i32>),
+        r#Ns(::std::vec::Vec<i32>),
         r#N(i32),
         r#M(i32),
-        r#S(String),
-        r#Ibinder(Option<rsbinder::SIBinder>),
-        r#Ss(Vec<String>),
+        r#S(::std::string::String),
+        r#Ibinder(::core::option::Option<rsbinder::SIBinder>),
+        r#Ss(::std::vec::Vec<::std::string::String>),
         r#Be(super::ByteEnum::ByteEnum),
     }
     pub const r#S1: &str = "a string constant in union";
@@ -948,7 +948,7 @@ pub mod Union {
             let tag: i32 = parcel.read()?;
             match tag {
                 0 => {
-                    let value: Vec<i32> = parcel.read()?;
+                    let value: ::std::vec::Vec<i32> = parcel.read()?;
                     *self = Self::r#Ns(value);
                     ::core::result::Result::Ok(())
                 }
@@ -963,17 +963,17 @@ pub mod Union {
                     ::core::result::Result::Ok(())
                 }
                 3 => {
-                    let value: String = parcel.read()?;
+                    let value: ::std::string::String = parcel.read()?;
                     *self = Self::r#S(value);
                     ::core::result::Result::Ok(())
                 }
                 4 => {
-                    let value: Option<rsbinder::SIBinder> = parcel.read()?;
+                    let value: ::core::option::Option<rsbinder::SIBinder> = parcel.read()?;
                     *self = Self::r#Ibinder(value);
                     ::core::result::Result::Ok(())
                 }
                 5 => {
-                    let value: Vec<String> = parcel.read()?;
+                    let value: ::std::vec::Vec<::std::string::String> = parcel.read()?;
                     *self = Self::r#Ss(value);
                     ::core::result::Result::Ok(())
                 }

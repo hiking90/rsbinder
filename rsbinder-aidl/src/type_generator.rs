@@ -7,6 +7,16 @@ use crate::const_expr::{ConstExpr, InitParam, ValueType};
 use crate::error::{AidlError, ResolutionError, SemanticError};
 use crate::parser::{self, *};
 
+/// `Option` as generated code names it: by path, since an AIDL nested type may take the bare
+/// name in the module the code lands in (AOSP `aidl_to_rust.cpp` paths `Vec`/`Box`/`String`).
+pub const OPTION: &str = "::core::option::Option";
+/// `Vec` as generated code names it; see [`OPTION`].
+pub const VEC: &str = "::std::vec::Vec";
+/// `Box` as generated code names it; see [`OPTION`].
+pub const BOX: &str = "::std::boxed::Box";
+/// `String` as generated code names it; see [`OPTION`].
+pub const STRING: &str = "::std::string::String";
+
 /// Source and span for a type-level diagnostic; placeholder name without source context.
 fn diagnostic_source(span: Option<(usize, usize)>) -> (NamedSource<String>, SourceSpan) {
     let filename = parser::current_source_name();
@@ -614,7 +624,7 @@ impl TypeGenerator {
             format!("{path}<{}>", args.join(", "))
         };
         let name = if needs_box {
-            format!("Box<{path}>")
+            format!("{BOX}<{path}>")
         } else {
             path
         };
@@ -650,7 +660,7 @@ impl TypeGenerator {
         if Self::is_primitive(value_type) {
             type_name.to_owned()
         } else {
-            format!("Option<{type_name}>")
+            format!("{OPTION}<{type_name}>")
         }
     }
 
@@ -1024,7 +1034,7 @@ impl TypeGenerator {
             if (self.is_nullable && Self::is_aidl_nullable(&array_info.value_type))
                 || !Self::can_be_defaulted(&array_info.value_type, is_struct)
             {
-                format!("Option<{type_name}>")
+                format!("{OPTION}<{type_name}>")
             } else {
                 type_name
             }
@@ -1033,7 +1043,7 @@ impl TypeGenerator {
             if matches!(self.direction, Direction::Out)
                 && !Self::can_be_defaulted(&array_info.value_type, is_struct)
             {
-                format!("Option<{type_name}>")
+                format!("{OPTION}<{type_name}>")
             } else if self.is_nullable {
                 Self::nullable_element(&array_info.value_type, &type_name)
             } else {
@@ -1051,7 +1061,7 @@ impl TypeGenerator {
         // Fixed-size array wrapping ignores direction; only nullability adds `Option<_>`.
         let fixed_array = self.make_fixed_array(array_info, is_struct);
         if self.is_nullable {
-            format!("Option<{fixed_array}>")
+            format!("{OPTION}<{fixed_array}>")
         } else {
             fixed_array
         }
@@ -1068,41 +1078,41 @@ impl TypeGenerator {
             Direction::Out => {
                 if self.is_nullable {
                     format!(
-                        "Vec<{}>",
+                        "{VEC}<{}>",
                         Self::nullable_element(&sub_type.value_type, &type_name)
                     )
                 } else if Self::can_be_defaulted(&sub_type.value_type, is_struct) {
-                    format!("Vec<{type_name}>")
+                    format!("{VEC}<{type_name}>")
                 } else {
-                    format!("Vec<Option<{type_name}>>")
+                    format!("{VEC}<{OPTION}<{type_name}>>")
                 }
             }
             Direction::Inout => {
                 if self.is_nullable {
                     format!(
-                        "Vec<{}>",
+                        "{VEC}<{}>",
                         Self::nullable_element(&sub_type.value_type, &type_name)
                     )
                 } else {
                     // AOSP `RustNameOf` INOUT: read fully populated, no element needs `Default`.
-                    format!("Vec<{type_name}>")
+                    format!("{VEC}<{type_name}>")
                 }
             }
             _ => {
                 if is_struct {
                     if self.is_nullable && Self::is_aidl_nullable(&sub_type.value_type) {
-                        format!("Vec<Option<{type_name}>>")
+                        format!("{VEC}<{OPTION}<{type_name}>>")
                     } else {
-                        format!("Vec<{type_name}>")
+                        format!("{VEC}<{type_name}>")
                     }
                 } else if self.is_nullable {
                     if Self::is_primitive(&sub_type.value_type) {
-                        format!("Option<Vec<{type_name}>>")
+                        format!("{OPTION}<{VEC}<{type_name}>>")
                     } else {
-                        format!("Option<Vec<Option<{type_name}>>>")
+                        format!("{OPTION}<{VEC}<{OPTION}<{type_name}>>>")
                     }
                 } else {
-                    format!("Vec<{type_name}>")
+                    format!("{VEC}<{type_name}>")
                 }
             }
         }
@@ -1111,7 +1121,7 @@ impl TypeGenerator {
     fn type_decl(&self, value_type: &ValueType, allow_box: bool) -> String {
         match value_type {
             ValueType::Void => "()".into(),
-            ValueType::String(_) => "String".into(),
+            ValueType::String(_) => STRING.into(),
             ValueType::Byte(_) => "i8".into(),
             ValueType::Int32(_) => "i32".into(),
             ValueType::Int64(_) => "i64".into(),
@@ -1146,8 +1156,8 @@ impl TypeGenerator {
             }
         };
 
-        if is_nullable && !name.starts_with("Option<") {
-            format!("Option<{name}>")
+        if is_nullable && !name.starts_with(&format!("{OPTION}<")) {
+            format!("{OPTION}<{name}>")
         } else {
             name
         }
@@ -1223,14 +1233,14 @@ impl TypeGenerator {
         match self.direction {
             Direction::Out | Direction::Inout => {
                 if self.is_nullable {
-                    format!("&mut Option<{fixed_array}>")
+                    format!("&mut {OPTION}<{fixed_array}>")
                 } else {
                     format!("&mut {fixed_array}")
                 }
             }
             _ => {
                 if self.is_nullable {
-                    format!("Option<&{fixed_array}>")
+                    format!("{OPTION}<&{fixed_array}>")
                 } else {
                     format!("&{fixed_array}")
                 }
@@ -1248,35 +1258,35 @@ impl TypeGenerator {
             Direction::Out => {
                 if self.is_nullable {
                     format!(
-                        "&mut Option<Vec<{}>>",
+                        "&mut {OPTION}<{VEC}<{}>>",
                         Self::nullable_element(&sub_type.value_type, &type_name)
                     )
                 } else if Self::can_be_defaulted(&sub_type.value_type, false)
                     || Self::is_primitive(&sub_type.value_type)
                 {
                     // Enum is a primitive type.
-                    format!("&mut Vec<{type_name}>")
+                    format!("&mut {VEC}<{type_name}>")
                 } else {
-                    format!("&mut Vec<Option<{type_name}>>")
+                    format!("&mut {VEC}<{OPTION}<{type_name}>>")
                 }
             }
             Direction::Inout => {
                 // Must match `list_type_decl`'s `Inout` arm: the server passes `&mut` its local.
                 if self.is_nullable {
                     format!(
-                        "&mut Option<Vec<{}>>",
+                        "&mut {OPTION}<{VEC}<{}>>",
                         Self::nullable_element(&sub_type.value_type, &type_name)
                     )
                 } else {
-                    format!("&mut Vec<{type_name}>")
+                    format!("&mut {VEC}<{type_name}>")
                 }
             }
             _ => {
                 if self.is_nullable {
                     if Self::is_primitive(&sub_type.value_type) {
-                        format!("Option<&[{type_name}]>")
+                        format!("{OPTION}<&[{type_name}]>")
                     } else {
-                        format!("Option<&[Option<{type_name}>]>")
+                        format!("{OPTION}<&[{OPTION}<{type_name}>]>")
                     }
                 } else {
                     format!("&[{type_name}]")
@@ -1297,7 +1307,7 @@ impl TypeGenerator {
                 }
                 _ => {
                     if self.is_nullable {
-                        "Option<&str>".into()
+                        format!("{OPTION}<&str>")
                     } else {
                         "&str".into()
                     }
@@ -1317,7 +1327,7 @@ impl TypeGenerator {
                         || (matches!(self.direction, Direction::Out)
                             && !Self::can_be_defaulted(&self.value_type, false))
                     {
-                        format!("&mut Option<{name}>")
+                        format!("&mut {OPTION}<{name}>")
                     } else {
                         format!("&mut {name}")
                     }
@@ -1328,7 +1338,7 @@ impl TypeGenerator {
                     } else {
                         let name = self.type_decl(&self.value_type, true);
                         if self.is_nullable {
-                            format!("Option<&{name}>")
+                            format!("{OPTION}<&{name}>")
                         } else {
                             format!("&{name}")
                         }
@@ -1345,14 +1355,14 @@ impl TypeGenerator {
                 // Must match `init_array_branch`'s predicate, which decides `Some(..)` elements.
                 let element = |name: &str| {
                     if self.is_nullable && Self::is_aidl_nullable(&info.value_type) {
-                        format!("Option<{name}>")
+                        format!("{OPTION}<{name}>")
                     } else {
                         name.to_owned()
                     }
                 };
                 let outer = |name: String| {
                     if self.is_nullable {
-                        format!("Option<{name}>")
+                        format!("{OPTION}<{name}>")
                     } else {
                         name
                     }
@@ -1392,7 +1402,7 @@ impl TypeGenerator {
         } else {
             let decl = self.type_declaration(false);
 
-            if decl == "String" {
+            if decl == STRING {
                 format!("{}.as_str()", self.identifier)
             } else {
                 match self.direction {
@@ -1400,9 +1410,11 @@ impl TypeGenerator {
                         format!("&mut {}", self.identifier)
                     }
                     _ => {
-                        if decl.starts_with("Option<Vec<") || decl.starts_with("Option<String>") {
+                        if decl.starts_with(&format!("{OPTION}<{VEC}<"))
+                            || decl == format!("{OPTION}<{STRING}>")
+                        {
                             format!("{}.as_deref()", self.identifier)
-                        } else if decl.starts_with("Option<") {
+                        } else if decl.starts_with(&format!("{OPTION}<")) {
                             format!("{}.as_ref()", self.identifier)
                         } else {
                             format!("&{}", self.identifier)
@@ -1775,20 +1787,26 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(gen.type_declaration(false), "String");
+        assert_eq!(gen.type_declaration(false), "::std::string::String");
 
         let nullable_gen = gen.clone().nullable().unwrap();
-        assert_eq!(nullable_gen.type_declaration(false), "Option<String>");
+        assert_eq!(
+            nullable_gen.type_declaration(false),
+            "::core::option::Option<::std::string::String>"
+        );
 
         let array_gen = gen.array(&Vec::new()).unwrap();
-        assert_eq!(array_gen.type_declaration(false), "Vec<String>");
+        assert_eq!(
+            array_gen.type_declaration(false),
+            "::std::vec::Vec<::std::string::String>"
+        );
         assert_eq!(
             array_gen
                 .clone()
                 .direction(&Direction::Out)
                 .unwrap()
                 .type_declaration(false),
-            "Vec<String>"
+            "::std::vec::Vec<::std::string::String>"
         );
         assert_eq!(
             array_gen
@@ -1796,13 +1814,13 @@ mod tests {
                 .direction(&Direction::Inout)
                 .unwrap()
                 .type_declaration(false),
-            "Vec<String>"
+            "::std::vec::Vec<::std::string::String>"
         );
 
         let nullable_array_gen = array_gen.nullable().unwrap();
         assert_eq!(
             nullable_array_gen.type_declaration(false),
-            "Option<Vec<Option<String>>>"
+            "::core::option::Option<::std::vec::Vec<::core::option::Option<::std::string::String>>>"
         );
         assert_eq!(
             nullable_array_gen
@@ -1810,14 +1828,14 @@ mod tests {
                 .direction(&Direction::Out)
                 .unwrap()
                 .type_declaration(false),
-            "Option<Vec<Option<String>>>"
+            "::core::option::Option<::std::vec::Vec<::core::option::Option<::std::string::String>>>"
         );
         assert_eq!(
             nullable_array_gen
                 .direction(&Direction::Inout)
                 .unwrap()
                 .type_declaration(false),
-            "Option<Vec<Option<String>>>"
+            "::core::option::Option<::std::vec::Vec<::core::option::Option<::std::string::String>>>"
         );
     }
 
@@ -1835,18 +1853,21 @@ mod tests {
         let nullable_gen = gen.clone().nullable().unwrap();
         assert_eq!(
             nullable_gen.type_declaration(false),
-            "Option<rsbinder::SIBinder>"
+            "::core::option::Option<rsbinder::SIBinder>"
         );
 
         let array_gen = gen.array(&Vec::new()).unwrap();
-        assert_eq!(array_gen.type_declaration(false), "Vec<rsbinder::SIBinder>");
+        assert_eq!(
+            array_gen.type_declaration(false),
+            "::std::vec::Vec<rsbinder::SIBinder>"
+        );
         assert_eq!(
             array_gen
                 .clone()
                 .direction(&Direction::Out)
                 .unwrap()
                 .type_declaration(false),
-            "Vec<Option<rsbinder::SIBinder>>"
+            "::std::vec::Vec<::core::option::Option<rsbinder::SIBinder>>"
         );
         // `inout` elements need no `Default`: AOSP `RustNameOf` keeps `element_mode = VALUE`.
         assert_eq!(
@@ -1855,13 +1876,13 @@ mod tests {
                 .direction(&Direction::Inout)
                 .unwrap()
                 .type_declaration(false),
-            "Vec<rsbinder::SIBinder>"
+            "::std::vec::Vec<rsbinder::SIBinder>"
         );
 
         let nullable_array_gen = array_gen.nullable().unwrap();
         assert_eq!(
             nullable_array_gen.type_declaration(false),
-            "Option<Vec<Option<rsbinder::SIBinder>>>"
+            "::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::SIBinder>>>"
         );
         assert_eq!(
             nullable_array_gen
@@ -1869,14 +1890,14 @@ mod tests {
                 .direction(&Direction::Out)
                 .unwrap()
                 .type_declaration(false),
-            "Option<Vec<Option<rsbinder::SIBinder>>>"
+            "::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::SIBinder>>>"
         );
         assert_eq!(
             nullable_array_gen
                 .direction(&Direction::Inout)
                 .unwrap()
                 .type_declaration(false),
-            "Option<Vec<Option<rsbinder::SIBinder>>>"
+            "::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::SIBinder>>>"
         );
     }
 
@@ -1897,7 +1918,7 @@ mod tests {
         let nullable_gen = gen.clone().nullable().unwrap();
         assert_eq!(
             nullable_gen.type_decl_for_func().unwrap(),
-            "Option<&rsbinder::ParcelFileDescriptor>"
+            "::core::option::Option<&rsbinder::ParcelFileDescriptor>"
         );
 
         let array_gen = gen.array(&Vec::new()).unwrap();
@@ -1912,7 +1933,7 @@ mod tests {
                 .unwrap()
                 .type_decl_for_func()
                 .unwrap(),
-            "&mut Vec<Option<rsbinder::ParcelFileDescriptor>>"
+            "&mut ::std::vec::Vec<::core::option::Option<rsbinder::ParcelFileDescriptor>>"
         );
         // Must equal `list_type_decl(false)`: the server passes `&mut` its local here.
         assert_eq!(
@@ -1922,13 +1943,13 @@ mod tests {
                 .unwrap()
                 .type_decl_for_func()
                 .unwrap(),
-            "&mut Vec<rsbinder::ParcelFileDescriptor>"
+            "&mut ::std::vec::Vec<rsbinder::ParcelFileDescriptor>"
         );
 
         let nullable_array_gen = array_gen.nullable().unwrap();
         assert_eq!(
             nullable_array_gen.type_decl_for_func().unwrap(),
-            "Option<&[Option<rsbinder::ParcelFileDescriptor>]>"
+            "::core::option::Option<&[::core::option::Option<rsbinder::ParcelFileDescriptor>]>"
         );
         assert_eq!(
             nullable_array_gen
@@ -1937,7 +1958,7 @@ mod tests {
                 .unwrap()
                 .type_decl_for_func()
                 .unwrap(),
-            "&mut Option<Vec<Option<rsbinder::ParcelFileDescriptor>>>"
+            "&mut ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::ParcelFileDescriptor>>>"
         );
         assert_eq!(
             nullable_array_gen
@@ -1945,7 +1966,7 @@ mod tests {
                 .unwrap()
                 .type_decl_for_func()
                 .unwrap(),
-            "&mut Option<Vec<Option<rsbinder::ParcelFileDescriptor>>>"
+            "&mut ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::ParcelFileDescriptor>>>"
         );
 
         let gen = TypeGenerator::new(&NonArrayType {
@@ -1961,7 +1982,7 @@ mod tests {
                 .unwrap()
                 .type_decl_for_func()
                 .unwrap(),
-            "&mut Vec<bool>"
+            "&mut ::std::vec::Vec<bool>"
         );
 
         // `ITestService.aidl` `ReverseUtf8CppStringList` input: `Option<&[Option<String>]>`.
@@ -1974,7 +1995,7 @@ mod tests {
         let nullable_array_gen = gen.array(&Vec::new()).unwrap().nullable().unwrap();
         assert_eq!(
             nullable_array_gen.type_decl_for_func().unwrap(),
-            "Option<&[Option<String>]>"
+            "::core::option::Option<&[::core::option::Option<::std::string::String>]>"
         );
     }
 
@@ -2077,6 +2098,9 @@ mod tests {
             .unwrap()
             .nullable()
             .unwrap();
-        assert_eq!(array_nullable.type_declaration(true), "Option<[bool; 2]>");
+        assert_eq!(
+            array_nullable.type_declaration(true),
+            "::core::option::Option<[bool; 2]>"
+        );
     }
 }

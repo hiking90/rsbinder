@@ -176,7 +176,7 @@ fn fixture_files() -> Vec<(String, String)> {
 
 /// `quote`'s spacing, not `type_str`'s printers; kept, as a stripped `&mutT` re-parses wrong.
 fn norm(ty: &Type) -> String {
-    let mut s = quote::quote!(#ty).to_string();
+    let mut s = norm_exact(ty);
     for path in USER_PATHS {
         s = s.replace(path, USER_PLACEHOLDER);
     }
@@ -238,7 +238,15 @@ fn place_enum(name: &str) -> Place {
 
 /// `norm` without the placeholder, so `MatrixCfg` and `MatrixMode` stay apart.
 fn norm_exact(ty: &Type) -> String {
-    quote::quote!(#ty).to_string()
+    let mut s = quote::quote!(#ty).to_string();
+    // The generator paths these (`rsbinder_aidl::render::OPTION`, …); `aidl_shape` advises bare.
+    use rsbinder_aidl::render::{BOX, OPTION, STRING, VEC};
+    for std in [OPTION, VEC, BOX, STRING] {
+        let path: syn::Path = syn::parse_str(std).expect("a path");
+        let bare = path.segments.last().expect("a segment").ident.to_string();
+        s = s.replace(&quote::quote!(#path).to_string(), &bare);
+    }
+    s
 }
 
 /// Every spelling the generator renders, keyed by place.

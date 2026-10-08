@@ -165,9 +165,8 @@ fn leaf_kind(leaf: &syn::Type, in_array: bool) -> Option<(Kind, String)> {
         syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| matches!(s.arguments, syn::PathArguments::AngleBracketed(_)))
     );
     Some(match name.as_deref() {
-        Some("str") => (Kind::Str, "String".to_string()),
-        // `written`, so a qualified spelling compares equal to itself.
-        Some("String") => (Kind::Str, written),
+        // `simplified` drops a `String` path, so a qualified spelling still compares equal.
+        Some("str" | "String") => (Kind::Str, "String".to_string()),
         Some("u8") if in_array && plain => (Kind::Primitive, written),
         Some("bool" | "i8" | "i32" | "i64" | "f32" | "f64" | "u16") if plain => {
             (Kind::Primitive, written)
@@ -233,7 +232,7 @@ pub(crate) fn check_canonical(ty: &syn::Type, place: Place) -> syn::Result<()> {
     Err(syn::Error::new_spanned(ty, message))
 }
 
-/// The spelling with `Vec`/`Option` unqualified, so `std::vec::Vec<T>` matches `Vec<T>`.
+/// The spelling with `Vec`/`Option`/`String` unqualified, so `std::vec::Vec<T>` matches `Vec<T>`.
 fn simplified(ty: &syn::Type) -> String {
     use crate::type_str::unwrap_group;
     use syn::Type;
@@ -273,7 +272,7 @@ fn simplified(ty: &syn::Type) -> String {
                 }
                 _ => String::new(),
             };
-            if seg.ident == "Vec" || seg.ident == "Option" {
+            if seg.ident == "Vec" || seg.ident == "Option" || seg.ident == "String" {
                 return format!("{}{args}", seg.ident);
             }
             let head: Vec<String> = p
