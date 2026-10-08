@@ -106,6 +106,11 @@ run_here() {
 
 skip() { record SKIP "$1" 0 "$2"; }
 
+# linux_run NAME CMD...: `run` for a test target that is `#![cfg(target_os = "linux")]`.
+linux_run() {
+    if [ "$(uname -s)" = Linux ]; then run "$@"; else skip "$1" "Linux-only test target"; fi
+}
+
 # libtest exits 0 when a filter or a `cfg` leaves nothing to run, so a test
 # command also has to report at least one passing test.
 tpass() {
@@ -177,7 +182,7 @@ tier_hermetic() {
     run "rsbinder-aidl" tpass cargo test -p rsbinder-aidl
     run "tests: async_runtime" tpass cargo test -p tests --test async_runtime
     run "tests: fmq_parcel" tpass cargo test -p tests --test fmq_parcel
-    run "tests: c_stream_header" tpass cargo test -p tests --test c_stream_header
+    linux_run "tests: c_stream_header" tpass cargo test -p tests --test c_stream_header
     run "rsbinder-fmq" tpass cargo test -p rsbinder-fmq
     run "rsbinder-tools" tpass cargo test -p rsbinder-tools
 
@@ -191,12 +196,15 @@ tier_hermetic() {
     run "rsbinder tls targets" tpass cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug \
         --test rpc_tls --test rpc_transport_conformance
     # Skips (and still passes) where unprivileged user namespaces are off; CI sets REQUIRED.
-    run "rpc_link_break (network namespace)" tpass cargo test -p rsbinder \
+    linux_run "rpc_link_break (network namespace)" tpass cargo test -p rsbinder \
         --features rpc-tls,rpc-tcp-debug --test rpc_link_break
     run "rpc_server: tls nested callback" tpass cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug \
         --test rpc_server -- --exact tls_android13plus_nested_callback_e2e
     run "rpc_server: preconnected inet fd" tpass cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug \
         --test rpc_server -- --exact preconnected_inet_fd_handshakes_over_tcp_debug
+    run "rpc_e2e: tcp/tls drains past the hold" tpass cargo test -p rsbinder \
+        --features rpc-tls,rpc-tcp-debug --test rpc_e2e -- \
+        drains_past_the_hold_android13plus_tcp_debug tls_flood::
     run "rpc_accessor (android_16)" tpass cargo test -p rsbinder --features rpc,android_16 --test rpc_accessor
     run "tests: rpc targets" tpass cargo test -p tests --features rpc --test rpc_generated_stub \
         --test entry_rpc --test gateway_rpc --test codegen_shapes --test rpc_async \
