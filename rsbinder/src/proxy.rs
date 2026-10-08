@@ -80,8 +80,8 @@
 //! slot is alive on entry. `Drop` clears a still-linked death subscription, then
 //! sends `BC_RELEASE` (AOSP `onLastStrongRef`). Once the strong count returns to 0, only a fresh
 //! wire delivery (e.g. servicemanager `checkService`) re-establishes a
-//! transactable strong ref; an in-process `WIBinder::upgrade()` returns
-//! `DeadObject` instead.
+//! transactable strong ref; until one does, an in-process `WIBinder::upgrade()`
+//! returns `DeadObject`, and after it, the revived proxy.
 //!
 //! # Operations without meaning on a proxy
 //!

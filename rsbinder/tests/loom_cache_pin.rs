@@ -299,6 +299,22 @@ impl Drop for StrongRef {
     }
 }
 
+impl PinRef {
+    /// `WIBinder::upgrade`'s `live_proxy_for_pin`; its first step is a plain `Weak::upgrade`.
+    fn upgrade(&self) -> Option<StrongRef> {
+        let cache = self.process.cache.read().unwrap();
+        let entry = cache
+            .get(&self.pin.handle)
+            .filter(|e| Arc::ptr_eq(&e.pin, &self.pin))?;
+        // Upgraded only on our pin and moved out, so no proxy drops under the read lock.
+        if entry.proxy.refs.try_upgrade() {
+            Some(self.process.strong(&entry.proxy))
+        } else {
+            None
+        }
+    }
+}
+
 impl Drop for PinRef {
     fn drop(&mut self) {
         self.process.release_pin(&self.pin);
@@ -406,5 +422,39 @@ fn weak_ref_keeps_the_pin_for_case_b() {
         } else {
             assert_eq!(increfs, 3, "case (a) after the pin's release pins afresh");
         }
+    });
+}
+
+/// A `WIBinder`'s upgrade races the lookup that revives its entry and that proxy's last drop.
+#[test]
+fn weak_upgrade_finds_the_revived_proxy() {
+    const HANDLE: u32 = 9;
+
+    model(|| {
+        let process = Process::new();
+
+        let first = process.lookup(HANDLE);
+        let kept_generation = first.generation();
+        let weak = first.downgrade();
+        drop(first);
+        assert!(weak.upgrade().is_none(), "no proxy is left to upgrade to");
+
+        // The reviver drops its proxy when it returns, racing the upgrade below.
+        let reviver = {
+            let process = Arc::clone(&process);
+            loom::thread::spawn(move || process.lookup(HANDLE).generation())
+        };
+        let upgraded = weak.upgrade().map(|strong| strong.generation());
+        let revived_generation = reviver.join().unwrap();
+
+        assert_eq!(
+            revived_generation, kept_generation,
+            "the WIBinder keeps the pin, so the lookup is case (b)"
+        );
+        if let Some(generation) = upgraded {
+            assert_eq!(generation, kept_generation, "only a proxy on its own pin");
+        }
+        drop(weak);
+        assert_released(&process, HANDLE);
     });
 }

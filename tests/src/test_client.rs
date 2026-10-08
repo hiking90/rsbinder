@@ -2726,10 +2726,18 @@ fn test_cache_pin_case_b_resurrection_round_trip() {
             .ping_binder()
             .expect("ping after resurrection must succeed");
         match &kept {
-            Some(weak) => assert!(
-                *weak == svc.as_binder(),
-                "round {round}: a kept WIBinder must name the resurrected proxy"
-            ),
+            Some(weak) => {
+                assert!(
+                    *weak == svc.as_binder(),
+                    "round {round}: a kept WIBinder must name the resurrected proxy"
+                );
+                // Holds whether this round revived the entry or another test kept it alive.
+                assert_eq!(
+                    weak.upgrade().as_ref(),
+                    Ok(&svc.as_binder()),
+                    "round {round}: a kept WIBinder must upgrade to the live proxy of its entry"
+                );
+            }
             None => kept = Some(SIBinder::downgrade(&svc.as_binder())),
         }
         // `kept` holds the pin, so the next round is case (b) unless another test holds a proxy.
@@ -2750,17 +2758,22 @@ fn test_cache_pin_case_b_resurrection_round_trip() {
 ///
 /// rsbinder previously tried to "resurrect" the proxy by re-issuing
 /// `BC_ACQUIRE` (strong 0→1) on the cache-pinned handle and then
-/// transacting. That was a bug: empirically the kernel rejects the
-/// transaction on a ref that went through strong == 0 with
-/// `BR_FAILED_REPLY` (confirmed on the emulator — see the trace
-/// `inc_strong → dec_strong → inc_strong → BR_FAILED_REPLY`). The
-/// `BC_INCREFS` cache pin keeps the `binder_ref` slot from being
-/// freed, but does NOT make a strong-0 ref transactable again.
+/// transacting. That was a bug: the C binder driver refuses a
+/// `BC_ACQUIRE` on a strong-0 ref (`binder_get_ref_olocked` with
+/// `need_strong_ref`: "tried to use weak ref as strong ref") without an
+/// errno, so the transaction fails with `BR_FAILED_REPLY` (confirmed on
+/// the emulator — see the trace
+/// `inc_strong → dec_strong → inc_strong → BR_FAILED_REPLY`; the Rust
+/// binder driver accepts it). The `BC_INCREFS` cache pin keeps the
+/// `binder_ref` slot from being freed, but does NOT make a strong-0 ref
+/// transactable again.
 ///
 /// The correct recovery, exercised below, is to re-resolve the
 /// service by name through the service manager (a fresh wire delivery
 /// of the handle that re-establishes a transactable kernel strong
-/// ref).
+/// ref). The re-resolve revives the cache entry this `WIBinder` keeps, so
+/// the `WIBinder` then upgrades to the revived proxy, as AOSP
+/// `wp::promote()` does after `getStrongProxyForHandle`'s `force_set`.
 ///
 /// Marked `#[ignore]` because it asserts the test is the *sole* strong
 /// holder of the shared `test_service` handle: it drops its `Strong`
@@ -2814,6 +2827,11 @@ fn test_weak_upgrade_after_sole_strong_drop_is_dead_then_reresolve_works() {
         .as_binder()
         .ping_binder()
         .expect("ping on a freshly re-resolved proxy must succeed");
+    assert_eq!(
+        weak.upgrade().as_ref(),
+        Ok(&resolved.as_binder()),
+        "the WIBinder must upgrade to the proxy the re-resolve revived"
+    );
 }
 
 /// Two `WIBinder` clones for the same underlying handle compare

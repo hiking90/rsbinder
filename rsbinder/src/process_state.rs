@@ -101,7 +101,16 @@
 //! by a fresh wire delivery of the handle (servicemanager `checkService`, or an
 //! incoming transaction carrying it), which gives the new `BC_ACQUIRE` a
 //! kernel strong count it can transact on. `WIBinder::upgrade()` differs: it
-//! is purely weak and never re-`BC_ACQUIRE`s a strong-0 handle.
+//! is purely weak and never re-`BC_ACQUIRE`s a strong-0 handle. When its own
+//! proxy is gone it returns the entry's live proxy, found by
+//! `live_proxy_for_pin` only while the entry names the `WIBinder`'s pin — AOSP
+//! `wp::promote()` after `getStrongProxyForHandle` revived the same `BpBinder`
+//! with `force_set` (`ProcessState.cpp:398`). The read-lock fast path is not
+//! reused: it does not check the pin, and after an obituary a case (a) puts a
+//! new generation in the entry, which this `WIBinder` does not name. The pin is
+//! compared before the upgrade, so no other pin's proxy is upgraded and then
+//! dropped under the read lock, where its pin's `Drop` would deadlock on the
+//! write lock.
 //!
 //! # Published natives
 //!
@@ -965,6 +974,19 @@ impl ProcessState {
         commit_new_acquired(&mut handle_to_proxy, pin, descriptor, stability).map(Some)
     }
 
+    /// The live proxy of the entry that still names `pin`; module doc "Proxy cache entry".
+    pub(crate) fn live_proxy_for_pin(pin: &Arc<HandlePin>) -> Option<Arc<ProxyHandle>> {
+        // Pin compared before upgrading, so no other pin's proxy is upgraded and dropped here.
+        Self::instance()
+            .get()?
+            .handle_to_proxy
+            .read()
+            .expect("Handle to proxy lock poisoned")
+            .get(&pin.handle())
+            .filter(|entry| std::ptr::eq(entry.pin.as_ptr(), Arc::as_ptr(pin)))
+            .and_then(|entry| entry.weak.upgrade())
+    }
+
     /// Test-only: the generation of `handle`'s entry while its pin lives.
     #[cfg(test)]
     pub(crate) fn cache_generation_for(&self, handle: u32) -> Option<u64> {
@@ -1641,6 +1663,11 @@ mod tests {
         assert!(
             weak == resurrected,
             "the WIBinder names the resurrected proxy"
+        );
+        assert_eq!(
+            weak.upgrade().as_ref(),
+            Ok(&resurrected),
+            "the WIBinder upgrades to the proxy revived on its pin, as AOSP promote() after force_set"
         );
 
         drop(resurrected);
