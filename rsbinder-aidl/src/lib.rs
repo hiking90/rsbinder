@@ -1035,7 +1035,24 @@ impl Builder {
         Ok(document_list)
     }
 
-    pub fn generate(mut self) -> Result<(), AidlError> {
+    /// Parse every source and write the generated Rust to the output path.
+    ///
+    /// Findings that do not stop generation print as `cargo:warning=` lines:
+    /// an unknown annotation, and a type named without an `import` that
+    /// resolves only because another file declares it in the same package.
+    /// rsbinder accepts that name, but AOSP's `aidl` resolves it only through
+    /// an import (`AidlDocument::ResolveName`), so the same `.aidl` fails in an
+    /// Android build; add the `import` the warning names.
+    pub fn generate(self) -> Result<(), AidlError> {
+        parser::collect_implicit_imports();
+        let result = self.generate_collecting();
+        for w in parser::take_implicit_imports() {
+            println!("cargo:warning={}", w.message);
+        }
+        result
+    }
+
+    fn generate_collecting(mut self) -> Result<(), AidlError> {
         let documents = self.parse_sources()?;
         // An empty output would defer this build-script typo to an include_aidl! import error.
         if documents.is_empty() {

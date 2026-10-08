@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::error::{pest_error_to_diagnostic, AidlError, ConstExprError, ParseError};
 
@@ -33,6 +33,9 @@ thread_local! {
 
     // Non-fatal diagnostics of the current `parse_document`, drained into `Document::warnings`.
     static CURRENT_WARNINGS: RefCell<Vec<crate::error::AidlWarning>> = const { RefCell::new(Vec::new()) };
+
+    // Names bound only by the same-package extension; `None` unless a `Builder` is collecting.
+    static IMPLICIT_IMPORTS: RefCell<Option<BTreeSet<String>>> = const { RefCell::new(None) };
 
     // Each `crate::BUILTIN_DECLS` entry: AIDL namespace -> Rust path relative to the runtime crate.
     static BUILTIN_RUST_PATHS: RefCell<HashMap<Namespace, String>> = RefCell::new(HashMap::new());
@@ -530,10 +533,56 @@ fn bind_type_name(name: &Namespace) -> Option<Namespace> {
     }
 
     // As written (AOSP); then rsbinder's extension: another file's top-level type in this package.
-    [child(&Namespace::default()), child(&top)]
+    let as_written = with_rest(child(&Namespace::default()));
+    if declared(&as_written) {
+        return Some(as_written);
+    }
+    let imported = child(&top);
+    let key = with_rest(imported.clone());
+    if !declared(&key) {
+        return None;
+    }
+    IMPLICIT_IMPORTS.with(|set| {
+        if let Some(set) = set.borrow_mut().as_mut() {
+            let scope = Some(current_namespace()).filter(|ns| !ns.ns.is_empty());
+            set.insert(implicit_import_warning(
+                scope.as_ref().unwrap_or(&top),
+                name,
+                &imported,
+            ));
+        }
+    });
+    Some(key)
+}
+
+fn implicit_import_warning(scope: &Namespace, name: &Namespace, imported: &Namespace) -> String {
+    let aidl = |ns: &Namespace| ns.to_string(Namespace::AIDL);
+    format!(
+        "{}: '{}' resolves to {} only through rsbinder's same-package lookup; \
+         AOSP aidl rejects it without `import {};`",
+        aidl(scope),
+        aidl(name),
+        aidl(imported),
+        aidl(imported),
+    )
+}
+
+/// Collect, until [`take_implicit_imports`], a warning for each name the
+/// same-package extension of [`bind_type_name`] binds. AOSP's `aidl` resolves
+/// such a name only through an `import` (`AidlDocument::ResolveName`,
+/// `aidl_language.cpp:1930-1957`), so the `.aidl` fails in an Android build.
+pub(crate) fn collect_implicit_imports() {
+    IMPLICIT_IMPORTS.with(|set| *set.borrow_mut() = Some(BTreeSet::new()));
+}
+
+/// Stop collecting and return the warnings, sorted and without duplicates.
+pub(crate) fn take_implicit_imports() -> Vec<crate::error::AidlWarning> {
+    IMPLICIT_IMPORTS
+        .with(|set| set.borrow_mut().take())
         .into_iter()
-        .map(with_rest)
-        .find(declared)
+        .flatten()
+        .map(crate::error::AidlWarning::new)
+        .collect()
 }
 
 // Edge of the `declaration_reaches` sizing graph; a `Vec`/`HashMap` is a handle, never an edge.
@@ -3390,6 +3439,43 @@ pub fn reset() {
 mod tests {
     use super::*;
     use std::error::Error;
+
+    /// A name only the same-package extension binds is reported once; an imported one is not.
+    #[test]
+    fn same_package_name_without_import_warns() -> Result<(), Box<dyn Error>> {
+        let parse = |file, text| parse_document(&SourceContext::new(file, text));
+        let bar = parse("p/Bar.aidl", "package p; parcelable Bar { int x; }")?;
+        let foo = parse(
+            "p/Foo.aidl",
+            "package p; parcelable Foo { Bar a; Bar[] b; }",
+        )?;
+        let baz = parse(
+            "p/Baz.aidl",
+            "package p; import p.Bar; parcelable Baz { Bar a; p.Bar b; }",
+        )?;
+        let gen = crate::Generator::new(false, false);
+
+        collect_implicit_imports();
+        for doc in [&bar, &foo, &baz] {
+            gen.document(doc)?;
+        }
+        let warnings: Vec<String> = take_implicit_imports()
+            .into_iter()
+            .map(|w| w.message)
+            .collect();
+        assert_eq!(
+            warnings,
+            [
+                "p.Foo: 'Bar' resolves to p.Bar only through rsbinder's same-package lookup; \
+              AOSP aidl rejects it without `import p.Bar;`"
+            ]
+        );
+
+        // Without a collector (the proc macro, `Generator` alone) nothing accumulates.
+        gen.document(&foo)?;
+        assert!(take_implicit_imports().is_empty());
+        Ok(())
+    }
 
     #[test]
     fn test_second_type_parameter_set_is_rejected() -> Result<(), Box<dyn Error>> {
