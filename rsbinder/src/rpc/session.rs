@@ -3520,7 +3520,10 @@ impl RpcSessionInner {
         addr: RpcAddress,
         amount: u32,
     ) -> RpcResult<()> {
-        for frame in self.profile.codec().encode_dec_strong(&addr, amount) {
+        let Some((frame, times)) = self.profile.codec().encode_dec_strong(&addr, amount) else {
+            return Ok(());
+        };
+        for _ in 0..times {
             // No drain, as AOSP `sendDecStrongToTarget`.
             if let Err(e) = self.send_msg(conn.transport(), &frame, &[], None) {
                 self.end_after_failed_send(&e);
@@ -8173,7 +8176,8 @@ mod tests {
         let mut counter = 0;
         let pay = codec
             .encode_dec_strong(&RpcAddress::unique(&mut counter, AddressSpace::Acceptor), 1)
-            .remove(0);
+            .expect("a frame")
+            .0;
         let Ok(WireMessage::DecStrong(addr, _)) = codec.decode_message(&pay) else {
             panic!("a DEC_STRONG");
         };
@@ -8194,7 +8198,7 @@ mod tests {
         assert!(session.inner.shared.lifecycle.is_torn_down());
         let mut written = Vec::new();
         std::io::Read::read_to_end(&mut peer, &mut written).expect("to the session's end");
-        let release = codec.encode_dec_strong(&addr, 1).remove(0);
+        let (release, _) = codec.encode_dec_strong(&addr, 1).expect("a frame");
         assert!(
             !written.windows(release.len()).any(|w| w == release),
             "the release followed the cut frame"
@@ -8808,9 +8812,9 @@ mod tests {
         let idle = Duration::from_millis(400);
         let (session, slots, peers) = idle_serve_slots(idle, 1);
         let ends = serve_all(&session, &slots);
-        let frame: Vec<u8> = Android13PlusCodec::android14_15()
+        let (frame, _) = Android13PlusCodec::android14_15()
             .encode_dec_strong(&RpcAddress::zero(), 1)
-            .concat();
+            .expect("a frame");
         // A `DEC_STRONG` opens no call: only its bytes are activity. 32 bytes, two at a time.
         for pair in frame.chunks(2) {
             peers[1].send_raw(pair).expect("trickle");
@@ -8831,9 +8835,10 @@ mod tests {
         let ends = serve_all(&session, &slots);
         let codec = Android13PlusCodec::android14_15();
         for _ in 0..12 {
-            for frame in codec.encode_dec_strong(&RpcAddress::zero(), 1) {
-                peers[1].send_raw(&frame).expect("a frame");
-            }
+            let (frame, _) = codec
+                .encode_dec_strong(&RpcAddress::zero(), 1)
+                .expect("a frame");
+            peers[1].send_raw(&frame).expect("a frame");
             std::thread::sleep(idle / 4);
         }
         assert!(

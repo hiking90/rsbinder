@@ -689,9 +689,9 @@ impl WireCodec for Android13PlusCodec {
         Ok(out)
     }
 
-    fn encode_dec_strong(&self, addr: &RpcAddress, amount: u32) -> Vec<Vec<u8>> {
+    fn encode_dec_strong(&self, addr: &RpcAddress, amount: u32) -> Option<(Vec<u8>, u32)> {
         if amount == 0 {
-            return Vec::new();
+            return None;
         }
         let header = Self::header(CMD_DEC_STRONG, A13_DEC_STRONG_LEN)
             .expect("DEC_STRONG body length is a const ≪ MAX_FRAME_LEN");
@@ -700,7 +700,7 @@ impl WireCodec for Android13PlusCodec {
         out.extend_from_slice(&Self::encode_addr(addr)); // 8
         out.extend_from_slice(&amount.to_le_bytes()); // amount
         out.extend_from_slice(&0u32.to_le_bytes()); // reserved
-        vec![out]
+        Some((out, 1))
     }
 
     fn decode_message(&self, frame: &[u8]) -> RpcResult<WireMessage> {
@@ -1392,7 +1392,7 @@ mod tests {
         for c in [c0, c1] {
             let mut ctr = 0u64;
             let a = RpcAddress::unique(&mut ctr, AddressSpace::Initiator);
-            let enc = c.encode_dec_strong(&a, 1).remove(0);
+            let (enc, _) = c.encode_dec_strong(&a, 1).expect("a frame");
             let mut want = Vec::new();
             want.extend_from_slice(&2u32.to_le_bytes()); // DEC_STRONG
             want.extend_from_slice(&16u32.to_le_bytes()); // bodySize
@@ -1524,18 +1524,18 @@ mod tests {
             }
             let mut ctr = 9u64;
             let addr = RpcAddress::unique(&mut ctr, AddressSpace::Initiator);
-            let batched = c.encode_dec_strong(&addr, 7);
-            assert_eq!(batched.len(), 1, "one frame carries the whole amount");
-            match c.decode_message(&batched[0]).unwrap() {
+            let (batched, times) = c.encode_dec_strong(&addr, 7).expect("a frame");
+            assert_eq!(times, 1, "one frame carries the whole amount");
+            match c.decode_message(&batched).unwrap() {
                 WireMessage::DecStrong(a, amount) => {
                     assert_eq!(a, addr);
                     assert_eq!(amount, 7, "the encoder writes the amount it is given");
                 }
                 other => panic!("expected DecStrong, got {other:?}"),
             }
-            assert!(c.encode_dec_strong(&addr, 0).is_empty());
+            assert!(c.encode_dec_strong(&addr, 0).is_none());
             // A peer may batch amount > 1 (AOSP `sendDecStrongToTarget`); the field is read.
-            let mut framed = c.encode_dec_strong(&addr, 1).remove(0);
+            let (mut framed, _) = c.encode_dec_strong(&addr, 1).expect("a frame");
             let amt_off = WIRE_HEADER_LEN + A13_ADDR_LEN;
             framed[amt_off..amt_off + 4].copy_from_slice(&3u32.to_le_bytes());
             match c.decode_message(&framed).unwrap() {
@@ -1759,8 +1759,8 @@ mod tests {
 
             let mut ctr = 7u64;
             let addr = RpcAddress::unique(&mut ctr, AddressSpace::Initiator);
-            write_aosp_message(&mut c, &codec.encode_dec_strong(&addr, 1)[0])
-                .expect("write dec_strong");
+            let (dec, _) = codec.encode_dec_strong(&addr, 1).expect("a frame");
+            write_aosp_message(&mut c, &dec).expect("write dec_strong");
 
             assert_eq!(srv.join().expect("server thread"), expect);
         }

@@ -164,12 +164,12 @@ pub trait WireCodec: Send + Sync {
     fn encode_reply(&self, reply: &WireReply) -> RpcResult<Vec<u8>> {
         self.encode_reply_ref(reply.into())
     }
-    /// Encode the `DEC_STRONG` frames that release `amount` references to
-    /// `addr`, in send order. A wire with an `amount` field (android-13+
-    /// `RpcDecStrong`) returns one frame; r34 has none, so it returns
-    /// `amount` one-reference frames, each framed on its own. `amount == 0`
-    /// returns no frame.
-    fn encode_dec_strong(&self, addr: &RpcAddress, amount: u32) -> Vec<Vec<u8>>;
+    /// Encode the `DEC_STRONG` frame that releases `amount` references to
+    /// `addr`, and how many times to send it, each framed on its own. A wire
+    /// with an `amount` field (android-13+ `RpcDecStrong`) sends it once; r34
+    /// has none, so its one-reference frame goes `amount` times. `amount == 0`
+    /// returns `None`. One frame either way: `amount` is the peer's to grow.
+    fn encode_dec_strong(&self, addr: &RpcAddress, amount: u32) -> Option<(Vec<u8>, u32)>;
     /// Decode one complete wire message (header + body).
     fn decode_message(&self, frame: &[u8]) -> RpcResult<WireMessage>;
     /// Encode the bare `int32` session-id preamble (no header).
@@ -270,7 +270,10 @@ impl WireCodec for R34Codec {
         Ok(out)
     }
 
-    fn encode_dec_strong(&self, addr: &RpcAddress, amount: u32) -> Vec<Vec<u8>> {
+    fn encode_dec_strong(&self, addr: &RpcAddress, amount: u32) -> Option<(Vec<u8>, u32)> {
+        if amount == 0 {
+            return None;
+        }
         let mut out = Vec::with_capacity(WIRE_HEADER_LEN + RPC_ADDR_LEN);
         // RPC_ADDR_LEN is far below MAX_FRAME_LEN, so the bound check cannot trip.
         out.extend_from_slice(
@@ -279,7 +282,7 @@ impl WireCodec for R34Codec {
         );
         out.extend_from_slice(addr.as_wire_bytes());
         // No amount field on r34: one frame per reference, as AOSP r34 sends them.
-        vec![out; amount as usize]
+        Some((out, amount))
     }
 
     fn decode_message(&self, frame: &[u8]) -> RpcResult<WireMessage> {
@@ -469,18 +472,22 @@ mod tests {
 
         let mut ctr = 99u64;
         let addr = RpcAddress::unique(&mut ctr, crate::rpc::AddressSpace::Initiator);
-        let enc = c.encode_dec_strong(&addr, 3);
-        assert_eq!(enc.len(), 3, "r34 has no amount: one frame per reference");
-        for frame in &enc {
-            match c.decode_message(frame).unwrap() {
-                WireMessage::DecStrong(a, amount) => {
-                    assert_eq!(a, addr);
-                    assert_eq!(amount, 1);
-                }
-                other => panic!("expected DecStrong, got {other:?}"),
+        let (frame, times) = c.encode_dec_strong(&addr, 3).expect("a frame");
+        assert_eq!(times, 3, "r34 has no amount: one frame per reference");
+        match c.decode_message(&frame).unwrap() {
+            WireMessage::DecStrong(a, amount) => {
+                assert_eq!(a, addr);
+                assert_eq!(amount, 1);
             }
+            other => panic!("expected DecStrong, got {other:?}"),
         }
-        assert!(c.encode_dec_strong(&addr, 0).is_empty());
+        assert!(c.encode_dec_strong(&addr, 0).is_none());
+        // `amount` is the peer's to grow: one frame, never `amount` copies of it.
+        let (frame, times) = c.encode_dec_strong(&addr, u32::MAX).expect("a frame");
+        assert_eq!(
+            (frame.len(), times),
+            (WIRE_HEADER_LEN + RPC_ADDR_LEN, u32::MAX)
+        );
 
         let pre = c.encode_session_preamble(RPC_SESSION_ID_NEW);
         assert_eq!(c.decode_session_preamble(&pre).unwrap(), RPC_SESSION_ID_NEW);
@@ -536,7 +543,7 @@ mod tests {
         // -- DEC_STRONG: header + 32B RpcWireAddress --
         let mut ctr = 0x4142_4344u64;
         let addr = RpcAddress::unique(&mut ctr, crate::rpc::AddressSpace::Initiator);
-        let enc = c.encode_dec_strong(&addr, 1).remove(0);
+        let (enc, _) = c.encode_dec_strong(&addr, 1).expect("a frame");
         assert_eq!(&enc[0..4], &2u32.to_le_bytes()); // command = DEC_STRONG
         assert_eq!(&enc[4..8], &32u32.to_le_bytes()); // bodySize = 32
         assert_eq!(&enc[8..16], &[0u8; 8]); // reserved[2]
