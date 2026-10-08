@@ -858,6 +858,14 @@ after 0.12.0. The single-connection one-liners
   bare `Option`/`Vec`/`Box`/`String` with the same paths. One case remains: a
   type named `Box` nested in an interface still breaks the async service
   trait, whose `async-trait` expansion names `Box` bare.
+- **`rsbinder-aidl`: a reference cycle cut by a `@nullable` field no longer
+  rejects the other fields on it.** `parcelable A { @nullable(heap=true) B b; }
+  parcelable B { A a; }` failed with `aidl::recursive_parcelable` on `B.a`,
+  although `A.b` is `Option<Box<B>>` and `B` is finite; so did a fixed-size
+  array `Node[3]` whose `Node` points back through a `@nullable` field. Only
+  fields no box breaks — non-`@nullable` fields and fixed-size arrays — now
+  close a cycle, as AOSP `CheckNoRecursiveDefinition` skips
+  `@nullable(heap=true)`. The generated code of accepted input is unchanged.
 - **RPC on the android-12 (r34) wire: releasing many references to one binder
   no longer allocates a frame per reference.** The r34 `DEC_STRONG` has no
   amount field, so `amount` frames go out, but they were built as `amount`
