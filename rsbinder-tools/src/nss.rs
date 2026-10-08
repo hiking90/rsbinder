@@ -122,8 +122,11 @@ pub fn uid_for_user(name: &str) -> Result<u32, NssError> {
 /// taken as a literal gid and never touches the name service — policy has
 /// to keep working in a minimal container with no group database.
 pub fn gid_for_group(spec: &str) -> Result<u32, NssError> {
-    if let Ok(gid) = spec.parse::<u32>() {
-        return Ok(gid);
+    // `u32::from_str` also takes a leading `+`, which is not "entirely digits".
+    if !spec.is_empty() && spec.bytes().all(|b| b.is_ascii_digit()) {
+        if let Ok(gid) = spec.parse::<u32>() {
+            return Ok(gid);
+        }
     }
     let cname = cstring("group", spec)?;
     let mut buf = vec![0u8; 1024];
@@ -342,7 +345,9 @@ impl GroupCache {
     /// The NSS lookup runs *outside* the cache lock: it can block for as
     /// long as the name service takes, and holding the lock across it would
     /// serialize every other thread's lookups behind the slowest one. A
-    /// concurrent duplicate resolve is possible; the first insert wins.
+    /// concurrent duplicate resolve is possible; it is merged into the entry
+    /// as in [`revalidate`](Self::revalidate), so a failed lookup that
+    /// inserted first cannot hide a successful one.
     ///
     /// A failed lookup is memoized as an empty set, so a name-service
     /// outage costs one lookup per [`MIN_REVALIDATE`](Self::MIN_REVALIDATE)
@@ -364,9 +369,12 @@ impl GroupCache {
             return resolved;
         }
         let entry = entries.entry(uid).or_insert_with(|| Entry {
-            gids: resolved,
+            gids: Arc::clone(&resolved),
             resolved_at: Instant::now(),
         });
+        if !resolved.is_subset(&entry.gids) {
+            entry.gids = Arc::new(entry.gids.union(&resolved).copied().collect());
+        }
         Arc::clone(&entry.gids)
     }
 
@@ -466,6 +474,7 @@ mod tests {
     fn numeric_group_spec_bypasses_nss() {
         assert_eq!(gid_for_group("0").unwrap(), 0);
         assert_eq!(gid_for_group("1234").unwrap(), 1234);
+        assert_ne!(gid_for_group("+100"), Ok(100));
     }
 
     #[test]
@@ -606,6 +615,31 @@ mod tests {
         let cache = clearing_on_call(1, set(&[50]));
         assert_eq!(*cache.gids_for(1), set(&[50]));
         assert!(!cache.entries.lock().unwrap().contains_key(&1));
+    }
+
+    /// A failed first read that lands while a successful one is in flight must not hide it.
+    #[test]
+    fn concurrent_failed_first_read_does_not_hide_success() {
+        let slot: Arc<std::sync::OnceLock<std::sync::Weak<GroupCache>>> = Arc::default();
+        let seen = std::sync::atomic::AtomicUsize::new(0);
+        let resolver = {
+            let slot = Arc::clone(&slot);
+            move |uid| {
+                if seen.fetch_add(1, Ordering::Relaxed) == 0 {
+                    // The nested read fails and inserts first.
+                    if let Some(cache) = slot.get().and_then(std::sync::Weak::upgrade) {
+                        cache.gids_for(uid);
+                    }
+                    Some(set(&[50]))
+                } else {
+                    None
+                }
+            }
+        };
+        let cache = Arc::new(GroupCache::with_resolver(Box::new(resolver)));
+        slot.set(Arc::downgrade(&cache)).unwrap();
+        assert_eq!(*cache.gids_for(1), set(&[50]));
+        assert_eq!(*cache.gids_for(1), set(&[50]));
     }
 
     /// A re-read that straddles a reload is answered but not stored.

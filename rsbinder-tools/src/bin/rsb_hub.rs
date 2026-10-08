@@ -175,7 +175,7 @@ impl Inner {
         Ok(())
     }
 
-    /// `ProxyHandle::Drop` does not clear the kernel subscription, so an unpaired one leaks.
+    /// Unlinks on the last release; an unpaired link lives until the handle's last proxy drops.
     fn release_death_link(&mut self, binder: &SIBinder) {
         let Some(handle) = binder.as_proxy().map(|proxy| proxy.handle()) else {
             return;
@@ -934,17 +934,34 @@ impl IServiceManager for ServiceManager {
                 inner.release_death_link(&old);
             }
 
-            inner.add_service(
-                name,
-                Service {
-                    binder: service.clone(),
-                    dump_priority: dumpPriority,
-                    has_clients: prev_clients,
-                    guarantee_client: false,
-                    context: caller,
-                    is_accessor,
-                },
-            )?;
+            // Same binder keeps the owner, else any `add`er holding it takes the uid/pid checks.
+            if same_binder {
+                if let Some(existing) = inner.name_to_service.get_mut(name) {
+                    if existing.context.uid == caller.uid || self.allow_cross_uid_overwrite {
+                        existing.dump_priority = dumpPriority;
+                        existing.guarantee_client = false;
+                        existing.is_accessor = is_accessor;
+                    } else {
+                        log::warn!(
+                            "addService: uid={} re-added '{name}' (owned by uid={}); keeping the owner's flags",
+                            caller.uid,
+                            existing.context.uid
+                        );
+                    }
+                }
+            } else {
+                inner.add_service(
+                    name,
+                    Service {
+                        binder: service.clone(),
+                        dump_priority: dumpPriority,
+                        has_clients: prev_clients,
+                        guarantee_client: false,
+                        context: caller,
+                        is_accessor,
+                    },
+                )?;
+            }
 
             if inner.name_to_registration_callbacks.contains_key(name) {
                 if let Some(service) = inner.name_to_service.get_mut(name) {

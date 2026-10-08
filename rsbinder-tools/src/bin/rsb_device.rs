@@ -4,8 +4,6 @@
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::Path;
 
-use std::process::Command;
-
 use anstyle::*;
 use rsbinder::*;
 use rsbinder_tools::nss::gid_for_group;
@@ -14,6 +12,28 @@ use rsbinder_tools::nss::gid_for_group;
 fn is_mounted(binderfs_path: &Path) -> std::io::Result<bool> {
     let mounts = std::fs::read_to_string("/proc/mounts")?;
     Ok(mounts_text_contains_target(&mounts, binderfs_path))
+}
+
+/// mount(2) directly: no `$PATH` lookup of mount(8) as root.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn mount_binderfs(target: &Path) -> std::io::Result<()> {
+    use rustix::mount::{mount, MountFlags};
+    mount(
+        "binder",
+        target,
+        "binder",
+        MountFlags::empty(),
+        None::<&std::ffi::CStr>,
+    )?;
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn mount_binderfs(_target: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "binderfs needs a Linux kernel",
+    ))
 }
 
 /// Split from `is_mounted` so tests need no `/proc`.
@@ -162,26 +182,13 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             "BinderFS is already mounted on {}",
             binderfs_path.display()
         )),
-        Ok(false) => {
-            // Absolute path: as root, a `mount` planted earlier on `$PATH` would run instead.
-            let status = Command::new("/bin/mount")
-                .arg("-t")
-                .arg("binder")
-                .arg("binder")
-                .arg(binderfs_path)
-                .status();
-            match status {
-                Ok(s) if s.success() => {
-                    log_ok(&format!("BinderFS mounted at {}.", binderfs_path.display()))
-                }
-                Ok(s) => log_err(&format!(
-                    "mount(8) exited with {} while mounting binderfs at {}",
-                    s,
-                    binderfs_path.display()
-                )),
-                Err(err) => log_err(&format!("Failed to spawn mount(8): {err}")),
-            }
-        }
+        Ok(false) => match mount_binderfs(binderfs_path) {
+            Ok(()) => log_ok(&format!("BinderFS mounted at {}.", binderfs_path.display())),
+            Err(err) => log_err(&format!(
+                "Failed to mount binderfs at {}: {err}",
+                binderfs_path.display()
+            )),
+        },
         Err(err) => log_err(&format!("Failed to read /proc/mounts: {err}")),
     }
 
