@@ -550,6 +550,11 @@ fn by_value_type_name(ty: &Type) -> Option<&str> {
     Some(&ty.non_array_type.name)
 }
 
+// Only a bare `@nullable` field gets `Option<Box<…>>`; a fixed-size array keeps elements inline.
+fn is_boxable_nullable(ty: &Type) -> bool {
+    ty.array_types.is_empty() && has_annotation(&ty.annotation_list, AnnotationType::IsNullable)
+}
+
 fn value_members(ns: &Namespace) -> Option<Vec<Declaration>> {
     DECLARATION_MAP.with(|map| match map.borrow().get(ns) {
         Some(Declaration::Parcelable(p)) => Some(p.members.clone()),
@@ -608,6 +613,17 @@ fn is_value_decl(ns: &Namespace) -> bool {
     })
 }
 
+/// Which fields [`declaration_reaches`] follows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SizingEdges {
+    /// Every field held by value. A bare `@nullable` field that closes a cycle
+    /// in this graph is the one rendered `Option<Box<…>>`.
+    ByValue,
+    /// Only fields no box can break. A bare `@nullable` field is left out: on a
+    /// cycle it is boxed, and off every cycle it cannot be part of one.
+    Unboxable,
+}
+
 /// Can `start` reach `target` by following the fields of parcelables and
 /// unions? A reference cycle of any length is an infinitely sized Rust type, so
 /// the field that closes it has to be boxed — a direct self-reference is only
@@ -618,7 +634,10 @@ fn is_value_decl(ns: &Namespace) -> bool {
 /// not be boxed: an interface is a `Strong<dyn …>` — the
 /// `CircularParcelable` / `ITestService` pair in the AOSP fixtures is exactly
 /// that shape — and a `Vec`/`HashMap` element is behind an allocation.
-pub fn declaration_reaches(start: &Namespace, target: &Namespace) -> bool {
+/// [`SizingEdges::Unboxable`] also drops the bare `@nullable` fields, which is
+/// how AOSP `CheckNoRecursiveDefinition` (`parser.cpp:144-195`) treats
+/// `@nullable(heap=true)`.
+pub fn declaration_reaches(start: &Namespace, target: &Namespace, edges: SizingEdges) -> bool {
     if !is_value_decl(start) || !is_value_decl(target) {
         return false;
     }
@@ -647,6 +666,9 @@ pub fn declaration_reaches(start: &Namespace, target: &Namespace) -> bool {
             let Some(name) = by_value_type_name(&var.r#type) else {
                 continue;
             };
+            if edges == SizingEdges::Unboxable && is_boxable_nullable(&var.r#type) {
+                continue;
+            }
             let Some(found) = lookup_decl_from_name(name, Namespace::AIDL) else {
                 continue;
             };

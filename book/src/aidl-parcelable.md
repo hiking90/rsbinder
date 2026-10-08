@@ -135,7 +135,9 @@ When the client passes `None`, the service receives `None` and can return `None`
 
 ## Recursive Structures
 
-AIDL supports self-referential parcelable types. In AOSP-faithful AIDL the recursive field is marked `@nullable(heap=true)`, signalling to the C++ and Java backends that the inner value lives on the heap so the struct has a finite, known size at compile time. rsbinder accepts the same syntax for source compatibility but ignores `heap=true`: it boxes a field whenever that field can reach its own enclosing type by value, which covers a cycle of any length, not only a direct self-reference. A type reached through an interface handle or a `Vec` element keeps the enclosing type finite and is not boxed.
+AIDL supports self-referential parcelable types. In AOSP-faithful AIDL the recursive field is marked `@nullable(heap=true)`, signalling to the C++ and Java backends that the inner value lives on the heap so the struct has a finite, known size at compile time. rsbinder accepts the same syntax for source compatibility but ignores `heap=true`: it boxes a `@nullable` field whenever that field can reach its own enclosing type by value, which covers a cycle of any length, not only a direct self-reference. A type reached through an interface handle or a `Vec` element keeps the enclosing type finite and is not boxed.
+
+Every cycle needs at least one such `@nullable` field. Once one field on the cycle is boxed, the other fields on it stay inline, as in AOSP: in `parcelable A { @nullable(heap=true) B b; } parcelable B { A a; }`, `A.b` is `Option<Box<B>>` and `B.a` is a plain `A`. A cycle made only of non-`@nullable` fields or fixed-size arrays (`T[N]`, which store their elements inline) is rejected with `aidl::recursive_parcelable`, because neither form can be boxed.
 
 AIDL definition (from `RecursiveList.aidl` in the test suite):
 
@@ -173,7 +175,7 @@ for n in 0..10 {
 assert!(current.is_none());
 ```
 
-Without the `Box` indirection the Rust compiler would reject the type definition because `RecursiveList` would need to contain itself directly, leading to an infinite-size type. The code generator inserts that indirection automatically whenever it sees a field whose type matches the enclosing parcelable.
+Without the `Box` indirection the Rust compiler would reject the type definition because `RecursiveList` would need to contain itself directly, leading to an infinite-size type. The code generator inserts that indirection automatically on the `@nullable` field that closes the cycle.
 
 ## ExtendableParcelable and ParcelableHolder
 

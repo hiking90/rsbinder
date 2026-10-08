@@ -219,6 +219,10 @@ jobs:
         # `tests/tests/prelude_shadow.rs` compiles and round-trips AIDL items
         # named `Ok`/`Err`/`Some`/`None`/`Default`: no /dev/binder, no feature.
         run: cargo test -p tests --test prelude_shadow
+      - name: Generated code for cycles cut by one boxed field (hermetic)
+        # `tests/tests/boxed_cycles.rs` compiles and round-trips parcelables whose
+        # reference cycle keeps every field but the boxed one inline: no /dev/binder, no feature.
+        run: cargo test -p tests --test boxed_cycles
       - name: NDK stream header on the host (hermetic — plan 10-7b P4)
         # `tests/tests/c_stream_header.rs` builds `contrib/ndk/rsbinder_stream.h`
         # with the runner's `cc` (AddressSanitizer + UBSan) and `c++` and runs

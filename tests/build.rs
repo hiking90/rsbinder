@@ -167,6 +167,13 @@ fn main() {
         .generate()
         .unwrap();
 
+    // `tests/boxed_cycles.rs`: a cycle cut by one boxed field keeps its other fields inline.
+    rsbinder_aidl::Builder::new()
+        .source(PathBuf::from("aidl/boxed_cycles/BoxedCycles.aidl"))
+        .output(PathBuf::from("boxed_cycles.rs"))
+        .generate()
+        .unwrap();
+
     // Plan 10-9 (`tests/transaction_names.rs`): `version`/`hash` stamp the preceding source.
     rsbinder_aidl::Builder::new()
         .source(PathBuf::from("aidl/tracedemo/ITraceDemo.aidl"))

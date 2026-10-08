@@ -516,8 +516,11 @@ impl TypeGenerator {
     /// non-nullable one has neither: boxing it alone would produce a `Default`
     /// that recurses until the stack runs out, and that `Default` is the
     /// deserialization entry point, so a peer's parcel would abort the
-    /// process. AOSP likewise makes the cycle-closing field nullable. Must be
-    /// invoked while the owning declaration's `NamespaceGuard` is active.
+    /// process. Only fields no box can break count here
+    /// (`SizingEdges::Unboxable`): once a `@nullable` field on a cycle is boxed,
+    /// the other fields on it stay inline, as AOSP `CheckNoRecursiveDefinition`
+    /// accepts for `@nullable(heap=true)`. Must be invoked while the owning
+    /// declaration's `NamespaceGuard` is active.
     pub fn ensure_sized(&self) -> Result<(), AidlError> {
         // Only bare fields (`@nullable` rescues) and inline `[T; N]` (no Box codec) close cycles.
         let (type_name, nullable_rescues) = match &self.value_type {
@@ -537,7 +540,7 @@ impl TypeGenerator {
         let Some(lookup_decl) = lookup_decl_from_name(type_name, crate::Namespace::AIDL) else {
             return Ok(());
         };
-        if !Self::closes_reference_cycle(&lookup_decl) {
+        if !Self::closes_reference_cycle(&lookup_decl, SizingEdges::Unboxable) {
             return Ok(());
         }
         let (src, span) = diagnostic_source(self.type_span);
@@ -573,7 +576,7 @@ impl TypeGenerator {
     }
 
     // Only a parcelable or union is held inline; interfaces are handles and enums are scalars.
-    fn closes_reference_cycle(lookup_decl: &crate::parser::LookupDecl) -> bool {
+    fn closes_reference_cycle(lookup_decl: &crate::parser::LookupDecl, edges: SizingEdges) -> bool {
         if !matches!(
             lookup_decl.decl,
             Declaration::Parcelable(_) | Declaration::Union(_)
@@ -587,7 +590,7 @@ impl TypeGenerator {
                 .ns
                 .last()
                 .is_some_and(|name| curr_ns.ns.last() == Some(name));
-        refers_to_self || crate::parser::declaration_reaches(&lookup_decl.ns, &curr_ns)
+        refers_to_self || crate::parser::declaration_reaches(&lookup_decl.ns, &curr_ns, edges)
     }
 
     /// `allow_box` is false for array elements: `Box<T>` has no `SerializeArray` impl.
@@ -603,7 +606,7 @@ impl TypeGenerator {
         let needs_box = allow_box
             && self.is_nullable
             && !is_interface
-            && Self::closes_reference_cycle(&lookup_decl);
+            && Self::closes_reference_cycle(&lookup_decl, SizingEdges::ByValue);
         // A builtin is the runtime crate's type, not a module of this output.
         let path = if let Some(builtin) = parser::builtin_rust_path(&lookup_decl.ns) {
             format!("{}::{builtin}", crate_name())

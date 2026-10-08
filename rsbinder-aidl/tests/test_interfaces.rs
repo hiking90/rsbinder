@@ -605,11 +605,59 @@ parcelable Tree {
     Node[3] nodes;
 }
 parcelable Node {
-    @nullable Tree owner;
+    Tree owner;
 }
         "##,
         "closes a reference cycle",
     );
+    aidl_generator_should_fail(
+        r##"
+parcelable Node {
+    @nullable Node[2] children;
+}
+        "##,
+        "closes a reference cycle",
+    );
+}
+
+/// A boxed field already cuts the cycle, so the other fields on it stay inline: AOSP
+/// `CheckNoRecursiveDefinition` (`parser.cpp:144-195`) skips `@nullable(heap=true)` edges.
+#[test]
+fn fields_on_a_boxed_cycle_stay_inline() -> Result<(), Box<dyn Error>> {
+    for (input, inline) in [
+        (
+            r##"
+parcelable A {
+    @nullable(heap=true) B b;
+}
+parcelable B {
+    A a;
+}
+            "##,
+            "pub r#a: super::A::A,",
+        ),
+        (
+            r##"
+parcelable Tree {
+    Node[3] nodes;
+}
+parcelable Node {
+    @nullable Tree owner;
+}
+            "##,
+            "pub r#nodes: [super::Node::Node; 3],",
+        ),
+    ] {
+        let ctx = rsbinder_aidl::SourceContext::new("test.aidl", input);
+        let document = rsbinder_aidl::parse_document(&ctx)?;
+        let out = rsbinder_aidl::Generator::new(false, false)
+            .document(&document)?
+            .1;
+        assert!(out.contains(inline), "{out}");
+        assert_eq!(out.matches("::std::boxed::Box<").count(), 1, "{out}");
+        syn::parse_file(&out).map_err(|e| format!("generated code does not parse: {e}\n{out}"))?;
+    }
+    Ok(())
 }
 
 /// Each name is already an item of the generated interface module: rustc E0428 downstream.
