@@ -46,7 +46,7 @@ pub mod ArrayOfInterfaces {
     #[derive(Debug)]
     pub struct ArrayOfInterfaces {
     }
-    impl Default for ArrayOfInterfaces {
+    impl ::core::default::Default for ArrayOfInterfaces {
         fn default() -> Self {
             Self {
             }

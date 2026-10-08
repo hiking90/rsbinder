@@ -346,10 +346,10 @@ pub mod Task {
         pub r#name: String,
         pub r#priority: i32,
     }
-    impl Default for Task {
+    impl ::core::default::Default for Task {
         fn default() -> Self {
             Self {
-                r#name: Default::default(),
+                r#name: ::core::default::Default::default(),
                 r#priority: 50,
             }
         }
@@ -750,7 +750,7 @@ fn test_parcelable_non_null_interface_field_is_option() -> Result<(), Box<dyn Er
 
     // And the default impl must compile (Option's Default is None).
     assert!(
-        output.contains("r#op: Default::default()"),
+        output.contains("r#op: ::core::default::Default::default()"),
         "Default impl must use Default::default() for the Option field, got:\n{}",
         output
     );

@@ -55,7 +55,7 @@ pub mod {{mod}} {
     {%- endif %}
     pub const r#{{ member.0 }}: {{ member.1 }} = {{ member.2 }};
     {%- endfor %}
-    impl Default for r#{{union_name}} {
+    impl ::core::default::Default for r#{{union_name}} {
         fn default() -> Self {
     {%- if members|length > 0 %}
             Self::{{members[0][0]}}({{members[0][3]}})
@@ -87,14 +87,14 @@ pub mod {{mod}} {
                 {{counter}} => {
                     let value: {{member.1}} = parcel.read()?;
     {%- if member.4 %}
-                    if value.is_none() { return Err({{crate}}::StatusCode::UnexpectedNull); }
+                    if value.is_none() { return ::core::result::Result::Err({{crate}}::StatusCode::UnexpectedNull); }
     {%- endif %}
                     *self = Self::r#{{member.0}}(value);
-                    Ok(())
+                    ::core::result::Result::Ok(())
                 }
     {%- set_global counter = counter + 1 %}
     {%- endfor %}
-                _ => Err({{crate}}::StatusCode::BadValue),
+                _ => ::core::result::Result::Err({{crate}}::StatusCode::BadValue),
             }
         }
     }
@@ -150,7 +150,7 @@ pub mod {{mod}} {
         pub _phantom_{{ param }}: core::marker::PhantomData<{{ param }}>,
     {%- endfor %}
     }
-    impl{{generics}} Default for {{ name }}{{generics}} {
+    impl{{generics}} ::core::default::Default for {{ name }}{{generics}} {
         fn default() -> Self {
             Self {
             {%- for member in members %}
@@ -900,7 +900,9 @@ fn quote_rust_string(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if c.is_control() => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c if c.is_control() || crate::const_expr::is_bidi_control(c) => {
+                out.push_str(&format!("\\u{{{:x}}}", c as u32))
+            }
             c => out.push(c),
         }
     }
@@ -1584,7 +1586,7 @@ fn render_enforce_permission_check(
     format!(
         "if !({condition}) {{ \
              _reply.write(&{crate_name}::Status::from({crate_name}::ExceptionCode::Security))?; \
-             return Ok(()); \
+             return ::core::result::Result::Ok(()); \
          }}"
     )
 }

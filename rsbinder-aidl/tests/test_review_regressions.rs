@@ -620,14 +620,14 @@ fn union_non_nullable_binder_member_is_null_strict() {
     // Read side: an inbound null is rejected on the non-nullable arms only.
     assert!(
         packed.contains(
-            "ifvalue.is_none(){returnErr(rsbinder::StatusCode::UnexpectedNull);}\
+            "ifvalue.is_none(){return::core::result::Result::Err(rsbinder::StatusCode::UnexpectedNull);}\
              *self=Self::r#B(value)"
         ),
         "non-nullable IBinder union member read must reject null (got: {packed})"
     );
     assert!(
         packed.contains(
-            "ifvalue.is_none(){returnErr(rsbinder::StatusCode::UnexpectedNull);}\
+            "ifvalue.is_none(){return::core::result::Result::Err(rsbinder::StatusCode::UnexpectedNull);}\
              *self=Self::r#Pfd(value)"
         ),
         "non-nullable PFD union member read must reject null (got: {packed})"
@@ -1531,12 +1531,16 @@ fn nullable_string_array_constant_type_matches_its_initializer() {
     .expect("must generate");
     assert!(
         out.contains(
-            "pub const r#X: Option<[Option<&str>; 2]> = Some([Some(\"a\"),Some(\"b\"),]);"
+            "pub const r#X: Option<[Option<&str>; 2]> = ::core::option::Option::Some([\
+             ::core::option::Option::Some(\"a\"),::core::option::Option::Some(\"b\"),]);"
         ),
         "got:\n{out}"
     );
     assert!(
-        out.contains("pub const r#Y: Option<&[Option<&str>]> = Some(&[Some(\"a\"),]);"),
+        out.contains(
+            "pub const r#Y: Option<&[Option<&str>]> = ::core::option::Option::Some(&[\
+             ::core::option::Option::Some(\"a\"),]);"
+        ),
         "got:\n{out}"
     );
 }
@@ -1621,7 +1625,10 @@ fn rust_derive_accepts_only_the_aosp_schema() {
     assert!(!out.contains("#[derive(Default"), "got:\n{out}");
     assert!(!out.contains("Default,"), "got:\n{out}");
     assert!(out.contains("#[derive(Clone)]"), "got:\n{out}");
-    assert!(out.contains("impl Default for P"), "got:\n{out}");
+    assert!(
+        out.contains("impl ::core::default::Default for P"),
+        "got:\n{out}"
+    );
 }
 
 /// `""` (from `strip_package`) is the cwd: dedup with `.`, never emit a bare `rerun-if-changed=`.
@@ -1689,7 +1696,8 @@ fn empty_interface_hash_is_rejected() {
     let _ = rsbinder_aidl::Builder::new().source("I.aidl").hash("");
 }
 
-/// `Builder::hash` takes any non-empty text; `"` and `\` must not end the emitted literal early.
+/// `Builder::hash` takes any non-empty text; `"` and `\` must not end the emitted literal early,
+/// and a bidi control (rustc's deny-by-default `text_direction_codepoint_in_literal`) is escaped.
 #[test]
 fn interface_hash_is_emitted_as_an_escaped_literal() {
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("hash_escape");
@@ -1699,14 +1707,25 @@ fn interface_hash_is_emitted_as_an_escaped_literal() {
     std::fs::write(&src, "interface I { void f(); }").unwrap();
     rsbinder_aidl::Builder::new()
         .source(&src)
-        .hash("a\"b\\")
+        .hash("a\"b\\\u{202E}c")
         .dest_dir(&dir)
         .output(std::path::PathBuf::from("out.rs"))
         .generate()
         .expect("generates");
     let out = std::fs::read_to_string(dir.join("out.rs")).unwrap();
     assert!(
-        out.contains(r#"pub const HASH: &str = "a\"b\\";"#),
+        out.contains(r#"pub const HASH: &str = "a\"b\\\u{202e}c";"#),
+        "got:\n{out}"
+    );
+}
+
+/// A `@deprecated` note becomes a `#[deprecated = "..."]` literal: its bidi controls are escaped.
+#[test]
+fn deprecated_note_escapes_bidi_controls() {
+    let out = generate_str("package a; /** @deprecated use a\u{202E}b */ parcelable P { int x; }")
+        .expect("must generate");
+    assert!(
+        out.contains(r#"#[deprecated = "use a\u{202e}b"]"#),
         "got:\n{out}"
     );
 }

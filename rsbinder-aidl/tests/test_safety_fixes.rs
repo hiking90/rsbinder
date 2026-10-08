@@ -416,7 +416,9 @@ fn test_enum_array_default_initializers() {
         "non-nullable enum array default mismatch, got:\n{out}"
     );
     assert!(
-        out.contains("r#maybeColors: Some(vec![super::Color::Color::GREEN,]),"),
+        out.contains(
+            "r#maybeColors: ::core::option::Option::Some(vec![super::Color::Color::GREEN,]),"
+        ),
         "nullable enum array default mismatch, got:\n{out}"
     );
 }

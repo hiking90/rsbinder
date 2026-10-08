@@ -613,7 +613,7 @@ impl ValueType {
                     let some_str = if let ValueType::Array(_) = v.value {
                         init_str
                     } else if param.is_nullable {
-                        format!("Some({init_str})")
+                        format!("::core::option::Option::Some({init_str})")
                     } else {
                         init_str
                     };
@@ -632,7 +632,7 @@ impl ValueType {
                         param.crate_name, param.crate_name
                     )
                 } else {
-                    "Default::default()".to_string()
+                    "::core::default::Default::default()".to_string()
                 }
             }
             ValueType::Byte(_)
@@ -642,7 +642,7 @@ impl ValueType {
             | ValueType::Expr { .. }
             | ValueType::Unary { .. } => self.to_value_string(),
 
-            _ => "Default::default()".to_string(),
+            _ => "::core::default::Default::default()".to_string(),
         }
     }
 
@@ -1024,7 +1024,7 @@ fn resolve_name(name: &str) -> Result<ConstExpr, ConstExprError> {
 }
 
 // rustc denies these raw in a literal (`text_direction_codepoint_in_literal`); escape them.
-fn is_bidi_control(c: char) -> bool {
+pub(crate) fn is_bidi_control(c: char) -> bool {
     matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 

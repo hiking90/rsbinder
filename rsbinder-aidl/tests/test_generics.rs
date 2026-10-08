@@ -67,11 +67,11 @@ pub mod GenericStructuredParcelable {
         pub _phantom_U: core::marker::PhantomData<U>,
         pub _phantom_B: core::marker::PhantomData<B>,
     }
-    impl<T, U, B> Default for GenericStructuredParcelable<T, U, B> {
+    impl<T, U, B> ::core::default::Default for GenericStructuredParcelable<T, U, B> {
         fn default() -> Self {
             Self {
-                r#a: Default::default(),
-                r#b: Default::default(),
+                r#a: ::core::default::Default::default(),
+                r#b: ::core::default::Default::default(),
                 _phantom_T: core::marker::PhantomData,
                 _phantom_U: core::marker::PhantomData,
                 _phantom_B: core::marker::PhantomData,

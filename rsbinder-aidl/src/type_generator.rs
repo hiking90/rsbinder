@@ -1437,7 +1437,10 @@ impl TypeGenerator {
 
     /// `std::array::from_fn` init for a non-nullable array with a dim > 32 (no `Default` impl).
     fn fixed_array_default(&self) -> Option<String> {
-        self.fixed_array_init("Default::default()", "std::array::from_fn")
+        self.fixed_array_init(
+            "::core::default::Default::default()",
+            "::core::array::from_fn",
+        )
     }
 
     /// `from_fn` once per dimension around `leaf`, spelled by the caller.
@@ -1458,7 +1461,7 @@ impl TypeGenerator {
 
     pub fn default_value(&self) -> String {
         self.fixed_array_default()
-            .unwrap_or_else(|| "Default::default()".to_owned())
+            .unwrap_or_else(|| "::core::default::Default::default()".to_owned())
     }
 
     fn enum_lookup(&self) -> Option<LookupDecl> {
@@ -1752,7 +1755,7 @@ impl TypeGenerator {
         };
 
         Ok(if self.is_nullable {
-            format!("Some({init_str})")
+            format!("::core::option::Option::Some({init_str})")
         } else {
             init_str
         })
@@ -1993,10 +1996,10 @@ mod tests {
             .init_value(None, InitParam::builder().with_const(false))
             .unwrap();
         assert!(
-            field_default.contains("std::array::from_fn"),
+            field_default.contains("::core::array::from_fn"),
             "parcelable field default must not be bare Default::default(): {field_default}"
         );
-        assert!(big.default_value().contains("std::array::from_fn"));
+        assert!(big.default_value().contains("::core::array::from_fn"));
 
         // Every dimension <= 32 keeps `Default::default()`.
         let small = TypeGenerator::new(&NonArrayType {
@@ -2009,7 +2012,7 @@ mod tests {
             const_expr: Some(ConstExpr::new(ValueType::Int32(8))),
         }])
         .unwrap();
-        assert_eq!(small.default_value(), "Default::default()");
+        assert_eq!(small.default_value(), "::core::default::Default::default()");
     }
 
     #[test]

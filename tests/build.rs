@@ -156,6 +156,15 @@ fn main() {
         .generate()
         .unwrap();
 
+    // `tests/prelude_shadow.rs`: generated items named `Ok`/`Err`/`Some`/`None`/`Default`.
+    rsbinder_aidl::Builder::new()
+        .source(PathBuf::from("aidl/prelude_shadow/ShadowUnion.aidl"))
+        .source(PathBuf::from("aidl/prelude_shadow/ShadowParcelable.aidl"))
+        .source(PathBuf::from("aidl/prelude_shadow/IShadow.aidl"))
+        .output(PathBuf::from("prelude_shadow.rs"))
+        .generate()
+        .unwrap();
+
     // Plan 10-9 (`tests/transaction_names.rs`): `version`/`hash` stamp the preceding source.
     rsbinder_aidl::Builder::new()
         .source(PathBuf::from("aidl/tracedemo/ITraceDemo.aidl"))

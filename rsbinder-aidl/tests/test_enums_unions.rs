@@ -137,7 +137,7 @@ pub mod Union {
         r#Be(super::ByteEnum::ByteEnum),
     }
     pub const r#S1: &str = "a string constant in union";
-    impl Default for r#Union {
+    impl ::core::default::Default for r#Union {
         fn default() -> Self {
             Self::Ns(vec![])
         }
@@ -181,39 +181,39 @@ pub mod Union {
                 0 => {
                     let value: Vec<i32> = parcel.read()?;
                     *self = Self::r#Ns(value);
-                    Ok(())
+                    ::core::result::Result::Ok(())
                 }
                 1 => {
                     let value: i32 = parcel.read()?;
                     *self = Self::r#N(value);
-                    Ok(())
+                    ::core::result::Result::Ok(())
                 }
                 2 => {
                     let value: i32 = parcel.read()?;
                     *self = Self::r#M(value);
-                    Ok(())
+                    ::core::result::Result::Ok(())
                 }
                 3 => {
                     let value: String = parcel.read()?;
                     *self = Self::r#S(value);
-                    Ok(())
+                    ::core::result::Result::Ok(())
                 }
                 4 => {
                     let value: Option<rsbinder::SIBinder> = parcel.read()?;
                     *self = Self::r#Ibinder(value);
-                    Ok(())
+                    ::core::result::Result::Ok(())
                 }
                 5 => {
                     let value: Vec<String> = parcel.read()?;
                     *self = Self::r#Ss(value);
-                    Ok(())
+                    ::core::result::Result::Ok(())
                 }
                 6 => {
                     let value: super::ByteEnum::ByteEnum = parcel.read()?;
                     *self = Self::r#Be(value);
-                    Ok(())
+                    ::core::result::Result::Ok(())
                 }
-                _ => Err(rsbinder::StatusCode::BadValue),
+                _ => ::core::result::Result::Err(rsbinder::StatusCode::BadValue),
             }
         }
     }
@@ -481,9 +481,9 @@ pub mod NestedUnion {
     pub enum r#NestedUnion {
         r#InnerField(Inner::Inner),
     }
-    impl Default for r#NestedUnion {
+    impl ::core::default::Default for r#NestedUnion {
         fn default() -> Self {
-            Self::InnerField(Default::default())
+            Self::InnerField(::core::default::Default::default())
         }
     }
     impl rsbinder::Parcelable for r#NestedUnion {
@@ -501,9 +501,9 @@ pub mod NestedUnion {
                 0 => {
                     let value: Inner::Inner = parcel.read()?;
                     *self = Self::r#InnerField(value);
-                    Ok(())
+                    ::core::result::Result::Ok(())
                 }
-                _ => Err(rsbinder::StatusCode::BadValue),
+                _ => ::core::result::Result::Err(rsbinder::StatusCode::BadValue),
             }
         }
     }
@@ -551,7 +551,10 @@ fn test_union_enum_first_field_defaults_to_zero() -> Result<(), Box<dyn Error>> 
         union U { E e; int x; }
         "#,
     )?;
-    assert!(res.contains("Self::E(Default::default())"), "{res}");
+    assert!(
+        res.contains("Self::E(::core::default::Default::default())"),
+        "{res}"
+    );
     Ok(())
 }
 
@@ -566,7 +569,10 @@ fn test_union_tag_first_field_generates() -> Result<(), Box<dyn Error>> {
         }
         "#,
     )?;
-    assert!(res.contains("Self::T(Default::default())"), "{res}");
+    assert!(
+        res.contains("Self::T(::core::default::Default::default())"),
+        "{res}"
+    );
     Ok(())
 }
 
@@ -641,9 +647,9 @@ pub mod OuterUnion {
         r#SimpleField(i32),
         r#DataField(InnerData::InnerData),
     }
-    impl Default for r#OuterUnion {
+    impl ::core::default::Default for r#OuterUnion {
         fn default() -> Self {
-            Self::SimpleField(Default::default())
+            Self::SimpleField(::core::default::Default::default())
         }
     }
     impl rsbinder::Parcelable for r#OuterUnion {
@@ -665,14 +671,14 @@ pub mod OuterUnion {
                 0 => {
                     let value: i32 = parcel.read()?;
                     *self = Self::r#SimpleField(value);
-                    Ok(())
+                    ::core::result::Result::Ok(())
                 }
                 1 => {
                     let value: InnerData::InnerData = parcel.read()?;
                     *self = Self::r#DataField(value);
-                    Ok(())
+                    ::core::result::Result::Ok(())
                 }
-                _ => Err(rsbinder::StatusCode::BadValue),
+                _ => ::core::result::Result::Err(rsbinder::StatusCode::BadValue),
             }
         }
     }
@@ -694,11 +700,11 @@ pub mod OuterUnion {
             pub r#value: i32,
             pub r#name: String,
         }
-        impl Default for InnerData {
+        impl ::core::default::Default for InnerData {
             fn default() -> Self {
                 Self {
-                    r#value: Default::default(),
-                    r#name: Default::default(),
+                    r#value: ::core::default::Default::default(),
+                    r#name: ::core::default::Default::default(),
                 }
             }
         }
@@ -762,9 +768,9 @@ pub mod MultiNestedUnion {
         r#RawValue(i32),
         r#StatusField(Status::Status),
     }
-    impl Default for r#MultiNestedUnion {
+    impl ::core::default::Default for r#MultiNestedUnion {
         fn default() -> Self {
-            Self::RawValue(Default::default())
+            Self::RawValue(::core::default::Default::default())
         }
     }
     impl rsbinder::Parcelable for r#MultiNestedUnion {
@@ -786,14 +792,14 @@ pub mod MultiNestedUnion {
                 0 => {
                     let value: i32 = parcel.read()?;
                     *self = Self::r#RawValue(value);
-                    Ok(())
+                    ::core::result::Result::Ok(())
                 }
                 1 => {
                     let value: Status::Status = parcel.read()?;
                     *self = Self::r#StatusField(value);
-                    Ok(())
+                    ::core::result::Result::Ok(())
                 }
-                _ => Err(rsbinder::StatusCode::BadValue),
+                _ => ::core::result::Result::Err(rsbinder::StatusCode::BadValue),
             }
         }
     }
@@ -824,10 +830,10 @@ pub mod MultiNestedUnion {
         pub struct Metadata {
             pub r#id: i32,
         }
-        impl Default for Metadata {
+        impl ::core::default::Default for Metadata {
             fn default() -> Self {
                 Self {
-                    r#id: Default::default(),
+                    r#id: ::core::default::Default::default(),
                 }
             }
         }

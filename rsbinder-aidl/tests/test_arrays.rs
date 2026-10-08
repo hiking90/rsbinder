@@ -237,10 +237,10 @@ pub mod StructuredParcelable {
     pub struct StructuredParcelable {
         pub r#value: i32,
     }
-    impl Default for StructuredParcelable {
+    impl ::core::default::Default for StructuredParcelable {
         fn default() -> Self {
             Self {
-                r#value: Default::default(),
+                r#value: ::core::default::Default::default(),
             }
         }
     }
@@ -308,13 +308,13 @@ pub mod FixedSizeArrayExample {
         pub r#byteEnumNullableMatrix: Option<[[ByteEnum::ByteEnum; 2]; 2]>,
         pub r#interfaceNullableMatrix: Option<[[Option<rsbinder::Strong<dyn IEmptyInterface::IEmptyInterface>>; 2]; 2]>,
     }
-    impl Default for FixedSizeArrayExample {
+    impl ::core::default::Default for FixedSizeArrayExample {
         fn default() -> Self {
             Self {
                 r#int2x3: [[1,2,3,],[4,5,6,],],
-                r#stringNullableMatrix: Some([[Some("hello".into()),Some("world".into()),],[Some("Ciao".into()),Some("mondo".into()),],]),
-                r#byteEnumNullableMatrix: Default::default(),
-                r#interfaceNullableMatrix: Default::default(),
+                r#stringNullableMatrix: ::core::option::Option::Some([[::core::option::Option::Some("hello".into()),::core::option::Option::Some("world".into()),],[::core::option::Option::Some("Ciao".into()),::core::option::Option::Some("mondo".into()),],]),
+                r#byteEnumNullableMatrix: ::core::default::Default::default(),
+                r#interfaceNullableMatrix: ::core::default::Default::default(),
             }
         }
     }
@@ -458,10 +458,10 @@ pub mod FixedSizeArrayExample {
         pub struct IntParcelable {
             pub r#value: i32,
         }
-        impl Default for IntParcelable {
+        impl ::core::default::Default for IntParcelable {
             fn default() -> Self {
                 Self {
-                    r#value: Default::default(),
+                    r#value: ::core::default::Default::default(),
                 }
             }
         }

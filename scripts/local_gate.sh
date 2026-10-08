@@ -182,6 +182,7 @@ tier_hermetic() {
     run "rsbinder-aidl" tpass cargo test -p rsbinder-aidl
     run "tests: async_runtime" tpass cargo test -p tests --test async_runtime
     run "tests: fmq_parcel" tpass cargo test -p tests --test fmq_parcel
+    run "tests: prelude_shadow" tpass cargo test -p tests --test prelude_shadow
     linux_run "tests: c_stream_header" tpass cargo test -p tests --test c_stream_header
     run "rsbinder-fmq" tpass cargo test -p rsbinder-fmq
     run "rsbinder-tools" tpass cargo test -p rsbinder-tools

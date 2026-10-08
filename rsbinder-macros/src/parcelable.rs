@@ -99,7 +99,7 @@ pub(crate) fn render_source(input: &DeriveInput) -> syn::Result<String> {
         type_str::check_type_at(&field.ty, type_str::Place::Field)?;
         let decl = type_str::as_written_in(&field.ty, type_str::Ctx::Parcelable)?;
         // Read only by the `impl Default` that is dropped below.
-        let mut member = ParcelableMember::new(ident, decl, "Default::default()");
+        let mut member = ParcelableMember::new(ident, decl, "::core::default::Default::default()");
         member.deprecated = crate::deprecated_of(&field.attrs)?;
         members.push(member);
     }

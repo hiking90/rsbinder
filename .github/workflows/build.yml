@@ -215,6 +215,10 @@ jobs:
         # queue's fd) and a generic parcelable through a `Parcel`: no
         # /dev/binder, no feature.
         run: cargo test -p tests --test fmq_parcel
+      - name: Generated code under prelude-shadowing AIDL names (hermetic)
+        # `tests/tests/prelude_shadow.rs` compiles and round-trips AIDL items
+        # named `Ok`/`Err`/`Some`/`None`/`Default`: no /dev/binder, no feature.
+        run: cargo test -p tests --test prelude_shadow
       - name: NDK stream header on the host (hermetic — plan 10-7b P4)
         # `tests/tests/c_stream_header.rs` builds `contrib/ndk/rsbinder_stream.h`
         # with the runner's `cc` (AddressSanitizer + UBSan) and `c++` and runs

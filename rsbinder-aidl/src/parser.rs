@@ -1047,7 +1047,7 @@ impl VariableDecl {
     }
 
     pub fn member_init(&self) -> String {
-        "Default::default()".into()
+        "::core::default::Default::default()".into()
     }
 }
 
@@ -1580,6 +1580,17 @@ pub fn get_descriptor_from_annotation_list(
     let value = const_expr_as_string(expr).ok_or_else(|| {
         fail("Invalid value for parameter value on annotation Descriptor.".into())
     })?;
+    // The value lands raw in a Rust literal, where rustc denies bidi control characters.
+    if let Some(c) = value
+        .chars()
+        .find(|&c| crate::const_expr::is_bidi_control(c))
+    {
+        return Err(fail(format!(
+            "@Descriptor value contains the bidirectional control character U+{:04X}, \
+             which Rust rejects in a string literal",
+            c as u32
+        )));
+    }
     // AOSP `AidlInterface::GetDescriptor`: an empty override falls back to the canonical name.
     Ok((!value.is_empty()).then_some(value))
 }

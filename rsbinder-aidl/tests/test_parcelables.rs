@@ -118,7 +118,7 @@ pub mod VintfExtendableParcelable {
     pub struct VintfExtendableParcelable {
         pub r#ext: rsbinder::ParcelableHolder,
     }
-    impl Default for VintfExtendableParcelable {
+    impl ::core::default::Default for VintfExtendableParcelable {
         fn default() -> Self {
             Self {
                 r#ext: rsbinder::ParcelableHolder::new(rsbinder::Stability::Vintf),
@@ -166,10 +166,10 @@ pub mod VintfParcelable {
     pub struct VintfParcelable {
         pub r#a: i32,
     }
-    impl Default for VintfParcelable {
+    impl ::core::default::Default for VintfParcelable {
         fn default() -> Self {
             Self {
-                r#a: Default::default(),
+                r#a: ::core::default::Default::default(),
             }
         }
     }
@@ -227,7 +227,7 @@ pub mod IServiceManager {
     #[derive(Debug)]
     pub struct IServiceManager {
     }
-    impl Default for IServiceManager {
+    impl ::core::default::Default for IServiceManager {
         fn default() -> Self {
             Self {
             }
@@ -285,11 +285,11 @@ pub mod ConnectionInfo {
         pub r#ipAddress: String,
         pub r#port: i32,
     }
-    impl Default for ConnectionInfo {
+    impl ::core::default::Default for ConnectionInfo {
         fn default() -> Self {
             Self {
-                r#ipAddress: Default::default(),
-                r#port: Default::default(),
+                r#ipAddress: ::core::default::Default::default(),
+                r#port: ::core::default::Default::default(),
             }
         }
     }
@@ -569,18 +569,18 @@ pub mod StructuredParcelable {
         pub r#shouldBeConstS1: Option<super::Union::Union>,
         pub r#defaultWithFoo: super::IntEnum::IntEnum,
     }
-    impl Default for StructuredParcelable {
+    impl ::core::default::Default for StructuredParcelable {
         fn default() -> Self {
             Self {
-                r#shouldContainThreeFs: Default::default(),
-                r#f: Default::default(),
-                r#shouldBeJerry: Default::default(),
-                r#shouldBeByteBar: Default::default(),
-                r#shouldBeIntBar: Default::default(),
-                r#shouldBeLongBar: Default::default(),
-                r#shouldContainTwoByteFoos: Default::default(),
-                r#shouldContainTwoIntFoos: Default::default(),
-                r#shouldContainTwoLongFoos: Default::default(),
+                r#shouldContainThreeFs: ::core::default::Default::default(),
+                r#f: ::core::default::Default::default(),
+                r#shouldBeJerry: ::core::default::Default::default(),
+                r#shouldBeByteBar: ::core::default::Default::default(),
+                r#shouldBeIntBar: ::core::default::Default::default(),
+                r#shouldBeLongBar: ::core::default::Default::default(),
+                r#shouldContainTwoByteFoos: ::core::default::Default::default(),
+                r#shouldContainTwoIntFoos: ::core::default::Default::default(),
+                r#shouldContainTwoLongFoos: ::core::default::Default::default(),
                 r#stringDefaultsToFoo: "foo".into(),
                 r#byteDefaultsToFour: 4,
                 r#intDefaultsToFive: 5,
@@ -591,12 +591,12 @@ pub mod StructuredParcelable {
                 r#doubleWithDefault: -314000000000000000f64,
                 r#arrayDefaultsTo123: vec![1,2,3,],
                 r#arrayDefaultsToEmpty: vec![],
-                r#boolDefault: Default::default(),
-                r#byteDefault: Default::default(),
-                r#intDefault: Default::default(),
-                r#longDefault: Default::default(),
-                r#floatDefault: Default::default(),
-                r#doubleDefault: Default::default(),
+                r#boolDefault: ::core::default::Default::default(),
+                r#byteDefault: ::core::default::Default::default(),
+                r#intDefault: ::core::default::Default::default(),
+                r#longDefault: ::core::default::Default::default(),
+                r#floatDefault: ::core::default::Default::default(),
+                r#doubleDefault: ::core::default::Default::default(),
                 r#checkDoubleFromFloat: 3.14f64,
                 r#checkStringArray1: vec!["a".into(),"b".into(),],
                 r#checkStringArray2: vec!["a".into(),"b".into(),],
@@ -604,28 +604,28 @@ pub mod StructuredParcelable {
                 r#int32_max: 2147483647,
                 r#int64_max: 9223372036854775807,
                 r#hexInt32_neg_1: -1,
-                r#ibinder: Default::default(),
-                r#empty: Default::default(),
+                r#ibinder: ::core::default::Default::default(),
+                r#empty: ::core::default::Default::default(),
                 r#int8_1: vec![1,1,1,1,1,],
                 r#int32_1: vec![1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,],
                 r#int64_1: vec![1,1,1,1,1,1,1,1,1,1,],
                 r#hexInt32_pos_1: 1,
                 r#hexInt64_pos_1: 1,
-                r#const_exprs_1: Default::default(),
-                r#const_exprs_2: Default::default(),
-                r#const_exprs_3: Default::default(),
-                r#const_exprs_4: Default::default(),
-                r#const_exprs_5: Default::default(),
-                r#const_exprs_6: Default::default(),
-                r#const_exprs_7: Default::default(),
-                r#const_exprs_8: Default::default(),
-                r#const_exprs_9: Default::default(),
-                r#const_exprs_10: Default::default(),
+                r#const_exprs_1: ::core::default::Default::default(),
+                r#const_exprs_2: ::core::default::Default::default(),
+                r#const_exprs_3: ::core::default::Default::default(),
+                r#const_exprs_4: ::core::default::Default::default(),
+                r#const_exprs_5: ::core::default::Default::default(),
+                r#const_exprs_6: ::core::default::Default::default(),
+                r#const_exprs_7: ::core::default::Default::default(),
+                r#const_exprs_8: ::core::default::Default::default(),
+                r#const_exprs_9: ::core::default::Default::default(),
+                r#const_exprs_10: ::core::default::Default::default(),
                 r#addString1: "hello world!".into(),
                 r#addString2: "The quick brown fox jumps over the lazy dog.".into(),
-                r#shouldSetBit0AndBit2: Default::default(),
-                r#u: Default::default(),
-                r#shouldBeConstS1: Default::default(),
+                r#shouldSetBit0AndBit2: ::core::default::Default::default(),
+                r#u: ::core::default::Default::default(),
+                r#shouldBeConstS1: ::core::default::Default::default(),
                 r#defaultWithFoo: super::IntEnum::IntEnum::FOO,
             }
         }
@@ -818,7 +818,7 @@ pub mod StructuredParcelable {
         #[derive(Clone,PartialEq)]
         pub struct Empty {
         }
-        impl Default for Empty {
+        impl ::core::default::Default for Empty {
             fn default() -> Self {
                 Self {
                 }
@@ -906,7 +906,7 @@ pub mod Union {
         r#Be(super::ByteEnum::ByteEnum),
     }
     pub const r#S1: &str = "a string constant in union";
-    impl Default for r#Union {
+    impl ::core::default::Default for r#Union {
         fn default() -> Self {
             Self::Ns(vec![])
         }
@@ -950,39 +950,39 @@ pub mod Union {
                 0 => {
                     let value: Vec<i32> = parcel.read()?;
                     *self = Self::r#Ns(value);
-                    Ok(())
+                    ::core::result::Result::Ok(())
                 }
                 1 => {
                     let value: i32 = parcel.read()?;
                     *self = Self::r#N(value);
-                    Ok(())
+                    ::core::result::Result::Ok(())
                 }
                 2 => {
                     let value: i32 = parcel.read()?;
                     *self = Self::r#M(value);
-                    Ok(())
+                    ::core::result::Result::Ok(())
                 }
                 3 => {
                     let value: String = parcel.read()?;
                     *self = Self::r#S(value);
-                    Ok(())
+                    ::core::result::Result::Ok(())
                 }
                 4 => {
                     let value: Option<rsbinder::SIBinder> = parcel.read()?;
                     *self = Self::r#Ibinder(value);
-                    Ok(())
+                    ::core::result::Result::Ok(())
                 }
                 5 => {
                     let value: Vec<String> = parcel.read()?;
                     *self = Self::r#Ss(value);
-                    Ok(())
+                    ::core::result::Result::Ok(())
                 }
                 6 => {
                     let value: super::ByteEnum::ByteEnum = parcel.read()?;
                     *self = Self::r#Be(value);
-                    Ok(())
+                    ::core::result::Result::Ok(())
                 }
-                _ => Err(rsbinder::StatusCode::BadValue),
+                _ => ::core::result::Result::Err(rsbinder::StatusCode::BadValue),
             }
         }
     }
