@@ -112,6 +112,29 @@
 //! dropped under the read lock, where its pin's `Drop` would deadlock on the
 //! write lock.
 //!
+//! # Proxy counting
+//!
+//! `crate::proxy_count` counts pins, not `Arc<ProxyHandle>`s: AOSP counts a
+//! `BpBinder` from `BpBinder::create` to `~BpBinder` (`BpBinder.cpp:180-232`,
+//! `:796-830`), and a pin is that lifetime. A handle a `WIBinder` alone keeps
+//! stays counted, and a case-(b) revival is not counted again.
+//!
+//! `HandlePin::count_once` runs at the pin's first commit, in P3 after the
+//! `BC_ACQUIRE`, under P3's `CallbackDeferGuard` (`proxy_count` module doc
+//! "Callback deferral"), and records the uid it charged in `counted`;
+//! `HandlePin::drop` posts the matching `on_proxy_drop` from it, so the uid is
+//! the one at creation (AOSP `mTrackedUid`) and toggling per-uid tracking
+//! while the pin lives cannot desync the map. The uid is
+//! `thread_state::get_calling_uid` (AOSP `IPCThreadState::getCallingUid()`):
+//! the sender of the `BR_TRANSACTION` being handled, or this process's own
+//! `getuid()` when none is on the stack. Counting at P1's pinning would charge
+//! pins that are never committed — a P2 `query_interface` failure, or P3
+//! adopting another thread's pin — so no proxy anyone received; AOSP builds
+//! and returns its `BpBinder` under one lock and has no such pin. The cost is
+//! that a pin is uncounted during its P2 IPC. A case (a) replacing a pin in
+//! its `Drop` counts 2 until that `Drop` posts, as AOSP does while a new
+//! `BpBinder` replaces one in its destructor.
+//!
 //! # Published natives
 //!
 //! `flat_binder_object.binder` carries a process-monotonic u64 id (from
@@ -268,12 +291,36 @@ use crate::{binder::*, error::*, proxy::*, sys::binder, thread_state};
 pub(crate) struct HandlePin {
     handle: u32,
     generation: u64,
+    /// Set by the pin's first commit; module doc "Proxy counting".
+    counted: OnceLock<CountedPin>,
+}
+
+/// What `on_proxy_create` charged, for the matching `on_proxy_drop` (AOSP `mTrackedUid`).
+struct CountedPin {
+    uid: u32,
+    by_uid: bool,
 }
 
 impl HandlePin {
     /// Caller has issued and flushed the `BC_INCREFS` this pin releases.
     fn new(handle: u32, generation: u64) -> Arc<Self> {
-        Arc::new(Self { handle, generation })
+        Arc::new(Self {
+            handle,
+            generation,
+            counted: OnceLock::new(),
+        })
+    }
+
+    /// AOSP `BpBinder::create`'s count, once per pin; P3 calls it under its `CallbackDeferGuard`.
+    fn count_once(&self) {
+        self.counted.get_or_init(|| {
+            // Outside a transaction this is this process's own uid, as in AOSP.
+            let uid = thread_state::get_calling_uid();
+            CountedPin {
+                uid,
+                by_uid: crate::proxy_count::on_proxy_create(uid),
+            }
+        });
     }
 
     /// Test-only: a pin with no `BC_INCREFS` behind it; the caller must never let it drop.
@@ -292,8 +339,11 @@ impl HandlePin {
 }
 
 impl Drop for HandlePin {
-    /// AOSP `~BpBinder`: `expungeHandle` then `decWeakHandle` (`BpBinder.cpp:833-834`).
+    /// AOSP `~BpBinder`: count, then `expungeHandle` and `decWeakHandle` (`BpBinder.cpp:796-834`).
     fn drop(&mut self) {
+        if let Some(counted) = self.counted.get() {
+            crate::proxy_count::on_proxy_drop(counted.uid, counted.by_uid);
+        }
         let Some(this) = ProcessState::instance().get() else {
             return;
         };
@@ -382,6 +432,7 @@ fn commit_new_acquired(
     stability: Stability,
 ) -> Result<SIBinder> {
     let arc = ProxyHandle::new_acquired(pin, descriptor.clone(), stability)?;
+    pin.count_once();
     handle_to_proxy.insert(
         pin.handle(),
         CacheEntry {
@@ -1635,18 +1686,40 @@ mod tests {
             arcs[0].clone()
         };
 
+        // The count follows the pin, as AOSP's follows the BpBinder (module doc "Proxy counting").
+        let uid = thread_state::get_calling_uid();
+        let was_by_uid = crate::proxy_count::is_count_by_uid_enabled();
+        crate::proxy_count::enable_count_by_uid(true);
+        let count = || {
+            (
+                crate::proxy_count::get_binder_proxy_count(),
+                crate::proxy_count::get_binder_proxy_count_for_uid(uid),
+            )
+        };
+        let (base, base_uid) = count();
+
         let initial = ProcessState::as_self()
             .strong_proxy_for_handle(0)
             .expect("initial strong_proxy failed");
         let initial_gen = ProcessState::as_self()
             .cache_generation_for(0)
             .expect("entry must exist for handle 0");
+        assert_eq!(
+            count(),
+            (base + 1, base_uid + 1),
+            "a committed pin counts once"
+        );
         let weak = SIBinder::downgrade(&initial);
         // A clean process holds no other handle-0 `Arc`, so this is the last proxy.
         drop(initial);
         assert!(
             weak.upgrade().is_err(),
             "WIBinder::upgrade never resurrects"
+        );
+        assert_eq!(
+            count(),
+            (base + 1, base_uid + 1),
+            "a pin only a WIBinder keeps stays counted, as a BpBinder a wp keeps"
         );
         assert_eq!(
             ProcessState::as_self().cache_generation_for(0),
@@ -1669,6 +1742,11 @@ mod tests {
             Ok(&resurrected),
             "the WIBinder upgrades to the proxy revived on its pin, as AOSP promote() after force_set"
         );
+        assert_eq!(
+            count(),
+            (base + 1, base_uid + 1),
+            "a case (b) revival is not counted again"
+        );
 
         drop(resurrected);
         drop(weak);
@@ -1676,6 +1754,11 @@ mod tests {
             ProcessState::as_self().cache_generation_for(0),
             None,
             "the last proxy and WIBinder gone, the pin's drop removes the entry"
+        );
+        assert_eq!(
+            count(),
+            (base, base_uid),
+            "the pin's drop posts the decrement"
         );
         let rebuilt = lookup_from_8_threads();
         let rebuilt_gen = ProcessState::as_self()
@@ -1685,7 +1768,14 @@ mod tests {
             rebuilt_gen, initial_gen,
             "a fresh case (a) takes a new generation"
         );
+        assert_eq!(
+            count(),
+            (base + 1, base_uid + 1),
+            "8 racing lookups count one pin, uncommitted spares none"
+        );
         drop(rebuilt);
+        assert_eq!(count(), (base, base_uid));
+        crate::proxy_count::enable_count_by_uid(was_by_uid);
     }
 
     /// A same-thread obituary between P1 and P2 takes the lock, no deadlock; module doc "Tests".

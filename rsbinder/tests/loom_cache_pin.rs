@@ -12,7 +12,7 @@
 
 #![cfg(loom)]
 
-use loom::sync::atomic::{AtomicU32, Ordering};
+use loom::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use loom::sync::{Arc, Mutex, RwLock};
 use std::collections::HashMap;
 
@@ -113,6 +113,8 @@ struct Pin {
     handle: u32,
     generation: u32,
     refs: Refs,
+    /// `HandlePin::counted`: set by the pin's first commit.
+    counted: AtomicBool,
 }
 
 struct Proxy {
@@ -130,6 +132,8 @@ struct Process {
     cache: RwLock<HashMap<u32, Entry>>,
     kernel: MockKernel,
     next_generation: AtomicU32,
+    /// `proxy_count::PROXY_COUNT`: committed pins not yet released.
+    proxy_count: AtomicU32,
 }
 
 /// A user `SIBinder` of a proxy.
@@ -160,6 +164,7 @@ impl Process {
             cache: RwLock::new(HashMap::new()),
             kernel: MockKernel::default(),
             next_generation: AtomicU32::new(1),
+            proxy_count: AtomicU32::new(0),
         })
     }
 
@@ -167,6 +172,10 @@ impl Process {
     fn release_pin(&self, pin: &Arc<Pin>) {
         if !pin.refs.release() {
             return;
+        }
+        if pin.counted.load(Ordering::Relaxed) {
+            let before = self.proxy_count.fetch_sub(1, Ordering::Relaxed);
+            assert!(before >= 1, "on_proxy_drop without its on_proxy_create");
         }
         {
             let mut cache = self.cache.write().unwrap();
@@ -231,6 +240,7 @@ impl SharedProcess for Arc<Process> {
                             handle,
                             generation,
                             refs: Refs::one(),
+                            counted: AtomicBool::new(false),
                         });
                         Plan::CaseA {
                             pin: self.pin_ref(&pin),
@@ -259,6 +269,10 @@ impl SharedProcess for Arc<Process> {
                 }
             };
             self.kernel.bc_acquire(handle);
+            // `HandlePin::count_once`: the first commit counts, a case (b) revival does not.
+            if !pin.counted.swap(true, Ordering::Relaxed) {
+                self.proxy_count.fetch_add(1, Ordering::Relaxed);
+            }
             pin.refs.add();
             let proxy = Arc::new(Proxy {
                 pin: Arc::clone(&pin),
@@ -347,6 +361,11 @@ fn assert_released(process: &Process, handle: u32) {
         MockKernel::count(&kernel.bc_release_count),
         "every proxy is released once"
     );
+    assert_eq!(
+        process.proxy_count.load(Ordering::Relaxed),
+        0,
+        "every counted pin posts its drop"
+    );
 }
 
 /// Two threads each look up then drop, racing each other's last proxy and pin drops.
@@ -402,9 +421,19 @@ fn weak_ref_keeps_the_pin_for_case_b() {
         let weak = second.downgrade();
         drop(second);
         assert_eq!(kernel.ref_state(HANDLE), (0, 1));
+        assert_eq!(
+            process.proxy_count.load(Ordering::Relaxed),
+            1,
+            "the WIBinder's pin counts"
+        );
         let third = process.lookup(HANDLE);
         assert_eq!(third.generation(), kept_generation);
         assert_eq!(MockKernel::count(&kernel.bc_increfs_count), 2);
+        assert_eq!(
+            process.proxy_count.load(Ordering::Relaxed),
+            1,
+            "revival counts nothing"
+        );
         drop(third);
 
         // A lookup racing the WIBinder's drop: case (b) if it upgrades the pin first.

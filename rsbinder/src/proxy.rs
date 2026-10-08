@@ -127,23 +127,9 @@
 //!
 //! # Proxy counting
 //!
-//! `tracked_uid` is the uid `crate::proxy_count`'s per-uid map charges this
-//! proxy to, captured at construction via `thread_state::get_calling_uid`
-//! (AOSP `IPCThreadState::getCallingUid()`): the sender uid of the
-//! `BR_TRANSACTION` being handled, or this process's own `getuid()` when no
-//! incoming transaction is on the stack.
-//!
-//! `count_acquired` is `true` iff construction reached
-//! `proxy_count::on_proxy_create`, so `Drop` owes a matching `on_proxy_drop`.
-//! It stays `false` only for test-only construction (`synthetic_proxy`); a
-//! failed `inc_strong_handle` returns before any `ProxyHandle` exists.
-//! `counted_by_uid` is `true` iff `on_proxy_create` incremented the per-uid
-//! map (tracking was enabled at construction). `Drop` decides from this field,
-//! not from the live `COUNT_BY_UID_ENABLED` flag, so disabling tracking while
-//! the proxy lives cannot desync the count (AOSP `BpBinder::mTrackedUid`).
-//! Both are plain `bool`: written once before the `Arc<ProxyHandle>` is
-//! shared and read only in `Drop` (`&mut self`); the `Arc` refcount's
-//! release/acquire supplies the happens-before.
+//! A `ProxyHandle` is not what `crate::proxy_count` counts: the count follows
+//! the handle's pin, as AOSP's follows the `BpBinder` across strong 0→1
+//! revivals. See the `process_state` module doc "Proxy counting".
 //!
 //! # `obituary_sent` ordering
 //!
@@ -238,12 +224,6 @@ pub struct ProxyHandle {
     /// Shared `BC_INCREFS`; its generation is this proxy's. See module doc "Proxy identity".
     pin: Arc<HandlePin>,
     descriptor: String,
-    /// Uid charged in `proxy_count`'s per-uid map; see module doc "Proxy counting".
-    tracked_uid: u32,
-    /// `Drop` owes `on_proxy_drop` iff this is set; see module doc "Proxy counting".
-    count_acquired: bool,
-    /// Per-uid map was incremented at construction; `Drop` reads this, not the live flag.
-    counted_by_uid: bool,
     stability: Stability,
     /// Lock-free readers `Acquire`, locked readers `Relaxed`; see the module doc table.
     obituary_sent: AtomicBool,
@@ -259,18 +239,11 @@ impl ProxyHandle {
         stability: Stability,
     ) -> Result<Arc<Self>> {
         let handle = pin.handle();
-        // Outside a transaction this is this process's own uid, as in AOSP.
-        let tracked_uid = thread_state::get_calling_uid();
-        // Kernel ref before `on_proxy_create`, so a failure owes no `on_proxy_drop`.
         thread_state::inc_strong_handle(handle)?;
-        let counted_by_uid = crate::proxy_count::on_proxy_create(tracked_uid);
         Ok(Arc::new(Self {
             handle,
             pin: Arc::clone(pin),
             descriptor,
-            tracked_uid,
-            count_acquired: true,
-            counted_by_uid,
             stability,
             obituary_sent: AtomicBool::new(false),
             recipients: RwLock::new(Vec::new()),
@@ -511,10 +484,6 @@ impl Drop for ProxyHandle {
                 self.handle
             );
         }
-        // Only a proxy that reached `on_proxy_create` posts the drop (no phantom drops).
-        if self.count_acquired {
-            crate::proxy_count::on_proxy_drop(self.tracked_uid, self.counted_by_uid);
-        }
     }
 }
 
@@ -721,10 +690,6 @@ mod tests {
             handle: 1,
             pin: HandlePin::synthetic(1, 1),
             descriptor: "test".to_string(),
-            tracked_uid: 0,
-            // `Drop` skips `on_proxy_drop`, as this skips `on_proxy_create`.
-            count_acquired: false,
-            counted_by_uid: false,
             stability: Stability::Local,
             obituary_sent: AtomicBool::new(obituary_sent),
             recipients: RwLock::new(Vec::new()),

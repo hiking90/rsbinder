@@ -188,6 +188,8 @@ tier_hermetic() {
     # CI does not run loom; a target dir of its own, since the cfg rebuilds every dependency.
     run "rsbinder-fmq loom (EventFlag)" tpass env CARGO_TARGET_DIR=target/loom \
         RUSTFLAGS="--cfg loom" cargo test -p rsbinder-fmq --lib --release loom
+    run "rsbinder loom (cache pin)" tpass env CARGO_TARGET_DIR=target/loom \
+        RUSTFLAGS="--cfg loom" cargo test -p rsbinder --test loom_cache_pin --release
     run "rsbinder-tools" tpass cargo test -p rsbinder-tools
 
     run "rpc build matrix" rpc_build_matrix
