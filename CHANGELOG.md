@@ -519,6 +519,14 @@ This changelog starts at 0.9.0. For earlier releases, see the
   included, a binder with `BinderFeatures::set_requesting_sid` no longer asks
   the driver for the caller's context. Under Smack or AppArmor 0.11.0 returned
   the label, read on to the next NUL byte.
+- **`rsbinder-aidl`: an AIDL keyword is a whole word and never a name**, as
+  AOSP's lexer (`aidl_language_l.ll`) tokenizes it. A field, argument or
+  enumerator named `in`, `out`, `inout`, `package`, `import`, `const`,
+  `interface`, `parcelable`, `enum`, `union` or `oneway` is now a syntax error
+  (`int in;` used to pass when `;` or `,` followed the name); rename it.
+  Text such as `interfaceIFoo {`, `packagep;` or `oneway oneway interface` is
+  rejected too. AOSP's `aidl` rejects all of these, so an `.aidl` shared with
+  an Android build is unaffected.
 - **Android builds must link for API 29 (Android 10, the oldest supported
   platform) or newer: pass `--platform 29` to `cargo ndk`.** rsbinder now
   calls bionic's `process_vm_readv`, which cargo-ndk's default API 21 does
@@ -866,6 +874,11 @@ after 0.12.0. The single-connection one-liners
   fields no box breaks — non-`@nullable` fields and fixed-size arrays — now
   close a cycle, as AOSP `CheckNoRecursiveDefinition` skips
   `@nullable(heap=true)`. The generated code of accepted input is unchanged.
+- **`rsbinder-aidl`: a direction followed directly by a comment parses.**
+  `void f(in/*c*/ int[] a)` was a syntax error, because `in`, `out` and
+  `inout` had to be followed by whitespace; any non-name character now ends
+  them, as in AOSP. The same change makes keywords whole words (see
+  *Migrating from 0.11.0*).
 - **RPC on the android-12 (r34) wire: releasing many references to one binder
   no longer allocates a frame per reference.** The r34 `DEC_STRONG` has no
   amount field, so `amount` frames go out, but they were built as `amount`
