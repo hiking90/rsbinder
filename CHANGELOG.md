@@ -831,6 +831,23 @@ after 0.12.0. The single-connection one-liners
 
 ### Fixed
 
+- **`rsbinder-aidl`: an AIDL item named `Ok`, `Err`, `Some`, `None` or
+  `Default` no longer breaks the generated code.** Such a constant or nested
+  type is an item of the generated module and shadows the std prelude there,
+  so a union's `read_from_parcel`, an `@EnforcePermission` check, a field
+  default or an `impl Default` failed to compile (E0618, E0404, E0425). The
+  generated code now names these by path (`::core::result::Result::Ok`,
+  `::core::default::Default`, …). A nested type named `Option`, `Vec`, `Box`
+  or `String` still shadows the field types that use those names.
+- **`rsbinder-aidl`: a bidirectional control character (U+202A–U+202E,
+  U+2066–U+2069) no longer reaches a generated string literal raw**, where
+  rustc's deny-by-default `text_direction_codepoint_in_literal` failed the
+  user's crate with no AIDL diagnostic. `Builder::hash` and `@deprecated`
+  notes escape it; an `@Descriptor` value holding one is refused with a
+  diagnostic.
+- **RPC TLS: a send that rustls stopped accepting after part of the frame
+  went out now ends the session.** It returned `Protocol`, which means
+  nothing was sent and keeps the session, so the peer kept a partial frame.
 - **RPC on macOS: a call or send whose peer closed while it waited (with
   `set_timeout` set) returned `BadValue` instead of `DeadObject`.** XNU
   refuses `SO_RCVTIMEO` on a socket shut in both directions; the deadline is
