@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::error::{pest_error_to_diagnostic, AidlError, ConstExprError, ParseError};
 
+use pest::iterators::Pair;
 use pest::Parser;
 #[derive(pest_derive::Parser)]
 #[grammar = "aidl.pest"]
@@ -203,28 +204,108 @@ fn scan_comments(source: &str) -> Vec<CommentSpan> {
     spans
 }
 
-/// First `@deprecated` block in the comment run before `start` (AOSP FindDeprecated, 14.0.0_r50+).
-pub fn deprecated_at(start: usize) -> Option<String> {
+/// AOSP `FindDeprecated` (14.0.0_r50+) over the comments AOSP merges into `pair`'s declaration.
+fn deprecated_in(pair: &Pair<Rule>) -> Option<String> {
+    let mut starts = Vec::new();
+    collect_comment_token_starts(pair, &mut starts);
+    starts.dedup();
     CURRENT_COMMENTS.with(|spans| {
         let spans = spans.borrow();
         CURRENT_SOURCE_TEXT.with(|text| {
             let text = text.borrow();
-            let end = spans.partition_point(|c| c.end <= start);
-            // Walk back while only whitespace separates a comment from what follows it.
-            let mut first = end;
-            let mut next_start = start;
-            while let Some(span) = first.checked_sub(1).map(|i| spans[i]) {
-                let gap = text.get(span.end..next_start)?;
-                if !gap.chars().all(char::is_whitespace) {
-                    break;
+            starts.iter().find_map(|&start| {
+                comment_run_before(&spans, &text, start)
+                    .iter()
+                    .filter(|span| span.is_block)
+                    .find_map(|span| find_deprecated(text.get(span.start..span.end)?))
+            })
+        })
+    })
+}
+
+/// Annotations, keyword or `oneway`, type, method name: tokens AOSP takes comments from.
+fn collect_comment_token_starts(pair: &Pair<Rule>, starts: &mut Vec<usize>) {
+    let annotations = |list: Pair<Rule>, starts: &mut Vec<usize>| {
+        starts.extend(list.into_inner().map(|a| a.as_span().start()));
+    };
+    match pair.as_rule() {
+        Rule::decl => {
+            for child in pair.clone().into_inner() {
+                match child.as_rule() {
+                    Rule::annotation_list => annotations(child, starts),
+                    // The keyword, or `oneway` before `interface` (AOSP keeps only its comments).
+                    _ => starts.push(child.as_span().start()),
                 }
-                first -= 1;
-                next_start = span.start;
             }
-            spans[first..end]
-                .iter()
-                .filter(|span| span.is_block)
-                .find_map(|span| find_deprecated(text.get(span.start..span.end)?))
+        }
+        Rule::method_decl | Rule::constant_decl | Rule::variable_decl => {
+            let mut keyword_from =
+                (pair.as_rule() == Rule::constant_decl).then(|| pair.as_span().start());
+            for child in pair.clone().into_inner() {
+                match child.as_rule() {
+                    Rule::annotation_list => {
+                        if keyword_from.is_some() {
+                            keyword_from = Some(child.as_span().end());
+                        }
+                        annotations(child, starts);
+                    }
+                    Rule::ONEWAY => starts.push(child.as_span().start()),
+                    Rule::r#type => {
+                        // `const` is a silent rule: the first token after the annotations.
+                        if let Some(from) = keyword_from.take() {
+                            starts.push(next_token_start(from));
+                        }
+                        for part in child.into_inner() {
+                            match part.as_rule() {
+                                Rule::annotation_list => annotations(part, starts),
+                                Rule::non_array_type => starts.push(part.as_span().start()),
+                                _ => {}
+                            }
+                        }
+                    }
+                    Rule::identifier if pair.as_rule() == Rule::method_decl => {
+                        starts.push(child.as_span().start());
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => starts.push(pair.as_span().start()),
+    }
+}
+
+/// The comments separated from `start`, and from each other, by whitespace only.
+fn comment_run_before<'a>(spans: &'a [CommentSpan], text: &str, start: usize) -> &'a [CommentSpan] {
+    let end = spans.partition_point(|c| c.end <= start);
+    let mut first = end;
+    let mut next_start = start;
+    while let Some(span) = first.checked_sub(1).map(|i| spans[i]) {
+        match text.get(span.end..next_start) {
+            Some(gap) if gap.chars().all(char::is_whitespace) => {}
+            _ => break,
+        }
+        first -= 1;
+        next_start = span.start;
+    }
+    &spans[first..end]
+}
+
+/// The first offset at or after `from` that is neither whitespace nor inside a comment.
+fn next_token_start(from: usize) -> usize {
+    CURRENT_COMMENTS.with(|spans| {
+        let spans = spans.borrow();
+        CURRENT_SOURCE_TEXT.with(|text| {
+            let text = text.borrow();
+            let mut at = from;
+            loop {
+                let rest = text.get(at..).unwrap_or("");
+                at += rest.len() - rest.trim_start().len();
+                match spans.binary_search_by_key(&at, |c| c.start) {
+                    Ok(i) => at = spans[i].end,
+                    Err(_) => return at,
+                }
+            }
         })
     })
 }
@@ -2507,21 +2588,21 @@ fn parse_interface_members(
     for pair in pairs {
         match pair.as_rule() {
             Rule::method_decl => {
-                let deprecated = deprecated_at(pair.as_span().start());
+                let deprecated = deprecated_in(&pair);
                 let mut method = parse_method_decl(pair.into_inner())?;
                 method.deprecated = deprecated;
                 interface.method_list.push(method);
             }
 
             Rule::constant_decl => {
-                let deprecated = deprecated_at(pair.as_span().start());
+                let deprecated = deprecated_in(&pair);
                 let mut constant = parse_variable_decl(pair.into_inner(), true)?;
                 constant.deprecated = deprecated;
                 interface.constant_list.push(constant);
             }
 
             Rule::decl => {
-                let deprecated = deprecated_at(pair.as_span().start());
+                let deprecated = deprecated_in(&pair);
                 let mut members = parse_decl(pair.into_inner())?;
                 for member in &mut members {
                     member.set_deprecated(deprecated.clone());
@@ -2581,13 +2662,13 @@ fn parse_parcelable_members(
         match pair.as_rule() {
             Rule::variable_decl | Rule::constant_decl => {
                 let constant = pair.as_rule() == Rule::constant_decl;
-                let deprecated = deprecated_at(pair.as_span().start());
+                let deprecated = deprecated_in(&pair);
                 let mut var = parse_variable_decl(pair.into_inner(), constant)?;
                 var.deprecated = deprecated;
                 res.push(Declaration::Variable(var));
             }
             Rule::decl => {
-                let deprecated = deprecated_at(pair.as_span().start());
+                let deprecated = deprecated_in(&pair);
                 let mut members = parse_decl(pair.into_inner())?;
                 for member in &mut members {
                     member.set_deprecated(deprecated.clone());
@@ -2861,7 +2942,7 @@ fn parse_enum_decl(
                 enum_decl.name_span = Some((span.start(), span.end()));
             }
             Rule::enumerator => {
-                let deprecated = deprecated_at(pair.as_span().start());
+                let deprecated = deprecated_in(&pair);
                 let mut enumerator = parse_enumerator(pair.into_inner())?;
                 enumerator.deprecated = deprecated;
                 enum_decl.enumerator_list.push(enumerator);
@@ -3221,7 +3302,7 @@ pub fn parse_document(ctx: &SourceContext) -> Result<Document, AidlError> {
                     }
 
                     Rule::decl => {
-                        let deprecated = deprecated_at(pair.as_span().start());
+                        let deprecated = deprecated_in(&pair);
                         let mut decls = parse_decl(pair.into_inner())?;
                         for decl in &mut decls {
                             decl.set_deprecated(deprecated.clone());

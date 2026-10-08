@@ -2554,3 +2554,72 @@ fn bare_enum_default_is_not_looked_up_in_the_field_enum() {
         "package p; enum E { A, B } parcelable P { E e = E.B; E[] es = {E.A, E.B}; }"
     ));
 }
+
+/// AOSP merges into a declaration the comments of every annotation, the keyword, and for a
+/// member its type and (methods only) its name; `FindDeprecated` searches them all.
+#[test]
+fn deprecated_counts_every_token_aosp_merges_into_the_declaration() {
+    for (src, note) in [
+        // Between an annotation and the keyword (`decl`: `Annotate` + keyword token).
+        (
+            "package a; @VintfStability /** @deprecated use Bar */ parcelable Foo { int x; }",
+            "use Bar",
+        ),
+        (
+            "package a; @VintfStability /** @deprecated i */ interface I { void f(); }",
+            "i",
+        ),
+        (
+            "package a; @Backing(type=\"int\") /** @deprecated e */ enum E { A }",
+            "e",
+        ),
+        // Before a second annotation.
+        (
+            "package a; @VintfStability /** @deprecated two */ @FixedSize parcelable P { int x; }",
+            "two",
+        ),
+        // Method: annotation, `oneway`, return type and name all count.
+        (
+            "package a; interface I { @EnforcePermission(\"X\") /** @deprecated m */ void f(); }",
+            "m",
+        ),
+        (
+            "package a; interface I { oneway /** @deprecated ow */ void f(); }",
+            "ow",
+        ),
+        (
+            "package a; interface I { void /** @deprecated name */ f(); }",
+            "name",
+        ),
+        // Field and constant: the type token counts.
+        (
+            "package a; parcelable P { @nullable /** @deprecated f */ String s; }",
+            "f",
+        ),
+        (
+            "package a; interface I { const /** @deprecated c */ int X = 1; }",
+            "c",
+        ),
+    ] {
+        let out = generate_str(src).unwrap_or_else(|| panic!("must generate: {src}"));
+        assert!(
+            out.contains(&format!("#[deprecated = \"{note}\"]")),
+            "{src}\n---\n{out}"
+        );
+    }
+}
+
+/// Comments AOSP drops: a field's or constant's name, between `oneway` and `interface`, and
+/// inside an annotation's arguments.
+#[test]
+fn deprecated_ignores_comments_aosp_does_not_merge() {
+    for src in [
+        "package a; parcelable P { int /** @deprecated */ x; }",
+        "package a; interface I { const int /** @deprecated */ X = 1; }",
+        "package a; oneway /** @deprecated */ interface I { void f(); }",
+        "package a; @Descriptor(value=/** @deprecated */ \"a.B\") interface I { void f(); }",
+    ] {
+        let out = generate_str(src).unwrap_or_else(|| panic!("must generate: {src}"));
+        assert!(!out.contains("#[deprecated"), "{src}\n---\n{out}");
+    }
+}
