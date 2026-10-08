@@ -1,24 +1,7 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! The accept/refuse boundary, held against the generator instead of against a
-//! hand-written rule.
-//!
-//! The golden tests pin rows a human chose, so a spelling nobody thought of is
-//! invisible to them: nothing fails, because no row exists. This asserts the
-//! boundary itself, in both directions and at every place:
-//!
-//! * **under-acceptance** — every spelling `.aidl` renders at a place must be
-//!   accepted there, or a `.aidl` port has no equivalent trait;
-//! * **over-acceptance** — every spelling accepted at a place must be one
-//!   `.aidl` renders there, or a trait has no equivalent `.aidl`.
-//!
-//! Both sides are enumerated in code rather than listed by hand. The fixture is
-//! the cross product of element type × nullability × arity × place, so a shape
-//! cannot be missing from the canonical set by oversight — the one failure mode
-//! that would turn this test into a source of false positives. A combination
-//! `.aidl` refuses fails generation loudly and is excluded here by name, with
-//! the reason; it is never dropped silently.
+//! Accept/refuse boundary vs the generator over type × nullability × arity × place.
 
 use crate::aidl_shape::{self, Arity, Kind, Shape};
 use crate::golden::from_aidl_files;
@@ -33,68 +16,68 @@ struct Base {
     string: bool,
     /// A `@Backing` enum: AIDL refuses `@nullable Mode` and `out Mode`, the macro cannot tell.
     enum_like: bool,
+    /// `IBinder` or an interface.
+    binder: bool,
+    pfd: bool,
 }
+
+const PLAIN: Base = Base {
+    aidl: "",
+    primitive: false,
+    string: false,
+    enum_like: false,
+    binder: false,
+    pfd: false,
+};
 
 const BASES: &[Base] = &[
     Base {
         aidl: "int",
         primitive: true,
-        string: false,
-        enum_like: false,
+        ..PLAIN
     },
     Base {
         aidl: "boolean",
         primitive: true,
-        string: false,
-        enum_like: false,
+        ..PLAIN
     },
     Base {
         aidl: "byte",
         primitive: true,
-        string: false,
-        enum_like: false,
+        ..PLAIN
     },
     Base {
         aidl: "String",
-        primitive: false,
         string: true,
-        enum_like: false,
+        ..PLAIN
     },
     Base {
         aidl: "MatrixCfg",
-        primitive: false,
-        string: false,
-        enum_like: false,
+        ..PLAIN
     },
     Base {
         aidl: "MatrixMode",
-        primitive: false,
-        string: false,
         enum_like: true,
+        ..PLAIN
     },
     Base {
         aidl: "MatrixPair<MatrixCfg>",
-        primitive: false,
-        string: false,
-        enum_like: false,
+        ..PLAIN
     },
     Base {
         aidl: "ParcelFileDescriptor",
-        primitive: false,
-        string: false,
-        enum_like: false,
+        pfd: true,
+        ..PLAIN
     },
     Base {
         aidl: "IMatrixCb",
-        primitive: false,
-        string: false,
-        enum_like: false,
+        binder: true,
+        ..PLAIN
     },
     Base {
         aidl: "IBinder",
-        primitive: false,
-        string: false,
-        enum_like: false,
+        binder: true,
+        ..PLAIN
     },
 ];
 
@@ -117,14 +100,14 @@ fn aidl_refuses(place: &str, base: &Base, nullable: bool, arity: &str) -> bool {
     if nullable && (base.primitive || base.enum_like) && scalar {
         return true;
     }
-    // `direction_at`: a primitive, an enum and a `String` go `in` only.
+    // `GetArgumentAspect`: primitive, enum, `String`, binder `in` only; a fd `in` or `inout`.
     if scalar
-        && (base.primitive || base.enum_like || base.string)
+        && (base.primitive || base.enum_like || base.string || base.binder)
         && matches!(place, "out" | "inout")
     {
         return true;
     }
-    false
+    scalar && base.pfd && place == "out"
 }
 
 /// The `.aidl` sources, with every legal cell of the cross product present.
@@ -253,8 +236,17 @@ fn place_enum(name: &str) -> Place {
     }
 }
 
+/// `norm` without the placeholder, so `MatrixCfg` and `MatrixMode` stay apart.
+fn norm_exact(ty: &Type) -> String {
+    quote::quote!(#ty).to_string()
+}
+
 /// Every spelling the generator renders, keyed by place.
 fn canonical() -> BTreeMap<&'static str, BTreeSet<String>> {
+    canonical_by(norm)
+}
+
+fn canonical_by(normalize: fn(&Type) -> String) -> BTreeMap<&'static str, BTreeSet<String>> {
     let owned = fixture_files();
     let files: Vec<(&str, &str)> = owned
         .iter()
@@ -284,13 +276,13 @@ fn canonical() -> BTreeMap<&'static str, BTreeSet<String>> {
         };
         for input in &f.sig.inputs {
             if let FnArg::Typed(pat_ty) = input {
-                out.entry(place).or_default().insert(norm(&pat_ty.ty));
+                out.entry(place).or_default().insert(normalize(&pat_ty.ty));
             }
         }
         if place == "return" {
             if let ReturnType::Type(_, ty) = &f.sig.output {
                 if let Some(inner) = binder_result_inner(ty) {
-                    out.entry("return").or_default().insert(norm(inner));
+                    out.entry("return").or_default().insert(normalize(inner));
                 }
             }
         }
@@ -307,7 +299,7 @@ fn canonical() -> BTreeMap<&'static str, BTreeSet<String>> {
         })
         .expect("generated struct");
     for field in &st.fields {
-        out.entry("field").or_default().insert(norm(&field.ty));
+        out.entry("field").or_default().insert(normalize(&field.ty));
     }
 
     out
@@ -466,6 +458,8 @@ fn types_md() -> String {
             primitive: matches!(kind, Kind::Primitive),
             string: matches!(kind, Kind::Str),
             enum_like: user_is_enum,
+            binder: base == "rsbinder::SIBinder" || base.starts_with("rsbinder::Strong"),
+            pfd: base == "rsbinder::ParcelFileDescriptor",
         };
         for arity_aidl in ARITIES {
             let arity = match *arity_aidl {
@@ -562,7 +556,8 @@ fn rust_base(aidl: &str) -> (Kind, &'static str) {
 /// `aidl_shape`'s table must be the generator's, cell for cell, or its refusals mean nothing.
 #[test]
 fn the_shape_table_renders_what_the_generator_renders() {
-    let from_generator = canonical();
+    // Exact paths: a placeholder would let a swapped enum/parcelable render pass.
+    let from_generator = canonical_by(norm_exact);
     let mut produced: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
     let mut wrong = Vec::new();
 
@@ -590,7 +585,10 @@ fn the_shape_table_renders_what_the_generator_renders() {
                     else {
                         continue;
                     };
-                    let normalized = norm_str(&rendered);
+                    let normalized = norm_exact(
+                        &syn::parse_str(&rendered)
+                            .unwrap_or_else(|e| panic!("parse `{rendered}`: {e}")),
+                    );
                     produced
                         .entry(place)
                         .or_default()
@@ -731,4 +729,23 @@ fn every_accepted_spelling_is_one_aidl_renders() {
          trait would have no `.aidl` equivalent:\n{}",
         extra.join("\n")
     );
+}
+
+/// Path qualification is fine, so a qualified `String` or `byte[]` element is its bare spelling.
+#[test]
+fn a_qualified_string_or_byte_element_is_accepted() {
+    for (spelling, place) in [
+        ("std::string::String", Place::Return),
+        ("std::string::String", Place::Field),
+        ("Option<std::string::String>", Place::Field),
+        ("Vec<std::string::String>", Place::Return),
+        ("&[std::string::String]", Place::In),
+        ("Vec<core::primitive::u8>", Place::Field),
+        ("&[core::primitive::u8]", Place::In),
+    ] {
+        let ty: Type = syn::parse_str(spelling).unwrap();
+        if let Err(e) = crate::type_str::check_type_at(&ty, place) {
+            panic!("`{spelling}` refused: {e}");
+        }
+    }
 }

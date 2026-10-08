@@ -35,10 +35,7 @@ spelling (an enum and a parcelable are both a bare name to the macro), where
 it depends on a reference cycle the macro cannot see (a parcelable field's
 `Option<Box<T>>`), or the type is reached through an alias or a rename, which
 the macro cannot see through; the crate docs list all three and carry the full
-type table. Two
-attributes fill the gaps a Rust signature leaves: `#[nonnull]` marks an `out`
-binder or fd that is not `@nullable`, and `#[deprecated]` renders AIDL's
-`@deprecated`.
+type table. `#[deprecated]` renders AIDL's `@deprecated`.
 
 Enable it through `rsbinder`:
 

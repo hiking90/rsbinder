@@ -296,6 +296,10 @@ pub fn check_type_at(ty: &Type, place: Place) -> syn::Result<()> {
     check_array_elements(ty, place.word())?;
     reject_nested_option(ty)?;
     reject_generic_arg_shape(ty)?;
+    // A signature's `self::`/`Self` is refused anyway, so the advice below must not name one.
+    if !matches!(place, Place::Field) && crate::aidl_shape::shape_of(ty).is_some() {
+        as_written(ty)?;
+    }
     // Last, so a shape with no wire form at all keeps the specific rule's diagnostic.
     crate::aidl_shape::check_canonical(ty, place)
 }
@@ -840,11 +844,6 @@ fn lacks_default(ty: &Type) -> bool {
         || named_generic(ty, "Strong").is_some()
 }
 
-/// `&mut Option<T>` over a binder or fd: the spelling `out T` and `out @nullable T` share.
-pub fn out_option_is_ambiguous(ty: &Type) -> bool {
-    option_inner(peel(ty)).is_some_and(lacks_default)
-}
-
 /// The element an out array is sized or defaulted from, through every dimension.
 fn out_array_elem(ty: &Type) -> Option<&Type> {
     let mut elem = option_vec_elem(ty).or_else(|| vec_elem(ty));
@@ -992,6 +991,32 @@ pub fn check_out_capable(ty: &Type, direction: &str) -> syn::Result<()> {
         "a primitive"
     } else if is_string(named) {
         "`String`"
+    } else if lacks_default(named) {
+        // AOSP `GetArgumentAspect`: `IBinder` and an interface `in` only, a fd `in` or `inout`.
+        let is_pfd = plain_name(named).is_some_and(|n| n == "ParcelFileDescriptor");
+        if is_pfd && direction == "inout" {
+            return Ok(());
+        }
+        let (what, allowed, instead) = if is_pfd {
+            (
+                "a `ParcelFileDescriptor`",
+                "`in` or `inout`",
+                "mark it `#[inout]`, return it, or use an array",
+            )
+        } else {
+            (
+                "a binder object (`IBinder` or an interface)",
+                "only `in`",
+                "return it instead, or use an array or a parcelable",
+            )
+        };
+        return Err(syn::Error::new_spanned(
+            ty,
+            format!(
+                "{what} cannot be an `{direction}` parameter — `.aidl` passes it {allowed}, \
+                 `@nullable` or not; {instead}"
+            ),
+        ));
     } else {
         // Only `out` starts slots empty; `inout` reads them in, fixed-size or not.
         if direction == "out" && out_array_elem(inner).is_some_and(lacks_default) {

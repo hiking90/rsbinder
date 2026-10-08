@@ -354,6 +354,19 @@ mod tests {
         assert!(s.contains("self.r#cfg"), "{s}");
     }
 
+    /// A `self::` leaf still meets the canonical gate its unqualified spelling meets.
+    #[test]
+    fn a_self_path_field_is_held_to_the_aidl_spelling() {
+        for tokens in [
+            quote! { struct Bad { opt: Option<Vec<self::pair::Pair<Cfg>>> } },
+            quote! { struct Bad { cb: self::Strong<dyn IFoo> } },
+        ] {
+            let input: DeriveInput = syn::parse2(tokens).unwrap();
+            let err = render_source(&input).unwrap_err();
+            assert!(err.to_string().contains("renders this as"), "{err}");
+        }
+    }
+
     #[test]
     fn raw_identifier_field_is_not_double_escaped() {
         let s = source(quote! {
