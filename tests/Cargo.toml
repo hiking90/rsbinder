@@ -94,6 +94,12 @@ name = "reconnect_hub_restart"
 path = "tests/reconnect_hub_restart.rs"
 required-features = ["rpc"]
 
+# Plan 4-3 Phase D: freeze notifications, observing a `reconnect_service`.
+[[test]]
+name = "freeze_kernel"
+path = "tests/freeze_kernel.rs"
+required-features = ["rpc"]
+
 [[test]]
 name = "aidl_spans"
 path = "tests/aidl_spans.rs"

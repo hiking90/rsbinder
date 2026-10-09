@@ -135,6 +135,26 @@
 //! its `Drop` counts 2 until that `Drop` posts, as AOSP does while a new
 //! `BpBinder` replaces one in its destructor.
 //!
+//! # Freeze notifications
+//!
+//! `freeze` holds one slot per handle (the `freeze` module doc has the
+//! kernel rules and why the slot is per handle, not per proxy). Under its
+//! lock a caller decides a transition and writes the command it implies.
+//! `BC_REQUEST_FREEZE_NOTIFICATION` is also flushed under the lock: once the
+//! slot reads `Registered`, another thread may write a clear, and the kernel
+//! refuses a clear that reaches it before the request. A clear may stay
+//! queued (the dropping proxy's `BC_RELEASE` flushes it): a request is
+//! deferred until its clear-done, which needs the clear in the kernel first.
+//! The lock nests outside `pin_ledger` and is never held across user code
+//! or a cache lookup; `deliver_frozen` reads the cache before taking it and
+//! drops the proxy after releasing it, since a proxy's drop takes it.
+//!
+//! Support is read from the binderfs `features/freeze_notification` file:
+//! first next to the opened driver node (Linux mounts binderfs anywhere),
+//! then AOSP's fixed `/dev/binderfs/features/`
+//! (`ProcessState.cpp:537-550`). The first file found decides; none means
+//! unsupported, and the API returns `InvalidOperation` without a command.
+//!
 //! # Published natives
 //!
 //! `flat_binder_object.binder` carries a process-monotonic u64 id (from
@@ -284,7 +304,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{self, Arc, Mutex, OnceLock, RwLock};
 use std::thread;
+use std::time::Duration;
 
+use crate::freeze::{ClearDone, FreezeCmd, FreezeRegistry};
 use crate::{binder::*, error::*, proxy::*, sys::binder, thread_state};
 
 /// A handle's shared `BC_INCREFS`; `Drop` write-locks `handle_to_proxy`, so never drop under it.
@@ -468,22 +490,40 @@ fn expunge_locked(
     ours
 }
 
-/// Per-handle dropped pins, held while death-notification clears are in flight.
+/// Per-handle dropped pins, held while death- or freeze-notification clears are in flight.
 #[derive(Default)]
 struct PinLedger(HashMap<u32, LedgerSlot>);
+
+/// Which notification a clear belongs to; the counts are kept apart so a done matches its kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClearKind {
+    Death,
+    Freeze,
+}
 
 #[derive(Default)]
 struct LedgerSlot {
     /// `BC_CLEAR_DEATH_NOTIFICATION`s queued whose `BR_CLEAR_DEATH_NOTIFICATION_DONE` is pending.
     clears_in_flight: u32,
+    /// The same for `BC_CLEAR_FREEZE_NOTIFICATION`: the kernel drops a registration with its ref.
+    freeze_clears_in_flight: u32,
     /// Dropped `HandlePin`s whose `BC_DECREFS` has not been sent.
     held_pins: u32,
 }
 
+impl LedgerSlot {
+    fn in_flight(&mut self, kind: ClearKind) -> &mut u32 {
+        match kind {
+            ClearKind::Death => &mut self.clears_in_flight,
+            ClearKind::Freeze => &mut self.freeze_clears_in_flight,
+        }
+    }
+}
+
 impl PinLedger {
-    fn note_clear(&mut self, handle: u32) {
-        let slot = self.0.entry(handle).or_default();
-        slot.clears_in_flight = slot.clears_in_flight.saturating_add(1);
+    fn note_clear(&mut self, handle: u32, kind: ClearKind) {
+        let count = self.0.entry(handle).or_default().in_flight(kind);
+        *count = count.saturating_add(1);
     }
 
     fn hold(&mut self, handle: u32) {
@@ -494,17 +534,17 @@ impl PinLedger {
     /// Pins to release now: every held one, once no clear is in flight.
     fn take_releasable(&mut self, handle: u32) -> u32 {
         match self.0.get(&handle) {
-            Some(slot) if slot.clears_in_flight == 0 => {
+            Some(slot) if slot.clears_in_flight == 0 && slot.freeze_clears_in_flight == 0 => {
                 self.0.remove(&handle).map_or(0, |slot| slot.held_pins)
             }
             _ => 0,
         }
     }
 
-    fn clear_done(&mut self, handle: u32) -> u32 {
-        match self.0.get_mut(&handle) {
-            Some(slot) if slot.clears_in_flight > 0 => slot.clears_in_flight -= 1,
-            _ => log::warn!("BR_CLEAR_DEATH_NOTIFICATION_DONE for handle {handle} with no clear"),
+    fn clear_done(&mut self, handle: u32, kind: ClearKind) -> u32 {
+        match self.0.get_mut(&handle).map(|slot| slot.in_flight(kind)) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => log::warn!("{kind:?} clear done for handle {handle} with no clear in flight"),
         }
         self.take_releasable(handle)
     }
@@ -517,6 +557,34 @@ fn release_pins(handle: u32, count: u32) {
             log::error!("BC_DECREFS for handle {handle} failed: {err:?}; its binder_ref leaks");
         }
     }
+}
+
+/// Reads a binderfs `features/<name>` flag; module doc "Freeze notifications".
+fn driver_feature_enabled(driver_name: &Path, name: &str) -> bool {
+    // The driver's own binderfs first (Linux mounts vary), then AOSP's fixed path.
+    let own = std::fs::canonicalize(driver_name)
+        .ok()
+        .and_then(|path| path.parent().map(|dir| dir.join("features").join(name)));
+    let aosp = Path::new("/dev/binderfs/features").join(name);
+    own.into_iter()
+        .chain(std::iter::once(aosp))
+        .find_map(|path| std::fs::read_to_string(path).ok())
+        .is_some_and(|value| value.trim() == "1")
+}
+
+/// What the binder driver recorded for a process since its last freeze,
+/// from [`ProcessState::process_freeze_info`]. AOSP
+/// `IPCThreadState::getProcessFreezeInfo`, decoded from
+/// `binder_frozen_status_info`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ProcessFreezeInfo {
+    /// A synchronous call reached the process while it was frozen (bit 0 of `sync_recv`).
+    pub sync_received: bool,
+    /// Transactions are still pending in the process (bit 1 of `sync_recv`).
+    pub transactions_pending: bool,
+    /// A oneway call reached the process while it was frozen (`async_recv`).
+    pub async_received: bool,
 }
 
 /// Sidecar entry for a published native, keyed by a u64 id; see module doc "Published natives".
@@ -586,6 +654,10 @@ pub struct ProcessState {
     next_generation: AtomicU64,
     /// Leaf lock; never held across a command. See module doc "Proxy cache entry".
     pin_ledger: Mutex<PinLedger>,
+    /// Freeze-notification slots by handle; module doc "Freeze notifications".
+    freeze: Mutex<FreezeRegistry>,
+    /// `features/freeze_notification`, read once on first use.
+    freeze_notification: OnceLock<bool>,
     /// Published natives by the u64 id in `flat_binder_object.binder`; see `PublishedNative`.
     published_natives: RwLock<HashMap<u64, PublishedNative>>,
     /// Monotonic u64 id allocator for `published_natives`.
@@ -726,6 +798,8 @@ impl ProcessState {
             handle_to_proxy: RwLock::new(HashMap::new()),
             next_generation: AtomicU64::new(1),
             pin_ledger: Mutex::new(PinLedger::default()),
+            freeze: Mutex::new(FreezeRegistry::default()),
+            freeze_notification: OnceLock::new(),
             published_natives: RwLock::new(HashMap::new()),
             next_native_id: AtomicU64::new(1),
             disable_background_scheduling: AtomicBool::new(false),
@@ -1095,14 +1169,228 @@ impl ProcessState {
     /// Counts a `BC_CLEAR_DEATH_NOTIFICATION` about to go out; `handle`'s pins wait for its done.
     pub(crate) fn note_death_clear(handle: u32) {
         if let Some(this) = Self::instance().get() {
-            this.pin_ledger_lock().note_clear(handle);
+            this.pin_ledger_lock().note_clear(handle, ClearKind::Death);
         }
     }
 
     /// `BR_CLEAR_DEATH_NOTIFICATION_DONE`; R1: call with no `THREAD_STATE` borrow held.
     pub(crate) fn death_clear_done(&self, handle: u32) {
-        let count = self.pin_ledger_lock().clear_done(handle);
+        let count = self.pin_ledger_lock().clear_done(handle, ClearKind::Death);
         release_pins(handle, count);
+    }
+
+    /// Counts a `BC_CLEAR_FREEZE_NOTIFICATION` about to go out, as [`Self::note_death_clear`].
+    pub(crate) fn note_freeze_clear(handle: u32) {
+        if let Some(this) = Self::instance().get() {
+            this.pin_ledger_lock().note_clear(handle, ClearKind::Freeze);
+        }
+    }
+
+    /// Leaf lock but for the freeze commands written under it; see module doc "Freeze notifications".
+    fn freeze_lock(&self) -> sync::MutexGuard<'_, FreezeRegistry> {
+        self.freeze.lock().expect("Freeze registry lock poisoned")
+    }
+
+    /// Whether the driver reports freeze notifications; module doc "Freeze notifications".
+    pub(crate) fn freeze_notification_supported(&self) -> bool {
+        *self
+            .freeze_notification
+            .get_or_init(|| driver_feature_enabled(&self.driver_name, "freeze_notification"))
+    }
+
+    /// Registers `callback` for the proxy at address `owner`; R1: no `THREAD_STATE` borrow held.
+    pub(crate) fn add_frozen_callback(
+        &self,
+        handle: u32,
+        owner: usize,
+        callback: sync::Weak<dyn FrozenStateChangeCallback>,
+    ) -> Result<()> {
+        {
+            let mut registry = self.freeze_lock();
+            if registry.add(handle, owner, callback) == Some(FreezeCmd::Request) {
+                self.request_freeze_locked(&mut registry, handle)?;
+            }
+        }
+        // Hands a state the kernel already reported to the new callback.
+        self.deliver_frozen(handle);
+        Ok(())
+    }
+
+    /// Sends `BC_REQUEST_FREEZE_NOTIFICATION` under the registry lock, or forgets the slot.
+    ///
+    /// Flushed before the lock is released: a clear for the handle can be written
+    /// once the slot is `Registered`, and the kernel refuses a clear that reaches
+    /// it before the request (module doc "Freeze notifications"). A request the
+    /// kernel never got is rewound, not left queued, and the slot goes with it.
+    fn request_freeze_locked(&self, registry: &mut FreezeRegistry, handle: u32) -> Result<()> {
+        thread_state::send_freeze_request(handle).inspect_err(|_| registry.abort_request(handle))
+    }
+
+    /// Removes `owner`'s first registration of `callback`; `NameNotFound` if there is none.
+    pub(crate) fn remove_frozen_callback(
+        &self,
+        handle: u32,
+        owner: usize,
+        callback: &sync::Weak<dyn FrozenStateChangeCallback>,
+    ) -> Result<()> {
+        let mut registry = self.freeze_lock();
+        if registry.remove(handle, owner, callback)? == Some(FreezeCmd::Clear) {
+            Self::write_freeze_clear(handle);
+            // AOSP flushes eagerly (`RELEASE_LIBBINDER_FREEZE_USE_FLUSH_EAGERLY`).
+            if let Err(err) = thread_state::flush_commands_if_alive() {
+                log::error!(
+                    "BC_CLEAR_FREEZE_NOTIFICATION for handle {handle} not flushed: {err:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// `ProxyHandle::drop` of a proxy that registered callbacks; the drop's `BC_RELEASE` flushes.
+    pub(crate) fn drop_frozen_owner(&self, handle: u32, owner: usize) {
+        if self.freeze_lock().drop_owner(handle, owner) == Some(FreezeCmd::Clear) {
+            Self::write_freeze_clear(handle);
+        }
+    }
+
+    /// Queues the clear; a failure stays counted in the ledger, so the pins outlive it anyway.
+    fn write_freeze_clear(handle: u32) {
+        if let Err(err) = thread_state::clear_freeze_notification(handle) {
+            log::error!("BC_CLEAR_FREEZE_NOTIFICATION for handle {handle} failed: {err:?}");
+        }
+    }
+
+    /// `BR_FROZEN_BINDER` for `handle`; R1: call with no `THREAD_STATE` borrow held.
+    pub(crate) fn frozen_state_changed(&self, handle: u32, is_frozen: bool) {
+        if self.freeze_lock().state_changed(handle, is_frozen) {
+            self.deliver_frozen(handle);
+        }
+    }
+
+    /// `BR_CLEAR_FREEZE_NOTIFICATION_DONE`; R1: call with no `THREAD_STATE` borrow held.
+    pub(crate) fn freeze_clear_done(&self, handle: u32) {
+        let outcome = {
+            let mut registry = self.freeze_lock();
+            let outcome = registry.clear_done(handle);
+            // AOSP re-requests here too (`onFrozenStateChangeListenerRemoved`).
+            if outcome == ClearDone::Rerequest {
+                if let Err(err) = self.request_freeze_locked(&mut registry, handle) {
+                    log::error!(
+                        "BC_REQUEST_FREEZE_NOTIFICATION for handle {handle} failed: {err:?}; \
+                         its callbacks are dropped"
+                    );
+                }
+            }
+            outcome
+        };
+        if outcome == ClearDone::Unexpected {
+            log::warn!("BR_CLEAR_FREEZE_NOTIFICATION_DONE for handle {handle} with no clear");
+        }
+        let count = self.pin_ledger_lock().clear_done(handle, ClearKind::Freeze);
+        release_pins(handle, count);
+    }
+
+    /// Runs `handle`'s undelivered callbacks, one thread at a time; see `freeze` module doc.
+    fn deliver_frozen(&self, handle: u32) {
+        loop {
+            // Looked up outside the registry lock: dropping it may run `ProxyHandle::drop`.
+            let proxy = self
+                .handle_to_proxy
+                .read()
+                .expect("Handle to proxy lock poisoned")
+                .get(&handle)
+                .and_then(|entry| entry.weak.upgrade());
+            let Some(proxy) = proxy else {
+                return;
+            };
+            let owner = Arc::as_ptr(&proxy) as usize;
+            let batch = self.freeze_lock().begin_batch(handle, owner);
+            let Some((token, state, callbacks)) = batch else {
+                return;
+            };
+            // Held through the callbacks: its last drop would remove them (AOSP `onLastStrongRef`).
+            let binder = SIBinder::from_arc(proxy as Arc<dyn IBinder>);
+            let who = SIBinder::downgrade(&binder);
+            for callback in &callbacks {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    callback.on_state_changed(&who, state);
+                }));
+                if let Err(payload) = result {
+                    let msg = payload
+                        .downcast_ref::<&'static str>()
+                        .copied()
+                        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                        .unwrap_or("<non-string panic payload>");
+                    log::error!("FrozenStateChangeCallback panicked for handle {handle:X}: {msg}");
+                }
+            }
+            self.freeze_lock().end_batch(handle, token);
+            // `binder` drops here, after the guard: its drop may take the registry lock.
+        }
+    }
+
+    /// Freeze or thaw the binder state of process `pid`. AOSP `IPCThreadState::freeze`.
+    ///
+    /// This sets the kernel binder driver's per-process freeze state; it does
+    /// not stop the process's threads, which is the cgroup freezer's job
+    /// (Android's cached-app freezer does both). While frozen, the driver
+    /// fails synchronous calls into the process with
+    /// [`StatusCode::FailedTransaction`] (`BR_FROZEN_REPLY`), queues oneway
+    /// calls until it is thawed, and notifies every
+    /// [`FrozenStateChangeCallback`] registered on its binders.
+    ///
+    /// Freezing waits up to `timeout` for the process's in-flight
+    /// transactions to finish. If synchronous ones are still pending, the
+    /// freeze is rolled back and [`StatusCode::WouldBlock`] (`EAGAIN`) is
+    /// returned; call again to retry, as AOSP documents. A zero `timeout`
+    /// checks once without waiting. Thawing never waits. `timeout` is
+    /// rounded down to milliseconds and capped at `u32::MAX` of them.
+    ///
+    /// The driver makes no permission check of its own and applies the
+    /// call to every binder context the process opened. On Android, SELinux
+    /// restricts who may issue it.
+    ///
+    /// # Errors
+    ///
+    /// - [`StatusCode::BadValue`] for a `pid` that is not positive or has
+    ///   no binder state (it never opened a binder device).
+    /// - [`StatusCode::WouldBlock`] as described above.
+    pub fn freeze_process(&self, pid: i32, enable: bool, timeout: Duration) -> Result<()> {
+        let pid = u32::try_from(pid)
+            .ok()
+            .filter(|pid| *pid > 0)
+            .ok_or(StatusCode::BadValue)?;
+        let info = binder::binder_freeze_info {
+            pid,
+            enable: enable.into(),
+            timeout_ms: u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX),
+        };
+        binder::freeze(&*self.driver, info).map_err(StatusCode::from)
+    }
+
+    /// What the binder driver recorded for process `pid` since its last
+    /// freeze. AOSP `IPCThreadState::getProcessFreezeInfo`.
+    ///
+    /// # Errors
+    ///
+    /// [`StatusCode::BadValue`] for a `pid` that is not positive or has no
+    /// binder state.
+    pub fn process_freeze_info(&self, pid: i32) -> Result<ProcessFreezeInfo> {
+        let pid = u32::try_from(pid)
+            .ok()
+            .filter(|pid| *pid > 0)
+            .ok_or(StatusCode::BadValue)?;
+        let mut info = binder::binder_frozen_status_info {
+            pid,
+            sync_recv: 0,
+            async_recv: 0,
+        };
+        binder::get_frozen_info(&*self.driver, &mut info).map_err(StatusCode::from)?;
+        Ok(ProcessFreezeInfo {
+            sync_received: info.sync_recv & 1 != 0,
+            transactions_pending: info.sync_recv & 2 != 0,
+            async_received: info.async_recv != 0,
+        })
     }
 
     /// Publish a native (dedup by `Arc::ptr_eq`) and return its id; see module doc.
@@ -1488,22 +1776,70 @@ mod tests {
         assert!(ledger.0.is_empty(), "a released handle leaves no slot");
 
         // Linked: the drop's clear holds the pin until its done.
-        ledger.note_clear(7);
+        ledger.note_clear(7, ClearKind::Death);
         ledger.hold(7);
         assert_eq!(ledger.take_releasable(7), 0);
         // A second clear (an earlier unlink) still in flight keeps it held.
-        ledger.note_clear(7);
-        assert_eq!(ledger.clear_done(7), 0);
-        assert_eq!(ledger.clear_done(7), 1);
+        ledger.note_clear(7, ClearKind::Death);
+        assert_eq!(ledger.clear_done(7, ClearKind::Death), 0);
+        assert_eq!(ledger.clear_done(7, ClearKind::Death), 1);
         assert!(ledger.0.is_empty());
 
         // Handles are independent; a stray done releases nothing it does not hold.
-        ledger.note_clear(1);
+        ledger.note_clear(1, ClearKind::Death);
         ledger.hold(1);
         ledger.hold(2);
         assert_eq!(ledger.take_releasable(2), 1);
-        assert_eq!(ledger.clear_done(3), 0);
-        assert_eq!(ledger.clear_done(1), 1);
+        assert_eq!(ledger.clear_done(3, ClearKind::Death), 0);
+        assert_eq!(ledger.clear_done(1, ClearKind::Death), 1);
+        assert!(ledger.0.is_empty());
+    }
+
+    /// The flag next to the opened driver node decides, before AOSP's fixed path.
+    #[test]
+    fn driver_feature_flag_is_read_next_to_the_driver_node() {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "rsbinder-features-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let features = root.join("features");
+        std::fs::create_dir_all(&features).expect("temp dir");
+        let driver = root.join("binder");
+        std::fs::write(&driver, b"").expect("driver stand-in");
+
+        std::fs::write(features.join("on"), b"1\n").expect("flag");
+        std::fs::write(features.join("off"), b"0\n").expect("flag");
+        assert!(driver_feature_enabled(&driver, "on"));
+        // A local `0` decides even if the AOSP path says otherwise.
+        assert!(!driver_feature_enabled(&driver, "off"));
+        // Missing locally: the answer is AOSP's fixed path, whatever this host has there.
+        let aosp = std::fs::read_to_string("/dev/binderfs/features/freeze_notification")
+            .is_ok_and(|value| value.trim() == "1");
+        assert_eq!(driver_feature_enabled(&driver, "freeze_notification"), aosp);
+
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// A freeze clear holds the pin like a death clear, and one kind's done never
+    /// releases a pin the other kind's clear still holds (the kernel drops a
+    /// freeze registration with its ref, `freeze` module doc).
+    #[test]
+    fn pin_ledger_holds_pins_for_freeze_clears_too() {
+        let mut ledger = PinLedger::default();
+        ledger.note_clear(4, ClearKind::Freeze);
+        ledger.note_clear(4, ClearKind::Death);
+        ledger.hold(4);
+        assert_eq!(ledger.take_releasable(4), 0);
+        assert_eq!(
+            ledger.clear_done(4, ClearKind::Death),
+            0,
+            "freeze still in flight"
+        );
+        // A done of the wrong kind is a stray: it must not count down the freeze clear.
+        assert_eq!(ledger.clear_done(4, ClearKind::Death), 0);
+        assert_eq!(ledger.clear_done(4, ClearKind::Freeze), 1);
         assert!(ledger.0.is_empty());
     }
 

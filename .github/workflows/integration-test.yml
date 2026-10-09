@@ -301,6 +301,18 @@ jobs:
             exit 1
           }
 
+      - name: Run freeze_kernel (freeze notifications, #[ignore]'d)
+        run: |
+          # Plan 4-3. Freezes a `reconnect_service` of its own name with
+          # BINDER_FREEZE and checks the callbacks. A driver without
+          # features/freeze_notification makes the tests check the refusal
+          # (InvalidOperation) instead, so either kernel passes.
+          RUST_BACKTRACE=1 cargo test -p tests --features rpc --test freeze_kernel -- --ignored --test-threads=1 || {
+            echo "::error::freeze_kernel failed"
+            cp -f rsb_hub.log artifacts/freeze-kernel-rsb_hub.log 2>/dev/null || true
+            exit 1
+          }
+
       - name: Run fmq_binder (an FMQ descriptor across the kernel binder, #[ignore]'d)
         run: |
           # Plan 12-fmq F2. `fmq_probe serve` in a child process makes and

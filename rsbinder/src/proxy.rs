@@ -193,7 +193,7 @@ use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{self, Arc, RwLock};
 
-use crate::process_state::HandlePin;
+use crate::process_state::{HandlePin, ProcessState};
 use crate::{binder::*, error::*, parcel::*, parcelable::DeserializeOption, thread_state};
 
 /// Proxy-side extension cache; strong vs weak rule in module doc "Extension cache".
@@ -229,6 +229,8 @@ pub struct ProxyHandle {
     obituary_sent: AtomicBool,
     recipients: RwLock<Vec<sync::Weak<dyn DeathRecipient>>>,
     extension: RwLock<ExtensionCache>,
+    /// Set by the first freeze-callback add, never cleared; module doc "Freeze notifications".
+    freeze_used: AtomicBool,
 }
 
 impl ProxyHandle {
@@ -248,7 +250,13 @@ impl ProxyHandle {
             obituary_sent: AtomicBool::new(false),
             recipients: RwLock::new(Vec::new()),
             extension: RwLock::new(ExtensionCache::NotQueried),
+            freeze_used: AtomicBool::new(false),
         }))
+    }
+
+    /// This proxy's key in the freeze registry; stable while it lives.
+    fn freeze_owner(&self) -> usize {
+        self as *const Self as usize
     }
 
     /// Get the underlying binder handle number.
@@ -477,6 +485,11 @@ impl Drop for ProxyHandle {
                 );
             }
         }
+        // A proxy that never registered skips the registry lock (module doc "Freeze notifications").
+        // Set only after an add reached the initialized `ProcessState`, so `as_self` cannot panic.
+        if *self.freeze_used.get_mut() {
+            ProcessState::as_self().drop_frozen_owner(self.handle, self.freeze_owner());
+        }
         // Safe: the cache pin's BC_INCREFS keeps the slot alive (module doc "Reference counts").
         if let Err(err) = thread_state::dec_strong_handle(self.handle) {
             log::error!(
@@ -579,6 +592,43 @@ impl IBinder for ProxyHandle {
             let _ = thread_state::flush_commands();
         }
         Ok(())
+    }
+
+    /// AOSP `BpBinder::addFrozenStateChangeCallback`; module doc "Freeze notifications".
+    fn add_frozen_state_change_callback(
+        &self,
+        callback: sync::Weak<dyn FrozenStateChangeCallback>,
+    ) -> Result<()> {
+        // AOSP order: a dead weak is `BAD_VALUE` before the driver is consulted.
+        if callback.upgrade().is_none() {
+            return Err(StatusCode::BadValue);
+        }
+        let process = ProcessState::as_self();
+        if !process.freeze_notification_supported() {
+            return Err(StatusCode::InvalidOperation);
+        }
+        if process.max_threads() == 0 && process.current_threads.load(Ordering::Relaxed) == 0 {
+            // AOSP `ALOGE`s the same (`BpBinder.cpp:617-623`); the BR goes to looper threads only.
+            log::error!(
+                "add_frozen_state_change_callback on {} but no thread serves binder: \
+                 notifications wait for start_thread_pool or join_thread_pool",
+                self.descriptor
+            );
+        }
+        // Before the add, so a drop that races it still finds the entry (module doc).
+        self.freeze_used.store(true, Ordering::Relaxed);
+        process.add_frozen_callback(self.handle, self.freeze_owner(), callback)
+    }
+
+    /// AOSP `BpBinder::removeFrozenStateChangeCallback`; the first match only.
+    fn remove_frozen_state_change_callback(
+        &self,
+        callback: sync::Weak<dyn FrozenStateChangeCallback>,
+    ) -> Result<()> {
+        if !self.freeze_used.load(Ordering::Relaxed) {
+            return Err(StatusCode::NameNotFound);
+        }
+        ProcessState::as_self().remove_frozen_callback(self.handle, self.freeze_owner(), &callback)
     }
 
     /// Send a ping transaction to this object
@@ -694,6 +744,7 @@ mod tests {
             obituary_sent: AtomicBool::new(obituary_sent),
             recipients: RwLock::new(Vec::new()),
             extension: RwLock::new(ExtensionCache::NotQueried),
+            freeze_used: AtomicBool::new(false),
         })
     }
 

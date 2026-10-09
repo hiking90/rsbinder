@@ -236,6 +236,65 @@ pub trait DeathRecipient: Send + Sync {
     fn binder_died(&self, who: &WIBinder);
 }
 
+/// Freeze state of the process hosting a remote binder, as the kernel binder
+/// driver reports it. AOSP `IBinder::FrozenStateChangeCallback::State`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FrozenState {
+    /// The hosting process is frozen: it serves no transaction until thawed.
+    Frozen,
+    /// The hosting process is not frozen.
+    Unfrozen,
+}
+
+impl From<bool> for FrozenState {
+    fn from(is_frozen: bool) -> Self {
+        if is_frozen {
+            FrozenState::Frozen
+        } else {
+            FrozenState::Unfrozen
+        }
+    }
+}
+
+/// Receives freeze state changes of the process hosting a remote binder.
+/// AOSP `IBinder::FrozenStateChangeCallback`; register it with
+/// [`IBinder::add_frozen_state_change_callback`].
+///
+/// # Delivery
+///
+/// - The first call reports the state at registration time; later calls
+///   report changes only, so one state never arrives twice in a row.
+/// - Changes that happen before the previous one is delivered are combined
+///   into the latest state, as AOSP documents: `Frozen` then `Unfrozen` may
+///   reach the callback as `Unfrozen` alone. Do not count calls.
+/// - Calls for one binder are made one at a time, in the order the kernel
+///   reported the states.
+/// - Calls run with no rsbinder lock held, usually on a binder looper thread
+///   (the thread pool, or a thread in
+///   [`ProcessState::join_thread_pool`](crate::ProcessState::join_thread_pool));
+///   without a looper thread nothing is delivered.
+/// - A callback added after the kernel already reported a state gets that
+///   state from the adding thread, inside
+///   [`IBinder::add_frozen_state_change_callback`], as in AOSP. While it is
+///   delivering, that thread also delivers any state that arrives
+///   meanwhile, to every callback of the binder, so do not hold a lock
+///   across the add that a callback takes. If a looper is delivering
+///   already, the new callback gets the state from the looper instead,
+///   possibly after the add returns.
+///
+/// # Panic safety
+///
+/// A panic in `on_state_changed` is caught and logged, as for
+/// [`DeathRecipient::binder_died`]; the same `panic = "unwind"` caveat applies.
+pub trait FrozenStateChangeCallback: Send + Sync {
+    /// Called with the new freeze state of `who`'s hosting process.
+    ///
+    /// `who` is a weak reference to the binder the callback was registered
+    /// on; compare it against held `SIBinder`s to tell binders apart.
+    /// Outbound binder calls are allowed here.
+    fn on_state_changed(&self, who: &WIBinder, state: FrozenState);
+}
+
 /// Core interface for binder objects, both local and remote.
 ///
 /// This trait corresponds to the public interface of the C++ `IBinder` class,
@@ -268,6 +327,60 @@ pub trait IBinder: Any + Send + Sync {
     /// The recipient will no longer be called if this object
     /// dies.
     fn unlink_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()>;
+
+    /// Register `callback` for freeze state changes of the process hosting
+    /// this remote binder. AOSP `IBinder::addFrozenStateChangeCallback`
+    /// (libbinder `android-15.0.0_r6` and later, Java API in Android 16).
+    ///
+    /// The callback is invoked with the state at registration time, then on
+    /// each change; see [`FrozenStateChangeCallback`] for delivery rules.
+    /// The state is the one the kernel binder driver tracks, set by
+    /// `BINDER_FREEZE` (on Android, the cached-app freezer;
+    /// [`ProcessState::freeze_process`](crate::ProcessState::freeze_process)
+    /// elsewhere). A cgroup freezer alone produces no notification.
+    ///
+    /// This link holds a weak reference to `callback`: keep a strong `Arc`
+    /// alive, or the callback silently never fires. Registrations are
+    /// removed automatically when the last strong reference to the proxy
+    /// is dropped, as AOSP does.
+    ///
+    /// # Errors
+    ///
+    /// - [`StatusCode::BadValue`] if `callback` is already dropped.
+    /// - [`StatusCode::InvalidOperation`] if the driver lacks freeze
+    ///   notification (`features/freeze_notification` absent or `0`), and
+    ///   for every binder that is not a kernel proxy: a local binder (it
+    ///   cannot be frozen without this process being frozen too), and an
+    ///   RPC proxy. Only the kernel binder driver knows a process's freeze
+    ///   state, and the RPC wire carries no freeze command (AOSP's RPC binder
+    ///   aborts here instead). Over RPC, a peer's exit or lost connection
+    ///   is reported by [`link_to_death`](Self::link_to_death); a peer that
+    ///   stops answering while its socket stays open is visible only as a
+    ///   reply timeout. A gateway that re-exports a kernel binder over RPC
+    ///   does not forward its freeze state.
+    fn add_frozen_state_change_callback(
+        &self,
+        callback: sync::Weak<dyn FrozenStateChangeCallback>,
+    ) -> Result<()> {
+        let _ = callback;
+        Err(StatusCode::InvalidOperation)
+    }
+
+    /// Remove a callback registered with
+    /// [`add_frozen_state_change_callback`](Self::add_frozen_state_change_callback).
+    /// Removes the first matching registration only, as AOSP.
+    ///
+    /// Returns [`StatusCode::NameNotFound`] if `callback` is not registered
+    /// on this proxy (including on a driver without freeze notification, as
+    /// AOSP), and [`StatusCode::InvalidOperation`] for a binder that is not a
+    /// kernel proxy.
+    fn remove_frozen_state_change_callback(
+        &self,
+        callback: sync::Weak<dyn FrozenStateChangeCallback>,
+    ) -> Result<()> {
+        let _ = callback;
+        Err(StatusCode::InvalidOperation)
+    }
 
     /// Send a ping transaction to this object
     fn ping_binder(&self) -> Result<()>;
@@ -968,6 +1081,25 @@ impl SIBinder {
         let weak: sync::Weak<R> = Arc::downgrade(recipient);
         self.unlink_to_death(weak)
     }
+
+    /// [`IBinder::add_frozen_state_change_callback`] taking the concrete
+    /// `Arc<C>`. Only a weak reference is stored: keep `callback` alive.
+    pub fn add_frozen_state_change_callback_arc<C: FrozenStateChangeCallback + 'static>(
+        &self,
+        callback: &Arc<C>,
+    ) -> Result<()> {
+        let weak: sync::Weak<C> = Arc::downgrade(callback);
+        self.add_frozen_state_change_callback(weak)
+    }
+
+    /// [`IBinder::remove_frozen_state_change_callback`] taking the concrete `Arc<C>`.
+    pub fn remove_frozen_state_change_callback_arc<C: FrozenStateChangeCallback + 'static>(
+        &self,
+        callback: &Arc<C>,
+    ) -> Result<()> {
+        let weak: sync::Weak<C> = Arc::downgrade(callback);
+        self.remove_frozen_state_change_callback(weak)
+    }
 }
 
 impl Debug for SIBinder {
@@ -1489,6 +1621,34 @@ mod tests {
         fn dec_weak(&self) -> Result<()> {
             Ok(())
         }
+    }
+
+    struct NoopFrozen;
+    impl FrozenStateChangeCallback for NoopFrozen {
+        fn on_state_changed(&self, _: &WIBinder, _: FrozenState) {}
+    }
+
+    /// Anything but a kernel proxy refuses freeze callbacks and records nothing (AOSP
+    /// `INVALID_OPERATION` for a local binder; RPC proxies take the same default).
+    #[test]
+    fn non_kernel_binders_refuse_freeze_callbacks() {
+        let binder = SIBinder::new(Arc::new(MockBinder)).expect("SIBinder::new");
+        let callback = Arc::new(NoopFrozen);
+        assert_eq!(
+            binder.add_frozen_state_change_callback_arc(&callback),
+            Err(StatusCode::InvalidOperation)
+        );
+        assert_eq!(
+            binder.remove_frozen_state_change_callback_arc(&callback),
+            Err(StatusCode::InvalidOperation)
+        );
+        assert_eq!(Arc::weak_count(&callback), 0, "no registration kept a weak");
+    }
+
+    #[test]
+    fn frozen_state_from_the_kernel_flag() {
+        assert_eq!(FrozenState::from(true), FrozenState::Frozen);
+        assert_eq!(FrozenState::from(false), FrozenState::Unfrozen);
     }
 
     /// A native `WIBinder::upgrade()` returns `DeadObject` once the last `Arc` is dropped.

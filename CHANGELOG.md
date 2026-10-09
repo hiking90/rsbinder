@@ -205,6 +205,14 @@ change bytes between peers: upgrade both ends together.
   array shape `.aidl` renders.**
 - **rsbinder-tools: `config::is_valid_service_name`**; `config::Config` and
   `config::FileContents` are re-exported.
+- **Freeze notifications**: `IBinder::add_frozen_state_change_callback` /
+  `remove_frozen_state_change_callback` with `FrozenStateChangeCallback` and
+  `FrozenState` (AOSP `addFrozenStateChangeCallback`, libbinder
+  android-15.0.0_r6+), on drivers that report
+  `features/freeze_notification`; `InvalidOperation` elsewhere and on RPC.
+  `ProcessState::freeze_process` and `process_freeze_info` issue
+  `BINDER_FREEZE` / `BINDER_GET_FROZEN_INFO` (AOSP `IPCThreadState::freeze` /
+  `getProcessFreezeInfo`).
 ### Changed
 
 - **`rsbinder-aidl` warns on a bare `@nullable` field that closes a reference
