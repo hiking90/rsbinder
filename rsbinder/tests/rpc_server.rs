@@ -3658,16 +3658,19 @@ fn dec_strong_outside_handler_does_not_block_or_desync() {
     let held = Arc::clone(&h.held);
     let mut h = h;
     drop(h.server_cb.take());
-    let t0 = Instant::now();
+    // Channel deadline: a drop that blocks must fail the test, not hang the run.
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
+        let t0 = Instant::now();
         *held.lock().unwrap() = None;
-    })
-    .join()
-    .expect("drop thread");
+        let _ = tx.send(t0.elapsed());
+    });
+    let took = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("dropping a proxy outside a handler must not block; still blocked");
     assert!(
-        t0.elapsed() < Duration::from_millis(500),
-        "dropping a proxy outside a handler must not block: {:?}",
-        t0.elapsed()
+        took < Duration::from_millis(500),
+        "dropping a proxy outside a handler must not block: {took:?}"
     );
     // The wire on the served slot is intact.
     for i in 0..20 {

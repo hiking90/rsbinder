@@ -1138,7 +1138,11 @@ impl<'a> RpcClientConfig<'a> {
     ///   answers nothing (one at its connection cap leaves new connections
     ///   in its listen backlog, where `connect(2)` succeeds) fails the setup
     ///   call after `d` instead of hanging it. The r34 wire has no
-    ///   handshake, so there it bounds `connect(2)` only.
+    ///   handshake, so there it bounds `connect(2)` only. A `unix` or
+    ///   `vsock` `connect(2)` is not bounded by `d`: on Linux and Android
+    ///   the first waits while the listener's accept queue is full, and the
+    ///   kernel bounds the second by its own connect timeout
+    ///   (`SO_VM_SOCKETS_CONNECT_TIMEOUT`, 2 s by default).
     /// - **The session**: applied **as soon as it exists**, so it also
     ///   bounds the round trips this setup performs (`GET_MAX_THREADS` for a
     ///   fan-out, `GET_SESSION_ID` for any additional connection), and then

@@ -78,10 +78,12 @@ pub struct ClientOptions {
     ///   fan-out or incoming attach. It is not a budget for the phase as a
     ///   whole, so `open` can take a multiple of it before returning; what
     ///   it guarantees is that no single step waits on a silent peer
-    ///   forever. Two steps are out of its reach: resolving the host name,
-    ///   which blocks in the platform's resolver, and on Linux and Android a
+    ///   forever. Three steps are out of its reach: resolving the host name,
+    ///   which blocks in the platform's resolver; on Linux and Android a
     ///   `unix://` or `unix-abstract://` connect into a listener whose
-    ///   accept queue is full, which waits until the server accepts.
+    ///   accept queue is full, which waits until the server accepts; and a
+    ///   `vsock://` connect, which the kernel bounds by its own connect
+    ///   timeout instead (`SO_VM_SOCKETS_CONNECT_TIMEOUT`, 2 s by default).
     /// - **The session**: applied as soon as the session exists, so it also
     ///   bounds the round trips `open` makes after that point (the r34
     ///   fd-mode negotiation, the `GET_MAX_THREADS` / `GET_SESSION_ID`
