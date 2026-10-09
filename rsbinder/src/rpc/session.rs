@@ -388,7 +388,12 @@
 //! `:1395-1400`). On the android-13+ wire that is judged from the header, before any body byte,
 //! as AOSP's `getAndExecuteCommand` reads only the header before `processCommand`
 //! (`:907-926`): a peer that announces a large body and never sends it cannot hold the send. The
-//! r34 frame is read whole (its length is capped at `MAX_FRAME_LEN`) and judged after.
+//! r34 frame is read whole (its length is capped at `MAX_FRAME_LEN`) and its header judged after,
+//! by the same rule with the r34 `DEC_STRONG` body (32 bytes), so the statuses are the same.
+//! AOSP has nothing to match there: android-12 r34 `rpcSend` is a plain blocking `send` that
+//! never drains, and the r34 profile's length-prefixed frame is rsbinder's own. A peer that
+//! stops inside a frame holds the send until the send deadline, as one that stops inside an
+//! android-13+ header does.
 //!
 //! "Neither can start" does not hold for a send made inside this thread's own reply wait on
 //! the same connection. A `Drop` that a `DEC_STRONG` read in that wait releases may transact on
@@ -573,13 +578,14 @@ use super::state::RpcState;
 use super::transport::{PeerIdentity, RpcTransport};
 use super::wire::{
     R34Codec, WireCodec, WireMessage, WireReply, WireReplyRef, WireTransaction, WireTransactionRef,
+    WIRE_HEADER_LEN,
 };
 use super::wire_android13::{
     client_connect_with_id, client_read_connection_init, client_write_connection_header,
     control_only_refusal, read_aosp_message, read_aosp_message_gated, read_aosp_message_with_fds,
     server_accept_deferred_init, write_aosp_message, write_aosp_message_with_fds,
-    Android13PlusCodec, RawTransportIo, A13_ADDR_LEN, FD_MODE_NONE, FD_MODE_UNIX, PROTOCOL_V1,
-    PROTOCOL_V2,
+    Android13PlusCodec, RawTransportIo, A13_ADDR_LEN, A13_DEC_STRONG_LEN, FD_MODE_NONE,
+    FD_MODE_UNIX, PROTOCOL_V1, PROTOCOL_V2,
 };
 use super::{RpcError, RpcResult};
 
@@ -2736,10 +2742,18 @@ impl RpcSessionInner {
         };
         // A `DEC_STRONG` carries no fds; any that came are closed here, as AOSP drops them.
         let (frame, _fds) =
-            self.recv_msg_gated(transport, |header| match control_only_refusal(header) {
-                None => Ok(()),
-                Some((status, what)) => refuse(status, what),
+            self.recv_msg_gated(transport, |header| {
+                match control_only_refusal(header, A13_DEC_STRONG_LEN) {
+                    None => Ok(()),
+                    Some((status, what)) => refuse(status, what),
+                }
             })?;
+        // r34 reads the frame whole: its header is judged here, so the statuses match android-13+.
+        if !self.profile.aosp_framing() && frame.len() >= WIRE_HEADER_LEN {
+            if let Some((status, what)) = control_only_refusal(&frame, RPC_ADDR_LEN) {
+                return refuse(status, what);
+            }
+        }
         match self.profile.codec().decode_message(&frame)? {
             WireMessage::DecStrong(addr, amount) => {
                 let mut st = self.shared.state.lock().expect("rpc state poisoned");
@@ -8093,6 +8107,25 @@ mod tests {
             peer.send_frame(&frame).expect("peer frame");
             let sent = oneway_past_the_buffer(&session).expect("the send must stop at the frame");
             assert_eq!(sent, Err(want));
+            assert!(session.inner.shared.lifecycle.is_torn_down());
+        }
+    }
+
+    /// r34 judges a drained frame by the android-13+ rule, so a malformed one gets the same status.
+    #[test]
+    fn an_r34_drained_frame_gets_the_android13_status() {
+        use super::super::transport::UnixTransport;
+        for (command, body_size, want) in [
+            (2, 16, StatusCode::BadValue),
+            (9, RPC_ADDR_LEN, StatusCode::DeadObject),
+        ] {
+            let mut frame = a13_header(command, body_size as u32).to_vec();
+            frame.resize(WIRE_HEADER_LEN + body_size, 0);
+            let (a, peer) = UnixTransport::pair().expect("socketpair");
+            let session = RpcSession::new(Box::new(a), AddressSpace::Initiator).expect("session");
+            peer.send_frame(&frame).expect("peer frame");
+            let sent = oneway_past_the_buffer(&session).expect("the send must stop at the frame");
+            assert_eq!(sent, Err(want), "command {command}");
             assert!(session.inner.shared.lifecycle.is_torn_down());
         }
     }

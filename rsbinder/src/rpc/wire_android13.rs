@@ -246,7 +246,13 @@ const CMD_REPLY: u32 = 1;
 const CMD_DEC_STRONG: u32 = 2;
 
 /// AOSP `processCommand(CONTROL_ONLY)` judged on the header alone: `None` admits the message.
-pub(crate) fn control_only_refusal(header: &[u8]) -> Option<(crate::StatusCode, &'static str)> {
+///
+/// `dec_strong_len` is the wire's `DEC_STRONG` body: [`A13_DEC_STRONG_LEN`], or 32 on r34,
+/// whose frame is read whole and judged by the same rule after.
+pub(crate) fn control_only_refusal(
+    header: &[u8],
+    dec_strong_len: usize,
+) -> Option<(crate::StatusCode, &'static str)> {
     use crate::StatusCode;
     let command = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
     let body_size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
@@ -254,7 +260,7 @@ pub(crate) fn control_only_refusal(header: &[u8]) -> Option<(crate::StatusCode, 
         // android-17.0.0_r1 `RpcState.cpp:973-978`.
         CMD_TRANSACT => Some((StatusCode::BadType, "a TRANSACT")),
         // `processDecStrong`, `RpcState.cpp:1395-1400`.
-        CMD_DEC_STRONG if body_size != A13_DEC_STRONG_LEN => {
+        CMD_DEC_STRONG if body_size != dec_strong_len => {
             Some((StatusCode::BadValue, "a DEC_STRONG of the wrong size"))
         }
         CMD_DEC_STRONG => None,

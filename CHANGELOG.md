@@ -1100,8 +1100,10 @@ after 0.12.0. The single-connection one-liners
   waiting for a reply, so enough of them blocked both ends. A transaction's
   send now reads `DEC_STRONG`s off its connection while it waits for room, as
   AOSP's `drainCommands` does; any other command read there ends the session
-  (`BadType` for a request), judged on the android-13+ wire from its header
-  alone, and those reads are bounded by the session's send deadline
+  with AOSP's status (`BadType` for a request, `DeadObject` for a reply or an
+  unknown command, `BadValue` for a `DEC_STRONG` of the wrong size), judged on
+  the android-13+ wire from its header alone and on the r34 wire once its
+  frame is read, and those reads are bounded by the session's send deadline
   (`set_timeout`, or a server's idle timeout). A send that fails ends the
   session before anything else is written on its connection. An rsbinder
   server also holds such `DEC_STRONG`s, up to 10 000 addresses per
