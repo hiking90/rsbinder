@@ -527,6 +527,11 @@ This changelog starts at 0.9.0. For earlier releases, see the
   Text such as `interfaceIFoo {`, `packagep;` or `oneway oneway interface` is
   rejected too. AOSP's `aidl` rejects all of these, so an `.aidl` shared with
   an Android build is unaffected.
+- **RPC on the android-13+ wire: a null binder now carries a stability
+  `int32`, as libbinder's does** (see *Fixed*). An rsbinder 0.11.0 peer on
+  that wire reads the parcel 4 bytes off after a null binder or a null
+  interface, so update both ends together. Parcels without a null binder are
+  unchanged.
 - **Android builds must link for API 29 (Android 10, the oldest supported
   platform) or newer: pass `--platform 29` to `cargo ndk`.** rsbinder now
   calls bionic's `process_vm_readv`, which cargo-ndk's default API 21 does
@@ -881,6 +886,17 @@ after 0.12.0. The single-connection one-liners
   fields no box breaks — non-`@nullable` fields and fixed-size arrays — now
   close a cycle, as AOSP `CheckNoRecursiveDefinition` skips
   `@nullable(heap=true)`. The generated code of accepted input is unchanged.
+- **RPC (android-13+ wire): a null binder now interoperates with libbinder.**
+  AOSP writes a stability `int32` after every RPC binder, a null one
+  included (`UNDECLARED`), and reads it back (`Parcel::flattenBinder` /
+  `unflattenBinder`, android-13.0.0_r1 through 17). rsbinder wrote and read
+  only the null marker, so every field after a null binder or a null
+  interface sat 4 bytes off: a libbinder peer read the next value as the
+  stability and failed short (`NOT_ENOUGH_DATA`), and rsbinder read the
+  stability as the next value. rsbinder now writes and reads it, refuses a
+  null binder declaring any other level with `BadType`, as AOSP
+  `Stability::setRepr` does, and answers `GET_ROOT` on a server with no root
+  the same way. The r34 wire is unchanged.
 - **`rsbinder-aidl`: a direction followed directly by a comment parses.**
   `void f(in/*c*/ int[] a)` was a syntax error, because `in`, `out` and
   `inout` had to be followed by whitespace; any non-name character now ends
