@@ -29,6 +29,7 @@
 - [Cross-Transport Services](./cross-transport-services.md)
 - [Security & Authorization](./security.md)
 - [Stability Tiers](./stability-tiers.md)
+- [Migrating from 0.11 to 0.12](./migrating-0.12.md)
 - [Enable binder for Linux](./enable-binder-for-linux.md)
     - [Arch Linux](./arch-linux.md)
     - [Ubuntu Linux](./ubuntu-linux.md)
