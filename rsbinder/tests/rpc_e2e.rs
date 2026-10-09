@@ -292,6 +292,12 @@ fn make_root() -> SIBinder {
 /// Runs the full scenario over a connected transport pair, asserting server node accounting.
 fn run_scenario(server_t: Box<dyn RpcTransport>, client_t: Box<dyn RpcTransport>) {
     let server = RpcSession::new(server_t, AddressSpace::Acceptor).expect("RpcSession::new");
+    let client = RpcSession::new(client_t, AddressSpace::Initiator).expect("RpcSession::new");
+    run_scenario_on(server, client);
+}
+
+/// [`run_scenario`] on sessions already set up, whatever wire they speak.
+fn run_scenario_on(server: RpcSession, client: RpcSession) {
     server.set_root(make_root()).expect("set_root");
     let server_for_thread = server.clone();
     let handle = thread::spawn(move || {
@@ -299,7 +305,6 @@ fn run_scenario(server_t: Box<dyn RpcTransport>, client_t: Box<dyn RpcTransport>
     });
 
     {
-        let client = RpcSession::new(client_t, AddressSpace::Initiator).expect("RpcSession::new");
         let root = SmokeProxy(client.get_root().expect("get_root"));
 
         // Scalar + string round-trip, exact values.
@@ -331,6 +336,8 @@ fn run_scenario(server_t: Box<dyn RpcTransport>, client_t: Box<dyn RpcTransport>
         );
     }
 
+    // The client's end is the server's end of stream, which returns `serve_blocking`.
+    drop(client);
     handle.join().expect("server thread");
 }
 
@@ -344,6 +351,23 @@ fn rpc_e2e_over_mem() {
 fn rpc_e2e_over_unix_socketpair() {
     let (a, b) = UnixTransport::pair().expect("socketpair");
     run_scenario(Box::new(a), Box::new(b));
+}
+
+/// `mem`'s byte stream carries the android-13+ handshake and AOSP framing at every version.
+#[test]
+fn rpc_e2e_android13plus_over_mem() {
+    for version in 0..=2 {
+        let (a, b) = MemTransport::pair();
+        let accept = thread::spawn(move || RpcSession::accept_android13plus(Box::new(a), version));
+        let client = RpcSession::connect_android13plus(Box::new(b), version)
+            .unwrap_or_else(|e| panic!("v{version}: connect: {e:?}"));
+        let server = accept
+            .join()
+            .expect("accept thread")
+            .unwrap_or_else(|e| panic!("v{version}: accept: {e:?}"));
+        assert_eq!(client.wire_protocol_version(), Some(version));
+        run_scenario_on(server, client);
+    }
 }
 
 /// An RPC binder's `as_remote()` drives a full call via `RemoteProxy`; see module doc "Notes".

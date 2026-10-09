@@ -1107,8 +1107,7 @@ impl RpcServer {
     /// then runs the AOSP connection handshake and negotiates
     /// `min(max_version, client_max)`. Default (unset) speaks the
     /// AOSP android-12 r34 wire. Has effect only on a
-    /// transport with raw byte access (every built-in backend but the
-    /// frame-only `mem`).
+    /// transport with raw byte access (every built-in backend).
     ///
     /// **Sequencing:** advertising `2` is sound
     /// only because the Parcel binder/FD object-position producer

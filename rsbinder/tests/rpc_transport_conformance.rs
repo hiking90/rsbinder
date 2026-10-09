@@ -17,6 +17,11 @@
 //! | tcp_debug | as above | end of stream | reads end of stream; its first send is **accepted on both** — TCP reports the reset on a later write | fails at once, `EndOfStream` | `Ok` |
 //! | mem | the frame, then end of stream (models Linux unix) | end of stream (≤ one 20 ms tick) | reads end of stream; its sends fail at once | fails at once, `EndOfStream` | `Ok` |
 //!
+//! `unix` and `mem` are also run through `send_raw`/`recv_raw`, the byte
+//! stream the android-13+ profile reads, with the same rows: a raw read's
+//! `Ok(0)` is the end of stream. That pins `mem`'s raw path to the Linux
+//! socket it models.
+//!
 //! "Queued" means in our receive queue before the shutdown, and for
 //! `tcp_debug` the scenario waits until it is: XNU's loopback delivers a
 //! segment after the sender's `send` returns, and one that lands after our
@@ -117,11 +122,44 @@ fn shutdown_within(name: &str, t: &Shared) {
     h.join().expect("shutdown thread");
 }
 
-fn recv(t: &dyn RpcTransport, fd_mode: bool) -> Result<Vec<u8>, RpcError> {
-    if fd_mode {
-        t.recv_frame_with_fds().map(|(frame, _fds)| frame)
-    } else {
-        t.recv_frame()
+/// How a scenario moves bytes: length-framed, framed with `SCM_RIGHTS`, or the raw byte stream.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Frame,
+    FdFrame,
+    Raw,
+}
+
+impl Mode {
+    /// The peer's side of a scenario never passes fds.
+    fn peer(self) -> Mode {
+        if self == Mode::FdFrame {
+            Mode::Frame
+        } else {
+            self
+        }
+    }
+}
+
+fn send(t: &dyn RpcTransport, mode: Mode, buf: &[u8]) -> Result<(), RpcError> {
+    match mode {
+        Mode::Raw => t.send_raw(buf),
+        Mode::Frame | Mode::FdFrame => t.send_frame(buf),
+    }
+}
+
+/// One frame, or one raw read; a raw `Ok(0)` is reported as the `EndOfStream` a frame read gives.
+fn recv(t: &dyn RpcTransport, mode: Mode) -> Result<Vec<u8>, RpcError> {
+    match mode {
+        Mode::Frame => t.recv_frame(),
+        Mode::FdFrame => t.recv_frame_with_fds().map(|(frame, _fds)| frame),
+        Mode::Raw => {
+            let mut buf = [0u8; 64];
+            match t.recv_raw(&mut buf)? {
+                0 => Err(RpcError::EndOfStream),
+                n => Ok(buf[..n].to_vec()),
+            }
+        }
     }
 }
 
@@ -130,11 +168,11 @@ fn queued_then_shutdown(
     name: &str,
     local: &Shared,
     peer: &Shared,
-    fd_mode: bool,
+    mode: Mode,
     queued: Queued,
     peer_send: PeerSend,
 ) {
-    queued_then_shutdown_after(name, local, peer, fd_mode, queued, peer_send, || {});
+    queued_then_shutdown_after(name, local, peer, mode, queued, peer_send, || {});
 }
 
 /// [`queued_then_shutdown`], with `arrived` returning once the frame is in our receive queue.
@@ -142,23 +180,22 @@ fn queued_then_shutdown_after(
     name: &str,
     local: &Shared,
     peer: &Shared,
-    fd_mode: bool,
+    mode: Mode,
     queued: Queued,
     peer_send: PeerSend,
     arrived: impl FnOnce(),
 ) {
-    peer.send_frame(b"queued")
-        .expect("peer sends into our queue");
+    send(&**peer, mode.peer(), b"queued").expect("peer sends into our queue");
     arrived();
     shutdown_within(name, local);
     if let Queued::Delivered = queued {
         assert_eq!(
-            recv(&**local, fd_mode).expect("the queued frame is still delivered"),
+            recv(&**local, mode).expect("the queued frame is still delivered"),
             b"queued",
             "{name}: a frame queued before shutdown is delivered on this platform"
         );
     }
-    let end = recv(&**local, fd_mode);
+    let end = recv(&**local, mode);
     assert!(
         matches!(end, Err(RpcError::EndOfStream)),
         "{name}: after shutdown (and any queued frame) the read is the end of stream, got {end:?}"
@@ -166,13 +203,13 @@ fn queued_then_shutdown_after(
     // A second shutdown is Ok (idempotent).
     shutdown_within(name, local);
     // The peer: our shutdown is its end of stream.
-    let peer_end = peer.recv_frame();
+    let peer_end = recv(&**peer, mode.peer());
     assert!(
         matches!(peer_end, Err(RpcError::EndOfStream)),
         "{name}: the peer reads our shutdown as its end of stream, got {peer_end:?}"
     );
     // Measured per backend and platform: a change here changes the module-doc table too.
-    let sent = peer.send_frame(b"x");
+    let sent = send(&**peer, mode.peer(), b"x");
     match peer_send {
         PeerSend::FailsAtOnce => assert!(
             sent.is_err(),
@@ -186,14 +223,14 @@ fn queued_then_shutdown_after(
 }
 
 /// Scenario B: a local shutdown wakes a parked reader with the end of stream, within a bound.
-fn blocked_reader_is_woken(name: &str, local: &Shared, fd_mode: bool) {
+fn blocked_reader_is_woken(name: &str, local: &Shared, mode: Mode) {
     let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, RpcError>>(1);
     let (started_tx, started_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let reader = {
         let local = Arc::clone(local);
         std::thread::spawn(move || {
             let _ = started_tx.send(());
-            let _ = tx.send(recv(&*local, fd_mode));
+            let _ = tx.send(recv(&*local, mode));
         })
     };
     started_rx.recv().expect("the reader thread started");
@@ -214,9 +251,9 @@ fn blocked_reader_is_woken(name: &str, local: &Shared, fd_mode: bool) {
 }
 
 /// Scenario E: our own send after our own shutdown fails as `EndOfStream` (see module doc).
-fn our_send_after_our_shutdown_fails(name: &str, local: &Shared) {
+fn our_send_after_our_shutdown_fails(name: &str, local: &Shared, mode: Mode) {
     shutdown_within(name, local);
-    let sent = local.send_frame(b"after");
+    let sent = send(&**local, mode, b"after");
     assert!(
         matches!(sent, Err(RpcError::EndOfStream)),
         "{name}: our own send after our own shutdown fails as the end of stream, got {sent:?}"
@@ -290,7 +327,7 @@ fn unix_queued_frame_then_shutdown() {
         "unix",
         &local,
         &peer,
-        false,
+        Mode::Frame,
         socket_expectation(),
         unix_peer_send(),
     );
@@ -299,7 +336,7 @@ fn unix_queued_frame_then_shutdown() {
 #[test]
 fn unix_blocked_reader_is_woken() {
     let (local, _peer) = unix_pair();
-    blocked_reader_is_woken("unix", &local, false);
+    blocked_reader_is_woken("unix", &local, Mode::Frame);
 }
 
 #[test]
@@ -309,7 +346,7 @@ fn unix_fd_mode_queued_frame_then_shutdown() {
         "unix fd-mode",
         &local,
         &peer,
-        true,
+        Mode::FdFrame,
         socket_expectation(),
         unix_peer_send(),
     );
@@ -318,13 +355,38 @@ fn unix_fd_mode_queued_frame_then_shutdown() {
 #[test]
 fn unix_fd_mode_blocked_reader_is_woken() {
     let (local, _peer) = unix_pair();
-    blocked_reader_is_woken("unix fd-mode", &local, true);
+    blocked_reader_is_woken("unix fd-mode", &local, Mode::FdFrame);
 }
 
 #[test]
 fn unix_our_send_after_our_shutdown_fails() {
     let (local, _peer) = unix_pair();
-    our_send_after_our_shutdown_fails("unix", &local);
+    our_send_after_our_shutdown_fails("unix", &local, Mode::Frame);
+}
+
+#[test]
+fn unix_raw_queued_bytes_then_shutdown() {
+    let (local, peer) = unix_pair();
+    queued_then_shutdown(
+        "unix raw",
+        &local,
+        &peer,
+        Mode::Raw,
+        socket_expectation(),
+        unix_peer_send(),
+    );
+}
+
+#[test]
+fn unix_raw_blocked_reader_is_woken() {
+    let (local, _peer) = unix_pair();
+    blocked_reader_is_woken("unix raw", &local, Mode::Raw);
+}
+
+#[test]
+fn unix_raw_our_send_after_our_shutdown_fails() {
+    let (local, _peer) = unix_pair();
+    our_send_after_our_shutdown_fails("unix raw", &local, Mode::Raw);
 }
 
 #[test]
@@ -347,7 +409,7 @@ fn mem_queued_frame_then_shutdown() {
         "mem",
         &local,
         &peer,
-        false,
+        Mode::Frame,
         Queued::Delivered,
         PeerSend::FailsAtOnce,
     );
@@ -356,13 +418,38 @@ fn mem_queued_frame_then_shutdown() {
 #[test]
 fn mem_blocked_reader_is_woken() {
     let (local, _peer) = mem_pair();
-    blocked_reader_is_woken("mem", &local, false);
+    blocked_reader_is_woken("mem", &local, Mode::Frame);
 }
 
 #[test]
 fn mem_our_send_after_our_shutdown_fails() {
     let (local, _peer) = mem_pair();
-    our_send_after_our_shutdown_fails("mem", &local);
+    our_send_after_our_shutdown_fails("mem", &local, Mode::Frame);
+}
+
+#[test]
+fn mem_raw_queued_bytes_then_shutdown() {
+    let (local, peer) = mem_pair();
+    queued_then_shutdown(
+        "mem raw",
+        &local,
+        &peer,
+        Mode::Raw,
+        Queued::Delivered,
+        PeerSend::FailsAtOnce,
+    );
+}
+
+#[test]
+fn mem_raw_blocked_reader_is_woken() {
+    let (local, _peer) = mem_pair();
+    blocked_reader_is_woken("mem raw", &local, Mode::Raw);
+}
+
+#[test]
+fn mem_raw_our_send_after_our_shutdown_fails() {
+    let (local, _peer) = mem_pair();
+    our_send_after_our_shutdown_fails("mem raw", &local, Mode::Raw);
 }
 
 #[cfg(feature = "rpc-tcp-debug")]
@@ -398,7 +485,7 @@ mod tcp {
             "tcp_debug",
             &local,
             &peer,
-            false,
+            Mode::Frame,
             socket_expectation(),
             PeerSend::Accepted,
             // Blocks under the 5 s deadline `armed` set on this socket.
@@ -414,13 +501,13 @@ mod tcp {
     #[test]
     fn tcp_debug_blocked_reader_is_woken() {
         let (local, _peer) = tcp_pair();
-        blocked_reader_is_woken("tcp_debug", &local, false);
+        blocked_reader_is_woken("tcp_debug", &local, Mode::Frame);
     }
 
     #[test]
     fn tcp_debug_our_send_after_our_shutdown_fails() {
         let (local, _peer) = tcp_pair();
-        our_send_after_our_shutdown_fails("tcp_debug", &local);
+        our_send_after_our_shutdown_fails("tcp_debug", &local, Mode::Frame);
     }
 
     #[test]
@@ -487,7 +574,7 @@ mod tls {
             "tls",
             &local,
             &peer,
-            false,
+            Mode::Frame,
             socket_expectation(),
             unix_peer_send(),
         );
@@ -496,13 +583,13 @@ mod tls {
     #[test]
     fn tls_blocked_reader_is_woken() {
         let (local, _peer) = tls_pair();
-        blocked_reader_is_woken("tls", &local, false);
+        blocked_reader_is_woken("tls", &local, Mode::Frame);
     }
 
     #[test]
     fn tls_our_send_after_our_shutdown_fails() {
         let (local, _peer) = tls_pair();
-        our_send_after_our_shutdown_fails("tls", &local);
+        our_send_after_our_shutdown_fails("tls", &local, Mode::Frame);
     }
 
     /// The socket's close decides, so an unread record (here a whole frame) changes nothing.

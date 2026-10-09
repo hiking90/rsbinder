@@ -177,7 +177,7 @@ impl RpcTransport for TcpDebugTransport {
 
     /// Raw, unframed write for the android-13+ profile (the real android
     /// RPC wire has no length prefix). Same shape as `VsockTransport`'s;
-    /// the trait default refuses raw access, which is right for a
+    /// the trait default refuses raw access, which is right only for a
     /// frame-only backend and wrong here — `RpcSession::from_preconnected_fd`
     /// wraps an `AF_INET` fd in this transport and goes straight into the
     /// android-13+ handshake, whose first byte is a raw write.

@@ -4391,10 +4391,10 @@ impl RpcSession {
     /// highest `RPC_WIRE_PROTOCOL_VERSION` to offer (0 = android-13,
     /// 1 = android-14/15, 2 = android-16).
     ///
-    /// Requires a transport with raw byte access (every built-in backend
-    /// but the frame-only `mem`, which fails the handshake: its raw-byte
-    /// refusal crosses the `std::io` bridge as an unclassified I/O error
-    /// and reaches the caller as [`StatusCode::Unknown`]). The default [`RpcSession::new`] /
+    /// Requires a transport with raw byte access (every built-in backend;
+    /// a frame-only transport of the caller's fails the handshake: its
+    /// raw-byte refusal crosses the `std::io` bridge as an unclassified I/O
+    /// error and reaches the caller as [`StatusCode::Unknown`]). The default [`RpcSession::new`] /
     /// [`RpcSession::setup_unix_client`] keep the r34 wire — this never
     /// changes the R34 path (AOSP android-12 layout).
     pub fn connect_android13plus(
@@ -6904,8 +6904,9 @@ mod tests {
             .expect("build session");
         let base = session.inner.slot_count();
 
-        // `mem` has no raw byte stream, so the `"cci"` write fails: the case under test.
-        let (t, _p) = MemTransport::pair();
+        // The peer is gone, so the `"cci"` write fails: the case under test.
+        let (t, p) = MemTransport::pair();
+        drop(p);
         assert!(
             session
                 .add_callback_slot_and_init(Box::new(t), 2, &codec)

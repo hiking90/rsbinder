@@ -393,11 +393,12 @@ pub trait RpcTransport: Send + Sync {
     /// has no length prefix (`RpcState::rpcSend` writes the
     /// `RpcWireHeader` + body directly) — the android-13+ profile drives
     /// framing itself via `wire_android13`. The default is
-    /// **unsupported**: right for a frame-only backend (`mem`), and a
+    /// **unsupported**: right for a frame-only backend, and a
     /// silent trap for a byte-stream one — an android-13+ session over a
     /// backend that does not override it fails at its first handshake
-    /// byte. Every stream backend (`unix`, `tcp_debug`, `vsock`, `tls`)
-    /// must override both this and [`recv_raw`](Self::recv_raw). The R34
+    /// byte. Every bundled backend (`unix`, `tcp_debug`, `vsock`, `tls`,
+    /// and `mem`, which keeps the unread rest of a message for the next
+    /// read) overrides both this and [`recv_raw`](Self::recv_raw). The R34
     /// path never calls this; it uses `send_frame`/`recv_frame`.
     fn send_raw(&self, _buf: &[u8]) -> RpcResult<()> {
         Err(RpcError::Protocol("this transport has no raw byte access"))

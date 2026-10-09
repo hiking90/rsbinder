@@ -553,6 +553,12 @@ This changelog starts at 0.9.0. For earlier releases, see the
   Service".
 - **`RpcSession::is_ended`**: whether a session has ended. After a failed
   call this, not the status code, says whether to reconnect.
+- **`rpc::transport::MemTransport` carries a raw byte stream**:
+  `send_raw`/`recv_raw` work, with the same shutdown and read-deadline
+  behavior as its frames, so an android-13+ session (handshake and AOSP
+  framing) runs over `mem` in hermetic tests. One direction carries frames or
+  raw bytes, not both: a `recv_frame` while a raw read has left part of a
+  message unread is `RpcError::Protocol`.
 - **`RpcTransport::peer_closed` and `TlsStream::peer_closed`**: whether the
   peer closed the connection, from a zero-timeout poll that reads nothing
   (`POLLRDHUP` on Linux and Android; `POLLHUP` on Apple platforms, and for

@@ -1230,7 +1230,7 @@ fn write_all_raw<W: Write>(w: &mut W, buf: &[u8]) -> RpcResult<()> {
 /// Bridges a [`RpcTransport`](super::transport::RpcTransport) to
 /// `std::io::{Read, Write}` so the AOSP-faithful framing + handshake
 /// helpers above run over any transport with raw byte access
-/// (every built-in backend but the frame-only `mem`). EOF (`recv_raw` ⇒ `Ok(0)`) is preserved as
+/// (every built-in backend). EOF (`recv_raw` ⇒ `Ok(0)`) is preserved as
 /// `Read` returning `Ok(0)`, so `read_exact_raw` still yields the
 /// correct `EndOfStream`/`Truncated`. This is the bridge the opt-in
 /// android-13+ `RpcSession` profile uses; the R34 path never touches
@@ -1834,11 +1834,28 @@ mod tests {
             assert_eq!(srv.join().expect("server thread"), expect);
         }
 
-        // Default transports have no raw access (additive, by type).
-        use crate::rpc::transport::RpcTransport;
-        let (m, _m2) = crate::rpc::transport::MemTransport::pair();
-        assert!(m.send_raw(b"x").is_err(), "mem has no raw byte access");
-        assert!(m.recv_raw(&mut [0u8; 4]).is_err());
+        // A transport that keeps the trait defaults has no raw access (additive, by type).
+        use crate::rpc::transport::{PeerIdentity, RpcTransport};
+        struct FrameOnly;
+        impl RpcTransport for FrameOnly {
+            fn send_frame(&self, _buf: &[u8]) -> RpcResult<()> {
+                Ok(())
+            }
+            fn recv_frame(&self) -> RpcResult<Vec<u8>> {
+                Err(RpcError::EndOfStream)
+            }
+            fn peer_identity(&self) -> PeerIdentity {
+                PeerIdentity::Anonymous
+            }
+            fn describe(&self) -> &str {
+                "frame-only"
+            }
+            fn shutdown(&self) -> RpcResult<()> {
+                Ok(())
+            }
+        }
+        assert!(FrameOnly.send_raw(b"x").is_err(), "no raw byte access");
+        assert!(FrameOnly.recv_raw(&mut [0u8; 4]).is_err());
     }
 
     /// Attach handshake is byte-exact to AOSP; see module doc "Mutation gates".
