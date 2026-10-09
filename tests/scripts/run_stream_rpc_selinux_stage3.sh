@@ -77,7 +77,11 @@ dev setenforce 1
 as_shell
 [ "$(dev id -u)" != 0 ] || { echo "adb unroot did not take"; exit 1; }
 T0=$(dev "date +'%m-%d %H:%M:%S.000'")
-printf 'client domain %s, %s\n' "$(dev id -Z)" "$(dev getenforce)"
+CLIENT_LABEL=$(dev id -Z)
+MODE=$(dev getenforce)
+printf 'client domain %s, %s\n' "$CLIENT_LABEL" "$MODE"
+[ "$CLIENT_LABEL" = u:r:shell:s0 ] || { echo "FAIL: the client is not in shell"; exit 1; }
+[ "$MODE" = Enforcing ] || { echo "FAIL: SELinux is not enforcing"; exit 1; }
 
 # Every stdio stream off adb's: the `su` server outlives the test and would hold them open.
 dev "cd $DEV && STREAM_PROBE_BIN=$DEV/probe-su.sh timeout 120 ./stream_rpc --exact $CASE \
@@ -85,7 +89,9 @@ dev "cd $DEV && STREAM_PROBE_BIN=$DEV/probe-su.sh timeout 120 ./stream_rpc --exa
 SVC_LABEL=$(dev "ps -A -o LABEL,NAME | grep stream_probe" | awk '{print $1}' | head -1)
 printf 'service domain %s\n' "${SVC_LABEL:-<gone>}"
 dev cat "$DEV/out.txt" | grep -E '^test |test result|panicked'
-DENIALS=$(dev su root logcat -d -b all -T "'$T0'" 2>/dev/null | grep 'avc:  denied' | grep -v adbd)
+# Only the two test domains: a denial another daemon logs meanwhile is not this run's.
+DENIALS=$(dev su root logcat -d -b all -T "'$T0'" 2>/dev/null | grep 'avc:  denied' |
+    grep -E 'scontext=u:r:(shell|su):s0')
 
 FAIL=0
 [ "$(dev cat $DEV/rc)" = 0 ] || { echo "FAIL: the test failed"; FAIL=1; }
