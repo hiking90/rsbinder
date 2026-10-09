@@ -313,6 +313,16 @@ jobs:
             exit 1
           }
 
+      - name: Run death_reorder_kernel (a death link survives a late clear, #[ignore]'d)
+        run: |
+          # A dropped proxy's BC_CLEAR_DEATH_NOTIFICATION, held on a looper,
+          # must not remove a newer proxy's link to the same handle.
+          RUST_BACKTRACE=1 cargo test -p tests --features rpc --test death_reorder_kernel -- --ignored --test-threads=1 || {
+            echo "::error::death_reorder_kernel failed"
+            cp -f rsb_hub.log artifacts/death-reorder-kernel-rsb_hub.log 2>/dev/null || true
+            exit 1
+          }
+
       - name: Run fmq_binder (an FMQ descriptor across the kernel binder, #[ignore]'d)
         run: |
           # Plan 12-fmq F2. `fmq_probe serve` in a child process makes and

@@ -135,6 +135,15 @@
 //! its `Drop` counts 2 until that `Drop` posts, as AOSP does while a new
 //! `BpBinder` replaces one in its destructor.
 //!
+//! # Death links
+//!
+//! `death` holds one slot per handle listing the proxies whose recipient
+//! list is non-empty (the `death` module doc has why). The first link
+//! requests the registration, flushed under the lock; the last unlink, drop
+//! or obituary queues the clear; a link while the clear is in flight defers
+//! its request to `death_clear_done`. The lock nests outside `pin_ledger`,
+//! like the freeze lock, and is never held across user code.
+//!
 //! # Freeze notifications
 //!
 //! `freeze` holds one slot per handle (the `freeze` module doc has the
@@ -306,6 +315,7 @@ use std::sync::{self, Arc, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::Duration;
 
+use crate::death::{DeathCmd, DeathRegistry};
 use crate::freeze::{ClearDone, FreezeCmd, FreezeRegistry};
 use crate::{binder::*, error::*, proxy::*, sys::binder, thread_state};
 
@@ -654,6 +664,8 @@ pub struct ProcessState {
     next_generation: AtomicU64,
     /// Leaf lock; never held across a command. See module doc "Proxy cache entry".
     pin_ledger: Mutex<PinLedger>,
+    /// Death-registration slots by handle; module doc "Death links".
+    death: Mutex<DeathRegistry>,
     /// Freeze-notification slots by handle; module doc "Freeze notifications".
     freeze: Mutex<FreezeRegistry>,
     /// `features/freeze_notification`, read once on first use.
@@ -798,6 +810,7 @@ impl ProcessState {
             handle_to_proxy: RwLock::new(HashMap::new()),
             next_generation: AtomicU64::new(1),
             pin_ledger: Mutex::new(PinLedger::default()),
+            death: Mutex::new(DeathRegistry::default()),
             freeze: Mutex::new(FreezeRegistry::default()),
             freeze_notification: OnceLock::new(),
             published_natives: RwLock::new(HashMap::new()),
@@ -1175,8 +1188,49 @@ impl ProcessState {
 
     /// `BR_CLEAR_DEATH_NOTIFICATION_DONE`; R1: call with no `THREAD_STATE` borrow held.
     pub(crate) fn death_clear_done(&self, handle: u32) {
+        {
+            let mut registry = self.death_lock();
+            // A link made during the clear asked for this request (module doc "Death links").
+            if registry.clear_done(handle) == ClearDone::Rerequest {
+                if let Err(err) = thread_state::send_death_request(handle) {
+                    registry.abort_request(handle);
+                    log::error!(
+                        "BC_REQUEST_DEATH_NOTIFICATION for handle {handle} failed: {err:?}; \
+                         its recipients will not hear of its death"
+                    );
+                }
+            }
+        }
         let count = self.pin_ledger_lock().clear_done(handle, ClearKind::Death);
         release_pins(handle, count);
+    }
+
+    fn death_lock(&self) -> sync::MutexGuard<'_, DeathRegistry> {
+        self.death.lock().expect("Death registry lock poisoned")
+    }
+
+    /// A proxy's recipient list became non-empty; `owner` = its address. R1: no borrow held.
+    ///
+    /// `Err` only if the request never reached the kernel; then nothing is registered.
+    pub(crate) fn link_death(&self, handle: u32, owner: usize) -> Result<()> {
+        let mut registry = self.death_lock();
+        if registry.link(handle, owner) == Some(DeathCmd::Request) {
+            // Flushed under the lock: a clear written after it must not overtake it.
+            thread_state::send_death_request(handle)
+                .inspect_err(|_| registry.abort_request(handle))?;
+        }
+        Ok(())
+    }
+
+    /// A proxy's recipient list became empty (unlink, drop or obituary); queues the clear
+    /// when it was the handle's last linked proxy. A failed write stays counted in the
+    /// ledger, so the handle's pins outlive the registration anyway.
+    pub(crate) fn unlink_death(&self, handle: u32, owner: usize) -> Result<()> {
+        let mut registry = self.death_lock();
+        match registry.unlink(handle, owner) {
+            Some(DeathCmd::Clear) => thread_state::clear_death_notification(handle),
+            _ => Ok(()),
+        }
     }
 
     /// Counts a `BC_CLEAR_FREEZE_NOTIFICATION` about to go out, as [`Self::note_death_clear`].

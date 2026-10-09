@@ -2310,36 +2310,15 @@ pub(crate) fn join_thread_pool(is_main: bool) -> Result<()> {
     })
 }
 
-pub(crate) fn request_death_notification(handle: u32) -> Result<()> {
-    log::trace!("request_death_notification: {handle}");
-    THREAD_STATE.with(|thread_state| -> Result<()> {
-        {
-            let mut state = thread_state.borrow_mut();
-
-            state
-                .out_parcel
-                .write_cmd::<u32>(&(binder::BC_REQUEST_DEATH_NOTIFICATION))?;
-            state.out_parcel.write_cmd::<u32>(&(handle))?;
-            // Android binder calls writePointer(proxy) here, but we just write handle.
-            state
-                .out_parcel
-                .write_cmd::<binder::binder_uintptr_t>(&(handle as _))?;
-        }
-
-        Ok(())
-    })
-}
-
+/// Queues `BC_CLEAR_DEATH_NOTIFICATION`; only `death::DeathRegistry` decides when.
+///
 /// Also counts the clear for the pin ledger, failed or not: the subscription may still be live.
 pub(crate) fn clear_death_notification(handle: u32) -> Result<()> {
     log::trace!("clear_death_notification: {handle}");
     // Counted before the driver can see it, so its done never arrives first.
     ProcessState::note_death_clear(handle);
-    let write = |out: &mut CommandStream| -> Result<()> {
-        out.write_cmd::<u32>(&(binder::BC_CLEAR_DEATH_NOTIFICATION))?;
-        out.write_cmd::<u32>(&(handle))?;
-        // Android binder calls writePointer(proxy) here, but we just write handle.
-        out.write_cmd::<binder::binder_uintptr_t>(&(handle as _))
+    let write = |out: &mut CommandStream| {
+        write_handle_cookie(out, binder::BC_CLEAR_DEATH_NOTIFICATION, handle)
     };
     // `try_with`: a `ProxyHandle` dropped at thread exit calls this after teardown.
     match THREAD_STATE.try_with(|thread_state| write(&mut thread_state.borrow_mut().out_parcel)) {
@@ -2348,22 +2327,22 @@ pub(crate) fn clear_death_notification(handle: u32) -> Result<()> {
     }
 }
 
-/// `binder_handle_cookie` with cookie = handle, as the death commands (`freeze` module doc).
-fn write_freeze_handle_cookie(out: &mut CommandStream, cmd: u32, handle: u32) -> Result<()> {
+/// `binder_handle_cookie` with cookie = handle; AOSP writes the `BpBinder` pointer instead.
+fn write_handle_cookie(out: &mut CommandStream, cmd: u32, handle: u32) -> Result<()> {
     out.write_cmd::<u32>(&cmd)?;
     out.write_cmd::<u32>(&handle)?;
     out.write_cmd::<binder::binder_uintptr_t>(&(handle as _))
 }
 
-/// Writes and flushes `BC_REQUEST_FREEZE_NOTIFICATION`; `Err` only if the kernel never got it.
+/// Writes and flushes a death or freeze request; `Err` only if the kernel never got it.
 ///
 /// The caller marks the handle registered on `Ok`, after which another thread
 /// may clear it, so a request left queued by a failed flush would let that
-/// clear reach the kernel first and be refused. A flush that fails before the
-/// driver consumed anything (same epoch) rewinds the request instead; one the
-/// driver consumed counts as sent. Only `freeze::FreezeRegistry` decides when.
-pub(crate) fn send_freeze_request(handle: u32) -> Result<()> {
-    log::trace!("send_freeze_request: {handle}");
+/// clear reach the kernel first (`death` / `freeze` module docs). A flush that
+/// fails before the driver consumed anything (same epoch) rewinds the request
+/// instead; one the driver consumed counts as sent.
+fn send_request_flushed(cmd: u32, handle: u32) -> Result<()> {
+    log::trace!("{}: {handle}", command_to_str(cmd));
     // `try_with`: a call from a TLS destructor must fail, not panic under the registry lock.
     THREAD_STATE
         .try_with(|thread_state| -> Result<()> {
@@ -2376,11 +2355,8 @@ pub(crate) fn send_freeze_request(handle: u32) -> Result<()> {
                 }
                 rewound
             };
-            let written = write_freeze_handle_cookie(
-                &mut thread_state.borrow_mut().out_parcel,
-                binder::BC_REQUEST_FREEZE_NOTIFICATION,
-                handle,
-            );
+            let written =
+                write_handle_cookie(&mut thread_state.borrow_mut().out_parcel, cmd, handle);
             if let Err(err) = written {
                 rewind();
                 return Err(err);
@@ -2389,12 +2365,22 @@ pub(crate) fn send_freeze_request(handle: u32) -> Result<()> {
                 Ok(()) => Ok(()),
                 Err(err) if rewind() => Err(err),
                 Err(err) => {
-                    log::warn!("flush after BC_REQUEST_FREEZE_NOTIFICATION({handle}): {err:?}");
+                    log::warn!("flush after {}({handle}): {err:?}", command_to_str(cmd));
                     Ok(())
                 }
             }
         })
         .unwrap_or(Err(StatusCode::InvalidOperation))
+}
+
+/// `BC_REQUEST_DEATH_NOTIFICATION`, flushed; only `death::DeathRegistry` decides when.
+pub(crate) fn send_death_request(handle: u32) -> Result<()> {
+    send_request_flushed(binder::BC_REQUEST_DEATH_NOTIFICATION, handle)
+}
+
+/// `BC_REQUEST_FREEZE_NOTIFICATION`, flushed; only `freeze::FreezeRegistry` decides when.
+pub(crate) fn send_freeze_request(handle: u32) -> Result<()> {
+    send_request_flushed(binder::BC_REQUEST_FREEZE_NOTIFICATION, handle)
 }
 
 /// [`flush_commands`] unless this thread's state is torn down (a TLS destructor), where
@@ -2411,7 +2397,7 @@ pub(crate) fn clear_freeze_notification(handle: u32) -> Result<()> {
     log::trace!("clear_freeze_notification: {handle}");
     ProcessState::note_freeze_clear(handle);
     let write = |out: &mut CommandStream| {
-        write_freeze_handle_cookie(out, binder::BC_CLEAR_FREEZE_NOTIFICATION, handle)
+        write_handle_cookie(out, binder::BC_CLEAR_FREEZE_NOTIFICATION, handle)
     };
     // `try_with`: a `ProxyHandle` dropped at thread exit calls this after teardown.
     match THREAD_STATE.try_with(|thread_state| write(&mut thread_state.borrow_mut().out_parcel)) {

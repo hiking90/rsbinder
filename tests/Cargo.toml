@@ -94,6 +94,12 @@ name = "reconnect_hub_restart"
 path = "tests/reconnect_hub_restart.rs"
 required-features = ["rpc"]
 
+# A death link must survive the previous proxy's late clear (plan 4-3 §10-4).
+[[test]]
+name = "death_reorder_kernel"
+path = "tests/death_reorder_kernel.rs"
+required-features = ["rpc"]
+
 # Plan 4-3 Phase D: freeze notifications, observing a `reconnect_service`.
 [[test]]
 name = "freeze_kernel"

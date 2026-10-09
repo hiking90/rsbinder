@@ -254,6 +254,8 @@ pub mod bridge;
 mod command_stream;
 // Error types; private, `Result` and `StatusCode` are re-exported at the crate root.
 mod error;
+// Per-handle death-registration bookkeeping behind `IBinder::link_to_death`.
+mod death;
 // `ParcelFileDescriptor`, re-exported at the crate root.
 mod file_descriptor;
 // Per-handle freeze-notification bookkeeping behind `IBinder::add_frozen_state_change_callback`.
