@@ -24,7 +24,8 @@
 //! backend-dependent (macOS discards the kernel queue, Linux keeps it, `mem` keeps it like
 //! Linux by design, a transport may hold a buffered leftover). The same claim tends to be restated
 //! in several places and corrected in one, so the test pins every `.rs` under `src/` plus
-//! `CHANGELOG.md`: a restatement trips the build rather than the next reviewer. Rephrase,
+//! `CHANGELOG.md` and the book's migration guides (`book/src/migrating-*.md`): a restatement
+//! trips the build rather than the next reviewer. Rephrase,
 //! don't route around — if a phrase is needed to state something *true*, narrow the phrase in
 //! the test.
 //!
@@ -124,7 +125,7 @@ fn visit<F: FnMut(&Path, &str)>(dir: &Path, f: &mut F) {
     }
 }
 
-/// Rejects prose in `src/` and `CHANGELOG.md` the code contradicts; see module doc "Refuted prose".
+/// Rejects prose in `src/`, CHANGELOG and migration guides the code contradicts; see module doc.
 #[test]
 fn prose_does_not_restate_refuted_shutdown_claims() {
     const FORBIDDEN: &[&str] = &[
@@ -171,6 +172,17 @@ fn prose_does_not_restate_refuted_shutdown_claims() {
     let changelog = manifest.join("../CHANGELOG.md");
     if let Ok(content) = fs::read_to_string(&changelog) {
         scan(&changelog, &content);
+    }
+    if let Ok(entries) = fs::read_dir(manifest.join("../book/src")) {
+        for path in entries.flatten().map(|e| e.path()) {
+            let is_guide = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("migrating-") && n.ends_with(".md"));
+            if let (true, Ok(content)) = (is_guide, fs::read_to_string(&path)) {
+                scan(&path, &content);
+            }
+        }
     }
     assert!(
         hits.is_empty(),
