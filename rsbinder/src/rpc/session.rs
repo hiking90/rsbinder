@@ -568,7 +568,9 @@
 use std::cell::RefCell;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -2024,6 +2026,8 @@ pub(crate) struct SharedSession {
     fd_unix_supported: AtomicBool,
     /// `GET_SESSION_ID`'s random id: AOSP `kSessionIdBytes == 32`, libbinder refuses other sizes.
     rpc_session_id: RpcSessionId,
+    /// r34 `GET_SESSION_ID`: the `int32` an `RpcServer` minted, `RPC_SESSION_ID_NEW` if none.
+    r34_session_id: AtomicI32,
     /// Client role: the server-minted id from the first `get_session_id`; attaches must echo it.
     server_session_id: Mutex<Option<Vec<u8>>>,
     /// `Live(n)`/`Dying`/`Dead`; `Dying` reads as torn down before the obituaries (module doc).
@@ -3004,6 +3008,11 @@ impl RpcSessionInner {
                 .lock()
                 .expect("incoming_threads poisoned"),
         )
+    }
+
+    /// The r34 id an `RpcServer` minted for this session, answered by `GET_SESSION_ID`.
+    pub(crate) fn set_r34_session_id(&self, id: i32) {
+        self.shared.r34_session_id.store(id, Ordering::SeqCst);
     }
 
     /// AOSP `setMaxIncomingThreads`: the `GET_MAX_THREADS` advertise and the `Incoming` slot cap.
@@ -4073,9 +4082,19 @@ impl RpcSessionInner {
                 self.send_reply(0, reply.rpc_data_bytes(), &[], &[])
             }
             Some(SpecialTransaction::GetSessionId) => {
-                // AOSP `writeByteVector(mId)` = the `&[u8]` path; a bare `i32` is BAD_VALUE there.
                 let mut reply = Parcel::new();
-                reply.write(&self.shared.rpc_session_id.as_bytes()[..])?;
+                if self.profile.wire_version().is_some() {
+                    // AOSP `writeByteVector(mId)` = the `&[u8]` path; a bare `i32` is BAD_VALUE.
+                    reply.write(&self.shared.rpc_session_id.as_bytes()[..])?;
+                } else {
+                    // android-12 `writeInt32(id)`, an id only an `RpcServer` mints.
+                    let id = self.shared.r34_session_id.load(Ordering::SeqCst);
+                    if id == RPC_SESSION_ID_NEW {
+                        let status = StatusCode::UnknownTransaction.into();
+                        return self.send_reply(status, &[], &[], &[]);
+                    }
+                    reply.write(&id)?;
+                }
                 self.send_reply(0, reply.rpc_data_bytes(), &[], &[])
             }
             // android-13+ fixes the mode in the header (AOSP); a flip races other slots' reads.
@@ -4257,6 +4276,7 @@ impl RpcSession {
             fd_mode: AtomicU8::new(FD_MODE_NONE),
             fd_unix_supported: AtomicBool::new(false),
             rpc_session_id: gen_rpc_session_id()?,
+            r34_session_id: AtomicI32::new(RPC_SESSION_ID_NEW),
             server_session_id: Mutex::new(None),
             lifecycle: SessionLifecycle::new(),
             ended_locally: AtomicBool::new(false),
@@ -4643,6 +4663,11 @@ impl RpcSession {
     /// A client session keeps the first id it reads: an attach on it
     /// must echo exactly that id (AOSP attaches with its own `mId`), and
     /// one that has not read it yet makes this round trip itself.
+    ///
+    /// On the r34 wire the id is android-12's `int32` (`writeInt32(id)`),
+    /// returned as its 4 little-endian bytes. Only a session an
+    /// [`RpcServer`](super::RpcServer) accepted has one; any other r34 peer
+    /// answers [`StatusCode::UnknownTransaction`].
     pub fn get_session_id(&self) -> Result<Vec<u8>> {
         let data = Parcel::new();
         let mut reply = self
@@ -4655,7 +4680,11 @@ impl RpcSession {
             )?
             .ok_or(StatusCode::UnexpectedNull)?;
         // Keep the read error: BadValue/BadType on a malformed vector differs from a null reply.
-        let id = reply.read::<Vec<u8>>()?;
+        let id = if self.inner.profile.wire_version().is_some() {
+            reply.read::<Vec<u8>>()?
+        } else {
+            reply.read::<i32>()?.to_le_bytes().to_vec()
+        };
         if self.inner.shared.space() == AddressSpace::Initiator {
             let mut kept = self.server_id_lock();
             if kept.is_none() {
@@ -7522,6 +7551,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Only an `RpcServer` mints an r34 id, so a bare acceptor answers `GET_SESSION_ID` as an
+    /// unknown transaction rather than with an id no connection could join.
+    #[test]
+    fn a_bare_r34_acceptor_has_no_session_id() {
+        use super::super::transport::MemTransport;
+        let (a, b) = MemTransport::pair();
+        let server = RpcSession::new(Box::new(a), AddressSpace::Acceptor).expect("server");
+        let serving = std::thread::spawn(move || server.serve_blocking());
+        let client = RpcSession::new(Box::new(b), AddressSpace::Initiator).expect("client");
+        client.set_timeout(Some(Duration::from_secs(5)));
+        assert_eq!(client.get_session_id(), Err(StatusCode::UnknownTransaction));
+        client.close_session();
+        assert!(
+            serving.join().expect("serve").is_clean(),
+            "the client closed"
+        );
     }
 
     /// A preamble other than `-1` asks to join a session a bare acceptor does not have; a

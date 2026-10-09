@@ -44,7 +44,10 @@ This changelog starts at 0.9.0. For earlier releases, see the
   binder in an r34 parcel, a null one included, is now followed by its
   stability as android-12 writes it, a `Category` (`0x0c000001` for System,
   `0x00000001` for null) whatever the host's SDK; a null binder with a
-  declared level or a `Category` of version 0 is refused with `BadType`. A custom
+  declared level or a `Category` of version 0 is refused with `BadType`.
+  `GET_SESSION_ID` on r34 answers android-12's `int32`, so
+  `RpcSession::get_session_id` returns 4 bytes there (was 32); a session not
+  accepted by an `RpcServer` has no id and answers `UnknownTransaction`. A custom
   `RpcTransport` that implements only `send_frame` / `recv_frame` can no
   longer carry any session: `RpcSession::new` as a client fails with
   `RpcError::Protocol`, as the android-13+ profile always did; implement
@@ -567,6 +570,14 @@ This changelog starts at 0.9.0. For earlier releases, see the
   connection. Kernel binder and every RPC transport; works with the root
   object of a libbinder `RpcServer`. See the book's "Reconnecting to a
   Service".
+- **An r34 `RpcServer` serves android-12 libbinder's multi-connection
+  clients.** It mints a random `int32` id for each new session and admits
+  the client's further connections that write it, up to `set_max_threads`
+  in all, each served as its own connection of that session, so calls on
+  different connections run at once. A local connection joins only from the
+  founding connection's uid (rsbinder's own check; android-12's ids count
+  from 1). Refusals count in `rejected_unknown_id_count`, joins in
+  `attached_count`.
 - **`RpcSession::is_ended`**: whether a session has ended. After a failed
   call this, not the status code, says whether to reconnect.
 - **`rpc::transport::MemTransport` carries a raw byte stream**:

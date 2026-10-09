@@ -109,6 +109,35 @@
 //! `RpcSessionId` newtype to mark the 32 bytes as an attach capability;
 //! public APIs keep `&[u8]` / `[u8; 32]`.
 //!
+//! `r34_sessions` is the same registry for the r34 wire, keyed by
+//! android-12's `int32` id (android-12.0.0_r34 `RpcServer::establishConnection`,
+//! `RpcSession::setupSocketClient`). A connection's preamble `-1` founds a
+//! session; the server mints its id and registers it before serving, so the
+//! client's `GET_SESSION_ID` (answered with `writeInt32`) can be followed by
+//! `maxThreads - 1` connections that write that id. Each such connection is
+//! admitted as above (`add_incoming_slot_capped`, the founding slot counted
+//! against `max_threads`) when:
+//!
+//! - the id names a live session and the server is not shutting down;
+//! - the session has fewer than `max_threads` connections, and the new one
+//!   is of the founding connection's transport kind;
+//! - **rsbinder only:** a `PeerIdentity::Local` connection has the founding
+//!   connection's uid. AOSP 12 checks nothing here, and its ids count up
+//!   from 1 (b/183988761); rsbinder's are random, non-negative and at least
+//!   `0x100`, and the uid check keeps another local process from reaching
+//!   the objects a session's client was handed even if it learns one.
+//!
+//! A joined connection serves with no read or write deadline: AOSP 12 sends
+//! on it only when another call is in flight, so it may idle indefinitely.
+//! Any one connection's end ends the whole session, as on every wire
+//! (`RpcSession::serve_blocking`); android-12 ends a server session only
+//! with its last connection (`RpcSession::removeServerConnection`). An
+//! android-12 client opens and closes its connections together, so the
+//! difference shows only when one of them fails alone.
+//! Every refusal closes the connection and counts in
+//! `rejected_unknown_id_count`; a successful join counts in
+//! `attached_count`.
+//!
 //! # Termination
 //!
 //! `terminating` is raised only by `terminate`, and stored before it takes
@@ -360,6 +389,12 @@ impl Remotable for ServiceDirectory {
 /// `true` admits the peer; `Arc` so it is cloned out of the lock and called lock-free.
 type Authorizer = Arc<dyn Fn(&PeerIdentity) -> bool + Send + Sync>;
 
+/// An r34 registry entry: the founding inner, and the peer a joining connection must match.
+struct R34Session {
+    inner: std::sync::Weak<RpcSessionInner>,
+    founder: PeerIdentity,
+}
+
 /// An RPC server. Backend is chosen by the constructor:
 /// [`setup_unix_server`](RpcServer::setup_unix_server) (UDS, default) or
 /// `setup_vsock_server` (Linux/Android only,
@@ -396,6 +431,8 @@ pub struct RpcServer {
     attach_shutdown_probe: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Id → founding inner (AOSP `RpcServer::mSessions`); see module doc "Session registry".
     sessions: Mutex<HashMap<RpcSessionId, std::sync::Weak<RpcSessionInner>>>,
+    /// r34 `int32` id → founding inner and its peer; see module doc "Session registry".
+    r34_sessions: Mutex<HashMap<i32, R34Session>>,
     /// Mints, attaches and refusals for the `*_count` getters; atomics off the transaction path.
     session_registered: AtomicUsize,
     attached_count: AtomicUsize,
@@ -587,6 +624,7 @@ impl RpcServer {
             authorizer: Mutex::new(None),
             attach_shutdown_probe: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
+            r34_sessions: Mutex::new(HashMap::new()),
             session_registered: AtomicUsize::new(0),
             attached_count: AtomicUsize::new(0),
             rejected_unknown_id: AtomicUsize::new(0),
@@ -1197,6 +1235,52 @@ impl RpcServer {
         self.session_registered.fetch_add(1, Ordering::SeqCst);
     }
 
+    /// Mint an r34 id for a new session and register it; see module doc "Session registry".
+    ///
+    /// AOSP 12 counts ids up from 1 (`++mSessionIdCounter`). The client only echoes the id back,
+    /// so its value is free: a random one is not guessed by another process as a counter is, and
+    /// skipping `0..0x100` keeps an android-13+ client's `RpcConnectionHeader.version`, which
+    /// arrives where the id would, from naming a live session.
+    fn register_r34_session(
+        &self,
+        inner: &Arc<RpcSessionInner>,
+        founder: PeerIdentity,
+    ) -> RpcResult<i32> {
+        let mut map = self.r34_sessions.lock().expect("r34_sessions poisoned");
+        map.retain(|_, s| s.inner.strong_count() > 0);
+        let id = loop {
+            let mut bytes = [0u8; 4];
+            getrandom::fill(&mut bytes).map_err(|e| {
+                super::RpcError::Io(std::io::Error::other(format!(
+                    "CSPRNG getrandom failed for an r34 session id: {e}"
+                )))
+            })?;
+            // Non-negative, so never `RPC_SESSION_ID_NEW` (-1).
+            let id = i32::from_le_bytes(bytes) & i32::MAX;
+            if id >= 0x100 && !map.contains_key(&id) {
+                break id;
+            }
+        };
+        map.insert(
+            id,
+            R34Session {
+                inner: Arc::downgrade(inner),
+                founder,
+            },
+        );
+        drop(map);
+        inner.set_r34_session_id(id);
+        self.session_registered.fetch_add(1, Ordering::SeqCst);
+        Ok(id)
+    }
+
+    /// The live session an r34 joining connection names, with its founding peer.
+    fn resolve_r34_session(&self, id: i32) -> Option<(Arc<RpcSessionInner>, PeerIdentity)> {
+        let map = self.r34_sessions.lock().expect("r34_sessions poisoned");
+        let entry = map.get(&id)?;
+        Some((entry.inner.upgrade()?, entry.founder.clone()))
+    }
+
     /// Echoed id → live founding inner; `None` for a non-32-byte, unknown or stale id.
     fn resolve_session(&self, id: &[u8]) -> Option<Arc<RpcSessionInner>> {
         let key = RpcSessionId::try_from_slice(id)?;
@@ -1207,8 +1291,9 @@ impl RpcServer {
             .and_then(std::sync::Weak::upgrade)
     }
 
-    /// Observability counter: new-session ids registered. Every android-13+
-    /// session counts here, including the default (empty-id) flow.
+    /// Observability counter: new-session ids registered. Every session
+    /// counts here, android-13+ (including the default empty-id flow) and
+    /// r34 (preamble `-1`).
     pub fn session_registered_count(&self) -> usize {
         self.session_registered.load(Ordering::SeqCst)
     }
@@ -1225,11 +1310,11 @@ impl RpcServer {
     /// this server's callback budget also raises it. Stays zero on the
     /// empty-id flow.
     ///
-    /// On the r34 wire it counts connections whose `int32` session-id
-    /// preamble is not `-1` (a new session). The first word of an
-    /// android-13+ client's `RpcConnectionHeader` (its version) and of a
-    /// length-prefixed frame from an rsbinder before 0.12.0 both read as
-    /// such an id.
+    /// On the r34 wire it counts refused joins: a preamble id that names no
+    /// live session, or a join refused as module doc "Session registry"
+    /// lists. The first word of an android-13+ client's
+    /// `RpcConnectionHeader` (its version) and of a length-prefixed frame
+    /// from an rsbinder before 0.12.0 both read as an unknown id.
     pub fn rejected_unknown_id_count(&self) -> usize {
         self.rejected_unknown_id.load(Ordering::SeqCst)
     }
@@ -1601,14 +1686,7 @@ impl RpcServer {
                 );
                 match id {
                     Ok(super::address::RPC_SESSION_ID_NEW) => {}
-                    Ok(id) => {
-                        server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
-                        log::warn!(
-                            "RPC r34: client asked to join unknown session id {id}; \
-                             rejecting connection"
-                        );
-                        return;
-                    }
+                    Ok(id) => return Self::join_r34_session(&server, id, transport),
                     Err(e) => {
                         log::debug!("RPC r34: no session-id preamble: {e:?}");
                         return;
@@ -1618,6 +1696,7 @@ impl RpcServer {
                 if let Err(e) = transport.set_write_timeout(None) {
                     log::debug!("RPC r34: failed to lift handshake write deadline: {e:?}");
                 }
+                let founder = transport.peer_identity();
                 let session = match server.make_session(transport) {
                     Ok(s) => s,
                     Err(e) => {
@@ -1625,6 +1704,12 @@ impl RpcServer {
                         return;
                     }
                 };
+                // Before the serve loop: a client joins only after `GET_SESSION_ID` answered.
+                if let Err(e) = server.register_r34_session(&session.inner_arc(), founder) {
+                    log::warn!("RPC r34: cannot mint a session id: {e:?}");
+                    session.close_session();
+                    return;
+                }
                 if server.minted_after_terminate(&session) {
                     return;
                 }
@@ -1634,6 +1719,63 @@ impl RpcServer {
                     .log("RPC session ended");
             }
         }
+    }
+
+    /// AOSP 12 `establishConnection` for an id other than `-1`: one more connection of the
+    /// session that id names, served as its own slot; see module doc "Session registry".
+    fn join_r34_session(server: &Arc<Self>, id: i32, transport: Box<dyn RpcTransport>) {
+        let refuse = |why: &str| {
+            server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
+            log::warn!("RPC r34: connection asking to join session {id} refused: {why}");
+        };
+        let Some((inner, founder)) = server.resolve_r34_session(id) else {
+            // An android-13+ client's `RpcConnectionHeader` opens with its version where r34 has the id.
+            if u32::try_from(id).is_ok_and(super::wire_android13::is_supported_protocol_version) {
+                log::warn!(
+                    "RPC r34: preamble {id} reads as an android-13+ connection header; \
+                     an android-13+ client needs `RpcServer::set_android13plus`"
+                );
+            }
+            return refuse("no live session has that id");
+        };
+        if server.shutdown.load(Ordering::SeqCst) {
+            return refuse("the server is shutting down");
+        }
+        // Not in AOSP 12, whose id a counter makes guessable (b/183988761): another local
+        // process joining would reach every object the session's client was handed.
+        if let PeerIdentity::Local { uid, .. } = transport.peer_identity() {
+            if !matches!(founder, PeerIdentity::Local { uid: founding, .. } if founding == uid) {
+                return refuse("its peer is not the founding connection's uid");
+            }
+        }
+        // AOSP 12 uses a joined connection only for concurrent calls, so it may sit idle.
+        for lifted in [
+            transport.set_read_timeout(None),
+            transport.set_write_timeout(None),
+        ] {
+            if let Err(e) = lifted {
+                log::debug!("RPC r34: failed to lift a joined connection's deadline: {e:?}");
+            }
+        }
+        // Founding slot included: AOSP 12 opens `maxThreads` connections in all.
+        let cap = inner.max_threads_value() as usize;
+        let session = RpcSession::wrap_inner(inner);
+        let slot_id = match session.add_incoming_slot_capped(transport, cap) {
+            Ok(slot_id) => slot_id,
+            Err(StatusCode::FailedTransaction) => {
+                return refuse(&format!(
+                    "the session has its max_threads={cap} connections"
+                ))
+            }
+            Err(StatusCode::BadType) => {
+                return refuse("its transport differs from the founding connection's")
+            }
+            Err(e) => return refuse(&format!("the session ended ({e:?})")),
+        };
+        server.attached_count.fetch_add(1, Ordering::SeqCst);
+        session
+            .serve_blocking_on(slot_id)
+            .log("RPC r34 joined connection ended");
     }
 
     /// Run the accept loop until [`RpcServer::stop_accepting`]. Each accepted
