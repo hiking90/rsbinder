@@ -20,7 +20,7 @@ scripts/local_gate.sh stage3 --only fmq_interop,stream_interop
 | --- | --- | --- |
 | `hermetic` | every step of `.github/workflows/build.yml`: fmt, clippy, rustdoc, MSRV, all hermetic test targets, big-endian (s390x), public API goldens, Android builds | nothing beyond Rust; `cross` + docker, the pinned nightly + `cargo-public-api`, `cargo-semver-checks`, `cargo-ndk` enable their steps |
 | `kernel` | the Linux job of `integration-test.yml` (unit tests with a live binder, the `tests` suite sync/async, the `#[ignore]`d kernel tests one by one), `tests/scripts/run_*_ac.sh`, `run_d8b_register.sh`, vsock loopback, the libfmq host peer | a writable `/dev/binderfs/binder` (`sudo target/debug/rsb_device binder`), no `rsb_hub` already running; `vsock_loopback` and the AOSP checkout enable their steps |
-| `stage3` | the interop scripts (`example-hello/cpp/run_*.sh`, `run_stream_ac.sh --adb`) against the real servicemanager, libbinder and libfmq | one booted rootable device or emulator (`-s SERIAL` otherwise), `cargo-ndk`, `ANDROID_NDK_HOME`, the AOSP checkout at `$AOSP` for the libfmq/libbinder header builds |
+| `stage3` | the interop scripts (`example-hello/cpp/run_*.sh`, `run_stream_ac.sh --adb`, `run_stream_rpc_selinux_stage3.sh`) against the real servicemanager, libbinder and libfmq | one booted rootable device or emulator (`-s SERIAL` otherwise), `cargo-ndk`, `ANDROID_NDK_HOME`, the AOSP checkout at `$AOSP` for the libfmq/libbinder header builds |
 
 Whatever a tier cannot run on the machine is listed as `SKIP` with what
 it needs; the exit status is non-zero when a step fails, and each step's

@@ -407,6 +407,7 @@ STAGE3=(
     "stream_interop|33|-|aosp"
     "stream_rpc_interop|34|-|aosp"
     "stream_ac|33|-|"
+    "stream_rpc_selinux_stage3|33|-|"
     "typed_error_interop|29|-|"
     "update_txn_interop|31|-|"
     "work_source_interop|29|-|"
@@ -453,6 +454,7 @@ stage3_selected() {
 stage3_script() {
     case "$1" in
         stream_ac) echo tests/scripts/run_stream_ac.sh ;;
+        stream_rpc_selinux_stage3) echo tests/scripts/run_stream_rpc_selinux_stage3.sh ;;
         *) echo "example-hello/cpp/run_$1.sh" ;;
     esac
 }
@@ -533,10 +535,16 @@ tier_stage3() {
     if grep -qx lazy_service_stage3 <<<"$(printf '%s\n' "${queue[@]}")"; then
         run "cargo ndk build example-hello ($triple)" cargo ndk -t "$triple" --platform 29 build -p example-hello --bins
     fi
-    if grep -qx stream_ac <<<"$(printf '%s\n' "${queue[@]}")"; then
+    local ndk_api=$((sdk < 35 ? sdk : 35))
+    if grep -qx stream_rpc_selinux_stage3 <<<"$(printf '%s\n' "${queue[@]}")"; then
+        # One `rpc` build of stream_probe serves stream_ac as well.
+        run "cargo ndk build stream_probe, rpc ($triple)" cargo ndk -t "$triple" \
+            --platform "$ndk_api" build -p tests --features rpc --bin stream_probe
+        run "cargo ndk build stream_rpc test ($triple)" cargo ndk -t "$triple" \
+            --platform "$ndk_api" test -p tests --features rpc --test stream_rpc --no-run
+    elif grep -qx stream_ac <<<"$(printf '%s\n' "${queue[@]}")"; then
         run "cargo ndk build stream_probe ($triple)" cargo ndk -t "$triple" \
-            --platform "$((sdk < 35 ? sdk : 35))" \
-            build -p tests --bin stream_probe
+            --platform "$ndk_api" build -p tests --bin stream_probe
     fi
 
     trap 'stage3_restore; stop_service; stop_hub' EXIT
@@ -547,6 +555,7 @@ tier_stage3() {
         case "$name" in
             lazy_service_stage3) run "run_$name" timeout 1800 bash "$script" "$SERIAL" ;;
             stream_ac) run "run_stream_ac --adb" timeout 1800 bash "$script" --adb -s "$SERIAL" --target "$triple" ;;
+            stream_rpc_selinux_stage3) run "run_$name" timeout 1800 bash "$script" -s "$SERIAL" --target "$triple" ;;
             *) run "run_$name" timeout 1800 bash "$script" -s "$SERIAL" ;;
         esac
     done
