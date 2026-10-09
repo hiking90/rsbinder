@@ -572,7 +572,7 @@ use std::time::{Duration, Instant};
 use super::end::{EndReason, EndedBy, ServeStep, SessionEnd};
 use super::fd_mode::FileDescriptorTransportMode;
 use super::lifecycle::SessionLifecycle;
-use crate::binder::{SIBinder, FLAG_ONEWAY, INTERFACE_TRANSACTION, PING_TRANSACTION};
+use crate::binder::{SIBinder, Stability, FLAG_ONEWAY, INTERFACE_TRANSACTION, PING_TRANSACTION};
 use crate::error::{Result, StatusCode};
 use crate::parcel::{CopiedBinders, Parcel, RpcParcelOps};
 
@@ -1195,6 +1195,35 @@ impl WireProfile {
     /// android-13+: AOSP framing (no `u32` length prefix) over the raw byte channel.
     fn aosp_framing(&self) -> bool {
         matches!(self, WireProfile::Android13Plus(_))
+    }
+
+    /// AOSP `transactInternal` `onBinderLeaving`: the peer pays a transaction's target back.
+    fn counts_transaction_targets(&self) -> bool {
+        matches!(self, WireProfile::Android13Plus(_))
+    }
+
+    /// A twoway's target receipt is paid just before its `REPLY` ("Deferred `DEC_STRONG`").
+    fn pays_target_before_reply(&self) -> bool {
+        matches!(self, WireProfile::Android13Plus(_))
+    }
+
+    /// Body size of a well-formed `DEC_STRONG` (AOSP `processDecStrong` refuses any other).
+    fn dec_strong_body_len(&self) -> usize {
+        match self {
+            WireProfile::R34(_) => RPC_ADDR_LEN,
+            WireProfile::Android13Plus(_) => A13_DEC_STRONG_LEN,
+        }
+    }
+
+    /// Whether every binder, null included, is followed by an `int32` stability (module doc).
+    fn carries_binder_stability(&self) -> bool {
+        matches!(self, WireProfile::Android13Plus(_))
+    }
+
+    /// The stability word after a binder (`None` = null, `UNDECLARED`), if this wire carries one.
+    fn binder_stability_repr(&self, stability: Option<Stability>) -> Option<i32> {
+        self.carries_binder_stability()
+            .then(|| stability.map_or(0, i32::from))
     }
 
     /// The negotiated protocol version; `None` for R34, which has no object table.
@@ -2747,14 +2776,16 @@ impl RpcSessionInner {
         // A `DEC_STRONG` carries no fds; any that came are closed here, as AOSP drops them.
         let (frame, _fds) =
             self.recv_msg_gated(transport, |header| {
-                match control_only_refusal(header, A13_DEC_STRONG_LEN) {
+                match control_only_refusal(header, self.profile.dec_strong_body_len()) {
                     None => Ok(()),
                     Some((status, what)) => refuse(status, what),
                 }
             })?;
         // r34 reads the frame whole: its header is judged here, so the statuses match android-13+.
         if !self.profile.aosp_framing() && frame.len() >= WIRE_HEADER_LEN {
-            if let Some((status, what)) = control_only_refusal(&frame, RPC_ADDR_LEN) {
+            if let Some((status, what)) =
+                control_only_refusal(&frame, self.profile.dec_strong_body_len())
+            {
                 return refuse(status, what);
             }
         }
@@ -3009,9 +3040,9 @@ impl RpcSessionInner {
         match binder {
             None => {
                 parcel.write(&0i32)?;
-                if matches!(self.profile, WireProfile::Android13Plus(_)) {
-                    // AOSP `finishFlattenBinder` follows a null binder too, with `UNDECLARED`.
-                    parcel.write(&0i32)?;
+                // AOSP `finishFlattenBinder` follows a null binder too, with `UNDECLARED`.
+                if let Some(rep) = self.profile.binder_stability_repr(None) {
+                    parcel.write(&rep)?;
                 }
                 Ok(())
             }
@@ -3070,9 +3101,8 @@ impl RpcSessionInner {
                 if self.profile.records_binder_positions() {
                     parcel.rpc_record_object_position(obj_pos);
                 }
-                if matches!(self.profile, WireProfile::Android13Plus(_)) {
-                    // libbinder requires the declared stability: module doc (binders).
-                    let rep: i32 = b.stability().into();
+                // libbinder requires the declared stability: module doc (binders).
+                if let Some(rep) = self.profile.binder_stability_repr(Some(b.stability())) {
                     parcel.write(&rep)?;
                 }
                 // Freeze stability mutation once it crosses IPC, as the kernel path does.
@@ -3088,10 +3118,10 @@ impl RpcSessionInner {
         let obj_pos = parcel.data_position();
         let present: i32 = parcel.read()?;
         if present == 0 {
-            if matches!(self.profile, WireProfile::Android13Plus(_)) {
+            if let Some(undeclared) = self.profile.binder_stability_repr(None) {
                 // AOSP `Stability::setRepr`: a null binder's stability must be `UNDECLARED`.
                 let stability: i32 = parcel.read()?;
-                if stability != 0 {
+                if stability != undeclared {
                     log::error!("RPC: null binder with stability {stability:#x}");
                     return Err(StatusCode::BadType);
                 }
@@ -3103,7 +3133,7 @@ impl RpcSessionInner {
             return Err(StatusCode::BadValue);
         }
         let addr = self.wire_read_binder_addr(parcel)?;
-        if matches!(self.profile, WireProfile::Android13Plus(_)) {
+        if self.profile.carries_binder_stability() {
             // AOSP `finishUnflattenBinder`: the trailing stability `int32`.
             let _stability: i32 = parcel.read()?;
         }
@@ -3395,7 +3425,7 @@ impl RpcSessionInner {
         };
         let transport = conn.transport();
         // AOSP `transactInternal` `onBinderLeaving`: the peer pays the target back (r34 does not).
-        let counts_target = !addr.is_zero() && self.profile.aosp_framing();
+        let counts_target = !addr.is_zero() && self.profile.counts_transaction_targets();
         // AOSP `BinderNode::asyncNumber` (send side, per-remote-addr).
         let async_number = {
             let mut st = self.shared.state.lock().expect("rpc state poisoned");
@@ -3760,7 +3790,7 @@ impl RpcSessionInner {
         let addr = t.address;
         let wire_async = t.async_number;
         // Target receipts this drain resolved (module doc "Deferred `DEC_STRONG`"); not r34's.
-        let counts_targets = self.profile.aosp_framing();
+        let counts_targets = self.profile.counts_transaction_targets();
         let mut owed: u32 = 0;
         let decision = self
             .shared
@@ -3861,7 +3891,7 @@ impl RpcSessionInner {
 
         if !oneway {
             // The target receipt, paid just before the `REPLY`; module doc "Deferred `DEC_STRONG`".
-            if self.profile.aosp_framing() {
+            if self.profile.pays_target_before_reply() {
                 if let Some(slot_id) = self.driving_slot() {
                     self.hold_dec_strong(slot_id, t.address, 1);
                 }
