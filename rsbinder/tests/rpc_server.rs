@@ -2109,9 +2109,12 @@ fn r34_server_answers_an_aosp12_shaped_client() {
     let body_size = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
     let mut body = vec![0u8; body_size];
     s.read_exact(&mut body).expect("reply body");
-    // `RpcWireReply.status`, then the parcel: a non-null binder's type word and address.
+    // `RpcWireReply.status`, then the parcel: a non-null binder's type word, its 32-byte
+    // address and its stability as an android-12 `Category` (System, version 1).
+    assert_eq!(body.len(), 4 + 4 + 32 + 4);
     assert_eq!(body[..4], 0i32.to_le_bytes(), "status OK");
     assert_eq!(body[4..8], 1i32.to_le_bytes(), "a non-null root");
+    assert_eq!(body[40..], 0x0c00_0001i32.to_le_bytes(), "stability");
 }
 
 /// An rsbinder r34 client from before AOSP framing leads with a `u32` frame length, which the

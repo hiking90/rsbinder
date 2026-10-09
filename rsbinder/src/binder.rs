@@ -697,7 +697,10 @@ where
 /// android-13+ and non-Android builds write the raw `Level`: the level value
 /// itself (0/3/12/63) in the low byte, high bytes zero. On Android the encoder
 /// picks by the runtime SDK version (`frameworks/native/libs/binder/include/binder/Stability.h`,
-/// android-11.0.0_r21 through android-14.0.0_r2).
+/// android-11.0.0_r21 through android-14.0.0_r2). That choice is the kernel
+/// path's and the android-13+ RPC wire's: an RPC session on the r34 wire
+/// always writes the android-12 form, since its peer is android-12 libbinder
+/// whatever the host's SDK.
 ///
 /// AOSP-12 declares `Category { uint8_t version; uint8_t reserved[2]; Level level; }`,
 /// builds it with `currentFromLevel` = `{ version: 1, reserved: 0, level }`, and
@@ -736,29 +739,32 @@ impl Stability {
         let required: i32 = required.into();
         (provided & required) == required
     }
+
+    /// AOSP `Stability::Level`: the raw bitmask, `UNDECLARED` (0) for `Local`.
+    pub(crate) const fn level(self) -> i32 {
+        match self {
+            Stability::Local => 0,
+            Stability::Vendor => 0b000011,
+            Stability::System => 0b001100,
+            Stability::Vintf => 0b111111,
+        }
+    }
 }
 
 /// AOSP `Stability::kBinderWireFormatVersion` (`Stability.cpp:31`), stamped into a `Category`.
 const BINDER_WIRE_FORMAT_VERSION: i32 = 1;
 
 /// android-12 `Category::repr()` for a raw `Level`; see `Stability` doc "Wire encoding".
-// Only reachable in the `target_os = "android"` encode branch (and unit tests).
-#[cfg_attr(not(target_os = "android"), allow(dead_code))]
-const fn android12_category_repr(level: i32) -> i32 {
+// The `target_os = "android"` encode branch and the r34 RPC wire, which always speaks it.
+#[cfg_attr(not(any(target_os = "android", feature = "rpc")), allow(dead_code))]
+pub(crate) const fn android12_category_repr(level: i32) -> i32 {
     (level << 24) | BINDER_WIRE_FORMAT_VERSION
 }
 
 // Encoding chosen by SDK version: see the `Stability` rustdoc, "Wire encoding".
 impl From<Stability> for i32 {
     fn from(stability: Stability) -> i32 {
-        use Stability::*;
-
-        let level = match stability {
-            Local => 0,
-            Vendor => 0b000011,
-            System => 0b001100,
-            Vintf => 0b111111,
-        };
+        let level = stability.level();
 
         #[cfg(target_os = "android")]
         {

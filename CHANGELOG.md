@@ -40,7 +40,11 @@ This changelog starts at 0.9.0. For earlier releases, see the
   message as a bare `RpcWireHeader` and its body, with no `u32` length prefix.
   An older server reads the `-1` as a frame length past `MAX_FRAME_LEN`, and a
   0.12.0 server reads an older client's first length as a session id it does
-  not have; both close the connection. Upgrade both ends together. A custom
+  not have; both close the connection. Upgrade both ends together. Every
+  binder in an r34 parcel, a null one included, is now followed by its
+  stability as android-12 writes it, a `Category` (`0x0c000001` for System,
+  `0x00000001` for null) whatever the host's SDK; a null binder with a
+  declared level or a `Category` of version 0 is refused with `BadType`. A custom
   `RpcTransport` that implements only `send_frame` / `recv_frame` can no
   longer carry any session: `RpcSession::new` as a client fails with
   `RpcError::Protocol`, as the android-13+ profile always did; implement
@@ -914,7 +918,11 @@ after 0.12.0. The single-connection one-liners
   stability as the next value. rsbinder now writes and reads it, refuses a
   null binder declaring any other level with `BadType`, as AOSP
   `Stability::setRepr` does, and answers `GET_ROOT` on a server with no root
-  the same way. The r34 wire is unchanged.
+  the same way. A non-null binder's stability is read after the binder has
+  entered, as `finishUnflattenBinder` runs after `onBinderEntering`, so a
+  binder whose stability is short or refused is released, not leaked on the
+  sender. The r34 wire carries the same word in its android-12 form (see
+  *Migrating from 0.11.0*).
 - **`rsbinder-aidl`: a direction followed directly by a comment parses.**
   `void f(in/*c*/ int[] a)` was a syntax error, because `in`, `out` and
   `inout` had to be followed by whitespace; any non-name character now ends

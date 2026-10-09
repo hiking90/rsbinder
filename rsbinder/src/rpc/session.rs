@@ -475,18 +475,24 @@
 //!   AOSP's `bindersInObjectPositions` gate. v0/v1/r34 record no binder
 //!   positions. Interop does not need the check (a lenient decoder still
 //!   round-trips); it hardens v2 conformance.
-//! * On android-13+ a stability `int32` follows the address
-//!   (`finishFlattenBinder` → `Stability::getRepr`). libbinder's
-//!   `finishUnflattenBinder` requires it: without it the short read yields a
-//!   null root. rsbinder sends the binder's declared stability, not a
-//!   hardcoded 0; its default `Stability::System` (`0b001100`, plus
-//!   `0x0c000000` on Android SDK 31/32) is a level libbinder accepts for an
-//!   RPC binder. A null binder carries one too, always `UNDECLARED` (0):
-//!   `flattenBinder` ends in `finishFlattenBinder` either way, and
-//!   `Stability::setRepr` refuses a null binder with any other level
-//!   (`BAD_TYPE`), as rsbinder's read does. The r34 profile omits it on
-//!   both sides, although android-12 writes and reads it as well
-//!   (`Parcel.cpp:198-214`); plan 2-25 Phase 3 adds it.
+//! * A stability `int32` follows every binder, null included
+//!   (`finishFlattenBinder` → `Stability::getRepr`; android-12.0.0_r34
+//!   `Parcel.cpp:198-214`). libbinder's `finishUnflattenBinder` requires it:
+//!   without it the short read yields a null root. rsbinder sends the
+//!   binder's declared stability, not a hardcoded 0; its default
+//!   `Stability::System` is a level libbinder accepts for an RPC binder. A
+//!   null binder's is always `UNDECLARED` (level 0). android-13+ writes the
+//!   bare level (`0b001100` for System, plus `0x0c000000` on Android SDK
+//!   31/32); r34 writes the android-12 `Category`, `version (1) | level << 24`
+//!   (`0x0c000001`, a null binder `0x00000001`), whatever the host.
+//! * Reading it follows AOSP `Stability::setRepr`: a null binder with any
+//!   level but `UNDECLARED` is `BAD_TYPE`, and on r34 so is a `Category` whose
+//!   version is below android-12's `kBinderWireFormatOldest` (1). A non-null
+//!   binder's level is not checked (AOSP also requires VENDOR, SYSTEM or VINTF),
+//!   so a `Stability::Local` binder rsbinder sends is refused by libbinder and
+//!   accepted by rsbinder. The word is read after the binder has entered, as
+//!   `finishUnflattenBinder` runs after `onBinderEntering`: a refused binder is
+//!   dropped, which pays its receipt back.
 //! * A local binder written into a parcel takes one `timesSent` bump
 //!   (`RpcState::on_binder_leaving`), and the parcel owns it while unsent
 //!   (AOSP `mSendState`): `Parcel::drop` hands it back through
@@ -1211,15 +1217,39 @@ impl WireProfile {
         }
     }
 
-    /// Whether every binder, null included, is followed by an `int32` stability (module doc).
-    fn carries_binder_stability(&self) -> bool {
-        matches!(self, WireProfile::Android13Plus(_))
+    /// The `int32` stability written after every binder (`None` = null, `UNDECLARED`).
+    ///
+    /// android-12 writes a `Category` (`version | level << 24`) whatever the host SDK, so r34
+    /// does too; android-13+ writes the bare level.
+    fn binder_stability_repr(&self, stability: Option<Stability>) -> i32 {
+        match self {
+            WireProfile::R34(_) => {
+                crate::binder::android12_category_repr(stability.map_or(0, Stability::level))
+            }
+            WireProfile::Android13Plus(_) => stability.map_or(0, i32::from),
+        }
     }
 
-    /// The stability word after a binder (`None` = null, `UNDECLARED`), if this wire carries one.
-    fn binder_stability_repr(&self, stability: Option<Stability>) -> Option<i32> {
-        self.carries_binder_stability()
-            .then(|| stability.map_or(0, i32::from))
+    /// AOSP `Stability::setRepr` on a received stability word; module doc (binders).
+    fn check_binder_stability(&self, repr: i32, null: bool) -> Result<()> {
+        let level = match self {
+            WireProfile::R34(_) => {
+                // android-12 `kBinderWireFormatOldest` is 1: a `Category` without one is older.
+                let version = repr & 0xff;
+                if version < 1 {
+                    log::error!("RPC: binder stability {repr:#x} has wire format version 0");
+                    return Err(StatusCode::BadType);
+                }
+                (repr >> 24) & 0xff
+            }
+            WireProfile::Android13Plus(_) => repr,
+        };
+        // A null binder's stability must be `UNDECLARED`.
+        if null && level != 0 {
+            log::error!("RPC: null binder with stability {repr:#x}");
+            return Err(StatusCode::BadType);
+        }
+        Ok(())
     }
 
     /// The negotiated protocol version; `None` for R34, which has no object table.
@@ -3013,9 +3043,7 @@ impl RpcSessionInner {
             None => {
                 parcel.write(&0i32)?;
                 // AOSP `finishFlattenBinder` follows a null binder too, with `UNDECLARED`.
-                if let Some(rep) = self.profile.binder_stability_repr(None) {
-                    parcel.write(&rep)?;
-                }
+                parcel.write(&self.profile.binder_stability_repr(None))?;
                 Ok(())
             }
             Some(b) => {
@@ -3074,9 +3102,7 @@ impl RpcSessionInner {
                     parcel.rpc_record_object_position(obj_pos);
                 }
                 // libbinder requires the declared stability: module doc (binders).
-                if let Some(rep) = self.profile.binder_stability_repr(Some(b.stability())) {
-                    parcel.write(&rep)?;
-                }
+                parcel.write(&self.profile.binder_stability_repr(Some(b.stability())))?;
                 // Freeze stability mutation once it crosses IPC, as the kernel path does.
                 b.set_parceled();
                 Ok(())
@@ -3090,14 +3116,9 @@ impl RpcSessionInner {
         let obj_pos = parcel.data_position();
         let present: i32 = parcel.read()?;
         if present == 0 {
-            if let Some(undeclared) = self.profile.binder_stability_repr(None) {
-                // AOSP `Stability::setRepr`: a null binder's stability must be `UNDECLARED`.
-                let stability: i32 = parcel.read()?;
-                if stability != undeclared {
-                    log::error!("RPC: null binder with stability {stability:#x}");
-                    return Err(StatusCode::BadType);
-                }
-            }
+            // AOSP `finishUnflattenBinder` follows a null binder too.
+            let stability: i32 = parcel.read()?;
+            self.profile.check_binder_stability(stability, true)?;
             return Ok(None);
         }
         // v2 strict receive (`bindersInObjectPositions`): module doc "Binders in an RPC parcel".
@@ -3105,24 +3126,30 @@ impl RpcSessionInner {
             return Err(StatusCode::BadValue);
         }
         let addr = self.wire_read_binder_addr(parcel)?;
-        if self.profile.carries_binder_stability() {
-            // AOSP `finishUnflattenBinder`: the trailing stability `int32`.
-            let _stability: i32 = parcel.read()?;
-        }
+        let binder = self.binder_at(parcel, obj_pos, addr)?;
+        // AOSP `finishUnflattenBinder` runs after `onBinderEntering`: a refused binder drops here,
+        // so its receipt is paid as AOSP's `sp` release pays it.
+        let stability: i32 = parcel.read()?;
+        self.profile.check_binder_stability(stability, false)?;
+        Ok(Some(binder))
+    }
+
+    /// The binder a non-null RPC binder at `obj_pos` names: entered once if it arrived here.
+    fn binder_at(&self, parcel: &mut Parcel, obj_pos: usize, addr: RpcAddress) -> Result<SIBinder> {
         // AOSP android-16.0.0_r4 `unflattenBinder`: only a received position enters.
         if !parcel.rpc_received_at(obj_pos) {
-            return self.lookup_binder(addr).map(Some);
+            return self.lookup_binder(addr);
         }
         if let Some((entered, binder)) = parcel.rpc_entered_at(obj_pos) {
             if entered != addr {
                 log::error!("RPC: position {obj_pos} entered {entered:?}, now reads {addr:?}");
                 return Err(StatusCode::BadValue);
             }
-            return Ok(Some(binder));
+            return Ok(binder);
         }
         let binder = self.enter_binder(addr)?;
         parcel.rpc_record_entered(obj_pos, addr, binder.clone());
-        Ok(Some(binder))
+        Ok(binder)
     }
 
     /// AOSP `lookupAddress`, for a binder that did not arrive with its parcel: nothing is owed.
@@ -7429,7 +7456,8 @@ mod tests {
         match R34Codec.decode_message(&reply).expect("decode") {
             WireMessage::Reply(r) => {
                 assert_eq!(r.status, 0);
-                assert_eq!(r.data, 0i32.to_le_bytes());
+                // Null, then `UNDECLARED` as an android-12 `Category`.
+                assert_eq!(r.data, [0, 0, 0, 0, 1, 0, 0, 0]);
             }
             other => panic!("expected a REPLY, got {other:?}"),
         }
@@ -7438,6 +7466,62 @@ mod tests {
             serving.join().expect("serve").reason,
             EndReason::EndOfStream
         );
+    }
+
+    /// An android-12 `GET_ROOT` reply, built by hand: the root binder becomes a proxy and its
+    /// stability is consumed. A `Category` of version 0 is refused after the binder entered, so
+    /// its receipt goes back as a `DEC_STRONG` (AOSP `finishUnflattenBinder` runs after
+    /// `onBinderEntering`).
+    #[test]
+    fn r34_client_reads_an_aosp12_root_reply() {
+        let addr = [0x5a_u8; RPC_ADDR_LEN];
+        for (stability, accepted) in [(0x0c00_0001_i32, true), (0x0c00_0000, false)] {
+            let (session, mut peer) = r34_client_with_raw_peer();
+            session.set_timeout(Some(Duration::from_secs(5)));
+            peer.set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("peer read timeout");
+            let inner = Arc::clone(&session.inner);
+            let call = std::thread::spawn(move || {
+                let mut reply = inner
+                    .client_transact(
+                        RpcAddress::zero(),
+                        SpecialTransaction::GetRoot.code(),
+                        &Parcel::new(),
+                        0,
+                    )?
+                    .ok_or(StatusCode::UnexpectedNull)?;
+                let root = reply.read::<SIBinder>();
+                let at_end = reply.data_position() == reply.data_size();
+                root.map(|_| at_end)
+            });
+            assert_eq!(
+                read_r34_session_preamble(&mut peer).expect("preamble"),
+                RPC_SESSION_ID_NEW
+            );
+            read_aosp_message(&mut peer).expect("GET_ROOT");
+            let mut data = 1i32.to_le_bytes().to_vec();
+            data.extend_from_slice(&addr);
+            data.extend_from_slice(&stability.to_le_bytes());
+            let reply = R34Codec
+                .encode_reply(&WireReply {
+                    status: 0,
+                    data,
+                    ..WireReply::default()
+                })
+                .expect("reply");
+            std::io::Write::write_all(&mut peer, &reply).expect("reply");
+            let got = call.join().expect("caller");
+            if accepted {
+                assert_eq!(got, Ok(true), "a proxy, and the cursor past the stability");
+            } else {
+                assert_eq!(got, Err(StatusCode::BadType), "stability {stability:#x}");
+                let release = read_aosp_message(&mut peer).expect("the refused root's release");
+                match R34Codec.decode_message(&release).expect("decode") {
+                    WireMessage::DecStrong(a, 1) => assert_eq!(*a.as_wire_bytes(), addr),
+                    other => panic!("expected a DEC_STRONG, got {other:?}"),
+                }
+            }
+        }
     }
 
     /// A preamble other than `-1` asks to join a session a bare acceptor does not have; a
@@ -9288,26 +9372,31 @@ mod tests {
         );
     }
 
-    /// android-13+ follows a null binder with an `UNDECLARED` stability, as AOSP `flattenBinder` does.
+    /// A session with no live peer, for parcel-level wire tests.
+    fn parcel_session(profile: WireProfile) -> RpcSession {
+        let (t, _peer) = crate::rpc::transport::MemTransport::pair();
+        RpcSession::with_profile(Box::new(t), AddressSpace::Acceptor, profile).expect("session")
+    }
+
+    fn a13_v2() -> WireProfile {
+        WireProfile::Android13Plus(Android13PlusCodec::with_version(PROTOCOL_V2).expect("v2"))
+    }
+
+    /// Every wire follows a null binder with an `UNDECLARED` stability, as AOSP `flattenBinder`
+    /// does: android-13+ as the bare level, r34 as the android-12 `Category` (`version` 1).
     #[test]
-    fn a_null_binder_carries_its_stability_on_android13() {
-        use crate::rpc::transport::MemTransport;
-        let a13 = || {
-            WireProfile::Android13Plus(Android13PlusCodec::with_version(PROTOCOL_V2).expect("v2"))
-        };
+    fn a_null_binder_carries_its_stability_on_every_wire() {
         for (profile, words) in [
-            (a13(), &[0i32, 0][..]),
-            (WireProfile::R34(R34Codec), &[0][..]),
+            (a13_v2(), [0i32, 0]),
+            (WireProfile::R34(R34Codec), [0, 0x0000_0001]),
         ] {
-            let (t, _peer) = MemTransport::pair();
-            let session =
-                RpcSession::with_profile(Box::new(t), AddressSpace::Acceptor, profile).expect("s");
+            let session = parcel_session(profile);
             let mut p = Parcel::new();
             p.attach_rpc_ops(session.inner.parcel_ops());
             p.write(&None::<SIBinder>).expect("write null");
             assert_eq!(p.data_size(), words.len() * 4);
             p.set_data_position(0);
-            for &w in words {
+            for w in words {
                 assert_eq!(p.read::<i32>().expect("word"), w);
             }
             p.set_data_position(0);
@@ -9318,20 +9407,50 @@ mod tests {
                 "the stability is consumed"
             );
         }
+    }
 
-        // AOSP `Stability::setRepr`: a null binder with a declared level is `BAD_TYPE`.
-        let (t, _peer) = MemTransport::pair();
-        let session =
-            RpcSession::with_profile(Box::new(t), AddressSpace::Acceptor, a13()).expect("s");
+    /// AOSP `Stability::setRepr` on a null binder's stability; android-12 also wants `version >= 1`.
+    #[test]
+    fn a_null_binder_stability_is_checked_as_aosp_does() {
+        for (profile, stability, want) in [
+            (a13_v2(), 0x0c, Err(StatusCode::BadType)),
+            (
+                WireProfile::R34(R34Codec),
+                0x0c00_0001,
+                Err(StatusCode::BadType),
+            ),
+            (WireProfile::R34(R34Codec), 0, Err(StatusCode::BadType)),
+            // Only the level and `kBinderWireFormatOldest` are checked, not the exact version.
+            (WireProfile::R34(R34Codec), 0x0000_0002, Ok(())),
+        ] {
+            let session = parcel_session(profile);
+            let mut p = Parcel::new();
+            p.attach_rpc_ops(session.inner.parcel_ops());
+            p.write(&0i32).expect("present");
+            p.write(&stability).expect("stability");
+            p.set_data_position(0);
+            assert_eq!(
+                p.read::<Option<SIBinder>>().map(|b| assert!(b.is_none())),
+                want,
+                "stability {stability:#x}"
+            );
+        }
+    }
+
+    /// r34 writes a non-null binder as android-12 does: `1`, the 32-byte address, then the
+    /// `Category` of its stability (System: `0x0c000001`).
+    #[test]
+    fn an_r34_binder_is_followed_by_its_android12_category() {
+        let session = parcel_session(WireProfile::R34(R34Codec));
+        let local = crate::Interface::as_binder(&crate::Binder::new(LocalSvc));
         let mut p = Parcel::new();
         p.attach_rpc_ops(session.inner.parcel_ops());
-        p.write(&0i32).expect("present");
-        p.write(&0x0c_i32).expect("stability");
+        p.write(&local).expect("write");
+        assert_eq!(p.data_size(), 4 + RPC_ADDR_LEN + 4);
         p.set_data_position(0);
-        assert_eq!(
-            p.read::<Option<SIBinder>>().err(),
-            Some(StatusCode::BadType)
-        );
+        assert_eq!(p.read::<i32>().expect("present"), 1);
+        p.set_data_position(4 + RPC_ADDR_LEN);
+        assert_eq!(p.read::<i32>().expect("stability"), 0x0c00_0001);
     }
 
     /// One claim at a time: a failed attempt frees the parcel for a retry, a sent one stays sent.
