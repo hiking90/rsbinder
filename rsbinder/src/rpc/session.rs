@@ -484,7 +484,11 @@
 //!   null root. rsbinder sends the binder's declared stability, not a
 //!   hardcoded 0; its default `Stability::System` (`0b001100`, plus
 //!   `0x0c000000` on Android SDK 31/32) is a level libbinder accepts for an
-//!   RPC binder. The r34 profile (rsbinder↔rsbinder) omits it on both sides.
+//!   RPC binder. A null binder carries one too, always `UNDECLARED` (0):
+//!   `flattenBinder` ends in `finishFlattenBinder` either way, and
+//!   `Stability::setRepr` refuses a null binder with any other level
+//!   (`BAD_TYPE`), as rsbinder's read does. The r34 profile
+//!   (rsbinder↔rsbinder) omits it on both sides.
 //! * A local binder written into a parcel takes one `timesSent` bump
 //!   (`RpcState::on_binder_leaving`), and the parcel owns it while unsent
 //!   (AOSP `mSendState`): `Parcel::drop` hands it back through
@@ -3003,7 +3007,14 @@ impl RpcSessionInner {
     /// AOSP `flattenBinder` (RPC branch): `i32` present flag, then the profile's address if set.
     fn write_binder(&self, binder: Option<&SIBinder>, parcel: &mut Parcel) -> Result<()> {
         match binder {
-            None => parcel.write(&0i32),
+            None => {
+                parcel.write(&0i32)?;
+                if matches!(self.profile, WireProfile::Android13Plus(_)) {
+                    // AOSP `finishFlattenBinder` follows a null binder too, with `UNDECLARED`.
+                    parcel.write(&0i32)?;
+                }
+                Ok(())
+            }
             Some(b) => {
                 let addr = if let Some(rp) = (**b).as_any().downcast_ref::<RpcProxy>() {
                     // Another session's address is meaningless here (AOSP `onBinderLeaving`).
@@ -3077,6 +3088,14 @@ impl RpcSessionInner {
         let obj_pos = parcel.data_position();
         let present: i32 = parcel.read()?;
         if present == 0 {
+            if matches!(self.profile, WireProfile::Android13Plus(_)) {
+                // AOSP `Stability::setRepr`: a null binder's stability must be `UNDECLARED`.
+                let stability: i32 = parcel.read()?;
+                if stability != 0 {
+                    log::error!("RPC: null binder with stability {stability:#x}");
+                    return Err(StatusCode::BadType);
+                }
+            }
             return Ok(None);
         }
         // v2 strict receive (`bindersInObjectPositions`): module doc "Binders in an RPC parcel".
@@ -4007,10 +4026,7 @@ impl RpcSessionInner {
                 let mut reply = Parcel::new();
                 reply.attach_rpc_ops(self.parcel_ops());
                 // On any failure below `reply` drops unsent and gives the root's bump back.
-                match &root {
-                    Some(b) => reply.write(b)?,
-                    None => reply.write(&0i32)?,
-                }
+                reply.write(&root)?;
                 // At v2 the root binder's position is in the object table.
                 self.send_reply_parcel(&reply)
             }
@@ -9110,6 +9126,52 @@ mod tests {
             session.local_node_count(),
             0,
             "the unsent parcel's drop gives the bump back"
+        );
+    }
+
+    /// android-13+ follows a null binder with an `UNDECLARED` stability, as AOSP `flattenBinder` does.
+    #[test]
+    fn a_null_binder_carries_its_stability_on_android13() {
+        use crate::rpc::transport::MemTransport;
+        let a13 = || {
+            WireProfile::Android13Plus(Android13PlusCodec::with_version(PROTOCOL_V2).expect("v2"))
+        };
+        for (profile, words) in [
+            (a13(), &[0i32, 0][..]),
+            (WireProfile::R34(R34Codec), &[0][..]),
+        ] {
+            let (t, _peer) = MemTransport::pair();
+            let session =
+                RpcSession::with_profile(Box::new(t), AddressSpace::Acceptor, profile).expect("s");
+            let mut p = Parcel::new();
+            p.attach_rpc_ops(session.inner.parcel_ops());
+            p.write(&None::<SIBinder>).expect("write null");
+            assert_eq!(p.data_size(), words.len() * 4);
+            p.set_data_position(0);
+            for &w in words {
+                assert_eq!(p.read::<i32>().expect("word"), w);
+            }
+            p.set_data_position(0);
+            assert!(p.read::<Option<SIBinder>>().expect("read null").is_none());
+            assert_eq!(
+                p.data_position(),
+                p.data_size(),
+                "the stability is consumed"
+            );
+        }
+
+        // AOSP `Stability::setRepr`: a null binder with a declared level is `BAD_TYPE`.
+        let (t, _peer) = MemTransport::pair();
+        let session =
+            RpcSession::with_profile(Box::new(t), AddressSpace::Acceptor, a13()).expect("s");
+        let mut p = Parcel::new();
+        p.attach_rpc_ops(session.inner.parcel_ops());
+        p.write(&0i32).expect("present");
+        p.write(&0x0c_i32).expect("stability");
+        p.set_data_position(0);
+        assert_eq!(
+            p.read::<Option<SIBinder>>().err(),
+            Some(StatusCode::BadType)
         );
     }
 

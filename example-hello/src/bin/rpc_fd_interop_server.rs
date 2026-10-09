@@ -18,8 +18,13 @@
 //! 3=give_fd()->PFD, 4=new_child()->IBinder,
 //! 5=echo_holder(ParcelableHolder)->ParcelableHolder (relayed undecoded),
 //! 6=node_count()->i32, 7=take_binder(IBinder)->i32,
-//! 8=holder_retry(ParcelableHolder)->i32. No AIDL `Status` header, so the
-//! gate isolates the parcel body.
+//! 8=holder_retry(ParcelableHolder)->i32,
+//! 9=null_binder(null IBinder, i32)->(null IBinder, i32, i32). No AIDL
+//! `Status` header, so the gate isolates the parcel body.
+//!
+//! 9 checks the stability `int32` AOSP writes after a null RPC binder too
+//! (`flattenBinder` → `finishFlattenBinder`, android-13.0.0_r1 onward): a
+//! side that skips it reads the sentinel 4 bytes off.
 //!
 //! 7 and 8 drive the received-binder accounting of plan 2-23: a binder of
 //! ours sent back as an argument (7), and one inside a holder whose decode
@@ -59,6 +64,10 @@ const TX_TAKE_BINDER: TransactionCode = FIRST_CALL_TRANSACTION + 6;
 const TX_HOLDER_RETRY: TransactionCode = FIRST_CALL_TRANSACTION + 7;
 /// Must match the launcher's holder payload name.
 const RETRY_PROBE: &str = "rsbinder.test.RetryProbe";
+/// Reads a null binder then a sentinel `i32`; reply = a null binder, 1 if both read right, the sentinel.
+const TX_NULL_BINDER: TransactionCode = FIRST_CALL_TRANSACTION + 8;
+/// Must match the launcher's sentinel.
+const NULL_SENTINEL: i32 = 0x4e55_4c4c;
 
 /// Reads a binder then two `i32`s; the launcher sends one, so each decode fails past the binder.
 #[derive(Debug, Default)]
@@ -162,6 +171,18 @@ impl Remotable for Interop {
                 let second = holder.get_parcelable::<RetryProbe>();
                 eprintln!("[rsbinder-server] holder_retry: {first:?} then {second:?}");
                 reply.write(&i32::from(first.is_err() && second.is_err()))
+            }
+            TX_NULL_BINDER => {
+                let b: Option<SIBinder> = reader.read()?;
+                let sentinel: i32 = reader.read()?;
+                let ok = b.is_none() && sentinel == NULL_SENTINEL;
+                eprintln!(
+                    "[rsbinder-server] null_binder: none={} sentinel={sentinel:#x}",
+                    b.is_none()
+                );
+                reply.write(&None::<SIBinder>)?;
+                reply.write(&i32::from(ok))?;
+                reply.write(&NULL_SENTINEL)
             }
             _ => {
                 eprintln!("[rsbinder-server] unknown txn {code:#x}");

@@ -42,6 +42,12 @@
 // Each must bring the server's node count back to its base. Prints `REF ...`
 // and `REF_PASS`; the harness also greps logcat for an over-decrement.
 //
+// Null binder, after REF_PASS: AOSP writes a stability `int32` after a null
+// RPC binder too (`flattenBinder` → `finishFlattenBinder`). We send a null
+// binder and a sentinel; the server must read both, and its reply (a null
+// binder, its verdict, the sentinel) must parse here. Prints `NULL ...` and
+// `NULL_PASS`.
+//
 // Build (see run_rpc_fd_interop.sh):
 //   $NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android35-clang++ \
 //       -O2 -Wall -std=c++17 -static-libstdc++ \
@@ -96,6 +102,8 @@ constexpr transaction_code_t TX_NODE_COUNT = FIRST_CALL_TRANSACTION + 5;
 constexpr transaction_code_t TX_TAKE_BINDER = FIRST_CALL_TRANSACTION + 6;
 constexpr transaction_code_t TX_HOLDER_RETRY = FIRST_CALL_TRANSACTION + 7;
 constexpr const char* kRetryProbe = "rsbinder.test.RetryProbe";
+constexpr transaction_code_t TX_NULL_BINDER = FIRST_CALL_TRANSACTION + 8;
+constexpr int32_t kNullSentinel = 0x4e554c4c;
 constexpr int32_t kHolderHead = 0x484f4c44;
 constexpr int32_t kHolderTail = 0x21544c48;
 
@@ -428,6 +436,35 @@ int run_ref_accounting(AIBinder* root, const AIBinder_Class* clazz) {
     return 0;
 }
 
+// The null binder case (file comment); returns 0 on NULL_PASS.
+int run_null_binder(AIBinder* root) {
+    ParcelOwned in, reply;
+    if (AIBinder_prepareTransaction(root, &in.p) != STATUS_OK) return 40;
+    if (AParcel_writeStrongBinder(in.p, nullptr) != STATUS_OK ||
+        AParcel_writeInt32(in.p, kNullSentinel) != STATUS_OK) {
+        return 41;
+    }
+    binder_status_t rc = AIBinder_transact(root, TX_NULL_BINDER, &in.p, &reply.p, 0);
+    in.p = nullptr;
+    AIBinder* got = nullptr;
+    int32_t server_ok = -1, sentinel = 0;
+    binder_status_t rb = rc == STATUS_OK ? AParcel_readStrongBinder(reply.p, &got) : rc;
+    binder_status_t r1 = rb == STATUS_OK ? AParcel_readInt32(reply.p, &server_ok) : rb;
+    binder_status_t r2 = r1 == STATUS_OK ? AParcel_readInt32(reply.p, &sentinel) : r1;
+    if (got) AIBinder_decStrong(got);
+    std::string echoed;
+    bool root_ok = do_echo(root, "after-null", &echoed) && echoed == "after-null";
+    printf("NULL rc=%d read=%d server_ok=%d reply_null=%d sentinel=%#x root_ok=%d\n", rc, r2,
+           server_ok, got == nullptr, sentinel, root_ok);
+    if (r2 != STATUS_OK || server_ok != 1 || got != nullptr || sentinel != kNullSentinel ||
+        !root_ok) {
+        printf("NULL_FAIL\n");
+        return 42;
+    }
+    printf("NULL_PASS\n");
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -496,5 +533,8 @@ int main(int argc, char** argv) {
     int rc = run_holder_relay(root, clazz);
     if (rc != 0) return rc;
     fflush(stdout);
-    return run_ref_accounting(root, clazz);
+    rc = run_ref_accounting(root, clazz);
+    if (rc != 0) return rc;
+    fflush(stdout);
+    return run_null_binder(root);
 }
