@@ -18,8 +18,8 @@
 //!
 //! The negotiated version is selected at runtime by the connection
 //! handshake (`RpcConnectionHeader`/`RpcNewSessionResponse`). r34
-//! (android-12, pre-versioning, 32-byte address, no handshake) stays a
-//! separate codec.
+//! (android-12, pre-versioning, 32-byte address, an `int32` session-id
+//! preamble instead of a handshake) stays a separate codec.
 //!
 //! # v1 ≡ v2 framing (verified vs `android-16.0.0_r4`)
 //!
@@ -113,16 +113,18 @@
 //! 16-byte `RpcWireHeader` (whose `bodySize` field decides the body
 //! length) followed by the body, and the handshake structs are written as
 //! raw fixed-size structs (AOSP `RpcState::rpcSend`/`rpcRec` —
-//! `interruptableWriteFully`/`ReadFully` of iovecs, no framing). This is
-//! distinct from rsbinder's own `RpcTransport` framing, which prepends a
-//! `u32` length (`transport::write_frame`) — that extra prefix is an
-//! rsbinder-ism a real android peer neither writes nor expects.
+//! `interruptableWriteFully`/`ReadFully` of iovecs, no framing). android-12
+//! frames its messages the same way. This is distinct from the
+//! `RpcTransport::send_frame` framing, which prepends a `u32` length
+//! (`transport::write_frame`) — that prefix is an rsbinder-ism a real
+//! android peer neither writes nor expects, and no `RpcSession` uses it.
 //!
 //! The `*_aosp_message*` and handshake helpers operate directly on a byte
 //! stream (`Read + Write`), so they are wire-identical to a genuine
-//! android-13/14/15 RPC peer. They are the reusable primitives the opt-in
-//! `RpcSession` android-13+ profile wires in; nothing here touches the R34
-//! `RpcSession`/`RpcTransport` path (additive; R34 stays the AOSP android-12 layout).
+//! android RPC peer. `RpcSession` reads and writes every message of both
+//! profiles through them; the handshake helpers are android-13+ only, and
+//! the r34 profile's one connection-setup step, the `int32` session-id
+//! preamble, is `read_r34_session_preamble`.
 //!
 //! `read_aosp_message` and `read_aosp_message_with_fds` read header and
 //! body into one allocation: `bodySize` is peer-chosen up to
@@ -904,6 +906,14 @@ pub(crate) fn read_aosp_message_gated<R: Read>(
     Ok(out)
 }
 
+/// The r34 connection preamble: the bare `int32` session id an android-12 client writes before
+/// its first message (`RpcSession::setupOneSocketConnection`, `RpcServer::establishConnection`).
+pub(crate) fn read_r34_session_preamble<R: Read>(r: &mut R) -> RpcResult<i32> {
+    let mut id = [0u8; 4];
+    read_exact_into(r, &mut id)?;
+    Ok(i32::from_le_bytes(id))
+}
+
 /// [`write_aosp_message`] + out-of-band `SCM_RIGHTS` fds (the
 /// android-13+ v1+ `Unix` FD-over-RPC path). `msg` is
 /// the codec output (`[RpcWireHeader(16) | body]`, `bodySize` correct),
@@ -1232,9 +1242,8 @@ fn write_all_raw<W: Write>(w: &mut W, buf: &[u8]) -> RpcResult<()> {
 /// helpers above run over any transport with raw byte access
 /// (every built-in backend). EOF (`recv_raw` ⇒ `Ok(0)`) is preserved as
 /// `Read` returning `Ok(0)`, so `read_exact_raw` still yields the
-/// correct `EndOfStream`/`Truncated`. This is the bridge the opt-in
-/// android-13+ `RpcSession` profile uses; the R34 path never touches
-/// it.
+/// correct `EndOfStream`/`Truncated`. `RpcSession` reads through this
+/// bridge on both wire profiles.
 pub struct RawTransportIo<'a>(pub &'a dyn super::transport::RpcTransport);
 
 impl Read for RawTransportIo<'_> {

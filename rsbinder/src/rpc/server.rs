@@ -60,8 +60,9 @@
 //!   `RpcProxy::send_obituary`). Unset, every peer is admitted.
 //! - **Handshake deadline.** Armed on read and write before the blocking
 //!   serve loop. The android-13+ path lifts both sides after its handshake;
-//!   the r34 path, which has no handshake, lifts the write side before the
-//!   serve loop and the read side after the first frame. The 10 s default
+//!   the r34 path, which has no handshake, reads the client's session-id
+//!   preamble under it, lifts the write side before the serve loop and the
+//!   read side after the first frame. The 10 s default
 //!   exists so a peer that never sends its handshake cannot hold a
 //!   `max_connections` slot, or pin the server's `Arc`, forever.
 //! - **Serve deadlines.** After the android-13+ handshake the handshake
@@ -792,7 +793,8 @@ impl RpcServer {
     /// The deadline bounds **only** the handshake/first-contact phase. For
     /// the android-13+ profile it is cleared after the explicit handshake;
     /// for the default r34 profile (no separate handshake) it covers the
-    /// first serve-loop frame and is cleared once that frame is read. Either
+    /// client's `int32` session-id preamble and the first serve-loop frame,
+    /// and is cleared once that frame is read. Either
     /// way an established two-way session may then sit idle between requests
     /// unbounded (the per-call reply deadline is managed separately via
     /// [`RpcSession::set_timeout`](super::RpcSession::set_timeout)).
@@ -1159,8 +1161,8 @@ impl RpcServer {
 
     /// Build, configure and track a new r34 session with its own fresh `RpcState`.
     fn make_session(&self, transport: Box<dyn RpcTransport>) -> super::RpcResult<RpcSession> {
-        // The server accepted this connection ⇒ Acceptor subspace.
-        let session = RpcSession::new(transport, super::address::AddressSpace::Acceptor)?;
+        // The server accepted this connection ⇒ Acceptor subspace; the worker read the preamble.
+        let session = RpcSession::new_accepted(transport, super::address::AddressSpace::Acceptor)?;
         self.configure_session(&session);
         self.track_session(&session.inner_arc());
         Ok(session)
@@ -1222,6 +1224,12 @@ impl RpcServer {
     /// stale ids: a well-behaved client whose `incoming_connections` exceeds
     /// this server's callback budget also raises it. Stays zero on the
     /// empty-id flow.
+    ///
+    /// On the r34 wire it counts connections whose `int32` session-id
+    /// preamble is not `-1` (a new session). The first word of an
+    /// android-13+ client's `RpcConnectionHeader` (its version) and of a
+    /// length-prefixed frame from an rsbinder before 0.12.0 both read as
+    /// such an id.
     pub fn rejected_unknown_id_count(&self) -> usize {
         self.rejected_unknown_id.load(Ordering::SeqCst)
     }
@@ -1587,6 +1595,25 @@ impl RpcServer {
                 }
             }
             None => {
+                // AOSP `RpcServer::establishConnection`: the client's session id comes first.
+                let id = super::wire_android13::read_r34_session_preamble(
+                    &mut super::wire_android13::RawTransportIo(&*transport),
+                );
+                match id {
+                    Ok(super::address::RPC_SESSION_ID_NEW) => {}
+                    Ok(id) => {
+                        server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
+                        log::warn!(
+                            "RPC r34: client asked to join unknown session id {id}; \
+                             rejecting connection"
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        log::debug!("RPC r34: no session-id preamble: {e:?}");
+                        return;
+                    }
+                }
                 // The serve loop lifts only the read deadline; r34 writes nothing before frame 1.
                 if let Err(e) = transport.set_write_timeout(None) {
                     log::debug!("RPC r34: failed to lift handshake write deadline: {e:?}");

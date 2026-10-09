@@ -98,8 +98,8 @@
 //! a frame boundary. Every other read failure lacks that guarantee — including ones that in
 //! fact consumed nothing — and is treated as a lost position. One caller asks through the
 //! crate-private `RpcError::leaves_frame_boundary_intact`: the android-13+ reader, which
-//! promotes a mid-frame case to `Truncated` / `DeadlineMidFrame`. The r34
-//! framing readers and the serve loop reimplement the same split inline — against the io
+//! promotes a mid-frame case to `Truncated` / `DeadlineMidFrame`. The transports'
+//! length-prefix readers and the serve loop reimplement the same split inline — against the io
 //! error kind and the `RpcError` variants respectively — so a change to the set has to be
 //! made in all three places.
 

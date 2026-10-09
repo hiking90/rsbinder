@@ -2887,7 +2887,6 @@ pub fn rsbinder::rpc::transport::MemTransport::recv_frame_with_fds(&self) -> rsb
 pub fn rsbinder::rpc::transport::MemTransport::recv_raw(&self, &mut [u8]) -> rsbinder::rpc::RpcResult<usize>
 pub fn rsbinder::rpc::transport::MemTransport::recv_raw_with_fds(&self, &mut [u8]) -> rsbinder::rpc::RpcResult<(usize, alloc::vec::Vec<std::os::fd::owned::OwnedFd>)>
 pub fn rsbinder::rpc::transport::MemTransport::send_frame(&self, &[u8]) -> rsbinder::rpc::RpcResult<()>
-pub fn rsbinder::rpc::transport::MemTransport::send_frame_draining(&self, &[u8], &[std::os::fd::owned::BorrowedFd<'_>], &mut dyn core::ops::function::FnMut() -> rsbinder::rpc::RpcResult<()>) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::MemTransport::send_frame_with_fds(&self, &[u8], &[std::os::fd::owned::BorrowedFd<'_>]) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::MemTransport::send_raw(&self, &[u8]) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::MemTransport::send_raw_draining(&self, &[u8], &[std::os::fd::owned::BorrowedFd<'_>], &mut dyn core::ops::function::FnMut() -> rsbinder::rpc::RpcResult<()>) -> rsbinder::rpc::RpcResult<()>
@@ -2920,7 +2919,6 @@ pub fn rsbinder::rpc::transport::UnixTransport::recv_frame_with_fds(&self) -> rs
 pub fn rsbinder::rpc::transport::UnixTransport::recv_raw(&self, &mut [u8]) -> rsbinder::rpc::RpcResult<usize>
 pub fn rsbinder::rpc::transport::UnixTransport::recv_raw_with_fds(&self, &mut [u8]) -> rsbinder::rpc::RpcResult<(usize, alloc::vec::Vec<std::os::fd::owned::OwnedFd>)>
 pub fn rsbinder::rpc::transport::UnixTransport::send_frame(&self, &[u8]) -> rsbinder::rpc::RpcResult<()>
-pub fn rsbinder::rpc::transport::UnixTransport::send_frame_draining(&self, &[u8], &[std::os::fd::owned::BorrowedFd<'_>], &mut dyn core::ops::function::FnMut() -> rsbinder::rpc::RpcResult<()>) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::UnixTransport::send_frame_with_fds(&self, &[u8], &[std::os::fd::owned::BorrowedFd<'_>]) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::UnixTransport::send_raw(&self, &[u8]) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::UnixTransport::send_raw_draining(&self, &[u8], &[std::os::fd::owned::BorrowedFd<'_>], &mut dyn core::ops::function::FnMut() -> rsbinder::rpc::RpcResult<()>) -> rsbinder::rpc::RpcResult<()>
@@ -2947,7 +2945,6 @@ pub fn rsbinder::rpc::transport::RpcTransport::recv_frame_with_fds(&self) -> rsb
 pub fn rsbinder::rpc::transport::RpcTransport::recv_raw(&self, &mut [u8]) -> rsbinder::rpc::RpcResult<usize>
 pub fn rsbinder::rpc::transport::RpcTransport::recv_raw_with_fds(&self, &mut [u8]) -> rsbinder::rpc::RpcResult<(usize, alloc::vec::Vec<std::os::fd::owned::OwnedFd>)>
 pub fn rsbinder::rpc::transport::RpcTransport::send_frame(&self, &[u8]) -> rsbinder::rpc::RpcResult<()>
-pub fn rsbinder::rpc::transport::RpcTransport::send_frame_draining(&self, &[u8], &[std::os::fd::owned::BorrowedFd<'_>], &mut dyn core::ops::function::FnMut() -> rsbinder::rpc::RpcResult<()>) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::RpcTransport::send_frame_with_fds(&self, &[u8], &[std::os::fd::owned::BorrowedFd<'_>]) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::RpcTransport::send_raw(&self, &[u8]) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::RpcTransport::send_raw_draining(&self, &[u8], &[std::os::fd::owned::BorrowedFd<'_>], &mut dyn core::ops::function::FnMut() -> rsbinder::rpc::RpcResult<()>) -> rsbinder::rpc::RpcResult<()>
@@ -2966,7 +2963,6 @@ pub fn rsbinder::rpc::transport::MemTransport::recv_frame_with_fds(&self) -> rsb
 pub fn rsbinder::rpc::transport::MemTransport::recv_raw(&self, &mut [u8]) -> rsbinder::rpc::RpcResult<usize>
 pub fn rsbinder::rpc::transport::MemTransport::recv_raw_with_fds(&self, &mut [u8]) -> rsbinder::rpc::RpcResult<(usize, alloc::vec::Vec<std::os::fd::owned::OwnedFd>)>
 pub fn rsbinder::rpc::transport::MemTransport::send_frame(&self, &[u8]) -> rsbinder::rpc::RpcResult<()>
-pub fn rsbinder::rpc::transport::MemTransport::send_frame_draining(&self, &[u8], &[std::os::fd::owned::BorrowedFd<'_>], &mut dyn core::ops::function::FnMut() -> rsbinder::rpc::RpcResult<()>) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::MemTransport::send_frame_with_fds(&self, &[u8], &[std::os::fd::owned::BorrowedFd<'_>]) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::MemTransport::send_raw(&self, &[u8]) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::MemTransport::send_raw_draining(&self, &[u8], &[std::os::fd::owned::BorrowedFd<'_>], &mut dyn core::ops::function::FnMut() -> rsbinder::rpc::RpcResult<()>) -> rsbinder::rpc::RpcResult<()>
@@ -2985,7 +2981,6 @@ pub fn rsbinder::rpc::transport::UnixTransport::recv_frame_with_fds(&self) -> rs
 pub fn rsbinder::rpc::transport::UnixTransport::recv_raw(&self, &mut [u8]) -> rsbinder::rpc::RpcResult<usize>
 pub fn rsbinder::rpc::transport::UnixTransport::recv_raw_with_fds(&self, &mut [u8]) -> rsbinder::rpc::RpcResult<(usize, alloc::vec::Vec<std::os::fd::owned::OwnedFd>)>
 pub fn rsbinder::rpc::transport::UnixTransport::send_frame(&self, &[u8]) -> rsbinder::rpc::RpcResult<()>
-pub fn rsbinder::rpc::transport::UnixTransport::send_frame_draining(&self, &[u8], &[std::os::fd::owned::BorrowedFd<'_>], &mut dyn core::ops::function::FnMut() -> rsbinder::rpc::RpcResult<()>) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::UnixTransport::send_frame_with_fds(&self, &[u8], &[std::os::fd::owned::BorrowedFd<'_>]) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::UnixTransport::send_raw(&self, &[u8]) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::UnixTransport::send_raw_draining(&self, &[u8], &[std::os::fd::owned::BorrowedFd<'_>], &mut dyn core::ops::function::FnMut() -> rsbinder::rpc::RpcResult<()>) -> rsbinder::rpc::RpcResult<()>
@@ -3434,7 +3429,6 @@ pub fn rsbinder::rpc::RpcTransport::recv_frame_with_fds(&self) -> rsbinder::rpc:
 pub fn rsbinder::rpc::RpcTransport::recv_raw(&self, &mut [u8]) -> rsbinder::rpc::RpcResult<usize>
 pub fn rsbinder::rpc::RpcTransport::recv_raw_with_fds(&self, &mut [u8]) -> rsbinder::rpc::RpcResult<(usize, alloc::vec::Vec<std::os::fd::owned::OwnedFd>)>
 pub fn rsbinder::rpc::RpcTransport::send_frame(&self, &[u8]) -> rsbinder::rpc::RpcResult<()>
-pub fn rsbinder::rpc::RpcTransport::send_frame_draining(&self, &[u8], &[std::os::fd::owned::BorrowedFd<'_>], &mut dyn core::ops::function::FnMut() -> rsbinder::rpc::RpcResult<()>) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::RpcTransport::send_frame_with_fds(&self, &[u8], &[std::os::fd::owned::BorrowedFd<'_>]) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::RpcTransport::send_raw(&self, &[u8]) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::RpcTransport::send_raw_draining(&self, &[u8], &[std::os::fd::owned::BorrowedFd<'_>], &mut dyn core::ops::function::FnMut() -> rsbinder::rpc::RpcResult<()>) -> rsbinder::rpc::RpcResult<()>
@@ -3453,7 +3447,6 @@ pub fn rsbinder::rpc::transport::MemTransport::recv_frame_with_fds(&self) -> rsb
 pub fn rsbinder::rpc::transport::MemTransport::recv_raw(&self, &mut [u8]) -> rsbinder::rpc::RpcResult<usize>
 pub fn rsbinder::rpc::transport::MemTransport::recv_raw_with_fds(&self, &mut [u8]) -> rsbinder::rpc::RpcResult<(usize, alloc::vec::Vec<std::os::fd::owned::OwnedFd>)>
 pub fn rsbinder::rpc::transport::MemTransport::send_frame(&self, &[u8]) -> rsbinder::rpc::RpcResult<()>
-pub fn rsbinder::rpc::transport::MemTransport::send_frame_draining(&self, &[u8], &[std::os::fd::owned::BorrowedFd<'_>], &mut dyn core::ops::function::FnMut() -> rsbinder::rpc::RpcResult<()>) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::MemTransport::send_frame_with_fds(&self, &[u8], &[std::os::fd::owned::BorrowedFd<'_>]) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::MemTransport::send_raw(&self, &[u8]) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::MemTransport::send_raw_draining(&self, &[u8], &[std::os::fd::owned::BorrowedFd<'_>], &mut dyn core::ops::function::FnMut() -> rsbinder::rpc::RpcResult<()>) -> rsbinder::rpc::RpcResult<()>
@@ -3472,7 +3465,6 @@ pub fn rsbinder::rpc::transport::UnixTransport::recv_frame_with_fds(&self) -> rs
 pub fn rsbinder::rpc::transport::UnixTransport::recv_raw(&self, &mut [u8]) -> rsbinder::rpc::RpcResult<usize>
 pub fn rsbinder::rpc::transport::UnixTransport::recv_raw_with_fds(&self, &mut [u8]) -> rsbinder::rpc::RpcResult<(usize, alloc::vec::Vec<std::os::fd::owned::OwnedFd>)>
 pub fn rsbinder::rpc::transport::UnixTransport::send_frame(&self, &[u8]) -> rsbinder::rpc::RpcResult<()>
-pub fn rsbinder::rpc::transport::UnixTransport::send_frame_draining(&self, &[u8], &[std::os::fd::owned::BorrowedFd<'_>], &mut dyn core::ops::function::FnMut() -> rsbinder::rpc::RpcResult<()>) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::UnixTransport::send_frame_with_fds(&self, &[u8], &[std::os::fd::owned::BorrowedFd<'_>]) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::UnixTransport::send_raw(&self, &[u8]) -> rsbinder::rpc::RpcResult<()>
 pub fn rsbinder::rpc::transport::UnixTransport::send_raw_draining(&self, &[u8], &[std::os::fd::owned::BorrowedFd<'_>], &mut dyn core::ops::function::FnMut() -> rsbinder::rpc::RpcResult<()>) -> rsbinder::rpc::RpcResult<()>

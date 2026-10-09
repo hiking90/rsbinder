@@ -18,7 +18,7 @@
 //!
 //! `fd_v1plus_aosp_roundtrip_both_directions` runs the v1+ FD-over-RPC path end-to-end over a
 //! real UDS: FD mode negotiated in the `RpcConnectionHeader`, `SCM_RIGHTS` carried on the
-//! `aosp_framing` no-length-prefix wire, the `[not-null|hasComm|TYPE|fdIndex]` body, and
+//! AOSP no-length-prefix wire, the `[not-null|hasComm|TYPE|fdIndex]` body, and
 //! strict object-position read, at v1 (android-14/15) **and** v2 (android-16). The fd travels
 //! both ways: as a transaction *argument* (client→server, the server inbound-args gate) and in
 //! the *reply* (server→client), valid + `O_CLOEXEC` at the receiver. This is the hermetic

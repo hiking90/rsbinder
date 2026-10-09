@@ -920,7 +920,8 @@ fn silent_r34_peer_released_by_handshake_deadline() {
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
-    // An r34 connect writes nothing, so c1 is a silent peer holding the only slot.
+    // An r34 connect writes only its session-id preamble, so c1 is a silent peer holding the
+    // only slot.
     let c1 = RpcSession::setup_unix_client(&path).expect("connect c1 (silent)");
 
     // c2 waits in the backlog until c1's worker hits the first-frame deadline.
@@ -2066,6 +2067,103 @@ fn r34_server_reports_an_android13plus_client_as_a_dead_peer() {
             ),
         }
     }
+}
+
+/// The bytes an android-12 libbinder client writes, built by hand: the `-1` session id, then
+/// `GET_ROOT` as a bare `RpcWireHeader` + `RpcWireTransaction` (no length prefix).
+fn aosp12_get_root() -> Vec<u8> {
+    let mut msg = (-1i32).to_le_bytes().to_vec();
+    msg.extend_from_slice(&0u32.to_le_bytes()); // command = TRANSACT
+    msg.extend_from_slice(&64u32.to_le_bytes()); // bodySize
+    msg.extend_from_slice(&[0; 8]); // reserved
+    msg.extend_from_slice(&[0; 32]); // address: special
+    msg.extend_from_slice(&0u32.to_le_bytes()); // code = GET_ROOT
+    msg.extend_from_slice(&[0; 4 + 8 + 16]); // flags, asyncNumber, reserved
+    msg
+}
+
+/// An r34 server answers a client that speaks the android-12 wire byte for byte.
+#[test]
+fn r34_server_answers_an_aosp12_shaped_client() {
+    use std::io::{Read, Write};
+    let path = tmp_sock("aosp12");
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    server
+        .set_root(make_service(Arc::new(AtomicI64::new(0))))
+        .expect("set_root");
+    let bg = server.run_background();
+    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
+    wait_for_sock(&path);
+
+    let mut s = std::os::unix::net::UnixStream::connect(&path).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    s.write_all(&aosp12_get_root()).expect("GET_ROOT");
+    let mut header = [0u8; 16];
+    s.read_exact(&mut header).expect("reply header");
+    assert_eq!(
+        header[..4],
+        1u32.to_le_bytes(),
+        "RpcWireHeader.command = REPLY"
+    );
+    let body_size = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+    let mut body = vec![0u8; body_size];
+    s.read_exact(&mut body).expect("reply body");
+    // `RpcWireReply.status`, then the parcel: a non-null binder's type word and address.
+    assert_eq!(body[..4], 0i32.to_le_bytes(), "status OK");
+    assert_eq!(body[4..8], 1i32.to_le_bytes(), "a non-null root");
+}
+
+/// An rsbinder r34 client from before AOSP framing leads with a `u32` frame length, which the
+/// server reads as the id of a session it does not have.
+#[test]
+fn r34_server_refuses_a_length_prefixed_client() {
+    use std::io::{Read, Write};
+    let path = tmp_sock("prefixed");
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    server
+        .set_root(make_service(Arc::new(AtomicI64::new(0))))
+        .expect("set_root");
+    let bg = server.run_background();
+    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
+    wait_for_sock(&path);
+
+    let before = server.rejected_unknown_id_count();
+    let mut s = std::os::unix::net::UnixStream::connect(&path).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    let frame = &aosp12_get_root()[4..];
+    let mut old = (frame.len() as u32).to_le_bytes().to_vec();
+    old.extend_from_slice(frame);
+    s.write_all(&old).expect("old frame");
+    let mut rest = Vec::new();
+    match s.read_to_end(&mut rest) {
+        Ok(_) => assert!(rest.is_empty(), "no reply, the connection is closed"),
+        Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset),
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while server.rejected_unknown_id_count() == before && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(server.rejected_unknown_id_count(), before + 1);
+}
+
+/// The reverse: a server from before AOSP framing reads the `-1` preamble as a frame length
+/// past `MAX_FRAME_LEN` and refuses it before allocating.
+#[test]
+fn a_length_prefixed_server_refuses_the_r34_preamble() {
+    use rsbinder::rpc::transport::UnixTransport;
+    use rsbinder::rpc::{AddressSpace, RpcError, RpcTransport};
+    let (a, old_server) = UnixTransport::pair().expect("socketpair");
+    let client = RpcSession::new(Box::new(a), AddressSpace::Initiator).expect("client");
+    client.set_timeout(Some(Duration::from_secs(5)));
+    let caller = std::thread::spawn(move || client.get_root().map(|_| ()));
+    assert!(matches!(
+        old_server.recv_frame(),
+        Err(RpcError::FrameTooLarge { .. })
+    ));
+    drop(old_server);
+    assert!(caller.join().expect("caller").is_err());
 }
 
 /// A session id on an entry that builds a new `RpcSession` is `BadValue`; see module doc.

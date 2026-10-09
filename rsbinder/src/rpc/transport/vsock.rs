@@ -135,28 +135,6 @@ impl RpcTransport for VsockTransport {
         )
     }
 
-    fn send_frame_draining(
-        &self,
-        buf: &[u8],
-        fds: &[std::os::fd::BorrowedFd<'_>],
-        drain: &mut dyn FnMut() -> RpcResult<()>,
-    ) -> RpcResult<()> {
-        use std::os::fd::AsFd;
-        if !fds.is_empty() {
-            return self.send_frame_with_fds(buf, fds);
-        }
-        // One buffer, as `send_frame` writes it.
-        let mut framed = Vec::with_capacity(4 + buf.len());
-        framed.extend_from_slice(&super::frame_header(buf)?);
-        framed.extend_from_slice(buf);
-        super::unix::send_draining(
-            self.stream.as_fd(),
-            &mut [std::io::IoSlice::new(&framed)],
-            &[],
-            drain,
-        )
-    }
-
     fn peer_identity(&self) -> PeerIdentity {
         self.peer.clone()
     }

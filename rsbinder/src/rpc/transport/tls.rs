@@ -721,22 +721,6 @@ impl RpcTransport for TlsTransport {
         }
     }
 
-    fn send_frame_draining(
-        &self,
-        buf: &[u8],
-        fds: &[std::os::fd::BorrowedFd<'_>],
-        drain: &mut dyn FnMut() -> RpcResult<()>,
-    ) -> RpcResult<()> {
-        if !fds.is_empty() {
-            return self.send_frame_with_fds(buf, fds);
-        }
-        // One buffer, as `send_frame`'s `write_frame` builds it.
-        let mut framed = Vec::with_capacity(4 + buf.len());
-        framed.extend_from_slice(&super::frame_header(buf)?);
-        framed.extend_from_slice(buf);
-        self.send_raw_draining(&framed, &[], drain)
-    }
-
     /// Single-reader: one thread drives `recv_*` per connection (the RPC
     /// serve loop / the in-flight transact's reply wait). Concurrent
     /// multi-reader would interleave `pump_incoming` socket reads and

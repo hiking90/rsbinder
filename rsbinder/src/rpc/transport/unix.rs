@@ -763,21 +763,6 @@ impl RpcTransport for UnixTransport {
         )
     }
 
-    fn send_frame_draining(
-        &self,
-        buf: &[u8],
-        fds: &[std::os::fd::BorrowedFd<'_>],
-        drain: &mut dyn FnMut() -> RpcResult<()>,
-    ) -> RpcResult<()> {
-        let header = super::frame_header(buf)?;
-        send_draining(
-            self.stream.as_fd(),
-            &mut [std::io::IoSlice::new(&header), std::io::IoSlice::new(buf)],
-            fds,
-            drain,
-        )
-    }
-
     /// Receive one length-prefixed frame plus any `SCM_RIGHTS` fds.
     /// Received fds are `O_CLOEXEC` (`MSG_CMSG_CLOEXEC`; on Apple, which
     /// lacks it, `fcntl_setfd` after receipt — same as

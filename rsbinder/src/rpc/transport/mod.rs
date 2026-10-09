@@ -118,13 +118,20 @@ pub use vsock::VsockTransport;
 /// yet bounded.
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 
-/// One RPC connection: framed byte transport + peer identity.
+/// One RPC connection: byte transport + peer identity.
 ///
 /// Synchronous and blocking. `&self` (not `&mut self`) so a session can
 /// hold one transport and use it from a sender thread and a receiver
 /// thread concurrently — full-duplex sockets and the `mem` channel pair
 /// both support that without a deadlock. Implementations must keep
-/// `send_frame`/`recv_frame` independently callable from two threads.
+/// the send and receive methods independently callable from two threads.
+///
+/// An [`RpcSession`](super::RpcSession) moves its bytes through
+/// [`send_raw`](Self::send_raw) / [`recv_raw`](Self::recv_raw) (and their
+/// fd and draining forms) on both wire profiles: AOSP frames each message
+/// by its own header, with no length prefix. A transport for a session
+/// must override those; their defaults refuse. `send_frame` / `recv_frame`
+/// are a separate length-prefixed message API that no session calls.
 pub trait RpcTransport: Send + Sync {
     /// Send exactly one logical frame. The implementation guarantees
     /// framing (length prefix or channel message boundary).
@@ -391,15 +398,14 @@ pub trait RpcTransport: Send + Sync {
 
     /// Send raw bytes with **no framing**. The real android RPC wire
     /// has no length prefix (`RpcState::rpcSend` writes the
-    /// `RpcWireHeader` + body directly) — the android-13+ profile drives
-    /// framing itself via `wire_android13`. The default is
-    /// **unsupported**: right for a frame-only backend, and a
-    /// silent trap for a byte-stream one — an android-13+ session over a
-    /// backend that does not override it fails at its first handshake
-    /// byte. Every bundled backend (`unix`, `tcp_debug`, `vsock`, `tls`,
-    /// and `mem`, which keeps the unread rest of a message for the next
-    /// read) overrides both this and [`recv_raw`](Self::recv_raw). The R34
-    /// path never calls this; it uses `send_frame`/`recv_frame`.
+    /// `RpcWireHeader` + body directly) — a session drives framing
+    /// itself via `wire_android13`, on both profiles. The default is
+    /// **unsupported**: a session over a backend that does not override
+    /// it fails at its first byte (an r34 client's session-id preamble in
+    /// `RpcSession::new`, an android-13+ handshake). Every bundled backend
+    /// (`unix`, `tcp_debug`, `vsock`, `tls`, and `mem`, which keeps the
+    /// unread rest of a message for the next read) overrides both this and
+    /// [`recv_raw`](Self::recv_raw).
     fn send_raw(&self, _buf: &[u8]) -> RpcResult<()> {
         Err(RpcError::Protocol("this transport has no raw byte access"))
     }
@@ -500,20 +506,6 @@ pub trait RpcTransport: Send + Sync {
         let _ = drain;
         self.send_raw_with_fds(buf, fds)
     }
-
-    /// [`send_raw_draining`](Self::send_raw_draining) for the length-framed
-    /// r34 profile: [`send_frame_with_fds`](Self::send_frame_with_fds) that
-    /// calls `drain` as that method describes. The default is
-    /// `send_frame_with_fds`, which never calls `drain`.
-    fn send_frame_draining(
-        &self,
-        buf: &[u8],
-        fds: &[std::os::fd::BorrowedFd<'_>],
-        drain: &mut dyn FnMut() -> RpcResult<()>,
-    ) -> RpcResult<()> {
-        let _ = drain;
-        self.send_frame_with_fds(buf, fds)
-    }
 }
 
 /// A draining send's read-side failure, kept out of the two "nothing was sent" variants.
@@ -524,17 +516,6 @@ pub(crate) fn read_side_failure(e: RpcError) -> RpcError {
         }
         e => e,
     }
-}
-
-/// The length prefix of the shared stream frame, refusing a body past `MAX_FRAME_LEN`.
-pub(crate) fn frame_header(buf: &[u8]) -> RpcResult<[u8; 4]> {
-    if buf.len() > MAX_FRAME_LEN {
-        return Err(RpcError::FrameTooLarge {
-            declared: buf.len(),
-            max: MAX_FRAME_LEN,
-        });
-    }
-    Ok((buf.len() as u32).to_le_bytes())
 }
 
 /// Identity of the peer on the other end of a [`RpcTransport`].

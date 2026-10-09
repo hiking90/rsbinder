@@ -152,24 +152,6 @@ impl RpcTransport for TcpDebugTransport {
         )
     }
 
-    fn send_frame_draining(
-        &self,
-        buf: &[u8],
-        fds: &[std::os::fd::BorrowedFd<'_>],
-        drain: &mut dyn FnMut() -> RpcResult<()>,
-    ) -> RpcResult<()> {
-        if !fds.is_empty() {
-            return self.send_frame_with_fds(buf, fds);
-        }
-        let header = super::frame_header(buf)?;
-        send_draining(
-            self.stream.as_fd(),
-            &mut [std::io::IoSlice::new(&header), std::io::IoSlice::new(buf)],
-            &[],
-            drain,
-        )
-    }
-
     fn recv_frame(&self) -> RpcResult<Vec<u8>> {
         let mut r = &self.stream;
         read_frame(&mut r)

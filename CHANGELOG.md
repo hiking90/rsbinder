@@ -34,6 +34,18 @@ This changelog starts at 0.9.0. For earlier releases, see the
   `StatusCode::BadValue` (omitting it or repeating the value still works).
   Likewise `ClientOptions::driver` / `mmap_size` must agree with the URI's
   `?driver=` / `?mmap=`.
+- **The r34 RPC wire (the default profile) now frames messages as android-12
+  libbinder does; a 0.12.0 peer and an older one no longer connect.** A
+  client writes the `int32` session id `-1` when it connects, then every
+  message as a bare `RpcWireHeader` and its body, with no `u32` length prefix.
+  An older server reads the `-1` as a frame length past `MAX_FRAME_LEN`, and a
+  0.12.0 server reads an older client's first length as a session id it does
+  not have; both close the connection. Upgrade both ends together. A custom
+  `RpcTransport` that implements only `send_frame` / `recv_frame` can no
+  longer carry any session: `RpcSession::new` as a client fails with
+  `RpcError::Protocol`, as the android-13+ profile always did; implement
+  `send_raw` / `recv_raw`. `RpcSession::new` as an acceptor reads the id in
+  its first `serve_blocking` read and ends the session on any id but `-1`.
 - **An RPC session refuses a connection whose transport differs from its
   founding one** (fd passing or local peer) with `BadType` at attach. A manual
   attach (`add_{outgoing,incoming}_connection_with_config`) over such a
@@ -810,8 +822,8 @@ This changelog starts at 0.9.0. For earlier releases, see the
   An android-13+ RPC message's 16-byte header is read into a
   stack buffer instead of a heap allocation of its own. No wire or signature
   change.
-- **RPC (r34 framing over Unix sockets, and `tcp_debug`): frames move with
-  fewer copies.** A frame goes out as its length and its body in one
+- **RPC (`RpcTransport::send_frame` / `recv_frame` over Unix sockets, and
+  `tcp_debug`): frames move with fewer copies.** A frame goes out as its length and its body in one
   `sendmsg`, without first joining them into a new buffer. A connection in fd
   mode reads each frame's header and then its body straight into the frame,
   where it used to read through an 8 KiB scratch buffer zeroed before every
@@ -1072,8 +1084,8 @@ after 0.12.0. The single-connection one-liners
   `EINVAL`, which surfaced as `BadValue`.
 - **RPC: a send to a peer that has closed is an error, not `SIGPIPE`, on the
   bundled Unix-socket, TLS and `tcp_debug` paths.** On Linux and Android
-  every send over a Unix-domain socket (r34 frames, android-13+ messages,
-  and the `sendmsg` calls that carry fds) and TLS over a `UnixStream` went
+  every send over a Unix-domain socket (length-prefixed frames, raw RPC
+  messages, and the `sendmsg` calls that carry fds) and TLS over a `UnixStream` went
   out through `write(2)` or a flagless `sendmsg`; they now pass
   `MSG_NOSIGNAL`, as std's own TCP `send` does. Such a send killed a process
   whose runtime does not ignore `SIGPIPE` (a C or JNI host). On Apple
@@ -1123,9 +1135,8 @@ after 0.12.0. The single-connection one-liners
   send now reads `DEC_STRONG`s off its connection while it waits for room, as
   AOSP's `drainCommands` does; any other command read there ends the session
   with AOSP's status (`BadType` for a request, `DeadObject` for a reply or an
-  unknown command, `BadValue` for a `DEC_STRONG` of the wrong size), judged on
-  the android-13+ wire from its header alone and on the r34 wire once its
-  frame is read, and those reads are bounded by the session's send deadline
+  unknown command, `BadValue` for a `DEC_STRONG` of the wrong size), judged
+  from its header alone, and those reads are bounded by the session's send deadline
   (`set_timeout`, or a server's idle timeout). A send that fails ends the
   session before anything else is written on its connection. An rsbinder
   server also holds such `DEC_STRONG`s, up to 10 000 addresses per
@@ -1133,9 +1144,9 @@ after 0.12.0. The single-connection one-liners
   client serves; past that it writes them as libbinder does, which a client
   that never drains (libbinder 16_r4+ with incoming threads, android-12
   libbinder, rsbinder before this release) can still block on. A custom
-  `RpcTransport` drains by implementing the new `send_raw_draining` and
-  `send_frame_draining` (the defaults send without reading), and a custom
-  `TlsStream` by returning its socket from the new `socket`.
+  `RpcTransport` drains by implementing the new `send_raw_draining` (the
+  default sends without reading), and a custom `TlsStream` by returning its
+  socket from the new `socket`.
 - **An RPC parcel dropped without being sent releases its local binders'
   `timesSent` reservations** (AOSP `mSendState`); a request refused before the
   send (`WouldBlock`, `DeadObject`) keeps them, so the documented retry with
