@@ -212,7 +212,12 @@ change bytes between peers: upgrade both ends together.
   `features/freeze_notification`; `InvalidOperation` elsewhere and on RPC.
   `ProcessState::freeze_process` and `process_freeze_info` issue
   `BINDER_FREEZE` / `BINDER_GET_FROZEN_INFO` (AOSP `IPCThreadState::freeze` /
-  `getProcessFreezeInfo`).
+  `getProcessFreezeInfo`); Android's SELinux grants both to `system_server`
+  only, so elsewhere they fail with `EACCES`. A freeze request goes to the
+  driver alone, so a C driver older than Linux 6.13 that refuses it for a
+  binder whose process has died (fixed upstream in `ca63c66935b9`, backported
+  to 6.12.4 and the GKI branches in late 2024) fails the add instead of
+  aborting the process.
 ### Changed
 
 - **`rsbinder-aidl` warns on a bare `@nullable` field that closes a reference

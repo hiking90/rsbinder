@@ -66,8 +66,12 @@
 //! The C driver may report one state twice (`binder_add_freeze_work` sets
 //! `resend` on a round trip); `last` filters it, as AOSP's `onFrozenStateChanged`.
 //!
-//! Entries are tagged with their proxy's address: only the live proxy's
-//! entries are delivered, and a dropping proxy removes only its own.
+//! Entries carry their proxy's address and a weak reference to it. A state
+//! goes to every proxy that still lives, whether or not the proxy cache holds
+//! it: an obituary removes the cache entry while the user may keep the proxy,
+//! and AOSP's cookie is the `BpBinder` itself, so its delivery does not depend
+//! on a lookup either. A dropping proxy no longer upgrades and removes only
+//! its own entries.
 
 use std::collections::hash_map::Entry as MapEntry;
 use std::collections::HashMap;
@@ -102,21 +106,23 @@ enum Kernel {
     PendingClear { rerequest: bool },
 }
 
-struct Entry {
+struct Entry<P> {
     owner: usize,
+    /// The owner's proxy, upgraded outside the lock to deliver (module doc "Delivery").
+    proxy: P,
     callback: sync::Weak<dyn FrozenStateChangeCallback>,
     delivered: Option<bool>,
 }
 
-struct Slot {
+struct Slot<P> {
     /// Unique per slot ever created; the delivery claim's token (module doc "Delivery").
     id: u64,
     kernel: Kernel,
-    entries: Vec<Entry>,
+    entries: Vec<Entry<P>>,
     delivering: bool,
 }
 
-impl Slot {
+impl<P> Slot<P> {
     /// After entries were removed: the clear to write, if none remain.
     fn after_removal(&mut self) -> Option<FreezeCmd> {
         if !self.entries.is_empty() {
@@ -139,23 +145,33 @@ impl Slot {
 /// to give it to.
 pub(crate) type Batch = (u64, FrozenState, Vec<Arc<dyn FrozenStateChangeCallback>>);
 
-/// Slots keyed by handle (= kernel cookie). See the module doc.
-#[derive(Default)]
-pub(crate) struct FreezeRegistry {
-    slots: HashMap<u32, Slot>,
+/// Slots keyed by handle (= kernel cookie), entries holding a `P` for their proxy.
+pub(crate) struct FreezeRegistry<P> {
+    slots: HashMap<u32, Slot<P>>,
     next_id: u64,
 }
 
-impl FreezeRegistry {
+impl<P> Default for FreezeRegistry<P> {
+    fn default() -> Self {
+        Self {
+            slots: HashMap::new(),
+            next_id: 0,
+        }
+    }
+}
+
+impl<P: Clone> FreezeRegistry<P> {
     /// Adds `callback` for `owner`; `Some(Request)` when the handle had no slot.
     pub(crate) fn add(
         &mut self,
         handle: u32,
         owner: usize,
+        proxy: P,
         callback: sync::Weak<dyn FrozenStateChangeCallback>,
     ) -> Option<FreezeCmd> {
         let entry = Entry {
             owner,
+            proxy,
             callback,
             delivered: None,
         };
@@ -245,6 +261,23 @@ impl FreezeRegistry {
         }
     }
 
+    /// One `P` per owner with an undelivered state; empty while another thread delivers.
+    pub(crate) fn pending_owners(&self, handle: u32) -> Vec<P> {
+        let Some(slot) = self.slots.get(&handle).filter(|slot| !slot.delivering) else {
+            return Vec::new();
+        };
+        let Kernel::Registered { last: Some(last) } = slot.kernel else {
+            return Vec::new();
+        };
+        let mut owners: Vec<(usize, P)> = Vec::new();
+        for e in slot.entries.iter().filter(|e| e.delivered != Some(last)) {
+            if !owners.iter().any(|(owner, _)| *owner == e.owner) {
+                owners.push((e.owner, e.proxy.clone()));
+            }
+        }
+        owners.into_iter().map(|(_, proxy)| proxy).collect()
+    }
+
     /// Claims delivery of `owner`'s undelivered entries; `None` if another thread delivers.
     pub(crate) fn begin_batch(&mut self, handle: u32, owner: usize) -> Option<Batch> {
         let slot = self.slots.get_mut(&handle)?;
@@ -311,10 +344,13 @@ mod tests {
     fn first_add_requests_and_later_adds_do_not() {
         let mut reg = FreezeRegistry::default();
         let (c1, c2) = (callback(), callback());
-        assert_eq!(reg.add(H, A, Arc::downgrade(&c1)), Some(FreezeCmd::Request));
-        assert_eq!(reg.add(H, A, Arc::downgrade(&c2)), None);
+        assert_eq!(
+            reg.add(H, A, A, Arc::downgrade(&c1)),
+            Some(FreezeCmd::Request)
+        );
+        assert_eq!(reg.add(H, A, A, Arc::downgrade(&c2)), None);
         // A second proxy of the same handle (case (b) overlap) must not request again.
-        assert_eq!(reg.add(H, B, Arc::downgrade(&c1)), None);
+        assert_eq!(reg.add(H, B, B, Arc::downgrade(&c1)), None);
         assert_eq!(reg.kernel(H), Some(Kernel::Registered { last: None }));
     }
 
@@ -322,8 +358,8 @@ mod tests {
     fn last_removal_clears_once() {
         let mut reg = FreezeRegistry::default();
         let (c1, c2) = (callback(), callback());
-        reg.add(H, A, Arc::downgrade(&c1));
-        reg.add(H, A, Arc::downgrade(&c2));
+        reg.add(H, A, A, Arc::downgrade(&c1));
+        reg.add(H, A, A, Arc::downgrade(&c2));
         assert_eq!(reg.remove(H, A, &Arc::downgrade(&c1)), Ok(None));
         assert_eq!(
             reg.remove(H, A, &Arc::downgrade(&c2)),
@@ -345,8 +381,8 @@ mod tests {
     fn remove_matches_owner_and_first_entry_only() {
         let mut reg = FreezeRegistry::default();
         let c = callback();
-        reg.add(H, A, Arc::downgrade(&c));
-        reg.add(H, A, Arc::downgrade(&c));
+        reg.add(H, A, A, Arc::downgrade(&c));
+        reg.add(H, A, A, Arc::downgrade(&c));
         assert_eq!(
             reg.remove(H, B, &Arc::downgrade(&c)),
             Err(StatusCode::NameNotFound)
@@ -366,8 +402,8 @@ mod tests {
     fn dropping_old_proxy_keeps_new_proxys_registration() {
         let mut reg = FreezeRegistry::default();
         let (old, new) = (callback(), callback());
-        reg.add(H, A, Arc::downgrade(&old));
-        reg.add(H, B, Arc::downgrade(&new));
+        reg.add(H, A, A, Arc::downgrade(&old));
+        reg.add(H, B, B, Arc::downgrade(&new));
         assert_eq!(reg.drop_owner(H, A), None);
         assert_eq!(reg.drop_owner(H, B), Some(FreezeCmd::Clear));
     }
@@ -376,7 +412,7 @@ mod tests {
     fn drop_owner_clears_a_registration_emptied_by_pruning() {
         let mut reg = FreezeRegistry::default();
         let c = callback();
-        reg.add(H, A, Arc::downgrade(&c));
+        reg.add(H, A, A, Arc::downgrade(&c));
         drop(c);
         assert!(reg.state_changed(H, true));
         assert!(reg.begin_batch(H, A).is_none());
@@ -387,10 +423,10 @@ mod tests {
     fn add_during_clear_defers_the_request() {
         let mut reg = FreezeRegistry::default();
         let c = callback();
-        reg.add(H, A, Arc::downgrade(&c));
+        reg.add(H, A, A, Arc::downgrade(&c));
         assert_eq!(reg.drop_owner(H, A), Some(FreezeCmd::Clear));
         // No request while the clear is in flight (kernel would refuse a second one).
-        assert_eq!(reg.add(H, B, Arc::downgrade(&c)), None);
+        assert_eq!(reg.add(H, B, B, Arc::downgrade(&c)), None);
         assert_eq!(reg.clear_done(H), ClearDone::Rerequest);
         assert_eq!(reg.kernel(H), Some(Kernel::Registered { last: None }));
     }
@@ -399,14 +435,17 @@ mod tests {
     fn add_then_remove_during_clear_does_not_rerequest() {
         let mut reg = FreezeRegistry::default();
         let c = callback();
-        reg.add(H, A, Arc::downgrade(&c));
+        reg.add(H, A, A, Arc::downgrade(&c));
         reg.drop_owner(H, A);
-        reg.add(H, B, Arc::downgrade(&c));
+        reg.add(H, B, B, Arc::downgrade(&c));
         assert_eq!(reg.remove(H, B, &Arc::downgrade(&c)), Ok(None));
         assert_eq!(reg.clear_done(H), ClearDone::Removed);
         assert_eq!(reg.kernel(H), None);
         // A fresh add after removal requests again.
-        assert_eq!(reg.add(H, B, Arc::downgrade(&c)), Some(FreezeCmd::Request));
+        assert_eq!(
+            reg.add(H, B, B, Arc::downgrade(&c)),
+            Some(FreezeCmd::Request)
+        );
     }
 
     #[test]
@@ -414,7 +453,7 @@ mod tests {
         let mut reg = FreezeRegistry::default();
         assert_eq!(reg.clear_done(H), ClearDone::Unexpected);
         let c = callback();
-        reg.add(H, A, Arc::downgrade(&c));
+        reg.add(H, A, A, Arc::downgrade(&c));
         assert_eq!(reg.clear_done(H), ClearDone::Unexpected);
         assert_eq!(reg.kernel(H), Some(Kernel::Registered { last: None }));
     }
@@ -423,10 +462,16 @@ mod tests {
     fn abort_request_forgets_the_slot() {
         let mut reg = FreezeRegistry::default();
         let c = callback();
-        assert_eq!(reg.add(H, A, Arc::downgrade(&c)), Some(FreezeCmd::Request));
+        assert_eq!(
+            reg.add(H, A, A, Arc::downgrade(&c)),
+            Some(FreezeCmd::Request)
+        );
         reg.abort_request(H);
         assert_eq!(reg.kernel(H), None);
-        assert_eq!(reg.add(H, A, Arc::downgrade(&c)), Some(FreezeCmd::Request));
+        assert_eq!(
+            reg.add(H, A, A, Arc::downgrade(&c)),
+            Some(FreezeCmd::Request)
+        );
     }
 
     #[test]
@@ -434,7 +479,7 @@ mod tests {
         let mut reg = FreezeRegistry::default();
         let c = callback();
         assert!(!reg.state_changed(H, true), "no slot");
-        reg.add(H, A, Arc::downgrade(&c));
+        reg.add(H, A, A, Arc::downgrade(&c));
         assert!(reg.state_changed(H, false));
         assert!(
             !reg.state_changed(H, false),
@@ -449,8 +494,8 @@ mod tests {
     fn batches_deliver_each_state_once_to_the_live_owner() {
         let mut reg = FreezeRegistry::default();
         let (mine, theirs) = (callback(), callback());
-        reg.add(H, A, Arc::downgrade(&mine));
-        reg.add(H, B, Arc::downgrade(&theirs));
+        reg.add(H, A, A, Arc::downgrade(&mine));
+        reg.add(H, B, B, Arc::downgrade(&theirs));
         assert!(reg.begin_batch(H, A).is_none(), "no state yet");
 
         reg.state_changed(H, true);
@@ -463,18 +508,37 @@ mod tests {
 
         // A late add gets the cached state.
         let late = callback();
-        reg.add(H, A, Arc::downgrade(&late));
+        reg.add(H, A, A, Arc::downgrade(&late));
         let (token, state, callbacks) = reg.begin_batch(H, A).expect("late batch");
         assert_eq!(state, FrozenState::Frozen);
         assert!(Arc::ptr_eq(&callbacks[0], &late));
         reg.end_batch(H, token);
     }
 
+    /// Delivery targets come from the entries, so a proxy the cache no longer holds still gets them.
+    #[test]
+    fn pending_owners_lists_each_owner_with_an_undelivered_state() {
+        let mut reg = FreezeRegistry::default();
+        let (a1, a2, b) = (callback(), callback(), callback());
+        reg.add(H, A, A, Arc::downgrade(&a1));
+        reg.add(H, A, A, Arc::downgrade(&a2));
+        reg.add(H, B, B, Arc::downgrade(&b));
+        assert!(reg.pending_owners(H).is_empty(), "no state yet");
+        reg.state_changed(H, true);
+        assert_eq!(reg.pending_owners(H), [A, B]);
+        let (token, _, _) = reg.begin_batch(H, A).expect("A's batch");
+        assert!(reg.pending_owners(H).is_empty(), "another thread delivers");
+        reg.end_batch(H, token);
+        assert_eq!(reg.pending_owners(H), [B]);
+        reg.drop_owner(H, B);
+        assert!(reg.pending_owners(H).is_empty());
+    }
+
     #[test]
     fn a_second_deliverer_backs_off_until_the_first_ends() {
         let mut reg = FreezeRegistry::default();
         let c = callback();
-        reg.add(H, A, Arc::downgrade(&c));
+        reg.add(H, A, A, Arc::downgrade(&c));
         reg.state_changed(H, true);
         let (token, _, _) = reg.begin_batch(H, A).expect("first");
         reg.state_changed(H, false);
@@ -489,12 +553,15 @@ mod tests {
     fn a_stale_batch_cannot_end_a_newer_slots_batch() {
         let mut reg = FreezeRegistry::default();
         let c = callback();
-        reg.add(H, A, Arc::downgrade(&c));
+        reg.add(H, A, A, Arc::downgrade(&c));
         reg.state_changed(H, true);
         let (stale, _, _) = reg.begin_batch(H, A).expect("old slot's batch");
         assert_eq!(reg.drop_owner(H, A), Some(FreezeCmd::Clear));
         assert_eq!(reg.clear_done(H), ClearDone::Removed);
-        assert_eq!(reg.add(H, B, Arc::downgrade(&c)), Some(FreezeCmd::Request));
+        assert_eq!(
+            reg.add(H, B, B, Arc::downgrade(&c)),
+            Some(FreezeCmd::Request)
+        );
         reg.state_changed(H, false);
         let (fresh, _, _) = reg.begin_batch(H, B).expect("new slot's batch");
         assert_ne!(stale, fresh);
@@ -513,12 +580,12 @@ mod tests {
     fn rerequest_redelivers_the_new_initial_state() {
         let mut reg = FreezeRegistry::default();
         let c = callback();
-        reg.add(H, A, Arc::downgrade(&c));
+        reg.add(H, A, A, Arc::downgrade(&c));
         reg.state_changed(H, true);
         let (token, _, _) = reg.begin_batch(H, A).expect("batch");
         reg.end_batch(H, token);
         reg.drop_owner(H, A);
-        reg.add(H, B, Arc::downgrade(&c));
+        reg.add(H, B, B, Arc::downgrade(&c));
         assert_eq!(reg.clear_done(H), ClearDone::Rerequest);
         assert!(reg.state_changed(H, true));
         let (_, state, _) = reg.begin_batch(H, B).expect("re-delivered");

@@ -12,8 +12,34 @@
 //! The observed process is a `reconnect_service` of this test's own name;
 //! this process registers the callbacks and freezes it with
 //! `ProcessState::freeze_process`, which the driver allows any binder process
-//! to issue. A driver without `features/freeze_notification` is not a
-//! failure: the tests then check the refusal (`InvalidOperation`) and stop.
+//! to issue; Android's SELinux allows it to system_server only, so there these
+//! tests run as root with SELinux permissive.
+//! `unprivileged_domain_observes_app_freeze` covers the enforcing `shell`
+//! domain instead. A driver without `features/freeze_notification` is not a
+//! failure: the tests then check the refusal (`InvalidOperation`) and stop,
+//! unless `/dev/binderfs/features/freeze_notification` reads `1`, which makes
+//! the refusal a failed support check.
+//!
+//! `Recorder` keeps the thread that delivered each state, which tells a fresh
+//! kernel registration from a cached state: the kernel's initial
+//! `BR_FROZEN_BINDER` arrives on a looper, while a state the registry already
+//! held is handed over on the thread calling `add`. The adding thread can
+//! also win the race to deliver a fresh registration's state (about 2% of
+//! tight add/remove cycles on a 16-core host), so `add_registered` tries
+//! three times: a slot left registered hands its state over on every try.
+//! `dropping_the_proxy_clears_its_registration` relies on it: each round drops
+//! its proxy for good (its `WIBinder` no longer upgrades) and the next looks
+//! the service up again on the same handle, while the drop's clear may still
+//! be in flight.
+//!
+//! `unprivileged_domain_observes_app_freeze` runs as `shell` with SELinux
+//! enforcing (`adb unroot`), not root: every domain may read
+//! `binderfs_features` and use the `BINDER_WRITE_READ` commands, while
+//! `BINDER_FREEZE` / `BINDER_GET_FROZEN_INFO` are left out of the
+//! `unpriv_binder_ioctls` allowlist and granted to system_server alone
+//! (`system/sepolicy` `private/domain.te`, `private/system_server.te`).
+//! `RSB_FREEZE_APP_SERVICE` / `RSB_FREEZE_APP_PROCESS` name the observed
+//! service and its app process (default `phone` / `com.android.phone`).
 //!
 //! The protocol is between the kernel and this process only, so no libbinder
 //! peer is needed; what matters is the driver (Rust binder on REMOTE_LINUX,
@@ -25,7 +51,7 @@
 
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
 
@@ -82,12 +108,7 @@ fn init() {
     ProcessState::start_thread_pool();
 }
 
-/// Records every state it is given, the thread that gave it, and whether `who`
-/// named the expected binder.
-///
-/// The thread tells a fresh kernel registration from a cached state: the
-/// kernel's initial `BR_FROZEN_BINDER` arrives on a looper, while a state the
-/// registry already held is handed over on the thread calling `add`.
+/// Records each state with its delivering thread: a looper means a kernel registration.
 #[derive(Default)]
 struct Recorder {
     states: Mutex<Vec<(FrozenState, ThreadId)>>,
@@ -171,11 +192,53 @@ fn supported_or_refused(binder: &SIBinder) -> bool {
             true
         }
         Err(StatusCode::InvalidOperation) => {
+            let reported = std::fs::read_to_string("/dev/binderfs/features/freeze_notification")
+                .is_ok_and(|v| v.trim() == "1");
+            assert!(
+                !reported,
+                "the driver reports freeze notifications, but the add was refused"
+            );
             eprintln!("driver lacks features/freeze_notification: checked the refusal only");
             false
         }
         Err(err) => panic!("add_frozen_state_change_callback: {err:?}"),
     }
+}
+
+/// Adds a recorder whose initial state came from a kernel registration; see module doc.
+fn add_registered(binder: &SIBinder, initial: FrozenState, what: &str) -> Arc<Recorder> {
+    for _ in 0..3 {
+        let recorder = Recorder::for_binder(binder);
+        binder
+            .add_frozen_state_change_callback_arc(&recorder)
+            .expect("add");
+        assert_eq!(recorder.wait_for(1), [initial], "{what}: initial state");
+        if recorder.first_from_kernel() {
+            return recorder;
+        }
+        binder
+            .remove_frozen_state_change_callback_arc(&recorder)
+            .expect("remove");
+        thread::sleep(Duration::from_millis(50));
+    }
+    panic!("{what}: three adds in a row got a cached state, not a new kernel registration");
+}
+
+struct Died(Mutex<mpsc::Sender<()>>);
+impl DeathRecipient for Died {
+    fn binder_died(&self, _: &WIBinder) {
+        let _ = self.0.lock().unwrap().send(());
+    }
+}
+
+/// Kills the service and waits for the obituary, which removes the proxy's cache entry.
+fn kill_and_await_obituary(svc: &mut Service, binder: &SIBinder) {
+    let (tx, rx) = mpsc::channel();
+    let died = Arc::new(Died(Mutex::new(tx)));
+    binder.link_to_death_arc(&died).expect("link_to_death");
+    svc.0.kill().expect("kill the service");
+    let _ = svc.0.wait();
+    rx.recv_timeout(WAIT).expect("obituary");
 }
 
 /// AC-4.3.9: initial state, freeze, thaw, late add, remove, re-add.
@@ -191,15 +254,7 @@ fn callbacks_follow_freeze_and_thaw() {
     }
     let pid = svc.pid();
 
-    let first = Recorder::for_binder(&binder);
-    binder
-        .add_frozen_state_change_callback_arc(&first)
-        .expect("add");
-    assert_eq!(first.wait_for(1), [FrozenState::Unfrozen], "initial state");
-    assert!(
-        first.first_from_kernel(),
-        "the kernel sent the initial state"
-    );
+    let first = add_registered(&binder, FrozenState::Unfrozen, "first add");
 
     set_frozen(pid, true);
     assert_eq!(
@@ -207,8 +262,7 @@ fn callbacks_follow_freeze_and_thaw() {
         [FrozenState::Unfrozen, FrozenState::Frozen]
     );
 
-    // A synchronous call into a frozen process fails (`BR_FROZEN_REPLY`); a oneway one
-    // is queued and completes (`BR_TRANSACTION_PENDING_FROZEN`, AC-4.3.11). Both are recorded.
+    // Frozen: a sync call fails (`BR_FROZEN_REPLY`), a oneway one is queued (AC-4.3.11).
     let smoke: Strong<dyn IRpcSmoke> = binder.clone().into_interface().expect("IRpcSmoke");
     assert!(
         smoke.r#echo("x").is_err(),
@@ -267,17 +321,8 @@ fn callbacks_follow_freeze_and_thaw() {
     assert_eq!(first.snapshot().len(), 3, "removed callbacks stay silent");
     assert_eq!(late.snapshot().len(), 2, "removed callbacks stay silent");
 
-    // Re-adding right after the clear (possibly before its done) registers again: the
-    // state comes from a new kernel registration, not from a slot the clear left behind.
-    let again = Recorder::for_binder(&binder);
-    binder
-        .add_frozen_state_change_callback_arc(&again)
-        .expect("re-add");
-    assert_eq!(again.wait_for(1), [FrozenState::Unfrozen]);
-    assert!(
-        again.first_from_kernel(),
-        "the removal cleared the registration, so the re-add requested a new one"
-    );
+    // The removal cleared the registration, so a re-add requests a new one.
+    let again = add_registered(&binder, FrozenState::Unfrozen, "re-add");
     binder
         .remove_frozen_state_change_callback_arc(&again)
         .expect("remove");
@@ -308,39 +353,56 @@ fn a_dropped_callback_is_refused() {
     );
 }
 
-/// AC-4.3.5/4.3.9: dropping the proxy clears its registration.
-///
-/// Each round's proxy is dropped for good (its `WIBinder` no longer upgrades)
-/// before the next round looks the service up again, on the same handle while
-/// the clear may still be in flight. Every round's initial state must then come
-/// from a new kernel registration (a looper), not from a slot the drop left
-/// `Registered` (the adding thread). The recorders stay alive, so a freeze at the
-/// end shows that no dropped proxy's callback is still registered.
+/// After the obituary a late callback still gets the cached state (AOSP `initialStateReceived`).
+#[test]
+#[ignore = "needs /dev/binderfs/binder and a running rsb_hub"]
+fn a_callback_added_after_the_obituary_gets_the_cached_state() {
+    init();
+    let name = service_name("obituary");
+    let mut svc = Service::start(&name);
+    let binder = hub::check_service(&name).expect("registered");
+    if !supported_or_refused(&binder) {
+        return;
+    }
+    let first = add_registered(&binder, FrozenState::Unfrozen, "first add");
+    set_frozen(svc.pid(), true);
+    assert_eq!(
+        first.wait_for(2),
+        [FrozenState::Unfrozen, FrozenState::Frozen]
+    );
+
+    kill_and_await_obituary(&mut svc, &binder);
+    let late = Recorder::for_binder(&binder);
+    binder
+        .add_frozen_state_change_callback_arc(&late)
+        .expect("add after the obituary");
+    assert_eq!(late.wait_for(1), [FrozenState::Frozen], "cached state");
+    for recorder in [&first, &late] {
+        binder
+            .remove_frozen_state_change_callback_arc(recorder)
+            .expect("remove");
+        assert_eq!(
+            *recorder.wrong_who.lock().unwrap(),
+            0,
+            "`who` names the binder"
+        );
+    }
+}
+
+/// AC-4.3.5/4.3.9: each round's initial state comes from a new kernel registration.
 #[test]
 #[ignore = "needs /dev/binderfs/binder and a running rsb_hub"]
 fn dropping_the_proxy_clears_its_registration() {
     init();
     let name = service_name("drop");
-    let svc = Service::start(&name);
-    let mut recorders = Vec::new();
+    let _svc = Service::start(&name);
     for round in 0..3 {
         let binder = hub::check_service(&name).expect("registered");
         if !supported_or_refused(&binder) {
             return;
         }
-        let recorder = Recorder::for_binder(&binder);
-        binder
-            .add_frozen_state_change_callback_arc(&recorder)
-            .expect("add");
-        assert_eq!(
-            recorder.wait_for(1),
-            [FrozenState::Unfrozen],
-            "round {round}"
-        );
-        assert!(
-            recorder.first_from_kernel(),
-            "round {round}: the previous proxy's drop cleared its registration"
-        );
+        // The previous round's drop cleared its registration.
+        let _recorder = add_registered(&binder, FrozenState::Unfrozen, &format!("round {round}"));
         let weak = SIBinder::downgrade(&binder);
         drop(binder);
         // A looper may still hold the proxy while finishing its delivery.
@@ -352,16 +414,103 @@ fn dropping_the_proxy_clears_its_registration() {
             );
             thread::sleep(Duration::from_millis(10));
         }
-        recorders.push(recorder);
     }
-    set_frozen(svc.pid(), true);
-    set_frozen(svc.pid(), false);
-    thread::sleep(Duration::from_millis(300));
-    for (round, recorder) in recorders.iter().enumerate() {
+}
+
+/// `cmd activity freeze|unfreeze PROCESS`: system_server issues `BINDER_FREEZE`.
+#[cfg(target_os = "android")]
+fn am_freeze(process: &str, frozen: bool) {
+    let mut cmd = Command::new("cmd");
+    cmd.arg("activity");
+    if frozen {
+        cmd.args(["freeze", "--sticky"]);
+    } else {
+        cmd.arg("unfreeze");
+    }
+    let status = cmd.arg(process).status().expect("run cmd activity");
+    assert!(status.success(), "cmd activity freeze={frozen} {process}");
+}
+
+/// Thaws the app if the test stops while it is frozen.
+#[cfg(target_os = "android")]
+struct Thaw<'a>(&'a str);
+#[cfg(target_os = "android")]
+impl Drop for Thaw<'_> {
+    fn drop(&mut self) {
+        // Asserting while unwinding would abort the test binary.
+        if thread::panicking() {
+            let _ = Command::new("cmd")
+                .args(["activity", "unfreeze", self.0])
+                .status();
+        } else {
+            am_freeze(self.0, false);
+        }
+    }
+}
+
+/// Run as `shell` with SELinux enforcing; see module doc.
+#[cfg(target_os = "android")]
+#[test]
+#[ignore = "needs an Android device; run as shell with SELinux enforcing"]
+fn unprivileged_domain_observes_app_freeze() {
+    init();
+    let service = std::env::var("RSB_FREEZE_APP_SERVICE").unwrap_or_else(|_| "phone".to_owned());
+    let process =
+        std::env::var("RSB_FREEZE_APP_PROCESS").unwrap_or_else(|_| "com.android.phone".to_owned());
+
+    let domain = std::fs::read_to_string("/proc/self/attr/current").unwrap_or_default();
+    let enforcing =
+        std::fs::read_to_string("/sys/fs/selinux/enforce").is_ok_and(|v| v.trim() == "1");
+    eprintln!(
+        "domain {}, enforcing {enforcing}",
+        domain.trim_end_matches(['\0', '\n'])
+    );
+    // Only `shell` is checked: userdebug's `su` is a permissive domain (`su.te`).
+    if enforcing && domain.contains(":shell:") {
+        // Our own pid, thawing: harmless where the ioctl is allowed.
+        let me = std::process::id() as i32;
+        let eacces = StatusCode::Errno(-13);
         assert_eq!(
-            recorder.snapshot(),
-            [FrozenState::Unfrozen],
-            "round {round}: a dropped proxy's callback stays silent"
+            ProcessState::as_self().freeze_process(me, false, Duration::ZERO),
+            Err(eacces),
+            "SELinux refuses BINDER_FREEZE"
         );
+        assert_eq!(
+            ProcessState::as_self().process_freeze_info(me).err(),
+            Some(eacces),
+            "SELinux refuses BINDER_GET_FROZEN_INFO"
+        );
+    } else {
+        eprintln!("not the enforcing shell domain: ioctl refusal not checked");
     }
+
+    let binder = hub::check_service(&service).expect("the observed service");
+    if !supported_or_refused(&binder) {
+        return;
+    }
+    let recorder = add_registered(&binder, FrozenState::Unfrozen, "app service");
+
+    let thaw = Thaw(&process);
+    am_freeze(&process, true);
+    assert_eq!(
+        recorder.wait_for(2),
+        [FrozenState::Unfrozen, FrozenState::Frozen]
+    );
+    drop(thaw);
+    assert_eq!(
+        recorder.wait_for(3),
+        [
+            FrozenState::Unfrozen,
+            FrozenState::Frozen,
+            FrozenState::Unfrozen
+        ]
+    );
+    binder
+        .remove_frozen_state_change_callback_arc(&recorder)
+        .expect("remove");
+    assert_eq!(
+        *recorder.wrong_who.lock().unwrap(),
+        0,
+        "`who` names the binder"
+    );
 }

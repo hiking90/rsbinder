@@ -231,8 +231,10 @@ pub struct ProxyHandle {
     obituary_sent: AtomicBool,
     recipients: RwLock<Vec<sync::Weak<dyn DeathRecipient>>>,
     extension: RwLock<ExtensionCache>,
-    /// Set by the first freeze-callback add, never cleared; module doc "Freeze notifications".
+    /// Set by every freeze-callback add, never cleared; while unset `Drop` skips the freeze lock.
     freeze_used: AtomicBool,
+    /// Freeze delivery target, independent of the proxy cache an obituary empties.
+    me: sync::Weak<ProxyHandle>,
 }
 
 impl ProxyHandle {
@@ -244,7 +246,7 @@ impl ProxyHandle {
     ) -> Result<Arc<Self>> {
         let handle = pin.handle();
         thread_state::inc_strong_handle(handle)?;
-        Ok(Arc::new(Self {
+        Ok(Arc::new_cyclic(|me| Self {
             handle,
             pin: Arc::clone(pin),
             descriptor,
@@ -253,6 +255,7 @@ impl ProxyHandle {
             recipients: RwLock::new(Vec::new()),
             extension: RwLock::new(ExtensionCache::NotQueried),
             freeze_used: AtomicBool::new(false),
+            me: me.clone(),
         }))
     }
 
@@ -349,7 +352,6 @@ impl ProxyHandle {
 
             if !recipients.is_empty() {
                 // Best effort, as AOSP: a failure must not stop the once-only obituary.
-                // The clear goes out only if no other proxy of the handle is linked.
                 let unlinked = ProcessState::as_self().unlink_death(self.handle, self.owner_key());
                 if let Err(e) = unlinked {
                     log::error!(
@@ -482,7 +484,6 @@ impl Drop for ProxyHandle {
             .is_empty();
         if linked {
             // Clears only if no newer proxy of the handle linked meanwhile (`death` module doc).
-            // A failed clear stays counted, so the pin outlives the subscription anyway.
             let unlinked = ProcessState::as_self().unlink_death(self.handle, self.owner_key());
             if let Err(err) = unlinked {
                 log::error!(
@@ -491,8 +492,7 @@ impl Drop for ProxyHandle {
                 );
             }
         }
-        // A proxy that never registered skips the registry lock (module doc "Freeze notifications").
-        // Set only after an add reached the initialized `ProcessState`, so `as_self` cannot panic.
+        // Set only once an add reached an initialized `ProcessState`, so `as_self` cannot panic.
         if *self.freeze_used.get_mut() {
             ProcessState::as_self().drop_frozen_owner(self.handle, self.owner_key());
         }
@@ -599,7 +599,7 @@ impl IBinder for ProxyHandle {
         Ok(())
     }
 
-    /// AOSP `BpBinder::addFrozenStateChangeCallback`; module doc "Freeze notifications".
+    /// AOSP `BpBinder::addFrozenStateChangeCallback`; see `process_state` "Freeze notifications".
     fn add_frozen_state_change_callback(
         &self,
         callback: sync::Weak<dyn FrozenStateChangeCallback>,
@@ -612,17 +612,17 @@ impl IBinder for ProxyHandle {
         if !process.freeze_notification_supported() {
             return Err(StatusCode::InvalidOperation);
         }
-        if process.max_threads() == 0 && process.current_threads.load(Ordering::Relaxed) == 0 {
-            // AOSP `ALOGE`s the same (`BpBinder.cpp:617-623`); the BR goes to looper threads only.
+        if !process.thread_pool_started() && process.current_threads.load(Ordering::Relaxed) == 0 {
+            // AOSP's `getThreadPoolMaxTotalThreadCount() == 0` (`BpBinder.cpp:617`): no looper yet.
             log::error!(
                 "add_frozen_state_change_callback on {} but no thread serves binder: \
                  notifications wait for start_thread_pool or join_thread_pool",
                 self.descriptor
             );
         }
-        // Before the add, so a drop that races it still finds the entry (module doc).
+        // Before the add: a callback it delivers may remove itself before the add returns.
         self.freeze_used.store(true, Ordering::Relaxed);
-        process.add_frozen_callback(self.handle, self.owner_key(), callback)
+        process.add_frozen_callback(self.handle, self.owner_key(), self.me.clone(), callback)
     }
 
     /// AOSP `BpBinder::removeFrozenStateChangeCallback`; the first match only.
@@ -741,7 +741,7 @@ mod tests {
 
     /// `ProxyHandle` with no kernel refs; `mem::forget` it to skip `BC_RELEASE` and `BC_DECREFS`.
     fn synthetic_proxy(obituary_sent: bool) -> Arc<ProxyHandle> {
-        Arc::new(ProxyHandle {
+        Arc::new_cyclic(|me| ProxyHandle {
             handle: 1,
             pin: HandlePin::synthetic(1, 1),
             descriptor: "test".to_string(),
@@ -750,6 +750,7 @@ mod tests {
             recipients: RwLock::new(Vec::new()),
             extension: RwLock::new(ExtensionCache::NotQueried),
             freeze_used: AtomicBool::new(false),
+            me: me.clone(),
         })
     }
 
