@@ -40,8 +40,10 @@ This changelog starts at 0.9.0. For earlier releases, see the
   message as a bare `RpcWireHeader` and its body, with no `u32` length prefix.
   An older server reads the `-1` as a frame length past `MAX_FRAME_LEN`, and a
   0.12.0 server reads an older client's first length as a session id it does
-  not have; both close the connection. Upgrade both ends together. Every
-  binder in an r34 parcel, a null one included, is now followed by its
+  not have; both close the connection. Upgrade both ends together. The new
+  wire was checked against android-12 libbinder on an SDK 31 emulator, with
+  each side as client and as server (`example-hello/cpp/run_rpc_r34_interop.sh`).
+  Every binder in an r34 parcel, a null one included, is now followed by its
   stability as android-12 writes it, a `Category` (`0x0c000001` for System,
   `0x00000001` for null) whatever the host's SDK; a null binder with a
   declared level or a `Category` of version 0 is refused with `BadType`.
@@ -939,6 +941,10 @@ after 0.12.0. The single-connection one-liners
   `inout` had to be followed by whitespace; any non-name character now ends
   them, as in AOSP. The same change makes keywords whole words (see
   *Migrating from 0.11.0*).
+- **`RpcServer::live_session_node_count` counts the sessions of an r34
+  server.** It summed only the android-13+ session registry, so on the
+  default profile it read 0 whatever the server's sessions had sent, and a
+  leak check against it could not fail.
 - **RPC on the android-12 (r34) wire: releasing many references to one binder
   no longer allocates a frame per reference.** The r34 `DEC_STRONG` has no
   amount field, so `amount` frames go out, but they were built as `amount`

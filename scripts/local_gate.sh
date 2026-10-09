@@ -402,6 +402,7 @@ STAGE3=(
     "rpc_fd_interop|34|-|"
     "rpc_incoming_interop|36|-|"
     "rpc_multiconn_interop|36|-|"
+    "rpc_r34_interop|31|32|aosp"
     "rpc_reconnect_interop|36|-|"
     "stream_interop|33|-|aosp"
     "stream_rpc_interop|34|-|aosp"

@@ -235,7 +235,7 @@ Android 12 libbinder differs from what rsbinder offers on this wire:
 
 | | Android 12 libbinder | rsbinder r34 |
 |---|---|---|
-| Largest message body | 100,000 bytes (`kMaxTransactionAllocation`): it refuses to send more (`NO_MEMORY`) and closes a connection that announces more | `MAX_FRAME_LEN` (64 MiB) |
+| Largest message body | 100,000 bytes (`kMaxTransactionAllocation`): it refuses to send more (`NO_MEMORY`). A server connection that receives more closes; a client waiting for a larger reply gets `NO_MEMORY` with the body left unread, and its next call on that connection ends its session | `MAX_FRAME_LEN` (64 MiB) |
 | TLS | none | r34 inside TLS, between rsbinder peers only |
 | Incoming (callback) connections | none | none |
 | File descriptors | refused (`BAD_TYPE`) | `negotiate_fd_transport`, between rsbinder peers only; against Android 12 it returns `None` |
@@ -252,8 +252,12 @@ an Android 12 client opens and closes them together.
 > A custom `RpcTransport` must implement `send_raw` / `recv_raw`; see the
 > CHANGELOG.
 
-Validation of this profile against real Android 12 libbinder on an SDK
-31 emulator is pending.
+This profile has been validated against real Android 12 libbinder on an
+SDK 31 emulator, both ways: an Android 12 client against an rsbinder
+`RpcServer` with three connections per session (parallel calls, oneway
+order, nested callbacks, null binders, reference counts, the size limit),
+and an rsbinder client against an Android 12 `RpcServer`
+(`example-hello/cpp/run_rpc_r34_interop.sh`).
 
 ## Transports
 
