@@ -2305,7 +2305,7 @@ pub mod {mod} {{
                     &var.identifier,
                 )?;
                 generator.ensure_resolvable()?;
-                generator.ensure_sized()?;
+                generator.ensure_sized(&var.identifier)?;
                 Self::ensure_declarable(&generator, &owner_name, &var.identifier)?;
                 if var.constant {
                     Self::ensure_constant_type(&generator, &owner_name, &var.identifier)?;
@@ -2612,7 +2612,7 @@ pub mod {mod} {{
             if let parser::Declaration::Variable(var) = member {
                 let generator = var.r#type.to_generator()?;
                 generator.ensure_resolvable()?;
-                generator.ensure_sized()?;
+                generator.ensure_sized(&var.identifier)?;
                 Self::ensure_declarable(&generator, &decl.name, &var.identifier)?;
                 if var.constant {
                     // Fields go through `seen_variants`; two same-named `pub const` are E0428.

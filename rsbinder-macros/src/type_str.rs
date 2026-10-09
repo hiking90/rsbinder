@@ -330,7 +330,7 @@ fn reject_field_references(ty: &Type) -> syn::Result<()> {
     reject_inner_references(ty)
 }
 
-/// `.aidl` boxes only a `@nullable` parcelable field closing a reference cycle, and only there.
+/// `.aidl` boxes only a parcelable field (`@nullable(heap=true)`, or `@nullable` on a cycle).
 fn reject_bare_box(ty: &Type, place: Place) -> syn::Result<()> {
     match cycle_box(ty, place) {
         Some(boxed) => reject_any_box(boxed),
@@ -376,9 +376,10 @@ fn reject_any_box(ty: &Type) -> syn::Result<()> {
     if std_box_arg(ty).is_some() {
         return Err(syn::Error::new_spanned(
             ty,
-            "`.aidl` never renders this `Box` — it boxes only a `@nullable` parcelable field \
-             that closes a reference cycle, as `Option<Box<T>>`, never an argument or a \
-             return, and a call site written against one does not take the other; use `T` \
+            "`.aidl` never renders this `Box` — it boxes only a parcelable field that is \
+             `@nullable(heap=true)` or a `@nullable` one closing a reference cycle, as \
+             `Option<Box<T>>`, never an argument or a return, and a call site written \
+             against one does not take the other; use `T` \
              (a parcelable of your own named `Box` needs a qualified path, such as \
              `crate::…::Box<T>`)",
         ));

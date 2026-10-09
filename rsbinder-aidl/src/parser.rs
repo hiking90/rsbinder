@@ -34,8 +34,8 @@ thread_local! {
     // Non-fatal diagnostics of the current `parse_document`, drained into `Document::warnings`.
     static CURRENT_WARNINGS: RefCell<Vec<crate::error::AidlWarning>> = const { RefCell::new(Vec::new()) };
 
-    // Names bound only by the same-package extension; `None` unless a `Builder` is collecting.
-    static IMPLICIT_IMPORTS: RefCell<Option<BTreeSet<String>>> = const { RefCell::new(None) };
+    // Input rsbinder accepts but AOSP aidl rejects; `None` unless a `Builder` is collecting.
+    static GENERATION_WARNINGS: RefCell<Option<BTreeSet<String>>> = const { RefCell::new(None) };
 
     // Each `crate::BUILTIN_DECLS` entry: AIDL namespace -> Rust path relative to the runtime crate.
     static BUILTIN_RUST_PATHS: RefCell<HashMap<Namespace, String>> = RefCell::new(HashMap::new());
@@ -542,16 +542,12 @@ fn bind_type_name(name: &Namespace) -> Option<Namespace> {
     if !declared(&key) {
         return None;
     }
-    IMPLICIT_IMPORTS.with(|set| {
-        if let Some(set) = set.borrow_mut().as_mut() {
-            let scope = Some(current_namespace()).filter(|ns| !ns.ns.is_empty());
-            set.insert(implicit_import_warning(
-                scope.as_ref().unwrap_or(&top),
-                name,
-                &imported,
-            ));
-        }
-    });
+    let scope = Some(current_namespace()).filter(|ns| !ns.ns.is_empty());
+    note_generation_warning(implicit_import_warning(
+        scope.as_ref().unwrap_or(&top),
+        name,
+        &imported,
+    ));
     Some(key)
 }
 
@@ -567,17 +563,28 @@ fn implicit_import_warning(scope: &Namespace, name: &Namespace, imported: &Names
     )
 }
 
-/// Collect, until [`take_implicit_imports`], a warning for each name the
-/// same-package extension of [`bind_type_name`] binds. AOSP's `aidl` resolves
-/// such a name only through an `import` (`AidlDocument::ResolveName`,
-/// `aidl_language.cpp:1930-1957`), so the `.aidl` fails in an Android build.
-pub(crate) fn collect_implicit_imports() {
-    IMPLICIT_IMPORTS.with(|set| *set.borrow_mut() = Some(BTreeSet::new()));
+/// Collect, until [`take_generation_warnings`], a warning for each input that
+/// generates here but fails AOSP's `aidl` in an Android build: a name bound only
+/// by the same-package extension of [`bind_type_name`] (AOSP resolves it only
+/// through an `import`, `AidlDocument::ResolveName`,
+/// `aidl_language.cpp:1930-1957`), and a bare `@nullable` field on a cycle
+/// (`TypeGenerator::ensure_sized`).
+pub(crate) fn collect_generation_warnings() {
+    GENERATION_WARNINGS.with(|set| *set.borrow_mut() = Some(BTreeSet::new()));
+}
+
+/// Record `message` while a `Builder` collects; dropped otherwise.
+pub(crate) fn note_generation_warning(message: String) {
+    GENERATION_WARNINGS.with(|set| {
+        if let Some(set) = set.borrow_mut().as_mut() {
+            set.insert(message);
+        }
+    });
 }
 
 /// Stop collecting and return the warnings, sorted and without duplicates.
-pub(crate) fn take_implicit_imports() -> Vec<crate::error::AidlWarning> {
-    IMPLICIT_IMPORTS
+pub(crate) fn take_generation_warnings() -> Vec<crate::error::AidlWarning> {
+    GENERATION_WARNINGS
         .with(|set| set.borrow_mut().take())
         .into_iter()
         .flatten()
@@ -599,9 +606,14 @@ fn by_value_type_name(ty: &Type) -> Option<&str> {
     Some(&ty.non_array_type.name)
 }
 
-// Only a bare `@nullable` field gets `Option<Box<…>>`; a fixed-size array keeps elements inline.
+// Only a `@nullable` field can be `Option<Box<…>>`; a fixed-size array keeps elements inline.
 fn is_boxable_nullable(ty: &Type) -> bool {
     ty.array_types.is_empty() && has_annotation(&ty.annotation_list, AnnotationType::IsNullable)
+}
+
+// Always `Option<Box<…>>` (AOSP `aidl_to_rust.cpp:305-306`), so never an inline edge.
+fn is_heap_field(ty: &Type) -> bool {
+    ty.array_types.is_empty() && is_heap_nullable(&ty.annotation_list)
 }
 
 fn value_members(ns: &Namespace) -> Option<Vec<Declaration>> {
@@ -665,12 +677,17 @@ fn is_value_decl(ns: &Namespace) -> bool {
 /// Which fields [`declaration_reaches`] follows.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SizingEdges {
-    /// Every field held by value. A bare `@nullable` field that closes a cycle
-    /// in this graph is the one rendered `Option<Box<…>>`.
+    /// Every field held inline. A `@nullable(heap=true)` field is boxed
+    /// wherever it is, so it is left out; a bare `@nullable` field that closes
+    /// a cycle in this graph is the one rendered `Option<Box<…>>`.
     ByValue,
-    /// Only fields no box can break. A bare `@nullable` field is left out: on a
+    /// Only fields no box can break. Every `@nullable` field is left out: on a
     /// cycle it is boxed, and off every cycle it cannot be part of one.
     Unboxable,
+    /// AOSP `CheckNoRecursiveDefinition` (`parser.cpp:177-188`): every field but
+    /// an array or a `@nullable(heap=true)` one. A cycle here is an input AOSP
+    /// `aidl` rejects.
+    Aosp,
 }
 
 /// Can `start` reach `target` by following the fields of parcelables and
@@ -683,9 +700,7 @@ pub enum SizingEdges {
 /// not be boxed: an interface is a `Strong<dyn …>` — the
 /// `CircularParcelable` / `ITestService` pair in the AOSP fixtures is exactly
 /// that shape — and a `Vec`/`HashMap` element is behind an allocation.
-/// [`SizingEdges::Unboxable`] also drops the bare `@nullable` fields, which is
-/// how AOSP `CheckNoRecursiveDefinition` (`parser.cpp:144-195`) treats
-/// `@nullable(heap=true)`.
+/// [`SizingEdges`] says which further fields each graph drops.
 pub fn declaration_reaches(start: &Namespace, target: &Namespace, edges: SizingEdges) -> bool {
     if !is_value_decl(start) || !is_value_decl(target) {
         return false;
@@ -715,7 +730,13 @@ pub fn declaration_reaches(start: &Namespace, target: &Namespace, edges: SizingE
             let Some(name) = by_value_type_name(&var.r#type) else {
                 continue;
             };
-            if edges == SizingEdges::Unboxable && is_boxable_nullable(&var.r#type) {
+            let ty = &var.r#type;
+            let skip = match edges {
+                SizingEdges::ByValue => is_heap_field(ty),
+                SizingEdges::Unboxable => is_boxable_nullable(ty),
+                SizingEdges::Aosp => !ty.array_types.is_empty() || is_heap_field(ty),
+            };
+            if skip {
                 continue;
             }
             let Some(found) = lookup_decl_from_name(name, Namespace::AIDL) else {
@@ -1503,6 +1524,19 @@ pub enum AnnotationType {
     /// `@VintfStability` this is **not** scoped: AOSP reads it with the plain
     /// `GetAnnotation`, so a nested declaration does not inherit it.
     FixedSize,
+}
+
+/// AOSP `AidlAnnotatable::IsHeapNullable`: `@nullable(heap=true)`.
+pub fn is_heap_nullable(annotation_list: &[Annotation]) -> bool {
+    annotation_list.iter().any(|annotation| {
+        annotation.annotation == "@nullable"
+            && annotation.parameter_list.iter().any(|p| {
+                p.identifier == "heap"
+                    && p.const_expr
+                        .calculate()
+                        .is_ok_and(|c| c.to_bool().unwrap_or(false))
+            })
+    })
 }
 
 /// Returns whether the annotation list contains the queried annotation.
@@ -2370,6 +2404,34 @@ fn parse_annotation_list(
                     ),
                     annotation.annotation_span,
                 ));
+            }
+        }
+
+        // AOSP `AidlAnnotation::CheckValid` against the `nullable` schema: `heap`, a boolean.
+        if annotation.annotation == "@nullable" {
+            for param in &annotation.parameter_list {
+                if param.identifier != "heap" {
+                    return Err(make_invalid_operation_error(
+                        format!(
+                            "Parameter {} not supported for annotation nullable. \
+                             It must be one of: heap",
+                            param.identifier
+                        ),
+                        annotation.annotation_span,
+                    ));
+                }
+                if !matches!(
+                    param.const_expr.calculate().map(|c| c.value),
+                    Ok(ValueType::Bool(_)
+                        | ValueType::Byte(_)
+                        | ValueType::Int32(_)
+                        | ValueType::Int64(_))
+                ) {
+                    return Err(make_invalid_operation_error(
+                        "Invalid value for parameter heap on annotation nullable.".into(),
+                        annotation.annotation_span,
+                    ));
+                }
             }
         }
 
@@ -3440,6 +3502,44 @@ mod tests {
     use super::*;
     use std::error::Error;
 
+    /// A bare `@nullable` field on a cycle AOSP sees is reported; AOSP rejects that `.aidl`.
+    #[test]
+    fn bare_nullable_on_an_aosp_cycle_warns() -> Result<(), Box<dyn Error>> {
+        let warnings_for = |text: &str| -> Result<Vec<String>, Box<dyn Error>> {
+            let doc = parse_document(&SourceContext::new("p/T.aidl", text))?;
+            collect_generation_warnings();
+            let generated = crate::Generator::new(false, false).document(&doc);
+            let warnings = take_generation_warnings()
+                .into_iter()
+                .map(|w| w.message)
+                .collect();
+            generated?;
+            Ok(warnings)
+        };
+        let advice = "AOSP aidl rejects the cycle as a recursive parcelable; \
+                      write `@nullable(heap=true)`";
+
+        let w = warnings_for("package p; parcelable A { @nullable B b; } parcelable B { A a; }")?;
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].starts_with("p.A.b: ") && w[0].contains(advice),
+            "{w:?}"
+        );
+        let w = warnings_for("package p; parcelable A { @nullable A next; }")?;
+        assert!(w.len() == 1 && w[0].starts_with("p.A.next: "), "{w:?}");
+
+        // No warning where AOSP accepts the input: `heap=true`, or a cycle through an array.
+        for text in [
+            "package p; parcelable A { @nullable(heap=true) B b; } parcelable B { A a; }",
+            "package p; parcelable A { @nullable(heap=true) B b; } parcelable B { @nullable A a; }",
+            "package p; parcelable Tree { Node[3] n; } parcelable Node { @nullable Tree t; }",
+            "package p; parcelable B { int x; } parcelable A { @nullable B b; }",
+        ] {
+            assert!(warnings_for(text)?.is_empty(), "{text}");
+        }
+        Ok(())
+    }
+
     /// A name only the same-package extension binds is reported once; an imported one is not.
     #[test]
     fn same_package_name_without_import_warns() -> Result<(), Box<dyn Error>> {
@@ -3455,11 +3555,11 @@ mod tests {
         )?;
         let gen = crate::Generator::new(false, false);
 
-        collect_implicit_imports();
+        collect_generation_warnings();
         for doc in [&bar, &foo, &baz] {
             gen.document(doc)?;
         }
-        let warnings: Vec<String> = take_implicit_imports()
+        let warnings: Vec<String> = take_generation_warnings()
             .into_iter()
             .map(|w| w.message)
             .collect();
@@ -3473,7 +3573,7 @@ mod tests {
 
         // Without a collector (the proc macro, `Generator` alone) nothing accumulates.
         gen.document(&foo)?;
-        assert!(take_implicit_imports().is_empty());
+        assert!(take_generation_warnings().is_empty());
         Ok(())
     }
 

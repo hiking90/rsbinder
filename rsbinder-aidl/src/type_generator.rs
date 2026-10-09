@@ -177,9 +177,14 @@ impl ArrayInfo {
     }
 }
 
+/// AOSP's refusal of `heap=true` on anything but a parcelable, word for word.
+const HEAP_NEEDS_PARCELABLE: &str = "@nullable(heap=true) is available to parcelables.";
+
 #[derive(Clone)]
 pub struct TypeGenerator {
     pub(crate) is_nullable: bool,
+    /// `@nullable(heap=true)`: a field of this type is `Option<Box<T>>` wherever it is.
+    is_heap_nullable: bool,
     pub value_type: ValueType,
     array_types: Vec<ArrayInfo>,
     /// User-defined generic's arguments, bare or as array/`List` element; empty otherwise.
@@ -287,6 +292,7 @@ impl TypeGenerator {
 
         Ok(Self {
             is_nullable: false,
+            is_heap_nullable: false,
             value_type,
             array_types,
             type_args,
@@ -345,16 +351,23 @@ impl TypeGenerator {
             this = this.array(&_type.array_types)?;
         }
 
-        if has_annotation(&_type.annotation_list, AnnotationType::IsNullable) {
-            let nullable_span = _type
-                .annotation_list
-                .iter()
-                .find(|a| a.annotation == "@nullable")
-                .and_then(|a| a.annotation_span);
-            this.nullable_at(nullable_span)
-        } else {
-            Ok(this)
+        if !has_annotation(&_type.annotation_list, AnnotationType::IsNullable) {
+            return Ok(this);
         }
+        let nullable_span = _type
+            .annotation_list
+            .iter()
+            .find(|a| a.annotation == "@nullable")
+            .and_then(|a| a.annotation_span);
+        let mut this = this.nullable_at(nullable_span)?;
+        if is_heap_nullable(&_type.annotation_list) {
+            // AOSP `CheckValid` (`aidl_language.cpp:914-918`); `ensure_resolvable` sees the decl.
+            if is_array || !matches!(this.value_type, ValueType::UserDefined(_)) {
+                return Err(make_type_error(HEAP_NEEDS_PARCELABLE, nullable_span));
+            }
+            this.is_heap_nullable = true;
+        }
+        Ok(this)
     }
 
     /// Verify that every user-defined type this generator references resolves
@@ -390,6 +403,14 @@ impl TypeGenerator {
         }
         for arg in &self.type_args {
             arg.ensure_resolvable()?;
+        }
+        // AOSP `AsParcelable()`: a structured or unstructured parcelable, or a union.
+        if self.is_heap_nullable
+            && !named.as_ref().is_some_and(|d| {
+                matches!(d.decl, Declaration::Parcelable(_) | Declaration::Union(_))
+            })
+        {
+            return Err(make_type_error(HEAP_NEEDS_PARCELABLE, self.type_span));
         }
         match named {
             Some(lookup_decl) => self.ensure_type_args(&lookup_decl),
@@ -519,9 +540,13 @@ impl TypeGenerator {
     /// process. Only fields no box can break count here
     /// (`SizingEdges::Unboxable`): once a `@nullable` field on a cycle is boxed,
     /// the other fields on it stay inline, as AOSP `CheckNoRecursiveDefinition`
-    /// accepts for `@nullable(heap=true)`. Must be invoked while the owning
-    /// declaration's `NamespaceGuard` is active.
-    pub fn ensure_sized(&self) -> Result<(), AidlError> {
+    /// accepts for `@nullable(heap=true)`.
+    ///
+    /// A bare `@nullable` field (no `heap=true`) on a cycle AOSP sees is boxed
+    /// too, but AOSP rejects it, so it records a generation warning naming
+    /// `field`. Must be invoked while the owning declaration's
+    /// `NamespaceGuard` is active.
+    pub fn ensure_sized(&self, field: &str) -> Result<(), AidlError> {
         // Only bare fields (`@nullable` rescues) and inline `[T; N]` (no Box codec) close cycles.
         let (type_name, nullable_rescues) = match &self.value_type {
             ValueType::UserDefined(name) => (name, true),
@@ -534,19 +559,29 @@ impl TypeGenerator {
             },
             _ => return Ok(()),
         };
-        if nullable_rescues && self.is_nullable {
-            return Ok(());
-        }
         let Some(lookup_decl) = lookup_decl_from_name(type_name, crate::Namespace::AIDL) else {
             return Ok(());
         };
+        if nullable_rescues && self.is_nullable {
+            if !self.is_heap_nullable
+                && Self::closes_reference_cycle(&lookup_decl, SizingEdges::Aosp)
+            {
+                parser::note_generation_warning(format!(
+                    "{}.{field}: a `@nullable` field that closes a reference cycle is \
+                     `Option<Box<…>>` here, but AOSP aidl rejects the cycle as a recursive \
+                     parcelable; write `@nullable(heap=true)`",
+                    current_namespace().to_string(crate::Namespace::AIDL),
+                ));
+            }
+            return Ok(());
+        }
         if !Self::closes_reference_cycle(&lookup_decl, SizingEdges::Unboxable) {
             return Ok(());
         }
         let (src, span) = diagnostic_source(self.type_span);
         let help = if nullable_rescues {
-            "mark the field `@nullable` so it becomes `Option<Box<…>>`, which \
-             breaks the cycle and can still be default-constructed"
+            "mark the field `@nullable(heap=true)` so it becomes `Option<Box<…>>`, \
+             which breaks the cycle and can still be default-constructed"
         } else {
             "a fixed-size array keeps its elements inline; use a \
              variable-length array (`T[]`) so the elements live behind a `Vec`"
@@ -594,7 +629,8 @@ impl TypeGenerator {
     }
 
     /// `allow_box` is false for array elements: `Box<T>` has no `SerializeArray` impl.
-    fn make_user_defined_type_name(&self, type_name: &str, allow_box: bool) -> String {
+    /// `field`: a parcelable or union field, the only place `heap=true` boxes here.
+    fn make_user_defined_type_name(&self, type_name: &str, allow_box: bool, field: bool) -> String {
         let lookup_decl = lookup_decl_from_name(type_name, crate::Namespace::AIDL)
             .expect("type must be resolved during code generation");
         let curr_ns = current_namespace();
@@ -603,10 +639,12 @@ impl TypeGenerator {
         let simple = crate::escape_rust_keyword(lookup_decl.name.ns.last().unwrap());
         let is_interface = matches!(lookup_decl.decl, Declaration::Interface(_));
         // Only `@nullable` boxes: `Option` ends `Default` recursion; `ensure_sized` rejects others.
+        // `heap=true` boxes wherever it is (AOSP `aidl_to_rust.cpp:305-306`), a bare one on a cycle.
         let needs_box = allow_box
             && self.is_nullable
             && !is_interface
-            && Self::closes_reference_cycle(&lookup_decl, SizingEdges::ByValue);
+            && ((field && self.is_heap_nullable)
+                || Self::closes_reference_cycle(&lookup_decl, SizingEdges::ByValue));
         // A builtin is the runtime crate's type, not a module of this output.
         let path = if let Some(builtin) = parser::builtin_rust_path(&lookup_decl.ns) {
             format!("{}::{builtin}", crate_name())
@@ -1122,6 +1160,11 @@ impl TypeGenerator {
     }
 
     fn type_decl(&self, value_type: &ValueType, allow_box: bool) -> String {
+        self.type_decl_in(value_type, allow_box, false)
+    }
+
+    /// [`type_decl`](Self::type_decl); `field` lets `heap=true` box (`make_user_defined_type_name`).
+    fn type_decl_in(&self, value_type: &ValueType, allow_box: bool, field: bool) -> String {
         match value_type {
             ValueType::Void => "()".into(),
             ValueType::String(_) => STRING.into(),
@@ -1139,7 +1182,9 @@ impl TypeGenerator {
             ValueType::IBinder => format!("{}::SIBinder", crate_name()),
             ValueType::FileDescriptor => format!("{}::ParcelFileDescriptor", crate_name()),
             ValueType::Holder => format!("{}::ParcelableHolder", crate_name()),
-            ValueType::UserDefined(name) => self.make_user_defined_type_name(name, allow_box),
+            ValueType::UserDefined(name) => {
+                self.make_user_defined_type_name(name, allow_box, field)
+            }
             _ => unreachable!(),
         }
     }
@@ -1155,7 +1200,7 @@ impl TypeGenerator {
                 {
                     is_nullable = true;
                 }
-                self.type_decl(&self.value_type, true)
+                self.type_decl_in(&self.value_type, true, is_struct)
             }
         };
 

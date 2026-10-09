@@ -9,7 +9,10 @@ use rsbinder::{Parcel, Parcelable};
 
 include!(concat!(env!("OUT_DIR"), "/boxed_cycles.rs"));
 
-use boxedcycles::BoxedCycles::{Inner::Inner, Node::Node, Outer::Outer, Tree::Tree};
+use boxedcycles::BoxedCycles::{
+    Back::Back, Front::Front, HeapLeaf::HeapLeaf, HeapUnion::HeapUnion, Inner::Inner, Leaf::Leaf,
+    Node::Node, Outer::Outer, Tree::Tree,
+};
 
 fn round_trip<T>(value: &T) -> T
 where
@@ -40,6 +43,31 @@ fn inline_field_beside_a_heap_nullable_edge_round_trips() {
     let inner = back.outer.inner.expect("inner");
     assert_eq!(inner.value, 3);
     assert!(inner.outer.inner.is_none());
+}
+
+/// The field types are the assertion: each binding fails to compile if the shape changes.
+#[test]
+fn heap_nullable_off_a_cycle_is_boxed_as_aosp_renders_it() {
+    let leaf: Option<Box<Leaf>> = Some(Box::new(Leaf { value: 7 }));
+    let back = round_trip(&HeapLeaf { leaf });
+    assert_eq!(back.leaf.map(|l| l.value), Some(7));
+
+    let back = round_trip(&HeapUnion::Leaf(Some(Box::new(Leaf { value: 8 }))));
+    match back {
+        HeapUnion::Leaf(Some(leaf)) => assert_eq!(leaf.value, 8),
+        other => panic!("union came back as {other:?}"),
+    }
+
+    let front: Option<Front> = Some(Front::default());
+    let back_edge: Option<Box<Back>> = Some(Box::new(Back { front }));
+    let back = round_trip(&Front { back: back_edge });
+    assert!(back
+        .back
+        .expect("back")
+        .front
+        .expect("front")
+        .back
+        .is_none());
 }
 
 #[test]

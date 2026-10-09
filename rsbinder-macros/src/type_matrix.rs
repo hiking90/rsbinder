@@ -449,7 +449,8 @@ fn types_md() -> String {
          spelling of these types the macro refuses, naming the cell you \
          wanted — except between the `Cfg` and `Mode` rows, which are both a \
          bare name to the macro, and a field's `Option<Box<Cfg>>`, which `.aidl` \
-         writes for a `@nullable` parcelable field that closes a reference cycle.\n\
+         writes for a `@nullable(heap=true)` parcelable field and for a \
+         `@nullable` one that closes a reference cycle.\n\
          \n\
          `—` marks a combination AIDL itself rejects.\n\
          \n\

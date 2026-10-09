@@ -107,13 +107,13 @@
 //! accepts either and cannot tell you which is right — spell an enum element
 //! bare and a parcelable element `Option<_>`, as `.aidl` renders them.
 //!
-//! **A `Box` appears in one place only.** `.aidl` boxes a `@nullable`
-//! parcelable field that closes a reference cycle — `Option<Box<T>>` — and
-//! nothing else, so a `Box` anywhere else is refused, including every argument
-//! and return: a cycle is judged against the declaration being generated, and
-//! an interface is never part of one. Whether a field's
-//! cycle closes depends on declarations the macro cannot see, so it accepts
-//! that spelling on any parcelable field; write it only where the cycle is real.
+//! **A `Box` appears in one place only.** `.aidl` boxes a parcelable field
+//! that is `@nullable(heap=true)`, or a bare `@nullable` one that closes a
+//! reference cycle — `Option<Box<T>>` — and nothing else, so a `Box` anywhere
+//! else is refused, including every argument and return: a cycle is judged
+//! against the declaration being generated, and an interface is never part of
+//! one. Which `.aidl` field that spelling stands for depends on annotations and
+//! declarations the macro cannot see, so it accepts it on any parcelable field.
 //!
 //! **Paths resolve inside the generated module.** The body lands in a
 //! `{Trait}_binder` module one level below where the macro was written, and it

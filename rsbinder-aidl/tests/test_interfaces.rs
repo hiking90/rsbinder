@@ -660,6 +660,87 @@ parcelable Node {
     Ok(())
 }
 
+fn generate(input: &str) -> Result<String, Box<dyn Error>> {
+    let ctx = rsbinder_aidl::SourceContext::new("test.aidl", input);
+    let document = rsbinder_aidl::parse_document(&ctx)?;
+    let out = rsbinder_aidl::Generator::new(false, false)
+        .document(&document)?
+        .1;
+    syn::parse_file(&out).map_err(|e| format!("generated code does not parse: {e}\n{out}"))?;
+    Ok(out)
+}
+
+/// A `heap=true` field is `Option<Box<T>>` on a cycle or off one, as AOSP's Rust backend renders
+/// it (`aidl_to_rust.cpp:305-306`); a method argument keeps its type.
+#[test]
+fn heap_nullable_boxes_a_field_wherever_it_is() -> Result<(), Box<dyn Error>> {
+    let out = generate("parcelable B { int x; } parcelable A { @nullable(heap=true) B b; }")?;
+    assert!(
+        out.contains("pub r#b: ::core::option::Option<::std::boxed::Box<super::B::B>>,"),
+        "{out}"
+    );
+    let out = generate("parcelable B { int x; } union U { int x; @nullable(heap=true) B b; }")?;
+    assert!(
+        out.contains("r#B(::core::option::Option<::std::boxed::Box<super::B::B>>)"),
+        "{out}"
+    );
+    let out =
+        generate("parcelable P { int x; } interface I { void f(in @nullable(heap=true) P p); }")?;
+    assert!(!out.contains("::std::boxed::Box<"), "{out}");
+    Ok(())
+}
+
+/// A `heap=true` field is no inline edge, so a bare `@nullable` field it cuts off stays `Option<T>`.
+#[test]
+fn a_heap_field_cuts_the_cycle_for_the_bare_field_behind_it() -> Result<(), Box<dyn Error>> {
+    let out =
+        generate("parcelable A { @nullable(heap=true) B b; } parcelable B { @nullable A a; }")?;
+    assert!(
+        out.contains("pub r#a: ::core::option::Option<super::A::A>,"),
+        "{out}"
+    );
+    assert_eq!(out.matches("::std::boxed::Box<").count(), 1, "{out}");
+    Ok(())
+}
+
+/// AOSP `CheckValid` (`aidl_language.cpp:914-918`): `heap=true` only on a parcelable or union.
+#[test]
+fn heap_nullable_on_a_non_parcelable_is_rejected() {
+    for input in [
+        "parcelable A { @nullable(heap=true) String s; }",
+        "parcelable B { int x; } parcelable A { @nullable(heap=true) B[] bs; }",
+        "parcelable B { int x; } parcelable A { @nullable(heap=true) List<B> bs; }",
+        "interface I {} parcelable A { @nullable(heap=true) I i; }",
+        "parcelable A { @nullable(heap=true) IBinder b; }",
+        "interface I { void f(in @nullable(heap=true) String s); }",
+    ] {
+        aidl_generator_should_fail(input, "@nullable(heap=true) is available to parcelables.");
+    }
+}
+
+/// AOSP `AidlAnnotation::CheckValid`: `@nullable` takes only `heap`, a boolean.
+#[test]
+fn a_nullable_parameter_outside_its_schema_is_rejected() {
+    for (input, error) in [
+        (
+            "parcelable B { int x; } parcelable A { @nullable(hep=true) B b; }",
+            "Parameter hep not supported for annotation nullable",
+        ),
+        (
+            "parcelable B { int x; } parcelable A { @nullable(true) B b; }",
+            "Parameter value not supported for annotation nullable",
+        ),
+        (
+            "parcelable B { int x; } parcelable A { @nullable(heap=\"yes\") B b; }",
+            "Invalid value for parameter heap on annotation nullable",
+        ),
+    ] {
+        let ctx = rsbinder_aidl::SourceContext::new("test.aidl", input);
+        let err = rsbinder_aidl::parse_document(&ctx).expect_err(input);
+        assert!(err.to_string().contains(error), "{input}: {err}");
+    }
+}
+
 /// Each name is already an item of the generated interface module: rustc E0428 downstream.
 #[test]
 fn names_clashing_with_generated_interface_items_are_rejected() {

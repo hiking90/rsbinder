@@ -133,6 +133,19 @@ This changelog starts at 0.9.0. For earlier releases, see the
   `int` `-1`, so a `long` constant set to it is `-1`, not `4294967295`, and
   `0x1FFFFFFFFu32` is a `long` instead of a parse error. Nothing in the build
   warns; a constant sent on the wire changes value.
+- **`rsbinder-aidl`: `@nullable(heap=true)` is no longer ignored.** A
+  parcelable or union field marked with it is `Option<Box<T>>` wherever it
+  is, as AOSP's Rust backend renders it (`aidl_to_rust.cpp:305-306`); only
+  one on a reference cycle was boxed before, so code building or matching
+  such a field off a cycle as `Option<T>` stops compiling (wrap the value in
+  `Box::new`). Such a field no longer counts as an inline edge either, so a
+  bare `@nullable` field it cuts off a cycle is `Option<T>`, not
+  `Option<Box<T>>`: in `parcelable A { @nullable(heap=true) B b; }
+  parcelable B { @nullable A a; }`, `B.a` is now `Option<A>`. `heap=true` on
+  anything but a parcelable or union type (a `String`, an array, an
+  interface) and any `@nullable` parameter but `heap` are refused, with
+  AOSP's messages. The wire is unchanged. Method arguments and returns keep
+  their types.
 - **`rsbinder-aidl`: a union whose first field is an enum without an
   initializer defaults to the enum's `Default` (backing value `0`)**, not to
   its first enumerator (see *Fixed*). For `enum E { A = 5, B = 6 }` and
@@ -776,6 +789,13 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Changed
 
+- **`rsbinder-aidl` warns on a bare `@nullable` field that closes a reference
+  cycle.** It still generates the field as `Option<Box<T>>`, but AOSP `aidl`
+  rejects the cycle as a recursive parcelable (`CheckNoRecursiveDefinition`
+  skips only arrays and `@nullable(heap=true)` fields), so `Builder::generate`
+  prints a `cargo:warning` naming the field; write `@nullable(heap=true)`. The
+  recursive-parcelable error now suggests `heap=true` as well, and the book
+  recommends it in place of a bare `@nullable`.
 - **A kernel proxy's cache entry and its `BC_INCREFS` reference are released
   when the last `SIBinder` and the last `WIBinder` for the handle are gone**,
   as AOSP releases them in `~BpBinder` (`expungeHandle` + `decWeakHandle`).

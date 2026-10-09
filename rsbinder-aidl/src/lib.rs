@@ -1038,15 +1038,18 @@ impl Builder {
     /// Parse every source and write the generated Rust to the output path.
     ///
     /// Findings that do not stop generation print as `cargo:warning=` lines:
-    /// an unknown annotation, and a type named without an `import` that
-    /// resolves only because another file declares it in the same package.
-    /// rsbinder accepts that name, but AOSP's `aidl` resolves it only through
-    /// an import (`AidlDocument::ResolveName`), so the same `.aidl` fails in an
-    /// Android build; add the `import` the warning names.
+    /// an unknown annotation, and two inputs rsbinder generates but AOSP's
+    /// `aidl` rejects, so the same `.aidl` fails in an Android build. One is a
+    /// type named without an `import` that resolves only because another file
+    /// declares it in the same package (AOSP resolves it only through an
+    /// import, `AidlDocument::ResolveName`); add the `import` the warning
+    /// names. The other is a bare `@nullable` field that closes a reference
+    /// cycle, which AOSP rejects as a recursive parcelable; write
+    /// `@nullable(heap=true)`.
     pub fn generate(self) -> Result<(), AidlError> {
-        parser::collect_implicit_imports();
+        parser::collect_generation_warnings();
         let result = self.generate_collecting();
-        for w in parser::take_implicit_imports() {
+        for w in parser::take_generation_warnings() {
             println!("cargo:warning={}", w.message);
         }
         result
