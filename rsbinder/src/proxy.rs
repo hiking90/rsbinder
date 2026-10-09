@@ -18,22 +18,23 @@
 //!   the flag outside the lock would leave a window where `send_obituary`
 //!   sets the flag and drains the recipients between the check and the lock,
 //!   so a recipient registered after death would never fire.
-//! - `BC_REQUEST_DEATH_NOTIFICATION` is queued only when the list goes from
-//!   empty to non-empty, and `BC_CLEAR_DEATH_NOTIFICATION` only when an unlink
-//!   takes it from non-empty to empty; unlinking from an already-empty list
-//!   (the `NameNotFound` path) queues nothing for a subscription that was
-//!   never requested. A failed parcel write of either command propagates, as
-//!   it signals `out_parcel` corruption (rare, e.g. OOM) rather than a driver
-//!   round-trip problem. The following `flush_commands` result is ignored,
-//!   as C++ ignores `flushCommands`; propagating it would skip
-//!   `recipients.push` and leave the kernel with a subscription that no
-//!   recipient can service.
+//! - The list going from empty to non-empty, and back (unlink, drop or
+//!   obituary), is reported to `ProcessState`'s per-handle death registry,
+//!   which decides `BC_REQUEST_DEATH_NOTIFICATION` and
+//!   `BC_CLEAR_DEATH_NOTIFICATION`: the registration belongs to the handle,
+//!   since a dropping proxy and its replacement can coexist and the old
+//!   proxy's clear would otherwise remove the new proxy's registration
+//!   (`death` module doc). Unlinking from an already-empty list (the
+//!   `NameNotFound` path) reports nothing. A link fails only if its request
+//!   never reached the kernel (a failed write, or a flush the driver consumed
+//!   nothing of, which is rewound), so `recipients.push` is skipped exactly
+//!   when no recipient could be serviced. An unlink's flush result is
+//!   ignored, as C++ ignores `flushCommands`.
 //! - `link_to_death` rejects a recipient whose strong count is already zero
 //!   (`BadValue`) — a common mistake when the caller drops the
 //!   `Arc<dyn DeathRecipient>` before passing the weak, which `send_obituary`
-//!   would otherwise skip silently. The check runs before
-//!   `request_death_notification`, so a dead weak never consumes a kernel
-//!   subscription. It does not cover a recipient dropped after
+//!   would otherwise skip silently. The check runs before the registry is
+//!   told, so a dead weak never consumes a kernel subscription. It does not cover a recipient dropped after
 //!   `link_to_death` returns; that is ordinary `Weak` semantics.
 //! - `unlink_to_death` removes only the first matching entry
 //!   (order-preserving, C++ `removeAt(i)`); a `retain` would drop every
@@ -50,7 +51,8 @@
 //!    `unlink_to_death` on the same proxy without deadlocking.
 //! 3. A second `send_obituary` (e.g. a spurious double `BR_DEAD_BINDER`) sees
 //!    `obituary_sent` and returns, as C++'s `if (mObitsSent) return;`.
-//! 4. `BC_CLEAR_DEATH_NOTIFICATION` is queued before the list is taken, best
+//! 4. The unlink (and with it any `BC_CLEAR_DEATH_NOTIFICATION`) is reported
+//!    before the list is taken, best
 //!    effort: `BR_DEAD_BINDER` is delivered once, so a queueing failure must
 //!    not abort the obituary, or the recipients would never hear of the death
 //!    and `obituary_sent` would never latch.
@@ -193,7 +195,7 @@ use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{self, Arc, RwLock};
 
-use crate::process_state::HandlePin;
+use crate::process_state::{HandlePin, ProcessState};
 use crate::{binder::*, error::*, parcel::*, parcelable::DeserializeOption, thread_state};
 
 /// Proxy-side extension cache; strong vs weak rule in module doc "Extension cache".
@@ -229,6 +231,10 @@ pub struct ProxyHandle {
     obituary_sent: AtomicBool,
     recipients: RwLock<Vec<sync::Weak<dyn DeathRecipient>>>,
     extension: RwLock<ExtensionCache>,
+    /// Set by every freeze-callback add, never cleared; while unset `Drop` skips the freeze lock.
+    freeze_used: AtomicBool,
+    /// Freeze delivery target, independent of the proxy cache an obituary empties.
+    me: sync::Weak<ProxyHandle>,
 }
 
 impl ProxyHandle {
@@ -240,7 +246,7 @@ impl ProxyHandle {
     ) -> Result<Arc<Self>> {
         let handle = pin.handle();
         thread_state::inc_strong_handle(handle)?;
-        Ok(Arc::new(Self {
+        Ok(Arc::new_cyclic(|me| Self {
             handle,
             pin: Arc::clone(pin),
             descriptor,
@@ -248,7 +254,14 @@ impl ProxyHandle {
             obituary_sent: AtomicBool::new(false),
             recipients: RwLock::new(Vec::new()),
             extension: RwLock::new(ExtensionCache::NotQueried),
+            freeze_used: AtomicBool::new(false),
+            me: me.clone(),
         }))
+    }
+
+    /// This proxy's key in the death and freeze registries; stable while it lives.
+    fn owner_key(&self) -> usize {
+        self as *const Self as usize
     }
 
     /// Get the underlying binder handle number.
@@ -339,7 +352,8 @@ impl ProxyHandle {
 
             if !recipients.is_empty() {
                 // Best effort, as AOSP: a failure must not stop the once-only obituary.
-                if let Err(e) = thread_state::clear_death_notification(self.handle()) {
+                let unlinked = ProcessState::as_self().unlink_death(self.handle, self.owner_key());
+                if let Err(e) = unlinked {
                     log::error!(
                         "clear_death_notification failed for handle {}: {e:?}; \
                          delivering the obituary anyway",
@@ -469,13 +483,18 @@ impl Drop for ProxyHandle {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_empty();
         if linked {
-            // A failed clear stays counted, so the pin outlives the subscription anyway.
-            if let Err(err) = thread_state::clear_death_notification(self.handle) {
+            // Clears only if no newer proxy of the handle linked meanwhile (`death` module doc).
+            let unlinked = ProcessState::as_self().unlink_death(self.handle, self.owner_key());
+            if let Err(err) = unlinked {
                 log::error!(
                     "BC_CLEAR_DEATH_NOTIFICATION for handle {} failed during Drop: {err:?}",
                     self.handle
                 );
             }
+        }
+        // Set only once an add reached an initialized `ProcessState`, so `as_self` cannot panic.
+        if *self.freeze_used.get_mut() {
+            ProcessState::as_self().drop_frozen_owner(self.handle, self.owner_key());
         }
         // Safe: the cache pin's BC_INCREFS keeps the slot alive (module doc "Reference counts").
         if let Err(err) = thread_state::dec_strong_handle(self.handle) {
@@ -541,9 +560,8 @@ impl IBinder for ProxyHandle {
             return Err(StatusCode::BadValue);
         }
         if recipients.is_empty() {
-            // As C++ `BpBinder::linkToDeath`: write errors propagate, flush errors are ignored.
-            thread_state::request_death_notification(self.handle())?;
-            let _ = thread_state::flush_commands();
+            // Per handle, not per proxy (`death` module doc); errs only if nothing got registered.
+            ProcessState::as_self().link_death(self.handle, self.owner_key())?;
         }
         recipients.push(recipient);
         Ok(())
@@ -574,11 +592,48 @@ impl IBinder for ProxyHandle {
         };
         recipients.remove(i);
         if recipients.is_empty() {
-            // Symmetric with `link_to_death`: write errors propagate, flush errors are ignored.
-            thread_state::clear_death_notification(self.handle())?;
-            let _ = thread_state::flush_commands();
+            // Write errors propagate; flush errors are ignored, as C++ `unlinkToDeath`.
+            ProcessState::as_self().unlink_death(self.handle, self.owner_key())?;
+            let _ = thread_state::flush_commands_if_alive();
         }
         Ok(())
+    }
+
+    /// AOSP `BpBinder::addFrozenStateChangeCallback`; see `process_state` "Freeze notifications".
+    fn add_frozen_state_change_callback(
+        &self,
+        callback: sync::Weak<dyn FrozenStateChangeCallback>,
+    ) -> Result<()> {
+        // AOSP order: a dead weak is `BAD_VALUE` before the driver is consulted.
+        if callback.upgrade().is_none() {
+            return Err(StatusCode::BadValue);
+        }
+        let process = ProcessState::as_self();
+        if !process.freeze_notification_supported() {
+            return Err(StatusCode::InvalidOperation);
+        }
+        if !process.thread_pool_started() && process.current_threads.load(Ordering::Relaxed) == 0 {
+            // AOSP's `getThreadPoolMaxTotalThreadCount() == 0` (`BpBinder.cpp:617`): no looper yet.
+            log::error!(
+                "add_frozen_state_change_callback on {} but no thread serves binder: \
+                 notifications wait for start_thread_pool or join_thread_pool",
+                self.descriptor
+            );
+        }
+        // Before the add: a callback it delivers may remove itself before the add returns.
+        self.freeze_used.store(true, Ordering::Relaxed);
+        process.add_frozen_callback(self.handle, self.owner_key(), self.me.clone(), callback)
+    }
+
+    /// AOSP `BpBinder::removeFrozenStateChangeCallback`; the first match only.
+    fn remove_frozen_state_change_callback(
+        &self,
+        callback: sync::Weak<dyn FrozenStateChangeCallback>,
+    ) -> Result<()> {
+        if !self.freeze_used.load(Ordering::Relaxed) {
+            return Err(StatusCode::NameNotFound);
+        }
+        ProcessState::as_self().remove_frozen_callback(self.handle, self.owner_key(), &callback)
     }
 
     /// Send a ping transaction to this object
@@ -686,7 +741,7 @@ mod tests {
 
     /// `ProxyHandle` with no kernel refs; `mem::forget` it to skip `BC_RELEASE` and `BC_DECREFS`.
     fn synthetic_proxy(obituary_sent: bool) -> Arc<ProxyHandle> {
-        Arc::new(ProxyHandle {
+        Arc::new_cyclic(|me| ProxyHandle {
             handle: 1,
             pin: HandlePin::synthetic(1, 1),
             descriptor: "test".to_string(),
@@ -694,6 +749,8 @@ mod tests {
             obituary_sent: AtomicBool::new(obituary_sent),
             recipients: RwLock::new(Vec::new()),
             extension: RwLock::new(ExtensionCache::NotQueried),
+            freeze_used: AtomicBool::new(false),
+            me: me.clone(),
         })
     }
 

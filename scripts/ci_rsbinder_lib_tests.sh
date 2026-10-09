@@ -29,6 +29,7 @@ binder_device=(
     process_state::tests::test_strong_proxy_under_same_thread_dead_binder_no_deadlock
     process_state::tests::set_call_restriction_reaches_a_thread_that_already_used_binder
     tests::process_state
+    thread_state::tests::a_refused_freeze_request_behind_queued_commands_fails
     thread_state::tests::calling_sid_outlives_the_transaction_buffer
     thread_state::tests::nested_kernel_transaction_answers_for_the_kernel_caller
     thread_state::tests::test_clear_and_restore_calling_identity_round_trip

@@ -254,8 +254,12 @@ pub mod bridge;
 mod command_stream;
 // Error types; private, `Result` and `StatusCode` are re-exported at the crate root.
 mod error;
+// Per-handle death-registration bookkeeping behind `IBinder::link_to_death`.
+mod death;
 // `ParcelFileDescriptor`, re-exported at the crate root.
 mod file_descriptor;
+// Per-handle freeze-notification bookkeeping behind `IBinder::add_frozen_state_change_callback`.
+mod freeze;
 // `LazyServiceRegistrar`; documented inside (plain comment, same reason as `entry`).
 pub mod lazy_service;
 mod macros;
@@ -350,14 +354,15 @@ pub use rsbinder_macros::{interface, BinderEnum, Parcelable, ServiceSpecificErro
 
 // From `binder` — core binder identity, transaction codes, traits.
 pub use binder::{
-    DeathRecipient, FromIBinder, IBinder, Interface, Remotable, RemoteProxy, SIBinder, Stability,
-    Strong, ToAsyncInterface, ToSyncInterface, Transactable, TransactionCode, TransactionFlags,
-    WIBinder, Weak, DEBUG_PID_TRANSACTION, DUMP_TRANSACTION, EXTENSION_TRANSACTION,
-    FIRST_CALL_TRANSACTION, FLAG_CLEAR_BUF, FLAG_COLLECT_NOTED_APP_OPS, FLAG_ONEWAY,
-    FLAG_PRIVATE_LOCAL, FLAG_PRIVATE_VENDOR, FLAG_UPDATE_TXN, INTERFACE_HEADER,
-    INTERFACE_TRANSACTION, LAST_CALL_TRANSACTION, LIKE_TRANSACTION, PING_TRANSACTION,
-    SET_RPC_CLIENT_TRANSACTION, SHELL_COMMAND_TRANSACTION, START_RECORDING_TRANSACTION,
-    STOP_RECORDING_TRANSACTION, SYSPROPS_TRANSACTION, TWEET_TRANSACTION,
+    DeathRecipient, FromIBinder, FrozenState, FrozenStateChangeCallback, IBinder, Interface,
+    Remotable, RemoteProxy, SIBinder, Stability, Strong, ToAsyncInterface, ToSyncInterface,
+    Transactable, TransactionCode, TransactionFlags, WIBinder, Weak, DEBUG_PID_TRANSACTION,
+    DUMP_TRANSACTION, EXTENSION_TRANSACTION, FIRST_CALL_TRANSACTION, FLAG_CLEAR_BUF,
+    FLAG_COLLECT_NOTED_APP_OPS, FLAG_ONEWAY, FLAG_PRIVATE_LOCAL, FLAG_PRIVATE_VENDOR,
+    FLAG_UPDATE_TXN, INTERFACE_HEADER, INTERFACE_TRANSACTION, LAST_CALL_TRANSACTION,
+    LIKE_TRANSACTION, PING_TRANSACTION, SET_RPC_CLIENT_TRANSACTION, SHELL_COMMAND_TRANSACTION,
+    START_RECORDING_TRANSACTION, STOP_RECORDING_TRANSACTION, SYSPROPS_TRANSACTION,
+    TWEET_TRANSACTION,
 };
 // `declare_binder_interface!` calls `$crate::__rpc_stamp_descriptor` from consumer crates.
 #[doc(hidden)]
@@ -400,7 +405,8 @@ pub use parcelable::{
 
 pub use parcelable_holder::ParcelableHolder;
 pub use process_state::{
-    CallRestriction, ProcessState, DEFAULT_MAX_BINDER_THREADS, MAX_BINDER_MMAP_SIZE,
+    CallRestriction, ProcessFreezeInfo, ProcessState, DEFAULT_MAX_BINDER_THREADS,
+    MAX_BINDER_MMAP_SIZE,
 };
 
 // From `proxy` — client-side handle types.

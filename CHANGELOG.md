@@ -205,6 +205,19 @@ change bytes between peers: upgrade both ends together.
   array shape `.aidl` renders.**
 - **rsbinder-tools: `config::is_valid_service_name`**; `config::Config` and
   `config::FileContents` are re-exported.
+- **Freeze notifications**: `IBinder::add_frozen_state_change_callback` /
+  `remove_frozen_state_change_callback` with `FrozenStateChangeCallback` and
+  `FrozenState` (AOSP `addFrozenStateChangeCallback`, libbinder
+  android-15.0.0_r6+), on drivers that report
+  `features/freeze_notification`; `InvalidOperation` elsewhere and on RPC.
+  `ProcessState::freeze_process` and `process_freeze_info` issue
+  `BINDER_FREEZE` / `BINDER_GET_FROZEN_INFO` (AOSP `IPCThreadState::freeze` /
+  `getProcessFreezeInfo`); Android's SELinux grants both to `system_server`
+  only, so elsewhere they fail with `EACCES`. A freeze request goes to the
+  driver alone, so a C driver older than Linux 6.13 that refuses it for a
+  binder whose process has died (fixed upstream in `ca63c66935b9`, backported
+  to 6.12.4 and the GKI branches in late 2024) fails the add instead of
+  aborting the process.
 ### Changed
 
 - **`rsbinder-aidl` warns on a bare `@nullable` field that closes a reference
@@ -256,6 +269,16 @@ single-connection setup calls (`setup_unix_client_android13plus`, `_abstract`,
 
 Kernel binder and `Parcel`:
 
+- **A death link survives the previous proxy's late clear.** When the last
+  proxy of a handle dropped while its `BC_CLEAR_DEATH_NOTIFICATION` was still
+  queued (on a looper, until its handler returned) and another thread
+  re-resolved the handle and linked, the driver ignored the new request and
+  the old clear removed the registration: the new recipients never heard of
+  the death, and the handle's `BC_DECREFS` was held for good. The registration
+  is now per handle, cleared by its last linked proxy, and a link during a
+  clear requests again after the clear completes. AOSP's `BpBinder` has the
+  same order. `link_to_death` now fails when its request never reached the
+  driver, instead of reporting a link that cannot fire.
 - **A parcel refuses a write that overlaps an object it recorded**
   (`PermissionDenied`); a rewritten fd number could close an fd the parcel did
   not own (see *Migrating*).

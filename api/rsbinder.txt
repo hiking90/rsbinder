@@ -3274,6 +3274,29 @@ impl core::marker::Unpin for rsbinder::ExceptionCode
 impl core::marker::UnsafeUnpin for rsbinder::ExceptionCode
 impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::ExceptionCode
 impl core::panic::unwind_safe::UnwindSafe for rsbinder::ExceptionCode
+pub enum rsbinder::FrozenState
+pub rsbinder::FrozenState::Frozen
+pub rsbinder::FrozenState::Unfrozen
+impl core::clone::Clone for rsbinder::FrozenState
+pub fn rsbinder::FrozenState::clone(&self) -> rsbinder::FrozenState
+impl core::cmp::Eq for rsbinder::FrozenState
+impl core::cmp::PartialEq for rsbinder::FrozenState
+pub fn rsbinder::FrozenState::eq(&self, &rsbinder::FrozenState) -> bool
+impl core::convert::From<bool> for rsbinder::FrozenState
+pub fn rsbinder::FrozenState::from(bool) -> Self
+impl core::fmt::Debug for rsbinder::FrozenState
+pub fn rsbinder::FrozenState::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for rsbinder::FrozenState
+pub fn rsbinder::FrozenState::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for rsbinder::FrozenState
+impl core::marker::StructuralPartialEq for rsbinder::FrozenState
+impl core::marker::Freeze for rsbinder::FrozenState
+impl core::marker::Send for rsbinder::FrozenState
+impl core::marker::Sync for rsbinder::FrozenState
+impl core::marker::Unpin for rsbinder::FrozenState
+impl core::marker::UnsafeUnpin for rsbinder::FrozenState
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::FrozenState
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::FrozenState
 pub enum rsbinder::Stability
 pub rsbinder::Stability::Local
 pub rsbinder::Stability::System
@@ -3783,6 +3806,26 @@ impl core::marker::Unpin for rsbinder::ParcelableHolder
 impl core::marker::UnsafeUnpin for rsbinder::ParcelableHolder
 impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::ParcelableHolder
 impl core::panic::unwind_safe::UnwindSafe for rsbinder::ParcelableHolder
+#[non_exhaustive] pub struct rsbinder::ProcessFreezeInfo
+pub rsbinder::ProcessFreezeInfo::async_received: bool
+pub rsbinder::ProcessFreezeInfo::sync_received: bool
+pub rsbinder::ProcessFreezeInfo::transactions_pending: bool
+impl core::clone::Clone for rsbinder::ProcessFreezeInfo
+pub fn rsbinder::ProcessFreezeInfo::clone(&self) -> rsbinder::ProcessFreezeInfo
+impl core::cmp::Eq for rsbinder::ProcessFreezeInfo
+impl core::cmp::PartialEq for rsbinder::ProcessFreezeInfo
+pub fn rsbinder::ProcessFreezeInfo::eq(&self, &rsbinder::ProcessFreezeInfo) -> bool
+impl core::fmt::Debug for rsbinder::ProcessFreezeInfo
+pub fn rsbinder::ProcessFreezeInfo::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for rsbinder::ProcessFreezeInfo
+impl core::marker::StructuralPartialEq for rsbinder::ProcessFreezeInfo
+impl core::marker::Freeze for rsbinder::ProcessFreezeInfo
+impl core::marker::Send for rsbinder::ProcessFreezeInfo
+impl core::marker::Sync for rsbinder::ProcessFreezeInfo
+impl core::marker::Unpin for rsbinder::ProcessFreezeInfo
+impl core::marker::UnsafeUnpin for rsbinder::ProcessFreezeInfo
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::ProcessFreezeInfo
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::ProcessFreezeInfo
 pub struct rsbinder::ProcessState
 impl rsbinder::ProcessState
 pub fn rsbinder::ProcessState::as_self() -> &'static rsbinder::ProcessState
@@ -3792,12 +3835,14 @@ pub fn rsbinder::ProcessState::context_object(&self) -> rsbinder::Result<rsbinde
 pub fn rsbinder::ProcessState::default_mmap_size() -> usize
 pub fn rsbinder::ProcessState::disable_background_scheduling(&self, bool)
 pub fn rsbinder::ProcessState::driver(&self) -> alloc::sync::Arc<std::fs::File>
+pub fn rsbinder::ProcessState::freeze_process(&self, i32, bool, core::time::Duration) -> rsbinder::Result<()>
 pub fn rsbinder::ProcessState::init(&str, u32) -> core::result::Result<&'static rsbinder::ProcessState, alloc::boxed::Box<dyn core::error::Error>>
 pub fn rsbinder::ProcessState::init_default() -> core::result::Result<&'static rsbinder::ProcessState, alloc::boxed::Box<dyn core::error::Error>>
 pub fn rsbinder::ProcessState::init_with_mmap_size(&str, u32, usize) -> core::result::Result<&'static rsbinder::ProcessState, alloc::boxed::Box<dyn core::error::Error>>
 pub fn rsbinder::ProcessState::is_initialized() -> bool
 pub fn rsbinder::ProcessState::join_thread_pool() -> rsbinder::Result<()>
 pub fn rsbinder::ProcessState::mmap_size(&self) -> usize
+pub fn rsbinder::ProcessState::process_freeze_info(&self, i32) -> rsbinder::Result<rsbinder::ProcessFreezeInfo>
 pub fn rsbinder::ProcessState::set_call_restriction(&self, rsbinder::CallRestriction)
 pub fn rsbinder::ProcessState::start_thread_pool()
 pub fn rsbinder::ProcessState::strong_proxy_for_handle(&self, u32) -> rsbinder::Result<rsbinder::SIBinder>
@@ -3827,6 +3872,7 @@ pub fn rsbinder::ProxyHandle::fmt(&self, &mut core::fmt::Formatter<'_>) -> core:
 impl core::ops::drop::Drop for rsbinder::ProxyHandle
 pub fn rsbinder::ProxyHandle::drop(&mut self)
 impl rsbinder::IBinder for rsbinder::ProxyHandle
+pub fn rsbinder::ProxyHandle::add_frozen_state_change_callback(&self, alloc::sync::Weak<dyn rsbinder::FrozenStateChangeCallback>) -> rsbinder::Result<()>
 pub fn rsbinder::ProxyHandle::as_any(&self) -> &dyn core::any::Any
 pub fn rsbinder::ProxyHandle::as_transactable(&self) -> core::option::Option<&dyn rsbinder::Transactable>
 pub fn rsbinder::ProxyHandle::attempt_inc_strong(&self) -> bool
@@ -3843,6 +3889,7 @@ pub fn rsbinder::ProxyHandle::link_to_death(&self, alloc::sync::Weak<dyn rsbinde
 pub fn rsbinder::ProxyHandle::local_binder_flags(&self) -> u32
 pub fn rsbinder::ProxyHandle::mark_vintf(&self) -> rsbinder::Result<()>
 pub fn rsbinder::ProxyHandle::ping_binder(&self) -> rsbinder::Result<()>
+pub fn rsbinder::ProxyHandle::remove_frozen_state_change_callback(&self, alloc::sync::Weak<dyn rsbinder::FrozenStateChangeCallback>) -> rsbinder::Result<()>
 pub fn rsbinder::ProxyHandle::set_extension(&self, &rsbinder::SIBinder) -> rsbinder::Result<()>
 pub fn rsbinder::ProxyHandle::set_parceled(&self)
 pub fn rsbinder::ProxyHandle::stability(&self) -> rsbinder::Stability
@@ -3881,6 +3928,7 @@ impl<T> !core::panic::unwind_safe::RefUnwindSafe for rsbinder::reconnect::Reconn
 impl<T> !core::panic::unwind_safe::UnwindSafe for rsbinder::reconnect::Reconnecting<T>
 pub struct rsbinder::SIBinder
 impl rsbinder::SIBinder
+pub fn rsbinder::SIBinder::add_frozen_state_change_callback_arc<C: rsbinder::FrozenStateChangeCallback + 'static>(&self, &alloc::sync::Arc<C>) -> rsbinder::Result<()>
 pub fn rsbinder::SIBinder::downgrade(&Self) -> rsbinder::WIBinder
 pub fn rsbinder::SIBinder::force_downgrade_to_system_stability(&self) -> rsbinder::Result<()>
 pub fn rsbinder::SIBinder::force_downgrade_to_vendor_stability(&self) -> rsbinder::Result<()>
@@ -3888,6 +3936,7 @@ pub fn rsbinder::SIBinder::into_interface<I: rsbinder::FromIBinder + rsbinder::I
 pub fn rsbinder::SIBinder::link_to_death_arc<R: rsbinder::DeathRecipient + 'static>(&self, &alloc::sync::Arc<R>) -> rsbinder::Result<()>
 pub fn rsbinder::SIBinder::mark_vintf(&self) -> rsbinder::Result<()>
 pub fn rsbinder::SIBinder::new(alloc::sync::Arc<dyn rsbinder::IBinder>) -> rsbinder::Result<Self>
+pub fn rsbinder::SIBinder::remove_frozen_state_change_callback_arc<C: rsbinder::FrozenStateChangeCallback + 'static>(&self, &alloc::sync::Arc<C>) -> rsbinder::Result<()>
 pub fn rsbinder::SIBinder::stability(&self) -> rsbinder::Stability
 pub fn rsbinder::SIBinder::unlink_to_death_arc<R: rsbinder::DeathRecipient + 'static>(&self, &alloc::sync::Arc<R>) -> rsbinder::Result<()>
 pub fn rsbinder::SIBinder::was_parceled(&self) -> bool
@@ -4528,7 +4577,10 @@ impl<P: rsbinder::BinderAsyncPool> rsbinder::FromIBinder for dyn rsbinder::hub::
 pub fn dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsync<P>::try_from(rsbinder::SIBinder) -> core::result::Result<rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsync<P>>, rsbinder::StatusCode>
 impl<P: rsbinder::BinderAsyncPool> rsbinder::FromIBinder for dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync<P>
 pub fn dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync<P>::try_from(rsbinder::SIBinder) -> core::result::Result<rsbinder::Strong<dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync<P>>, rsbinder::StatusCode>
+pub trait rsbinder::FrozenStateChangeCallback: core::marker::Send + core::marker::Sync
+pub fn rsbinder::FrozenStateChangeCallback::on_state_changed(&self, &rsbinder::WIBinder, rsbinder::FrozenState)
 pub trait rsbinder::IBinder: core::any::Any + core::marker::Send + core::marker::Sync
+pub fn rsbinder::IBinder::add_frozen_state_change_callback(&self, alloc::sync::Weak<dyn rsbinder::FrozenStateChangeCallback>) -> rsbinder::Result<()>
 pub fn rsbinder::IBinder::as_any(&self) -> &dyn core::any::Any
 pub fn rsbinder::IBinder::as_transactable(&self) -> core::option::Option<&dyn rsbinder::Transactable>
 pub fn rsbinder::IBinder::attempt_inc_strong(&self) -> bool
@@ -4545,12 +4597,14 @@ pub fn rsbinder::IBinder::link_to_death(&self, alloc::sync::Weak<dyn rsbinder::D
 pub fn rsbinder::IBinder::local_binder_flags(&self) -> u32
 pub fn rsbinder::IBinder::mark_vintf(&self) -> rsbinder::Result<()>
 pub fn rsbinder::IBinder::ping_binder(&self) -> rsbinder::Result<()>
+pub fn rsbinder::IBinder::remove_frozen_state_change_callback(&self, alloc::sync::Weak<dyn rsbinder::FrozenStateChangeCallback>) -> rsbinder::Result<()>
 pub fn rsbinder::IBinder::set_extension(&self, &rsbinder::SIBinder) -> rsbinder::Result<()>
 pub fn rsbinder::IBinder::set_parceled(&self)
 pub fn rsbinder::IBinder::stability(&self) -> rsbinder::Stability
 pub fn rsbinder::IBinder::unlink_to_death(&self, alloc::sync::Weak<dyn rsbinder::DeathRecipient>) -> rsbinder::Result<()>
 pub fn rsbinder::IBinder::was_parceled(&self) -> bool
 impl rsbinder::IBinder for rsbinder::ProxyHandle
+pub fn rsbinder::ProxyHandle::add_frozen_state_change_callback(&self, alloc::sync::Weak<dyn rsbinder::FrozenStateChangeCallback>) -> rsbinder::Result<()>
 pub fn rsbinder::ProxyHandle::as_any(&self) -> &dyn core::any::Any
 pub fn rsbinder::ProxyHandle::as_transactable(&self) -> core::option::Option<&dyn rsbinder::Transactable>
 pub fn rsbinder::ProxyHandle::attempt_inc_strong(&self) -> bool
@@ -4567,6 +4621,7 @@ pub fn rsbinder::ProxyHandle::link_to_death(&self, alloc::sync::Weak<dyn rsbinde
 pub fn rsbinder::ProxyHandle::local_binder_flags(&self) -> u32
 pub fn rsbinder::ProxyHandle::mark_vintf(&self) -> rsbinder::Result<()>
 pub fn rsbinder::ProxyHandle::ping_binder(&self) -> rsbinder::Result<()>
+pub fn rsbinder::ProxyHandle::remove_frozen_state_change_callback(&self, alloc::sync::Weak<dyn rsbinder::FrozenStateChangeCallback>) -> rsbinder::Result<()>
 pub fn rsbinder::ProxyHandle::set_extension(&self, &rsbinder::SIBinder) -> rsbinder::Result<()>
 pub fn rsbinder::ProxyHandle::set_parceled(&self)
 pub fn rsbinder::ProxyHandle::stability(&self) -> rsbinder::Stability

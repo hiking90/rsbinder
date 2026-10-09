@@ -237,8 +237,6 @@ pub mod binder {
         }
     }
 
-    // plan 4-3 Phase B (freeze) will issue this; declared ahead so the opcode is pinned.
-    #[allow(dead_code)]
     pub(crate) fn freeze<Fd: AsFd>(
         fd: Fd,
         info: binder_freeze_info,
@@ -253,8 +251,6 @@ pub mod binder {
         }
     }
 
-    // plan 4-3 Phase B (freeze) will issue this; declared ahead so the opcode is pinned.
-    #[allow(dead_code)]
     pub(crate) fn get_frozen_info<Fd: AsFd>(
         fd: Fd,
         frozen_info: &mut binder_frozen_status_info,

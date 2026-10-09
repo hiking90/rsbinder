@@ -235,6 +235,14 @@
 //!   priority over the flush error, which is logged so it is not lost when
 //!   both fail. A `queue_done` failure (only when `out_parcel` is unhealthy,
 //!   e.g. OOM) skips `flush`; the next ioctl on this thread fails anyway.
+//! - **Frozen-binder handshake.** For `BR_FROZEN_BINDER`,
+//!   `drive_frozen_binder_handshake` runs `notify` (the callbacks) and then
+//!   queues `BC_FREEZE_NOTIFICATION_DONE` whatever `notify` did, panic
+//!   included, as AOSP queues it unconditionally (`IPCThreadState.cpp:1647-1659`).
+//!   The kernel sends no further notification for the registration, and holds
+//!   its clear-done, until the done arrives, and refuses a second done for one
+//!   notification (`freeze` module doc). The done is not flushed there: the
+//!   looper's next `talk_with_driver` writes it.
 //! - **Refused commands.** A `BINDER_WRITE_READ` that fails or stops short
 //!   reports `write_consumed`, and which command that offset names depends on
 //!   how the driver stopped (android17-6.18 `binder_thread_write`). A command
@@ -260,7 +268,10 @@
 //!   `talkWithDriver` (android-17.0.0_r1 `IPCThreadState.cpp:1358-1362`, same
 //!   in 16.0.0_r4) returns every errno with `mOut` as is and resends all of it
 //!   on the next call, applied commands included; only its short write without
-//!   an errno is fatal (`:1333-1340`).
+//!   an errno is fatal (`:1333-1340`). `send_request_flushed` flushes what is
+//!   already queued before it writes a death or freeze request, so the request
+//!   goes out alone and a refusal returns its errno instead of aborting: C
+//!   drivers before `ca63c66935b9` refuse a freeze request on a dead node.
 //! - **Driver errors.** Which errors end a wait follows AOSP `waitForResponse`
 //!   and `executeCommand`. A `BINDER_WRITE_READ` errno other than EINTR
 //!   (retried with `bwr` kept, as `:1296-1320`) ends `wait_for_response` with
@@ -569,7 +580,7 @@ fn return_to_str(cmd: std::os::raw::c_uint) -> &'static str {
     }
 }
 
-// Freeze BC labels (nr=19/20/21) are debug-print only; nothing queues these commands.
+// Indexed by _IOC_NR; also names refused freeze commands.
 const COMMAND_STRINGS: [&str; 22] = [
     "BC_TRANSACTION",
     "BC_REPLY",
@@ -1262,6 +1273,23 @@ where
     Ok(())
 }
 
+/// `BR_FROZEN_BINDER`: queues the done once after `notify`, even if it panics.
+fn drive_frozen_binder_handshake<N, Q>(
+    cookie: binder::binder_uintptr_t,
+    notify: N,
+    queue_done: Q,
+) -> Result<()>
+where
+    N: FnOnce(),
+    Q: FnOnce() -> Result<()>,
+{
+    // User callbacks are caught one by one; this guards rsbinder's own code around them.
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(notify)).is_err() {
+        error!("BR_FROZEN_BINDER: notification for cookie {cookie:X} panicked");
+    }
+    queue_done()
+}
+
 /// `transact` with panics caught; call with no borrow held (R1). See module doc "Handler panics".
 fn dispatch_transact_caught(
     transactable: &dyn Transactable,
@@ -1639,6 +1667,54 @@ fn execute_command(cmd: i32) -> Result<()> {
                 };
                 // AOSP drops the weak ref `linkToDeath` took (`IPCThreadState.cpp:1640-1644`).
                 ProcessState::as_self().death_clear_done(handle as _);
+            }
+            binder::BR_FROZEN_BINDER => {
+                // `binder_frozen_state_info`: u64 cookie, u32 is_frozen, u32 reserved.
+                let (cookie, is_frozen) = {
+                    let mut state = thread_state.borrow_mut();
+                    let cookie = state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?;
+                    let is_frozen = state.in_parcel.read_cmd::<u32>()? != 0;
+                    let _reserved = state.in_parcel.read_cmd::<u32>()?;
+                    (cookie, is_frozen)
+                };
+                log::trace!("BR_FROZEN_BINDER: cookie {cookie:X} is_frozen {is_frozen}");
+
+                // Callbacks are not an RPC dispatch; hide the suspended RPC peer from them.
+                #[cfg(feature = "rpc")]
+                let _rpc_suspended = RpcCallingGuard::suspend();
+
+                let notify = || match u32::try_from(cookie) {
+                    Ok(handle) => ProcessState::as_self().frozen_state_changed(handle, is_frozen),
+                    Err(_) => log::error!("BR_FROZEN_BINDER cookie {cookie:X} is not a handle"),
+                };
+                let queue_done = || {
+                    let mut state = thread_state.borrow_mut();
+                    state
+                        .out_parcel
+                        .write_cmd::<u32>(&(binder::BC_FREEZE_NOTIFICATION_DONE))?;
+                    state
+                        .out_parcel
+                        .write_cmd::<binder::binder_uintptr_t>(&cookie)
+                };
+                // Logged, not returned, as the dead-binder handshake; module doc "Driver errors".
+                if let Err(e) = drive_frozen_binder_handshake(cookie, notify, queue_done) {
+                    log::error!(
+                        "BR_FROZEN_BINDER: queue BC_FREEZE_NOTIFICATION_DONE failed: {e:?}"
+                    );
+                }
+            }
+            binder::BR_CLEAR_FREEZE_NOTIFICATION_DONE => {
+                let cookie = {
+                    let mut state = thread_state.borrow_mut();
+                    state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?
+                };
+                log::trace!("BR_CLEAR_FREEZE_NOTIFICATION_DONE: cookie {cookie:X}");
+                match u32::try_from(cookie) {
+                    Ok(handle) => ProcessState::as_self().freeze_clear_done(handle),
+                    Err(_) => log::error!(
+                        "BR_CLEAR_FREEZE_NOTIFICATION_DONE cookie {cookie:X} is not a handle"
+                    ),
+                }
             }
             _ => {
                 log::error!("*** BAD COMMAND {cmd} received from Binder driver\n");
@@ -2238,36 +2314,91 @@ pub(crate) fn join_thread_pool(is_main: bool) -> Result<()> {
     })
 }
 
-pub(crate) fn request_death_notification(handle: u32) -> Result<()> {
-    log::trace!("request_death_notification: {handle}");
-    THREAD_STATE.with(|thread_state| -> Result<()> {
-        {
-            let mut state = thread_state.borrow_mut();
-
-            state
-                .out_parcel
-                .write_cmd::<u32>(&(binder::BC_REQUEST_DEATH_NOTIFICATION))?;
-            state.out_parcel.write_cmd::<u32>(&(handle))?;
-            // Android binder calls writePointer(proxy) here, but we just write handle.
-            state
-                .out_parcel
-                .write_cmd::<binder::binder_uintptr_t>(&(handle as _))?;
-        }
-
-        Ok(())
-    })
-}
-
-/// Also counts the clear for the pin ledger, failed or not: the subscription may still be live.
+/// Queues `BC_CLEAR_DEATH_NOTIFICATION`; counted in the pin ledger even if the write fails.
 pub(crate) fn clear_death_notification(handle: u32) -> Result<()> {
     log::trace!("clear_death_notification: {handle}");
     // Counted before the driver can see it, so its done never arrives first.
     ProcessState::note_death_clear(handle);
-    let write = |out: &mut CommandStream| -> Result<()> {
-        out.write_cmd::<u32>(&(binder::BC_CLEAR_DEATH_NOTIFICATION))?;
-        out.write_cmd::<u32>(&(handle))?;
-        // Android binder calls writePointer(proxy) here, but we just write handle.
-        out.write_cmd::<binder::binder_uintptr_t>(&(handle as _))
+    let write = |out: &mut CommandStream| {
+        write_handle_cookie(out, binder::BC_CLEAR_DEATH_NOTIFICATION, handle)
+    };
+    // `try_with`: a `ProxyHandle` dropped at thread exit calls this after teardown.
+    match THREAD_STATE.try_with(|thread_state| write(&mut thread_state.borrow_mut().out_parcel)) {
+        Ok(result) => result,
+        Err(_) => write_without_thread_state_with(write),
+    }
+}
+
+/// `binder_handle_cookie` with cookie = handle; AOSP writes the `BpBinder` pointer instead.
+fn write_handle_cookie(out: &mut CommandStream, cmd: u32, handle: u32) -> Result<()> {
+    out.write_cmd::<u32>(&cmd)?;
+    out.write_cmd::<u32>(&handle)?;
+    out.write_cmd::<binder::binder_uintptr_t>(&(handle as _))
+}
+
+/// Writes and flushes a death or freeze request; `Err` only if the kernel never got it (rewound).
+fn send_request_flushed(cmd: u32, handle: u32) -> Result<()> {
+    log::trace!("{}: {handle}", command_to_str(cmd));
+    // `try_with`: a call from a TLS destructor must fail, not panic under the registry lock.
+    THREAD_STATE
+        .try_with(|thread_state| -> Result<()> {
+            // Alone in its write, so a refusal cannot abort (module doc "Refused commands").
+            if thread_state.borrow().out_parcel.data_size() > 0 {
+                flush_commands()?;
+            }
+            let mark = thread_state.borrow().unflushed_mark();
+            let rewind = || {
+                let mut ts = thread_state.borrow_mut();
+                let rewound = ts.out_flush_epoch == mark.0 && ts.out_parcel.data_size() > mark.1;
+                if rewound {
+                    let _ = ts.out_parcel.set_data_size(mark.1);
+                }
+                rewound
+            };
+            let written =
+                write_handle_cookie(&mut thread_state.borrow_mut().out_parcel, cmd, handle);
+            if let Err(err) = written {
+                rewind();
+                return Err(err);
+            }
+            match flush_commands() {
+                // A pending `return_error` makes the driver succeed without consuming anything.
+                Ok(()) if rewind() => Err(StatusCode::InvalidOperation),
+                Ok(()) => Ok(()),
+                Err(err) if rewind() => Err(err),
+                Err(err) => {
+                    log::warn!("flush after {}({handle}): {err:?}", command_to_str(cmd));
+                    Ok(())
+                }
+            }
+        })
+        .unwrap_or(Err(StatusCode::InvalidOperation))
+}
+
+/// `BC_REQUEST_DEATH_NOTIFICATION`, flushed; only `death::DeathRegistry` decides when.
+pub(crate) fn send_death_request(handle: u32) -> Result<()> {
+    send_request_flushed(binder::BC_REQUEST_DEATH_NOTIFICATION, handle)
+}
+
+/// `BC_REQUEST_FREEZE_NOTIFICATION`, flushed; only `freeze::FreezeRegistry` decides when.
+pub(crate) fn send_freeze_request(handle: u32) -> Result<()> {
+    send_request_flushed(binder::BC_REQUEST_FREEZE_NOTIFICATION, handle)
+}
+
+/// [`flush_commands`] unless `THREAD_STATE` is torn down; the fallback writer already sent.
+pub(crate) fn flush_commands_if_alive() -> Result<()> {
+    match THREAD_STATE.try_with(|_| ()) {
+        Ok(()) => flush_commands(),
+        Err(_) => Ok(()),
+    }
+}
+
+/// Queues `BC_CLEAR_FREEZE_NOTIFICATION`, counted for the pin ledger first, as the death clear.
+pub(crate) fn clear_freeze_notification(handle: u32) -> Result<()> {
+    log::trace!("clear_freeze_notification: {handle}");
+    ProcessState::note_freeze_clear(handle);
+    let write = |out: &mut CommandStream| {
+        write_handle_cookie(out, binder::BC_CLEAR_FREEZE_NOTIFICATION, handle)
     };
     // `try_with`: a `ProxyHandle` dropped at thread exit calls this after teardown.
     match THREAD_STATE.try_with(|thread_state| write(&mut thread_state.borrow_mut().out_parcel)) {
@@ -3237,6 +3368,48 @@ mod tests {
         assert_eq!(*order.borrow(), vec!["obituary", "queue", "flush"]);
     }
 
+    /// The done is queued exactly once after the notification, even when it panics.
+    #[test]
+    fn frozen_binder_handshake_queues_the_done_once_whatever_notify_does() {
+        use std::cell::RefCell;
+
+        let order = RefCell::new(Vec::<&'static str>::new());
+        let push = |label: &'static str| order.borrow_mut().push(label);
+
+        let result = drive_frozen_binder_handshake(
+            7,
+            || push("notify"),
+            || {
+                push("queue");
+                Ok(())
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(*order.borrow(), vec!["notify", "queue"]);
+        order.borrow_mut().clear();
+
+        let result = drive_frozen_binder_handshake(
+            7,
+            || {
+                push("notify");
+                panic!("rsbinder bug inside the notification");
+            },
+            || {
+                push("queue");
+                Ok(())
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(*order.borrow(), vec!["notify", "queue"]);
+        order.borrow_mut().clear();
+
+        // Only a failed write (an unhealthy `out_parcel`) surfaces.
+        let result =
+            drive_frozen_binder_handshake(7, || push("notify"), || Err(StatusCode::NoMemory));
+        assert_eq!(result, Err(StatusCode::NoMemory));
+        assert_eq!(*order.borrow(), vec!["notify"]);
+    }
+
     /// A re-entrant push from a user `Inner<T>::drop` mid-drain; see `# Mutation gates`.
     #[test]
     #[cfg_attr(
@@ -3765,6 +3938,35 @@ mod tests {
             "child {test}: {:?}\n{stdout}\n{}",
             out.status,
             String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    /// A refused freeze request behind queued commands fails instead of aborting.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[serial_test::serial(binder)]
+    fn a_refused_freeze_request_behind_queued_commands_fails() {
+        in_child_process(
+            "thread_state::tests::a_refused_freeze_request_behind_queued_commands_fails",
+            || {
+                // No such ref: refused by both drivers, and by one without freeze notifications.
+                const NO_REF: u32 = 0x7fff_fff0;
+                ProcessState::init_default().expect("init_default");
+                THREAD_STATE.with(|ts| {
+                    // Applied by the driver and cancelling out: a weak ref on the context manager.
+                    let mut ts = ts.borrow_mut();
+                    for cmd in [binder::BC_INCREFS, binder::BC_DECREFS] {
+                        ts.out_parcel.write_cmd::<u32>(&cmd).unwrap();
+                        ts.out_parcel.write_cmd::<u32>(&0).unwrap();
+                    }
+                });
+                assert!(send_freeze_request(NO_REF).is_err());
+                assert_eq!(
+                    THREAD_STATE.with(|ts| ts.borrow().out_parcel.data_size()),
+                    0,
+                    "the queued commands went out and the request was rewound"
+                );
+            },
         );
     }
 
