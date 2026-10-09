@@ -1325,6 +1325,9 @@ impl RpcServer {
     /// must net to **0** once every client proxy is dropped — a value
     /// stuck above baseline indicates a leaked excess `DEC_STRONG`.
     ///
+    /// Counts the sessions of both wires: android-13+ and r34 sessions are
+    /// registered apart (module doc "Session registry").
+    ///
     /// Lock ladder: collect the live `Arc<RpcSessionInner>` snapshot
     /// **first** (releasing the `sessions` mutex), then walk each
     /// session's `state` mutex (via the inner's `local_node_count`
@@ -1332,13 +1335,20 @@ impl RpcServer {
     /// a poisoned `state` lock in one session does not poison `sessions`
     /// as a side-effect.
     pub fn live_session_node_count(&self) -> usize {
-        let sessions: Vec<_> = self
+        let mut sessions: Vec<_> = self
             .sessions
             .lock()
             .expect("sessions poisoned")
             .values()
             .filter_map(std::sync::Weak::upgrade)
             .collect();
+        sessions.extend(
+            self.r34_sessions
+                .lock()
+                .expect("r34_sessions poisoned")
+                .values()
+                .filter_map(|s| s.inner.upgrade()),
+        );
         sessions.iter().map(|s| s.local_node_count()).sum()
     }
 

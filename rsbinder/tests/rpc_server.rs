@@ -2488,6 +2488,23 @@ fn r34_get_session_id_is_the_minted_int32() {
     assert_eq!(joined.special_i32(2), id);
 }
 
+/// The leak counter sees r34 sessions, which are registered apart from android-13+ ones.
+#[test]
+fn r34_session_nodes_are_counted() {
+    let (server, _cu, path) = r34_server("r34nodes", 1, Arc::new(AtomicI64::new(0)));
+    let client = RpcSession::setup_unix_client(&path).expect("connect");
+    let root = EchoProxy(client.get_root().expect("get_root"));
+    assert_eq!(root.echo("x").unwrap(), "x");
+    assert_eq!(server.live_session_node_count(), 1, "the root sent");
+    drop(root);
+    let _ = client.get_session_id().expect("ordering barrier");
+    assert!(
+        poll_until(|| server.live_session_node_count() == 0),
+        "root node not freed: {}",
+        server.live_session_node_count()
+    );
+}
+
 /// A session id on an entry that builds a new `RpcSession` is `BadValue`; see module doc.
 #[test]
 #[allow(deprecated)] // Pins the deprecated id-taking entries' refusal too.
