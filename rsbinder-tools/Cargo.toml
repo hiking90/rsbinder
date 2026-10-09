@@ -24,6 +24,10 @@ thiserror.workspace = true
 serde.workspace = true
 toml.workspace = true
 
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+# `rsb_device` mounts binderfs with mount(2); rustix has `mount` only for Linux.
+rustix = { workspace = true, features = ["mount"] }
+
 [features]
 # Teach the policy enforcer about RPC callers (`Caller::Rpc`). Off by
 # default: `rsb_hub` serves kernel binder only, so nothing in this crate

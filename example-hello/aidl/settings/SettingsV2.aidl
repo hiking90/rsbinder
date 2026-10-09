@@ -3,6 +3,9 @@
 
 package settings;
 
+import settings.Endpoint;
+import settings.Mode;
+
 /**
  * Version 2: {@link SettingsV1} with two fields appended, and nothing else
  * touched.

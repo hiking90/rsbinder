@@ -63,24 +63,25 @@
 //!    swallow the obituary; a panicking recipient is caught and logged so it
 //!    cannot stop the worker thread or starve the remaining recipients. If the
 //!    flush fails, the command stays in `out_parcel` and is sent by
-//!    `release_obituary_pin`'s phase-2 flush in the same `BR_DEAD_BINDER` arm,
+//!    `finish_obituary`'s phase-2 flush in the same `BR_DEAD_BINDER` arm,
 //!    which preserves kernel ordering.
 //!
 //! # Reference counts
 //!
 //! The `IBinder` ref-count methods are no-ops on a proxy under the cache-pin
 //! model. Kernel strong refs are owned one per `Arc<ProxyHandle>` (acquired
-//! in `new_acquired`, released in `Drop`); kernel weak refs are owned by the
-//! process-wide cache pin in `ProcessState::handle_to_proxy`. User-side
-//! `SIBinder` / `WIBinder` clone and drop is a plain `Arc::clone` /
-//! `sync::Weak::clone` of the trait-object `Arc`, with no kernel command.
+//! in `new_acquired`, released in `Drop`); the kernel weak ref is the cache pin
+//! (`process_state::HandlePin`) shared by the entry's proxies and `WIBinder`s.
+//! User-side clone and drop sends no kernel command, except the last proxy drop (`BC_RELEASE`)
+//! and the pin's last drop.
 //!
 //! The pin's `BC_INCREFS` keeps `binder_ref(handle).weak >= 1`, so the
 //! `BC_RELEASE` in `Drop` is safe regardless of concurrent lookups: the kernel
-//! slot is alive on entry. Once the strong count returns to 0, only a fresh
+//! slot is alive on entry. `Drop` clears a still-linked death subscription, then
+//! sends `BC_RELEASE` (AOSP `onLastStrongRef`). Once the strong count returns to 0, only a fresh
 //! wire delivery (e.g. servicemanager `checkService`) re-establishes a
-//! transactable strong ref, through slow-path case (b); an in-process
-//! `WIBinder::upgrade()` returns `DeadObject` instead.
+//! transactable strong ref; until one does, an in-process `WIBinder::upgrade()`
+//! returns `DeadObject`, and after it, the revived proxy.
 //!
 //! # Operations without meaning on a proxy
 //!
@@ -100,21 +101,21 @@
 //!
 //! `ProxyHandle::new_acquired` allocates the `Arc<ProxyHandle>` and sends one
 //! `BC_ACQUIRE`. Its caller must hold the `ProcessState::handle_to_proxy`
-//! write lock and must already have issued and flushed the cache pin
-//! (`BC_INCREFS`) for the handle (sub-case (a)), or verified that an existing
-//! cache entry's pin is still active (sub-case (b)). The pin keeps the
+//! write lock and a reference to the handle's pin: a fresh one whose
+//! `BC_INCREFS` it issued and flushed (sub-case (a)), or the existing entry's
+//! pin upgraded under that lock (sub-case (b)). The pin keeps the
 //! `binder_ref` slot alive, so this `BC_ACQUIRE` cannot race a concurrent
 //! `BC_RELEASE` into a freed slot.
 //!
 //! # Proxy identity
 //!
 //! A handle id is unique only while its `binder_ref` slot lives; the kernel
-//! may recycle it for a different node afterwards. `ProxyHandle` therefore
-//! stores the process-wide generation counter snapshotted when its cache
+//! may recycle it for a different node afterwards. The handle's pin therefore
+//! carries the process-wide generation counter snapshotted when its cache
 //! entry was created, and `(handle, generation)` identifies the *node*; that
 //! pair is what `WIBinder` equality and `ProxyHandle`'s `PartialEq` compare.
 //!
-//! The generation is stored on the proxy rather than looked up from the proxy
+//! The generation is read from the proxy's pin rather than looked up from the proxy
 //! cache on demand, because the obituary retires the cache entry *before*
 //! dispatching `binder_died`. A cache lookup would answer `None` for exactly
 //! the binders a death recipient needs to match: a `downgrade` taken inside
@@ -126,23 +127,9 @@
 //!
 //! # Proxy counting
 //!
-//! `tracked_uid` is the uid `crate::proxy_count`'s per-uid map charges this
-//! proxy to, captured at construction via `thread_state::get_calling_uid`
-//! (AOSP `IPCThreadState::getCallingUid()`): the sender uid of the
-//! `BR_TRANSACTION` being handled, or this process's own `getuid()` when no
-//! incoming transaction is on the stack.
-//!
-//! `count_acquired` is `true` iff construction reached
-//! `proxy_count::on_proxy_create`, so `Drop` owes a matching `on_proxy_drop`.
-//! It stays `false` only for test-only construction (`synthetic_proxy`); a
-//! failed `inc_strong_handle` returns before any `ProxyHandle` exists.
-//! `counted_by_uid` is `true` iff `on_proxy_create` incremented the per-uid
-//! map (tracking was enabled at construction). `Drop` decides from this field,
-//! not from the live `COUNT_BY_UID_ENABLED` flag, so disabling tracking while
-//! the proxy lives cannot desync the count (AOSP `BpBinder::mTrackedUid`).
-//! Both are plain `bool`: written once before the `Arc<ProxyHandle>` is
-//! shared and read only in `Drop` (`&mut self`); the `Arc` refcount's
-//! release/acquire supplies the happens-before.
+//! A `ProxyHandle` is not what `crate::proxy_count` counts: the count follows
+//! the handle's pin, as AOSP's follows the `BpBinder` across strong 0→1
+//! revivals. See the `process_state` module doc "Proxy counting".
 //!
 //! # `obituary_sent` ordering
 //!
@@ -206,6 +193,7 @@ use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{self, Arc, RwLock};
 
+use crate::process_state::HandlePin;
 use crate::{binder::*, error::*, parcel::*, parcelable::DeserializeOption, thread_state};
 
 /// Proxy-side extension cache; strong vs weak rule in module doc "Extension cache".
@@ -227,20 +215,15 @@ enum CachedExtension {
 ///
 /// Owns exactly **one kernel strong ref** (`BC_ACQUIRE` at construction,
 /// `BC_RELEASE` on `Drop`). The kernel weak ref that keeps the
-/// `binder_ref` slot alive across `strong = 0` windows is held by the
-/// process-wide cache pin (`ProcessState::handle_to_proxy`), not by this
-/// type — see `process_state::strong_proxy_for_handle_stability`.
+/// `binder_ref` slot alive across `strong = 0` windows is the handle's
+/// cache pin, which this type shares with the other proxies and proxy
+/// `WIBinder`s of the same cache entry; the last of them releases it — see
+/// the `process_state` module doc "Proxy cache entry".
 pub struct ProxyHandle {
     handle: u32,
-    /// Snapshotted cache generation; `(handle, generation)` names the node. See module doc.
-    generation: u64,
+    /// Shared `BC_INCREFS`; its generation is this proxy's. See module doc "Proxy identity".
+    pin: Arc<HandlePin>,
     descriptor: String,
-    /// Uid charged in `proxy_count`'s per-uid map; see module doc "Proxy counting".
-    tracked_uid: u32,
-    /// `Drop` owes `on_proxy_drop` iff this is set; see module doc "Proxy counting".
-    count_acquired: bool,
-    /// Per-uid map was incremented at construction; `Drop` reads this, not the live flag.
-    counted_by_uid: bool,
     stability: Stability,
     /// Lock-free readers `Acquire`, locked readers `Relaxed`; see the module doc table.
     obituary_sent: AtomicBool,
@@ -249,25 +232,18 @@ pub struct ProxyHandle {
 }
 
 impl ProxyHandle {
-    /// Sends `BC_ACQUIRE`; caller holds the proxy-cache lock and a live pin. See module doc.
+    /// Sends `BC_ACQUIRE`; caller holds the proxy-cache lock and `pin`. See module doc.
     pub(crate) fn new_acquired(
-        handle: u32,
-        generation: u64,
+        pin: &Arc<HandlePin>,
         descriptor: String,
         stability: Stability,
     ) -> Result<Arc<Self>> {
-        // Outside a transaction this is this process's own uid, as in AOSP.
-        let tracked_uid = thread_state::get_calling_uid();
-        // Kernel ref before `on_proxy_create`, so a failure owes no `on_proxy_drop`.
+        let handle = pin.handle();
         thread_state::inc_strong_handle(handle)?;
-        let counted_by_uid = crate::proxy_count::on_proxy_create(tracked_uid);
         Ok(Arc::new(Self {
             handle,
-            generation,
+            pin: Arc::clone(pin),
             descriptor,
-            tracked_uid,
-            count_acquired: true,
-            counted_by_uid,
             stability,
             obituary_sent: AtomicBool::new(false),
             recipients: RwLock::new(Vec::new()),
@@ -282,7 +258,12 @@ impl ProxyHandle {
 
     /// Generation this handle was resolved under; valid even after the obituary retires the entry.
     pub(crate) fn generation(&self) -> u64 {
-        self.generation
+        self.pin.generation()
+    }
+
+    /// The cache pin a proxy `WIBinder` holds, as a `wp<BpBinder>` holds the `BpBinder`.
+    pub(crate) fn pin(&self) -> &Arc<HandlePin> {
+        &self.pin
     }
 
     /// Get the interface descriptor for this proxy.
@@ -301,6 +282,11 @@ impl ProxyHandle {
     }
 
     /// Submit a transaction to the remote service.
+    ///
+    /// If a two-way call fails with a driver errno after the kernel took the
+    /// transaction, its `BR_REPLY` still arrives, at this thread's next wait,
+    /// and the thread's next two-way call returns it as its own reply, as in
+    /// AOSP. The `thread_state` module doc ("Driver errors") has the cases.
     pub fn submit_transact(
         &self,
         code: TransactionCode,
@@ -373,7 +359,7 @@ impl ProxyHandle {
         // Callbacks before the flush, so an ioctl failure cannot swallow the obituary.
         self.dispatch_obituary_callbacks(&recipients_snapshot, who);
 
-        // On failure the command stays queued for `release_obituary_pin`'s phase-2 flush.
+        // On failure the command stays queued for `finish_obituary`'s phase-2 flush.
         if !recipients_snapshot.is_empty() {
             thread_state::flush_commands()?;
         }
@@ -461,7 +447,7 @@ impl Debug for ProxyHandle {
     }
 }
 
-/// Identity is `(handle, generation)`, as the `generation` field
+/// Identity is `(handle, generation)`, as the module doc "Proxy identity"
 /// documents: the kernel recycles a handle number once its `binder_ref`
 /// slot is released, so two `ProxyHandle`s with the same handle can name
 /// different nodes. Matches `WIBinder`'s identity model.
@@ -474,17 +460,29 @@ impl PartialEq for ProxyHandle {
 impl Eq for ProxyHandle {}
 
 impl Drop for ProxyHandle {
+    /// AOSP `onLastStrongRef`; the `pin` field drops after this, as `~BpBinder` follows it.
     fn drop(&mut self) {
+        // Unlinks before `BC_RELEASE`, as `kDecStrongLast` builds do (`BpBinder.cpp:880`, `:907`).
+        let linked = !self
+            .recipients
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty();
+        if linked {
+            // A failed clear stays counted, so the pin outlives the subscription anyway.
+            if let Err(err) = thread_state::clear_death_notification(self.handle) {
+                log::error!(
+                    "BC_CLEAR_DEATH_NOTIFICATION for handle {} failed during Drop: {err:?}",
+                    self.handle
+                );
+            }
+        }
         // Safe: the cache pin's BC_INCREFS keeps the slot alive (module doc "Reference counts").
         if let Err(err) = thread_state::dec_strong_handle(self.handle) {
             log::error!(
                 "BC_RELEASE for handle {} failed during Drop: {err:?}",
                 self.handle
             );
-        }
-        // Only a proxy that reached `on_proxy_create` posts the drop (no phantom drops).
-        if self.count_acquired {
-            crate::proxy_count::on_proxy_drop(self.tracked_uid, self.counted_by_uid);
         }
     }
 }
@@ -686,16 +684,12 @@ mod tests {
 
     use super::*;
 
-    /// `ProxyHandle` without `BC_ACQUIRE`; the caller must `mem::forget` it to skip `BC_RELEASE`.
+    /// `ProxyHandle` with no kernel refs; `mem::forget` it to skip `BC_RELEASE` and `BC_DECREFS`.
     fn synthetic_proxy(obituary_sent: bool) -> Arc<ProxyHandle> {
         Arc::new(ProxyHandle {
             handle: 1,
-            generation: 1,
+            pin: HandlePin::synthetic(1, 1),
             descriptor: "test".to_string(),
-            tracked_uid: 0,
-            // `Drop` skips `on_proxy_drop`, as this skips `on_proxy_create`.
-            count_acquired: false,
-            counted_by_uid: false,
             stability: Stability::Local,
             obituary_sent: AtomicBool::new(obituary_sent),
             recipients: RwLock::new(Vec::new()),

@@ -43,8 +43,8 @@ pub mod ITestService {
     #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated)]
     pub trait ITestService: rsbinder::Interface + ::core::marker::Send {
         fn descriptor() -> &'static str where Self: Sized { "android.aidl.fixedsizearray.ITestService" }
-        fn r#ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>) -> rsbinder::BinderResult<Vec<bool>>;
-        fn r#RepeatNullableIntArray(&self, _arg_input: Option<&[i32]>) -> rsbinder::BinderResult<Option<Vec<i32>>>;
+        fn r#ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut ::std::vec::Vec<bool>) -> rsbinder::BinderResult<::std::vec::Vec<bool>>;
+        fn r#RepeatNullableIntArray(&self, _arg_input: ::core::option::Option<&[i32]>) -> rsbinder::BinderResult<::core::option::Option<::std::vec::Vec<i32>>>;
         fn r#FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable) -> rsbinder::BinderResult<()>;
         fn getDefaultImpl() -> ::core::option::Option<ITestServiceDefaultRef> where Self: Sized {
             DEFAULT_IMPL.get().cloned()
@@ -54,10 +54,10 @@ pub mod ITestService {
         }
     }
     pub trait ITestServiceDefault: ::core::marker::Send + ::core::marker::Sync {
-        fn r#ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>) -> rsbinder::BinderResult<Vec<bool>> {
+        fn r#ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut ::std::vec::Vec<bool>) -> rsbinder::BinderResult<::std::vec::Vec<bool>> {
             ::core::result::Result::Err(rsbinder::StatusCode::UnknownTransaction.into())
         }
-        fn r#RepeatNullableIntArray(&self, _arg_input: Option<&[i32]>) -> rsbinder::BinderResult<Option<Vec<i32>>> {
+        fn r#RepeatNullableIntArray(&self, _arg_input: ::core::option::Option<&[i32]>) -> rsbinder::BinderResult<::core::option::Option<::std::vec::Vec<i32>>> {
             ::core::result::Result::Err(rsbinder::StatusCode::UnknownTransaction.into())
         }
         fn r#FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable) -> rsbinder::BinderResult<()> {
@@ -80,13 +80,13 @@ pub mod ITestService {
         }
     }
     impl BpTestService {
-        fn build_parcel_ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>) -> rsbinder::Result<rsbinder::Parcel> {
+        fn build_parcel_ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut ::std::vec::Vec<bool>) -> rsbinder::Result<rsbinder::Parcel> {
             let mut data = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.prepare_transact(true)?;
             data.write(_arg_input)?;
             data.write_slice_size(::core::option::Option::Some(_arg_repeated))?;
             ::core::result::Result::Ok(data)
         }
-        fn read_response_ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>, _aidl_reply: rsbinder::Result<::core::option::Option<rsbinder::Parcel>>) -> rsbinder::BinderResult<Vec<bool>> {
+        fn read_response_ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut ::std::vec::Vec<bool>, _aidl_reply: rsbinder::Result<::core::option::Option<rsbinder::Parcel>>) -> rsbinder::BinderResult<::std::vec::Vec<bool>> {
             if let ::core::result::Result::Err(rsbinder::StatusCode::UnknownTransaction) = _aidl_reply {
                 if let ::core::option::Option::Some(_aidl_default_impl) = <Self as ITestService>::getDefaultImpl() {
                   return _aidl_default_impl.r#ReverseBoolean(_arg_input, _arg_repeated);
@@ -95,16 +95,16 @@ pub mod ITestService {
             let mut _aidl_reply = _aidl_reply?.ok_or(rsbinder::StatusCode::UnexpectedNull)?;
             let _status = _aidl_reply.read::<rsbinder::Status>()?;
             if !_status.is_ok() { return ::core::result::Result::Err(_status); }
-            let _aidl_return: Vec<bool> = _aidl_reply.read()?;
+            let _aidl_return: ::std::vec::Vec<bool> = _aidl_reply.read()?;
             _aidl_reply.read_onto(_arg_repeated)?;
             ::core::result::Result::Ok(_aidl_return)
         }
-        fn build_parcel_RepeatNullableIntArray(&self, _arg_input: Option<&[i32]>) -> rsbinder::Result<rsbinder::Parcel> {
+        fn build_parcel_RepeatNullableIntArray(&self, _arg_input: ::core::option::Option<&[i32]>) -> rsbinder::Result<rsbinder::Parcel> {
             let mut data = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.prepare_transact(true)?;
             data.write(&_arg_input)?;
             ::core::result::Result::Ok(data)
         }
-        fn read_response_RepeatNullableIntArray(&self, _arg_input: Option<&[i32]>, _aidl_reply: rsbinder::Result<::core::option::Option<rsbinder::Parcel>>) -> rsbinder::BinderResult<Option<Vec<i32>>> {
+        fn read_response_RepeatNullableIntArray(&self, _arg_input: ::core::option::Option<&[i32]>, _aidl_reply: rsbinder::Result<::core::option::Option<rsbinder::Parcel>>) -> rsbinder::BinderResult<::core::option::Option<::std::vec::Vec<i32>>> {
             if let ::core::result::Result::Err(rsbinder::StatusCode::UnknownTransaction) = _aidl_reply {
                 if let ::core::option::Option::Some(_aidl_default_impl) = <Self as ITestService>::getDefaultImpl() {
                   return _aidl_default_impl.r#RepeatNullableIntArray(_arg_input);
@@ -113,7 +113,7 @@ pub mod ITestService {
             let mut _aidl_reply = _aidl_reply?.ok_or(rsbinder::StatusCode::UnexpectedNull)?;
             let _status = _aidl_reply.read::<rsbinder::Status>()?;
             if !_status.is_ok() { return ::core::result::Result::Err(_status); }
-            let _aidl_return: Option<Vec<i32>> = _aidl_reply.read()?;
+            let _aidl_return: ::core::option::Option<::std::vec::Vec<i32>> = _aidl_reply.read()?;
             ::core::result::Result::Ok(_aidl_return)
         }
         fn build_parcel_FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable) -> rsbinder::Result<rsbinder::Parcel> {
@@ -135,12 +135,12 @@ pub mod ITestService {
         }
     }
     impl ITestService for BpTestService {
-        fn r#ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>) -> rsbinder::BinderResult<Vec<bool>> {
+        fn r#ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut ::std::vec::Vec<bool>) -> rsbinder::BinderResult<::std::vec::Vec<bool>> {
             let _aidl_data = self.build_parcel_ReverseBoolean(_arg_input, _arg_repeated)?;
             let _aidl_reply = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#ReverseBoolean, &_aidl_data, rsbinder::FLAG_CLEAR_BUF | rsbinder::FLAG_PRIVATE_LOCAL);
             self.read_response_ReverseBoolean(_arg_input, _arg_repeated, _aidl_reply)
         }
-        fn r#RepeatNullableIntArray(&self, _arg_input: Option<&[i32]>) -> rsbinder::BinderResult<Option<Vec<i32>>> {
+        fn r#RepeatNullableIntArray(&self, _arg_input: ::core::option::Option<&[i32]>) -> rsbinder::BinderResult<::core::option::Option<::std::vec::Vec<i32>>> {
             let _aidl_data = self.build_parcel_RepeatNullableIntArray(_arg_input)?;
             let _aidl_reply = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#RepeatNullableIntArray, &_aidl_data, rsbinder::FLAG_CLEAR_BUF | rsbinder::FLAG_PRIVATE_LOCAL);
             self.read_response_RepeatNullableIntArray(_arg_input, _aidl_reply)
@@ -152,10 +152,10 @@ pub mod ITestService {
         }
     }
     impl ITestService for rsbinder::Binder<BnTestService> {
-        fn r#ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>) -> rsbinder::BinderResult<Vec<bool>> {
+        fn r#ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut ::std::vec::Vec<bool>) -> rsbinder::BinderResult<::std::vec::Vec<bool>> {
             self.0.r#ReverseBoolean(_arg_input, _arg_repeated)
         }
-        fn r#RepeatNullableIntArray(&self, _arg_input: Option<&[i32]>) -> rsbinder::BinderResult<Option<Vec<i32>>> {
+        fn r#RepeatNullableIntArray(&self, _arg_input: ::core::option::Option<&[i32]>) -> rsbinder::BinderResult<::core::option::Option<::std::vec::Vec<i32>>> {
             self.0.r#RepeatNullableIntArray(_arg_input)
         }
         fn r#FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable) -> rsbinder::BinderResult<()> {
@@ -169,10 +169,10 @@ pub mod ITestService {
     /// Binder-typed arguments still have to be re-wrapped by hand; a proxy
     /// forwarded as-is is refused at the stack boundary.
     impl ITestService for rsbinder::Strong<dyn ITestService> {
-        fn r#ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut Vec<bool>) -> rsbinder::BinderResult<Vec<bool>> {
+        fn r#ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut ::std::vec::Vec<bool>) -> rsbinder::BinderResult<::std::vec::Vec<bool>> {
             (**self).r#ReverseBoolean(_arg_input, _arg_repeated)
         }
-        fn r#RepeatNullableIntArray(&self, _arg_input: Option<&[i32]>) -> rsbinder::BinderResult<Option<Vec<i32>>> {
+        fn r#RepeatNullableIntArray(&self, _arg_input: ::core::option::Option<&[i32]>) -> rsbinder::BinderResult<::core::option::Option<::std::vec::Vec<i32>>> {
             (**self).r#RepeatNullableIntArray(_arg_input)
         }
         fn r#FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable) -> rsbinder::BinderResult<()> {
@@ -183,8 +183,8 @@ pub mod ITestService {
         _service: &dyn ITestService, _code: rsbinder::TransactionCode, _reader: &mut rsbinder::Parcel, _reply: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
         match _code {
             transactions::r#ReverseBoolean => {
-                let _arg_input: Vec<bool> = _reader.read()?;
-                let mut _arg_repeated: Vec<bool> = ::core::default::Default::default();
+                let _arg_input: ::std::vec::Vec<bool> = _reader.read()?;
+                let mut _arg_repeated: ::std::vec::Vec<bool> = ::core::default::Default::default();
                 _reader.resize_out_vec(&mut _arg_repeated)?;
                 let _aidl_return = _service.r#ReverseBoolean(&_arg_input, &mut _arg_repeated);
                 match &_aidl_return {
@@ -200,7 +200,7 @@ pub mod ITestService {
                 ::core::result::Result::Ok(())
             }
             transactions::r#RepeatNullableIntArray => {
-                let _arg_input: Option<Vec<i32>> = _reader.read()?;
+                let _arg_input: ::core::option::Option<::std::vec::Vec<i32>> = _reader.read()?;
                 let _aidl_return = _service.r#RepeatNullableIntArray(_arg_input.as_deref());
                 match &_aidl_return {
                     ::core::result::Result::Ok(_aidl_return) => {
@@ -237,10 +237,10 @@ pub mod StructuredParcelable {
     pub struct StructuredParcelable {
         pub r#value: i32,
     }
-    impl Default for StructuredParcelable {
+    impl ::core::default::Default for StructuredParcelable {
         fn default() -> Self {
             Self {
-                r#value: Default::default(),
+                r#value: ::core::default::Default::default(),
             }
         }
     }
@@ -304,17 +304,17 @@ pub mod FixedSizeArrayExample {
     #[derive(Debug)]
     pub struct FixedSizeArrayExample {
         pub r#int2x3: [[i32; 3]; 2],
-        pub r#stringNullableMatrix: Option<[[Option<String>; 2]; 2]>,
-        pub r#byteEnumNullableMatrix: Option<[[ByteEnum::ByteEnum; 2]; 2]>,
-        pub r#interfaceNullableMatrix: Option<[[Option<rsbinder::Strong<dyn IEmptyInterface::IEmptyInterface>>; 2]; 2]>,
+        pub r#stringNullableMatrix: ::core::option::Option<[[::core::option::Option<::std::string::String>; 2]; 2]>,
+        pub r#byteEnumNullableMatrix: ::core::option::Option<[[ByteEnum::ByteEnum; 2]; 2]>,
+        pub r#interfaceNullableMatrix: ::core::option::Option<[[::core::option::Option<rsbinder::Strong<dyn IEmptyInterface::IEmptyInterface>>; 2]; 2]>,
     }
-    impl Default for FixedSizeArrayExample {
+    impl ::core::default::Default for FixedSizeArrayExample {
         fn default() -> Self {
             Self {
                 r#int2x3: [[1,2,3,],[4,5,6,],],
-                r#stringNullableMatrix: Some([[Some("hello".into()),Some("world".into()),],[Some("Ciao".into()),Some("mondo".into()),],]),
-                r#byteEnumNullableMatrix: Default::default(),
-                r#interfaceNullableMatrix: Default::default(),
+                r#stringNullableMatrix: ::core::option::Option::Some([[::core::option::Option::Some("hello".into()),::core::option::Option::Some("world".into()),],[::core::option::Option::Some("Ciao".into()),::core::option::Option::Some("mondo".into()),],]),
+                r#byteEnumNullableMatrix: ::core::default::Default::default(),
+                r#interfaceNullableMatrix: ::core::default::Default::default(),
             }
         }
     }
@@ -458,10 +458,10 @@ pub mod FixedSizeArrayExample {
         pub struct IntParcelable {
             pub r#value: i32,
         }
-        impl Default for IntParcelable {
+        impl ::core::default::Default for IntParcelable {
             fn default() -> Self {
                 Self {
-                    r#value: Default::default(),
+                    r#value: ::core::default::Default::default(),
                 }
             }
         }

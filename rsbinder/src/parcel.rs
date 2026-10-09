@@ -2195,7 +2195,7 @@ impl Parcel {
         self.write_aligned_data(&obj.to_bytes())?;
 
         if null_meta || obj.pointer() != 0 {
-            // Pin first: `acquire` then hits the cached proxy instead of a temporary one.
+            // The pin is the HANDLE's strong ref (module doc "Kernel proxies"); `acquire` skips it.
             match binder.filter(|_| obj.header_type() == BINDER_TYPE_HANDLE) {
                 Some(b) => {
                     debug_assert_eq!(b.as_proxy().map(|p| p.handle()), Some(obj.handle()));
@@ -2335,8 +2335,10 @@ impl Parcel {
             f(self)?;
         }
         let end = self.data_position();
+        if end < start {
+            return Err(StatusCode::BadValue);
+        }
         self.set_data_position(start);
-        assert!(end >= start);
         self.write::<i32>(&((end - start) as _))?;
         self.set_data_position(end);
         Ok(())
@@ -4199,16 +4201,17 @@ mod data_serde {
 
     #[test]
     fn a_file_descriptor_field_is_refused_before_the_dup() {
-        use std::os::fd::AsRawFd;
-        let file = std::fs::File::open("/dev/null").expect("/dev/null");
-        let pfd = crate::ParcelFileDescriptor::new(file);
+        // A pipe end has its own inode, so a reused fd number cannot pass for it.
+        let (_r, w) = crate::ParcelFileDescriptor::pipe().expect("pipe");
+        let ino = rustix::fs::fstat(&w).expect("fstat").st_ino;
 
         let mut parcel = Parcel::new_data_only();
-        assert_eq!(parcel.write(&pfd), Err(StatusCode::FdsNotAllowed));
-        assert!(
-            pfd.as_raw_fd() >= 0,
-            "the caller's fd is untouched by the refusal"
-        );
+        assert_eq!(parcel.write(&w), Err(StatusCode::FdsNotAllowed));
+        let untouched = rustix::fs::fstat(&w).map(|s| s.st_ino) == Ok(ino);
+        if !untouched {
+            std::mem::forget(w);
+        }
+        assert!(untouched, "the caller's fd is untouched by the refusal");
         // No fd-count assertion: the count is process-global and sibling tests dup fds in parallel.
     }
 

@@ -116,6 +116,25 @@ impl RpcTransport for VsockTransport {
         }
     }
 
+    // No fd passing: `fds` reaches only the trait's refusing default.
+    fn send_raw_draining(
+        &self,
+        buf: &[u8],
+        fds: &[std::os::fd::BorrowedFd<'_>],
+        drain: &mut dyn FnMut() -> RpcResult<()>,
+    ) -> RpcResult<()> {
+        use std::os::fd::AsFd;
+        if !fds.is_empty() {
+            return self.send_raw_with_fds(buf, fds);
+        }
+        super::unix::send_draining(
+            self.stream.as_fd(),
+            &mut [std::io::IoSlice::new(buf)],
+            &[],
+            drain,
+        )
+    }
+
     fn peer_identity(&self) -> PeerIdentity {
         self.peer.clone()
     }

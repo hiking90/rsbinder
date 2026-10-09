@@ -18,8 +18,8 @@
 //!
 //! The negotiated version is selected at runtime by the connection
 //! handshake (`RpcConnectionHeader`/`RpcNewSessionResponse`). r34
-//! (android-12, pre-versioning, 32-byte address, no handshake) stays a
-//! separate codec.
+//! (android-12, pre-versioning, 32-byte address, an `int32` session-id
+//! preamble instead of a handshake) stays a separate codec.
 //!
 //! # v1 ≡ v2 framing (verified vs `android-16.0.0_r4`)
 //!
@@ -113,16 +113,18 @@
 //! 16-byte `RpcWireHeader` (whose `bodySize` field decides the body
 //! length) followed by the body, and the handshake structs are written as
 //! raw fixed-size structs (AOSP `RpcState::rpcSend`/`rpcRec` —
-//! `interruptableWriteFully`/`ReadFully` of iovecs, no framing). This is
-//! distinct from rsbinder's own `RpcTransport` framing, which prepends a
-//! `u32` length (`transport::write_frame`) — that extra prefix is an
-//! rsbinder-ism a real android peer neither writes nor expects.
+//! `interruptableWriteFully`/`ReadFully` of iovecs, no framing). android-12
+//! frames its messages the same way. This is distinct from the
+//! `RpcTransport::send_frame` framing, which prepends a `u32` length
+//! (`transport::write_frame`) — that prefix is an rsbinder-ism a real
+//! android peer neither writes nor expects, and no `RpcSession` uses it.
 //!
 //! The `*_aosp_message*` and handshake helpers operate directly on a byte
 //! stream (`Read + Write`), so they are wire-identical to a genuine
-//! android-13/14/15 RPC peer. They are the reusable primitives the opt-in
-//! `RpcSession` android-13+ profile wires in; nothing here touches the R34
-//! `RpcSession`/`RpcTransport` path (additive; R34 stays the AOSP android-12 layout).
+//! android RPC peer. `RpcSession` reads and writes every message of both
+//! profiles through them; the handshake helpers are android-13+ only, and
+//! the r34 profile's one connection-setup step, the `int32` session-id
+//! preamble, is `read_r34_session_preamble`.
 //!
 //! `read_aosp_message` and `read_aosp_message_with_fds` read header and
 //! body into one allocation: `bodySize` is peer-chosen up to
@@ -244,6 +246,31 @@ pub const A13_CONN_INIT_LEN: usize = 8;
 const CMD_TRANSACT: u32 = 0;
 const CMD_REPLY: u32 = 1;
 const CMD_DEC_STRONG: u32 = 2;
+
+/// AOSP `processCommand(CONTROL_ONLY)` judged on the header alone: `None` admits the message.
+///
+/// `dec_strong_len` is the wire's `DEC_STRONG` body: [`A13_DEC_STRONG_LEN`], or 32 on r34,
+/// whose frame is read whole and judged by the same rule after.
+pub(crate) fn control_only_refusal(
+    header: &[u8],
+    dec_strong_len: usize,
+) -> Option<(crate::StatusCode, &'static str)> {
+    use crate::StatusCode;
+    let command = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+    let body_size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+    match command {
+        // android-17.0.0_r1 `RpcState.cpp:973-978`.
+        CMD_TRANSACT => Some((StatusCode::BadType, "a TRANSACT")),
+        // `processDecStrong`, `RpcState.cpp:1395-1400`.
+        CMD_DEC_STRONG if body_size != dec_strong_len => {
+            Some((StatusCode::BadValue, "a DEC_STRONG of the wrong size"))
+        }
+        CMD_DEC_STRONG => None,
+        // No `REPLY` case there: the unknown-command arm, `RpcState.cpp:986-996`.
+        CMD_REPLY => Some((StatusCode::DeadObject, "a REPLY")),
+        _ => Some((StatusCode::DeadObject, "an unknown command")),
+    }
+}
 
 /// `RPC_WIRE_ADDRESS_OPTION_*` (RpcWireFormat.h).
 const ADDR_OPTION_CREATED: u32 = 1 << 0;
@@ -670,9 +697,9 @@ impl WireCodec for Android13PlusCodec {
         Ok(out)
     }
 
-    fn encode_dec_strong(&self, addr: &RpcAddress, amount: u32) -> Vec<Vec<u8>> {
+    fn encode_dec_strong(&self, addr: &RpcAddress, amount: u32) -> Option<(Vec<u8>, u32)> {
         if amount == 0 {
-            return Vec::new();
+            return None;
         }
         let header = Self::header(CMD_DEC_STRONG, A13_DEC_STRONG_LEN)
             .expect("DEC_STRONG body length is a const ≪ MAX_FRAME_LEN");
@@ -681,7 +708,7 @@ impl WireCodec for Android13PlusCodec {
         out.extend_from_slice(&Self::encode_addr(addr)); // 8
         out.extend_from_slice(&amount.to_le_bytes()); // amount
         out.extend_from_slice(&0u32.to_le_bytes()); // reserved
-        vec![out]
+        Some((out, 1))
     }
 
     fn decode_message(&self, frame: &[u8]) -> RpcResult<WireMessage> {
@@ -850,8 +877,17 @@ pub fn write_aosp_message<W: Write>(w: &mut W, msg: &[u8]) -> RpcResult<()> {
 /// `[header | body]`, exactly what [`Android13PlusCodec::decode_message`]
 /// expects.
 pub fn read_aosp_message<R: Read>(r: &mut R) -> RpcResult<Vec<u8>> {
+    read_aosp_message_gated(r, |_| Ok(()))
+}
+
+/// [`read_aosp_message`] that lets `gate` refuse the header before any body byte is read.
+pub(crate) fn read_aosp_message_gated<R: Read>(
+    r: &mut R,
+    gate: impl FnOnce(&[u8]) -> RpcResult<()>,
+) -> RpcResult<Vec<u8>> {
     let mut header = [0u8; WIRE_HEADER_LEN];
     read_exact_into(r, &mut header)?;
+    gate(&header)?;
     let body_size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
     if body_size > MAX_FRAME_LEN {
         return Err(RpcError::FrameTooLarge {
@@ -870,6 +906,14 @@ pub fn read_aosp_message<R: Read>(r: &mut R) -> RpcResult<Vec<u8>> {
     Ok(out)
 }
 
+/// The r34 connection preamble: the bare `int32` session id an android-12 client writes before
+/// its first message (`RpcSession::setupOneSocketConnection`, `RpcServer::establishConnection`).
+pub(crate) fn read_r34_session_preamble<R: Read>(r: &mut R) -> RpcResult<i32> {
+    let mut id = [0u8; 4];
+    read_exact_into(r, &mut id)?;
+    Ok(i32::from_le_bytes(id))
+}
+
 /// [`write_aosp_message`] + out-of-band `SCM_RIGHTS` fds (the
 /// android-13+ v1+ `Unix` FD-over-RPC path). `msg` is
 /// the codec output (`[RpcWireHeader(16) | body]`, `bodySize` correct),
@@ -877,10 +921,12 @@ pub fn read_aosp_message<R: Read>(r: &mut R) -> RpcResult<Vec<u8>> {
 /// `sendmsg` (AOSP `RpcTransportRaw`). With `fds` empty this is exactly
 /// [`write_aosp_message`] on the transport's raw channel (byte-identical
 /// to the no-FD android-13+ path).
+/// With `drain`, the send reads while it waits (`RpcTransport::send_raw_draining`).
 pub fn write_aosp_message_with_fds(
     t: &dyn super::transport::RpcTransport,
     msg: &[u8],
     fds: &[std::os::fd::BorrowedFd<'_>],
+    drain: Option<&mut dyn FnMut() -> RpcResult<()>>,
 ) -> RpcResult<()> {
     if msg.len() < WIRE_HEADER_LEN {
         return Err(RpcError::Protocol("message shorter than RpcWireHeader"));
@@ -891,7 +937,10 @@ pub fn write_aosp_message_with_fds(
             max: MAX_FRAME_LEN,
         });
     }
-    t.send_raw_with_fds(msg, fds)
+    match drain {
+        Some(drain) => t.send_raw_draining(msg, fds, drain),
+        None => t.send_raw_with_fds(msg, fds),
+    }
 }
 
 /// [`read_aosp_message`] + the `SCM_RIGHTS` fds delivered with it.
@@ -905,8 +954,10 @@ pub fn write_aosp_message_with_fds(
 /// a short read after partial progress ⇒ [`RpcError::Truncated`]
 /// (mirrors [`read_aosp_message`]). `recv` is one `recvmsg`
 /// (`RpcTransport::recv_raw_with_fds`).
+/// `gate` may refuse the header before any body byte is read.
 pub fn read_aosp_message_with_fds(
     mut recv: impl FnMut(&mut [u8]) -> RpcResult<(usize, Vec<std::os::fd::OwnedFd>)>,
+    gate: impl FnOnce(&[u8]) -> RpcResult<()>,
 ) -> RpcResult<(Vec<u8>, Vec<std::os::fd::OwnedFd>)> {
     let mut fds: Vec<std::os::fd::OwnedFd> = Vec::new();
     let mut total_read = 0usize;
@@ -936,6 +987,7 @@ pub fn read_aosp_message_with_fds(
 
     let mut header = [0u8; WIRE_HEADER_LEN];
     fill(&mut header)?;
+    gate(&header)?;
     let body_size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
     if body_size > MAX_FRAME_LEN {
         return Err(RpcError::FrameTooLarge {
@@ -1188,11 +1240,10 @@ fn write_all_raw<W: Write>(w: &mut W, buf: &[u8]) -> RpcResult<()> {
 /// Bridges a [`RpcTransport`](super::transport::RpcTransport) to
 /// `std::io::{Read, Write}` so the AOSP-faithful framing + handshake
 /// helpers above run over any transport with raw byte access
-/// (every built-in backend but the frame-only `mem`). EOF (`recv_raw` ⇒ `Ok(0)`) is preserved as
+/// (every built-in backend). EOF (`recv_raw` ⇒ `Ok(0)`) is preserved as
 /// `Read` returning `Ok(0)`, so `read_exact_raw` still yields the
-/// correct `EndOfStream`/`Truncated`. This is the bridge the opt-in
-/// android-13+ `RpcSession` profile uses; the R34 path never touches
-/// it.
+/// correct `EndOfStream`/`Truncated`. `RpcSession` reads through this
+/// bridge on both wire profiles.
 pub struct RawTransportIo<'a>(pub &'a dyn super::transport::RpcTransport);
 
 impl Read for RawTransportIo<'_> {
@@ -1356,7 +1407,7 @@ mod tests {
         for c in [c0, c1] {
             let mut ctr = 0u64;
             let a = RpcAddress::unique(&mut ctr, AddressSpace::Initiator);
-            let enc = c.encode_dec_strong(&a, 1).remove(0);
+            let (enc, _) = c.encode_dec_strong(&a, 1).expect("a frame");
             let mut want = Vec::new();
             want.extend_from_slice(&2u32.to_le_bytes()); // DEC_STRONG
             want.extend_from_slice(&16u32.to_le_bytes()); // bodySize
@@ -1488,18 +1539,18 @@ mod tests {
             }
             let mut ctr = 9u64;
             let addr = RpcAddress::unique(&mut ctr, AddressSpace::Initiator);
-            let batched = c.encode_dec_strong(&addr, 7);
-            assert_eq!(batched.len(), 1, "one frame carries the whole amount");
-            match c.decode_message(&batched[0]).unwrap() {
+            let (batched, times) = c.encode_dec_strong(&addr, 7).expect("a frame");
+            assert_eq!(times, 1, "one frame carries the whole amount");
+            match c.decode_message(&batched).unwrap() {
                 WireMessage::DecStrong(a, amount) => {
                     assert_eq!(a, addr);
                     assert_eq!(amount, 7, "the encoder writes the amount it is given");
                 }
                 other => panic!("expected DecStrong, got {other:?}"),
             }
-            assert!(c.encode_dec_strong(&addr, 0).is_empty());
+            assert!(c.encode_dec_strong(&addr, 0).is_none());
             // A peer may batch amount > 1 (AOSP `sendDecStrongToTarget`); the field is read.
-            let mut framed = c.encode_dec_strong(&addr, 1).remove(0);
+            let (mut framed, _) = c.encode_dec_strong(&addr, 1).expect("a frame");
             let amt_off = WIRE_HEADER_LEN + A13_ADDR_LEN;
             framed[amt_off..amt_off + 4].copy_from_slice(&3u32.to_le_bytes());
             match c.decode_message(&framed).unwrap() {
@@ -1723,8 +1774,8 @@ mod tests {
 
             let mut ctr = 7u64;
             let addr = RpcAddress::unique(&mut ctr, AddressSpace::Initiator);
-            write_aosp_message(&mut c, &codec.encode_dec_strong(&addr, 1)[0])
-                .expect("write dec_strong");
+            let (dec, _) = codec.encode_dec_strong(&addr, 1).expect("a frame");
+            write_aosp_message(&mut c, &dec).expect("write dec_strong");
 
             assert_eq!(srv.join().expect("server thread"), expect);
         }
@@ -1792,11 +1843,28 @@ mod tests {
             assert_eq!(srv.join().expect("server thread"), expect);
         }
 
-        // Default transports have no raw access (additive, by type).
-        use crate::rpc::transport::RpcTransport;
-        let (m, _m2) = crate::rpc::transport::MemTransport::pair();
-        assert!(m.send_raw(b"x").is_err(), "mem has no raw byte access");
-        assert!(m.recv_raw(&mut [0u8; 4]).is_err());
+        // A transport that keeps the trait defaults has no raw access (additive, by type).
+        use crate::rpc::transport::{PeerIdentity, RpcTransport};
+        struct FrameOnly;
+        impl RpcTransport for FrameOnly {
+            fn send_frame(&self, _buf: &[u8]) -> RpcResult<()> {
+                Ok(())
+            }
+            fn recv_frame(&self) -> RpcResult<Vec<u8>> {
+                Err(RpcError::EndOfStream)
+            }
+            fn peer_identity(&self) -> PeerIdentity {
+                PeerIdentity::Anonymous
+            }
+            fn describe(&self) -> &str {
+                "frame-only"
+            }
+            fn shutdown(&self) -> RpcResult<()> {
+                Ok(())
+            }
+        }
+        assert!(FrameOnly.send_raw(b"x").is_err(), "no raw byte access");
+        assert!(FrameOnly.recv_raw(&mut [0u8; 4]).is_err());
     }
 
     /// Attach handshake is byte-exact to AOSP; see module doc "Mutation gates".

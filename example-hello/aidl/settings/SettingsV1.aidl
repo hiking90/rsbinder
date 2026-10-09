@@ -3,6 +3,9 @@
 
 package settings;
 
+import settings.Endpoint;
+import settings.Mode;
+
 /**
  * Version 1 of a stored record.
  *

@@ -227,14 +227,14 @@
 //!   states the full guarantee.
 //! - **Dead-binder handshake.** For `BR_DEAD_BINDER`,
 //!   `drive_dead_binder_handshake` runs three phases: `obituary` (the user
-//!   callbacks), `queue_done` (write `BC_DEAD_BINDER_DONE`), and `pin_release`
-//!   (flush `release_obituary_pin`'s `BC_DECREFS`). The kernel `binder_ref`
-//!   slot leaks for good if either of the last two is lost, so both run
-//!   whatever the obituary returned. The obituary error takes priority over
-//!   the pin-release error, which is logged so it is not lost when both fail.
-//!   A `queue_done` failure (only when `out_parcel` is unhealthy, e.g. OOM)
-//!   skips `pin_release` and the slot leaks; the next ioctl on this thread
-//!   fails anyway.
+//!   callbacks), `queue_done` (write `BC_DEAD_BINDER_DONE`), and `flush`
+//!   (`finish_obituary`). The kernel holds the death's
+//!   `BR_CLEAR_DEATH_NOTIFICATION_DONE`, and with it the pin release that
+//!   waits for it, until `BC_DEAD_BINDER_DONE` arrives, so both of the last
+//!   two run whatever the obituary returned. The obituary error takes
+//!   priority over the flush error, which is logged so it is not lost when
+//!   both fail. A `queue_done` failure (only when `out_parcel` is unhealthy,
+//!   e.g. OOM) skips `flush`; the next ioctl on this thread fails anyway.
 //! - **Refused commands.** A `BINDER_WRITE_READ` that fails or stops short
 //!   reports `write_consumed`, and which command that offset names depends on
 //!   how the driver stopped (android17-6.18 `binder_thread_write`). A command
@@ -250,7 +250,36 @@
 //!   size). It names the command because the usual causes are caller bugs the
 //!   errno alone cannot tell apart: a refcount underflow from an over-released
 //!   proxy (`BC_RELEASE` / `BC_DECREFS`), or a `BC_FREE_BUFFER` for a buffer
-//!   already returned.
+//!   already returned. An error with `write_consumed` past 0 and short of the
+//!   end aborts like a short write: the commands before the refused one were
+//!   applied, so resending them repeats a `BC_FREE_BUFFER` or refcount change,
+//!   and dropping them would shift the offsets `unflushed_mark` handed out.
+//!   With the whole buffer consumed the error comes from the read side;
+//!   `out_parcel` is emptied as on success and the errno is returned. With
+//!   `write_consumed` at 0 the errno is returned with `out_parcel` kept. AOSP
+//!   `talkWithDriver` (android-17.0.0_r1 `IPCThreadState.cpp:1358-1362`, same
+//!   in 16.0.0_r4) returns every errno with `mOut` as is and resends all of it
+//!   on the next call, applied commands included; only its short write without
+//!   an errno is fatal (`:1333-1340`).
+//! - **Driver errors.** Which errors end a wait follows AOSP `waitForResponse`
+//!   and `executeCommand`. A `BINDER_WRITE_READ` errno other than EINTR
+//!   (retried with `bwr` kept, as `:1296-1320`) ends `wait_for_response` with
+//!   that errno (`:1159`). So does an `execute_command` error (`:1228-1230`):
+//!   `BR_ERROR`, `BR_FINISHED`, an unknown command, or a truncated
+//!   `in_parcel`. A failed or panicked reply to a nested `BR_TRANSACTION` and a
+//!   failed `BR_DEAD_BINDER` handshake are logged, not returned, as AOSP
+//!   (`sendReply` result, `:1583-1589`; `BR_DEAD_BINDER`, `:1631-1638`), so
+//!   they neither end an outer wait nor take a looper thread out of the pool.
+//!   A nested handler's own failed outgoing call reaches its caller only
+//!   through the reply status. AOSP has the same residual window: when an
+//!   errno ends the wait of a two-way `transact` whose `BC_TRANSACTION` the
+//!   driver already consumed — in the failed ioctl itself, or in an earlier
+//!   one before a read-only ioctl failed — the call stays on the kernel's
+//!   transaction stack and its `BR_REPLY` (after its `BR_TRANSACTION_COMPLETE`
+//!   if the failed ioctl sent it) arrives at this thread's next wait.
+//!   A two-way `transact` returns it as its own reply; a oneway `transact` or
+//!   a reply wait frees it and keeps waiting, where AOSP aborts on
+//!   "Unexpected BR_REPLY" (`:1209`).
 
 use log::error;
 use std::backtrace::Backtrace;
@@ -1192,17 +1221,17 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
     })
 }
 
-/// `BR_DEAD_BINDER` phases; only a `queue_done` error skips `pin_release`. See module doc.
-fn drive_dead_binder_handshake<O, Q, P>(
+/// `BR_DEAD_BINDER` phases; only a `queue_done` error skips `flush`. See module doc.
+fn drive_dead_binder_handshake<O, Q, F>(
     handle: binder::binder_uintptr_t,
     obituary: O,
     queue_done: Q,
-    pin_release: P,
+    flush: F,
 ) -> Result<()>
 where
     O: FnOnce() -> Result<()>,
     Q: FnOnce() -> Result<()>,
-    P: FnOnce() -> Result<()>,
+    F: FnOnce() -> Result<()>,
 {
     // Phase 1: dispatch recipients; never short-circuit, the handshake must complete.
     let obituary_result = obituary();
@@ -1218,18 +1247,18 @@ where
         return Err(qe);
     }
 
-    // Phase 3: always release the pin; log its error now, as the obituary error wins below.
-    let pin_result = pin_release();
-    if let Err(e) = &pin_result {
+    // Phase 3: always flush; log its error now, as the obituary error wins below.
+    let flush_result = flush();
+    if let Err(e) = &flush_result {
         error!(
-            "release_obituary_pin failed for handle {handle:X}: {e:?}; \
+            "finish_obituary failed for handle {handle:X}: {e:?}; \
              obituary_result: {obituary_result:?}"
         );
     }
 
-    // The user-visible obituary error wins; the pin error surfaces only on its own.
+    // The user-visible obituary error wins; the flush error surfaces only on its own.
     obituary_result?;
-    pin_result?;
+    flush_result?;
     Ok(())
 }
 
@@ -1464,8 +1493,13 @@ fn execute_command(cmd: i32) -> Result<()> {
                     thread_state.strict_mode_policy = strict_mode_policy_old;
                 }
 
+                // Logged, not returned, as AOSP `sendReply`; module doc "Driver errors".
                 match reply_result {
-                    Ok(inner) => inner?,
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => log::error!(
+                        "error in reply for code {}: {e}",
+                        tr_secctx.transaction_data.code
+                    ),
                     Err(_payload) => {
                         // Rewind only this reply's bytes, no retry (module doc "Dispatch notes").
                         discard_unflushed_commands(thread_state, queued_at, false);
@@ -1473,7 +1507,6 @@ fn execute_command(cmd: i32) -> Result<()> {
                             "reply path panicked for code {}; reply dropped",
                             tr_secctx.transaction_data.code
                         );
-                        return Err(StatusCode::Unknown);
                     }
                 }
             }
@@ -1580,7 +1613,8 @@ fn execute_command(cmd: i32) -> Result<()> {
                 #[cfg(feature = "rpc")]
                 let _rpc_suspended = RpcCallingGuard::suspend();
 
-                drive_dead_binder_handshake(
+                // Logged, not returned, as AOSP; module doc "Driver errors".
+                if let Err(e) = drive_dead_binder_handshake(
                     handle,
                     || ProcessState::as_self().send_obituary_for_handle(handle as _),
                     || {
@@ -1593,12 +1627,18 @@ fn execute_command(cmd: i32) -> Result<()> {
                             .write_cmd::<binder::binder_uintptr_t>(&handle)?;
                         Ok(())
                     },
-                    || ProcessState::as_self().release_obituary_pin(handle as _),
-                )?;
+                    || ProcessState::as_self().finish_obituary(),
+                ) {
+                    log::error!("BR_DEAD_BINDER handshake failed for handle {handle:X}: {e:?}");
+                }
             }
             binder::BR_CLEAR_DEATH_NOTIFICATION_DONE => {
-                let mut state = thread_state.borrow_mut();
-                state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?;
+                let handle = {
+                    let mut state = thread_state.borrow_mut();
+                    state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?
+                };
+                // AOSP drops the weak ref `linkToDeath` took (`IPCThreadState.cpp:1640-1644`).
+                ProcessState::as_self().death_clear_done(handle as _);
             }
             _ => {
                 log::error!("*** BAD COMMAND {cmd} received from Binder driver\n");
@@ -1662,6 +1702,7 @@ fn empty_write_read() -> binder::binder_write_read {
 
 /// One driver round trip; see module doc "R1 at specific call sites" for its ioctl borrow.
 fn talk_with_driver(do_receive: bool) -> Result<()> {
+    use std::io::Write as _;
     THREAD_STATE.with(|thread_state| -> Result<()> {
         let mut thread_state = thread_state.borrow_mut();
         let thread_state = &mut *thread_state;
@@ -1715,7 +1756,31 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
                 bwr.write_consumed as _,
                 false,
             );
-            log::error!("binder::write_read() error : {errno}; {detail}");
+            log::error!(
+                "binder::write_read() error : {errno}; {detail}; \
+                 this thread's connection to the driver may no longer work"
+            );
+            let consumed = bwr.write_consumed as usize;
+            if consumed == thread_state.out_parcel.data_size() {
+                // Every command was applied, so none is resent; module doc "Refused commands".
+                if consumed > 0 {
+                    thread_state.out_parcel.set_data_size(0)?;
+                    thread_state.out_flush_epoch += 1;
+                }
+            } else if consumed > 0 {
+                // stderr, not `log` (a consumer may have no logger); `eprintln!` panics on EPIPE.
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "rsbinder FATAL: driver applied the write buffer up to a refused command —\n\
+                     resending would apply the commands before it twice; dropping\n\
+                     them would rewind the marks callers hold\n\
+                     {detail}\nQueued commands:\n{:?}",
+                    thread_state.out_parcel
+                );
+                // Same desync as the short write below; module doc "Refused commands".
+                std::process::abort();
+            }
+            // As AOSP; an in-flight call's BR_REPLY still comes (module doc "Driver errors").
             return Err(StatusCode::from(errno));
         }
 
@@ -1734,8 +1799,9 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
                     bwr.write_consumed as _,
                     true,
                 );
-                // stderr, not `log`: a consumer with no logger would otherwise die mute.
-                eprintln!(
+                // stderr, not `log` (a consumer may have no logger); `eprintln!` panics on EPIPE.
+                let _ = writeln!(
+                    std::io::stderr(),
                     "rsbinder FATAL: driver did not consume the write buffer — {detail}\n\
                      The remainder was never seen by the kernel, so the reference\n\
                      counts and buffer ownership this process believes in are no\n\
@@ -1805,9 +1871,17 @@ pub(crate) fn inc_strong_handle(handle: u32) -> Result<()> {
 
 // `THREAD_STATE` torn down at thread exit: write one command directly, then exit the thread again.
 fn write_without_thread_state<T: NativeScalar>(cmd: u32, arg: T) -> Result<()> {
+    write_without_thread_state_with(|out| {
+        out.write_cmd::<u32>(&cmd)?;
+        out.write_cmd::<T>(&arg)
+    })
+}
+
+fn write_without_thread_state_with(
+    build: impl FnOnce(&mut CommandStream) -> Result<()>,
+) -> Result<()> {
     let mut out = CommandStream::new();
-    out.write_cmd::<u32>(&cmd)?;
-    out.write_cmd::<T>(&arg)?;
+    build(&mut out)?;
     let driver = ProcessState::as_self().driver();
     let write = out.as_bytes()?;
     let mut bwr = empty_write_read();
@@ -2184,24 +2258,22 @@ pub(crate) fn request_death_notification(handle: u32) -> Result<()> {
     })
 }
 
+/// Also counts the clear for the pin ledger, failed or not: the subscription may still be live.
 pub(crate) fn clear_death_notification(handle: u32) -> Result<()> {
     log::trace!("clear_death_notification: {handle}");
-    THREAD_STATE.with(|thread_state| -> Result<()> {
-        {
-            let mut state = thread_state.borrow_mut();
-
-            state
-                .out_parcel
-                .write_cmd::<u32>(&(binder::BC_CLEAR_DEATH_NOTIFICATION))?;
-            state.out_parcel.write_cmd::<u32>(&(handle))?;
-            // Android binder calls writePointer(proxy) here, but we just write handle.
-            state
-                .out_parcel
-                .write_cmd::<binder::binder_uintptr_t>(&(handle as _))?;
-        }
-
-        Ok(())
-    })
+    // Counted before the driver can see it, so its done never arrives first.
+    ProcessState::note_death_clear(handle);
+    let write = |out: &mut CommandStream| -> Result<()> {
+        out.write_cmd::<u32>(&(binder::BC_CLEAR_DEATH_NOTIFICATION))?;
+        out.write_cmd::<u32>(&(handle))?;
+        // Android binder calls writePointer(proxy) here, but we just write handle.
+        out.write_cmd::<binder::binder_uintptr_t>(&(handle as _))
+    };
+    // `try_with`: a `ProxyHandle` dropped at thread exit calls this after teardown.
+    match THREAD_STATE.try_with(|thread_state| write(&mut thread_state.borrow_mut().out_parcel)) {
+        Ok(result) => result,
+        Err(_) => write_without_thread_state_with(write),
+    }
 }
 
 #[derive(Debug)]
@@ -2684,11 +2756,9 @@ mod tests {
     //!   without a kernel `ProcessState` (hermetic, also on macOS). The own-uid / `!handling` /
     //!   `None` answers outside the guard also prove the pure-RPC accessors do not panic while
     //!   `ProcessState` is uninitialized.
-    //! - `test_drive_dead_binder_handshake_orchestration`: pins that phases run obituary →
-    //!   queue → pin on success; an obituary error short-circuits neither queue nor pin; a
-    //!   queue error skips pin; with obituary and pin both failing the obituary error wins; the
-    //!   kernel handshake (queue + pin) runs whenever queue succeeds. Losing any of these (e.g. a
-    //!   `?` early return on the obituary error) leaks the kernel `binder_ref` slot.
+    //! - `test_drive_dead_binder_handshake_orchestration`: obituary → queue → flush; an obituary
+    //!   error skips neither, a queue error skips flush, the obituary error outranks a flush one.
+    //!   A `?` on the obituary error would leave `BC_DEAD_BINDER_DONE` unsent.
     //! - `test_process_pending_derefs_handles_reentrant_push_from_drop`: a `BINDER_DEREFS` borrow held
     //!   across `deref_native_kernel` panics on the second `borrow_mut()` when entry removal runs
     //!   an `Inner<T>::drop` whose destructor makes another `BR_RELEASE` / `BR_DECREFS` land
@@ -3076,15 +3146,15 @@ mod tests {
                 Ok(())
             },
             || {
-                push("pin");
+                push("flush");
                 Ok(())
             },
         );
         assert!(result.is_ok());
-        assert_eq!(*order.borrow(), vec!["obituary", "queue", "pin"]);
+        assert_eq!(*order.borrow(), vec!["obituary", "queue", "flush"]);
         order.borrow_mut().clear();
 
-        // Case B: obituary errors → queue and pin still run, so the binder_ref slot never leaks.
+        // Case B: obituary errors → queue and flush still run, so BC_DEAD_BINDER_DONE goes out.
         let result = drive_dead_binder_handshake(
             42,
             || {
@@ -3096,15 +3166,15 @@ mod tests {
                 Ok(())
             },
             || {
-                push("pin");
+                push("flush");
                 Ok(())
             },
         );
         assert!(matches!(result, Err(StatusCode::DeadObject)));
-        assert_eq!(*order.borrow(), vec!["obituary", "queue", "pin"]);
+        assert_eq!(*order.borrow(), vec!["obituary", "queue", "flush"]);
         order.borrow_mut().clear();
 
-        // Case C: queue write fails → pin skipped (documented edge); queue error surfaces.
+        // Case C: queue write fails → flush skipped (documented edge); queue error surfaces.
         let result = drive_dead_binder_handshake(
             42,
             || {
@@ -3116,7 +3186,7 @@ mod tests {
                 Err(StatusCode::NoMemory)
             },
             || {
-                push("pin");
+                push("flush");
                 Ok(())
             },
         );
@@ -3124,7 +3194,7 @@ mod tests {
         assert_eq!(*order.borrow(), vec!["obituary", "queue"]);
         order.borrow_mut().clear();
 
-        // Case D: obituary OK, pin errors → pin error surfaces.
+        // Case D: obituary OK, flush errors → flush error surfaces.
         let result = drive_dead_binder_handshake(
             42,
             || {
@@ -3136,15 +3206,15 @@ mod tests {
                 Ok(())
             },
             || {
-                push("pin");
+                push("flush");
                 Err(StatusCode::DeadObject)
             },
         );
         assert!(matches!(result, Err(StatusCode::DeadObject)));
-        assert_eq!(*order.borrow(), vec!["obituary", "queue", "pin"]);
+        assert_eq!(*order.borrow(), vec!["obituary", "queue", "flush"]);
         order.borrow_mut().clear();
 
-        // Case E: obituary and pin both fail → obituary error surfaces; pin error only logged.
+        // Case E: obituary and flush both fail → obituary error surfaces; flush error only logged.
         let result = drive_dead_binder_handshake(
             42,
             || {
@@ -3156,15 +3226,15 @@ mod tests {
                 Ok(())
             },
             || {
-                push("pin");
+                push("flush");
                 Err(StatusCode::DeadObject)
             },
         );
         assert!(
             matches!(result, Err(StatusCode::PermissionDenied)),
-            "obituary error must take priority over pin error, got {result:?}"
+            "obituary error must take priority over flush error, got {result:?}"
         );
-        assert_eq!(*order.borrow(), vec!["obituary", "queue", "pin"]);
+        assert_eq!(*order.borrow(), vec!["obituary", "queue", "flush"]);
     }
 
     /// A re-entrant push from a user `Inner<T>::drop` mid-drain; see `# Mutation gates`.

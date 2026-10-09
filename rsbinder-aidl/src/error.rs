@@ -249,16 +249,36 @@ pub enum SemanticError {
         span: SourceSpan,
     },
 
-    #[error("invalid operation: Primitive types and String cannot be an out or inout parameter")]
+    /// AOSP `AidlArgument::CheckValid`: the direction is not one `GetArgumentAspect` permits.
+    #[error("invalid direction: '{arg}' can't be an {direction} parameter because {type_kind} can only be an {allowed} parameter")]
     #[diagnostic(code(aidl::invalid_direction))]
-    DirectionPrimitive {
+    InvalidDirection {
+        arg: String,
         direction: String,
+        /// AOSP's name for the type: `int`, `String`, `IBinder`, `interface`, `enum`, ...
         type_kind: String,
+        /// The permitted directions, formatted as AOSP does (`in`, `in or inout`).
+        allowed: String,
         #[help]
         help: Option<String>,
         #[source_code]
         src: NamedSource<String>,
         #[label("'{direction}' cannot apply to {type_kind}")]
+        span: SourceSpan,
+    },
+
+    /// AOSP `AidlArgument::CheckValid`: a type that is not `in`-only needs an explicit direction.
+    #[error("missing direction: the direction of '{arg}' is not specified; {type_kind} can be an {allowed} parameter")]
+    #[diagnostic(code(aidl::missing_direction))]
+    DirectionNotSpecified {
+        arg: String,
+        type_kind: String,
+        allowed: String,
+        #[help]
+        help: Option<String>,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("no direction for this {type_kind}")]
         span: SourceSpan,
     },
 

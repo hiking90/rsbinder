@@ -180,6 +180,159 @@ pub(crate) fn send_frame_vectored(
     Ok(())
 }
 
+/// A send that fails with `EAGAIN` instead of blocking; XNU ignores `MSG_DONTWAIT` on a send.
+pub(crate) fn send_nonblocking<T>(
+    sock: std::os::fd::BorrowedFd<'_>,
+    send: impl FnOnce(rustix::net::SendFlags) -> rustix::io::Result<T>,
+) -> rustix::io::Result<T> {
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = sock;
+        send(SEND_FLAGS | rustix::net::SendFlags::DONTWAIT)
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
+        let flags = fcntl_getfl(sock)?;
+        if flags.contains(OFlags::NONBLOCK) {
+            return send(SEND_FLAGS);
+        }
+        fcntl_setfl(sock, flags | OFlags::NONBLOCK)?;
+        let sent = send(SEND_FLAGS);
+        // A socket left non-blocking would fail every later blocking read with `EAGAIN`.
+        fcntl_setfl(sock, flags)?;
+        sent
+    }
+}
+
+/// `RpcTransport::send_raw_draining` on a stream socket, `fds` on the first byte.
+pub(crate) fn send_draining(
+    sock: std::os::fd::BorrowedFd<'_>,
+    slices: &mut [std::io::IoSlice<'_>],
+    fds: &[std::os::fd::BorrowedFd<'_>],
+    drain: &mut dyn FnMut() -> RpcResult<()>,
+) -> RpcResult<()> {
+    use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage};
+    use std::io::IoSlice;
+    use std::mem::MaybeUninit;
+
+    if fds.len() > MAX_FDS_PER_FRAME {
+        return Err(RpcError::Protocol("too many fds in one RPC frame"));
+    }
+    let total: usize = slices.iter().map(|s| s.len()).sum();
+    if !fds.is_empty() && total == 0 {
+        // No payload means no `sendmsg` to carry the fds; AOSP frames are never empty.
+        return Err(RpcError::Protocol(
+            "cannot attach fds to an empty RPC frame",
+        ));
+    }
+    let mut rest: &mut [IoSlice<'_>] = slices;
+    let mut space = [MaybeUninit::uninit(); FD_SPACE];
+    let mut sent = 0;
+    let mut waiting = SendWait::new(sock);
+    while sent < total {
+        let mut anc = SendAncillaryBuffer::new(&mut space);
+        // Sending without the fds would leave the parcel's fd table pointing at nothing.
+        if sent == 0 && !fds.is_empty() && !anc.push(SendAncillaryMessage::ScmRights(fds)) {
+            return Err(RpcError::Protocol(
+                "failed to attach SCM_RIGHTS ancillary data",
+            ));
+        }
+        match send_nonblocking(sock, |flags| {
+            rustix::net::sendmsg(sock, rest, &mut anc, flags)
+        }) {
+            Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into()),
+            Ok(n) => {
+                sent += n;
+                IoSlice::advance_slices(&mut rest, n);
+                waiting.progressed();
+            }
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(rustix::io::Errno::AGAIN) => match waiting.wait()? {
+                Some(true) => drain().map_err(super::read_side_failure)?,
+                Some(false) => {}
+                // As `write_all_reporting`: a deadline before any byte keeps frame sync.
+                None if sent == 0 => return Err(RpcError::Timeout),
+                None => return Err(RpcError::Io(std::io::ErrorKind::WouldBlock.into())),
+            },
+            Err(e) => return Err(std::io::Error::from(e).into()),
+        }
+    }
+    Ok(())
+}
+
+/// The waits of one draining send: `SO_SNDTIMEO` counted from the first wait since progress.
+pub(crate) struct SendWait<'a> {
+    sock: std::os::fd::BorrowedFd<'a>,
+    since: Option<std::time::Instant>,
+    /// Read at the first wait: most sends never wait, and the option costs a syscall.
+    limit: Option<Option<std::time::Duration>>,
+}
+
+impl<'a> SendWait<'a> {
+    pub(crate) fn new(sock: std::os::fd::BorrowedFd<'a>) -> Self {
+        SendWait {
+            sock,
+            since: None,
+            limit: None,
+        }
+    }
+
+    /// A byte went out: the next wait starts its own deadline.
+    pub(crate) fn progressed(&mut self) {
+        self.since = None;
+    }
+
+    /// What is left of this wait's deadline: `Some(None)` unbounded, `None` passed.
+    fn left(&mut self) -> Option<Option<std::time::Duration>> {
+        use rustix::net::sockopt::{socket_timeout, Timeout};
+
+        let since = *self.since.get_or_insert_with(std::time::Instant::now);
+        let sock = self.sock;
+        let limit = *self
+            .limit
+            .get_or_insert_with(|| socket_timeout(sock, Timeout::Send).ok().flatten());
+        match limit {
+            Some(d) => match d.checked_sub(since.elapsed()) {
+                Some(left) if !left.is_zero() => Some(Some(left)),
+                _ => None,
+            },
+            None => Some(None),
+        }
+    }
+
+    /// Whether the send deadline passed with no byte out; starts the wait if none is running.
+    #[cfg(feature = "rpc-tls")]
+    pub(crate) fn expired(&mut self) -> bool {
+        self.left().is_none()
+    }
+
+    /// `Some(true)` input or the peer's end, `Some(false)` room or a send error, `None` expired.
+    pub(crate) fn wait(&mut self) -> RpcResult<Option<bool>> {
+        use rustix::event::{poll, PollFd, PollFlags, Timespec};
+
+        loop {
+            let Some(left) = self.left() else {
+                return Ok(None);
+            };
+            let ts = left.map(|d| Timespec {
+                tv_sec: d.as_secs().try_into().unwrap_or(i64::MAX),
+                tv_nsec: d.subsec_nanos() as _,
+            });
+            let mut fds = [PollFd::from_borrowed_fd(
+                self.sock,
+                PollFlags::IN | PollFlags::OUT,
+            )];
+            match poll(&mut fds, ts.as_ref()) {
+                Ok(0) => continue,
+                Ok(_) => return Ok(Some(fds[0].revents().contains(PollFlags::IN))),
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(e) => return Err(std::io::Error::from(e).into()),
+            }
+        }
+    }
+}
+
 /// A framed transport over a connected Unix domain socket.
 pub struct UnixTransport {
     stream: UnixStream,
@@ -452,12 +605,7 @@ impl RpcTransport for UnixTransport {
         if fds.len() > MAX_FDS_PER_FRAME {
             return Err(RpcError::Protocol("too many fds in one RPC frame"));
         }
-        if buf.len() > MAX_FRAME_LEN {
-            return Err(RpcError::FrameTooLarge {
-                declared: buf.len(),
-                max: MAX_FRAME_LEN,
-            });
-        }
+        // As `send_raw`, no length check: `write_aosp_message_with_fds` caps the body.
         let mut space = vec![MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(fds.len()))];
         let mut sent = 0;
         while sent < buf.len() {
@@ -598,6 +746,21 @@ impl RpcTransport for UnixTransport {
         fds: &[std::os::fd::BorrowedFd<'_>],
     ) -> RpcResult<()> {
         send_frame_vectored(self.stream.as_fd(), buf, fds)
+    }
+
+    fn send_raw_draining(
+        &self,
+        buf: &[u8],
+        fds: &[std::os::fd::BorrowedFd<'_>],
+        drain: &mut dyn FnMut() -> RpcResult<()>,
+    ) -> RpcResult<()> {
+        // No length check: raw bytes have no frame, and the caller caps the body.
+        send_draining(
+            self.stream.as_fd(),
+            &mut [std::io::IoSlice::new(buf)],
+            fds,
+            drain,
+        )
     }
 
     /// Receive one length-prefixed frame plus any `SCM_RIGHTS` fds.
@@ -957,5 +1120,30 @@ mod tests {
             matches!(r, Err(RpcError::Truncated)),
             "expected Truncated (2-of-4 header consumed before EOF), got {r:?}"
         );
+    }
+
+    /// A `MAX_FRAME_LEN` body goes out with its header, draining or not, as on other transports.
+    #[test]
+    fn a_max_frame_len_body_is_not_refused_for_its_header() {
+        use crate::rpc::wire_android13::write_aosp_message_with_fds;
+        use std::os::fd::AsFd;
+        let (a, b) = UnixTransport::pair().expect("socketpair");
+        let msg = vec![0u8; 16 + MAX_FRAME_LEN];
+        let total = 2 * msg.len();
+        let reader = std::thread::spawn(move || {
+            let mut buf = vec![0u8; 1 << 20];
+            let mut got = 0;
+            while got < total {
+                match b.recv_raw_with_fds(&mut buf) {
+                    Ok((0, _)) | Err(_) => break,
+                    Ok((n, _)) => got += n,
+                }
+            }
+            got
+        });
+        let (fd, _keep) = std::os::unix::net::UnixStream::pair().expect("an fd");
+        write_aosp_message_with_fds(&a, &msg, &[], Some(&mut || Ok(()))).expect("draining");
+        write_aosp_message_with_fds(&a, &msg, &[fd.as_fd()], None).expect("with an fd");
+        assert_eq!(reader.join().expect("reader"), total);
     }
 }

@@ -25,7 +25,8 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::{read_frame, unix::send_frame_vectored, PeerIdentity, RpcTransport};
+use super::unix::{send_draining, send_frame_vectored};
+use super::{read_frame, PeerIdentity, RpcTransport};
 use crate::rpc::RpcResult;
 
 /// Set on the first `TcpDebugTransport` construction; gates the one-time warning, read by tests.
@@ -133,6 +134,24 @@ impl RpcTransport for TcpDebugTransport {
         send_frame_vectored(self.stream.as_fd(), buf, &[])
     }
 
+    // No fd passing: `fds` reaches only the trait's refusing default.
+    fn send_raw_draining(
+        &self,
+        buf: &[u8],
+        fds: &[std::os::fd::BorrowedFd<'_>],
+        drain: &mut dyn FnMut() -> RpcResult<()>,
+    ) -> RpcResult<()> {
+        if !fds.is_empty() {
+            return self.send_raw_with_fds(buf, fds);
+        }
+        send_draining(
+            self.stream.as_fd(),
+            &mut [std::io::IoSlice::new(buf)],
+            &[],
+            drain,
+        )
+    }
+
     fn recv_frame(&self) -> RpcResult<Vec<u8>> {
         let mut r = &self.stream;
         read_frame(&mut r)
@@ -140,7 +159,7 @@ impl RpcTransport for TcpDebugTransport {
 
     /// Raw, unframed write for the android-13+ profile (the real android
     /// RPC wire has no length prefix). Same shape as `VsockTransport`'s;
-    /// the trait default refuses raw access, which is right for a
+    /// the trait default refuses raw access, which is right only for a
     /// frame-only backend and wrong here — `RpcSession::from_preconnected_fd`
     /// wraps an `AF_INET` fd in this transport and goes straight into the
     /// android-13+ handshake, whose first byte is a raw write.

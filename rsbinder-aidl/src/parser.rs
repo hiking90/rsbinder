@@ -1,17 +1,18 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
-use crate::error::{pest_error_to_diagnostic, AidlError, ParseError};
+use crate::error::{pest_error_to_diagnostic, AidlError, ConstExprError, ParseError};
 
+use pest::iterators::Pair;
 use pest::Parser;
 #[derive(pest_derive::Parser)]
 #[grammar = "aidl.pest"]
 pub struct AIDLParser;
 
-use crate::const_expr::{ConstExpr, ValueType};
+use crate::const_expr::{ConstExpr, RefKind, ValueType};
 use crate::type_generator;
 use crate::Namespace;
 
@@ -19,12 +20,12 @@ thread_local! {
     static DECLARATION_MAP: RefCell<HashMap<Namespace, Declaration>> = RefCell::new(HashMap::new());
     static DECLARATION_DOCUMENT_MAP: RefCell<HashMap<Namespace, DocumentContext>> = RefCell::new(HashMap::new());
     static NAMESPACE_STACK: RefCell<Vec<Namespace>> = const { RefCell::new(Vec::new()) };
-    static DOCUMENT: RefCell<Document> = RefCell::new(Document::new());
+    static DOCUMENT: RefCell<DocumentContext> = RefCell::new(DocumentContext::default());
 
-    // Universal Symbol Table - supports all types of named constants
-    static SYMBOL_TABLE: RefCell<HashMap<String, ConstExpr>> = RefCell::new(HashMap::new());
-    static ENUM_VALUE_CACHE: RefCell<HashMap<String, ConstExpr>> = RefCell::new(HashMap::new());
-    static ENUM_RESOLUTION_STACK: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    // Final value of each constant and enum member by `Symbol::key`; `None` while it is resolving.
+    static CONST_VALUES: RefCell<HashMap<String, Option<Result<ConstExpr, String>>>> = RefCell::new(HashMap::new());
+    // Live `resolve_symbol` calls; each is iterative, so only re-entry would add stack.
+    static RESOLVE_NESTING: Cell<usize> = const { Cell::new(0) };
 
     // Filename and text of the source being parsed, for error diagnostics.
     static CURRENT_SOURCE_NAME: RefCell<String> = const { RefCell::new(String::new()) };
@@ -32,6 +33,9 @@ thread_local! {
 
     // Non-fatal diagnostics of the current `parse_document`, drained into `Document::warnings`.
     static CURRENT_WARNINGS: RefCell<Vec<crate::error::AidlWarning>> = const { RefCell::new(Vec::new()) };
+
+    // Input rsbinder accepts but AOSP aidl rejects; `None` unless a `Builder` is collecting.
+    static GENERATION_WARNINGS: RefCell<Option<BTreeSet<String>>> = const { RefCell::new(None) };
 
     // Each `crate::BUILTIN_DECLS` entry: AIDL namespace -> Rust path relative to the runtime crate.
     static BUILTIN_RUST_PATHS: RefCell<HashMap<Namespace, String>> = RefCell::new(HashMap::new());
@@ -203,28 +207,108 @@ fn scan_comments(source: &str) -> Vec<CommentSpan> {
     spans
 }
 
-/// First `@deprecated` block in the comment run before `start` (AOSP FindDeprecated, 14.0.0_r50+).
-pub fn deprecated_at(start: usize) -> Option<String> {
+/// AOSP `FindDeprecated` (14.0.0_r50+) over the comments AOSP merges into `pair`'s declaration.
+fn deprecated_in(pair: &Pair<Rule>) -> Option<String> {
+    let mut starts = Vec::new();
+    collect_comment_token_starts(pair, &mut starts);
+    starts.dedup();
     CURRENT_COMMENTS.with(|spans| {
         let spans = spans.borrow();
         CURRENT_SOURCE_TEXT.with(|text| {
             let text = text.borrow();
-            let end = spans.partition_point(|c| c.end <= start);
-            // Walk back while only whitespace separates a comment from what follows it.
-            let mut first = end;
-            let mut next_start = start;
-            while let Some(span) = first.checked_sub(1).map(|i| spans[i]) {
-                let gap = text.get(span.end..next_start)?;
-                if !gap.chars().all(char::is_whitespace) {
-                    break;
+            starts.iter().find_map(|&start| {
+                comment_run_before(&spans, &text, start)
+                    .iter()
+                    .filter(|span| span.is_block)
+                    .find_map(|span| find_deprecated(text.get(span.start..span.end)?))
+            })
+        })
+    })
+}
+
+/// Annotations, keyword or `oneway`, type, method name: tokens AOSP takes comments from.
+fn collect_comment_token_starts(pair: &Pair<Rule>, starts: &mut Vec<usize>) {
+    let annotations = |list: Pair<Rule>, starts: &mut Vec<usize>| {
+        starts.extend(list.into_inner().map(|a| a.as_span().start()));
+    };
+    match pair.as_rule() {
+        Rule::decl => {
+            for child in pair.clone().into_inner() {
+                match child.as_rule() {
+                    Rule::annotation_list => annotations(child, starts),
+                    // The keyword, or `oneway` before `interface` (AOSP keeps only its comments).
+                    _ => starts.push(child.as_span().start()),
                 }
-                first -= 1;
-                next_start = span.start;
             }
-            spans[first..end]
-                .iter()
-                .filter(|span| span.is_block)
-                .find_map(|span| find_deprecated(text.get(span.start..span.end)?))
+        }
+        Rule::method_decl | Rule::constant_decl | Rule::variable_decl => {
+            let mut keyword_from =
+                (pair.as_rule() == Rule::constant_decl).then(|| pair.as_span().start());
+            for child in pair.clone().into_inner() {
+                match child.as_rule() {
+                    Rule::annotation_list => {
+                        if keyword_from.is_some() {
+                            keyword_from = Some(child.as_span().end());
+                        }
+                        annotations(child, starts);
+                    }
+                    Rule::ONEWAY => starts.push(child.as_span().start()),
+                    Rule::r#type => {
+                        // `const` is a silent rule: the first token after the annotations.
+                        if let Some(from) = keyword_from.take() {
+                            starts.push(next_token_start(from));
+                        }
+                        for part in child.into_inner() {
+                            match part.as_rule() {
+                                Rule::annotation_list => annotations(part, starts),
+                                Rule::non_array_type => starts.push(part.as_span().start()),
+                                _ => {}
+                            }
+                        }
+                    }
+                    Rule::identifier if pair.as_rule() == Rule::method_decl => {
+                        starts.push(child.as_span().start());
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => starts.push(pair.as_span().start()),
+    }
+}
+
+/// The comments separated from `start`, and from each other, by whitespace only.
+fn comment_run_before<'a>(spans: &'a [CommentSpan], text: &str, start: usize) -> &'a [CommentSpan] {
+    let end = spans.partition_point(|c| c.end <= start);
+    let mut first = end;
+    let mut next_start = start;
+    while let Some(span) = first.checked_sub(1).map(|i| spans[i]) {
+        match text.get(span.end..next_start) {
+            Some(gap) if gap.chars().all(char::is_whitespace) => {}
+            _ => break,
+        }
+        first -= 1;
+        next_start = span.start;
+    }
+    &spans[first..end]
+}
+
+/// The first offset at or after `from` that is neither whitespace nor inside a comment.
+fn next_token_start(from: usize) -> usize {
+    CURRENT_COMMENTS.with(|spans| {
+        let spans = spans.borrow();
+        CURRENT_SOURCE_TEXT.with(|text| {
+            let text = text.borrow();
+            let mut at = from;
+            loop {
+                let rest = text.get(at..).unwrap_or("");
+                at += rest.len() - rest.trim_start().len();
+                match spans.binary_search_by_key(&at, |c| c.start) {
+                    Ok(i) => at = spans[i].end,
+                    Err(_) => return at,
+                }
+            }
         })
     })
 }
@@ -300,13 +384,8 @@ pub fn current_namespace() -> Namespace {
     NAMESPACE_STACK.with(|stack| stack.borrow().last().cloned().unwrap_or_default())
 }
 
-fn reset_enum_resolution_state() {
-    ENUM_VALUE_CACHE.with(|cache| {
-        cache.borrow_mut().clear();
-    });
-    ENUM_RESOLUTION_STACK.with(|stack| {
-        stack.borrow_mut().clear();
-    });
+fn reset_const_values() {
+    CONST_VALUES.with(|values| values.borrow_mut().clear());
 }
 
 pub fn set_current_document(document: &Document) {
@@ -315,19 +394,11 @@ pub fn set_current_document(document: &Document) {
 }
 
 fn set_current_document_context(context: &DocumentContext) {
-    DOCUMENT.with(|doc| {
-        let mut doc = doc.borrow_mut();
-
-        doc.package = context.package.clone();
-        doc.imports = context.imports.clone();
-    })
+    DOCUMENT.with(|doc| *doc.borrow_mut() = context.clone())
 }
 
 fn current_document_context() -> DocumentContext {
-    DOCUMENT.with(|doc| {
-        let doc = doc.borrow();
-        DocumentContext::from_document(&doc)
-    })
+    DOCUMENT.with(|doc| doc.borrow().clone())
 }
 
 struct DocumentGuard(DocumentContext);
@@ -350,21 +421,6 @@ fn declaration_document_context(ns: &Namespace) -> Option<DocumentContext> {
     DECLARATION_DOCUMENT_MAP.with(|hashmap| hashmap.borrow().get(ns).cloned())
 }
 
-fn make_ns_candidate(ns: &Namespace, name: &Namespace) -> Vec<Namespace> {
-    let mut res = Vec::new();
-
-    let mut curr_ns = ns.clone();
-    curr_ns.push_ns(name);
-    res.push(curr_ns.clone());
-
-    if name.ns.len() > 1 {
-        curr_ns.pop(); // Remove the last name in case of IntEnum.Foo. Removed the Foo.
-        res.push(curr_ns);
-    }
-
-    res
-}
-
 #[derive(Debug)]
 pub struct LookupDecl {
     pub decl: Declaration,
@@ -373,90 +429,167 @@ pub struct LookupDecl {
 }
 
 pub fn lookup_decl_from_name(name: &str, style: &str) -> Option<LookupDecl> {
-    let mut namespace = Namespace::new(name, style);
+    let found = locate_decl(name, style)?;
+    let decl = with_decl(&found.key, Declaration::clone)?;
+    Some(LookupDecl {
+        decl,
+        ns: found.ns,
+        name: found.name,
+    })
+}
 
-    let mut ns_vec = Vec::new();
+/// [`lookup_decl_from_name`] without cloning the declaration; `key` is its `DECLARATION_MAP` entry.
+struct DeclLocation {
+    key: Namespace,
+    ns: Namespace,
+    name: Namespace,
+}
 
-    // AOSP `AidlScope::ResolveName` order: enclosing scopes, imports, then the package.
-    let package_ns = DOCUMENT.with(|curr_doc| {
-        curr_doc
-            .borrow()
-            .package
-            .as_ref()
-            .map(|package| Namespace::new(package, Namespace::AIDL))
-    });
+fn with_decl<R>(key: &Namespace, f: impl FnOnce(&Declaration) -> R) -> Option<R> {
+    DECLARATION_MAP.with(|map| map.borrow().get(key).map(f))
+}
 
-    // 1. Enclosing scopes outward, unbounded as AOSP `GetEnclosingScope()`; stop at the package.
-    let mut curr_ns = current_namespace();
-    loop {
-        if package_ns.as_ref() == Some(&curr_ns) {
-            break;
-        }
-        ns_vec.append(&mut make_ns_candidate(&curr_ns, &namespace));
-        if curr_ns.pop().is_none() {
-            break;
-        }
-    }
+fn locate_decl(name: &str, style: &str) -> Option<DeclLocation> {
+    let namespace = Namespace::new(name, style);
+    let key = bind_type_name(&namespace)?;
+    decl_location(key, namespace)
+}
 
-    // 2. imports, then the package.
-    DOCUMENT.with(|curr_doc| {
-        let curr_doc = curr_doc.borrow();
-        if let Some(imported) = curr_doc.imports.get(&namespace.ns[0]) {
-            let mut new_ns = Namespace::new(imported, Namespace::AIDL);
-            new_ns.ns.extend_from_slice(&namespace.ns[1..]);
-            ns_vec.push(new_ns.clone());
-            // Same shape as the other scopes: `IFoo.BAR` also tries the owner `a.IFoo`.
-            if namespace.ns.len() > 1 {
-                new_ns.pop();
-                ns_vec.push(new_ns);
-            }
-        }
-    });
-    if let Some(package_ns) = &package_ns {
-        ns_vec.append(&mut make_ns_candidate(package_ns, &namespace));
-    }
+/// [`lookup_decl_from_name`] for a name already resolved: it is the key, never bound again.
+pub(crate) fn lookup_decl_from_canonical(name: &str) -> Option<LookupDecl> {
+    let namespace = Namespace::new(name, Namespace::AIDL);
+    let found = decl_location(namespace.clone(), namespace)?;
+    let decl = with_decl(&found.key, Declaration::clone)?;
+    Some(LookupDecl {
+        decl,
+        ns: found.ns,
+        name: found.name,
+    })
+}
 
-    // 3. check fully-qualified names as written.
-    if namespace.ns.len() > 1 {
-        ns_vec.append(&mut make_ns_candidate(&Namespace::default(), &namespace));
-    }
-
-    let (decl, ns) = DECLARATION_MAP.with(|hashmap| {
-        for ns in &ns_vec {
-            if let Some(decl) = hashmap.borrow().get(ns) {
-                return Some((decl.clone(), ns.clone()));
-            }
-        }
-
-        // Only a simple name may fall back to the current decl; `foo.Missing.X` must not.
-        if namespace.ns.len() == 1 {
-            let curr_ns = current_namespace();
-            if let Some(decl) = hashmap.borrow().get(&curr_ns) {
-                return Some((decl.clone(), curr_ns));
-            }
-        }
-
-        None
-    })?;
-
+fn decl_location(key: Namespace, mut namespace: Namespace) -> Option<DeclLocation> {
     // A union `Tag` sits in `mod <Union>`: use the union's ns (`<Union>::Tag`, not `Tag::Tag`).
-    let effective_ns = match &decl {
-        Declaration::Enum(e) if e.tag_of_union.is_some() => {
-            e.tag_of_union.clone().expect("checked Some above")
-        }
-        _ => ns,
-    };
+    let tag_of_union = with_decl(&key, |decl| match decl {
+        Declaration::Enum(e) => e.tag_of_union.clone(),
+        _ => None,
+    })?;
 
     // leave max 2 items because the other items are for name space.
     if namespace.ns.len() > 2 {
         namespace.ns.drain(0..namespace.ns.len() - 2);
     }
 
-    Some(LookupDecl {
-        decl,
-        ns: effective_ns,
+    Some(DeclLocation {
+        ns: tag_of_union.unwrap_or_else(|| key.clone()),
+        key,
         name: namespace,
     })
+}
+
+// AOSP `ResolveName`: the innermost scope naming the first segment binds the whole name.
+fn bind_type_name(name: &Namespace) -> Option<Namespace> {
+    let (first, rest) = name.ns.split_first()?;
+    let declared = |ns: &Namespace| DECLARATION_MAP.with(|map| map.borrow().contains_key(ns));
+    let child = |scope: &Namespace| {
+        let mut ns = scope.clone();
+        ns.push(first);
+        ns
+    };
+    let (top, imported, own) = DOCUMENT.with(|doc| {
+        let doc = doc.borrow();
+        let top = doc
+            .package
+            .as_ref()
+            .map_or_else(Namespace::default, |p| Namespace::new(p, Namespace::AIDL));
+        let imported = doc
+            .imports
+            .get(first)
+            .map(|i| Namespace::new(i, Namespace::AIDL));
+        (
+            top,
+            imported,
+            doc.top_level.iter().any(|name| name == first),
+        )
+    });
+    let with_rest = |mut key: Namespace| {
+        key.ns.extend_from_slice(rest);
+        key
+    };
+
+    // Enclosing types outward, then imports, then this document's own top-level types.
+    let mut scope = current_namespace();
+    let mut bound = None;
+    while scope.ns.len() > top.ns.len() && scope.ns.starts_with(&top.ns) {
+        let candidate = child(&scope);
+        if declared(&candidate) {
+            bound = Some(candidate);
+            break;
+        }
+        scope.pop();
+    }
+    let bound = bound.or(imported).or_else(|| own.then(|| child(&top)));
+    if let Some(key) = bound {
+        return Some(with_rest(key)).filter(declared);
+    }
+
+    // As written (AOSP); then rsbinder's extension: another file's top-level type in this package.
+    let as_written = with_rest(child(&Namespace::default()));
+    if declared(&as_written) {
+        return Some(as_written);
+    }
+    let imported = child(&top);
+    let key = with_rest(imported.clone());
+    if !declared(&key) {
+        return None;
+    }
+    let scope = Some(current_namespace()).filter(|ns| !ns.ns.is_empty());
+    note_generation_warning(implicit_import_warning(
+        scope.as_ref().unwrap_or(&top),
+        name,
+        &imported,
+    ));
+    Some(key)
+}
+
+fn implicit_import_warning(scope: &Namespace, name: &Namespace, imported: &Namespace) -> String {
+    let aidl = |ns: &Namespace| ns.to_string(Namespace::AIDL);
+    format!(
+        "{}: '{}' resolves to {} only through rsbinder's same-package lookup; \
+         AOSP aidl rejects it without `import {};`",
+        aidl(scope),
+        aidl(name),
+        aidl(imported),
+        aidl(imported),
+    )
+}
+
+/// Collect, until [`take_generation_warnings`], a warning for each input that
+/// generates here but fails AOSP's `aidl` in an Android build: a name bound only
+/// by the same-package extension of [`bind_type_name`] (AOSP resolves it only
+/// through an `import`, `AidlDocument::ResolveName`,
+/// `aidl_language.cpp:1930-1957`), and a bare `@nullable` field on a cycle
+/// (`TypeGenerator::ensure_sized`).
+pub(crate) fn collect_generation_warnings() {
+    GENERATION_WARNINGS.with(|set| *set.borrow_mut() = Some(BTreeSet::new()));
+}
+
+/// Record `message` while a `Builder` collects; dropped otherwise.
+pub(crate) fn note_generation_warning(message: String) {
+    GENERATION_WARNINGS.with(|set| {
+        if let Some(set) = set.borrow_mut().as_mut() {
+            set.insert(message);
+        }
+    });
+}
+
+/// Stop collecting and return the warnings, sorted and without duplicates.
+pub(crate) fn take_generation_warnings() -> Vec<crate::error::AidlWarning> {
+    GENERATION_WARNINGS
+        .with(|set| set.borrow_mut().take())
+        .into_iter()
+        .flatten()
+        .map(crate::error::AidlWarning::new)
+        .collect()
 }
 
 // Edge of the `declaration_reaches` sizing graph; a `Vec`/`HashMap` is a handle, never an edge.
@@ -471,6 +604,16 @@ fn by_value_type_name(ty: &Type) -> Option<&str> {
         return None;
     }
     Some(&ty.non_array_type.name)
+}
+
+// Only a `@nullable` field can be `Option<Box<…>>`; a fixed-size array keeps elements inline.
+fn is_boxable_nullable(ty: &Type) -> bool {
+    ty.array_types.is_empty() && has_annotation(&ty.annotation_list, AnnotationType::IsNullable)
+}
+
+// Always `Option<Box<…>>` (AOSP `aidl_to_rust.cpp:305-306`), so never an inline edge.
+fn is_heap_field(ty: &Type) -> bool {
+    ty.array_types.is_empty() && is_heap_nullable(&ty.annotation_list)
 }
 
 fn value_members(ns: &Namespace) -> Option<Vec<Declaration>> {
@@ -531,6 +674,22 @@ fn is_value_decl(ns: &Namespace) -> bool {
     })
 }
 
+/// Which fields [`declaration_reaches`] follows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SizingEdges {
+    /// Every field held inline. A `@nullable(heap=true)` field is boxed
+    /// wherever it is, so it is left out; a bare `@nullable` field that closes
+    /// a cycle in this graph is the one rendered `Option<Box<…>>`.
+    ByValue,
+    /// Only fields no box can break. Every `@nullable` field is left out: on a
+    /// cycle it is boxed, and off every cycle it cannot be part of one.
+    Unboxable,
+    /// AOSP `CheckNoRecursiveDefinition` (`parser.cpp:177-188`): every field but
+    /// an array or a `@nullable(heap=true)` one. A cycle here is an input AOSP
+    /// `aidl` rejects.
+    Aosp,
+}
+
 /// Can `start` reach `target` by following the fields of parcelables and
 /// unions? A reference cycle of any length is an infinitely sized Rust type, so
 /// the field that closes it has to be boxed — a direct self-reference is only
@@ -541,7 +700,8 @@ fn is_value_decl(ns: &Namespace) -> bool {
 /// not be boxed: an interface is a `Strong<dyn …>` — the
 /// `CircularParcelable` / `ITestService` pair in the AOSP fixtures is exactly
 /// that shape — and a `Vec`/`HashMap` element is behind an allocation.
-pub fn declaration_reaches(start: &Namespace, target: &Namespace) -> bool {
+/// [`SizingEdges`] says which further fields each graph drops.
+pub fn declaration_reaches(start: &Namespace, target: &Namespace, edges: SizingEdges) -> bool {
     if !is_value_decl(start) || !is_value_decl(target) {
         return false;
     }
@@ -570,6 +730,15 @@ pub fn declaration_reaches(start: &Namespace, target: &Namespace) -> bool {
             let Some(name) = by_value_type_name(&var.r#type) else {
                 continue;
             };
+            let ty = &var.r#type;
+            let skip = match edges {
+                SizingEdges::ByValue => is_heap_field(ty),
+                SizingEdges::Unboxable => is_boxable_nullable(ty),
+                SizingEdges::Aosp => !ty.array_types.is_empty() || is_heap_field(ty),
+            };
+            if skip {
+                continue;
+            }
             let Some(found) = lookup_decl_from_name(name, Namespace::AIDL) else {
                 continue;
             };
@@ -589,253 +758,326 @@ pub fn declaration_reaches(start: &Namespace, target: &Namespace) -> bool {
     false
 }
 
-thread_local! {
-    // `<owner>.<ident>` constants being folded; a true cycle re-enters and bottoms out here.
-    static FOLDING: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+// A constant or enum member; its value is folded once, in `owner`'s scope, under `key`.
+#[derive(Clone)]
+struct Symbol {
+    key: String,
+    owner: Namespace,
+    def: SymbolDef,
 }
 
-// Fold in the owner's scope: a raw `BASE + 1` would otherwise pick up the referencer's `BASE`.
-fn fold_in_owner_scope(expr: &ConstExpr, owner: &Namespace, ident: &str) -> ConstExpr {
-    if *owner == current_namespace() {
-        return expr.clone();
+#[derive(Clone)]
+enum SymbolDef {
+    Constant(ConstExpr),
+    EnumExplicit(EnumMember, ConstExpr),
+    // AOSP `previous + 1` fill: `offset` past the nearest valued member (or 0).
+    EnumImplicit(EnumMember, Option<Box<Symbol>>, i64),
+}
+
+#[derive(Clone)]
+struct EnumMember {
+    enum_type: String,
+    enum_name: String,
+    member_name: String,
+}
+
+impl EnumMember {
+    fn reference(&self, value: i64, kind: RefKind) -> ConstExpr {
+        ConstExpr::new(ValueType::Reference {
+            enum_type: self.enum_type.clone(),
+            enum_name: self.enum_name.clone(),
+            member_name: self.member_name.clone(),
+            value,
+            kind,
+        })
     }
-    let key = format!("{}.{ident}", owner.to_string(Namespace::AIDL));
-    let re_entered = FOLDING.with(|s| s.borrow().contains(&key));
-    if re_entered {
-        return expr.clone();
+}
+
+impl Symbol {
+    fn label(&self) -> &str {
+        match &self.def {
+            SymbolDef::EnumExplicit(member, _) | SymbolDef::EnumImplicit(member, ..) => {
+                &member.member_name
+            }
+            SymbolDef::Constant(_) => self.key.rsplit('.').next().unwrap_or(&self.key),
+        }
     }
-    FOLDING.with(|s| s.borrow_mut().push(key));
+
+    // Every dependency is resolved by now, so the fold below reads values and never recurses.
+    fn evaluate(&self) -> Result<ConstExpr, String> {
+        in_scope(&self.owner, || match &self.def {
+            SymbolDef::Constant(expr) => fold_symbol_expr(expr),
+            SymbolDef::EnumExplicit(member, expr) => {
+                let value = fold_symbol_expr(expr)?;
+                // AOSP `AreCompatibleOperandTypes`: bool is integral; `decl_enum` rejects the rest.
+                match RefKind::of(&value.value) {
+                    Some(kind) => {
+                        Ok(member.reference(value.to_i64().map_err(|e| e.message)?, kind))
+                    }
+                    None => Ok(value),
+                }
+            }
+            SymbolDef::EnumImplicit(member, base, offset) => {
+                let Some(base) = base else {
+                    return Ok(member.reference(*offset, RefKind::Int32));
+                };
+                let base = resolve_symbol(base.as_ref().clone()).map_err(|e| e.message)?;
+                match base.value {
+                    // AOSP folds `previous + 1` at the promoted type and rejects overflow.
+                    ValueType::Reference { value, kind, .. } => {
+                        let long = kind == RefKind::Int64;
+                        let kind = if long { RefKind::Int64 } else { RefKind::Int32 };
+                        value
+                            .checked_add(*offset)
+                            .filter(|value| long || i32::try_from(*value).is_ok())
+                            .map(|value| member.reference(value, kind))
+                            .ok_or_else(|| {
+                                format!(
+                                    "constant expression computation overflows ('+' on {})",
+                                    if long { "long" } else { "int" }
+                                )
+                            })
+                    }
+                    // A non-integral base is the diagnostic of every member counted from it.
+                    _ => Ok(base),
+                }
+            }
+        })
+    }
+}
+
+// A name left unresolved in the owner's scope must not reach a referencer, where it could resolve.
+fn fold_symbol_expr(expr: &ConstExpr) -> Result<ConstExpr, String> {
+    let value = expr.calculate().map_err(|e| e.message)?;
+    match value.value.unresolved_name() {
+        Some(name) => Err(format!("cannot resolve constant reference '{name}'")),
+        None => Ok(value),
+    }
+}
+
+fn in_scope<R>(owner: &Namespace, f: impl FnOnce() -> R) -> R {
     let document_context = declaration_document_context(owner);
     let _document_guard = document_context.as_ref().map(DocumentGuard::new);
     let _ns_guard = NamespaceGuard::new(owner);
-    let folded = expr.calculate().unwrap_or_else(|_| expr.clone());
-    FOLDING.with(|s| {
-        s.borrow_mut().pop();
-    });
-    folded
+    f()
 }
 
-fn make_const_expr(const_expr: Option<&ConstExpr>, lookup_decl: &LookupDecl) -> ConstExpr {
-    if let Some(expr) = const_expr {
-        let ident = lookup_decl.name.ns.last().map_or("", String::as_str);
-        fold_in_owner_scope(expr, &lookup_decl.ns, ident)
-    } else {
-        let name = if let Some(path) = builtin_rust_path(&lookup_decl.ns) {
-            let member = lookup_decl.name.ns.last().map_or("", String::as_str);
-            format!("{}::{path}::{member}", type_generator::crate_name())
-        } else {
-            let ns = current_namespace().relative_mod(&lookup_decl.ns);
-            if !ns.is_empty() {
-                format!(
-                    "{}{}{}",
-                    ns,
-                    Namespace::RUST,
-                    lookup_decl.name.to_string(Namespace::RUST)
-                )
-            } else {
-                lookup_decl.name.to_string(Namespace::RUST)
-            }
-        };
-        ConstExpr::new(ValueType::Name(name))
+fn constant_symbol(owner: &Namespace, ident: &str, expr: &ConstExpr) -> Symbol {
+    Symbol {
+        key: format!("const {}.{ident}", owner.to_string(Namespace::AIDL)),
+        owner: owner.clone(),
+        def: SymbolDef::Constant(expr.clone()),
     }
 }
 
-fn lookup_name_from_decl(decl: &Declaration, lookup_decl: &LookupDecl) -> Option<ConstExpr> {
-    let lookup_ident = lookup_decl.name.ns.last().unwrap().to_owned();
-    match decl {
-        Declaration::Variable(decl) => {
-            // AOSP resolves a reference against constants only, never a field default.
-            if decl.constant && decl.identifier == lookup_ident {
-                Some(make_const_expr(decl.const_expr.as_ref(), lookup_decl))
-            } else {
-                None
-            }
-        }
-        Declaration::Interface(ref decl) => {
-            for var in &decl.constant_list {
-                if var.identifier == lookup_ident {
-                    return Some(make_const_expr(var.const_expr.as_ref(), lookup_decl));
-                }
-            }
-            // `members` holds only nested type declarations; constants live in `constant_list`.
-            None
-        }
-
-        Declaration::Parcelable(ref decl) => lookup_name_members(&decl.members, lookup_decl),
-
-        Declaration::Enum(ref decl) => {
-            for enumerator in &decl.enumerator_list {
-                if enumerator.identifier == lookup_ident {
-                    return enum_member_const_expr_from_lookup(lookup_decl, &lookup_ident);
-                }
-            }
-            lookup_name_members(&decl.members, lookup_decl)
-        }
-
-        Declaration::Union(ref decl) => lookup_name_members(&decl.members, lookup_decl),
-    }
-}
-
-// Direct members only: `Outer.X` never means `Outer.Inner.X`; a nested owner is its own candidate.
-fn lookup_name_members(members: &[Declaration], lookup_decl: &LookupDecl) -> Option<ConstExpr> {
-    members
+fn enum_member_symbol(decl: &EnumDecl, ns: &Namespace, member_name: &str) -> Option<Symbol> {
+    let index = decl
+        .enumerator_list
         .iter()
-        .filter(|decl| matches!(decl, Declaration::Variable(_)))
-        .find_map(|decl| lookup_name_from_decl(decl, lookup_decl))
+        .position(|enumerator| enumerator.identifier == member_name)?;
+    Some(enum_member_symbol_at(decl, ns, index))
 }
 
-pub(crate) fn enum_member_const_expr_from_lookup(
-    lookup_decl: &LookupDecl,
-    member_name: &str,
-) -> Option<ConstExpr> {
-    let Declaration::Enum(enum_decl) = &lookup_decl.decl else {
-        return None;
+fn enum_member_symbol_at(decl: &EnumDecl, ns: &Namespace, index: usize) -> Symbol {
+    let enum_type = ns.to_string(Namespace::AIDL);
+    let enumerator = &decl.enumerator_list[index];
+    let member = EnumMember {
+        enum_type: enum_type.clone(),
+        enum_name: decl.name.clone(),
+        member_name: enumerator.identifier.clone(),
+    };
+    let def = match &enumerator.const_expr {
+        Some(expr) => SymbolDef::EnumExplicit(member, expr.clone()),
+        None => {
+            let base = decl.enumerator_list[..index]
+                .iter()
+                .rposition(|enumerator| enumerator.const_expr.is_some());
+            let offset = (index - base.unwrap_or(0)) as i64;
+            let base = base.map(|base| Box::new(enum_member_symbol_at(decl, ns, base)));
+            SymbolDef::EnumImplicit(member, base, offset)
+        }
+    };
+    Symbol {
+        key: format!("enum {enum_type}.{}", enumerator.identifier),
+        owner: ns.clone(),
+        def,
+    }
+}
+
+// What `ident` names inside `decl`; AOSP resolves references to constants only, never fields.
+fn symbol_in_decl(decl: &Declaration, ns: &Namespace, ident: &str) -> Option<Symbol> {
+    let constant = |var: &VariableDecl| {
+        var.const_expr
+            .as_ref()
+            .filter(|_| var.constant && var.identifier == ident)
+            .map(|expr| constant_symbol(ns, ident, expr))
+    };
+    // Direct members only: `Outer.X` never means `Outer.Inner.X`.
+    let in_members = |members: &[Declaration]| {
+        members.iter().find_map(|member| match member {
+            Declaration::Variable(var) => constant(var),
+            _ => None,
+        })
+    };
+    match decl {
+        Declaration::Variable(var) => constant(var),
+        // `members` holds only nested type declarations; constants live in `constant_list`.
+        Declaration::Interface(decl) => decl
+            .constant_list
+            .iter()
+            .find(|var| var.identifier == ident)
+            .and_then(|var| var.const_expr.as_ref())
+            .map(|expr| constant_symbol(ns, ident, expr)),
+        Declaration::Parcelable(decl) => in_members(&decl.members),
+        Declaration::Enum(decl) => {
+            enum_member_symbol(decl, ns, ident).or_else(|| in_members(&decl.members))
+        }
+        Declaration::Union(decl) => in_members(&decl.members),
+    }
+}
+
+// AOSP `AidlConstantReference`: a type, then its member after the last `.`.
+fn symbol_from_lookup(name: &str) -> Option<Symbol> {
+    let (qualifier, ident) = name.rsplit_once('.')?;
+    let found = locate_decl(qualifier, Namespace::AIDL)?;
+    with_decl(&found.key, |decl| symbol_in_decl(decl, &found.ns, ident)).flatten()
+}
+
+// What a name in a constant expression refers to, from the current scope; `None` leaves a `Name`.
+fn symbol_for_name(name: &str) -> Option<Symbol> {
+    // A qualifier that is not a type is AOSP's "Failed to resolve"; no shorter form is tried.
+    if name.contains('.') {
+        return symbol_from_lookup(name);
+    }
+
+    // AOSP `AidlConstantReference::Resolve`: a bare name, a default's too, is in this type only.
+    let curr = current_namespace();
+    with_decl(&curr, |decl| symbol_in_decl(decl, &curr, name)).flatten()
+}
+
+// Bounds re-entrant `resolve_symbol` calls; a dependency chain itself never recurses.
+const MAX_RESOLVE_NESTING: usize = 16;
+
+fn circular_reference(name: &str) -> String {
+    format!("circular reference detected while resolving constant '{name}'")
+}
+
+fn stored_value(key: &str) -> Option<Option<Result<ConstExpr, String>>> {
+    CONST_VALUES.with(|values| values.borrow().get(key).cloned())
+}
+
+fn store_value(key: &str, value: Option<Result<ConstExpr, String>>) {
+    CONST_VALUES.with(|values| {
+        values.borrow_mut().insert(key.to_owned(), value);
+    });
+}
+
+struct NestingGuard;
+
+impl NestingGuard {
+    fn enter() -> Option<Self> {
+        RESOLVE_NESTING.with(|n| {
+            (n.get() < MAX_RESOLVE_NESTING).then(|| {
+                n.set(n.get() + 1);
+                NestingGuard
+            })
+        })
+    }
+}
+
+impl Drop for NestingGuard {
+    fn drop(&mut self) {
+        RESOLVE_NESTING.with(|n| n.set(n.get() - 1));
+    }
+}
+
+struct Frame {
+    symbol: Symbol,
+    // Dependencies not yet checked, next last: (name as written, symbol).
+    deps: Vec<(String, Symbol)>,
+}
+
+impl Frame {
+    fn enter(symbol: Symbol) -> Self {
+        store_value(&symbol.key, None);
+        let mut deps: Vec<(String, Symbol)> = match &symbol.def {
+            SymbolDef::Constant(expr) | SymbolDef::EnumExplicit(_, expr) => {
+                in_scope(&symbol.owner, || {
+                    expr.value
+                        .referenced_names()
+                        .into_iter()
+                        .filter_map(|name| symbol_for_name(&name).map(|dep| (name, dep)))
+                        .collect()
+                })
+            }
+            SymbolDef::EnumImplicit(_, base, _) => base
+                .iter()
+                .map(|base| (base.label().to_owned(), base.as_ref().clone()))
+                .collect(),
+        };
+        deps.reverse();
+        Frame { symbol, deps }
+    }
+}
+
+// Depth-first over an explicit stack: a chain costs no Rust stack; an in-progress dep is a cycle.
+fn resolve_symbol(root: Symbol) -> Result<ConstExpr, ConstExprError> {
+    match stored_value(&root.key) {
+        Some(Some(value)) => return value.map_err(ConstExprError::new),
+        Some(None) => return Err(ConstExprError::new(circular_reference(root.label()))),
+        None => {}
+    }
+    let Some(_nesting) = NestingGuard::enter() else {
+        return Err(ConstExprError::new(
+            "constant expression nested too deeply (exceeded recursion limit)",
+        ));
     };
 
-    let mut enum_val: i64 = 0;
-    let enum_type = lookup_decl.ns.to_string(Namespace::AIDL);
-    let resolution_key = format!("{enum_type}.{member_name}");
-
-    if let Some(cached) =
-        ENUM_VALUE_CACHE.with(|cache| cache.borrow().get(&resolution_key).cloned())
-    {
-        return Some(cached);
-    }
-
-    let is_circular = ENUM_RESOLUTION_STACK.with(|stack| {
-        let mut stack = stack.borrow_mut();
-        if stack.contains(&resolution_key) {
-            true
-        } else {
-            stack.insert(resolution_key.clone());
-            false
-        }
-    });
-    if is_circular {
-        return None;
-    }
-
-    let document_context = declaration_document_context(&lookup_decl.ns);
-    let _document_guard = document_context.as_ref().map(DocumentGuard::new);
-    let _guard = NamespaceGuard::new(&lookup_decl.ns);
-    let mut result = None;
-
-    // An unfoldable explicit value poisons auto-increment so `decl_enum` diagnoses, not zeroes.
-    let mut carried: Option<ConstExpr> = None;
-    let mut result_is_carried = false;
-    for enumerator in &enum_decl.enumerator_list {
-        if let Some(const_expr) = &enumerator.const_expr {
-            match const_expr.calculate() {
-                Ok(calculated) => match &calculated.value {
-                    ValueType::Name(_) => carried = Some(const_expr.clone()),
-                    // AOSP `AreCompatibleOperandTypes`: bool is integral; the rest poison.
-                    ValueType::Byte(_)
-                    | ValueType::Int32(_)
-                    | ValueType::Int64(_)
-                    | ValueType::Bool(_)
-                    | ValueType::Reference { .. } => match calculated.to_i64() {
-                        Ok(v) => {
-                            enum_val = v;
-                            carried = None;
-                        }
-                        Err(_) => carried = Some(calculated),
-                    },
-                    _ => carried = Some(calculated),
-                },
-                Err(_) => carried = Some(const_expr.clone()),
-            }
-        }
-
-        if enumerator.identifier == member_name {
-            match carried.take() {
-                Some(expr) => {
-                    result = Some(expr);
-                    result_is_carried = true;
+    let root_key = root.key.clone();
+    let mut stack = vec![Frame::enter(root)];
+    while let Some(top) = stack.last_mut() {
+        if let Some((name, dep)) = top.deps.pop() {
+            match stored_value(&dep.key) {
+                Some(Some(_)) => {}
+                // A cycle has no value; AOSP rejects it ("Found a circular reference").
+                Some(None) => {
+                    let key = top.symbol.key.clone();
+                    stack.pop();
+                    store_value(&key, Some(Err(circular_reference(&name))));
                 }
-                None => {
-                    result = Some(ConstExpr::new(ValueType::Reference {
-                        enum_type: enum_type.clone(),
-                        enum_name: enum_decl.name.clone(),
-                        member_name: member_name.to_string(),
-                        value: enum_val,
-                    }))
-                }
+                None => stack.push(Frame::enter(dep)),
             }
-            break;
+            continue;
         }
-
-        // AOSP auto-increments with `previous + 1`, whose fold rejects an overflow.
-        match enum_val.checked_add(1) {
-            Some(next) => enum_val = next,
-            None => {
-                let next = ConstExpr::new_expr(
-                    ConstExpr::new(ValueType::Int64(enum_val)),
-                    "+",
-                    ConstExpr::new(ValueType::Int64(1)),
-                );
-                carried = carried.or(Some(next));
-            }
+        if let Some(frame) = stack.pop() {
+            let value = frame.symbol.evaluate();
+            store_value(&frame.symbol.key, Some(value));
         }
     }
 
-    ENUM_RESOLUTION_STACK.with(|stack| {
-        stack.borrow_mut().remove(&resolution_key);
-    });
-
-    // Never cache a carried result: frozen before symbols register, it duplicates discriminants.
-    if let Some(expr) = &result {
-        if !result_is_carried {
-            ENUM_VALUE_CACHE.with(|cache| {
-                cache.borrow_mut().insert(resolution_key, expr.clone());
-            });
-        }
+    match stored_value(&root_key) {
+        Some(Some(value)) => value.map_err(ConstExprError::new),
+        _ => Err(ConstExprError::new(circular_reference(&root_key))),
     }
-
-    result
 }
 
-pub fn name_to_enum_member_const_expr(name: &str, target_enum: Option<&str>) -> Option<ConstExpr> {
-    // A field default's target type resolves bare members and rejects other enums' members.
-    if let Some((enum_name, member_name)) = name.rsplit_once('.') {
-        let lookup_decl = lookup_decl_from_name(enum_name, Namespace::AIDL)?;
-        // The simple-name fallback may return the current declaration under another name.
-        let written = enum_name.rsplit('.').next().unwrap_or(enum_name);
-        if !matches!(&lookup_decl.decl, Declaration::Enum(e) if e.name == written) {
-            return None;
-        }
+/// Final value of what `name` refers to here; `Ok(None)` leaves it a `Name`.
+pub(crate) fn name_to_const_expr(name: &str) -> Result<Option<ConstExpr>, ConstExprError> {
+    symbol_for_name(name).map(resolve_symbol).transpose()
+}
 
-        if let Some(target_enum) = target_enum {
-            let target_lookup = lookup_decl_from_name(target_enum, Namespace::AIDL)?;
-            if lookup_decl.ns != target_lookup.ns {
-                return None;
-            }
-        }
-
-        return enum_member_const_expr_from_lookup(&lookup_decl, member_name);
-    }
-
-    if let Some(target_enum) = target_enum {
-        let lookup_decl = lookup_decl_from_name(target_enum, Namespace::AIDL)?;
-        if matches!(lookup_decl.decl, Declaration::Enum(_)) {
-            return enum_member_const_expr_from_lookup(&lookup_decl, name);
-        }
-        return None;
-    }
-
-    let curr_ns = current_namespace();
-    DECLARATION_MAP.with(|hashmap| {
-        let lookup_decl = hashmap
-            .borrow()
-            .get(&curr_ns)
-            .filter(|decl| matches!(decl, Declaration::Enum(_)))
-            .cloned()
-            .map(|decl| LookupDecl {
-                decl,
-                ns: curr_ns.clone(),
-                name: Namespace::new(name, Namespace::AIDL),
-            })?;
-        enum_member_const_expr_from_lookup(&lookup_decl, name)
-    })
+/// The discriminant of `member_name` in the enum `lookup_decl` holds.
+pub(crate) fn enum_member_value(
+    lookup_decl: &LookupDecl,
+    member_name: &str,
+) -> Result<ConstExpr, ConstExprError> {
+    let symbol = match &lookup_decl.decl {
+        Declaration::Enum(decl) => enum_member_symbol(decl, &lookup_decl.ns, member_name),
+        _ => None,
+    };
+    let symbol = symbol
+        .ok_or_else(|| ConstExprError::new(format!("'{member_name}' is not an enum member")))?;
+    resolve_symbol(symbol)
 }
 
 // AOSP `Parser::CheckValidTypeName`; only an unstructured parcelable may be qualified.
@@ -899,118 +1141,6 @@ fn reject_unrepresentable_identifier(
     ))
 }
 
-// Promote to `@Backing` (`byte` -> `int`, AOSP `AidlConstantReference`); unknown enum -> i64.
-pub(crate) fn enum_reference_promoted(enum_type: &str, value: i64) -> ConstExpr {
-    let backing = lookup_decl_from_name(enum_type, crate::Namespace::AIDL).and_then(|lookup| {
-        match lookup.decl {
-            Declaration::Enum(decl) => get_backing_type(&decl.annotation_list, decl.name_span)
-                .ok()
-                .map(|generator| generator.value_type),
-            _ => None,
-        }
-    });
-    match backing {
-        // Too wide is `decl_enum`'s diagnostic (only if generated); never truncate here.
-        Some(ValueType::Byte(_)) | Some(ValueType::Int32(_)) => match i32::try_from(value) {
-            Ok(v) => ConstExpr::new(ValueType::Int32(v)),
-            Err(_) => ConstExpr::new(ValueType::Int64(value)),
-        },
-        _ => ConstExpr::new(ValueType::Int64(value)),
-    }
-}
-
-// Universal symbol registration - supports all types of named constants
-pub fn register_symbol(name: &str, value: ConstExpr, namespace: Option<&str>) {
-    SYMBOL_TABLE.with(|table| {
-        let mut table = table.borrow_mut();
-
-        // Key by declaring namespace: a bare key lets an unrelated decl's constant win.
-        match namespace {
-            Some(ns) => {
-                table.insert(format!("{ns}.{name}"), value);
-            }
-            None => {
-                table.insert(name.to_string(), value);
-            }
-        }
-    });
-}
-
-// Enhanced name resolution with universal symbol table
-pub fn name_to_const_expr(name: &str) -> Option<ConstExpr> {
-    if let Some(expr) = name_to_enum_member_const_expr(name, None) {
-        return Some(expr);
-    }
-
-    // Dotted names: namespace-aware lookup first, since suffix stripping loses the parent type.
-    if name.contains('.') {
-        if let Some(lookup_decl) = lookup_decl_from_name(name, Namespace::AIDL) {
-            if let Some(expr) = lookup_name_from_decl(&lookup_decl.decl, &lookup_decl) {
-                return Some(expr);
-            }
-        }
-    }
-
-    // Scope-first order: an unqualified name resolves against its own declaration first.
-    let alternative_formats = generate_name_variants(name);
-    for variant in alternative_formats {
-        let variant_result = SYMBOL_TABLE.with(|table| table.borrow().get(&variant).cloned());
-        if let Some(expr) = variant_result {
-            // The key is `<owner ns>.<name>`; fold in that owner's scope.
-            return Some(match variant.rsplit_once('.') {
-                Some((owner, ident)) => {
-                    fold_in_owner_scope(&expr, &Namespace::new(owner, Namespace::AIDL), ident)
-                }
-                None => expr,
-            });
-        }
-    }
-
-    // Fallback to original resolution
-    if let Some(lookup_decl) = lookup_decl_from_name(name, Namespace::AIDL) {
-        return lookup_name_from_decl(&lookup_decl.decl, &lookup_decl);
-    }
-
-    None
-}
-
-// Symbol-table keys, most specific first; an unqualified name searches enclosing scopes only.
-fn generate_name_variants(name: &str) -> Vec<String> {
-    let mut variants = Vec::new();
-    let dotted = name.contains('.');
-
-    if dotted {
-        variants.push(name.to_string());
-    }
-
-    let current = current_namespace();
-    // Stop at the package boundary: a package segment is not a scope that holds constants.
-    let floor = declaration_document_context(&current)
-        .and_then(|ctx| ctx.package)
-        .map_or(0, |package| {
-            Namespace::new(&package, Namespace::AIDL).ns.len()
-        });
-    let current_ns = current.to_string(crate::Namespace::AIDL);
-    if !current_ns.is_empty() {
-        let segments: Vec<&str> = current_ns.split('.').collect();
-        for end in (floor + 1..=segments.len()).rev() {
-            variants.push(format!("{}.{}", segments[..end].join("."), name));
-        }
-    }
-
-    if dotted {
-        // Progressively shorter suffixes: "A.B.C" -> "B.C", "C".
-        let parts: Vec<&str> = name.split('.').collect();
-        for i in 1..parts.len() {
-            variants.push(parts[i..].join("."));
-        }
-    } else {
-        variants.push(name.to_string());
-    }
-
-    variants
-}
-
 #[derive(Debug)]
 pub struct Document {
     pub package: Option<String>,
@@ -1038,6 +1168,8 @@ impl Document {
 struct DocumentContext {
     package: Option<String>,
     imports: HashMap<String, String>,
+    // AOSP `AidlDocument::DefinedTypes()`: this document's own top-level type names.
+    top_level: Vec<String>,
 }
 
 impl DocumentContext {
@@ -1045,6 +1177,12 @@ impl DocumentContext {
         Self {
             package: document.package.clone(),
             imports: document.imports.clone(),
+            top_level: document
+                .decls
+                .iter()
+                .filter(|decl| decl.is_variable().is_none())
+                .map(|decl| decl.name().to_owned())
+                .collect(),
         }
     }
 }
@@ -1082,7 +1220,7 @@ impl VariableDecl {
     }
 
     pub fn member_init(&self) -> String {
-        "Default::default()".into()
+        "::core::default::Default::default()".into()
     }
 }
 
@@ -1161,7 +1299,7 @@ impl Arg {
         let generator = type_generator::TypeGenerator::new_with_type(&self.r#type)?;
 
         Ok(generator
-            .direction_at(&self.direction, self.direction_span)?
+            .direction_at(&self.direction, self.direction_span, &self.identifier)?
             .identifier(&self.identifier))
     }
 
@@ -1252,6 +1390,20 @@ impl Declaration {
             Declaration::Union(decl) => &decl.annotation_list,
             Declaration::Variable(decl) => &decl.annotation_list,
         }
+    }
+
+    /// The type declarations nested directly in this one; a variable has none.
+    pub(crate) fn nested_types(&self) -> impl DoubleEndedIterator<Item = &Declaration> {
+        let members: &[Declaration] = match self {
+            Declaration::Parcelable(decl) => &decl.members,
+            Declaration::Interface(decl) => &decl.members,
+            Declaration::Enum(decl) => &decl.members,
+            Declaration::Union(decl) => &decl.members,
+            Declaration::Variable(_) => &[],
+        };
+        members
+            .iter()
+            .filter(|member| member.is_variable().is_none())
     }
 
     pub fn members_mut(&mut self) -> &mut Vec<Declaration> {
@@ -1372,6 +1524,19 @@ pub enum AnnotationType {
     /// `@VintfStability` this is **not** scoped: AOSP reads it with the plain
     /// `GetAnnotation`, so a nested declaration does not inherit it.
     FixedSize,
+}
+
+/// AOSP `AidlAnnotatable::IsHeapNullable`: `@nullable(heap=true)`.
+pub fn is_heap_nullable(annotation_list: &[Annotation]) -> bool {
+    annotation_list.iter().any(|annotation| {
+        annotation.annotation == "@nullable"
+            && annotation.parameter_list.iter().any(|p| {
+                p.identifier == "heap"
+                    && p.const_expr
+                        .calculate()
+                        .is_ok_and(|c| c.to_bool().unwrap_or(false))
+            })
+    })
 }
 
 /// Returns whether the annotation list contains the queried annotation.
@@ -1601,6 +1766,17 @@ pub fn get_descriptor_from_annotation_list(
     let value = const_expr_as_string(expr).ok_or_else(|| {
         fail("Invalid value for parameter value on annotation Descriptor.".into())
     })?;
+    // The value lands raw in a Rust literal, where rustc denies bidi control characters.
+    if let Some(c) = value
+        .chars()
+        .find(|&c| crate::const_expr::is_bidi_control(c))
+    {
+        return Err(fail(format!(
+            "@Descriptor value contains the bidirectional control character U+{:04X}, \
+             which Rust rejects in a string literal",
+            c as u32
+        )));
+    }
     // AOSP `AidlInterface::GetDescriptor`: an empty override falls back to the canonical name.
     Ok((!value.is_empty()).then_some(value))
 }
@@ -1732,10 +1908,29 @@ fn validate_oneway_methods(interface: &InterfaceDecl) -> Result<(), AidlError> {
     }
 }
 
-fn parse_unary(mut pairs: pest::iterators::Pairs<Rule>) -> Result<ConstExpr, AidlError> {
-    let operator = pairs.next().unwrap().as_str().to_owned();
-    let factor = parse_factor(pairs.next().unwrap().into_inner().next().unwrap())?;
-    Ok(ConstExpr::new_unary(&operator, factor))
+fn parse_unary(mut pairs: pest::iterators::Pairs<Rule>) -> Result<(ConstExpr, usize), AidlError> {
+    let op = pairs.next().unwrap();
+    let operator = op.as_str().to_owned();
+    let (factor, depth) = parse_factor(pairs.next().unwrap().into_inner().next().unwrap())?;
+    let depth = bound_expr_depth(depth + 1, &op)?;
+    Ok((ConstExpr::new_unary(&operator, factor), depth))
+}
+
+// Bounds the built tree, whatever shape the pre-scan missed: its clone/drop recurse per level.
+fn bound_expr_depth(depth: usize, op: &pest::iterators::Pair<Rule>) -> Result<usize, AidlError> {
+    if depth > MAX_OPERATOR_RUN {
+        let name = CURRENT_SOURCE_NAME.with(|n| n.borrow().clone());
+        let text = CURRENT_SOURCE_TEXT.with(|t| t.borrow().clone());
+        return Err(ParseError::nesting_too_deep(
+            &name,
+            &text,
+            op.as_span().start(),
+            NestingLimit::OperatorRun.describe(),
+            MAX_OPERATOR_RUN,
+        )
+        .into());
+    }
+    Ok(depth)
 }
 
 fn parse_intvalue(arg_value: &str, span: (usize, usize)) -> Result<ConstExpr, AidlError> {
@@ -1892,16 +2087,18 @@ fn parse_value(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr, AidlError
     }
 }
 
-fn parse_factor(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr, AidlError> {
+fn parse_factor(pair: pest::iterators::Pair<Rule>) -> Result<(ConstExpr, usize), AidlError> {
     match pair.as_rule() {
-        Rule::expression => parse_expression(pair.into_inner()),
+        Rule::expression => parse_expression_with_depth(pair.into_inner()),
         Rule::unary => parse_unary(pair.into_inner()),
-        Rule::value => parse_value(pair.into_inner().next().unwrap()),
+        Rule::value => Ok((parse_value(pair.into_inner().next().unwrap())?, 0)),
         _ => unreachable!("Unexpected rule in parse_factor(): {}", pair),
     }
 }
 
-fn parse_expression_term(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr, AidlError> {
+fn parse_expression_term(
+    pair: pest::iterators::Pair<Rule>,
+) -> Result<(ConstExpr, usize), AidlError> {
     match pair.as_rule() {
         Rule::equality
         | Rule::comparison
@@ -1911,23 +2108,30 @@ fn parse_expression_term(pair: pest::iterators::Pair<Rule>) -> Result<ConstExpr,
         | Rule::shift
         | Rule::arith
         | Rule::logical_or
-        | Rule::logical_and => parse_expression(pair.into_inner()),
+        | Rule::logical_and => parse_expression_with_depth(pair.into_inner()),
         Rule::factor => parse_factor(pair.into_inner().next().unwrap()),
         _ => unreachable!("Unexpected rule in Rule::parse_expression_into: {}", pair),
     }
 }
 
-fn parse_expression(mut pairs: pest::iterators::Pairs<Rule>) -> Result<ConstExpr, AidlError> {
-    let mut lhs = parse_expression_term(pairs.next().unwrap())?;
+fn parse_expression(pairs: pest::iterators::Pairs<Rule>) -> Result<ConstExpr, AidlError> {
+    parse_expression_with_depth(pairs).map(|(expr, _)| expr)
+}
+
+fn parse_expression_with_depth(
+    mut pairs: pest::iterators::Pairs<Rule>,
+) -> Result<(ConstExpr, usize), AidlError> {
+    let (mut lhs, mut depth) = parse_expression_term(pairs.next().unwrap())?;
 
     while let Some(pair) = pairs.next() {
         let op = pair.as_str().to_owned();
-        let rhs = parse_expression_term(pairs.next().unwrap())?;
+        let (rhs, rhs_depth) = parse_expression_term(pairs.next().unwrap())?;
+        depth = bound_expr_depth(depth.max(rhs_depth) + 1, &pair)?;
 
         lhs = ConstExpr::new_expr(lhs, &op, rhs)
     }
 
-    Ok(lhs)
+    Ok((lhs, depth))
 }
 
 // Verbatim in Rust `"..."`: non-ASCII passes (AOSP `isValidLiteralChar` bars it); ctrl/`\` fail.
@@ -2200,6 +2404,34 @@ fn parse_annotation_list(
                     ),
                     annotation.annotation_span,
                 ));
+            }
+        }
+
+        // AOSP `AidlAnnotation::CheckValid` against the `nullable` schema: `heap`, a boolean.
+        if annotation.annotation == "@nullable" {
+            for param in &annotation.parameter_list {
+                if param.identifier != "heap" {
+                    return Err(make_invalid_operation_error(
+                        format!(
+                            "Parameter {} not supported for annotation nullable. \
+                             It must be one of: heap",
+                            param.identifier
+                        ),
+                        annotation.annotation_span,
+                    ));
+                }
+                if !matches!(
+                    param.const_expr.calculate().map(|c| c.value),
+                    Ok(ValueType::Bool(_)
+                        | ValueType::Byte(_)
+                        | ValueType::Int32(_)
+                        | ValueType::Int64(_))
+                ) {
+                    return Err(make_invalid_operation_error(
+                        "Invalid value for parameter heap on annotation nullable.".into(),
+                        annotation.annotation_span,
+                    ));
+                }
             }
         }
 
@@ -2489,21 +2721,21 @@ fn parse_interface_members(
     for pair in pairs {
         match pair.as_rule() {
             Rule::method_decl => {
-                let deprecated = deprecated_at(pair.as_span().start());
+                let deprecated = deprecated_in(&pair);
                 let mut method = parse_method_decl(pair.into_inner())?;
                 method.deprecated = deprecated;
                 interface.method_list.push(method);
             }
 
             Rule::constant_decl => {
-                let deprecated = deprecated_at(pair.as_span().start());
+                let deprecated = deprecated_in(&pair);
                 let mut constant = parse_variable_decl(pair.into_inner(), true)?;
                 constant.deprecated = deprecated;
                 interface.constant_list.push(constant);
             }
 
             Rule::decl => {
-                let deprecated = deprecated_at(pair.as_span().start());
+                let deprecated = deprecated_in(&pair);
                 let mut members = parse_decl(pair.into_inner())?;
                 for member in &mut members {
                     member.set_deprecated(deprecated.clone());
@@ -2563,13 +2795,13 @@ fn parse_parcelable_members(
         match pair.as_rule() {
             Rule::variable_decl | Rule::constant_decl => {
                 let constant = pair.as_rule() == Rule::constant_decl;
-                let deprecated = deprecated_at(pair.as_span().start());
+                let deprecated = deprecated_in(&pair);
                 let mut var = parse_variable_decl(pair.into_inner(), constant)?;
                 var.deprecated = deprecated;
                 res.push(Declaration::Variable(var));
             }
             Rule::decl => {
-                let deprecated = deprecated_at(pair.as_span().start());
+                let deprecated = deprecated_in(&pair);
                 let mut members = parse_decl(pair.into_inner())?;
                 for member in &mut members {
                     member.set_deprecated(deprecated.clone());
@@ -2843,7 +3075,7 @@ fn parse_enum_decl(
                 enum_decl.name_span = Some((span.start(), span.end()));
             }
             Rule::enumerator => {
-                let deprecated = deprecated_at(pair.as_span().start());
+                let deprecated = deprecated_in(&pair);
                 let mut enumerator = parse_enumerator(pair.into_inner())?;
                 enumerator.deprecated = deprecated;
                 enum_decl.enumerator_list.push(enumerator);
@@ -2960,12 +3192,24 @@ fn calculate_namespace(
     });
 
     // Stub `Tag` enum only so `<Union>.Tag` resolves; codegen: see `EnumDecl::tag_of_union`.
-    if matches!(decl, Declaration::Union(_)) {
+    if let Declaration::Union(union) = decl {
         let mut tag_ns = namespace.clone();
         tag_ns.push("Tag");
+        // AOSP `UnionTagGenerater` (parser.cpp): one unvalued enumerator per field, in order.
+        let enumerator_list = union
+            .members
+            .iter()
+            .filter_map(Declaration::is_variable)
+            .filter(|var| !var.constant)
+            .map(|var| Enumerator {
+                identifier: var.identifier.clone(),
+                ..Default::default()
+            })
+            .collect();
         let tag_enum = Declaration::Enum(EnumDecl {
             namespace: tag_ns.clone(),
             name: "Tag".into(),
+            enumerator_list,
             tag_of_union: Some(namespace.clone()),
             ..Default::default()
         });
@@ -2990,7 +3234,7 @@ const MAX_NESTING_DEPTH: usize = 256;
 // Generic re-parse is exponential (~3.7x/level), not just deep; AOSP's deepest vendored is 3.
 const MAX_GENERIC_DEPTH: usize = 12;
 
-/// Operators per statement/element: a bracket-free `1+1+...` chain recurses once per operator.
+/// Operators on one operand path, brackets included: each is one ConstExpr tree level.
 const MAX_OPERATOR_RUN: usize = 1024;
 
 #[derive(Debug, Clone, Copy)]
@@ -3022,7 +3266,8 @@ fn check_nesting_depth(source: &str) -> Option<(usize, NestingLimit, usize)> {
                                       // Open `<`s; only a `>`-closed one is generic (`0 < 1`).
     let mut angle_open: Vec<usize> = Vec::new();
     let mut generic_depth: usize = 0;
-    let mut op_run: usize = 0; // operator tokens in the current statement/element
+    let mut op_run: usize = 0; // operators on the current operand path, inherited into brackets
+    let mut run_base: Vec<usize> = Vec::new(); // `op_run` at each open bracket
     let next = |i: usize| bytes.get(i + 1).copied();
     while i < bytes.len() {
         match bytes[i] {
@@ -3055,21 +3300,19 @@ fn check_nesting_depth(source: &str) -> Option<(usize, NestingLimit, usize)> {
                 i += 2;
                 continue;
             }
-            // A bracket/element/statement boundary restarts the operator run.
+            // A close bracket resumes the enclosing run; an element/statement restarts at its base.
             b'(' | b'[' | b'{' => {
                 bracket_depth += 1;
-                op_run = 0;
+                run_base.push(op_run);
             }
             b')' | b']' | b'}' => {
                 bracket_depth = bracket_depth.saturating_sub(1);
-                op_run = 0;
+                op_run = run_base.pop().unwrap_or(0);
             }
-            b',' => op_run = 0,
+            b',' => op_run = run_base.last().copied().unwrap_or(0),
             // `<<` shift / `<=` are not generic openers.
             b'<' if matches!(next(i), Some(b'<') | Some(b'=')) => {
-                if bytes[i + 1] == b'<' {
-                    op_run += 1; // `<<` drives one shift-recursion level
-                }
+                op_run += 1; // `<<`/`<=` drives one binary-operator level
                 i += 2;
                 continue;
             }
@@ -3078,6 +3321,8 @@ fn check_nesting_depth(source: &str) -> Option<(usize, NestingLimit, usize)> {
                 let next_tok = bytes[i + 1..].iter().find(|b| !b.is_ascii_whitespace());
                 if next_tok.is_some_and(|b| b.is_ascii_alphabetic() || b"_@/".contains(b)) {
                     angle_open.push(i);
+                } else {
+                    op_run += 1;
                 }
             }
             // `>>` closes two open generics (`Map<int, List<int>>`), else it is a shift.
@@ -3094,6 +3339,7 @@ fn check_nesting_depth(source: &str) -> Option<(usize, NestingLimit, usize)> {
             }
             // `>=` is a comparison, never a generic closer.
             b'>' if next(i) == Some(b'=') => {
+                op_run += 1;
                 i += 2;
                 continue;
             }
@@ -3101,12 +3347,15 @@ fn check_nesting_depth(source: &str) -> Option<(usize, NestingLimit, usize)> {
                 generic_depth = generic_depth.max(angle_open.len());
                 angle_open.pop();
             }
+            b'>' => op_run += 1,
             b';' => {
                 angle_open.clear();
-                op_run = 0;
+                op_run = run_base.last().copied().unwrap_or(0);
             }
-            // Each operator is one recursion level; `op_run` bounds unbracketed chains.
-            b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^' | b'!' | b'~' => op_run += 1,
+            // Each operator is one tree level; `op_run` bounds the deepest operand path.
+            b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^' | b'!' | b'~' | b'=' => {
+                op_run += 1
+            }
             _ => {}
         }
         if bracket_depth > MAX_NESTING_DEPTH {
@@ -3140,7 +3389,7 @@ pub fn parse_document(ctx: &SourceContext) -> Result<Document, AidlError> {
         )
         .into());
     }
-    reset_enum_resolution_state();
+    reset_const_values();
     // Drop leftovers from a previous call so the warnings are scoped to this parse.
     CURRENT_WARNINGS.with(|w| w.borrow_mut().clear());
     let mut document = Document::new();
@@ -3186,7 +3435,7 @@ pub fn parse_document(ctx: &SourceContext) -> Result<Document, AidlError> {
                     }
 
                     Rule::decl => {
-                        let deprecated = deprecated_at(pair.as_span().start());
+                        let deprecated = deprecated_in(&pair);
                         let mut decls = parse_decl(pair.into_inner())?;
                         for decl in &mut decls {
                             decl.set_deprecated(deprecated.clone());
@@ -3220,6 +3469,8 @@ pub fn parse_document(ctx: &SourceContext) -> Result<Document, AidlError> {
 
     // Move this parse's warnings into the document so they don't leak into the next.
     document.warnings = CURRENT_WARNINGS.with(|w| std::mem::take(&mut *w.borrow_mut()));
+    // Values folded while declarations were still missing (annotation parameters) are not final.
+    reset_const_values();
 
     Ok(document)
 }
@@ -3235,10 +3486,7 @@ pub fn reset() {
         stack.borrow_mut().clear();
     });
     DOCUMENT.with(|doc| {
-        *doc.borrow_mut() = Document::new();
-    });
-    SYMBOL_TABLE.with(|table| {
-        table.borrow_mut().clear();
+        *doc.borrow_mut() = DocumentContext::default();
     });
     CURRENT_WARNINGS.with(|w| {
         w.borrow_mut().clear();
@@ -3246,13 +3494,88 @@ pub fn reset() {
     BUILTIN_RUST_PATHS.with(|map| {
         map.borrow_mut().clear();
     });
-    reset_enum_resolution_state();
+    reset_const_values();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::error::Error;
+
+    /// A bare `@nullable` field on a cycle AOSP sees is reported; AOSP rejects that `.aidl`.
+    #[test]
+    fn bare_nullable_on_an_aosp_cycle_warns() -> Result<(), Box<dyn Error>> {
+        let warnings_for = |text: &str| -> Result<Vec<String>, Box<dyn Error>> {
+            let doc = parse_document(&SourceContext::new("p/T.aidl", text))?;
+            collect_generation_warnings();
+            let generated = crate::Generator::new(false, false).document(&doc);
+            let warnings = take_generation_warnings()
+                .into_iter()
+                .map(|w| w.message)
+                .collect();
+            generated?;
+            Ok(warnings)
+        };
+        let advice = "AOSP aidl rejects the cycle as a recursive parcelable; \
+                      write `@nullable(heap=true)`";
+
+        let w = warnings_for("package p; parcelable A { @nullable B b; } parcelable B { A a; }")?;
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].starts_with("p.A.b: ") && w[0].contains(advice),
+            "{w:?}"
+        );
+        let w = warnings_for("package p; parcelable A { @nullable A next; }")?;
+        assert!(w.len() == 1 && w[0].starts_with("p.A.next: "), "{w:?}");
+
+        // No warning where AOSP accepts the input: `heap=true`, or a cycle through an array.
+        for text in [
+            "package p; parcelable A { @nullable(heap=true) B b; } parcelable B { A a; }",
+            "package p; parcelable A { @nullable(heap=true) B b; } parcelable B { @nullable A a; }",
+            "package p; parcelable Tree { Node[3] n; } parcelable Node { @nullable Tree t; }",
+            "package p; parcelable B { int x; } parcelable A { @nullable B b; }",
+        ] {
+            assert!(warnings_for(text)?.is_empty(), "{text}");
+        }
+        Ok(())
+    }
+
+    /// A name only the same-package extension binds is reported once; an imported one is not.
+    #[test]
+    fn same_package_name_without_import_warns() -> Result<(), Box<dyn Error>> {
+        let parse = |file, text| parse_document(&SourceContext::new(file, text));
+        let bar = parse("p/Bar.aidl", "package p; parcelable Bar { int x; }")?;
+        let foo = parse(
+            "p/Foo.aidl",
+            "package p; parcelable Foo { Bar a; Bar[] b; }",
+        )?;
+        let baz = parse(
+            "p/Baz.aidl",
+            "package p; import p.Bar; parcelable Baz { Bar a; p.Bar b; }",
+        )?;
+        let gen = crate::Generator::new(false, false);
+
+        collect_generation_warnings();
+        for doc in [&bar, &foo, &baz] {
+            gen.document(doc)?;
+        }
+        let warnings: Vec<String> = take_generation_warnings()
+            .into_iter()
+            .map(|w| w.message)
+            .collect();
+        assert_eq!(
+            warnings,
+            [
+                "p.Foo: 'Bar' resolves to p.Bar only through rsbinder's same-package lookup; \
+              AOSP aidl rejects it without `import p.Bar;`"
+            ]
+        );
+
+        // Without a collector (the proc macro, `Generator` alone) nothing accumulates.
+        gen.document(&foo)?;
+        assert!(take_generation_warnings().is_empty());
+        Ok(())
+    }
 
     #[test]
     fn test_second_type_parameter_set_is_rejected() -> Result<(), Box<dyn Error>> {

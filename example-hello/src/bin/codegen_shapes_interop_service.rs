@@ -20,16 +20,15 @@ struct Shapes;
 impl Interface for Shapes {}
 
 impl ICodegenShapes for Shapes {
-    fn r#takeOutBinder(
+    fn r#takeOutBinders(
         &self,
         src: &SIBinder,
         fill: bool,
-        dst: &mut Option<SIBinder>,
+        dst: &mut Vec<Option<SIBinder>>,
     ) -> rsbinder::BinderResult<()> {
-        // `fill == false` leaves the non-nullable `out` unset, which the
-        // generated server arm must turn into UNEXPECTED_NULL.
+        // `fill == false` leaves every element unset; each goes back as a null binder.
         if fill {
-            *dst = Some(src.clone());
+            dst.fill(Some(src.clone()));
         }
         Ok(())
     }

@@ -67,11 +67,11 @@ pub mod GenericStructuredParcelable {
         pub _phantom_U: core::marker::PhantomData<U>,
         pub _phantom_B: core::marker::PhantomData<B>,
     }
-    impl<T, U, B> Default for GenericStructuredParcelable<T, U, B> {
+    impl<T, U, B> ::core::default::Default for GenericStructuredParcelable<T, U, B> {
         fn default() -> Self {
             Self {
-                r#a: Default::default(),
-                r#b: Default::default(),
+                r#a: ::core::default::Default::default(),
+                r#b: ::core::default::Default::default(),
                 _phantom_T: core::marker::PhantomData,
                 _phantom_U: core::marker::PhantomData,
                 _phantom_B: core::marker::PhantomData,
@@ -139,13 +139,13 @@ fn type_arguments_reach_the_rust_path() {
     .unwrap();
     for expected in [
         "pub r#one: super::Box::Box<i32>,",
-        "pub r#many: Vec<super::Box::Box<super::Kind::Kind>>,",
-        "pub r#listed: Vec<super::Box::Box<String>>,",
+        "pub r#many: ::std::vec::Vec<super::Box::Box<super::Kind::Kind>>,",
+        "pub r#listed: ::std::vec::Vec<super::Box::Box<::std::string::String>>,",
         "pub r#nested: super::Box::Box<super::Box::Box<i32>>,",
         "pub r#mixed: super::Pair::Pair<i32, super::Box::Box<i32>>,",
-        "pub r#maybe: Option<super::Box::Box<i32>>,",
+        "pub r#maybe: ::core::option::Option<super::Box::Box<i32>>,",
         "_arg_p: &super::Pair::Pair<i32, super::Kind::Kind>",
-        "_arg_out_boxes: &mut Vec<super::Box::Box<i32>>",
+        "_arg_out_boxes: &mut ::std::vec::Vec<super::Box::Box<i32>>",
         "rsbinder::BinderResult<super::Box::Box<i32>>",
     ] {
         assert!(out.contains(expected), "missing `{expected}` in:\n{out}");
@@ -278,11 +278,11 @@ fn a_cycle_through_generic_parcelables_is_boxed_or_rejected() {
     )
     .unwrap();
     assert!(
-        out.contains("pub r#b: Option<Box<super::B::B<i32>>>,"),
+        out.contains("pub r#b: ::core::option::Option<::std::boxed::Box<super::B::B<i32>>>,"),
         "{out}"
     );
     assert!(
-        out.contains("pub r#a: Option<Box<super::A::A<i32>>>,"),
+        out.contains("pub r#a: ::core::option::Option<::std::boxed::Box<super::A::A<i32>>>,"),
         "{out}"
     );
 
@@ -559,7 +559,7 @@ fn builtin_fmq_types_map_to_the_runtime_crate() {
     for expected in [
         "pub r#queue: rsbinder::fmq::MQDescriptor<i32, rsbinder::fmq::SynchronizedReadWrite>,",
         "pub r#handle: rsbinder::NativeHandle,",
-        "pub r#more: Vec<rsbinder::fmq::MQDescriptor<i8, rsbinder::fmq::UnsynchronizedWrite>>,",
+        "pub r#more: ::std::vec::Vec<rsbinder::fmq::MQDescriptor<i8, rsbinder::fmq::UnsynchronizedWrite>>,",
         "rsbinder::BinderResult<rsbinder::fmq::MQDescriptor<i8, rsbinder::fmq::SynchronizedReadWrite>>",
         "_arg_desc: &rsbinder::fmq::MQDescriptor<i8, rsbinder::fmq::SynchronizedReadWrite>",
     ] {
@@ -625,7 +625,7 @@ fn builtin_stream_endpoint_carries_its_item_type() {
     let generated = std::fs::read_to_string(&out).unwrap();
     for expected in [
         "_arg_endpoint: &rsbinder::stream::StreamEndpoint<super::LogLine::LogLine>",
-        "rsbinder::BinderResult<rsbinder::stream::StreamEndpoint<String>>",
+        "rsbinder::BinderResult<rsbinder::stream::StreamEndpoint<::std::string::String>>",
     ] {
         assert!(
             generated.contains(expected),

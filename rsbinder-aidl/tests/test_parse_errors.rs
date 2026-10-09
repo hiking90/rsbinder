@@ -1,8 +1,7 @@
 // Copyright 2025 rsbinder Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Parse diagnostics: AIDL syntax errors must return `Err` with a usable
-//! span and message, never panic.
+//! Syntax errors return `Err` with a usable span and message, never panic.
 
 use miette::Diagnostic;
 use rsbinder_aidl::{parse_document, AidlError, SourceContext};
@@ -63,6 +62,42 @@ fn test_empty_document() {
 fn test_keyword_as_identifier() {
     let err = expect_parse_error("parcelable interface {\n    int val;\n}", "test.aidl");
     assert!(matches!(&err, AidlError::Parse(_)));
+}
+
+// AOSP's flex lexer takes the longest token: a keyword is a whole word, and always a keyword.
+#[test]
+fn keywords_are_whole_words() {
+    for input in [
+        "interfaceIFoo { void f(); }",
+        "enumE { A }",
+        "unionU { int a; }",
+        "parcelableP { int x; }",
+        "packagep; parcelable P { int x; }",
+        "package p; importp.Q; parcelable P { int x; }",
+        "interface IFoo { constint X = 1; }",
+        "oneway oneway interface IFoo { void f(); }",
+        // Not an identifier wherever it stands (`aidl_language_y.yy` `identifier`).
+        "parcelable P { int in; }",
+        "parcelable P { int package; }",
+        "parcelable P { int import; }",
+        "interface IFoo { void f(int out); }",
+        "enum E { inout }",
+    ] {
+        let ctx = SourceContext::new("test.aidl", input);
+        assert!(parse_document(&ctx).is_err(), "accepted: {input}");
+    }
+    for input in [
+        "interface IFoo { void f(in/*c*/ int[] a, out//c\n int[] b); }",
+        "parcelable P { int inner; int outer; int interfaces; int enumerated; int constant; }",
+        "parcelable P { int cpp_header; int rust_type; boolean b = true; }",
+        "oneway interface IFoo { void f(); }",
+        "package p;import p.Q;parcelable P { Q q; }",
+    ] {
+        let ctx = SourceContext::new("test.aidl", input);
+        if let Err(e) = parse_document(&ctx) {
+            panic!("rejected: {input}: {e}");
+        }
+    }
 }
 
 // Unclosed brace
@@ -183,6 +218,44 @@ fn test_char_constant_unknown_escape_rejected() {
             parse_document(&ctx).is_ok(),
             "supported char literal must still parse: {src}"
         );
+    }
+}
+
+/// Comparison chains and bracket-split runs hit the operator cap instead of overflowing the stack.
+#[test]
+fn operator_runs_through_comparisons_and_brackets_are_rejected() {
+    // 200 bracket levels (under the bracket cap) of 50 operators each: one path of 10000.
+    let level = format!("({}", "1+".repeat(50));
+    let nested = format!("{}1{}", level.repeat(200), ")".repeat(200));
+    for expr in [
+        format!("{}1", "1 == ".repeat(200_000)),
+        format!("{}1", "1 != ".repeat(200_000)),
+        format!("{}1", "1 < ".repeat(200_000)),
+        format!("{}1", "1 <= ".repeat(200_000)),
+        format!("{}1", "1 > ".repeat(200_000)),
+        format!("{}1", "1 >= ".repeat(200_000)),
+        format!("{}1", "(1)+".repeat(200_000)),
+        nested,
+        format!("{}A", "A < A > ".repeat(100_000)),
+        format!("{}A", "A<A<A>>".repeat(100_000)),
+    ] {
+        let src = format!("parcelable P {{ const int X = {expr}; }}");
+        // Default test-thread stack: a build script's main thread is no smaller.
+        let result = std::thread::spawn(move || {
+            parse_document(&SourceContext::new("test.aidl", &src)).map(|_| ())
+        })
+        .join()
+        .expect("parsing must not panic");
+        let err = result.expect_err("an unbounded operator run must be refused");
+        let AidlError::Parse(pe) = &err else {
+            panic!("expected a ParseError, got: {err:?}");
+        };
+        assert!(
+            pe.message.contains("too many operators in one expression"),
+            "got: {}",
+            pe.message
+        );
+        assert!(pe.help().is_some(), "nesting diagnostic must carry help");
     }
 }
 

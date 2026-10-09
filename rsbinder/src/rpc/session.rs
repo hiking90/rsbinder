@@ -22,9 +22,10 @@
 //! `DEC_STRONG`"). A serve-driven (incoming) slot is never
 //! taken from a free scan, matching AOSP `ExclusiveConnection::find`, which
 //! looks `mIncoming` up with `available = nullptr`: the peer reads that
-//! socket only inside its own reply wait, so an unsolicited frame is not
-//! merely delayed — once the socket buffer fills, the send blocks and that
-//! slot's serve loop is locked out of its own connection.
+//! socket only inside its own reply wait (and, while a send of its own there
+//! waits, only for a `DEC_STRONG`: "Draining sends"), so an unsolicited
+//! request is not merely delayed — once the socket buffer fills, the send
+//! blocks and that slot's serve loop is locked out of its own connection.
 //!
 //! Each slot carries a role: `Incoming` (this end serves it, AOSP `mIncoming`: a server's
 //! founding slot and attaches, a client's callback connections) or `Outgoing` (this end sends on
@@ -149,10 +150,16 @@
 //!   ends the session ("Session end"): the late `REPLY` carries no id to tell it from the next
 //!   call's, and a connection left unread would stall the peer's next write on it (plan 2-24
 //!   D2). The call gets `TimedOut`, the others in flight `DeadObject`. A guard arms it
-//!   and, on every exit (return, `?`, panic), restores the slot's baseline read deadline rather
-//!   than `None`: a callback made from a twoway handler rides the serve connection through the
-//!   `DRIVING` pin, and clearing would disable that connection's idle deadline for good (the
-//!   serve loop arms it once, not per frame). Serve slots' baseline is the server's
+//!   and, on every exit (return, `?`, panic), restores the read deadline it replaced: the one an
+//!   enclosing guard on this thread set on the same transport, else the slot's baseline, never
+//!   `None` by default. A call made inside a reply wait on the same connection (a `Drop` that a
+//!   `DEC_STRONG` read there releases, which AOSP also runs inline, `RpcState.cpp:1455`) thus
+//!   leaves the outer wait its deadline. A callback made from a twoway handler rides the serve
+//!   connection through the `DRIVING` pin, and clearing would disable that connection's idle
+//!   deadline for good (the serve loop arms it once, not per frame). A deadline that cannot be
+//!   armed because the peer has closed (XNU refuses `SO_RCVTIMEO` once both directions are
+//!   shut) is skipped: a read there returns what is left and then the end of stream, so the
+//!   call ends as `DeadObject`. Serve slots' baseline is the server's
 //!   `set_idle_timeout` on the android-13+ path; an r34 server's serve slots and all other
 //!   slots have none. With no reply deadline set, a twoway call on this session by a thread
 //!   whose `DRIVING` stack holds one of this session's serve slots waits under the baseline
@@ -312,10 +319,11 @@
 //! address (`super::state` module doc "Ref-count model"). The route below never orders a
 //! release after a send on another connection; the hold does. It never waits for a
 //! slot, because `RpcProxy::drop` runs on arbitrary user threads and a slot wait there would let
-//! a hung peer block the user's `Drop`. It writes only where the peer is reading: rsbinder reads
-//! a connection no serve loop drives only inside its own reply wait (it has no counterpart of
-//! AOSP `drainCommands`), so frames written where nobody reads fill the socket buffer until the
-//! writer blocks and its serve loop stops reading too. `dec_route` picks, in this order:
+//! a hung peer block the user's `Drop`. It writes only where the peer is reading. A peer reads a
+//! connection none of its serve loops drives inside its reply wait, and, if it drains, while a
+//! send of its own there waits for room ("Draining sends"); at any other time nothing reads it,
+//! so frames written there fill the socket buffer until the writer blocks and its serve loop
+//! stops reading too. `dec_route` picks, in this order:
 //!
 //! 1. **The pin, when the peer reads it**: an `Outgoing` pin, which the peer serves, or an
 //!    `Incoming` pin whose dispatch grants `allow_nested`, where the peer waits for the reply of
@@ -331,11 +339,19 @@
 //!    `pending_dec`, one entry per address with the amounts summed, and written just before the
 //!    next `REPLY` on the slot, which the peer is waiting to read. `write_reply` writes every
 //!    `REPLY`, so it is the one flush. AOSP `ExclusiveConnection::find` writes a
-//!    `CLIENT_REFCOUNT` on the incoming connection here and relies on the peer's
-//!    `drainCommands` (android-17.0.0_r1 `RpcSession.cpp:924-943`); holding it is what keeps a
-//!    oneway-only rsbinder peer from stalling. Such a peer, with no callback connection, gets
-//!    the `DEC_STRONG`s with its next twoway. A hold dies with its slot, which leaves the pool
-//!    only with the session, and a session end resets the peer's counts anyway.
+//!    `CLIENT_REFCOUNT` on the incoming connection here at once and relies on the peer's
+//!    `drainCommands` (android-17.0.0_r1 `RpcSession.cpp:933-942`). The hold is rsbinder's: it
+//!    keeps this handler out of a write that only the peer's next send could unblock. A peer
+//!    reads nothing there while it sends nothing, and some never drain: libbinder from
+//!    android-16.0.0_r4 with incoming threads, android-12, rsbinder before "Draining sends". A
+//!    peer that sends only oneways, with no callback connection, gets the held `DEC_STRONG`s
+//!    with its next twoway. A hold dies with its slot, which leaves the pool only with the
+//!    session, and a session end resets the peer's counts anyway. The peer picks the addresses,
+//!    so a pin holds at most `HELD_DEC_STRONG_LIMIT` of them; a new address past that is written
+//!    on the pin itself, as AOSP does. A peer that drains reads it at its next send there. One
+//!    that does not, or sends nothing more, fills the socket buffer and leaves this handler
+//!    blocked in the write until it next reads the connection or the send deadline ends the
+//!    session, as AOSP leaves its own writer.
 //! 4. **The reaper**, for a thread that drives no slot when no `Outgoing` slot is free: the
 //!    amount is queued, and a reaper thread per session waits for one. A session with no
 //!    `Outgoing` slot at all (a server whose client opened no callback connection) drops it,
@@ -356,6 +372,66 @@
 //! session means the peer is gone, AOSP parity), but a transport failure still ends the
 //! session ("Failed sends"). A connection joins the pool only after its attach is confirmed,
 //! so `confirm_attach`, which reads nothing but a `REPLY`, never meets a `DEC_STRONG`.
+//!
+//! # Draining sends
+//!
+//! A transaction's send (`client_transact`: oneway or twoway, on any slot) reads its own
+//! connection while it waits for room, as AOSP `RpcState::transactAddress` does through its
+//! write's `altPoll` (android-17.0.0_r1 `RpcState.cpp:703-748`; `drainCommands` at `:928-943`).
+//! `RpcTransport::send_raw_draining` calls `drain_one` for each
+//! message that has begun to arrive, and retries the write after it. Only a `DEC_STRONG` belongs
+//! there: the peer sends a `TRANSACT` on this connection only nested in a call of ours, and a
+//! `REPLY` only for one, and neither can start before this request is out. Anything else ends
+//! the session with AOSP's `CONTROL_ONLY` status (`processCommand`, `RpcState.cpp:948-1005`):
+//! `BadType` for a `TRANSACT`, `DeadObject` for any other command, and `BadValue` for a
+//! `DEC_STRONG` whose `bodySize` is not that of the wire's `DEC_STRONG` body (`RpcDecStrong` on
+//! android-13+, the 32-byte address on r34; `processDecStrong`, `:1395-1400`). It is judged from
+//! the header, before any body byte, as AOSP's `getAndExecuteCommand` reads only the header
+//! before `processCommand` (`:907-926`): a peer that announces a large body and never sends it
+//! cannot hold the send. On r34 the rule is rsbinder's: android-12 `rpcSend` is a plain blocking
+//! `send` that never drains, so the statuses are android-13+'s. A peer that stops inside a header
+//! or a `DEC_STRONG` body holds the send until the send deadline.
+//!
+//! "Neither can start" does not hold for a send made inside this thread's own reply wait on
+//! the same connection. A `Drop` that a `DEC_STRONG` read in that wait releases may transact on
+//! this session, and `find_conn` hands it the connection the wait drives, as AOSP
+//! `ExclusiveConnection::find` does for every use, `CLIENT_ASYNC` included (`RpcSession.cpp:948`
+//! after `findConnection`, `:1001-1006`). The peer may have written the outer call's `REPLY`
+//! right after that `DEC_STRONG` (AOSP flushes a target's refs just before the reply,
+//! `RpcState.cpp:1301`). If the inner send then waits for room, its drain reads that `REPLY`
+//! and the session ends with `DeadObject`, which the outer call returns too. AOSP does the same
+//! where it drains: `doDecStrong` drops the node inline in `waitForReply` (`:1455`), the inner
+//! `transactAddress` drains through `altPoll`, and `processCommand` ends the session on the
+//! `REPLY` as an unknown command (`:986-996`). libbinder from android-16.0.0_r4 with incoming
+//! threads does not drain; its inner send waits until the peer's serve loop reads, and the
+//! `REPLY` stays for the outer wait. An inner send that never waits for room drains nothing. The
+//! drain's read deadline is set back to the outer wait's when the inner send ends ("Reply
+//! deadlines").
+//!
+//! The drain's reads are bounded by the send deadline (`set_timeout` and the idle deadline,
+//! "Liveness"), armed as the read deadline at the first message drained and set back to the
+//! one it replaced when the send ends ("Reply deadlines"); a peer that has closed skips the
+//! arm, and the drain reads the end of stream. AOSP has no deadline on this path; rsbinder's send
+//! deadline bounds a send whose peer stops reading, and a send waiting on a read the peer
+//! never completes is the same stall. Each read that moves no byte for that long fails, which
+//! ends the session as a failed send.
+//!
+//! A `DEC_STRONG`'s counts apply at once under the state lock, but the objects it releases
+//! drop, and the proxy releases it lets go are sent, only after the send returns: a user `Drop`
+//! may transact and a release is written on a slot, either of which would put a frame inside
+//! the one being written (and `tls` holds its write lock throughout). When the send failed, the
+//! session ends first ("Failed sends"), as AOSP's `rpcSend` shuts the session down before it
+//! returns (`handleRpcError`, `RpcState.cpp:403-438`); the releases then drop with the peer's
+//! counts instead of being written after a cut frame. A `REPLY` and a `DEC_STRONG` are written
+//! without draining, as AOSP's are (`rpcSend` with no `altPoll`, `RpcState.cpp:904` and
+//! `:1385`).
+//!
+//! AOSP drains on every transaction from android-13.0.0_r1 to android-16.0.0_r3, and from
+//! android-16.0.0_r4 only while `getMaxIncomingThreads() == 0` (17_r1 `RpcState.cpp:709`).
+//! rsbinder drains on every transaction: its wait is a `poll` for room or input instead of
+//! AOSP's doubling sleep, so the read adds no wait, and a peer writes a `DEC_STRONG` on this
+//! connection whatever this end's incoming connections (libbinder when its other connections
+//! are busy, rsbinder past its hold).
 //!
 //! # Session death
 //!
@@ -399,13 +475,24 @@
 //!   AOSP's `bindersInObjectPositions` gate. v0/v1/r34 record no binder
 //!   positions. Interop does not need the check (a lenient decoder still
 //!   round-trips); it hardens v2 conformance.
-//! * On android-13+ a stability `int32` follows the address
-//!   (`finishFlattenBinder` → `Stability::getRepr`). libbinder's
-//!   `finishUnflattenBinder` requires it: without it the short read yields a
-//!   null root. rsbinder sends the binder's declared stability, not a
-//!   hardcoded 0; its default `Stability::System` (`0b001100`, plus
-//!   `0x0c000000` on Android SDK 31/32) is a level libbinder accepts for an
-//!   RPC binder. The r34 profile (rsbinder↔rsbinder) omits it on both sides.
+//! * A stability `int32` follows every binder, null included
+//!   (`finishFlattenBinder` → `Stability::getRepr`; android-12.0.0_r34
+//!   `Parcel.cpp:198-214`). libbinder's `finishUnflattenBinder` requires it:
+//!   without it the short read yields a null root. rsbinder sends the
+//!   binder's declared stability, not a hardcoded 0; its default
+//!   `Stability::System` is a level libbinder accepts for an RPC binder. A
+//!   null binder's is always `UNDECLARED` (level 0). android-13+ writes the
+//!   bare level (`0b001100` for System, plus `0x0c000000` on Android SDK
+//!   31/32); r34 writes the android-12 `Category`, `version (1) | level << 24`
+//!   (`0x0c000001`, a null binder `0x00000001`), whatever the host.
+//! * Reading it follows AOSP `Stability::setRepr`: a null binder with any
+//!   level but `UNDECLARED` is `BAD_TYPE`, and on r34 so is a `Category` whose
+//!   version is below android-12's `kBinderWireFormatOldest` (1). A non-null
+//!   binder's level is not checked (AOSP also requires VENDOR, SYSTEM or VINTF),
+//!   so a `Stability::Local` binder rsbinder sends is refused by libbinder and
+//!   accepted by rsbinder. The word is read after the binder has entered, as
+//!   `finishUnflattenBinder` runs after `onBinderEntering`: a refused binder is
+//!   dropped, which pays its receipt back.
 //! * A local binder written into a parcel takes one `timesSent` bump
 //!   (`RpcState::on_binder_leaving`), and the parcel owns it while unsent
 //!   (AOSP `mSendState`): `Parcel::drop` hands it back through
@@ -481,7 +568,9 @@
 use std::cell::RefCell;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -489,11 +578,13 @@ use std::time::{Duration, Instant};
 use super::end::{EndReason, EndedBy, ServeStep, SessionEnd};
 use super::fd_mode::FileDescriptorTransportMode;
 use super::lifecycle::SessionLifecycle;
-use crate::binder::{SIBinder, FLAG_ONEWAY, INTERFACE_TRANSACTION, PING_TRANSACTION};
+use crate::binder::{SIBinder, Stability, FLAG_ONEWAY, INTERFACE_TRANSACTION, PING_TRANSACTION};
 use crate::error::{Result, StatusCode};
 use crate::parcel::{CopiedBinders, Parcel, RpcParcelOps};
 
-use super::address::{AddressSpace, RpcAddress, SpecialTransaction, RPC_ADDR_LEN};
+use super::address::{
+    AddressSpace, RpcAddress, SpecialTransaction, RPC_ADDR_LEN, RPC_SESSION_ID_NEW,
+};
 use super::proxy::RpcProxy;
 use super::state::RpcState;
 use super::transport::{PeerIdentity, RpcTransport};
@@ -502,9 +593,10 @@ use super::wire::{
 };
 use super::wire_android13::{
     client_connect_with_id, client_read_connection_init, client_write_connection_header,
-    read_aosp_message, read_aosp_message_with_fds, server_accept_deferred_init, write_aosp_message,
-    write_aosp_message_with_fds, Android13PlusCodec, RawTransportIo, A13_ADDR_LEN, FD_MODE_NONE,
-    FD_MODE_UNIX, PROTOCOL_V1, PROTOCOL_V2,
+    control_only_refusal, read_aosp_message, read_aosp_message_gated, read_aosp_message_with_fds,
+    read_r34_session_preamble, server_accept_deferred_init, write_aosp_message,
+    write_aosp_message_with_fds, Android13PlusCodec, RawTransportIo, A13_ADDR_LEN,
+    A13_DEC_STRONG_LEN, FD_MODE_NONE, FD_MODE_UNIX, PROTOCOL_V1, PROTOCOL_V2,
 };
 use super::{RpcError, RpcResult};
 
@@ -1046,7 +1138,11 @@ impl<'a> RpcClientConfig<'a> {
     ///   answers nothing (one at its connection cap leaves new connections
     ///   in its listen backlog, where `connect(2)` succeeds) fails the setup
     ///   call after `d` instead of hanging it. The r34 wire has no
-    ///   handshake, so there it bounds `connect(2)` only.
+    ///   handshake, so there it bounds `connect(2)` only. A `unix` or
+    ///   `vsock` `connect(2)` is not bounded by `d`: on Linux and Android
+    ///   the first waits while the listener's accept queue is full, and the
+    ///   kernel bounds the second by its own connect timeout
+    ///   (`SO_VM_SOCKETS_CONNECT_TIMEOUT`, 2 s by default).
     /// - **The session**: applied **as soon as it exists**, so it also
     ///   bounds the round trips this setup performs (`GET_MAX_THREADS` for a
     ///   fan-out, `GET_SESSION_ID` for any additional connection), and then
@@ -1092,8 +1188,10 @@ impl<'a> RpcClientConfig<'a> {
 }
 
 /// The wire a session speaks: r34 (default, no handshake) or android-13+ (handshake-negotiated).
+///
+/// Both use AOSP framing: a bare `RpcWireHeader` and `bodySize` bytes, no length prefix.
 enum WireProfile {
-    /// android-12 r34: rsbinder's `u32` length-prefix framing + `R34Codec`.
+    /// android-12 r34: the client's `int32` session-id preamble, then `R34Codec` messages.
     R34(R34Codec),
     /// android-13+: AOSP framing, codec negotiated (v0 = 13, v1 = 14/15, v2 = 16).
     Android13Plus(Android13PlusCodec),
@@ -1107,9 +1205,57 @@ impl WireProfile {
         }
     }
 
-    /// android-13+: AOSP framing (no `u32` length prefix) over the raw byte channel.
-    fn aosp_framing(&self) -> bool {
+    /// AOSP `transactInternal` `onBinderLeaving`: the peer pays a transaction's target back.
+    fn counts_transaction_targets(&self) -> bool {
         matches!(self, WireProfile::Android13Plus(_))
+    }
+
+    /// A twoway's target receipt is paid just before its `REPLY` ("Deferred `DEC_STRONG`").
+    fn pays_target_before_reply(&self) -> bool {
+        matches!(self, WireProfile::Android13Plus(_))
+    }
+
+    /// Body size of a well-formed `DEC_STRONG` (AOSP `processDecStrong` refuses any other).
+    fn dec_strong_body_len(&self) -> usize {
+        match self {
+            WireProfile::R34(_) => RPC_ADDR_LEN,
+            WireProfile::Android13Plus(_) => A13_DEC_STRONG_LEN,
+        }
+    }
+
+    /// The `int32` stability written after every binder (`None` = null, `UNDECLARED`).
+    ///
+    /// android-12 writes a `Category` (`version | level << 24`) whatever the host SDK, so r34
+    /// does too; android-13+ writes the bare level.
+    fn binder_stability_repr(&self, stability: Option<Stability>) -> i32 {
+        match self {
+            WireProfile::R34(_) => {
+                crate::binder::android12_category_repr(stability.map_or(0, Stability::level))
+            }
+            WireProfile::Android13Plus(_) => stability.map_or(0, i32::from),
+        }
+    }
+
+    /// AOSP `Stability::setRepr` on a received stability word; module doc (binders).
+    fn check_binder_stability(&self, repr: i32, null: bool) -> Result<()> {
+        let level = match self {
+            WireProfile::R34(_) => {
+                // android-12 `kBinderWireFormatOldest` is 1: a `Category` without one is older.
+                let version = repr & 0xff;
+                if version < 1 {
+                    log::error!("RPC: binder stability {repr:#x} has wire format version 0");
+                    return Err(StatusCode::BadType);
+                }
+                (repr >> 24) & 0xff
+            }
+            WireProfile::Android13Plus(_) => repr,
+        };
+        // A null binder's stability must be `UNDECLARED`.
+        if null && level != 0 {
+            log::error!("RPC: null binder with stability {repr:#x}");
+            return Err(StatusCode::BadType);
+        }
+        Ok(())
     }
 
     /// The negotiated protocol version; `None` for R34, which has no object table.
@@ -1206,7 +1352,54 @@ pub(super) fn reject_zero_deadline(timeout: Option<Duration>, msg: &str) -> Opti
     }
 }
 
-/// The reply read deadline, reset to the slot's baseline on every exit (module doc).
+thread_local! {
+    /// Read deadlines this thread's guards hold, innermost last, by transport ("Reply deadlines").
+    static ARMED_READ: RefCell<Vec<(usize, Option<Duration>)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn transport_key(t: &dyn RpcTransport) -> usize {
+    t as *const dyn RpcTransport as *const () as usize
+}
+
+/// The read deadline this thread's innermost live guard set on `t`, else `baseline`.
+fn read_deadline_in_effect(t: &dyn RpcTransport, baseline: Option<Duration>) -> Option<Duration> {
+    let key = transport_key(t);
+    // R1: the borrow spans only this scan.
+    ARMED_READ
+        .try_with(|a| a.borrow().iter().rev().find(|e| e.0 == key).map(|e| e.1))
+        .ok()
+        .flatten()
+        .unwrap_or(baseline)
+}
+
+/// Set `t`'s read deadline and record it; `false` if skipped on a closed peer ("Reply deadlines").
+fn push_read_deadline(t: &dyn RpcTransport, d: Option<Duration>) -> RpcResult<bool> {
+    if let Err(e) = t.set_read_timeout(d) {
+        // XNU refuses `SO_RCVTIMEO` once both directions are shut; reads there end at EOF.
+        return if t.peer_closed() == Some(true) {
+            Ok(false)
+        } else {
+            Err(e)
+        };
+    }
+    let _ = ARMED_READ.try_with(|a| a.borrow_mut().push((transport_key(t), d)));
+    Ok(true)
+}
+
+/// Drop the innermost record for `t` and set `restore` back on it.
+fn pop_read_deadline(t: &dyn RpcTransport, restore: Option<Duration>) {
+    let key = transport_key(t);
+    let _ = ARMED_READ.try_with(|a| {
+        let mut a = a.borrow_mut();
+        if let Some(i) = a.iter().rposition(|e| e.0 == key) {
+            a.remove(i);
+        }
+    });
+    // Best-effort: Drop cannot surface it, and the next caller re-arms or clears anyway.
+    let _ = t.set_read_timeout(restore);
+}
+
+/// The reply read deadline, reset on every exit to what it replaced (module doc).
 struct ReplyDeadlineGuard<'a> {
     transport: &'a dyn RpcTransport,
     armed: bool,
@@ -1214,15 +1407,17 @@ struct ReplyDeadlineGuard<'a> {
 }
 
 impl<'a> ReplyDeadlineGuard<'a> {
+    /// `baseline`: the slot's own read deadline, restored when no enclosing guard set one.
     fn arm(
         transport: &'a dyn RpcTransport,
         deadline: Option<Duration>,
-        restore: Option<Duration>,
+        baseline: Option<Duration>,
     ) -> RpcResult<Self> {
-        let armed = deadline.is_some();
-        if let Some(d) = deadline {
-            transport.set_read_timeout(Some(d))?;
-        }
+        let restore = read_deadline_in_effect(transport, baseline);
+        let armed = match deadline {
+            Some(d) => push_read_deadline(transport, Some(d))?,
+            None => false,
+        };
         Ok(Self {
             transport,
             armed,
@@ -1234,8 +1429,7 @@ impl<'a> ReplyDeadlineGuard<'a> {
 impl Drop for ReplyDeadlineGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            // Best-effort: Drop cannot surface it, and the next caller re-arms or clears anyway.
-            let _ = self.transport.set_read_timeout(self.restore);
+            pop_read_deadline(self.transport, self.restore);
         }
     }
 }
@@ -1410,12 +1604,13 @@ struct NestedDeadlineGuard<'a> {
 
 impl<'a> NestedDeadlineGuard<'a> {
     fn lift(transport: &'a dyn RpcTransport, deadline: Option<Duration>) -> RpcResult<Self> {
-        if deadline.is_some() {
-            transport.set_read_timeout(None)?;
-        }
+        let lifted = match deadline {
+            Some(_) => push_read_deadline(transport, None)?,
+            None => false,
+        };
         Ok(Self {
             transport,
-            restore: deadline,
+            restore: deadline.filter(|_| lifted),
         })
     }
 }
@@ -1423,8 +1618,8 @@ impl<'a> NestedDeadlineGuard<'a> {
 impl Drop for NestedDeadlineGuard<'_> {
     fn drop(&mut self) {
         if let Some(d) = self.restore {
-            // Best-effort (Drop): the reply loop's next `recv` surfaces a transport error anyway.
-            let _ = self.transport.set_read_timeout(Some(d));
+            // The reply loop's next `recv` surfaces a transport error anyway.
+            pop_read_deadline(self.transport, Some(d));
         }
     }
 }
@@ -1471,6 +1666,18 @@ enum DecRoute<'a> {
     Reaper,
 }
 
+/// Addresses an `Incoming` pin holds before it writes as AOSP does (module doc, step 3).
+const HELD_DEC_STRONG_LIMIT: usize = 10_000;
+
+/// What `DEC_STRONG`s read during a send released, settled once the frame is whole.
+#[derive(Default)]
+struct DrainedReleases {
+    /// Local objects whose last reference the peer gave back; their drop may run user code.
+    released: Vec<SIBinder>,
+    /// Proxy releases that waited for these payments (`pay_proxy_sends`).
+    releases: Vec<(RpcAddress, u32)>,
+}
+
 /// Why a `REPLY` did not go out; `Refused` put no byte on the slot (module doc "Failed sends").
 enum ReplyNotSent {
     Refused(StatusCode),
@@ -1515,7 +1722,7 @@ mod slot_pool {
         /// AOSP `allowNested`: set only while a twoway dispatched here runs; the peer reads then.
         pub(super) allow_nested: bool,
         /// `DEC_STRONG`s held for this slot's next `REPLY`; module doc "Deferred `DEC_STRONG`".
-        pub(super) pending_dec: Vec<(RpcAddress, u32)>,
+        pub(super) pending_dec: std::collections::HashMap<RpcAddress, u32>,
         /// Private: only `SlotPool::push` builds a slot, so none can overwrite a pooled one.
         _pooled: (),
     }
@@ -1562,7 +1769,7 @@ mod slot_pool {
                 id,
                 role,
                 allow_nested: false,
-                pending_dec: Vec::new(),
+                pending_dec: std::collections::HashMap::new(),
                 _pooled: (),
             });
         }
@@ -1823,6 +2030,8 @@ pub(crate) struct SharedSession {
     fd_unix_supported: AtomicBool,
     /// `GET_SESSION_ID`'s random id: AOSP `kSessionIdBytes == 32`, libbinder refuses other sizes.
     rpc_session_id: RpcSessionId,
+    /// r34 `GET_SESSION_ID`: the `int32` an `RpcServer` minted, `RPC_SESSION_ID_NEW` if none.
+    r34_session_id: AtomicI32,
     /// Client role: the server-minted id from the first `get_session_id`; attaches must echo it.
     server_session_id: Mutex<Option<Vec<u8>>>,
     /// `Live(n)`/`Dying`/`Dead`; `Dying` reads as torn down before the obituaries (module doc).
@@ -1950,6 +2159,8 @@ pub(crate) struct RpcSessionInner {
     incoming_live: AtomicUsize,
     /// Threads `close_session` has `join()`ed; `incoming_live` reads 0 whether joined or not.
     incoming_joined: AtomicUsize,
+    /// The founding slot's serve loop reads the r34 session-id preamble first (`RpcSession::new`).
+    awaits_preamble: AtomicBool,
 }
 
 /// The `RpcParcelOps` implementation bound to one session.
@@ -2317,16 +2528,20 @@ impl RpcSessionInner {
     /// `arm_liveness` with `SharedSession::liveness` already held.
     fn arm_liveness_locked(&self, transport: &dyn RpcTransport) {
         let timeout = *self.shared.timeout.lock().expect("timeout poisoned");
-        let idle = self.shared.serve_read_deadline();
-        let send = match (timeout, idle) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
-        if let Err(e) = transport.set_write_timeout(send) {
+        if let Err(e) = transport.set_write_timeout(self.send_deadline()) {
             log::warn!("RPC: failed to arm a connection's send deadline: {e:?}");
         }
         if let Err(e) = transport.set_liveness(timeout) {
             log::warn!("RPC: failed to arm a connection's liveness check: {e:?}");
+        }
+    }
+
+    /// The send deadline: the smaller of `set_timeout` and the idle deadline ("Liveness").
+    fn send_deadline(&self) -> Option<Duration> {
+        let timeout = *self.shared.timeout.lock().expect("timeout poisoned");
+        match (timeout, self.shared.serve_read_deadline()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
         }
     }
 
@@ -2532,59 +2747,109 @@ impl RpcSessionInner {
         self.profile.records_fd_positions()
     }
 
-    /// Send one frame; only a `Unix`-mode connection carries fds (`SCM_RIGHTS`).
+    /// Send one frame (fds in `Unix` mode only); `drain` reads while it waits ("Draining sends").
     fn send_msg(
         &self,
         transport: &dyn RpcTransport,
         frame: &[u8],
         fds: &[OwnedFd],
+        drain: Option<&mut dyn FnMut() -> RpcResult<()>>,
     ) -> RpcResult<()> {
-        if self.profile.aosp_framing() {
-            // A frame on its way out is activity until its write returns, at any pace ("Idle").
-            let _sending = OpenCall::enter(&self.shared);
-            // AOSP wire: no length prefix; fds ride the first `sendmsg` (`RpcTransportRaw`).
-            if self.fd_mode() == FileDescriptorTransportMode::Unix {
-                let borrowed: Vec<_> = fds.iter().map(|f| f.as_fd()).collect();
-                return write_aosp_message_with_fds(transport, frame, &borrowed);
-            }
-            // Not `RawTransportIo`: it folds a not-started send's `Timeout` into `Io`.
-            debug_assert!(
-                fds.is_empty(),
-                "non-Unix android-13+ session must not carry fds"
-            );
-            let _ = fds; // release: `debug_assert!` is compiled out, so `fds` is otherwise unused
-            return write_aosp_message_with_fds(transport, frame, &[]);
-        }
+        // A frame on its way out is activity until its write returns, at any pace ("Idle").
+        let _sending = OpenCall::enter(&self.shared);
+        // AOSP wire: no length prefix; fds ride the first `sendmsg` (`RpcTransportRaw`).
         if self.fd_mode() == FileDescriptorTransportMode::Unix {
             let borrowed: Vec<_> = fds.iter().map(|f| f.as_fd()).collect();
-            transport.send_frame_with_fds(frame, &borrowed)
-        } else {
-            transport.send_frame(frame)
+            return write_aosp_message_with_fds(transport, frame, &borrowed, drain);
+        }
+        // Not `RawTransportIo`: it folds a not-started send's `Timeout` into `Io`.
+        debug_assert!(fds.is_empty(), "a non-Unix session must not carry fds");
+        let _ = fds; // release: `debug_assert!` is compiled out, so `fds` is otherwise unused
+        write_aosp_message_with_fds(transport, frame, &[], drain)
+    }
+
+    /// AOSP `drainCommands(CONTROL_ONLY)` for one message; module doc "Draining sends".
+    fn drain_one<'t>(
+        &self,
+        transport: &'t dyn RpcTransport,
+        slot_id: u64,
+        deadline: &mut Option<ReplyDeadlineGuard<'t>>,
+        after: &mut DrainedReleases,
+        fault: &std::cell::Cell<Option<StatusCode>>,
+    ) -> RpcResult<()> {
+        if deadline.is_none() {
+            let baseline = self.slot_baseline_read_deadline(slot_id);
+            *deadline = Some(ReplyDeadlineGuard::arm(
+                transport,
+                self.send_deadline(),
+                baseline,
+            )?);
+        }
+        let refuse = |status: StatusCode, what: &'static str| {
+            log::error!(
+                "RPC: {what} arrived while a transaction was being sent; ending the session"
+            );
+            fault.set(Some(status));
+            Err(RpcError::Protocol(what))
+        };
+        // A `DEC_STRONG` carries no fds; any that came are closed here, as AOSP drops them.
+        let (frame, _fds) =
+            self.recv_msg_gated(transport, |header| {
+                match control_only_refusal(header, self.profile.dec_strong_body_len()) {
+                    None => Ok(()),
+                    Some((status, what)) => refuse(status, what),
+                }
+            })?;
+        match self.profile.codec().decode_message(&frame)? {
+            WireMessage::DecStrong(addr, amount) => {
+                let mut st = self.shared.state.lock().expect("rpc state poisoned");
+                after.released.extend(st.dec_strong_local(&addr, amount));
+                let held = st.pay_proxy_sends(&addr, amount);
+                if held > 0 {
+                    after.releases.push((addr, held));
+                }
+                Ok(())
+            }
+            // AOSP `processCommand`: `TRANSACT` under `CONTROL_ONLY` is `BAD_TYPE`.
+            WireMessage::Transact(_) => refuse(StatusCode::BadType, "a TRANSACT"),
+            // AOSP has no `REPLY` case there: an unknown command, `DEAD_OBJECT`.
+            WireMessage::Reply(_) => refuse(StatusCode::DeadObject, "a REPLY"),
         }
     }
 
     /// Receive one frame (+ `SCM_RIGHTS` fds in `Unix` mode, fixed before any RPC traffic).
     fn recv_msg(&self, transport: &dyn RpcTransport) -> RpcResult<(Vec<u8>, Vec<OwnedFd>)> {
-        if self.profile.aosp_framing() {
-            // Header, then `bodySize` bytes; each read that moved bytes bumps `io_gen` ("Idle").
-            let io_gen = &self.shared.io_gen;
-            if self.fd_mode() == FileDescriptorTransportMode::Unix {
-                return read_aosp_message_with_fds(|buf| {
+        self.recv_msg_gated(transport, |_| Ok(()))
+    }
+
+    /// `recv_msg` whose `header_gate` may refuse the `RpcWireHeader` before the body is read.
+    fn recv_msg_gated(
+        &self,
+        transport: &dyn RpcTransport,
+        header_gate: impl FnOnce(&[u8]) -> RpcResult<()>,
+    ) -> RpcResult<(Vec<u8>, Vec<OwnedFd>)> {
+        // Header, then `bodySize` bytes; each read that moved bytes bumps `io_gen` ("Idle").
+        let io_gen = &self.shared.io_gen;
+        if self.fd_mode() == FileDescriptorTransportMode::Unix {
+            return read_aosp_message_with_fds(
+                |buf| {
                     let got = transport.recv_raw_with_fds(buf)?;
                     if got.0 > 0 {
                         io_gen.fetch_add(1, Ordering::Relaxed);
                     }
                     Ok(got)
-                });
-            }
-            let frame = read_aosp_message(&mut CountedIo(RawTransportIo(transport), io_gen))?;
-            return Ok((frame, Vec::new()));
+                },
+                header_gate,
+            );
         }
-        if self.fd_mode() == FileDescriptorTransportMode::Unix {
-            transport.recv_frame_with_fds()
-        } else {
-            Ok((transport.recv_frame()?, Vec::new()))
-        }
+        let mut io = CountedIo(RawTransportIo(transport), io_gen);
+        Ok((read_aosp_message_gated(&mut io, header_gate)?, Vec::new()))
+    }
+
+    /// The `int32` session id a client writes before its first message on the r34 wire.
+    fn read_session_preamble(&self, transport: &dyn RpcTransport) -> RpcResult<i32> {
+        let mut io = CountedIo(RawTransportIo(transport), &self.shared.io_gen);
+        read_r34_session_preamble(&mut io)
     }
 
     fn self_weak(&self) -> Weak<RpcSessionInner> {
@@ -2749,6 +3014,11 @@ impl RpcSessionInner {
         )
     }
 
+    /// The r34 id an `RpcServer` minted for this session, answered by `GET_SESSION_ID`.
+    pub(crate) fn set_r34_session_id(&self, id: i32) {
+        self.shared.r34_session_id.store(id, Ordering::SeqCst);
+    }
+
     /// AOSP `setMaxIncomingThreads`: the `GET_MAX_THREADS` advertise and the `Incoming` slot cap.
     pub(crate) fn max_threads_value(&self) -> u32 {
         // `Relaxed`: one config cell set before any accept; `thread::spawn` orders the workers.
@@ -2783,7 +3053,12 @@ impl RpcSessionInner {
     /// AOSP `flattenBinder` (RPC branch): `i32` present flag, then the profile's address if set.
     fn write_binder(&self, binder: Option<&SIBinder>, parcel: &mut Parcel) -> Result<()> {
         match binder {
-            None => parcel.write(&0i32),
+            None => {
+                parcel.write(&0i32)?;
+                // AOSP `finishFlattenBinder` follows a null binder too, with `UNDECLARED`.
+                parcel.write(&self.profile.binder_stability_repr(None))?;
+                Ok(())
+            }
             Some(b) => {
                 let addr = if let Some(rp) = (**b).as_any().downcast_ref::<RpcProxy>() {
                     // Another session's address is meaningless here (AOSP `onBinderLeaving`).
@@ -2839,11 +3114,8 @@ impl RpcSessionInner {
                 if self.profile.records_binder_positions() {
                     parcel.rpc_record_object_position(obj_pos);
                 }
-                if matches!(self.profile, WireProfile::Android13Plus(_)) {
-                    // libbinder requires the declared stability: module doc (binders).
-                    let rep: i32 = b.stability().into();
-                    parcel.write(&rep)?;
-                }
+                // libbinder requires the declared stability: module doc (binders).
+                parcel.write(&self.profile.binder_stability_repr(Some(b.stability())))?;
                 // Freeze stability mutation once it crosses IPC, as the kernel path does.
                 b.set_parceled();
                 Ok(())
@@ -2857,6 +3129,9 @@ impl RpcSessionInner {
         let obj_pos = parcel.data_position();
         let present: i32 = parcel.read()?;
         if present == 0 {
+            // AOSP `finishUnflattenBinder` follows a null binder too.
+            let stability: i32 = parcel.read()?;
+            self.profile.check_binder_stability(stability, true)?;
             return Ok(None);
         }
         // v2 strict receive (`bindersInObjectPositions`): module doc "Binders in an RPC parcel".
@@ -2864,24 +3139,30 @@ impl RpcSessionInner {
             return Err(StatusCode::BadValue);
         }
         let addr = self.wire_read_binder_addr(parcel)?;
-        if matches!(self.profile, WireProfile::Android13Plus(_)) {
-            // AOSP `finishUnflattenBinder`: the trailing stability `int32`.
-            let _stability: i32 = parcel.read()?;
-        }
+        let binder = self.binder_at(parcel, obj_pos, addr)?;
+        // AOSP `finishUnflattenBinder` runs after `onBinderEntering`: a refused binder drops here,
+        // so its receipt is paid as AOSP's `sp` release pays it.
+        let stability: i32 = parcel.read()?;
+        self.profile.check_binder_stability(stability, false)?;
+        Ok(Some(binder))
+    }
+
+    /// The binder a non-null RPC binder at `obj_pos` names: entered once if it arrived here.
+    fn binder_at(&self, parcel: &mut Parcel, obj_pos: usize, addr: RpcAddress) -> Result<SIBinder> {
         // AOSP android-16.0.0_r4 `unflattenBinder`: only a received position enters.
         if !parcel.rpc_received_at(obj_pos) {
-            return self.lookup_binder(addr).map(Some);
+            return self.lookup_binder(addr);
         }
         if let Some((entered, binder)) = parcel.rpc_entered_at(obj_pos) {
             if entered != addr {
                 log::error!("RPC: position {obj_pos} entered {entered:?}, now reads {addr:?}");
                 return Err(StatusCode::BadValue);
             }
-            return Ok(Some(binder));
+            return Ok(binder);
         }
         let binder = self.enter_binder(addr)?;
         parcel.rpc_record_entered(obj_pos, addr, binder.clone());
-        Ok(Some(binder))
+        Ok(binder)
     }
 
     /// AOSP `lookupAddress`, for a binder that did not arrive with its parcel: nothing is owed.
@@ -3156,7 +3437,7 @@ impl RpcSessionInner {
         };
         let transport = conn.transport();
         // AOSP `transactInternal` `onBinderLeaving`: the peer pays the target back (r34 does not).
-        let counts_target = !addr.is_zero() && self.profile.aosp_framing();
+        let counts_target = !addr.is_zero() && self.profile.counts_transaction_targets();
         // AOSP `BinderNode::asyncNumber` (send side, per-remote-addr).
         let async_number = {
             let mut st = self.shared.state.lock().expect("rpc state poisoned");
@@ -3202,13 +3483,32 @@ impl RpcSessionInner {
         };
         // A twoway is open from its send to its return, nested dispatches included ("Idle").
         let _open = (!oneway).then(|| OpenCall::enter(&self.shared));
-        // Out-of-band fds (empty unless `Unix` fd-mode).
-        if let Err(e) = self.send_msg(transport, &frame, data.rpc_out_fds()) {
+        // Out-of-band fds (empty unless `Unix` fd-mode); the send reads while it waits.
+        let mut drained = DrainedReleases::default();
+        let mut drain_deadline = None;
+        let fault = std::cell::Cell::new(None);
+        let sent = self.send_msg(
+            transport,
+            &frame,
+            data.rpc_out_fds(),
+            Some(&mut || {
+                let slot = conn.slot_id;
+                self.drain_one(transport, slot, &mut drain_deadline, &mut drained, &fault)
+            }),
+        );
+        drop(drain_deadline);
+        let DrainedReleases { released, releases } = drained;
+        if let Err(e) = sent {
             let held = rollback();
+            // First: a release written now on this slot would follow a cut frame.
             self.end_after_failed_send(&e);
+            drop(released);
+            self.send_held_releases(releases);
             self.send_dec_strong(addr, held);
-            return Err(Self::send_error_status(e));
+            return Err(fault.get().unwrap_or_else(|| Self::send_error_status(e)));
         }
+        drop(released);
+        self.send_held_releases(releases);
         data.rpc_end_send(true);
         if oneway {
             return Ok(None);
@@ -3218,11 +3518,11 @@ impl RpcSessionInner {
             self.fail_session();
             Err(status)
         };
-        // The reply deadline covers the reply wait only; the guard restores the slot baseline.
-        let restore = self.slot_baseline_read_deadline(conn.slot_id);
+        // The reply deadline covers the reply wait only; the guard restores what it replaced.
+        let baseline = self.slot_baseline_read_deadline(conn.slot_id);
         // Driving a serve slot of this session, the idle value stands in ("Reply deadlines").
         let deadline = self.timeout().or_else(|| self.handler_read_deadline());
-        let _deadline_guard = match ReplyDeadlineGuard::arm(transport, deadline, restore) {
+        let _deadline_guard = match ReplyDeadlineGuard::arm(transport, deadline, baseline) {
             Ok(g) => g,
             Err(e) => return fail(e.into()),
         };
@@ -3276,7 +3576,12 @@ impl RpcSessionInner {
             DecRoute::Conn(conn) => {
                 let _ = self.write_dec_strong(&conn, addr, amount);
             }
-            DecRoute::Pending(slot_id) => self.hold_dec_strong(slot_id, addr, amount),
+            DecRoute::Pending(slot_id) => match self.held_past_limit(slot_id, &addr) {
+                Some(conn) => {
+                    let _ = self.write_dec_strong(&conn, addr, amount);
+                }
+                None => self.hold_dec_strong(slot_id, addr, amount),
+            },
             DecRoute::Reaper => {
                 let _ = self.dec_strong_tx.send((addr, amount));
             }
@@ -3290,13 +3595,33 @@ impl RpcSessionInner {
         addr: RpcAddress,
         amount: u32,
     ) -> RpcResult<()> {
-        for frame in self.profile.codec().encode_dec_strong(&addr, amount) {
-            if let Err(e) = self.send_msg(conn.transport(), &frame, &[]) {
+        let Some((frame, times)) = self.profile.codec().encode_dec_strong(&addr, amount) else {
+            return Ok(());
+        };
+        for _ in 0..times {
+            // No drain, as AOSP `sendDecStrongToTarget`.
+            if let Err(e) = self.send_msg(conn.transport(), &frame, &[], None) {
                 self.end_after_failed_send(&e);
                 return Err(e);
             }
         }
         Ok(())
+    }
+
+    /// The pin itself once it holds `HELD_DEC_STRONG_LIMIT` other addresses: AOSP's write there.
+    fn held_past_limit(&self, slot_id: u64, addr: &RpcAddress) -> Option<ConnGuard<'_>> {
+        let st = self.conn_state.lock().expect("conn_state poisoned");
+        let s = st.slots.iter().find(|s| s.id == slot_id)?;
+        if s.pending_dec.len() < HELD_DEC_STRONG_LIMIT || s.pending_dec.contains_key(addr) {
+            return None;
+        }
+        // This thread drives the slot (`Pending` came from its pin), so the guard is reentrant.
+        Some(ConnGuard {
+            inner: self,
+            slot_id,
+            transport: Arc::clone(&s.transport),
+            reentrant: true,
+        })
     }
 
     /// Add to `slot_id`'s held `DEC_STRONG`s, one entry per address; lost if the slot is gone.
@@ -3305,14 +3630,13 @@ impl RpcSessionInner {
         let Some(slot) = st.slots.iter_mut().find(|s| s.id == slot_id) else {
             return;
         };
-        match slot.pending_dec.iter_mut().find(|(a, _)| *a == addr) {
-            Some((_, owed)) => *owed = owed.saturating_add(amount),
-            None => slot.pending_dec.push((addr, amount)),
-        }
+        // Keyed: a peer-sized backlog would make a linear search quadratic under `conn_state`.
+        let owed = slot.pending_dec.entry(addr).or_insert(0);
+        *owed = owed.saturating_add(amount);
     }
 
     /// The `DEC_STRONG`s held for `slot_id`, emptied: its `REPLY` is about to go out.
-    fn take_held_dec_strongs(&self, slot_id: u64) -> Vec<(RpcAddress, u32)> {
+    fn take_held_dec_strongs(&self, slot_id: u64) -> std::collections::HashMap<RpcAddress, u32> {
         let mut st = self.conn_state.lock().expect("conn_state poisoned");
         st.slots
             .iter_mut()
@@ -3384,7 +3708,8 @@ impl RpcSessionInner {
                 }
             }
         }
-        if let Err(e) = self.send_msg(conn.transport(), &frame, fds) {
+        // No drain, as AOSP's reply `rpcSend`: the peer is reading for this `REPLY`.
+        if let Err(e) = self.send_msg(conn.transport(), &frame, fds, None) {
             self.end_after_failed_send(&e);
             return Err(match e {
                 RpcError::FrameTooLarge { .. } | RpcError::Protocol(_) => ReplyNotSent::refused(e),
@@ -3477,7 +3802,7 @@ impl RpcSessionInner {
         let addr = t.address;
         let wire_async = t.async_number;
         // Target receipts this drain resolved (module doc "Deferred `DEC_STRONG`"); not r34's.
-        let counts_targets = self.profile.aosp_framing();
+        let counts_targets = self.profile.counts_transaction_targets();
         let mut owed: u32 = 0;
         let decision = self
             .shared
@@ -3578,7 +3903,7 @@ impl RpcSessionInner {
 
         if !oneway {
             // The target receipt, paid just before the `REPLY`; module doc "Deferred `DEC_STRONG`".
-            if self.profile.aosp_framing() {
+            if self.profile.pays_target_before_reply() {
                 if let Some(slot_id) = self.driving_slot() {
                     self.hold_dec_strong(slot_id, t.address, 1);
                 }
@@ -3687,20 +4012,27 @@ impl RpcSessionInner {
             return ServeStep::Ended(EndReason::SessionEnded);
         };
         let transport = conn.transport();
+        // Only the founding slot's first read takes it: no other read can come before it.
+        if slot_id == RpcSession::FOUNDING_SLOT_ID
+            && self.awaits_preamble.swap(false, Ordering::SeqCst)
+        {
+            match self.read_session_preamble(transport) {
+                Ok(RPC_SESSION_ID_NEW) => {}
+                Ok(id) => {
+                    log::error!(
+                        "RPC r34: the client asked to join session id {id}; joining an existing \
+                         session needs an `RpcServer`, so this connection is closed"
+                    );
+                    return ServeStep::Ended(EndReason::Frame(
+                        RpcError::Protocol("r34 preamble names an existing session").into(),
+                    ));
+                }
+                Err(e) => return ServeStep::Ended(recv_end_reason(e)),
+            }
+        }
         let (frame, in_fds) = match self.recv_msg(transport) {
             Ok(f) => f,
-            Err(RpcError::EndOfStream) => return ServeStep::Ended(EndReason::EndOfStream),
-            Err(RpcError::UncleanEndOfStream) => {
-                return ServeStep::Ended(EndReason::UncleanEndOfStream)
-            }
-            Err(RpcError::DeadlineMidFrame) => {
-                return ServeStep::Ended(EndReason::DeadlineMidFrame)
-            }
-            // The kernel's `ETIMEDOUT`: a lost connection, not an idle eviction.
-            Err(RpcError::Io(e)) if e.kind() == std::io::ErrorKind::TimedOut => {
-                return ServeStep::Ended(EndReason::Frame(StatusCode::DeadObject))
-            }
-            Err(e) => return ServeStep::Ended(EndReason::Frame(e.into())),
+            Err(e) => return ServeStep::Ended(recv_end_reason(e)),
         };
         // Ended locally with this frame in flight (a kernel may keep its queue past shutdown).
         if self.shared.ended_locally.load(Ordering::SeqCst) {
@@ -3743,10 +4075,7 @@ impl RpcSessionInner {
                 let mut reply = Parcel::new();
                 reply.attach_rpc_ops(self.parcel_ops());
                 // On any failure below `reply` drops unsent and gives the root's bump back.
-                match &root {
-                    Some(b) => reply.write(b)?,
-                    None => reply.write(&0i32)?,
-                }
+                reply.write(&root)?;
                 // At v2 the root binder's position is in the object table.
                 self.send_reply_parcel(&reply)
             }
@@ -3757,9 +4086,19 @@ impl RpcSessionInner {
                 self.send_reply(0, reply.rpc_data_bytes(), &[], &[])
             }
             Some(SpecialTransaction::GetSessionId) => {
-                // AOSP `writeByteVector(mId)` = the `&[u8]` path; a bare `i32` is BAD_VALUE there.
                 let mut reply = Parcel::new();
-                reply.write(&self.shared.rpc_session_id.as_bytes()[..])?;
+                if self.profile.wire_version().is_some() {
+                    // AOSP `writeByteVector(mId)` = the `&[u8]` path; a bare `i32` is BAD_VALUE.
+                    reply.write(&self.shared.rpc_session_id.as_bytes()[..])?;
+                } else {
+                    // android-12 `writeInt32(id)`, an id only an `RpcServer` mints.
+                    let id = self.shared.r34_session_id.load(Ordering::SeqCst);
+                    if id == RPC_SESSION_ID_NEW {
+                        let status = StatusCode::UnknownTransaction.into();
+                        return self.send_reply(status, &[], &[], &[]);
+                    }
+                    reply.write(&id)?;
+                }
                 self.send_reply(0, reply.rpc_data_bytes(), &[], &[])
             }
             // android-13+ fixes the mode in the header (AOSP); a flip races other slots' reads.
@@ -3803,6 +4142,20 @@ impl RpcSessionInner {
             }
             None => self.send_reply(StatusCode::UnknownTransaction.into(), &[], &[], &[]),
         }
+    }
+}
+
+/// How a serve loop's failed read ends it.
+fn recv_end_reason(e: RpcError) -> EndReason {
+    match e {
+        RpcError::EndOfStream => EndReason::EndOfStream,
+        RpcError::UncleanEndOfStream => EndReason::UncleanEndOfStream,
+        RpcError::DeadlineMidFrame => EndReason::DeadlineMidFrame,
+        // The kernel's `ETIMEDOUT`: a lost connection, not an idle eviction.
+        RpcError::Io(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            EndReason::Frame(StatusCode::DeadObject)
+        }
+        e => EndReason::Frame(e.into()),
     }
 }
 
@@ -3867,8 +4220,38 @@ impl RpcSession {
     /// (`?profile=android13plus`,
     /// `RpcClientConfig::incoming_connections`); the r34 profile has
     /// no such mechanism.
+    ///
+    /// # Preamble
+    ///
+    /// The session speaks the android-12 r34 wire, which opens every
+    /// connection with the client's `int32` session id (AOSP
+    /// `RpcSession::setupOneSocketConnection`). An `Initiator` writes `-1`
+    /// (a new session) here, before the session exists, so a transport with
+    /// no raw byte access fails this call with [`RpcError::Protocol`]. An
+    /// `Acceptor` does not block here: its first
+    /// [`serve_blocking`](Self::serve_blocking) read takes the id and accepts
+    /// only `-1`. Any other id asks to join a session this endpoint does not
+    /// have — joining needs an [`RpcServer`](super::RpcServer) — and ends the
+    /// session.
     pub fn new(transport: Box<dyn RpcTransport>, space: AddressSpace) -> RpcResult<RpcSession> {
-        // Default = the AOSP android-12 r34 wire.
+        match space {
+            AddressSpace::Initiator => {
+                transport.send_raw(&R34Codec.encode_session_preamble(RPC_SESSION_ID_NEW))?;
+                Self::new_accepted(transport, space)
+            }
+            AddressSpace::Acceptor => {
+                let session = Self::new_accepted(transport, space)?;
+                session.inner.awaits_preamble.store(true, Ordering::SeqCst);
+                Ok(session)
+            }
+        }
+    }
+
+    /// An r34 session whose preamble is already past: written by `new`, or read by `RpcServer`.
+    pub(crate) fn new_accepted(
+        transport: Box<dyn RpcTransport>,
+        space: AddressSpace,
+    ) -> RpcResult<RpcSession> {
         RpcSession::with_profile(transport, space, WireProfile::R34(R34Codec))
     }
 
@@ -3897,6 +4280,7 @@ impl RpcSession {
             fd_mode: AtomicU8::new(FD_MODE_NONE),
             fd_unix_supported: AtomicBool::new(false),
             rpc_session_id: gen_rpc_session_id()?,
+            r34_session_id: AtomicI32::new(RPC_SESSION_ID_NEW),
             server_session_id: Mutex::new(None),
             lifecycle: SessionLifecycle::new(),
             ended_locally: AtomicBool::new(false),
@@ -3942,6 +4326,7 @@ impl RpcSession {
             incoming_threads: Mutex::new(Vec::new()),
             incoming_live: AtomicUsize::new(0),
             incoming_joined: AtomicUsize::new(0),
+            awaits_preamble: AtomicBool::new(false),
         });
         inner.arm_liveness(&*armed);
         // Detached reaper for deferred DEC_STRONG; exits when the inner drops its sender.
@@ -4081,10 +4466,10 @@ impl RpcSession {
     /// highest `RPC_WIRE_PROTOCOL_VERSION` to offer (0 = android-13,
     /// 1 = android-14/15, 2 = android-16).
     ///
-    /// Requires a transport with raw byte access (every built-in backend
-    /// but the frame-only `mem`, which fails the handshake: its raw-byte
-    /// refusal crosses the `std::io` bridge as an unclassified I/O error
-    /// and reaches the caller as [`StatusCode::Unknown`]). The default [`RpcSession::new`] /
+    /// Requires a transport with raw byte access (every built-in backend;
+    /// a frame-only transport of the caller's fails the handshake: its
+    /// raw-byte refusal crosses the `std::io` bridge as an unclassified I/O
+    /// error and reaches the caller as [`StatusCode::Unknown`]). The default [`RpcSession::new`] /
     /// [`RpcSession::setup_unix_client`] keep the r34 wire — this never
     /// changes the R34 path (AOSP android-12 layout).
     pub fn connect_android13plus(
@@ -4282,6 +4667,11 @@ impl RpcSession {
     /// A client session keeps the first id it reads: an attach on it
     /// must echo exactly that id (AOSP attaches with its own `mId`), and
     /// one that has not read it yet makes this round trip itself.
+    ///
+    /// On the r34 wire the id is android-12's `int32` (`writeInt32(id)`),
+    /// returned as its 4 little-endian bytes. Only a session an
+    /// [`RpcServer`](super::RpcServer) accepted has one; any other r34 peer
+    /// answers [`StatusCode::UnknownTransaction`].
     pub fn get_session_id(&self) -> Result<Vec<u8>> {
         let data = Parcel::new();
         let mut reply = self
@@ -4294,7 +4684,11 @@ impl RpcSession {
             )?
             .ok_or(StatusCode::UnexpectedNull)?;
         // Keep the read error: BadValue/BadType on a malformed vector differs from a null reply.
-        let id = reply.read::<Vec<u8>>()?;
+        let id = if self.inner.profile.wire_version().is_some() {
+            reply.read::<Vec<u8>>()?
+        } else {
+            reply.read::<i32>()?.to_le_bytes().to_vec()
+        };
         if self.inner.shared.space() == AddressSpace::Initiator {
             let mut kept = self.server_id_lock();
             if kept.is_none() {
@@ -5725,6 +6119,13 @@ impl RpcSession {
         self.inner.slot_count()
     }
 
+    /// Test/diagnostic, not a stable API: `HELD_DEC_STRONG_LIMIT` ("Deferred `DEC_STRONG`").
+    #[cfg(feature = "test-util")]
+    #[doc(hidden)]
+    pub fn __held_dec_strong_limit() -> usize {
+        HELD_DEC_STRONG_LIMIT
+    }
+
     /// Test/diagnostic: incoming-connection threads whose `JoinHandle`
     /// this session still holds. `close_session` takes the whole set before
     /// joining any of it, so this drops to zero the moment `close_session`
@@ -6489,6 +6890,57 @@ mod tests {
         );
     }
 
+    /// A oneway pin holds a bounded number of addresses; past it the `DEC_STRONG` goes out there.
+    #[test]
+    fn a_oneway_pin_holds_a_bounded_number_of_addresses() {
+        use super::super::transport::UnixTransport;
+        // Server side with no callback connection: a oneway handler's `DEC_STRONG`s are held.
+        let (t0, peer) = UnixTransport::pair().expect("socketpair");
+        let session = RpcSession::from_android13plus(
+            Box::new(t0),
+            Android13PlusCodec::android14_15(),
+            FD_MODE_NONE,
+            false,
+        )
+        .expect("build session");
+        let inner = &*session.inner;
+        let slot_id = RpcSession::FOUNDING_SLOT_ID;
+        let sess_ptr = inner as *const RpcSessionInner as usize;
+        DRIVING.with(|d| d.borrow_mut().push((sess_ptr, slot_id)));
+        let held = || {
+            let st = inner.conn_state.lock().expect("conn_state");
+            st.slots
+                .iter()
+                .find(|s| s.id == slot_id)
+                .map(|s| s.pending_dec.len())
+        };
+
+        let mut counter = 0;
+        for _ in 0..HELD_DEC_STRONG_LIMIT {
+            inner.send_dec_strong(RpcAddress::unique(&mut counter, AddressSpace::Initiator), 1);
+        }
+        assert_eq!(held(), Some(HELD_DEC_STRONG_LIMIT));
+        inner.send_dec_strong(RpcAddress::unique(&mut counter, AddressSpace::Initiator), 1);
+        DRIVING.with(|d| d.borrow_mut().pop());
+
+        assert_eq!(
+            held(),
+            Some(HELD_DEC_STRONG_LIMIT),
+            "the extra address is not held"
+        );
+        peer.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("peer timeout");
+        let mut buf = [0u8; 64];
+        assert!(
+            peer.recv_raw(&mut buf).expect("the DEC_STRONG frame") > 0,
+            "it went out on the pin"
+        );
+        assert!(
+            !inner.shared.lifecycle.is_torn_down(),
+            "the session stays up"
+        );
+    }
+
     /// The callback-slot cap (checked and pushed under one `conn_state` lock) refuses past it.
     #[test]
     fn callback_slot_cap_is_enforced() {
@@ -6536,8 +6988,9 @@ mod tests {
             .expect("build session");
         let base = session.inner.slot_count();
 
-        // `mem` has no raw byte stream, so the `"cci"` write fails: the case under test.
-        let (t, _p) = MemTransport::pair();
+        // The peer is gone, so the `"cci"` write fails: the case under test.
+        let (t, p) = MemTransport::pair();
+        drop(p);
         assert!(
             session
                 .add_callback_slot_and_init(Box::new(t), 2, &codec)
@@ -6994,6 +7447,153 @@ mod tests {
         client.close_session();
     }
 
+    /// An r34 client's first bytes, as android-12 `RpcServer::establishConnection` and
+    /// `RpcState::rpcRec` read them: the `-1` session id, then `GET_ROOT` with no length prefix.
+    #[test]
+    fn r34_client_opens_with_the_preamble_and_an_unprefixed_get_root() {
+        let (session, mut peer) = r34_client_with_raw_peer();
+        session.set_timeout(Some(Duration::from_secs(5)));
+        let call = std::thread::spawn(move || session.get_root().map(|_| ()));
+        let mut got = [0u8; 4 + 16 + 64];
+        std::io::Read::read_exact(&mut peer, &mut got).expect("the client's first bytes");
+        let mut want = vec![0xff; 4]; // RPC_SESSION_ID_NEW
+        want.extend_from_slice(&[0, 0, 0, 0]); // RpcWireHeader.command = TRANSACT
+        want.extend_from_slice(&[64, 0, 0, 0]); // bodySize
+        want.extend_from_slice(&[0; 8]); // reserved
+        want.extend_from_slice(&[0; 32]); // RpcWireTransaction.address (special)
+        want.extend_from_slice(&[0, 0, 0, 0]); // code = RPC_SPECIAL_TRANSACT_GET_ROOT
+        want.extend_from_slice(&[0; 4 + 8 + 16]); // flags, asyncNumber, reserved
+        assert_eq!(got.to_vec(), want);
+        drop(peer);
+        assert!(call.join().expect("caller").is_err(), "the peer closed");
+    }
+
+    /// An r34 acceptor reads the preamble, then AOSP-framed messages; `GET_ROOT` with no root
+    /// is a null binder (`flattenBinder` writes `0`).
+    #[test]
+    fn r34_acceptor_takes_the_preamble_then_unprefixed_messages() {
+        use super::super::transport::UnixTransport;
+        let (a, peer) = UnixTransport::pair().expect("socketpair");
+        let server = RpcSession::new(Box::new(a), AddressSpace::Acceptor).expect("session");
+        let serving = std::thread::spawn(move || server.serve_blocking());
+        let get_root = R34Codec
+            .encode_transact(&WireTransaction {
+                address: RpcAddress::zero(),
+                code: SpecialTransaction::GetRoot.code(),
+                ..WireTransaction::default()
+            })
+            .expect("GET_ROOT");
+        peer.send_raw(&(-1i32).to_le_bytes()).expect("preamble");
+        peer.send_raw(&get_root).expect("GET_ROOT");
+        let reply = read_aosp_message(&mut RawTransportIo(&peer)).expect("reply");
+        match R34Codec.decode_message(&reply).expect("decode") {
+            WireMessage::Reply(r) => {
+                assert_eq!(r.status, 0);
+                // Null, then `UNDECLARED` as an android-12 `Category`.
+                assert_eq!(r.data, [0, 0, 0, 0, 1, 0, 0, 0]);
+            }
+            other => panic!("expected a REPLY, got {other:?}"),
+        }
+        drop(peer);
+        assert_eq!(
+            serving.join().expect("serve").reason,
+            EndReason::EndOfStream
+        );
+    }
+
+    /// An android-12 `GET_ROOT` reply, built by hand: the root binder becomes a proxy and its
+    /// stability is consumed. A `Category` of version 0 is refused after the binder entered, so
+    /// its receipt goes back as a `DEC_STRONG` (AOSP `finishUnflattenBinder` runs after
+    /// `onBinderEntering`).
+    #[test]
+    fn r34_client_reads_an_aosp12_root_reply() {
+        let addr = [0x5a_u8; RPC_ADDR_LEN];
+        for (stability, accepted) in [(0x0c00_0001_i32, true), (0x0c00_0000, false)] {
+            let (session, mut peer) = r34_client_with_raw_peer();
+            session.set_timeout(Some(Duration::from_secs(5)));
+            peer.set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("peer read timeout");
+            let inner = Arc::clone(&session.inner);
+            let call = std::thread::spawn(move || {
+                let mut reply = inner
+                    .client_transact(
+                        RpcAddress::zero(),
+                        SpecialTransaction::GetRoot.code(),
+                        &Parcel::new(),
+                        0,
+                    )?
+                    .ok_or(StatusCode::UnexpectedNull)?;
+                let root = reply.read::<SIBinder>();
+                let at_end = reply.data_position() == reply.data_size();
+                root.map(|_| at_end)
+            });
+            assert_eq!(
+                read_r34_session_preamble(&mut peer).expect("preamble"),
+                RPC_SESSION_ID_NEW
+            );
+            read_aosp_message(&mut peer).expect("GET_ROOT");
+            let mut data = 1i32.to_le_bytes().to_vec();
+            data.extend_from_slice(&addr);
+            data.extend_from_slice(&stability.to_le_bytes());
+            let reply = R34Codec
+                .encode_reply(&WireReply {
+                    status: 0,
+                    data,
+                    ..WireReply::default()
+                })
+                .expect("reply");
+            std::io::Write::write_all(&mut peer, &reply).expect("reply");
+            let got = call.join().expect("caller");
+            if accepted {
+                assert_eq!(got, Ok(true), "a proxy, and the cursor past the stability");
+            } else {
+                assert_eq!(got, Err(StatusCode::BadType), "stability {stability:#x}");
+                let release = read_aosp_message(&mut peer).expect("the refused root's release");
+                match R34Codec.decode_message(&release).expect("decode") {
+                    WireMessage::DecStrong(a, 1) => assert_eq!(*a.as_wire_bytes(), addr),
+                    other => panic!("expected a DEC_STRONG, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// Only an `RpcServer` mints an r34 id, so a bare acceptor answers `GET_SESSION_ID` as an
+    /// unknown transaction rather than with an id no connection could join.
+    #[test]
+    fn a_bare_r34_acceptor_has_no_session_id() {
+        use super::super::transport::MemTransport;
+        let (a, b) = MemTransport::pair();
+        let server = RpcSession::new(Box::new(a), AddressSpace::Acceptor).expect("server");
+        let serving = std::thread::spawn(move || server.serve_blocking());
+        let client = RpcSession::new(Box::new(b), AddressSpace::Initiator).expect("client");
+        client.set_timeout(Some(Duration::from_secs(5)));
+        assert_eq!(client.get_session_id(), Err(StatusCode::UnknownTransaction));
+        client.close_session();
+        assert!(
+            serving.join().expect("serve").is_clean(),
+            "the client closed"
+        );
+    }
+
+    /// A preamble other than `-1` asks to join a session a bare acceptor does not have; a
+    /// length-prefixed (pre-AOSP-framing rsbinder) client's first word reads as one.
+    #[test]
+    fn r34_acceptor_refuses_any_preamble_but_new() {
+        use super::super::transport::UnixTransport;
+        for first in [5i32.to_le_bytes(), 80u32.to_le_bytes()] {
+            let (a, peer) = UnixTransport::pair().expect("socketpair");
+            let server = RpcSession::new(Box::new(a), AddressSpace::Acceptor).expect("session");
+            peer.send_raw(&first).expect("preamble");
+            let end = server.serve_blocking();
+            assert!(
+                matches!(end.reason, EndReason::Frame(_)),
+                "refused, got {:?}",
+                end.reason
+            );
+            assert_eq!(peer.recv_raw(&mut [0u8; 4]).expect("closed"), 0);
+        }
+    }
+
     /// An r34 peer without the extension (AOSP libbinder) answers `UNKNOWN_TRANSACTION`: `None`.
     #[test]
     fn r34_get_fd_mode_unknown_to_the_peer_negotiates_none() {
@@ -7002,7 +7602,10 @@ mod tests {
         let client = RpcSession::new(Box::new(a), AddressSpace::Initiator).expect("session");
         client.set_timeout(Some(Duration::from_secs(5)));
         let answering = std::thread::spawn(move || {
-            let frame = peer.recv_frame().expect("GET_FD_MODE");
+            let mut io = RawTransportIo(&peer);
+            let id = read_r34_session_preamble(&mut io).expect("preamble");
+            assert_eq!(id, RPC_SESSION_ID_NEW);
+            let frame = read_aosp_message(&mut io).expect("GET_FD_MODE");
             match R34Codec.decode_message(&frame).expect("decode") {
                 WireMessage::Transact(t) => {
                     assert_eq!(t.code, SpecialTransaction::GetFdMode.code())
@@ -7014,7 +7617,7 @@ mod tests {
                 ..WireReply::default()
             };
             let reply = R34Codec.encode_reply(&reply).expect("encode");
-            peer.send_frame(&reply).expect("reply");
+            peer.send_raw(&reply).expect("reply");
             peer
         });
         assert_eq!(
@@ -7521,6 +8124,9 @@ mod tests {
             fn describe(&self) -> &str {
                 "recorder"
             }
+            fn send_raw(&self, _: &[u8]) -> RpcResult<()> {
+                Ok(())
+            }
             fn set_write_timeout(&self, t: Option<Duration>) -> RpcResult<()> {
                 self.0.send.lock().unwrap().push(t);
                 Ok(())
@@ -7582,6 +8188,9 @@ mod tests {
             }
             fn describe(&self) -> &str {
                 "held"
+            }
+            fn send_raw(&self, _: &[u8]) -> RpcResult<()> {
+                Ok(())
             }
             // The hook: the first arm holds here, its value already read, until released.
             fn set_write_timeout(&self, t: Option<Duration>) -> RpcResult<()> {
@@ -7665,6 +8274,9 @@ mod tests {
             }
             fn describe(&self) -> &str {
                 "closing"
+            }
+            fn send_raw(&self, _: &[u8]) -> RpcResult<()> {
+                Ok(())
             }
             fn set_write_timeout(&self, t: Option<Duration>) -> RpcResult<()> {
                 self.0.send.lock().unwrap().push(t);
@@ -7755,6 +8367,267 @@ mod tests {
             "a send deadline, mid-frame"
         );
         assert!(session.inner.shared.lifecycle.is_torn_down());
+    }
+
+    /// Only a `DEC_STRONG` may arrive while a transaction's send waits (AOSP `CONTROL_ONLY`).
+    #[test]
+    fn a_request_or_reply_read_while_a_send_waits_ends_the_session() {
+        use super::super::transport::UnixTransport;
+        let txn = R34Codec
+            .encode_transact_ref(WireTransactionRef {
+                address: &RpcAddress::zero(),
+                code: 1,
+                flags: FLAG_ONEWAY,
+                async_number: 0,
+                data: &[],
+                object_positions: &[],
+            })
+            .expect("TRANSACT");
+        let reply = R34Codec
+            .encode_reply_ref(WireReplyRef {
+                status: 0,
+                data: &[],
+                object_positions: &[],
+            })
+            .expect("REPLY");
+        for (frame, want) in [(txn, StatusCode::BadType), (reply, StatusCode::DeadObject)] {
+            let (a, peer) = UnixTransport::pair().expect("socketpair");
+            let session = RpcSession::new(Box::new(a), AddressSpace::Initiator).expect("session");
+            // Written before the send and never followed by a read of ours.
+            peer.send_raw(&frame).expect("peer frame");
+            let sent = oneway_past_the_buffer(&session).expect("the send must stop at the frame");
+            assert_eq!(sent, Err(want));
+            assert!(session.inner.shared.lifecycle.is_torn_down());
+        }
+    }
+
+    /// r34 judges a drained message by its header too: a body that never comes holds nothing.
+    #[test]
+    fn an_r34_drained_header_is_refused_before_its_body() {
+        for (command, body_size, want) in [
+            (0, 1000, StatusCode::BadType),
+            (1, 1000, StatusCode::DeadObject),
+            // r34's `DEC_STRONG` body is the 32-byte address alone.
+            (2, 16, StatusCode::BadValue),
+            (2, A13_DEC_STRONG_LEN as u32, StatusCode::BadValue),
+            (9, RPC_ADDR_LEN as u32, StatusCode::DeadObject),
+        ] {
+            let (session, mut peer) = r34_client_with_raw_peer();
+            std::io::Write::write_all(&mut peer, &a13_header(command, body_size)).expect("header");
+            let sent = oneway_past_the_buffer(&session)
+                .unwrap_or_else(|| panic!("command {command}: the send waited for the body"));
+            assert_eq!(sent, Err(want), "command {command}, body {body_size}");
+            assert!(session.inner.shared.lifecycle.is_torn_down());
+        }
+    }
+
+    /// An r34 client session whose peer is a raw socket the test scripts; the preamble is unread.
+    fn r34_client_with_raw_peer() -> (RpcSession, std::os::unix::net::UnixStream) {
+        use super::super::transport::UnixTransport;
+        use std::os::unix::net::UnixStream;
+        let (client_fd, peer_fd) = unix_socketpair_fd();
+        let session = RpcSession::new(
+            Box::new(UnixTransport::from_stream(UnixStream::from(client_fd)).expect("transport")),
+            AddressSpace::Initiator,
+        )
+        .expect("session");
+        (session, UnixStream::from(peer_fd))
+    }
+
+    /// An 8 MiB oneway from another thread, far past any socket buffer; `None` if still sending.
+    fn oneway_past_the_buffer(session: &RpcSession) -> Option<Result<()>> {
+        let mut data = Parcel::new();
+        data.write(&vec![0u8; 8 << 20]).expect("payload");
+        let (tx, rx) = mpsc::channel();
+        let inner = Arc::clone(&session.inner);
+        std::thread::spawn(move || {
+            let r = inner.client_transact(RpcAddress::zero(), 1, &data, FLAG_ONEWAY);
+            let _ = tx.send(r.map(|_| ()));
+        });
+        let sent = rx.recv_timeout(Duration::from_secs(10)).ok();
+        if sent.is_none() {
+            // Unblocks the sender, so a failing run does not leave it parked.
+            session.close_session();
+        }
+        sent
+    }
+
+    /// An android-13+ client session whose peer is a raw socket the test scripts.
+    fn a13_client_with_raw_peer() -> (RpcSession, std::os::unix::net::UnixStream) {
+        use super::super::transport::UnixTransport;
+        use std::os::unix::net::UnixStream;
+        let (client_fd, peer_fd) = unix_socketpair_fd();
+        let session = RpcSession::with_profile(
+            Box::new(UnixTransport::from_stream(UnixStream::from(client_fd)).expect("transport")),
+            AddressSpace::Initiator,
+            WireProfile::Android13Plus(Android13PlusCodec::with_version(PROTOCOL_V2).expect("v2")),
+        )
+        .expect("session");
+        (session, UnixStream::from(peer_fd))
+    }
+
+    /// A 16-byte `RpcWireHeader` announcing `body_size` bytes that never follow.
+    fn a13_header(command: u32, body_size: u32) -> [u8; 16] {
+        let mut h = [0u8; 16];
+        h[..4].copy_from_slice(&command.to_le_bytes());
+        h[4..8].copy_from_slice(&body_size.to_le_bytes());
+        h
+    }
+
+    /// android-13+ judges a drained message by its header: a body that never comes holds nothing.
+    #[test]
+    fn a_drained_header_is_refused_before_its_body() {
+        for (command, body_size, want) in [
+            (0, 1000, StatusCode::BadType),
+            (1, 1000, StatusCode::DeadObject),
+            (2, 1000, StatusCode::BadValue),
+            (9, 1000, StatusCode::DeadObject),
+        ] {
+            let (session, mut peer) = a13_client_with_raw_peer();
+            std::io::Write::write_all(&mut peer, &a13_header(command, body_size)).expect("header");
+            let sent = oneway_past_the_buffer(&session)
+                .unwrap_or_else(|| panic!("command {command}: the send waited for the body"));
+            assert_eq!(sent, Err(want), "command {command}");
+            assert!(session.inner.shared.lifecycle.is_torn_down());
+        }
+    }
+
+    /// A drained message cut short fails the send at the send deadline instead of never.
+    #[test]
+    fn a_peer_that_stalls_inside_a_drained_message_fails_the_send_at_its_deadline() {
+        let (session, mut peer) = a13_client_with_raw_peer();
+        session.set_timeout(Some(Duration::from_millis(300)));
+        let len = crate::rpc::wire_android13::A13_DEC_STRONG_LEN as u32;
+        let half = &a13_header(2, len)[..8];
+        std::io::Write::write_all(&mut peer, half).expect("half a header");
+        let sent = oneway_past_the_buffer(&session).expect("the send must end at its deadline");
+        assert_eq!(sent, Err(StatusCode::TimedOut));
+        assert!(session.inner.shared.lifecycle.is_torn_down());
+    }
+
+    /// A failed send ends the session first, so no drained release follows the cut frame.
+    #[test]
+    fn a_failed_send_writes_no_drained_release_after_its_cut_frame() {
+        let (session, mut peer) = a13_client_with_raw_peer();
+        let codec = Android13PlusCodec::with_version(PROTOCOL_V2).expect("v2");
+        let mut counter = 0;
+        let pay = codec
+            .encode_dec_strong(&RpcAddress::unique(&mut counter, AddressSpace::Acceptor), 1)
+            .expect("a frame")
+            .0;
+        let Ok(WireMessage::DecStrong(addr, _)) = codec.decode_message(&pay) else {
+            panic!("a DEC_STRONG");
+        };
+        {
+            // A proxy of the peer's `addr` dropped while a send of it is unpaid: its release waits.
+            let mut st = session.inner.shared.state.lock().expect("state");
+            st.on_proxy_leaving(addr);
+            assert_eq!(st.release_proxy(&addr, std::ptr::null()), 0);
+        }
+        // Armed before the session can end: macOS refuses `SO_RCVTIMEO` once the peer closed.
+        peer.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("peer timeout");
+        std::io::Write::write_all(&mut peer, &pay).expect("payment");
+        std::io::Write::write_all(&mut peer, &a13_header(0, 1000)).expect("TRANSACT header");
+
+        let sent = oneway_past_the_buffer(&session).expect("the send must end at the TRANSACT");
+        assert_eq!(sent, Err(StatusCode::BadType));
+        assert!(session.inner.shared.lifecycle.is_torn_down());
+        let mut written = Vec::new();
+        std::io::Read::read_to_end(&mut peer, &mut written).expect("to the session's end");
+        let (release, _) = codec.encode_dec_strong(&addr, 1).expect("a frame");
+        assert!(
+            !written.windows(release.len()).any(|w| w == release),
+            "the release followed the cut frame"
+        );
+    }
+
+    /// A peer that closes while a send waits is `DeadObject` with or without a send deadline.
+    #[test]
+    fn a_peer_that_closes_while_a_send_waits_is_a_dead_object() {
+        use super::super::transport::UnixTransport;
+        for timeout in [None, Some(Duration::from_secs(5))] {
+            let (a, peer) = UnixTransport::pair().expect("socketpair");
+            let session = RpcSession::new(Box::new(a), AddressSpace::Initiator).expect("session");
+            session.set_timeout(timeout);
+            let closer = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                drop(peer);
+            });
+            let sent = oneway_past_the_buffer(&session).expect("the send must end at the close");
+            closer.join().expect("closer");
+            assert_eq!(sent, Err(StatusCode::DeadObject), "timeout {timeout:?}");
+            assert!(session.inner.shared.lifecycle.is_torn_down());
+        }
+    }
+
+    /// A deadline guard sets back what it replaced: an enclosing guard's value, else the baseline.
+    #[test]
+    fn a_deadline_guard_restores_the_deadline_it_replaced() {
+        #[derive(Default)]
+        struct Rec {
+            read: Mutex<Option<Duration>>,
+            closed: AtomicBool,
+        }
+        impl RpcTransport for Rec {
+            fn send_frame(&self, _: &[u8]) -> RpcResult<()> {
+                Ok(())
+            }
+            fn recv_frame(&self) -> RpcResult<Vec<u8>> {
+                Err(RpcError::EndOfStream)
+            }
+            fn peer_identity(&self) -> PeerIdentity {
+                PeerIdentity::Anonymous
+            }
+            fn describe(&self) -> &str {
+                "rec"
+            }
+            fn shutdown(&self) -> RpcResult<()> {
+                Ok(())
+            }
+            // As XNU: `SO_RCVTIMEO` on a socket shut both ways is `EINVAL`.
+            fn set_read_timeout(&self, t: Option<Duration>) -> RpcResult<()> {
+                if self.closed.load(Ordering::SeqCst) {
+                    return Err(RpcError::Io(std::io::Error::from_raw_os_error(22)));
+                }
+                *self.read.lock().unwrap() = t;
+                Ok(())
+            }
+            fn peer_closed(&self) -> Option<bool> {
+                Some(self.closed.load(Ordering::SeqCst))
+            }
+        }
+        let t = Rec::default();
+        let now = || *t.read.lock().unwrap();
+        let ms = Duration::from_millis;
+        let baseline = Some(ms(900));
+        {
+            let _reply = ReplyDeadlineGuard::arm(&t, Some(ms(100)), baseline).expect("outer");
+            {
+                // A reentrant send's drain inside the outer reply wait.
+                let _drain = ReplyDeadlineGuard::arm(&t, Some(ms(200)), baseline).expect("inner");
+                assert_eq!(now(), Some(ms(200)));
+            }
+            assert_eq!(
+                now(),
+                Some(ms(100)),
+                "the outer reply wait keeps its deadline"
+            );
+            {
+                let _nested = NestedDeadlineGuard::lift(&t, Some(ms(100))).expect("lift");
+                assert_eq!(now(), None);
+                drop(ReplyDeadlineGuard::arm(&t, Some(ms(200)), baseline).expect("inner"));
+                assert_eq!(now(), None, "the nested dispatch keeps its lifted deadline");
+            }
+            assert_eq!(now(), Some(ms(100)));
+        }
+        assert_eq!(now(), baseline);
+        t.closed.store(true, Ordering::SeqCst);
+        drop(ReplyDeadlineGuard::arm(&t, Some(ms(100)), baseline).expect("closed peer: skipped"));
+        drop(NestedDeadlineGuard::lift(&t, Some(ms(100))).expect("closed peer: skipped"));
+        t.closed.store(false, Ordering::SeqCst);
+        assert_eq!(now(), baseline);
+        ARMED_READ.with(|a| assert!(a.borrow().is_empty(), "every record is dropped"));
     }
 
     /// A slow but steady reader is not cut: the deadline bounds each wait, not the whole send.
@@ -8276,9 +9149,9 @@ mod tests {
         let idle = Duration::from_millis(400);
         let (session, slots, peers) = idle_serve_slots(idle, 1);
         let ends = serve_all(&session, &slots);
-        let frame: Vec<u8> = Android13PlusCodec::android14_15()
+        let (frame, _) = Android13PlusCodec::android14_15()
             .encode_dec_strong(&RpcAddress::zero(), 1)
-            .concat();
+            .expect("a frame");
         // A `DEC_STRONG` opens no call: only its bytes are activity. 32 bytes, two at a time.
         for pair in frame.chunks(2) {
             peers[1].send_raw(pair).expect("trickle");
@@ -8299,9 +9172,10 @@ mod tests {
         let ends = serve_all(&session, &slots);
         let codec = Android13PlusCodec::android14_15();
         for _ in 0..12 {
-            for frame in codec.encode_dec_strong(&RpcAddress::zero(), 1) {
-                peers[1].send_raw(&frame).expect("a frame");
-            }
+            let (frame, _) = codec
+                .encode_dec_strong(&RpcAddress::zero(), 1)
+                .expect("a frame");
+            peers[1].send_raw(&frame).expect("a frame");
             std::thread::sleep(idle / 4);
         }
         assert!(
@@ -8323,6 +9197,9 @@ mod tests {
                 self.0.send_frame(buf)
             }
             fn recv_frame(&self) -> RpcResult<Vec<u8>> {
+                self.0.recv_frame()
+            }
+            fn recv_raw(&self, _: &mut [u8]) -> RpcResult<usize> {
                 let session = self.1.lock().unwrap().upgrade();
                 if let Some(inner) = session {
                     inner.fail_session();
@@ -8374,9 +9251,12 @@ mod tests {
             fn send_frame(&self, _: &[u8]) -> RpcResult<()> {
                 Err(RpcError::EndOfStream)
             }
-            // The stream backends' own framing reader, so its timeout split is what is tested.
             fn recv_frame(&self) -> RpcResult<Vec<u8>> {
                 crate::rpc::transport::read_frame(&mut Etimedout)
+            }
+            // A socket backend's raw read, so the session reader's timeout split is what is tested.
+            fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize> {
+                std::io::Read::read(&mut Etimedout, buf).map_err(RpcError::from)
             }
             fn peer_identity(&self) -> PeerIdentity {
                 PeerIdentity::Anonymous
@@ -8541,6 +9421,87 @@ mod tests {
             0,
             "the unsent parcel's drop gives the bump back"
         );
+    }
+
+    /// A session with no live peer, for parcel-level wire tests.
+    fn parcel_session(profile: WireProfile) -> RpcSession {
+        let (t, _peer) = crate::rpc::transport::MemTransport::pair();
+        RpcSession::with_profile(Box::new(t), AddressSpace::Acceptor, profile).expect("session")
+    }
+
+    fn a13_v2() -> WireProfile {
+        WireProfile::Android13Plus(Android13PlusCodec::with_version(PROTOCOL_V2).expect("v2"))
+    }
+
+    /// Every wire follows a null binder with an `UNDECLARED` stability, as AOSP `flattenBinder`
+    /// does: android-13+ as the bare level, r34 as the android-12 `Category` (`version` 1).
+    #[test]
+    fn a_null_binder_carries_its_stability_on_every_wire() {
+        for (profile, words) in [
+            (a13_v2(), [0i32, 0]),
+            (WireProfile::R34(R34Codec), [0, 0x0000_0001]),
+        ] {
+            let session = parcel_session(profile);
+            let mut p = Parcel::new();
+            p.attach_rpc_ops(session.inner.parcel_ops());
+            p.write(&None::<SIBinder>).expect("write null");
+            assert_eq!(p.data_size(), words.len() * 4);
+            p.set_data_position(0);
+            for w in words {
+                assert_eq!(p.read::<i32>().expect("word"), w);
+            }
+            p.set_data_position(0);
+            assert!(p.read::<Option<SIBinder>>().expect("read null").is_none());
+            assert_eq!(
+                p.data_position(),
+                p.data_size(),
+                "the stability is consumed"
+            );
+        }
+    }
+
+    /// AOSP `Stability::setRepr` on a null binder's stability; android-12 also wants `version >= 1`.
+    #[test]
+    fn a_null_binder_stability_is_checked_as_aosp_does() {
+        for (profile, stability, want) in [
+            (a13_v2(), 0x0c, Err(StatusCode::BadType)),
+            (
+                WireProfile::R34(R34Codec),
+                0x0c00_0001,
+                Err(StatusCode::BadType),
+            ),
+            (WireProfile::R34(R34Codec), 0, Err(StatusCode::BadType)),
+            // Only the level and `kBinderWireFormatOldest` are checked, not the exact version.
+            (WireProfile::R34(R34Codec), 0x0000_0002, Ok(())),
+        ] {
+            let session = parcel_session(profile);
+            let mut p = Parcel::new();
+            p.attach_rpc_ops(session.inner.parcel_ops());
+            p.write(&0i32).expect("present");
+            p.write(&stability).expect("stability");
+            p.set_data_position(0);
+            assert_eq!(
+                p.read::<Option<SIBinder>>().map(|b| assert!(b.is_none())),
+                want,
+                "stability {stability:#x}"
+            );
+        }
+    }
+
+    /// r34 writes a non-null binder as android-12 does: `1`, the 32-byte address, then the
+    /// `Category` of its stability (System: `0x0c000001`).
+    #[test]
+    fn an_r34_binder_is_followed_by_its_android12_category() {
+        let session = parcel_session(WireProfile::R34(R34Codec));
+        let local = crate::Interface::as_binder(&crate::Binder::new(LocalSvc));
+        let mut p = Parcel::new();
+        p.attach_rpc_ops(session.inner.parcel_ops());
+        p.write(&local).expect("write");
+        assert_eq!(p.data_size(), 4 + RPC_ADDR_LEN + 4);
+        p.set_data_position(0);
+        assert_eq!(p.read::<i32>().expect("present"), 1);
+        p.set_data_position(4 + RPC_ADDR_LEN);
+        assert_eq!(p.read::<i32>().expect("stability"), 0x0c00_0001);
     }
 
     /// One claim at a time: a failed attempt frees the parcel for a retry, a sent one stays sent.

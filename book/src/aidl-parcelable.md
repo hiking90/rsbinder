@@ -135,7 +135,11 @@ When the client passes `None`, the service receives `None` and can return `None`
 
 ## Recursive Structures
 
-AIDL supports self-referential parcelable types. In AOSP-faithful AIDL the recursive field is marked `@nullable(heap=true)`, signalling to the C++ and Java backends that the inner value lives on the heap so the struct has a finite, known size at compile time. rsbinder accepts the same syntax for source compatibility but ignores `heap=true`: it boxes a field whenever that field can reach its own enclosing type by value, which covers a cycle of any length, not only a direct self-reference. A type reached through an interface handle or a `Vec` element keeps the enclosing type finite and is not boxed.
+AIDL supports self-referential parcelable types. Mark the recursive field `@nullable(heap=true)`: the inner value then lives on the heap, so the struct has a finite, known size. As in AOSP's Rust backend, such a field is `Option<Box<T>>` wherever it is, on a cycle or not. `heap=true` is accepted only on a parcelable or union type; on any other type (a `String`, an array, an interface) it is rejected, as AOSP rejects it.
+
+Every cycle needs at least one such field. Once one field on the cycle is boxed, the other fields on it stay inline, as in AOSP: in `parcelable A { @nullable(heap=true) B b; } parcelable B { A a; }`, `A.b` is `Option<Box<B>>` and `B.a` is a plain `A`. A type reached through an interface handle or a `Vec` element keeps the enclosing type finite and closes no cycle. A cycle made only of non-`@nullable` fields or fixed-size arrays (`T[N]`, which store their elements inline) is rejected with `aidl::recursive_parcelable`, because neither form can be boxed.
+
+rsbinder also accepts a bare `@nullable` field (no `heap=true`) that closes a cycle and boxes it, since Rust can represent it. AOSP's `aidl` rejects that `.aidl` as a recursive parcelable, so rsbinder-aidl prints a `cargo:warning` naming the field; add `heap=true` to keep the file buildable in an Android tree.
 
 AIDL definition (from `RecursiveList.aidl` in the test suite):
 
@@ -146,7 +150,7 @@ parcelable RecursiveList {
 }
 ```
 
-This generates a Rust struct where `next` has the type `Option<Box<RecursiveList>>`: `@nullable` makes it `Option`, and the cycle analysis adds the `Box`.
+This generates a Rust struct where `next` has the type `Option<Box<RecursiveList>>`: `@nullable` makes it `Option`, and `heap=true` adds the `Box`.
 
 Rust usage (based on the `test_reverse_recursive_list` test):
 
@@ -173,7 +177,7 @@ for n in 0..10 {
 assert!(current.is_none());
 ```
 
-Without the `Box` indirection the Rust compiler would reject the type definition because `RecursiveList` would need to contain itself directly, leading to an infinite-size type. The code generator inserts that indirection automatically whenever it sees a field whose type matches the enclosing parcelable.
+Without the `Box` indirection the Rust compiler would reject the type definition because `RecursiveList` would need to contain itself directly, leading to an infinite-size type.
 
 ## ExtendableParcelable and ParcelableHolder
 
@@ -315,7 +319,7 @@ The generator rejects, with a diagnostic naming the reason:
 
 - **Use `@RustDerive(PartialEq=true)`** when you need to compare parcelable instances in assertions or business logic. As with `Clone`, all fields must implement `PartialEq`.
 
-- **`@nullable` is what you need on a recursive field, not `heap=true`.** Write `heap=true` for source compatibility with AOSP if you like, but rsbinder-aidl ignores it: the `Box` comes from the generator's own cycle analysis, and the `Option` comes from `@nullable`.
+- **Write `@nullable(heap=true)` on a recursive field.** It gives the field the same `Option<Box<T>>` type AOSP's Rust backend generates, and keeps the `.aidl` accepted by AOSP's `aidl`; a bare `@nullable` there works in rsbinder but draws a warning.
 
 - **Default values in AIDL translate to Rust's `Default` trait.** When you write `int count = 5;` in AIDL, calling `MyParcelable::default()` in Rust will produce a struct with `count` set to `5`.
 

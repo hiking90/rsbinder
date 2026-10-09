@@ -99,7 +99,7 @@ pub(crate) fn render_source(input: &DeriveInput) -> syn::Result<String> {
         type_str::check_type_at(&field.ty, type_str::Place::Field)?;
         let decl = type_str::as_written_in(&field.ty, type_str::Ctx::Parcelable)?;
         // Read only by the `impl Default` that is dropped below.
-        let mut member = ParcelableMember::new(ident, decl, "Default::default()");
+        let mut member = ParcelableMember::new(ident, decl, "::core::default::Default::default()");
         member.deprecated = crate::deprecated_of(&field.attrs)?;
         members.push(member);
     }
@@ -352,6 +352,19 @@ mod tests {
             struct Outer { cfg: self::Config }
         });
         assert!(s.contains("self.r#cfg"), "{s}");
+    }
+
+    /// A `self::` leaf still meets the canonical gate its unqualified spelling meets.
+    #[test]
+    fn a_self_path_field_is_held_to_the_aidl_spelling() {
+        for tokens in [
+            quote! { struct Bad { opt: Option<Vec<self::pair::Pair<Cfg>>> } },
+            quote! { struct Bad { cb: self::Strong<dyn IFoo> } },
+        ] {
+            let input: DeriveInput = syn::parse2(tokens).unwrap();
+            let err = render_source(&input).unwrap_err();
+            assert!(err.to_string().contains("renders this as"), "{err}");
+        }
     }
 
     #[test]

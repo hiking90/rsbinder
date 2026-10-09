@@ -710,8 +710,10 @@ impl RawClient {
     }
 
     fn dec_strong(&mut self, addr: &RpcAddress, amount: u32) {
-        for frame in self.codec.encode_dec_strong(addr, amount) {
-            write_aosp_message(&mut self.stream, &frame).expect("write");
+        if let Some((frame, times)) = self.codec.encode_dec_strong(addr, amount) {
+            for _ in 0..times {
+                write_aosp_message(&mut self.stream, &frame).expect("write");
+            }
         }
     }
 }

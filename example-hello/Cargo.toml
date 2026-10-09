@@ -131,6 +131,18 @@ required-features = ["rpc"]
 name = "rpc_fd_interop_server"
 required-features = ["rpc"]
 
+# Plan 2-25 Phase 7 STAGE3 — the r34 wire against real android-12
+# libbinder on an SDK 31 emulator, both directions. Pairs with
+# cpp/rpc_r34_interop.cpp; cpp/run_rpc_r34_interop.sh builds, pushes and
+# runs them.
+[[bin]]
+name = "rpc_r34_interop_server"
+required-features = ["rpc"]
+
+[[bin]]
+name = "rpc_r34_interop_client"
+required-features = ["rpc"]
+
 # Shared-memory example (plans 4-7a/4-7b/Phase D). Kernel binder needs no
 # feature; pass `rpc` on the command line for the Unix-socket variant
 # (gated inside the binaries on the `rpc` feature):

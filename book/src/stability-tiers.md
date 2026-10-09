@@ -71,7 +71,7 @@ tweaks; wire formats are already locked.
   Feature-gated but **not** Experimental: the emitted code is byte-for-byte
   the `.aidl` code, so the wire is whatever `.aidl` already guarantees. Only
   the Rust-facing spelling is provisional; 0.12.0 narrowed it to what `.aidl`
-  renders and added `#[nonnull]` and `#[deprecated]`. See
+  renders and added `#[deprecated]`. See
   [Interface Macros](./interface-macros.md).
 - **Shared memory (new in 0.11.0)** — `SharedMemory`, `MemoryHeapBase`,
   `MappedHeap`, `MemoryDealer`, `HeapCache`, and the `IMemory` / `IMemoryHeap`

@@ -3,6 +3,7 @@
 
 //! `syn::Type` printed as `TypeGenerator::type_declaration` does: the golden gate compares text.
 
+use rsbinder_aidl::render::{BOX, OPTION, STRING, VEC};
 use syn::{GenericArgument, PathArguments, Type};
 
 /// The expanding macro, so an unsupported-type error names the one the user wrote.
@@ -102,7 +103,7 @@ pub fn as_written_in(ty: &Type, ctx: Ctx) -> syn::Result<String> {
                 if i > 0 || p.path.leading_colon.is_some() {
                     out.push_str("::");
                 }
-                out.push_str(&seg.ident.to_string());
+                out.push_str(&segment_name(&p.path, seg));
                 reject_parenthesized(&seg.arguments)?;
                 if let PathArguments::AngleBracketed(args) = &seg.arguments {
                     let mut rendered = Vec::new();
@@ -127,6 +128,20 @@ pub fn as_written_in(ty: &Type, ctx: Ctx) -> syn::Result<String> {
         }
         other => return Err(syn::Error::new_spanned(other, ctx.unsupported())),
     })
+}
+
+/// A segment as printed: a bare `Option`/`Vec`/`Box`/`String` gets `rsbinder-aidl`'s path,
+/// since the checks here already read those names as std's.
+fn segment_name(path: &syn::Path, seg: &syn::PathSegment) -> String {
+    let bare = path.leading_colon.is_none() && path.segments.len() == 1;
+    let std = match seg.ident.to_string().as_str() {
+        "Option" if bare => OPTION,
+        "Vec" if bare => VEC,
+        "Box" if bare => BOX,
+        "String" if bare => STRING,
+        _ => return seg.ident.to_string(),
+    };
+    std.to_string()
 }
 
 /// The printers walk only `<..>` arguments, so `Fn(i32)` would render as a bare `Fn`.
@@ -220,8 +235,8 @@ pub fn owned(ty: &Type) -> syn::Result<String> {
     let ty = unwrap_group(ty);
     Ok(match ty {
         Type::Reference(r) => match unwrap_group(&r.elem) {
-            Type::Path(p) if p.path.is_ident("str") => "String".to_string(),
-            Type::Slice(s) => format!("Vec<{}>", owned(&s.elem)?),
+            Type::Path(p) if p.path.is_ident("str") => STRING.to_string(),
+            Type::Slice(s) => format!("{VEC}<{}>", owned(&s.elem)?),
             inner => owned(inner)?,
         },
         Type::Path(p) => {
@@ -237,7 +252,7 @@ pub fn owned(ty: &Type) -> syn::Result<String> {
                 if i > 0 || p.path.leading_colon.is_some() {
                     out.push_str("::");
                 }
-                out.push_str(&seg.ident.to_string());
+                out.push_str(&segment_name(&p.path, seg));
                 reject_parenthesized(&seg.arguments)?;
                 if let PathArguments::AngleBracketed(args) = &seg.arguments {
                     let mut rendered = Vec::new();
@@ -260,7 +275,7 @@ pub fn owned(ty: &Type) -> syn::Result<String> {
             }
             out
         }
-        Type::Slice(s) => format!("Vec<{}>", owned(&s.elem)?),
+        Type::Slice(s) => format!("{VEC}<{}>", owned(&s.elem)?),
         other => as_written(other)?,
     })
 }
@@ -296,6 +311,10 @@ pub fn check_type_at(ty: &Type, place: Place) -> syn::Result<()> {
     check_array_elements(ty, place.word())?;
     reject_nested_option(ty)?;
     reject_generic_arg_shape(ty)?;
+    // A signature's `self::`/`Self` is refused anyway, so the advice below must not name one.
+    if !matches!(place, Place::Field) && crate::aidl_shape::shape_of(ty).is_some() {
+        as_written(ty)?;
+    }
     // Last, so a shape with no wire form at all keeps the specific rule's diagnostic.
     crate::aidl_shape::check_canonical(ty, place)
 }
@@ -311,7 +330,7 @@ fn reject_field_references(ty: &Type) -> syn::Result<()> {
     reject_inner_references(ty)
 }
 
-/// `.aidl` boxes only a `@nullable` parcelable field closing a reference cycle, and only there.
+/// `.aidl` boxes only a parcelable field (`@nullable(heap=true)`, or `@nullable` on a cycle).
 fn reject_bare_box(ty: &Type, place: Place) -> syn::Result<()> {
     match cycle_box(ty, place) {
         Some(boxed) => reject_any_box(boxed),
@@ -357,9 +376,10 @@ fn reject_any_box(ty: &Type) -> syn::Result<()> {
     if std_box_arg(ty).is_some() {
         return Err(syn::Error::new_spanned(
             ty,
-            "`.aidl` never renders this `Box` — it boxes only a `@nullable` parcelable field \
-             that closes a reference cycle, as `Option<Box<T>>`, never an argument or a \
-             return, and a call site written against one does not take the other; use `T` \
+            "`.aidl` never renders this `Box` — it boxes only a parcelable field that is \
+             `@nullable(heap=true)` or a `@nullable` one closing a reference cycle, as \
+             `Option<Box<T>>`, never an argument or a return, and a call site written \
+             against one does not take the other; use `T` \
              (a parcelable of your own named `Box` needs a qualified path, such as \
              `crate::…::Box<T>`)",
         ));
@@ -840,11 +860,6 @@ fn lacks_default(ty: &Type) -> bool {
         || named_generic(ty, "Strong").is_some()
 }
 
-/// `&mut Option<T>` over a binder or fd: the spelling `out T` and `out @nullable T` share.
-pub fn out_option_is_ambiguous(ty: &Type) -> bool {
-    option_inner(peel(ty)).is_some_and(lacks_default)
-}
-
 /// The element an out array is sized or defaulted from, through every dimension.
 fn out_array_elem(ty: &Type) -> Option<&Type> {
     let mut elem = option_vec_elem(ty).or_else(|| vec_elem(ty));
@@ -992,6 +1007,32 @@ pub fn check_out_capable(ty: &Type, direction: &str) -> syn::Result<()> {
         "a primitive"
     } else if is_string(named) {
         "`String`"
+    } else if lacks_default(named) {
+        // AOSP `GetArgumentAspect`: `IBinder` and an interface `in` only, a fd `in` or `inout`.
+        let is_pfd = plain_name(named).is_some_and(|n| n == "ParcelFileDescriptor");
+        if is_pfd && direction == "inout" {
+            return Ok(());
+        }
+        let (what, allowed, instead) = if is_pfd {
+            (
+                "a `ParcelFileDescriptor`",
+                "`in` or `inout`",
+                "mark it `#[inout]`, return it, or use an array",
+            )
+        } else {
+            (
+                "a binder object (`IBinder` or an interface)",
+                "only `in`",
+                "return it instead, or use an array or a parcelable",
+            )
+        };
+        return Err(syn::Error::new_spanned(
+            ty,
+            format!(
+                "{what} cannot be an `{direction}` parameter — `.aidl` passes it {allowed}, \
+                 `@nullable` or not; {instead}"
+            ),
+        ));
     } else {
         // Only `out` starts slots empty; `inout` reads them in, fixed-size or not.
         if direction == "out" && out_array_elem(inner).is_some_and(lacks_default) {

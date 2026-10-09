@@ -130,6 +130,11 @@ fn ill_formed_descriptor_is_rejected() {
         ("valu = \"x\"", "Parameter valu not supported"),
         ("", "Missing 'value'"),
         ("value = test.pkg.X", "contains reference to test.pkg.X"),
+        // rsbinder-only: the value is emitted raw into a Rust string literal.
+        (
+            "value = \"a\u{202E}b\"",
+            "bidirectional control character U+202E",
+        ),
     ] {
         let input =
             format!("package test.pkg; @Descriptor({args}) interface IFoo {{ void run(); }}");

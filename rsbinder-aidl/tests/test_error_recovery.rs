@@ -1,8 +1,7 @@
 // Copyright 2025 rsbinder Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Every diagnosable input must return `Err` rather than panic, and the
-//! generator source must stay free of `catch_unwind`.
+//! Diagnosable input returns `Err`, never panics; the generator has no `catch_unwind`.
 
 use rsbinder_aidl::{parse_document, AidlError, Generator, SourceContext};
 use std::path::PathBuf;
@@ -36,16 +35,12 @@ parcelable Foo {
     const byte val = 256u8;
 }
     "#;
-    // Should not panic — either parse error or semantic error
-    let result = std::panic::catch_unwind(|| {
-        let ctx = SourceContext::new("test.aidl", input);
-        let parse_result = parse_document(&ctx);
-        if let Ok(doc) = parse_result {
-            let gen = Generator::new(false, false);
-            let _ = gen.document(&doc);
-        }
-    });
-    assert!(result.is_ok(), "Should not panic on u8 overflow");
+    let ctx = SourceContext::new("test.aidl", input);
+    let err = parse_document(&ctx).expect_err("256u8 must be rejected");
+    assert!(
+        format!("{err:?}").contains("u8 literal overflow"),
+        "{err:?}"
+    );
 }
 
 // u8 boundary value 255 should succeed

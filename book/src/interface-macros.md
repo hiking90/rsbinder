@@ -57,7 +57,6 @@ could be mistaken for one, it is a compile error naming the reason.
 | `x: &Cfg`, `x: &str`, `x: &[T]`, `Option<&T>` — every other `in` type borrows | `in` argument |
 | `x: &mut T` | **`out`** — the server fills the caller's value |
 | `#[inout] x: &mut T` | written **and** read back |
-| `#[nonnull] x: &mut Option<T>` | an `out` binder or fd that is not `@nullable` |
 | `Option<T>` | `@nullable` |
 | `#[oneway]` on a method | no reply; must return `BinderResult<()>` |
 | `#[deprecated]` / `#[deprecated = "…"]` | AIDL's `@deprecated`, on the trait, a method, a `#[derive(Parcelable)]` struct or a field |
@@ -75,10 +74,11 @@ shape with no `.aidl` equivalent is a compile error naming the form to use:
 - A primitive or a `String` cannot be `out` — `.aidl` passes them only `in`,
   and `@nullable` does not change that (`&mut Option<String>` is refused too).
   Return the value, or use a `Vec<T>` or a parcelable.
-- An `out` binder or fd is `&mut Option<_>`, since the callee has no value to
-  start from; bare `&mut Strong<dyn IFoo>` is refused. Add `#[nonnull]` when
-  the `.aidl` form is not `@nullable`, and a `None` left by the service then
-  fails the call with `UNEXPECTED_NULL`.
+- A binder object (`Strong<dyn IFoo>`, `SIBinder`) cannot be `out` or
+  `inout`, and a `ParcelFileDescriptor` cannot be `out`, `Option` or not —
+  AOSP `aidl` refuses them. Return the object, pass the fd `#[inout]`, or use
+  an array, which takes every direction (`out`: `&mut Vec<Option<_>>`,
+  `#[inout]`: `&mut Vec<_>`).
 - A primitive has no null form, so `Option<i32>` is refused; so is
   `Option<Mode>` for a derived enum, which travels as its `repr` scalar.
 - A borrowed type nested inside another (`&[&str]`) has nothing to borrow from

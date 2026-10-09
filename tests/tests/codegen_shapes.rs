@@ -1,9 +1,7 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! End-to-end round trip for the argument shapes the AOSP fixture corpus never
-//! uses (non-nullable `out` binder, `@nullable` primitive arrays, non-nullable
-//! `inout` binder array), so that their codegen is run, not only type-checked.
+//! Runs, not only type-checks, codegen for shapes the AOSP fixture corpus never uses.
 //!
 //! Driven over the RPC transport so the same test runs on Linux, macOS and an
 //! Android device without a kernel binder node. The generated server stub and
@@ -26,14 +24,14 @@ struct ShapesSvc;
 impl Interface for ShapesSvc {}
 
 impl ICodegenShapes for ShapesSvc {
-    fn r#takeOutBinder(
+    fn r#takeOutBinders(
         &self,
         src: &SIBinder,
         fill: bool,
-        dst: &mut Option<SIBinder>,
+        dst: &mut Vec<Option<SIBinder>>,
     ) -> rsbinder::BinderResult<()> {
         if fill {
-            *dst = Some(src.clone());
+            dst.fill(Some(src.clone()));
         }
         Ok(())
     }
@@ -93,29 +91,19 @@ fn run(server_t: Box<dyn RpcTransport>, client_t: Box<dyn RpcTransport>) {
         let shapes = <dyn ICodegenShapes as FromIBinder>::try_from(sib.clone())
             .expect("generated BpCodegenShapes resolves from an RPC binder");
 
-        // A non-nullable `out` binder the service fills comes back.
-        let mut dst = None;
+        // A caller-sized, non-nullable `out` binder array comes back filled.
+        let mut dst = vec![None, None];
         shapes
-            .r#takeOutBinder(&sib, true, &mut dst)
-            .expect("a filled out-binder round-trips");
-        assert!(dst.is_some(), "the out binder must come back");
+            .r#takeOutBinders(&sib, true, &mut dst)
+            .expect("a filled out-binder array round-trips");
+        assert_eq!(dst, vec![Some(sib.clone()), Some(sib.clone())]);
 
-        // Left unset it is UNEXPECTED_NULL from the server, not a null on the
-        // wire that the client silently accepts.
-        let mut dst = Some(sib.clone());
-        let err = shapes
-            .r#takeOutBinder(&sib, false, &mut dst)
-            .expect_err("an unset non-nullable out binder must fail the transaction");
-        assert_eq!(
-            err.exception_code(),
-            ExceptionCode::TransactionFailed,
-            "got: {err:?}"
-        );
-        assert_eq!(
-            err.transaction_error(),
-            rsbinder::StatusCode::UnexpectedNull,
-            "got: {err:?}"
-        );
+        // Unset elements come back null, as AOSP's Rust backend (it guards only fd arrays).
+        let mut dst = vec![Some(sib.clone())];
+        shapes
+            .r#takeOutBinders(&sib, false, &mut dst)
+            .expect("an unset out-binder element is a legal null binder");
+        assert_eq!(dst, vec![None]);
 
         // `@nullable int[]` carries no per-element null marker: a bare
         // `Vec<i32>` on both sides.

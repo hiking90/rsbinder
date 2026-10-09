@@ -156,6 +156,24 @@ fn main() {
         .generate()
         .unwrap();
 
+    // `tests/prelude_shadow.rs`: generated items named `Ok`/`Err`/`Some`/`None`/`Default`.
+    rsbinder_aidl::Builder::new()
+        .source(PathBuf::from("aidl/prelude_shadow/ShadowUnion.aidl"))
+        .source(PathBuf::from("aidl/prelude_shadow/ShadowParcelable.aidl"))
+        .source(PathBuf::from("aidl/prelude_shadow/IShadow.aidl"))
+        .source(PathBuf::from("aidl/prelude_shadow/ShadowTypes.aidl"))
+        .source(PathBuf::from("aidl/prelude_shadow/IShadowTypes.aidl"))
+        .output(PathBuf::from("prelude_shadow.rs"))
+        .generate()
+        .unwrap();
+
+    // `tests/boxed_cycles.rs`: a cycle cut by one boxed field keeps its other fields inline.
+    rsbinder_aidl::Builder::new()
+        .source(PathBuf::from("aidl/boxed_cycles/BoxedCycles.aidl"))
+        .output(PathBuf::from("boxed_cycles.rs"))
+        .generate()
+        .unwrap();
+
     // Plan 10-9 (`tests/transaction_names.rs`): `version`/`hash` stamp the preceding source.
     rsbinder_aidl::Builder::new()
         .source(PathBuf::from("aidl/tracedemo/ITraceDemo.aidl"))

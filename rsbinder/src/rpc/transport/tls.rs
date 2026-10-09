@@ -233,6 +233,18 @@ pub trait TlsStream: Send + Sync {
     fn peer_closed(&self) -> Option<bool> {
         None
     }
+    /// The connected stream socket that `read` and `write` use, for a
+    /// transaction send that reads while it waits
+    /// (`RpcTransport::send_raw_draining`). `TlsTransport` writes that send
+    /// to the socket itself with `MSG_DONTWAIT` (on Apple platforms, by setting
+    /// `O_NONBLOCK` on the socket for the duration of each `send`) and `poll`s it, so the
+    /// socket must carry exactly the bytes `read` and `write` do. The
+    /// default is `None`: such a send then blocks without reading, and a
+    /// peer that writes on the connection meanwhile can stall it. The
+    /// bundled streams return their socket.
+    fn socket(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        None
+    }
 }
 
 // std streams implement `Read`/`Write` for `&Stream`, so `&self` forwards with no lock.
@@ -263,6 +275,10 @@ impl TlsStream for TcpStream {
         use std::os::fd::AsFd;
         super::socket_peer_closed(self.as_fd(), super::SocketKind::TcpOrVsock)
     }
+    fn socket(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        use std::os::fd::AsFd;
+        Some(self.as_fd())
+    }
 }
 
 impl TlsStream for UnixStream {
@@ -289,6 +305,10 @@ impl TlsStream for UnixStream {
         use std::os::fd::AsFd;
         super::socket_peer_closed(self.as_fd(), super::SocketKind::UnixDomain)
     }
+    fn socket(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        use std::os::fd::AsFd;
+        Some(self.as_fd())
+    }
 }
 
 #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
@@ -314,6 +334,10 @@ impl TlsStream for vsock::VsockStream {
     fn peer_closed(&self) -> Option<bool> {
         use std::os::fd::AsFd;
         super::socket_peer_closed(self.as_fd(), super::SocketKind::TcpOrVsock)
+    }
+    fn socket(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        use std::os::fd::AsFd;
+        Some(self.as_fd())
     }
 }
 
@@ -477,6 +501,131 @@ impl TlsTransport {
         Ok(())
     }
 
+    /// `send_raw`'s body; with a socket and `drain`, a waiting send reads (`send_raw_draining`).
+    fn send_records(
+        &self,
+        buf: &[u8],
+        mut draining: Option<(
+            std::os::fd::BorrowedFd<'_>,
+            &mut dyn FnMut() -> RpcResult<()>,
+        )>,
+    ) -> RpcResult<()> {
+        // Refused after our `shutdown` so its `wlock` wait is a handoff (module doc "Shutdown").
+        if self.shut.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(RpcError::EndOfStream);
+        }
+        // Spans encrypt-drain + transmit so wire record order = sequence order (module doc).
+        let _g = self.wlock.lock();
+        // rustls caps buffered plaintext (~64 KiB), so chunk and interleave encrypt + transmit.
+        debug_assert!(!buf.is_empty(), "send_raw with an empty frame");
+        let mut cipher = Vec::new();
+        let mut off = 0;
+        while off < buf.len() {
+            {
+                let mut c = self.conn.lock().expect("tls conn poisoned");
+                let n = c.writer().write(&buf[off..])?;
+                if n == 0 {
+                    const MSG: &str = "rustls accepted no plaintext";
+                    // Past the first chunk the peer holds part of a frame: end the session.
+                    return Err(if off == 0 {
+                        RpcError::Protocol(MSG)
+                    } else {
+                        RpcError::Io(std::io::Error::other(MSG))
+                    });
+                }
+                off += n;
+                cipher.clear();
+                c.write_tls(&mut cipher)?;
+            }
+            match draining.as_mut() {
+                Some((sock, drain)) => self.write_socket_draining(&cipher, *sock, &mut **drain)?,
+                None => self.write_socket_locked(&cipher)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// `write_socket_locked` that hands input to `drain` while the socket is full.
+    fn write_socket_draining(
+        &self,
+        cipher: &[u8],
+        sock: std::os::fd::BorrowedFd<'_>,
+        drain: &mut dyn FnMut() -> RpcResult<()>,
+    ) -> RpcResult<()> {
+        let mut waiting = super::unix::SendWait::new(sock);
+        let mut off = 0;
+        while off < cipher.len() {
+            let rest = &cipher[off..];
+            let sent =
+                super::unix::send_nonblocking(sock, |flags| rustix::net::send(sock, rest, flags));
+            match sent {
+                Ok(0) => return Err(RpcError::EndOfStream),
+                Ok(n) => {
+                    off += n;
+                    waiting.progressed();
+                }
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(rustix::io::Errno::AGAIN) => {
+                    // A send deadline, wherever the record stopped: as `write_socket_locked`.
+                    let expired = || RpcError::Io(std::io::ErrorKind::WouldBlock.into());
+                    if waiting.expired() {
+                        return Err(expired());
+                    }
+                    if self.input_waiting(sock).map_err(super::read_side_failure)? {
+                        drain().map_err(super::read_side_failure)?;
+                    } else if waiting.wait()?.is_none() {
+                        return Err(expired());
+                    }
+                }
+                Err(e) => return Err(std::io::Error::from(e).into()),
+            }
+        }
+        self.stream.flush()?;
+        Ok(())
+    }
+
+    /// Plaintext or the peer's end is ready for `drain`; takes in what the socket holds, unblocked.
+    fn input_waiting(&self, sock: std::os::fd::BorrowedFd<'_>) -> RpcResult<bool> {
+        use rustix::event::{poll, PollFd, PollFlags, Timespec};
+        loop {
+            {
+                let mut c = self.conn.lock().expect("tls conn poisoned");
+                let io = c.process_new_packets().map_err(|e| {
+                    log::warn!("TLS record processing failed: {e}");
+                    RpcError::Protocol("TLS record processing failed")
+                })?;
+                if io.plaintext_bytes_to_read() > 0 || io.peer_has_closed() {
+                    return Ok(true);
+                }
+            }
+            if !self
+                .pending_in
+                .lock()
+                .expect("tls pending_in poisoned")
+                .is_empty()
+            {
+                self.pump_incoming()?;
+                continue;
+            }
+            let mut fds = [PollFd::from_borrowed_fd(sock, PollFlags::IN)];
+            let now = Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            match poll(&mut fds, Some(&now)) {
+                Ok(_) if fds[0].revents().contains(PollFlags::IN) => {}
+                // Nothing to read; an error flag alone is the next send's to report.
+                Ok(_) => return Ok(false),
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(e) => return Err(std::io::Error::from(e).into()),
+            }
+            // Readable, so this read returns at once; at EOF `drain` reads the end.
+            if !self.pump_incoming()? {
+                return Ok(true);
+            }
+        }
+    }
+
     /// Flush queued control records (`KeyUpdate`/alert); skips if `wlock` is held (module doc).
     fn flush_control(&self) -> RpcResult<()> {
         let Some(_g) = self.wlock.try_lock() else {
@@ -556,30 +705,20 @@ impl RpcTransport for TlsTransport {
     }
 
     fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
-        // Refused after our `shutdown` so its `wlock` wait is a handoff (module doc "Shutdown").
-        if self.shut.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(RpcError::EndOfStream);
+        self.send_records(buf, None)
+    }
+
+    fn send_raw_draining(
+        &self,
+        buf: &[u8],
+        fds: &[std::os::fd::BorrowedFd<'_>],
+        drain: &mut dyn FnMut() -> RpcResult<()>,
+    ) -> RpcResult<()> {
+        match self.stream.socket() {
+            Some(sock) if fds.is_empty() => self.send_records(buf, Some((sock, drain))),
+            // A stream with no socket sends without reading; `fds` meets the refusing default.
+            _ => self.send_raw_with_fds(buf, fds),
         }
-        // Spans encrypt-drain + transmit so wire record order = sequence order (module doc).
-        let _g = self.wlock.lock();
-        // rustls caps buffered plaintext (~64 KiB), so chunk and interleave encrypt + transmit.
-        debug_assert!(!buf.is_empty(), "send_raw with an empty frame");
-        let mut cipher = Vec::new();
-        let mut off = 0;
-        while off < buf.len() {
-            {
-                let mut c = self.conn.lock().expect("tls conn poisoned");
-                let n = c.writer().write(&buf[off..])?;
-                if n == 0 {
-                    return Err(RpcError::Protocol("rustls accepted no plaintext"));
-                }
-                off += n;
-                cipher.clear();
-                c.write_tls(&mut cipher)?;
-            }
-            self.write_socket_locked(&cipher)?;
-        }
-        Ok(())
     }
 
     /// Single-reader: one thread drives `recv_*` per connection (the RPC

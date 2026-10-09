@@ -359,10 +359,13 @@ impl Parcelable for ParcelableHolder {
                 parcelable.write_to_parcel(parcel)?;
 
                 let end = parcel.data_position();
+                // Err, not panic: the `data` guard is held and a panic would poison it.
+                if end < data_start {
+                    return Err(StatusCode::BadValue);
+                }
                 // The position came from `data_position`, so it is in range.
                 parcel.set_data_position(length_start);
 
-                assert!(end >= data_start);
                 parcel.write(&((end - data_start) as i32))?;
                 // The position came from `data_position`, so it is in range.
                 parcel.set_data_position(end);

@@ -98,8 +98,8 @@
 //! a frame boundary. Every other read failure lacks that guarantee — including ones that in
 //! fact consumed nothing — and is treated as a lost position. One caller asks through the
 //! crate-private `RpcError::leaves_frame_boundary_intact`: the android-13+ reader, which
-//! promotes a mid-frame case to `Truncated` / `DeadlineMidFrame`. The r34
-//! framing readers and the serve loop reimplement the same split inline — against the io
+//! promotes a mid-frame case to `Truncated` / `DeadlineMidFrame`. The transports'
+//! length-prefix readers and the serve loop reimplement the same split inline — against the io
 //! error kind and the `RpcError` variants respectively — so a change to the set has to be
 //! made in all three places.
 
@@ -191,9 +191,10 @@ pub enum RpcError {
     /// The stream ended without the transport's own close signal — a TLS
     /// session whose TCP stream ended with no `close_notify`. It arrives at
     /// a frame boundary or part-way through one, and the position is not
-    /// assumed intact either way (the r34 framing readers promote it to
-    /// [`Truncated`](Self::Truncated) mid-frame; the android-13+ ones leave
-    /// it as itself). Kept apart from [`EndOfStream`](Self::EndOfStream)
+    /// assumed intact either way (the length-prefix readers behind
+    /// `send_frame` / `recv_frame` promote it to
+    /// [`Truncated`](Self::Truncated) mid-frame; the AOSP-framing ones every
+    /// session uses leave it as itself). Kept apart from [`EndOfStream`](Self::EndOfStream)
     /// because on the one backend built for untrusted networks this is
     /// exactly what a truncation attack looks like; a plain socket has no
     /// close signal to miss and never reports it. The transport's own
@@ -321,8 +322,8 @@ impl From<RpcError> for std::io::Error {
     /// hold an `io::Result<_>` accumulator. Its consumers are the
     /// adapters that bridge an [`transport::RpcTransport`] to a
     /// `std::io` `Read`/`Write` — `RawTransportIo`
-    /// (`rpc::wire_android13`, the android-13+ raw framing) and `RawIo`
-    /// (`rpc::transport::tls`, R34 framing over TLS).
+    /// (`rpc::wire_android13`, the AOSP raw framing of both profiles) and
+    /// `RawIo` (`rpc::transport::tls`, length-prefixed frames over TLS).
     ///
     /// `RpcError::Io` hands its payload back as-is, but the reverse
     /// direction folds the disconnect kinds, so an `Io` carrying one of

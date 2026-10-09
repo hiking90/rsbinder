@@ -26,7 +26,11 @@
 # unmatched DEC_STRONG, so a session that stays up proves nothing. On a
 # negotiated v2 the holder case's binder must be paid back as well.
 #
-# Exits 0 on FD_PASS, HOLDER_PASS and REF_PASS with a clean logcat;
+# Then the null binder case: a null binder and a sentinel each way, which
+# lines up only if both sides write and read the stability `int32` AOSP puts
+# after a null RPC binder.
+#
+# Exits 0 on FD_PASS, HOLDER_PASS, REF_PASS and NULL_PASS with a clean logcat;
 # non-zero otherwise.
 
 set -euo pipefail
@@ -155,6 +159,12 @@ if grep -q '^REF_PASS' <<<"$out" && [[ -z "$overdec" ]]; then
 else
     echo "==> received-binder accounting FAIL"
     [[ -n "$overdec" ]] && echo "$overdec"
+    rc=1
+fi
+if grep -q '^NULL_PASS' <<<"$out"; then
+    echo "==> null binder PASS"
+else
+    echo "==> null binder FAIL"
     rc=1
 fi
 # On v2 the server enters every binder on receipt (plan 2-23 R3), so B, sent inside holder

@@ -1,32 +1,7 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! What `.aidl` would render, computed once instead of approximated per rule.
-//!
-//! Validation in [`crate::type_str`] grew as a set of hand-written predicates,
-//! each deciding whether one spelling is wrong for one reason. The generator
-//! decides the same thing in one pass, from four axes — direction, nullability,
-//! arity and whether the element has a `Default` — so every predicate is a
-//! partial re-derivation of a table that already exists, and they drift from it
-//! and from each other one rule at a time.
-//!
-//! This module states the table once: a [`Shape`] is what the macro can tell
-//! about a written type, and [`canonical`] renders the spelling `.aidl` gives
-//! that shape at a place. A refusal then becomes a comparison — what you wrote
-//! against what `.aidl` renders — and the diagnostic can name the canonical
-//! spelling instead of describing a rule, which is what keeps advice from
-//! recommending something another rule refuses.
-//!
-//! The macro cannot call the generator (its `parser` and `type_generator`
-//! modules are private, and the user-defined path needs a symbol table the
-//! macro has no way to build), so this is still a second copy of those rules.
-//! The difference is that it is *one* copy with a single entry point, and
-//! `type_matrix` holds it against the real generator for every cell of the
-//! cross product rather than against a reviewer's attention.
-//!
-//! Ported from `TypeGenerator`: `type_decl_for_func`, `type_declaration`,
-//! `list_type_decl`, `func_list_type_decl`, `make_fixed_array`,
-//! `array_type_name`, `nullable_element`, `can_be_defaulted`.
+//! Port of `TypeGenerator`'s spelling for a shape at a place; `type_matrix` checks the copy.
 
 use crate::type_str::Place;
 
@@ -173,9 +148,10 @@ fn generic_arg<'a>(ty: &'a syn::Type, name: &str) -> Option<&'a syn::Type> {
     })
 }
 
-/// The leaf's kind and scalar spelling; an array's `u8` is `byte`, so it renders from `i8`.
+/// The leaf's kind and scalar spelling; an array's `u8` is `byte`, kept as written.
 fn leaf_kind(leaf: &syn::Type, in_array: bool) -> Option<(Kind, String)> {
-    let written = crate::type_str::as_written(leaf).ok()?;
+    // `Parcelable`: a field's `self::` is legal, so it must still reach the gate.
+    let written = crate::type_str::as_written_in(leaf, crate::type_str::Ctx::Parcelable).ok()?;
     let name = match crate::type_str::unwrap_group(leaf) {
         syn::Type::Path(p) => p.path.segments.last().map(|s| s.ident.to_string()),
         _ => None,
@@ -189,8 +165,9 @@ fn leaf_kind(leaf: &syn::Type, in_array: bool) -> Option<(Kind, String)> {
         syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| matches!(s.arguments, syn::PathArguments::AngleBracketed(_)))
     );
     Some(match name.as_deref() {
+        // `simplified` drops a `String` path, so a qualified spelling still compares equal.
         Some("str" | "String") => (Kind::Str, "String".to_string()),
-        Some("u8") if in_array && plain => (Kind::Primitive, "i8".to_string()),
+        Some("u8") if in_array && plain => (Kind::Primitive, written),
         Some("bool" | "i8" | "i32" | "i64" | "f32" | "f64" | "u16") if plain => {
             (Kind::Primitive, written)
         }
@@ -255,7 +232,7 @@ pub(crate) fn check_canonical(ty: &syn::Type, place: Place) -> syn::Result<()> {
     Err(syn::Error::new_spanned(ty, message))
 }
 
-/// The spelling with `Vec`/`Option` unqualified, so `std::vec::Vec<T>` matches `Vec<T>`.
+/// The spelling with `Vec`/`Option`/`String` unqualified, so `std::vec::Vec<T>` matches `Vec<T>`.
 fn simplified(ty: &syn::Type) -> String {
     use crate::type_str::unwrap_group;
     use syn::Type;
@@ -295,7 +272,7 @@ fn simplified(ty: &syn::Type) -> String {
                 }
                 _ => String::new(),
             };
-            if seg.ident == "Vec" || seg.ident == "Option" {
+            if seg.ident == "Vec" || seg.ident == "Option" || seg.ident == "String" {
                 return format!("{}{args}", seg.ident);
             }
             let head: Vec<String> = p

@@ -7,6 +7,16 @@ use crate::const_expr::{ConstExpr, InitParam, ValueType};
 use crate::error::{AidlError, ResolutionError, SemanticError};
 use crate::parser::{self, *};
 
+/// `Option` as generated code names it: by path, since an AIDL nested type may take the bare
+/// name in the module the code lands in (AOSP `aidl_to_rust.cpp` paths `Vec`/`Box`/`String`).
+pub const OPTION: &str = "::core::option::Option";
+/// `Vec` as generated code names it; see [`OPTION`].
+pub const VEC: &str = "::std::vec::Vec";
+/// `Box` as generated code names it; see [`OPTION`].
+pub const BOX: &str = "::std::boxed::Box";
+/// `String` as generated code names it; see [`OPTION`].
+pub const STRING: &str = "::std::string::String";
+
 /// Source and span for a type-level diagnostic; placeholder name without source context.
 fn diagnostic_source(span: Option<(usize, usize)>) -> (NamedSource<String>, SourceSpan) {
     let filename = parser::current_source_name();
@@ -30,6 +40,22 @@ fn diagnostic_source(span: Option<(usize, usize)>) -> (NamedSource<String>, Sour
     )
 }
 
+/// AOSP `FormatDirections` (`aidl_language.cpp:1072`): `in`, `in or inout`, `in, out, or inout`.
+fn format_directions(directions: &[&str]) -> String {
+    match directions {
+        [] => String::new(),
+        [one] => (*one).to_owned(),
+        [a, b] => format!("{a} or {b}"),
+        [init @ .., last] => format!("{}, or {last}", init.join(", ")),
+    }
+}
+
+fn format_directions_quoted(directions: &[&str]) -> String {
+    let quoted: Vec<String> = directions.iter().map(|d| format!("'{d}'")).collect();
+    let quoted: Vec<&str> = quoted.iter().map(String::as_str).collect();
+    format_directions(&quoted)
+}
+
 fn make_type_error(message: impl Into<String>, span: Option<(usize, usize)>) -> AidlError {
     let (src, span) = diagnostic_source(span);
     AidlError::from(SemanticError::InvalidOperation {
@@ -37,6 +63,16 @@ fn make_type_error(message: impl Into<String>, span: Option<(usize, usize)>) -> 
         src,
         span,
     })
+}
+
+/// AIDL name of a `Reference`'s enum: `enum_type`, or `<Union>.Tag` for a union's `Tag`.
+fn enum_aidl_name(enum_type: &str, enum_name: &str) -> String {
+    match parser::lookup_decl_from_canonical(enum_type) {
+        Some(found) if matches!(found.decl, Declaration::Union(_)) => {
+            format!("{enum_type}.{enum_name}")
+        }
+        _ => enum_type.to_owned(),
+    }
 }
 
 thread_local! {
@@ -141,9 +177,14 @@ impl ArrayInfo {
     }
 }
 
+/// AOSP's refusal of `heap=true` on anything but a parcelable, word for word.
+const HEAP_NEEDS_PARCELABLE: &str = "@nullable(heap=true) is available to parcelables.";
+
 #[derive(Clone)]
 pub struct TypeGenerator {
     pub(crate) is_nullable: bool,
+    /// `@nullable(heap=true)`: a field of this type is `Option<Box<T>>` wherever it is.
+    is_heap_nullable: bool,
     pub value_type: ValueType,
     array_types: Vec<ArrayInfo>,
     /// User-defined generic's arguments, bare or as array/`List` element; empty otherwise.
@@ -251,6 +292,7 @@ impl TypeGenerator {
 
         Ok(Self {
             is_nullable: false,
+            is_heap_nullable: false,
             value_type,
             array_types,
             type_args,
@@ -309,16 +351,23 @@ impl TypeGenerator {
             this = this.array(&_type.array_types)?;
         }
 
-        if has_annotation(&_type.annotation_list, AnnotationType::IsNullable) {
-            let nullable_span = _type
-                .annotation_list
-                .iter()
-                .find(|a| a.annotation == "@nullable")
-                .and_then(|a| a.annotation_span);
-            this.nullable_at(nullable_span)
-        } else {
-            Ok(this)
+        if !has_annotation(&_type.annotation_list, AnnotationType::IsNullable) {
+            return Ok(this);
         }
+        let nullable_span = _type
+            .annotation_list
+            .iter()
+            .find(|a| a.annotation == "@nullable")
+            .and_then(|a| a.annotation_span);
+        let mut this = this.nullable_at(nullable_span)?;
+        if is_heap_nullable(&_type.annotation_list) {
+            // AOSP `CheckValid` (`aidl_language.cpp:914-918`); `ensure_resolvable` sees the decl.
+            if is_array || !matches!(this.value_type, ValueType::UserDefined(_)) {
+                return Err(make_type_error(HEAP_NEEDS_PARCELABLE, nullable_span));
+            }
+            this.is_heap_nullable = true;
+        }
+        Ok(this)
     }
 
     /// Verify that every user-defined type this generator references resolves
@@ -332,10 +381,7 @@ impl TypeGenerator {
     pub fn ensure_resolvable(&self) -> Result<(), AidlError> {
         let check = |value_type: &ValueType| -> Result<Option<LookupDecl>, AidlError> {
             if let ValueType::UserDefined(name) = value_type {
-                // Lookup falls back to the current decl on a miss, so compare the simple name.
-                let requested = name.rsplit('.').next().unwrap_or(name.as_str());
-                let resolved = lookup_decl_from_name(name, crate::Namespace::AIDL)
-                    .filter(|lookup_decl| lookup_decl.decl.name() == requested);
+                let resolved = lookup_decl_from_name(name, crate::Namespace::AIDL);
                 if resolved.is_none() {
                     let (src, span) = diagnostic_source(self.type_span);
                     return Err(AidlError::from(ResolutionError::UnknownType {
@@ -357,6 +403,14 @@ impl TypeGenerator {
         }
         for arg in &self.type_args {
             arg.ensure_resolvable()?;
+        }
+        // AOSP `AsParcelable()`: a structured or unstructured parcelable, or a union.
+        if self.is_heap_nullable
+            && !named.as_ref().is_some_and(|d| {
+                matches!(d.decl, Declaration::Parcelable(_) | Declaration::Union(_))
+            })
+        {
+            return Err(make_type_error(HEAP_NEEDS_PARCELABLE, self.type_span));
         }
         match named {
             Some(lookup_decl) => self.ensure_type_args(&lookup_decl),
@@ -483,9 +537,16 @@ impl TypeGenerator {
     /// non-nullable one has neither: boxing it alone would produce a `Default`
     /// that recurses until the stack runs out, and that `Default` is the
     /// deserialization entry point, so a peer's parcel would abort the
-    /// process. AOSP likewise makes the cycle-closing field nullable. Must be
-    /// invoked while the owning declaration's `NamespaceGuard` is active.
-    pub fn ensure_sized(&self) -> Result<(), AidlError> {
+    /// process. Only fields no box can break count here
+    /// (`SizingEdges::Unboxable`): once a `@nullable` field on a cycle is boxed,
+    /// the other fields on it stay inline, as AOSP `CheckNoRecursiveDefinition`
+    /// accepts for `@nullable(heap=true)`.
+    ///
+    /// A bare `@nullable` field (no `heap=true`) on a cycle AOSP sees is boxed
+    /// too, but AOSP rejects it, so it records a generation warning naming
+    /// `field`. Must be invoked while the owning declaration's
+    /// `NamespaceGuard` is active.
+    pub fn ensure_sized(&self, field: &str) -> Result<(), AidlError> {
         // Only bare fields (`@nullable` rescues) and inline `[T; N]` (no Box codec) close cycles.
         let (type_name, nullable_rescues) = match &self.value_type {
             ValueType::UserDefined(name) => (name, true),
@@ -498,19 +559,29 @@ impl TypeGenerator {
             },
             _ => return Ok(()),
         };
-        if nullable_rescues && self.is_nullable {
-            return Ok(());
-        }
         let Some(lookup_decl) = lookup_decl_from_name(type_name, crate::Namespace::AIDL) else {
             return Ok(());
         };
-        if !Self::closes_reference_cycle(&lookup_decl) {
+        if nullable_rescues && self.is_nullable {
+            if !self.is_heap_nullable
+                && Self::closes_reference_cycle(&lookup_decl, SizingEdges::Aosp)
+            {
+                parser::note_generation_warning(format!(
+                    "{}.{field}: a `@nullable` field that closes a reference cycle is \
+                     `Option<Box<…>>` here, but AOSP aidl rejects the cycle as a recursive \
+                     parcelable; write `@nullable(heap=true)`",
+                    current_namespace().to_string(crate::Namespace::AIDL),
+                ));
+            }
+            return Ok(());
+        }
+        if !Self::closes_reference_cycle(&lookup_decl, SizingEdges::Unboxable) {
             return Ok(());
         }
         let (src, span) = diagnostic_source(self.type_span);
         let help = if nullable_rescues {
-            "mark the field `@nullable` so it becomes `Option<Box<…>>`, which \
-             breaks the cycle and can still be default-constructed"
+            "mark the field `@nullable(heap=true)` so it becomes `Option<Box<…>>`, \
+             which breaks the cycle and can still be default-constructed"
         } else {
             "a fixed-size array keeps its elements inline; use a \
              variable-length array (`T[]`) so the elements live behind a `Vec`"
@@ -540,7 +611,7 @@ impl TypeGenerator {
     }
 
     // Only a parcelable or union is held inline; interfaces are handles and enums are scalars.
-    fn closes_reference_cycle(lookup_decl: &crate::parser::LookupDecl) -> bool {
+    fn closes_reference_cycle(lookup_decl: &crate::parser::LookupDecl, edges: SizingEdges) -> bool {
         if !matches!(
             lookup_decl.decl,
             Declaration::Parcelable(_) | Declaration::Union(_)
@@ -554,11 +625,12 @@ impl TypeGenerator {
                 .ns
                 .last()
                 .is_some_and(|name| curr_ns.ns.last() == Some(name));
-        refers_to_self || crate::parser::declaration_reaches(&lookup_decl.ns, &curr_ns)
+        refers_to_self || crate::parser::declaration_reaches(&lookup_decl.ns, &curr_ns, edges)
     }
 
     /// `allow_box` is false for array elements: `Box<T>` has no `SerializeArray` impl.
-    fn make_user_defined_type_name(&self, type_name: &str, allow_box: bool) -> String {
+    /// `field`: a parcelable or union field, the only place `heap=true` boxes here.
+    fn make_user_defined_type_name(&self, type_name: &str, allow_box: bool, field: bool) -> String {
         let lookup_decl = lookup_decl_from_name(type_name, crate::Namespace::AIDL)
             .expect("type must be resolved during code generation");
         let curr_ns = current_namespace();
@@ -567,10 +639,12 @@ impl TypeGenerator {
         let simple = crate::escape_rust_keyword(lookup_decl.name.ns.last().unwrap());
         let is_interface = matches!(lookup_decl.decl, Declaration::Interface(_));
         // Only `@nullable` boxes: `Option` ends `Default` recursion; `ensure_sized` rejects others.
+        // `heap=true` boxes wherever it is (AOSP `aidl_to_rust.cpp:305-306`), a bare one on a cycle.
         let needs_box = allow_box
             && self.is_nullable
             && !is_interface
-            && Self::closes_reference_cycle(&lookup_decl);
+            && ((field && self.is_heap_nullable)
+                || Self::closes_reference_cycle(&lookup_decl, SizingEdges::ByValue));
         // A builtin is the runtime crate's type, not a module of this output.
         let path = if let Some(builtin) = parser::builtin_rust_path(&lookup_decl.ns) {
             format!("{}::{builtin}", crate_name())
@@ -591,7 +665,7 @@ impl TypeGenerator {
             format!("{path}<{}>", args.join(", "))
         };
         let name = if needs_box {
-            format!("Box<{path}>")
+            format!("{BOX}<{path}>")
         } else {
             path
         };
@@ -627,7 +701,7 @@ impl TypeGenerator {
         if Self::is_primitive(value_type) {
             type_name.to_owned()
         } else {
-            format!("Option<{type_name}>")
+            format!("{OPTION}<{type_name}>")
         }
     }
 
@@ -853,45 +927,118 @@ impl TypeGenerator {
         self
     }
 
+    /// AOSP `GetArgumentAspect` (aidl_typenames.cpp:332): (type name, permitted directions).
+    fn argument_aspect(&self) -> Option<(&'static str, &'static [&'static str])> {
+        const ALL: &[&str] = &["in", "out", "inout"];
+        const IN: &[&str] = &["in"];
+        Some(match &self.value_type {
+            ValueType::Array(_) => match self.array_types.first() {
+                Some(info) if info.is_list => ("List", ALL),
+                _ => ("array", ALL),
+            },
+            // Not default-constructible, so no `out`.
+            ValueType::FileDescriptor => ("ParcelFileDescriptor", &["in", "inout"]),
+            ValueType::Holder => return None,
+            ValueType::IBinder => ("IBinder", IN),
+            ValueType::Void => ("void", IN),
+            ValueType::Bool(_) => ("boolean", IN),
+            ValueType::Byte(_) => ("byte", IN),
+            ValueType::Char(_) => ("char", IN),
+            ValueType::Int32(_) => ("int", IN),
+            ValueType::Int64(_) => ("long", IN),
+            ValueType::Float(_) => ("float", IN),
+            ValueType::Double(_) => ("double", IN),
+            ValueType::String(_) => ("String", IN),
+            ValueType::UserDefined(name) => {
+                let is_immutable = |annotations: &[Annotation]| {
+                    annotations
+                        .iter()
+                        .any(|a| a.annotation == "@JavaOnlyImmutable")
+                };
+                let found = lookup_decl_from_name(name, crate::Namespace::AIDL)?;
+                match found.decl {
+                    Declaration::Parcelable(decl) if is_immutable(&decl.annotation_list) => {
+                        ("@JavaOnlyImmutable", IN)
+                    }
+                    Declaration::Union(decl) if is_immutable(&decl.annotation_list) => {
+                        ("@JavaOnlyImmutable", IN)
+                    }
+                    Declaration::Parcelable(_) | Declaration::Union(_) => ("parcelable/union", ALL),
+                    Declaration::Interface(_) => ("interface", IN),
+                    Declaration::Enum(_) => ("enum", IN),
+                    Declaration::Variable(_) => return None,
+                }
+            }
+            _ => return None,
+        })
+    }
+
+    /// Sets an argument's direction, checked as AOSP `AidlArgument::CheckValid`.
     pub fn direction_at(
         mut self,
         direction: &Direction,
         direction_span: Option<(usize, usize)>,
+        arg: &str,
     ) -> Result<Self, AidlError> {
-        if matches!(direction, Direction::Out | Direction::Inout)
-            && (Self::is_primitive(&self.value_type)
-                || matches!(self.value_type, ValueType::String(_)))
-        {
-            let direction_str = match direction {
-                Direction::Out => "out",
-                Direction::Inout => "inout",
-                Direction::In | Direction::None => {
-                    unreachable!("direction guarded by matches! above")
+        if let Some((type_kind, allowed)) = self.argument_aspect() {
+            let given = match direction {
+                Direction::None => None,
+                Direction::In => Some("in"),
+                Direction::Out => Some("out"),
+                Direction::Inout => Some("inout"),
+            };
+            let allowed_text = format_directions(allowed);
+            match given {
+                None if allowed != ["in"] => {
+                    let (src, span) = diagnostic_source(self.type_span);
+                    return Err(AidlError::from(SemanticError::DirectionNotSpecified {
+                        arg: arg.to_owned(),
+                        type_kind: type_kind.to_owned(),
+                        help: Some(format!(
+                            "declare it as {} before the type",
+                            format_directions_quoted(allowed)
+                        )),
+                        allowed: allowed_text,
+                        src,
+                        span,
+                    }));
                 }
-            };
-            let type_kind = if matches!(self.value_type, ValueType::String(_)) {
-                "String"
-            } else {
-                "a primitive type"
-            };
-            let (src, span) = diagnostic_source(direction_span.or(self.type_span));
-            return Err(AidlError::from(SemanticError::DirectionPrimitive {
-                direction: direction_str.to_string(),
-                type_kind: type_kind.to_string(),
-                help: Some(format!(
-                    "remove '{direction_str}', or change the parameter type to a non-primitive type \
-                     (parcelable, interface, List, etc.)"
-                )),
-                src,
-                span,
-            }));
+                Some(dir) if !allowed.contains(&dir) => {
+                    let help = if allowed == ["in"] {
+                        format!(
+                            "remove '{dir}'; to pass a value back, return it, or use an array, \
+                             which can be an in, out, or inout parameter"
+                        )
+                    } else {
+                        let others: Vec<&str> =
+                            allowed.iter().copied().filter(|d| *d != "in").collect();
+                        format!(
+                            "remove '{dir}', or declare it as {}",
+                            format_directions_quoted(&others)
+                        )
+                    };
+                    let (src, span) = diagnostic_source(direction_span.or(self.type_span));
+                    return Err(AidlError::from(SemanticError::InvalidDirection {
+                        arg: arg.to_owned(),
+                        direction: dir.to_owned(),
+                        type_kind: type_kind.to_owned(),
+                        allowed: allowed_text,
+                        help: Some(help),
+                        src,
+                        span,
+                    }));
+                }
+                _ => {}
+            }
         }
         self.direction = direction.clone();
         Ok(self)
     }
 
-    pub fn direction(self, direction: &Direction) -> Result<Self, AidlError> {
-        self.direction_at(direction, None)
+    /// Sets the direction unchecked, for code generation; arguments go through `direction_at`.
+    pub fn direction(mut self, direction: &Direction) -> Result<Self, AidlError> {
+        self.direction = direction.clone();
+        Ok(self)
     }
 
     // Switch to array type.
@@ -928,7 +1075,7 @@ impl TypeGenerator {
             if (self.is_nullable && Self::is_aidl_nullable(&array_info.value_type))
                 || !Self::can_be_defaulted(&array_info.value_type, is_struct)
             {
-                format!("Option<{type_name}>")
+                format!("{OPTION}<{type_name}>")
             } else {
                 type_name
             }
@@ -937,7 +1084,7 @@ impl TypeGenerator {
             if matches!(self.direction, Direction::Out)
                 && !Self::can_be_defaulted(&array_info.value_type, is_struct)
             {
-                format!("Option<{type_name}>")
+                format!("{OPTION}<{type_name}>")
             } else if self.is_nullable {
                 Self::nullable_element(&array_info.value_type, &type_name)
             } else {
@@ -955,7 +1102,7 @@ impl TypeGenerator {
         // Fixed-size array wrapping ignores direction; only nullability adds `Option<_>`.
         let fixed_array = self.make_fixed_array(array_info, is_struct);
         if self.is_nullable {
-            format!("Option<{fixed_array}>")
+            format!("{OPTION}<{fixed_array}>")
         } else {
             fixed_array
         }
@@ -972,50 +1119,55 @@ impl TypeGenerator {
             Direction::Out => {
                 if self.is_nullable {
                     format!(
-                        "Vec<{}>",
+                        "{VEC}<{}>",
                         Self::nullable_element(&sub_type.value_type, &type_name)
                     )
                 } else if Self::can_be_defaulted(&sub_type.value_type, is_struct) {
-                    format!("Vec<{type_name}>")
+                    format!("{VEC}<{type_name}>")
                 } else {
-                    format!("Vec<Option<{type_name}>>")
+                    format!("{VEC}<{OPTION}<{type_name}>>")
                 }
             }
             Direction::Inout => {
                 if self.is_nullable {
                     format!(
-                        "Vec<{}>",
+                        "{VEC}<{}>",
                         Self::nullable_element(&sub_type.value_type, &type_name)
                     )
                 } else {
                     // AOSP `RustNameOf` INOUT: read fully populated, no element needs `Default`.
-                    format!("Vec<{type_name}>")
+                    format!("{VEC}<{type_name}>")
                 }
             }
             _ => {
                 if is_struct {
                     if self.is_nullable && Self::is_aidl_nullable(&sub_type.value_type) {
-                        format!("Vec<Option<{type_name}>>")
+                        format!("{VEC}<{OPTION}<{type_name}>>")
                     } else {
-                        format!("Vec<{type_name}>")
+                        format!("{VEC}<{type_name}>")
                     }
                 } else if self.is_nullable {
                     if Self::is_primitive(&sub_type.value_type) {
-                        format!("Option<Vec<{type_name}>>")
+                        format!("{OPTION}<{VEC}<{type_name}>>")
                     } else {
-                        format!("Option<Vec<Option<{type_name}>>>")
+                        format!("{OPTION}<{VEC}<{OPTION}<{type_name}>>>")
                     }
                 } else {
-                    format!("Vec<{type_name}>")
+                    format!("{VEC}<{type_name}>")
                 }
             }
         }
     }
 
     fn type_decl(&self, value_type: &ValueType, allow_box: bool) -> String {
+        self.type_decl_in(value_type, allow_box, false)
+    }
+
+    /// [`type_decl`](Self::type_decl); `field` lets `heap=true` box (`make_user_defined_type_name`).
+    fn type_decl_in(&self, value_type: &ValueType, allow_box: bool, field: bool) -> String {
         match value_type {
             ValueType::Void => "()".into(),
-            ValueType::String(_) => "String".into(),
+            ValueType::String(_) => STRING.into(),
             ValueType::Byte(_) => "i8".into(),
             ValueType::Int32(_) => "i32".into(),
             ValueType::Int64(_) => "i64".into(),
@@ -1030,7 +1182,9 @@ impl TypeGenerator {
             ValueType::IBinder => format!("{}::SIBinder", crate_name()),
             ValueType::FileDescriptor => format!("{}::ParcelFileDescriptor", crate_name()),
             ValueType::Holder => format!("{}::ParcelableHolder", crate_name()),
-            ValueType::UserDefined(name) => self.make_user_defined_type_name(name, allow_box),
+            ValueType::UserDefined(name) => {
+                self.make_user_defined_type_name(name, allow_box, field)
+            }
             _ => unreachable!(),
         }
     }
@@ -1046,12 +1200,12 @@ impl TypeGenerator {
                 {
                     is_nullable = true;
                 }
-                self.type_decl(&self.value_type, true)
+                self.type_decl_in(&self.value_type, true, is_struct)
             }
         };
 
-        if is_nullable && !name.starts_with("Option<") {
-            format!("Option<{name}>")
+        if is_nullable && !name.starts_with(&format!("{OPTION}<")) {
+            format!("{OPTION}<{name}>")
         } else {
             name
         }
@@ -1127,14 +1281,14 @@ impl TypeGenerator {
         match self.direction {
             Direction::Out | Direction::Inout => {
                 if self.is_nullable {
-                    format!("&mut Option<{fixed_array}>")
+                    format!("&mut {OPTION}<{fixed_array}>")
                 } else {
                     format!("&mut {fixed_array}")
                 }
             }
             _ => {
                 if self.is_nullable {
-                    format!("Option<&{fixed_array}>")
+                    format!("{OPTION}<&{fixed_array}>")
                 } else {
                     format!("&{fixed_array}")
                 }
@@ -1152,35 +1306,35 @@ impl TypeGenerator {
             Direction::Out => {
                 if self.is_nullable {
                     format!(
-                        "&mut Option<Vec<{}>>",
+                        "&mut {OPTION}<{VEC}<{}>>",
                         Self::nullable_element(&sub_type.value_type, &type_name)
                     )
                 } else if Self::can_be_defaulted(&sub_type.value_type, false)
                     || Self::is_primitive(&sub_type.value_type)
                 {
                     // Enum is a primitive type.
-                    format!("&mut Vec<{type_name}>")
+                    format!("&mut {VEC}<{type_name}>")
                 } else {
-                    format!("&mut Vec<Option<{type_name}>>")
+                    format!("&mut {VEC}<{OPTION}<{type_name}>>")
                 }
             }
             Direction::Inout => {
                 // Must match `list_type_decl`'s `Inout` arm: the server passes `&mut` its local.
                 if self.is_nullable {
                     format!(
-                        "&mut Option<Vec<{}>>",
+                        "&mut {OPTION}<{VEC}<{}>>",
                         Self::nullable_element(&sub_type.value_type, &type_name)
                     )
                 } else {
-                    format!("&mut Vec<{type_name}>")
+                    format!("&mut {VEC}<{type_name}>")
                 }
             }
             _ => {
                 if self.is_nullable {
                     if Self::is_primitive(&sub_type.value_type) {
-                        format!("Option<&[{type_name}]>")
+                        format!("{OPTION}<&[{type_name}]>")
                     } else {
-                        format!("Option<&[Option<{type_name}>]>")
+                        format!("{OPTION}<&[{OPTION}<{type_name}>]>")
                     }
                 } else {
                     format!("&[{type_name}]")
@@ -1201,7 +1355,7 @@ impl TypeGenerator {
                 }
                 _ => {
                     if self.is_nullable {
-                        "Option<&str>".into()
+                        format!("{OPTION}<&str>")
                     } else {
                         "&str".into()
                     }
@@ -1221,7 +1375,7 @@ impl TypeGenerator {
                         || (matches!(self.direction, Direction::Out)
                             && !Self::can_be_defaulted(&self.value_type, false))
                     {
-                        format!("&mut Option<{name}>")
+                        format!("&mut {OPTION}<{name}>")
                     } else {
                         format!("&mut {name}")
                     }
@@ -1232,7 +1386,7 @@ impl TypeGenerator {
                     } else {
                         let name = self.type_decl(&self.value_type, true);
                         if self.is_nullable {
-                            format!("Option<&{name}>")
+                            format!("{OPTION}<&{name}>")
                         } else {
                             format!("&{name}")
                         }
@@ -1249,14 +1403,14 @@ impl TypeGenerator {
                 // Must match `init_array_branch`'s predicate, which decides `Some(..)` elements.
                 let element = |name: &str| {
                     if self.is_nullable && Self::is_aidl_nullable(&info.value_type) {
-                        format!("Option<{name}>")
+                        format!("{OPTION}<{name}>")
                     } else {
                         name.to_owned()
                     }
                 };
                 let outer = |name: String| {
                     if self.is_nullable {
-                        format!("Option<{name}>")
+                        format!("{OPTION}<{name}>")
                     } else {
                         name
                     }
@@ -1296,7 +1450,7 @@ impl TypeGenerator {
         } else {
             let decl = self.type_declaration(false);
 
-            if decl == "String" {
+            if decl == STRING {
                 format!("{}.as_str()", self.identifier)
             } else {
                 match self.direction {
@@ -1304,9 +1458,11 @@ impl TypeGenerator {
                         format!("&mut {}", self.identifier)
                     }
                     _ => {
-                        if decl.starts_with("Option<Vec<") || decl.starts_with("Option<String>") {
+                        if decl.starts_with(&format!("{OPTION}<{VEC}<"))
+                            || decl == format!("{OPTION}<{STRING}>")
+                        {
                             format!("{}.as_deref()", self.identifier)
-                        } else if decl.starts_with("Option<") {
+                        } else if decl.starts_with(&format!("{OPTION}<")) {
                             format!("{}.as_ref()", self.identifier)
                         } else {
                             format!("&{}", self.identifier)
@@ -1341,7 +1497,10 @@ impl TypeGenerator {
 
     /// `std::array::from_fn` init for a non-nullable array with a dim > 32 (no `Default` impl).
     fn fixed_array_default(&self) -> Option<String> {
-        self.fixed_array_init("Default::default()", "std::array::from_fn")
+        self.fixed_array_init(
+            "::core::default::Default::default()",
+            "::core::array::from_fn",
+        )
     }
 
     /// `from_fn` once per dimension around `leaf`, spelled by the caller.
@@ -1362,7 +1521,7 @@ impl TypeGenerator {
 
     pub fn default_value(&self) -> String {
         self.fixed_array_default()
-            .unwrap_or_else(|| "Default::default()".to_owned())
+            .unwrap_or_else(|| "::core::default::Default::default()".to_owned())
     }
 
     fn enum_lookup(&self) -> Option<LookupDecl> {
@@ -1378,51 +1537,35 @@ impl TypeGenerator {
         }
     }
 
-    fn resolve_enum_reference_for_target(expr: &ConstExpr, target_enum: &str) -> ConstExpr {
-        match &expr.value {
-            ValueType::Name(name) => {
-                parser::name_to_enum_member_const_expr(name, Some(target_enum))
-                    .unwrap_or_else(|| expr.clone())
-            }
-            ValueType::Array(values) => ConstExpr::new(ValueType::Array(
-                values
-                    .iter()
-                    .map(|value| Self::resolve_enum_reference_for_target(value, target_enum))
-                    .collect(),
-            )),
-            ValueType::Expr { lhs, operator, rhs } => ConstExpr::new(ValueType::Expr {
-                lhs: Box::new(Self::resolve_enum_reference_for_target(lhs, target_enum)),
-                operator: operator.clone(),
-                rhs: Box::new(Self::resolve_enum_reference_for_target(rhs, target_enum)),
-            }),
-            ValueType::Unary { operator, expr } => ConstExpr::new(ValueType::Unary {
-                operator: operator.clone(),
-                expr: Box::new(Self::resolve_enum_reference_for_target(expr, target_enum)),
-            }),
-            _ => expr.clone(),
-        }
-    }
-
     fn validate_enum_value(
         &self,
         expr: &ConstExpr,
         target_lookup: &LookupDecl,
     ) -> Result<ConstExpr, AidlError> {
         let target_enum = target_lookup.ns.to_string(crate::Namespace::AIDL);
-        let resolved = Self::resolve_enum_reference_for_target(expr, &target_enum);
-        let calculated = resolved
+        // `ns` of a union's `Tag` is the union's; diagnostics name the `Tag` itself.
+        let target_name = || match &target_lookup.decl {
+            Declaration::Enum(e) if e.tag_of_union.is_some() => format!("{target_enum}.{}", e.name),
+            _ => target_enum.clone(),
+        };
+        let calculated = expr
             .calculate()
             .map_err(|e| make_type_error(e.message, self.type_span))?;
 
         match &calculated.value {
-            ValueType::Reference { enum_type, .. } => {
+            ValueType::Reference {
+                enum_type,
+                enum_name,
+                member_name,
+                ..
+            } => {
                 // Member names repeat across enums; the default must belong to the field's enum.
                 if enum_type != &target_enum {
                     return Err(make_type_error(
                         format!(
-                            "enum default value {} does not match target enum {}",
-                            calculated.to_value_string(),
-                            target_enum
+                            "enum default value {}.{member_name} does not match target enum {}",
+                            enum_aidl_name(enum_type, enum_name),
+                            target_name(),
                         ),
                         self.type_span,
                     ));
@@ -1433,7 +1576,8 @@ impl TypeGenerator {
             ValueType::Name(name) => Err(make_type_error(
                 format!(
                     "unresolved enum default value {} for target enum {}",
-                    name, target_enum
+                    name,
+                    target_name()
                 ),
                 self.type_span,
             )),
@@ -1441,7 +1585,7 @@ impl TypeGenerator {
                 format!(
                     "enum default value {} is not a member of target enum {}",
                     calculated.to_value_string(),
-                    target_enum
+                    target_name()
                 ),
                 self.type_span,
             )),
@@ -1468,9 +1612,7 @@ impl TypeGenerator {
         is_fixed_array: bool,
         is_nullable: bool,
     ) -> Result<String, AidlError> {
-        let target_enum = target_lookup.ns.to_string(crate::Namespace::AIDL);
-        let resolved = Self::resolve_enum_reference_for_target(expr, &target_enum);
-        let calculated = resolved
+        let calculated = expr
             .calculate()
             .map_err(|e| make_type_error(e.message, self.type_span))?;
 
@@ -1637,13 +1779,13 @@ impl TypeGenerator {
                     self.type_span,
                 ));
             }
-            ValueType::Reference {
-                enum_type, value, ..
-            } => parser::enum_reference_promoted(enum_type, *value)
-                .convert_to(&self.value_type)
-                .map_err(|e| make_type_error(e.message, self.type_span))?
-                .value
-                .to_init(scalar_param),
+            ValueType::Reference { value, kind, .. } => {
+                ConstExpr::new(ValueType::promoted_reference(*value, *kind))
+                    .convert_to(&self.value_type)
+                    .map_err(|e| make_type_error(e.message, self.type_span))?
+                    .value
+                    .to_init(scalar_param)
+            }
             // Laxer than AOSP `ValueString` for char/float/double targets; non-enum types error.
             _ => calculated
                 .convert_to(&self.value_type)
@@ -1673,7 +1815,7 @@ impl TypeGenerator {
         };
 
         Ok(if self.is_nullable {
-            format!("Some({init_str})")
+            format!("::core::option::Option::Some({init_str})")
         } else {
             init_str
         })
@@ -1693,20 +1835,26 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(gen.type_declaration(false), "String");
+        assert_eq!(gen.type_declaration(false), "::std::string::String");
 
         let nullable_gen = gen.clone().nullable().unwrap();
-        assert_eq!(nullable_gen.type_declaration(false), "Option<String>");
+        assert_eq!(
+            nullable_gen.type_declaration(false),
+            "::core::option::Option<::std::string::String>"
+        );
 
         let array_gen = gen.array(&Vec::new()).unwrap();
-        assert_eq!(array_gen.type_declaration(false), "Vec<String>");
+        assert_eq!(
+            array_gen.type_declaration(false),
+            "::std::vec::Vec<::std::string::String>"
+        );
         assert_eq!(
             array_gen
                 .clone()
                 .direction(&Direction::Out)
                 .unwrap()
                 .type_declaration(false),
-            "Vec<String>"
+            "::std::vec::Vec<::std::string::String>"
         );
         assert_eq!(
             array_gen
@@ -1714,13 +1862,13 @@ mod tests {
                 .direction(&Direction::Inout)
                 .unwrap()
                 .type_declaration(false),
-            "Vec<String>"
+            "::std::vec::Vec<::std::string::String>"
         );
 
         let nullable_array_gen = array_gen.nullable().unwrap();
         assert_eq!(
             nullable_array_gen.type_declaration(false),
-            "Option<Vec<Option<String>>>"
+            "::core::option::Option<::std::vec::Vec<::core::option::Option<::std::string::String>>>"
         );
         assert_eq!(
             nullable_array_gen
@@ -1728,14 +1876,14 @@ mod tests {
                 .direction(&Direction::Out)
                 .unwrap()
                 .type_declaration(false),
-            "Option<Vec<Option<String>>>"
+            "::core::option::Option<::std::vec::Vec<::core::option::Option<::std::string::String>>>"
         );
         assert_eq!(
             nullable_array_gen
                 .direction(&Direction::Inout)
                 .unwrap()
                 .type_declaration(false),
-            "Option<Vec<Option<String>>>"
+            "::core::option::Option<::std::vec::Vec<::core::option::Option<::std::string::String>>>"
         );
     }
 
@@ -1753,18 +1901,21 @@ mod tests {
         let nullable_gen = gen.clone().nullable().unwrap();
         assert_eq!(
             nullable_gen.type_declaration(false),
-            "Option<rsbinder::SIBinder>"
+            "::core::option::Option<rsbinder::SIBinder>"
         );
 
         let array_gen = gen.array(&Vec::new()).unwrap();
-        assert_eq!(array_gen.type_declaration(false), "Vec<rsbinder::SIBinder>");
+        assert_eq!(
+            array_gen.type_declaration(false),
+            "::std::vec::Vec<rsbinder::SIBinder>"
+        );
         assert_eq!(
             array_gen
                 .clone()
                 .direction(&Direction::Out)
                 .unwrap()
                 .type_declaration(false),
-            "Vec<Option<rsbinder::SIBinder>>"
+            "::std::vec::Vec<::core::option::Option<rsbinder::SIBinder>>"
         );
         // `inout` elements need no `Default`: AOSP `RustNameOf` keeps `element_mode = VALUE`.
         assert_eq!(
@@ -1773,13 +1924,13 @@ mod tests {
                 .direction(&Direction::Inout)
                 .unwrap()
                 .type_declaration(false),
-            "Vec<rsbinder::SIBinder>"
+            "::std::vec::Vec<rsbinder::SIBinder>"
         );
 
         let nullable_array_gen = array_gen.nullable().unwrap();
         assert_eq!(
             nullable_array_gen.type_declaration(false),
-            "Option<Vec<Option<rsbinder::SIBinder>>>"
+            "::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::SIBinder>>>"
         );
         assert_eq!(
             nullable_array_gen
@@ -1787,14 +1938,14 @@ mod tests {
                 .direction(&Direction::Out)
                 .unwrap()
                 .type_declaration(false),
-            "Option<Vec<Option<rsbinder::SIBinder>>>"
+            "::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::SIBinder>>>"
         );
         assert_eq!(
             nullable_array_gen
                 .direction(&Direction::Inout)
                 .unwrap()
                 .type_declaration(false),
-            "Option<Vec<Option<rsbinder::SIBinder>>>"
+            "::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::SIBinder>>>"
         );
     }
 
@@ -1815,7 +1966,7 @@ mod tests {
         let nullable_gen = gen.clone().nullable().unwrap();
         assert_eq!(
             nullable_gen.type_decl_for_func().unwrap(),
-            "Option<&rsbinder::ParcelFileDescriptor>"
+            "::core::option::Option<&rsbinder::ParcelFileDescriptor>"
         );
 
         let array_gen = gen.array(&Vec::new()).unwrap();
@@ -1830,7 +1981,7 @@ mod tests {
                 .unwrap()
                 .type_decl_for_func()
                 .unwrap(),
-            "&mut Vec<Option<rsbinder::ParcelFileDescriptor>>"
+            "&mut ::std::vec::Vec<::core::option::Option<rsbinder::ParcelFileDescriptor>>"
         );
         // Must equal `list_type_decl(false)`: the server passes `&mut` its local here.
         assert_eq!(
@@ -1840,13 +1991,13 @@ mod tests {
                 .unwrap()
                 .type_decl_for_func()
                 .unwrap(),
-            "&mut Vec<rsbinder::ParcelFileDescriptor>"
+            "&mut ::std::vec::Vec<rsbinder::ParcelFileDescriptor>"
         );
 
         let nullable_array_gen = array_gen.nullable().unwrap();
         assert_eq!(
             nullable_array_gen.type_decl_for_func().unwrap(),
-            "Option<&[Option<rsbinder::ParcelFileDescriptor>]>"
+            "::core::option::Option<&[::core::option::Option<rsbinder::ParcelFileDescriptor>]>"
         );
         assert_eq!(
             nullable_array_gen
@@ -1855,7 +2006,7 @@ mod tests {
                 .unwrap()
                 .type_decl_for_func()
                 .unwrap(),
-            "&mut Option<Vec<Option<rsbinder::ParcelFileDescriptor>>>"
+            "&mut ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::ParcelFileDescriptor>>>"
         );
         assert_eq!(
             nullable_array_gen
@@ -1863,7 +2014,7 @@ mod tests {
                 .unwrap()
                 .type_decl_for_func()
                 .unwrap(),
-            "&mut Option<Vec<Option<rsbinder::ParcelFileDescriptor>>>"
+            "&mut ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::ParcelFileDescriptor>>>"
         );
 
         let gen = TypeGenerator::new(&NonArrayType {
@@ -1879,7 +2030,7 @@ mod tests {
                 .unwrap()
                 .type_decl_for_func()
                 .unwrap(),
-            "&mut Vec<bool>"
+            "&mut ::std::vec::Vec<bool>"
         );
 
         // `ITestService.aidl` `ReverseUtf8CppStringList` input: `Option<&[Option<String>]>`.
@@ -1892,7 +2043,7 @@ mod tests {
         let nullable_array_gen = gen.array(&Vec::new()).unwrap().nullable().unwrap();
         assert_eq!(
             nullable_array_gen.type_decl_for_func().unwrap(),
-            "Option<&[Option<String>]>"
+            "::core::option::Option<&[::core::option::Option<::std::string::String>]>"
         );
     }
 
@@ -1914,10 +2065,10 @@ mod tests {
             .init_value(None, InitParam::builder().with_const(false))
             .unwrap();
         assert!(
-            field_default.contains("std::array::from_fn"),
+            field_default.contains("::core::array::from_fn"),
             "parcelable field default must not be bare Default::default(): {field_default}"
         );
-        assert!(big.default_value().contains("std::array::from_fn"));
+        assert!(big.default_value().contains("::core::array::from_fn"));
 
         // Every dimension <= 32 keeps `Default::default()`.
         let small = TypeGenerator::new(&NonArrayType {
@@ -1930,7 +2081,7 @@ mod tests {
             const_expr: Some(ConstExpr::new(ValueType::Int32(8))),
         }])
         .unwrap();
-        assert_eq!(small.default_value(), "Default::default()");
+        assert_eq!(small.default_value(), "::core::default::Default::default()");
     }
 
     #[test]
@@ -1995,6 +2146,9 @@ mod tests {
             .unwrap()
             .nullable()
             .unwrap();
-        assert_eq!(array_nullable.type_declaration(true), "Option<[bool; 2]>");
+        assert_eq!(
+            array_nullable.type_declaration(true),
+            "::core::option::Option<[bool; 2]>"
+        );
     }
 }

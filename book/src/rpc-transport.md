@@ -205,10 +205,59 @@ let session = RpcSession::setup_unix_client_android13plus(
 )?;
 ```
 
-Both stacks have been validated end-to-end against **real AOSP
-`libbinder`** on Android 13/14/15/16 emulators (full parcel-body
+The android-13+ profile has been validated end-to-end against **real
+AOSP `libbinder`** on Android 13/14/15/16 emulators (full parcel-body
 transact, byte-correct), so an rsbinder RPC server can serve a real
 Android `libbinder` client and vice versa.
+
+### The Android 12 (r34) profile
+
+The default profile speaks the wire of Android 12 and 12L
+(`android-12.0.0_r1` through `r34`, SDK 31 and 32), whose RPC code did
+not change across those releases. It has no handshake:
+
+- A client opens each connection by writing an `int32` session id: `-1`
+  for a new session. After that every message is a 16-byte
+  `RpcWireHeader` and the body it announces, with no length prefix.
+- Every binder in a parcel, a null one included, is followed by its
+  stability as Android 12 writes it (`0x0c000001` for the default
+  `Stability::System`, `0x00000001` for null), whatever the host's SDK.
+- An `RpcServer` mints an id for each new session. An Android 12 client
+  reads `GET_MAX_THREADS` and `GET_SESSION_ID`, then opens
+  `max_threads - 1` more connections that write that id; the server
+  serves each as its own connection of the session, so calls on
+  different connections run at once. A local connection joins only from
+  the founding connection's uid, a check Android 12 does not make.
+  `RpcSession::get_session_id` returns the id's 4 bytes.
+- An rsbinder r34 client opens one connection and does not join more.
+
+Android 12 libbinder differs from what rsbinder offers on this wire:
+
+| | Android 12 libbinder | rsbinder r34 |
+|---|---|---|
+| Largest message body | 100,000 bytes (`kMaxTransactionAllocation`): it refuses to send more (`NO_MEMORY`). A server connection that receives more closes; a client waiting for a larger reply gets `NO_MEMORY` with the body left unread, and its next call on that connection ends its session | `MAX_FRAME_LEN` (64 MiB) |
+| TLS | none | r34 inside TLS, between rsbinder peers only |
+| Incoming (callback) connections | none | none |
+| File descriptors | refused (`BAD_TYPE`) | `negotiate_fd_transport`, between rsbinder peers only; against Android 12 it returns `None` |
+| A session ends | when its last connection does | when any one of its connections does |
+
+Keep a parcel exchanged with Android 12 under 100,000 bytes. The last
+row matters only when one of a session's connections fails on its own:
+an Android 12 client opens and closes them together.
+
+> **0.12.0 changed this wire.** Releases before it framed every r34
+> message with a `u32` length and wrote no session id or stability, so
+> they cannot talk to Android 12 libbinder, and a 0.12.0 peer and an
+> older one refuse each other's first bytes. Upgrade both ends together.
+> A custom `RpcTransport` must implement `send_raw` / `recv_raw`; see the
+> CHANGELOG.
+
+This profile has been validated against real Android 12 libbinder on an
+SDK 31 emulator, both ways: an Android 12 client against an rsbinder
+`RpcServer` with three connections per session (parallel calls, oneway
+order, nested callbacks, null binders, reference counts, the size limit),
+and an rsbinder client against an Android 12 `RpcServer`
+(`example-hello/cpp/run_rpc_r34_interop.sh`).
 
 ## Transports
 
@@ -231,7 +280,11 @@ rsbinder = { version = "0.12", features = ["rpc", "rpc-vsock"] }
 
 Each backend implements the
 [`RpcTransport`](https://docs.rs/rsbinder/latest/rsbinder/rpc/transport/trait.RpcTransport.html)
-trait — you can implement your own if you need a custom carrier.
+trait — you can implement your own if you need a custom carrier. A
+session moves its bytes through `send_raw` / `recv_raw` on both wire
+profiles, so a transport of your own implements those; the trait's
+`send_frame` / `recv_frame` are a separate length-prefixed API no session
+calls.
 
 ### Abstract Unix-domain sockets (Linux/Android)
 
@@ -501,7 +554,8 @@ kernel binder for, with a few extras specific to socket transport:
 `setMaxIncomingThreads`. Both `N == 1` (the default — one connection
 per session, the mode every example in the book uses) and `N >= 2`
 (multi-connection sessions) are validated against real Android 13–16
-libbinder peers. See the rustdoc on
+libbinder peers. On the r34 wire `N` is how many connections an
+Android 12 client opens ([The Android 12 (r34) profile](#the-android-12-r34-profile)). See the rustdoc on
 [`RpcServer::set_max_threads`](https://docs.rs/rsbinder/latest/rsbinder/rpc/struct.RpcServer.html#method.set_max_threads)
 for the per-mode details.
 

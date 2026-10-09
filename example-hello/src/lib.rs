@@ -76,9 +76,9 @@ pub mod settings {
     pub const STORE_PATH: &str = "/tmp/rsb_settings.bin";
 }
 
-/// Argument shapes the AOSP fixture corpus never uses (`out` scalars with no
-/// `Default`, `@nullable` primitive arrays, non-nullable `inout` binder
-/// arrays). The `.aidl` is shared with the tests crate;
+/// Argument shapes the AOSP fixture corpus never uses (non-nullable `out` and
+/// `inout` binder arrays, `@nullable` primitive arrays). The `.aidl` is shared
+/// with the tests crate;
 /// `bin/codegen_shapes_interop_service` serves it to
 /// `cpp/codegen_shapes_interop`, a real-libbinder client.
 pub mod shapes {

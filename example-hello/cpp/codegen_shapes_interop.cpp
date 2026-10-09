@@ -15,8 +15,7 @@
 // What is asserted:
 //   1. `inout @nullable int[]`  — [1,2,3] comes back [1,2,3,99]; null stays null.
 //   2. `in/out @nullable int[3]` — [4,5,6] comes back [6,5,4]; null stays null.
-//   3. `out IBinder` (non-nullable) — filled, it round-trips; left unset, the
-//      call must fail observably rather than deliver a null binder.
+//   3. `out IBinder[]` (non-nullable) — filled, it round-trips; unset elements arrive null.
 //   5. `@FixedSize` union `Tag[]` — a byte[] (`AParcel_{write,read}ByteArray`).
 //   6. A service's `Status::from(StatusCode::UnexpectedNull)` — the transact
 //      status STATUS_UNEXPECTED_NULL, as AOSP `Status::fromStatusT`, not an
@@ -50,7 +49,7 @@ constexpr const char* kDescriptor = "shapes.ICodegenShapes";
 constexpr const char* kServiceName = "rsbinder.test.shapes";
 
 // Method order in `ICodegenShapes.aidl`.
-constexpr transaction_code_t kTxTakeOutBinder = FIRST_CALL_TRANSACTION;
+constexpr transaction_code_t kTxTakeOutBinders = FIRST_CALL_TRANSACTION;
 constexpr transaction_code_t kTxRoundNullableVec = FIRST_CALL_TRANSACTION + 1;
 constexpr transaction_code_t kTxRoundNullableFixed = FIRST_CALL_TRANSACTION + 2;
 constexpr transaction_code_t kTxReverseTags = FIRST_CALL_TRANSACTION + 4;
@@ -139,12 +138,31 @@ bool write_i32_array(AParcel* p, void* ctx) {
 struct OutBinderArgs {
     AIBinder* src;
     bool fill;
+    int32_t size;
 };
 
+// An `out` array sends only its length, as AOSP's `AParcel_writeVectorSize`.
 bool write_out_binder_args(AParcel* p, void* ctx) {
     auto* a = static_cast<OutBinderArgs*>(ctx);
     if (AParcel_writeStrongBinder(p, a->src) != STATUS_OK) return false;
-    return AParcel_writeBool(p, a->fill) == STATUS_OK;
+    if (AParcel_writeBool(p, a->fill) != STATUS_OK) return false;
+    return AParcel_writeInt32(p, a->size) == STATUS_OK;
+}
+
+// `IBinder[]` wire: int32 count, then strong binders; false if unreadable, `nulls` counts nulls.
+bool read_binder_array(const AParcel* p, int32_t* count, int32_t* nulls) {
+    if (AParcel_readInt32(p, count) != STATUS_OK) return false;
+    *nulls = 0;
+    for (int32_t i = 0; i < *count; i++) {
+        AIBinder* got = nullptr;
+        if (AParcel_readStrongBinder(p, &got) != STATUS_OK) return false;
+        if (got) {
+            AIBinder_decStrong(got);
+        } else {
+            (*nulls)++;
+        }
+    }
+    return true;
 }
 
 // ---- the three cases ------------------------------------------------
@@ -231,46 +249,36 @@ void test_nullable_fixed(AIBinder* binder) {
 }
 
 void test_out_binder(AIBinder* binder) {
-    printf("[3] out IBinder (non-nullable)\n");
+    printf("[3] out IBinder[] (non-nullable)\n");
     {
-        OutBinderArgs args{binder, true};
+        OutBinderArgs args{binder, true, 2};
         Reply reply;
-        if (!transact(binder, kTxTakeOutBinder, write_out_binder_args, &args, &reply)) {
+        if (!transact(binder, kTxTakeOutBinders, write_out_binder_args, &args, &reply)) {
             check(false, "transact (filled)");
             return;
         }
         check(reply.ok(), "reply status is EX_NONE");
         if (!reply.ok()) return;
-        AIBinder* got = nullptr;
-        binder_status_t st = AParcel_readStrongBinder(reply.parcel, &got);
-        check(st == STATUS_OK && got != nullptr, "a filled out-binder round-trips");
-        if (got) AIBinder_decStrong(got);
+        int32_t count = 0;
+        int32_t nulls = 0;
+        bool read = read_binder_array(reply.parcel, &count, &nulls);
+        check(read && count == 2 && nulls == 0, "a filled out-binder array round-trips");
     }
     {
-        OutBinderArgs args{binder, false};
+        OutBinderArgs args{binder, false, 1};
         Reply reply;
-        if (!transact(binder, kTxTakeOutBinder, write_out_binder_args, &args, &reply)) {
+        if (!transact(binder, kTxTakeOutBinders, write_out_binder_args, &args, &reply)) {
             check(false, "transact (unset)");
             return;
         }
-        // A conforming client must not end up holding a null binder from a
-        // call it believes succeeded. Any of: transact error, non-EX_NONE
-        // status, unreadable binder — is an observable failure.
-        bool delivered_null = false;
-        if (reply.ok()) {
-            AIBinder* got = nullptr;
-            if (AParcel_readStrongBinder(reply.parcel, &got) == STATUS_OK && got == nullptr) {
-                delivered_null = true;
-            }
-            if (got) AIBinder_decStrong(got);
-        }
         printf("    (transact=%d exception=%d)\n", reply.transact_status, reply.exception);
-        check(!delivered_null, "an unset out-binder is not delivered as a silent null");
-        // The generated server arm turns the unset `Option` into
-        // UNEXPECTED_NULL, which reaches the client as the transact status —
-        // the same value AOSP's own generated server produces.
-        check(reply.transact_status == STATUS_UNEXPECTED_NULL,
-              "the failure surfaces as STATUS_UNEXPECTED_NULL");
+        check(reply.ok(), "reply status is EX_NONE (unset)");
+        if (!reply.ok()) return;
+        // Legal: AOSP's Rust backend guards only `out ParcelFileDescriptor[]`.
+        int32_t count = 0;
+        int32_t nulls = 0;
+        bool read = read_binder_array(reply.parcel, &count, &nulls);
+        check(read && count == 1 && nulls == 1, "an unset element arrives as a null binder");
     }
 }
 

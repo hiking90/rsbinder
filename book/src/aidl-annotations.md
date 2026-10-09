@@ -157,13 +157,17 @@ pub struct RecursiveList {
 
 The `Box` indirection is necessary because without it, `RecursiveList` would contain itself directly, making the type infinitely large.
 
-In rsbinder the `Box<T>` comes from the generator's own **cycle analysis**, not
-from `heap=true`, which is accepted for AOSP syntax compatibility and then
-ignored. A field is boxed whenever it can reach its own enclosing type by
-value — a cycle of any length, not just a direct self-reference — and is left
-alone when the path runs through an interface handle or a `Vec` element, which
-already keep the type finite. Keep writing `heap=true` if the same AIDL must
-also compile under the AOSP toolchain.
+As in AOSP's Rust backend, a `heap=true` field is `Option<Box<T>>` wherever it
+is, on a cycle or not, and a method argument or return keeps its usual type.
+`heap=true` is accepted only on a parcelable or union type, and `heap` is the
+annotation's only parameter; anything else is an error, as in AOSP.
+
+rsbinder also boxes a bare `@nullable` field that closes a reference cycle — a
+cycle of any length, not just a direct self-reference — because Rust can
+represent it. A path through an interface handle or a `Vec` element already
+keeps the type finite and closes no cycle. AOSP's `aidl` rejects a bare
+`@nullable` on a cycle, so rsbinder-aidl prints a `cargo:warning` for it; write
+`heap=true` if the same AIDL must also compile under the AOSP toolchain.
 
 For non-recursive optional fields, plain `@nullable` is sufficient and avoids the extra heap allocation.
 

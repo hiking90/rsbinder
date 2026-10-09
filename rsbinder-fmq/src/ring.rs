@@ -1,35 +1,7 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! The only code that touches ring memory: copies in and out of it, every
-//! access a relaxed atomic.
-//!
-//! A run of ring bytes is split at its first `usize` boundary: `AtomicU8`
-//! up to it, `AtomicUsize` words after it, `AtomicU8` for the bytes left
-//! over. The split depends only on the run's address, so two copies over
-//! the same bytes from the same start use the same access sizes. The ring
-//! base is 8-aligned (grantor offsets are multiples of 8 and `mmap` returns
-//! a page-aligned address), but a run starts wherever its element does —
-//! any byte for `u8` elements — so nothing here relies on that alignment.
-//!
-//! Within one mapping no two threads ever copy at once (the module doc of
-//! `rsbinder::shared_memory` states why that matters for mixed sizes):
-//! [`Regions`](crate::Regions) is neither `Send` nor `Sync` and exists only
-//! under a `&mut MessageQueue`, which is not `Sync`. Another handle on the
-//! same memory is another mapping, and the Rust abstract machine sees its
-//! stores, like the peer's, as changes made from outside this mapping.
-//!
-//! `Run::new` is sound when its caller keeps three conditions: `at..at + len`
-//! stays mapped for the run's lifetime; this process reaches those bytes only
-//! through atomics; and no other thread accesses them at the same time with a
-//! different access size through this mapping (two runs from different
-//! starts split the same bytes differently). Given those, each slice it
-//! builds lies inside `at..at + len`; `AtomicU8` has `u8`'s size and
-//! alignment; the word slice starts on a `WORD` boundary and `AtomicUsize`
-//! has `usize`'s size and alignment; an empty word slice is `&[]`, because
-//! the head's end may be unaligned and `from_raw_parts` wants an aligned
-//! pointer even for length 0; and every pointer derives from the non-null
-//! `at`.
+//! Copies in and out of ring memory, each access a relaxed atomic; see [`Regions`](crate::Regions).
 
 use std::mem::size_of;
 use std::ptr::NonNull;
@@ -47,14 +19,14 @@ pub(crate) struct Run<'a> {
 }
 
 impl Run<'_> {
-    /// Safety: mapped, atomic-only, no concurrent other-size access (module doc, `Run::new`).
+    /// Safety: `at..at + len` stays mapped, atomic-only, no concurrent other-size access.
     #[inline]
     pub(crate) unsafe fn new(at: NonNull<u8>, len: usize) -> Self {
         let head_len = ((WORD - at.as_ptr() as usize % WORD) % WORD).min(len);
         let word_count = (len - head_len) / WORD;
         let tail_len = len - head_len - word_count * WORD;
         let at = at.as_ptr();
-        // SAFETY: the caller keeps the three conditions the module doc lists for `Run::new`.
+        // SAFETY: contract above; slices tile `at..at + len`, words aligned, empty is `&[]`.
         unsafe {
             let words: &[AtomicUsize] = if word_count == 0 {
                 &[]

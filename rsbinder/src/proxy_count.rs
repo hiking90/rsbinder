@@ -25,7 +25,7 @@
 //! Enabling it (`COUNT_BY_UID_ENABLED`) does **not** retroactively populate
 //! the uid map; only proxies created after the flip are tracked.
 //! `on_proxy_create` returns whether it incremented the uid map, and the
-//! proxy records that as `counted_by_uid` so its `on_proxy_drop` decrements
+//! handle's pin records that with the uid so its `on_proxy_drop` decrements
 //! the map iff its create did. Re-reading the live flag at drop instead
 //! would, after tracking is toggled off with proxies live, skip the matching
 //! decrement and permanently inflate the uid's count (and latch its
@@ -181,9 +181,14 @@ fn fire_callback(cb: &ProxyCountCallback, event: ProxyCountEvent) {
 
 /// Snapshot of the process-global proxy count.
 ///
-/// Counts every live kernel [`ProxyHandle`](crate::proxy::ProxyHandle);
-/// RPC proxies (the `rpc` feature) are not counted, matching the AOSP
-/// "BpBinder kernel proxies only" surface.
+/// Counts kernel proxies the way AOSP counts `BpBinder` objects: a handle
+/// is counted from its first proxy until the last proxy *and* the last
+/// [`WIBinder`](crate::WIBinder) for it are gone, so a handle only a
+/// `WIBinder` keeps is still counted, and re-receiving it while that
+/// `WIBinder` lives does not count it again. The per-uid count charges the
+/// uid seen when the handle was first counted. RPC proxies (the `rpc`
+/// feature) are not counted, matching the AOSP "BpBinder kernel proxies
+/// only" surface.
 pub fn get_binder_proxy_count() -> u64 {
     PROXY_COUNT.load(Ordering::Relaxed)
 }
@@ -257,7 +262,7 @@ pub fn clear_count_by_uid() {
     state.per_uid.clear();
 }
 
-/// `ProxyHandle::new_acquired` hook; `true` iff counted per uid (module doc "Per-uid tracking").
+/// `HandlePin::count_once` hook; `true` iff counted per uid (module doc "Per-uid tracking").
 pub(crate) fn on_proxy_create(uid: u32) -> bool {
     PROXY_COUNT.fetch_add(1, Ordering::Relaxed);
     if !COUNT_BY_UID_ENABLED.load(Ordering::Relaxed) {
@@ -299,7 +304,7 @@ pub(crate) fn on_proxy_create(uid: u32) -> bool {
     true
 }
 
-/// `ProxyHandle::drop` hook; joint debounce reset at `<= low` (module doc "Per-uid tracking").
+/// `HandlePin::drop` hook; joint debounce reset at `<= low` (module doc "Per-uid tracking").
 pub(crate) fn on_proxy_drop(uid: u32, counted_by_uid: bool) {
     PROXY_COUNT.fetch_sub(1, Ordering::Relaxed);
     if !counted_by_uid {
@@ -486,7 +491,7 @@ mod tests {
         assert_eq!(get_binder_proxy_count(), 2);
         clear_count_by_uid();
         assert_eq!(get_binder_proxy_counts_by_uid(), vec![]);
-        // The global counter tracks live `ProxyHandle`s, not the per-uid statistic.
+        // The global counter tracks live proxy pins, not the per-uid statistic.
         assert_eq!(get_binder_proxy_count(), 2);
         on_proxy_drop(1000, true);
         on_proxy_drop(2000, true);

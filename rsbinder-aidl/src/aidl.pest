@@ -3,11 +3,11 @@
 
 document = _{ SOI ~ package? ~ imports* ~ decls ~ EOI }
 
-package = { "package" ~ qualified_name ~ ";" }
+package = { PACKAGE ~ qualified_name ~ ";" }
 
 imports = { import+ }
 
-import = _{ "import" ~ qualified_name ~ ";" }
+import = _{ IMPORT ~ qualified_name ~ ";" }
 
 decls = _{ decl+ }
 
@@ -30,7 +30,7 @@ parcelable_decl = {
 
 interface_decl = {
     INTERFACE ~ qualified_name ~ ";" |
-    ONEWAY* ~ INTERFACE ~ qualified_name ~ "{" ~ interface_members? ~ "}"
+    ONEWAY? ~ INTERFACE ~ qualified_name ~ "{" ~ interface_members? ~ "}"
 }
 
 // Iterative: per-member recursion overflows on 1000s of methods, unseen by `check_nesting_depth`.
@@ -75,7 +75,7 @@ method_decl = {
     annotation_list* ~ ONEWAY? ~ type ~ identifier ~ "(" ~ arg_list? ~ ")" ~ "=" ~ INTVALUE ~ ";"
 }
 
-direction = @{ (INOUT | IN | OUT) ~ &WHITESPACE }
+direction = @{ (INOUT | IN | OUT) ~ WORD_END }
 
 // A single direction, as AOSP `aidl_language_y.yy` (`direction: IN | OUT | INOUT | empty`).
 arg = {
@@ -112,12 +112,17 @@ variable_decl = {
 
 parcelable_members = { (variable_decl | constant_decl | decl)+ }
 
+// AOSP `aidl_language_l.ll` tokens that `identifier` (`aidl_language_y.yy`) does not accept.
+// A longer word precedes its prefix (`inout`, `interface` before `in`): no backtracking.
 keywords = @{
     (
-        INTERFACE | ONEWAY | CONST | INOUT | IN | OUT | ENUM | UNION | CPP_HEADER | NDK_HEADER | RUST_TYPE | PARCELABLE |
-        TRUE_LITERAL | FALSE_LITERAL
-    ) ~ &WHITESPACE
+        "interface" | "parcelable" | "package" | "import" | "inout" | "in" | "out" | "oneway" |
+        "const" | "enum" | "union" | "true" | "false"
+    ) ~ WORD_END
 }
+
+// The flex lexer takes the longest token, so a keyword is a whole word (`interfaceI` is a name).
+WORD_END = _{ !("_" | ASCII_ALPHANUMERIC) }
 
 parameter = { identifier ~ "=" ~ const_expr }
 
@@ -173,23 +178,26 @@ value = {
 
 ANNOTATION = @{ "@" ~ identifier }
 
-INTERFACE = _{ "interface" }
-ONEWAY = @{ "oneway" ~ !("_" | ASCII_ALPHANUMERIC) }
-CONST = _{ "const" }
+// `&keywords` keeps a keyword whole without implicit whitespace; none here prefixes another.
+INTERFACE = _{ &keywords ~ "interface" }
+PACKAGE = _{ &keywords ~ "package" }
+IMPORT = _{ &keywords ~ "import" }
+ONEWAY = @{ "oneway" ~ WORD_END }
+CONST = _{ &keywords ~ "const" }
 RSHIFT = { ">>" }
 LSHIFT = { "<<" }
 IN = { "in" }
 OUT = { "out" }
 INOUT = { "inout" }
-ENUM = _{ "enum" }
-UNION = _{ "union" }
+ENUM = _{ &keywords ~ "enum" }
+UNION = _{ &keywords ~ "union" }
 CPP_HEADER = { "cpp_header" }
 NDK_HEADER = { "ndk_header" }
 RUST_TYPE = { "rust_type" }
-PARCELABLE = _{ "parcelable" }
+PARCELABLE = _{ &keywords ~ "parcelable" }
 IDENTIFIER = @{ ("_" | ASCII_ALPHA)+ ~ ("_" | ASCII_ALPHA | ASCII_DIGIT)* }
-TRUE_LITERAL = @{ "true" ~ !("_" | ASCII_ALPHANUMERIC) }
-FALSE_LITERAL = @{ "false" ~ !("_" | ASCII_ALPHANUMERIC) }
+TRUE_LITERAL = @{ "true" ~ WORD_END }
+FALSE_LITERAL = @{ "false" ~ WORD_END }
 CHARVALUE = @{ "'" ~ ("\\" ~ ANY | !"'" ~ ANY) ~ "'" }
 INT_SUFFIX = _{ "l" | "L" | "u8" | "u32" | "u64" }
 // `_` between digits (AOSP `1_000_000`); suffixes are AOSP's u8/u32/u64/l/L.

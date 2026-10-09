@@ -128,6 +128,7 @@ pub mod render {
         render_parcelable, ConstMember, EnumMember, EnumRender, FnMembers, InterfaceRender,
         ParcelableMember, ParcelableRender, TransactionWrite, RESERVED_NAME_PREFIX,
     };
+    pub use crate::type_generator::{BOX, OPTION, STRING, VEC};
 }
 pub use parser::parse_document;
 pub use parser::SourceContext;
@@ -300,7 +301,17 @@ fn resolve_import(includes: &[PathBuf], import: &str) -> Vec<PathBuf> {
 // The AST drops import offsets; approximate by text search.
 fn import_span(path: &Path, import: &str) -> (NamedSource<String>, SourceSpan) {
     let source_text = fs::read_to_string(path).unwrap_or_default();
-    let offset = source_text.find(import).unwrap_or(0);
+    // Whole-name match: `p.IFoo` must not land on an earlier `p.IFooBar` or `q.p.IFoo`.
+    let is_name_char = |c: char| c.is_alphanumeric() || c == '_' || c == '.';
+    let offset = source_text
+        .match_indices(import)
+        .find(|(i, _)| {
+            let before = source_text[..*i].chars().next_back();
+            let after = source_text[i + import.len()..].chars().next();
+            !before.is_some_and(is_name_char) && !after.is_some_and(is_name_char)
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(0);
     let len = if offset > 0 { import.len() } else { 0 };
     (
         NamedSource::new(path.to_string_lossy().as_ref(), source_text),
@@ -369,17 +380,147 @@ struct VersionMeta {
     hash: Option<String>,
 }
 
+/// `rerun-if-changed` paths: none missing, none whose cargo rescan reaches what a build writes.
+struct RerunSet {
+    out_dir: Option<PathBuf>,
+    output: Option<PathBuf>,
+    paths: Vec<PathBuf>,
+    // Canonical dirs whose scan, as cargo runs it, reaches nothing the build writes.
+    clean: HashSet<PathBuf>,
+}
+
+impl RerunSet {
+    fn new(out_dir: Option<PathBuf>, output: Option<PathBuf>) -> Self {
+        Self {
+            out_dir: out_dir.as_deref().map(output_key),
+            output: output.as_deref().map(output_key),
+            paths: Vec::new(),
+            clean: HashSet::new(),
+        }
+    }
+
+    fn under_out_dir(&self, key: &Path) -> bool {
+        self.out_dir
+            .as_ref()
+            .is_some_and(|out| key.starts_with(out))
+    }
+
+    /// A dir the walk does not enter: `OUT_DIR` or an ancestor of it, or a tagged cargo dir.
+    fn holds_out_dir(&self, path: &Path) -> bool {
+        let Ok(key) = fs::canonicalize(path) else {
+            return false;
+        };
+        self.out_dir
+            .as_ref()
+            .is_some_and(|out| out.starts_with(&key))
+            || is_cache_dir(&key)
+    }
+
+    /// `key` (canonical) lies under `OUT_DIR`, is the output, or holds either.
+    fn build_written(&self, key: &Path) -> bool {
+        let holds = |out: &Option<PathBuf>| out.as_ref().is_some_and(|out| out.starts_with(key));
+        self.under_out_dir(key) || holds(&self.out_dir) || holds(&self.output)
+    }
+
+    /// Whether cargo's scan of `root` (canonical) reaches a path the build writes.
+    fn scan_reaches_build(&mut self, root: &Path) -> bool {
+        let mut visited = HashSet::from([root.to_path_buf()]);
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            if is_cache_dir(&dir) {
+                return true;
+            }
+            if self.clean.contains(&dir) {
+                continue;
+            }
+            // Unreadable entries are skipped, as cargo's own scan skips them.
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                // Only a symlink leaves `dir`; any other entry's path is already canonical.
+                let key = if entry.file_type().is_ok_and(|t| t.is_symlink()) {
+                    let Ok(key) = fs::canonicalize(entry.path()) else {
+                        continue;
+                    };
+                    key
+                } else {
+                    entry.path()
+                };
+                if self.build_written(&key) {
+                    return true;
+                }
+                if key.is_dir() && visited.insert(key.clone()) {
+                    pending.push(key);
+                }
+            }
+        }
+        self.clean.extend(visited);
+        false
+    }
+
+    fn file(&mut self, path: &Path) {
+        let Ok(key) = fs::canonicalize(path) else {
+            return;
+        };
+        if !self.under_out_dir(&key) && self.output.as_ref() != Some(&key) {
+            self.paths.push(path.to_path_buf());
+        }
+    }
+
+    /// Records `path` unless that would rerun every build; returns whether it was recorded.
+    fn dir(&mut self, path: &Path) -> bool {
+        let Ok(key) = fs::canonicalize(path) else {
+            return false;
+        };
+        let recorded = key.is_dir() && !self.build_written(&key) && !self.scan_reaches_build(&key);
+        if recorded {
+            self.paths.push(path.to_path_buf());
+        }
+        recorded
+    }
+
+    /// The dirs under `root` an import can resolve into: `<root>/<first package segment>`.
+    fn import_dirs(&mut self, root: &Path, tops: &[&str]) {
+        for top in tops {
+            if root == Path::new(".") {
+                self.dir(Path::new(top));
+            } else {
+                self.dir(&root.join(top));
+            }
+        }
+    }
+}
+
+/// `dir` carries a Cache Directory Tagging `CACHEDIR.TAG`, as cargo's target and build dirs do.
+fn is_cache_dir(dir: &Path) -> bool {
+    const SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+    let mut head = [0; SIGNATURE.len()];
+    fs::File::open(dir.join("CACHEDIR.TAG"))
+        .and_then(|mut tag| std::io::Read::read_exact(&mut tag, &mut head))
+        .is_ok_and(|()| head == SIGNATURE)
+}
+
+/// Canonical form of a maybe-missing output path: deepest existing ancestor canonicalized.
+fn output_key(path: &Path) -> PathBuf {
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    abs.ancestors()
+        .find_map(|a| Some(fs::canonicalize(a).ok()?.join(abs.strip_prefix(a).ok()?)))
+        .unwrap_or(abs)
+}
+
 pub struct Builder {
     sources: Vec<PathBuf>,
     includes: Vec<PathBuf>,
-    dest_dir: PathBuf,
+    // `None` outside cargo with no `dest_dir()`: output goes to `aidl_gen`, no rerun consumer.
+    dest_dir: Option<PathBuf>,
     output: PathBuf,
     enabled_async: bool,
     is_crate: bool,
     trace: bool,
     /// Per-source version/hash, keyed by the path passed to [`Builder::source`].
     version_meta: HashMap<PathBuf, VersionMeta>,
-    // Contributing `.aidl` files plus walked dirs: cargo rescans dirs, so additions rerun too.
+    // Filled by `parse_sources` from its `RerunSet`.
     dependencies: Vec<PathBuf>,
     // Builtin declarations an import pulled in: parsed so references resolve, never generated.
     builtin_documents: Vec<parser::Document>,
@@ -396,7 +537,7 @@ impl Builder {
         Self {
             sources: Vec::new(),
             includes: Vec::new(),
-            dest_dir: PathBuf::from(std::env::var_os("OUT_DIR").unwrap_or("aidl_gen".into())),
+            dest_dir: std::env::var_os("OUT_DIR").map(PathBuf::from),
             output: "rsbinder_generated_aidl.rs".into(),
             enabled_async: cfg!(feature = "async"),
             is_crate: false,
@@ -420,7 +561,7 @@ impl Builder {
     /// — would have to mutate the environment to steer the output, which is
     /// not thread-safe. Set the directory here instead.
     pub fn dest_dir(mut self, dir: impl AsRef<Path>) -> Self {
-        self.dest_dir = dir.as_ref().into();
+        self.dest_dir = Some(dir.as_ref().into());
         self
     }
 
@@ -503,6 +644,13 @@ impl Builder {
         self.output = output;
 
         self
+    }
+
+    fn output_path(&self) -> PathBuf {
+        self.dest_dir
+            .as_deref()
+            .unwrap_or(Path::new("aidl_gen"))
+            .join(&self.output)
     }
 
     pub fn set_async_support(mut self, enable: bool) -> Self {
@@ -671,10 +819,15 @@ impl Builder {
         for dir in take(&mut self.includes) {
             let dir = name_the_cwd(dir);
             if include_seen.insert(include_key(&dir)) {
-                self.dependencies.push(dir.clone());
                 includes.push(dir);
             }
         }
+        // `includes[..user_includes]` are `include_dir()`s; the rest are package-derived roots.
+        let user_includes = includes.len();
+        let mut rerun = RerunSet::new(
+            std::env::var_os("OUT_DIR").map(PathBuf::from),
+            self.dest_dir.is_some().then(|| self.output_path()),
+        );
         let mut document_list = Vec::new();
         let mut errors = Vec::new();
 
@@ -705,7 +858,7 @@ impl Builder {
                 if path.is_file() {
                     match Self::parse_file(&path) {
                         Ok((name, doc, ctx)) => {
-                            self.dependencies.push(path.clone());
+                            rerun.file(&path);
                             if let Some(dir) = doc
                                 .package
                                 .as_ref()
@@ -713,8 +866,7 @@ impl Builder {
                             {
                                 let dir = name_the_cwd(dir);
                                 if include_seen.insert(include_key(&dir)) {
-                                    includes.push(dir.clone());
-                                    self.dependencies.push(dir);
+                                    includes.push(dir);
                                 }
                             }
 
@@ -739,7 +891,7 @@ impl Builder {
                         format!("source {path:?} does not exist"),
                     )));
                 } else {
-                    self.dependencies.push(path.clone());
+                    rerun.dir(&path);
                     let entries = fs::read_dir(&path).map_err(|err| {
                         std::io::Error::new(
                             err.kind(),
@@ -756,7 +908,8 @@ impl Builder {
                                 )
                             })?
                             .path();
-                        if path.is_dir()
+                        // Not into `target/`: cargo writes there, and its OUT_DIRs are not sources.
+                        if (path.is_dir() && !rerun.holds_out_dir(&path))
                             || (path.is_file() && path.extension().unwrap_or_default() == "aidl")
                         {
                             sources.push(path);
@@ -860,10 +1013,49 @@ impl Builder {
             return Err(err);
         }
 
+        // A new file changes the result only at an import candidate, under `<root>/<top>`.
+        let mut tops: Vec<&str> = document_list
+            .iter()
+            .map(|(_, doc, _)| doc)
+            .chain(&self.builtin_documents)
+            .flat_map(|doc| doc.imports.values())
+            .filter(|import| !is_builtin_aidl_type(import))
+            .filter_map(|import| import.split('.').next())
+            .collect();
+        tops.sort_unstable();
+        tops.dedup();
+        for (i, root) in includes.iter().enumerate() {
+            // A user dir is watched whole; an inferred root may be any ancestor, e.g. `$HOME`.
+            if i >= user_includes || !rerun.dir(root) {
+                rerun.import_dirs(root, &tops);
+            }
+        }
+        self.dependencies = rerun.paths;
+
         Ok(document_list)
     }
 
-    pub fn generate(mut self) -> Result<(), AidlError> {
+    /// Parse every source and write the generated Rust to the output path.
+    ///
+    /// Findings that do not stop generation print as `cargo:warning=` lines:
+    /// an unknown annotation, and two inputs rsbinder generates but AOSP's
+    /// `aidl` rejects, so the same `.aidl` fails in an Android build. One is a
+    /// type named without an `import` that resolves only because another file
+    /// declares it in the same package (AOSP resolves it only through an
+    /// import, `AidlDocument::ResolveName`); add the `import` the warning
+    /// names. The other is a bare `@nullable` field that closes a reference
+    /// cycle, which AOSP rejects as a recursive parcelable; write
+    /// `@nullable(heap=true)`.
+    pub fn generate(self) -> Result<(), AidlError> {
+        parser::collect_generation_warnings();
+        let result = self.generate_collecting();
+        for w in parser::take_generation_warnings() {
+            println!("cargo:warning={}", w.message);
+        }
+        result
+    }
+
+    fn generate_collecting(mut self) -> Result<(), AidlError> {
         let documents = self.parse_sources()?;
         // An empty output would defer this build-script typo to an include_aidl! import error.
         if documents.is_empty() {
@@ -887,42 +1079,37 @@ impl Builder {
                 });
             }
         }
-        // AOSP `AidlTypenames` "redefinition": one qualified name declared in two files.
+        // AOSP `AidlTypenames::AddDocument` "redefinition": one qualified name in two files.
         let mut defined: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
         for document in &documents {
-            let package = document.1.package.as_deref().unwrap_or_default();
-            for decl in &document.1.decls {
-                let qualified = if package.is_empty() {
-                    decl.name().to_string()
-                } else {
-                    format!("{package}.{}", decl.name())
-                };
-                // Within one file `Generator::document` reports it, with a span.
-                let Some(earlier) = defined.insert(qualified.clone(), &document.2.filename) else {
-                    continue;
-                };
-                if earlier != document.2.filename {
-                    return Err(AidlError::Config {
-                        message: format!(
-                            "type '{qualified}' is defined in both {earlier} and {}",
-                            document.2.filename
-                        ),
-                    });
+            // Nested types too, a union's implicit `Tag` included, as AOSP recurses into them.
+            let mut pending: Vec<&parser::Declaration> = document.1.decls.iter().rev().collect();
+            while let Some(decl) = pending.pop() {
+                let qualified = decl.namespace().to_string(Namespace::AIDL);
+                let tag = matches!(decl, parser::Declaration::Union(_))
+                    .then(|| format!("{qualified}.Tag"));
+                for qualified in std::iter::once(qualified).chain(tag) {
+                    // Within one file `Generator::document` reports it, with a span.
+                    let Some(earlier) = defined.insert(qualified.clone(), &document.2.filename)
+                    else {
+                        continue;
+                    };
+                    if earlier != document.2.filename {
+                        return Err(AidlError::Config {
+                            message: format!(
+                                "type '{qualified}' is defined in both {earlier} and {}",
+                                document.2.filename
+                            ),
+                        });
+                    }
                 }
+                pending.extend(decl.nested_types().rev());
             }
         }
         self.emit_rerun_if_changed();
         Self::emit_warnings(&documents);
 
-        // 1st pass: enums first, so defaults resolve enum references in any file order.
-        for document in &self.builtin_documents {
-            generator::Generator::pre_register_enums(document);
-        }
-        for document in &documents {
-            generator::Generator::pre_register_enums(&document.1);
-        }
-
-        // 2nd pass: generate code, collecting errors across files
+        // Generate code, collecting errors across files.
         let mut package_list = Vec::new();
         let mut errors = Vec::new();
         for document in &documents {
@@ -954,7 +1141,7 @@ impl Builder {
 
         let content = self.generate_all(package_list)?;
 
-        let out_path = self.dest_dir.join(&self.output);
+        let out_path = self.output_path();
         if let Some(parent) = out_path.parent() {
             fs::create_dir_all(parent).map_err(|err| {
                 std::io::Error::new(
@@ -974,13 +1161,35 @@ impl Builder {
     }
 
     /// Return the sorted, deduplicated paths recorded as build-script
-    /// dependencies during the parse phase. Each entry is either a
-    /// `.aidl` file that contributed to the generated output (initial
-    /// sources + transitively resolved imports) or a directory that
-    /// was walked during resolution (user-supplied `include_dir`s,
-    /// [`Builder::source`] paths that resolved to a directory, and
-    /// the include root inferred from each parsed source's package
-    /// declaration — its directory with the package segments stripped).
+    /// dependencies during the parse phase. Each entry is either
+    ///
+    /// - a `.aidl` file that contributed to the generated output (initial
+    ///   sources + transitively resolved imports), or
+    /// - a directory watched so that a **new** `.aidl` file reruns the build:
+    ///   every directory a [`Builder::source`] directory walk visited, each
+    ///   [`Builder::include_dir`], and, for each include root inferred from a
+    ///   parsed source's package declaration, `<root>/<segment>` for the first
+    ///   package segment of every import (the only place an import can
+    ///   resolve into).
+    ///
+    /// cargo rescans a recorded directory recursively, following symlinks,
+    /// and reruns the build script whenever a recorded path is missing, so a
+    /// path is left out when it does not exist, lies under `OUT_DIR`, or its
+    /// rescan would reach `OUT_DIR`, the generated file (`dest_dir`/`output`),
+    /// or a directory holding a `CACHEDIR.TAG` (cargo tags the target and
+    /// build directories it creates), directly or through a symlink. An
+    /// `include_dir` left out — `.` in a crate whose `target/` is inside it —
+    /// is replaced by its `<dir>/<segment>` directories, as an inferred root
+    /// is. A directory walk does not enter a directory that contains
+    /// `OUT_DIR` or is tagged. The cost: a new file directly in a directory
+    /// left out, or under a `<root>/<segment>` that does not exist yet, does
+    /// not rerun the build.
+    ///
+    /// cargo passes a build script no target directory, so one is recognized
+    /// only by `OUT_DIR` or its tag. With `build.build-dir` outside the crate,
+    /// an untagged target directory inside a recorded one (cargo writes the
+    /// tag only when it creates the directory) reruns the build every time;
+    /// removing that directory once lets cargo recreate it tagged.
     ///
     /// This is the same set [`Builder::generate`] emits as
     /// `cargo:rerun-if-changed=` lines, exposed as a non-stdout API so

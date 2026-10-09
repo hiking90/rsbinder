@@ -697,7 +697,10 @@ where
 /// android-13+ and non-Android builds write the raw `Level`: the level value
 /// itself (0/3/12/63) in the low byte, high bytes zero. On Android the encoder
 /// picks by the runtime SDK version (`frameworks/native/libs/binder/include/binder/Stability.h`,
-/// android-11.0.0_r21 through android-14.0.0_r2).
+/// android-11.0.0_r21 through android-14.0.0_r2). That choice is the kernel
+/// path's and the android-13+ RPC wire's: an RPC session on the r34 wire
+/// always writes the android-12 form, since its peer is android-12 libbinder
+/// whatever the host's SDK.
 ///
 /// AOSP-12 declares `Category { uint8_t version; uint8_t reserved[2]; Level level; }`,
 /// builds it with `currentFromLevel` = `{ version: 1, reserved: 0, level }`, and
@@ -736,29 +739,32 @@ impl Stability {
         let required: i32 = required.into();
         (provided & required) == required
     }
+
+    /// AOSP `Stability::Level`: the raw bitmask, `UNDECLARED` (0) for `Local`.
+    pub(crate) const fn level(self) -> i32 {
+        match self {
+            Stability::Local => 0,
+            Stability::Vendor => 0b000011,
+            Stability::System => 0b001100,
+            Stability::Vintf => 0b111111,
+        }
+    }
 }
 
 /// AOSP `Stability::kBinderWireFormatVersion` (`Stability.cpp:31`), stamped into a `Category`.
 const BINDER_WIRE_FORMAT_VERSION: i32 = 1;
 
 /// android-12 `Category::repr()` for a raw `Level`; see `Stability` doc "Wire encoding".
-// Only reachable in the `target_os = "android"` encode branch (and unit tests).
-#[cfg_attr(not(target_os = "android"), allow(dead_code))]
-const fn android12_category_repr(level: i32) -> i32 {
+// The `target_os = "android"` encode branch and the r34 RPC wire, which always speaks it.
+#[cfg_attr(not(any(target_os = "android", feature = "rpc")), allow(dead_code))]
+pub(crate) const fn android12_category_repr(level: i32) -> i32 {
     (level << 24) | BINDER_WIRE_FORMAT_VERSION
 }
 
 // Encoding chosen by SDK version: see the `Stability` rustdoc, "Wire encoding".
 impl From<Stability> for i32 {
     fn from(stability: Stability) -> i32 {
-        use Stability::*;
-
-        let level = match stability {
-            Local => 0,
-            Vendor => 0b000011,
-            System => 0b001100,
-            Vintf => 0b111111,
-        };
+        let level = stability.level();
 
         #[cfg(target_os = "android")]
         {
@@ -835,12 +841,14 @@ impl SIBinder {
 
     /// Construct a weak reference to this binder.
     ///
-    /// Pure `Arc::downgrade` — no kernel command, no trait dispatch.
+    /// No kernel command, no trait dispatch.
     ///
     /// For proxies, the resulting `WIBinder` is genuinely weak: it
     /// snapshots `(handle, stability, generation)` for identity
-    /// (`PartialEq`) but upgrades only while some `Arc<ProxyHandle>`
-    /// for the handle is still alive (kernel strong count > 0). Once
+    /// (`PartialEq`), and holds the handle's cache entry the way a
+    /// `wp<BpBinder>` does (see [`WIBinder`]), but upgrades only while
+    /// some `Arc<ProxyHandle>` for the handle is still alive (kernel
+    /// strong count > 0). Once
     /// the last user `Strong` drops — sending `BC_RELEASE` and driving
     /// the kernel strong count to 0 — `upgrade()` returns
     /// `Err(DeadObject)`, matching Android `wp<BpBinder>::promote()`:
@@ -873,6 +881,7 @@ impl SIBinder {
                     stability: proxy_handle.stability(),
                     generation: proxy_handle.generation(),
                     weak,
+                    pin: Arc::clone(proxy_handle.pin()),
                 },
             }
         } else {
@@ -1007,20 +1016,22 @@ impl Eq for SIBinder {}
 /// depend on whether the underlying binder is a proxy (remote) or a
 /// native (local) one:
 ///
-/// **Proxy.** `upgrade()` is genuinely weak: it succeeds iff some
-/// `Arc<ProxyHandle>` for this handle is still alive in the process,
-/// which is exactly the condition under which the kernel strong count
-/// is still > 0.
-///   - If some `Arc<ProxyHandle>` is still alive, `upgrade()` returns
-///     it directly (a shared strong reference; no kernel command).
+/// **Proxy.** `upgrade()` is genuinely weak: it succeeds iff a proxy of the
+/// same `(handle, generation)` is alive, which keeps the kernel strong count
+/// above 0, and it never sends a kernel command.
+///   - If the `Arc<ProxyHandle>` this `WIBinder` was downgraded from is
+///     still alive, `upgrade()` returns it.
+///   - Otherwise, if a fresh wire delivery of the handle has since revived
+///     the proxy-cache entry this `WIBinder` keeps, `upgrade()` returns that
+///     revived proxy.
 ///   - Otherwise (every user-side `Strong` has been dropped, so the
 ///     last `BC_RELEASE` drove the kernel strong count to 0)
 ///     `upgrade()` returns `Err(DeadObject)`. It does **not** try to
-///     re-acquire the handle: once strong has reached 0, a fresh
-///     `BC_ACQUIRE` followed by a transaction is rejected by the
-///     kernel with `BR_FAILED_REPLY` (the `BC_INCREFS` cache pin keeps
-///     the `binder_ref` slot from being freed, but does not make a
-///     strong-0 ref transactable again). Obtaining a fresh,
+///     re-acquire the handle: the binder driver refuses a `BC_ACQUIRE` on a
+///     strong-0 reference ("tried to use weak ref as strong ref",
+///     `binder_get_ref_olocked`) without an errno, so the next transaction
+///     fails with `BR_FAILED_REPLY`. The Rust binder driver accepts it; this
+///     follows the C driver and AOSP. Obtaining a fresh,
 ///     transactable proxy requires re-resolving the handle through a
 ///     new wire delivery (e.g. by name through the service manager).
 ///
@@ -1028,7 +1039,20 @@ impl Eq for SIBinder {}
 /// `OBJECT_LIFETIME_WEAK`, so a weak→strong promote while strong == 0
 /// routes through `IPCThreadState::attemptIncStrongHandle`, which
 /// returns `INVALID_OPERATION` and refuses the promote — AOSP never
-/// revives a strong ref from weak-only on a binder handle.
+/// revives a strong ref from weak-only on a binder handle. A re-delivery
+/// revives the same `BpBinder` (`getStrongProxyForHandle`'s `force_set`),
+/// after which `promote()` succeeds; the second case above is that.
+///
+/// A proxy `WIBinder` keeps the handle's proxy-cache entry and its kernel
+/// weak ref (`BC_INCREFS`), as a `wp<BpBinder>` keeps the `BpBinder` and
+/// its cache slot (`BpBinder.cpp:280`, `:833-834`). While it lives, the
+/// handle number cannot be given to another node, and a re-resolve of the
+/// handle revives the same `(handle, generation)`, so it compares equal to
+/// the new proxy. Dropping the last such reference once no proxy is left
+/// queues `BC_DECREFS`. After the remote dies the entry is retired, so a
+/// later delivery of the handle is a new generation this `WIBinder` does not
+/// upgrade to (AOSP would hand back the dead `BpBinder`, whose calls fail
+/// with `DEAD_OBJECT`).
 ///
 /// **Native.** `upgrade()` succeeds iff some `Arc<dyn IBinder>` to the
 /// inner binder is still alive in the process. This is plain
@@ -1045,6 +1069,8 @@ pub(crate) enum WIBinderInner {
         stability: Stability,
         generation: u64,
         weak: sync::Weak<dyn IBinder>,
+        /// Keeps the cache entry and its `BC_INCREFS`, as a `wp<BpBinder>` keeps the `BpBinder`.
+        pin: Arc<crate::process_state::HandlePin>,
     },
     /// Native weak reference. Plain `sync::Weak`.
     Native(sync::Weak<dyn IBinder>),
@@ -1056,33 +1082,40 @@ impl WIBinder {
     /// A native weak reference upgrades while some `Arc<dyn IBinder>` to the
     /// binder is alive.
     ///
-    /// A proxy weak reference is genuinely weak: it upgrades only while some
-    /// `Arc<ProxyHandle>` for the handle is alive in the process, i.e. while
-    /// the kernel strong count is above 0. This mirrors Android
+    /// A proxy weak reference is genuinely weak: it upgrades only while a
+    /// proxy of its `(handle, generation)` is alive, which keeps the kernel
+    /// strong count above 0 — the `Arc<ProxyHandle>` it was downgraded from,
+    /// or the proxy a later wire delivery of the handle revived on the cache
+    /// entry this `WIBinder` keeps. This mirrors Android
     /// `wp<BpBinder>::promote()`: `BpBinder` is `OBJECT_LIFETIME_WEAK`, so
     /// promoting a weak reference with strong == 0 goes through
     /// `IPCThreadState::attemptIncStrongHandle`, which returns
     /// `INVALID_OPERATION` and refuses the promote (`RefBase.cpp:627-703`,
-    /// `BpBinder.cpp:267`). AOSP never revives a strong reference from
-    /// weak-only on a binder handle.
+    /// `BpBinder.cpp:267`), while a `BpBinder` that `getStrongProxyForHandle`
+    /// revived with `force_set` (`ProcessState.cpp:398`) promotes again.
     ///
     /// A strong-0 handle is never re-acquired. Once the last user `Strong`
-    /// drops and its `BC_RELEASE` drives the kernel strong count to 0, a
-    /// re-`BC_ACQUIRE` (0→1) followed by a transaction is rejected by the
-    /// kernel with `BR_FAILED_REPLY`: the `BC_INCREFS` cache pin keeps the
-    /// `binder_ref` slot from being freed but does not make a strong-0
-    /// reference transactable. A transactable strong reference requires a
-    /// fresh wire delivery of the handle, e.g. re-resolving the service by
-    /// name through the service manager.
+    /// drops and its `BC_RELEASE` drives the kernel strong count to 0, the
+    /// binder driver refuses a re-`BC_ACQUIRE` (`binder_get_ref_olocked`
+    /// with `need_strong_ref`) and the next transaction fails with
+    /// `BR_FAILED_REPLY`: the `BC_INCREFS` cache pin this `WIBinder` holds
+    /// keeps the `binder_ref` slot from being freed but does not make a
+    /// strong-0 reference transactable. A transactable strong reference
+    /// requires a fresh wire delivery of the handle, e.g. re-resolving the
+    /// service by name through the service manager.
     pub fn upgrade(&self) -> Result<SIBinder> {
         match &self.inner {
             WIBinderInner::Native(weak) => weak
                 .upgrade()
                 .map(SIBinder::from_arc)
                 .ok_or(StatusCode::DeadObject),
-            WIBinderInner::Proxy { weak, .. } => {
-                // Never re-acquires a strong-0 handle (kernel: BR_FAILED_REPLY); see rustdoc.
+            WIBinderInner::Proxy { weak, pin, .. } => {
+                // Never re-acquires a strong-0 handle; only a proxy revived by a delivery (rustdoc).
                 weak.upgrade()
+                    .or_else(|| {
+                        crate::process_state::ProcessState::live_proxy_for_pin(pin)
+                            .map(|arc| arc as Arc<dyn IBinder>)
+                    })
                     .map(SIBinder::from_arc)
                     .ok_or(StatusCode::DeadObject)
             }
@@ -1103,12 +1136,14 @@ impl Debug for WIBinder {
                 stability,
                 generation,
                 weak,
+                ..
             } => f
                 .debug_struct("WIBinder::Proxy")
                 .field("handle", handle)
                 .field("stability", stability)
                 .field("generation", generation)
-                .field("strong_count", &weak.strong_count())
+                // Not the revived proxy's count, which `upgrade()` also reaches; reading it locks.
+                .field("downgraded_from_strong_count", &weak.strong_count())
                 .finish(),
         }
     }
@@ -1123,11 +1158,13 @@ impl Clone for WIBinder {
                 stability,
                 generation,
                 weak,
+                pin,
             } => WIBinderInner::Proxy {
                 handle: *handle,
                 stability: *stability,
                 generation: *generation,
                 weak: sync::Weak::clone(weak),
+                pin: Arc::clone(pin),
             },
         };
         Self { inner }
