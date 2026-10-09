@@ -379,13 +379,41 @@ pub fn __fuzz_decode_wire(input: &[u8]) {
 /// any input; bad negotiation values are rejected, not trusted. (The
 /// android-13+ connection header has its own path — `server_accept` /
 /// `decode_connection_header` — and is not covered here.)
+///
+/// The input is then read as the byte stream an r34 server reads: the
+/// `int32` session id (`read_r34_session_preamble`), then AOSP-framed
+/// messages (`read_aosp_message`) until the input ends, each decoded.
+/// A header announcing more body than the input holds stops the read
+/// before `read_aosp_message` allocates for it, so a run is bounded by
+/// the input, not by `MAX_FRAME_LEN`.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub fn __fuzz_session_handshake(input: &[u8]) {
+    use super::wire_android13::{read_aosp_message, read_r34_session_preamble};
     let c = R34Codec;
     let (pre, rest) = input.split_at(input.len().min(4));
     let _ = c.decode_session_preamble(pre);
     let _ = c.decode_message(rest);
+
+    let mut stream = std::io::Cursor::new(input);
+    if read_r34_session_preamble(&mut stream).is_err() {
+        return;
+    }
+    loop {
+        let at = stream.position() as usize;
+        let left = &input[at..];
+        let Some(size) = left.get(4..8) else { break };
+        let body = u32::from_le_bytes(size.try_into().expect("4 bytes")) as usize;
+        if body > left.len().saturating_sub(WIRE_HEADER_LEN) {
+            break;
+        }
+        match read_aosp_message(&mut stream) {
+            Ok(msg) => {
+                let _ = c.decode_message(&msg);
+            }
+            Err(_) => break,
+        }
+    }
 }
 
 /// Decode-only entrypoint for the `rpc_address_decode` fuzz target: both
@@ -414,6 +442,22 @@ mod tests {
 
     fn rt_codec() -> R34Codec {
         R34Codec
+    }
+
+    /// The fuzz entry reads a whole r34 stream and stops at a body the input does not hold.
+    #[cfg(feature = "fuzzing")]
+    #[test]
+    fn fuzz_session_handshake_reads_the_stream() {
+        let mut input = RPC_SESSION_ID_NEW.to_le_bytes().to_vec();
+        let get_root = R34Codec
+            .encode_transact(&WireTransaction::default())
+            .expect("GET_ROOT");
+        input.extend_from_slice(&get_root);
+        input.extend_from_slice(&get_root);
+        // A header announcing `MAX_FRAME_LEN`: no allocation for it, no panic.
+        input.extend_from_slice(&R34Codec::header(CMD_TRANSACT, MAX_FRAME_LEN).expect("header"));
+        super::__fuzz_session_handshake(&input);
+        super::__fuzz_session_handshake(&input[..7]);
     }
 
     /// `R34Codec::header` rejects a body over `MAX_FRAME_LEN` like `Android13PlusCodec`, no wrap.
