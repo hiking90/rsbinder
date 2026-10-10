@@ -28,9 +28,11 @@
 //! handshakes are in flight.
 //!
 //! The TLS handshake does blocking reads and writes on the raw socket
-//! before the worker arms its admission deadline on the wrapped
-//! transport, so the handshake deadline is armed on the raw stream first:
-//! on the read side for a connected-but-silent peer, and on the write side
+//! before the wrapped transport exists, so the worker arms the admission
+//! deadline on the raw stream. Its whole-phase cut (the raw socket's
+//! `shutdown_handle`) counts the TLS handshake against the deadline; its
+//! socket deadlines bound each wait, on the read side for a
+//! connected-but-silent peer, and on the write side
 //! for a peer that is admitted but stops reading, stalling our handshake
 //! `write_all` once its receive window fills. Without it such a peer pins
 //! its worker — and, under `set_max_connections`, the whole accept loop —
@@ -62,7 +64,14 @@
 //!   serve loop. The android-13+ path lifts both sides after its handshake;
 //!   the r34 path, which has no handshake, reads the client's session-id
 //!   preamble under it, lifts the write side before the serve loop and the
-//!   read side after the first frame. The 10 s default
+//!   read side after the first frame. The socket deadlines start over with
+//!   every wait; the phase as a whole, from the accept to admission, is
+//!   bounded by a thread of the deadline's own that shuts the connection
+//!   down (`RpcTransport::shutdown_handle`) once the phase outlives it.
+//!   The deadline is stopped while the authorizer runs and re-armed with what
+//!   was left: the shutdown could not stop the authorizer, whose time is this
+//!   process's, only drop the connection it admits.
+//!   The 10 s default
 //!   exists so a peer that never sends its handshake cannot hold a
 //!   `max_connections` slot, or pin the server's `Arc`, forever.
 //! - **Serve deadlines.** After the android-13+ handshake the handshake
@@ -173,12 +182,14 @@ use crate::error::{Result, StatusCode};
 use crate::native::Binder;
 use crate::parcel::Parcel;
 
+use super::deadline::PhaseDeadline;
 use super::session::{RpcSession, RpcSessionId, RpcSessionInner};
 #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
 use super::transport::VsockTransport;
 use super::transport::{PeerIdentity, RpcTransport, UnixTransport};
 #[cfg(feature = "rpc-tls")]
 use super::transport::{TlsStream, TlsTransport};
+use super::wire_android13::BAD_SESSION_ID_SIZE;
 use super::RpcResult;
 
 /// Server TLS config, `None` = plain; `Mutex<Option>` like the other late-bound knobs.
@@ -287,6 +298,19 @@ impl RawAccepted {
             #[cfg(feature = "rpc-tls")]
             RawAccepted::Tcp(s) => s.set_write_timeout(timeout),
         }
+    }
+
+    /// What cuts the socket when the admission deadline passes (`PhaseDeadline`).
+    fn shutdown_handle(&self) -> Option<super::deadline::Cut> {
+        use std::os::fd::AsFd;
+        let sock = match self {
+            RawAccepted::Unix(s) => s.as_fd(),
+            #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
+            RawAccepted::Vsock(s) => s.as_fd(),
+            #[cfg(feature = "rpc-tls")]
+            RawAccepted::Tcp(s) => s.as_fd(),
+        };
+        super::transport::socket_shutdown_handle(sock)
     }
 
     /// Wrap on the worker: TLS handshake if `tls_config` is set, else native (plain TCP refused).
@@ -801,8 +825,9 @@ impl RpcServer {
     /// multiplexing) make workers fewer than connections.
     ///
     /// **Slot exhaustion**: each worker holds its admission slot until it
-    /// exits, so a connected-but-silent peer would pin a slot forever
-    /// without a read deadline. The default
+    /// exits, so a connected-but-silent peer, or one that sends its
+    /// handshake a byte at a time, would pin a slot forever without a
+    /// deadline on the handshake. The default
     /// [`set_handshake_timeout`](RpcServer::set_handshake_timeout) guards
     /// against this; do not set it to `None` together with a small `n`
     /// unless the peer set is trusted.
@@ -828,11 +853,23 @@ impl RpcServer {
     /// blocking `write_all` once its receive window fills) is bounded too,
     /// not just a peer that refuses to send.
     ///
+    /// The deadline is on the phase as a whole, from the accept to
+    /// admission, a TLS handshake included: a peer that sends its handshake
+    /// one byte at a time, each well inside `d`, is dropped `d` after it
+    /// connected all the same. The [`set_authorizer`](Self::set_authorizer)
+    /// hook's run is not counted. The socket deadlines bound each wait; a
+    /// thread of the deadline's own cuts the connection when the phase
+    /// outlives it ([`RpcTransport::shutdown_handle`]). A transport handed
+    /// to [`serve_connection`](Self::serve_connection) whose
+    /// `shutdown_handle` is `None` is bounded per wait only.
+    ///
     /// The deadline bounds **only** the handshake/first-contact phase. For
     /// the android-13+ profile it is cleared after the explicit handshake;
     /// for the default r34 profile (no separate handshake) it covers the
-    /// client's `int32` session-id preamble and the first serve-loop frame,
-    /// and is cleared once that frame is read. Either
+    /// client's `int32` session-id preamble and, on a connection that opens a
+    /// new session, its first transaction until that transaction has been
+    /// served (reply sent included); a connection that joins an existing
+    /// session is admitted with its preamble. Either
     /// way an established two-way session may then sit idle between requests
     /// unbounded (the per-call reply deadline is managed separately via
     /// [`RpcSession::set_timeout`](super::RpcSession::set_timeout)).
@@ -934,13 +971,17 @@ impl RpcServer {
     /// server that picks its peers with
     /// [`set_authorizer`](Self::set_authorizer) or TLS client
     /// authentication needs it less. It fits a protocol with regular
-    /// traffic.
+    /// traffic. It bounds silence, not slowness: a peer that keeps sending
+    /// a request one byte at a time is busy, not idle, and holds its worker
+    /// for as long as it keeps that up.
     ///
     /// The serve phase arms this value on the **write** side too, so a peer
-    /// that stops draining replies ends the session as well. The write half
-    /// bounds each wait for socket buffer space, not a whole reply: a
-    /// consumer that reads a large reply slowly but steadily is not cut,
-    /// one that reads nothing for `d` is. With
+    /// that stops draining replies ends the session as well. Both halves
+    /// count from the client's last progress, not from the start of a reply:
+    /// a consumer that reads a large reply slowly but steadily is not cut,
+    /// even after the reply's send has returned and its tail waits in the
+    /// socket, and one that reads nothing for `d` is
+    /// ([`transport` doc "A slow peer"](super::transport#a-slow-peer)). With
     /// [`set_reply_timeout`](Self::set_reply_timeout) also set, the smaller
     /// of the two bounds the sends. The write half is the transport's
     /// [`RpcTransport::set_write_timeout`]:
@@ -1032,8 +1073,9 @@ impl RpcServer {
     /// callback behind a busy pool can take up to twice this value
     /// end-to-end.
     ///
-    /// Being the session's `set_timeout`, it also bounds each wait for
-    /// socket buffer space on every connection of the session and, on TCP,
+    /// Being the session's `set_timeout`, it also bounds how long a send on
+    /// any connection of the session may go without the client's progress
+    /// and, on TCP,
     /// sizes the kernel's check that the client's host still answers
     /// ([`RpcTransport::set_liveness`] has the values and platform limits).
     ///
@@ -1078,7 +1120,10 @@ impl RpcServer {
     /// thread — concurrently across connections, not serialized by the
     /// accept loop — and holds that connection's
     /// [`set_max_connections`](Self::set_max_connections) admission slot
-    /// for its whole duration.
+    /// for its whole duration. That duration does not count against
+    /// [`set_handshake_timeout`](Self::set_handshake_timeout), which bounds
+    /// the peer's part of admission: the deadline shuts the socket down,
+    /// which would not stop the hook, only drop the connection it admits.
     pub fn set_authorizer<F>(&self, f: F)
     where
         F: Fn(&PeerIdentity) -> bool + Send + Sync + 'static,
@@ -1404,7 +1449,7 @@ impl RpcServer {
         let handle = match std::thread::Builder::new()
             .name("rpc-conn".into())
             .spawn(move || {
-                Self::run_connection_in_worker(server, transport);
+                Self::run_connection_in_worker(server, transport, None);
             }) {
             Ok(h) => h,
             Err(e) => {
@@ -1429,11 +1474,14 @@ impl RpcServer {
                     log::warn!("RPC: failed to prepare accepted stream, dropping: {e:?}");
                     return;
                 }
-                // The TLS handshake in `wrap_accepted` precedes the worker's own deadline.
+                // Socket deadlines bound each wait; `admission` bounds the phase.
                 let handshake_timeout = *server
                     .handshake_timeout
                     .lock()
                     .expect("handshake_timeout poisoned");
+                // Accept to admission, TLS handshake included: `set_handshake_timeout`.
+                let admission =
+                    PhaseDeadline::arm_with(handshake_timeout, || raw.shutdown_handle());
                 if let Some(d) = handshake_timeout {
                     if let Err(e) = raw.set_read_timeout(Some(d)) {
                         log::debug!("RPC: failed to arm pre-wrap handshake read timeout: {e:?}");
@@ -1444,12 +1492,16 @@ impl RpcServer {
                 }
                 let transport = match server.wrap_accepted(raw) {
                     Ok(t) => t,
+                    Err(_) if admission.fired() => {
+                        log::warn!("RPC: handshake deadline passed during the transport wrap");
+                        return;
+                    }
                     Err(e) => {
                         log::warn!("RPC transport wrap (TLS or native) failed: {e:?}");
                         return;
                     }
                 };
-                Self::run_connection_in_worker(server, transport);
+                Self::run_connection_in_worker(server, transport, Some(admission));
             });
         // Spawn can fail (EAGAIN): drop the connection rather than panic in the accept loop.
         let handle = match spawned {
@@ -1490,14 +1542,35 @@ impl RpcServer {
         }
     }
 
-    /// Worker body after the wrap: authorize, then serve the r34 or android-13+ path inline.
-    fn run_connection_in_worker(server: Arc<Self>, transport: Box<dyn RpcTransport>) {
+    /// Worker body after the wrap; `admission` is the accept's deadline, `None` arms one here.
+    fn run_connection_in_worker(
+        server: Arc<Self>,
+        transport: Box<dyn RpcTransport>,
+        admission: Option<PhaseDeadline>,
+    ) {
         // Authorization gate (`authorizer` field doc); a TLS peer identity is already final.
         let authorizer = server
             .authorizer
             .lock()
             .expect("authorizer poisoned")
             .clone();
+        // Bound the handshake phase; `arm_serve_timeouts` swaps in the serve deadline later.
+        let handshake_timeout = *server
+            .handshake_timeout
+            .lock()
+            .expect("handshake_timeout poisoned");
+        // The cut cannot stop the authorizer, so its run is left out of the peer's phase.
+        let (mut admission, rearm) = match admission {
+            Some(mut armed) if authorizer.is_some() => match armed.stop() {
+                Some(left) => (PhaseDeadline::none(), Some(left)),
+                None => {
+                    log::warn!("RPC: the handshake deadline passed before the authorizer ran");
+                    return;
+                }
+            },
+            Some(armed) => (armed, None),
+            None => (PhaseDeadline::none(), Some(handshake_timeout)),
+        };
         if let Some(authz) = authorizer {
             let peer = transport.peer_identity();
             if !authz(&peer) {
@@ -1505,11 +1578,10 @@ impl RpcServer {
                 return;
             }
         }
-        // Bound the handshake phase; `arm_serve_timeouts` swaps in the serve deadline later.
-        let handshake_timeout = *server
-            .handshake_timeout
-            .lock()
-            .expect("handshake_timeout poisoned");
+        // The whole phase; the socket deadlines below bound each wait in it.
+        if let Some(after) = rearm {
+            admission = PhaseDeadline::arm_with(after, || transport.shutdown_handle());
+        }
         if let Some(d) = handshake_timeout {
             if let Err(e) = transport.set_read_timeout(Some(d)) {
                 log::debug!("RPC: failed to arm handshake read timeout: {e:?}");
@@ -1530,12 +1602,30 @@ impl RpcServer {
                 let (transport, codec, client_fd_mode, client_id, incoming) =
                     match RpcSession::android13plus_accept_handshake(transport, max) {
                         Ok(parts) => parts,
+                        Err(_) if admission.fired() => {
+                            log::warn!("android-13+ RPC handshake: the handshake deadline passed");
+                            return;
+                        }
+                        // An id no session can have: refused unread, but counted as a bad id.
+                        Err(super::RpcError::Protocol(BAD_SESSION_ID_SIZE)) => {
+                            server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
+                            log::warn!(
+                                "android-13+ RPC: client supplied a session id that is not \
+                                 32 bytes; rejecting connection"
+                            );
+                            return;
+                        }
                         Err(e) => {
                             // Interop failure: `warn!`; `{e}` names a profile mismatch.
                             log::warn!("android-13+ RPC handshake failed: {e}");
                             return;
                         }
                     };
+                // The handshake is over; a `false` here means the deadline cut it at the end.
+                if !admission.disarm() {
+                    log::warn!("android-13+ RPC handshake: the handshake deadline passed");
+                    return;
+                }
                 // Read once: this socket's deadlines and the session baseline must be one value.
                 let idle = *server.idle_timeout.lock().expect("idle_timeout poisoned");
                 if incoming {
@@ -1696,7 +1786,18 @@ impl RpcServer {
                 );
                 match id {
                     Ok(super::address::RPC_SESSION_ID_NEW) => {}
-                    Ok(id) => return Self::join_r34_session(&server, id, transport),
+                    // A joining connection's admission ends with its preamble.
+                    Ok(id) if admission.disarm() => {
+                        return Self::join_r34_session(&server, id, transport)
+                    }
+                    Ok(_) => {
+                        log::debug!("RPC r34: the handshake deadline passed");
+                        return;
+                    }
+                    Err(_) if admission.fired() => {
+                        log::debug!("RPC r34: the handshake deadline passed");
+                        return;
+                    }
                     Err(e) => {
                         log::debug!("RPC r34: no session-id preamble: {e:?}");
                         return;
@@ -1725,7 +1826,10 @@ impl RpcServer {
                 }
                 session
                     // No deadline armed ⇒ no first-frame `TimedOut` is an eviction of ours.
-                    .serve_blocking_clearing_admission_deadline(handshake_timeout.is_some())
+                    .serve_blocking_clearing_admission_deadline(
+                        handshake_timeout.is_some(),
+                        admission,
+                    )
                     .log("RPC session ended");
             }
         }

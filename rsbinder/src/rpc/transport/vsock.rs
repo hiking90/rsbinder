@@ -22,7 +22,7 @@ use std::os::fd::OwnedFd;
 
 use vsock::{VsockAddr, VsockStream};
 
-use super::{read_frame, write_frame, PeerIdentity, RpcTransport};
+use super::{read_frame, write_frame, OutQueue, PeerIdentity, ReadDeadline, RpcTransport};
 use crate::rpc::RpcResult;
 
 /// A framed transport over a connected vsock stream (Linux).
@@ -36,6 +36,8 @@ pub struct VsockTransport {
     stream: VsockStream,
     peer: PeerIdentity,
     desc: String,
+    reads: ReadDeadline,
+    queue: OutQueue,
 }
 
 impl VsockTransport {
@@ -71,7 +73,13 @@ impl VsockTransport {
             Ok(a) => format!("vsock:cid={},port={}", a.cid(), a.port()),
             Err(_) => "vsock".to_string(),
         };
-        Ok(VsockTransport { stream, peer, desc })
+        Ok(VsockTransport {
+            stream,
+            peer,
+            desc,
+            reads: ReadDeadline::default(),
+            queue: OutQueue::default(),
+        })
     }
 }
 
@@ -93,12 +101,19 @@ impl RpcTransport for VsockTransport {
     /// `vsock://…?profile=android13plus` session starts with a raw write:
     /// on Microdroid/AVF the peer is libbinder and speaks only this wire.
     fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
-        super::write_raw(&mut &self.stream, buf)
+        use std::os::fd::AsFd;
+        // vsock is Linux and Android only, where every send waits in `poll`.
+        let slices = &mut [std::io::IoSlice::new(buf)];
+        super::unix::send_waiting(self.stream.as_fd(), &self.queue, slices, &[], None)
     }
 
     /// Raw, unframed read: `read_raw`, as `UnixTransport::recv_raw`.
     fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize> {
-        super::read_raw(&mut &self.stream, buf)
+        use std::os::fd::AsFd;
+        let sock = Some(self.stream.as_fd());
+        self.reads.read(sock, &self.queue, || {
+            super::read_raw(&mut &self.stream, buf)
+        })
     }
 
     // No fd passing: `fds` reaches only the trait's refusing default.
@@ -112,11 +127,12 @@ impl RpcTransport for VsockTransport {
         if !fds.is_empty() {
             return self.send_raw_with_fds(buf, fds);
         }
-        super::unix::send_draining(
+        super::unix::send_waiting(
             self.stream.as_fd(),
+            &self.queue,
             &mut [std::io::IoSlice::new(buf)],
             &[],
-            drain,
+            Some(drain),
         )
     }
 
@@ -130,6 +146,7 @@ impl RpcTransport for VsockTransport {
 
     fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> RpcResult<()> {
         self.stream.set_read_timeout(timeout)?;
+        self.reads.note(timeout);
         Ok(())
     }
 
@@ -145,5 +162,10 @@ impl RpcTransport for VsockTransport {
     fn peer_closed(&self) -> Option<bool> {
         use std::os::fd::AsFd;
         super::socket_peer_closed(self.stream.as_fd(), super::SocketKind::TcpOrVsock)
+    }
+
+    fn shutdown_handle(&self) -> Option<Box<dyn FnOnce() + Send>> {
+        use std::os::fd::AsFd;
+        super::socket_shutdown_handle(self.stream.as_fd())
     }
 }

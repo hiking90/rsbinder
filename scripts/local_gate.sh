@@ -205,6 +205,8 @@ tier_hermetic() {
     # Skips (and still passes) where unprivileged user namespaces are off; CI sets REQUIRED.
     linux_run "rpc_link_break (network namespace)" tpass cargo test -p rsbinder \
         --features rpc-tls,rpc-tcp-debug --test rpc_link_break
+    linux_run "rpc_slow_peer (network namespace, netem)" tpass cargo test -p rsbinder \
+        --features rpc-tls,rpc-tcp-debug --test rpc_slow_peer
     run "rpc_server: tls nested callback" tpass cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug \
         --test rpc_server -- --exact tls_android13plus_nested_callback_e2e
     run "rpc_server: preconnected inet fd" tpass cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug \

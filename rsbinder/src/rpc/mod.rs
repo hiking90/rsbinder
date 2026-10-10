@@ -104,6 +104,7 @@
 //! made in all three places.
 
 pub mod address;
+pub(crate) mod deadline;
 pub mod end;
 pub mod fd_mode;
 pub(crate) mod lifecycle;

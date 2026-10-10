@@ -115,7 +115,7 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConnection, Connection, ServerConnection};
 use sha2::{Digest, Sha256};
 
-use super::{read_frame, write_frame, CertId, PeerIdentity, RpcTransport};
+use super::{read_frame, write_frame, CertId, OutQueue, PeerIdentity, ReadDeadline, RpcTransport};
 use crate::rpc::{RpcError, RpcResult};
 
 /// Ciphertext read chunk: one TLS record is ≤ 16 KiB, so a read takes about one record.
@@ -242,6 +242,15 @@ pub trait TlsStream: Send + Sync {
     /// default is `None`: such a send then blocks without reading, and a
     /// peer that writes on the connection meanwhile can stall it. The
     /// bundled streams return their socket.
+    ///
+    /// On Linux and Android a `Some` socket carries more than that send:
+    /// every `send_raw` writes to it the same way, and a read with a
+    /// deadline armed looks at its `SIOCOUTQ` and may `poll` it first
+    /// ([module doc "A slow peer"](super#a-slow-peer)). Such a send takes
+    /// its deadline from the socket's own `SO_SNDTIMEO`, not from
+    /// [`set_write_timeout`](Self::set_write_timeout), so a stream that
+    /// returns `Some` must implement `set_write_timeout` by setting
+    /// `SO_SNDTIMEO` on this socket, or its sends wait without a bound.
     fn socket(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
         None
     }
@@ -372,6 +381,8 @@ pub struct TlsTransport {
     shut: std::sync::atomic::AtomicBool,
     /// Ciphertext read off the socket but not yet fed to rustls; reader-only.
     pending_in: Mutex<Vec<u8>>,
+    reads: ReadDeadline,
+    queue: OutQueue,
 }
 
 /// Leaf-cert SHA-256 as [`CertId`]; `subject` is only a label (no X.509 parse), the hash decides.
@@ -391,13 +402,21 @@ fn cert_identity(
 
 /// Run the handshake to completion (blocking, before sharing); verification failures surface here.
 fn drive_handshake(conn: &mut Connection, stream: &dyn TlsStream) -> RpcResult<()> {
+    // A socket deadline is the handshake's deadline, not "nothing sent, retry" (`WouldBlock`).
+    let deadline = |e: std::io::Error| {
+        if super::is_timeout(&e) {
+            RpcError::Timeout
+        } else {
+            RpcError::from(e)
+        }
+    };
     let mut io = IoAdapter(stream);
     while conn.is_handshaking() {
-        let (_rd, _wr) = conn.complete_io(&mut io)?;
+        let (_rd, _wr) = conn.complete_io(&mut io).map_err(deadline)?;
     }
     // Flush any trailing handshake flight still queued.
     while conn.wants_write() {
-        conn.write_tls(&mut io)?;
+        conn.write_tls(&mut io).map_err(deadline)?;
     }
     Ok(())
 }
@@ -427,6 +446,8 @@ impl TlsTransport {
             desc: format!("tls:{server_name}"),
             shut: std::sync::atomic::AtomicBool::new(false),
             pending_in: Mutex::new(Vec::new()),
+            reads: ReadDeadline::default(),
+            queue: OutQueue::default(),
         })
     }
 
@@ -460,6 +481,8 @@ impl TlsTransport {
             desc: "tls:server".to_string(),
             shut: std::sync::atomic::AtomicBool::new(false),
             pending_in: Mutex::new(Vec::new()),
+            reads: ReadDeadline::default(),
+            queue: OutQueue::default(),
         })
     }
 
@@ -501,14 +524,12 @@ impl TlsTransport {
         Ok(())
     }
 
-    /// `send_raw`'s body; with a socket and `drain`, a waiting send reads (`send_raw_draining`).
+    /// `send_raw`'s body; with `sock` a send waits in `poll`, and with `drain` it reads meanwhile.
     fn send_records(
         &self,
         buf: &[u8],
-        mut draining: Option<(
-            std::os::fd::BorrowedFd<'_>,
-            &mut dyn FnMut() -> RpcResult<()>,
-        )>,
+        sock: Option<std::os::fd::BorrowedFd<'_>>,
+        mut drain: Option<&mut dyn FnMut() -> RpcResult<()>>,
     ) -> RpcResult<()> {
         // Refused after our `shutdown` so its `wlock` wait is a handoff (module doc "Shutdown").
         if self.shut.load(std::sync::atomic::Ordering::SeqCst) {
@@ -537,22 +558,28 @@ impl TlsTransport {
                 cipher.clear();
                 c.write_tls(&mut cipher)?;
             }
-            match draining.as_mut() {
-                Some((sock, drain)) => self.write_socket_draining(&cipher, *sock, &mut **drain)?,
+            match sock {
+                Some(sock) => {
+                    let drain = drain
+                        .as_mut()
+                        .map(|d| &mut **d as &mut dyn FnMut() -> RpcResult<()>);
+                    self.write_socket_waiting(&cipher, sock, drain)?
+                }
                 None => self.write_socket_locked(&cipher)?,
             }
         }
         Ok(())
     }
 
-    /// `write_socket_locked` that hands input to `drain` while the socket is full.
-    fn write_socket_draining(
+    /// `write_socket_locked` that waits in `poll`, handing input to `drain` if there is one.
+    fn write_socket_waiting(
         &self,
         cipher: &[u8],
         sock: std::os::fd::BorrowedFd<'_>,
-        drain: &mut dyn FnMut() -> RpcResult<()>,
+        mut drain: Option<&mut dyn FnMut() -> RpcResult<()>>,
     ) -> RpcResult<()> {
-        let mut waiting = super::unix::SendWait::new(sock);
+        let reads = drain.is_some();
+        let mut waiting = super::unix::SendWait::new(sock, &self.queue);
         let mut off = 0;
         while off < cipher.len() {
             let rest = &cipher[off..];
@@ -571,10 +598,15 @@ impl TlsTransport {
                     if waiting.expired() {
                         return Err(expired());
                     }
-                    if self.input_waiting(sock).map_err(super::read_side_failure)? {
-                        drain().map_err(super::read_side_failure)?;
-                    } else if waiting.wait()?.is_none() {
-                        return Err(expired());
+                    let input =
+                        reads && self.input_waiting(sock).map_err(super::read_side_failure)?;
+                    match drain.as_mut() {
+                        Some(drain) if input => drain().map_err(super::read_side_failure)?,
+                        _ => {
+                            if waiting.wait(reads)?.is_none() {
+                                return Err(expired());
+                            }
+                        }
                     }
                 }
                 Err(e) => return Err(std::io::Error::from(e).into()),
@@ -653,16 +685,18 @@ impl TlsTransport {
             return Ok(true);
         }
         let mut tmp = [0u8; TLS_READ_CHUNK];
-        let k = loop {
-            match self.stream.read(&mut tmp) {
-                Ok(k) => break k,
-                // EINTR: retry the interrupted blocking read.
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                // Deadline → `Timeout`, as plain sockets (android-13+ `DeadlineMidFrame` split).
-                Err(e) if super::is_timeout(&e) => return Err(RpcError::Timeout),
-                Err(e) => return Err(e.into()),
-            }
-        };
+        let k = self
+            .reads
+            .read(self.stream.socket(), &self.queue, || loop {
+                match self.stream.read(&mut tmp) {
+                    Ok(k) => return Ok(k),
+                    // EINTR: retry the interrupted blocking read.
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    // Deadline → `Timeout`, as plain sockets (the `DeadlineMidFrame` split).
+                    Err(e) if super::is_timeout(&e) => return Err(RpcError::Timeout),
+                    Err(e) => return Err(e.into()),
+                }
+            })?;
         let mut c = self.conn.lock().expect("tls conn poisoned");
         if k == 0 {
             let mut eof: &[u8] = &[];
@@ -705,7 +739,8 @@ impl RpcTransport for TlsTransport {
     }
 
     fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
-        self.send_records(buf, None)
+        let sock = self.stream.socket().filter(|_| super::unix::WAITING_SENDS);
+        self.send_records(buf, sock, None)
     }
 
     fn send_raw_draining(
@@ -715,7 +750,7 @@ impl RpcTransport for TlsTransport {
         drain: &mut dyn FnMut() -> RpcResult<()>,
     ) -> RpcResult<()> {
         match self.stream.socket() {
-            Some(sock) if fds.is_empty() => self.send_records(buf, Some((sock, drain))),
+            Some(sock) if fds.is_empty() => self.send_records(buf, Some(sock), Some(drain)),
             // A stream with no socket sends without reading; `fds` meets the refusing default.
             _ => self.send_raw_with_fds(buf, fds),
         }
@@ -776,6 +811,7 @@ impl RpcTransport for TlsTransport {
 
     fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> RpcResult<()> {
         self.stream.set_read_timeout(timeout)?;
+        self.reads.note(timeout);
         Ok(())
     }
 
@@ -792,6 +828,11 @@ impl RpcTransport for TlsTransport {
     // The socket's FIN, not `close_notify`: a buffered alert is still an unread byte.
     fn peer_closed(&self) -> Option<bool> {
         self.stream.peer_closed()
+    }
+
+    // The socket, not `close_notify`: a deadline's peer is not reading our alerts either.
+    fn shutdown_handle(&self) -> Option<Box<dyn FnOnce() + Send>> {
+        self.stream.socket().and_then(super::socket_shutdown_handle)
     }
 
     fn shutdown(&self) -> RpcResult<()> {

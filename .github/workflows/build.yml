@@ -295,15 +295,19 @@ jobs:
           t cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_server -- --exact tls_android13plus_nested_callback_e2e
           t cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_server -- --exact preconnected_inet_fd_handshakes_over_tcp_debug
           t cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_e2e -- drains_past_the_hold_android13plus_tcp_debug tls_flood::
-      - name: TCP links cut inside a network namespace (plan 2-24 §5.2)
+      - name: TCP links cut and slowed inside a network namespace (plans 2-24 §5.2, 2-25)
         # `rpc_link_break` reruns itself under `unshare -rn` and drops a
         # port's packets with `nft`, so that keepalive and TCP_USER_TIMEOUT
-        # really fire. Ubuntu 24.04 keeps unprivileged user namespaces behind
-        # an AppArmor switch; REQUIRED turns a skip into a failure here.
+        # really fire; `rpc_slow_peer` shapes loopback with `tc netem` the
+        # same way. Ubuntu 24.04 keeps unprivileged user namespaces behind
+        # an AppArmor switch, and a namespace cannot load a qdisc module the
+        # host has not; REQUIRED turns a skip into a failure here.
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           command -v nft >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq nftables; }
+          sudo modprobe -a sch_netem sch_prio cls_u32 || true
           RSB_LINK_BREAK_REQUIRED=1 cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_link_break -- --nocapture
+          RSB_SLOW_LINK_REQUIRED=1 cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_slow_peer -- --nocapture
       - name: RPC accessor (hermetic, requires android_16 — gap-fill)
         # `rpc_accessor.rs` is `#![cfg(all(feature = "rpc", feature =
         # "android_16"))]`; without `android_16` the file compiles to
@@ -509,7 +513,7 @@ jobs:
           bash scripts/ci_rsbinder_lib_tests.sh
           t cargo test -p rsbinder --features rpc --doc
           cargo test -p rsbinder --features rpc --test rpc_e2e --test rpc_scenarios --test rpc_server --test rpc_fd --test rpc_shared_memory --test rpc_cross_stack --test rpc_transport_conformance --test source_invariants --test blob_rpc --test pipe_rpc --test parcel_alloc
-          cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_tls --test rpc_transport_conformance
+          cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_tls --test rpc_transport_conformance --test rpc_slow_peer
           t cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_server -- --exact tls_android13plus_nested_callback_e2e
           t cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_server -- --exact preconnected_inet_fd_handshakes_over_tcp_debug
           t cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_e2e -- drains_past_the_hold_android13plus_tcp_debug tls_flood::

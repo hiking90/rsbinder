@@ -107,6 +107,8 @@ change bytes between peers: upgrade both ends together.
 - An android-13+ session takes its fd mode from the connection header only.
 - An android-13+ server refuses a client that requests an fd mode it does not
   support.
+- `RpcSession::accept_android13plus[_fd]` refuses a connection header whose
+  session id is neither empty nor 32 bytes.
 
 **RPC sessions and connections**
 
@@ -114,8 +116,17 @@ change bytes between peers: upgrade both ends together.
   refused with `BadType`.
 - A session ends as a whole when any of its connections fails.
 - An expired reply deadline ends the session.
-- The session timeout also bounds sends, connect and handshake steps, and TCP
-  liveness.
+- The session timeout also bounds sends, connect and handshake steps (a
+  `unix` or `vsock` `connect(2)` excepted), and TCP liveness.
+- `RpcServer::set_handshake_timeout` bounds the whole admission phase (on r34,
+  through a new session's first transaction; a joining connection's ends with
+  its session-id preamble), a client's handshake deadline (`timeout`, the
+  deprecated `handshake_timeout`) each TLS or android-13+ handshake step as a
+  whole, not each read, and `RpcSession::from_preconnected_fd` its handshake
+  by a fixed 10 s as a whole.
+- An expired TLS handshake is `RpcError::Timeout`, not `Io(WouldBlock)`.
+- On Linux and Android a send or read deadline counts the peer taking this
+  end's bytes as progress; Apple keeps the 0.11.0 rule.
 - TCP connections, TLS over TCP included, have keepalive on by default.
 - `RpcServer::set_idle_timeout` judges the session, not the connection.
 - A kernel `ETIMEDOUT` on a connection ends the session.
@@ -205,6 +216,10 @@ change bytes between peers: upgrade both ends together.
 - **`RpcSession::is_ended`**, **`rpc::EndReason::SessionEnded`**,
   **`RpcTransport::peer_closed`** and **`RpcTransport::set_liveness`** (both
   also on `TlsStream`).
+- **`RpcTransport::shutdown_handle`**: cuts a connection from another thread,
+  for the whole-handshake deadline; a transport of your own that returns
+  `None` (the default) has its handshake bounded per wait only, by the
+  `set_read_timeout` and `set_write_timeout` it implements (neither: no bound).
 - **`rpc::transport::MemTransport` carries a raw byte stream**, so an
   android-13+ session runs over `mem` in hermetic tests.
 - **Work source API** (`set_calling_work_source_uid` and friends), carried on
@@ -368,6 +383,34 @@ Status codes:
 
 RPC:
 
+- **A slow link no longer trips the session's deadlines while the peer keeps
+  up.** On the bundled socket transports a send deadline counted only the
+  sends the kernel accepted, and the kernel reports room after a third of a
+  send buffer TCP grows to megabytes has drained; a read deadline (a reply
+  wait, a server's idle wait) counted only the peer's bytes, while the tail of
+  a large frame of ours could still be on its way to it. Over a 1 Mbit/s link
+  a 2 MiB call with `set_timeout(1 s)` ended the session after 2.5 s, and a
+  server with `set_idle_timeout(1 s)` ended one while its large reply was
+  still being delivered. On Linux and Android both now count the peer taking
+  this end's bytes (`SIOCOUTQ`) as progress; on Apple neither changes, nor on
+  a socket that refuses `SIOCOUTQ` (Android SELinux on another domain's
+  socket, a vsock socket on a kernel whose vsock does not report its queue),
+  which is asked once. See
+  the `transport` module doc "A slow peer".
+- **An android-13+ server refuses a session id that is not 32 bytes before
+  reading it**, as AOSP `RpcServer::establishConnection` does; it read up to
+  65535 bytes first, holding the connection's worker meanwhile.
+- **A handshake deadline bounds the whole handshake, not each read.** A peer
+  that sent one byte at a time, each inside the deadline, kept a server's
+  handshake going indefinitely (holding its worker, and under
+  `set_max_connections` an admission slot, so that `stop_and_join` waited on
+  it too) and a client's setup call from returning. A thread of the
+  deadline's own now cuts the connection once the phase outlives it:
+  `set_handshake_timeout` from the accept to admission (the authorizer's run
+  left out), the client's
+  `timeout` for each TLS or android-13+ handshake step, and
+  `RpcSession::from_preconnected_fd`'s 10 s for its handshake. An expired TLS
+  handshake reports `TimedOut`, not `WouldBlock`.
 - **On the android-13+ wire a null binder interoperates with libbinder**: it
   carries the stability `int32` AOSP writes (see *Migrating*).
 - **On the r34 wire an android-12 peer's binder is no longer refused one time
@@ -386,7 +429,9 @@ RPC:
 - **A client that only sends oneways no longer deadlocks with its server**: a
   send drains `DEC_STRONG`s while it waits. A custom `RpcTransport` drains by
   implementing `send_raw_draining`, a custom `TlsStream` by returning its
-  `socket`.
+  `socket`, whose `SO_SNDTIMEO` then carries the send deadline: on Linux and
+  Android every send on such a stream waits on that socket
+  (`TlsStream::socket`).
 - **An RPC parcel dropped unsent releases its local binders' reservations**;
   writing a local binder into an ended session's parcel is `DeadObject`.
 - **A `ParcelableHolder` read from an RPC transaction decodes the binders and
