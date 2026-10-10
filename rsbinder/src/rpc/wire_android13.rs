@@ -222,12 +222,11 @@ use std::io::{Read, Write};
 use super::address::RpcAddress;
 use super::transport::MAX_FRAME_LEN;
 use super::wire::{
-    WireCodec, WireMessage, WireReply, WireReplyRef, WireTransaction, WireTransactionRef,
+    encode_header, header_body_size, split_frame, WireCodec, WireMessage, WireReply, WireReplyRef,
+    WireTransaction, WireTransactionRef, WIRE_HEADER_LEN,
 };
 use super::{RpcError, RpcResult};
 
-/// `RpcWireHeader` size (unchanged r34 / v0 / v1).
-const WIRE_HEADER_LEN: usize = 16;
 /// android-13+ `RpcWireAddress` size (`u32 options; u32 address`).
 pub const A13_ADDR_LEN: usize = 8;
 /// `RpcWireTransaction` fixed prefix (v0 & v1 are both 40 B; only the
@@ -426,21 +425,6 @@ impl Android13PlusCodec {
     /// The negotiated protocol version this codec encodes/decodes.
     pub fn version(&self) -> u32 {
         self.version
-    }
-
-    fn header(command: u32, body_size: usize) -> RpcResult<[u8; WIRE_HEADER_LEN]> {
-        // Match the decoder's cap: `as u32` would silently truncate and misframe the peer.
-        if body_size > MAX_FRAME_LEN {
-            return Err(RpcError::FrameTooLarge {
-                declared: body_size,
-                max: MAX_FRAME_LEN,
-            });
-        }
-        let mut h = [0u8; WIRE_HEADER_LEN];
-        h[0..4].copy_from_slice(&command.to_le_bytes());
-        h[4..8].copy_from_slice(&(body_size as u32).to_le_bytes());
-        // reserved[2] stays zero.
-        Ok(h)
     }
 
     /// 32-byte `RpcAddress` → 8-byte `RpcWireAddress`; see module doc "Address projection".
@@ -661,7 +645,7 @@ impl WireCodec for Android13PlusCodec {
             0
         };
         let body_len = A13_TXN_FIXED_LEN + txn.data.len() + table_bytes;
-        let header = Self::header(CMD_TRANSACT, body_len)?;
+        let header = encode_header(CMD_TRANSACT, body_len)?;
         let mut out = Vec::with_capacity(WIRE_HEADER_LEN + body_len);
         out.extend_from_slice(&header);
         out.extend_from_slice(&Self::encode_addr(txn.address)); // 8
@@ -687,7 +671,7 @@ impl WireCodec for Android13PlusCodec {
             0
         };
         let body_len = fixed + reply.data.len() + table_bytes;
-        let header = Self::header(CMD_REPLY, body_len)?;
+        let header = encode_header(CMD_REPLY, body_len)?;
         let mut out = Vec::with_capacity(WIRE_HEADER_LEN + body_len);
         out.extend_from_slice(&header);
         out.extend_from_slice(&reply.status.to_le_bytes()); // i32 status
@@ -703,7 +687,7 @@ impl WireCodec for Android13PlusCodec {
         if amount == 0 {
             return None;
         }
-        let header = Self::header(CMD_DEC_STRONG, A13_DEC_STRONG_LEN)
+        let header = encode_header(CMD_DEC_STRONG, A13_DEC_STRONG_LEN)
             .expect("DEC_STRONG body length is a const ≪ MAX_FRAME_LEN");
         let mut out = Vec::with_capacity(WIRE_HEADER_LEN + A13_DEC_STRONG_LEN);
         out.extend_from_slice(&header);
@@ -714,25 +698,7 @@ impl WireCodec for Android13PlusCodec {
     }
 
     fn decode_message(&self, frame: &[u8]) -> RpcResult<WireMessage> {
-        if frame.len() < WIRE_HEADER_LEN {
-            return Err(RpcError::Protocol("frame shorter than RpcWireHeader"));
-        }
-        let command = rd_u32(frame, 0)?;
-        let body_size = rd_u32(frame, 4)? as usize;
-        if body_size > MAX_FRAME_LEN {
-            return Err(RpcError::FrameTooLarge {
-                declared: body_size,
-                max: MAX_FRAME_LEN,
-            });
-        }
-        let expected = WIRE_HEADER_LEN
-            .checked_add(body_size)
-            .ok_or(RpcError::Protocol("body size overflow"))?;
-        if frame.len() != expected {
-            return Err(RpcError::Protocol("frame length != header + bodySize"));
-        }
-        let body = &frame[WIRE_HEADER_LEN..];
-
+        let (command, body) = split_frame(frame)?;
         match command {
             CMD_TRANSACT => {
                 if body.len() < A13_TXN_FIXED_LEN {
@@ -859,6 +825,14 @@ fn read_exact_into_counted<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<(), (Rp
 /// (`[RpcWireHeader(16) | body]`, `bodySize` already correct), emitted
 /// raw with no length prefix — exactly what a real android peer reads.
 pub fn write_aosp_message<W: Write>(w: &mut W, msg: &[u8]) -> RpcResult<()> {
+    check_message_len(msg)?;
+    w.write_all(msg).map_err(map_io)?;
+    w.flush().map_err(map_io)?;
+    Ok(())
+}
+
+/// An outgoing `[header | body]` holds a whole header and a body within `MAX_FRAME_LEN`.
+fn check_message_len(msg: &[u8]) -> RpcResult<()> {
     if msg.len() < WIRE_HEADER_LEN {
         return Err(RpcError::Protocol("message shorter than RpcWireHeader"));
     }
@@ -868,8 +842,6 @@ pub fn write_aosp_message<W: Write>(w: &mut W, msg: &[u8]) -> RpcResult<()> {
             max: MAX_FRAME_LEN,
         });
     }
-    w.write_all(msg).map_err(map_io)?;
-    w.flush().map_err(map_io)?;
     Ok(())
 }
 
@@ -890,13 +862,7 @@ pub(crate) fn read_aosp_message_gated<R: Read>(
     let mut header = [0u8; WIRE_HEADER_LEN];
     read_exact_into(r, &mut header)?;
     gate(&header)?;
-    let body_size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
-    if body_size > MAX_FRAME_LEN {
-        return Err(RpcError::FrameTooLarge {
-            declared: body_size,
-            max: MAX_FRAME_LEN,
-        });
-    }
+    let body_size = header_body_size(&header)?;
     // One allocation for header + body (module doc "Raw framing").
     let mut out = vec![0u8; WIRE_HEADER_LEN + body_size];
     out[..WIRE_HEADER_LEN].copy_from_slice(&header);
@@ -930,15 +896,7 @@ pub fn write_aosp_message_with_fds(
     fds: &[std::os::fd::BorrowedFd<'_>],
     drain: Option<&mut dyn FnMut() -> RpcResult<()>>,
 ) -> RpcResult<()> {
-    if msg.len() < WIRE_HEADER_LEN {
-        return Err(RpcError::Protocol("message shorter than RpcWireHeader"));
-    }
-    if msg.len() - WIRE_HEADER_LEN > MAX_FRAME_LEN {
-        return Err(RpcError::FrameTooLarge {
-            declared: msg.len() - WIRE_HEADER_LEN,
-            max: MAX_FRAME_LEN,
-        });
-    }
+    check_message_len(msg)?;
     match drain {
         Some(drain) => t.send_raw_draining(msg, fds, drain),
         None => t.send_raw_with_fds(msg, fds),
@@ -990,13 +948,7 @@ pub fn read_aosp_message_with_fds(
     let mut header = [0u8; WIRE_HEADER_LEN];
     fill(&mut header)?;
     gate(&header)?;
-    let body_size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
-    if body_size > MAX_FRAME_LEN {
-        return Err(RpcError::FrameTooLarge {
-            declared: body_size,
-            max: MAX_FRAME_LEN,
-        });
-    }
+    let body_size = header_body_size(&header)?;
     // One allocation for header + body (module doc "Raw framing").
     let mut out = vec![0u8; WIRE_HEADER_LEN + body_size];
     out[..WIRE_HEADER_LEN].copy_from_slice(&header);

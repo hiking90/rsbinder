@@ -28,7 +28,7 @@ use super::address::{RpcAddress, RPC_ADDR_LEN};
 use super::transport::MAX_FRAME_LEN;
 use super::{RpcError, RpcResult};
 
-/// `RpcWireHeader` size (android-12 r34).
+/// `RpcWireHeader` size (android-12 r34; the same at android-13+ v0/v1).
 pub(crate) const WIRE_HEADER_LEN: usize = 16;
 /// `RpcWireTransaction` fixed-prefix size (before `data[]`).
 pub(crate) const WIRE_TXN_FIXED_LEN: usize = RPC_ADDR_LEN + 4 + 4 + 8 + 16; // = 64
@@ -182,21 +182,50 @@ pub trait WireCodec: Send + Sync {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct R34Codec;
 
-impl R34Codec {
-    fn header(command: u32, body_size: usize) -> RpcResult<[u8; WIRE_HEADER_LEN]> {
-        // As the decoder: past the cap, `as u32` could truncate `bodySize` and misframe the peer.
-        if body_size > MAX_FRAME_LEN {
-            return Err(RpcError::FrameTooLarge {
-                declared: body_size,
-                max: MAX_FRAME_LEN,
-            });
-        }
-        let mut h = [0u8; WIRE_HEADER_LEN];
-        h[0..4].copy_from_slice(&command.to_le_bytes());
-        h[4..8].copy_from_slice(&(body_size as u32).to_le_bytes());
-        // reserved[2] stays zero.
-        Ok(h)
+// --- `RpcWireHeader`: one layout for r34 and android-13+ v0/v1, so one rule for both codecs -
+
+/// Encode an `RpcWireHeader`; past `MAX_FRAME_LEN`, `as u32` could truncate and misframe the peer.
+pub(crate) fn encode_header(command: u32, body_size: usize) -> RpcResult<[u8; WIRE_HEADER_LEN]> {
+    if body_size > MAX_FRAME_LEN {
+        return Err(RpcError::FrameTooLarge {
+            declared: body_size,
+            max: MAX_FRAME_LEN,
+        });
     }
+    let mut h = [0u8; WIRE_HEADER_LEN];
+    h[0..4].copy_from_slice(&command.to_le_bytes());
+    h[4..8].copy_from_slice(&(body_size as u32).to_le_bytes());
+    // reserved[2] stays zero.
+    Ok(h)
+}
+
+/// A received header's `bodySize`, refused past `MAX_FRAME_LEN` before anything is allocated.
+pub(crate) fn header_body_size(header: &[u8]) -> RpcResult<usize> {
+    let body_size = rd_u32(header, 4)? as usize;
+    if body_size > MAX_FRAME_LEN {
+        return Err(RpcError::FrameTooLarge {
+            declared: body_size,
+            max: MAX_FRAME_LEN,
+        });
+    }
+    Ok(body_size)
+}
+
+/// `(command, body)` of one whole message, which must be exactly header + `bodySize`.
+pub(crate) fn split_frame(frame: &[u8]) -> RpcResult<(u32, &[u8])> {
+    if frame.len() < WIRE_HEADER_LEN {
+        return Err(RpcError::Protocol("frame shorter than RpcWireHeader"));
+    }
+    let command = rd_u32(frame, 0)?;
+    let body_size = header_body_size(frame)?;
+    // No trailing slop, no short body.
+    let expected = WIRE_HEADER_LEN
+        .checked_add(body_size)
+        .ok_or(RpcError::Protocol("body size overflow"))?;
+    if frame.len() != expected {
+        return Err(RpcError::Protocol("frame length != header + bodySize"));
+    }
+    Ok((command, &frame[WIRE_HEADER_LEN..]))
 }
 
 /// Read a little-endian `u32` at `off`, bounds-checked.
@@ -246,7 +275,7 @@ impl WireCodec for R34Codec {
         }
         let body_len = WIRE_TXN_FIXED_LEN + txn.data.len();
         let mut out = Vec::with_capacity(WIRE_HEADER_LEN + body_len);
-        out.extend_from_slice(&Self::header(CMD_TRANSACT, body_len)?);
+        out.extend_from_slice(&encode_header(CMD_TRANSACT, body_len)?);
         out.extend_from_slice(txn.address.as_wire_bytes()); // 32
         out.extend_from_slice(&txn.code.to_le_bytes()); // 4
         out.extend_from_slice(&txn.flags.to_le_bytes()); // 4
@@ -264,7 +293,7 @@ impl WireCodec for R34Codec {
         }
         let body_len = 4 + reply.data.len();
         let mut out = Vec::with_capacity(WIRE_HEADER_LEN + body_len);
-        out.extend_from_slice(&Self::header(CMD_REPLY, body_len)?);
+        out.extend_from_slice(&encode_header(CMD_REPLY, body_len)?);
         out.extend_from_slice(&reply.status.to_le_bytes());
         out.extend_from_slice(reply.data);
         Ok(out)
@@ -277,7 +306,7 @@ impl WireCodec for R34Codec {
         let mut out = Vec::with_capacity(WIRE_HEADER_LEN + RPC_ADDR_LEN);
         // RPC_ADDR_LEN is far below MAX_FRAME_LEN, so the bound check cannot trip.
         out.extend_from_slice(
-            &Self::header(CMD_DEC_STRONG, RPC_ADDR_LEN)
+            &encode_header(CMD_DEC_STRONG, RPC_ADDR_LEN)
                 .expect("dec_strong header is within the frame bound"),
         );
         out.extend_from_slice(addr.as_wire_bytes());
@@ -286,26 +315,7 @@ impl WireCodec for R34Codec {
     }
 
     fn decode_message(&self, frame: &[u8]) -> RpcResult<WireMessage> {
-        if frame.len() < WIRE_HEADER_LEN {
-            return Err(RpcError::Protocol("frame shorter than RpcWireHeader"));
-        }
-        let command = rd_u32(frame, 0)?;
-        let body_size = rd_u32(frame, 4)? as usize;
-        if body_size > MAX_FRAME_LEN {
-            return Err(RpcError::FrameTooLarge {
-                declared: body_size,
-                max: MAX_FRAME_LEN,
-            });
-        }
-        // The frame must be exactly header + bodySize (no trailing slop, no short body).
-        let expected = WIRE_HEADER_LEN
-            .checked_add(body_size)
-            .ok_or(RpcError::Protocol("body size overflow"))?;
-        if frame.len() != expected {
-            return Err(RpcError::Protocol("frame length != header + bodySize"));
-        }
-        let body = &frame[WIRE_HEADER_LEN..];
-
+        let (command, body) = split_frame(frame)?;
         match command {
             CMD_TRANSACT => {
                 if body.len() < WIRE_TXN_FIXED_LEN {
@@ -426,7 +436,7 @@ pub fn __fuzz_session_handshake(input: &[u8]) {
 pub fn __fuzz_decode_address(input: &[u8]) {
     let _ = rd_addr(input, 0);
     let _ = super::wire_android13::Android13PlusCodec::decode_addr(input, 0);
-    let Ok(header) = R34Codec::header(CMD_DEC_STRONG, input.len()) else {
+    let Ok(header) = encode_header(CMD_DEC_STRONG, input.len()) else {
         return;
     };
     let mut frame = Vec::with_capacity(WIRE_HEADER_LEN + input.len());
@@ -455,19 +465,19 @@ mod tests {
         input.extend_from_slice(&get_root);
         input.extend_from_slice(&get_root);
         // A header announcing `MAX_FRAME_LEN`: no allocation for it, no panic.
-        input.extend_from_slice(&R34Codec::header(CMD_TRANSACT, MAX_FRAME_LEN).expect("header"));
+        input.extend_from_slice(&encode_header(CMD_TRANSACT, MAX_FRAME_LEN).expect("header"));
         super::__fuzz_session_handshake(&input);
         super::__fuzz_session_handshake(&input[..7]);
     }
 
-    /// `R34Codec::header` rejects a body over `MAX_FRAME_LEN` like `Android13PlusCodec`, no wrap.
+    /// `encode_header` rejects a body over `MAX_FRAME_LEN` rather than wrap `bodySize`.
     #[test]
     fn header_rejects_oversize_body() {
         assert!(matches!(
-            R34Codec::header(CMD_TRANSACT, MAX_FRAME_LEN + 1),
+            encode_header(CMD_TRANSACT, MAX_FRAME_LEN + 1),
             Err(RpcError::FrameTooLarge { .. })
         ));
-        assert!(R34Codec::header(CMD_TRANSACT, MAX_FRAME_LEN).is_ok());
+        assert!(encode_header(CMD_TRANSACT, MAX_FRAME_LEN).is_ok());
     }
 
     /// encode∘decode == identity for every command, payloads sampled over 0..1 MiB.
