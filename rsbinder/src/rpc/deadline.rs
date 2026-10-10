@@ -74,12 +74,16 @@ impl Shared {
 /// A deadline on a whole phase of one connection, disarmed on drop; see the module doc.
 pub(crate) struct PhaseDeadline {
     shared: Option<Arc<Shared>>,
+    at: Option<Instant>,
 }
 
 impl PhaseDeadline {
     /// No deadline: `disarm` is `true`, `fired` is `false`.
     pub(crate) fn none() -> Self {
-        PhaseDeadline { shared: None }
+        PhaseDeadline {
+            shared: None,
+            at: None,
+        }
     }
 
     /// Run `cut` once `after` has passed, unless the phase is disarmed first.
@@ -99,6 +103,7 @@ impl PhaseDeadline {
         match spawned {
             Ok(_) => PhaseDeadline {
                 shared: Some(shared),
+                at: Some(at),
             },
             Err(e) => {
                 log::warn!(
@@ -131,6 +136,15 @@ impl PhaseDeadline {
         drop(state);
         shared.ended.notify_one();
         true
+    }
+
+    /// `disarm` that keeps what was left (inner `None`: no deadline); `None` if the cut ran.
+    pub(crate) fn stop(&mut self) -> Option<Option<Duration>> {
+        let left = self
+            .at
+            .take()
+            .map(|at| at.saturating_duration_since(Instant::now()));
+        self.disarm().then_some(left)
     }
 
     /// Whether the deadline passed and cut the connection (before `disarm`).
@@ -209,6 +223,25 @@ mod tests {
         drop(PhaseDeadline::arm(Duration::from_millis(300), cut));
         std::thread::sleep(Duration::from_millis(600));
         assert_eq!(cuts.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn stopping_disarms_and_keeps_what_was_left() {
+        let (cuts, cut) = counting();
+        let mut d = PhaseDeadline::arm(Duration::from_millis(300), cut);
+        let left = d.stop().expect("stopped in time").expect("armed");
+        assert!(
+            left > Duration::ZERO && left <= Duration::from_millis(300),
+            "{left:?}"
+        );
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(cuts.load(Ordering::SeqCst), 0);
+
+        let (_, cut) = counting();
+        let mut cut_already = PhaseDeadline::arm(Duration::from_millis(1), cut);
+        assert!(wait_for(|| cut_already.fired()), "the deadline never fired");
+        assert_eq!(cut_already.stop(), None);
+        assert_eq!(PhaseDeadline::none().stop(), Some(None));
     }
 
     #[test]

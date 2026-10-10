@@ -68,6 +68,9 @@
 //!   every wait; the phase as a whole, from the accept to admission, is
 //!   bounded by a thread of the deadline's own that shuts the connection
 //!   down (`RpcTransport::shutdown_handle`) once the phase outlives it.
+//!   The deadline is stopped while the authorizer runs and re-armed with what
+//!   was left: the shutdown could not stop the authorizer, whose time is this
+//!   process's, only drop the connection it admits.
 //!   The 10 s default
 //!   exists so a peer that never sends its handshake cannot hold a
 //!   `max_connections` slot, or pin the server's `Arc`, forever.
@@ -851,9 +854,10 @@ impl RpcServer {
     /// not just a peer that refuses to send.
     ///
     /// The deadline is on the phase as a whole, from the accept to
-    /// admission (a TLS handshake included): a peer that sends its handshake
+    /// admission, a TLS handshake included: a peer that sends its handshake
     /// one byte at a time, each well inside `d`, is dropped `d` after it
-    /// connected all the same. The socket deadlines bound each wait; a
+    /// connected all the same. The [`set_authorizer`](Self::set_authorizer)
+    /// hook's run is not counted. The socket deadlines bound each wait; a
     /// thread of the deadline's own cuts the connection when the phase
     /// outlives it ([`RpcTransport::shutdown_handle`]). A transport handed
     /// to [`serve_connection`](Self::serve_connection) whose
@@ -1116,7 +1120,10 @@ impl RpcServer {
     /// thread — concurrently across connections, not serialized by the
     /// accept loop — and holds that connection's
     /// [`set_max_connections`](Self::set_max_connections) admission slot
-    /// for its whole duration.
+    /// for its whole duration. That duration does not count against
+    /// [`set_handshake_timeout`](Self::set_handshake_timeout), which bounds
+    /// the peer's part of admission: the deadline shuts the socket down,
+    /// which would not stop the hook, only drop the connection it admits.
     pub fn set_authorizer<F>(&self, f: F)
     where
         F: Fn(&PeerIdentity) -> bool + Send + Sync + 'static,
@@ -1547,6 +1554,23 @@ impl RpcServer {
             .lock()
             .expect("authorizer poisoned")
             .clone();
+        // Bound the handshake phase; `arm_serve_timeouts` swaps in the serve deadline later.
+        let handshake_timeout = *server
+            .handshake_timeout
+            .lock()
+            .expect("handshake_timeout poisoned");
+        // The cut cannot stop the authorizer, so its run is left out of the peer's phase.
+        let (mut admission, rearm) = match admission {
+            Some(mut armed) if authorizer.is_some() => match armed.stop() {
+                Some(left) => (PhaseDeadline::none(), Some(left)),
+                None => {
+                    log::warn!("RPC: the handshake deadline passed before the authorizer ran");
+                    return;
+                }
+            },
+            Some(armed) => (armed, None),
+            None => (PhaseDeadline::none(), Some(handshake_timeout)),
+        };
         if let Some(authz) = authorizer {
             let peer = transport.peer_identity();
             if !authz(&peer) {
@@ -1554,15 +1578,10 @@ impl RpcServer {
                 return;
             }
         }
-        // Bound the handshake phase; `arm_serve_timeouts` swaps in the serve deadline later.
-        let handshake_timeout = *server
-            .handshake_timeout
-            .lock()
-            .expect("handshake_timeout poisoned");
         // The whole phase; the socket deadlines below bound each wait in it.
-        let mut admission = admission.unwrap_or_else(|| {
-            PhaseDeadline::arm_with(handshake_timeout, || transport.shutdown_handle())
-        });
+        if let Some(after) = rearm {
+            admission = PhaseDeadline::arm_with(after, || transport.shutdown_handle());
+        }
         if let Some(d) = handshake_timeout {
             if let Err(e) = transport.set_read_timeout(Some(d)) {
                 log::debug!("RPC: failed to arm handshake read timeout: {e:?}");

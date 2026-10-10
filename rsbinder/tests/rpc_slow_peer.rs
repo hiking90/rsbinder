@@ -217,6 +217,8 @@ struct ServerSpec {
     reply_timeout: Option<Duration>,
     max_connections: Option<usize>,
     idle_timeout: Option<Duration>,
+    /// An authorizer that admits every peer after this long.
+    authorizer_takes: Option<Duration>,
 }
 
 impl ServerSpec {
@@ -227,6 +229,7 @@ impl ServerSpec {
             reply_timeout: None,
             max_connections: None,
             idle_timeout: None,
+            authorizer_takes: None,
         }
     }
 
@@ -242,6 +245,12 @@ impl ServerSpec {
             server.set_max_connections(n);
         }
         server.set_idle_timeout(self.idle_timeout);
+        if let Some(takes) = self.authorizer_takes {
+            server.set_authorizer(move |_| {
+                thread::sleep(takes);
+                true
+            });
+        }
         server
             .set_root(Binder::new(Svc).as_binder())
             .expect("set_root");
@@ -975,6 +984,69 @@ fn server_cuts_a_trickled_tls_handshake() {
     server_cuts_a_trickled_handshake(server, Pace::Trickle(TRICKLE_EVERY), |at| {
         let _ = connect(Link::Tls, &at, None);
     });
+}
+
+/// The authorizer's run is the server's own time: a hook slower than `d` admits its client.
+fn a_slow_authorizer_is_not_the_peers_time(link: Link) {
+    let spec = ServerSpec {
+        handshake_timeout: Some(D),
+        authorizer_takes: Some(D * 3 / 2),
+        ..ServerSpec::a13()
+    };
+    let server = match link {
+        Link::Unix => spec.unix(),
+        Link::TcpDebug => spec.tcp_debug(),
+        Link::Tls => spec.tls(),
+    };
+    let at = server.at.clone();
+    let got = within(D * 3 + SLACK, move || {
+        connect(link, &at, Some(Duration::from_secs(10))).map(|s| {
+            let root = s.get_root();
+            s.close_session();
+            root.map(|_| ())
+        })
+    });
+    assert_eq!(got, Some(Ok(Ok(()))), "a slow authorizer cost its client");
+}
+
+#[test]
+fn unix_slow_authorizer_is_not_the_peers_time() {
+    a_slow_authorizer_is_not_the_peers_time(Link::Unix);
+}
+
+/// `serve_connection`, which arms the deadline after the authorizer.
+#[test]
+fn tcp_slow_authorizer_is_not_the_peers_time() {
+    a_slow_authorizer_is_not_the_peers_time(Link::TcpDebug);
+}
+
+#[test]
+fn tls_slow_authorizer_is_not_the_peers_time() {
+    a_slow_authorizer_is_not_the_peers_time(Link::Tls);
+}
+
+/// The deadline resumes after the authorizer: a trickler is cut `d` plus the hook's run in.
+#[test]
+fn server_cuts_a_trickled_handshake_after_its_authorizer() {
+    let takes = D / 2;
+    let server = ServerSpec {
+        handshake_timeout: Some(D),
+        authorizer_takes: Some(takes),
+        ..ServerSpec::a13()
+    }
+    .unix();
+    let relay = Relay::start(&server.at, Pace::Trickle(TRICKLE_EVERY), Pace::Full);
+    let at = relay.at.clone();
+    thread::spawn(move || {
+        let _ = connect(Link::Unix, &at, None);
+    });
+    let left = relay
+        .server_left_within(D + takes + SLACK)
+        .expect("the server still holds a trickled handshake after its authorizer");
+    assert!(
+        left >= (D + takes).mul_f32(0.8),
+        "dropped after {left:?}: not by the deadline"
+    );
 }
 
 /// A trickler holds no admission slot past `d`: the next client gets in.

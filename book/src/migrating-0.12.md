@@ -377,7 +377,8 @@ a reference such as "(CHANGELOG *Fixed*)" points to the 0.12.0 section there.
   `SO_SNDTIMEO`) that every read or write started over, so a client whose
   handshake bytes kept coming was admitted however long they took. Now the
   connection is dropped once the deadline has passed since its accept, its
-  TLS handshake included: a client on a link slow enough to need longer than
+  TLS handshake included and the `set_authorizer` hook's run left out: a
+  client on a link slow enough to need longer than
   the deadline (10 s by default) for its whole handshake is refused. On the
   r34 wire a connection that opens a new session ends the phase only once its
   first transaction has been served, so a large first transaction counts too;

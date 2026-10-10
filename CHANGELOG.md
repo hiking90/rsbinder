@@ -403,7 +403,8 @@ RPC:
   `set_max_connections` an admission slot, so that `stop_and_join` waited on
   it too) and a client's setup call from returning. A thread of the
   deadline's own now cuts the connection once the phase outlives it:
-  `set_handshake_timeout` from the accept to admission, the client's
+  `set_handshake_timeout` from the accept to admission (the authorizer's run
+  left out), the client's
   `timeout` for each TLS or android-13+ handshake step. An expired TLS
   handshake reports `TimedOut`, not `WouldBlock`.
 - **On the android-13+ wire a null binder interoperates with libbinder**: it
