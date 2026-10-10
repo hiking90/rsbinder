@@ -2216,14 +2216,8 @@ impl RpcSessionInner {
         // The scan is `Outgoing`-only for every use: module doc "Connection selection".
         let mut wait_until: Option<Option<Instant>> = None;
         let tid = current_tid();
-        let sess_ptr = self as *const RpcSessionInner as usize;
         // (1) Reentrant pin, innermost first; a serve-driven slot also needs `allow_nested`.
-        let pinned = DRIVING.with(|d| {
-            d.borrow()
-                .iter()
-                .rev()
-                .find_map(|&(sp, sid)| if sp == sess_ptr { Some(sid) } else { None })
-        });
+        let pinned = self.driving_slot();
         if let Some(slot_id) = pinned {
             let reusable = {
                 let st = self.conn_state.lock().expect("conn_state poisoned");
@@ -2264,17 +2258,7 @@ impl RpcSessionInner {
                 .iter()
                 .position(|s| free(s) && s.role == SlotRole::Outgoing);
             if let Some(idx) = pick {
-                let s = &mut st.slots[idx];
-                s.exclusive_tid = Some(tid);
-                let slot_id = s.id;
-                let transport = Arc::clone(&s.transport);
-                DRIVING.with(|d| d.borrow_mut().push((sess_ptr, slot_id)));
-                return Ok(ConnGuard {
-                    inner: self,
-                    slot_id,
-                    transport,
-                    reentrant: false,
-                });
+                return Ok(self.claim_slot(&mut st.slots[idx], tid));
             }
             // (3b) No `Outgoing` slot, and only a peer attach creates one: AOSP `WOULD_BLOCK`.
             if !st.slots.iter().any(|s| s.role == SlotRole::Outgoing) {
@@ -2340,10 +2324,22 @@ impl RpcSessionInner {
         })
     }
 
+    /// Hold `slot` for `tid` and push it on `DRIVING`; dropping the guard undoes both.
+    fn claim_slot(&self, slot: &mut ConnSlot, tid: Tid) -> ConnGuard<'_> {
+        slot.exclusive_tid = Some(tid);
+        let sess_ptr = self as *const RpcSessionInner as usize;
+        DRIVING.with(|d| d.borrow_mut().push((sess_ptr, slot.id)));
+        ConnGuard {
+            inner: self,
+            slot_id: slot.id,
+            transport: Arc::clone(&slot.transport),
+            reentrant: false,
+        }
+    }
+
     /// Non-blocking choice of a `DEC_STRONG`'s connection; module doc "Deferred `DEC_STRONG`".
     fn dec_route(&self) -> DecRoute<'_> {
         let tid = current_tid();
-        let sess_ptr = self as *const RpcSessionInner as usize;
         let pinned = self.driving_slot();
         let mut st = self.conn_state.lock().expect("conn_state poisoned");
         let mut pending_on = None;
@@ -2369,17 +2365,7 @@ impl RpcSessionInner {
             .iter()
             .position(|s| s.exclusive_tid.is_none() && s.role == SlotRole::Outgoing);
         if let Some(idx) = free {
-            let s = &mut st.slots[idx];
-            s.exclusive_tid = Some(tid);
-            let slot_id = s.id;
-            let transport = Arc::clone(&s.transport);
-            DRIVING.with(|d| d.borrow_mut().push((sess_ptr, slot_id)));
-            return DecRoute::Conn(ConnGuard {
-                inner: self,
-                slot_id,
-                transport,
-                reentrant: false,
-            });
+            return DecRoute::Conn(self.claim_slot(&mut st.slots[idx], tid));
         }
         match pending_on {
             Some(slot_id) => DecRoute::Pending(slot_id),
@@ -2390,7 +2376,6 @@ impl RpcSessionInner {
     /// Reaper `find_conn`: `None` once torn down or drained, so the reaper drops its strong `Arc`.
     fn find_conn_for_reaper(&self) -> Option<ConnGuard<'_>> {
         let tid = current_tid();
-        let sess_ptr = self as *const RpcSessionInner as usize;
         let mut st = self.conn_state.lock().expect("conn_state poisoned");
         loop {
             if self.shared.lifecycle.is_torn_down() || st.slots.is_empty() {
@@ -2403,17 +2388,7 @@ impl RpcSessionInner {
                 .iter()
                 .position(|s| free(s) && s.role == SlotRole::Outgoing);
             if let Some(idx) = pick {
-                let s = &mut st.slots[idx];
-                s.exclusive_tid = Some(tid);
-                let slot_id = s.id;
-                let transport = Arc::clone(&s.transport);
-                DRIVING.with(|d| d.borrow_mut().push((sess_ptr, slot_id)));
-                return Some(ConnGuard {
-                    inner: self,
-                    slot_id,
-                    transport,
-                    reentrant: false,
-                });
+                return Some(self.claim_slot(&mut st.slots[idx], tid));
             }
             // Only a peer attach adds an `Outgoing` slot; parking would hold the strong `Arc`.
             if !st.slots.iter().any(|s| s.role == SlotRole::Outgoing) {
@@ -2456,15 +2431,7 @@ impl RpcSessionInner {
                 return Err(StatusCode::DeadObject);
             };
             if slot.exclusive_tid.is_none() || slot.exclusive_tid == Some(tid) {
-                slot.exclusive_tid = Some(tid);
-                let transport = Arc::clone(&slot.transport);
-                DRIVING.with(|d| d.borrow_mut().push((sess_ptr, want_slot_id)));
-                return Ok(ConnGuard {
-                    inner: self,
-                    slot_id: want_slot_id,
-                    transport,
-                    reentrant: false,
-                });
+                return Ok(self.claim_slot(slot, tid));
             }
             #[cfg(test)]
             if let Some(tx) = &*self.shared.park_hook.lock().expect("park hook") {
