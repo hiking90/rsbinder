@@ -240,6 +240,8 @@ pub const A13_CONN_HEADER_LEN: usize = 16;
 pub const A13_NEW_SESSION_RESP_LEN: usize = 8;
 /// `RpcOutgoingConnectionInit` size.
 pub const A13_CONN_INIT_LEN: usize = 8;
+/// A session id's size on the wire (AOSP `kSessionIdBytes`); a header may also carry none.
+const SESSION_ID_LEN: usize = 32;
 
 /// `RpcWireHeader.command` (unchanged).
 const CMD_TRANSACT: u32 = 0;
@@ -1147,6 +1149,12 @@ pub fn server_accept_deferred_init<S: Read + Write>(
     let options = head[4];
     let incoming = (options & CONN_OPTION_INCOMING) != 0;
     let id_size = u16::from_le_bytes([head[14], head[15]]) as usize;
+    // Before reading it, as AOSP `RpcServer::establishConnection` (android17 `RpcServer.cpp:474`).
+    if id_size != 0 && id_size != SESSION_ID_LEN {
+        return Err(RpcError::Protocol(
+            "RpcConnectionHeader.sessionIdSize is neither 0 nor 32",
+        ));
+    }
     let session_id = if id_size > 0 {
         read_exact_raw(stream, id_size)?
     } else {

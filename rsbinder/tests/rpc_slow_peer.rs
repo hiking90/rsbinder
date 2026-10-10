@@ -991,7 +991,6 @@ fn a_trickled_handshake_does_not_hold_a_connection_slot() {
 
 /// As AOSP `RpcServer::establishConnection`: a session id not 32 bytes long is refused unread.
 #[test]
-#[ignore = "plan 2-25 D5: the session id size check lands in a later commit"]
 fn server_refuses_a_session_id_size_other_than_32_at_once() {
     let server = ServerSpec {
         handshake_timeout: Some(Duration::from_secs(5)),

@@ -379,6 +379,9 @@ RPC:
   still being delivered. On Linux and Android both now count the peer taking
   this end's bytes (`SIOCOUTQ`) as progress; on Apple the send side is
   unchanged. See the `transport` module doc "A slow peer".
+- **An android-13+ server refuses a session id that is not 32 bytes before
+  reading it**, as AOSP `RpcServer::establishConnection` does; it read up to
+  65535 bytes first, holding the connection's worker meanwhile.
 - **On the android-13+ wire a null binder interoperates with libbinder**: it
   carries the stability `int32` AOSP writes (see *Migrating*).
 - **On the r34 wire an android-12 peer's binder is no longer refused one time
