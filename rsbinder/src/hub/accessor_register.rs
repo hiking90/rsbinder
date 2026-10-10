@@ -211,11 +211,12 @@ impl std::fmt::Display for AccessorConnectError {
 
 impl std::error::Error for AccessorConnectError {}
 
-/// AF_UNIX connect (Linux + macOS): the client end of a connection accepted on `path`.
-fn connect_unix_owned_fd(path: &PathBuf) -> std::result::Result<OwnedFd, AccessorConnectError> {
-    use std::os::unix::net::UnixStream;
-    match UnixStream::connect(path) {
-        Ok(stream) => Ok(OwnedFd::from(stream)),
+/// A `connect(2)` outcome as `IAccessor` reports it: `EACCES` has a code of its own.
+fn connected<S: Into<OwnedFd>>(
+    r: std::io::Result<S>,
+) -> std::result::Result<OwnedFd, AccessorConnectError> {
+    match r {
+        Ok(stream) => Ok(stream.into()),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             Err(AccessorConnectError::ConnectFailedEacces)
         }
@@ -224,20 +225,18 @@ fn connect_unix_owned_fd(path: &PathBuf) -> std::result::Result<OwnedFd, Accesso
     }
 }
 
+/// AF_UNIX connect (Linux + macOS): the client end of a connection accepted on `path`.
+fn connect_unix_owned_fd(path: &PathBuf) -> std::result::Result<OwnedFd, AccessorConnectError> {
+    connected(std::os::unix::net::UnixStream::connect(path))
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn connect_unix_abstract_owned_fd(
     name: &[u8],
 ) -> std::result::Result<OwnedFd, AccessorConnectError> {
-    use std::os::unix::net::UnixStream;
     let addr =
         UnixSocketAddr::from_abstract_name(name).map_err(AccessorConnectError::ConnectFailed)?;
-    match UnixStream::connect_addr(&addr) {
-        Ok(stream) => Ok(OwnedFd::from(stream)),
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            Err(AccessorConnectError::ConnectFailedEacces)
-        }
-        Err(e) => Err(AccessorConnectError::ConnectFailed(e)),
-    }
+    connected(std::os::unix::net::UnixStream::connect_addr(&addr))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -254,13 +253,7 @@ fn connect_vsock_owned_fd(
     port: u32,
 ) -> std::result::Result<OwnedFd, AccessorConnectError> {
     use vsock::{VsockAddr, VsockStream};
-    match VsockStream::connect(&VsockAddr::new(cid, port)) {
-        Ok(stream) => Ok(OwnedFd::from(stream)),
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            Err(AccessorConnectError::ConnectFailedEacces)
-        }
-        Err(e) => Err(AccessorConnectError::ConnectFailed(e)),
-    }
+    connected(VsockStream::connect(&VsockAddr::new(cid, port)))
 }
 
 #[cfg(not(feature = "rpc-vsock"))]
@@ -274,14 +267,7 @@ fn connect_vsock_owned_fd(
 /// AF_INET v4 connect, behind debug-only `rpc-tcp-debug`; the stub returns `UnsupportedFamily`.
 #[cfg(feature = "rpc-tcp-debug")]
 fn connect_inet_owned_fd(addr: SocketAddrV4) -> std::result::Result<OwnedFd, AccessorConnectError> {
-    use std::net::TcpStream;
-    match TcpStream::connect(addr) {
-        Ok(stream) => Ok(OwnedFd::from(stream)),
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            Err(AccessorConnectError::ConnectFailedEacces)
-        }
-        Err(e) => Err(AccessorConnectError::ConnectFailed(e)),
-    }
+    connected(std::net::TcpStream::connect(addr))
 }
 
 #[cfg(not(feature = "rpc-tcp-debug"))]
