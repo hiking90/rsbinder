@@ -262,6 +262,7 @@ change bytes between peers: upgrade both ends together.
   binder whose process has died (fixed upstream in `ca63c66935b9`, backported
   to 6.12.4 and the GKI branches in late 2024) fails the add instead of
   aborting the process.
+
 ### Changed
 
 - **The entry API takes a typed destination, `rsbinder::Uri`**, built from

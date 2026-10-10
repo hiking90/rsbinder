@@ -101,11 +101,14 @@ the only available place to document:
   experimental paths),
 - experimental status with the opt-in feature name.
 
-Multi-paragraph rustdoc + plan / spec deeplinks (`plan/2-X-*.md`,
-`RPC_STATUS.md`) are encouraged where they document enduring invariants.
+Multi-paragraph rustdoc is encouraged where it documents enduring
+invariants. Cite a design plan by its ID (`plan 2-12`) rather than
+linking it: the `plans/` directory holds the maintainer's local design
+notes and is not part of the repository, so a link to one resolves
+neither on docs.rs nor on GitHub.
 
 Dated incident detail (specific dates, hex dumps, log lines) belongs in
-the linked `RPC_STATUS.md` / `plan/*.md`, not in rustdoc itself —
+the commit message or the PR description, not in rustdoc itself —
 rustdoc is read in isolation on docs.rs and dated material rots.
 
 ### References
