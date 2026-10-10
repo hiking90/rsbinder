@@ -48,6 +48,18 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
+/// A `spawn_blocking` failure as a status; a panic resumes (none on Android: `panic = abort`).
+pub(crate) fn join_error_status(e: tokio::task::JoinError) -> StatusCode {
+    if e.is_panic() {
+        std::panic::resume_unwind(e.into_panic());
+    }
+    if e.is_cancelled() {
+        StatusCode::FailedTransaction
+    } else {
+        StatusCode::Unknown
+    }
+}
+
 /// Retrieve an existing service for a particular interface — one
 /// `getService` wire call, which does not block (see
 /// [`crate::hub::try_get_interface`]). For an event-driven wait use
@@ -72,16 +84,9 @@ pub async fn get_interface_async<T: FromIBinder + ?Sized + 'static>(
     }
 
     let name = name.to_string();
-    let res = tokio::task::spawn_blocking(move || lookup::<T>(&name)).await;
-
-    // The `is_panic` arm is unreachable on Android (`panic = abort`).
-    match res {
-        Ok(Ok(service)) => Ok(service),
-        Ok(Err(err)) => Err(err),
-        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-        Err(e) if e.is_cancelled() => Err(StatusCode::FailedTransaction),
-        Err(_) => Err(StatusCode::Unknown),
-    }
+    tokio::task::spawn_blocking(move || lookup::<T>(&name))
+        .await
+        .unwrap_or_else(|e| Err(join_error_status(e)))
 }
 
 /// Wait until the service named `name` is registered, then cast it to `T` —
@@ -174,15 +179,7 @@ pub async fn wait_for_interface_async<T: FromIBinder + ?Sized + 'static>(
         FromIBinder::try_from(binder)
     })
     .await;
-
-    // The `is_panic` arm is unreachable on Android (`panic = abort`).
-    match res {
-        Ok(Ok(service)) => Ok(service),
-        Ok(Err(err)) => Err(err),
-        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-        Err(e) if e.is_cancelled() => Err(StatusCode::FailedTransaction),
-        Err(_) => Err(StatusCode::Unknown),
-    }
+    res.unwrap_or_else(|e| Err(join_error_status(e)))
 }
 
 /// Cancels the wait on drop: a `spawn_blocking` task ignores `abort()`, so its state tells it.
@@ -220,15 +217,9 @@ pub async fn check_interface_async<T: FromIBinder + ?Sized + 'static>(
     }
 
     let name = name.to_string();
-    let res = tokio::task::spawn_blocking(move || lookup::<T>(&name)).await;
-
-    match res {
-        Ok(Ok(service)) => Ok(service),
-        Ok(Err(err)) => Err(err),
-        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-        Err(e) if e.is_cancelled() => Err(StatusCode::FailedTransaction),
-        Err(_) => Err(StatusCode::Unknown),
-    }
+    tokio::task::spawn_blocking(move || lookup::<T>(&name))
+        .await
+        .unwrap_or_else(|e| Err(join_error_status(e)))
 }
 
 /// A future that completes when a binder dies — one `select!` arm instead of a
@@ -413,12 +404,9 @@ impl BinderAsyncPool for Tokio {
         } else {
             let handle = tokio::task::spawn_blocking(spawn_me);
             Box::pin(async move {
-                // The `is_panic` arm is unreachable on Android (`panic = abort`).
                 match handle.await {
                     Ok(res) => after_spawn(res).await,
-                    Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-                    Err(e) if e.is_cancelled() => Err(StatusCode::FailedTransaction.into()),
-                    Err(_) => Err(StatusCode::Unknown.into()),
+                    Err(e) => Err(join_error_status(e).into()),
                 }
             })
         }

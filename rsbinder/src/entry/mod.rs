@@ -112,12 +112,9 @@ pub fn connect_async<T: FromIBinder + ?Sized + 'static>(
             client::new_client(uri, ClientOptions::default())?;
             return crate::wait_for_interface_async::<T>(&name).await;
         }
-        match tokio::task::spawn_blocking(move || connect::<T>(uri)).await {
-            Ok(r) => r,
-            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-            Err(e) if e.is_cancelled() => Err(crate::StatusCode::FailedTransaction),
-            Err(_) => Err(crate::StatusCode::Unknown),
-        }
+        tokio::task::spawn_blocking(move || connect::<T>(uri))
+            .await
+            .unwrap_or_else(|e| Err(crate::rt::join_error_status(e)))
     }
 }
 
