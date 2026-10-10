@@ -654,7 +654,7 @@ impl RpcTransport for UnixTransport {
     /// and accumulates fds across those `recvmsg`s (AOSP
     /// `RpcTransportRaw::interruptableReadFully`).
     fn recv_raw_with_fds(&self, buf: &mut [u8]) -> RpcResult<(usize, Vec<std::os::fd::OwnedFd>)> {
-        use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, ReturnFlags};
+        use rustix::net::RecvAncillaryBuffer;
         use std::io::IoSliceMut;
         use std::mem::MaybeUninit;
 
@@ -682,25 +682,7 @@ impl RpcTransport for UnixTransport {
                 }
             }
         };
-        // `MSG_CTRUNC`: the kernel dropped surplus fds; fail, as AOSP `OS_unix_base.cpp` (EPIPE).
-        if r.flags.contains(ReturnFlags::CTRUNC) {
-            return Err(RpcError::Protocol(
-                "SCM_RIGHTS control message truncated (too many fds in one message)",
-            ));
-        }
-        for msg in anc.drain() {
-            if let RecvAncillaryMessage::ScmRights(iter) = msg {
-                for fd in iter {
-                    #[cfg(target_vendor = "apple")]
-                    rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)
-                        .map_err(std::io::Error::from)?;
-                    fds.push(fd);
-                    if fds.len() > MAX_FDS_PER_FRAME {
-                        return Err(RpcError::Protocol("too many fds in one RPC frame"));
-                    }
-                }
-            }
-        }
+        take_scm_rights(r.flags, &mut anc, &mut fds)?;
         Ok((r.bytes, fds))
     }
 
@@ -812,7 +794,7 @@ impl UnixTransport {
         fds: &mut Vec<OwnedFd>,
         started: bool,
     ) -> RpcResult<usize> {
-        use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, ReturnFlags};
+        use rustix::net::RecvAncillaryBuffer;
         use std::io::IoSliceMut;
 
         let consumed = started || !fds.is_empty();
@@ -844,25 +826,7 @@ impl UnixTransport {
                 }
             }
         };
-        // `MSG_CTRUNC`: surplus fds were dropped; reject, as AOSP `OS_unix_base.cpp` (EPIPE).
-        if r.flags.contains(ReturnFlags::CTRUNC) {
-            return Err(RpcError::Protocol(
-                "SCM_RIGHTS control message truncated (too many fds in one message)",
-            ));
-        }
-        for msg in anc.drain() {
-            if let RecvAncillaryMessage::ScmRights(iter) = msg {
-                for fd in iter {
-                    #[cfg(target_vendor = "apple")]
-                    rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)
-                        .map_err(std::io::Error::from)?;
-                    fds.push(fd);
-                    if fds.len() > MAX_FDS_PER_FRAME {
-                        return Err(RpcError::Protocol("too many fds in one RPC frame"));
-                    }
-                }
-            }
-        }
+        take_scm_rights(r.flags, &mut anc, fds)?;
         if r.bytes == 0 {
             return Err(if consumed || !fds.is_empty() {
                 RpcError::Truncated
@@ -872,6 +836,36 @@ impl UnixTransport {
         }
         Ok(r.bytes)
     }
+}
+
+/// One `recvmsg`'s fds into `fds` (`O_CLOEXEC` on Apple too); the cap counts all of `fds`.
+fn take_scm_rights(
+    flags: rustix::net::ReturnFlags,
+    anc: &mut rustix::net::RecvAncillaryBuffer<'_>,
+    fds: &mut Vec<OwnedFd>,
+) -> RpcResult<()> {
+    use rustix::net::{RecvAncillaryMessage, ReturnFlags};
+
+    // `MSG_CTRUNC`: the kernel dropped surplus fds; fail, as AOSP `OS_unix_base.cpp` (EPIPE).
+    if flags.contains(ReturnFlags::CTRUNC) {
+        return Err(RpcError::Protocol(
+            "SCM_RIGHTS control message truncated (too many fds in one message)",
+        ));
+    }
+    for msg in anc.drain() {
+        if let RecvAncillaryMessage::ScmRights(iter) = msg {
+            for fd in iter {
+                #[cfg(target_vendor = "apple")]
+                rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)
+                    .map_err(std::io::Error::from)?;
+                fds.push(fd);
+                if fds.len() > MAX_FDS_PER_FRAME {
+                    return Err(RpcError::Protocol("too many fds in one RPC frame"));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
