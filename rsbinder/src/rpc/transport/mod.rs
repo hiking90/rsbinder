@@ -75,6 +75,39 @@
 //! same split: `Timeout` only for a deadline of this end's that consumed
 //! nothing, any loss of the connection as another variant.
 //!
+//! # A slow peer
+//!
+//! A deadline this end arms on a bundled socket transport (the session's
+//! `set_timeout`, a server's idle and reply deadlines) expires only once the
+//! peer has gone that long without progress in either direction: sending
+//! this end a byte, or taking one of this end's. On Linux and Android the
+//! second is read from `SIOCOUTQ` (`queued_bytes`): what TCP has not had
+//! acknowledged, what a Unix-domain peer has not read, what vsock has not
+//! sent.
+//!
+//! - **Sends** wait in `poll` (`unix::SendWait`), with or without a drain,
+//!   instead of blocking in `send(2)`. The kernel reports room only once a
+//!   share of the send buffer has drained (TCP: free space at least half of
+//!   what is queued; Unix-domain: the write allocation down to a quarter of
+//!   `SO_SNDBUF`), and TCP grows that buffer to megabytes on a long path, so
+//!   on a slow link one such step can take longer than the deadline. The wait
+//!   looks at `SIOCOUTQ` every eighth of the deadline (10 to 250 ms) and
+//!   starts the deadline over when it fell: the verdict comes between `d`
+//!   and `d` plus one such pause after the peer's last progress.
+//! - **Reads** (`ReadDeadline`): a frame's tail can sit in this end's send
+//!   buffer for longer than the deadline after its send returned, and the
+//!   peer has nothing to send back until it has read it. A read that starts
+//!   with bytes of this end's still queued waits in `poll`, looking at
+//!   `SIOCOUTQ` as a send does; one with nothing queued is the plain blocking
+//!   read under `SO_RCVTIMEO`. While a read deadline is armed, each read
+//!   costs one `ioctl` to tell the two apart.
+//!
+//! Apple has no `SIOCOUTQ`. There a send's progress is a send that accepted
+//! bytes, a send without a drain blocks in `send(2)` under `SO_SNDTIMEO`, and
+//! a read deadline counts only the peer's bytes; so does a `tls` stream with
+//! no socket. A transport of the caller's own keeps whatever its
+//! `set_write_timeout` and `set_read_timeout` do.
+//!
 //! # Mutation gates
 //!
 //! - `a_send_deadline_is_a_timeout_only_before_the_first_byte`: dropping the
@@ -168,6 +201,10 @@ pub trait RpcTransport: Send + Sync {
     /// Neither variant is for anything but this deadline: a connection the
     /// platform gave up on (the kernel's `ETIMEDOUT`) is lost, and reports
     /// as [`RpcError::Io`] or an end of stream.
+    ///
+    /// On the bundled socket transports, a peer that is still taking this
+    /// end's bytes keeps the deadline from expiring
+    /// ([module doc "A slow peer"](self#a-slow-peer)).
     fn set_read_timeout(&self, _timeout: Option<std::time::Duration>) -> RpcResult<()> {
         Ok(())
     }
@@ -180,7 +217,9 @@ pub trait RpcTransport: Send + Sync {
     /// admission and then stops reading cannot pin its worker thread (and,
     /// under [`set_max_connections`](super::server::RpcServer::set_max_connections),
     /// its admission slot) forever by stalling our blocking `write_all`
-    /// once the kernel send buffer fills.
+    /// once the kernel send buffer fills. On the bundled socket transports it
+    /// bounds the time without the peer's progress, not a whole send
+    /// ([module doc "A slow peer"](self#a-slow-peer)).
     ///
     /// A transport that keeps the default gives a stalled send no bound at
     /// all. A server session counts a frame being written as activity
@@ -473,7 +512,7 @@ pub trait RpcTransport: Send + Sync {
     /// one message whole, waiting for the rest of it if needed, and the send
     /// is retried after it. An error from `drain` ends the send with that
     /// error. A send deadline ([`set_write_timeout`](Self::set_write_timeout))
-    /// still bounds each wait in which no byte goes out, with the errors a
+    /// still bounds the time without the peer's progress, with the errors a
     /// blocking send gives. A failure on the read side, the transport's own
     /// or `drain`'s, is never reported as [`RpcError::Protocol`] or
     /// [`RpcError::FrameTooLarge`]: those two mean nothing was sent, and the
@@ -484,9 +523,10 @@ pub trait RpcTransport: Send + Sync {
     ///
     /// `unix`, `tcp_debug` and `vsock` send without blocking; when the send
     /// buffer is full they wait in `poll` for room or input and hand input
-    /// to `drain`. `SO_SNDTIMEO` bounds each such wait as it bounds a
-    /// blocking send. XNU ignores `MSG_DONTWAIT` on a send (a unix-socket
-    /// `sendmsg` with it blocks), so on Apple platforms the socket is made
+    /// to `drain`. `SO_SNDTIMEO` bounds the time without the peer's progress
+    /// ([module doc "A slow peer"](self#a-slow-peer)). XNU ignores
+    /// `MSG_DONTWAIT` on a send (a unix-socket `sendmsg` with it blocks),
+    /// so on Apple platforms the socket is made
     /// `O_NONBLOCK` for that one call and its flags are restored after it.
     ///
     /// `tls` writes each chunk's ciphertext to `TlsStream::socket` without
@@ -682,11 +722,8 @@ pub(crate) fn write_all_reporting<W: Write>(w: &mut W, buf: &[u8]) -> RpcResult<
     Ok(())
 }
 
-/// `send_raw` of a blocking stream backend: [`write_all_reporting`], then `flush`.
-#[cfg(any(
-    feature = "rpc-tcp-debug",
-    all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android"))
-))]
+/// `tcp_debug`'s blocking `send_raw` where sends do not wait in `poll` (`unix::WAITING_SENDS`).
+#[cfg(feature = "rpc-tcp-debug")]
 pub(crate) fn write_raw<W: Write>(w: &mut W, buf: &[u8]) -> RpcResult<()> {
     write_all_reporting(w, buf)?;
     w.flush()?;
@@ -704,6 +741,109 @@ pub(crate) fn read_raw<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<usize> {
             Err(e) if is_timeout(&e) => Err(RpcError::Timeout),
             Err(e) => Err(RpcError::from(e)),
         };
+    }
+}
+
+/// Bytes `sock` holds that its peer has not taken yet (`SIOCOUTQ`); `None` where unsupported.
+///
+/// TCP counts sent-but-unacknowledged and unsent bytes (`tcp_ioctl`), a Unix-domain stream the
+/// buffers its peer has not read (`unix_outq_len`), vsock what its transport has not sent.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn queued_bytes(sock: std::os::fd::BorrowedFd<'_>) -> Option<u32> {
+    use rustix::ioctl::{ioctl, Getter, Opcode};
+    // SAFETY: `SIOCOUTQ` (`TIOCOUTQ` on a socket) writes one `c_int`; `sock` is a live fd.
+    let n = unsafe {
+        ioctl(
+            sock,
+            Getter::<{ libc::TIOCOUTQ as Opcode }, libc::c_int>::new(),
+        )
+    };
+    n.ok().and_then(|n| u32::try_from(n).ok())
+}
+
+/// Apple has no `SIOCOUTQ`: only the bytes a send accepts count as the peer's progress.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub(crate) fn queued_bytes(_sock: std::os::fd::BorrowedFd<'_>) -> Option<u32> {
+    None
+}
+
+/// How often a wait with this end's bytes still queued looks at [`queued_bytes`]: an eighth of
+/// the deadline `d`, held to 10..=250 ms, so the verdict comes at most that long after `d`.
+pub(crate) fn look_every(d: std::time::Duration) -> std::time::Duration {
+    const MIN: std::time::Duration = std::time::Duration::from_millis(10);
+    const MAX: std::time::Duration = std::time::Duration::from_millis(250);
+    (d / 8).clamp(MIN, MAX)
+}
+
+/// A socket transport's read deadline, which the peer taking this end's bytes extends.
+///
+/// `SO_RCVTIMEO` expires after `d` with no byte from the peer. While the peer is still taking
+/// a frame of ours it has nothing to send back, so a read that starts with bytes queued waits
+/// in `poll` instead and runs its deadline from the peer's last progress (module doc "A slow
+/// peer"). A read with nothing queued is the plain blocking read.
+#[derive(Debug, Default)]
+pub(crate) struct ReadDeadline {
+    /// The `SO_RCVTIMEO` the transport last set, in nanoseconds; 0 for none.
+    limit_ns: std::sync::atomic::AtomicU64,
+}
+
+impl ReadDeadline {
+    /// What the transport just set as `SO_RCVTIMEO`: the read path looks only when one is armed.
+    pub(crate) fn note(&self, timeout: Option<std::time::Duration>) {
+        let ns = timeout.map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+        self.limit_ns
+            .store(ns, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `read` (one blocking socket read), after waiting while the peer takes this end's bytes.
+    pub(crate) fn read<T>(
+        &self,
+        sock: Option<std::os::fd::BorrowedFd<'_>>,
+        read: impl FnOnce() -> RpcResult<T>,
+    ) -> RpcResult<T> {
+        use rustix::event::{poll, PollFd, PollFlags, Timespec};
+
+        let ns = self.limit_ns.load(std::sync::atomic::Ordering::Relaxed);
+        let (Some(sock), true) = (sock, ns != 0) else {
+            return read();
+        };
+        let Some(mut queued) = queued_bytes(sock).filter(|q| *q > 0) else {
+            return read();
+        };
+        let limit = std::time::Duration::from_nanos(ns);
+        let mut since = std::time::Instant::now();
+        loop {
+            let left = match limit.checked_sub(since.elapsed()) {
+                Some(left) if !left.is_zero() => left,
+                // Nothing came and nothing was taken for the whole deadline.
+                _ => return Err(RpcError::Timeout),
+            };
+            let pause = if queued > 0 {
+                left.min(look_every(limit))
+            } else {
+                left
+            };
+            let ts = Timespec {
+                tv_sec: pause.as_secs().try_into().unwrap_or(i64::MAX),
+                tv_nsec: pause.subsec_nanos() as _,
+            };
+            let mut fds = [PollFd::from_borrowed_fd(sock, PollFlags::IN)];
+            match poll(&mut fds, Some(&ts)) {
+                // Input, the peer's end, or an error: the read returns at once with it.
+                Ok(n) if n > 0 => return read(),
+                Ok(_) => {
+                    if queued > 0 {
+                        let now = queued_bytes(sock).unwrap_or(queued);
+                        if now < queued {
+                            since = std::time::Instant::now();
+                        }
+                        queued = now;
+                    }
+                }
+                Err(rustix::io::Errno::INTR) => {}
+                Err(e) => return Err(std::io::Error::from(e).into()),
+            }
+        }
     }
 }
 

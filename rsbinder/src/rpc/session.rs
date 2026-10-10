@@ -5168,8 +5168,11 @@ impl RpcSession {
     ///   [`RpcTransport::set_write_timeout`] (with the no-op default a
     ///   stalled send has no bound), so a send that makes no progress for `d`
     ///   because the peer stopped reading fails and ends the session. A
-    ///   peer that reads slowly but steadily is not cut: the deadline
-    ///   bounds each wait for socket buffer space, not the whole send.
+    ///   peer that reads slowly but steadily is not cut: on the bundled
+    ///   socket transports the deadline counts from the peer's last progress,
+    ///   and on Linux and Android a reply wait does not expire while the peer
+    ///   is still taking the request either
+    ///   ([`transport` doc "A slow peer"](super::transport#a-slow-peer)).
     /// - **The peer's host**, on TCP (`tcp_debug`, `tls` over TCP): the
     ///   kernel's check that the host still answers, sized to `d` and on
     ///   with `None` too, ends the session once the host goes silent even
@@ -8597,7 +8600,7 @@ mod tests {
         ARMED_READ.with(|a| assert!(a.borrow().is_empty(), "every record is dropped"));
     }
 
-    /// A slow but steady reader is not cut: the deadline bounds each wait, not the whole send.
+    /// A slow but steady reader is not cut: the deadline counts from its last progress.
     #[test]
     fn a_peer_that_reads_slowly_is_not_cut_by_the_send_deadline() {
         use super::super::transport::UnixTransport;

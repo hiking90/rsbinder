@@ -368,6 +368,17 @@ Status codes:
 
 RPC:
 
+- **A slow link no longer trips the session's deadlines while the peer keeps
+  up.** On the bundled socket transports a send deadline counted only the
+  sends the kernel accepted, and the kernel reports room after a third of a
+  send buffer TCP grows to megabytes has drained; a read deadline (a reply
+  wait, a server's idle wait) counted only the peer's bytes, while the tail of
+  a large frame of ours could still be on its way to it. Over a 1 Mbit/s link
+  a 2 MiB call with `set_timeout(1 s)` ended the session after 2.5 s, and a
+  server with `set_idle_timeout(1 s)` ended one while its large reply was
+  still being delivered. On Linux and Android both now count the peer taking
+  this end's bytes (`SIOCOUTQ`) as progress; on Apple the send side is
+  unchanged. See the `transport` module doc "A slow peer".
 - **On the android-13+ wire a null binder interoperates with libbinder**: it
   carries the stability `int32` AOSP writes (see *Migrating*).
 - **On the r34 wire an android-12 peer's binder is no longer refused one time

@@ -25,8 +25,8 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::unix::{send_draining, send_frame_vectored};
-use super::{read_frame, PeerIdentity, RpcTransport};
+use super::unix::{send_frame_vectored, send_waiting};
+use super::{read_frame, PeerIdentity, ReadDeadline, RpcTransport};
 use crate::rpc::RpcResult;
 
 /// Set on the first `TcpDebugTransport` construction; gates the one-time warning, read by tests.
@@ -52,6 +52,7 @@ pub fn insecure_warning_emitted() -> bool {
 pub struct TcpDebugTransport {
     stream: TcpStream,
     desc: String,
+    reads: ReadDeadline,
 }
 
 impl TcpDebugTransport {
@@ -70,7 +71,11 @@ impl TcpDebugTransport {
             Ok(a) => format!("tcp_debug:{a}"),
             Err(_) => "tcp_debug".to_string(),
         };
-        Ok(TcpDebugTransport { stream, desc })
+        Ok(TcpDebugTransport {
+            stream,
+            desc,
+            reads: ReadDeadline::default(),
+        })
     }
 
     /// Wrap a preconnected `OwnedFd` (the `IAccessor::addConnection()`
@@ -144,11 +149,11 @@ impl RpcTransport for TcpDebugTransport {
         if !fds.is_empty() {
             return self.send_raw_with_fds(buf, fds);
         }
-        send_draining(
+        send_waiting(
             self.stream.as_fd(),
             &mut [std::io::IoSlice::new(buf)],
             &[],
-            drain,
+            Some(drain),
         )
     }
 
@@ -164,12 +169,18 @@ impl RpcTransport for TcpDebugTransport {
     /// wraps an `AF_INET` fd in this transport and goes straight into the
     /// android-13+ handshake, whose first byte is a raw write.
     fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
+        if super::unix::WAITING_SENDS {
+            let slices = &mut [std::io::IoSlice::new(buf)];
+            return send_waiting(self.stream.as_fd(), slices, &[], None);
+        }
         super::write_raw(&mut &self.stream, buf)
     }
 
     /// Raw, unframed read: `read_raw`, shared by the stream backends.
     fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize> {
-        super::read_raw(&mut &self.stream, buf)
+        let sock = Some(self.stream.as_fd());
+        self.reads
+            .read(sock, || super::read_raw(&mut &self.stream, buf))
     }
 
     /// **Always** [`PeerIdentity::Anonymous`]. There is deliberately no
@@ -185,6 +196,7 @@ impl RpcTransport for TcpDebugTransport {
 
     fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> RpcResult<()> {
         self.stream.set_read_timeout(timeout)?;
+        self.reads.note(timeout);
         Ok(())
     }
 

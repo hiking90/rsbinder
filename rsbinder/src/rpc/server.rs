@@ -937,10 +937,12 @@ impl RpcServer {
     /// traffic.
     ///
     /// The serve phase arms this value on the **write** side too, so a peer
-    /// that stops draining replies ends the session as well. The write half
-    /// bounds each wait for socket buffer space, not a whole reply: a
-    /// consumer that reads a large reply slowly but steadily is not cut,
-    /// one that reads nothing for `d` is. With
+    /// that stops draining replies ends the session as well. Both halves
+    /// count from the client's last progress, not from the start of a reply:
+    /// a consumer that reads a large reply slowly but steadily is not cut,
+    /// even after the reply's send has returned and its tail waits in the
+    /// socket, and one that reads nothing for `d` is
+    /// ([`transport` doc "A slow peer"](super::transport#a-slow-peer)). With
     /// [`set_reply_timeout`](Self::set_reply_timeout) also set, the smaller
     /// of the two bounds the sends. The write half is the transport's
     /// [`RpcTransport::set_write_timeout`]:
@@ -1032,8 +1034,9 @@ impl RpcServer {
     /// callback behind a busy pool can take up to twice this value
     /// end-to-end.
     ///
-    /// Being the session's `set_timeout`, it also bounds each wait for
-    /// socket buffer space on every connection of the session and, on TCP,
+    /// Being the session's `set_timeout`, it also bounds how long a send on
+    /// any connection of the session may go without the client's progress
+    /// and, on TCP,
     /// sizes the kernel's check that the client's host still answers
     /// ([`RpcTransport::set_liveness`] has the values and platform limits).
     ///

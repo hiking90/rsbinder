@@ -99,7 +99,7 @@ use std::os::unix::net::SocketAddr as UnixSocketAddr;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-use super::{read_frame, PeerIdentity, RpcTransport, MAX_FRAME_LEN};
+use super::{queued_bytes, read_frame, PeerIdentity, ReadDeadline, RpcTransport, MAX_FRAME_LEN};
 use crate::rpc::{RpcError, RpcResult};
 
 /// Per-message fd cap (DoS bound, < `SCM_MAX_FD` 253); `wire_android13` applies it across recvmsgs.
@@ -205,12 +205,19 @@ pub(crate) fn send_nonblocking<T>(
     }
 }
 
-/// `RpcTransport::send_raw_draining` on a stream socket, `fds` on the first byte.
-pub(crate) fn send_draining(
+/// Whether a send without `drain` waits in `poll` too: Apple has no `SIOCOUTQ` to gain from it,
+/// and its non-blocking send costs two `fcntl` (`send_nonblocking`).
+pub(crate) const WAITING_SENDS: bool = cfg!(any(target_os = "linux", target_os = "android"));
+
+/// A send on a stream socket that waits in `poll` (`SendWait`), `fds` on the first byte.
+///
+/// With `drain` it is `RpcTransport::send_raw_draining`; without, a plain send that judges its
+/// deadline by the peer's progress as the draining one does (`transport` doc "A slow peer").
+pub(crate) fn send_waiting(
     sock: std::os::fd::BorrowedFd<'_>,
     slices: &mut [std::io::IoSlice<'_>],
     fds: &[std::os::fd::BorrowedFd<'_>],
-    drain: &mut dyn FnMut() -> RpcResult<()>,
+    mut drain: Option<&mut dyn FnMut() -> RpcResult<()>>,
 ) -> RpcResult<()> {
     use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage};
     use std::io::IoSlice;
@@ -248,8 +255,12 @@ pub(crate) fn send_draining(
                 waiting.progressed();
             }
             Err(rustix::io::Errno::INTR) => continue,
-            Err(rustix::io::Errno::AGAIN) => match waiting.wait()? {
-                Some(true) => drain().map_err(super::read_side_failure)?,
+            Err(rustix::io::Errno::AGAIN) => match waiting.wait(drain.is_some())? {
+                Some(true) => {
+                    if let Some(drain) = drain.as_mut() {
+                        drain().map_err(super::read_side_failure)?;
+                    }
+                }
                 Some(false) => {}
                 // As `write_all_reporting`: a deadline before any byte keeps frame sync.
                 None if sent == 0 => return Err(RpcError::Timeout),
@@ -261,12 +272,14 @@ pub(crate) fn send_draining(
     Ok(())
 }
 
-/// The waits of one draining send: `SO_SNDTIMEO` counted from the first wait since progress.
+/// The waits of one send: `SO_SNDTIMEO` counted from the last progress (`transport` "A slow peer").
 pub(crate) struct SendWait<'a> {
     sock: std::os::fd::BorrowedFd<'a>,
     since: Option<std::time::Instant>,
     /// Read at the first wait: most sends never wait, and the option costs a syscall.
     limit: Option<Option<std::time::Duration>>,
+    /// `queued_bytes` at the last look in this wait; `None` before it or where unsupported.
+    queued: Option<u32>,
 }
 
 impl<'a> SendWait<'a> {
@@ -275,20 +288,29 @@ impl<'a> SendWait<'a> {
             sock,
             since: None,
             limit: None,
+            queued: None,
         }
     }
 
     /// A byte went out: the next wait starts its own deadline.
     pub(crate) fn progressed(&mut self) {
         self.since = None;
+        self.queued = None;
     }
 
     /// What is left of this wait's deadline: `Some(None)` unbounded, `None` passed.
     fn left(&mut self) -> Option<Option<std::time::Duration>> {
         use rustix::net::sockopt::{socket_timeout, Timeout};
 
-        let since = *self.since.get_or_insert_with(std::time::Instant::now);
         let sock = self.sock;
+        let since = match self.since {
+            Some(since) => since,
+            None => {
+                // A new wait: what the peer has yet to take is the baseline its progress lowers.
+                self.queued = queued_bytes(sock);
+                *self.since.insert(std::time::Instant::now())
+            }
+        };
         let limit = *self
             .limit
             .get_or_insert_with(|| socket_timeout(sock, Timeout::Send).ok().flatten());
@@ -301,30 +323,51 @@ impl<'a> SendWait<'a> {
         }
     }
 
-    /// Whether the send deadline passed with no byte out; starts the wait if none is running.
+    /// The peer took bytes since the last look: the deadline starts over from now.
+    fn look_for_peer_progress(&mut self) {
+        let Some(before) = self.queued else { return };
+        let Some(now) = queued_bytes(self.sock) else {
+            return;
+        };
+        self.queued = Some(now);
+        if now < before {
+            self.since = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Whether the send deadline passed with no progress; starts the wait if none is running.
     #[cfg(feature = "rpc-tls")]
     pub(crate) fn expired(&mut self) -> bool {
         self.left().is_none()
     }
 
+    /// Wait for room (and, with `input`, for input or the peer's end) until the deadline.
+    ///
     /// `Some(true)` input or the peer's end, `Some(false)` room or a send error, `None` expired.
-    pub(crate) fn wait(&mut self) -> RpcResult<Option<bool>> {
+    pub(crate) fn wait(&mut self, input: bool) -> RpcResult<Option<bool>> {
         use rustix::event::{poll, PollFd, PollFlags, Timespec};
 
+        let events = if input {
+            PollFlags::IN | PollFlags::OUT
+        } else {
+            PollFlags::OUT
+        };
         loop {
             let Some(left) = self.left() else {
                 return Ok(None);
             };
-            let ts = left.map(|d| Timespec {
+            // Wake to look at the peer's progress, which `poll` reports only in large steps.
+            let pause = match (left, self.limit, self.queued) {
+                (Some(left), Some(Some(d)), Some(_)) => Some(left.min(super::look_every(d))),
+                (left, _, _) => left,
+            };
+            let ts = pause.map(|d| Timespec {
                 tv_sec: d.as_secs().try_into().unwrap_or(i64::MAX),
                 tv_nsec: d.subsec_nanos() as _,
             });
-            let mut fds = [PollFd::from_borrowed_fd(
-                self.sock,
-                PollFlags::IN | PollFlags::OUT,
-            )];
+            let mut fds = [PollFd::from_borrowed_fd(self.sock, events)];
             match poll(&mut fds, ts.as_ref()) {
-                Ok(0) => continue,
+                Ok(0) => self.look_for_peer_progress(),
                 Ok(_) => return Ok(Some(fds[0].revents().contains(PollFlags::IN))),
                 Err(rustix::io::Errno::INTR) => continue,
                 Err(e) => return Err(std::io::Error::from(e).into()),
@@ -340,6 +383,7 @@ pub struct UnixTransport {
     desc: String,
     /// Held by the fd-mode reader for a whole frame; it keeps no bytes between frames.
     fd_recv_lock: std::sync::Mutex<()>,
+    reads: ReadDeadline,
 }
 
 impl UnixTransport {
@@ -367,6 +411,7 @@ impl UnixTransport {
             peer,
             desc,
             fd_recv_lock: std::sync::Mutex::new(()),
+            reads: ReadDeadline::default(),
         })
     }
 
@@ -561,6 +606,10 @@ impl RpcTransport for UnixTransport {
     /// wire has no length prefix). `send(2)` with `SEND_FLAGS` (no `SIGPIPE`)
     /// needs only `&self`, so it stays full-duplex (same as `send_frame`).
     fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
+        if WAITING_SENDS {
+            let slices = &mut [std::io::IoSlice::new(buf)];
+            return send_waiting(self.stream.as_fd(), slices, &[], None);
+        }
         send_raw_nosignal(self.stream.as_fd(), buf)
     }
 
@@ -568,7 +617,9 @@ impl RpcTransport for UnixTransport {
     /// android-13+ profile drives `RpcWireHeader`-based framing on top
     /// of this (`wire_android13::read_aosp_message`).
     fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize> {
-        super::read_raw(&mut &self.stream, buf)
+        let sock = Some(self.stream.as_fd());
+        self.reads
+            .read(sock, || super::read_raw(&mut &self.stream, buf))
     }
 
     /// Raw, **unframed** write + `SCM_RIGHTS` (the android-13+ v1+
@@ -585,6 +636,10 @@ impl RpcTransport for UnixTransport {
 
         if fds.is_empty() {
             return self.send_raw(buf);
+        }
+        if WAITING_SENDS {
+            let slices = &mut [IoSlice::new(buf)];
+            return send_waiting(self.stream.as_fd(), slices, fds, None);
         }
         if buf.is_empty() {
             // No payload means no `sendmsg` to carry the fds; AOSP frames are never empty.
@@ -652,14 +707,14 @@ impl RpcTransport for UnixTransport {
         let mut space =
             vec![MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_FDS_PER_FRAME))];
         let mut anc = RecvAncillaryBuffer::new(&mut space);
-        let r = loop {
+        let r = self.reads.read(Some(self.stream.as_fd()), || loop {
             match rustix::net::recvmsg(
                 &self.stream,
                 &mut [IoSliceMut::new(buf)],
                 &mut anc,
                 RECV_FLAGS,
             ) {
-                Ok(r) => break r,
+                Ok(r) => return Ok(r),
                 // EINTR retry, symmetric with read_header.
                 Err(rustix::io::Errno::INTR) => continue,
                 Err(e) => {
@@ -671,7 +726,7 @@ impl RpcTransport for UnixTransport {
                     return Err(io_err.into());
                 }
             }
-        };
+        })?;
         take_scm_rights(r.flags, &mut anc, &mut fds)?;
         Ok((r.bytes, fds))
     }
@@ -686,6 +741,7 @@ impl RpcTransport for UnixTransport {
 
     fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> RpcResult<()> {
         self.stream.set_read_timeout(timeout)?;
+        self.reads.note(timeout);
         Ok(())
     }
 
@@ -727,11 +783,11 @@ impl RpcTransport for UnixTransport {
         drain: &mut dyn FnMut() -> RpcResult<()>,
     ) -> RpcResult<()> {
         // No length check: raw bytes have no frame, and the caller caps the body.
-        send_draining(
+        send_waiting(
             self.stream.as_fd(),
             &mut [std::io::IoSlice::new(buf)],
             fds,
-            drain,
+            Some(drain),
         )
     }
 
