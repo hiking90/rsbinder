@@ -405,7 +405,8 @@ RPC:
   deadline's own now cuts the connection once the phase outlives it:
   `set_handshake_timeout` from the accept to admission (the authorizer's run
   left out), the client's
-  `timeout` for each TLS or android-13+ handshake step. An expired TLS
+  `timeout` for each TLS or android-13+ handshake step, and
+  `RpcSession::from_preconnected_fd`'s 10 s for its handshake. An expired TLS
   handshake reports `TimedOut`, not `WouldBlock`.
 - **On the android-13+ wire a null binder interoperates with libbinder**: it
   carries the stability `int32` AOSP writes (see *Migrating*).

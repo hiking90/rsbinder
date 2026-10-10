@@ -1160,3 +1160,31 @@ fn client_times_out_a_trickled_a13_handshake() {
 fn client_times_out_a_trickled_tls_handshake() {
     client_times_out_a_trickled_handshake(Link::Tls);
 }
+
+/// An Accessor's fd: `from_preconnected_fd` bounds its handshake by a fixed 10 s as a whole.
+#[test]
+fn preconnected_fd_times_out_a_trickled_handshake() {
+    const PRECONNECTED: Duration = Duration::from_secs(10);
+    let server = ServerSpec::a13().unix();
+    // The 8-byte response one byte every 2 s: each read is inside 10 s, the whole is not.
+    let down = Pace::Trickle(Duration::from_secs(2));
+    let relay = Relay::start(&server.at, Pace::Full, down);
+    let At::Unix(path) = relay.at.clone() else {
+        unreachable!()
+    };
+    let t0 = Instant::now();
+    let got = within(PRECONNECTED + SLACK, move || {
+        let sock = UnixStream::connect(path).expect("connect");
+        RpcSession::from_preconnected_fd(sock.into(), 2).map(|_| ())
+    });
+    let took = t0.elapsed();
+    assert_eq!(
+        got,
+        Some(Err(StatusCode::TimedOut)),
+        "a trickled preconnected handshake, after {took:?}"
+    );
+    assert!(
+        took >= PRECONNECTED.mul_f32(0.8),
+        "failed after {took:?}: not by the deadline"
+    );
+}

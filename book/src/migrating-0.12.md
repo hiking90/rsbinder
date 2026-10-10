@@ -388,7 +388,8 @@ a reference such as "(CHANGELOG *Fixed*)" points to the 0.12.0 section there.
   `RpcUnixClientConfig` and `ClientOptions`) bounds each TLS or android-13+
   handshake step as a whole in the same way: in 0.11.0 `handshake_timeout`
   bounded each read, and now a step that outlasts it fails the setup call
-  with `TimedOut`.
+  with `TimedOut`. `RpcSession::from_preconnected_fd` bounds its handshake
+  by a fixed 10 s the same way, where 0.11.0 bounded each read by it.
 - **An expired TLS handshake is `RpcError::Timeout`, not `Io(WouldBlock)`**:
   `TlsTransport::connect`, `accept`, `connect_stream` and `accept_stream`
   return `RpcError::Timeout` (`StatusCode::TimedOut`) when the stream's

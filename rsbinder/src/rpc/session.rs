@@ -6091,12 +6091,15 @@ impl RpcSession {
     /// blocking: an `EAGAIN` mid-handshake would surface as `Io(WouldBlock)`
     /// and end the connection.
     ///
-    /// The handshake is bounded by a 10 s read and write deadline. The fd
-    /// comes from an Accessor the service manager returned, a peer that may
-    /// accept the connection and then never send or never read; without the
-    /// deadline `getService`/`get_root` would block forever, because the
-    /// per-call session timeout applies only inside a transaction. The
-    /// deadline is cleared on the established session.
+    /// The handshake as a whole is bounded by 10 s, as
+    /// [`RpcClientConfig::timeout`] bounds a handshake step: a peer that
+    /// answers one byte at a time does not stretch it, and an expired
+    /// handshake returns [`StatusCode::TimedOut`]. The fd comes from an
+    /// Accessor the service manager returned, a peer that may accept the
+    /// connection and then never send or never read; without the deadline
+    /// `getService`/`get_root` would block forever, because the per-call
+    /// session timeout applies only inside a transaction. The deadline is
+    /// cleared on the established session.
     pub fn from_preconnected_fd(fd: OwnedFd, max_version: u32) -> Result<RpcSession> {
         // (a) `getsockname`, not `SO_DOMAIN` (absent on macOS); a connected fd always has a name.
         let local = rustix::net::getsockname(fd.as_fd())
@@ -6134,16 +6137,13 @@ impl RpcSession {
             }
         };
 
-        // (c) Bound the handshake (rustdoc); best-effort: a set failure means no deadline.
+        // (c) android-13+ handshake without FD mode, bounded as a whole (rustdoc).
         const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-        let _ = transport.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
-        let _ = transport.set_write_timeout(Some(HANDSHAKE_TIMEOUT));
-
-        // (d) android-13+ handshake without FD mode: the Accessor fd carries no fd-mode metadata.
-        let session = RpcSession::connect_android13plus_fd(
+        let session = RpcSession::connect_android13plus_fd_hs(
             transport,
             max_version,
             FileDescriptorTransportMode::None,
+            Some(HANDSHAKE_TIMEOUT),
         )?;
         session.inner.clear_handshake_timeouts();
         Ok(session)
