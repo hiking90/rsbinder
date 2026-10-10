@@ -19,113 +19,86 @@
 //! (`hub::android_16::resolve_accessor`) needs the generated proxy to call
 //! `addConnection()` / `getInstanceName()`. `ParcelFileDescriptor` is already
 //! part of the runtime crate.
+//!
+//! A codegen failure prints the `miette` report and exits 1, as the
+//! rsbinder-aidl README's `build.rs` does.
 
 use std::path::PathBuf;
+
+fn generate_bindings(async_enabled: bool, sources: &[&str], output: &str) {
+    let builder = sources.iter().fold(
+        rsbinder_aidl::Builder::new()
+            .set_crate_support(true)
+            .set_async_support(async_enabled),
+        |builder, source| builder.source(PathBuf::from(source)),
+    );
+    if let Err(err) = builder.output(PathBuf::from(output)).generate() {
+        eprintln!("generating {output}: {:?}", miette::Report::new(err));
+        std::process::exit(1);
+    }
+}
 
 fn main() {
     // Codegen `async` follows the runtime crate's feature (see the module doc).
     let async_enabled = std::env::var_os("CARGO_FEATURE_ASYNC").is_some();
-    let new_builder = || {
-        rsbinder_aidl::Builder::new()
-            .set_crate_support(true)
-            .set_async_support(async_enabled)
-    };
+    let generate =
+        |sources: &[&str], output: &str| generate_bindings(async_enabled, sources, output);
 
-    new_builder()
-        .source(PathBuf::from("aidl/11/android/os/IServiceManager.aidl"))
-        .output(PathBuf::from("service_manager_11.rs"))
-        .generate()
-        .unwrap();
-
-    new_builder()
-        .source(PathBuf::from("aidl/12/android/os/IServiceManager.aidl"))
-        .output(PathBuf::from("service_manager_12.rs"))
-        .generate()
-        .unwrap();
-
-    new_builder()
-        .source(PathBuf::from("aidl/13/android/os/IServiceManager.aidl"))
-        .output(PathBuf::from("service_manager_13.rs"))
-        .generate()
-        .unwrap();
-
-    new_builder()
-        .source(PathBuf::from("aidl/14/android/os/IServiceManager.aidl"))
-        .output(PathBuf::from("service_manager_14.rs"))
-        .generate()
-        .unwrap();
-
+    generate(
+        &["aidl/11/android/os/IServiceManager.aidl"],
+        "service_manager_11.rs",
+    );
+    generate(
+        &["aidl/12/android/os/IServiceManager.aidl"],
+        "service_manager_12.rs",
+    );
+    generate(
+        &["aidl/13/android/os/IServiceManager.aidl"],
+        "service_manager_13.rs",
+    );
+    generate(
+        &["aidl/14/android/os/IServiceManager.aidl"],
+        "service_manager_14.rs",
+    );
     // 15.0.0_r6+ (`getService2`): `hub::servicemanager_15`; r1–r5 use 14's; `hub::default` probes.
-    new_builder()
-        .source(PathBuf::from("aidl/15/android/os/IServiceManager.aidl"))
-        .output(PathBuf::from("service_manager_15.rs"))
-        .generate()
-        .unwrap();
-
-    new_builder()
-        .source(PathBuf::from("aidl/16/android/os/IServiceManager.aidl"))
-        .output(PathBuf::from("service_manager_16.rs"))
-        .generate()
-        .unwrap();
-
+    generate(
+        &["aidl/15/android/os/IServiceManager.aidl"],
+        "service_manager_15.rs",
+    );
+    generate(
+        &["aidl/16/android/os/IServiceManager.aidl"],
+        "service_manager_16.rs",
+    );
     // Not imported by `IServiceManager.aidl`, so compiled on its own (see the module doc).
-    new_builder()
-        .source(PathBuf::from("aidl/16/android/os/IAccessor.aidl"))
-        .output(PathBuf::from("accessor_16.rs"))
-        .generate()
-        .unwrap();
-
+    generate(&["aidl/16/android/os/IAccessor.aidl"], "accessor_16.rs");
     // Client stub for PermissionManagerService; stable across android-{11..16}, so unversioned.
-    new_builder()
-        .source(PathBuf::from(
-            "aidl/permission/android/os/IPermissionController.aidl",
-        ))
-        .output(PathBuf::from("permission_controller.rs"))
-        .generate()
-        .unwrap();
-
+    generate(
+        &["aidl/permission/android/os/IPermissionController.aidl"],
+        "permission_controller.rs",
+    );
     // Plan 10-5: unchanged since 2012, so unversioned; rsbinder implements both sides of it.
-    new_builder()
-        .source(PathBuf::from(
-            "aidl/cancel/android/os/ICancellationSignal.aidl",
-        ))
-        .output(PathBuf::from("cancellation_signal.rs"))
-        .generate()
-        .unwrap();
-
+    generate(
+        &["aidl/cancel/android/os/ICancellationSignal.aidl"],
+        "cancellation_signal.rs",
+    );
     // AOSP FMQ AIDL (plans/12-fmq.md): rsbinder-aidl maps user imports to it, so built once here.
-    new_builder()
-        .source(PathBuf::from(
+    generate(
+        &[
             "aidl/fmq/android/hardware/common/NativeHandle.aidl",
-        ))
-        .source(PathBuf::from(
             "aidl/fmq/android/hardware/common/fmq/GrantorDescriptor.aidl",
-        ))
-        .source(PathBuf::from(
             "aidl/fmq/android/hardware/common/fmq/MQDescriptor.aidl",
-        ))
-        .source(PathBuf::from(
             "aidl/fmq/android/hardware/common/fmq/SynchronizedReadWrite.aidl",
-        ))
-        .source(PathBuf::from(
             "aidl/fmq/android/hardware/common/fmq/UnsynchronizedWrite.aidl",
-        ))
-        .output(PathBuf::from("fmq.rs"))
-        .generate()
-        .unwrap();
-
+        ],
+        "fmq.rs",
+    );
     // rsbinder's own streaming AIDL (AOSP has none): plans/10-7b-streaming-over-fmq.md §2.1.
-    new_builder()
-        .source(PathBuf::from(
+    generate(
+        &[
             "aidl/stream/rsbinder/stream/StreamEndpoint.aidl",
-        ))
-        .source(PathBuf::from(
             "aidl/stream/rsbinder/stream/IStreamSink.aidl",
-        ))
-        .source(PathBuf::from(
             "aidl/stream/rsbinder/stream/IStreamSource.aidl",
-        ))
-        .output(PathBuf::from("stream.rs"))
-        .generate()
-        .unwrap();
+        ],
+        "stream.rs",
+    );
 }

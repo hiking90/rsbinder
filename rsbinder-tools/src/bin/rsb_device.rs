@@ -131,7 +131,9 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
-    let device_name = app.get_one::<String>("device_name").unwrap();
+    let device_name = app
+        .get_one::<String>("device_name")
+        .expect("clap enforces the required device_name");
 
     // Runs as root and is joined into paths below: one component, within BINDERFS_MAX_NAME (255).
     if device_name.is_empty()

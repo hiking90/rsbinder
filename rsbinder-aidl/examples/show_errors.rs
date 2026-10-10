@@ -13,10 +13,10 @@ fn demo_parse(label: &str, src: &str) {
 }
 
 fn demo_builder(label: &str, src: &str) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("create a temporary directory");
     let input = dir.path().join(format!("{label}.aidl"));
     let output = dir.path().join(format!("{label}.rs"));
-    std::fs::write(&input, src).unwrap();
+    std::fs::write(&input, src).expect("write the .aidl input");
 
     let result = rsbinder_aidl::Builder::new()
         .source(input)

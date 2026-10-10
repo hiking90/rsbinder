@@ -155,6 +155,8 @@ libc = { workspace = true }
 # `async` feature above carries the same edge conditionally, which is what
 # makes the two crates agree by default.
 rsbinder-aidl = { workspace = true }
+# Renders a codegen failure; already in the graph through rsbinder-aidl.
+miette = { workspace = true }
 
 [dev-dependencies]
 env_logger = { workspace = true }
