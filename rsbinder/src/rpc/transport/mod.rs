@@ -333,6 +333,26 @@ pub trait RpcTransport: Send + Sync {
         None
     }
 
+    /// A function that cuts this connection from another thread, as
+    /// [`shutdown`](Self::shutdown) does, without a reference to the
+    /// transport. `None` (the default) when the transport has none.
+    ///
+    /// A handshake deadline is a bound on the whole handshake, but each read's
+    /// own deadline starts over with every byte, so a peer that sends one byte
+    /// at a time keeps the handshake going for as long as it likes. The deadline
+    /// therefore cuts the connection from a thread of its own once it passes
+    /// ([`RpcServer::set_handshake_timeout`](super::server::RpcServer::set_handshake_timeout),
+    /// [`RpcClientConfig::timeout`](super::RpcClientConfig::timeout)). A
+    /// transport that returns `None` has its handshake bounded per read only.
+    ///
+    /// The bundled socket transports return a function that shuts down a
+    /// duplicate of their socket: `shutdown(2)` acts on the socket, whichever
+    /// descriptor names it, and the duplicate keeps it from being closed and
+    /// its number reused while the function is held.
+    fn shutdown_handle(&self) -> Option<Box<dyn FnOnce() + Send>> {
+        None
+    }
+
     /// Shut the connection down in both directions: wake a reader blocked
     /// in [`recv_frame`](Self::recv_frame) / [`recv_raw`](Self::recv_raw)
     /// and make this end's later sends fail. (The *peer's* sends are the
@@ -765,6 +785,23 @@ pub(crate) fn queued_bytes(sock: std::os::fd::BorrowedFd<'_>) -> Option<u32> {
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub(crate) fn queued_bytes(_sock: std::os::fd::BorrowedFd<'_>) -> Option<u32> {
     None
+}
+
+/// `RpcTransport::shutdown_handle` of a socket transport: shut a duplicate of `sock` down.
+pub(crate) fn socket_shutdown_handle(
+    sock: std::os::fd::BorrowedFd<'_>,
+) -> Option<Box<dyn FnOnce() + Send>> {
+    let dup = match sock.try_clone_to_owned() {
+        Ok(dup) => dup,
+        Err(e) => {
+            log::debug!("RPC: cannot duplicate a socket for its deadline: {e}");
+            return None;
+        }
+    };
+    Some(Box::new(move || {
+        // `ENOTCONN` when the peer already left: the connection is down either way.
+        let _ = rustix::net::shutdown(&dup, rustix::net::Shutdown::Both);
+    }))
 }
 
 /// How often a wait with this end's bytes still queued looks at [`queued_bytes`]: an eighth of

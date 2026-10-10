@@ -760,6 +760,10 @@ impl RpcTransport for UnixTransport {
         super::socket_peer_closed(self.stream.as_fd(), super::SocketKind::UnixDomain)
     }
 
+    fn shutdown_handle(&self) -> Option<Box<dyn FnOnce() + Send>> {
+        super::socket_shutdown_handle(self.stream.as_fd())
+    }
+
     fn supports_fd_passing(&self) -> bool {
         true
     }

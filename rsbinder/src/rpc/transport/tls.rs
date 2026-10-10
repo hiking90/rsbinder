@@ -392,13 +392,21 @@ fn cert_identity(
 
 /// Run the handshake to completion (blocking, before sharing); verification failures surface here.
 fn drive_handshake(conn: &mut Connection, stream: &dyn TlsStream) -> RpcResult<()> {
+    // A socket deadline is the handshake's deadline, not "nothing sent, retry" (`WouldBlock`).
+    let deadline = |e: std::io::Error| {
+        if super::is_timeout(&e) {
+            RpcError::Timeout
+        } else {
+            RpcError::from(e)
+        }
+    };
     let mut io = IoAdapter(stream);
     while conn.is_handshaking() {
-        let (_rd, _wr) = conn.complete_io(&mut io)?;
+        let (_rd, _wr) = conn.complete_io(&mut io).map_err(deadline)?;
     }
     // Flush any trailing handshake flight still queued.
     while conn.wants_write() {
-        conn.write_tls(&mut io)?;
+        conn.write_tls(&mut io).map_err(deadline)?;
     }
     Ok(())
 }
@@ -806,6 +814,11 @@ impl RpcTransport for TlsTransport {
     // The socket's FIN, not `close_notify`: a buffered alert is still an unread byte.
     fn peer_closed(&self) -> Option<bool> {
         self.stream.peer_closed()
+    }
+
+    // The socket, not `close_notify`: a deadline's peer is not reading our alerts either.
+    fn shutdown_handle(&self) -> Option<Box<dyn FnOnce() + Send>> {
+        self.stream.socket().and_then(super::socket_shutdown_handle)
     }
 
     fn shutdown(&self) -> RpcResult<()> {

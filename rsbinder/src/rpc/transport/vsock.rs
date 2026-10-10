@@ -159,4 +159,9 @@ impl RpcTransport for VsockTransport {
         use std::os::fd::AsFd;
         super::socket_peer_closed(self.stream.as_fd(), super::SocketKind::TcpOrVsock)
     }
+
+    fn shutdown_handle(&self) -> Option<Box<dyn FnOnce() + Send>> {
+        use std::os::fd::AsFd;
+        super::socket_shutdown_handle(self.stream.as_fd())
+    }
 }

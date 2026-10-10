@@ -511,6 +511,7 @@ fn pump(mut from: Box<dyn Read + Send>, mut to: Box<dyn Write + Send>, pace: Pac
 /// Set for the run inside a namespace; the `in_ns_*` cases do nothing without it.
 const IN_NS: &str = "RSB_SLOW_LINK_IN_NS";
 /// Set where a skip would hide a gap (CI): a host that cannot run the cases fails instead.
+#[cfg(target_os = "linux")]
 const REQUIRED: &str = "RSB_SLOW_LINK_REQUIRED";
 
 /// The kernel wakes a waiting sender once about a third of a send buffer that has grown to
@@ -523,14 +524,18 @@ const BULK: usize = 2 * 1024 * 1024;
 const BULK_AT_LEAST: Duration = Duration::from_secs(4);
 
 /// What the other direction gets: the delay, not the rate.
+#[cfg(target_os = "linux")]
 const REVERSE_LINK: &str = "delay 20ms";
 /// The server's port inside a case's namespace, by which the shaping tells the directions apart.
 const NS_PORT: u16 = 7000;
 /// The `u32` match for the slow direction: towards the server (a request) or from it (a reply).
+#[cfg(target_os = "linux")]
 const TO_SERVER: &str = "dport";
+#[cfg(target_os = "linux")]
 const FROM_SERVER: &str = "sport";
 
 /// `(case, slow direction)`: each runs in a namespace of its own.
+#[cfg(target_os = "linux")]
 const NS_CASES: &[(&str, &str)] = &[
     ("in_ns_tcp_large_request_over_a_slow_link", TO_SERVER),
     ("in_ns_tls_large_request_over_a_slow_link", TO_SERVER),
@@ -911,7 +916,6 @@ fn server_cuts_a_trickled_handshake(server: Server, client: impl FnOnce(At) + Se
 }
 
 #[test]
-#[ignore = "plan 2-25 D3: the whole-phase handshake deadline lands in the next commit"]
 fn server_cuts_a_trickled_a13_handshake() {
     let server = ServerSpec {
         handshake_timeout: Some(D),
@@ -924,7 +928,6 @@ fn server_cuts_a_trickled_a13_handshake() {
 }
 
 #[test]
-#[ignore = "plan 2-25 D3: the whole-phase handshake deadline lands in the next commit"]
 fn server_cuts_a_trickled_r34_first_frame() {
     let server = ServerSpec {
         wire: Wire::R34,
@@ -941,7 +944,6 @@ fn server_cuts_a_trickled_r34_first_frame() {
 }
 
 #[test]
-#[ignore = "plan 2-25 D3: the whole-phase handshake deadline lands in the next commit"]
 fn server_cuts_a_trickled_tls_handshake() {
     let server = ServerSpec {
         handshake_timeout: Some(D),
@@ -955,7 +957,6 @@ fn server_cuts_a_trickled_tls_handshake() {
 
 /// A trickler holds no admission slot past `d`: the next client gets in.
 #[test]
-#[ignore = "plan 2-25 D3: the whole-phase handshake deadline lands in the next commit"]
 fn a_trickled_handshake_does_not_hold_a_connection_slot() {
     let server = ServerSpec {
         handshake_timeout: Some(D),
@@ -1048,13 +1049,11 @@ fn client_times_out_a_trickled_handshake(link: Link) {
 }
 
 #[test]
-#[ignore = "plan 2-25 D3: the whole-phase handshake deadline lands in the next commit"]
 fn client_times_out_a_trickled_a13_handshake() {
     client_times_out_a_trickled_handshake(Link::Unix);
 }
 
 #[test]
-#[ignore = "plan 2-25 D3: the whole-phase handshake deadline lands in the next commit"]
 fn client_times_out_a_trickled_tls_handshake() {
     client_times_out_a_trickled_handshake(Link::Tls);
 }

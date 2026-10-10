@@ -575,6 +575,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use super::deadline::PhaseDeadline;
 use super::end::{EndReason, EndedBy, ServeStep, SessionEnd};
 use super::fd_mode::FileDescriptorTransportMode;
 use super::lifecycle::SessionLifecycle;
@@ -856,8 +857,19 @@ fn connect_tls(
         tcp.set_read_timeout(Some(d))?;
         tcp.set_write_timeout(Some(d))?;
     }
-    let t = super::transport::TlsTransport::connect(tcp, server_name, config.clone())
-        .map_err(StatusCode::from)?;
+    // Each wait above; the whole handshake here, against a peer that sends a byte at a time.
+    let mut whole = PhaseDeadline::arm_with(handshake_timeout, || {
+        use std::os::fd::AsFd;
+        super::transport::socket_shutdown_handle(tcp.as_fd())
+    });
+    let t = match super::transport::TlsTransport::connect(tcp, server_name, config.clone()) {
+        Ok(t) => t,
+        Err(_) if whole.fired() => return Err(StatusCode::TimedOut),
+        Err(e) => return Err(StatusCode::from(e)),
+    };
+    if !whole.disarm() {
+        return Err(StatusCode::TimedOut);
+    }
     if handshake_timeout.is_some() {
         // Later traffic arms its own deadlines; a sticky one here would cut an idle session.
         t.set_read_timeout(None).map_err(StatusCode::from)?;
@@ -1134,7 +1146,10 @@ impl<'a> RpcClientConfig<'a> {
     /// - **Connecting**: each step of each connection — the `founding`
     ///   connect and every fan-out or incoming attach — is bounded by `d`:
     ///   `connect(2)` for `tcp_debug` and `tls`, the TLS handshake, and the
-    ///   android-13+ handshake. A server that accepts the socket and then
+    ///   android-13+ handshake. The bound is on the step as a whole: a server
+    ///   that answers one byte at a time does not stretch it, on a transport
+    ///   with a [`RpcTransport::shutdown_handle`] (the bundled ones; another is
+    ///   bounded per wait only). A server that accepts the socket and then
     ///   answers nothing (one at its connection cap leaves new connections
     ///   in its listen backlog, where `connect(2)` succeeds) fails the setup
     ///   call after `d` instead of hanging it. The r34 wire has no
@@ -1435,9 +1450,13 @@ impl Drop for ReplyDeadlineGuard<'_> {
 }
 
 /// Handshake read and write deadlines, cleared on drop; see module doc "Reply deadlines".
+///
+/// The socket deadlines bound each wait; `whole` bounds the step (plan 2-25 D3), where the
+/// transport has a `shutdown_handle`.
 struct HandshakeDeadline<'a> {
     transport: &'a dyn RpcTransport,
     armed: bool,
+    whole: PhaseDeadline,
 }
 
 impl<'a> HandshakeDeadline<'a> {
@@ -1457,7 +1476,30 @@ impl<'a> HandshakeDeadline<'a> {
             transport.set_read_timeout(deadline)?;
             transport.set_write_timeout(deadline)?;
         }
-        Ok(Self { transport, armed })
+        let whole = PhaseDeadline::arm_with(deadline, || transport.shutdown_handle());
+        Ok(Self {
+            transport,
+            armed,
+            whole,
+        })
+    }
+
+    /// End the step that succeeded: `Timeout` if the deadline cut the connection as it ended.
+    fn finish(&mut self) -> RpcResult<()> {
+        if self.whole.disarm() {
+            Ok(())
+        } else {
+            Err(RpcError::Timeout)
+        }
+    }
+
+    /// A step's failure as the deadline's when the deadline cut the connection under it.
+    fn classify(&self, e: RpcError) -> RpcError {
+        if self.whole.fired() {
+            RpcError::Timeout
+        } else {
+            e
+        }
     }
 }
 
@@ -4514,12 +4556,14 @@ impl RpcSession {
         };
         let codec = {
             // Scoped: the deadline is cleared before `transport` moves into the session.
-            let _hs = HandshakeDeadline::arm(transport.as_ref(), handshake_timeout)
+            let mut hs = HandshakeDeadline::arm(transport.as_ref(), handshake_timeout)
                 .map_err(StatusCode::from)?;
             let mut io = RawTransportIo(transport.as_ref());
             // An empty id requests a new session.
-            client_connect_with_id(&mut io, max_version, false, hdr_fd_mode, &[])
-                .map_err(client_handshake_err)?
+            let codec = client_connect_with_id(&mut io, max_version, false, hdr_fd_mode, &[])
+                .map_err(|e| client_handshake_err(hs.classify(e)))?;
+            hs.finish().map_err(client_handshake_err)?;
+            codec
         };
         let negotiated = codec.version();
         let session = RpcSession::with_profile(
@@ -4925,7 +4969,8 @@ impl RpcSession {
         std::thread::Builder::new()
             .name("rsbinder-rpc-serve".into())
             .spawn(move || {
-                session.serve_blocking_on_inner(Self::FOUNDING_SLOT_ID, false, false, serves)
+                let none = PhaseDeadline::none();
+                session.serve_blocking_on_inner(Self::FOUNDING_SLOT_ID, false, false, none, serves)
             })
             .map_err(|e| {
                 log::error!("RpcSession::spawn_serve: cannot start the serve thread: {e}");
@@ -4949,7 +4994,7 @@ impl RpcSession {
     /// call at once with [`EndReason::SessionEnded`], and leaves the
     /// session as it was.
     pub fn serve_blocking_on(&self, slot_id: u64) -> SessionEnd {
-        self.serve_blocking_on_inner(slot_id, false, false, false)
+        self.serve_blocking_on_inner(slot_id, false, false, PhaseDeadline::none(), false)
     }
 
     /// Like [`serve_blocking`](RpcSession::serve_blocking), but the
@@ -4971,12 +5016,19 @@ impl RpcSession {
     /// `Lost` stream, and `NotLocal` unless this end had already decided to
     /// end the session.
     pub fn serve_blocking_clearing_deadline_after_first(&self) -> SessionEnd {
-        self.serve_blocking_on_inner(Self::FOUNDING_SLOT_ID, true, true, false)
+        let none = PhaseDeadline::none();
+        self.serve_blocking_on_inner(Self::FOUNDING_SLOT_ID, true, true, none, false)
     }
 
     /// Server entry; `armed` is false after `set_handshake_timeout(None)`: no deadline to evict by.
-    pub(crate) fn serve_blocking_clearing_admission_deadline(&self, armed: bool) -> SessionEnd {
-        self.serve_blocking_on_inner(Self::FOUNDING_SLOT_ID, true, armed, false)
+    ///
+    /// `admission` is the whole-phase deadline the accept armed, ended with the first frame.
+    pub(crate) fn serve_blocking_clearing_admission_deadline(
+        &self,
+        armed: bool,
+        admission: PhaseDeadline,
+    ) -> SessionEnd {
+        self.serve_blocking_on_inner(Self::FOUNDING_SLOT_ID, true, armed, admission, false)
     }
 
     /// `spawn_declared`: `spawn_serve` already counted this loop in `serve_declared`.
@@ -4985,6 +5037,7 @@ impl RpcSession {
         slot_id: u64,
         clear_deadline_after_first: bool,
         admission_deadline_armed: bool,
+        mut admission: PhaseDeadline,
         spawn_declared: bool,
     ) -> SessionEnd {
         let declared = &self.inner.shared.serve_declared;
@@ -5012,10 +5065,15 @@ impl RpcSession {
                         // Lift the admission deadline: later idle waits are unbounded.
                         if first {
                             self.inner.clear_slot_read_timeout(slot_id);
+                            admission.disarm();
                             first = false;
                             deadline_armed = false;
                         }
                         seen = self.inner.activity();
+                    }
+                    // The whole-phase deadline cut the first frame: the admission deadline's end.
+                    ServeStep::Ended(_) if first && admission.fired() => {
+                        break (EndReason::Frame(StatusCode::TimedOut), deadline_armed);
                     }
                     // The pool emptied under the expiry: another connection ended the session.
                     ServeStep::Ended(EndReason::Frame(StatusCode::TimedOut))
@@ -5654,7 +5712,8 @@ impl RpcSession {
             return Err(StatusCode::BadType);
         }
         let codec = {
-            let _hs = HandshakeDeadline::arm(&*t, handshake_timeout).map_err(StatusCode::from)?;
+            let mut hs =
+                HandshakeDeadline::arm(&*t, handshake_timeout).map_err(StatusCode::from)?;
             let mut io = RawTransportIo(&*t);
             // A failed header write leaves the server short of it, so none admitted.
             let codec = client_write_connection_header(
@@ -5664,11 +5723,15 @@ impl RpcSession {
                 hdr_fd_mode,
                 session_id,
             )
-            .map_err(StatusCode::from)?;
+            .map_err(|e| StatusCode::from(hs.classify(e)))?;
             // libbinder pools the connection once it has the header, before it reads `"cci"`.
             let init = std::io::Write::write_all(&mut io, &codec.encode_connection_init());
             if let Err(e) = init {
-                return Err(self.end_past_outgoing_header(StatusCode::from(RpcError::from(e))));
+                let e = hs.classify(RpcError::from(e));
+                return Err(self.end_past_outgoing_header(StatusCode::from(e)));
+            }
+            if let Err(e) = hs.finish() {
+                return Err(self.end_past_outgoing_header(StatusCode::from(e)));
             }
             codec
         };
@@ -5676,11 +5739,12 @@ impl RpcSession {
             // Confirm admission before the slot joins; the probe falls back to `set_timeout`.
             let probe_deadline =
                 handshake_timeout.or(*self.inner.shared.timeout.lock().expect("timeout poisoned"));
-            let _hs = match HandshakeDeadline::arm(&*t, probe_deadline) {
+            let mut hs = match HandshakeDeadline::arm(&*t, probe_deadline) {
                 Ok(hs) => hs,
                 Err(e) => return Err(self.end_past_outgoing_header(StatusCode::from(e))),
             };
-            if let Err(e) = confirm_attach(&*t, &codec, session_id) {
+            if let Err(e) = confirm_attach(&*t, &codec, session_id).and_then(|()| hs.finish()) {
+                let e = hs.classify(e);
                 log_attach_refused(&e);
                 return Err(self.end_past_outgoing_header(StatusCode::from(e)));
             }
@@ -5830,7 +5894,8 @@ impl RpcSession {
         }
         {
             // Cleared before the push: a lingering read deadline would break the serve loop.
-            let _hs = HandshakeDeadline::arm(&*t, handshake_timeout).map_err(StatusCode::from)?;
+            let mut hs =
+                HandshakeDeadline::arm(&*t, handshake_timeout).map_err(StatusCode::from)?;
             let mut io = RawTransportIo(&*t);
             // An INCOMING header; a failed write leaves the server short of it, so none admitted.
             let codec = client_write_connection_header(
@@ -5840,8 +5905,14 @@ impl RpcSession {
                 hdr_fd_mode,
                 session_id,
             )
-            .map_err(StatusCode::from)?;
+            .map_err(|e| StatusCode::from(hs.classify(e)))?;
+            // The deadline's cut reads as an end of stream: classified, it ends the session.
             if let Err((e, received)) = client_read_connection_init(&mut io, &codec) {
+                return Err(self.fail_awaiting_cci(hs.classify(e), received));
+            }
+            // `"cci"` came, but the deadline cut the connection as it did: the server holds it.
+            if let Err(e) = hs.finish() {
+                let received = super::wire_android13::A13_CONN_INIT_LEN;
                 return Err(self.fail_awaiting_cci(e, received));
             }
         }

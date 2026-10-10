@@ -205,6 +205,9 @@ change bytes between peers: upgrade both ends together.
 - **`RpcSession::is_ended`**, **`rpc::EndReason::SessionEnded`**,
   **`RpcTransport::peer_closed`** and **`RpcTransport::set_liveness`** (both
   also on `TlsStream`).
+- **`RpcTransport::shutdown_handle`**: cuts a connection from another thread,
+  for the whole-handshake deadline; a transport of your own that returns
+  `None` (the default) has its handshake bounded per read only.
 - **`rpc::transport::MemTransport` carries a raw byte stream**, so an
   android-13+ session runs over `mem` in hermetic tests.
 - **Work source API** (`set_calling_work_source_uid` and friends), carried on
@@ -382,6 +385,15 @@ RPC:
 - **An android-13+ server refuses a session id that is not 32 bytes before
   reading it**, as AOSP `RpcServer::establishConnection` does; it read up to
   65535 bytes first, holding the connection's worker meanwhile.
+- **A handshake deadline bounds the whole handshake, not each read.** A peer
+  that sent one byte at a time, each inside the deadline, kept a server's
+  handshake going indefinitely (holding its worker, and under
+  `set_max_connections` an admission slot, so that `stop_and_join` waited on
+  it too) and a client's setup call from returning. A thread of the
+  deadline's own now cuts the connection once the phase outlives it:
+  `set_handshake_timeout` from the accept to admission, the client's
+  `timeout` for each TLS or android-13+ handshake step. An expired TLS
+  handshake reports `TimedOut`, not `WouldBlock`.
 - **On the android-13+ wire a null binder interoperates with libbinder**: it
   carries the stability `int32` AOSP writes (see *Migrating*).
 - **On the r34 wire an android-12 peer's binder is no longer refused one time
