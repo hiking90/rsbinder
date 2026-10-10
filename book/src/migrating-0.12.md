@@ -318,6 +318,12 @@ a reference such as "(CHANGELOG *Fixed*)" points to the 0.12.0 section there.
   `RpcSession::accept_android13plus_fd` with `server_fd_unix == false` (and
   `accept_android13plus`) refuses the same way. The r34 wire is unchanged: its
   `GET_FD_MODE` still agrees `None`.
+- **`RpcSession::accept_android13plus` and `accept_android13plus_fd` refuse a
+  connection header whose session id is neither empty nor 32 bytes**, as AOSP
+  `RpcServer::establishConnection` does, before reading the id; the call
+  returns `StatusCode::RpcError`. 0.11.0 read the id and ignored it, so a client that
+  sent a 16-byte id got a session. `RpcServer` is unchanged: it refused such a
+  connection in 0.11.0 too, when the id matched no session.
 
 ## RPC sessions and connections
 
@@ -366,6 +372,36 @@ a reference such as "(CHANGELOG *Fixed*)" points to the 0.12.0 section there.
   on a client each connect and handshake step. A send deadline that expires
   part-way through a frame returns `TimedOut` (0.11.0: `WouldBlock`, which
   means nothing was sent).
+- **`RpcServer::set_handshake_timeout` bounds the whole admission phase, not
+  each read.** In 0.11.0 it was a socket deadline (`SO_RCVTIMEO`,
+  `SO_SNDTIMEO`) that every read or write started over, so a client whose
+  handshake bytes kept coming was admitted however long they took. Now the
+  connection is dropped once the deadline has passed since its accept, its
+  TLS handshake included: a client on a link slow enough to need longer than
+  the deadline (10 s by default) for its whole handshake is refused. On the
+  r34 wire a connection that opens a new session ends the phase only once its
+  first transaction has been served, so a large first transaction counts too;
+  a connection that joins an existing session ends it with its session-id
+  preamble. Raise the deadline for such links. A client's handshake deadline
+  (`timeout`, or the deprecated `handshake_timeout` of `RpcClientConfig`,
+  `RpcUnixClientConfig` and `ClientOptions`) bounds each TLS or android-13+
+  handshake step as a whole in the same way: in 0.11.0 `handshake_timeout`
+  bounded each read, and now a step that outlasts it fails the setup call
+  with `TimedOut`.
+- **An expired TLS handshake is `RpcError::Timeout`, not `Io(WouldBlock)`**:
+  `TlsTransport::connect`, `accept`, `connect_stream` and `accept_stream`
+  return `RpcError::Timeout` (`StatusCode::TimedOut`) when the stream's
+  deadline ends the handshake. 0.11.0 returned `RpcError::Io` of kind
+  `WouldBlock`.
+- **On Linux and Android a send or read deadline counts the peer taking this
+  end's bytes as progress** (`SIOCOUTQ`; the
+  [`transport` module doc "A slow peer"](https://docs.rs/rsbinder/latest/rsbinder/rpc/transport/index.html#a-slow-peer)).
+  A consumer that reads a large reply slower than `set_idle_timeout`'s or the
+  session timeout's period, but keeps reading, is no longer cut mid-send, nor
+  while the tail of a reply whose send returned is still on its way, and a
+  reply wait goes on while the peer is still taking the request. Apple keeps
+  the 0.11.0 rule: a send's progress is a send that accepted bytes, and a read
+  deadline counts only the peer's bytes.
 - **TCP connections, TLS over TCP included, have keepalive on by default**, at
   the system's intervals without a session timeout (hours), so a session
   whose peer host vanished ends and fires its death recipients. No wire byte

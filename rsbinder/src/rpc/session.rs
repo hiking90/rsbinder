@@ -1449,10 +1449,7 @@ impl Drop for ReplyDeadlineGuard<'_> {
     }
 }
 
-/// Handshake read and write deadlines, cleared on drop; see module doc "Reply deadlines".
-///
-/// The socket deadlines bound each wait; `whole` bounds the step (plan 2-25 D3), where the
-/// transport has a `shutdown_handle`.
+/// Handshake socket deadlines, cleared on drop ("Reply deadlines"); `whole` bounds the step.
 struct HandshakeDeadline<'a> {
     transport: &'a dyn RpcTransport,
     armed: bool,
@@ -5020,9 +5017,7 @@ impl RpcSession {
         self.serve_blocking_on_inner(Self::FOUNDING_SLOT_ID, true, true, none, false)
     }
 
-    /// Server entry; `armed` is false after `set_handshake_timeout(None)`: no deadline to evict by.
-    ///
-    /// `admission` is the whole-phase deadline the accept armed, ended with the first frame.
+    /// Server entry; `armed`: a handshake deadline is set; the first frame ends `admission`.
     pub(crate) fn serve_blocking_clearing_admission_deadline(
         &self,
         armed: bool,
@@ -5065,8 +5060,11 @@ impl RpcSession {
                         // Lift the admission deadline: later idle waits are unbounded.
                         if first {
                             self.inner.clear_slot_read_timeout(slot_id);
-                            admission.disarm();
                             first = false;
+                            // The deadline cut the connection as the first frame ended.
+                            if !admission.disarm() {
+                                break (EndReason::Frame(StatusCode::TimedOut), deadline_armed);
+                            }
                             deadline_armed = false;
                         }
                         seen = self.inner.activity();

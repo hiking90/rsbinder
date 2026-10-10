@@ -107,6 +107,8 @@ change bytes between peers: upgrade both ends together.
 - An android-13+ session takes its fd mode from the connection header only.
 - An android-13+ server refuses a client that requests an fd mode it does not
   support.
+- `RpcSession::accept_android13plus[_fd]` refuses a connection header whose
+  session id is neither empty nor 32 bytes.
 
 **RPC sessions and connections**
 
@@ -116,6 +118,14 @@ change bytes between peers: upgrade both ends together.
 - An expired reply deadline ends the session.
 - The session timeout also bounds sends, connect and handshake steps, and TCP
   liveness.
+- `RpcServer::set_handshake_timeout` bounds the whole admission phase (on r34,
+  through a new session's first transaction; a joining connection's ends with
+  its session-id preamble), and a client's handshake deadline (`timeout`, the
+  deprecated `handshake_timeout`) each TLS or android-13+ handshake step as a
+  whole, not each read.
+- An expired TLS handshake is `RpcError::Timeout`, not `Io(WouldBlock)`.
+- On Linux and Android a send or read deadline counts the peer taking this
+  end's bytes as progress; Apple keeps the 0.11.0 rule.
 - TCP connections, TLS over TCP included, have keepalive on by default.
 - `RpcServer::set_idle_timeout` judges the session, not the connection.
 - A kernel `ETIMEDOUT` on a connection ends the session.
@@ -380,8 +390,8 @@ RPC:
   a 2 MiB call with `set_timeout(1 s)` ended the session after 2.5 s, and a
   server with `set_idle_timeout(1 s)` ended one while its large reply was
   still being delivered. On Linux and Android both now count the peer taking
-  this end's bytes (`SIOCOUTQ`) as progress; on Apple the send side is
-  unchanged. See the `transport` module doc "A slow peer".
+  this end's bytes (`SIOCOUTQ`) as progress; on Apple neither changes. See
+  the `transport` module doc "A slow peer".
 - **An android-13+ server refuses a session id that is not 32 bytes before
   reading it**, as AOSP `RpcServer::establishConnection` does; it read up to
   65535 bytes first, holding the connection's worker meanwhile.

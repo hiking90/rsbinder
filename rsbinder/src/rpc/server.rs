@@ -28,9 +28,11 @@
 //! handshakes are in flight.
 //!
 //! The TLS handshake does blocking reads and writes on the raw socket
-//! before the worker arms its admission deadline on the wrapped
-//! transport, so the handshake deadline is armed on the raw stream first:
-//! on the read side for a connected-but-silent peer, and on the write side
+//! before the wrapped transport exists, so the worker arms the admission
+//! deadline on the raw stream. Its whole-phase cut (the raw socket's
+//! `shutdown_handle`) counts the TLS handshake against the deadline; its
+//! socket deadlines bound each wait, on the read side for a
+//! connected-but-silent peer, and on the write side
 //! for a peer that is admitted but stops reading, stalling our handshake
 //! `write_all` once its receive window fills. Without it such a peer pins
 //! its worker — and, under `set_max_connections`, the whole accept loop —
@@ -62,7 +64,11 @@
 //!   serve loop. The android-13+ path lifts both sides after its handshake;
 //!   the r34 path, which has no handshake, reads the client's session-id
 //!   preamble under it, lifts the write side before the serve loop and the
-//!   read side after the first frame. The 10 s default
+//!   read side after the first frame. The socket deadlines start over with
+//!   every wait; the phase as a whole, from the accept to admission, is
+//!   bounded by a thread of the deadline's own that shuts the connection
+//!   down (`RpcTransport::shutdown_handle`) once the phase outlives it.
+//!   The 10 s default
 //!   exists so a peer that never sends its handshake cannot hold a
 //!   `max_connections` slot, or pin the server's `Arc`, forever.
 //! - **Serve deadlines.** After the android-13+ handshake the handshake
@@ -180,6 +186,7 @@ use super::transport::VsockTransport;
 use super::transport::{PeerIdentity, RpcTransport, UnixTransport};
 #[cfg(feature = "rpc-tls")]
 use super::transport::{TlsStream, TlsTransport};
+use super::wire_android13::BAD_SESSION_ID_SIZE;
 use super::RpcResult;
 
 /// Server TLS config, `None` = plain; `Mutex<Option>` like the other late-bound knobs.
@@ -855,8 +862,10 @@ impl RpcServer {
     /// The deadline bounds **only** the handshake/first-contact phase. For
     /// the android-13+ profile it is cleared after the explicit handshake;
     /// for the default r34 profile (no separate handshake) it covers the
-    /// client's `int32` session-id preamble and the first serve-loop frame,
-    /// and is cleared once that frame is read. Either
+    /// client's `int32` session-id preamble and, on a connection that opens a
+    /// new session, its first transaction until that transaction has been
+    /// served (reply sent included); a connection that joins an existing
+    /// session is admitted with its preamble. Either
     /// way an established two-way session may then sit idle between requests
     /// unbounded (the per-call reply deadline is managed separately via
     /// [`RpcSession::set_timeout`](super::RpcSession::set_timeout)).
@@ -1458,12 +1467,12 @@ impl RpcServer {
                     log::warn!("RPC: failed to prepare accepted stream, dropping: {e:?}");
                     return;
                 }
-                // The TLS handshake in `wrap_accepted` precedes the worker's own deadline.
+                // Socket deadlines bound each wait; `admission` bounds the phase.
                 let handshake_timeout = *server
                     .handshake_timeout
                     .lock()
                     .expect("handshake_timeout poisoned");
-                // From the accept to admission, the TLS handshake included (module doc).
+                // Accept to admission, TLS handshake included: `set_handshake_timeout`.
                 let admission =
                     PhaseDeadline::arm_with(handshake_timeout, || raw.shutdown_handle());
                 if let Some(d) = handshake_timeout {
@@ -1526,9 +1535,7 @@ impl RpcServer {
         }
     }
 
-    /// Worker body after the wrap: authorize, then serve the r34 or android-13+ path inline.
-    ///
-    /// `admission` is the deadline the accept armed; `None` arms one here (`serve_connection`).
+    /// Worker body after the wrap; `admission` is the accept's deadline, `None` arms one here.
     fn run_connection_in_worker(
         server: Arc<Self>,
         transport: Box<dyn RpcTransport>,
@@ -1578,6 +1585,15 @@ impl RpcServer {
                         Ok(parts) => parts,
                         Err(_) if admission.fired() => {
                             log::warn!("android-13+ RPC handshake: the handshake deadline passed");
+                            return;
+                        }
+                        // An id no session can have: refused unread, but counted as a bad id.
+                        Err(super::RpcError::Protocol(BAD_SESSION_ID_SIZE)) => {
+                            server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
+                            log::warn!(
+                                "android-13+ RPC: client supplied a session id that is not \
+                                 32 bytes; rejecting connection"
+                            );
                             return;
                         }
                         Err(e) => {

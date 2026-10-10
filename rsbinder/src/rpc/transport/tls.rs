@@ -242,6 +242,15 @@ pub trait TlsStream: Send + Sync {
     /// default is `None`: such a send then blocks without reading, and a
     /// peer that writes on the connection meanwhile can stall it. The
     /// bundled streams return their socket.
+    ///
+    /// On Linux and Android a `Some` socket carries more than that send:
+    /// every `send_raw` writes to it the same way, and a read with a
+    /// deadline armed looks at its `SIOCOUTQ` and may `poll` it first
+    /// ([module doc "A slow peer"](super#a-slow-peer)). Such a send takes
+    /// its deadline from the socket's own `SO_SNDTIMEO`, not from
+    /// [`set_write_timeout`](Self::set_write_timeout), so a stream that
+    /// returns `Some` must implement `set_write_timeout` by setting
+    /// `SO_SNDTIMEO` on this socket, or its sends wait without a bound.
     fn socket(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
         None
     }

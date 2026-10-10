@@ -21,6 +21,12 @@
 //!
 //! The cut runs under the deadline's lock, and disarming takes the same lock,
 //! so once [`PhaseDeadline::disarm`] has returned `true` the cut never runs.
+//! Dropping a deadline disarms it, so an early return ends the phase too.
+//!
+//! [`PhaseDeadline::arm_with`] makes the cut only when a duration is set,
+//! since making one duplicates the socket's fd. A duration too long for an
+//! [`Instant`] to hold (`Duration::MAX`, which the timeout setters accept)
+//! arms no deadline, as `SO_RCVTIMEO` saturates such a value to "never".
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -65,9 +71,7 @@ impl Shared {
     }
 }
 
-/// A deadline on a whole phase of one connection; see the module doc.
-///
-/// Disarmed on drop, so an early return ends the phase too.
+/// A deadline on a whole phase of one connection, disarmed on drop; see the module doc.
 pub(crate) struct PhaseDeadline {
     shared: Option<Arc<Shared>>,
 }
@@ -80,11 +84,14 @@ impl PhaseDeadline {
 
     /// Run `cut` once `after` has passed, unless the phase is disarmed first.
     pub(crate) fn arm(after: Duration, cut: Cut) -> Self {
+        // Beyond what an `Instant` holds: never passes (module doc).
+        let Some(at) = Instant::now().checked_add(after) else {
+            return Self::none();
+        };
         let shared = Arc::new(Shared {
             state: Mutex::new(State::Armed(cut)),
             ended: Condvar::new(),
         });
-        let at = Instant::now() + after;
         let watching = Arc::clone(&shared);
         let spawned = std::thread::Builder::new()
             .name("rpc-deadline".into())
@@ -103,9 +110,7 @@ impl PhaseDeadline {
         }
     }
 
-    /// `after` with the cut `cut` makes, or no deadline when either is missing.
-    ///
-    /// `cut` runs only with a deadline: making one duplicates a socket fd.
+    /// `after` with the cut `cut` makes, or none if either is missing; `cut` runs only on `after`.
     pub(crate) fn arm_with(after: Option<Duration>, cut: impl FnOnce() -> Option<Cut>) -> Self {
         match after.and_then(|after| cut().map(|cut| (after, cut))) {
             Some((after, cut)) => Self::arm(after, cut),
@@ -191,18 +196,27 @@ mod tests {
     #[test]
     fn a_phase_that_ends_in_time_is_never_cut() {
         let (cuts, cut) = counting();
-        let mut d = PhaseDeadline::arm(Duration::from_millis(30), cut);
+        // Inside the sleep below, so a disarm that leaves the cut armed fails the test.
+        let mut d = PhaseDeadline::arm(Duration::from_millis(300), cut);
         assert!(d.disarm());
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(600));
         assert_eq!(cuts.load(Ordering::SeqCst), 0);
-        assert!(!d.fired());
     }
 
     #[test]
     fn dropping_the_deadline_disarms_it() {
         let (cuts, cut) = counting();
-        drop(PhaseDeadline::arm(Duration::from_millis(30), cut));
-        std::thread::sleep(Duration::from_millis(100));
+        drop(PhaseDeadline::arm(Duration::from_millis(300), cut));
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(cuts.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_deadline_past_what_an_instant_holds_is_none() {
+        let (cuts, cut) = counting();
+        let mut d = PhaseDeadline::arm(Duration::MAX, cut);
+        assert!(!d.fired());
+        assert!(d.disarm());
         assert_eq!(cuts.load(Ordering::SeqCst), 0);
     }
 

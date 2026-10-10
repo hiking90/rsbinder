@@ -79,11 +79,13 @@
 //!
 //! A deadline this end arms on a bundled socket transport (the session's
 //! `set_timeout`, a server's idle and reply deadlines) expires only once the
-//! peer has gone that long without progress in either direction: sending
-//! this end a byte, or taking one of this end's. On Linux and Android the
-//! second is read from `SIOCOUTQ` (`queued_bytes`): what TCP has not had
-//! acknowledged, what a Unix-domain peer has not read, what vsock has not
-//! sent.
+//! peer has gone that long without progress. For a read deadline progress is
+//! the peer sending this end a byte or taking one of this end's; for a send
+//! deadline it is only the second, so a peer that keeps sending but takes
+//! nothing does not hold a send open. On Linux and Android the peer taking
+//! bytes is read from `SIOCOUTQ` (`queued_bytes`): what TCP has not sent or
+//! not had acknowledged (`tcp_ioctl`), the buffers a Unix-domain peer has not
+//! read (`unix_outq_len`), what vsock's transport has not sent.
 //!
 //! - **Sends** wait in `poll` (`unix::SendWait`), with or without a drain,
 //!   instead of blocking in `send(2)`. The kernel reports room only once a
@@ -203,7 +205,9 @@ pub trait RpcTransport: Send + Sync {
     /// as [`RpcError::Io`] or an end of stream.
     ///
     /// On the bundled socket transports, a peer that is still taking this
-    /// end's bytes keeps the deadline from expiring
+    /// end's bytes keeps the deadline of a [`recv_raw`](Self::recv_raw) or
+    /// [`recv_raw_with_fds`](Self::recv_raw_with_fds) call, the reads a
+    /// session makes, from expiring
     /// ([module doc "A slow peer"](self#a-slow-peer)).
     fn set_read_timeout(&self, _timeout: Option<std::time::Duration>) -> RpcResult<()> {
         Ok(())
@@ -218,7 +222,9 @@ pub trait RpcTransport: Send + Sync {
     /// under [`set_max_connections`](super::server::RpcServer::set_max_connections),
     /// its admission slot) forever by stalling our blocking `write_all`
     /// once the kernel send buffer fills. On the bundled socket transports it
-    /// bounds the time without the peer's progress, not a whole send
+    /// bounds a [`send_raw`](Self::send_raw) call and its fd and draining
+    /// forms, the sends a session makes, by the time without the peer's
+    /// progress, not as a whole send
     /// ([module doc "A slow peer"](self#a-slow-peer)).
     ///
     /// A transport that keeps the default gives a stalled send no bound at
@@ -765,9 +771,6 @@ pub(crate) fn read_raw<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<usize> {
 }
 
 /// Bytes `sock` holds that its peer has not taken yet (`SIOCOUTQ`); `None` where unsupported.
-///
-/// TCP counts sent-but-unacknowledged and unsent bytes (`tcp_ioctl`), a Unix-domain stream the
-/// buffers its peer has not read (`unix_outq_len`), vsock what its transport has not sent.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn queued_bytes(sock: std::os::fd::BorrowedFd<'_>) -> Option<u32> {
     use rustix::ioctl::{ioctl, Getter, Opcode};
@@ -794,7 +797,10 @@ pub(crate) fn socket_shutdown_handle(
     let dup = match sock.try_clone_to_owned() {
         Ok(dup) => dup,
         Err(e) => {
-            log::debug!("RPC: cannot duplicate a socket for its deadline: {e}");
+            log::warn!(
+                "rsbinder RPC: cannot duplicate a socket for its deadline ({e}); this phase is \
+                 bounded per read only"
+            );
             return None;
         }
     };
@@ -804,20 +810,14 @@ pub(crate) fn socket_shutdown_handle(
     }))
 }
 
-/// How often a wait with this end's bytes still queued looks at [`queued_bytes`]: an eighth of
-/// the deadline `d`, held to 10..=250 ms, so the verdict comes at most that long after `d`.
+/// How often a wait looks at [`queued_bytes`]: `d / 8` held to 10..=250 ms ("A slow peer").
 pub(crate) fn look_every(d: std::time::Duration) -> std::time::Duration {
     const MIN: std::time::Duration = std::time::Duration::from_millis(10);
     const MAX: std::time::Duration = std::time::Duration::from_millis(250);
     (d / 8).clamp(MIN, MAX)
 }
 
-/// A socket transport's read deadline, which the peer taking this end's bytes extends.
-///
-/// `SO_RCVTIMEO` expires after `d` with no byte from the peer. While the peer is still taking
-/// a frame of ours it has nothing to send back, so a read that starts with bytes queued waits
-/// in `poll` instead and runs its deadline from the peer's last progress (module doc "A slow
-/// peer"). A read with nothing queued is the plain blocking read.
+/// A socket transport's read deadline, which the peer taking our bytes extends ("A slow peer").
 #[derive(Debug, Default)]
 pub(crate) struct ReadDeadline {
     /// The `SO_RCVTIMEO` the transport last set, in nanoseconds; 0 for none.
@@ -941,7 +941,10 @@ pub(crate) enum SocketKind {
     // TCP and vsock: only their transports' features use it.
     #[cfg_attr(
         not(any(feature = "rpc-tcp-debug", feature = "rpc-tls", feature = "rpc-vsock")),
-        allow(dead_code)
+        allow(
+            dead_code,
+            reason = "only the TCP, TLS and vsock transports construct it"
+        )
     )]
     TcpOrVsock,
 }

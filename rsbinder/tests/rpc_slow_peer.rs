@@ -18,6 +18,19 @@
 //!   case (netem acts on every packet of the interface), the way
 //!   `rpc_link_break` runs under `unshare -rn`. The Unix-domain case needs no
 //!   namespace: a relay that reads slowly is a slow peer.
+//!
+//!   On a 1 Mbit/s link each such wake-up takes several times `D`, and a
+//!   `BULK` frame's tail sits in the send buffer, unread, for more than `D`
+//!   after its send returned. The shaping keeps the two directions apart: one
+//!   netem on `lo` would queue both together, so the receiver's ACKs would
+//!   wait behind the data they acknowledge, as on no real link, and `SIOCOUTQ`
+//!   would stand still for seconds while the link is busy. A `prio` qdisc with
+//!   a `u32` port match gives each direction a netem of its own.
+//!
+//!   A Unix-domain socket is reported writable again only once its write
+//!   allocation is down to a quarter of `SO_SNDBUF` (about 150 KiB of payload
+//!   to drain at the default 208 KiB), which a reader of 16 KiB every 100 ms
+//!   takes about 0.9 s: longer than the deadline that case arms.
 //! - **The handshake deadline** (`RpcServer::set_handshake_timeout`, and the
 //!   client's `timeout` for each handshake step) is a bound on the whole
 //!   phase. A peer that sends one byte at a time, each well inside `d`, must
@@ -127,14 +140,6 @@ fn tmp_sock(tag: &str) -> PathBuf {
         "rsb_slow_{tag}_{}_{nanos}.sock",
         std::process::id()
     ))
-}
-
-/// A loopback port nothing listens on right now.
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .expect("free port")
-        .port()
 }
 
 fn root_proxy(root: &SIBinder) -> &RpcProxy {
@@ -283,7 +288,11 @@ impl ServerSpec {
     }
 
     fn tls(self) -> Server {
-        self.tls_on(free_port())
+        let server = RpcServer::setup_tcp_server_tls("127.0.0.1:0", server_config()).expect("tls");
+        self.apply(&server);
+        let _ = server.run_background();
+        let at = At::Tcp(server.tcp_address().expect("tcp address"));
+        Server { server, at }
     }
 
     fn tls_on(self, port: u16) -> Server {
@@ -333,6 +342,8 @@ enum Pace {
     Full,
     /// One byte per interval: a peer that never goes quiet for long.
     Trickle(Duration),
+    /// The first `n` bytes at once, then `Trickle`: a peer whose preamble arrives in time.
+    TrickleAfter(usize, Duration),
     /// At most `n` bytes per interval from the source: a reader that is slow but steady.
     Rate(usize, Duration),
     /// Full until the flag is set, then nothing more is read: a peer that stops reading.
@@ -442,6 +453,14 @@ impl Relay {
     }
 }
 
+impl Drop for Relay {
+    fn drop(&mut self) {
+        if let At::Unix(path) = &self.at {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 fn pump_pair<S: Duplex>(
     client: S,
     server: S,
@@ -472,6 +491,7 @@ fn pump_pair<S: Duplex>(
 
 fn pump(mut from: Box<dyn Read + Send>, mut to: Box<dyn Write + Send>, pace: Pace) {
     let mut buf = vec![0u8; 64 * 1024];
+    let mut moved = 0usize;
     loop {
         let limit = match &pace {
             Pace::Rate(n, _) => (*n).min(buf.len()),
@@ -491,6 +511,13 @@ fn pump(mut from: Box<dyn Read + Send>, mut to: Box<dyn Write + Send>, pace: Pac
         let ok = match &pace {
             Pace::Trickle(every) => buf[..n].iter().all(|b| {
                 thread::sleep(*every);
+                to.write_all(std::slice::from_ref(b)).is_ok()
+            }),
+            Pace::TrickleAfter(skip, every) => buf[..n].iter().all(|b| {
+                moved += 1;
+                if moved > *skip {
+                    thread::sleep(*every);
+                }
                 to.write_all(std::slice::from_ref(b)).is_ok()
             }),
             _ => to.write_all(&buf[..n]).is_ok(),
@@ -514,11 +541,9 @@ const IN_NS: &str = "RSB_SLOW_LINK_IN_NS";
 #[cfg(target_os = "linux")]
 const REQUIRED: &str = "RSB_SLOW_LINK_REQUIRED";
 
-/// The kernel wakes a waiting sender once about a third of a send buffer that has grown to
-/// megabytes has drained: at 1 Mbit/s each wake-up takes several times `D`.
+/// Each wake-up of a waiting sender takes several times `D` at this rate (module doc).
 const SLOW_LINK: &str = "rate 1mbit delay 20ms";
-/// About 17 s on `SLOW_LINK`: long enough for the send buffer to grow, and for the frame's tail
-/// to sit in it, unread, for more than `D` after the send returned.
+/// About 17 s on `SLOW_LINK`: the send buffer grows and the tail outlasts `D` unread (module doc).
 const BULK: usize = 2 * 1024 * 1024;
 /// Under the time `BULK` needs: a faster result means the shaping did not apply.
 const BULK_AT_LEAST: Duration = Duration::from_secs(4);
@@ -544,11 +569,7 @@ const NS_CASES: &[(&str, &str)] = &[
     ("in_ns_tcp_large_reply_under_an_idle_deadline", FROM_SERVER),
 ];
 
-/// Shell commands that shape loopback: `SLOW_LINK` one way, `REVERSE_LINK` the other.
-///
-/// One netem on `lo` would queue both directions together, so the receiver's ACKs would wait
-/// behind the data they acknowledge, as on no real link, and `SIOCOUTQ` would stand still for
-/// seconds while the link is busy. A `prio` qdisc with a `u32` port match keeps them apart.
+/// Shell commands that shape loopback: `SLOW_LINK` one way, `REVERSE_LINK` the other (module doc).
 #[cfg(target_os = "linux")]
 fn shaping(slow: &str) -> String {
     format!(
@@ -758,10 +779,6 @@ ns_cases! {
 // ---------------------------------------------------------------------------
 
 /// A Unix-domain peer that reads 16 KiB every 100 ms is slow but steady: not cut at `d`.
-///
-/// The kernel reports the socket writable again only once its write
-/// allocation is down to a quarter of `SO_SNDBUF` (about 150 KiB of payload
-/// to drain at the default 208 KiB), which this pace takes about 0.9 s.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn unix_steady_slow_reader_is_not_cut() {
@@ -831,8 +848,7 @@ fn stalled_reader_is_cut(link: Link) {
     assert!(session.is_ended(), "a failed send ends the session");
 }
 
-/// A reply wait whose request the peer never takes ends near `d`: queued bytes that do not
-/// move are no progress.
+/// A reply wait ends near `d` if the peer takes none of the request: unmoved bytes are no progress.
 fn reply_wait_on_a_stalled_reader_ends(link: Link) {
     let spec = ServerSpec::a13();
     let server = match link {
@@ -901,9 +917,13 @@ fn tls_stalled_reader_is_cut() {
 // The handshake deadline: trickling peers (hermetic)
 // ---------------------------------------------------------------------------
 
-/// A client that sends its handshake one byte at a time is dropped `d` after it connected.
-fn server_cuts_a_trickled_handshake(server: Server, client: impl FnOnce(At) + Send + 'static) {
-    let relay = Relay::start(&server.at, Pace::Trickle(TRICKLE_EVERY), Pace::Full);
+/// A client whose bytes `up` trickles is dropped `d` after it connected.
+fn server_cuts_a_trickled_handshake(
+    server: Server,
+    up: Pace,
+    client: impl FnOnce(At) + Send + 'static,
+) {
+    let relay = Relay::start(&server.at, up, Pace::Full);
     let at = relay.at.clone();
     thread::spawn(move || client(at));
     let left = relay
@@ -922,7 +942,7 @@ fn server_cuts_a_trickled_a13_handshake() {
         ..ServerSpec::a13()
     }
     .unix();
-    server_cuts_a_trickled_handshake(server, |at| {
+    server_cuts_a_trickled_handshake(server, Pace::Trickle(TRICKLE_EVERY), |at| {
         let _ = connect(Link::Unix, &at, None);
     });
 }
@@ -935,7 +955,9 @@ fn server_cuts_a_trickled_r34_first_frame() {
         ..ServerSpec::a13()
     }
     .unix();
-    server_cuts_a_trickled_handshake(server, |at| {
+    // Past the 4-byte session-id preamble, so the deadline cuts the first frame.
+    let up = Pace::TrickleAfter(4, TRICKLE_EVERY);
+    server_cuts_a_trickled_handshake(server, up, |at| {
         let At::Unix(path) = at else { unreachable!() };
         if let Ok(session) = RpcSession::setup_unix_client(path) {
             let _ = session.get_root();
@@ -950,7 +972,7 @@ fn server_cuts_a_trickled_tls_handshake() {
         ..ServerSpec::a13()
     }
     .tls();
-    server_cuts_a_trickled_handshake(server, |at| {
+    server_cuts_a_trickled_handshake(server, Pace::Trickle(TRICKLE_EVERY), |at| {
         let _ = connect(Link::Tls, &at, None);
     });
 }
@@ -1023,6 +1045,15 @@ fn server_refuses_a_session_id_size_other_than_32_at_once() {
         took < Duration::from_secs(1),
         "the server waited {took:?} for a 65535-byte session id"
     );
+    // Still an id-carrying connection refused: `rejected_unknown_id_count` counts it.
+    let counting = Instant::now();
+    while server.server.rejected_unknown_id_count() == 0 {
+        assert!(
+            counting.elapsed() < Duration::from_secs(5),
+            "a refused id size was not counted"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// A server that answers the handshake one byte at a time fails the setup call after `d`.

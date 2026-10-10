@@ -205,14 +205,10 @@ pub(crate) fn send_nonblocking<T>(
     }
 }
 
-/// Whether a send without `drain` waits in `poll` too: Apple has no `SIOCOUTQ` to gain from it,
-/// and its non-blocking send costs two `fcntl` (`send_nonblocking`).
+/// Whether a send without `drain` waits in `poll`: not on Apple (no `SIOCOUTQ`, 2 `fcntl` a send).
 pub(crate) const WAITING_SENDS: bool = cfg!(any(target_os = "linux", target_os = "android"));
 
-/// A send on a stream socket that waits in `poll` (`SendWait`), `fds` on the first byte.
-///
-/// With `drain` it is `RpcTransport::send_raw_draining`; without, a plain send that judges its
-/// deadline by the peer's progress as the draining one does (`transport` doc "A slow peer").
+/// A stream-socket send waiting in `poll` (`SendWait`), `fds` on the first byte, `drain` meanwhile.
 pub(crate) fn send_waiting(
     sock: std::os::fd::BorrowedFd<'_>,
     slices: &mut [std::io::IoSlice<'_>],
@@ -303,14 +299,16 @@ impl<'a> SendWait<'a> {
         use rustix::net::sockopt::{socket_timeout, Timeout};
 
         let sock = self.sock;
-        let since = match self.since {
-            Some(since) => since,
+        match self.since {
+            // On every pass, not only a quiet `poll`: input can wake each one before the pause.
+            Some(_) => self.look_for_peer_progress(),
             None => {
                 // A new wait: what the peer has yet to take is the baseline its progress lowers.
                 self.queued = queued_bytes(sock);
-                *self.since.insert(std::time::Instant::now())
+                self.since = Some(std::time::Instant::now());
             }
-        };
+        }
+        let since = *self.since.get_or_insert_with(std::time::Instant::now);
         let limit = *self
             .limit
             .get_or_insert_with(|| socket_timeout(sock, Timeout::Send).ok().flatten());
@@ -341,9 +339,7 @@ impl<'a> SendWait<'a> {
         self.left().is_none()
     }
 
-    /// Wait for room (and, with `input`, for input or the peer's end) until the deadline.
-    ///
-    /// `Some(true)` input or the peer's end, `Some(false)` room or a send error, `None` expired.
+    /// `Some(false)` room or send error, `Some(true)` (`input` only) input or EOF, `None` expired.
     pub(crate) fn wait(&mut self, input: bool) -> RpcResult<Option<bool>> {
         use rustix::event::{poll, PollFd, PollFlags, Timespec};
 
@@ -367,7 +363,7 @@ impl<'a> SendWait<'a> {
             });
             let mut fds = [PollFd::from_borrowed_fd(self.sock, events)];
             match poll(&mut fds, ts.as_ref()) {
-                Ok(0) => self.look_for_peer_progress(),
+                Ok(0) => {}
                 Ok(_) => return Ok(Some(fds[0].revents().contains(PollFlags::IN))),
                 Err(rustix::io::Errno::INTR) => continue,
                 Err(e) => return Err(std::io::Error::from(e).into()),
@@ -1189,5 +1185,60 @@ mod tests {
         write_aosp_message_with_fds(&a, &msg, &[], Some(&mut || Ok(()))).expect("draining");
         write_aosp_message_with_fds(&a, &msg, &[fd.as_fd()], None).expect("with an fd");
         assert_eq!(reader.join().expect("reader"), total);
+    }
+
+    /// A send wait that input wakes before each pause still counts the peer taking its bytes.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_wait_woken_by_input_still_sees_the_peer_take_bytes() {
+        use rustix::net::{recv, send, RecvFlags, SendFlags};
+        use std::os::fd::AsFd;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        let d = Duration::from_millis(400);
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+        ours.set_write_timeout(Some(d)).expect("SO_SNDTIMEO");
+        // Fill the send buffer one 4 KiB skb at a time, so each peer read frees one.
+        while send(&ours, &[0u8; 4096], SendFlags::DONTWAIT).is_ok() {}
+        let stop = Arc::new(AtomicBool::new(false));
+        let peer = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                for i in 0u32.. {
+                    if stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let _ = send(&theirs, b"x", SendFlags::DONTWAIT);
+                    // A slow reader: 4 KiB every 40 ms, so the socket stays unwritable for seconds.
+                    if i % 8 == 0 {
+                        let _ = recv(&theirs, &mut buf, RecvFlags::DONTWAIT);
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
+        let mut waiting = SendWait::new(ours.as_fd());
+        let t0 = Instant::now();
+        let mut verdict = Ok(Some(true));
+        while t0.elapsed() < d * 5 / 2 {
+            verdict = waiting.wait(true);
+            match verdict {
+                Ok(Some(true)) => {
+                    let mut sink = [0u8; 256];
+                    let _ = recv(&ours, &mut sink, RecvFlags::DONTWAIT);
+                }
+                Ok(Some(false)) => {}
+                _ => break,
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+        peer.join().expect("peer");
+        assert!(
+            matches!(verdict, Ok(Some(_))),
+            "a peer taking bytes every 40 ms expired a {d:?} wait after {:?}: {verdict:?}",
+            t0.elapsed()
+        );
     }
 }
