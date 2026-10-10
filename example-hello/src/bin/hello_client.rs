@@ -20,7 +20,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     // `Client::open` starts the binder thread pool, so the death
     // notification registered below is delivered promptly.
-    let client = rsbinder::Client::open("binder://")?;
+    let client = rsbinder::Client::open(Uri::kernel())?;
 
     println!("list services:");
     // Kernel-only service-manager powers stay on `hub`.

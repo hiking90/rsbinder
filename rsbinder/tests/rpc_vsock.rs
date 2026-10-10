@@ -29,11 +29,12 @@
 
 #![cfg(all(feature = "rpc-vsock", target_os = "linux"))]
 
+use rsbinder::entry::{WireProfile, WireVersion};
 use rsbinder::rpc::transport::VsockTransport;
 use rsbinder::rpc::{PeerIdentity, RpcServer, RpcSession, RpcTransport};
 use rsbinder::{
-    Binder, Interface, Parcel, Remotable, Result, SIBinder, Status, StatusCode, TransactionCode,
-    FIRST_CALL_TRANSACTION,
+    Binder, Endpoint, Interface, Parcel, Remotable, Result, SIBinder, Status, StatusCode,
+    TransactionCode, Uri, FIRST_CALL_TRANSACTION,
 };
 
 const DESC: &str = "rsbinder.test.IVsockPing";
@@ -319,7 +320,8 @@ fn entry_vsock_incoming_connections_carry_callbacks() {
     };
 
     let port = TEST_PORT + 3;
-    let uri = format!("vsock://{VMADDR_CID_LOCAL}:{port}?profile=android13plus");
+    let uri = Uri::new(Endpoint::vsock(VMADDR_CID_LOCAL, port))
+        .with_wire(WireProfile::Android13Plus(WireVersion::MAX));
     let _guard = rsbinder::serve(&uri)
         .expect("serve vsock://")
         .add(

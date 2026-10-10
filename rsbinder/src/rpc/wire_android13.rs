@@ -296,6 +296,8 @@ pub const PROTOCOL_V2: u32 = 2;
 /// Highest version this codec implements (android-16.0.0_r4
 /// `RPC_WIRE_PROTOCOL_VERSION`).
 pub const SUPPORTED_MAX_VERSION: u32 = PROTOCOL_V2;
+// `Uri` exists without `rpc`, so it keeps its own copy; raising one without the other fails here.
+const _: () = assert!(SUPPORTED_MAX_VERSION == crate::entry::uri::WireVersion::MAX.get());
 /// `RPC_WIRE_PROTOCOL_VERSION_NEXT` (android-16.0.0_r4) — the first
 /// version rsbinder cannot speak; `setProtocolVersion` rejects
 /// `>= _NEXT` (unless `_EXPERIMENTAL`).

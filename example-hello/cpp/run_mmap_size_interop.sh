@@ -122,9 +122,9 @@ start_service() {
     return 1
 }
 # A synchronous kernel transaction blocks in ioctl until a reply or
-# BR_DEAD_REPLY, and the `SERVING` line is printed before `run()` starts
-# the thread pool — a regression there would hang this script instead of
-# failing it. Unset on a host without coreutils `timeout` (word-split on
+# BR_DEAD_REPLY, so a service whose thread pool never serves the call
+# would hang this script instead of failing it. Unset on a host without
+# coreutils `timeout` (word-split on
 # purpose, so an empty value adds no word).
 CALL_TIMEOUT=""
 if command -v timeout >/dev/null 2>&1; then CALL_TIMEOUT="timeout 60"; fi

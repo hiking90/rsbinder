@@ -8,7 +8,7 @@ rsbinder = { version = "0.12", features = ["macros"] }
 ```
 
 ```rust
-use rsbinder::{interface, BinderResult, Strong};
+use rsbinder::{interface, BinderResult, Strong, Uri};
 
 #[interface(descriptor = "com.example.IHello")]
 pub trait IHello {
@@ -19,8 +19,8 @@ pub trait IHello {
 }
 
 // `Hello` is your `impl IHello`, plus `impl Interface for Hello {}`.
-rsbinder::serve("binder://")?.add("hello", BnHello::new_binder(Hello))?.run()?;
-let hello: Strong<dyn IHello> = rsbinder::connect("binder://hello")?;
+rsbinder::serve(Uri::kernel())?.add("hello", BnHello::new_binder(Hello))?.run()?;
+let hello: Strong<dyn IHello> = rsbinder::connect(Uri::kernel().with_service("hello"))?;
 ```
 
 `BnHello`, `BpHello` and `IHelloDefault` appear where you wrote the trait, so

@@ -16,7 +16,7 @@
 
 use env_logger::Env;
 use example_hello::*;
-use rsbinder::Strong;
+use rsbinder::{Endpoint, Strong};
 
 /// Unix-domain socket `rpc_hello_service` binds.
 const RPC_SOCKET: &str = "/tmp/rsb_hello_rpc.sock";
@@ -30,7 +30,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // `connect` opens the session, looks the name up and casts — the
     // proxy keeps the session alive; nothing else to hold.
     let hello: Strong<dyn IHello> =
-        rsbinder::connect(&format!("unix://{RPC_SOCKET}#{SERVICE_NAME}"))?;
+        rsbinder::connect(Endpoint::unix(RPC_SOCKET).with_service(SERVICE_NAME))?;
 
     let reply = hello.echo("Hello over RPC!")?;
     println!("rpc_hello_client: server replied {reply:?}");

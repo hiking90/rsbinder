@@ -484,10 +484,11 @@ profile — see
 [Callbacks outside a handler](./rpc-transport.md#callbacks-outside-a-handler):
 
 ```rust
-let client = rsbinder::Client::open_with(
-    "unix:///run/demo.sock?profile=android13plus",
-    |o, _| o.incoming_connections = Some(1),
-)?;
+use rsbinder::entry::{WireProfile, WireVersion};
+
+let uri = rsbinder::Uri::new(rsbinder::Endpoint::unix("/run/demo.sock"))
+    .with_wire(WireProfile::Android13Plus(WireVersion::MAX));
+let client = rsbinder::Client::open_with(uri, |o, _| o.incoming_connections = Some(1))?;
 ```
 
 Without one, the client's end refuses with `StatusCode::InvalidOperation`

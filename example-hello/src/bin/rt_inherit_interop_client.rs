@@ -42,7 +42,7 @@ fn try_become_rt(_priority: i32) -> bool {
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let client = match rsbinder::Client::open("binder://") {
+    let client = match rsbinder::Client::open(rsbinder::Uri::kernel()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("kernel client init failed: {e:?}");

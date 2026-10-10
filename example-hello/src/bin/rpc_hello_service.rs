@@ -39,12 +39,12 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
     // No `ProcessState` / `hub`: RPC does not touch the kernel binder
-    // singleton. `serve("unix://…")` takes the UDS, `add` publishes the
+    // singleton. `serve(Endpoint::unix(…))` takes the UDS, `add` publishes the
     // generated `BnHello` under a name, and the server drives this one
-    // socket until killed — the same three calls as `serve("binder://")`.
+    // socket until killed — the same three calls as `serve(Uri::kernel())`.
     // `spawn` binds before returning, so the line below is only printed
     // once the socket really exists.
-    let _guard = rsbinder::serve(&format!("unix://{RPC_SOCKET}"))?
+    let _guard = rsbinder::serve(Endpoint::unix(RPC_SOCKET))?
         .add(SERVICE_NAME, BnHello::new_binder(IHelloService {}))?
         .spawn()?;
     println!("rpc_hello_service listening on {RPC_SOCKET}");

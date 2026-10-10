@@ -18,7 +18,7 @@
 //! - **RPC transport**: binder-over-socket (`rpc` module, behind the `rpc`
 //!   feature) — a separate stack from the kernel binder path
 //! - **Entry API**: [`serve`] / [`connect`] — publish and look up services
-//!   with one URI-selected transport (kernel binder or RPC)
+//!   at one [`Uri`], whose endpoint picks the transport (kernel binder or RPC)
 //! - **Shared memory**: [`shared_memory`] — payloads too big to copy through
 //!   a transaction (AOSP `IMemory` wire)
 //! - **Interface macros**: `#[rsbinder::interface]` (behind the `macros`
@@ -127,13 +127,14 @@
 //! This library works with AIDL (Android Interface Definition Language) files to generate
 //! type-safe Rust bindings for IPC services.
 //!
-//! **[`serve`] and [`connect`] are the way in.** One URI picks the
-//! transport — `binder://` for kernel binder, `unix:///run/svc.sock`,
-//! `vsock://…` or `tls://…` for RPC — and the service and
+//! **[`serve`] and [`connect`] are the way in.** One [`Uri`] picks the
+//! transport — [`Uri::kernel`] for kernel binder, [`Endpoint::unix`],
+//! [`Endpoint::vsock`] or [`Endpoint::tls`] for RPC, or the same parsed
+//! from a string such as `unix:///run/svc.sock#name` — and the service and
 //! client code either side of it is identical. The lower-level route
 //! ([`ProcessState`] plus the [`hub`] service-manager calls) stays
 //! available and is what the entry API is built on; reach for it when you
-//! need control the URI does not express, not as the default way to start.
+//! need control the `Uri` does not express, not as the default way to start.
 //!
 //! ## Setting up an AIDL-based Service
 //!
@@ -187,8 +188,8 @@
 //! # fn main() -> Result<()> {
 //! // Kernel binder: init the process state, register with the service
 //! // manager, start the thread pool and join it. The same three calls
-//! // with `serve("unix:///tmp/hello.sock")` serve over RPC instead.
-//! rsbinder::serve("binder://")?
+//! // with `serve(Endpoint::unix("/tmp/hello.sock"))` serve over RPC instead.
+//! rsbinder::serve(Uri::kernel())?
 //!     .add("hello_service", BnHello::new_binder(HelloService))?
 //!     .run()?;
 //! # Ok(())
@@ -209,9 +210,10 @@
 //!
 //! # fn main() -> Result<()> {
 //! // Init the process state, wait for the service to be registered, and
-//! // cast it to the interface. Over RPC: "unix:///tmp/hello.sock#hello_service".
+//! // cast it to the interface. Over RPC:
+//! // `Endpoint::unix("/tmp/hello.sock").with_service("hello_service")`.
 //! let hello_service: rsbinder::Strong<dyn IHello> =
-//!     rsbinder::connect("binder://hello_service")?;
+//!     rsbinder::connect(Uri::kernel().with_service("hello_service"))?;
 //!
 //! // Call remote method
 //! let result = hello_service.echo("Hello, World!")?;
@@ -339,7 +341,7 @@ pub use reconnect::Reconnecting;
 pub use entry::connect_async;
 pub use entry::{
     connect, connect_binder, serve, Client, ClientOptions, Endpoint, ServeOptions, Server,
-    ServerGuard,
+    ServerGuard, Uri,
 };
 // For generated `IFooAsyncService` impls, so consumers need no `async-trait` dependency.
 #[cfg(feature = "async")]

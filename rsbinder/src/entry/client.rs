@@ -3,11 +3,13 @@
 
 use std::time::Duration;
 
+#[cfg(feature = "rpc")]
+use super::uri::WireProfile;
 use super::uri::{Endpoint, Uri};
 use crate::error::{Result, StatusCode};
 use crate::{FromIBinder, SIBinder, Strong};
 
-/// Options that do not fit in the URI. Set through
+/// Options that are not part of the [`Uri`]. Set through
 /// [`Client::open_with`]. An option that does not apply to the
 /// transport is [`StatusCode::BadValue`] (logged), never ignored.
 #[derive(Default)]
@@ -208,6 +210,8 @@ fn one_source<T: PartialEq + std::fmt::Debug>(
 }
 
 pub(super) fn new_client(uri: Uri, o: ClientOptions) -> Result<Client> {
+    // Here and not in `open_staged`: the reconnect helper validates once at `build`.
+    uri.validate()?;
     open_staged(uri, o).map_err(|(_, code)| code)
 }
 
@@ -227,7 +231,7 @@ pub(crate) fn open_staged(
 ) -> std::result::Result<Client, (OpenStage, StatusCode)> {
     let setup = |code| (OpenStage::Setup, code);
     #[cfg(feature = "rpc")]
-    if !matches!(uri.endpoint, Endpoint::Kernel { .. }) {
+    if !uri.endpoint.is_kernel() {
         let cfg = rpc_setup(&uri, &o).map_err(setup)?;
         let session = rpc_connect(cfg, &uri, &o).map_err(|code| (OpenStage::Connect, code))?;
         return Ok(Client {
@@ -242,9 +246,7 @@ pub(crate) fn open_staged(
 #[allow(deprecated)] // Refuses `handshake_timeout` where it does not apply, while it is honored.
 fn kernel_open(uri: Uri, o: ClientOptions) -> Result<Client> {
     if uri.service.is_some() {
-        log::error!(
-            "rsbinder::Client::open: a `#service` fragment is not allowed here (use connect)"
-        );
+        log::error!("rsbinder::Client::open: a service name is not allowed here (use connect)");
         return Err(StatusCode::BadValue);
     }
     let reject = |what: &str| {
@@ -255,11 +257,7 @@ fn kernel_open(uri: Uri, o: ClientOptions) -> Result<Client> {
         StatusCode::BadValue
     };
     match &uri.endpoint {
-        Endpoint::Kernel {
-            driver,
-            threads,
-            mmap_size,
-        } => {
+        Endpoint::Kernel(k) => {
             if o.session_id.is_some()
                 || o.outgoing_connections.is_some()
                 || o.incoming_connections.is_some()
@@ -277,9 +275,9 @@ fn kernel_open(uri: Uri, o: ClientOptions) -> Result<Client> {
             if o.tls.is_some() || o.tls_server_name.is_some() {
                 return Err(reject("tls/tls_server_name"));
             }
-            let driver = one_source("driver", o.driver.as_deref(), driver.as_deref())?;
-            let mmap_size = one_source("mmap_size", o.mmap_size, *mmap_size)?;
-            super::server::kernel_init(driver, *threads, mmap_size)?;
+            let driver = one_source("driver", o.driver.as_deref(), k.driver())?;
+            let mmap_size = one_source("mmap_size", o.mmap_size, k.mmap_size())?;
+            super::server::kernel_init(driver, k.threads(), mmap_size)?;
             crate::ProcessState::start_thread_pool();
             Ok(Client {
                 endpoint: uri.endpoint.clone(),
@@ -302,9 +300,7 @@ fn kernel_open(uri: Uri, o: ClientOptions) -> Result<Client> {
 #[allow(deprecated)] // Forwards `handshake_timeout` to the config's own deprecated setter.
 fn rpc_setup<'a>(uri: &'a Uri, o: &'a ClientOptions) -> Result<crate::rpc::RpcClientConfig<'a>> {
     if uri.service.is_some() {
-        log::error!(
-            "rsbinder::Client::open: a `#service` fragment is not allowed here (use connect)"
-        );
+        log::error!("rsbinder::Client::open: a service name is not allowed here (use connect)");
         return Err(StatusCode::BadValue);
     }
     if o.driver.is_some() || o.mmap_size.is_some() {
@@ -335,7 +331,10 @@ fn rpc_setup<'a>(uri: &'a Uri, o: &'a ClientOptions) -> Result<crate::rpc::RpcCl
         o.handshake_timeout,
         "ClientOptions::handshake_timeout",
     )?;
-    let versioned = uri.wire_max_version;
+    let versioned = match uri.wire {
+        WireProfile::R34 => None,
+        WireProfile::Android13Plus(v) => Some(v.get()),
+    };
     let fan_out = o.outgoing_connections.unwrap_or(1).max(1);
     let incoming = o.incoming_connections.unwrap_or(0);
     // `is_some()`, not the value: a set option this endpoint lacks is `BadValue`, never ignored.
@@ -343,7 +342,7 @@ fn rpc_setup<'a>(uri: &'a Uri, o: &'a ClientOptions) -> Result<crate::rpc::RpcCl
     if versioned.is_none() && (o.session_id.is_some() || multi_conn) {
         log::error!(
             "rsbinder::Client::open: session_id/outgoing_connections/incoming_connections \
-             need `?profile=android13plus` ({:?})",
+             need `WireProfile::Android13Plus` (`?profile=android13plus`) ({:?})",
             uri.endpoint
         );
         return Err(StatusCode::BadValue);
@@ -351,11 +350,11 @@ fn rpc_setup<'a>(uri: &'a Uri, o: &'a ClientOptions) -> Result<crate::rpc::RpcCl
     // r34 has no handshake to bound (see `ClientOptions::handshake_timeout`); `tls://` does.
     if versioned.is_none()
         && o.handshake_timeout.is_some()
-        && !matches!(uri.endpoint, Endpoint::Tls(..))
+        && !matches!(uri.endpoint, Endpoint::Tls { .. })
     {
         log::error!(
-            "rsbinder::Client::open: handshake_timeout needs `?profile=android13plus` \
-             (or a `tls://` endpoint) ({:?})",
+            "rsbinder::Client::open: handshake_timeout needs `WireProfile::Android13Plus` \
+             (`?profile=android13plus`) or a TLS endpoint ({:?})",
             uri.endpoint
         );
         return Err(StatusCode::BadValue);
@@ -363,7 +362,7 @@ fn rpc_setup<'a>(uri: &'a Uri, o: &'a ClientOptions) -> Result<crate::rpc::RpcCl
 
     // TLS only on `tls://`: elsewhere it would connect in plaintext the caller thinks encrypted.
     #[cfg(feature = "rpc-tls")]
-    if !matches!(uri.endpoint, Endpoint::Tls(..))
+    if !matches!(uri.endpoint, Endpoint::Tls { .. })
         && (o.tls.is_some() || o.tls_server_name.is_some())
     {
         return Err(reject_option("tls/tls_server_name", &uri.endpoint));
@@ -402,7 +401,7 @@ fn rpc_connect(
 ) -> Result<crate::rpc::RpcSession> {
     use crate::rpc::{AddressSpace, RpcSession};
 
-    if uri.wire_max_version.is_some() {
+    if uri.wire != WireProfile::R34 {
         // One connection each, as AOSP `setupClient` calls `connectAndInit`, on every transport.
         return RpcSession::setup_client_android13plus_with_config(cfg);
     }
@@ -432,7 +431,7 @@ fn client_config<'a>(
         StatusCode::from(e)
     };
     match endpoint {
-        Endpoint::Kernel { .. } => unreachable!("kernel handled by caller"),
+        Endpoint::Kernel(_) => unreachable!("kernel handled by caller"),
         Endpoint::Unix(path) => {
             // `UnixStream::connect`'s refusal (same code), made before connecting.
             std::os::unix::net::SocketAddr::from_pathname(path).map_err(unix_addr_refused)?;
@@ -457,7 +456,7 @@ fn client_config<'a>(
                 Err(StatusCode::InvalidOperation)
             }
         }
-        Endpoint::Vsock(cid, port) => {
+        Endpoint::Vsock { cid, port } => {
             #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
             {
                 Ok(RpcClientConfig::vsock(*cid, *port, max_version))
@@ -474,11 +473,13 @@ fn client_config<'a>(
                 Err(StatusCode::InvalidOperation)
             }
         }
-        Endpoint::Tls(host, port) => {
+        Endpoint::Tls { host, port } => {
             #[cfg(feature = "rpc-tls")]
             {
                 let tls = o.tls.clone().ok_or_else(|| {
-                    log::error!("rsbinder::Client::open: `tls://` requires `ClientOptions::tls`");
+                    log::error!(
+                        "rsbinder::Client::open: a TLS endpoint requires `ClientOptions::tls`"
+                    );
                     StatusCode::BadValue
                 })?;
                 let name = o.tls_server_name.as_deref().unwrap_or(host);
@@ -500,21 +501,24 @@ fn client_config<'a>(
 }
 
 impl Client {
-    /// Open a resolver on `uri` (no `#service`). See [`ClientOptions`]
-    /// for what cannot be expressed in the URI.
-    pub fn open(uri: &str) -> Result<Client> {
-        new_client(super::uri::parse(uri)?, ClientOptions::default())
+    /// Open a resolver on `uri`, which must not name a service (that is
+    /// [`connect`](super::connect)). See [`ClientOptions`] for what is not
+    /// part of the [`Uri`].
+    pub fn open(uri: impl Into<Uri>) -> Result<Client> {
+        new_client(uri.into(), ClientOptions::default())
     }
 
     /// [`open`](Self::open) with [`ClientOptions`]. The closure also sees
-    /// the parsed [`Endpoint`], so an option that applies to only some
-    /// transports can be set conditionally without re-parsing or
-    /// string-matching the URI.
-    pub fn open_with(uri: &str, f: impl FnOnce(&mut ClientOptions, &Endpoint)) -> Result<Client> {
-        let parsed = super::uri::parse(uri)?;
+    /// the [`Endpoint`], so an option that applies to only some transports
+    /// can be set conditionally when `uri` came from a string.
+    pub fn open_with(
+        uri: impl Into<Uri>,
+        f: impl FnOnce(&mut ClientOptions, &Endpoint),
+    ) -> Result<Client> {
+        let uri = uri.into();
         let mut o = ClientOptions::default();
-        f(&mut o, &parsed.endpoint);
-        new_client(parsed, o)
+        f(&mut o, &uri.endpoint);
+        new_client(uri, o)
     }
 
     /// The endpoint this client is connected to. Mirrors
@@ -577,7 +581,7 @@ impl Client {
     /// ```no_run
     /// # fn f() -> rsbinder::Result<()> {
     /// use rsbinder::TransportCaps;
-    /// let client = rsbinder::Client::open("unix:///tmp/x.sock")?;
+    /// let client = rsbinder::Client::open(rsbinder::Endpoint::unix("/tmp/x.sock"))?;
     /// // Fails here, naming the option to set, rather than on the first
     /// // callback.
     /// client.caps().require(TransportCaps::CALLBACKS, "event subscription")?;
@@ -591,7 +595,7 @@ impl Client {
         }
     }
 
-    /// The underlying RPC session (`None` for `binder://`).
+    /// The underlying RPC session (`None` for kernel binder).
     #[cfg(feature = "rpc")]
     pub fn session(&self) -> Option<&crate::rpc::RpcSession> {
         match &self.inner {
@@ -610,22 +614,28 @@ mod tests {
     #[test]
     #[allow(deprecated)] // Sets `session_id` to pin its refusal.
     fn open_reports_the_stage_that_failed() {
-        let open = |uri: &str, f: fn(&mut ClientOptions)| {
+        use super::super::uri::WireVersion;
+        let open = |uri: Uri, f: fn(&mut ClientOptions)| {
             let mut o = ClientOptions::default();
             f(&mut o);
-            open_staged(super::super::uri::parse(uri).unwrap(), o).map(|_| ())
+            open_staged(uri, o).map(|_| ())
         };
-        let missing = "unix:///nonexistent/rsbinder-open-stage.sock";
+        let missing = Uri::new(Endpoint::unix("/nonexistent/rsbinder-open-stage.sock"));
 
         assert_eq!(
-            open(missing, |o| o.incoming_connections = Some(1)),
+            open(missing.clone(), |o| o.incoming_connections = Some(1)),
             Err((OpenStage::Setup, StatusCode::BadValue)),
-            "multi-connection options need ?profile=android13plus"
+            "multi-connection options need WireProfile::Android13Plus"
         );
         assert_eq!(
-            open(&format!("{missing}?profile=android13plus"), |o| {
-                o.session_id = Some(vec![1; 32]);
-            }),
+            open(
+                missing
+                    .clone()
+                    .with_wire(WireProfile::Android13Plus(WireVersion::MAX)),
+                |o| {
+                    o.session_id = Some(vec![1; 32]);
+                }
+            ),
             Err((OpenStage::Setup, StatusCode::BadValue)),
             "a session_id would open a second client session on one server session"
         );

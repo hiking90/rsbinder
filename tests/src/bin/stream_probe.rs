@@ -228,11 +228,13 @@ impl IStreamDemo for DemoSvc {
 
 fn serve(name: &str) -> Result<()> {
     let demo = BnStreamDemo::new_binder(DemoSvc::default());
-    let server = rsbinder::serve("binder://")?.add(name, Interface::as_binder(&demo))?;
+    let _server = rsbinder::serve(Uri::kernel())?
+        .add(name, Interface::as_binder(&demo))?
+        .spawn()?;
     println!("SERVING {name}");
     use std::io::Write;
     std::io::stdout().flush().ok();
-    server.run()
+    ProcessState::join_thread_pool()
 }
 
 /// The service as an RPC root; `ring` adds the `Unix` fd mode and ring uploads (plan 10-7c).
@@ -262,7 +264,7 @@ fn serve_rpc(path: &str, reply_timeout: Option<Duration>, ring: bool) -> Result<
     server.run()
 }
 
-fn connect_via(uri: &str, name: &str) -> Result<Strong<dyn IStreamDemo>> {
+fn connect_via(uri: impl Into<Uri>, name: &str) -> Result<Strong<dyn IStreamDemo>> {
     let binder = rsbinder::Client::open(uri)
         .and_then(|_| hub::check_service(name).ok_or(StatusCode::NameNotFound))?;
     if binder.as_remote().is_none() {
@@ -273,7 +275,7 @@ fn connect_via(uri: &str, name: &str) -> Result<Strong<dyn IStreamDemo>> {
 }
 
 fn connect(name: &str) -> Result<Strong<dyn IStreamDemo>> {
-    connect_via("binder://", name)
+    connect_via(Uri::kernel(), name)
 }
 
 /// The service is a kernel proxy here, so the endpoint carries a ring of `ring_bytes`.
@@ -412,7 +414,7 @@ fn pause(name: &str, count: i32, ring_bytes: usize, take: i32) -> Result<()> {
 /// `streams` streams from one service at once, into a process with a one-page binder mapping.
 fn crowd(name: &str, streams: usize, count: i32) -> Result<()> {
     let page = rustix::param::page_size();
-    let demo = connect_via(&format!("binder://?mmap={page}"), name)?;
+    let demo = connect_via(entry::KernelEndpoint::default().with_mmap_size(page), name)?;
     let mut receivers = Vec::with_capacity(streams);
     for _ in 0..streams {
         let (rx, endpoint) = Receiver::<i32>::new(&demo.as_binder())?;

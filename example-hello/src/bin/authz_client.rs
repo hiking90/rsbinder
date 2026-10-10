@@ -14,14 +14,14 @@
 
 use env_logger::Env;
 use example_hello::authz::*;
-use rsbinder::Strong;
+use rsbinder::{Endpoint, Strong};
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
     // The proxy keeps the RPC session alive; nothing else to hold.
     let authz: Strong<dyn IAuthz> =
-        rsbinder::connect(&format!("unix://{RPC_SOCKET}#{SERVICE_NAME}"))?;
+        rsbinder::connect(Endpoint::unix(RPC_SOCKET).with_service(SERVICE_NAME))?;
 
     // Allowed: an identifiable Unix-RPC peer (this process).
     match authz.whoami() {

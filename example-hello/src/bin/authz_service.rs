@@ -35,7 +35,7 @@
 use env_logger::Env;
 use example_hello::authz::*;
 use rsbinder::rpc::PeerIdentity;
-use rsbinder::{Caller, ExceptionCode, Interface, Status};
+use rsbinder::{Caller, Endpoint, ExceptionCode, Interface, Status};
 
 struct AuthzService;
 impl Interface for AuthzService {}
@@ -77,12 +77,12 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
     // The same `AuthzService` impl would also work over kernel binder
-    // (`serve("binder://")`); served here over RPC so the transport-aware
+    // (`serve(Uri::kernel())`); served here over RPC so the transport-aware
     // authorization is demonstrable without `/dev/binder`.
     // `spawn` binds the socket before returning, so the line below is
     // printed only once the server is really listening (`run` binds
     // lazily, and would announce before it could fail).
-    let _guard = rsbinder::serve(&format!("unix://{RPC_SOCKET}"))?
+    let _guard = rsbinder::serve(Endpoint::unix(RPC_SOCKET))?
         .add(SERVICE_NAME, BnAuthz::new_binder(AuthzService))?
         .spawn()?;
 

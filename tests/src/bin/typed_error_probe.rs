@@ -97,18 +97,20 @@ impl Remotable for Probe {
 
 fn serve(name: &str) -> Result<()> {
     let probe = Binder::new(Probe);
-    let server = rsbinder::serve("binder://")?.add(name, Interface::as_binder(&probe))?;
+    let _server = rsbinder::serve(Uri::kernel())?
+        .add(name, Interface::as_binder(&probe))?
+        .spawn()?;
     println!("SERVING {name}");
     use std::io::Write;
     std::io::stdout().flush().ok();
-    server.run()
+    ProcessState::join_thread_pool()
 }
 
 /// `Ok(false)` = the peer answered with something other than a
 /// service-specific error; the caller turns that into a non-zero exit,
 /// as the C++ half does.
 fn call(name: &str, code: i32) -> Result<bool> {
-    let binder = rsbinder::Client::open("binder://")
+    let binder = rsbinder::Client::open(Uri::kernel())
         .and_then(|_| hub::check_service(name).ok_or(StatusCode::NameNotFound))?;
     let remote = binder.as_remote().ok_or_else(|| {
         eprintln!("typed_error_probe: {name} is local to this process, not a proxy");

@@ -1565,14 +1565,14 @@ fn client_handshake_err(e: RpcError) -> StatusCode {
         RpcError::EndOfStream => log::error!(
             "rsbinder RPC: the android-13+ handshake failed at the transport ({e}) after \
                  the peer accepted the connection — it may be speaking the r34 (default) \
-                 profile. Connect without `?profile=android13plus`, or enable the android-13+ \
-                 wire on the server (`RpcServer::set_android13plus`)"
+                 profile. Connect with `WireProfile::R34` (no `?profile=android13plus`), or \
+                 enable the android-13+ wire on the server (`RpcServer::set_android13plus`)"
         ),
         RpcError::Truncated => log::error!(
             "rsbinder RPC: the android-13+ handshake failed part-way through a response \
                  ({e}) — the peer closed mid-frame; it may be speaking the r34 (default) \
-                 profile. Connect without \
-                 `?profile=android13plus`, or enable the android-13+ wire on the server \
+                 profile. Connect with `WireProfile::R34` (no \
+                 `?profile=android13plus`), or enable the android-13+ wire on the server \
                  (`RpcServer::set_android13plus`)"
         ),
         RpcError::Timeout | RpcError::DeadlineMidFrame => log::error!(
@@ -2286,8 +2286,8 @@ impl RpcSessionInner {
                          accepted the connection, and the r34 profile cannot open or \
                          attach one. Only a nested twoway call (from inside a twoway \
                          handler) can transact here — a oneway never nests; use \
-                         `?profile=android13plus` for oneway calls and for callbacks \
-                         outside a handler"
+                         `WireProfile::Android13Plus` (`?profile=android13plus`) for oneway \
+                         calls and for callbacks outside a handler"
                     );
                 } else {
                     log::error!(

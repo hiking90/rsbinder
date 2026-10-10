@@ -47,7 +47,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     eprintln!("STAGE3 4-2 server: init ProcessState");
-    let server = rsbinder::serve("binder://")?;
+    let server = rsbinder::serve(Uri::kernel())?;
 
     let mut features = BinderFeatures::default();
     features.set_requesting_sid = true;

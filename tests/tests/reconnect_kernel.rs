@@ -76,8 +76,8 @@ fn eventually(mut f: impl FnMut() -> bool) -> bool {
     f()
 }
 
-fn kernel(name: &str) -> String {
-    format!("binder://{name}")
+fn kernel(name: &str) -> Uri {
+    Uri::kernel().with_service(name)
 }
 
 /// AC-10b.3: a restarted service is reconnected by its death notification alone.
@@ -88,7 +88,7 @@ fn a_restarted_service_is_reconnected_without_a_call() {
     let svc = Service::start(&name, "a");
     let connects = Arc::new(AtomicU32::new(0));
     let counted = connects.clone();
-    let h = Reconnecting::<dyn IRpcSmoke>::builder(&kernel(&name))
+    let h = Reconnecting::<dyn IRpcSmoke>::builder(kernel(&name))
         .on_connect(move |c| {
             counted.fetch_add(1, Ordering::SeqCst);
             c.proxy().r#ping()?;
@@ -113,7 +113,7 @@ fn a_restarted_service_is_reconnected_without_a_call() {
 #[ignore = "needs /dev/binderfs/binder and a running rsb_hub"]
 fn a_helper_built_before_its_service_connects_on_registration() {
     let name = service_name("late");
-    let h = Reconnecting::<dyn IRpcSmoke>::builder(&kernel(&name))
+    let h = Reconnecting::<dyn IRpcSmoke>::builder(kernel(&name))
         .build()
         .expect("an unregistered name is not a build error");
     assert_eq!(h.generation(), 0);
@@ -128,7 +128,7 @@ fn a_helper_built_before_its_service_connects_on_registration() {
 #[test]
 #[ignore = "needs /dev/binderfs/binder and a running rsb_hub"]
 fn an_invalid_name_is_a_build_error() {
-    let r = Reconnecting::<dyn IRpcSmoke>::builder("binder://not a valid name")
+    let r = Reconnecting::<dyn IRpcSmoke>::builder(kernel("not a valid name"))
         .build()
         .err();
     assert_eq!(r, Some(StatusCode::BadValue));
@@ -156,9 +156,9 @@ fn a_local_service_is_used_without_watching() {
     }
     let name = service_name("local");
     // Initializes ProcessState as the helper would; the service must exist first.
-    drop(Client::open("binder://").expect("open"));
+    drop(Client::open(Uri::kernel()).expect("open"));
     hub::add_service(&name, BnRpcSmoke::new_binder(Local).as_binder()).expect("add_service");
-    let h = Reconnecting::<dyn IRpcSmoke>::builder(&kernel(&name))
+    let h = Reconnecting::<dyn IRpcSmoke>::builder(kernel(&name))
         .build()
         .expect("build");
     assert_eq!(h.with(|p| p.r#echo("x")).unwrap(), "local:x");
@@ -177,7 +177,7 @@ fn dropping_a_waiting_helper_unregisters_its_callback() {
         }
     }
     let name = service_name("dropwait");
-    let h = Reconnecting::<dyn IRpcSmoke>::builder(&kernel(&name))
+    let h = Reconnecting::<dyn IRpcSmoke>::builder(kernel(&name))
         .build()
         .expect("build");
     // The first background attempt finds nothing and waits for the name.

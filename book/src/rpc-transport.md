@@ -596,8 +596,8 @@ let session = RpcSession::setup_client_android13plus_with_config(
 ```
 
 or, through the unified entry, `Client::open_with(uri, |o, _| {
-o.incoming_connections = Some(1) })` on an `?profile=android13plus`
-URI. This works on every RPC transport — `unix://`, `vsock://` and
+o.incoming_connections = Some(1) })` on a `Uri` with
+`WireProfile::Android13Plus` (`?profile=android13plus`). This works on every RPC transport — `unix://`, `vsock://` and
 `tls://` alike. Each incoming connection is a further connection to the
 same endpoint (over `tls://`, its own TLS session), attached to the same
 session and served by a thread the session owns; `n` of them let `n`

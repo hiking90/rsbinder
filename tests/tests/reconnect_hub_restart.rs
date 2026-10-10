@@ -99,7 +99,7 @@ fn reconnects_across_a_service_manager_restart() {
     let name = format!("rsb.test.reconnect.hub.{}", std::process::id());
     let mut sm = hub();
     let mut svc = service(&name, "a");
-    let h = Reconnecting::<dyn IRpcSmoke>::builder(&format!("binder://{name}"))
+    let h = Reconnecting::<dyn IRpcSmoke>::builder(Uri::kernel().with_service(&name))
         .build()
         .expect("build");
     assert_eq!(h.with(|p| p.r#echo("x")).unwrap(), "a:x");

@@ -63,7 +63,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     eprintln!("STAGE3 4-4 server: register `{SERVICE_NAME}`");
     hub::add_service(SERVICE_NAME, &service)?;
 
-    // NOTE: kept low-level on purpose — `rsbinder::serve("binder://")`'s
+    // NOTE: kept low-level on purpose — `rsbinder::serve(Uri::kernel())`'s
     // `run()` calls `start_thread_pool()`, but this dedup test must NOT pre-spawn
     // a looper. With `max_threads=1` and no `start_thread_pool()`, the
     // main thread becomes the sole consumer once it enters

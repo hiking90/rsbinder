@@ -4,7 +4,7 @@
 //! Define a Binder interface as a Rust trait — no `.aidl`, no `build.rs`.
 //!
 //! ```ignore
-//! use rsbinder::{interface, BinderResult, Strong};
+//! use rsbinder::{interface, BinderResult, Strong, Uri};
 //!
 //! #[interface(descriptor = "com.example.IHello")]
 //! pub trait IHello {
@@ -13,8 +13,8 @@
 //!     #[oneway] fn ping(&self) -> BinderResult<()>;
 //! }
 //!
-//! rsbinder::serve("binder://")?.add("hello", BnHello::new_binder(Impl))?.run()?;
-//! let h: Strong<dyn IHello> = rsbinder::connect("binder://hello")?;
+//! rsbinder::serve(Uri::kernel())?.add("hello", BnHello::new_binder(Impl))?.run()?;
+//! let h: Strong<dyn IHello> = rsbinder::connect(Uri::kernel().with_service("hello"))?;
 //! ```
 //!
 //! # Relationship to `.aidl`

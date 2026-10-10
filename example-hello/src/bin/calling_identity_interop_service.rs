@@ -60,7 +60,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 
     eprintln!("STAGE3 4-1 server: init ProcessState");
-    let server = rsbinder::serve("binder://")?;
+    let server = rsbinder::serve(Uri::kernel())?;
 
     // Opt the binder into BR_TRANSACTION_SEC_CTX so the kernel delivers
     // the caller's SELinux context. `BinderFeatures` are per binder

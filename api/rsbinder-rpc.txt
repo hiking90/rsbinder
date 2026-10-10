@@ -247,25 +247,40 @@ pub type rsbinder::cancel::ICancellationSignalDefaultRef = alloc::sync::Arc<dyn 
 pub mod rsbinder::entry
 pub mod rsbinder::entry::uri
 #[non_exhaustive] pub enum rsbinder::entry::uri::Endpoint
-pub rsbinder::entry::uri::Endpoint::Kernel
-pub rsbinder::entry::uri::Endpoint::Kernel::driver: core::option::Option<std::path::PathBuf>
-pub rsbinder::entry::uri::Endpoint::Kernel::mmap_size: core::option::Option<usize>
-pub rsbinder::entry::uri::Endpoint::Kernel::threads: core::option::Option<u32>
-pub rsbinder::entry::uri::Endpoint::Tls(alloc::string::String, u16)
+pub rsbinder::entry::uri::Endpoint::Kernel(rsbinder::entry::uri::KernelEndpoint)
+pub rsbinder::entry::uri::Endpoint::Tls
+pub rsbinder::entry::uri::Endpoint::Tls::host: alloc::string::String
+pub rsbinder::entry::uri::Endpoint::Tls::port: u16
 pub rsbinder::entry::uri::Endpoint::Unix(std::path::PathBuf)
 pub rsbinder::entry::uri::Endpoint::UnixAbstract(alloc::vec::Vec<u8>)
-pub rsbinder::entry::uri::Endpoint::Vsock(u32, u32)
+pub rsbinder::entry::uri::Endpoint::Vsock
+pub rsbinder::entry::uri::Endpoint::Vsock::cid: u32
+pub rsbinder::entry::uri::Endpoint::Vsock::port: u32
 impl rsbinder::entry::uri::Endpoint
 pub fn rsbinder::entry::uri::Endpoint::is_kernel(&self) -> bool
+pub fn rsbinder::entry::uri::Endpoint::kernel() -> Self
 pub fn rsbinder::entry::uri::Endpoint::static_caps(&self) -> rsbinder::TransportCaps
 pub fn rsbinder::entry::uri::Endpoint::supports_fd_passing(&self) -> bool
+pub fn rsbinder::entry::uri::Endpoint::tls(impl core::convert::Into<alloc::string::String>, u16) -> Self
+pub fn rsbinder::entry::uri::Endpoint::unix(impl core::convert::Into<std::path::PathBuf>) -> Self
+pub fn rsbinder::entry::uri::Endpoint::unix_abstract(impl core::convert::Into<alloc::vec::Vec<u8>>) -> Self
+pub fn rsbinder::entry::uri::Endpoint::vsock(u32, u32) -> Self
+pub fn rsbinder::entry::uri::Endpoint::with_service(self, impl core::convert::Into<alloc::string::String>) -> rsbinder::entry::uri::Uri
 impl core::clone::Clone for rsbinder::entry::uri::Endpoint
 pub fn rsbinder::entry::uri::Endpoint::clone(&self) -> rsbinder::entry::uri::Endpoint
 impl core::cmp::Eq for rsbinder::entry::uri::Endpoint
 impl core::cmp::PartialEq for rsbinder::entry::uri::Endpoint
 pub fn rsbinder::entry::uri::Endpoint::eq(&self, &rsbinder::entry::uri::Endpoint) -> bool
+impl core::convert::From<&rsbinder::entry::uri::Endpoint> for rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::from(&rsbinder::entry::uri::Endpoint) -> Self
+impl core::convert::From<rsbinder::entry::uri::Endpoint> for rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::from(rsbinder::entry::uri::Endpoint) -> Self
+impl core::convert::From<rsbinder::entry::uri::KernelEndpoint> for rsbinder::entry::uri::Endpoint
+pub fn rsbinder::entry::uri::Endpoint::from(rsbinder::entry::uri::KernelEndpoint) -> Self
 impl core::fmt::Debug for rsbinder::entry::uri::Endpoint
 pub fn rsbinder::entry::uri::Endpoint::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for rsbinder::entry::uri::Endpoint
+pub fn rsbinder::entry::uri::Endpoint::hash<__H: core::hash::Hasher>(&self, &mut __H)
 impl core::marker::StructuralPartialEq for rsbinder::entry::uri::Endpoint
 impl core::marker::Freeze for rsbinder::entry::uri::Endpoint
 impl core::marker::Send for rsbinder::entry::uri::Endpoint
@@ -274,18 +289,130 @@ impl core::marker::Unpin for rsbinder::entry::uri::Endpoint
 impl core::marker::UnsafeUnpin for rsbinder::entry::uri::Endpoint
 impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::entry::uri::Endpoint
 impl core::panic::unwind_safe::UnwindSafe for rsbinder::entry::uri::Endpoint
+#[non_exhaustive] pub enum rsbinder::entry::uri::UriErrorKind
+pub rsbinder::entry::uri::UriErrorKind::BadBrackets
+pub rsbinder::entry::uri::UriErrorKind::BadNumber
+pub rsbinder::entry::uri::UriErrorKind::BadPercentEscape
+pub rsbinder::entry::uri::UriErrorKind::DuplicateQueryKey
+pub rsbinder::entry::uri::UriErrorKind::EmptyHost
+pub rsbinder::entry::uri::UriErrorKind::EmptyName
+pub rsbinder::entry::uri::UriErrorKind::EmptyService
+pub rsbinder::entry::uri::UriErrorKind::MalformedQuery
+pub rsbinder::entry::uri::UriErrorKind::MissingPort
+pub rsbinder::entry::uri::UriErrorKind::MissingScheme
+pub rsbinder::entry::uri::UriErrorKind::NotUtf8
+pub rsbinder::entry::uri::UriErrorKind::QueryAfterService
+pub rsbinder::entry::uri::UriErrorKind::RelativeUnixPath
+pub rsbinder::entry::uri::UriErrorKind::ServiceGivenTwice
+pub rsbinder::entry::uri::UriErrorKind::UnknownProfile
+pub rsbinder::entry::uri::UriErrorKind::UnknownQueryKey
+pub rsbinder::entry::uri::UriErrorKind::UnknownScheme
+pub rsbinder::entry::uri::UriErrorKind::UnsupportedWireVersion
+impl core::clone::Clone for rsbinder::entry::uri::UriErrorKind
+pub fn rsbinder::entry::uri::UriErrorKind::clone(&self) -> rsbinder::entry::uri::UriErrorKind
+impl core::cmp::Eq for rsbinder::entry::uri::UriErrorKind
+impl core::cmp::PartialEq for rsbinder::entry::uri::UriErrorKind
+pub fn rsbinder::entry::uri::UriErrorKind::eq(&self, &rsbinder::entry::uri::UriErrorKind) -> bool
+impl core::fmt::Debug for rsbinder::entry::uri::UriErrorKind
+pub fn rsbinder::entry::uri::UriErrorKind::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for rsbinder::entry::uri::UriErrorKind
+pub fn rsbinder::entry::uri::UriErrorKind::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for rsbinder::entry::uri::UriErrorKind
+impl core::marker::StructuralPartialEq for rsbinder::entry::uri::UriErrorKind
+impl core::marker::Freeze for rsbinder::entry::uri::UriErrorKind
+impl core::marker::Send for rsbinder::entry::uri::UriErrorKind
+impl core::marker::Sync for rsbinder::entry::uri::UriErrorKind
+impl core::marker::Unpin for rsbinder::entry::uri::UriErrorKind
+impl core::marker::UnsafeUnpin for rsbinder::entry::uri::UriErrorKind
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::entry::uri::UriErrorKind
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::entry::uri::UriErrorKind
+pub enum rsbinder::entry::uri::WireProfile
+pub rsbinder::entry::uri::WireProfile::Android13Plus(rsbinder::entry::uri::WireVersion)
+pub rsbinder::entry::uri::WireProfile::R34
+impl core::clone::Clone for rsbinder::entry::uri::WireProfile
+pub fn rsbinder::entry::uri::WireProfile::clone(&self) -> rsbinder::entry::uri::WireProfile
+impl core::cmp::Eq for rsbinder::entry::uri::WireProfile
+impl core::cmp::PartialEq for rsbinder::entry::uri::WireProfile
+pub fn rsbinder::entry::uri::WireProfile::eq(&self, &rsbinder::entry::uri::WireProfile) -> bool
+impl core::default::Default for rsbinder::entry::uri::WireProfile
+pub fn rsbinder::entry::uri::WireProfile::default() -> rsbinder::entry::uri::WireProfile
+impl core::fmt::Debug for rsbinder::entry::uri::WireProfile
+pub fn rsbinder::entry::uri::WireProfile::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for rsbinder::entry::uri::WireProfile
+pub fn rsbinder::entry::uri::WireProfile::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for rsbinder::entry::uri::WireProfile
+impl core::marker::StructuralPartialEq for rsbinder::entry::uri::WireProfile
+impl core::marker::Freeze for rsbinder::entry::uri::WireProfile
+impl core::marker::Send for rsbinder::entry::uri::WireProfile
+impl core::marker::Sync for rsbinder::entry::uri::WireProfile
+impl core::marker::Unpin for rsbinder::entry::uri::WireProfile
+impl core::marker::UnsafeUnpin for rsbinder::entry::uri::WireProfile
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::entry::uri::WireProfile
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::entry::uri::WireProfile
+#[non_exhaustive] pub struct rsbinder::entry::uri::KernelEndpoint
+impl rsbinder::entry::uri::KernelEndpoint
+pub fn rsbinder::entry::uri::KernelEndpoint::driver(&self) -> core::option::Option<&std::path::Path>
+pub fn rsbinder::entry::uri::KernelEndpoint::mmap_size(&self) -> core::option::Option<usize>
+pub fn rsbinder::entry::uri::KernelEndpoint::threads(&self) -> core::option::Option<u32>
+pub fn rsbinder::entry::uri::KernelEndpoint::with_driver(self, impl core::convert::Into<std::path::PathBuf>) -> Self
+pub fn rsbinder::entry::uri::KernelEndpoint::with_mmap_size(self, usize) -> Self
+pub fn rsbinder::entry::uri::KernelEndpoint::with_threads(self, u32) -> Self
+impl core::clone::Clone for rsbinder::entry::uri::KernelEndpoint
+pub fn rsbinder::entry::uri::KernelEndpoint::clone(&self) -> rsbinder::entry::uri::KernelEndpoint
+impl core::cmp::Eq for rsbinder::entry::uri::KernelEndpoint
+impl core::cmp::PartialEq for rsbinder::entry::uri::KernelEndpoint
+pub fn rsbinder::entry::uri::KernelEndpoint::eq(&self, &rsbinder::entry::uri::KernelEndpoint) -> bool
+impl core::convert::From<rsbinder::entry::uri::KernelEndpoint> for rsbinder::entry::uri::Endpoint
+pub fn rsbinder::entry::uri::Endpoint::from(rsbinder::entry::uri::KernelEndpoint) -> Self
+impl core::convert::From<rsbinder::entry::uri::KernelEndpoint> for rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::from(rsbinder::entry::uri::KernelEndpoint) -> Self
+impl core::default::Default for rsbinder::entry::uri::KernelEndpoint
+pub fn rsbinder::entry::uri::KernelEndpoint::default() -> rsbinder::entry::uri::KernelEndpoint
+impl core::fmt::Debug for rsbinder::entry::uri::KernelEndpoint
+pub fn rsbinder::entry::uri::KernelEndpoint::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for rsbinder::entry::uri::KernelEndpoint
+pub fn rsbinder::entry::uri::KernelEndpoint::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::StructuralPartialEq for rsbinder::entry::uri::KernelEndpoint
+impl core::marker::Freeze for rsbinder::entry::uri::KernelEndpoint
+impl core::marker::Send for rsbinder::entry::uri::KernelEndpoint
+impl core::marker::Sync for rsbinder::entry::uri::KernelEndpoint
+impl core::marker::Unpin for rsbinder::entry::uri::KernelEndpoint
+impl core::marker::UnsafeUnpin for rsbinder::entry::uri::KernelEndpoint
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::entry::uri::KernelEndpoint
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::entry::uri::KernelEndpoint
 pub struct rsbinder::entry::uri::Uri
-pub rsbinder::entry::uri::Uri::endpoint: rsbinder::entry::uri::Endpoint
-pub rsbinder::entry::uri::Uri::service: core::option::Option<alloc::string::String>
-pub rsbinder::entry::uri::Uri::wire_max_version: core::option::Option<u32>
+impl rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::endpoint(&self) -> &rsbinder::entry::uri::Endpoint
+pub fn rsbinder::entry::uri::Uri::kernel() -> Self
+pub fn rsbinder::entry::uri::Uri::new(impl core::convert::Into<rsbinder::entry::uri::Endpoint>) -> Self
+pub fn rsbinder::entry::uri::Uri::parse(&str) -> core::result::Result<Self, rsbinder::entry::uri::UriError>
+pub fn rsbinder::entry::uri::Uri::service(&self) -> core::option::Option<&str>
+pub fn rsbinder::entry::uri::Uri::wire(&self) -> rsbinder::entry::uri::WireProfile
+pub fn rsbinder::entry::uri::Uri::with_service(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn rsbinder::entry::uri::Uri::with_wire(self, rsbinder::entry::uri::WireProfile) -> Self
 impl core::clone::Clone for rsbinder::entry::uri::Uri
 pub fn rsbinder::entry::uri::Uri::clone(&self) -> rsbinder::entry::uri::Uri
 impl core::cmp::Eq for rsbinder::entry::uri::Uri
 impl core::cmp::PartialEq for rsbinder::entry::uri::Uri
 pub fn rsbinder::entry::uri::Uri::eq(&self, &rsbinder::entry::uri::Uri) -> bool
+impl core::convert::From<&rsbinder::entry::uri::Endpoint> for rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::from(&rsbinder::entry::uri::Endpoint) -> Self
+impl core::convert::From<&rsbinder::entry::uri::Uri> for rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::from(&rsbinder::entry::uri::Uri) -> Self
+impl core::convert::From<rsbinder::entry::uri::Endpoint> for rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::from(rsbinder::entry::uri::Endpoint) -> Self
+impl core::convert::From<rsbinder::entry::uri::KernelEndpoint> for rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::from(rsbinder::entry::uri::KernelEndpoint) -> Self
 impl core::fmt::Debug for rsbinder::entry::uri::Uri
 pub fn rsbinder::entry::uri::Uri::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::hash<__H: core::hash::Hasher>(&self, &mut __H)
 impl core::marker::StructuralPartialEq for rsbinder::entry::uri::Uri
+impl core::str::traits::FromStr for rsbinder::entry::uri::Uri
+pub type rsbinder::entry::uri::Uri::Err = rsbinder::entry::uri::UriError
+pub fn rsbinder::entry::uri::Uri::from_str(&str) -> core::result::Result<Self, rsbinder::entry::uri::UriError>
 impl core::marker::Freeze for rsbinder::entry::uri::Uri
 impl core::marker::Send for rsbinder::entry::uri::Uri
 impl core::marker::Sync for rsbinder::entry::uri::Uri
@@ -293,27 +420,95 @@ impl core::marker::Unpin for rsbinder::entry::uri::Uri
 impl core::marker::UnsafeUnpin for rsbinder::entry::uri::Uri
 impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::entry::uri::Uri
 impl core::panic::unwind_safe::UnwindSafe for rsbinder::entry::uri::Uri
-pub fn rsbinder::entry::uri::parse(&str) -> rsbinder::Result<rsbinder::entry::uri::Uri>
+pub struct rsbinder::entry::uri::UriError
+impl rsbinder::entry::uri::UriError
+pub fn rsbinder::entry::uri::UriError::input(&self) -> &str
+pub fn rsbinder::entry::uri::UriError::kind(&self) -> rsbinder::entry::uri::UriErrorKind
+impl core::clone::Clone for rsbinder::entry::uri::UriError
+pub fn rsbinder::entry::uri::UriError::clone(&self) -> rsbinder::entry::uri::UriError
+impl core::cmp::Eq for rsbinder::entry::uri::UriError
+impl core::cmp::PartialEq for rsbinder::entry::uri::UriError
+pub fn rsbinder::entry::uri::UriError::eq(&self, &rsbinder::entry::uri::UriError) -> bool
+impl core::convert::From<rsbinder::entry::uri::UriError> for rsbinder::StatusCode
+pub fn rsbinder::StatusCode::from(rsbinder::entry::uri::UriError) -> Self
+impl core::error::Error for rsbinder::entry::uri::UriError
+impl core::fmt::Debug for rsbinder::entry::uri::UriError
+pub fn rsbinder::entry::uri::UriError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for rsbinder::entry::uri::UriError
+pub fn rsbinder::entry::uri::UriError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for rsbinder::entry::uri::UriError
+impl core::marker::Freeze for rsbinder::entry::uri::UriError
+impl core::marker::Send for rsbinder::entry::uri::UriError
+impl core::marker::Sync for rsbinder::entry::uri::UriError
+impl core::marker::Unpin for rsbinder::entry::uri::UriError
+impl core::marker::UnsafeUnpin for rsbinder::entry::uri::UriError
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::entry::uri::UriError
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::entry::uri::UriError
+pub struct rsbinder::entry::uri::WireVersion(_)
+impl rsbinder::entry::uri::WireVersion
+pub const rsbinder::entry::uri::WireVersion::MAX: Self
+pub const rsbinder::entry::uri::WireVersion::V0: Self
+pub const rsbinder::entry::uri::WireVersion::V1: Self
+pub const rsbinder::entry::uri::WireVersion::V2: Self
+pub const fn rsbinder::entry::uri::WireVersion::get(self) -> u32
+pub fn rsbinder::entry::uri::WireVersion::new(u32) -> core::result::Result<Self, rsbinder::entry::uri::UriError>
+impl core::clone::Clone for rsbinder::entry::uri::WireVersion
+pub fn rsbinder::entry::uri::WireVersion::clone(&self) -> rsbinder::entry::uri::WireVersion
+impl core::cmp::Eq for rsbinder::entry::uri::WireVersion
+impl core::cmp::Ord for rsbinder::entry::uri::WireVersion
+pub fn rsbinder::entry::uri::WireVersion::cmp(&self, &rsbinder::entry::uri::WireVersion) -> core::cmp::Ordering
+impl core::cmp::PartialEq for rsbinder::entry::uri::WireVersion
+pub fn rsbinder::entry::uri::WireVersion::eq(&self, &rsbinder::entry::uri::WireVersion) -> bool
+impl core::cmp::PartialOrd for rsbinder::entry::uri::WireVersion
+pub fn rsbinder::entry::uri::WireVersion::partial_cmp(&self, &rsbinder::entry::uri::WireVersion) -> core::option::Option<core::cmp::Ordering>
+impl core::fmt::Debug for rsbinder::entry::uri::WireVersion
+pub fn rsbinder::entry::uri::WireVersion::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for rsbinder::entry::uri::WireVersion
+pub fn rsbinder::entry::uri::WireVersion::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for rsbinder::entry::uri::WireVersion
+impl core::marker::StructuralPartialEq for rsbinder::entry::uri::WireVersion
+impl core::marker::Freeze for rsbinder::entry::uri::WireVersion
+impl core::marker::Send for rsbinder::entry::uri::WireVersion
+impl core::marker::Sync for rsbinder::entry::uri::WireVersion
+impl core::marker::Unpin for rsbinder::entry::uri::WireVersion
+impl core::marker::UnsafeUnpin for rsbinder::entry::uri::WireVersion
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::entry::uri::WireVersion
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::entry::uri::WireVersion
 #[non_exhaustive] pub enum rsbinder::entry::Endpoint
-pub rsbinder::entry::Endpoint::Kernel
-pub rsbinder::entry::Endpoint::Kernel::driver: core::option::Option<std::path::PathBuf>
-pub rsbinder::entry::Endpoint::Kernel::mmap_size: core::option::Option<usize>
-pub rsbinder::entry::Endpoint::Kernel::threads: core::option::Option<u32>
-pub rsbinder::entry::Endpoint::Tls(alloc::string::String, u16)
+pub rsbinder::entry::Endpoint::Kernel(rsbinder::entry::uri::KernelEndpoint)
+pub rsbinder::entry::Endpoint::Tls
+pub rsbinder::entry::Endpoint::Tls::host: alloc::string::String
+pub rsbinder::entry::Endpoint::Tls::port: u16
 pub rsbinder::entry::Endpoint::Unix(std::path::PathBuf)
 pub rsbinder::entry::Endpoint::UnixAbstract(alloc::vec::Vec<u8>)
-pub rsbinder::entry::Endpoint::Vsock(u32, u32)
+pub rsbinder::entry::Endpoint::Vsock
+pub rsbinder::entry::Endpoint::Vsock::cid: u32
+pub rsbinder::entry::Endpoint::Vsock::port: u32
 impl rsbinder::entry::uri::Endpoint
 pub fn rsbinder::entry::uri::Endpoint::is_kernel(&self) -> bool
+pub fn rsbinder::entry::uri::Endpoint::kernel() -> Self
 pub fn rsbinder::entry::uri::Endpoint::static_caps(&self) -> rsbinder::TransportCaps
 pub fn rsbinder::entry::uri::Endpoint::supports_fd_passing(&self) -> bool
+pub fn rsbinder::entry::uri::Endpoint::tls(impl core::convert::Into<alloc::string::String>, u16) -> Self
+pub fn rsbinder::entry::uri::Endpoint::unix(impl core::convert::Into<std::path::PathBuf>) -> Self
+pub fn rsbinder::entry::uri::Endpoint::unix_abstract(impl core::convert::Into<alloc::vec::Vec<u8>>) -> Self
+pub fn rsbinder::entry::uri::Endpoint::vsock(u32, u32) -> Self
+pub fn rsbinder::entry::uri::Endpoint::with_service(self, impl core::convert::Into<alloc::string::String>) -> rsbinder::entry::uri::Uri
 impl core::clone::Clone for rsbinder::entry::uri::Endpoint
 pub fn rsbinder::entry::uri::Endpoint::clone(&self) -> rsbinder::entry::uri::Endpoint
 impl core::cmp::Eq for rsbinder::entry::uri::Endpoint
 impl core::cmp::PartialEq for rsbinder::entry::uri::Endpoint
 pub fn rsbinder::entry::uri::Endpoint::eq(&self, &rsbinder::entry::uri::Endpoint) -> bool
+impl core::convert::From<&rsbinder::entry::uri::Endpoint> for rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::from(&rsbinder::entry::uri::Endpoint) -> Self
+impl core::convert::From<rsbinder::entry::uri::Endpoint> for rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::from(rsbinder::entry::uri::Endpoint) -> Self
+impl core::convert::From<rsbinder::entry::uri::KernelEndpoint> for rsbinder::entry::uri::Endpoint
+pub fn rsbinder::entry::uri::Endpoint::from(rsbinder::entry::uri::KernelEndpoint) -> Self
 impl core::fmt::Debug for rsbinder::entry::uri::Endpoint
 pub fn rsbinder::entry::uri::Endpoint::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for rsbinder::entry::uri::Endpoint
+pub fn rsbinder::entry::uri::Endpoint::hash<__H: core::hash::Hasher>(&self, &mut __H)
 impl core::marker::StructuralPartialEq for rsbinder::entry::uri::Endpoint
 impl core::marker::Freeze for rsbinder::entry::uri::Endpoint
 impl core::marker::Send for rsbinder::entry::uri::Endpoint
@@ -322,14 +517,74 @@ impl core::marker::Unpin for rsbinder::entry::uri::Endpoint
 impl core::marker::UnsafeUnpin for rsbinder::entry::uri::Endpoint
 impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::entry::uri::Endpoint
 impl core::panic::unwind_safe::UnwindSafe for rsbinder::entry::uri::Endpoint
+#[non_exhaustive] pub enum rsbinder::entry::UriErrorKind
+pub rsbinder::entry::UriErrorKind::BadBrackets
+pub rsbinder::entry::UriErrorKind::BadNumber
+pub rsbinder::entry::UriErrorKind::BadPercentEscape
+pub rsbinder::entry::UriErrorKind::DuplicateQueryKey
+pub rsbinder::entry::UriErrorKind::EmptyHost
+pub rsbinder::entry::UriErrorKind::EmptyName
+pub rsbinder::entry::UriErrorKind::EmptyService
+pub rsbinder::entry::UriErrorKind::MalformedQuery
+pub rsbinder::entry::UriErrorKind::MissingPort
+pub rsbinder::entry::UriErrorKind::MissingScheme
+pub rsbinder::entry::UriErrorKind::NotUtf8
+pub rsbinder::entry::UriErrorKind::QueryAfterService
+pub rsbinder::entry::UriErrorKind::RelativeUnixPath
+pub rsbinder::entry::UriErrorKind::ServiceGivenTwice
+pub rsbinder::entry::UriErrorKind::UnknownProfile
+pub rsbinder::entry::UriErrorKind::UnknownQueryKey
+pub rsbinder::entry::UriErrorKind::UnknownScheme
+pub rsbinder::entry::UriErrorKind::UnsupportedWireVersion
+impl core::clone::Clone for rsbinder::entry::uri::UriErrorKind
+pub fn rsbinder::entry::uri::UriErrorKind::clone(&self) -> rsbinder::entry::uri::UriErrorKind
+impl core::cmp::Eq for rsbinder::entry::uri::UriErrorKind
+impl core::cmp::PartialEq for rsbinder::entry::uri::UriErrorKind
+pub fn rsbinder::entry::uri::UriErrorKind::eq(&self, &rsbinder::entry::uri::UriErrorKind) -> bool
+impl core::fmt::Debug for rsbinder::entry::uri::UriErrorKind
+pub fn rsbinder::entry::uri::UriErrorKind::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for rsbinder::entry::uri::UriErrorKind
+pub fn rsbinder::entry::uri::UriErrorKind::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for rsbinder::entry::uri::UriErrorKind
+impl core::marker::StructuralPartialEq for rsbinder::entry::uri::UriErrorKind
+impl core::marker::Freeze for rsbinder::entry::uri::UriErrorKind
+impl core::marker::Send for rsbinder::entry::uri::UriErrorKind
+impl core::marker::Sync for rsbinder::entry::uri::UriErrorKind
+impl core::marker::Unpin for rsbinder::entry::uri::UriErrorKind
+impl core::marker::UnsafeUnpin for rsbinder::entry::uri::UriErrorKind
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::entry::uri::UriErrorKind
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::entry::uri::UriErrorKind
+pub enum rsbinder::entry::WireProfile
+pub rsbinder::entry::WireProfile::Android13Plus(rsbinder::entry::uri::WireVersion)
+pub rsbinder::entry::WireProfile::R34
+impl core::clone::Clone for rsbinder::entry::uri::WireProfile
+pub fn rsbinder::entry::uri::WireProfile::clone(&self) -> rsbinder::entry::uri::WireProfile
+impl core::cmp::Eq for rsbinder::entry::uri::WireProfile
+impl core::cmp::PartialEq for rsbinder::entry::uri::WireProfile
+pub fn rsbinder::entry::uri::WireProfile::eq(&self, &rsbinder::entry::uri::WireProfile) -> bool
+impl core::default::Default for rsbinder::entry::uri::WireProfile
+pub fn rsbinder::entry::uri::WireProfile::default() -> rsbinder::entry::uri::WireProfile
+impl core::fmt::Debug for rsbinder::entry::uri::WireProfile
+pub fn rsbinder::entry::uri::WireProfile::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for rsbinder::entry::uri::WireProfile
+pub fn rsbinder::entry::uri::WireProfile::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for rsbinder::entry::uri::WireProfile
+impl core::marker::StructuralPartialEq for rsbinder::entry::uri::WireProfile
+impl core::marker::Freeze for rsbinder::entry::uri::WireProfile
+impl core::marker::Send for rsbinder::entry::uri::WireProfile
+impl core::marker::Sync for rsbinder::entry::uri::WireProfile
+impl core::marker::Unpin for rsbinder::entry::uri::WireProfile
+impl core::marker::UnsafeUnpin for rsbinder::entry::uri::WireProfile
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::entry::uri::WireProfile
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::entry::uri::WireProfile
 pub struct rsbinder::entry::Client
 impl rsbinder::Client
 pub fn rsbinder::Client::binder(&self, &str) -> rsbinder::Result<rsbinder::SIBinder>
 pub fn rsbinder::Client::caps(&self) -> rsbinder::TransportCaps
 pub fn rsbinder::Client::endpoint(&self) -> &rsbinder::entry::uri::Endpoint
 pub fn rsbinder::Client::get<T: rsbinder::FromIBinder + ?core::marker::Sized>(&self, &str) -> rsbinder::Result<rsbinder::Strong<T>>
-pub fn rsbinder::Client::open(&str) -> rsbinder::Result<rsbinder::Client>
-pub fn rsbinder::Client::open_with(&str, impl core::ops::function::FnOnce(&mut rsbinder::ClientOptions, &rsbinder::entry::uri::Endpoint)) -> rsbinder::Result<rsbinder::Client>
+pub fn rsbinder::Client::open(impl core::convert::Into<rsbinder::entry::uri::Uri>) -> rsbinder::Result<rsbinder::Client>
+pub fn rsbinder::Client::open_with(impl core::convert::Into<rsbinder::entry::uri::Uri>, impl core::ops::function::FnOnce(&mut rsbinder::ClientOptions, &rsbinder::entry::uri::Endpoint)) -> rsbinder::Result<rsbinder::Client>
 pub fn rsbinder::Client::session(&self) -> core::option::Option<&rsbinder::rpc::session::RpcSession>
 pub fn rsbinder::Client::try_get<T: rsbinder::FromIBinder + ?core::marker::Sized>(&self, &str) -> rsbinder::Result<core::option::Option<rsbinder::Strong<T>>>
 impl core::fmt::Debug for rsbinder::Client
@@ -361,6 +616,37 @@ impl core::marker::Unpin for rsbinder::ClientOptions
 impl core::marker::UnsafeUnpin for rsbinder::ClientOptions
 impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::ClientOptions
 impl core::panic::unwind_safe::UnwindSafe for rsbinder::ClientOptions
+#[non_exhaustive] pub struct rsbinder::entry::KernelEndpoint
+impl rsbinder::entry::uri::KernelEndpoint
+pub fn rsbinder::entry::uri::KernelEndpoint::driver(&self) -> core::option::Option<&std::path::Path>
+pub fn rsbinder::entry::uri::KernelEndpoint::mmap_size(&self) -> core::option::Option<usize>
+pub fn rsbinder::entry::uri::KernelEndpoint::threads(&self) -> core::option::Option<u32>
+pub fn rsbinder::entry::uri::KernelEndpoint::with_driver(self, impl core::convert::Into<std::path::PathBuf>) -> Self
+pub fn rsbinder::entry::uri::KernelEndpoint::with_mmap_size(self, usize) -> Self
+pub fn rsbinder::entry::uri::KernelEndpoint::with_threads(self, u32) -> Self
+impl core::clone::Clone for rsbinder::entry::uri::KernelEndpoint
+pub fn rsbinder::entry::uri::KernelEndpoint::clone(&self) -> rsbinder::entry::uri::KernelEndpoint
+impl core::cmp::Eq for rsbinder::entry::uri::KernelEndpoint
+impl core::cmp::PartialEq for rsbinder::entry::uri::KernelEndpoint
+pub fn rsbinder::entry::uri::KernelEndpoint::eq(&self, &rsbinder::entry::uri::KernelEndpoint) -> bool
+impl core::convert::From<rsbinder::entry::uri::KernelEndpoint> for rsbinder::entry::uri::Endpoint
+pub fn rsbinder::entry::uri::Endpoint::from(rsbinder::entry::uri::KernelEndpoint) -> Self
+impl core::convert::From<rsbinder::entry::uri::KernelEndpoint> for rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::from(rsbinder::entry::uri::KernelEndpoint) -> Self
+impl core::default::Default for rsbinder::entry::uri::KernelEndpoint
+pub fn rsbinder::entry::uri::KernelEndpoint::default() -> rsbinder::entry::uri::KernelEndpoint
+impl core::fmt::Debug for rsbinder::entry::uri::KernelEndpoint
+pub fn rsbinder::entry::uri::KernelEndpoint::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for rsbinder::entry::uri::KernelEndpoint
+pub fn rsbinder::entry::uri::KernelEndpoint::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::StructuralPartialEq for rsbinder::entry::uri::KernelEndpoint
+impl core::marker::Freeze for rsbinder::entry::uri::KernelEndpoint
+impl core::marker::Send for rsbinder::entry::uri::KernelEndpoint
+impl core::marker::Sync for rsbinder::entry::uri::KernelEndpoint
+impl core::marker::Unpin for rsbinder::entry::uri::KernelEndpoint
+impl core::marker::UnsafeUnpin for rsbinder::entry::uri::KernelEndpoint
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::entry::uri::KernelEndpoint
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::entry::uri::KernelEndpoint
 #[non_exhaustive] pub struct rsbinder::entry::ServeOptions
 pub rsbinder::entry::ServeOptions::authorizer: core::option::Option<rsbinder::entry::Authorizer>
 pub rsbinder::entry::ServeOptions::call_restriction: core::option::Option<rsbinder::CallRestriction>
@@ -409,10 +695,104 @@ impl core::marker::Unpin for rsbinder::ServerGuard
 impl core::marker::UnsafeUnpin for rsbinder::ServerGuard
 impl !core::panic::unwind_safe::RefUnwindSafe for rsbinder::ServerGuard
 impl !core::panic::unwind_safe::UnwindSafe for rsbinder::ServerGuard
-pub fn rsbinder::entry::connect<T: rsbinder::FromIBinder + ?core::marker::Sized>(&str) -> rsbinder::Result<rsbinder::Strong<T>>
-pub async fn rsbinder::entry::connect_async<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static>(&str) -> rsbinder::Result<rsbinder::Strong<T>>
-pub fn rsbinder::entry::connect_binder(&str) -> rsbinder::Result<rsbinder::SIBinder>
-pub fn rsbinder::entry::serve(&str) -> rsbinder::Result<rsbinder::Server>
+pub struct rsbinder::entry::Uri
+impl rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::endpoint(&self) -> &rsbinder::entry::uri::Endpoint
+pub fn rsbinder::entry::uri::Uri::kernel() -> Self
+pub fn rsbinder::entry::uri::Uri::new(impl core::convert::Into<rsbinder::entry::uri::Endpoint>) -> Self
+pub fn rsbinder::entry::uri::Uri::parse(&str) -> core::result::Result<Self, rsbinder::entry::uri::UriError>
+pub fn rsbinder::entry::uri::Uri::service(&self) -> core::option::Option<&str>
+pub fn rsbinder::entry::uri::Uri::wire(&self) -> rsbinder::entry::uri::WireProfile
+pub fn rsbinder::entry::uri::Uri::with_service(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn rsbinder::entry::uri::Uri::with_wire(self, rsbinder::entry::uri::WireProfile) -> Self
+impl core::clone::Clone for rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::clone(&self) -> rsbinder::entry::uri::Uri
+impl core::cmp::Eq for rsbinder::entry::uri::Uri
+impl core::cmp::PartialEq for rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::eq(&self, &rsbinder::entry::uri::Uri) -> bool
+impl core::convert::From<&rsbinder::entry::uri::Endpoint> for rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::from(&rsbinder::entry::uri::Endpoint) -> Self
+impl core::convert::From<&rsbinder::entry::uri::Uri> for rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::from(&rsbinder::entry::uri::Uri) -> Self
+impl core::convert::From<rsbinder::entry::uri::Endpoint> for rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::from(rsbinder::entry::uri::Endpoint) -> Self
+impl core::convert::From<rsbinder::entry::uri::KernelEndpoint> for rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::from(rsbinder::entry::uri::KernelEndpoint) -> Self
+impl core::fmt::Debug for rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::StructuralPartialEq for rsbinder::entry::uri::Uri
+impl core::str::traits::FromStr for rsbinder::entry::uri::Uri
+pub type rsbinder::entry::uri::Uri::Err = rsbinder::entry::uri::UriError
+pub fn rsbinder::entry::uri::Uri::from_str(&str) -> core::result::Result<Self, rsbinder::entry::uri::UriError>
+impl core::marker::Freeze for rsbinder::entry::uri::Uri
+impl core::marker::Send for rsbinder::entry::uri::Uri
+impl core::marker::Sync for rsbinder::entry::uri::Uri
+impl core::marker::Unpin for rsbinder::entry::uri::Uri
+impl core::marker::UnsafeUnpin for rsbinder::entry::uri::Uri
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::entry::uri::Uri
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::entry::uri::Uri
+pub struct rsbinder::entry::UriError
+impl rsbinder::entry::uri::UriError
+pub fn rsbinder::entry::uri::UriError::input(&self) -> &str
+pub fn rsbinder::entry::uri::UriError::kind(&self) -> rsbinder::entry::uri::UriErrorKind
+impl core::clone::Clone for rsbinder::entry::uri::UriError
+pub fn rsbinder::entry::uri::UriError::clone(&self) -> rsbinder::entry::uri::UriError
+impl core::cmp::Eq for rsbinder::entry::uri::UriError
+impl core::cmp::PartialEq for rsbinder::entry::uri::UriError
+pub fn rsbinder::entry::uri::UriError::eq(&self, &rsbinder::entry::uri::UriError) -> bool
+impl core::convert::From<rsbinder::entry::uri::UriError> for rsbinder::StatusCode
+pub fn rsbinder::StatusCode::from(rsbinder::entry::uri::UriError) -> Self
+impl core::error::Error for rsbinder::entry::uri::UriError
+impl core::fmt::Debug for rsbinder::entry::uri::UriError
+pub fn rsbinder::entry::uri::UriError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for rsbinder::entry::uri::UriError
+pub fn rsbinder::entry::uri::UriError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for rsbinder::entry::uri::UriError
+impl core::marker::Freeze for rsbinder::entry::uri::UriError
+impl core::marker::Send for rsbinder::entry::uri::UriError
+impl core::marker::Sync for rsbinder::entry::uri::UriError
+impl core::marker::Unpin for rsbinder::entry::uri::UriError
+impl core::marker::UnsafeUnpin for rsbinder::entry::uri::UriError
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::entry::uri::UriError
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::entry::uri::UriError
+pub struct rsbinder::entry::WireVersion(_)
+impl rsbinder::entry::uri::WireVersion
+pub const rsbinder::entry::uri::WireVersion::MAX: Self
+pub const rsbinder::entry::uri::WireVersion::V0: Self
+pub const rsbinder::entry::uri::WireVersion::V1: Self
+pub const rsbinder::entry::uri::WireVersion::V2: Self
+pub const fn rsbinder::entry::uri::WireVersion::get(self) -> u32
+pub fn rsbinder::entry::uri::WireVersion::new(u32) -> core::result::Result<Self, rsbinder::entry::uri::UriError>
+impl core::clone::Clone for rsbinder::entry::uri::WireVersion
+pub fn rsbinder::entry::uri::WireVersion::clone(&self) -> rsbinder::entry::uri::WireVersion
+impl core::cmp::Eq for rsbinder::entry::uri::WireVersion
+impl core::cmp::Ord for rsbinder::entry::uri::WireVersion
+pub fn rsbinder::entry::uri::WireVersion::cmp(&self, &rsbinder::entry::uri::WireVersion) -> core::cmp::Ordering
+impl core::cmp::PartialEq for rsbinder::entry::uri::WireVersion
+pub fn rsbinder::entry::uri::WireVersion::eq(&self, &rsbinder::entry::uri::WireVersion) -> bool
+impl core::cmp::PartialOrd for rsbinder::entry::uri::WireVersion
+pub fn rsbinder::entry::uri::WireVersion::partial_cmp(&self, &rsbinder::entry::uri::WireVersion) -> core::option::Option<core::cmp::Ordering>
+impl core::fmt::Debug for rsbinder::entry::uri::WireVersion
+pub fn rsbinder::entry::uri::WireVersion::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for rsbinder::entry::uri::WireVersion
+pub fn rsbinder::entry::uri::WireVersion::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for rsbinder::entry::uri::WireVersion
+impl core::marker::StructuralPartialEq for rsbinder::entry::uri::WireVersion
+impl core::marker::Freeze for rsbinder::entry::uri::WireVersion
+impl core::marker::Send for rsbinder::entry::uri::WireVersion
+impl core::marker::Sync for rsbinder::entry::uri::WireVersion
+impl core::marker::Unpin for rsbinder::entry::uri::WireVersion
+impl core::marker::UnsafeUnpin for rsbinder::entry::uri::WireVersion
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::entry::uri::WireVersion
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::entry::uri::WireVersion
+pub fn rsbinder::entry::connect<T: rsbinder::FromIBinder + ?core::marker::Sized>(impl core::convert::Into<rsbinder::entry::uri::Uri>) -> rsbinder::Result<rsbinder::Strong<T>>
+pub fn rsbinder::entry::connect_async<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static>(impl core::convert::Into<rsbinder::entry::uri::Uri>) -> impl core::future::future::Future<Output = rsbinder::Result<rsbinder::Strong<T>>> + 'static
+pub fn rsbinder::entry::connect_binder(impl core::convert::Into<rsbinder::entry::uri::Uri>) -> rsbinder::Result<rsbinder::SIBinder>
+pub fn rsbinder::entry::serve(impl core::convert::Into<rsbinder::entry::uri::Uri>) -> rsbinder::Result<rsbinder::Server>
 pub type rsbinder::entry::Authorizer = alloc::boxed::Box<(dyn core::ops::function::Fn(&rsbinder::rpc::transport::PeerIdentity) -> bool + core::marker::Send + core::marker::Sync)>
 pub mod rsbinder::fmq
 pub use rsbinder::fmq::<<rsbinder_fmq::*>>
@@ -2434,7 +2814,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::reconnect::ReconnectP
 impl core::panic::unwind_safe::UnwindSafe for rsbinder::reconnect::ReconnectPolicy
 pub struct rsbinder::reconnect::Reconnecting<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static>
 impl<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static> rsbinder::reconnect::Reconnecting<T>
-pub fn rsbinder::reconnect::Reconnecting<T>::builder(&str) -> rsbinder::reconnect::ReconnectBuilder<T>
+pub fn rsbinder::reconnect::Reconnecting<T>::builder(impl core::convert::Into<rsbinder::entry::uri::Uri>) -> rsbinder::reconnect::ReconnectBuilder<T>
 pub fn rsbinder::reconnect::Reconnecting<T>::close(self)
 pub async fn rsbinder::reconnect::Reconnecting<T>::connected(&self) -> rsbinder::Result<rsbinder::Strong<T>>
 pub fn rsbinder::reconnect::Reconnecting<T>::current(&self) -> rsbinder::Result<rsbinder::Strong<T>>
@@ -4378,25 +4758,40 @@ impl core::marker::UnsafeUnpin for rsbinder::thread_state::Caller
 impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::thread_state::Caller
 impl core::panic::unwind_safe::UnwindSafe for rsbinder::thread_state::Caller
 #[non_exhaustive] pub enum rsbinder::Endpoint
-pub rsbinder::Endpoint::Kernel
-pub rsbinder::Endpoint::Kernel::driver: core::option::Option<std::path::PathBuf>
-pub rsbinder::Endpoint::Kernel::mmap_size: core::option::Option<usize>
-pub rsbinder::Endpoint::Kernel::threads: core::option::Option<u32>
-pub rsbinder::Endpoint::Tls(alloc::string::String, u16)
+pub rsbinder::Endpoint::Kernel(rsbinder::entry::uri::KernelEndpoint)
+pub rsbinder::Endpoint::Tls
+pub rsbinder::Endpoint::Tls::host: alloc::string::String
+pub rsbinder::Endpoint::Tls::port: u16
 pub rsbinder::Endpoint::Unix(std::path::PathBuf)
 pub rsbinder::Endpoint::UnixAbstract(alloc::vec::Vec<u8>)
-pub rsbinder::Endpoint::Vsock(u32, u32)
+pub rsbinder::Endpoint::Vsock
+pub rsbinder::Endpoint::Vsock::cid: u32
+pub rsbinder::Endpoint::Vsock::port: u32
 impl rsbinder::entry::uri::Endpoint
 pub fn rsbinder::entry::uri::Endpoint::is_kernel(&self) -> bool
+pub fn rsbinder::entry::uri::Endpoint::kernel() -> Self
 pub fn rsbinder::entry::uri::Endpoint::static_caps(&self) -> rsbinder::TransportCaps
 pub fn rsbinder::entry::uri::Endpoint::supports_fd_passing(&self) -> bool
+pub fn rsbinder::entry::uri::Endpoint::tls(impl core::convert::Into<alloc::string::String>, u16) -> Self
+pub fn rsbinder::entry::uri::Endpoint::unix(impl core::convert::Into<std::path::PathBuf>) -> Self
+pub fn rsbinder::entry::uri::Endpoint::unix_abstract(impl core::convert::Into<alloc::vec::Vec<u8>>) -> Self
+pub fn rsbinder::entry::uri::Endpoint::vsock(u32, u32) -> Self
+pub fn rsbinder::entry::uri::Endpoint::with_service(self, impl core::convert::Into<alloc::string::String>) -> rsbinder::entry::uri::Uri
 impl core::clone::Clone for rsbinder::entry::uri::Endpoint
 pub fn rsbinder::entry::uri::Endpoint::clone(&self) -> rsbinder::entry::uri::Endpoint
 impl core::cmp::Eq for rsbinder::entry::uri::Endpoint
 impl core::cmp::PartialEq for rsbinder::entry::uri::Endpoint
 pub fn rsbinder::entry::uri::Endpoint::eq(&self, &rsbinder::entry::uri::Endpoint) -> bool
+impl core::convert::From<&rsbinder::entry::uri::Endpoint> for rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::from(&rsbinder::entry::uri::Endpoint) -> Self
+impl core::convert::From<rsbinder::entry::uri::Endpoint> for rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::from(rsbinder::entry::uri::Endpoint) -> Self
+impl core::convert::From<rsbinder::entry::uri::KernelEndpoint> for rsbinder::entry::uri::Endpoint
+pub fn rsbinder::entry::uri::Endpoint::from(rsbinder::entry::uri::KernelEndpoint) -> Self
 impl core::fmt::Debug for rsbinder::entry::uri::Endpoint
 pub fn rsbinder::entry::uri::Endpoint::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for rsbinder::entry::uri::Endpoint
+pub fn rsbinder::entry::uri::Endpoint::hash<__H: core::hash::Hasher>(&self, &mut __H)
 impl core::marker::StructuralPartialEq for rsbinder::entry::uri::Endpoint
 impl core::marker::Freeze for rsbinder::entry::uri::Endpoint
 impl core::marker::Send for rsbinder::entry::uri::Endpoint
@@ -4557,6 +4952,8 @@ impl core::convert::From<rsbinder::StatusCode> for rsbinder::Status
 pub fn rsbinder::Status::from(rsbinder::StatusCode) -> Self
 impl core::convert::From<rsbinder::StatusCode> for rsbinder::reconnect::ConnectError
 pub fn rsbinder::reconnect::ConnectError::from(rsbinder::StatusCode) -> Self
+impl core::convert::From<rsbinder::entry::uri::UriError> for rsbinder::StatusCode
+pub fn rsbinder::StatusCode::from(rsbinder::entry::uri::UriError) -> Self
 impl core::convert::From<rsbinder::rpc::RpcError> for rsbinder::StatusCode
 pub fn rsbinder::StatusCode::from(rsbinder::rpc::RpcError) -> Self
 impl core::convert::From<rsbinder_fmq::error::Error> for rsbinder::StatusCode
@@ -4758,8 +5155,8 @@ pub fn rsbinder::Client::binder(&self, &str) -> rsbinder::Result<rsbinder::SIBin
 pub fn rsbinder::Client::caps(&self) -> rsbinder::TransportCaps
 pub fn rsbinder::Client::endpoint(&self) -> &rsbinder::entry::uri::Endpoint
 pub fn rsbinder::Client::get<T: rsbinder::FromIBinder + ?core::marker::Sized>(&self, &str) -> rsbinder::Result<rsbinder::Strong<T>>
-pub fn rsbinder::Client::open(&str) -> rsbinder::Result<rsbinder::Client>
-pub fn rsbinder::Client::open_with(&str, impl core::ops::function::FnOnce(&mut rsbinder::ClientOptions, &rsbinder::entry::uri::Endpoint)) -> rsbinder::Result<rsbinder::Client>
+pub fn rsbinder::Client::open(impl core::convert::Into<rsbinder::entry::uri::Uri>) -> rsbinder::Result<rsbinder::Client>
+pub fn rsbinder::Client::open_with(impl core::convert::Into<rsbinder::entry::uri::Uri>, impl core::ops::function::FnOnce(&mut rsbinder::ClientOptions, &rsbinder::entry::uri::Endpoint)) -> rsbinder::Result<rsbinder::Client>
 pub fn rsbinder::Client::session(&self) -> core::option::Option<&rsbinder::rpc::session::RpcSession>
 pub fn rsbinder::Client::try_get<T: rsbinder::FromIBinder + ?core::marker::Sized>(&self, &str) -> rsbinder::Result<core::option::Option<rsbinder::Strong<T>>>
 impl core::fmt::Debug for rsbinder::Client
@@ -5101,7 +5498,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::ProxyHandle
 impl core::panic::unwind_safe::UnwindSafe for rsbinder::ProxyHandle
 pub struct rsbinder::Reconnecting<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static>
 impl<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static> rsbinder::reconnect::Reconnecting<T>
-pub fn rsbinder::reconnect::Reconnecting<T>::builder(&str) -> rsbinder::reconnect::ReconnectBuilder<T>
+pub fn rsbinder::reconnect::Reconnecting<T>::builder(impl core::convert::Into<rsbinder::entry::uri::Uri>) -> rsbinder::reconnect::ReconnectBuilder<T>
 pub fn rsbinder::reconnect::Reconnecting<T>::close(self)
 pub async fn rsbinder::reconnect::Reconnecting<T>::connected(&self) -> rsbinder::Result<rsbinder::Strong<T>>
 pub fn rsbinder::reconnect::Reconnecting<T>::current(&self) -> rsbinder::Result<rsbinder::Strong<T>>
@@ -5430,6 +5827,46 @@ impl core::marker::Unpin for rsbinder::TransportCaps
 impl core::marker::UnsafeUnpin for rsbinder::TransportCaps
 impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::TransportCaps
 impl core::panic::unwind_safe::UnwindSafe for rsbinder::TransportCaps
+pub struct rsbinder::Uri
+impl rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::endpoint(&self) -> &rsbinder::entry::uri::Endpoint
+pub fn rsbinder::entry::uri::Uri::kernel() -> Self
+pub fn rsbinder::entry::uri::Uri::new(impl core::convert::Into<rsbinder::entry::uri::Endpoint>) -> Self
+pub fn rsbinder::entry::uri::Uri::parse(&str) -> core::result::Result<Self, rsbinder::entry::uri::UriError>
+pub fn rsbinder::entry::uri::Uri::service(&self) -> core::option::Option<&str>
+pub fn rsbinder::entry::uri::Uri::wire(&self) -> rsbinder::entry::uri::WireProfile
+pub fn rsbinder::entry::uri::Uri::with_service(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn rsbinder::entry::uri::Uri::with_wire(self, rsbinder::entry::uri::WireProfile) -> Self
+impl core::clone::Clone for rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::clone(&self) -> rsbinder::entry::uri::Uri
+impl core::cmp::Eq for rsbinder::entry::uri::Uri
+impl core::cmp::PartialEq for rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::eq(&self, &rsbinder::entry::uri::Uri) -> bool
+impl core::convert::From<&rsbinder::entry::uri::Endpoint> for rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::from(&rsbinder::entry::uri::Endpoint) -> Self
+impl core::convert::From<&rsbinder::entry::uri::Uri> for rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::from(&rsbinder::entry::uri::Uri) -> Self
+impl core::convert::From<rsbinder::entry::uri::Endpoint> for rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::from(rsbinder::entry::uri::Endpoint) -> Self
+impl core::convert::From<rsbinder::entry::uri::KernelEndpoint> for rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::from(rsbinder::entry::uri::KernelEndpoint) -> Self
+impl core::fmt::Debug for rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for rsbinder::entry::uri::Uri
+pub fn rsbinder::entry::uri::Uri::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::StructuralPartialEq for rsbinder::entry::uri::Uri
+impl core::str::traits::FromStr for rsbinder::entry::uri::Uri
+pub type rsbinder::entry::uri::Uri::Err = rsbinder::entry::uri::UriError
+pub fn rsbinder::entry::uri::Uri::from_str(&str) -> core::result::Result<Self, rsbinder::entry::uri::UriError>
+impl core::marker::Freeze for rsbinder::entry::uri::Uri
+impl core::marker::Send for rsbinder::entry::uri::Uri
+impl core::marker::Sync for rsbinder::entry::uri::Uri
+impl core::marker::Unpin for rsbinder::entry::uri::Uri
+impl core::marker::UnsafeUnpin for rsbinder::entry::uri::Uri
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::entry::uri::Uri
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::entry::uri::Uri
 pub struct rsbinder::WIBinder
 impl rsbinder::WIBinder
 pub fn rsbinder::WIBinder::upgrade(&self) -> rsbinder::Result<rsbinder::SIBinder>
@@ -6307,9 +6744,9 @@ pub async fn rsbinder::check_interface_async<T: rsbinder::FromIBinder + ?core::m
 pub fn rsbinder::clear_calling_identity() -> i64
 pub fn rsbinder::clear_calling_work_source() -> i64
 pub fn rsbinder::clear_propagate_work_source()
-pub fn rsbinder::connect<T: rsbinder::FromIBinder + ?core::marker::Sized>(&str) -> rsbinder::Result<rsbinder::Strong<T>>
-pub async fn rsbinder::connect_async<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static>(&str) -> rsbinder::Result<rsbinder::Strong<T>>
-pub fn rsbinder::connect_binder(&str) -> rsbinder::Result<rsbinder::SIBinder>
+pub fn rsbinder::connect<T: rsbinder::FromIBinder + ?core::marker::Sized>(impl core::convert::Into<rsbinder::entry::uri::Uri>) -> rsbinder::Result<rsbinder::Strong<T>>
+pub fn rsbinder::connect_async<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static>(impl core::convert::Into<rsbinder::entry::uri::Uri>) -> impl core::future::future::Future<Output = rsbinder::Result<rsbinder::Strong<T>>> + 'static
+pub fn rsbinder::connect_binder(impl core::convert::Into<rsbinder::entry::uri::Uri>) -> rsbinder::Result<rsbinder::SIBinder>
 pub fn rsbinder::death_signal(&rsbinder::SIBinder) -> core::result::Result<rsbinder::DeathSignal, rsbinder::StatusCode>
 pub fn rsbinder::from_bytes<T: rsbinder::Deserialize>(&[u8]) -> rsbinder::Result<T>
 pub fn rsbinder::get_calling_pid() -> std::os::raw::c_int
@@ -6325,7 +6762,7 @@ pub fn rsbinder::is_handling_transaction() -> bool
 pub fn rsbinder::restore_calling_identity(i64)
 pub fn rsbinder::restore_calling_work_source(i64)
 pub fn rsbinder::sdk_at_least(u32) -> bool
-pub fn rsbinder::serve(&str) -> rsbinder::Result<rsbinder::Server>
+pub fn rsbinder::serve(impl core::convert::Into<rsbinder::entry::uri::Uri>) -> rsbinder::Result<rsbinder::Server>
 pub fn rsbinder::set_calling_work_source_uid(std::os::raw::c_uint) -> i64
 pub fn rsbinder::set_strict_mode_policy(i32)
 pub fn rsbinder::should_propagate_work_source() -> bool

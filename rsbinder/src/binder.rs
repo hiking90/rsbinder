@@ -1496,8 +1496,8 @@ impl<I: FromIBinder + ?Sized> Deref for Strong<I> {
 ///
 /// ```ignore
 /// // B: reached C over the kernel; re-publishes it on a socket.
-/// let upstream: Strong<dyn IFoo> = rsbinder::connect("binder://my.foo")?;
-/// rsbinder::serve("unix:///tmp/gw.sock")?
+/// let upstream: Strong<dyn IFoo> = rsbinder::connect(Uri::kernel().with_service("my.foo"))?;
+/// rsbinder::serve(Endpoint::unix("/tmp/gw.sock"))?
 ///     .add("foo", BnFoo::new_binder(upstream))?
 ///     .run()?;
 /// ```

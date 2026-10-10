@@ -97,9 +97,9 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
     let uri = match std::env::args().nth(1).as_deref() {
-        Some("kernel") => "binder://".to_string(),
-        Some("rpc") => format!("unix://{RPC_SOCKET}"),
-        Some(uri) => uri.to_string(),
+        Some("kernel") => Uri::kernel(),
+        Some("rpc") => Uri::new(Endpoint::unix(RPC_SOCKET)),
+        Some(uri) => uri.parse::<Uri>()?,
         None => {
             eprintln!("usage: shm_service <kernel|rpc|URI>   (rpc needs --features rpc)");
             std::process::exit(2);

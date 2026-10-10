@@ -267,7 +267,8 @@ fn connect_peer_rpc(path: &str) -> Result<Strong<dyn IMeshNode>> {
     // Named-service model: the peer's `serve(..).add(MESH_SVC, ..)`
     // published the binder; `connect` looks it up through the session's
     // in-process directory. The proxy keeps the session alive.
-    let node: Strong<dyn IMeshNode> = rsbinder::connect(&format!("unix://{path}#{MESH_SVC}"))?;
+    let node: Strong<dyn IMeshNode> =
+        rsbinder::connect(Endpoint::unix(path).with_service(MESH_SVC))?;
     // A connect() can succeed against a socket whose server has bound but
     // not yet entered its accept/serve loop; the first transaction then
     // races and may surface DeadObject. Probe once here so the caller's
@@ -318,7 +319,7 @@ fn run_rpc_server(
     let listen = cfg.listen.as_ref().ok_or("rpc-server requires --listen")?;
     let _ = std::fs::remove_file(listen);
     let svc = MeshNodeImpl::new(cfg.name.clone(), NodeKind::RPC, Arc::clone(&served));
-    let _bg = rsbinder::serve(&format!("unix://{listen}"))?
+    let _bg = rsbinder::serve(Endpoint::unix(listen))?
         .add(MESH_SVC, BnMeshNode::new_binder(svc))?
         .spawn()?;
 
@@ -418,10 +419,10 @@ fn run_kernel_server(
         .kernel_service
         .as_ref()
         .ok_or("kernel-server requires --kernel-service")?;
-    // `spawn()` on the kernel: ProcessState init + register + start the
-    // thread pool without joining it, so this node can also run as a client.
+    // `spawn()` on the kernel: start the thread pool + register, without
+    // joining the pool, so this node can also run as a client.
     let svc = MeshNodeImpl::new(cfg.name.clone(), NodeKind::KERNEL, Arc::clone(&served));
-    let _kernel = rsbinder::serve("binder://")?
+    let _kernel = rsbinder::serve(Uri::kernel())?
         .add(name, BnMeshNode::new_binder(svc))?
         .spawn()?;
 
@@ -454,7 +455,7 @@ fn run_kernel_client(
         let _ = std::fs::remove_file(listen);
         let svc = MeshNodeImpl::new(cfg.name.clone(), NodeKind::RPC, Arc::clone(&served));
         Some(
-            rsbinder::serve(&format!("unix://{listen}"))?
+            rsbinder::serve(Endpoint::unix(listen))?
                 .add(MESH_SVC, BnMeshNode::new_binder(svc))?
                 .spawn()?,
         )
@@ -462,9 +463,9 @@ fn run_kernel_client(
         None
     };
 
-    // `Client::open("binder://")` does the (idempotent) ProcessState init
+    // `Client::open(Uri::kernel())` does the (idempotent) ProcessState init
     // so the system service manager is reachable.
-    let client = rsbinder::Client::open("binder://")?;
+    let client = rsbinder::Client::open(Uri::kernel())?;
 
     // Connect the kernel service with bounded retry (`try_get` does not
     // wait, so the retry budget stays ours).

@@ -127,19 +127,20 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("Creating service...");
     let service = BnHello::new_binder(IHelloService{});
 
-    // `serve("binder://")` initializes the kernel binder process state,
-    // `add` registers the service with the service manager (it takes
-    // anything convertible into `SIBinder`), and `run` starts the binder
-    // thread pool and joins it — this blocks for the life of the service.
+    // `serve(Uri::kernel())` initializes the kernel binder process state,
+    // `add` names the service (it takes anything convertible into
+    // `SIBinder`), and `run` starts the binder thread pool, registers the
+    // service with the service manager and joins the pool — this blocks
+    // for the life of the service.
     println!("Serving {SERVICE_NAME}...");
-    rsbinder::serve("binder://")?
+    rsbinder::serve(Uri::kernel())?
         .add(SERVICE_NAME, &service)?
         .run()?;
     Ok(())
 }
 ```
 
-> The same three calls with `serve("unix:///tmp/hello.sock")` serve the
+> The same three calls with `serve(Endpoint::unix("/tmp/hello.sock"))` serve the
 > service over a Unix socket instead of kernel binder — see
 > [Cross-Transport Services](./cross-transport-services.md). The low-level
 > form (`ProcessState::init_default()`, `start_thread_pool()`,
@@ -178,10 +179,12 @@ impl DeathRecipient for MyDeathRecipient {
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
-    // `connect("binder://<name>")` initializes the kernel binder process
-    // state, blocks until the service is registered (the event-driven
-    // equivalent of AOSP's `waitForService`), and casts it to the interface.
-    let hello: rsbinder::Strong<dyn IHello> = rsbinder::connect(&format!("binder://{SERVICE_NAME}"))?;
+    // `connect` on a kernel `Uri` with a service name initializes the kernel
+    // binder process state, blocks until the service is registered (the
+    // event-driven equivalent of AOSP's `waitForService`), and casts it to
+    // the interface.
+    let hello: rsbinder::Strong<dyn IHello> =
+        rsbinder::connect(Uri::kernel().with_service(SERVICE_NAME))?;
 
     println!("list services:");
     // Service-manager extras stay on `hub`.
@@ -267,9 +270,9 @@ availability notifications, and linked a death recipient.
 
 ### Troubleshooting
 
-1. **"ProcessState is not initialized!"** — `rsbinder::serve("binder://")` / `rsbinder::connect("binder://…")` (or the low-level `ProcessState::init_default()`) must run before any other rsbinder API that touches the binder device.
+1. **"ProcessState is not initialized!"** — `rsbinder::serve(Uri::kernel())` / `rsbinder::connect(Uri::kernel().with_service(…))` (or the low-level `ProcessState::init_default()`) must run before any other rsbinder API that touches the binder device.
 2. **"environment variable OUT_DIR not defined"** — `build.rs` must be in the project root, next to `Cargo.toml`, not inside `src/`.
-3. **Client blocks without output** — `rsbinder::connect("binder://…")` waits until the service is registered; make sure the service is running.
+3. **Client blocks without output** — `rsbinder::connect` on a kernel `Uri` waits until the service is registered; make sure the service is running.
 4. **Permission errors** — the binder device node defaults to `0600`, root only. Give it a group with `rsb_device binder --group <group> --mode 0660` and make sure you are in that group.
 5. **Service manager not found** — check that `rsb_hub` is running, and that it did not exit at startup for want of a policy.
 

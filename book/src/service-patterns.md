@@ -4,9 +4,9 @@ How to structure a service, from a single method to a process hosting several.
 
 > This chapter uses the low-level lifecycle — `ProcessState`, the thread pool,
 > `hub::add_service` — because that is what the pieces actually are.
-> `rsbinder::serve("binder://")?.add(name, binder)?.run()?` performs exactly
+> `rsbinder::serve(Uri::kernel())?.add(name, binder)?.run()?` performs exactly
 > these steps and is the shorter way to write them; reach past it when you need
-> control a URI does not express. See
+> control a `Uri` does not express. See
 > [Cross-Transport Services](./cross-transport-services.md).
 
 ## Basic Service Structure
@@ -193,7 +193,7 @@ The `ping_binder()` method tests whether a service is reachable and responsive.
 It sends a lightweight ping transaction and returns `Ok(())` on success:
 
 ```rust
-let hello: Strong<dyn IHello> = rsbinder::connect("binder://my.hello")?;
+let hello: Strong<dyn IHello> = rsbinder::connect(Uri::kernel().with_service("my.hello"))?;
 assert_eq!(hello.as_binder().ping_binder(), Ok(()));
 ```
 

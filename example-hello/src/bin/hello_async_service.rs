@@ -46,7 +46,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // which a current-thread runtime could not survive.) The kernel grows the
     // pool from there as load arrives.
     println!("Serving {SERVICE_NAME} over kernel binder (async)...");
-    let _guard = rsbinder::serve("binder://")?
+    let _guard = rsbinder::serve(Uri::kernel())?
         .add(SERVICE_NAME, &service)?
         .spawn()?;
 

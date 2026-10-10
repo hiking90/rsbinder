@@ -87,13 +87,13 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let rt = TokioRuntime(tokio::runtime::Handle::current());
     let service = BnMyService::new_async_binder(MyAsyncService::default(), rt);
 
-    // `serve("binder://")` initializes the kernel `ProcessState`; `add`
+    // `serve(Uri::kernel())` initializes the kernel `ProcessState`; `add`
     // registers with the service manager. `spawn` starts the binder thread
     // pool and returns — unlike `run`, which joins it and never comes back.
-    // Swap the URI for `unix:///tmp/my.sock` to serve the same service over
-    // RPC; nothing else in this file changes, but rsbinder then needs
-    // `features = ["rpc"]`.
-    let _guard = rsbinder::serve("binder://")?
+    // Swap the `Uri` for `Endpoint::unix("/tmp/my.sock")` to serve the same
+    // service over RPC; nothing else in this file changes, but rsbinder then
+    // needs `features = ["rpc"]`.
+    let _guard = rsbinder::serve(Uri::kernel())?
         .add("com.example.myservice", &service)?
         .spawn()?;
 
@@ -142,7 +142,7 @@ let runtime = tokio::runtime::Builder::new_current_thread()
 runtime.block_on(async {
     let rt = TokioRuntime(tokio::runtime::Handle::current());
     let service = BnMyService::new_async_binder(MyAsyncService::default(), rt);
-    let _guard = rsbinder::serve("binder://")?.add("com.example.myservice", &service)?.spawn()?;
+    let _guard = rsbinder::serve(Uri::kernel())?.add("com.example.myservice", &service)?.spawn()?;
     std::future::pending::<()>().await;
     Ok(())
 })
@@ -264,7 +264,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let rt = TokioRuntime(runtime.handle().clone());
 
     println!("serving over RPC at /tmp/hello.sock");
-    rsbinder::serve("unix:///tmp/hello.sock")?
+    rsbinder::serve(Endpoint::unix("/tmp/hello.sock"))?
         .add("hello", BnHello::new_async_binder(IHelloService {}, rt))?
         .run()?; // blocks, driving this one socket
     Ok(())
@@ -284,7 +284,8 @@ The client side is the ordinary `connect` followed by `into_async` — or
 let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
 
 runtime.block_on(async {
-    let hello = rsbinder::connect_async::<dyn IHelloAsync<Tokio>>("unix:///tmp/hello.sock#hello").await?;
+    let uri = Endpoint::unix("/tmp/hello.sock").with_service("hello");
+    let hello = rsbinder::connect_async::<dyn IHelloAsync<Tokio>>(uri).await?;
     println!("{}", hello.echo("hi").await?);
     Ok::<_, Box<dyn std::error::Error>>(())
 })?;
@@ -298,14 +299,14 @@ runtime.block_on(async {
 
 ### Switching transports
 
-To run the exact same async service over **kernel binder** instead, swap only the URI —
+To run the exact same async service over **kernel binder** instead, swap only the `Uri` —
 the service `impl` is unchanged. Keep the multi-threaded runtime: `run()` parks the calling
 thread in the binder pool, which a current-thread runtime's owner cannot afford (see
 [Advanced: a current-thread runtime](#advanced-a-current-thread-runtime)) — use `spawn()`
 there.
 
 ```rust
-rsbinder::serve("binder://")?                      // instead of "unix:///tmp/hello.sock"
+rsbinder::serve(Uri::kernel())?                    // instead of Endpoint::unix("/tmp/hello.sock")
     .add("hello", BnHello::new_async_binder(IHelloService {}, rt))?  // the `rt` bound above
     .run()?;                                       // joins the process-wide binder pool
 ```
@@ -651,8 +652,8 @@ steps:
 
 Because async lives in the generated stubs, the same async service runs over **either
 transport** — `add` the `new_async_binder` result to `rsbinder::serve(uri)` and look it up
-with [`connect`](./cross-transport-services.md). Nothing in the recipe changes but the URI —
-a non-`binder://` URI additionally needs rsbinder's `rpc` feature, which is not on by default.
+with [`connect`](./cross-transport-services.md). Nothing in the recipe changes but the `Uri` —
+an RPC endpoint additionally needs rsbinder's `rpc` feature, which is not on by default.
 
 For complete working examples, see `tests/src/bin/test_service_async.rs` (kernel binder) and
 `tests/tests/rpc_async.rs` (RPC) in the rsbinder repository.

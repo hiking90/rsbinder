@@ -182,18 +182,20 @@ impl IFmqPeer for Peer {
 /// Publish a `Peer` as `name` on the kernel binder and serve it until the loop ends.
 pub fn serve(name: &str) -> Result<()> {
     let peer = BnFmqPeer::new_binder(Peer::default());
-    let server = rsbinder::serve("binder://")?.add(name, Interface::as_binder(&peer))?;
+    let _server = rsbinder::serve(Uri::kernel())?
+        .add(name, Interface::as_binder(&peer))?
+        .spawn()?;
     println!("SERVING {name}");
     use std::io::Write;
     std::io::stdout().flush().ok();
-    server.run()
+    ProcessState::join_thread_pool()
 }
 
 // ---- the driver -----------------------------------------------------------
 
 /// A proxy for the peer `name`; refused when the name resolves to this process's binder.
 pub fn connect(name: &str) -> Result<Strong<dyn IFmqPeer>> {
-    let binder = rsbinder::Client::open("binder://")
+    let binder = rsbinder::Client::open(Uri::kernel())
         .and_then(|_| hub::check_service(name).ok_or(StatusCode::NameNotFound))?;
     if binder.as_remote().is_none() {
         return Err(StatusCode::BadType);

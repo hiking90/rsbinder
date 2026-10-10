@@ -30,7 +30,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     eprintln!("STAGE3 4-5 server: init ProcessState");
-    let server = rsbinder::serve("binder://")?;
+    let server = rsbinder::serve(Uri::kernel())?;
 
     // Advertise SCHED_FIFO floor + inherit_rt so the driver lifts the
     // binder worker into RT for any incoming transaction. The

@@ -96,16 +96,18 @@ impl Remotable for Probe {
 
 fn serve(name: &str) -> Result<()> {
     let probe = Binder::new(Probe);
-    let server = rsbinder::serve("binder://")?.add(name, Interface::as_binder(&probe))?;
+    let _server = rsbinder::serve(Uri::kernel())?
+        .add(name, Interface::as_binder(&probe))?
+        .spawn()?;
     println!("SERVING {name}");
     std::io::stdout().flush().ok();
-    server.run()
+    ProcessState::join_thread_pool()
 }
 
 /// `Ok(false)` = the stream arrived, but not as asked for; the caller
 /// turns that into a non-zero exit, as the C++ half does.
 fn read(name: &str, len: usize) -> Result<bool> {
-    let binder = rsbinder::Client::open("binder://")
+    let binder = rsbinder::Client::open(Uri::kernel())
         .and_then(|_| hub::check_service(name).ok_or(StatusCode::NameNotFound))?;
     let remote = binder.as_remote().ok_or_else(|| {
         eprintln!("pipe_probe: {name} is local to this process, not a proxy");

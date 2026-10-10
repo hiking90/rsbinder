@@ -3,19 +3,20 @@
 
 //! A service handle that reconnects after its peer goes away (plan 10-10b).
 //!
-//! [`Reconnecting`] keeps a proxy to one service named by a URI — a kernel
-//! `binder://name`, or an RPC endpoint with `#name` (or none, for the root
-//! object of a server such as libbinder's `RpcServer::setRootObject`). When
+//! [`Reconnecting`] keeps a proxy to one service named by a [`Uri`] — a
+//! kernel endpoint with a service name, or an RPC endpoint with one (or none,
+//! for the root object of a server such as libbinder's
+//! `RpcServer::setRootObject`). When
 //! the service's process dies or the RPC session ends, it looks the service
 //! up again on a thread of its own, runs your [`on_connect`] hook (register
 //! callbacks there) and swaps the new proxy in. Calls go through
 //! [`with`](Reconnecting::with), which hands the current proxy to a closure.
 //!
 //! ```ignore
-//! use rsbinder::Reconnecting;
+//! use rsbinder::{Endpoint, Reconnecting};
 //!
 //! let listener = listener.clone();
-//! let hello = Reconnecting::<dyn IHello>::builder("unix:///run/hello.sock#hello")
+//! let hello = Reconnecting::<dyn IHello>::builder(Endpoint::unix("/run/hello.sock").with_service("hello"))
 //!     .on_connect(move |conn| {
 //!         // Every (re)connection, before the new proxy is handed out.
 //!         conn.proxy().register_listener(&listener)?;
@@ -29,7 +30,7 @@
 //!
 //! A failed call is never sent again: whether a call may run twice is the
 //! service's business, so `with` returns the closure's result as it is. The
-//! connection's shape (incoming connections, timeouts) is the URI's and the
+//! connection's shape (incoming connections, timeouts) is the [`Uri`]'s and the
 //! [`options`](ReconnectBuilder::options)' — the helper adds nothing. It does
 //! not register services: a service that outlives a restarted service manager
 //! must add itself again.
@@ -40,7 +41,7 @@
 //! |---|---|
 //! | kernel proxy | its death notification (`Client::open` starts the binder thread pool) |
 //! | RPC, session with incoming connections or a serve loop | its death notification, as the session ends |
-//! | RPC, otherwise (the default `unix://…#name`, an Android 16 accessor) | before each call, `RpcTransport::peer_closed` and `RpcSession::is_ended`; after a failed call, `is_ended` |
+//! | RPC, otherwise (the default, e.g. a Unix socket with a service name; an Android 16 accessor) | before each call, `RpcTransport::peer_closed` and `RpcSession::is_ended`; after a failed call, `is_ended` |
 //! | a local binder (the service lives in this process) | never: it cannot die on its own |
 //!
 //! A status code is never the signal: a call that ended a session can return
@@ -80,7 +81,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
-use crate::entry::uri::{self, Endpoint, Uri};
+use crate::entry::uri::{Endpoint, Uri};
 use crate::entry::{open_staged, Client, ClientOptions, OpenStage};
 use crate::hub::{WaitEnd, WaiterState};
 #[cfg(feature = "rpc")]
@@ -219,7 +220,7 @@ type OnConnectFn<T> =
 
 /// Configures a [`Reconnecting`]; from [`Reconnecting::builder`].
 pub struct ReconnectBuilder<T: FromIBinder + ?Sized> {
-    uri: String,
+    uri: Uri,
     options: Option<Box<OptionsFn>>,
     on_connect: Option<Box<OnConnectFn<T>>>,
     policy: ReconnectPolicy,
@@ -269,9 +270,10 @@ impl<T: FromIBinder + ?Sized + 'static> ReconnectBuilder<T> {
 
     /// Make one connection attempt without waiting, and return the helper.
     ///
-    /// `Err` only for what another attempt cannot change: a malformed URI,
-    /// options that do not apply to it, a missing feature, a kernel URI
-    /// without a service name, no binder device for a kernel URI
+    /// `Err` only for what another attempt cannot change: a [`Uri`] that
+    /// `serve` / `connect` would refuse, options that do not apply to it, a
+    /// missing feature, a kernel endpoint without a service name, no binder
+    /// device for a kernel endpoint
     /// ([`StatusCode::NoInit`]), a kernel service of another interface
     /// ([`StatusCode::BadType`]; a cast to another interface over RPC is
     /// reported by the first call), an RPC name lookup on a server without
@@ -290,21 +292,20 @@ impl<T: FromIBinder + ?Sized + 'static> ReconnectBuilder<T> {
     /// for its reply, so set [`ClientOptions::timeout`] through
     /// [`options`](Self::options) to bound it (and every later call).
     pub fn build(self) -> Result<Reconnecting<T>> {
-        let mut uri = uri::parse(&self.uri)?;
+        let mut uri = self.uri;
+        // Once here: `open_staged` would redo it on every attempt.
+        uri.validate()?;
         let lookup = match uri.service.take() {
             Some(name) => Lookup::Name(name),
-            None if matches!(uri.endpoint, Endpoint::Kernel { .. }) => {
-                log::error!(
-                    "Reconnecting: a kernel URI needs a service name ({:?})",
-                    self.uri
-                );
+            None if uri.endpoint.is_kernel() => {
+                log::error!("Reconnecting: a kernel endpoint needs a service name ({uri})");
                 return Err(StatusCode::BadValue);
             }
             #[cfg(feature = "rpc")]
             None => Lookup::Root,
             #[cfg(not(feature = "rpc"))]
             None => {
-                log::error!("Reconnecting: {:?} needs the `rpc` feature", self.uri);
+                log::error!("Reconnecting: {uri} needs the `rpc` feature");
                 return Err(StatusCode::InvalidOperation);
             }
         };
@@ -358,11 +359,12 @@ pub struct Reconnecting<T: FromIBinder + ?Sized + 'static> {
 }
 
 impl<T: FromIBinder + ?Sized + 'static> Reconnecting<T> {
-    /// Start configuring a helper for `uri`: `binder://name`, or an RPC URI
-    /// with `#name` (or without, for the server's root object).
-    pub fn builder(uri: &str) -> ReconnectBuilder<T> {
+    /// Start configuring a helper for `uri`: a kernel endpoint with a
+    /// service name, or an RPC endpoint with one (or without, for the
+    /// server's root object).
+    pub fn builder(uri: impl Into<Uri>) -> ReconnectBuilder<T> {
         ReconnectBuilder {
-            uri: uri.to_string(),
+            uri: uri.into(),
             options: None,
             on_connect: None,
             policy: ReconnectPolicy::default(),
@@ -1353,7 +1355,7 @@ mod tests {
         Reconnecting {
             shared: Arc::new(Shared {
                 cfg: Config {
-                    uri: uri::parse(&format!("binder://{name}")).expect("a kernel URI"),
+                    uri: Uri::kernel().with_service(name),
                     lookup: Lookup::Name(name.into()),
                     options: None,
                     on_connect: None,

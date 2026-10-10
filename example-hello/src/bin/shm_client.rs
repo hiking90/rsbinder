@@ -55,9 +55,9 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
     let uri = match std::env::args().nth(1).as_deref() {
-        Some("kernel") => "binder://".to_string(),
-        Some("rpc") => format!("unix://{RPC_SOCKET}"),
-        Some(uri) => uri.to_string(),
+        Some("kernel") => Uri::kernel(),
+        Some("rpc") => Uri::new(Endpoint::unix(RPC_SOCKET)),
+        Some(uri) => uri.parse::<Uri>()?,
         None => {
             eprintln!("usage: shm_client <kernel|rpc|URI>   (rpc needs --features rpc)");
             std::process::exit(2);
@@ -66,9 +66,9 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Shared memory travels as an fd. A Unix-socket RPC session must opt
     // into fd passing (SCM_RIGHTS) before the first lookup — without it the
     // service's `getRegion()` reply is rejected with FdsNotAllowed. Every other
-    // endpoint rejects the option, so ask the parsed endpoint rather than
-    // the URI string.
-    let client = rsbinder::Client::open_with(&uri, |_o, _endpoint| {
+    // endpoint rejects the option, so set it only where the endpoint
+    // supports fd passing.
+    let client = rsbinder::Client::open_with(uri, |_o, _endpoint| {
         #[cfg(feature = "rpc")]
         if _endpoint.supports_fd_passing() {
             _o.fd_mode = Some(rsbinder::rpc::FileDescriptorTransportMode::Unix);

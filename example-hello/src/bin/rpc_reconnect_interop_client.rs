@@ -23,7 +23,8 @@
 use std::time::{Duration, Instant};
 
 use example_hello::IHello;
-use rsbinder::Reconnecting;
+use rsbinder::entry::{WireProfile, WireVersion};
+use rsbinder::{Endpoint, Reconnecting, Uri};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -42,8 +43,9 @@ fn main() {
         other => panic!("unknown mode {other}"),
     };
 
-    let uri = format!("unix://{sock}?profile=android13plus");
-    let h = Reconnecting::<dyn IHello>::builder(&uri)
+    let uri =
+        Uri::new(Endpoint::unix(sock)).with_wire(WireProfile::Android13Plus(WireVersion::MAX));
+    let h = Reconnecting::<dyn IHello>::builder(uri)
         .options(move |o, _| {
             o.incoming_connections = incoming;
             o.timeout = Some(Duration::from_secs(5));

@@ -32,7 +32,7 @@
 
 use env_logger::Env;
 use example_hello::*;
-use rsbinder::Strong;
+use rsbinder::{Strong, Uri};
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
@@ -49,6 +49,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         );
         std::process::exit(2);
     };
+    let upstream_uri: Uri = upstream_uri.parse()?;
+    let listen_uri: Uri = listen_uri.parse()?;
 
     // The upstream service, reached however its URI says.
     let upstream: Strong<dyn IHello> = rsbinder::connect(&upstream_uri)?;
@@ -61,7 +63,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Handing the proxy over directly — `.add(SERVICE_NAME,
     // upstream.as_binder())` — is refused with `InvalidOperation`: a
     // binder of one stack cannot be published on the other.
-    rsbinder::serve(&listen_uri)?
+    rsbinder::serve(listen_uri)?
         .add(SERVICE_NAME, BnHello::new_binder(upstream))?
         .run()?;
 
