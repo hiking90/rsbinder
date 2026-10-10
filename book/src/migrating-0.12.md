@@ -369,7 +369,8 @@ a reference such as "(CHANGELOG *Fixed*)" points to the 0.12.0 section there.
   `RpcTransport::set_write_timeout` (without it a stalled send has no bound),
   the kernel's keepalive check on TCP and TLS over TCP
   (`RpcTransport::set_liveness` has the values and platform differences), and
-  on a client each connect and handshake step. A send deadline that expires
+  on a client each connect and handshake step (`connect(2)` itself for
+  `tcp_debug` and `tls` only, not for `unix` or `vsock`). A send deadline that expires
   part-way through a frame returns `TimedOut` (0.11.0: `WouldBlock`, which
   means nothing was sent).
 - **`RpcServer::set_handshake_timeout` bounds the whole admission phase, not
@@ -389,7 +390,11 @@ a reference such as "(CHANGELOG *Fixed*)" points to the 0.12.0 section there.
   handshake step as a whole in the same way: in 0.11.0 `handshake_timeout`
   bounded each read, and now a step that outlasts it fails the setup call
   with `TimedOut`. `RpcSession::from_preconnected_fd` bounds its handshake
-  by a fixed 10 s the same way, where 0.11.0 bounded each read by it.
+  by a fixed 10 s the same way, where 0.11.0 bounded each read by it. No API
+  changes that 10 s: for a peer that needs longer for the whole handshake
+  `from_preconnected_fd` returns `TimedOut`, and a service-manager lookup
+  that resolves through such an Accessor finds no service (the reason is
+  logged).
 - **An expired TLS handshake is `RpcError::Timeout`, not `Io(WouldBlock)`**:
   `TlsTransport::connect`, `accept`, `connect_stream` and `accept_stream`
   return `RpcError::Timeout` (`StatusCode::TimedOut`) when the stream's
@@ -405,7 +410,8 @@ a reference such as "(CHANGELOG *Fixed*)" points to the 0.12.0 section there.
   the 0.11.0 rule: a send's progress is a send that accepted bytes, and a read
   deadline counts only the peer's bytes. So does a socket that refuses
   `SIOCOUTQ` (Android SELinux grants `ioctl` on another domain's socket only
-  where policy says so); it is asked once, not on every wait.
+  where policy says so, and a kernel whose vsock does not report its queue
+  refuses it on a vsock socket); it is asked once, not on every wait.
 - **TCP connections, TLS over TCP included, have keepalive on by default**, at
   the system's intervals without a session timeout (hours), so a session
   whose peer host vanished ends and fires its death recipients. No wire byte

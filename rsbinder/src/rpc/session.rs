@@ -1468,11 +1468,18 @@ impl<'a> HandshakeDeadline<'a> {
                 std::io::ErrorKind::InvalidInput,
             )));
         }
-        let armed = deadline.is_some();
-        if armed {
-            transport.set_read_timeout(deadline)?;
-            transport.set_write_timeout(deadline)?;
-        }
+        let armed = match deadline {
+            Some(_) => match transport
+                .set_read_timeout(deadline)
+                .and_then(|()| transport.set_write_timeout(deadline))
+            {
+                Ok(()) => true,
+                // As `push_read_deadline`: XNU refuses it on a shut socket, whose reads end at EOF.
+                Err(_) if transport.peer_closed() == Some(true) => false,
+                Err(e) => return Err(e),
+            },
+            None => false,
+        };
         let whole = PhaseDeadline::arm_with(deadline, || transport.shutdown_handle());
         Ok(Self {
             transport,
@@ -1615,14 +1622,15 @@ fn client_handshake_err(e: RpcError) -> StatusCode {
                  (`RpcServer::set_android13plus`)"
         ),
         RpcError::Timeout | RpcError::DeadlineMidFrame => log::error!(
-            "rsbinder RPC: the android-13+ handshake stalled and a read deadline armed on \
-                 this connection elapsed — that deadline is the caller's own \
-                 (`RpcClientConfig::timeout` / `ClientOptions::timeout` or their deprecated \
-                 `handshake_timeout`, \
-                 the 10s `RpcSession::from_preconnected_fd` arms, or one set on the transport \
-                 directly), so it may simply be shorter than this peer's legitimate response \
-                 time. A peer that should have answered well within it may be speaking the \
-                 r34 (default) profile instead"
+            "rsbinder RPC: the android-13+ handshake did not complete within a deadline \
+                 armed on this connection — that deadline is the caller's own (the \
+                 whole-step bound of `RpcClientConfig::timeout` / `ClientOptions::timeout` \
+                 or their deprecated `handshake_timeout`, the 10s whole-handshake bound \
+                 `RpcSession::from_preconnected_fd` arms, or a read deadline set on the \
+                 transport directly), so it may simply be shorter than this peer's \
+                 legitimate response time, a peer answering a byte at a time included. A \
+                 peer that should have answered well within it may be speaking the r34 \
+                 (default) profile instead"
         ),
         // The returned status drops the reason string; this log is the only description.
         RpcError::Protocol(_) => log::error!(
@@ -4538,7 +4546,7 @@ impl RpcSession {
         Self::connect_android13plus_fd_hs(transport, max_version, fd_mode, None)
     }
 
-    /// `connect_android13plus_fd` with a handshake-read deadline; `None` blocks forever.
+    /// `connect_android13plus_fd` with a whole-handshake deadline (`HandshakeDeadline`).
     pub(crate) fn connect_android13plus_fd_hs(
         transport: Box<dyn RpcTransport>,
         max_version: u32,
@@ -6450,6 +6458,43 @@ mod tests {
         // The two shapes that are deadlines still arm.
         assert!(HandshakeDeadline::arm(&a, None).is_ok());
         assert!(HandshakeDeadline::arm(&a, Some(Duration::from_millis(50))).is_ok());
+    }
+
+    /// A transport that refuses socket deadlines, as XNU does once both directions are shut.
+    struct RefusesDeadlines {
+        closed: bool,
+    }
+
+    impl RpcTransport for RefusesDeadlines {
+        fn send_frame(&self, _buf: &[u8]) -> RpcResult<()> {
+            Err(RpcError::EndOfStream)
+        }
+        fn recv_frame(&self) -> RpcResult<Vec<u8>> {
+            Err(RpcError::EndOfStream)
+        }
+        fn peer_identity(&self) -> super::super::transport::PeerIdentity {
+            super::super::transport::PeerIdentity::Anonymous
+        }
+        fn describe(&self) -> &str {
+            "refuses-deadlines"
+        }
+        fn shutdown(&self) -> RpcResult<()> {
+            Ok(())
+        }
+        fn set_read_timeout(&self, _timeout: Option<Duration>) -> RpcResult<()> {
+            Err(RpcError::Io(std::io::ErrorKind::InvalidInput.into()))
+        }
+        fn peer_closed(&self) -> Option<bool> {
+            Some(self.closed)
+        }
+    }
+
+    /// A deadline refused on a closed peer is skipped, as `push_read_deadline` skips it.
+    #[test]
+    fn a_handshake_deadline_refused_on_a_closed_peer_is_skipped() {
+        let d = Some(Duration::from_secs(1));
+        assert!(HandshakeDeadline::arm(&RefusesDeadlines { closed: true }, d).is_ok());
+        assert!(HandshakeDeadline::arm(&RefusesDeadlines { closed: false }, d).is_err());
     }
 
     /// A connect's own deadline is `TimedOut` though std's error for it carries no errno.

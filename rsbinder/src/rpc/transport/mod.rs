@@ -357,7 +357,10 @@ pub trait RpcTransport: Send + Sync {
     /// therefore cuts the connection from a thread of its own once it passes
     /// ([`RpcServer::set_handshake_timeout`](super::server::RpcServer::set_handshake_timeout),
     /// [`RpcClientConfig::timeout`](super::RpcClientConfig::timeout)). A
-    /// transport that returns `None` has its handshake bounded per read only.
+    /// transport that returns `None` has its handshake bounded per wait only,
+    /// by the [`set_read_timeout`](Self::set_read_timeout) and
+    /// [`set_write_timeout`](Self::set_write_timeout) it implements; one that
+    /// implements neither has no handshake bound at all.
     ///
     /// The bundled socket transports return a function that shuts down a
     /// duplicate of their socket: `shutdown(2)` acts on the socket, whichever
@@ -837,7 +840,7 @@ pub(crate) fn socket_shutdown_handle(
         Err(e) => {
             log::warn!(
                 "rsbinder RPC: cannot duplicate a socket for its deadline ({e}); this phase is \
-                 bounded per read only"
+                 bounded per wait only"
             );
             return None;
         }

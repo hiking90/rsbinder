@@ -116,13 +116,14 @@ change bytes between peers: upgrade both ends together.
   refused with `BadType`.
 - A session ends as a whole when any of its connections fails.
 - An expired reply deadline ends the session.
-- The session timeout also bounds sends, connect and handshake steps, and TCP
-  liveness.
+- The session timeout also bounds sends, connect and handshake steps (a
+  `unix` or `vsock` `connect(2)` excepted), and TCP liveness.
 - `RpcServer::set_handshake_timeout` bounds the whole admission phase (on r34,
   through a new session's first transaction; a joining connection's ends with
-  its session-id preamble), and a client's handshake deadline (`timeout`, the
+  its session-id preamble), a client's handshake deadline (`timeout`, the
   deprecated `handshake_timeout`) each TLS or android-13+ handshake step as a
-  whole, not each read.
+  whole, not each read, and `RpcSession::from_preconnected_fd` its handshake
+  by a fixed 10 s as a whole.
 - An expired TLS handshake is `RpcError::Timeout`, not `Io(WouldBlock)`.
 - On Linux and Android a send or read deadline counts the peer taking this
   end's bytes as progress; Apple keeps the 0.11.0 rule.
@@ -217,7 +218,8 @@ change bytes between peers: upgrade both ends together.
   also on `TlsStream`).
 - **`RpcTransport::shutdown_handle`**: cuts a connection from another thread,
   for the whole-handshake deadline; a transport of your own that returns
-  `None` (the default) has its handshake bounded per read only.
+  `None` (the default) has its handshake bounded per wait only, by the
+  `set_read_timeout` and `set_write_timeout` it implements (neither: no bound).
 - **`rpc::transport::MemTransport` carries a raw byte stream**, so an
   android-13+ session runs over `mem` in hermetic tests.
 - **Work source API** (`set_calling_work_source_uid` and friends), carried on
@@ -392,7 +394,8 @@ RPC:
   still being delivered. On Linux and Android both now count the peer taking
   this end's bytes (`SIOCOUTQ`) as progress; on Apple neither changes, nor on
   a socket that refuses `SIOCOUTQ` (Android SELinux on another domain's
-  socket), which is asked once. See
+  socket, a vsock socket on a kernel whose vsock does not report its queue),
+  which is asked once. See
   the `transport` module doc "A slow peer".
 - **An android-13+ server refuses a session id that is not 32 bytes before
   reading it**, as AOSP `RpcServer::establishConnection` does; it read up to

@@ -108,7 +108,7 @@ impl PhaseDeadline {
             Err(e) => {
                 log::warn!(
                     "rsbinder RPC: cannot start a deadline thread ({e}); this phase is bounded \
-                     per read only"
+                     per wait only"
                 );
                 Self::none()
             }
@@ -227,13 +227,20 @@ mod tests {
 
     #[test]
     fn stopping_disarms_and_keeps_what_was_left() {
-        let (cuts, cut) = counting();
-        let mut d = PhaseDeadline::arm(Duration::from_millis(300), cut);
-        let left = d.stop().expect("stopped in time").expect("armed");
+        let (_, cut) = counting();
+        let mut long = PhaseDeadline::arm(Duration::from_secs(10), cut);
+        // Time spent armed, so a `stop` that returns the full period fails the bound below.
+        std::thread::sleep(Duration::from_millis(100));
+        let left = long.stop().expect("stopped in time").expect("armed");
         assert!(
-            left > Duration::ZERO && left <= Duration::from_millis(300),
+            left > Duration::ZERO && left <= Duration::from_millis(9_900),
             "{left:?}"
         );
+
+        let (cuts, cut) = counting();
+        // Inside the sleep below, so a `stop` that leaves the cut armed fails the test.
+        let mut d = PhaseDeadline::arm(Duration::from_millis(300), cut);
+        assert!(d.stop().is_some());
         std::thread::sleep(Duration::from_millis(600));
         assert_eq!(cuts.load(Ordering::SeqCst), 0);
 
