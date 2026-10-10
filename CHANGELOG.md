@@ -419,6 +419,14 @@ RPC:
   `timeout` for each TLS or android-13+ handshake step, and
   `RpcSession::from_preconnected_fd`'s 10 s for its handshake. An expired TLS
   handshake reports `TimedOut`, not `WouldBlock`.
+- **A `tls` client's connect deadline bounds every resolved address
+  together.** `RpcClientConfig::timeout` and `ClientOptions::timeout` gave
+  each address the host name resolved to the full deadline, so a host with
+  `N` silent addresses held the setup call for `N` times it. Each try now
+  gets an even share of the time left; an address refused at once leaves
+  its share to the next. `RpcSession::setup_tcp_client_tls` and
+  `setup_tcp_client_tls_android13plus` take no deadline, and their docs now
+  say so and name the bounded form.
 - **On the android-13+ wire a null binder interoperates with libbinder**: it
   carries the stability `int32` AOSP writes (see *Migrating*).
 - **On the r34 wire an android-12 peer's binder is no longer refused one time
