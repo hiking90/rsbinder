@@ -857,7 +857,7 @@ fn stalled_reader_is_cut(link: Link) {
     assert!(session.is_ended(), "a failed send ends the session");
 }
 
-/// A reply wait ends near `d` if the peer takes none of the request: unmoved bytes are no progress.
+/// A reply wait ends near `d` if the peer takes none of the request; Unix checks unmoved bytes.
 fn reply_wait_on_a_stalled_reader_ends(link: Link) {
     let spec = ServerSpec::a13();
     let server = match link {
@@ -875,7 +875,7 @@ fn reply_wait_on_a_stalled_reader_ends(link: Link) {
         "a healthy session answers"
     );
     hold.store(true, Ordering::SeqCst);
-    // The first frame wakes the relay into its hold; the second stays queued here.
+    // The first frame wakes the relay into its hold; on Unix the second stays queued here.
     let _ = echo(&root, &[2; 16], FLAG_ONEWAY);
     thread::sleep(Duration::from_millis(100));
     let t0 = Instant::now();

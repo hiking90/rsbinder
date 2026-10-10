@@ -426,7 +426,9 @@ RPC:
 - **A client that only sends oneways no longer deadlocks with its server**: a
   send drains `DEC_STRONG`s while it waits. A custom `RpcTransport` drains by
   implementing `send_raw_draining`, a custom `TlsStream` by returning its
-  `socket`.
+  `socket`, whose `SO_SNDTIMEO` then carries the send deadline: on Linux and
+  Android every send on such a stream waits on that socket
+  (`TlsStream::socket`).
 - **An RPC parcel dropped unsent releases its local binders' reservations**;
   writing a local binder into an ended session's parcel is `DeadObject`.
 - **A `ParcelableHolder` read from an RPC transaction decodes the binders and

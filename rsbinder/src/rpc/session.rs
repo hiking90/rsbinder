@@ -4610,9 +4610,11 @@ impl RpcSession {
     /// [`RpcSession::accept_android13plus`].
     ///
     /// This is a thin wrapper over `android13plus_accept_handshake` then
-    /// `from_android13plus`, which always builds a fresh session (the
-    /// client-supplied id is ignored). The id-demux (new vs. attach) lives
-    /// in [`super::RpcServer::serve_connection`].
+    /// `from_android13plus`, which always builds a fresh session: a 32-byte
+    /// client id is ignored, and an id of any other non-empty size is
+    /// refused before it is read, as AOSP `RpcServer::establishConnection`
+    /// does. The id-demux (new vs. attach) lives in
+    /// [`super::RpcServer::serve_connection`].
     pub fn accept_android13plus_fd(
         transport: Box<dyn RpcTransport>,
         server_max_version: u32,
