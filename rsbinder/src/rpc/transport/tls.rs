@@ -115,7 +115,7 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConnection, Connection, ServerConnection};
 use sha2::{Digest, Sha256};
 
-use super::{read_frame, write_frame, CertId, PeerIdentity, ReadDeadline, RpcTransport};
+use super::{read_frame, write_frame, CertId, OutQueue, PeerIdentity, ReadDeadline, RpcTransport};
 use crate::rpc::{RpcError, RpcResult};
 
 /// Ciphertext read chunk: one TLS record is ≤ 16 KiB, so a read takes about one record.
@@ -382,6 +382,7 @@ pub struct TlsTransport {
     /// Ciphertext read off the socket but not yet fed to rustls; reader-only.
     pending_in: Mutex<Vec<u8>>,
     reads: ReadDeadline,
+    queue: OutQueue,
 }
 
 /// Leaf-cert SHA-256 as [`CertId`]; `subject` is only a label (no X.509 parse), the hash decides.
@@ -446,6 +447,7 @@ impl TlsTransport {
             shut: std::sync::atomic::AtomicBool::new(false),
             pending_in: Mutex::new(Vec::new()),
             reads: ReadDeadline::default(),
+            queue: OutQueue::default(),
         })
     }
 
@@ -480,6 +482,7 @@ impl TlsTransport {
             shut: std::sync::atomic::AtomicBool::new(false),
             pending_in: Mutex::new(Vec::new()),
             reads: ReadDeadline::default(),
+            queue: OutQueue::default(),
         })
     }
 
@@ -576,7 +579,7 @@ impl TlsTransport {
         mut drain: Option<&mut dyn FnMut() -> RpcResult<()>>,
     ) -> RpcResult<()> {
         let reads = drain.is_some();
-        let mut waiting = super::unix::SendWait::new(sock);
+        let mut waiting = super::unix::SendWait::new(sock, &self.queue);
         let mut off = 0;
         while off < cipher.len() {
             let rest = &cipher[off..];
@@ -682,16 +685,18 @@ impl TlsTransport {
             return Ok(true);
         }
         let mut tmp = [0u8; TLS_READ_CHUNK];
-        let k = self.reads.read(self.stream.socket(), || loop {
-            match self.stream.read(&mut tmp) {
-                Ok(k) => return Ok(k),
-                // EINTR: retry the interrupted blocking read.
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                // Deadline → `Timeout`, as plain sockets (android-13+ `DeadlineMidFrame` split).
-                Err(e) if super::is_timeout(&e) => return Err(RpcError::Timeout),
-                Err(e) => return Err(e.into()),
-            }
-        })?;
+        let k = self
+            .reads
+            .read(self.stream.socket(), &self.queue, || loop {
+                match self.stream.read(&mut tmp) {
+                    Ok(k) => return Ok(k),
+                    // EINTR: retry the interrupted blocking read.
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    // Deadline → `Timeout`, as plain sockets (the `DeadlineMidFrame` split).
+                    Err(e) if super::is_timeout(&e) => return Err(RpcError::Timeout),
+                    Err(e) => return Err(e.into()),
+                }
+            })?;
         let mut c = self.conn.lock().expect("tls conn poisoned");
         if k == 0 {
             let mut eof: &[u8] = &[];

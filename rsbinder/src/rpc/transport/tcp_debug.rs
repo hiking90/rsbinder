@@ -26,7 +26,7 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::unix::{send_frame_vectored, send_waiting};
-use super::{read_frame, PeerIdentity, ReadDeadline, RpcTransport};
+use super::{read_frame, OutQueue, PeerIdentity, ReadDeadline, RpcTransport};
 use crate::rpc::RpcResult;
 
 /// Set on the first `TcpDebugTransport` construction; gates the one-time warning, read by tests.
@@ -53,6 +53,7 @@ pub struct TcpDebugTransport {
     stream: TcpStream,
     desc: String,
     reads: ReadDeadline,
+    queue: OutQueue,
 }
 
 impl TcpDebugTransport {
@@ -75,6 +76,7 @@ impl TcpDebugTransport {
             stream,
             desc,
             reads: ReadDeadline::default(),
+            queue: OutQueue::default(),
         })
     }
 
@@ -151,6 +153,7 @@ impl RpcTransport for TcpDebugTransport {
         }
         send_waiting(
             self.stream.as_fd(),
+            &self.queue,
             &mut [std::io::IoSlice::new(buf)],
             &[],
             Some(drain),
@@ -171,7 +174,7 @@ impl RpcTransport for TcpDebugTransport {
     fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
         if super::unix::WAITING_SENDS {
             let slices = &mut [std::io::IoSlice::new(buf)];
-            return send_waiting(self.stream.as_fd(), slices, &[], None);
+            return send_waiting(self.stream.as_fd(), &self.queue, slices, &[], None);
         }
         super::write_raw(&mut &self.stream, buf)
     }
@@ -179,8 +182,9 @@ impl RpcTransport for TcpDebugTransport {
     /// Raw, unframed read: `read_raw`, shared by the stream backends.
     fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize> {
         let sock = Some(self.stream.as_fd());
-        self.reads
-            .read(sock, || super::read_raw(&mut &self.stream, buf))
+        self.reads.read(sock, &self.queue, || {
+            super::read_raw(&mut &self.stream, buf)
+        })
     }
 
     /// **Always** [`PeerIdentity::Anonymous`]. There is deliberately no

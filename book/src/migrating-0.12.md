@@ -401,7 +401,9 @@ a reference such as "(CHANGELOG *Fixed*)" points to the 0.12.0 section there.
   while the tail of a reply whose send returned is still on its way, and a
   reply wait goes on while the peer is still taking the request. Apple keeps
   the 0.11.0 rule: a send's progress is a send that accepted bytes, and a read
-  deadline counts only the peer's bytes.
+  deadline counts only the peer's bytes. So does a socket that refuses
+  `SIOCOUTQ` (Android SELinux grants `ioctl` on another domain's socket only
+  where policy says so); it is asked once, not on every wait.
 - **TCP connections, TLS over TCP included, have keepalive on by default**, at
   the system's intervals without a session timeout (hours), so a session
   whose peer host vanished ends and fires its death recipients. No wire byte

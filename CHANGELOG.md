@@ -390,7 +390,9 @@ RPC:
   a 2 MiB call with `set_timeout(1 s)` ended the session after 2.5 s, and a
   server with `set_idle_timeout(1 s)` ended one while its large reply was
   still being delivered. On Linux and Android both now count the peer taking
-  this end's bytes (`SIOCOUTQ`) as progress; on Apple neither changes. See
+  this end's bytes (`SIOCOUTQ`) as progress; on Apple neither changes, nor on
+  a socket that refuses `SIOCOUTQ` (Android SELinux on another domain's
+  socket), which is asked once. See
   the `transport` module doc "A slow peer".
 - **An android-13+ server refuses a session id that is not 32 bytes before
   reading it**, as AOSP `RpcServer::establishConnection` does; it read up to

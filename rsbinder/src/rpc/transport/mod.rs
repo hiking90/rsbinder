@@ -104,6 +104,14 @@
 //!   read under `SO_RCVTIMEO`. While a read deadline is armed, each read
 //!   costs one `ioctl` to tell the two apart.
 //!
+//! The `ioctl` runs only while a deadline is armed: a send or read without
+//! one has no verdict for it to change. A socket that refuses it once
+//! (`OutQueue`) is not asked again: Android SELinux grants `ioctl` on a
+//! socket of another domain only where policy says so (an Accessor's
+//! preconnected fd is one), each refusal is an audit record, and a kernel
+//! whose vsock does not report its queue answers `EOPNOTSUPP` every time.
+//! Such a socket counts progress as Apple does.
+//!
 //! Apple has no `SIOCOUTQ`. There a send's progress is a send that accepted
 //! bytes, a send without a drain blocks in `send(2)` under `SO_SNDTIMEO`, and
 //! a read deadline counts only the peer's bytes; so does a `tls` stream with
@@ -770,9 +778,9 @@ pub(crate) fn read_raw<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<usize> {
     }
 }
 
-/// Bytes `sock` holds that its peer has not taken yet (`SIOCOUTQ`); `None` where unsupported.
+/// Bytes `sock` holds that its peer has not taken yet (`SIOCOUTQ`).
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub(crate) fn queued_bytes(sock: std::os::fd::BorrowedFd<'_>) -> Option<u32> {
+fn queued_bytes(sock: std::os::fd::BorrowedFd<'_>) -> rustix::io::Result<u32> {
     use rustix::ioctl::{ioctl, Getter, Opcode};
     // SAFETY: `SIOCOUTQ` (`TIOCOUTQ` on a socket) writes one `c_int`; `sock` is a live fd.
     let n = unsafe {
@@ -780,14 +788,44 @@ pub(crate) fn queued_bytes(sock: std::os::fd::BorrowedFd<'_>) -> Option<u32> {
             sock,
             Getter::<{ libc::TIOCOUTQ as Opcode }, libc::c_int>::new(),
         )
-    };
-    n.ok().and_then(|n| u32::try_from(n).ok())
+    }?;
+    u32::try_from(n).map_err(|_| rustix::io::Errno::INVAL)
 }
 
 /// Apple has no `SIOCOUTQ`: only the bytes a send accepts count as the peer's progress.
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-pub(crate) fn queued_bytes(_sock: std::os::fd::BorrowedFd<'_>) -> Option<u32> {
-    None
+fn queued_bytes(_sock: std::os::fd::BorrowedFd<'_>) -> rustix::io::Result<u32> {
+    Err(rustix::io::Errno::NOSYS)
+}
+
+/// One socket's `SIOCOUTQ`, asked until the socket refuses it once ("A slow peer").
+#[derive(Debug, Default)]
+pub(crate) struct OutQueue {
+    refused: std::sync::atomic::AtomicBool,
+}
+
+impl OutQueue {
+    /// Bytes `sock` holds that its peer has not taken yet; `None` once `sock` refused to say.
+    pub(crate) fn bytes(&self, sock: std::os::fd::BorrowedFd<'_>) -> Option<u32> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.refused.load(Relaxed) {
+            return None;
+        }
+        match queued_bytes(sock) {
+            Ok(n) => Some(n),
+            Err(e) => {
+                // The socket's label or family decides the answer, so it would not change.
+                let first = !self.refused.swap(true, Relaxed);
+                if first && cfg!(any(target_os = "linux", target_os = "android")) {
+                    log::debug!(
+                        "rsbinder RPC: SIOCOUTQ refused ({e}); this socket's deadlines count \
+                         only the bytes a send accepts"
+                    );
+                }
+                None
+            }
+        }
+    }
 }
 
 /// `RpcTransport::shutdown_handle` of a socket transport: shut a duplicate of `sock` down.
@@ -810,7 +848,7 @@ pub(crate) fn socket_shutdown_handle(
     }))
 }
 
-/// How often a wait looks at [`queued_bytes`]: `d / 8` held to 10..=250 ms ("A slow peer").
+/// How often a wait looks at [`OutQueue`]: `d / 8` held to 10..=250 ms ("A slow peer").
 pub(crate) fn look_every(d: std::time::Duration) -> std::time::Duration {
     const MIN: std::time::Duration = std::time::Duration::from_millis(10);
     const MAX: std::time::Duration = std::time::Duration::from_millis(250);
@@ -836,6 +874,7 @@ impl ReadDeadline {
     pub(crate) fn read<T>(
         &self,
         sock: Option<std::os::fd::BorrowedFd<'_>>,
+        queue: &OutQueue,
         read: impl FnOnce() -> RpcResult<T>,
     ) -> RpcResult<T> {
         use rustix::event::{poll, PollFd, PollFlags, Timespec};
@@ -844,7 +883,7 @@ impl ReadDeadline {
         let (Some(sock), true) = (sock, ns != 0) else {
             return read();
         };
-        let Some(mut queued) = queued_bytes(sock).filter(|q| *q > 0) else {
+        let Some(mut queued) = queue.bytes(sock).filter(|q| *q > 0) else {
             return read();
         };
         let limit = std::time::Duration::from_nanos(ns);
@@ -870,7 +909,7 @@ impl ReadDeadline {
                 Ok(n) if n > 0 => return read(),
                 Ok(_) => {
                     if queued > 0 {
-                        let now = queued_bytes(sock).unwrap_or(queued);
+                        let now = queue.bytes(sock).unwrap_or(queued);
                         if now < queued {
                             since = std::time::Instant::now();
                         }
@@ -1311,5 +1350,26 @@ mod tests {
             format!("{anon}").contains("NO peer identity"),
             "Anonymous Display must make the missing-identity state loud"
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_socket_that_refuses_siocoutq_is_not_asked_again() {
+        use std::io::Write;
+        use std::os::fd::AsFd;
+
+        let (mut ours, _theirs) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        ours.write_all(b"unread").expect("write");
+        let answers = OutQueue::default().bytes(ours.as_fd());
+        assert!(
+            answers.is_some_and(|n| n > 0),
+            "SIOCOUTQ on a socket: {answers:?}"
+        );
+
+        // `/dev/null` answers `ENOTTY`, as a socket SELinux refuses answers `EACCES`.
+        let refuses = std::fs::File::open("/dev/null").expect("/dev/null");
+        let queue = OutQueue::default();
+        assert_eq!(queue.bytes(refuses.as_fd()), None);
+        assert_eq!(queue.bytes(ours.as_fd()), None, "a refusal was asked again");
     }
 }

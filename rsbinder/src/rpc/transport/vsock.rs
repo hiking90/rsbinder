@@ -22,7 +22,7 @@ use std::os::fd::OwnedFd;
 
 use vsock::{VsockAddr, VsockStream};
 
-use super::{read_frame, write_frame, PeerIdentity, ReadDeadline, RpcTransport};
+use super::{read_frame, write_frame, OutQueue, PeerIdentity, ReadDeadline, RpcTransport};
 use crate::rpc::RpcResult;
 
 /// A framed transport over a connected vsock stream (Linux).
@@ -37,6 +37,7 @@ pub struct VsockTransport {
     peer: PeerIdentity,
     desc: String,
     reads: ReadDeadline,
+    queue: OutQueue,
 }
 
 impl VsockTransport {
@@ -77,6 +78,7 @@ impl VsockTransport {
             peer,
             desc,
             reads: ReadDeadline::default(),
+            queue: OutQueue::default(),
         })
     }
 }
@@ -102,15 +104,16 @@ impl RpcTransport for VsockTransport {
         use std::os::fd::AsFd;
         // vsock is Linux and Android only, where every send waits in `poll`.
         let slices = &mut [std::io::IoSlice::new(buf)];
-        super::unix::send_waiting(self.stream.as_fd(), slices, &[], None)
+        super::unix::send_waiting(self.stream.as_fd(), &self.queue, slices, &[], None)
     }
 
     /// Raw, unframed read: `read_raw`, as `UnixTransport::recv_raw`.
     fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize> {
         use std::os::fd::AsFd;
         let sock = Some(self.stream.as_fd());
-        self.reads
-            .read(sock, || super::read_raw(&mut &self.stream, buf))
+        self.reads.read(sock, &self.queue, || {
+            super::read_raw(&mut &self.stream, buf)
+        })
     }
 
     // No fd passing: `fds` reaches only the trait's refusing default.
@@ -126,6 +129,7 @@ impl RpcTransport for VsockTransport {
         }
         super::unix::send_waiting(
             self.stream.as_fd(),
+            &self.queue,
             &mut [std::io::IoSlice::new(buf)],
             &[],
             Some(drain),

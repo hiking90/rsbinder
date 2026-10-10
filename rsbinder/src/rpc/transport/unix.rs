@@ -99,7 +99,7 @@ use std::os::unix::net::SocketAddr as UnixSocketAddr;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-use super::{queued_bytes, read_frame, PeerIdentity, ReadDeadline, RpcTransport, MAX_FRAME_LEN};
+use super::{read_frame, OutQueue, PeerIdentity, ReadDeadline, RpcTransport, MAX_FRAME_LEN};
 use crate::rpc::{RpcError, RpcResult};
 
 /// Per-message fd cap (DoS bound, < `SCM_MAX_FD` 253); `wire_android13` applies it across recvmsgs.
@@ -211,6 +211,7 @@ pub(crate) const WAITING_SENDS: bool = cfg!(any(target_os = "linux", target_os =
 /// A stream-socket send waiting in `poll` (`SendWait`), `fds` on the first byte, `drain` meanwhile.
 pub(crate) fn send_waiting(
     sock: std::os::fd::BorrowedFd<'_>,
+    queue: &OutQueue,
     slices: &mut [std::io::IoSlice<'_>],
     fds: &[std::os::fd::BorrowedFd<'_>],
     mut drain: Option<&mut dyn FnMut() -> RpcResult<()>>,
@@ -232,7 +233,7 @@ pub(crate) fn send_waiting(
     let mut rest: &mut [IoSlice<'_>] = slices;
     let mut space = [MaybeUninit::uninit(); FD_SPACE];
     let mut sent = 0;
-    let mut waiting = SendWait::new(sock);
+    let mut waiting = SendWait::new(sock, queue);
     while sent < total {
         let mut anc = SendAncillaryBuffer::new(&mut space);
         // Sending without the fds would leave the parcel's fd table pointing at nothing.
@@ -271,17 +272,19 @@ pub(crate) fn send_waiting(
 /// The waits of one send: `SO_SNDTIMEO` counted from the last progress (`transport` "A slow peer").
 pub(crate) struct SendWait<'a> {
     sock: std::os::fd::BorrowedFd<'a>,
+    queue: &'a OutQueue,
     since: Option<std::time::Instant>,
     /// Read at the first wait: most sends never wait, and the option costs a syscall.
     limit: Option<Option<std::time::Duration>>,
-    /// `queued_bytes` at the last look in this wait; `None` before it or where unsupported.
+    /// `queue` at the last look in this wait; `None` before it, unbounded or where unsupported.
     queued: Option<u32>,
 }
 
 impl<'a> SendWait<'a> {
-    pub(crate) fn new(sock: std::os::fd::BorrowedFd<'a>) -> Self {
+    pub(crate) fn new(sock: std::os::fd::BorrowedFd<'a>, queue: &'a OutQueue) -> Self {
         SendWait {
             sock,
+            queue,
             since: None,
             limit: None,
             queued: None,
@@ -299,32 +302,33 @@ impl<'a> SendWait<'a> {
         use rustix::net::sockopt::{socket_timeout, Timeout};
 
         let sock = self.sock;
+        let limit = *self
+            .limit
+            .get_or_insert_with(|| socket_timeout(sock, Timeout::Send).ok().flatten());
+        // No deadline: the peer's progress decides nothing, so it is not looked at.
+        let Some(d) = limit else {
+            return Some(None);
+        };
         match self.since {
             // On every pass, not only a quiet `poll`: input can wake each one before the pause.
             Some(_) => self.look_for_peer_progress(),
             None => {
                 // A new wait: what the peer has yet to take is the baseline its progress lowers.
-                self.queued = queued_bytes(sock);
+                self.queued = self.queue.bytes(sock);
                 self.since = Some(std::time::Instant::now());
             }
         }
         let since = *self.since.get_or_insert_with(std::time::Instant::now);
-        let limit = *self
-            .limit
-            .get_or_insert_with(|| socket_timeout(sock, Timeout::Send).ok().flatten());
-        match limit {
-            Some(d) => match d.checked_sub(since.elapsed()) {
-                Some(left) if !left.is_zero() => Some(Some(left)),
-                _ => None,
-            },
-            None => Some(None),
+        match d.checked_sub(since.elapsed()) {
+            Some(left) if !left.is_zero() => Some(Some(left)),
+            _ => None,
         }
     }
 
     /// The peer took bytes since the last look: the deadline starts over from now.
     fn look_for_peer_progress(&mut self) {
         let Some(before) = self.queued else { return };
-        let Some(now) = queued_bytes(self.sock) else {
+        let Some(now) = self.queue.bytes(self.sock) else {
             return;
         };
         self.queued = Some(now);
@@ -380,6 +384,7 @@ pub struct UnixTransport {
     /// Held by the fd-mode reader for a whole frame; it keeps no bytes between frames.
     fd_recv_lock: std::sync::Mutex<()>,
     reads: ReadDeadline,
+    queue: OutQueue,
 }
 
 impl UnixTransport {
@@ -408,6 +413,7 @@ impl UnixTransport {
             desc,
             fd_recv_lock: std::sync::Mutex::new(()),
             reads: ReadDeadline::default(),
+            queue: OutQueue::default(),
         })
     }
 
@@ -604,7 +610,7 @@ impl RpcTransport for UnixTransport {
     fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
         if WAITING_SENDS {
             let slices = &mut [std::io::IoSlice::new(buf)];
-            return send_waiting(self.stream.as_fd(), slices, &[], None);
+            return send_waiting(self.stream.as_fd(), &self.queue, slices, &[], None);
         }
         send_raw_nosignal(self.stream.as_fd(), buf)
     }
@@ -614,8 +620,9 @@ impl RpcTransport for UnixTransport {
     /// of this (`wire_android13::read_aosp_message`).
     fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize> {
         let sock = Some(self.stream.as_fd());
-        self.reads
-            .read(sock, || super::read_raw(&mut &self.stream, buf))
+        self.reads.read(sock, &self.queue, || {
+            super::read_raw(&mut &self.stream, buf)
+        })
     }
 
     /// Raw, **unframed** write + `SCM_RIGHTS` (the android-13+ v1+
@@ -635,7 +642,7 @@ impl RpcTransport for UnixTransport {
         }
         if WAITING_SENDS {
             let slices = &mut [IoSlice::new(buf)];
-            return send_waiting(self.stream.as_fd(), slices, fds, None);
+            return send_waiting(self.stream.as_fd(), &self.queue, slices, fds, None);
         }
         if buf.is_empty() {
             // No payload means no `sendmsg` to carry the fds; AOSP frames are never empty.
@@ -703,26 +710,28 @@ impl RpcTransport for UnixTransport {
         let mut space =
             vec![MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_FDS_PER_FRAME))];
         let mut anc = RecvAncillaryBuffer::new(&mut space);
-        let r = self.reads.read(Some(self.stream.as_fd()), || loop {
-            match rustix::net::recvmsg(
-                &self.stream,
-                &mut [IoSliceMut::new(buf)],
-                &mut anc,
-                RECV_FLAGS,
-            ) {
-                Ok(r) => return Ok(r),
-                // EINTR retry, symmetric with read_header.
-                Err(rustix::io::Errno::INTR) => continue,
-                Err(e) => {
-                    let io_err = std::io::Error::from(e);
-                    // Deadline → `Timeout`; mid-message the reader makes it `DeadlineMidFrame`.
-                    if super::is_timeout(&io_err) {
-                        return Err(RpcError::Timeout);
+        let r = self
+            .reads
+            .read(Some(self.stream.as_fd()), &self.queue, || loop {
+                match rustix::net::recvmsg(
+                    &self.stream,
+                    &mut [IoSliceMut::new(buf)],
+                    &mut anc,
+                    RECV_FLAGS,
+                ) {
+                    Ok(r) => return Ok(r),
+                    // EINTR retry, symmetric with read_header.
+                    Err(rustix::io::Errno::INTR) => continue,
+                    Err(e) => {
+                        let io_err = std::io::Error::from(e);
+                        // Deadline → `Timeout`; mid-message the reader makes it `DeadlineMidFrame`.
+                        if super::is_timeout(&io_err) {
+                            return Err(RpcError::Timeout);
+                        }
+                        return Err(io_err.into());
                     }
-                    return Err(io_err.into());
                 }
-            }
-        })?;
+            })?;
         take_scm_rights(r.flags, &mut anc, &mut fds)?;
         Ok((r.bytes, fds))
     }
@@ -785,6 +794,7 @@ impl RpcTransport for UnixTransport {
         // No length check: raw bytes have no frame, and the caller caps the body.
         send_waiting(
             self.stream.as_fd(),
+            &self.queue,
             &mut [std::io::IoSlice::new(buf)],
             fds,
             Some(drain),
@@ -1187,6 +1197,20 @@ mod tests {
         assert_eq!(reader.join().expect("reader"), total);
     }
 
+    /// No send deadline, no `SIOCOUTQ`: `/dev/null` has no `SO_SNDTIMEO` and refuses the ioctl.
+    #[test]
+    fn a_wait_without_a_deadline_does_not_look_at_the_queue() {
+        let null = std::fs::File::open("/dev/null").expect("/dev/null");
+        let queue = OutQueue::default();
+        let mut waiting = SendWait::new(null.as_fd(), &queue);
+        assert!(matches!(waiting.wait(false), Ok(Some(false))));
+        assert!(matches!(waiting.wait(true), Ok(Some(_))));
+        assert!(
+            !queue.refused.load(std::sync::atomic::Ordering::Relaxed),
+            "a wait with no deadline asked for SIOCOUTQ"
+        );
+    }
+
     /// A send wait that input wakes before each pause still counts the peer taking its bytes.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
@@ -1219,7 +1243,8 @@ mod tests {
                 }
             })
         };
-        let mut waiting = SendWait::new(ours.as_fd());
+        let queue = OutQueue::default();
+        let mut waiting = SendWait::new(ours.as_fd(), &queue);
         let t0 = Instant::now();
         let mut verdict = Ok(Some(true));
         while t0.elapsed() < d * 5 / 2 {
