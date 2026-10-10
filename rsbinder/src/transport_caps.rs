@@ -171,7 +171,7 @@ impl TransportCaps {
     /// what `what` needed and which bits are missing, and returns
     /// [`StatusCode::InvalidOperation`] — AOSP's code for "this transport
     /// cannot do this", as opposed to
-    /// [`StatusCode::BadValue`](crate::StatusCode::BadValue) for a
+    /// [`StatusCode::BadValue`] for a
     /// malformed request.
     ///
     /// The point is the timing: a streaming sink or a cancellation that

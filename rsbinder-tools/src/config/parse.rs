@@ -222,7 +222,7 @@ pub enum ConfigError {
     },
     /// A `[[service]]` name that is not `interface/instance` with both halves
     /// non-empty, or that `addService` would refuse (see
-    /// [`is_valid_service_name`](super::is_valid_service_name)). There is no
+    /// [`is_valid_service_name`]). There is no
     /// implicit instance: AOSP `AidlName::fill` likewise refuses a name without `/`.
     #[error(
         "{path}: service {name:?}: name must be `interface/instance`, both parts non-empty, \

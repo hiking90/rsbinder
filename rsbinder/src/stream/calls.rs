@@ -1925,13 +1925,19 @@ mod tests {
     impl IStreamSource for RefusingSource {
         fn r#request(&self, total: i64) -> BinderResult<()> {
             self.0.attempts.fetch_add(1, Ordering::SeqCst);
-            // Its replacement `try_update` is newer than the MSRV.
-            #[allow(deprecated)]
-            let refused = self
-                .0
-                .refuse
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
-            if refused.is_ok() {
+            // Takes one refusal if any is left; `try_update` is newer than the MSRV.
+            let refuse = &self.0.refuse;
+            let mut n = refuse.load(Ordering::SeqCst);
+            let refused = loop {
+                let Some(next) = n.checked_sub(1) else {
+                    break false;
+                };
+                match refuse.compare_exchange_weak(n, next, Ordering::SeqCst, Ordering::SeqCst) {
+                    Ok(_) => break true,
+                    Err(current) => n = current,
+                }
+            };
+            if refused {
                 return Err(Status::from(ExceptionCode::IllegalState));
             }
             self.0.granted.fetch_max(total as usize, Ordering::SeqCst);

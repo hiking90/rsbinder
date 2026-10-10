@@ -1273,7 +1273,7 @@ impl Parcel {
     /// where it cannot hand over a shared-memory fd. It does not gate
     /// anything on its own: writing an fd into a parcel that answers
     /// `false` still fails with
-    /// [`StatusCode::FdsNotAllowed`](crate::StatusCode::FdsNotAllowed)
+    /// [`StatusCode::FdsNotAllowed`]
     /// at the one place that enforces it.
     pub fn allow_fds(&self) -> bool {
         if self.is_kernel_backed() {
@@ -2601,10 +2601,13 @@ impl Parcel {
                 log::error!("Parcel::sub_parcel: {offset} + {size} exceeds the parcel");
                 StatusCode::BadValue
             })?;
-        #[cfg_attr(not(feature = "rpc"), allow(unused_mut))]
-        let mut sub = Parcel::data_only_from_vec(self.data.as_slice()[offset..end].to_vec());
+        let sub = Parcel::data_only_from_vec(self.data.as_slice()[offset..end].to_vec());
         #[cfg(feature = "rpc")]
-        self.carry_rpc_objects(&mut sub, offset, end);
+        let sub = {
+            let mut sub = sub;
+            self.carry_rpc_objects(&mut sub, offset, end);
+            sub
+        };
         Ok(sub)
     }
 
@@ -3207,8 +3210,10 @@ mod tests {
 
         let mut backing = vec![0u64; 3];
         let base = backing.as_mut_ptr() as *mut u8;
-        // SAFETY: 4 bytes into a 24-byte allocation; the 20 left hold two unaligned `u64`s.
-        let objects = unsafe { base.add(4) } as *mut crate::sys::binder::binder_size_t;
+        // Half the alignment: 4 bytes where `u64` aligns to 8, 2 on i686 where it aligns to 4.
+        let skew = std::mem::align_of::<crate::sys::binder::binder_size_t>() / 2;
+        // SAFETY: at most 4 bytes into a 24-byte allocation; the rest holds two unaligned `u64`s.
+        let objects = unsafe { base.add(skew) } as *mut crate::sys::binder::binder_size_t;
         // SAFETY: both writes stay inside `backing`, and `write_unaligned` needs no alignment.
         unsafe {
             objects.write_unaligned(8);
@@ -4411,7 +4416,6 @@ mod data_serde {
 
     /// Inode of `fd`: which open file an fd table slot holds.
     #[cfg(feature = "rpc")]
-    #[allow(clippy::unnecessary_cast)] // `st_ino` is not `u64` on every target.
     fn inode_of(fd: impl std::os::fd::AsFd) -> u64 {
         rustix::fs::fstat(fd).unwrap().st_ino as u64
     }

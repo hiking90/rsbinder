@@ -153,8 +153,9 @@ macro_rules! impl_sm_module_body {
         /// `Service` union `getService2` returns has a payload that varies by
         /// release train, so `servicemanager_15` never parses it (see that
         /// module's docs). The `allow(deprecated)` is scoped to each call, not
-        /// the crate, so a future deprecation elsewhere still warns.
-        #[allow(deprecated)]
+        /// the crate, so a future deprecation elsewhere still warns; it is not
+        /// an `expect` because the Android 11-14 AIDL has no `@deprecated`.
+        #[allow(deprecated, reason = "lookups stay on `getService`; see above")]
         pub fn get_service(sm: &BpServiceManager, name: &str) -> Option<SIBinder> {
             match sm.getService(name) {
                 Ok(result) => result,
@@ -169,8 +170,7 @@ macro_rules! impl_sm_module_body {
         /// collapsing it to `None`, so a waiter can tell "not yet registered"
         /// (`Ok(None)`) from "service manager unreachable" (`Err`) — the
         /// distinction AOSP `realGetService` carries in its `Status`.
-        // See `get_service` for why the deprecated `getService` is called.
-        #[allow(deprecated)]
+        #[allow(deprecated, reason = "lookups stay on `getService`; see `get_service`")]
         pub fn try_get_service(sm: &BpServiceManager, name: &str) -> Result<Option<SIBinder>> {
             sm.getService(name).map_err(|e| e.into())
         }
@@ -246,8 +246,7 @@ macro_rules! impl_sm_module_body {
             }
         }
 
-        // See `get_service` for why the deprecated `getService` is called.
-        #[allow(deprecated)]
+        #[allow(deprecated, reason = "lookups stay on `getService`; see `get_service`")]
         pub fn get_interface<T: FromIBinder + ?Sized>(
             sm: &BpServiceManager,
             name: &str,
@@ -405,7 +404,6 @@ pub mod android_15 {
 
 #[cfg(feature = "rpc")]
 pub(crate) mod accessor_16;
-/// Register side of the accessor bridge, companion to [`accessor_16`] (same `rpc` gate).
 #[cfg(feature = "rpc")]
 pub(crate) mod accessor_register;
 mod servicemanager_16;
@@ -515,7 +513,13 @@ enum Android15Numbering {
 }
 
 /// Side-effect-free: past the end pre-r6, `getServiceDebugInfo()` on r6+ (`numbering_pins`).
-#[allow(dead_code)] // only issued on android; pinned everywhere
+#[cfg(any(
+    test,
+    all(
+        target_os = "android",
+        any(feature = "android_14", feature = "android_15")
+    )
+))]
 pub(crate) const ANDROID_15_PROBE_CODE: TransactionCode = 14;
 
 /// Tells the two Android 15 numberings apart with one [`ANDROID_15_PROBE_CODE`] transaction.
@@ -2219,5 +2223,27 @@ mod wait_end_tests {
             matches!(end, WaitEnd::Transient(StatusCode::DeadObject)),
             "{end:?}"
         );
+    }
+}
+
+#[cfg(all(test, target_os = "android"))]
+mod android_10_tests {
+    use super::*;
+
+    /// Android 10: handle 0 resolves on any build; the hub needs the `android_10` feature.
+    #[test]
+    #[serial_test::serial(binder)]
+    fn android_10_hands_out_its_service_manager_only_with_its_feature() {
+        if crate::get_android_sdk_version() != sdk_versions::ANDROID_10 {
+            return;
+        }
+        ProcessState::init_default().expect("init_default");
+        assert!(ProcessState::as_self().context_object().is_ok());
+        let sm = default();
+        if cfg!(feature = "android_10") {
+            assert!(sm.is_ok(), "{:?}", sm.err());
+        } else {
+            assert_eq!(sm.err(), Some(StatusCode::InvalidOperation));
+        }
     }
 }

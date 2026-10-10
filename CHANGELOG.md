@@ -300,6 +300,11 @@ change bytes between peers: upgrade both ends together.
   (`String16`, oneway replies, RPC sends, stream items). No wire change.
 - **`@EnforcePermission` over kernel binder costs one IPC per check, not two**:
   the `IPermissionController` is kept, as AOSP keeps `gPermissionController`.
+- **`rsbinder-aidl` generated code passes `clippy::unwrap_used`,
+  `clippy::expect_used` and `clippy::allow_attributes_without_reason`**: a
+  `Builder::hash()` proxy keeps the remote hash in a `OnceLock` instead of a
+  `Mutex` locked with `unwrap()`, and every generated `allow` carries a
+  `reason`. The hash a proxy returns is unchanged.
 
 ### Deprecated
 
@@ -366,6 +371,9 @@ Kernel binder and `Parcel`:
 - **`get_extended_error()` returns `InvalidOperation`** on a driver without
   `BINDER_GET_EXTENDED_ERROR`, as documented.
 - **`list_services` on Android 10 no longer stops at a 127-character name.**
+- **On Android 10 a build without the `android_10` feature names the missing
+  feature**: `hub::default` fails with `InvalidOperation`, as on the other
+  SDKs, where `context_object()` failed with `PermissionDenied`.
 - **`connect_async` on a kernel endpoint can be cancelled** by dropping the future.
 - **A synchronous handle to a local async service no longer panics when called
   from async code**; see `TokioRuntime`'s docs for the cases left.

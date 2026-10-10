@@ -16,7 +16,6 @@
 //! its own session pair, so they are parallel-safe.
 
 #![cfg(feature = "rpc")]
-#![allow(non_snake_case)]
 
 use std::collections::HashMap;
 use std::sync::Mutex;

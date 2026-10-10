@@ -869,7 +869,7 @@ const BINDER_WIRE_FORMAT_VERSION: i32 = 1;
 
 /// android-12 `Category::repr()` for a raw `Level`; see `Stability` doc "Wire encoding".
 // The `target_os = "android"` encode branch and the r34 RPC wire, which always speaks it.
-#[cfg_attr(not(any(target_os = "android", feature = "rpc")), allow(dead_code))]
+#[cfg(any(target_os = "android", feature = "rpc", test))]
 pub(crate) const fn android12_category_repr(level: i32) -> i32 {
     (level << 24) | BINDER_WIRE_FORMAT_VERSION
 }

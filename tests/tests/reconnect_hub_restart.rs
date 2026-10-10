@@ -15,7 +15,6 @@
 //! `target/debug/rsb_hub`).
 
 #![cfg(any(target_os = "linux", target_os = "android"))]
-#![allow(non_snake_case)]
 
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;

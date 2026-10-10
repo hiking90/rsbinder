@@ -1051,8 +1051,8 @@ mod stability_mutation_tests {
     /// After the `Binder` drops, the test's own `Arc` is the only strong reference left.
     #[test]
     fn binder_drop_releases_attached_objects() {
-        struct Probe(#[allow(dead_code)] u32);
-        let probe = Arc::new(Probe(99));
+        struct Probe;
+        let probe = Arc::new(Probe);
         assert_eq!(Arc::strong_count(&probe), 1);
         {
             let b = Binder::new(DummyRemotable);

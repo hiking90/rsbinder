@@ -104,7 +104,7 @@ pub struct ClientOptions {
     /// [`timeout`](Self::timeout) for that phase. The r34 wire (no
     /// `?profile=`) has no handshake, so on a plain r34 endpoint other than
     /// `tls://` `open` refuses it with
-    /// [`StatusCode::BadValue`](crate::StatusCode::BadValue), and it
+    /// [`StatusCode::BadValue`], and it
     /// refuses `Some(Duration::ZERO)` the same way.
     #[cfg(feature = "rpc")]
     #[deprecated(
@@ -114,7 +114,7 @@ pub struct ClientOptions {
     pub handshake_timeout: Option<Duration>,
     /// Kernel: `?driver=` equivalent. The device is fixed process-wide by
     /// whoever initializes `ProcessState` first, so a *different* path here
-    /// is [`StatusCode::BadValue`](crate::StatusCode::BadValue) at
+    /// is [`StatusCode::BadValue`] at
     /// [`open`](Client::open) — see
     /// [`ServeOptions::threads`](super::ServeOptions::threads) for the same
     /// rule on the server side.
@@ -127,7 +127,7 @@ pub struct ClientOptions {
     /// this one takes effect — [`open`](Client::open) reads it before it
     /// initializes `ProcessState`. A *different* size than the one
     /// already in force is
-    /// [`StatusCode::BadValue`](crate::StatusCode::BadValue), as with
+    /// [`StatusCode::BadValue`], as with
     /// [`driver`](Self::driver).
     pub mmap_size: Option<usize>,
 }
@@ -166,7 +166,10 @@ impl std::fmt::Debug for Client {
 }
 
 impl std::fmt::Debug for ClientOptions {
-    #[allow(deprecated)] // Shows `handshake_timeout` while it is still honored.
+    #[expect(
+        deprecated,
+        reason = "shows `session_id` and `handshake_timeout` while they are still read"
+    )]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut d = f.debug_struct("ClientOptions");
         #[cfg(feature = "rpc-tls")]
@@ -220,7 +223,7 @@ pub(super) fn new_client(uri: Uri, o: ClientOptions) -> Result<Client> {
 pub(crate) enum OpenStage {
     Setup,
     // Opening the kernel endpoint does no transport I/O; only RPC connects.
-    #[cfg_attr(not(feature = "rpc"), allow(dead_code))]
+    #[cfg(feature = "rpc")]
     Connect,
 }
 
@@ -243,7 +246,10 @@ pub(crate) fn open_staged(
 }
 
 /// The kernel endpoint and every option check; RPC endpoints end here without the `rpc` feature.
-#[allow(deprecated)] // Refuses `handshake_timeout` where it does not apply, while it is honored.
+#[expect(
+    deprecated,
+    reason = "refuses `session_id` and `handshake_timeout` where they do not apply"
+)]
 fn kernel_open(uri: Uri, o: ClientOptions) -> Result<Client> {
     if uri.service.is_some() {
         log::error!("rsbinder::Client::open: a service name is not allowed here (use connect)");
@@ -297,7 +303,10 @@ fn kernel_open(uri: Uri, o: ClientOptions) -> Result<Client> {
 
 /// Every check an RPC open makes before any I/O, and the config it then connects with.
 #[cfg(feature = "rpc")]
-#[allow(deprecated)] // Forwards `handshake_timeout` to the config's own deprecated setter.
+#[expect(
+    deprecated,
+    reason = "forwards `handshake_timeout` to the config's own deprecated setter"
+)]
 fn rpc_setup<'a>(uri: &'a Uri, o: &'a ClientOptions) -> Result<crate::rpc::RpcClientConfig<'a>> {
     if uri.service.is_some() {
         log::error!("rsbinder::Client::open: a service name is not allowed here (use connect)");

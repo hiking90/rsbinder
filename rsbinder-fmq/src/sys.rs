@@ -134,7 +134,33 @@ mod imp {
     pub(crate) fn futex_wake(word: &AtomicU32, bits: u32) -> Result<()> {
         use rustix::thread::futex::{wake_bitset, Flags};
         let bits = NonZeroU32::new(bits).ok_or(Error::BadValue("empty bit mask"))?;
-        wake_bitset(word, Flags::empty(), i32::MAX as u32, bits)?;
+        match wake_bitset(word, Flags::empty(), i32::MAX as u32, bits) {
+            Ok(_) => Ok(()),
+            // rustix 1.1's libc backend sends a 32-bit wake only as `futex_time64` (Linux 5.1).
+            #[cfg(all(target_os = "android", target_pointer_width = "32"))]
+            Err(rustix::io::Errno::NOSYS) => futex_wake_old(word, bits),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// `FUTEX_WAKE_BITSET` via `SYS_futex`, which every 32-bit kernel has; it takes no timespec.
+    #[cfg(all(target_os = "android", target_pointer_width = "32"))]
+    fn futex_wake_old(word: &AtomicU32, bits: NonZeroU32) -> Result<()> {
+        // SAFETY: `word` is a live `AtomicU32`; the timeout and `uaddr2` are unused by WAKE_BITSET.
+        let r = unsafe {
+            libc::syscall(
+                libc::SYS_futex,
+                word.as_ptr(),
+                libc::FUTEX_WAKE_BITSET,
+                i32::MAX,
+                std::ptr::null::<libc::timespec>(),
+                std::ptr::null::<u32>(),
+                bits.get(),
+            )
+        };
+        if r < 0 {
+            return Err(crate::error::errno_of(&std::io::Error::last_os_error()).into());
+        }
         Ok(())
     }
 }

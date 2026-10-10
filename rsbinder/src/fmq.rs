@@ -67,7 +67,6 @@
 //! platform is `InvalidOperation`, a wait that ran out is `TimedOut`, and an
 //! OS error keeps its errno.
 
-#[allow(clippy::all, unused_imports, dead_code)]
 pub(crate) mod generated {
     include!(concat!(env!("OUT_DIR"), "/fmq.rs"));
 }

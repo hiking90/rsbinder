@@ -15,6 +15,13 @@
 //! counts. It is process-global, so everything runs in one `#[test]`.
 
 #![cfg(all(feature = "rpc", feature = "tracing"))]
+#![cfg_attr(
+    target_os = "android",
+    allow(
+        clippy::missing_const_for_thread_local,
+        reason = "android-only false positive, even on thread_locals already using `const { .. }`"
+    )
+)]
 
 use std::collections::HashMap;
 use std::fmt;

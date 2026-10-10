@@ -311,7 +311,7 @@ use crate::status::Status;
 ///
 /// Use via [`Self::new_binder`] (the `BnAccessor::new_binder` AIDL
 /// stub) — the returned `SIBinder` is what
-/// [`create_accessor`](crate::hub::android_16::create_accessor) wraps
+/// [`create_accessor`] wraps
 /// for registration and what `kernel addService(name, _)`
 /// publishes to the system service manager.
 pub struct LocalAccessor {

@@ -6,6 +6,16 @@
 //! `sys.rs` is unmodified bindgen output; `generate.sh` regenerates it from
 //! the verbatim kernel headers under `include/` and states the options.
 //!
+//! # UAPI items not used yet
+//!
+//! The bindings keep every item of the two headers, including ones no
+//! rsbinder path uses, so that the crate matches the UAPI:
+//!
+//! - `BC_ATTEMPT_ACQUIRE`, `BC_TRANSACTION_SG`, `BC_REPLY_SG`: defined by
+//!   the driver and sent by neither AOSP libbinder nor rsbinder.
+//! - The `set_idle_timeout`, `set_idle_priority` and `get_node_debug_info`
+//!   wrappers below, each with its reason.
+//!
 //! # ioctl safety
 //!
 //! Shared SAFETY rationale for every `ioctl::ioctl(fd, ctl)` in `binder`:
@@ -44,8 +54,11 @@
 //! from `thread_state::free_buffer`, called when a parcel drops or for a
 //! status reply no parcel ever wrapped.
 
-// Allowances scoped to the bindgen output: `dead_code` still flags unused wrappers below.
-#[allow(non_camel_case_types, non_upper_case_globals, dead_code)]
+#[expect(
+    non_camel_case_types,
+    dead_code,
+    reason = "bindgen output: C type names, and UAPI items not used yet (module doc)"
+)]
 mod raw {
     include!("sys.rs");
 }
@@ -55,11 +68,9 @@ pub mod binder {
     pub use crate::sys::*;
 
     /// `binder_transaction_data.sender_pid`'s type, under its libc name.
-    #[allow(non_camel_case_types)]
-    pub type pid_t = __kernel_pid_t;
+    pub use crate::sys::__kernel_pid_t as pid_t;
     /// `binder_transaction_data.sender_euid`'s type, under its libc name.
-    #[allow(non_camel_case_types)]
-    pub type uid_t = __kernel_uid32_t;
+    pub use crate::sys::__kernel_uid32_t as uid_t;
 
     use rustix::{io, ioctl};
     use std::os::fd::AsFd;
@@ -158,7 +169,7 @@ pub mod binder {
     }
 
     // `binderfs::add_device` substitutes a mock under `cfg(test)`.
-    #[cfg_attr(test, allow(dead_code))]
+    #[cfg(not(test))]
     pub(crate) fn binder_ctl_add<Fd: AsFd>(
         fd: Fd,
         device: &mut binderfs_device,
@@ -173,8 +184,10 @@ pub mod binder {
         }
     }
 
-    // BINDER_SET_IDLE_TIMEOUT is a no-op in every shipping driver; kept for UAPI completeness.
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "BINDER_SET_IDLE_TIMEOUT is a no-op in every shipping driver; kept for the UAPI"
+    )]
     pub(crate) fn set_idle_timeout<Fd: AsFd>(
         fd: Fd,
         timeout: i64,
@@ -186,8 +199,10 @@ pub mod binder {
         }
     }
 
-    // BINDER_SET_IDLE_PRIORITY is a no-op in every shipping driver; kept for UAPI completeness.
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "BINDER_SET_IDLE_PRIORITY is a no-op in every shipping driver; kept for the UAPI"
+    )]
     pub(crate) fn set_idle_priority<Fd: AsFd>(
         fd: Fd,
         priority: i32,
@@ -207,8 +222,7 @@ pub mod binder {
         }
     }
 
-    // debug-only ioctl; no crate path issues it yet.
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "debug-only ioctl; no crate path issues it yet")]
     pub(crate) fn get_node_debug_info<Fd: AsFd>(
         fd: Fd,
         node_debug_info: &mut binder_node_debug_info,

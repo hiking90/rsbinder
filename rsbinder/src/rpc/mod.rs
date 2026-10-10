@@ -114,10 +114,7 @@ pub mod session;
 // Codec and session bookkeeping are `pub(crate)` so the protocol can change without semver breaks.
 pub(crate) mod state;
 pub mod transport;
-// Both codec modules are tested in their own `mod tests`; some entry points are not live yet.
-#[allow(dead_code)]
 pub(crate) mod wire;
-#[allow(dead_code)]
 pub(crate) mod wire_android13;
 /// Fuzz entrypoints (`fuzz/fuzz_targets/rpc_{wire,address}_decode.rs`,
 /// `rpc_session_handshake.rs`); not part of the supported API.
@@ -130,7 +127,10 @@ pub use end::{EndReason, EndedBy, SessionEnd, StreamState};
 pub use fd_mode::FileDescriptorTransportMode;
 pub use proxy::RpcProxy;
 pub use server::RpcServer;
-#[allow(deprecated)]
+#[expect(
+    deprecated,
+    reason = "re-exports the deprecated config while it is honored"
+)]
 pub use session::RpcUnixClientConfig;
 pub use session::{RpcClientConfig, RpcSession};
 pub use transport::{CertId, PeerIdentity, RpcTransport};

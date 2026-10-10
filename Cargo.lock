@@ -863,6 +863,7 @@ dependencies = [
  "libc",
  "log",
  "loom",
+ "miette",
  "pretty-hex",
  "rsbinder",
  "rsbinder-aidl",

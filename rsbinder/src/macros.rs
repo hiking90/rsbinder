@@ -39,13 +39,13 @@ macro_rules! __declare_binder_interface {
         $(
             pub trait $native_adapter {
                 fn as_sync(&self) -> &dyn $interface;
-                #[allow(dead_code)]
+                #[allow(dead_code, reason = "called only from the async half of the expansion, which an interface may omit")]
                 fn as_async(&self) -> &dyn $native_async;
                 /// `Some` only for an async-backed service; `None` for a
                 /// sync-only one. Lets the async `FromIBinder` cast
                 /// reject a sync-only local binder up front instead of letting
                 /// [`Self::as_async`] panic when a method is later called.
-                #[allow(dead_code)]
+                #[allow(dead_code, reason = "called only from the async half of the expansion, which an interface may omit")]
                 fn try_as_async(&self) -> ::core::option::Option<&dyn $native_async>;
             }
 
@@ -610,19 +610,19 @@ macro_rules! declare_binder_enum {
     } => {
         $( #[$attr] )*
         #[derive(Debug, Default, Copy, Clone, PartialOrd, Ord, PartialEq, Eq, Hash)]
-        #[allow(missing_docs)]
+        #[allow(missing_docs, reason = "expands into user crates that may deny missing_docs")]
         pub struct $enum(pub $backing);
         impl $enum {
-            $( $( #[$value_attr] )* #[allow(missing_docs)] pub const $name: Self = Self($value); )*
+            $( $( #[$value_attr] )* #[allow(missing_docs, reason = "expands into user crates that may deny missing_docs")] pub const $name: Self = Self($value); )*
 
             #[inline(always)]
-            #[allow(missing_docs)]
+            #[allow(missing_docs, reason = "expands into user crates that may deny missing_docs")]
             pub const fn enum_values() -> [Self; $size] {
                 [$(Self::$name),*]
             }
 
             #[inline(always)]
-            #[allow(missing_docs)]
+            #[allow(missing_docs, reason = "expands into user crates that may deny missing_docs")]
             pub const fn get(&self) -> $backing {
                 self.0
             }
@@ -883,7 +883,6 @@ mod tests {
         }
     }
 
-    #[allow(dead_code)]
     impl IBye for Binder<BnBye> {
         #[cfg(feature = "async")]
         fn bye(&self) -> Result<()> {

@@ -58,7 +58,7 @@ impl CommandStream {
         self.0.as_bytes()
     }
 
-    /// The zeroed buffer `BINDER_WRITE_READ` fills; see [`Parcel::driver_read_buffer`].
+    /// What `BINDER_WRITE_READ` fills, zero past `data_size` ([`Parcel::driver_read_buffer`]).
     pub(crate) fn driver_read_buffer(&mut self) -> &mut [u8] {
         self.0.driver_read_buffer()
     }

@@ -30,7 +30,9 @@ pub fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
     let deprecated = input.attrs.iter().any(|a| a.path().is_ident("deprecated"))
         || matches!(&input.data, Data::Struct(s)
             if s.fields.iter().any(|f| f.attrs.iter().any(|a| a.path().is_ident("deprecated"))));
-    let allow = deprecated.then(|| quote!(#[allow(deprecated)]));
+    let allow = deprecated.then(
+        || quote!(#[allow(deprecated, reason = "the codec reads and writes the deprecated item")]),
+    );
     let items = module.content.map(|(_, items)| items).unwrap_or_default();
 
     // A derive cannot redeclare the struct or its `Default`; keep only the codec.
@@ -292,7 +294,7 @@ mod tests {
         let field: DeriveInput =
             syn::parse2(quote! { struct Config { #[deprecated] name: String } }).unwrap();
         let out = expand(&field).expect("expand").to_string();
-        assert!(out.contains("allow (deprecated)"), "{out}");
+        assert!(out.contains("allow (deprecated , reason ="), "{out}");
     }
 
     /// One allowed const holds every item, so a `#[deprecated]` struct's codec stays quiet.
