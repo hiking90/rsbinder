@@ -19,44 +19,48 @@
 //! would see whatever this one left behind.
 //!
 //! Needs a real binder device (`/dev/binder`, Linux + binderfs or
-//! Android) — but no service manager, since nothing is registered. Hence
+//! Android). The first test needs no service manager, since nothing is
+//! registered; the second checks what reaches one, so it needs a running
+//! `rsb_hub` (the `local_gate.sh kernel` tier starts it). Hence
 //! `#[ignore]`:
 //!
 //! ```text
-//! cargo test -p tests --test entry_kernel_options -- --ignored --nocapture
+//! cargo test -p tests --test entry_kernel_options -- --ignored --nocapture --test-threads=1
 //! ```
 
 #![cfg(any(target_os = "linux", target_os = "android"))]
 
-use rsbinder::StatusCode;
+use rsbinder::entry::KernelEndpoint;
+use rsbinder::{StatusCode, Uri};
 
 #[test]
 #[ignore = "requires kernel binder (/dev/binder); run on REMOTE_LINUX/emulator"]
 fn a_kernel_option_the_process_cannot_honor_is_refused() {
     // First in the process: this one decides the pool size. Only the check at `serve` is tested.
-    let _ =
-        rsbinder::serve("binder://?threads=4").expect("the first serve initializes ProcessState");
+    let _ = rsbinder::serve(KernelEndpoint::default().with_threads(4))
+        .expect("the first serve initializes ProcessState");
 
     // Asking again for what is already true is not an error — the caller
     // gets exactly what it asked for.
-    let _ = rsbinder::serve("binder://?threads=4").expect("the same value must be accepted");
+    let _ = rsbinder::serve(KernelEndpoint::default().with_threads(4))
+        .expect("the same value must be accepted");
 
     // A different value cannot be applied, and saying so is the point:
     // the pool stays at 4 either way, but now the caller is told.
     assert_eq!(
-        rsbinder::serve("binder://?threads=8").err(),
+        rsbinder::serve(KernelEndpoint::default().with_threads(8)).err(),
         Some(StatusCode::BadValue),
         "a different thread count must be refused, not warned about"
     );
 
     // Omitting the option asks for nothing, so it always succeeds — this
     // is what keeps a second server in the same process working.
-    let _ = rsbinder::serve("binder://").expect("no `?threads=` asks for nothing");
+    let _ = rsbinder::serve(Uri::kernel()).expect("no thread count asks for nothing");
 
     // The same rule through `ServeOptions`, which is applied later (at
-    // `spawn`) than the URI form (at `serve`).
-    let err = rsbinder::serve("binder://")
-        .expect("parse")
+    // `spawn`) than the endpoint's setting (at `serve`).
+    let err = rsbinder::serve(Uri::kernel())
+        .expect("serve")
         .with(|o| o.threads = Some(8))
         .spawn()
         .err();
@@ -68,7 +72,7 @@ fn a_kernel_option_the_process_cannot_honor_is_refused() {
 
     // And the client half shares the one check.
     assert_eq!(
-        rsbinder::Client::open_with("binder://", |o, _| {
+        rsbinder::Client::open_with(Uri::kernel(), |o, _| {
             o.driver = Some("/dev/definitely-not-the-binder-in-use".into())
         })
         .err(),
@@ -84,14 +88,11 @@ fn a_kernel_option_the_process_cannot_honor_is_refused() {
         rsbinder::ProcessState::default_mmap_size(),
         "the first serve carried no `?mmap=`, so the default is what it mapped"
     );
-    let _ = rsbinder::serve(&format!("binder://?mmap={in_force}"))
+    let _ = rsbinder::serve(KernelEndpoint::default().with_mmap_size(in_force))
         .expect("the size already in force must be accepted");
     assert_eq!(
-        rsbinder::serve(&format!(
-            "binder://?mmap={}",
-            rsbinder::MAX_BINDER_MMAP_SIZE
-        ))
-        .err(),
+        rsbinder::serve(KernelEndpoint::default().with_mmap_size(rsbinder::MAX_BINDER_MMAP_SIZE))
+            .err(),
         Some(StatusCode::BadValue),
         "a different mapping size cannot be applied to a process that already mapped one"
     );
@@ -101,22 +102,21 @@ fn a_kernel_option_the_process_cannot_honor_is_refused() {
     // this process cannot produce; the range and rounding contract is
     // covered by the unit tests in `process_state.rs`.
     assert_eq!(
-        rsbinder::serve("binder://?mmap=1").err(),
+        rsbinder::serve(KernelEndpoint::default().with_mmap_size(1)).err(),
         Some(StatusCode::BadValue),
         "below the floor must be refused"
     );
     assert_eq!(
-        rsbinder::serve(&format!(
-            "binder://?mmap={}",
-            rsbinder::MAX_BINDER_MMAP_SIZE + 1
-        ))
+        rsbinder::serve(
+            KernelEndpoint::default().with_mmap_size(rsbinder::MAX_BINDER_MMAP_SIZE + 1)
+        )
         .err(),
         Some(StatusCode::BadValue),
         "above the driver's silent 4 MB clamp must be refused, not clamped"
     );
     assert_eq!(
-        rsbinder::serve("binder://")
-            .expect("parse")
+        rsbinder::serve(Uri::kernel())
+            .expect("serve")
             .with(|o| o.mmap_size = Some(rsbinder::MAX_BINDER_MMAP_SIZE))
             .spawn()
             .err(),
@@ -124,13 +124,66 @@ fn a_kernel_option_the_process_cannot_honor_is_refused() {
         "ServeOptions::mmap_size must follow the same rule as `?mmap=`"
     );
     assert_eq!(
-        rsbinder::Client::open_with("binder://", |o, _| {
+        rsbinder::Client::open_with(Uri::kernel(), |o, _| {
             o.mmap_size = Some(rsbinder::MAX_BINDER_MMAP_SIZE)
         })
         .err(),
         Some(StatusCode::BadValue),
         "and so must ClientOptions::mmap_size"
     );
-    rsbinder::Client::open_with("binder://", |o, _| o.mmap_size = Some(in_force))
+    rsbinder::Client::open_with(Uri::kernel(), |o, _| o.mmap_size = Some(in_force))
         .expect("the size already in force must be accepted on the client path too");
+}
+
+/// A kernel server registers its names at `spawn`, after the options are checked.
+#[test]
+#[ignore = "requires kernel binder (/dev/binder) and a running service manager (rsb_hub)"]
+fn a_kernel_server_registers_nothing_until_it_starts() {
+    let name = format!("rsb.entry.optfail.{}", std::process::id());
+    let svc = || rsbinder::Interface::as_binder(&rsbinder::Binder::new(Inert));
+
+    // An option the kernel cannot honor fails the start, and the name never reaches the hub.
+    let err = rsbinder::serve(Uri::kernel())
+        .expect("serve")
+        .add(&name, svc())
+        .expect("add only queues the name")
+        .with(|o| o.idle_timeout = Some(std::time::Duration::from_secs(1)))
+        .spawn()
+        .err();
+    assert_eq!(err, Some(StatusCode::BadValue), "idle_timeout is RPC-only");
+    assert!(
+        rsbinder::hub::check_service(&name).is_none(),
+        "a server that failed to start must not leave {name} registered without a thread pool"
+    );
+
+    // A name the service manager refuses is reported by `spawn`, where it is registered.
+    let refused = rsbinder::serve(Uri::kernel())
+        .expect("serve")
+        .add("no spaces allowed", svc())
+        .expect("add only queues the name; the service manager has not seen it yet")
+        .spawn();
+    assert!(refused.is_err(), "an invalid name must fail the start");
+}
+
+struct Inert;
+
+impl rsbinder::Interface for Inert {}
+
+impl rsbinder::Remotable for Inert {
+    fn descriptor() -> &'static str {
+        "rsb.entry.Inert"
+    }
+
+    fn on_transact(
+        &self,
+        _code: rsbinder::TransactionCode,
+        _reader: &mut rsbinder::Parcel,
+        _reply: &mut rsbinder::Parcel,
+    ) -> rsbinder::Result<()> {
+        Err(StatusCode::UnknownTransaction)
+    }
+
+    fn on_dump(&self, _writer: &mut dyn std::io::Write, _args: &[String]) -> rsbinder::Result<()> {
+        Ok(())
+    }
 }

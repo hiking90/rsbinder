@@ -86,7 +86,7 @@ impl IRpcSmoke for KernelSvc {
 fn rpc_client_reaches_a_kernel_service_through_a_gateway() {
     // Child role (C): publish on kernel binder and block.
     if let Ok(name) = std::env::var("RSB_GW_KERNEL_SERVICE") {
-        rsbinder::serve("binder://")
+        rsbinder::serve(rsbinder::Uri::kernel())
             .expect("serve kernel")
             .add(
                 &name,
@@ -104,7 +104,7 @@ fn rpc_client_reaches_a_kernel_service_through_a_gateway() {
     let mut sock = std::env::temp_dir();
     sock.push(format!("rsb_gw_kernel.{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&sock);
-    let uri = format!("unix://{}", sock.display());
+    let uri = rsbinder::Endpoint::unix(&sock);
 
     let exe = std::env::current_exe().expect("current_exe");
     let child = std::process::Command::new(exe)
@@ -120,11 +120,11 @@ fn rpc_client_reaches_a_kernel_service_through_a_gateway() {
     let mut kill = KillOnDrop(child);
 
     // B — the gateway: a kernel proxy of C, re-published on a socket.
-    // Polled rather than `connect("binder://…")`: `waitForService` waits
+    // Polled rather than kernel `connect`: `waitForService` waits
     // forever on a name that is never registered, so a child that dies on
     // `addService` (a service manager that is not permissive) would hang
     // the job instead of failing the test.
-    let client = rsbinder::Client::open("binder://").expect("kernel client");
+    let client = rsbinder::Client::open(rsbinder::Uri::kernel()).expect("kernel client");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let upstream: Strong<dyn IRpcSmoke> = loop {
         if let Some(s) = client.try_get::<dyn IRpcSmoke>(&name).expect("try_get") {
@@ -165,7 +165,7 @@ fn rpc_client_reaches_a_kernel_service_through_a_gateway() {
         .expect("spawn rpc");
 
     // A — pure RPC; it never learns the kernel exists.
-    let a: Strong<dyn IRpcSmoke> = rsbinder::connect(&format!("{uri}#smoke")).expect("A→B");
+    let a: Strong<dyn IRpcSmoke> = rsbinder::connect(uri.with_service("smoke")).expect("A→B");
     assert_eq!(
         a.r#echo("hi").expect("echo through the gateway"),
         "kernel:hi",

@@ -73,9 +73,9 @@ impl ICodegenShapes for Shapes {
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 
-    let server = rsbinder::serve("binder://")?;
+    let server = rsbinder::serve(Uri::kernel())?;
     let service = BnCodegenShapes::new_binder(Shapes);
-    let server = server.add(SERVICE_NAME, &service)?;
+    let _server = server.add(SERVICE_NAME, &service)?.spawn()?;
     eprintln!("SHAPES_SERVICE_READY {SERVICE_NAME}");
-    Ok(server.run()?)
+    Ok(ProcessState::join_thread_pool()?)
 }

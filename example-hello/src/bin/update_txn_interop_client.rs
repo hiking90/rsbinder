@@ -133,7 +133,7 @@ fn extended_error_round() -> std::result::Result<(), String> {
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let client = match rsbinder::Client::open("binder://") {
+    let client = match rsbinder::Client::open(Uri::kernel()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("kernel client init failed: {e}");

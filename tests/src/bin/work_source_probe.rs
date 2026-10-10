@@ -107,15 +107,17 @@ fn forward(binder: &SIBinder, set: i32) -> Result<(i32, i32)> {
 
 fn serve(name: &str, next: Option<String>) -> Result<()> {
     let probe = Binder::new(Probe { next });
-    let server = rsbinder::serve("binder://")?.add(name, Interface::as_binder(&probe))?;
+    let _server = rsbinder::serve(Uri::kernel())?
+        .add(name, Interface::as_binder(&probe))?
+        .spawn()?;
     println!("SERVING {name}");
     use std::io::Write;
     std::io::stdout().flush().ok();
-    server.run()
+    ProcessState::join_thread_pool()
 }
 
 fn check(front: &str) -> Result<bool> {
-    rsbinder::Client::open("binder://")?;
+    rsbinder::Client::open(Uri::kernel())?;
     let front = lookup(front)?;
     let mut ok = true;
     let mut expect = |name: &str, got: String, want: String| {
@@ -170,7 +172,7 @@ fn check(front: &str) -> Result<bool> {
 }
 
 fn get_once(name: &str, uid: &str) -> Result<(i32, bool)> {
-    rsbinder::Client::open("binder://")?;
+    rsbinder::Client::open(Uri::kernel())?;
     if uid != "unset" {
         set_calling_work_source_uid(uid.parse().map_err(|_| StatusCode::BadValue)?);
     }

@@ -114,15 +114,17 @@ fn serve(name: &str) -> Result<()> {
         lines: lines.clone(),
     })));
     let svc = BnTraceDemo::new_binder(Svc { lines });
-    let server = rsbinder::serve("binder://")?.add(name, svc.as_binder())?;
+    let _server = rsbinder::serve(Uri::kernel())?
+        .add(name, svc.as_binder())?
+        .spawn()?;
     println!("SERVING {name}");
     use std::io::Write;
     std::io::stdout().flush().ok();
-    server.run()
+    ProcessState::join_thread_pool()
 }
 
 fn check(name: &str) -> Result<bool> {
-    let svc: Strong<dyn ITraceDemo> = rsbinder::connect(&format!("binder://{name}"))?;
+    let svc: Strong<dyn ITraceDemo> = rsbinder::connect(Uri::kernel().with_service(name))?;
     let mut ok = true;
 
     if let Err(e) = svc.ping() {

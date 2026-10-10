@@ -19,7 +19,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use rsbinder::{interface, BinderEnum, BinderResult, Interface, Parcelable, Strong};
+use rsbinder::{interface, BinderEnum, BinderResult, Endpoint, Interface, Parcelable, Strong, Uri};
 
 #[interface(descriptor = "rsbinder.test.IMacroEcho")]
 pub trait IMacroEcho {
@@ -157,8 +157,11 @@ impl SockPath {
         let _ = std::fs::remove_file(&p);
         SockPath(p)
     }
-    fn uri(&self, frag: &str) -> String {
-        format!("unix://{}{frag}", self.0.display())
+    fn uri(&self) -> Uri {
+        Uri::new(Endpoint::unix(&self.0))
+    }
+    fn service(&self, name: &str) -> Uri {
+        Endpoint::unix(&self.0).with_service(name)
     }
 }
 impl Drop for SockPath {
@@ -171,7 +174,7 @@ impl Drop for SockPath {
 fn macro_interface_round_trips_over_rpc() {
     let sock = SockPath::new("echo");
     let pinged = Arc::new(Mutex::new(0));
-    let _guard = rsbinder::serve(&sock.uri(""))
+    let _guard = rsbinder::serve(sock.uri())
         .expect("serve")
         .add(
             "echo",
@@ -183,7 +186,7 @@ fn macro_interface_round_trips_over_rpc() {
         .spawn()
         .expect("spawn");
 
-    let echo: Strong<dyn IMacroEcho> = rsbinder::connect(&sock.uri("#echo")).expect("connect");
+    let echo: Strong<dyn IMacroEcho> = rsbinder::connect(sock.service("echo")).expect("connect");
 
     assert_eq!(echo.echo("hi").unwrap(), "echo:hi");
     assert_eq!(echo.add(40, 2).unwrap(), 42);
@@ -210,7 +213,7 @@ fn macro_interface_round_trips_over_rpc() {
 #[test]
 fn macro_interface_carries_a_callback_binder() {
     let sock = SockPath::new("cb");
-    let _guard = rsbinder::serve(&sock.uri(""))
+    let _guard = rsbinder::serve(sock.uri())
         .expect("serve")
         .add(
             "echo",
@@ -222,7 +225,7 @@ fn macro_interface_carries_a_callback_binder() {
         .spawn()
         .expect("spawn");
 
-    let echo: Strong<dyn IMacroEcho> = rsbinder::connect(&sock.uri("#echo")).expect("connect");
+    let echo: Strong<dyn IMacroEcho> = rsbinder::connect(sock.service("echo")).expect("connect");
     let seen = Arc::new(Mutex::new(Vec::new()));
     let sink = BnMacroSink::new_binder(Sink { seen: seen.clone() });
 
@@ -249,7 +252,7 @@ fn macro_interface_gateway_republishes_a_proxy() {
     let up = SockPath::new("gwup");
     let down = SockPath::new("gwdown");
 
-    let _c = rsbinder::serve(&up.uri(""))
+    let _c = rsbinder::serve(up.uri())
         .expect("serve")
         .add(
             "echo",
@@ -261,15 +264,15 @@ fn macro_interface_gateway_republishes_a_proxy() {
         .spawn()
         .expect("spawn");
 
-    let upstream: Strong<dyn IMacroEcho> = rsbinder::connect(&up.uri("#echo")).expect("connect");
-    let _b = rsbinder::serve(&down.uri(""))
+    let upstream: Strong<dyn IMacroEcho> = rsbinder::connect(up.service("echo")).expect("connect");
+    let _b = rsbinder::serve(down.uri())
         .expect("serve")
         .add("echo", BnMacroEcho::new_binder(upstream))
         .expect("the macro path yields the same one-line gateway")
         .spawn()
         .expect("spawn");
 
-    let via: Strong<dyn IMacroEcho> = rsbinder::connect(&down.uri("#echo")).expect("connect");
+    let via: Strong<dyn IMacroEcho> = rsbinder::connect(down.service("echo")).expect("connect");
     assert_eq!(via.echo("hi").unwrap(), "echo:hi");
     assert_eq!(via.add(40, 2).unwrap(), 42);
 }
@@ -277,7 +280,7 @@ fn macro_interface_gateway_republishes_a_proxy() {
 #[test]
 fn macro_interface_can_reference_itself() {
     let sock = SockPath::new("chain");
-    let _guard = rsbinder::serve(&sock.uri(""))
+    let _guard = rsbinder::serve(sock.uri())
         .expect("serve")
         .add(
             "chain",
@@ -289,7 +292,7 @@ fn macro_interface_can_reference_itself() {
         .spawn()
         .expect("spawn");
 
-    let chain: Strong<dyn IMacroChain> = rsbinder::connect(&sock.uri("#chain")).expect("connect");
+    let chain: Strong<dyn IMacroChain> = rsbinder::connect(sock.service("chain")).expect("connect");
     let local = BnMacroChain::new_binder(Chain {
         tag: "local".into(),
     });
@@ -301,14 +304,14 @@ fn macro_interface_can_reference_itself() {
 #[test]
 fn derived_parcelable_and_enum_cross_the_wire() {
     let sock = SockPath::new("data");
-    let _guard = rsbinder::serve(&sock.uri(""))
+    let _guard = rsbinder::serve(sock.uri())
         .expect("serve")
         .add("data", BnMacroData::new_binder(Data))
         .expect("add")
         .spawn()
         .expect("spawn");
 
-    let data: Strong<dyn IMacroData> = rsbinder::connect(&sock.uri("#data")).expect("connect");
+    let data: Strong<dyn IMacroData> = rsbinder::connect(sock.service("data")).expect("connect");
 
     let cfg = Config {
         name: "cfg".into(),

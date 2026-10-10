@@ -35,9 +35,9 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     // `kernel` / `rpc` are shorthands; anything else is taken as a URI.
     let uri = match std::env::args().nth(1).as_deref() {
-        Some("kernel") => "binder://".to_string(),
-        Some("rpc") => format!("unix://{RPC_SOCKET}"),
-        Some(uri) => uri.to_string(),
+        Some("kernel") => Uri::kernel(),
+        Some("rpc") => Uri::new(Endpoint::unix(RPC_SOCKET)),
+        Some(uri) => uri.parse::<Uri>()?,
         None => {
             eprintln!("usage: unified_service <kernel|rpc|URI>");
             std::process::exit(2);
@@ -46,7 +46,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("unified_service: serving {SERVICE_NAME} at {uri}");
     // Kernel: init + thread pool + service manager + join. RPC: bind the
     // socket, publish, accept loop. Same three calls either way.
-    rsbinder::serve(&uri)?
+    rsbinder::serve(uri)?
         .add(SERVICE_NAME, BnHello::new_binder(IHelloService {}))?
         .run()?;
     Ok(())

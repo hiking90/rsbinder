@@ -48,11 +48,39 @@ change bytes between peers: upgrade both ends together.
   `FailedTransaction`.
 - **wire**: `FLAG_COLLECT_NOTED_APP_OPS` is `0x2`, not `0x80`.
 
+**Entry API (`serve` / `connect`)**
+
+- `serve`, `connect`, `connect_binder`, `connect_async`, `Client::open` and
+  `Client::open_with` take `impl Into<Uri>`, not `&str`; parse a string with
+  `.parse::<Uri>()?`.
+- `Endpoint::Kernel` holds a `KernelEndpoint`; `Endpoint::Vsock` and
+  `Endpoint::Tls` have named fields.
+- `Uri`'s fields are private and `wire_max_version` is `wire()`
+  (`WireProfile`); `rsbinder::entry::uri::parse` is gone.
+- A `tls://` host is percent-decoded, so an IPv6 zone id is written `%25`
+  (`tls://[fe80::1%25eth0]:9000`; a client also sets
+  `ClientOptions::tls_server_name`, since the host is the default TLS server
+  name and a server name cannot hold a zone id). Its `[ ]`, if any, must be
+  one pair enclosing the whole host, and a host holding `:` needs them
+  (`tls://[[::1]]:9000`, `tls://[::1:9000`, `tls://::1:9000` are
+  `BadBrackets`); `tls://[]:<port>` is `EmptyHost`.
+- A query key given twice is refused (`DuplicateQueryKey`), not
+  last-value-wins.
+- A `?query` after `#service` is refused (`QueryAfterService`), not part of
+  the service name.
+- A `unix://` path or `?driver=` may hold percent-escaped bytes that are not
+  UTF-8.
+- `?profile=android13plus-vN` accepts any decimal spelling of `N` (`-v02`).
+- A kernel `Server::add` queues the name; `run` / `spawn` register it, after
+  the options are checked and the thread pool is started. Print a readiness
+  line after `spawn()?` (then `ProcessState::join_thread_pool()`), not
+  between `add` and `run`. A registration error is returned by `run` /
+  `spawn`, not `add`.
+
 **Kernel binder, `Parcel` and process state**
 
-- `Endpoint::Kernel` gained an `mmap_size` field.
 - A kernel option `serve` / `Client::open` cannot honor is `BadValue`, not a
-  warning.
+  warning; so is a kernel driver path that is not UTF-8.
 - `ServerGuard` and `Server` are `#[must_use]`.
 - A kernel transaction dispatched inside an RPC handler reports the kernel
   caller.
@@ -157,7 +185,7 @@ change bytes between peers: upgrade both ends together.
 ### Added
 
 - **`rsbinder::Reconnecting`** (`rsbinder::reconnect`): a handle to one
-  service, named by a URI, that looks it up again after its process dies or
+  service, named by a `Uri`, that looks it up again after its process dies or
   its RPC session ends and reruns an `on_connect` hook. Book: "Reconnecting
   to a Service".
 - **Streaming with back-pressure** (`rsbinder::stream`): `Sink<T>` and
@@ -193,7 +221,8 @@ change bytes between peers: upgrade both ends together.
 - **Typed service-specific errors** (`ServiceSpecificError`,
   `#[derive(ServiceSpecificError)]`) and **`Status::message()`**.
 - **A configurable receive mapping**: `ProcessState::init_with_mmap_size`,
-  `binder://?mmap=`, `ClientOptions::mmap_size`.
+  `KernelEndpoint::with_mmap_size` (`binder://?mmap=`),
+  `ClientOptions::mmap_size`.
 - **`TransportCaps`**: what a transport can do, from `Client::caps()`,
   `RpcSession::caps()` or `calling_caps()`.
 - **`wait_for_interface_async`, `check_interface_async` and `death_signal`**
@@ -220,6 +249,23 @@ change bytes between peers: upgrade both ends together.
   aborting the process.
 ### Changed
 
+- **The entry API takes a typed destination, `rsbinder::Uri`**, built from
+  `Uri::kernel()`, `Endpoint::unix` / `unix_abstract` / `vsock` / `tls`,
+  `KernelEndpoint` and `with_service` / `with_wire`, or parsed from a string
+  with the same schemes and query keys as before (`Uri::parse`, `str::parse`;
+  what the parser now accepts or refuses differently is under *Migrating*,
+  "Entry API"). A parse failure is a `UriError` whose `kind()` says why; it
+  converts into `StatusCode::BadValue` for `?`, logging the reason. `Display`
+  writes the string form back, and parsing it yields the same `Uri` for every
+  value `serve` / `connect` accept, so a Unix path or driver path with `#`,
+  `?`, `%` or non-UTF-8 bytes is now expressible (a non-UTF-8 driver path is
+  still `BadValue` at `serve` / `connect`, since `ProcessState` opens a
+  `&str`). `serve` / `connect` refuse with `BadValue` the values the
+  string form cannot carry: a relative Unix path, an empty abstract name, TLS
+  host or service name, and a kernel endpoint with
+  `WireProfile::Android13Plus`. `connect_async` converts its argument at the
+  call, so its future no longer borrows it. `KernelEndpoint`, `WireProfile`,
+  `WireVersion`, `UriError` and `UriErrorKind` are in `rsbinder::entry`.
 - **`rsbinder-aidl` warns on a bare `@nullable` field that closes a reference
   cycle**, which AOSP `aidl` rejects; write `@nullable(heap=true)`.
 - **A kernel proxy's cache entry and `BC_INCREFS` reference are released when
@@ -305,7 +351,7 @@ Kernel binder and `Parcel`:
 - **`get_extended_error()` returns `InvalidOperation`** on a driver without
   `BINDER_GET_EXTENDED_ERROR`, as documented.
 - **`list_services` on Android 10 no longer stops at a 127-character name.**
-- **`connect_async("binder://…")` can be cancelled** by dropping the future.
+- **`connect_async` on a kernel endpoint can be cancelled** by dropping the future.
 - **A synchronous handle to a local async service no longer panics when called
   from async code**; see `TokioRuntime`'s docs for the cases left.
 

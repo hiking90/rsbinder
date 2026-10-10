@@ -4156,7 +4156,9 @@ fn entry_client_open_with_incoming() {
         },
     );
     let path = h.server.path().expect("unix path").to_path_buf();
-    let uri = format!("unix://{}?profile=android13plus", path.display());
+    let r34 = rsbinder::Uri::new(rsbinder::Endpoint::unix(&path));
+    let a13 = rsbinder::entry::WireProfile::Android13Plus(rsbinder::entry::WireVersion::MAX);
+    let uri = r34.clone().with_wire(a13);
     let client = rsbinder::Client::open_with(&uri, |o, _| o.incoming_connections = Some(1))
         .expect("open with incoming");
     let session = client.session().expect("rpc session");
@@ -4166,7 +4168,6 @@ fn entry_client_open_with_incoming() {
     session.close_session();
     assert_eq!(slots, 2);
     assert_eq!(threads, 1);
-    let r34 = format!("unix://{}", path.display());
     assert!(matches!(
         rsbinder::Client::open_with(&r34, |o, _| o.incoming_connections = Some(1)).map(|_| ()),
         Err(StatusCode::BadValue)

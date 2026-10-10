@@ -40,13 +40,13 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     //     features.set_requesting_sid = true;
     //     let service = BnHello::new_binder_with_features(IHelloService {}, features);
 
-    // `serve("binder://")` initializes the kernel binder `ProcessState`;
-    // `add` registers with the service manager (anything `Into<SIBinder>`
-    // — pass `&service` to keep the local handle alive); `run` starts the
-    // thread pool and joins it. The same three calls with
-    // `serve("unix:///tmp/hello.sock")` would serve over RPC instead.
+    // `serve(Uri::kernel())` initializes the kernel binder `ProcessState`;
+    // `add` names the service (anything `Into<SIBinder>` — pass `&service`
+    // to keep the local handle alive); `run` starts the thread pool,
+    // registers with the service manager and joins. The same three calls with
+    // `serve(Endpoint::unix("/tmp/hello.sock"))` would serve over RPC instead.
     println!("Serving {SERVICE_NAME} over kernel binder...");
-    rsbinder::serve("binder://")?
+    rsbinder::serve(Uri::kernel())?
         .add(SERVICE_NAME, &service)?
         .run()?;
     Ok(())

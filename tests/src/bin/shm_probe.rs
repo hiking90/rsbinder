@@ -52,7 +52,7 @@ fn checksum_step(acc: u32, off: usize, bytes: &[u8]) -> u32 {
 }
 
 fn serve(name: &str, len: usize) -> Result<()> {
-    let server = rsbinder::serve("binder://")?;
+    let server = rsbinder::serve(Uri::kernel())?;
     let heap = Arc::new(MemoryHeapBase::new(len, 0)?);
     let mut off = 0;
     while off < len {
@@ -67,15 +67,15 @@ fn serve(name: &str, len: usize) -> Result<()> {
         0,
         len,
     )?);
-    let server = server.add(name, memory.export())?;
+    let _server = server.add(name, memory.export())?.spawn()?;
     println!("SERVING {name} {len}");
     use std::io::Write;
     std::io::stdout().flush().ok();
-    server.run()
+    ProcessState::join_thread_pool()
 }
 
 fn open(name: &str) -> Result<BpMemory> {
-    let binder = rsbinder::Client::open("binder://")
+    let binder = rsbinder::Client::open(Uri::kernel())
         .and_then(|_| hub::check_service(name).ok_or(StatusCode::NameNotFound))?;
     let bp = BpMemory::new(binder);
     bp.resolve()?;

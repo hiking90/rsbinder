@@ -89,11 +89,13 @@ fn serve(name: &str) -> Result<()> {
     let probe = Binder::new(Probe {
         current: Mutex::new(None),
     });
-    let server = rsbinder::serve("binder://")?.add(name, Interface::as_binder(&probe))?;
+    let _server = rsbinder::serve(Uri::kernel())?
+        .add(name, Interface::as_binder(&probe))?
+        .spawn()?;
     println!("SERVING {name}");
     use std::io::Write;
     std::io::stdout().flush().ok();
-    server.run()
+    ProcessState::join_thread_pool()
 }
 
 fn status(remote: &dyn RemoteProxy) -> Result<bool> {
@@ -107,7 +109,7 @@ fn status(remote: &dyn RemoteProxy) -> Result<bool> {
 }
 
 fn cancel(name: &str) -> Result<()> {
-    let binder = rsbinder::Client::open("binder://")
+    let binder = rsbinder::Client::open(Uri::kernel())
         .and_then(|_| hub::check_service(name).ok_or(StatusCode::NameNotFound))?;
     let remote = binder.as_remote().ok_or_else(|| {
         eprintln!("cancel_probe: {name} is local to this process, not a proxy");

@@ -70,7 +70,7 @@ fn get_test_service() -> rsbinder::Strong<dyn ITestService::ITestService> {
         })
 }
 
-/// Plan 2-17 entry API on the kernel transport: `Client::open("binder://")`
+/// Plan 2-17 entry API on the kernel transport: `Client::open(Uri::kernel())`
 /// resolves the running test service exactly like `hub` does. `try_get` (not
 /// `get`) keeps the failure fast and self-describing — `get` waits for
 /// registration, so an absent service would hang the suite instead of
@@ -83,7 +83,7 @@ fn get_test_service() -> rsbinder::Strong<dyn ITestService::ITestService> {
 fn test_entry_kernel_client_parity() {
     init_test();
     let desc = <BpTestService as ITestService::ITestService>::descriptor();
-    let client = rsbinder::Client::open("binder://").expect("Client::open(binder://)");
+    let client = rsbinder::Client::open(rsbinder::Uri::kernel()).expect("Client::open(binder://)");
     let service: rsbinder::Strong<dyn ITestService::ITestService> = client
         .try_get(desc)
         .expect("Client::try_get")
@@ -92,7 +92,8 @@ fn test_entry_kernel_client_parity() {
     // `connect` is the one-call form; it waits, which is right for a client
     // but is why the lookup above uses `try_get`.
     let direct: rsbinder::Strong<dyn ITestService::ITestService> =
-        rsbinder::connect(&format!("binder://{desc}")).expect("connect(binder://name)");
+        rsbinder::connect(rsbinder::Uri::kernel().with_service(desc))
+            .expect("connect(binder://name)");
     assert_eq!(direct.RepeatString("connect"), Ok("connect".to_string()));
 }
 

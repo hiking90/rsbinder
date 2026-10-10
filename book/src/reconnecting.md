@@ -8,10 +8,10 @@ registering your callbacks again. `rsbinder::Reconnecting` does that for one
 service.
 
 ```rust,ignore
-use rsbinder::Reconnecting;
+use rsbinder::{Endpoint, Reconnecting};
 
 let listener = listener.clone();
-let hello = Reconnecting::<dyn IHello>::builder("unix:///run/hello.sock#hello")
+let hello = Reconnecting::<dyn IHello>::builder(Endpoint::unix("/run/hello.sock").with_service("hello"))
     .on_connect(move |conn| {
         // Every (re)connection, before callers get the new proxy.
         conn.proxy().register_listener(&listener)?;
@@ -22,9 +22,10 @@ let hello = Reconnecting::<dyn IHello>::builder("unix:///run/hello.sock#hello")
 let reply = hello.with(|h| h.echo("hi"))?;
 ```
 
-The URI is any the [entry API](./rpc-transport.md) takes: `binder://name`
-for the service manager, or an RPC endpoint with `#name`. Leave the fragment
-out to connect to a server's root object — the form a libbinder
+The `Uri` is any the [entry API](./cross-transport-services.md) takes: a
+kernel endpoint with a service name (`Uri::kernel().with_service(name)`,
+`binder://name`) for the service manager, or an RPC endpoint with one
+(`#name`). Leave the service name out to connect to a server's root object — the form a libbinder
 `RpcServer::setRootObject` server needs, since only an rsbinder server has a
 directory of names.
 
@@ -67,8 +68,9 @@ waiting, for async code that must not block.
 ## Starting before the server
 
 `build()` tries once without waiting. It fails only for what another
-attempt cannot change — a malformed URI, options that do not fit it, a
-missing feature, no binder device for a kernel URI (`NoInit`), a kernel
+attempt cannot change — a `Uri` that `serve` / `connect` would refuse,
+options that do not fit it, a missing feature, a kernel endpoint without a
+service name, no binder device for a kernel endpoint (`NoInit`), a kernel
 service of another interface (`BadType`), an RPC name lookup on a server
 without a directory of names (`BadType`), a name the service manager
 refuses to watch, or

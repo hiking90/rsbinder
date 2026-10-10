@@ -7,9 +7,10 @@ runs unchanged over kernel binder or RPC. What differs is only the
 service manager, while RPC uses `RpcServer` / `RpcSession`.
 
 `rsbinder::serve` and `rsbinder::connect` make that bootstrap
-transport-agnostic too: the transport is a **URI**, and everything else is
-the same three calls. The low-level APIs remain the direct path and are
-unchanged; this is a thin layer over them with no wire change.
+transport-agnostic too: the destination is a **`Uri`** value, and
+everything else is the same three calls. The low-level APIs remain the
+direct path and are unchanged; this is a thin layer over them with no wire
+change.
 
 ## Three lines per side
 
@@ -17,40 +18,77 @@ unchanged; this is a thin layer over them with no wire change.
 use rsbinder::*;
 
 // Server — kernel binder: ProcessState init + thread pool + service
-// manager registration + join. The same code with "unix:///tmp/x.sock"
+// manager registration + join. The same code with Endpoint::unix("/tmp/x.sock")
 // binds a socket, publishes the service, and runs the accept loop.
-rsbinder::serve("binder://")?
+rsbinder::serve(Uri::kernel())?
     .add("hello", BnHello::new_binder(MyService))?
     .run()?;
 
 // Client — open, look up, cast. The proxy alone keeps an RPC session
 // alive; there is nothing else to hold.
-let hello: Strong<dyn IHello> = rsbinder::connect("binder://hello")?;
-//  rsbinder::connect("unix:///tmp/x.sock#hello")?
+let hello: Strong<dyn IHello> = rsbinder::connect(Uri::kernel().with_service("hello"))?;
+//  rsbinder::connect(Endpoint::unix("/tmp/x.sock").with_service("hello"))?
 hello.echo("hi")?;
 ```
 
-## URIs
+## Destinations: `Uri`
+
+A `Uri` is an `Endpoint` (where), an optional service name (what to look
+up), and the RPC wire to speak. `serve`, `connect`, `Client::open` and
+`Reconnecting::builder` take anything that converts into one: a `Uri`, a
+`&Uri`, an `Endpoint`, or a `KernelEndpoint`.
+
+| Endpoint | Constructor | Notes |
+|---|---|---|
+| kernel binder | `Uri::kernel()`, `Endpoint::kernel()`, `KernelEndpoint::default().with_driver(..).with_threads(..).with_mmap_size(..)` | settings apply to the process-wide `ProcessState` |
+| Unix socket | `Endpoint::unix(path)` | absolute path; any bytes the OS accepts |
+| abstract Unix socket | `Endpoint::unix_abstract(name)` | Linux/Android |
+| vsock | `Endpoint::vsock(cid, port)` | feature `rpc-vsock` |
+| TLS over TCP | `Endpoint::tls(host, port)` | feature `rpc-tls` (TCP is TLS-only) |
+
+- `endpoint.with_service("hello")` (or `uri.with_service(..)`) names the
+  service. `serve()` ignores it, so a server and its clients can share one
+  value; `connect()` requires it; `Client::open()` rejects it.
+- `uri.with_wire(WireProfile::Android13Plus(WireVersion::MAX))` selects the
+  AOSP versioned wire on an RPC endpoint; the default `WireProfile::R34`
+  speaks the r34 wire. A kernel endpoint takes only `R34`.
+- `KernelEndpoint::with_mmap_size` sizes the mapping this process receives
+  transactions into — the real meaning of the "1 MB binder limit". See
+  [Receive mapping size](#receive-mapping-size).
+- `KernelEndpoint`, `WireProfile`, `WireVersion`, `UriError` and
+  `UriErrorKind` live in `rsbinder::entry`.
+
+### String form
+
+Configuration files and command lines carry the same value as a string.
+Parse it explicitly — the entry functions take no `&str`:
+
+```rust
+let uri: Uri = config.target.parse()?;      // or Uri::parse(&config.target)?
+let hello: Strong<dyn IHello> = rsbinder::connect(uri)?;
+```
 
 ```text
 binder://[<service>][?driver=<path>&threads=<n>&mmap=<bytes>]
 unix://<abs-path>[#<service>]               (three slashes: unix:///tmp/x.sock)
 unix-abstract://<name>[#<service>]          Linux/Android
 vsock://<cid>:<port>[#<service>]            feature rpc-vsock
-tls://<host>:<port>[#<service>]             feature rpc-tls (TCP is TLS-only)
+tls://<host>:<port>[#<service>]             feature rpc-tls; IPv6 host in [ ]
 ```
 
 - The service name is the `#fragment`; `binder://name` is a shorthand for
   `binder://#name`.
-- `?profile=android13plus[-vN]` on any RPC scheme selects the AOSP
-  versioned wire (default `v2`); without it the session speaks the r34 wire.
-- `?mmap=<bytes>` (kernel only) sizes the mapping this process receives
-  transactions into — the real meaning of the "1 MB binder limit". See
-  [Receive mapping size](#receive-mapping-size).
-- `serve()` ignores the fragment, `connect()` requires it, and
-  `Client::open()` rejects it.
-- An unknown scheme or query key, an empty `#`, or `binder://a#b` is
-  `StatusCode::BadValue` with a log line saying why.
+- `?profile=android13plus[-vN]` on any RPC scheme is
+  `WireProfile::Android13Plus` (`WireVersion::MAX` when `-vN` is omitted).
+- Paths, names, hosts and the service are percent-decoded, so a path with
+  `#`, `?`, `%` or bytes that are not UTF-8 is written escaped.
+- An unknown scheme or query key, a key given twice, an empty `#`, or
+  `binder://a#b` is a `UriError`; `uri_error.kind()` says which.
+  `UriError` converts into `StatusCode::BadValue` for `?` (logging the
+  reason) and implements `std::error::Error` for `Box<dyn Error>`.
+- `uri.to_string()` writes the string form back. Parsing it gives the same
+  `Uri`, for every value `serve` / `connect` accept — so build URIs with the
+  constructors, not with `format!`.
 
 ## `Server`
 
@@ -58,17 +96,17 @@ tls://<host>:<port>[#<service>]             feature rpc-tls (TCP is TLS-only)
 
 | | |
 |---|---|
-| `add(name, svc)` | publish `svc` (anything `Into<SIBinder>`, e.g. `BnFoo::new_binder(..)`). Kernel: registered with the service manager right away. RPC: queued until the server starts. |
+| `add(name, svc)` | publish `svc` (anything `Into<SIBinder>`, e.g. `BnFoo::new_binder(..)`). Queued; `run` / `spawn` register it after checking the options (kernel: with the service manager, once the thread pool is up; RPC: in the server's directory). |
 | `with(\|o\| ..)` | set [`ServeOptions`](#options) |
 | `run()` | serve and block. Kernel: start the thread pool and join it (never returns normally). RPC: the accept loop, until shut down. |
 | `spawn()` | serve in the background; returns a `ServerGuard`. RPC: dropping the guard (or `ServerGuard::stop_and_join()`) ends the server — every session is closed and the threads are joined. Kernel: the guard is inert (the process thread pool has no shutdown). |
 
-Kernel `serve("binder://")` initializes the process-wide `ProcessState`
+Kernel `serve(Uri::kernel())` initializes the process-wide `ProcessState`
 idempotently; a second kernel server in the same process reuses it, and is
 refused with `StatusCode::BadValue` if it asked for a different driver,
 thread count, or mapping size — the process cannot give it one. The refusal
-lands where the option is read: `serve()` itself for `?driver=` /
-`?threads=` / `?mmap=`, `run`/`spawn` for `ServeOptions::threads` and
+lands where the option is read: `serve()` itself for the `KernelEndpoint`
+settings (`?driver=` / `?threads=` / `?mmap=`), `run`/`spawn` for `ServeOptions::threads` and
 `ServeOptions::mmap_size`, and `open` for `ClientOptions::driver` and
 `ClientOptions::mmap_size`. RPC
 servers bind their listener at `run`/`spawn`, so options (TLS config, limits)
@@ -76,11 +114,11 @@ set via `with` apply first.
 
 ## `Client`
 
-`connect(uri)` is `Client::open(base)?.get(name)`. Keep a `Client` only to
+`connect(uri)` is `Client::open(endpoint)?.get(name)`. Keep a `Client` only to
 issue more lookups on the same endpoint:
 
 ```rust
-let c = rsbinder::Client::open("unix:///run/app.sock")?;
+let c = rsbinder::Client::open(Endpoint::unix("/run/app.sock"))?;
 let hello: Strong<dyn IHello> = c.get("hello")?;
 let stats: Strong<dyn IStats> = c.get("stats")?;
 drop(c);                                  // proxies stay valid
@@ -91,20 +129,20 @@ drop(c);                                  // proxies stay valid
 | `get::<T>(name)` | kernel: waits for registration (AOSP `waitForService`); RPC: one directory lookup, `NameNotFound` if absent |
 | `try_get::<T>(name)` | non-waiting; `Ok(None)` when absent |
 | `binder(name)` | untyped `SIBinder` |
-| `session()` | the underlying `RpcSession` (`None` on `binder://`) |
-| `endpoint()` | the parsed `Endpoint` (mirrors `Server::endpoint()`) |
+| `session()` | the underlying `RpcSession` (`None` on kernel binder) |
+| `endpoint()` | the `Endpoint` (mirrors `Server::endpoint()`) |
 
-`Client::open("binder://")` also starts the binder thread pool, so
+`Client::open(Uri::kernel())` also starts the binder thread pool, so
 callbacks, death notifications, and registration waits are delivered
 promptly.
 
 ## Options
 
-Anything that does not fit a URI goes through `ServeOptions` /
+Anything that is not part of the `Uri` goes through `ServeOptions` /
 `ClientOptions`:
 
 ```rust
-rsbinder::serve("tls://0.0.0.0:9000")?
+rsbinder::serve(Endpoint::tls("0.0.0.0", 9000))?
     .with(|o| {
         o.tls = Some(server_tls_config);          // rustls::ServerConfig (feature rpc-tls)
         o.max_connections = Some(64);
@@ -113,7 +151,7 @@ rsbinder::serve("tls://0.0.0.0:9000")?
     .add("hello", BnHello::new_binder(MyService))?
     .run()?;
 
-let hello: Strong<dyn IHello> = rsbinder::Client::open_with("tls://host:9000", |o, _endpoint| {
+let hello: Strong<dyn IHello> = rsbinder::Client::open_with(Endpoint::tls("host", 9000), |o, _endpoint| {
     o.tls = Some(client_tls_config);
 })?
 .get("hello")?;
@@ -137,7 +175,9 @@ is what bounds a call. rsbinder maps the same ~1 MB AOSP `libbinder` does;
 raise it on a service that must accept larger calls:
 
 ```rust
-rsbinder::serve("binder://?mmap=4194304")?          // 4 MB, the driver's ceiling
+use rsbinder::entry::KernelEndpoint;
+
+rsbinder::serve(KernelEndpoint::default().with_mmap_size(4 << 20))?   // 4 MB, the driver's ceiling
     .add("bulk", BnBulk::new_binder(MyService))?
     .run()?;
 ```
@@ -154,18 +194,19 @@ rsbinder::serve("binder://?mmap=4194304")?          // 4 MB, the driver's ceilin
   rest so an async flood cannot starve synchronous calls.
 - Only address space is reserved; pages are faulted in as they are used.
 - Process-wide and fixed at the first `serve` / `Client::open`, like
-  `?driver=` and `?threads=`. `ProcessState::init_with_mmap_size` is the
+  the driver and thread count. `ProcessState::init_with_mmap_size` is the
   direct form, and `ProcessState::mmap_size()` reports what is in force.
 - `ServeOptions::mmap_size` cannot make the mapping: `serve` initializes
   `ProcessState` before the option is read, so the field can only agree with
   the size already in force and a different one is `BadValue` at
   `run`/`spawn` — the same rule as `ServeOptions::threads`. What sets the
-  size on a kernel server is `binder://?mmap=`, or
-  `ProcessState::init_with_mmap_size` called before `serve`.
+  size on a kernel server is `KernelEndpoint::with_mmap_size`
+  (`binder://?mmap=`), or `ProcessState::init_with_mmap_size` called before
+  `serve`.
 
-`Client::open_with`'s closure also receives the parsed `Endpoint`, so an
-option that applies to only some transports is set from the endpoint rather
-than from the URI text:
+`Client::open_with`'s closure also receives the `Endpoint`, so an option
+that applies to only some transports can be set from it — useful when the
+`Uri` was parsed from configuration:
 
 ```rust
 let client = rsbinder::Client::open_with(&uri, |o, endpoint| {
@@ -175,14 +216,16 @@ let client = rsbinder::Client::open_with(&uri, |o, endpoint| {
 })?;
 ```
 
-An option that does not apply to the transport (a TLS config on
-`binder://`, `call_restriction` on `unix://`) is **`BadValue` at
+An option that does not apply to the transport (a TLS config on kernel
+binder, `call_restriction` on a Unix socket) is **`BadValue` at
 `run`/`spawn`/`open` time**, with a log line naming the option — never
-silently ignored. A kernel option that *does* apply but the process cannot
-honor — `?threads=` or `?driver=` against a `ProcessState` already
+silently ignored. A kernel setting that *does* apply but the process cannot
+honor — a thread count or driver against a `ProcessState` already
 initialized with another value — is refused the same way, at `serve()` for
-the URI form. Users who want that checked at compile time use the
-low-level types directly.
+the `KernelEndpoint` form. So is a `Uri` whose string form could not carry
+it: a relative Unix path, an empty abstract name, TLS host or service name,
+or a kernel endpoint with `WireProfile::Android13Plus`. Users who want that
+checked at compile time use the low-level types directly.
 
 ## Bridging two transports in one process
 
@@ -214,9 +257,9 @@ points at, that is one line:
 
 ```rust
 // B: reach C over kernel binder, re-publish it on a Unix socket.
-let upstream: Strong<dyn IHello> = rsbinder::connect("binder://my.hello")?;
+let upstream: Strong<dyn IHello> = rsbinder::connect(Uri::kernel().with_service("my.hello"))?;
 
-rsbinder::serve("unix:///tmp/rsb_gw.sock")?
+rsbinder::serve(Endpoint::unix("/tmp/rsb_gw.sock"))?
     .add("hello", BnHello::new_binder(upstream))?   // <- the gateway
     .run()?;
 ```
@@ -289,7 +332,7 @@ cargo run -p example-hello --features rpc --bin unified_client \
     unix:///tmp/rsb_gw.sock                                    # A
 ```
 
-## What the URI does *not* hide
+## What the `Uri` does *not* hide
 
 Moving a service between transports changes its trust boundary — read
 [Security & Authorization](./security.md).
@@ -316,7 +359,7 @@ you commit:
 ```rust,ignore
 use rsbinder::TransportCaps;
 
-let client = rsbinder::Client::open("unix:///run/app.sock")?;
+let client = rsbinder::Client::open(rsbinder::Endpoint::unix("/run/app.sock"))?;
 // Fails here, logging which bits are missing and when each one holds,
 // instead of on the first callback the server tries to make.
 client.caps().require(TransportCaps::CALLBACKS, "event subscription")?;
@@ -364,7 +407,7 @@ runs the connect on `spawn_blocking`. Async servers pass
 
 `example-hello` ships `bin/unified_service.rs` / `bin/unified_client.rs`:
 identical service, registration, and call code with the transport chosen by
-the argument (`kernel`, `rpc`, or any URI).
+the argument (`kernel`, `rpc`, or any URI string, parsed into a `Uri`).
 
 ```text
 cargo run -p example-hello --features rpc --bin unified_service rpc

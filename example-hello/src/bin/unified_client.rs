@@ -20,9 +20,9 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
     let base = match std::env::args().nth(1).as_deref() {
-        Some("kernel") => "binder://".to_string(),
-        Some("rpc") => format!("unix://{RPC_SOCKET}"),
-        Some(uri) => uri.to_string(),
+        Some("kernel") => Uri::kernel(),
+        Some("rpc") => Uri::new(Endpoint::unix(RPC_SOCKET)),
+        Some(uri) => uri.parse::<Uri>()?,
         None => {
             eprintln!("usage: unified_client <kernel|rpc|URI>");
             std::process::exit(2);
@@ -30,7 +30,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     };
     // `connect` = open the endpoint + look the name up + interface cast.
     // The proxy alone keeps an RPC session alive.
-    let hello: Strong<dyn IHello> = rsbinder::connect(&format!("{base}#{SERVICE_NAME}"))?;
+    let hello: Strong<dyn IHello> = rsbinder::connect(base.with_service(SERVICE_NAME))?;
     let reply = hello.echo("hello over rsbinder::connect")?;
     println!("unified_client: echo -> {reply:?}");
     Ok(())

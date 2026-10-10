@@ -66,14 +66,15 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use rsbinder::entry::{WireProfile, WireVersion};
 use rsbinder::rpc::rustls::pki_types::pem::PemObject;
 use rsbinder::rpc::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rsbinder::rpc::rustls::{ClientConfig, RootCertStore, ServerConfig};
 use rsbinder::rpc::transport::TlsTransport;
 use rsbinder::rpc::{AddressSpace, PeerIdentity, RpcError, RpcSession, RpcTransport};
 use rsbinder::{
-    Binder, Interface, Parcel, Remotable, Result, SIBinder, Status, StatusCode, TransactionCode,
-    FIRST_CALL_TRANSACTION,
+    Binder, Endpoint, Interface, Parcel, Remotable, Result, SIBinder, Status, StatusCode,
+    TransactionCode, Uri, FIRST_CALL_TRANSACTION,
 };
 
 const DESC: &str = "rsbinder.test.IPing";
@@ -234,7 +235,7 @@ fn tls_valid_cert_e2e_and_peer_identity() {
     );
     // The endpoint agrees, without needing a session at all.
     assert_eq!(
-        rsbinder::Endpoint::Tls("localhost".into(), addr.port()).static_caps(),
+        Endpoint::tls("localhost", addr.port()).static_caps(),
         TransportCaps::NONE
     );
 
@@ -429,7 +430,7 @@ fn setup_tcp_client_tls_convenience_e2e() {
 #[test]
 fn entry_tls_serve_and_client() {
     let svc = Interface::as_binder(&Binder::new(BnPing(Box::new(PingSvc))));
-    let guard = rsbinder::serve("tls://127.0.0.1:0")
+    let guard = rsbinder::serve(Endpoint::tls("127.0.0.1", 0))
         .expect("serve tls://")
         .with(|o| o.tls = Some(server_config(SRV_CRT, SRV_KEY)))
         .add("ping", svc)
@@ -443,7 +444,8 @@ fn entry_tls_serve_and_client() {
         .tcp_address()
         .expect("bound TCP address");
 
-    let client = rsbinder::Client::open_with(&format!("tls://{addr}"), |o, _endpoint| {
+    let endpoint = Endpoint::tls(addr.ip().to_string(), addr.port());
+    let client = rsbinder::Client::open_with(endpoint, |o, _endpoint| {
         o.tls = Some(client_config_trusting(CA));
         // The fixture cert names `localhost`, not the dialed address in the URI.
         o.tls_server_name = Some("localhost".to_string());
@@ -459,12 +461,12 @@ fn entry_tls_serve_and_client() {
 /// `tls://` without a config is refused on both sides before any socket work (URI has no trust).
 #[test]
 fn entry_tls_requires_explicit_config() {
-    let err = rsbinder::Client::open("tls://127.0.0.1:1")
+    let err = rsbinder::Client::open(Endpoint::tls("127.0.0.1", 1))
         .expect_err("tls:// without ClientOptions::tls must fail");
     assert_eq!(err, StatusCode::BadValue);
 
-    let err = rsbinder::serve("tls://127.0.0.1:0")
-        .expect("parse")
+    let err = rsbinder::serve(Endpoint::tls("127.0.0.1", 0))
+        .expect("serve")
         .spawn()
         .expect_err("tls:// without ServeOptions::tls must fail");
     assert_eq!(err, StatusCode::BadValue);
@@ -474,8 +476,8 @@ fn entry_tls_requires_explicit_config() {
 #[test]
 fn entry_tls_rejects_unix_fd_mode() {
     use rsbinder::rpc::FileDescriptorTransportMode;
-    let err = rsbinder::serve("tls://127.0.0.1:0")
-        .expect("parse")
+    let err = rsbinder::serve(Endpoint::tls("127.0.0.1", 0))
+        .expect("serve")
         .with(|o| {
             o.tls = Some(server_config(SRV_CRT, SRV_KEY));
             o.fd_modes = Some(vec![FileDescriptorTransportMode::Unix]);
@@ -484,7 +486,7 @@ fn entry_tls_rejects_unix_fd_mode() {
         .expect_err("Unix fd passing is not available over TLS");
     assert_eq!(err, StatusCode::BadValue);
 
-    let err = rsbinder::Client::open_with("tls://127.0.0.1:1", |o, _| {
+    let err = rsbinder::Client::open_with(Endpoint::tls("127.0.0.1", 1), |o, _| {
         o.tls = Some(client_config_trusting(CA));
         o.fd_mode = Some(FileDescriptorTransportMode::Unix);
     })
@@ -922,7 +924,8 @@ fn entry_tls_incoming_connections_carry_callbacks() {
     use rsbinder::TransportCaps;
 
     let held = Arc::new(Mutex::new(None));
-    let guard = rsbinder::serve("tls://127.0.0.1:0?profile=android13plus")
+    let android13plus = WireProfile::Android13Plus(WireVersion::MAX);
+    let guard = rsbinder::serve(Uri::new(Endpoint::tls("127.0.0.1", 0)).with_wire(android13plus))
         .expect("serve tls://")
         .with(|o| {
             o.tls = Some(server_config(SRV_CRT, SRV_KEY));
@@ -941,7 +944,9 @@ fn entry_tls_incoming_connections_carry_callbacks() {
         .tcp_address()
         .expect("bound TCP address");
     let open = |incoming: Option<u32>, outgoing: Option<u32>| {
-        rsbinder::Client::open_with(&format!("tls://{addr}?profile=android13plus"), |o, _| {
+        let uri =
+            Uri::new(Endpoint::tls(addr.ip().to_string(), addr.port())).with_wire(android13plus);
+        rsbinder::Client::open_with(uri, |o, _| {
             o.tls = Some(client_config_trusting(CA));
             o.tls_server_name = Some("localhost".to_string());
             o.incoming_connections = incoming;

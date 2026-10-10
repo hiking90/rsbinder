@@ -69,11 +69,14 @@ impl Remotable for Probe {
 
 fn serve(size: &str, name: &str) -> Result<()> {
     let uri = match size {
-        "default" => "binder://".to_string(),
-        n => format!("binder://?mmap={n}"),
+        "default" => entry::KernelEndpoint::default(),
+        n => entry::KernelEndpoint::default()
+            .with_mmap_size(n.parse().map_err(|_| StatusCode::BadValue)?),
     };
     let probe = Binder::new(Probe);
-    let server = rsbinder::serve(&uri)?.add(name, Interface::as_binder(&probe))?;
+    let _server = rsbinder::serve(uri)?
+        .add(name, Interface::as_binder(&probe))?
+        .spawn()?;
     println!(
         "SERVING {name} mmap={}",
         ProcessState::as_self().mmap_size()
@@ -82,7 +85,7 @@ fn serve(size: &str, name: &str) -> Result<()> {
     // to be flushed before this blocks forever.
     use std::io::Write;
     std::io::stdout().flush().ok();
-    server.run()
+    ProcessState::join_thread_pool()
 }
 
 /// `Ok(false)` = anything but the echo coming back, `FAILEDTXN` included;
@@ -91,7 +94,7 @@ fn serve(size: &str, name: &str) -> Result<()> {
 fn call(bytes: usize, name: &str) -> Result<bool> {
     // A plain client: it neither serves nor receives callbacks, so the
     // default mapping is all it needs (the reply here is four bytes).
-    let binder = rsbinder::Client::open("binder://")
+    let binder = rsbinder::Client::open(Uri::kernel())
         .and_then(|_| hub::check_service(name).ok_or(StatusCode::NameNotFound))?;
     let remote = binder.as_remote().ok_or_else(|| {
         // In-process would prove nothing — see the module doc.

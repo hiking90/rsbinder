@@ -310,7 +310,7 @@ fn dropping_the_wait_returns_the_blocking_thread() {
     outcome.expect("blocking thread was not reclaimed");
 }
 
-/// `connect_async("binder://…")` waits through the same cancellable path.
+/// `connect_async(Uri::kernel().with_service(…))` waits through the same cancellable path.
 ///
 /// Mutant: moving the kernel arm back onto `spawn_blocking(connect)` keeps
 /// the blocking thread past the timeout and the second probe fails.
@@ -328,10 +328,10 @@ fn a_timed_out_connect_async_returns_the_blocking_thread() {
         .expect("runtime");
 
     let outcome: std::result::Result<(), String> = rt.block_on(async {
-        let uri = format!("binder://{}", service_name("never-connect"));
+        let uri = rsbinder::Uri::kernel().with_service(service_name("never-connect"));
         let timed_out = tokio::time::timeout(
             Duration::from_millis(300),
-            rsbinder::connect_async::<dyn IAsyncRt>(&uri),
+            rsbinder::connect_async::<dyn IAsyncRt>(uri),
         )
         .await;
         if timed_out.is_ok() {

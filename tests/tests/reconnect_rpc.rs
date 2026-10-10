@@ -15,8 +15,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use rsbinder::entry::{UriErrorKind, WireProfile, WireVersion};
 use rsbinder::reconnect::{ConnectError, ReconnectPolicy, Reconnecting};
-use rsbinder::{Interface, ServerGuard, Status, StatusCode, Strong};
+use rsbinder::{Endpoint, Interface, ServerGuard, Status, StatusCode, Strong, Uri};
 
 include!(concat!(env!("OUT_DIR"), "/rpc_smoke.rs"));
 
@@ -57,11 +58,11 @@ impl Sock {
         let _ = std::fs::remove_file(&p);
         Sock(p)
     }
-    fn uri(&self, query: &str, frag: &str) -> String {
-        format!("unix://{}{query}{frag}", self.0.display())
+    fn uri(&self) -> Uri {
+        Uri::new(Endpoint::unix(&self.0))
     }
-    fn serve(&self, query: &str, tag: &'static str) -> ServerGuard {
-        rsbinder::serve(&self.uri(query, ""))
+    fn serve(&self, wire: WireProfile, tag: &'static str) -> ServerGuard {
+        rsbinder::serve(self.uri().with_wire(wire))
             .expect("serve")
             .add("smoke", BnRpcSmoke::new_binder(Svc { tag }))
             .expect("add")
@@ -75,7 +76,8 @@ impl Drop for Sock {
     }
 }
 
-const PROFILE: &str = "?profile=android13plus";
+const PROFILE: WireProfile = WireProfile::Android13Plus(WireVersion::MAX);
+const R34: WireProfile = WireProfile::R34;
 
 fn echo(h: &Reconnecting<dyn IRpcSmoke>, s: &str) -> Result<String, Status> {
     h.with(|p| p.r#echo(s))
@@ -100,15 +102,16 @@ fn reconnects_after_a_restart_noticed_by_death_notification() {
     let guard = sock.serve(PROFILE, "a");
     let connects = Arc::new(AtomicU32::new(0));
     let counted = connects.clone();
-    let h = Reconnecting::<dyn IRpcSmoke>::builder(&sock.uri(PROFILE, "#smoke"))
-        .options(|o, _| o.incoming_connections = Some(1))
-        .on_connect(move |c| {
-            counted.fetch_add(1, Ordering::SeqCst);
-            c.proxy().r#ping()?;
-            Ok(())
-        })
-        .build()
-        .expect("build");
+    let h =
+        Reconnecting::<dyn IRpcSmoke>::builder(sock.uri().with_wire(PROFILE).with_service("smoke"))
+            .options(|o, _| o.incoming_connections = Some(1))
+            .on_connect(move |c| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                c.proxy().r#ping()?;
+                Ok(())
+            })
+            .build()
+            .expect("build");
     assert_eq!(h.generation(), 1);
     assert_eq!(echo(&h, "x").unwrap(), "a:x");
 
@@ -129,14 +132,14 @@ fn reconnects_after_a_restart_noticed_by_death_notification() {
 #[test]
 fn first_call_after_an_unnoticed_restart_runs_on_the_new_connection() {
     let sock = Sock::new("r34");
-    let guard = sock.serve("", "a");
-    let h = Reconnecting::<dyn IRpcSmoke>::builder(&sock.uri("", "#smoke"))
+    let guard = sock.serve(R34, "a");
+    let h = Reconnecting::<dyn IRpcSmoke>::builder(sock.uri().with_service("smoke"))
         .build()
         .expect("build");
     assert_eq!(echo(&h, "x").unwrap(), "a:x");
 
     drop(guard);
-    let _guard = sock.serve("", "b");
+    let _guard = sock.serve(R34, "b");
     let runs = AtomicU32::new(0);
     let reply = h.with(|p| {
         runs.fetch_add(1, Ordering::SeqCst);
@@ -155,8 +158,8 @@ fn first_call_after_an_unnoticed_restart_runs_on_the_new_connection() {
 #[test]
 fn a_call_between_attempts_fails_at_once() {
     let sock = Sock::new("down");
-    let guard = sock.serve("", "a");
-    let h = Reconnecting::<dyn IRpcSmoke>::builder(&sock.uri("", "#smoke"))
+    let guard = sock.serve(R34, "a");
+    let h = Reconnecting::<dyn IRpcSmoke>::builder(sock.uri().with_service("smoke"))
         .build()
         .expect("build");
     drop(guard);
@@ -178,12 +181,12 @@ fn a_call_between_attempts_fails_at_once() {
 #[test]
 fn build_before_the_server_connects_in_the_background() {
     let sock = Sock::new("late");
-    let h = Reconnecting::<dyn IRpcSmoke>::builder(&sock.uri("", "#smoke"))
+    let h = Reconnecting::<dyn IRpcSmoke>::builder(sock.uri().with_service("smoke"))
         .build()
         .expect("a missing server is not a build error");
     assert_eq!(h.generation(), 0);
     assert!(h.current().is_err());
-    let _guard = sock.serve("", "a");
+    let _guard = sock.serve(R34, "a");
     let p = h
         .wait_connected(Some(Duration::from_secs(5)))
         .expect("connected");
@@ -195,18 +198,21 @@ fn build_before_the_server_connects_in_the_background() {
 #[test]
 fn build_refuses_what_a_retry_cannot_fix() {
     let sock = Sock::new("refuse");
-    let _guard = sock.serve("", "a");
-    let build = |uri: String| Reconnecting::<dyn IRpcSmoke>::builder(&uri).build().err();
-    assert_eq!(build("bogus://x".into()), Some(StatusCode::BadValue));
-    assert_eq!(build("binder://".into()), Some(StatusCode::BadValue));
+    let _guard = sock.serve(R34, "a");
+    let build = |uri: Uri| Reconnecting::<dyn IRpcSmoke>::builder(uri).build().err();
+    assert_eq!(
+        "bogus://x".parse::<Uri>().unwrap_err().kind(),
+        UriErrorKind::UnknownScheme
+    );
+    assert_eq!(build(Uri::kernel()), Some(StatusCode::BadValue));
     // Multi-connection options need the android13plus profile: setup, not the transport.
-    let r = Reconnecting::<dyn IRpcSmoke>::builder(&sock.uri("", "#smoke"))
+    let r = Reconnecting::<dyn IRpcSmoke>::builder(sock.uri().with_service("smoke"))
         .options(|o, _| o.incoming_connections = Some(1))
         .build()
         .err();
     assert_eq!(r, Some(StatusCode::BadValue));
     // An RPC cast does not ask the server, so a root of another interface fails at the call.
-    let h = Reconnecting::<dyn IRpcSmoke>::builder(&sock.uri("", ""))
+    let h = Reconnecting::<dyn IRpcSmoke>::builder(sock.uri())
         .build()
         .expect("the cast does not check the interface");
     assert_eq!(
@@ -220,8 +226,8 @@ fn build_refuses_what_a_retry_cannot_fix() {
 #[test]
 fn on_connect_stops_only_when_asked() {
     let sock = Sock::new("hook");
-    let _guard = sock.serve("", "a");
-    let stopped = Reconnecting::<dyn IRpcSmoke>::builder(&sock.uri("", "#smoke"))
+    let _guard = sock.serve(R34, "a");
+    let stopped = Reconnecting::<dyn IRpcSmoke>::builder(sock.uri().with_service("smoke"))
         .on_connect(|_| Err(ConnectError::stop(StatusCode::PermissionDenied)))
         .build()
         .err();
@@ -229,7 +235,7 @@ fn on_connect_stops_only_when_asked() {
 
     let tries = Arc::new(AtomicU32::new(0));
     let counted = tries.clone();
-    let h = Reconnecting::<dyn IRpcSmoke>::builder(&sock.uri("", "#smoke"))
+    let h = Reconnecting::<dyn IRpcSmoke>::builder(sock.uri().with_service("smoke"))
         .on_connect(move |_| {
             // `?` on a code that also names a configuration error: still a retry.
             if counted.fetch_add(1, Ordering::SeqCst) < 2 {
@@ -250,8 +256,8 @@ fn on_connect_stops_only_when_asked() {
 #[test]
 fn a_call_that_ends_the_session_reconnects_without_another_call() {
     let sock = Sock::new("deadline");
-    let _guard = sock.serve("", "a");
-    let h = Reconnecting::<dyn IRpcSmoke>::builder(&sock.uri("", "#smoke"))
+    let _guard = sock.serve(R34, "a");
+    let h = Reconnecting::<dyn IRpcSmoke>::builder(sock.uri().with_service("smoke"))
         .options(|o, _| o.timeout = Some(Duration::from_millis(100)))
         .build()
         .expect("build");
@@ -267,8 +273,8 @@ fn a_call_that_ends_the_session_reconnects_without_another_call() {
 #[test]
 fn a_relayed_dead_object_does_not_reconnect() {
     let sock = Sock::new("relay");
-    let _guard = sock.serve("", "a");
-    let h = Reconnecting::<dyn IRpcSmoke>::builder(&sock.uri("", "#smoke"))
+    let _guard = sock.serve(R34, "a");
+    let h = Reconnecting::<dyn IRpcSmoke>::builder(sock.uri().with_service("smoke"))
         .build()
         .expect("build");
     let err = echo(&h, "dead").unwrap_err();
@@ -284,7 +290,7 @@ fn weak_handle_and_attempt_cap() {
     let mut policy = ReconnectPolicy::default();
     policy.max_attempts = Some(2);
     policy.initial = Duration::from_millis(1);
-    let h = Reconnecting::<dyn IRpcSmoke>::builder(&sock.uri("", "#smoke"))
+    let h = Reconnecting::<dyn IRpcSmoke>::builder(sock.uri().with_service("smoke"))
         .policy(policy)
         .build()
         .expect("build");
@@ -311,8 +317,8 @@ fn weak_handle_and_attempt_cap() {
 #[test]
 fn drop_does_not_wait_for_a_stuck_attempt() {
     let sock = Sock::new("stuck");
-    let guard = sock.serve("", "a");
-    let h = Reconnecting::<dyn IRpcSmoke>::builder(&sock.uri("", "#smoke"))
+    let guard = sock.serve(R34, "a");
+    let h = Reconnecting::<dyn IRpcSmoke>::builder(sock.uri().with_service("smoke"))
         .build()
         .expect("build");
     drop(guard);
@@ -354,13 +360,13 @@ fn connected_resolves_once_the_server_is_up() {
         .enable_time()
         .build()
         .unwrap();
-    let h = Reconnecting::<dyn IRpcSmoke>::builder(&sock.uri("", "#smoke"))
+    let h = Reconnecting::<dyn IRpcSmoke>::builder(sock.uri().with_service("smoke"))
         .build()
         .expect("build");
-    let uri = sock.uri("", "");
+    let uri = sock.uri();
     let late = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(100));
-        rsbinder::serve(&uri)
+        rsbinder::serve(uri)
             .expect("serve")
             .add("smoke", BnRpcSmoke::new_binder(Svc { tag: "a" }))
             .expect("add")
@@ -376,11 +382,12 @@ fn connected_resolves_once_the_server_is_up() {
 
     let mut policy = ReconnectPolicy::default();
     policy.max_attempts = Some(1);
-    let doomed =
-        Reconnecting::<dyn IRpcSmoke>::builder(&Sock::new("async_doomed").uri("", "#smoke"))
-            .policy(policy)
-            .build()
-            .expect("build");
+    let doomed = Reconnecting::<dyn IRpcSmoke>::builder(
+        Sock::new("async_doomed").uri().with_service("smoke"),
+    )
+    .policy(policy)
+    .build()
+    .expect("build");
     let r = rt
         .block_on(async { tokio::time::timeout(Duration::from_secs(5), doomed.connected()).await });
     assert!(r.expect("a closing helper wakes the waiter").is_err());
@@ -390,8 +397,8 @@ fn connected_resolves_once_the_server_is_up() {
 #[test]
 fn current_hands_out_the_proxy_without_waiting() {
     let sock = Sock::new("current");
-    let _guard = sock.serve("", "a");
-    let h = Reconnecting::<dyn IRpcSmoke>::builder(&sock.uri("", "#smoke"))
+    let _guard = sock.serve(R34, "a");
+    let h = Reconnecting::<dyn IRpcSmoke>::builder(sock.uri().with_service("smoke"))
         .build()
         .expect("build");
     let p: Strong<dyn IRpcSmoke> = h.current().expect("connected");

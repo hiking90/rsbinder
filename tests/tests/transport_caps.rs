@@ -25,7 +25,6 @@
 
 #![cfg(feature = "rpc")]
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use rsbinder::rpc::transport::{MemTransport, UnixTransport};
@@ -117,11 +116,7 @@ fn caller_of(session: &RpcSession) -> rsbinder::Strong<dyn IRpcCaller> {
 /// without opening a device — the row of the table that needs no session.
 #[test]
 fn kernel_endpoint_has_every_capability() {
-    let kernel = Endpoint::Kernel {
-        driver: None,
-        threads: None,
-        mmap_size: None,
-    };
+    let kernel = Endpoint::kernel();
     assert_eq!(kernel.static_caps(), TransportCaps::KERNEL);
     for bit in [
         TransportCaps::FD_PASSING,
@@ -140,26 +135,20 @@ fn kernel_endpoint_has_every_capability() {
 /// `KERNEL_KNOBS` (there is no driver underneath).
 #[test]
 fn rpc_endpoints_offer_what_their_socket_can_carry() {
+    assert_eq!(Endpoint::unix("/tmp/x").static_caps(), FD_TRUST_HOST);
     assert_eq!(
-        Endpoint::Unix(PathBuf::from("/tmp/x")).static_caps(),
-        FD_TRUST_HOST
-    );
-    assert_eq!(
-        Endpoint::UnixAbstract(b"x".to_vec()).static_caps(),
+        Endpoint::unix_abstract(b"x".to_vec()).static_caps(),
         FD_TRUST_HOST
     );
     // vsock crosses a VM boundary: no shared kernel, no uid, no fds.
-    assert_eq!(Endpoint::Vsock(2, 5000).static_caps(), TransportCaps::NONE);
+    assert_eq!(Endpoint::vsock(2, 5000).static_caps(), TransportCaps::NONE);
     // TLS identifies the peer by certificate, which is not a uid.
-    assert_eq!(
-        Endpoint::Tls("h".into(), 443).static_caps(),
-        TransportCaps::NONE
-    );
+    assert_eq!(Endpoint::tls("h", 443).static_caps(), TransportCaps::NONE);
     for e in [
-        Endpoint::Unix(PathBuf::from("/tmp/x")),
-        Endpoint::UnixAbstract(b"x".to_vec()),
-        Endpoint::Vsock(2, 5000),
-        Endpoint::Tls("h".into(), 443),
+        Endpoint::unix("/tmp/x"),
+        Endpoint::unix_abstract(b"x".to_vec()),
+        Endpoint::vsock(2, 5000),
+        Endpoint::tls("h", 443),
     ] {
         let c = e.static_caps();
         assert!(
@@ -194,7 +183,7 @@ fn fd_passing_follows_the_negotiated_mode_not_the_socket() {
     assert!(!client.caps().contains(TransportCaps::FD_PASSING));
     // The endpoint would have said yes — the two answers are different
     // questions, and this is why both exist.
-    assert!(Endpoint::Unix(PathBuf::from("/tmp/x"))
+    assert!(Endpoint::unix("/tmp/x")
         .static_caps()
         .contains(TransportCaps::FD_PASSING));
 

@@ -29,7 +29,8 @@ use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rsbinder::bridge::Rewrap;
-use rsbinder::{Interface, StatusCode, Strong};
+use rsbinder::entry::{WireProfile, WireVersion};
+use rsbinder::{Endpoint, Interface, StatusCode, Strong, Uri};
 
 include!(concat!(env!("OUT_DIR"), "/mesh.rs"));
 
@@ -126,8 +127,8 @@ impl SockPath {
         ));
         SockPath(p)
     }
-    fn uri(&self, frag: &str) -> String {
-        format!("unix://{}{frag}", self.0.display())
+    fn uri(&self) -> Uri {
+        Uri::new(Endpoint::unix(&self.0))
     }
 }
 impl Drop for SockPath {
@@ -157,7 +158,7 @@ fn gateway_forwards_calls_with_no_handwritten_delegate() {
     let b_sock = SockPath::new("b");
 
     // C — the real service.
-    let _c = rsbinder::serve(&c_sock.uri(""))
+    let _c = rsbinder::serve(c_sock.uri())
         .expect("serve C")
         .add("mesh", upstream("node-c"))
         .expect("add C")
@@ -165,8 +166,9 @@ fn gateway_forwards_calls_with_no_handwritten_delegate() {
         .expect("spawn C");
 
     // B — the gateway. One line: connect, then re-publish.
-    let c_proxy: Strong<dyn IMeshNode> = rsbinder::connect(&c_sock.uri("#mesh")).expect("B→C");
-    let _b = rsbinder::serve(&b_sock.uri(""))
+    let c_proxy: Strong<dyn IMeshNode> =
+        rsbinder::connect(c_sock.uri().with_service("mesh")).expect("B→C");
+    let _b = rsbinder::serve(b_sock.uri())
         .expect("serve B")
         .add("mesh", BnMeshNode::new_binder(c_proxy))
         .expect("AC-22.7: a proxy wrapped in a Bn* is publishable")
@@ -174,7 +176,8 @@ fn gateway_forwards_calls_with_no_handwritten_delegate() {
         .expect("spawn B");
 
     // A — talks only to B, but the answers come from C.
-    let a: Strong<dyn IMeshNode> = rsbinder::connect(&b_sock.uri("#mesh")).expect("A→B");
+    let a: Strong<dyn IMeshNode> =
+        rsbinder::connect(b_sock.uri().with_service("mesh")).expect("A→B");
 
     let reply = a.r#exchange(&msg(7, "node-a")).expect("exchange");
     assert_eq!(reply.r#seq, 8, "seq must come back incremented by C");
@@ -208,22 +211,24 @@ fn gateway_refuses_a_forwarded_callback() {
     let c_sock = SockPath::new("cbc");
     let b_sock = SockPath::new("cbb");
 
-    let _c = rsbinder::serve(&c_sock.uri(""))
+    let _c = rsbinder::serve(c_sock.uri())
         .expect("serve C")
         .add("mesh", upstream("node-c"))
         .expect("add C")
         .spawn()
         .expect("spawn C");
 
-    let c_proxy: Strong<dyn IMeshNode> = rsbinder::connect(&c_sock.uri("#mesh")).expect("B→C");
-    let _b = rsbinder::serve(&b_sock.uri(""))
+    let c_proxy: Strong<dyn IMeshNode> =
+        rsbinder::connect(c_sock.uri().with_service("mesh")).expect("B→C");
+    let _b = rsbinder::serve(b_sock.uri())
         .expect("serve B")
         .add("mesh", BnMeshNode::new_binder(c_proxy))
         .expect("add B")
         .spawn()
         .expect("spawn B");
 
-    let a: Strong<dyn IMeshNode> = rsbinder::connect(&b_sock.uri("#mesh")).expect("A→B");
+    let a: Strong<dyn IMeshNode> =
+        rsbinder::connect(b_sock.uri().with_service("mesh")).expect("A→B");
     let hits = Arc::new(AtomicI32::new(0));
     let obs = BnMeshObserver::new_binder(CountingObserver(hits.clone()));
 
@@ -247,14 +252,14 @@ fn gateway_rewrapping_a_callback_reaches_the_original_observer() {
 
     // A server→client callback needs a connection the server may send on
     // outside the reply, which is what `incoming_connections` opens (plan
-    // 2-20); it rides the versioned wire, hence `?profile=android13plus`
+    // 2-20); it rides the versioned wire, hence `WireProfile::Android13Plus`
     // on both ends of both hops.
-    const A13: &str = "?profile=android13plus";
-    let callback_ready = |o: &mut rsbinder::ClientOptions, _: &rsbinder::Endpoint| {
+    const A13: WireProfile = WireProfile::Android13Plus(WireVersion::MAX);
+    let callback_ready = |o: &mut rsbinder::ClientOptions, _: &Endpoint| {
         o.incoming_connections = Some(1);
     };
 
-    let _c = rsbinder::serve(&format!("{}{A13}", c_sock.uri("")))
+    let _c = rsbinder::serve(c_sock.uri().with_wire(A13))
         .expect("serve C")
         .add("mesh", upstream("node-c"))
         .expect("add C")
@@ -294,10 +299,10 @@ fn gateway_rewrapping_a_callback_reaches_the_original_observer() {
         }
     }
 
-    let b_to_c = rsbinder::Client::open_with(&format!("{}{A13}", c_sock.uri("")), callback_ready)
-        .expect("B→C");
+    let b_to_c =
+        rsbinder::Client::open_with(c_sock.uri().with_wire(A13), callback_ready).expect("B→C");
     let c_proxy: Strong<dyn IMeshNode> = b_to_c.get("mesh").expect("B→C mesh");
-    let _b = rsbinder::serve(&format!("{}{A13}", b_sock.uri("")))
+    let _b = rsbinder::serve(b_sock.uri().with_wire(A13))
         .expect("serve B")
         .add(
             "mesh",
@@ -310,8 +315,8 @@ fn gateway_rewrapping_a_callback_reaches_the_original_observer() {
         .spawn()
         .expect("spawn B");
 
-    let a_to_b = rsbinder::Client::open_with(&format!("{}{A13}", b_sock.uri("")), callback_ready)
-        .expect("A→B");
+    let a_to_b =
+        rsbinder::Client::open_with(b_sock.uri().with_wire(A13), callback_ready).expect("A→B");
     let a: Strong<dyn IMeshNode> = a_to_b.get("mesh").expect("A→B mesh");
     let hits = Arc::new(AtomicI32::new(0));
     let obs = BnMeshObserver::new_binder(CountingObserver(hits.clone()));
@@ -399,7 +404,7 @@ fn gateway_reports_the_upstream_version_and_hash() {
     let c_sock = SockPath::new("verc");
     let b_sock = SockPath::new("verb");
 
-    let _c = rsbinder::serve(&c_sock.uri(""))
+    let _c = rsbinder::serve(c_sock.uri())
         .expect("serve C")
         .add("trunk", BnTrunkV1::new_binder(TrunkV1Svc))
         .expect("add C")
@@ -407,15 +412,17 @@ fn gateway_reports_the_upstream_version_and_hash() {
         .expect("spawn C");
 
     // B sees C through the *V2* stub and re-publishes it with the V2 `Bn`.
-    let c_proxy: Strong<dyn ITrunkV2> = rsbinder::connect(&c_sock.uri("#trunk")).expect("B→C");
-    let _b = rsbinder::serve(&b_sock.uri(""))
+    let c_proxy: Strong<dyn ITrunkV2> =
+        rsbinder::connect(c_sock.uri().with_service("trunk")).expect("B→C");
+    let _b = rsbinder::serve(b_sock.uri())
         .expect("serve B")
         .add("trunk", BnTrunkV2::new_binder(c_proxy))
         .expect("add B")
         .spawn()
         .expect("spawn B");
 
-    let a: Strong<dyn ITrunkV2> = rsbinder::connect(&b_sock.uri("#trunk")).expect("A→B");
+    let a: Strong<dyn ITrunkV2> =
+        rsbinder::connect(b_sock.uri().with_service("trunk")).expect("A→B");
     assert_eq!(
         a.r#getInterfaceVersion().expect("version"),
         1,
@@ -481,14 +488,14 @@ fn rewrap_returns_one_local_object_per_remote() {
         rewrap,
         seen: Mutex::new(Vec::new()),
     };
-    let _s = rsbinder::serve(&sock.uri(""))
+    let _s = rsbinder::serve(sock.uri())
         .expect("serve")
         .add("mesh", BnMeshNode::new_binder(svc))
         .expect("add")
         .spawn()
         .expect("spawn");
 
-    let client = rsbinder::Client::open(&sock.uri("")).expect("open");
+    let client = rsbinder::Client::open(sock.uri()).expect("open");
     let node: Strong<dyn IMeshNode> = client.get("mesh").expect("mesh");
 
     let one = BnMeshObserver::new_binder(CountingObserver(Arc::new(AtomicI32::new(0))));

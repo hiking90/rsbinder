@@ -16,7 +16,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use rsbinder::{interface, BinderEnum, BinderResult, Interface, Parcelable, Strong};
+use rsbinder::{interface, BinderEnum, BinderResult, Endpoint, Interface, Parcelable, Strong};
 
 include!(concat!(env!("OUT_DIR"), "/macro_cross.rs"));
 
@@ -129,8 +129,8 @@ impl SockPath {
         let _ = std::fs::remove_file(&p);
         SockPath(p)
     }
-    fn uri(&self, frag: &str) -> String {
-        format!("unix://{}{frag}", self.0.display())
+    fn endpoint(&self) -> Endpoint {
+        Endpoint::unix(&self.0)
     }
 }
 impl Drop for SockPath {
@@ -144,7 +144,7 @@ impl Drop for SockPath {
 fn aidl_client_calls_a_macro_service() {
     let sock = SockPath::new("m2a");
     let pinged = Arc::new(Mutex::new(0));
-    let _guard = rsbinder::serve(&sock.uri(""))
+    let _guard = rsbinder::serve(sock.endpoint())
         .expect("serve")
         .add(
             "svc",
@@ -158,7 +158,8 @@ fn aidl_client_calls_a_macro_service() {
 
     // Over RPC the descriptors are checked by the interface token on the
     // first transact, not by this cast.
-    let svc: Strong<dyn AidlIface> = rsbinder::connect(&sock.uri("#svc")).expect("connect");
+    let svc: Strong<dyn AidlIface> =
+        rsbinder::connect(sock.endpoint().with_service("svc")).expect("connect");
 
     assert_eq!(svc.r#echo("x").unwrap(), "macro:x");
     assert_eq!(svc.r#add(40, 2).unwrap(), 42);
@@ -196,7 +197,7 @@ fn aidl_client_calls_a_macro_service() {
 fn macro_client_calls_an_aidl_service() {
     let sock = SockPath::new("a2m");
     let pinged = Arc::new(Mutex::new(0));
-    let _guard = rsbinder::serve(&sock.uri(""))
+    let _guard = rsbinder::serve(sock.endpoint())
         .expect("serve")
         .add(
             "svc",
@@ -208,7 +209,8 @@ fn macro_client_calls_an_aidl_service() {
         .spawn()
         .expect("spawn");
 
-    let svc: Strong<dyn IMacroSide> = rsbinder::connect(&sock.uri("#svc")).expect("connect");
+    let svc: Strong<dyn IMacroSide> =
+        rsbinder::connect(sock.endpoint().with_service("svc")).expect("connect");
 
     assert_eq!(svc.echo("x").unwrap(), "aidl:x");
     assert_eq!(svc.add(40, 2).unwrap(), 42);

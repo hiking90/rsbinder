@@ -13,7 +13,8 @@
 
 use std::path::PathBuf;
 
-use rsbinder::{Interface, StatusCode, Strong};
+use rsbinder::entry::{UriErrorKind, WireProfile, WireVersion};
+use rsbinder::{Endpoint, Interface, StatusCode, Strong, Uri};
 
 include!(concat!(env!("OUT_DIR"), "/rpc_smoke.rs"));
 
@@ -51,10 +52,12 @@ impl SockPath {
         p.push(format!("rsb_entry_{}_{}.sock", tag, std::process::id()));
         SockPath(p)
     }
-    fn uri(&self, frag: &str) -> String {
-        format!("unix://{}{frag}", self.0.display())
+    fn uri(&self) -> Uri {
+        Uri::new(Endpoint::unix(&self.0))
     }
 }
+
+const A13: WireProfile = WireProfile::Android13Plus(WireVersion::MAX);
 impl Drop for SockPath {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
@@ -66,14 +69,15 @@ impl Drop for SockPath {
 #[test]
 fn entry_serve_and_connect_over_unix() {
     let sock = SockPath::new("basic");
-    let _guard = rsbinder::serve(&sock.uri(""))
+    let _guard = rsbinder::serve(sock.uri())
         .expect("serve")
         .add("hello", tagged("hello"))
         .expect("add")
         .spawn()
         .expect("spawn");
 
-    let hello: Strong<dyn IRpcSmoke> = rsbinder::connect(&sock.uri("#hello")).expect("connect");
+    let hello: Strong<dyn IRpcSmoke> =
+        rsbinder::connect(sock.uri().with_service("hello")).expect("connect");
     assert_eq!(hello.r#echo("x").unwrap(), "hello:x");
     assert_eq!(hello.r#add(40, 2).unwrap(), 42);
     hello.r#ping().unwrap();
@@ -88,13 +92,14 @@ fn entry_serve_and_connect_over_unix() {
 #[test]
 fn entry_guard_drop_ends_a_connected_client() {
     let sock = SockPath::new("guard-drop");
-    let guard = rsbinder::serve(&sock.uri(""))
+    let guard = rsbinder::serve(sock.uri())
         .expect("serve")
         .add("svc", tagged("svc"))
         .expect("add")
         .spawn()
         .expect("spawn");
-    let svc: Strong<dyn IRpcSmoke> = rsbinder::connect(&sock.uri("#svc")).expect("connect");
+    let svc: Strong<dyn IRpcSmoke> =
+        rsbinder::connect(sock.uri().with_service("svc")).expect("connect");
     assert_eq!(svc.r#echo("x").unwrap(), "svc:x");
 
     let dropped = std::thread::spawn(move || drop(guard));
@@ -115,7 +120,7 @@ fn entry_guard_drop_ends_a_connected_client() {
 #[test]
 fn entry_client_multi_lookup_and_proxy_outlives_client() {
     let sock = SockPath::new("multi");
-    let server = rsbinder::serve(&sock.uri(""))
+    let server = rsbinder::serve(sock.uri())
         .expect("serve")
         .add("first", tagged("first"))
         .expect("add")
@@ -123,7 +128,7 @@ fn entry_client_multi_lookup_and_proxy_outlives_client() {
         .expect("add");
     let _guard = server.spawn().expect("spawn");
 
-    let client = rsbinder::Client::open(&sock.uri("")).expect("open");
+    let client = rsbinder::Client::open(sock.uri()).expect("open");
     let first: Strong<dyn IRpcSmoke> = client.get("first").expect("first");
     let second: Strong<dyn IRpcSmoke> = client.get("second").expect("second");
     assert!(client
@@ -148,16 +153,16 @@ fn entry_add_refuses_a_remote_binder() {
     let a = SockPath::new("gw_up");
     let b = SockPath::new("gw_down");
 
-    let _up = rsbinder::serve(&a.uri(""))
+    let _up = rsbinder::serve(a.uri())
         .expect("serve")
         .add("svc", tagged("upstream"))
         .expect("add")
         .spawn()
         .expect("spawn");
 
-    let client = rsbinder::Client::open(&a.uri("")).expect("open");
+    let client = rsbinder::Client::open(a.uri()).expect("open");
 
-    let refused = rsbinder::serve(&b.uri(""))
+    let refused = rsbinder::serve(b.uri())
         .expect("serve")
         .add("svc", client.binder("svc").expect("binder"))
         .err();
@@ -170,7 +175,7 @@ fn entry_add_refuses_a_remote_binder() {
     // The gateway spelling — the same proxy, wrapped in a local `Bn*` —
     // is accepted, and forwards to the upstream service.
     let upstream: Strong<dyn IRpcSmoke> = client.get("svc").expect("svc");
-    let _down = rsbinder::serve(&b.uri(""))
+    let _down = rsbinder::serve(b.uri())
         .expect("serve")
         .add("svc", BnRpcSmoke::new_binder(upstream))
         .expect("gateway add")
@@ -178,17 +183,15 @@ fn entry_add_refuses_a_remote_binder() {
         .expect("spawn");
 
     let via_gateway: Strong<dyn IRpcSmoke> =
-        rsbinder::connect(&b.uri("#svc")).expect("connect through gateway");
+        rsbinder::connect(b.uri().with_service("svc")).expect("connect through gateway");
     assert_eq!(via_gateway.r#echo("x").unwrap(), "upstream:x");
 }
 
-/// Misuse is loud and early: a `#service` on `Client::open`, no service
-/// on `connect`, an option for the wrong transport, and an unknown
-/// scheme are all `BadValue`.
+/// Service misuse, wrong-transport options and unencodable values are `BadValue` at the entry.
 #[test]
 fn entry_misuse_is_bad_value() {
     let sock = SockPath::new("misuse");
-    let _guard = rsbinder::serve(&sock.uri(""))
+    let _guard = rsbinder::serve(sock.uri())
         .expect("serve")
         .add("svc", tagged("svc"))
         .expect("add")
@@ -196,23 +199,39 @@ fn entry_misuse_is_bad_value() {
         .expect("spawn");
 
     assert_eq!(
-        rsbinder::Client::open(&sock.uri("#svc")).err(),
+        rsbinder::Client::open(sock.uri().with_service("svc")).err(),
         Some(StatusCode::BadValue)
     );
     assert_eq!(
-        rsbinder::connect_binder(&sock.uri("")).err(),
+        rsbinder::connect_binder(sock.uri()).err(),
         Some(StatusCode::BadValue)
     );
-    assert_eq!(rsbinder::serve("ftp://x").err(), Some(StatusCode::BadValue));
+    assert_eq!(
+        "ftp://x".parse::<Uri>().unwrap_err().kind(),
+        UriErrorKind::UnknownScheme
+    );
+    // Values the string form cannot carry are refused at the entry, before any I/O.
+    assert_eq!(
+        rsbinder::serve(Endpoint::unix("relative.sock")).err(),
+        Some(StatusCode::BadValue)
+    );
+    assert_eq!(
+        rsbinder::connect_binder(sock.uri().with_service("")).err(),
+        Some(StatusCode::BadValue)
+    );
+    assert_eq!(
+        rsbinder::serve(Uri::kernel().with_wire(A13)).err(),
+        Some(StatusCode::BadValue)
+    );
     // Kernel-only option on an RPC server surfaces when the server starts.
     let sock2 = SockPath::new("misuse2");
-    let r = rsbinder::serve(&sock2.uri(""))
+    let r = rsbinder::serve(sock2.uri())
         .expect("serve")
         .with(|o| o.call_restriction = Some(rsbinder::CallRestriction::None))
         .spawn();
     assert_eq!(r.err(), Some(StatusCode::BadValue));
     // RPC-only option on a kernel client, rejected before any binder init.
-    let r = rsbinder::Client::open_with("binder://", |o, _| {
+    let r = rsbinder::Client::open_with(Uri::kernel(), |o, _| {
         o.timeout = Some(std::time::Duration::from_secs(1))
     });
     assert_eq!(r.err(), Some(StatusCode::BadValue));
@@ -224,7 +243,7 @@ fn entry_misuse_is_bad_value() {
 #[test]
 fn entry_options_apply_to_rpc_server() {
     let sock = SockPath::new("opts");
-    let _guard = rsbinder::serve(&sock.uri(""))
+    let _guard = rsbinder::serve(sock.uri())
         .expect("serve")
         .with(|o| {
             o.max_connections = Some(1);
@@ -235,9 +254,10 @@ fn entry_options_apply_to_rpc_server() {
         .spawn()
         .expect("spawn");
 
-    let keep: Strong<dyn IRpcSmoke> = rsbinder::connect(&sock.uri("#svc")).expect("first session");
+    let keep: Strong<dyn IRpcSmoke> =
+        rsbinder::connect(sock.uri().with_service("svc")).expect("first session");
     assert_eq!(keep.r#echo("1").unwrap(), "svc:1");
-    let second = rsbinder::Client::open_with(&sock.uri(""), |o, _| {
+    let second = rsbinder::Client::open_with(sock.uri(), |o, _| {
         o.timeout = Some(std::time::Duration::from_secs(2))
     })
     .and_then(|c| c.binder("svc"));
@@ -265,28 +285,28 @@ fn entry_options_apply_to_rpc_server() {
 #[allow(deprecated)] // The deprecated field is still honored, so its zero is still refused.
 fn entry_zero_handshake_timeout_is_refused() {
     let sock13 = SockPath::new("zerohs13");
-    let _guard13 = rsbinder::serve(&sock13.uri("?profile=android13plus"))
+    let _guard13 = rsbinder::serve(sock13.uri().with_wire(A13))
         .expect("serve")
         .add("svc", tagged("svc"))
         .expect("add")
         .spawn()
         .expect("spawn");
 
-    let err = rsbinder::Client::open_with(&sock13.uri("?profile=android13plus"), |o, _| {
+    let err = rsbinder::Client::open_with(sock13.uri().with_wire(A13), |o, _| {
         o.handshake_timeout = Some(std::time::Duration::ZERO)
     })
     .expect_err("a zero handshake deadline must be refused before any connect");
     assert_eq!(err, rsbinder::StatusCode::BadValue);
 
     // Control: on the same endpoint a positive deadline connects.
-    let ok = rsbinder::Client::open_with(&sock13.uri("?profile=android13plus"), |o, _| {
+    let ok = rsbinder::Client::open_with(sock13.uri().with_wire(A13), |o, _| {
         o.handshake_timeout = Some(std::time::Duration::from_secs(5))
     })
     .and_then(|c| c.binder("svc"));
     assert!(ok.is_ok(), "a positive deadline still connects");
 
     // `timeout`'s zero is no deadline at all, as `RpcSession::set_timeout` treats it.
-    let zero = rsbinder::Client::open_with(&sock13.uri("?profile=android13plus"), |o, _| {
+    let zero = rsbinder::Client::open_with(sock13.uri().with_wire(A13), |o, _| {
         o.timeout = Some(std::time::Duration::ZERO)
     })
     .and_then(|c| c.binder("svc"));
@@ -295,13 +315,13 @@ fn entry_zero_handshake_timeout_is_refused() {
     // The r34 wire has no handshake phase, so the option is refused there
     // whatever its value.
     let sock = SockPath::new("zerohs");
-    let _guard = rsbinder::serve(&sock.uri(""))
+    let _guard = rsbinder::serve(sock.uri())
         .expect("serve")
         .add("svc", tagged("svc"))
         .expect("add")
         .spawn()
         .expect("spawn");
-    let err = rsbinder::Client::open_with(&sock.uri(""), |o, _| {
+    let err = rsbinder::Client::open_with(sock.uri(), |o, _| {
         o.handshake_timeout = Some(std::time::Duration::from_secs(5))
     })
     .expect_err("handshake_timeout does not apply to the r34 wire");
@@ -313,7 +333,7 @@ fn entry_zero_handshake_timeout_is_refused() {
 #[test]
 fn entry_connect_async_over_unix() {
     let sock = SockPath::new("async");
-    let _guard = rsbinder::serve(&sock.uri(""))
+    let _guard = rsbinder::serve(sock.uri())
         .expect("serve")
         .add("svc", tagged("svc"))
         .expect("add")
@@ -328,31 +348,66 @@ fn entry_connect_async_over_unix() {
     rt.block_on(async {
         // Sync interface first: `connect_async` is transport/interface
         // agnostic — it is the blocking connect moved off the runtime.
-        let sync: Strong<dyn IRpcSmoke> = rsbinder::connect_async(&sock.uri("#svc"))
+        let sync: Strong<dyn IRpcSmoke> = rsbinder::connect_async(sock.uri().with_service("svc"))
             .await
             .expect("connect_async");
         assert_eq!(sync.r#echo("a").unwrap(), "svc:a");
 
         // Async view of the same service, driven with `.await`.
-        let r#async =
-            rsbinder::connect_async::<dyn IRpcSmokeAsync<rsbinder::Tokio>>(&sock.uri("#svc"))
-                .await
-                .expect("connect_async (async interface)");
+        let r#async = rsbinder::connect_async::<dyn IRpcSmokeAsync<rsbinder::Tokio>>(
+            sock.uri().with_service("svc"),
+        )
+        .await
+        .expect("connect_async (async interface)");
         assert_eq!(r#async.r#echo("b").await.unwrap(), "svc:b");
+
+        // The future owns its destination, so it outlives the `Uri` it borrowed.
+        let uri = sock.uri().with_service("svc");
+        let task = tokio::spawn(rsbinder::connect_async::<dyn IRpcSmoke>(&uri));
+        drop(uri);
+        let spawned = task.await.expect("join").expect("connect_async (spawned)");
+        assert_eq!(spawned.r#echo("c").unwrap(), "svc:c");
     });
 }
 
-/// `?profile=android13plus` selects the versioned wire on both sides.
+/// A non-UTF-8 socket path serves, connects, and reads back from its escaped string form.
+// APFS refuses non-UTF-8 file names (EILSEQ).
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
-fn entry_android13plus_profile_roundtrip() {
-    let sock = SockPath::new("a13");
-    let _guard = rsbinder::serve(&sock.uri("?profile=android13plus"))
+fn entry_non_utf8_unix_path() {
+    use std::os::unix::ffi::OsStringExt;
+    let mut name = format!("rsb_entry_nonutf8_{}_", std::process::id()).into_bytes();
+    name.extend_from_slice(b"\xff.sock");
+    let sock = SockPath(std::env::temp_dir().join(std::ffi::OsString::from_vec(name)));
+    let _guard = rsbinder::serve(sock.uri())
         .expect("serve")
         .add("svc", tagged("svc"))
         .expect("add")
         .spawn()
         .expect("spawn");
-    let client = rsbinder::Client::open(&sock.uri("?profile=android13plus")).expect("open");
+
+    let typed: Strong<dyn IRpcSmoke> =
+        rsbinder::connect(sock.uri().with_service("svc")).expect("connect");
+    assert_eq!(typed.r#echo("a").unwrap(), "svc:a");
+
+    let text = sock.uri().with_service("svc").to_string();
+    assert!(text.contains("%FF"), "{text}");
+    let parsed: Strong<dyn IRpcSmoke> =
+        rsbinder::connect(text.parse::<Uri>().expect("parse")).expect("connect parsed");
+    assert_eq!(parsed.r#echo("b").unwrap(), "svc:b");
+}
+
+/// `WireProfile::Android13Plus` selects the versioned wire on both sides.
+#[test]
+fn entry_android13plus_profile_roundtrip() {
+    let sock = SockPath::new("a13");
+    let _guard = rsbinder::serve(sock.uri().with_wire(A13))
+        .expect("serve")
+        .add("svc", tagged("svc"))
+        .expect("add")
+        .spawn()
+        .expect("spawn");
+    let client = rsbinder::Client::open(sock.uri().with_wire(A13)).expect("open");
     assert_eq!(client.session().unwrap().wire_protocol_version(), Some(2));
     let svc: Strong<dyn IRpcSmoke> = client.get("svc").expect("get");
     assert_eq!(svc.r#echo("v2").unwrap(), "svc:v2");

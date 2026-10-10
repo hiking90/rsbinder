@@ -27,7 +27,7 @@ use example_hello::calling_identity::{ICallingIdentity, SERVICE_NAME};
 fn describe_caller_round_trip() -> Result<()> {
     // `try_get`, not `get`: the harness has no timeout, so a missing
     // service must fail fast rather than wait for registration.
-    let client = rsbinder::Client::open("binder://")?;
+    let client = rsbinder::Client::open(Uri::kernel())?;
     let svc = client
         .try_get::<dyn ICallingIdentity>(SERVICE_NAME)
         .map_err(|e| {

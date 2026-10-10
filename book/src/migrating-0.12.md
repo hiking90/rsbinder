@@ -93,20 +93,107 @@ a reference such as "(CHANGELOG *Fixed*)" points to the 0.12.0 section there.
   flag value sent on the wire changes, so a 0.11.0 peer testing or setting it
   disagrees with a 0.12.0 one; rebuild both sides.
 
+## Entry API (`serve` / `connect`)
+
+- **`serve`, `connect`, `connect_binder`, `connect_async`, `Client::open` and
+  `Client::open_with` take `impl Into<Uri>`, not `&str`** (CHANGELOG
+  *Changed*). Build the destination with constructors, or parse a string
+  explicitly:
+
+  ```rust
+  // 0.11.0
+  rsbinder::serve("binder://")?;
+  let h: Strong<dyn IHello> = rsbinder::connect("unix:///tmp/x.sock#hello")?;
+  let h: Strong<dyn IHello> = rsbinder::connect(&config.target)?;
+
+  // 0.12.0
+  rsbinder::serve(Uri::kernel())?;
+  let h: Strong<dyn IHello> = rsbinder::connect(Endpoint::unix("/tmp/x.sock").with_service("hello"))?;
+  let h: Strong<dyn IHello> = rsbinder::connect(config.target.parse::<Uri>()?)?;
+  ```
+
+  The schemes and query keys are the same, but a malformed string now fails at
+  `parse` with a `UriError` instead of at `serve` / `connect`; `?` into
+  `rsbinder::Result` still yields `StatusCode::BadValue` and logs the reason.
+  Replace a URI built with `format!("unix://{}", path.display())` by
+  `Endpoint::unix(&path)`: the string form is percent-decoded, so a path
+  holding `%`, `#` or `?` named a different socket or failed to parse.
+- **`Endpoint` changed shape.** `Endpoint::Kernel(KernelEndpoint)` replaces
+  the 0.11.0 struct variant `Kernel { driver, threads }`; read the settings with
+  `KernelEndpoint::driver()` / `threads()` / `mmap_size()` and build one with
+  `KernelEndpoint::default().with_threads(..)`. `Endpoint::Vsock { cid, port }`
+  and `Endpoint::Tls { host, port }` replace the tuple variants; build them
+  with `Endpoint::vsock(cid, port)` and `Endpoint::tls(host, port)`.
+- **`Uri`'s fields are private**: use `endpoint()`, `service()` and `wire()`.
+  `wire_max_version: Option<u32>` is now a `WireProfile` — `R34`, or
+  `Android13Plus(WireVersion)` for `?profile=android13plus[-vN]`.
+  **`rsbinder::entry::uri::parse` is removed**; use `Uri::parse` or
+  `str::parse`.
+- **A `tls://` host is percent-decoded, its `[ ]`, if any, must be one pair
+  enclosing the whole host, and a host holding `:` needs them.** 0.11.0
+  took the host text literally, split it from the port at the last `:` and
+  stripped any number of brackets from its ends: `tls://[[::1]]:9000`,
+  `tls://[::1:9000` and `tls://::1:9000` reached `::1`, `tls://a]:9000`
+  reached `a`, and `tls://fe80::1`, with no port, became host `fe80:` and
+  port 1. All of these are now `UriErrorKind::BadBrackets`; write
+  `tls://[::1]:9000`. Write an IPv6 zone id as `%25`
+  (`tls://[fe80::1%25eth0]:9000`): `tls://[fe80::1%eth0]:9000` is now
+  `BadPercentEscape`, and a numeric zone such as `%12` decodes to a control
+  character instead of reaching the resolver. A client connecting to a host
+  with a zone id must also set `ClientOptions::tls_server_name`: the host is
+  the default TLS server name, a server name cannot hold a zone id, and
+  without it the connect fails with `StatusCode::RpcError`. `tls://[]:9000`,
+  which 0.11.0 took as an empty host, is `EmptyHost`.
+- **A query key given twice is refused** (`UriErrorKind::DuplicateQueryKey`).
+  0.11.0 used the last value, so
+  `unix:///a?profile=android13plus-v2&profile=android13plus-v0` spoke v0.
+- **A `?query` after `#service` is refused** (`UriErrorKind::QueryAfterService`).
+  0.11.0 made it part of the service name: `binder://#svc?driver=/dev/x` looked
+  up `"svc?driver=/dev/x"` on the default driver. Put the query first.
+- **A `unix://` path or `?driver=` may hold percent-escaped bytes that are not
+  UTF-8**; 0.11.0 refused `unix:///tmp/%FF.sock`. A kernel driver path that
+  is not UTF-8 parses but is `BadValue` at `serve` / `connect`, since
+  `ProcessState` opens the driver by a `&str`.
+- **`?profile=android13plus-vN` accepts any decimal spelling of `N`**, so
+  `-v02` is version 2; 0.11.0 matched only `-v0`, `-v1` and `-v2`.
+- **A kernel `Server::add` no longer registers the name; `run` / `spawn`
+  do**, in this order: check the `ServeOptions`, start the thread pool,
+  register the names. 0.11.0 registered at `add`, so an option refused at
+  `run` / `spawn` left the name published with no thread to serve it, and
+  its callers blocked. Two consequences:
+  - A readiness signal printed between `add` and `run` now comes before the
+    name exists, and a client that looks it up once (`check_service`) can
+    miss it. Signal after `spawn` instead:
+
+    ```rust
+    // 0.11.0
+    let server = rsbinder::serve(Uri::kernel())?.add(NAME, svc)?;
+    println!("READY");
+    server.run()
+
+    // 0.12.0
+    let _server = rsbinder::serve(Uri::kernel())?.add(NAME, svc)?.spawn()?;
+    println!("READY");
+    ProcessState::join_thread_pool()
+    ```
+
+  - A registration error — a name the service manager refuses (invalid, or
+    held by another uid under `rsb_hub`), a policy denial, an RPC proxy — is
+    returned by `run` / `spawn`, not `add`. Names registered
+    before the failing one stay published and served until the process
+    exits.
+
 ## Kernel binder, `Parcel` and process state
 
-- **`Endpoint::Kernel` gained an `mmap_size` field** (CHANGELOG *Added*). It
-  is not `#[non_exhaustive]`, so a struct literal or a `match` arm naming
-  every field no longer compiles; add `mmap_size: None` for the previous
-  behavior. Matching with `..` and endpoints obtained from `serve` /
-  `Client::open` are unaffected.
 - **A kernel option `serve` / `Client::open` cannot honor is now `BadValue`.**
-  `binder://?threads=`, `?driver=`, `ServeOptions::threads` and
-  `ClientOptions::driver` are fixed by whoever initializes `ProcessState`
-  first; a later *different* value used to log a warning and now returns
-  `StatusCode::BadValue` (omitting it or repeating the value still works).
-  Likewise `ClientOptions::driver` / `mmap_size` must agree with the URI's
-  `?driver=` / `?mmap=`.
+  The `KernelEndpoint` thread count and driver (`binder://?threads=`,
+  `?driver=`), `ServeOptions::threads` and `ClientOptions::driver` are fixed
+  by whoever initializes `ProcessState` first; a later *different* value used
+  to log a warning and now returns `StatusCode::BadValue` (omitting it or
+  repeating the value still works). Likewise `ClientOptions::driver` /
+  `mmap_size` must agree with the `KernelEndpoint`'s driver and mapping size.
+  A driver path that is not UTF-8 is `BadValue` too; 0.11.0 opened its lossy
+  UTF-8 conversion, a different path.
 - **`ServerGuard` and `Server` are `#[must_use]`**: `serve(uri)?.spawn()?;`
   stopped an RPC server at once. Bind the guard to a named variable.
 - **A kernel transaction dispatched inside an RPC handler now reports the

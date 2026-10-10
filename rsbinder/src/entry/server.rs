@@ -12,17 +12,20 @@ use crate::SIBinder;
 #[cfg(feature = "rpc")]
 pub type Authorizer = Box<dyn Fn(&crate::rpc::PeerIdentity) -> bool + Send + Sync>;
 
-/// Options that do not fit in the URI. Set through [`Server::with`].
+/// Options that are not part of the [`Uri`]. Set through [`Server::with`].
 /// An option that does not apply to the server's transport is reported
 /// at [`Server::run`] / [`Server::spawn`] time as [`StatusCode::BadValue`]
-/// (with a log line naming it) — never silently ignored.
+/// (with a log line naming it) — never silently ignored. The check runs
+/// before any name is registered, so a refused option leaves nothing
+/// published.
 #[derive(Default)]
 #[non_exhaustive]
 pub struct ServeOptions {
     /// RPC: `RpcServer::set_max_threads`.
     ///
-    /// Kernel: **the URI form (`binder://?threads=`) is the only one
-    /// that takes effect.** [`serve`](super::serve) initializes the
+    /// Kernel: **[`KernelEndpoint::with_threads`](super::KernelEndpoint::with_threads)
+    /// (`binder://?threads=`) is the only form that takes effect.**
+    /// [`serve`](super::serve) initializes the
     /// process-wide `ProcessState` — where the kernel pool size is
     /// fixed, once, for the life of the process — before this option
     /// can be read, so a value set here is only compared against the
@@ -37,9 +40,9 @@ pub struct ServeOptions {
     /// service that must accept transactions larger than the ~1 MB
     /// default.
     ///
-    /// **The URI form (`binder://?mmap=`) is the only one that takes
-    /// effect**, for the same reason as [`threads`](Self::threads): the
-    /// mapping is made when [`serve`](super::serve) initializes
+    /// **[`KernelEndpoint::with_mmap_size`](super::KernelEndpoint::with_mmap_size)
+    /// (`binder://?mmap=`) is the only form that takes effect**, for the
+    /// same reason as [`threads`](Self::threads): the mapping is made when [`serve`](super::serve) initializes
     /// `ProcessState`, before this option is read. A value set here is
     /// only compared against the mapping already in force, and a
     /// *different* one (after page rounding) is [`StatusCode::BadValue`]
@@ -102,9 +105,13 @@ pub struct ServeOptions {
 /// Kernel (`binder://`): construction initializes the process-wide
 /// [`ProcessState`] (idempotently — a second kernel server in the same
 /// process reuses it, and is refused with [`StatusCode::BadValue`] if it
-/// asked for a different driver or thread count, which the process
-/// cannot give it). RPC: the listener is bound at `run`/`spawn` so
+/// asked for a different driver, thread count or mapping size, which the
+/// process cannot give it). RPC: the listener is bound at `run`/`spawn` so
 /// [`ServeOptions`] (TLS config, limits) can be applied first.
+///
+/// On either transport, names given to [`add`](Self::add) are registered
+/// at `run`/`spawn`, after the options are checked — so a server that
+/// fails to start has published nothing it cannot serve.
 #[must_use = "a Server serves nothing until `run` or `spawn` is called"]
 pub struct Server {
     uri: Uri,
@@ -180,13 +187,9 @@ impl Drop for ServerGuard {
 }
 
 pub(super) fn new_server(uri: Uri) -> Result<Server> {
-    if let Endpoint::Kernel {
-        driver,
-        threads,
-        mmap_size,
-    } = &uri.endpoint
-    {
-        kernel_init(driver.as_deref(), *threads, *mmap_size)?;
+    uri.validate()?;
+    if let Endpoint::Kernel(k) = &uri.endpoint {
+        kernel_init(k.driver(), k.threads(), k.mmap_size())?;
     }
     #[cfg(not(feature = "rpc"))]
     if !uri.endpoint.is_kernel() {
@@ -213,9 +216,11 @@ pub(super) fn kernel_init(
     let mmap_size = mmap_size
         .map(ProcessState::normalized_mmap_size)
         .transpose()?;
-    let driver_path = driver.map(|p| p.to_string_lossy().into_owned());
-    let driver_path: &str = match &driver_path {
-        Some(p) => p,
+    let driver_path: &str = match driver {
+        Some(p) => p.to_str().ok_or_else(|| {
+            log::error!("rsbinder: binder driver path {p:?} is not UTF-8");
+            StatusCode::BadValue
+        })?,
         None => ProcessState::default_driver_path(),
     };
     let ps = ProcessState::init_with_mmap_size(
@@ -246,9 +251,13 @@ pub(super) fn kernel_init(
 }
 
 impl Server {
-    /// Publish `svc` under `name`. Kernel: registered with the system
-    /// service manager immediately. RPC: queued and registered in the
-    /// server's directory when it starts.
+    /// Publish `svc` under `name`. The name is queued here and registered
+    /// when the server starts: kernel — with the system service manager, by
+    /// [`run`](Self::run) / [`spawn`](Self::spawn), after the options are
+    /// checked and the thread pool is started; RPC — in the server's
+    /// directory. So a readiness signal belongs after `spawn`, not between
+    /// `add` and `run`, and a registration error (a name the service
+    /// manager refuses, a policy denial) comes back from `run` / `spawn`.
     ///
     /// An RPC endpoint refuses a **remote** binder with
     /// [`StatusCode::InvalidOperation`]: a proxy cannot be re-published on a
@@ -258,23 +267,20 @@ impl Server {
     /// `BnFoo::new_binder(proxy)`). The kernel arm still accepts a *kernel*
     /// proxy — re-registering one with the system service manager is a
     /// legitimate use — but an RPC proxy is refused there too, by the same
-    /// stack-boundary check, when the registration parcel is written.
+    /// stack-boundary check, when the registration parcel is written at
+    /// `run` / `spawn`.
     ///
     /// [gateway section]: https://hiking90.github.io/rsbinder/cross-transport-services.html
     pub fn add(mut self, name: &str, svc: impl Into<SIBinder>) -> Result<Self> {
         let binder = svc.into();
-        if self.uri.endpoint.is_kernel() {
-            crate::hub::add_service(name, binder).map_err(StatusCode::from)?;
-        } else {
-            if (*binder).is_remote() {
-                log::error!(
-                    "serve(...).add({name}): refusing a remote binder on an RPC endpoint; \
-                     wrap it in a local Bn* (gateway) instead"
-                );
-                return Err(StatusCode::InvalidOperation);
-            }
-            self.pending.push((name.to_string(), binder));
+        if !self.uri.endpoint.is_kernel() && (*binder).is_remote() {
+            log::error!(
+                "serve(...).add({name}): refusing a remote binder on an RPC endpoint; \
+                 wrap it in a local Bn* (gateway) instead"
+            );
+            return Err(StatusCode::InvalidOperation);
         }
+        self.pending.push((name.to_string(), binder));
         Ok(self)
     }
 
@@ -285,20 +291,24 @@ impl Server {
         self
     }
 
-    /// The parsed endpoint.
+    /// The endpoint this server listens on.
     pub fn endpoint(&self) -> &Endpoint {
         &self.uri.endpoint
     }
 
-    /// Start serving and block. Kernel: starts the thread pool and joins
-    /// it (never returns normally). RPC: runs the accept loop until
-    /// `RpcServer::stop_accepting` is called from another thread
+    /// Start serving and block. Kernel: checks the options, starts the
+    /// thread pool, registers the [`add`](Self::add)ed names in order, then
+    /// joins the pool (never returns normally). RPC: runs the accept loop
+    /// until `RpcServer::stop_accepting` is called from another thread
     /// (reachable via [`spawn`](Self::spawn)'s guard instead).
+    ///
+    /// Kernel: if registering a name fails, the error is returned and the
+    /// names registered before it stay published — and served, since the
+    /// pool is already running — until the process exits.
     pub fn run(self) -> Result<()> {
         match self.uri.endpoint {
-            Endpoint::Kernel { .. } => {
-                self.apply_kernel_options()?;
-                ProcessState::start_thread_pool();
+            Endpoint::Kernel(_) => {
+                self.start_kernel()?;
                 ProcessState::join_thread_pool()
             }
             #[cfg(feature = "rpc")]
@@ -308,14 +318,14 @@ impl Server {
         }
     }
 
-    /// Start serving in the background. Kernel: starts the thread pool
+    /// Start serving in the background. Kernel: as [`run`](Self::run)
+    /// without the join — every name is registered when this returns `Ok`
     /// (the returned guard is inert). RPC: accept loop on its own thread;
     /// dropping the guard shuts it down.
     pub fn spawn(self) -> Result<ServerGuard> {
         match self.uri.endpoint {
-            Endpoint::Kernel { .. } => {
-                self.apply_kernel_options()?;
-                ProcessState::start_thread_pool();
+            Endpoint::Kernel(_) => {
+                self.start_kernel()?;
                 Ok(ServerGuard {
                     #[cfg(feature = "rpc")]
                     rpc: None,
@@ -340,6 +350,19 @@ impl Server {
             self.uri.endpoint
         );
         StatusCode::BadValue
+    }
+
+    /// Pool before names: a registered name always has a looper, even when a later one fails.
+    fn start_kernel(self) -> Result<()> {
+        self.apply_kernel_options()?;
+        ProcessState::start_thread_pool();
+        for (name, binder) in self.pending {
+            crate::hub::add_service(&name, binder).map_err(|e| {
+                log::error!("rsbinder::serve: registering {name:?} failed: {e:?}");
+                StatusCode::from(e)
+            })?;
+        }
+        Ok(())
     }
 
     fn apply_kernel_options(&self) -> Result<()> {
@@ -388,17 +411,17 @@ impl Server {
         let tls = o.tls.clone();
         // As `ClientOptions::tls`: no facade TLS client over unix/vsock, so refuse, never ignore.
         #[cfg(feature = "rpc-tls")]
-        if tls.is_some() && !matches!(uri.endpoint, Endpoint::Tls(..)) {
+        if tls.is_some() && !matches!(uri.endpoint, Endpoint::Tls { .. }) {
             log::error!(
                 "rsbinder::serve: option `tls` does not apply to {:?} \
-                 (only `tls://`; RpcServer::setup_unix_server_tls / \
+                 (only `Endpoint::Tls`; RpcServer::setup_unix_server_tls / \
                  setup_vsock_server_tls are the direct forms)",
                 uri.endpoint
             );
             return Err(StatusCode::BadValue);
         }
         let server = match &uri.endpoint {
-            Endpoint::Kernel { .. } => unreachable!("kernel handled by caller"),
+            Endpoint::Kernel(_) => unreachable!("kernel handled by caller"),
             Endpoint::Unix(path) => RpcServer::setup_unix_server(path.clone())?,
             Endpoint::UnixAbstract(name) => {
                 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -412,7 +435,7 @@ impl Server {
                     return Err(StatusCode::InvalidOperation);
                 }
             }
-            Endpoint::Vsock(cid, port) => {
+            Endpoint::Vsock { cid, port } => {
                 #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
                 {
                     RpcServer::setup_vsock_server(*cid, *port)?
@@ -429,11 +452,11 @@ impl Server {
                     return Err(StatusCode::InvalidOperation);
                 }
             }
-            Endpoint::Tls(host, port) => {
+            Endpoint::Tls { host, port } => {
                 #[cfg(feature = "rpc-tls")]
                 {
                     let cfg = tls.ok_or_else(|| {
-                        log::error!("rsbinder::serve: `tls://` requires `ServeOptions::tls`");
+                        log::error!("rsbinder::serve: a TLS endpoint requires `ServeOptions::tls`");
                         StatusCode::BadValue
                     })?;
                     RpcServer::setup_tcp_server_tls((host.as_str(), *port), cfg)?
@@ -446,8 +469,8 @@ impl Server {
                 }
             }
         };
-        if let Some(v) = uri.wire_max_version {
-            server.set_android13plus(v);
+        if let super::uri::WireProfile::Android13Plus(v) = uri.wire {
+            server.set_android13plus(v.get());
         }
         if let Some(n) = o.threads {
             server.set_max_threads(n);
