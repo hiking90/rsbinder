@@ -88,7 +88,7 @@
 //!   harness ignores `SIGPIPE`, so the sends run in a child process that
 //!   restores `SIG_DFL`; a `SIGPIPE` there kills the child and fails the test.
 
-use std::io::{Read, Write};
+use std::io::Write;
 #[cfg(target_os = "android")]
 use std::os::android::net::SocketAddrExt;
 use std::os::fd::{AsFd, OwnedFd};
@@ -568,17 +568,7 @@ impl RpcTransport for UnixTransport {
     /// android-13+ profile drives `RpcWireHeader`-based framing on top
     /// of this (`wire_android13::read_aosp_message`).
     fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize> {
-        let mut r = &self.stream;
-        loop {
-            return match r.read(buf) {
-                Ok(n) => Ok(n),
-                // EINTR: retry, as `recv_raw_with_fds` and AOSP `interruptableReadFully` do.
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                // Deadline → `Timeout`: `read_exact_raw` splits `Timeout`/`DeadlineMidFrame`.
-                Err(e) if super::is_timeout(&e) => Err(RpcError::Timeout),
-                Err(e) => Err(RpcError::from(e)),
-            };
-        }
+        super::read_raw(&mut &self.stream, buf)
     }
 
     /// Raw, **unframed** write + `SCM_RIGHTS` (the android-13+ v1+

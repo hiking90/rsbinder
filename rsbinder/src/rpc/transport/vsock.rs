@@ -88,32 +88,17 @@ impl RpcTransport for VsockTransport {
     }
 
     /// Raw, unframed write for the android-13+ profile (the real android
-    /// RPC wire has no length prefix). Mirrors `UnixTransport::send_raw`.
+    /// RPC wire has no length prefix).
     /// The trait default refuses raw access, and a
     /// `vsock://…?profile=android13plus` session starts with a raw write:
     /// on Microdroid/AVF the peer is libbinder and speaks only this wire.
     fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
-        use std::io::Write;
-        let mut w = &self.stream;
-        super::write_all_reporting(&mut w, buf)?;
-        w.flush()?;
-        Ok(())
+        super::write_raw(&mut &self.stream, buf)
     }
 
-    /// Raw, unframed read (one `read`; `Ok(0)` = peer closed). Mirrors
-    /// `UnixTransport::recv_raw`, including the `Interrupted` retry and the
-    /// deadline → `Timeout` mapping.
+    /// Raw, unframed read: `read_raw`, as `UnixTransport::recv_raw`.
     fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize> {
-        use std::io::Read;
-        let mut r = &self.stream;
-        loop {
-            return match r.read(buf) {
-                Ok(n) => Ok(n),
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) if super::is_timeout(&e) => Err(crate::rpc::RpcError::Timeout),
-                Err(e) => Err(e.into()),
-            };
-        }
+        super::read_raw(&mut &self.stream, buf)
     }
 
     // No fd passing: `fds` reaches only the trait's refusing default.

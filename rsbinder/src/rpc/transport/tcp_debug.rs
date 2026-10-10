@@ -158,33 +158,18 @@ impl RpcTransport for TcpDebugTransport {
     }
 
     /// Raw, unframed write for the android-13+ profile (the real android
-    /// RPC wire has no length prefix). Same shape as `VsockTransport`'s;
+    /// RPC wire has no length prefix), as `VsockTransport`'s;
     /// the trait default refuses raw access, which is right only for a
     /// frame-only backend and wrong here — `RpcSession::from_preconnected_fd`
     /// wraps an `AF_INET` fd in this transport and goes straight into the
     /// android-13+ handshake, whose first byte is a raw write.
     fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
-        use std::io::Write;
-        let mut w = &self.stream;
-        super::write_all_reporting(&mut w, buf)?;
-        w.flush()?;
-        Ok(())
+        super::write_raw(&mut &self.stream, buf)
     }
 
-    /// Raw, unframed read (one `read`; `Ok(0)` = end of stream), with the
-    /// `Interrupted` retry and the deadline → `Timeout` mapping the other
-    /// stream backends share.
+    /// Raw, unframed read: `read_raw`, shared by the stream backends.
     fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize> {
-        use std::io::Read;
-        let mut r = &self.stream;
-        loop {
-            return match r.read(buf) {
-                Ok(n) => Ok(n),
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) if super::is_timeout(&e) => Err(crate::rpc::RpcError::Timeout),
-                Err(e) => Err(e.into()),
-            };
-        }
+        super::read_raw(&mut &self.stream, buf)
     }
 
     /// **Always** [`PeerIdentity::Anonymous`]. There is deliberately no

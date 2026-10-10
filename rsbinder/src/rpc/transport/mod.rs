@@ -682,6 +682,31 @@ pub(crate) fn write_all_reporting<W: Write>(w: &mut W, buf: &[u8]) -> RpcResult<
     Ok(())
 }
 
+/// `send_raw` of a blocking stream backend: [`write_all_reporting`], then `flush`.
+#[cfg(any(
+    feature = "rpc-tcp-debug",
+    all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android"))
+))]
+pub(crate) fn write_raw<W: Write>(w: &mut W, buf: &[u8]) -> RpcResult<()> {
+    write_all_reporting(w, buf)?;
+    w.flush()?;
+    Ok(())
+}
+
+/// Stream-backend `recv_raw`: one `read` (`Ok(0)` = EOF), `EINTR` retried, deadline → `Timeout`.
+pub(crate) fn read_raw<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<usize> {
+    loop {
+        return match r.read(buf) {
+            Ok(n) => Ok(n),
+            // EINTR: retry, as `recv_raw_with_fds` and AOSP `interruptableReadFully` do.
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            // Deadline → `Timeout`: `read_exact_raw` splits `Timeout`/`DeadlineMidFrame`.
+            Err(e) if is_timeout(&e) => Err(RpcError::Timeout),
+            Err(e) => Err(RpcError::from(e)),
+        };
+    }
+}
+
 /// Read exactly `buf.len()` header bytes; see module doc "Short reads and writes".
 fn read_header<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
     let mut filled = 0;
