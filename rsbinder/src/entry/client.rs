@@ -75,8 +75,10 @@ pub struct ClientOptions {
     ///
     /// - **Connecting**: it bounds each step of connecting as a whole —
     ///   `connect(2)` (for `tls://`, every address the host name resolves to
-    ///   together: each try gets an even share of the time left, so an
-    ///   address refused at once leaves its share to the next), the TLS
+    ///   together: each try gets an even share of the time left but at least
+    ///   2 s, or all of it when less is left, so an address refused at once
+    ///   leaves its share to the next and one slower to accept than its share
+    ///   is given up for the next), the TLS
     ///   handshake, and the android-13+ handshake — on the founding
     ///   connection and on every fan-out or incoming attach. A peer that
     ///   answers one byte at a time does not stretch a step. It is not a

@@ -807,7 +807,17 @@ fn tcp_connect(
     }
 }
 
-/// First of `addrs` to connect, all within `deadline`: each try gets an even share of what is left.
+/// Go `net`'s floor: past the first SYN retransmit (Linux initial RTO 1 s) and its answer.
+#[cfg(feature = "rpc-tls")]
+const CONNECT_SHARE_FLOOR: Duration = Duration::from_secs(2);
+
+/// One try's part of `left` with `tries` to go: an even share, at least the floor or all of `left`.
+#[cfg(feature = "rpc-tls")]
+fn connect_share(left: Duration, tries: u32) -> Duration {
+    (left / tries).max(left.min(CONNECT_SHARE_FLOOR))
+}
+
+/// First of `addrs` to connect, all within `deadline`; each try's part is [`connect_share`].
 #[cfg(feature = "rpc-tls")]
 fn tcp_connect_any(
     addrs: &[std::net::SocketAddr],
@@ -821,7 +831,7 @@ fn tcp_connect_any(
             Some(Some(end)) => {
                 let left = end.saturating_duration_since(Instant::now());
                 let tries = u32::try_from(addrs.len() - i).unwrap_or(u32::MAX);
-                let share = left / tries;
+                let share = connect_share(left, tries);
                 // `connect_timeout` refuses a zero duration with `InvalidInput`.
                 if share.is_zero() {
                     return Err(std::io::ErrorKind::TimedOut.into());
@@ -1166,10 +1176,12 @@ impl<'a> RpcClientConfig<'a> {
     ///   `connect(2)` for `tcp_debug` and `tls`, the TLS handshake, and the
     ///   android-13+ handshake. For `tls`, `connect(2)` is one step across
     ///   every address `host` resolves to: each try gets an even share of the
-    ///   time left, so an address refused at once leaves its share to the
-    ///   next. Resolving `host` is not bounded; it blocks in the platform's
-    ///   resolver. The bound is on the step as a whole: a server
-    ///   that answers one byte at a time does not stretch it, on a transport
+    ///   time left but at least 2 s (all of it when less is left), so an
+    ///   address refused at once leaves its share to the next and one slower
+    ///   to accept than its share is given up for the next. Resolving `host`
+    ///   is not bounded; it blocks in the platform's resolver. The bound is
+    ///   on the step as a whole: a server that answers one byte at a time
+    ///   does not stretch it, on a transport
     ///   with a [`RpcTransport::shutdown_handle`] (the bundled ones; another is
     ///   bounded per wait only). A server that accepts the socket and then
     ///   answers nothing (one at its connection cap leaves new connections
@@ -5390,7 +5402,11 @@ impl RpcSession {
     /// hangs this call. [`Client::open_with`](crate::Client::open_with) on
     /// [`Endpoint::tls`](crate::Endpoint::tls) with
     /// [`ClientOptions::timeout`](crate::ClientOptions::timeout) set opens
-    /// the same r34 TLS session with each connecting step bounded.
+    /// the same r34 TLS session with each connecting step bounded. That
+    /// `timeout` then stays the session's reply deadline
+    /// ([`RpcSession::set_timeout`]), and an expired reply wait ends the
+    /// session; call `set_timeout(None)` on the session afterwards to keep
+    /// reply waits unbounded.
     #[cfg(feature = "rpc-tls")]
     pub fn setup_tcp_client_tls(
         addr: impl std::net::ToSocketAddrs,
@@ -5416,7 +5432,11 @@ impl RpcSession {
     /// then sends nothing hangs this call.
     /// [`setup_client_android13plus_with_config`](Self::setup_client_android13plus_with_config)
     /// with [`RpcClientConfig::tls`] and [`RpcClientConfig::timeout`] set
-    /// opens the same session with each of those steps bounded.
+    /// opens the same session with each of those steps bounded. That
+    /// `timeout` then stays the session's reply deadline
+    /// ([`RpcSession::set_timeout`]), and an expired reply wait ends the
+    /// session; call `set_timeout(None)` on the session afterwards to keep
+    /// reply waits unbounded.
     #[cfg(feature = "rpc-tls")]
     pub fn setup_tcp_client_tls_android13plus(
         addr: impl std::net::ToSocketAddrs,
@@ -6506,8 +6526,26 @@ mod tests {
 
         let live = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let live = live.local_addr().expect("addr");
+        let d = CONNECT_SHARE_FLOOR + CONNECT_SHARE_FLOOR / 2;
+        let start = Instant::now();
         let (_, reached) = tcp_connect_any(&[silent, live], Some(d)).expect("the live address");
+        let took = start.elapsed();
         assert_eq!(reached, live);
+        assert!(
+            took >= CONNECT_SHARE_FLOOR * 9 / 10,
+            "the silent address got {took:?}, under the floor"
+        );
+    }
+
+    /// Each try waits at least the floor, or all that is left when that is less.
+    #[cfg(feature = "rpc-tls")]
+    #[test]
+    fn a_connect_share_is_even_above_the_floor() {
+        let s = Duration::from_secs;
+        assert_eq!(connect_share(s(10), 2), s(5));
+        assert_eq!(connect_share(s(10), 10), CONNECT_SHARE_FLOOR);
+        assert_eq!(connect_share(s(1), 2), s(1));
+        assert_eq!(connect_share(s(3), 1), s(3));
     }
 
     /// An address refused at once leaves its share of the deadline to the next one.
@@ -6520,7 +6558,8 @@ mod tests {
             .expect("bind")
             .local_addr()
             .expect("addr");
-        let d = Duration::from_secs(1);
+        // Above the floor, so the silent address's own even share is half of `d`.
+        let d = CONNECT_SHARE_FLOOR * 2;
 
         let start = Instant::now();
         let e = tcp_connect_any(&[refused, silent], Some(d)).expect_err("nothing answers");

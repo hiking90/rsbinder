@@ -373,6 +373,20 @@ a reference such as "(CHANGELOG *Fixed*)" points to the 0.12.0 section there.
   `tcp_debug` and `tls` only, not for `unix` or `vsock`). A send deadline that expires
   part-way through a frame returns `TimedOut` (0.11.0: `WouldBlock`, which
   means nothing was sent).
+- **A `tls` client's connect deadline is shared by every address the host
+  name resolves to.** In 0.11.0 `ClientOptions::handshake_timeout` gave each
+  address its own full `connect(2)` deadline, so a host with `N` addresses
+  that drop the SYN held `open` for `N` times it. Now `timeout` (or the
+  deprecated `handshake_timeout` of `RpcClientConfig` and `ClientOptions`)
+  bounds the tries together: each gets an even share of the time left but
+  at least 2 s (all of it when less is left), an address refused at once
+  leaves its share to the next, and an address slower to accept than its
+  share is given up for the next even when it would have accepted within
+  the deadline. A `timeout` under 2 s therefore goes to the first address
+  that does not refuse at once. For a host that resolves to several
+  addresses over a link whose connect takes more than the larger of
+  `timeout / N` and 2 s, raise the deadline or connect to one IP address
+  (with `tls_server_name` naming the certificate's host).
 - **`RpcServer::set_handshake_timeout` bounds the whole admission phase, not
   each read.** In 0.11.0 it was a socket deadline (`SO_RCVTIMEO`,
   `SO_SNDTIMEO`) that every read or write started over, so a client whose

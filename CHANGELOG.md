@@ -118,6 +118,10 @@ change bytes between peers: upgrade both ends together.
 - An expired reply deadline ends the session.
 - The session timeout also bounds sends, connect and handshake steps (a
   `unix` or `vsock` `connect(2)` excepted), and TCP liveness.
+- A `tls` client's connect deadline (`timeout`, the deprecated
+  `handshake_timeout`) is shared by every address the host name resolves to;
+  0.11.0's `ClientOptions::handshake_timeout` gave each address the whole
+  deadline.
 - `RpcServer::set_handshake_timeout` bounds the whole admission phase (on r34,
   through a new session's first transaction; a joining connection's ends with
   its session-id preamble), a client's handshake deadline (`timeout`, the
@@ -421,11 +425,15 @@ RPC:
   `RpcSession::from_preconnected_fd`'s 10 s for its handshake. An expired TLS
   handshake reports `TimedOut`, not `WouldBlock`.
 - **A `tls` client's connect deadline bounds every resolved address
-  together.** `RpcClientConfig::timeout` and `ClientOptions::timeout` gave
-  each address the host name resolved to the full deadline, so a host with
-  `N` silent addresses held the setup call for `N` times it. Each try now
-  gets an even share of the time left; an address refused at once leaves
-  its share to the next. `RpcSession::setup_tcp_client_tls` and
+  together.** In 0.11.0 `ClientOptions::handshake_timeout` gave each address
+  the host name resolved to the full deadline, so a host with `N` silent
+  addresses held the setup call for `N` times it. `timeout` (and the
+  deprecated `handshake_timeout`, `RpcClientConfig`'s too) now bounds them
+  together: each try gets an even share of the time left but at least 2 s
+  (Go `net`'s floor; all of it when less is left), so an address refused at
+  once leaves its share to the next, and one slower to accept than its share
+  is given up for the next (see *Migrating*).
+  `RpcSession::setup_tcp_client_tls` and
   `setup_tcp_client_tls_android13plus` take no deadline, and their docs now
   say so and name the bounded form.
 - **On the android-13+ wire a null binder interoperates with libbinder**: it
