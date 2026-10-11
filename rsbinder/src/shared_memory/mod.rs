@@ -1,8 +1,7 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared-memory IPC: AOSP `IMemory` / `IMemoryHeap` for rsbinder
-//! ([plan/4-7a](https://github.com/hiking90/rsbinder/blob/master/plans/4-7a-shared-memory-impl.md)).
+//! Shared-memory IPC: AOSP `IMemory` / `IMemoryHeap` for rsbinder (plan 4-7a).
 //!
 //! AOSP `IMemory.h`
 //! ([source](https://cs.android.com/android/platform/superproject/+/android-16.0.0_r4:frameworks/native/libs/binder/include/binder/IMemory.h))

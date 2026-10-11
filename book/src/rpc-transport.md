@@ -372,8 +372,9 @@ before connecting.
 ### TLS client
 
 ```rust
-use rsbinder::rpc::{rustls, RpcSession};
-use std::sync::Arc;
+use rsbinder::rpc::rustls;
+use rsbinder::{Client, Endpoint};
+use std::{sync::Arc, time::Duration};
 
 let mut roots = rustls::RootCertStore::empty();
 // ... populate `roots` from your trust anchors ...
@@ -383,15 +384,23 @@ let config = Arc::new(
         .with_no_client_auth(),
 );
 
-// Third argument must be `Arc<rustls::ClientConfig>` — `setup_tcp_client_tls`
-// takes the config by shared ownership so it can be cloned per connection.
-let session = RpcSession::setup_tcp_client_tls(
-    "binder.example.com:9999",
-    "binder.example.com",
-    config,
-)?;
-let root = session.get_root()?;
+// The certificate is verified against the host name unless
+// `tls_server_name` names another.
+let client = Client::open_with(Endpoint::tls("binder.example.com", 9999), |o, _| {
+    o.tls = Some(config);
+    o.timeout = Some(Duration::from_secs(10));
+})?;
+let root = client.session().expect("an RPC client").get_root()?;
 ```
+
+`timeout` bounds each step of connecting — `connect(2)` across every
+address the host name resolves to, the TLS handshake, and on
+`?profile=android13plus` the android-13+ handshake — and then the
+session's reply waits ([Timeouts](#timeouts)). Without it, a server that
+accepts the connection and then sends nothing hangs `open_with`.
+`RpcSession::setup_tcp_client_tls` and `setup_tcp_client_tls_android13plus`
+take no deadline at all; `RpcClientConfig::tls(..).timeout(d)` is the
+bounded form of the second.
 
 `rsbinder::rpc::rustls` is the **exact** `rustls` version the `rpc-tls`
 backend links against, re-exported so you don't have to track it in
@@ -700,7 +709,7 @@ deadline below is an rsbinder addition, and each measures one thing.
 
 | Setting | What it bounds | On expiry |
 |---|---|---|
-| `RpcSession::set_timeout(d)`; `RpcClientConfig::timeout`, `ClientOptions::timeout`; on a server `RpcServer::set_reply_timeout`, `ServeOptions::reply_timeout`, applied to every session it makes | How long the peer may leave this end without an answer: a reply wait; a send that makes no progress (`SO_SNDTIMEO`, every bundled socket transport; a transport of your own only if it implements `RpcTransport::set_write_timeout`; on Linux and Android progress is the peer taking this end's bytes, `SIOCOUTQ`, which a reply wait counts too, and Apple counts the bytes a send accepted: [`transport` module doc "A slow peer"](https://docs.rs/rsbinder/latest/rsbinder/rpc/transport/index.html#a-slow-peer)); the peer's host not answering (the kernel's keepalive check, TCP and TLS over TCP); on a client, each connect and handshake step (`connect(2)` itself only for `tcp_debug` and `tls`: a `unix` connect waits while the listener's accept queue is full, and the kernel bounds a `vsock` one by its own connect timeout) | The session ends; the call that waited returns `TimedOut`. A connect or handshake step: the setup or attach call returns `TimedOut`, and an attach whose step expires after its header went out ends the session ([How a connection ends](#how-a-connection-ends)) |
+| `RpcSession::set_timeout(d)`; `RpcClientConfig::timeout`, `ClientOptions::timeout`; on a server `RpcServer::set_reply_timeout`, `ServeOptions::reply_timeout`, applied to every session it makes | How long the peer may leave this end without an answer: a reply wait; a send that makes no progress (`SO_SNDTIMEO`, every bundled socket transport; a transport of your own only if it implements `RpcTransport::set_write_timeout`; on Linux and Android progress is the peer taking this end's bytes, `SIOCOUTQ`, which a reply wait counts too, and Apple counts the bytes a send accepted: [`transport` module doc "A slow peer"](https://docs.rs/rsbinder/latest/rsbinder/rpc/transport/index.html#a-slow-peer)); the peer's host not answering (the kernel's keepalive check, TCP and TLS over TCP); on a client, each connect and handshake step (`connect(2)` itself only for `tcp_debug` and `tls`, where it is one step across every address the host resolves to: a `unix` connect waits while the listener's accept queue is full, and the kernel bounds a `vsock` one by its own connect timeout) | The session ends; the call that waited returns `TimedOut`. A connect or handshake step: the setup or attach call returns `TimedOut`, and an attach whose step expires after its header went out ends the session ([How a connection ends](#how-a-connection-ends)) |
 | The same `d`, for a free connection in the session's pool | A wait for a connection to send on; nothing has been sent yet | That call returns `WouldBlock`; the session goes on |
 | `RpcServer::set_handshake_timeout`, `ServeOptions::handshake_timeout` (default 10 s) | An accepted connection from its accept to admission, its TLS handshake and first contact included, as a whole: a peer that sends its handshake a byte at a time does not stretch it. The `set_authorizer` hook's run is not counted. A transport whose `RpcTransport::shutdown_handle` is `None`, the default for one of your own, is bounded per wait only, by the `set_read_timeout` and `set_write_timeout` it implements (neither: no bound) | The connection is dropped |
 | `RpcServer::set_idle_timeout`, `ServeOptions::idle_timeout` | A session in which no byte crossed any connection and no call was open, judged per session ([`set_idle_timeout`](https://docs.rs/rsbinder/latest/rsbinder/rpc/struct.RpcServer.html#method.set_idle_timeout) states the timing and what counts) | The session ends |

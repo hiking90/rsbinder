@@ -154,6 +154,28 @@ tweaks; wire formats are already locked.
   the wire: the work source uses a header field kernel binder already has. The
   work source is STAGE3-gated against real `libbinder`. See
   [Observability](./observability.md).
+- **Reconnecting (new in 0.12.0)** — `Reconnecting` and the `reconnect`
+  module: one service named by a `Uri`, looked up again after its process
+  dies or its RPC session ends, with an `on_connect` hook rerun on each new
+  connection. It adds nothing to the wire. On kernel binder it sends, beyond
+  a plain `connect`, a death link and, while the name is absent, a
+  service-manager notification registration, both existing commands; over
+  RPC it sends nothing a plain `connect` does not. Validated over
+  kernel binder and RPC, and against a real `libbinder` `RpcServer` that is
+  killed and restarted on an emulator
+  (`example-hello/cpp/run_rpc_reconnect_interop.sh`). See
+  [Reconnecting to a Service](./reconnecting.md).
+- **Freeze notifications (new in 0.12.0)** —
+  `IBinder::add_frozen_state_change_callback` /
+  `remove_frozen_state_change_callback`, `FrozenStateChangeCallback`,
+  `FrozenState`, and `ProcessState::freeze_process` /
+  `process_freeze_info`: AOSP `addFrozenStateChangeCallback` (libbinder
+  android-15.0.0_r6+) over the driver's own commands, so the contract is the
+  kernel UAPI rather than a libbinder wire. Validated on the Rust binder
+  driver, on the C driver of an Android 17 emulator, and on an Android 15
+  driver without `features/freeze_notification`, where
+  `add_frozen_state_change_callback` returns `InvalidOperation`
+  (`tests/tests/freeze_kernel.rs`).
 - **`RpcClientConfig` (new in 0.12.0)** — one android-13+ client configuration
   for every transport (`unix`, `unix_abstract`, `vsock`, `tls`, `tcp_debug`,
   `new`), with `incoming_connections` and `outgoing_connections` on all of

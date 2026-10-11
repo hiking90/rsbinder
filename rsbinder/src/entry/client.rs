@@ -73,15 +73,20 @@ pub struct ClientOptions {
     /// RPC: how long the server may go without answering before this end
     /// counts it as broken (`RpcSession::set_timeout`, plan 2-24 D4 and D6).
     ///
-    /// - **Connecting**: it bounds each blocking step of connecting — one
-    ///   `connect(2)` per address the founding connection tries (`tls://`),
-    ///   the TLS handshake, then each read and write of the
-    ///   android-13+ handshake — on the founding connection and on every
-    ///   fan-out or incoming attach. It is not a budget for the phase as a
-    ///   whole, so `open` can take a multiple of it before returning; what
-    ///   it guarantees is that no single step waits on a silent peer
-    ///   forever. Three steps are out of its reach: resolving the host name,
-    ///   which blocks in the platform's resolver; on Linux and Android a
+    /// - **Connecting**: it bounds each step of connecting as a whole —
+    ///   `connect(2)` (for `tls://`, every address the host name resolves to
+    ///   together: each try gets an even share of the time left but at least
+    ///   2 s, or all of it when less is left, so an address refused at once
+    ///   leaves its share to the next and one slower to accept than its share
+    ///   is given up for the next), the TLS
+    ///   handshake, and the android-13+ handshake — on the founding
+    ///   connection and on every fan-out or incoming attach. A peer that
+    ///   answers one byte at a time does not stretch a step. It is not a
+    ///   budget for the phase as a whole, so `open` can take a multiple of
+    ///   it before returning; what it guarantees is that no single step
+    ///   waits on a silent peer forever. Three steps are out of its reach:
+    ///   resolving the host name, which blocks in the platform's resolver;
+    ///   on Linux and Android a
     ///   `unix://` or `unix-abstract://` connect into a listener whose
     ///   accept queue is full, which waits until the server accepts; and a
     ///   `vsock://` connect, which the kernel bounds by its own connect
