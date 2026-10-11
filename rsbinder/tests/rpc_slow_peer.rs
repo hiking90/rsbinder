@@ -47,7 +47,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -131,14 +131,13 @@ fn client_config() -> Arc<ClientConfig> {
     )
 }
 
+/// Named by a counter: the tests share `tag`s, and macOS `SystemTime` is µs.
 fn tmp_sock(tag: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     std::env::temp_dir().join(format!(
-        "rsb_slow_{tag}_{}_{nanos}.sock",
-        std::process::id()
+        "rsb_slow_{tag}_{}_{}.sock",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
     ))
 }
 
