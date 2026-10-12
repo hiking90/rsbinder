@@ -240,13 +240,13 @@ fn ashmem_size(_fd: std::os::fd::BorrowedFd<'_>) -> Result<usize> {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn write_sealed<F: AsFd>(fd: F) -> bool {
-    use rustix::fs::SealFlags;
+    use rsbinder_fmq::shm::Seals;
     // ashmem answers `F_GET_SEALS` with `EINVAL`; its read-only state is the prot mask.
     if is_ashmem_fd(fd.as_fd()) {
         return ashmem_write_protected(fd.as_fd());
     }
-    rustix::fs::fcntl_get_seals(fd)
-        .map(|s| s.intersects(SealFlags::WRITE | SealFlags::FUTURE_WRITE))
+    rsbinder_fmq::shm::seals(fd.as_fd())
+        .map(|s| s.intersects(Seals::WRITE | Seals::FUTURE_WRITE))
         .unwrap_or(false)
 }
 

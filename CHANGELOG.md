@@ -49,6 +49,17 @@ Each item below changes what a 0.12.0 program observes.
   `MessageQueue::create` and `attach` too, so a seccomp filter that kills
   or traps on a system call outside its list must allow it; Android's
   filters do (bionic `SYSCALLS.TXT` lists `fstatfs64` and `fstatfs`).
+- `rsbinder`'s shared memory maps through `shm::Mapping` and so has the same
+  two refusals, both `BadValue`: `MappedHeap::from_fd` — and what maps a
+  received fd through it: `SharedMemory::from_fd`, `Parcel::read_blob`, an
+  `IMemory` from a peer — refuses an fd the kernel reports as a hugetlbfs
+  file, and on a 32-bit target it and `MemoryHeapBase::new` refuse a region
+  of more than `isize::MAX` bytes. 0.12.0 passed both to `mmap`. A
+  hugetlbfs mapping then could not be unmapped when the heap was dropped,
+  and a region that large is more than the slices the heap's accessors
+  build may span. AOSP's `MemoryHeapBase` and `SharedMemory` make ordinary
+  memfd or ashmem regions, which are not refused. The `fstatfs` of the item
+  above is made here too, once for each mapping.
 - Off Linux and Android (macOS), `MessageQueue::create` and
   `MessageQueue::attach` return `Error::Unsupported` before they look at
   their arguments or make a system call. 0.12.0 checked `create`'s

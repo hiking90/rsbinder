@@ -42,23 +42,34 @@
 //! [`as_ptr`](MemoryHeapBase::as_ptr) carries AOSP's `unsecurePointer()`
 //! caveat, and it is the caller's `unsafe` to dereference.
 //!
-//! The heaps' shared state is `Send + Sync` on the same basis. Its only
-//! non-auto-`Send`/`Sync` member is the mapping's raw pointer; the region
-//! behind it has no thread affinity, and every safe access goes through
+//! The heaps' shared state is `Send + Sync` on the same basis. The mapping
+//! is a `rsbinder_fmq::shm::Mapping`, an address range with no thread
+//! affinity that is `Send + Sync` itself, and every safe access goes through
 //! `Mapping::region` — atomic loads and stores, uniformly word-sized on the
 //! word part — so concurrent `read_at`/`write_at`/`base` from several
 //! threads (or another process) are data races only in the hardware sense,
-//! never in Rust's model. Stores are gated on the heap being writable, so a
-//! `PROT_READ` mapping is never written. The atomic view relies on `mmap`
-//! returning page-aligned memory (the word part is `usize`-aligned),
-//! `AtomicUsize` having `usize`'s size and alignment, and `AtomicU8` being
-//! `repr(transparent)` over `u8`.
+//! never in Rust's model. That is the contract `shm::Mapping` sets for the
+//! code that turns its address into references: atomic access only, no byte
+//! at two sizes through one mapping, and `Relaxed` loads no wider than a
+//! `usize` through a read-only one. Stores are gated on the heap being
+//! writable, so a `PROT_READ` mapping is never written. The atomic view
+//! relies on the mapping starting on a page boundary (the heap's offset is
+//! page-aligned, so the word part is `usize`-aligned), `AtomicUsize` having
+//! `usize`'s size and alignment, and `AtomicU8` being `repr(transparent)`
+//! over `u8`.
+//!
+//! `shm::Mapping` adds two refusals to the `mmap` it makes, both
+//! `BadValue`: a range of more than `isize::MAX` bytes, which no Rust slice
+//! may span (a 32-bit target only), and on Linux and Android an fd the
+//! kernel reports as a hugetlbfs file, whose mapping could not be released
+//! on drop.
 
 use std::os::fd::{AsFd, OwnedFd};
-use std::ptr::NonNull;
 #[cfg(target_os = "macos")]
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+
+use rsbinder_fmq::shm;
 
 use super::{IMemoryHeap, Region, SharedBytes, FLAG_READ_ONLY, WORD};
 use crate::error::{Result, StatusCode};
@@ -100,61 +111,44 @@ fn round_up_to_page(size: usize) -> Option<usize> {
     size.checked_add(ps - 1).map(|s| s & !(ps - 1))
 }
 
-/// One `mmap` region; unmapped on drop.
-struct Mapping {
-    ptr: NonNull<u8>,
-    len: usize,
-}
+/// One page-aligned shared mapping; `rsbinder_fmq::shm` makes it and unmaps it on drop.
+struct Mapping(shm::Mapping);
 
 impl Mapping {
     fn map(fd: &OwnedFd, len: usize, offset: usize, writable: bool) -> Result<Self> {
-        use rustix::mm::{MapFlags, ProtFlags};
-        if len == 0 {
+        // `region` views the base as `usize` words; a page-aligned offset keeps it page-aligned.
+        if offset % page_size() != 0 {
             return Err(StatusCode::BadValue);
         }
-        let mut prot = ProtFlags::READ;
-        if writable {
-            prot |= ProtFlags::WRITE;
-        }
-        // SAFETY: null hint, `len > 0`, live `fd`; only this `Mapping`'s `Drop` unmaps it.
-        let raw = unsafe {
-            rustix::mm::mmap(
-                std::ptr::null_mut(),
-                len,
-                prot,
-                MapFlags::SHARED,
-                fd,
-                offset as u64,
-            )
-        }?;
-        let ptr = NonNull::new(raw.cast::<u8>()).ok_or(StatusCode::NoMemory)?;
-        Ok(Self { ptr, len })
+        let access = if writable {
+            shm::Access::ReadWrite
+        } else {
+            shm::Access::ReadOnly
+        };
+        let mapping = shm::Mapping::map(fd.as_fd(), offset as u64, len as u64, access)?;
+        Ok(Self(mapping))
     }
-}
 
-impl Mapping {
     /// The mapping as atomics ([`Region`]): `&[u8]` would assert immutability peers can break.
     fn region(&self) -> Region<'_> {
-        let words = self.len / WORD;
-        let base = self.ptr.as_ptr();
+        let len = self.0.len();
+        let words = len / WORD;
+        let base = self.0.as_ptr().as_ptr();
         // SAFETY: live page-aligned mapping outlives the borrows; atomic layouts match; disjoint.
         let (words, tail) = unsafe {
             (
                 std::slice::from_raw_parts(base.cast::<AtomicUsize>(), words),
                 std::slice::from_raw_parts(
                     base.add(words * WORD).cast::<AtomicU8>(),
-                    self.len - words * WORD,
+                    len - words * WORD,
                 ),
             )
         };
         Region::new(words, tail)
     }
-}
 
-impl Drop for Mapping {
-    fn drop(&mut self) {
-        // SAFETY: `ptr`/`len` came from a successful `mmap` and nothing else unmaps them.
-        let _ = unsafe { rustix::mm::munmap(self.ptr.as_ptr().cast(), self.len) };
+    fn as_ptr(&self) -> *mut u8 {
+        self.0.as_ptr().as_ptr()
     }
 }
 
@@ -171,10 +165,6 @@ struct HeapInner {
     flags: u32,
     writable: bool,
 }
-
-// SAFETY: every access to the raw mapping is atomic via `Mapping::region` (module doc, Aliasing).
-unsafe impl Send for HeapInner {}
-unsafe impl Sync for HeapInner {}
 
 impl HeapInner {
     fn region(&self) -> Result<Region<'_>> {
@@ -200,7 +190,7 @@ impl HeapInner {
     }
 
     fn as_ptr(&self) -> Option<*mut u8> {
-        self.map.as_ref().map(|m| m.ptr.as_ptr())
+        self.map.as_ref().map(Mapping::as_ptr)
     }
 
     /// The fd peers receive: `ro_fd` when present and `export_ro` is set, else `fd`.
@@ -250,34 +240,35 @@ struct Created {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod backend {
     use super::*;
-    use rustix::fs::{MemfdFlags, SealFlags};
+    use shm::Seals;
 
     pub(super) fn create(name: &str, size: usize) -> Result<Created> {
-        let fd = rustix::fs::memfd_create(name, MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING)?;
-        rustix::fs::ftruncate(&fd, size as u64)?;
+        let fd = shm::create(size as u64, &shm::CreateOptions::new(name))?;
         Ok(Created { fd, ro_fd: None })
     }
 
     pub(super) fn seal_future_write(fd: &OwnedFd, _ro: Option<&OwnedFd>) -> Result<()> {
-        rustix::fs::fcntl_add_seals(fd, SealFlags::FUTURE_WRITE)?;
+        shm::add_seals(fd.as_fd(), Seals::FUTURE_WRITE)?;
         Ok(())
     }
 
     /// AOSP `MemoryHeapBase` seal set; run *after* the owner mapping, which FUTURE_WRITE blocks.
     pub(super) fn seal(fd: &OwnedFd, flags: u32) -> Result<()> {
-        let mut seals = SealFlags::GROW | SealFlags::SHRINK;
+        let mut seals = Seals::GROW | Seals::SHRINK;
         if flags & FLAG_READ_ONLY != 0 {
-            seals |= SealFlags::FUTURE_WRITE;
+            seals |= Seals::FUTURE_WRITE;
         }
         if flags & FLAG_MEMFD_ALLOW_SEALING == 0 {
-            seals |= SealFlags::SEAL;
+            seals |= Seals::SEAL;
         }
-        match rustix::fs::fcntl_add_seals(fd, seals) {
+        match shm::add_seals(fd.as_fd(), seals) {
             Ok(()) => Ok(()),
             // Pre-5.1 kernel lacks FUTURE_WRITE (EINVAL): apply the rest; `seals()` shows the gap.
-            Err(rustix::io::Errno::INVAL) if seals.contains(SealFlags::FUTURE_WRITE) => {
+            Err(rsbinder_fmq::Error::Os(rustix::io::Errno::INVAL))
+                if seals.contains(Seals::FUTURE_WRITE) =>
+            {
                 log::warn!("memfd F_SEAL_FUTURE_WRITE unsupported by this kernel; read-only heap is not write-sealed");
-                rustix::fs::fcntl_add_seals(fd, seals - SealFlags::FUTURE_WRITE)?;
+                shm::add_seals(fd.as_fd(), seals.difference(Seals::FUTURE_WRITE))?;
                 Ok(())
             }
             Err(e) => Err(e.into()),
@@ -285,7 +276,7 @@ mod backend {
     }
 
     pub(super) fn get_seals(fd: &OwnedFd) -> Option<u32> {
-        rustix::fs::fcntl_get_seals(fd).ok().map(|s| s.bits())
+        shm::seals(fd.as_fd()).ok().map(Seals::bits)
     }
 }
 
@@ -586,6 +577,14 @@ impl MappedHeap {
     /// `ftruncate`s after this call still `SIGBUS`es on the next access.
     /// [`from_fd_strict`](Self::from_fd_strict) is the opt-in that
     /// demands the sender sealed against it.
+    ///
+    /// Two ranges that pass those checks are `BadValue` as well, refused by
+    /// `rsbinder_fmq::shm::Mapping` before any `mmap`: one of more than
+    /// `isize::MAX` bytes, which only a 32-bit target can be asked for, and
+    /// on Linux and Android one on an fd the kernel reports as a hugetlbfs
+    /// file (a memfd created `MFD_HUGETLB`). The kernel maps such a file in
+    /// whole huge pages and refuses the `munmap` of the length asked for,
+    /// so the mapping could not be released when the heap is dropped.
     ///
     /// This constructor works on every unix target, including the ones
     /// with no backing store of their own (the `other` row of the table
@@ -999,6 +998,36 @@ mod tests {
             let fd = OwnedFd::from(h.to_parcel_fd().unwrap());
             // A receiver that lies about the flag is stopped by the kernel.
             assert!(MappedHeap::from_fd(fd, h.size(), 0, 0).is_err());
+        }
+
+        #[test]
+        fn a_hugetlbfs_fd_is_refused() {
+            use rustix::fs::{memfd_create, MemfdFlags};
+            // One huge page of file: `from_fd` checks the range against `st_size` first.
+            let Some(huge_page) = std::fs::read_to_string("/proc/meminfo")
+                .ok()
+                .and_then(|info| {
+                    let line = info.lines().find(|l| l.starts_with("Hugepagesize:"))?;
+                    line.split_whitespace().nth(1)?.parse::<u64>().ok()
+                })
+                .map(|kib| kib * 1024)
+            else {
+                return;
+            };
+            // No such fd to refuse on a kernel without hugetlbfs or without this huge page size.
+            let Ok(fd) = memfd_create("huge", MemfdFlags::CLOEXEC | MemfdFlags::HUGETLB) else {
+                return;
+            };
+            if rustix::fs::ftruncate(&fd, huge_page).is_err() || rustix::fs::fstatfs(&fd).is_err() {
+                return;
+            }
+            for flags in [0, FLAG_READ_ONLY] {
+                let fd = fd.try_clone().unwrap();
+                assert_eq!(
+                    MappedHeap::from_fd(fd, page_size(), 0, flags).unwrap_err(),
+                    StatusCode::BadValue
+                );
+            }
         }
     }
 
