@@ -36,11 +36,24 @@
 //!   ashmem (or, on Android 11+, a memfd sealed `GROW | SHRINK` by
 //!   libcutils); both attach.
 //!
+//! # Shared-memory primitives
+//!
+//! What the queue is built from is public as the [`shm`] module: a memfd
+//! and its seals, a mapping at any byte offset, copies in and out of shared
+//! memory through atomics, and non-private futex wait and wake. A protocol
+//! other than FMQ can be built on the same module; `rsbinder`'s shared-memory
+//! code asks it about a peer's fd ([`shm::is_ashmem_fd`],
+//! [`shm::ashmem_size`]). The module carries no layout and no protocol; those
+//! are the queue's.
+//!
 //! # Platforms
 //!
-//! Linux and Android. The crate compiles everywhere, and on any other
-//! target [`MessageQueue::create`] and [`MessageQueue::attach`] return
-//! [`Error::Unsupported`].
+//! The queue works on Linux and Android targets that have 64-bit atomics.
+//! The crate also compiles for macOS, for a Linux target without 64-bit
+//! atomics (`armv5te-unknown-linux-gnueabi`) and for WASI
+//! (`wasm32-wasip1`); there [`MessageQueue::create`] and
+//! [`MessageQueue::attach`] return [`Error::Unsupported`]. The [`shm`]
+//! module says which of its items each of those targets has.
 //!
 //! # A descriptor is untrusted
 //!
@@ -72,7 +85,6 @@ mod event_flag;
 mod queue;
 mod ring;
 pub mod shm;
-mod sys;
 
 pub use descriptor::{AttachPolicy, Descriptor, Flavor, Grantor};
 pub use error::{Error, Result};
@@ -89,5 +101,46 @@ mod unsupported_tests {
             MessageQueue::<u8>::create(16, true).err(),
             Some(Error::Unsupported)
         );
+    }
+
+    #[test]
+    fn the_target_verdict_comes_before_the_arguments() {
+        // On a target that runs a queue a capacity of zero is `BadValue`.
+        assert_eq!(
+            MessageQueue::<u8>::create(0, true).err(),
+            Some(Error::Unsupported)
+        );
+        let desc = Descriptor {
+            fds: vec![std::fs::File::open("/dev/null").expect("/dev/null").into()],
+            ints: Vec::new(),
+            grantors: Vec::new(),
+            quantum: 1,
+            flavor: Flavor::SynchronizedReadWrite,
+        };
+        let policy = AttachPolicy {
+            max_capacity: 1,
+            require_seal: true,
+            require_event_flag: true,
+        };
+        assert_eq!(
+            MessageQueue::<u8>::attach(&desc, &policy).err(),
+            Some(Error::Unsupported)
+        );
+    }
+
+    #[test]
+    fn memfd_seals_and_futex_report_unsupported() {
+        use std::os::fd::AsFd;
+        use std::sync::atomic::AtomicU32;
+        let options = shm::CreateOptions::new("unit");
+        assert_eq!(shm::create(4096, &options).err(), Some(Error::Unsupported));
+        let file = std::fs::File::open("/dev/null").expect("/dev/null");
+        let seals = shm::Seals::GROW;
+        assert_eq!(shm::add_seals(file.as_fd(), seals), Err(Error::Unsupported));
+        assert_eq!(shm::seals(file.as_fd()), Err(Error::Unsupported));
+        assert!(!shm::shrink_sealed(file.as_fd()));
+        let word = AtomicU32::new(0);
+        assert_eq!(shm::futex_wait(&word, 0, 1, None), Err(Error::Unsupported));
+        assert_eq!(shm::futex_wake(&word, 1), Err(Error::Unsupported));
     }
 }

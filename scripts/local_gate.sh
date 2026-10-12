@@ -158,11 +158,13 @@ public_api() {
     cargo +nightly-2026-05-25 public-api -p rsbinder --simplified > "$out.txt" &&
         diff -u api/rsbinder.txt "$out.txt" &&
         cargo +nightly-2026-05-25 public-api -p rsbinder --simplified --features rpc > "$out-rpc.txt" &&
-        diff -u api/rsbinder-rpc.txt "$out-rpc.txt"
+        diff -u api/rsbinder-rpc.txt "$out-rpc.txt" &&
+        cargo +nightly-2026-05-25 public-api -p rsbinder-fmq --simplified > "$out-fmq.txt" &&
+        diff -u api/rsbinder-fmq.txt "$out-fmq.txt"
 }
 
 semver() {
-    cargo semver-checks check-release -p rsbinder -p rsbinder-aidl --default-features &&
+    cargo semver-checks check-release -p rsbinder -p rsbinder-aidl -p rsbinder-fmq --default-features &&
         cargo semver-checks check-release -p rsbinder --only-explicit-features \
             --features rpc,rpc-tcp-debug,rpc-tls,rpc-vsock,async
 }

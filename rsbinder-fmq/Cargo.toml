@@ -3,7 +3,7 @@ name = "rsbinder-fmq"
 version = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }
-description = "AOSP-compatible Fast Message Queue (libfmq) in pure Rust — a shared-memory ring with futex wake-ups, independent of binder."
+description = "AOSP-compatible Fast Message Queue (libfmq) in pure Rust — a shared-memory ring with futex wake-ups, independent of binder — and the shared-memory primitives under it (sealed memfd, mappings, atomic copies, futex)."
 homepage = { workspace = true }
 repository = { workspace = true }
 readme = "README.md"
@@ -18,9 +18,10 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [dependencies]
 # `time` is for the absolute `CLOCK_MONOTONIC` deadline a futex wait takes;
-# `param` for the page size the mappings are aligned to. Both compile on every
-# unix, which keeps one implementation of the queue for all targets — the
-# platform-specific primitives live in `src/sys.rs`.
+# `param` for the page size the mappings are aligned to. Both compile on Linux,
+# Android and macOS, which keeps one implementation of the queue for them — the
+# platform-specific primitives live in `src/shm/`, which also splits out the
+# targets where rustix has no `clock_gettime` or no `mm`.
 rustix = { workspace = true, features = ["fs", "mm", "param", "time"] }
 # A wake that fails after a committed transfer is logged, as libfmq's
 # `EventFlag::wake` does, rather than returned.
@@ -32,13 +33,20 @@ rustix = { workspace = true, features = ["thread"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 # `ASHMEM_GET_SIZE`: rustix's ioctl patterns carry no "the return value is
-# the result" shape, and libcutils reads the size exactly that way.
+# the result" shape, and libcutils reads the size exactly that way. Also the
+# `futex` system call on 32-bit Android, where rustix calls `futex_time64`
+# (`src/shm/futex.rs`).
 libc = { workspace = true }
 
 [dev-dependencies]
 # `net` is for the two-process test, which hands the queue's fd to a child
 # over a unix socket (`SCM_RIGHTS`), independent of binder (`plans/12-fmq.md`).
 rustix = { workspace = true, features = ["net"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# One `shm::Mapping` test loads a seccomp filter that denies `fstatfs`; rustix
+# has no call that loads a filter.
+libc = { workspace = true }
 
 # loom is only used by the unit tests gated on `--cfg loom` (`src/event_flag/loom_tests.rs`).
 # Run with (a target dir of its own: the cfg rebuilds every dependency):

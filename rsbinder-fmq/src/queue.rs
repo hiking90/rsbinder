@@ -4,9 +4,11 @@
 use std::cell::Cell;
 use std::marker::PhantomData;
 use std::mem::size_of;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(target_has_atomic = "64")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::descriptor::{
@@ -14,8 +16,8 @@ use crate::descriptor::{
 };
 use crate::error::{Error, Result};
 use crate::event_flag::EventFlag;
-use crate::ring::{self, Run};
-use crate::sys::{self, Mapping};
+use crate::ring;
+use crate::shm::{self, Access, CreateOptions, Deadline, Mapping, Run, Seals};
 
 /// A type that can be an element of a [`MessageQueue`].
 ///
@@ -40,6 +42,34 @@ macro_rules! elements {
 }
 elements!(u8, i8, u16, i16, u32, i32, u64, i64, f32, f64);
 
+/// Stands in for std's `AtomicU64` on a target without one. Uninhabited: no `Counter` is made.
+#[cfg(not(target_has_atomic = "64"))]
+enum AtomicU64 {}
+
+#[cfg(not(target_has_atomic = "64"))]
+impl AtomicU64 {
+    fn load(&self, _: Ordering) -> u64 {
+        match *self {}
+    }
+
+    fn store(&self, _: u64, _: Ordering) {
+        match *self {}
+    }
+}
+
+/// `Unsupported` where no queue can exist: off Linux and Android, or without 64-bit atomics.
+fn check_target() -> Result<()> {
+    let runs_a_queue = cfg!(all(
+        any(target_os = "linux", target_os = "android"),
+        target_has_atomic = "64"
+    ));
+    if runs_a_queue {
+        Ok(())
+    } else {
+        Err(Error::Unsupported)
+    }
+}
+
 struct Counter {
     _mapping: Mapping,
     ptr: NonNull<AtomicU64>,
@@ -47,13 +77,16 @@ struct Counter {
 
 impl Counter {
     fn map(desc: &Descriptor, g: Grantor) -> Result<Self> {
+        // No `Counter` exists where `AtomicU64` is the uninhabited stand-in; `get` relies on it.
+        check_target()?;
         // Only the 8-byte word: a peer-sized extent would be the peer's choice of address space.
         let mapping = Mapping::map(
             desc.fds[g.fd_index as usize].as_fd(),
             u64::from(g.offset),
             8,
+            Access::ReadWrite,
         )?;
-        let ptr = mapping.ptr().cast::<AtomicU64>();
+        let ptr = mapping.as_ptr().cast::<AtomicU64>();
         debug_assert_eq!(ptr.as_ptr() as usize % std::mem::align_of::<AtomicU64>(), 0);
         Ok(Self {
             _mapping: mapping,
@@ -162,7 +195,17 @@ impl<T: Element> MessageQueue<T> {
     /// refuses a larger extent, and the EventFlag word's offset, an AIDL
     /// `int`, lands past the ring. [`attach`](Self::attach) caps `extent` (a `long`
     /// in AIDL) at `i32::MAX` too, so that a ring fits a 32-bit `usize`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Unsupported`] comes first: on a target that cannot run a
+    /// queue — one that is not Linux or Android, or has no 64-bit atomics —
+    /// it is returned whatever the arguments are, before any system call.
+    /// On the other targets: [`Error::BadValue`] for a zero-sized `T` or a
+    /// `capacity` outside the bounds above, then [`Error::Os`] when
+    /// creating, allocating, sealing or mapping the memfd fails.
     pub fn create(capacity: usize, event_flag: bool) -> Result<Self> {
+        check_target()?;
         let quantum = size_of::<T>();
         if quantum == 0 {
             return Err(Error::BadValue("zero-sized element"));
@@ -175,7 +218,7 @@ impl<T: Element> MessageQueue<T> {
             .filter(|b| *b <= i32::MAX as u64 - rustix::param::page_size() as u64)
             .ok_or(Error::BadValue("queue too large"))?;
         let (grantors, total) = default_layout(data_bytes, event_flag);
-        let fd = sys::create_shared(total)?;
+        let fd = create_shared(total)?;
         let desc = Descriptor {
             fds: vec![fd],
             ints: Vec::new(),
@@ -204,6 +247,22 @@ impl<T: Element> MessageQueue<T> {
     /// there too); a two-fd one may exceed the `extent` cap, and an
     /// unsynchronized one is refused.
     ///
+    /// On a 32-bit target the ring has one more bound. The bytes mapped for
+    /// it start at the page boundary below the data grantor's `offset`, and
+    /// [`Mapping::map`] refuses more than `isize::MAX` of them: `extent`
+    /// plus `offset` modulo the page size is at most that, or the descriptor
+    /// is `BadValue`. On 32-bit Android bionic's `mmap64` also refuses
+    /// (`ENOMEM`) a mapping whose page-rounded length is more than
+    /// `isize::MAX`.
+    ///
+    /// A descriptor in which a counter, the data or the EventFlag grantor
+    /// names a hugetlbfs fd (a memfd created `MFD_HUGETLB`) is `BadValue` as
+    /// well: [`Mapping::map`] refuses a file the kernel reports as
+    /// hugetlbfs, whose mapping it could not release. Where the kernel does
+    /// not answer that query (see [`Mapping`]) the fd is mapped like any
+    /// other, and a mapping of a hugetlbfs file stays until the process
+    /// exits.
+    ///
     /// The counters are left as they are.
     ///
     /// Grantors whose bytes overlap are refused: two at the same fd index,
@@ -215,15 +274,24 @@ impl<T: Element> MessageQueue<T> {
     /// at all; an overlap that passes makes the counters fail their check
     /// or the elements wrong, not undefined behavior (see "One handle, one
     /// side").
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Unsupported`] comes first: on a target that cannot run a
+    /// queue — one that is not Linux or Android, or has no 64-bit atomics —
+    /// it is returned whatever `desc` and `policy` hold, before any system
+    /// call. On the other targets: [`Error::Os`] when an fd cannot be
+    /// duplicated, [`Error::BadValue`] for a descriptor the checks above
+    /// refuse, and [`Error::Os`] when a system call those checks or the
+    /// mappings make fails.
     pub fn attach(desc: &Descriptor, policy: &AttachPolicy) -> Result<Self> {
+        check_target()?;
         Self::open(desc.try_clone()?, policy)
     }
 
     fn open(desc: Descriptor, policy: &AttachPolicy) -> Result<Self> {
-        // Before validation: off Linux no fd is sealed, so the policy would refuse first.
-        if cfg!(not(any(target_os = "linux", target_os = "android"))) {
-            return Err(Error::Unsupported);
-        }
+        // The target's verdict comes before the descriptor's.
+        check_target()?;
         let geo = validate(&desc, size_of::<T>(), policy)?;
         let read = Counter::map(&desc, geo.read)?;
         let write = Counter::map(&desc, geo.write)?;
@@ -233,9 +301,10 @@ impl<T: Element> MessageQueue<T> {
                 desc.fds[g.fd_index as usize].as_fd(),
                 u64::from(g.offset),
                 g.extent,
+                Access::ReadWrite,
             )?;
             Ring {
-                base: mapping.ptr(),
+                base: mapping.as_ptr(),
                 // ≤ i32::MAX, checked by `validate`.
                 bytes: g.extent as usize,
                 _mapping: mapping,
@@ -247,6 +316,7 @@ impl<T: Element> MessageQueue<T> {
                 desc.fds[g.fd_index as usize].as_fd(),
                 u64::from(g.offset),
                 4,
+                Access::ReadWrite,
             )?)),
             None => None,
         };
@@ -551,7 +621,7 @@ impl<T: Element> MessageQueue<T> {
         if items.len() > self.capacity {
             return Err(Error::BadValue("more items than the queue holds"));
         }
-        let deadline = sys::deadline_after(timeout)?;
+        let deadline = timeout.and_then(Deadline::after);
         loop {
             if self.write(items)? {
                 wake_after_commit(&flag, wake_bits);
@@ -592,7 +662,7 @@ impl<T: Element> MessageQueue<T> {
         if out.len() > self.capacity {
             return Err(Error::BadValue("more items than the queue holds"));
         }
-        let deadline = sys::deadline_after(timeout)?;
+        let deadline = timeout.and_then(Deadline::after);
         loop {
             if self.read(out)? {
                 wake_after_commit(&flag, wake_bits);
@@ -611,6 +681,18 @@ impl<T: Element> MessageQueue<T> {
             }
         }
     }
+}
+
+/// A sealed, fully allocated memfd of `total` bytes, page-rounded as libfmq rounds ashmem.
+fn create_shared(total: u64) -> Result<OwnedFd> {
+    let page = rustix::param::page_size() as u64;
+    let total = total
+        .checked_add(page - 1)
+        .map(|t| t & !(page - 1))
+        .ok_or(Error::BadValue("queue too large"))?;
+    let fd = shm::create(total, &CreateOptions::new("rsbinder-fmq").allocate(true))?;
+    shm::add_seals(fd.as_fd(), Seals::GROW | Seals::SHRINK | Seals::SEAL)?;
+    Ok(fd)
 }
 
 /// The transfer is committed, so a failed wake is logged rather than returned (libfmq does too).
@@ -644,13 +726,16 @@ impl<T: Element> std::fmt::Debug for MessageQueue<T> {
 ///
 /// Both runs of a copy lie inside the ring: the index range is checked
 /// against [`len`](Self::len). The ring stays mapped while a `Regions`
-/// borrows its queue. Every access to ring bytes is a relaxed
+/// borrows its queue. It is one read-write [`Mapping`]: a single `mmap`
+/// result of at most `isize::MAX` bytes, every byte initialized as the pages
+/// of a mapped file are. Every access to ring bytes is a relaxed
 /// atomic load or store — `AtomicU8` up to the first `usize` boundary,
 /// `AtomicUsize` words after it, `AtomicU8` for the bytes left over — and
 /// the caller's slice is ordinary memory on the other side of the copy.
 /// Nothing hands out a reference into the ring. The split depends only on
-/// where a run starts, which is any byte for `u8` elements, so nothing
-/// relies on the ring base's alignment.
+/// which `usize`-aligned words a run covers whole — its start and its
+/// length, the start being any byte for `u8` elements — so nothing relies
+/// on the ring base's alignment.
 ///
 /// A change made to the ring from outside — the peer process, another
 /// handle in this process (each handle `mmap`s the memory itself: a second
@@ -665,10 +750,11 @@ impl<T: Element> std::fmt::Debug for MessageQueue<T> {
 /// mapping the same way.
 ///
 /// Rust's model makes unordered atomic accesses of different sizes to the
-/// same bytes a data race, and two copies from different starts split the
-/// same bytes into different sizes. Copies through one mapping never run at
-/// the same time: a `Regions` is neither `Send` nor `Sync` and borrows a
-/// `&mut MessageQueue`, which is not `Sync`.
+/// same bytes undefined behavior unless both are loads, and two copies that
+/// differ in start or length split the same bytes into different sizes.
+/// Copies through one mapping
+/// never run at the same time: a `Regions` is neither `Send` nor `Sync` and
+/// borrows a `&mut MessageQueue`, which is not `Sync`.
 ///
 /// ```compile_fail,E0277
 /// fn is_send<T: Send>() {}

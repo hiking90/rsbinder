@@ -21,8 +21,9 @@
 //!   those imports.
 //! * The queue — `MessageQueue`, `EventFlag`, `Descriptor`, `AttachPolicy`
 //!   — is `rsbinder-fmq`, re-exported here on every platform. Making or
-//!   attaching a queue works on Linux and Android, where the shared memory
-//!   and futex it needs exist, and returns `Error::Unsupported` elsewhere.
+//!   attaching a queue works on Linux and Android targets with 64-bit
+//!   atomics, where the shared memory, futex and counters it needs exist,
+//!   and returns `Error::Unsupported` elsewhere.
 //! * The two conversions below join them: an [`MQDescriptor`] that arrived in
 //!   a parcel becomes a `Descriptor` to attach to (`TryFrom<&MQDescriptor>`),
 //!   and a queue's `Descriptor` becomes the [`MQDescriptor`] to send

@@ -4,7 +4,10 @@
 //! One process, one queue, two handles (the creator's and an attached one).
 //! Plan 12-fmq AC-12.1 (same process), 12.2, 12.3, 12.4, 12.5, 12.6.
 
-#![cfg(any(target_os = "linux", target_os = "android"))]
+#![cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    target_has_atomic = "64"
+))]
 
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1015,6 +1018,7 @@ fn ring_code_makes_no_plain_copy_of_ring_memory() {
         let text = match file {
             "queue.rs" => include_str!("../src/queue.rs"),
             "ring.rs" => include_str!("../src/ring.rs"),
+            "shm/run.rs" => include_str!("../src/shm/run.rs"),
             _ => panic!("{file} is not embedded"),
         };
         text.lines()
@@ -1052,12 +1056,13 @@ fn ring_code_makes_no_plain_copy_of_ring_memory() {
         "&raw ",
     ];
     // The queue's own `read`/`write` calls, the counter's `&AtomicU64`, and pointer arithmetic.
-    const ALLOWED: [&str; 11] = [
+    const ALLOWED: [&str; 12] = [
         "if self.write(items)? {",
         "if self.read(out)? {",
         "unsafe { self.ptr.as_ref() }",
+        "let ptr = mapping.as_ptr().cast::<AtomicU64>();",
+        "base: mapping.as_ptr(),",
         "debug_assert_eq!(ptr.as_ptr() as usize % std::mem::align_of::<AtomicU64>(), 0);",
-        "let first = unsafe { self.ring.base.as_ptr().add(offset) };",
         "let first = self.first.as_ptr().add(start.min(self.first_len) * q);",
         ".as_ptr()",
         "let head_len = ((WORD - at.as_ptr() as usize % WORD) % WORD).min(len);",
@@ -1065,7 +1070,7 @@ fn ring_code_makes_no_plain_copy_of_ring_memory() {
         "unsafe { std::slice::from_raw_parts(user.as_ptr().cast(), std::mem::size_of_val(user)) }",
         "unsafe { Run::new(NonNull::new_unchecked(at.as_ptr().add(offset)), len) }",
     ];
-    for file in ["queue.rs", "ring.rs"] {
+    for file in ["queue.rs", "ring.rs", "shm/run.rs"] {
         let text = source(file);
         for line in text.lines().filter(|l| !ALLOWED.contains(&l.trim())) {
             for pattern in PLAIN_ACCESSES {
@@ -1073,9 +1078,9 @@ fn ring_code_makes_no_plain_copy_of_ring_memory() {
             }
         }
     }
-    // `queue.rs` builds no slice at all; `ring.rs` builds atomics or views of a caller's slice.
+    // `queue.rs` builds no slice at all; the other two build atomics or views of a caller's slice.
     assert!(!source("queue.rs").contains("from_raw_parts"));
-    let ring = source("ring.rs");
+    let ring = source("ring.rs") + &source("shm/run.rs");
     let calls: Vec<&str> = ring
         .match_indices("from_raw_parts")
         .map(|(at, _)| {

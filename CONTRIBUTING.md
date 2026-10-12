@@ -46,9 +46,9 @@ Linux/Android-only.
 
 - `scripts/local_gate.sh` passes: at least `hermetic`, plus `kernel` for
   anything touching `rsbinder::*` or `rpc::`
-- `cargo-semver-checks` runs automatically on PRs against `rsbinder`
-  and `rsbinder-aidl` — intentional API breaks need acknowledgment in
-  the PR description
+- `cargo-semver-checks` runs automatically on PRs against `rsbinder`,
+  `rsbinder-aidl` and `rsbinder-fmq` — intentional API breaks need
+  acknowledgment in the PR description
 - Wire-format-affecting changes need a STAGE3 (real-`libbinder` interop)
   result documented in the PR
 

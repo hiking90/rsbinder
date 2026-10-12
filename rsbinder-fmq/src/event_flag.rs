@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
-use crate::sys::{self, Mapping, Timespec};
+use crate::shm::{self, Deadline, Mapping};
 
 /// libfmq `FMQ_NOT_FULL`: the reader sets it after consuming, the writer
 /// waits on it when the ring is full.
@@ -53,7 +53,7 @@ pub struct EventFlag {
 
 impl EventFlag {
     pub(crate) fn from_mapping(mapping: Mapping) -> Self {
-        let word = mapping.ptr().cast::<AtomicU32>();
+        let word = mapping.as_ptr().cast::<AtomicU32>();
         debug_assert_eq!(
             word.as_ptr() as usize % std::mem::align_of::<AtomicU32>(),
             0
@@ -120,11 +120,11 @@ impl EventFlag {
     /// indefinitely; otherwise [`Error::TimedOut`]
     /// once it elapses. `bits == 0` is rejected.
     pub fn wait(&self, bits: u32, timeout: Option<Duration>) -> Result<u32> {
-        self.wait_until(bits, sys::deadline_after(timeout)?)
+        self.wait_until(bits, timeout.and_then(Deadline::after))
     }
 
     /// [`wait`](Self::wait) against an absolute deadline, so a retry loop keeps one deadline.
-    pub(crate) fn wait_until(&self, bits: u32, deadline: Option<Timespec>) -> Result<u32> {
+    pub(crate) fn wait_until(&self, bits: u32, deadline: Option<Deadline>) -> Result<u32> {
         wait_until(self.word(), bits, deadline.as_ref())
     }
 
@@ -141,7 +141,7 @@ pub(crate) trait FlagWord {
     fn load(&self, order: Ordering) -> u32;
     fn fence(&self, order: Ordering);
     /// Sleep while the word holds `expected`, until a wake on `bits` or `deadline`.
-    fn futex_wait(&self, expected: u32, bits: u32, deadline: Option<&Timespec>) -> Result<()>;
+    fn futex_wait(&self, expected: u32, bits: u32, deadline: Option<&Deadline>) -> Result<()>;
     fn futex_wake(&self, bits: u32) -> Result<()>;
 }
 
@@ -158,11 +158,11 @@ impl FlagWord for AtomicU32 {
     fn fence(&self, order: Ordering) {
         fence(order);
     }
-    fn futex_wait(&self, expected: u32, bits: u32, deadline: Option<&Timespec>) -> Result<()> {
-        sys::futex_wait(self, expected, bits, deadline)
+    fn futex_wait(&self, expected: u32, bits: u32, deadline: Option<&Deadline>) -> Result<()> {
+        shm::futex_wait(self, expected, bits, deadline)
     }
     fn futex_wake(&self, bits: u32) -> Result<()> {
-        sys::futex_wake(self, bits)
+        shm::futex_wake(self, bits)
     }
 }
 
@@ -191,7 +191,7 @@ pub(crate) fn wake_lazy<W: FlagWord + ?Sized>(word: &W, bits: u32) -> Result<()>
 pub(crate) fn wait_until<W: FlagWord + ?Sized>(
     word: &W,
     bits: u32,
-    deadline: Option<&Timespec>,
+    deadline: Option<&Deadline>,
 ) -> Result<u32> {
     if bits == 0 {
         return Err(Error::BadValue("empty bit mask"));

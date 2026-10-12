@@ -662,8 +662,9 @@ the details in `StreamEndpoint.aidl`:
 An NDK peer cannot link `libfmq` — it is not part of the NDK, and the device's
 `libfmq.so` is built against the platform's C++ library rather than the NDK's.
 Two header-only C11 files do that part instead:
-`rsbinder-fmq/c/rsbinder_fmq.h` is the ring (attach with the same checks
-rsbinder makes, create a sealed memfd, the counters, the EventFlag futex), and
+`rsbinder-fmq/c/rsbinder_fmq.h` is the ring (attach with the same descriptor
+and policy checks rsbinder makes, create a sealed memfd, the counters, the
+EventFlag futex), and
 `contrib/ndk/rsbinder_stream.h` is the record layer on it (`rsbs_send`,
 `rsbs_end`, `rsbs_recv`, `rsbs_cancel`). The NDK compiles them with no extra
 flag; on a 32-bit glibc host they need `-D_FILE_OFFSET_BITS=64`, without which

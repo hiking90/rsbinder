@@ -109,7 +109,8 @@ tweaks; wire formats are already locked.
   `DeathSignal`. Wire behavior is that of the synchronous calls they wrap.
 - **Fast Message Queue (new in 0.12.0)** — the `rsbinder-fmq` crate
   (`MessageQueue`, `EventFlag`, `Descriptor`, `AttachPolicy`; the synchronized
-  flavor, primitive elements, Linux and Android) and `rsbinder::fmq`, which
+  flavor, primitive elements, Linux and Android targets with 64-bit atomics)
+  and `rsbinder::fmq`, which
   re-exports it on every platform beside the AOSP parcelables `MQDescriptor`,
   `GrantorDescriptor`, `SynchronizedReadWrite`, `UnsynchronizedWrite` and
   `NativeHandle`, with the two `TryFrom` conversions between `MQDescriptor`
@@ -130,6 +131,19 @@ tweaks; wire formats are already locked.
   rsbinder on an emulator (`example-hello/cpp/run_stream_interop.sh`).
   See [Builtin AOSP Types](./aidl-data-types.md#builtin-aosp-types) and
   [Generic Parcelables](./aidl-parcelable.md#generic-parcelables).
+- **Shared-memory primitives** — the `rsbinder_fmq::shm` module, also
+  reachable as `rsbinder::fmq::shm`: `create` / `add_seals` / `seals` /
+  `Seals` (a memfd and its seals), `Mapping` / `Access`, `Run` (copies
+  through atomics), `futex_wait` / `futex_wake` / `Deadline`, and the fd
+  queries `region_size`, `shrink_sealed`, `is_ashmem_fd`, `ashmem_size`. This
+  is what the queue above is built from, made public for protocols of the
+  caller's own; `rsbinder`'s shared-memory types call the ashmem queries
+  (`is_ashmem_fd`, `ashmem_size`). It is listed apart from the queue
+  because its tier is its own: there is no wire or layout here to be faithful
+  to — the module wraps system calls — so what Provisional covers is the Rust
+  signatures. memfd, seals and futex are Linux and Android. `Mapping` needs
+  only `mmap`, so it works on macOS too (on WASI `Mapping::map` returns
+  `Unsupported`), and `Run` only atomics.
 - **Streaming (new in 0.12.0)** — the `stream` module: `Sink`, `Receiver`,
   and the three AIDL files in `rsbinder/aidl/stream/`: the
   `rsbinder.stream.StreamEndpoint<T>` parcelable (`T` the item type; the ring's
@@ -226,8 +240,9 @@ these types reads as intentional rather than as a gap.
   replacement to name; one that only alters a value or a behavior may be
   recorded under *Fixed* instead. *Changed* / *Removed* carry the rationale
   for the entries that have one, but not every entry appears there.
-  rsbinder runs `cargo-semver-checks` for both `rsbinder` and `rsbinder-aidl`
-  (default features and RPC features) on pull requests targeting `master`; it
+  rsbinder runs `cargo-semver-checks` for `rsbinder`, `rsbinder-aidl` and
+  `rsbinder-fmq` (default features, and `rsbinder` with the RPC features) on
+  pull requests targeting `master`; it
   reports signature changes, and cannot see a change that alters only a value
   or a behavior. Neither can your build — for those, read *Migrating* and
   *Fixed* both.

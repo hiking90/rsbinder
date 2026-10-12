@@ -13,6 +13,92 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ## [Unreleased]
 
+### Migrating from 0.12.0
+
+Each item below changes what a 0.12.0 program observes.
+
+- On a 32-bit target `MessageQueue::attach` refuses, with `BadValue`, a data
+  grantor whose `extent` plus `offset` modulo the page size is more than
+  `isize::MAX` (2 GiB − 1). That sum is the length mapped for the ring, and
+  `shm::Mapping` maps no more than a Rust slice may span. 0.12.0 passed the
+  length to `mmap`: on 32-bit Linux it attached the queue when the address
+  space had room for it (it does in an i686 process on an x86_64 kernel);
+  on 32-bit Android bionic's `mmap64` refused the length with `ENOMEM`, so
+  there only the error changes (`Os(ENOMEM)` to `BadValue`). Only a
+  descriptor with an `extent` within one page of `i32::MAX` and a data
+  `offset` that is not a multiple of the page size can be refused; one from
+  `MessageQueue::create` never is, and 64-bit targets are not affected. Make
+  the ring smaller; on 32-bit Linux a data grantor on a page boundary
+  attaches too.
+- `MessageQueue::attach` refuses, with `BadValue`, a descriptor in which a
+  counter, the data or the EventFlag grantor names an fd that is a hugetlbfs
+  file, such as a memfd created `MFD_HUGETLB`; the check is in
+  `shm::Mapping::map`, which on Linux and Android calls `fstatfs`
+  (`fstatfs64` on a 32-bit target) before each `mmap` and refuses an fd
+  whose filesystem the kernel reports as hugetlbfs.
+  0.12.0 mapped such a queue where the kernel allowed it and could not
+  unmap it when the queue was dropped: the kernel rounds a hugetlbfs
+  mapping up to the huge page size and refuses (`EINVAL`) the `munmap` of
+  the length that was asked for, so the mappings stayed until the process
+  ended. libfmq makes its queues with `ashmem_create_region` (ashmem, or an
+  ordinary memfd), so a queue from libfmq or from `MessageQueue::create` is
+  not refused. Back the queue with an ordinary memfd or with ashmem.
+  No other fd is refused: where the `fstatfs` fails — SELinux denies
+  `getattr` on the fd's filesystem, a seccomp filter answers the call with
+  an error — the fd is mapped as in 0.12.0. The call is made by
+  `MessageQueue::create` and `attach` too, so a seccomp filter that kills
+  or traps on a system call outside its list must allow it; Android's
+  filters do (bionic `SYSCALLS.TXT` lists `fstatfs64` and `fstatfs`).
+- Off Linux and Android (macOS), `MessageQueue::create` and
+  `MessageQueue::attach` return `Error::Unsupported` before they look at
+  their arguments or make a system call. 0.12.0 checked `create`'s
+  arguments first, so `create(0, ..)` was `BadValue`, and duplicated the
+  descriptor's fds in `attach` first, so a failed duplication was `Os`.
+  Neither release makes a queue on those targets.
+- `Error::Unsupported` displays as "not supported on this target: it lacks
+  memfd, futex, mmap or 64-bit atomics" (0.12.0: "fast message queues need
+  Linux or Android"). The functions of `shm` return the same error to
+  callers that have no queue, and it is returned on Linux targets without
+  64-bit atomics as well. Code that compares the text needs the new one;
+  matching on the variant is unaffected.
+
+### Added
+
+- **Shared-memory primitives in `rsbinder_fmq::shm`** (also
+  `rsbinder::fmq::shm`): what the queue is built from, for protocols other
+  than FMQ. `create` with `CreateOptions`, `add_seals`, `seals` and `Seals`
+  (a memfd and its seals; `add_seals` returns the kernel's error unchanged,
+  so `EINVAL` for an unsupported `FUTURE_WRITE` is the caller's to handle);
+  `Mapping` with `Access` (a shared mapping at any byte offset, read-only or
+  read-write, on macOS as well as Linux and Android); `Run` (copies in and
+  out of shared memory through atomics); `futex_wait`, `futex_wake` and
+  `Deadline` (non-private bitset futex against one absolute
+  `CLOCK_MONOTONIC` deadline). The four functions the module had in 0.12.0
+  are unchanged.
+
+### Fixed
+
+- **On 32-bit Android, `rsbinder-fmq`'s futex wait and wake call `futex`, not
+  `futex_time64`** (`EventFlag`, the blocking queue calls, `stream` over
+  kernel binder). Android 10's seccomp allowlist (bionic
+  `SECCOMP_WHITELIST_COMMON.TXT`) has no `futex_time64`, and its policy
+  (`seccomp_policy.cpp`) traps a call outside the list (`SECCOMP_RET_TRAP`,
+  a `SIGSYS`) instead of returning `ENOSYS`. libfmq's `EventFlag` calls
+  `futex` as well. A wake is one system call on every kernel.
+- **`rsbinder-fmq` compiles for Linux targets without 64-bit atomics and for
+  WASI** (checked: `armv5te-unknown-linux-gnueabi`,
+  `powerpc-unknown-linux-gnu`, `wasm32-wasip1`). 0.12.0 did not compile
+  there — the queue imports `AtomicU64`, and rustix has no `clock_gettime`
+  for WASI — although its documentation said the crate compiles
+  everywhere. On these targets `MessageQueue::create` and
+  `MessageQueue::attach` return `Error::Unsupported`. On the Linux ones the
+  `shm` module is complete, except that `shm::futex_wake` needs Linux 5.1
+  on a 32-bit target that rustix serves through libc, where it calls
+  `futex_time64` (by default `powerpc-unknown-linux-gnu`, 32-bit MIPS and
+  the architectures rustix has no inline assembly for); on WASI
+  `shm::Mapping::map` returns `Unsupported` too and
+  `shm::Deadline::after` returns `None`.
+
 ## [0.12.0] - 2026-10-11
 
 ### Migrating from 0.11.0

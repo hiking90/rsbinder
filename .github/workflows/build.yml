@@ -45,13 +45,15 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
-      - name: Check semver (rsbinder + rsbinder-aidl)
+      - name: Check semver (rsbinder + rsbinder-aidl + rsbinder-fmq)
         uses: obi1kenobi/cargo-semver-checks-action@v2
         with:
-          # The two published library crates whose public API stability
+          # The published library crates whose public API stability
           # matters to downstream consumers. `rsbinder-tools` is binaries
-          # only, no library surface.
-          package: rsbinder,rsbinder-aidl
+          # only, no library surface. `rsbinder-fmq` is checked by name:
+          # `rsbinder` re-exports it with a glob, which this check does
+          # not follow into the other crate.
+          package: rsbinder,rsbinder-aidl,rsbinder-fmq
           # `default` profile already exercises the common surface; the
           # RPC stack has its own dedicated stability discussion (see
           # RpcServer::set_max_threads rustdoc) and is checked under
@@ -83,11 +85,16 @@ jobs:
     # one: everything RPC — including `to_bytes`/`from_bytes`, which need
     # the session-less parcel mode — would otherwise change unobserved.
     #
+    # `rsbinder-fmq` has a golden of its own: `rsbinder::fmq` re-exports it
+    # with a glob, which the `rsbinder` goldens record as one line, so an
+    # item added to `rsbinder_fmq::shm` would show in neither.
+    #
     # To update after an intentional change, run the same commands and
     # commit the result:
     #
     #   cargo +nightly-2026-05-25 public-api -p rsbinder --simplified > api/rsbinder.txt
     #   cargo +nightly-2026-05-25 public-api -p rsbinder --simplified --features rpc > api/rsbinder-rpc.txt
+    #   cargo +nightly-2026-05-25 public-api -p rsbinder-fmq --simplified > api/rsbinder-fmq.txt
     #
     # Both the toolchain and the tool version are pinned because the
     # rendering is not stable across either; bumping one means
@@ -109,6 +116,8 @@ jobs:
           diff -u api/rsbinder.txt /tmp/public-api.txt
           cargo public-api -p rsbinder --simplified --features rpc > /tmp/public-api-rpc.txt
           diff -u api/rsbinder-rpc.txt /tmp/public-api-rpc.txt
+          cargo public-api -p rsbinder-fmq --simplified > /tmp/public-api-fmq.txt
+          diff -u api/rsbinder-fmq.txt /tmp/public-api-fmq.txt
 
   test:
     name: Test Suite
@@ -537,8 +546,9 @@ jobs:
         # path either.
         run: cargo test -p rsbinder-aidl
       - name: Fast Message Queue on a target without one (plan 12 AC-12.8)
-        # The crate compiles everywhere; off Linux/Android every constructor
-        # returns `Unsupported`, and that is the one test that runs here.
+        # macOS has `shm::Mapping` and `shm::Run` but no memfd or futex: the
+        # queue's constructors and those `shm` functions return `Unsupported`,
+        # and the mapping and run tests run here.
         run: cargo test -p rsbinder-fmq
 
   android-build:

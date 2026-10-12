@@ -25,7 +25,8 @@ assert_eq!(&buf, b"hello");
 ```
 
 Scope: the `SynchronizedReadWrite` flavor, primitive elements, Linux and
-Android (elsewhere the crate compiles and every constructor returns
+Android targets with 64-bit atomics (for macOS, WASI and a Linux target
+without those atomics the crate compiles and the queue's constructors return
 `Unsupported`). A descriptor from a peer is checked against an
 `AttachPolicy` before anything is mapped, and the counters are checked on
 every operation. Every access to the shared memory is a Rust atomic, so a
@@ -34,10 +35,22 @@ counters fail their check or the elements wrong, never undefined behavior;
 nothing detects it, as with libfmq. See the crate documentation for the
 full contract.
 
+The pieces the queue is built from are public as `rsbinder_fmq::shm`, for
+shared-memory protocols other than FMQ: `create` / `add_seals` / `seals` (a
+memfd and its seals), `Mapping` (a shared mapping at any byte offset,
+read-only or read-write), `Run` (copies in and out of shared memory through
+atomics, so a peer's concurrent store is not a data race) and `futex_wait` /
+`futex_wake` (non-private, so they cross processes). memfd, seals and futex
+are Linux and Android. `Mapping` needs only `mmap`, so it works on macOS too
+(on WASI `Mapping::map` returns `Unsupported`), and `Run` only atomics.
+
 For a peer that cannot link `libfmq` — an NDK app, where it is not available —
 `c/rsbinder_fmq.h` is the same queue as one C11 header: attach with the same
-checks, create a sealed memfd, the counters and the EventFlag protocol, plus
-two C++ templates for the NDK backend's `MQDescriptor`. `tests/c_header.rs`
+descriptor and policy checks, create a sealed memfd, the counters and the
+EventFlag protocol, plus two C++ templates for the NDK backend's
+`MQDescriptor`. Its `mmap` step does not have the two refusals of
+`shm::Mapping::map`: a hugetlbfs fd, and on a 32-bit target a ring mapping
+of more than `isize::MAX` bytes. `tests/c_header.rs`
 runs it against this crate in both roles. It needs a 64-bit `off_t`: on
 32-bit glibc compile with `-D_FILE_OFFSET_BITS=64` (the header stops with
 `#error` otherwise); 64-bit glibc, musl and the NDK need no such flag.

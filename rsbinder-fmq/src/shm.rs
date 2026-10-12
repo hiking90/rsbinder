@@ -1,15 +1,73 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Questions about a shared-memory fd that arrived from a peer: how large it
-//! is, whether it is ashmem, whether it can still shrink. libcutils answers
-//! them for libfmq (`ashmem-dev.cpp`); these are the same answers, so
-//! `rsbinder`'s shared-memory code uses them too rather than keeping a second
-//! copy that could drift.
+//! Shared-memory primitives: the pieces a queue is built from, usable on
+//! their own.
+//!
+//! [`MessageQueue`](crate::MessageQueue) is one protocol over memory two
+//! processes map. This module is what lies under it, without the protocol:
+//!
+//! | Need | Item |
+//! |---|---|
+//! | Make the memory | [`create`] (a memfd), [`add_seals`], [`seals`], [`Seals`] |
+//! | Map it | [`Mapping`], [`Access`] |
+//! | Copy bytes in and out without a data race | [`Run`] |
+//! | Sleep until a peer changes a word, and wake a peer | [`futex_wait`], [`futex_wake`], [`Deadline`] |
+//! | Ask about an fd that arrived from a peer | [`region_size`], [`shrink_sealed`], [`is_ashmem_fd`], [`ashmem_size`] |
+//!
+//! The last row is what libcutils answers for libfmq (`ashmem-dev.cpp`),
+//! with the same answers; `rsbinder`'s shared-memory code calls
+//! [`is_ashmem_fd`] and [`ashmem_size`] from here rather than keeping a
+//! second copy that could drift.
+//!
+//! # What is safe and what is not
+//!
+//! Creating, sealing and mapping are safe: they hand back an fd or an
+//! address. The `unsafe` boundary is where an address becomes a reference —
+//! [`Run::new`], or a `&AtomicU32` the caller forms for [`futex_wait`]. The
+//! rule there is the same for every user of shared memory in Rust: all
+//! access is atomic, and no byte is accessed at two sizes at once through
+//! one mapping (see [`Mapping`]). A peer that ignores the protocol can then
+//! make the data wrong, not the program undefined.
+//!
+//! Nothing here validates what a peer sent. A mapping of a peer's fd is as
+//! large as the caller asks, readable or writable as the caller asks; check
+//! size and seals first ([`region_size`], [`seals`]).
+//!
+//! # Platforms
+//!
+//! memfd, seals and futex are Linux and Android; elsewhere those functions
+//! return [`Error::Unsupported`](crate::Error::Unsupported). None of the
+//! module needs 64-bit atomics, so a Linux target without them
+//! (`armv5te-unknown-linux-gnueabi`) has all of it. [`futex_wake`] has one
+//! more condition on a 32-bit Linux target that rustix serves through libc
+//! instead of its own system calls (x32 and AArch64 ILP32 excepted): there
+//! the call is the `futex_time64` system call, which Linux has from 5.1, and
+//! an older kernel answers `ENOSYS`. rustix goes through libc by default for
+//! PowerPC, MIPS and every architecture it has no inline assembly for
+//! (`powerpc-unknown-linux-gnu`, `mips-unknown-linux-gnu`,
+//! `sparc-unknown-linux-gnu`), and for any other target when it is built
+//! with its `use-libc` feature or `--cfg rustix_use_libc`.
+//!
+//! [`Mapping`] needs only `mmap` and [`Deadline`] only `CLOCK_MONOTONIC`,
+//! which macOS has too. On WASI (`wasm32-wasip1`), where this crate has
+//! neither, [`Mapping::map`] returns `Unsupported` and [`Deadline::after`]
+//! returns `None`. [`Run`] is atomic loads and stores and has no condition
+//! of its own.
 
 use std::os::fd::BorrowedFd;
 
 use crate::error::Result;
+
+mod futex;
+mod mapping;
+mod memfd;
+mod run;
+
+pub use futex::{futex_wait, futex_wake, Deadline};
+pub use mapping::{Access, Mapping};
+pub use memfd::{add_seals, create, seals, CreateOptions, Seals};
+pub use run::Run;
 
 /// libcutils `__ashmem_is_ashmem`: is `fd` open on the ashmem character
 /// device? Always `false` off Android. A peer-supplied fd must pass this
@@ -97,17 +155,8 @@ pub fn region_size(fd: BorrowedFd<'_>) -> Result<u64> {
 }
 
 /// Whether `fd` carries `F_SEAL_SHRINK`, so no holder can truncate it under
-/// a live mapping. `false` when the fd does not support seals at all.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+/// a live mapping. `false` when the fd does not support seals at all, which
+/// is every fd where memfd seals do not exist.
 pub fn shrink_sealed(fd: BorrowedFd<'_>) -> bool {
-    rustix::fs::fcntl_get_seals(fd)
-        .map(|s| s.contains(rustix::fs::SealFlags::SHRINK))
-        .unwrap_or(false)
-}
-
-/// Whether `fd` carries `F_SEAL_SHRINK`. Always `false` where memfd seals
-/// do not exist.
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-pub fn shrink_sealed(_fd: BorrowedFd<'_>) -> bool {
-    false
+    seals(fd).is_ok_and(|s| s.contains(Seals::SHRINK))
 }
