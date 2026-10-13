@@ -243,28 +243,12 @@ fn write_sealed<F: AsFd>(fd: F) -> bool {
     use rsbinder_fmq::shm::Seals;
     // ashmem answers `F_GET_SEALS` with `EINVAL`; its read-only state is the prot mask.
     if is_ashmem_fd(fd.as_fd()) {
-        return ashmem_write_protected(fd.as_fd());
+        // `false` when the ioctl fails: the region is then offered as writable.
+        return rsbinder_fmq::shm::ashmem_write_protected(fd.as_fd()).unwrap_or(false);
     }
     rsbinder_fmq::shm::seals(fd.as_fd())
         .map(|s| s.intersects(Seals::WRITE | Seals::FUTURE_WRITE))
         .unwrap_or(false)
-}
-
-/// libcutils `ashmem_get_prot_region` lacks `PROT_WRITE`; `false` when the ioctl fails.
-#[cfg(target_os = "android")]
-fn ashmem_write_protected(fd: std::os::fd::BorrowedFd<'_>) -> bool {
-    use std::os::fd::AsRawFd;
-    // `ASHMEM_GET_PROT_MASK` = `_IO(0x77, 6)`; the mask is the ioctl's return value.
-    const ASHMEM_GET_PROT_MASK: libc::c_ulong = 0x7706;
-    // SAFETY: caller checked `is_ashmem_fd`; no pointer argument (`0` fills the vararg).
-    let prot = unsafe { libc::ioctl(fd.as_raw_fd(), ASHMEM_GET_PROT_MASK as _, 0) };
-    prot >= 0 && prot & libc::PROT_WRITE == 0
-}
-
-/// No ashmem off Android: `is_ashmem_fd` is `false`, so this is never reached.
-#[cfg(target_os = "linux")]
-fn ashmem_write_protected(_fd: std::os::fd::BorrowedFd<'_>) -> bool {
-    false
 }
 
 #[cfg(target_os = "macos")]

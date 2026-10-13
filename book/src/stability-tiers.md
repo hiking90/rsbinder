@@ -151,7 +151,7 @@ tweaks; wire formats are already locked.
   `Deadline`, `RoRun` / `RoWord32` / `RoWord64` (memory this process may
   only read), `verify_received` (the checks on a peer's memfd before it is
   mapped), and the fd queries `region_size`, `shrink_sealed`, `is_ashmem_fd`,
-  `ashmem_size`. This is what the queue above is built from, made public for
+  `ashmem_size`, `ashmem_write_protected`. This is what the queue above is built from, made public for
   protocols of the caller's own; `rsbinder`'s shared-memory types create,
   seal and map through it as well. It is listed apart from the queue
   because its tier is its own: there is no wire or layout here to be faithful

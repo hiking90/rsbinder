@@ -124,7 +124,9 @@ Each item below changes what a 0.12.0 program observes.
   out of shared memory through atomics); `futex_wait`, `futex_wake` and
   `Deadline` (non-private bitset futex against one absolute
   `CLOCK_MONOTONIC` deadline). The four functions the module had in 0.12.0
-  are unchanged.
+  are unchanged, and `ashmem_write_protected` joins them: libcutils
+  `ashmem_get_prot_region` without `PROT_WRITE`, which is to an ashmem
+  region what the write seals are to a memfd.
 - **For memory a peer owns, in `rsbinder_fmq::shm`:**
   - `verify_received` checks an fd from a peer before it is mapped — a
     tmpfs memfd, sealed against shrinking and writing, every page holding

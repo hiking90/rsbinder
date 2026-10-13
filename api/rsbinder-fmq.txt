@@ -178,6 +178,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::shm::Seals
 impl core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::shm::Seals
 pub fn rsbinder_fmq::shm::add_seals(std::os::fd::owned::BorrowedFd<'_>, rsbinder_fmq::shm::Seals) -> rsbinder_fmq::Result<()>
 pub fn rsbinder_fmq::shm::ashmem_size(std::os::fd::owned::BorrowedFd<'_>) -> rsbinder_fmq::Result<u64>
+pub fn rsbinder_fmq::shm::ashmem_write_protected(std::os::fd::owned::BorrowedFd<'_>) -> rsbinder_fmq::Result<bool>
 pub fn rsbinder_fmq::shm::create(u64, &rsbinder_fmq::shm::CreateOptions<'_>) -> rsbinder_fmq::Result<std::os::fd::owned::OwnedFd>
 pub fn rsbinder_fmq::shm::futex_wait(&core::sync::atomic::AtomicU32, u32, u32, core::option::Option<&rsbinder_fmq::shm::Deadline>) -> rsbinder_fmq::Result<()>
 pub fn rsbinder_fmq::shm::futex_wake(&core::sync::atomic::AtomicU32, u32) -> rsbinder_fmq::Result<()>

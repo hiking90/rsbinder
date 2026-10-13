@@ -15,11 +15,11 @@
 //! | Sleep until a peer changes a word, and wake a peer | [`futex_wait`], [`futex_wake`], [`Deadline`] |
 //! | Read memory this process may not write | [`RoRun`], [`RoWord32`], `RoWord64` |
 //! | Refuse a peer's fd whose pages the peer could take away | [`verify_received`] |
-//! | Ask about an fd that arrived from a peer | [`region_size`], [`shrink_sealed`], [`is_ashmem_fd`], [`ashmem_size`] |
+//! | Ask about an fd that arrived from a peer | [`region_size`], [`shrink_sealed`], [`is_ashmem_fd`], [`ashmem_size`], [`ashmem_write_protected`] |
 //!
 //! The last row is what libcutils answers for libfmq (`ashmem-dev.cpp`),
 //! with the same answers; `rsbinder`'s shared-memory code calls
-//! [`is_ashmem_fd`] and [`ashmem_size`] from here rather than keeping a
+//! [`is_ashmem_fd`], [`ashmem_size`] and [`ashmem_write_protected`] from here rather than keeping a
 //! second copy that could drift, and makes, seals and maps its heaps with
 //! the first two rows.
 //!
@@ -127,29 +127,53 @@ fn is_char_device(st: &rustix::fs::Stat) -> bool {
     rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::CharacterDevice
 }
 
-/// libcutils `ashmem_get_size_region`: the size of an ashmem region, read
-/// with `ASHMEM_GET_SIZE`. `BadValue` when `fd` is not ashmem — which is
-/// always the case off Android.
+/// An ashmem `_IO(0x77, nr)` request, whose answer is the ioctl's return value.
+/// `BadValue` when `fd` is not ashmem.
 #[cfg(target_os = "android")]
-pub fn ashmem_size(fd: BorrowedFd<'_>) -> Result<u64> {
+fn ashmem_query(fd: BorrowedFd<'_>, request: libc::c_ulong) -> Result<u64> {
     use std::os::fd::AsRawFd;
     if !is_ashmem_fd(fd) {
         return Err(crate::Error::BadValue("not an ashmem fd"));
     }
-    // `ASHMEM_GET_SIZE` = `_IO(0x77, 4)`; the size is the ioctl's return value.
-    const ASHMEM_GET_SIZE: libc::c_ulong = 0x7704;
     // SAFETY: `fd` is a verified ashmem fd; the request takes no pointer (`0` fills the vararg).
-    let r = unsafe { libc::ioctl(fd.as_raw_fd(), ASHMEM_GET_SIZE as _, 0) };
+    let r = unsafe { libc::ioctl(fd.as_raw_fd(), request as _, 0) };
     if r < 0 {
         return Err(crate::error::errno_of(&std::io::Error::last_os_error()).into());
     }
     Ok(r as u64)
 }
 
+/// libcutils `ashmem_get_size_region`: the size of an ashmem region, read
+/// with `ASHMEM_GET_SIZE`. `BadValue` when `fd` is not ashmem — which is
+/// always the case off Android.
+#[cfg(target_os = "android")]
+pub fn ashmem_size(fd: BorrowedFd<'_>) -> Result<u64> {
+    // `ASHMEM_GET_SIZE` = `_IO(0x77, 4)`.
+    ashmem_query(fd, 0x7704)
+}
+
 /// libcutils `ashmem_get_size_region`. `BadValue` when `fd` is not ashmem —
 /// which is always the case off Android.
 #[cfg(not(target_os = "android"))]
 pub fn ashmem_size(_fd: BorrowedFd<'_>) -> Result<u64> {
+    Err(crate::Error::BadValue("not an ashmem fd"))
+}
+
+/// Whether an ashmem region can no longer be mapped for writing: libcutils
+/// `ashmem_get_prot_region` (`ASHMEM_GET_PROT_MASK`) without `PROT_WRITE`.
+/// It is to ashmem what [`Seals::WRITE`] is to a memfd, which ashmem has no
+/// seals to answer with. `BadValue` when `fd` is not ashmem — which is
+/// always the case off Android.
+#[cfg(target_os = "android")]
+pub fn ashmem_write_protected(fd: BorrowedFd<'_>) -> Result<bool> {
+    // `ASHMEM_GET_PROT_MASK` = `_IO(0x77, 6)`.
+    Ok(ashmem_query(fd, 0x7706)? & libc::PROT_WRITE as u64 == 0)
+}
+
+/// libcutils `ashmem_get_prot_region` without `PROT_WRITE`. `BadValue` when
+/// `fd` is not ashmem — which is always the case off Android.
+#[cfg(not(target_os = "android"))]
+pub fn ashmem_write_protected(_fd: BorrowedFd<'_>) -> Result<bool> {
     Err(crate::Error::BadValue("not an ashmem fd"))
 }
 
@@ -169,4 +193,63 @@ pub fn region_size(fd: BorrowedFd<'_>) -> Result<u64> {
 /// is every fd where memfd seals do not exist.
 pub fn shrink_sealed(fd: BorrowedFd<'_>) -> bool {
     seals(fd).is_ok_and(|s| s.contains(Seals::SHRINK))
+}
+
+#[cfg(all(test, target_os = "android"))]
+mod ashmem_tests {
+    use super::*;
+    use std::os::fd::{AsFd, AsRawFd};
+
+    /// `_IOW(0x77, nr, size_t)`: `ASHMEM_SET_SIZE` is 3, `ASHMEM_SET_PROT_MASK` is 5.
+    fn set(file: &std::fs::File, nr: libc::c_ulong, value: usize) {
+        let request =
+            (1 << 30) | ((std::mem::size_of::<usize>() as libc::c_ulong) << 16) | 0x7700 | nr;
+        // SAFETY: an open ashmem fd; both requests take their argument by value, not a pointer.
+        let r = unsafe { libc::ioctl(file.as_raw_fd(), request as _, value) };
+        assert_eq!(
+            r,
+            0,
+            "ashmem request {nr}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// A one-page region as libcutils `__ashmem_open` makes it, or `None` on a device without ashmem.
+    fn region() -> Option<std::fs::File> {
+        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+        let open = |path: &str| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+        };
+        let file = open(&format!("/dev/ashmem{}", boot_id.trim()))
+            .or_else(|_| open("/dev/ashmem"))
+            .ok()?;
+        set(&file, 3, rustix::param::page_size());
+        Some(file)
+    }
+
+    #[test]
+    fn a_region_answers_its_size_and_whether_it_takes_writes() {
+        let Some(file) = region() else {
+            eprintln!("SKIP: no ashmem device");
+            return;
+        };
+        let fd = file.as_fd();
+        assert!(is_ashmem_fd(fd));
+        assert_eq!(ashmem_size(fd), Ok(rustix::param::page_size() as u64));
+        assert_eq!(ashmem_write_protected(fd), Ok(false));
+        set(&file, 5, libc::PROT_READ as usize);
+        assert_eq!(ashmem_write_protected(fd), Ok(true));
+        eprintln!("RAN: ashmem prot mask");
+    }
+
+    #[test]
+    fn a_memfd_is_not_asked() {
+        let memfd = create(4096, &CreateOptions::new("not-ashmem")).unwrap();
+        let not_ashmem = crate::Error::BadValue("not an ashmem fd");
+        assert_eq!(ashmem_size(memfd.as_fd()), Err(not_ashmem));
+        assert_eq!(ashmem_write_protected(memfd.as_fd()), Err(not_ashmem));
+    }
 }
