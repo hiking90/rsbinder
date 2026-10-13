@@ -3,7 +3,7 @@
 
 use std::mem::size_of;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{fence, AtomicU8, AtomicUsize, Ordering};
 
 const WORD: usize = size_of::<usize>();
 
@@ -18,13 +18,21 @@ const WORD: usize = size_of::<usize>();
 /// thread's atomic store: the bytes read may be a mix of old and new, never
 /// undefined.
 ///
-/// Every access is `Relaxed`. A `Run` moves bytes; it does not publish them.
-/// The protocol around it orders the copy against whatever counter says the
-/// bytes are there (a `Release` store of the counter after
-/// [`store`](Self::store), an `Acquire` load before [`load`](Self::load)).
-/// A counter in an [`Access::ReadOnly`](super::Access::ReadOnly) mapping is
-/// read with a `Relaxed` load followed by `fence(Ordering::Acquire)`, for
-/// the reason given on that variant.
+/// [`store`](Self::store) and [`load`](Self::load) are `Relaxed`: they move
+/// bytes and do not publish them. The protocol around them orders the copy
+/// against whatever counter says the bytes are there (a `Release` store of
+/// the counter after `store`, an `Acquire` load before `load`). A counter in
+/// an [`Access::ReadOnly`](super::Access::ReadOnly) mapping is read with a
+/// `Relaxed` load followed by `fence(Ordering::Acquire)`, for the reason
+/// given on that variant; [`RoWord32`](super::RoWord32) does so.
+///
+/// [`store_release`](Self::store_release) and
+/// [`load_acquire`](Self::load_acquire) are for a protocol in which the
+/// bytes themselves carry the order — one whose writer may overwrite bytes a
+/// reader is copying, and whose reader finds out afterwards from a word the
+/// writer stored *before* it started. There the reader's check needs "these
+/// bytes are new, so that word is at least as new", which relaxed copies do
+/// not give.
 pub struct Run<'a> {
     head: &'a [AtomicU8],
     words: &'a [AtomicUsize],
@@ -52,9 +60,10 @@ impl Run<'_> {
     ///   `mmap` result; two mappings that happen to be adjacent are two
     ///   allocations.
     /// * `at` is [valid](std::ptr#safety) for reads of `len` bytes, and for
-    ///   writes of them if [`store`](Self::store) is called on this run.
-    ///   `store` on a read-only mapping is a `SIGSEGV`; this is the one place
-    ///   that says so, because `store` itself is safe.
+    ///   writes of them if [`store`](Self::store) or
+    ///   [`store_release`](Self::store_release) is called on this run. Either
+    ///   on a read-only mapping is a `SIGSEGV`; both are safe functions, so
+    ///   the obligation is stated here.
     /// * Every byte of the range is initialized. The pages of a mapped file
     ///   or memfd are; memory from `alloc` or a `MaybeUninit` buffer is not
     ///   until it is written.
@@ -126,23 +135,7 @@ impl Run<'_> {
     /// When `src` is not exactly [`len`](Self::len) bytes long.
     #[inline]
     pub fn store(&self, src: &[u8]) {
-        assert_eq!(
-            src.len(),
-            self.len(),
-            "a run and its source differ in length"
-        );
-        let (head, rest) = src.split_at(self.head.len());
-        let (words, tail) = rest.split_at(self.words.len() * WORD);
-        for (d, s) in self.head.iter().zip(head) {
-            d.store(*s, Ordering::Relaxed);
-        }
-        for (d, s) in self.words.iter().zip(words.chunks_exact(WORD)) {
-            let word: [u8; WORD] = s.try_into().expect("a whole word");
-            d.store(usize::from_ne_bytes(word), Ordering::Relaxed);
-        }
-        for (d, s) in self.tail.iter().zip(tail) {
-            d.store(*s, Ordering::Relaxed);
-        }
+        self.store_with(src, Ordering::Relaxed);
     }
 
     /// Copy the run into `dst` with relaxed loads.
@@ -152,6 +145,77 @@ impl Run<'_> {
     /// When `dst` is not exactly [`len`](Self::len) bytes long.
     #[inline]
     pub fn load(&self, dst: &mut [u8]) {
+        self.load_with(dst);
+    }
+
+    /// Copy `src` into the run with `Release` stores.
+    ///
+    /// Whatever this thread did before the call — a store to a word that
+    /// announces the write, say — happens before a
+    /// [`load_acquire`](Self::load_acquire) that reads any byte this call
+    /// stored. That holds for each byte on its own: a reader that overlaps
+    /// the copy may get some bytes of this store and some older ones, and is
+    /// ordered after this thread's earlier actions if it got at least one.
+    ///
+    /// On x86 this compiles to the code [`store`](Self::store) does. On
+    /// AArch64 each word is an `STLR`, which costs more than a plain store.
+    ///
+    /// # Panics
+    ///
+    /// When `src` is not exactly [`len`](Self::len) bytes long.
+    #[inline]
+    pub fn store_release(&self, src: &[u8]) {
+        self.store_with(src, Ordering::Release);
+    }
+
+    /// Copy the run into `dst`, and be ordered after every
+    /// [`store_release`](Self::store_release) whose bytes the copy read.
+    ///
+    /// After the call, a load this thread makes of a word sees a value at
+    /// least as new as the one the storing thread saw or stored before its
+    /// `store_release` began. A reader uses that to detect an overwrite: it
+    /// copies, then loads the word the writer stores before it writes, and
+    /// discards the copy when the word says the bytes were being replaced.
+    ///
+    /// The loads are `Relaxed` and one `fence(Ordering::Acquire)` follows
+    /// them, which orders this thread as an `Acquire` load of each byte
+    /// would. The copy is made this way so that it is defined through an
+    /// [`Access::ReadOnly`](super::Access::ReadOnly) mapping, where the
+    /// standard library promises nothing for a load of any other ordering.
+    ///
+    /// # Panics
+    ///
+    /// When `dst` is not exactly [`len`](Self::len) bytes long.
+    #[inline]
+    pub fn load_acquire(&self, dst: &mut [u8]) {
+        self.load_with(dst);
+        fence(Ordering::Acquire);
+    }
+
+    #[inline]
+    fn store_with(&self, src: &[u8], order: Ordering) {
+        assert_eq!(
+            src.len(),
+            self.len(),
+            "a run and its source differ in length"
+        );
+        let (head, rest) = src.split_at(self.head.len());
+        let (words, tail) = rest.split_at(self.words.len() * WORD);
+        for (d, s) in self.head.iter().zip(head) {
+            d.store(*s, order);
+        }
+        for (d, s) in self.words.iter().zip(words.chunks_exact(WORD)) {
+            let word: [u8; WORD] = s.try_into().expect("a whole word");
+            d.store(usize::from_ne_bytes(word), order);
+        }
+        for (d, s) in self.tail.iter().zip(tail) {
+            d.store(*s, order);
+        }
+    }
+
+    // Always `Relaxed`: the one load ordering defined on a read-only mapping.
+    #[inline]
+    fn load_with(&self, dst: &mut [u8]) {
         assert_eq!(
             dst.len(),
             self.len(),
@@ -178,6 +242,76 @@ impl std::fmt::Debug for Run<'_> {
     }
 }
 
+/// A [`Run`] over bytes that this process reads and never writes: the two
+/// loads, and no store.
+///
+/// [`Run::store`] is a safe method, and on a run of an
+/// [`Access::ReadOnly`](super::Access::ReadOnly) mapping it is a `SIGSEGV`.
+/// Code that is handed an `RoRun` for a peer's memory cannot make that call:
+///
+/// ```compile_fail,E0599
+/// fn overwrite(run: &rsbinder_fmq::shm::RoRun<'_>) {
+///     run.store(&[]);
+/// }
+/// ```
+///
+/// Both loads are `Relaxed` loads no wider than a `usize`, the kind the
+/// standard library defines on read-only memory.
+pub struct RoRun<'a>(Run<'a>);
+
+impl RoRun<'_> {
+    /// View `len` bytes at `at` as atomics that are only loaded.
+    ///
+    /// # Safety
+    ///
+    /// The contract of [`Run::new`]; `at` need not be valid for writes.
+    #[inline]
+    pub unsafe fn new(at: NonNull<u8>, len: usize) -> Self {
+        // SAFETY: the caller's contract is `Run::new`'s; no store is made through this value.
+        Self(unsafe { Run::new(at, len) })
+    }
+
+    /// The number of bytes the run covers.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the run covers no byte.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Copy the run into `dst` with relaxed loads: [`Run::load`].
+    ///
+    /// # Panics
+    ///
+    /// When `dst` is not exactly [`len`](Self::len) bytes long.
+    #[inline]
+    pub fn load(&self, dst: &mut [u8]) {
+        self.0.load(dst);
+    }
+
+    /// Copy the run into `dst`, and be ordered after every
+    /// [`Run::store_release`] whose bytes the copy read:
+    /// [`Run::load_acquire`].
+    ///
+    /// # Panics
+    ///
+    /// When `dst` is not exactly [`len`](Self::len) bytes long.
+    #[inline]
+    pub fn load_acquire(&self, dst: &mut [u8]) {
+        self.0.load_acquire(dst);
+    }
+}
+
+impl std::fmt::Debug for RoRun<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RoRun").field("len", &self.len()).finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,6 +327,7 @@ mod tests {
         unsafe { Run::new(NonNull::new_unchecked(at.as_ptr().add(offset)), len) }
     }
 
+    // Under Miri run it with `-Zmiri-disable-weak-memory-emulation` (`scripts/local_gate.sh`).
     #[test]
     fn round_trip_at_every_start_and_length() {
         let buf = buffer(8);
@@ -249,5 +384,64 @@ mod tests {
         assert!(run.is_empty());
         run.store(&[]);
         run.load(&mut []);
+        run.store_release(&[]);
+        run.load_acquire(&mut []);
+    }
+
+    #[test]
+    fn the_ordered_copies_move_the_same_bytes() {
+        let buf = buffer(8);
+        // A head, whole words and a tail.
+        let (offset, len) = (3, 2 * WORD + 7);
+        let src: Vec<u8> = (0..len).map(|i| i as u8 ^ 0xa5).collect();
+        run_at(&buf, offset, len).store_release(&src);
+        let mut out = vec![0u8; len];
+        run_at(&buf, offset, len).load_acquire(&mut out);
+        assert_eq!(out, src);
+        run_at(&buf, offset, len).load(&mut out);
+        assert_eq!(out, src);
+
+        let start = NonNull::from(&*buf).cast::<u8>();
+        // SAFETY: the same bytes of `buf` as `run_at`'s, only loaded here.
+        let reader = unsafe { RoRun::new(start.add(offset), len) };
+        assert_eq!((reader.len(), reader.is_empty()), (len, false));
+        for load in [RoRun::load, RoRun::load_acquire] {
+            out.fill(0);
+            load(&reader, &mut out);
+            assert_eq!(out, src);
+        }
+    }
+
+    /// The order the two give. Natively x86 keeps it with relaxed copies too; Miri does not.
+    #[test]
+    fn a_byte_read_orders_the_reader_after_the_writers_announcement() {
+        let (repeats, rounds) = if cfg!(miri) { (1, 30) } else { (200, 200u8) };
+        // Starts mid-word: a head, one word and a tail.
+        let (offset, len) = (1, WORD + 9);
+        for _ in 0..repeats {
+            let buf = buffer(4);
+            let announced = AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                let (buf, announced): (&[AtomicUsize], _) = (&buf, &announced);
+                s.spawn(move || {
+                    for round in 1..=rounds {
+                        announced.store(usize::from(round), Ordering::Relaxed);
+                        run_at(buf, offset, len).store_release(&vec![round; len]);
+                    }
+                });
+                s.spawn(move || {
+                    let mut out = vec![0u8; len];
+                    for _ in 0..rounds {
+                        run_at(buf, offset, len).load_acquire(&mut out);
+                        let seen = announced.load(Ordering::Relaxed);
+                        let newest = usize::from(*out.iter().max().unwrap());
+                        assert!(seen >= newest, "read round {newest}, announced {seen}");
+                    }
+                });
+            });
+        }
     }
 }
+
+#[cfg(all(test, loom))]
+mod loom_tests;

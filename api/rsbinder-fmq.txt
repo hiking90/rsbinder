@@ -24,9 +24,11 @@ impl core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::shm::Access
 #[non_exhaustive] pub struct rsbinder_fmq::shm::CreateOptions<'a>
 pub rsbinder_fmq::shm::CreateOptions::allocate: bool
 pub rsbinder_fmq::shm::CreateOptions::name: &'a str
+pub rsbinder_fmq::shm::CreateOptions::populate: bool
 impl<'a> rsbinder_fmq::shm::CreateOptions<'a>
 pub const fn rsbinder_fmq::shm::CreateOptions<'a>::allocate(self, bool) -> Self
 pub const fn rsbinder_fmq::shm::CreateOptions<'a>::new(&'a str) -> Self
+pub const fn rsbinder_fmq::shm::CreateOptions<'a>::populate(self, bool) -> Self
 impl<'a> core::clone::Clone for rsbinder_fmq::shm::CreateOptions<'a>
 pub fn rsbinder_fmq::shm::CreateOptions<'a>::clone(&self) -> rsbinder_fmq::shm::CreateOptions<'a>
 impl<'a> core::fmt::Debug for rsbinder_fmq::shm::CreateOptions<'a>
@@ -70,13 +72,61 @@ impl core::marker::Unpin for rsbinder_fmq::shm::Mapping
 impl core::marker::UnsafeUnpin for rsbinder_fmq::shm::Mapping
 impl core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::shm::Mapping
 impl core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::shm::Mapping
+pub struct rsbinder_fmq::shm::RoRun<'a>(_)
+impl rsbinder_fmq::shm::RoRun<'_>
+pub fn rsbinder_fmq::shm::RoRun<'_>::is_empty(&self) -> bool
+pub fn rsbinder_fmq::shm::RoRun<'_>::len(&self) -> usize
+pub fn rsbinder_fmq::shm::RoRun<'_>::load(&self, &mut [u8])
+pub fn rsbinder_fmq::shm::RoRun<'_>::load_acquire(&self, &mut [u8])
+pub unsafe fn rsbinder_fmq::shm::RoRun<'_>::new(core::ptr::non_null::NonNull<u8>, usize) -> Self
+impl core::fmt::Debug for rsbinder_fmq::shm::RoRun<'_>
+pub fn rsbinder_fmq::shm::RoRun<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<'a> core::marker::Freeze for rsbinder_fmq::shm::RoRun<'a>
+impl<'a> core::marker::Send for rsbinder_fmq::shm::RoRun<'a>
+impl<'a> core::marker::Sync for rsbinder_fmq::shm::RoRun<'a>
+impl<'a> core::marker::Unpin for rsbinder_fmq::shm::RoRun<'a>
+impl<'a> core::marker::UnsafeUnpin for rsbinder_fmq::shm::RoRun<'a>
+impl<'a> core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::shm::RoRun<'a>
+impl<'a> core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::shm::RoRun<'a>
+#[repr(transparent)] pub struct rsbinder_fmq::shm::RoWord32(_)
+impl rsbinder_fmq::shm::RoWord32
+pub unsafe fn rsbinder_fmq::shm::RoWord32::from_ptr<'a>(core::ptr::non_null::NonNull<u8>) -> &'a Self
+pub fn rsbinder_fmq::shm::RoWord32::load(&self) -> u32
+pub fn rsbinder_fmq::shm::RoWord32::load_acquire(&self) -> u32
+pub fn rsbinder_fmq::shm::RoWord32::wait(&self, u32, u32, core::option::Option<&rsbinder_fmq::shm::Deadline>) -> rsbinder_fmq::Result<()>
+pub fn rsbinder_fmq::shm::RoWord32::wake(&self, u32) -> rsbinder_fmq::Result<()>
+impl core::fmt::Debug for rsbinder_fmq::shm::RoWord32
+pub fn rsbinder_fmq::shm::RoWord32::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl !core::marker::Freeze for rsbinder_fmq::shm::RoWord32
+impl core::marker::Send for rsbinder_fmq::shm::RoWord32
+impl core::marker::Sync for rsbinder_fmq::shm::RoWord32
+impl core::marker::Unpin for rsbinder_fmq::shm::RoWord32
+impl core::marker::UnsafeUnpin for rsbinder_fmq::shm::RoWord32
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::shm::RoWord32
+impl core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::shm::RoWord32
+#[repr(transparent)] pub struct rsbinder_fmq::shm::RoWord64(_)
+impl rsbinder_fmq::shm::RoWord64
+pub unsafe fn rsbinder_fmq::shm::RoWord64::from_ptr<'a>(core::ptr::non_null::NonNull<u8>) -> &'a Self
+pub fn rsbinder_fmq::shm::RoWord64::load(&self) -> u64
+pub fn rsbinder_fmq::shm::RoWord64::load_acquire(&self) -> u64
+impl core::fmt::Debug for rsbinder_fmq::shm::RoWord64
+pub fn rsbinder_fmq::shm::RoWord64::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl !core::marker::Freeze for rsbinder_fmq::shm::RoWord64
+impl core::marker::Send for rsbinder_fmq::shm::RoWord64
+impl core::marker::Sync for rsbinder_fmq::shm::RoWord64
+impl core::marker::Unpin for rsbinder_fmq::shm::RoWord64
+impl core::marker::UnsafeUnpin for rsbinder_fmq::shm::RoWord64
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::shm::RoWord64
+impl core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::shm::RoWord64
 pub struct rsbinder_fmq::shm::Run<'a>
 impl rsbinder_fmq::shm::Run<'_>
 pub fn rsbinder_fmq::shm::Run<'_>::is_empty(&self) -> bool
 pub fn rsbinder_fmq::shm::Run<'_>::len(&self) -> usize
 pub fn rsbinder_fmq::shm::Run<'_>::load(&self, &mut [u8])
+pub fn rsbinder_fmq::shm::Run<'_>::load_acquire(&self, &mut [u8])
 pub unsafe fn rsbinder_fmq::shm::Run<'_>::new(core::ptr::non_null::NonNull<u8>, usize) -> Self
 pub fn rsbinder_fmq::shm::Run<'_>::store(&self, &[u8])
+pub fn rsbinder_fmq::shm::Run<'_>::store_release(&self, &[u8])
 impl core::fmt::Debug for rsbinder_fmq::shm::Run<'_>
 pub fn rsbinder_fmq::shm::Run<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<'a> core::marker::Freeze for rsbinder_fmq::shm::Run<'a>
@@ -135,6 +185,7 @@ pub fn rsbinder_fmq::shm::is_ashmem_fd(std::os::fd::owned::BorrowedFd<'_>) -> bo
 pub fn rsbinder_fmq::shm::region_size(std::os::fd::owned::BorrowedFd<'_>) -> rsbinder_fmq::Result<u64>
 pub fn rsbinder_fmq::shm::seals(std::os::fd::owned::BorrowedFd<'_>) -> rsbinder_fmq::Result<rsbinder_fmq::shm::Seals>
 pub fn rsbinder_fmq::shm::shrink_sealed(std::os::fd::owned::BorrowedFd<'_>) -> bool
+pub fn rsbinder_fmq::shm::verify_received(std::os::fd::owned::BorrowedFd<'_>) -> rsbinder_fmq::Result<u64>
 #[non_exhaustive] pub enum rsbinder_fmq::Error
 pub rsbinder_fmq::Error::BadValue(&'static str)
 pub rsbinder_fmq::Error::Corrupted(&'static str)

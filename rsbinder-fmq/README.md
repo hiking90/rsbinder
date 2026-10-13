@@ -39,10 +39,17 @@ The pieces the queue is built from are public as `rsbinder_fmq::shm`, for
 shared-memory protocols other than FMQ: `create` / `add_seals` / `seals` (a
 memfd and its seals), `Mapping` (a shared mapping at any byte offset,
 read-only or read-write), `Run` (copies in and out of shared memory through
-atomics, so a peer's concurrent store is not a data race) and `futex_wait` /
-`futex_wake` (non-private, so they cross processes). memfd, seals and futex
+atomics, so a peer's concurrent store is not a data race), `futex_wait` /
+`futex_wake` (non-private, so they cross processes), `RoRun` / `RoWord32` /
+`RoWord64` (bytes or a word in a read-only mapping, with no method that
+stores) and
+`verify_received` (refuses a peer's fd unless it is a sealed memfd with every
+page in place, so that the peer cannot shrink the file or leave a page
+missing under the mapping). memfd, seals and futex
 are Linux and Android. `Mapping` needs only `mmap`, so it works on macOS too
 (on WASI `Mapping::map` returns `Unsupported`), and `Run` only atomics.
+`RoWord64` exists on the 64-bit architectures, on 32-bit x86 with SSE2 and on
+32-bit ARM with 64-bit atomics.
 
 For a peer that cannot link `libfmq` — an NDK app, where it is not available —
 `c/rsbinder_fmq.h` is the same queue as one C11 header: attach with the same

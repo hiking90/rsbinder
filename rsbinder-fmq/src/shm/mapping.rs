@@ -21,8 +21,10 @@ pub enum Access {
     /// compare-exchange, which writes. [`Run::load`](super::Run::load) makes
     /// only loads within the rule. For an acquire load, make a `Relaxed`
     /// load and then call `fence(Ordering::Acquire)`. A 64-bit counter read
-    /// on a 32-bit target is wider than the limit and needs
-    /// [`Access::ReadWrite`].
+    /// on a 32-bit target is wider than the limit. `RoWord64` is the type
+    /// for it on the 32-bit targets its documentation names; on any other
+    /// the counter needs [`Access::ReadWrite`] and a target that has
+    /// `AtomicU64`.
     ///
     /// Whether the kernel makes this mapping of a memfd sealed
     /// [`WRITE`](super::Seals::WRITE), through an fd that is open for
@@ -310,6 +312,31 @@ mod tests {
         let ro = Mapping::map(file.as_fd(), 0, page as u64, Access::ReadOnly).unwrap();
         byte(rw.as_ptr(), 3).store(7, Ordering::Relaxed);
         assert_eq!(byte(ro.as_ptr(), 3).load(Ordering::Relaxed), 7);
+    }
+
+    #[test]
+    fn a_read_only_run_loads_what_a_writable_run_stores() {
+        use crate::shm::{RoRun, Run};
+        let (file, page) = two_pages(&read_write());
+        let rw = Mapping::map(file.as_fd(), 0, page as u64, Access::ReadWrite).unwrap();
+        let ro = Mapping::map(file.as_fd(), 0, page as u64, Access::ReadOnly).unwrap();
+        // A head, whole words and a tail; two mappings, so each run is alone in its own.
+        let (at, len) = (3, 4 * std::mem::size_of::<usize>() + 5);
+        let src: Vec<u8> = (0..len).map(|i| i as u8 ^ 0x3c).collect();
+        // SAFETY: `at..at + len` inside each live one-page mapping, reached through atomics only.
+        let (writer, reader) = unsafe {
+            (
+                Run::new(rw.as_ptr().add(at), len),
+                RoRun::new(ro.as_ptr().add(at), len),
+            )
+        };
+        writer.store_release(&src);
+        let mut out = vec![0u8; len];
+        reader.load_acquire(&mut out);
+        assert_eq!(out, src);
+        out.fill(0);
+        reader.load(&mut out);
+        assert_eq!(out, src);
     }
 
     #[test]

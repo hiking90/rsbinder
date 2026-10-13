@@ -134,16 +134,20 @@ tweaks; wire formats are already locked.
 - **Shared-memory primitives** — the `rsbinder_fmq::shm` module, also
   reachable as `rsbinder::fmq::shm`: `create` / `add_seals` / `seals` /
   `Seals` (a memfd and its seals), `Mapping` / `Access`, `Run` (copies
-  through atomics), `futex_wait` / `futex_wake` / `Deadline`, and the fd
-  queries `region_size`, `shrink_sealed`, `is_ashmem_fd`, `ashmem_size`. This
-  is what the queue above is built from, made public for protocols of the
-  caller's own; `rsbinder`'s shared-memory types call the ashmem queries
-  (`is_ashmem_fd`, `ashmem_size`). It is listed apart from the queue
+  through atomics, relaxed or ordered), `futex_wait` / `futex_wake` /
+  `Deadline`, `RoRun` / `RoWord32` / `RoWord64` (memory this process may
+  only read), `verify_received` (the checks on a peer's memfd before it is
+  mapped), and the fd queries `region_size`, `shrink_sealed`, `is_ashmem_fd`,
+  `ashmem_size`. This is what the queue above is built from, made public for
+  protocols of the caller's own; `rsbinder`'s shared-memory types create,
+  seal and map through it as well. It is listed apart from the queue
   because its tier is its own: there is no wire or layout here to be faithful
   to — the module wraps system calls — so what Provisional covers is the Rust
   signatures. memfd, seals and futex are Linux and Android. `Mapping` needs
   only `mmap`, so it works on macOS too (on WASI `Mapping::map` returns
-  `Unsupported`), and `Run` only atomics.
+  `Unsupported`), and `Run` only atomics. `RoWord64` exists on the 64-bit
+  architectures, on 32-bit x86 with SSE2 and on 32-bit ARM with 64-bit
+  atomics.
 - **Streaming (new in 0.12.0)** — the `stream` module: `Sink`, `Receiver`,
   and the three AIDL files in `rsbinder/aidl/stream/`: the
   `rsbinder.stream.StreamEndpoint<T>` parcelable (`T` the item type; the ring's

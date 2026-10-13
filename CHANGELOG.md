@@ -86,6 +86,31 @@ Each item below changes what a 0.12.0 program observes.
   `Deadline` (non-private bitset futex against one absolute
   `CLOCK_MONOTONIC` deadline). The four functions the module had in 0.12.0
   are unchanged.
+- **For memory a peer owns, in `rsbinder_fmq::shm`:**
+  - `verify_received` checks an fd from a peer before it is mapped — a
+    tmpfs memfd, sealed against shrinking and writing, every page holding
+    data — so that the peer cannot shrink the file or leave a page missing
+    under the mapping. A swapped-out page counts as data; a caller that
+    cannot accept a swap-in under its access locks the mapping (`mlock`). It
+    finds holes with `lseek(SEEK_HOLE)`, not with the block count, which
+    also counts pages allocated past the end of the file.
+  - `CreateOptions::populate` makes the memfd that passes: it writes zeros
+    over the whole file. `allocate` (`fallocate`) alone does not, because
+    the kernel reports a reserved page nothing has touched as a hole.
+  - `RoWord32`, `RoWord64` and `RoRun` view a word, or a run of bytes, in a
+    read-only mapping. They have loads, and `RoWord32` the futex wait and
+    wake, and no method that stores, so code that holds one cannot fault on
+    a write — `AtomicU32::store` and `Run::store` are safe methods that do
+    on a read-only page. `RoWord64` exists where an 8-byte load does not
+    write: the 64-bit architectures, for which the standard library defines
+    it on read-only memory, and 32-bit x86 with SSE2 and 32-bit ARM with
+    64-bit atomics, where it is the instruction the compiler emits (`movq`,
+    `ldrexd`) and a test loads through a read-only mapping.
+  - `Run::store_release` and `Run::load_acquire` copy with an order: a
+    reader that got any byte of a `store_release` is ordered after what the
+    writer did before it, which lets a reader detect that its copy was
+    overwritten. `load_acquire` is relaxed loads and one acquire fence, so
+    it is defined through a read-only mapping.
 
 ### Fixed
 
@@ -103,10 +128,11 @@ Each item below changes what a 0.12.0 program observes.
   for WASI — although its documentation said the crate compiles
   everywhere. On these targets `MessageQueue::create` and
   `MessageQueue::attach` return `Error::Unsupported`. On the Linux ones the
-  `shm` module is complete, except that `shm::futex_wake` needs Linux 5.1
-  on a 32-bit target that rustix serves through libc, where it calls
-  `futex_time64` (by default `powerpc-unknown-linux-gnu`, 32-bit MIPS and
-  the architectures rustix has no inline assembly for); on WASI
+  `shm` module is complete but for `RoWord64` (see Added), except that
+  `shm::futex_wake` needs Linux 5.1 on a 32-bit target that rustix serves
+  through libc, where it calls `futex_time64` (by default
+  `powerpc-unknown-linux-gnu`, 32-bit MIPS and the architectures rustix has
+  no inline assembly for); on WASI
   `shm::Mapping::map` returns `Unsupported` too and
   `shm::Deadline::after` returns `None`.
 

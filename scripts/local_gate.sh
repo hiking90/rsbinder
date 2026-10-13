@@ -163,6 +163,20 @@ public_api() {
         diff -u api/rsbinder-fmq.txt "$out-fmq.txt"
 }
 
+# `shm::Run` under Miri, in two passes. The copies that race need Miri's weak-memory emulation,
+# and it is what tells `Release`/`Acquire` from `Relaxed` (x86 runs both as the same code); the
+# round trip makes sequential accesses at two sizes, on which that emulation panics.
+miri_fmq() {
+    local seed dir=CARGO_TARGET_DIR=target/miri
+    local miri=(cargo +nightly-2026-05-25 miri test -p rsbinder-fmq --lib --)
+    for seed in 0 1 2 3 4 5 6 7; do
+        tpass env "$dir" MIRIFLAGS="-Zmiri-seed=$seed" "${miri[@]}" shm::run --skip round_trip ||
+            return 1
+    done
+    tpass env "$dir" MIRIFLAGS="-Zmiri-disable-weak-memory-emulation" "${miri[@]}" \
+        shm::run::tests::round_trip
+}
+
 semver() {
     cargo semver-checks check-release -p rsbinder -p rsbinder-aidl -p rsbinder-fmq --default-features &&
         cargo semver-checks check-release -p rsbinder --only-explicit-features \
@@ -190,8 +204,18 @@ tier_hermetic() {
     linux_run "tests: c_stream_header" tpass cargo test -p tests --test c_stream_header
     run "rsbinder-fmq" tpass cargo test -p rsbinder-fmq
     # CI does not run loom; a target dir of its own, since the cfg rebuilds every dependency.
-    run "rsbinder-fmq loom (EventFlag)" tpass env CARGO_TARGET_DIR=target/loom \
+    run "rsbinder-fmq loom (EventFlag, Run order model)" tpass env CARGO_TARGET_DIR=target/loom \
         RUSTFLAGS="--cfg loom" cargo test -p rsbinder-fmq --lib --release loom
+    # CI does not run Miri either.
+    if toolchain nightly-2026-05-25 &&
+        cargo +nightly-2026-05-25 miri --version >/dev/null 2>&1 &&
+        rustup +nightly-2026-05-25 component list --installed 2>/dev/null |
+        grep -q '^rust-src'; then
+        run "rsbinder-fmq Miri (shm::Run)" miri_fmq
+    else
+        skip "rsbinder-fmq Miri (shm::Run)" \
+            "rustup toolchain install nightly-2026-05-25 --component miri,rust-src"
+    fi
     run "rsbinder loom (cache pin)" tpass env CARGO_TARGET_DIR=target/loom \
         RUSTFLAGS="--cfg loom" cargo test -p rsbinder --test loom_cache_pin --release
     run "rsbinder-tools" tpass cargo test -p rsbinder-tools

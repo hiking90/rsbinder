@@ -13,33 +13,38 @@
 //! | Map it | [`Mapping`], [`Access`] |
 //! | Copy bytes in and out without a data race | [`Run`] |
 //! | Sleep until a peer changes a word, and wake a peer | [`futex_wait`], [`futex_wake`], [`Deadline`] |
+//! | Read memory this process may not write | [`RoRun`], [`RoWord32`], `RoWord64` |
+//! | Refuse a peer's fd whose pages the peer could take away | [`verify_received`] |
 //! | Ask about an fd that arrived from a peer | [`region_size`], [`shrink_sealed`], [`is_ashmem_fd`], [`ashmem_size`] |
 //!
 //! The last row is what libcutils answers for libfmq (`ashmem-dev.cpp`),
 //! with the same answers; `rsbinder`'s shared-memory code calls
 //! [`is_ashmem_fd`] and [`ashmem_size`] from here rather than keeping a
-//! second copy that could drift.
+//! second copy that could drift, and makes, seals and maps its heaps with
+//! the first two rows.
 //!
 //! # What is safe and what is not
 //!
 //! Creating, sealing and mapping are safe: they hand back an fd or an
 //! address. The `unsafe` boundary is where an address becomes a reference —
-//! [`Run::new`], or a `&AtomicU32` the caller forms for [`futex_wait`]. The
-//! rule there is the same for every user of shared memory in Rust: all
-//! access is atomic, and no byte is accessed at two sizes at once through
-//! one mapping (see [`Mapping`]). A peer that ignores the protocol can then
-//! make the data wrong, not the program undefined.
+//! [`Run::new`], [`RoWord32::from_ptr`], or a `&AtomicU32` the caller forms
+//! for [`futex_wait`]. The rule there is the same for every user of shared
+//! memory in Rust: all access is atomic, and no byte is accessed at two
+//! sizes at once through one mapping (see [`Mapping`]). A peer that ignores
+//! the protocol can then make the data wrong, not the program undefined.
 //!
-//! Nothing here validates what a peer sent. A mapping of a peer's fd is as
-//! large as the caller asks, readable or writable as the caller asks; check
-//! size and seals first ([`region_size`], [`seals`]).
+//! [`Mapping::map`] validates nothing a peer sent: the mapping is as large
+//! as the caller asks, readable or writable as the caller asks. Check the fd
+//! first — [`verify_received`] for a memfd whose pages the peer must not be
+//! able to take away, or size and seals one by one ([`region_size`],
+//! [`seals`]) for a protocol with other rules, as libfmq's are.
 //!
 //! # Platforms
 //!
 //! memfd, seals and futex are Linux and Android; elsewhere those functions
-//! return [`Error::Unsupported`](crate::Error::Unsupported). None of the
-//! module needs 64-bit atomics, so a Linux target without them
-//! (`armv5te-unknown-linux-gnueabi`) has all of it. [`futex_wake`] has one
+//! return [`Error::Unsupported`](crate::Error::Unsupported). `RoWord64`
+//! apart, none of the module needs 64-bit atomics, so a Linux target without
+//! them (`armv5te-unknown-linux-gnueabi`) has the rest. [`futex_wake`] has one
 //! more condition on a 32-bit Linux target that rustix serves through libc
 //! instead of its own system calls (x32 and AArch64 ILP32 excepted): there
 //! the call is the `futex_time64` system call, which Linux has from 5.1, and
@@ -53,7 +58,9 @@
 //! which macOS has too. On WASI (`wasm32-wasip1`), where this crate has
 //! neither, [`Mapping::map`] returns `Unsupported` and [`Deadline::after`]
 //! returns `None`. [`Run`] is atomic loads and stores and has no condition
-//! of its own.
+//! of its own. `RoWord64` exists where an 8-byte load does not write: the
+//! 64-bit architectures, 32-bit x86 with SSE2 and 32-bit ARM with 64-bit
+//! atomics (its documentation gives the grounds for each).
 
 use std::os::fd::BorrowedFd;
 
@@ -63,11 +70,14 @@ mod futex;
 mod mapping;
 mod memfd;
 mod run;
+mod word;
 
 pub use futex::{futex_wait, futex_wake, Deadline};
 pub use mapping::{Access, Mapping};
-pub use memfd::{add_seals, create, seals, CreateOptions, Seals};
-pub use run::Run;
+pub use memfd::{add_seals, create, seals, verify_received, CreateOptions, Seals};
+pub use run::{RoRun, Run};
+// A glob: `RoWord64` is there only on the architectures `word.rs` names.
+pub use word::*;
 
 /// libcutils `__ashmem_is_ashmem`: is `fd` open on the ashmem character
 /// device? Always `false` off Android. A peer-supplied fd must pass this

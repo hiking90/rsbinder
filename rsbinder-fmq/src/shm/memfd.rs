@@ -126,6 +126,13 @@ pub struct CreateOptions<'a> {
     /// cgroup kills. Without it the file is sparse and pages appear on
     /// first touch.
     pub allocate: bool,
+    /// Write zeros over the whole file now, so that every page is allocated
+    /// and holds data. This is what [`verify_received`] asks of a peer's
+    /// memfd. `allocate` alone does not give it: the kernel reports a page
+    /// that `fallocate` reserved and nothing has touched yet as a hole
+    /// (`lseek(SEEK_HOLE)`), as it does one that was never allocated. The
+    /// cost is one pass of writes over the file's size.
+    pub populate: bool,
 }
 
 impl<'a> CreateOptions<'a> {
@@ -134,12 +141,19 @@ impl<'a> CreateOptions<'a> {
         Self {
             name,
             allocate: false,
+            populate: false,
         }
     }
 
     /// Set [`allocate`](field@Self::allocate).
     pub const fn allocate(mut self, allocate: bool) -> Self {
         self.allocate = allocate;
+        self
+    }
+
+    /// Set [`populate`](field@Self::populate).
+    pub const fn populate(mut self, populate: bool) -> Self {
+        self.populate = populate;
         self
     }
 }
@@ -161,7 +175,8 @@ impl<'a> CreateOptions<'a> {
 /// `memfd_create` (`EINVAL` for a name with an interior NUL or longer than
 /// 249 bytes, `EMFILE`), `ftruncate`, or with
 /// [`allocate`](field@CreateOptions::allocate) `fallocate` (`ENOMEM`/`ENOSPC` when
-/// the pages cannot be had, `EINVAL` for a `size` of zero).
+/// the pages cannot be had, `EINVAL` for a `size` of zero), or with
+/// [`populate`](field@CreateOptions::populate) `pwrite` (`ENOSPC`, `ENOMEM`).
 /// [`Error::Unsupported`](crate::Error::Unsupported) off Linux and Android.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn create(size: u64, options: &CreateOptions<'_>) -> Result<OwnedFd> {
@@ -173,6 +188,18 @@ pub fn create(size: u64, options: &CreateOptions<'_>) -> Result<OwnedFd> {
     rustix::fs::ftruncate(&fd, size)?;
     if options.allocate {
         rustix::fs::fallocate(&fd, FallocateFlags::empty(), 0, size)?;
+    }
+    if options.populate {
+        // 64 KiB a call: zeros the kernel copies into each page, which marks the page as data.
+        let zeros = vec![0u8; size.min(1 << 16) as usize];
+        let mut at = 0;
+        while at < size {
+            let chunk = &zeros[..(size - at).min(zeros.len() as u64) as usize];
+            match rustix::io::pwrite(&fd, chunk, at)? {
+                0 => return Err(rustix::io::Errno::NOSPC.into()),
+                written => at += written as u64,
+            }
+        }
     }
     Ok(fd)
 }
@@ -243,6 +270,114 @@ pub fn seals(fd: BorrowedFd<'_>) -> Result<Seals> {
 /// on this target.
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub fn seals(_fd: BorrowedFd<'_>) -> Result<Seals> {
+    Err(crate::Error::Unsupported)
+}
+
+/// `TMPFS_MAGIC` (`include/uapi/linux/magic.h`): the filesystem a memfd lives on.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const TMPFS_MAGIC: i128 = 0x0102_1994;
+
+/// Check an fd that came from a peer before mapping it, and return the size
+/// of its file: it must be a memfd whose pages are all there and can no
+/// longer be taken away.
+///
+/// A mapping of a peer's fd is memory the peer still has a hand on. These
+/// four checks leave the peer no way to take a page of that memory away: a
+/// later access finds neither a shorter file nor a missing page.
+///
+/// 1. The file answers `F_GET_SEALS`. Only shmem and hugetlbfs files do, so
+///    a file on a disk or on FUSE — where touching a page waits for a daemon
+///    the peer runs — stops here, as does a pipe, a socket or an ashmem
+///    region.
+/// 2. Its filesystem is tmpfs (`fstatfs`). A hugetlbfs memfd passes the
+///    first check, and an access to one raises `SIGBUS` when the huge page
+///    pool is empty.
+/// 3. It carries [`Seals::SHRINK`] and a write seal, [`Seals::FUTURE_WRITE`]
+///    or [`Seals::WRITE`]. `SHRINK` rules out a truncation, which would make
+///    an access past the new end a `SIGBUS`; the write seal rules out
+///    punching a hole, which the kernel treats as a write. A regular file on
+///    a tmpfs mount passes the first two checks and stops here: it carries
+///    [`Seals::SEAL`] alone.
+/// 4. It is not empty and has no hole (`lseek(SEEK_HOLE)` finds none before
+///    the end): every page holds data, in memory or swapped out. With the
+///    third check that stays so, and an access never has to allocate a page
+///    for a hole — which is charged to the process that touches it, and ends
+///    in `SIGBUS` or the OOM killer when it fails.
+///
+/// The fourth check asks for more than allocation. To the kernel a page that
+/// `fallocate` reserved and nothing has read or written yet is a hole too,
+/// so a memfd made with [`CreateOptions::allocate`](field@CreateOptions::allocate)
+/// alone is refused. The file's block count (`st_blocks`) would accept it,
+/// and is not used because it also counts pages allocated past the end of
+/// the file (`fallocate` with `FALLOC_FL_KEEP_SIZE`): a peer could present a
+/// file that is one hole with the block count of a full one.
+///
+/// Make a memfd that passes with [`create`] and
+/// [`CreateOptions::populate`](field@CreateOptions::populate), then
+/// [`add_seals`] with [`Seals::SHRINK`] and a write seal.
+///
+/// The caller compares the returned size with what its protocol needs and
+/// then maps; with the `SHRINK` seal the size cannot go below it afterwards.
+/// What the checks do not cover: the content, which is the peer's to write
+/// if it kept a writable mapping from before a `FUTURE_WRITE` seal, and a
+/// page that is swapped out. An access to one waits for the swap device and
+/// allocates a page — charged to the memory cgroup that owned the page when
+/// it was swapped out, or to the toucher's once that cgroup is gone — and
+/// raises `SIGBUS` when the read fails. The peer can put its pages there
+/// itself: `madvise(MADV_PAGEOUT)` swaps out a page that no other process
+/// has touched through a mapping yet. A caller that cannot accept a swap-in
+/// under its access locks the mapping (`mlock`).
+///
+/// The fourth check moves the file offset and puts it back. The offset
+/// belongs to the open file description, which the peer shares; a peer that
+/// reads or writes the fd with `read`/`write` at the same moment may see it
+/// moved. A memfd that is only mapped has no use for the offset.
+///
+/// # Errors
+///
+/// [`Error::BadValue`](crate::Error::BadValue), naming the check, for an fd
+/// that fails one. Any other failure of a system call as
+/// [`Error::Os`](crate::Error::Os): the fd is not verified, and that
+/// includes an `fstatfs` the kernel denies (SELinux, a seccomp filter).
+/// [`Error::Unsupported`](crate::Error::Unsupported) off Linux and Android.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn verify_received(fd: BorrowedFd<'_>) -> Result<u64> {
+    use crate::Error;
+    use rustix::fs::SeekFrom;
+    let seals = match seals(fd) {
+        Ok(seals) => seals,
+        Err(Error::Os(rustix::io::Errno::INVAL)) => {
+            return Err(Error::BadValue("received fd is not a sealable file"));
+        }
+        Err(e) => return Err(e),
+    };
+    if i128::from(rustix::fs::fstatfs(fd)?.f_type) != TMPFS_MAGIC {
+        return Err(Error::BadValue("received fd is not a tmpfs file"));
+    }
+    if !seals.contains(Seals::SHRINK) || !seals.intersects(Seals::WRITE.union(Seals::FUTURE_WRITE))
+    {
+        return Err(Error::BadValue(
+            "received memfd is not sealed against shrinking and writing",
+        ));
+    }
+    let size = u64::try_from(rustix::fs::fstat(fd)?.st_size)
+        .map_err(|_| Error::BadValue("received memfd has a negative size"))?;
+    if size == 0 {
+        return Err(Error::BadValue("received memfd is empty"));
+    }
+    let offset = rustix::fs::tell(fd)?;
+    let first_hole = rustix::fs::seek(fd, SeekFrom::Hole(0));
+    rustix::fs::seek(fd, SeekFrom::Start(offset))?;
+    if first_hole? != size {
+        return Err(Error::BadValue("received memfd has a page without data"));
+    }
+    Ok(size)
+}
+
+/// Check an fd that came from a peer.
+/// [`Error::Unsupported`](crate::Error::Unsupported) on this target.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub fn verify_received(_fd: BorrowedFd<'_>) -> Result<u64> {
     Err(crate::Error::Unsupported)
 }
 
@@ -365,5 +500,151 @@ mod tests {
         let set = Seals::GROW | Seals::FUTURE_WRITE | Seals::from_bits(0x100);
         assert_eq!(format!("{set:?}"), "{GROW, FUTURE_WRITE, 0x100}");
         assert_eq!(format!("{:?}", Seals::empty()), "{}");
+    }
+
+    const PEER_SEALS: Seals = Seals::SHRINK.union(Seals::FUTURE_WRITE);
+
+    /// The check that refused `fd`, by the name `verify_received` gives it.
+    fn refusal(fd: BorrowedFd<'_>) -> &'static str {
+        match verify_received(fd).unwrap_err() {
+            Error::BadValue(check) => check,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_populated_sealed_memfd_is_accepted_and_its_offset_kept() {
+        // More than one `pwrite` chunk, and an end inside a page.
+        let size = (1 << 16) + 3 * page() + 128;
+        let fd = create(size, &CreateOptions::new("unit").populate(true)).unwrap();
+        add_seals(fd.as_fd(), PEER_SEALS).unwrap();
+        rustix::fs::seek(&fd, rustix::fs::SeekFrom::Start(77)).unwrap();
+        assert_eq!(verify_received(fd.as_fd()).unwrap(), size);
+        assert_eq!(rustix::fs::tell(&fd).unwrap(), 77);
+        // `WRITE` is a write seal too.
+        let fd = create(page(), &CreateOptions::new("unit").populate(true)).unwrap();
+        add_seals(fd.as_fd(), Seals::SHRINK | Seals::WRITE).unwrap();
+        assert_eq!(verify_received(fd.as_fd()).unwrap(), page());
+    }
+
+    #[test]
+    fn pages_that_were_only_reserved_are_refused() {
+        let no_data = "received memfd has a page without data";
+        let fd = create(4 * page(), &CreateOptions::new("unit").allocate(true)).unwrap();
+        add_seals(fd.as_fd(), PEER_SEALS).unwrap();
+        assert_eq!(refusal(fd.as_fd()), no_data);
+        // Blocks past the end give a file that is one hole the block count of a full one.
+        let fd = create(4 * page(), &CreateOptions::new("unit")).unwrap();
+        let keep_size = rustix::fs::FallocateFlags::KEEP_SIZE;
+        rustix::fs::fallocate(&fd, keep_size, 4 * page(), 4 * page()).unwrap();
+        let st = rustix::fs::fstat(&fd).unwrap();
+        assert!(st.st_blocks as u64 * 512 >= st.st_size as u64, "{st:?}");
+        add_seals(fd.as_fd(), PEER_SEALS).unwrap();
+        assert_eq!(refusal(fd.as_fd()), no_data);
+    }
+
+    #[test]
+    fn pages_that_were_written_count_as_allocated() {
+        let fd = create(2 * page(), &CreateOptions::new("unit")).unwrap();
+        let owner = Mapping::map(fd.as_fd(), 0, 2 * page(), Access::ReadWrite).unwrap();
+        for index in [0, page() as usize] {
+            // SAFETY: two bytes of a live two-page mapping, reached through atomics only.
+            let byte = unsafe { owner.as_ptr().add(index).cast::<AtomicU8>().as_ref() };
+            byte.store(1, Ordering::Relaxed);
+        }
+        add_seals(fd.as_fd(), PEER_SEALS).unwrap();
+        assert_eq!(verify_received(fd.as_fd()).unwrap(), 2 * page());
+    }
+
+    #[test]
+    fn a_memfd_with_a_hole_is_refused() {
+        // Sparse: no page yet.
+        let sparse = create(4 * page(), &CreateOptions::new("unit")).unwrap();
+        add_seals(sparse.as_fd(), PEER_SEALS).unwrap();
+        assert_eq!(
+            refusal(sparse.as_fd()),
+            "received memfd has a page without data"
+        );
+        // Pages 0, 1 and 3 written, page 2 left out.
+        let fd = create(4 * page(), &CreateOptions::new("unit")).unwrap();
+        let owner = Mapping::map(fd.as_fd(), 0, 4 * page(), Access::ReadWrite).unwrap();
+        for index in [0, 1, 3] {
+            let at = index * page() as usize;
+            // SAFETY: a byte of a live four-page mapping, reached through atomics only.
+            let byte = unsafe { owner.as_ptr().add(at).cast::<AtomicU8>().as_ref() };
+            byte.store(1, Ordering::Relaxed);
+        }
+        add_seals(fd.as_fd(), PEER_SEALS).unwrap();
+        assert_eq!(
+            refusal(fd.as_fd()),
+            "received memfd has a page without data"
+        );
+    }
+
+    #[test]
+    fn a_memfd_without_the_two_seals_is_refused() {
+        let unsealed = "received memfd is not sealed against shrinking and writing";
+        for seals in [
+            Seals::empty(),
+            Seals::SHRINK,
+            Seals::FUTURE_WRITE,
+            Seals::GROW | Seals::SEAL,
+        ] {
+            let fd = create(page(), &CreateOptions::new("unit").populate(true)).unwrap();
+            add_seals(fd.as_fd(), seals).unwrap();
+            assert_eq!(refusal(fd.as_fd()), unsealed, "{seals:?}");
+        }
+    }
+
+    #[test]
+    fn an_empty_memfd_is_refused() {
+        let fd = rustix::fs::memfd_create(
+            "empty",
+            rustix::fs::MemfdFlags::CLOEXEC | rustix::fs::MemfdFlags::ALLOW_SEALING,
+        )
+        .unwrap();
+        add_seals(fd.as_fd(), PEER_SEALS).unwrap();
+        assert_eq!(refusal(fd.as_fd()), "received memfd is empty");
+    }
+
+    #[test]
+    fn an_fd_that_is_not_a_memfd_is_refused() {
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert_eq!(
+            refusal(socket.as_fd()),
+            "received fd is not a sealable file"
+        );
+        // A regular file: no seals on a disk, `SEAL` alone on a tmpfs mount.
+        let path = std::env::temp_dir().join(format!("rsbinder-fmq-verify-{}", std::process::id()));
+        std::fs::write(&path, vec![0u8; page() as usize]).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let check = refusal(file.as_fd());
+        assert!(
+            [
+                "received fd is not a sealable file",
+                "received fd is not a tmpfs file",
+                "received memfd is not sealed against shrinking and writing",
+            ]
+            .contains(&check),
+            "{check}"
+        );
+    }
+
+    #[test]
+    fn a_hugetlbfs_memfd_is_refused_as_not_tmpfs() {
+        use rustix::fs::{memfd_create, MemfdFlags};
+        let huge = match memfd_create("huge", MemfdFlags::CLOEXEC | MemfdFlags::HUGETLB) {
+            Ok(fd) => fd,
+            // No such fd to refuse: no hugetlbfs (`ENOSYS`), no huge page size, or no such flag.
+            Err(Errno::NOSYS | Errno::NODEV | Errno::NOENT | Errno::INVAL) => {
+                eprintln!("skipped: this kernel makes no MFD_HUGETLB memfd");
+                return;
+            }
+            Err(e) => panic!("memfd_create(MFD_HUGETLB): {e}"),
+        };
+        // It has seals to report, which is why the filesystem is asked as well.
+        seals(huge.as_fd()).unwrap();
+        assert_eq!(refusal(huge.as_fd()), "received fd is not a tmpfs file");
     }
 }
