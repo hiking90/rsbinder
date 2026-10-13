@@ -394,6 +394,12 @@ mod tests {
         rustix::param::page_size() as u64
     }
 
+    fn byte(map: &Mapping, index: usize) -> &AtomicU8 {
+        assert!(index < map.len());
+        // SAFETY: a byte inside a live mapping that outlives the borrow; the tests use atomics only.
+        unsafe { map.as_ptr().add(index).cast::<AtomicU8>().as_ref() }
+    }
+
     /// `seals`, less `F_SEAL_EXEC`: a host with `vm.memfd_noexec` set puts it on every new memfd.
     fn named_seals(fd: &OwnedFd) -> Seals {
         seals(fd.as_fd())
@@ -465,15 +471,8 @@ mod tests {
             Error::Os(Errno::PERM)
         );
         let reader = Mapping::map(fd.as_fd(), 0, page(), Access::ReadOnly).unwrap();
-        // SAFETY: byte 0 of two live one-page mappings, reached through atomics only.
-        let (stored, loaded) = unsafe {
-            (
-                owner.as_ptr().cast::<AtomicU8>().as_ref(),
-                reader.as_ptr().cast::<AtomicU8>().as_ref(),
-            )
-        };
-        stored.store(0x5a, Ordering::Relaxed);
-        assert_eq!(loaded.load(Ordering::Relaxed), 0x5a);
+        byte(&owner, 0).store(0x5a, Ordering::Relaxed);
+        assert_eq!(byte(&reader, 0).load(Ordering::Relaxed), 0x5a);
     }
 
     #[test]
@@ -548,9 +547,7 @@ mod tests {
         let fd = create(2 * page(), &CreateOptions::new("unit")).unwrap();
         let owner = Mapping::map(fd.as_fd(), 0, 2 * page(), Access::ReadWrite).unwrap();
         for index in [0, page() as usize] {
-            // SAFETY: two bytes of a live two-page mapping, reached through atomics only.
-            let byte = unsafe { owner.as_ptr().add(index).cast::<AtomicU8>().as_ref() };
-            byte.store(1, Ordering::Relaxed);
+            byte(&owner, index).store(1, Ordering::Relaxed);
         }
         add_seals(fd.as_fd(), PEER_SEALS).unwrap();
         assert_eq!(verify_received(fd.as_fd()).unwrap(), 2 * page());
@@ -569,10 +566,7 @@ mod tests {
         let fd = create(4 * page(), &CreateOptions::new("unit")).unwrap();
         let owner = Mapping::map(fd.as_fd(), 0, 4 * page(), Access::ReadWrite).unwrap();
         for index in [0, 1, 3] {
-            let at = index * page() as usize;
-            // SAFETY: a byte of a live four-page mapping, reached through atomics only.
-            let byte = unsafe { owner.as_ptr().add(at).cast::<AtomicU8>().as_ref() };
-            byte.store(1, Ordering::Relaxed);
+            byte(&owner, index * page() as usize).store(1, Ordering::Relaxed);
         }
         add_seals(fd.as_fd(), PEER_SEALS).unwrap();
         assert_eq!(

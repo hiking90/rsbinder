@@ -616,7 +616,7 @@ impl<T: Element> MessageQueue<T> {
         wake_bits: u32,
         timeout: Option<Duration>,
     ) -> Result<()> {
-        let flag = self.flag.clone().ok_or(Error::NoEventFlag)?;
+        self.flag_ref()?;
         if wait_bits == 0 {
             return Err(Error::BadValue("empty wait mask"));
         }
@@ -626,15 +626,15 @@ impl<T: Element> MessageQueue<T> {
         let deadline = timeout.and_then(Deadline::after);
         loop {
             if self.write(items)? {
-                wake_after_commit(&flag, wake_bits);
+                self.wake_after_commit(wake_bits);
                 return Ok(());
             }
-            match flag.wait_until(wait_bits, deadline) {
+            match self.flag_ref()?.wait_until(wait_bits, deadline) {
                 Ok(_) => {}
                 // One more try: the reader may have run while the clock ran out.
                 Err(Error::TimedOut) => {
                     if self.write(items)? {
-                        wake_after_commit(&flag, wake_bits);
+                        self.wake_after_commit(wake_bits);
                         return Ok(());
                     }
                     return Err(Error::TimedOut);
@@ -657,7 +657,7 @@ impl<T: Element> MessageQueue<T> {
         wake_bits: u32,
         timeout: Option<Duration>,
     ) -> Result<()> {
-        let flag = self.flag.clone().ok_or(Error::NoEventFlag)?;
+        self.flag_ref()?;
         if wait_bits == 0 {
             return Err(Error::BadValue("empty wait mask"));
         }
@@ -667,14 +667,14 @@ impl<T: Element> MessageQueue<T> {
         let deadline = timeout.and_then(Deadline::after);
         loop {
             if self.read(out)? {
-                wake_after_commit(&flag, wake_bits);
+                self.wake_after_commit(wake_bits);
                 return Ok(());
             }
-            match flag.wait_until(wait_bits, deadline) {
+            match self.flag_ref()?.wait_until(wait_bits, deadline) {
                 Ok(_) => {}
                 Err(Error::TimedOut) => {
                     if self.read(out)? {
-                        wake_after_commit(&flag, wake_bits);
+                        self.wake_after_commit(wake_bits);
                         return Ok(());
                     }
                     return Err(Error::TimedOut);
@@ -695,10 +695,20 @@ pub(crate) fn allocate_shared(total: u64) -> Result<OwnedFd> {
     shm::create(total, &CreateOptions::new("rsbinder-fmq").allocate(true))
 }
 
-/// The transfer is committed, so a failed wake is logged rather than returned (libfmq does too).
-fn wake_after_commit(flag: &EventFlag, bits: u32) {
-    if let Err(e) = flag.wake(bits) {
-        log::error!("fmq: the wake after a committed transfer failed: {e:?}");
+impl<T: Element> MessageQueue<T> {
+    fn flag_ref(&self) -> Result<&EventFlag> {
+        match &self.flag {
+            Some(flag) => Ok(flag),
+            None => Err(Error::NoEventFlag),
+        }
+    }
+
+    /// The transfer is committed, so a failed wake is logged rather than returned (libfmq does too).
+    fn wake_after_commit(&self, bits: u32) {
+        let Some(flag) = &self.flag else { return };
+        if let Err(e) = flag.wake(bits) {
+            log::error!("fmq: the wake after a committed transfer failed: {e:?}");
+        }
     }
 }
 

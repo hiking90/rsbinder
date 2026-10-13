@@ -1,7 +1,6 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::ptr::NonNull;
 use std::sync::atomic::{fence, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,13 +16,8 @@ pub const NOT_FULL: u32 = 0x01;
 pub const NOT_EMPTY: u32 = 0x02;
 
 struct Inner {
-    _mapping: Mapping,
-    word: NonNull<AtomicU32>,
+    mapping: Mapping,
 }
-
-// SAFETY: `word` points into `_mapping`, owned by `Inner`, and is touched only as `AtomicU32`.
-unsafe impl Send for Inner {}
-unsafe impl Sync for Inner {}
 
 /// A handle on the queue's 32-bit EventFlag word: the futex both peers wait
 /// on and wake through (libfmq `EventFlag`, `EventFlag.cpp`).
@@ -53,22 +47,18 @@ pub struct EventFlag {
 
 impl EventFlag {
     pub(crate) fn from_mapping(mapping: Mapping) -> Self {
-        let word = mapping.as_ptr().cast::<AtomicU32>();
         debug_assert_eq!(
-            word.as_ptr() as usize % std::mem::align_of::<AtomicU32>(),
+            mapping.as_ptr().as_ptr() as usize % std::mem::align_of::<AtomicU32>(),
             0
         );
         Self {
-            inner: Arc::new(Inner {
-                _mapping: mapping,
-                word,
-            }),
+            inner: Arc::new(Inner { mapping }),
         }
     }
 
     fn word(&self) -> &AtomicU32 {
         // SAFETY: in `inner`'s mapping, 4-aligned (grantor offsets are 8-aligned), atomic-only.
-        unsafe { self.inner.word.as_ref() }
+        unsafe { self.inner.mapping.as_ptr().cast::<AtomicU32>().as_ref() }
     }
 
     pub(crate) fn reset(&self) {

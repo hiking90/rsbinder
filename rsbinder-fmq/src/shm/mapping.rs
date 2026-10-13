@@ -162,8 +162,8 @@ impl Mapping {
     /// [`len`](Self::len) bytes from here are mapped.
     #[inline]
     pub fn as_ptr(&self) -> NonNull<u8> {
-        // SAFETY: `delta < len` (`map` rejects an empty extent), so this stays in the mapping.
-        unsafe { NonNull::new_unchecked(self.base.as_ptr().add(self.delta)) }
+        // `delta < len` (`map` rejects an empty extent): inside the mapping, so the add never saturates.
+        self.base.map_addr(|addr| addr.saturating_add(self.delta))
     }
 
     /// The `extent` given to [`map`](Self::map): the mapped bytes from
@@ -419,13 +419,10 @@ mod tests {
             len: filter.len() as libc::c_ushort,
             filter: filter.as_mut_ptr(),
         };
-        let (on, zero): (libc::c_ulong, libc::c_ulong) = (1, 0);
         let mode = libc::SECCOMP_MODE_FILTER as libc::c_ulong;
-        // SAFETY: `program` points at `filter`, alive across the call; the kernel copies it.
-        let loaded = unsafe {
-            libc::prctl(libc::PR_SET_NO_NEW_PRIVS, on, zero, zero, zero) == 0
-                && libc::prctl(libc::PR_SET_SECCOMP, mode, &program) == 0
-        };
+        let loaded = rustix::thread::set_no_new_privs(true).is_ok()
+            // SAFETY: `program` points at `filter`, alive across the call; the kernel copies it.
+            && unsafe { libc::prctl(libc::PR_SET_SECCOMP, mode, &program) == 0 };
         // An emulated x86 on another architecture's kernel loads the filter and matches nothing.
         loaded
             && FSTATFS.iter().all(|nr| {

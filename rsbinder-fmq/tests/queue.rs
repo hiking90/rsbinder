@@ -13,6 +13,7 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use rsbinder_fmq::shm::{Access, Mapping};
 use rsbinder_fmq::{
     AttachPolicy, Descriptor, Error, Flavor, Grantor, MessageQueue, NOT_EMPTY, NOT_FULL,
 };
@@ -39,45 +40,21 @@ fn bad(r: Result<MessageQueue<u32>, Error>) -> &'static str {
 }
 
 /// A raw view of a single-fd queue's counters, to play the hostile peer.
-struct Counters {
-    base: *mut u8,
-    len: usize,
-}
+struct Counters(Mapping);
 
 impl Counters {
     fn map(desc: &Descriptor) -> Self {
-        let len = rsbinder_fmq::shm::region_size(desc.fds[0].as_fd()).unwrap() as usize;
-        // SAFETY: a fresh shared mapping of the whole fd; unmapped in Drop.
-        let base = unsafe {
-            rustix::mm::mmap(
-                std::ptr::null_mut(),
-                len,
-                rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE,
-                rustix::mm::MapFlags::SHARED,
-                &desc.fds[0],
-                0,
-            )
-        }
-        .unwrap()
-        .cast::<u8>();
-        Self { base, len }
+        Self(Mapping::map(desc.fds[0].as_fd(), 0, 16, Access::ReadWrite).unwrap())
     }
 
     fn counter(&self, index: usize) -> &AtomicU64 {
         // SAFETY: offsets 0 and 8 of the default layout, inside the mapping.
-        unsafe { &*self.base.add(index * 8).cast::<AtomicU64>() }
+        unsafe { self.0.as_ptr().add(8 * index).cast::<AtomicU64>().as_ref() }
     }
 
     fn set(&self, read: u64, write: u64) {
         self.counter(0).store(read, Ordering::SeqCst);
         self.counter(1).store(write, Ordering::SeqCst);
-    }
-}
-
-impl Drop for Counters {
-    fn drop(&mut self) {
-        // SAFETY: exactly what `mmap` returned.
-        let _ = unsafe { rustix::mm::munmap(self.base.cast(), self.len) };
     }
 }
 
