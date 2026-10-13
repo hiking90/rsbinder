@@ -19,11 +19,16 @@
 //!   packages compiles against them without a vendored copy: `rsbinder-aidl`
 //!   names `rsbinder::fmq::MQDescriptor` and `rsbinder::NativeHandle` for
 //!   those imports.
-//! * The queue — `MessageQueue`, `EventFlag`, `Descriptor`, `AttachPolicy`
-//!   — is `rsbinder-fmq`, re-exported here on every platform. Making or
+//! * The queue — `MessageQueue`, `EventFlag`, `Descriptor`, `AttachPolicy`,
+//!   and for the unsynchronized flavor `UnsyncWriter` and `UnsyncReader` —
+//!   is `rsbinder-fmq`, re-exported here on every platform. Making or
 //!   attaching a queue works on Linux and Android targets with 64-bit
 //!   atomics, where the shared memory, futex and counters it needs exist,
-//!   and returns `Error::Unsupported` elsewhere.
+//!   and returns `Error::Unsupported` elsewhere. `UnsyncReader::attach`
+//!   needs `shm::RoWord64` as well and returns `Unsupported` on a target
+//!   without that type (32-bit x86 without SSE2), and `UnsyncWriter::create`
+//!   with `read_only_readers` returns it on a kernel without
+//!   `F_SEAL_FUTURE_WRITE`.
 //! * The two conversions below join them: an [`MQDescriptor`] that arrived in
 //!   a parcel becomes a `Descriptor` to attach to (`TryFrom<&MQDescriptor>`),
 //!   and a queue's `Descriptor` becomes the [`MQDescriptor`] to send

@@ -24,13 +24,50 @@ assert_eq!(&buf, b"hello");
 # Ok::<(), rsbinder_fmq::Error>(())
 ```
 
-Scope: the `SynchronizedReadWrite` flavor, primitive elements, Linux and
+That is libfmq's synchronized flavor: one writer, one reader, and a full ring
+refuses the write. The unsynchronized flavor — one writer, any number of
+readers, a full ring overwrites its oldest elements — is `UnsyncWriter` and
+`UnsyncReader`, with the counter discipline of `android-17.0.0_r1`:
+
+```rust
+use rsbinder_fmq::{AttachPolicy, UnsyncCreate, UnsyncRead, UnsyncReader, UnsyncStart, UnsyncWriter};
+
+// The writer allocates; `read_only_readers` seals the memory so that no reader can write it.
+let mut writer = UnsyncWriter::<u32>::create(64, &UnsyncCreate::new().read_only_readers(true))?;
+let descriptor = writer.descriptor()?;            // send it to each reader
+
+let policy = AttachPolicy { max_capacity: 1 << 16, require_seal: true, require_event_flag: false };
+let mut reader = UnsyncReader::<u32>::attach(&descriptor, &policy, UnsyncStart::Now)?;
+
+writer.write(&[1, 2, 3])?;                        // never waits for a reader
+let mut buf = [0u32; 3];
+match reader.read(&mut buf)? {
+    UnsyncRead::Done => assert_eq!(buf, [1, 2, 3]),
+    UnsyncRead::Empty => {}                       // fewer than three are there yet
+    UnsyncRead::Lost { elements } => eprintln!("lapped by the writer: skipped {elements} elements"),
+}
+# Ok::<(), rsbinder_fmq::Error>(())
+```
+
+A reader keeps its read counter in its own process and maps the queue
+read-only; one that falls a whole ring behind is told how many elements it
+skipped and resumes half a ring behind the writer. `read_latest` takes the
+newest elements and drops the backlog. A libfmq reader of such a queue must
+attach with `resetPointers = false` (the default resets the writer's
+counters).
+
+Scope: both flavors, primitive elements, Linux and
 Android targets with 64-bit atomics (for macOS, WASI and a Linux target
 without those atomics the crate compiles and the queue's constructors return
-`Unsupported`). A descriptor from a peer is checked against an
+`Unsupported`). `UnsyncReader::attach` needs `shm::RoWord64` as well and
+returns `Unsupported` on a target without that type (32-bit x86 without
+SSE2), and `UnsyncWriter::create` with `read_only_readers` returns it on a
+kernel without `F_SEAL_FUTURE_WRITE` (mainline Linux before 5.1). A
+descriptor from a peer is checked against an
 `AttachPolicy` before anything is mapped, and the counters are checked on
-every operation. Every access to the shared memory is a Rust atomic, so a
-second writer or reader — the peer, another handle, C code — makes the
+every operation. Every access to the shared memory is a Rust atomic, so
+breaking a flavor's rule — a second writer, or a second reader of a
+synchronized queue; the peer, another handle, C code — makes the
 counters fail their check or the elements wrong, never undefined behavior;
 nothing detects it, as with libfmq. See the crate documentation for the
 full contract.
@@ -52,9 +89,9 @@ are Linux and Android. `Mapping` needs only `mmap`, so it works on macOS too
 32-bit ARM with 64-bit atomics.
 
 For a peer that cannot link `libfmq` — an NDK app, where it is not available —
-`c/rsbinder_fmq.h` is the same queue as one C11 header: attach with the same
-descriptor and policy checks, create a sealed memfd, the counters and the
-EventFlag protocol, plus two C++ templates for the NDK backend's
+`c/rsbinder_fmq.h` is the synchronized queue as one C11 header: attach with
+the same descriptor and policy checks, create a sealed memfd, the counters
+and the EventFlag protocol, plus two C++ templates for the NDK backend's
 `MQDescriptor`. Its `mmap` step does not have the two refusals of
 `shm::Mapping::map`: a hugetlbfs fd, and on a 32-bit target a ring mapping
 of more than `isize::MAX` bytes. `tests/c_header.rs`

@@ -12,9 +12,16 @@ use std::fmt;
 pub enum Error {
     /// The target lacks what the call needs. The queue's constructors return
     /// this off Linux and Android, and on a target without 64-bit atomics;
-    /// the memfd, seal and futex functions of [`shm`](crate::shm) off Linux
-    /// and Android; [`Mapping::map`](crate::shm::Mapping::map) on a target
+    /// [`UnsyncReader::attach`](crate::UnsyncReader::attach) also on a target
+    /// without `shm::RoWord64` (32-bit x86 without SSE2); the memfd, seal
+    /// and futex functions of [`shm`](crate::shm) off Linux and Android;
+    /// [`Mapping::map`](crate::shm::Mapping::map) on a target
     /// without `mmap` (WASI).
+    ///
+    /// One case depends on the running kernel and not on the target:
+    /// [`UnsyncWriter::create`](crate::UnsyncWriter::create) with
+    /// [`read_only_readers`](field@crate::UnsyncCreate::read_only_readers)
+    /// returns this on a kernel without `F_SEAL_FUTURE_WRITE`.
     Unsupported,
     /// A descriptor, policy or argument failed a check; the failing call
     /// moved no counter, though a `write` may already have copied items into
@@ -43,7 +50,8 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Unsupported => f.write_str(
-                "not supported on this target: it lacks memfd, futex, mmap or 64-bit atomics",
+                "not supported on this target or kernel: it lacks memfd, futex, mmap, \
+                 64-bit atomics, a read-only 64-bit load or F_SEAL_FUTURE_WRITE",
             ),
             Error::BadValue(what) => write!(f, "rejected: {what}"),
             Error::Corrupted(what) => write!(f, "shared counters corrupted: {what}"),

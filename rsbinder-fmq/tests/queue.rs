@@ -688,7 +688,7 @@ fn attach_rejects_the_unsynchronized_flavor() {
     d.flavor = Flavor::UnsynchronizedWrite;
     assert_eq!(
         bad(MessageQueue::<u32>::attach(&d, &policy(1 << 20, true))),
-        "only the synchronized flavor is supported"
+        "descriptor is not of the synchronized flavor"
     );
 }
 
@@ -1019,6 +1019,7 @@ fn ring_code_makes_no_plain_copy_of_ring_memory() {
             "queue.rs" => include_str!("../src/queue.rs"),
             "ring.rs" => include_str!("../src/ring.rs"),
             "shm/run.rs" => include_str!("../src/shm/run.rs"),
+            "unsync.rs" => include_str!("../src/unsync.rs"),
             _ => panic!("{file} is not embedded"),
         };
         text.lines()
@@ -1056,12 +1057,13 @@ fn ring_code_makes_no_plain_copy_of_ring_memory() {
         "&raw ",
     ];
     // The queue's own `read`/`write` calls, the counter's `&AtomicU64`, and pointer arithmetic.
-    const ALLOWED: [&str; 12] = [
+    const ALLOWED: [&str; 13] = [
         "if self.write(items)? {",
         "if self.read(out)? {",
         "unsafe { self.ptr.as_ref() }",
         "let ptr = mapping.as_ptr().cast::<AtomicU64>();",
         "base: mapping.as_ptr(),",
+        "at: mapping.as_ptr(),",
         "debug_assert_eq!(ptr.as_ptr() as usize % std::mem::align_of::<AtomicU64>(), 0);",
         "let first = self.first.as_ptr().add(start.min(self.first_len) * q);",
         ".as_ptr()",
@@ -1070,7 +1072,7 @@ fn ring_code_makes_no_plain_copy_of_ring_memory() {
         "unsafe { std::slice::from_raw_parts(user.as_ptr().cast(), std::mem::size_of_val(user)) }",
         "unsafe { Run::new(NonNull::new_unchecked(at.as_ptr().add(offset)), len) }",
     ];
-    for file in ["queue.rs", "ring.rs", "shm/run.rs"] {
+    for file in ["queue.rs", "ring.rs", "shm/run.rs", "unsync.rs"] {
         let text = source(file);
         for line in text.lines().filter(|l| !ALLOWED.contains(&l.trim())) {
             for pattern in PLAIN_ACCESSES {
@@ -1078,8 +1080,9 @@ fn ring_code_makes_no_plain_copy_of_ring_memory() {
             }
         }
     }
-    // `queue.rs` builds no slice at all; the other two build atomics or views of a caller's slice.
+    // The two queues build no slice at all; the others build atomics or views of a caller's slice.
     assert!(!source("queue.rs").contains("from_raw_parts"));
+    assert!(!source("unsync.rs").contains("from_raw_parts"));
     let ring = source("ring.rs") + &source("shm/run.rs");
     let calls: Vec<&str> = ring
         .match_indices("from_raw_parts")

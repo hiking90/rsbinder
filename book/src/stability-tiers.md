@@ -131,6 +131,19 @@ tweaks; wire formats are already locked.
   rsbinder on an emulator (`example-hello/cpp/run_stream_interop.sh`).
   See [Builtin AOSP Types](./aidl-data-types.md#builtin-aosp-types) and
   [Generic Parcelables](./aidl-parcelable.md#generic-parcelables).
+- **Fast Message Queue, unsynchronized flavor** — `UnsyncWriter` and
+  `UnsyncReader` of `rsbinder-fmq`, with `UnsyncCreate`, `UnsyncStart` and
+  `UnsyncRead`: one writer, any number of readers, a full ring overwrites its
+  oldest elements. The layout and the counter discipline are `libfmq`'s as of
+  `android-17.0.0_r1` (the write region end, the resume half a ring behind
+  the writer, `readLatest`), so, as for the synchronized flavor, only the
+  Rust signatures may still change. It differs from `libfmq` in the places
+  the documentation of the types names, the main ones being that the writer
+  never lowers the write region end, and that a reader maps the queue
+  read-only and resets no counter when it attaches.
+  Validated against AOSP's own `libfmq` on the host in both roles
+  (`rsbinder-fmq/tests/libfmq_host.rs`); not yet run on an Android device or
+  on AArch64.
 - **Shared-memory primitives** — the `rsbinder_fmq::shm` module, also
   reachable as `rsbinder::fmq::shm`: `create` / `add_seals` / `seals` /
   `Seals` (a memfd and its seals), `Mapping` / `Access`, `Run` (copies

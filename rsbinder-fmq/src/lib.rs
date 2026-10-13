@@ -14,27 +14,40 @@
 //!
 //! # Compatibility scope
 //!
-//! * **Flavor**: `SynchronizedReadWrite` — one reader, one writer, a full
-//!   ring refuses the write. Keeping to one reader and one writer is the
-//!   callers' protocol, as in libfmq; nothing detects a second one (see
-//!   [`MessageQueue`]). The unsynchronized flavor is modelled in [`Flavor`]
-//!   but cannot be attached.
+//! * **Flavors**: both of libfmq's, each with types of its own.
+//!   `SynchronizedReadWrite` — one reader, one writer, a full ring refuses
+//!   the write — is [`MessageQueue`]. Keeping to one reader and one writer
+//!   is the callers' protocol, as in libfmq; nothing detects a second one.
+//!   `UnsynchronizedWrite` — one writer, any number of readers, a full ring
+//!   overwrites its oldest elements and a reader that had not read them is
+//!   told so — is [`UnsyncWriter`] and [`UnsyncReader`], with the counter
+//!   discipline of `android-17.0.0_r1`: the write region end
+//!   (`android-16.0.0_r4`), the resume half a ring behind the writer
+//!   (`android-15.0.0_r6`) and `readLatest`. [`UnsyncWriter`] and
+//!   [`UnsyncReader`] say what holds against a libfmq peer older than
+//!   those.
 //! * **Layout**: grantor 0 = read counter (`u64`, bytes consumed), 1 = write
 //!   counter (`u64`, bytes produced), 2 = the ring, 3 = the EventFlag word
 //!   (`u32`, optional). Offsets are multiples of 8. Counters never wrap; a
 //!   position is `counter % ring bytes`. Unchanged in libfmq from Android 12
-//!   through 17.
+//!   through 17. In the unsynchronized flavor every reader keeps its read
+//!   counter in its own process, and grantor 0 is the writer's *write region
+//!   end*: the counter value the write in progress runs up to.
 //! * **EventFlag**: `FUTEX_WAIT_BITSET` / `FUTEX_WAKE_BITSET` on the shared
 //!   word without `FUTEX_PRIVATE_FLAG`, bits [`NOT_FULL`] and [`NOT_EMPTY`]
 //!   as libfmq names them, a wait consuming the bits in its mask. See
-//!   [`EventFlag`].
+//!   [`EventFlag`]. The unsynchronized flavor has no blocking operations, in
+//!   libfmq or here.
 //! * **Elements**: primitive integers and floats ([`Element`]). AIDL
 //!   `@FixedSize` parcelables need a `repr(C)` type with the AIDL's
 //!   layout, which the AIDL compiler is the place to generate.
 //! * **Memory**: a queue this crate creates is a memfd sealed against
 //!   resizing, with every page allocated up front. One made by libfmq is
 //!   ashmem (or, on Android 11+, a memfd sealed `GROW | SHRINK` by
-//!   libcutils); both attach.
+//!   libcutils); both attach. An unsynchronized queue can be sealed
+//!   `F_SEAL_FUTURE_WRITE` as well
+//!   ([`UnsyncCreate::read_only_readers`](field@UnsyncCreate::read_only_readers)),
+//!   so that only its writer has it mapped writable.
 //!
 //! # Shared-memory primitives
 //!
@@ -51,9 +64,14 @@
 //! The queue works on Linux and Android targets that have 64-bit atomics.
 //! The crate also compiles for macOS, for a Linux target without 64-bit
 //! atomics (`armv5te-unknown-linux-gnueabi`) and for WASI
-//! (`wasm32-wasip1`); there [`MessageQueue::create`] and
-//! [`MessageQueue::attach`] return [`Error::Unsupported`]. The [`shm`]
+//! (`wasm32-wasip1`); there [`MessageQueue::create`],
+//! [`MessageQueue::attach`], [`UnsyncWriter::create`] and
+//! [`UnsyncReader::attach`] return [`Error::Unsupported`]. The [`shm`]
 //! module says which of its items each of those targets has.
+//! [`UnsyncReader`] reads 64-bit counters through a read-only mapping and so
+//! needs `shm::RoWord64` too; a 32-bit x86 target without SSE2 has 64-bit
+//! atomics and no such type, and `UnsyncReader::attach` is `Unsupported`
+//! there.
 //!
 //! # A descriptor is untrusted
 //!
@@ -85,11 +103,41 @@ mod event_flag;
 mod queue;
 mod ring;
 pub mod shm;
+mod unsync;
 
 pub use descriptor::{AttachPolicy, Descriptor, Flavor, Grantor};
 pub use error::{Error, Result};
 pub use event_flag::{EventFlag, NOT_EMPTY, NOT_FULL};
 pub use queue::{Element, MessageQueue, Regions};
+pub use unsync::{UnsyncCreate, UnsyncRead, UnsyncReader, UnsyncStart, UnsyncWriter};
+
+#[cfg(all(
+    test,
+    not(loom),
+    any(target_os = "linux", target_os = "android"),
+    target_has_atomic = "64"
+))]
+mod reader_target_tests {
+    use super::*;
+
+    /// `tests/unsync.rs` runs only where a reader exists; this states what the other targets get.
+    #[test]
+    fn a_reader_attaches_exactly_where_the_wide_word_exists() {
+        let writer = UnsyncWriter::<u8>::create(8, &UnsyncCreate::new()).expect("create");
+        let desc = writer.descriptor().expect("descriptor");
+        let policy = AttachPolicy {
+            max_capacity: 8,
+            require_seal: true,
+            require_event_flag: false,
+        };
+        let attached = UnsyncReader::<u8>::attach(&desc, &policy, UnsyncStart::Oldest);
+        if shm::RoWord64::PRESENT {
+            assert!(attached.is_ok(), "{:?}", attached.err());
+        } else {
+            assert_eq!(attached.err(), Some(Error::Unsupported));
+        }
+    }
+}
 
 #[cfg(all(test, not(any(target_os = "linux", target_os = "android"))))]
 mod unsupported_tests {
@@ -124,6 +172,14 @@ mod unsupported_tests {
         };
         assert_eq!(
             MessageQueue::<u8>::attach(&desc, &policy).err(),
+            Some(Error::Unsupported)
+        );
+        assert_eq!(
+            UnsyncWriter::<u8>::create(0, &UnsyncCreate::new()).err(),
+            Some(Error::Unsupported)
+        );
+        assert_eq!(
+            UnsyncReader::<u8>::attach(&desc, &policy, UnsyncStart::Now).err(),
             Some(Error::Unsupported)
         );
     }

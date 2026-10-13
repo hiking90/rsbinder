@@ -160,6 +160,9 @@ mod wide {
     pub struct RoWord64(std::sync::atomic::AtomicU64);
 
     impl RoWord64 {
+        /// `false` on the stand-in the crate resolves this name to where the type is absent.
+        pub(crate) const PRESENT: bool = true;
+
         /// View the 8 bytes at `at` as a read-only word.
         ///
         /// # Safety
@@ -244,6 +247,32 @@ mod wide {
 ))]
 pub use wide::RoWord64;
 
+mod absent {
+    use std::ptr::NonNull;
+
+    /// What `RoWord64` names inside the crate where the type is absent. Uninhabited.
+    #[allow(dead_code, reason = "named only on a target that has no `RoWord64`")]
+    pub(crate) enum RoWord64 {}
+
+    #[allow(dead_code, reason = "named only on a target that has no `RoWord64`")]
+    impl RoWord64 {
+        pub(crate) const PRESENT: bool = false;
+
+        /// # Safety: none; `unsafe` only so that one call site compiles against either type.
+        pub(crate) unsafe fn from_ptr<'a>(_at: NonNull<u8>) -> &'a Self {
+            unreachable!("no `RoWord64` on this target: `RoWord64::PRESENT` is false")
+        }
+
+        pub(crate) fn load_acquire(&self) -> u64 {
+            match *self {}
+        }
+    }
+}
+
+// A glob, which the `pub use` above shadows wherever the real type exists.
+#[allow(unused_imports, reason = "shadowed on a target that has `RoWord64`")]
+pub(crate) use absent::*;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +323,14 @@ mod tests {
         owner.store(9, Ordering::Release);
         assert_eq!(word.load_acquire(), 9);
         assert_eq!(format!("{word:?}"), "RoWord32(9)");
+    }
+
+    /// Where the gate on `PRESENT` is missed, the stand-in panics and views nothing.
+    #[test]
+    #[should_panic(expected = "`RoWord64::PRESENT` is false")]
+    fn the_stand_in_for_an_absent_wide_word_panics() {
+        // SAFETY: the stand-in's `from_ptr` has no contract.
+        let _ = unsafe { absent::RoWord64::from_ptr(NonNull::dangling()) };
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]

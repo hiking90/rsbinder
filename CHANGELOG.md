@@ -60,21 +60,60 @@ Each item below changes what a 0.12.0 program observes.
   build may span. AOSP's `MemoryHeapBase` and `SharedMemory` make ordinary
   memfd or ashmem regions, which are not refused. The `fstatfs` of the item
   above is made here too, once for each mapping.
+- `MessageQueue::attach` refuses a descriptor of the unsynchronized flavor
+  with `BadValue("descriptor is not of the synchronized flavor")` (0.12.0:
+  `"only the synchronized flavor is supported"`). The flavor now has types
+  of its own (see Added). Code that compares the text needs the new one;
+  matching on the variant is unaffected.
 - Off Linux and Android (macOS), `MessageQueue::create` and
   `MessageQueue::attach` return `Error::Unsupported` before they look at
   their arguments or make a system call. 0.12.0 checked `create`'s
   arguments first, so `create(0, ..)` was `BadValue`, and duplicated the
   descriptor's fds in `attach` first, so a failed duplication was `Os`.
   Neither release makes a queue on those targets.
-- `Error::Unsupported` displays as "not supported on this target: it lacks
-  memfd, futex, mmap or 64-bit atomics" (0.12.0: "fast message queues need
-  Linux or Android"). The functions of `shm` return the same error to
-  callers that have no queue, and it is returned on Linux targets without
-  64-bit atomics as well. Code that compares the text needs the new one;
-  matching on the variant is unaffected.
+- `Error::Unsupported` displays as "not supported on this target or kernel:
+  it lacks memfd, futex, mmap, 64-bit atomics, a read-only 64-bit load or
+  F_SEAL_FUTURE_WRITE" (0.12.0:
+  "fast message queues need Linux or Android"). The functions of `shm`
+  return the same error to callers that have no queue, and it is returned
+  on Linux targets without 64-bit atomics as well. Code that compares the
+  text needs the new one; matching on the variant is unaffected.
 
 ### Added
 
+- **The unsynchronized FMQ flavor in `rsbinder-fmq`** (also `rsbinder::fmq`):
+  `UnsyncWriter` and `UnsyncReader`, libfmq's
+  `MessageQueue<T, kUnsynchronizedWrite>`. One writer, any number of
+  readers; a write never waits, a full ring overwrites its oldest elements,
+  and a reader that had not read them gets `UnsyncRead::Lost` with the
+  number it skipped and resumes half a ring behind the writer. 0.12.0
+  modelled the flavor in `Flavor` and refused to attach it.
+  - The layout and counter discipline are those of `android-17.0.0_r1`:
+    grantor 0 is the write region end (`Descriptor::WRITE_REGION_END`,
+    libfmq from `android-16.0.0_r4`), which the writer stores before it
+    copies and a reader loads after its own copy to find out that it was
+    overwritten. `UnsyncReader::read_latest` follows libfmq's `readLatest`,
+    except that a write in progress on a full ring makes it return `0` only
+    when that write reserves the whole ring.
+  - `UnsyncCreate::read_only_readers` seals the memfd `F_SEAL_FUTURE_WRITE`
+    after the writer mapped it, so no reader can write the counters or the
+    ring. On a kernel without that seal (mainline Linux before 5.1)
+    `UnsyncWriter::create` returns `Error::Unsupported` and makes no queue.
+    `UnsyncReader` maps read-only in any case, and stores nothing when
+    it attaches. A libfmq reader of a queue in use must be constructed with
+    `resetPointers = false`: the default resets the writer's counters, which
+    on a read-only queue is a `SIGSEGV` in that reader.
+  - `UnsyncStart::Now` starts a reader at the write counter instead of at
+    zero, where a libfmq reader starts.
+  - Unlike libfmq, `UnsyncWriter` does not lower the write region end when
+    fewer elements are committed than were reserved, so a reader never
+    returns elements a partly committed write overwrote; and one write is at
+    most `capacity - 1` elements, which libfmq accepts at `capacity` with a
+    warning.
+  - Checked against AOSP's libfmq on the host in both roles
+    (`tests/libfmq_host.rs`). Not yet run on an Android device or on
+    AArch64. `UnsyncReader::attach` is `Unsupported` where `shm::RoWord64`
+    does not exist.
 - **Shared-memory primitives in `rsbinder_fmq::shm`** (also
   `rsbinder::fmq::shm`): what the queue is built from, for protocols other
   than FMQ. `create` with `CreateOptions`, `add_seals`, `seals` and `Seals`

@@ -241,6 +241,50 @@ impl core::marker::Unpin for rsbinder_fmq::Flavor
 impl core::marker::UnsafeUnpin for rsbinder_fmq::Flavor
 impl core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::Flavor
 impl core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::Flavor
+pub enum rsbinder_fmq::UnsyncRead
+pub rsbinder_fmq::UnsyncRead::Done
+pub rsbinder_fmq::UnsyncRead::Empty
+pub rsbinder_fmq::UnsyncRead::Lost
+pub rsbinder_fmq::UnsyncRead::Lost::elements: u64
+impl core::clone::Clone for rsbinder_fmq::UnsyncRead
+pub fn rsbinder_fmq::UnsyncRead::clone(&self) -> rsbinder_fmq::UnsyncRead
+impl core::cmp::Eq for rsbinder_fmq::UnsyncRead
+impl core::cmp::PartialEq for rsbinder_fmq::UnsyncRead
+pub fn rsbinder_fmq::UnsyncRead::eq(&self, &rsbinder_fmq::UnsyncRead) -> bool
+impl core::fmt::Debug for rsbinder_fmq::UnsyncRead
+pub fn rsbinder_fmq::UnsyncRead::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for rsbinder_fmq::UnsyncRead
+pub fn rsbinder_fmq::UnsyncRead::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for rsbinder_fmq::UnsyncRead
+impl core::marker::StructuralPartialEq for rsbinder_fmq::UnsyncRead
+impl core::marker::Freeze for rsbinder_fmq::UnsyncRead
+impl core::marker::Send for rsbinder_fmq::UnsyncRead
+impl core::marker::Sync for rsbinder_fmq::UnsyncRead
+impl core::marker::Unpin for rsbinder_fmq::UnsyncRead
+impl core::marker::UnsafeUnpin for rsbinder_fmq::UnsyncRead
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::UnsyncRead
+impl core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::UnsyncRead
+pub enum rsbinder_fmq::UnsyncStart
+pub rsbinder_fmq::UnsyncStart::Now
+pub rsbinder_fmq::UnsyncStart::Oldest
+impl core::clone::Clone for rsbinder_fmq::UnsyncStart
+pub fn rsbinder_fmq::UnsyncStart::clone(&self) -> rsbinder_fmq::UnsyncStart
+impl core::cmp::Eq for rsbinder_fmq::UnsyncStart
+impl core::cmp::PartialEq for rsbinder_fmq::UnsyncStart
+pub fn rsbinder_fmq::UnsyncStart::eq(&self, &rsbinder_fmq::UnsyncStart) -> bool
+impl core::fmt::Debug for rsbinder_fmq::UnsyncStart
+pub fn rsbinder_fmq::UnsyncStart::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for rsbinder_fmq::UnsyncStart
+pub fn rsbinder_fmq::UnsyncStart::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for rsbinder_fmq::UnsyncStart
+impl core::marker::StructuralPartialEq for rsbinder_fmq::UnsyncStart
+impl core::marker::Freeze for rsbinder_fmq::UnsyncStart
+impl core::marker::Send for rsbinder_fmq::UnsyncStart
+impl core::marker::Sync for rsbinder_fmq::UnsyncStart
+impl core::marker::Unpin for rsbinder_fmq::UnsyncStart
+impl core::marker::UnsafeUnpin for rsbinder_fmq::UnsyncStart
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::UnsyncStart
+impl core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::UnsyncStart
 pub struct rsbinder_fmq::AttachPolicy
 pub rsbinder_fmq::AttachPolicy::max_capacity: usize
 pub rsbinder_fmq::AttachPolicy::require_event_flag: bool
@@ -272,6 +316,7 @@ pub const rsbinder_fmq::Descriptor::DATA: usize
 pub const rsbinder_fmq::Descriptor::EVENT_FLAG_WORD: usize
 pub const rsbinder_fmq::Descriptor::READ_COUNTER: usize
 pub const rsbinder_fmq::Descriptor::WRITE_COUNTER: usize
+pub const rsbinder_fmq::Descriptor::WRITE_REGION_END: usize
 pub fn rsbinder_fmq::Descriptor::capacity(&self) -> core::option::Option<u64>
 pub fn rsbinder_fmq::Descriptor::has_event_flag(&self) -> bool
 pub fn rsbinder_fmq::Descriptor::try_clone(&self) -> rsbinder_fmq::Result<Self>
@@ -369,6 +414,65 @@ impl<'a, T> core::marker::Unpin for rsbinder_fmq::Regions<'a, T>
 impl<'a, T> core::marker::UnsafeUnpin for rsbinder_fmq::Regions<'a, T>
 impl<'a, T> core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::Regions<'a, T> where T: core::panic::unwind_safe::RefUnwindSafe
 impl<'a, T> !core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::Regions<'a, T>
+#[non_exhaustive] pub struct rsbinder_fmq::UnsyncCreate
+pub rsbinder_fmq::UnsyncCreate::read_only_readers: bool
+impl rsbinder_fmq::UnsyncCreate
+pub const fn rsbinder_fmq::UnsyncCreate::new() -> Self
+pub const fn rsbinder_fmq::UnsyncCreate::read_only_readers(self, bool) -> Self
+impl core::clone::Clone for rsbinder_fmq::UnsyncCreate
+pub fn rsbinder_fmq::UnsyncCreate::clone(&self) -> rsbinder_fmq::UnsyncCreate
+impl core::cmp::Eq for rsbinder_fmq::UnsyncCreate
+impl core::cmp::PartialEq for rsbinder_fmq::UnsyncCreate
+pub fn rsbinder_fmq::UnsyncCreate::eq(&self, &rsbinder_fmq::UnsyncCreate) -> bool
+impl core::default::Default for rsbinder_fmq::UnsyncCreate
+pub fn rsbinder_fmq::UnsyncCreate::default() -> rsbinder_fmq::UnsyncCreate
+impl core::fmt::Debug for rsbinder_fmq::UnsyncCreate
+pub fn rsbinder_fmq::UnsyncCreate::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for rsbinder_fmq::UnsyncCreate
+impl core::marker::StructuralPartialEq for rsbinder_fmq::UnsyncCreate
+impl core::marker::Freeze for rsbinder_fmq::UnsyncCreate
+impl core::marker::Send for rsbinder_fmq::UnsyncCreate
+impl core::marker::Sync for rsbinder_fmq::UnsyncCreate
+impl core::marker::Unpin for rsbinder_fmq::UnsyncCreate
+impl core::marker::UnsafeUnpin for rsbinder_fmq::UnsyncCreate
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::UnsyncCreate
+impl core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::UnsyncCreate
+pub struct rsbinder_fmq::UnsyncReader<T: rsbinder_fmq::Element>
+impl<T: rsbinder_fmq::Element> rsbinder_fmq::UnsyncReader<T>
+pub fn rsbinder_fmq::UnsyncReader<T>::attach(&rsbinder_fmq::Descriptor, &rsbinder_fmq::AttachPolicy, rsbinder_fmq::UnsyncStart) -> rsbinder_fmq::Result<Self>
+pub fn rsbinder_fmq::UnsyncReader<T>::available_to_read(&self) -> rsbinder_fmq::Result<usize>
+pub fn rsbinder_fmq::UnsyncReader<T>::capacity(&self) -> usize
+pub fn rsbinder_fmq::UnsyncReader<T>::quantum(&self) -> usize
+pub fn rsbinder_fmq::UnsyncReader<T>::read(&mut self, &mut [T]) -> rsbinder_fmq::Result<rsbinder_fmq::UnsyncRead>
+pub fn rsbinder_fmq::UnsyncReader<T>::read_latest(&mut self, &mut [T]) -> rsbinder_fmq::Result<usize>
+impl<T: rsbinder_fmq::Element> core::fmt::Debug for rsbinder_fmq::UnsyncReader<T>
+pub fn rsbinder_fmq::UnsyncReader<T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<T: rsbinder_fmq::Element> core::marker::Send for rsbinder_fmq::UnsyncReader<T>
+impl<T> !core::marker::Freeze for rsbinder_fmq::UnsyncReader<T>
+impl<T> !core::marker::Sync for rsbinder_fmq::UnsyncReader<T>
+impl<T> core::marker::Unpin for rsbinder_fmq::UnsyncReader<T> where T: core::marker::Unpin
+impl<T> core::marker::UnsafeUnpin for rsbinder_fmq::UnsyncReader<T>
+impl<T> !core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::UnsyncReader<T>
+impl<T> core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::UnsyncReader<T> where T: core::panic::unwind_safe::UnwindSafe
+pub struct rsbinder_fmq::UnsyncWriter<T: rsbinder_fmq::Element>
+impl<T: rsbinder_fmq::Element> rsbinder_fmq::UnsyncWriter<T>
+pub fn rsbinder_fmq::UnsyncWriter<T>::begin_write(&mut self, usize) -> rsbinder_fmq::Result<rsbinder_fmq::Regions<'_, T>>
+pub fn rsbinder_fmq::UnsyncWriter<T>::capacity(&self) -> usize
+pub fn rsbinder_fmq::UnsyncWriter<T>::commit_write(&mut self, usize) -> rsbinder_fmq::Result<()>
+pub fn rsbinder_fmq::UnsyncWriter<T>::create(usize, &rsbinder_fmq::UnsyncCreate) -> rsbinder_fmq::Result<Self>
+pub fn rsbinder_fmq::UnsyncWriter<T>::descriptor(&self) -> rsbinder_fmq::Result<rsbinder_fmq::Descriptor>
+pub fn rsbinder_fmq::UnsyncWriter<T>::quantum(&self) -> usize
+pub fn rsbinder_fmq::UnsyncWriter<T>::write(&mut self, &[T]) -> rsbinder_fmq::Result<()>
+pub fn rsbinder_fmq::UnsyncWriter<T>::written(&self) -> u64
+impl<T: rsbinder_fmq::Element> core::fmt::Debug for rsbinder_fmq::UnsyncWriter<T>
+pub fn rsbinder_fmq::UnsyncWriter<T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<T: rsbinder_fmq::Element> core::marker::Send for rsbinder_fmq::UnsyncWriter<T>
+impl<T> core::marker::Freeze for rsbinder_fmq::UnsyncWriter<T>
+impl<T> !core::marker::Sync for rsbinder_fmq::UnsyncWriter<T>
+impl<T> core::marker::Unpin for rsbinder_fmq::UnsyncWriter<T> where T: core::marker::Unpin
+impl<T> core::marker::UnsafeUnpin for rsbinder_fmq::UnsyncWriter<T>
+impl<T> !core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::UnsyncWriter<T>
+impl<T> core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::UnsyncWriter<T> where T: core::panic::unwind_safe::UnwindSafe
 pub const rsbinder_fmq::NOT_EMPTY: u32
 pub const rsbinder_fmq::NOT_FULL: u32
 pub unsafe trait rsbinder_fmq::Element: core::marker::Copy + 'static

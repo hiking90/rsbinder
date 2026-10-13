@@ -12,9 +12,13 @@ use crate::shm;
 /// `MQFlavor` — which reader/writer discipline the queue follows.
 ///
 /// The AIDL `MQDescriptor.flags` field carries this value ([`Flavor::flags`]).
-/// Only [`SynchronizedReadWrite`](Flavor::SynchronizedReadWrite) can be
-/// attached; the unsynchronized flavor is modelled so a descriptor round-trips
-/// without loss.
+/// Each flavor has its own types:
+/// [`MessageQueue`](crate::MessageQueue) for
+/// [`SynchronizedReadWrite`](Flavor::SynchronizedReadWrite),
+/// [`UnsyncWriter`](crate::UnsyncWriter) and
+/// [`UnsyncReader`](crate::UnsyncReader) for
+/// [`UnsynchronizedWrite`](Flavor::UnsynchronizedWrite). Attaching a
+/// descriptor of the other flavor is `BadValue`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Flavor {
     /// One reader, one writer; a full queue refuses the write.
@@ -64,7 +68,9 @@ pub struct Grantor {
 /// fds travel.
 ///
 /// The grantor at each index has a fixed role, as in libfmq
-/// (`MQDescriptorBase.h`): [`READ_COUNTER`](Self::READ_COUNTER),
+/// (`MQDescriptorBase.h`): [`READ_COUNTER`](Self::READ_COUNTER) — in the
+/// unsynchronized flavor the same grantor is
+/// [`WRITE_REGION_END`](Self::WRITE_REGION_END) —
 /// [`WRITE_COUNTER`](Self::WRITE_COUNTER), [`DATA`](Self::DATA) and, when
 /// present, [`EVENT_FLAG_WORD`](Self::EVENT_FLAG_WORD). Any grantor past
 /// those four is carried but not interpreted.
@@ -86,6 +92,11 @@ pub struct Descriptor {
 impl Descriptor {
     /// Grantor index of the reader's 8-byte counter (bytes consumed so far).
     pub const READ_COUNTER: usize = 0;
+    /// The same grantor in the unsynchronized flavor, where each reader
+    /// keeps its read counter to itself: the writer's 8-byte "write region
+    /// end", the counter value its reserved write runs up to (libfmq
+    /// `WRITEREGIONENDPTRPOS`, from `android-16.0.0_r4`).
+    pub const WRITE_REGION_END: usize = 0;
     /// Grantor index of the writer's 8-byte counter (bytes produced so far).
     pub const WRITE_COUNTER: usize = 1;
     /// Grantor index of the ring itself.
@@ -214,9 +225,13 @@ pub(crate) fn validate(
     desc: &Descriptor,
     quantum: usize,
     policy: &AttachPolicy,
+    flavor: Flavor,
 ) -> Result<Geometry> {
-    if desc.flavor != Flavor::SynchronizedReadWrite {
-        return Err(Error::BadValue("only the synchronized flavor is supported"));
+    if desc.flavor != flavor {
+        return Err(Error::BadValue(match flavor {
+            Flavor::SynchronizedReadWrite => "descriptor is not of the synchronized flavor",
+            Flavor::UnsynchronizedWrite => "descriptor is not of the unsynchronized flavor",
+        }));
     }
     if quantum == 0 || desc.quantum as usize != quantum {
         return Err(Error::BadValue("quantum differs from the element size"));

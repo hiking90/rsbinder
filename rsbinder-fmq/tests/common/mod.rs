@@ -109,6 +109,25 @@ pub fn sock_path(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("rsbinder-fmq-{}-{tag}.sock", std::process::id()))
 }
 
+/// The path of a bound socket, removed on drop so that a failed assertion leaves no file.
+pub struct SockFile(pub PathBuf);
+
+impl SockFile {
+    /// Bind the socket of `tag` in place of whatever file an earlier run left there.
+    pub fn bind(tag: &str) -> (Self, UnixListener) {
+        let path = Self(sock_path(tag));
+        let _ = std::fs::remove_file(&path.0);
+        let listener = UnixListener::bind(&path.0).expect("bind");
+        (path, listener)
+    }
+}
+
+impl Drop for SockFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 pub fn connect_with_retry(path: &PathBuf) -> UnixStream {
     let started = Instant::now();
     loop {
@@ -160,7 +179,14 @@ pub fn spawn(cmd: &mut Command) -> Child {
 }
 
 /// The peer's stdout once it exits; past the deadline it is killed and the test panics.
-pub fn finish(mut child: Child) -> String {
+pub fn finish(child: Child) -> String {
+    let (status, out) = finish_with_status(child);
+    assert!(status.success(), "peer failed: {status}\n{out}");
+    out
+}
+
+/// `finish` for a peer that is expected to fail: its exit status and its stdout.
+pub fn finish_with_status(mut child: Child) -> (std::process::ExitStatus, String) {
     use std::io::Read;
     let started = Instant::now();
     let mut stdout = child.stdout.take().expect("piped stdout");
@@ -171,11 +197,7 @@ pub fn finish(mut child: Child) -> String {
     });
     loop {
         match child.try_wait().expect("try_wait") {
-            Some(status) => {
-                let out = reader.join().expect("stdout reader");
-                assert!(status.success(), "peer failed: {status}\n{out}");
-                return out;
-            }
+            Some(status) => return (status, reader.join().expect("stdout reader")),
             None if started.elapsed() > Duration::from_secs(30) => {
                 let _ = child.kill();
                 let _ = child.wait();
