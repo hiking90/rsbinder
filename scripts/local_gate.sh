@@ -571,15 +571,10 @@ tier_stage3() {
         run "cargo ndk build example-hello ($triple)" cargo ndk -t "$triple" --platform 29 build -p example-hello --bins
     fi
     local ndk_api=$((sdk < 35 ? sdk : 35))
+    # One `rpc` build of stream_probe serves stream_ac as well, when both are queued.
+    local probe_rpc=
     if grep -qx stream_rpc_selinux_stage3 <<<"$(printf '%s\n' "${queue[@]}")"; then
-        # One `rpc` build of stream_probe serves stream_ac as well.
-        run "cargo ndk build stream_probe, rpc ($triple)" cargo ndk -t "$triple" \
-            --platform "$ndk_api" build -p tests --features rpc --bin stream_probe
-        run "cargo ndk build stream_rpc test ($triple)" cargo ndk -t "$triple" \
-            --platform "$ndk_api" test -p tests --features rpc --test stream_rpc --no-run
-    elif grep -qx stream_ac <<<"$(printf '%s\n' "${queue[@]}")"; then
-        run "cargo ndk build stream_probe ($triple)" cargo ndk -t "$triple" \
-            --platform "$ndk_api" build -p tests --bin stream_probe
+        probe_rpc=1
     fi
 
     trap 'stage3_restore; stop_service; stop_hub' EXIT
@@ -587,10 +582,24 @@ tier_stage3() {
         restore_enforce
         local script
         script=$(stage3_script "$name")
+        # The two stream scripts push debug/stream_probe and build nothing themselves. It is
+        # built right before each: other scripts build `tests` into the same directory.
         case "$name" in
             lazy_service_stage3) run "run_$name" timeout 1800 bash "$script" "$SERIAL" ;;
-            stream_ac) run "run_stream_ac --adb" timeout 1800 bash "$script" --adb -s "$SERIAL" --target "$triple" ;;
-            stream_rpc_selinux_stage3) run "run_$name" timeout 1800 bash "$script" -s "$SERIAL" --target "$triple" ;;
+            stream_ac)
+                # Unquoted on purpose: two words, or none.
+                # shellcheck disable=SC2086
+                run "cargo ndk build stream_probe for stream_ac ($triple)" cargo ndk -t "$triple" \
+                    --platform "$ndk_api" build -p tests ${probe_rpc:+--features rpc} --bin stream_probe
+                run "run_stream_ac --adb" timeout 1800 bash "$script" --adb -s "$SERIAL" --target "$triple"
+                ;;
+            stream_rpc_selinux_stage3)
+                run "cargo ndk build stream_probe, rpc ($triple)" cargo ndk -t "$triple" \
+                    --platform "$ndk_api" build -p tests --features rpc --bin stream_probe
+                run "cargo ndk build stream_rpc test ($triple)" cargo ndk -t "$triple" \
+                    --platform "$ndk_api" test -p tests --features rpc --test stream_rpc --no-run
+                run "run_$name" timeout 1800 bash "$script" -s "$SERIAL" --target "$triple"
+                ;;
             *) run "run_$name" timeout 1800 bash "$script" -s "$SERIAL" ;;
         esac
     done
