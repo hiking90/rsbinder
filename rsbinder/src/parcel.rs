@@ -2837,15 +2837,12 @@ mod tests {
     #[should_panic(expected = "can't support as_mut_slice()")]
     fn parcel_data_slice_refuses_as_mut_slice() {
         // A `Slice` stands for the read-only kernel mapping: reads alias it, writes panic.
-        let leaked: &'static mut [u8] = Box::leak(vec![0u8, 1, 2, 3].into_boxed_slice());
-        let ptr = leaked.as_mut_ptr();
-        let len = leaked.len();
-        // SAFETY: `Box::leak` yields a valid, exclusive, `'static` buffer of `len` bytes.
-        let mut pd: super::ParcelData<u8> =
-            unsafe { super::ParcelData::from_raw_parts_mut(ptr, len) };
+        let leaked: &'static [u8] = Box::leak(vec![0u8, 1, 2, 3].into_boxed_slice());
+        let ptr = leaked.as_ptr();
+        let mut pd: super::ParcelData<u8> = super::ParcelData::Slice(leaked);
 
         assert_eq!(pd.as_slice(), &[0u8, 1, 2, 3][..]);
-        assert_eq!(pd.as_ptr(), ptr as *const u8);
+        assert_eq!(pd.as_ptr(), ptr);
         let _ = pd.as_mut_slice();
     }
 
@@ -2903,10 +2900,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "can't support write_at()")]
     fn parcel_data_slice_refuses_write_at() {
-        let leaked: &'static mut [u8] = Box::leak(vec![0u8; 4].into_boxed_slice());
-        // SAFETY: `Box::leak` yields a valid, exclusive, `'static` buffer of 4 bytes.
-        let mut pd: super::ParcelData<u8> =
-            unsafe { super::ParcelData::from_raw_parts_mut(leaked.as_mut_ptr(), 4) };
+        let leaked: &'static [u8] = Box::leak(vec![0u8; 4].into_boxed_slice());
+        let mut pd: super::ParcelData<u8> = super::ParcelData::Slice(leaked);
         pd.write_at(0, &[1], 0);
     }
 

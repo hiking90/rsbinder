@@ -1394,7 +1394,7 @@ impl<T: Deserialize> Consumer<T> {
                 hook();
             }
             if outranks {
-                *end = Some(status.clone());
+                return Step::End(end.insert(status).clone());
             }
             // What was recorded is the end, as the empty-ring branch reports it.
             return Step::End(end.clone().unwrap_or(status));

@@ -317,7 +317,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::os::raw::c_void;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{self, Arc, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::Duration;
@@ -668,7 +668,7 @@ pub struct ProcessState {
     max_threads: u32,
     driver_name: PathBuf,
     driver: Arc<File>,
-    mmap: RwLock<MemoryMap>,
+    mmap: MemoryMap,
     context_manager: RwLock<Option<SIBinder>>,
     handle_to_proxy: RwLock<HashMap<u32, CacheEntry>>,
     /// Source of `HandlePin::generation`, bumped once per case-(a) pin.
@@ -688,7 +688,7 @@ pub struct ProcessState {
     /// Monotonic u64 id allocator for `published_natives`.
     next_native_id: AtomicU64,
     disable_background_scheduling: AtomicBool,
-    call_restriction: RwLock<CallRestriction>,
+    call_restriction: AtomicU8,
     thread_pool_started: AtomicBool,
     thread_pool_seq: AtomicUsize,
     /// `BR_SPAWN_LOOPER` spawns, bumped asynchronously by workers; not tied to any one caller.
@@ -734,22 +734,17 @@ impl ProcessState {
     /// `ProcessState::setCallRestriction` aborts when the calling thread
     /// already has an `IPCThreadState`; rsbinder updates that thread instead.
     pub fn set_call_restriction(&self, call_restriction: CallRestriction) {
-        {
-            let mut self_call_restriction = self
-                .call_restriction
-                .write()
-                .expect("Call restriction lock poisoned");
-            *self_call_restriction = call_restriction;
-        }
-        // After the write guard drops: a first-time `ThreadState::new` reads this lock.
+        self.call_restriction
+            .store(call_restriction as u8, Ordering::Release);
         thread_state::set_call_restriction(call_restriction);
     }
 
     pub(crate) fn call_restriction(&self) -> CallRestriction {
-        *self
-            .call_restriction
-            .read()
-            .expect("Call restriction lock poisoned")
+        match self.call_restriction.load(Ordering::Acquire) {
+            0 => CallRestriction::None,
+            1 => CallRestriction::ErrorIfNotOneway,
+            _ => CallRestriction::FatalIfNotOneway,
+        }
     }
 
     /// Log what `max_threads` means; as in AOSP, it reaches `BINDER_SET_MAX_THREADS` unchanged.
@@ -799,27 +794,25 @@ impl ProcessState {
         let features_dir = features_dir(&driver_name);
 
         // SAFETY: live binder fd, `vm_size > 0`, null addr, read-only; unmapped once in Drop.
-        let mmap = unsafe {
-            let vm_start = rustix::mm::mmap(
+        let vm_start = unsafe {
+            rustix::mm::mmap(
                 std::ptr::null_mut(),
                 vm_size,
                 rustix::mm::ProtFlags::READ,
                 rustix::mm::MapFlags::PRIVATE | rustix::mm::MapFlags::NORESERVE,
                 &driver,
                 0,
-            )?;
-
-            (vm_start, vm_size)
-        };
+            )
+        }?;
 
         Ok(ProcessState {
             max_threads,
             driver_name,
             driver: driver.into(),
-            mmap: RwLock::new(MemoryMap {
-                ptr: mmap.0,
-                size: mmap.1,
-            }),
+            mmap: MemoryMap {
+                ptr: vm_start,
+                size: vm_size,
+            },
             context_manager: RwLock::new(None),
             handle_to_proxy: RwLock::new(HashMap::new()),
             next_generation: AtomicU64::new(1),
@@ -831,7 +824,7 @@ impl ProcessState {
             published_natives: RwLock::new(HashMap::new()),
             next_native_id: AtomicU64::new(1),
             disable_background_scheduling: AtomicBool::new(false),
-            call_restriction: RwLock::new(CallRestriction::None),
+            call_restriction: AtomicU8::new(CallRestriction::None as u8),
             thread_pool_started: AtomicBool::new(false),
             thread_pool_seq: AtomicUsize::new(1),
             kernel_started_threads: AtomicUsize::new(0),
@@ -1097,7 +1090,7 @@ impl ProcessState {
         &self,
         handle: u32,
         stability: Stability,
-        ready: SlowPathReady,
+        mut ready: SlowPathReady,
     ) -> Result<Option<SIBinder>> {
         // Declared first so it drops after the lock: watermark callbacks may re-enter the cache.
         let _proxy_count_defer = crate::proxy_count::CallbackDeferGuard::new();
@@ -1116,11 +1109,11 @@ impl ProcessState {
         let entry_descriptor = entry.map(|e| e.descriptor.clone());
         entry_pin = entry.and_then(|e| e.pin.upgrade());
 
-        let (pin, descriptor) = match (&ready, &entry_pin, entry_descriptor) {
+        let (pin, descriptor) = match (&mut ready, &entry_pin, entry_descriptor) {
             // Case (b), or another thread's commit during P2: revive the entry on its live pin.
             (_, Some(pin), Some(descriptor)) => (pin, descriptor),
             // Standard case (a), replacing an entry whose pin is in its `Drop`, if any.
-            (SlowPathReady::CaseA { pin, descriptor }, _, _) => (pin, descriptor.clone()),
+            (SlowPathReady::CaseA { pin, descriptor }, _, _) => (&*pin, std::mem::take(descriptor)),
             // An obituary removed the entry, or replaced it with a dying pin: redo P1.
             (SlowPathReady::CaseB { .. }, _, _) => return Ok(None),
         };
@@ -1648,14 +1641,13 @@ impl ProcessState {
     /// process was initialized by [`init`](Self::init) /
     /// [`init_default`](Self::init_default).
     pub fn mmap_size(&self) -> usize {
-        self.mmap.read().unwrap_or_else(|e| e.into_inner()).size
+        self.mmap.size
     }
 
     /// Addresses of the receive mapping; bounds the `calling_sid` copy ("Receive mapping").
     pub(crate) fn mapped_range(&self) -> std::ops::Range<usize> {
-        let mmap = self.mmap.read().unwrap_or_else(|e| e.into_inner());
-        let start = mmap.ptr as usize;
-        start..start + mmap.size
+        let start = self.mmap.ptr as usize;
+        start..start + self.mmap.size
     }
 
     /// Start the binder thread pool: spawn one worker now and **enable
@@ -1721,8 +1713,7 @@ impl ProcessState {
             .driver_name
             .file_name()
             .and_then(|name| name.to_str())
-            .map(|name| name.to_owned())
-            .unwrap_or("BINDER".to_owned());
+            .unwrap_or("BINDER");
         format!("{driver_name}:{pid}_{seq:X}")
     }
 
@@ -1822,13 +1813,9 @@ pub(crate) fn selinux_available() -> bool {
 
 impl Drop for ProcessState {
     fn drop(self: &mut ProcessState) {
-        // No panic here (init-race losers drop too); a poisoned POD `ptr`/`size` is still valid.
-        let mmap = self.mmap.read().unwrap_or_else(|e| e.into_inner());
         // SAFETY: `inner_init`'s own live mapping, unmapped once here; nothing outlives `self`.
-        unsafe {
-            if let Err(e) = rustix::mm::munmap(mmap.ptr, mmap.size) {
-                log::error!("ProcessState::drop: munmap failed: {e}");
-            }
+        if let Err(e) = unsafe { rustix::mm::munmap(self.mmap.ptr, self.mmap.size) } {
+            log::error!("ProcessState::drop: munmap failed: {e}");
         }
     }
 }

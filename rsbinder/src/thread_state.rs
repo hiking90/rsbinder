@@ -294,7 +294,7 @@
 
 use log::error;
 use std::backtrace::Backtrace;
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::VecDeque;
 use std::ffi::CString;
 use std::fmt::Debug;
@@ -316,7 +316,7 @@ thread_local! {
     static THREAD_STATE: RefCell<ThreadState> = RefCell::new(ThreadState::new());
     static BINDER_DEREFS: RefCell<BinderDerefs> = RefCell::new(BinderDerefs::new());
     // Apart from `THREAD_STATE`: `ThreadState`'s own Drop could not reach `THREAD_STATE.with`.
-    static THREAD_EXIT_GUARD: RefCell<Option<ThreadExitGuard>> = const { RefCell::new(None) };
+    static THREAD_EXIT_GUARD: OnceCell<ThreadExitGuard> = const { OnceCell::new() };
 }
 
 /// AOSP `threadDestructor`: flush, then `BINDER_THREAD_EXIT`; see module doc "Thread exit".
@@ -341,12 +341,9 @@ impl Drop for ThreadExitGuard {
 /// Arms [`ThreadExitGuard`] once per thread, from `talk_with_driver` (every round trip).
 fn ensure_thread_exit_guard(driver: &Arc<File>) {
     let _ = THREAD_EXIT_GUARD.try_with(|g| {
-        let mut g = g.borrow_mut();
-        if g.is_none() {
-            *g = Some(ThreadExitGuard {
-                driver: Arc::clone(driver),
-            });
-        }
+        g.get_or_init(|| ThreadExitGuard {
+            driver: Arc::clone(driver),
+        });
     });
 }
 
@@ -673,21 +670,20 @@ fn copy_c_string(addr: usize, end: usize) -> Option<CString> {
     let mut at = addr;
     while at < end {
         let want = (page - at % page).min(end - at);
-        bytes.reserve(want);
         let filled = bytes.len();
+        bytes.resize(filled + want, 0);
         let local = libc::iovec {
-            iov_base: bytes.spare_capacity_mut().as_mut_ptr().cast(),
+            iov_base: bytes[filled..].as_mut_ptr().cast(),
             iov_len: want,
         };
         let remote = libc::iovec {
             iov_base: at as *mut libc::c_void,
             iov_len: want,
         };
-        // SAFETY: `local` is `want` reserved spare bytes; only the kernel reads `remote`.
+        // SAFETY: `local` is the `want` bytes just appended; only the kernel reads `remote`.
         let got = unsafe { libc::process_vm_readv(pid, &local, 1, &remote, 1, 0) };
         let got = usize::try_from(got).ok().filter(|&got| got <= want)?;
-        // SAFETY: the kernel initialized the first `got` (<= `want`) bytes of the spare capacity.
-        unsafe { bytes.set_len(filled + got) };
+        bytes.truncate(filled + got);
         if let Some(nul) = bytes[filled..].iter().position(|&byte| byte == 0) {
             bytes.truncate(filled + nul);
             return CString::new(bytes).ok();

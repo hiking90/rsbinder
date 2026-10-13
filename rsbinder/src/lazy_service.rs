@@ -148,8 +148,6 @@ impl Registry for HubRegistry {
 /// One registered name → binder pair plus its last `onClients` state.
 #[derive(Clone)]
 struct RegisteredService {
-    /// Service name as registered with the service manager.
-    name: String,
     /// The binder being lazily managed.
     binder: SIBinder,
     /// Last `onClients(name, _)` value; AOSP `ServiceInfo::clients` (LazyServiceRegistrar.cpp:53).
@@ -215,9 +213,9 @@ impl Shared {
     fn name_of(&self, binder: &SIBinder) -> Option<String> {
         self.lock()
             .services
-            .values()
-            .find(|e| e.binder == *binder)
-            .map(|e| e.name.clone())
+            .iter()
+            .find(|(_, e)| e.binder == *binder)
+            .map(|(name, _)| name.clone())
     }
 
     fn on_clients_binder(&self, binder: &SIBinder, has_clients: bool) {
@@ -320,9 +318,9 @@ impl Shared {
             let inner = self.lock();
             inner
                 .services
-                .values()
-                .filter(|e| e.registered)
-                .map(|e| (e.name.clone(), e.binder.clone()))
+                .iter()
+                .filter(|(_, e)| e.registered)
+                .map(|(name, e)| (name.clone(), e.binder.clone()))
                 .collect()
         };
 
@@ -373,9 +371,9 @@ impl Shared {
             let inner = self.lock();
             inner
                 .services
-                .values()
-                .filter(|e| !e.registered)
-                .map(|e| (e.name.clone(), e.binder.clone()))
+                .iter()
+                .filter(|(_, e)| !e.registered)
+                .map(|(name, e)| (name.clone(), e.binder.clone()))
                 .collect()
         };
 
@@ -513,13 +511,12 @@ impl LazyServiceRegistrar {
         // Published before the round trips: `onClients` can land on a pool thread meanwhile.
         let previous = {
             let mut inner = self.shared.lock();
-            let previous = inner.services.get(name).cloned();
-            inner.services.insert(
+            let has_clients = inner.services.get(name).is_some_and(|e| e.has_clients);
+            let previous = inner.services.insert(
                 name.to_string(),
                 RegisteredService {
-                    name: name.to_string(),
                     binder: binder.clone(),
-                    has_clients: previous.as_ref().is_some_and(|e| e.has_clients),
+                    has_clients,
                     registered: true,
                 },
             );
@@ -642,8 +639,8 @@ impl LazyServiceRegistrar {
         let inner = self.shared.lock();
         inner
             .services
-            .values()
-            .map(|e| (e.name.clone(), e.has_clients, e.registered))
+            .iter()
+            .map(|(name, e)| (name.clone(), e.has_clients, e.registered))
             .collect()
     }
 

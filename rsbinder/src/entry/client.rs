@@ -243,7 +243,7 @@ pub(crate) fn open_staged(
         let cfg = rpc_setup(&uri, &o).map_err(setup)?;
         let session = rpc_connect(cfg, &uri, &o).map_err(|code| (OpenStage::Connect, code))?;
         return Ok(Client {
-            endpoint: uri.endpoint.clone(),
+            endpoint: uri.endpoint,
             inner: Inner::Rpc(session),
         });
     }
@@ -291,7 +291,7 @@ fn kernel_open(uri: Uri, o: ClientOptions) -> Result<Client> {
             super::server::kernel_init(driver, k.threads(), mmap_size)?;
             crate::ProcessState::start_thread_pool();
             Ok(Client {
-                endpoint: uri.endpoint.clone(),
+                endpoint: uri.endpoint,
                 inner: Inner::Kernel,
             })
         }
@@ -498,7 +498,7 @@ fn client_config<'a>(
                 })?;
                 let name = o.tls_server_name.as_deref().unwrap_or(host);
                 // `TlsTransport::connect_stream`'s refusal (same code), made before connecting.
-                if rustls::pki_types::ServerName::try_from(name.to_string()).is_err() {
+                if rustls::pki_types::ServerName::try_from(name).is_err() {
                     log::error!("rsbinder::Client::open: invalid TLS server name {name:?}");
                     return Err(StatusCode::RpcError);
                 }

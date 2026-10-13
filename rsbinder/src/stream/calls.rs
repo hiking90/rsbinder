@@ -518,7 +518,7 @@ struct TerminatorInTransit {
     service_specific: i32,
     message: Option<String>,
     /// The send's result, wherever made: the pool's own answer says only whether the task ran.
-    outcome: Arc<Mutex<Option<Result<()>>>>,
+    outcome: Arc<std::sync::OnceLock<Result<()>>>,
     sent: bool,
 }
 
@@ -539,7 +539,7 @@ impl TerminatorInTransit {
         if let Err(e) = sent {
             log::warn!("stream: the terminator could not be delivered: {e:?}");
         }
-        *self.outcome.lock().unwrap_or_else(|e| e.into_inner()) = Some(sent);
+        let _ = self.outcome.set(sent);
     }
 }
 
@@ -862,7 +862,7 @@ impl<T: Serialize + ?Sized> Producer<T> {
                 }
                 _ => (exception, service_specific, message),
             };
-        let outcome = Arc::new(Mutex::new(None));
+        let outcome = Arc::new(std::sync::OnceLock::new());
         let terminator = TerminatorInTransit {
             peer: self.peer.clone(),
             exception,
@@ -879,7 +879,7 @@ impl<T: Serialize + ?Sized> Producer<T> {
         })
         .await;
         // The token's answer first: if the pool never ran it, its `Drop` still sent the end.
-        let sent = outcome.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let sent = outcome.get().copied();
         let ended = sent.unwrap_or(pooled);
         match failed {
             Some(e) if !canceled => Err(e),
@@ -1520,9 +1520,9 @@ impl<T: Deserialize> Consumer<T> {
     #[cfg(feature = "tokio")]
     pub(super) async fn recv_async(&mut self) -> Option<BinderResult<T>> {
         self.retry_armed = true;
+        let stream = self.stream.clone();
         loop {
             // Created before looking, so a batch landing before the await is not missed.
-            let stream = self.stream.clone();
             let notified = stream.notify.notified();
             if let Some(done) = self.advance_async().await {
                 return done;
@@ -2261,7 +2261,7 @@ mod tests {
                 "test",
             )
             .expect("a local sink");
-            let outcome = Arc::new(Mutex::new(None));
+            let outcome = Arc::new(std::sync::OnceLock::new());
             let terminator = TerminatorInTransit {
                 peer: Arc::new(peer),
                 exception: ExceptionCode::None as i32,
@@ -2279,7 +2279,7 @@ mod tests {
             }
             assert_eq!(recorded.ends.load(Ordering::SeqCst), 1, "{way:?}");
             assert_eq!(
-                outcome.lock().unwrap_or_else(|e| e.into_inner()).take(),
+                outcome.get().copied(),
                 Some(Ok(())),
                 "{way:?}: the caller is told what the send came to, not where it ran"
             );

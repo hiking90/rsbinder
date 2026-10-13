@@ -62,7 +62,7 @@
 //! the kernel `ProxyHandle::send_obituary` state machine minus the
 //! kernel-only `BC_CLEAR_DEATH_NOTIFICATION` / `flush_commands`.
 //! `obituary_sent` is set once the obituary is dispatched and is touched only
-//! under the `recipients` write lock (kernel `mLock` parity), which supplies
+//! under the `recipients` lock (kernel `mLock` parity), which supplies
 //! the happens-before, hence `Relaxed` throughout. A second call (a serve
 //! loop ending after a transact already observed the close) sees it set and
 //! returns.
@@ -70,7 +70,7 @@
 use std::any::Any;
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{self, Arc, OnceLock, RwLock};
+use std::sync::{self, Arc, Mutex, OnceLock};
 
 use crate::binder::{DeathRecipient, IBinder, SIBinder, Stability, Transactable, WIBinder};
 use crate::binder::{TransactionCode, TransactionFlags};
@@ -87,9 +87,9 @@ pub struct RpcProxy {
     descriptor: OnceLock<String>,
     /// Strong, as AOSP `sp<RpcSession>`: a proxy keeps its session alive; see module doc "Session".
     session: Arc<RpcSessionInner>,
-    /// Set once the obituary is dispatched; only under the `recipients` write lock, so `Relaxed`.
+    /// Set once the obituary is dispatched; only under the `recipients` lock, so `Relaxed`.
     obituary_sent: AtomicBool,
-    recipients: RwLock<Vec<sync::Weak<dyn DeathRecipient>>>,
+    recipients: Mutex<Vec<sync::Weak<dyn DeathRecipient>>>,
 }
 
 impl RpcProxy {
@@ -104,7 +104,7 @@ impl RpcProxy {
             descriptor: OnceLock::new(),
             session,
             obituary_sent: AtomicBool::new(false),
-            recipients: RwLock::new(Vec::new()),
+            recipients: Mutex::new(Vec::new()),
         }
     }
 
@@ -112,7 +112,7 @@ impl RpcProxy {
     pub(crate) fn send_obituary(&self, who: &WIBinder) {
         let snapshot: Vec<sync::Weak<dyn DeathRecipient>> = {
             // `obituary_sent` is touched only under this lock; poison logs, never panics.
-            let mut recipients = match self.recipients.write() {
+            let mut recipients = match self.recipients.lock() {
                 Ok(g) => g,
                 Err(_) => {
                     log::error!(
@@ -313,7 +313,7 @@ impl IBinder for RpcProxy {
             return Err(StatusCode::InvalidOperation);
         }
         // Check `obituary_sent` under the lock, as AOSP `linkToDeath` checks `mObitsSent`.
-        let mut recipients = self.recipients.write().map_err(|_| {
+        let mut recipients = self.recipients.lock().map_err(|_| {
             // Poison = a prior panic on the death path; `DeadObject` lets the caller reconnect.
             StatusCode::DeadObject
         })?;
@@ -329,7 +329,7 @@ impl IBinder for RpcProxy {
     /// — kernel `removeAt(i)` parity, *not* `retain`, so a duplicate
     /// registration keeps its remaining subscriptions).
     fn unlink_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()> {
-        let mut recipients = self.recipients.write().map_err(|_| {
+        let mut recipients = self.recipients.lock().map_err(|_| {
             // Poison = a prior panic on the death path; `DeadObject` lets the caller reconnect.
             StatusCode::DeadObject
         })?;

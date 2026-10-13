@@ -3285,8 +3285,9 @@ impl RpcSessionInner {
         use super::wire_android13::TYPE_NATIVE_FILE_DESCRIPTOR;
         const TYPE_BINDER: i32 = 1;
         let mut result = Ok(());
-        let positions = p.rpc_object_positions().to_vec();
-        for pos in positions {
+        // By index: reading a binder never changes the table, and `read_binder` looks it up.
+        for i in 0..p.rpc_object_positions().len() {
+            let pos = p.rpc_object_positions()[i];
             p.set_data_position(pos as usize);
             // A skipped position's `timesSent` would stay with the peer for the session's life.
             let entered = match p.read::<i32>() {
@@ -3829,7 +3830,7 @@ impl RpcSessionInner {
         let oneway = (t.flags & FLAG_ONEWAY) != 0;
         if t.address.is_zero() {
             // Zero-address specials (GET_ROOT etc.): no caller identity, no user handler.
-            return self.serve_special(&t, oneway);
+            return self.serve_special(t, oneway);
         }
         // One `Arc` (Plan 2-16): each oneway drain entry installs it with a refcount bump.
         let peer = Arc::new(peer);
@@ -4112,7 +4113,7 @@ impl RpcSessionInner {
     }
 
     /// Zero-address specials: AOSP `GET_ROOT`, `GET_MAX_THREADS`, `GET_SESSION_ID`; `GET_FD_MODE`.
-    fn serve_special(&self, t: &WireTransaction, oneway: bool) -> Result<()> {
+    fn serve_special(&self, t: WireTransaction, oneway: bool) -> Result<()> {
         if oneway {
             // Special transactions are never oneway.
             return Ok(());
@@ -4160,7 +4161,7 @@ impl RpcSessionInner {
                     reply.write(&1i32)?;
                     return self.send_reply(0, reply.rpc_data_bytes(), &[], &[]);
                 }
-                let mut req = Parcel::from_vec(t.data.clone());
+                let mut req = Parcel::from_vec(t.data);
                 req.set_data_position(0);
                 // A malformed body defaults to "no FD support", but is logged.
                 let want_unix = match req.read::<i32>() {
@@ -4758,21 +4759,23 @@ impl RpcSession {
             .expect("server_session_id poisoned")
     }
 
-    /// The id an attach on this session must echo: the server-minted one (cached) for a client.
-    fn own_attach_id(&self) -> Result<Vec<u8>> {
+    /// Whether `session_id` is the id an attach on this session must echo: the server-minted
+    /// one (cached) for a client.
+    fn is_own_attach_id(&self, session_id: &[u8]) -> Result<bool> {
         if self.inner.shared.space() != AddressSpace::Initiator {
-            return Ok(self.session_id().to_vec());
+            return Ok(session_id == self.session_id().as_slice());
         }
-        let kept = self.server_id_lock().clone();
+        // One statement, so the guard is gone before `get_session_id` locks again.
+        let kept = self.server_id_lock().as_deref().map(|id| id == session_id);
         match kept {
-            Some(id) => Ok(id),
-            None => self.get_session_id(),
+            Some(same) => Ok(same),
+            None => Ok(session_id == self.get_session_id()?.as_slice()),
         }
     }
 
     /// Refuse an attach id other than this session's own: it would join another server session.
     fn refuse_foreign_attach_id(&self, session_id: &[u8]) -> Result<()> {
-        if session_id == self.own_attach_id()?.as_slice() {
+        if self.is_own_attach_id(session_id)? {
             return Ok(());
         }
         if session_id == self.session_id().as_slice() {
