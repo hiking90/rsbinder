@@ -181,6 +181,15 @@ Each item below changes what a 0.12.0 program observes.
   `shm::Mapping::map` returns `Unsupported` too and
   `shm::Deadline::after` returns `None`.
 
+### Security
+
+- **The `rustls` floor is 0.23.46** for RUSTSEC-2026-0346 (client session
+  `Debug` impls print TLS secrets), RUSTSEC-2026-0347 (application data
+  sent to the outer server after an ECH rejection), RUSTSEC-2026-0348
+  (Brotli certificate decompression allocates up to 1 GiB before
+  authentication) and RUSTSEC-2026-0349 (an unauthenticated ServerHello
+  downgrades later connections to classical key exchange); `rpc-tls` only.
+
 ## [0.12.0] - 2026-10-11
 
 ### Migrating from 0.11.0
