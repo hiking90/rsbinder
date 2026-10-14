@@ -1,0 +1,44 @@
+[package]
+name = "rsbinder-topic"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+description = "One publisher and many subscribers over kernel binder: a binder call sets a subscription up, and the records then travel through shared memory the subscribers map read-only. Experimental."
+homepage = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
+keywords = ["android", "binder", "shared-memory", "ipc", "linux"]
+# Held back until the crate has its public API (plan 15).
+publish = false
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
+[features]
+default = ["tokio"]
+# The async receive path. Without it the crate is its sync API alone.
+tokio = ["rsbinder/tokio"]
+# The entry point the `fuzz/` crate calls, as `rsbinder`'s feature of the
+# same name: absent from every other build.
+fuzzing = []
+
+[dependencies]
+# Not `workspace = true`: a member cannot turn off the default features of an
+# inherited dependency, and this crate must build without `rsbinder/tokio`.
+# The shared-memory primitives come through `rsbinder::fmq::shm`, so there is
+# no direct dependency on `rsbinder-fmq`.
+rsbinder = { version = "0.12.0", path = "../rsbinder", default-features = false }
+# `Errno`, to tell "the kernel has no `F_SEAL_FUTURE_WRITE`" from the other
+# failures of a seal.
+rustix = { workspace = true }
+
+# loom is only used by the unit tests gated on `--cfg loom` (`src/ring/loom_tests.rs`).
+# Run with (a target dir of its own: the cfg rebuilds every dependency):
+#   CARGO_TARGET_DIR=target/loom RUSTFLAGS="--cfg loom" \
+#       cargo test -p rsbinder-topic --lib --release loom
+# Without the cfg the module is not compiled.
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"

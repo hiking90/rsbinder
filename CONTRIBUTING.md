@@ -69,8 +69,8 @@ Library code (each lib crate outside `#[cfg(test)]`) does not call
 
 Every `allow` outside tests carries `reason = ".."`; one the code needs
 in every build is an `#[expect]`. The library crates (rsbinder,
-rsbinder-aidl, rsbinder-macros, rsbinder-fmq, rsbinder-tools) enforce
-the no-`unwrap` rule and the `reason` rule with
+rsbinder-aidl, rsbinder-macros, rsbinder-fmq, rsbinder-topic,
+rsbinder-tools) enforce the no-`unwrap` rule and the `reason` rule with
 `#![cfg_attr(not(test), deny(clippy::unwrap_used))]` and
 `#![cfg_attr(not(test), deny(clippy::allow_attributes_without_reason))]`
 at the crate root; a new library crate adds the same two lines. Review

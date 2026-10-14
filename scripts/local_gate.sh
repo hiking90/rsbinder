@@ -178,6 +178,19 @@ miri_fmq() {
         shm::run::tests::round_trip
 }
 
+# The topic ring over heap memory under Miri: the two tests in which a reader copies records while
+# the publisher overwrites them, and the reads of forged memory images, where a copy outside the
+# ring would be an out-of-bounds access. The other tests of `ring::tests` publish thousands of
+# records to one thread and add nothing here for the minutes they take.
+miri_topic() {
+    local seed dir=CARGO_TARGET_DIR=target/miri
+    for seed in 0 1 2 3 4 5 6 7; do
+        tpass env "$dir" MIRIFLAGS="-Zmiri-seed=$seed" \
+            cargo +nightly-2026-05-25 miri test -p rsbinder-topic --lib -- image::tests \
+            ring::tests::records_returned ring::tests::a_copy_that || return 1
+    done
+}
+
 semver() {
     cargo semver-checks check-release -p rsbinder -p rsbinder-aidl -p rsbinder-fmq --default-features &&
         cargo semver-checks check-release -p rsbinder --only-explicit-features \
@@ -207,14 +220,20 @@ tier_hermetic() {
     # CI does not run loom; a target dir of its own, since the cfg rebuilds every dependency.
     run "rsbinder-fmq loom (EventFlag, Run order, unsync reader)" tpass env CARGO_TARGET_DIR=target/loom \
         RUSTFLAGS="--cfg loom" cargo test -p rsbinder-fmq --lib --release loom
+    run "rsbinder-topic" tpass cargo test -p rsbinder-topic
+    run "rsbinder-topic loom (ring writer and reader)" tpass env CARGO_TARGET_DIR=target/loom \
+        RUSTFLAGS="--cfg loom" cargo test -p rsbinder-topic --lib --release loom
     # CI does not run Miri either.
     if toolchain nightly-2026-05-25 &&
         cargo +nightly-2026-05-25 miri --version >/dev/null 2>&1 &&
         rustup +nightly-2026-05-25 component list --installed 2>/dev/null |
         grep -q '^rust-src'; then
         run "rsbinder-fmq Miri (shm::Run, unsync)" miri_fmq
+        run "rsbinder-topic Miri (ring over heap memory)" miri_topic
     else
         skip "rsbinder-fmq Miri (shm::Run, unsync)" \
+            "rustup toolchain install nightly-2026-05-25 --component miri,rust-src"
+        skip "rsbinder-topic Miri (ring over heap memory)" \
             "rustup toolchain install nightly-2026-05-25 --component miri,rust-src"
     fi
     run "rsbinder loom (cache pin)" tpass env CARGO_TARGET_DIR=target/loom \
@@ -481,7 +500,7 @@ stage3_selected() {
     changed=$({ git diff --name-only "$BASE"...HEAD 2>/dev/null
                 git diff --name-only HEAD
                 git ls-files --others --exclude-standard; } |
-              grep -E '^(rsbinder|rsbinder-aidl|rsbinder-fmq|rsbinder-macros|contrib|example-hello|tests)/' |
+              grep -E '^(rsbinder|rsbinder-aidl|rsbinder-fmq|rsbinder-macros|rsbinder-topic|contrib|example-hello|tests)/' |
               grep -vE '\.md$')
     [ -n "$changed" ]
 }

@@ -933,6 +933,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsbinder-topic"
+version = "0.12.0"
+dependencies = [
+ "loom",
+ "rsbinder",
+ "rustix",
+]
+
+[[package]]
 name = "rsproperties"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
