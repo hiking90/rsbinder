@@ -146,7 +146,10 @@ Each item below changes what a 0.12.0 program observes.
     write: the 64-bit architectures, for which the standard library defines
     it on read-only memory, and 32-bit x86 with SSE2 and 32-bit ARM with
     64-bit atomics, where it is the instruction the compiler emits (`movq`,
-    `ldrexd`) and a test loads through a read-only mapping.
+    `ldrexd`) and a test loads through a read-only mapping. On every other
+    target `RoWord64` is a type with no value, with the same methods, so
+    that code naming it compiles everywhere: `RoWord64::PRESENT` tells the
+    two apart, and there `from_ptr` panics.
   - `Run::store_release` and `Run::load_acquire` copy with an order: a
     reader that got any byte of a `store_release` is ordered after what the
     writer did before it, which lets a reader detect that its copy was
@@ -169,7 +172,8 @@ Each item below changes what a 0.12.0 program observes.
   for WASI — although its documentation said the crate compiles
   everywhere. On these targets `MessageQueue::create` and
   `MessageQueue::attach` return `Error::Unsupported`. On the Linux ones the
-  `shm` module is complete but for `RoWord64` (see Added), except that
+  `shm` module is complete, with `RoWord64` a type that has no value (see
+  Added), except that
   `shm::futex_wake` needs Linux 5.1 on a 32-bit target that rustix serves
   through libc, where it calls `futex_time64` (by default
   `powerpc-unknown-linux-gnu`, 32-bit MIPS and the architectures rustix has

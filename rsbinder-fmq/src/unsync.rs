@@ -634,8 +634,8 @@ impl Word {
 /// [`attach`](Self::attach) stores nothing either, where libfmq's
 /// constructor resets the shared counters by default.
 ///
-/// A 64-bit counter in a read-only mapping needs `RoWord64`, which exists
-/// on the 64-bit architectures, on 32-bit x86 with SSE2 and on 32-bit ARM
+/// A 64-bit counter in a read-only mapping needs `RoWord64`, which has a
+/// value on the 64-bit architectures, on 32-bit x86 with SSE2 and on 32-bit ARM
 /// with 64-bit atomics (its documentation gives the grounds).
 /// [`attach`](Self::attach) returns [`Error::Unsupported`] on any other
 /// target.
@@ -728,7 +728,7 @@ impl<T: Element> UnsyncReader<T> {
     ///
     /// [`Error::Unsupported`] comes first, whatever `desc` and `policy`
     /// hold: on a target that is not Linux or Android, has no 64-bit
-    /// atomics, or has no `shm::RoWord64`. On the other targets:
+    /// atomics, or has `shm::RoWord64::PRESENT` false. On the other targets:
     /// [`Error::BadValue`] for a descriptor the checks refuse,
     /// [`Error::Os`] when a system call those checks or the mappings make
     /// fails, and, with [`UnsyncStart::Now`], [`Error::Corrupted`] when the

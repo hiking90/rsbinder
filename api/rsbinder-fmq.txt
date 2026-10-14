@@ -106,6 +106,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::shm::RoWord32
 impl core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::shm::RoWord32
 #[repr(transparent)] pub struct rsbinder_fmq::shm::RoWord64(_)
 impl rsbinder_fmq::shm::RoWord64
+pub const rsbinder_fmq::shm::RoWord64::PRESENT: bool
 pub unsafe fn rsbinder_fmq::shm::RoWord64::from_ptr<'a>(core::ptr::non_null::NonNull<u8>) -> &'a Self
 pub fn rsbinder_fmq::shm::RoWord64::load(&self) -> u64
 pub fn rsbinder_fmq::shm::RoWord64::load_acquire(&self) -> u64

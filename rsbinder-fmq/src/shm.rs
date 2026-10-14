@@ -13,7 +13,7 @@
 //! | Map it | [`Mapping`], [`Access`] |
 //! | Copy bytes in and out without a data race | [`Run`] |
 //! | Sleep until a peer changes a word, and wake a peer | [`futex_wait`], [`futex_wake`], [`Deadline`] |
-//! | Read memory this process may not write | [`RoRun`], [`RoWord32`], `RoWord64` |
+//! | Read memory this process may not write | [`RoRun`], [`RoWord32`], [`RoWord64`] |
 //! | Refuse a peer's fd whose pages the peer could take away | [`verify_received`] |
 //! | Ask about an fd that arrived from a peer | [`region_size`], [`shrink_sealed`], [`is_ashmem_fd`], [`ashmem_size`], [`ashmem_write_protected`] |
 //!
@@ -58,9 +58,11 @@
 //! which macOS has too. On WASI (`wasm32-wasip1`), where this crate has
 //! neither, [`Mapping::map`] returns `Unsupported` and [`Deadline::after`]
 //! returns `None`. [`Run`] is atomic loads and stores and has no condition
-//! of its own. `RoWord64` exists where an 8-byte load does not write: the
-//! 64-bit architectures, 32-bit x86 with SSE2 and 32-bit ARM with 64-bit
-//! atomics (its documentation gives the grounds for each).
+//! of its own. [`RoWord64`] has a value where an 8-byte load does not write:
+//! the 64-bit architectures, 32-bit x86 with SSE2 and 32-bit ARM with 64-bit
+//! atomics (its documentation gives the grounds for each). On any other
+//! target the name is a type with no value and [`RoWord64::PRESENT`] is
+//! `false`, so a caller compiles everywhere and refuses at run time.
 
 use std::os::fd::BorrowedFd;
 

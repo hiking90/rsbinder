@@ -69,9 +69,9 @@
 //! [`UnsyncReader::attach`] return [`Error::Unsupported`]. The [`shm`]
 //! module says which of its items each of those targets has.
 //! [`UnsyncReader`] reads 64-bit counters through a read-only mapping and so
-//! needs `shm::RoWord64` too; a 32-bit x86 target without SSE2 has 64-bit
-//! atomics and no such type, and `UnsyncReader::attach` is `Unsupported`
-//! there.
+//! needs [`shm::RoWord64::PRESENT`] too; a 32-bit x86 target without SSE2
+//! has 64-bit atomics and `PRESENT` is `false` there, and
+//! `UnsyncReader::attach` is `Unsupported`.
 //!
 //! # A descriptor is untrusted
 //!

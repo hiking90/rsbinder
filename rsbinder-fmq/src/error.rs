@@ -12,9 +12,10 @@ use std::fmt;
 pub enum Error {
     /// The target lacks what the call needs. The queue's constructors return
     /// this off Linux and Android, and on a target without 64-bit atomics;
-    /// [`UnsyncReader::attach`](crate::UnsyncReader::attach) also on a target
-    /// without `shm::RoWord64` (32-bit x86 without SSE2); the memfd, seal
-    /// and futex functions of [`shm`](crate::shm) off Linux and Android;
+    /// [`UnsyncReader::attach`](crate::UnsyncReader::attach) also where
+    /// `shm::RoWord64::PRESENT` is false (32-bit x86 without SSE2); the
+    /// memfd, seal and futex functions of [`shm`](crate::shm) off Linux and
+    /// Android;
     /// [`Mapping::map`](crate::shm::Mapping::map) on a target
     /// without `mmap` (WASI).
     ///
