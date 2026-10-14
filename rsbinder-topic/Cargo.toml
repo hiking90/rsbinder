@@ -35,6 +35,10 @@ rsbinder = { version = "0.12.0", path = "../rsbinder", default-features = false 
 # failures of a seal.
 rustix = { workspace = true }
 
+[dev-dependencies]
+# `#[derive(rsbinder::Parcelable)]` for the tests' parcelables: the code `.aidl` generates.
+rsbinder = { version = "0.12.0", path = "../rsbinder", default-features = false, features = ["macros"] }
+
 # loom is only used by the unit tests gated on `--cfg loom` (`src/ring/loom_tests.rs`).
 # Run with (a target dir of its own: the cfg rebuilds every dependency):
 #   CARGO_TARGET_DIR=target/loom RUSTFLAGS="--cfg loom" \

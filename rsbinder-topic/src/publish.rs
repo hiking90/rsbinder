@@ -1,0 +1,215 @@
+// Copyright 2026 Jeff Kim <hiking90@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
+//! The publisher's typed side: what a topic is made with, and values encoded into records.
+
+use std::fmt;
+use std::marker::PhantomData;
+use std::os::fd::OwnedFd;
+use std::sync::Mutex;
+
+use rsbinder::fmq::shm::Mapping;
+use rsbinder::{Status, StatusCode};
+
+use crate::layout::{self, Stored, MIN_RING};
+use crate::ring::{Kind, Refused, Stores, Writer};
+use crate::{end, Payload};
+
+/// What a topic is made with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublisherPolicy {
+    /// Bytes of ring, from 4 KiB to 1 GiB, rounded up to a multiple of 8. Default 64 KiB.
+    ///
+    /// The ring is one memfd the publisher allocates up front and every subscriber maps, so it
+    /// is charged once, to the publisher, however many subscribers there are. A record is at most
+    /// half the ring: the payload of one is at most `ring_bytes / 2 - 8` bytes, 32760 in the
+    /// default ring. How many records a subscriber can fall behind by before it loses some is the
+    /// ring's size over the size of a record; [`for_payload`](Self::for_payload) works the size
+    /// out from that.
+    pub ring_bytes: usize,
+}
+
+impl Default for PublisherPolicy {
+    fn default() -> Self {
+        Self {
+            ring_bytes: 64 << 10,
+        }
+    }
+}
+
+impl PublisherPolicy {
+    /// A ring that keeps the newest `depth` records of up to `max_payload` bytes each, including
+    /// while the next one is being written: `(depth + 1) × (8 + max_payload rounded up to 8)`
+    /// bytes, and no less than 4 KiB. A `depth` of zero is taken as one.
+    ///
+    /// Smaller records take less of the ring, so more of them are kept. A size above 1 GiB is
+    /// refused when the topic is made.
+    pub fn for_payload(max_payload: usize, depth: usize) -> Self {
+        let record = max_payload.div_ceil(8).saturating_mul(8).saturating_add(8);
+        let records = depth.max(1).saturating_add(1);
+        Self {
+            ring_bytes: records.saturating_mul(record).max(MIN_RING),
+        }
+    }
+}
+
+/// Why a publish wrote nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PublishError {
+    /// The value encodes to more bytes than a record of this ring carries.
+    TooLarge {
+        /// The encoded value's length.
+        bytes: usize,
+        /// The longest payload a record of this ring carries: half the ring, less 8.
+        max: usize,
+    },
+    /// [`Payload::encode`] failed with this. A parcelable that holds a binder fails with
+    /// `BadType`, one that holds a file descriptor with `FdsNotAllowed`.
+    Encode(StatusCode),
+    /// The topic has been closed.
+    Closed,
+}
+
+impl fmt::Display for PublishError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooLarge { bytes, max } => write!(
+                f,
+                "a value of {bytes} bytes is larger than the {max} a record of this topic carries"
+            ),
+            Self::Encode(code) => write!(f, "the value failed to encode: {code}"),
+            Self::Closed => f.write_str("the topic is closed"),
+        }
+    }
+}
+
+impl std::error::Error for PublishError {}
+
+impl From<Refused> for PublishError {
+    fn from(refused: Refused) -> Self {
+        match refused {
+            Refused::TooLarge { bytes, max } => Self::TooLarge { bytes, max },
+            Refused::Ended | Refused::Spent => Self::Closed,
+        }
+    }
+}
+
+/// Encoded values on their way into the ring: one buffer, and where each record in it ends.
+#[derive(Default)]
+struct Scratch {
+    bytes: Vec<u8>,
+    ends: Vec<usize>,
+}
+
+/// A topic's writer behind a lock, fed with values of `T`. Any thread may publish.
+pub(crate) struct TypedWriter<T, S> {
+    writer: Mutex<Writer<S>>,
+    /// Buffers to encode into, one per thread that publishes at a time.
+    scratch: Mutex<Vec<Scratch>>,
+    max_payload: usize,
+    /// The ring's bytes, the most a buffer keeps when it goes back.
+    capacity: usize,
+    _payload: PhantomData<fn(&T)>,
+}
+
+impl<T: Payload> TypedWriter<T, Stored<Mapping>> {
+    /// Make topic memory for `policy`: the fd to hand to subscribers, and the writer.
+    pub(crate) fn create(policy: &PublisherPolicy) -> rsbinder::fmq::Result<(OwnedFd, Self)> {
+        let (fd, stored) = layout::create_topic(policy.ring_bytes)?;
+        Ok((fd, Self::new(Writer::new(stored))))
+    }
+}
+
+impl<T: Payload, S: Stores> TypedWriter<T, S> {
+    pub(crate) fn new(writer: Writer<S>) -> Self {
+        Self {
+            max_payload: writer.max_payload(),
+            capacity: usize::try_from(writer.capacity()).unwrap_or(usize::MAX),
+            writer: Mutex::new(writer),
+            scratch: Mutex::new(Vec::new()),
+            _payload: PhantomData,
+        }
+    }
+
+    /// Write `value` as one record.
+    pub(crate) fn publish(&self, value: &T) -> Result<(), PublishError> {
+        self.publish_all([value]).map(drop)
+    }
+
+    /// Write each value as a record, all of them or, on any error, none; the count written.
+    ///
+    /// Every value is encoded before the lock is taken: no code of the application runs under it,
+    /// so a panic in `encode` leaves the lock as it was, and an `encode` that publishes to this
+    /// topic does not wait for itself.
+    pub(crate) fn publish_all<'a, I>(&self, values: I) -> Result<usize, PublishError>
+    where
+        T: 'a,
+        I: IntoIterator<Item = &'a T>,
+    {
+        let mut scratch = self
+            .scratch
+            .lock()
+            .expect("lock poisoned")
+            .pop()
+            .unwrap_or_default();
+        let written = self
+            .encode(values, &mut scratch)
+            .and_then(|()| self.write(&scratch));
+        if scratch.bytes.capacity() <= self.capacity && scratch.ends.capacity() <= self.capacity / 8
+        {
+            self.scratch.lock().expect("lock poisoned").push(scratch);
+        }
+        written
+    }
+
+    /// Write the end record with `status`. Later publishes are [`PublishError::Closed`]; a second
+    /// close writes nothing.
+    pub(crate) fn close(&self, status: &Status) {
+        let mut writer = self.writer.lock().expect("lock poisoned");
+        // A 4 KiB ring takes the longest end record, so only an end already written refuses it.
+        if writer.put(Kind::End, &end::payload(status)).is_ok() {
+            writer.announce();
+        }
+    }
+
+    fn encode<'a, I>(&self, values: I, scratch: &mut Scratch) -> Result<(), PublishError>
+    where
+        T: 'a,
+        I: IntoIterator<Item = &'a T>,
+    {
+        scratch.bytes.clear();
+        scratch.ends.clear();
+        for value in values {
+            let start = scratch.bytes.len();
+            value
+                .encode(&mut scratch.bytes)
+                .map_err(PublishError::Encode)?;
+            let bytes = (scratch.bytes.len().checked_sub(start))
+                .expect("`Payload::encode` removed bytes it did not write");
+            if bytes > self.max_payload {
+                let max = self.max_payload;
+                return Err(PublishError::TooLarge { bytes, max });
+            }
+            scratch.ends.push(scratch.bytes.len());
+        }
+        Ok(())
+    }
+
+    fn write(&self, scratch: &Scratch) -> Result<usize, PublishError> {
+        if scratch.ends.is_empty() {
+            return Ok(0);
+        }
+        let records = || {
+            let starts = std::iter::once(0).chain(scratch.ends.iter().copied());
+            starts.zip(scratch.ends.iter().copied())
+        };
+        let mut writer = self.writer.lock().expect("lock poisoned");
+        // Checked first, so that a refusal comes before the first record and none is written.
+        writer.admits(records().map(|(start, end)| end - start))?;
+        for (start, end) in records() {
+            writer.put(Kind::Item, &scratch.bytes[start..end])?;
+        }
+        writer.announce();
+        Ok(scratch.ends.len())
+    }
+}

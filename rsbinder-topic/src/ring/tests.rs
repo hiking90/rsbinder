@@ -110,6 +110,63 @@ fn a_record_longer_than_half_the_ring_is_refused() {
 }
 
 #[test]
+fn a_batch_is_admitted_only_if_put_takes_every_record_of_it() {
+    let heap = Heap::new(RING);
+    let mut writer = writer_of(&heap);
+    assert_eq!(writer.admits([0, 2040, 7]), Ok(()));
+    let too_large = Refused::TooLarge {
+        bytes: 2041,
+        max: 2040,
+    };
+    assert_eq!(writer.admits([1, 2041, 1]), Err(too_large));
+    // Two records of 32 bytes end at the last position below 2^64; one more of 8 does not fit.
+    let last = u64::MAX / 8 * 8;
+    writer.written = last - 64;
+    assert_eq!(writer.admits([24, 24]), Ok(()));
+    assert_eq!(writer.admits([24, 24, 0]), Err(Refused::Spent));
+    writer.written = 0;
+    writer.put(Kind::End, &[]).unwrap();
+    assert_eq!(writer.admits([]), Err(Refused::Ended));
+
+    // A batch whose last record would pass 2^64 writes none of the ones before it.
+    let heap = Heap::new(RING);
+    let mut writer = writer_of(&heap);
+    writer.written = last - 64;
+    let topic = crate::publish::TypedWriter::new(writer);
+    let batch = [crate::Bytes(vec![1; 24]), crate::Bytes(vec![2; 24])];
+    assert_eq!(
+        topic.publish_all(batch.iter().chain([&crate::Bytes(vec![])])),
+        Err(crate::PublishError::Closed)
+    );
+    assert_eq!(heap.loaded().write(), 0);
+    assert_eq!(topic.publish_all(&batch), Ok(2));
+    assert_eq!(heap.loaded().write(), last);
+}
+
+#[test]
+fn a_ring_sized_for_a_payload_keeps_that_many_of_the_largest_records_while_it_writes() {
+    for (max, depth) in [(2000, 1), (1000, 3), (300, 16), (8, 2), (0, 0)] {
+        let ring = crate::PublisherPolicy::for_payload(max, depth).ring_bytes;
+        let heap = Heap::new(ring);
+        let mut writer = writer_of(&heap);
+        let record = 8 + max.div_ceil(8) * 8;
+        for _ in 0..ring / record + 2 {
+            let index = writer.next_index();
+            writer.put(Kind::Item, &body(index, max)).unwrap();
+        }
+        // The next record's `tail` is stored and none of its bytes yet: the fewest kept.
+        writer.stop = Stop::AfterRegionEnd;
+        writer.put(Kind::Item, &body(0, max)).unwrap();
+        let kept = drain(&mut reader_of(&heap, Start::Oldest)).len();
+        if ring > crate::layout::MIN_RING {
+            assert_eq!(kept, depth, "{max} bytes, depth {depth}");
+        } else {
+            assert!(kept >= depth.max(1), "{max} bytes, depth {depth}: {kept}");
+        }
+    }
+}
+
+#[test]
 fn the_counters_keep_their_order_after_every_publish() {
     let heap = Heap::new(RING);
     let (mut writer, view) = (writer_of(&heap), heap.loaded());

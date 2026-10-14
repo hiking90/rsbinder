@@ -178,6 +178,11 @@ impl<M: Stores> Writer<M> {
         usize::try_from(record.saturating_sub(rules::HEADER)).unwrap_or(usize::MAX)
     }
 
+    /// Bytes in the ring.
+    pub(crate) fn capacity(&self) -> u64 {
+        self.memory.capacity()
+    }
+
     /// Bytes committed so far: where the next record starts.
     pub(crate) fn position(&self) -> u64 {
         self.written
@@ -198,25 +203,39 @@ impl<M: Stores> Writer<M> {
         self.memory.bump_seq();
     }
 
-    fn put_raw(&mut self, kind: u32, payload: &[u8]) -> Result<(), Refused> {
+    /// Whether [`put`](Self::put) would write items with payloads of these lengths, one after
+    /// another, without refusing any of them.
+    pub(crate) fn admits(&self, lens: impl IntoIterator<Item = usize>) -> Result<(), Refused> {
+        if self.ended {
+            return Err(Refused::Ended);
+        }
+        let mut end = self.written;
+        for len in lens {
+            end = self.end_after(end, len)?;
+        }
+        Ok(())
+    }
+
+    /// Where a record with `len` bytes of payload that starts at `start` ends.
+    fn end_after(&self, start: u64, len: usize) -> Result<u64, Refused> {
         if self.ended {
             return Err(Refused::Ended);
         }
         let max = self.max_payload();
-        let len = u32::try_from(payload.len())
-            .ok()
-            .filter(|_| payload.len() <= max);
-        let Some(len) = len else {
-            return Err(Refused::TooLarge {
-                bytes: payload.len(),
-                max,
-            });
+        let Some(len) = u32::try_from(len).ok().filter(|_| len <= max) else {
+            return Err(Refused::TooLarge { bytes: len, max });
         };
-        let capacity = self.memory.capacity();
-        let start = self.written;
-        let end = start
+        start
             .checked_add(rules::record_size(len))
-            .ok_or(Refused::Spent)?;
+            .ok_or(Refused::Spent)
+    }
+
+    fn put_raw(&mut self, kind: u32, payload: &[u8]) -> Result<(), Refused> {
+        let start = self.written;
+        let end = self.end_after(start, payload.len())?;
+        // `end_after` bounded the length by half the ring.
+        let len = payload.len() as u32;
+        let capacity = self.memory.capacity();
         while self
             .starts
             .front()
