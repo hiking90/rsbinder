@@ -14,7 +14,7 @@ members = [
 
 # The cargo-fuzz crate needs a nightly toolchain + libFuzzer; keep it
 # out of normal `cargo build`/`test`. See fuzz/Cargo.toml.
-exclude = ["fuzz"]
+exclude = ["fuzz", "bench/ipc-compare"]
 
 [workspace.package]
 version = "0.12.0"
