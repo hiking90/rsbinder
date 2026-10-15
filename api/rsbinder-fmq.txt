@@ -1,5 +1,27 @@
 pub mod rsbinder_fmq
 pub mod rsbinder_fmq::shm
+pub mod rsbinder_fmq::shm::spin
+pub struct rsbinder_fmq::shm::spin::SpinGauge
+impl rsbinder_fmq::shm::spin::SpinGauge
+pub fn rsbinder_fmq::shm::spin::SpinGauge::budget(&self, core::option::Option<std::time::Instant>) -> core::time::Duration
+pub fn rsbinder_fmq::shm::spin::SpinGauge::is_off(&self) -> bool
+pub fn rsbinder_fmq::shm::spin::SpinGauge::parked(&self, core::time::Duration)
+pub fn rsbinder_fmq::shm::spin::SpinGauge::spun(&self, core::time::Duration, bool)
+impl core::default::Default for rsbinder_fmq::shm::spin::SpinGauge
+pub fn rsbinder_fmq::shm::spin::SpinGauge::default() -> rsbinder_fmq::shm::spin::SpinGauge
+impl core::fmt::Debug for rsbinder_fmq::shm::spin::SpinGauge
+pub fn rsbinder_fmq::shm::spin::SpinGauge::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl !core::marker::Freeze for rsbinder_fmq::shm::spin::SpinGauge
+impl core::marker::Send for rsbinder_fmq::shm::spin::SpinGauge
+impl core::marker::Sync for rsbinder_fmq::shm::spin::SpinGauge
+impl core::marker::Unpin for rsbinder_fmq::shm::spin::SpinGauge
+impl core::marker::UnsafeUnpin for rsbinder_fmq::shm::spin::SpinGauge
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::shm::spin::SpinGauge
+impl core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::shm::spin::SpinGauge
+pub const rsbinder_fmq::shm::spin::SPIN: core::time::Duration
+pub const rsbinder_fmq::shm::spin::SPIN_CLOCK_EVERY: u32
+pub fn rsbinder_fmq::shm::spin::spin_budget(core::option::Option<std::time::Instant>) -> core::time::Duration
+pub fn rsbinder_fmq::shm::spin::spin_until(core::time::Duration, impl core::ops::function::FnMut() -> bool) -> (bool, core::time::Duration)
 pub enum rsbinder_fmq::shm::Access
 pub rsbinder_fmq::shm::Access::ReadOnly
 pub rsbinder_fmq::shm::Access::ReadWrite

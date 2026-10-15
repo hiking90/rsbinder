@@ -155,6 +155,12 @@ Each item below changes what a 0.12.0 program observes.
     writer did before it, which lets a reader detect that its copy was
     overwritten. `load_acquire` is relaxed loads and one acquire fence, so
     it is defined through a read-only mapping.
+- **`rsbinder_fmq::shm::spin`**: how long a side of a shared-memory channel
+  looks at the memory before it parks on a futex — `SPIN`, `spin_budget`,
+  `spin_until`, `SpinGauge` and `SPIN_CLOCK_EVERY`. This is the policy
+  `rsbinder::stream`'s ring has used since 0.12.0, moved here unchanged so
+  that every channel in a process counts against one limit on concurrent
+  looks (half the cores); `stream` now calls it from here.
 
 ### Fixed
 

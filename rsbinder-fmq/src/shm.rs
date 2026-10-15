@@ -13,6 +13,7 @@
 //! | Map it | [`Mapping`], [`Access`] |
 //! | Copy bytes in and out without a data race | [`Run`] |
 //! | Sleep until a peer changes a word, and wake a peer | [`futex_wait`], [`futex_wake`], [`Deadline`] |
+//! | Decide how long to look at the memory before sleeping | [`spin`] |
 //! | Read memory this process may not write | [`RoRun`], [`RoWord32`], [`RoWord64`] |
 //! | Refuse a peer's fd whose pages the peer could take away | [`verify_received`] |
 //! | Ask about an fd that arrived from a peer | [`region_size`], [`shrink_sealed`], [`is_ashmem_fd`], [`ashmem_size`], [`ashmem_write_protected`] |
@@ -72,6 +73,7 @@ mod futex;
 mod mapping;
 mod memfd;
 mod run;
+pub mod spin;
 mod word;
 
 pub use futex::{futex_wait, futex_wake, Deadline};
