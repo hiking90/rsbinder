@@ -221,7 +221,7 @@ tier_hermetic() {
     run "rsbinder-fmq loom (EventFlag, Run order, unsync reader)" tpass env CARGO_TARGET_DIR=target/loom \
         RUSTFLAGS="--cfg loom" cargo test -p rsbinder-fmq --lib --release loom
     run "rsbinder-topic" tpass cargo test -p rsbinder-topic
-    run "rsbinder-topic loom (ring writer and reader)" tpass env CARGO_TARGET_DIR=target/loom \
+    run "rsbinder-topic loom (ring writer and reader, wait and wake)" tpass env CARGO_TARGET_DIR=target/loom \
         RUSTFLAGS="--cfg loom" cargo test -p rsbinder-topic --lib --release loom
     # CI does not run Miri either.
     if toolchain nightly-2026-05-25 &&

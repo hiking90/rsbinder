@@ -20,7 +20,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 [features]
 default = ["tokio"]
 # The async receive path. Without it the crate is its sync API alone.
-tokio = ["rsbinder/tokio"]
+tokio = ["rsbinder/tokio", "dep:tokio"]
 # The entry point the `fuzz/` crate calls, as `rsbinder`'s feature of the
 # same name: absent from every other build.
 fuzzing = []
@@ -36,6 +36,8 @@ rsbinder = { version = "0.12.0", path = "../rsbinder", default-features = false,
 # `Errno`, to tell "the kernel has no `F_SEAL_FUTURE_WRITE`" from the other
 # failures of a seal.
 rustix = { workspace = true }
+# `Notify`: a `recv_async` joins the wait a dropped one left on the blocking pool.
+tokio = { workspace = true, optional = true, features = ["sync"] }
 
 [build-dependencies]
 rsbinder-aidl = { workspace = true }
@@ -47,6 +49,8 @@ miette = { workspace = true }
 rsbinder = { version = "0.12.0", path = "../rsbinder", default-features = false, features = ["macros", "rpc"] }
 # `setrlimit`, for a subscriber that cannot take the reply's fd.
 rustix = { workspace = true, features = ["process"] }
+# A runtime for `recv_async`'s tests.
+tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
 
 # loom is only used by the unit tests gated on `--cfg loom` (`src/ring/loom_tests.rs`).
 # Run with (a target dir of its own: the cfg rebuilds every dependency):

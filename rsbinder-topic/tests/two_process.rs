@@ -289,6 +289,100 @@ fn a_subscriber_reads_what_a_dead_publisher_committed_then_learns_it_died() {
     assert_eq!(subscriber.try_latest(), died);
 }
 
+/// AC-15.2.5, 2.11: 8 sleeping subscribers of a killed publisher end within 1 s, 1000 times.
+#[test]
+#[ignore = "needs a binder device and rsb_hub"]
+fn sleeping_subscribers_learn_within_a_second_that_their_publisher_died() {
+    init();
+    let deaths: u32 = std::env::var("RSBINDER_TOPIC_DEATHS")
+        .ok()
+        .and_then(|deaths| deaths.parse().ok())
+        .unwrap_or(1000);
+    for death in 0..deaths {
+        let name = name(&format!("deaths.{death}"));
+        let mut peer = Peer::spawn("publish", &name);
+        assert_eq!(peer.says(), "ready");
+        let topic = hub::check_service(&name).expect("the publisher's binder");
+        let receiving: Vec<_> = (0..8)
+            .map(|_| {
+                let mut subscriber =
+                    Subscriber::<Bytes>::request(&topic, &SubscriberPolicy::default()).unwrap();
+                std::thread::spawn(move || {
+                    let first = subscriber.recv();
+                    let killed = subscriber.recv();
+                    (first, killed, Instant::now())
+                })
+            })
+            .collect();
+        peer.tell("publish 1");
+        assert_eq!(peer.says(), "published");
+        // Past the spin of 20 µs: each second `recv` sleeps by now.
+        std::thread::sleep(Duration::from_millis(5));
+        let killed = Instant::now();
+        peer.kill();
+        eventually("every subscriber is out of its sleep", || {
+            receiving.iter().all(|r| r.is_finished())
+        });
+        for receiving in receiving {
+            let (first, then, at) = receiving.join().unwrap();
+            assert_eq!(first, Ok(Bytes(vec![0])));
+            assert_eq!(then, Err(RecvError::Closed(Closed::PublisherDied)));
+            let took = at.saturating_duration_since(killed);
+            assert!(took < Duration::from_secs(1), "death {death}: {took:?}");
+        }
+    }
+}
+
+/// AC-15.2.41: receives after dropped `recv_async`s get each record, then `PublisherDied`.
+#[cfg(feature = "tokio")]
+#[test]
+#[ignore = "needs a binder device and rsb_hub"]
+fn a_receive_after_a_dropped_async_receive_learns_that_the_publisher_died() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    init();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .build()
+        .unwrap();
+    let name = name("joined");
+    let mut peer = Peer::spawn("publish", &name);
+    assert_eq!(peer.says(), "ready");
+    let topic = hub::check_service(&name).expect("the publisher's binder");
+    let mut subscriber =
+        Subscriber::<Bytes>::request(&topic, &SubscriberPolicy::default()).unwrap();
+    let abandon = |subscriber: &mut Subscriber<Bytes>| {
+        let _enter = runtime.enter();
+        let mut future = std::pin::pin!(subscriber.recv_async());
+        let polled = future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()));
+        assert!(matches!(polled, Poll::Pending), "nothing to receive yet");
+    };
+    for round in 0..100 {
+        abandon(&mut subscriber);
+        peer.tell("publish 1");
+        let got = subscriber.recv_timeout(WAIT);
+        assert_eq!(got, Ok(Bytes(vec![0])), "round {round}");
+        assert_eq!(peer.says(), "published");
+    }
+    abandon(&mut subscriber);
+    let killing = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        peer.kill();
+    });
+    let started = Instant::now();
+    assert_eq!(
+        subscriber.recv_timeout(WAIT),
+        Err(RecvError::Closed(Closed::PublisherDied))
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
+    killing.join().unwrap();
+    drop(subscriber);
+    runtime.shutdown_timeout(Duration::from_secs(1));
+}
+
 /// The other process's side of the tests above.
 #[test]
 #[ignore = "run by the tests above as their other process"]
@@ -379,19 +473,19 @@ fn child() {
             let publisher = Publisher::<Bytes>::new(&PublisherPolicy::default()).unwrap();
             hub::add_service(&name, publisher.as_binder()).unwrap();
             say("ready");
-            let mut line = String::new();
-            std::io::stdin().read_line(&mut line).unwrap();
-            let count: u8 = line
-                .trim()
-                .strip_prefix("publish ")
-                .unwrap()
-                .parse()
-                .unwrap();
-            for byte in 0..count {
-                publisher.publish(&Bytes(vec![byte])).unwrap();
+            // `publish N` publishes the bytes 0 to N - 1, as many times as told, until EOF.
+            for line in std::io::stdin().lines().map_while(Result::ok) {
+                let count: u8 = line
+                    .trim()
+                    .strip_prefix("publish ")
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                for byte in 0..count {
+                    publisher.publish(&Bytes(vec![byte])).unwrap();
+                }
+                say("published");
             }
-            say("published");
-            wait_for_eof();
         }
         other => panic!("no role {other}"),
     }

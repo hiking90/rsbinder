@@ -13,12 +13,18 @@ use crate::{end, Payload};
 
 /// Why a receive returned no value.
 ///
-/// `Empty`, `Lagged` and `Decode` leave the subscription as it was; `Closed` ends it, and every
-/// later receive returns it again.
+/// `Empty`, `Timeout`, `Cancelled`, `Lagged` and `Decode` leave the subscription as it was;
+/// `Closed` ends it, and every later receive returns it again.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RecvError {
     /// No record is unread. The next receive tries again from the same place.
     Empty,
+    /// A wait with a bound reached it with no record unread. The next receive tries again from
+    /// the same place.
+    Timeout,
+    /// An [`Interrupter`](crate::Interrupter) ended the wait, or the async runtime could not run
+    /// it. The next receive tries again from the same place.
+    Cancelled,
     /// The publisher overwrote this many records before they were read. The next receive returns
     /// the first record after them.
     Lagged(u64),
@@ -47,6 +53,8 @@ impl fmt::Display for RecvError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => f.write_str("no record is unread"),
+            Self::Timeout => f.write_str("no record arrived within the wait"),
+            Self::Cancelled => f.write_str("the wait was cancelled"),
             Self::Lagged(records) => write!(f, "{records} records were overwritten unread"),
             Self::Decode(code) => write!(f, "a record failed to decode: {code}"),
             Self::Closed(closed) => fmt::Display::fmt(closed, f),
@@ -100,6 +108,11 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
     /// Records reported as lost so far.
     pub(crate) fn lost(&self) -> u64 {
         self.reader.lost()
+    }
+
+    /// Whether the publisher has committed past this reader.
+    pub(crate) fn pending(&self) -> bool {
+        self.reader.pending()
     }
 }
 

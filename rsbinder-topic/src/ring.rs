@@ -98,6 +98,8 @@ pub(crate) trait Stores {
     fn store_half(&self, position: u64);
     /// Add one to the word a waiting subscriber sleeps on.
     fn bump_seq(&self);
+    /// Wake every subscriber that sleeps on that word: one system call, however many sleep.
+    fn wake_seq(&self);
     /// Copy `src` to `position`, wrapping at the ring's end. Both are multiples of 8.
     fn store_ring(&self, position: u64, src: &[u8]);
 }
@@ -156,6 +158,9 @@ pub(crate) struct Writer<M> {
     ended: bool,
     #[cfg(test)]
     stop: Stop,
+    /// Wakes sent: a test's count of the futex system calls this writer made.
+    #[cfg(test)]
+    wakes: u64,
 }
 
 impl<M: Stores> Writer<M> {
@@ -169,6 +174,8 @@ impl<M: Stores> Writer<M> {
             ended: false,
             #[cfg(test)]
             stop: Stop::Never,
+            #[cfg(test)]
+            wakes: 0,
         }
     }
 
@@ -206,6 +213,21 @@ impl<M: Stores> Writer<M> {
     /// Tell the subscribers that sleep that something was committed.
     pub(crate) fn announce(&self) {
         self.memory.bump_seq();
+    }
+
+    /// Wake the subscribers that sleep on `seq`. The caller decides that one does (plan 15 §5.5).
+    pub(crate) fn wake(&mut self) {
+        self.memory.wake_seq();
+        #[cfg(test)]
+        {
+            self.wakes += 1;
+        }
+    }
+
+    /// The wakes sent so far.
+    #[cfg(all(test, not(loom), any(target_os = "linux", target_os = "android")))]
+    pub(crate) fn wakes(&self) -> u64 {
+        self.wakes
     }
 
     /// Whether [`put`](Self::put) would write items with payloads of these lengths, one after
@@ -402,6 +424,11 @@ impl<M: Loads> Reader<M> {
     /// Records reported as [`Taken::Lagged`] so far.
     pub(crate) fn lost(&self) -> u64 {
         self.lost
+    }
+
+    /// Whether the publisher committed past this reader: one `Acquire` load, as a wait needs.
+    pub(crate) fn pending(&self) -> bool {
+        self.memory.write() != self.read
     }
 
     /// The next record, without waiting.

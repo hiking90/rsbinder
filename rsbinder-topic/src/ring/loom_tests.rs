@@ -98,6 +98,8 @@ impl Stores for Arc<Memory> {
 
     fn bump_seq(&self) {}
 
+    fn wake_seq(&self) {}
+
     fn store_ring(&self, position: u64, src: &[u8]) {
         let order = match self.flaw {
             Flaw::RelaxedRing => Ordering::Relaxed,

@@ -184,15 +184,15 @@ fn a_batch_with_a_value_that_fails_to_encode_writes_nothing() {
         Err(PublishError::Encode(StatusCode::BadValue))
     );
     let memory = heap.loaded();
-    assert_eq!((memory.write(), memory.seq().load()), (0, 0));
+    assert_eq!((memory.write(), memory.seq().word().load()), (0, 0));
     assert_eq!(sub.try_recv(), Err(RecvError::Empty));
     // An empty batch writes nothing either, and wakes no one.
     assert_eq!(topic.publish_all(&[]), Ok(0));
-    assert_eq!(memory.seq().load(), 0);
+    assert_eq!(memory.seq().word().load(), 0);
     let batch = [Picky(Some(1)), Picky(Some(2)), Picky(Some(3))];
     assert_eq!(topic.publish_all(&batch), Ok(3));
     // One announcement for the batch.
-    assert_eq!(memory.seq().load(), 1);
+    assert_eq!(memory.seq().word().load(), 1);
     for value in batch {
         assert_eq!(sub.try_recv(), Ok(value));
     }

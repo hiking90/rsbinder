@@ -78,6 +78,7 @@
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use rsbinder::fmq::shm::{
     self, Access, CreateOptions, Mapping, RoRun, RoWord32, RoWord64, Run, Seals,
@@ -123,14 +124,13 @@ mod control {
 }
 
 /// `state` bit 0: the subscriber is about to sleep, or sleeps, on `seq`.
-#[allow(
-    dead_code,
-    reason = "the waiting receive (plan 15 P2b-2) sets it; tests use it now"
-)]
 pub(crate) const WAITING: u32 = 1;
 
 /// `state` bit 1: the subscriber has dropped the subscription.
 pub(crate) const CLOSED: u32 = 2;
+
+/// One wait in `state`'s count, bits 2–31: what tells one wait from the next (plan 15 §5.5).
+pub(crate) const WAIT_COUNT: u32 = 4;
 
 /// `Unsupported` where topics cannot work: off Linux and Android, or where `RoWord64` has no value.
 pub(crate) fn check_target() -> Result<()> {
@@ -262,6 +262,11 @@ impl<O> Stores for Stored<O> {
         self.word32(topic::SEQ).fetch_add(1, Ordering::SeqCst);
     }
 
+    fn wake_seq(&self) {
+        // Fails only where the system call does not exist; there no subscriber can sleep either.
+        let _ = shm::futex_wake(self.word32(topic::SEQ), u32::MAX);
+    }
+
     fn store_ring(&self, position: u64, src: &[u8]) {
         let (offset, first) = split(self.capacity, position, src.len());
         let (head, wrapped) = src.split_at(first);
@@ -309,13 +314,15 @@ impl<O> Loaded<O> {
         unsafe { RoRun::new(self.base.add(topic::RING + offset), len) }
     }
 
-    /// The word a subscriber sleeps on.
-    #[allow(
-        dead_code,
-        reason = "the waiting receive (plan 15 P2b-2) sleeps on it; tests use it"
-    )]
-    pub(crate) fn seq(&self) -> &RoWord32 {
-        self.word32(topic::SEQ)
+    /// The word a subscriber sleeps on, as a handle that keeps the memory alive on its own.
+    pub(crate) fn seq(&self) -> Seq<O>
+    where
+        O: Clone,
+    {
+        Seq {
+            base: self.base,
+            _owner: self._owner.clone(),
+        }
     }
 
     /// Whether the two words that say what this memory is hold what this crate writes there.
@@ -364,6 +371,24 @@ impl<O> Loads for Loaded<O> {
     }
 }
 
+/// Topic memory's `seq`, apart from the reader: what a wait on another thread sleeps on and wakes.
+pub(crate) struct Seq<O> {
+    base: NonNull<u8>,
+    _owner: O,
+}
+
+// SAFETY: an address into memory `O` keeps alive, reached through `RoWord32` only.
+unsafe impl<O: Send> Send for Seq<O> {}
+// SAFETY: as above; `RoWord32` is an atomic, so `&Seq` on two threads is two atomic accesses.
+unsafe impl<O: Sync> Sync for Seq<O> {}
+
+impl<O> Seq<O> {
+    pub(crate) fn word(&self) -> &RoWord32 {
+        // SAFETY: the `Loaded` this came from: an aligned 4-byte word of the header, one size.
+        unsafe { RoWord32::from_ptr(self.base.add(topic::SEQ)) }
+    }
+}
+
 /// The ring's size for a request of `ring_bytes`: rounded up to 8, within the two bounds.
 fn ring_capacity(ring_bytes: usize) -> Result<usize> {
     if !(MIN_RING..=MAX_RING).contains(&ring_bytes) {
@@ -389,7 +414,7 @@ pub(crate) fn create_topic(ring_bytes: usize) -> Result<(OwnedFd, Stored<Mapping
 }
 
 /// Map topic memory a publisher sent, read-only, once the fd, its size and its marks pass.
-pub(crate) fn map_topic(fd: BorrowedFd<'_>, max_ring: usize) -> Result<Loaded<Mapping>> {
+pub(crate) fn map_topic(fd: BorrowedFd<'_>, max_ring: usize) -> Result<Loaded<Arc<Mapping>>> {
     check_target()?;
     let size = shm::verify_received(fd)?;
     let capacity = usize::try_from(size)
@@ -397,7 +422,8 @@ pub(crate) fn map_topic(fd: BorrowedFd<'_>, max_ring: usize) -> Result<Loaded<Ma
         .and_then(|size| size.checked_sub(topic::RING))
         .filter(|ring| ring % 8 == 0 && (MIN_RING..=MAX_RING.min(max_ring)).contains(ring))
         .ok_or(Error::BadValue("topic memory of a size outside the bounds"))?;
-    let mapping = Mapping::map(fd, 0, size, Access::ReadOnly)?;
+    // Shared, so that a `Seq` taken from the view outlives a dropped reader.
+    let mapping = Arc::new(Mapping::map(fd, 0, size, Access::ReadOnly)?);
     // SAFETY: a page-aligned mapping of `size` bytes `verify_received` found present and sealed.
     let loaded = unsafe { Loaded::new(mapping.as_ptr(), capacity, mapping) };
     loaded.marked()?;

@@ -49,10 +49,10 @@ fn topic_memory_is_written_through_one_mapping_and_read_through_another() {
         })
     );
     // The word a subscriber sleeps on moves once for each announcement.
-    assert_eq!(seq.seq().load(), 0);
+    assert_eq!(seq.seq().word().load(), 0);
     writer.announce();
     writer.announce();
-    assert_eq!(seq.seq().load(), 2);
+    assert_eq!(seq.seq().word().load(), 2);
 }
 
 #[test]

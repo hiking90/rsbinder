@@ -3,12 +3,12 @@
 
 //! The publisher's list of subscriptions, and the death links both ends hold.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Weak};
 
 use rsbinder::{DeathRecipient, SIBinder, WIBinder};
 
-use crate::layout::{ControlView, CLOSED};
+use crate::layout::{ControlView, CLOSED, WAITING};
 
 /// A death notification registered on a proxy, removed on drop.
 pub(crate) struct DeathLink<R: DeathRecipient + 'static> {
@@ -28,10 +28,6 @@ impl<R: DeathRecipient + 'static> DeathLink<R> {
             binder: binder.clone(),
             recipient,
         }))
-    }
-
-    pub(crate) fn recipient(&self) -> &R {
-        &self.recipient
     }
 }
 
@@ -85,6 +81,8 @@ pub(crate) struct Link {
     control: ControlView,
     uid: u32,
     dead: Arc<Dead>,
+    /// The `state` of the wait last woken, so a wait gets one wake (plan 15 §5.5). Under the lock.
+    woken: AtomicU32,
     _death: Option<DeathLink<Watch>>,
 }
 
@@ -106,7 +104,19 @@ impl Link {
             uid,
             _death: DeathLink::new(token, watch)?,
             dead,
+            // No `state` with `WAITING` raised is zero.
+            woken: AtomicU32::new(0),
         })
+    }
+
+    /// Whether the subscriber sleeps in a wait not woken yet, which counts as woken from here on.
+    fn wants_wake(&self) -> bool {
+        let state = self.control.state().load();
+        if state & WAITING == 0 || state == self.woken.load(Ordering::Relaxed) {
+            return false;
+        }
+        self.woken.store(state, Ordering::Relaxed);
+        true
     }
 
     /// The subscriber's process died, or it dropped the subscription.
@@ -134,6 +144,15 @@ impl Links {
 
     pub(crate) fn push(&mut self, link: Arc<Link>) {
         self.0.push(link);
+    }
+
+    /// Whether a subscriber waits for a wake; each such wait counts once (plan 15 §5.5).
+    pub(crate) fn wake_wanted(&self) -> bool {
+        // Every link, not up to the first: each one remembers the wait this wake is for.
+        self.0
+            .iter()
+            .filter(|link| !link.ended())
+            .fold(false, |wanted, link| link.wants_wake() | wanted)
     }
 
     /// Take out the subscriptions that ended.

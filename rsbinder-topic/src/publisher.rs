@@ -107,6 +107,12 @@ impl<T: Payload + 'static> Publisher<T> {
         self.shared.writer.publish_all(values)
     }
 
+    /// The futex wakes the topic has sent.
+    #[cfg(all(test, not(loom), any(target_os = "linux", target_os = "android")))]
+    pub(crate) fn wakes(&self) -> u64 {
+        self.shared.writer.wakes()
+    }
+
     /// The subscriptions the topic holds, after taking out those that ended.
     ///
     /// For skipping the work of a value no one would receive; it changes as subscribers come

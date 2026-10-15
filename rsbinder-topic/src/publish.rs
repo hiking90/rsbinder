@@ -6,6 +6,7 @@
 use std::fmt;
 use std::marker::PhantomData;
 use std::os::fd::OwnedFd;
+use std::sync::atomic::{fence, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use rsbinder::fmq::shm::Mapping;
@@ -125,6 +126,18 @@ pub(crate) struct State<S> {
     pub(crate) links: Links,
 }
 
+impl<S: Stores> State<S> {
+    /// After a commit: bump `seq`, then one wake if a subscriber sleeps, none if not (§5.5).
+    fn announce(&mut self) {
+        self.writer.announce();
+        // Against the `SeqCst` raise of `WAITING`: this load sees it, or that futex sees new `seq`.
+        fence(Ordering::SeqCst);
+        if self.links.wake_wanted() {
+            self.writer.wake();
+        }
+    }
+}
+
 /// A topic's writer behind a lock, fed with values of `T`. Any thread may publish.
 pub(crate) struct TypedWriter<T, S> {
     state: Mutex<State<S>>,
@@ -161,6 +174,12 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
     /// The lock every change to the ring and to the list of subscriptions takes.
     pub(crate) fn lock(&self) -> MutexGuard<'_, State<S>> {
         self.state.lock().expect("lock poisoned")
+    }
+
+    /// The futex wakes this topic has sent.
+    #[cfg(all(test, not(loom), any(target_os = "linux", target_os = "android")))]
+    pub(crate) fn wakes(&self) -> u64 {
+        self.lock().writer.wakes()
     }
 
     /// Write `value` as one record.
@@ -200,7 +219,7 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
         let mut state = self.lock();
         // A 4 KiB ring takes the longest end record, so only an end already written refuses it.
         if state.writer.put(Kind::End, &end::payload(status)).is_ok() {
-            state.writer.announce();
+            state.announce();
         }
     }
 
@@ -243,7 +262,7 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
         for (start, end) in records() {
             state.writer.put(Kind::Item, &scratch.bytes[start..end])?;
         }
-        state.writer.announce();
+        state.announce();
         let gone = state.links.prune();
         drop(state);
         drop(gone);

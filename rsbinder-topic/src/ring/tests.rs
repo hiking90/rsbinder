@@ -766,6 +766,10 @@ impl<M: Stores> Stores for Paced<'_, M> {
         self.0.bump_seq();
     }
 
+    fn wake_seq(&self) {
+        self.0.wake_seq();
+    }
+
     fn store_ring(&self, position: u64, src: &[u8]) {
         self.0.store_ring(position, src);
         self.1.stores.fetch_add(1, Ordering::Relaxed);
