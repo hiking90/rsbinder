@@ -17,7 +17,7 @@ const RING: usize = 4096;
 
 #[derive(rsbinder::Parcelable, Clone, Debug, Default, PartialEq)]
 #[parcelable(descriptor = "rsbinder.topic.test.Sample")]
-struct Sample {
+pub(crate) struct Sample {
     seq: i32,
     name: String,
     values: Vec<i64>,
@@ -331,7 +331,10 @@ mod mapped {
 
     #[test]
     fn a_ring_under_4_kib_is_refused_and_one_sized_for_a_payload_is_made() {
-        let small = PublisherPolicy { ring_bytes: 4095 };
+        let small = PublisherPolicy {
+            ring_bytes: 4095,
+            ..PublisherPolicy::default()
+        };
         let made = TypedWriter::<Bytes, _>::create(&small);
         assert!(matches!(made.err(), Some(Error::BadValue(_))));
         let policy = PublisherPolicy::for_payload(1, 1);

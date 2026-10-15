@@ -937,7 +937,9 @@ name = "rsbinder-topic"
 version = "0.12.0"
 dependencies = [
  "loom",
+ "miette",
  "rsbinder",
+ "rsbinder-aidl",
  "rustix",
 ]
 

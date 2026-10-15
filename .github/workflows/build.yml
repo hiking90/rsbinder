@@ -250,12 +250,15 @@ jobs:
         # the C header's peer with the runner's own `cc` and `c++` (plan
         # 10-7b P4).
         run: cargo test -p rsbinder-fmq
-      - name: Topic ring tests (hermetic — plan 15)
-        # `rsbinder-topic` so far is its shared-memory core, which needs
-        # memfd only: the ring's writer and reader over heap memory and over
-        # two mappings of one memfd, forged memory images, and the layout of
-        # the two memory objects. Its loom models and its run under Miri are
-        # in `scripts/local_gate.sh`, as `rsbinder-fmq`'s are.
+      - name: Topic tests (hermetic — plan 15)
+        # Needs memfd only: the ring's writer and reader over heap memory and
+        # over two mappings of one memfd, forged memory images, the layout of
+        # the two memory objects, and the subscription call between a
+        # publisher and a subscriber of one process, which reach each other
+        # without binder (and an RPC binder, refused). The two-process tests
+        # are `#[ignore]`d and run in integration-test.yml. Its loom models
+        # and its run under Miri are in `scripts/local_gate.sh`, as
+        # `rsbinder-fmq`'s are.
         run: cargo test -p rsbinder-topic
       - name: rsbinder-tools unit tests (hermetic)
         # The `rsb_hub` configuration parser, policy and enforcer, the NSS

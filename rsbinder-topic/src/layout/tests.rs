@@ -110,10 +110,10 @@ fn an_fd_that_is_not_topic_memory_is_not_mapped() {
 
 #[test]
 fn a_control_page_is_written_by_the_subscriber_and_read_by_the_publisher() {
-    let page = ControlPage::create(0).unwrap();
-    assert_eq!(shm::region_size(page.fd()), Ok(0x80));
-    assert_eq!(shm::verify_received(page.fd()), Ok(0x80));
-    let view = ControlView::map(page.fd(), 0).unwrap();
+    let (fd, page) = ControlPage::create(0).unwrap();
+    assert_eq!(shm::region_size(fd.as_fd()), Ok(0x80));
+    assert_eq!(shm::verify_received(fd.as_fd()), Ok(0x80));
+    let view = ControlView::map(fd.as_fd(), 0).unwrap();
     assert_eq!((view.state().load(), view.read(), view.lost()), (0, 0, 0));
 
     page.state().fetch_or(WAITING, Ordering::SeqCst);
@@ -128,27 +128,27 @@ fn a_control_page_is_written_by_the_subscriber_and_read_by_the_publisher() {
     assert_eq!((view.read(), view.lost()), (1 << 40, 7));
 
     // The publisher's side has no way to a writable mapping.
-    let writable = Mapping::map(page.fd(), 0, 0x80, Access::ReadWrite);
+    let writable = Mapping::map(fd.as_fd(), 0, 0x80, Access::ReadWrite);
     assert_eq!(writable.err(), Some(Error::Os(rustix::io::Errno::PERM)));
 }
 
 #[test]
 fn a_control_page_has_its_pin_words_after_the_header() {
     for (pins, size) in [(0, 0x80), (1, 0x88), (2, 0x88), (3, 0x90), (64, 0x180)] {
-        let page = ControlPage::create(pins).unwrap();
-        assert_eq!(shm::region_size(page.fd()), Ok(size), "{pins} pins");
-        assert!(ControlView::map(page.fd(), pins).is_ok(), "{pins} pins");
+        let (fd, _page) = ControlPage::create(pins).unwrap();
+        assert_eq!(shm::region_size(fd.as_fd()), Ok(size), "{pins} pins");
+        assert!(ControlView::map(fd.as_fd(), pins).is_ok(), "{pins} pins");
     }
 }
 
 #[test]
 fn an_fd_that_is_not_the_control_page_asked_for_is_not_mapped() {
     let map = |fd: BorrowedFd<'_>, pins| bad_value(ControlView::map(fd, pins).map(|_| ()));
-    let page = ControlPage::create(1).unwrap();
-    assert_eq!(map(page.fd(), 0), "control page of another size");
-    assert_eq!(map(page.fd(), 3), "control page of another size");
+    let (fd, _page) = ControlPage::create(1).unwrap();
+    assert_eq!(map(fd.as_fd(), 0), "control page of another size");
+    assert_eq!(map(fd.as_fd(), 3), "control page of another size");
     // One and two pin words take the same eight bytes: the size passes and the word decides.
-    assert_eq!(map(page.fd(), 2), "control page with another pin count");
+    assert_eq!(map(fd.as_fd(), 2), "control page with another pin count");
 
     let blank = sealed(0x80, &[]);
     assert_eq!(

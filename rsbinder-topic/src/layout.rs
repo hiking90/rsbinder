@@ -82,7 +82,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use rsbinder::fmq::shm::{
     self, Access, CreateOptions, Mapping, RoRun, RoWord32, RoWord64, Run, Seals,
 };
-use rsbinder::fmq::{Error, Result};
+use rsbinder::fmq::{Descriptor, Error, Flavor, Grantor, Result};
 
 use crate::ring::{Loads, Stores};
 
@@ -123,6 +123,10 @@ mod control {
 }
 
 /// `state` bit 0: the subscriber is about to sleep, or sleeps, on `seq`.
+#[allow(
+    dead_code,
+    reason = "the waiting receive (plan 15 P2b-2) sets it; tests use it now"
+)]
 pub(crate) const WAITING: u32 = 1;
 
 /// `state` bit 1: the subscriber has dropped the subscription.
@@ -147,7 +151,8 @@ thread_local! {
             reason = "the initializer is `const`; Android's expansion of the macro hides that"
         )
     )]
-    static NO_FUTURE_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static NO_FUTURE_WRITE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// Add `seals` to `fd`: `shm::add_seals`, behind the switch above.
@@ -305,6 +310,10 @@ impl<O> Loaded<O> {
     }
 
     /// The word a subscriber sleeps on.
+    #[allow(
+        dead_code,
+        reason = "the waiting receive (plan 15 P2b-2) sleeps on it; tests use it"
+    )]
     pub(crate) fn seq(&self) -> &RoWord32 {
         self.word32(topic::SEQ)
     }
@@ -395,33 +404,62 @@ pub(crate) fn map_topic(fd: BorrowedFd<'_>, max_ring: usize) -> Result<Loaded<Ma
     Ok(loaded)
 }
 
+/// Where the words between the counters and the ring start: magic, version, `seq` and the rest.
+pub(crate) const HEADER_OFFSET: usize = topic::MAGIC;
+
+/// The grantors of topic memory with a ring of `capacity` bytes, as libfmq's unsynchronized
+/// queue of bytes has them in one fd: write region end, write counter, ring.
+pub(crate) fn grantors(capacity: u64) -> Vec<Grantor> {
+    let grantor = |offset: usize, extent| Grantor {
+        fd_index: 0,
+        offset: offset as u32,
+        extent,
+    };
+    vec![
+        grantor(topic::REGION_END, 8),
+        grantor(topic::WRITE, 8),
+        grantor(topic::RING, capacity),
+    ]
+}
+
+/// The descriptor of topic memory: `fd`, a duplicate of the publisher's, and the grantors.
+pub(crate) fn descriptor(fd: OwnedFd, capacity: u64) -> Descriptor {
+    Descriptor {
+        fds: vec![fd],
+        ints: Vec::new(),
+        grantors: grantors(capacity),
+        quantum: 1,
+        flavor: Flavor::UnsynchronizedWrite,
+    }
+}
+
 /// Bytes of a control page with `pins` pin words.
 fn control_size(pins: u32) -> u64 {
     (control::PIN + 4 * u64::from(pins)).div_ceil(8) * 8
 }
 
-/// A subscriber's control page: the memfd it hands to the publisher, mapped read-write.
+/// A subscriber's control page, mapped read-write.
 pub(crate) struct ControlPage {
-    fd: OwnedFd,
     mapping: Mapping,
 }
 
 impl ControlPage {
-    /// Make a control page with `pins` pin words. The errors are [`create_topic`]'s.
-    pub(crate) fn create(pins: u32) -> Result<Self> {
+    /// Make a control page with `pins` pin words: the fd to hand to the publisher, and the page.
+    /// The errors are [`create_topic`]'s.
+    pub(crate) fn create(pins: u32) -> Result<(OwnedFd, Self)> {
         check_target()?;
         let size = control_size(pins);
         let options = CreateOptions::new("rsbinder-topic-control").populate(true);
         let fd = shm::create(size, &options)?;
         let mapping = Mapping::map(fd.as_fd(), 0, size, Access::ReadWrite)?;
-        let page = Self { fd, mapping };
+        let page = Self { mapping };
         page.word32(control::MAGIC)
             .store(CONTROL_MAGIC, Ordering::Relaxed);
         page.word32(control::VERSION)
             .store(VERSION, Ordering::Relaxed);
         page.word32(control::PINS).store(pins, Ordering::Relaxed);
-        seal(page.fd.as_fd())?;
-        Ok(page)
+        seal(fd.as_fd())?;
+        Ok((fd, page))
     }
 
     fn word32(&self, at: usize) -> &AtomicU32 {
@@ -434,11 +472,6 @@ impl ControlPage {
         debug_assert!(at == control::READ || at == control::LOST);
         // SAFETY: an aligned 8-byte word of the page's second line, in a mapping `self` owns.
         unsafe { self.mapping.as_ptr().add(at).cast::<AtomicU64>().as_ref() }
-    }
-
-    /// The fd to send to the publisher.
-    pub(crate) fn fd(&self) -> BorrowedFd<'_> {
-        self.fd.as_fd()
     }
 
     /// The [`WAITING`] and [`CLOSED`] bits and the count of waits. Changed a bit at a time.
@@ -462,6 +495,10 @@ pub(crate) struct ControlView {
     mapping: Mapping,
 }
 
+#[allow(
+    dead_code,
+    reason = "`read` and `lost` are for statistics (plan 15 P2e); tests use them"
+)]
 impl ControlView {
     /// Map a control page a subscriber sent, after checking the fd, its size and what it holds.
     pub(crate) fn map(fd: BorrowedFd<'_>, pins: u32) -> Result<Self> {

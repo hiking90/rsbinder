@@ -29,15 +29,24 @@ fuzzing = []
 # Not `workspace = true`: a member cannot turn off the default features of an
 # inherited dependency, and this crate must build without `rsbinder/tokio`.
 # The shared-memory primitives come through `rsbinder::fmq::shm`, so there is
-# no direct dependency on `rsbinder-fmq`.
-rsbinder = { version = "0.12.0", path = "../rsbinder", default-features = false }
+# no direct dependency on `rsbinder-fmq`. `async` always: the generated AIDL
+# code takes one shape or the other by `rsbinder`'s `async`, which another
+# crate in the build can turn on and `build.rs` cannot see. It adds no runtime.
+rsbinder = { version = "0.12.0", path = "../rsbinder", default-features = false, features = ["async"] }
 # `Errno`, to tell "the kernel has no `F_SEAL_FUTURE_WRITE`" from the other
 # failures of a seal.
 rustix = { workspace = true }
 
+[build-dependencies]
+rsbinder-aidl = { workspace = true }
+miette = { workspace = true }
+
 [dev-dependencies]
 # `#[derive(rsbinder::Parcelable)]` for the tests' parcelables: the code `.aidl` generates.
-rsbinder = { version = "0.12.0", path = "../rsbinder", default-features = false, features = ["macros"] }
+# `rpc`: an RPC binder, which a subscriber refuses.
+rsbinder = { version = "0.12.0", path = "../rsbinder", default-features = false, features = ["macros", "rpc"] }
+# `setrlimit`, for a subscriber that cannot take the reply's fd.
+rustix = { workspace = true, features = ["process"] }
 
 # loom is only used by the unit tests gated on `--cfg loom` (`src/ring/loom_tests.rs`).
 # Run with (a target dir of its own: the cfg rebuilds every dependency):

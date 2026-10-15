@@ -6,12 +6,13 @@
 use std::fmt;
 use std::marker::PhantomData;
 use std::os::fd::OwnedFd;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use rsbinder::fmq::shm::Mapping;
 use rsbinder::{Status, StatusCode};
 
 use crate::layout::{self, Stored, MIN_RING};
+use crate::link::Links;
 use crate::ring::{Kind, Refused, Stores, Writer};
 use crate::{end, Payload};
 
@@ -27,20 +28,36 @@ pub struct PublisherPolicy {
     /// ring's size over the size of a record; [`for_payload`](Self::for_payload) works the size
     /// out from that.
     pub ring_bytes: usize,
+    /// Subscriptions the topic holds at once. Default 64.
+    ///
+    /// The publisher maps each subscriber's control page and, after every commit, loads a word of
+    /// it, so the bound limits both the mappings a subscriber can make this process hold and the
+    /// work of a publish. One more is refused with [`ITopic::ERROR_FULL`]; subscriptions that
+    /// ended (the subscriber dropped it, or its process died) are taken out first.
+    ///
+    /// [`ITopic::ERROR_FULL`]: crate::aidl::ITopic::ERROR_FULL
+    pub max_subscribers: usize,
+    /// Subscriptions one uid holds at once, refused past it as `max_subscribers` is. Default 64,
+    /// which with the default `max_subscribers` limits nothing: lower it so that one uid allowed
+    /// to subscribe cannot take every place.
+    pub max_per_uid: usize,
 }
 
 impl Default for PublisherPolicy {
     fn default() -> Self {
         Self {
             ring_bytes: 64 << 10,
+            max_subscribers: 64,
+            max_per_uid: 64,
         }
     }
 }
 
 impl PublisherPolicy {
-    /// A ring that keeps the newest `depth` records of up to `max_payload` bytes each, including
-    /// while the next one is being written: `(depth + 1) × (8 + max_payload rounded up to 8)`
-    /// bytes, and no less than 4 KiB. A `depth` of zero is taken as one.
+    /// The default policy with a ring that keeps the newest `depth` records of up to `max_payload`
+    /// bytes each, including while the next one is being written: `(depth + 1) × (8 +
+    /// max_payload rounded up to 8)` bytes, and no less than 4 KiB. A `depth` of zero is taken as
+    /// one.
     ///
     /// Smaller records take less of the ring, so more of them are kept. A size above 1 GiB is
     /// refused when the topic is made.
@@ -49,6 +66,7 @@ impl PublisherPolicy {
         let records = depth.max(1).saturating_add(1);
         Self {
             ring_bytes: records.saturating_mul(record).max(MIN_RING),
+            ..Self::default()
         }
     }
 }
@@ -101,9 +119,15 @@ struct Scratch {
     ends: Vec<usize>,
 }
 
+/// What the publisher's lock guards: the ring's writer and the subscriptions it serves.
+pub(crate) struct State<S> {
+    pub(crate) writer: Writer<S>,
+    pub(crate) links: Links,
+}
+
 /// A topic's writer behind a lock, fed with values of `T`. Any thread may publish.
 pub(crate) struct TypedWriter<T, S> {
-    writer: Mutex<Writer<S>>,
+    state: Mutex<State<S>>,
     /// Buffers to encode into, one per thread that publishes at a time.
     scratch: Mutex<Vec<Scratch>>,
     max_payload: usize,
@@ -125,10 +149,18 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
         Self {
             max_payload: writer.max_payload(),
             capacity: usize::try_from(writer.capacity()).unwrap_or(usize::MAX),
-            writer: Mutex::new(writer),
+            state: Mutex::new(State {
+                writer,
+                links: Links::default(),
+            }),
             scratch: Mutex::new(Vec::new()),
             _payload: PhantomData,
         }
+    }
+
+    /// The lock every change to the ring and to the list of subscriptions takes.
+    pub(crate) fn lock(&self) -> MutexGuard<'_, State<S>> {
+        self.state.lock().expect("lock poisoned")
     }
 
     /// Write `value` as one record.
@@ -165,10 +197,10 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
     /// Write the end record with `status`. Later publishes are [`PublishError::Closed`]; a second
     /// close writes nothing.
     pub(crate) fn close(&self, status: &Status) {
-        let mut writer = self.writer.lock().expect("lock poisoned");
+        let mut state = self.lock();
         // A 4 KiB ring takes the longest end record, so only an end already written refuses it.
-        if writer.put(Kind::End, &end::payload(status)).is_ok() {
-            writer.announce();
+        if state.writer.put(Kind::End, &end::payload(status)).is_ok() {
+            state.writer.announce();
         }
     }
 
@@ -203,13 +235,18 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
             let starts = std::iter::once(0).chain(scratch.ends.iter().copied());
             starts.zip(scratch.ends.iter().copied())
         };
-        let mut writer = self.writer.lock().expect("lock poisoned");
+        let mut state = self.lock();
         // Checked first, so that a refusal comes before the first record and none is written.
-        writer.admits(records().map(|(start, end)| end - start))?;
+        state
+            .writer
+            .admits(records().map(|(start, end)| end - start))?;
         for (start, end) in records() {
-            writer.put(Kind::Item, &scratch.bytes[start..end])?;
+            state.writer.put(Kind::Item, &scratch.bytes[start..end])?;
         }
-        writer.announce();
+        state.writer.announce();
+        let gone = state.links.prune();
+        drop(state);
+        drop(gone);
         Ok(scratch.ends.len())
     }
 }

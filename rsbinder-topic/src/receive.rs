@@ -36,6 +36,8 @@ pub enum Closed {
     End,
     /// The publisher ended it with this status.
     Status(Status),
+    /// The publisher's process died. Every record it committed was returned before this.
+    PublisherDied,
     /// The publisher's memory failed a check: a length or a counter no publisher that follows the
     /// protocol writes. Nothing more is read from it.
     Corrupted,
@@ -57,6 +59,7 @@ impl fmt::Display for Closed {
         match self {
             Self::End => f.write_str("the topic has ended"),
             Self::Status(status) => write!(f, "the topic has ended with {status}"),
+            Self::PublisherDied => f.write_str("the publisher's process died"),
             Self::Corrupted => f.write_str("the topic's memory is corrupted"),
         }
     }
@@ -87,6 +90,16 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
     /// lost.
     pub(crate) fn try_latest(&mut self) -> Result<T, RecvError> {
         typed(self.reader.try_latest())
+    }
+
+    /// Where the next record to return starts.
+    pub(crate) fn position(&self) -> u64 {
+        self.reader.position()
+    }
+
+    /// Records reported as lost so far.
+    pub(crate) fn lost(&self) -> u64 {
+        self.reader.lost()
     }
 }
 

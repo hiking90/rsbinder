@@ -385,6 +385,8 @@ tier_kernel() {
     run "async_wait + entry_kernel_options" tpass cargo test -p tests --features rpc \
         --test async_wait --test entry_kernel_options -- --ignored --test-threads=1
     run "fmq_binder" tpass cargo test -p tests --test fmq_binder -- --ignored
+    run "rsbinder-topic two_process" tpass cargo test -p rsbinder-topic --test two_process \
+        -- --ignored --test-threads=1
     run "reconnect_kernel" tpass cargo test -p tests --features rpc \
         --test reconnect_kernel -- --ignored --test-threads=1
     run "freeze_kernel" tpass cargo test -p tests --features rpc \

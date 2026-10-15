@@ -339,6 +339,20 @@ jobs:
             exit 1
           }
 
+      - name: Run rsbinder-topic two_process (#[ignore]'d)
+        run: |
+          # Plan 15 P2b-1: a publisher and a subscriber in two processes (the
+          # test binary run again as the other one). Subscribers killed, also
+          # while they subscribe, and dropped; refusals across processes; a
+          # reply the subscriber refuses; a publisher that dies. Needs
+          # /dev/binder and the permissive rsb_hub; registers names of its
+          # own. One at a time: each counts the publisher's memfds.
+          RUST_BACKTRACE=1 cargo test -p rsbinder-topic --test two_process -- --ignored --test-threads=1 || {
+            echo "::error::rsbinder-topic two_process failed"
+            cp -f rsb_hub.log artifacts/topic-two-process-rsb_hub.log 2>/dev/null || true
+            exit 1
+          }
+
       - name: Restart test_service for test_death_recipient
         run: |
           # Each #[ignore]'d destructive test consumes a live

@@ -193,6 +193,11 @@ impl<M: Stores> Writer<M> {
         self.index
     }
 
+    /// Whether the end record has been written.
+    pub(crate) fn ended(&self) -> bool {
+        self.ended
+    }
+
     /// Write one record, over the oldest ones when the ring is full, and commit it.
     pub(crate) fn put(&mut self, kind: Kind, payload: &[u8]) -> Result<(), Refused> {
         self.put_raw(kind as u32, payload)
