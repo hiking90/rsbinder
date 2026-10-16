@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! A publisher and a subscriber in two processes over the kernel binder (plan 15 AC-15.2.4,
-//! 2.13, 2.23, 2.44, and the end of a subscription whose publisher died). `#[ignore]`d: they
+//! 2.13, 2.20, 2.23, 2.44, and the end of a subscription whose publisher died). `#[ignore]`d: they
 //! need a binder device and a service manager that lets any name register:
 //!
 //! ```text
@@ -33,8 +33,8 @@ use rsbinder::{
 use rsbinder_topic::aidl::ITopic::{ITopic, ERROR_VERSION};
 use rsbinder_topic::aidl::SubscribeRequest::SubscribeRequest;
 use rsbinder_topic::{
-    wait_any, Bytes, Closed, Payload, Publisher, PublisherPolicy, RecvError, Subscriber,
-    SubscriberPolicy, Wake,
+    wait_any, Bytes, Closed, Disconnected, NamedSubscriber, Payload, Publisher, PublisherPolicy,
+    RecvError, Subscriber, SubscriberPolicy, Wake,
 };
 
 const ROLE: &str = "RSBINDER_TOPIC_ROLE";
@@ -290,6 +290,41 @@ fn a_subscriber_reads_what_a_dead_publisher_committed_then_learns_it_died() {
     assert_eq!(subscriber.try_latest(), died);
 }
 
+/// AC-15.2.20: a subscriber of a name made before its publisher receives from it; after the
+/// publisher is killed and started again, one `Disconnected`, then the new one's first record.
+#[test]
+#[ignore = "needs a binder device and rsb_hub"]
+fn a_name_subscriber_outlives_a_killed_publisher_and_reads_the_next_from_its_first_record() {
+    init();
+    let name = name("named");
+    let policy = SubscriberPolicy::default();
+    let mut subscriber = NamedSubscriber::<Bytes>::subscribe(&name, &policy).unwrap();
+    assert!(!subscriber.wait_connected(Duration::from_millis(100)));
+    let mut peer = Peer::spawn("advertise", &name);
+    assert_eq!(peer.says(), "ready");
+    assert!(subscriber.wait_connected(WAIT));
+    peer.tell("publish 2");
+    assert_eq!(peer.says(), "published");
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![0])));
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![1])));
+    peer.kill();
+    assert_eq!(
+        subscriber.recv_timeout(WAIT),
+        Err(RecvError::Disconnected(Disconnected::Ended(
+            Closed::PublisherDied
+        )))
+    );
+    let mut peer = Peer::spawn("advertise", &name);
+    assert_eq!(peer.says(), "ready");
+    // Published whether or not the subscriber has connected yet.
+    peer.tell("publish 3");
+    assert_eq!(peer.says(), "published");
+    for byte in 0..3 {
+        assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![byte])));
+    }
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+}
+
 /// AC-15.2.5, 2.11: 8 sleeping subscribers of a killed publisher end within 1 s, 1000 times.
 #[test]
 #[ignore = "needs a binder device and rsb_hub"]
@@ -537,9 +572,15 @@ fn child() {
             say(&format!("refused: {}", verdict(refused)));
             wait_for_eof();
         }
-        "publish" => {
-            let publisher = Publisher::<Bytes>::new(&PublisherPolicy::default()).unwrap();
-            hub::add_service(&name, publisher.as_binder()).unwrap();
+        role @ ("publish" | "advertise") => {
+            let policy = PublisherPolicy::default();
+            let publisher = if role == "advertise" {
+                Publisher::<Bytes>::advertise(&name, &policy).unwrap()
+            } else {
+                let publisher = Publisher::<Bytes>::new(&policy).unwrap();
+                hub::add_service(&name, publisher.as_binder()).unwrap();
+                publisher
+            };
             say("ready");
             // `publish N` publishes the bytes 0 to N - 1, as many times as told, until EOF.
             for line in std::io::stdin().lines().map_while(Result::ok) {

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! One publisher and many subscribers over kernel binder (plan 15). **Experimental, and not
-//! complete: no service-manager name layer and no loaned samples yet.**
+//! complete: no loaned samples yet.**
 //!
 //! A topic carries records from one publisher to any number of subscribers. A binder call sets
 //! a subscription up; after it the records travel through shared memory and no binder
@@ -58,6 +58,14 @@
 //! # Ok(()) }
 //! ```
 //!
+//! A topic can also be found by name, the publisher and the subscriber starting in either
+//! order: [`Publisher::advertise`] registers the binder with the service manager, and a
+//! [`NamedSubscriber`] watches the name and connects to whichever publisher holds it, again and
+//! again. Where a `Subscriber`'s topic ends with [`RecvError::Closed`], a `NamedSubscriber`
+//! returns [`RecvError::Disconnected`] once and waits for the next publisher. Names come from a
+//! [`Resolver`], the service manager by default ([`ServiceManager`]). Who may subscribe is
+//! [`PublisherPolicy::authorize`].
+//!
 //! The subscription call never leaves a process whose publisher is in it, so a subscriber of a
 //! publisher of its own process needs no binder device. An RPC binder is not subscribed to.
 //!
@@ -74,21 +82,25 @@ mod connect;
 mod end;
 mod layout;
 mod link;
+mod named;
 mod payload;
 mod poll;
 mod publish;
 mod publisher;
 mod receive;
+mod resolve;
 mod ring;
 mod subscriber;
 mod wait;
 mod wake;
 
+pub use named::NamedSubscriber;
 pub use payload::{Bytes, Payload};
 pub use poll::{wait_any, Wait};
-pub use publish::{PublishError, PublisherPolicy};
+pub use publish::{Authorize, PublishError, PublisherPolicy};
 pub use publisher::{Acceptor, Publisher};
-pub use receive::{Closed, RecvError};
+pub use receive::{Closed, Disconnected, RecvError};
+pub use resolve::{Resolver, ServiceManager, Watch};
 pub use subscriber::{Interrupter, Start, Subscriber, SubscriberPolicy, Wake};
 
 #[cfg(any(test, feature = "fuzzing"))]
@@ -117,6 +129,19 @@ mod typed_tests;
     )
 ))]
 mod connect_tests;
+
+#[cfg(all(
+    test,
+    not(loom),
+    not(miri),
+    any(target_os = "linux", target_os = "android"),
+    any(
+        target_pointer_width = "64",
+        all(target_arch = "x86", target_feature = "sse2"),
+        all(target_arch = "arm", target_has_atomic = "64")
+    )
+))]
+mod named_tests;
 
 #[cfg(all(
     test,

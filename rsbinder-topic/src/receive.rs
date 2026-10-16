@@ -14,7 +14,8 @@ use crate::{end, Payload};
 /// Why a receive returned no value.
 ///
 /// `Empty`, `Timeout`, `Cancelled`, `Lagged` and `Decode` leave the subscription as it was;
-/// `Closed` ends it, and every later receive returns it again.
+/// `Closed` ends it, and every later receive returns it again. `Disconnected` is the
+/// [`NamedSubscriber`](crate::NamedSubscriber)'s, which goes on with the next publisher.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RecvError {
     /// No record is unread. The next receive tries again from the same place.
@@ -33,6 +34,30 @@ pub enum RecvError {
     Decode(StatusCode),
     /// The topic has ended: every record before the end has been returned.
     Closed(Closed),
+    /// A [`NamedSubscriber`](crate::NamedSubscriber)'s connection to one publisher is over, or
+    /// could not be made, and the subscriber waits for the next publisher of the name. Returned
+    /// once per event; the next receive goes on with the next connection. A
+    /// [`Subscriber`](crate::Subscriber) never returns it.
+    Disconnected(Disconnected),
+}
+
+/// Why a [`NamedSubscriber`](crate::NamedSubscriber) lost or did not get a connection.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Disconnected {
+    /// The topic of the connection ended, as [`Closed`] says. Every record before the end was
+    /// returned.
+    Ended(Closed),
+    /// The publisher refused the subscription with this status. Refusals that a retry cannot
+    /// change (`EX_SECURITY`, `BadType`, [`ITopic::ERROR_VERSION`]) wait for another publisher
+    /// to take the name; [`ITopic::ERROR_FULL`] and transaction errors are retried on the same
+    /// publisher, at intervals from 1 to 30 seconds, and reported once.
+    ///
+    /// [`ITopic::ERROR_VERSION`]: crate::aidl::ITopic::ERROR_VERSION
+    /// [`ITopic::ERROR_FULL`]: crate::aidl::ITopic::ERROR_FULL
+    Rejected(Status),
+    /// Another publisher took the name. Every record the previous one had committed when this
+    /// was seen was returned first.
+    Replaced,
 }
 
 /// How a topic ended.
@@ -58,6 +83,17 @@ impl fmt::Display for RecvError {
             Self::Lagged(records) => write!(f, "{records} records were overwritten unread"),
             Self::Decode(code) => write!(f, "a record failed to decode: {code}"),
             Self::Closed(closed) => fmt::Display::fmt(closed, f),
+            Self::Disconnected(why) => fmt::Display::fmt(why, f),
+        }
+    }
+}
+
+impl fmt::Display for Disconnected {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ended(closed) => write!(f, "disconnected: {closed}"),
+            Self::Rejected(status) => write!(f, "the publisher refused the subscription: {status}"),
+            Self::Replaced => f.write_str("another publisher took the name"),
         }
     }
 }
@@ -113,6 +149,11 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
     /// Whether the publisher has committed past this reader.
     pub(crate) fn pending(&self) -> bool {
         self.reader.pending()
+    }
+
+    /// Where the publisher's committed records end now.
+    pub(crate) fn committed(&self) -> u64 {
+        self.reader.committed()
     }
 }
 

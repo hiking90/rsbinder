@@ -431,6 +431,11 @@ impl<M: Loads> Reader<M> {
         self.memory.write() != self.read
     }
 
+    /// Where the publisher's committed records end now.
+    pub(crate) fn committed(&self) -> u64 {
+        self.memory.write()
+    }
+
     /// The next record, without waiting.
     pub(crate) fn try_recv(&mut self) -> Result<Taken<'_>, Corrupted> {
         let outcome = self.next()?;

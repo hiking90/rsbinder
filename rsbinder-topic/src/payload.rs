@@ -44,6 +44,30 @@ pub trait Payload: Sized {
 /// An AIDL parcelable. A binder or a file descriptor in the value cannot be carried, since
 /// neither means anything in the subscriber's process: [`rsbinder::to_bytes`] refuses the first
 /// with `BadType` and the second with `FdsNotAllowed`.
+///
+/// The type name is the parcelable's descriptor, which for a generic parcelable (`Foo<T>`) names
+/// no type argument, as in AOSP's generated code, where `ParcelableHolder` carries and compares
+/// that string. So `Foo<A>` and `Foo<B>` have one type name, and a subscriber of one is taken by
+/// a publisher of the other, whose records then fail to decode or decode wrong. A topic of a
+/// generic parcelable that must not meet another instance wraps it in a type of its own that
+/// implements `Payload` with a name that says the arguments:
+///
+/// ```ignore
+/// struct Pairs(Pair<i64>);
+///
+/// impl rsbinder_topic::Payload for Pairs {
+///     fn type_name() -> &'static str {
+///         "my.package.Pair<long>"
+///     }
+///     fn encode(&self, out: &mut Vec<u8>) -> rsbinder::Result<()> {
+///         out.extend_from_slice(&rsbinder::to_bytes(&self.0)?);
+///         Ok(())
+///     }
+///     fn decode(bytes: &[u8]) -> rsbinder::Result<Self> {
+///         rsbinder::from_bytes(bytes).map(Self)
+///     }
+/// }
+/// ```
 impl<T: Serialize + Deserialize + ParcelableMetadata> Payload for T {
     fn type_name() -> &'static str {
         T::descriptor()

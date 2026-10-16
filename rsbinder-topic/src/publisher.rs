@@ -30,7 +30,8 @@ use crate::connect::{asked_here, refuse, status_of};
 use crate::layout::{self, ControlView, Stored, HEADER_OFFSET, VERSION};
 use crate::link::{Dead, Forget, Link};
 use crate::publish::TypedWriter;
-use crate::{wake, Payload, PublishError, PublisherPolicy};
+use crate::resolve::{Resolver, ServiceManager};
+use crate::{wake, Authorize, Payload, PublishError, PublisherPolicy};
 
 /// The sending end of a topic of `T`: it writes values into the topic's memory and takes
 /// subscriptions to it.
@@ -66,6 +67,7 @@ struct Shared<T> {
     capacity: u64,
     max_subscribers: usize,
     max_per_uid: usize,
+    authorize: Option<Authorize>,
 }
 
 impl<T: Payload + 'static> Publisher<T> {
@@ -83,12 +85,40 @@ impl<T: Payload + 'static> Publisher<T> {
             capacity,
             max_subscribers: policy.max_subscribers,
             max_per_uid: policy.max_per_uid,
+            authorize: policy.authorize.clone(),
         });
         let acceptor = Acceptor {
             topic: Arc::downgrade(&shared) as Weak<dyn Accept>,
         };
         let binder = BnTopic::new_binder(Service { acceptor }).as_binder();
         Ok(Self { shared, binder })
+    }
+
+    /// Make a topic with `policy` and register its binder with the service manager under
+    /// `name`, for [`NamedSubscriber`](crate::NamedSubscriber)s of the name to find.
+    ///
+    /// The name follows the service manager's rules for a service name; a name it refuses, or a
+    /// caller it does not let add a service, fails here. The errors of [`new`](Self::new) come
+    /// back as a status: `EX_UNSUPPORTED_OPERATION` for `Unsupported`, `BadValue`, or an OS
+    /// error's code. Who may subscribe is [`PublisherPolicy::authorize`].
+    ///
+    /// Dropping the publisher ends the topic but leaves the name registered until the process
+    /// ends; a subscriber that reaches it after that is refused with
+    /// [`ITopic::ERROR_CLOSED`](crate::aidl::ITopic::ERROR_CLOSED) and waits for the next
+    /// registration of the name.
+    pub fn advertise(name: &str, policy: &PublisherPolicy) -> BinderResult<Self> {
+        Self::advertise_with(name, policy, &ServiceManager)
+    }
+
+    /// [`advertise`](Self::advertise) through `resolver` instead of the service manager.
+    pub fn advertise_with(
+        name: &str,
+        policy: &PublisherPolicy,
+        resolver: &dyn Resolver,
+    ) -> BinderResult<Self> {
+        let publisher = Self::new(policy).map_err(status_of)?;
+        resolver.advertise(name, publisher.as_binder())?;
+        Ok(publisher)
     }
 }
 
@@ -121,7 +151,6 @@ impl<T: Payload + 'static> Publisher<T> {
     pub(crate) fn sends(&self) -> u64 {
         self.shared.writer.sends()
     }
-
     /// The subscriptions the topic holds, after taking out those that ended.
     ///
     /// For skipping the work of a value no one would receive; it changes as subscribers come
@@ -225,7 +254,8 @@ pub struct Acceptor {
 impl Acceptor {
     /// Take the subscription `request` asks for, or say why not.
     ///
-    /// Refusals: [`ITopic::ERROR_VERSION`] for another layout version; `BadType` when the
+    /// Refusals: `EX_SECURITY` when [`PublisherPolicy::authorize`] does not admit the caller,
+    /// checked first; [`ITopic::ERROR_VERSION`] for another layout version; `BadType` when the
     /// request names another payload type; `BadValue` for a token of this process that came
     /// through binder (its death would say nothing about the caller), a nonzero pin count, a
     /// `wake` that is neither [`ITopic::WAKE_FUTEX`] nor [`ITopic::WAKE_FD`], or a control page
@@ -268,6 +298,14 @@ trait Accept: Send + Sync {
 
 impl<T: Payload + 'static> Accept for Shared<T> {
     fn accept(self: Arc<Self>, request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
+        if let Some(authorize) = &self.authorize {
+            if !authorize.admits(&CallingContext::default()) {
+                return Err(Status::from((
+                    ExceptionCode::Security,
+                    "the publisher's policy does not admit the caller",
+                )));
+            }
+        }
         if request.version != VERSION as i32 {
             return Err(refuse(
                 ERROR_VERSION,

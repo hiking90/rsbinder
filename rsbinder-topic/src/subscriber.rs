@@ -378,8 +378,18 @@ impl<T: Payload> Subscriber<T> {
     /// A handle that ends this subscriber's wait from another thread.
     pub fn interrupter(&self) -> Interrupter {
         Interrupter {
-            local: Arc::downgrade(&self.local),
+            target: Target::Subscriber(Arc::downgrade(&self.local)),
         }
+    }
+
+    /// Where the next record to return starts.
+    pub(crate) fn position(&self) -> u64 {
+        self.reader.position()
+    }
+
+    /// Where the publisher's committed records end now.
+    pub(crate) fn committed(&self) -> u64 {
+        self.reader.committed()
     }
 
     /// The next record, or the newest with `latest`, without waiting.
@@ -394,7 +404,7 @@ impl<T: Payload> Subscriber<T> {
     }
 
     /// A receive that waits until `deadline`, or without a bound.
-    fn wait(&mut self, deadline: Option<Instant>, latest: bool) -> Result<T, RecvError> {
+    pub(crate) fn wait(&mut self, deadline: Option<Instant>, latest: bool) -> Result<T, RecvError> {
         #[cfg(feature = "tokio")]
         {
             // Before the first look: a wait left on the pool would take the next wake.
@@ -608,24 +618,55 @@ impl Reactor {
 /// record does not wait and does not consume the interrupt. The subscription goes on either way.
 #[derive(Clone)]
 pub struct Interrupter {
-    local: Weak<Local<Parts>>,
+    target: Target,
+}
+
+/// What an [`Interrupter`] ends the wait of.
+#[derive(Clone)]
+enum Target {
+    Subscriber(Weak<Local<Parts>>),
+    Named(Weak<dyn Interrupt>),
+}
+
+/// A subscriber whose waits an [`Interrupter`] ends.
+pub(crate) trait Interrupt: Send + Sync {
+    fn interrupt(&self);
 }
 
 impl Interrupter {
+    pub(crate) fn named(named: Weak<dyn Interrupt>) -> Self {
+        Self {
+            target: Target::Named(named),
+        }
+    }
+
     /// End the wait in progress, or the next one. Returns once that wait is out of its sleep, or
     /// at once when none sleeps; does nothing after the subscriber has been dropped.
     pub fn interrupt(&self) {
-        if let Some(local) = self.local.upgrade() {
-            local.raise(INTERRUPT);
+        match &self.target {
+            Target::Subscriber(local) => {
+                if let Some(local) = local.upgrade() {
+                    local.raise(INTERRUPT);
+                }
+            }
+            Target::Named(named) => {
+                if let Some(named) = named.upgrade() {
+                    named.interrupt();
+                }
+            }
         }
     }
 
     /// `interrupt`, and the wakes it sent.
     #[cfg(all(test, not(loom), any(target_os = "linux", target_os = "android")))]
     pub(crate) fn interrupt_counting(&self) -> usize {
-        self.local
-            .upgrade()
-            .map_or(0, |local| local.raise(INTERRUPT))
+        match &self.target {
+            Target::Subscriber(local) => local.upgrade().map_or(0, |local| local.raise(INTERRUPT)),
+            Target::Named(_) => {
+                self.interrupt();
+                0
+            }
+        }
     }
 }
 

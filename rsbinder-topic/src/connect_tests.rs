@@ -654,6 +654,69 @@ fn a_publisher_is_shared_between_threads_and_a_subscriber_moved_to_one() {
     moved::<Subscriber<Bytes>>();
 }
 
+/// A generic parcelable as AIDL generates one: the descriptor names no type argument.
+#[derive(Debug, Default, PartialEq)]
+struct Pair<T>(T);
+
+impl<T> rsbinder::ParcelableMetadata for Pair<T> {
+    fn descriptor() -> &'static str {
+        "rsbinder.topic.test.Pair"
+    }
+}
+
+impl<T: rsbinder::Serialize> rsbinder::Serialize for Pair<T> {
+    fn serialize(&self, parcel: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
+        parcel.write(&self.0)
+    }
+}
+
+impl<T: rsbinder::Deserialize> rsbinder::Deserialize for Pair<T> {
+    fn deserialize(parcel: &mut rsbinder::Parcel) -> rsbinder::Result<Self> {
+        parcel.read().map(Self)
+    }
+}
+
+/// `Pair<i64>` under a name of its own, as `Payload`'s documentation shows.
+#[derive(Debug, PartialEq)]
+struct Longs(Pair<i64>);
+
+impl Payload for Longs {
+    fn type_name() -> &'static str {
+        "rsbinder.topic.test.Pair<long>"
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) -> rsbinder::Result<()> {
+        out.extend_from_slice(&rsbinder::to_bytes(&self.0)?);
+        Ok(())
+    }
+
+    fn decode(bytes: &[u8]) -> rsbinder::Result<Self> {
+        rsbinder::from_bytes(bytes).map(Self)
+    }
+}
+
+#[test]
+fn instances_of_a_generic_parcelable_share_a_type_name_unless_wrapped() {
+    assert_eq!(
+        <Pair<i32> as Payload>::type_name(),
+        <Pair<i64> as Payload>::type_name()
+    );
+    let publisher = Publisher::<Pair<i32>>::new(&policy()).unwrap();
+    let topic = publisher.as_binder();
+    // Taken, and the records are not what the subscriber's type reads.
+    let mut other = subscribe::<Pair<i64>>(&topic, Start::Latest).unwrap();
+    publisher.publish(&Pair(7)).unwrap();
+    assert!(matches!(other.try_recv(), Err(RecvError::Decode(_))));
+    assert_eq!(
+        code(subscribe::<Longs>(&topic, Start::Latest)),
+        StatusCode::BadType
+    );
+    let longs = Publisher::<Longs>::new(&policy()).unwrap();
+    let mut wrapped = subscribe::<Longs>(&longs.as_binder(), Start::Latest).unwrap();
+    longs.publish(&Longs(Pair(-3))).unwrap();
+    assert_eq!(wrapped.try_recv(), Ok(Longs(Pair(-3))));
+}
+
 #[test]
 fn grantors_name_the_unsynchronized_queue_of_bytes() {
     let at = |offset, extent| Grantor {

@@ -7,10 +7,10 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{fence, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use rsbinder::fmq::shm::Mapping;
-use rsbinder::{Status, StatusCode};
+use rsbinder::{CallingContext, Status, StatusCode};
 
 use crate::layout::{self, Stored, MIN_RING};
 use crate::link::Links;
@@ -42,6 +42,16 @@ pub struct PublisherPolicy {
     /// which with the default `max_subscribers` limits nothing: lower it so that one uid allowed
     /// to subscribe cannot take every place.
     pub max_per_uid: usize,
+    /// Who may subscribe. Default `None`: any caller that can reach the topic's binder, which
+    /// for a topic registered with the service manager is any caller it lets find the name.
+    ///
+    /// Checked first for every subscription, from the publisher's own binder
+    /// ([`Publisher::as_binder`](crate::Publisher::as_binder)) and from an
+    /// [`Acceptor`](crate::Acceptor) alike, with the caller of the subscription call; a
+    /// refusal is `EX_SECURITY`, which a [`NamedSubscriber`](crate::NamedSubscriber) does not
+    /// retry on the same publisher. A subscriber in the publisher's process is seen with the
+    /// process's own uid and pid.
+    pub authorize: Option<Authorize>,
 }
 
 impl Default for PublisherPolicy {
@@ -50,7 +60,52 @@ impl Default for PublisherPolicy {
             ring_bytes: 64 << 10,
             max_subscribers: 64,
             max_per_uid: 64,
+            authorize: None,
         }
+    }
+}
+
+/// A check of the caller that a topic runs before it takes a subscription:
+/// [`PublisherPolicy::authorize`].
+///
+/// ```
+/// use rsbinder_topic::{Authorize, PublisherPolicy};
+///
+/// let policy = PublisherPolicy {
+///     authorize: Some(Authorize::new(|caller| caller.uid == 1000)),
+///     ..PublisherPolicy::default()
+/// };
+/// # drop(policy);
+/// ```
+///
+/// Two values are equal when they are clones of one check.
+#[derive(Clone)]
+pub struct Authorize(Arc<dyn Fn(&CallingContext) -> bool + Send + Sync>);
+
+impl Authorize {
+    /// A check that admits the callers for which `admit` returns `true`. It runs on the binder
+    /// thread the subscription call arrived on, while the call waits.
+    pub fn new(admit: impl Fn(&CallingContext) -> bool + Send + Sync + 'static) -> Self {
+        Self(Arc::new(admit))
+    }
+
+    /// Whether the check admits `caller`.
+    pub fn admits(&self, caller: &CallingContext) -> bool {
+        (self.0)(caller)
+    }
+}
+
+impl PartialEq for Authorize {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for Authorize {}
+
+impl fmt::Debug for Authorize {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Authorize").finish_non_exhaustive()
     }
 }
 
