@@ -162,6 +162,13 @@ Each item below changes what a 0.12.0 program observes.
   that every channel in a process counts against one limit on concurrent
   looks (half the cores); `stream` now calls it from here.
 
+### Changed
+
+- **The `tokio` floor is 1.53.3**, the first release with
+  `AsyncFd::register_with_interest`; the constructors it replaces are
+  deprecated there as unsound (tokio #8587). `rsbinder` itself makes no new
+  call; the workspace shares one floor.
+
 ### Fixed
 
 - **On 32-bit Android, `rsbinder-fmq`'s futex wait and wake call `futex`, not

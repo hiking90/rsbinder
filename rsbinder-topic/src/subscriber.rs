@@ -295,7 +295,7 @@ impl<T: Payload> Subscriber<T> {
     /// # Panics
     ///
     /// Outside a Tokio runtime, as `tokio::task::spawn_blocking` does, and with [`Wake::Fd`] in a
-    /// runtime whose IO driver is off, as `AsyncFd::new` does.
+    /// runtime whose IO driver is off, as `AsyncFd::register` does.
     #[cfg(feature = "tokio")]
     pub async fn recv_async(&mut self) -> Result<T, RecvError> {
         if self.local.words().fd.is_some() {
@@ -569,7 +569,8 @@ impl AsRawFd for Unowned {
 impl Reactor {
     fn new(fds: [BorrowedFd<'_>; 2]) -> std::io::Result<Self> {
         let register = |fd: BorrowedFd<'_>| {
-            AsyncFd::with_interest(Unowned(fd.as_raw_fd()), Interest::READABLE)
+            // SAFETY: `local` owns both fds and outlives `reactor`, the field declared before it.
+            unsafe { AsyncFd::register_with_interest(Unowned(fd.as_raw_fd()), Interest::READABLE) }
         };
         let [socket, event] = fds;
         Ok(Self([register(socket)?, register(event)?]))
