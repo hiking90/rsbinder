@@ -4,7 +4,8 @@
 //! ```text
 //! ipc-compare b1 --impl rsb|ix [--wait block|poll] --size B
 //! ipc-compare b2 --impl rsb-stream|ix [--wait block|poll] --size B --rate HZ
-//! ipc-compare b3 --impl rsb-stream|rsb-oneway|ix [--wait block|poll] --n N --size B --rate HZ
+//! ipc-compare b3 --impl rsb-stream|rsb-oneway|rsb-topic|ix [--wait block|poll] --n N --size B --rate HZ
+//!   (rsb-topic also takes --wait fd)
 //! ipc-compare b4 --impl fmq|ix
 //!   [--count C --warmup W] [--producer-cpu 1] [--consumer-cpus 2,3,4,5,6,7,0,8]
 //! ```
@@ -57,6 +58,7 @@ fn child(words: &[String]) {
         "rsb-producer" => rsb::producer(&a).err().map(|e| format!("{e:?}")),
         "rsb-stream" => rsb::stream_consumer(&a).err().map(|e| format!("{e:?}")),
         "rsb-oneway" => rsb::callback_consumer(&a).err().map(|e| format!("{e:?}")),
+        "rsb-topic" => rsb::topic_consumer(&a).err().map(|e| format!("{e:?}")),
         "rsb-echo" => rsb::echo_client(&a).err().map(|e| format!("{e:?}")),
         "ix-producer" => ix::producer(&a).err().map(|e| e.to_string()),
         "ix-consumer" => ix::consumer(&a).err().map(|e| e.to_string()),
@@ -158,6 +160,12 @@ fn fanout(bench: &str, a: &Args) {
                 }
                 note.push(format!("ring {ring} B"));
             }
+            let producer = spawn("rsb-producer", &[("name", name.clone()), ("cpu", producer_cpu)]);
+            (producer, imp.clone(), vec![("ring", ring.to_string())])
+        }
+        "rsb-topic" => {
+            let ring = rsb::topic_ring_for(size);
+            note.push(format!("ring {ring} B; copies the payload out"));
             let producer = spawn("rsb-producer", &[("name", name.clone()), ("cpu", producer_cpu)]);
             (producer, imp.clone(), vec![("ring", ring.to_string())])
         }

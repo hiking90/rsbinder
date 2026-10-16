@@ -13,6 +13,7 @@ edition = "2021"
 
 [dependencies]
 rsbinder = { path = "../../rsbinder" }
+rsbinder-topic = { path = "../../rsbinder-topic" }
 iceoryx2 = "=0.10.0"
 iceoryx2-bb-lock-free = "=0.10.0"
 hdrhistogram = "7.5"

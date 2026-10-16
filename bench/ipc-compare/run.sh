@@ -4,8 +4,9 @@
 #   bench/ipc-compare/run.sh all|b1|b2|b3|b4|stream|ix-block [repeats]
 #
 # `stream` is B2 for rsbinder's stream alone, the comparison AC-15.1.10 makes before and after
-# P1a-3; run it with 5 repeats. `ix-block` is the iceoryx2 blocking rows of B2 and B3. Each
-# repeat writes its own CSV.
+# P1a-3; run it with 5 repeats. `ix-block` is the iceoryx2 blocking rows of B2 and B3. `topic`
+# is B2 and B3 for rsbinder-topic (futex, fd and poll waits) next to iceoryx2's. Each repeat
+# writes its own CSV.
 #
 # Results go to plans/15-pubsub-bench/<time>-<set>/: conditions.txt and results-<repeat>.csv.
 #
@@ -120,6 +121,9 @@ for repeat in $(seq "$repeats"); do
         b4) b4 ;;
         stream) b2 "rsb-stream block" "rsb-stream poll" ;;
         ix-block) b2 "ix block"; b3 "ix block" ;;
+        topic)
+            topic_pairs=("rsb-topic block" "rsb-topic fd" "rsb-topic poll" "ix block" "ix poll")
+            b2 "${topic_pairs[@]}"; b3 "${topic_pairs[@]}" ;;
         *) echo "run.sh: unknown set $set_name" >&2; exit 2 ;;
     esac
 done

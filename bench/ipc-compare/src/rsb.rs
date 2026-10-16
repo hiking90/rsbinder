@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use rsbinder::stream::{Receiver, ReceiverPolicy, Sink, SinkPolicy, StreamEndpoint};
 use rsbinder::*;
+use rsbinder_topic::{Bytes, Publisher, PublisherPolicy, RecvError, Subscriber, SubscriberPolicy, Wake};
 
 use crate::common::*;
 
@@ -64,10 +65,17 @@ pub fn ring_for(size: usize) -> usize {
     ((size + 64) * 4).next_power_of_two().clamp(64 * 1024, MAX_RING)
 }
 
+/// The topic's ring: `depth` records of `size`, iceoryx2's subscriber buffer for that size.
+pub fn topic_ring_for(size: usize) -> usize {
+    let depth = crate::ix::buffer_for(size);
+    PublisherPolicy::for_payload(size.max(STAMP_BYTES), depth).ring_bytes
+}
+
 #[derive(Default)]
 struct Producer {
     streams: Mutex<Vec<Sink<StreamBytes>>>,
     callbacks: Mutex<Vec<Strong<dyn IBenchSink>>>,
+    topic: Mutex<Option<Publisher<Bytes>>>,
     failures: Arc<AtomicI32>,
 }
 
@@ -86,18 +94,43 @@ impl IBench for Producer {
         Ok(())
     }
 
+    fn r#topic(&self, ring_bytes: i32) -> BinderResult<SIBinder> {
+        let mut topic = self.topic.lock().expect("lock");
+        if topic.is_none() {
+            let policy = PublisherPolicy {
+                ring_bytes: ring_bytes.max(0) as usize,
+                ..PublisherPolicy::default()
+            };
+            let publisher = Publisher::<Bytes>::new(&policy).map_err(|e| {
+                eprintln!("rsb-producer: topic: {e}");
+                Status::from(StatusCode::NoMemory)
+            })?;
+            *topic = Some(publisher);
+        }
+        Ok(topic.as_ref().expect("made above").as_binder())
+    }
+
     fn r#start(&self, count: i32, size: i32, rate_hz: i32) -> BinderResult<()> {
         let mut sinks = std::mem::take(&mut *self.streams.lock().expect("lock"));
         let callbacks = std::mem::take(&mut *self.callbacks.lock().expect("lock"));
+        let topic = self.topic.lock().expect("lock").take();
         let failures = self.failures.clone();
         failures.store(0, Ordering::SeqCst);
         std::thread::spawn(move || {
             let mut item = StreamBytes(vec![0u8; (size.max(0) as usize).max(STAMP_BYTES)]);
+            let mut record = Bytes(item.0.clone());
             let period = if rate_hz > 0 { 1_000_000_000 / rate_hz as u64 } else { 0 };
             let start = now_ns() + 1_000_000;
             for seq in 0..count.max(0) as u64 {
                 if period > 0 {
                     sleep_until(start + seq * period);
+                }
+                if let Some(topic) = &topic {
+                    stamp(&mut record.0, seq);
+                    if topic.publish(&record).is_err() {
+                        failures.fetch_add(1, Ordering::Relaxed);
+                    }
+                    continue;
                 }
                 stamp(&mut item.0, seq);
                 for sink in sinks.iter_mut() {
@@ -114,6 +147,8 @@ impl IBench for Producer {
             for sink in sinks {
                 let _ = sink.end();
             }
+            // Dropping the publisher writes the end record its subscribers stop at.
+            drop(topic);
         });
         Ok(())
     }
@@ -188,6 +223,52 @@ pub fn stream_consumer(a: &Args) -> Result<()> {
         };
         idle = None;
         record.take(&item.0);
+    }
+    println!("{}", record.line());
+    Ok(())
+}
+
+/// Child role `rsb-topic`: one topic subscriber. `--wait block` sleeps on the futex, `fd` on
+/// the wake socket, `poll` spins on `try_recv`. Records the ring overwrote count toward `count`
+/// and are reported as `lost=` in the note: a publish never waits for a subscriber.
+pub fn topic_consumer(a: &Args) -> Result<()> {
+    pin(a.num("cpu", 2) as usize);
+    let count = a.num("count", 0);
+    let wait = a.str("wait", "block");
+    let bench = connect(&a.str("name", ""))?;
+    let topic = bench.r#topic(a.num("ring", 64 * 1024) as i32)?;
+    let policy = SubscriberPolicy {
+        max_ring_bytes: 1 << 30,
+        wake: if wait == "fd" { Wake::Fd } else { Wake::Futex },
+        ..SubscriberPolicy::default()
+    };
+    let mut subscriber = Subscriber::<Bytes>::request(&topic, &policy)?;
+    ready("SUBSCRIBED");
+    let mut record = Record::new(a.num("warmup", 0));
+    let mut lost = 0u64;
+    let mut idle: Option<Instant> = None;
+    while record.received + lost < count {
+        let got = if wait == "poll" { subscriber.try_recv() } else { subscriber.recv_timeout(SILENCE) };
+        match got {
+            Ok(item) => {
+                idle = None;
+                record.take(&item.0);
+            }
+            Err(RecvError::Empty) => {
+                if idle.get_or_insert_with(Instant::now).elapsed() > SILENCE {
+                    break;
+                }
+            }
+            Err(RecvError::Lagged(n)) => lost += n,
+            Err(RecvError::Closed(_) | RecvError::Timeout) => break,
+            Err(e) => {
+                eprintln!("rsb-topic: {e}");
+                break;
+            }
+        }
+    }
+    if lost > 0 {
+        record.extra = format!("lost={lost}");
     }
     println!("{}", record.line());
     Ok(())

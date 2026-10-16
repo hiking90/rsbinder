@@ -12,6 +12,10 @@ interface IBench {
 
     void addCallback(IBenchSink sink);
 
+    // The producer's topic (rsbinder-topic), made on the first call with a
+    // ring of `ringBytes`; start() publishes to it as well.
+    IBinder topic(int ringBytes);
+
     // Publishes `count` items of `size` bytes to every consumer added, at
     // `rateHz` (0 = as fast as the slowest consumer takes them), then ends.
     void start(int count, int size, int rateHz);
