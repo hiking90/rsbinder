@@ -52,4 +52,13 @@ parcelable SubscribeRequest {
      * loans, and the publisher refuses any other value with `BAD_VALUE`.
      */
     int pins;
+
+    /**
+     * How the publisher wakes the subscriber: ITopic.WAKE_FUTEX, a futex on
+     * the topic memory's `seq` that one wake per commit serves for every
+     * such subscriber, or ITopic.WAKE_FD, a byte on a socket of this
+     * subscription alone, which the subscriber can poll with other fds. The
+     * publisher refuses any other value with `BAD_VALUE`.
+     */
+    int wake;
 }

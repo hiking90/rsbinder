@@ -9,7 +9,7 @@
 //! "Futex system calls" here are the publisher's wakes, which it counts: the lock it takes is
 //! uncontended in these tests, and a waiting subscriber's own sleep is not the publisher's.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -217,16 +217,30 @@ fn a_slow_subscriber_is_told_what_it_lost_and_the_others_lose_nothing() {
     let publisher = topic(64 << 10);
     let mut slow = subscriber(&publisher);
     let mut fast = subscriber(&publisher);
-    let receiving = thread::spawn(move || {
-        (0..20_000)
-            .map(|_| fast.recv().map(|bytes| value(&bytes)))
-            .collect::<Vec<_>>()
-    });
-    for n in 0..20_000 {
-        publisher.publish(&num(n)).unwrap();
-        if n % 1000 == 999 {
-            thread::sleep(Duration::from_millis(1));
+    let read = Arc::new(AtomicU32::new(0));
+    // Up to the first error, so that a lag or a lost wake fails the test instead of hanging it.
+    let receiving = thread::spawn({
+        let read = read.clone();
+        move || {
+            let mut got = Vec::new();
+            while got.len() < 20_000 {
+                let received = fast.recv_timeout(Duration::from_secs(10));
+                let stop = received.is_err();
+                got.push(received.map(|bytes| value(&bytes)));
+                read.fetch_add(1, Ordering::Relaxed);
+                if stop {
+                    break;
+                }
+            }
+            got
         }
+    });
+    for n in 0..20_000u32 {
+        // Half the ring ahead at most: a reader the scheduler holds back must not lag.
+        while n.saturating_sub(read.load(Ordering::Relaxed)) > 2000 && !receiving.is_finished() {
+            thread::sleep(Duration::from_micros(100));
+        }
+        publisher.publish(&num(n)).unwrap();
     }
     let all: Vec<Result<u32, RecvError>> = (0..20_000).map(Ok).collect();
     assert_eq!(receiving.join().unwrap(), all);

@@ -33,7 +33,8 @@ use rsbinder::{
 use rsbinder_topic::aidl::ITopic::{ITopic, ERROR_VERSION};
 use rsbinder_topic::aidl::SubscribeRequest::SubscribeRequest;
 use rsbinder_topic::{
-    Bytes, Closed, Payload, Publisher, PublisherPolicy, RecvError, Subscriber, SubscriberPolicy,
+    wait_any, Bytes, Closed, Payload, Publisher, PublisherPolicy, RecvError, Subscriber,
+    SubscriberPolicy, Wake,
 };
 
 const ROLE: &str = "RSBINDER_TOPIC_ROLE";
@@ -293,11 +294,26 @@ fn a_subscriber_reads_what_a_dead_publisher_committed_then_learns_it_died() {
 #[test]
 #[ignore = "needs a binder device and rsb_hub"]
 fn sleeping_subscribers_learn_within_a_second_that_their_publisher_died() {
+    sleepers_of_a_killed_publisher(Wake::Futex);
+}
+
+/// The same with the fd wake: the death notice or the socket's hang-up, whichever comes first.
+#[test]
+#[ignore = "needs a binder device and rsb_hub"]
+fn sleeping_fd_subscribers_learn_within_a_second_that_their_publisher_died() {
+    sleepers_of_a_killed_publisher(Wake::Fd);
+}
+
+fn sleepers_of_a_killed_publisher(wake: Wake) {
     init();
     let deaths: u32 = std::env::var("RSBINDER_TOPIC_DEATHS")
         .ok()
         .and_then(|deaths| deaths.parse().ok())
         .unwrap_or(1000);
+    let policy = SubscriberPolicy {
+        wake,
+        ..SubscriberPolicy::default()
+    };
     for death in 0..deaths {
         let name = name(&format!("deaths.{death}"));
         let mut peer = Peer::spawn("publish", &name);
@@ -305,8 +321,7 @@ fn sleeping_subscribers_learn_within_a_second_that_their_publisher_died() {
         let topic = hub::check_service(&name).expect("the publisher's binder");
         let receiving: Vec<_> = (0..8)
             .map(|_| {
-                let mut subscriber =
-                    Subscriber::<Bytes>::request(&topic, &SubscriberPolicy::default()).unwrap();
+                let mut subscriber = Subscriber::<Bytes>::request(&topic, &policy).unwrap();
                 std::thread::spawn(move || {
                     let first = subscriber.recv();
                     let killed = subscriber.recv();
@@ -331,6 +346,59 @@ fn sleeping_subscribers_learn_within_a_second_that_their_publisher_died() {
             assert!(took < Duration::from_secs(1), "death {death}: {took:?}");
         }
     }
+}
+
+/// AC-15.2.17 across processes: `wait_any` on two publishers; one's death ends its subscription.
+#[test]
+#[ignore = "needs a binder device and rsb_hub"]
+fn fd_subscribers_of_two_publishers_wait_on_one_thread_and_learn_of_a_death() {
+    init();
+    let names = [name("fd.first"), name("fd.second")];
+    let mut peers = names.clone().map(|name| Peer::spawn("publish", &name));
+    for peer in &peers {
+        assert_eq!(peer.says(), "ready");
+    }
+    let policy = SubscriberPolicy {
+        wake: Wake::Fd,
+        ..SubscriberPolicy::default()
+    };
+    let [mut first, mut second] = names.map(|name| {
+        let topic = hub::check_service(&name).expect("the publisher's binder");
+        Subscriber::<Bytes>::request(&topic, &policy).unwrap()
+    });
+    for round in 0..200 {
+        let from = round % 2;
+        peers[from].tell("publish 1");
+        let got = loop {
+            assert!(wait_any(&mut [&mut first, &mut second], Some(WAIT)).unwrap());
+            match (first.try_recv(), second.try_recv()) {
+                (Ok(value), Err(RecvError::Empty)) => break (0, value),
+                (Err(RecvError::Empty), Ok(value)) => break (1, value),
+                (Err(RecvError::Empty), Err(RecvError::Empty)) => {}
+                other => panic!("round {round}: {other:?}"),
+            }
+        };
+        assert_eq!(got, (from, Bytes(vec![0])), "round {round}");
+        assert_eq!(peers[from].says(), "published");
+    }
+    let killed = Instant::now();
+    peers[0].kill();
+    loop {
+        assert!(wait_any(&mut [&mut first, &mut second], Some(WAIT)).unwrap());
+        match first.try_recv() {
+            Err(RecvError::Empty) => {}
+            Err(RecvError::Closed(Closed::PublisherDied)) => break,
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(
+        killed.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        killed.elapsed()
+    );
+    peers[1].tell("publish 1");
+    assert!(wait_any(&mut [&mut second], Some(WAIT)).unwrap());
+    assert_eq!(second.try_recv(), Ok(Bytes(vec![0])));
 }
 
 /// AC-15.2.41: receives after dropped `recv_async`s get each record, then `PublisherDied`.
@@ -510,6 +578,7 @@ fn raw_request(token: SIBinder) -> SubscribeRequest {
         token: Some(token),
         control: Some(ParcelFileDescriptor::from(control_page())),
         pins: 0,
+        wake: 0,
     }
 }
 

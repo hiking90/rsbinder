@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! One publisher and many subscribers over kernel binder (plan 15). **Experimental, and not
-//! complete: no service-manager name layer, no loaned samples, no wake through a file
-//! descriptor yet.**
+//! complete: no service-manager name layer and no loaned samples yet.**
 //!
 //! A topic carries records from one publisher to any number of subscribers. A binder call sets
 //! a subscription up; after it the records travel through shared memory and no binder
@@ -25,7 +24,10 @@
 //! A receive may wait for a record ([`Subscriber::recv`], `recv_timeout`, `recv_latest`, and
 //! `recv_async` with the `tokio` feature). A waiting subscriber sleeps on a futex word in the
 //! topic's memory; a publish wakes every subscriber that sleeps with one system call, and makes
-//! none when none sleeps. An [`Interrupter`] ends a wait from another thread.
+//! none when none sleeps. An [`Interrupter`] ends a wait from another thread. A subscriber made
+//! with [`Wake::Fd`] is woken through a socket of its own instead, a system call per waiting
+//! subscriber, and has file descriptors to poll: one thread waits for several subscriptions with
+//! [`wait_any`] or an event loop ([`Wait`]), and `recv_async` holds no thread while it waits.
 //!
 //! A [`Publisher`] makes the topic and hands out an `ITopic` binder; a [`Subscriber`] takes a
 //! subscription through it with one twoway call. Each end learns of the other's end: a
@@ -73,18 +75,21 @@ mod end;
 mod layout;
 mod link;
 mod payload;
+mod poll;
 mod publish;
 mod publisher;
 mod receive;
 mod ring;
 mod subscriber;
 mod wait;
+mod wake;
 
 pub use payload::{Bytes, Payload};
+pub use poll::{wait_any, Wait};
 pub use publish::{PublishError, PublisherPolicy};
 pub use publisher::{Acceptor, Publisher};
 pub use receive::{Closed, RecvError};
-pub use subscriber::{Interrupter, Start, Subscriber, SubscriberPolicy};
+pub use subscriber::{Interrupter, Start, Subscriber, SubscriberPolicy, Wake};
 
 #[cfg(any(test, feature = "fuzzing"))]
 mod image;
@@ -125,6 +130,19 @@ mod connect_tests;
     )
 ))]
 mod wait_tests;
+
+#[cfg(all(
+    test,
+    not(loom),
+    not(miri),
+    any(target_os = "linux", target_os = "android"),
+    any(
+        target_pointer_width = "64",
+        all(target_arch = "x86", target_feature = "sse2"),
+        all(target_arch = "arm", target_has_atomic = "64")
+    )
+))]
+mod fd_wait_tests;
 
 #[cfg(all(test, not(any(target_os = "linux", target_os = "android"))))]
 mod unsupported_tests {

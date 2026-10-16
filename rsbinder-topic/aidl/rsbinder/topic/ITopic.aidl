@@ -17,6 +17,11 @@ import rsbinder.topic.TopicEndpoint;
  * every topic; the request names the type and the publisher compares it.
  */
 interface ITopic {
+    /** SubscribeRequest.wake: a futex on the topic memory's `seq`. */
+    const int WAKE_FUTEX = 0;
+    /** SubscribeRequest.wake: a byte on TopicEndpoint.wakeFd. */
+    const int WAKE_FD = 1;
+
     /** ServiceSpecific: the request's layout version is not the publisher's. */
     const int ERROR_VERSION = 1;
     /**

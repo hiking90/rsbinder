@@ -6,7 +6,9 @@
 //! compares `seq` under a lock its wake takes too, as the kernel's hash bucket lock does, so a
 //! wake is lost only when it comes before the sleeper takes the lock. A test that does not
 //! finish is a deadlock, which loom reports. The flawed models show the checks are not vacuous:
-//! a publisher without its fence, a waker that wakes once, a new wait that does not join.
+//! a publisher without its fence, a waker that wakes once, a new wait that does not join, an fd
+//! wait that polls without loading `seq` again. The fd model (plan 15 §5.5a) counts the socket's
+//! bytes and the eventfd's in place of the futex.
 //! Run: see `Cargo.toml` (`--cfg loom`).
 
 // The std `Arc`: one of loom's dropped while a deadlock unwinds calls into loom and aborts.
@@ -29,16 +31,25 @@ enum Flaw {
     WakeOnce,
     /// A new wait starts without joining the one a dropped future left on the pool.
     NoJoin,
+    /// An fd wait polls without loading `seq` once more after raising `WAITING`.
+    NoSecondLook,
 }
 
-/// `seq`, `state`, the futex on `seq`, and `write` for the ring.
+/// `seq`, `state`, `write` for the ring, and the futex on `seq` or, with `fd`, the two fds.
 struct Model {
     seq: AtomicU32,
     state: AtomicU32,
     write: AtomicU32,
-    futex: Mutex<()>,
+    futex: Mutex<Fds>,
     woken: Condvar,
+    fd: bool,
     flaw: Flaw,
+}
+
+#[derive(Default)]
+struct Fds {
+    bytes: u32,
+    count: u32,
 }
 
 impl Words for Arc<Model> {
@@ -51,11 +62,23 @@ impl Words for Arc<Model> {
         self.state.fetch_or(WAITING, Ordering::SeqCst);
     }
 
-    fn end_wait(&self) {
+    fn end_wait(&self) -> bool {
+        *self.futex.lock().unwrap() = Fds::default();
         self.state.fetch_and(!WAITING, Ordering::SeqCst);
+        false
     }
 
-    fn sleep(&self, seen: u32, _: Option<&Deadline>) -> bool {
+    fn sleep(&self, seen: u32, _: Option<Instant>) -> bool {
+        if self.fd {
+            if self.flaw != Flaw::NoSecondLook && self.seq() != seen {
+                return true;
+            }
+            let mut fds = self.futex.lock().unwrap();
+            while fds.bytes == 0 && fds.count == 0 {
+                fds = self.woken.wait(fds).unwrap();
+            }
+            return true;
+        }
         let futex = self.futex.lock().unwrap();
         if self.seq.load(Ordering::SeqCst) == seen {
             drop(self.woken.wait(futex).unwrap());
@@ -64,18 +87,34 @@ impl Words for Arc<Model> {
     }
 
     fn wake(&self) {
-        let _futex = self.futex.lock().unwrap();
+        let mut fds = self.futex.lock().unwrap();
+        if self.fd {
+            fds.count += 1;
+        }
         self.woken.notify_all();
+    }
+
+    fn latched(&self) -> bool {
+        self.fd
     }
 }
 
 fn model(flaw: Flaw) -> (Arc<Model>, Arc<Local<Arc<Model>>>) {
+    built(flaw, false)
+}
+
+fn fd_model(flaw: Flaw) -> (Arc<Model>, Arc<Local<Arc<Model>>>) {
+    built(flaw, true)
+}
+
+fn built(flaw: Flaw, fd: bool) -> (Arc<Model>, Arc<Local<Arc<Model>>>) {
     let model = Arc::new(Model {
         seq: AtomicU32::new(0),
         state: AtomicU32::new(0),
         write: AtomicU32::new(0),
-        futex: Mutex::new(()),
+        futex: Mutex::new(Fds::default()),
         woken: Condvar::new(),
+        fd,
         flaw,
     });
     let local = Arc::new(Local::new());
@@ -90,7 +129,14 @@ fn publish(model: &Arc<Model>) {
     if model.flaw != Flaw::NoFence {
         fence(Ordering::SeqCst);
     }
-    if model.state.load(Ordering::Relaxed) & WAITING != 0 {
+    if model.state.load(Ordering::Relaxed) & WAITING == 0 {
+        return;
+    }
+    if model.fd {
+        // `send_wake`: a byte on the socket, which stays until the wait drains it.
+        model.futex.lock().unwrap().bytes += 1;
+        model.woken.notify_all();
+    } else {
         model.wake();
     }
 }
@@ -248,4 +294,50 @@ fn loom_wait_a_new_wait_joins_the_one_a_dropped_future_left() {
 #[should_panic(expected = "deadlock")]
 fn loom_wait_a_new_wait_that_does_not_join_sleeps_through() {
     a_new_wait_after_a_dropped_one(Flaw::NoJoin);
+}
+
+fn a_commit_ends_an_fd_wait(flaw: Flaw) {
+    check(move || {
+        let (model, local) = fd_model(flaw);
+        let publisher = {
+            let model = model.clone();
+            thread::spawn(move || publish(&model))
+        };
+        assert_eq!(receive(&model, &local, &mut 0), Received::Record);
+        publisher.join().unwrap();
+    });
+}
+
+#[test]
+fn loom_wait_fd_a_commit_ends_a_wait() {
+    a_commit_ends_an_fd_wait(Flaw::None);
+}
+
+#[test]
+#[should_panic(expected = "deadlock")]
+fn loom_wait_fd_a_wait_that_does_not_look_at_seq_again_sleeps_through() {
+    a_commit_ends_an_fd_wait(Flaw::NoSecondLook);
+}
+
+fn a_bit_from_this_process_ends_an_fd_wait(bit: u32, ends: Received) {
+    check(move || {
+        let (model, local) = fd_model(Flaw::None);
+        let waker = {
+            let local = local.clone();
+            thread::spawn(move || local.raise(bit))
+        };
+        assert_eq!(receive(&model, &local, &mut 0), ends);
+        waker.join().unwrap();
+    });
+}
+
+/// One wake to the eventfd, with no loop: its count stays until the wait drains it.
+#[test]
+fn loom_wait_fd_an_interrupt_ends_a_wait() {
+    a_bit_from_this_process_ends_an_fd_wait(INTERRUPT, Received::Cancelled);
+}
+
+#[test]
+fn loom_wait_fd_a_death_ends_a_wait() {
+    a_bit_from_this_process_ends_an_fd_wait(DIED, Received::Died);
 }

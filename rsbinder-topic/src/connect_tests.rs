@@ -22,20 +22,22 @@ use rsbinder::{
     StatusCode,
 };
 
-use crate::aidl::ITopic::{BnTopic, ITopic, ERROR_CLOSED, ERROR_FULL, ERROR_VERSION};
+use crate::aidl::ITopic::{
+    BnTopic, ITopic, ERROR_CLOSED, ERROR_FULL, ERROR_VERSION, WAKE_FD, WAKE_FUTEX,
+};
 use crate::aidl::SubscribeRequest::SubscribeRequest;
 use crate::aidl::TopicEndpoint::TopicEndpoint;
 use crate::connect::Token;
 use crate::layout::{self, ControlView, CLOSED, HEADER_OFFSET, MIN_RING, NO_FUTURE_WRITE, VERSION};
 use crate::{
     Acceptor, Bytes, Closed, Payload, PublishError, Publisher, PublisherPolicy, RecvError, Start,
-    Subscriber, SubscriberPolicy,
+    Subscriber, SubscriberPolicy, Wake,
 };
 
 const ALONE: &str = "RSBINDER_TOPIC_ALONE";
 
 /// Run test `name` again in a child process with no other test; `true` in that child.
-fn alone(name: &str) -> bool {
+pub(crate) fn alone(name: &str) -> bool {
     if std::env::var_os(ALONE).is_some() {
         return true;
     }
@@ -116,6 +118,7 @@ fn request(control: OwnedFd, token: SIBinder) -> SubscribeRequest {
         token: Some(token),
         control: Some(ParcelFileDescriptor::from(control)),
         pins: 0,
+        wake: WAKE_FUTEX,
     }
 }
 
@@ -203,6 +206,15 @@ fn a_request_the_publisher_cannot_take_is_refused_for_what_is_wrong_with_it() {
     let mut other = request(page(), token());
     other.pins = 1;
     assert_eq!(code(acceptor.accept(&other)), StatusCode::BadValue);
+    // A token this thread asks with, so that the wake alone is wrong.
+    let asking = token();
+    let mut other = request(page(), asking.clone());
+    other.wake = WAKE_FD + 1;
+    let refused = {
+        let _asking = crate::connect::Asking::new(&asking);
+        acceptor.accept(&other)
+    };
+    assert_eq!(code(refused), StatusCode::BadValue);
     // A binder of this process that came in no call of this thread's: the publisher's own.
     let foreign = request(page(), publisher.as_binder());
     assert_eq!(code(acceptor.accept(&foreign)), StatusCode::BadValue);
@@ -347,6 +359,7 @@ fn endpoint(fd: OwnedFd, capacity: u64) -> TopicEndpoint {
         headerOffset: HEADER_OFFSET as i32,
         start: 0,
         startIndex: 0,
+        wakeFd: None,
     }
 }
 
@@ -441,6 +454,95 @@ fn a_reply_the_subscriber_cannot_use_is_refused_and_its_control_page_closed() {
     };
     let topic = BnTopic::new_binder(forged).as_binder();
     assert!(Subscriber::<Bytes>::request(&topic, &policy).is_ok());
+}
+
+/// AC-15.2.25 for the wake: a reply whose `wakeFd` is not what the request asked for.
+#[test]
+fn a_reply_with_a_wake_fd_the_subscriber_cannot_use_is_refused() {
+    let (good, _stored) = layout::create_topic(MIN_RING).unwrap();
+    let good = Arc::new(good);
+    let capacity = MIN_RING as u64;
+    type Wakes = fn() -> Option<OwnedFd>;
+    let socket: Wakes = || Some(crate::wake::pair().unwrap().1);
+    let none: Wakes = || None;
+    let pipe: Wakes = || Some(rustix::pipe::pipe().unwrap().0);
+    let datagram: Wakes = || {
+        let (_, theirs) = rustix::net::socketpair(
+            rustix::net::AddressFamily::UNIX,
+            rustix::net::SocketType::DGRAM,
+            rustix::net::SocketFlags::CLOEXEC,
+            None,
+        )
+        .unwrap();
+        Some(theirs)
+    };
+    let cases: [(Wake, Wakes, bool, &str); 5] = [
+        (Wake::Futex, socket, false, "a socket for a futex wake"),
+        (Wake::Fd, none, false, "no socket for an fd wake"),
+        (Wake::Fd, pipe, false, "a pipe"),
+        (Wake::Fd, datagram, false, "a datagram socket"),
+        (Wake::Fd, socket, true, "a stream socket"),
+    ];
+    for (wake, wake_fd, taken, why) in cases {
+        let control = Arc::new(Mutex::new(None));
+        let good = good.clone();
+        let forged = Forged {
+            endpoint: Box::new(move || TopicEndpoint {
+                wakeFd: wake_fd().map(ParcelFileDescriptor::new),
+                ..endpoint(good.try_clone().unwrap(), capacity)
+            }),
+            control: control.clone(),
+        };
+        let topic = BnTopic::new_binder(forged).as_binder();
+        let policy = SubscriberPolicy {
+            wake,
+            ..SubscriberPolicy::default()
+        };
+        let made = Subscriber::<Bytes>::request(&topic, &policy).map(drop);
+        if taken {
+            assert!(made.is_ok(), "{why}");
+            continue;
+        }
+        assert_eq!(code(made), StatusCode::BadValue, "{why}");
+        let view = control.lock().unwrap().take().unwrap();
+        assert_eq!(view.state().load() & CLOSED, CLOSED, "{why}");
+    }
+}
+
+/// A wake socket closed with no end record ends the wait as the publisher's death, with no spin.
+#[test]
+fn a_wake_socket_closed_without_an_end_ends_the_wait_as_the_publishers_death() {
+    let (memory, _stored) = layout::create_topic(MIN_RING).unwrap();
+    let ours = Arc::new(Mutex::new(None));
+    let forged = Forged {
+        endpoint: Box::new({
+            let ours = ours.clone();
+            move || {
+                let (publisher_end, theirs) = crate::wake::pair().unwrap();
+                *ours.lock().unwrap() = Some(publisher_end);
+                TopicEndpoint {
+                    wakeFd: Some(ParcelFileDescriptor::new(theirs)),
+                    ..endpoint(memory.try_clone().unwrap(), MIN_RING as u64)
+                }
+            }
+        }),
+        control: Arc::new(Mutex::new(None)),
+    };
+    let topic = BnTopic::new_binder(forged).as_binder();
+    let policy = SubscriberPolicy {
+        wake: Wake::Fd,
+        ..SubscriberPolicy::default()
+    };
+    let mut subscriber = Subscriber::<Bytes>::request(&topic, &policy).unwrap();
+    let local = subscriber.local().clone();
+    let wait = std::time::Duration::from_secs(10);
+    let receiving = std::thread::spawn(move || subscriber.recv_timeout(wait).map(drop));
+    while !local.is_parked() {
+        std::thread::sleep(std::time::Duration::from_micros(50));
+    }
+    drop(ours.lock().unwrap().take());
+    let died = Err(RecvError::Closed(Closed::PublisherDied));
+    assert_eq!(receiving.join().unwrap(), died);
 }
 
 /// A value whose encoding panics.

@@ -127,12 +127,12 @@ pub(crate) struct State<S> {
 }
 
 impl<S: Stores> State<S> {
-    /// After a commit: bump `seq`, then one wake if a subscriber sleeps, none if not (§5.5).
+    /// After a commit: bump `seq`, then wake the waiters, one futex wake at most (§5.5, §5.5a).
     fn announce(&mut self) {
         self.writer.announce();
-        // Against the `SeqCst` raise of `WAITING`: this load sees it, or that futex sees new `seq`.
+        // Against the `SeqCst` raise of `WAITING`: this load sees it, or the waiter sees new `seq`.
         fence(Ordering::SeqCst);
-        if self.links.wake_wanted() {
+        if self.links.wake() {
             self.writer.wake();
         }
     }
@@ -180,6 +180,12 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
     #[cfg(all(test, not(loom), any(target_os = "linux", target_os = "android")))]
     pub(crate) fn wakes(&self) -> u64 {
         self.lock().writer.wakes()
+    }
+
+    /// The wake bytes this topic has sent.
+    #[cfg(all(test, not(loom), any(target_os = "linux", target_os = "android")))]
+    pub(crate) fn sends(&self) -> u64 {
+        self.lock().links.sends()
     }
 
     /// Write `value` as one record.

@@ -34,10 +34,12 @@ fuzzing = []
 # crate in the build can turn on and `build.rs` cannot see. It adds no runtime.
 rsbinder = { version = "0.12.0", path = "../rsbinder", default-features = false, features = ["async"] }
 # `Errno`, to tell "the kernel has no `F_SEAL_FUTURE_WRITE`" from the other
-# failures of a seal.
-rustix = { workspace = true }
+# failures of a seal. `event` and `net`: the fd wake, a socket pair, an eventfd
+# and `poll` (both are features `rsbinder` turns on already).
+rustix = { workspace = true, features = ["event", "net"] }
 # `Notify`: a `recv_async` joins the wait a dropped one left on the blocking pool.
-tokio = { workspace = true, optional = true, features = ["sync"] }
+# `net`: `AsyncFd`, which a `recv_async` of an fd-woken subscription waits on.
+tokio = { workspace = true, optional = true, features = ["sync", "net"] }
 
 [build-dependencies]
 rsbinder-aidl = { workspace = true }
@@ -47,10 +49,13 @@ miette = { workspace = true }
 # `#[derive(rsbinder::Parcelable)]` for the tests' parcelables: the code `.aidl` generates.
 # `rpc`: an RPC binder, which a subscriber refuses.
 rsbinder = { version = "0.12.0", path = "../rsbinder", default-features = false, features = ["macros", "rpc"] }
-# `setrlimit`, for a subscriber that cannot take the reply's fd.
-rustix = { workspace = true, features = ["process"] }
-# A runtime for `recv_async`'s tests.
-tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
+# `setrlimit`, for a subscriber that cannot take the reply's fd. `pipe` and
+# `param`: an fd of the wrong kind for a wake, and the page a fault is held in.
+rustix = { workspace = true, features = ["process", "pipe", "param"] }
+# `userfaultfd` and `SIGPIPE`'s default, which rustix does not offer.
+libc = { workspace = true }
+# A runtime for `recv_async`'s tests; `time` bounds a wait that a mutant would lose.
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
 
 # loom is only used by the unit tests gated on `--cfg loom` (`src/ring/loom_tests.rs`).
 # Run with (a target dir of its own: the cfg rebuilds every dependency):

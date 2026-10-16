@@ -13,19 +13,25 @@
 //! sleeps on the topic's `seq` by the protocol in `wait.rs`.
 
 use std::fmt;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, BorrowedFd};
+#[cfg(feature = "tokio")]
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
+#[cfg(feature = "tokio")]
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use rsbinder::fmq::shm::spin::{spin_until, SpinGauge};
-use rsbinder::fmq::shm::{Deadline, Mapping};
+use rsbinder::fmq::shm::Mapping;
 use rsbinder::fmq::Descriptor;
 use rsbinder::{
     BinderResult, Interface, ParcelFileDescriptor, SIBinder, Status, StatusCode, Strong,
 };
+#[cfg(feature = "tokio")]
+use tokio::io::{unix::AsyncFd, Interest};
 
-use crate::aidl::ITopic::{ITopic, ERROR_VERSION};
+use crate::aidl::ITopic::{ITopic, ERROR_VERSION, WAKE_FD, WAKE_FUTEX};
 use crate::aidl::SubscribeRequest::SubscribeRequest;
 use crate::aidl::TopicEndpoint::TopicEndpoint;
 use crate::connect::{refuse, status_of, Asking, Token};
@@ -35,8 +41,9 @@ use crate::receive::TypedReader;
 use crate::ring::{self, Loads, Reader};
 #[cfg(feature = "tokio")]
 use crate::wait::{on_pool, Leftover};
-use crate::wait::{Died, Local, Parts, Slept, Words, ABANDON, INTERRUPT};
-use crate::{Closed, Payload, RecvError};
+use crate::wait::{Died, Local, Parts, Slept, Words, ABANDON, DIED, INTERRUPT};
+use crate::wake::FdWake;
+use crate::{poll, Closed, Payload, RecvError};
 
 /// Where a subscription starts reading.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -51,6 +58,23 @@ pub enum Start {
     Oldest,
 }
 
+/// How the publisher wakes a subscriber that waits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Wake {
+    /// A futex on a word of the topic's memory: one wake system call per commit serves every
+    /// subscriber of this kind that sleeps, however many. A wait holds a thread: `recv` the
+    /// calling one, `recv_async` one of the blocking pool.
+    #[default]
+    Futex,
+    /// A byte on a socket of this subscription alone, which the publisher sends without waiting
+    /// when a commit finds the subscriber waiting: one system call per such subscriber. The
+    /// subscription has file descriptors to poll ([`Wait`](crate::Wait)), so one thread can wait
+    /// for several with [`wait_any`](crate::wait_any) or an event loop of its own, and
+    /// `recv_async` waits on the runtime's reactor without holding a thread. Two file
+    /// descriptors per subscription in this process, one in the publisher's.
+    Fd,
+}
+
 /// How a subscriber subscribes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubscriberPolicy {
@@ -62,6 +86,8 @@ pub struct SubscriberPolicy {
     /// this bounds the address space a publisher can make the subscriber's process give up. A
     /// larger ring is refused with `BadValue`.
     pub max_ring_bytes: usize,
+    /// How the publisher wakes this subscriber. Default [`Wake::Futex`].
+    pub wake: Wake,
 }
 
 impl Default for SubscriberPolicy {
@@ -69,6 +95,7 @@ impl Default for SubscriberPolicy {
         Self {
             start: Start::Latest,
             max_ring_bytes: 16 << 20,
+            wake: Wake::Futex,
         }
     }
 }
@@ -86,16 +113,21 @@ impl Default for SubscriberPolicy {
 /// | [`try_recv`](Self::try_recv), [`try_latest`](Self::try_latest) | [`RecvError::Empty`] at once |
 /// | [`recv`](Self::recv), [`recv_latest`](Self::recv_latest) | waits for one |
 /// | [`recv_timeout`](Self::recv_timeout) | waits, then [`RecvError::Timeout`] |
-/// | `recv_async` (`tokio` feature) | waits on the blocking pool |
+/// | `recv_async` (`tokio` feature) | on the blocking pool; with [`Wake::Fd`], the reactor |
+/// | [`Wait`](crate::Wait), [`wait_any`](crate::wait_any) ([`Wake::Fd`]) | the caller polls |
 ///
 /// A wait first looks at the ring for up to 20 µs, the policy of
-/// [`rsbinder::fmq::shm::spin`], then sleeps on a word of the topic's memory until the publisher
-/// commits. The publisher makes one wake system call per commit when some subscriber sleeps,
-/// whatever their number, and none when none does. An [`Interrupter`] ends a wait from another
-/// thread.
+/// [`rsbinder::fmq::shm::spin`], then sleeps until the publisher commits, as
+/// [`SubscriberPolicy::wake`] says: on a word of the topic's memory, for which the publisher
+/// makes one wake system call per commit when some subscriber sleeps, whatever their number, and
+/// none when none does; or on file descriptors of the subscription. An [`Interrupter`] ends a
+/// wait from another thread.
 pub struct Subscriber<T: Payload> {
     reader: TypedReader<T, Loaded<Arc<Mapping>>>,
     control: Closing,
+    /// [`Wake::Fd`]'s fds on the reactor; dropped before `local` closes them.
+    #[cfg(feature = "tokio")]
+    reactor: Option<Reactor>,
     local: Arc<Local<Parts>>,
     spin: SpinGauge,
     /// The wait a dropped `recv_async` left on the blocking pool, which the next wait joins.
@@ -130,8 +162,10 @@ impl<T: Payload> Subscriber<T> {
     /// (off Linux and Android, or on a kernel without `F_SEAL_FUTURE_WRITE`),
     /// [`ITopic::ERROR_VERSION`](crate::aidl::ITopic::ERROR_VERSION) for a publisher of another
     /// layout version, and `BadValue` for a reply it cannot use: topic memory that is not a
-    /// sealed memfd of the expected layout, or a ring larger than
-    /// [`max_ring_bytes`](SubscriberPolicy::max_ring_bytes).
+    /// sealed memfd of the expected layout, a ring larger than
+    /// [`max_ring_bytes`](SubscriberPolicy::max_ring_bytes), or a wake fd that is not what
+    /// [`wake`](SubscriberPolicy::wake) asked for (a unix stream socket for [`Wake::Fd`], none
+    /// for [`Wake::Futex`]).
     ///
     /// **The process has to run the binder thread pool**
     /// (`rsbinder::ProcessState::start_thread_pool`) for a publisher in another process: the
@@ -154,17 +188,30 @@ impl<T: Payload> Subscriber<T> {
             token: Some(token.clone()),
             control: Some(ParcelFileDescriptor::from(fd)),
             pins: 0,
+            wake: match policy.wake {
+                Wake::Futex => WAKE_FUTEX,
+                Wake::Fd => WAKE_FD,
+            },
         };
-        let endpoint = {
+        let mut endpoint = {
             let _asking = Asking::new(&token);
             service.r#subscribe(&request)?
         };
         // The control page's fd: the publisher has its mapping, and this side keeps its own.
         drop(request);
         let memory = map_endpoint(&endpoint, policy.max_ring_bytes)?;
+        let fd = match (policy.wake, endpoint.wakeFd.take()) {
+            (Wake::Futex, None) => None,
+            (Wake::Fd, Some(socket)) => {
+                let wake = FdWake::new(socket.into()).map_err(StatusCode::from)?;
+                Some(wake.ok_or(StatusCode::BadValue)?)
+            }
+            _ => return Err(StatusCode::BadValue.into()),
+        };
         local.set_words(Parts {
             seq: memory.seq(),
             control: control.0.clone(),
+            fd,
         });
         let start = match policy.start {
             // The bits of the position and the index, as the publisher wrote them.
@@ -179,6 +226,8 @@ impl<T: Payload> Subscriber<T> {
         Ok(Self {
             reader: TypedReader::new(reader),
             control,
+            #[cfg(feature = "tokio")]
+            reactor: None,
             local,
             spin: SpinGauge::default(),
             #[cfg(feature = "tokio")]
@@ -231,19 +280,27 @@ impl<T: Payload> Subscriber<T> {
         self.wait(None, true)
     }
 
-    /// [`recv`](Self::recv) for an async caller: the wait sleeps on a thread of the blocking pool
-    /// (`tokio::task::spawn_blocking`, or the calling thread inside a binder transaction), so
-    /// it holds that thread, not an executor thread, for as long as it lasts.
+    /// [`recv`](Self::recv) for an async caller.
     ///
-    /// Cancel-safe: dropping the future loses no record. The wait it left on the pool is woken,
+    /// With [`Wake::Futex`] the wait sleeps on a thread of the blocking pool
+    /// (`tokio::task::spawn_blocking`, or the calling thread inside a binder transaction), so
+    /// it holds that thread, not an executor thread, for as long as it lasts. With [`Wake::Fd`]
+    /// it waits on the runtime's reactor (`tokio::io::unix::AsyncFd`) and holds no thread.
+    ///
+    /// Cancel-safe: dropping the future loses no record. A wait it left on the pool is woken,
     /// and the next receive that may wait joins it before looking at the ring. Besides `recv`'s
-    /// results, [`RecvError::Cancelled`] when the pool cannot run the wait.
+    /// results, [`RecvError::Cancelled`] when the pool cannot run the wait, or the reactor
+    /// cannot take the subscription's file descriptors.
     ///
     /// # Panics
     ///
-    /// Outside a Tokio runtime, as `tokio::task::spawn_blocking` does.
+    /// Outside a Tokio runtime, as `tokio::task::spawn_blocking` does, and with [`Wake::Fd`] in a
+    /// runtime whose IO driver is off, as `AsyncFd::new` does.
     #[cfg(feature = "tokio")]
     pub async fn recv_async(&mut self) -> Result<T, RecvError> {
+        if self.local.words().fd.is_some() {
+            return self.recv_on_reactor().await;
+        }
         loop {
             if self.leftover.busy() {
                 self.leftover.join_async().await;
@@ -271,6 +328,48 @@ impl<T: Payload> Subscriber<T> {
             let ran = on_pool(&self.local, &self.leftover, seen).await;
             abandon.armed = false;
             if ran.is_err() {
+                return Err(RecvError::Cancelled);
+            }
+        }
+    }
+
+    /// `recv_async` of a [`Wake::Fd`] subscription: the two fds on the runtime's reactor.
+    #[cfg(feature = "tokio")]
+    async fn recv_on_reactor(&mut self) -> Result<T, RecvError> {
+        loop {
+            match self.look(false) {
+                Err(RecvError::Empty) => {}
+                other => return other,
+            }
+            if self.local.take(INTERRUPT) {
+                return Err(RecvError::Cancelled);
+            }
+            let seen = self.local.words().seq();
+            // No `ABANDON` here: only a futex wake's pool wait and a dropped subscriber raise it.
+            if self.reader.pending() || self.local.stopped() {
+                continue;
+            }
+            if self.reactor.is_none() {
+                let fds = self.local.words().fd.as_ref().map(FdWake::fds);
+                let made = fds.map(Reactor::new).transpose();
+                self.reactor = made.map_err(|_| RecvError::Cancelled)?;
+            }
+            let Some(reactor) = &self.reactor else {
+                return Err(RecvError::Cancelled);
+            };
+            #[cfg(test)]
+            if let Some(hook) = self.about_to_park.as_mut() {
+                hook();
+            }
+            let armed = Armed(&self.local);
+            if self.local.arm() != 0 || self.local.words().seq() != seen {
+                continue;
+            }
+            let woke = reactor.readable().await;
+            drop(armed);
+            if woke.is_err() {
+                // A reactor that went away with its runtime: the next call takes the current one.
+                self.reactor = None;
                 return Err(RecvError::Cancelled);
             }
         }
@@ -324,22 +423,15 @@ impl<T: Payload> Subscriber<T> {
                 woke = true;
                 continue;
             }
-            let sleep_until = match deadline {
-                None => None,
-                Some(deadline) => {
-                    let left = deadline.saturating_duration_since(Instant::now());
-                    if left.is_zero() {
-                        return Err(RecvError::Timeout);
-                    }
-                    Deadline::after(left)
-                }
-            };
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(RecvError::Timeout);
+            }
             #[cfg(test)]
             if let Some(hook) = self.about_to_park.as_mut() {
                 hook();
             }
             let parked_at = Instant::now();
-            match self.local.park(seen, sleep_until.as_ref()) {
+            match self.local.park(seen, deadline) {
                 Slept::Woke => self.spin.parked(parked_at.elapsed()),
                 Slept::TimedOut | Slept::Stopped => {}
             }
@@ -383,6 +475,39 @@ impl<T: Payload> Subscriber<T> {
     }
 }
 
+impl<T: Payload> poll::Sealed for Subscriber<T> {}
+
+impl<T: Payload> poll::Wait for Subscriber<T> {
+    fn wait_fds(&self) -> Option<[BorrowedFd<'_>; 2]> {
+        self.local.words().fd.as_ref().map(FdWake::fds)
+    }
+
+    fn prepare_wait(&mut self) -> bool {
+        assert!(
+            self.local.words().fd.is_some(),
+            "prepare_wait: a subscription made with `Wake::Futex` has no file descriptor to poll"
+        );
+        let seen = self.local.words().seq();
+        if self.reader.pending() || self.local.died() {
+            return false;
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.about_to_park.as_mut() {
+            hook();
+        }
+        // An interrupt stays up for the next receive that waits; its eventfd count ends this poll.
+        if self.local.arm() & DIED != 0 || self.local.words().seq() != seen {
+            self.local.disarm();
+            return false;
+        }
+        true
+    }
+
+    fn finish_wait(&mut self) {
+        self.local.disarm();
+    }
+}
+
 impl<T: Payload> Drop for Subscriber<T> {
     fn drop(&mut self) {
         // A wait left on the pool: woken, so it lets go of the memory now rather than at a commit.
@@ -411,6 +536,66 @@ impl Drop for Abandon {
         if self.armed {
             self.local.raise(ABANDON);
         }
+    }
+}
+
+/// Ends the wait [`Local::arm`] started when dropped, also with the future it lives in.
+#[cfg(feature = "tokio")]
+struct Armed<'a>(&'a Local<Parts>);
+
+#[cfg(feature = "tokio")]
+impl Drop for Armed<'_> {
+    fn drop(&mut self) {
+        self.0.disarm();
+    }
+}
+
+/// A [`Wake::Fd`] subscription's socket and eventfd, registered with the runtime's reactor.
+#[cfg(feature = "tokio")]
+struct Reactor([AsyncFd<Unowned>; 2]);
+
+/// An fd the subscriber owns, as the reactor takes it.
+#[cfg(feature = "tokio")]
+struct Unowned(RawFd);
+
+#[cfg(feature = "tokio")]
+impl AsRawFd for Unowned {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl Reactor {
+    fn new(fds: [BorrowedFd<'_>; 2]) -> std::io::Result<Self> {
+        let register = |fd: BorrowedFd<'_>| {
+            AsyncFd::with_interest(Unowned(fd.as_raw_fd()), Interest::READABLE)
+        };
+        let [socket, event] = fds;
+        Ok(Self([register(socket)?, register(event)?]))
+    }
+
+    /// Until either fd is readable; its readiness is cleared, as the wait's end drains it.
+    async fn readable(&self) -> std::io::Result<()> {
+        std::future::poll_fn(|cx| {
+            let mut woke = false;
+            for fd in &self.0 {
+                match fd.poll_read_ready(cx) {
+                    Poll::Ready(Ok(mut ready)) => {
+                        ready.clear_ready();
+                        woke = true;
+                    }
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Pending => {}
+                }
+            }
+            if woke {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        })
+        .await
     }
 }
 

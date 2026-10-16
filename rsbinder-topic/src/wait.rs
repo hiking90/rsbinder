@@ -16,6 +16,11 @@
 //! `parked` and then loads `stop`, so either it sees the bit and does not sleep, or the waker
 //! sees `parked` and keeps waking until the waiter is out.
 //!
+//! A subscription woken through an fd (plan 15 §5.5a) keeps the protocol and changes what sleeps
+//! and what wakes: the waiter loads `seq` once more after the fence and then polls its socket and
+//! its eventfd, and a wake from this process adds to the eventfd, whose count stays until the wait
+//! drains it, so it is sent once and never repeated.
+//!
 //! One wait at a time per subscriber: the code that waits joins a wait left on the blocking
 //! pool before it looks at the ring (`Leftover`), so `WAITING` and `parked` have one owner.
 
@@ -28,8 +33,7 @@ use std::sync::atomic::{fence, AtomicBool, AtomicU32, Ordering};
 use std::sync::OnceLock;
 #[cfg(not(loom))]
 use std::thread::yield_now;
-
-use rsbinder::fmq::shm::Deadline;
+use std::time::Instant;
 
 /// `stop`: an [`Interrupter`](crate::Interrupter) asked; the wait that sees it clears it.
 pub(crate) const INTERRUPT: u32 = 1;
@@ -51,12 +55,14 @@ pub(crate) trait Words: Send + Sync {
     fn seq(&self) -> u32;
     /// Count one more wait in `state`, then raise `WAITING`; both `SeqCst`.
     fn begin_wait(&self);
-    /// Lower `WAITING` alone: `CLOSED` and the count stay as they are.
-    fn end_wait(&self);
+    /// Drain an fd wake, then lower `WAITING` alone; `true` when the publisher's socket hung up.
+    fn end_wait(&self) -> bool;
     /// Sleep while `seq` holds `seen`; `false` when `deadline` passed first.
-    fn sleep(&self, seen: u32, deadline: Option<&Deadline>) -> bool;
-    /// Wake every sleeper on `seq`.
+    fn sleep(&self, seen: u32, deadline: Option<Instant>) -> bool;
+    /// Wake the sleeper.
     fn wake(&self);
+    /// Whether a wake sent before the sleep still ends it (an eventfd's count).
+    fn latched(&self) -> bool;
 }
 
 /// How [`Local::park`] returned.
@@ -102,27 +108,39 @@ impl<W: Words> Local<W> {
     }
 
     /// One wait: sleep on `seq` while it holds `seen`, unless a bit in `stop` is up.
-    pub(crate) fn park(&self, seen: u32, deadline: Option<&Deadline>) -> Slept {
-        let words = self.words();
-        words.begin_wait();
-        self.parked.store(true, Ordering::SeqCst);
-        // Against the publisher's fence after `seq` and a waker's after `stop`: each side sees one.
-        fence(Ordering::SeqCst);
-        let slept = if self.stop.load(Ordering::SeqCst) != 0 {
+    pub(crate) fn park(&self, seen: u32, deadline: Option<Instant>) -> Slept {
+        let slept = if self.arm() != 0 {
             Slept::Stopped
-        } else if words.sleep(seen, deadline) {
+        } else if self.words().sleep(seen, deadline) {
             Slept::Woke
         } else {
             Slept::TimedOut
         };
+        self.disarm();
+        slept
+    }
+
+    /// Start a wait: count it, raise `WAITING` and `parked`; the bits up in `stop`, after both.
+    pub(crate) fn arm(&self) -> u32 {
+        self.words().begin_wait();
+        self.parked.store(true, Ordering::SeqCst);
+        // Against the publisher's fence after `seq` and a waker's after `stop`: each side sees one.
+        fence(Ordering::SeqCst);
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    /// End the wait [`arm`](Self::arm) started, whether it slept or not.
+    pub(crate) fn disarm(&self) {
         // Also when it did not sleep: a waker of `DIED` loops until it sees this.
         self.parked.store(false, Ordering::SeqCst);
         #[cfg(all(test, not(loom)))]
         if let Some(pause) = self.after_sleep.lock().expect("lock").as_ref() {
             pause();
         }
-        words.end_wait();
-        slept
+        if self.words().end_wait() {
+            // The publisher closes its end only as its process dies or after the end record.
+            self.stop.fetch_or(DIED, Ordering::SeqCst);
+        }
     }
 
     /// Raise `bit` and wake the wait until it is out or the bit is cleared; the wakes it sent.
@@ -132,6 +150,10 @@ impl<W: Words> Local<W> {
         let Some(words) = self.words.get() else {
             return 0;
         };
+        if words.latched() {
+            words.wake();
+            return 1;
+        }
         let waiting =
             || self.stop.load(Ordering::SeqCst) & bit != 0 && self.parked.load(Ordering::SeqCst);
         let mut wakes = 0;
@@ -177,6 +199,7 @@ pub(crate) use real::{Died, Parts};
 mod real {
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
+    use std::time::Instant;
 
     use rsbinder::fmq::shm::{Deadline, Mapping};
     use rsbinder::fmq::Error;
@@ -184,11 +207,14 @@ mod real {
 
     use super::{Local, Words, DIED};
     use crate::layout::{ControlPage, Seq, WAITING, WAIT_COUNT};
+    use crate::wake::FdWake;
 
     /// The words of one subscription: `seq` in the topic memory, `state` in the control page.
     pub(crate) struct Parts {
         pub(crate) seq: Seq<Arc<Mapping>>,
         pub(crate) control: Arc<ControlPage>,
+        /// The fds of a subscription the publisher wakes through its socket.
+        pub(crate) fd: Option<FdWake>,
     }
 
     impl Words for Parts {
@@ -202,21 +228,47 @@ mod real {
             state.fetch_or(WAITING, Ordering::SeqCst);
         }
 
-        fn end_wait(&self) {
+        fn end_wait(&self) -> bool {
+            // A byte sent for this wait after the drain makes the next wait look once for nothing.
+            let hung_up = self.fd.as_ref().is_some_and(FdWake::drain);
             self.control.state().fetch_and(!WAITING, Ordering::SeqCst);
+            hung_up
         }
 
-        fn sleep(&self, seen: u32, deadline: Option<&Deadline>) -> bool {
+        fn sleep(&self, seen: u32, deadline: Option<Instant>) -> bool {
+            if let Some(fd) = &self.fd {
+                // What the futex's compare does in the kernel: after `WAITING`, `seq` once more.
+                return self.seq() != seen || fd.sleep(deadline);
+            }
+            let deadline = match deadline {
+                None => None,
+                Some(at) => {
+                    let left = at.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return false;
+                    }
+                    Deadline::after(left)
+                }
+            };
             // Any other error is a sleep that did not happen: the caller looks and comes back.
             !matches!(
-                self.seq.word().wait(seen, u32::MAX, deadline),
+                self.seq.word().wait(seen, u32::MAX, deadline.as_ref()),
                 Err(Error::TimedOut)
             )
         }
 
         fn wake(&self) {
-            // Fails only where the system call does not exist, and then nobody sleeps on it.
-            let _ = self.seq.word().wake(u32::MAX);
+            match &self.fd {
+                Some(fd) => fd.poke(),
+                // Fails only where the system call does not exist, and then nobody sleeps on it.
+                None => {
+                    let _ = self.seq.word().wake(u32::MAX);
+                }
+            }
+        }
+
+        fn latched(&self) -> bool {
+            self.fd.is_some()
         }
     }
 

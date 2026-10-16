@@ -3,12 +3,14 @@
 
 //! The publisher's list of subscriptions, and the death links both ends hold.
 
+use std::os::fd::{AsFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Weak};
 
 use rsbinder::{DeathRecipient, SIBinder, WIBinder};
 
 use crate::layout::{ControlView, CLOSED, WAITING};
+use crate::wake::{send_wake, Sent};
 
 /// A death notification registered on a proxy, removed on drop.
 pub(crate) struct DeathLink<R: DeathRecipient + 'static> {
@@ -83,14 +85,28 @@ pub(crate) struct Link {
     dead: Arc<Dead>,
     /// The `state` of the wait last woken, so a wait gets one wake (plan 15 §5.5). Under the lock.
     woken: AtomicU32,
+    /// The publisher's end of the socket pair of a subscription woken through it (§5.5a).
+    socket: Option<OwnedFd>,
+    /// The subscriber closed its end of the socket.
+    hung_up: AtomicBool,
     _death: Option<DeathLink<Watch>>,
 }
 
+/// How a link wants waking after a commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wanted {
+    No,
+    Futex,
+    /// Its socket was sent a byte, or found closed.
+    Sent,
+}
+
 impl Link {
-    /// A subscription through `control` from `uid`; `token`'s death takes it out of `list`.
+    /// A subscription through `control` from `uid`, woken by `socket` if any, gone with `token`.
     pub(crate) fn new(
         control: ControlView,
         uid: u32,
+        socket: Option<OwnedFd>,
         token: &SIBinder,
         list: Weak<dyn Forget>,
     ) -> rsbinder::Result<Self> {
@@ -106,22 +122,36 @@ impl Link {
             dead,
             // No `state` with `WAITING` raised is zero.
             woken: AtomicU32::new(0),
+            socket,
+            hung_up: AtomicBool::new(false),
         })
     }
 
-    /// Whether the subscriber sleeps in a wait not woken yet, which counts as woken from here on.
-    fn wants_wake(&self) -> bool {
+    /// Mark a wait not woken yet as woken; a socket's byte is sent here, a futex's by the caller.
+    fn wake(&self) -> Wanted {
         let state = self.control.state().load();
         if state & WAITING == 0 || state == self.woken.load(Ordering::Relaxed) {
-            return false;
+            return Wanted::No;
+        }
+        let Some(socket) = &self.socket else {
+            self.woken.store(state, Ordering::Relaxed);
+            return Wanted::Futex;
+        };
+        match send_wake(socket.as_fd()) {
+            Sent::Pending => {}
+            Sent::Closed => self.hung_up.store(true, Ordering::Relaxed),
+            // Not counted as woken: the next commit sends again.
+            Sent::Failed => return Wanted::Sent,
         }
         self.woken.store(state, Ordering::Relaxed);
-        true
+        Wanted::Sent
     }
 
-    /// The subscriber's process died, or it dropped the subscription.
+    /// The subscriber's process died, or it dropped the subscription or its wake socket.
     pub(crate) fn ended(&self) -> bool {
-        self.dead.get() || self.control.state().load() & CLOSED != 0
+        self.dead.get()
+            || self.hung_up.load(Ordering::Relaxed)
+            || self.control.state().load() & CLOSED != 0
     }
 
     pub(crate) fn dead(&self) -> bool {
@@ -131,34 +161,55 @@ impl Link {
 
 /// One topic's subscriptions, under the writer's lock; removals are returned to drop after it.
 #[derive(Default)]
-pub(crate) struct Links(Vec<Arc<Link>>);
+pub(crate) struct Links {
+    links: Vec<Arc<Link>>,
+    /// Wake bytes sent.
+    #[cfg(test)]
+    sends: u64,
+}
 
 impl Links {
     pub(crate) fn len(&self) -> usize {
-        self.0.len()
+        self.links.len()
     }
 
     pub(crate) fn of_uid(&self, uid: u32) -> usize {
-        self.0.iter().filter(|link| link.uid == uid).count()
+        self.links.iter().filter(|link| link.uid == uid).count()
     }
 
     pub(crate) fn push(&mut self, link: Arc<Link>) {
-        self.0.push(link);
+        self.links.push(link);
     }
 
-    /// Whether a subscriber waits for a wake; each such wait counts once (plan 15 §5.5).
-    pub(crate) fn wake_wanted(&self) -> bool {
-        // Every link, not up to the first: each one remembers the wait this wake is for.
-        self.0
-            .iter()
-            .filter(|link| !link.ended())
-            .fold(false, |wanted, link| link.wants_wake() | wanted)
+    /// A byte to each socket waiter, once per wait; whether one waits on the futex (§5.5, §5.5a).
+    pub(crate) fn wake(&mut self) -> bool {
+        let mut futex = false;
+        // Every link, not up to the first futex one: each remembers the wait it is woken for.
+        for link in self.links.iter().filter(|link| !link.ended()) {
+            match link.wake() {
+                Wanted::No => {}
+                Wanted::Futex => futex = true,
+                Wanted::Sent => {
+                    #[cfg(test)]
+                    {
+                        self.sends += 1;
+                    }
+                }
+            }
+        }
+        futex
+    }
+
+    /// The wake bytes sent so far.
+    #[cfg(all(test, not(loom), any(target_os = "linux", target_os = "android")))]
+    pub(crate) fn sends(&self) -> u64 {
+        self.sends
     }
 
     /// Take out the subscriptions that ended.
     pub(crate) fn prune(&mut self) -> Vec<Arc<Link>> {
         let mut gone = Vec::new();
-        self.0.retain(|link| {
+        self.links.retain(|link| {
             let ended = link.ended();
             if ended {
                 gone.push(link.clone());
@@ -171,9 +222,9 @@ impl Links {
     /// Take out the subscription flagged by `dead`.
     pub(crate) fn remove(&mut self, dead: &Arc<Dead>) -> Option<Arc<Link>> {
         let at = self
-            .0
+            .links
             .iter()
             .position(|link| Arc::ptr_eq(&link.dead, dead))?;
-        Some(self.0.swap_remove(at))
+        Some(self.links.swap_remove(at))
     }
 }

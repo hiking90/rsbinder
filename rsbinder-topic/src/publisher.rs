@@ -5,11 +5,11 @@
 //!
 //! A subscription is taken in this order, the steps PUB1–PUB7 of the plan. The application's own
 //! `ITopic`, if it has one, checks the caller (PUB1). [`Acceptor::accept`] then checks the
-//! request, maps the control page, duplicates the topic's fd and links to the token's death
-//! (PUB2–PUB5), all outside the publisher's lock; under it, it takes out the subscriptions that
-//! ended, refuses or adds this one, and reads where it starts (PUB6). Nothing after that can
-//! fail on this side (PUB7), so a subscription in the list is one whose subscriber got the reply
-//! or will learn that it did not.
+//! request, maps the control page, duplicates the topic's fd, makes the socket pair of a
+//! subscription woken through an fd and links to the token's death (PUB2–PUB5), all outside the
+//! publisher's lock; under it, it takes out the subscriptions that ended, refuses or adds this
+//! one, and reads where it starts (PUB6). Nothing after that can fail on this side (PUB7), so a
+//! subscription in the list is one whose subscriber got the reply or will learn that it did not.
 
 use std::fmt;
 use std::os::fd::{AsFd, OwnedFd};
@@ -17,17 +17,20 @@ use std::sync::{Arc, Weak};
 
 use rsbinder::fmq::shm::Mapping;
 use rsbinder::{
-    BinderResult, CallingContext, ExceptionCode, Interface, SIBinder, Status, StatusCode,
+    BinderResult, CallingContext, ExceptionCode, Interface, ParcelFileDescriptor, SIBinder, Status,
+    StatusCode,
 };
 
-use crate::aidl::ITopic::{BnTopic, ITopic, ERROR_CLOSED, ERROR_FULL, ERROR_VERSION};
+use crate::aidl::ITopic::{
+    BnTopic, ITopic, ERROR_CLOSED, ERROR_FULL, ERROR_VERSION, WAKE_FD, WAKE_FUTEX,
+};
 use crate::aidl::SubscribeRequest::SubscribeRequest;
 use crate::aidl::TopicEndpoint::TopicEndpoint;
 use crate::connect::{asked_here, refuse, status_of};
 use crate::layout::{self, ControlView, Stored, HEADER_OFFSET, VERSION};
 use crate::link::{Dead, Forget, Link};
 use crate::publish::TypedWriter;
-use crate::{Payload, PublishError, PublisherPolicy};
+use crate::{wake, Payload, PublishError, PublisherPolicy};
 
 /// The sending end of a topic of `T`: it writes values into the topic's memory and takes
 /// subscriptions to it.
@@ -111,6 +114,12 @@ impl<T: Payload + 'static> Publisher<T> {
     #[cfg(all(test, not(loom), any(target_os = "linux", target_os = "android")))]
     pub(crate) fn wakes(&self) -> u64 {
         self.shared.writer.wakes()
+    }
+
+    /// The wake bytes the topic has sent.
+    #[cfg(all(test, not(loom), any(target_os = "linux", target_os = "android")))]
+    pub(crate) fn sends(&self) -> u64 {
+        self.shared.writer.sends()
     }
 
     /// The subscriptions the topic holds, after taking out those that ended.
@@ -218,11 +227,12 @@ impl Acceptor {
     ///
     /// Refusals: [`ITopic::ERROR_VERSION`] for another layout version; `BadType` when the
     /// request names another payload type; `BadValue` for a token of this process that came
-    /// through binder (its death would say nothing about the caller), a nonzero pin count, or a
-    /// control page that is not a sealed memfd of the size, magic, version and pin count the
-    /// request states; [`ITopic::ERROR_FULL`] when the publisher holds as many subscriptions as
-    /// its policy allows, in all or from the caller's uid; [`ITopic::ERROR_CLOSED`] once the
-    /// publisher is closed or dropped; `DeadObject` when the caller died during the call.
+    /// through binder (its death would say nothing about the caller), a nonzero pin count, a
+    /// `wake` that is neither [`ITopic::WAKE_FUTEX`] nor [`ITopic::WAKE_FD`], or a control page
+    /// that is not a sealed memfd of the size, magic, version and pin count the request states;
+    /// [`ITopic::ERROR_FULL`] when the publisher holds as many subscriptions as its policy allows,
+    /// in all or from the caller's uid; [`ITopic::ERROR_CLOSED`] once the publisher is closed or
+    /// dropped; `DeadObject` when the caller died during the call.
     ///
     /// A token of a third process cannot be told from the caller's own: its subscription lasts
     /// until that process dies or the publisher does, and `max_per_uid` bounds how many a caller
@@ -235,6 +245,8 @@ impl Acceptor {
     /// [`ITopic::ERROR_VERSION`]: crate::aidl::ITopic::ERROR_VERSION
     /// [`ITopic::ERROR_FULL`]: crate::aidl::ITopic::ERROR_FULL
     /// [`ITopic::ERROR_CLOSED`]: crate::aidl::ITopic::ERROR_CLOSED
+    /// [`ITopic::WAKE_FUTEX`]: crate::aidl::ITopic::WAKE_FUTEX
+    /// [`ITopic::WAKE_FD`]: crate::aidl::ITopic::WAKE_FD
     pub fn accept(&self, request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
         match self.topic.upgrade() {
             Some(topic) => topic.accept(request),
@@ -265,7 +277,7 @@ impl<T: Payload + 'static> Accept for Shared<T> {
         if request.r#type != T::type_name() {
             return Err(StatusCode::BadType.into());
         }
-        if request.pins != 0 {
+        if request.pins != 0 || ![WAKE_FUTEX, WAKE_FD].contains(&request.wake) {
             return Err(StatusCode::BadValue.into());
         }
         let token = request.token.as_ref().ok_or(StatusCode::UnexpectedNull)?;
@@ -276,9 +288,16 @@ impl<T: Payload + 'static> Accept for Shared<T> {
         let control = ControlView::map(control.as_fd(), 0).map_err(status_of)?;
         let fd = self.fd.try_clone().map_err(StatusCode::from)?;
         let ring = layout::descriptor(fd, self.capacity).try_into()?;
+        let (socket, wake_fd) = match request.wake {
+            WAKE_FD => {
+                let (ours, theirs) = wake::pair().map_err(StatusCode::from)?;
+                (Some(ours), Some(ParcelFileDescriptor::new(theirs)))
+            }
+            _ => (None, None),
+        };
         let uid = CallingContext::default().uid;
         let list = Arc::downgrade(&self) as Weak<dyn Forget>;
-        let link = Arc::new(Link::new(control, uid, token, list)?);
+        let link = Arc::new(Link::new(control, uid, socket, token, list)?);
 
         let mut state = self.writer.lock();
         let gone = state.links.prune();
@@ -309,6 +328,7 @@ impl<T: Payload + 'static> Accept for Shared<T> {
             // The bits of the `u64` position and `u32` index; the subscriber reads them back so.
             start: start as i64,
             startIndex: index as i32,
+            wakeFd: wake_fd,
         })
     }
 }
