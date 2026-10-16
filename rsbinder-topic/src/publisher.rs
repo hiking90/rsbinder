@@ -151,6 +151,13 @@ impl<T: Payload + 'static> Publisher<T> {
     pub(crate) fn sends(&self) -> u64 {
         self.shared.writer.sends()
     }
+
+    /// Run `pause` in every commit between its `seq` bump and its look at the subscribers.
+    #[cfg(all(test, not(loom), any(target_os = "linux", target_os = "android")))]
+    pub(crate) fn pause_after_bump(&self, pause: Box<dyn FnMut() + Send>) {
+        self.shared.writer.lock().after_bump = Some(pause);
+    }
+
     /// The subscriptions the topic holds, after taking out those that ended.
     ///
     /// For skipping the work of a value no one would receive; it changes as subscribers come

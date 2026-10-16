@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use rsbinder::Status;
 
 use crate::{
-    Bytes, Closed, Publisher, PublisherPolicy, RecvError, Start, Subscriber, SubscriberPolicy,
+    Bytes, Closed, Publisher, PublisherPolicy, RecvError, Start, Subscriber, SubscriberPolicy, Wake,
 };
 
 fn num(n: u32) -> Bytes {
@@ -196,9 +196,22 @@ fn eight_subscribers_receive_the_same_records_in_order() {
         .map(|_| {
             let mut subscriber = subscriber(&publisher);
             thread::spawn(move || {
-                (0..1000)
-                    .map(|_| subscriber.recv().map(|bytes| value(&bytes)))
-                    .collect::<Vec<_>>()
+                let mut got = Vec::new();
+                for _ in 0..1000 {
+                    let started = Instant::now();
+                    let received = subscriber.recv_timeout(Duration::from_secs(5));
+                    // A lost wake waits for the deadline: the test fails rather than hangs.
+                    let received = match started.elapsed() < Duration::from_secs(1) {
+                        true => received.map(|bytes| value(&bytes)),
+                        false => Err(RecvError::Timeout),
+                    };
+                    let failed = received.is_err();
+                    got.push(received);
+                    if failed {
+                        break;
+                    }
+                }
+                got
             })
         })
         .collect();
@@ -287,8 +300,9 @@ fn ten_thousand_interrupts_of_a_waiter_that_waits_again_all_return() {
     );
 }
 
-/// The wakes one `interrupt` may send: 2 to 4 measured alone, the rest for a test run's load.
-const WAKES_PER_INTERRUPT: usize = 64;
+/// The wakes one `interrupt` may send: 2 to 4 alone, 66 seen beside a build; a raise that wakes
+/// at every look without yielding sends thousands.
+const WAKES_PER_INTERRUPT: usize = 256;
 
 /// AC-15.2.11 within a process: an interrupt ends eight waits within a second, a thousand times.
 #[test]
@@ -334,6 +348,80 @@ fn an_interrupt_before_the_wait_ends_the_next_one() {
     let interrupter = subscriber.interrupter();
     drop(subscriber);
     interrupter.interrupt();
+}
+
+/// A commit whose look at `state` comes after a newer wait raised `WAITING` wakes that wait
+/// before it sleeps, which is no wake for it: it sleeps on the `seq` the commit made. The next
+/// commit must wake it all the same.
+#[test]
+fn a_wake_sent_before_the_wait_sleeps_does_not_stand_for_the_next_commit() {
+    a_commit_after_a_wait_that_saw_the_last(Wake::Futex);
+}
+
+/// The same with the fd wake, whose byte would stay; the publisher sends none for such a wait.
+#[test]
+fn a_wait_that_saw_a_commit_on_the_fd_wake_is_woken_by_the_next() {
+    a_commit_after_a_wait_that_saw_the_last(Wake::Fd);
+}
+
+fn a_commit_after_a_wait_that_saw_the_last(wake: Wake) {
+    use std::sync::mpsc;
+    let publisher = Arc::new(topic(64 << 10));
+    let policy = SubscriberPolicy {
+        wake,
+        ..SubscriberPolicy::default()
+    };
+    let mut subscriber = Subscriber::request(&publisher.as_binder(), &policy).unwrap();
+    // Once each: the first commit stops after its bump, the wait after `WAITING`.
+    let (bumped, at_bump) = mpsc::sync_channel::<()>(0);
+    let (resume, resumed) = mpsc::sync_channel::<()>(0);
+    let pause = Arc::new(std::sync::Mutex::new(Some((bumped, resumed))));
+    publisher.pause_after_bump(Box::new(move || {
+        if let Some((bumped, resumed)) = pause.lock().unwrap().take() {
+            bumped.send(()).unwrap();
+            resumed.recv().unwrap();
+        }
+    }));
+    let first = {
+        let publisher = publisher.clone();
+        thread::spawn(move || publisher.publish(&num(1)).unwrap())
+    };
+    at_bump.recv().unwrap();
+    // Committed and `seq` bumped: read without waiting, then wait for the next record.
+    assert_eq!(subscriber.try_recv().map(|bytes| value(&bytes)), Ok(1));
+    let (armed, at_arm) = mpsc::sync_channel::<()>(0);
+    let (go, gone) = mpsc::sync_channel::<()>(0);
+    let hold = Arc::new(std::sync::Mutex::new(Some((armed, gone))));
+    *subscriber.local().before_sleep.lock().unwrap() = Some(Box::new(move || {
+        if let Some((armed, gone)) = hold.lock().unwrap().take() {
+            armed.send(()).unwrap();
+            gone.recv().unwrap();
+        }
+    }));
+    let receiving = thread::spawn(move || {
+        let started = Instant::now();
+        let got = subscriber.recv_timeout(Duration::from_secs(5));
+        (got.map(|bytes| value(&bytes)), started.elapsed())
+    });
+    at_arm.recv().unwrap();
+    // The first commit looks at `state` now, while the wait has not slept yet.
+    resume.send(()).unwrap();
+    first.join().unwrap();
+    go.send(()).unwrap();
+    thread::sleep(Duration::from_millis(50));
+    publisher.publish(&num(2)).unwrap();
+    let (got, took) = receiving.join().unwrap();
+    assert_eq!(got, Ok(2));
+    assert!(
+        took < Duration::from_secs(1),
+        "the second commit did not wake the wait: {took:?}"
+    );
+    // The first commit sent nothing to the wait that had seen it; the second, one wake.
+    let sent = match wake {
+        Wake::Futex => publisher.wakes(),
+        Wake::Fd => publisher.sends(),
+    };
+    assert_eq!(sent, 1);
 }
 
 #[cfg(feature = "tokio")]
@@ -401,28 +489,47 @@ mod pool {
         let runtime = runtime();
         let publisher = Arc::new(topic(64 << 10));
         let mut subscriber = subscriber(&publisher);
-        // Each value is published after its delay.
+        // Each value is published after its delay; `published` says when, from `base`.
         let (send, values) = mpsc::channel::<(u32, Duration)>();
+        let base = Instant::now();
+        let published = Arc::new(std::sync::Mutex::new((0u32, Duration::ZERO)));
         let publishing = {
             let publisher = publisher.clone();
+            let published = published.clone();
             thread::spawn(move || {
                 for (n, delay) in values {
                     thread::sleep(delay);
                     publisher.publish(&num(n)).unwrap();
+                    *published.lock().unwrap() = (n, base.elapsed());
                 }
             })
         };
         let rounds = |subscriber: &mut Subscriber<Bytes>, from: u32, to: u32, delay| {
             for n in from..to {
                 abandon(&runtime, subscriber);
+                let wakes = publisher.wakes();
                 send.send((n, delay)).unwrap();
                 let started = Instant::now();
                 let got = subscriber.recv_timeout(Duration::from_secs(5));
                 // A wait that slept through the commit still finds it once its deadline passes.
-                assert!(
-                    started.elapsed() < Duration::from_secs(1),
-                    "round {n} missed the wake"
-                );
+                let took = started.elapsed();
+                if took >= Duration::from_secs(1) {
+                    let words = subscriber.local().words();
+                    panic!(
+                        "round {n} missed the wake ({took:?}): {got:?}, started at {:?}, \
+                         published {:?}, {} futex wakes, joined in {:?}, sleeps {:?}, \
+                         state {:#x}, seq {}, read {} of {}",
+                        started - base,
+                        *published.lock().unwrap(),
+                        publisher.wakes() - wakes,
+                        subscriber.trace.join,
+                        subscriber.trace.parks,
+                        words.control.state().load(Ordering::SeqCst),
+                        crate::wait::Words::seq(words),
+                        subscriber.position(),
+                        subscriber.committed(),
+                    );
+                }
                 assert_eq!(got.map(|bytes| value(&bytes)), Ok(n), "round {n}");
             }
         };

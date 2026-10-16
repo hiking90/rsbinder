@@ -96,8 +96,8 @@ pub(crate) trait Stores {
     fn store_write(&self, position: u64);
     fn store_last(&self, position: u64);
     fn store_half(&self, position: u64);
-    /// Add one to the word a waiting subscriber sleeps on.
-    fn bump_seq(&self);
+    /// Add one to the word a waiting subscriber sleeps on; the value it holds now.
+    fn bump_seq(&self) -> u32;
     /// Wake every subscriber that sleeps on that word: one system call, however many sleep.
     fn wake_seq(&self);
     /// Copy `src` to `position`, wrapping at the ring's end. Both are multiples of 8.
@@ -210,9 +210,9 @@ impl<M: Stores> Writer<M> {
         self.put_raw(kind as u32, payload)
     }
 
-    /// Tell the subscribers that sleep that something was committed.
-    pub(crate) fn announce(&self) {
-        self.memory.bump_seq();
+    /// Tell the subscribers that sleep that something was committed; the `seq` that says so.
+    pub(crate) fn announce(&self) -> u32 {
+        self.memory.bump_seq()
     }
 
     /// Wake the subscribers that sleep on `seq`. The caller decides that one does (plan 15 §5.5).

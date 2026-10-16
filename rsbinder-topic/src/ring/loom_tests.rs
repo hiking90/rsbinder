@@ -96,7 +96,9 @@ impl Stores for Arc<Memory> {
         self.half.store(position, Ordering::Release);
     }
 
-    fn bump_seq(&self) {}
+    fn bump_seq(&self) -> u32 {
+        0
+    }
 
     fn wake_seq(&self) {}
 

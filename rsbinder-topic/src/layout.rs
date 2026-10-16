@@ -129,8 +129,14 @@ pub(crate) const WAITING: u32 = 1;
 /// `state` bit 1: the subscriber has dropped the subscription.
 pub(crate) const CLOSED: u32 = 2;
 
-/// One wait in `state`'s count, bits 2–31: what tells one wait from the next (plan 15 §5.5).
-pub(crate) const WAIT_COUNT: u32 = 4;
+/// `state` bits 2–31: the low 30 bits of the `seq` the wait sleeps on (plan 15 §5.5). They tell
+/// one wait from the next, and the publisher wakes no wait that has seen its commit.
+pub(crate) const SEEN_SHIFT: u32 = 2;
+
+/// The `seen` field of `state` for a wait on `seq`.
+pub(crate) fn seen_field(seq: u32) -> u32 {
+    seq << SEEN_SHIFT
+}
 
 /// `Unsupported` where topics cannot work: off Linux and Android, or where `RoWord64` has no value.
 pub(crate) fn check_target() -> Result<()> {
@@ -258,8 +264,9 @@ impl<O> Stores for Stored<O> {
         self.word64(topic::HALF).store(position, Ordering::Release);
     }
 
-    fn bump_seq(&self) {
-        self.word32(topic::SEQ).fetch_add(1, Ordering::SeqCst);
+    fn bump_seq(&self) -> u32 {
+        let seq = self.word32(topic::SEQ).fetch_add(1, Ordering::SeqCst);
+        seq.wrapping_add(1)
     }
 
     fn wake_seq(&self) {
@@ -500,7 +507,7 @@ impl ControlPage {
         unsafe { self.mapping.as_ptr().add(at).cast::<AtomicU64>().as_ref() }
     }
 
-    /// The [`WAITING`] and [`CLOSED`] bits and the count of waits. Changed a bit at a time.
+    /// The [`WAITING`] and [`CLOSED`] bits and the `seq` a wait sleeps on. Changed by RMWs alone.
     pub(crate) fn state(&self) -> &AtomicU32 {
         self.word32(control::STATE)
     }
@@ -560,7 +567,7 @@ impl ControlView {
         unsafe { RoWord64::from_ptr(self.mapping.as_ptr().add(at)) }
     }
 
-    /// The subscriber's [`WAITING`] and [`CLOSED`] bits and its count of waits.
+    /// The subscriber's [`WAITING`] and [`CLOSED`] bits and the `seq` its wait sleeps on.
     pub(crate) fn state(&self) -> &RoWord32 {
         self.word32(control::STATE)
     }

@@ -140,6 +140,22 @@ pub struct Subscriber<T: Payload> {
     /// A test's pause before a wait sleeps.
     #[cfg(test)]
     pub(crate) about_to_park: Option<Box<dyn FnMut() + Send + Sync>>,
+    /// What the last sync wait did, for a test that reports a slow one.
+    #[cfg(all(test, feature = "tokio"))]
+    pub(crate) trace: Trace,
+}
+
+/// The steps of one sync wait: how long it took to join the pool's, and each sleep.
+#[cfg(all(test, feature = "tokio"))]
+#[derive(Default)]
+#[allow(
+    dead_code,
+    reason = "read by `wait_tests`, which runs on Linux and Android only"
+)]
+pub(crate) struct Trace {
+    pub(crate) join: Duration,
+    /// How each sleep ended, how long it lasted, and the `seq` it slept on.
+    pub(crate) parks: Vec<(Slept, Duration, u32)>,
 }
 
 /// The control page, marked `CLOSED` when dropped. A wait left on the pool shares it.
@@ -236,6 +252,8 @@ impl<T: Payload> Subscriber<T> {
             _death: death,
             #[cfg(test)]
             about_to_park: None,
+            #[cfg(all(test, feature = "tokio"))]
+            trace: Trace::default(),
         })
     }
 
@@ -362,7 +380,7 @@ impl<T: Payload> Subscriber<T> {
                 hook();
             }
             let armed = Armed(&self.local);
-            if self.local.arm() != 0 || self.local.words().seq() != seen {
+            if self.local.arm(seen) != 0 || self.local.words().seq() != seen {
                 continue;
             }
             let woke = reactor.readable().await;
@@ -407,8 +425,18 @@ impl<T: Payload> Subscriber<T> {
     pub(crate) fn wait(&mut self, deadline: Option<Instant>, latest: bool) -> Result<T, RecvError> {
         #[cfg(feature = "tokio")]
         {
+            #[cfg(test)]
+            let joining = Instant::now();
             // Before the first look: a wait left on the pool would take the next wake.
-            if !self.leftover.join(deadline) {
+            let joined = self.leftover.join(deadline);
+            #[cfg(test)]
+            {
+                self.trace = Trace {
+                    join: joining.elapsed(),
+                    parks: Vec::new(),
+                };
+            }
+            if !joined {
                 return Err(RecvError::Timeout);
             }
             self.local.take(ABANDON);
@@ -441,7 +469,10 @@ impl<T: Payload> Subscriber<T> {
                 hook();
             }
             let parked_at = Instant::now();
-            match self.local.park(seen, deadline) {
+            let slept = self.local.park(seen, deadline);
+            #[cfg(all(test, feature = "tokio"))]
+            self.trace.parks.push((slept, parked_at.elapsed(), seen));
+            match slept {
                 Slept::Woke => self.spin.parked(parked_at.elapsed()),
                 Slept::TimedOut | Slept::Stopped => {}
             }
@@ -506,7 +537,7 @@ impl<T: Payload> poll::Wait for Subscriber<T> {
             hook();
         }
         // An interrupt stays up for the next receive that waits; its eventfd count ends this poll.
-        if self.local.arm() & DIED != 0 || self.local.words().seq() != seen {
+        if self.local.arm(seen) & DIED != 0 || self.local.words().seq() != seen {
             self.local.disarm();
             return false;
         }

@@ -179,15 +179,22 @@ struct Scratch {
 pub(crate) struct State<S> {
     pub(crate) writer: Writer<S>,
     pub(crate) links: Links,
+    /// A test's pause after a commit bumps `seq`, before it loads the subscribers' `state`.
+    #[cfg(all(test, not(loom)))]
+    pub(crate) after_bump: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl<S: Stores> State<S> {
     /// After a commit: bump `seq`, then wake the waiters, one futex wake at most (§5.5, §5.5a).
     fn announce(&mut self) {
-        self.writer.announce();
+        let seq = self.writer.announce();
+        #[cfg(all(test, not(loom)))]
+        if let Some(pause) = self.after_bump.as_mut() {
+            pause();
+        }
         // Against the `SeqCst` raise of `WAITING`: this load sees it, or the waiter sees new `seq`.
         fence(Ordering::SeqCst);
-        if self.links.wake() {
+        if self.links.wake(seq) {
             self.writer.wake();
         }
     }
@@ -220,6 +227,8 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
             state: Mutex::new(State {
                 writer,
                 links: Links::default(),
+                #[cfg(all(test, not(loom)))]
+                after_bump: None,
             }),
             scratch: Mutex::new(Vec::new()),
             _payload: PhantomData,

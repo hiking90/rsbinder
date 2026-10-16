@@ -119,7 +119,7 @@ fn a_control_page_is_written_by_the_subscriber_and_read_by_the_publisher() {
     page.state().fetch_or(WAITING, Ordering::SeqCst);
     page.state().fetch_add(4, Ordering::SeqCst);
     assert_eq!(view.state().load_acquire(), 4 | WAITING);
-    // A bit at a time: closing leaves the count and the waiting bit as they are.
+    // A bit at a time: closing leaves the `seen` field and the waiting bit as they are.
     page.state().fetch_or(CLOSED, Ordering::SeqCst);
     page.state().fetch_and(!WAITING, Ordering::SeqCst);
     assert_eq!(view.state().load_acquire(), 4 | CLOSED);

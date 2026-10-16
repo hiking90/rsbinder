@@ -9,6 +9,13 @@
 //! loaded. Both sides change their word and then look at the other's with `SeqCst`, so one of
 //! them sees the other: the publisher sees `WAITING`, or the kernel's compare sees the new `seq`.
 //!
+//! The publisher wakes each wait once (`Link::wake`), and `WAITING` carries the `seq` the wait
+//! sleeps on, so it can tell which wake ends the wait. A wake from a commit whose `seq` is the
+//! one the wait loaded ends nothing: the wait has seen that commit, and if the wake lands before
+//! it enters the kernel, it sleeps on that `seq` all the same. Such a wait is neither woken nor
+//! taken as woken; the next commit wakes it. A wake from any later commit always ends the wait,
+//! in the kernel or at the compare, so after it the publisher sends nothing more to that wait.
+//!
 //! The other party is in this process: a death notice, an [`Interrupter`](crate::Interrupter), a
 //! dropped `recv_async` future, a dropped subscriber. None of them can change `seq`, so a wake
 //! that lands before the waiter enters the kernel would be lost. Each raises a bit in `stop`
@@ -53,8 +60,8 @@ const RECHECKS: u32 = 1;
 pub(crate) trait Words: Send + Sync {
     /// `seq`, ordered before the caller's next look at the ring.
     fn seq(&self) -> u32;
-    /// Count one more wait in `state`, then raise `WAITING`; both `SeqCst`.
-    fn begin_wait(&self);
+    /// Put `seen`, the `seq` the wait sleeps on, in `state` and raise `WAITING`: one `SeqCst` RMW.
+    fn begin_wait(&self, seen: u32);
     /// Drain an fd wake, then lower `WAITING` alone; `true` when the publisher's socket hung up.
     fn end_wait(&self) -> bool;
     /// Sleep while `seq` holds `seen`; `false` when `deadline` passed first.
@@ -85,6 +92,12 @@ pub(crate) struct Local<W> {
     /// A test's pause after a wait lowers `parked`, before it lowers `WAITING`.
     #[cfg(all(test, not(loom)))]
     pub(crate) after_sleep: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// A test's pause after a wait raises `WAITING` and finds no bit up, before it sleeps.
+    #[cfg(all(test, not(loom)))]
+    pub(crate) before_sleep: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// The waits [`arm`](Self::arm) started, for a test that counts them.
+    #[cfg(all(test, not(loom)))]
+    pub(crate) arms: std::sync::atomic::AtomicUsize,
 }
 
 impl<W: Words> Local<W> {
@@ -95,6 +108,10 @@ impl<W: Words> Local<W> {
             words: OnceLock::new(),
             #[cfg(all(test, not(loom)))]
             after_sleep: std::sync::Mutex::new(None),
+            #[cfg(all(test, not(loom)))]
+            before_sleep: std::sync::Mutex::new(None),
+            #[cfg(all(test, not(loom)))]
+            arms: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -109,7 +126,14 @@ impl<W: Words> Local<W> {
 
     /// One wait: sleep on `seq` while it holds `seen`, unless a bit in `stop` is up.
     pub(crate) fn park(&self, seen: u32, deadline: Option<Instant>) -> Slept {
-        let slept = if self.arm() != 0 {
+        let stopped = self.arm(seen) != 0;
+        #[cfg(all(test, not(loom)))]
+        if !stopped {
+            if let Some(pause) = self.before_sleep.lock().expect("lock").as_ref() {
+                pause();
+            }
+        }
+        let slept = if stopped {
             Slept::Stopped
         } else if self.words().sleep(seen, deadline) {
             Slept::Woke
@@ -120,9 +144,11 @@ impl<W: Words> Local<W> {
         slept
     }
 
-    /// Start a wait: count it, raise `WAITING` and `parked`; the bits up in `stop`, after both.
-    pub(crate) fn arm(&self) -> u32 {
-        self.words().begin_wait();
+    /// Start a wait on `seen`: raise `WAITING` with it and `parked`; the bits up in `stop` after.
+    pub(crate) fn arm(&self, seen: u32) -> u32 {
+        #[cfg(all(test, not(loom)))]
+        self.arms.fetch_add(1, Ordering::Relaxed);
+        self.words().begin_wait(seen);
         self.parked.store(true, Ordering::SeqCst);
         // Against the publisher's fence after `seq` and a waker's after `stop`: each side sees one.
         fence(Ordering::SeqCst);
@@ -206,7 +232,7 @@ mod real {
     use rsbinder::{DeathRecipient, WIBinder};
 
     use super::{Local, Words, DIED};
-    use crate::layout::{ControlPage, Seq, WAITING, WAIT_COUNT};
+    use crate::layout::{seen_field, ControlPage, Seq, CLOSED, WAITING};
     use crate::wake::FdWake;
 
     /// The words of one subscription: `seq` in the topic memory, `state` in the control page.
@@ -222,10 +248,18 @@ mod real {
             self.seq.word().load_acquire()
         }
 
-        fn begin_wait(&self) {
+        fn begin_wait(&self, seen: u32) {
             let state = self.control.state();
-            state.fetch_add(WAIT_COUNT, Ordering::SeqCst);
-            state.fetch_or(WAITING, Ordering::SeqCst);
+            let mut old = state.load(Ordering::Relaxed);
+            // `CLOSED` is the other bit raised meanwhile, by the subscriber's drop.
+            while let Err(now) = state.compare_exchange_weak(
+                old,
+                old & CLOSED | seen_field(seen) | WAITING,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            ) {
+                old = now;
+            }
         }
 
         fn end_wait(&self) -> bool {

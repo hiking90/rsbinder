@@ -395,7 +395,7 @@ fn a_waiting_subscriber_that_never_reads_its_socket_holds_no_publish() {
         .map_or(1_000_000, |count| count.parse().unwrap());
     let publisher = topic(64 << 10);
     let subscriber = fd_subscriber(&publisher);
-    subscriber.local().arm();
+    subscriber.local().arm(subscriber.local().words().seq());
     for n in 0..publishes {
         publisher.publish(&num(n)).unwrap();
     }
@@ -411,7 +411,7 @@ fn a_subscriber_that_waits_anew_at_every_commit_and_never_reads_holds_no_publish
     let subscriber = fd_subscriber(&publisher);
     let words = subscriber.local().words();
     for n in 0..COMMITS {
-        words.begin_wait();
+        words.begin_wait(words.seq());
         publisher.publish(&num(n as u32)).unwrap();
     }
     assert_eq!(publisher.sends(), COMMITS);
@@ -449,8 +449,9 @@ fn a_subscriber_that_closes_its_socket_is_taken_out_and_raises_no_sigpipe() {
         publisher.acceptor().accept(&request).unwrap()
     };
     drop(endpoint.wakeFd.unwrap());
-    let waiting = crate::layout::WAITING | crate::layout::WAIT_COUNT;
-    page.state().fetch_or(waiting, Ordering::SeqCst);
+    // A wait on `seq` 0, which the publish below moves on from.
+    page.state()
+        .fetch_or(crate::layout::WAITING, Ordering::SeqCst);
     assert_eq!(publisher.subscriber_count(), 1);
     publisher.publish(&num(1)).unwrap();
     assert_eq!(publisher.sends(), 1);
@@ -535,7 +536,7 @@ fn a_receive_held_in_a_page_fault_holds_no_publish() {
     let publisher = topic(64 << 10);
     let subscriber = fd_subscriber(&publisher);
     // A byte in the socket for the `recv` to copy into the page that faults.
-    subscriber.local().arm();
+    subscriber.local().arm(subscriber.local().words().seq());
     publisher.publish(&num(0)).unwrap();
     let socket = subscriber.wait_fds().unwrap()[0].as_raw_fd();
     let address = region as usize;
@@ -547,7 +548,8 @@ fn a_receive_held_in_a_page_fault_holds_no_publish() {
     assert_eq!(poll(&mut fds, Some(&ten)).unwrap(), 1);
     let started = Instant::now();
     for n in 1..=1000 {
-        subscriber.local().words().begin_wait();
+        let words = subscriber.local().words();
+        words.begin_wait(words.seq());
         publisher.publish(&num(n)).unwrap();
     }
     assert!(
@@ -685,17 +687,14 @@ mod reactor {
         assert_eq!(publisher.sends(), 0);
     }
 
-    /// An async wait sleeps between wakes: `state` counts one wait per wake, not one per spin.
+    /// An async wait sleeps between wakes: it arms once per wake, not once per spin.
     #[test]
     fn an_async_wait_arms_once_per_wake() {
         let runtime = runtime();
         let publisher = topic(64 << 10);
         let mut subscriber = fd_subscriber(&publisher);
         let local = subscriber.local().clone();
-        let waits = || {
-            let state = local.words().control.state().load(Ordering::SeqCst);
-            state / crate::layout::WAIT_COUNT
-        };
+        let waits = || local.arms.load(Ordering::SeqCst);
         let receiving = runtime.spawn(async move {
             let mut got = Vec::new();
             for _ in 0..2 {

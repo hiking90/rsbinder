@@ -9,7 +9,7 @@ use std::sync::{Arc, Weak};
 
 use rsbinder::{DeathRecipient, SIBinder, WIBinder};
 
-use crate::layout::{ControlView, CLOSED, WAITING};
+use crate::layout::{seen_field, ControlView, CLOSED, WAITING};
 use crate::wake::{send_wake, Sent};
 
 /// A death notification registered on a proxy, removed on drop.
@@ -83,7 +83,7 @@ pub(crate) struct Link {
     control: ControlView,
     uid: u32,
     dead: Arc<Dead>,
-    /// The `state` of the wait last woken, so a wait gets one wake (plan 15 §5.5). Under the lock.
+    /// The `state` of the wait last woken by a wake that ends it, so a wait gets one (§5.5).
     woken: AtomicU32,
     /// The publisher's end of the socket pair of a subscription woken through it (§5.5a).
     socket: Option<OwnedFd>,
@@ -127,10 +127,15 @@ impl Link {
         })
     }
 
-    /// Mark a wait not woken yet as woken; a socket's byte is sent here, a futex's by the caller.
-    fn wake(&self) -> Wanted {
+    /// After the commit that made `seq`: mark a wait not woken yet as woken; a socket's byte is
+    /// sent here, a futex's by the caller.
+    fn wake(&self, seq: u32) -> Wanted {
         let state = self.control.state().load();
         if state & WAITING == 0 || state == self.woken.load(Ordering::Relaxed) {
+            return Wanted::No;
+        }
+        // A wait on this `seq` saw the commit: a wake may land before it sleeps and end nothing.
+        if state & !(WAITING | CLOSED) == seen_field(seq) {
             return Wanted::No;
         }
         let Some(socket) = &self.socket else {
@@ -181,12 +186,13 @@ impl Links {
         self.links.push(link);
     }
 
-    /// A byte to each socket waiter, once per wait; whether one waits on the futex (§5.5, §5.5a).
-    pub(crate) fn wake(&mut self) -> bool {
+    /// After the commit that made `seq`: a byte to each socket waiter, once per wait; whether one
+    /// waits on the futex (§5.5, §5.5a).
+    pub(crate) fn wake(&mut self, seq: u32) -> bool {
         let mut futex = false;
         // Every link, not up to the first futex one: each remembers the wait it is woken for.
         for link in self.links.iter().filter(|link| !link.ended()) {
-            match link.wake() {
+            match link.wake(seq) {
                 Wanted::No => {}
                 Wanted::Futex => futex = true,
                 Wanted::Sent => {
