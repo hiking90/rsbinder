@@ -395,6 +395,27 @@ impl PoolReader {
         self.unpin();
         Ok(())
     }
+
+    /// [`copy`](Self::copy) for a subscriber that vouches for its publisher: a plain memory copy
+    /// of the slot, into `into` emptied and not zeroed.
+    ///
+    /// # Safety
+    ///
+    /// The publisher keeps the pin protocol, and this process reads this pool through no run
+    /// ([`LoadedPool::slot_slice`]'s contract): the subscriber is
+    /// [`Trusted`](crate::Trusted).
+    pub(crate) unsafe fn copy_vouched(
+        &self,
+        loan: Loan,
+        into: &mut Vec<u8>,
+    ) -> Result<(), Unpinned> {
+        self.pin(loan)?;
+        into.clear();
+        // SAFETY: the pin this call holds, and the caller's word for the publisher.
+        into.extend_from_slice(unsafe { self.pool.slot_slice(loan.slot, loan.len as usize) });
+        self.unpin();
+        Ok(())
+    }
 }
 
 #[cfg(all(test, not(loom)))]

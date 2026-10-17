@@ -24,7 +24,9 @@
 //! writes it straight into a slot of a second memfd ([`Publisher::loan_slice`], [`LoanMut`]) and
 //! the ring carries only a record that names the slot. A [`Bytes`] subscriber receives it as any
 //! other value, or where it lies with [`Subscriber::recv_sample`]: the [`Sample`] pins the slot,
-//! and the publisher lends no pinned slot.
+//! and the publisher lends no pinned slot. A subscriber copies a lent value out with atomic loads
+//! unless it vouches for its publisher ([`Subscriber::trust_publisher`], [`Trusted`]); then its
+//! samples deref to `[u8]` in place and its copies are plain memory copies.
 //!
 //! A receive may wait for a record ([`Subscriber::recv`], `recv_timeout`, `recv_latest`, and
 //! `recv_async` with the `tokio` feature). A waiting subscriber sleeps on a futex word in the
@@ -99,6 +101,7 @@ mod ring;
 mod sample;
 mod stats;
 mod subscriber;
+mod trust;
 mod wait;
 mod wake;
 
@@ -112,6 +115,7 @@ pub use resolve::{Resolver, ServiceManager, Watch};
 pub use sample::Sample;
 pub use stats::{PublisherStats, SubscriberInfo, SubscriberStats};
 pub use subscriber::{Interrupter, Start, Subscriber, SubscriberPolicy, Wake};
+pub use trust::{Trust, Trusted, Untrusted};
 
 #[cfg(any(test, feature = "fuzzing"))]
 mod image;

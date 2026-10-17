@@ -6,7 +6,8 @@
 //! ipc-compare b2 --impl rsb-stream|ix [--wait block|poll] --size B --rate HZ
 //! ipc-compare b3 --impl rsb-stream|rsb-oneway|rsb-topic|rsb-topic-loan|ix [--wait block|poll] --n N --size B --rate HZ
 //!   (rsb-topic and rsb-topic-loan also take --wait fd; rsb-topic-loan lends a pool slot per item
-//!   and its subscriber reads it in place, or copies it out with --touch yes)
+//!   and its subscriber reads it in place, or copies it out with --touch yes; with --trust yes
+//!   the subscriber vouches for the publisher and copies with a plain memory copy)
 //! ipc-compare b5 --wake futex|fd --n N [--rate HZ]     (one process: publish time, N waiting)
 //! ipc-compare b6 --codec alloc|parcel|bytes --side publish|receive --size B  (one process: codec)
 //!   (b2, b3 with --impl ix also take --touch yes: the subscriber copies the payload out)
@@ -182,8 +183,10 @@ fn fanout(bench: &str, a: &Args) {
             let depth = ix::buffer_for(size);
             let slot = size.max(STAMP_BYTES);
             let touch = a.str("touch", "no") == "yes";
+            let trust = a.str("trust", "no") == "yes";
             let reads = if touch { "copies the payload out" } else { "reads the stamp in place" };
-            note.push(format!("pool {} slots of {slot} B; {reads}", n + 1 + depth + 1));
+            let vouches = if trust { "; trusts the publisher" } else { "" };
+            note.push(format!("pool {} slots of {slot} B; {reads}{vouches}", n + 1 + depth + 1));
             let producer = spawn("rsb-producer", &[("name", name.clone()), ("cpu", producer_cpu)]);
             let mut extra = vec![
                 ("ring", (64 << 10).to_string()),
@@ -193,6 +196,9 @@ fn fanout(bench: &str, a: &Args) {
             ];
             if touch {
                 extra.push(("touch", "yes".to_string()));
+            }
+            if trust {
+                extra.push(("trust", "yes".to_string()));
             }
             (producer, imp.clone(), extra)
         }

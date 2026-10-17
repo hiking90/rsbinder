@@ -10,7 +10,7 @@ use rsbinder::{Status, StatusCode};
 
 use crate::pool::{PoolReader, Unpinned};
 use crate::ring::{Corrupted, Loads, Reader, Taken};
-use crate::{end, Payload, Record, Sample};
+use crate::{end, Payload, Record, Sample, Trust};
 
 /// Why a receive returned no value.
 ///
@@ -150,7 +150,26 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
         self.typed(true)
     }
 
+    /// [`try_recv`](Self::try_recv), or [`try_latest`](Self::try_latest) with `latest`, that
+    /// copies a loan's value with a plain memory copy.
+    ///
+    /// # Safety
+    ///
+    /// [`PoolReader::copy_vouched`]'s: the subscriber is [`Trusted`](crate::Trusted).
+    pub(crate) unsafe fn recv_vouched(&mut self, latest: bool) -> Result<T, RecvError> {
+        // SAFETY: the caller's word for the publisher.
+        unsafe { self.typed_as(latest, true) }
+    }
+
     fn typed(&mut self, latest: bool) -> Result<T, RecvError> {
+        // SAFETY: not vouched: the copy is by atomic loads, which ask nothing of the publisher.
+        unsafe { self.typed_as(latest, false) }
+    }
+
+    /// # Safety
+    ///
+    /// With `vouched`, [`recv_vouched`](Self::recv_vouched)'s.
+    unsafe fn typed_as(&mut self, latest: bool, vouched: bool) -> Result<T, RecvError> {
         if self.corrupted {
             return Err(RecvError::Closed(Closed::Corrupted));
         }
@@ -167,6 +186,8 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
             other => return Err(not_a_value(other)),
         };
         let copied = match &self.pool {
+            // SAFETY: `vouched` is the caller's word for the publisher.
+            Some(pool) if vouched => unsafe { pool.copy_vouched(loan, &mut self.loaned) },
             Some(pool) => pool.copy(loan, &mut self.loaned),
             None => Err(NO_POOL),
         };
@@ -199,8 +220,8 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
         })
     }
 
-    /// The sample of what [`take_held`](Self::take_held) returned last.
-    pub(crate) fn sample(&self, held: Held) -> Sample<'_> {
+    /// The sample of what [`take_held`](Self::take_held) returned last, for a subscriber of `M`.
+    pub(crate) fn sample<M: Trust>(&self, held: Held) -> Sample<'_, M> {
         match held {
             Held::Ring { len } => Sample::ring(self.reader.held(len)),
             Held::Slot { slot, len } => {

@@ -9,8 +9,9 @@
 # time one publish in one process (waiting subscribers by wake; encode by codec); `p0b` is both,
 # and B3's large payloads with iceoryx2 subscribers that copy them out. `p2e5` is `b6` and
 # rsbinder-topic's B3 rows, to set against the `topic` set's. `p3` is B3's large payloads with
-# rsbinder-topic's loans, read in place and copied out, next to its ring copies and iceoryx2's
-# two kinds of subscriber. Each repeat writes its own CSV.
+# rsbinder-topic's loans, read in place and copied out (by a subscriber that does not vouch for
+# the publisher, and by one that does), next to its ring copies and iceoryx2's two kinds of
+# subscriber. Each repeat writes its own CSV.
 #
 # Results go to plans/15-pubsub-bench/<time>-<set>/: conditions.txt and results-<repeat>.csv.
 #
@@ -160,6 +161,11 @@ b3_loan() {
                     for touch in no yes; do
                         measure b3 --impl rsb-topic-loan --wait "$wait" --touch "$touch" \
                             --n "$n" --size "$size" --rate "$rate"
+                        # A subscriber that vouches for the publisher copies as iceoryx2's does.
+                        if [ "$touch" = yes ]; then
+                            measure b3 --impl rsb-topic-loan --wait "$wait" --touch yes \
+                                --trust yes --n "$n" --size "$size" --rate "$rate"
+                        fi
                         measure b3 --impl ix --wait "$wait" --touch "$touch" \
                             --n "$n" --size "$size" --rate "$rate"
                     done

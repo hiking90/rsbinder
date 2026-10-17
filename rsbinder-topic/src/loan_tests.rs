@@ -170,6 +170,41 @@ fn a_lent_sample_lies_in_the_pool_and_a_ring_sample_in_the_subscriber() {
     assert_eq!(subscriber.stats().received, 2);
 }
 
+/// AC-15.3.6: a subscriber that vouches for its publisher reads a lent value in place through
+/// `Deref`, and every way it reads one returns what an untrusted subscriber's copies do. The
+/// subscription goes on across the change, from where it was read up to.
+#[test]
+fn a_trusted_subscriber_reads_a_lent_value_in_place_and_copies_the_same_bytes() {
+    // 2 pins, one to write, a depth of 4 and 1 loan: the three values stay readable.
+    let publisher = Publisher::<Bytes>::new(&pooled(2, 4, 1)).unwrap();
+    let mut untrusted = subscribe(&publisher);
+    let mut first = subscribe(&publisher);
+    publisher.publish(&Bytes(vec![1])).unwrap();
+    assert_eq!(first.try_recv(), Ok(Bytes(vec![1])));
+    assert_eq!(untrusted.try_recv(), Ok(Bytes(vec![1])));
+    // SAFETY: the publisher is this crate's, in this process.
+    let mut trusted = unsafe { first.trust_publisher() };
+    let pool = trusted.pool().unwrap().addresses();
+    lend(&publisher, &pattern(5, 3000));
+    publisher.publish(&Bytes(pattern(6, 100))).unwrap();
+    lend(&publisher, &pattern(7, SLOT));
+    for (lent, value) in [(true, pattern(5, 3000)), (false, pattern(6, 100))] {
+        let sample = trusted.try_recv_sample().unwrap();
+        assert_eq!((sample.is_loaned(), &*sample), (lent, &value[..]));
+        assert_eq!(pool.contains(&(sample.as_ptr() as usize)), lent);
+        assert_eq!(sample.to_owned(), value);
+        let mut copied = vec![0; value.len()];
+        sample.copy_to(&mut copied);
+        assert_eq!(copied, value);
+        drop(sample);
+        assert_eq!(untrusted.try_recv_sample().unwrap().to_owned(), value);
+    }
+    assert_eq!(trusted.try_recv(), Ok(Bytes(pattern(7, SLOT))));
+    assert_eq!(untrusted.try_recv(), Ok(Bytes(pattern(7, SLOT))));
+    assert_eq!(trusted.try_recv_sample().err(), Some(RecvError::Empty));
+    assert_eq!((trusted.stats().received, trusted.stats().lost), (4, 0));
+}
+
 /// AC-15.3.2: a slot stays as it was while a subscriber holds its sample, however many values
 /// the publisher lends meanwhile; the subscriber loses the ones whose slots went round.
 #[test]

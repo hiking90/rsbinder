@@ -4,8 +4,11 @@
 //! A value received where it lies (plan 15 §6.3).
 
 use std::fmt;
+use std::marker::PhantomData;
+use std::ops::Deref;
 
 use crate::pool::PoolReader;
+use crate::{Trust, Trusted, Untrusted};
 
 /// A value of a [`Bytes`](crate::Bytes) topic, received where it lies:
 /// [`Subscriber::recv_sample`](crate::Subscriber::recv_sample) and the calls beside it.
@@ -15,12 +18,36 @@ use crate::pool::PoolReader;
 /// dropping the sample lets go. A value that came through the ring is in the subscriber's buffer.
 /// Either way the sample borrows the subscriber, so it holds one at a time.
 ///
-/// [`copy_to`](Self::copy_to) and [`to_owned`](Self::to_owned) copy the value out with atomic
-/// loads: a publisher that does not keep the pin protocol and writes the slot meanwhile makes the
-/// copy wrong, and nothing worse. [`as_slice`](Self::as_slice) reads it in place with no copy, and
-/// asks the caller to vouch for the publisher.
-pub struct Sample<'a> {
+/// How a lent value is read depends on whether the subscriber vouches for its publisher, `M`:
+///
+/// - [`Untrusted`], the subscriber [`Subscriber::request`](crate::Subscriber::request) makes:
+///   [`copy_to`](Self::copy_to) and [`to_owned`](Self::to_owned) copy the value out with atomic
+///   loads, so a publisher that does not keep the pin protocol and writes the slot meanwhile
+///   makes the copy wrong, and nothing worse. `unsafe` [`as_slice`](Self::as_slice) reads it in
+///   place and asks the caller to vouch for the publisher at each call.
+/// - [`Trusted`], after [`trust_publisher`](crate::Subscriber::trust_publisher): the sample
+///   derefs to `[u8]` in place, and `copy_to` and `to_owned` are a plain memory copy.
+///
+/// An untrusted sample does not deref:
+///
+/// ```compile_fail
+/// fn first(sample: &rsbinder_topic::Sample<'_>) -> Option<u8> {
+///     sample.first().copied()
+/// }
+/// ```
+///
+/// A trusted one does:
+///
+/// ```
+/// use rsbinder_topic::{Sample, Trusted};
+///
+/// fn first(sample: &Sample<'_, Trusted>) -> Option<u8> {
+///     sample.first().copied()
+/// }
+/// ```
+pub struct Sample<'a, M: Trust = Untrusted> {
     source: Source<'a>,
+    _trust: PhantomData<fn() -> M>,
 }
 
 enum Source<'a> {
@@ -32,10 +59,11 @@ enum Source<'a> {
     },
 }
 
-impl<'a> Sample<'a> {
+impl<'a, M: Trust> Sample<'a, M> {
     pub(crate) fn ring(bytes: &'a [u8]) -> Self {
         Self {
             source: Source::Ring(bytes),
+            _trust: PhantomData,
         }
     }
 
@@ -43,6 +71,7 @@ impl<'a> Sample<'a> {
     pub(crate) fn slot(pool: &'a PoolReader, slot: u32, len: usize) -> Self {
         Self {
             source: Source::Slot { pool, slot, len },
+            _trust: PhantomData,
         }
     }
 
@@ -59,30 +88,59 @@ impl<'a> Sample<'a> {
         self.len() == 0
     }
 
-    /// Copy the value into `dst`.
+    /// Copy the value into `dst`: by atomic loads for a lent value of an [`Untrusted`]
+    /// subscriber, a plain memory copy otherwise.
     ///
     /// # Panics
     ///
     /// When `dst` is not [`len`](Self::len) bytes long, as `<[u8]>::copy_from_slice` does.
     pub fn copy_to(&self, dst: &mut [u8]) {
         assert_eq!(dst.len(), self.len(), "a destination of another length");
-        match self.source {
-            Source::Ring(bytes) => dst.copy_from_slice(bytes),
-            Source::Slot { pool, slot, .. } => pool.pool().load_slot(slot, dst),
+        if let Some(bytes) = self.in_reach() {
+            dst.copy_from_slice(bytes);
+        } else if let Source::Slot { pool, slot, .. } = self.source {
+            pool.pool().load_slot(slot, dst);
         }
     }
 
-    /// The value, copied into a new buffer.
+    /// The value, copied into a new buffer: zeroed, then filled by atomic loads, for a lent value
+    /// of an [`Untrusted`] subscriber; one plain memory copy otherwise.
     pub fn to_owned(&self) -> Vec<u8> {
+        if let Some(bytes) = self.in_reach() {
+            return bytes.to_vec();
+        }
         let mut value = vec![0; self.len()];
         self.copy_to(&mut value);
         value
     }
 
+    /// The value as a slice, where reading it so asks nothing of the caller: a value in the
+    /// subscriber's buffer, or any value of a [`Trusted`] subscriber.
+    fn in_reach(&self) -> Option<&[u8]> {
+        match self.source {
+            Source::Ring(bytes) => Some(bytes),
+            Source::Slot { pool, slot, len } if M::TRUSTED => {
+                // SAFETY: the pin this sample holds, and the word `trust_publisher` took.
+                Some(unsafe { pool.pool().slot_slice(slot, len) })
+            }
+            Source::Slot { .. } => None,
+        }
+    }
+
+    /// Whether the value lies in a slot of the pool, for tests of where samples come from.
+    #[cfg(all(test, not(loom), any(target_os = "linux", target_os = "android")))]
+    pub(crate) fn is_loaned(&self) -> bool {
+        matches!(self.source, Source::Slot { .. })
+    }
+}
+
+impl Sample<'_, Untrusted> {
     /// The value in place, with no copy.
     ///
     /// The slice borrows the sample mutably, so [`copy_to`](Self::copy_to) and
-    /// [`to_owned`](Self::to_owned), which read the slot another way, wait until it is gone.
+    /// [`to_owned`](Self::to_owned), which read the slot another way, wait until it is gone. A
+    /// subscriber that vouches for its publisher once, rather than at each call, is
+    /// [`Trusted`](crate::Trusted), whose samples deref to the slice.
     ///
     /// # Safety
     ///
@@ -99,15 +157,23 @@ impl<'a> Sample<'a> {
             Source::Slot { pool, slot, len } => unsafe { pool.pool().slot_slice(slot, len) },
         }
     }
+}
 
-    /// Whether the value lies in a slot of the pool, for tests of where samples come from.
-    #[cfg(all(test, not(loom), any(target_os = "linux", target_os = "android")))]
-    pub(crate) fn is_loaned(&self) -> bool {
-        matches!(self.source, Source::Slot { .. })
+impl Deref for Sample<'_, Trusted> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.in_reach().expect("a trusted sample is in reach")
     }
 }
 
-impl Drop for Sample<'_> {
+impl AsRef<[u8]> for Sample<'_, Trusted> {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl<M: Trust> Drop for Sample<'_, M> {
     fn drop(&mut self) {
         if let Source::Slot { pool, .. } = self.source {
             pool.unpin();
@@ -115,10 +181,11 @@ impl Drop for Sample<'_> {
     }
 }
 
-impl fmt::Debug for Sample<'_> {
+impl<M: Trust> fmt::Debug for Sample<'_, M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Sample")
             .field("len", &self.len())
+            .field("trusted", &M::TRUSTED)
             .finish_non_exhaustive()
     }
 }

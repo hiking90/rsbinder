@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 use rsbinder::stream::{Receiver, ReceiverPolicy, Sink, SinkPolicy, StreamEndpoint};
 use rsbinder::*;
 use rsbinder_topic::{
-    Bytes, PoolPolicy, Publisher, PublisherPolicy, RecvError, Sample, Subscriber, SubscriberPolicy, Wake,
+    Bytes, PoolPolicy, Publisher, PublisherPolicy, RecvError, Sample, Subscriber, SubscriberPolicy, Trust,
+    Wake,
 };
 
 use crate::common::*;
@@ -312,10 +313,11 @@ pub fn topic_consumer(a: &Args) -> Result<()> {
 
 /// Child role `rsb-topic-loan`: one subscriber of the topic with a pool. It receives each value
 /// where it lies (`recv_sample`) and reads the stamp in place, or with `--touch yes` copies the
-/// value out first, as the iceoryx2 subscriber does with the same flag.
+/// value out first, as the iceoryx2 subscriber does with the same flag. With `--trust yes` it
+/// vouches for the publisher first (`trust_publisher`), as an iceoryx2 subscriber does, and
+/// copies with a plain memory copy.
 pub fn topic_loan_consumer(a: &Args) -> Result<()> {
     pin(a.num("cpu", 2) as usize);
-    let count = a.num("count", 0);
     let wait = a.str("wait", "block");
     let touch = a.str("touch", "no") == "yes";
     let bench = connect(&a.str("name", ""))?;
@@ -327,13 +329,45 @@ pub fn topic_loan_consumer(a: &Args) -> Result<()> {
         wake: if wait == "fd" { Wake::Fd } else { Wake::Futex },
         ..SubscriberPolicy::default()
     };
-    let mut subscriber = Subscriber::<Bytes>::request(&topic, &policy)?;
+    let subscriber = Subscriber::<Bytes>::request(&topic, &policy)?;
     ready("SUBSCRIBED");
+    let record = if a.str("trust", "no") == "yes" {
+        // SAFETY: the producer is this harness's own rsbinder-topic `Publisher`.
+        let subscriber = unsafe { subscriber.trust_publisher() };
+        take_samples(subscriber, a, |record, sample| {
+            if touch {
+                record.take(&sample.to_owned());
+            } else {
+                record.take(sample);
+            }
+        })
+    } else {
+        take_samples(subscriber, a, |record, sample| {
+            if touch {
+                record.take(&sample.to_owned());
+            } else {
+                // SAFETY: the producer is this harness's own rsbinder-topic `Publisher`.
+                record.take(unsafe { sample.as_slice() });
+            }
+        })
+    };
+    println!("{}", record.line());
+    Ok(())
+}
+
+/// Receive `--count` samples, or until the topic falls silent, handing each to `take`.
+fn take_samples<M: Trust>(
+    mut subscriber: Subscriber<Bytes, M>,
+    a: &Args,
+    mut take: impl FnMut(&mut Record, &mut Sample<'_, M>),
+) -> Record {
+    let count = a.num("count", 0);
+    let poll = a.str("wait", "block") == "poll";
     let mut record = Record::new(a.num("warmup", 0));
     let mut lost = 0u64;
     let mut idle: Option<Instant> = None;
     while record.received + lost < count {
-        let got = if wait == "poll" {
+        let got = if poll {
             subscriber.try_recv_sample()
         } else {
             subscriber.recv_sample_timeout(SILENCE)
@@ -341,7 +375,7 @@ pub fn topic_loan_consumer(a: &Args) -> Result<()> {
         match got {
             Ok(mut sample) => {
                 idle = None;
-                take_sample(&mut record, &mut sample, touch);
+                take(&mut record, &mut sample);
             }
             Err(RecvError::Empty) => {
                 if idle.get_or_insert_with(Instant::now).elapsed() > SILENCE {
@@ -359,17 +393,7 @@ pub fn topic_loan_consumer(a: &Args) -> Result<()> {
     if lost > 0 {
         record.extra = format!("lost={lost}");
     }
-    println!("{}", record.line());
-    Ok(())
-}
-
-fn take_sample(record: &mut Record, sample: &mut Sample<'_>, touch: bool) {
-    if touch {
-        record.take(&sample.to_owned());
-    } else {
-        // SAFETY: the producer is this harness's own rsbinder-topic `Publisher`.
-        record.take(unsafe { sample.as_slice() });
-    }
+    record
 }
 
 struct CallbackSink {

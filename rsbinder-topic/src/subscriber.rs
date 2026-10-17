@@ -13,6 +13,7 @@
 //! sleeps on the topic's `seq` by the protocol in `wait.rs`.
 
 use std::fmt;
+use std::marker::PhantomData;
 use std::os::fd::{AsFd, BorrowedFd};
 #[cfg(feature = "tokio")]
 use std::os::fd::{AsRawFd, RawFd};
@@ -45,7 +46,9 @@ use crate::ring::{self, Loads, Reader};
 use crate::wait::{on_pool, Leftover};
 use crate::wait::{Died, Local, Parts, Slept, Words, ABANDON, DIED, INTERRUPT};
 use crate::wake::{self, FdWake};
-use crate::{poll, Bytes, Closed, Payload, RecvError, Sample, SubscriberStats};
+use crate::{
+    poll, Bytes, Closed, Payload, RecvError, Sample, SubscriberStats, Trust, Trusted, Untrusted,
+};
 
 /// Where a subscription starts reading.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -133,7 +136,17 @@ impl Default for SubscriberPolicy {
 /// makes one wake system call per commit when some subscriber sleeps, whatever their number, and
 /// none when none does; or on file descriptors of the subscription. An [`Interrupter`] ends a
 /// wait from another thread.
-pub struct Subscriber<T: Payload> {
+///
+/// # Vouching for the publisher
+///
+/// `M` says whether this subscriber vouches for its publisher, which decides how a value the
+/// publisher lent is read ([`Sample`]). `request` makes an [`Untrusted`] subscriber; on a topic of
+/// [`Bytes`], `unsafe` [`trust_publisher`](Subscriber::trust_publisher) makes it
+/// [`Trusted`](crate::Trusted).
+pub struct Subscriber<T: Payload, M: Trust = Untrusted> {
+    /// Raises `ABANDON` when the subscriber is dropped, first of the fields: a wait left on the
+    /// pool lets go of the memory now rather than at a commit.
+    _abandon: Abandon,
     reader: TypedReader<T, Loaded<Arc<Mapping>>>,
     control: Closing,
     /// [`Wake::Fd`]'s fds on the reactor; dropped before `local` closes them.
@@ -157,6 +170,7 @@ pub struct Subscriber<T: Payload> {
     /// What the last sync wait did, for a test that reports a slow one.
     #[cfg(all(test, feature = "tokio"))]
     pub(crate) trace: Trace,
+    _trust: PhantomData<fn() -> M>,
 }
 
 /// The steps of one sync wait: how long it took to join the pool's, and each sleep.
@@ -183,7 +197,7 @@ impl Drop for Closing {
 
 impl<T: Payload> Subscriber<T> {
     /// Subscribe to the topic behind `topic`, an `ITopic` binder: a kernel binder proxy, or a
-    /// binder of this process.
+    /// binder of this process. The subscriber does not vouch for the publisher ([`Untrusted`]).
     ///
     /// One twoway call; after it, receiving makes none. The refusals of the publisher come back
     /// as it sent them ([`Acceptor::accept`](crate::Acceptor::accept) lists them, and an
@@ -269,6 +283,10 @@ impl<T: Payload> Subscriber<T> {
         };
         let reader = Reader::attach(memory, start).map_err(|_| StatusCode::BadValue)?;
         Ok(Self {
+            _abandon: Abandon {
+                local: local.clone(),
+                armed: true,
+            },
             reader: TypedReader::new(reader, pool),
             control,
             #[cfg(feature = "tokio")]
@@ -285,9 +303,12 @@ impl<T: Payload> Subscriber<T> {
             about_to_park: None,
             #[cfg(all(test, feature = "tokio"))]
             trace: Trace::default(),
+            _trust: PhantomData,
         })
     }
+}
 
+impl<T: Payload, M: Trust> Subscriber<T, M> {
     /// The next value, without waiting.
     ///
     /// [`RecvError::Empty`] when no record is unread. After the publisher's process died, every
@@ -454,10 +475,11 @@ impl<T: Payload> Subscriber<T> {
     /// The next record, or the newest with `latest`, without waiting.
     fn look(&mut self, latest: bool) -> Result<T, RecvError> {
         let died = self.local.died();
-        let received = if latest {
-            self.reader.try_latest()
-        } else {
-            self.reader.try_recv()
+        let received = match (M::TRUSTED, latest) {
+            // SAFETY: `Trusted`, which only `trust_publisher` makes, on its caller's word.
+            (true, latest) => unsafe { self.reader.recv_vouched(latest) },
+            (false, true) => self.reader.try_latest(),
+            (false, false) => self.reader.try_recv(),
         };
         self.settle(received, died)
     }
@@ -579,6 +601,81 @@ impl<T: Payload> Subscriber<T> {
 }
 
 impl Subscriber<Bytes> {
+    /// This subscriber, vouching for its publisher from now on ([`Trusted`]): its samples deref
+    /// to `[u8]` in place, and every copy of a lent value, a sample's or [`recv`](Self::recv)'s,
+    /// is a plain memory copy into a buffer not zeroed first.
+    ///
+    /// The subscription goes on as it was: the same read position, waits and statistics. Values
+    /// that came through the ring are copied as before, since the ring lets the publisher write
+    /// over a record that is being read; only a slot the pin protects is read in place. There is
+    /// no way back: a subscriber that stops vouching subscribes again.
+    ///
+    /// # Safety
+    ///
+    /// For as long as the subscription lives, the publisher behind the topic keeps the pin
+    /// protocol of plan 15 §6.2: it never writes a slot a subscriber has pinned. An
+    /// `rsbinder-topic` [`Publisher`](crate::Publisher) does. Nothing in this process can check
+    /// which process published the topic, so the caller answers for it: a process that
+    /// subscribes to its own system's service, say, and not one less privileged than itself. A
+    /// publisher that breaks the protocol can change the bytes under a live `&[u8]`, which is
+    /// undefined behavior.
+    ///
+    /// ```no_run
+    /// use rsbinder_topic::{Bytes, Subscriber, SubscriberPolicy, Trusted};
+    ///
+    /// fn checksum(topic: &rsbinder::SIBinder) -> rsbinder::BinderResult<u32> {
+    ///     let subscriber = Subscriber::<Bytes>::request(topic, &SubscriberPolicy::default())?;
+    ///     // SAFETY: the topic is this system's own service, an rsbinder-topic Publisher.
+    ///     let mut subscriber: Subscriber<Bytes, Trusted> = unsafe { subscriber.trust_publisher() };
+    ///     let sample = subscriber.recv_sample().expect("a value");
+    ///     Ok(sample.iter().map(|&byte| u32::from(byte)).sum())
+    /// }
+    /// ```
+    pub unsafe fn trust_publisher(self) -> Subscriber<Bytes, Trusted> {
+        let Self {
+            _abandon,
+            reader,
+            control,
+            #[cfg(feature = "tokio")]
+            reactor,
+            local,
+            spin,
+            received,
+            decode_errors,
+            #[cfg(feature = "tokio")]
+            leftover,
+            _token,
+            _death,
+            #[cfg(test)]
+            about_to_park,
+            #[cfg(all(test, feature = "tokio"))]
+            trace,
+            _trust,
+        } = self;
+        Subscriber {
+            _abandon,
+            reader,
+            control,
+            #[cfg(feature = "tokio")]
+            reactor,
+            local,
+            spin,
+            received,
+            decode_errors,
+            #[cfg(feature = "tokio")]
+            leftover,
+            _token,
+            _death,
+            #[cfg(test)]
+            about_to_park,
+            #[cfg(all(test, feature = "tokio"))]
+            trace,
+            _trust: PhantomData,
+        }
+    }
+}
+
+impl<M: Trust> Subscriber<Bytes, M> {
     /// The next value where it lies, without waiting: [`try_recv`](Self::try_recv) with no copy
     /// of a value the publisher lent ([`Publisher::loan_slice`](crate::Publisher::loan_slice)).
     ///
@@ -586,21 +683,21 @@ impl Subscriber<Bytes> {
     /// nothing else is received meanwhile. A value that came through the ring is returned in
     /// the subscriber's buffer. The errors are `try_recv`'s; a lent slot the publisher took back
     /// before this call pinned it is a loss of one record, [`RecvError::Lagged`]`(1)`.
-    pub fn try_recv_sample(&mut self) -> Result<Sample<'_>, RecvError> {
+    pub fn try_recv_sample(&mut self) -> Result<Sample<'_, M>, RecvError> {
         let held = self.look_held()?;
         Ok(self.reader.sample(held))
     }
 
     /// The next value where it lies, waiting for one: [`try_recv_sample`](Self::try_recv_sample)
     /// after the wait [`recv`](Self::recv) makes.
-    pub fn recv_sample(&mut self) -> Result<Sample<'_>, RecvError> {
+    pub fn recv_sample(&mut self) -> Result<Sample<'_, M>, RecvError> {
         let held = self.wait_with(None, Self::look_held)?;
         Ok(self.reader.sample(held))
     }
 
     /// [`recv_sample`](Self::recv_sample) with a bound: [`RecvError::Timeout`] once `timeout`
     /// passes with no record unread.
-    pub fn recv_sample_timeout(&mut self, timeout: Duration) -> Result<Sample<'_>, RecvError> {
+    pub fn recv_sample_timeout(&mut self, timeout: Duration) -> Result<Sample<'_, M>, RecvError> {
         let deadline = Instant::now().checked_add(timeout);
         let held = self.wait_with(deadline, Self::look_held)?;
         Ok(self.reader.sample(held))
@@ -613,9 +710,9 @@ impl Subscriber<Bytes> {
     }
 }
 
-impl<T: Payload> poll::Sealed for Subscriber<T> {}
+impl<T: Payload, M: Trust> poll::Sealed for Subscriber<T, M> {}
 
-impl<T: Payload> poll::Wait for Subscriber<T> {
+impl<T: Payload, M: Trust> poll::Wait for Subscriber<T, M> {
     fn wait_fd(&self) -> Option<BorrowedFd<'_>> {
         self.local.words().fd.as_ref().map(FdWake::fd)
     }
@@ -646,29 +743,22 @@ impl<T: Payload> poll::Wait for Subscriber<T> {
     }
 }
 
-impl<T: Payload> Drop for Subscriber<T> {
-    fn drop(&mut self) {
-        // A wait left on the pool: woken, so it lets go of the memory now rather than at a commit.
-        self.local.raise(ABANDON);
-    }
-}
-
-impl<T: Payload> fmt::Debug for Subscriber<T> {
+impl<T: Payload, M: Trust> fmt::Debug for Subscriber<T, M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Subscriber")
             .field("type", &T::type_name())
+            .field("trusted", &M::TRUSTED)
             .finish_non_exhaustive()
     }
 }
 
-/// Raises `ABANDON` when the `recv_async` future it lives in is dropped mid-wait.
-#[cfg(feature = "tokio")]
+/// Raises `ABANDON` when dropped armed: by the subscriber, and by a `recv_async` future dropped
+/// mid-wait.
 struct Abandon {
     local: Arc<Local<Parts>>,
     armed: bool,
 }
 
-#[cfg(feature = "tokio")]
 impl Drop for Abandon {
     fn drop(&mut self) {
         if self.armed {
