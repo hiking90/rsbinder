@@ -32,11 +32,13 @@ use rsbinder::{
 use tokio::io::{unix::AsyncFd, Interest};
 
 use crate::aidl::ITopic::{ITopic, ERROR_VERSION, WAKE_FD, WAKE_FUTEX};
+use crate::aidl::Pool::Pool;
 use crate::aidl::SubscribeRequest::SubscribeRequest;
 use crate::aidl::TopicEndpoint::TopicEndpoint;
 use crate::connect::{refuse, status_of, Asking, Token};
-use crate::layout::{self, ControlPage, Loaded, CLOSED, HEADER_OFFSET, VERSION};
+use crate::layout::{self, ControlPage, Loaded, LoadedPool, CLOSED, HEADER_OFFSET, VERSION};
 use crate::link::DeathLink;
+use crate::pool::MAX_PINS;
 use crate::receive::TypedReader;
 use crate::ring::{self, Loads, Reader};
 #[cfg(feature = "tokio")]
@@ -87,6 +89,13 @@ pub struct SubscriberPolicy {
     /// this bounds the address space a publisher can make the subscriber's process give up. A
     /// larger ring is refused with `BadValue`.
     pub max_ring_bytes: usize,
+    /// The largest pool this subscriber maps, in bytes. Default 256 MiB.
+    ///
+    /// A publisher that lends slots ([`PoolPolicy`](crate::PoolPolicy)) sends a pool besides the
+    /// ring, and the subscriber maps all of it read-only, so this bounds the address space it
+    /// can make the subscriber's process give up as `max_ring_bytes` does. A larger pool is
+    /// refused with `BadValue`.
+    pub max_pool_bytes: usize,
     /// How the publisher wakes this subscriber. Default [`Wake::Futex`].
     pub wake: Wake,
 }
@@ -96,6 +105,7 @@ impl Default for SubscriberPolicy {
         Self {
             start: Start::Latest,
             max_ring_bytes: 16 << 20,
+            max_pool_bytes: 256 << 20,
             wake: Wake::Futex,
         }
     }
@@ -126,6 +136,9 @@ impl Default for SubscriberPolicy {
 pub struct Subscriber<T: Payload> {
     reader: TypedReader<T, Loaded<Arc<Mapping>>>,
     control: Closing,
+    /// The publisher's pool, for a topic that lends slots.
+    #[allow(dead_code, reason = "plan 15 P3-3 reads loaned values out of it")]
+    pool: Option<LoadedPool>,
     /// [`Wake::Fd`]'s fds on the reactor; dropped before `local` closes them.
     #[cfg(feature = "tokio")]
     reactor: Option<Reactor>,
@@ -183,7 +196,9 @@ impl<T: Payload> Subscriber<T> {
     /// [`ITopic::ERROR_VERSION`](crate::aidl::ITopic::ERROR_VERSION) for a publisher of another
     /// layout version, and `BadValue` for a reply it cannot use: topic memory that is not a
     /// sealed memfd of the expected layout, a ring larger than
-    /// [`max_ring_bytes`](SubscriberPolicy::max_ring_bytes), or a wake fd that is not what
+    /// [`max_ring_bytes`](SubscriberPolicy::max_ring_bytes), a pool that is not a sealed memfd of
+    /// the slots it states or is larger than
+    /// [`max_pool_bytes`](SubscriberPolicy::max_pool_bytes), or a wake fd that is not what
     /// [`wake`](SubscriberPolicy::wake) asked for (a unix stream socket for [`Wake::Fd`], none
     /// for [`Wake::Futex`]).
     ///
@@ -196,7 +211,7 @@ impl<T: Payload> Subscriber<T> {
         if topic.as_proxy().is_none() && topic.is_remote() {
             return Err(StatusCode::InvalidOperation.into());
         }
-        let (fd, page) = ControlPage::create(0).map_err(status_of)?;
+        let (fd, page) = ControlPage::create(MAX_PINS).map_err(status_of)?;
         let control = Closing(Arc::new(page));
         let token = rsbinder::Binder::new(Token).as_binder();
         let local = Arc::new(Local::new());
@@ -219,7 +234,7 @@ impl<T: Payload> Subscriber<T> {
             r#type: T::type_name().to_owned(),
             token: Some(token.clone()),
             control: Some(ParcelFileDescriptor::from(fd)),
-            pins: 0,
+            pins: MAX_PINS as i32,
             wake: match policy.wake {
                 Wake::Futex => WAKE_FUTEX,
                 Wake::Fd => WAKE_FD,
@@ -234,6 +249,10 @@ impl<T: Payload> Subscriber<T> {
         // the mapping and a duplicate.
         drop(request);
         let memory = map_endpoint(&endpoint, policy.max_ring_bytes)?;
+        let pool = match &endpoint.pool {
+            Some(pool) => Some(map_pool(pool, policy.max_pool_bytes)?),
+            None => None,
+        };
         local.set_words(Parts {
             seq: memory.seq(),
             control: control.0.clone(),
@@ -252,6 +271,7 @@ impl<T: Payload> Subscriber<T> {
         Ok(Self {
             reader: TypedReader::new(reader),
             control,
+            pool,
             #[cfg(feature = "tokio")]
             reactor: None,
             local,
@@ -525,6 +545,12 @@ impl<T: Payload> Subscriber<T> {
         }
     }
 
+    /// The publisher's pool as this subscriber mapped it, for tests of the subscription.
+    #[cfg(all(test, not(loom), any(target_os = "linux", target_os = "android")))]
+    pub(crate) fn pool(&self) -> Option<&LoadedPool> {
+        self.pool.as_ref()
+    }
+
     /// This subscriber's waiting state, for tests that pause or watch a wait.
     #[cfg(all(test, not(loom), any(target_os = "linux", target_os = "android")))]
     pub(crate) fn local(&self) -> &Arc<Local<Parts>> {
@@ -743,4 +769,14 @@ fn map_endpoint(endpoint: &TopicEndpoint, max_ring: usize) -> BinderResult<Loade
         return Err(bad_value());
     }
     Ok(memory)
+}
+
+/// Map the pool an endpoint names, no larger than `max_pool`.
+fn map_pool(pool: &Pool, max_pool: usize) -> BinderResult<LoadedPool> {
+    let (Ok(slots), Ok(slot_bytes)) = (u32::try_from(pool.slots), u32::try_from(pool.slotBytes))
+    else {
+        return Err(StatusCode::BadValue.into());
+    };
+    let memory = pool.memory.as_ref().ok_or(StatusCode::UnexpectedNull)?;
+    layout::map_pool(memory.as_fd(), slots, slot_bytes, max_pool).map_err(status_of)
 }

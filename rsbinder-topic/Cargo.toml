@@ -35,8 +35,9 @@ fuzzing = []
 rsbinder = { version = "0.12.0", path = "../rsbinder", default-features = false, features = ["async"] }
 # `Errno`, to tell "the kernel has no `F_SEAL_FUTURE_WRITE`" from the other
 # failures of a seal. `event` and `net`: the fd wake, a socket pair, an eventfd
-# and `poll` (both are features `rsbinder` turns on already).
-rustix = { workspace = true, features = ["event", "net"] }
+# and `poll` (both are features `rsbinder` turns on already). `mm`: `madvise`
+# for a pool on huge pages.
+rustix = { workspace = true, features = ["event", "net", "mm"] }
 # `Notify`: a `recv_async` joins the wait a dropped one left on the blocking pool.
 # `net`: `AsyncFd`, which a `recv_async` of an fd-woken subscription waits on.
 tokio = { workspace = true, optional = true, features = ["sync", "net"] }

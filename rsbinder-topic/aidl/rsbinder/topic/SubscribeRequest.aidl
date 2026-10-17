@@ -48,8 +48,11 @@ parcelable SubscribeRequest {
     ParcelFileDescriptor control;
 
     /**
-     * Pin words at the end of the control page. 0: this version has no
-     * loans, and the publisher refuses any other value with `BAD_VALUE`.
+     * Pin words at the end of the control page, from offset 0x80: 0 or 1,
+     * and the publisher refuses any other value with `BAD_VALUE`. A pin word
+     * is 0, or the number of the pool slot the subscriber reads plus one;
+     * the publisher does not lend a slot a pin word names. A subscriber
+     * without a pin word cannot read the values of a publisher with a pool.
      */
     int pins;
 

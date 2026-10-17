@@ -7,6 +7,7 @@ package rsbinder.topic;
 
 import android.hardware.common.fmq.MQDescriptor;
 import android.hardware.common.fmq.UnsynchronizedWrite;
+import rsbinder.topic.Pool;
 
 /**
  * What a publisher returns for an accepted subscription: the topic memory to
@@ -42,4 +43,11 @@ parcelable TopicEndpoint {
 
     /** The index of the record written at `start`. */
     int startIndex;
+
+    /**
+     * The pool of a publisher that lends slots, null for one that does not.
+     * A subscriber that gets one reads it with the pin word of its control
+     * page.
+     */
+    @nullable Pool pool;
 }

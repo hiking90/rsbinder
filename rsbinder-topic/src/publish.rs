@@ -12,9 +12,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use rsbinder::fmq::shm::Mapping;
 use rsbinder::{CallingContext, Status, StatusCode};
 
-use crate::layout::{self, Stored, MIN_RING};
+use crate::layout::{self, Stored, StoredPool, MIN_RING};
 use crate::link::Links;
 use crate::payload::{relabel, Piece};
+use crate::pool::{Slots, MAX_PINS};
 use crate::ring::{Kind, Refused, Stores, Writer};
 use crate::{end, Encoding, Payload, PublisherStats};
 
@@ -65,6 +66,9 @@ pub struct PublisherPolicy {
     /// retry on the same publisher. A subscriber in the publisher's process is seen with the
     /// process's own uid and pid.
     pub authorize: Option<Authorize>,
+    /// The pool of slots values are lent from. Default `None`: every value goes through the
+    /// ring.
+    pub pool: Option<PoolPolicy>,
 }
 
 impl Default for PublisherPolicy {
@@ -74,7 +78,73 @@ impl Default for PublisherPolicy {
             max_subscribers: 64,
             max_per_uid: 64,
             authorize: None,
+            pool: None,
         }
+    }
+}
+
+/// The pool of a topic that lends slots: [`PublisherPolicy::pool`] (plan 15 §6).
+///
+/// A loaned value is written straight into a slot of a second memfd that every subscriber maps
+/// read-only, and the ring carries only a record of 24 bytes that names the slot. A subscriber
+/// pins the slot while it reads it, and the publisher never lends a pinned slot, so a value
+/// larger than a cache, which costs its size twice to copy through the ring, is written once.
+///
+/// The pool has `max_subscribers + 1 + depth + max_loans` slots of `slot_bytes` each: every
+/// subscriber pinning one still leaves a slot to lend, with `depth` values kept for subscribers
+/// that have not pinned them yet. All of its pages are written when the topic is made and stay
+/// the publisher's memory: the default `max_subscribers` of 64 with the default 1 MiB slots is
+/// 68 MiB of the publisher's resident memory, whether or not anyone subscribes. Lower
+/// `max_subscribers` for a pool of large slots. A pool larger than 4 GiB is refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PoolPolicy {
+    /// Bytes of a slot, the largest value a loan holds, rounded up to a multiple of 64. Default
+    /// 1 MiB.
+    pub slot_bytes: usize,
+    /// Values kept for subscribers that have not read them yet, past those pinned. Default 2.
+    ///
+    /// The slot lent next is one that every subscriber has read past, the one published last of
+    /// those, so that a busy pool reuses the slots still in the cache; with none, the oldest. A
+    /// subscriber that falls more than `depth` values behind loses the older ones, as one that
+    /// falls behind the ring does.
+    pub depth: usize,
+    /// Loans held at once and not yet published, past which a loan is refused. Default 1.
+    pub max_loans: usize,
+    /// Ask the kernel for transparent huge pages for the pool (`MADV_HUGEPAGE`). Default
+    /// `false`.
+    ///
+    /// Copying out of a slot then takes fewer TLB misses: on an x86_64 desktop with 4 KiB pages
+    /// otherwise, a 1 MiB value copied about 6–10 µs faster (plan 15 §8.4). The pool's resident
+    /// memory then grows in steps of 2 MiB. Where the system turns huge pages for shared memory
+    /// off (`/sys/kernel/mm/transparent_hugepage/shmem_enabled` is `never` or `deny`), it changes
+    /// nothing.
+    pub huge_pages: bool,
+}
+
+impl Default for PoolPolicy {
+    fn default() -> Self {
+        Self {
+            slot_bytes: 1 << 20,
+            depth: 2,
+            max_loans: 1,
+            huge_pages: false,
+        }
+    }
+}
+
+impl PoolPolicy {
+    /// Slots and the bytes of each for a topic of `max_subscribers`; `None` past what a pool holds.
+    pub(crate) fn shape(&self, max_subscribers: usize) -> Option<(u32, u32)> {
+        let grain = layout::SLOT_GRAIN as usize;
+        let slot_bytes = self.slot_bytes.max(1).checked_next_multiple_of(grain)?;
+        let slots = max_subscribers
+            .checked_mul(MAX_PINS as usize)?
+            .checked_add(1)?
+            .checked_add(self.depth)?
+            .checked_add(self.max_loans)?;
+        let (slots, slot_bytes) = (u32::try_from(slots).ok()?, u32::try_from(slot_bytes).ok()?);
+        layout::pool_size(slots, slot_bytes)?;
+        Some((slots, slot_bytes))
     }
 }
 
@@ -190,10 +260,25 @@ struct Scratch {
     records: Vec<(usize, usize)>,
 }
 
+/// The pool, and the publisher's account of what its slots hold.
+#[allow(dead_code, reason = "plan 15 P3-2 lends its slots")]
+pub(crate) struct Lending {
+    pub(crate) memory: StoredPool,
+    pub(crate) slots: Slots,
+}
+
+/// The pool memory a reply hands out: a duplicate of `fd`, and its shape.
+pub(crate) struct PoolFd {
+    pub(crate) fd: OwnedFd,
+    pub(crate) slots: u32,
+    pub(crate) slot_bytes: u32,
+}
+
 /// What the publisher's lock guards: the ring's writer and the subscriptions it serves.
 pub(crate) struct State<S> {
     pub(crate) writer: Writer<S>,
     pub(crate) links: Links,
+    pub(crate) lending: Option<Lending>,
     /// Records published, and their payload bytes, for [`PublisherStats`].
     published: u64,
     bytes: u64,
@@ -230,10 +315,30 @@ pub(crate) struct TypedWriter<T, S> {
 }
 
 impl<T: Payload> TypedWriter<T, Stored<Mapping>> {
-    /// Make topic memory for `policy`: the fd to hand to subscribers, and the writer.
-    pub(crate) fn create(policy: &PublisherPolicy) -> rsbinder::fmq::Result<(OwnedFd, Self)> {
+    /// Make topic memory for `policy`, and its pool if it has one: the fds to hand to
+    /// subscribers, and the writer. `BadValue` for a pool past 4 GiB.
+    pub(crate) fn create(
+        policy: &PublisherPolicy,
+    ) -> rsbinder::fmq::Result<(OwnedFd, Option<PoolFd>, Self)> {
         let (fd, stored) = layout::create_topic(policy.ring_bytes)?;
-        Ok((fd, Self::new(Writer::new(stored))))
+        let writer = Self::new(Writer::new(stored));
+        let Some(pool) = &policy.pool else {
+            return Ok((fd, None, writer));
+        };
+        let (slots, slot_bytes) = pool
+            .shape(policy.max_subscribers)
+            .ok_or(rsbinder::fmq::Error::BadValue("pool larger than 4 GiB"))?;
+        let (pool_fd, memory) = layout::create_pool(slots, slot_bytes, pool.huge_pages)?;
+        writer.lock().lending = Some(Lending {
+            memory,
+            slots: Slots::new(slots, pool.max_loans),
+        });
+        let pool_fd = PoolFd {
+            fd: pool_fd,
+            slots,
+            slot_bytes,
+        };
+        Ok((fd, Some(pool_fd), writer))
     }
 }
 
@@ -245,6 +350,7 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
             state: Mutex::new(State {
                 writer,
                 links: Links::default(),
+                lending: None,
                 published: 0,
                 bytes: 0,
                 #[cfg(all(test, not(loom)))]

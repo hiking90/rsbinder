@@ -168,11 +168,133 @@ fn an_fd_that_is_not_the_control_page_asked_for_is_not_mapped() {
 }
 
 #[test]
+fn a_pin_word_is_stored_by_the_subscriber_and_loaded_by_the_publisher() {
+    let (fd, page) = ControlPage::create(1).unwrap();
+    let view = ControlView::map(fd.as_fd(), 1).unwrap();
+    assert_eq!((view.pins(), view.pin(0)), (1, 0));
+    page.store_pin(4, Ordering::Release);
+    assert_eq!(view.pin(0), 4);
+    // The words after it are padding, not pins.
+    let past = std::panic::catch_unwind(|| view.pin(1));
+    assert!(past.is_err());
+}
+
+#[test]
 fn without_the_future_write_seal_nothing_is_made() {
     NO_FUTURE_WRITE.set(true);
     assert_eq!(create_topic(MIN_RING).err(), Some(Error::Unsupported));
     assert_eq!(ControlPage::create(0).err(), Some(Error::Unsupported));
+    assert_eq!(create_pool(1, 64, false).err(), Some(Error::Unsupported));
     NO_FUTURE_WRITE.set(false);
     assert!(create_topic(MIN_RING).is_ok());
     assert!(ControlPage::create(0).is_ok());
+    assert!(create_pool(1, 64, false).is_ok());
+}
+
+#[test]
+fn a_pool_is_its_header_and_generations_on_a_cache_line_then_its_slots() {
+    // The generations end at 0x40 + 8 × slots, and the slots start at the next 64.
+    assert_eq!(pool_size(3, 64), Some(0x80 + 3 * 64));
+    assert_eq!(pool_size(8, 64), Some(0x80 + 8 * 64));
+    assert_eq!(pool_size(9, 128), Some(0xc0 + 9 * 128));
+    assert_eq!(pool_size(1, 1 << 31), Some(0x80 + (1 << 31)));
+    for (slots, slot_bytes) in [(0, 64), (1, 0), (1, 32), (1, 96), (2, 1 << 31)] {
+        assert_eq!(pool_size(slots, slot_bytes), None, "{slots} × {slot_bytes}");
+    }
+    assert!(bad_value(create_pool(1, 96, false).map(|_| ())).contains("size outside"));
+}
+
+#[test]
+fn pool_memory_is_written_through_one_mapping_and_read_through_another() {
+    let (fd, stored) = create_pool(3, 64, false).unwrap();
+    let size = pool_size(3, 64).unwrap();
+    assert_eq!(shm::region_size(fd.as_fd()), Ok(size));
+    assert_eq!(shm::verify_received(fd.as_fd()), Ok(size));
+    let sealed = shm::seals(fd.as_fd()).unwrap();
+    assert!(sealed.contains(Seals::GROW | Seals::SHRINK | Seals::FUTURE_WRITE | Seals::SEAL));
+    let writable = Mapping::map(fd.as_fd(), 0, size, Access::ReadWrite);
+    assert_eq!(writable.err(), Some(Error::Os(rustix::io::Errno::PERM)));
+
+    let loaded = map_pool(fd.as_fd(), 3, 64, size as usize).unwrap();
+    assert_eq!(loaded.slots(), 3);
+    assert_eq!(
+        (0..3).map(|slot| loaded.load_generation(slot)).max(),
+        Some(0)
+    );
+    stored.store_generation(2, 7, Ordering::Release);
+    assert_eq!(loaded.load_generation(2), 7);
+    assert_eq!(loaded.load_generation(1), 0);
+}
+
+#[test]
+fn an_fd_that_is_not_the_pool_its_endpoint_states_is_not_mapped() {
+    let map = |fd: BorrowedFd<'_>, slots, slot_bytes| {
+        bad_value(map_pool(fd, slots, slot_bytes, MAX_POOL as usize).map(|_| ()))
+    };
+    let (fd, _stored) = create_pool(3, 64, false).unwrap();
+    let size = pool_size(3, 64).unwrap() as usize;
+    assert!(bad_value(map_pool(fd.as_fd(), 3, 64, size - 1).map(|_| ())).contains("size outside"));
+    assert!(map(fd.as_fd(), 3, 65).contains("size outside"));
+    assert_eq!(
+        map(fd.as_fd(), 4, 64),
+        "pool memory of another size than its slots"
+    );
+    // One slot of 192 bytes takes the size of three of 64: the words decide.
+    assert_eq!(pool_size(1, 192), pool_size(3, 64));
+    assert_eq!(
+        map(fd.as_fd(), 1, 192),
+        "pool memory with other slots than its endpoint"
+    );
+
+    // Topic memory, and blank or other-version memory, of a size some pool has.
+    let (topic, _stored) = create_topic(MIN_RING).unwrap();
+    let one_slot = (TOPIC_SIZE - 0x80) as u32;
+    assert_eq!(
+        map(topic.as_fd(), 1, one_slot),
+        "received memfd is not pool memory"
+    );
+    let blank = sealed(size as u64, &[]);
+    assert_eq!(
+        map(blank.as_fd(), 3, 64),
+        "received memfd is not pool memory"
+    );
+    let marked = [(pool::MAGIC, POOL_MAGIC), (pool::VERSION, VERSION + 1)];
+    let other_version = sealed(size as u64, &marked);
+    assert_eq!(
+        map(other_version.as_fd(), 3, 64),
+        "pool memory of another layout version"
+    );
+    let options = CreateOptions::new("unsealed").populate(true);
+    let unsealed = shm::create(size as u64, &options).unwrap();
+    assert!(map(unsealed.as_fd(), 3, 64).contains("not sealed"));
+}
+
+/// The `VmFlags` line `/proc/self/smaps` gives the mapping that starts at `at`.
+fn vm_flags(at: NonNull<u8>) -> String {
+    let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+    let start = format!("{:x}-", at.as_ptr() as usize);
+    let entry = smaps.split_once(&*start).expect("the mapping in smaps").1;
+    let flags = entry.lines().find(|line| line.starts_with("VmFlags:"));
+    flags.expect("a VmFlags line").to_owned()
+}
+
+#[test]
+fn a_pool_on_huge_pages_is_advised_so_and_holds_data_on_every_page() {
+    // `hg`: `MADV_HUGEPAGE` took. Whether the kernel then found huge pages is its own affair.
+    let (fd, stored) = create_pool(4, 1 << 20, true).unwrap();
+    let size = pool_size(4, 1 << 20).unwrap();
+    assert_eq!(shm::verify_received(fd.as_fd()), Ok(size));
+    let thp = std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled");
+    if thp.is_ok_and(|thp| !thp.contains("[never]")) {
+        let flags = vm_flags(stored.mapping.as_ptr());
+        assert!(flags.split_whitespace().any(|flag| flag == "hg"), "{flags}");
+    }
+    let loaded = map_pool(fd.as_fd(), 4, 1 << 20, size as usize).unwrap();
+    assert_eq!(loaded.load_generation(3), 0);
+    let (_fd, small) = create_pool(4, 1 << 20, false).unwrap();
+    let flags = vm_flags(small.mapping.as_ptr());
+    assert!(
+        !flags.split_whitespace().any(|flag| flag == "hg"),
+        "{flags}"
+    );
 }

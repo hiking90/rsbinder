@@ -367,7 +367,7 @@ mod mapped {
 
     #[test]
     fn parcelables_and_bytes_reach_a_second_mapping_unchanged() {
-        let (fd, topic) = TypedWriter::create(&PublisherPolicy::default()).unwrap();
+        let (fd, _, topic) = TypedWriter::create(&PublisherPolicy::default()).unwrap();
         let mut sub = subscriber::<Sample>(fd.as_fd());
         let samples: Vec<_> = (0..100).map(sample).collect();
         topic.publish(&samples[0]).unwrap();
@@ -377,7 +377,7 @@ mod mapped {
         }
         assert_eq!(sub.try_recv(), Err(RecvError::Empty));
 
-        let (fd, topic) = TypedWriter::create(&PublisherPolicy::default()).unwrap();
+        let (fd, _, topic) = TypedWriter::create(&PublisherPolicy::default()).unwrap();
         let mut sub = subscriber::<Bytes>(fd.as_fd());
         let values: Vec<_> = (0..100u8)
             .map(|byte| Bytes(vec![byte; byte.into()]))
@@ -398,7 +398,7 @@ mod mapped {
         assert!(matches!(made.err(), Some(Error::BadValue(_))));
         let policy = PublisherPolicy::for_payload(1, 1);
         assert_eq!(policy.ring_bytes, 4096);
-        let (fd, topic) = TypedWriter::<Bytes, _>::create(&policy).unwrap();
+        let (fd, _, topic) = TypedWriter::<Bytes, _>::create(&policy).unwrap();
         topic.publish(&Bytes(vec![7; 2040])).unwrap();
         assert_eq!(subscriber(fd.as_fd()).try_recv(), Ok(Bytes(vec![7; 2040])));
     }

@@ -49,20 +49,40 @@
 //! | `0x80` | 4 × pins | pin words (plan 15, loans) |
 //!
 //! The rest of the first `0x80` bytes is zero. `state` has a cache line of its own because the
-//! publisher loads it at every commit, while the subscriber stores `read` at every record.
+//! publisher loads it at every commit, while the subscriber stores `read` at every record. A pin
+//! word is 0 or a slot's number plus one (`pool.rs`).
+//!
+//! # Pool memory
+//!
+//! A publisher whose policy has a pool makes one per topic and every subscriber maps it
+//! (`pool.rs`).
+//!
+//! | offset | size | word |
+//! |---|---|---|
+//! | `0x00` | 4 | magic, the bytes `RSTL` |
+//! | `0x04` | 4 | layout version |
+//! | `0x08` | 4 | `slots` |
+//! | `0x0c` | 4 | `slot_bytes`: a multiple of 64, at least 64 |
+//! | `0x40` | 8 × slots | each slot's generation |
+//! | `area` | slots × slot_bytes | the slots; `area` is `0x40 + 8 × slots` rounded up to 64 |
+//!
+//! The file is exactly `area + slots × slot_bytes` bytes and at most [`MAX_POOL`], every page
+//! written once at creation. A slot starts on a multiple of 64, so no two slots share a cache line.
 //!
 //! # Making and mapping
 //!
-//! The four entry points — [`create_topic`], [`map_topic`], [`ControlPage::create`] and
-//! [`ControlView::map`] — return `Unsupported` before they look at an argument where topics cannot
-//! work: off Linux and Android, and where `shm::RoWord64::PRESENT` is `false` (no 8-byte load of a
-//! read-only mapping is known not to write there). The two that make a memfd return it as well on a
-//! kernel without `F_SEAL_FUTURE_WRITE`; there is no way to make either object without that seal.
+//! The six entry points — [`create_topic`], [`map_topic`], [`create_pool`], [`map_pool`],
+//! [`ControlPage::create`] and [`ControlView::map`] — return `Unsupported` before they look at an
+//! argument where topics cannot work: off Linux and Android, and where `shm::RoWord64::PRESENT` is
+//! `false` (no 8-byte load of a read-only mapping is known not to write there). The three that
+//! make a memfd return it as well on a kernel without `F_SEAL_FUTURE_WRITE`; there is no way to
+//! make any of the objects without that seal.
 //!
-//! The two that map check the fd first (`shm::verify_received`: a sealed memfd with every page
+//! The three that map check the fd first (`shm::verify_received`: a sealed memfd with every page
 //! present), then its size, then the words that say what it is. For topic memory the size gives
-//! the ring's capacity, and the caller's `max_ring` bounds it, which bounds the address space a
-//! peer can make this process map.
+//! the ring's capacity, and the caller's `max_ring` bounds it; for pool memory the endpoint gives
+//! the slots, the size has to match them, and the caller's `max_pool` bounds it. Both bound the
+//! address space a peer can make this process map.
 //!
 //! # The views
 //!
@@ -77,7 +97,7 @@
 
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use rsbinder::fmq::shm::{
@@ -85,6 +105,7 @@ use rsbinder::fmq::shm::{
 };
 use rsbinder::fmq::{Descriptor, Error, Flavor, Grantor, Result};
 
+use crate::pool::{GenerationLoads, Generations, Pin};
 use crate::ring::{Loads, Stores};
 
 /// The layout version this crate reads and writes: 0.1.
@@ -122,6 +143,23 @@ mod control {
     pub(super) const LOST: usize = 0x48;
     pub(super) const PIN: u64 = 0x80;
 }
+
+/// Offsets in pool memory.
+mod pool {
+    pub(super) const MAGIC: usize = 0x00;
+    pub(super) const VERSION: usize = 0x04;
+    pub(super) const SLOTS: usize = 0x08;
+    pub(super) const SLOT_BYTES: usize = 0x0c;
+    pub(super) const GENERATIONS: usize = 0x40;
+}
+
+const POOL_MAGIC: u32 = u32::from_ne_bytes(*b"RSTL");
+
+/// A slot's size is a multiple of this, and at least this: a cache line.
+pub(crate) const SLOT_GRAIN: u32 = 64;
+
+/// The largest pool memory, header included.
+pub(crate) const MAX_POOL: u64 = 4 << 30;
 
 /// `state` bit 0: the subscriber is about to sleep, or sleeps, on `seq`.
 pub(crate) const WAITING: u32 = 1;
@@ -474,6 +512,7 @@ fn control_size(pins: u32) -> u64 {
 /// A subscriber's control page, mapped read-write.
 pub(crate) struct ControlPage {
     mapping: Mapping,
+    pins: u32,
 }
 
 impl ControlPage {
@@ -485,7 +524,7 @@ impl ControlPage {
         let options = CreateOptions::new("rsbinder-topic-control").populate(true);
         let fd = shm::create(size, &options)?;
         let mapping = Mapping::map(fd.as_fd(), 0, size, Access::ReadWrite)?;
-        let page = Self { mapping };
+        let page = Self { mapping, pins };
         page.word32(control::MAGIC)
             .store(CONTROL_MAGIC, Ordering::Relaxed);
         page.word32(control::VERSION)
@@ -521,11 +560,26 @@ impl ControlPage {
     pub(crate) fn lost(&self) -> &AtomicU64 {
         self.word64(control::LOST)
     }
+
+    /// Pin word `nth`: 0, or the number of the slot this subscriber reads plus one.
+    fn pin(&self, nth: u32) -> &AtomicU32 {
+        assert!(nth < self.pins, "a pin word the page does not have");
+        let at = control::PIN as usize + 4 * nth as usize;
+        // SAFETY: an aligned 4-byte word below `control_size(pins)`, in a mapping `self` owns.
+        unsafe { self.mapping.as_ptr().add(at).cast::<AtomicU32>().as_ref() }
+    }
+}
+
+impl Pin for ControlPage {
+    fn store_pin(&self, value: u32, order: Ordering) {
+        self.pin(0).store(value, order);
+    }
 }
 
 /// A subscriber's control page as the publisher maps it: read-only.
 pub(crate) struct ControlView {
     mapping: Mapping,
+    pins: u32,
 }
 
 #[allow(
@@ -542,6 +596,7 @@ impl ControlView {
         }
         let view = Self {
             mapping: Mapping::map(fd, 0, size, Access::ReadOnly)?,
+            pins,
         };
         if view.word32(control::MAGIC).load() != CONTROL_MAGIC {
             return Err(Error::BadValue("received memfd is not a control page"));
@@ -581,6 +636,187 @@ impl ControlView {
     pub(crate) fn lost(&self) -> u64 {
         self.word64(control::LOST).load_acquire()
     }
+
+    /// The pin words the page has.
+    pub(crate) fn pins(&self) -> u32 {
+        self.pins
+    }
+
+    /// Pin word `nth`, a `Relaxed` load: the caller fences (`pool.rs`).
+    pub(crate) fn pin(&self, nth: u32) -> u32 {
+        assert!(nth < self.pins, "a pin word the page does not have");
+        let at = control::PIN as usize + 4 * nth as usize;
+        // SAFETY: an aligned 4-byte word below `control_size(pins)`, in a mapping `self` owns.
+        unsafe { RoWord32::from_ptr(self.mapping.as_ptr().add(at)) }.load()
+    }
+}
+
+/// Bytes before the first slot: the header and the generations, rounded up to a cache line.
+fn slot_area(slots: u32) -> u64 {
+    (pool::GENERATIONS as u64 + 8 * u64::from(slots)).div_ceil(64) * 64
+}
+
+/// Bytes of pool memory with `slots` slots of `slot_bytes`, if those are a pool's.
+pub(crate) fn pool_size(slots: u32, slot_bytes: u32) -> Option<u64> {
+    if slots == 0 || slot_bytes < SLOT_GRAIN || slot_bytes % SLOT_GRAIN != 0 {
+        return None;
+    }
+    let size = slot_area(slots).checked_add(u64::from(slots) * u64::from(slot_bytes))?;
+    (size <= MAX_POOL && usize::try_from(size).is_ok()).then_some(size)
+}
+
+/// Pool memory as the publisher reaches it.
+pub(crate) struct StoredPool {
+    mapping: Mapping,
+    slots: u32,
+    #[allow(dead_code, reason = "plan 15 P3-2 lends slots of this size")]
+    slot_bytes: u32,
+}
+
+impl StoredPool {
+    fn word32(&self, at: usize) -> &AtomicU32 {
+        debug_assert!(at % 4 == 0 && at + 4 <= pool::GENERATIONS);
+        // SAFETY: an aligned 4-byte word of the header, in a mapping `self` owns.
+        unsafe { self.mapping.as_ptr().add(at).cast::<AtomicU32>().as_ref() }
+    }
+
+    fn generation(&self, slot: u32) -> &AtomicU64 {
+        assert!(slot < self.slots, "a slot outside the pool");
+        let at = pool::GENERATIONS + 8 * slot as usize;
+        // SAFETY: an aligned 8-byte word below `slot_area(slots)`, in a mapping `self` owns.
+        unsafe { self.mapping.as_ptr().add(at).cast::<AtomicU64>().as_ref() }
+    }
+}
+
+impl Generations for StoredPool {
+    fn store_generation(&self, slot: u32, value: u64, order: Ordering) {
+        self.generation(slot).store(value, order);
+    }
+}
+
+/// Pool memory as a subscriber reaches it: loads only.
+pub(crate) struct LoadedPool {
+    mapping: Mapping,
+    slots: u32,
+    #[allow(dead_code, reason = "plan 15 P3-3 bounds a loan's length by it")]
+    slot_bytes: u32,
+}
+
+impl LoadedPool {
+    fn word32(&self, at: usize) -> &RoWord32 {
+        debug_assert!(at % 4 == 0 && at + 4 <= pool::GENERATIONS);
+        // SAFETY: an aligned 4-byte word of the header, in a mapping `self` owns.
+        unsafe { RoWord32::from_ptr(self.mapping.as_ptr().add(at)) }
+    }
+}
+
+impl GenerationLoads for LoadedPool {
+    fn slots(&self) -> u32 {
+        self.slots
+    }
+
+    fn load_generation(&self, slot: u32) -> u64 {
+        assert!(slot < self.slots, "a slot outside the pool");
+        let at = pool::GENERATIONS + 8 * slot as usize;
+        // SAFETY: an aligned 8-byte word below `slot_area(slots)`, in a mapping `self` owns.
+        unsafe { RoWord64::from_ptr(self.mapping.as_ptr().add(at)) }.load()
+    }
+}
+
+/// Make pool memory of `slots` slots of `slot_bytes`: the fd to hand to subscribers, and the
+/// mapping. `huge` asks the kernel for transparent huge pages (`MADV_HUGEPAGE`) before the pages
+/// are first written. `BadValue` for sizes [`pool_size`] refuses; the rest as [`create_topic`].
+pub(crate) fn create_pool(
+    slots: u32,
+    slot_bytes: u32,
+    huge: bool,
+) -> Result<(OwnedFd, StoredPool)> {
+    check_target()?;
+    let size =
+        pool_size(slots, slot_bytes).ok_or(Error::BadValue("pool of a size outside the bounds"))?;
+    // Huge pages come with the first write through a mapping advised so, not with `pwrite`.
+    let options = CreateOptions::new("rsbinder-topic-pool").populate(!huge);
+    let fd = shm::create(size, &options)?;
+    let mapping = Mapping::map(fd.as_fd(), 0, size, Access::ReadWrite)?;
+    let stored = StoredPool {
+        mapping,
+        slots,
+        slot_bytes,
+    };
+    if huge {
+        stored.touch_huge();
+    }
+    stored
+        .word32(pool::MAGIC)
+        .store(POOL_MAGIC, Ordering::Relaxed);
+    stored
+        .word32(pool::VERSION)
+        .store(VERSION, Ordering::Relaxed);
+    stored.word32(pool::SLOTS).store(slots, Ordering::Relaxed);
+    stored
+        .word32(pool::SLOT_BYTES)
+        .store(slot_bytes, Ordering::Relaxed);
+    seal(fd.as_fd())?;
+    Ok((fd, stored))
+}
+
+impl StoredPool {
+    /// Advise huge pages, then write a byte of every 4 KiB so that each page holds data.
+    fn touch_huge(&self) {
+        let len = self.mapping.len();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            // Refused without transparent huge pages, which leaves small ones: nothing to undo.
+            let advice = rustix::mm::Advice::LinuxHugepage;
+            let at = self.mapping.as_ptr().as_ptr().cast();
+            // SAFETY: this whole mapping, and an advice that changes no byte of it.
+            let _ = unsafe { rustix::mm::madvise(at, len, advice) };
+        }
+        for at in (0..len).step_by(4 << 10) {
+            // SAFETY: a byte this mapping owns, before any peer has the fd: no access races it.
+            unsafe { self.mapping.as_ptr().add(at).cast::<AtomicU8>().as_ref() }
+                .store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Map pool memory a publisher sent, read-only, once the fd, its size and its marks pass: the
+/// size has to be what `slots` and `slot_bytes` make, and no more than `max_pool`.
+pub(crate) fn map_pool(
+    fd: BorrowedFd<'_>,
+    slots: u32,
+    slot_bytes: u32,
+    max_pool: usize,
+) -> Result<LoadedPool> {
+    check_target()?;
+    let expected = pool_size(slots, slot_bytes)
+        .filter(|&size| size <= max_pool as u64)
+        .ok_or(Error::BadValue("pool memory of a size outside the bounds"))?;
+    let size = shm::verify_received(fd)?;
+    if size != expected {
+        return Err(Error::BadValue(
+            "pool memory of another size than its slots",
+        ));
+    }
+    let pool = LoadedPool {
+        mapping: Mapping::map(fd, 0, size, Access::ReadOnly)?,
+        slots,
+        slot_bytes,
+    };
+    if pool.word32(pool::MAGIC).load() != POOL_MAGIC {
+        return Err(Error::BadValue("received memfd is not pool memory"));
+    }
+    if pool.word32(pool::VERSION).load() != VERSION {
+        return Err(Error::BadValue("pool memory of another layout version"));
+    }
+    if pool.word32(pool::SLOTS).load() != slots
+        || pool.word32(pool::SLOT_BYTES).load() != slot_bytes
+    {
+        return Err(Error::BadValue(
+            "pool memory with other slots than its endpoint",
+        ));
+    }
+    Ok(pool)
 }
 
 #[cfg(any(test, feature = "fuzzing"))]

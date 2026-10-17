@@ -17,18 +17,21 @@ use std::sync::{Arc, Weak};
 
 use rsbinder::fmq::shm::Mapping;
 use rsbinder::{
-    BinderResult, CallingContext, ExceptionCode, Interface, SIBinder, Status, StatusCode,
+    BinderResult, CallingContext, ExceptionCode, Interface, ParcelFileDescriptor, SIBinder, Status,
+    StatusCode,
 };
 
 use crate::aidl::ITopic::{
     BnTopic, ITopic, ERROR_CLOSED, ERROR_FULL, ERROR_VERSION, WAKE_FD, WAKE_FUTEX,
 };
+use crate::aidl::Pool::Pool;
 use crate::aidl::SubscribeRequest::SubscribeRequest;
 use crate::aidl::TopicEndpoint::TopicEndpoint;
 use crate::connect::{asked_here, refuse, status_of};
 use crate::layout::{self, ControlView, Stored, HEADER_OFFSET, VERSION};
 use crate::link::{Dead, Forget, Link};
-use crate::publish::TypedWriter;
+use crate::pool::MAX_PINS;
+use crate::publish::{PoolFd, TypedWriter};
 use crate::resolve::{Resolver, ServiceManager};
 use crate::{wake, Authorize, Payload, PublishError, PublisherPolicy, PublisherStats};
 
@@ -63,6 +66,8 @@ struct Shared<T> {
     writer: TypedWriter<T, Stored<Mapping>>,
     /// The topic memory, duplicated into every reply.
     fd: OwnedFd,
+    /// The pool memory, duplicated into every reply, for a topic that lends slots.
+    pool: Option<PoolFd>,
     capacity: u64,
     max_subscribers: usize,
     max_per_uid: usize,
@@ -72,15 +77,17 @@ struct Shared<T> {
 impl<T: Payload + 'static> Publisher<T> {
     /// Make a topic with `policy`.
     ///
-    /// `BadValue` when `policy.ring_bytes` is outside 4 KiB to 1 GiB. `Unsupported` off Linux and
-    /// Android, on a target where a 64-bit word of a read-only mapping cannot be loaded, and on a
-    /// kernel without `F_SEAL_FUTURE_WRITE`. An OS error when the memory cannot be made.
+    /// `BadValue` when `policy.ring_bytes` is outside 4 KiB to 1 GiB, or `policy.pool` makes a
+    /// pool larger than 4 GiB. `Unsupported` off Linux and Android, on a target where a 64-bit
+    /// word of a read-only mapping cannot be loaded, and on a kernel without
+    /// `F_SEAL_FUTURE_WRITE`. An OS error when the memory cannot be made.
     pub fn new(policy: &PublisherPolicy) -> rsbinder::fmq::Result<Self> {
-        let (fd, writer) = TypedWriter::create(policy)?;
+        let (fd, pool, writer) = TypedWriter::create(policy)?;
         let capacity = writer.lock().writer.capacity();
         let shared = Arc::new(Shared {
             writer,
             fd,
+            pool,
             capacity,
             max_subscribers: policy.max_subscribers,
             max_per_uid: policy.max_per_uid,
@@ -269,7 +276,8 @@ impl Acceptor {
     /// Refusals: `EX_SECURITY` when [`PublisherPolicy::authorize`] does not admit the caller,
     /// checked first; [`ITopic::ERROR_VERSION`] for another layout version; `BadType` when the
     /// request names another payload type; `BadValue` for a token of this process that came
-    /// through binder (its death would say nothing about the caller), a nonzero pin count, a
+    /// through binder (its death would say nothing about the caller), a pin count other than 0
+    /// or 1, a
     /// `wake` that is neither [`ITopic::WAKE_FUTEX`] nor [`ITopic::WAKE_FD`], a `wakeFd` that is
     /// not a unix stream socket for `WAKE_FD` or not null for `WAKE_FUTEX`, or a control page
     /// that is not a sealed memfd of the size, magic, version and pin count the request states;
@@ -328,9 +336,12 @@ impl<T: Payload + 'static> Accept for Shared<T> {
         if request.r#type != T::type_name() {
             return Err(StatusCode::BadType.into());
         }
-        if request.pins != 0 || ![WAKE_FUTEX, WAKE_FD].contains(&request.wake) {
+        let pins = u32::try_from(request.pins)
+            .ok()
+            .filter(|&pins| pins <= MAX_PINS);
+        let Some(pins) = pins.filter(|_| [WAKE_FUTEX, WAKE_FD].contains(&request.wake)) else {
             return Err(StatusCode::BadValue.into());
-        }
+        };
         let token = request.token.as_ref().ok_or(StatusCode::UnexpectedNull)?;
         let control = request.control.as_ref().ok_or(StatusCode::UnexpectedNull)?;
         if token.as_proxy().is_none() && !asked_here(token) {
@@ -347,9 +358,20 @@ impl<T: Payload + 'static> Accept for Shared<T> {
             }
             _ => return Err(StatusCode::BadValue.into()),
         };
-        let control = ControlView::map(control.as_fd(), 0).map_err(status_of)?;
+        let control = ControlView::map(control.as_fd(), pins).map_err(status_of)?;
         let fd = self.fd.try_clone().map_err(StatusCode::from)?;
         let ring = layout::descriptor(fd, self.capacity).try_into()?;
+        let pool = match &self.pool {
+            Some(pool) => Some(Pool {
+                memory: Some(ParcelFileDescriptor::new(
+                    pool.fd.try_clone().map_err(StatusCode::from)?,
+                )),
+                // At most 4 GiB of pool, of 64-byte slots: both fit an `i32`.
+                slots: pool.slots as i32,
+                slotBytes: pool.slot_bytes as i32,
+            }),
+            None => None,
+        };
         let caller = CallingContext::default();
         let uid = caller.uid;
         let list = Arc::downgrade(&self) as Weak<dyn Forget>;
@@ -385,6 +407,7 @@ impl<T: Payload + 'static> Accept for Shared<T> {
             // The bits of the `u64` position and `u32` index; the subscriber reads them back so.
             start: start as i64,
             startIndex: index as i32,
+            pool,
         })
     }
 }

@@ -25,13 +25,15 @@ use rsbinder::{
 use crate::aidl::ITopic::{
     BnTopic, ITopic, ERROR_CLOSED, ERROR_FULL, ERROR_VERSION, WAKE_FD, WAKE_FUTEX,
 };
+use crate::aidl::Pool::Pool;
 use crate::aidl::SubscribeRequest::SubscribeRequest;
 use crate::aidl::TopicEndpoint::TopicEndpoint;
 use crate::connect::Token;
 use crate::layout::{self, ControlView, CLOSED, HEADER_OFFSET, MIN_RING, NO_FUTURE_WRITE, VERSION};
+use crate::pool::GenerationLoads;
 use crate::{
-    Acceptor, Bytes, Closed, Payload, PublishError, Publisher, PublisherPolicy, RecvError, Start,
-    Subscriber, SubscriberPolicy, Wake,
+    Acceptor, Bytes, Closed, Payload, PoolPolicy, PublishError, Publisher, PublisherPolicy,
+    RecvError, Start, Subscriber, SubscriberPolicy, Wake,
 };
 
 const ALONE: &str = "RSBINDER_TOPIC_ALONE";
@@ -204,9 +206,15 @@ fn a_request_the_publisher_cannot_take_is_refused_for_what_is_wrong_with_it() {
     assert_eq!(service_specific(acceptor.accept(&other)), ERROR_VERSION);
     let other = subscribe::<crate::typed_tests::Sample>(&publisher.as_binder(), Start::Latest);
     assert_eq!(code(other), StatusCode::BadType);
-    let mut other = request(page(), token());
-    other.pins = 1;
-    assert_eq!(code(acceptor.accept(&other)), StatusCode::BadValue);
+    for pins in [2, -1] {
+        let mut other = request(page(), token());
+        other.pins = pins;
+        assert_eq!(
+            code(acceptor.accept(&other)),
+            StatusCode::BadValue,
+            "{pins} pins"
+        );
+    }
     // A token this thread asks with, so that the wake alone is wrong.
     let asking = token();
     let mut other = request(page(), asking.clone());
@@ -250,7 +258,11 @@ fn a_control_page_that_is_not_what_the_request_says_is_refused() {
     let _asking = crate::connect::Asking::new(&token);
     let page = control(b"RSTC", VERSION, 0, 0x80);
     assert!(acceptor.accept(&request(page, token.clone())).is_ok());
-    assert_eq!(publisher.subscriber_count(), 1);
+    // One pin word: four bytes past the header, rounded up to eight.
+    let mut pinned = request(control(b"RSTC", VERSION, 1, 0x88), token.clone());
+    pinned.pins = 1;
+    assert!(acceptor.accept(&pinned).is_ok());
+    assert_eq!(publisher.subscriber_count(), 2);
 }
 
 #[test]
@@ -347,7 +359,8 @@ impl Interface for Forged {}
 impl ITopic for Forged {
     fn r#subscribe(&self, request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
         let fd = request.control.as_ref().unwrap().as_fd();
-        *self.control.lock().unwrap() = Some(ControlView::map(fd, 0).unwrap());
+        let pins = request.pins as u32;
+        *self.control.lock().unwrap() = Some(ControlView::map(fd, pins).unwrap());
         Ok((self.endpoint)())
     }
 }
@@ -360,7 +373,71 @@ fn endpoint(fd: OwnedFd, capacity: u64) -> TopicEndpoint {
         headerOffset: HEADER_OFFSET as i32,
         start: 0,
         startIndex: 0,
+        pool: None,
     }
+}
+
+/// `endpoint` with pool memory `fd` that it says has `slots` of `slot_bytes`.
+fn with_pool(endpoint: TopicEndpoint, fd: OwnedFd, slots: i32, slot_bytes: i32) -> TopicEndpoint {
+    TopicEndpoint {
+        pool: Some(Pool {
+            memory: Some(ParcelFileDescriptor::new(fd)),
+            slots,
+            slotBytes: slot_bytes,
+        }),
+        ..endpoint
+    }
+}
+
+#[test]
+fn a_publisher_with_a_pool_hands_it_to_each_subscriber() {
+    let pooled = PoolPolicy {
+        slot_bytes: 100,
+        depth: 1,
+        max_loans: 2,
+        huge_pages: false,
+    };
+    let policy = PublisherPolicy {
+        max_subscribers: 2,
+        pool: Some(pooled.clone()),
+        ..policy()
+    };
+    // A slot for each subscriber's pin, one to write, the depth and the loans; 64-byte slots.
+    assert_eq!(pooled.shape(2), Some((2 + 1 + 1 + 2, 128)));
+    let publisher = Publisher::<Bytes>::new(&policy).unwrap();
+    let mut subscriber = subscribe::<Bytes>(&publisher.as_binder(), Start::Latest).unwrap();
+    let pool = subscriber.pool().expect("the publisher's pool");
+    assert_eq!(pool.slots(), 6);
+    assert_eq!((0..6).map(|slot| pool.load_generation(slot)).max(), Some(0));
+    // The ring works as it does without one.
+    publisher.publish(&bytes(9)).unwrap();
+    assert_eq!(subscriber.try_recv(), Ok(bytes(9)));
+
+    let plain = Publisher::<Bytes>::new(&self::policy()).unwrap();
+    let subscriber = subscribe::<Bytes>(&plain.as_binder(), Start::Latest).unwrap();
+    assert!(subscriber.pool().is_none());
+}
+
+#[test]
+fn a_pool_past_4_gib_is_refused_before_anything_is_made() {
+    let pool = |slot_bytes| PoolPolicy {
+        slot_bytes,
+        ..PoolPolicy::default()
+    };
+    // 68 slots of 64 MiB is past 4 GiB; of 32 MiB, under it.
+    assert_eq!(pool(64 << 20).shape(64), None);
+    assert_eq!(pool(32 << 20).shape(64), Some((68, 32 << 20)));
+    assert_eq!(pool(usize::MAX).shape(1), None);
+    assert_eq!(pool(1).shape(usize::MAX), None);
+    let policy = PublisherPolicy {
+        pool: Some(pool(64 << 20)),
+        ..policy()
+    };
+    let made = Publisher::<Bytes>::new(&policy);
+    assert_eq!(
+        made.err(),
+        Some(rsbinder::fmq::Error::BadValue("pool larger than 4 GiB"))
+    );
 }
 
 #[test]
@@ -428,9 +505,55 @@ fn a_reply_the_subscriber_cannot_use_is_refused_and_its_control_page_closed() {
             None,
             "a ring above the subscriber's bound",
         ),
+        (
+            Box::new({
+                let good = good.clone();
+                move || {
+                    let (pool, _stored) = layout::create_pool(17, 64 << 10, false).unwrap();
+                    with_pool(endpoint(dup(&good), capacity), pool, 17, 64 << 10)
+                }
+            }),
+            None,
+            "a pool above the subscriber's bound",
+        ),
+        (
+            Box::new({
+                let good = good.clone();
+                move || {
+                    let (pool, _stored) = layout::create_pool(3, 64, false).unwrap();
+                    with_pool(endpoint(dup(&good), capacity), pool, 4, 64)
+                }
+            }),
+            None,
+            "a pool of other slots than it states",
+        ),
+        (
+            Box::new({
+                let good = good.clone();
+                move || {
+                    let (pool, _stored) = layout::create_pool(3, 64, false).unwrap();
+                    with_pool(endpoint(dup(&good), capacity), pool, -3, 64)
+                }
+            }),
+            None,
+            "a negative slot count",
+        ),
+        (
+            Box::new({
+                let good = good.clone();
+                move || {
+                    // The topic memory again, stated as one slot of its size.
+                    let slot = 0x40 + capacity as i32 - 0x80;
+                    with_pool(endpoint(dup(&good), capacity), dup(&good), 1, slot)
+                }
+            }),
+            None,
+            "topic memory as the pool",
+        ),
     ];
     let policy = SubscriberPolicy {
         max_ring_bytes: MIN_RING,
+        max_pool_bytes: 1 << 20,
         ..SubscriberPolicy::default()
     };
     for (make, refused, why) in cases {

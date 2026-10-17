@@ -16,6 +16,7 @@ fn main() {
     let sources = [
         "aidl/rsbinder/topic/SubscribeRequest.aidl",
         "aidl/rsbinder/topic/TopicEndpoint.aidl",
+        "aidl/rsbinder/topic/Pool.aidl",
         "aidl/rsbinder/topic/ITopic.aidl",
     ];
     let builder = sources.iter().fold(
