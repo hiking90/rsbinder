@@ -754,6 +754,68 @@ fn instances_of_a_generic_parcelable_share_a_type_name_unless_wrapped() {
     assert_eq!(wrapped.try_recv(), Ok(Longs(Pair(-3))));
 }
 
+/// AC-15.2.31: the ring a reply names is libfmq's unsynchronized queue of bytes. Its reader, made
+/// from the reply's descriptor alone, reads the publisher's records in order, across the ring's
+/// end: an 8-byte header (kind and length, then index) and the payload padded to 8.
+#[test]
+fn an_unsynchronized_reader_of_bytes_reads_the_records_of_a_reply() {
+    use rsbinder::fmq::{AttachPolicy, Descriptor, UnsyncRead, UnsyncReader, UnsyncStart};
+
+    let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
+    let asking = token();
+    let asked = request(control(b"RSTC", VERSION, 0, 0x80), asking.clone());
+    let endpoint = {
+        let _asking = crate::connect::Asking::new(&asking);
+        publisher.acceptor().accept(&asked).unwrap()
+    };
+    let descriptor = Descriptor::try_from(&endpoint.ring).unwrap();
+    let policy = AttachPolicy {
+        max_capacity: MIN_RING,
+        require_seal: true,
+        require_event_flag: false,
+    };
+    let mut reader = UnsyncReader::<u8>::attach(&descriptor, &policy, UnsyncStart::Oldest).unwrap();
+    assert_eq!(reader.capacity(), MIN_RING);
+    let mut read_exactly = |len: usize| {
+        let mut bytes = vec![0u8; len];
+        assert_eq!(
+            reader.read(&mut bytes).unwrap(),
+            UnsyncRead::Done,
+            "{len} bytes"
+        );
+        bytes
+    };
+    // Two batches of 60 records of 41 bytes, 56 a record: the second crosses the ring's end.
+    let mut index = 0u32;
+    for batch in 0..2u8 {
+        let values: Vec<Bytes> = (0..60u8).map(|n| Bytes(vec![batch ^ n; 41])).collect();
+        publisher.publish_all(&values).unwrap();
+        for value in &values {
+            let header = read_exactly(8);
+            let word = u32::from_le_bytes(header[..4].try_into().unwrap());
+            assert_eq!(
+                (word >> 30, word & ((1 << 30) - 1)),
+                (0, 41),
+                "record {index}"
+            );
+            assert_eq!(u32::from_le_bytes(header[4..].try_into().unwrap()), index);
+            let payload = read_exactly(48);
+            assert_eq!(&payload[..41], value.0.as_slice(), "record {index}");
+            assert!(
+                payload[41..].iter().all(|byte| *byte == 0),
+                "padding of {index}"
+            );
+            index += 1;
+        }
+    }
+    assert!(
+        u64::from(index) * 56 > MIN_RING as u64,
+        "the records did not wrap"
+    );
+    let mut more = [0u8; 1];
+    assert_eq!(reader.read(&mut more).unwrap(), UnsyncRead::Empty);
+}
+
 #[test]
 fn grantors_name_the_unsynchronized_queue_of_bytes() {
     let at = |offset, extent| Grantor {
