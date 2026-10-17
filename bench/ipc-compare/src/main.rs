@@ -6,6 +6,9 @@
 //! ipc-compare b2 --impl rsb-stream|ix [--wait block|poll] --size B --rate HZ
 //! ipc-compare b3 --impl rsb-stream|rsb-oneway|rsb-topic|ix [--wait block|poll] --n N --size B --rate HZ
 //!   (rsb-topic also takes --wait fd)
+//! ipc-compare b5 --wake futex|fd --n N [--rate HZ]     (one process: publish time, N waiting)
+//! ipc-compare b6 --codec alloc|direct --size B         (one process: publish time, encode)
+//!   (b2, b3 with --impl ix also take --touch yes: the subscriber copies the payload out)
 //! ipc-compare b4 --impl fmq|ix
 //!   [--count C --warmup W] [--producer-cpu 1] [--consumer-cpus 2,3,4,5,6,7,0,8]
 //! ```
@@ -18,6 +21,7 @@ mod common;
 mod ix;
 mod queue;
 mod rsb;
+mod topic_cost;
 
 use std::time::Duration;
 
@@ -44,6 +48,8 @@ fn main() {
         "b1" => b1(&a),
         "b2" | "b3" => fanout(what, &a),
         "b4" => b4(&a),
+        "b5" => topic_cost::b5(&a),
+        "b6" => topic_cost::b6(&a),
         _ => {
             eprintln!("ipc-compare: unknown measurement {what}");
             std::process::exit(2);
@@ -170,7 +176,9 @@ fn fanout(bench: &str, a: &Args) {
             (producer, imp.clone(), vec![("ring", ring.to_string())])
         }
         "ix" => {
-            note.push(format!("subscriber buffer {} samples; reads the stamp in place", ix::buffer_for(size)));
+            let touch = a.str("touch", "no") == "yes";
+            let reads = if touch { "copies the payload out" } else { "reads the stamp in place" };
+            note.push(format!("subscriber buffer {} samples; {reads}", ix::buffer_for(size)));
             let producer = spawn(
                 "ix-producer",
                 &[
@@ -183,7 +191,8 @@ fn fanout(bench: &str, a: &Args) {
                     ("wait", wait.clone()),
                 ],
             );
-            (producer, "ix-consumer".to_string(), Vec::new())
+            let extra = if touch { vec![("touch", "yes".to_string())] } else { Vec::new() };
+            (producer, "ix-consumer".to_string(), extra)
         }
         other => {
             eprintln!("ipc-compare: unknown --impl {other}");

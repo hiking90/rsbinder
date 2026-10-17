@@ -5,8 +5,10 @@
 #
 # `stream` is B2 for rsbinder's stream alone, the comparison AC-15.1.10 makes before and after
 # P1a-3; run it with 5 repeats. `ix-block` is the iceoryx2 blocking rows of B2 and B3. `topic`
-# is B2 and B3 for rsbinder-topic (futex, fd and poll waits) next to iceoryx2's. Each repeat
-# writes its own CSV.
+# is B2 and B3 for rsbinder-topic (futex, fd and poll waits) next to iceoryx2's. `b5` and `b6`
+# time one publish in one process (waiting subscribers by wake; encode by codec); `p0b` is both,
+# and B3's large payloads with iceoryx2 subscribers that copy them out. Each repeat writes its
+# own CSV.
 #
 # Results go to plans/15-pubsub-bench/<time>-<set>/: conditions.txt and results-<repeat>.csv.
 #
@@ -109,6 +111,35 @@ b4() {
     done
 }
 
+b5() {
+    for wake in futex fd; do
+        for n in 0 1 8 64; do
+            measure b5 --wake "$wake" --n "$n"
+        done
+    done
+}
+
+b6() {
+    for size in 64 1024 16384 65536; do
+        measure b6 --codec alloc --size "$size"
+        measure b6 --codec direct --size "$size"
+    done
+}
+
+# B3's large payloads with iceoryx2 subscribers that copy each payload out, as a reader that
+# keeps the value does; rsbinder-topic's rows are the `topic` set's.
+b3_touch() {
+    for n in 1 8; do
+        for size in 65536 1048576 4194304; do
+            for rate in 1000 10000; do
+                for wait in block poll; do
+                    measure b3 --impl ix --wait "$wait" --touch yes --n "$n" --size "$size" --rate "$rate"
+                done
+            done
+        done
+    done
+}
+
 for repeat in $(seq "$repeats"); do
     csv=$out/results-$repeat.csv
     "$bin" header > "$csv"
@@ -124,6 +155,9 @@ for repeat in $(seq "$repeats"); do
         topic)
             topic_pairs=("rsb-topic block" "rsb-topic fd" "rsb-topic poll" "ix block" "ix poll")
             b2 "${topic_pairs[@]}"; b3 "${topic_pairs[@]}" ;;
+        b5) b5 ;;
+        b6) b6 ;;
+        p0b) b5; b6; b3_touch ;;
         *) echo "run.sh: unknown set $set_name" >&2; exit 2 ;;
     esac
 done

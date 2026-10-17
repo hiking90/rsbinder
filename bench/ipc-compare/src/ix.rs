@@ -111,6 +111,7 @@ pub fn consumer(a: &Args) -> Result<(), Error> {
     let base = a.str("name", "");
     let count = a.num("count", 0);
     let block = a.str("wait", "block") == "block";
+    let touch = a.str("touch", "no") == "yes";
     let node = node()?;
     let event = node.service_builder(&name(&base, "/ev")?).event().open()?;
     let listener = event.listener_builder().create()?;
@@ -126,7 +127,13 @@ pub fn consumer(a: &Args) -> Result<(), Error> {
         if let Some(sample) = subscriber.receive()? {
             missed += u64::from(timed_out);
             timed_out = false;
-            record.take(sample.payload());
+            if touch {
+                // As a reader that keeps the value: one copy out of the sample.
+                let copy = sample.payload().to_vec();
+                record.take(&copy);
+            } else {
+                record.take(sample.payload());
+            }
             idle = None;
             continue;
         }
