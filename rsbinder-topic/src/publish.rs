@@ -37,7 +37,19 @@ pub struct PublisherPolicy {
     /// work of a publish. One more is refused with [`ITopic::ERROR_FULL`]; subscriptions that
     /// ended (the subscriber dropped it, or its process died) are taken out first.
     ///
+    /// A publish wakes the subscribers it finds waiting before it lets go of the topic's lock,
+    /// so the bound is also the longest a publish holds it and the other publishers wait. The
+    /// wake grows with the subscribers that wait: one futex wake for all those of
+    /// [`Wake::Futex`], whose kernel time grows with each one it wakes, and one `send` for each
+    /// of [`Wake::Fd`]. Measured on an x86_64 desktop (plan 15 §8.4), a publish took about
+    /// 0.25 µs with no subscriber waiting, and with 64 waiting about 0.17 ms on futex wakes and
+    /// 0.28 ms on fd wakes: about 1–3 µs and 4.5 µs for each subscriber that waits. Lower the
+    /// bound where a publish must not stall that long, raise it for more subscribers at that
+    /// cost.
+    ///
     /// [`ITopic::ERROR_FULL`]: crate::aidl::ITopic::ERROR_FULL
+    /// [`Wake::Futex`]: crate::Wake::Futex
+    /// [`Wake::Fd`]: crate::Wake::Fd
     pub max_subscribers: usize,
     /// Subscriptions one uid holds at once, refused past it as `max_subscribers` is. Default 64,
     /// which with the default `max_subscribers` limits nothing: lower it so that one uid allowed
