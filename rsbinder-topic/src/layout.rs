@@ -769,6 +769,27 @@ impl LoadedPool {
         // SAFETY: inside a slot of a mapping `self` owns, whose slots this process reads by runs.
         unsafe { RoRun::new(self.mapping.as_ptr().add(at), dst.len()) }.load(dst);
     }
+
+    /// The first `len` bytes of `slot`, in place.
+    ///
+    /// # Safety
+    ///
+    /// While the slice lives, no process writes those bytes — the publisher keeps the pin
+    /// protocol (`pool.rs`) and the caller holds the pin — and this process reads them through
+    /// no run ([`load_slot`](Self::load_slot)).
+    pub(crate) unsafe fn slot_slice(&self, slot: u32, len: usize) -> &[u8] {
+        assert!(slot < self.slots && len <= self.slot_bytes as usize);
+        let at = slot_area(self.slots) as usize + slot as usize * self.slot_bytes as usize;
+        // SAFETY: inside a slot of a mapping `self` owns; the caller's contract keeps it unchanged.
+        unsafe { std::slice::from_raw_parts(self.mapping.as_ptr().add(at).as_ptr(), len) }
+    }
+
+    /// The addresses the mapping covers, for tests that a sample lies in it.
+    #[cfg(all(test, not(loom), any(target_os = "linux", target_os = "android")))]
+    pub(crate) fn addresses(&self) -> std::ops::Range<usize> {
+        let start = self.mapping.as_ptr().as_ptr() as usize;
+        start..start + self.mapping.len()
+    }
 }
 
 impl GenerationLoads for LoadedPool {

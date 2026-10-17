@@ -536,6 +536,11 @@ impl<M: Loads> Reader<M> {
         self.memory.write()
     }
 
+    /// The first `len` bytes of the buffer the last item was copied into.
+    pub(crate) fn held(&self, len: usize) -> &[u8] {
+        &self.payload[..len]
+    }
+
     /// The next record, without waiting.
     pub(crate) fn try_recv(&mut self) -> Result<Taken<'_>, Corrupted> {
         let outcome = self.next()?;

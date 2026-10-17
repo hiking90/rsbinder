@@ -303,16 +303,25 @@ impl PoolReader {
         Self { pool, control }
     }
 
-    #[cfg(all(test, not(loom), any(target_os = "linux", target_os = "android")))]
     pub(crate) fn pool(&self) -> &LoadedPool {
         &self.pool
+    }
+
+    /// Pin the slot `loan` names, if it still holds that loan's value.
+    pub(crate) fn pin(&self, loan: Loan) -> Result<(), Unpinned> {
+        pin(&self.pool, &*self.control, loan, self.pool.slot_bytes())
+    }
+
+    /// Let go of the slot pinned.
+    pub(crate) fn unpin(&self) {
+        unpin(&*self.control);
     }
 
     /// Copy the value `loan` names into `into`, which then holds it and nothing more: pin the
     /// slot, copy it with atomic loads, let go. A publisher that broke the protocol and wrote the
     /// slot meanwhile makes the copy wrong, never undefined.
     pub(crate) fn copy(&self, loan: Loan, into: &mut Vec<u8>) -> Result<(), Unpinned> {
-        pin(&self.pool, &*self.control, loan, self.pool.slot_bytes())?;
+        self.pin(loan)?;
         let len = loan.len as usize;
         if into.capacity() < len {
             // A taken buffer, as the ring's reader makes it again: zeroed allocation.
@@ -321,7 +330,7 @@ impl PoolReader {
             into.resize(len, 0);
         }
         self.pool.load_slot(loan.slot, into);
-        unpin(&*self.control);
+        self.unpin();
         Ok(())
     }
 }

@@ -142,6 +142,98 @@ fn the_slot_read_last_is_lent_again_and_a_subscriber_behind_loses_the_oldest() {
     assert_eq!(lend(&publisher, &[6; 8]), lent[0]);
 }
 
+/// AC-15.3.1: a lent value is received in its slot of the pool, with no copy; one that came
+/// through the ring is in the subscriber's buffer. Both read the same three ways.
+#[test]
+fn a_lent_sample_lies_in_the_pool_and_a_ring_sample_in_the_subscriber() {
+    let publisher = Publisher::<Bytes>::new(&pooled(1, 1, 1)).unwrap();
+    let mut subscriber = subscribe(&publisher);
+    let pool = subscriber.pool().unwrap().addresses();
+    lend(&publisher, &pattern(5, 3000));
+    publisher.publish(&Bytes(pattern(6, 100))).unwrap();
+    for (lent, value) in [(true, pattern(5, 3000)), (false, pattern(6, 100))] {
+        let mut sample = subscriber.try_recv_sample().unwrap();
+        assert_eq!((sample.is_loaned(), sample.len()), (lent, value.len()));
+        assert_eq!(sample.to_owned(), value);
+        let mut copied = vec![0; value.len()];
+        sample.copy_to(&mut copied);
+        assert_eq!(copied, value);
+        // SAFETY: the publisher is this crate's, in this process.
+        let bytes = unsafe { sample.as_slice() };
+        assert_eq!(bytes, value);
+        assert_eq!(pool.contains(&(bytes.as_ptr() as usize)), lent);
+    }
+    assert_eq!(subscriber.try_recv_sample().err(), Some(RecvError::Empty));
+    assert_eq!(subscriber.stats().received, 2);
+}
+
+/// AC-15.3.2: a slot stays as it was while a subscriber holds its sample, however many values
+/// the publisher lends meanwhile; the subscriber loses the ones whose slots went round.
+#[test]
+fn a_held_sample_is_not_written_however_many_values_follow() {
+    // 1 pin, one to write, a depth of 1 and 1 loan: 4 slots.
+    let publisher = Publisher::<Bytes>::new(&pooled(1, 1, 1)).unwrap();
+    let mut subscriber = subscribe(&publisher);
+    lend(&publisher, &pattern(42, SLOT));
+    let mut sample = subscriber.try_recv_sample().unwrap();
+    for n in 0..4 * 4 {
+        lend(&publisher, &pattern(n, SLOT));
+    }
+    assert_eq!(sample.to_owned(), pattern(42, SLOT));
+    // SAFETY: the publisher is this crate's, in this process.
+    assert_eq!(unsafe { sample.as_slice() }, pattern(42, SLOT));
+    drop(sample);
+    let (mut received, mut lost, mut last) = (0, 0, None);
+    loop {
+        match subscriber.try_recv_sample() {
+            Ok(sample) => {
+                received += 1;
+                last = Some(sample.to_owned());
+            }
+            Err(RecvError::Lagged(n)) => lost += n,
+            Err(RecvError::Empty) => break,
+            Err(other) => panic!("{other}"),
+        }
+    }
+    assert_eq!(received + lost, 16, "{received} received, {lost} lost");
+    assert!(lost > 0);
+    assert_eq!(last, Some(pattern(15, SLOT)));
+}
+
+#[test]
+fn a_dropped_sample_lets_go_of_its_slot() {
+    let publisher = Publisher::<Bytes>::new(&pooled(1, 1, 1)).unwrap();
+    let mut subscriber = subscribe(&publisher);
+    let slot = lend(&publisher, &[3; 8]);
+    drop(subscriber.try_recv_sample().unwrap());
+    // Read by everyone and published last: the same slot, once nothing pins it.
+    assert_eq!(publisher.loan_slice(8).unwrap().slot(), slot);
+}
+
+#[test]
+fn a_sample_is_waited_for_until_a_value_a_bound_or_the_end() {
+    let publisher = Publisher::<Bytes>::new(&pooled(1, 1, 1)).unwrap();
+    let mut subscriber = subscribe(&publisher);
+    let bound = std::time::Duration::from_millis(20);
+    assert_eq!(
+        subscriber.recv_sample_timeout(bound).err(),
+        Some(RecvError::Timeout)
+    );
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            lend(&publisher, &pattern(1, 64));
+        });
+        let sample = subscriber.recv_sample().unwrap();
+        assert_eq!(sample.to_owned(), pattern(1, 64));
+    });
+    publisher.close(&Status::from(ExceptionCode::None));
+    assert_eq!(
+        subscriber.recv_sample().err(),
+        Some(RecvError::Closed(crate::Closed::End))
+    );
+}
+
 /// A subscription made by hand, so that the test holds its control page and pin word.
 fn pinning(publisher: &Publisher<Bytes>) -> (ControlPage, LoadedPool) {
     let (fd, page) = ControlPage::create(MAX_PINS).unwrap();

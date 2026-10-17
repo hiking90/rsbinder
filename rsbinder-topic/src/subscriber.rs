@@ -39,13 +39,13 @@ use crate::connect::{refuse, status_of, Asking, Token};
 use crate::layout::{self, ControlPage, Loaded, LoadedPool, CLOSED, HEADER_OFFSET, VERSION};
 use crate::link::DeathLink;
 use crate::pool::{PoolReader, MAX_PINS};
-use crate::receive::TypedReader;
+use crate::receive::{Held, TypedReader};
 use crate::ring::{self, Loads, Reader};
 #[cfg(feature = "tokio")]
 use crate::wait::{on_pool, Leftover};
 use crate::wait::{Died, Local, Parts, Slept, Words, ABANDON, DIED, INTERRUPT};
 use crate::wake::{self, FdWake};
-use crate::{poll, Closed, Payload, RecvError, SubscriberStats};
+use crate::{poll, Bytes, Closed, Payload, RecvError, Sample, SubscriberStats};
 
 /// Where a subscription starts reading.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -464,6 +464,16 @@ impl<T: Payload> Subscriber<T> {
 
     /// A receive that waits until `deadline`, or without a bound.
     pub(crate) fn wait(&mut self, deadline: Option<Instant>, latest: bool) -> Result<T, RecvError> {
+        self.wait_with(deadline, |subscriber| subscriber.look(latest))
+    }
+
+    /// Wait until `look` finds something other than [`RecvError::Empty`], or `deadline` passes.
+    /// What `look` returns holds no borrow of the subscriber, so the loop can go round.
+    fn wait_with<V>(
+        &mut self,
+        deadline: Option<Instant>,
+        mut look: impl FnMut(&mut Self) -> Result<V, RecvError>,
+    ) -> Result<V, RecvError> {
         #[cfg(feature = "tokio")]
         {
             #[cfg(test)]
@@ -485,7 +495,7 @@ impl<T: Payload> Subscriber<T> {
         // After a wake, look without spinning: the publisher has just committed or a bit is up.
         let mut woke = false;
         loop {
-            match self.look(latest) {
+            match look(self) {
                 Err(RecvError::Empty) => {}
                 other => return other,
             }
@@ -529,7 +539,7 @@ impl<T: Payload> Subscriber<T> {
         found
     }
 
-    fn settle(&mut self, received: Result<T, RecvError>, died: bool) -> Result<T, RecvError> {
+    fn settle<V>(&mut self, received: Result<V, RecvError>, died: bool) -> Result<V, RecvError> {
         let page = &self.control.0;
         page.read().store(self.reader.position(), Ordering::Relaxed);
         page.lost().store(self.reader.lost(), Ordering::Relaxed);
@@ -565,6 +575,41 @@ impl<T: Payload> Subscriber<T> {
     ))]
     pub(crate) fn leftover(&self) -> &Arc<Leftover> {
         &self.leftover
+    }
+}
+
+impl Subscriber<Bytes> {
+    /// The next value where it lies, without waiting: [`try_recv`](Self::try_recv) with no copy
+    /// of a value the publisher lent ([`Publisher::loan_slice`](crate::Publisher::loan_slice)).
+    ///
+    /// The [`Sample`] pins the value's slot until it is dropped, and borrows the subscriber, so
+    /// nothing else is received meanwhile. A value that came through the ring is returned in
+    /// the subscriber's buffer. The errors are `try_recv`'s; a lent slot the publisher took back
+    /// before this call pinned it is a loss of one record, [`RecvError::Lagged`]`(1)`.
+    pub fn try_recv_sample(&mut self) -> Result<Sample<'_>, RecvError> {
+        let held = self.look_held()?;
+        Ok(self.reader.sample(held))
+    }
+
+    /// The next value where it lies, waiting for one: [`try_recv_sample`](Self::try_recv_sample)
+    /// after the wait [`recv`](Self::recv) makes.
+    pub fn recv_sample(&mut self) -> Result<Sample<'_>, RecvError> {
+        let held = self.wait_with(None, Self::look_held)?;
+        Ok(self.reader.sample(held))
+    }
+
+    /// [`recv_sample`](Self::recv_sample) with a bound: [`RecvError::Timeout`] once `timeout`
+    /// passes with no record unread.
+    pub fn recv_sample_timeout(&mut self, timeout: Duration) -> Result<Sample<'_>, RecvError> {
+        let deadline = Instant::now().checked_add(timeout);
+        let held = self.wait_with(deadline, Self::look_held)?;
+        Ok(self.reader.sample(held))
+    }
+
+    fn look_held(&mut self) -> Result<Held, RecvError> {
+        let died = self.local.died();
+        let held = self.reader.take_held();
+        self.settle(held, died)
     }
 }
 

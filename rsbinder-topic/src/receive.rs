@@ -10,7 +10,7 @@ use rsbinder::{Status, StatusCode};
 
 use crate::pool::{PoolReader, Unpinned};
 use crate::ring::{Corrupted, Loads, Reader, Taken};
-use crate::{end, Payload, Record};
+use crate::{end, Payload, Record, Sample};
 
 /// Why a receive returned no value.
 ///
@@ -160,20 +160,60 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
             self.reader.try_recv()
         };
         let loan = match taken {
+            Ok(Taken::Item { mut record, .. }) => {
+                return T::decode(&mut record).map_err(RecvError::Decode)
+            }
             Ok(Taken::Loan { loan, .. }) => loan,
-            other => return typed(other),
+            other => return Err(not_a_value(other)),
         };
         let copied = match &self.pool {
             Some(pool) => pool.copy(loan, &mut self.loaned),
-            None => Err(Unpinned::Corrupted(
-                "a loan from a publisher without a pool",
-            )),
+            None => Err(NO_POOL),
         };
-        match copied {
-            Ok(()) => {
-                let len = self.loaned.len();
-                T::decode(&mut Record::new(&mut self.loaned, len)).map_err(RecvError::Decode)
+        self.loaned(copied)?;
+        let len = self.loaned.len();
+        T::decode(&mut Record::new(&mut self.loaned, len)).map_err(RecvError::Decode)
+    }
+
+    /// The next value where it lies, the ring's buffer or a slot this call pins, without waiting.
+    pub(crate) fn take_held(&mut self) -> Result<Held, RecvError> {
+        if self.corrupted {
+            return Err(RecvError::Closed(Closed::Corrupted));
+        }
+        let loan = match self.reader.try_recv() {
+            Ok(Taken::Item { record, .. }) => {
+                let len = record.bytes().len();
+                return Ok(Held::Ring { len });
             }
+            Ok(Taken::Loan { loan, .. }) => loan,
+            other => return Err(not_a_value(other)),
+        };
+        let pinned = match &self.pool {
+            Some(pool) => pool.pin(loan),
+            None => Err(NO_POOL),
+        };
+        self.loaned(pinned)?;
+        Ok(Held::Slot {
+            slot: loan.slot,
+            len: loan.len as usize,
+        })
+    }
+
+    /// The sample of what [`take_held`](Self::take_held) returned last.
+    pub(crate) fn sample(&self, held: Held) -> Sample<'_> {
+        match held {
+            Held::Ring { len } => Sample::ring(self.reader.held(len)),
+            Held::Slot { slot, len } => {
+                let pool = self.pool.as_ref().expect("a pinned slot is the pool's");
+                Sample::slot(pool, slot, len)
+            }
+        }
+    }
+
+    /// What a pin of a loan's slot, or a copy of it, reports.
+    fn loaned(&mut self, done: Result<(), Unpinned>) -> Result<(), RecvError> {
+        match done {
+            Ok(()) => Ok(()),
             Err(Unpinned::Lost) => {
                 self.lost_loans += 1;
                 Err(RecvError::Lagged(1))
@@ -212,17 +252,30 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
     }
 }
 
-fn typed<T: Payload>(taken: Result<Taken<'_>, Corrupted>) -> Result<T, RecvError> {
+/// Where a value taken by [`TypedReader::take_held`] lies.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Held {
+    /// The ring reader's buffer, `len` bytes of it.
+    Ring { len: usize },
+    /// A slot of the pool, pinned.
+    Slot { slot: u32, len: usize },
+}
+
+const NO_POOL: Unpinned = Unpinned::Corrupted("a loan from a publisher without a pool");
+
+/// What a receive reports for a record that holds no value.
+fn not_a_value(taken: Result<Taken<'_>, Corrupted>) -> RecvError {
     match taken {
-        Ok(Taken::Item { mut record, .. }) => T::decode(&mut record).map_err(RecvError::Decode),
-        Ok(Taken::End { payload }) => Err(RecvError::Closed(match end::status(payload) {
+        Ok(Taken::End { payload }) => RecvError::Closed(match end::status(payload) {
             Some(status) if status.is_ok() => Closed::End,
             Some(status) => Closed::Status(status),
             None => Closed::Corrupted,
-        })),
-        Ok(Taken::Empty) => Err(RecvError::Empty),
-        Ok(Taken::Lagged(records)) => Err(RecvError::Lagged(records)),
-        // `TypedReader::typed` takes a loan before it gets here.
-        Ok(Taken::Loan { .. }) | Err(Corrupted(_)) => Err(RecvError::Closed(Closed::Corrupted)),
+        }),
+        Ok(Taken::Empty) => RecvError::Empty,
+        Ok(Taken::Lagged(records)) => RecvError::Lagged(records),
+        // The callers take items and loans before they get here.
+        Ok(Taken::Item { .. } | Taken::Loan { .. }) | Err(Corrupted(_)) => {
+            RecvError::Closed(Closed::Corrupted)
+        }
     }
 }

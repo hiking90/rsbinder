@@ -1,8 +1,7 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! One publisher and many subscribers over kernel binder (plan 15). **Experimental, and not
-//! complete: no loaned samples yet.**
+//! One publisher and many subscribers over kernel binder (plan 15). **Experimental.**
 //!
 //! A topic carries records from one publisher to any number of subscribers. A binder call sets
 //! a subscription up; after it the records travel through shared memory and no binder
@@ -20,6 +19,12 @@
 //! publish encodes one value into one record, and each receive decodes one record or says why
 //! it returned none ([`RecvError`]): nothing was unread, records were lost, one failed to decode,
 //! or the topic ended.
+//!
+//! A value too large to copy twice goes through a pool instead ([`PoolPolicy`]): the publisher
+//! writes it straight into a slot of a second memfd ([`Publisher::loan_slice`], [`LoanMut`]) and
+//! the ring carries only a record that names the slot. A [`Bytes`] subscriber receives it as any
+//! other value, or where it lies with [`Subscriber::recv_sample`]: the [`Sample`] pins the slot,
+//! and the publisher lends no pinned slot.
 //!
 //! A receive may wait for a record ([`Subscriber::recv`], `recv_timeout`, `recv_latest`, and
 //! `recv_async` with the `tokio` feature). A waiting subscriber sleeps on a futex word in the
@@ -91,6 +96,7 @@ mod publisher;
 mod receive;
 mod resolve;
 mod ring;
+mod sample;
 mod stats;
 mod subscriber;
 mod wait;
@@ -103,6 +109,7 @@ pub use publish::{Authorize, PoolPolicy, PublishError, PublisherPolicy};
 pub use publisher::{Acceptor, LoanMut, Publisher};
 pub use receive::{Closed, Disconnected, RecvError};
 pub use resolve::{Resolver, ServiceManager, Watch};
+pub use sample::Sample;
 pub use stats::{PublisherStats, SubscriberInfo, SubscriberStats};
 pub use subscriber::{Interrupter, Start, Subscriber, SubscriberPolicy, Wake};
 
