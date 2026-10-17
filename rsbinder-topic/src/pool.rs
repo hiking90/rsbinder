@@ -51,21 +51,29 @@
 //! A slot that every subscriber has read past (the `read` its control page reports is at or above
 //! the end of the slot's `LOAN` record) is needed by none of them; of those, the one published
 //! last is lent first, so that a pool larger than the cache keeps reusing the slots still in it
-//! (plan 15 §8.4, "P3-0"). With none, the oldest is lent, which keeps the newest values longest.
+//! (plan 15 §8.4, "P3-0"). With none, the oldest is lent, which keeps the newest values longest;
+//! a lossless pool (below) waits instead.
 //! A `read` is the subscriber's to write: a wrong one only changes which slot is lent, and the
 //! generation check still decides what a subscriber reads, so it costs that subscriber values.
 //!
 //! # How far behind a subscriber may fall
 //!
 //! Each publish takes back the values older than the newest `depth`: their generation goes odd,
-//! and a subscriber that reaches their `LOAN` records loses them, without a copy. A subscriber more than `depth` values behind thus skips to the newest `depth`, as one
-//! behind the ring skips to what the ring still holds. The slots kept for pins would otherwise
-//! hold older values whenever no pin is on them, and a subscriber that cannot keep up would read
-//! values as old as the pool is deep (plan 15 §8.4, "P3-4").
+//! and a subscriber that reaches their `LOAN` records loses them, without a copy. A subscriber
+//! more than `depth` values behind thus skips to the newest `depth`, as one behind the ring
+//! skips to what the ring still holds. The slots kept for pins would otherwise hold older values
+//! whenever no pin is on them, and a subscriber that cannot keep up would read values as old as
+//! the pool is deep (plan 15 §8.4, "P3-4").
 //!
 //! With `slots >= max_subscribers × MAX_PINS + 1 + depth + max_loans` the publisher always finds
 //! a slot: pins hold at most `max_subscribers` of them, values kept `depth`, and loans not yet
 //! published `max_loans`.
+//!
+//! A pool of a topic with backpressure is lossless: nothing is taken back, and only a slot that
+//! every subscriber waited for has read past is lent. With none, the lend waits
+//! (`backpressure.rs`); a subscriber can fall at least `depth + 1` values behind before a lend
+//! waits for it. Taking a subscriber out of the wait leaves its pin in place, so the slot it
+//! holds stays its own.
 
 #[cfg(loom)]
 use loom::sync::atomic::fence;
@@ -145,7 +153,8 @@ pub(crate) trait Pin {
 pub(crate) enum LendError {
     /// As many loans as the policy allows are held and not published.
     TooMany,
-    /// Every slot not lent is pinned: more pins than the pool was made for.
+    /// Every slot not lent is pinned, which is more pins than the pool was made for, or, in a
+    /// lossless pool, pinned or not read past yet, which a wait for room waits out.
     NoSlot,
 }
 
@@ -166,6 +175,8 @@ pub(crate) struct Slots {
     max_loans: usize,
     /// Published values that stay readable, at least the newest.
     depth: usize,
+    /// Backpressure (plan 15 §6.5): only a slot read past is lent, and no value is taken back.
+    lossless: bool,
     /// The slots one `lend` has tried, as flags and in order, and the slots the pin words named;
     /// kept to spare allocations per loan.
     tried: Vec<bool>,
@@ -175,14 +186,15 @@ pub(crate) struct Slots {
 
 impl Slots {
     /// A pool of `count` slots, all of generation 0, which keeps the newest `depth` values and
-    /// lends `max_loans` slots at once.
-    pub(crate) fn new(count: u32, depth: usize, max_loans: usize) -> Self {
+    /// lends `max_loans` slots at once; `lossless`, every value until every subscriber reads it.
+    pub(crate) fn new(count: u32, depth: usize, max_loans: usize, lossless: bool) -> Self {
         let count = count as usize;
         Self {
             slots: vec![Slot::default(); count],
             lent: 0,
             max_loans,
             depth: depth.max(1),
+            lossless,
             tried: vec![false; count],
             order: Vec::with_capacity(count),
             pinned: Vec::new(),
@@ -230,7 +242,8 @@ impl Slots {
         Err(LendError::NoSlot)
     }
 
-    /// The slot to try next: of those read by every subscriber the newest, else the oldest.
+    /// The slot to try next: of those read by every subscriber the newest, else the oldest, or
+    /// none for a lossless pool.
     fn candidate(&self, read: u64) -> Option<usize> {
         let mut newest_read: Option<(usize, u64)> = None;
         let mut oldest: Option<(usize, u64)> = None;
@@ -244,7 +257,7 @@ impl Slots {
                 if newest_read.is_none_or(|(_, end)| slot.end > end) {
                     newest_read = Some((at, slot.end));
                 }
-            } else if oldest.is_none_or(|(_, end)| slot.end < end) {
+            } else if !self.lossless && oldest.is_none_or(|(_, end)| slot.end < end) {
                 oldest = Some((at, slot.end));
             }
         }
@@ -263,7 +276,9 @@ impl Slots {
         entry.lent = false;
         let generation = entry.generation;
         self.lent -= 1;
-        self.retire(generations);
+        if !self.lossless {
+            self.retire(generations);
+        }
         generation
     }
 

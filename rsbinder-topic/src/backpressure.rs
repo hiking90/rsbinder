@@ -10,6 +10,10 @@
 //! [`MAX_NAP`] and back to [`MIN_NAP`] whenever a subscriber reads on. A subscriber stores its
 //! `read` with `Release` once it has copied the record, and the publisher loads it with `Acquire`,
 //! so the record's bytes are read before they are written over.
+//!
+//! A lend from the topic's pool waits the same way, for a slot that every subscription has read
+//! past and none pins (`pool.rs`), and past the timeout takes out the subscriptions furthest
+//! behind, one at a time, until there is one.
 
 use std::time::{Duration, Instant};
 
@@ -27,9 +31,11 @@ use rsbinder::fmq::shm::spin::{spin_until, SPIN};
 pub struct Backpressure {
     /// The longest a publish waits for room, from when it holds the topic's lock. Default 1 s.
     ///
-    /// Once it passes the record is written anyway, and the subscribers in the way lose the
-    /// records it writes over, as on a topic without backpressure. A `timeout` past what an
-    /// `Instant` holds waits without one.
+    /// Once it passes, the subscriptions in the way are taken out and the publish goes on: each
+    /// subscriber is told, its receives return
+    /// [`Closed::Evicted`](crate::Closed::Evicted), and the publisher logs it and counts it in
+    /// [`PublisherStats::evicted`](crate::PublisherStats::evicted). A `timeout` of zero takes
+    /// them out at once; one past what an `Instant` holds waits without a bound.
     pub timeout: Duration,
 }
 
@@ -65,23 +71,32 @@ pub(crate) enum Room {
 
 /// Wait until `readers` have read up to `need`, or `deadline` passes; `None` waits without one.
 pub(crate) fn wait_for(readers: &impl Readers, need: u64, deadline: Option<Instant>) -> Room {
-    let made = || readers.lowest_read() >= need;
+    wait_until(readers, || readers.lowest_read() >= need, deadline)
+}
+
+/// Wait until `made` holds, or `deadline` passes: a pool's wait for a slot, which a pin let go
+/// frees as well as a read. Each rise of `readers`' lowest read starts the sleeps over.
+pub(crate) fn wait_until(
+    readers: &impl Readers,
+    mut made: impl FnMut() -> bool,
+    deadline: Option<Instant>,
+) -> Room {
     if made() {
         return Room::Made;
     }
     if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
         return Room::TimedOut;
     }
-    if spin_until(SPIN, made).0 {
+    if spin_until(SPIN, &mut made).0 {
         return Room::Made;
     }
     let mut nap = MIN_NAP;
     let mut seen = readers.lowest_read();
     loop {
-        let read = readers.lowest_read();
-        if read >= need {
+        if made() {
             return Room::Made;
         }
+        let read = readers.lowest_read();
         if read > seen {
             seen = read;
             nap = MIN_NAP;

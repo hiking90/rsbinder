@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use crate::layout::MIN_RING;
 use crate::{
-    Backpressure, Bytes, Closed, Publisher, PublisherPolicy, RecvError, Subscriber,
-    SubscriberPolicy, Wake,
+    Backpressure, Bytes, Closed, PoolPolicy, Publisher, PublisherPolicy, RecvError, Subscriber,
+    SubscriberPolicy, Trusted, Wake,
 };
 
 const SPAN: Duration = Duration::from_secs(10);
@@ -40,14 +40,39 @@ fn value(n: u32) -> Bytes {
     Bytes(bytes)
 }
 
+/// The number `value` put in `bytes`.
+fn number(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes(bytes[..4].try_into().unwrap())
+}
+
 /// Receive `count` values, sleeping a pseudo-random while of up to `pause` after each; the
 /// numbers they carry.
-fn receive(mut subscriber: Subscriber<Bytes>, count: u32, pause: Duration, seed: u32) -> Vec<u32> {
+fn receive(subscriber: Subscriber<Bytes>, count: u32, pause: Duration, seed: u32) -> Vec<u32> {
+    receive_as(subscriber, count, pause, seed, false)
+}
+
+/// [`receive`], each value as a sample where it lies with `samples`.
+fn receive_as(
+    mut subscriber: Subscriber<Bytes>,
+    count: u32,
+    pause: Duration,
+    seed: u32,
+    samples: bool,
+) -> Vec<u32> {
     let mut got = Vec::new();
     let mut state = seed | 1;
     while got.len() < count as usize {
-        match subscriber.recv_timeout(SPAN) {
-            Ok(Bytes(bytes)) => got.push(u32::from_le_bytes(bytes[..4].try_into().unwrap())),
+        let received = if samples {
+            subscriber
+                .recv_sample_timeout(SPAN)
+                .map(|sample| number(&sample.to_owned()))
+        } else {
+            subscriber
+                .recv_timeout(SPAN)
+                .map(|Bytes(bytes)| number(&bytes))
+        };
+        match received {
+            Ok(n) => got.push(n),
             Err(error) => panic!("after {} values: {error:?}", got.len()),
         }
         state ^= state << 13;
@@ -248,4 +273,166 @@ fn a_wait_ends_when_the_subscriber_it_waits_for_drops_its_subscription() {
     let took = began.elapsed();
     assert!(took >= Duration::from_millis(200), "none waited: {took:?}");
     assert!(took < timeout - Duration::from_secs(2), "{took:?}");
+}
+
+const SLOT: usize = 4096;
+
+/// A topic of `max_subscribers` with the smallest ring and a pool of `max_subscribers + 3` slots
+/// (a depth of 1, one loan), which waits up to `timeout`.
+fn pooled(max_subscribers: usize, timeout: Duration) -> Publisher<Bytes> {
+    Publisher::new(&PublisherPolicy {
+        ring_bytes: MIN_RING,
+        max_subscribers,
+        max_per_uid: max_subscribers,
+        pool: Some(PoolPolicy {
+            slot_bytes: SLOT,
+            depth: 1,
+            max_loans: 1,
+            huge_pages: false,
+        }),
+        backpressure: Some(Backpressure { timeout }),
+        ..PublisherPolicy::default()
+    })
+    .unwrap()
+}
+
+/// Lend a slot, write `value(n)` into it and publish it; the slot's number.
+fn lend(publisher: &Publisher<Bytes>, n: u32) -> u32 {
+    let Bytes(bytes) = value(n);
+    let mut loan = publisher.loan_slice(bytes.len()).unwrap();
+    loan.copy_from_slice(&bytes);
+    let slot = loan.slot();
+    loan.publish().unwrap();
+    slot
+}
+
+/// AC-15.3.8 (loan): four subscribers, two woken by the futex and two by their fds, two copying
+/// each value out and two reading it where it lies, receive every one of values that go round a
+/// pool of seven slots many times.
+#[test]
+fn every_loaned_value_reaches_every_subscriber_however_often_the_pool_goes_round() {
+    const VALUES: u32 = 2000;
+    let publisher = pooled(4, SPAN);
+    let wakes = [Wake::Futex, Wake::Fd, Wake::Futex, Wake::Fd];
+    let subscribers: Vec<_> = wakes.map(|wake| subscribe(&publisher, wake)).into();
+    thread::scope(|scope| {
+        let receiving: Vec<_> = subscribers
+            .into_iter()
+            .enumerate()
+            .map(|(n, subscriber)| {
+                let pause = Duration::from_micros(200);
+                let seed = n as u32 + 11;
+                scope.spawn(move || receive_as(subscriber, VALUES, pause, seed, n >= 2))
+            })
+            .collect();
+        for n in 0..VALUES {
+            lend(&publisher, n);
+        }
+        for receiving in receiving {
+            assert_eq!(receiving.join().unwrap(), (0..VALUES).collect::<Vec<_>>());
+        }
+    });
+    let stats = publisher.stats();
+    assert_eq!((stats.published, stats.evicted), (u64::from(VALUES), 0));
+}
+
+/// AC-15.3.15 (pool): a lend waits for a pin as well as for a read. The one slot read past is
+/// pinned; the wait ends when the sample lets go of it, though the subscriber reads no further.
+#[test]
+fn a_lend_waits_for_a_pin_to_let_go_of_the_one_slot_read_past() {
+    let timeout = Duration::from_secs(5);
+    let publisher = pooled(1, timeout);
+    let mut subscriber = subscribe(&publisher, Wake::Futex);
+    // Four slots: the first value held as a sample, three nobody has read.
+    let first = lend(&publisher, 0);
+    let (held, release) = std::sync::mpsc::channel();
+    let began = thread::scope(|scope| {
+        // Returned, so that the subscription lives on past the sample, still waited for.
+        let holding = scope.spawn(move || {
+            let sample = subscriber.recv_sample_timeout(SPAN).unwrap();
+            held.send(()).unwrap();
+            thread::sleep(Duration::from_millis(200));
+            drop(sample);
+            subscriber
+        });
+        release.recv().unwrap();
+        for n in 1..4 {
+            lend(&publisher, n);
+        }
+        let began = Instant::now();
+        assert_eq!(lend(&publisher, 4), first, "the slot the sample let go of");
+        let subscriber = holding.join().unwrap();
+        assert_eq!(subscriber.stats().received, 1);
+        began
+    });
+    let took = began.elapsed();
+    assert!(took >= Duration::from_millis(100), "none waited: {took:?}");
+    assert!(took < timeout - Duration::from_secs(2), "{took:?}");
+    assert_eq!(publisher.stats().evicted, 0);
+}
+
+/// AC-15.3.15 (pool): past the timeout a lend takes out the subscriber furthest behind, and no
+/// more once a slot is read past: the one that read two values stays and loses none.
+#[test]
+fn a_lend_past_the_timeout_takes_out_only_the_subscriber_furthest_behind() {
+    let timeout = Duration::from_millis(100);
+    let publisher = pooled(2, timeout);
+    let mut idle = subscribe(&publisher, Wake::Futex);
+    let mut reader = subscribe(&publisher, Wake::Futex);
+    for n in 0..5 {
+        lend(&publisher, n);
+    }
+    assert_eq!(reader.try_recv(), Ok(value(0)));
+    assert_eq!(reader.try_recv(), Ok(value(1)));
+    let began = Instant::now();
+    lend(&publisher, 5);
+    let took = began.elapsed();
+    assert!(took >= timeout, "{took:?}");
+    assert!(took < timeout + Duration::from_secs(1), "{took:?}");
+    let stats = publisher.stats();
+    assert_eq!(stats.evicted, 1);
+    let flags: Vec<bool> = stats.subscribers.iter().map(|info| info.evicted).collect();
+    assert_eq!(flags, [true, false]);
+    for n in 2..6 {
+        assert_eq!(reader.try_recv(), Ok(value(n)));
+    }
+    assert_eq!(reader.stats().lost, 0);
+    assert_eq!(idle.try_recv(), Err(RecvError::Closed(Closed::Evicted)));
+}
+
+/// AC-15.3.10: a subscriber taken out keeps the slot of the sample it holds until it lets go.
+/// Once the lend takes out the subscriber furthest behind, the only slots read past are its
+/// sample's and the other subscriber's, both pinned: a lend that passed over the pin of a
+/// subscriber taken out would choose the first, the newer of the two read past.
+#[test]
+fn a_sample_held_by_a_subscriber_taken_out_keeps_its_slot() {
+    let timeout = Duration::from_millis(100);
+    let publisher = pooled(2, timeout);
+    let subscribe_trusted = |publisher: &Publisher<Bytes>| -> Subscriber<Bytes, Trusted> {
+        // SAFETY: the publisher is this crate's, in this process.
+        unsafe { subscribe(publisher, Wake::Futex).trust_publisher() }
+    };
+    let mut first = subscribe_trusted(&publisher);
+    let mut second = subscribe_trusted(&publisher);
+    let a = lend(&publisher, 0);
+    let held = first.try_recv_sample().unwrap();
+    assert_eq!(second.try_recv(), Ok(value(0)));
+    let b = lend(&publisher, 1);
+    let also = second.try_recv_sample().unwrap();
+    // Three slots nobody has read past.
+    for n in 2..5 {
+        lend(&publisher, n);
+    }
+    let began = Instant::now();
+    let slot = lend(&publisher, 5);
+    let took = began.elapsed();
+    assert!(took >= timeout, "{took:?}");
+    assert!(![a, b].contains(&slot), "slot {slot}, pinned");
+    assert_eq!(publisher.stats().evicted, 2);
+    assert_eq!(&*held, &value(0).0[..]);
+    assert_eq!(&*also, &value(1).0[..]);
+    drop((held, also));
+    let evicted = Err(RecvError::Closed(Closed::Evicted));
+    assert_eq!(first.try_recv(), evicted);
+    assert_eq!(second.try_recv(), evicted);
 }

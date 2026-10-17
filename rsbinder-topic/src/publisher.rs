@@ -219,8 +219,12 @@ impl Publisher<Bytes> {
     ///
     /// The slot holds whatever it held before: write all `len` bytes. A subscriber receives the
     /// value as it receives a [`Bytes`] published with [`publish`](Self::publish), and the two
-    /// mix on one topic. Taking a loan takes the topic's lock once, briefly; nothing waits for a
-    /// subscriber.
+    /// mix on one topic. Taking a loan takes the topic's lock once.
+    ///
+    /// Without [`PublisherPolicy::backpressure`] nothing waits for a subscriber. With it, the
+    /// loan waits for a slot that every subscriber has read past and no [`Sample`](crate::Sample)
+    /// holds, and past the timeout takes out the subscribers furthest behind, one at a time,
+    /// until there is one; a sample that a subscriber taken out holds keeps its slot.
     ///
     /// [`PublishError::NoPool`] for a topic made without [`PublisherPolicy::pool`],
     /// [`PublishError::TooLarge`] past [`PoolPolicy::slot_bytes`](crate::PoolPolicy::slot_bytes),

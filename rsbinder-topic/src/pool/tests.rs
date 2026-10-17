@@ -84,7 +84,7 @@ fn a_loan_record_reads_back_and_another_length_is_none() {
 #[test]
 fn a_lend_makes_the_generation_odd_and_a_publish_even_with_release() {
     let memory = Fake::new(3);
-    let mut slots = Slots::new(3, 3, 1);
+    let mut slots = Slots::new(3, 3, 1, false);
     let slot = slots.lend(&memory, &memory, 0).expect("a slot");
     assert_eq!(memory.load_generation(slot), 1);
     assert_eq!(slots.publish(&memory, slot, 24), 2);
@@ -97,7 +97,7 @@ fn a_lend_makes_the_generation_odd_and_a_publish_even_with_release() {
 #[test]
 fn the_slot_read_by_everyone_and_published_last_is_lent_first() {
     let memory = Fake::new(4);
-    let mut slots = Slots::new(4, 4, 1);
+    let mut slots = Slots::new(4, 4, 1, false);
     // Nobody has read anything: the free slots, then the oldest values.
     let a = put(&mut slots, &memory, 0, 24);
     let b = put(&mut slots, &memory, 0, 48);
@@ -119,7 +119,7 @@ fn the_slot_read_by_everyone_and_published_last_is_lent_first() {
 #[test]
 fn a_pinned_slot_is_passed_over_and_left_odd() {
     let memory = Fake::new(3);
-    let mut slots = Slots::new(3, 3, 1);
+    let mut slots = Slots::new(3, 3, 1, false);
     let a = put(&mut slots, &memory, 0, 24);
     let b = put(&mut slots, &memory, 0, 48);
     memory.pinned.borrow_mut().push(b);
@@ -139,7 +139,7 @@ fn a_pinned_slot_is_passed_over_and_left_odd() {
 #[test]
 fn values_past_the_depth_are_taken_back_oldest_first() {
     let memory = Fake::new(3);
-    let mut slots = Slots::new(3, 2, 1);
+    let mut slots = Slots::new(3, 2, 1, false);
     let a = put(&mut slots, &memory, 0, 24);
     let b = put(&mut slots, &memory, 0, 48);
     assert_eq!([a, b].map(|slot| memory.load_generation(slot)), [2, 2]);
@@ -168,7 +168,7 @@ fn values_past_the_depth_are_taken_back_oldest_first() {
     assert_eq!(memory.stores.borrow().len(), stores);
 
     let memory = Fake::new(2);
-    let mut slots = Slots::new(2, 0, 1);
+    let mut slots = Slots::new(2, 0, 1, false);
     let a = put(&mut slots, &memory, 0, 24);
     let b = put(&mut slots, &memory, 0, 48);
     let generations = [a, b].map(|slot| memory.load_generation(slot));
@@ -176,9 +176,30 @@ fn values_past_the_depth_are_taken_back_oldest_first() {
 }
 
 #[test]
+fn a_lossless_pool_lends_only_a_slot_read_past_and_takes_nothing_back() {
+    let memory = Fake::new(3);
+    let mut slots = Slots::new(3, 1, 1, true);
+    let a = put(&mut slots, &memory, 0, 24);
+    let b = put(&mut slots, &memory, 0, 48);
+    let c = put(&mut slots, &memory, 0, 72);
+    assert_eq!([a, b, c].map(|slot| memory.load_generation(slot)), [2; 3]);
+    // Nothing read: no slot, and none tried, so every value stays readable.
+    let stores = memory.stores.borrow().len();
+    assert_eq!(slots.lend(&memory, &memory, 0), Err(LendError::NoSlot));
+    assert_eq!(memory.stores.borrow().len(), stores);
+    assert_eq!(slots.lent(), 0);
+    // Read up to 48: the newer of `a` and `b`, and `c` still unread is left alone.
+    assert_eq!(slots.lend(&memory, &memory, 48), Ok(b));
+    slots.publish(&memory, b, 96);
+    assert_eq!(memory.load_generation(c), 2);
+    memory.pinned.borrow_mut().push(a);
+    assert_eq!(slots.lend(&memory, &memory, 48), Err(LendError::NoSlot));
+}
+
+#[test]
 fn loans_past_the_policys_bound_are_refused_and_a_given_back_slot_is_free() {
     let memory = Fake::new(4);
-    let mut slots = Slots::new(4, 4, 2);
+    let mut slots = Slots::new(4, 4, 2, false);
     let a = slots.lend(&memory, &memory, 0).expect("a slot");
     let b = slots.lend(&memory, &memory, 0).expect("a slot");
     assert_ne!(a, b);
@@ -193,7 +214,7 @@ fn loans_past_the_policys_bound_are_refused_and_a_given_back_slot_is_free() {
 #[test]
 fn a_pin_that_moves_during_a_lend_holds_one_slot_only() {
     let memory = Fake::new(2);
-    let mut slots = Slots::new(2, 2, 1);
+    let mut slots = Slots::new(2, 2, 1, false);
     let a = put(&mut slots, &memory, u64::MAX, 24);
     // One pin word, on `a` when `a` is tried and on the other slot when that one is.
     memory.moving.borrow_mut().extend([vec![a], vec![1 - a]]);
@@ -204,7 +225,7 @@ fn a_pin_that_moves_during_a_lend_holds_one_slot_only() {
 #[test]
 fn every_open_slot_pinned_is_no_slot() {
     let memory = Fake::new(2);
-    let mut slots = Slots::new(2, 2, 1);
+    let mut slots = Slots::new(2, 2, 1, false);
     memory.pinned.borrow_mut().extend([0, 1]);
     assert_eq!(slots.lend(&memory, &memory, 0), Err(LendError::NoSlot));
     assert_eq!(slots.lent(), 0);
@@ -213,7 +234,7 @@ fn every_open_slot_pinned_is_no_slot() {
 #[test]
 fn a_pin_holds_while_the_generation_matches_and_lets_go_when_it_does_not() {
     let memory = Fake::new(2);
-    let mut slots = Slots::new(2, 2, 1);
+    let mut slots = Slots::new(2, 2, 1, false);
     let slot = put(&mut slots, &memory, 0, 24);
     let loan = Loan {
         slot,

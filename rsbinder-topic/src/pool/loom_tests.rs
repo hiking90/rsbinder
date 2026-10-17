@@ -107,7 +107,7 @@ fn a_pinned_slot_is_read_whole_and_never_written(flaw: Flaw, rounds: u64, read: 
         let publisher = {
             let model = model.clone();
             thread::spawn(move || {
-                let mut slots = Slots::new(SLOTS, 1, 1);
+                let mut slots = Slots::new(SLOTS, 1, 1, false);
                 for round in 1..=rounds {
                     let slot = slots.lend(&*model, &*model, read).expect("a slot");
                     // SAFETY: a lent slot, which no pin holds; loom checks that it is so.

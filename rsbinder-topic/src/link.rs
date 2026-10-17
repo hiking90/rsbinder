@@ -149,6 +149,16 @@ impl Link {
         self.evicted.load(Ordering::Relaxed)
     }
 
+    /// No longer waited for: what to tell the subscriber.
+    fn evict(&self) -> Eviction {
+        self.evicted.store(true, Ordering::Relaxed);
+        Eviction {
+            subscription: self.subscription.clone(),
+            uid: self.uid,
+            pid: self.pid,
+        }
+    }
+
     /// Where the subscriber has read up to, no lower than where it started.
     fn read(&self) -> u64 {
         self.control.read().max(self.start.load(Ordering::Relaxed))
@@ -274,17 +284,14 @@ impl Links {
     /// Take out every subscription waited for that has not read up to `need`: what to tell them.
     pub(crate) fn evict_behind(&self, need: u64) -> Vec<Eviction> {
         let behind = self.waited_for().filter(|link| link.read() < need);
-        let evicted: Vec<Eviction> = behind
-            .map(|link| {
-                link.evicted.store(true, Ordering::Relaxed);
-                Eviction {
-                    subscription: link.subscription.clone(),
-                    uid: link.uid,
-                    pid: link.pid,
-                }
-            })
-            .collect();
-        evicted
+        behind.map(|link| link.evict()).collect()
+    }
+
+    /// Take out the subscription waited for that has read the least, the first of a tie; `None`
+    /// with none left.
+    pub(crate) fn evict_lowest(&self) -> Option<Eviction> {
+        let lowest = self.waited_for().min_by_key(|link| link.read())?;
+        Some(lowest.evict())
     }
 
     /// After the commit that made `seq`: a byte to each socket waiter, once per wait; whether one

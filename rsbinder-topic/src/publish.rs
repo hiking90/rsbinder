@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use rsbinder::fmq::shm::Mapping;
 use rsbinder::{CallingContext, Status, StatusCode};
 
-use crate::backpressure::{wait_for, Room};
+use crate::backpressure::{wait_for, wait_until, Room};
 use crate::layout::{self, LentSlot, Stored, StoredPool, MIN_RING};
 use crate::link::{Eviction, Link, Links};
 use crate::payload::{relabel, Piece};
@@ -71,9 +71,10 @@ pub struct PublisherPolicy {
     /// The pool of slots values are lent from. Default `None`: every value goes through the
     /// ring.
     pub pool: Option<PoolPolicy>,
-    /// Whether a publish waits for its subscribers to read what it would overwrite, and for how
-    /// long. Default `None`: a publish never waits, and a subscriber that falls a ring behind
-    /// loses the records written over ([`RecvError::Lagged`](crate::RecvError::Lagged)).
+    /// Whether a publish waits for its subscribers to read what it would overwrite, and a loan
+    /// for a slot they have read past, and for how long. Default `None`: neither waits, and a
+    /// subscriber that falls more than a ring or [`depth`](PoolPolicy::depth) loans behind loses
+    /// the oldest values ([`RecvError::Lagged`](crate::RecvError::Lagged)).
     ///
     /// The wait holds the topic's lock: subscriptions arriving meanwhile, [`stats`], and other
     /// threads' publishes wait too. It runs on the calling thread; an async caller hands the
@@ -123,6 +124,10 @@ pub struct PoolPolicy {
     /// [`Sample`](crate::Sample) stays its own however old it grows. The slot lent next is one
     /// that every subscriber has read past, the one published last of those, so that a busy pool
     /// reuses the slots still in the cache; with none, the oldest.
+    ///
+    /// With [`PublisherPolicy::backpressure`] no value is taken back: a loan waits instead for a
+    /// slot every subscriber has read past, and a subscriber can fall at least `depth + 1` values
+    /// behind before a loan waits for it.
     pub depth: usize,
     /// Loans held at once and not yet published, past which a loan is refused. Default 1.
     pub max_loans: usize,
@@ -361,6 +366,52 @@ impl<S: Stores> State<S> {
         }
         Ok(())
     }
+
+    /// Lend a slot for `len` bytes. With backpressure the pool lends only a slot no subscription
+    /// waited for still has to read: wait for one, and past the timeout take out the subscriptions
+    /// furthest behind, one at a time, until there is one (plan 15 §6.5).
+    fn lend_slot(&mut self, len: usize) -> Result<LentSlot, LendError> {
+        let Self {
+            links,
+            lending,
+            backpressure,
+            evictions,
+            evicted,
+            ..
+        } = self;
+        let lending = lending.as_mut().expect("a lend asks a topic with a pool");
+        let mut lend = |links: &Links| {
+            let read = links.lowest_read();
+            lending.memory.lend(&mut lending.slots, links, read, len)
+        };
+        let first = lend(links);
+        let (Err(LendError::NoSlot), Some(timeout)) = (&first, *backpressure) else {
+            return first;
+        };
+        let mut lent = None;
+        let deadline = Instant::now().checked_add(timeout);
+        // Only `NoSlot` fails a retry: the loans held change under this lock alone.
+        let made = || {
+            lent = lend(links).ok();
+            lent.is_some()
+        };
+        wait_until(&*links, made, deadline);
+        if let Some(slot) = lent {
+            return Ok(slot);
+        }
+        loop {
+            // With none left, every slot not lent or pinned is one to lend.
+            let Some(out) = links.evict_lowest() else {
+                return lend(links);
+            };
+            *evicted += 1;
+            evictions.push(out);
+            match lend(links) {
+                Err(LendError::NoSlot) => {}
+                other => return other,
+            }
+        }
+    }
 }
 
 /// A topic's writer behind a lock, fed with values of `T`. Any thread may publish.
@@ -390,9 +441,10 @@ impl<T: Payload> TypedWriter<T, Stored<Mapping>> {
             .shape(policy.max_subscribers)
             .ok_or(rsbinder::fmq::Error::BadValue("pool larger than 4 GiB"))?;
         let (pool_fd, memory) = layout::create_pool(slots, slot_bytes, pool.huge_pages)?;
+        let lossless = policy.backpressure.is_some();
         writer.lock().lending = Some(Lending {
             memory,
-            slots: Slots::new(slots, pool.depth, pool.max_loans),
+            slots: Slots::new(slots, pool.depth, pool.max_loans, lossless),
             max_loans: pool.max_loans,
         });
         let pool_fd = PoolFd {
@@ -517,31 +569,22 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
     pub(crate) fn lend(&self, len: usize) -> Result<LentSlot, PublishError> {
         let mut state = self.lock();
         let gone = state.links.prune();
-        let State {
-            writer,
-            links,
-            lending,
-            ..
-        } = &mut *state;
-        let lent = match lending {
-            _ if writer.ended() => Err(PublishError::Closed),
+        let lent = match &state.lending {
+            _ if state.writer.ended() => Err(PublishError::Closed),
             None => Err(PublishError::NoPool),
             Some(lending) if len > lending.memory.slot_bytes() as usize => {
                 let max = lending.memory.slot_bytes() as usize;
                 Err(PublishError::TooLarge { bytes: len, max })
             }
-            Some(lending) => {
-                let read = links.lowest_read();
-                let lent = lending.memory.lend(&mut lending.slots, links, read, len);
-                lent.map_err(|refused| match refused {
-                    LendError::TooMany => PublishError::TooManyLoans {
-                        max: lending.max_loans,
-                    },
-                    // Pins hold one slot per subscription, at most `max_subscribers`.
-                    LendError::NoSlot => unreachable!("a pool has a slot past every pin and loan"),
-                })
-            }
+            Some(lending) => Ok(lending.max_loans),
         };
+        let lent = lent.and_then(|max| {
+            state.lend_slot(len).map_err(|refused| match refused {
+                LendError::TooMany => PublishError::TooManyLoans { max },
+                // Pins hold one slot per subscription, at most `max_subscribers`.
+                LendError::NoSlot => unreachable!("a pool has a slot past every pin and loan"),
+            })
+        });
         self.unlock(state, gone);
         lent
     }

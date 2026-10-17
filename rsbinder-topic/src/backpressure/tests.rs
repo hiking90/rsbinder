@@ -1,7 +1,7 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 
 use super::*;
@@ -56,6 +56,25 @@ fn a_wait_with_no_progress_gives_up_at_its_deadline_and_not_before() {
     let waited = began.elapsed();
     assert!(waited >= timeout, "{waited:?}");
     assert!(waited < timeout + Duration::from_secs(1), "{waited:?}");
+}
+
+#[test]
+fn a_wait_until_ends_on_what_it_waits_for_with_no_read_moving() {
+    let read = Read(AtomicU64::new(0));
+    let freed = AtomicBool::new(false);
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            thread::sleep(Duration::from_millis(20));
+            freed.store(true, Ordering::Release);
+        });
+        let made = || freed.load(Ordering::Acquire);
+        let began = Instant::now();
+        let room = wait_until(&read, made, after(Duration::from_secs(10)));
+        let took = began.elapsed();
+        assert_eq!(room, Room::Made);
+        assert!(took < Duration::from_secs(5), "{took:?}");
+    });
+    assert_eq!(read.0.load(Ordering::Relaxed), 0);
 }
 
 #[test]
