@@ -5,8 +5,8 @@
 //!
 //! A subscription is taken in this order, the steps PUB1–PUB7 of the plan. The application's own
 //! `ITopic`, if it has one, checks the caller (PUB1). [`Acceptor::accept`] then checks the
-//! request, maps the control page, duplicates the topic's fd, makes the socket pair of a
-//! subscription woken through an fd and links to the token's death (PUB2–PUB5), all outside the
+//! request, takes the wake socket of a subscription woken through an fd, maps the control page,
+//! duplicates the topic's fd and links to the token's death (PUB2–PUB5), all outside the
 //! publisher's lock; under it, it takes out the subscriptions that ended, refuses or adds this
 //! one, and reads where it starts (PUB6). Nothing after that can fail on this side (PUB7), so a
 //! subscription in the list is one whose subscriber got the reply or will learn that it did not.
@@ -17,8 +17,7 @@ use std::sync::{Arc, Weak};
 
 use rsbinder::fmq::shm::Mapping;
 use rsbinder::{
-    BinderResult, CallingContext, ExceptionCode, Interface, ParcelFileDescriptor, SIBinder, Status,
-    StatusCode,
+    BinderResult, CallingContext, ExceptionCode, Interface, SIBinder, Status, StatusCode,
 };
 
 use crate::aidl::ITopic::{
@@ -271,7 +270,8 @@ impl Acceptor {
     /// checked first; [`ITopic::ERROR_VERSION`] for another layout version; `BadType` when the
     /// request names another payload type; `BadValue` for a token of this process that came
     /// through binder (its death would say nothing about the caller), a nonzero pin count, a
-    /// `wake` that is neither [`ITopic::WAKE_FUTEX`] nor [`ITopic::WAKE_FD`], or a control page
+    /// `wake` that is neither [`ITopic::WAKE_FUTEX`] nor [`ITopic::WAKE_FD`], a `wakeFd` that is
+    /// not a unix stream socket for `WAKE_FD` or not null for `WAKE_FUTEX`, or a control page
     /// that is not a sealed memfd of the size, magic, version and pin count the request states;
     /// [`ITopic::ERROR_FULL`] when the publisher holds as many subscriptions as its policy allows,
     /// in all or from the caller's uid; [`ITopic::ERROR_CLOSED`] once the publisher is closed or
@@ -336,16 +336,20 @@ impl<T: Payload + 'static> Accept for Shared<T> {
         if token.as_proxy().is_none() && !asked_here(token) {
             return Err(StatusCode::BadValue.into());
         }
+        // The subscriber's socket: sent on with per-call flags only, which it cannot change.
+        let socket = match (request.wake, &request.wakeFd) {
+            (WAKE_FUTEX, None) => None,
+            (WAKE_FD, Some(socket)) if wake::is_stream_socket(socket.as_fd()) => {
+                let socket = socket.as_fd().try_clone_to_owned();
+                let socket = socket.map_err(StatusCode::from)?;
+                wake::limit_send_buffer(&socket).map_err(StatusCode::from)?;
+                Some(socket)
+            }
+            _ => return Err(StatusCode::BadValue.into()),
+        };
         let control = ControlView::map(control.as_fd(), 0).map_err(status_of)?;
         let fd = self.fd.try_clone().map_err(StatusCode::from)?;
         let ring = layout::descriptor(fd, self.capacity).try_into()?;
-        let (socket, wake_fd) = match request.wake {
-            WAKE_FD => {
-                let (ours, theirs) = wake::pair().map_err(StatusCode::from)?;
-                (Some(ours), Some(ParcelFileDescriptor::new(theirs)))
-            }
-            _ => (None, None),
-        };
         let caller = CallingContext::default();
         let uid = caller.uid;
         let list = Arc::downgrade(&self) as Weak<dyn Forget>;
@@ -381,7 +385,6 @@ impl<T: Payload + 'static> Accept for Shared<T> {
             // The bits of the `u64` position and `u32` index; the subscriber reads them back so.
             start: start as i64,
             startIndex: index as i32,
-            wakeFd: wake_fd,
         })
     }
 }

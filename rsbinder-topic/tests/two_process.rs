@@ -402,9 +402,9 @@ fn name_subscribers_on_one_poll_loop_go_on_through_a_killed_publisher() {
     for subscriber in &subscribers {
         assert!(subscriber.wait_connected(WAIT));
     }
-    let fds = |subscribers: &[NamedSubscriber<Bytes>]| -> Vec<[i32; 2]> {
-        let fds = subscribers.iter().map(|s| s.wait_fds().unwrap());
-        fds.map(|fds| fds.map(|fd| fd.as_raw_fd())).collect()
+    let fds = |subscribers: &[NamedSubscriber<Bytes>]| -> Vec<i32> {
+        let fds = subscribers.iter().map(|s| s.wait_fd().unwrap());
+        fds.map(|fd| fd.as_raw_fd()).collect()
     };
     let before = fds(&subscribers);
     let mut got: Received = vec![Vec::new(), Vec::new(), Vec::new()];
@@ -733,6 +733,7 @@ fn raw_request(token: SIBinder) -> SubscribeRequest {
         control: Some(ParcelFileDescriptor::from(control_page())),
         pins: 0,
         wake: 0,
+        wakeFd: None,
     }
 }
 

@@ -9,7 +9,8 @@
 //! a publisher without its fence, a waker that wakes once, a new wait that does not join, an fd
 //! wait that polls without loading `seq` again, a publisher that takes as woken a wait that saw
 //! its commit. The publisher wakes each wait once, as `Link::wake` does. The fd model (plan 15
-//! §5.5a) counts the socket's bytes and the eventfd's in place of the futex.
+//! §5.5a) counts the bytes on the wake socket in place of the futex: the publisher's, and those
+//! this process sends on its duplicate of the publisher's end.
 //! Run: see `Cargo.toml` (`--cfg loom`).
 
 // The std `Arc`: one of loom's dropped while a deadlock unwinds calls into loom and aborts.

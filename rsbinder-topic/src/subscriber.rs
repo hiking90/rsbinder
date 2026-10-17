@@ -42,7 +42,7 @@ use crate::ring::{self, Loads, Reader};
 #[cfg(feature = "tokio")]
 use crate::wait::{on_pool, Leftover};
 use crate::wait::{Died, Local, Parts, Slept, Words, ABANDON, DIED, INTERRUPT};
-use crate::wake::FdWake;
+use crate::wake::{self, FdWake};
 use crate::{poll, Closed, Payload, RecvError, SubscriberStats};
 
 /// Where a subscription starts reading.
@@ -70,8 +70,9 @@ pub enum Wake {
     /// when a commit finds the subscriber waiting: one system call per such subscriber. The
     /// subscription has file descriptors to poll ([`Wait`](crate::Wait)), so one thread can wait
     /// for several with [`wait_any`](crate::wait_any) or an event loop of its own, and
-    /// `recv_async` waits on the runtime's reactor without holding a thread. Two file
-    /// descriptors per subscription in this process, one in the publisher's.
+    /// `recv_async` waits on the runtime's reactor without holding a thread. One file descriptor
+    /// to poll; the subscription holds two in this process (both ends of a socket pair it makes,
+    /// one to poll and one to wake its own waits with) and the publisher one.
     Fd,
 }
 
@@ -201,6 +202,18 @@ impl<T: Payload> Subscriber<T> {
         let local = Arc::new(Local::new());
         let death = DeathLink::new(topic, Died(local.clone()))?;
         let service: Strong<dyn ITopic> = topic.clone().into_interface()?;
+        // With `Wake::Fd`, a pair of this side's own: the publisher sends on one end, as does this
+        // process on a duplicate of it, and the subscriber polls the other.
+        let (fd_wake, sent) = match policy.wake {
+            Wake::Futex => (None, None),
+            Wake::Fd => {
+                let (theirs, polled) = wake::pair().map_err(StatusCode::from)?;
+                let local = theirs.try_clone().map_err(StatusCode::from)?;
+                let sent = ParcelFileDescriptor::new(theirs);
+                let fd_wake = FdWake::new(polled, local).map_err(StatusCode::from)?;
+                (Some(fd_wake), Some(sent))
+            }
+        };
         let request = SubscribeRequest {
             version: VERSION as i32,
             r#type: T::type_name().to_owned(),
@@ -211,26 +224,20 @@ impl<T: Payload> Subscriber<T> {
                 Wake::Futex => WAKE_FUTEX,
                 Wake::Fd => WAKE_FD,
             },
+            wakeFd: sent,
         };
-        let mut endpoint = {
+        let endpoint = {
             let _asking = Asking::new(&token);
             service.r#subscribe(&request)?
         };
-        // The control page's fd: the publisher has its mapping, and this side keeps its own.
+        // The control page's fd and the publisher's end: it has its own, and this side keeps
+        // the mapping and a duplicate.
         drop(request);
         let memory = map_endpoint(&endpoint, policy.max_ring_bytes)?;
-        let fd = match (policy.wake, endpoint.wakeFd.take()) {
-            (Wake::Futex, None) => None,
-            (Wake::Fd, Some(socket)) => {
-                let wake = FdWake::new(socket.into()).map_err(StatusCode::from)?;
-                Some(wake.ok_or(StatusCode::BadValue)?)
-            }
-            _ => return Err(StatusCode::BadValue.into()),
-        };
         local.set_words(Parts {
             seq: memory.seq(),
             control: control.0.clone(),
-            fd,
+            fd: fd_wake,
         });
         let start = match policy.start {
             // The bits of the position and the index, as the publisher wrote them.
@@ -356,7 +363,7 @@ impl<T: Payload> Subscriber<T> {
         }
     }
 
-    /// `recv_async` of a [`Wake::Fd`] subscription: the two fds on the runtime's reactor.
+    /// `recv_async` of a [`Wake::Fd`] subscription: its fd on the runtime's reactor.
     #[cfg(feature = "tokio")]
     async fn recv_on_reactor(&mut self) -> Result<T, RecvError> {
         loop {
@@ -373,8 +380,8 @@ impl<T: Payload> Subscriber<T> {
                 continue;
             }
             if self.reactor.is_none() {
-                let fds = self.local.words().fd.as_ref().map(FdWake::fds);
-                let made = fds.map(Reactor::new).transpose();
+                let fd = self.local.words().fd.as_ref().map(FdWake::fd);
+                let made = fd.map(Reactor::new).transpose();
                 self.reactor = made.map_err(|_| RecvError::Cancelled)?;
             }
             let Some(reactor) = &self.reactor else {
@@ -539,8 +546,8 @@ impl<T: Payload> Subscriber<T> {
 impl<T: Payload> poll::Sealed for Subscriber<T> {}
 
 impl<T: Payload> poll::Wait for Subscriber<T> {
-    fn wait_fds(&self) -> Option<[BorrowedFd<'_>; 2]> {
-        self.local.words().fd.as_ref().map(FdWake::fds)
+    fn wait_fd(&self) -> Option<BorrowedFd<'_>> {
+        self.local.words().fd.as_ref().map(FdWake::fd)
     }
 
     fn prepare_wait(&mut self) -> bool {
@@ -556,7 +563,7 @@ impl<T: Payload> poll::Wait for Subscriber<T> {
         if let Some(hook) = self.about_to_park.as_mut() {
             hook();
         }
-        // An interrupt stays up for the next receive that waits; its eventfd count ends this poll.
+        // An interrupt stays up for the next receive that waits; its byte ends this poll.
         if self.local.arm(seen) & DIED != 0 || self.local.words().seq() != seen {
             self.local.disarm();
             return false;
@@ -611,9 +618,9 @@ impl Drop for Armed<'_> {
     }
 }
 
-/// A [`Wake::Fd`] subscription's socket and eventfd, registered with the runtime's reactor.
+/// A [`Wake::Fd`] subscription's fd, registered with the runtime's reactor.
 #[cfg(feature = "tokio")]
-struct Reactor([AsyncFd<Unowned>; 2]);
+struct Reactor(AsyncFd<Unowned>);
 
 /// An fd the subscriber owns, as the reactor takes it.
 #[cfg(feature = "tokio")]
@@ -628,34 +635,22 @@ impl AsRawFd for Unowned {
 
 #[cfg(feature = "tokio")]
 impl Reactor {
-    fn new(fds: [BorrowedFd<'_>; 2]) -> std::io::Result<Self> {
-        let register = |fd: BorrowedFd<'_>| {
-            // SAFETY: `local` owns both fds and outlives `reactor`, the field declared before it.
-            unsafe { AsyncFd::register_with_interest(Unowned(fd.as_raw_fd()), Interest::READABLE) }
-        };
-        let [socket, event] = fds;
-        Ok(Self([register(socket)?, register(event)?]))
+    fn new(fd: BorrowedFd<'_>) -> std::io::Result<Self> {
+        let unowned = Unowned(fd.as_raw_fd());
+        // SAFETY: `local` owns the fd and outlives `reactor`, the field declared before it.
+        let registered = unsafe { AsyncFd::register_with_interest(unowned, Interest::READABLE) };
+        Ok(Self(registered?))
     }
 
-    /// Until either fd is readable; its readiness is cleared, as the wait's end drains it.
+    /// Until the fd is readable; its readiness is cleared, as the wait's end drains it.
     async fn readable(&self) -> std::io::Result<()> {
-        std::future::poll_fn(|cx| {
-            let mut woke = false;
-            for fd in &self.0 {
-                match fd.poll_read_ready(cx) {
-                    Poll::Ready(Ok(mut ready)) => {
-                        ready.clear_ready();
-                        woke = true;
-                    }
-                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                    Poll::Pending => {}
-                }
-            }
-            if woke {
+        std::future::poll_fn(|cx| match self.0.poll_read_ready(cx) {
+            Poll::Ready(Ok(mut ready)) => {
+                ready.clear_ready();
                 Poll::Ready(Ok(()))
-            } else {
-                Poll::Pending
             }
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
         })
         .await
     }

@@ -24,28 +24,28 @@ pub trait Sealed {}
 /// loop {
 ///     receive with try_recv until it returns Empty   (Closed: stop)
 ///     if prepare_wait() {
-///         poll the wait_fds() for readability, with the loop's other fds
+///         poll the wait_fd() for readability, with the loop's other fds
 ///         finish_wait()
 ///     }
 /// }
 /// ```
 ///
 /// [`prepare_wait`](Self::prepare_wait) tells the publisher that the subscriber waits, then looks
-/// once more; [`finish_wait`](Self::finish_wait) empties the fds and tells it the wait is over.
-/// Between them the publisher's next commit makes one of the fds readable, and so do the death of
-/// the publisher's process and an [`Interrupter`](crate::Interrupter). An interrupt ends no wait
-/// of this kind: it stays for the next receive that waits, such as `recv`.
+/// once more; [`finish_wait`](Self::finish_wait) empties the fd and tells it the wait is over.
+/// Between them the publisher's next commit makes the fd readable, and so do the death of the
+/// publisher's process and an [`Interrupter`](crate::Interrupter). An interrupt ends no wait of
+/// this kind: it stays for the next receive that waits, such as `recv`.
 ///
-/// The fds are the same for the life of the subscriber, a `NamedSubscriber`'s through every
-/// reconnection. Register them once, level-triggered or edge-triggered: `finish_wait` empties
-/// what made them readable. A `NamedSubscriber` also ends a poll when its connection changes: a
-/// notice to return, a connection to take; its `try_recv` then returns it.
+/// The fd is the same for the life of the subscriber, a `NamedSubscriber`'s through every
+/// reconnection. Register it once, level-triggered or edge-triggered: `finish_wait` empties what
+/// made it readable. A `NamedSubscriber` also ends a poll when its connection changes: a notice
+/// to return, a connection to take; its `try_recv` then returns it.
 pub trait Wait: Sealed {
-    /// The fds to poll for readability: a `Subscriber`'s socket and eventfd, or a
-    /// `NamedSubscriber`'s epoll instance, which holds its current connection's two, and an
+    /// The fd to poll for readability: a `Subscriber`'s end of its wake socket, or a
+    /// `NamedSubscriber`'s epoll instance, which holds its current connection's fd and an
     /// eventfd of its own. `None` for a subscription made with
     /// [`Wake::Futex`](crate::Wake::Futex), which has none.
-    fn wait_fds(&self) -> Option<[BorrowedFd<'_>; 2]>;
+    fn wait_fd(&self) -> Option<BorrowedFd<'_>>;
 
     /// Start a wait: `true` when the caller should poll, then call
     /// [`finish_wait`](Self::finish_wait). `false` when a record is unread or the publisher's
@@ -78,7 +78,7 @@ pub trait Wait: Sealed {
 /// When one of `waits` was made with [`Wake::Futex`](crate::Wake::Futex).
 pub fn wait_any(waits: &mut [&mut dyn Wait], timeout: Option<Duration>) -> io::Result<bool> {
     assert!(
-        waits.iter().all(|wait| wait.wait_fds().is_some()),
+        waits.iter().all(|wait| wait.wait_fd().is_some()),
         "wait_any: a subscription made with `Wake::Futex` has no file descriptor to poll"
     );
     let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
@@ -101,8 +101,7 @@ pub fn wait_any(waits: &mut [&mut dyn Wait], timeout: Option<Duration>) -> io::R
 fn poll_all(waits: &[&mut dyn Wait], deadline: Option<Instant>) -> io::Result<bool> {
     let mut fds: Vec<PollFd<'_>> = waits
         .iter()
-        .filter_map(|wait| wait.wait_fds())
-        .flatten()
+        .filter_map(|wait| wait.wait_fd())
         .map(|fd| PollFd::from_borrowed_fd(fd, PollFlags::IN))
         .collect();
     loop {

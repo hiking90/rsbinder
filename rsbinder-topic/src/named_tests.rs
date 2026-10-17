@@ -484,8 +484,8 @@ fn subscribe_on(names: &Names, name: &str, wake: Wake) -> NamedSubscriber<Bytes>
     NamedSubscriber::subscribe_with(name, &policy, names).unwrap()
 }
 
-fn raw_fds(subscriber: &NamedSubscriber<Bytes>) -> [i32; 2] {
-    subscriber.wait_fds().unwrap().map(|fd| fd.as_raw_fd())
+fn raw_fds(subscriber: &NamedSubscriber<Bytes>) -> i32 {
+    subscriber.wait_fd().unwrap().as_raw_fd()
 }
 
 /// One thread, a poll loop of `wait_any`: receive into `got` until `done` holds of it.
@@ -627,7 +627,7 @@ fn an_interrupt_ends_a_poll_with_no_connection() {
 fn a_futex_name_subscriber_has_no_wait_to_prepare() {
     let names = Names::default();
     let mut subscriber = subscribe(&names);
-    assert!(subscriber.wait_fds().is_none());
+    assert!(subscriber.wait_fd().is_none());
     subscriber.prepare_wait();
 }
 

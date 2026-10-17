@@ -74,7 +74,7 @@ const LAST_RETRY: Duration = Duration::from_secs(30);
 /// publisher, so all it published is news to it.
 ///
 /// With [`Wake::Fd`] the subscriber is a [`Wait`]: an event loop or
-/// [`wait_any`](crate::wait_any) polls the same two fds through every reconnection.
+/// [`wait_any`](crate::wait_any) polls the same fd through every reconnection.
 /// `recv_async` waits on the connection's `recv_async`, and between connections without a
 /// thread.
 ///
@@ -437,9 +437,9 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
         }
     }
 
-    /// Put a connection's fds among the subscriber's, with [`Wake::Fd`].
+    /// Put a connection's fd in the subscriber's epoll instance, with [`Wake::Fd`].
     fn join(&self, subscriber: &Subscriber<T>) -> std::io::Result<()> {
-        match (&self.named.fds, subscriber.wait_fds()) {
+        match (&self.named.fds, subscriber.wait_fd()) {
             (Some(fds), Some(theirs)) => fds.join(theirs),
             _ => Ok(()),
         }
@@ -468,7 +468,7 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
             drop(state);
         }
         if let (Some(fds), Some(connection)) = (&self.named.fds, &gone) {
-            if let Some(theirs) = connection.subscriber.wait_fds() {
+            if let Some(theirs) = connection.subscriber.wait_fd() {
                 fds.leave(theirs);
             }
         }
@@ -495,12 +495,12 @@ enum Step<'n, T: Payload> {
 
 impl<T: Payload> Sealed for NamedSubscriber<T> {}
 
-/// A [`Wake::Fd`] name subscriber's fds are an epoll instance that holds the current
-/// connection's two, and an eventfd its changes of state add to: the same two fds for the
-/// subscriber's life, through every reconnection.
+/// A [`Wake::Fd`] name subscriber's fd is an epoll instance that holds the current connection's
+/// fd and an eventfd its changes of state add to: the same fd for the subscriber's life, through
+/// every reconnection.
 impl<T: Payload + 'static> Wait for NamedSubscriber<T> {
-    fn wait_fds(&self) -> Option<[BorrowedFd<'_>; 2]> {
-        self.named.fds.as_ref().map(NamedFds::fds)
+    fn wait_fd(&self) -> Option<BorrowedFd<'_>> {
+        self.named.fds.as_ref().map(NamedFds::fd)
     }
 
     fn prepare_wait(&mut self) -> bool {

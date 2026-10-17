@@ -24,9 +24,9 @@
 //! sees `parked` and keeps waking until the waiter is out.
 //!
 //! A subscription woken through an fd (plan 15 §5.5a) keeps the protocol and changes what sleeps
-//! and what wakes: the waiter loads `seq` once more after the fence and then polls its socket and
-//! its eventfd, and a wake from this process adds to the eventfd, whose count stays until the wait
-//! drains it, so it is sent once and never repeated.
+//! and what wakes: the waiter loads `seq` once more after the fence and then polls its socket, and
+//! a wake from this process is a byte sent to that socket, which stays until the wait drains it,
+//! so it is sent once and never repeated.
 //!
 //! One wait at a time per subscriber: the code that waits joins a wait left on the blocking
 //! pool before it looks at the ring (`Leftover`), so `WAITING` and `parked` have one owner.
@@ -68,7 +68,7 @@ pub(crate) trait Words: Send + Sync {
     fn sleep(&self, seen: u32, deadline: Option<Instant>) -> bool;
     /// Wake the sleeper.
     fn wake(&self);
-    /// Whether a wake sent before the sleep still ends it (an eventfd's count).
+    /// Whether a wake sent before the sleep still ends it (a byte on the wake socket).
     fn latched(&self) -> bool;
 }
 

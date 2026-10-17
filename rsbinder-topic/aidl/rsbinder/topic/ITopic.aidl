@@ -19,7 +19,7 @@ import rsbinder.topic.TopicEndpoint;
 interface ITopic {
     /** SubscribeRequest.wake: a futex on the topic memory's `seq`. */
     const int WAKE_FUTEX = 0;
-    /** SubscribeRequest.wake: a byte on TopicEndpoint.wakeFd. */
+    /** SubscribeRequest.wake: a byte on SubscribeRequest.wakeFd. */
     const int WAKE_FD = 1;
 
     /** ServiceSpecific: the request's layout version is not the publisher's. */

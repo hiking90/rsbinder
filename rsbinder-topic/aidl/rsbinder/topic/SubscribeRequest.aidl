@@ -61,4 +61,14 @@ parcelable SubscribeRequest {
      * publisher refuses any other value with `BAD_VALUE`.
      */
     int wake;
+    /**
+     * For ITopic.WAKE_FD, one end of a unix stream socket pair the
+     * subscriber made; null otherwise, and `BAD_VALUE` if either is not so.
+     * The publisher sends one byte on it, without waiting, when a commit
+     * finds the subscriber waiting, and takes the subscription out once its
+     * sends fail with `EPIPE`: closing the other end ends the subscription.
+     * The subscriber keeps this end too, to wake its own waits through the
+     * same socket.
+     */
+    @nullable ParcelFileDescriptor wakeFd;
 }

@@ -42,13 +42,4 @@ parcelable TopicEndpoint {
 
     /** The index of the record written at `start`. */
     int startIndex;
-
-    /**
-     * For a request with ITopic.WAKE_FD, the subscriber's end of a unix
-     * stream socket pair the publisher made; null otherwise. The publisher
-     * sends one byte, without waiting, when a commit finds the subscriber
-     * waiting, and takes the subscription out once its sends fail with
-     * `EPIPE`: closing this end ends the subscription.
-     */
-    @nullable ParcelFileDescriptor wakeFd;
 }

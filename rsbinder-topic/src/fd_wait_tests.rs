@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Receives of a subscription woken through its socket (plan 15 §5.5a), within one process: the
-//! publisher's bytes, `wait_any` and a poll loop of the caller's, the eventfd's wakes, and what
+//! publisher's bytes, `wait_any` and a poll loop of the caller's, this process's wakes, and what
 //! a subscriber that never reads its socket can do to the publisher. A publisher that dies is in
 //! `tests/two_process.rs`; the protocol under every interleaving is in `wait/loom_tests.rs`.
 //!
@@ -108,13 +108,10 @@ fn asleep(
     receiving
 }
 
-/// `poll` the fds of `subscriber` for up to `timeout`; how many were readable.
+/// `poll` the fd of `subscriber` for up to `timeout`; whether it was readable, as 1 or 0.
 fn poll_for(subscriber: &Subscriber<Bytes>, timeout: Duration) -> usize {
-    let [socket, event] = subscriber.wait_fds().unwrap();
-    let mut fds = [
-        PollFd::from_borrowed_fd(socket, PollFlags::IN),
-        PollFd::from_borrowed_fd(event, PollFlags::IN),
-    ];
+    let fd = subscriber.wait_fd().unwrap();
+    let mut fds = [PollFd::from_borrowed_fd(fd, PollFlags::IN)];
     poll(&mut fds, Some(&Timespec::try_from(timeout).unwrap())).unwrap()
 }
 
@@ -322,11 +319,11 @@ fn wait_any_returns_at_once_with_a_record_unread_and_false_after_its_timeout() {
 fn wait_any_refuses_a_subscription_woken_by_the_futex() {
     let publisher = topic(64 << 10);
     let mut subscriber = woken_by(&publisher, Wake::Futex);
-    assert!(subscriber.wait_fds().is_none());
+    assert!(subscriber.wait_fd().is_none());
     let _ = wait_any(&mut [&mut subscriber], Some(Duration::ZERO));
 }
 
-/// An interrupt is one eventfd write, with no loop of wakes: its count stays until drained.
+/// An interrupt is one byte sent, with no loop of wakes: it stays until drained.
 #[test]
 fn an_interrupt_ends_an_fd_wait_with_one_wake() {
     let publisher = topic(64 << 10);
@@ -415,7 +412,7 @@ fn a_subscriber_that_waits_anew_at_every_commit_and_never_reads_holds_no_publish
         publisher.publish(&num(n as u32)).unwrap();
     }
     assert_eq!(publisher.sends(), COMMITS);
-    let socket = subscriber.wait_fds().unwrap()[0];
+    let socket = subscriber.wait_fd().unwrap();
     let queued = rustix::io::ioctl_fionread(socket).unwrap();
     assert!(
         queued < COMMITS,
@@ -436,6 +433,7 @@ fn a_subscriber_that_closes_its_socket_is_taken_out_and_raises_no_sigpipe() {
     let publisher = topic(64 << 10);
     let (fd, page) = crate::layout::ControlPage::create(0).unwrap();
     let token = rsbinder::Interface::as_binder(&rsbinder::Binder::new(crate::connect::Token));
+    let (theirs, polled) = crate::wake::pair().unwrap();
     let request = crate::aidl::SubscribeRequest::SubscribeRequest {
         version: crate::layout::VERSION as i32,
         r#type: Bytes::type_name().to_owned(),
@@ -443,12 +441,15 @@ fn a_subscriber_that_closes_its_socket_is_taken_out_and_raises_no_sigpipe() {
         control: Some(rsbinder::ParcelFileDescriptor::from(fd)),
         pins: 0,
         wake: crate::aidl::ITopic::WAKE_FD,
+        wakeFd: Some(rsbinder::ParcelFileDescriptor::new(theirs)),
     };
-    let endpoint = {
+    {
         let _asking = crate::connect::Asking::new(&token);
-        publisher.acceptor().accept(&request).unwrap()
-    };
-    drop(endpoint.wakeFd.unwrap());
+        publisher.acceptor().accept(&request).unwrap();
+    }
+    // The publisher keeps its end; this side closes both of its own, as a dropped one would.
+    drop(request);
+    drop(polled);
     // A wait on `seq` 0, which the publish below moves on from.
     page.state()
         .fetch_or(crate::layout::WAITING, Ordering::SeqCst);
@@ -538,7 +539,7 @@ fn a_receive_held_in_a_page_fault_holds_no_publish() {
     // A byte in the socket for the `recv` to copy into the page that faults.
     subscriber.local().arm(subscriber.local().words().seq());
     publisher.publish(&num(0)).unwrap();
-    let socket = subscriber.wait_fds().unwrap()[0].as_raw_fd();
+    let socket = subscriber.wait_fd().unwrap().as_raw_fd();
     let address = region as usize;
     // SAFETY: one byte into the mapping, which outlives the thread (joined below).
     let held = thread::spawn(move || unsafe { libc::recv(socket, address as *mut _, 1, 0) });

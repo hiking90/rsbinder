@@ -119,6 +119,7 @@ fn request(control: OwnedFd, token: SIBinder) -> SubscribeRequest {
         control: Some(ParcelFileDescriptor::from(control)),
         pins: 0,
         wake: WAKE_FUTEX,
+        wakeFd: None,
     }
 }
 
@@ -359,7 +360,6 @@ fn endpoint(fd: OwnedFd, capacity: u64) -> TopicEndpoint {
         headerOffset: HEADER_OFFSET as i32,
         start: 0,
         startIndex: 0,
-        wakeFd: None,
     }
 }
 
@@ -456,18 +456,17 @@ fn a_reply_the_subscriber_cannot_use_is_refused_and_its_control_page_closed() {
     assert!(Subscriber::<Bytes>::request(&topic, &policy).is_ok());
 }
 
-/// AC-15.2.25 for the wake: a reply whose `wakeFd` is not what the request asked for.
+/// AC-15.2.25 for the wake: a request whose `wakeFd` is not what its `wake` asks for.
 #[test]
-fn a_reply_with_a_wake_fd_the_subscriber_cannot_use_is_refused() {
-    let (good, _stored) = layout::create_topic(MIN_RING).unwrap();
-    let good = Arc::new(good);
-    let capacity = MIN_RING as u64;
+fn a_request_with_a_wake_fd_the_publisher_cannot_use_is_refused() {
+    let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
+    let acceptor = publisher.acceptor();
     type Wakes = fn() -> Option<OwnedFd>;
-    let socket: Wakes = || Some(crate::wake::pair().unwrap().1);
+    let socket: Wakes = || Some(crate::wake::pair().unwrap().0);
     let none: Wakes = || None;
-    let pipe: Wakes = || Some(rustix::pipe::pipe().unwrap().0);
+    let pipe: Wakes = || Some(rustix::pipe::pipe().unwrap().1);
     let datagram: Wakes = || {
-        let (_, theirs) = rustix::net::socketpair(
+        let (theirs, _) = rustix::net::socketpair(
             rustix::net::AddressFamily::UNIX,
             rustix::net::SocketType::DGRAM,
             rustix::net::SocketFlags::CLOEXEC,
@@ -476,59 +475,96 @@ fn a_reply_with_a_wake_fd_the_subscriber_cannot_use_is_refused() {
         .unwrap();
         Some(theirs)
     };
-    let cases: [(Wake, Wakes, bool, &str); 5] = [
-        (Wake::Futex, socket, false, "a socket for a futex wake"),
-        (Wake::Fd, none, false, "no socket for an fd wake"),
-        (Wake::Fd, pipe, false, "a pipe"),
-        (Wake::Fd, datagram, false, "a datagram socket"),
-        (Wake::Fd, socket, true, "a stream socket"),
+    let cases: [(i32, Wakes, bool, &str); 5] = [
+        (WAKE_FUTEX, socket, false, "a socket for a futex wake"),
+        (WAKE_FD, none, false, "no socket for an fd wake"),
+        (WAKE_FD, pipe, false, "a pipe"),
+        (WAKE_FD, datagram, false, "a datagram socket"),
+        (WAKE_FD, socket, true, "a stream socket"),
     ];
     for (wake, wake_fd, taken, why) in cases {
-        let control = Arc::new(Mutex::new(None));
-        let good = good.clone();
-        let forged = Forged {
-            endpoint: Box::new(move || TopicEndpoint {
-                wakeFd: wake_fd().map(ParcelFileDescriptor::new),
-                ..endpoint(good.try_clone().unwrap(), capacity)
-            }),
-            control: control.clone(),
+        // A token this thread asks with, so that the wake alone decides.
+        let asking = token();
+        let mut asked = request(control(b"RSTC", VERSION, 0, 0x80), asking.clone());
+        asked.wake = wake;
+        asked.wakeFd = wake_fd().map(ParcelFileDescriptor::new);
+        let answered = {
+            let _asking = crate::connect::Asking::new(&asking);
+            acceptor.accept(&asked)
         };
-        let topic = BnTopic::new_binder(forged).as_binder();
-        let policy = SubscriberPolicy {
-            wake,
-            ..SubscriberPolicy::default()
-        };
-        let made = Subscriber::<Bytes>::request(&topic, &policy).map(drop);
-        if taken {
-            assert!(made.is_ok(), "{why}");
-            continue;
+        match taken {
+            true => assert!(answered.is_ok(), "{why}"),
+            false => assert_eq!(code(answered), StatusCode::BadValue, "{why}"),
         }
-        assert_eq!(code(made), StatusCode::BadValue, "{why}");
-        let view = control.lock().unwrap().take().unwrap();
-        assert_eq!(view.state().load() & CLOSED, CLOSED, "{why}");
     }
+    assert_eq!(publisher.subscriber_count(), 1);
+
+    // The publisher bounds the send buffer of a socket the subscriber made large.
+    let (theirs, _polled) = crate::wake::pair().unwrap();
+    rustix::net::sockopt::set_socket_send_buffer_size(&theirs, 1 << 20).unwrap();
+    let large = rustix::net::sockopt::socket_send_buffer_size(&theirs).unwrap();
+    let kept = theirs.try_clone().unwrap();
+    let asking = token();
+    let mut asked = request(control(b"RSTC", VERSION, 0, 0x80), asking.clone());
+    asked.wake = WAKE_FD;
+    asked.wakeFd = Some(ParcelFileDescriptor::new(theirs));
+    {
+        let _asking = crate::connect::Asking::new(&asking);
+        acceptor.accept(&asked).unwrap();
+    }
+    let bounded = rustix::net::sockopt::socket_send_buffer_size(&kept).unwrap();
+    assert!(bounded < large, "{bounded} of {large}");
 }
 
-/// A wake socket closed with no end record ends the wait as the publisher's death, with no spin.
+/// The wake socket is the subscriber's own: a byte this process sends on it makes the polled fd
+/// readable until drained.
 #[test]
-fn a_wake_socket_closed_without_an_end_ends_the_wait_as_the_publishers_death() {
-    let (memory, _stored) = layout::create_topic(MIN_RING).unwrap();
-    let ours = Arc::new(Mutex::new(None));
-    let forged = Forged {
-        endpoint: Box::new({
-            let ours = ours.clone();
-            move || {
-                let (publisher_end, theirs) = crate::wake::pair().unwrap();
-                *ours.lock().unwrap() = Some(publisher_end);
-                TopicEndpoint {
-                    wakeFd: Some(ParcelFileDescriptor::new(theirs)),
-                    ..endpoint(memory.try_clone().unwrap(), MIN_RING as u64)
-                }
-            }
-        }),
-        control: Arc::new(Mutex::new(None)),
+fn a_wake_of_this_process_makes_the_wake_socket_readable_until_drained() {
+    let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
+    let policy = SubscriberPolicy {
+        wake: Wake::Fd,
+        ..SubscriberPolicy::default()
     };
-    let topic = BnTopic::new_binder(forged).as_binder();
+    let subscriber = Subscriber::<Bytes>::request(&publisher.as_binder(), &policy).unwrap();
+    let words = subscriber.local().words();
+    let fd = words.fd.as_ref().unwrap();
+    let readable = || {
+        let mut fds = [rustix::event::PollFd::from_borrowed_fd(
+            fd.fd(),
+            rustix::event::PollFlags::IN,
+        )];
+        let now = rustix::event::Timespec::default();
+        rustix::event::poll(&mut fds, Some(&now)).unwrap() == 1
+    };
+    assert!(!readable());
+    fd.poke();
+    assert!(readable());
+    assert!(!fd.drain(), "nothing shut the socket down");
+    assert!(!readable());
+}
+
+/// A wake socket the publisher shuts down, with no end record, ends the wait as its death.
+#[test]
+fn a_wake_socket_shut_down_without_an_end_ends_the_wait_as_the_publishers_death() {
+    let (memory, _stored) = layout::create_topic(MIN_RING).unwrap();
+    let theirs = Arc::new(Mutex::new(None));
+    struct Shutting {
+        memory: OwnedFd,
+        theirs: Arc<Mutex<Option<OwnedFd>>>,
+    }
+    impl Interface for Shutting {}
+    impl ITopic for Shutting {
+        fn r#subscribe(&self, request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
+            let socket = request.wakeFd.as_ref().unwrap().as_fd();
+            *self.theirs.lock().unwrap() = Some(socket.try_clone_to_owned().unwrap());
+            Ok(endpoint(self.memory.try_clone().unwrap(), MIN_RING as u64))
+        }
+    }
+    let shutting = Shutting {
+        memory,
+        theirs: theirs.clone(),
+    };
+    let topic = BnTopic::new_binder(shutting).as_binder();
     let policy = SubscriberPolicy {
         wake: Wake::Fd,
         ..SubscriberPolicy::default()
@@ -540,7 +576,8 @@ fn a_wake_socket_closed_without_an_end_ends_the_wait_as_the_publishers_death() {
     while !local.is_parked() {
         std::thread::sleep(std::time::Duration::from_micros(50));
     }
-    drop(ours.lock().unwrap().take());
+    let socket = theirs.lock().unwrap().take().unwrap();
+    rustix::net::shutdown(&socket, rustix::net::Shutdown::Both).unwrap();
     let died = Err(RecvError::Closed(Closed::PublisherDied));
     assert_eq!(receiving.join().unwrap(), died);
 }
