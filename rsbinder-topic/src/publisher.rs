@@ -38,7 +38,8 @@ use crate::{wake, Authorize, Bytes, Payload, PublishError, PublisherPolicy, Publ
 /// The sending end of a topic of `T`: it writes values into the topic's memory and takes
 /// subscriptions to it.
 ///
-/// A publish never waits for a subscriber. When the ring is full the oldest records are
+/// A publish never waits for a subscriber, unless the topic asks for
+/// [`backpressure`](PublisherPolicy::backpressure). When the ring is full the oldest records are
 /// overwritten, and a subscriber that had not read them is told how many it lost. Any thread may
 /// publish (`publish` takes `&self`): share the publisher in an `Arc` to publish from several.
 ///

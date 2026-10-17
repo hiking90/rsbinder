@@ -85,6 +85,7 @@
 #![cfg_attr(not(test), deny(clippy::allow_attributes_without_reason))]
 
 pub mod aidl;
+mod backpressure;
 mod connect;
 mod end;
 mod layout;
@@ -105,6 +106,7 @@ mod trust;
 mod wait;
 mod wake;
 
+pub use backpressure::Backpressure;
 pub use named::NamedSubscriber;
 pub use payload::{Bytes, Encoding, Payload, Record};
 pub use poll::{wait_any, Wait};
@@ -156,6 +158,19 @@ mod connect_tests;
     )
 ))]
 mod loan_tests;
+
+#[cfg(all(
+    test,
+    not(loom),
+    not(miri),
+    any(target_os = "linux", target_os = "android"),
+    any(
+        target_pointer_width = "64",
+        all(target_arch = "x86", target_feature = "sse2"),
+        all(target_arch = "arm", target_has_atomic = "64")
+    )
+))]
+mod backpressure_tests;
 
 #[cfg(all(
     test,

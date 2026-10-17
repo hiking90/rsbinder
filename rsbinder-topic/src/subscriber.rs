@@ -563,7 +563,8 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
 
     fn settle<V>(&mut self, received: Result<V, RecvError>, died: bool) -> Result<V, RecvError> {
         let page = &self.control.0;
-        page.read().store(self.reader.position(), Ordering::Relaxed);
+        // After the copy: a publisher that waits for this `read` writes over the record only then.
+        page.read().store(self.reader.position(), Ordering::Release);
         page.lost().store(self.reader.lost(), Ordering::Relaxed);
         match &received {
             Ok(_) => self.received += 1,

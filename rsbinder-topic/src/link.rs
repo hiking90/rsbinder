@@ -9,6 +9,7 @@ use std::sync::{Arc, Weak};
 
 use rsbinder::{DeathRecipient, SIBinder, WIBinder};
 
+use crate::backpressure::Readers;
 use crate::layout::{seen_field, ControlView, CLOSED, WAITING};
 use crate::pool::Pins;
 use crate::wake::{send_wake, Sent};
@@ -213,12 +214,14 @@ impl Links {
         self.links.push(link);
     }
 
-    /// The lowest read position among the subscriptions, each as its control page reports it and
-    /// no lower than where it started; `u64::MAX` with none. A slot whose record ends at or below
-    /// it is one no subscriber still has to read (`pool.rs`).
+    /// The lowest read position among the subscriptions that have not ended, each as its control
+    /// page reports it and no lower than where it started; `u64::MAX` with none. A slot whose
+    /// record ends at or below it is one no subscriber still has to read (`pool.rs`), and a record
+    /// that overwrites nothing above it is one a publish need not wait for (`backpressure.rs`).
     pub(crate) fn lowest_read(&self) -> u64 {
         let read = |link: &Arc<Link>| link.control.read().max(link.start.load(Ordering::Relaxed));
-        self.links.iter().map(read).min().unwrap_or(u64::MAX)
+        let live = self.links.iter().filter(|link| !link.ended());
+        live.map(read).min().unwrap_or(u64::MAX)
     }
 
     /// After the commit that made `seq`: a byte to each socket waiter, once per wait; whether one
@@ -269,6 +272,12 @@ impl Links {
             .iter()
             .position(|link| Arc::ptr_eq(&link.dead, dead))?;
         Some(self.links.swap_remove(at))
+    }
+}
+
+impl Readers for Links {
+    fn lowest_read(&self) -> u64 {
+        Links::lowest_read(self)
     }
 }
 

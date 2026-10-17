@@ -23,7 +23,8 @@
 //!
 //! # The publisher
 //!
-//! There is one. It never waits and never reads the shared words; what it needs to know it keeps
+//! There is one. It never waits for a reader here and never reads the shared words (a topic with
+//! backpressure waits before it writes, `backpressure.rs`); what it needs to know it keeps
 //! to itself (the positions of the records still in the ring). To write a record of `r` bytes at
 //! position `w` it stores, in this order:
 //!

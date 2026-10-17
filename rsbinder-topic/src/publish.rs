@@ -8,16 +8,18 @@ use std::marker::PhantomData;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{fence, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use rsbinder::fmq::shm::Mapping;
 use rsbinder::{CallingContext, Status, StatusCode};
 
+use crate::backpressure::wait_for;
 use crate::layout::{self, LentSlot, Stored, StoredPool, MIN_RING};
 use crate::link::Links;
 use crate::payload::{relabel, Piece};
 use crate::pool::{LendError, Loan, Slots, MAX_PINS};
 use crate::ring::{Kind, Refused, Stores, Writer};
-use crate::{end, Encoding, Payload, PublisherStats};
+use crate::{end, Backpressure, Encoding, Payload, PublisherStats};
 
 /// What a topic is made with.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,6 +71,16 @@ pub struct PublisherPolicy {
     /// The pool of slots values are lent from. Default `None`: every value goes through the
     /// ring.
     pub pool: Option<PoolPolicy>,
+    /// Whether a publish waits for its subscribers to read what it would overwrite, and for how
+    /// long. Default `None`: a publish never waits, and a subscriber that falls a ring behind
+    /// loses the records written over ([`RecvError::Lagged`](crate::RecvError::Lagged)).
+    ///
+    /// The wait holds the topic's lock: subscriptions arriving meanwhile, [`stats`], and other
+    /// threads' publishes wait too. It runs on the calling thread; an async caller hands the
+    /// publish to a blocking thread.
+    ///
+    /// [`stats`]: crate::Publisher::stats
+    pub backpressure: Option<Backpressure>,
 }
 
 impl Default for PublisherPolicy {
@@ -79,6 +91,7 @@ impl Default for PublisherPolicy {
             max_per_uid: 64,
             authorize: None,
             pool: None,
+            backpressure: None,
         }
     }
 }
@@ -296,6 +309,8 @@ pub(crate) struct State<S> {
     pub(crate) writer: Writer<S>,
     pub(crate) links: Links,
     pub(crate) lending: Option<Lending>,
+    /// How long a record waits for room: [`PublisherPolicy::backpressure`].
+    backpressure: Option<Duration>,
     /// Records published, and their payload bytes, for [`PublisherStats`].
     published: u64,
     bytes: u64,
@@ -318,6 +333,26 @@ impl<S: Stores> State<S> {
             self.writer.wake();
         }
     }
+
+    /// With backpressure, wait until a record of `len` bytes overwrites no record a subscription
+    /// still has to read. `unannounced`: records written since the last announcement, which go
+    /// out first, or the subscribers asleep before them would never wake to read on.
+    fn make_room(&mut self, len: usize, unannounced: bool) -> Result<(), Refused> {
+        let Some(timeout) = self.backpressure else {
+            return Ok(());
+        };
+        let capacity = self.writer.capacity();
+        let need = self.writer.end_of(len)?.saturating_sub(capacity);
+        if self.links.lowest_read() >= need {
+            return Ok(());
+        }
+        if unannounced {
+            self.announce();
+        }
+        // Past the deadline the record overwrites the subscribers in the way.
+        let _ = wait_for(&self.links, need, Instant::now().checked_add(timeout));
+        Ok(())
+    }
 }
 
 /// A topic's writer behind a lock, fed with values of `T`. Any thread may publish.
@@ -339,6 +374,7 @@ impl<T: Payload> TypedWriter<T, Stored<Mapping>> {
     ) -> rsbinder::fmq::Result<(OwnedFd, Option<PoolFd>, Self)> {
         let (fd, stored) = layout::create_topic(policy.ring_bytes)?;
         let writer = Self::new(Writer::new(stored));
+        writer.lock().backpressure = policy.backpressure.as_ref().map(|wait| wait.timeout);
         let Some(pool) = &policy.pool else {
             return Ok((fd, None, writer));
         };
@@ -369,6 +405,7 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
                 writer,
                 links: Links::default(),
                 lending: None,
+                backpressure: None,
                 published: 0,
                 bytes: 0,
                 #[cfg(all(test, not(loom)))]
@@ -493,6 +530,12 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
         let len = slot.bytes().len();
         let number = slot.slot();
         drop(slot);
+        if let Err(refused) = state.make_room(Loan::BYTES, false) {
+            if let Some(lending) = state.lending.as_mut() {
+                lending.slots.give_back(number);
+            }
+            return Err(refused.into());
+        }
         let State {
             writer, lending, ..
         } = &mut *state;
@@ -577,7 +620,8 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
         // Checked first, so that a refusal comes before the first record and none is written.
         state.writer.admits(records.iter().map(|&(_, len)| len))?;
         let mut first = 0;
-        for &(end, len) in records {
+        for (written, &(end, len)) in records.iter().enumerate() {
+            state.make_room(len, written > 0)?;
             let parts = encoding.pieces[first..end]
                 .iter()
                 .map(|&piece| encoding.of(piece));
