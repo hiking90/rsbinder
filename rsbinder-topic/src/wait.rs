@@ -48,6 +48,8 @@ pub(crate) const INTERRUPT: u32 = 1;
 pub(crate) const ABANDON: u32 = 2;
 /// `stop`: the publisher's process died. Never cleared, and no wait sleeps while it is up.
 pub(crate) const DIED: u32 = 4;
+/// `stop`: the publisher took the subscription out (plan 15 §6.5). Never cleared, as `DIED`.
+pub(crate) const EVICTED: u32 = 8;
 
 /// Yields a waker looks before waking again: a wake is lost only before the waiter's syscall.
 #[cfg(not(loom))]
@@ -216,6 +218,11 @@ impl<W: Words> Local<W> {
     /// Whether the publisher's process died. Loaded before the ring: the read finds its commits.
     pub(crate) fn died(&self) -> bool {
         self.stop.load(Ordering::Acquire) & DIED != 0
+    }
+
+    /// Whether the publisher took the subscription out.
+    pub(crate) fn evicted(&self) -> bool {
+        self.stop.load(Ordering::Acquire) & EVICTED != 0
     }
 }
 

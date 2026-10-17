@@ -275,7 +275,7 @@ fn a_sample_is_waited_for_until_a_value_a_bound_or_the_end() {
 /// A subscription made by hand, so that the test holds its control page and pin word.
 fn pinning(publisher: &Publisher<Bytes>) -> (ControlPage, LoadedPool) {
     let (fd, page) = ControlPage::create(MAX_PINS).unwrap();
-    let token = rsbinder::Interface::as_binder(&rsbinder::Binder::new(Token));
+    let token = Token::detached();
     let request = SubscribeRequest {
         version: VERSION as i32,
         r#type: Bytes::type_name().to_owned(),

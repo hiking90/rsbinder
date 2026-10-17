@@ -433,7 +433,7 @@ fn a_subscriber_that_closes_its_socket_is_taken_out_and_raises_no_sigpipe() {
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let publisher = topic(64 << 10);
     let (fd, page) = crate::layout::ControlPage::create(0).unwrap();
-    let token = rsbinder::Interface::as_binder(&rsbinder::Binder::new(crate::connect::Token));
+    let token = crate::connect::Token::detached();
     let (theirs, polled) = crate::wake::pair().unwrap();
     let request = crate::aidl::SubscribeRequest::SubscribeRequest {
         version: crate::layout::VERSION as i32,

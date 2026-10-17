@@ -948,6 +948,7 @@ name = "rsbinder-topic"
 version = "0.12.0"
 dependencies = [
  "libc",
+ "log",
  "loom",
  "miette",
  "rsbinder",

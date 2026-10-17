@@ -26,7 +26,7 @@ use crate::resolve::{Resolver, ServiceManager, Watch};
 use crate::subscriber::Interrupt;
 use crate::wake::NamedFds;
 use crate::{
-    Disconnected, Interrupter, Payload, RecvError, Start, Subscriber, SubscriberPolicy,
+    Closed, Disconnected, Interrupter, Payload, RecvError, Start, Subscriber, SubscriberPolicy,
     SubscriberStats, Wake,
 };
 
@@ -44,8 +44,11 @@ const LAST_RETRY: Duration = Duration::from_secs(30);
 ///
 /// A receive returns what a [`Subscriber`]'s does, except that the end of a connection is
 /// [`RecvError::Disconnected`], returned once, after which the next receive goes on with the next
-/// connection; a `NamedSubscriber` never returns [`RecvError::Closed`]. Code that only wants the
-/// values goes on past it:
+/// connection. The one [`RecvError::Closed`] a `NamedSubscriber` returns is
+/// [`Closed::Evicted`]: a publisher with backpressure took the subscription out, and since a
+/// subscriber as slow as before would be taken out again, no connection is made after it, to that
+/// publisher or the next; it is returned from then on. Code that only wants the values goes on
+/// past the rest:
 ///
 /// ```no_run
 /// use rsbinder::ProcessState;
@@ -111,6 +114,8 @@ struct Named<T: Payload> {
 
 struct State<T: Payload> {
     dropped: bool,
+    /// A publisher took the subscription out (plan 15 §6.5): no connection is made again.
+    evicted: bool,
     /// An interrupt not yet returned; the connection's own interrupt is raised with it.
     interrupted: bool,
     /// The binder the name was last given.
@@ -135,6 +140,7 @@ impl<T: Payload> State<T> {
     fn new() -> Self {
         Self {
             dropped: false,
+            evicted: false,
             interrupted: false,
             latest: None,
             ready: None,
@@ -370,6 +376,9 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
     /// Take a notice or a connection, and with a connection the next record before a
     /// replacement. `Idle` keeps the lock, for a wait to look at the interrupt and sleep.
     fn step<'n>(&mut self, mut state: MutexGuard<'n, State<T>>, latest: bool) -> Step<'n, T> {
+        if state.evicted {
+            return Step::Done(Err(RecvError::Closed(Closed::Evicted)));
+        }
         if let Some(notice) = state.notices.pop_front() {
             return Step::Done(Err(RecvError::Disconnected(notice)));
         }
@@ -414,6 +423,7 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
                 connection.subscriber.try_recv()
             };
             match received {
+                Err(RecvError::Closed(Closed::Evicted)) => return Step::Done(Err(self.evict())),
                 Err(RecvError::Empty | RecvError::Closed(_)) => {}
                 other => return Step::Done(other),
             }
@@ -432,9 +442,37 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
                 // A replacement ended the wait to be looked at; else the runtime could not run it.
                 (!state.replaced).then_some(Err(RecvError::Cancelled))
             }
+            Err(RecvError::Closed(Closed::Evicted)) => Some(Err(self.evict())),
             Err(RecvError::Closed(closed)) => Some(Err(self.finish(Disconnected::Ended(closed)))),
             other => Some(other),
         }
+    }
+
+    /// The publisher took the subscription out: drop the connection and make none again, since a
+    /// subscriber as slow as before would be taken out again (plan 15 §6.5).
+    fn evict(&mut self) -> RecvError {
+        let gone = self.current.take();
+        if let Some(connection) = &gone {
+            self.past += connection.subscriber.stats();
+        }
+        let mut state = self.named.lock();
+        state.evicted = true;
+        state.connected = None;
+        state.wake = None;
+        state.replaced = false;
+        let ready = state.ready.take();
+        drop(state);
+        // A connection thread under way looks at `evicted` and ends.
+        self.named.signal();
+        if let (Some(fds), Some(connection)) = (&self.named.fds, &gone) {
+            if let Some(theirs) = connection.subscriber.wait_fd() {
+                fds.leave(theirs);
+            }
+        }
+        // Unmapped outside the lock.
+        drop(gone);
+        drop(ready);
+        RecvError::Closed(Closed::Evicted)
     }
 
     /// Put a connection's fd in the subscriber's epoll instance, with [`Wake::Fd`].
@@ -509,8 +547,9 @@ impl<T: Payload + 'static> Wait for NamedSubscriber<T> {
             "prepare_wait: a subscription made with `Wake::Futex` has no file descriptor to poll"
         );
         let state = self.named.lock();
-        // A notice, a connection to take or a replacement's records: a receive returns at once.
-        if !state.notices.is_empty() || state.ready.is_some() || state.replaced {
+        // A notice, a connection to take, a replacement's records or the end of an eviction: a
+        // receive returns at once.
+        if state.evicted || !state.notices.is_empty() || state.ready.is_some() || state.replaced {
             return false;
         }
         drop(state);
@@ -581,7 +620,7 @@ impl<T: Payload + 'static> Named<T> {
     /// The resolver's callback: keep the binder, and connect to it if nothing else is under way.
     fn registered(self: &Arc<Self>, binder: SIBinder) {
         let mut state = self.lock();
-        if state.dropped {
+        if state.dropped || state.evicted {
             return;
         }
         state.latest = Some(binder.clone());
@@ -633,7 +672,7 @@ impl<T: Payload + 'static> Named<T> {
         loop {
             let policy = {
                 let mut state = self.lock();
-                if state.dropped {
+                if state.dropped || state.evicted {
                     state.connecting = false;
                     return;
                 }
@@ -642,7 +681,7 @@ impl<T: Payload + 'static> Named<T> {
             let result = Subscriber::<T>::request(&binder, &policy);
             let mut state = self.lock();
             let newer = state.latest.clone().filter(|latest| *latest != binder);
-            if state.dropped {
+            if state.dropped || state.evicted {
                 state.connecting = false;
                 drop(state);
                 // Its control page is marked closed as it drops; the publisher takes it out.
@@ -691,7 +730,8 @@ impl<T: Payload + 'static> Named<T> {
                         self.signal();
                     }
                     let until = Instant::now() + delay;
-                    while !state.dropped && state.latest.as_ref() == Some(&binder) {
+                    while !state.dropped && !state.evicted && state.latest.as_ref() == Some(&binder)
+                    {
                         let now = Instant::now();
                         if now >= until {
                             break;

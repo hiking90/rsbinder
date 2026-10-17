@@ -6,9 +6,11 @@
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
-use rsbinder::{DeathRecipient, SIBinder, WIBinder};
+use rsbinder::{DeathRecipient, SIBinder, Strong, WIBinder};
 
+use crate::aidl::ISubscription::ISubscription;
 use crate::backpressure::Readers;
 use crate::layout::{seen_field, ControlView, CLOSED, WAITING};
 use crate::pool::Pins;
@@ -95,6 +97,10 @@ pub(crate) struct Link {
     hung_up: AtomicBool,
     /// Where the subscription started: no record before it is one the subscriber reads.
     start: AtomicU64,
+    /// The subscriber's token, told through when the subscription is taken out.
+    subscription: Strong<dyn ISubscription>,
+    /// Taken out by a wait for room (plan 15 §6.5): no longer waited for, its pin still kept.
+    evicted: AtomicBool,
     _death: Option<DeathLink<Watch>>,
 }
 
@@ -109,12 +115,12 @@ enum Wanted {
 
 impl Link {
     /// A subscription through `control` from `uid` and `pid`, woken by `socket` if any, gone with
-    /// `token`.
+    /// `token`, which is `subscription`.
     pub(crate) fn new(
         control: ControlView,
         (uid, pid): (u32, i32),
         socket: Option<OwnedFd>,
-        token: &SIBinder,
+        (token, subscription): (&SIBinder, Strong<dyn ISubscription>),
         list: Weak<dyn Forget>,
     ) -> rsbinder::Result<Self> {
         let dead = Arc::new(Dead::default());
@@ -133,7 +139,19 @@ impl Link {
             socket,
             hung_up: AtomicBool::new(false),
             start: AtomicU64::new(0),
+            subscription,
+            evicted: AtomicBool::new(false),
         })
+    }
+
+    /// Whether a wait for room took the subscription out.
+    pub(crate) fn evicted(&self) -> bool {
+        self.evicted.load(Ordering::Relaxed)
+    }
+
+    /// Where the subscriber has read up to, no lower than where it started.
+    fn read(&self) -> u64 {
+        self.control.read().max(self.start.load(Ordering::Relaxed))
     }
 
     /// After the commit that made `seq`: mark a wait not woken yet as woken; a socket's byte is
@@ -181,7 +199,30 @@ impl Link {
             lag_bytes: write.saturating_sub(self.control.read()),
             lost: self.control.lost(),
             waiting: self.control.state().load() & WAITING != 0,
+            evicted: self.evicted(),
         }
+    }
+}
+
+/// A subscription a wait for room took out, to tell its subscriber and log once the topic's lock
+/// is let go: a binder call made under it could run a death notice that takes the lock.
+pub(crate) struct Eviction {
+    subscription: Strong<dyn ISubscription>,
+    uid: u32,
+    pid: i32,
+}
+
+impl Eviction {
+    /// Tell the subscriber, and log it for the topic of `payload` that waited `waited`.
+    pub(crate) fn tell(self, payload: &str, waited: Duration) {
+        log::warn!(
+            "rsbinder-topic {payload}: took out the subscription of uid {} pid {}, which kept a \
+             publish waiting {waited:?}",
+            self.uid,
+            self.pid
+        );
+        // One way: nothing to wait for, and a subscriber gone already needs no telling.
+        let _ = self.subscription.r#evicted();
     }
 }
 
@@ -219,9 +260,31 @@ impl Links {
     /// record ends at or below it is one no subscriber still has to read (`pool.rs`), and a record
     /// that overwrites nothing above it is one a publish need not wait for (`backpressure.rs`).
     pub(crate) fn lowest_read(&self) -> u64 {
-        let read = |link: &Arc<Link>| link.control.read().max(link.start.load(Ordering::Relaxed));
-        let live = self.links.iter().filter(|link| !link.ended());
-        live.map(read).min().unwrap_or(u64::MAX)
+        let reads = self.waited_for().map(|link| link.read());
+        reads.min().unwrap_or(u64::MAX)
+    }
+
+    /// The subscriptions a publish reads past or waits for: not ended, not taken out.
+    fn waited_for(&self) -> impl Iterator<Item = &Arc<Link>> {
+        self.links
+            .iter()
+            .filter(|link| !link.ended() && !link.evicted())
+    }
+
+    /// Take out every subscription waited for that has not read up to `need`: what to tell them.
+    pub(crate) fn evict_behind(&self, need: u64) -> Vec<Eviction> {
+        let behind = self.waited_for().filter(|link| link.read() < need);
+        let evicted: Vec<Eviction> = behind
+            .map(|link| {
+                link.evicted.store(true, Ordering::Relaxed);
+                Eviction {
+                    subscription: link.subscription.clone(),
+                    uid: link.uid,
+                    pid: link.pid,
+                }
+            })
+            .collect();
+        evicted
     }
 
     /// After the commit that made `seq`: a byte to each socket waiter, once per wait; whether one

@@ -126,7 +126,7 @@ fn request(control: OwnedFd, token: SIBinder) -> SubscribeRequest {
 }
 
 fn token() -> SIBinder {
-    rsbinder::Binder::new(Token).as_binder()
+    Token::detached()
 }
 
 fn service_specific(result: BinderResult<impl Sized>) -> i32 {
@@ -229,6 +229,13 @@ fn a_request_the_publisher_cannot_take_is_refused_for_what_is_wrong_with_it() {
     assert_eq!(code(acceptor.accept(&foreign)), StatusCode::BadValue);
     let foreign = request(page(), token());
     assert_eq!(code(acceptor.accept(&foreign)), StatusCode::BadValue);
+    // A token this thread asks with that is not an `ISubscription`: nothing to tell it through.
+    let other = publisher.as_binder();
+    let refused = {
+        let _asking = crate::connect::Asking::new(&other);
+        acceptor.accept(&request(page(), other.clone()))
+    };
+    assert_eq!(code(refused), StatusCode::BadValue);
     assert_eq!(publisher.subscriber_count(), 0);
 }
 

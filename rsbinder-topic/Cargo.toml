@@ -41,6 +41,8 @@ rustix = { workspace = true, features = ["event", "net", "mm"] }
 # `Notify`: a `recv_async` joins the wait a dropped one left on the blocking pool.
 # `net`: `AsyncFd`, which a `recv_async` of an fd-woken subscription waits on.
 tokio = { workspace = true, optional = true, features = ["sync", "net"] }
+# The warning a topic with backpressure gives when it takes a subscription out (plan 15 §6.5).
+log = { workspace = true }
 
 [build-dependencies]
 rsbinder-aidl = { workspace = true }

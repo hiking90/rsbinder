@@ -73,6 +73,11 @@ pub enum Closed {
     /// The publisher's memory failed a check: a length or a counter no publisher that follows the
     /// protocol writes. Nothing more is read from it.
     Corrupted,
+    /// The publisher took the subscription out: its topic waits for subscribers
+    /// ([`PublisherPolicy::backpressure`](crate::PublisherPolicy::backpressure)), and waited for
+    /// this one past its timeout. The records it had not read are not returned, as the publisher
+    /// no longer keeps them; those before the notice arrived were.
+    Evicted,
 }
 
 impl fmt::Display for RecvError {
@@ -106,6 +111,7 @@ impl fmt::Display for Closed {
             Self::Status(status) => write!(f, "the topic has ended with {status}"),
             Self::PublisherDied => f.write_str("the publisher's process died"),
             Self::Corrupted => f.write_str("the topic's memory is corrupted"),
+            Self::Evicted => f.write_str("the publisher took the subscription out"),
         }
     }
 }

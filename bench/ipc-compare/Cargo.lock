@@ -1114,6 +1114,7 @@ dependencies = [
 name = "rsbinder-topic"
 version = "0.12.0"
 dependencies = [
+ "log",
  "miette",
  "rsbinder",
  "rsbinder-aidl",

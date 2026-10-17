@@ -108,8 +108,10 @@ use rsbinder::fmq::{Descriptor, Error, Flavor, Grantor, Result};
 use crate::pool::{GenerationLoads, Generations, LendError, Pin, Pins, Slots};
 use crate::ring::{Loads, Stores};
 
-/// The layout version this crate reads and writes: 0.1.
-pub(crate) const VERSION: u32 = 1;
+/// The layout version this crate reads and writes: 0.2. Version 2 has the subscriber store its
+/// `read` with `Release` and answer `ISubscription.evicted` (plan 15 §6.5); a subscriber of 1
+/// does neither, and a topic with backpressure would wait on it wrongly.
+pub(crate) const VERSION: u32 = 2;
 
 /// The smallest ring. An end record with its message has to fit half of it.
 pub(crate) const MIN_RING: usize = 4 << 10;

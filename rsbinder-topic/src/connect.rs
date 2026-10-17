@@ -12,28 +12,38 @@
 //! subscribes to a topic of its own process still sees its caller's pid.
 
 use std::cell::RefCell;
+use std::sync::Weak;
 
-use rsbinder::{ExceptionCode, SIBinder, Status, StatusCode};
+use rsbinder::{BinderResult, ExceptionCode, Interface, SIBinder, Status, StatusCode};
 
-/// The binder a subscriber sends as `SubscribeRequest.token`; it answers nothing.
-pub(crate) struct Token;
+use crate::aidl::ISubscription::ISubscription;
+use crate::wait::{Local, Parts, EVICTED};
 
-impl rsbinder::Remotable for Token {
-    fn descriptor() -> &'static str {
-        "rsbinder.topic.Token"
-    }
+/// The binder a subscriber sends as `SubscribeRequest.token`, an `ISubscription`: the publisher
+/// links to its death, and tells it through it that the subscription was taken out.
+pub(crate) struct Token {
+    /// The subscriber's waits; gone with the subscriber, after which a call does nothing.
+    pub(crate) local: Weak<Local<Parts>>,
+}
 
-    fn on_transact(
-        &self,
-        _: rsbinder::TransactionCode,
-        _: &mut rsbinder::Parcel,
-        _: &mut rsbinder::Parcel,
-    ) -> rsbinder::Result<()> {
-        Err(StatusCode::UnknownTransaction)
-    }
+impl Interface for Token {}
 
-    fn on_dump(&self, _: &mut dyn std::io::Write, _: &[String]) -> rsbinder::Result<()> {
+impl ISubscription for Token {
+    fn r#evicted(&self) -> BinderResult<()> {
+        if let Some(local) = self.local.upgrade() {
+            local.raise(EVICTED);
+        }
         Ok(())
+    }
+}
+
+impl Token {
+    /// The token of no subscriber, for tests that make the subscription call themselves.
+    #[cfg(test)]
+    pub(crate) fn detached() -> SIBinder {
+        use crate::aidl::ISubscription::BnSubscription;
+        let token = Self { local: Weak::new() };
+        rsbinder::Interface::as_binder(&BnSubscription::new_binder(token))
     }
 }
 

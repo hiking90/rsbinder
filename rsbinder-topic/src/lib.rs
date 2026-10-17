@@ -69,7 +69,8 @@
 //! order: [`Publisher::advertise`] registers the binder with the service manager, and a
 //! [`NamedSubscriber`] watches the name and connects to whichever publisher holds it, again and
 //! again. Where a `Subscriber`'s topic ends with [`RecvError::Closed`], a `NamedSubscriber`
-//! returns [`RecvError::Disconnected`] once and waits for the next publisher. Names come from a
+//! returns [`RecvError::Disconnected`] once and waits for the next publisher, except after
+//! [`Closed::Evicted`], which ends it. Names come from a
 //! [`Resolver`], the service manager by default ([`ServiceManager`]). Who may subscribe is
 //! [`PublisherPolicy::authorize`].
 //!

@@ -13,9 +13,9 @@ use std::time::{Duration, Instant};
 use rsbinder::fmq::shm::Mapping;
 use rsbinder::{CallingContext, Status, StatusCode};
 
-use crate::backpressure::wait_for;
+use crate::backpressure::{wait_for, Room};
 use crate::layout::{self, LentSlot, Stored, StoredPool, MIN_RING};
-use crate::link::Links;
+use crate::link::{Eviction, Link, Links};
 use crate::payload::{relabel, Piece};
 use crate::pool::{LendError, Loan, Slots, MAX_PINS};
 use crate::ring::{Kind, Refused, Stores, Writer};
@@ -311,6 +311,10 @@ pub(crate) struct State<S> {
     pub(crate) lending: Option<Lending>,
     /// How long a record waits for room: [`PublisherPolicy::backpressure`].
     backpressure: Option<Duration>,
+    /// Subscriptions a wait took out, to tell once the lock is let go
+    /// ([`TypedWriter::unlock`]), and how many it took out in all.
+    evictions: Vec<Eviction>,
+    evicted: u64,
     /// Records published, and their payload bytes, for [`PublisherStats`].
     published: u64,
     bytes: u64,
@@ -349,8 +353,12 @@ impl<S: Stores> State<S> {
         if unannounced {
             self.announce();
         }
-        // Past the deadline the record overwrites the subscribers in the way.
-        let _ = wait_for(&self.links, need, Instant::now().checked_add(timeout));
+        if wait_for(&self.links, need, Instant::now().checked_add(timeout)) == Room::TimedOut {
+            // Every subscription still waited for has read past `need` after this.
+            let out = self.links.evict_behind(need);
+            self.evicted += out.len() as u64;
+            self.evictions.extend(out);
+        }
         Ok(())
     }
 }
@@ -406,6 +414,8 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
                 links: Links::default(),
                 lending: None,
                 backpressure: None,
+                evictions: Vec::new(),
+                evicted: 0,
                 published: 0,
                 bytes: 0,
                 #[cfg(all(test, not(loom)))]
@@ -424,6 +434,7 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
             published: state.published,
             bytes: state.bytes,
             subscribers: state.links.infos(state.writer.position()),
+            evicted: state.evicted,
         };
         drop(state);
         drop(gone);
@@ -433,6 +444,18 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
     /// The lock every change to the ring and to the list of subscriptions takes.
     pub(crate) fn lock(&self) -> MutexGuard<'_, State<S>> {
         self.state.lock().expect("lock poisoned")
+    }
+
+    /// Let go of the lock, then tell the subscriptions a wait took out, then drop those that
+    /// ended (`gone`): a binder call under the lock could run a death notice that takes it.
+    fn unlock(&self, mut state: MutexGuard<'_, State<S>>, gone: Vec<Arc<Link>>) {
+        let evictions = std::mem::take(&mut state.evictions);
+        let waited = state.backpressure.unwrap_or_default();
+        drop(state);
+        for eviction in evictions {
+            eviction.tell(T::type_name(), waited);
+        }
+        drop(gone);
     }
 
     /// The futex wakes this topic has sent.
@@ -519,8 +542,7 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
                 })
             }
         };
-        drop(state);
-        drop(gone);
+        self.unlock(state, gone);
         lent
     }
 
@@ -560,8 +582,7 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
         state.bytes += len as u64;
         state.announce();
         let gone = state.links.prune();
-        drop(state);
-        drop(gone);
+        self.unlock(state, gone);
         Ok(())
     }
 
@@ -577,12 +598,19 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
 
     /// Write the end record with `status`. Later publishes are [`PublishError::Closed`]; a second
     /// close writes nothing.
+    ///
+    /// With backpressure the end record waits for room as a value does, so a subscriber reads
+    /// every value before it, and this call (and the publisher's drop) waits up to the timeout.
     pub(crate) fn close(&self, status: &Status) {
         let mut state = self.lock();
+        let payload = end::payload(status);
         // A 4 KiB ring takes the longest end record, so only an end already written refuses it.
-        if state.writer.put(Kind::End, &end::payload(status)).is_ok() {
+        if state.make_room(payload.len(), false).is_ok()
+            && state.writer.put(Kind::End, &payload).is_ok()
+        {
             state.announce();
         }
+        self.unlock(state, Vec::new());
     }
 
     fn encode<'a, I>(
@@ -632,8 +660,7 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
         state.bytes += records.iter().map(|&(_, len)| len as u64).sum::<u64>();
         state.announce();
         let gone = state.links.prune();
-        drop(state);
-        drop(gone);
+        self.unlock(state, gone);
         Ok(records.len())
     }
 }

@@ -20,8 +20,9 @@ use crate::layout::MIN_RING;
 use std::os::fd::AsRawFd;
 
 use crate::{
-    wait_any, Acceptor, Authorize, Bytes, Closed, Disconnected, NamedSubscriber, Publisher,
-    PublisherPolicy, RecvError, Resolver, Subscriber, SubscriberPolicy, Wait, Wake, Watch,
+    wait_any, Acceptor, Authorize, Backpressure, Bytes, Closed, Disconnected, NamedSubscriber,
+    Publisher, PublisherPolicy, RecvError, Resolver, Subscriber, SubscriberPolicy, Wait, Wake,
+    Watch,
 };
 
 /// The bound of every wait a test makes, so that a broken subscriber fails rather than hangs.
@@ -697,6 +698,72 @@ mod reactor {
             Err(RecvError::Cancelled)
         );
     }
+}
+
+/// A policy that waits up to 100 ms for its subscribers.
+fn waiting() -> PublisherPolicy {
+    PublisherPolicy {
+        backpressure: Some(Backpressure {
+            timeout: Duration::from_millis(100),
+        }),
+        ..policy()
+    }
+}
+
+/// Two rings' worth of values, which a subscriber that reads none holds up past the timeout.
+fn overrun(publisher: &Publisher<Bytes>) {
+    for n in 0..2 * MIN_RING / 16 {
+        publisher.publish(&bytes(n as u8)).unwrap();
+    }
+}
+
+/// AC-15.3.13: a subscriber of a name taken out by a publisher with backpressure returns
+/// `Closed(Evicted)` from then on, and connects to no publisher of the name again.
+#[test]
+fn a_subscriber_of_a_name_taken_out_connects_to_no_publisher_again() {
+    for wake in [Wake::Futex, Wake::Fd] {
+        let names = Names::default();
+        let first = advertise(&names, &waiting());
+        let woken = SubscriberPolicy {
+            wake,
+            ..SubscriberPolicy::default()
+        };
+        let mut subscriber = NamedSubscriber::subscribe_with(NAME, &woken, &names).unwrap();
+        connected(&subscriber);
+        overrun(&first);
+        assert_eq!(first.stats().evicted, 1, "{wake:?}");
+        let evicted = Err(RecvError::Closed(Closed::Evicted));
+        assert_eq!(recv(&mut subscriber), evicted, "{wake:?}");
+        if wake == Wake::Fd {
+            assert!(!subscriber.prepare_wait(), "a receive returns at once");
+        }
+        drop(first);
+        let second = advertise(&names, &policy());
+        assert!(!subscriber.wait_connected(Duration::from_millis(200)));
+        assert!(second.stats().subscribers.is_empty(), "{wake:?}");
+        assert_eq!(subscriber.try_recv(), evicted, "{wake:?}");
+    }
+}
+
+/// AC-15.3.13, draining: a subscriber taken out while it drains the publisher the name left
+/// returns `Closed(Evicted)`, not `Replaced`, and does not move to the new publisher.
+#[test]
+fn a_subscriber_of_a_name_taken_out_while_it_drains_stays_out() {
+    let names = Names::default();
+    let first = advertise(&names, &waiting());
+    let mut subscriber = subscribe(&names);
+    connected(&subscriber);
+    first.publish(&bytes(0)).unwrap();
+    // Taken: the connection is the subscriber's, and the next receive drains it.
+    assert_eq!(recv(&mut subscriber), Ok(bytes(0)));
+    overrun(&first);
+    assert_eq!(first.stats().evicted, 1);
+    let second = advertise(&names, &policy());
+    let evicted = Err(RecvError::Closed(Closed::Evicted));
+    assert_eq!(recv(&mut subscriber), evicted);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(second.stats().subscribers.is_empty());
+    assert_eq!(subscriber.try_recv(), evicted);
 }
 
 #[test]

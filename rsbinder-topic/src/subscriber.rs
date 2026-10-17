@@ -32,6 +32,7 @@ use rsbinder::{
 #[cfg(feature = "tokio")]
 use tokio::io::{unix::AsyncFd, Interest};
 
+use crate::aidl::ISubscription::BnSubscription;
 use crate::aidl::ITopic::{ITopic, ERROR_VERSION, WAKE_FD, WAKE_FUTEX};
 use crate::aidl::Pool::Pool;
 use crate::aidl::SubscribeRequest::SubscribeRequest;
@@ -44,7 +45,7 @@ use crate::receive::{Held, TypedReader};
 use crate::ring::{self, Loads, Reader};
 #[cfg(feature = "tokio")]
 use crate::wait::{on_pool, Leftover};
-use crate::wait::{Died, Local, Parts, Slept, Words, ABANDON, DIED, INTERRUPT};
+use crate::wait::{Died, Local, Parts, Slept, Words, ABANDON, DIED, EVICTED, INTERRUPT};
 use crate::wake::{self, FdWake};
 use crate::{
     poll, Bytes, Closed, Payload, RecvError, Sample, SubscriberStats, Trust, Trusted, Untrusted,
@@ -224,8 +225,11 @@ impl<T: Payload> Subscriber<T> {
         }
         let (fd, page) = ControlPage::create(MAX_PINS).map_err(status_of)?;
         let control = Closing(Arc::new(page));
-        let token = rsbinder::Binder::new(Token).as_binder();
         let local = Arc::new(Local::new());
+        let token = Token {
+            local: Arc::downgrade(&local),
+        };
+        let token = BnSubscription::new_binder(token).as_binder();
         let death = DeathLink::new(topic, Died(local.clone()))?;
         let service: Strong<dyn ITopic> = topic.clone().into_interface()?;
         // With `Wake::Fd`, a pair of this side's own: the publisher sends on one end, as does this
@@ -474,6 +478,9 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
 
     /// The next record, or the newest with `latest`, without waiting.
     fn look(&mut self, latest: bool) -> Result<T, RecvError> {
+        if self.local.evicted() {
+            return Err(RecvError::Closed(Closed::Evicted));
+        }
         let died = self.local.died();
         let received = match (M::TRUSTED, latest) {
             // SAFETY: `Trusted`, which only `trust_publisher` makes, on its caller's word.
@@ -705,6 +712,9 @@ impl<M: Trust> Subscriber<Bytes, M> {
     }
 
     fn look_held(&mut self) -> Result<Held, RecvError> {
+        if self.local.evicted() {
+            return Err(RecvError::Closed(Closed::Evicted));
+        }
         let died = self.local.died();
         let held = self.reader.take_held();
         self.settle(held, died)
@@ -724,7 +734,7 @@ impl<T: Payload, M: Trust> poll::Wait for Subscriber<T, M> {
             "prepare_wait: a subscription made with `Wake::Futex` has no file descriptor to poll"
         );
         let seen = self.local.words().seq();
-        if self.reader.pending() || self.local.died() {
+        if self.reader.pending() || self.local.died() || self.local.evicted() {
             return false;
         }
         #[cfg(test)]
@@ -732,7 +742,7 @@ impl<T: Payload, M: Trust> poll::Wait for Subscriber<T, M> {
             hook();
         }
         // An interrupt stays up for the next receive that waits; its byte ends this poll.
-        if self.local.arm(seen) & DIED != 0 || self.local.words().seq() != seen {
+        if self.local.arm(seen) & (DIED | EVICTED) != 0 || self.local.words().seq() != seen {
             self.local.disarm();
             return false;
         }

@@ -14,13 +14,19 @@ pub struct PublisherStats {
     pub bytes: u64,
     /// The subscriptions the topic holds, after taking out those that ended.
     pub subscribers: Vec<SubscriberInfo>,
+    /// Subscriptions a wait for room took out
+    /// ([`PublisherPolicy::backpressure`](crate::PublisherPolicy::backpressure)), each logged too.
+    pub evicted: u64,
 }
 
 /// One subscription as its publisher sees it.
 ///
 /// `lag_bytes`, `lost` and `waiting` come from the subscriber's control page, which the
 /// subscriber writes: they say what it reports, and a subscriber that does not follow the
-/// protocol can make them say anything. Nothing the publisher does depends on them.
+/// protocol can make them say anything. The read position behind `lag_bytes` decides which slot
+/// of a pool is lent next and, with backpressure, how long a publish waits: a subscriber that
+/// reports it wrongly loses records of its own if ahead, and is taken out after the timeout if
+/// behind.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubscriberInfo {
     /// The uid of the process that made the subscription call.
@@ -33,6 +39,9 @@ pub struct SubscriberInfo {
     pub lost: u64,
     /// Whether it is about to sleep, or sleeps, for the next record.
     pub waiting: bool,
+    /// Whether a wait for room took it out. It holds its place until the subscriber drops it,
+    /// and the slot it pins stays pinned.
+    pub evicted: bool,
 }
 
 /// What a subscriber has received: [`Subscriber::stats`](crate::Subscriber::stats) and

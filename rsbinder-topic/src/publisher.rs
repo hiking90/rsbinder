@@ -18,9 +18,10 @@ use std::sync::{Arc, Weak};
 use rsbinder::fmq::shm::Mapping;
 use rsbinder::{
     BinderResult, CallingContext, ExceptionCode, Interface, ParcelFileDescriptor, SIBinder, Status,
-    StatusCode,
+    StatusCode, Strong,
 };
 
+use crate::aidl::ISubscription::ISubscription;
 use crate::aidl::ITopic::{
     BnTopic, ITopic, ERROR_CLOSED, ERROR_FULL, ERROR_VERSION, WAKE_FD, WAKE_FUTEX,
 };
@@ -445,6 +446,11 @@ impl<T: Payload + 'static> Accept for Shared<T> {
         if token.as_proxy().is_none() && !asked_here(token) {
             return Err(StatusCode::BadValue.into());
         }
+        // A comparison of the cached descriptor, no call; outside the lock all the same.
+        let subscription: Strong<dyn ISubscription> = token
+            .clone()
+            .into_interface()
+            .map_err(|_| StatusCode::BadValue)?;
         // The subscriber's socket: sent on with per-call flags only, which it cannot change.
         let socket = match (request.wake, &request.wakeFd) {
             (WAKE_FUTEX, None) => None,
@@ -473,7 +479,13 @@ impl<T: Payload + 'static> Accept for Shared<T> {
         let caller = CallingContext::default();
         let uid = caller.uid;
         let list = Arc::downgrade(&self) as Weak<dyn Forget>;
-        let link = Link::new(control, (uid, caller.pid), socket, token, list)?;
+        let link = Link::new(
+            control,
+            (uid, caller.pid),
+            socket,
+            (token, subscription),
+            list,
+        )?;
         let link = Arc::new(link);
 
         let mut state = self.writer.lock();

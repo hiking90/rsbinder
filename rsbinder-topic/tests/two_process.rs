@@ -33,8 +33,8 @@ use rsbinder::{
 use rsbinder_topic::aidl::ITopic::{ITopic, ERROR_VERSION};
 use rsbinder_topic::aidl::SubscribeRequest::SubscribeRequest;
 use rsbinder_topic::{
-    wait_any, Bytes, Closed, Disconnected, NamedSubscriber, Payload, PoolPolicy, Publisher,
-    PublisherPolicy, RecvError, Subscriber, SubscriberPolicy, Wait, Wake,
+    wait_any, Backpressure, Bytes, Closed, Disconnected, NamedSubscriber, Payload, PoolPolicy,
+    Publisher, PublisherPolicy, RecvError, Subscriber, SubscriberPolicy, Wait, Wake,
 };
 
 const ROLE: &str = "RSBINDER_TOPIC_ROLE";
@@ -653,6 +653,99 @@ fn a_receive_after_a_dropped_async_receive_learns_that_the_publisher_died() {
     runtime.shutdown_timeout(Duration::from_secs(1));
 }
 
+/// A topic of the smallest ring that waits up to `timeout`, registered with the hub.
+fn waiting(tag: &str, timeout: Duration) -> (String, Publisher<Bytes>) {
+    init();
+    let publisher = Publisher::<Bytes>::new(&PublisherPolicy {
+        ring_bytes: 4096,
+        backpressure: Some(Backpressure { timeout }),
+        ..PublisherPolicy::default()
+    })
+    .unwrap();
+    let name = name(tag);
+    hub::add_service(&name, publisher.as_binder()).unwrap();
+    (name, publisher)
+}
+
+/// 64 bytes that carry `n`.
+fn numbered(n: u32) -> Bytes {
+    let mut bytes = vec![0; 64];
+    bytes[..4].copy_from_slice(&n.to_le_bytes());
+    Bytes(bytes)
+}
+
+/// Publish two rings' worth of numbered values; the longest a publish took.
+fn overrun(publisher: &Publisher<Bytes>) -> Duration {
+    (0..2 * 4096 / 72)
+        .map(|n| {
+            let began = Instant::now();
+            publisher.publish(&numbered(n)).unwrap();
+            began.elapsed()
+        })
+        .max()
+        .unwrap()
+}
+
+fn signal(peer: &Peer, signal: rustix::process::Signal) {
+    let pid = rustix::process::Pid::from_raw(peer.child.id() as i32).unwrap();
+    rustix::process::kill_process(pid, signal).unwrap();
+}
+
+/// AC-15.3.9: a subscriber in another process stopped while a ring behind is taken out once a
+/// publish has waited the timeout for it; a subscriber that keeps up loses nothing; and the
+/// stopped one, let go on, ends its subscription with `Closed(Evicted)`.
+#[test]
+#[ignore = "needs a binder device and rsb_hub"]
+fn a_subscriber_stopped_past_the_timeout_is_taken_out_and_told() {
+    let timeout = Duration::from_millis(300);
+    let (name, publisher) = waiting("stall", timeout);
+    let mut peer = Peer::spawn("stall", &name);
+    assert_eq!(peer.says(), "subscribed");
+    let mut keeper =
+        Subscriber::<Bytes>::request(&publisher.as_binder(), &SubscriberPolicy::default()).unwrap();
+    signal(&peer, rustix::process::Signal::STOP);
+    let longest = std::thread::scope(|scope| {
+        let receiving = scope.spawn(move || {
+            (0..2 * 4096 / 72)
+                .map(|_| keeper.recv_timeout(WAIT).unwrap())
+                .collect::<Vec<_>>()
+        });
+        let longest = overrun(&publisher);
+        let got = receiving.join().unwrap();
+        assert_eq!(got, (0..2 * 4096 / 72).map(numbered).collect::<Vec<_>>());
+        longest
+    });
+    assert!(longest >= timeout, "{longest:?}");
+    assert!(longest < timeout + Duration::from_secs(1), "{longest:?}");
+    assert_eq!(publisher.stats().evicted, 1);
+    signal(&peer, rustix::process::Signal::CONT);
+    peer.tell("receive");
+    assert_eq!(peer.says(), "closed Evicted");
+}
+
+/// AC-15.3.11: a publish waiting for a subscriber whose process is killed ends with its death,
+/// well before the timeout, and takes nobody out.
+#[test]
+#[ignore = "needs a binder device and rsb_hub"]
+fn a_wait_for_a_subscriber_that_dies_ends_with_its_death() {
+    let timeout = Duration::from_secs(10);
+    let (name, publisher) = waiting("die", timeout);
+    let mut peer = Peer::spawn("stall", &name);
+    assert_eq!(peer.says(), "subscribed");
+    let began = Instant::now();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            std::thread::sleep(Duration::from_millis(300));
+            peer.kill();
+        });
+        overrun(&publisher);
+    });
+    let took = began.elapsed();
+    assert!(took >= Duration::from_millis(300), "none waited: {took:?}");
+    assert!(took < Duration::from_secs(5), "{took:?}");
+    assert_eq!(publisher.stats().evicted, 0);
+}
+
 /// The other process's side of the tests above.
 #[test]
 #[ignore = "run by the tests above as their other process"]
@@ -697,6 +790,30 @@ fn child() {
             wait_for_eof();
             drop(sample);
         }
+        "stall" => {
+            let topic = hub::check_service(&name).unwrap();
+            let policy = SubscriberPolicy::default();
+            let mut subscriber = Subscriber::<Bytes>::request(&topic, &policy).unwrap();
+            say("subscribed");
+            // Reads nothing until told, then receives until the subscription ends.
+            let mut told = String::new();
+            std::io::stdin().read_line(&mut told).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match subscriber.recv_timeout(Duration::from_millis(100)) {
+                    Err(RecvError::Closed(closed)) => {
+                        say(&format!("closed {closed:?}"));
+                        break;
+                    }
+                    _ if Instant::now() > deadline => {
+                        say("not closed");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            wait_for_eof();
+        }
         "subscribe-loop" => {
             let topic = hub::check_service(&name).unwrap();
             let policy = SubscriberPolicy::default();
@@ -711,7 +828,7 @@ fn child() {
             let service = topic.clone().into_interface::<dyn ITopic>().unwrap();
             let token = || rsbinder::Binder::new(Inert).as_binder();
             let mut request = raw_request(token());
-            request.version = 2;
+            request.version = 99;
             say(&format!(
                 "version: {}",
                 verdict(service.r#subscribe(&request))
@@ -793,7 +910,7 @@ fn verdict<T>(result: rsbinder::BinderResult<T>) -> String {
 /// A request as `Subscriber::request` makes it for `Bytes`, with `token` given.
 fn raw_request(token: SIBinder) -> SubscribeRequest {
     SubscribeRequest {
-        version: 1,
+        version: 2,
         r#type: Bytes::type_name().to_owned(),
         token: Some(token),
         control: Some(ParcelFileDescriptor::from(control_page())),
@@ -803,12 +920,12 @@ fn raw_request(token: SIBinder) -> SubscribeRequest {
     }
 }
 
-/// A control page of layout 0.1 with no pin words, as a subscriber makes it.
+/// A control page of layout 0.2 with no pin words, as a subscriber makes it.
 fn control_page() -> OwnedFd {
     let options = CreateOptions::new("rsbinder-topic-test").populate(true);
     let file = File::from(shm::create(0x80, &options).unwrap());
     file.write_at(b"RSTC", 0).unwrap();
-    file.write_at(&1u32.to_ne_bytes(), 4).unwrap();
+    file.write_at(&2u32.to_ne_bytes(), 4).unwrap();
     let fd = OwnedFd::from(file);
     let seals = Seals::GROW | Seals::SHRINK | Seals::FUTURE_WRITE | Seals::SEAL;
     shm::add_seals(fd.as_fd(), seals).unwrap();
