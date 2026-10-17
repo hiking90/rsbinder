@@ -424,6 +424,111 @@ fn a_commit_after_a_wait_that_saw_the_last(wake: Wake) {
     assert_eq!(sent, 1);
 }
 
+/// AC-15.2.33: each subscription named with its caller; what was published, and what each
+/// subscriber's control page reports.
+#[test]
+fn a_publishers_stats_name_its_subscriptions_and_count_its_records() {
+    let publisher = topic(64 << 10);
+    let mut reading = subscriber(&publisher);
+    let idle = subscriber(&publisher);
+    for n in 0..3 {
+        publisher.publish(&num(n)).unwrap();
+    }
+    assert_eq!(reading.try_recv().map(|bytes| value(&bytes)), Ok(0));
+    let stats = publisher.stats();
+    assert_eq!((stats.published, stats.bytes), (3, 12));
+    // Outside a transaction, this process's own: the subscribers are in it.
+    let caller = rsbinder::CallingContext::default();
+    assert_eq!(stats.subscribers.len(), 2);
+    for info in &stats.subscribers {
+        assert_eq!((info.uid, info.pid, info.lost), (caller.uid, caller.pid, 0));
+        assert!(!info.waiting);
+    }
+    // A record is 8 bytes of header and its payload padded to 8: 16 here.
+    let lags: Vec<u64> = stats
+        .subscribers
+        .iter()
+        .map(|info| info.lag_bytes)
+        .collect();
+    assert_eq!(lags, [32, 48]);
+    drop(idle);
+    assert_eq!(publisher.stats().subscribers.len(), 1);
+    assert_eq!(
+        reading.stats(),
+        crate::SubscriberStats {
+            received: 1,
+            lost: 0,
+            decode_errors: 0,
+            connections: 1,
+        }
+    );
+}
+
+#[test]
+fn a_waiting_subscriber_is_reported_waiting() {
+    let publisher = topic(64 << 10);
+    let subscriber = subscriber(&publisher);
+    let local = subscriber.local().clone();
+    let receiving = asleep(subscriber, Subscriber::recv);
+    eventually("the subscriber sleeps", || local.is_parked());
+    assert!(publisher.stats().subscribers[0].waiting);
+    publisher.publish(&num(4)).unwrap();
+    assert_eq!(receiving.join().unwrap(), Ok(4));
+    // The thread dropped its subscriber, which the next look takes out.
+    assert!(publisher.stats().subscribers.is_empty());
+}
+
+/// The payload type of `Bytes` that cannot decode a record of four bytes.
+#[derive(Debug, PartialEq)]
+struct NotFour(Vec<u8>);
+
+impl crate::Payload for NotFour {
+    fn type_name() -> &'static str {
+        <Bytes as crate::Payload>::type_name()
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) -> rsbinder::Result<()> {
+        out.extend_from_slice(&self.0);
+        Ok(())
+    }
+
+    fn decode(bytes: &[u8]) -> rsbinder::Result<Self> {
+        match bytes.len() {
+            4 => Err(rsbinder::StatusCode::BadValue),
+            _ => Ok(Self(bytes.to_vec())),
+        }
+    }
+}
+
+/// AC-15.2.33: a slow subscriber's `lost` is the sum of the `Lagged` it got, on both ends.
+#[test]
+fn a_slow_subscribers_lost_is_the_sum_of_its_lagged_on_both_ends() {
+    let publisher = topic(4096);
+    let policy = SubscriberPolicy::default();
+    let mut slow = Subscriber::<NotFour>::request(&publisher.as_binder(), &policy).unwrap();
+    for n in 0..1000 {
+        publisher.publish(&num(n)).unwrap();
+    }
+    publisher.publish(&Bytes(vec![1; 5])).unwrap();
+    let (mut lagged, mut decode_errors) = (0, 0);
+    loop {
+        match slow.try_recv() {
+            Err(RecvError::Lagged(lost)) => lagged += lost,
+            Err(RecvError::Decode(_)) => decode_errors += 1,
+            Ok(value) => assert_eq!(value, NotFour(vec![1; 5])),
+            Err(RecvError::Empty) => break,
+            Err(other) => panic!("{other:?}"),
+        }
+    }
+    assert!(lagged > 0, "a ring of 4 KiB kept all of 1000 records");
+    let stats = slow.stats();
+    assert_eq!((stats.lost, stats.received), (lagged, 1));
+    assert_eq!(stats.lost + stats.decode_errors + stats.received, 1001);
+    assert_eq!(stats.decode_errors, decode_errors);
+    let info = &publisher.stats().subscribers[0];
+    assert_eq!((info.lost, info.lag_bytes), (lagged, 0));
+}
+
 #[cfg(feature = "tokio")]
 mod pool {
     use std::future::Future;

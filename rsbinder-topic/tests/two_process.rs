@@ -171,6 +171,28 @@ fn a_killed_or_dropped_subscriber_is_taken_out_and_its_page_unmapped() {
     assert_eq!(memfds(), before);
 }
 
+/// AC-15.2.33: a subscription from another process is named with that process's uid and pid.
+#[test]
+#[ignore = "needs a binder device and rsb_hub"]
+fn a_publishers_stats_name_a_subscriber_of_another_process() {
+    let (name, publisher) = publish("stats");
+    let mut peer = Peer::spawn("subscribe", &name);
+    assert_eq!(peer.says(), "subscribed");
+    publisher.publish(&Bytes(vec![7; 9])).unwrap();
+    let stats = publisher.stats();
+    assert_eq!((stats.published, stats.bytes), (1, 9));
+    let [info] = stats.subscribers.as_slice() else {
+        panic!("{stats:?}");
+    };
+    assert_eq!(info.pid, peer.child.id() as i32);
+    assert_eq!(info.uid, rustix::process::getuid().as_raw());
+    // Not read: the record, 8 bytes of header and 16 of padded payload.
+    assert_eq!(info.lag_bytes, 24);
+    peer.tell("drop");
+    assert_eq!(peer.says(), "dropped");
+    assert!(publisher.stats().subscribers.is_empty());
+}
+
 #[test]
 #[ignore = "needs a binder device and rsb_hub"]
 fn subscribers_killed_while_they_subscribe_leave_nothing() {

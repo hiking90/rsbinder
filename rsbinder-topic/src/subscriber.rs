@@ -43,7 +43,7 @@ use crate::ring::{self, Loads, Reader};
 use crate::wait::{on_pool, Leftover};
 use crate::wait::{Died, Local, Parts, Slept, Words, ABANDON, DIED, INTERRUPT};
 use crate::wake::FdWake;
-use crate::{poll, Closed, Payload, RecvError};
+use crate::{poll, Closed, Payload, RecvError, SubscriberStats};
 
 /// Where a subscription starts reading.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -130,6 +130,9 @@ pub struct Subscriber<T: Payload> {
     reactor: Option<Reactor>,
     local: Arc<Local<Parts>>,
     spin: SpinGauge,
+    /// Values returned and records that failed to decode, for [`SubscriberStats`].
+    received: u64,
+    decode_errors: u64,
     /// The wait a dropped `recv_async` left on the blocking pool, which the next wait joins.
     #[cfg(feature = "tokio")]
     leftover: Arc<Leftover>,
@@ -246,6 +249,8 @@ impl<T: Payload> Subscriber<T> {
             reactor: None,
             local,
             spin: SpinGauge::default(),
+            received: 0,
+            decode_errors: 0,
             #[cfg(feature = "tokio")]
             leftover: Arc::default(),
             _token: token,
@@ -400,6 +405,16 @@ impl<T: Payload> Subscriber<T> {
         }
     }
 
+    /// What this subscription has received, counted in this process (plan 15 §5.9a).
+    pub fn stats(&self) -> SubscriberStats {
+        SubscriberStats {
+            received: self.received,
+            lost: self.reader.lost(),
+            decode_errors: self.decode_errors,
+            connections: 1,
+        }
+    }
+
     /// Where the next record to return starts.
     pub(crate) fn position(&self) -> u64 {
         self.reader.position()
@@ -488,10 +503,15 @@ impl<T: Payload> Subscriber<T> {
         found
     }
 
-    fn settle(&self, received: Result<T, RecvError>, died: bool) -> Result<T, RecvError> {
+    fn settle(&mut self, received: Result<T, RecvError>, died: bool) -> Result<T, RecvError> {
         let page = &self.control.0;
         page.read().store(self.reader.position(), Ordering::Relaxed);
         page.lost().store(self.reader.lost(), Ordering::Relaxed);
+        match &received {
+            Ok(_) => self.received += 1,
+            Err(RecvError::Decode(_)) => self.decode_errors += 1,
+            Err(_) => {}
+        }
         match received {
             Err(RecvError::Empty) if died => Err(RecvError::Closed(Closed::PublisherDied)),
             other => other,

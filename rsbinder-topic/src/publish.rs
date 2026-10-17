@@ -15,7 +15,7 @@ use rsbinder::{CallingContext, Status, StatusCode};
 use crate::layout::{self, Stored, MIN_RING};
 use crate::link::Links;
 use crate::ring::{Kind, Refused, Stores, Writer};
-use crate::{end, Payload};
+use crate::{end, Payload, PublisherStats};
 
 /// What a topic is made with.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -179,6 +179,9 @@ struct Scratch {
 pub(crate) struct State<S> {
     pub(crate) writer: Writer<S>,
     pub(crate) links: Links,
+    /// Records published, and their payload bytes, for [`PublisherStats`].
+    published: u64,
+    bytes: u64,
     /// A test's pause after a commit bumps `seq`, before it loads the subscribers' `state`.
     #[cfg(all(test, not(loom)))]
     pub(crate) after_bump: Option<Box<dyn FnMut() + Send>>,
@@ -227,12 +230,28 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
             state: Mutex::new(State {
                 writer,
                 links: Links::default(),
+                published: 0,
+                bytes: 0,
                 #[cfg(all(test, not(loom)))]
                 after_bump: None,
             }),
             scratch: Mutex::new(Vec::new()),
             _payload: PhantomData,
         }
+    }
+
+    /// What has been published, and the subscriptions held after taking out those that ended.
+    pub(crate) fn stats(&self) -> PublisherStats {
+        let mut state = self.lock();
+        let gone = state.links.prune();
+        let stats = PublisherStats {
+            published: state.published,
+            bytes: state.bytes,
+            subscribers: state.links.infos(state.writer.position()),
+        };
+        drop(state);
+        drop(gone);
+        stats
     }
 
     /// The lock every change to the ring and to the list of subscriptions takes.
@@ -332,6 +351,8 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
         for (start, end) in records() {
             state.writer.put(Kind::Item, &scratch.bytes[start..end])?;
         }
+        state.published += scratch.ends.len() as u64;
+        state.bytes += scratch.bytes.len() as u64;
         state.announce();
         let gone = state.links.prune();
         drop(state);

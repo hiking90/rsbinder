@@ -11,6 +11,7 @@ use rsbinder::{DeathRecipient, SIBinder, WIBinder};
 
 use crate::layout::{seen_field, ControlView, CLOSED, WAITING};
 use crate::wake::{send_wake, Sent};
+use crate::SubscriberInfo;
 
 /// A death notification registered on a proxy, removed on drop.
 pub(crate) struct DeathLink<R: DeathRecipient + 'static> {
@@ -82,6 +83,7 @@ impl DeathRecipient for Watch {
 pub(crate) struct Link {
     control: ControlView,
     uid: u32,
+    pid: i32,
     dead: Arc<Dead>,
     /// The `state` of the wait last woken by a wake that ends it, so a wait gets one (§5.5).
     woken: AtomicU32,
@@ -102,10 +104,11 @@ enum Wanted {
 }
 
 impl Link {
-    /// A subscription through `control` from `uid`, woken by `socket` if any, gone with `token`.
+    /// A subscription through `control` from `uid` and `pid`, woken by `socket` if any, gone with
+    /// `token`.
     pub(crate) fn new(
         control: ControlView,
-        uid: u32,
+        (uid, pid): (u32, i32),
         socket: Option<OwnedFd>,
         token: &SIBinder,
         list: Weak<dyn Forget>,
@@ -118,6 +121,7 @@ impl Link {
         Ok(Self {
             control,
             uid,
+            pid,
             _death: DeathLink::new(token, watch)?,
             dead,
             // No `state` with `WAITING` raised is zero.
@@ -162,6 +166,18 @@ impl Link {
     pub(crate) fn dead(&self) -> bool {
         self.dead.get()
     }
+
+    /// The subscription as its control page reports it, against the publisher's `write`.
+    fn info(&self, write: u64) -> SubscriberInfo {
+        SubscriberInfo {
+            uid: self.uid,
+            pid: self.pid,
+            // The subscriber writes `read`: one ahead of `write` is a wrong report, not a lag.
+            lag_bytes: write.saturating_sub(self.control.read()),
+            lost: self.control.lost(),
+            waiting: self.control.state().load() & WAITING != 0,
+        }
+    }
 }
 
 /// One topic's subscriptions, under the writer's lock; removals are returned to drop after it.
@@ -180,6 +196,11 @@ impl Links {
 
     pub(crate) fn of_uid(&self, uid: u32) -> usize {
         self.links.iter().filter(|link| link.uid == uid).count()
+    }
+
+    /// Each subscription as its control page reports it, against the publisher's `write`.
+    pub(crate) fn infos(&self, write: u64) -> Vec<SubscriberInfo> {
+        self.links.iter().map(|link| link.info(write)).collect()
     }
 
     pub(crate) fn push(&mut self, link: Arc<Link>) {

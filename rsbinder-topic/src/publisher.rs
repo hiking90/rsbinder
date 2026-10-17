@@ -31,7 +31,7 @@ use crate::layout::{self, ControlView, Stored, HEADER_OFFSET, VERSION};
 use crate::link::{Dead, Forget, Link};
 use crate::publish::TypedWriter;
 use crate::resolve::{Resolver, ServiceManager};
-use crate::{wake, Authorize, Payload, PublishError, PublisherPolicy};
+use crate::{wake, Authorize, Payload, PublishError, PublisherPolicy, PublisherStats};
 
 /// The sending end of a topic of `T`: it writes values into the topic's memory and takes
 /// subscriptions to it.
@@ -156,6 +156,12 @@ impl<T: Payload + 'static> Publisher<T> {
     #[cfg(all(test, not(loom), any(target_os = "linux", target_os = "android")))]
     pub(crate) fn pause_after_bump(&self, pause: Box<dyn FnMut() + Send>) {
         self.shared.writer.lock().after_bump = Some(pause);
+    }
+
+    /// What the topic has published, and each subscription it holds after taking out those that
+    /// ended: who made it and what its control page reports (plan 15 §5.9a).
+    pub fn stats(&self) -> PublisherStats {
+        self.shared.writer.stats()
     }
 
     /// The subscriptions the topic holds, after taking out those that ended.
@@ -340,9 +346,11 @@ impl<T: Payload + 'static> Accept for Shared<T> {
             }
             _ => (None, None),
         };
-        let uid = CallingContext::default().uid;
+        let caller = CallingContext::default();
+        let uid = caller.uid;
         let list = Arc::downgrade(&self) as Weak<dyn Forget>;
-        let link = Arc::new(Link::new(control, uid, socket, token, list)?);
+        let link = Link::new(control, (uid, caller.pid), socket, token, list)?;
+        let link = Arc::new(link);
 
         let mut state = self.writer.lock();
         let gone = state.links.prune();

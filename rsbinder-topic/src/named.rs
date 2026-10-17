@@ -20,7 +20,10 @@ use rsbinder::{BinderResult, ExceptionCode, SIBinder, Status, StatusCode};
 use crate::aidl::ITopic::{ERROR_CLOSED, ERROR_VERSION};
 use crate::resolve::{Resolver, ServiceManager, Watch};
 use crate::subscriber::Interrupt;
-use crate::{Disconnected, Interrupter, Payload, RecvError, Start, Subscriber, SubscriberPolicy};
+use crate::{
+    Disconnected, Interrupter, Payload, RecvError, Start, Subscriber, SubscriberPolicy,
+    SubscriberStats,
+};
 
 /// The first wait before a refused subscription is asked again, doubled up to [`LAST_RETRY`].
 const FIRST_RETRY: Duration = Duration::from_secs(1);
@@ -71,6 +74,8 @@ const LAST_RETRY: Duration = Duration::from_secs(30);
 pub struct NamedSubscriber<T: Payload> {
     named: Arc<Named<T>>,
     current: Option<Connection<T>>,
+    /// What the connections that ended counted.
+    past: SubscriberStats,
     _watch: Watch,
 }
 
@@ -193,8 +198,19 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
         Ok(Self {
             named,
             current: None,
+            past: SubscriberStats::default(),
             _watch: watch,
         })
+    }
+
+    /// What this subscriber has received over all its connections, counted in this process
+    /// (plan 15 §5.9a).
+    pub fn stats(&self) -> SubscriberStats {
+        let mut stats = self.past;
+        if let Some(connection) = &self.current {
+            stats += connection.subscriber.stats();
+        }
+        stats
     }
 
     /// The next value, without waiting: [`Subscriber::try_recv`] on the connection.
@@ -337,6 +353,9 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
     /// Drop the connection, look for the next publisher, and say why.
     fn finish(&mut self, why: Disconnected) -> RecvError {
         let gone = self.current.take();
+        if let Some(connection) = &gone {
+            self.past += connection.subscriber.stats();
+        }
         let mut state = self.named.lock();
         state.connected = None;
         state.wake = None;

@@ -451,6 +451,29 @@ fn a_subscriber_dropped_during_a_call_that_hangs_returns_and_the_late_reply_is_c
     }
 }
 
+/// AC-15.2.33: a name subscriber's stats add up its connections.
+#[test]
+fn a_name_subscribers_stats_count_every_connection() {
+    let names = Names::default();
+    let mut subscriber = subscribe(&names);
+    assert_eq!(subscriber.stats(), crate::SubscriberStats::default());
+    let first = advertise(&names, &policy());
+    connected(&subscriber);
+    first.publish(&bytes(1)).unwrap();
+    first.publish(&bytes(2)).unwrap();
+    drop(first);
+    assert_eq!(recv(&mut subscriber), Ok(bytes(1)));
+    assert_eq!(recv(&mut subscriber), Ok(bytes(2)));
+    let ended = Err(RecvError::Disconnected(Disconnected::Ended(Closed::End)));
+    assert_eq!(recv(&mut subscriber), ended);
+    let second = advertise(&names, &policy());
+    connected(&subscriber);
+    second.publish(&bytes(3)).unwrap();
+    assert_eq!(recv(&mut subscriber), Ok(bytes(3)));
+    let stats = subscriber.stats();
+    assert_eq!((stats.received, stats.connections, stats.lost), (3, 2, 0));
+}
+
 #[test]
 fn a_name_subscriber_and_its_interrupter_move_between_threads() {
     fn moved<T: Send>() {}

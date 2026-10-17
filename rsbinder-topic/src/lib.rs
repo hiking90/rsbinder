@@ -90,6 +90,7 @@ mod publisher;
 mod receive;
 mod resolve;
 mod ring;
+mod stats;
 mod subscriber;
 mod wait;
 mod wake;
@@ -101,6 +102,7 @@ pub use publish::{Authorize, PublishError, PublisherPolicy};
 pub use publisher::{Acceptor, Publisher};
 pub use receive::{Closed, Disconnected, RecvError};
 pub use resolve::{Resolver, ServiceManager, Watch};
+pub use stats::{PublisherStats, SubscriberInfo, SubscriberStats};
 pub use subscriber::{Interrupter, Start, Subscriber, SubscriberPolicy, Wake};
 
 #[cfg(any(test, feature = "fuzzing"))]
