@@ -12,10 +12,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use rsbinder::fmq::shm::Mapping;
 use rsbinder::{CallingContext, Status, StatusCode};
 
-use crate::layout::{self, Stored, StoredPool, MIN_RING};
+use crate::layout::{self, LentSlot, Stored, StoredPool, MIN_RING};
 use crate::link::Links;
 use crate::payload::{relabel, Piece};
-use crate::pool::{Slots, MAX_PINS};
+use crate::pool::{LendError, Loan, Slots, MAX_PINS};
 use crate::ring::{Kind, Refused, Stores, Writer};
 use crate::{end, Encoding, Payload, PublisherStats};
 
@@ -225,6 +225,13 @@ pub enum PublishError {
     Encode(StatusCode),
     /// The topic has been closed.
     Closed,
+    /// A loan from a topic made without a pool ([`PublisherPolicy::pool`] is `None`).
+    NoPool,
+    /// As many loans as [`PoolPolicy::max_loans`] are held and not yet published or dropped.
+    TooManyLoans {
+        /// The policy's bound.
+        max: usize,
+    },
 }
 
 impl fmt::Display for PublishError {
@@ -236,6 +243,13 @@ impl fmt::Display for PublishError {
             ),
             Self::Encode(code) => write!(f, "the value failed to encode: {code}"),
             Self::Closed => f.write_str("the topic is closed"),
+            Self::NoPool => f.write_str("the topic has no pool to lend from"),
+            Self::TooManyLoans { max } => {
+                write!(
+                    f,
+                    "{max} loans are held, as many as the topic's pool allows"
+                )
+            }
         }
     }
 }
@@ -261,10 +275,10 @@ struct Scratch {
 }
 
 /// The pool, and the publisher's account of what its slots hold.
-#[allow(dead_code, reason = "plan 15 P3-2 lends its slots")]
 pub(crate) struct Lending {
     pub(crate) memory: StoredPool,
     pub(crate) slots: Slots,
+    max_loans: usize,
 }
 
 /// The pool memory a reply hands out: a duplicate of `fd`, and its shape.
@@ -332,6 +346,7 @@ impl<T: Payload> TypedWriter<T, Stored<Mapping>> {
         writer.lock().lending = Some(Lending {
             memory,
             slots: Slots::new(slots, pool.max_loans),
+            max_loans: pool.max_loans,
         });
         let pool_fd = PoolFd {
             fd: pool_fd,
@@ -433,6 +448,85 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
             self.scratch.lock().expect("lock poisoned").push(scratch);
         }
         written
+    }
+
+    /// Lend a slot of the pool for a value of `len` bytes (plan 15 §6).
+    pub(crate) fn lend(&self, len: usize) -> Result<LentSlot, PublishError> {
+        let mut state = self.lock();
+        let gone = state.links.prune();
+        let State {
+            writer,
+            links,
+            lending,
+            ..
+        } = &mut *state;
+        let lent = match lending {
+            _ if writer.ended() => Err(PublishError::Closed),
+            None => Err(PublishError::NoPool),
+            Some(lending) if len > lending.memory.slot_bytes() as usize => {
+                let max = lending.memory.slot_bytes() as usize;
+                Err(PublishError::TooLarge { bytes: len, max })
+            }
+            Some(lending) => {
+                let read = links.lowest_read();
+                let lent = lending.memory.lend(&mut lending.slots, links, read, len);
+                lent.map_err(|refused| match refused {
+                    LendError::TooMany => PublishError::TooManyLoans {
+                        max: lending.max_loans,
+                    },
+                    // Pins hold one slot per subscription, at most `max_subscribers`.
+                    LendError::NoSlot => unreachable!("a pool has a slot past every pin and loan"),
+                })
+            }
+        };
+        drop(state);
+        drop(gone);
+        lent
+    }
+
+    /// Publish the value written into `slot`: its `LOAN` record, then the announcement.
+    pub(crate) fn publish_loan(&self, slot: LentSlot) -> Result<(), PublishError> {
+        let mut state = self.lock();
+        let len = slot.bytes().len();
+        let number = slot.slot();
+        drop(slot);
+        let State {
+            writer, lending, ..
+        } = &mut *state;
+        let lending = lending.as_mut().expect("a lent slot comes from the pool");
+        let end = match writer.end_of(Loan::BYTES) {
+            Ok(end) => end,
+            Err(refused) => {
+                lending.slots.give_back(number);
+                return Err(refused.into());
+            }
+        };
+        let generation = lending.slots.publish(&lending.memory, number, end);
+        let loan = Loan {
+            slot: number,
+            // At most `slot_bytes`, a `u32`.
+            len: len as u32,
+            generation,
+        };
+        // `end_of` admitted this record, so `put` writes it.
+        writer.put(Kind::Loan, &loan.bytes())?;
+        state.published += 1;
+        state.bytes += len as u64;
+        state.announce();
+        let gone = state.links.prune();
+        drop(state);
+        drop(gone);
+        Ok(())
+    }
+
+    /// `slot` comes back unpublished.
+    pub(crate) fn give_back(&self, slot: LentSlot) {
+        let number = slot.slot();
+        drop(slot);
+        let mut state = self.lock();
+        if let Some(lending) = state.lending.as_mut() {
+            lending.slots.give_back(number);
+        }
     }
 
     /// Write the end record with `status`. Later publishes are [`PublishError::Closed`]; a second

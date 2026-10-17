@@ -120,7 +120,7 @@ fn publisher<T: Payload>(heap: &Heap) -> TypedWriter<T, impl Stores> {
 }
 
 fn subscriber<T: Payload>(heap: &Heap, start: Start) -> TypedReader<T, impl Loads> {
-    TypedReader::new(Reader::attach(heap.loaded(), start).unwrap())
+    TypedReader::new(Reader::attach(heap.loaded(), start).unwrap(), None)
 }
 
 fn sample(seq: i32) -> Sample {
@@ -362,7 +362,7 @@ mod mapped {
 
     fn subscriber<T: Payload>(fd: std::os::fd::BorrowedFd<'_>) -> TypedReader<T, impl Loads> {
         let memory = map_topic(fd, MAX_RING).unwrap();
-        TypedReader::new(Reader::attach(memory, Start::Oldest).unwrap())
+        TypedReader::new(Reader::attach(memory, Start::Oldest).unwrap(), None)
     }
 
     #[test]

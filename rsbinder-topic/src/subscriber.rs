@@ -38,7 +38,7 @@ use crate::aidl::TopicEndpoint::TopicEndpoint;
 use crate::connect::{refuse, status_of, Asking, Token};
 use crate::layout::{self, ControlPage, Loaded, LoadedPool, CLOSED, HEADER_OFFSET, VERSION};
 use crate::link::DeathLink;
-use crate::pool::MAX_PINS;
+use crate::pool::{PoolReader, MAX_PINS};
 use crate::receive::TypedReader;
 use crate::ring::{self, Loads, Reader};
 #[cfg(feature = "tokio")]
@@ -136,9 +136,6 @@ impl Default for SubscriberPolicy {
 pub struct Subscriber<T: Payload> {
     reader: TypedReader<T, Loaded<Arc<Mapping>>>,
     control: Closing,
-    /// The publisher's pool, for a topic that lends slots.
-    #[allow(dead_code, reason = "plan 15 P3-3 reads loaned values out of it")]
-    pool: Option<LoadedPool>,
     /// [`Wake::Fd`]'s fds on the reactor; dropped before `local` closes them.
     #[cfg(feature = "tokio")]
     reactor: Option<Reactor>,
@@ -250,7 +247,10 @@ impl<T: Payload> Subscriber<T> {
         drop(request);
         let memory = map_endpoint(&endpoint, policy.max_ring_bytes)?;
         let pool = match &endpoint.pool {
-            Some(pool) => Some(map_pool(pool, policy.max_pool_bytes)?),
+            Some(pool) => {
+                let pool = map_pool(pool, policy.max_pool_bytes)?;
+                Some(PoolReader::new(pool, control.0.clone()))
+            }
             None => None,
         };
         local.set_words(Parts {
@@ -269,9 +269,8 @@ impl<T: Payload> Subscriber<T> {
         };
         let reader = Reader::attach(memory, start).map_err(|_| StatusCode::BadValue)?;
         Ok(Self {
-            reader: TypedReader::new(reader),
+            reader: TypedReader::new(reader, pool),
             control,
-            pool,
             #[cfg(feature = "tokio")]
             reactor: None,
             local,
@@ -548,7 +547,7 @@ impl<T: Payload> Subscriber<T> {
     /// The publisher's pool as this subscriber mapped it, for tests of the subscription.
     #[cfg(all(test, not(loom), any(target_os = "linux", target_os = "android")))]
     pub(crate) fn pool(&self) -> Option<&LoadedPool> {
-        self.pool.as_ref()
+        self.reader.pool().map(PoolReader::pool)
     }
 
     /// This subscriber's waiting state, for tests that pause or watch a wait.

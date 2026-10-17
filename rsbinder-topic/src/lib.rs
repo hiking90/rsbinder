@@ -100,7 +100,7 @@ pub use named::NamedSubscriber;
 pub use payload::{Bytes, Encoding, Payload, Record};
 pub use poll::{wait_any, Wait};
 pub use publish::{Authorize, PoolPolicy, PublishError, PublisherPolicy};
-pub use publisher::{Acceptor, Publisher};
+pub use publisher::{Acceptor, LoanMut, Publisher};
 pub use receive::{Closed, Disconnected, RecvError};
 pub use resolve::{Resolver, ServiceManager, Watch};
 pub use stats::{PublisherStats, SubscriberInfo, SubscriberStats};
@@ -132,6 +132,19 @@ mod typed_tests;
     )
 ))]
 mod connect_tests;
+
+#[cfg(all(
+    test,
+    not(loom),
+    not(miri),
+    any(target_os = "linux", target_os = "android"),
+    any(
+        target_pointer_width = "64",
+        all(target_arch = "x86", target_feature = "sse2"),
+        all(target_arch = "arm", target_has_atomic = "64")
+    )
+))]
+mod loan_tests;
 
 #[cfg(all(
     test,

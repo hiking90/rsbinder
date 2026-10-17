@@ -28,12 +28,12 @@ use crate::aidl::Pool::Pool;
 use crate::aidl::SubscribeRequest::SubscribeRequest;
 use crate::aidl::TopicEndpoint::TopicEndpoint;
 use crate::connect::{asked_here, refuse, status_of};
-use crate::layout::{self, ControlView, Stored, HEADER_OFFSET, VERSION};
+use crate::layout::{self, ControlView, LentSlot, Stored, HEADER_OFFSET, VERSION};
 use crate::link::{Dead, Forget, Link};
 use crate::pool::MAX_PINS;
 use crate::publish::{PoolFd, TypedWriter};
 use crate::resolve::{Resolver, ServiceManager};
-use crate::{wake, Authorize, Payload, PublishError, PublisherPolicy, PublisherStats};
+use crate::{wake, Authorize, Bytes, Payload, PublishError, PublisherPolicy, PublisherStats};
 
 /// The sending end of a topic of `T`: it writes values into the topic's memory and takes
 /// subscriptions to it.
@@ -208,6 +208,103 @@ impl<T: Payload + 'static> Publisher<T> {
     /// The same binder every time. It refers to the publisher without keeping it.
     pub fn as_binder(&self) -> SIBinder {
         self.binder.clone()
+    }
+}
+
+impl Publisher<Bytes> {
+    /// A slot of the topic's pool to write a value of `len` bytes into, published by
+    /// [`LoanMut::publish`] without a copy through the ring (plan 15 §6).
+    ///
+    /// The slot holds whatever it held before: write all `len` bytes. A subscriber receives the
+    /// value as it receives a [`Bytes`] published with [`publish`](Self::publish), and the two
+    /// mix on one topic. Taking a loan takes the topic's lock once, briefly; nothing waits for a
+    /// subscriber.
+    ///
+    /// [`PublishError::NoPool`] for a topic made without [`PublisherPolicy::pool`],
+    /// [`PublishError::TooLarge`] past [`PoolPolicy::slot_bytes`](crate::PoolPolicy::slot_bytes),
+    /// [`PublishError::TooManyLoans`] while [`PoolPolicy::max_loans`](crate::PoolPolicy::max_loans)
+    /// loans are held, [`PublishError::Closed`] once the topic is closed.
+    ///
+    /// ```no_run
+    /// use rsbinder_topic::{Bytes, PoolPolicy, Publisher, PublisherPolicy};
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let policy = PublisherPolicy {
+    ///     max_subscribers: 4,
+    ///     pool: Some(PoolPolicy::default()),
+    ///     ..PublisherPolicy::default()
+    /// };
+    /// let publisher = Publisher::<Bytes>::new(&policy)?;
+    /// let mut frame = publisher.loan_slice(640 * 480)?;
+    /// frame.fill(0x80);
+    /// frame.publish()?;
+    /// # Ok(()) }
+    /// ```
+    pub fn loan_slice(&self, len: usize) -> Result<LoanMut<'_>, PublishError> {
+        let slot = self.shared.writer.lend(len)?;
+        Ok(LoanMut {
+            writer: &self.shared.writer,
+            slot: Some(slot),
+        })
+    }
+}
+
+/// A slot of a topic's pool, lent for one value: [`Publisher::loan_slice`].
+///
+/// It dereferences to the value's bytes. [`publish`](Self::publish) hands it to the subscribers;
+/// dropping it unpublished gives the slot back. No subscriber reads the slot while it is lent.
+pub struct LoanMut<'a> {
+    writer: &'a TypedWriter<Bytes, Stored<Mapping>>,
+    /// `None` once published.
+    slot: Option<LentSlot>,
+}
+
+impl LoanMut<'_> {
+    /// Publish the value: one record of 24 bytes in the ring names the slot, and the subscribers
+    /// waiting are woken as for [`Publisher::publish`]. [`PublishError::Closed`] once the topic
+    /// is closed, and the slot goes back.
+    pub fn publish(mut self) -> Result<(), PublishError> {
+        let slot = self.slot.take().expect("a loan is published once");
+        self.writer.publish_loan(slot)
+    }
+
+    /// The number of the slot lent, for tests of which one the pool chose.
+    #[cfg(all(test, not(loom), any(target_os = "linux", target_os = "android")))]
+    pub(crate) fn slot(&self) -> u32 {
+        self.slot.as_ref().expect("held until published").slot()
+    }
+}
+
+impl std::ops::Deref for LoanMut<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.slot.as_ref().expect("held until published").bytes()
+    }
+}
+
+impl std::ops::DerefMut for LoanMut<'_> {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        self.slot
+            .as_mut()
+            .expect("held until published")
+            .bytes_mut()
+    }
+}
+
+impl Drop for LoanMut<'_> {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.take() {
+            self.writer.give_back(slot);
+        }
+    }
+}
+
+impl fmt::Debug for LoanMut<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LoanMut")
+            .field("len", &self.len())
+            .finish_non_exhaustive()
     }
 }
 
@@ -392,8 +489,9 @@ impl<T: Payload + 'static> Accept for Shared<T> {
                 "the publisher has no room for another subscription",
             ))
         } else {
-            state.links.push(link.clone());
-            Ok((state.writer.position(), state.writer.next_index()))
+            let start = state.writer.position();
+            state.links.push(link.clone(), start);
+            Ok((start, state.writer.next_index()))
         };
         drop(state);
         // Unmapped and unlinked here, after the lock: `link` too, when it was refused.

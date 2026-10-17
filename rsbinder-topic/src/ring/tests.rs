@@ -423,12 +423,38 @@ fn a_record_of_parts_is_their_bytes_then_zeros_to_a_word() {
 }
 
 #[test]
+fn a_loan_record_is_returned_with_what_it_names_between_items() {
+    let heap = Heap::new(RING);
+    let (mut writer, mut reader) = (writer_of(&heap), reader_of(&heap, Start::Oldest));
+    let loan = Loan {
+        slot: 2,
+        len: 9,
+        generation: 4,
+    };
+    publish(&mut writer, 1);
+    writer.put(Kind::Loan, &loan.bytes()).unwrap();
+    publish(&mut writer, 1);
+    assert_eq!(take(&mut reader), item(0));
+    assert_eq!(take(&mut reader), Got::Loan(1, loan));
+    assert_eq!(take(&mut reader), item(2));
+    writer.put(Kind::Loan, &loan.bytes()).unwrap();
+    assert_eq!(latest(&mut reader), Got::Loan(3, loan));
+    assert_eq!(reader.position(), writer.position());
+    // One of another length is no loan of this layout's.
+    writer.put(Kind::Loan, &[0; 8]).unwrap();
+    assert_eq!(
+        take(&mut reader),
+        Got::Corrupted("loan record of another length")
+    );
+}
+
+#[test]
 fn records_of_a_later_layout_are_stepped_over_without_a_loss() {
     let heap = Heap::new(RING);
     let (mut writer, mut reader) = (writer_of(&heap), reader_of(&heap, Start::Oldest));
     publish(&mut writer, 1);
     writer.put_raw(3, 8, [&b"reserved"[..]]).unwrap();
-    writer.put_raw(2, 0, []).unwrap();
+    writer.put_raw(3, 0, []).unwrap();
     publish(&mut writer, 1);
     assert_eq!(take(&mut reader), item(0));
     assert_eq!(take(&mut reader), item(3));

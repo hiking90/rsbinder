@@ -8,8 +8,9 @@ use std::marker::PhantomData;
 
 use rsbinder::{Status, StatusCode};
 
+use crate::pool::{PoolReader, Unpinned};
 use crate::ring::{Corrupted, Loads, Reader, Taken};
-use crate::{end, Payload};
+use crate::{end, Payload, Record};
 
 /// Why a receive returned no value.
 ///
@@ -111,29 +112,77 @@ impl fmt::Display for Closed {
 
 impl std::error::Error for RecvError {}
 
-/// A reader of a topic's ring that decodes each record as a `T`.
+/// A reader of a topic's ring that decodes each record as a `T`, and each loan's value once it
+/// is copied out of the pool.
 pub(crate) struct TypedReader<T, L> {
     reader: Reader<L>,
+    /// The publisher's pool, for a topic that lends slots.
+    pool: Option<PoolReader>,
+    /// What a loan's value is copied into.
+    loaned: Vec<u8>,
+    /// Loans whose slot was taken back before this reader pinned it.
+    lost_loans: u64,
+    /// A loan named what no pool of the publisher's has: nothing more is read.
+    corrupted: bool,
     _payload: PhantomData<fn() -> T>,
 }
 
 impl<T: Payload, L: Loads> TypedReader<T, L> {
-    pub(crate) fn new(reader: Reader<L>) -> Self {
+    pub(crate) fn new(reader: Reader<L>, pool: Option<PoolReader>) -> Self {
         Self {
             reader,
+            pool,
+            loaned: Vec::new(),
+            lost_loans: 0,
+            corrupted: false,
             _payload: PhantomData,
         }
     }
 
     /// The next value, without waiting.
     pub(crate) fn try_recv(&mut self) -> Result<T, RecvError> {
-        typed(self.reader.try_recv())
+        self.typed(false)
     }
 
     /// The newest value, without waiting; the records before it are skipped and not counted as
     /// lost.
     pub(crate) fn try_latest(&mut self) -> Result<T, RecvError> {
-        typed(self.reader.try_latest())
+        self.typed(true)
+    }
+
+    fn typed(&mut self, latest: bool) -> Result<T, RecvError> {
+        if self.corrupted {
+            return Err(RecvError::Closed(Closed::Corrupted));
+        }
+        let taken = if latest {
+            self.reader.try_latest()
+        } else {
+            self.reader.try_recv()
+        };
+        let loan = match taken {
+            Ok(Taken::Loan { loan, .. }) => loan,
+            other => return typed(other),
+        };
+        let copied = match &self.pool {
+            Some(pool) => pool.copy(loan, &mut self.loaned),
+            None => Err(Unpinned::Corrupted(
+                "a loan from a publisher without a pool",
+            )),
+        };
+        match copied {
+            Ok(()) => {
+                let len = self.loaned.len();
+                T::decode(&mut Record::new(&mut self.loaned, len)).map_err(RecvError::Decode)
+            }
+            Err(Unpinned::Lost) => {
+                self.lost_loans += 1;
+                Err(RecvError::Lagged(1))
+            }
+            Err(Unpinned::Corrupted(_)) => {
+                self.corrupted = true;
+                Err(RecvError::Closed(Closed::Corrupted))
+            }
+        }
     }
 
     /// Where the next record to return starts.
@@ -141,9 +190,15 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
         self.reader.position()
     }
 
-    /// Records reported as lost so far.
+    /// Records and loans reported as lost so far.
     pub(crate) fn lost(&self) -> u64 {
-        self.reader.lost()
+        self.reader.lost().saturating_add(self.lost_loans)
+    }
+
+    /// The publisher's pool, as this reader mapped it.
+    #[cfg(all(test, not(loom), any(target_os = "linux", target_os = "android")))]
+    pub(crate) fn pool(&self) -> Option<&PoolReader> {
+        self.pool.as_ref()
     }
 
     /// Whether the publisher has committed past this reader.
@@ -167,6 +222,7 @@ fn typed<T: Payload>(taken: Result<Taken<'_>, Corrupted>) -> Result<T, RecvError
         })),
         Ok(Taken::Empty) => Err(RecvError::Empty),
         Ok(Taken::Lagged(records)) => Err(RecvError::Lagged(records)),
-        Err(Corrupted(_)) => Err(RecvError::Closed(Closed::Corrupted)),
+        // `TypedReader::typed` takes a loan before it gets here.
+        Ok(Taken::Loan { .. }) | Err(Corrupted(_)) => Err(RecvError::Closed(Closed::Corrupted)),
     }
 }

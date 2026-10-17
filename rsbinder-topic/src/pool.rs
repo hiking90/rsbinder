@@ -52,16 +52,14 @@
 //! With `slots >= max_subscribers × MAX_PINS + 1 + depth + max_loans` the publisher always finds
 //! a slot: pins hold at most `max_subscribers` of them, and loans not yet published `max_loans`.
 
-#![allow(
-    dead_code,
-    reason = "plan 15 P3-1: the loan and the sample that use these come in P3-2 and P3-3"
-)]
-
 #[cfg(loom)]
 use loom::sync::atomic::fence;
 #[cfg(not(loom))]
 use std::sync::atomic::fence;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
+use crate::layout::{ControlPage, LoadedPool};
 
 /// Pin words in a subscriber's control page. A sample borrows its subscriber mutably, so a
 /// subscriber holds at most one.
@@ -245,6 +243,7 @@ impl Slots {
     }
 
     /// The loans held and not published.
+    #[cfg(test)]
     pub(crate) fn lent(&self) -> usize {
         self.lent
     }
@@ -291,6 +290,40 @@ pub(crate) fn pin(
 /// Let go of the slot pinned: the reads of it come before the publisher's next writes.
 pub(crate) fn unpin(pin: &impl Pin) {
     pin.store_pin(0, Ordering::Release);
+}
+
+/// A subscriber's way to the values of a pool: the pool mapped read-only, and its pin word.
+pub(crate) struct PoolReader {
+    pool: LoadedPool,
+    control: Arc<ControlPage>,
+}
+
+impl PoolReader {
+    pub(crate) fn new(pool: LoadedPool, control: Arc<ControlPage>) -> Self {
+        Self { pool, control }
+    }
+
+    #[cfg(all(test, not(loom), any(target_os = "linux", target_os = "android")))]
+    pub(crate) fn pool(&self) -> &LoadedPool {
+        &self.pool
+    }
+
+    /// Copy the value `loan` names into `into`, which then holds it and nothing more: pin the
+    /// slot, copy it with atomic loads, let go. A publisher that broke the protocol and wrote the
+    /// slot meanwhile makes the copy wrong, never undefined.
+    pub(crate) fn copy(&self, loan: Loan, into: &mut Vec<u8>) -> Result<(), Unpinned> {
+        pin(&self.pool, &*self.control, loan, self.pool.slot_bytes())?;
+        let len = loan.len as usize;
+        if into.capacity() < len {
+            // A taken buffer, as the ring's reader makes it again: zeroed allocation.
+            *into = vec![0; len];
+        } else {
+            into.resize(len, 0);
+        }
+        self.pool.load_slot(loan.slot, into);
+        unpin(&*self.control);
+        Ok(())
+    }
 }
 
 #[cfg(all(test, not(loom)))]

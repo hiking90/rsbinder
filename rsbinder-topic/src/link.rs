@@ -4,12 +4,13 @@
 //! The publisher's list of subscriptions, and the death links both ends hold.
 
 use std::os::fd::{AsFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use rsbinder::{DeathRecipient, SIBinder, WIBinder};
 
 use crate::layout::{seen_field, ControlView, CLOSED, WAITING};
+use crate::pool::Pins;
 use crate::wake::{send_wake, Sent};
 use crate::SubscriberInfo;
 
@@ -91,6 +92,8 @@ pub(crate) struct Link {
     socket: Option<OwnedFd>,
     /// The subscriber closed its end of the socket.
     hung_up: AtomicBool,
+    /// Where the subscription started: no record before it is one the subscriber reads.
+    start: AtomicU64,
     _death: Option<DeathLink<Watch>>,
 }
 
@@ -128,6 +131,7 @@ impl Link {
             woken: AtomicU32::new(0),
             socket,
             hung_up: AtomicBool::new(false),
+            start: AtomicU64::new(0),
         })
     }
 
@@ -203,8 +207,18 @@ impl Links {
         self.links.iter().map(|link| link.info(write)).collect()
     }
 
-    pub(crate) fn push(&mut self, link: Arc<Link>) {
+    /// Add a subscription that starts at `start`.
+    pub(crate) fn push(&mut self, link: Arc<Link>, start: u64) {
+        link.start.store(start, Ordering::Relaxed);
         self.links.push(link);
+    }
+
+    /// The lowest read position among the subscriptions, each as its control page reports it and
+    /// no lower than where it started; `u64::MAX` with none. A slot whose record ends at or below
+    /// it is one no subscriber still has to read (`pool.rs`).
+    pub(crate) fn lowest_read(&self) -> u64 {
+        let read = |link: &Arc<Link>| link.control.read().max(link.start.load(Ordering::Relaxed));
+        self.links.iter().map(read).min().unwrap_or(u64::MAX)
     }
 
     /// After the commit that made `seq`: a byte to each socket waiter, once per wait; whether one
@@ -247,11 +261,20 @@ impl Links {
     }
 
     /// Take out the subscription flagged by `dead`.
+    ///
+    /// Its pin word goes with it: a slot it pinned is lent again.
     pub(crate) fn remove(&mut self, dead: &Arc<Dead>) -> Option<Arc<Link>> {
         let at = self
             .links
             .iter()
             .position(|link| Arc::ptr_eq(&link.dead, dead))?;
         Some(self.links.swap_remove(at))
+    }
+}
+
+impl Pins for Links {
+    fn pinned(&self, slot: u32) -> bool {
+        let names = |link: &Arc<Link>| link.control.pins() > 0 && link.control.pin(0) == slot + 1;
+        self.links.iter().any(names)
     }
 }

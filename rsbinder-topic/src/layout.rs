@@ -105,7 +105,7 @@ use rsbinder::fmq::shm::{
 };
 use rsbinder::fmq::{Descriptor, Error, Flavor, Grantor, Result};
 
-use crate::pool::{GenerationLoads, Generations, Pin};
+use crate::pool::{GenerationLoads, Generations, LendError, Pin, Pins, Slots};
 use crate::ring::{Loads, Stores};
 
 /// The layout version this crate reads and writes: 0.1.
@@ -665,11 +665,11 @@ pub(crate) fn pool_size(slots: u32, slot_bytes: u32) -> Option<u64> {
     (size <= MAX_POOL && usize::try_from(size).is_ok()).then_some(size)
 }
 
-/// Pool memory as the publisher reaches it.
+/// Pool memory as the publisher reaches it. Its slots are reached only through [`LentSlot`]s.
 pub(crate) struct StoredPool {
-    mapping: Mapping,
+    /// Shared with each [`LentSlot`], so that a loan outlives no mapping.
+    mapping: Arc<Mapping>,
     slots: u32,
-    #[allow(dead_code, reason = "plan 15 P3-2 lends slots of this size")]
     slot_bytes: u32,
 }
 
@@ -686,6 +686,56 @@ impl StoredPool {
         // SAFETY: an aligned 8-byte word below `slot_area(slots)`, in a mapping `self` owns.
         unsafe { self.mapping.as_ptr().add(at).cast::<AtomicU64>().as_ref() }
     }
+
+    pub(crate) fn slot_bytes(&self) -> u32 {
+        self.slot_bytes
+    }
+
+    /// Lend a slot for a value of `len` bytes, at most [`slot_bytes`](Self::slot_bytes):
+    /// [`Slots::lend`] with this pool's generations, and the slot's bytes.
+    pub(crate) fn lend(
+        &self,
+        slots: &mut Slots,
+        pins: &impl Pins,
+        read: u64,
+        len: usize,
+    ) -> std::result::Result<LentSlot, LendError> {
+        assert!(len <= self.slot_bytes as usize, "a loan longer than a slot");
+        let slot = slots.lend(self, pins, read)?;
+        let at = slot_area(self.slots) as usize + slot as usize * self.slot_bytes as usize;
+        Ok(LentSlot {
+            _mapping: self.mapping.clone(),
+            slot,
+            // SAFETY: inside the slot, in the mapping the value keeps alive.
+            at: unsafe { self.mapping.as_ptr().add(at) },
+            len,
+        })
+    }
+}
+
+/// The bytes of a slot the publisher lent: `Slots` lends it to this value alone until the slot
+/// is published or given back, which takes the value.
+pub(crate) struct LentSlot {
+    _mapping: Arc<Mapping>,
+    slot: u32,
+    at: NonNull<u8>,
+    len: usize,
+}
+
+impl LentSlot {
+    pub(crate) fn slot(&self) -> u32 {
+        self.slot
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        // SAFETY: a lent slot, which nothing else in this process reaches; initialized memfd pages.
+        unsafe { std::slice::from_raw_parts(self.at.as_ptr(), self.len) }
+    }
+
+    pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as `bytes`, and `&mut self` makes this the only reference.
+        unsafe { std::slice::from_raw_parts_mut(self.at.as_ptr(), self.len) }
+    }
 }
 
 impl Generations for StoredPool {
@@ -698,7 +748,6 @@ impl Generations for StoredPool {
 pub(crate) struct LoadedPool {
     mapping: Mapping,
     slots: u32,
-    #[allow(dead_code, reason = "plan 15 P3-3 bounds a loan's length by it")]
     slot_bytes: u32,
 }
 
@@ -707,6 +756,18 @@ impl LoadedPool {
         debug_assert!(at % 4 == 0 && at + 4 <= pool::GENERATIONS);
         // SAFETY: an aligned 4-byte word of the header, in a mapping `self` owns.
         unsafe { RoWord32::from_ptr(self.mapping.as_ptr().add(at)) }
+    }
+
+    pub(crate) fn slot_bytes(&self) -> u32 {
+        self.slot_bytes
+    }
+
+    /// Fill `dst` from the start of `slot`, with `Relaxed` loads: the caller pinned it.
+    pub(crate) fn load_slot(&self, slot: u32, dst: &mut [u8]) {
+        assert!(slot < self.slots && dst.len() <= self.slot_bytes as usize);
+        let at = slot_area(self.slots) as usize + slot as usize * self.slot_bytes as usize;
+        // SAFETY: inside a slot of a mapping `self` owns, whose slots this process reads by runs.
+        unsafe { RoRun::new(self.mapping.as_ptr().add(at), dst.len()) }.load(dst);
     }
 }
 
@@ -737,7 +798,7 @@ pub(crate) fn create_pool(
     // Huge pages come with the first write through a mapping advised so, not with `pwrite`.
     let options = CreateOptions::new("rsbinder-topic-pool").populate(!huge);
     let fd = shm::create(size, &options)?;
-    let mapping = Mapping::map(fd.as_fd(), 0, size, Access::ReadWrite)?;
+    let mapping = Arc::new(Mapping::map(fd.as_fd(), 0, size, Access::ReadWrite)?);
     let stored = StoredPool {
         mapping,
         slots,

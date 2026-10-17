@@ -13,6 +13,7 @@
 use std::cell::Cell;
 
 use crate::layout::Heap;
+use crate::pool::Loan;
 use crate::ring::{Corrupted, Loads, Reader, Start, Taken, RETRIES};
 
 /// What one receive call returned, owning the payload.
@@ -20,6 +21,7 @@ use crate::ring::{Corrupted, Loads, Reader, Start, Taken, RETRIES};
 pub(crate) enum Got {
     Item(u32, Vec<u8>),
     End(Vec<u8>),
+    Loan(u32, Loan),
     Empty,
     Lagged(u64),
     Corrupted(&'static str),
@@ -30,6 +32,7 @@ impl Got {
         match taken {
             Ok(Taken::Item { index, record }) => Got::Item(index, record.bytes().to_vec()),
             Ok(Taken::End { payload }) => Got::End(payload.to_vec()),
+            Ok(Taken::Loan { index, loan }) => Got::Loan(index, loan),
             Ok(Taken::Empty) => Got::Empty,
             Ok(Taken::Lagged(records)) => Got::Lagged(records),
             Err(Corrupted(what)) => Got::Corrupted(what),
@@ -312,7 +315,7 @@ mod tests {
     fn records_of_a_later_layout_are_stepped_over() {
         let image = Image::new()
             .record(0, 3, 0, b"reserved")
-            .record(16, 2, 1, b"")
+            .record(16, 3, 1, b"")
             .record(24, 0, 2, b"item")
             .record(40, 3, 3, b"tail")
             .write(56)
@@ -325,6 +328,34 @@ mod tests {
         );
         let got = replay(&Image::new().record(0, 3, 0, b"").write(8).0, Start::Oldest);
         assert!(got.iter().all(|outcome| *outcome == Got::Empty));
+    }
+
+    #[test]
+    fn a_loan_record_names_its_slot_and_one_of_another_length_is_corrupted() {
+        let loan = Loan {
+            slot: 3,
+            len: 100,
+            generation: 6,
+        };
+        let image = Image::new()
+            .record(0, 2, 0, &loan.bytes())
+            .write(24)
+            .last(0);
+        let got = oldest(image);
+        assert_eq!(until_settled(&got), [Got::Loan(0, loan), Got::Empty]);
+        // The newest, again.
+        let image = Image::new()
+            .record(0, 2, 4, &loan.bytes())
+            .write(24)
+            .last(0);
+        assert_eq!(replay(&image.0, Start::Last)[0], Got::Loan(4, loan));
+        for payload in [&b""[..], &[0; 8], &[0; 24]] {
+            let image = Image::new().record(0, 2, 0, payload).write(64).last(0);
+            let image = image.record(8 + payload.len(), 0, 1, b"");
+            let got = oldest(image);
+            assert_eq!(got[0], Got::Corrupted("loan record of another length"));
+            assert!(got.iter().all(|outcome| *outcome == got[0]));
+        }
     }
 
     #[test]

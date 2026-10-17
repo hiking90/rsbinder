@@ -16,10 +16,10 @@
 //! payload, then zeros up to the next multiple of 8
 //! ```
 //!
-//! Kind 0 is an item and kind 1 the end of the topic, after which the publisher writes nothing.
-//! Kinds 2 and 3 belong to later versions of the layout (plan 15 gives 2 to a loaned slot and
-//! keeps 3 free); a reader of this version steps over them by their length. One record is at most
-//! half the capacity.
+//! Kind 0 is an item, kind 1 the end of the topic, after which the publisher writes nothing, and
+//! kind 2 a loan: a value in a slot of the pool, which the record names in 16 bytes (`pool.rs`).
+//! Kind 3 belongs to a later version of the layout; a reader of this version steps over it by its
+//! length. One record is at most half the capacity.
 //!
 //! # The publisher
 //!
@@ -75,6 +75,7 @@ mod rules;
 
 use rules::{Header, Seen, View};
 
+use crate::pool::Loan;
 use crate::Record;
 
 /// How often one receive call resumes after being lapped before it returns without a record.
@@ -87,6 +88,8 @@ pub(crate) enum Kind {
     Item = 0,
     /// The topic's last record; its payload says how it ended.
     End = 1,
+    /// A value in a slot of the pool: the payload is a [`Loan`].
+    Loan = 2,
 }
 
 /// Topic memory as the publisher reaches it. Each store is `Release`.
@@ -251,6 +254,11 @@ impl<M: Stores> Writer<M> {
     /// Bytes committed so far: where the next record starts.
     pub(crate) fn position(&self) -> u64 {
         self.written
+    }
+
+    /// Where the next record ends if its payload is `len` bytes, or why it would be refused.
+    pub(crate) fn end_of(&self, len: usize) -> Result<u64, Refused> {
+        self.end_after(self.written, len)
     }
 
     /// The index the next record gets.
@@ -429,6 +437,19 @@ pub(crate) enum Taken<'a> {
         /// Its payload.
         payload: &'a [u8],
     },
+    /// The next value is in a slot of the pool. The reader has moved past the record.
+    Loan {
+        /// The record's index.
+        #[cfg_attr(
+            not(any(test, feature = "fuzzing")),
+            expect(
+                dead_code,
+                reason = "a subscriber counts losses itself; tests check the index"
+            )
+        )]
+        index: u32,
+        loan: Loan,
+    },
     /// No committed record is unread, or the call was lapped [`RETRIES`] times and gave up.
     Empty,
     /// This many records were overwritten unread. The next call returns the one after them.
@@ -439,6 +460,7 @@ pub(crate) enum Taken<'a> {
 enum Outcome {
     Item { index: u32, len: usize },
     End { len: usize },
+    Loan { index: u32, loan: Loan },
     Empty,
     Lagged(u64),
 }
@@ -535,6 +557,7 @@ impl<M: Loads> Reader<M> {
             Outcome::End { len } => Taken::End {
                 payload: &self.payload[..len],
             },
+            Outcome::Loan { index, loan } => Taken::Loan { index, loan },
             Outcome::Empty => Taken::Empty,
             Outcome::Lagged(records) => Taken::Lagged(records),
         }
@@ -649,7 +672,7 @@ impl<M: Loads> Reader<M> {
             let header = self.header(self.read);
             let expected = self.expected.is_none_or(|index| index == header.index);
             let size = match header.extent(self.read, self.seen.write(), capacity) {
-                Ok(size) if expected && header.kind <= Kind::End as u32 => size,
+                Ok(size) if expected && header.kind <= Kind::Loan as u32 => size,
                 size => {
                     // Believed only once `tail` says the publisher was not writing over it.
                     if self.overwritten(self.read)? {
@@ -662,7 +685,7 @@ impl<M: Loads> Reader<M> {
                     if let Some(expected) = self.expected {
                         lost += u64::from(header.index.wrapping_sub(expected));
                     }
-                    if header.kind > Kind::End as u32 {
+                    if header.kind > Kind::Loan as u32 {
                         self.read += size;
                         self.expected = Some(header.index.wrapping_add(1));
                         if steps == 0 {
@@ -698,13 +721,29 @@ impl<M: Loads> Reader<M> {
                 self.expected = Some(header.index);
                 return Ok(Outcome::End { len });
             }
+            let outcome = self.outcome(header)?;
             self.read += size;
             self.expected = Some(header.index.wrapping_add(1));
+            return Ok(outcome);
+        }
+    }
+
+    /// An item or a loan, from the payload just copied and judged.
+    fn outcome(&mut self, header: Header) -> Result<Outcome, Corrupted> {
+        let len = header.len as usize;
+        if header.kind != Kind::Loan as u32 {
             return Ok(Outcome::Item {
                 index: header.index,
                 len,
             });
         }
+        let loan =
+            Loan::parse(&self.payload[..len]).ok_or(Corrupted("loan record of another length"));
+        let loan = self.keep(loan)?;
+        Ok(Outcome::Loan {
+            index: header.index,
+            loan,
+        })
     }
 
     fn latest(&mut self) -> Result<Outcome, Corrupted> {
@@ -722,7 +761,7 @@ impl<M: Loads> Reader<M> {
             // `at` is below the `write` held either way, and the record there is committed.
             let size = header.extent(at, self.seen.write(), capacity);
             match size {
-                Ok(size) if header.kind <= Kind::End as u32 => self.copy(at, size),
+                Ok(size) if header.kind <= Kind::Loan as u32 => self.copy(at, size),
                 _ => {}
             }
             if self.overwritten(at)? {
@@ -733,7 +772,7 @@ impl<M: Loads> Reader<M> {
                 continue;
             }
             let size = self.keep(size)?;
-            if header.kind > Kind::End as u32 {
+            if header.kind > Kind::Loan as u32 {
                 self.read = at + size;
                 self.expected = Some(header.index.wrapping_add(1));
                 if laps == RETRIES {
@@ -748,12 +787,10 @@ impl<M: Loads> Reader<M> {
                 self.expected = Some(header.index);
                 return Ok(Outcome::End { len });
             }
+            let outcome = self.outcome(header)?;
             self.read = at + size;
             self.expected = Some(header.index.wrapping_add(1));
-            return Ok(Outcome::Item {
-                index: header.index,
-                len,
-            });
+            return Ok(outcome);
         }
     }
 }
