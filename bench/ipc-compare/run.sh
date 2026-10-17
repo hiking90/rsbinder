@@ -8,7 +8,9 @@
 # is B2 and B3 for rsbinder-topic (futex, fd and poll waits) next to iceoryx2's. `b5` and `b6`
 # time one publish in one process (waiting subscribers by wake; encode by codec); `p0b` is both,
 # and B3's large payloads with iceoryx2 subscribers that copy them out. `p2e5` is `b6` and
-# rsbinder-topic's B3 rows, to set against the `topic` set's. Each repeat writes its own CSV.
+# rsbinder-topic's B3 rows, to set against the `topic` set's. `p3` is B3's large payloads with
+# rsbinder-topic's loans, read in place and copied out, next to its ring copies and iceoryx2's
+# two kinds of subscriber. Each repeat writes its own CSV.
 #
 # Results go to plans/15-pubsub-bench/<time>-<set>/: conditions.txt and results-<repeat>.csv.
 #
@@ -143,6 +145,27 @@ b3_touch() {
     done
 }
 
+# B3's large payloads lent from rsbinder-topic's pool (plan 15 P3-4), each next to the same
+# payload copied through its ring and through iceoryx2, read in place and copied out.
+b3_loan() {
+    local touch
+    for n in 1 8; do
+        for size in 65536 1048576 4194304; do
+            for rate in 1000 10000; do
+                for wait in block poll; do
+                    for touch in no yes; do
+                        measure b3 --impl rsb-topic-loan --wait "$wait" --touch "$touch" \
+                            --n "$n" --size "$size" --rate "$rate"
+                        measure b3 --impl ix --wait "$wait" --touch "$touch" \
+                            --n "$n" --size "$size" --rate "$rate"
+                    done
+                    measure b3 --impl rsb-topic --wait "$wait" --n "$n" --size "$size" --rate "$rate"
+                done
+            done
+        done
+    done
+}
+
 for repeat in $(seq "$repeats"); do
     csv=$out/results-$repeat.csv
     "$bin" header > "$csv"
@@ -162,6 +185,7 @@ for repeat in $(seq "$repeats"); do
         b6) b6 ;;
         p0b) b5; b6; b3_touch ;;
         p2e5) b6; b3 "rsb-topic block" "rsb-topic poll" ;;
+        p3) b3_loan ;;
         *) echo "run.sh: unknown set $set_name" >&2; exit 2 ;;
     esac
 done

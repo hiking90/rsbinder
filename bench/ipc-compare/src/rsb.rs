@@ -2,13 +2,15 @@
 //! consumer, and B1's twoway client.
 
 use std::io::Write;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use rsbinder::stream::{Receiver, ReceiverPolicy, Sink, SinkPolicy, StreamEndpoint};
 use rsbinder::*;
-use rsbinder_topic::{Bytes, Publisher, PublisherPolicy, RecvError, Subscriber, SubscriberPolicy, Wake};
+use rsbinder_topic::{
+    Bytes, PoolPolicy, Publisher, PublisherPolicy, RecvError, Sample, Subscriber, SubscriberPolicy, Wake,
+};
 
 use crate::common::*;
 
@@ -76,7 +78,25 @@ struct Producer {
     streams: Mutex<Vec<Sink<StreamBytes>>>,
     callbacks: Mutex<Vec<Strong<dyn IBenchSink>>>,
     topic: Mutex<Option<Publisher<Bytes>>>,
+    /// The topic has a pool, and start() lends a slot per item instead of publishing a copy.
+    loans: AtomicBool,
     failures: Arc<AtomicI32>,
+}
+
+impl Producer {
+    /// The topic, made with `policy` on the first call.
+    fn topic_with(&self, policy: &PublisherPolicy) -> BinderResult<SIBinder> {
+        let mut topic = self.topic.lock().expect("lock");
+        if topic.is_none() {
+            let publisher = Publisher::<Bytes>::new(policy).map_err(|e| {
+                eprintln!("rsb-producer: topic: {e}");
+                Status::from(StatusCode::NoMemory)
+            })?;
+            *topic = Some(publisher);
+            self.loans.store(policy.pool.is_some(), Ordering::SeqCst);
+        }
+        Ok(topic.as_ref().expect("made above").as_binder())
+    }
 }
 
 impl Interface for Producer {}
@@ -95,25 +115,32 @@ impl IBench for Producer {
     }
 
     fn r#topic(&self, ring_bytes: i32) -> BinderResult<SIBinder> {
-        let mut topic = self.topic.lock().expect("lock");
-        if topic.is_none() {
-            let policy = PublisherPolicy {
-                ring_bytes: ring_bytes.max(0) as usize,
-                ..PublisherPolicy::default()
-            };
-            let publisher = Publisher::<Bytes>::new(&policy).map_err(|e| {
-                eprintln!("rsb-producer: topic: {e}");
-                Status::from(StatusCode::NoMemory)
-            })?;
-            *topic = Some(publisher);
-        }
-        Ok(topic.as_ref().expect("made above").as_binder())
+        self.topic_with(&PublisherPolicy {
+            ring_bytes: ring_bytes.max(0) as usize,
+            ..PublisherPolicy::default()
+        })
+    }
+
+    fn r#loanTopic(&self, ring_bytes: i32, slot_bytes: i32, depth: i32, subscribers: i32) -> BinderResult<SIBinder> {
+        let subscribers = subscribers.max(1) as usize;
+        self.topic_with(&PublisherPolicy {
+            ring_bytes: ring_bytes.max(0) as usize,
+            max_subscribers: subscribers,
+            max_per_uid: subscribers,
+            pool: Some(PoolPolicy {
+                slot_bytes: slot_bytes.max(0) as usize,
+                depth: depth.max(0) as usize,
+                ..PoolPolicy::default()
+            }),
+            ..PublisherPolicy::default()
+        })
     }
 
     fn r#start(&self, count: i32, size: i32, rate_hz: i32) -> BinderResult<()> {
         let mut sinks = std::mem::take(&mut *self.streams.lock().expect("lock"));
         let callbacks = std::mem::take(&mut *self.callbacks.lock().expect("lock"));
         let topic = self.topic.lock().expect("lock").take();
+        let loans = self.loans.load(Ordering::SeqCst);
         let failures = self.failures.clone();
         failures.store(0, Ordering::SeqCst);
         std::thread::spawn(move || {
@@ -127,7 +154,16 @@ impl IBench for Producer {
                 }
                 if let Some(topic) = &topic {
                     stamp(&mut record.0, seq);
-                    if topic.publish(&record).is_err() {
+                    // A loan is written with one copy of the item, as iceoryx2's producer writes.
+                    let published = if loans {
+                        topic.loan_slice(record.0.len()).and_then(|mut loan| {
+                            loan.copy_from_slice(&record.0);
+                            loan.publish()
+                        })
+                    } else {
+                        topic.publish(&record)
+                    };
+                    if published.is_err() {
                         failures.fetch_add(1, Ordering::Relaxed);
                     }
                     continue;
@@ -272,6 +308,68 @@ pub fn topic_consumer(a: &Args) -> Result<()> {
     }
     println!("{}", record.line());
     Ok(())
+}
+
+/// Child role `rsb-topic-loan`: one subscriber of the topic with a pool. It receives each value
+/// where it lies (`recv_sample`) and reads the stamp in place, or with `--touch yes` copies the
+/// value out first, as the iceoryx2 subscriber does with the same flag.
+pub fn topic_loan_consumer(a: &Args) -> Result<()> {
+    pin(a.num("cpu", 2) as usize);
+    let count = a.num("count", 0);
+    let wait = a.str("wait", "block");
+    let touch = a.str("touch", "no") == "yes";
+    let bench = connect(&a.str("name", ""))?;
+    let num = |key: &str| a.num(key, 0) as i32;
+    let topic = bench.r#loanTopic(num("ring"), num("slot"), num("depth"), num("n"))?;
+    let policy = SubscriberPolicy {
+        max_ring_bytes: 1 << 30,
+        max_pool_bytes: usize::MAX,
+        wake: if wait == "fd" { Wake::Fd } else { Wake::Futex },
+        ..SubscriberPolicy::default()
+    };
+    let mut subscriber = Subscriber::<Bytes>::request(&topic, &policy)?;
+    ready("SUBSCRIBED");
+    let mut record = Record::new(a.num("warmup", 0));
+    let mut lost = 0u64;
+    let mut idle: Option<Instant> = None;
+    while record.received + lost < count {
+        let got = if wait == "poll" {
+            subscriber.try_recv_sample()
+        } else {
+            subscriber.recv_sample_timeout(SILENCE)
+        };
+        match got {
+            Ok(mut sample) => {
+                idle = None;
+                take_sample(&mut record, &mut sample, touch);
+            }
+            Err(RecvError::Empty) => {
+                if idle.get_or_insert_with(Instant::now).elapsed() > SILENCE {
+                    break;
+                }
+            }
+            Err(RecvError::Lagged(n)) => lost += n,
+            Err(RecvError::Closed(_) | RecvError::Timeout) => break,
+            Err(e) => {
+                eprintln!("rsb-topic-loan: {e}");
+                break;
+            }
+        }
+    }
+    if lost > 0 {
+        record.extra = format!("lost={lost}");
+    }
+    println!("{}", record.line());
+    Ok(())
+}
+
+fn take_sample(record: &mut Record, sample: &mut Sample<'_>, touch: bool) {
+    if touch {
+        record.take(&sample.to_owned());
+    } else {
+        // SAFETY: the producer is this harness's own rsbinder-topic `Publisher`.
+        record.take(unsafe { sample.as_slice() });
+    }
 }
 
 struct CallbackSink {

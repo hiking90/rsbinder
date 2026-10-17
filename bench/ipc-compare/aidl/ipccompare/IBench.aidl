@@ -16,6 +16,10 @@ interface IBench {
     // ring of `ringBytes`; start() publishes to it as well.
     IBinder topic(int ringBytes);
 
+    // The same topic with a pool of `slotBytes` slots, for `subscribers`
+    // consumers keeping `depth` values; start() lends a slot per item.
+    IBinder loanTopic(int ringBytes, int slotBytes, int depth, int subscribers);
+
     // Publishes `count` items of `size` bytes to every consumer added, at
     // `rateHz` (0 = as fast as the slowest consumer takes them), then ends.
     void start(int count, int size, int rateHz);

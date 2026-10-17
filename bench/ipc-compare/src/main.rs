@@ -4,8 +4,9 @@
 //! ```text
 //! ipc-compare b1 --impl rsb|ix [--wait block|poll] --size B
 //! ipc-compare b2 --impl rsb-stream|ix [--wait block|poll] --size B --rate HZ
-//! ipc-compare b3 --impl rsb-stream|rsb-oneway|rsb-topic|ix [--wait block|poll] --n N --size B --rate HZ
-//!   (rsb-topic also takes --wait fd)
+//! ipc-compare b3 --impl rsb-stream|rsb-oneway|rsb-topic|rsb-topic-loan|ix [--wait block|poll] --n N --size B --rate HZ
+//!   (rsb-topic and rsb-topic-loan also take --wait fd; rsb-topic-loan lends a pool slot per item
+//!   and its subscriber reads it in place, or copies it out with --touch yes)
 //! ipc-compare b5 --wake futex|fd --n N [--rate HZ]     (one process: publish time, N waiting)
 //! ipc-compare b6 --codec alloc|parcel|bytes --side publish|receive --size B  (one process: codec)
 //!   (b2, b3 with --impl ix also take --touch yes: the subscriber copies the payload out)
@@ -65,6 +66,7 @@ fn child(words: &[String]) {
         "rsb-stream" => rsb::stream_consumer(&a).err().map(|e| format!("{e:?}")),
         "rsb-oneway" => rsb::callback_consumer(&a).err().map(|e| format!("{e:?}")),
         "rsb-topic" => rsb::topic_consumer(&a).err().map(|e| format!("{e:?}")),
+        "rsb-topic-loan" => rsb::topic_loan_consumer(&a).err().map(|e| format!("{e:?}")),
         "rsb-echo" => rsb::echo_client(&a).err().map(|e| format!("{e:?}")),
         "ix-producer" => ix::producer(&a).err().map(|e| e.to_string()),
         "ix-consumer" => ix::consumer(&a).err().map(|e| e.to_string()),
@@ -174,6 +176,25 @@ fn fanout(bench: &str, a: &Args) {
             note.push(format!("ring {ring} B; copies the payload out"));
             let producer = spawn("rsb-producer", &[("name", name.clone()), ("cpu", producer_cpu)]);
             (producer, imp.clone(), vec![("ring", ring.to_string())])
+        }
+        "rsb-topic-loan" => {
+            // The pool keeps as many values as iceoryx2's subscriber buffer for this size.
+            let depth = ix::buffer_for(size);
+            let slot = size.max(STAMP_BYTES);
+            let touch = a.str("touch", "no") == "yes";
+            let reads = if touch { "copies the payload out" } else { "reads the stamp in place" };
+            note.push(format!("pool {} slots of {slot} B; {reads}", n + 1 + depth + 1));
+            let producer = spawn("rsb-producer", &[("name", name.clone()), ("cpu", producer_cpu)]);
+            let mut extra = vec![
+                ("ring", (64 << 10).to_string()),
+                ("slot", slot.to_string()),
+                ("depth", depth.to_string()),
+                ("n", n.to_string()),
+            ];
+            if touch {
+                extra.push(("touch", "yes".to_string()));
+            }
+            (producer, imp.clone(), extra)
         }
         "ix" => {
             let touch = a.str("touch", "no") == "yes";
