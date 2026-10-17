@@ -7,8 +7,8 @@
 # P1a-3; run it with 5 repeats. `ix-block` is the iceoryx2 blocking rows of B2 and B3. `topic`
 # is B2 and B3 for rsbinder-topic (futex, fd and poll waits) next to iceoryx2's. `b5` and `b6`
 # time one publish in one process (waiting subscribers by wake; encode by codec); `p0b` is both,
-# and B3's large payloads with iceoryx2 subscribers that copy them out. Each repeat writes its
-# own CSV.
+# and B3's large payloads with iceoryx2 subscribers that copy them out. `p2e5` is `b6` and
+# rsbinder-topic's B3 rows, to set against the `topic` set's. Each repeat writes its own CSV.
 #
 # Results go to plans/15-pubsub-bench/<time>-<set>/: conditions.txt and results-<repeat>.csv.
 #
@@ -120,9 +120,12 @@ b5() {
 }
 
 b6() {
-    for size in 64 1024 16384 65536; do
-        measure b6 --codec alloc --size "$size"
-        measure b6 --codec direct --size "$size"
+    for side in publish receive; do
+        for size in 64 1024 16384 65536 1048576; do
+            for codec in alloc parcel bytes; do
+                measure b6 --codec "$codec" --side "$side" --size "$size"
+            done
+        done
     done
 }
 
@@ -158,6 +161,7 @@ for repeat in $(seq "$repeats"); do
         b5) b5 ;;
         b6) b6 ;;
         p0b) b5; b6; b3_touch ;;
+        p2e5) b6; b3 "rsb-topic block" "rsb-topic poll" ;;
         *) echo "run.sh: unknown set $set_name" >&2; exit 2 ;;
     esac
 done

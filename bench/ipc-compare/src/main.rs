@@ -7,7 +7,7 @@
 //! ipc-compare b3 --impl rsb-stream|rsb-oneway|rsb-topic|ix [--wait block|poll] --n N --size B --rate HZ
 //!   (rsb-topic also takes --wait fd)
 //! ipc-compare b5 --wake futex|fd --n N [--rate HZ]     (one process: publish time, N waiting)
-//! ipc-compare b6 --codec alloc|direct --size B         (one process: publish time, encode)
+//! ipc-compare b6 --codec alloc|parcel|bytes --side publish|receive --size B  (one process: codec)
 //!   (b2, b3 with --impl ix also take --touch yes: the subscriber copies the payload out)
 //! ipc-compare b4 --impl fmq|ix
 //!   [--count C --warmup W] [--producer-cpu 1] [--consumer-cpus 2,3,4,5,6,7,0,8]
