@@ -10,7 +10,7 @@ use crate::layout::Heap;
 use crate::publish::TypedWriter;
 use crate::receive::TypedReader;
 use crate::ring::{Kind, Loads, Reader, Start, Stores, Writer};
-use crate::{Bytes, Closed, Payload, PublishError, RecvError};
+use crate::{Bytes, Closed, Encoding, Payload, PublishError, Record, RecvError};
 
 /// A ring whose records carry at most 2040 bytes.
 const RING: usize = 4096;
@@ -42,13 +42,13 @@ impl Payload for Text {
         "text"
     }
 
-    fn encode(&self, out: &mut Vec<u8>) -> rsbinder::Result<()> {
-        out.extend_from_slice(self.0.as_bytes());
+    fn encode<'a>(&'a self, out: &mut Encoding<'a>) -> rsbinder::Result<()> {
+        out.borrow(self.0.as_bytes());
         Ok(())
     }
 
-    fn decode(bytes: &[u8]) -> rsbinder::Result<Self> {
-        let text = std::str::from_utf8(bytes).map_err(|_| StatusCode::BadValue)?;
+    fn decode(record: &mut Record<'_>) -> rsbinder::Result<Self> {
+        let text = std::str::from_utf8(record.bytes()).map_err(|_| StatusCode::BadValue)?;
         Ok(Self(text.to_owned()))
     }
 }
@@ -61,12 +61,12 @@ impl Payload for Raw {
         "text"
     }
 
-    fn encode(&self, out: &mut Vec<u8>) -> rsbinder::Result<()> {
-        out.extend_from_slice(self.0);
+    fn encode<'a>(&'a self, out: &mut Encoding<'a>) -> rsbinder::Result<()> {
+        out.extend(self.0);
         Ok(())
     }
 
-    fn decode(_: &[u8]) -> rsbinder::Result<Self> {
+    fn decode(_: &mut Record<'_>) -> rsbinder::Result<Self> {
         unreachable!("only published")
     }
 }
@@ -80,13 +80,13 @@ impl Payload for Picky {
         "picky"
     }
 
-    fn encode(&self, out: &mut Vec<u8>) -> rsbinder::Result<()> {
-        out.push(self.0.ok_or(StatusCode::BadValue)?);
+    fn encode<'a>(&'a self, out: &mut Encoding<'a>) -> rsbinder::Result<()> {
+        out.extend(&[self.0.ok_or(StatusCode::BadValue)?]);
         Ok(())
     }
 
-    fn decode(bytes: &[u8]) -> rsbinder::Result<Self> {
-        match bytes {
+    fn decode(record: &mut Record<'_>) -> rsbinder::Result<Self> {
+        match record.bytes() {
             [byte] => Ok(Self(Some(*byte))),
             _ => Err(StatusCode::BadValue),
         }
@@ -142,6 +142,65 @@ fn a_parcelable_is_named_by_its_descriptor_and_read_back_whole() {
         assert_eq!(sub.try_recv(), Ok(sample(seq)));
     }
     assert_eq!(sub.try_recv(), Err(RecvError::Empty));
+}
+
+/// A record of every kind of piece, in lengths that share words: copied, borrowed, a parcelable.
+#[derive(Debug, PartialEq)]
+struct Mixed(Vec<u8>);
+
+impl Mixed {
+    fn bytes(&self) -> Vec<u8> {
+        let mut bytes = b"ab".to_vec();
+        bytes.extend_from_slice(&self.0);
+        bytes.extend_from_slice(b"xyz");
+        bytes.extend_from_slice(&rsbinder::to_bytes(&-7i32).unwrap());
+        bytes.extend_from_slice(&self.0);
+        bytes
+    }
+}
+
+impl Payload for Mixed {
+    fn type_name() -> &'static str {
+        "mixed"
+    }
+
+    fn encode<'a>(&'a self, out: &mut Encoding<'a>) -> rsbinder::Result<()> {
+        out.extend(b"ab");
+        out.borrow(&self.0);
+        out.extend(b"x");
+        out.extend(b"yz");
+        out.parcelable(&-7i32)?;
+        out.borrow(&[]);
+        out.borrow(&self.0);
+        Ok(())
+    }
+
+    fn decode(record: &mut Record<'_>) -> rsbinder::Result<Self> {
+        Ok(Self(record.take()))
+    }
+}
+
+#[test]
+fn a_record_is_its_pieces_in_order_whatever_words_they_share() {
+    let heap = Heap::new(RING);
+    let (topic, mut sub) = (publisher(&heap), subscriber::<Bytes>(&heap, Start::Oldest));
+    // Borrowed runs of 0 to 17 bytes put every piece at every offset in a word; the ring wraps.
+    for round in 0..8 {
+        let batch: Vec<Mixed> = (0..18u8)
+            .map(|n| Mixed(vec![n ^ round; n.into()]))
+            .collect();
+        assert_eq!(topic.publish_all(&batch), Ok(batch.len()));
+        for value in &batch {
+            assert_eq!(
+                sub.try_recv(),
+                Ok(Bytes(value.bytes())),
+                "{} bytes",
+                value.0.len()
+            );
+        }
+    }
+    assert_eq!(sub.try_recv(), Err(RecvError::Empty));
+    assert!(heap.loaded().write() > RING as u64, "the ring did not wrap");
 }
 
 #[test]

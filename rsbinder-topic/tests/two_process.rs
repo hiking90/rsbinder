@@ -758,11 +758,11 @@ impl Payload for Other {
         "other"
     }
 
-    fn encode(&self, _: &mut Vec<u8>) -> rsbinder::Result<()> {
+    fn encode(&self, _: &mut rsbinder_topic::Encoding<'_>) -> rsbinder::Result<()> {
         Ok(())
     }
 
-    fn decode(_: &[u8]) -> rsbinder::Result<Self> {
+    fn decode(_: &mut rsbinder_topic::Record<'_>) -> rsbinder::Result<Self> {
         Ok(Self)
     }
 }

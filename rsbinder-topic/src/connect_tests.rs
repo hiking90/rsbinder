@@ -590,11 +590,11 @@ impl Payload for Explosive {
         "explosive"
     }
 
-    fn encode(&self, _: &mut Vec<u8>) -> rsbinder::Result<()> {
+    fn encode(&self, _: &mut crate::Encoding<'_>) -> rsbinder::Result<()> {
         panic!("encode");
     }
 
-    fn decode(_: &[u8]) -> rsbinder::Result<Self> {
+    fn decode(_: &mut crate::Record<'_>) -> rsbinder::Result<Self> {
         Ok(Self)
     }
 }
@@ -722,13 +722,12 @@ impl Payload for Longs {
         "rsbinder.topic.test.Pair<long>"
     }
 
-    fn encode(&self, out: &mut Vec<u8>) -> rsbinder::Result<()> {
-        out.extend_from_slice(&rsbinder::to_bytes(&self.0)?);
-        Ok(())
+    fn encode<'a>(&'a self, out: &mut crate::Encoding<'a>) -> rsbinder::Result<()> {
+        out.parcelable(&self.0)
     }
 
-    fn decode(bytes: &[u8]) -> rsbinder::Result<Self> {
-        rsbinder::from_bytes(bytes).map(Self)
+    fn decode(record: &mut crate::Record<'_>) -> rsbinder::Result<Self> {
+        record.parcelable().map(Self)
     }
 }
 

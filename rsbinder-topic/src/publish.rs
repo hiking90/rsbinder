@@ -14,8 +14,9 @@ use rsbinder::{CallingContext, Status, StatusCode};
 
 use crate::layout::{self, Stored, MIN_RING};
 use crate::link::Links;
+use crate::payload::{relabel, Piece};
 use crate::ring::{Kind, Refused, Stores, Writer};
-use crate::{end, Payload, PublisherStats};
+use crate::{end, Encoding, Payload, PublisherStats};
 
 /// What a topic is made with.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -168,11 +169,13 @@ impl From<Refused> for PublishError {
     }
 }
 
-/// Encoded values on their way into the ring: one buffer, and where each record in it ends.
+/// What a publish encodes into, kept for the next one: the allocations of an [`Encoding`].
 #[derive(Default)]
 struct Scratch {
     bytes: Vec<u8>,
-    ends: Vec<usize>,
+    pieces: Vec<Piece<'static>>,
+    /// Per record, where its pieces end and its length.
+    records: Vec<(usize, usize)>,
 }
 
 /// What the publisher's lock guards: the ring's writer and the subscriptions it serves.
@@ -292,11 +295,23 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
             .expect("lock poisoned")
             .pop()
             .unwrap_or_default();
+        let mut records = std::mem::take(&mut scratch.records);
+        records.clear();
+        let mut encoding = Encoding::new(
+            std::mem::take(&mut scratch.bytes),
+            std::mem::take(&mut scratch.pieces),
+        );
         let written = self
-            .encode(values, &mut scratch)
-            .and_then(|()| self.write(&scratch));
-        if scratch.bytes.capacity() <= self.capacity && scratch.ends.capacity() <= self.capacity / 8
+            .encode(values, &mut encoding, &mut records)
+            .and_then(|()| self.write(&encoding, &records));
+        let keeps = |len: usize, most: usize| len <= most;
+        if keeps(encoding.bytes.capacity(), self.capacity)
+            && keeps(encoding.pieces.capacity(), self.capacity / 8)
+            && keeps(records.capacity(), self.capacity / 8)
         {
+            scratch.bytes = encoding.bytes;
+            scratch.pieces = relabel(encoding.pieces);
+            scratch.records = records;
             self.scratch.lock().expect("lock poisoned").push(scratch);
         }
         written
@@ -312,51 +327,54 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
         }
     }
 
-    fn encode<'a, I>(&self, values: I, scratch: &mut Scratch) -> Result<(), PublishError>
+    fn encode<'a, I>(
+        &self,
+        values: I,
+        encoding: &mut Encoding<'a>,
+        records: &mut Vec<(usize, usize)>,
+    ) -> Result<(), PublishError>
     where
         T: 'a,
         I: IntoIterator<Item = &'a T>,
     {
-        scratch.bytes.clear();
-        scratch.ends.clear();
         for value in values {
-            let start = scratch.bytes.len();
-            value
-                .encode(&mut scratch.bytes)
-                .map_err(PublishError::Encode)?;
-            let bytes = (scratch.bytes.len().checked_sub(start))
-                .expect("`Payload::encode` removed bytes it did not write");
+            encoding.begin();
+            value.encode(encoding).map_err(PublishError::Encode)?;
+            let bytes = encoding.len;
             if bytes > self.max_payload {
                 let max = self.max_payload;
                 return Err(PublishError::TooLarge { bytes, max });
             }
-            scratch.ends.push(scratch.bytes.len());
+            records.push((encoding.pieces.len(), bytes));
         }
         Ok(())
     }
 
-    fn write(&self, scratch: &Scratch) -> Result<usize, PublishError> {
-        if scratch.ends.is_empty() {
+    fn write(
+        &self,
+        encoding: &Encoding<'_>,
+        records: &[(usize, usize)],
+    ) -> Result<usize, PublishError> {
+        if records.is_empty() {
             return Ok(0);
         }
-        let records = || {
-            let starts = std::iter::once(0).chain(scratch.ends.iter().copied());
-            starts.zip(scratch.ends.iter().copied())
-        };
         let mut state = self.lock();
         // Checked first, so that a refusal comes before the first record and none is written.
-        state
-            .writer
-            .admits(records().map(|(start, end)| end - start))?;
-        for (start, end) in records() {
-            state.writer.put(Kind::Item, &scratch.bytes[start..end])?;
+        state.writer.admits(records.iter().map(|&(_, len)| len))?;
+        let mut first = 0;
+        for &(end, len) in records {
+            let parts = encoding.pieces[first..end]
+                .iter()
+                .map(|&piece| encoding.of(piece));
+            state.writer.put_parts(Kind::Item, len, parts)?;
+            first = end;
         }
-        state.published += scratch.ends.len() as u64;
-        state.bytes += scratch.bytes.len() as u64;
+        state.published += records.len() as u64;
+        state.bytes += records.iter().map(|&(_, len)| len as u64).sum::<u64>();
         state.announce();
         let gone = state.links.prune();
         drop(state);
         drop(gone);
-        Ok(scratch.ends.len())
+        Ok(records.len())
     }
 }

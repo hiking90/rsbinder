@@ -487,15 +487,15 @@ impl crate::Payload for NotFour {
         <Bytes as crate::Payload>::type_name()
     }
 
-    fn encode(&self, out: &mut Vec<u8>) -> rsbinder::Result<()> {
-        out.extend_from_slice(&self.0);
+    fn encode<'a>(&'a self, out: &mut crate::Encoding<'a>) -> rsbinder::Result<()> {
+        out.borrow(&self.0);
         Ok(())
     }
 
-    fn decode(bytes: &[u8]) -> rsbinder::Result<Self> {
-        match bytes.len() {
+    fn decode(record: &mut crate::Record<'_>) -> rsbinder::Result<Self> {
+        match record.bytes().len() {
             4 => Err(rsbinder::StatusCode::BadValue),
-            _ => Ok(Self(bytes.to_vec())),
+            _ => Ok(Self(record.take())),
         }
     }
 }

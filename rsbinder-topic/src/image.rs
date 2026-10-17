@@ -28,7 +28,7 @@ pub(crate) enum Got {
 impl Got {
     pub(crate) fn of(taken: Result<Taken<'_>, Corrupted>) -> Self {
         match taken {
-            Ok(Taken::Item { index, payload }) => Got::Item(index, payload.to_vec()),
+            Ok(Taken::Item { index, record }) => Got::Item(index, record.bytes().to_vec()),
             Ok(Taken::End { payload }) => Got::End(payload.to_vec()),
             Ok(Taken::Empty) => Got::Empty,
             Ok(Taken::Lagged(records)) => Got::Lagged(records),

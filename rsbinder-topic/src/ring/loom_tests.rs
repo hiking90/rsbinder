@@ -173,11 +173,12 @@ fn every_record_returned_is_the_one_written(flaw: Flaw, puts: u32) {
         let mut next = 0;
         for _ in 0..2 {
             match reader.try_recv() {
-                Ok(Taken::Item {
-                    index,
-                    payload: got,
-                }) if index == next => {
-                    assert_eq!(got, payload(index), "a record that was not written there");
+                Ok(Taken::Item { index, record }) if index == next => {
+                    assert_eq!(
+                        record.bytes(),
+                        payload(index),
+                        "a record that was not written there"
+                    );
                     next += 1;
                 }
                 Ok(Taken::Lagged(lost)) => next += lost as u32,

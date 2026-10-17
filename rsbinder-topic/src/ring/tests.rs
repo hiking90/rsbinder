@@ -407,23 +407,39 @@ fn the_end_record_is_the_last_and_every_call_returns_it() {
 }
 
 #[test]
+fn a_record_of_parts_is_their_bytes_then_zeros_to_a_word() {
+    let heap = Heap::new(RING);
+    let mut writer = writer_of(&heap);
+    // The second part completes a word the first began, the third begins the last one.
+    let parts: [&[u8]; 4] = [b"abc", b"defgh", b"", b"ij"];
+    writer.put_parts(Kind::Item, 10, parts).unwrap();
+    let mut stored = [0xff; 16];
+    heap.loaded().load_ring(rules::HEADER, &mut stored);
+    assert_eq!(&stored, b"abcdefghij\0\0\0\0\0\0");
+    assert_eq!(
+        take(&mut reader_of(&heap, Start::Oldest)),
+        Got::Item(0, b"abcdefghij".to_vec())
+    );
+}
+
+#[test]
 fn records_of_a_later_layout_are_stepped_over_without_a_loss() {
     let heap = Heap::new(RING);
     let (mut writer, mut reader) = (writer_of(&heap), reader_of(&heap, Start::Oldest));
     publish(&mut writer, 1);
-    writer.put_raw(3, b"reserved").unwrap();
-    writer.put_raw(2, &[]).unwrap();
+    writer.put_raw(3, 8, [&b"reserved"[..]]).unwrap();
+    writer.put_raw(2, 0, []).unwrap();
     publish(&mut writer, 1);
     assert_eq!(take(&mut reader), item(0));
     assert_eq!(take(&mut reader), item(3));
     assert_eq!(reader.lost(), 0);
     // The newest record is one this version does not read: nothing to return, and it is consumed.
-    writer.put_raw(3, &[0; 16]).unwrap();
+    writer.put_raw(3, 16, [&[0; 16][..]]).unwrap();
     assert_eq!(latest(&mut reader), Got::Empty);
     assert_eq!(reader.position(), writer.position());
     // A ring of nothing else is crossed in one call.
     for _ in 0..100 {
-        writer.put_raw(3, &[]).unwrap();
+        writer.put_raw(3, 0, []).unwrap();
     }
     publish(&mut writer, 1);
     assert_eq!(take(&mut reader), item(105));

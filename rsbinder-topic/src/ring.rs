@@ -75,6 +75,8 @@ mod rules;
 
 use rules::{Header, Seen, View};
 
+use crate::Record;
+
 /// How often one receive call resumes after being lapped before it returns without a record.
 pub(crate) const RETRIES: u32 = 4;
 
@@ -118,6 +120,62 @@ pub(crate) trait Loads {
     fn load_ring(&self, position: u64, dst: &mut [u8]);
     /// An acquire fence: the loads that follow come after the stores the ring's loads saw.
     fn fence(&self);
+}
+
+/// Bytes of any lengths stored one after another from `position`, in the whole words
+/// [`Stores::store_ring`] takes: a word that two parts share is stored once both gave it bytes,
+/// and the last one is padded with zeros.
+struct Aligned<'m, M> {
+    memory: &'m M,
+    position: u64,
+    stored: u64,
+    word: [u8; 8],
+    held: usize,
+}
+
+impl<'m, M: Stores> Aligned<'m, M> {
+    fn new(memory: &'m M, position: u64) -> Self {
+        debug_assert_eq!(position % 8, 0);
+        Self {
+            memory,
+            position,
+            stored: 0,
+            word: [0; 8],
+            held: 0,
+        }
+    }
+
+    fn push(&mut self, mut bytes: &[u8]) {
+        self.stored += bytes.len() as u64;
+        if self.held > 0 {
+            let take = bytes.len().min(8 - self.held);
+            self.word[self.held..self.held + take].copy_from_slice(&bytes[..take]);
+            self.held += take;
+            bytes = &bytes[take..];
+            if self.held < 8 {
+                return;
+            }
+            self.memory.store_ring(self.position, &self.word);
+            self.position += 8;
+            self.held = 0;
+        }
+        let (whole, rest) = bytes.split_at(bytes.len() / 8 * 8);
+        if !whole.is_empty() {
+            self.memory.store_ring(self.position, whole);
+            self.position += whole.len() as u64;
+        }
+        self.word[..rest.len()].copy_from_slice(rest);
+        self.held = rest.len();
+    }
+
+    /// Store the last word, if one is begun; the bytes pushed.
+    fn finish(mut self) -> u64 {
+        if self.held > 0 {
+            self.word[self.held..].fill(0);
+            self.memory.store_ring(self.position, &self.word);
+        }
+        self.stored
+    }
 }
 
 /// Why a record was not written. Nothing in shared memory changed.
@@ -207,7 +265,17 @@ impl<M: Stores> Writer<M> {
 
     /// Write one record, over the oldest ones when the ring is full, and commit it.
     pub(crate) fn put(&mut self, kind: Kind, payload: &[u8]) -> Result<(), Refused> {
-        self.put_raw(kind as u32, payload)
+        self.put_raw(kind as u32, payload.len(), [payload])
+    }
+
+    /// [`put`](Self::put) of the payload that is `parts` one after another, `len` bytes in all.
+    pub(crate) fn put_parts<'p>(
+        &mut self,
+        kind: Kind,
+        len: usize,
+        parts: impl IntoIterator<Item = &'p [u8]>,
+    ) -> Result<(), Refused> {
+        self.put_raw(kind as u32, len, parts)
     }
 
     /// Tell the subscribers that sleep that something was committed; the `seq` that says so.
@@ -257,11 +325,16 @@ impl<M: Stores> Writer<M> {
             .ok_or(Refused::Spent)
     }
 
-    fn put_raw(&mut self, kind: u32, payload: &[u8]) -> Result<(), Refused> {
+    fn put_raw<'p>(
+        &mut self,
+        kind: u32,
+        len: usize,
+        parts: impl IntoIterator<Item = &'p [u8]>,
+    ) -> Result<(), Refused> {
         let start = self.written;
-        let end = self.end_after(start, payload.len())?;
+        let end = self.end_after(start, len)?;
         // `end_after` bounded the length by half the ring.
-        let len = payload.len() as u32;
+        let len = len as u32;
         let capacity = self.memory.capacity();
         while self
             .starts
@@ -284,14 +357,12 @@ impl<M: Stores> Writer<M> {
             index: self.index,
         };
         self.memory.store_ring(start, &header.bytes());
-        let (whole, rest) = payload.split_at(payload.len() / 8 * 8);
-        self.memory.store_ring(start + rules::HEADER, whole);
-        if !rest.is_empty() {
-            let mut padded = [0; 8];
-            padded[..rest.len()].copy_from_slice(rest);
-            self.memory
-                .store_ring(start + rules::HEADER + whole.len() as u64, &padded);
+        let mut words = Aligned::new(&self.memory, start + rules::HEADER);
+        for part in parts {
+            words.push(part);
         }
+        let stored = words.finish();
+        debug_assert_eq!(stored, u64::from(len), "the parts are not `len` bytes");
         self.memory.store_write(end);
         self.written = end;
         self.index = self.index.wrapping_add(1);
@@ -337,14 +408,21 @@ pub(crate) enum Start {
 pub(crate) struct Corrupted(pub(crate) &'static str);
 
 /// What a receive call found.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum Taken<'a> {
     /// The next item. The reader has moved past it.
     Item {
         /// The record's index.
+        #[cfg_attr(
+            not(any(test, feature = "fuzzing")),
+            expect(
+                dead_code,
+                reason = "a subscriber counts losses itself; tests check the index"
+            )
+        )]
         index: u32,
-        /// Its payload, in the reader's buffer until the next call.
-        payload: &'a [u8],
+        /// Its payload, in the reader's buffer until the next call, which a decoder may take.
+        record: Record<'a>,
     },
     /// The topic's end record. The reader stays on it: every later call returns it again.
     End {
@@ -448,11 +526,11 @@ impl<M: Loads> Reader<M> {
         Ok(self.lend(outcome))
     }
 
-    fn lend(&self, outcome: Outcome) -> Taken<'_> {
+    fn lend(&mut self, outcome: Outcome) -> Taken<'_> {
         match outcome {
             Outcome::Item { index, len } => Taken::Item {
                 index,
-                payload: &self.payload[..len],
+                record: Record::new(&mut self.payload, len),
             },
             Outcome::End { len } => Taken::End {
                 payload: &self.payload[..len],
@@ -537,7 +615,13 @@ impl<M: Loads> Reader<M> {
     /// Copy the payload of the record at `position`, `size` bytes long, into the buffer.
     fn copy(&mut self, position: u64, size: u64) {
         // `Header::extent` bounded `size` by half the ring, which is mapped: it fits a `usize`.
-        self.payload.resize((size - rules::HEADER) as usize, 0);
+        let len = (size - rules::HEADER) as usize;
+        if self.payload.capacity() < len {
+            // A taken or outgrown buffer: zeroed allocation, so a large one is not filled first.
+            self.payload = vec![0; len];
+        } else {
+            self.payload.resize(len, 0);
+        }
         self.memory
             .load_ring(position + rules::HEADER, &mut self.payload);
     }

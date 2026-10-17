@@ -96,7 +96,7 @@ mod wait;
 mod wake;
 
 pub use named::NamedSubscriber;
-pub use payload::{Bytes, Payload};
+pub use payload::{Bytes, Encoding, Payload, Record};
 pub use poll::{wait_any, Wait};
 pub use publish::{Authorize, PublishError, PublisherPolicy};
 pub use publisher::{Acceptor, Publisher};

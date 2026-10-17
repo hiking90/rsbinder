@@ -39,13 +39,14 @@ impl Payload for Word {
         "rsbinder.topic.test.Word"
     }
 
-    fn encode(&self, out: &mut Vec<u8>) -> rsbinder::Result<()> {
-        out.extend_from_slice(&self.0.to_le_bytes());
+    fn encode(&self, out: &mut crate::Encoding<'_>) -> rsbinder::Result<()> {
+        out.extend(&self.0.to_le_bytes());
         Ok(())
     }
 
-    fn decode(bytes: &[u8]) -> rsbinder::Result<Self> {
-        let bytes = bytes
+    fn decode(record: &mut crate::Record<'_>) -> rsbinder::Result<Self> {
+        let bytes = record
+            .bytes()
             .try_into()
             .map_err(|_| rsbinder::StatusCode::BadValue)?;
         Ok(Self(u64::from_le_bytes(bytes)))

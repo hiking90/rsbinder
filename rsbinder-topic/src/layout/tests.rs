@@ -5,7 +5,8 @@
 //! second time by the side that only reads.
 
 use super::*;
-use crate::ring::{Kind, Reader, Start, Taken, Writer};
+use crate::image::Got;
+use crate::ring::{Kind, Reader, Start, Writer};
 
 /// A populated, sealed memfd of `size` bytes holding the 4-byte `words` and zeros.
 fn sealed(size: u64, words: &[(usize, u32)]) -> OwnedFd {
@@ -39,14 +40,11 @@ fn topic_memory_is_written_through_one_mapping_and_read_through_another() {
     let seq = map_topic(fd.as_fd(), MAX_RING).unwrap();
     let mut writer = Writer::new(stored);
     let mut reader = Reader::attach(view, Start::Oldest).unwrap();
-    assert_eq!(reader.try_recv(), Ok(Taken::Empty));
+    assert_eq!(Got::of(reader.try_recv()), Got::Empty);
     writer.put(Kind::Item, b"through shared memory").unwrap();
     assert_eq!(
-        reader.try_recv(),
-        Ok(Taken::Item {
-            index: 0,
-            payload: b"through shared memory"
-        })
+        Got::of(reader.try_recv()),
+        Got::Item(0, b"through shared memory".to_vec())
     );
     // The word a subscriber sleeps on moves once for each announcement.
     assert_eq!(seq.seq().word().load(), 0);

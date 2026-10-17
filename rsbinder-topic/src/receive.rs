@@ -159,7 +159,7 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
 
 fn typed<T: Payload>(taken: Result<Taken<'_>, Corrupted>) -> Result<T, RecvError> {
     match taken {
-        Ok(Taken::Item { payload, .. }) => T::decode(payload).map_err(RecvError::Decode),
+        Ok(Taken::Item { mut record, .. }) => T::decode(&mut record).map_err(RecvError::Decode),
         Ok(Taken::End { payload }) => Err(RecvError::Closed(match end::status(payload) {
             Some(status) if status.is_ok() => Closed::End,
             Some(status) => Closed::Status(status),
