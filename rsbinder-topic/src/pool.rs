@@ -27,7 +27,8 @@
 //!   pin = i + 1; fence(SeqCst); generation[i] == g ? read the slot : pin = 0 and lose it
 //!   done reading: pin = 0 (Release)
 //! publisher, to lend slot i:
-//!   generation[i] = odd; fence(SeqCst); every pin word: i + 1 ? try another slot : lend i
+//!   generation[i] = odd; fence(SeqCst); load every pin word
+//!   the first slot tried, i or one before it, that no pin word names: lend it; none: try another
 //!   lending it: fence(Acquire), then the slot is written
 //!   published: generation[i] = even (Release), then the LOAN record
 //! ```
@@ -40,6 +41,11 @@
 //! acquire fence after it orders the subscriber's reads before the writes the publisher then
 //! makes.
 //!
+//! Every slot tried stays odd, so a later fence and load of the pin words decide it as well as
+//! its own did. The publisher judges the slots tried so far by one load of all the pin words, not
+//! each by its own load: a subscriber that moves its pin from slot to slot during one lend is
+//! then seen on one slot only, and with more slots tried than there are pin words one is free.
+//!
 //! # Which slot is lent
 //!
 //! A slot that every subscriber has read past (the `read` its control page reports is at or above
@@ -49,8 +55,17 @@
 //! A `read` is the subscriber's to write: a wrong one only changes which slot is lent, and the
 //! generation check still decides what a subscriber reads, so it costs that subscriber values.
 //!
+//! # How far behind a subscriber may fall
+//!
+//! Each publish takes back the values older than the newest `depth`: their generation goes odd,
+//! and a subscriber that reaches their `LOAN` records loses them, without a copy. A subscriber more than `depth` values behind thus skips to the newest `depth`, as one
+//! behind the ring skips to what the ring still holds. The slots kept for pins would otherwise
+//! hold older values whenever no pin is on them, and a subscriber that cannot keep up would read
+//! values as old as the pool is deep (plan 15 §8.4, "P3-4").
+//!
 //! With `slots >= max_subscribers × MAX_PINS + 1 + depth + max_loans` the publisher always finds
-//! a slot: pins hold at most `max_subscribers` of them, and loans not yet published `max_loans`.
+//! a slot: pins hold at most `max_subscribers` of them, values kept `depth`, and loans not yet
+//! published `max_loans`.
 
 #[cfg(loom)]
 use loom::sync::atomic::fence;
@@ -107,8 +122,9 @@ pub(crate) trait Generations {
 
 /// The subscribers' pin words as the publisher reaches them, read-only.
 pub(crate) trait Pins {
-    /// Whether some pin word names `slot`: a `Relaxed` load of each, after the caller's fence.
-    fn pinned(&self, slot: u32) -> bool;
+    /// Into `pinned`, cleared first, the slot each pin word names: a `Relaxed` load of each, after
+    /// the caller's fence. A word of 0 names none.
+    fn load_pins(&self, pinned: &mut Vec<u32>);
 }
 
 /// The generations as a subscriber reaches them, read-only.
@@ -148,19 +164,28 @@ pub(crate) struct Slots {
     slots: Vec<Slot>,
     lent: usize,
     max_loans: usize,
-    /// The slots one `lend` has tried, kept to spare an allocation per loan.
+    /// Published values that stay readable, at least the newest.
+    depth: usize,
+    /// The slots one `lend` has tried, as flags and in order, and the slots the pin words named;
+    /// kept to spare allocations per loan.
     tried: Vec<bool>,
+    order: Vec<usize>,
+    pinned: Vec<u32>,
 }
 
 impl Slots {
-    /// A pool of `count` slots, all of generation 0, of which `max_loans` may be lent at once.
-    pub(crate) fn new(count: u32, max_loans: usize) -> Self {
+    /// A pool of `count` slots, all of generation 0, which keeps the newest `depth` values and
+    /// lends `max_loans` slots at once.
+    pub(crate) fn new(count: u32, depth: usize, max_loans: usize) -> Self {
         let count = count as usize;
         Self {
             slots: vec![Slot::default(); count],
             lent: 0,
             max_loans,
+            depth: depth.max(1),
             tried: vec![false; count],
+            order: Vec::with_capacity(count),
+            pinned: Vec::new(),
         }
     }
 
@@ -176,24 +201,31 @@ impl Slots {
             return Err(LendError::TooMany);
         }
         self.tried.fill(false);
+        self.order.clear();
         while let Some(at) = self.candidate(read) {
             self.tried[at] = true;
+            self.order.push(at);
             let slot = &mut self.slots[at];
-            let number = at as u32;
             if slot.generation % 2 == 0 {
                 slot.generation += 1;
-                generations.store_generation(number, slot.generation, Ordering::Relaxed);
+                generations.store_generation(at as u32, slot.generation, Ordering::Relaxed);
             }
-            // The odd generation, an earlier lend's or this one's, before the pins are loaded.
+            // Odd by now, from this lend, an earlier one or a retire, before the pins are loaded.
             fence(Ordering::SeqCst);
-            if pins.pinned(number) {
+            pins.load_pins(&mut self.pinned);
+            let pinned = &self.pinned;
+            let free = self
+                .order
+                .iter()
+                .find(|&&at| !pinned.contains(&(at as u32)));
+            let Some(&free) = free else {
                 continue;
-            }
+            };
             // After a released pin: the subscriber's reads of the slot come before the next fill.
             fence(Ordering::Acquire);
-            slot.lent = true;
+            self.slots[free].lent = true;
             self.lent += 1;
-            return Ok(number);
+            return Ok(free as u32);
         }
         Err(LendError::NoSlot)
     }
@@ -229,8 +261,38 @@ impl Slots {
         generations.store_generation(slot, entry.generation, Ordering::Release);
         entry.end = end;
         entry.lent = false;
+        let generation = entry.generation;
         self.lent -= 1;
-        entry.generation
+        self.retire(generations);
+        generation
+    }
+
+    /// Take back the values older than the newest `depth`: odd, so a subscriber further behind
+    /// loses them, as one behind the ring does. `Relaxed`: no write follows until a lend, whose
+    /// fence orders it before the pins are loaded; a subscriber that still sees the value even
+    /// reads it whole, since nothing writes the slot before that lend.
+    fn retire(&mut self, generations: &impl Generations) {
+        loop {
+            let mut held = 0;
+            let mut oldest: Option<(usize, u64)> = None;
+            let published = self
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|&(_, slot)| !slot.lent && slot.end != 0 && slot.generation % 2 == 0);
+            for (at, slot) in published {
+                held += 1;
+                if oldest.is_none_or(|(_, end)| slot.end < end) {
+                    oldest = Some((at, slot.end));
+                }
+            }
+            let Some((at, _)) = oldest.filter(|_| held > self.depth) else {
+                return;
+            };
+            let slot = &mut self.slots[at];
+            slot.generation += 1;
+            generations.store_generation(at as u32, slot.generation, Ordering::Relaxed);
+        }
     }
 
     /// Lent `slot` comes back unpublished. Its generation stays odd: it holds no value.

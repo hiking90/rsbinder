@@ -101,12 +101,15 @@ pub struct PoolPolicy {
     /// Bytes of a slot, the largest value a loan holds, rounded up to a multiple of 64. Default
     /// 1 MiB.
     pub slot_bytes: usize,
-    /// Values kept for subscribers that have not read them yet, past those pinned. Default 2.
+    /// The newest values published that stay readable for a subscriber behind. Default 2; 0
+    /// counts as 1.
     ///
-    /// The slot lent next is one that every subscriber has read past, the one published last of
-    /// those, so that a busy pool reuses the slots still in the cache; with none, the oldest. A
-    /// subscriber that falls more than `depth` values behind loses the older ones, as one that
-    /// falls behind the ring does.
+    /// Each publish takes back the values older than these, so a subscriber that falls more than
+    /// `depth` values behind loses the older ones, as one that falls behind the ring does, and
+    /// receives no value older than `depth` publishes. A value a subscriber holds as a
+    /// [`Sample`](crate::Sample) stays its own however old it grows. The slot lent next is one
+    /// that every subscriber has read past, the one published last of those, so that a busy pool
+    /// reuses the slots still in the cache; with none, the oldest.
     pub depth: usize,
     /// Loans held at once and not yet published, past which a loan is refused. Default 1.
     pub max_loans: usize,
@@ -345,7 +348,7 @@ impl<T: Payload> TypedWriter<T, Stored<Mapping>> {
         let (pool_fd, memory) = layout::create_pool(slots, slot_bytes, pool.huge_pages)?;
         writer.lock().lending = Some(Lending {
             memory,
-            slots: Slots::new(slots, pool.max_loans),
+            slots: Slots::new(slots, pool.depth, pool.max_loans),
             max_loans: pool.max_loans,
         });
         let pool_fd = PoolFd {

@@ -273,8 +273,9 @@ impl Links {
 }
 
 impl Pins for Links {
-    fn pinned(&self, slot: u32) -> bool {
-        let names = |link: &Arc<Link>| link.control.pins() > 0 && link.control.pin(0) == slot + 1;
-        self.links.iter().any(names)
+    fn load_pins(&self, pinned: &mut Vec<u32>) {
+        pinned.clear();
+        let words = self.links.iter().filter(|link| link.control.pins() > 0);
+        pinned.extend(words.filter_map(|link| link.control.pin(0).checked_sub(1)));
     }
 }

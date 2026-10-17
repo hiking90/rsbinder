@@ -55,7 +55,8 @@ fn lend(publisher: &Publisher<Bytes>, value: &[u8]) -> u32 {
 
 #[test]
 fn a_loaned_value_reaches_every_subscriber_between_the_rings_values() {
-    let publisher = Publisher::<Bytes>::new(&pooled(2, 2, 1)).unwrap();
+    // A depth of 3: the three loans stay readable until the subscribers come.
+    let publisher = Publisher::<Bytes>::new(&pooled(2, 3, 1)).unwrap();
     let mut subscribers = [subscribe(&publisher), subscribe(&publisher)];
     publisher.publish(&Bytes(vec![1, 2, 3])).unwrap();
     lend(&publisher, &pattern(7, 1000));
@@ -115,9 +116,9 @@ fn a_dropped_loan_publishes_nothing_and_its_slot_is_lent_again() {
 }
 
 #[test]
-fn the_slot_read_last_is_lent_again_and_a_subscriber_behind_loses_the_oldest() {
-    // 2 pins, one to write, a depth of 1 and 1 loan: 5 slots.
-    let publisher = Publisher::<Bytes>::new(&pooled(2, 1, 1)).unwrap();
+fn the_slot_read_last_is_lent_again_and_a_subscriber_behind_gets_the_newest_depth() {
+    // 2 pins, one to write, a depth of 2 and 1 loan: 6 slots.
+    let publisher = Publisher::<Bytes>::new(&pooled(2, 2, 1)).unwrap();
     // With nobody subscribed every slot is read: the one published last comes back.
     let first = lend(&publisher, &[1; 8]);
     for _ in 0..4 {
@@ -125,21 +126,23 @@ fn the_slot_read_last_is_lent_again_and_a_subscriber_behind_loses_the_oldest() {
     }
     // A subscriber that has read nothing since it started: the free slots, then the oldest.
     let mut subscriber = subscribe(&publisher);
-    let lent: Vec<u32> = (0..5u8).map(|n| lend(&publisher, &[n; 8])).collect();
+    let lent: Vec<u32> = (0..6u8).map(|n| lend(&publisher, &[n; 8])).collect();
     let mut distinct = lent.clone();
     distinct.sort_unstable();
     distinct.dedup();
-    assert_eq!(distinct.len(), 5, "{lent:?}");
+    assert_eq!(distinct.len(), 6, "{lent:?}");
     assert_eq!(lent[0], first, "read by everyone and published last");
-    assert_eq!(lend(&publisher, &[5; 8]), lent[0], "the oldest");
-    // The first value's slot holds the sixth now: that one is lost, the rest arrive.
-    assert_eq!(subscriber.try_recv(), Err(RecvError::Lagged(1)));
-    for n in 1..6u8 {
+    assert_eq!(lend(&publisher, &[6; 8]), lent[0], "the oldest");
+    // Seven values behind, depth 2: the five oldest are taken back and the newest two arrive.
+    for _ in 0..5 {
+        assert_eq!(subscriber.try_recv(), Err(RecvError::Lagged(1)));
+    }
+    for n in 5..7u8 {
         assert_eq!(subscriber.try_recv(), Ok(Bytes(vec![n; 8])));
     }
-    assert_eq!(subscriber.stats().lost, 1);
+    assert_eq!(subscriber.stats().lost, 5);
     // Read up to the end: the slot published last comes back again.
-    assert_eq!(lend(&publisher, &[6; 8]), lent[0]);
+    assert_eq!(lend(&publisher, &[7; 8]), lent[0]);
 }
 
 /// AC-15.3.1: a lent value is received in its slot of the pool, with no copy; one that came

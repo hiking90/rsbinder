@@ -10,8 +10,10 @@
 //! and the reader's counter load are. The flawed models show the check is not vacuous: a
 //! publisher that does not look at the pins, a pin released `Relaxed`. A generation published
 //! `Relaxed` is no flaw here: the record's commit comes after it and orders the value as well.
-//! The publisher prefers the slot published last, so it keeps coming back to the one the
-//! subscriber may hold. Run: see `Cargo.toml` (`--cfg loom`).
+//! With everything read the publisher prefers the slot published last, so it keeps coming back to
+//! the one the subscriber may hold. With nothing read it lends the oldest, and with a depth of 1
+//! that is a slot the publish before took back, which only the retire's odd generation keeps
+//! from a subscriber holding its record. Run: see `Cargo.toml` (`--cfg loom`).
 
 // The std `Arc`: one of loom's dropped while a failed model unwinds calls into loom and aborts.
 use std::sync::Arc;
@@ -65,8 +67,12 @@ impl Generations for Model {
 }
 
 impl Pins for Model {
-    fn pinned(&self, slot: u32) -> bool {
-        self.flaw != Flaw::IgnoresPins && self.pin.load(Ordering::Relaxed) == slot + 1
+    fn load_pins(&self, pinned: &mut Vec<u32>) {
+        pinned.clear();
+        let word = self.pin.load(Ordering::Relaxed);
+        if self.flaw != Flaw::IgnoresPins {
+            pinned.extend(word.checked_sub(1));
+        }
     }
 }
 
@@ -90,9 +96,10 @@ impl Pin for Model {
     }
 }
 
-/// The publisher fills `rounds` slots with the round's number; the subscriber takes the newest
-/// record twice, and reads the slot it names when the pin holds.
-fn a_pinned_slot_is_read_whole_and_never_written(flaw: Flaw, rounds: u64) {
+/// The publisher fills `rounds` slots with the round's number, lending as if the subscribers had
+/// read up to `read`; the subscriber takes the newest record twice, and reads the slot it names
+/// when the pin holds.
+fn a_pinned_slot_is_read_whole_and_never_written(flaw: Flaw, rounds: u64, read: u64) {
     let mut model = loom::model::Builder::new();
     model.preemption_bound = Some(3);
     model.check(move || {
@@ -100,10 +107,9 @@ fn a_pinned_slot_is_read_whole_and_never_written(flaw: Flaw, rounds: u64) {
         let publisher = {
             let model = model.clone();
             thread::spawn(move || {
-                let mut slots = Slots::new(SLOTS, 1);
+                let mut slots = Slots::new(SLOTS, 1, 1);
                 for round in 1..=rounds {
-                    // Read past everything: the slot published last comes first.
-                    let slot = slots.lend(&*model, &*model, u64::MAX).expect("a slot");
+                    let slot = slots.lend(&*model, &*model, read).expect("a slot");
                     // SAFETY: a lent slot, which no pin holds; loom checks that it is so.
                     model.slots[slot as usize].with_mut(|value| unsafe { *value = round });
                     let generation = slots.publish(&*model, slot, round);
@@ -139,17 +145,24 @@ fn a_pinned_slot_is_read_whole_and_never_written(flaw: Flaw, rounds: u64) {
 
 #[test]
 fn loom_pool_a_pinned_slot_is_read_whole_and_never_written() {
-    a_pinned_slot_is_read_whole_and_never_written(Flaw::None, 3);
+    a_pinned_slot_is_read_whole_and_never_written(Flaw::None, 3, u64::MAX);
+}
+
+/// Nothing read: the third round lends the oldest slot, which the second took back, so the record
+/// of the first is lost and not read as the third round writes the slot.
+#[test]
+fn loom_pool_a_slot_taken_back_and_lent_again_is_never_read() {
+    a_pinned_slot_is_read_whole_and_never_written(Flaw::None, 3, 0);
 }
 
 #[test]
 #[should_panic(expected = "Causality violation")]
 fn loom_pool_a_publisher_that_ignores_the_pins_writes_a_slot_being_read() {
-    a_pinned_slot_is_read_whole_and_never_written(Flaw::IgnoresPins, 3);
+    a_pinned_slot_is_read_whole_and_never_written(Flaw::IgnoresPins, 3, u64::MAX);
 }
 
 #[test]
 #[should_panic(expected = "Causality violation")]
 fn loom_pool_a_pin_released_relaxed_lets_the_next_fill_race_the_read() {
-    a_pinned_slot_is_read_whole_and_never_written(Flaw::RelaxedUnpin, 3);
+    a_pinned_slot_is_read_whole_and_never_written(Flaw::RelaxedUnpin, 3, u64::MAX);
 }
