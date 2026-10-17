@@ -33,8 +33,8 @@ use rsbinder::{
 use rsbinder_topic::aidl::ITopic::{ITopic, ERROR_VERSION};
 use rsbinder_topic::aidl::SubscribeRequest::SubscribeRequest;
 use rsbinder_topic::{
-    wait_any, Bytes, Closed, Disconnected, NamedSubscriber, Payload, Publisher, PublisherPolicy,
-    RecvError, Subscriber, SubscriberPolicy, Wait, Wake,
+    wait_any, Bytes, Closed, Disconnected, NamedSubscriber, Payload, PoolPolicy, Publisher,
+    PublisherPolicy, RecvError, Subscriber, SubscriberPolicy, Wait, Wake,
 };
 
 const ROLE: &str = "RSBINDER_TOPIC_ROLE";
@@ -169,6 +169,60 @@ fn a_killed_or_dropped_subscriber_is_taken_out_and_its_page_unmapped() {
     // No death: the page says `CLOSED`, and the count takes it out.
     assert_eq!(publisher.subscriber_count(), 0);
     assert_eq!(memfds(), before);
+}
+
+/// Lend a slot for `value` and publish it; the slot's address, which names it.
+fn lend(publisher: &Publisher<Bytes>, value: &[u8]) -> usize {
+    let mut loan = publisher.loan_slice(value.len()).unwrap();
+    loan.copy_from_slice(value);
+    let at = loan.as_ptr() as usize;
+    loan.publish().unwrap();
+    at
+}
+
+/// AC-15.3.4: a slot pinned by a subscriber that is killed holding it is lent again once the
+/// death notification takes the subscription out.
+#[test]
+#[ignore = "needs a binder device and rsb_hub"]
+fn a_slot_a_killed_subscriber_pinned_is_lent_again() {
+    init();
+    // 2 pins, one to write, a depth of 1 and 1 loan: 5 slots.
+    let policy = PublisherPolicy {
+        max_subscribers: 2,
+        max_per_uid: 2,
+        pool: Some(PoolPolicy {
+            slot_bytes: 4096,
+            depth: 1,
+            max_loans: 1,
+            huge_pages: false,
+        }),
+        ..PublisherPolicy::default()
+    };
+    let publisher = Publisher::<Bytes>::new(&policy).unwrap();
+    let name = name("pinned");
+    hub::add_service(&name, publisher.as_binder()).unwrap();
+    // A subscriber that reads nothing: no slot is read by everyone, so the oldest go round.
+    let idle = SubscriberPolicy::default();
+    let _idle = Subscriber::<Bytes>::request(&publisher.as_binder(), &idle).unwrap();
+    let mut peer = Peer::spawn("pin", &name);
+    assert_eq!(peer.says(), "subscribed");
+    let pinned = lend(&publisher, b"held");
+    assert_eq!(peer.says(), "pinned held");
+    let lent = |count| {
+        (0..count)
+            .map(|_| lend(&publisher, b"next"))
+            .collect::<Vec<_>>()
+    };
+    assert!(!lent(5 * 4).contains(&pinned), "a pinned slot lent");
+    assert_eq!(publisher.subscriber_count(), 2);
+    peer.kill();
+    eventually("the death to take the subscription out", || {
+        publisher.subscriber_count() == 1
+    });
+    assert!(
+        lent(5).contains(&pinned),
+        "the dead subscriber's slot not lent again"
+    );
 }
 
 /// AC-15.2.33: a subscription from another process is named with that process's uid and pid.
@@ -630,6 +684,18 @@ fn child() {
             drop(subscriber);
             say("dropped");
             wait_for_eof();
+        }
+        "pin" => {
+            let topic = hub::check_service(&name).unwrap();
+            let mut subscriber =
+                Subscriber::<Bytes>::request(&topic, &SubscriberPolicy::default()).unwrap();
+            say("subscribed");
+            let sample = subscriber.recv_sample().unwrap();
+            let value = String::from_utf8(sample.to_owned()).unwrap();
+            say(&format!("pinned {value}"));
+            // Held until the process is killed.
+            wait_for_eof();
+            drop(sample);
         }
         "subscribe-loop" => {
             let topic = hub::check_service(&name).unwrap();
