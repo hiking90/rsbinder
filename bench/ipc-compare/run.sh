@@ -56,6 +56,10 @@ uniq_of() { sort | uniq -c | sed 's/^ *//' | tr '\n' ' '; }
     echo "governor: $(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | uniq_of)"
     echo "epp: $(cat /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference 2>/dev/null | uniq_of)"
     echo "boost: $(cat /sys/devices/system/cpu/cpufreq/boost 2>/dev/null || echo -)"
+    echo "cpuidle: $(cat /sys/devices/system/cpu/cpuidle/current_governor 2>/dev/null || echo -);" \
+        "cpus with each state disabled: $(for s in /sys/devices/system/cpu/cpu0/cpuidle/state*; do
+            printf '%s=%s ' "$(cat "$s/name")" \
+                "$(cat /sys/devices/system/cpu/cpu*/cpuidle/"${s##*/}"/disable | grep -c 1)"; done)"
     echo "smt siblings: $(cat /sys/devices/system/cpu/cpu*/topology/thread_siblings_list | sort -un | tr '\n' ' ')"
     echo "pinning: producer/server cpu 1; consumers/client cpus 2,3,4,5,6,7,0,8 in that order;" \
         "B4 threads cpus 2,3; the driver is not pinned"
