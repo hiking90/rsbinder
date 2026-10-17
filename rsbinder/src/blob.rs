@@ -437,7 +437,7 @@ mod tests {
         // 1 MB inline plus length and tag: no fd, so the bytes carry the whole payload.
         assert!(bytes.len() >= data.len() + 8);
 
-        let mut parcel = Parcel::from_slice(&bytes);
+        let mut parcel = Parcel::data_only_from_vec(bytes);
         let blob = parcel.read_blob().expect("read_blob");
         assert_eq!(blob.inline().map(<[u8]>::len), Some(data.len()));
         assert_eq!(blob.to_vec().expect("to_vec"), data);

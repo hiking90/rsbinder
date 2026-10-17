@@ -161,6 +161,13 @@ Each item below changes what a 0.12.0 program observes.
   `rsbinder::stream`'s ring has used since 0.12.0, moved here unchanged so
   that every channel in a process counts against one limit on concurrent
   looks (half the cores); `stream` now calls it from here.
+- **`to_bytes_into` and `from_bytes_in`**: `to_bytes` and `from_bytes` on a
+  buffer the caller keeps. `to_bytes_into(&value, &mut out)` appends to `out`
+  the bytes `to_bytes` returns, wherever `out` ends, and on an error leaves
+  `out` as it was. `from_bytes_in(&mut bytes)` reads the value from `bytes`
+  themselves, where `from_bytes` decodes a copy, and leaves them unchanged.
+  A caller that encodes or decodes many values allocates only when its
+  buffer grows; `to_bytes` and `from_bytes` are these two on a new buffer.
 
 ### Changed
 

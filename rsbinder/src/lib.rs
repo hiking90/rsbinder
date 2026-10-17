@@ -406,7 +406,7 @@ pub use thread_state::{
 
 pub use parcel::Parcel;
 // No feature needed: the session-less parcel mode is what refuses binders and fds.
-pub use parcel::{from_bytes, to_bytes};
+pub use parcel::{from_bytes, from_bytes_in, to_bytes, to_bytes_into};
 
 // From `parcelable` — (de)serialization trait stack.
 pub use parcelable::{
