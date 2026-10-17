@@ -17,9 +17,11 @@ use crate::aidl::ITopic::{BnTopic, ITopic, ERROR_FULL};
 use crate::aidl::SubscribeRequest::SubscribeRequest;
 use crate::aidl::TopicEndpoint::TopicEndpoint;
 use crate::layout::MIN_RING;
+use std::os::fd::AsRawFd;
+
 use crate::{
-    Acceptor, Authorize, Bytes, Closed, Disconnected, NamedSubscriber, Publisher, PublisherPolicy,
-    RecvError, Resolver, Subscriber, SubscriberPolicy, Watch,
+    wait_any, Acceptor, Authorize, Bytes, Closed, Disconnected, NamedSubscriber, Publisher,
+    PublisherPolicy, RecvError, Resolver, Subscriber, SubscriberPolicy, Wait, Wake, Watch,
 };
 
 /// The bound of every wait a test makes, so that a broken subscriber fails rather than hangs.
@@ -472,6 +474,229 @@ fn a_name_subscribers_stats_count_every_connection() {
     assert_eq!(recv(&mut subscriber), Ok(bytes(3)));
     let stats = subscriber.stats();
     assert_eq!((stats.received, stats.connections, stats.lost), (3, 2, 0));
+}
+
+fn subscribe_on(names: &Names, name: &str, wake: Wake) -> NamedSubscriber<Bytes> {
+    let policy = SubscriberPolicy {
+        wake,
+        ..SubscriberPolicy::default()
+    };
+    NamedSubscriber::subscribe_with(name, &policy, names).unwrap()
+}
+
+fn raw_fds(subscriber: &NamedSubscriber<Bytes>) -> [i32; 2] {
+    subscriber.wait_fds().unwrap().map(|fd| fd.as_raw_fd())
+}
+
+/// One thread, a poll loop of `wait_any`: receive into `got` until `done` holds of it.
+fn poll_until(
+    subscribers: &mut [NamedSubscriber<Bytes>],
+    got: &mut [Vec<Result<Bytes, RecvError>>],
+    done: impl Fn(&[Vec<Result<Bytes, RecvError>>]) -> bool,
+) {
+    let deadline = Instant::now() + WAIT;
+    while !done(got) {
+        assert!(Instant::now() < deadline, "received only {got:?}");
+        let mut waits: Vec<&mut dyn Wait> = subscribers
+            .iter_mut()
+            .map(|subscriber| subscriber as &mut dyn Wait)
+            .collect();
+        // Up to the deadline: a wake that does not come fails the test, as no later poll finds it.
+        let left = deadline.saturating_duration_since(Instant::now());
+        wait_any(&mut waits, Some(left)).unwrap();
+        for (subscriber, got) in subscribers.iter_mut().zip(got.iter_mut()) {
+            loop {
+                match subscriber.try_recv() {
+                    Err(RecvError::Empty) => break,
+                    other => got.push(other),
+                }
+            }
+        }
+    }
+}
+
+/// AC-15.2.36: three name subscribers on one thread, one of whose publishers is replaced by
+/// another; the fds polled are the same throughout.
+#[test]
+fn name_subscribers_on_one_poll_loop_keep_their_fds_through_a_new_publisher() {
+    let names = Names::default();
+    let topics = ["test.a", "test.b", "test.c"];
+    let publishers: Vec<_> = topics
+        .iter()
+        .map(|name| Publisher::<Bytes>::advertise_with(name, &policy(), &names).unwrap())
+        .collect();
+    let mut subscribers: Vec<_> = topics
+        .iter()
+        .map(|name| subscribe_on(&names, name, Wake::Fd))
+        .collect();
+    for subscriber in &subscribers {
+        connected(subscriber);
+    }
+    let fds: Vec<_> = subscribers.iter().map(raw_fds).collect();
+    let mut got = vec![Vec::new(), Vec::new(), Vec::new()];
+    for publisher in &publishers {
+        publisher.publish(&bytes(1)).unwrap();
+    }
+    poll_until(&mut subscribers, &mut got, |got| {
+        got.iter().all(|got| got.len() == 1)
+    });
+    let mut publishers = publishers.into_iter();
+    let (a, b, c) = (publishers.next(), publishers.next(), publishers.next());
+    drop(b);
+    poll_until(&mut subscribers, &mut got, |got| got[1].len() == 2);
+    // Published before the name is given: the reconnection reads it.
+    let next = Publisher::<Bytes>::new(&policy()).unwrap();
+    next.publish(&bytes(7)).unwrap();
+    names.give("test.b", next.as_binder());
+    poll_until(&mut subscribers, &mut got, |got| got[1].len() == 3);
+    for publisher in [a.as_ref(), Some(&next), c.as_ref()].into_iter().flatten() {
+        publisher.publish(&bytes(2)).unwrap();
+    }
+    poll_until(&mut subscribers, &mut got, |got| {
+        got.iter().all(|got| got.last() == Some(&Ok(bytes(2))))
+    });
+    let ended = Err(RecvError::Disconnected(Disconnected::Ended(Closed::End)));
+    assert_eq!(got[0], [Ok(bytes(1)), Ok(bytes(2))]);
+    assert_eq!(got[1], [Ok(bytes(1)), ended, Ok(bytes(7)), Ok(bytes(2))]);
+    assert_eq!(got[2], [Ok(bytes(1)), Ok(bytes(2))]);
+    let after: Vec<_> = subscribers.iter().map(raw_fds).collect();
+    assert_eq!(after, fds);
+}
+
+/// A poll that sleeps ends at a commit of the connection, the first one and the next.
+#[test]
+fn a_poll_that_sleeps_ends_at_a_commit_through_a_reconnection() {
+    let names = Names::default();
+    let mut subscriber = subscribe_on(&names, NAME, Wake::Fd);
+    for round in 0..2u8 {
+        let publisher = Arc::new(advertise(&names, &policy()));
+        // Took the connection: the next receive finds nothing, the poll then sleeps.
+        connected(&subscriber);
+        assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+        let later = publisher.clone();
+        let publishing = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            later.publish(&bytes(round)).unwrap();
+        });
+        // A poll that ends for an earlier change finds nothing; the one after waits for the commit.
+        let started = Instant::now();
+        let got = loop {
+            let left = WAIT.saturating_sub(started.elapsed());
+            assert!(!left.is_zero(), "round {round}: no commit ended the poll");
+            let mut waits: [&mut dyn Wait; 1] = [&mut subscriber];
+            wait_any(&mut waits, Some(left)).unwrap();
+            match subscriber.try_recv() {
+                Err(RecvError::Empty) => {}
+                other => break other,
+            }
+        };
+        publishing.join().unwrap();
+        assert_eq!(got, Ok(bytes(round)));
+        // The commit came at 50 ms; a poll that it did not end sleeps to the bound.
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(5), "round {round}: {took:?}");
+        drop(publisher);
+        let ended = Err(RecvError::Disconnected(Disconnected::Ended(Closed::End)));
+        assert_eq!(recv(&mut subscriber), ended);
+    }
+}
+
+#[test]
+fn an_interrupt_ends_a_poll_with_no_connection() {
+    let names = Names::default();
+    let mut subscriber = subscribe_on(&names, NAME, Wake::Fd);
+    let interrupter = subscriber.interrupter();
+    let interrupting = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        interrupter.interrupt();
+    });
+    let started = Instant::now();
+    assert!(subscriber.prepare_wait());
+    let mut waits: [&mut dyn Wait; 1] = [&mut subscriber];
+    assert!(wait_any(&mut waits, Some(WAIT)).unwrap());
+    assert!(started.elapsed() < WAIT);
+    subscriber.finish_wait();
+    interrupting.join().unwrap();
+    // A receive that does not wait leaves the interrupt to the next one that does.
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    assert_eq!(recv(&mut subscriber), Err(RecvError::Cancelled));
+}
+
+#[test]
+#[should_panic(expected = "Wake::Futex")]
+fn a_futex_name_subscriber_has_no_wait_to_prepare() {
+    let names = Names::default();
+    let mut subscriber = subscribe(&names);
+    assert!(subscriber.wait_fds().is_none());
+    subscriber.prepare_wait();
+}
+
+/// AC-15.2.36: `recv_async` through a change of publisher, on either wake.
+#[cfg(feature = "tokio")]
+mod reactor {
+    use super::*;
+
+    fn through_a_new_publisher(wake: Wake) {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let names = Names::default();
+        let first = advertise(&names, &policy());
+        let mut subscriber = subscribe_on(&names, NAME, wake);
+        connected(&subscriber);
+        let receiving = runtime.spawn(async move {
+            let mut got = Vec::new();
+            while got.len() < 4 {
+                let next = tokio::time::timeout(WAIT, subscriber.recv_async()).await;
+                got.push(next.expect("a receive that did not end"));
+            }
+            got
+        });
+        first.publish(&bytes(1)).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        drop(first);
+        // The receive waits with no connection, then the next publisher's first record comes.
+        std::thread::sleep(Duration::from_millis(20));
+        let second = advertise(&names, &policy());
+        second.publish(&bytes(2)).unwrap();
+        second.publish(&bytes(3)).unwrap();
+        let got = runtime.block_on(receiving).unwrap();
+        let ended = Err(RecvError::Disconnected(Disconnected::Ended(Closed::End)));
+        assert_eq!(got, [Ok(bytes(1)), ended, Ok(bytes(2)), Ok(bytes(3))]);
+    }
+
+    #[test]
+    fn an_async_receive_goes_on_with_the_next_publisher_on_the_futex() {
+        through_a_new_publisher(Wake::Futex);
+    }
+
+    #[test]
+    fn an_async_receive_goes_on_with_the_next_publisher_on_the_fd() {
+        through_a_new_publisher(Wake::Fd);
+    }
+
+    #[test]
+    fn an_interrupt_ends_an_async_wait_for_a_connection() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let names = Names::default();
+        let mut subscriber = subscribe_on(&names, NAME, Wake::Fd);
+        let interrupter = subscriber.interrupter();
+        let receiving =
+            runtime.spawn(async move { tokio::time::timeout(WAIT, subscriber.recv_async()).await });
+        std::thread::sleep(Duration::from_millis(50));
+        interrupter.interrupt();
+        let got = runtime.block_on(receiving).unwrap();
+        assert_eq!(
+            got.expect("the interrupt ended the wait"),
+            Err(RecvError::Cancelled)
+        );
+    }
 }
 
 #[test]

@@ -24,6 +24,7 @@ mod imp {
     use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
     use std::time::{Duration, Instant};
 
+    use rustix::event::epoll::{self, EventData, EventFlags};
     use rustix::event::{eventfd, poll, EventfdFlags, PollFd, PollFlags, Timespec};
     use rustix::io::Errno;
     use rustix::net::{
@@ -137,6 +138,58 @@ mod imp {
             }
         }
     }
+
+    /// A name subscriber's two fds, the same through its reconnections: an epoll instance that
+    /// holds the current connection's fds, and an eventfd its changes of state add to.
+    pub(crate) struct NamedFds {
+        epoll: OwnedFd,
+        event: OwnedFd,
+    }
+
+    impl NamedFds {
+        pub(crate) fn new() -> io::Result<Self> {
+            Ok(Self {
+                epoll: epoll::create(epoll::CreateFlags::CLOEXEC)?,
+                event: eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)?,
+            })
+        }
+
+        /// The epoll instance, then the eventfd.
+        pub(crate) fn fds(&self) -> [BorrowedFd<'_>; 2] {
+            [self.epoll.as_fd(), self.event.as_fd()]
+        }
+
+        /// Make the next poll of these fds return.
+        pub(crate) fn poke(&self) {
+            // Fails only with the count at `u64::MAX - 1`, which a poll returns for anyway.
+            let _ = rustix::io::write(&self.event, &1u64.to_ne_bytes());
+        }
+
+        /// Empty the eventfd; the connection's fds are the connection's to empty.
+        pub(crate) fn drain(&self) {
+            let mut count = [0u8; 8];
+            let _ = rustix::io::read(&self.event, &mut count);
+        }
+
+        /// Put a connection's fds in the epoll instance, both or neither.
+        pub(crate) fn join(&self, fds: [BorrowedFd<'_>; 2]) -> io::Result<()> {
+            let add = |fd| epoll::add(&self.epoll, fd, EventData::new_u64(0), EventFlags::IN);
+            add(fds[0])?;
+            if let Err(error) = add(fds[1]) {
+                self.leave(fds);
+                return Err(error.into());
+            }
+            Ok(())
+        }
+
+        /// Take a connection's fds out of the epoll instance.
+        pub(crate) fn leave(&self, fds: [BorrowedFd<'_>; 2]) {
+            for fd in fds {
+                // Closing them takes them out too: a failure here leaves nothing behind.
+                let _ = epoll::delete(&self.epoll, fd);
+            }
+        }
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -190,6 +243,35 @@ mod imp {
         }
 
         pub(crate) fn sleep(&self, _: Option<Instant>) -> bool {
+            match *self {}
+        }
+    }
+
+    /// None exists here: a name subscriber connects to nothing.
+    pub(crate) enum NamedFds {}
+
+    impl NamedFds {
+        pub(crate) fn new() -> io::Result<Self> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+
+        pub(crate) fn fds(&self) -> [BorrowedFd<'_>; 2] {
+            match *self {}
+        }
+
+        pub(crate) fn poke(&self) {
+            match *self {}
+        }
+
+        pub(crate) fn drain(&self) {
+            match *self {}
+        }
+
+        pub(crate) fn join(&self, _: [BorrowedFd<'_>; 2]) -> io::Result<()> {
+            match *self {}
+        }
+
+        pub(crate) fn leave(&self, _: [BorrowedFd<'_>; 2]) {
             match *self {}
         }
     }

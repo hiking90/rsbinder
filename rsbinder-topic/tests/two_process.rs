@@ -34,7 +34,7 @@ use rsbinder_topic::aidl::ITopic::{ITopic, ERROR_VERSION};
 use rsbinder_topic::aidl::SubscribeRequest::SubscribeRequest;
 use rsbinder_topic::{
     wait_any, Bytes, Closed, Disconnected, NamedSubscriber, Payload, Publisher, PublisherPolicy,
-    RecvError, Subscriber, SubscriberPolicy, Wake,
+    RecvError, Subscriber, SubscriberPolicy, Wait, Wake,
 };
 
 const ROLE: &str = "RSBINDER_TOPIC_ROLE";
@@ -345,6 +345,97 @@ fn a_name_subscriber_outlives_a_killed_publisher_and_reads_the_next_from_its_fir
         assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![byte])));
     }
     assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+}
+
+/// What each of several subscribers received, in order.
+type Received = Vec<Vec<Result<Bytes, RecvError>>>;
+
+/// One thread, a poll loop of `wait_any`: receive into `got` until `done` holds of it.
+fn poll_until(
+    subscribers: &mut [NamedSubscriber<Bytes>],
+    got: &mut Received,
+    done: impl Fn(&Received) -> bool,
+) {
+    let deadline = Instant::now() + WAIT;
+    while !done(got) {
+        assert!(Instant::now() < deadline, "received only {got:?}");
+        let mut waits: Vec<&mut dyn Wait> = subscribers
+            .iter_mut()
+            .map(|subscriber| subscriber as &mut dyn Wait)
+            .collect();
+        // Up to the deadline: a wake that does not come fails the test, as no later poll finds it.
+        let left = deadline.saturating_duration_since(Instant::now());
+        wait_any(&mut waits, Some(left)).unwrap();
+        for (subscriber, got) in subscribers.iter_mut().zip(got.iter_mut()) {
+            loop {
+                match subscriber.try_recv() {
+                    Err(RecvError::Empty) => break,
+                    other => got.push(other),
+                }
+            }
+        }
+    }
+}
+
+/// AC-15.2.36: three name subscribers on one poll loop; one publisher is killed and started
+/// again, and its subscriber goes on through the same fds.
+#[test]
+#[ignore = "needs a binder device and rsb_hub"]
+fn name_subscribers_on_one_poll_loop_go_on_through_a_killed_publisher() {
+    init();
+    let names = [name("loop.a"), name("loop.b"), name("loop.c")];
+    let mut peers: Vec<Peer> = names
+        .iter()
+        .map(|name| Peer::spawn("advertise", name))
+        .collect();
+    for peer in &peers {
+        assert_eq!(peer.says(), "ready");
+    }
+    let policy = SubscriberPolicy {
+        wake: Wake::Fd,
+        ..SubscriberPolicy::default()
+    };
+    let mut subscribers: Vec<_> = names
+        .iter()
+        .map(|name| NamedSubscriber::<Bytes>::subscribe(name, &policy).unwrap())
+        .collect();
+    for subscriber in &subscribers {
+        assert!(subscriber.wait_connected(WAIT));
+    }
+    let fds = |subscribers: &[NamedSubscriber<Bytes>]| -> Vec<[i32; 2]> {
+        let fds = subscribers.iter().map(|s| s.wait_fds().unwrap());
+        fds.map(|fds| fds.map(|fd| fd.as_raw_fd())).collect()
+    };
+    let before = fds(&subscribers);
+    let mut got: Received = vec![Vec::new(), Vec::new(), Vec::new()];
+    for peer in &mut peers {
+        peer.tell("publish 1");
+        assert_eq!(peer.says(), "published");
+    }
+    poll_until(&mut subscribers, &mut got, |got| {
+        got.iter().all(|got| got.len() == 1)
+    });
+    peers[1].kill();
+    poll_until(&mut subscribers, &mut got, |got| got[1].len() == 2);
+    peers[1] = Peer::spawn("advertise", &names[1]);
+    assert_eq!(peers[1].says(), "ready");
+    peers[1].tell("publish 2");
+    assert_eq!(peers[1].says(), "published");
+    poll_until(&mut subscribers, &mut got, |got| got[1].len() == 4);
+    let died = Err(RecvError::Disconnected(Disconnected::Ended(
+        Closed::PublisherDied,
+    )));
+    assert_eq!(
+        got[1],
+        [
+            Ok(Bytes(vec![0])),
+            died,
+            Ok(Bytes(vec![0])),
+            Ok(Bytes(vec![1]))
+        ]
+    );
+    assert_eq!((got[0].len(), got[2].len()), (1, 1));
+    assert_eq!(fds(&subscribers), before);
 }
 
 /// AC-15.2.5, 2.11: 8 sleeping subscribers of a killed publisher end within 1 s, 1000 times.

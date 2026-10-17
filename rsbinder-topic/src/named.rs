@@ -12,17 +12,22 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::os::fd::BorrowedFd;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use rsbinder::{BinderResult, ExceptionCode, SIBinder, Status, StatusCode};
 
 use crate::aidl::ITopic::{ERROR_CLOSED, ERROR_VERSION};
+use crate::connect::status_of;
+use crate::layout;
+use crate::poll::{Sealed, Wait};
 use crate::resolve::{Resolver, ServiceManager, Watch};
 use crate::subscriber::Interrupt;
+use crate::wake::NamedFds;
 use crate::{
     Disconnected, Interrupter, Payload, RecvError, Start, Subscriber, SubscriberPolicy,
-    SubscriberStats,
+    SubscriberStats, Wake,
 };
 
 /// The first wait before a refused subscription is asked again, doubled up to [`LAST_RETRY`].
@@ -68,6 +73,11 @@ const LAST_RETRY: Duration = Duration::from_secs(30);
 /// [`start`](SubscriberPolicy::start) is [`Start::Last`]: the subscription is older than that
 /// publisher, so all it published is news to it.
 ///
+/// With [`Wake::Fd`] the subscriber is a [`Wait`]: an event loop or
+/// [`wait_any`](crate::wait_any) polls the same two fds through every reconnection.
+/// `recv_async` waits on the connection's `recv_async`, and between connections without a
+/// thread.
+///
 /// **The process has to run the binder thread pool**
 /// (`rsbinder::ProcessState::start_thread_pool`): the service manager's notice of the name is a
 /// call into it, and without the pool the subscriber never connects.
@@ -91,7 +101,12 @@ struct Connection<T: Payload> {
 struct Named<T: Payload> {
     policy: SubscriberPolicy,
     state: Mutex<State<T>>,
+    /// Each change of `state` is signalled to every kind of wait: a thread's, a future's, a poll's.
     changed: Condvar,
+    #[cfg(feature = "tokio")]
+    notify: tokio::sync::Notify,
+    /// With [`Wake::Fd`]: the fds handed out, which hold the connection's.
+    fds: Option<NamedFds>,
 }
 
 struct State<T: Payload> {
@@ -181,10 +196,18 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
         policy: &SubscriberPolicy,
         resolver: &dyn Resolver,
     ) -> BinderResult<Self> {
+        layout::check_target().map_err(status_of)?;
+        let fds = match policy.wake {
+            Wake::Futex => None,
+            Wake::Fd => Some(NamedFds::new().map_err(StatusCode::from)?),
+        };
         let named = Arc::new(Named {
             policy: policy.clone(),
             state: Mutex::new(State::new()),
             changed: Condvar::new(),
+            #[cfg(feature = "tokio")]
+            notify: tokio::sync::Notify::new(),
+            fds,
         });
         let weak = Arc::downgrade(&named);
         let watch = resolver.watch(
@@ -274,79 +297,151 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
     /// A receive: without waiting (`wait` is `None`), or waiting until a deadline or without one.
     fn receive(&mut self, wait: Option<Option<Instant>>, latest: bool) -> Result<T, RecvError> {
         loop {
-            let mut state = self.named.lock();
-            if let Some(notice) = state.notices.pop_front() {
-                return Err(RecvError::Disconnected(notice));
-            }
-            if self.current.is_none() {
-                if let Some((subscriber, binder)) = state.ready.take() {
-                    let wake = subscriber.interrupter();
-                    if state.interrupted {
-                        wake.interrupt();
-                    }
-                    state.wake = Some(wake);
-                    self.current = Some(Connection {
-                        subscriber,
-                        binder,
-                        drain_to: None,
-                    });
-                }
-            }
-            let Some(connection) = self.current.as_mut() else {
-                let Some(deadline) = wait else {
-                    return Err(RecvError::Empty);
-                };
-                if std::mem::take(&mut state.interrupted) {
-                    return Err(RecvError::Cancelled);
-                }
-                match deadline {
-                    None => drop(self.named.changed.wait(state).expect("lock poisoned")),
-                    Some(deadline) => {
-                        let now = Instant::now();
-                        if now >= deadline {
-                            return Err(RecvError::Timeout);
-                        }
-                        let waited = self.named.changed.wait_timeout(state, deadline - now);
-                        drop(waited.expect("lock poisoned"));
-                    }
-                }
-                continue;
-            };
-            if state.replaced && connection.drain_to.is_none() {
-                connection.drain_to = Some(connection.subscriber.committed());
-            }
-            drop(state);
-            if let Some(end) = connection.drain_to {
-                if connection.subscriber.position() < end {
-                    let received = if latest {
-                        connection.subscriber.try_latest()
-                    } else {
-                        connection.subscriber.try_recv()
+            let named = self.named.clone();
+            let mut state = match self.step(named.lock(), latest) {
+                Step::Done(received) => return received,
+                Step::Idle(state) => state,
+                Step::Connected => {
+                    let connection = self.current.as_mut().expect("a connection");
+                    let received = match wait {
+                        None if latest => connection.subscriber.try_latest(),
+                        None => connection.subscriber.try_recv(),
+                        Some(deadline) => connection.subscriber.wait(deadline, latest),
                     };
-                    match received {
-                        Err(RecvError::Empty | RecvError::Closed(_)) => {}
-                        other => return other,
+                    match self.settle(received) {
+                        Some(received) => return received,
+                        None => continue,
                     }
                 }
-                return Err(self.finish(Disconnected::Replaced));
-            }
-            let received = match wait {
-                None if latest => connection.subscriber.try_latest(),
-                None => connection.subscriber.try_recv(),
-                Some(deadline) => connection.subscriber.wait(deadline, latest),
             };
-            match received {
-                Err(RecvError::Cancelled) => {
-                    if std::mem::take(&mut self.named.lock().interrupted) {
+            let Some(deadline) = wait else {
+                return Err(RecvError::Empty);
+            };
+            if std::mem::take(&mut state.interrupted) {
+                return Err(RecvError::Cancelled);
+            }
+            match deadline {
+                None => drop(named.changed.wait(state).expect("lock poisoned")),
+                Some(deadline) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(RecvError::Timeout);
+                    }
+                    let waited = named.changed.wait_timeout(state, deadline - now);
+                    drop(waited.expect("lock poisoned"));
+                }
+            }
+        }
+    }
+
+    /// [`recv`](Self::recv) for an async caller: the connection's
+    /// [`Subscriber::recv_async`], and between connections a wait that holds no thread.
+    ///
+    /// Cancel-safe, as `Subscriber::recv_async` is, and with its panics.
+    #[cfg(feature = "tokio")]
+    pub async fn recv_async(&mut self) -> Result<T, RecvError> {
+        loop {
+            let named = self.named.clone();
+            // Made before the look: a `Notified` gets `notify_waiters` from its creation on.
+            let notified = named.notify.notified();
+            // Decided before any await: the lock, and the type that holds it, end here.
+            let connected = match self.step(named.lock(), false) {
+                Step::Done(received) => return received,
+                Step::Idle(state) => {
+                    if take_interrupt(state) {
                         return Err(RecvError::Cancelled);
                     }
-                    // A change of state ended the wait: look at it.
+                    false
                 }
-                Err(RecvError::Closed(closed)) => {
-                    return Err(self.finish(Disconnected::Ended(closed)));
-                }
-                other => return other,
+                Step::Connected => true,
+            };
+            if !connected {
+                notified.await;
+                continue;
             }
+            let connection = self.current.as_mut().expect("a connection");
+            let received = connection.subscriber.recv_async().await;
+            if let Some(received) = self.settle(received) {
+                return received;
+            }
+        }
+    }
+
+    /// Take a notice or a connection, and with a connection the next record before a
+    /// replacement. `Idle` keeps the lock, for a wait to look at the interrupt and sleep.
+    fn step<'n>(&mut self, mut state: MutexGuard<'n, State<T>>, latest: bool) -> Step<'n, T> {
+        if let Some(notice) = state.notices.pop_front() {
+            return Step::Done(Err(RecvError::Disconnected(notice)));
+        }
+        if self.current.is_none() {
+            if let Some((subscriber, binder)) = state.ready.take() {
+                if let Err(error) = self.join(&subscriber) {
+                    // The next registration of the name tries again.
+                    state.connected = None;
+                    drop(state);
+                    drop(subscriber);
+                    let status = Status::from(StatusCode::from(error));
+                    return Step::Done(Err(RecvError::Disconnected(Disconnected::Rejected(
+                        status,
+                    ))));
+                }
+                let wake = subscriber.interrupter();
+                if state.interrupted {
+                    wake.interrupt();
+                }
+                state.wake = Some(wake);
+                self.current = Some(Connection {
+                    subscriber,
+                    binder,
+                    drain_to: None,
+                });
+            }
+        }
+        let Some(connection) = self.current.as_mut() else {
+            return Step::Idle(state);
+        };
+        if state.replaced && connection.drain_to.is_none() {
+            connection.drain_to = Some(connection.subscriber.committed());
+        }
+        drop(state);
+        let Some(end) = connection.drain_to else {
+            return Step::Connected;
+        };
+        if connection.subscriber.position() < end {
+            let received = if latest {
+                connection.subscriber.try_latest()
+            } else {
+                connection.subscriber.try_recv()
+            };
+            match received {
+                Err(RecvError::Empty | RecvError::Closed(_)) => {}
+                other => return Step::Done(other),
+            }
+        }
+        Step::Done(Err(self.finish(Disconnected::Replaced)))
+    }
+
+    /// What a receive on the connection leads to: a result, or `None` to look again.
+    fn settle(&mut self, received: Result<T, RecvError>) -> Option<Result<T, RecvError>> {
+        match received {
+            Err(RecvError::Cancelled) => {
+                let state = &mut *self.named.lock();
+                if std::mem::take(&mut state.interrupted) {
+                    return Some(Err(RecvError::Cancelled));
+                }
+                // A replacement ended the wait to be looked at; else the runtime could not run it.
+                (!state.replaced).then_some(Err(RecvError::Cancelled))
+            }
+            Err(RecvError::Closed(closed)) => Some(Err(self.finish(Disconnected::Ended(closed)))),
+            other => Some(other),
+        }
+    }
+
+    /// Put a connection's fds among the subscriber's, with [`Wake::Fd`].
+    fn join(&self, subscriber: &Subscriber<T>) -> std::io::Result<()> {
+        match (&self.named.fds, subscriber.wait_fds()) {
+            (Some(fds), Some(theirs)) => fds.join(theirs),
+            _ => Ok(()),
         }
     }
 
@@ -372,9 +467,66 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
         } else {
             drop(state);
         }
+        if let (Some(fds), Some(connection)) = (&self.named.fds, &gone) {
+            if let Some(theirs) = connection.subscriber.wait_fds() {
+                fds.leave(theirs);
+            }
+        }
         // Unmapped outside the lock.
         drop(gone);
         RecvError::Disconnected(why)
+    }
+}
+
+/// Clear a pending interrupt, whether one was; the lock is released on return.
+#[cfg(feature = "tokio")]
+fn take_interrupt<T: Payload>(mut state: MutexGuard<'_, State<T>>) -> bool {
+    std::mem::take(&mut state.interrupted)
+}
+
+/// Where a receive stands after [`NamedSubscriber::step`].
+enum Step<'n, T: Payload> {
+    Done(Result<T, RecvError>),
+    /// No connection, nothing to return: wait for a change, the lock held until then.
+    Idle(MutexGuard<'n, State<T>>),
+    /// Receive from the connection.
+    Connected,
+}
+
+impl<T: Payload> Sealed for NamedSubscriber<T> {}
+
+/// A [`Wake::Fd`] name subscriber's fds are an epoll instance that holds the current
+/// connection's two, and an eventfd its changes of state add to: the same two fds for the
+/// subscriber's life, through every reconnection.
+impl<T: Payload + 'static> Wait for NamedSubscriber<T> {
+    fn wait_fds(&self) -> Option<[BorrowedFd<'_>; 2]> {
+        self.named.fds.as_ref().map(NamedFds::fds)
+    }
+
+    fn prepare_wait(&mut self) -> bool {
+        assert!(
+            self.named.fds.is_some(),
+            "prepare_wait: a subscription made with `Wake::Futex` has no file descriptor to poll"
+        );
+        let state = self.named.lock();
+        // A notice, a connection to take or a replacement's records: a receive returns at once.
+        if !state.notices.is_empty() || state.ready.is_some() || state.replaced {
+            return false;
+        }
+        drop(state);
+        match self.current.as_mut() {
+            Some(connection) => connection.subscriber.prepare_wait(),
+            None => true,
+        }
+    }
+
+    fn finish_wait(&mut self) {
+        if let Some(fds) = &self.named.fds {
+            fds.drain();
+        }
+        if let Some(connection) = self.current.as_mut() {
+            connection.subscriber.finish_wait();
+        }
     }
 }
 
@@ -386,7 +538,7 @@ impl<T: Payload> Drop for NamedSubscriber<T> {
         let ready = state.ready.take();
         drop(state);
         // A connection thread asleep before a retry looks at `dropped` and ends.
-        self.named.changed.notify_all();
+        self.named.signal();
         drop(ready);
     }
 }
@@ -403,6 +555,16 @@ impl<T: Payload> fmt::Debug for NamedSubscriber<T> {
 impl<T: Payload> Named<T> {
     fn lock(&self) -> MutexGuard<'_, State<T>> {
         self.state.lock().expect("lock poisoned")
+    }
+
+    /// Tell every wait that `state` changed; called after the change, with the lock released.
+    fn signal(&self) {
+        Condvar::notify_all(&self.changed);
+        #[cfg(feature = "tokio")]
+        self.notify.notify_waiters();
+        if let Some(fds) = &self.fds {
+            fds.poke();
+        }
     }
 
     /// Where a connection starts: the policy's place first, the new ring's oldest record after.
@@ -431,7 +593,7 @@ impl<T: Payload + 'static> Named<T> {
             state.replaced = true;
             let wake = state.wake.clone();
             drop(state);
-            self.changed.notify_all();
+            self.signal();
             if let Some(wake) = wake {
                 wake.interrupt();
             }
@@ -440,7 +602,7 @@ impl<T: Payload + 'static> Named<T> {
         if state.connecting {
             drop(state);
             // A thread waiting to retry moves to this binder.
-            self.changed.notify_all();
+            self.signal();
             return;
         }
         if state.refused.as_ref() == Some(&binder) {
@@ -500,7 +662,7 @@ impl<T: Payload + 'static> Named<T> {
                     state.reconnect = true;
                     state.connecting = false;
                     drop(state);
-                    self.changed.notify_all();
+                    self.signal();
                     return;
                 }
                 Err(status) => status,
@@ -515,18 +677,18 @@ impl<T: Payload + 'static> Named<T> {
                     let Some(next) = next else {
                         state.connecting = false;
                         drop(state);
-                        self.changed.notify_all();
+                        self.signal();
                         return;
                     };
                     drop(state);
-                    self.changed.notify_all();
+                    self.signal();
                     (binder, delay, told) = (next, FIRST_RETRY, false);
                 }
                 Refusal::Retry => {
                     if !told {
                         state.notices.push_back(Disconnected::Rejected(status));
                         told = true;
-                        self.changed.notify_all();
+                        self.signal();
                     }
                     let until = Instant::now() + delay;
                     while !state.dropped && state.latest.as_ref() == Some(&binder) {
@@ -554,7 +716,7 @@ impl<T: Payload> Interrupt for Named<T> {
         state.interrupted = true;
         let wake = state.wake.clone();
         drop(state);
-        self.changed.notify_all();
+        self.signal();
         if let Some(wake) = wake {
             wake.interrupt();
         }

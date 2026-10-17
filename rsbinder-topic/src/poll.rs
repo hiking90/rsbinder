@@ -17,8 +17,8 @@ const MAX_POLL: Duration = Duration::from_secs(i32::MAX as u64);
 /// Keeps [`Wait`] to this crate's types.
 pub trait Sealed {}
 
-/// A wait an event loop drives: a [`Subscriber`](crate::Subscriber) made with
-/// [`Wake::Fd`](crate::Wake::Fd).
+/// A wait an event loop drives: a [`Subscriber`](crate::Subscriber) or a
+/// [`NamedSubscriber`](crate::NamedSubscriber) made with [`Wake::Fd`](crate::Wake::Fd).
 ///
 /// ```text
 /// loop {
@@ -36,11 +36,15 @@ pub trait Sealed {}
 /// the publisher's process and an [`Interrupter`](crate::Interrupter). An interrupt ends no wait
 /// of this kind: it stays for the next receive that waits, such as `recv`.
 ///
-/// The fds are the same for the life of the subscriber. Register them once, level-triggered or
-/// edge-triggered: `finish_wait` reads both until they have nothing left.
+/// The fds are the same for the life of the subscriber, a `NamedSubscriber`'s through every
+/// reconnection. Register them once, level-triggered or edge-triggered: `finish_wait` empties
+/// what made them readable. A `NamedSubscriber` also ends a poll when its connection changes: a
+/// notice to return, a connection to take; its `try_recv` then returns it.
 pub trait Wait: Sealed {
-    /// The fds to poll for readability, a socket and an eventfd; `None` for a subscription made
-    /// with [`Wake::Futex`](crate::Wake::Futex), which has none.
+    /// The fds to poll for readability: a `Subscriber`'s socket and eventfd, or a
+    /// `NamedSubscriber`'s epoll instance, which holds its current connection's two, and an
+    /// eventfd of its own. `None` for a subscription made with
+    /// [`Wake::Futex`](crate::Wake::Futex), which has none.
     fn wait_fds(&self) -> Option<[BorrowedFd<'_>; 2]>;
 
     /// Start a wait: `true` when the caller should poll, then call
