@@ -46,7 +46,10 @@
 //! `tail`, and if `tail` has passed the record's start, what was copied may be bytes of a newer
 //! record and is dropped. That check is ordered, not merely likely to work: the publisher's
 //! stores are `Release`, so a reader that copied even one byte of an overwriting record then
-//! loads a `tail` at least as new as the one stored before that record. A header is believed
+//! loads a `tail` at least as new as the one stored before that record. A long payload is copied
+//! in chunks with the same check between them, so a copy the publisher overtakes stops there and
+//! costs at most a chunk past that point, not the rest of the record; a check that passes
+//! between chunks decides nothing, and the one after the copy still judges it. A header is believed
 //! before that check only when it is what the reader expects (the next index, a length that fits
 //! what is committed); any other header is judged by `tail` first, so a torn one is not taken
 //! for corruption.
@@ -81,6 +84,16 @@ use crate::Record;
 
 /// How often one receive call resumes after being lapped before it returns without a record.
 pub(crate) const RETRIES: u32 = 4;
+
+/// The most payload bytes a reader copies between two looks at `tail`: a copy the publisher
+/// overtakes stops within this many bytes instead of running to the record's end. A look is an
+/// acquire fence and one load, small beside copying this much, and a record no longer than this
+/// takes none.
+#[cfg(not(any(test, loom)))]
+const CHUNK: usize = 64 * 1024;
+/// Smaller than the records of the race tests (24 bytes), so that they copy in two chunks.
+#[cfg(any(test, loom))]
+const CHUNK: usize = 16;
 
 /// The kinds of record this version writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -641,8 +654,9 @@ impl<M: Loads> Reader<M> {
         Header::parse(bytes)
     }
 
-    /// Copy the payload of the record at `position`, `size` bytes long, into the buffer.
-    fn copy(&mut self, position: u64, size: u64) {
+    /// Copy the payload of the record at `position`, `size` bytes long, into the buffer, [`CHUNK`]
+    /// bytes at a time; `false` once a look at `tail` between two of them finds it overwritten.
+    fn copy(&mut self, position: u64, size: u64) -> Result<bool, Corrupted> {
         // `Header::extent` bounded `size` by half the ring, which is mapped: it fits a `usize`.
         let len = (size - rules::HEADER) as usize;
         if self.payload.capacity() < len {
@@ -651,8 +665,19 @@ impl<M: Loads> Reader<M> {
         } else {
             self.payload.resize(len, 0);
         }
-        self.memory
-            .load_ring(position + rules::HEADER, &mut self.payload);
+        let mut copied = 0;
+        while copied < len {
+            let end = len.min(copied + CHUNK);
+            self.memory.load_ring(
+                position + rules::HEADER + copied as u64,
+                &mut self.payload[copied..end],
+            );
+            copied = end;
+            if copied < len && self.overwritten(position)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Count what `lost` holds as reported.
@@ -709,9 +734,9 @@ impl<M: Loads> Reader<M> {
                 // Losses counted from records stepped over; this one is read by the next call.
                 return Ok(self.settle(lost));
             }
-            self.copy(self.read, size);
+            let whole = self.copy(self.read, size)?;
             // Only now is what was copied, header and payload, known to be this record's.
-            if self.overwritten(self.read)? {
+            if !whole || self.overwritten(self.read)? {
                 // A record the reader has not read yet does not count before its first.
                 if let Some(index) = self.expected {
                     lost = 1;
@@ -766,11 +791,11 @@ impl<M: Loads> Reader<M> {
             let header = self.header(at);
             // `at` is below the `write` held either way, and the record there is committed.
             let size = header.extent(at, self.seen.write(), capacity);
-            match size {
-                Ok(size) if header.kind <= Kind::Loan as u32 => self.copy(at, size),
-                _ => {}
-            }
-            if self.overwritten(at)? {
+            let whole = match size {
+                Ok(size) if header.kind <= Kind::Loan as u32 => self.copy(at, size)?,
+                _ => true,
+            };
+            if !whole || self.overwritten(at)? {
                 if laps == RETRIES {
                     return Ok(Outcome::Empty);
                 }

@@ -737,6 +737,85 @@ fn an_oldest_start_whose_tail_passed_the_write_counter_it_loaded_reads_on() {
     assert_eq!(drain(&mut reader).len(), 127);
 }
 
+/// A reader's view behind which a publisher writes more than a ring at the `tail` load `at`,
+/// counting the ring bytes the reader loads.
+struct Overtaking<'a, M, S> {
+    memory: M,
+    writer: &'a RefCell<Writer<S>>,
+    tails: Cell<u32>,
+    at: Cell<u32>,
+    loaded: Cell<usize>,
+}
+
+impl<M: Loads, S: Stores> Loads for Overtaking<'_, M, S> {
+    fn capacity(&self) -> u64 {
+        self.memory.capacity()
+    }
+
+    fn tail(&self) -> u64 {
+        self.tails.set(self.tails.get() + 1);
+        if self.tails.get() == self.at.get() {
+            publish(&mut self.writer.borrow_mut(), 200);
+        }
+        self.memory.tail()
+    }
+
+    fn write(&self) -> u64 {
+        self.memory.write()
+    }
+
+    fn last(&self) -> u64 {
+        self.memory.last()
+    }
+
+    fn half(&self) -> u64 {
+        self.memory.half()
+    }
+
+    fn load_ring(&self, position: u64, dst: &mut [u8]) {
+        self.loaded.set(self.loaded.get() + dst.len());
+        self.memory.load_ring(position, dst);
+    }
+
+    fn fence(&self) {
+        self.memory.fence();
+    }
+}
+
+#[test]
+fn a_copy_the_publisher_overtakes_stops_at_the_next_chunk() {
+    const LONG: usize = 16 * CHUNK;
+    let heap = Heap::new(RING);
+    let writer = RefCell::new(writer_of(&heap));
+    publish(&mut writer.borrow_mut(), 1);
+    let overtaking = Overtaking {
+        memory: heap.loaded(),
+        writer: &writer,
+        tails: Cell::new(0),
+        at: Cell::new(0),
+        loaded: Cell::new(0),
+    };
+    let mut reader = Reader::attach(overtaking, Start::Oldest).unwrap();
+    // A record overtaken before the first one read would not count as lost.
+    assert_eq!(take(&mut reader), item(0));
+    writer.borrow_mut().put(Kind::Item, &body(1, LONG)).unwrap();
+    // The first `tail` the receive loads is the one after its first chunk.
+    reader.memory.at.set(reader.memory.tails.get() + 1);
+    reader.memory.loaded.set(0);
+    let Got::Lagged(lost) = take(&mut reader) else {
+        panic!("the overtaken record was not reported lost");
+    };
+    // Its header and first chunk, then the header of the record it resumes at.
+    let header = rules::HEADER as usize;
+    assert_eq!(reader.memory.loaded.get(), header + CHUNK + header);
+    let rest = drain(&mut reader);
+    assert_eq!(rest[0], item(1 + lost as u32));
+    assert_eq!(
+        1 + lost + rest.len() as u64,
+        u64::from(writer.borrow().next_index())
+    );
+}
+
 /// What the two sides of the race below share to pace one another.
 struct Pace {
     /// Ring stores the publisher has made.
