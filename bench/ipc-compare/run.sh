@@ -12,7 +12,8 @@
 # rsbinder-topic's loans, read in place and copied out (by a subscriber that does not vouch for
 # the publisher, and by one that does), next to its ring copies and iceoryx2's two kinds of
 # subscriber. `p36` is rsbinder-topic's large payloads, ring and pool, without and with
-# backpressure. Each repeat writes its own CSV.
+# backpressure; `p36f` is the large payloads with backpressure, without and with a window. Each
+# repeat writes its own CSV.
 #
 # Results go to plans/15-pubsub-bench/<time>-<set>/: conditions.txt and results-<repeat>.csv.
 #
@@ -201,6 +202,28 @@ b3_backpressure() {
     done
 }
 
+# B3's large payloads through rsbinder-topic's ring and its pool with a backpressure of 1 s,
+# without and with a window of 2 records (plan 15 P3-6f): where the subscribers cannot keep up
+# the window bounds the latency by two records and the bytes behind the slowest subscriber;
+# where they keep up the two rows should not differ.
+b3_window() {
+    local window
+    for n in 1 8; do
+        for size in 1048576 4194304; do
+            for rate in 1000 0; do
+                for window in 0 2; do
+                    local flags=(--backpressure 1000)
+                    [ "$window" -gt 0 ] && flags+=(--window "$window")
+                    measure b3 --impl rsb-topic --wait block --n "$n" --size "$size" \
+                        --rate "$rate" "${flags[@]}"
+                    measure b3 --impl rsb-topic-loan --wait block --touch yes --n "$n" \
+                        --size "$size" --rate "$rate" "${flags[@]}"
+                done
+            done
+        done
+    done
+}
+
 for repeat in $(seq "$repeats"); do
     csv=$out/results-$repeat.csv
     "$bin" header > "$csv"
@@ -222,6 +245,7 @@ for repeat in $(seq "$repeats"); do
         p2e5) b6; b3 "rsb-topic block" "rsb-topic poll" ;;
         p3) b3_loan ;;
         p36) b3_backpressure ;;
+        p36f) b3_window ;;
         *) echo "run.sh: unknown set $set_name" >&2; exit 2 ;;
     esac
 done

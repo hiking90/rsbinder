@@ -9,7 +9,9 @@
 //!   and its subscriber reads it in place, or copies it out with --touch yes; with --trust yes
 //!   the subscriber vouches for the publisher and copies with a plain memory copy; with
 //!   --backpressure MS a publish or a loan waits up to MS ms for the subscribers, and the row's
-//!   impl gains `+bp`)
+//!   impl gains `+bp`; with --window N as well, also for one it would leave more than N records
+//!   behind, and the impl is `+bp-wN`; rsb-topic takes --ring B for a ring of B bytes in place
+//!   of the one sized for --size)
 //! ipc-compare b5 --wake futex|fd --n N [--rate HZ]     (one process: publish time, N waiting)
 //! ipc-compare b6 --codec alloc|parcel|bytes --side publish|receive --size B  (one process: codec)
 //!   (b2, b3 with --impl ix also take --touch yes: the subscriber copies the payload out)
@@ -136,12 +138,20 @@ fn fanout(bench: &str, a: &Args) {
         "rsb-topic" | "rsb-topic-loan" if a.has("backpressure") => Some(a.num("backpressure", 0)),
         _ => None,
     };
-    let label = match backpressure {
-        Some(ms) => {
+    let window = match backpressure {
+        Some(_) if a.num("window", 0) > 0 => Some(a.num("window", 0)),
+        _ => None,
+    };
+    let label = match (backpressure, window) {
+        (Some(ms), Some(records)) => {
+            note.push(format!("backpressure {ms} ms window {records}"));
+            format!("{imp}+bp-w{records}")
+        }
+        (Some(ms), None) => {
             note.push(format!("backpressure {ms} ms"));
             format!("{imp}+bp")
         }
-        None => imp.clone(),
+        (None, _) => imp.clone(),
     };
     let row = |hist, msgs_per_s, failures, note: Vec<String>| {
         Row {
@@ -187,7 +197,7 @@ fn fanout(bench: &str, a: &Args) {
             (producer, imp.clone(), vec![("ring", ring.to_string())])
         }
         "rsb-topic" => {
-            let ring = rsb::topic_ring_for(size);
+            let ring = if a.has("ring") { a.num("ring", 0) as usize } else { rsb::topic_ring_for(size) };
             note.push(format!("ring {ring} B; copies the payload out"));
             let producer = spawn("rsb-producer", &[("name", name.clone()), ("cpu", producer_cpu)]);
             (producer, imp.clone(), vec![("ring", ring.to_string())])
@@ -243,6 +253,9 @@ fn fanout(bench: &str, a: &Args) {
     let mut extra = extra;
     if let Some(ms) = backpressure {
         extra.push(("backpressure", ms.to_string()));
+    }
+    if let Some(records) = window {
+        extra.push(("window", records.to_string()));
     }
     if producer.wait_for("READY", START).is_none() {
         return row(None, 0.0, 0, vec!["producer did not start".into()]);

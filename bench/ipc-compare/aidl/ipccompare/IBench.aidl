@@ -16,11 +16,13 @@ interface IBench {
     // ring of `ringBytes`; start() publishes to it as well. With
     // `backpressureMs` of 0 or more a publish waits that long for its
     // subscribers (PublisherPolicy::backpressure); below 0 it never waits.
-    IBinder topic(int ringBytes, int backpressureMs);
+    // A `window` above 0 is Backpressure::window; 0 sets none.
+    IBinder topic(int ringBytes, int backpressureMs, int window);
 
     // The same topic with a pool of `slotBytes` slots, for `subscribers`
     // consumers keeping `depth` values; start() lends a slot per item.
-    IBinder loanTopic(int ringBytes, int slotBytes, int depth, int subscribers, int backpressureMs);
+    IBinder loanTopic(int ringBytes, int slotBytes, int depth, int subscribers, int backpressureMs,
+            int window);
 
     // Publishes `count` items of `size` bytes to every consumer added, at
     // `rateHz` (0 = as fast as the slowest consumer takes them), then ends.

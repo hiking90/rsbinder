@@ -2,6 +2,7 @@
 //! consumer, and B1's twoway client.
 
 use std::io::Write;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -74,15 +75,22 @@ pub fn topic_ring_for(size: usize) -> usize {
     PublisherPolicy::for_payload(size.max(STAMP_BYTES), depth).ring_bytes
 }
 
-/// A wait of `ms` for the topic's subscribers; none below 0.
-fn backpressure(ms: i32) -> Option<Backpressure> {
+/// A wait of `ms` for the topic's subscribers, `window` records ahead at most (none at 0); none
+/// below 0.
+fn backpressure(ms: i32, window: i32) -> Option<Backpressure> {
     let ms = u64::try_from(ms).ok()?;
-    Some(Backpressure { timeout: Duration::from_millis(ms), ..Backpressure::default() })
+    let window = NonZeroUsize::new(window.max(0) as usize);
+    Some(Backpressure { timeout: Duration::from_millis(ms), window })
 }
 
 /// `--backpressure MS` as the producer takes it: -1 without the flag.
 fn backpressure_arg(a: &Args) -> i32 {
     if a.has("backpressure") { a.num("backpressure", 0) as i32 } else { -1 }
+}
+
+/// `--window N` as the producer takes it: 0 without the flag.
+fn window_arg(a: &Args) -> i32 {
+    a.num("window", 0) as i32
 }
 
 /// What a consumer notes besides its histogram, one word: values lost, and a subscription taken
@@ -139,10 +147,15 @@ impl IBench for Producer {
         Ok(())
     }
 
-    fn r#topic(&self, ring_bytes: i32, backpressure_ms: i32) -> BinderResult<SIBinder> {
+    fn r#topic(
+        &self,
+        ring_bytes: i32,
+        backpressure_ms: i32,
+        window: i32,
+    ) -> BinderResult<SIBinder> {
         self.topic_with(&PublisherPolicy {
             ring_bytes: ring_bytes.max(0) as usize,
-            backpressure: backpressure(backpressure_ms),
+            backpressure: backpressure(backpressure_ms, window),
             ..PublisherPolicy::default()
         })
     }
@@ -154,6 +167,7 @@ impl IBench for Producer {
         depth: i32,
         subscribers: i32,
         backpressure_ms: i32,
+        window: i32,
     ) -> BinderResult<SIBinder> {
         let subscribers = subscribers.max(1) as usize;
         self.topic_with(&PublisherPolicy {
@@ -165,7 +179,7 @@ impl IBench for Producer {
                 depth: depth.max(0) as usize,
                 ..PoolPolicy::default()
             }),
-            backpressure: backpressure(backpressure_ms),
+            backpressure: backpressure(backpressure_ms, window),
             ..PublisherPolicy::default()
         })
     }
@@ -307,7 +321,8 @@ pub fn topic_consumer(a: &Args) -> Result<()> {
     let count = a.num("count", 0);
     let wait = a.str("wait", "block");
     let bench = connect(&a.str("name", ""))?;
-    let topic = bench.r#topic(a.num("ring", 64 * 1024) as i32, backpressure_arg(a))?;
+    let topic =
+        bench.r#topic(a.num("ring", 64 * 1024) as i32, backpressure_arg(a), window_arg(a))?;
     let policy = SubscriberPolicy {
         max_ring_bytes: 1 << 30,
         wake: if wait == "fd" { Wake::Fd } else { Wake::Futex },
@@ -359,8 +374,14 @@ pub fn topic_loan_consumer(a: &Args) -> Result<()> {
     let touch = a.str("touch", "no") == "yes";
     let bench = connect(&a.str("name", ""))?;
     let num = |key: &str| a.num(key, 0) as i32;
-    let topic =
-        bench.r#loanTopic(num("ring"), num("slot"), num("depth"), num("n"), backpressure_arg(a))?;
+    let topic = bench.r#loanTopic(
+        num("ring"),
+        num("slot"),
+        num("depth"),
+        num("n"),
+        backpressure_arg(a),
+        window_arg(a),
+    )?;
     let policy = SubscriberPolicy {
         max_ring_bytes: 1 << 30,
         max_pool_bytes: usize::MAX,
