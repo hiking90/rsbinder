@@ -910,10 +910,13 @@ fn verdict<T>(result: rsbinder::BinderResult<T>) -> String {
     }
 }
 
+/// The crate's layout version (`layout.rs`), which a test outside it cannot name.
+const LAYOUT: u32 = 3;
+
 /// A request as `Subscriber::request` makes it for `Bytes`, with `token` given.
 fn raw_request(token: SIBinder) -> SubscribeRequest {
     SubscribeRequest {
-        version: 2,
+        version: LAYOUT as i32,
         r#type: Bytes::type_name().to_owned(),
         token: Some(token),
         control: Some(ParcelFileDescriptor::from(control_page())),
@@ -928,7 +931,7 @@ fn control_page() -> OwnedFd {
     let options = CreateOptions::new("rsbinder-topic-test").populate(true);
     let file = File::from(shm::create(0x80, &options).unwrap());
     file.write_at(b"RSTC", 0).unwrap();
-    file.write_at(&2u32.to_ne_bytes(), 4).unwrap();
+    file.write_at(&LAYOUT.to_ne_bytes(), 4).unwrap();
     let fd = OwnedFd::from(file);
     let seals = Seals::GROW | Seals::SHRINK | Seals::FUTURE_WRITE | Seals::SEAL;
     shm::add_seals(fd.as_fd(), seals).unwrap();

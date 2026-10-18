@@ -24,7 +24,7 @@
 //! | `0x20` | 8 | `tail`: the start of the oldest record not overwritten |
 //! | `0x28` | 8 | `last`: the start of the newest record |
 //! | `0x30` | 8 | `half`: the start of the oldest record in the newer half of the ring |
-//! | `0x38` | 8 | zero |
+//! | `0x38` | 8 | `frontier`: how far the chunks of the record being written reach |
 //! | `0x40` | capacity | the ring (`ring.rs`) |
 //!
 //! The first two words and the ring are where libfmq puts the write region end, the write
@@ -108,10 +108,12 @@ use rsbinder::fmq::{Descriptor, Error, Flavor, Grantor, Result};
 use crate::pool::{GenerationLoads, Generations, LendError, Pin, Pins, Slots};
 use crate::ring::{Loads, Stores};
 
-/// The layout version this crate reads and writes: 0.2. Version 2 has the subscriber store its
+/// The layout version this crate reads and writes: 0.3. Version 2 has the subscriber store its
 /// `read` with `Release` and answer `ISubscription.evicted` (plan 15 §6.5); a subscriber of 1
-/// does neither, and a topic with backpressure would wait on it wrongly.
-pub(crate) const VERSION: u32 = 2;
+/// does neither, and a topic with backpressure would wait on it wrongly. Version 3 has the
+/// publisher store `frontier` before each chunk of a record, which a subscriber judges its copies
+/// by (`ring.rs`); one of 2 leaves it at zero, and a subscriber of 3 would take torn copies.
+pub(crate) const VERSION: u32 = 3;
 
 /// The smallest ring. An end record with its message has to fit half of it.
 pub(crate) const MIN_RING: usize = 4 << 10;
@@ -132,6 +134,7 @@ mod topic {
     pub(super) const TAIL: usize = 0x20;
     pub(super) const LAST: usize = 0x28;
     pub(super) const HALF: usize = 0x30;
+    pub(super) const FRONTIER: usize = 0x38;
     pub(super) const RING: usize = 0x40;
 }
 
@@ -292,6 +295,11 @@ impl<O> Stores for Stored<O> {
             .store(position, Ordering::Release);
     }
 
+    fn store_frontier(&self, position: u64) {
+        self.word64(topic::FRONTIER)
+            .store(position, Ordering::Release);
+    }
+
     fn store_write(&self, position: u64) {
         self.word64(topic::WRITE).store(position, Ordering::Release);
     }
@@ -391,6 +399,10 @@ impl<O> Loads for Loaded<O> {
 
     fn tail(&self) -> u64 {
         self.word64(topic::TAIL).load_acquire()
+    }
+
+    fn frontier(&self) -> u64 {
+        self.word64(topic::FRONTIER).load_acquire()
     }
 
     fn write(&self) -> u64 {

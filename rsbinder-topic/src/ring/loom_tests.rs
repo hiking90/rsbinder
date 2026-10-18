@@ -3,11 +3,13 @@
 
 //! The writer and the reader of `ring.rs`, run by loom over a model of topic memory: the words
 //! are loom's atomics, with the orderings `layout.rs` gives the mapped ones. What loom checks is
-//! the order the protocol rests on, on every interleaving it explores: `tail` is stored before
-//! the bytes, the bytes with `Release`, the reader's counter loads are followed by an acquire
-//! fence, and an acquire fence comes between a copy and the load of `tail` that judges it, so
-//! that `tail` covers every record whose bytes the copy saw. The three flawed memories show that
-//! the check is not vacuous. Run: see `Cargo.toml` (`--cfg loom`).
+//! the order the protocol rests on, on every interleaving it explores: `frontier` is stored
+//! before each chunk's bytes, the bytes with `Release`, the reader's counter loads are followed
+//! by an acquire fence, and an acquire fence comes between a chunk's copy and the load of
+//! `frontier` that judges it, so that `frontier` covers every byte the copy saw of a newer
+//! record. Records are two chunks long for the reader (`CHUNK` is 8 under loom), so a record whose
+//! head is written over after its first chunk passed is judged by its second. The four flawed
+//! memories show that the check is not vacuous. Run: see `Cargo.toml` (`--cfg loom`).
 
 use loom::sync::atomic::{fence, AtomicU64, Ordering};
 use loom::sync::Arc;
@@ -15,8 +17,8 @@ use loom::thread;
 
 use super::*;
 
-/// A ring of four words: two records of a header and one payload word.
-const WORDS: u64 = 4;
+/// A ring of six words: two records of a header and two payload words.
+const WORDS: u64 = 6;
 
 /// What a memory leaves out of the orderings the mapped one has.
 #[derive(Clone, Copy, PartialEq)]
@@ -28,12 +30,17 @@ enum Flaw {
     NoFence,
     /// The counters' loads keep theirs; `Loads::fence`, between a copy and its check, is gone.
     NoCopyFence,
+    /// `frontier` lags a chunk: each store writes the value the one before it was given.
+    LateFrontier,
 }
 
 struct Memory {
     region_end: AtomicU64,
     write: AtomicU64,
     tail: AtomicU64,
+    frontier: AtomicU64,
+    /// The value [`Flaw::LateFrontier`] holds back for the next store.
+    held_frontier: AtomicU64,
     last: AtomicU64,
     half: AtomicU64,
     ring: [AtomicU64; WORDS as usize],
@@ -46,6 +53,8 @@ impl Memory {
             region_end: AtomicU64::new(0),
             write: AtomicU64::new(0),
             tail: AtomicU64::new(0),
+            frontier: AtomicU64::new(0),
+            held_frontier: AtomicU64::new(0),
             last: AtomicU64::new(0),
             half: AtomicU64::new(0),
             ring: [(); WORDS as usize].map(|()| AtomicU64::new(0)),
@@ -82,6 +91,15 @@ impl Stores for Arc<Memory> {
 
     fn store_region_end(&self, position: u64) {
         self.region_end.store(position, Ordering::Release);
+    }
+
+    fn store_frontier(&self, position: u64) {
+        let position = match self.flaw {
+            // The writer's own word: only its thread touches it.
+            Flaw::LateFrontier => self.held_frontier.swap(position, Ordering::Relaxed),
+            _ => position,
+        };
+        self.frontier.store(position, Ordering::Release);
     }
 
     fn store_write(&self, position: u64) {
@@ -123,6 +141,10 @@ impl Loads for Arc<Memory> {
         self.load(&self.tail)
     }
 
+    fn frontier(&self) -> u64 {
+        self.load(&self.frontier)
+    }
+
     fn write(&self) -> u64 {
         self.load(&self.write)
     }
@@ -149,8 +171,8 @@ impl Loads for Arc<Memory> {
     }
 }
 
-fn payload(index: u32) -> [u8; 8] {
-    [index as u8 + 1; 8]
+fn payload(index: u32) -> [u8; 16] {
+    [index as u8 + 1; 16]
 }
 
 /// The writer puts `puts` records; the reader receives twice and judges what it is given.
@@ -177,14 +199,16 @@ fn every_record_returned_is_the_one_written(flaw: Flaw, puts: u32) {
                     assert_eq!(
                         record.bytes(),
                         payload(index),
-                        "a record that was not written there"
+                        "unsound: a record that was not written there"
                     );
                     next += 1;
                 }
                 Ok(Taken::Lagged(lost)) => next += lost as u32,
                 Ok(Taken::Empty) => {}
-                Err(Corrupted(what)) => panic!("a publisher that conforms failed a check: {what}"),
-                other => panic!("a record that was not written there: {other:?}"),
+                Err(Corrupted(what)) => {
+                    panic!("unsound: a publisher that conforms failed a check: {what}")
+                }
+                other => panic!("unsound: a record that was not written there: {other:?}"),
             }
         }
         writer.join().unwrap();
@@ -202,9 +226,10 @@ fn loom_topic_reader_over_relaxed_ring_stores_returns_a_torn_record() {
     every_record_returned_is_the_one_written(Flaw::RelaxedRing, 3);
 }
 
+// Without them a `write` can be seen with an older `frontier`, which a check finds first.
 #[test]
-#[should_panic(expected = "a record that was not written there")]
-fn loom_topic_reader_without_the_fences_returns_a_torn_record() {
+#[should_panic(expected = "unsound:")]
+fn loom_topic_reader_without_the_fences_returns_a_torn_record_or_fails_a_check() {
     every_record_returned_is_the_one_written(Flaw::NoFence, 3);
 }
 
@@ -213,4 +238,11 @@ fn loom_topic_reader_without_the_fences_returns_a_torn_record() {
 #[should_panic(expected = "a record that was not written there")]
 fn loom_topic_reader_without_the_fence_before_its_check_returns_a_torn_record() {
     every_record_returned_is_the_one_written(Flaw::NoCopyFence, 3);
+}
+
+// `frontier` has to reach past a chunk before the chunk's bytes are stored.
+#[test]
+#[should_panic(expected = "a record that was not written there")]
+fn loom_topic_reader_behind_a_late_frontier_returns_a_torn_record() {
+    every_record_returned_is_the_one_written(Flaw::LateFrontier, 3);
 }

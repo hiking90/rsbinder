@@ -80,6 +80,7 @@ pub(super) struct View {
 pub(super) struct Seen {
     tail: u64,
     write: u64,
+    frontier: u64,
 }
 
 impl Seen {
@@ -141,6 +142,22 @@ impl Seen {
         }
         self.tail = tail;
         Ok(tail)
+    }
+
+    /// A `frontier` loaded after every earlier load, of `write` too.
+    pub(super) fn frontier(&mut self, frontier: u64) -> Result<u64, Corrupted> {
+        if frontier % 8 != 0 {
+            return Err(Corrupted("frontier off the record grid"));
+        }
+        if frontier < self.frontier {
+            return Err(Corrupted("frontier moved backwards"));
+        }
+        // Stored up to a record's end before its `write`, and the `write` held was loaded earlier.
+        if frontier < self.write {
+            return Err(Corrupted("frontier behind the write counter"));
+        }
+        self.frontier = frontier;
+        Ok(frontier)
     }
 
     /// A record start the publisher keeps in a word (`half`, `last`): after `tail`, before `write`.

@@ -522,17 +522,34 @@ fn a_forged_length_ends_the_reader_without_a_copy_outside_the_ring() {
     );
 }
 
+/// The reader fails with `what` from the call for the newest record, the one of the two calls
+/// that loads `tail` without being lapped, and goes on failing with it.
+fn assert_corrupted_newest<M: Loads>(reader: &mut Reader<M>, what: &'static str) {
+    assert_eq!(latest(reader), Got::Corrupted(what));
+    assert_eq!(take(reader), Got::Corrupted(what));
+}
+
 #[test]
 fn forged_counters_end_the_reader() {
     let (_heap, mut reader, forge) = forged();
     forge.store_tail(2 * SLOT + 8);
-    assert_corrupted(&mut reader, "tail past the write counter");
+    assert_corrupted_newest(&mut reader, "tail past the write counter");
 
-    // A `write` is loaded again once the reader reaches the one it holds: after record 1.
+    // A `write` is loaded again once the reader reaches the one it holds: after record 1. The
+    // `frontier` a publisher stored before it reaches it.
     let (_heap, mut reader, forge) = forged();
     forge.store_write(RING as u64 + 8);
     assert_eq!(take(&mut reader), item(1));
-    assert_corrupted(&mut reader, "more bytes kept than the ring holds");
+    assert_corrupted(&mut reader, "frontier behind the write counter");
+
+    // `frontier` judges each copy.
+    let (_heap, mut reader, forge) = forged();
+    forge.store_frontier(SLOT);
+    assert_corrupted(&mut reader, "frontier moved backwards");
+
+    let (_heap, mut reader, forge) = forged();
+    forge.store_frontier(2 * SLOT + 4);
+    assert_corrupted(&mut reader, "frontier off the record grid");
 
     let (_heap, mut reader, forge) = forged();
     forge.store_write(SLOT);
@@ -541,7 +558,7 @@ fn forged_counters_end_the_reader() {
 
     let (_heap, mut reader, forge) = forged();
     forge.store_tail(SLOT + 4);
-    assert_corrupted(&mut reader, "tail off the record grid");
+    assert_corrupted_newest(&mut reader, "tail off the record grid");
 
     let (_heap, mut reader, forge) = forged();
     forge.store_write(2 * SLOT + 4);
@@ -561,6 +578,8 @@ fn forged_counters_end_the_reader() {
         let (_heap, mut reader, forge) = forged();
         forge.store_write(3 * SLOT);
         forge.store_tail(2 * SLOT);
+        // Past record 1 by a ring: the reader takes itself for lapped there.
+        forge.store_frontier(RING as u64 + 2 * SLOT);
         forge.store_half(half);
         assert_corrupted(&mut reader, "half outside the kept records");
     }
@@ -587,7 +606,8 @@ fn forged_counters_end_the_reader() {
     );
 }
 
-/// A reader's view behind which a publisher laps the reader each time `tail` or `write` is loaded.
+/// A reader's view behind which a publisher laps the reader each time `tail`, `frontier` or
+/// `write` is loaded.
 struct Chased<'a, M, S> {
     memory: M,
     writer: &'a RefCell<Writer<S>>,
@@ -604,6 +624,11 @@ impl<M: Loads, S: Stores> Loads for Chased<'_, M, S> {
     fn tail(&self) -> u64 {
         self.chase();
         self.memory.tail()
+    }
+
+    fn frontier(&self) -> u64 {
+        self.chase();
+        self.memory.frontier()
     }
 
     fn write(&self) -> u64 {
@@ -699,6 +724,10 @@ impl<M: Loads, S: Stores> Loads for Lapping<'_, M, S> {
         self.memory.tail()
     }
 
+    fn frontier(&self) -> u64 {
+        self.memory.frontier()
+    }
+
     fn write(&self) -> u64 {
         self.memory.write()
     }
@@ -737,12 +766,13 @@ fn an_oldest_start_whose_tail_passed_the_write_counter_it_loaded_reads_on() {
     assert_eq!(drain(&mut reader).len(), 127);
 }
 
-/// A reader's view behind which a publisher writes more than a ring at the `tail` load `at`,
+/// A reader's view behind which a publisher writes at the `frontier` load `at`, by `publish`,
 /// counting the ring bytes the reader loads.
 struct Overtaking<'a, M, S> {
     memory: M,
     writer: &'a RefCell<Writer<S>>,
-    tails: Cell<u32>,
+    publish: fn(&mut Writer<S>),
+    looks: Cell<u32>,
     at: Cell<u32>,
     loaded: Cell<usize>,
 }
@@ -753,11 +783,15 @@ impl<M: Loads, S: Stores> Loads for Overtaking<'_, M, S> {
     }
 
     fn tail(&self) -> u64 {
-        self.tails.set(self.tails.get() + 1);
-        if self.tails.get() == self.at.get() {
-            publish(&mut self.writer.borrow_mut(), 200);
-        }
         self.memory.tail()
+    }
+
+    fn frontier(&self) -> u64 {
+        self.looks.set(self.looks.get() + 1);
+        if self.looks.get() == self.at.get() {
+            (self.publish)(&mut self.writer.borrow_mut());
+        }
+        self.memory.frontier()
     }
 
     fn write(&self) -> u64 {
@@ -791,7 +825,8 @@ fn a_copy_the_publisher_overtakes_stops_at_the_next_chunk() {
     let overtaking = Overtaking {
         memory: heap.loaded(),
         writer: &writer,
-        tails: Cell::new(0),
+        publish: |writer| publish(writer, 200),
+        looks: Cell::new(0),
         at: Cell::new(0),
         loaded: Cell::new(0),
     };
@@ -799,8 +834,8 @@ fn a_copy_the_publisher_overtakes_stops_at_the_next_chunk() {
     // A record overtaken before the first one read would not count as lost.
     assert_eq!(take(&mut reader), item(0));
     writer.borrow_mut().put(Kind::Item, &body(1, LONG)).unwrap();
-    // The first `tail` the receive loads is the one after its first chunk.
-    reader.memory.at.set(reader.memory.tails.get() + 1);
+    // The first `frontier` the receive loads is the one after its first chunk.
+    reader.memory.at.set(reader.memory.looks.get() + 1);
     reader.memory.loaded.set(0);
     let Got::Lagged(lost) = take(&mut reader) else {
         panic!("the overtaken record was not reported lost");
@@ -813,6 +848,51 @@ fn a_copy_the_publisher_overtakes_stops_at_the_next_chunk() {
     assert_eq!(
         1 + lost + rest.len() as u64,
         u64::from(writer.borrow().next_index())
+    );
+}
+
+/// In a ring of two records of half its size, the publisher writes a record of `len` bytes over
+/// the head of the first one right after the reader copied the first two chunks of it: what the
+/// reader returns.
+fn written_over_behind_the_reader(len: usize) -> Got {
+    const HALF: usize = 128 - rules::HEADER as usize;
+    let heap = Heap::new(256);
+    let writer = RefCell::new(writer_of(&heap));
+    for index in 0..2 {
+        writer
+            .borrow_mut()
+            .put(Kind::Item, &body(index, HALF))
+            .unwrap();
+    }
+    let behind: fn(&mut Writer<_>) = match len {
+        8 => |writer| writer.put(Kind::Item, &body(2, 8)).unwrap(),
+        16 => |writer| writer.put(Kind::Item, &body(2, 16)).unwrap(),
+        _ => |writer| writer.put(Kind::Item, &body(2, 24)).unwrap(),
+    };
+    let overtaking = Overtaking {
+        memory: heap.loaded(),
+        writer: &writer,
+        publish: behind,
+        looks: Cell::new(0),
+        // The look that judges the second chunk, from 8 + CHUNK on; the first passed its own.
+        at: Cell::new(2),
+        loaded: Cell::new(0),
+    };
+    let mut reader = Reader::attach(overtaking, Start::Oldest).unwrap();
+    take(&mut reader)
+}
+
+#[test]
+fn a_record_written_over_behind_the_reader_is_returned_while_its_rest_is_not() {
+    const HALF: usize = 128 - rules::HEADER as usize;
+    let whole = Got::Item(0, body(0, HALF));
+    // Up to where the second chunk starts, the reader copied it before the publisher came.
+    assert_eq!(written_over_behind_the_reader(8), whole);
+    assert_eq!(written_over_behind_the_reader(16), whole);
+    // A word into the second chunk: judged as written over, and the reader resumes at `half`.
+    assert_eq!(
+        written_over_behind_the_reader(24),
+        Got::Item(2, body(2, 24))
     );
 }
 
@@ -833,8 +913,9 @@ enum Rhythm {
     Staged,
 }
 
-/// Ring stores a staged reader waits for. A record is two; four or more overwrite its record.
-const STAGES: [u32; 6] = [0, 4, 1, 5, 2, 6];
+/// Ring stores a staged reader waits for. A record is three (its header, then its payload cut at
+/// the first chunk's end); six or more overwrite its record.
+const STAGES: [u32; 6] = [0, 6, 1, 7, 2, 8];
 
 /// Memory behind which a reader lets the publisher store a while between two of its own steps.
 struct Paced<'a, M>(M, &'a Pace, Cell<u32>, Rhythm);
@@ -869,6 +950,10 @@ impl<M: Stores> Stores for Paced<'_, M> {
 
     fn store_region_end(&self, position: u64) {
         self.0.store_region_end(position);
+    }
+
+    fn store_frontier(&self, position: u64) {
+        self.0.store_frontier(position);
     }
 
     fn store_write(&self, position: u64) {
@@ -907,6 +992,10 @@ impl<M: Loads> Loads for Paced<'_, M> {
         self.0.tail()
     }
 
+    fn frontier(&self) -> u64 {
+        self.0.frontier()
+    }
+
     fn write(&self) -> u64 {
         self.0.write()
     }
@@ -934,7 +1023,7 @@ impl<M: Loads> Loads for Paced<'_, M> {
     }
 
     fn fence(&self) {
-        // Between a copy and the load of `tail` that judges it: a publish may fall between them.
+        // Between a copy and the load of `frontier` that judges it: a publish may fall between.
         if self.3 == Rhythm::Scattered {
             // One or two stores, in two of every 48 judgments.
             self.wait(Some(self.scatter(48)).filter(|n| *n < 3).unwrap_or(0));
@@ -1027,7 +1116,7 @@ fn records_returned_while_the_publisher_overwrites_are_whole() {
 
 // What tells `Release` ring stores from `Relaxed` ones, under Miri: x86 runs both as one code.
 #[test]
-fn a_copy_that_caught_an_overwrite_is_judged_by_a_tail_stored_before_it() {
+fn a_copy_that_caught_an_overwrite_is_judged_by_a_frontier_stored_before_it() {
     let records = if cfg!(miri) { 120 } else { 30_000 };
     // Each payload copy comes after a wait that leaves the record whole, or does not.
     let read = race(Rhythm::Staged, records, |_| BODY);

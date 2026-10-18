@@ -55,6 +55,10 @@ impl<M: Loads> Loads for &Counted<M> {
         self.memory.tail()
     }
 
+    fn frontier(&self) -> u64 {
+        self.memory.frontier()
+    }
+
     fn write(&self) -> u64 {
         self.memory.write()
     }
@@ -151,8 +155,13 @@ mod tests {
             self
         }
 
+        /// `write`, and `frontier` where a publisher at rest leaves it: at the same position.
         fn write(self, value: u64) -> Self {
-            self.word(0x08, value)
+            self.word(0x08, value).frontier(value)
+        }
+
+        fn frontier(self, value: u64) -> Self {
+            self.word(0x38, value)
         }
 
         fn tail(self, value: u64) -> Self {

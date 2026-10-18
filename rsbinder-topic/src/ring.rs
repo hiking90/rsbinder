@@ -31,35 +31,42 @@
 //! 1. `tail`: the start of the oldest record that survives, so that `w + r - tail <= capacity`.
 //!    From here on a reader treats everything below `tail` as gone.
 //! 2. `region_end = w + r`, the word a libfmq reader of the unsynchronized flavor judges by.
-//! 3. The record's bytes, with `Release` stores.
+//! 3. The record's bytes, with `Release` stores, a [`CHUNK`] at a time counted from `w`: before
+//!    each chunk, `frontier` = the chunk's end. The byte at `p` of the ring before this lap is
+//!    written over from position `p + capacity` on, so it is untouched while `frontier <= p +
+//!    capacity`.
 //! 4. `write = w + r`. The record is committed.
 //! 5. `last = w`, the start of the newest record.
 //! 6. `half`: the start of the oldest record at or above `write - capacity / 2`.
 //!
-//! Between any two of these stores `tail <= half <= last < write` and `write - tail <= capacity`
-//! hold, so a publisher that dies there leaves memory a reader can finish reading.
+//! Between any two of these stores `tail <= half <= last < write`, `write - tail <= capacity`
+//! and `write <= frontier` hold, so a publisher that dies there leaves memory a reader can finish
+//! reading.
 //!
 //! # A subscriber
 //!
 //! It keeps its own read position, in its own memory, and only loads the shared words. A record
-//! is copied out, header and payload, and judged afterwards: an acquire fence, then one load of
-//! `tail`, and if `tail` has passed the record's start, what was copied may be bytes of a newer
-//! record and is dropped. That check is ordered, not merely likely to work: the publisher's
-//! stores are `Release`, so a reader that copied even one byte of an overwriting record then
-//! loads a `tail` at least as new as the one stored before that record. A long payload is copied
-//! in chunks with the same check between them, so a copy the publisher overtakes stops there and
-//! costs at most a chunk past that point, not the rest of the record; a check that passes
-//! between chunks decides nothing, and the one after the copy still judges it. A header is believed
-//! before that check only when it is what the reader expects (the next index, a length that fits
-//! what is committed); any other header is judged by `tail` first, so a torn one is not taken
-//! for corruption.
+//! is copied out a [`CHUNK`] of payload at a time, and each piece is judged once copied: an
+//! acquire fence, then one load of `frontier`, and if `frontier` is past the piece's first byte
+//! plus the capacity, the piece may hold bytes of a newer record and the record is dropped. The
+//! first piece is judged from the record's start, with the header loaded before it. That check
+//! is ordered, not merely likely to work: the publisher's stores are `Release`, so a reader that
+//! copied even one byte of a chunk of an overwriting record then loads a `frontier` at least as
+//! new as the one stored before that chunk. The publisher writes the ring in the order the
+//! reader copies it, so a piece judged whole stays a whole copy whatever is written over it
+//! later: a record whose head the publisher writes over behind the reader is still returned, and
+//! a copy the publisher overtakes stops within a chunk of where it was overtaken. A header is
+//! believed before its judgment only when it is what the reader expects (the next index, a
+//! length that fits what is committed); any other header is judged by `frontier` first, so a
+//! torn one is not taken for corruption.
 //!
 //! The reader holds the newest `write` it loaded and loads it again only once it has read up to
 //! it: every record below it is committed, and the acquire after that load orders the copies of
 //! them. A received record thus costs one counter load. The checks on the counters compare each
 //! with the reader's own state, or two loaded in the order that makes the bound hold for a
 //! publisher that follows the protocol: `write - tail <= capacity` with `write` loaded first,
-//! `tail <= write` with `tail` first (only after a lap, where `half` is checked against both).
+//! `tail <= write` with `tail` first (only after a lap, where `half` is checked against both),
+//! `write <= frontier` with `write` first (at each judgment).
 //!
 //! A reader the publisher has lapped resumes at `half`. Resuming at `tail` would put it on the
 //! record the next publish overwrites; from `half` the publisher has to write half a ring before
@@ -71,7 +78,7 @@
 //! ([`Corrupted`]); the place a copy starts is a position modulo the capacity and its length is
 //! bounded by half the capacity, so no value in shared memory makes a copy leave the ring; and a
 //! call that finds itself lapped [`RETRIES`] times gives up, so a publisher that keeps moving
-//! `tail` cannot hold a caller.
+//! `frontier` cannot hold a caller.
 
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
@@ -86,15 +93,19 @@ use crate::Record;
 /// How often one receive call resumes after being lapped before it returns without a record.
 pub(crate) const RETRIES: u32 = 4;
 
-/// The most payload bytes a reader copies between two looks at `tail`: a copy the publisher
-/// overtakes stops within this many bytes instead of running to the record's end. A look is an
-/// acquire fence and one load, small beside copying this much, and a record no longer than this
-/// takes none.
+/// The bytes between two moves of `frontier` as a record is written, and the most payload bytes
+/// a reader copies before it judges them by `frontier`: a copy the publisher overtakes stops
+/// within this many bytes, and a copy it does not reach is judged whole though the publisher has
+/// begun on the record. A move is a store and a judgment an acquire fence and a load, small
+/// beside storing or copying this much; a record no longer than this takes one of each.
 #[cfg(not(any(test, loom)))]
 const CHUNK: usize = 64 * 1024;
 /// Smaller than the records of the race tests (24 bytes), so that they copy in two chunks.
-#[cfg(any(test, loom))]
+#[cfg(all(test, not(loom)))]
 const CHUNK: usize = 16;
+/// Half the payload of loom's records (16 bytes), so that a reader judges two chunks of each.
+#[cfg(loom)]
+const CHUNK: usize = 8;
 
 /// The kinds of record this version writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,6 +124,8 @@ pub(crate) trait Stores {
     fn capacity(&self) -> u64;
     fn store_tail(&self, position: u64);
     fn store_region_end(&self, position: u64);
+    /// How far the record being written reaches once the chunk about to be stored is.
+    fn store_frontier(&self, position: u64);
     fn store_write(&self, position: u64);
     fn store_last(&self, position: u64);
     fn store_half(&self, position: u64);
@@ -130,6 +143,7 @@ pub(crate) trait Loads {
     /// Bytes in the ring: a multiple of 8, never zero.
     fn capacity(&self) -> u64;
     fn tail(&self) -> u64;
+    fn frontier(&self) -> u64;
     fn write(&self) -> u64;
     fn last(&self) -> u64;
     fn half(&self) -> u64;
@@ -140,23 +154,30 @@ pub(crate) trait Loads {
     fn fence(&self);
 }
 
-/// Bytes of any lengths stored one after another from `position`, in the whole words
-/// [`Stores::store_ring`] takes: a word that two parts share is stored once both gave it bytes,
-/// and the last one is padded with zeros.
+/// A record's bytes, of parts of any lengths, stored one after another from where it starts in
+/// the whole words [`Stores::store_ring`] takes: a word that two parts share is stored once both
+/// gave it bytes, and the last one is padded with zeros. Before each [`CHUNK`] of them, counted
+/// from the record's start, `frontier` is moved to that chunk's end.
 struct Aligned<'m, M> {
     memory: &'m M,
     position: u64,
+    /// Where the record ends, and how far `frontier` has been moved.
+    end: u64,
+    frontier: u64,
     stored: u64,
     word: [u8; 8],
     held: usize,
 }
 
 impl<'m, M: Stores> Aligned<'m, M> {
-    fn new(memory: &'m M, position: u64) -> Self {
-        debug_assert_eq!(position % 8, 0);
+    /// The record from `start` to `end`, whose bytes are about to be pushed.
+    fn new(memory: &'m M, start: u64, end: u64) -> Self {
+        debug_assert_eq!(start % 8, 0);
         Self {
             memory,
-            position,
+            position: start,
+            end,
+            frontier: start,
             stored: 0,
             word: [0; 8],
             held: 0,
@@ -173,24 +194,39 @@ impl<'m, M: Stores> Aligned<'m, M> {
             if self.held < 8 {
                 return;
             }
-            self.memory.store_ring(self.position, &self.word);
-            self.position += 8;
+            let word = self.word;
+            self.emit(&word);
             self.held = 0;
         }
         let (whole, rest) = bytes.split_at(bytes.len() / 8 * 8);
-        if !whole.is_empty() {
-            self.memory.store_ring(self.position, whole);
-            self.position += whole.len() as u64;
-        }
+        self.emit(whole);
         self.word[..rest.len()].copy_from_slice(rest);
         self.held = rest.len();
+    }
+
+    /// Store whole words at the position reached, each chunk after `frontier` passes it.
+    fn emit(&mut self, mut words: &[u8]) {
+        while !words.is_empty() {
+            if self.position == self.frontier {
+                self.frontier = self.end.min(self.frontier + CHUNK as u64);
+                // Before the chunk's bytes: a reader that copies one of them then loads this value.
+                self.memory.store_frontier(self.frontier);
+            }
+            // Both on the grid of 8 and the gap at most a chunk: the piece is whole words.
+            let take = words.len().min((self.frontier - self.position) as usize);
+            let (piece, rest) = words.split_at(take);
+            self.memory.store_ring(self.position, piece);
+            self.position += take as u64;
+            words = rest;
+        }
     }
 
     /// Store the last word, if one is begun; the bytes pushed.
     fn finish(mut self) -> u64 {
         if self.held > 0 {
             self.word[self.held..].fill(0);
-            self.memory.store_ring(self.position, &self.word);
+            let word = self.word;
+            self.emit(&word);
         }
         self.stored
     }
@@ -376,7 +412,7 @@ impl<M: Stores> Writer<M> {
         {
             self.starts.pop_front();
         }
-        // Before any byte of the record: a reader that copies one of them then loads this value.
+        // Before `frontier` and the bytes: a reader that saw either then loads this value or newer.
         self.memory
             .store_tail(self.starts.front().copied().unwrap_or(start));
         self.memory.store_region_end(end);
@@ -389,13 +425,17 @@ impl<M: Stores> Writer<M> {
             len,
             index: self.index,
         };
-        self.memory.store_ring(start, &header.bytes());
-        let mut words = Aligned::new(&self.memory, start + rules::HEADER);
+        let mut words = Aligned::new(&self.memory, start, end);
+        words.push(&header.bytes());
         for part in parts {
             words.push(part);
         }
         let stored = words.finish();
-        debug_assert_eq!(stored, u64::from(len), "the parts are not `len` bytes");
+        debug_assert_eq!(
+            stored,
+            rules::HEADER + u64::from(len),
+            "the parts are not `len` bytes"
+        );
         self.memory.store_write(end);
         self.written = end;
         self.index = self.index.wrapping_add(1);
@@ -626,12 +666,14 @@ impl<M: Loads> Reader<M> {
         Ok(write)
     }
 
-    /// Whether the publisher has begun to write over `position`, judged after what was copied.
-    fn overwritten(&mut self, position: u64) -> Result<bool, Corrupted> {
+    /// Whether the publisher may have begun to write over the ring at or past `from`, judged after
+    /// what was copied from there: a byte at `from` is written over from position `from +
+    /// capacity` on, and `frontier` is past that once the chunk that does it may have begun.
+    fn overwritten(&mut self, from: u64) -> Result<bool, Corrupted> {
         self.memory.fence();
-        let tail = self.memory.tail();
-        let tail = self.seen.tail(tail, self.memory.capacity());
-        Ok(position < self.keep(tail)?)
+        let frontier = self.memory.frontier();
+        let frontier = self.seen.frontier(frontier);
+        Ok(self.keep(frontier)? > from.saturating_add(self.memory.capacity()))
     }
 
     /// The start of the newest record. The `write` held says one is committed.
@@ -646,12 +688,15 @@ impl<M: Loads> Reader<M> {
     }
 
     /// Move a lapped reader to `half`; `false` once this call has done so [`RETRIES`] times.
-    /// `overwritten` has just loaded `tail`.
     fn resume(&mut self, laps: &mut u32) -> Result<bool, Corrupted> {
         if *laps == RETRIES {
             return Ok(false);
         }
         *laps += 1;
+        // After the `frontier` that found the lap: at least the `tail` stored before it.
+        let tail = self.memory.tail();
+        let tail = self.seen.tail(tail, self.memory.capacity());
+        self.keep(tail)?;
         let half = self.memory.half();
         let write = self.memory.write();
         let half = self.seen.kept(half, write, "half outside the kept records");
@@ -666,7 +711,8 @@ impl<M: Loads> Reader<M> {
     }
 
     /// Copy the payload of the record at `position`, `size` bytes long, into the buffer, [`CHUNK`]
-    /// bytes at a time; `false` once a look at `tail` between two of them finds it overwritten.
+    /// bytes at a time, each judged by `frontier` once copied, the first with the header the
+    /// caller loaded; whether every one of them was copied before the publisher reached it.
     fn copy(&mut self, position: u64, size: u64) -> Result<bool, Corrupted> {
         // `Header::extent` bounded `size` by half the ring, which is mapped: it fits a `usize`.
         let len = (size - rules::HEADER) as usize;
@@ -676,19 +722,19 @@ impl<M: Loads> Reader<M> {
         } else {
             self.payload.resize(len, 0);
         }
-        let mut copied = 0;
-        while copied < len {
+        let (mut copied, mut from) = (0, position);
+        loop {
             let end = len.min(copied + CHUNK);
-            self.memory.load_ring(
-                position + rules::HEADER + copied as u64,
-                &mut self.payload[copied..end],
-            );
-            copied = end;
-            if copied < len && self.overwritten(position)? {
+            let at = position + rules::HEADER + copied as u64;
+            self.memory.load_ring(at, &mut self.payload[copied..end]);
+            if self.overwritten(from)? {
                 return Ok(false);
             }
+            if end == len {
+                return Ok(true);
+            }
+            (copied, from) = (end, at + (end - copied) as u64);
         }
-        Ok(true)
     }
 
     /// Count what `lost` holds as reported.
@@ -716,7 +762,7 @@ impl<M: Loads> Reader<M> {
             let size = match header.extent(self.read, self.seen.write(), capacity) {
                 Ok(size) if expected && header.kind <= Kind::Loan as u32 => size,
                 size => {
-                    // Believed only once `tail` says the publisher was not writing over it.
+                    // Believed only once `frontier` says the publisher was not writing over it.
                     if self.overwritten(self.read)? {
                         if !self.resume(&mut laps)? {
                             return Ok(self.settle(lost));
@@ -745,9 +791,8 @@ impl<M: Loads> Reader<M> {
                 // Losses counted from records stepped over; this one is read by the next call.
                 return Ok(self.settle(lost));
             }
-            let whole = self.copy(self.read, size)?;
-            // Only now is what was copied, header and payload, known to be this record's.
-            if !whole || self.overwritten(self.read)? {
+            // Only once copied and judged are the header and payload known to be this record's.
+            if !self.copy(self.read, size)? {
                 // A record the reader has not read yet does not count before its first.
                 if let Some(index) = self.expected {
                     lost = 1;
@@ -804,9 +849,9 @@ impl<M: Loads> Reader<M> {
             let size = header.extent(at, self.seen.write(), capacity);
             let whole = match size {
                 Ok(size) if header.kind <= Kind::Loan as u32 => self.copy(at, size)?,
-                _ => true,
+                _ => !self.overwritten(at)?,
             };
-            if !whole || self.overwritten(at)? {
+            if !whole {
                 if laps == RETRIES {
                     return Ok(Outcome::Empty);
                 }
