@@ -540,3 +540,47 @@ fn a_lend_past_the_window_waits_though_a_slot_is_free() {
     let evicted = Err(RecvError::Closed(Closed::Evicted));
     assert_eq!(subscriber.recv_timeout(SPAN), evicted);
 }
+
+/// A subscriber reports a loaned value read once its sample is dropped, not when the sample is
+/// returned: its lag covers the value's record until then.
+#[test]
+fn a_held_sample_leaves_its_record_unread_until_dropped() {
+    let publisher = pooled(1, SPAN);
+    let mut subscriber = subscribe(&publisher, Wake::Futex);
+    lend(&publisher, 0);
+    let lag = |publisher: &Publisher<Bytes>| publisher.stats().subscribers[0].lag_bytes;
+    let sample = subscriber.try_recv_sample().unwrap();
+    assert!(lag(&publisher) > 0);
+    drop(sample);
+    assert_eq!(lag(&publisher), 0);
+}
+
+/// With a window of 1 a lend waits for the subscriber to read the value before it, and a held
+/// sample of that value is still being read: the lend goes on once the sample is dropped.
+#[test]
+fn a_lend_inside_the_window_waits_for_a_held_sample_to_drop() {
+    let timeout = Duration::from_secs(5);
+    let publisher = pooled_within(1, timeout, NonZeroUsize::new(1));
+    let mut subscriber = subscribe(&publisher, Wake::Futex);
+    lend(&publisher, 0);
+    let (held, release) = std::sync::mpsc::channel();
+    let took = thread::scope(|scope| {
+        let holding = scope.spawn(move || {
+            let sample = subscriber.recv_sample_timeout(SPAN).unwrap();
+            held.send(()).unwrap();
+            thread::sleep(Duration::from_millis(200));
+            drop(sample);
+            subscriber
+        });
+        release.recv().unwrap();
+        let began = Instant::now();
+        lend(&publisher, 1);
+        let took = began.elapsed();
+        let mut subscriber = holding.join().unwrap();
+        assert_eq!(subscriber.try_recv(), Ok(value(1)));
+        took
+    });
+    assert!(took >= Duration::from_millis(100), "none waited: {took:?}");
+    assert!(took < timeout - Duration::from_secs(2), "{took:?}");
+    assert_eq!(publisher.stats().evicted, 0);
+}

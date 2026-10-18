@@ -44,7 +44,7 @@
 //! | `0x04` | 4 | layout version |
 //! | `0x08` | 4 | `state`: bit 0 waiting, bit 1 closed, bits 2–31 a count of waits |
 //! | `0x0c` | 4 | `pins`: how many pin words follow the header |
-//! | `0x40` | 8 | `read`: the subscriber's read position, for statistics |
+//! | `0x40` | 8 | `read`: the subscriber's read position, for statistics, lends and backpressure |
 //! | `0x48` | 8 | `lost`: records it reported as lost, for statistics |
 //! | `0x80` | 4 × pins | pin words (plan 15, loans) |
 //!
@@ -553,7 +553,8 @@ impl ControlPage {
         self.word32(control::STATE)
     }
 
-    /// The subscriber's read position, which the publisher reads for statistics only.
+    /// The subscriber's read position, which the publisher reads for statistics, the pool's lends
+    /// and, with backpressure, its waits.
     pub(crate) fn read(&self) -> &AtomicU64 {
         self.word64(control::READ)
     }

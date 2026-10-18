@@ -488,7 +488,8 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
             (false, true) => self.reader.try_latest(),
             (false, false) => self.reader.try_recv(),
         };
-        self.settle(received, died)
+        let read = self.reader.position();
+        self.settle(received, died, read)
     }
 
     /// A receive that waits until `deadline`, or without a bound.
@@ -568,10 +569,16 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
         found
     }
 
-    fn settle<V>(&mut self, received: Result<V, RecvError>, died: bool) -> Result<V, RecvError> {
+    /// Report `read` and the losses, and count what `received` is.
+    fn settle<V>(
+        &mut self,
+        received: Result<V, RecvError>,
+        died: bool,
+        read: u64,
+    ) -> Result<V, RecvError> {
         let page = &self.control.0;
         // After the copy: a publisher that waits for this `read` writes over the record only then.
-        page.read().store(self.reader.position(), Ordering::Release);
+        page.read().store(read, Ordering::Release);
         page.lost().store(self.reader.lost(), Ordering::Relaxed);
         match &received {
             Ok(_) => self.received += 1,
@@ -688,19 +695,21 @@ impl<M: Trust> Subscriber<Bytes, M> {
     /// of a value the publisher lent ([`Publisher::loan_slice`](crate::Publisher::loan_slice)).
     ///
     /// The [`Sample`] pins the value's slot until it is dropped, and borrows the subscriber, so
-    /// nothing else is received meanwhile. A value that came through the ring is returned in
+    /// nothing else is received meanwhile. Until then the subscriber has not read the value as a
+    /// publisher with [`Backpressure`](crate::Backpressure) counts it: a publish that waits for
+    /// this subscriber waits for the drop. A value that came through the ring is returned in
     /// the subscriber's buffer. The errors are `try_recv`'s; a lent slot the publisher took back
     /// before this call pinned it is a loss of one record, [`RecvError::Lagged`]`(1)`.
     pub fn try_recv_sample(&mut self) -> Result<Sample<'_, M>, RecvError> {
         let held = self.look_held()?;
-        Ok(self.reader.sample(held))
+        Ok(self.reader.sample(held, self.control.0.read()))
     }
 
     /// The next value where it lies, waiting for one: [`try_recv_sample`](Self::try_recv_sample)
     /// after the wait [`recv`](Self::recv) makes.
     pub fn recv_sample(&mut self) -> Result<Sample<'_, M>, RecvError> {
         let held = self.wait_with(None, Self::look_held)?;
-        Ok(self.reader.sample(held))
+        Ok(self.reader.sample(held, self.control.0.read()))
     }
 
     /// [`recv_sample`](Self::recv_sample) with a bound: [`RecvError::Timeout`] once `timeout`
@@ -708,7 +717,7 @@ impl<M: Trust> Subscriber<Bytes, M> {
     pub fn recv_sample_timeout(&mut self, timeout: Duration) -> Result<Sample<'_, M>, RecvError> {
         let deadline = Instant::now().checked_add(timeout);
         let held = self.wait_with(deadline, Self::look_held)?;
-        Ok(self.reader.sample(held))
+        Ok(self.reader.sample(held, self.control.0.read()))
     }
 
     fn look_held(&mut self) -> Result<Held, RecvError> {
@@ -716,8 +725,14 @@ impl<M: Trust> Subscriber<Bytes, M> {
             return Err(RecvError::Closed(Closed::Evicted));
         }
         let died = self.local.died();
+        let start = self.reader.position();
         let held = self.reader.take_held();
-        self.settle(held, died)
+        // A pinned slot is still being read: its record counts as read once the sample drops.
+        let read = match held {
+            Ok(Held::Slot { .. }) => start,
+            _ => self.reader.position(),
+        };
+        self.settle(held, died, read)
     }
 }
 

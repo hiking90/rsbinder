@@ -95,7 +95,17 @@ pub struct Backpressure {
     /// reads its records from DRAM. A `window` bounds both by a number of records, whatever the
     /// machine. Set one for large values with several subscribers, or where a value has to
     /// arrive within a bound; 2 lets the publisher write one record while the slowest
-    /// subscriber reads the one before.
+    /// subscriber reads the one before. A loaned value received as a [`Sample`](crate::Sample) is
+    /// being read until the sample is dropped.
+    ///
+    /// On the ring a window moves a cost rather than removing it. The publisher writes where the
+    /// ring's oldest record lies: in a ring of `r` records with a window of `w` it writes over
+    /// bytes read `r - w` records before, which may have left the CPU's caches by then, where a
+    /// full ring without a window writes over the record just read. With one subscriber that
+    /// reads about as fast as the publisher writes, that can lower the rate. A ring of about
+    /// `w + 1` records ([`PublisherPolicy::for_payload`](crate::PublisherPolicy::for_payload)
+    /// with a depth of `w`) keeps the writes where reading just ended. A pool has no such cost:
+    /// a loan takes the slot read most recently.
     ///
     /// Waiting for the window is waiting for room, with the same `timeout`: a subscriber that
     /// stops for longer is taken out though the ring has room left. A small window leaves little

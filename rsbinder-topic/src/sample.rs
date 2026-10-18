@@ -6,6 +6,7 @@
 use std::fmt;
 use std::marker::PhantomData;
 use std::ops::Deref;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::pool::PoolReader;
 use crate::{Trust, Trusted, Untrusted};
@@ -15,8 +16,10 @@ use crate::{Trust, Trusted, Untrusted};
 ///
 /// A value the publisher lent ([`Publisher::loan_slice`](crate::Publisher::loan_slice)) stays in
 /// its slot of the topic's pool, which the sample pins: the publisher lends no pinned slot, and
-/// dropping the sample lets go. A value that came through the ring is in the subscriber's buffer.
-/// Either way the sample borrows the subscriber, so it holds one at a time.
+/// dropping the sample lets go. The subscriber reports a lent value read only then, so a
+/// publisher with [`Backpressure`](crate::Backpressure) that waits for it waits for the drop. A
+/// value that came through the ring is in the subscriber's buffer. Either way the sample borrows
+/// the subscriber, so it holds one at a time.
 ///
 /// How a lent value is read depends on whether the subscriber vouches for its publisher, `M`:
 ///
@@ -47,6 +50,8 @@ use crate::{Trust, Trusted, Untrusted};
 /// ```
 pub struct Sample<'a, M: Trust = Untrusted> {
     source: Source<'a>,
+    /// A lent value's: the subscriber's `read` word, and where its record ends, stored on drop.
+    done: Option<(&'a AtomicU64, u64)>,
     _trust: PhantomData<fn() -> M>,
 }
 
@@ -63,14 +68,23 @@ impl<'a, M: Trust> Sample<'a, M> {
     pub(crate) fn ring(bytes: &'a [u8]) -> Self {
         Self {
             source: Source::Ring(bytes),
+            done: None,
             _trust: PhantomData,
         }
     }
 
-    /// A sample of `slot`, which the caller pinned through `pool`.
-    pub(crate) fn slot(pool: &'a PoolReader, slot: u32, len: usize) -> Self {
+    /// A sample of `slot`, which the caller pinned through `pool`. Dropped, it stores `end` into
+    /// `read`, the subscriber's word: only then has the subscriber read the record.
+    pub(crate) fn slot(
+        pool: &'a PoolReader,
+        slot: u32,
+        len: usize,
+        read: &'a AtomicU64,
+        end: u64,
+    ) -> Self {
         Self {
             source: Source::Slot { pool, slot, len },
+            done: Some((read, end)),
             _trust: PhantomData,
         }
     }
@@ -177,6 +191,10 @@ impl<M: Trust> Drop for Sample<'_, M> {
     fn drop(&mut self) {
         if let Source::Slot { pool, .. } = self.source {
             pool.unpin();
+        }
+        if let Some((read, end)) = self.done {
+            // As a receive's: a publisher that waits for this `read` counts the value read now.
+            read.store(end, Ordering::Release);
         }
     }
 }

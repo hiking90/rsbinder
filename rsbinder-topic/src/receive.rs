@@ -5,6 +5,7 @@
 
 use std::fmt;
 use std::marker::PhantomData;
+use std::sync::atomic::AtomicU64;
 
 use rsbinder::{Status, StatusCode};
 
@@ -226,13 +227,14 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
         })
     }
 
-    /// The sample of what [`take_held`](Self::take_held) returned last, for a subscriber of `M`.
-    pub(crate) fn sample<M: Trust>(&self, held: Held) -> Sample<'_, M> {
+    /// The sample of what [`take_held`](Self::take_held) returned last, for a subscriber of `M`;
+    /// one of a slot stores this reader's position into `read` when dropped.
+    pub(crate) fn sample<'a, M: Trust>(&'a self, held: Held, read: &'a AtomicU64) -> Sample<'a, M> {
         match held {
             Held::Ring { len } => Sample::ring(self.reader.held(len)),
             Held::Slot { slot, len } => {
                 let pool = self.pool.as_ref().expect("a pinned slot is the pool's");
-                Sample::slot(pool, slot, len)
+                Sample::slot(pool, slot, len, read, self.position())
             }
         }
     }
