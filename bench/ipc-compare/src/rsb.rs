@@ -77,7 +77,7 @@ pub fn topic_ring_for(size: usize) -> usize {
 /// A wait of `ms` for the topic's subscribers; none below 0.
 fn backpressure(ms: i32) -> Option<Backpressure> {
     let ms = u64::try_from(ms).ok()?;
-    Some(Backpressure { timeout: Duration::from_millis(ms) })
+    Some(Backpressure { timeout: Duration::from_millis(ms), ..Backpressure::default() })
 }
 
 /// `--backpressure MS` as the producer takes it: -1 without the flag.

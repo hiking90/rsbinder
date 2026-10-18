@@ -71,9 +71,9 @@
 //!
 //! A pool of a topic with backpressure is lossless: nothing is taken back, and only a slot that
 //! every subscriber waited for has read past is lent. With none, the lend waits
-//! (`backpressure.rs`); a subscriber can fall at least `depth + 1` values behind before a lend
-//! waits for it. Taking a subscriber out of the wait leaves its pin in place, so the slot it
-//! holds stays its own.
+//! (`backpressure.rs`); without a window a subscriber can fall at least `depth + 1` values behind
+//! before a lend waits for it. Taking a subscriber out of the wait leaves its pin in place, so
+//! the slot it holds stays its own.
 
 #[cfg(loom)]
 use loom::sync::atomic::fence;

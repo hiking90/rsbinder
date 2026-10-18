@@ -5,6 +5,7 @@
 
 use std::fmt;
 use std::marker::PhantomData;
+use std::num::NonZeroUsize;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{fence, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -311,8 +312,10 @@ pub(crate) struct State<S> {
     pub(crate) writer: Writer<S>,
     pub(crate) links: Links,
     pub(crate) lending: Option<Lending>,
-    /// How long a record waits for room: [`PublisherPolicy::backpressure`].
+    /// How long a record waits for room, and how far ahead it may go:
+    /// [`PublisherPolicy::backpressure`].
     backpressure: Option<Duration>,
+    window: Option<NonZeroUsize>,
     /// Subscriptions a wait took out, to tell once the lock is let go
     /// ([`TypedWriter::unlock`]), and how many it took out in all.
     evictions: Vec<Eviction>,
@@ -348,7 +351,10 @@ impl<S: Stores> State<S> {
             return Ok(());
         };
         let capacity = self.writer.capacity();
-        let need = self.writer.end_of(len)?.saturating_sub(capacity);
+        let mut need = self.writer.end_of(len)?.saturating_sub(capacity);
+        if let Some(window) = self.window {
+            need = need.max(self.writer.window_floor(window));
+        }
         if self.links.lowest_read() >= need {
             return Ok(());
         }
@@ -365,20 +371,28 @@ impl<S: Stores> State<S> {
     }
 
     /// Lend a slot for `len` bytes. With backpressure the pool lends only a slot no subscription
-    /// waited for still has to read: wait for one, and past the timeout take out the subscriptions
-    /// furthest behind, one at a time, until there is one (plan 15 §6.5).
+    /// waited for still has to read, and only inside the window of the record the loan publishes:
+    /// wait for one, and past the timeout take out the subscriptions furthest behind, one at a
+    /// time, until there is one (plan 15 §6.5).
     fn lend_slot(&mut self, len: usize) -> Result<LentSlot, LendError> {
         let Self {
+            writer,
             links,
             lending,
             backpressure,
+            window,
             evictions,
             evicted,
             ..
         } = self;
         let lending = lending.as_mut().expect("a lend asks a topic with a pool");
+        // Under this lock nothing is written, so the floor holds for the whole wait.
+        let floor = window.map_or(0, |window| writer.window_floor(window));
         let mut lend = |links: &Links| {
             let read = links.lowest_read();
+            if read < floor {
+                return Err(LendError::NoSlot);
+            }
             lending.memory.lend(&mut lending.slots, links, read, len)
         };
         let first = lend(links);
@@ -430,7 +444,11 @@ impl<T: Payload> TypedWriter<T, Stored<Mapping>> {
     ) -> rsbinder::fmq::Result<(OwnedFd, Option<PoolFd>, Self)> {
         let (fd, stored) = layout::create_topic(policy.ring_bytes)?;
         let writer = Self::new(Writer::new(stored));
-        writer.lock().backpressure = policy.backpressure.as_ref().map(|wait| wait.timeout);
+        {
+            let mut state = writer.lock();
+            state.backpressure = policy.backpressure.as_ref().map(|wait| wait.timeout);
+            state.window = policy.backpressure.as_ref().and_then(|wait| wait.window);
+        }
         let Some(pool) = &policy.pool else {
             return Ok((fd, None, writer));
         };
@@ -463,6 +481,7 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
                 links: Links::default(),
                 lending: None,
                 backpressure: None,
+                window: None,
                 evictions: Vec::new(),
                 evicted: 0,
                 published: 0,

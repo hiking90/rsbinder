@@ -5,16 +5,21 @@
 //!
 //! A record of a topic with [`Backpressure`] is written only once it overwrites no record a
 //! subscriber still has to read: with `E` where the record ends, once `E − capacity` is at or
-//! below the lowest `read` the subscriptions report. The publisher waits for that under the
-//! topic's lock, looking for a spin's budget and then sleeping, each sleep twice the last up to
-//! [`MAX_NAP`] and back to [`MIN_NAP`] whenever a subscriber reads on. A subscriber stores its
-//! `read` with `Release` once it has copied the record, and the publisher loads it with `Acquire`,
-//! so the record's bytes are read before they are written over.
+//! below the lowest `read` the subscriptions report. With a [`Backpressure::window`] of `w` that
+//! `read` has also to be at least where the record `w - 1` before it starts
+//! (`Writer::window_floor` in `ring.rs`), so that no subscriber is more than `w` records behind.
+//! The publisher waits for that under the topic's lock, looking for a spin's budget and then
+//! sleeping, each sleep twice the last up to [`MAX_NAP`] and back to [`MIN_NAP`] whenever a
+//! subscriber reads on. A subscriber stores its `read` with `Release` once it has copied the
+//! record, and the publisher loads it with `Acquire`, so the record's bytes are read before they
+//! are written over.
 //!
 //! A lend from the topic's pool waits the same way, for a slot that every subscription has read
-//! past and none pins (`pool.rs`), and past the timeout takes out the subscriptions furthest
-//! behind, one at a time, until there is one.
+//! past and none pins (`pool.rs`) and for the window of the record the loan will publish, and
+//! past the timeout takes out the subscriptions furthest behind, one at a time, until there is
+//! one.
 
+use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
 use rsbinder::fmq::shm::spin::{spin_until, SPIN};
@@ -23,9 +28,11 @@ use rsbinder::fmq::shm::spin::{spin_until, SPIN};
 ///
 /// A publish waits until the record it writes overwrites no record that a subscriber has not
 /// read yet, from where the subscriber's subscription started on, and a loan
-/// ([`Publisher::loan_slice`]) waits for a slot that every subscriber has read past. A
-/// subscriber that never falls that far behind costs nothing; one that does holds the
-/// publisher, and with it every other subscriber, for up to `timeout`, and is then taken out.
+/// ([`Publisher::loan_slice`]) waits for a slot that every subscriber has read past. With a
+/// [`window`](Self::window) both also wait until the record leaves no subscriber more than that
+/// many records behind. A subscriber that never falls that far behind costs nothing; one that
+/// does holds the publisher, and with it every other subscriber, for up to `timeout`, and is then
+/// taken out.
 ///
 /// # What waits with it
 ///
@@ -78,6 +85,24 @@ pub struct Backpressure {
     /// [`PublisherStats::evicted`](crate::PublisherStats::evicted). A `timeout` of zero takes
     /// them out at once; one past what an `Instant` holds waits without a bound.
     pub timeout: Duration,
+    /// The most records a subscriber may be behind the publisher, counting the one it is reading:
+    /// a record that would leave one further behind waits. `None` (the default) lets it fall as
+    /// far behind as the ring holds.
+    ///
+    /// A subscriber that falls behind without one lets the ring fill. Each value it receives then
+    /// waited behind every record before it, and between the record it reads and the newest lie
+    /// the bytes written since: once those are more than the CPU's last-level cache holds, it
+    /// reads its records from DRAM. A `window` bounds both by a number of records, whatever the
+    /// machine. Set one for large values with several subscribers, or where a value has to
+    /// arrive within a bound; 2 lets the publisher write one record while the slowest
+    /// subscriber reads the one before.
+    ///
+    /// Waiting for the window is waiting for room, with the same `timeout`: a subscriber that
+    /// stops for longer is taken out though the ring has room left. A small window leaves little
+    /// to ride out a subscriber's stall with, and on a topic of small values published at a high
+    /// rate the publisher stalls with it; choose `timeout` longer than the stalls to ride out. A
+    /// window larger than the records the ring holds waits as `None` does.
+    pub window: Option<NonZeroUsize>,
 }
 
 impl Default for Backpressure {
@@ -85,6 +110,7 @@ impl Default for Backpressure {
         Self {
             // Longer than a scheduling delay, shorter than a stop a person makes (plan 15 §6.5).
             timeout: Duration::from_secs(1),
+            window: None,
         }
     }
 }

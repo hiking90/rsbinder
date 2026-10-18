@@ -74,6 +74,7 @@
 //! `tail` cannot hold a caller.
 
 use std::collections::VecDeque;
+use std::num::NonZeroUsize;
 
 mod rules;
 
@@ -273,6 +274,16 @@ impl<M: Stores> Writer<M> {
     /// Where the next record ends if its payload is `len` bytes, or why it would be refused.
     pub(crate) fn end_of(&self, len: usize) -> Result<u64, Refused> {
         self.end_after(self.written, len)
+    }
+
+    /// How far every reader has to have read for the next record to leave none of them more than
+    /// `window` records behind: where the record `window - 1` before the next starts, or 0 if the
+    /// ring holds fewer.
+    pub(crate) fn window_floor(&self, window: NonZeroUsize) -> u64 {
+        match self.starts.len().checked_sub(window.get() - 1) {
+            Some(at) => self.starts.get(at).copied().unwrap_or(self.written),
+            None => 0,
+        }
     }
 
     /// The index the next record gets.

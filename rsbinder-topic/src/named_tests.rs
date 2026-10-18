@@ -705,6 +705,7 @@ fn waiting() -> PublisherPolicy {
     PublisherPolicy {
         backpressure: Some(Backpressure {
             timeout: Duration::from_millis(100),
+            ..Backpressure::default()
         }),
         ..policy()
     }

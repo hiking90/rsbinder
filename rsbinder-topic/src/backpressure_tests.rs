@@ -4,6 +4,7 @@
 //! A topic that waits for its subscribers (plan 15 §6.5): every value reaches every subscriber,
 //! however far the ring goes round, and a subscription that ended is not waited for.
 
+use std::num::NonZeroUsize;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -17,9 +18,14 @@ const SPAN: Duration = Duration::from_secs(10);
 
 /// A topic with the smallest ring, which waits up to `timeout`.
 fn waiting(timeout: Duration) -> Publisher<Bytes> {
+    within(timeout, None)
+}
+
+/// [`waiting`], for a subscriber more than `window` records behind as well.
+fn within(timeout: Duration, window: Option<NonZeroUsize>) -> Publisher<Bytes> {
     Publisher::new(&PublisherPolicy {
         ring_bytes: MIN_RING,
-        backpressure: Some(Backpressure { timeout }),
+        backpressure: Some(Backpressure { timeout, window }),
         ..PublisherPolicy::default()
     })
     .unwrap()
@@ -280,6 +286,15 @@ const SLOT: usize = 4096;
 /// A topic of `max_subscribers` with the smallest ring and a pool of `max_subscribers + 3` slots
 /// (a depth of 1, one loan), which waits up to `timeout`.
 fn pooled(max_subscribers: usize, timeout: Duration) -> Publisher<Bytes> {
+    pooled_within(max_subscribers, timeout, None)
+}
+
+/// [`pooled`], for a subscriber more than `window` records behind as well.
+fn pooled_within(
+    max_subscribers: usize,
+    timeout: Duration,
+    window: Option<NonZeroUsize>,
+) -> Publisher<Bytes> {
     Publisher::new(&PublisherPolicy {
         ring_bytes: MIN_RING,
         max_subscribers,
@@ -290,7 +305,7 @@ fn pooled(max_subscribers: usize, timeout: Duration) -> Publisher<Bytes> {
             max_loans: 1,
             huge_pages: false,
         }),
-        backpressure: Some(Backpressure { timeout }),
+        backpressure: Some(Backpressure { timeout, window }),
         ..PublisherPolicy::default()
     })
     .unwrap()
@@ -435,4 +450,93 @@ fn a_sample_held_by_a_subscriber_taken_out_keeps_its_slot() {
     let evicted = Err(RecvError::Closed(Closed::Evicted));
     assert_eq!(first.try_recv(), evicted);
     assert_eq!(second.try_recv(), evicted);
+}
+
+/// A window of `w` lets a publish go while it leaves the subscriber at most `w` records behind,
+/// counting the one it reads, and holds up the one that would leave it `w + 1` behind: for 1, 2
+/// and 3 that publish waits out the timeout and takes the subscriber out, though the ring has
+/// room for dozens more.
+#[test]
+fn a_publish_that_would_leave_a_subscriber_past_the_window_waits_for_it() {
+    let timeout = Duration::from_millis(100);
+    for window in 1..=3 {
+        let publisher = within(timeout, NonZeroUsize::new(window as usize));
+        let mut subscriber = subscribe(&publisher, Wake::Futex);
+        let quick = |n: u32| {
+            let began = Instant::now();
+            publisher.publish(&value(n)).unwrap();
+            assert!(began.elapsed() < timeout / 2, "window {window}, value {n}");
+        };
+        for n in 0..window {
+            quick(n);
+        }
+        // One read lets one more go.
+        assert_eq!(subscriber.try_recv(), Ok(value(0)));
+        quick(window);
+        assert_eq!(publisher.stats().evicted, 0, "window {window}");
+        let began = Instant::now();
+        publisher.publish(&value(window + 1)).unwrap();
+        let took = began.elapsed();
+        assert!(took >= timeout, "window {window}: {took:?}");
+        assert_eq!(publisher.stats().evicted, 1, "window {window}");
+        let evicted = Err(RecvError::Closed(Closed::Evicted));
+        assert_eq!(subscriber.recv_timeout(SPAN), evicted);
+    }
+}
+
+/// With a window of 1 every publish waits for both subscribers, one woken by the futex and one by
+/// its fd, to read the value before it, and they receive every value.
+#[test]
+fn every_value_reaches_every_subscriber_through_a_window_of_one() {
+    const VALUES: u32 = 1000;
+    let publisher = within(SPAN, NonZeroUsize::new(1));
+    let subscribers = [
+        subscribe(&publisher, Wake::Futex),
+        subscribe(&publisher, Wake::Fd),
+    ];
+    thread::scope(|scope| {
+        let receiving: Vec<_> = subscribers
+            .into_iter()
+            .enumerate()
+            .map(|(n, subscriber)| {
+                let pause = Duration::from_micros(100);
+                scope.spawn(move || receive(subscriber, VALUES, pause, n as u32 + 5))
+            })
+            .collect();
+        for n in 0..VALUES {
+            publisher.publish(&value(n)).unwrap();
+        }
+        for receiving in receiving {
+            assert_eq!(receiving.join().unwrap(), (0..VALUES).collect::<Vec<_>>());
+        }
+    });
+    assert_eq!(publisher.stats().evicted, 0);
+}
+
+/// A lend waits for the window of the record its loan publishes, not only for a slot: with a
+/// window of 2, the lend of a value that would leave the subscriber three behind waits out the
+/// timeout though a slot nobody has filled is free, and the publish after it waits no more.
+#[test]
+fn a_lend_past_the_window_waits_though_a_slot_is_free() {
+    let timeout = Duration::from_millis(100);
+    let publisher = pooled_within(1, timeout, NonZeroUsize::new(2));
+    let mut subscriber = subscribe(&publisher, Wake::Futex);
+    lend(&publisher, 0);
+    lend(&publisher, 1);
+    assert_eq!(subscriber.try_recv(), Ok(value(0)));
+    let began = Instant::now();
+    lend(&publisher, 2);
+    assert!(began.elapsed() < timeout / 2, "{:?}", began.elapsed());
+    let Bytes(bytes) = value(3);
+    let began = Instant::now();
+    let mut loan = publisher.loan_slice(bytes.len()).unwrap();
+    let took = began.elapsed();
+    assert!(took >= timeout, "{took:?}");
+    loan.copy_from_slice(&bytes);
+    let began = Instant::now();
+    loan.publish().unwrap();
+    assert!(began.elapsed() < timeout / 2, "{:?}", began.elapsed());
+    assert_eq!(publisher.stats().evicted, 1);
+    let evicted = Err(RecvError::Closed(Closed::Evicted));
+    assert_eq!(subscriber.recv_timeout(SPAN), evicted);
 }
