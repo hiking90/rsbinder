@@ -22,11 +22,52 @@ use rsbinder::fmq::shm::spin::{spin_until, SPIN};
 /// How a topic waits for its slowest subscriber: [`PublisherPolicy::backpressure`].
 ///
 /// A publish waits until the record it writes overwrites no record that a subscriber has not
-/// read yet, from where the subscriber's subscription started on. A subscriber that never falls
-/// behind by a ring's worth costs nothing; one that does holds the publisher, and with it every
-/// other subscriber, for up to `timeout`.
+/// read yet, from where the subscriber's subscription started on, and a loan
+/// ([`Publisher::loan_slice`]) waits for a slot that every subscriber has read past. A
+/// subscriber that never falls that far behind costs nothing; one that does holds the
+/// publisher, and with it every other subscriber, for up to `timeout`, and is then taken out.
+///
+/// # What waits with it
+///
+/// - The wait holds the topic's lock. Subscriptions that arrive meanwhile, [`Publisher::stats`],
+///   [`Publisher::close`] and the publishes of other threads wait for the lock, and the timeout
+///   of each counts from when it holds the lock: a publish queued behind another one's wait can
+///   take longer than `timeout`. [`Publisher::publish_all`] counts the timeout per value, so it
+///   takes up to the number of values times `timeout`.
+/// - [`Publisher::close`], and dropping the publisher, write the end record after the same wait,
+///   so that a subscriber reads every value before the end: a drop can take up to `timeout`.
+/// - The wait sleeps the calling thread. From async code, publish on a blocking thread
+///   (`tokio::task::spawn_blocking`, or a thread of its own).
+/// - A thread that publishes and is also the topic's only slow subscriber, receiving between
+///   its publishes, waits for itself and takes itself out after `timeout`.
+///
+/// # Binder threads
+///
+/// A subscriber's death ends a wait for it once a binder thread of the publisher's process has
+/// read the death notice: the publisher's process runs the binder thread pool. A subscription
+/// call that arrives during a wait holds a binder thread until the wait ends, so subscribers
+/// that keep retrying can hold every thread of the pool, and the wait then ends by its timeout
+/// rather than by the death.
+///
+/// A subscriber learns that it was taken out through a one-way call into its process, which its
+/// binder thread pool handles. One that runs no pool is not told: it goes on receiving and
+/// loses the records written over, as [`RecvError::Lagged`].
+///
+/// # Subscribing again
+///
+/// A subscriber taken out may subscribe again, and if it is as slow as before it holds each
+/// publish up for `timeout` again before it is taken out again. The topic does not refuse it:
+/// limit who may subscribe with [`PublisherPolicy::authorize`], and how many subscriptions one
+/// uid holds with [`PublisherPolicy::max_per_uid`].
 ///
 /// [`PublisherPolicy::backpressure`]: crate::PublisherPolicy::backpressure
+/// [`PublisherPolicy::authorize`]: crate::PublisherPolicy::authorize
+/// [`PublisherPolicy::max_per_uid`]: crate::PublisherPolicy::max_per_uid
+/// [`Publisher::loan_slice`]: crate::Publisher::loan_slice
+/// [`Publisher::stats`]: crate::Publisher::stats
+/// [`Publisher::close`]: crate::Publisher::close
+/// [`Publisher::publish_all`]: crate::Publisher::publish_all
+/// [`RecvError::Lagged`]: crate::RecvError::Lagged
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Backpressure {
     /// The longest a publish waits for room, from when it holds the topic's lock. Default 1 s.

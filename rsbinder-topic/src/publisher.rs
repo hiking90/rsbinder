@@ -191,7 +191,9 @@ impl<T: Payload + 'static> Publisher<T> {
     /// [`PublishError::Closed`] and later subscriptions are refused with
     /// [`ITopic::ERROR_CLOSED`]. Closing again does nothing.
     ///
-    /// The status's message is cut to 1 KiB.
+    /// The status's message is cut to 1 KiB. With
+    /// [`backpressure`](PublisherPolicy::backpressure) the end record waits for room as a value
+    /// does, so this call, and dropping the publisher, can take up to the timeout.
     ///
     /// [`ITopic::ERROR_CLOSED`]: crate::aidl::ITopic::ERROR_CLOSED
     pub fn close(&self, status: &Status) {

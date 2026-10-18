@@ -76,11 +76,8 @@ pub struct PublisherPolicy {
     /// subscriber that falls more than a ring or [`depth`](PoolPolicy::depth) loans behind loses
     /// the oldest values ([`RecvError::Lagged`](crate::RecvError::Lagged)).
     ///
-    /// The wait holds the topic's lock: subscriptions arriving meanwhile, [`stats`], and other
-    /// threads' publishes wait too. It runs on the calling thread; an async caller hands the
-    /// publish to a blocking thread.
-    ///
-    /// [`stats`]: crate::Publisher::stats
+    /// The wait holds the topic's lock and sleeps the calling thread; [`Backpressure`] says what
+    /// waits with it, and what it asks of the binder thread pools.
     pub backpressure: Option<Backpressure>,
 }
 

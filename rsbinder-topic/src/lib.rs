@@ -9,9 +9,12 @@
 //!
 //! * The publisher allocates the topic's memory, a ring of records in a sealed memfd, and
 //!   every subscriber maps it read-only. One copy into the ring serves all of them.
-//! * A publish never waits. When the ring is full the oldest records are overwritten, and a
-//!   subscriber that had not read them is told how many it lost. A receiver that must see
-//!   every value uses a stream (`rsbinder::stream`) instead, which holds the sender back.
+//! * A publish does not wait for a subscriber. When the ring is full the oldest records are
+//!   overwritten, and a subscriber that had not read them is told how many it lost. A topic
+//!   with [`Backpressure`] waits instead, up to a timeout, for its subscribers to read what a
+//!   publish would overwrite, and then takes out the ones still in the way
+//!   ([`Closed::Evicted`]). A receiver that must see every value however slow it is uses a
+//!   stream (`rsbinder::stream`), which holds the sender back and takes no receiver out.
 //! * A subscriber writes one small memfd of its own, its control page, which the publisher
 //!   maps read-only. Nothing a subscriber does reaches the ring or another subscriber.
 //!
