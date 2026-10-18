@@ -7,7 +7,9 @@
 //! ipc-compare b3 --impl rsb-stream|rsb-oneway|rsb-topic|rsb-topic-loan|ix [--wait block|poll] --n N --size B --rate HZ
 //!   (rsb-topic and rsb-topic-loan also take --wait fd; rsb-topic-loan lends a pool slot per item
 //!   and its subscriber reads it in place, or copies it out with --touch yes; with --trust yes
-//!   the subscriber vouches for the publisher and copies with a plain memory copy)
+//!   the subscriber vouches for the publisher and copies with a plain memory copy; with
+//!   --backpressure MS a publish or a loan waits up to MS ms for the subscribers, and the row's
+//!   impl gains `+bp`)
 //! ipc-compare b5 --wake futex|fd --n N [--rate HZ]     (one process: publish time, N waiting)
 //! ipc-compare b6 --codec alloc|parcel|bytes --side publish|receive --size B  (one process: codec)
 //!   (b2, b3 with --impl ix also take --touch yes: the subscriber copies the payload out)
@@ -129,10 +131,22 @@ fn fanout(bench: &str, a: &Args) {
     let name = unique_name();
     let mut note = Vec::new();
     let mut failures = 0;
+    // A topic's subscribers ask the producer for the wait when they ask for the topic.
+    let backpressure = match imp.as_str() {
+        "rsb-topic" | "rsb-topic-loan" if a.has("backpressure") => Some(a.num("backpressure", 0)),
+        _ => None,
+    };
+    let label = match backpressure {
+        Some(ms) => {
+            note.push(format!("backpressure {ms} ms"));
+            format!("{imp}+bp")
+        }
+        None => imp.clone(),
+    };
     let row = |hist, msgs_per_s, failures, note: Vec<String>| {
         Row {
             bench,
-            imp: &imp,
+            imp: &label,
             wait: &wait,
             n,
             size,
@@ -226,6 +240,10 @@ fn fanout(bench: &str, a: &Args) {
             std::process::exit(2);
         }
     };
+    let mut extra = extra;
+    if let Some(ms) = backpressure {
+        extra.push(("backpressure", ms.to_string()));
+    }
     if producer.wait_for("READY", START).is_none() {
         return row(None, 0.0, 0, vec!["producer did not start".into()]);
     }

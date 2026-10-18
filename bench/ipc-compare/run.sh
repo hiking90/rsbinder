@@ -11,7 +11,8 @@
 # rsbinder-topic's B3 rows, to set against the `topic` set's. `p3` is B3's large payloads with
 # rsbinder-topic's loans, read in place and copied out (by a subscriber that does not vouch for
 # the publisher, and by one that does), next to its ring copies and iceoryx2's two kinds of
-# subscriber. Each repeat writes its own CSV.
+# subscriber. `p36` is rsbinder-topic's large payloads, ring and pool, without and with
+# backpressure. Each repeat writes its own CSV.
 #
 # Results go to plans/15-pubsub-bench/<time>-<set>/: conditions.txt and results-<repeat>.csv.
 #
@@ -176,6 +177,30 @@ b3_loan() {
     done
 }
 
+# B3's large payloads through rsbinder-topic's ring and its pool, each without and with a
+# backpressure of 1 s (plan 15 P3-6, AC-15.3.14): where the subscribers keep up the two rows
+# differ by the cost of the wait's check; where they cannot, the row with backpressure goes at
+# the slowest subscriber's pace and loses nothing.
+b3_backpressure() {
+    local bp
+    for n in 1 8; do
+        for size in 65536 1048576 4194304; do
+            for rate in 1000 10000 0; do
+                for wait in block poll; do
+                    for bp in no yes; do
+                        local flags=()
+                        [ "$bp" = yes ] && flags=(--backpressure 1000)
+                        measure b3 --impl rsb-topic --wait "$wait" --n "$n" --size "$size" \
+                            --rate "$rate" "${flags[@]}"
+                        measure b3 --impl rsb-topic-loan --wait "$wait" --touch yes --n "$n" \
+                            --size "$size" --rate "$rate" "${flags[@]}"
+                    done
+                done
+            done
+        done
+    done
+}
+
 for repeat in $(seq "$repeats"); do
     csv=$out/results-$repeat.csv
     "$bin" header > "$csv"
@@ -196,6 +221,7 @@ for repeat in $(seq "$repeats"); do
         p0b) b5; b6; b3_touch ;;
         p2e5) b6; b3 "rsb-topic block" "rsb-topic poll" ;;
         p3) b3_loan ;;
+        p36) b3_backpressure ;;
         *) echo "run.sh: unknown set $set_name" >&2; exit 2 ;;
     esac
 done

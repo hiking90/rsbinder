@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use rsbinder::stream::{Receiver, ReceiverPolicy, Sink, SinkPolicy, StreamEndpoint};
 use rsbinder::*;
 use rsbinder_topic::{
-    Bytes, PoolPolicy, Publisher, PublisherPolicy, RecvError, Sample, Subscriber, SubscriberPolicy, Trust,
-    Wake,
+    Backpressure, Bytes, Closed, PoolPolicy, Publisher, PublisherPolicy, RecvError, Sample, Subscriber,
+    SubscriberPolicy, Trust, Wake,
 };
 
 use crate::common::*;
@@ -74,6 +74,30 @@ pub fn topic_ring_for(size: usize) -> usize {
     PublisherPolicy::for_payload(size.max(STAMP_BYTES), depth).ring_bytes
 }
 
+/// A wait of `ms` for the topic's subscribers; none below 0.
+fn backpressure(ms: i32) -> Option<Backpressure> {
+    let ms = u64::try_from(ms).ok()?;
+    Some(Backpressure { timeout: Duration::from_millis(ms) })
+}
+
+/// `--backpressure MS` as the producer takes it: -1 without the flag.
+fn backpressure_arg(a: &Args) -> i32 {
+    if a.has("backpressure") { a.num("backpressure", 0) as i32 } else { -1 }
+}
+
+/// What a consumer notes besides its histogram, one word: values lost, and a subscription taken
+/// out by the publisher's wait.
+fn extra(lost: u64, evicted: bool) -> String {
+    let mut words = Vec::new();
+    if lost > 0 {
+        words.push(format!("lost={lost}"));
+    }
+    if evicted {
+        words.push("evicted".to_string());
+    }
+    words.join(",")
+}
+
 #[derive(Default)]
 struct Producer {
     streams: Mutex<Vec<Sink<StreamBytes>>>,
@@ -115,14 +139,22 @@ impl IBench for Producer {
         Ok(())
     }
 
-    fn r#topic(&self, ring_bytes: i32) -> BinderResult<SIBinder> {
+    fn r#topic(&self, ring_bytes: i32, backpressure_ms: i32) -> BinderResult<SIBinder> {
         self.topic_with(&PublisherPolicy {
             ring_bytes: ring_bytes.max(0) as usize,
+            backpressure: backpressure(backpressure_ms),
             ..PublisherPolicy::default()
         })
     }
 
-    fn r#loanTopic(&self, ring_bytes: i32, slot_bytes: i32, depth: i32, subscribers: i32) -> BinderResult<SIBinder> {
+    fn r#loanTopic(
+        &self,
+        ring_bytes: i32,
+        slot_bytes: i32,
+        depth: i32,
+        subscribers: i32,
+        backpressure_ms: i32,
+    ) -> BinderResult<SIBinder> {
         let subscribers = subscribers.max(1) as usize;
         self.topic_with(&PublisherPolicy {
             ring_bytes: ring_bytes.max(0) as usize,
@@ -133,6 +165,7 @@ impl IBench for Producer {
                 depth: depth.max(0) as usize,
                 ..PoolPolicy::default()
             }),
+            backpressure: backpressure(backpressure_ms),
             ..PublisherPolicy::default()
         })
     }
@@ -267,13 +300,14 @@ pub fn stream_consumer(a: &Args) -> Result<()> {
 
 /// Child role `rsb-topic`: one topic subscriber. `--wait block` sleeps on the futex, `fd` on
 /// the wake socket, `poll` spins on `try_recv`. Records the ring overwrote count toward `count`
-/// and are reported as `lost=` in the note: a publish never waits for a subscriber.
+/// and are reported as `lost=` in the note: without `--backpressure` a publish never waits for a
+/// subscriber. A subscription the publisher's wait took out ends the run and notes `evicted`.
 pub fn topic_consumer(a: &Args) -> Result<()> {
     pin(a.num("cpu", 2) as usize);
     let count = a.num("count", 0);
     let wait = a.str("wait", "block");
     let bench = connect(&a.str("name", ""))?;
-    let topic = bench.r#topic(a.num("ring", 64 * 1024) as i32)?;
+    let topic = bench.r#topic(a.num("ring", 64 * 1024) as i32, backpressure_arg(a))?;
     let policy = SubscriberPolicy {
         max_ring_bytes: 1 << 30,
         wake: if wait == "fd" { Wake::Fd } else { Wake::Futex },
@@ -283,6 +317,7 @@ pub fn topic_consumer(a: &Args) -> Result<()> {
     ready("SUBSCRIBED");
     let mut record = Record::new(a.num("warmup", 0));
     let mut lost = 0u64;
+    let mut evicted = false;
     let mut idle: Option<Instant> = None;
     while record.received + lost < count {
         let got = if wait == "poll" { subscriber.try_recv() } else { subscriber.recv_timeout(SILENCE) };
@@ -297,6 +332,10 @@ pub fn topic_consumer(a: &Args) -> Result<()> {
                 }
             }
             Err(RecvError::Lagged(n)) => lost += n,
+            Err(RecvError::Closed(Closed::Evicted)) => {
+                evicted = true;
+                break;
+            }
             Err(RecvError::Closed(_) | RecvError::Timeout) => break,
             Err(e) => {
                 eprintln!("rsb-topic: {e}");
@@ -304,9 +343,7 @@ pub fn topic_consumer(a: &Args) -> Result<()> {
             }
         }
     }
-    if lost > 0 {
-        record.extra = format!("lost={lost}");
-    }
+    record.extra = extra(lost, evicted);
     println!("{}", record.line());
     Ok(())
 }
@@ -322,7 +359,8 @@ pub fn topic_loan_consumer(a: &Args) -> Result<()> {
     let touch = a.str("touch", "no") == "yes";
     let bench = connect(&a.str("name", ""))?;
     let num = |key: &str| a.num(key, 0) as i32;
-    let topic = bench.r#loanTopic(num("ring"), num("slot"), num("depth"), num("n"))?;
+    let topic =
+        bench.r#loanTopic(num("ring"), num("slot"), num("depth"), num("n"), backpressure_arg(a))?;
     let policy = SubscriberPolicy {
         max_ring_bytes: 1 << 30,
         max_pool_bytes: usize::MAX,
@@ -365,6 +403,7 @@ fn take_samples<M: Trust>(
     let poll = a.str("wait", "block") == "poll";
     let mut record = Record::new(a.num("warmup", 0));
     let mut lost = 0u64;
+    let mut evicted = false;
     let mut idle: Option<Instant> = None;
     while record.received + lost < count {
         let got = if poll {
@@ -383,6 +422,10 @@ fn take_samples<M: Trust>(
                 }
             }
             Err(RecvError::Lagged(n)) => lost += n,
+            Err(RecvError::Closed(Closed::Evicted)) => {
+                evicted = true;
+                break;
+            }
             Err(RecvError::Closed(_) | RecvError::Timeout) => break,
             Err(e) => {
                 eprintln!("rsb-topic-loan: {e}");
@@ -390,9 +433,7 @@ fn take_samples<M: Trust>(
             }
         }
     }
-    if lost > 0 {
-        record.extra = format!("lost={lost}");
-    }
+    record.extra = extra(lost, evicted);
     record
 }
 
