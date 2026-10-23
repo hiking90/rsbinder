@@ -1,7 +1,7 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Whether a subscriber vouches for its publisher (plan 15 §6.3, P3-5).
+//! Whether a subscriber vouches for its publisher (plan 15 §6.3).
 
 /// Whether a [`Subscriber`](crate::Subscriber) vouches for its topic's publisher: [`Untrusted`],
 /// what [`Subscriber::request`](crate::Subscriber::request) makes, or [`Trusted`], what

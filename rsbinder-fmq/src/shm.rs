@@ -131,8 +131,7 @@ fn is_char_device(st: &rustix::fs::Stat) -> bool {
     rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::CharacterDevice
 }
 
-/// An ashmem `_IO(0x77, nr)` request, whose answer is the ioctl's return value.
-/// `BadValue` when `fd` is not ashmem.
+/// `_IO(0x77, nr)` on `fd`: the ioctl's return value, or `BadValue` when `fd` is not ashmem.
 #[cfg(target_os = "android")]
 fn ashmem_query(fd: BorrowedFd<'_>, request: libc::c_ulong) -> Result<u64> {
     use std::os::fd::AsRawFd;
@@ -218,7 +217,7 @@ mod ashmem_tests {
         );
     }
 
-    /// A one-page region as libcutils `__ashmem_open` makes it, or `None` on a device without ashmem.
+    /// A one-page region as libcutils `__ashmem_open` makes it; `None` without an ashmem device.
     fn region() -> Option<std::fs::File> {
         let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
         let open = |path: &str| {

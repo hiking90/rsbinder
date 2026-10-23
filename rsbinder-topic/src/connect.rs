@@ -5,18 +5,23 @@
 //! never left this process is told from one that came through binder.
 //!
 //! A publisher takes a token that lives in its own process only from a call that never left
-//! it: [`Subscriber::request`](crate::Subscriber::request) marks the thread with its token
-//! ([`Asking`]) and a local `ITopic` runs on that thread. A token of this process that came
-//! through binder is one the caller got from this process, so its death says nothing about the
-//! caller, and it is refused. The pid of the call cannot tell the two apart: a handler that
-//! subscribes to a topic of its own process still sees its caller's pid.
+//! it: [`Subscriber::request`](crate::Subscriber::request) marks the thread with the request it
+//! sends ([`Asking`]) and a local `ITopic` runs on that thread with that very request. A token of
+//! this process that came through binder is one the caller got from this process, so its death
+//! says nothing about the caller, and it is refused. The pid of the call cannot tell the two
+//! apart: a handler that subscribes to a topic of its own process still sees its caller's pid.
+//! Nor can the token alone: while the thread waits for the reply of a remote `ITopic`, the
+//! kernel runs on it a call that remote process makes back into this one, and that call can
+//! carry the token it was just sent. Its request is one read from a parcel, never the request
+//! the thread is sending, so the address of the request tells the two apart.
 
-use std::cell::RefCell;
+use std::cell::Cell;
 use std::sync::Weak;
 
-use rsbinder::{BinderResult, ExceptionCode, Interface, SIBinder, Status, StatusCode};
+use rsbinder::{BinderResult, ExceptionCode, Interface, Status, StatusCode};
 
 use crate::aidl::ISubscription::ISubscription;
+use crate::aidl::SubscribeRequest::SubscribeRequest;
 use crate::wait::{Local, Parts, EVICTED};
 
 /// The binder a subscriber sends as `SubscribeRequest.token`, an `ISubscription`: the publisher
@@ -40,7 +45,7 @@ impl ISubscription for Token {
 impl Token {
     /// The token of no subscriber, for tests that make the subscription call themselves.
     #[cfg(test)]
-    pub(crate) fn detached() -> SIBinder {
+    pub(crate) fn detached() -> rsbinder::SIBinder {
         use crate::aidl::ISubscription::BnSubscription;
         let token = Self { local: Weak::new() };
         rsbinder::Interface::as_binder(&BnSubscription::new_binder(token))
@@ -48,7 +53,7 @@ impl Token {
 }
 
 thread_local! {
-    /// The token of the subscription call this thread is making, while it makes it.
+    /// The address of the request this thread subscribes with, while it does; 0 for none.
     #[cfg_attr(
         target_os = "android",
         expect(
@@ -56,27 +61,35 @@ thread_local! {
             reason = "the initializer is `const`; Android's expansion of the macro hides that"
         )
     )]
-    static ASKING: RefCell<Option<SIBinder>> = const { RefCell::new(None) };
+    static ASKING: Cell<usize> = const { Cell::new(0) };
 }
 
-/// Marks this thread as making a subscription call with `token` until dropped.
-pub(crate) struct Asking(Option<SIBinder>);
+/// Marks this thread as subscribing with `request`, which outlives the mark, until dropped.
+/// Not `Send`: the drop restores the mark of the thread that made it.
+pub(crate) struct Asking<'a>(
+    usize,
+    std::marker::PhantomData<(&'a SubscribeRequest, *const ())>,
+);
 
-impl Asking {
-    pub(crate) fn new(token: &SIBinder) -> Self {
-        Self(ASKING.replace(Some(token.clone())))
+impl<'a> Asking<'a> {
+    pub(crate) fn new(request: &'a SubscribeRequest) -> Self {
+        Self(ASKING.replace(address(request)), std::marker::PhantomData)
     }
 }
 
-impl Drop for Asking {
+impl Drop for Asking<'_> {
     fn drop(&mut self) {
-        ASKING.set(self.0.take());
+        ASKING.set(self.0);
     }
 }
 
-/// Whether `token` came with a subscription call this thread is making itself.
-pub(crate) fn asked_here(token: &SIBinder) -> bool {
-    ASKING.with_borrow(|asking| asking.as_ref() == Some(token))
+fn address(request: &SubscribeRequest) -> usize {
+    std::ptr::from_ref(request) as usize
+}
+
+/// Whether `request` is the one of a subscription call this thread is making itself.
+pub(crate) fn asked_here(request: &SubscribeRequest) -> bool {
+    ASKING.get() == address(request)
 }
 
 /// A refusal with one of `ITopic`'s service-specific codes.

@@ -9,7 +9,8 @@
 //! only ever growing, `a` loaded first gives `a <= b`: the `b` loaded later is at least the `b` of
 //! the moment `a` was loaded. With `b - a <= n` it is the other way round, `b` first. Each function
 //! names the order it was written for, and none of them fails a publisher that follows the
-//! protocol, wherever between its stores the loads fall.
+//! protocol, wherever between its stores the loads fall. `frontier - tail <= capacity` holds too:
+//! a record's `tail` is stored before any of its `frontier`s, which reach at most its end.
 
 use super::Corrupted;
 
@@ -144,6 +145,16 @@ impl Seen {
         Ok(tail)
     }
 
+    /// [`tail`](Self::tail), after the `frontier` that found a lap: a ring behind it at most.
+    pub(super) fn lapped_tail(&mut self, tail: u64, capacity: u64) -> Result<u64, Corrupted> {
+        let tail = self.tail(tail, capacity)?;
+        // `frontier - tail <= capacity` at every instant, and the `frontier` held was loaded first.
+        if self.frontier.saturating_sub(tail) > capacity {
+            return Err(Corrupted("frontier more than a ring past tail"));
+        }
+        Ok(tail)
+    }
+
     /// A `frontier` loaded after every earlier load, of `write` too.
     pub(super) fn frontier(&mut self, frontier: u64) -> Result<u64, Corrupted> {
         if frontier % 8 != 0 {
@@ -160,7 +171,7 @@ impl Seen {
         Ok(frontier)
     }
 
-    /// A record start the publisher keeps in a word (`half`, `last`): after `tail`, before `write`.
+    /// A record start kept in a word (`tail`, `half`, `last`): from `tail` on, before `write`.
     pub(super) fn kept(
         &mut self,
         start: u64,
@@ -261,6 +272,24 @@ mod tests {
         seen.newer(72).unwrap();
         assert!(what(seen.tail(0, CAPACITY)).contains("more bytes kept"));
         assert_eq!(seen.tail(8, CAPACITY), Ok(8));
+    }
+
+    #[test]
+    fn a_tail_after_a_lap_is_at_most_a_ring_behind_the_frontier_loaded_before_it() {
+        let mut seen = Seen::default();
+        seen.newer(64).unwrap();
+        seen.frontier(CAPACITY + 8).unwrap();
+        assert_eq!(seen.lapped_tail(8, CAPACITY), Ok(8));
+        // The publisher went on between the two loads: a `tail` past that `frontier` is no defect.
+        assert_eq!(seen.lapped_tail(200, CAPACITY), Ok(200));
+
+        let mut seen = Seen::default();
+        seen.newer(64).unwrap();
+        seen.frontier(CAPACITY + 8).unwrap();
+        assert!(what(seen.lapped_tail(0, CAPACITY)).contains("frontier more than a ring"));
+        let mut seen = Seen::default();
+        seen.newer(64).unwrap();
+        assert!(what(seen.lapped_tail(4, CAPACITY)).contains("tail off"));
     }
 
     #[test]

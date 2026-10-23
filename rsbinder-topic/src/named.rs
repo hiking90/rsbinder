@@ -34,6 +34,11 @@ use crate::{
 const FIRST_RETRY: Duration = Duration::from_secs(1);
 const LAST_RETRY: Duration = Duration::from_secs(30);
 
+/// Looks of a drain that may give up lapped before it ends: the most one of its receives makes.
+const DRAIN_GIVE_UPS: u32 = 2;
+/// Drain receives in a row that may leave it where it was before it ends; a conforming one, none.
+const DRAIN_STALLS: u32 = 2;
+
 /// A subscriber of a topic name: it connects to the publisher the name is given to, and to the
 /// next one when that one ends or another takes the name.
 ///
@@ -71,10 +76,25 @@ const LAST_RETRY: Duration = Duration::from_secs(30);
 /// ```
 ///
 /// Records do not carry over from one connection to the next: the index starts again, and what
-/// was published between the two is not counted as lost (the `Disconnected` marks the gap). A
-/// connection after the first starts at the oldest record of the new ring, unless the policy's
-/// [`start`](SubscriberPolicy::start) is [`Start::Last`]: the subscription is older than that
-/// publisher, so all it published is news to it.
+/// was published between the two is not counted as lost (the `Disconnected` marks the gap). The
+/// first connection starts where the policy's [`start`](SubscriberPolicy::start) says. A later
+/// connection to a publisher this subscriber was not connected to before starts at the oldest
+/// record of the new ring, unless that `start` is [`Start::Last`]: the subscription is older than
+/// that publisher, so all it published is news to it. A connection to a publisher it was
+/// connected to before, as when the name comes back to that publisher after another held it,
+/// starts at [`Start::Latest`], so that no record the earlier connection returned is returned
+/// again. A connection counts from the receive that takes it; one whose fd the subscriber's
+/// epoll instance refuses ([`Disconnected::Rejected`]) does not.
+///
+/// The subscriber remembers a publisher it was connected to by a reference to its binder, and
+/// forgets it only on what a connection to it saw: the connection read the end record of its
+/// topic (what [`Closed::End`] and [`Closed::Status`] report), after which the publisher refuses
+/// every later subscription, or the notice of its binder's death arrived while the connection
+/// was held. How the connection ended does not decide it, so a publisher no connection saw end
+/// stays remembered, as it may take the name again, until a later connection to it sees its end
+/// or the subscriber drops. A connection sees the records its receives read, those of the drain
+/// before a [`Disconnected::Replaced`] included, and the death notice that arrives while it is
+/// held; an end it read no record of, or a notice that arrives once it is over, goes to none.
 ///
 /// With [`Wake::Fd`] the subscriber is a [`Wait`]: an event loop or
 /// [`wait_any`](crate::wait_any) polls the same fd through every reconnection.
@@ -96,8 +116,80 @@ pub struct NamedSubscriber<T: Payload> {
 struct Connection<T: Payload> {
     subscriber: Subscriber<T>,
     binder: SIBinder,
-    /// Where the records to return end, once another publisher took the name.
-    drain_to: Option<u64>,
+    /// The records to return before the end, once another publisher took the name.
+    drain: Option<Drain>,
+}
+
+impl<T: Payload> Connection<T> {
+    /// The name came back to this connection's publisher: nothing replaced, no drain, read live.
+    fn keep(&mut self, state: &mut State<T>) {
+        state.replaced = false;
+        self.drain = None;
+        self.subscriber.stop_at(None);
+    }
+}
+
+/// A drain of the records a replaced publisher had committed when the replacement was seen.
+#[derive(Debug, PartialEq)]
+struct Drain {
+    /// Where those records end: the reader is [stopped at](Subscriber::stop_at) it.
+    end: u64,
+    /// Looks of this drain that gave up, up to [`DRAIN_GIVE_UPS`].
+    gave_up: u32,
+    /// The furthest this drain has read to.
+    reach: u64,
+    /// Receives in a row that did not read past `reach`, up to [`DRAIN_STALLS`].
+    stalls: u32,
+    /// The losses before `end` were counted and returned: the next receive ends the drain.
+    settled: bool,
+}
+
+/// What a drain does after one of its looks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AfterLook {
+    /// Look once more within this receive.
+    Again,
+    /// Count what is left before the end as lost, and end the drain.
+    Settle,
+    /// Return what the look found.
+    Return,
+}
+
+impl Drain {
+    /// A drain to `end` of a reader at `position`.
+    fn new(end: u64, position: u64) -> Self {
+        Self {
+            end,
+            gave_up: 0,
+            reach: position,
+            stalls: 0,
+            settled: false,
+        }
+    }
+
+    /// After a look that ended at `position`; `gave_up` is the subscriber's, as its waits see it.
+    fn after_look(&mut self, gave_up: bool, position: u64) -> AfterLook {
+        if !gave_up {
+            return AfterLook::Return;
+        }
+        self.gave_up += 1;
+        // Only `try_latest`, which does not look at `end`, gives up at it or past it: drained.
+        if position >= self.end || self.gave_up >= DRAIN_GIVE_UPS {
+            AfterLook::Settle
+        } else {
+            AfterLook::Again
+        }
+    }
+
+    /// Count a receive that returned a result and left the reader at `position`.
+    fn count_stall(&mut self, position: u64) {
+        if position > self.reach {
+            self.reach = position;
+            self.stalls = 0;
+        } else {
+            self.stalls += 1;
+        }
+    }
 }
 
 /// What the subscriber, the resolver's callback and the connection thread share.
@@ -116,8 +208,10 @@ struct State<T: Payload> {
     dropped: bool,
     /// A publisher took the subscription out (plan 15 §6.5): no connection is made again.
     evicted: bool,
-    /// An interrupt not yet returned; the connection's own interrupt is raised with it.
+    /// An interrupt no receive has returned, the only one kept: the connection gets a `NOTICE`.
     interrupted: bool,
+    /// That interrupt has not ended a poll yet; a poll takes it, a receive with `interrupted`.
+    kicked: bool,
     /// The binder the name was last given.
     latest: Option<SIBinder>,
     /// A connection the thread made that the subscriber has not taken yet.
@@ -132,8 +226,12 @@ struct State<T: Payload> {
     notices: VecDeque<Disconnected>,
     /// Ends the wait of the subscriber's connection when the state changes.
     wake: Option<Interrupter>,
-    /// A connection was made before: the next starts at the new ring's oldest record.
-    reconnect: bool,
+    /// Binders joined, each once; one leaves when its connection saw the topic's end or its death.
+    joined: Vec<SIBinder>,
+    /// A connection has joined: a later one to a binder not joined starts at `Oldest`, or `Last`.
+    later: bool,
+    /// The wait before asking again a publisher whose connection failed to join; zero after a join.
+    rejoin: Duration,
 }
 
 impl<T: Payload> State<T> {
@@ -142,6 +240,7 @@ impl<T: Payload> State<T> {
             dropped: false,
             evicted: false,
             interrupted: false,
+            kicked: false,
             latest: None,
             ready: None,
             connected: None,
@@ -150,8 +249,16 @@ impl<T: Payload> State<T> {
             replaced: false,
             notices: VecDeque::new(),
             wake: None,
-            reconnect: false,
+            joined: Vec::new(),
+            later: false,
+            rejoin: Duration::ZERO,
         }
+    }
+
+    /// Take a pending interrupt for a receive to return, its kick with it; whether one was.
+    fn take_interrupt(&mut self) -> bool {
+        self.kicked = false;
+        std::mem::take(&mut self.interrupted)
     }
 }
 
@@ -266,6 +373,10 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
     }
 
     /// The newest value, waiting until some record is unread, as [`Subscriber::recv_latest`].
+    ///
+    /// After another publisher took the name, it may return one record the previous publisher
+    /// committed after that was seen, the newest when it looked, and then
+    /// [`Disconnected::Replaced`].
     pub fn recv_latest(&mut self) -> Result<T, RecvError> {
         self.receive(Some(None), true)
     }
@@ -323,7 +434,7 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
             let Some(deadline) = wait else {
                 return Err(RecvError::Empty);
             };
-            if std::mem::take(&mut state.interrupted) {
+            if state.take_interrupt() {
                 return Err(RecvError::Cancelled);
             }
             match deadline {
@@ -373,8 +484,7 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
         }
     }
 
-    /// Take a notice or a connection, and with a connection the next record before a
-    /// replacement. `Idle` keeps the lock, for a wait to look at the interrupt and sleep.
+    /// A notice, a connection, or its next record before a replacement; `Idle` keeps the lock.
     fn step<'n>(&mut self, mut state: MutexGuard<'n, State<T>>, latest: bool) -> Step<'n, T> {
         if state.evicted {
             return Step::Done(Err(RecvError::Closed(Closed::Evicted)));
@@ -385,50 +495,128 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
         if self.current.is_none() {
             if let Some((subscriber, binder)) = state.ready.take() {
                 if let Err(error) = self.join(&subscriber) {
-                    // The next registration of the name tries again.
                     state.connected = None;
+                    state.replaced = false;
+                    // Asked again as a transaction error is: a newer binder now, this one later.
+                    let next = state.latest.clone().filter(|latest| {
+                        Some(latest) != state.refused.as_ref() && !state.connecting
+                    });
+                    let after = match &next {
+                        Some(next) if *next == binder => {
+                            state.rejoin = (state.rejoin * 2).clamp(FIRST_RETRY, LAST_RETRY);
+                            state.rejoin
+                        }
+                        _ => {
+                            state.rejoin = Duration::ZERO;
+                            Duration::ZERO
+                        }
+                    };
+                    state.connecting |= next.is_some();
                     drop(state);
                     drop(subscriber);
+                    if let Some(next) = next {
+                        self.named.connect(next, after);
+                    }
                     let status = Status::from(StatusCode::from(error));
                     return Step::Done(Err(RecvError::Disconnected(Disconnected::Rejected(
                         status,
                     ))));
                 }
+                state.rejoin = Duration::ZERO;
+                state.later = true;
+                if !state.joined.contains(&binder) {
+                    state.joined.push(binder.clone());
+                }
                 let wake = subscriber.interrupter();
                 if state.interrupted {
-                    wake.interrupt();
+                    wake.notice();
                 }
                 state.wake = Some(wake);
                 self.current = Some(Connection {
                     subscriber,
                     binder,
-                    drain_to: None,
+                    drain: None,
                 });
             }
         }
         let Some(connection) = self.current.as_mut() else {
             return Step::Idle(state);
         };
-        if state.replaced && connection.drain_to.is_none() {
-            connection.drain_to = Some(connection.subscriber.committed());
+        if state.replaced && state.latest.as_ref() == Some(&connection.binder) {
+            // The name came back to this publisher: nothing to drain to; `settle` takes its wake.
+            connection.keep(&mut state);
+        }
+        if state.replaced && connection.drain.is_none() {
+            let end = connection.subscriber.committed();
+            connection.subscriber.stop_at(Some(end));
+            connection.drain = Some(Drain::new(end, connection.subscriber.position()));
         }
         drop(state);
-        let Some(end) = connection.drain_to else {
+        let Connection {
+            subscriber, drain, ..
+        } = connection;
+        let Some(drain) = drain else {
             return Step::Connected;
         };
-        if connection.subscriber.position() < end {
-            let received = if latest {
-                connection.subscriber.try_latest()
-            } else {
-                connection.subscriber.try_recv()
-            };
+        if !drain.settled && subscriber.position() < drain.end {
+            // Held in place, as only a publisher that breaks the protocol holds it: drained.
+            let mut settle = drain.stalls == DRAIN_STALLS;
+            let mut received = Err(RecvError::Empty);
+            while !settle {
+                received = if latest {
+                    subscriber.try_latest()
+                } else {
+                    subscriber.try_recv()
+                };
+                // The give-up as a wait sees it: also when a death turned its `Empty` to `Closed`.
+                match drain.after_look(subscriber.gave_up(), subscriber.position()) {
+                    AfterLook::Return => break,
+                    AfterLook::Settle => settle = true,
+                    AfterLook::Again => {
+                        #[cfg(test)]
+                        BETWEEN_LOOKS.with_borrow_mut(|hook| hook.iter_mut().for_each(|h| h()));
+                    }
+                }
+            }
+            if settle {
+                // `try_latest` skips what it does not return; `try_recv` counts it as lost.
+                let lost = if latest {
+                    0
+                } else {
+                    subscriber.count_lost_before()
+                };
+                if lost > 0 {
+                    drain.settled = true;
+                    return Step::Done(Err(RecvError::Lagged(lost)));
+                }
+                return self.end_drain();
+            }
             match received {
                 Err(RecvError::Closed(Closed::Evicted)) => return Step::Done(Err(self.evict())),
                 Err(RecvError::Empty | RecvError::Closed(_)) => {}
-                other => return Step::Done(other),
+                other => {
+                    drain.count_stall(subscriber.position());
+                    return Step::Done(other);
+                }
             }
         }
-        Step::Done(Err(self.finish(Disconnected::Replaced)))
+        self.end_drain()
+    }
+
+    /// End the drain, unless the name came back to its publisher: decided in `finish`'s lock.
+    fn end_drain<'n>(&mut self) -> Step<'n, T> {
+        #[cfg(test)]
+        BEFORE_DRAIN_ENDS.with_borrow_mut(|hook| hook.iter_mut().for_each(|hook| hook()));
+        let named = self.named.clone();
+        let mut state = named.lock();
+        let connection = self.current.as_mut().expect("a connection");
+        // `registered` for the connected binder starts no connection: kept here, or by none.
+        if state.latest.as_ref() == Some(&connection.binder) {
+            // The losses the drain counted stay counted: the live reader goes on past them.
+            connection.keep(&mut state);
+            return Step::Connected;
+        }
+        Step::Done(Err(self.finish_locked(state, Disconnected::Replaced)))
     }
 
     /// What a receive on the connection leads to: a result, or `None` to look again.
@@ -436,11 +624,13 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
         match received {
             Err(RecvError::Cancelled) => {
                 let state = &mut *self.named.lock();
-                if std::mem::take(&mut state.interrupted) {
+                if state.take_interrupt() {
                     return Some(Err(RecvError::Cancelled));
                 }
-                // A replacement ended the wait to be looked at; else the runtime could not run it.
-                (!state.replaced).then_some(Err(RecvError::Cancelled))
+                let current = self.current.as_ref();
+                let noticed = current.is_some_and(|c| c.subscriber.take_notice());
+                // A notice ended the wait to be looked at; else the runtime could not run it.
+                (!noticed && !state.replaced).then_some(Err(RecvError::Cancelled))
             }
             Err(RecvError::Closed(Closed::Evicted)) => Some(Err(self.evict())),
             Err(RecvError::Closed(closed)) => Some(Err(self.finish(Disconnected::Ended(closed)))),
@@ -448,8 +638,7 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
         }
     }
 
-    /// The publisher took the subscription out: drop the connection and make none again, since a
-    /// subscriber as slow as before would be taken out again (plan 15 §6.5).
+    /// Taken out: drop the connection and make none, as one as slow would be too (plan 15 §6.5).
     fn evict(&mut self) -> RecvError {
         let gone = self.current.take();
         if let Some(connection) = &gone {
@@ -478,22 +667,43 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
     /// Put a connection's fd in the subscriber's epoll instance, with [`Wake::Fd`].
     fn join(&self, subscriber: &Subscriber<T>) -> std::io::Result<()> {
         match (&self.named.fds, subscriber.wait_fd()) {
-            (Some(fds), Some(theirs)) => fds.join(theirs),
+            (Some(fds), Some(theirs)) => {
+                #[cfg(test)]
+                if NO_JOIN.get() {
+                    return Err(std::io::ErrorKind::OutOfMemory.into());
+                }
+                fds.join(theirs)
+            }
             _ => Ok(()),
         }
     }
 
     /// Drop the connection, look for the next publisher, and say why.
     fn finish(&mut self, why: Disconnected) -> RecvError {
+        let named = self.named.clone();
+        self.finish_locked(named.lock(), why)
+    }
+
+    /// [`finish`](Self::finish) under the lock in which the caller decided to.
+    fn finish_locked(
+        &mut self,
+        mut state: MutexGuard<'_, State<T>>,
+        why: Disconnected,
+    ) -> RecvError {
         let gone = self.current.take();
         if let Some(connection) = &gone {
             self.past += connection.subscriber.stats();
         }
-        let mut state = self.named.lock();
         state.connected = None;
         state.wake = None;
         state.replaced = false;
         let old = gone.as_ref().map(|connection| &connection.binder);
+        // Not by `why`: an ended topic refuses every later subscription, a dead binder every call.
+        let ended = gone.as_ref().filter(|c| c.subscriber.saw_publisher_end());
+        let forgotten = ended.and_then(|connection| {
+            let at = state.joined.iter().position(|j| *j == connection.binder);
+            at.map(|at| state.joined.swap_remove(at))
+        });
         let next = state
             .latest
             .clone()
@@ -501,7 +711,7 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
         if let Some(next) = next.filter(|_| !state.connecting) {
             state.connecting = true;
             drop(state);
-            self.named.connect(next);
+            self.named.connect(next, Duration::ZERO);
         } else {
             drop(state);
         }
@@ -512,14 +722,140 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
         }
         // Unmapped outside the lock.
         drop(gone);
+        drop(forgotten);
         RecvError::Disconnected(why)
     }
+
+    /// What ends the wait of the connection taken, as `registered` holds it, for a test.
+    #[cfg(all(
+        test,
+        not(loom),
+        not(miri),
+        any(target_os = "linux", target_os = "android"),
+        any(
+            target_pointer_width = "64",
+            all(target_arch = "x86", target_feature = "sse2"),
+            all(target_arch = "arm", target_has_atomic = "64")
+        )
+    ))]
+    pub(crate) fn connection_wake(&self) -> Option<Interrupter> {
+        self.named.lock().wake.clone()
+    }
+
+    /// Receives in a row of the connection's drain that did not move it, for a test.
+    #[cfg(all(
+        test,
+        not(loom),
+        not(miri),
+        any(target_os = "linux", target_os = "android"),
+        any(
+            target_pointer_width = "64",
+            all(target_arch = "x86", target_feature = "sse2"),
+            all(target_arch = "arm", target_has_atomic = "64")
+        )
+    ))]
+    pub(crate) fn drain_stalls(&self) -> u32 {
+        let drain = self.current.as_ref().and_then(|c| c.drain.as_ref());
+        drain.map_or(0, |drain| drain.stalls)
+    }
+
+    /// The publishers remembered as connected to before, for a test.
+    #[cfg(all(
+        test,
+        not(loom),
+        not(miri),
+        any(target_os = "linux", target_os = "android"),
+        any(
+            target_pointer_width = "64",
+            all(target_arch = "x86", target_feature = "sse2"),
+            all(target_arch = "arm", target_has_atomic = "64")
+        )
+    ))]
+    pub(crate) fn remembered(&self) -> usize {
+        self.named.lock().joined.len()
+    }
+
+    /// The connection's position and the end of its drain, for a test.
+    #[cfg(all(
+        test,
+        not(loom),
+        not(miri),
+        any(target_os = "linux", target_os = "android"),
+        any(
+            target_pointer_width = "64",
+            all(target_arch = "x86", target_feature = "sse2"),
+            all(target_arch = "arm", target_has_atomic = "64")
+        )
+    ))]
+    pub(crate) fn drain_position(&self) -> Option<(u64, u64)> {
+        let connection = self.current.as_ref()?;
+        let end = connection.drain.as_ref()?.end;
+        Some((connection.subscriber.position(), end))
+    }
+
+    /// The waiting state of the connection taken, for a test that raises a bit on it.
+    #[cfg(all(
+        test,
+        not(loom),
+        not(miri),
+        any(target_os = "linux", target_os = "android"),
+        any(
+            target_pointer_width = "64",
+            all(target_arch = "x86", target_feature = "sse2"),
+            all(target_arch = "arm", target_has_atomic = "64")
+        )
+    ))]
+    pub(crate) fn connection_local(&self) -> Option<Arc<crate::wait::Local<crate::wait::Parts>>> {
+        let connection = self.current.as_ref()?;
+        Some(connection.subscriber.local().clone())
+    }
+
+    /// The death recipient of the connection taken, for a test that runs it.
+    #[cfg(all(
+        test,
+        not(loom),
+        not(miri),
+        any(target_os = "linux", target_os = "android"),
+        any(
+            target_pointer_width = "64",
+            all(target_arch = "x86", target_feature = "sse2"),
+            all(target_arch = "arm", target_has_atomic = "64")
+        )
+    ))]
+    pub(crate) fn connection_death(&self) -> Option<crate::wait::Died> {
+        Some(self.current.as_ref()?.subscriber.death_notice())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set by a test: `join` then fails as `epoll_ctl` does with `ENOSPC` or `ENOMEM`.
+    #[cfg_attr(
+        target_os = "android",
+        expect(
+            clippy::missing_const_for_thread_local,
+            reason = "the initializer is `const`; Android's expansion of the macro hides that"
+        )
+    )]
+    pub(crate) static NO_JOIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set by a test: run between a drain's look that gave up lapped and the look after it.
+    pub(crate) static BETWEEN_LOOKS: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Set by a test: run by a drain that ends, before it takes the lock that decides how.
+    pub(crate) static BEFORE_DRAIN_ENDS: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Set by a test: run by `registered` past its unlock, before it wakes the connection's wait.
+    pub(crate) static BEFORE_REPLACE: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Set by a test: run by `interrupt` past its unlock, before it wakes the connection's wait.
+    pub(crate) static BEFORE_INTERRUPT: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Clear a pending interrupt, whether one was; the lock is released on return.
 #[cfg(feature = "tokio")]
 fn take_interrupt<T: Payload>(mut state: MutexGuard<'_, State<T>>) -> bool {
-    std::mem::take(&mut state.interrupted)
+    state.take_interrupt()
 }
 
 /// Where a receive stands after [`NamedSubscriber::step`].
@@ -547,19 +883,30 @@ impl<T: Payload + 'static> Wait for NamedSubscriber<T> {
             "prepare_wait: a subscription made with `Wake::Futex` has no file descriptor to poll"
         );
         let state = self.named.lock();
-        // A notice, a connection to take, a replacement's records or the end of an eviction: a
-        // receive returns at once.
+        // A notice, a connection, a replacement's records or an eviction: a receive returns now.
         if state.evicted || !state.notices.is_empty() || state.ready.is_some() || state.replaced {
             return false;
         }
         drop(state);
-        match self.current.as_mut() {
+        let armed = match self.current.as_mut() {
             Some(connection) => connection.subscriber.prepare_wait(),
             None => true,
+        };
+        // After every other reason: the interrupt's kick ends one poll, and is taken by it.
+        if !armed || !std::mem::take(&mut self.named.lock().kicked) {
+            return armed;
         }
+        if let Some(connection) = self.current.as_mut() {
+            connection.subscriber.finish_wait();
+        }
+        false
     }
 
     fn finish_wait(&mut self) {
+        assert!(
+            self.named.fds.is_some(),
+            "finish_wait: a subscription made with `Wake::Futex` has no file descriptor to poll"
+        );
         if let Some(fds) = &self.named.fds {
             fds.drain();
         }
@@ -606,10 +953,12 @@ impl<T: Payload> Named<T> {
         }
     }
 
-    /// Where a connection starts: the policy's place first, the new ring's oldest record after.
-    fn policy(&self, reconnect: bool) -> SubscriberPolicy {
+    /// Where a connection to `binder` starts, by the rule of [`NamedSubscriber`]'s documentation.
+    fn policy(&self, state: &State<T>, binder: &SIBinder) -> SubscriberPolicy {
         let mut policy = self.policy.clone();
-        if reconnect && policy.start != Start::Last {
+        if state.joined.contains(binder) {
+            policy.start = Start::Latest;
+        } else if state.later && policy.start != Start::Last {
             policy.start = Start::Oldest;
         }
         policy
@@ -633,8 +982,10 @@ impl<T: Payload + 'static> Named<T> {
             let wake = state.wake.clone();
             drop(state);
             self.signal();
+            #[cfg(test)]
+            BEFORE_REPLACE.with_borrow_mut(|hook| hook.iter_mut().for_each(|hook| hook()));
             if let Some(wake) = wake {
-                wake.interrupt();
+                wake.notice();
             }
             return;
         }
@@ -649,26 +1000,31 @@ impl<T: Payload + 'static> Named<T> {
         }
         state.connecting = true;
         drop(state);
-        self.connect(binder);
+        self.connect(binder, Duration::ZERO);
     }
 
-    /// Start the connection thread; the caller has set `connecting`.
-    fn connect(self: &Arc<Self>, binder: SIBinder) {
+    /// Start the connection thread, which asks `binder` after `after`; the caller set `connecting`.
+    fn connect(self: &Arc<Self>, binder: SIBinder, after: Duration) {
         let named = self.clone();
         let spawned = std::thread::Builder::new()
             .name("rsbinder-topic-connect".into())
-            .spawn(move || named.run(binder));
+            .spawn(move || named.run(binder, after));
         if spawned.is_err() {
             // The next registration of the name tries again.
             self.lock().connecting = false;
         }
     }
 
-    /// The connection thread: subscribe to `binder`, retrying while the refusal may change, and
-    /// moving to a newer binder of the name.
-    fn run(self: Arc<Self>, mut binder: SIBinder) {
+    /// The connection thread: subscribe to `binder` after `after`, retry, and move to a newer one.
+    fn run(self: Arc<Self>, mut binder: SIBinder, after: Duration) {
         let mut delay = FIRST_RETRY;
         let mut told = false;
+        if !after.is_zero() {
+            let state = self.hold(self.lock(), &binder, Instant::now() + after);
+            if let Some(newer) = state.latest.clone().filter(|latest| *latest != binder) {
+                binder = newer;
+            }
+        }
         loop {
             let policy = {
                 let mut state = self.lock();
@@ -676,7 +1032,7 @@ impl<T: Payload + 'static> Named<T> {
                     state.connecting = false;
                     return;
                 }
-                self.policy(state.reconnect)
+                self.policy(&state, &binder)
             };
             let result = Subscriber::<T>::request(&binder, &policy);
             let mut state = self.lock();
@@ -698,7 +1054,6 @@ impl<T: Payload + 'static> Named<T> {
                     }
                     state.ready = Some((subscriber, binder.clone()));
                     state.connected = Some(binder);
-                    state.reconnect = true;
                     state.connecting = false;
                     drop(state);
                     self.signal();
@@ -727,18 +1082,12 @@ impl<T: Payload + 'static> Named<T> {
                     if !told {
                         state.notices.push_back(Disconnected::Rejected(status));
                         told = true;
+                        drop(state);
                         self.signal();
+                        // `hold` looks at `latest`, `dropped` and `evicted` again under this lock.
+                        state = self.lock();
                     }
-                    let until = Instant::now() + delay;
-                    while !state.dropped && !state.evicted && state.latest.as_ref() == Some(&binder)
-                    {
-                        let now = Instant::now();
-                        if now >= until {
-                            break;
-                        }
-                        let waited = self.changed.wait_timeout(state, until - now);
-                        state = waited.expect("lock poisoned").0;
-                    }
+                    state = self.hold(state, &binder, Instant::now() + delay);
                     match state.latest.clone().filter(|latest| *latest != binder) {
                         Some(newer) => (binder, delay, told) = (newer, FIRST_RETRY, false),
                         None => delay = (delay * 2).min(LAST_RETRY),
@@ -748,17 +1097,92 @@ impl<T: Payload + 'static> Named<T> {
             }
         }
     }
+
+    /// Wait until `until`, the subscriber's drop or eviction, or another binder for the name.
+    fn hold<'s>(
+        &'s self,
+        mut state: MutexGuard<'s, State<T>>,
+        binder: &SIBinder,
+        until: Instant,
+    ) -> MutexGuard<'s, State<T>> {
+        while !state.dropped && !state.evicted && state.latest.as_ref() == Some(binder) {
+            let now = Instant::now();
+            if now >= until {
+                break;
+            }
+            let waited = self.changed.wait_timeout(state, until - now);
+            state = waited.expect("lock poisoned").0;
+        }
+        state
+    }
 }
 
 impl<T: Payload> Interrupt for Named<T> {
     fn interrupt(&self) {
         let mut state = self.lock();
         state.interrupted = true;
+        state.kicked = true;
         let wake = state.wake.clone();
         drop(state);
         self.signal();
+        #[cfg(test)]
+        BEFORE_INTERRUPT.with_borrow_mut(|hook| hook.iter_mut().for_each(|hook| hook()));
+        // A notice, not an interrupt: `interrupted` alone decides the one `Cancelled` it makes.
         if let Some(wake) = wake {
-            wake.interrupt();
+            wake.notice();
         }
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod drain_tests {
+    use super::{AfterLook, Drain};
+
+    /// What a drain to 32 decides after each of `looks`, given as (gave up, position).
+    fn decisions(looks: &[(bool, u64)]) -> Vec<AfterLook> {
+        let mut drain = Drain::new(32, 8);
+        let decided = looks
+            .iter()
+            .map(|&(gave_up, at)| drain.after_look(gave_up, at));
+        decided.collect()
+    }
+
+    #[test]
+    fn a_look_that_did_not_give_up_is_returned_and_not_counted() {
+        use AfterLook::*;
+        assert_eq!(decisions(&[(false, 8)]), [Return]);
+        assert_eq!(decisions(&[(false, 40)]), [Return]);
+        assert_eq!(decisions(&[(false, 8), (true, 8)]), [Return, Again]);
+        assert_eq!(
+            decisions(&[(true, 8), (false, 16), (true, 16)]),
+            [Again, Return, Settle]
+        );
+    }
+
+    #[test]
+    fn a_drain_settles_at_its_second_look_that_gave_up_short_of_its_end() {
+        use AfterLook::*;
+        assert_eq!(decisions(&[(true, 8), (true, 8)]), [Again, Settle]);
+        assert_eq!(decisions(&[(true, 8), (true, 24)]), [Again, Settle]);
+    }
+
+    #[test]
+    fn a_look_that_gave_up_at_the_end_or_past_it_settles_at_once() {
+        use AfterLook::*;
+        assert_eq!(decisions(&[(true, 32)]), [Settle]);
+        assert_eq!(decisions(&[(true, 40)]), [Settle]);
+        assert_eq!(decisions(&[(true, 24)]), [Again]);
+    }
+
+    #[test]
+    fn a_receive_that_reads_past_the_furthest_position_counts_no_stall() {
+        let mut drain = Drain::new(32, 8);
+        drain.count_stall(8);
+        drain.count_stall(8);
+        assert_eq!(drain.stalls, 2);
+        drain.count_stall(16);
+        assert_eq!((drain.stalls, drain.reach), (0, 16));
+        drain.count_stall(16);
+        assert_eq!(drain.stalls, 1);
     }
 }

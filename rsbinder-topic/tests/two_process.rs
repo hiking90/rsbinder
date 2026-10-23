@@ -14,6 +14,14 @@
 //! it answers on stdout with lines that start with `topic:` and exits when its stdin closes.
 //! The publisher's side counts its memfds (fds open on one, mappings of one), so the tests run
 //! one at a time.
+//!
+//! A reply whose fds the subscriber has no numbers for ends by driver. The C driver (`binder.c`,
+//! `binder_thread_read`, "fd fixups failed") answers it with `BR_FAILED_REPLY` and records no
+//! errno, which rsbinder reports as `FailedTransaction`. The Rust driver
+//! (`drivers/android/binder/transaction.rs`) drops the reply and sends `BR_FAILED_REPLY` only to
+//! the sender of a transaction, so the caller waits for ever, and the test returns before it.
+//! Either way the publisher added the subscription and holds the control page mapped; the
+//! subscriber, still alive, closed it, and the next commit takes the subscription out.
 
 #![cfg(any(target_os = "linux", target_os = "android"))]
 
@@ -180,8 +188,7 @@ fn lend(publisher: &Publisher<Bytes>, value: &[u8]) -> usize {
     at
 }
 
-/// AC-15.3.4: a slot pinned by a subscriber that is killed holding it is lent again once the
-/// death notification takes the subscription out.
+/// AC-15.3.4: a slot a killed subscriber pinned is lent again once its death takes it out.
 #[test]
 #[ignore = "needs a binder device and rsb_hub"]
 fn a_slot_a_killed_subscriber_pinned_is_lent_again() {
@@ -308,24 +315,21 @@ fn rust_binder() -> bool {
     std::path::Path::new("/sys/module/rust_binder").exists()
 }
 
+/// A reply with fds the subscriber has no numbers for: the C driver fails it; the Rust one hangs.
 #[test]
 #[ignore = "needs a binder device and rsb_hub"]
 fn a_reply_the_subscriber_cannot_take_leaves_its_page_closed() {
     if rust_binder() {
-        // `drivers/android/binder/transaction.rs`: a reply whose fds cannot be installed is
-        // dropped, and `BR_FAILED_REPLY` goes only to the sender of a transaction, so the
-        // caller waits for ever. The C driver returns `BR_FAILED_REPLY` to it (`binder.c`).
+        // The Rust driver drops a reply whose fds cannot be installed; the caller never returns.
         eprintln!("skipped: the Rust binder driver leaves the caller of a failed reply waiting");
         return;
     }
     let (name, publisher) = publish("nofile");
     let before = memfds();
     let peer = Peer::spawn("nofile", &name);
-    // EMFILE: the kernel had no fd number to give the topic memory in the reply.
-    assert_eq!(peer.says(), "failed: Errno(-24)");
-    // The publisher added the subscription and holds its control page, mapped, though the
-    // reply failed; the subscriber, still alive, closed the page, and the next commit takes
-    // the subscription out.
+    // The C driver's `BR_FAILED_REPLY`: no fd number for the topic memory, and no errno.
+    assert_eq!(peer.says(), "failed: FailedTransaction");
+    // The publisher still maps the page the subscriber closed; the next commit drops it.
     assert_eq!(memfds(), (before.0, before.1 + 1));
     publisher.publish(&Bytes(vec![1])).unwrap();
     assert_eq!(memfds(), before);
@@ -366,13 +370,26 @@ fn a_subscriber_reads_what_a_dead_publisher_committed_then_learns_it_died() {
     assert_eq!(subscriber.try_latest(), died);
 }
 
-/// AC-15.2.20: a subscriber of a name made before its publisher receives from it; after the
-/// publisher is killed and started again, one `Disconnected`, then the new one's first record.
+/// Whether the service manager is Android 10's, which has no notices and refuses a name subscriber.
+fn without_notices(name: &str) -> bool {
+    if rsbinder::sdk_at_least(30) {
+        return false;
+    }
+    let refused = NamedSubscriber::<Bytes>::subscribe(name, &SubscriberPolicy::default());
+    let refused = refused.err().map(|status| status.transaction_error());
+    assert_eq!(refused, Some(StatusCode::UnknownTransaction));
+    true
+}
+
+/// AC-15.2.20: across a publisher's restart, one `Disconnected`, then the new one's first record.
 #[test]
 #[ignore = "needs a binder device and rsb_hub"]
 fn a_name_subscriber_outlives_a_killed_publisher_and_reads_the_next_from_its_first_record() {
     init();
     let name = name("named");
+    if without_notices(&name) {
+        return;
+    }
     let policy = SubscriberPolicy::default();
     let mut subscriber = NamedSubscriber::<Bytes>::subscribe(&name, &policy).unwrap();
     assert!(!subscriber.wait_connected(Duration::from_millis(100)));
@@ -431,13 +448,15 @@ fn poll_until(
     }
 }
 
-/// AC-15.2.36: three name subscribers on one poll loop; one publisher is killed and started
-/// again, and its subscriber goes on through the same fds.
+/// AC-15.2.36: three name subscribers on one poll loop go on through the same fds past a restart.
 #[test]
 #[ignore = "needs a binder device and rsb_hub"]
 fn name_subscribers_on_one_poll_loop_go_on_through_a_killed_publisher() {
     init();
     let names = [name("loop.a"), name("loop.b"), name("loop.c")];
+    if without_notices(&names[0]) {
+        return;
+    }
     let mut peers: Vec<Peer> = names
         .iter()
         .map(|name| Peer::spawn("advertise", name))
@@ -694,9 +713,7 @@ fn signal(peer: &Peer, signal: rustix::process::Signal) {
     rustix::process::kill_process(pid, signal).unwrap();
 }
 
-/// AC-15.3.9: a subscriber in another process stopped while a ring behind is taken out once a
-/// publish has waited the timeout for it; a subscriber that keeps up loses nothing; and the
-/// stopped one, let go on, ends its subscription with `Closed(Evicted)`.
+/// AC-15.3.9: a subscriber stopped past the timeout is taken out and told; one keeping up isn't.
 #[test]
 #[ignore = "needs a binder device and rsb_hub"]
 fn a_subscriber_stopped_past_the_timeout_is_taken_out_and_told() {
@@ -726,8 +743,7 @@ fn a_subscriber_stopped_past_the_timeout_is_taken_out_and_told() {
     assert_eq!(peer.says(), "closed Evicted");
 }
 
-/// AC-15.3.11: a publish waiting for a subscriber whose process is killed ends with its death,
-/// well before the timeout, and takes nobody out.
+/// AC-15.3.11: a publish waiting for a killed subscriber ends at its death, before the timeout.
 #[test]
 #[ignore = "needs a binder device and rsb_hub"]
 fn a_wait_for_a_subscriber_that_dies_ends_with_its_death() {
@@ -848,8 +864,7 @@ fn child() {
         }
         "nofile" => {
             let topic = hub::check_service(&name).unwrap();
-            // The two lowest free fds go to the control page and the parcel's duplicate of it;
-            // the reply's fd would need the next.
+            // Two free fds: the control page and the parcel's copy; the reply's needs a third.
             let lowest = File::open("/dev/null").unwrap().as_raw_fd();
             let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
             let lowered = rustix::process::Rlimit {

@@ -9,11 +9,32 @@ use rsbinder::{Deserialize, ParcelableMetadata, Result, Serialize};
 /// A value a topic carries: a name both ends compare, and the codec that turns it into the bytes
 /// of one record and back.
 ///
-/// Every AIDL parcelable implements it — a type generated from `.aidl` or derived with
-/// `#[derive(rsbinder::Parcelable)]` — with the parcelable's descriptor as the name and
-/// [`rsbinder::to_bytes`]' encoding as the codec. A parcelable writes a length header, so a
-/// subscriber built against an older definition reads a record that has fields appended after
-/// it, as it would over binder. [`Bytes`] carries bytes as they are.
+/// Every AIDL parcelable implements it, with the parcelable's descriptor as the name and
+/// [`rsbinder::to_bytes`]' encoding as the codec. A topic between Rust processes defines its type
+/// with `#[derive(rsbinder::Parcelable)]` (rsbinder's `macros` feature) and no `.aidl`: the derive
+/// emits the code `.aidl` generates, so the record is the same either way. The descriptor names
+/// the package, since the derive's default is the bare type name, which a `Sample` of another
+/// crate shares:
+///
+/// ```
+/// #[derive(rsbinder::Parcelable, Debug, Default)]
+/// #[parcelable(descriptor = "my.package.Reading")]
+/// struct Reading {
+///     seq: i64,
+///     values: Vec<f64>,
+/// }
+///
+/// fn type_name<T: rsbinder_topic::Payload>() -> &'static str {
+///     T::type_name()
+/// }
+/// assert_eq!(type_name::<Reading>(), "my.package.Reading");
+/// ```
+///
+/// A `.aidl` parcelable is for a type whose definition another language shares, so that one file
+/// generates both ends; a shape the derive cannot express, a union for one, is written there too
+/// or implements this trait itself. A parcelable writes a length header, so a subscriber built
+/// against an older definition reads a record that has fields appended after it, as it would over
+/// binder. [`Bytes`] carries bytes as they are.
 ///
 /// A type of the application's own may implement it to use another codec. The name is all the
 /// two ends compare when a subscription is set up, so two implementations that share a name and

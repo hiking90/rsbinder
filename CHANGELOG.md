@@ -53,8 +53,9 @@ Each item below changes what a 0.12.0 program observes.
   two refusals, both `BadValue`: `MappedHeap::from_fd` — and what maps a
   received fd through it: `SharedMemory::from_fd`, `Parcel::read_blob`, an
   `IMemory` from a peer — refuses an fd the kernel reports as a hugetlbfs
-  file, and on a 32-bit target it and `MemoryHeapBase::new` refuse a region
-  of more than `isize::MAX` bytes. 0.12.0 passed both to `mmap`. A
+  file, and on a 32-bit target it and `MemoryHeapBase::new` without
+  `FLAG_DONT_MAP_LOCALLY` refuse a region of more than `isize::MAX` bytes.
+  0.12.0 passed both to `mmap`. A
   hugetlbfs mapping then could not be unmapped when the heap was dropped,
   and a region that large is more than the slices the heap's accessors
   build may span. AOSP's `MemoryHeapBase` and `SharedMemory` make ordinary

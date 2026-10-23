@@ -31,15 +31,21 @@ pub trait Sealed {}
 /// ```
 ///
 /// [`prepare_wait`](Self::prepare_wait) tells the publisher that the subscriber waits, then looks
-/// once more; [`finish_wait`](Self::finish_wait) empties the fd and tells it the wait is over.
+/// once more; [`finish_wait`](Self::finish_wait) drains the fd and tells it the wait is over.
 /// Between them the publisher's next commit makes the fd readable, and so do the death of the
-/// publisher's process and an [`Interrupter`](crate::Interrupter). An interrupt ends no wait of
-/// this kind: it stays for the next receive that waits, such as `recv`.
+/// publisher's process, the publisher taking the subscription out (`try_recv` then returns
+/// [`Closed::Evicted`](crate::Closed::Evicted)), and an [`Interrupter`](crate::Interrupter). An
+/// interrupt makes the next `prepare_wait` return `false`, and each wake it sends ends the poll in
+/// progress or, sent after that poll drained the fd, a later one at once ([`wait_any`] counts the
+/// calls that return for it). It is not taken: it stays for the next receive that waits, such as
+/// `recv`, which returns [`RecvError::Cancelled`](crate::RecvError::Cancelled). `try_recv` does
+/// not see it.
 ///
 /// The fd is the same for the life of the subscriber, a `NamedSubscriber`'s through every
-/// reconnection. Register it once, level-triggered or edge-triggered: `finish_wait` empties what
-/// made it readable. A `NamedSubscriber` also ends a poll when its connection changes: a notice
-/// to return, a connection to take; its `try_recv` then returns it.
+/// reconnection. Register it once, level-triggered or edge-triggered: bytes a `finish_wait` leaves
+/// make the next `prepare_wait` return `false`, so no poll sleeps on readiness it was told of
+/// already. A `NamedSubscriber` also ends a poll when its connection changes: a notice to return,
+/// a connection to take; its `try_recv` then returns it.
 pub trait Wait: Sealed {
     /// The fd to poll for readability: a `Subscriber`'s end of its wake socket, or a
     /// `NamedSubscriber`'s epoll instance, which holds its current connection's fd and an
@@ -48,8 +54,12 @@ pub trait Wait: Sealed {
     fn wait_fd(&self) -> Option<BorrowedFd<'_>>;
 
     /// Start a wait: `true` when the caller should poll, then call
-    /// [`finish_wait`](Self::finish_wait). `false` when a record is unread or the publisher's
-    /// process has died, and receiving returns at once; there is nothing to finish then.
+    /// [`finish_wait`](Self::finish_wait). `false` when a record is unread, the publisher's
+    /// process has died, or the publisher took the subscription out, and receiving returns at
+    /// once; when an interrupt came that no `prepare_wait` has returned `false` for, also after a
+    /// poll the interrupt's wake ended, and then this call is that one; or while a publisher
+    /// keeps the fd fuller than one `finish_wait` empties, as each call empties a part, so that
+    /// no wait takes the thread for longer than a few reads. There is nothing to finish then.
     ///
     /// # Panics
     ///
@@ -67,21 +77,35 @@ pub trait Wait: Sealed {
 
 /// Wait until one of `waits` may have a record to receive, or `timeout` passes.
 ///
-/// `Ok(true)` when one of them may: a record was committed, the publisher's process died, or an
-/// interrupt was sent; receive from each with `try_recv` until it returns
-/// [`RecvError::Empty`](crate::RecvError::Empty). `Ok(false)` when `timeout` passed first; no
-/// timeout waits without a bound, and so does one too long for an `Instant`. An error is what
-/// `poll(2)` failed with.
+/// `Ok(true)` when one of them may: a record was committed, the publisher's process died, the
+/// publisher took the subscription out, or an interrupt was sent; receive from each with
+/// `try_recv` until it returns [`RecvError::Empty`](crate::RecvError::Empty). `Ok(false)` when
+/// `timeout` passed first; no timeout waits without a bound, and so does one too long for an
+/// `Instant`. An error is what `poll(2)` failed with.
+///
+/// One interrupt makes at most two calls return for a [`Subscriber`](crate::Subscriber) and
+/// three for a [`NamedSubscriber`](crate::NamedSubscriber): the one whose `prepare_wait` returns
+/// `false` for it, and one for each wake it sends, which ends the call in progress or, sent after
+/// that call drained the fd, a later one at once. A `Subscriber` is sent at most one wake, only
+/// while a wait of it is armed, from `prepare_wait` to `finish_wait`; a `NamedSubscriber` two,
+/// its own, sent whether or not a call is in progress, and its connection's. The call after them
+/// sleeps until something else happens.
 ///
 /// # Panics
 ///
-/// When one of `waits` was made with [`Wake::Futex`](crate::Wake::Futex).
+/// When one of `waits` was made with [`Wake::Futex`](crate::Wake::Futex), and when `waits` is
+/// empty and the wait has no bound: nothing would end it. Empty with a bound, it sleeps until
+/// `timeout` passes and returns `Ok(false)`.
 pub fn wait_any(waits: &mut [&mut dyn Wait], timeout: Option<Duration>) -> io::Result<bool> {
     assert!(
         waits.iter().all(|wait| wait.wait_fd().is_some()),
         "wait_any: a subscription made with `Wake::Futex` has no file descriptor to poll"
     );
     let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
+    assert!(
+        !waits.is_empty() || deadline.is_some(),
+        "wait_any: no subscription to wait for, and no bound on the wait"
+    );
     let mut armed = 0;
     while armed < waits.len() && waits[armed].prepare_wait() {
         armed += 1;

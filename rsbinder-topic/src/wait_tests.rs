@@ -53,6 +53,12 @@ fn eventually(what: &str, mut holds: impl FnMut() -> bool) {
     }
 }
 
+/// Join `receiving` once it returns, failing after 10 s: a lost wake fails a test, not hangs it.
+fn joined<T>(receiving: thread::JoinHandle<T>) -> T {
+    eventually("the receive returns", || receiving.is_finished());
+    receiving.join().unwrap()
+}
+
 /// `recv` on a thread of its own, once the subscriber sleeps; its results by value.
 fn asleep(
     mut subscriber: Subscriber<Bytes>,
@@ -69,8 +75,31 @@ fn a_receive_sleeps_until_the_publisher_commits_and_one_wake_ends_it() {
     let publisher = topic(64 << 10);
     let receiving = asleep(subscriber(&publisher), Subscriber::recv);
     publisher.publish(&num(7)).unwrap();
-    assert_eq!(receiving.join().unwrap(), Ok(7));
+    assert_eq!(joined(receiving), Ok(7));
     assert_eq!(publisher.wakes(), 1);
+}
+
+/// A wait that unwinds between its arm and its sleep is disarmed: `parked` and `WAITING` down.
+#[test]
+fn a_wait_that_unwinds_before_it_sleeps_is_disarmed() {
+    let publisher = topic(64 << 10);
+    let mut subscriber = subscriber(&publisher);
+    let local = subscriber.local().clone();
+    *local.before_sleep.lock().unwrap() = Some(Box::new(|| panic!("a sleep that unwinds")));
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| subscriber.recv()));
+    // The pause's own panic: an unwind past the arm, not one before it.
+    let payload = unwound.expect_err("the sleep unwinds");
+    assert_eq!(
+        payload.downcast_ref::<&str>(),
+        Some(&"a sleep that unwinds")
+    );
+    let state = local.words().control.state().load(Ordering::SeqCst);
+    let (parked, waiting) = (local.is_parked(), state & crate::layout::WAITING != 0);
+    if parked {
+        // Its drop would wake a wait left `parked` until it is out, which it never is.
+        std::mem::forget(subscriber);
+    }
+    assert!(!parked && !waiting, "parked {parked}, WAITING {waiting}");
 }
 
 /// AC-15.2.6: no subscriber sleeps, so no publish makes a system call.
@@ -98,7 +127,7 @@ fn one_publish_wakes_eight_sleeping_subscribers_with_one_system_call() {
     publisher.publish(&num(1)).unwrap();
     assert_eq!(publisher.wakes(), 1);
     for receiving in receiving {
-        assert_eq!(receiving.join().unwrap(), Ok(1));
+        assert_eq!(joined(receiving), Ok(1));
     }
 }
 
@@ -120,7 +149,7 @@ fn a_hundred_publishes_before_the_woken_wait_ends_send_one_wake() {
     }
     assert_eq!(publisher.wakes(), 1);
     release.store(true, Ordering::SeqCst);
-    assert_eq!(receiving.join().unwrap(), Ok(0));
+    assert_eq!(joined(receiving), Ok(0));
 }
 
 /// AC-15.2.37: `publish_all` wakes once.
@@ -130,7 +159,7 @@ fn a_batch_is_announced_with_one_wake() {
     let receiving = asleep(subscriber(&publisher), Subscriber::recv);
     assert_eq!(publisher.publish_all(&[num(1), num(2), num(3)]), Ok(3));
     assert_eq!(publisher.wakes(), 1);
-    assert_eq!(receiving.join().unwrap(), Ok(1));
+    assert_eq!(joined(receiving), Ok(1));
 }
 
 /// AC-15.2.37: the end reaches a sleeping subscriber with the status it was given.
@@ -141,7 +170,7 @@ fn a_close_wakes_a_sleeping_subscriber_with_its_status() {
     let status = Status::new_service_specific_error(5, Some("over".into()));
     publisher.close(&status);
     assert_eq!(
-        receiving.join().unwrap(),
+        joined(receiving),
         Err(RecvError::Closed(Closed::Status(status)))
     );
 
@@ -149,10 +178,7 @@ fn a_close_wakes_a_sleeping_subscriber_with_its_status() {
     let publisher = topic(64 << 10);
     let receiving = asleep(subscriber(&publisher), Subscriber::recv);
     drop(publisher);
-    assert_eq!(
-        receiving.join().unwrap(),
-        Err(RecvError::Closed(Closed::End))
-    );
+    assert_eq!(joined(receiving), Err(RecvError::Closed(Closed::End)));
 }
 
 /// AC-15.2.37: a bounded wait ends at its bound, and the subscription goes on.
@@ -185,7 +211,7 @@ fn the_latest_receive_waits_then_skips_to_the_newest() {
     let publisher = topic(64 << 10);
     let receiving = asleep(subscriber(&publisher), Subscriber::recv_latest);
     assert_eq!(publisher.publish_all(&[num(1), num(2), num(3)]), Ok(3));
-    assert_eq!(receiving.join().unwrap(), Ok(3));
+    assert_eq!(joined(receiving), Ok(3));
 }
 
 /// AC-15.2.1: eight subscribers that keep up receive every record, in the same order.
@@ -292,7 +318,7 @@ fn ten_thousand_interrupts_of_a_waiter_that_waits_again_all_return() {
         most = most.max(interrupter.interrupt_counting());
     }
     publisher.publish(&num(0)).unwrap();
-    assert_eq!(receiving.join().unwrap(), 10_000);
+    assert_eq!(joined(receiving), 10_000);
     assert!(most >= 1, "every interrupt found the wait asleep");
     assert!(
         most <= WAKES_PER_INTERRUPT,
@@ -300,8 +326,7 @@ fn ten_thousand_interrupts_of_a_waiter_that_waits_again_all_return() {
     );
 }
 
-/// The wakes one `interrupt` may send: 2 to 4 alone, 66 seen beside a build; a raise that wakes
-/// at every look without yielding sends thousands.
+/// Wakes one `interrupt` may send: 2 to 4 alone, 66 beside a build; without yielding, thousands.
 const WAKES_PER_INTERRUPT: usize = 256;
 
 /// AC-15.2.11 within a process: an interrupt ends eight waits within a second, a thousand times.
@@ -350,9 +375,7 @@ fn an_interrupt_before_the_wait_ends_the_next_one() {
     interrupter.interrupt();
 }
 
-/// A commit whose look at `state` comes after a newer wait raised `WAITING` wakes that wait
-/// before it sleeps, which is no wake for it: it sleeps on the `seq` the commit made. The next
-/// commit must wake it all the same.
+/// A wake that lands before a wait on that commit's `seq` sleeps: the next commit still wakes it.
 #[test]
 fn a_wake_sent_before_the_wait_sleeps_does_not_stand_for_the_next_commit() {
     a_commit_after_a_wait_that_saw_the_last(Wake::Futex);
@@ -424,8 +447,7 @@ fn a_commit_after_a_wait_that_saw_the_last(wake: Wake) {
     assert_eq!(sent, 1);
 }
 
-/// AC-15.2.33: each subscription named with its caller; what was published, and what each
-/// subscriber's control page reports.
+/// AC-15.2.33: each subscription named with its caller, what was published, each control page's.
 #[test]
 fn a_publishers_stats_name_its_subscriptions_and_count_its_records() {
     let publisher = topic(64 << 10);
@@ -473,7 +495,7 @@ fn a_waiting_subscriber_is_reported_waiting() {
     eventually("the subscriber sleeps", || local.is_parked());
     assert!(publisher.stats().subscribers[0].waiting);
     publisher.publish(&num(4)).unwrap();
-    assert_eq!(receiving.join().unwrap(), Ok(4));
+    assert_eq!(joined(receiving), Ok(4));
     // The thread dropped its subscriber, which the next look takes out.
     assert!(publisher.stats().subscribers.is_empty());
 }
@@ -536,8 +558,10 @@ mod pool {
     use std::task::{Context, Poll, Waker};
 
     use super::*;
+    use crate::wait::{Local, Parts, Slept, ABANDON, DIED};
+    use crate::Interrupter;
 
-    /// A runtime whose drop waits 1 s at most for the pool: a stuck wait fails, not hangs, a test.
+    /// A runtime whose drop waits at most 1 s for the pool: a wait stuck there is left behind.
     struct Pool(Option<tokio::runtime::Runtime>);
 
     impl std::ops::Deref for Pool {
@@ -575,6 +599,32 @@ mod pool {
         assert!(matches!(polled, Poll::Pending), "nothing to receive yet");
     }
 
+    /// `abandon`, dropping the future only once a pool thread sleeps in its wait.
+    fn abandon_asleep(runtime: &tokio::runtime::Runtime, subscriber: &mut Subscriber<Bytes>) {
+        let local = subscriber.local().clone();
+        let _enter = runtime.enter();
+        let mut future = std::pin::pin!(subscriber.recv_async());
+        // Polled until then: it may first join the wait of a receive that found a record.
+        eventually("the wait sleeps on the pool", || {
+            let polled = future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()));
+            assert!(matches!(polled, Poll::Pending), "nothing to receive yet");
+            local.is_parked()
+        });
+    }
+
+    /// Start a `recv_async` and leak it mid-wait: with no drop, its wait stays handed over.
+    fn leak(runtime: &tokio::runtime::Runtime, subscriber: &mut Subscriber<Bytes>) {
+        let _enter = runtime.enter();
+        let mut future = Box::pin(subscriber.recv_async());
+        let polled = future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()));
+        assert!(matches!(polled, Poll::Pending), "nothing to receive yet");
+        std::mem::forget(future);
+    }
+
     #[test]
     fn an_async_receive_waits_on_the_pool() {
         let runtime = runtime();
@@ -584,6 +634,7 @@ mod pool {
         let receiving = runtime.spawn(async move { subscriber.recv_async().await });
         eventually("the wait sleeps", || local.is_parked());
         publisher.publish(&num(9)).unwrap();
+        eventually("the receive returns", || receiving.is_finished());
         let got = runtime.block_on(receiving).unwrap();
         assert_eq!(got.map(|bytes| value(&bytes)), Ok(9));
     }
@@ -611,7 +662,11 @@ mod pool {
         };
         let rounds = |subscriber: &mut Subscriber<Bytes>, from: u32, to: u32, delay| {
             for n in from..to {
-                abandon(&runtime, subscriber);
+                // Half the drops race the pool thread for the wait, half wake it from its sleep.
+                match n % 2 {
+                    0 => abandon(&runtime, subscriber),
+                    _ => abandon_asleep(&runtime, subscriber),
+                }
                 let wakes = publisher.wakes();
                 send.send((n, delay)).unwrap();
                 let started = Instant::now();
@@ -653,6 +708,264 @@ mod pool {
         eventually("no wait is left on the pool", || {
             !subscriber.leftover().busy()
         });
+    }
+
+    /// A wait queued behind the pool's one busy thread is taken back at its drop and never runs.
+    #[test]
+    fn a_wait_the_pool_has_not_started_is_taken_back_when_its_future_drops() {
+        let (runtime, release) = held_pool();
+        let publisher = topic(64 << 10);
+        let mut subscriber = subscriber(&publisher);
+        abandon(&runtime, &mut subscriber);
+        assert!(!subscriber.leftover().busy(), "taken back at the drop");
+        let stop = subscriber.local().stop_bits();
+        assert_eq!(stop & ABANDON, 0, "no wait to end");
+        publisher.publish(&num(7)).unwrap();
+        let got = subscriber.recv_timeout(Duration::from_millis(100));
+        assert_eq!(got.map(|bytes| value(&bytes)), Ok(7));
+        release.send(()).unwrap();
+        // Queued after the closure of the wait taken back, on the one thread: it runs after it.
+        let after = runtime.spawn_blocking(|| ());
+        runtime.block_on(after).unwrap();
+        let arms = subscriber.local().arms.load(Ordering::Relaxed);
+        assert_eq!(arms, 0, "the closure of the wait taken back made a wait");
+    }
+
+    /// A busy pool, a dropped `recv_async`: a bounded receive sleeps on its own to its deadline.
+    #[test]
+    fn a_bounded_receive_after_a_wait_taken_back_sleeps_on_its_own_to_its_deadline() {
+        let (runtime, release) = held_pool();
+        let publisher = topic(64 << 10);
+        let mut subscriber = subscriber(&publisher);
+        abandon(&runtime, &mut subscriber);
+        let started = Instant::now();
+        let got = subscriber.recv_timeout(Duration::from_millis(100));
+        let took = started.elapsed();
+        release.send(()).unwrap();
+        assert_eq!(got.map(|bytes| value(&bytes)), Err(RecvError::Timeout));
+        assert!(took < Duration::from_secs(1), "{took:?}");
+        let parks = &subscriber.trace.parks;
+        let slept = parks.iter().any(|(slept, ..)| *slept == Slept::TimedOut);
+        assert!(slept, "joined in {:?}", subscriber.trace.join);
+    }
+
+    /// A busy pool, a dropped `recv_async`, then a record: no receive waits for the pool.
+    #[test]
+    fn a_record_committed_after_a_receive_behind_a_wait_taken_back_began_ends_it() {
+        let (runtime, release) = held_pool();
+        let publisher = Arc::new(topic(64 << 10));
+        let mut subscriber = subscriber(&publisher);
+        abandon(&runtime, &mut subscriber);
+        let publishing = {
+            let publisher = publisher.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(50));
+                publisher.publish(&num(7)).unwrap();
+            })
+        };
+        let started = Instant::now();
+        let got = subscriber.recv_timeout(Duration::from_secs(5));
+        let took = started.elapsed();
+        release.send(()).unwrap();
+        publishing.join().unwrap();
+        assert_eq!(got.map(|bytes| value(&bytes)), Ok(7));
+        assert!(took < Duration::from_secs(1), "the receive waited {took:?}");
+    }
+
+    /// An interrupt before a receive behind a dropped `recv_async` on a busy pool ends it at once.
+    #[test]
+    fn an_interrupt_before_a_receive_after_a_wait_taken_back_ends_it_at_once() {
+        let (runtime, release) = held_pool();
+        let publisher = topic(64 << 10);
+        let mut subscriber = subscriber(&publisher);
+        abandon(&runtime, &mut subscriber);
+        subscriber.interrupter().interrupt();
+        let started = Instant::now();
+        let got = subscriber.recv_timeout(Duration::from_secs(1));
+        let took = started.elapsed();
+        release.send(()).unwrap();
+        assert_eq!(got.map(|bytes| value(&bytes)), Err(RecvError::Cancelled));
+        assert!(took < Duration::from_millis(500), "{took:?}");
+    }
+
+    /// A wait dropped once a pool thread sleeps in it is woken, and that thread leaves it.
+    #[test]
+    fn a_wait_the_pool_runs_is_woken_when_its_future_drops() {
+        let runtime = runtime();
+        let publisher = topic(64 << 10);
+        let mut subscriber = subscriber(&publisher);
+        abandon_asleep(&runtime, &mut subscriber);
+        let local = subscriber.local();
+        assert!(!local.is_parked(), "the drop returns once the wait is out");
+        let started = Instant::now();
+        eventually("the left wait ends", || !subscriber.leftover().busy());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(local.stop_bits() & ABANDON, 0, "the wait takes its own");
+    }
+
+    /// The closure of a wait taken back runs on an empty hand: the next hand-off is its own.
+    #[test]
+    fn a_hand_off_after_a_wait_taken_back_is_not_settled_by_its_closure() {
+        let (runtime, release) = held_pool();
+        let publisher = topic(64 << 10);
+        let mut subscriber = subscriber(&publisher);
+        abandon(&runtime, &mut subscriber);
+        let local = subscriber.local().clone();
+        let left = subscriber.leftover().clone();
+        // Its closure queues behind the empty one.
+        let receiving = runtime.spawn(async move { subscriber.recv_async().await });
+        eventually("the second wait is handed over", || left.busy());
+        release.send(()).unwrap();
+        eventually("the second wait sleeps on the pool", || local.is_parked());
+        assert!(left.busy(), "the empty closure settled the second wait");
+        publisher.publish(&num(7)).unwrap();
+        eventually("the receive returns", || receiving.is_finished());
+        let got = runtime.block_on(receiving).unwrap();
+        assert_eq!(got.map(|bytes| value(&bytes)), Ok(7));
+        assert!(!left.busy());
+    }
+
+    /// A hand-off that unwinds, as `spawn_blocking` outside a runtime does, leaves no wait out.
+    #[test]
+    fn a_hand_off_that_unwinds_leaves_no_wait_out() {
+        let publisher = topic(64 << 10);
+        let mut subscriber = subscriber(&publisher);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut future = std::pin::pin!(subscriber.recv_async());
+            let _ = future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()));
+        }));
+        assert!(unwound.is_err(), "no runtime to hand the wait to");
+        assert!(!subscriber.leftover().busy());
+    }
+
+    /// A runtime whose one blocking thread is busy until the sender sends, for 10 s at most.
+    fn held_pool() -> (Pool, mpsc::Sender<()>) {
+        let runtime = Pool(Some(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .max_blocking_threads(1)
+                .build()
+                .unwrap(),
+        ));
+        let (release, held) = mpsc::channel::<()>();
+        let _holding = runtime.spawn_blocking(move || held.recv_timeout(Duration::from_secs(10)));
+        (runtime, release)
+    }
+
+    /// Until `holds` does, for 1 s at most; whether it did.
+    fn within_a_second(mut holds: impl FnMut() -> bool) -> bool {
+        let end = Instant::now() + Duration::from_secs(1);
+        while !holds() {
+            if Instant::now() >= end {
+                return false;
+            }
+            thread::sleep(Duration::from_micros(50));
+        }
+        true
+    }
+
+    /// A busy pool, a dropped `recv_async`, then a `recv` that sleeps: `raise` ends it in 1 s.
+    fn a_receive_after_a_wait_taken_back_ends_at(
+        raise: impl FnOnce(&Interrupter, &Local<Parts>),
+        ends: RecvError,
+    ) -> Subscriber<Bytes> {
+        let (runtime, release) = held_pool();
+        let publisher = topic(64 << 10);
+        let mut subscriber = subscriber(&publisher);
+        abandon(&runtime, &mut subscriber);
+        let (local, interrupter) = (subscriber.local().clone(), subscriber.interrupter());
+        let (send, got) = mpsc::channel();
+        let receiving = thread::spawn(move || {
+            send.send(subscriber.recv().map(|bytes| value(&bytes)))
+                .unwrap();
+            subscriber
+        });
+        let parked = within_a_second(|| local.is_parked());
+        raise(&interrupter, &local);
+        let ended = got.recv_timeout(Duration::from_secs(1));
+        release.send(()).unwrap();
+        assert_eq!(ended, Ok(Err(ends)));
+        assert!(parked, "the receive slept on its own");
+        receiving.join().unwrap()
+    }
+
+    #[test]
+    fn an_interrupt_ends_a_receive_after_a_wait_taken_back_from_a_busy_pool() {
+        let interrupt = |interrupter: &Interrupter, _: &_| interrupter.interrupt();
+        a_receive_after_a_wait_taken_back_ends_at(interrupt, RecvError::Cancelled);
+    }
+
+    #[test]
+    fn a_notice_ends_a_receive_after_a_wait_taken_back_from_a_busy_pool() {
+        let notice = |interrupter: &Interrupter, _: &_| interrupter.notice();
+        let subscriber = a_receive_after_a_wait_taken_back_ends_at(notice, RecvError::Cancelled);
+        assert!(subscriber.take_notice(), "the receive leaves the bit up");
+    }
+
+    #[test]
+    fn a_death_ends_a_receive_after_a_wait_taken_back_from_a_busy_pool() {
+        let died = |_: &_, local: &Local<_>| {
+            local.raise(DIED);
+        };
+        let ends = RecvError::Closed(Closed::PublisherDied);
+        a_receive_after_a_wait_taken_back_ends_at(died, ends);
+    }
+
+    /// Records behind a leaked wait the pool has not run: receives with no bound get them at once.
+    #[test]
+    fn an_unbounded_receive_behind_a_leaked_wait_the_pool_has_not_run_returns_the_record() {
+        let (runtime, release) = held_pool();
+        let publisher = topic(64 << 10);
+        let mut subscriber = subscriber(&publisher);
+        leak(&runtime, &mut subscriber);
+        publisher.publish(&num(7)).unwrap();
+        publisher.publish(&num(8)).unwrap();
+        {
+            let _enter = runtime.enter();
+            let mut future = std::pin::pin!(subscriber.recv_async());
+            let polled = future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()));
+            let polled = polled.map(|got| got.map(|bytes| value(&bytes)));
+            assert_eq!(polled, Poll::Ready(Ok(7)), "async");
+        }
+        assert!(subscriber.leftover().busy(), "the left wait is queued");
+        let (send, got) = mpsc::channel();
+        let receiving = thread::spawn(move || {
+            send.send(subscriber.recv().map(|bytes| value(&bytes)))
+                .unwrap();
+            subscriber
+        });
+        let first = got.recv_timeout(Duration::from_secs(1));
+        release.send(()).unwrap();
+        assert_eq!(first, Ok(Ok(8)), "sync");
+        let subscriber = receiving.join().unwrap();
+        eventually("the left wait ends", || !subscriber.leftover().busy());
+    }
+
+    /// A record committed while a bounded receive joins a leaked wait the pool has not run.
+    #[test]
+    fn a_bounded_receive_gets_a_record_committed_while_it_joins_a_leaked_wait() {
+        let (runtime, release) = held_pool();
+        let publisher = Arc::new(topic(64 << 10));
+        let mut subscriber = subscriber(&publisher);
+        leak(&runtime, &mut subscriber);
+        {
+            let publisher = publisher.clone();
+            // Committed past the look before the join, as the join begins.
+            *subscriber.leftover().before_join.lock().unwrap() = Some(Box::new(move || {
+                publisher.publish(&num(7)).unwrap();
+            }));
+        }
+        let got = subscriber.recv_timeout(Duration::from_secs(1));
+        // Set only past the join: a look before it that found the record leaves it zero.
+        let joined_for = subscriber.trace.join;
+        release.send(()).unwrap();
+        assert_eq!(got.map(|bytes| value(&bytes)), Ok(7));
+        assert!(joined_for >= Duration::from_millis(500), "{joined_for:?}");
+        eventually("the left wait ends", || !subscriber.leftover().busy());
     }
 
     /// AC-15.2.11 within a process: dropped async receives leave the pool within a second.

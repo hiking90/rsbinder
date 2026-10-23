@@ -703,7 +703,7 @@ impl<T: Element> MessageQueue<T> {
         }
     }
 
-    /// The transfer is committed, so a failed wake is logged rather than returned (libfmq does too).
+    /// The transfer is committed, so a failed wake is logged, not returned (libfmq does too).
     fn wake_after_commit(&self, bits: u32) {
         let Some(flag) = &self.flag else { return };
         if let Err(e) = flag.wake(bits) {

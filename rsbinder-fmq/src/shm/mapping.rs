@@ -162,7 +162,7 @@ impl Mapping {
     /// [`len`](Self::len) bytes from here are mapped.
     #[inline]
     pub fn as_ptr(&self) -> NonNull<u8> {
-        // `delta < len` (`map` rejects an empty extent): inside the mapping, so the add never saturates.
+        // `map` refuses an empty extent: `delta < len`, so the add never saturates.
         self.base.map_addr(|addr| addr.saturating_add(self.delta))
     }
 

@@ -229,7 +229,8 @@ fn pool_memory_is_written_through_one_mapping_and_read_through_another() {
 #[test]
 fn an_fd_that_is_not_the_pool_its_endpoint_states_is_not_mapped() {
     let map = |fd: BorrowedFd<'_>, slots, slot_bytes| {
-        bad_value(map_pool(fd, slots, slot_bytes, MAX_POOL as usize).map(|_| ()))
+        let max = usize::try_from(MAX_POOL).unwrap_or(usize::MAX);
+        bad_value(map_pool(fd, slots, slot_bytes, max).map(|_| ()))
     };
     let (fd, _stored) = create_pool(3, 64, false).unwrap();
     let size = pool_size(3, 64).unwrap() as usize;

@@ -13,8 +13,9 @@
 //! the send buffer of the end it is given to the kernel's least, whatever the subscriber set.
 //!
 //! A wake from the subscriber's process (a death notice, an interrupt) is a byte sent on the
-//! duplicate: the polled end is the one fd to wait on, and a byte stays until the wait drains
-//! it, so one lands whenever it is sent. Whose byte it was does not matter: a wake only ends a
+//! duplicate while a wait is `parked`, again until one is queued (`ENOBUFS`), and none while no
+//! wait is (`Local::raise`): the polled end is the one fd to wait on. A byte stands for no event,
+//! whose byte it was does not matter, and one drained unread loses nothing: a wake only ends a
 //! sleep, and the waiter then looks at its bits and the ring. The duplicate keeps the socket open
 //! after the publisher's process dies, so that death is told by the death notice, not by an end
 //! of file; an end of file is a publisher that shut the socket down, taken as its death too.
@@ -27,6 +28,7 @@ pub(crate) use imp::*;
 mod imp {
     use std::io;
     use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
     use rustix::event::epoll::{self, EventData, EventFlags};
@@ -39,6 +41,9 @@ mod imp {
 
     /// The longest single `poll` timeout; a longer wait polls again. `i32` seconds fit every ABI.
     const MAX_POLL: Duration = Duration::from_secs(i32::MAX as u64);
+
+    /// The reads of one [`FdWake::drain`], 4 KiB in all.
+    const DRAIN_READS: usize = 16;
 
     /// A socket pair for one subscription, which the subscriber makes: the end the publisher
     /// sends on, then the end the subscriber polls.
@@ -90,12 +95,23 @@ mod imp {
     pub(crate) struct FdWake {
         socket: OwnedFd,
         local: OwnedFd,
+        /// The last drain stopped at its bound: bytes are left that no new edge announces.
+        unread: AtomicBool,
+        /// Set by a test: this many sends of this process queue no byte, as at `ENOBUFS`.
+        #[cfg(test)]
+        pub(crate) failing: std::sync::atomic::AtomicU32,
     }
 
     impl FdWake {
         /// The end polled, and a duplicate of the publisher's end.
         pub(crate) fn new(socket: OwnedFd, local: OwnedFd) -> io::Result<Self> {
-            Ok(Self { socket, local })
+            Ok(Self {
+                socket,
+                local,
+                unread: AtomicBool::new(false),
+                #[cfg(test)]
+                failing: std::sync::atomic::AtomicU32::new(0),
+            })
         }
 
         /// The fd to poll.
@@ -103,24 +119,54 @@ mod imp {
             self.socket.as_fd()
         }
 
-        /// Make the next poll of the fd return.
-        pub(crate) fn poke(&self) {
+        /// Make the next poll return; `false` when no byte was queued (`ENOBUFS`, `ENOMEM`).
+        pub(crate) fn poke(&self) -> bool {
+            #[cfg(test)]
+            if self.failing.load(Ordering::Relaxed) > 0 {
+                self.failing.fetch_sub(1, Ordering::Relaxed);
+                return false;
+            }
             // `EAGAIN`: a byte is queued already, and the fd readable.
-            let _ = send(&self.local, &[1], SendFlags::DONTWAIT | SendFlags::NOSIGNAL);
+            match send(&self.local, &[1], SendFlags::DONTWAIT | SendFlags::NOSIGNAL) {
+                Ok(_) | Err(Errno::AGAIN) => true,
+                // Shut down by the publisher (`SHUT_WR`): the polled end reads end of file.
+                Err(Errno::PIPE) => true,
+                Err(_) => false,
+            }
         }
 
         /// Empty the fd; `true` when the socket was shut down, which only a publisher that does
         /// not follow the protocol does.
+        ///
+        /// At most [`DRAIN_READS`] reads: a publisher that keeps the socket full would hold the
+        /// thread past any deadline. The bytes left keep the fd readable, and
+        /// [`unread`](Self::unread) tells the next wait so, for a reactor or an edge-triggered
+        /// poll that reports no readiness the fd had before. The kernel's least send buffer, the
+        /// one a publisher that follows the protocol keeps, holds a few one-byte sends: one read.
         pub(crate) fn drain(&self) -> bool {
-            let mut bytes = [0u8; 64];
-            loop {
-                match recv(&self.socket, &mut bytes, RecvFlags::DONTWAIT) {
-                    Ok((_, 0)) => break true,
-                    Ok(_) => {}
-                    Err(Errno::INTR) => {}
-                    Err(_) => break false,
-                }
+            let mut bytes = [0u8; 256];
+            for _ in 0..DRAIN_READS {
+                let hung_up = match recv(&self.socket, &mut bytes, RecvFlags::DONTWAIT) {
+                    Ok((_, 0)) => true,
+                    Ok(_) | Err(Errno::INTR) => continue,
+                    Err(_) => false,
+                };
+                self.unread.store(false, Ordering::Relaxed);
+                return hung_up;
             }
+            self.unread.store(true, Ordering::Relaxed);
+            false
+        }
+
+        /// Whether the last [`drain`](Self::drain) left bytes: the next wait drains, not sleeps.
+        pub(crate) fn unread(&self) -> bool {
+            self.unread.load(Ordering::Relaxed)
+        }
+
+        /// The duplicate of the publisher's end, for a test that sends as a publisher does.
+        #[cfg(all(test, not(loom), not(miri)))]
+        pub(crate) fn sender(&self) -> BorrowedFd<'_> {
+            self.local.as_fd()
         }
 
         /// Sleep until the fd is readable; `false` when `deadline` passed first.
@@ -255,11 +301,15 @@ mod imp {
             match *self {}
         }
 
-        pub(crate) fn poke(&self) {
+        pub(crate) fn poke(&self) -> bool {
             match *self {}
         }
 
         pub(crate) fn drain(&self) -> bool {
+            match *self {}
+        }
+
+        pub(crate) fn unread(&self) -> bool {
             match *self {}
         }
 

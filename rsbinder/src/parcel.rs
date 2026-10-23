@@ -2806,7 +2806,8 @@ pub fn to_bytes<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
 ///
 /// Those of [`to_bytes`]. On an error `out` is as it was: whatever the
 /// value had written is cut off again. The `i32` bound applies to `out`
-/// as a whole — its length before the call plus the value.
+/// as a whole — its length before the call plus the value. If the value's
+/// `Serialize` panics, `out` is left empty.
 pub fn to_bytes_into<T: Serialize + ?Sized>(value: &T, out: &mut Vec<u8>) -> Result<()> {
     let start = out.len();
     if start >= i32::MAX as usize {

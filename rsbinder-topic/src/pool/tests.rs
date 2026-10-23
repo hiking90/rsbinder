@@ -252,9 +252,9 @@ fn a_pin_holds_while_the_generation_matches_and_lets_go_when_it_does_not() {
     assert_eq!(
         *memory.pin_stores.borrow(),
         [
-            (slot + 1, Ordering::Relaxed),
+            (slot + 1, Ordering::Release),
             (0, Ordering::Release),
-            (slot + 1, Ordering::Relaxed),
+            (slot + 1, Ordering::Release),
             (0, Ordering::Release)
         ]
     );
@@ -279,4 +279,12 @@ fn a_loan_outside_the_pool_is_corrupted_before_any_pin() {
         );
     }
     assert!(memory.pin_stores.borrow().is_empty());
+}
+
+#[test]
+fn only_the_subscribers_that_ended_are_taken_out_in_order() {
+    let mut subscribers = vec![1, 2, 3, 4];
+    assert_eq!(take_ended(&mut subscribers, |&s| s % 2 == 0), [2, 4]);
+    assert_eq!(subscribers, [1, 3]);
+    assert!(take_ended(&mut subscribers, |_| false).is_empty());
 }

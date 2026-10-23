@@ -285,13 +285,13 @@ const TMPFS_MAGIC: i128 = 0x0102_1994;
 /// four checks leave the peer no way to take a page of that memory away: a
 /// later access finds neither a shorter file nor a missing page.
 ///
-/// 1. The file answers `F_GET_SEALS`. Only shmem and hugetlbfs files do, so
-///    a file on a disk or on FUSE — where touching a page waits for a daemon
-///    the peer runs — stops here, as does a pipe, a socket or an ashmem
-///    region.
-/// 2. Its filesystem is tmpfs (`fstatfs`). A hugetlbfs memfd passes the
-///    first check, and an access to one raises `SIGBUS` when the huge page
-///    pool is empty.
+/// 1. The file answers `F_GET_SEALS`. Only shmem files, and hugetlbfs files
+///    from Linux 4.16, do, so a file on a disk or on FUSE — where touching a
+///    page waits for a daemon the peer runs — stops here, as does a pipe, a
+///    socket or an ashmem region.
+/// 2. Its filesystem is tmpfs (`fstatfs`). A hugetlbfs memfd of Linux 4.16
+///    or later passes the first check, and an access to one raises `SIGBUS`
+///    when the huge page pool is empty.
 /// 3. It carries [`Seals::SHRINK`] and a write seal, [`Seals::FUTURE_WRITE`]
 ///    or [`Seals::WRITE`]. `SHRINK` rules out a truncation, which would make
 ///    an access past the new end a `SIGBUS`; the write seal rules out
@@ -396,7 +396,7 @@ mod tests {
 
     fn byte(map: &Mapping, index: usize) -> &AtomicU8 {
         assert!(index < map.len());
-        // SAFETY: a byte inside a live mapping that outlives the borrow; the tests use atomics only.
+        // SAFETY: a byte inside a live mapping that outlives the borrow; tests use atomics only.
         unsafe { map.as_ptr().add(index).cast::<AtomicU8>().as_ref() }
     }
 
@@ -637,6 +637,11 @@ mod tests {
             }
             Err(e) => panic!("memfd_create(MFD_HUGETLB): {e}"),
         };
+        // Seals on a hugetlbfs memfd came with Linux 4.16; before, it is refused as unsealable.
+        if let Err(Error::Os(Errno::INVAL)) = seals(huge.as_fd()) {
+            assert_eq!(refusal(huge.as_fd()), "received fd is not a sealable file");
+            return;
+        }
         // It has seals to report, which is why the filesystem is asked as well.
         seals(huge.as_fd()).unwrap();
         assert_eq!(refusal(huge.as_fd()), "received fd is not a tmpfs file");

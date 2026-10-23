@@ -163,6 +163,22 @@ fn a_hundred_publishes_before_the_woken_wait_ends_send_one_byte() {
     assert_eq!(receiving.join().unwrap(), Ok(0));
 }
 
+/// `state` keeps 30 bits of `seq`: a commit that finds no wait forgets the one it woke.
+#[test]
+fn a_wait_in_the_state_of_one_woken_long_ago_is_woken() {
+    for wake in [Wake::Futex, Wake::Fd] {
+        let publisher = topic(64 << 10);
+        let mut subscriber = woken_by(&publisher, wake);
+        let next = subscriber.local().words().seq().wrapping_add(1);
+        publisher.take_as_woken(crate::layout::seen_field(next) | crate::layout::WAITING);
+        publisher.publish(&num(1)).unwrap();
+        assert_eq!(recv(&mut subscriber).map(|bytes| value(&bytes)), Ok(1));
+        let receiving = asleep(subscriber, recv);
+        publisher.publish(&num(2)).unwrap();
+        assert_eq!(receiving.join().unwrap(), Ok(2), "{wake:?}");
+    }
+}
+
 /// A publish in the hook that runs once, between the waiter's last look and its `WAITING`.
 fn commit_before_the_wait(publisher: &Arc<Publisher<Bytes>>, subscriber: &mut Subscriber<Bytes>) {
     let publisher = publisher.clone();
@@ -199,6 +215,21 @@ fn a_commit_just_before_prepare_wait_arms_makes_it_return_false() {
     commit_before_the_wait(&publisher, &mut subscriber);
     assert!(!subscriber.prepare_wait());
     assert_eq!(subscriber.try_recv().map(|bytes| value(&bytes)), Ok(8));
+}
+
+/// A loop that takes one record per turn: each `prepare_wait` judges by the look made since.
+#[test]
+fn a_poll_loop_that_takes_one_record_a_turn_polls_only_once_none_is_unread() {
+    let publisher = topic(64 << 10);
+    let mut subscriber = fd_subscriber(&publisher);
+    publisher.publish(&num(1)).unwrap();
+    publisher.publish(&num(2)).unwrap();
+    let short = Some(Duration::from_millis(100));
+    for n in [1, 2] {
+        assert!(wait_any(&mut [&mut subscriber], short).unwrap(), "{n}");
+        assert_eq!(subscriber.try_recv().map(|bytes| value(&bytes)), Ok(n));
+    }
+    assert!(!wait_any(&mut [&mut subscriber], short).unwrap());
 }
 
 /// AC-15.2.45: a loop that polls the fds itself, with no `wait_any` and no runtime, gets them all.
@@ -307,7 +338,8 @@ fn wait_any_returns_at_once_with_a_record_unread_and_false_after_its_timeout() {
     assert!(!woke.unwrap());
     assert!(started.elapsed() >= Duration::from_millis(50));
     publisher.publish(&num(3)).unwrap();
-    let woke = wait_any(&mut [&mut subscriber], None);
+    // A bound: a poll that sleeps on the unread record times out and fails the test.
+    let woke = wait_any(&mut [&mut subscriber], Some(WAIT));
     assert!(woke.unwrap());
     assert_eq!(subscriber.try_recv().map(|bytes| value(&bytes)), Ok(3));
     // Neither wait was armed when a commit landed, and none is left armed.
@@ -324,15 +356,55 @@ fn wait_any_refuses_a_subscription_woken_by_the_futex() {
     let _ = wait_any(&mut [&mut subscriber], Some(Duration::ZERO));
 }
 
+#[test]
+#[should_panic(expected = "finish_wait: a subscription made with `Wake::Futex`")]
+fn a_subscription_woken_by_the_futex_has_no_wait_to_finish() {
+    let publisher = topic(64 << 10);
+    let mut subscriber = woken_by(&publisher, Wake::Futex);
+    subscriber.finish_wait();
+}
+
+#[test]
+#[should_panic(expected = "no subscription to wait for, and no bound")]
+fn wait_any_refuses_to_wait_for_nothing_without_a_bound() {
+    let _ = wait_any(&mut [], None);
+}
+
+#[test]
+#[should_panic(expected = "no subscription to wait for, and no bound")]
+fn wait_any_refuses_to_wait_for_nothing_for_longer_than_an_instant_holds() {
+    let _ = wait_any(&mut [], Some(Duration::MAX));
+}
+
+/// Nothing to wait for, with a bound: a sleep to it.
+#[test]
+fn wait_any_of_nothing_with_a_bound_sleeps_to_it() {
+    let started = Instant::now();
+    assert!(!wait_any(&mut [], Some(Duration::from_millis(20))).unwrap());
+    assert!(started.elapsed() >= Duration::from_millis(20));
+}
+
+/// A flag that a wait of `subscriber` raises once its arm found no bit up, before it sleeps.
+fn armed_to_sleep(subscriber: &Subscriber<Bytes>) -> Arc<AtomicBool> {
+    let armed = Arc::new(AtomicBool::new(false));
+    let raised = armed.clone();
+    *subscriber.local().before_sleep.lock().unwrap() =
+        Some(Box::new(move || raised.store(true, Ordering::SeqCst)));
+    armed
+}
+
 /// An interrupt is one byte sent, with no loop of wakes: it stays until drained.
 #[test]
 fn an_interrupt_ends_an_fd_wait_with_one_wake() {
     let publisher = topic(64 << 10);
     let subscriber = fd_subscriber(&publisher);
     let interrupter = subscriber.interrupter();
+    let armed = armed_to_sleep(&subscriber);
     let receiving = asleep(subscriber, |subscriber| {
         subscriber.recv_timeout(Duration::from_secs(10))
     });
+    // Past an arm that saw no bit: `parked` stays up until a wake, so the interrupt sends one.
+    eventually("the wait armed to sleep", || armed.load(Ordering::SeqCst));
     let interrupted = Instant::now();
     assert_eq!(interrupter.interrupt_counting(), 1);
     assert_eq!(receiving.join().unwrap(), Err(RecvError::Cancelled));
@@ -340,17 +412,121 @@ fn an_interrupt_ends_an_fd_wait_with_one_wake() {
     assert!(interrupted.elapsed() < Duration::from_secs(5));
 }
 
+/// Its byte ends the poll, the next `prepare_wait` takes its kick, and the poll after sleeps.
 #[test]
-fn an_interrupt_wakes_a_poll_loop_once_and_stays_for_the_next_receive() {
+fn an_interrupt_wakes_a_poll_loop_and_stays_for_the_next_receive() {
     let publisher = topic(64 << 10);
     let mut subscriber = fd_subscriber(&publisher);
     assert!(subscriber.prepare_wait());
     subscriber.interrupter().interrupt();
     assert_eq!(poll_for(&subscriber, Duration::from_secs(10)), 1);
     subscriber.finish_wait();
-    // Drained: the next poll sleeps through its timeout.
+    assert!(!subscriber.prepare_wait(), "the interrupt's kick");
+    // Taken: the next poll sleeps through its timeout.
     assert!(subscriber.prepare_wait());
     assert_eq!(poll_for(&subscriber, Duration::from_millis(20)), 0);
+    subscriber.finish_wait();
+    assert_eq!(recv(&mut subscriber), Err(RecvError::Cancelled));
+}
+
+/// `wait_any` of one subscriber, bounded by `timeout`.
+fn waited(subscriber: &mut Subscriber<Bytes>, timeout: Duration) -> bool {
+    wait_any(&mut [subscriber], Some(timeout)).unwrap()
+}
+
+/// Raised after the poll returned, its byte drained by `finish_wait`: the next call ends at once.
+#[test]
+fn an_interrupt_whose_byte_a_finish_wait_drains_ends_the_next_poll() {
+    let publisher = topic(64 << 10);
+    let mut subscriber = fd_subscriber(&publisher);
+    assert!(subscriber.prepare_wait());
+    // As at the poll's timeout, or a return for another fd of the loop's.
+    subscriber.interrupter().interrupt();
+    subscriber.finish_wait();
+    let started = Instant::now();
+    assert!(waited(&mut subscriber, WAIT));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(!waited(&mut subscriber, Duration::from_millis(20)));
+    let short = Duration::from_millis(50);
+    assert_eq!(subscriber.recv_timeout(short), Err(RecvError::Cancelled));
+    assert!(!waited(&mut subscriber, Duration::from_millis(20)));
+}
+
+/// A poll asleep at the interrupt returns, then at most one call at once, then one sleeps.
+#[test]
+fn an_interrupt_ends_a_sleeping_poll_and_at_most_one_call_after_it() {
+    let publisher = topic(64 << 10);
+    let mut subscriber = fd_subscriber(&publisher);
+    let (local, interrupter) = (subscriber.local().clone(), subscriber.interrupter());
+    let polling = thread::spawn(move || {
+        let woken = waited(&mut subscriber, WAIT);
+        let mut early = 0;
+        while waited(&mut subscriber, Duration::from_millis(20)) {
+            early += 1;
+            assert!(early <= 1, "a poll loop that spins at one interrupt");
+        }
+        (woken, subscriber)
+    });
+    eventually("the poll sleeps", || local.is_parked());
+    interrupter.interrupt();
+    let (woken, mut subscriber) = polling.join().unwrap();
+    assert!(woken);
+    assert_eq!(recv(&mut subscriber), Err(RecvError::Cancelled));
+}
+
+/// With no wait `parked` an interrupt sends no byte; the next `prepare_wait` sees it as it arms.
+#[test]
+fn an_interrupt_with_no_wait_sends_no_byte() {
+    let publisher = topic(64 << 10);
+    let mut subscriber = fd_subscriber(&publisher);
+    assert_eq!(subscriber.interrupter().interrupt_counting(), 0);
+    assert_eq!(poll_for(&subscriber, Duration::ZERO), 0);
+    assert!(!subscriber.prepare_wait(), "the interrupt's kick");
+    assert!(subscriber.prepare_wait());
+    subscriber.finish_wait();
+    assert_eq!(recv(&mut subscriber), Err(RecvError::Cancelled));
+}
+
+/// A send that queues no byte while a poll sleeps is sent again until one is.
+#[test]
+fn an_interrupt_whose_first_byte_is_not_queued_ends_a_sleeping_poll() {
+    let publisher = topic(64 << 10);
+    let mut subscriber = fd_subscriber(&publisher);
+    let (local, interrupter) = (subscriber.local().clone(), subscriber.interrupter());
+    let fd = local.words().fd.as_ref().unwrap();
+    fd.failing.store(1, Ordering::Relaxed);
+    let armed = armed_to_sleep(&subscriber);
+    let polling = thread::spawn(move || waited(&mut subscriber, WAIT));
+    // Past an arm that saw no bit: the failed send is followed by one while the poll is parked.
+    eventually("the poll armed to sleep", || armed.load(Ordering::SeqCst));
+    let started = Instant::now();
+    assert_eq!(interrupter.interrupt_counting(), 2);
+    assert!(polling.join().unwrap());
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+/// A receive that returns an interrupt takes its kick too: no poll after it ends for it.
+#[test]
+fn a_receive_cancelled_by_an_interrupt_leaves_no_poll_to_end_for_it() {
+    let publisher = topic(64 << 10);
+    let mut subscriber = fd_subscriber(&publisher);
+    subscriber.interrupter().interrupt();
+    let short = Duration::from_millis(50);
+    assert_eq!(subscriber.recv_timeout(short), Err(RecvError::Cancelled));
+    assert!(!waited(&mut subscriber, Duration::from_millis(20)));
+}
+
+/// A `prepare_wait` that returns for a record leaves the interrupt's kick to the next one.
+#[test]
+fn a_poll_that_returns_for_a_record_leaves_the_kick_to_the_next() {
+    let publisher = topic(64 << 10);
+    let mut subscriber = fd_subscriber(&publisher);
+    publisher.publish(&num(1)).unwrap();
+    subscriber.interrupter().interrupt();
+    assert!(!subscriber.prepare_wait(), "a record is unread");
+    assert_eq!(subscriber.try_recv().map(|bytes| value(&bytes)), Ok(1));
+    assert!(!subscriber.prepare_wait(), "the interrupt's kick");
+    assert!(subscriber.prepare_wait());
     subscriber.finish_wait();
     assert_eq!(recv(&mut subscriber), Err(RecvError::Cancelled));
 }
@@ -384,6 +560,99 @@ fn a_dropped_publisher_ends_an_fd_wait_and_every_later_receive_with_its_end() {
         receiving.join().unwrap(),
         Err(RecvError::Closed(Closed::End))
     );
+}
+
+/// A subscriber dropped armed on a socket whose sends fail with `EPIPE` still drops.
+#[test]
+fn a_subscriber_dropped_armed_on_a_shut_down_socket_drops() {
+    let publisher = topic(64 << 10);
+    let mut subscriber = fd_subscriber(&publisher);
+    assert!(subscriber.prepare_wait());
+    // The socket state a publisher's `SHUT_WR` makes: `RCV_SHUTDOWN` here, `SEND_SHUTDOWN` there.
+    rustix::net::shutdown(subscriber.wait_fd().unwrap(), rustix::net::Shutdown::Read).unwrap();
+    let (dropped, done) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        drop(subscriber);
+        dropped.send(()).unwrap();
+    });
+    assert!(done.recv_timeout(Duration::from_secs(10)).is_ok());
+}
+
+/// A copy of the publisher's end of the wake socket, its send buffer raised past the protocol's.
+fn hostile_end(subscriber: &Subscriber<Bytes>) -> std::os::fd::OwnedFd {
+    let words = subscriber.local().words();
+    let end = words
+        .fd
+        .as_ref()
+        .unwrap()
+        .sender()
+        .try_clone_to_owned()
+        .unwrap();
+    rustix::net::sockopt::set_socket_send_buffer_size(&end, 1 << 20).unwrap();
+    end
+}
+
+/// Send 64 KiB at a time on `end` until the socket takes no more.
+fn fill(end: &std::os::fd::OwnedFd) {
+    let chunk = vec![0u8; 64 << 10];
+    let flags = rustix::net::SendFlags::DONTWAIT | rustix::net::SendFlags::NOSIGNAL;
+    loop {
+        match rustix::net::send(end, &chunk, flags) {
+            Ok(_) => {}
+            Err(rustix::io::Errno::AGAIN) => return,
+            Err(error) => panic!("send: {error}"),
+        }
+    }
+}
+
+/// A publisher that keeps the wake socket full holds no receive past its deadline.
+#[test]
+fn a_receive_on_a_socket_a_publisher_keeps_full_ends_at_its_deadline() {
+    let publisher = topic(64 << 10);
+    let mut subscriber = fd_subscriber(&publisher);
+    let end = hostile_end(&subscriber);
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopped = stop.clone();
+    let flooding = thread::spawn(move || {
+        let started = Instant::now();
+        while !stopped.load(Ordering::Relaxed) && started.elapsed() < Duration::from_secs(5) {
+            fill(&end);
+        }
+    });
+    let started = Instant::now();
+    let got = subscriber.recv_timeout(Duration::from_millis(100));
+    let took = started.elapsed();
+    stop.store(true, Ordering::Relaxed);
+    flooding.join().unwrap();
+    assert_eq!(got, Err(RecvError::Timeout));
+    assert!(
+        took < Duration::from_secs(2),
+        "the 100 ms wait took {took:?}"
+    );
+}
+
+/// Bytes one `finish_wait` leaves end the next `prepare_wait`, which an edge-triggered poll needs.
+#[test]
+fn a_poll_loop_drains_a_full_socket_in_parts_and_then_sleeps_until_a_wake() {
+    let publisher = topic(64 << 10);
+    let mut subscriber = fd_subscriber(&publisher);
+    fill(&hostile_end(&subscriber));
+    assert!(subscriber.prepare_wait());
+    subscriber.finish_wait();
+    assert_eq!(poll_for(&subscriber, Duration::ZERO), 1, "the bytes left");
+    assert!(
+        !subscriber.prepare_wait(),
+        "a poll would sleep on bytes left"
+    );
+    let mut calls = 1;
+    while !subscriber.prepare_wait() {
+        calls += 1;
+        assert!(calls < 10_000, "never drained");
+    }
+    assert_eq!(poll_for(&subscriber, Duration::ZERO), 0, "drained");
+    subscriber.interrupter().interrupt();
+    assert_eq!(poll_for(&subscriber, WAIT), 1, "the interrupt's byte");
+    subscriber.finish_wait();
 }
 
 /// AC-15.2.18: a subscriber that raises `WAITING` and never reads; a million publishes, one byte.
@@ -445,7 +714,7 @@ fn a_subscriber_that_closes_its_socket_is_taken_out_and_raises_no_sigpipe() {
         wakeFd: Some(rsbinder::ParcelFileDescriptor::new(theirs)),
     };
     {
-        let _asking = crate::connect::Asking::new(&token);
+        let _asking = crate::connect::Asking::new(&request);
         publisher.acceptor().accept(&request).unwrap();
     }
     // The publisher keeps its end; this side closes both of its own, as a dropped one would.
@@ -726,6 +995,52 @@ mod reactor {
             waited.await.map(|got| got.map(drop))
         });
         eventually("the wait sleeps", || local.is_parked());
+        interrupter.interrupt();
+        assert_eq!(
+            runtime.block_on(receiving).unwrap().ok(),
+            Some(Err(RecvError::Cancelled))
+        );
+    }
+
+    /// A runtime made per receive: the one after a runtime's drop waits on the next one's reactor.
+    #[test]
+    fn an_async_receive_after_its_reactors_runtime_is_dropped_waits_on_its_own() {
+        let publisher = Arc::new(topic(64 << 10));
+        let mut subscriber = fd_subscriber(&publisher);
+        for n in 1..=2 {
+            let local = subscriber.local().clone();
+            let later = publisher.clone();
+            let publishing = thread::spawn(move || {
+                eventually("the wait sleeps", || local.is_parked());
+                later.publish(&num(n)).unwrap();
+            });
+            let arms = subscriber.local().arms.load(Ordering::SeqCst);
+            let got = runtime().block_on(async {
+                let waited = tokio::time::timeout(WAIT, subscriber.recv_async()).await;
+                waited.map(|got| got.map(|bytes| value(&bytes)))
+            });
+            assert_eq!(got.ok(), Some(Ok(n)), "receive {n}");
+            let spun = subscriber.local().arms.load(Ordering::SeqCst) - arms;
+            assert!(spun <= 3, "receive {n} armed {spun} times");
+            publishing.join().unwrap();
+        }
+    }
+
+    /// An async wait on a socket left full drains it, then wakes at the interrupt it could hide.
+    #[test]
+    fn an_async_wait_on_a_full_socket_drains_it_and_wakes_at_an_interrupt() {
+        let runtime = runtime();
+        let publisher = topic(64 << 10);
+        let mut subscriber = fd_subscriber(&publisher);
+        fill(&hostile_end(&subscriber));
+        let interrupter = subscriber.interrupter();
+        let local = subscriber.local().clone();
+        let receiving = runtime.spawn(async move {
+            let waited = tokio::time::timeout(WAIT, subscriber.recv_async());
+            waited.await.map(|got| got.map(drop))
+        });
+        let arms = || local.arms.load(Ordering::SeqCst);
+        eventually("a drain, then a wait", || arms() >= 2 && local.is_parked());
         interrupter.interrupt();
         assert_eq!(
             runtime.block_on(receiving).unwrap().ok(),

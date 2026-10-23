@@ -13,7 +13,7 @@ use rsbinder::{DeathRecipient, SIBinder, Strong, WIBinder};
 use crate::aidl::ISubscription::ISubscription;
 use crate::backpressure::Readers;
 use crate::layout::{seen_field, ControlView, CLOSED, WAITING};
-use crate::pool::Pins;
+use crate::pool::{self, Pins};
 use crate::wake::{send_wake, Sent};
 use crate::SubscriberInfo;
 
@@ -89,7 +89,7 @@ pub(crate) struct Link {
     uid: u32,
     pid: i32,
     dead: Arc<Dead>,
-    /// The `state` of the wait last woken by a wake that ends it, so a wait gets one (§5.5).
+    /// The `state` of the wait last woken: one wake per wait (§5.5); 0 once a commit sees no wait.
     woken: AtomicU32,
     /// The publisher's end of the socket pair of a subscription woken through it (§5.5a).
     socket: Option<OwnedFd>,
@@ -164,11 +164,15 @@ impl Link {
         self.control.read().max(self.start.load(Ordering::Relaxed))
     }
 
-    /// After the commit that made `seq`: mark a wait not woken yet as woken; a socket's byte is
-    /// sent here, a futex's by the caller.
+    /// After the commit that made `seq`: wake a wait not woken yet; the caller makes a futex wake.
     fn wake(&self, seq: u32) -> Wanted {
         let state = self.control.state().load();
-        if state & WAITING == 0 || state == self.woken.load(Ordering::Relaxed) {
+        if state & WAITING == 0 {
+            // Between waits: the next is another, even with a `state` that matches a woken one.
+            self.woken.store(0, Ordering::Relaxed);
+            return Wanted::No;
+        }
+        if state == self.woken.load(Ordering::Relaxed) {
             return Wanted::No;
         }
         // A wait on this `seq` saw the commit: a wake may land before it sleeps and end nothing.
@@ -320,17 +324,17 @@ impl Links {
         self.sends
     }
 
+    /// Take a wait in `state` as woken already in every link, as one `2^30` commits back is.
+    #[cfg(all(test, not(loom), any(target_os = "linux", target_os = "android")))]
+    pub(crate) fn take_as_woken(&self, state: u32) {
+        for link in &self.links {
+            link.woken.store(state, Ordering::Relaxed);
+        }
+    }
+
     /// Take out the subscriptions that ended.
     pub(crate) fn prune(&mut self) -> Vec<Arc<Link>> {
-        let mut gone = Vec::new();
-        self.links.retain(|link| {
-            let ended = link.ended();
-            if ended {
-                gone.push(link.clone());
-            }
-            !ended
-        });
-        gone
+        pool::take_ended(&mut self.links, |link| link.ended())
     }
 
     /// Take out the subscription flagged by `dead`.

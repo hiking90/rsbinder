@@ -30,6 +30,10 @@ pub enum RecvError {
     Cancelled,
     /// The publisher overwrote this many records before they were read. The next receive returns
     /// the first record after them.
+    ///
+    /// A [`NamedSubscriber`](crate::NamedSubscriber)'s drain of a replaced publisher that ends
+    /// lapped also counts here the records it leaves unread, and may count fewer than it left,
+    /// never more ([`Disconnected::Replaced`]).
     Lagged(u64),
     /// [`Payload::decode`] failed with this for one record, which is skipped. The next receive
     /// returns the record after it.
@@ -50,15 +54,55 @@ pub enum Disconnected {
     /// returned.
     Ended(Closed),
     /// The publisher refused the subscription with this status. Refusals that a retry cannot
-    /// change (`EX_SECURITY`, `BadType`, [`ITopic::ERROR_VERSION`]) wait for another publisher
-    /// to take the name; [`ITopic::ERROR_FULL`] and transaction errors are retried on the same
-    /// publisher, at intervals from 1 to 30 seconds, and reported once.
+    /// change (`EX_SECURITY`, `EX_UNSUPPORTED_OPERATION`, `BadType`, `InvalidOperation`,
+    /// [`ITopic::ERROR_VERSION`]) wait for another publisher to take the name;
+    /// [`ITopic::ERROR_FULL`], the other transaction errors and the other exceptions are retried
+    /// on the same publisher, at intervals from 1 to 30 seconds, and reported once. `DeadObject`
+    /// and [`ITopic::ERROR_CLOSED`] are not reported: the subscriber waits for the name to be
+    /// registered anew, as for a refusal a retry cannot change. A connection whose fd the
+    /// subscriber's own epoll instance cannot take is reported each time, and asked for again
+    /// from a newer publisher of the name at once, else from the same one at those intervals.
     ///
     /// [`ITopic::ERROR_VERSION`]: crate::aidl::ITopic::ERROR_VERSION
     /// [`ITopic::ERROR_FULL`]: crate::aidl::ITopic::ERROR_FULL
+    /// [`ITopic::ERROR_CLOSED`]: crate::aidl::ITopic::ERROR_CLOSED
     Rejected(Status),
     /// Another publisher took the name. Every record the previous one had committed when this
-    /// was seen was returned first.
+    /// was seen was returned first or missed, and the records missed are counted in a
+    /// [`RecvError::Lagged`] before this, exactly or by a lower bound (below), but for those
+    /// before the first record the connection read, which are not counted, as a
+    /// [`Subscriber`](crate::Subscriber)'s are not. When the name comes back to the previous
+    /// publisher before this is returned, it is not: the connection reads on from where the drain
+    /// left it, and what the drain counted stays counted.
+    ///
+    /// The previous publisher, still publishing, can write over those records while they are
+    /// read. A read of its ring that it laps five times in a row gives up, as one of
+    /// [`Subscriber::try_recv`](crate::Subscriber::try_recv) does, and the records missed are
+    /// counted by the index of the next record read, as for any `Lagged`. A lapped read of the
+    /// drain resumes at the oldest record the publisher keeps, not half a ring on as a
+    /// `Subscriber`'s does, until, twice in a row, the publisher writes over the record such a
+    /// resume reached before the drain has read past it; from then on the drain resumes half a
+    /// ring on, as a `Subscriber`'s read does, since that publisher writes over the oldest record
+    /// before the drain reaches it. Once is not enough: a resume that counts a loss returns the
+    /// `Lagged` first and leaves the drain on the oldest record, which a single commit before the
+    /// next receive writes over. A publisher that stopped writing before a lap writes over none of
+    /// the records from there on, so the drain then returns every record from the oldest kept to
+    /// the end. Where a resume would be the end of them or past it, the read gives up instead.
+    /// After a second read of the drain that gives up, also one that finds the publisher's process
+    /// dead, the drain ends with one `Lagged` for the records it did not return: exact, from the
+    /// index of the record after them, unless the publisher wrote over that record too or had not
+    /// committed it, and then one, a lower bound, or none when an earlier drain of this
+    /// connection counted that record already. A lower bound counts no more records than were
+    /// missed, and may count fewer, so no record committed after this was seen is counted. One
+    /// receive of the drain makes at most two reads, so a publisher that keeps lapping it holds
+    /// no receive; one that breaks the protocol to hold the drain where it is ends it the same
+    /// way after two receives in a row that read nothing new.
+    ///
+    /// [`try_latest`](crate::NamedSubscriber::try_latest) and
+    /// [`recv_latest`](crate::NamedSubscriber::recv_latest) skip records without counting them,
+    /// as a [`Subscriber`](crate::Subscriber)'s do, and return the newest record each time: a
+    /// drain of them may return one record the previous publisher committed after this was seen,
+    /// always before `Replaced`.
     Replaced,
 }
 
@@ -173,9 +217,7 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
         unsafe { self.typed_as(latest, false) }
     }
 
-    /// # Safety
-    ///
-    /// With `vouched`, [`recv_vouched`](Self::recv_vouched)'s.
+    /// # Safety: with `vouched`, [`recv_vouched`](Self::recv_vouched)'s.
     unsafe fn typed_as(&mut self, latest: bool, vouched: bool) -> Result<T, RecvError> {
         if self.corrupted {
             return Err(RecvError::Closed(Closed::Corrupted));
@@ -275,9 +317,28 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
         self.reader.pending()
     }
 
+    /// Whether the ring reader's last call gave up short of `write` ([`Reader::gave_up`]).
+    pub(crate) fn gave_up(&self) -> bool {
+        self.reader.gave_up()
+    }
+
+    /// [`Reader::count_lost_before`]; none when the reader has failed a check, after which nothing
+    /// more is read from it.
+    pub(crate) fn count_lost_before(&mut self) -> u64 {
+        if self.corrupted {
+            return 0;
+        }
+        self.reader.count_lost_before().unwrap_or(0)
+    }
+
     /// Where the publisher's committed records end now.
     pub(crate) fn committed(&self) -> u64 {
         self.reader.committed()
+    }
+
+    /// [`Reader::stop_at`].
+    pub(crate) fn stop_at(&mut self, end: Option<u64>) {
+        self.reader.stop_at(end);
     }
 }
 

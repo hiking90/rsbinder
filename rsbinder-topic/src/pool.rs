@@ -24,7 +24,7 @@
 //!
 //! ```text
 //! subscriber, holding a LOAN record {slot i, generation g}:
-//!   pin = i + 1; fence(SeqCst); generation[i] == g ? read the slot : pin = 0 and lose it
+//!   pin = i + 1 (Release); fence(SeqCst); generation[i] == g ? read the slot : pin = 0, lose it
 //!   done reading: pin = 0 (Release)
 //! publisher, to lend slot i:
 //!   generation[i] = odd; fence(SeqCst); load every pin word
@@ -37,9 +37,16 @@
 //! to the other side, where an atomic load is `Relaxed` alone: the `SeqCst` fences order each
 //! side's store before its load. Of a subscriber that pins as the publisher takes the slot back,
 //! one of the two sees the other's store: the subscriber finds the odd generation, or the
-//! publisher finds the pin. A pin seen as 0 was released with `Release`, and the publisher's
-//! acquire fence after it orders the subscriber's reads before the writes the publisher then
-//! makes.
+//! publisher finds the pin. Every store of the pin word is `Release`, 0 and a slot's number
+//! alike, so whichever the publisher loads, its acquire fence after the load orders the
+//! subscriber's reads of the slots it pinned before that store before the writes the publisher
+//! then makes. A `Relaxed` store of the next pin would not do: it is no part of the release
+//! sequence of the 0 before it, and a publisher that loads it lends the slot just let go.
+//!
+//! A subscriber taken off the publisher's list has its pin word loaded no more, so no lend's
+//! fence follows a load of its stores. [`take_ended`] fences instead, after the `Relaxed` load
+//! that found it ended: the `Release` store that ended it comes after its last read of the pool,
+//! and whichever thread lends next comes after the one that took it off.
 //!
 //! Every slot tried stays odd, so a later fence and load of the pin words decide it as well as
 //! its own did. The publisher judges the slots tried so far by one load of all the pin words, not
@@ -51,7 +58,7 @@
 //! A slot that every subscriber has read past (the `read` its control page reports is at or above
 //! the end of the slot's `LOAN` record) is needed by none of them; of those, the one published
 //! last is lent first, so that a pool larger than the cache keeps reusing the slots still in it
-//! (plan 15 §8.4, "P3-0"). With none, the oldest is lent, which keeps the newest values longest;
+//! (plan 15 §8.4). With none, the oldest is lent, which keeps the newest values longest;
 //! a lossless pool (below) waits instead.
 //! A `read` is the subscriber's to write: a wrong one only changes which slot is lent, and the
 //! generation check still decides what a subscriber reads, so it costs that subscriber values.
@@ -63,7 +70,11 @@
 //! more than `depth` values behind thus skips to the newest `depth`, as one behind the ring
 //! skips to what the ring still holds. The slots kept for pins would otherwise hold older values
 //! whenever no pin is on them, and a subscriber that cannot keep up would read values as old as
-//! the pool is deep (plan 15 §8.4, "P3-4").
+//! the pool is deep (plan 15 §8.4).
+//!
+//! A value taken back has its odd generation stored `Relaxed`: no write to the slot follows until
+//! a lend, whose fence orders that store before the pins are loaded, and a subscriber that still
+//! sees the even generation reads the value whole, since nothing writes the slot before that lend.
 //!
 //! With `slots >= max_subscribers × MAX_PINS + 1 + depth + max_loans` the publisher always finds
 //! a slot: pins hold at most `max_subscribers` of them, values kept `depth`, and loans not yet
@@ -177,8 +188,7 @@ pub(crate) struct Slots {
     depth: usize,
     /// Backpressure (plan 15 §6.5): only a slot read past is lent, and no value is taken back.
     lossless: bool,
-    /// The slots one `lend` has tried, as flags and in order, and the slots the pin words named;
-    /// kept to spare allocations per loan.
+    /// Per lend, reused: the slots tried, as flags and in order, and the slots pins name.
     tried: Vec<bool>,
     order: Vec<usize>,
     pinned: Vec<u32>,
@@ -242,8 +252,7 @@ impl Slots {
         Err(LendError::NoSlot)
     }
 
-    /// The slot to try next: of those read by every subscriber the newest, else the oldest, or
-    /// none for a lossless pool.
+    /// The slot to try next: the newest read by all, else the oldest; none for a lossless pool.
     fn candidate(&self, read: u64) -> Option<usize> {
         let mut newest_read: Option<(usize, u64)> = None;
         let mut oldest: Option<(usize, u64)> = None;
@@ -282,10 +291,7 @@ impl Slots {
         generation
     }
 
-    /// Take back the values older than the newest `depth`: odd, so a subscriber further behind
-    /// loses them, as one behind the ring does. `Relaxed`: no write follows until a lend, whose
-    /// fence orders it before the pins are loaded; a subscriber that still sees the value even
-    /// reads it whole, since nothing writes the slot before that lend.
+    /// Take back the values older than the newest `depth`: odd, so a subscriber behind loses them.
     fn retire(&mut self, generations: &impl Generations) {
         loop {
             let mut held = 0;
@@ -351,7 +357,8 @@ pub(crate) fn pin(
     if loan.generation % 2 == 1 {
         return Err(Unpinned::Corrupted("loan of a slot being written"));
     }
-    pin.store_pin(loan.slot + 1, Ordering::Relaxed);
+    // Release: a publisher that loads this pin comes after the reads of the slot pinned before.
+    pin.store_pin(loan.slot + 1, Ordering::Release);
     // The pin before the generation's load: the publisher's fence orders the other two.
     fence(Ordering::SeqCst);
     let generation = generations.load_generation(loan.slot);
@@ -367,6 +374,29 @@ pub(crate) fn pin(
 /// Let go of the slot pinned: the reads of it come before the publisher's next writes.
 pub(crate) fn unpin(pin: &impl Pin) {
     pin.store_pin(0, Ordering::Release);
+}
+
+/// Take out of `subscribers` those `ended` finds gone, in order.
+///
+/// `ended` may judge by a store the subscriber made `Release` after its last read of the pool,
+/// loaded `Relaxed`. A subscriber taken out has its pin word loaded by no later lend, so the
+/// acquire fence here, after that load, is what orders those reads before the next fill.
+///
+/// Neither loom nor Miri fails without this fence: both let a fence of the next lend order a
+/// store that thread never loaded, which the C++ memory model does not.
+pub(crate) fn take_ended<T: Clone>(subscribers: &mut Vec<T>, ended: impl Fn(&T) -> bool) -> Vec<T> {
+    let mut gone = Vec::new();
+    subscribers.retain(|subscriber| {
+        let ended = ended(subscriber);
+        if ended {
+            gone.push(subscriber.clone());
+        }
+        !ended
+    });
+    if !gone.is_empty() {
+        fence(Ordering::Acquire);
+    }
+    gone
 }
 
 /// A subscriber's way to the values of a pool: the pool mapped read-only, and its pin word.

@@ -312,12 +312,10 @@ pub(crate) struct State<S> {
     pub(crate) writer: Writer<S>,
     pub(crate) links: Links,
     pub(crate) lending: Option<Lending>,
-    /// How long a record waits for room, and how far ahead it may go:
-    /// [`PublisherPolicy::backpressure`].
+    /// [`PublisherPolicy::backpressure`]: the wait for room; `window`, how far ahead a record goes.
     backpressure: Option<Duration>,
     window: Option<NonZeroUsize>,
-    /// Subscriptions a wait took out, to tell once the lock is let go
-    /// ([`TypedWriter::unlock`]), and how many it took out in all.
+    /// Subscriptions a wait took out, told after [`TypedWriter::unlock`] lets go; `evicted` counts.
     evictions: Vec<Eviction>,
     evicted: u64,
     /// Records published, and their payload bytes, for [`PublisherStats`].
@@ -343,9 +341,7 @@ impl<S: Stores> State<S> {
         }
     }
 
-    /// With backpressure, wait until a record of `len` bytes overwrites no record a subscription
-    /// still has to read. `unannounced`: records written since the last announcement, which go
-    /// out first, or the subscribers asleep before them would never wake to read on.
+    /// Wait for room for `len` bytes; unannounced records go out first, or sleepers never read on.
     fn make_room(&mut self, len: usize, unannounced: bool) -> Result<(), Refused> {
         let Some(timeout) = self.backpressure else {
             return Ok(());
@@ -370,10 +366,7 @@ impl<S: Stores> State<S> {
         Ok(())
     }
 
-    /// Lend a slot for `len` bytes. With backpressure the pool lends only a slot no subscription
-    /// waited for still has to read, and only inside the window of the record the loan publishes:
-    /// wait for one, and past the timeout take out the subscriptions furthest behind, one at a
-    /// time, until there is one (plan 15 §6.5).
+    /// Lend a slot for `len` bytes, with backpressure one clear of reads and window (plan 15 §6.5).
     fn lend_slot(&mut self, len: usize) -> Result<LentSlot, LendError> {
         let Self {
             writer,
@@ -514,8 +507,7 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
         self.state.lock().expect("lock poisoned")
     }
 
-    /// Let go of the lock, then tell the subscriptions a wait took out, then drop those that
-    /// ended (`gone`): a binder call under the lock could run a death notice that takes it.
+    /// Unlock, then tell evictions and drop `gone`: a call under the lock may run a death notice.
     fn unlock(&self, mut state: MutexGuard<'_, State<S>>, gone: Vec<Arc<Link>>) {
         let evictions = std::mem::take(&mut state.evictions);
         let waited = state.backpressure.unwrap_or_default();

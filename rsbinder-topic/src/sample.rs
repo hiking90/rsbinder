@@ -128,8 +128,7 @@ impl<'a, M: Trust> Sample<'a, M> {
         value
     }
 
-    /// The value as a slice, where reading it so asks nothing of the caller: a value in the
-    /// subscriber's buffer, or any value of a [`Trusted`] subscriber.
+    /// The value as a slice where that asks nothing of the caller: in the buffer, or [`Trusted`]'s.
     fn in_reach(&self) -> Option<&[u8]> {
         match self.source {
             Source::Ring(bytes) => Some(bytes),

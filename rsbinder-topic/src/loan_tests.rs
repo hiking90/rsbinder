@@ -1,7 +1,7 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Loans (plan 15 P3-2): a value written straight into a slot of the pool, received as the
+//! Loans (plan 15 §6): a value written straight into a slot of the pool, received as the
 //! ring's values are, and the slots the publisher chooses around the subscribers' pins.
 
 use std::os::fd::AsFd;
@@ -145,8 +145,7 @@ fn the_slot_read_last_is_lent_again_and_a_subscriber_behind_gets_the_newest_dept
     assert_eq!(lend(&publisher, &[7; 8]), lent[0]);
 }
 
-/// AC-15.3.1: a lent value is received in its slot of the pool, with no copy; one that came
-/// through the ring is in the subscriber's buffer. Both read the same three ways.
+/// AC-15.3.1: a lent value lies in its slot, a ring value in the subscriber; both read alike.
 #[test]
 fn a_lent_sample_lies_in_the_pool_and_a_ring_sample_in_the_subscriber() {
     let publisher = Publisher::<Bytes>::new(&pooled(1, 1, 1)).unwrap();
@@ -170,9 +169,7 @@ fn a_lent_sample_lies_in_the_pool_and_a_ring_sample_in_the_subscriber() {
     assert_eq!(subscriber.stats().received, 2);
 }
 
-/// AC-15.3.6: a subscriber that vouches for its publisher reads a lent value in place through
-/// `Deref`, and every way it reads one returns what an untrusted subscriber's copies do. The
-/// subscription goes on across the change, from where it was read up to.
+/// AC-15.3.6: a trusted subscriber derefs a lent value in place; its reads match untrusted copies.
 #[test]
 fn a_trusted_subscriber_reads_a_lent_value_in_place_and_copies_the_same_bytes() {
     // 2 pins, one to write, a depth of 4 and 1 loan: the three values stay readable.
@@ -205,8 +202,7 @@ fn a_trusted_subscriber_reads_a_lent_value_in_place_and_copies_the_same_bytes() 
     assert_eq!((trusted.stats().received, trusted.stats().lost), (4, 0));
 }
 
-/// AC-15.3.2: a slot stays as it was while a subscriber holds its sample, however many values
-/// the publisher lends meanwhile; the subscriber loses the ones whose slots went round.
+/// AC-15.3.2: a held sample's slot stays as it was; the subscriber loses values that went round.
 #[test]
 fn a_held_sample_is_not_written_however_many_values_follow() {
     // 1 pin, one to write, a depth of 1 and 1 loan: 4 slots.
@@ -286,7 +282,7 @@ fn pinning(publisher: &Publisher<Bytes>) -> (ControlPage, LoadedPool) {
         wakeFd: None,
     };
     let endpoint = {
-        let _asking = Asking::new(&token);
+        let _asking = Asking::new(&request);
         publisher.acceptor().accept(&request).unwrap()
     };
     let pool = endpoint.pool.unwrap();
@@ -295,8 +291,7 @@ fn pinning(publisher: &Publisher<Bytes>) -> (ControlPage, LoadedPool) {
     (page, mapped.unwrap())
 }
 
-/// AC-15.3.3, and AC-15.3.2 at the publisher's side: with every subscriber holding a pin, loans
-/// still succeed, and a pinned slot is neither lent nor written.
+/// AC-15.3.3, AC-15.3.2: with every subscriber holding a pin, no pinned slot is lent or written.
 #[test]
 fn pinned_slots_are_not_lent_however_many_values_follow() {
     let publisher = Publisher::<Bytes>::new(&pooled(2, 1, 1)).unwrap();

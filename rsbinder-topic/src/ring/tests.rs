@@ -5,6 +5,7 @@
 //! no `mmap`). The mapped memory is exercised by `mapped_tests.rs`.
 
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use super::*;
@@ -522,8 +523,7 @@ fn a_forged_length_ends_the_reader_without_a_copy_outside_the_ring() {
     );
 }
 
-/// The reader fails with `what` from the call for the newest record, the one of the two calls
-/// that loads `tail` without being lapped, and goes on failing with it.
+/// The reader fails with `what` from the newest-record call (it loads `tail` unlapped), then again.
 fn assert_corrupted_newest<M: Loads>(reader: &mut Reader<M>, what: &'static str) {
     assert_eq!(latest(reader), Got::Corrupted(what));
     assert_eq!(take(reader), Got::Corrupted(what));
@@ -535,8 +535,7 @@ fn forged_counters_end_the_reader() {
     forge.store_tail(2 * SLOT + 8);
     assert_corrupted_newest(&mut reader, "tail past the write counter");
 
-    // A `write` is loaded again once the reader reaches the one it holds: after record 1. The
-    // `frontier` a publisher stored before it reaches it.
+    // `write` is loaded again once the reader reaches it (after record 1), below `frontier`.
     let (_heap, mut reader, forge) = forged();
     forge.store_write(RING as u64 + 8);
     assert_eq!(take(&mut reader), item(1));
@@ -606,8 +605,7 @@ fn forged_counters_end_the_reader() {
     );
 }
 
-/// A reader's view behind which a publisher laps the reader each time `tail`, `frontier` or
-/// `write` is loaded.
+/// A reader's view where a publisher laps the reader at each load of `tail`, `frontier`, `write`.
 struct Chased<'a, M, S> {
     memory: M,
     writer: &'a RefCell<Writer<S>>,
@@ -766,8 +764,7 @@ fn an_oldest_start_whose_tail_passed_the_write_counter_it_loaded_reads_on() {
     assert_eq!(drain(&mut reader).len(), 127);
 }
 
-/// A reader's view behind which a publisher writes at the `frontier` load `at`, by `publish`,
-/// counting the ring bytes the reader loads.
+/// A reader's view where `publish` writes at its `frontier` load `at`, counting ring bytes loaded.
 struct Overtaking<'a, M, S> {
     memory: M,
     writer: &'a RefCell<Writer<S>>,
@@ -851,9 +848,7 @@ fn a_copy_the_publisher_overtakes_stops_at_the_next_chunk() {
     );
 }
 
-/// In a ring of two records of half its size, the publisher writes a record of `len` bytes over
-/// the head of the first one right after the reader copied the first two chunks of it: what the
-/// reader returns.
+/// Of two half-ring records, the first's head is overwritten by `len` bytes once two chunks copy.
 fn written_over_behind_the_reader(len: usize) -> Got {
     const HALF: usize = 128 - rules::HEADER as usize;
     let heap = Heap::new(256);
@@ -896,6 +891,398 @@ fn a_record_written_over_behind_the_reader_is_returned_while_its_rest_is_not() {
     );
 }
 
+/// A view where a lap is written inside the header load at `at`, which returns what `forge` makes.
+struct Forging<M, S> {
+    memory: M,
+    writer: Rc<RefCell<Writer<S>>>,
+    at: Cell<Option<u64>>,
+    forge: fn([u8; 8], [u8; 8]) -> [u8; 8],
+}
+
+impl<M: Loads, S: Stores> Loads for Forging<M, S> {
+    fn capacity(&self) -> u64 {
+        self.memory.capacity()
+    }
+
+    fn tail(&self) -> u64 {
+        self.memory.tail()
+    }
+
+    fn frontier(&self) -> u64 {
+        self.memory.frontier()
+    }
+
+    fn write(&self) -> u64 {
+        self.memory.write()
+    }
+
+    fn last(&self) -> u64 {
+        self.memory.last()
+    }
+
+    fn half(&self) -> u64 {
+        self.memory.half()
+    }
+
+    fn load_ring(&self, position: u64, dst: &mut [u8]) {
+        if dst.len() != 8 || self.at.get() != Some(position) {
+            self.memory.load_ring(position, dst);
+            return;
+        }
+        self.at.set(None);
+        let (mut before, mut after) = ([0; 8], [0; 8]);
+        self.memory.load_ring(position, &mut before);
+        // More than a ring: past any end a drain before it took, and the bytes loaded too.
+        publish(&mut self.writer.borrow_mut(), 200);
+        self.memory.load_ring(position, &mut after);
+        dst.copy_from_slice(&(self.forge)(before, after));
+    }
+
+    fn fence(&self) {
+        self.memory.fence();
+    }
+}
+
+/// A drain to the end of ten records, `read` read, lapped at the next header: the call, the reader.
+fn forged_at_the_next_header(
+    read: u32,
+    forge: fn([u8; 8], [u8; 8]) -> [u8; 8],
+) -> (Got, Reader<impl Loads>) {
+    let heap = Heap::new(RING);
+    let writer = Rc::new(RefCell::new(writer_of(&heap)));
+    publish(&mut writer.borrow_mut(), 10);
+    let forging = Forging {
+        memory: heap.loaded(),
+        writer: writer.clone(),
+        at: Cell::new(None),
+        forge,
+    };
+    let mut reader = Reader::attach(forging, Start::Oldest).unwrap();
+    for index in 0..read {
+        assert_eq!(take(&mut reader), item(index));
+    }
+    reader.stop_at(Some(writer.borrow().position()));
+    reader.memory.at.set(Some(reader.position()));
+    let got = take(&mut reader);
+    (got, reader)
+}
+
+/// After a forged header: the reader read on as a live one reads only whole records it published.
+fn reads_on_honestly<M: Loads>(reader: &mut Reader<M>, read: u32, published: u32) {
+    reader.stop_at(None);
+    let lost_before = reader.lost();
+    let rest = drain(reader);
+    let Some(Got::Item(first, _)) = rest.iter().find(|got| matches!(got, Got::Item(..))) else {
+        panic!("nothing read on: {rest:?}");
+    };
+    let items: Vec<_> = rest
+        .iter()
+        .filter(|got| matches!(got, Got::Item(..)))
+        .collect();
+    let expected: Vec<_> = (*first..published).map(item).collect();
+    assert_eq!(items, expected.iter().collect::<Vec<_>>());
+    if read > 0 {
+        // Every record from the first read on returned or counted, and none twice.
+        assert_eq!(
+            u64::from(read) + reader.lost() + items.len() as u64,
+            u64::from(published)
+        );
+    } else {
+        assert_eq!(reader.lost(), lost_before);
+    }
+}
+
+#[test]
+fn an_overtaken_copy_never_moves_the_reader_by_its_header() {
+    // A word of zeros, as a payload of zeros of the new lap would be, before any record is read.
+    let (got, mut reader) = forged_at_the_next_header(0, |_, _| [0; 8]);
+    assert_eq!(
+        (got, reader.gave_up(), reader.position()),
+        (Got::Empty, true, 0)
+    );
+    assert_eq!(reader.count_lost_before(), Ok(0));
+    reads_on_honestly(&mut reader, 0, 210);
+
+    // Torn as a 32-bit reader's two loads can tear it: the new first word, the old index.
+    let torn = |before: [u8; 8], after: [u8; 8]| {
+        let mut torn = after;
+        torn[4..].copy_from_slice(&before[4..]);
+        torn
+    };
+    let (got, mut reader) = forged_at_the_next_header(2, torn);
+    assert_eq!(
+        (got, reader.gave_up(), reader.position()),
+        (Got::Empty, true, 2 * SLOT)
+    );
+    assert_eq!(reader.lost(), 0);
+    // Item 2 lies before the end, which was written over too: a lower bound.
+    assert_eq!(reader.count_lost_before(), Ok(1));
+    reads_on_honestly(&mut reader, 2, 210);
+}
+
+/// A payload of three words, each the header of item 2 with no payload.
+fn looks_like_item_2() -> Vec<u8> {
+    let word = Header {
+        kind: 0,
+        len: 0,
+        index: 2,
+    };
+    word.bytes().repeat(3)
+}
+
+#[test]
+fn a_payload_word_that_looks_like_the_header_expected_moves_the_reader_nowhere() {
+    let heap = Heap::new(RING);
+    let (mut writer, mut reader) = (writer_of(&heap), reader_of(&heap, Start::Oldest));
+    publish(&mut writer, 10);
+    assert_eq!(take(&mut reader), item(0));
+    assert_eq!(take(&mut reader), item(1));
+    reader.stop_at(Some(writer.position()));
+    // Shifted by 16, the new lap puts a payload's middle word, item 2's header, at item 2's start.
+    writer.put(Kind::Item, &body(10, 8)).unwrap();
+    for _ in 0..200 {
+        writer.put(Kind::Item, &looks_like_item_2()).unwrap();
+    }
+    let at = reader.position();
+    let mut header = [0; 8];
+    heap.loaded().load_ring(at, &mut header);
+    assert_eq!(Header::parse(header).index, 2);
+    assert_eq!(take(&mut reader), Got::Empty);
+    assert_eq!((reader.gave_up(), reader.position()), (true, at));
+    assert_eq!(reader.count_lost_before(), Ok(1));
+    // Read on: whole records only, the ones of the new lap as they were published.
+    reader.stop_at(None);
+    let Got::Lagged(_) = take(&mut reader) else {
+        panic!("the loss was not reported");
+    };
+    for got in drain(&mut reader) {
+        let Got::Item(index, payload) = got else {
+            panic!("{got:?}");
+        };
+        assert_eq!(payload, looks_like_item_2(), "item {index}");
+    }
+    assert_eq!(reader.position(), writer.position());
+}
+
+/// Record 1 of three read, lapped by `frontier`, `tail` and `half` at `at`; record 2 is `third`.
+fn lapped_onto(at: u64, frontier: u64, third: u32) -> Got {
+    let (_heap, mut reader, forge) = forged();
+    let header = Header {
+        kind: 0,
+        len: BODY as u32,
+        index: third,
+    };
+    forge.store_ring(2 * SLOT, &header.bytes());
+    forge.store_ring(2 * SLOT + 8, &body(third, BODY));
+    forge.store_write(3 * SLOT);
+    forge.store_tail(at);
+    forge.store_half(at);
+    forge.store_frontier(frontier);
+    take(&mut reader)
+}
+
+/// [`lapped_onto`] a third record of the index that follows.
+fn lapped_with_tail(at: u64, frontier: u64) -> Got {
+    lapped_onto(at, frontier, 2)
+}
+
+#[test]
+fn a_drain_at_its_end_or_before_its_first_record_counts_nothing() {
+    let heap = Heap::new(RING);
+    let (mut writer, mut reader) = (writer_of(&heap), reader_of(&heap, Start::Oldest));
+    publish(&mut writer, 3);
+    assert_eq!(reader.count_lost_before(), Ok(0), "not stopped");
+    reader.stop_at(Some(writer.position()));
+    assert_eq!(reader.count_lost_before(), Ok(0), "no record read yet");
+    assert_eq!(drain(&mut reader), (0..3).map(item).collect::<Vec<_>>());
+    // At the end: whatever lies there, nothing before it is owed.
+    assert_eq!(reader.count_lost_before(), Ok(0), "at the end");
+    publish(&mut writer, 1);
+    assert_eq!(
+        reader.count_lost_before(),
+        Ok(0),
+        "at the end, committed now"
+    );
+    assert_eq!((reader.lost(), reader.position()), (0, 3 * SLOT));
+}
+
+/// The record owed found whole where a lap resumes, as only a broken publisher puts it: returned.
+#[test]
+fn a_record_owed_found_where_a_lap_resumes_is_returned_by_that_call() {
+    assert_eq!(lapped_onto(2 * SLOT, 2 * SLOT + RING as u64, 1), item(1));
+}
+
+#[test]
+fn a_lap_resumes_ahead_of_the_reader_or_the_reader_fails() {
+    let what = Got::Corrupted("frontier more than a ring past tail");
+    // `tail` at the reader, which a `frontier` a ring past it does not allow.
+    assert_eq!(lapped_with_tail(SLOT, SLOT + RING as u64 + 8), what);
+    // Ahead of the reader, yet more than a ring behind `frontier`.
+    assert_eq!(lapped_with_tail(2 * SLOT, 2 * SLOT + RING as u64 + 8), what);
+    // A ring behind it: the reader resumes there, record 1 lost.
+    assert_eq!(
+        lapped_with_tail(2 * SLOT, 2 * SLOT + RING as u64),
+        Got::Lagged(1)
+    );
+}
+
+#[test]
+fn a_drain_resumes_at_tail_and_a_live_reader_at_half() {
+    let heap = Heap::new(RING);
+    let mut writer = writer_of(&heap);
+    let (mut live, mut stopped) = (
+        reader_of(&heap, Start::Oldest),
+        reader_of(&heap, Start::Oldest),
+    );
+    publish(&mut writer, 1);
+    assert_eq!(take(&mut live), item(0));
+    assert_eq!(take(&mut stopped), item(0));
+    publish(&mut writer, 200);
+    stopped.stop_at(Some(writer.position()));
+    let memory = heap.loaded();
+    let (tail, half) = ((memory.tail() / SLOT) as u32, (memory.half() / SLOT) as u32);
+    assert!(tail < half, "{tail} {half}");
+    assert_eq!(take(&mut stopped), Got::Lagged(u64::from(tail) - 1));
+    assert_eq!(take(&mut live), Got::Lagged(u64::from(half) - 1));
+    // The publisher wrote nothing after the lap: every record from `tail` on, none counted.
+    assert_eq!(
+        drain(&mut stopped),
+        (tail..201).map(item).collect::<Vec<_>>()
+    );
+    assert_eq!(drain(&mut live), (half..201).map(item).collect::<Vec<_>>());
+    let lost = (u64::from(tail) - 1, u64::from(half) - 1);
+    assert_eq!((stopped.lost(), live.lost()), lost);
+}
+
+/// Item 0 read, 200 records, a drain to their end resumed at `tail`: the reader, end, `tail`.
+fn lapped_drain(heap: &Heap, writer: &mut Writer<impl Stores>) -> (Reader<impl Loads>, u64, u32) {
+    let mut reader = reader_of(heap, Start::Oldest);
+    publish(writer, 1);
+    assert_eq!(take(&mut reader), item(0));
+    publish(writer, 200);
+    let end = writer.position();
+    reader.stop_at(Some(end));
+    let tail = (heap.loaded().tail() / SLOT) as u32;
+    assert_eq!(take(&mut reader), Got::Lagged(u64::from(tail) - 1));
+    (reader, end, tail)
+}
+
+/// Every receive of `reader` until it reaches `end`, `before_each` run before each.
+fn until_end<M: Loads>(
+    reader: &mut Reader<M>,
+    end: u64,
+    mut before_each: impl FnMut(),
+) -> Vec<Got> {
+    let mut returned = Vec::new();
+    while reader.position() < end {
+        before_each();
+        returned.push(take(reader));
+    }
+    returned
+}
+
+/// A drain at `tail` whose record there is written over once: it resumes at `tail` again.
+#[test]
+fn a_drain_overtaken_once_where_it_resumed_at_tail_resumes_at_tail_again() {
+    let heap = Heap::new(RING);
+    let mut writer = writer_of(&heap);
+    let (mut reader, end, tail) = lapped_drain(&heap, &mut writer);
+    // One record writes over the record at `tail`; the publisher stops.
+    publish(&mut writer, 1);
+    assert_eq!(take(&mut reader), Got::Lagged(1));
+    let returned = until_end(&mut reader, end, || {});
+    assert_eq!(returned, (tail + 1..201).map(item).collect::<Vec<_>>());
+    assert_eq!(1 + reader.lost() + returned.len() as u64, 201);
+}
+
+/// One record before each of two receives of a drain at `tail`, each writing over it: `half`.
+fn turned<M: Loads>(
+    heap: &Heap,
+    writer: &mut Writer<impl Stores>,
+    reader: &mut Reader<M>,
+    tail: u32,
+) -> u32 {
+    publish(writer, 1);
+    assert_eq!(take(reader), Got::Lagged(1));
+    publish(writer, 1);
+    let half = (heap.loaded().half() / SLOT) as u32;
+    assert_eq!(take(reader), Got::Lagged(u64::from(half - tail - 1)));
+    half
+}
+
+/// A drain at `tail` whose record there is written over twice in a row: it resumes at `half`.
+#[test]
+fn a_drain_overtaken_twice_where_it_resumed_at_tail_resumes_at_half() {
+    let heap = Heap::new(RING);
+    let mut writer = writer_of(&heap);
+    let (mut reader, end, tail) = lapped_drain(&heap, &mut writer);
+    // One record before each receive from now on.
+    let half = turned(&heap, &mut writer, &mut reader, tail);
+    let returned = until_end(&mut reader, end, || publish(&mut writer, 1));
+    assert_eq!(returned, (half..201).map(item).collect::<Vec<_>>());
+    assert_eq!(1 + reader.lost() + returned.len() as u64, 201);
+}
+
+/// A drain overtaken once at `tail`, then lapped after it read on: the count starts again.
+#[test]
+fn a_drain_that_read_on_between_two_overtakes_at_tail_resumes_at_tail() {
+    let heap = Heap::new(RING);
+    let mut writer = writer_of(&heap);
+    let (mut reader, _, tail) = lapped_drain(&heap, &mut writer);
+    publish(&mut writer, 1);
+    assert_eq!(take(&mut reader), Got::Lagged(1));
+    assert_eq!(take(&mut reader), item(tail + 1));
+    // Two records write over the next one, and `tail` is the one after it.
+    publish(&mut writer, 2);
+    assert_eq!(heap.loaded().tail() / SLOT, u64::from(tail + 3));
+    assert_eq!(take(&mut reader), Got::Lagged(1));
+    // Overtaken where that resume put it: the first of a new count, at `tail` again.
+    publish(&mut writer, 1);
+    assert_eq!(take(&mut reader), Got::Lagged(1));
+    assert_eq!(take(&mut reader), item(tail + 4));
+}
+
+/// A drain that read on from where it resumed at `tail`, lapped again: it resumes at `tail` again.
+#[test]
+fn a_drain_lapped_after_it_read_on_from_tail_resumes_at_tail_again() {
+    let heap = Heap::new(RING);
+    let mut writer = writer_of(&heap);
+    let (mut reader, _, tail) = lapped_drain(&heap, &mut writer);
+    for index in tail..tail + 3 {
+        assert_eq!(take(&mut reader), item(index));
+    }
+    // Four records write over the next one, and `tail` is the one after it.
+    publish(&mut writer, 4);
+    assert_eq!(heap.loaded().tail() / SLOT, u64::from(tail + 4));
+    assert_eq!(take(&mut reader), Got::Lagged(1));
+    assert_eq!(take(&mut reader), item(tail + 4));
+}
+
+/// A second drain of one reader, after the first turned to `half`, resumes at `tail` again.
+#[test]
+fn a_new_drain_of_a_reader_resumes_at_tail_again() {
+    let heap = Heap::new(RING);
+    let mut writer = writer_of(&heap);
+    let (mut reader, _, tail) = lapped_drain(&heap, &mut writer);
+    let half = turned(&heap, &mut writer, &mut reader, tail);
+    reader.stop_at(None);
+    assert_eq!(
+        drain(&mut reader),
+        (half..203).map(item).collect::<Vec<_>>()
+    );
+    publish(&mut writer, 200);
+    reader.stop_at(Some(writer.position()));
+    let tail = (heap.loaded().tail() / SLOT) as u32;
+    assert_eq!(take(&mut reader), Got::Lagged(u64::from(tail) - 203));
+    // Turned again, then a drain to a later end with no `None` between: at `tail` again.
+    turned(&heap, &mut writer, &mut reader, tail);
+    publish(&mut writer, 200);
+    reader.stop_at(Some(writer.position()));
+    let tail = (heap.loaded().tail() / SLOT) as u32;
+    assert!(matches!(take(&mut reader), Got::Lagged(_)));
+    assert_eq!(take(&mut reader), item(tail));
+}
+
 /// What the two sides of the race below share to pace one another.
 struct Pace {
     /// Ring stores the publisher has made.
@@ -911,10 +1298,11 @@ enum Rhythm {
     Scattered,
     /// Before each payload copy, for the next of [`STAGES`] stores.
     Staged,
+    /// Headers loaded twice, stores between: the new first word, the old index, as on 32-bit.
+    Torn,
 }
 
-/// Ring stores a staged reader waits for. A record is three (its header, then its payload cut at
-/// the first chunk's end); six or more overwrite its record.
+/// Stores a staged reader waits for: 3 a record (header, payload cut at chunk 1); 6+ overwrite.
 const STAGES: [u32; 6] = [0, 6, 1, 7, 2, 8];
 
 /// Memory behind which a reader lets the publisher store a while between two of its own steps.
@@ -1019,6 +1407,14 @@ impl<M: Loads> Loads for Paced<'_, M> {
             let turn = self.2.replace(self.2.get() + 1) as usize;
             self.wait(STAGES[turn % STAGES.len()]);
         }
+        if self.3 == Rhythm::Torn && dst.len() == 8 {
+            let mut first = [0; 8];
+            self.0.load_ring(position, &mut first);
+            self.wait(self.scatter(3));
+            self.0.load_ring(position, dst);
+            dst[4..].copy_from_slice(&first[4..]);
+            return;
+        }
         self.0.load_ring(position, dst);
     }
 
@@ -1043,6 +1439,36 @@ impl Drop for Finished<'_> {
 
 /// A publisher of `records` records, a ring of two, a reader of each kind: how many the first read.
 fn race(rhythm: Rhythm, records: u32, len_of: fn(u32) -> usize) -> u32 {
+    race_of(
+        rhythm,
+        records,
+        len_of,
+        body,
+        Start::Latest { at: 0, index: 0 },
+    )
+}
+
+/// Payloads of words that pass for headers of items with no payload, of indexes two to four back.
+fn passes_for_headers(index: u32, len: usize) -> Vec<u8> {
+    let word = |back: u32| {
+        let header = Header {
+            kind: 0,
+            len: 0,
+            index: index.wrapping_sub(back),
+        };
+        header.bytes()
+    };
+    (2..).flat_map(word).take(len).collect()
+}
+
+/// [`race`] of payloads `payload_of` makes, read from `start`: unanchored, losses count from then.
+fn race_of(
+    rhythm: Rhythm,
+    records: u32,
+    len_of: fn(u32) -> usize,
+    payload_of: fn(u32, usize) -> Vec<u8>,
+    start: Start,
+) -> u32 {
     let heap = Heap::new(64);
     let pace = Pace {
         stores: AtomicU32::new(0),
@@ -1051,26 +1477,24 @@ fn race(rhythm: Rhythm, records: u32, len_of: fn(u32) -> usize) -> u32 {
     let done = &pace.done;
     let paced = |memory, seed| Paced(memory, &pace, Cell::new(seed), rhythm);
     let mut writer = Writer::new(Paced(heap.stored(), &pace, Cell::new(0), rhythm));
-    let attach = |seed| {
-        let from_start = Start::Latest { at: 0, index: 0 };
-        Reader::attach(paced(heap.loaded(), seed), from_start).unwrap()
-    };
+    let attach = |seed, start| Reader::attach(paced(heap.loaded(), seed), start).unwrap();
     std::thread::scope(|scope| {
         scope.spawn(|| {
             // Set when the thread ends, by a panic too: the readers' pauses wait for it.
             let _finished = Finished(done);
             for index in 0..records {
-                let payload = body(index, len_of(index));
+                let payload = payload_of(index, len_of(index));
                 writer.put(Kind::Item, &payload).unwrap();
             }
         });
         scope.spawn(|| {
-            let mut newest = attach(2);
+            let mut newest = attach(2, Start::Latest { at: 0, index: 0 });
             let mut above = 0;
             while !done.load(Ordering::Acquire) {
                 match latest(&mut newest) {
                     Got::Item(index, payload) => {
-                        assert_eq!(payload, body(index, len_of(index)), "record {index}");
+                        let published = payload_of(index, len_of(index));
+                        assert_eq!(payload, published, "record {index}");
                         assert!(index >= above, "{index} after {above}");
                         above = index + 1;
                     }
@@ -1079,13 +1503,17 @@ fn race(rhythm: Rhythm, records: u32, len_of: fn(u32) -> usize) -> u32 {
                 }
             }
         });
-        let mut reader = attach(1);
-        let (mut next, mut read) = (0u32, 0u32);
+        let mut reader = attach(1, start);
+        let anchored = matches!(start, Start::Latest { .. });
+        let (mut next, mut read, mut first) = (0u32, 0u32, None);
         loop {
             let finished = done.load(Ordering::Acquire);
             match take(&mut reader) {
                 Got::Item(index, payload) => {
-                    assert_eq!(payload, body(index, len_of(index)), "record {index}");
+                    if !anchored && first.is_none() {
+                        (next, first) = (index, Some(index));
+                    }
+                    assert_eq!(payload, payload_of(index, len_of(index)), "record {index}");
                     assert_eq!(index, next, "an index out of order");
                     (next, read) = (next + 1, read + 1);
                 }
@@ -1096,9 +1524,10 @@ fn race(rhythm: Rhythm, records: u32, len_of: fn(u32) -> usize) -> u32 {
                 other => panic!("{other:?}"),
             }
         }
-        // Every record was either returned or reported as lost, and none twice.
+        // Every record from the first counted on was either returned or reported as lost, once.
+        let counted = records - first.unwrap_or(0);
         assert_eq!(next, records);
-        assert_eq!(u64::from(read) + reader.lost(), u64::from(records));
+        assert_eq!(u64::from(read) + reader.lost(), u64::from(counted));
         read
     })
 }
@@ -1122,4 +1551,19 @@ fn a_copy_that_caught_an_overwrite_is_judged_by_a_frontier_stored_before_it() {
     let read = race(Rhythm::Staged, records, |_| BODY);
     // Some whole record returned, so both judgements ran; how many depends on the machine's load.
     assert!(read > 0, "{read} of {records}");
+}
+
+/// Zero or header-like payloads, torn headers: none moves the reader unjudged, from either start.
+#[test]
+fn records_whose_payloads_pass_for_headers_are_returned_whole_or_counted() {
+    let records = if cfg!(miri) { 60 } else { 20_000 };
+    let lens = |index: u32| [0, 5, 24][index as usize % 3];
+    let zeros = |_, len| vec![0; len];
+    let starts = [Start::Latest { at: 0, index: 0 }, Start::Oldest];
+    for start in starts {
+        for rhythm in [Rhythm::Scattered, Rhythm::Torn] {
+            race_of(rhythm, records, lens, zeros, start);
+            race_of(rhythm, records, lens, passes_for_headers, start);
+        }
+    }
 }

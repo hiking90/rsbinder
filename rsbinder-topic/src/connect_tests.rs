@@ -206,21 +206,22 @@ fn a_request_the_publisher_cannot_take_is_refused_for_what_is_wrong_with_it() {
     assert_eq!(service_specific(acceptor.accept(&other)), ERROR_VERSION);
     let other = subscribe::<crate::typed_tests::Sample>(&publisher.as_binder(), Start::Latest);
     assert_eq!(code(other), StatusCode::BadType);
-    for pins in [2, -1] {
-        let mut other = request(page(), token());
+    // Asked from this thread, two pins on a page of two: the count alone is wrong.
+    for (pins, page) in [(2, control(b"RSTC", VERSION, 2, 0x88)), (-1, page())] {
+        let mut other = request(page, token());
         other.pins = pins;
-        assert_eq!(
-            code(acceptor.accept(&other)),
-            StatusCode::BadValue,
-            "{pins} pins"
-        );
+        let refused = {
+            let _asking = crate::connect::Asking::new(&other);
+            acceptor.accept(&other)
+        };
+        assert_eq!(code(refused), StatusCode::BadValue, "{pins} pins");
     }
     // A token this thread asks with, so that the wake alone is wrong.
     let asking = token();
     let mut other = request(page(), asking.clone());
     other.wake = WAKE_FD + 1;
     let refused = {
-        let _asking = crate::connect::Asking::new(&asking);
+        let _asking = crate::connect::Asking::new(&other);
         acceptor.accept(&other)
     };
     assert_eq!(code(refused), StatusCode::BadValue);
@@ -230,10 +231,10 @@ fn a_request_the_publisher_cannot_take_is_refused_for_what_is_wrong_with_it() {
     let foreign = request(page(), token());
     assert_eq!(code(acceptor.accept(&foreign)), StatusCode::BadValue);
     // A token this thread asks with that is not an `ISubscription`: nothing to tell it through.
-    let other = publisher.as_binder();
+    let other = request(page(), publisher.as_binder());
     let refused = {
         let _asking = crate::connect::Asking::new(&other);
-        acceptor.accept(&request(page(), other.clone()))
+        acceptor.accept(&other)
     };
     assert_eq!(code(refused), StatusCode::BadValue);
     assert_eq!(publisher.subscriber_count(), 0);
@@ -256,20 +257,38 @@ fn a_control_page_that_is_not_what_the_request_says_is_refused() {
         (control(b"RSTC", VERSION, 0, 0x88), "another size"),
     ] {
         // The request is made as `Subscriber::request` makes it, from this thread.
-        let token = token();
-        let _asking = crate::connect::Asking::new(&token);
-        let refused = acceptor.accept(&request(fd, token.clone()));
+        let asked = request(fd, token());
+        let _asking = crate::connect::Asking::new(&asked);
+        let refused = acceptor.accept(&asked);
         assert_eq!(code(refused), StatusCode::BadValue, "{why}");
     }
     let token = token();
-    let _asking = crate::connect::Asking::new(&token);
-    let page = control(b"RSTC", VERSION, 0, 0x80);
-    assert!(acceptor.accept(&request(page, token.clone())).is_ok());
+    let asked = request(control(b"RSTC", VERSION, 0, 0x80), token.clone());
+    {
+        let _asking = crate::connect::Asking::new(&asked);
+        assert!(acceptor.accept(&asked).is_ok());
+    }
     // One pin word: four bytes past the header, rounded up to eight.
     let mut pinned = request(control(b"RSTC", VERSION, 1, 0x88), token.clone());
     pinned.pins = 1;
+    let _asking = crate::connect::Asking::new(&pinned);
     assert!(acceptor.accept(&pinned).is_ok());
     assert_eq!(publisher.subscriber_count(), 2);
+}
+
+/// A request with this thread's token but not its address, as a nested call brings, is refused.
+#[test]
+fn a_copy_of_the_request_this_thread_makes_is_refused() {
+    let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
+    let acceptor = publisher.acceptor();
+    let token = token();
+    let asked = request(control(b"RSTC", VERSION, 0, 0x80), token.clone());
+    let _asking = crate::connect::Asking::new(&asked);
+    let echoed = request(control(b"RSTC", VERSION, 0, 0x80), token);
+    assert_eq!(code(acceptor.accept(&echoed)), StatusCode::BadValue);
+    assert_eq!(publisher.subscriber_count(), 0);
+    assert!(acceptor.accept(&asked).is_ok());
+    assert_eq!(publisher.subscriber_count(), 1);
 }
 
 #[test]
@@ -619,7 +638,7 @@ fn a_request_with_a_wake_fd_the_publisher_cannot_use_is_refused() {
         asked.wake = wake;
         asked.wakeFd = wake_fd().map(ParcelFileDescriptor::new);
         let answered = {
-            let _asking = crate::connect::Asking::new(&asking);
+            let _asking = crate::connect::Asking::new(&asked);
             acceptor.accept(&asked)
         };
         match taken {
@@ -639,15 +658,14 @@ fn a_request_with_a_wake_fd_the_publisher_cannot_use_is_refused() {
     asked.wake = WAKE_FD;
     asked.wakeFd = Some(ParcelFileDescriptor::new(theirs));
     {
-        let _asking = crate::connect::Asking::new(&asking);
+        let _asking = crate::connect::Asking::new(&asked);
         acceptor.accept(&asked).unwrap();
     }
     let bounded = rustix::net::sockopt::socket_send_buffer_size(&kept).unwrap();
     assert!(bounded < large, "{bounded} of {large}");
 }
 
-/// The wake socket is the subscriber's own: a byte this process sends on it makes the polled fd
-/// readable until drained.
+/// A byte this process sends on the subscriber's own wake socket is readable until drained.
 #[test]
 fn a_wake_of_this_process_makes_the_wake_socket_readable_until_drained() {
     let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
@@ -703,13 +721,226 @@ fn a_wake_socket_shut_down_without_an_end_ends_the_wait_as_the_publishers_death(
     let local = subscriber.local().clone();
     let wait = std::time::Duration::from_secs(10);
     let receiving = std::thread::spawn(move || subscriber.recv_timeout(wait).map(drop));
-    while !local.is_parked() {
+    let until = std::time::Instant::now() + wait;
+    while !local.is_parked() && std::time::Instant::now() < until {
         std::thread::sleep(std::time::Duration::from_micros(50));
     }
     let socket = theirs.lock().unwrap().take().unwrap();
     rustix::net::shutdown(&socket, rustix::net::Shutdown::Both).unwrap();
     let died = Err(RecvError::Closed(Closed::PublisherDied));
     assert_eq!(receiving.join().unwrap(), died);
+}
+
+/// The publisher of a topic of one item, written as `Writer::put` writes, which tests drive.
+type Lapper = Arc<Mutex<crate::ring::Writer<layout::Stored<rsbinder::fmq::shm::Mapping>>>>;
+
+/// A topic of one item at 0, and its publisher, which [`lap_each_judgment`] sets writing.
+fn lapped_topic() -> (SIBinder, Lapper) {
+    struct Lapping(OwnedFd);
+    impl Interface for Lapping {}
+    impl ITopic for Lapping {
+        fn r#subscribe(&self, _: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
+            Ok(endpoint(self.0.try_clone().unwrap(), MIN_RING as u64))
+        }
+    }
+    let (memory, stored) = layout::create_topic(MIN_RING).unwrap();
+    let mut writer = crate::ring::Writer::new(stored);
+    writer.put(crate::ring::Kind::Item, &[]).unwrap();
+    let topic = BnTopic::new_binder(Lapping(memory)).as_binder();
+    (topic, Arc::new(Mutex::new(writer)))
+}
+
+/// On this thread, more than a ring written before each judgment: every look gives up lapped.
+fn lap_each_judgment(writer: &Lapper) {
+    let writer = writer.clone();
+    crate::ring::BEFORE_JUDGING.set(Some(Box::new(move || {
+        let mut writer = writer.lock().unwrap();
+        for _ in 0..writer.capacity() / 8 + 1 {
+            writer.put(crate::ring::Kind::Item, &[]).unwrap();
+        }
+    })));
+}
+
+/// Every look lapped, `seq` moved before each decision: the deadline and the timeouts end it.
+#[test]
+fn a_reader_lapped_at_every_look_ends_at_its_deadline() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let (topic, writer) = lapped_topic();
+    // Before the `seq` a wait decides on: never the one its look came after, so it never sleeps.
+    let moving = |subscriber: &mut Subscriber<Bytes>| {
+        let writer = writer.clone();
+        subscriber.before_seen = Some(Box::new(move || {
+            writer.lock().unwrap().announce();
+        }));
+    };
+    let short = Duration::from_millis(100);
+    let (sent, got) = mpsc::channel();
+    let mut subscriber = subscribe::<Bytes>(&topic, Start::Latest).unwrap();
+    moving(&mut subscriber);
+    #[cfg_attr(
+        not(feature = "tokio"),
+        expect(unused_mut, reason = "only the async drivers are pushed")
+    )]
+    let mut locals = vec![subscriber.local().clone()];
+    let to = sent.clone();
+    let lapping = writer.clone();
+    std::thread::spawn(move || {
+        lap_each_judgment(&lapping);
+        to.send(subscriber.recv_timeout(short).map(drop))
+    });
+    // Each `recv_async`: on the blocking pool's path, and on the reactor's.
+    #[cfg(feature = "tokio")]
+    for wake in [Wake::Futex, Wake::Fd] {
+        let policy = SubscriberPolicy {
+            wake,
+            ..SubscriberPolicy::default()
+        };
+        let mut subscriber = Subscriber::<Bytes>::request(&topic, &policy).unwrap();
+        moving(&mut subscriber);
+        locals.push(subscriber.local().clone());
+        let (to, lapping) = (sent.clone(), writer.clone());
+        std::thread::spawn(move || {
+            lap_each_judgment(&lapping);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let got = runtime
+                .block_on(async { tokio::time::timeout(short, subscriber.recv_async()).await });
+            // The timer's end, as the sync receive's own.
+            to.send(got.unwrap_or(Err(RecvError::Timeout)).map(drop))
+        });
+    }
+    for _ in 0..locals.len() {
+        let got = got.recv_timeout(Duration::from_secs(10));
+        assert_eq!(got, Ok(Err(RecvError::Timeout)));
+    }
+    // None slept: a wait that arms has decided to.
+    for (driver, local) in locals.iter().enumerate() {
+        let arms = local.arms.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(arms, 0, "driver {driver}");
+    }
+}
+
+/// Every look lapped and no deadline: each wait sleeps until its interrupt, and so does a poll.
+#[test]
+fn a_reader_lapped_at_every_look_sleeps_when_no_deadline_ends_it() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    let (topic, writer) = lapped_topic();
+    let subscribe = |wake| {
+        let policy = SubscriberPolicy {
+            wake,
+            ..SubscriberPolicy::default()
+        };
+        Subscriber::<Bytes>::request(&topic, &policy).unwrap()
+    };
+    let cases = [
+        (Wake::Futex, false),
+        (Wake::Fd, false),
+        #[cfg(feature = "tokio")]
+        (Wake::Futex, true),
+        #[cfg(feature = "tokio")]
+        (Wake::Fd, true),
+    ];
+    for (wake, on_runtime) in cases {
+        let mut subscriber = subscribe(wake);
+        let (local, interrupter) = (subscriber.local().clone(), subscriber.interrupter());
+        let (sent, got) = mpsc::channel();
+        let lapping = writer.clone();
+        std::thread::spawn(move || {
+            lap_each_judgment(&lapping);
+            let got = match on_runtime {
+                #[cfg(feature = "tokio")]
+                true => tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(subscriber.recv_async()),
+                _ => subscriber.recv(),
+            };
+            sent.send(got.map(drop))
+        });
+        let until = Instant::now() + Duration::from_secs(10);
+        while !local.is_parked() && Instant::now() < until {
+            std::thread::sleep(Duration::from_micros(50));
+        }
+        // Asleep, not arming at every turn: `parked` stays up while no further wait starts.
+        let arms = local.arms.load(std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(100));
+        let armed = local.arms.load(std::sync::atomic::Ordering::SeqCst) - arms;
+        let slept = local.is_parked() && armed <= 1;
+        // Before the check: a receive that never sleeps still ends at it.
+        interrupter.interrupt();
+        let got = got.recv_timeout(Duration::from_secs(10));
+        let case = format!("{wake:?}, async {on_runtime}");
+        assert!(
+            slept,
+            "{case}: the wait never slept, {armed} arms in 100 ms"
+        );
+        assert_eq!(got, Ok(Err(RecvError::Cancelled)), "{case}");
+    }
+    // A poll loop: the first `prepare_wait` asks for one more look, the second polls.
+    lap_each_judgment(&writer);
+    let mut subscriber = subscribe(Wake::Fd);
+    let mut polled = Vec::new();
+    for _ in 0..2 {
+        assert_eq!(subscriber.try_recv().map(drop), Err(RecvError::Empty));
+        let short = Some(Duration::from_millis(100));
+        polled.push(crate::wait_any(&mut [&mut subscriber], short).unwrap());
+    }
+    assert_eq!(polled, [true, false]);
+}
+
+/// A `seq` moved before every arm and no record: the reactor's wait still ends at its `timeout`.
+#[cfg(feature = "tokio")]
+#[test]
+fn a_reactor_wait_whose_seq_moves_at_every_arm_ends_at_its_timeout() {
+    use crate::ring::Stores;
+    use std::sync::mpsc;
+    use std::time::Duration;
+    struct Keeping {
+        memory: OwnedFd,
+        theirs: Mutex<Option<OwnedFd>>,
+    }
+    impl Interface for Keeping {}
+    impl ITopic for Keeping {
+        fn r#subscribe(&self, request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
+            let socket = request.wakeFd.as_ref().unwrap().as_fd();
+            *self.theirs.lock().unwrap() = Some(socket.try_clone_to_owned().unwrap());
+            Ok(endpoint(self.memory.try_clone().unwrap(), MIN_RING as u64))
+        }
+    }
+    let (memory, stored) = layout::create_topic(MIN_RING).unwrap();
+    let keeping = Keeping {
+        memory,
+        theirs: Mutex::new(None),
+    };
+    let topic = BnTopic::new_binder(keeping).as_binder();
+    let policy = SubscriberPolicy {
+        wake: Wake::Fd,
+        ..SubscriberPolicy::default()
+    };
+    let mut subscriber = Subscriber::<Bytes>::request(&topic, &policy).unwrap();
+    // Between the wait's `seen` and its look after arming, so that look never finds `seen`.
+    let stored = Mutex::new(stored);
+    subscriber.about_to_park = Some(Box::new(move || {
+        stored.lock().unwrap().bump_seq();
+    }));
+    let (sent, got) = mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let short = Duration::from_millis(100);
+        let got =
+            runtime.block_on(async { tokio::time::timeout(short, subscriber.recv_async()).await });
+        sent.send(got.map(|got| got.map(drop)))
+    });
+    let got = got.recv_timeout(Duration::from_secs(10));
+    assert!(matches!(got, Ok(Err(_))), "{got:?}");
 }
 
 /// A value whose encoding panics.
@@ -883,9 +1114,7 @@ fn instances_of_a_generic_parcelable_share_a_type_name_unless_wrapped() {
     assert_eq!(wrapped.try_recv(), Ok(Longs(Pair(-3))));
 }
 
-/// AC-15.2.31: the ring a reply names is libfmq's unsynchronized queue of bytes. Its reader, made
-/// from the reply's descriptor alone, reads the publisher's records in order, across the ring's
-/// end: an 8-byte header (kind and length, then index) and the payload padded to 8.
+/// AC-15.2.31: libfmq's unsynchronized byte reader reads a reply's records in order, past the end.
 #[test]
 fn an_unsynchronized_reader_of_bytes_reads_the_records_of_a_reply() {
     use rsbinder::fmq::{AttachPolicy, Descriptor, UnsyncRead, UnsyncReader, UnsyncStart};
@@ -894,7 +1123,7 @@ fn an_unsynchronized_reader_of_bytes_reads_the_records_of_a_reply() {
     let asking = token();
     let asked = request(control(b"RSTC", VERSION, 0, 0x80), asking.clone());
     let endpoint = {
-        let _asking = crate::connect::Asking::new(&asking);
+        let _asking = crate::connect::Asking::new(&asked);
         publisher.acceptor().accept(&asked).unwrap()
     };
     let descriptor = Descriptor::try_from(&endpoint.ring).unwrap();

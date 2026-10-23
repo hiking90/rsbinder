@@ -8,10 +8,10 @@
 //!
 //! B6: `--codec alloc|parcel|bytes --side publish|receive --size B`. `publish` times a publish
 //! with no subscriber; `receive` times a `try_recv` of a record already in the ring, one
-//! subscriber in this process. The codecs: `alloc` is a parcelable of one `byte[]` as the blanket
-//! `Payload` impl of plan 15 P2e-4 coded it, `rsbinder::to_bytes` into a new buffer, copied, and
-//! `rsbinder::from_bytes` of a copy; `parcel` is the same parcelable through today's blanket impl;
-//! `bytes` is `Bytes`, the payload uncoded.
+//! subscriber in this process. The codecs: `alloc` is a parcelable of one `byte[]` whose `Payload`
+//! encodes it with `rsbinder::to_bytes` into a new buffer and copies that, and decodes it with
+//! `rsbinder::from_bytes` of a copy; `parcel` is the same parcelable through the blanket
+//! `Payload` impl; `bytes` is `Bytes`, the payload uncoded.
 
 use std::sync::Arc;
 use std::thread;
@@ -44,7 +44,7 @@ impl Deserialize for Blob {
     }
 }
 
-/// [`Blob`] coded as the blanket impl of P2e-4 did: a new buffer each way, and a copy of it.
+/// [`Blob`] with a `Payload` that codes into a new buffer each way, and copies that buffer.
 #[derive(Clone, PartialEq)]
 pub struct AllocBlob(pub Blob);
 

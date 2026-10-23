@@ -32,7 +32,7 @@ enum Flaw {
     None,
     /// The publisher lends a slot whatever the pin words say.
     IgnoresPins,
-    /// The subscriber stores 0 into its pin word `Relaxed`.
+    /// The subscriber stores its pin word `Relaxed`, 0 and a slot's number alike.
     RelaxedUnpin,
 }
 
@@ -96,9 +96,7 @@ impl Pin for Model {
     }
 }
 
-/// The publisher fills `rounds` slots with the round's number, lending as if the subscribers had
-/// read up to `read`; the subscriber takes the newest record twice, and reads the slot it names
-/// when the pin holds.
+/// `rounds` lends as if all read to `read`; twice, the subscriber reads the newest slot if pinned.
 fn a_pinned_slot_is_read_whole_and_never_written(flaw: Flaw, rounds: u64, read: u64) {
     let mut model = loom::model::Builder::new();
     model.preemption_bound = Some(3);
@@ -143,13 +141,48 @@ fn a_pinned_slot_is_read_whole_and_never_written(flaw: Flaw, rounds: u64, read: 
     });
 }
 
+/// The subscriber reads slot 0, then pins slot 1 as the publisher tries slot 0 first.
+#[test]
+fn loom_pool_a_pin_moved_to_another_slot_orders_the_read_of_the_first() {
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = Some(3);
+    builder.check(|| {
+        let model = Arc::new(Model::new(Flaw::None));
+        let mut slots = Slots::new(SLOTS, 2, 1, false);
+        let mut loans = [0, 0].map(|read| {
+            let slot = slots.lend(&*model, &*model, read).expect("a slot");
+            Loan {
+                slot,
+                len: 8,
+                generation: slots.publish(&*model, slot, u64::from(SLOTS - slot)),
+            }
+        });
+        loans.sort_by_key(|loan| loan.slot);
+        let publisher = {
+            let model = model.clone();
+            thread::spawn(move || {
+                let slot = slots.lend(&*model, &*model, u64::MAX).expect("a slot");
+                // SAFETY: a lent slot, which no pin holds; loom checks that it is so.
+                model.slots[slot as usize].with_mut(|value| unsafe { *value = 3 });
+            })
+        };
+        for loan in loans {
+            if pin(&*model, &*model, loan, 8).is_ok() {
+                // SAFETY: a pinned slot of the generation the loan names; loom checks it.
+                model.slots[loan.slot as usize].with(|value| unsafe { *value });
+                unpin(&*model);
+            }
+        }
+        publisher.join().unwrap();
+    });
+}
+
 #[test]
 fn loom_pool_a_pinned_slot_is_read_whole_and_never_written() {
     a_pinned_slot_is_read_whole_and_never_written(Flaw::None, 3, u64::MAX);
 }
 
-/// Nothing read: the third round lends the oldest slot, which the second took back, so the record
-/// of the first is lost and not read as the third round writes the slot.
+/// Nothing read: round 3 lends the slot round 2 took back, so round 1's record is lost, not read.
 #[test]
 fn loom_pool_a_slot_taken_back_and_lent_again_is_never_read() {
     a_pinned_slot_is_read_whole_and_never_written(Flaw::None, 3, 0);

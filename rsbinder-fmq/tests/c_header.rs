@@ -12,7 +12,8 @@
 //! Linux only: the header targets Android too, but this harness needs a C
 //! compiler where the test runs, which a device does not have.
 
-#![cfg(target_os = "linux")]
+// Without 64-bit atomics a queue is `Unsupported` (`MessageQueue::create`).
+#![cfg(all(target_os = "linux", target_has_atomic = "64"))]
 
 mod common;
 

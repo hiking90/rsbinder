@@ -122,6 +122,11 @@ fn fanout(bench: &str, a: &Args) {
     let imp = a.str("impl", "rsb-stream");
     let n = a.num("n", 1) as usize;
     let size = a.num("size", 64) as usize;
+    if size < STAMP_BYTES {
+        // A value carries its stamp: below it, the rows would record a size not sent.
+        eprintln!("ipc-compare: --size below the stamp's {STAMP_BYTES} bytes");
+        std::process::exit(2);
+    }
     let rate = a.num("rate", 0);
     let wait = if imp == "rsb-oneway" { "block".to_string() } else { a.str("wait", "block") };
     let (count, warmup) = match a.has("count") {

@@ -18,10 +18,11 @@
 //! * A subscriber writes one small memfd of its own, its control page, which the publisher
 //!   maps read-only. Nothing a subscriber does reaches the ring or another subscriber.
 //!
-//! A topic carries values of one type, a [`Payload`]: any AIDL parcelable, or [`Bytes`]. Each
-//! publish encodes one value into one record, and each receive decodes one record or says why
-//! it returned none ([`RecvError`]): nothing was unread, records were lost, one failed to decode,
-//! or the topic ended.
+//! A topic carries values of one type, a [`Payload`]: any parcelable, derived with
+//! `#[derive(rsbinder::Parcelable)]` or generated from `.aidl`, or [`Bytes`]. Each publish
+//! encodes one value into one record, and each receive decodes one record or says why it returned
+//! none ([`RecvError`]): nothing was unread, records were lost, one failed to decode, or the topic
+//! ended.
 //!
 //! A value too large to copy twice goes through a pool instead ([`PoolPolicy`]): the publisher
 //! writes it straight into a slot of a second memfd ([`Publisher::loan_slice`], [`LoanMut`]) and
@@ -217,7 +218,7 @@ mod fd_wait_tests;
 
 #[cfg(all(test, not(any(target_os = "linux", target_os = "android"))))]
 mod unsupported_tests {
-    use rsbinder::{ExceptionCode, Interface};
+    use rsbinder::ExceptionCode;
 
     use crate::{Bytes, Publisher, PublisherPolicy, Subscriber, SubscriberPolicy};
 
@@ -225,7 +226,7 @@ mod unsupported_tests {
     fn neither_end_of_a_topic_is_made_on_a_target_without_memfd() {
         let made = Publisher::<Bytes>::new(&PublisherPolicy::default());
         assert_eq!(made.err(), Some(rsbinder::fmq::Error::Unsupported));
-        let topic = rsbinder::Binder::new(crate::connect::Token).as_binder();
+        let topic = crate::connect::Token::detached();
         let refused = Subscriber::<Bytes>::request(&topic, &SubscriberPolicy::default());
         assert_eq!(
             refused.err().map(|status| status.exception_code()),

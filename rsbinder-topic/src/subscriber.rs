@@ -39,13 +39,15 @@ use crate::aidl::SubscribeRequest::SubscribeRequest;
 use crate::aidl::TopicEndpoint::TopicEndpoint;
 use crate::connect::{refuse, status_of, Asking, Token};
 use crate::layout::{self, ControlPage, Loaded, LoadedPool, CLOSED, HEADER_OFFSET, VERSION};
-use crate::link::DeathLink;
+use crate::link::{Dead, DeathLink};
 use crate::pool::{PoolReader, MAX_PINS};
 use crate::receive::{Held, TypedReader};
 use crate::ring::{self, Loads, Reader};
+use crate::wait::{
+    decide, Died, Local, Looked, Next, Parts, Slept, Words, ABANDON, ALL, INTERRUPTED, NOTICE,
+};
 #[cfg(feature = "tokio")]
-use crate::wait::{on_pool, Leftover};
-use crate::wait::{Died, Local, Parts, Slept, Words, ABANDON, DIED, EVICTED, INTERRUPT};
+use crate::wait::{on_pool, Armed, Leftover, REACTOR_ENDS};
 use crate::wake::{self, FdWake};
 use crate::{
     poll, Bytes, Closed, Payload, RecvError, Sample, SubscriberStats, Trust, Trusted, Untrusted,
@@ -145,8 +147,7 @@ impl Default for SubscriberPolicy {
 /// [`Bytes`], `unsafe` [`trust_publisher`](Subscriber::trust_publisher) makes it
 /// [`Trusted`](crate::Trusted).
 pub struct Subscriber<T: Payload, M: Trust = Untrusted> {
-    /// Raises `ABANDON` when the subscriber is dropped, first of the fields: a wait left on the
-    /// pool lets go of the memory now rather than at a commit.
+    /// Raises `ABANDON` on drop, first of the fields: a pool wait lets go of the memory now.
     _abandon: Abandon,
     reader: TypedReader<T, Loaded<Arc<Mapping>>>,
     control: Closing,
@@ -155,16 +156,25 @@ pub struct Subscriber<T: Payload, M: Trust = Untrusted> {
     reactor: Option<Reactor>,
     local: Arc<Local<Parts>>,
     spin: SpinGauge,
+    /// What the latest look found, which every look sets; a wait decides on it.
+    looked: Looked,
     /// Values returned and records that failed to decode, for [`SubscriberStats`].
     received: u64,
     decode_errors: u64,
-    /// The wait a dropped `recv_async` left on the blocking pool, which the next wait joins.
+    /// The wait a `recv_async` handed to the blocking pool, which the next wait joins.
     #[cfg(feature = "tokio")]
     leftover: Arc<Leftover>,
     /// The token the publisher links to; alive as long as the subscription.
     _token: SIBinder,
     /// On the publisher's binder; `None` when the publisher is in this process.
     _death: Option<DeathLink<Died>>,
+    /// Set by the death notice of the publisher's binder, which `DIED` alone does not tell.
+    dead: Arc<Dead>,
+    /// A look read the topic's end record: the publisher refuses every later subscription.
+    read_end: bool,
+    /// A test's pause before a wait loads the `seq` it decides on.
+    #[cfg(test)]
+    pub(crate) before_seen: Option<Box<dyn FnMut() + Send + Sync>>,
     /// A test's pause before a wait sleeps.
     #[cfg(test)]
     pub(crate) about_to_park: Option<Box<dyn FnMut() + Send + Sync>>,
@@ -208,11 +218,9 @@ impl<T: Payload> Subscriber<T> {
     /// [`ITopic::ERROR_VERSION`](crate::aidl::ITopic::ERROR_VERSION) for a publisher of another
     /// layout version, and `BadValue` for a reply it cannot use: topic memory that is not a
     /// sealed memfd of the expected layout, a ring larger than
-    /// [`max_ring_bytes`](SubscriberPolicy::max_ring_bytes), a pool that is not a sealed memfd of
-    /// the slots it states or is larger than
-    /// [`max_pool_bytes`](SubscriberPolicy::max_pool_bytes), or a wake fd that is not what
-    /// [`wake`](SubscriberPolicy::wake) asked for (a unix stream socket for [`Wake::Fd`], none
-    /// for [`Wake::Futex`]).
+    /// [`max_ring_bytes`](SubscriberPolicy::max_ring_bytes), or a pool that is not a sealed memfd
+    /// of the slots it states or is larger than
+    /// [`max_pool_bytes`](SubscriberPolicy::max_pool_bytes).
     ///
     /// **The process has to run the binder thread pool**
     /// (`rsbinder::ProcessState::start_thread_pool`) for a publisher in another process: the
@@ -230,10 +238,14 @@ impl<T: Payload> Subscriber<T> {
             local: Arc::downgrade(&local),
         };
         let token = BnSubscription::new_binder(token).as_binder();
-        let death = DeathLink::new(topic, Died(local.clone()))?;
+        let dead = Arc::new(Dead::default());
+        let died = Died {
+            local: local.clone(),
+            dead: dead.clone(),
+        };
+        let death = DeathLink::new(topic, died)?;
         let service: Strong<dyn ITopic> = topic.clone().into_interface()?;
-        // With `Wake::Fd`, a pair of this side's own: the publisher sends on one end, as does this
-        // process on a duplicate of it, and the subscriber polls the other.
+        // `Wake::Fd`: a pair of this side's own; the publisher and this process send, it polls.
         let (fd_wake, sent) = match policy.wake {
             Wake::Futex => (None, None),
             Wake::Fd => {
@@ -257,11 +269,10 @@ impl<T: Payload> Subscriber<T> {
             wakeFd: sent,
         };
         let endpoint = {
-            let _asking = Asking::new(&token);
+            let _asking = Asking::new(&request);
             service.r#subscribe(&request)?
         };
-        // The control page's fd and the publisher's end: it has its own, and this side keeps
-        // the mapping and a duplicate.
+        // The publisher holds its own fds now; this side keeps the mapping and a duplicate.
         drop(request);
         let memory = map_endpoint(&endpoint, policy.max_ring_bytes)?;
         let pool = match &endpoint.pool {
@@ -289,7 +300,6 @@ impl<T: Payload> Subscriber<T> {
         Ok(Self {
             _abandon: Abandon {
                 local: local.clone(),
-                armed: true,
             },
             reader: TypedReader::new(reader, pool),
             control,
@@ -297,12 +307,17 @@ impl<T: Payload> Subscriber<T> {
             reactor: None,
             local,
             spin: SpinGauge::default(),
+            looked: Looked::Exact,
             received: 0,
             decode_errors: 0,
             #[cfg(feature = "tokio")]
             leftover: Arc::default(),
             _token: token,
             _death: death,
+            dead,
+            read_end: false,
+            #[cfg(test)]
+            before_seen: None,
             #[cfg(test)]
             about_to_park: None,
             #[cfg(all(test, feature = "tokio"))]
@@ -334,6 +349,16 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
     /// [`RecvError::Cancelled`] when an [`Interrupter`] ends the wait. After the publisher's
     /// process died, it returns the records committed before the death and then
     /// [`Closed::PublisherDied`](crate::Closed::PublisherDied) without waiting.
+    ///
+    /// Before it sleeps the wait looks at the ring, and for a while watches the publisher's
+    /// committed position, so a record committed meanwhile is returned without a sleep. A sleep
+    /// ends at the wake the publisher sends after a commit and the bump of the topic's `seq` that
+    /// announces it (a bump before the sleep keeps it from sleeping, a bump alone ends none), at
+    /// an event of this process (an interrupt, the publisher's death notice, an eviction), or
+    /// when the futex wait returns early, as at a signal (`EINTR`); the wait then looks again. A
+    /// publisher that breaks the protocol and commits a record with no wake after it may leave a
+    /// wait without a bound asleep: the next receive returns that record, as each looks before it
+    /// waits, and [`recv_timeout`](Self::recv_timeout) returns [`RecvError::Timeout`] at its bound.
     pub fn recv(&mut self) -> Result<T, RecvError> {
         self.wait(None, false)
     }
@@ -359,12 +384,22 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
     /// With [`Wake::Futex`] the wait sleeps on a thread of the blocking pool
     /// (`tokio::task::spawn_blocking`, or the calling thread inside a binder transaction), so
     /// it holds that thread, not an executor thread, for as long as it lasts. With [`Wake::Fd`]
-    /// it waits on the runtime's reactor (`tokio::io::unix::AsyncFd`) and holds no thread.
+    /// it waits on the runtime's reactor (`tokio::io::unix::AsyncFd`) and holds no thread. That
+    /// reactor is the one of the runtime the first such call ran on, and later calls wait on it
+    /// from any runtime: a `current_thread` runtime that no longer runs `block_on` wakes none of
+    /// them until it is dropped; a wait whose reactor's runtime is dropped registers again with
+    /// the runtime it runs on.
     ///
-    /// Cancel-safe: dropping the future loses no record. A wait it left on the pool is woken,
-    /// and the next receive that may wait joins it before looking at the ring. Besides `recv`'s
-    /// results, [`RecvError::Cancelled`] when the pool cannot run the wait, or the reactor
-    /// cannot take the subscription's file descriptors.
+    /// Cancel-safe: dropping the future loses no record. A wait the pool has not started is taken
+    /// back at the drop, and one it has started is woken, so the next receive waits only for that
+    /// thread to leave it. A future leaked rather than dropped leaves its wait to the pool: the
+    /// next receive that may wait returns a record already unread, and else joins that wait
+    /// before it waits itself. The join lasts until a pool thread has run that wait, which ends
+    /// as any wait does, at a commit, an interrupt or a death; while it is still queued nothing
+    /// ends the join, however long the pool takes. A [`recv_timeout`](Self::recv_timeout) whose
+    /// `timeout` passes first looks at the ring once more and does not wait. Besides `recv`'s
+    /// results, [`RecvError::Cancelled`] when the pool cannot run the wait, or the reactor cannot
+    /// take the subscription's file descriptors.
     ///
     /// # Panics
     ///
@@ -377,6 +412,11 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
         }
         loop {
             if self.leftover.busy() {
+                // Before the join, as `wait_with` looks; it leaves `ABANDON` to the wait still out.
+                match self.look(false) {
+                    Err(RecvError::Empty) => {}
+                    other => return other,
+                }
                 self.leftover.join_async().await;
             }
             self.local.take(ABANDON);
@@ -384,23 +424,19 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
                 Err(RecvError::Empty) => {}
                 other => return other,
             }
-            if self.local.take(INTERRUPT) {
+            if self.cancelled() {
                 return Err(RecvError::Cancelled);
             }
-            let seen = self.local.words().seq();
-            if self.reader.pending() || self.local.stopped() {
+            let seen = self.seen();
+            if self.next(seen, ALL) == Next::Look {
+                yield_once().await;
                 continue;
             }
             #[cfg(test)]
             if let Some(hook) = self.about_to_park.as_mut() {
                 hook();
             }
-            let mut abandon = Abandon {
-                local: self.local.clone(),
-                armed: true,
-            };
             let ran = on_pool(&self.local, &self.leftover, seen).await;
-            abandon.armed = false;
             if ran.is_err() {
                 return Err(RecvError::Cancelled);
             }
@@ -415,17 +451,18 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
                 Err(RecvError::Empty) => {}
                 other => return other,
             }
-            if self.local.take(INTERRUPT) {
+            if self.cancelled() {
                 return Err(RecvError::Cancelled);
             }
-            let seen = self.local.words().seq();
-            // No `ABANDON` here: only a futex wake's pool wait and a dropped subscriber raise it.
-            if self.reader.pending() || self.local.stopped() {
+            let seen = self.seen();
+            if self.next(seen, REACTOR_ENDS) == Next::Look {
+                yield_once().await;
                 continue;
             }
             if self.reactor.is_none() {
                 let fd = self.local.words().fd.as_ref().map(FdWake::fd);
-                let made = fd.map(Reactor::new).transpose();
+                // SAFETY: `reactor` is declared before `local`, whose last `Arc` closes the fd.
+                let made = fd.map(|fd| unsafe { Reactor::new(fd) }).transpose();
                 self.reactor = made.map_err(|_| RecvError::Cancelled)?;
             }
             let Some(reactor) = &self.reactor else {
@@ -435,16 +472,20 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
             if let Some(hook) = self.about_to_park.as_mut() {
                 hook();
             }
+            // Bytes a drain left make no new edge, so the reactor would not report them.
+            let unread = self.local.words().fd.as_ref().is_some_and(FdWake::unread);
             let armed = Armed(&self.local);
-            if self.local.arm(seen) != 0 || self.local.words().seq() != seen {
+            if !self.local.arm_reactor(seen, unread) {
+                drop(armed);
+                yield_once().await;
                 continue;
             }
             let woke = reactor.readable().await;
             drop(armed);
             if woke.is_err() {
-                // A reactor that went away with its runtime: the next call takes the current one.
+                // A reactor that went away with its runtime: the wait goes on with the current one.
                 self.reactor = None;
-                return Err(RecvError::Cancelled);
+                continue;
             }
         }
     }
@@ -476,11 +517,44 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
         self.reader.committed()
     }
 
+    /// Whether the latest look gave up short of the publisher's `write` ([`Looked::GaveUp`]).
+    pub(crate) fn gave_up(&self) -> bool {
+        matches!(self.looked, Looked::GaveUp(_))
+    }
+
+    /// [`Reader::count_lost_before`](crate::ring::Reader::count_lost_before), for a drain that
+    /// ends at the end it was [stopped at](Self::stop_at) after a look that gave up, or after
+    /// receives that did not move it: the records it counted lost.
+    pub(crate) fn count_lost_before(&mut self) -> u64 {
+        // The reader may have moved: a wait looks again before it decides to sleep.
+        self.looked = Looked::Exact;
+        self.reader.count_lost_before()
+    }
+
+    /// [`Reader::stop_at`](crate::ring::Reader::stop_at), for a drain that ends at `end`.
+    pub(crate) fn stop_at(&mut self, end: Option<u64>) {
+        self.reader.stop_at(end);
+    }
+
+    /// Whether this subscription saw its publisher end for good: a look read the topic's end
+    /// record, or the death notice of the publisher's binder ran. A `DIED` raised for a wake
+    /// socket that hung up is neither, nor is a result that failed a check.
+    pub(crate) fn saw_publisher_end(&self) -> bool {
+        self.read_end || self.dead.get()
+    }
+
+    /// Clear [`NOTICE`], which a wait ends at and leaves up; whether it was up.
+    pub(crate) fn take_notice(&self) -> bool {
+        self.local.take(NOTICE)
+    }
+
     /// The next record, or the newest with `latest`, without waiting.
     fn look(&mut self, latest: bool) -> Result<T, RecvError> {
         if self.local.evicted() {
+            self.looked = Looked::Exact;
             return Err(RecvError::Closed(Closed::Evicted));
         }
+        let before = self.before_look();
         let died = self.local.died();
         let received = match (M::TRUSTED, latest) {
             // SAFETY: `Trusted`, which only `trust_publisher` makes, on its caller's word.
@@ -489,7 +563,15 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
             (false, false) => self.reader.try_recv(),
         };
         let read = self.reader.position();
-        self.settle(received, died, read)
+        self.settle(received, died, read, before)
+    }
+
+    /// `seq` before a look, loaded only after one that gave up: [`decide`] needs it then alone.
+    fn before_look(&self) -> Option<u32> {
+        match self.looked {
+            Looked::GaveUp(_) => Some(self.local.words().seq()),
+            Looked::Exact => None,
+        }
     }
 
     /// A receive that waits until `deadline`, or without a bound.
@@ -497,8 +579,7 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
         self.wait_with(deadline, |subscriber| subscriber.look(latest))
     }
 
-    /// Wait until `look` finds something other than [`RecvError::Empty`], or `deadline` passes.
-    /// What `look` returns holds no borrow of the subscriber, so the loop can go round.
+    /// Wait until `look` finds other than `Empty`, or `deadline` passes; `look` holds no borrow.
     fn wait_with<V>(
         &mut self,
         deadline: Option<Instant>,
@@ -508,8 +589,13 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
         {
             #[cfg(test)]
             let joining = Instant::now();
-            // Before the first look: a wait left on the pool would take the next wake.
-            let joined = self.leftover.join(deadline);
+            // Before this wait arms: a wait left on the pool would take the next wake.
+            let joined = !self.leftover.busy()
+                || match look(self) {
+                    // A look arms nothing: a record already unread waits for no turn of the pool.
+                    Err(RecvError::Empty) => self.leftover.join(deadline),
+                    other => return other,
+                };
             #[cfg(test)]
             {
                 self.trace = Trace {
@@ -518,7 +604,11 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
                 };
             }
             if !joined {
-                return Err(RecvError::Timeout);
+                // One look, which arms nothing: the wait still out keeps `WAITING` and `ABANDON`.
+                return match look(self) {
+                    Err(RecvError::Empty) => Err(RecvError::Timeout),
+                    other => other,
+                };
             }
             self.local.take(ABANDON);
         }
@@ -529,21 +619,24 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
                 Err(RecvError::Empty) => {}
                 other => return other,
             }
-            if self.local.take(INTERRUPT) {
+            if self.cancelled() {
                 return Err(RecvError::Cancelled);
             }
             // Stale: past the join no wait of this subscriber is out. Left up, it ends every park.
             self.local.take(ABANDON);
-            if !woke && self.spun(deadline) {
-                continue;
+            // At every turn: a look lapped each time finds nothing while `pending` holds.
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(RecvError::Timeout);
             }
-            let seen = self.local.words().seq();
-            if self.reader.pending() || self.local.stopped() {
+            if !woke && self.spun(deadline) {
+                // Once: on a ring lapped at every look `pending` holds, so every spin ends at once.
                 woke = true;
                 continue;
             }
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                return Err(RecvError::Timeout);
+            let seen = self.seen();
+            if self.next(seen, ALL) == Next::Look {
+                woke = true;
+                continue;
             }
             #[cfg(test)]
             if let Some(hook) = self.about_to_park.as_mut() {
@@ -569,20 +662,48 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
         found
     }
 
-    /// Report `read` and the losses, and count what `received` is.
+    /// `seq`, as a wait loads it to decide on and sleep on.
+    fn seen(&mut self) -> u32 {
+        #[cfg(test)]
+        if let Some(hook) = self.before_seen.as_mut() {
+            hook();
+        }
+        self.local.words().seq()
+    }
+
+    /// [`decide`] on the latest look, for a wait that ends at or takes the bits in `honors`.
+    fn next(&self, seen: u32, honors: u32) -> Next {
+        decide(self.looked, seen, self.local.stop_bits(), honors, || {
+            self.reader.pending()
+        })
+    }
+
+    /// [`Local::cancelled`]: at an interrupt, which it takes, or at [`NOTICE`].
+    fn cancelled(&self) -> bool {
+        self.local.cancelled()
+    }
+
+    /// Report `read` and the losses, record what the look found, and count what `received` is.
     fn settle<V>(
         &mut self,
         received: Result<V, RecvError>,
         died: bool,
         read: u64,
+        before: Option<u32>,
     ) -> Result<V, RecvError> {
         let page = &self.control.0;
         // After the copy: a publisher that waits for this `read` writes over the record only then.
         page.read().store(read, Ordering::Release);
         page.lost().store(self.reader.lost(), Ordering::Relaxed);
+        self.looked = match &received {
+            Err(RecvError::Empty) if self.reader.gave_up() => Looked::GaveUp(before),
+            _ => Looked::Exact,
+        };
         match &received {
             Ok(_) => self.received += 1,
             Err(RecvError::Decode(_)) => self.decode_errors += 1,
+            // Made of the end record alone (`not_a_value`).
+            Err(RecvError::Closed(Closed::End | Closed::Status(_))) => self.read_end = true,
             Err(_) => {}
         }
         match received {
@@ -601,6 +722,16 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
     #[cfg(all(test, not(loom), any(target_os = "linux", target_os = "android")))]
     pub(crate) fn local(&self) -> &Arc<Local<Parts>> {
         &self.local
+    }
+
+    /// The death recipient of this subscription, for tests that run it on a publisher of this
+    /// process, which has none.
+    #[cfg(all(test, not(loom), any(target_os = "linux", target_os = "android")))]
+    pub(crate) fn death_notice(&self) -> Died {
+        Died {
+            local: self.local.clone(),
+            dead: self.dead.clone(),
+        }
     }
 
     /// The record of a wait left on the pool, for tests that see it end.
@@ -655,12 +786,17 @@ impl Subscriber<Bytes> {
             reactor,
             local,
             spin,
+            looked,
             received,
             decode_errors,
             #[cfg(feature = "tokio")]
             leftover,
             _token,
             _death,
+            dead,
+            read_end,
+            #[cfg(test)]
+            before_seen,
             #[cfg(test)]
             about_to_park,
             #[cfg(all(test, feature = "tokio"))]
@@ -675,12 +811,17 @@ impl Subscriber<Bytes> {
             reactor,
             local,
             spin,
+            looked,
             received,
             decode_errors,
             #[cfg(feature = "tokio")]
             leftover,
             _token,
             _death,
+            dead,
+            read_end,
+            #[cfg(test)]
+            before_seen,
             #[cfg(test)]
             about_to_park,
             #[cfg(all(test, feature = "tokio"))]
@@ -722,8 +863,10 @@ impl<M: Trust> Subscriber<Bytes, M> {
 
     fn look_held(&mut self) -> Result<Held, RecvError> {
         if self.local.evicted() {
+            self.looked = Looked::Exact;
             return Err(RecvError::Closed(Closed::Evicted));
         }
+        let before = self.before_look();
         let died = self.local.died();
         let start = self.reader.position();
         let held = self.reader.take_held();
@@ -732,7 +875,7 @@ impl<M: Trust> Subscriber<Bytes, M> {
             Ok(Held::Slot { .. }) => start,
             _ => self.reader.position(),
         };
-        self.settle(held, died, read)
+        self.settle(held, died, read, before)
     }
 }
 
@@ -748,23 +891,27 @@ impl<T: Payload, M: Trust> poll::Wait for Subscriber<T, M> {
             self.local.words().fd.is_some(),
             "prepare_wait: a subscription made with `Wake::Futex` has no file descriptor to poll"
         );
-        let seen = self.local.words().seq();
-        if self.reader.pending() || self.local.died() || self.local.evicted() {
-            return false;
-        }
+        let seen = self.seen();
+        let (looked, local, reader) = (self.looked, &self.local, &self.reader);
         #[cfg(test)]
-        if let Some(hook) = self.about_to_park.as_mut() {
-            hook();
-        }
-        // An interrupt stays up for the next receive that waits; its byte ends this poll.
-        if self.local.arm(seen) & (DIED | EVICTED) != 0 || self.local.words().seq() != seen {
-            self.local.disarm();
-            return false;
-        }
-        true
+        let hook = &mut self.about_to_park;
+        let next = |ends| decide(looked, seen, local.stop_bits(), ends, || reader.pending());
+        let unread = || {
+            #[cfg(test)]
+            if let Some(hook) = hook.as_mut() {
+                hook();
+            }
+            // Bytes a drain left: an edge-triggered poll would not report them, so `disarm` drains.
+            local.words().fd.as_ref().is_some_and(FdWake::unread)
+        };
+        local.prepare_poll(seen, next, unread)
     }
 
     fn finish_wait(&mut self) {
+        assert!(
+            self.local.words().fd.is_some(),
+            "finish_wait: a subscription made with `Wake::Futex` has no file descriptor to poll"
+        );
         self.local.disarm();
     }
 }
@@ -778,29 +925,14 @@ impl<T: Payload, M: Trust> fmt::Debug for Subscriber<T, M> {
     }
 }
 
-/// Raises `ABANDON` when dropped armed: by the subscriber, and by a `recv_async` future dropped
-/// mid-wait.
+/// Raises `ABANDON` when the subscriber drops: a wait left on the pool lets go of the memory.
 struct Abandon {
     local: Arc<Local<Parts>>,
-    armed: bool,
 }
 
 impl Drop for Abandon {
     fn drop(&mut self) {
-        if self.armed {
-            self.local.raise(ABANDON);
-        }
-    }
-}
-
-/// Ends the wait [`Local::arm`] started when dropped, also with the future it lives in.
-#[cfg(feature = "tokio")]
-struct Armed<'a>(&'a Local<Parts>);
-
-#[cfg(feature = "tokio")]
-impl Drop for Armed<'_> {
-    fn drop(&mut self) {
-        self.0.disarm();
+        self.local.raise(ABANDON);
     }
 }
 
@@ -821,14 +953,15 @@ impl AsRawFd for Unowned {
 
 #[cfg(feature = "tokio")]
 impl Reactor {
-    fn new(fd: BorrowedFd<'_>) -> std::io::Result<Self> {
+    /// # Safety: `fd` stays open, as the same file description, until the `Reactor` drops.
+    unsafe fn new(fd: BorrowedFd<'_>) -> std::io::Result<Self> {
         let unowned = Unowned(fd.as_raw_fd());
-        // SAFETY: `local` owns the fd and outlives `reactor`, the field declared before it.
+        // SAFETY: the caller keeps `fd` open, as the same file description, while `Self` lives.
         let registered = unsafe { AsyncFd::register_with_interest(unowned, Interest::READABLE) };
         Ok(Self(registered?))
     }
 
-    /// Until the fd is readable; its readiness is cleared, as the wait's end drains it.
+    /// Until the fd is readable; its readiness is cleared: a drain that leaves bytes sets `unread`.
     async fn readable(&self) -> std::io::Result<()> {
         std::future::poll_fn(|cx| match self.0.poll_read_ready(cx) {
             Poll::Ready(Ok(mut ready)) => {
@@ -842,12 +975,32 @@ impl Reactor {
     }
 }
 
+/// One `Pending`, woken at once: lets the runtime run timers, so a `timeout` around it can fire.
+#[cfg(feature = "tokio")]
+async fn yield_once() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if yielded {
+            return Poll::Ready(());
+        }
+        yielded = true;
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    })
+    .await
+}
+
 /// Ends a [`Subscriber`]'s wait from another thread; made by
 /// [`Subscriber::interrupter`].
 ///
 /// A receive that waits returns [`RecvError::Cancelled`]: the one waiting when
 /// [`interrupt`](Self::interrupt) is called, or else the next one to wait. A receive that finds a
-/// record does not wait and does not consume the interrupt. The subscription goes on either way.
+/// record does not wait and does not consume the interrupt. With [`Wake::Fd`] a poll
+/// ([`Wait`](crate::Wait)) returns for it too and leaves it to that receive: the next
+/// [`prepare_wait`](crate::Wait::prepare_wait) before such a receive returns `false`, and the
+/// interrupt's wake ends the poll in progress or, landing after that poll drained the fd, a later
+/// one at once. One interrupt makes at most two calls of [`wait_any`](crate::wait_any) return,
+/// three for a `NamedSubscriber`, as `wait_any` counts. The subscription goes on either way.
 #[derive(Clone)]
 pub struct Interrupter {
     target: Target,
@@ -873,12 +1026,16 @@ impl Interrupter {
     }
 
     /// End the wait in progress, or the next one. Returns once that wait is out of its sleep, or
-    /// at once when none sleeps; does nothing after the subscriber has been dropped.
+    /// at once when none sleeps; does nothing after the subscriber has been dropped. With
+    /// [`Wake::Fd`] it returns, while a wait sleeps or polls, once a wake is queued on the socket
+    /// or the socket is found shut down, which the wait reads as an end of file, and the wait may
+    /// still be polling; or once the wait is out, or a `prepare_wait` returned `false` for the
+    /// interrupt. With none, it sends nothing: the next wait sees the interrupt as it starts.
     pub fn interrupt(&self) {
         match &self.target {
             Target::Subscriber(local) => {
                 if let Some(local) = local.upgrade() {
-                    local.raise(INTERRUPT);
+                    local.raise(INTERRUPTED);
                 }
             }
             Target::Named(named) => {
@@ -889,11 +1046,25 @@ impl Interrupter {
         }
     }
 
-    /// `interrupt`, and the wakes it sent.
+    /// End the wait in progress, or the next one, for the name layer of a `NamedSubscriber` to
+    /// look at its state, as another publisher taking the name or an interrupt makes it: with
+    /// [`NOTICE`], a bit apart from the caller's interrupts, which the name layer clears. Does
+    /// nothing to a `NamedSubscriber`'s own.
+    pub(crate) fn notice(&self) {
+        if let Target::Subscriber(local) = &self.target {
+            if let Some(local) = local.upgrade() {
+                local.raise(NOTICE);
+            }
+        }
+    }
+
+    /// `interrupt`, and the wakes it tried, those that failed included.
     #[cfg(all(test, not(loom), any(target_os = "linux", target_os = "android")))]
     pub(crate) fn interrupt_counting(&self) -> usize {
         match &self.target {
-            Target::Subscriber(local) => local.upgrade().map_or(0, |local| local.raise(INTERRUPT)),
+            Target::Subscriber(local) => {
+                local.upgrade().map_or(0, |local| local.raise(INTERRUPTED))
+            }
             Target::Named(_) => {
                 self.interrupt();
                 0

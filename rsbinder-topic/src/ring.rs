@@ -56,48 +56,65 @@
 //! reader copies it, so a piece judged whole stays a whole copy whatever is written over it
 //! later: a record whose head the publisher writes over behind the reader is still returned, and
 //! a copy the publisher overtakes stops within a chunk of where it was overtaken. A header is
-//! believed before its judgment only when it is what the reader expects (the next index, a
-//! length that fits what is committed); any other header is judged by `frontier` first, so a
-//! torn one is not taken for corruption.
+//! believed before its judgment only when it is what the reader expects (the next index, or any
+//! index while the reader knows none, before the first record of a reader that attached with no
+//! index, whose copy is judged from its start; a length that fits what is committed); any other
+//! header is judged by `frontier` first, so a torn one is not taken for corruption.
+//!
+//! A chunk is 64 KiB. A move of `frontier` is a store and a judgment an acquire fence and a load,
+//! small beside storing or copying that much, and a record no longer than a chunk takes one of
+//! each.
 //!
 //! The reader holds the newest `write` it loaded and loads it again only once it has read up to
 //! it: every record below it is committed, and the acquire after that load orders the copies of
-//! them. A received record thus costs one counter load. The checks on the counters compare each
-//! with the reader's own state, or two loaded in the order that makes the bound hold for a
-//! publisher that follows the protocol: `write - tail <= capacity` with `write` loaded first,
-//! `tail <= write` with `tail` first (only after a lap, where `half` is checked against both),
-//! `write <= frontier` with `write` first (at each judgment).
+//! them. A received record thus loads `write` at most once, besides the `frontier` of its
+//! judgments. The checks on the counters compare each with the reader's own state, or two loaded
+//! in the order that makes the bound hold for a publisher that follows the protocol:
+//! `write - tail <= capacity` with `write` loaded first, `tail <= write` with `tail` first (at
+//! attach, for `last`, and after a lap, where `half` is checked against both), `write <= frontier`
+//! with `write` first (at each judgment).
 //!
 //! A reader the publisher has lapped resumes at `half`. Resuming at `tail` would put it on the
 //! record the next publish overwrites; from `half` the publisher has to write half a ring before
-//! it catches up again. How many records were skipped is the distance between the index the
-//! reader expected and the index of the first record it reads after the jump, so the losses it
-//! reports add up to the records it did not return.
+//! it catches up again. A drain of the records before an end ([`Reader::stop_at`]) resumes at
+//! `tail` instead, which keeps the most of them, until two laps in a row find it still on the
+//! record such a resume put it on, overtaken before it moved past it: from then on it resumes at
+//! `half`, as that publisher writes over the oldest record before the drain reaches it. One such
+//! lap is not enough, as a drain that returns a `Lagged` first stays on the oldest record, which
+//! a single commit before its next receive writes over. A publisher that has stopped writing
+//! overtakes nothing at or after its `tail`, so the drain then reads every record from `tail` to
+//! its end. A drain gives up where a resume would reach its end.
+//! A copy the publisher overtook is a lap like any other: the header loaded before it moves the
+//! reader nowhere, as its bytes may be the new lap's. The `tail` a lapped reader resumes by is
+//! checked to lie no more than a ring behind the `frontier` that found the lap, so the record
+//! there is past every byte that judgment found written over, and ahead of the reader. How many
+//! records were skipped is the distance between the index of the record the reader owed and the
+//! index of the first record judged whole after the jump, so the losses it reports add up to the
+//! records it did not return.
 //!
 //! The publisher's memory is not trusted. Lengths and counters are checked before use
 //! ([`Corrupted`]); the place a copy starts is a position modulo the capacity and its length is
 //! bounded by half the capacity, so no value in shared memory makes a copy leave the ring; and a
-//! call that finds itself lapped [`RETRIES`] times gives up, so a publisher that keeps moving
-//! `frontier` cannot hold a caller.
+//! call that resumes [`RETRIES`] times and is lapped again gives up, so a publisher that keeps
+//! moving `frontier` cannot hold a caller.
 
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 
+mod cursor;
 mod rules;
 
+use cursor::Cursor;
 use rules::{Header, Seen, View};
 
 use crate::pool::Loan;
 use crate::Record;
 
-/// How often one receive call resumes after being lapped before it returns without a record.
+/// How often one receive call resumes after being lapped before it returns without a record;
+/// in `try_latest`, a record of a kind it skips takes one of them too.
 pub(crate) const RETRIES: u32 = 4;
 
-/// The bytes between two moves of `frontier` as a record is written, and the most payload bytes
-/// a reader copies before it judges them by `frontier`: a copy the publisher overtakes stops
-/// within this many bytes, and a copy it does not reach is judged whole though the publisher has
-/// begun on the record. A move is a store and a judgment an acquire fence and a load, small
-/// beside storing or copying this much; a record no longer than this takes one of each.
+/// Bytes between two moves of `frontier`, and the most a reader copies before it judges them.
 #[cfg(not(any(test, loom)))]
 const CHUNK: usize = 64 * 1024;
 /// Smaller than the records of the race tests (24 bytes), so that they copy in two chunks.
@@ -154,10 +171,7 @@ pub(crate) trait Loads {
     fn fence(&self);
 }
 
-/// A record's bytes, of parts of any lengths, stored one after another from where it starts in
-/// the whole words [`Stores::store_ring`] takes: a word that two parts share is stored once both
-/// gave it bytes, and the last one is padded with zeros. Before each [`CHUNK`] of them, counted
-/// from the record's start, `frontier` is moved to that chunk's end.
+/// A record's parts stored in whole words, the last padded; `frontier` moved before each [`CHUNK`].
 struct Aligned<'m, M> {
     memory: &'m M,
     position: u64,
@@ -208,7 +222,7 @@ impl<'m, M: Stores> Aligned<'m, M> {
     fn emit(&mut self, mut words: &[u8]) {
         while !words.is_empty() {
             if self.position == self.frontier {
-                self.frontier = self.end.min(self.frontier + CHUNK as u64);
+                self.frontier += (self.end - self.frontier).min(CHUNK as u64);
                 // Before the chunk's bytes: a reader that copies one of them then loads this value.
                 self.memory.store_frontier(self.frontier);
             }
@@ -515,7 +529,9 @@ pub(crate) enum Taken<'a> {
         index: u32,
         loan: Loan,
     },
-    /// No committed record is unread, or the call was lapped [`RETRIES`] times and gave up.
+    /// No committed record is unread; or a reader [stopped at](Reader::stop_at) an end stepped
+    /// over a record of a kind it skips to that end, and records after it are unread; or the call
+    /// gave up, which [`Reader::gave_up`] tells, with its causes.
     Empty,
     /// This many records were overwritten unread. The next call returns the one after them.
     Lagged(u64),
@@ -530,18 +546,41 @@ enum Outcome {
     Lagged(u64),
 }
 
+/// A header loaded at `at` whose bytes a judgment by `frontier` found not written over.
+#[derive(Clone, Copy, Debug)]
+struct Judged {
+    at: u64,
+    header: Header,
+    size: u64,
+}
+
+/// What a copy of a record found.
+enum Copied {
+    /// Every piece judged whole: the header and the payload are the record's.
+    Whole(Judged),
+    /// A piece may hold bytes of a newer record, the header's too.
+    Overtaken,
+}
+
+#[cfg(all(test, not(loom)))]
+thread_local! {
+    /// Set by a test: run before a judgment loads `frontier`, as a publisher writing then would.
+    pub(crate) static BEFORE_JUDGING: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// A subscriber's side of the ring. Any number read one topic memory, each at its own pace.
 pub(crate) struct Reader<M> {
     memory: M,
-    /// Where the next record to return starts. It lives here, not in shared memory.
-    read: u64,
-    /// The index that record has if none was lost; `None` until a first record sets it.
-    expected: Option<u32>,
+    /// Where the next record to return starts, and the record owed; not in shared memory.
+    cursor: Cursor,
     seen: Seen,
     /// Set by the first check that fails; every later call fails with it.
     failed: Option<&'static str>,
     /// Records reported as lost so far.
     lost: u64,
+    /// Whether the last call stopped short of `write`, as [`Reader::gave_up`] lists.
+    gave_up: bool,
     /// The payload of the record last returned, padded to 8.
     payload: Vec<u8>,
 }
@@ -551,49 +590,59 @@ impl<M: Loads> Reader<M> {
     pub(crate) fn attach(memory: M, start: Start) -> Result<Self, Corrupted> {
         let mut reader = Self {
             memory,
-            read: 0,
-            expected: None,
+            cursor: Cursor::attached(0, None),
             seen: Seen::default(),
             failed: None,
             lost: 0,
+            gave_up: false,
             payload: Vec::new(),
         };
         let view = reader.view()?;
-        match start {
+        reader.cursor = match start {
             Start::Latest { at, index } => {
                 if at % 8 != 0 || at > view.write {
                     return Err(Corrupted("start not a position the publisher committed"));
                 }
-                reader.read = at;
-                reader.expected = Some(index);
+                Cursor::attached(at, Some(index))
             }
             // No record yet: `write` is zero, and so is the place the first one goes.
-            Start::Last if view.write == 0 => {}
-            Start::Last => reader.read = reader.newest()?,
+            Start::Last if view.write == 0 => Cursor::attached(0, None),
+            Start::Last => Cursor::attached(reader.newest()?, None),
             Start::Oldest => {
-                reader.read = view.tail;
                 // That `tail` was loaded after `write` and may be above it; a later `write` is not.
                 if view.tail > view.write {
                     reader.reload()?;
                 }
+                Cursor::attached(view.tail, None)
             }
-        }
+        };
         Ok(reader)
     }
 
     /// Where the next record to return starts.
     pub(crate) fn position(&self) -> u64 {
-        self.read
+        self.cursor.read()
     }
 
-    /// Records reported as [`Taken::Lagged`] so far.
+    /// Records reported as [`Taken::Lagged`], or counted by
+    /// [`count_lost_before`](Self::count_lost_before), so far.
     pub(crate) fn lost(&self) -> u64 {
         self.lost
     }
 
+    /// Whether the last receive call gave up before it reached `write`: lapped again after
+    /// [`RETRIES`] resumes, past more records of kinds it skips than the ring holds, or, in
+    /// [`try_latest`](Self::try_latest), lapped or past a record of a kind it skips once more
+    /// after [`RETRIES`] of them, or, [stopped at](Self::stop_at) an end, lapped where a lap would
+    /// resume at that end or past it, which may be at the first lap. Its result was
+    /// [`Taken::Empty`] or [`Taken::Lagged`], though [`pending`](Self::pending) may hold.
+    pub(crate) fn gave_up(&self) -> bool {
+        self.gave_up
+    }
+
     /// Whether the publisher committed past this reader: one `Acquire` load, as a wait needs.
     pub(crate) fn pending(&self) -> bool {
-        self.memory.write() != self.read
+        self.memory.write() != self.cursor.read()
     }
 
     /// Where the publisher's committed records end now.
@@ -606,6 +655,24 @@ impl<M: Loads> Reader<M> {
         &self.payload[..len]
     }
 
+    /// Stop every later [`try_recv`](Self::try_recv) short of `end`, a record start the publisher
+    /// committed; with `None`, read on. No move of a `try_recv` from before `end` reaches it or
+    /// passes it but a step over the record just before it. A reader already at `end` is not held
+    /// there: the caller stops calling `try_recv` once [`position`](Self::position) reaches it.
+    /// One that steps over records of kinds it skips to `end` returns there: [`Taken::Empty`], or
+    /// [`Taken::Lagged`] for records missed among them. A lapped one resumes at `tail`, not
+    /// `half`, until two laps in a row overtake the record a resume at `tail` put it on before it
+    /// moved past it, and at `half` from then on (`cursor.rs` says why); where a resume would be
+    /// `end` or past it, it gives up instead, so that
+    /// [`count_lost_before`](Self::count_lost_before) counts what it missed. Each call with
+    /// `Some` starts a drain that resumes at `tail` first.
+    /// A reader stopped at `end` reaches it only having returned or counted every record before
+    /// it, but for those before the first record read. [`try_latest`](Self::try_latest) does not
+    /// look at `end`, and may move past it.
+    pub(crate) fn stop_at(&mut self, end: Option<u64>) {
+        self.cursor.stop_at(end);
+    }
+
     /// The next record, without waiting.
     pub(crate) fn try_recv(&mut self) -> Result<Taken<'_>, Corrupted> {
         let outcome = self.next()?;
@@ -616,6 +683,34 @@ impl<M: Loads> Reader<M> {
     pub(crate) fn try_latest(&mut self) -> Result<Taken<'_>, Corrupted> {
         let outcome = self.latest()?;
         Ok(self.lend(outcome))
+    }
+
+    /// Count as lost the records before the end this reader is [stopped at](Self::stop_at),
+    /// a record start the publisher had committed, that it has neither returned nor counted: how
+    /// many. A drain stops there after a [`try_recv`](Self::try_recv) that [gave
+    /// up](Self::gave_up), or after calls that left it where it was, two in a row of which only
+    /// a publisher that breaks the protocol makes.
+    ///
+    /// The reader knows the first record it owes: the one at its position, or, after a lap, one
+    /// at or before it, never at the end or past it, as no move reaches the end but a step over
+    /// a record judged whole. So with the reader at the end, or not stopped at one, or before the
+    /// first record read, nothing is counted. Otherwise the count is exact when the record at the
+    /// end is committed and judged whole: its index less the one owed, less what an earlier lower
+    /// bound counted of them; the reader then moves to the end. Else it is one, the record owed,
+    /// unless a lower bound counted it already, and then none: a lower bound. Either way the
+    /// losses reported never count a record at the end or after it, and add up to the records
+    /// before it not returned once the reader goes on past it.
+    pub(crate) fn count_lost_before(&mut self) -> Result<u64, Corrupted> {
+        self.failed()?;
+        let Some(end) = self.cursor.owing_before_end() else {
+            return Ok(0);
+        };
+        let lost = match self.index_at(end)? {
+            Some(judged) => self.cursor.count_to_end(judged),
+            None => self.cursor.credit(),
+        };
+        self.lost = self.lost.saturating_add(lost);
+        Ok(lost)
     }
 
     fn lend(&mut self, outcome: Outcome) -> Taken<'_> {
@@ -666,10 +761,10 @@ impl<M: Loads> Reader<M> {
         Ok(write)
     }
 
-    /// Whether the publisher may have begun to write over the ring at or past `from`, judged after
-    /// what was copied from there: a byte at `from` is written over from position `from +
-    /// capacity` on, and `frontier` is past that once the chunk that does it may have begun.
+    /// Whether `frontier`, loaded after a copy from `from`, says those bytes may be written over.
     fn overwritten(&mut self, from: u64) -> Result<bool, Corrupted> {
+        #[cfg(all(test, not(loom)))]
+        BEFORE_JUDGING.with_borrow_mut(|hook| hook.iter_mut().for_each(|hook| hook()));
         self.memory.fence();
         let frontier = self.memory.frontier();
         let frontier = self.seen.frontier(frontier);
@@ -687,21 +782,27 @@ impl<M: Loads> Reader<M> {
         self.keep(last)
     }
 
-    /// Move a lapped reader to `half`; `false` once this call has done so [`RETRIES`] times.
-    fn resume(&mut self, laps: &mut u32) -> Result<bool, Corrupted> {
+    /// Resume a lapped reader as the cursor says; `false` after [`RETRIES`] or at a drain's end.
+    fn lap(&mut self, laps: &mut u32) -> Result<bool, Corrupted> {
+        // Every overtaken copy or judgment is a lap the cursor hears of, the one that gives up too.
+        let at_tail = self.cursor.lapped();
         if *laps == RETRIES {
             return Ok(false);
         }
         *laps += 1;
         // After the `frontier` that found the lap: at least the `tail` stored before it.
         let tail = self.memory.tail();
-        let tail = self.seen.tail(tail, self.memory.capacity());
-        self.keep(tail)?;
-        let half = self.memory.half();
+        let tail = self.seen.lapped_tail(tail, self.memory.capacity());
+        let tail = self.keep(tail)?;
+        let (start, what) = if at_tail {
+            (tail, "tail at the write counter")
+        } else {
+            (self.memory.half(), "half outside the kept records")
+        };
         let write = self.memory.write();
-        let half = self.seen.kept(half, write, "half outside the kept records");
-        self.read = self.keep(half)?;
-        Ok(true)
+        let start = self.seen.kept(start, write, what);
+        let start = self.keep(start)?;
+        Ok(self.cursor.jump(start))
     }
 
     fn header(&self, position: u64) -> Header {
@@ -710,10 +811,33 @@ impl<M: Loads> Reader<M> {
         Header::parse(bytes)
     }
 
-    /// Copy the payload of the record at `position`, `size` bytes long, into the buffer, [`CHUNK`]
-    /// bytes at a time, each judged by `frontier` once copied, the first with the header the
-    /// caller loaded; whether every one of them was copied before the publisher reached it.
-    fn copy(&mut self, position: u64, size: u64) -> Result<bool, Corrupted> {
+    /// `header`, loaded at `at`, once `frontier` says it was not written over; `None` if it may be.
+    fn judge(&mut self, at: u64, header: Header) -> Result<Option<Judged>, Corrupted> {
+        let size = header.extent(at, self.seen.write(), self.memory.capacity());
+        if self.overwritten(at)? {
+            return Ok(None);
+        }
+        let size = self.keep(size)?;
+        Ok(Some(Judged { at, header, size }))
+    }
+
+    /// The record at `at`, if it is committed and judged whole.
+    fn index_at(&mut self, at: u64) -> Result<Option<Judged>, Corrupted> {
+        if at % 8 != 0 || (at >= self.seen.write() && self.reload()? <= at) {
+            return Ok(None);
+        }
+        let header = self.header(at);
+        let size = header.extent(at, self.seen.write(), self.memory.capacity());
+        // Believed only once `frontier` says the publisher was not writing over it.
+        let whole = !self.overwritten(at)?;
+        Ok(size
+            .ok()
+            .filter(|_| whole)
+            .map(|size| Judged { at, header, size }))
+    }
+
+    /// Copy the payload of `header`'s record at `position` by [`CHUNK`]s, each judged.
+    fn copy(&mut self, position: u64, header: Header, size: u64) -> Result<Copied, Corrupted> {
         // `Header::extent` bounded `size` by half the ring, which is mapped: it fits a `usize`.
         let len = (size - rules::HEADER) as usize;
         if self.payload.capacity() < len {
@@ -728,10 +852,15 @@ impl<M: Loads> Reader<M> {
             let at = position + rules::HEADER + copied as u64;
             self.memory.load_ring(at, &mut self.payload[copied..end]);
             if self.overwritten(from)? {
-                return Ok(false);
+                return Ok(Copied::Overtaken);
             }
             if end == len {
-                return Ok(true);
+                let judged = Judged {
+                    at: position,
+                    header,
+                    size,
+                };
+                return Ok(Copied::Whole(judged));
             }
             (copied, from) = (end, at + (end - copied) as u64);
         }
@@ -746,71 +875,73 @@ impl<M: Loads> Reader<M> {
         Outcome::Lagged(lost)
     }
 
+    /// [`settle`](Self::settle) for a call that stops short of `write`.
+    fn give_up(&mut self, lost: u64) -> Outcome {
+        self.gave_up = true;
+        self.settle(lost)
+    }
+
     fn next(&mut self) -> Result<Outcome, Corrupted> {
+        self.gave_up = false;
         self.failed()?;
         let capacity = self.memory.capacity();
         let (mut lost, mut laps) = (0u64, 0u32);
         // A ring holds at most this many records, so no more than that are stepped over.
         let mut steps = capacity / rules::HEADER;
         loop {
+            let read = self.cursor.read();
             // Below the `write` held, every record is committed: it is loaded only once reached.
-            if self.read == self.seen.write() && self.reload()? == self.read {
+            if read == self.seen.write() && self.reload()? == read {
                 return Ok(self.settle(lost));
             }
-            let header = self.header(self.read);
-            let expected = self.expected.is_none_or(|index| index == header.index);
-            let size = match header.extent(self.read, self.seen.write(), capacity) {
-                Ok(size) if expected && header.kind <= Kind::Loan as u32 => size,
-                size => {
+            let header = self.header(read);
+            let size = match header.extent(read, self.seen.write(), capacity) {
+                Ok(size) if self.cursor.expects(header) && header.kind <= Kind::Loan as u32 => size,
+                _ => {
                     // Believed only once `frontier` says the publisher was not writing over it.
-                    if self.overwritten(self.read)? {
-                        if !self.resume(&mut laps)? {
-                            return Ok(self.settle(lost));
+                    let Some(judged) = self.judge(read, header)? else {
+                        if !self.lap(&mut laps)? {
+                            return Ok(self.give_up(lost));
                         }
                         continue;
-                    }
-                    let size = self.keep(size)?;
-                    if let Some(expected) = self.expected {
-                        lost += u64::from(header.index.wrapping_sub(expected));
-                    }
+                    };
+                    lost += self.cursor.count_at(&judged);
                     if header.kind > Kind::Loan as u32 {
-                        self.read += size;
-                        self.expected = Some(header.index.wrapping_add(1));
-                        if steps == 0 {
+                        // A drain stepped to its end has read all it had: the rest is not its own.
+                        if self.cursor.step(judged) {
                             return Ok(self.settle(lost));
+                        }
+                        if steps == 0 {
+                            return Ok(self.give_up(lost));
                         }
                         steps -= 1;
                         continue;
                     }
-                    // The reader stays on this record: the next call returns it or finds it gone.
-                    self.expected = Some(header.index);
-                    return Ok(self.settle(lost));
+                    judged.size
                 }
             };
             if lost > 0 {
-                // Losses counted from records stepped over; this one is read by the next call.
+                // The reader stays on this record: the next call returns it or finds it gone.
                 return Ok(self.settle(lost));
             }
             // Only once copied and judged are the header and payload known to be this record's.
-            if !self.copy(self.read, size)? {
-                // A record the reader has not read yet does not count before its first.
-                if let Some(index) = self.expected {
-                    lost = 1;
-                    self.expected = Some(index.wrapping_add(1));
+            let judged = match self.copy(read, header, size)? {
+                Copied::Whole(judged) => judged,
+                // A lap at `read`: nothing is counted or stepped over by a header that may be new.
+                Copied::Overtaken => {
+                    if !self.lap(&mut laps)? {
+                        return Ok(self.give_up(lost));
+                    }
+                    continue;
                 }
-                if !self.resume(&mut laps)? {
-                    return Ok(self.settle(lost));
-                }
-                continue;
-            }
+            };
             let len = header.len as usize;
             if header.kind == Kind::End as u32 {
-                self.expected = Some(header.index);
+                self.cursor.rest_on(judged);
                 return Ok(Outcome::End { len });
             }
             let outcome = self.outcome(header)?;
-            self.read += size;
-            self.expected = Some(header.index.wrapping_add(1));
+            self.cursor.step(judged);
             return Ok(outcome);
         }
     }
@@ -834,49 +965,51 @@ impl<M: Loads> Reader<M> {
     }
 
     fn latest(&mut self) -> Result<Outcome, Corrupted> {
+        self.gave_up = false;
         self.failed()?;
         let capacity = self.memory.capacity();
         let mut laps = 0u32;
         loop {
-            if self.reload()? == self.read {
+            let read = self.cursor.read();
+            if self.reload()? == read {
                 return Ok(Outcome::Empty);
             }
             let last = self.newest()?;
             // Above `last` only when the publisher has stored `write` and not `last` yet.
-            let at = self.read.max(last);
+            let at = read.max(last);
             let header = self.header(at);
             // `at` is below the `write` held either way, and the record there is committed.
-            let size = header.extent(at, self.seen.write(), capacity);
-            let whole = match size {
-                Ok(size) if header.kind <= Kind::Loan as u32 => self.copy(at, size)?,
-                _ => !self.overwritten(at)?,
+            let judged = match header.extent(at, self.seen.write(), capacity) {
+                Ok(size) if header.kind <= Kind::Loan as u32 => {
+                    match self.copy(at, header, size)? {
+                        Copied::Whole(judged) => Some(judged),
+                        Copied::Overtaken => None,
+                    }
+                }
+                _ => self.judge(at, header)?,
             };
-            if !whole {
+            let Some(judged) = judged else {
                 if laps == RETRIES {
-                    return Ok(Outcome::Empty);
+                    return Ok(self.give_up(0));
                 }
                 laps += 1;
                 continue;
-            }
-            let size = self.keep(size)?;
+            };
             if header.kind > Kind::Loan as u32 {
-                self.read = at + size;
-                self.expected = Some(header.index.wrapping_add(1));
+                self.cursor.skip_to(judged);
                 if laps == RETRIES {
-                    return Ok(Outcome::Empty);
+                    return Ok(self.give_up(0));
                 }
                 laps += 1;
                 continue;
             }
             let len = header.len as usize;
             if header.kind == Kind::End as u32 {
-                self.read = at;
-                self.expected = Some(header.index);
+                self.cursor.rest_on(judged);
                 return Ok(Outcome::End { len });
             }
             let outcome = self.outcome(header)?;
-            self.read = at + size;
-            self.expected = Some(header.index.wrapping_add(1));
+            self.cursor.skip_to(judged);
             return Ok(outcome);
         }
     }

@@ -166,6 +166,12 @@ impl<T: Payload + 'static> Publisher<T> {
         self.shared.writer.lock().after_bump = Some(pause);
     }
 
+    /// Take a wait in `state` as woken already in every subscription.
+    #[cfg(all(test, not(loom), any(target_os = "linux", target_os = "android")))]
+    pub(crate) fn take_as_woken(&self, state: u32) {
+        self.shared.writer.lock().links.take_as_woken(state);
+    }
+
     /// What the topic has published, and each subscription it holds after taking out those that
     /// ended: who made it and what its control page reports (plan 15 §5.9a).
     pub fn stats(&self) -> PublisherStats {
@@ -394,9 +400,12 @@ impl Acceptor {
     /// until that process dies or the publisher does, and `max_per_uid` bounds how many a caller
     /// holds that way.
     ///
-    /// Call it from the handler of the subscription call, on the thread the call arrived on:
-    /// the uid it counts against `max_per_uid` is that call's, and a subscriber of this process
-    /// is recognized by the thread its call is made on.
+    /// Call it from the handler of the subscription call, on the thread the call arrived on,
+    /// with the `request` the handler was given: the uid it counts against `max_per_uid` is
+    /// that call's, and a subscriber of this process is recognized by the thread its call is
+    /// made on and by the request it made, not a copy. A call back into this process that a
+    /// remote `ITopic` makes while this thread waits for it runs on this thread too; its request
+    /// is a copy, so a token of this process in it is refused.
     ///
     /// [`ITopic::ERROR_VERSION`]: crate::aidl::ITopic::ERROR_VERSION
     /// [`ITopic::ERROR_FULL`]: crate::aidl::ITopic::ERROR_FULL
@@ -449,7 +458,7 @@ impl<T: Payload + 'static> Accept for Shared<T> {
         };
         let token = request.token.as_ref().ok_or(StatusCode::UnexpectedNull)?;
         let control = request.control.as_ref().ok_or(StatusCode::UnexpectedNull)?;
-        if token.as_proxy().is_none() && !asked_here(token) {
+        if token.as_proxy().is_none() && !asked_here(request) {
             return Err(StatusCode::BadValue.into());
         }
         // A comparison of the cached descriptor, no call; outside the lock all the same.

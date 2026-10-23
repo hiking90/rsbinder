@@ -51,8 +51,7 @@ fn number(bytes: &[u8]) -> u32 {
     u32::from_le_bytes(bytes[..4].try_into().unwrap())
 }
 
-/// Receive `count` values, sleeping a pseudo-random while of up to `pause` after each; the
-/// numbers they carry.
+/// Receive `count` values, sleeping a pseudo-random while up to `pause` after each; their numbers.
 fn receive(subscriber: Subscriber<Bytes>, count: u32, pause: Duration, seed: u32) -> Vec<u32> {
     receive_as(subscriber, count, pause, seed, false)
 }
@@ -90,9 +89,7 @@ fn receive_as(
     got
 }
 
-/// AC-15.3.8 (ring): four subscribers, two woken by the futex and two by their fds, each
-/// sleeping up to a tenth of the timeout after a value, receive every one of values that go
-/// round the ring many times.
+/// AC-15.3.8 (ring): two futex and two fd subscribers that pause get every value of many laps.
 #[test]
 fn every_value_reaches_every_subscriber_however_often_the_ring_goes_round() {
     const VALUES: u32 = 3000;
@@ -118,8 +115,7 @@ fn every_value_reaches_every_subscriber_however_often_the_ring_goes_round() {
     assert_eq!(publisher.stats().published, u64::from(VALUES));
 }
 
-/// AC-15.3.16: a batch larger than the ring announces what it wrote before each wait, so
-/// subscribers asleep before it wake, read on, and make the room it waits for.
+/// AC-15.3.16: a batch larger than the ring announces before each wait, so sleepers make its room.
 #[test]
 fn a_batch_larger_than_the_ring_wakes_the_subscribers_it_waits_for() {
     const VALUES: u32 = 500;
@@ -153,9 +149,7 @@ fn overrun(publisher: &Publisher<Bytes>, from: u32) -> u32 {
     end
 }
 
-/// AC-15.3.18: a subscriber of the publisher's own process that holds a publish up past the
-/// timeout is taken out, its notice handled on the publishing thread without a deadlock, while
-/// a subscriber that keeps up is left alone and loses nothing.
+/// AC-15.3.18: a local subscriber that holds a publish past the timeout is taken out, no deadlock.
 #[test]
 fn a_subscriber_that_holds_a_publish_up_past_the_timeout_is_taken_out() {
     let timeout = Duration::from_millis(100);
@@ -190,8 +184,7 @@ fn a_subscriber_that_holds_a_publish_up_past_the_timeout_is_taken_out() {
     assert_eq!(publisher.stats().evicted, 1);
 }
 
-/// AC-15.3.20: with a timeout of zero a publish takes out at once the subscriber in its way,
-/// and only that one.
+/// AC-15.3.20: a timeout of zero takes out at once the subscriber in the way, and only that one.
 #[test]
 fn a_zero_timeout_takes_out_at_once_only_the_subscriber_in_the_way() {
     let publisher = waiting(Duration::ZERO);
@@ -208,8 +201,7 @@ fn a_zero_timeout_takes_out_at_once_only_the_subscriber_in_the_way() {
     drop(idle);
 }
 
-/// AC-15.3.17: the end record waits for room as a value does, so a publisher dropped right after
-/// its last value leaves a subscriber every value and then the end.
+/// AC-15.3.17: the end waits for room as a value does: a dropped publisher leaves every value.
 #[test]
 fn a_publisher_dropped_after_its_last_value_leaves_every_value_then_the_end() {
     let publisher = waiting(SPAN);
@@ -237,8 +229,7 @@ fn a_publisher_dropped_after_its_last_value_leaves_every_value_then_the_end() {
     });
 }
 
-/// AC-15.3.19: once taken out, a subscription woken by its fd ends every wait at once: a poll is
-/// not prepared, and `recv` and `recv_async` return `Closed(Evicted)` without sleeping.
+/// AC-15.3.19: an fd subscription taken out ends every wait at once: no poll, `Closed(Evicted)`.
 #[test]
 fn a_subscriber_taken_out_ends_its_waits_at_once() {
     let publisher = waiting(Duration::ZERO);
@@ -258,8 +249,7 @@ fn a_subscriber_taken_out_ends_its_waits_at_once() {
     assert!(took < Duration::from_millis(100), "{took:?}");
 }
 
-/// AC-15.3.15 (a subscription that ended): a publish waiting for a subscriber a ring behind ends
-/// once that subscriber drops its subscription, well before the timeout.
+/// AC-15.3.15 (ended): a publish waiting for a subscriber ends once it drops, before the timeout.
 #[test]
 fn a_wait_ends_when_the_subscriber_it_waits_for_drops_its_subscription() {
     let timeout = Duration::from_secs(5);
@@ -283,8 +273,7 @@ fn a_wait_ends_when_the_subscriber_it_waits_for_drops_its_subscription() {
 
 const SLOT: usize = 4096;
 
-/// A topic of `max_subscribers` with the smallest ring and a pool of `max_subscribers + 3` slots
-/// (a depth of 1, one loan), which waits up to `timeout`.
+/// `max_subscribers`, the smallest ring, `max_subscribers + 3` slots (depth 1), waits of `timeout`.
 fn pooled(max_subscribers: usize, timeout: Duration) -> Publisher<Bytes> {
     pooled_within(max_subscribers, timeout, None)
 }
@@ -321,9 +310,7 @@ fn lend(publisher: &Publisher<Bytes>, n: u32) -> u32 {
     slot
 }
 
-/// AC-15.3.8 (loan): four subscribers, two woken by the futex and two by their fds, two copying
-/// each value out and two reading it where it lies, receive every one of values that go round a
-/// pool of seven slots many times.
+/// AC-15.3.8 (loan): futex and fd subscribers, copying or in place, get every value of many laps.
 #[test]
 fn every_loaned_value_reaches_every_subscriber_however_often_the_pool_goes_round() {
     const VALUES: u32 = 2000;
@@ -351,8 +338,7 @@ fn every_loaned_value_reaches_every_subscriber_however_often_the_pool_goes_round
     assert_eq!((stats.published, stats.evicted), (u64::from(VALUES), 0));
 }
 
-/// AC-15.3.15 (pool): a lend waits for a pin as well as for a read. The one slot read past is
-/// pinned; the wait ends when the sample lets go of it, though the subscriber reads no further.
+/// AC-15.3.15 (pool): a lend waits for a pin as for a read, until the sample lets go of its slot.
 #[test]
 fn a_lend_waits_for_a_pin_to_let_go_of_the_one_slot_read_past() {
     let timeout = Duration::from_secs(5);
@@ -386,8 +372,7 @@ fn a_lend_waits_for_a_pin_to_let_go_of_the_one_slot_read_past() {
     assert_eq!(publisher.stats().evicted, 0);
 }
 
-/// AC-15.3.15 (pool): past the timeout a lend takes out the subscriber furthest behind, and no
-/// more once a slot is read past: the one that read two values stays and loses none.
+/// AC-15.3.15 (pool): past the timeout a lend takes out only the subscriber furthest behind.
 #[test]
 fn a_lend_past_the_timeout_takes_out_only_the_subscriber_furthest_behind() {
     let timeout = Duration::from_millis(100);
@@ -416,9 +401,6 @@ fn a_lend_past_the_timeout_takes_out_only_the_subscriber_furthest_behind() {
 }
 
 /// AC-15.3.10: a subscriber taken out keeps the slot of the sample it holds until it lets go.
-/// Once the lend takes out the subscriber furthest behind, the only slots read past are its
-/// sample's and the other subscriber's, both pinned: a lend that passed over the pin of a
-/// subscriber taken out would choose the first, the newer of the two read past.
 #[test]
 fn a_sample_held_by_a_subscriber_taken_out_keeps_its_slot() {
     let timeout = Duration::from_millis(100);
@@ -442,7 +424,10 @@ fn a_sample_held_by_a_subscriber_taken_out_keeps_its_slot() {
     let slot = lend(&publisher, 5);
     let took = began.elapsed();
     assert!(took >= timeout, "{took:?}");
-    assert!(![a, b].contains(&slot), "slot {slot}, pinned");
+    assert!(
+        ![a, b].contains(&slot),
+        "slot {slot}: pinned by a subscriber taken out, the only slots read past"
+    );
     assert_eq!(publisher.stats().evicted, 2);
     assert_eq!(&*held, &value(0).0[..]);
     assert_eq!(&*also, &value(1).0[..]);
@@ -452,10 +437,7 @@ fn a_sample_held_by_a_subscriber_taken_out_keeps_its_slot() {
     assert_eq!(second.try_recv(), evicted);
 }
 
-/// A window of `w` lets a publish go while it leaves the subscriber at most `w` records behind,
-/// counting the one it reads, and holds up the one that would leave it `w + 1` behind: for 1, 2
-/// and 3 that publish waits out the timeout and takes the subscriber out, though the ring has
-/// room for dozens more.
+/// A window of `w` (1, 2, 3) holds up the publish that leaves a subscriber `w + 1` records behind.
 #[test]
 fn a_publish_that_would_leave_a_subscriber_past_the_window_waits_for_it() {
     let timeout = Duration::from_millis(100);
@@ -484,8 +466,7 @@ fn a_publish_that_would_leave_a_subscriber_past_the_window_waits_for_it() {
     }
 }
 
-/// With a window of 1 every publish waits for both subscribers, one woken by the futex and one by
-/// its fd, to read the value before it, and they receive every value.
+/// With a window of 1 each publish waits for a futex and an fd subscriber; both get every value.
 #[test]
 fn every_value_reaches_every_subscriber_through_a_window_of_one() {
     const VALUES: u32 = 1000;
@@ -513,9 +494,7 @@ fn every_value_reaches_every_subscriber_through_a_window_of_one() {
     assert_eq!(publisher.stats().evicted, 0);
 }
 
-/// A lend waits for the window of the record its loan publishes, not only for a slot: with a
-/// window of 2, the lend of a value that would leave the subscriber three behind waits out the
-/// timeout though a slot nobody has filled is free, and the publish after it waits no more.
+/// A lend waits for its record's window, not only for a slot: with 2, a free slot lets none go.
 #[test]
 fn a_lend_past_the_window_waits_though_a_slot_is_free() {
     let timeout = Duration::from_millis(100);
@@ -541,8 +520,7 @@ fn a_lend_past_the_window_waits_though_a_slot_is_free() {
     assert_eq!(subscriber.recv_timeout(SPAN), evicted);
 }
 
-/// A subscriber reports a loaned value read once its sample is dropped, not when the sample is
-/// returned: its lag covers the value's record until then.
+/// A loaned value counts as read once its sample drops: the lag covers its record until then.
 #[test]
 fn a_held_sample_leaves_its_record_unread_until_dropped() {
     let publisher = pooled(1, SPAN);
@@ -555,8 +533,7 @@ fn a_held_sample_leaves_its_record_unread_until_dropped() {
     assert_eq!(lag(&publisher), 0);
 }
 
-/// With a window of 1 a lend waits for the subscriber to read the value before it, and a held
-/// sample of that value is still being read: the lend goes on once the sample is dropped.
+/// With a window of 1 a lend waits for a held sample of the value before it to be dropped.
 #[test]
 fn a_lend_inside_the_window_waits_for_a_held_sample_to_drop() {
     let timeout = Duration::from_secs(5);

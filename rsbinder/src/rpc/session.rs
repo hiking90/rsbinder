@@ -4759,8 +4759,7 @@ impl RpcSession {
             .expect("server_session_id poisoned")
     }
 
-    /// Whether `session_id` is the id an attach on this session must echo: the server-minted
-    /// one (cached) for a client.
+    /// Whether `session_id` is the id an attach must echo: the server-minted one for a client.
     fn is_own_attach_id(&self, session_id: &[u8]) -> Result<bool> {
         if self.inner.shared.space() != AddressSpace::Initiator {
             return Ok(session_id == self.session_id().as_slice());

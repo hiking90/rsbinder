@@ -10,7 +10,11 @@
 //! The child is this test binary re-run with `RSBINDER_FMQ_CHILD` set,
 //! filtered to the same test function.
 
-#![cfg(any(target_os = "linux", target_os = "android"))]
+// Without 64-bit atomics a queue is `Unsupported` (`MessageQueue::create`).
+#![cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    target_has_atomic = "64"
+))]
 
 mod common;
 

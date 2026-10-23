@@ -33,8 +33,9 @@ parcelable TopicEndpoint {
 
     /**
      * Where the topic header starts in the fd: magic, version, the word a
-     * subscriber waits on, and the positions of the oldest, the newest and
-     * the middle record. 0x10 in this version.
+     * subscriber waits on, the positions of the oldest, the newest and the
+     * middle record, and how far the record being written reaches. 0x10 in
+     * this version.
      */
     int headerOffset;
 

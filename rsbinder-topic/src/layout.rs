@@ -42,7 +42,7 @@
 //! |---|---|---|
 //! | `0x00` | 4 | magic, the bytes `RSTC` |
 //! | `0x04` | 4 | layout version |
-//! | `0x08` | 4 | `state`: bit 0 waiting, bit 1 closed, bits 2–31 a count of waits |
+//! | `0x08` | 4 | `state`: bit 0 waiting, bit 1 closed, bits 2–31 the low 30 bits of the `seq` a wait sleeps on |
 //! | `0x0c` | 4 | `pins`: how many pin words follow the header |
 //! | `0x40` | 8 | `read`: the subscriber's read position, for statistics, lends and backpressure |
 //! | `0x48` | 8 | `lost`: records it reported as lost, for statistics |
@@ -108,11 +108,10 @@ use rsbinder::fmq::{Descriptor, Error, Flavor, Grantor, Result};
 use crate::pool::{GenerationLoads, Generations, LendError, Pin, Pins, Slots};
 use crate::ring::{Loads, Stores};
 
-/// The layout version this crate reads and writes: 0.3. Version 2 has the subscriber store its
-/// `read` with `Release` and answer `ISubscription.evicted` (plan 15 §6.5); a subscriber of 1
-/// does neither, and a topic with backpressure would wait on it wrongly. Version 3 has the
-/// publisher store `frontier` before each chunk of a record, which a subscriber judges its copies
-/// by (`ring.rs`); one of 2 leaves it at zero, and a subscriber of 3 would take torn copies.
+/// The layout version this crate reads and writes: 0.3. A subscriber stores its `read` with
+/// `Release` and answers `ISubscription.evicted` (plan 15 §6.5), and the publisher stores
+/// `frontier` before each chunk of a record, which a subscriber judges its copies by (`ring.rs`).
+/// A peer of another version is refused.
 pub(crate) const VERSION: u32 = 3;
 
 /// The smallest ring. An end record with its message has to fit half of it.
@@ -597,10 +596,6 @@ pub(crate) struct ControlView {
     pins: u32,
 }
 
-#[allow(
-    dead_code,
-    reason = "`read` and `lost` are for statistics (plan 15 P2e); tests use them"
-)]
 impl ControlView {
     /// Map a control page a subscriber sent, after checking the fd, its size and what it holds.
     pub(crate) fn map(fd: BorrowedFd<'_>, pins: u32) -> Result<Self> {
@@ -781,7 +776,7 @@ impl LoadedPool {
     pub(crate) fn load_slot(&self, slot: u32, dst: &mut [u8]) {
         assert!(slot < self.slots && dst.len() <= self.slot_bytes as usize);
         let at = slot_area(self.slots) as usize + slot as usize * self.slot_bytes as usize;
-        // SAFETY: inside a slot of a mapping `self` owns, whose slots this process reads by runs.
+        // SAFETY: a slot of a mapping `self` owns; no `slot_slice` slice is live (its contract).
         unsafe { RoRun::new(self.mapping.as_ptr().add(at), dst.len()) }.load(dst);
     }
 

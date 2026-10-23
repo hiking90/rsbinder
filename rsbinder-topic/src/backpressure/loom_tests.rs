@@ -16,8 +16,7 @@ use loom::cell::UnsafeCell;
 use loom::sync::atomic::{AtomicU64, Ordering};
 use loom::thread;
 
-/// A ring of one record: the record, how many the publisher committed, how many the subscriber
-/// read.
+/// A ring of one record: the record, the records committed, and the records read.
 struct Model {
     record: UnsafeCell<u64>,
     write: AtomicU64,
@@ -28,8 +27,7 @@ struct Model {
 // SAFETY: the record is what loom checks: every access is through `with` or `with_mut`.
 unsafe impl Sync for Model {}
 
-/// The publisher commits record 1, waits for the subscriber to read it, and writes record 2 over
-/// it; the subscriber waits for record 1, copies it, and stores its `read` with `read_order`.
+/// Record 2 written over record 1 once it is read; the subscriber stores `read` with `read_order`.
 fn a_record_is_written_over_only_after_it_is_read(read_order: Ordering) {
     loom::model(move || {
         let model = Arc::new(Model {
