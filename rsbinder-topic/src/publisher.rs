@@ -13,7 +13,7 @@
 
 use std::fmt;
 use std::os::fd::{AsFd, OwnedFd};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use rsbinder::fmq::shm::Mapping;
 use rsbinder::{
@@ -33,7 +33,7 @@ use crate::layout::{self, ControlView, LentSlot, Stored, HEADER_OFFSET, VERSION}
 use crate::link::{Dead, Forget, Link};
 use crate::pool::MAX_PINS;
 use crate::publish::{PoolFd, TypedWriter};
-use crate::resolve::{Resolver, ServiceManager};
+use crate::resolve::{Advertisement, Resolver, ServiceManager};
 use crate::{wake, Authorize, Bytes, Payload, PublishError, PublisherPolicy, PublisherStats};
 
 /// The sending end of a topic of `T`: it writes values into the topic's memory and takes
@@ -61,6 +61,8 @@ use crate::{wake, Authorize, Bytes, Payload, PublishError, PublisherPolicy, Publ
 pub struct Publisher<T: Payload> {
     shared: Arc<Shared<T>>,
     binder: SIBinder,
+    /// The name [`advertise_with`](Self::advertise_with) gave, dropped before the end record.
+    advertised: Mutex<Option<Advertisement>>,
 }
 
 /// What the publisher, the acceptors and the death notifications share.
@@ -99,7 +101,11 @@ impl<T: Payload + 'static> Publisher<T> {
             topic: Arc::downgrade(&shared) as Weak<dyn Accept>,
         };
         let binder = BnTopic::new_binder(Service { acceptor }).as_binder();
-        Ok(Self { shared, binder })
+        Ok(Self {
+            shared,
+            binder,
+            advertised: Mutex::new(None),
+        })
     }
 
     /// Make a topic with `policy` and register its binder with the service manager under
@@ -119,13 +125,18 @@ impl<T: Payload + 'static> Publisher<T> {
     }
 
     /// [`advertise`](Self::advertise) through `resolver` instead of the service manager.
+    ///
+    /// The publisher holds the [`Advertisement`] the resolver returns and drops it in
+    /// [`close`](Self::close), or as it drops, before it writes the end record. A resolver
+    /// that takes the name back then has, by the time a subscriber reads the end, been told to.
     pub fn advertise_with(
         name: &str,
         policy: &PublisherPolicy,
         resolver: &dyn Resolver,
     ) -> BinderResult<Self> {
-        let publisher = Self::new(policy).map_err(status_of)?;
-        resolver.advertise(name, publisher.as_binder())?;
+        let mut publisher = Self::new(policy).map_err(status_of)?;
+        let advertised = resolver.advertise(name, publisher.as_binder())?;
+        publisher.advertised = Mutex::new(Some(advertised));
         Ok(publisher)
     }
 }
@@ -197,12 +208,17 @@ impl<T: Payload + 'static> Publisher<T> {
     /// [`PublishError::Closed`] and later subscriptions are refused with
     /// [`ITopic::ERROR_CLOSED`]. Closing again does nothing.
     ///
+    /// A name [`advertise_with`](Self::advertise_with) gave is taken back first, as its
+    /// resolver does it: the service manager does not.
+    ///
     /// The status's message is cut to 1 KiB. With
     /// [`backpressure`](PublisherPolicy::backpressure) the end record waits for room as a value
     /// does, so this call, and dropping the publisher, can take up to the timeout.
     ///
     /// [`ITopic::ERROR_CLOSED`]: crate::aidl::ITopic::ERROR_CLOSED
     pub fn close(&self, status: &Status) {
+        let advertised = self.advertised.lock().expect("lock poisoned").take();
+        drop(advertised);
         self.shared.writer.close(status);
     }
 
@@ -324,6 +340,11 @@ impl fmt::Debug for LoanMut<'_> {
 
 impl<T: Payload> Drop for Publisher<T> {
     fn drop(&mut self) {
+        let advertised = self
+            .advertised
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        drop(advertised.take());
         self.shared.writer.close(&Status::from(ExceptionCode::None));
     }
 }

@@ -139,7 +139,11 @@ do not carry over: what was published between two connections is not counted
 as lost, and the `Disconnected` marks the gap. Only being taken out by a topic
 with backpressure, `Closed::Evicted`, ends it. The watch uses the service
 manager's registration notices, which Android 10's service manager does not
-have: there `NamedSubscriber::subscribe` fails.
+have: there `NamedSubscriber::subscribe` fails. A notice is a oneway call,
+which the kernel fails when the subscriber's process has no room left for one;
+when a publisher ends, or refuses as ended, with no other binder for the name,
+the subscriber asks the service manager once (`check_service`) for the binder
+the name has.
 
 ## Losing records, and backpressure
 

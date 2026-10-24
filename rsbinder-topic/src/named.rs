@@ -9,6 +9,10 @@
 //! (`Subscriber::request`) and hands the connection over. The receiving thread never makes the
 //! call, so a publisher that does not answer holds no receive, and dropping the subscriber does
 //! not wait for the thread: a connection the thread makes after the drop is dropped by it.
+//!
+//! A notice of the watch can be lost (plan 15 §12.5): the thread also asks the watch's lookup,
+//! once when a publisher refuses as ended and once when a connection's publisher ends with no
+//! binder after it, and takes the answer only when no notice came while it asked.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -22,7 +26,7 @@ use crate::aidl::ITopic::{ERROR_CLOSED, ERROR_VERSION};
 use crate::connect::status_of;
 use crate::layout;
 use crate::poll::{Sealed, Wait};
-use crate::resolve::{Resolver, ServiceManager, Watch};
+use crate::resolve::{Lookup, Resolver, ServiceManager, Watch};
 use crate::subscriber::Interrupt;
 use crate::wake::NamedFds;
 use crate::{
@@ -96,6 +100,18 @@ const DRAIN_STALLS: u32 = 2;
 /// before a [`Disconnected::Replaced`] included, and the death notice that arrives while it is
 /// held; an end it read no record of, or a notice that arrives once it is over, goes to none.
 ///
+/// A notice of the name is a oneway call, which fails when this process has no room left for
+/// one, so a subscriber can miss the binder a name was given. With a watch that has a lookup
+/// ([`Watch::with_lookup`]; the service manager's has one), the subscriber asks it for the
+/// binder the name has now, once each time it would otherwise wait for a notice that may not
+/// come: when a publisher refuses it as ended ([`ITopic::ERROR_CLOSED`] or `DeadObject`), and
+/// when the publisher of its connection ends and the name has been given no other binder. The
+/// answer is used only when no notice came while it asked, and not when it is the binder that
+/// ended or refused. Notices of one name are not ordered against the answer: with the service
+/// manager, a notice older than the answer that arrives after it moves the subscriber back to
+/// that binder, and from there, as it refuses or ends, to the binder the name has, through a
+/// [`Disconnected::Replaced`] and a reconnection.
+///
 /// With [`Wake::Fd`] the subscriber is a [`Wait`]: an event loop or
 /// [`wait_any`](crate::wait_any) polls the same fd through every reconnection.
 /// `recv_async` waits on the connection's `recv_async`, and between connections without a
@@ -104,6 +120,8 @@ const DRAIN_STALLS: u32 = 2;
 /// **The process has to run the binder thread pool**
 /// (`rsbinder::ProcessState::start_thread_pool`): the service manager's notice of the name is a
 /// call into it, and without the pool the subscriber never connects.
+///
+/// [`ITopic::ERROR_CLOSED`]: crate::aidl::ITopic::ERROR_CLOSED
 pub struct NamedSubscriber<T: Payload> {
     named: Arc<Named<T>>,
     current: Option<Connection<T>>,
@@ -232,6 +250,23 @@ struct State<T: Payload> {
     later: bool,
     /// The wait before asking again a publisher whose connection failed to join; zero after a join.
     rejoin: Duration,
+    find: Find,
+}
+
+/// The watch's lookup, as far as the subscriber knows it.
+enum Find {
+    /// The watch has not been returned yet; `true` once a refusal wanted its lookup.
+    Unknown(bool),
+    Lookup(Lookup),
+    Absent,
+}
+
+/// Where a connection thread starts.
+enum Begin {
+    /// Subscribe to this binder.
+    At(SIBinder),
+    /// Ask the watch's lookup first; the binder whose end led here, if one did.
+    Look(Option<SIBinder>),
 }
 
 impl<T: Payload> State<T> {
@@ -252,6 +287,7 @@ impl<T: Payload> State<T> {
             joined: Vec::new(),
             later: false,
             rejoin: Duration::ZERO,
+            find: Find::Unknown(false),
         }
     }
 
@@ -331,6 +367,22 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
                 }
             }),
         )?;
+        let mut state = named.lock();
+        let wanted = matches!(state.find, Find::Unknown(true));
+        state.find = match watch.lookup() {
+            Some(lookup) => Find::Lookup(lookup),
+            None => Find::Absent,
+        };
+        // A refusal before the watch was returned wanted the lookup it did not have yet.
+        let look = wanted
+            && matches!(state.find, Find::Lookup(_))
+            && !state.connecting
+            && state.connected.is_none();
+        state.connecting |= look;
+        drop(state);
+        if look {
+            named.connect(Begin::Look(None), Duration::ZERO);
+        }
         Ok(Self {
             named,
             current: None,
@@ -515,7 +567,7 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
                     drop(state);
                     drop(subscriber);
                     if let Some(next) = next {
-                        self.named.connect(next, after);
+                        self.named.connect(Begin::At(next), after);
                     }
                     let status = Status::from(StatusCode::from(error));
                     return Step::Done(Err(RecvError::Disconnected(Disconnected::Rejected(
@@ -708,12 +760,19 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
             .latest
             .clone()
             .filter(|latest| Some(latest) != old && Some(latest) != state.refused.as_ref());
-        if let Some(next) = next.filter(|_| !state.connecting) {
-            state.connecting = true;
-            drop(state);
-            self.named.connect(next, Duration::ZERO);
-        } else {
-            drop(state);
+        let begin = match next {
+            _ if state.connecting => None,
+            Some(next) => Some(Begin::At(next)),
+            // The notice of the binder after the one that ended may have been lost.
+            None if ended.is_some() && matches!(state.find, Find::Lookup(_)) => {
+                Some(Begin::Look(old.cloned()))
+            }
+            None => None,
+        };
+        state.connecting |= begin.is_some();
+        drop(state);
+        if let Some(begin) = begin {
+            self.named.connect(begin, Duration::ZERO);
         }
         if let (Some(fds), Some(connection)) = (&self.named.fds, &gone) {
             if let Some(theirs) = connection.subscriber.wait_fd() {
@@ -1000,23 +1059,33 @@ impl<T: Payload + 'static> Named<T> {
         }
         state.connecting = true;
         drop(state);
-        self.connect(binder, Duration::ZERO);
+        self.connect(Begin::At(binder), Duration::ZERO);
     }
 
-    /// Start the connection thread, which asks `binder` after `after`; the caller set `connecting`.
-    fn connect(self: &Arc<Self>, binder: SIBinder, after: Duration) {
+    /// Start the connection thread, which begins at `begin` after `after`; the caller set
+    /// `connecting`.
+    fn connect(self: &Arc<Self>, begin: Begin, after: Duration) {
         let named = self.clone();
         let spawned = std::thread::Builder::new()
             .name("rsbinder-topic-connect".into())
-            .spawn(move || named.run(binder, after));
+            .spawn(move || named.run(begin, after));
         if spawned.is_err() {
             // The next registration of the name tries again.
             self.lock().connecting = false;
         }
     }
 
-    /// The connection thread: subscribe to `binder` after `after`, retry, and move to a newer one.
-    fn run(self: Arc<Self>, mut binder: SIBinder, after: Duration) {
+    /// The connection thread: subscribe from `begin` after `after`, retry, and move to a newer
+    /// binder; ask the lookup once after a publisher refused as ended.
+    fn run(self: Arc<Self>, begin: Begin, after: Duration) {
+        // Whether `binder` is the lookup's answer: its refusal asks no more.
+        let (mut binder, mut looked) = match begin {
+            Begin::At(binder) => (binder, false),
+            Begin::Look(ended) => match self.look(ended.as_ref()) {
+                Some(next) => next,
+                None => return,
+            },
+        };
         let mut delay = FIRST_RETRY;
         let mut told = false;
         if !after.is_zero() {
@@ -1049,7 +1118,7 @@ impl<T: Payload + 'static> Named<T> {
                     if let Some(newer) = newer {
                         drop(state);
                         drop(subscriber);
-                        (binder, delay, told) = (newer, FIRST_RETRY, false);
+                        (binder, looked, delay, told) = (newer, false, FIRST_RETRY, false);
                         continue;
                     }
                     state.ready = Some((subscriber, binder.clone()));
@@ -1068,15 +1137,28 @@ impl<T: Payload + 'static> Named<T> {
                     }
                     state.refused = Some(binder);
                     let next = newer.filter(|newer| state.refused.as_ref() != Some(newer));
-                    let Some(next) = next else {
-                        state.connecting = false;
-                        drop(state);
-                        self.signal();
-                        return;
+                    let next = match next {
+                        Some(next) => {
+                            drop(state);
+                            (next, false)
+                        }
+                        None if tell || looked => {
+                            state.connecting = false;
+                            drop(state);
+                            self.signal();
+                            return;
+                        }
+                        // Refused as ended: the notice of the binder after it may have been lost.
+                        None => {
+                            drop(state);
+                            match self.look(None) {
+                                Some(next) => next,
+                                None => return,
+                            }
+                        }
                     };
-                    drop(state);
                     self.signal();
-                    (binder, delay, told) = (next, FIRST_RETRY, false);
+                    ((binder, looked), delay, told) = (next, FIRST_RETRY, false);
                 }
                 Refusal::Retry => {
                     if !told {
@@ -1089,7 +1171,9 @@ impl<T: Payload + 'static> Named<T> {
                     }
                     state = self.hold(state, &binder, Instant::now() + delay);
                     match state.latest.clone().filter(|latest| *latest != binder) {
-                        Some(newer) => (binder, delay, told) = (newer, FIRST_RETRY, false),
+                        Some(newer) => {
+                            (binder, looked, delay, told) = (newer, false, FIRST_RETRY, false);
+                        }
                         None => delay = (delay * 2).min(LAST_RETRY),
                     }
                     drop(state);
@@ -1115,6 +1199,52 @@ impl<T: Payload + 'static> Named<T> {
         }
         state
     }
+
+    /// Ask the watch's lookup, outside the lock, for the binder the name has now: the binder to
+    /// subscribe to and whether the lookup gave it, or `None` with `connecting` cleared.
+    ///
+    /// The answer is taken only when `latest` did not change meanwhile; a notice that did is
+    /// newer and is taken instead. Neither is taken when it is `ended` or `refused`.
+    fn look(&self, ended: Option<&SIBinder>) -> Option<(SIBinder, bool)> {
+        let mut state = self.lock();
+        let lookup = match &mut state.find {
+            Find::Lookup(lookup) => Some(lookup.clone()),
+            Find::Unknown(wanted) => {
+                *wanted = true;
+                None
+            }
+            Find::Absent => None,
+        };
+        let Some(lookup) = lookup else {
+            state.connecting = false;
+            return None;
+        };
+        let before = state.latest.clone();
+        drop(state);
+        let found = lookup().ok().flatten();
+        let mut state = self.lock();
+        let next = if state.dropped || state.evicted {
+            None
+        } else if state.latest == before {
+            let found = found.filter(|found| usable(found, &state, ended));
+            if let Some(found) = &found {
+                state.latest = Some(found.clone());
+            }
+            found.map(|found| (found, true))
+        } else {
+            let latest = state.latest.clone();
+            latest
+                .filter(|latest| usable(latest, &state, ended))
+                .map(|latest| (latest, false))
+        };
+        state.connecting = next.is_some();
+        next
+    }
+}
+
+/// Whether a connection thread may subscribe to `binder`: neither `ended` nor refused.
+fn usable<T: Payload>(binder: &SIBinder, state: &State<T>, ended: Option<&SIBinder>) -> bool {
+    Some(binder) != state.refused.as_ref() && Some(binder) != ended
 }
 
 impl<T: Payload> Interrupt for Named<T> {

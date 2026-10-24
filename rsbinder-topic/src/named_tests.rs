@@ -25,9 +25,9 @@ use rsbinder::fmq::shm::Mapping;
 use std::os::fd::{AsRawFd, OwnedFd};
 
 use crate::{
-    wait_any, Acceptor, Authorize, Backpressure, Bytes, Closed, Disconnected, NamedSubscriber,
-    Publisher, PublisherPolicy, RecvError, Resolver, Start, Subscriber, SubscriberPolicy, Wait,
-    Wake, Watch,
+    wait_any, Acceptor, Advertisement, Authorize, Backpressure, Bytes, Closed, Disconnected,
+    NamedSubscriber, Publisher, PublisherPolicy, RecvError, Resolver, Start, Subscriber,
+    SubscriberPolicy, Wait, Wake, Watch,
 };
 
 /// The bound of every wait a test makes, so that a broken subscriber fails rather than hangs.
@@ -35,6 +35,7 @@ const WAIT: Duration = Duration::from_secs(10);
 const NAME: &str = "test.topic";
 
 type Callback = Arc<dyn Fn(SIBinder) + Send + Sync>;
+type Hook = Arc<dyn Fn() + Send + Sync>;
 
 /// Names held in this process: `give` registers a binder and calls the watchers at once.
 #[derive(Clone, Default)]
@@ -45,9 +46,50 @@ struct Book {
     given: HashMap<String, SIBinder>,
     watchers: Vec<(usize, String, Callback)>,
     next: usize,
+    /// With [`Names::looking`]: the lookups the watches were asked.
+    lookups: Option<usize>,
+    /// Run by a lookup before it reads the name.
+    before_lookup: Option<Hook>,
+    /// Run by `watch` after its call with the binder the name has.
+    after_first_call: Option<Hook>,
 }
 
 impl Names {
+    /// Names whose watches have a lookup (`Watch::with_lookup`) that reads `given`.
+    fn looking() -> Self {
+        let names = Self::default();
+        names.0.lock().unwrap().lookups = Some(0);
+        names
+    }
+
+    /// Register `binder` as a notice lost on the way would: no watcher is called.
+    fn withhold(&self, name: &str, binder: SIBinder) {
+        let mut book = self.0.lock().unwrap();
+        book.given.insert(name.to_owned(), binder);
+    }
+
+    fn before_lookup(&self, hook: impl Fn() + Send + Sync + 'static) {
+        self.0.lock().unwrap().before_lookup = Some(Arc::new(hook));
+    }
+
+    fn after_first_call(&self, hook: impl Fn() + Send + Sync + 'static) {
+        self.0.lock().unwrap().after_first_call = Some(Arc::new(hook));
+    }
+
+    fn lookups(&self) -> usize {
+        self.0.lock().unwrap().lookups.expect("names that look")
+    }
+
+    fn look(&self, name: &str) -> Option<SIBinder> {
+        let hook = self.0.lock().unwrap().before_lookup.clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+        let mut book = self.0.lock().unwrap();
+        *book.lookups.as_mut().expect("names that look") += 1;
+        book.given.get(name).cloned()
+    }
+
     fn give(&self, name: &str, binder: SIBinder) {
         let mut book = self.0.lock().unwrap();
         book.given.insert(name.to_owned(), binder.clone());
@@ -69,9 +111,9 @@ impl Names {
 }
 
 impl Resolver for Names {
-    fn advertise(&self, name: &str, topic: SIBinder) -> BinderResult<()> {
+    fn advertise(&self, name: &str, topic: SIBinder) -> BinderResult<Advertisement> {
         self.give(name, topic);
-        Ok(())
+        Ok(Advertisement::none())
     }
 
     fn watch(
@@ -85,11 +127,21 @@ impl Resolver for Names {
         book.next += 1;
         book.watchers.push((id, name.to_owned(), callback.clone()));
         let given = book.given.get(name).cloned();
+        let looks = book.lookups.is_some();
+        let after_first_call = book.after_first_call.clone();
         drop(book);
         if let Some(binder) = given {
             callback(binder);
         }
-        Ok(Watch::new(Unwatch(self.clone(), id)))
+        if let Some(hook) = after_first_call {
+            hook();
+        }
+        let unwatch = Unwatch(self.clone(), id);
+        if !looks {
+            return Ok(Watch::new(unwatch));
+        }
+        let (names, name) = (self.clone(), name.to_owned());
+        Ok(Watch::with_lookup(unwatch, move || Ok(names.look(&name))))
     }
 }
 
@@ -1463,6 +1515,293 @@ fn a_closed_publisher_is_waited_past_without_a_notice() {
     connected(&subscriber);
     next.publish(&bytes(7)).unwrap();
     assert_eq!(recv(&mut subscriber), Ok(bytes(7)));
+}
+
+/// An `ITopic` that counts its subscription calls and hands them to a publisher's acceptor.
+struct Counted {
+    acceptor: Acceptor,
+    asked: Arc<AtomicUsize>,
+}
+
+impl Interface for Counted {}
+
+impl ITopic for Counted {
+    fn r#subscribe(&self, request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        self.acceptor.accept(request)
+    }
+}
+
+/// A closed publisher's binder, which refuses with `ERROR_CLOSED`, and its subscription calls.
+fn closed_counted() -> (Publisher<Bytes>, SIBinder, Arc<AtomicUsize>) {
+    let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
+    publisher.close(&Status::from(ExceptionCode::None));
+    let asked = Arc::new(AtomicUsize::new(0));
+    let counted = Counted {
+        acceptor: publisher.acceptor(),
+        asked: asked.clone(),
+    };
+    (publisher, BnTopic::new_binder(counted).as_binder(), asked)
+}
+
+/// Wait until `asked` reaches `calls`, then long enough for a call more to show.
+fn settled(asked: &AtomicUsize, calls: usize) {
+    let deadline = Instant::now() + WAIT;
+    while asked.load(Ordering::SeqCst) < calls {
+        assert!(Instant::now() < deadline, "asked {calls} times");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(asked.load(Ordering::SeqCst), calls);
+}
+
+/// AC-15.5.6 (1): a notice of an ended publisher, the notice after it lost.
+#[test]
+fn a_refusal_as_ended_asks_the_lookup_and_connects_to_the_binder_the_name_has() {
+    let names = Names::looking();
+    let (_closed, binder, asked) = closed_counted();
+    names.give(NAME, binder);
+    let next = Publisher::<Bytes>::new(&policy()).unwrap();
+    // Not given before the watch's first call: that call is the ended publisher.
+    let (lost, given) = (names.clone(), next.as_binder());
+    names.before_lookup(move || lost.withhold(NAME, given.clone()));
+    let mut subscriber = subscribe(&names);
+    connected(&subscriber);
+    next.publish(&bytes(4)).unwrap();
+    assert_eq!(recv(&mut subscriber), Ok(bytes(4)));
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+    assert_eq!(names.lookups(), 1);
+}
+
+/// The same refusal before the watch is returned, while the subscriber has no lookup yet.
+#[test]
+fn a_refusal_as_ended_before_the_watch_is_returned_asks_the_lookup_once_it_is() {
+    let names = Names::looking();
+    let (_closed, binder, asked) = closed_counted();
+    names.give(NAME, binder);
+    let next = Publisher::<Bytes>::new(&policy()).unwrap();
+    let (lost, given) = (names.clone(), next.as_binder());
+    // The refusal comes within the watch: by the margin of `settled`, before it returns.
+    names.after_first_call(move || {
+        settled(&asked, 1);
+        lost.withhold(NAME, given.clone());
+    });
+    let mut subscriber = subscribe(&names);
+    connected(&subscriber);
+    next.publish(&bytes(4)).unwrap();
+    assert_eq!(recv(&mut subscriber), Ok(bytes(4)));
+    assert_eq!(names.lookups(), 1);
+}
+
+/// AC-15.5.6 (4): an answer that is the refused binder is not asked again.
+#[test]
+fn a_lookup_that_answers_the_refused_binder_leaves_the_subscriber_waiting() {
+    let names = Names::looking();
+    let (_closed, binder, asked) = closed_counted();
+    names.give(NAME, binder);
+    let mut subscriber = subscribe(&names);
+    settled(&asked, 1);
+    assert_eq!(names.lookups(), 1);
+    assert!(!subscriber.wait_connected(Duration::ZERO));
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    let next = advertise(&names, &policy());
+    connected(&subscriber);
+    next.publish(&bytes(6)).unwrap();
+    assert_eq!(recv(&mut subscriber), Ok(bytes(6)));
+}
+
+/// AC-15.5.6 (4): an answer refused in turn asks no more, so two ended binders make no loop.
+#[test]
+fn a_lookup_answer_refused_as_ended_is_not_looked_past() {
+    let names = Names::looking();
+    let (_first, first, first_asked) = closed_counted();
+    let (_second, second, second_asked) = closed_counted();
+    names.give(NAME, first.clone());
+    // Each lookup answers the binder the last one did not: a loop would ask both forever.
+    let (flip, answers) = (names.clone(), Arc::new(AtomicUsize::new(0)));
+    names.before_lookup(move || {
+        let answer = [&second, &first][answers.fetch_add(1, Ordering::SeqCst) % 2];
+        flip.withhold(NAME, answer.clone());
+    });
+    let subscriber = subscribe(&names);
+    settled(&second_asked, 1);
+    assert_eq!(first_asked.load(Ordering::SeqCst), 1);
+    assert_eq!(names.lookups(), 1);
+    assert!(!subscriber.wait_connected(Duration::ZERO));
+}
+
+/// AC-15.5.6 (2): the end of the connection's publisher, the notice of the next one lost.
+#[test]
+fn an_ended_publisher_with_no_binder_after_it_asks_the_lookup() {
+    let names = Names::looking();
+    let first = advertise(&names, &policy());
+    let mut subscriber = subscribe(&names);
+    connected(&subscriber);
+    let second = Publisher::<Bytes>::new(&policy()).unwrap();
+    second.publish(&bytes(9)).unwrap();
+    names.withhold(NAME, second.as_binder());
+    first.publish(&bytes(1)).unwrap();
+    drop(first);
+    assert_eq!(recv(&mut subscriber), Ok(bytes(1)));
+    assert_eq!(
+        recv(&mut subscriber),
+        Err(RecvError::Disconnected(Disconnected::Ended(Closed::End)))
+    );
+    // A publisher not connected to before: read from its oldest record.
+    assert_eq!(recv(&mut subscriber), Ok(bytes(9)));
+    assert_eq!(names.lookups(), 1);
+}
+
+/// The death of the connection's publisher is an end too.
+#[test]
+fn a_dead_publisher_with_no_binder_after_it_asks_the_lookup() {
+    let names = Names::looking();
+    let first = advertise(&names, &policy());
+    let mut subscriber = subscribe(&names);
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    let second = Publisher::<Bytes>::new(&policy()).unwrap();
+    second.publish(&bytes(9)).unwrap();
+    names.withhold(NAME, second.as_binder());
+    let death = subscriber.connection_death().expect("a connection");
+    death.binder_died(&SIBinder::downgrade(&first.as_binder()));
+    assert!(matches!(
+        recv(&mut subscriber),
+        Err(RecvError::Disconnected(Disconnected::Ended(_)))
+    ));
+    assert_eq!(recv(&mut subscriber), Ok(bytes(9)));
+    assert_eq!(names.lookups(), 1);
+}
+
+/// A lookup that answers the publisher that ended, as the service manager's does for a name it
+/// keeps, leaves the subscriber waiting for a notice.
+#[test]
+fn a_lookup_that_answers_the_ended_publisher_leaves_the_subscriber_waiting() {
+    let names = Names::looking();
+    let first = Publisher::<Bytes>::new(&policy()).unwrap();
+    let asked = Arc::new(AtomicUsize::new(0));
+    let counted = Counted {
+        acceptor: first.acceptor(),
+        asked: asked.clone(),
+    };
+    names.give(NAME, BnTopic::new_binder(counted).as_binder());
+    let mut subscriber = subscribe(&names);
+    connected(&subscriber);
+    drop(first);
+    assert_eq!(
+        recv(&mut subscriber),
+        Err(RecvError::Disconnected(Disconnected::Ended(Closed::End)))
+    );
+    assert_eq!(
+        subscriber.recv_timeout(Duration::from_millis(300)),
+        Err(RecvError::Timeout)
+    );
+    assert_eq!(names.lookups(), 1);
+    // The answer is not asked: it is the publisher whose end the connection read.
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+    let next = advertise(&names, &policy());
+    next.publish(&bytes(3)).unwrap();
+    assert_eq!(recv(&mut subscriber), Ok(bytes(3)));
+}
+
+/// Without a lookup (`Watch::new`) a lost notice is waited for, as it ever was.
+#[test]
+fn without_a_lookup_an_ended_publisher_waits_for_the_next_notice() {
+    let names = Names::default();
+    let first = advertise(&names, &policy());
+    let mut subscriber = subscribe(&names);
+    connected(&subscriber);
+    let second = Publisher::<Bytes>::new(&policy()).unwrap();
+    second.publish(&bytes(9)).unwrap();
+    names.withhold(NAME, second.as_binder());
+    drop(first);
+    assert_eq!(
+        recv(&mut subscriber),
+        Err(RecvError::Disconnected(Disconnected::Ended(Closed::End)))
+    );
+    assert_eq!(
+        subscriber.recv_timeout(Duration::from_millis(300)),
+        Err(RecvError::Timeout)
+    );
+    assert_eq!(second.subscriber_count(), 0);
+}
+
+/// AC-15.5.6 (3): a notice that comes while the lookup runs is newer than its answer.
+#[test]
+fn a_notice_during_the_lookup_is_taken_over_its_answer() {
+    let names = Names::looking();
+    let first = advertise(&names, &policy());
+    let mut subscriber = subscribe(&names);
+    connected(&subscriber);
+    let answer = Publisher::<Bytes>::new(&policy()).unwrap();
+    let notice = Publisher::<Bytes>::new(&policy()).unwrap();
+    answer.publish(&bytes(8)).unwrap();
+    notice.publish(&bytes(5)).unwrap();
+    names.withhold(NAME, answer.as_binder());
+    let (late, given, answered) = (names.clone(), notice.as_binder(), answer.as_binder());
+    names.before_lookup(move || {
+        late.give(NAME, given.clone());
+        late.withhold(NAME, answered.clone());
+    });
+    drop(first);
+    assert_eq!(
+        recv(&mut subscriber),
+        Err(RecvError::Disconnected(Disconnected::Ended(Closed::End)))
+    );
+    assert_eq!(recv(&mut subscriber), Ok(bytes(5)));
+    assert_eq!(names.lookups(), 1);
+    assert_eq!(notice.subscriber_count(), 1);
+    assert_eq!(answer.subscriber_count(), 0);
+}
+
+/// A resolver whose advertisement looks at the topic as it is dropped: did it end before?
+#[derive(Clone, Default)]
+struct Ending(Arc<Mutex<Vec<Result<Bytes, RecvError>>>>);
+
+struct Looked {
+    /// In a `Mutex`, as an advertisement is `Sync` and a subscriber is not.
+    subscriber: Mutex<Subscriber<Bytes>>,
+    seen: Ending,
+}
+
+impl Drop for Looked {
+    fn drop(&mut self) {
+        let seen = self.subscriber.get_mut().unwrap().try_recv();
+        self.seen.0.lock().unwrap().push(seen);
+    }
+}
+
+impl Resolver for Ending {
+    fn advertise(&self, _: &str, topic: SIBinder) -> BinderResult<Advertisement> {
+        let subscriber = Subscriber::<Bytes>::request(&topic, &SubscriberPolicy::default())?;
+        Ok(Advertisement::new(Looked {
+            subscriber: Mutex::new(subscriber),
+            seen: self.clone(),
+        }))
+    }
+
+    fn watch(&self, _: &str, _: Box<dyn Fn(SIBinder) + Send + Sync>) -> BinderResult<Watch> {
+        Ok(Watch::new(()))
+    }
+}
+
+/// AC-15.5.6: the advertisement is dropped before the end record, by `close` and by `Drop`.
+#[test]
+fn a_publisher_drops_its_advertisement_before_its_end_record() {
+    let ending = Ending::default();
+    let closed = Publisher::<Bytes>::advertise_with(NAME, &policy(), &ending).unwrap();
+    closed.close(&Status::from(ExceptionCode::None));
+    assert_eq!(*ending.0.lock().unwrap(), [Err(RecvError::Empty)]);
+    // Closing again, and the drop after a close, have no advertisement left to drop.
+    closed.close(&Status::from(ExceptionCode::None));
+    drop(closed);
+    assert_eq!(ending.0.lock().unwrap().len(), 1);
+    let dropped = Publisher::<Bytes>::advertise_with(NAME, &policy(), &ending).unwrap();
+    drop(dropped);
+    assert_eq!(
+        *ending.0.lock().unwrap(),
+        [Err(RecvError::Empty), Err(RecvError::Empty)]
+    );
 }
 
 #[test]

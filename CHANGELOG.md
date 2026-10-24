@@ -96,7 +96,11 @@ Each item below changes what a 0.12.0 program observes.
     takes the subscribers in the way out (`Closed::Evicted`).
   - `Publisher::advertise` and `NamedSubscriber`: a topic found by a service
     manager name, the subscriber reconnecting to whichever publisher holds
-    it (`RecvError::Disconnected` between connections).
+    it (`RecvError::Disconnected` between connections). A registration
+    notice the subscriber missed (a oneway call, lost when the process has no
+    room for it) is made up by one `check_service` when a publisher ends, or
+    refuses as ended, with no other binder for the name. `Resolver` (`Advertisement`,
+    `Watch::with_lookup`) puts the names somewhere else.
   - Waits on a futex word of the topic (`Wake::Futex`, one wake system call
     per publish for every sleeping subscriber) or on a socket of the
     subscription (`Wake::Fd`, with `Wait` and `wait_any` for event loops);
