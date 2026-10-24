@@ -19,6 +19,7 @@ use crate::{end, Payload, Record, Sample, Trust};
 /// `Closed` ends it, and every later receive returns it again. `Disconnected` is the
 /// [`NamedSubscriber`](crate::NamedSubscriber)'s, which goes on with the next publisher.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum RecvError {
     /// No record is unread. The next receive tries again from the same place.
     Empty,
@@ -49,6 +50,7 @@ pub enum RecvError {
 
 /// Why a [`NamedSubscriber`](crate::NamedSubscriber) lost or did not get a connection.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Disconnected {
     /// The topic of the connection ended, as [`Closed`] says. Every record before the end was
     /// returned.
@@ -108,6 +110,7 @@ pub enum Disconnected {
 
 /// How a topic ended.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Closed {
     /// The publisher ended it without an error.
     End,

@@ -240,6 +240,7 @@ impl PublisherPolicy {
 
 /// Why a publish wrote nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PublishError {
     /// The value encodes to more bytes than a record of this ring carries.
     TooLarge {
