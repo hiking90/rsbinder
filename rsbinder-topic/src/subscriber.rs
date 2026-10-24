@@ -869,11 +869,12 @@ impl<M: Trust> Subscriber<Bytes, M> {
     /// copy of a value the publisher lent, as [`try_recv_sample`](Self::try_recv_sample) is.
     ///
     /// The records before the newest are skipped and not reported as lost, lent values among them
-    /// too: their slots are not pinned. Until the [`Sample`] drops the subscriber has read up to
-    /// the start of the newest record, so a publisher with
-    /// [`Backpressure`](crate::Backpressure) waits for that record alone, not for those skipped. A
-    /// lent value taken back before this call pinned its slot is gone past as `try_latest` goes
-    /// past one, and the errors are `try_latest`'s.
+    /// too: their slots are not pinned. Until the [`Sample`] of a lent value drops, the subscriber
+    /// has read up to the start of its record, so a publisher with
+    /// [`Backpressure`](crate::Backpressure) waits for that record alone, not for those skipped; a
+    /// value that came through the ring is read when the call returns. A lent value taken back
+    /// before this call pinned its slot is gone past as `try_latest` goes past one, and the errors
+    /// are `try_latest`'s.
     pub fn try_latest_sample(&mut self) -> Result<Sample<'_, M>, RecvError> {
         let held = self.look_held(true)?;
         Ok(self.reader.sample(held, self.control.0.read()))

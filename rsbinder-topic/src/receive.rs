@@ -253,8 +253,7 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
         }
     }
 
-    /// The next value where it lies, the ring's buffer or a slot this call pins, without waiting;
-    /// with `latest` the newest, skipped to as [`try_latest`](Self::try_latest) skips.
+    /// The next value (the newest with `latest`) in the reader's buffer or a slot this call pins.
     pub(crate) fn take_held(&mut self, latest: bool) -> Result<Held, RecvError> {
         if self.corrupted {
             return Err(RecvError::Closed(Closed::Corrupted));

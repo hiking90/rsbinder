@@ -379,8 +379,7 @@ fn the_newest_lent_value_is_received_past_the_values_before_it_with_no_loss() {
     assert_eq!((stats.received, stats.lost), (3, 0));
 }
 
-/// With a depth of 1, a value published as `try_latest_sample` judges the newest record takes
-/// that record's value back: the call goes on to the newer value and reports no loss.
+/// Depth 1, a lend while the newest is judged: the sample is the newer value, with no loss.
 #[test]
 fn the_newest_sample_taken_back_as_it_is_read_gives_way_to_the_newer_one() {
     let publisher = Rc::new(Publisher::<Bytes>::new(&pooled(1, 1, 1)).unwrap());
@@ -541,7 +540,9 @@ mod async_samples {
                     lend(&publisher, &pattern(1, 64));
                 });
                 runtime.block_on(async {
-                    let sample = subscriber.recv_sample_async().await?;
+                    let waiting = subscriber.recv_sample_async();
+                    let waited = tokio::time::timeout(Duration::from_secs(10), waiting).await;
+                    let sample = waited.map_err(|_| RecvError::Timeout)??;
                     Ok::<_, RecvError>((sample.is_loaned(), sample.to_owned()))
                 })
             });
@@ -550,8 +551,7 @@ mod async_samples {
         }
     }
 
-    /// A dropped async sample receive holds no pin: a value found is returned as a sample in the
-    /// poll that found it, so no poll that returns `Pending` has pinned a slot.
+    /// A sample is returned in the poll that pins it, so a dropped `Pending` receive holds no pin.
     #[test]
     fn a_dropped_async_sample_receive_holds_no_pin() {
         let runtime = runtime();
