@@ -32,7 +32,7 @@ impl Got {
         match taken {
             Ok(Taken::Item { index, record }) => Got::Item(index, record.bytes().to_vec()),
             Ok(Taken::End { payload }) => Got::End(payload.to_vec()),
-            Ok(Taken::Loan { index, loan }) => Got::Loan(index, loan),
+            Ok(Taken::Loan { index, loan, .. }) => Got::Loan(index, loan),
             Ok(Taken::Empty) => Got::Empty,
             Ok(Taken::Lagged(records)) => Got::Lagged(records),
             Err(Corrupted(what)) => Got::Corrupted(what),

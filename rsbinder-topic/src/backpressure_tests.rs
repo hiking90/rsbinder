@@ -533,6 +533,25 @@ fn a_held_sample_leaves_its_record_unread_until_dropped() {
     assert_eq!(lag(&publisher), 0);
 }
 
+/// A held sample of the newest value leaves its own record unread alone, not those it skipped.
+#[test]
+fn a_held_newest_sample_leaves_only_its_own_record_unread() {
+    let publisher = pooled(1, SPAN);
+    let mut subscriber = subscribe(&publisher, Wake::Futex);
+    let lag = |publisher: &Publisher<Bytes>| publisher.stats().subscribers[0].lag_bytes;
+    lend(&publisher, 0);
+    let record = lag(&publisher);
+    lend(&publisher, 1);
+    lend(&publisher, 2);
+    assert_eq!(lag(&publisher), 3 * record);
+    let sample = subscriber.try_latest_sample().unwrap();
+    assert_eq!(number(&sample.to_owned()), 2);
+    assert_eq!(lag(&publisher), record);
+    drop(sample);
+    assert_eq!(lag(&publisher), 0);
+    assert_eq!(subscriber.stats().lost, 0);
+}
+
 /// With a window of 1 a lend waits for a held sample of the value before it to be dropped.
 #[test]
 fn a_lend_inside_the_window_waits_for_a_held_sample_to_drop() {

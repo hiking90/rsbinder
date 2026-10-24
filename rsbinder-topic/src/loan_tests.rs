@@ -346,6 +346,61 @@ fn a_publisher_that_keeps_taking_the_newest_value_back_holds_no_try_latest() {
     );
 }
 
+/// The newest value, lent, is received copied or where it lies; the values skipped are not lost.
+#[test]
+fn the_newest_lent_value_is_received_past_the_values_before_it_with_no_loss() {
+    // A depth of 3: no value is taken back before it is skipped.
+    let publisher = Publisher::<Bytes>::new(&pooled(1, 3, 1)).unwrap();
+    let mut subscriber = subscribe(&publisher);
+    let pool = subscriber.pool().unwrap().addresses();
+    lend(&publisher, &pattern(1, 64));
+    publisher.publish(&Bytes(vec![2])).unwrap();
+    lend(&publisher, &pattern(3, 64));
+    assert_eq!(subscriber.try_latest(), Ok(Bytes(pattern(3, 64))));
+    assert_eq!(subscriber.try_latest(), Err(RecvError::Empty));
+    lend(&publisher, &pattern(4, 64));
+    publisher.publish(&Bytes(vec![5])).unwrap();
+    lend(&publisher, &pattern(6, 64));
+    let mut sample = subscriber.try_latest_sample().unwrap();
+    assert_eq!(
+        (sample.is_loaned(), sample.to_owned()),
+        (true, pattern(6, 64))
+    );
+    // SAFETY: the publisher is this crate's, in this process.
+    let bytes = unsafe { sample.as_slice() };
+    assert!(pool.contains(&(bytes.as_ptr() as usize)));
+    drop(sample);
+    assert_eq!(subscriber.try_latest_sample().err(), Some(RecvError::Empty));
+    publisher.publish(&Bytes(vec![7])).unwrap();
+    let sample = subscriber.try_latest_sample().unwrap();
+    assert_eq!((sample.is_loaned(), sample.to_owned()), (false, vec![7]));
+    drop(sample);
+    let stats = subscriber.stats();
+    assert_eq!((stats.received, stats.lost), (3, 0));
+}
+
+/// With a depth of 1, a value published as `try_latest_sample` judges the newest record takes
+/// that record's value back: the call goes on to the newer value and reports no loss.
+#[test]
+fn the_newest_sample_taken_back_as_it_is_read_gives_way_to_the_newer_one() {
+    let publisher = Rc::new(Publisher::<Bytes>::new(&pooled(1, 1, 1)).unwrap());
+    let mut subscriber = subscribe(&publisher);
+    lend(&publisher, &pattern(1, 64));
+    let mut next = Some(publisher.clone());
+    BEFORE_JUDGING.set(Some(Box::new(move || {
+        if let Some(publisher) = next.take() {
+            lend(&publisher, &pattern(2, 64));
+        }
+    })));
+    let got = subscriber
+        .try_latest_sample()
+        .map(|sample| sample.to_owned());
+    BEFORE_JUDGING.set(None);
+    assert_eq!(got, Ok(pattern(2, 64)));
+    assert_eq!(subscriber.stats().lost, 0);
+    assert_eq!(subscriber.try_latest_sample().err(), Some(RecvError::Empty));
+}
+
 #[test]
 fn a_dropped_sample_lets_go_of_its_slot() {
     let publisher = Publisher::<Bytes>::new(&pooled(1, 2, 1)).unwrap();

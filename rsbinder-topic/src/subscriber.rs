@@ -848,14 +848,28 @@ impl<M: Trust> Subscriber<Bytes, M> {
     /// the subscriber's buffer. The errors are `try_recv`'s; a lent slot the publisher took back
     /// before this call pinned it is a loss of one record, [`RecvError::Lagged`]`(1)`.
     pub fn try_recv_sample(&mut self) -> Result<Sample<'_, M>, RecvError> {
-        let held = self.look_held()?;
+        let held = self.look_held(false)?;
+        Ok(self.reader.sample(held, self.control.0.read()))
+    }
+
+    /// The newest value where it lies, without waiting: [`try_latest`](Self::try_latest) with no
+    /// copy of a value the publisher lent, as [`try_recv_sample`](Self::try_recv_sample) is.
+    ///
+    /// The records before the newest are skipped and not reported as lost, lent values among them
+    /// too: their slots are not pinned. Until the [`Sample`] drops the subscriber has read up to
+    /// the start of the newest record, so a publisher with
+    /// [`Backpressure`](crate::Backpressure) waits for that record alone, not for those skipped. A
+    /// lent value taken back before this call pinned its slot is gone past as `try_latest` goes
+    /// past one, and the errors are `try_latest`'s.
+    pub fn try_latest_sample(&mut self) -> Result<Sample<'_, M>, RecvError> {
+        let held = self.look_held(true)?;
         Ok(self.reader.sample(held, self.control.0.read()))
     }
 
     /// The next value where it lies, waiting for one: [`try_recv_sample`](Self::try_recv_sample)
     /// after the wait [`recv`](Self::recv) makes.
     pub fn recv_sample(&mut self) -> Result<Sample<'_, M>, RecvError> {
-        let held = self.wait_with(None, Self::look_held)?;
+        let held = self.wait_with(None, |subscriber| subscriber.look_held(false))?;
         Ok(self.reader.sample(held, self.control.0.read()))
     }
 
@@ -863,22 +877,21 @@ impl<M: Trust> Subscriber<Bytes, M> {
     /// passes with no record unread.
     pub fn recv_sample_timeout(&mut self, timeout: Duration) -> Result<Sample<'_, M>, RecvError> {
         let deadline = Instant::now().checked_add(timeout);
-        let held = self.wait_with(deadline, Self::look_held)?;
+        let held = self.wait_with(deadline, |subscriber| subscriber.look_held(false))?;
         Ok(self.reader.sample(held, self.control.0.read()))
     }
 
-    fn look_held(&mut self) -> Result<Held, RecvError> {
+    fn look_held(&mut self, latest: bool) -> Result<Held, RecvError> {
         if self.local.evicted() {
             self.looked = Looked::Exact;
             return Err(RecvError::Closed(Closed::Evicted));
         }
         let before = self.before_look();
         let died = self.local.died();
-        let start = self.reader.position();
-        let held = self.reader.take_held();
+        let held = self.reader.take_held(latest);
         // A pinned slot is still being read: its record counts as read once the sample drops.
         let read = match held {
-            Ok(Held::Slot { .. }) => start,
+            Ok(Held::Slot { at, .. }) => at,
             _ => self.reader.position(),
         };
         self.settle(held, died, read, before)

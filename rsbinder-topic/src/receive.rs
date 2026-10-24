@@ -244,9 +244,7 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
                 Some(pool) => pool.copy(loan, &mut self.loaned),
                 None => Err(NO_POOL),
             };
-            // Taken back after a newer record was committed (`pool.rs`): skipped as an older one.
-            if latest && copied == Err(Unpinned::Lost) && retries < LATEST_RETRIES {
-                retries += 1;
+            if goes_on(latest, &copied, &mut retries) {
                 continue;
             }
             self.loaned(copied)?;
@@ -255,28 +253,43 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
         }
     }
 
-    /// The next value where it lies, the ring's buffer or a slot this call pins, without waiting.
-    pub(crate) fn take_held(&mut self) -> Result<Held, RecvError> {
+    /// The next value where it lies, the ring's buffer or a slot this call pins, without waiting;
+    /// with `latest` the newest, skipped to as [`try_latest`](Self::try_latest) skips.
+    pub(crate) fn take_held(&mut self, latest: bool) -> Result<Held, RecvError> {
         if self.corrupted {
             return Err(RecvError::Closed(Closed::Corrupted));
         }
-        let loan = match self.reader.try_recv() {
-            Ok(Taken::Item { record, .. }) => {
-                let len = record.bytes().len();
-                return Ok(Held::Ring { len });
+        let mut retries = 0;
+        loop {
+            let taken = if latest {
+                self.reader.try_latest()
+            } else {
+                self.reader.try_recv()
+            };
+            let (loan, at) = match taken {
+                Ok(Taken::Item { record, .. }) => {
+                    let len = record.bytes().len();
+                    return Ok(Held::Ring { len });
+                }
+                Ok(Taken::Loan { loan, at, .. }) => (loan, at),
+                // The loan lost last was the newest: it is reported.
+                Ok(Taken::Empty) if retries > 0 => return Err(self.lost_loan()),
+                other => return Err(not_a_value(other)),
+            };
+            let pinned = match &self.pool {
+                Some(pool) => pool.pin(loan),
+                None => Err(NO_POOL),
+            };
+            if goes_on(latest, &pinned, &mut retries) {
+                continue;
             }
-            Ok(Taken::Loan { loan, .. }) => loan,
-            other => return Err(not_a_value(other)),
-        };
-        let pinned = match &self.pool {
-            Some(pool) => pool.pin(loan),
-            None => Err(NO_POOL),
-        };
-        self.loaned(pinned)?;
-        Ok(Held::Slot {
-            slot: loan.slot,
-            len: loan.len as usize,
-        })
+            self.loaned(pinned)?;
+            return Ok(Held::Slot {
+                slot: loan.slot,
+                len: loan.len as usize,
+                at,
+            });
+        }
     }
 
     /// The sample of what [`take_held`](Self::take_held) returned last, for a subscriber of `M`;
@@ -284,7 +297,7 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
     pub(crate) fn sample<'a, M: Trust>(&'a self, held: Held, read: &'a AtomicU64) -> Sample<'a, M> {
         match held {
             Held::Ring { len } => Sample::ring(self.reader.held(len)),
-            Held::Slot { slot, len } => {
+            Held::Slot { slot, len, .. } => {
                 let pool = self.pool.as_ref().expect("a pinned slot is the pool's");
                 Sample::slot(pool, slot, len, read, self.position())
             }
@@ -360,14 +373,22 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
 pub(crate) enum Held {
     /// The ring reader's buffer, `len` bytes of it.
     Ring { len: usize },
-    /// A slot of the pool, pinned.
-    Slot { slot: u32, len: usize },
+    /// A slot of the pool, pinned, named by the record that starts at `at`.
+    Slot { slot: u32, len: usize, at: u64 },
 }
 
 const NO_POOL: Unpinned = Unpinned::Corrupted("a loan from a publisher without a pool");
 
 /// How many loans taken back a receive of the newest value skips before it reports one lost.
 pub(crate) const LATEST_RETRIES: u32 = 4;
+
+/// Whether a receive of the newest value skips a loan `done` found taken back, counting the retry.
+fn goes_on(latest: bool, done: &Result<(), Unpinned>, retries: &mut u32) -> bool {
+    // Taken back only after a newer record was committed (`pool.rs`): skipped as an older one.
+    let on = latest && *done == Err(Unpinned::Lost) && *retries < LATEST_RETRIES;
+    *retries += u32::from(on);
+    on
+}
 
 /// What a receive reports for a record that holds no value.
 fn not_a_value(taken: Result<Taken<'_>, Corrupted>) -> RecvError {

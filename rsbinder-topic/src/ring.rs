@@ -530,6 +530,8 @@ pub(crate) enum Taken<'a> {
         )]
         index: u32,
         loan: Loan,
+        /// Where the record starts.
+        at: u64,
     },
     /// No committed record is unread; or a reader [stopped at](Reader::stop_at) an end stepped
     /// over a record of a kind it skips to that end, and records after it are unread; or the call
@@ -543,7 +545,7 @@ pub(crate) enum Taken<'a> {
 enum Outcome {
     Item { index: u32, len: usize },
     End { len: usize },
-    Loan { index: u32, loan: Loan },
+    Loan { index: u32, loan: Loan, at: u64 },
     Empty,
     Lagged(u64),
 }
@@ -724,7 +726,7 @@ impl<M: Loads> Reader<M> {
             Outcome::End { len } => Taken::End {
                 payload: &self.payload[..len],
             },
-            Outcome::Loan { index, loan } => Taken::Loan { index, loan },
+            Outcome::Loan { index, loan, at } => Taken::Loan { index, loan, at },
             Outcome::Empty => Taken::Empty,
             Outcome::Lagged(records) => Taken::Lagged(records),
         }
@@ -943,14 +945,15 @@ impl<M: Loads> Reader<M> {
                 self.cursor.rest_on(judged);
                 return Ok(Outcome::End { len });
             }
-            let outcome = self.outcome(header)?;
+            let outcome = self.outcome(judged)?;
             self.cursor.step(judged);
             return Ok(outcome);
         }
     }
 
     /// An item or a loan, from the payload just copied and judged.
-    fn outcome(&mut self, header: Header) -> Result<Outcome, Corrupted> {
+    fn outcome(&mut self, judged: Judged) -> Result<Outcome, Corrupted> {
+        let header = judged.header;
         let len = header.len as usize;
         if header.kind != Kind::Loan as u32 {
             return Ok(Outcome::Item {
@@ -964,6 +967,7 @@ impl<M: Loads> Reader<M> {
         Ok(Outcome::Loan {
             index: header.index,
             loan,
+            at: judged.at,
         })
     }
 
@@ -1011,7 +1015,7 @@ impl<M: Loads> Reader<M> {
                 self.cursor.rest_on(judged);
                 return Ok(Outcome::End { len });
             }
-            let outcome = self.outcome(header)?;
+            let outcome = self.outcome(judged)?;
             self.cursor.skip_to(judged);
             return Ok(outcome);
         }
