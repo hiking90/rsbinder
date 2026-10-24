@@ -216,6 +216,10 @@ Each item below changes what a 0.12.0 program observes.
   (Brotli certificate decompression allocates up to 1 GiB before
   authentication) and RUSTSEC-2026-0349 (an unauthenticated ServerHello
   downgrades later connections to classical key exchange); `rpc-tls` only.
+- **The `rustls-webpki` floor is 0.103.16** for RUSTSEC-2026-0382
+  (certificate verification may accept distrusted intermediates). No
+  `rustls` release requires the fixed version yet, so `rpc-tls` now names
+  `rustls-webpki` itself, for its floor alone; `rpc-tls` only.
 
 ## [0.12.0] - 2026-10-11
 
