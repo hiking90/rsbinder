@@ -76,6 +76,11 @@ impl<M: Loads> Loads for &Counted<M> {
         self.memory.load_ring(position, dst);
     }
 
+    fn load_ring_extend(&self, position: u64, len: usize, dst: &mut Vec<u8>) {
+        self.copies.set(self.copies.get() + 1);
+        self.memory.load_ring_extend(position, len, dst);
+    }
+
     fn fence(&self) {
         self.memory.fence();
     }

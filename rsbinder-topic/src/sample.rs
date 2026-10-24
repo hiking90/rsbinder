@@ -117,14 +117,16 @@ impl<'a, M: Trust> Sample<'a, M> {
         }
     }
 
-    /// The value, copied into a new buffer: zeroed, then filled by atomic loads, for a lent value
-    /// of an [`Untrusted`] subscriber; one plain memory copy otherwise.
+    /// The value, copied into a new buffer: filled by atomic loads, for a lent value of an
+    /// [`Untrusted`] subscriber; one plain memory copy otherwise.
     pub fn to_owned(&self) -> Vec<u8> {
         if let Some(bytes) = self.in_reach() {
             return bytes.to_vec();
         }
-        let mut value = vec![0; self.len()];
-        self.copy_to(&mut value);
+        let mut value = Vec::with_capacity(self.len());
+        if let Source::Slot { pool, slot, len } = self.source {
+            pool.pool().load_slot_extend(slot, len, &mut value);
+        }
         value
     }
 

@@ -156,6 +156,12 @@ Each item below changes what a 0.12.0 program observes.
     writer did before it, which lets a reader detect that its copy was
     overwritten. `load_acquire` is relaxed loads and one acquire fence, so
     it is defined through a read-only mapping.
+  - `Run::load_extend` and `RoRun::load_extend` append the run to a
+    `Vec<u8>`: the loads of `load`, relaxed and with no fence, written into
+    the vector's spare capacity without zeroing it first. The vector's
+    length grows by the run's length, and the bytes it held stay in front.
+    A caller that receives into a new or reused buffer no longer writes
+    every byte twice, once with zeros and once with the copy.
 - **`rsbinder_fmq::shm::spin`**: how long a side of a shared-memory channel
   looks at the memory before it parks on a futex — `SPIN`, `spin_budget`,
   `spin_until`, `SpinGauge` and `SPIN_CLOCK_EVERY`. This is the policy

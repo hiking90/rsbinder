@@ -164,6 +164,12 @@ impl Loads for Arc<Memory> {
         }
     }
 
+    fn load_ring_extend(&self, position: u64, len: usize, dst: &mut Vec<u8>) {
+        let start = dst.len();
+        dst.resize(start + len, 0);
+        self.load_ring(position, &mut dst[start..]);
+    }
+
     fn fence(&self) {
         if self.flaw != Flaw::NoCopyFence {
             self.acquire();

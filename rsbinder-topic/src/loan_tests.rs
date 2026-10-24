@@ -15,8 +15,8 @@ use crate::connect::{Asking, Token};
 use crate::layout::{self, ControlPage, LoadedPool, MIN_RING, VERSION};
 use crate::pool::{Pin, MAX_PINS};
 use crate::{
-    Bytes, Payload, PoolPolicy, PublishError, Publisher, PublisherPolicy, RecvError, Subscriber,
-    SubscriberPolicy,
+    Bytes, Encoding, Payload, PoolPolicy, PublishError, Publisher, PublisherPolicy, Record,
+    RecvError, Subscriber, SubscriberPolicy,
 };
 
 const SLOT: usize = 4096;
@@ -143,6 +143,41 @@ fn the_slot_read_last_is_lent_again_and_a_subscriber_behind_gets_the_newest_dept
     assert_eq!(subscriber.stats().lost, 5);
     // Read up to the end: the slot published last comes back again.
     assert_eq!(lend(&publisher, &[7; 8]), lent[0]);
+}
+
+/// Bytes under the type name of [`Bytes`], decoded where they lie: the buffer stays for the next.
+#[derive(Debug)]
+struct InPlace(Vec<u8>);
+
+impl Payload for InPlace {
+    fn type_name() -> &'static str {
+        Bytes::type_name()
+    }
+
+    fn encode<'a>(&'a self, out: &mut Encoding<'a>) -> rsbinder::Result<()> {
+        out.borrow(&self.0);
+        Ok(())
+    }
+
+    fn decode(record: &mut Record<'_>) -> rsbinder::Result<Self> {
+        Ok(Self(record.bytes().to_vec()))
+    }
+}
+
+#[test]
+fn loaned_values_copied_into_a_kept_buffer_hold_their_own_bytes_alone() {
+    let publisher = Publisher::<Bytes>::new(&pooled(1, 3, 1)).unwrap();
+    let policy = SubscriberPolicy::default();
+    let mut subscriber = Subscriber::<InPlace>::request(&publisher.as_binder(), &policy).unwrap();
+    // Shorter than the buffer the first copy leaves, then longer.
+    let values = [pattern(1, 3000), pattern(2, 1000), pattern(3, 4000)];
+    for value in &values {
+        lend(&publisher, value);
+    }
+    for value in values {
+        let InPlace(got) = subscriber.try_recv().unwrap();
+        assert!(got == value, "{} bytes for {}", got.len(), value.len());
+    }
 }
 
 /// AC-15.3.1: a lent value lies in its slot, a ring value in the subscriber; both read alike.

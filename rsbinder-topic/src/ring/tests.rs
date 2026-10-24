@@ -648,6 +648,11 @@ impl<M: Loads, S: Stores> Loads for Chased<'_, M, S> {
         self.memory.load_ring(position, dst);
     }
 
+    fn load_ring_extend(&self, position: u64, len: usize, dst: &mut Vec<u8>) {
+        self.copies.set(self.copies.get() + 1);
+        self.memory.load_ring_extend(position, len, dst);
+    }
+
     fn fence(&self) {
         self.memory.fence();
     }
@@ -742,6 +747,10 @@ impl<M: Loads, S: Stores> Loads for Lapping<'_, M, S> {
         self.memory.load_ring(position, dst);
     }
 
+    fn load_ring_extend(&self, position: u64, len: usize, dst: &mut Vec<u8>) {
+        self.memory.load_ring_extend(position, len, dst);
+    }
+
     fn fence(&self) {
         self.memory.fence();
     }
@@ -806,6 +815,11 @@ impl<M: Loads, S: Stores> Loads for Overtaking<'_, M, S> {
     fn load_ring(&self, position: u64, dst: &mut [u8]) {
         self.loaded.set(self.loaded.get() + dst.len());
         self.memory.load_ring(position, dst);
+    }
+
+    fn load_ring_extend(&self, position: u64, len: usize, dst: &mut Vec<u8>) {
+        self.loaded.set(self.loaded.get() + len);
+        self.memory.load_ring_extend(position, len, dst);
     }
 
     fn fence(&self) {
@@ -936,6 +950,16 @@ impl<M: Loads, S: Stores> Loads for Forging<M, S> {
         publish(&mut self.writer.borrow_mut(), 200);
         self.memory.load_ring(position, &mut after);
         dst.copy_from_slice(&(self.forge)(before, after));
+    }
+
+    fn load_ring_extend(&self, position: u64, len: usize, dst: &mut Vec<u8>) {
+        if len != 8 || self.at.get() != Some(position) {
+            self.memory.load_ring_extend(position, len, dst);
+            return;
+        }
+        let start = dst.len();
+        dst.resize(start + len, 0);
+        self.load_ring(position, &mut dst[start..]);
     }
 
     fn fence(&self) {
@@ -1319,6 +1343,19 @@ impl<M> Paced<'_, M> {
         }
     }
 
+    /// Between a look and a copy of `len` bytes: at times the publisher writes a ring's worth.
+    fn pace(&self, len: usize) {
+        if self.3 == Rhythm::Scattered {
+            // Mostly up to three stores; one time in four, enough to write the whole ring anew.
+            let turn = self.scatter(16);
+            self.wait(if turn < 12 { turn % 4 } else { turn });
+        }
+        if self.3 == Rhythm::Staged && len > 8 {
+            let turn = self.2.replace(self.2.get() + 1) as usize;
+            self.wait(STAGES[turn % STAGES.len()]);
+        }
+    }
+
     /// The next of a fixed sequence of numbers below `below`, for a scattered reader's waits.
     fn scatter(&self, below: u32) -> u32 {
         let state = self.2.get().wrapping_mul(1103515245).wrapping_add(12345);
@@ -1397,16 +1434,7 @@ impl<M: Loads> Loads for Paced<'_, M> {
     }
 
     fn load_ring(&self, position: u64, dst: &mut [u8]) {
-        // Between a look and the copy: at times the publisher writes a ring's worth there.
-        if self.3 == Rhythm::Scattered {
-            // Mostly up to three stores; one time in four, enough to write the whole ring anew.
-            let turn = self.scatter(16);
-            self.wait(if turn < 12 { turn % 4 } else { turn });
-        }
-        if self.3 == Rhythm::Staged && dst.len() > 8 {
-            let turn = self.2.replace(self.2.get() + 1) as usize;
-            self.wait(STAGES[turn % STAGES.len()]);
-        }
+        self.pace(dst.len());
         if self.3 == Rhythm::Torn && dst.len() == 8 {
             let mut first = [0; 8];
             self.0.load_ring(position, &mut first);
@@ -1416,6 +1444,17 @@ impl<M: Loads> Loads for Paced<'_, M> {
             return;
         }
         self.0.load_ring(position, dst);
+    }
+
+    fn load_ring_extend(&self, position: u64, len: usize, dst: &mut Vec<u8>) {
+        if self.3 == Rhythm::Torn && len == 8 {
+            let start = dst.len();
+            dst.resize(start + len, 0);
+            self.load_ring(position, &mut dst[start..]);
+            return;
+        }
+        self.pace(len);
+        self.0.load_ring_extend(position, len, dst);
     }
 
     fn fence(&self) {

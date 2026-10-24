@@ -431,12 +431,12 @@ impl PoolReader {
         self.pin(loan)?;
         let len = loan.len as usize;
         if into.capacity() < len {
-            // A taken buffer, as the ring's reader makes it again: zeroed allocation.
-            *into = vec![0; len];
+            // A taken buffer, as the ring's reader makes it again: a new one, not a `reserve`.
+            *into = Vec::with_capacity(len);
         } else {
-            into.resize(len, 0);
+            into.clear();
         }
-        self.pool.load_slot(loan.slot, into);
+        self.pool.load_slot_extend(loan.slot, len, into);
         self.unpin();
         Ok(())
     }

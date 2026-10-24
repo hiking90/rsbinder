@@ -167,6 +167,8 @@ pub(crate) trait Loads {
     /// Fill `dst` from `position`, wrapping at the ring's end, with `Relaxed` loads. Both are
     /// multiples of 8.
     fn load_ring(&self, position: u64, dst: &mut [u8]);
+    /// [`load_ring`](Self::load_ring) of `len` bytes appended to `dst`, not zeroed first.
+    fn load_ring_extend(&self, position: u64, len: usize, dst: &mut Vec<u8>);
     /// An acquire fence: the loads that follow come after the stores the ring's loads saw.
     fn fence(&self);
 }
@@ -841,16 +843,17 @@ impl<M: Loads> Reader<M> {
         // `Header::extent` bounded `size` by half the ring, which is mapped: it fits a `usize`.
         let len = (size - rules::HEADER) as usize;
         if self.payload.capacity() < len {
-            // A taken or outgrown buffer: zeroed allocation, so a large one is not filled first.
-            self.payload = vec![0; len];
+            // A taken or outgrown buffer: a new one, as a `reserve` would copy the old bytes over.
+            self.payload = Vec::with_capacity(len);
         } else {
-            self.payload.resize(len, 0);
+            self.payload.clear();
         }
         let (mut copied, mut from) = (0, position);
         loop {
             let end = len.min(copied + CHUNK);
             let at = position + rules::HEADER + copied as u64;
-            self.memory.load_ring(at, &mut self.payload[copied..end]);
+            self.memory
+                .load_ring_extend(at, end - copied, &mut self.payload);
             if self.overwritten(from)? {
                 return Ok(Copied::Overtaken);
             }

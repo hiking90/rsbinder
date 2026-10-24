@@ -1,7 +1,7 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::mem::size_of;
+use std::mem::{size_of, MaybeUninit};
 use std::ptr::NonNull;
 use std::sync::atomic::{fence, AtomicU8, AtomicUsize, Ordering};
 
@@ -148,6 +148,53 @@ impl Run<'_> {
         self.load_with(dst);
     }
 
+    /// Append the run to `dst` with relaxed loads: [`load`](Self::load) into
+    /// the vector's spare capacity, which is not zeroed first.
+    ///
+    /// `dst`'s length grows by [`len`](Self::len) and what it held stays in
+    /// front. The bytes past its old length are written once, by the loads,
+    /// split as `load` splits them — bytes up to the first word boundary of
+    /// the run, whole words, the remaining bytes — so a peer's concurrent
+    /// store leaves a mix of old and new bytes, never undefined ones.
+    ///
+    /// The loads are `Relaxed` and no fence follows them, as for `load`. A
+    /// caller that needs the order of [`load_acquire`](Self::load_acquire)
+    /// follows the call with `fence(Ordering::Acquire)`, which is what
+    /// `load_acquire` adds to `load`.
+    ///
+    /// The vector reserves room first, as [`Vec::reserve`] does: with less
+    /// spare capacity than the run's length it reallocates, which moves the
+    /// bytes it already holds. A caller that copies a long run into a buffer
+    /// it reuses keeps the buffer's spare capacity — `capacity() - len()` —
+    /// at least that length (`clear` it first, or start from
+    /// [`Vec::with_capacity`]).
+    ///
+    /// # Panics
+    ///
+    /// When the new capacity would exceed `isize::MAX` bytes, as
+    /// [`Vec::reserve`] does.
+    #[inline]
+    pub fn load_extend(&self, dst: &mut Vec<u8>) {
+        let len = self.len();
+        dst.reserve(len);
+        let start = dst.len();
+        let (head, rest) = dst.spare_capacity_mut()[..len].split_at_mut(self.head.len());
+        let (words, tail) = rest.split_at_mut(self.words.len() * WORD);
+        for (s, d) in self.head.iter().zip(head) {
+            *d = MaybeUninit::new(s.load(Ordering::Relaxed));
+        }
+        for (s, d) in self.words.iter().zip(words.chunks_exact_mut(WORD)) {
+            let word: &mut [MaybeUninit<u8>; WORD] = d.try_into().expect("a whole word");
+            let bytes = s.load(Ordering::Relaxed).to_ne_bytes();
+            *word = bytes.map(MaybeUninit::new);
+        }
+        for (s, d) in self.tail.iter().zip(tail) {
+            *d = MaybeUninit::new(s.load(Ordering::Relaxed));
+        }
+        // SAFETY: the loops wrote every byte of `head`, `words`, `tail`: `len` bytes from `start`.
+        unsafe { dst.set_len(start + len) };
+    }
+
     /// Copy `src` into the run with `Release` stores.
     ///
     /// Whatever this thread did before the call — a store to a word that
@@ -242,7 +289,7 @@ impl std::fmt::Debug for Run<'_> {
     }
 }
 
-/// A [`Run`] over bytes that this process reads and never writes: the two
+/// A [`Run`] over bytes that this process reads and never writes: the
 /// loads, and no store.
 ///
 /// [`Run::store`] is a safe method, and on a run of an
@@ -255,7 +302,7 @@ impl std::fmt::Debug for Run<'_> {
 /// }
 /// ```
 ///
-/// Both loads are `Relaxed` loads no wider than a `usize`, the kind the
+/// Its loads are `Relaxed` loads no wider than a `usize`, the kind the
 /// standard library defines on read-only memory.
 pub struct RoRun<'a>(Run<'a>);
 
@@ -291,6 +338,21 @@ impl RoRun<'_> {
     #[inline]
     pub fn load(&self, dst: &mut [u8]) {
         self.0.load(dst);
+    }
+
+    /// Append the run to `dst` with relaxed loads, into spare capacity that
+    /// is not zeroed first: [`Run::load_extend`].
+    ///
+    /// `dst`'s length grows by [`len`](Self::len); no fence follows the
+    /// loads.
+    ///
+    /// # Panics
+    ///
+    /// When the new capacity would exceed `isize::MAX` bytes, as
+    /// [`Vec::reserve`] does.
+    #[inline]
+    pub fn load_extend(&self, dst: &mut Vec<u8>) {
+        self.0.load_extend(dst);
     }
 
     /// Copy the run into `dst`, and be ordered after every
@@ -341,6 +403,10 @@ mod tests {
                 let mut out = vec![0u8; len];
                 run_at(&buf, offset, len).load(&mut out);
                 assert_eq!(out, src, "offset {offset} len {len}");
+                let mut extended = vec![0x11; 3];
+                run_at(&buf, offset, len).load_extend(&mut extended);
+                assert_eq!(extended[..3], [0x11; 3], "offset {offset} len {len}");
+                assert_eq!(extended[3..], src, "offset {offset} len {len}");
                 let mut whole = vec![0u8; all];
                 run_at(&buf, 0, all).load(&mut whole);
                 let outside = whole[..offset].iter().chain(&whole[offset + len..]);
@@ -368,10 +434,14 @@ mod tests {
                 }
             });
             s.spawn(move || {
-                let mut out = vec![0u8; len];
+                let (mut out, mut ext) = (vec![0u8; len], Vec::new());
                 for _ in 0..rounds {
                     run_at(buf, offset, len).load(&mut out);
                     assert!(out.iter().all(|b| [0, 0xaa, 0x55].contains(b)), "{out:x?}");
+                    ext.clear();
+                    run_at(buf, offset, len).load_extend(&mut ext);
+                    assert_eq!(ext.len(), len);
+                    assert!(ext.iter().all(|b| [0, 0xaa, 0x55].contains(b)), "{ext:x?}");
                 }
             });
         });
@@ -386,6 +456,38 @@ mod tests {
         run.load(&mut []);
         run.store_release(&[]);
         run.load_acquire(&mut []);
+        let (mut none, mut held) = (Vec::new(), vec![1, 2, 3]);
+        run.load_extend(&mut none);
+        run.load_extend(&mut held);
+        assert_eq!((none, held), (vec![], vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn load_extend_appends_the_run_after_what_the_vector_holds() {
+        let buf = buffer(8);
+        // A head, whole words and a tail.
+        let (offset, len) = (3, 2 * WORD + 7);
+        let src: Vec<u8> = (0..len).map(|i| i as u8 ^ 0x3c).collect();
+        run_at(&buf, offset, len).store(&src);
+        let start = NonNull::from(&*buf).cast::<u8>();
+        // SAFETY: the same bytes of `buf` as `run_at`'s, only loaded here.
+        let reader = unsafe { RoRun::new(start.add(offset), len) };
+        let held = [0x77u8; 5];
+        // No spare capacity, as much as one run needs, more than two need.
+        for spare in [0, len, 3 * len] {
+            let mut extended = Vec::with_capacity(held.len() + spare);
+            extended.extend_from_slice(&held);
+            let capacity = extended.capacity();
+            reader.load_extend(&mut extended);
+            run_at(&buf, offset, len).load_extend(&mut extended);
+            assert_eq!(extended.len(), held.len() + 2 * len, "spare {spare}");
+            assert_eq!(extended[..held.len()], held, "spare {spare}");
+            let (first, second) = extended[held.len()..].split_at(len);
+            assert_eq!((first, second), (&src[..], &src[..]), "spare {spare}");
+            if spare >= 2 * len {
+                assert_eq!(extended.capacity(), capacity, "spare {spare}");
+            }
+        }
     }
 
     #[test]

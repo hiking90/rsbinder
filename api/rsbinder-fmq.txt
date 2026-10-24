@@ -100,6 +100,7 @@ pub fn rsbinder_fmq::shm::RoRun<'_>::is_empty(&self) -> bool
 pub fn rsbinder_fmq::shm::RoRun<'_>::len(&self) -> usize
 pub fn rsbinder_fmq::shm::RoRun<'_>::load(&self, &mut [u8])
 pub fn rsbinder_fmq::shm::RoRun<'_>::load_acquire(&self, &mut [u8])
+pub fn rsbinder_fmq::shm::RoRun<'_>::load_extend(&self, &mut alloc::vec::Vec<u8>)
 pub unsafe fn rsbinder_fmq::shm::RoRun<'_>::new(core::ptr::non_null::NonNull<u8>, usize) -> Self
 impl core::fmt::Debug for rsbinder_fmq::shm::RoRun<'_>
 pub fn rsbinder_fmq::shm::RoRun<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -147,6 +148,7 @@ pub fn rsbinder_fmq::shm::Run<'_>::is_empty(&self) -> bool
 pub fn rsbinder_fmq::shm::Run<'_>::len(&self) -> usize
 pub fn rsbinder_fmq::shm::Run<'_>::load(&self, &mut [u8])
 pub fn rsbinder_fmq::shm::Run<'_>::load_acquire(&self, &mut [u8])
+pub fn rsbinder_fmq::shm::Run<'_>::load_extend(&self, &mut alloc::vec::Vec<u8>)
 pub unsafe fn rsbinder_fmq::shm::Run<'_>::new(core::ptr::non_null::NonNull<u8>, usize) -> Self
 pub fn rsbinder_fmq::shm::Run<'_>::store(&self, &[u8])
 pub fn rsbinder_fmq::shm::Run<'_>::store_release(&self, &[u8])

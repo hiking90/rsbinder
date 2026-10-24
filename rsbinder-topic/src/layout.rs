@@ -423,6 +423,12 @@ impl<O> Loads for Loaded<O> {
         self.ring(0, wrapped.len()).load(wrapped);
     }
 
+    fn load_ring_extend(&self, position: u64, len: usize, dst: &mut Vec<u8>) {
+        let (offset, first) = split(self.capacity, position, len);
+        self.ring(offset, first).load_extend(dst);
+        self.ring(0, len - first).load_extend(dst);
+    }
+
     fn fence(&self) {
         // What `RoRun::load_acquire` adds to `load`.
         std::sync::atomic::fence(Ordering::Acquire);
@@ -774,10 +780,19 @@ impl LoadedPool {
 
     /// Fill `dst` from the start of `slot`, with `Relaxed` loads: the caller pinned it.
     pub(crate) fn load_slot(&self, slot: u32, dst: &mut [u8]) {
-        assert!(slot < self.slots && dst.len() <= self.slot_bytes as usize);
+        self.slot_run(slot, dst.len()).load(dst);
+    }
+
+    /// [`load_slot`](Self::load_slot) of `len` bytes appended to `dst`, not zeroed first.
+    pub(crate) fn load_slot_extend(&self, slot: u32, len: usize, dst: &mut Vec<u8>) {
+        self.slot_run(slot, len).load_extend(dst);
+    }
+
+    fn slot_run(&self, slot: u32, len: usize) -> RoRun<'_> {
+        assert!(slot < self.slots && len <= self.slot_bytes as usize);
         let at = slot_area(self.slots) as usize + slot as usize * self.slot_bytes as usize;
         // SAFETY: a slot of a mapping `self` owns; no `slot_slice` slice is live (its contract).
-        unsafe { RoRun::new(self.mapping.as_ptr().add(at), dst.len()) }.load(dst);
+        unsafe { RoRun::new(self.mapping.as_ptr().add(at), len) }
     }
 
     /// The first `len` bytes of `slot`, in place.
