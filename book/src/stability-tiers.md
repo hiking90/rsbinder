@@ -8,7 +8,7 @@ what callers can rely on.
 |------|-----------|--------------------|--------------------|
 | **Stable** | Semver-strict | AOSP-faithful, byte-tested against real `libbinder` | Only on a major bump — and pre-1.0 the `0.x` minor slot *is* the major slot (see the [changelog](https://github.com/hiking90/rsbinder/blob/master/CHANGELOG.md) preamble). Breaking changes are last-resort. |
 | **Provisional** | Stabilizing toward 1.0 | AOSP-faithful in the validated cases (hermetic + real-`libbinder` STAGE3) | May break in a minor bump if 1.0 review surfaces an issue. Will be re-classified as Stable or Experimental at 1.0. |
-| **Experimental** | Opt-in via Cargo feature | **No guarantee** until the corresponding real-`libbinder` interop gate passes | Anytime, including the wire format. Default builds do not reach this code. |
+| **Experimental** | Opt-in: a Cargo feature, or a crate of its own | **No guarantee** until the corresponding real-`libbinder` interop gate passes, or, where the wire is rsbinder's own, at all | Anytime, including the wire format. Default builds do not reach this code. |
 
 ## Stable
 
@@ -219,14 +219,16 @@ tweaks; wire formats are already locked.
 
 ## Experimental (opt-in)
 
-Off by default, gated by a Cargo feature. Wire format and API may
-change without a deprecation cycle.
+Off by default: gated by a Cargo feature, or in a crate of its own that a
+build has to add. Wire format and API may change without a deprecation
+cycle.
 
-| Feature | Surface | Status |
+| Feature or crate | Surface | Status |
 |---------|---------|--------|
 | `rpc-tcp-debug` | `TcpDebugTransport` — plain TCP backend | Bring-up / interop only, never production. |
 | `rpc-vsock` | `VsockTransport` — host↔VM | Linux/Android only; loopback testing requires `vsock_loopback.ko`. |
 | `rpc-tls` | TLS over rustls, socket-orthogonal (tcp / unix / vsock) | Hermetic green; the `StreamOwned` decoupling (plan 2-15) has landed. Real-`libbinder` STAGE3 not yet attempted — stock emulator images ship no `libbinder_tls`. |
+| `rsbinder-topic` (crate) | Topics: one publisher, many subscribers over kernel binder, records in shared memory the subscribers map read-only (`Publisher`, `Subscriber`, `NamedSubscriber`, loans and `Sample`). See [Topics](./topics.md). | Linux CI runs its unit and two-process tests; loom models and Miri run in the local gate. The Android CI matrix does not run it yet. The subscription AIDL and the memory layout are rsbinder's own, so no `libbinder` gate applies: the layout version is checked at each subscription, and a peer of another version is refused. |
 
 ## Non-goals
 
@@ -264,7 +266,9 @@ these types reads as intentional rather than as a gap.
   or a behavior. Neither can your build — for those, read *Migrating* and
   *Fixed* both.
 - **Experimental** features never break the default build's wire
-  format. Enabling one is an explicit acknowledgement that the
-  corresponding interop gate has not passed.
+  format. Enabling one, or depending on an Experimental crate, is an
+  explicit acknowledgement that the corresponding interop gate has not
+  passed, or that there is none, and that its API may change in any
+  release.
 - After 1.0, all **Stable** items follow Semver strictly. Provisional
   items get re-classified as Stable or moved into a feature gate.

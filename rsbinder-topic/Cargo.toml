@@ -6,10 +6,9 @@ license = { workspace = true }
 description = "One publisher and many subscribers over kernel binder: a binder call sets a subscription up, and the records then travel through shared memory the subscribers map read-only. Experimental."
 homepage = { workspace = true }
 repository = { workspace = true }
+readme = "README.md"
 rust-version = { workspace = true }
 keywords = ["android", "binder", "shared-memory", "ipc", "linux"]
-# Held back until the crate has its public API (plan 15).
-publish = false
 
 [package.metadata.docs.rs]
 all-features = true

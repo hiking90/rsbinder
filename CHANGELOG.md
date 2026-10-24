@@ -82,6 +82,37 @@ Each item below changes what a 0.12.0 program observes.
 
 ### Added
 
+- **`rsbinder-topic`, a new crate (Experimental)**: one publisher and many
+  subscribers over kernel binder, on Linux and Android. A binder call sets
+  each subscription up; the records then travel through a ring in a sealed
+  memfd that every subscriber maps read-only, so one copy serves all of them
+  and receiving makes no binder call. See the book's
+  [Topics](https://hiking90.github.io/rsbinder/topics.html) chapter and the
+  crate's `examples/`.
+  - `Publisher<T>` and `Subscriber<T>` for any parcelable or `Bytes`
+    (`Payload`). A publish never waits: a subscriber that falls a ring
+    behind gets `RecvError::Lagged` with the number it lost. With
+    `PublisherPolicy::backpressure` a publish waits up to a timeout and then
+    takes the subscribers in the way out (`Closed::Evicted`).
+  - `Publisher::advertise` and `NamedSubscriber`: a topic found by a service
+    manager name, the subscriber reconnecting to whichever publisher holds
+    it (`RecvError::Disconnected` between connections).
+  - Waits on a futex word of the topic (`Wake::Futex`, one wake system call
+    per publish for every sleeping subscriber) or on a socket of the
+    subscription (`Wake::Fd`, with `Wait` and `wait_any` for event loops);
+    `recv_async` with the `tokio` feature; `Interrupter`.
+  - Loans (`PoolPolicy`, `Publisher::loan_slice`, `LoanMut`): a `Bytes` value
+    written straight into a slot of a second memfd and received in place as
+    a `Sample` (`recv_sample`, `try_latest_sample`, `recv_sample_async`).
+    An `Untrusted` subscriber copies a slot with atomic loads; `unsafe`
+    `trust_publisher` makes a `Trusted` one, whose samples deref to `[u8]`.
+  - `PublisherPolicy::authorize` and `Acceptor` decide who may subscribe;
+    `Publisher::stats` and `Subscriber::stats` count what went through.
+  - The error enums `RecvError`, `Closed`, `Disconnected` and `PublishError`
+    are `#[non_exhaustive]`. The subscription AIDL (`aidl/rsbinder/topic/`)
+    and the memory layout are rsbinder's own; a publisher and a subscriber
+    of different layout versions refuse each other
+    (`ITopic::ERROR_VERSION`).
 - **The unsynchronized FMQ flavor in `rsbinder-fmq`** (also `rsbinder::fmq`):
   `UnsyncWriter` and `UnsyncReader`, libfmq's
   `MessageQueue<T, kUnsynchronizedWrite>`. One writer, any number of

@@ -234,8 +234,9 @@ function run_coverage() {
 # (optionally, behind the `macros` feature) with a version requirement, which a
 # published manifest carries whether the dependency is optional or not.
 # `rsbinder-fmq` depends on no other crate here and `rsbinder` requires it
-# unconditionally, so it goes first.
-declare -a publish_dirs=("rsbinder-fmq" "rsbinder-aidl" "rsbinder-macros" "rsbinder" "rsbinder-tools")
+# unconditionally, so it goes first. `rsbinder-topic` depends on `rsbinder`
+# and builds its AIDL with `rsbinder-aidl`; `rsbinder-tools` comes last.
+declare -a publish_dirs=("rsbinder-fmq" "rsbinder-aidl" "rsbinder-macros" "rsbinder" "rsbinder-topic" "rsbinder-tools")
 
 function publish() {
     local cargo_options=()
