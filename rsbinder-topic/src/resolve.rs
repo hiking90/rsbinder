@@ -101,10 +101,11 @@ impl Watch {
     /// A [`NamedSubscriber`](crate::NamedSubscriber) asks when a call of the watch it needed
     /// may not have come, as a call that is a oneway transaction fails when the receiving
     /// process has no room for it: once when a subscription is refused as the publisher ended
-    /// ([`ITopic::ERROR_CLOSED`] or `DeadObject`), and once when the publisher of its
-    /// connection ends and no other binder has been given the name. It asks from a thread of
-    /// its own, never one that receives, and uses the answer only when no call of the watch
-    /// came while it asked. An `Err` counts as `None`. Without a lookup
+    /// ([`ITopic::ERROR_CLOSED`] or `DeadObject`), unless that publisher was the lookup's own
+    /// answer, and once when the publisher of its connection ends and no other binder has been
+    /// given the name. It asks from a thread of its own, never one that receives, and uses the
+    /// answer only when no call of the watch came while it asked; after a call of a binder it
+    /// cannot use, it asks once more. An `Err` counts as `None`. Without a lookup
     /// ([`Watch::new`]) the subscriber waits for the next call.
     ///
     /// [`ITopic::ERROR_CLOSED`]: crate::aidl::ITopic::ERROR_CLOSED

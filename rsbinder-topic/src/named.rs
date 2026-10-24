@@ -11,8 +11,9 @@
 //! not wait for the thread: a connection the thread makes after the drop is dropped by it.
 //!
 //! A notice of the watch can be lost (plan 15 §12.5): the thread also asks the watch's lookup,
-//! once when a publisher refuses as ended and once when a connection's publisher ends with no
-//! binder after it, and takes the answer only when no notice came while it asked.
+//! once when a publisher the lookup did not name refuses as ended and once when a connection's
+//! publisher ends with no binder after it, and takes the answer only when no notice came while
+//! it asked; a notice of a binder it cannot use makes it ask once more.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -104,13 +105,21 @@ const DRAIN_STALLS: u32 = 2;
 /// one, so a subscriber can miss the binder a name was given. With a watch that has a lookup
 /// ([`Watch::with_lookup`]; the service manager's has one), the subscriber asks it for the
 /// binder the name has now, once each time it would otherwise wait for a notice that may not
-/// come: when a publisher refuses it as ended ([`ITopic::ERROR_CLOSED`] or `DeadObject`), and
-/// when the publisher of its connection ends and the name has been given no other binder. The
-/// answer is used only when no notice came while it asked, and not when it is the binder that
-/// ended or refused. Notices of one name are not ordered against the answer: with the service
-/// manager, a notice older than the answer that arrives after it moves the subscriber back to
-/// that binder, and from there, as it refuses or ends, to the binder the name has, through a
+/// come: when a publisher refuses it as ended ([`ITopic::ERROR_CLOSED`] or `DeadObject`),
+/// unless that publisher was the lookup's own answer, and when the publisher of its connection
+/// ends and the name has been given no other binder. The answer is used only when no notice
+/// came while it asked, and not when it is the binder that ended or refused; a notice that came
+/// meanwhile is used instead, and one of a binder that ended or refused makes it ask once more.
+/// Notices of one name are not ordered against the answer: with the service manager, a notice
+/// older than the answer that arrives after it moves the subscriber back to that binder, and
+/// from there, as it refuses or ends, to the binder the name has, through a
 /// [`Disconnected::Replaced`] and a reconnection.
+///
+/// A subscriber with no connection and no subscription call under way, as while the name has
+/// no publisher or after a lookup found none it could use, learns of a binder only by a notice:
+/// one lost then is not made up, and the subscriber waits for the next registration of the
+/// name. [`wait_connected`](Self::wait_connected) tells that state; making the subscriber
+/// again watches the name again, and the watch's first notice is the binder the name has.
 ///
 /// With [`Wake::Fd`] the subscriber is a [`Wait`]: an event loop or
 /// [`wait_any`](crate::wait_any) polls the same fd through every reconnection.
@@ -772,6 +781,8 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
         state.connecting |= begin.is_some();
         drop(state);
         if let Some(begin) = begin {
+            #[cfg(test)]
+            BEFORE_LOOKING.with_borrow_mut(|hook| hook.iter_mut().for_each(|hook| hook()));
             self.named.connect(begin, Duration::ZERO);
         }
         if let (Some(fds), Some(connection)) = (&self.named.fds, &gone) {
@@ -908,6 +919,9 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     /// Set by a test: run by `interrupt` past its unlock, before it wakes the connection's wait.
     pub(crate) static BEFORE_INTERRUPT: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Set by a test: run by `finish_locked` past its unlock, before it starts a connection thread.
+    pub(crate) static BEFORE_LOOKING: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -1062,8 +1076,7 @@ impl<T: Payload + 'static> Named<T> {
         self.connect(Begin::At(binder), Duration::ZERO);
     }
 
-    /// Start the connection thread, which begins at `begin` after `after`; the caller set
-    /// `connecting`.
+    /// Start the connection thread at `begin` after `after`; the caller set `connecting`.
     fn connect(self: &Arc<Self>, begin: Begin, after: Duration) {
         let named = self.clone();
         let spawned = std::thread::Builder::new()
@@ -1075,8 +1088,7 @@ impl<T: Payload + 'static> Named<T> {
         }
     }
 
-    /// The connection thread: subscribe from `begin` after `after`, retry, and move to a newer
-    /// binder; ask the lookup once after a publisher refused as ended.
+    /// The connection thread: subscribe from `begin` after `after`, retry, move to a newer binder.
     fn run(self: Arc<Self>, begin: Begin, after: Duration) {
         // Whether `binder` is the lookup's answer: its refusal asks no more.
         let (mut binder, mut looked) = match begin {
@@ -1200,13 +1212,17 @@ impl<T: Payload + 'static> Named<T> {
         state
     }
 
-    /// Ask the watch's lookup, outside the lock, for the binder the name has now: the binder to
-    /// subscribe to and whether the lookup gave it, or `None` with `connecting` cleared.
-    ///
-    /// The answer is taken only when `latest` did not change meanwhile; a notice that did is
-    /// newer and is taken instead. Neither is taken when it is `ended` or `refused`.
+    /// The binder to subscribe to and whether the lookup gave it; `None` clears `connecting`.
     fn look(&self, ended: Option<&SIBinder>) -> Option<(SIBinder, bool)> {
         let mut state = self.lock();
+        if state.dropped || state.evicted {
+            state.connecting = false;
+            return None;
+        }
+        // The caller saw no usable `latest`: one now came by a notice since, newer than any answer.
+        if let Some(latest) = state.latest.clone().filter(|l| usable(l, &state, ended)) {
+            return Some((latest, false));
+        }
         let lookup = match &mut state.find {
             Find::Lookup(lookup) => Some(lookup.clone()),
             Find::Unknown(wanted) => {
@@ -1219,23 +1235,28 @@ impl<T: Payload + 'static> Named<T> {
             state.connecting = false;
             return None;
         };
-        let before = state.latest.clone();
-        drop(state);
-        let found = lookup().ok().flatten();
-        let mut state = self.lock();
-        let next = if state.dropped || state.evicted {
-            None
-        } else if state.latest == before {
-            let found = found.filter(|found| usable(found, &state, ended));
-            if let Some(found) = &found {
-                state.latest = Some(found.clone());
+        let mut again = true;
+        let next = loop {
+            let before = state.latest.clone();
+            drop(state);
+            let found = lookup().ok().flatten();
+            state = self.lock();
+            if state.dropped || state.evicted {
+                break None;
             }
-            found.map(|found| (found, true))
-        } else {
+            if state.latest == before {
+                let found = found.filter(|found| usable(found, &state, ended));
+                if let Some(found) = &found {
+                    state.latest = Some(found.clone());
+                }
+                break found.map(|found| (found, true));
+            }
             let latest = state.latest.clone();
-            latest
-                .filter(|latest| usable(latest, &state, ended))
-                .map(|latest| (latest, false))
+            let latest = latest.filter(|latest| usable(latest, &state, ended));
+            if latest.is_some() || !std::mem::take(&mut again) {
+                break latest.map(|latest| (latest, false));
+            }
+            // A notice gave the name a binder it cannot use while it asked: the answer is older.
         };
         state.connecting = next.is_some();
         next

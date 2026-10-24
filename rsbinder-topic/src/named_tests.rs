@@ -19,7 +19,9 @@ use crate::aidl::ITopic::{BnTopic, ITopic, ERROR_FULL};
 use crate::aidl::SubscribeRequest::SubscribeRequest;
 use crate::aidl::TopicEndpoint::TopicEndpoint;
 use crate::layout::{self, Stored, HEADER_OFFSET, MIN_RING, VERSION};
-use crate::named::{BEFORE_DRAIN_ENDS, BEFORE_INTERRUPT, BEFORE_REPLACE, BETWEEN_LOOKS};
+use crate::named::{
+    BEFORE_DRAIN_ENDS, BEFORE_INTERRUPT, BEFORE_LOOKING, BEFORE_REPLACE, BETWEEN_LOOKS,
+};
 use crate::ring::{Kind, Stores, Writer, BEFORE_JUDGING};
 use rsbinder::fmq::shm::Mapping;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -1528,8 +1530,21 @@ impl Interface for Counted {}
 impl ITopic for Counted {
     fn r#subscribe(&self, request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
         self.asked.fetch_add(1, Ordering::SeqCst);
+        ASKED_HERE.set(true);
         self.acceptor.accept(request)
     }
+}
+
+thread_local! {
+    /// Set on the thread a `Counted` call ran on: a call within this process runs on the caller's.
+    #[cfg_attr(
+        target_os = "android",
+        expect(
+            clippy::missing_const_for_thread_local,
+            reason = "the initializer is `const`; Android's expansion of the macro hides that"
+        )
+    )]
+    static ASKED_HERE: Cell<bool> = const { Cell::new(false) };
 }
 
 /// A closed publisher's binder, which refuses with `ERROR_CLOSED`, and its subscription calls.
@@ -1553,6 +1568,17 @@ fn settled(asked: &AtomicUsize, calls: usize) {
     }
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(asked.load(Ordering::SeqCst), calls);
+}
+
+/// Wait until the lookups reach `calls`, then long enough for a lookup more to show.
+fn looked(names: &Names, calls: usize) {
+    let deadline = Instant::now() + WAIT;
+    while names.lookups() < calls {
+        assert!(Instant::now() < deadline, "looked up {calls} times");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(names.lookups(), calls);
 }
 
 /// AC-15.5.6 (1): a notice of an ended publisher, the notice after it lost.
@@ -1586,11 +1612,50 @@ fn a_refusal_as_ended_before_the_watch_is_returned_asks_the_lookup_once_it_is() 
         settled(&asked, 1);
         lost.withhold(NAME, given.clone());
     });
+    let refused_here = Arc::new(Mutex::new(None));
+    let seen = refused_here.clone();
+    names.before_lookup(move || *seen.lock().unwrap() = Some(ASKED_HERE.get()));
     let mut subscriber = subscribe(&names);
     connected(&subscriber);
     next.publish(&bytes(4)).unwrap();
     assert_eq!(recv(&mut subscriber), Ok(bytes(4)));
     assert_eq!(names.lookups(), 1);
+    // Asked by the thread `subscribe_with` starts, not the one refused: the path under test.
+    assert_eq!(*refused_here.lock().unwrap(), Some(false));
+}
+
+/// A notice of the refused binder during the lookup makes the answer older: asked once more.
+#[test]
+fn a_notice_of_a_refused_binder_during_the_lookup_asks_once_more() {
+    let names = Names::looking();
+    let (_closed, refused, _) = closed_counted();
+    names.give(NAME, refused.clone());
+    let first = Publisher::<Bytes>::new(&policy()).unwrap();
+    let second = Publisher::<Bytes>::new(&policy()).unwrap();
+    second.publish(&bytes(9)).unwrap();
+    let (hook, calls) = (names.clone(), AtomicUsize::new(0));
+    let (to_first, to_second) = (first.as_binder(), second.as_binder());
+    names.before_lookup(move || match calls.fetch_add(1, Ordering::SeqCst) {
+        // After the closed publisher's refusal: the name has `first`.
+        0 => hook.withhold(NAME, to_first.clone()),
+        // After `first` ends: the closed one given again, then `second` with its notice lost.
+        1 => {
+            hook.give(NAME, refused.clone());
+            hook.withhold(NAME, to_second.clone());
+        }
+        _ => {}
+    });
+    let mut subscriber = subscribe(&names);
+    connected(&subscriber);
+    first.publish(&bytes(1)).unwrap();
+    assert_eq!(recv(&mut subscriber), Ok(bytes(1)));
+    drop(first);
+    assert_eq!(
+        recv(&mut subscriber),
+        Err(RecvError::Disconnected(Disconnected::Ended(Closed::End)))
+    );
+    assert_eq!(recv(&mut subscriber), Ok(bytes(9)));
+    assert_eq!(names.lookups(), 3);
 }
 
 /// AC-15.5.6 (4): an answer that is the refused binder is not asked again.
@@ -1601,7 +1666,7 @@ fn a_lookup_that_answers_the_refused_binder_leaves_the_subscriber_waiting() {
     names.give(NAME, binder);
     let mut subscriber = subscribe(&names);
     settled(&asked, 1);
-    assert_eq!(names.lookups(), 1);
+    looked(&names, 1);
     assert!(!subscriber.wait_connected(Duration::ZERO));
     assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
     let next = advertise(&names, &policy());
@@ -1673,8 +1738,7 @@ fn a_dead_publisher_with_no_binder_after_it_asks_the_lookup() {
     assert_eq!(names.lookups(), 1);
 }
 
-/// A lookup that answers the publisher that ended, as the service manager's does for a name it
-/// keeps, leaves the subscriber waiting for a notice.
+/// A lookup answering the ended publisher, as the service manager's may, leaves subscribers idle.
 #[test]
 fn a_lookup_that_answers_the_ended_publisher_leaves_the_subscriber_waiting() {
     let names = Names::looking();
@@ -1696,7 +1760,7 @@ fn a_lookup_that_answers_the_ended_publisher_leaves_the_subscriber_waiting() {
         subscriber.recv_timeout(Duration::from_millis(300)),
         Err(RecvError::Timeout)
     );
-    assert_eq!(names.lookups(), 1);
+    looked(&names, 1);
     // The answer is not asked: it is the publisher whose end the connection read.
     assert_eq!(asked.load(Ordering::SeqCst), 1);
     let next = advertise(&names, &policy());
@@ -1704,7 +1768,7 @@ fn a_lookup_that_answers_the_ended_publisher_leaves_the_subscriber_waiting() {
     assert_eq!(recv(&mut subscriber), Ok(bytes(3)));
 }
 
-/// Without a lookup (`Watch::new`) a lost notice is waited for, as it ever was.
+/// Without a lookup (`Watch::new`) the subscriber waits for the next notice of the name.
 #[test]
 fn without_a_lookup_an_ended_publisher_waits_for_the_next_notice() {
     let names = Names::default();
@@ -1724,6 +1788,31 @@ fn without_a_lookup_an_ended_publisher_waits_for_the_next_notice() {
         Err(RecvError::Timeout)
     );
     assert_eq!(second.subscriber_count(), 0);
+    names.give(NAME, second.as_binder());
+    assert_eq!(recv(&mut subscriber), Ok(bytes(9)));
+}
+
+/// A notice between an end and the lookup is taken, though the lookup would answer the end.
+#[test]
+fn a_notice_before_the_lookup_is_asked_is_taken_without_it() {
+    let names = Names::looking();
+    let first = advertise(&names, &policy());
+    let mut subscriber = subscribe(&names);
+    connected(&subscriber);
+    let second = Publisher::<Bytes>::new(&policy()).unwrap();
+    second.publish(&bytes(9)).unwrap();
+    let (stale, ended) = (names.clone(), first.as_binder());
+    names.before_lookup(move || stale.withhold(NAME, ended.clone()));
+    // Past the unlock in which the end decided to look, before the thread that looks.
+    let (late, given) = (names.clone(), second.as_binder());
+    BEFORE_LOOKING.set(Some(Box::new(move || late.give(NAME, given.clone()))));
+    drop(first);
+    assert_eq!(
+        recv(&mut subscriber),
+        Err(RecvError::Disconnected(Disconnected::Ended(Closed::End)))
+    );
+    assert_eq!(recv(&mut subscriber), Ok(bytes(9)));
+    assert_eq!(names.lookups(), 0);
 }
 
 /// AC-15.5.6 (3): a notice that comes while the lookup runs is newer than its answer.

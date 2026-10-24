@@ -99,8 +99,10 @@ Each item below changes what a 0.12.0 program observes.
     it (`RecvError::Disconnected` between connections). A registration
     notice the subscriber missed (a oneway call, lost when the process has no
     room for it) is made up by one `check_service` when a publisher ends, or
-    refuses as ended, with no other binder for the name. `Resolver` (`Advertisement`,
-    `Watch::with_lookup`) puts the names somewhere else.
+    refuses as ended, with no other binder for the name. `Resolver`
+    (`Advertisement`, `Watch::with_lookup`) puts the names somewhere else; a
+    `Publisher` drops the `Advertisement` its resolver returned in `close`, or
+    as it drops, before its end record.
   - Waits on a futex word of the topic (`Wake::Futex`, one wake system call
     per publish for every sleeping subscriber) or on a socket of the
     subscription (`Wake::Fd`, with `Wait` and `wait_any` for event loops);

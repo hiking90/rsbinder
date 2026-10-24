@@ -217,8 +217,12 @@ impl<T: Payload + 'static> Publisher<T> {
     ///
     /// [`ITopic::ERROR_CLOSED`]: crate::aidl::ITopic::ERROR_CLOSED
     pub fn close(&self, status: &Status) {
-        let advertised = self.advertised.lock().expect("lock poisoned").take();
-        drop(advertised);
+        // Held through the end record: a second `close` writes none before the name is taken back.
+        let mut advertised = self
+            .advertised
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        drop(advertised.take());
         self.shared.writer.close(status);
     }
 
