@@ -95,7 +95,7 @@ fn a_lend_makes_the_generation_odd_and_a_publish_even_with_release() {
 }
 
 #[test]
-fn the_slot_read_by_everyone_and_published_last_is_lent_first() {
+fn the_slot_read_by_everyone_and_published_second_last_is_lent_first() {
     let memory = Fake::new(4);
     let mut slots = Slots::new(4, 4, 1, false);
     // Nobody has read anything: the free slots, then the oldest values.
@@ -109,11 +109,26 @@ fn the_slot_read_by_everyone_and_published_last_is_lent_first() {
         a,
         "the oldest, when none is read"
     );
-    // Read up to 72: of `b` (48) and `c` (72), the newer.
-    assert_eq!(put(&mut slots, &memory, 72, 144), c);
-    // Read past everything: the one published last, again and again.
-    assert_eq!(put(&mut slots, &memory, u64::MAX, 168), c);
-    assert_eq!(put(&mut slots, &memory, u64::MAX, 192), c);
+    // Read up to 72: of `b` (48) and `c` (72), the older, as `c` was read last.
+    assert_eq!(put(&mut slots, &memory, 72, 144), b);
+    // Read past everything: the one published second last, so two slots in turn.
+    assert_eq!(put(&mut slots, &memory, u64::MAX, 168), a);
+    assert_eq!(put(&mut slots, &memory, u64::MAX, 192), b);
+    assert_eq!(put(&mut slots, &memory, u64::MAX, 216), a);
+    // The one published last is lent when no other is read past.
+    let memory = Fake::new(2);
+    let mut slots = Slots::new(2, 2, 1, false);
+    let a = put(&mut slots, &memory, 0, 24);
+    put(&mut slots, &memory, 0, 48);
+    assert_eq!(put(&mut slots, &memory, 24, 72), a);
+    let memory = Fake::new(3);
+    let mut slots = Slots::new(3, 3, 1, false);
+    for end in [24, 48, 72] {
+        put(&mut slots, &memory, 0, end);
+    }
+    assert_eq!(put(&mut slots, &memory, 0, 96), 0, "the oldest");
+    // Read past [96, 48, 72]: the second newest is slot 2, not the first other one met.
+    assert_eq!(put(&mut slots, &memory, u64::MAX, 120), 2);
 }
 
 #[test]
@@ -122,18 +137,19 @@ fn a_pinned_slot_is_passed_over_and_left_odd() {
     let mut slots = Slots::new(3, 3, 1, false);
     let a = put(&mut slots, &memory, 0, 24);
     let b = put(&mut slots, &memory, 0, 48);
-    memory.pinned.borrow_mut().push(b);
-    // `b` is the newest read slot; it is pinned, so it is taken back and the next one tried.
+    memory.pinned.borrow_mut().push(a);
+    // `b` read last: `a` is tried first, pinned, taken back; the free slot is next.
     let lent = slots.lend(&memory, &memory, u64::MAX).expect("a slot");
-    assert_eq!(lent, a);
-    assert_eq!(memory.load_generation(b), 3, "taken back: odd");
+    assert_eq!(lent, 2);
+    assert_eq!(memory.load_generation(a), 3, "taken back: odd");
+    assert_eq!(memory.load_generation(b), 2, "read last, not tried");
     slots.publish(&memory, lent, 72);
     // Unpinned, it is lent again without another store before its fill.
     memory.pinned.borrow_mut().clear();
     let stores = memory.stores.borrow().len();
-    assert_eq!(slots.lend(&memory, &memory, 48).expect("a slot"), b);
+    assert_eq!(slots.lend(&memory, &memory, 48).expect("a slot"), a);
     assert_eq!(memory.stores.borrow().len(), stores);
-    assert_eq!(slots.publish(&memory, b, 96), 4);
+    assert_eq!(slots.publish(&memory, a, 96), 4);
 }
 
 #[test]
@@ -188,12 +204,13 @@ fn a_lossless_pool_lends_only_a_slot_read_past_and_takes_nothing_back() {
     assert_eq!(slots.lend(&memory, &memory, 0), Err(LendError::NoSlot));
     assert_eq!(memory.stores.borrow().len(), stores);
     assert_eq!(slots.lent(), 0);
-    // Read up to 48: the newer of `a` and `b`, and `c` still unread is left alone.
-    assert_eq!(slots.lend(&memory, &memory, 48), Ok(b));
-    slots.publish(&memory, b, 96);
+    // Read up to 48: the older of `a` and `b`, as `b` was read last, and `c` unread is left alone.
+    assert_eq!(slots.lend(&memory, &memory, 48), Ok(a));
+    slots.publish(&memory, a, 96);
     assert_eq!(memory.load_generation(c), 2);
-    memory.pinned.borrow_mut().push(a);
+    memory.pinned.borrow_mut().push(b);
     assert_eq!(slots.lend(&memory, &memory, 48), Err(LendError::NoSlot));
+    assert_eq!(memory.load_generation(b), 3, "sole one read, tried");
 }
 
 #[test]
@@ -216,10 +233,10 @@ fn a_pin_that_moves_during_a_lend_holds_one_slot_only() {
     let memory = Fake::new(2);
     let mut slots = Slots::new(2, 2, 1, false);
     let a = put(&mut slots, &memory, u64::MAX, 24);
-    // One pin word, on `a` when `a` is tried and on the other slot when that one is.
-    memory.moving.borrow_mut().extend([vec![a], vec![1 - a]]);
-    assert_eq!(slots.lend(&memory, &memory, u64::MAX), Ok(a));
-    assert_eq!(memory.load_generation(1 - a), 1, "tried: odd");
+    // `a` read last: the free slot is tried first; the one pin word moves from it to `a`.
+    memory.moving.borrow_mut().extend([vec![1 - a], vec![a]]);
+    assert_eq!(slots.lend(&memory, &memory, u64::MAX), Ok(1 - a));
+    assert_eq!(memory.load_generation(a), 3, "tried: odd");
 }
 
 #[test]
@@ -236,6 +253,8 @@ fn a_pin_holds_while_the_generation_matches_and_lets_go_when_it_does_not() {
     let memory = Fake::new(2);
     let mut slots = Slots::new(2, 2, 1, false);
     let slot = put(&mut slots, &memory, 0, 24);
+    // A newer value, so that `slot` is the one a lend tries first.
+    put(&mut slots, &memory, 0, 48);
     let loan = Loan {
         slot,
         len: 64,

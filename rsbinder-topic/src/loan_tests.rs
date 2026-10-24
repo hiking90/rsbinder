@@ -116,13 +116,16 @@ fn a_dropped_loan_publishes_nothing_and_its_slot_is_lent_again() {
 }
 
 #[test]
-fn the_slot_read_last_is_lent_again_and_a_subscriber_behind_gets_the_newest_depth() {
+fn two_slots_read_by_everyone_are_lent_in_turn_and_a_subscriber_behind_gets_the_newest_depth() {
     // 2 pins, one to write, a depth of 2 and 1 loan: 6 slots.
     let publisher = Publisher::<Bytes>::new(&pooled(2, 2, 1)).unwrap();
-    // With nobody subscribed every slot is read: the one published last comes back.
+    // With nobody subscribed every slot is read: the one published second last comes back.
     let first = lend(&publisher, &[1; 8]);
-    for _ in 0..4 {
+    let second = lend(&publisher, &[1; 8]);
+    assert_ne!(first, second);
+    for _ in 0..2 {
         assert_eq!(lend(&publisher, &[2; 8]), first);
+        assert_eq!(lend(&publisher, &[2; 8]), second);
     }
     // A subscriber that has read nothing since it started: the free slots, then the oldest.
     let mut subscriber = subscribe(&publisher);
@@ -131,7 +134,11 @@ fn the_slot_read_last_is_lent_again_and_a_subscriber_behind_gets_the_newest_dept
     distinct.sort_unstable();
     distinct.dedup();
     assert_eq!(distinct.len(), 6, "{lent:?}");
-    assert_eq!(lent[0], first, "read by everyone and published last");
+    assert_eq!(lent[0], first, "read by everyone and published second last");
+    assert_eq!(
+        lent[5], second,
+        "read by everyone and published last, the only one left"
+    );
     assert_eq!(lend(&publisher, &[6; 8]), lent[0], "the oldest");
     // Seven values behind, depth 2: the five oldest are taken back and the newest two arrive.
     for _ in 0..5 {
@@ -141,8 +148,8 @@ fn the_slot_read_last_is_lent_again_and_a_subscriber_behind_gets_the_newest_dept
         assert_eq!(subscriber.try_recv(), Ok(Bytes(vec![n; 8])));
     }
     assert_eq!(subscriber.stats().lost, 5);
-    // Read up to the end: the slot published last comes back again.
-    assert_eq!(lend(&publisher, &[7; 8]), lent[0]);
+    // Read up to the end: the slot published second last comes back.
+    assert_eq!(lend(&publisher, &[7; 8]), lent[5]);
 }
 
 /// Bytes under the type name of [`Bytes`], decoded where they lie: the buffer stays for the next.
@@ -271,11 +278,15 @@ fn a_held_sample_is_not_written_however_many_values_follow() {
 
 #[test]
 fn a_dropped_sample_lets_go_of_its_slot() {
-    let publisher = Publisher::<Bytes>::new(&pooled(1, 1, 1)).unwrap();
+    let publisher = Publisher::<Bytes>::new(&pooled(1, 2, 1)).unwrap();
     let mut subscriber = subscribe(&publisher);
     let slot = lend(&publisher, &[3; 8]);
+    lend(&publisher, &[4; 8]);
     drop(subscriber.try_recv_sample().unwrap());
-    // Read by everyone and published last: the same slot, once nothing pins it.
+    // The free slots first; then the only one read past, as nothing pins it.
+    for n in 0..3u8 {
+        assert_ne!(lend(&publisher, &[n; 8]), slot);
+    }
     assert_eq!(publisher.loan_slice(8).unwrap().slot(), slot);
 }
 

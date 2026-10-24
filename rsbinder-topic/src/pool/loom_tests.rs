@@ -10,8 +10,9 @@
 //! and the reader's counter load are. The flawed models show the check is not vacuous: a
 //! publisher that does not look at the pins, a pin released `Relaxed`. A generation published
 //! `Relaxed` is no flaw here: the record's commit comes after it and orders the value as well.
-//! With everything read the publisher prefers the slot published last, so it keeps coming back to
-//! the one the subscriber may hold. With nothing read it lends the oldest, and with a depth of 1
+//! With everything read the publisher lends the slot published second last, so with two slots it
+//! lends them in turn, and the slot of a record the subscriber holds is lent again for the second
+//! publish after it. With nothing read it lends the oldest, and with a depth of 1
 //! that is a slot the publish before took back, which only the retire's odd generation keeps
 //! from a subscriber holding its record. Run: see `Cargo.toml` (`--cfg loom`).
 
@@ -154,7 +155,7 @@ fn loom_pool_a_pin_moved_to_another_slot_orders_the_read_of_the_first() {
             Loan {
                 slot,
                 len: 8,
-                generation: slots.publish(&*model, slot, u64::from(SLOTS - slot)),
+                generation: slots.publish(&*model, slot, u64::from(slot + 1)),
             }
         });
         loans.sort_by_key(|loan| loan.slot);

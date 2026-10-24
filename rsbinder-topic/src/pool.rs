@@ -56,10 +56,19 @@
 //! # Which slot is lent
 //!
 //! A slot that every subscriber has read past (the `read` its control page reports is at or above
-//! the end of the slot's `LOAN` record) is needed by none of them; of those, the one published
-//! last is lent first, so that a pool larger than the cache keeps reusing the slots still in it
-//! (plan 15 §8.4). With none, the oldest is lent, which keeps the newest values longest;
-//! a lossless pool (below) waits instead.
+//! the end of the slot's `LOAN` record, or the slot has held no value, which counts as published
+//! before every other) is needed by none of them; of those, the one published
+//! second last is lent first, and the one published last only when it is the only one read past.
+//! The slots published last are still in the shared cache, so that a pool larger than it keeps
+//! reusing them (plan 15 §8.4). The one published last is the one its subscribers read last,
+//! and their cores still hold its lines: a write must first take them back from each, which on
+//! an x86_64 desktop made a 1 MiB fill 3.3 times as slow (plan 15). Passing it over saves at
+//! most what a subscriber core's private cache holds of it, and only for a subscriber that reads
+//! the value whole. It costs once the two slots written in turn, with the buffers copied from and
+//! into, outgrow the last-level cache: from a slot of 3 to 6 MiB upward on a 16 MiB one, by how
+//! the value is read, where the slot read last would have been the one still cached (plan 15).
+//! With none read past, the oldest is lent, which keeps the newest values longest; a lossless
+//! pool (below) waits instead.
 //! A `read` is the subscriber's to write: a wrong one only changes which slot is lent, and the
 //! generation check still decides what a subscriber reads, so it costs that subscriber values.
 //!
@@ -252,9 +261,10 @@ impl Slots {
         Err(LendError::NoSlot)
     }
 
-    /// The slot to try next: the newest read by all, else the oldest; none for a lossless pool.
+    /// Next to try: the second newest read by all (newest if alone), else oldest; lossless: none.
     fn candidate(&self, read: u64) -> Option<usize> {
         let mut newest_read: Option<(usize, u64)> = None;
+        let mut next_read: Option<(usize, u64)> = None;
         let mut oldest: Option<(usize, u64)> = None;
         let open = self
             .slots
@@ -264,13 +274,21 @@ impl Slots {
         for (at, slot) in open {
             if slot.end <= read {
                 if newest_read.is_none_or(|(_, end)| slot.end > end) {
+                    next_read = newest_read;
                     newest_read = Some((at, slot.end));
+                } else if next_read.is_none_or(|(_, end)| slot.end > end) {
+                    next_read = Some((at, slot.end));
                 }
             } else if !self.lossless && oldest.is_none_or(|(_, end)| slot.end < end) {
                 oldest = Some((at, slot.end));
             }
         }
-        newest_read.or(oldest).map(|(at, _)| at)
+        // Its subscribers' cores still cache the value read last: a write must take it from them.
+        let read = match newest_read {
+            Some((_, end)) if end != 0 => next_read.or(newest_read),
+            _ => newest_read,
+        };
+        read.or(oldest).map(|(at, _)| at)
     }
 
     /// The value in lent `slot` is written: its even generation, stored `Release`. The commit of
