@@ -4,7 +4,9 @@
 //! Loans (plan 15 §6): a value written straight into a slot of the pool, received as the
 //! ring's values are, and the slots the publisher chooses around the subscribers' pins.
 
+use std::cell::{Cell, RefCell};
 use std::os::fd::AsFd;
+use std::rc::Rc;
 use std::sync::atomic::Ordering;
 
 use rsbinder::{ExceptionCode, ParcelFileDescriptor, Status};
@@ -14,6 +16,9 @@ use crate::aidl::SubscribeRequest::SubscribeRequest;
 use crate::connect::{Asking, Token};
 use crate::layout::{self, ControlPage, LoadedPool, MIN_RING, VERSION};
 use crate::pool::{Pin, MAX_PINS};
+use crate::publish::AFTER_LOAN_RECORD;
+use crate::receive::LATEST_RETRIES;
+use crate::ring::BEFORE_JUDGING;
 use crate::{
     Bytes, Encoding, Payload, PoolPolicy, PublishError, Publisher, PublisherPolicy, Record,
     RecvError, Subscriber, SubscriberPolicy,
@@ -274,6 +279,71 @@ fn a_held_sample_is_not_written_however_many_values_follow() {
     assert_eq!(received + lost, 16, "{received} received, {lost} lost");
     assert!(lost > 0);
     assert_eq!(last, Some(pattern(15, SLOT)));
+}
+
+/// Depth 1: a value taken back as `try_latest` reads it gives way to the newer one, with no loss.
+#[test]
+fn the_newest_value_taken_back_as_it_is_read_gives_way_to_the_newer_one() {
+    let publisher = Rc::new(Publisher::<Bytes>::new(&pooled(1, 1, 1)).unwrap());
+    let mut subscriber = subscribe(&publisher);
+    lend(&publisher, &pattern(1, 64));
+    let mut next = Some(publisher.clone());
+    BEFORE_JUDGING.set(Some(Box::new(move || {
+        if let Some(publisher) = next.take() {
+            lend(&publisher, &pattern(2, 64));
+        }
+    })));
+    let got = subscriber.try_latest();
+    BEFORE_JUDGING.set(None);
+    assert_eq!(got, Ok(Bytes(pattern(2, 64))));
+    assert_eq!(subscriber.stats().lost, 0);
+    assert_eq!(subscriber.try_latest(), Err(RecvError::Empty));
+}
+
+/// With a depth of 1, the value before a loan's is readable until that loan's record is.
+#[test]
+fn a_loan_takes_the_value_before_it_back_only_after_its_record_is_committed() {
+    let publisher = Publisher::<Bytes>::new(&pooled(1, 1, 1)).unwrap();
+    let subscriber = Rc::new(RefCell::new(subscribe(&publisher)));
+    lend(&publisher, &pattern(1, 64));
+    let (reading, seen) = (subscriber.clone(), Rc::new(RefCell::new(Vec::new())));
+    let saw = seen.clone();
+    AFTER_LOAN_RECORD.set(Some(Box::new(move || {
+        saw.borrow_mut().push(reading.borrow_mut().try_recv());
+    })));
+    lend(&publisher, &pattern(2, 64));
+    AFTER_LOAN_RECORD.set(None);
+    assert_eq!(*seen.borrow(), [Ok(Bytes(pattern(1, 64)))]);
+    let mut subscriber = subscriber.borrow_mut();
+    assert_eq!(subscriber.try_recv(), Ok(Bytes(pattern(2, 64))));
+    assert_eq!(subscriber.stats().lost, 0);
+}
+
+/// A publish at every judgment: past [`LATEST_RETRIES`] values taken back, one loss is reported.
+#[test]
+fn a_publisher_that_keeps_taking_the_newest_value_back_holds_no_try_latest() {
+    let publisher = Rc::new(Publisher::<Bytes>::new(&pooled(1, 1, 1)).unwrap());
+    let mut subscriber = subscribe(&publisher);
+    lend(&publisher, &pattern(0, 64));
+    let published = Rc::new(Cell::new(1u8));
+    let (lending, count) = (publisher.clone(), published.clone());
+    BEFORE_JUDGING.set(Some(Box::new(move || {
+        let n = count.get();
+        if n < 64 {
+            lend(&lending, &pattern(n, 64));
+            count.set(n + 1);
+        }
+    })));
+    let got = subscriber.try_latest();
+    BEFORE_JUDGING.set(None);
+    assert_eq!(got, Err(RecvError::Lagged(1)));
+    assert_eq!(subscriber.stats().lost, 1);
+    let published = published.get();
+    assert_eq!(published, LATEST_RETRIES as u8 + 2, "{published} values");
+    assert_eq!(
+        subscriber.try_latest(),
+        Ok(Bytes(pattern(published - 1, 64)))
+    );
 }
 
 #[test]

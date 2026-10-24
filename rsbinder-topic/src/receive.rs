@@ -222,27 +222,37 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
         if self.corrupted {
             return Err(RecvError::Closed(Closed::Corrupted));
         }
-        let taken = if latest {
-            self.reader.try_latest()
-        } else {
-            self.reader.try_recv()
-        };
-        let loan = match taken {
-            Ok(Taken::Item { mut record, .. }) => {
-                return T::decode(&mut record).map_err(RecvError::Decode)
+        let mut retries = 0;
+        loop {
+            let taken = if latest {
+                self.reader.try_latest()
+            } else {
+                self.reader.try_recv()
+            };
+            let loan = match taken {
+                Ok(Taken::Item { mut record, .. }) => {
+                    return T::decode(&mut record).map_err(RecvError::Decode)
+                }
+                Ok(Taken::Loan { loan, .. }) => loan,
+                // The loan lost last was the newest: it is reported.
+                Ok(Taken::Empty) if retries > 0 => return Err(self.lost_loan()),
+                other => return Err(not_a_value(other)),
+            };
+            let copied = match &self.pool {
+                // SAFETY: `vouched` is the caller's word for the publisher.
+                Some(pool) if vouched => unsafe { pool.copy_vouched(loan, &mut self.loaned) },
+                Some(pool) => pool.copy(loan, &mut self.loaned),
+                None => Err(NO_POOL),
+            };
+            // Taken back after a newer record was committed (`pool.rs`): skipped as an older one.
+            if latest && copied == Err(Unpinned::Lost) && retries < LATEST_RETRIES {
+                retries += 1;
+                continue;
             }
-            Ok(Taken::Loan { loan, .. }) => loan,
-            other => return Err(not_a_value(other)),
-        };
-        let copied = match &self.pool {
-            // SAFETY: `vouched` is the caller's word for the publisher.
-            Some(pool) if vouched => unsafe { pool.copy_vouched(loan, &mut self.loaned) },
-            Some(pool) => pool.copy(loan, &mut self.loaned),
-            None => Err(NO_POOL),
-        };
-        self.loaned(copied)?;
-        let len = self.loaned.len();
-        T::decode(&mut Record::new(&mut self.loaned, len)).map_err(RecvError::Decode)
+            self.loaned(copied)?;
+            let len = self.loaned.len();
+            return T::decode(&mut Record::new(&mut self.loaned, len)).map_err(RecvError::Decode);
+        }
     }
 
     /// The next value where it lies, the ring's buffer or a slot this call pins, without waiting.
@@ -285,15 +295,18 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
     fn loaned(&mut self, done: Result<(), Unpinned>) -> Result<(), RecvError> {
         match done {
             Ok(()) => Ok(()),
-            Err(Unpinned::Lost) => {
-                self.lost_loans += 1;
-                Err(RecvError::Lagged(1))
-            }
+            Err(Unpinned::Lost) => Err(self.lost_loan()),
             Err(Unpinned::Corrupted(_)) => {
                 self.corrupted = true;
                 Err(RecvError::Closed(Closed::Corrupted))
             }
         }
+    }
+
+    /// A loan whose slot was taken back before this reader pinned it, counted.
+    fn lost_loan(&mut self) -> RecvError {
+        self.lost_loans += 1;
+        RecvError::Lagged(1)
     }
 
     /// Where the next record to return starts.
@@ -352,6 +365,9 @@ pub(crate) enum Held {
 }
 
 const NO_POOL: Unpinned = Unpinned::Corrupted("a loan from a publisher without a pool");
+
+/// How many loans taken back a receive of the newest value skips before it reports one lost.
+pub(crate) const LATEST_RETRIES: u32 = 4;
 
 /// What a receive reports for a record that holds no value.
 fn not_a_value(taken: Result<Taken<'_>, Corrupted>) -> RecvError {

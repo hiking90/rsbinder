@@ -2,14 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The pin protocol of `pool.rs` under loom (plan 15 AC-15.3.5): [`Slots::lend`],
-//! [`Slots::publish`], [`pin`] and [`unpin`] as they are, over a model of the generations, one
-//! subscriber's pin word, and the slots' bytes in loom's `UnsafeCell`. loom fails a model in which
-//! a write of a slot does not happen after every read of it, or a read does not happen after the
-//! write it sees, so a pinned slot written over and a value read before it was published both
-//! fail. The ring's record is one atomic word, stored `Release` and loaded `Acquire` as a commit
+//! [`Slots::publish`], [`Slots::retire`], [`pin`] and [`unpin`] as they are, over a model of the
+//! generations, one subscriber's pin word, and the slots' bytes in loom's `UnsafeCell`. loom fails
+//! a model in which a write of a slot does not happen after every read of it, or a read does not
+//! happen after the write it sees, so a pinned slot written over and a value read before it was
+//! published both fail; so does a pin that finds its value taken back and then loads no newer
+//! record. The ring's record is one atomic word, stored `Release` and loaded `Acquire` as a commit
 //! and the reader's counter load are. The flawed models show the check is not vacuous: a
-//! publisher that does not look at the pins, a pin released `Relaxed`. A generation published
-//! `Relaxed` is no flaw here: the record's commit comes after it and orders the value as well.
+//! publisher that does not look at the pins, a pin released `Relaxed`, and values taken back
+//! before the newer record's commit, or with their odd generation `Relaxed`, which leave a lost
+//! pin with no newer record to load. A generation published `Relaxed` is no flaw here: the
+//! record's commit comes after it and orders the value as well.
 //! With everything read the publisher lends the slot published second last, so with two slots it
 //! lends them in turn, and the slot of a record the subscriber holds is lent again for the second
 //! publish after it. With nothing read it lends the oldest, and with a depth of 1
@@ -35,6 +38,10 @@ enum Flaw {
     IgnoresPins,
     /// The subscriber stores its pin word `Relaxed`, 0 and a slot's number alike.
     RelaxedUnpin,
+    /// The publisher takes values back before it commits the newer value's record.
+    RetireFirst,
+    /// The publisher stores a taken back value's odd generation `Relaxed`.
+    RelaxedRetire,
 }
 
 struct Model {
@@ -63,7 +70,41 @@ impl Model {
 
 impl Generations for Model {
     fn store_generation(&self, slot: u32, value: u64, order: Ordering) {
+        let order = match order {
+            Ordering::Release if self.flaw == Flaw::RelaxedRetire && value % 2 == 1 => {
+                Ordering::Relaxed
+            }
+            order => order,
+        };
         self.generations[slot as usize].store(value, order);
+    }
+}
+
+impl Model {
+    /// `publish_loan` with all read to `read`: lend, fill with `round`, commit, retire; the record.
+    fn publish(&self, slots: &mut Slots, round: u64, read: u64) -> u64 {
+        let slot = slots.lend(self, self, read).expect("a slot");
+        // SAFETY: a lent slot, which no pin holds; loom checks that it is so.
+        self.slots[slot as usize].with_mut(|value| unsafe { *value = round });
+        let generation = slots.publish(self, slot, round);
+        let record = u64::from(slot) | round << 8 | generation << 16;
+        if self.flaw == Flaw::RetireFirst {
+            slots.retire(self);
+            self.record.store(record, Ordering::Release);
+        } else {
+            self.record.store(record, Ordering::Release);
+            slots.retire(self);
+        }
+        record
+    }
+}
+
+/// The loan a model's record names.
+fn loan(record: u64) -> Loan {
+    Loan {
+        slot: (record & 0xff) as u32,
+        len: 8,
+        generation: record >> 16,
     }
 }
 
@@ -108,12 +149,7 @@ fn a_pinned_slot_is_read_whole_and_never_written(flaw: Flaw, rounds: u64, read: 
             thread::spawn(move || {
                 let mut slots = Slots::new(SLOTS, 1, 1, false);
                 for round in 1..=rounds {
-                    let slot = slots.lend(&*model, &*model, read).expect("a slot");
-                    // SAFETY: a lent slot, which no pin holds; loom checks that it is so.
-                    model.slots[slot as usize].with_mut(|value| unsafe { *value = round });
-                    let generation = slots.publish(&*model, slot, round);
-                    let record = u64::from(slot) | round << 8 | generation << 16;
-                    model.record.store(record, Ordering::Release);
+                    model.publish(&mut slots, round, read);
                 }
             })
         };
@@ -122,11 +158,7 @@ fn a_pinned_slot_is_read_whole_and_never_written(flaw: Flaw, rounds: u64, read: 
             if record == 0 {
                 continue;
             }
-            let loan = Loan {
-                slot: (record & 0xff) as u32,
-                len: 8,
-                generation: record >> 16,
-            };
+            let loan = loan(record);
             match pin(&*model, &*model, loan, 8) {
                 Ok(()) => {
                     // SAFETY: a pinned slot of the generation the record names; loom checks it.
@@ -199,4 +231,57 @@ fn loom_pool_a_publisher_that_ignores_the_pins_writes_a_slot_being_read() {
 #[should_panic(expected = "Causality violation")]
 fn loom_pool_a_pin_released_relaxed_lets_the_next_fill_race_the_read() {
     a_pinned_slot_is_read_whole_and_never_written(Flaw::RelaxedUnpin, 3, u64::MAX);
+}
+
+/// Depth 1, two publishes: a `try_latest` pin that finds its value taken back loads a newer record.
+fn a_value_taken_back_has_a_newer_record(flaw: Flaw) {
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = Some(3);
+    builder.check(move || {
+        let model = Arc::new(Model::new(flaw));
+        let publisher = {
+            let model = model.clone();
+            thread::spawn(move || {
+                let mut slots = Slots::new(SLOTS, 1, 1, false);
+                for round in 1..=2 {
+                    model.publish(&mut slots, round, 0);
+                }
+            })
+        };
+        let record = model.record.load(Ordering::Acquire);
+        if record != 0 {
+            match pin(&*model, &*model, loan(record), 8) {
+                Ok(()) => {
+                    let slot = loan(record).slot as usize;
+                    // SAFETY: a pinned slot of the generation the record names; loom checks it.
+                    let value = model.slots[slot].with(|value| unsafe { *value });
+                    assert_eq!(value, (record >> 8) & 0xff, "a pinned slot that changed");
+                    unpin(&*model);
+                }
+                Err(Unpinned::Lost) => {
+                    let newer = model.record.load(Ordering::Acquire);
+                    assert!(newer >> 8 & 0xff > record >> 8 & 0xff, "no newer record");
+                }
+                Err(Unpinned::Corrupted(what)) => panic!("a publisher that conforms: {what}"),
+            }
+        }
+        publisher.join().unwrap();
+    });
+}
+
+#[test]
+fn loom_pool_a_value_is_taken_back_only_after_a_newer_record() {
+    a_value_taken_back_has_a_newer_record(Flaw::None);
+}
+
+#[test]
+#[should_panic(expected = "no newer record")]
+fn loom_pool_a_value_taken_back_before_the_newer_record_is_lost_with_none() {
+    a_value_taken_back_has_a_newer_record(Flaw::RetireFirst);
+}
+
+#[test]
+#[should_panic(expected = "no newer record")]
+fn loom_pool_a_value_taken_back_relaxed_may_leave_the_newer_record_unseen() {
+    a_value_taken_back_has_a_newer_record(Flaw::RelaxedRetire);
 }

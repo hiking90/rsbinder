@@ -339,6 +339,12 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
 
     /// The newest value, without waiting; the records before it are skipped and not reported as
     /// lost. [`RecvError::Empty`] when no record is unread.
+    ///
+    /// A lent value ([`Publisher::loan_slice`](crate::Publisher::loan_slice)) that the publisher
+    /// took back before this call pinned its slot was replaced by a newer value, which the call
+    /// goes on to, as to any newer record. One call goes past at most four such values and
+    /// reports a fifth as lost, [`RecvError::Lagged`]`(1)`, so a publisher that keeps publishing
+    /// holds no call. A call that finds no newer record after such a value reports it lost as well.
     pub fn try_latest(&mut self) -> Result<T, RecvError> {
         self.look(true)
     }

@@ -30,7 +30,8 @@
 //!   generation[i] = odd; fence(SeqCst); load every pin word
 //!   the first slot tried, i or one before it, that no pin word names: lend it; none: try another
 //!   lending it: fence(Acquire), then the slot is written
-//!   published: generation[i] = even (Release), then the LOAN record
+//!   published: generation[i] = even (Release), then the LOAN record, then the values past the
+//!   newest `depth` taken back: generation = odd (Release)
 //! ```
 //!
 //! The pin word is the subscriber's memory and the generations the publisher's, each read-only
@@ -81,9 +82,15 @@
 //! whenever no pin is on them, and a subscriber that cannot keep up would read values as old as
 //! the pool is deep (plan 15 §8.4).
 //!
-//! A value taken back has its odd generation stored `Relaxed`: no write to the slot follows until
-//! a lend, whose fence orders that store before the pins are loaded, and a subscriber that still
-//! sees the even generation reads the value whole, since nothing writes the slot before that lend.
+//! A publish takes values back only after its own `LOAN` record is committed, so a value is taken
+//! back only once a newer one is readable, and with a depth of 1 the newest record's slot stays
+//! even until a later record is committed. The odd generation is stored `Release`: a subscriber
+//! whose pin finds it then loads a `write` at or past that newer record, which is how the newest
+//! value's reader ([`Subscriber::try_latest`](crate::Subscriber::try_latest)) goes on to a newer
+//! value instead of reporting the loss. The slot itself needs no more: no write to it follows
+//! until a lend, whose fence orders that store before the pins are loaded, and a subscriber that
+//! still sees the even generation reads the value whole, since nothing writes the slot before
+//! that lend.
 //!
 //! With `slots >= max_subscribers × MAX_PINS + 1 + depth + max_loans` the publisher always finds
 //! a slot: pins hold at most `max_subscribers` of them, values kept `depth`, and loans not yet
@@ -291,9 +298,7 @@ impl Slots {
         read.or(oldest).map(|(at, _)| at)
     }
 
-    /// The value in lent `slot` is written: its even generation, stored `Release`. The commit of
-    /// the `LOAN` record, after it, orders the value for a subscriber as well; `end` is where that
-    /// record will end.
+    /// Lent `slot` is written: even, `Release`; [`retire`](Self::retire) follows the commit.
     pub(crate) fn publish(&mut self, generations: &impl Generations, slot: u32, end: u64) -> u64 {
         let entry = &mut self.slots[slot as usize];
         debug_assert!(entry.lent && entry.generation % 2 == 1);
@@ -301,16 +306,15 @@ impl Slots {
         generations.store_generation(slot, entry.generation, Ordering::Release);
         entry.end = end;
         entry.lent = false;
-        let generation = entry.generation;
         self.lent -= 1;
-        if !self.lossless {
-            self.retire(generations);
-        }
-        generation
+        entry.generation
     }
 
-    /// Take back the values older than the newest `depth`: odd, so a subscriber behind loses them.
-    fn retire(&mut self, generations: &impl Generations) {
+    /// After the newest `LOAN` record's commit, take back the values older than the newest `depth`.
+    pub(crate) fn retire(&mut self, generations: &impl Generations) {
+        if self.lossless {
+            return;
+        }
         loop {
             let mut held = 0;
             let mut oldest: Option<(usize, u64)> = None;
@@ -330,7 +334,7 @@ impl Slots {
             };
             let slot = &mut self.slots[at];
             slot.generation += 1;
-            generations.store_generation(at as u32, slot.generation, Ordering::Relaxed);
+            generations.store_generation(at as u32, slot.generation, Ordering::Release);
         }
     }
 

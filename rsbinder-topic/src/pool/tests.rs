@@ -60,10 +60,11 @@ impl Pin for Fake {
     }
 }
 
-/// Lend and publish one value with its record ending at `end`; the slot.
+/// Lend and publish one value with its record ending at `end`, then retire; the slot.
 fn put(slots: &mut Slots, memory: &Fake, read: u64, end: u64) -> u32 {
     let slot = slots.lend(memory, memory, read).expect("a slot");
     slots.publish(memory, slot, end);
+    slots.retire(memory);
     slot
 }
 
@@ -160,13 +161,21 @@ fn values_past_the_depth_are_taken_back_oldest_first() {
     let b = put(&mut slots, &memory, 0, 48);
     assert_eq!([a, b].map(|slot| memory.load_generation(slot)), [2, 2]);
     let stores = memory.stores.borrow().len();
-    let c = put(&mut slots, &memory, 0, 72);
+    let c = slots.lend(&memory, &memory, 0).expect("a slot");
+    slots.publish(&memory, c, 72);
+    // The record of `c` is committed between these: until then `a` stays readable.
+    assert_eq!(
+        memory.load_generation(a),
+        2,
+        "a publish alone takes nothing back"
+    );
+    slots.retire(&memory);
     assert_eq!(
         memory.stores.borrow()[stores..],
         [
             (c, 1, Ordering::Relaxed),
             (c, 2, Ordering::Release),
-            (a, 3, Ordering::Relaxed)
+            (a, 3, Ordering::Release)
         ],
         "the third value takes the first back"
     );
@@ -207,6 +216,7 @@ fn a_lossless_pool_lends_only_a_slot_read_past_and_takes_nothing_back() {
     // Read up to 48: the older of `a` and `b`, as `b` was read last, and `c` unread is left alone.
     assert_eq!(slots.lend(&memory, &memory, 48), Ok(a));
     slots.publish(&memory, a, 96);
+    slots.retire(&memory);
     assert_eq!(memory.load_generation(c), 2);
     memory.pinned.borrow_mut().push(b);
     assert_eq!(slots.lend(&memory, &memory, 48), Err(LendError::NoSlot));

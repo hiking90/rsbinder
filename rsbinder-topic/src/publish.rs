@@ -116,19 +116,21 @@ pub struct PoolPolicy {
     /// The newest values published that stay readable for a subscriber behind. Default 2; 0
     /// counts as 1.
     ///
-    /// Each publish takes back the values older than these, so a subscriber that falls more than
-    /// `depth` values behind loses the older ones, as one that falls behind the ring does, and
-    /// receives no value older than `depth` publishes. A value a subscriber holds as a
-    /// [`Sample`](crate::Sample) stays its own however old it grows. The slot lent next is one
-    /// that every subscriber has read past: the one published second last of those, or the one
-    /// published last when it is the only one; with none, the oldest. A slot that has held no
-    /// value counts as read past and as published before every other. A busy pool thus reuses the
-    /// slots still in the cache but not the one its subscribers read last, whose lines their
-    /// cores still hold. Passing that one over saves at most what a subscriber core's private
-    /// cache holds of the value, and only for a subscriber that reads the value whole; with
-    /// values from about a fifth to three-eighths of the last-level cache upward, by how the value
-    /// is read, the two slots written in turn and the buffers copied from and into no longer stay
-    /// in it, and each fill reads part of the slot from memory instead (plan 15).
+    /// Each publish takes back the values older than these once its own value is readable, so a
+    /// subscriber that falls more than `depth` values behind loses the older ones, as one that
+    /// falls behind the ring does, and receives no value older than `depth` publishes.
+    /// [`Subscriber::try_latest`](crate::Subscriber::try_latest) goes on to the newer value
+    /// instead. A value a subscriber holds as a [`Sample`](crate::Sample) stays its own however
+    /// old it grows. The slot lent next is one that every subscriber has read past: the one
+    /// published second last of those, or the one published last when it is the only one; with
+    /// none, the oldest. A slot that has held no value counts as read past and as published
+    /// before every other. A busy pool thus reuses the slots still in the cache but not the one
+    /// its subscribers read last, whose lines their cores still hold. Passing that one over saves
+    /// at most what a subscriber core's private cache holds of the value, and only for a
+    /// subscriber that reads the value whole; with values from about a fifth to three-eighths of
+    /// the last-level cache upward, by how the value is read, the two slots written in turn and
+    /// the buffers copied from and into no longer stay in it, and each fill reads part of the
+    /// slot from memory instead (plan 15).
     ///
     /// With [`PublisherPolicy::backpressure`] no value is taken back: a loan waits instead for a
     /// slot every subscriber has read past, and a subscriber can fall at least `depth + 1` values
@@ -425,6 +427,13 @@ impl<S: Stores> State<S> {
     }
 }
 
+#[cfg(all(test, not(loom)))]
+thread_local! {
+    /// Set by a test: run by a loan's publish after it commits the record, under the lock.
+    pub(crate) static AFTER_LOAN_RECORD: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// A topic's writer behind a lock, fed with values of `T`. Any thread may publish.
 pub(crate) struct TypedWriter<T, S> {
     state: Mutex<State<S>>,
@@ -636,6 +645,10 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
         };
         // `end_of` admitted this record, so `put` writes it.
         writer.put(Kind::Loan, &loan.bytes())?;
+        #[cfg(all(test, not(loom)))]
+        AFTER_LOAN_RECORD.with_borrow_mut(|hook| hook.iter_mut().for_each(|hook| hook()));
+        // After the commit: a value is taken back only once a newer one is readable.
+        lending.slots.retire(&lending.memory);
         state.published += 1;
         state.bytes += len as u64;
         state.announce();
