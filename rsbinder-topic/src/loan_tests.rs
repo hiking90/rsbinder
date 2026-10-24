@@ -485,3 +485,112 @@ fn pinned_slots_are_not_lent_however_many_values_follow() {
     page.store_pin(0, Ordering::Release);
     assert!((0..5).any(|n| lend(&publisher, &[n; 8]) == pinned));
 }
+
+/// Samples received by an async caller, on the blocking pool and on the reactor.
+#[cfg(feature = "tokio")]
+mod async_samples {
+    use std::collections::BTreeSet;
+    use std::future::Future;
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::{Sample, Trusted, Untrusted, Wake};
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap()
+    }
+
+    fn woken_by(publisher: &Publisher<Bytes>, wake: Wake) -> Subscriber<Bytes> {
+        let policy = SubscriberPolicy {
+            wake,
+            ..SubscriberPolicy::default()
+        };
+        Subscriber::request(&publisher.as_binder(), &policy).unwrap()
+    }
+
+    /// Poll `future` once inside `runtime`, with a waker that does nothing.
+    fn poll_once<F: Future>(
+        runtime: &tokio::runtime::Runtime,
+        future: std::pin::Pin<&mut F>,
+    ) -> Poll<F::Output> {
+        let _enter = runtime.enter();
+        future.poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    #[test]
+    fn an_async_sample_receive_sleeps_until_a_value_is_lent() {
+        let runtime = runtime();
+        for wake in [Wake::Futex, Wake::Fd] {
+            let publisher = Publisher::<Bytes>::new(&pooled(1, 1, 1)).unwrap();
+            let mut subscriber = woken_by(&publisher, wake);
+            let local = subscriber.local().clone();
+            let got = std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    let began = Instant::now();
+                    while !local.is_parked() {
+                        assert!(began.elapsed() < Duration::from_secs(10), "no wait slept");
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    lend(&publisher, &pattern(1, 64));
+                });
+                runtime.block_on(async {
+                    let sample = subscriber.recv_sample_async().await?;
+                    Ok::<_, RecvError>((sample.is_loaned(), sample.to_owned()))
+                })
+            });
+            assert_eq!(got, Ok((true, pattern(1, 64))), "{wake:?}");
+            assert_eq!(subscriber.stats().received, 1);
+        }
+    }
+
+    /// A dropped async sample receive holds no pin: a value found is returned as a sample in the
+    /// poll that found it, so no poll that returns `Pending` has pinned a slot.
+    #[test]
+    fn a_dropped_async_sample_receive_holds_no_pin() {
+        let runtime = runtime();
+        for wake in [Wake::Futex, Wake::Fd] {
+            // 1 pin, one to write, a depth of 1 and 1 loan: 4 slots.
+            let publisher = Publisher::<Bytes>::new(&pooled(1, 1, 1)).unwrap();
+            let mut subscriber = woken_by(&publisher, wake);
+            {
+                let mut future = pin!(subscriber.recv_sample_async());
+                assert!(
+                    poll_once(&runtime, future.as_mut()).is_pending(),
+                    "nothing lent"
+                );
+            }
+            lend(&publisher, &pattern(1, 64));
+            {
+                let mut future = pin!(subscriber.recv_sample_async());
+                let Poll::Ready(Ok(sample)) = poll_once(&runtime, future.as_mut()) else {
+                    panic!("{wake:?}: a value lent, and no sample from the poll that looked");
+                };
+                assert_eq!(sample.to_owned(), pattern(1, 64));
+            }
+            // No slot is pinned: the values that follow are lent into every slot of the pool.
+            let lent: BTreeSet<u32> = (0..16).map(|n| lend(&publisher, &[n; 8])).collect();
+            assert_eq!(lent.len(), 4, "{wake:?}: {lent:?}");
+        }
+    }
+
+    #[test]
+    fn an_async_sample_receive_and_its_sample_move_between_threads() {
+        fn moved<T: Send>(_: &T) {}
+        fn movable<T: Send>() {}
+        let publisher = Publisher::<Bytes>::new(&pooled(2, 1, 1)).unwrap();
+        let mut subscriber = subscribe(&publisher);
+        moved(&subscriber.recv_sample_async());
+        // SAFETY: the publisher is this crate's, in this process.
+        let mut trusted = unsafe { subscribe(&publisher).trust_publisher() };
+        moved(&trusted.recv_sample_async());
+        movable::<Sample<'static, Untrusted>>();
+        movable::<Sample<'static, Trusted>>();
+    }
+}

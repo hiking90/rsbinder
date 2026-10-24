@@ -894,6 +894,26 @@ impl<M: Trust> Subscriber<Bytes, M> {
         Ok(self.reader.sample(held, self.control.0.read()))
     }
 
+    /// [`recv_sample`](Self::recv_sample) for an async caller: the value where it lies, waiting
+    /// for one as [`recv_async`](Self::recv_async) waits, on the blocking pool or the reactor.
+    ///
+    /// Cancel-safe, as `recv_async` is: a slot is pinned only by the look that finds its value,
+    /// and the future returns the [`Sample`] in that same poll, so a future dropped while it
+    /// waits holds no pin and loses no record. The results are `recv_sample`'s, and `recv_async`'s
+    /// [`RecvError::Cancelled`].
+    ///
+    /// # Panics
+    ///
+    /// As `recv_async` does: outside a Tokio runtime, and with [`Wake::Fd`] in a runtime whose IO
+    /// driver is off.
+    #[cfg(feature = "tokio")]
+    pub async fn recv_sample_async(&mut self) -> Result<Sample<'_, M>, RecvError> {
+        let held = self
+            .wait_async_with(|subscriber| subscriber.look_held(false))
+            .await?;
+        Ok(self.reader.sample(held, self.control.0.read()))
+    }
+
     fn look_held(&mut self, latest: bool) -> Result<Held, RecvError> {
         if self.local.evicted() {
             self.looked = Looked::Exact;
