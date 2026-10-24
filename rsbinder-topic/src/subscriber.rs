@@ -413,20 +413,30 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
     /// runtime whose IO driver is off, as `AsyncFd::register` does.
     #[cfg(feature = "tokio")]
     pub async fn recv_async(&mut self) -> Result<T, RecvError> {
+        self.wait_async_with(|subscriber| subscriber.look(false))
+            .await
+    }
+
+    /// An async wait until `look` finds other than `Empty`; `look` holds no borrow.
+    #[cfg(feature = "tokio")]
+    async fn wait_async_with<V>(
+        &mut self,
+        mut look: impl FnMut(&mut Self) -> Result<V, RecvError>,
+    ) -> Result<V, RecvError> {
         if self.local.words().fd.is_some() {
-            return self.recv_on_reactor().await;
+            return self.recv_on_reactor(look).await;
         }
         loop {
             if self.leftover.busy() {
                 // Before the join, as `wait_with` looks; it leaves `ABANDON` to the wait still out.
-                match self.look(false) {
+                match look(self) {
                     Err(RecvError::Empty) => {}
                     other => return other,
                 }
                 self.leftover.join_async().await;
             }
             self.local.take(ABANDON);
-            match self.look(false) {
+            match look(self) {
                 Err(RecvError::Empty) => {}
                 other => return other,
             }
@@ -449,11 +459,14 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
         }
     }
 
-    /// `recv_async` of a [`Wake::Fd`] subscription: its fd on the runtime's reactor.
+    /// [`wait_async_with`](Self::wait_async_with) of a [`Wake::Fd`] subscription: on the reactor.
     #[cfg(feature = "tokio")]
-    async fn recv_on_reactor(&mut self) -> Result<T, RecvError> {
+    async fn recv_on_reactor<V>(
+        &mut self,
+        mut look: impl FnMut(&mut Self) -> Result<V, RecvError>,
+    ) -> Result<V, RecvError> {
         loop {
-            match self.look(false) {
+            match look(self) {
                 Err(RecvError::Empty) => {}
                 other => return other,
             }
