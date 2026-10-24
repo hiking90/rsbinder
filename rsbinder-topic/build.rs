@@ -19,6 +19,10 @@ fn main() {
         "aidl/rsbinder/topic/Pool.aidl",
         "aidl/rsbinder/topic/ISubscription.aidl",
         "aidl/rsbinder/topic/ITopic.aidl",
+        "aidl/rsbinder/topic/TopicRef.aidl",
+        "aidl/rsbinder/topic/TopicInfo.aidl",
+        "aidl/rsbinder/topic/ITopicWatcher.aidl",
+        "aidl/rsbinder/topic/ITopicRegistry.aidl",
     ];
     let builder = sources.iter().fold(
         rsbinder_aidl::Builder::new().set_async_support(true),

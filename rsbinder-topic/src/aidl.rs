@@ -10,6 +10,10 @@
 //! subscriber passes that binder to [`Subscriber::request`](crate::Subscriber::request). Copying
 //! these files into another crate's AIDL build makes types of the same names that this crate does
 //! not take.
+//!
+//! [`ITopicRegistry`](ITopicRegistry::ITopicRegistry), [`ITopicWatcher`](ITopicWatcher::ITopicWatcher),
+//! `TopicRef` and `TopicInfo` are the interface of a registry of topic names, which
+//! [`registry::Registry`](crate::registry::Registry) serves.
 
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/topic.rs"));

@@ -102,6 +102,7 @@ mod pool;
 mod publish;
 mod publisher;
 mod receive;
+pub mod registry;
 mod resolve;
 mod ring;
 mod sample;

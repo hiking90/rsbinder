@@ -36,8 +36,8 @@ use crate::{
 };
 
 /// The first wait before a refused subscription is asked again, doubled up to [`LAST_RETRY`].
-const FIRST_RETRY: Duration = Duration::from_secs(1);
-const LAST_RETRY: Duration = Duration::from_secs(30);
+pub(crate) const FIRST_RETRY: Duration = Duration::from_secs(1);
+pub(crate) const LAST_RETRY: Duration = Duration::from_secs(30);
 
 /// Looks of a drain that may give up lapped before it ends: the most one of its receives makes.
 const DRAIN_GIVE_UPS: u32 = 2;
