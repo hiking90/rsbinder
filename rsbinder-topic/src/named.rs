@@ -241,6 +241,8 @@ struct State<T: Payload> {
     kicked: bool,
     /// The binder the name was last given.
     latest: Option<SIBinder>,
+    /// Notices `registered` took, each one counted though it repeats `latest`.
+    registrations: u64,
     /// A connection the thread made that the subscriber has not taken yet.
     ready: Option<(Subscriber<T>, SIBinder)>,
     /// The binder of the connection in `ready` or the subscriber's hands.
@@ -286,6 +288,7 @@ impl<T: Payload> State<T> {
             interrupted: false,
             kicked: false,
             latest: None,
+            registrations: 0,
             ready: None,
             connected: None,
             refused: None,
@@ -375,7 +378,16 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
                     named.registered(binder);
                 }
             }),
-        )?;
+        );
+        let watch = match watch {
+            Ok(watch) => watch,
+            Err(status) => {
+                // A call before the error may have started a connection thread: it ends on this.
+                named.lock().dropped = true;
+                named.signal();
+                return Err(status);
+            }
+        };
         let mut state = named.lock();
         let wanted = matches!(state.find, Find::Unknown(true));
         state.find = match watch.lookup() {
@@ -1046,6 +1058,7 @@ impl<T: Payload + 'static> Named<T> {
             return;
         }
         state.latest = Some(binder.clone());
+        state.registrations += 1;
         if let Some(connected) = &state.connected {
             // The same binder registered again is the same publisher.
             if *connected == binder || state.replaced {
@@ -1237,14 +1250,15 @@ impl<T: Payload + 'static> Named<T> {
         };
         let mut again = true;
         let next = loop {
-            let before = state.latest.clone();
+            // Counted, not compared: a notice of the binder `latest` already holds is a notice too.
+            let before = state.registrations;
             drop(state);
             let found = lookup().ok().flatten();
             state = self.lock();
             if state.dropped || state.evicted {
                 break None;
             }
-            if state.latest == before {
+            if state.registrations == before {
                 let found = found.filter(|found| usable(found, &state, ended));
                 if let Some(found) = &found {
                     state.latest = Some(found.clone());

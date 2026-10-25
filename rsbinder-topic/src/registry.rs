@@ -467,14 +467,14 @@ impl Shared {
         let allowed = kernel_ids(caller).is_some()
             && is_valid_name(name)
             && self.access.allows(Action::Subscribe, name, caller);
-        let inner = self.lock();
-        // Refused, the answer of a name with no topic: the generation tells nothing of this one.
-        let found = if allowed {
-            inner.table.lookup(name)
-        } else {
-            (None, inner.table.generation())
-        };
-        topic_ref(found)
+        if !allowed {
+            // Older than any change, so the watch of a caller let in again takes the next answer.
+            return TopicRef {
+                topic: None,
+                generation: i64::MIN,
+            };
+        }
+        topic_ref(self.lock().table.lookup(name))
     }
 
     pub(crate) fn watch_as(

@@ -838,7 +838,7 @@ fn a_change_takes_the_order_lock_before_the_table() {
 }
 
 #[test]
-fn a_refused_lookup_answers_as_a_name_with_no_topic() {
+fn a_refused_lookup_answers_no_topic_older_than_any_change() {
     let refusing = Refusing::default();
     let registry = Registry::new(refusing.clone());
     let shared = &registry.shared;
@@ -846,9 +846,9 @@ fn a_refused_lookup_answers_as_a_name_with_no_topic() {
     shared.advertise_as(&caller(1), "b", &topic()).unwrap();
     refusing.0.lock().unwrap().insert(2);
     let refused = shared.lookup_as(&caller(2), "a");
-    let none = shared.lookup_as(&caller(2), "c");
-    assert!(refused.topic.is_none());
-    assert_eq!((refused.generation, none.generation), (2, 2));
+    let none = shared.lookup_as(&caller(3), "c");
+    assert!(refused.topic.is_none() && none.topic.is_none());
+    assert_eq!((refused.generation, none.generation), (i64::MIN, 2));
 }
 
 #[test]

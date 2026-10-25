@@ -4,6 +4,7 @@
 //! The client side of a registry of topic names (plan 15 §12.5).
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rsbinder::{hub, BinderResult, Interface, SIBinder, StatusCode, Strong};
@@ -24,6 +25,9 @@ use crate::resolve::{Advertisement, Resolver, Watch};
 /// is the registry's `lookup`. Every topic and every answer carries the registry's generation,
 /// and the watch passes on none older than one it has seen: a notice still queued for this
 /// process, older than an answer the watch already used, does not take a subscriber back to it.
+/// The calls of one watch run one at a time, in the order of their generations. A call may drop
+/// its own [`Watch`]; dropping a watch does not wait for a call running on another thread, and
+/// none begins after it.
 ///
 /// A notice is a call into this process: it needs the binder thread pool
 /// (`rsbinder::ProcessState::start_thread_pool`), without which a watch hears only its reply.
@@ -75,7 +79,13 @@ impl fmt::Debug for RegistryResolver {
 impl Resolver for RegistryResolver {
     fn advertise(&self, name: &str, topic: SIBinder) -> BinderResult<Advertisement> {
         let topic: Strong<dyn ITopic> = topic.into_interface()?;
-        self.registry.r#advertise(name, &topic)?;
+        if let Err(status) = self.registry.r#advertise(name, &topic) {
+            // A reply that failed on its way here leaves the name in the registry.
+            if let Err(withdrawn) = self.registry.r#withdraw(name, &topic) {
+                log::warn!("topic registry: withdrawing {name:?} failed: {withdrawn}");
+            }
+            return Err(status);
+        }
         Ok(Advertisement::new(Advertised {
             registry: self.registry.clone(),
             name: name.to_owned(),
@@ -96,6 +106,7 @@ impl Resolver for RegistryResolver {
         let reply = match self.registry.r#watch(name, &watcher) {
             Ok(reply) => reply,
             Err(status) => {
+                newest.end();
                 // A reply that failed on its way here leaves the watch in the registry.
                 let _ = self.registry.r#unwatch(name, &watcher);
                 return Err(status);
@@ -183,39 +194,35 @@ impl ITopicWatcher for Notices {
 
 /// The newest generation one watch has seen, and what it lets through (plan 15 D14-c).
 pub(super) struct Newest<T> {
-    seen: Mutex<Seen>,
+    /// The newest generation seen.
+    seen: Mutex<i64>,
+    /// Apart from `seen`: a callback that drops its own watch ends it without taking that lock.
+    ended: AtomicBool,
     on_heard: Box<dyn Fn(T) + Send + Sync>,
-}
-
-struct Seen {
-    generation: i64,
-    ended: bool,
 }
 
 impl<T> Newest<T> {
     pub(super) fn new(on_heard: Box<dyn Fn(T) + Send + Sync>) -> Self {
         Self {
-            seen: Mutex::new(Seen {
-                generation: i64::MIN,
-                ended: false,
-            }),
+            seen: Mutex::new(i64::MIN),
+            ended: AtomicBool::new(false),
             on_heard,
         }
     }
 
     /// Whether `generation` is no older than any seen, which it then is the newest of.
-    fn newer(seen: &mut Seen, generation: i64) -> bool {
-        if seen.ended || generation < seen.generation {
+    fn newer(&self, seen: &mut i64, generation: i64) -> bool {
+        if self.ended.load(Ordering::Acquire) || generation < *seen {
             return false;
         }
-        seen.generation = generation;
+        *seen = generation;
         true
     }
 
     /// A notice or the reply: passed on unless older, under the lock so the calls keep its order.
     pub(super) fn heard(&self, topic: Option<T>, generation: i64) {
         let mut seen = self.seen.lock().expect("lock poisoned");
-        if Self::newer(&mut seen, generation) {
+        if self.newer(&mut seen, generation) {
             if let Some(topic) = topic {
                 (self.on_heard)(topic);
             }
@@ -225,14 +232,12 @@ impl<T> Newest<T> {
     /// A lookup's answer: `None` when older than one seen, as a notice since has the name's topic.
     pub(super) fn answer(&self, topic: Option<T>, generation: i64) -> Option<T> {
         let mut seen = self.seen.lock().expect("lock poisoned");
-        Self::newer(&mut seen, generation)
-            .then_some(topic)
-            .flatten()
+        self.newer(&mut seen, generation).then_some(topic).flatten()
     }
 
-    /// Pass nothing on from now.
+    /// Pass nothing on from now, without the lock: a running call, the caller's own too, goes on.
     fn end(&self) {
-        self.seen.lock().expect("lock poisoned").ended = true;
+        self.ended.store(true, Ordering::Release);
     }
 }
 
@@ -278,6 +283,16 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_answer_holds_back_no_later_answer() {
+        let (newest, heard) = newest();
+        newest.heard(Some(1), 5);
+        assert_eq!(newest.answer(None, i64::MIN), None);
+        assert_eq!(newest.answer(Some(2), 5), Some(2));
+        newest.heard(Some(3), 5);
+        assert_eq!(all(&heard), [1, 3]);
+    }
+
+    #[test]
     fn an_answer_older_than_a_notice_is_none_and_a_newer_one_holds_back_older_notices() {
         let (newest, heard) = newest();
         newest.heard(Some(1), 5);
@@ -295,6 +310,31 @@ mod tests {
         newest.heard(Some(1), 1);
         assert_eq!(newest.answer(Some(1), 2), None);
         assert_eq!(all(&heard), []);
+    }
+
+    /// A callback that ends its own watch, as by dropping the `Watch`, returns and ends it.
+    #[test]
+    fn a_callback_ends_its_own_watch() {
+        let newest = Arc::new_cyclic(|weak: &std::sync::Weak<Newest<u32>>| {
+            let weak = weak.clone();
+            Newest::new(Box::new(move |_| {
+                if let Some(newest) = weak.upgrade() {
+                    newest.end();
+                }
+            }))
+        });
+        let (done, returned) = mpsc::channel();
+        std::thread::spawn({
+            let newest = newest.clone();
+            move || {
+                newest.heard(Some(1), 1);
+                done.send(()).unwrap();
+            }
+        });
+        assert!(returned
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_ok());
+        assert_eq!(newest.answer(Some(2), 2), None);
     }
 
     /// The callback runs under the lock: one that is running holds back the next call.

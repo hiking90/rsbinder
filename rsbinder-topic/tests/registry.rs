@@ -212,6 +212,25 @@ fn a_watch_drops_older_notices_and_ends_what_it_began() {
     assert_eq!(fake.says(), "withdrawn 1");
 }
 
+/// A failed advertise withdraws the name the registry may keep, like a failed watch (D13-f).
+#[test]
+#[ignore = "needs a binder device and rsb_hub"]
+fn a_failed_advertise_withdraws_its_name() {
+    init();
+    let registry = registry_name("refused");
+    let mut fake = Peer::spawn("fake", &registry);
+    assert_eq!(fake.says(), "ready");
+    let resolver = resolver(&registry);
+    let name = name("refused");
+    fake.tell("refuse-advertise");
+    assert_eq!(fake.says(), "ok");
+    let policy = PublisherPolicy::default();
+    let refused = Publisher::<Bytes>::advertise_with(&name, &policy, &resolver).unwrap_err();
+    assert_eq!(refused.exception_code(), ExceptionCode::Security);
+    assert_eq!(fake.says(), "advertised 0");
+    assert_eq!(fake.says(), "withdrawn 0");
+}
+
 /// AC-15.5.6, plan 15 D8: connections outlive the host; a new one knows only new publishers.
 #[test]
 #[ignore = "needs a binder device and rsb_hub"]
@@ -253,8 +272,13 @@ fn child() {
     let registry = || resolver(&std::env::var(REGISTRY).unwrap());
     match role.to_str().unwrap() {
         "host" => {
-            // One binder thread, this one, as `rsb_hub` runs.
-            ProcessState::init(rsbinder::DEFAULT_BINDER_PATH, 0).unwrap();
+            // One binder thread, this one, as `rsb_hub` runs; the device `init_default` opens.
+            let device = if std::path::Path::new(rsbinder::DEFAULT_BINDER_PATH).exists() {
+                rsbinder::DEFAULT_BINDER_PATH
+            } else {
+                rsbinder::LEGACY_BINDER_PATH
+            };
+            ProcessState::init(device, 0).unwrap();
             let host = Registry::new(AllowAll);
             hub::add_service(&name, host.as_binder()).unwrap();
             std::thread::spawn(|| {
@@ -316,12 +340,13 @@ struct FakeState {
     topics: Vec<Strong<dyn ITopic>>,
     watch: Option<(String, Strong<dyn ITopicWatcher>)>,
     refuse_watch: bool,
+    refuse_advertise: bool,
 }
 
 /// The generation of the fake's `watch` reply.
 const REPLY_GENERATION: i64 = 4;
 
-/// `notify I G` sends the watch topic I with generation G; `refuse-watch` refuses the next watch.
+/// `notify I G` sends the watch topic I with generation G; `refuse-*` fails the next such call.
 fn fake_command(state: &Mutex<FakeState>, line: &str) {
     let mut state = state.lock().unwrap();
     let words: Vec<&str> = line.split_whitespace().collect();
@@ -338,6 +363,10 @@ fn fake_command(state: &Mutex<FakeState>, line: &str) {
             state.refuse_watch = true;
             say("ok");
         }
+        ["refuse-advertise"] => {
+            state.refuse_advertise = true;
+            say("ok");
+        }
         other => panic!("no command {other:?}"),
     }
 }
@@ -349,6 +378,10 @@ impl ITopicRegistry for Fake {
         let mut state = self.0.lock().unwrap();
         state.topics.push(topic.clone());
         say(&format!("advertised {}", state.topics.len() - 1));
+        // The name is kept, as when only the reply failed.
+        if std::mem::take(&mut state.refuse_advertise) {
+            return Err(Status::from(ExceptionCode::Security));
+        }
         Ok(())
     }
 

@@ -98,8 +98,9 @@ Each item below changes what a 0.12.0 program observes.
     manager name, the subscriber reconnecting to whichever publisher holds
     it (`RecvError::Disconnected` between connections). A registration
     notice the subscriber missed (a oneway call, lost when the process has no
-    room for it) is made up by one `check_service` when a publisher ends, or
-    refuses as ended, with no other binder for the name. `Resolver`
+    room for it) is made up by a `check_service` when a publisher ends, or
+    refuses as ended, with no other binder for the name; it asks once more
+    when a notice during the call gives the name a binder it cannot use. `Resolver`
     (`Advertisement`, `Watch::with_lookup`) puts the names somewhere else; a
     `Publisher` drops the `Advertisement` its resolver returned in `close`, or
     as it drops, before its end record.

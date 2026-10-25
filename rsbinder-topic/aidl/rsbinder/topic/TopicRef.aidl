@@ -13,7 +13,8 @@ parcelable TopicRef {
     @nullable ITopic topic;
     /**
      * The registry's generation when the name was given to `topic`; with no
-     * topic, the generation when the answer was made.
+     * topic, the generation when the answer was made, or `Long.MIN_VALUE` when
+     * the caller may not subscribe to the name.
      */
     long generation;
 }

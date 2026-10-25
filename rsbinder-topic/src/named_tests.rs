@@ -1658,6 +1658,34 @@ fn a_notice_of_a_refused_binder_during_the_lookup_asks_once_more() {
     assert_eq!(names.lookups(), 3);
 }
 
+/// A notice of the refused binder itself during the lookup is a notice too: asked once more.
+#[test]
+fn a_notice_that_gives_the_name_back_to_the_refused_binder_during_the_lookup_asks_once_more() {
+    let names = Names::looking();
+    let (_closed, refused, _) = closed_counted();
+    names.give(NAME, refused.clone());
+    let former = Publisher::<Bytes>::new(&policy()).unwrap();
+    let (hook, calls) = (names.clone(), AtomicUsize::new(0));
+    let answer = former.as_binder();
+    names.before_lookup(move || match calls.fetch_add(1, Ordering::SeqCst) {
+        // The answer is `former`, read before the closed binder was given the name again.
+        0 => {
+            hook.give(NAME, refused.clone());
+            hook.withhold(NAME, answer.clone());
+        }
+        // The name has the closed binder now.
+        _ => hook.withhold(NAME, refused.clone()),
+    });
+    let mut subscriber = subscribe(&names);
+    looked(&names, 2);
+    assert!(!subscriber.wait_connected(Duration::ZERO));
+    assert_eq!(former.subscriber_count(), 0);
+    let next = advertise(&names, &policy());
+    connected(&subscriber);
+    next.publish(&bytes(6)).unwrap();
+    assert_eq!(recv(&mut subscriber), Ok(bytes(6)));
+}
+
 /// AC-15.5.6 (4): an answer that is the refused binder is not asked again.
 #[test]
 fn a_lookup_that_answers_the_refused_binder_leaves_the_subscriber_waiting() {

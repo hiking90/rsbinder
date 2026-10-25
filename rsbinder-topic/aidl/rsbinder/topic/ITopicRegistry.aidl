@@ -18,7 +18,9 @@ import rsbinder.topic.TopicRef;
  * A refusal by the policy is `EX_SECURITY`, a name outside the service name
  * rule (1 to 127 bytes of `[A-Za-z0-9._/-]`) is `EX_ILLEGAL_ARGUMENT`, and
  * the other refusals are the constants below. `lookup` answers a refused
- * caller as it answers a name with no topic. A binder of the call (the
+ * caller with a null topic, as for a name with no topic, but with the
+ * generation `Long.MIN_VALUE`: older than any change, it does not hold back
+ * the answers the caller gets once let in again. A binder of the call (the
  * topic, the watcher) whose death the registry cannot be told of, as it is
  * dead, is `EX_ILLEGAL_STATE`, as the service manager answers it: a
  * `DEAD_OBJECT` status would read as the registry's own death.

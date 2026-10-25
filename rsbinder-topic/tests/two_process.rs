@@ -32,7 +32,7 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::fs::FileExt;
 use std::time::{Duration, Instant};
 
-use common::{eventually, init, name, signal, Peer, NAME, ROLE, WAIT};
+use common::{eventually, init, name, say, signal, wait_for_eof, Peer, NAME, ROLE, WAIT};
 use rsbinder::fmq::shm::{self, CreateOptions, Seals};
 use rsbinder::{hub, ExceptionCode, Interface, ParcelFileDescriptor, SIBinder, StatusCode};
 use rsbinder_topic::aidl::ITopic::{ITopic, ERROR_VERSION};
@@ -186,7 +186,7 @@ fn subscribers_killed_while_they_subscribe_leave_nothing() {
         // Some of the dropped ones wait for a commit; one keeps the list short.
         publisher.publish(&Bytes(Vec::new())).unwrap();
     }
-    // The last kill came after the last publish: its death notification takes it out.
+    // The last kill's subscribe may land after the last publish: its death takes it out.
     eventually("every page unmapped", || memfds() == before);
     assert_eq!(publisher.subscriber_count(), 0);
 }
@@ -679,16 +679,6 @@ fn child() {
     };
     init();
     let name = std::env::var(NAME).unwrap();
-    let say = |line: &str| println!("topic: {line}");
-    let wait_for_eof = || {
-        let mut line = String::new();
-        while std::io::stdin()
-            .read_line(&mut line)
-            .is_ok_and(|read| read != 0)
-        {
-            line.clear();
-        }
-    };
     match role.to_str().unwrap() {
         "subscribe" => {
             let topic = hub::check_service(&name).unwrap();
@@ -846,7 +836,7 @@ fn raw_request(token: SIBinder) -> SubscribeRequest {
     }
 }
 
-/// A control page of layout 0.2 with no pin words, as a subscriber makes it.
+/// A control page of the crate's layout with no pin words, as a subscriber makes it.
 fn control_page() -> OwnedFd {
     let options = CreateOptions::new("rsbinder-topic-test").populate(true);
     let file = File::from(shm::create(0x80, &options).unwrap());

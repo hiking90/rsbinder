@@ -142,8 +142,9 @@ manager's registration notices, which Android 10's service manager does not
 have: there `NamedSubscriber::subscribe` fails. A notice is a oneway call,
 which the kernel fails when the subscriber's process has no room left for one;
 when a publisher ends, or refuses as ended, with no other binder for the name,
-the subscriber asks the service manager once (`check_service`) for the binder
-the name has.
+the subscriber asks the service manager (`check_service`) for the binder the
+name has. It asks once more only when a notice that came during the call gave
+the name a binder it cannot use, one it refused or that ended.
 
 ## Losing records, and backpressure
 

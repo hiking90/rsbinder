@@ -206,11 +206,6 @@ impl<T: Key, W: Key> Table<T, W> {
         }
     }
 
-    /// The generation now: what [`lookup`](Self::lookup) answers for a name with no topic.
-    pub(crate) fn generation(&self) -> u64 {
-        self.generation
-    }
-
     /// Watch `name` for `caller`; what [`lookup`](Self::lookup) answers, the reply of the watch.
     pub(crate) fn watch(
         &mut self,
