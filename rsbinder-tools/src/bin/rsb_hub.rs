@@ -86,6 +86,16 @@ fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// AOSP `main.cpp`'s `addService("manager", ...)`.
 const SELF_SERVICE_NAME: &str = "manager";
 
+/// Names the hub registers at startup and refuses to every transaction's `add`, `allow_all` too.
+#[cfg(feature = "topic")]
+const RESERVED_NAMES: &[&str] = &[rsbinder_topic::aidl::ITopicRegistry::SERVICE_NAME];
+#[cfg(not(feature = "topic"))]
+const RESERVED_NAMES: &[&str] = &[];
+
+fn is_reserved(name: &str) -> bool {
+    RESERVED_NAMES.contains(&name)
+}
+
 /// Per-name callback cap, in place of AOSP's SELinux/uid admission that rsb_hub lacks.
 const MAX_CALLBACKS_PER_NAME: usize = 256;
 
@@ -430,6 +440,9 @@ struct ServiceManager {
     enforcer: Arc<Enforcer>,
     /// Brings a declared service up when a lookup misses it.
     activator: Activator,
+    /// The topic registry `main` registers; read by `dump` only.
+    #[cfg(feature = "topic")]
+    topics: Option<rsbinder_topic::registry::Registry>,
 }
 
 impl ServiceManager {
@@ -454,6 +467,8 @@ impl ServiceManager {
             allow_cross_uid_overwrite,
             enforcer,
             activator,
+            #[cfg(feature = "topic")]
+            topics: None,
         };
 
         this.run_death_receiver(death_receiver);
@@ -544,9 +559,12 @@ impl ServiceManager {
         permission: Permission,
         name: &str,
     ) -> bool {
+        let add = permission == Permission::Add;
         match caller {
+            // A reserved name taken over would hand every client the taker's binder.
+            Some(_) if add && is_reserved(name) => false,
             Some(caller) => self.enforcer.check_caller(permission, name, caller),
-            None => permission == Permission::Add && name == SELF_SERVICE_NAME,
+            None => add && (name == SELF_SERVICE_NAME || is_reserved(name)),
         }
     }
 
@@ -568,8 +586,13 @@ impl ServiceManager {
             return Ok(());
         }
         let ctx = rsbinder::thread_state::CallingContext::default();
+        let why = if permission == Permission::Add && is_reserved(name) {
+            "rsb_hub reserves the name and refused"
+        } else {
+            "policy denied"
+        };
         let msg = format!(
-            "policy denied {permission} on {name:?} for uid={} (pid={})",
+            "{why} {permission} on {name:?} for uid={} (pid={})",
             ctx.uid, ctx.pid
         );
         log::warn!("{msg}");
@@ -585,6 +608,40 @@ impl ServiceManager {
     ) -> bool {
         !allow_cross_uid_overwrite && !same_binder && existing_uid != caller_uid
     }
+}
+
+/// The topic registry's policy: `[[topic]]` and `[global] topics` through the hub's enforcer.
+#[cfg(feature = "topic")]
+struct TopicAccess(Arc<Enforcer>);
+
+#[cfg(feature = "topic")]
+impl rsbinder_topic::registry::RegistryAccess for TopicAccess {
+    fn allows(
+        &self,
+        action: rsbinder_topic::registry::Action,
+        name: &str,
+        caller: &rsbinder::Caller,
+    ) -> bool {
+        use rsbinder_topic::registry::Action;
+        let permission = match action {
+            Action::Advertise => config::TopicPermission::Advertise,
+            Action::Subscribe => config::TopicPermission::Subscribe,
+            Action::List => config::TopicPermission::List,
+            // `Action` is `#[non_exhaustive]`: what this hub does not know, it refuses.
+            _ => return false,
+        };
+        self.0.check_topic(permission, name, caller)
+    }
+}
+
+/// What a dump says of the topic registry.
+#[cfg(feature = "topic")]
+struct TopicDump {
+    /// Whether the registry's name holds the registry's binder.
+    registered: bool,
+    /// `None` when running under `--insecure-allow-all`.
+    rules: Option<usize>,
+    stats: rsbinder_topic::registry::RegistryStats,
 }
 
 /// Copied out of the lock: the `find` filter can hit the name service.
@@ -613,6 +670,8 @@ struct DumpSnapshot {
     filter: Vec<String>,
     /// Names the snapshot dropped because the caller may not `find` them.
     hidden: usize,
+    #[cfg(feature = "topic")]
+    topics: Option<TopicDump>,
 }
 
 /// Empty passes all; else a substring of any arg, so the hub needs no pattern syntax.
@@ -637,6 +696,10 @@ fn render_dump(w: &mut dyn std::io::Write, snap: &DumpSnapshot) -> std::io::Resu
     }
     if snap.hidden > 0 {
         writeln!(w, "hidden by policy: {} name(s)", snap.hidden)?;
+    }
+    #[cfg(feature = "topic")]
+    if let Some(topics) = &snap.topics {
+        render_topics(w, topics)?;
     }
 
     writeln!(w)?;
@@ -680,6 +743,41 @@ fn render_dump(w: &mut dyn std::io::Write, snap: &DumpSnapshot) -> std::io::Resu
     Ok(())
 }
 
+/// One `key=value` per counter, so a script reads `notices_failed` without parsing prose.
+#[cfg(feature = "topic")]
+fn render_topics(w: &mut dyn std::io::Write, topics: &TopicDump) -> std::io::Result<()> {
+    let name = rsbinder_topic::aidl::ITopicRegistry::SERVICE_NAME;
+    let registered = if topics.registered {
+        "registered"
+    } else {
+        "NOT registered"
+    };
+    match topics.rules {
+        Some(rules) => writeln!(
+            w,
+            "topic registry: {registered} as {name}, {rules} topic rule(s)"
+        )?,
+        None => writeln!(
+            w,
+            "topic registry: {registered} as {name}, access control DISABLED"
+        )?,
+    }
+    let s = &topics.stats;
+    writeln!(
+        w,
+        "  topics={} watched={} watchers={} notices_sent={} notices_failed={} \
+         notices_retried={} owed={} owed_dropped={}",
+        s.topics,
+        s.watched,
+        s.watchers,
+        s.notices_sent,
+        s.notices_failed,
+        s.notices_retried,
+        s.owed,
+        s.owed_dropped,
+    )
+}
+
 fn yes_no(b: bool) -> &'static str {
     if b {
         "yes"
@@ -696,8 +794,18 @@ impl ServiceManager {
             map.get(name).map_or(0, |v| v.len())
         }
 
+        #[cfg(feature = "topic")]
+        let mut registered = false;
         let (mut rows, mut awaited, death_subscriptions) = {
             let inner = lock_recover(&self.inner);
+            #[cfg(feature = "topic")]
+            if let Some(registry) = &self.topics {
+                let name = rsbinder_topic::aidl::ITopicRegistry::SERVICE_NAME;
+                registered = inner
+                    .name_to_service
+                    .get(name)
+                    .is_some_and(|service| service.binder == registry.as_binder());
+            }
             let rows: Vec<DumpRow> = inner
                 .name_to_service
                 .iter()
@@ -750,6 +858,12 @@ impl ServiceManager {
             declarations: config.declarations.len(),
             filter,
             hidden,
+            #[cfg(feature = "topic")]
+            topics: self.topics.as_ref().map(|registry| TopicDump {
+                registered,
+                rules: (!self.enforcer.is_allow_all()).then(|| config.topics.rules.len()),
+                stats: registry.stats(),
+            }),
         }
     }
 }
@@ -1554,6 +1668,20 @@ fn spawn_signal_thread(reloadable: Option<Reloadable>, notifier: Arc<Notifier>) 
     }
 }
 
+/// What a loaded configuration holds, for the startup and reload logs and the status line.
+fn summary(config: &config::Config) -> String {
+    let topics = if cfg!(feature = "topic") {
+        format!(", {} topic rule(s)", config.topics.rules.len())
+    } else {
+        String::new()
+    };
+    format!(
+        "{} rule(s){topics}, {} service declaration(s)",
+        config.policy.rules.len(),
+        config.declarations.len()
+    )
+}
+
 /// One SIGHUP's worth of work.
 fn reload(reloadable: Option<&Reloadable>, notifier: &Notifier) {
     let Some(Reloadable { enforcer, path }) = reloadable else {
@@ -1562,17 +1690,10 @@ fn reload(reloadable: Option<&Reloadable>, notifier: &Notifier) {
     };
     match config::load(path, &SystemResolver) {
         Ok(loaded) => {
-            let rules = loaded.policy.rules.len();
-            let services = loaded.declarations.len();
+            let summary = summary(&loaded);
             enforcer.replace(loaded);
-            log::info!(
-                "rsb_hub: SIGHUP reloaded {rules} rule(s) and {services} \
-                 service declaration(s) from {}",
-                path.display()
-            );
-            notifier.status(&format!(
-                "serving; {rules} rule(s), {services} declaration(s)"
-            ));
+            log::info!("rsb_hub: SIGHUP reloaded {summary} from {}", path.display());
+            notifier.status(&format!("serving; {summary}"));
         }
         Err(err) => log::error!(
             "rsb_hub: SIGHUP reload of {} failed, keeping the policy already in \
@@ -1692,21 +1813,18 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         )
     } else {
         let path = config_path.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_DIR));
-        let (enforcer, rules, services) = match config::load(&path, &SystemResolver) {
+        let (enforcer, summary) = match config::load(&path, &SystemResolver) {
             Ok(loaded) => {
-                let (rules, services) = (loaded.policy.rules.len(), loaded.declarations.len());
-                log::info!(
-                    "rsb_hub: loaded {rules} rule(s) and {services} service declaration(s) from {}",
-                    path.display()
-                );
-                (Arc::new(Enforcer::enforcing(loaded)), rules, services)
+                let summary = summary(&loaded);
+                log::info!("rsb_hub: loaded {summary} from {}", path.display());
+                (Arc::new(Enforcer::enforcing(loaded)), summary)
             }
             Err(err) => exit_without_config(&path, &err),
         };
         (
             Arc::clone(&enforcer),
             Some(Reloadable { enforcer, path }),
-            format!("serving; {rules} rule(s), {services} declaration(s)"),
+            format!("serving; {summary}"),
         )
     };
     spawn_signal_thread(reloadable, Arc::clone(&notifier));
@@ -1716,11 +1834,20 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // 0 = AOSP's `setThreadPoolMaxThreadCount(0)`: single-threaded like `servicemanager`.
     ProcessState::init(&binder_path, 0)?;
 
-    // Create a binder service.
-    let service = BnServiceManager::new_binder(ServiceManager::new(
-        allow_cross_uid_overwrite,
-        Arc::clone(&enforcer),
-    ));
+    #[cfg_attr(
+        not(feature = "topic"),
+        expect(unused_mut, reason = "only `topic` sets a field")
+    )]
+    let mut manager = ServiceManager::new(allow_cross_uid_overwrite, Arc::clone(&enforcer));
+    #[cfg(feature = "topic")]
+    let registry = {
+        let registry = rsbinder_topic::registry::Registry::new(TopicAccess(Arc::clone(&enforcer)))
+            .allow_cross_uid_overwrite(allow_cross_uid_overwrite);
+        let binder = registry.as_binder();
+        manager.topics = Some(registry);
+        binder
+    };
+    let service = BnServiceManager::new_binder(manager);
     // Non-fatal, as AOSP `main.cpp`: clients reach the hub through handle 0 regardless.
     if let Err(e) = service.addService(
         SELF_SERVICE_NAME,
@@ -1729,6 +1856,17 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         DUMP_FLAG_PRIORITY_DEFAULT,
     ) {
         log::error!("rsb_hub: could not self-register as '{SELF_SERVICE_NAME}': {e:?}");
+    }
+    // Before `READY=1`, so a unit ordered after the hub finds the registry.
+    #[cfg(feature = "topic")]
+    {
+        let name = rsbinder_topic::aidl::ITopicRegistry::SERVICE_NAME;
+        match service.addService(name, &registry, false, DUMP_FLAG_PRIORITY_DEFAULT) {
+            Ok(()) => log::info!("rsb_hub: serving the topic registry as '{name}'"),
+            Err(e) => {
+                log::error!("rsb_hub: could not register the topic registry as '{name}': {e:?}")
+            }
+        }
     }
 
     // The kernel enforces one context manager; the raw ioctl error does not name the cause.
@@ -2081,7 +2219,120 @@ mod tests {
             declarations: 0,
             filter: Vec::new(),
             hidden: 0,
+            #[cfg(feature = "topic")]
+            topics: None,
         }
+    }
+
+    fn kernel_caller(uid: u32) -> rsbinder::Caller {
+        rsbinder::Caller::Kernel {
+            uid,
+            pid: 4242,
+            sid: None,
+        }
+    }
+
+    /// Only startup, which runs outside any transaction, may add the hub's own names.
+    #[test]
+    fn a_transaction_may_add_no_reserved_name_even_allowed_all() {
+        let manager = ServiceManager::new(false, Arc::new(Enforcer::allow_all()));
+        let caller = kernel_caller(0);
+        for name in RESERVED_NAMES {
+            assert!(
+                !manager.allows_as(Some(&caller), Permission::Add, name),
+                "{name}"
+            );
+            assert!(
+                manager.allows_as(Some(&caller), Permission::Find, name),
+                "{name}"
+            );
+            assert!(manager.allows_as(None, Permission::Add, name), "{name}");
+        }
+        assert!(manager.allows_as(None, Permission::Add, SELF_SERVICE_NAME));
+        assert!(manager.allows_as(Some(&caller), Permission::Add, SELF_SERVICE_NAME));
+        assert!(!manager.allows_as(None, Permission::Add, "other"));
+        assert!(!manager.allows_as(None, Permission::Find, SELF_SERVICE_NAME));
+    }
+
+    /// Without the feature the registry's name is a service name like any other.
+    #[cfg(not(feature = "topic"))]
+    #[test]
+    fn without_topic_the_registry_name_is_not_reserved() {
+        let manager = ServiceManager::new(false, Arc::new(Enforcer::allow_all()));
+        let name = "rsbinder.topic.registry";
+        assert!(manager.allows_as(Some(&kernel_caller(0)), Permission::Add, name));
+        assert!(!manager.allows_as(None, Permission::Add, name));
+    }
+
+    #[cfg(feature = "topic")]
+    #[test]
+    fn the_reserved_name_is_the_topic_registry() {
+        assert_eq!(
+            RESERVED_NAMES,
+            [rsbinder_topic::aidl::ITopicRegistry::SERVICE_NAME]
+        );
+    }
+
+    /// Each action reaches its own topic permission, and none a service permission.
+    #[cfg(feature = "topic")]
+    #[test]
+    fn the_registry_asks_the_topic_rules() {
+        use rsbinder_tools::config::{NamePattern, Subjects, TopicRule};
+        use rsbinder_topic::registry::{Action, RegistryAccess};
+        let topic_rule = |advertise: u32, subscribe: u32, list: u32| {
+            let mut config = config::Config::default();
+            config.topics.list = Subjects::set([list], []);
+            config.topics.rules = vec![TopicRule {
+                pattern: NamePattern::Any,
+                advertise: Subjects::set([advertise], []),
+                subscribe: Subjects::set([subscribe], []),
+            }];
+            config.policy.list = Subjects::Any;
+            TopicAccess(Arc::new(Enforcer::enforcing(config)))
+        };
+        let access = topic_rule(1, 2, 3);
+        for (uid, allowed) in [
+            (1, [true, false, false]),
+            (2, [false, true, false]),
+            (3, [false, false, true]),
+        ] {
+            let caller = kernel_caller(uid);
+            let got = [Action::Advertise, Action::Subscribe, Action::List]
+                .map(|action| access.allows(action, "t", &caller));
+            assert_eq!(got, allowed, "uid {uid}");
+        }
+    }
+
+    #[cfg(feature = "topic")]
+    #[test]
+    fn a_dump_reports_the_topic_registry_and_its_counters() {
+        let mut stats = rsbinder_topic::registry::RegistryStats::default();
+        stats.topics = 2;
+        stats.notices_failed = 7;
+        stats.owed = 3;
+        let mut snap = empty_snapshot();
+        snap.topics = Some(TopicDump {
+            registered: true,
+            rules: Some(4),
+            stats,
+        });
+        let out = dump_to_string(&snap);
+        assert!(
+            out.contains("topic registry: registered as rsbinder.topic.registry, 4 topic rule(s)"),
+            "{out}"
+        );
+        assert!(out.contains(" topics=2 "), "{out}");
+        assert!(out.contains(" notices_failed=7 "), "{out}");
+        assert!(out.contains(" owed=3 "), "{out}");
+
+        snap.topics = Some(TopicDump {
+            registered: false,
+            rules: None,
+            stats,
+        });
+        let out = dump_to_string(&snap);
+        assert!(out.contains("NOT registered"), "{out}");
+        assert!(out.contains("access control DISABLED"), "{out}");
     }
 
     /// A broken caller fd answers OK: `DEAD_OBJECT` (`-EPIPE`) would mark rsb_hub dead in AOSP.

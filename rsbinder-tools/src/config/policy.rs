@@ -287,6 +287,104 @@ impl Policy {
     }
 }
 
+/// The three permissions a topic policy governs, those of the topic registry `rsb_hub` serves
+/// with its `topic` feature (`rsbinder_topic::registry::Action`).
+///
+/// Topic names are a namespace of their own: a [`Rule`] never grants one of these, and a
+/// [`TopicRule`] never grants a [`Permission`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TopicPermission {
+    /// Give a name to a topic. Gates `advertise`; a `withdraw` needs the uid and the topic
+    /// that hold the name, not this.
+    Advertise,
+    /// Find the topic a name has, or watch it. Gates `lookup`, `watch` and every notice a
+    /// watch is sent.
+    Subscribe,
+    /// Enumerate topic names at all. A single global gate, as [`Permission::List`]; the
+    /// entries `list` returns are additionally filtered by [`Self::Subscribe`].
+    List,
+}
+
+impl fmt::Display for TopicPermission {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            TopicPermission::Advertise => "advertise",
+            TopicPermission::Subscribe => "subscribe",
+            TopicPermission::List => "list",
+        })
+    }
+}
+
+/// One `[[topic]]` rule: a name pattern plus who may `advertise` and who may `subscribe` to
+/// topic names it covers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopicRule {
+    /// Topic names this rule governs.
+    pub pattern: NamePattern,
+    /// Who may give a covered name to a topic.
+    pub advertise: Subjects,
+    /// Who may find or watch a covered name.
+    pub subscribe: Subjects,
+}
+
+impl TopicRule {
+    /// A rule that grants nothing.
+    pub fn deny_all(pattern: NamePattern) -> TopicRule {
+        TopicRule {
+            pattern,
+            advertise: Subjects::None,
+            subscribe: Subjects::None,
+        }
+    }
+}
+
+/// The policy of topic names: the global `[global] topics` gate plus an ordered rule list,
+/// evaluated as a [`Policy`] is (first matching rule decides, no match denies).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TopicPolicy {
+    /// Who may enumerate topic names at all.
+    pub list: Subjects,
+    /// Rules in evaluation order (policy files sorted by filename, rules in file order).
+    pub rules: Vec<TopicRule>,
+}
+
+impl TopicPolicy {
+    /// May `subject` exercise `permission` on the topic name `name`? See [`Policy::check`].
+    pub fn check(&self, permission: TopicPermission, name: &str, subject: &Subject) -> bool {
+        self.check_parts(permission, name, subject.uid, &subject.gids)
+    }
+
+    /// [`check`](Self::check) for a subject held as parts.
+    pub(crate) fn check_parts(
+        &self,
+        permission: TopicPermission,
+        name: &str,
+        uid: u32,
+        gids: &BTreeSet<u32>,
+    ) -> bool {
+        self.subjects_for(permission, name)
+            .is_some_and(|subjects| subjects.allows_parts(uid, gids))
+    }
+
+    /// Could a larger group set change the answer? See [`Policy::group_could_grant`].
+    pub fn group_could_grant(&self, permission: TopicPermission, name: &str) -> bool {
+        matches!(
+            self.subjects_for(permission, name),
+            Some(Subjects::Set { gids, .. }) if !gids.is_empty()
+        )
+    }
+
+    /// The set that governs `permission` on `name`; `None` when no rule covers it.
+    fn subjects_for(&self, permission: TopicPermission, name: &str) -> Option<&Subjects> {
+        let rule = || self.rules.iter().find(|rule| rule.pattern.matches(name));
+        match permission {
+            TopicPermission::List => Some(&self.list),
+            TopicPermission::Advertise => rule().map(|rule| &rule.advertise),
+            TopicPermission::Subscribe => rule().map(|rule| &rule.subscribe),
+        }
+    }
+}
+
 /// Why a policy could not be built.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PolicyError {
@@ -519,5 +617,64 @@ mod tests {
         policy.list = Subjects::set([], [50]);
         assert!(policy.group_could_grant(Permission::List, "other"));
         assert!(!Policy::deny_all().group_could_grant(Permission::Find, "other"));
+    }
+
+    fn topic_policy() -> TopicPolicy {
+        TopicPolicy {
+            list: Subjects::set([], [50]),
+            rules: vec![
+                TopicRule {
+                    pattern: NamePattern::parse("sensors.*").unwrap(),
+                    advertise: Subjects::set([1000], []),
+                    subscribe: Subjects::set([], [60]),
+                },
+                TopicRule {
+                    pattern: NamePattern::Any,
+                    advertise: Subjects::Any,
+                    subscribe: Subjects::Any,
+                },
+            ],
+        }
+    }
+
+    /// First match decides, as for service names: the catch-all never widens `sensors.*`.
+    #[test]
+    fn a_topic_rule_decides_its_names_and_the_global_gate_lists() {
+        let policy = topic_policy();
+        let sensord = subject(1000, &[]);
+        let reader = subject(2000, &[60]);
+        assert!(policy.check(TopicPermission::Advertise, "sensors.imu", &sensord));
+        assert!(!policy.check(TopicPermission::Advertise, "sensors.imu", &reader));
+        assert!(policy.check(TopicPermission::Subscribe, "sensors.imu", &reader));
+        assert!(!policy.check(TopicPermission::Subscribe, "sensors.imu", &sensord));
+        assert!(policy.check(TopicPermission::Advertise, "other", &reader));
+
+        assert!(policy.check(TopicPermission::List, "", &subject(3000, &[50])));
+        assert!(!policy.check(TopicPermission::List, "", &reader));
+        assert!(policy.group_could_grant(TopicPermission::Subscribe, "sensors.imu"));
+        assert!(!policy.group_could_grant(TopicPermission::Advertise, "sensors.imu"));
+        assert!(policy.group_could_grant(TopicPermission::List, "ignored"));
+    }
+
+    /// An empty topic policy, what a configuration without `[[topic]]` loads, denies root too.
+    #[test]
+    fn an_empty_topic_policy_denies_everything() {
+        let root = subject(0, &[0]);
+        for permission in [
+            TopicPermission::Advertise,
+            TopicPermission::Subscribe,
+            TopicPermission::List,
+        ] {
+            assert!(
+                !TopicPolicy::default().check(permission, "x", &root),
+                "{permission}"
+            );
+            assert!(!TopicPolicy::default().group_could_grant(permission, "x"));
+        }
+        let unmatched = TopicPolicy {
+            list: Subjects::None,
+            rules: vec![TopicRule::deny_all(NamePattern::Exact("a".into()))],
+        };
+        assert!(!unmatched.check(TopicPermission::Subscribe, "b", &root));
     }
 }

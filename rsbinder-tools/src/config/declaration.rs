@@ -230,6 +230,32 @@ mod tests {
         assert!(d.instances_of("com.example.IFoo").is_empty());
     }
 
+    /// `rsbinder-topic` keeps a copy of the rule, as it does not depend on this crate.
+    #[cfg(feature = "topic")]
+    #[test]
+    fn the_topic_registry_takes_the_names_add_service_takes() {
+        let mut names: Vec<String> = ["", "a", "é", "日本", "aé"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        for len in [126, 127, 128] {
+            names.push("a".repeat(len));
+        }
+        names.push(format!("{}é", "a".repeat(125)));
+        names.extend(
+            (0..=0xffu32)
+                .filter_map(char::from_u32)
+                .map(|c| format!("a{c}b")),
+        );
+        for name in &names {
+            assert_eq!(
+                rsbinder_topic::registry::is_valid_name(name),
+                is_valid_service_name(name),
+                "{name:?}"
+            );
+        }
+    }
+
     #[test]
     fn missing_metadata_reports_none() {
         let mut d = Declarations::default();

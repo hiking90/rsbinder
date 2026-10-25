@@ -263,8 +263,12 @@ jobs:
       - name: rsbinder-tools unit tests (hermetic)
         # The `rsb_hub` configuration parser, policy and enforcer, the NSS
         # and notify helpers, and the three binaries' own tests: none opens
-        # the binder device, so the whole package runs here.
-        run: cargo test -p rsbinder-tools
+        # the binder device, so the whole package runs here. Once more with
+        # `topic`: its `[[topic]]` parse, the reserved registry name and the
+        # name rule shared with `rsbinder-topic` are tested under that feature.
+        run: |
+          cargo test -p rsbinder-tools
+          cargo test -p rsbinder-tools --features topic
 
   rpc-suite:
     name: RPC Transport Suite

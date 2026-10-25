@@ -938,6 +938,7 @@ dependencies = [
  "libc",
  "log",
  "rsbinder",
+ "rsbinder-topic",
  "rustix",
  "serde",
  "thiserror",

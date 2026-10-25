@@ -9,12 +9,13 @@
 //! two fields they could drift: a SIGHUP that updated the rules but not the
 //! declarations would enforce one file against another.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, RwLock};
 
 use rsbinder::Caller;
 
 use super::parse::Config;
-use super::policy::{Permission, Subject};
+use super::policy::{Permission, Subject, TopicPermission};
 use crate::nss::GroupCache;
 
 /// Applies a [`Policy`](super::policy::Policy) to live callers.
@@ -119,19 +120,43 @@ impl Enforcer {
     /// may be incomplete (see [`GroupCache`]); that re-read happens at most
     /// once per [`GroupCache::MIN_REVALIDATE`] per uid.
     pub fn check_uid(&self, permission: Permission, name: &str, uid: u32) -> bool {
+        let config = self.config();
+        let policy = &config.policy;
+        self.judge(
+            uid,
+            |gids| policy.check_parts(permission, name, uid, gids),
+            || policy.group_could_grant(permission, name),
+        )
+    }
+
+    /// May `uid` exercise `permission` on the topic name `name`? Judged as
+    /// [`check_uid`](Self::check_uid) judges a service name, against
+    /// [`Config::topics`].
+    pub fn check_topic_uid(&self, permission: TopicPermission, name: &str, uid: u32) -> bool {
+        let config = self.config();
+        let topics = &config.topics;
+        self.judge(
+            uid,
+            |gids| topics.check_parts(permission, name, uid, gids),
+            || topics.group_could_grant(permission, name),
+        )
+    }
+
+    /// `allows` on the memoized groups, then on re-read ones if a group could lift the deny.
+    fn judge(
+        &self,
+        uid: u32,
+        allows: impl Fn(&BTreeSet<u32>) -> bool,
+        group_could_grant: impl FnOnce() -> bool,
+    ) -> bool {
         if self.allow_all {
             return true;
         }
-        let config = self.config();
-        let policy = &config.policy;
         // Judged against the memoized set in place; `subject_for` would copy it.
-        if policy.check_parts(permission, name, uid, &self.groups.gids_for(uid)) {
+        if allows(&self.groups.gids_for(uid)) {
             return true;
         }
-        if !policy.group_could_grant(permission, name) {
-            return false;
-        }
-        policy.check_parts(permission, name, uid, &self.groups.revalidate(uid))
+        group_could_grant() && allows(&self.groups.revalidate(uid))
     }
 
     /// May `caller` exercise `permission` on `name`?
@@ -145,6 +170,15 @@ impl Enforcer {
     pub fn check_caller(&self, permission: Permission, name: &str, caller: &Caller) -> bool {
         match uid_of(caller) {
             Some(uid) => self.check_uid(permission, name, uid),
+            None => false,
+        }
+    }
+
+    /// May `caller` exercise `permission` on the topic name `name`? A caller with no uid is
+    /// denied, as by [`check_caller`](Self::check_caller), in `--insecure-allow-all` mode too.
+    pub fn check_topic(&self, permission: TopicPermission, name: &str, caller: &Caller) -> bool {
+        match uid_of(caller) {
+            Some(uid) => self.check_topic_uid(permission, name, uid),
             None => false,
         }
     }
@@ -312,6 +346,82 @@ mod tests {
             assert!(enforcer.check_uid(Permission::Find, "svc", 7));
         }
         assert_eq!(calls(&counter), 1);
+    }
+
+    fn topics_allowing_group(gid: u32) -> Config {
+        Config {
+            topics: crate::config::TopicPolicy {
+                list: Subjects::None,
+                rules: vec![crate::config::TopicRule {
+                    pattern: NamePattern::Any,
+                    advertise: Subjects::None,
+                    subscribe: Subjects::set([], [gid]),
+                }],
+            },
+            ..Config::default()
+        }
+    }
+
+    /// Topic names are judged by `[[topic]]` alone: a service rule for every name opens none.
+    #[test]
+    fn topics_follow_their_own_rules() {
+        let enforcer = Enforcer::from_policy(policy_allowing_uid(7));
+        for permission in [
+            TopicPermission::Advertise,
+            TopicPermission::Subscribe,
+            TopicPermission::List,
+        ] {
+            assert!(
+                !enforcer.check_topic_uid(permission, "t", 7),
+                "{permission}"
+            );
+        }
+        let (groups, _) = GroupCache::scripted(vec![gids(&[50])]);
+        let enforcer = Enforcer {
+            groups,
+            ..Enforcer::enforcing(topics_allowing_group(50))
+        };
+        assert!(enforcer.check_topic_uid(TopicPermission::Subscribe, "t", 7));
+        assert!(!enforcer.check_topic_uid(TopicPermission::Advertise, "t", 7));
+        assert!(!enforcer.check_uid(Permission::Find, "t", 7));
+        enforcer.replace(Config::default());
+        assert!(!enforcer.check_topic_uid(TopicPermission::Subscribe, "t", 7));
+    }
+
+    /// The re-read on a deny covers topic rules too, or a failed first lookup holds until SIGHUP.
+    #[test]
+    fn a_topic_deny_a_group_could_lift_is_revalidated() {
+        let (groups, counter) = GroupCache::scripted(vec![None, gids(&[50])]);
+        let enforcer = Enforcer {
+            groups,
+            ..Enforcer::enforcing(topics_allowing_group(50))
+        };
+        assert!(!enforcer.check_topic_uid(TopicPermission::Subscribe, "t", 7));
+        enforcer.groups.age_entries(GroupCache::MIN_REVALIDATE);
+        assert!(enforcer.check_topic_uid(TopicPermission::Subscribe, "t", 7));
+        assert_eq!(calls(&counter), 2);
+        // `advertise` grants no group, so its deny reads nothing.
+        enforcer.groups.age_entries(GroupCache::MIN_REVALIDATE);
+        assert!(!enforcer.check_topic_uid(TopicPermission::Advertise, "t", 7));
+        assert_eq!(calls(&counter), 2);
+    }
+
+    #[test]
+    fn allow_all_allows_topics_to_callers_with_a_uid() {
+        let enforcer = Enforcer::allow_all();
+        let kernel = Caller::Kernel {
+            uid: 1000,
+            pid: 1,
+            sid: None,
+        };
+        assert!(enforcer.check_topic(TopicPermission::Advertise, "t", &kernel));
+        assert!(enforcer.check_topic(TopicPermission::List, "", &kernel));
+        #[cfg(feature = "rpc")]
+        assert!(!enforcer.check_topic(
+            TopicPermission::Subscribe,
+            "t",
+            &Caller::Rpc(rsbinder::rpc::PeerIdentity::Anonymous)
+        ));
     }
 
     /// A re-read during an outage returns a subset; it must not take away a group already seen.

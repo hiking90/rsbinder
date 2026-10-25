@@ -61,5 +61,8 @@ pub use enforcer::Enforcer;
 pub use parse::{
     load, parse_file, Config, ConfigError, FileContents, NameResolver, SystemResolver,
 };
-pub use policy::{NamePattern, Permission, Policy, PolicyError, Rule, Subject, Subjects};
+pub use policy::{
+    NamePattern, Permission, Policy, PolicyError, Rule, Subject, Subjects, TopicPermission,
+    TopicPolicy, TopicRule,
+};
 pub use trust::{trust_problem, TrustProblem, Untrusted};

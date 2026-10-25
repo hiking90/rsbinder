@@ -239,6 +239,7 @@ tier_hermetic() {
     run "rsbinder loom (cache pin)" tpass env CARGO_TARGET_DIR=target/loom \
         RUSTFLAGS="--cfg loom" cargo test -p rsbinder --test loom_cache_pin --release
     run "rsbinder-tools" tpass cargo test -p rsbinder-tools
+    run "rsbinder-tools (topic)" tpass cargo test -p rsbinder-tools --features topic
 
     run "rpc build matrix" rpc_build_matrix
     run "rsbinder lib (no binder device)" bash scripts/ci_rsbinder_lib_tests.sh

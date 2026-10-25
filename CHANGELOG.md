@@ -86,6 +86,15 @@ Each item below changes what a 0.12.0 program observes.
   whose death notice the hub already holds, which is also what a caller
   sees when the hub itself has died. The call changes no registration in
   either release.
+- `rsbinder-tools`: `config::Config` has a field `topics` (a
+  `TopicPolicy`), `config::FileContents` the fields `global_topics` and
+  `topic_rules`, and `config::ConfigError` the variants
+  `DuplicateGlobalTopics` and `TopicPattern`, with or without the `topic`
+  feature. All three are now `#[non_exhaustive]`: build a `Config` with
+  `..Config::default()`, and give a `match` on `ConfigError` a wildcard arm.
+  `rsb_hub` logs a loaded configuration as "N rule(s), M service
+  declaration(s)" (0.12.0: "N rule(s) and M service declaration(s)") and
+  reports the same to its supervisor's status line.
 
 ### Added
 
@@ -127,6 +136,18 @@ Each item below changes what a 0.12.0 program observes.
     and the memory layout are rsbinder's own; a publisher and a subscriber
     of different layout versions refuse each other
     (`ITopic::ERROR_VERSION`).
+- **`rsb_hub`'s `topic` feature (off by default, Experimental)**: the hub
+  serves `rsbinder-topic`'s registry of topic names under
+  `rsbinder.topic.registry`, registered before it reports `READY=1`, and
+  refuses that name to every transaction's `addService`,
+  `registerClientCallback` and `tryUnregisterService`, under
+  `--insecure-allow-all` too. Its policy is `[[topic]]` rules (`name`,
+  `advertise`, `subscribe`) and a `[global] topics` gate in the hub's
+  configuration files, a namespace apart from `[[rule]]`; a hub built
+  without the feature refuses a file holding either. `rsb_service dump
+  manager` reports the registry's counters. In the library:
+  `config::TopicPolicy`, `TopicRule`, `TopicPermission` and
+  `Enforcer::check_topic`.
 - **The unsynchronized FMQ flavor in `rsbinder-fmq`** (also `rsbinder::fmq`):
   `UnsyncWriter` and `UnsyncReader`, libfmq's
   `MessageQueue<T, kUnsynchronizedWrite>`. One writer, any number of
