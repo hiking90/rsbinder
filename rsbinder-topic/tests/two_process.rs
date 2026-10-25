@@ -25,41 +25,22 @@
 
 #![cfg(any(target_os = "linux", target_os = "android"))]
 
+mod common;
+
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::fs::FileExt;
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc;
-use std::sync::Once;
 use std::time::{Duration, Instant};
 
+use common::{eventually, init, name, signal, Peer, NAME, ROLE, WAIT};
 use rsbinder::fmq::shm::{self, CreateOptions, Seals};
-use rsbinder::{
-    hub, ExceptionCode, Interface, ParcelFileDescriptor, ProcessState, SIBinder, StatusCode,
-};
+use rsbinder::{hub, ExceptionCode, Interface, ParcelFileDescriptor, SIBinder, StatusCode};
 use rsbinder_topic::aidl::ITopic::{ITopic, ERROR_VERSION};
 use rsbinder_topic::aidl::SubscribeRequest::SubscribeRequest;
 use rsbinder_topic::{
     wait_any, Backpressure, Bytes, Closed, Disconnected, NamedSubscriber, Payload, PoolPolicy,
     Publisher, PublisherPolicy, RecvError, Subscriber, SubscriberPolicy, Wait, Wake,
 };
-
-const ROLE: &str = "RSBINDER_TOPIC_ROLE";
-const NAME: &str = "RSBINDER_TOPIC_NAME";
-const WAIT: Duration = Duration::from_secs(10);
-
-fn init() {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        ProcessState::init_default().expect("a binder device");
-        ProcessState::start_thread_pool();
-    });
-}
-
-fn name(tag: &str) -> String {
-    format!("rsb.test.topic.{tag}.{}", std::process::id())
-}
 
 /// This process's memfds: the fds open on one, and the mappings of one.
 fn memfds() -> (usize, usize) {
@@ -73,77 +54,6 @@ fn memfds() -> (usize, usize) {
         fds,
         maps.lines().filter(|line| line.contains("/memfd:")).count(),
     )
-}
-
-/// Poll `done` until it holds or [`WAIT`] passes.
-fn eventually(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + WAIT;
-    while !done() {
-        assert!(Instant::now() < deadline, "{what} within {WAIT:?}");
-        std::thread::sleep(Duration::from_millis(5));
-    }
-}
-
-/// The other process, killed when dropped.
-struct Peer {
-    child: Child,
-    stdin: Option<ChildStdin>,
-    lines: mpsc::Receiver<String>,
-}
-
-impl Peer {
-    fn spawn(role: &str, name: &str) -> Self {
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "child",
-                "--ignored",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(ROLE, role)
-            .env(NAME, name)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let (send, lines) = mpsc::channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                // Not only at the start: libtest's `test child ... ` has no newline before it.
-                if let Some((_, said)) = line.split_once("topic: ") {
-                    let _ = send.send(said.to_owned());
-                }
-            }
-        });
-        let stdin = child.stdin.take();
-        Self {
-            child,
-            stdin,
-            lines,
-        }
-    }
-
-    /// The next line the peer says.
-    fn says(&self) -> String {
-        self.lines.recv_timeout(WAIT).expect("the peer to answer")
-    }
-
-    fn tell(&mut self, line: &str) {
-        writeln!(self.stdin.as_mut().unwrap(), "{line}").unwrap();
-    }
-
-    fn kill(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-impl Drop for Peer {
-    fn drop(&mut self) {
-        self.kill();
-    }
 }
 
 fn publish(tag: &str) -> (String, Publisher<Bytes>) {
@@ -706,11 +616,6 @@ fn overrun(publisher: &Publisher<Bytes>) -> Duration {
         })
         .max()
         .unwrap()
-}
-
-fn signal(peer: &Peer, signal: rustix::process::Signal) {
-    let pid = rustix::process::Pid::from_raw(peer.child.id() as i32).unwrap();
-    rustix::process::kill_process(pid, signal).unwrap();
 }
 
 /// AC-15.3.9: a subscriber stopped past the timeout is taken out and told; one keeping up isn't.

@@ -15,8 +15,10 @@ use rsbinder::{BinderResult, Interface, SIBinder, Strong};
 /// [`NamedSubscriber::subscribe_with`].
 ///
 /// [`ServiceManager`] is the implementation [`Publisher::advertise`] and
-/// [`NamedSubscriber::subscribe`] use.
+/// [`NamedSubscriber::subscribe`] use; [`RegistryResolver`] is a registry of topic names, apart
+/// from service names.
 ///
+/// [`RegistryResolver`]: crate::registry::RegistryResolver
 /// [`Publisher::advertise`]: crate::Publisher::advertise
 /// [`Publisher::advertise_with`]: crate::Publisher::advertise_with
 /// [`NamedSubscriber::subscribe`]: crate::NamedSubscriber::subscribe

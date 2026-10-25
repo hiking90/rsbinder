@@ -18,7 +18,10 @@ import rsbinder.topic.TopicRef;
  * A refusal by the policy is `EX_SECURITY`, a name outside the service name
  * rule (1 to 127 bytes of `[A-Za-z0-9._/-]`) is `EX_ILLEGAL_ARGUMENT`, and
  * the other refusals are the constants below. `lookup` answers a refused
- * caller as it answers a name with no topic.
+ * caller as it answers a name with no topic. A binder of the call (the
+ * topic, the watcher) whose death the registry cannot be told of, as it is
+ * dead, is `EX_ILLEGAL_STATE`, as the service manager answers it: a
+ * `DEAD_OBJECT` status would read as the registry's own death.
  */
 interface ITopicRegistry {
     /** The service name a host registers the registry under. */
@@ -43,7 +46,11 @@ interface ITopicRegistry {
      * has now, with the generation of that change, is the reply.
      */
     TopicRef watch(String name, ITopicWatcher watcher);
-    void unwatch(String name, ITopicWatcher watcher);
+    /**
+     * End the watch of `name` by `watcher`; nothing if there is none. Notices
+     * sent before it can still come.
+     */
+    oneway void unwatch(String name, ITopicWatcher watcher);
     /** The names under `prefix` the caller may subscribe to, sorted. */
     TopicInfo[] list(String prefix);
 }

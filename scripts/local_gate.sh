@@ -387,6 +387,8 @@ tier_kernel() {
     run "fmq_binder" tpass cargo test -p tests --test fmq_binder -- --ignored
     run "rsbinder-topic two_process" tpass cargo test -p rsbinder-topic --test two_process \
         -- --ignored --test-threads=1
+    run "rsbinder-topic registry" tpass cargo test -p rsbinder-topic --test registry \
+        -- --ignored --test-threads=1
     run "reconnect_kernel" tpass cargo test -p tests --features rpc \
         --test reconnect_kernel -- --ignored --test-threads=1
     run "freeze_kernel" tpass cargo test -p tests --features rpc \

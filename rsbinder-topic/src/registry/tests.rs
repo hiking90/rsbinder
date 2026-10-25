@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 use rsbinder::{BinderResult, Caller, ExceptionCode, Interface, Status, StatusCode, Strong};
 
 use super::table::{Key, Links, Refused, Sent, Table, MAX_NAMES, MAX_OWED, MAX_WATCHERS};
-use super::{classify, is_valid_name, Action, AllowAll, Registry, RegistryAccess};
+use super::{
+    classify, is_valid_name, refused, Action, AllowAll, Registry, RegistryAccess, RegistryResolver,
+};
 use crate::aidl::ITopic::{BnTopic, ITopic, ERROR_CLOSED};
 use crate::aidl::ITopicRegistry::{ITopicRegistry, ERROR_LIMIT, ERROR_TAKEN};
 use crate::aidl::ITopicWatcher::{BnTopicWatcher, ITopicWatcher};
@@ -666,6 +668,20 @@ fn a_call_within_the_process_is_refused() {
     assert!(remote.r#lookup("a").is_err());
     assert!(remote.r#list("").is_err());
     assert_eq!(registry.stats().topics, 0);
+}
+
+/// D14-a: a binder that cannot be linked is `IllegalState`, not the registry's own `DeadObject`.
+#[test]
+fn a_failed_link_is_an_illegal_state() {
+    let status = refused(Refused::Link(StatusCode::DeadObject.into()));
+    assert_eq!(status.exception_code(), ExceptionCode::IllegalState);
+}
+
+#[test]
+fn a_resolver_takes_no_registry_of_this_process() {
+    let registry = Registry::new(AllowAll);
+    let refused = RegistryResolver::new(registry.as_binder()).unwrap_err();
+    assert_eq!(refused.transaction_error(), StatusCode::BadValue);
 }
 
 #[test]

@@ -21,11 +21,19 @@
 //! most once in 30 seconds after a few failures, and for at most 256 watches at a time. Once one
 //! of these ends, the notice is not sent again.
 //!
+//! A [`RegistryResolver`] is the client side: [`Publisher::advertise_with`] and
+//! [`NamedSubscriber::subscribe_with`] take it in place of the service manager.
+//!
 //! [`ITopicRegistry::SERVICE_NAME`]: crate::aidl::ITopicRegistry::SERVICE_NAME
+//! [`Publisher::advertise_with`]: crate::Publisher::advertise_with
+//! [`NamedSubscriber::subscribe_with`]: crate::NamedSubscriber::subscribe_with
 
+mod resolver;
 mod table;
 #[cfg(test)]
 mod tests;
+
+pub use resolver::RegistryResolver;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -94,7 +102,7 @@ pub struct RegistryStats {
     pub notices_sent: u64,
     /// Sends of a notice that failed, the first ones and the ones sent again.
     pub notices_failed: u64,
-    /// Watches a notice is owed to, sent again until they take it.
+    /// Watches owed a notice, which the registry sends again as the module documentation says.
     pub owed: usize,
     /// Sends of an owed notice.
     pub notices_retried: u64,
@@ -358,8 +366,14 @@ fn refused(refused: Refused) -> Status {
         Refused::Limit | Refused::Full => {
             refuse(ERROR_LIMIT, "the registry holds as many as it takes")
         }
-        Refused::Link(status) => status,
+        Refused::Link(status) => link_failed(&status),
     }
+}
+
+/// A binder whose death cannot be linked; `DeadObject` would read as the registry's own death.
+fn link_failed(status: &Status) -> Status {
+    let why = format!("a binder of the call cannot be linked to its death: {status}");
+    Status::from((ExceptionCode::IllegalState, why.as_str()))
 }
 
 fn topic_ref((topic, generation): (Option<TopicKey>, u64)) -> TopicRef {

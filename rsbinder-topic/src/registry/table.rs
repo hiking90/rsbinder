@@ -119,7 +119,7 @@ pub(crate) struct Table<T, W> {
     counts: Counts,
 }
 
-/// The wait before the next send of a notice owed after `attempts` sends of it failed.
+/// The wait before the next send of an owed notice whose sends again failed `attempts` times.
 fn backoff(attempts: u32) -> Duration {
     let doubled = FIRST_RETRY.checked_mul(1 << attempts.min(16));
     doubled.map_or(LAST_RETRY, |wait| wait.min(LAST_RETRY))

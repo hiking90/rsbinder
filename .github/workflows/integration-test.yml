@@ -353,6 +353,19 @@ jobs:
             exit 1
           }
 
+      - name: Run rsbinder-topic registry (#[ignore]'d)
+        run: |
+          # Plan 15 P5-1b: a registry of topic names in a process of its own,
+          # with one binder thread as rsb_hub runs, registered under a name of
+          # the test's; publishers and subscribers reach it through
+          # RegistryResolver. Needs /dev/binder and the permissive rsb_hub,
+          # which has no registry of its own (one test finds none).
+          RUST_BACKTRACE=1 cargo test -p rsbinder-topic --test registry -- --ignored --test-threads=1 || {
+            echo "::error::rsbinder-topic registry failed"
+            cp -f rsb_hub.log artifacts/topic-registry-rsb_hub.log 2>/dev/null || true
+            exit 1
+          }
+
       - name: Restart test_service for test_death_recipient
         run: |
           # Each #[ignore]'d destructive test consumes a live
