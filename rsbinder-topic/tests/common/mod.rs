@@ -108,6 +108,11 @@ impl Peer {
     /// Stop the peer with `SIGSTOP` until the guard is dropped, also when the test fails.
     pub fn stop(&self) -> Stopped {
         signal(self, rustix::process::Signal::STOP);
+        // Until every thread stopped: the call that follows meets no running thread of it.
+        let pid = rustix::process::Pid::from_raw(self.child.id() as i32).unwrap();
+        let stopped =
+            rustix::process::WaitIdOptions::STOPPED | rustix::process::WaitIdOptions::NOWAIT;
+        rustix::process::waitid(rustix::process::WaitId::Pid(pid), stopped).unwrap();
         Stopped(self.child.id())
     }
 

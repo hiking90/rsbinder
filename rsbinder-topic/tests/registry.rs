@@ -13,6 +13,13 @@
 //! The host is a `child` with one binder thread, as `rsb_hub` has, registered under a name of the
 //! test's own. A fake registry, also a `child`, answers as the tests tell it, to send a watch the
 //! notices a registry would not.
+//!
+//! A stopped peer holds up a call only through what the call reaches. A client with no proxy of a
+//! topic asks its publisher for the descriptor (plan 15 §12.7), so a stopped publisher's name is
+//! looked up by a client that already holds its proxy. An `onAdvertised` takes of a watcher's
+//! async space what the kernel counts: its data and the offset of its one object, each rounded up
+//! to 8 bytes. A resumed watcher meets the last publisher by a notice sent again or by a lookup
+//! (plan 15 D14-e).
 
 #![cfg(any(target_os = "linux", target_os = "android"))]
 
@@ -335,9 +342,7 @@ fn a_binder_of_another_interface_is_refused_as_bad_type() {
     assert!(listed(&resolver, &name).is_some());
 }
 
-/// AC-15.5.1b: the registry calls no publisher, so a stopped one holds up no call of it. The
-/// stopped publisher's name is looked up by a client that holds its proxy: one with none asks the
-/// publisher for its descriptor and waits (plan 15 §12.7).
+/// AC-15.5.1b: a stopped publisher holds up no call; its name is looked up by a proxy holder.
 #[test]
 #[ignore = "needs a binder device and rsb_hub"]
 fn a_stopped_publisher_holds_up_no_call_of_the_registry() {
@@ -368,8 +373,7 @@ fn a_stopped_publisher_holds_up_no_call_of_the_registry() {
     assert!(took < 1000, "another client's lookup took {took} ms");
 }
 
-/// AC-15.5.5: watchers stopped past their async space hold up no call of the registry, and once
-/// resumed each meets the last publisher, by a notice sent again or by a lookup (plan 15 D14-e).
+/// AC-15.5.5 (D14-e): stopped watchers hold up no call; resumed, each meets the last publisher.
 #[test]
 #[ignore = "needs a binder device and rsb_hub"]
 fn stopped_watchers_hold_up_no_call_and_each_meets_the_last_publisher_once_resumed() {
@@ -412,6 +416,14 @@ fn stopped_watchers_hold_up_no_call_and_each_meets_the_last_publisher_once_resum
     assert!(found
         .topic
         .is_some_and(|topic| topic.as_binder() == last.as_binder()));
+    let looking = Peer::spawn_with("lookup", &name, &env);
+    let took: u64 = looking
+        .says()
+        .strip_prefix("found in ")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(took < 1000, "another client's lookup took {took} ms");
 
     drop(stopped);
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -431,8 +443,7 @@ fn stopped_watchers_hold_up_no_call_and_each_meets_the_last_publisher_once_resum
     drop(ended);
 }
 
-/// What one `onAdvertised` of `name` takes of a watcher's async space, as the kernel counts it:
-/// the data and the offset of its one object, each rounded up to 8 bytes.
+/// One `onAdvertised` of `name` in a watcher's async space: data and one offset, 8-aligned.
 fn notice_size(registry: &Strong<dyn ITopicRegistry>, name: &str) -> usize {
     let size = |write: &dyn Fn(&mut Parcel) -> rsbinder::Result<()>| {
         let mut parcel = Parcel::new();
