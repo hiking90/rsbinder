@@ -16,10 +16,10 @@
 //!
 //! A watcher hears of every topic a name is given through a oneway call, which fails when the
 //! watcher's process has no room left for one. The registry sends such a notice again, with the
-//! topic the name has by then, until the watcher takes it, unwatches or dies: once a second at
-//! first, at most once in 30 seconds after a few failures, and for at most 256 watches at a time.
-//! A notice the policy refused to send, as when a reload took the caller's right away, is not
-//! sent again.
+//! topic the name has by then, for as long as its sends fail for want of room, the watch lasts,
+//! the name has a topic and the policy allows the watch's caller: once a second at first, at
+//! most once in 30 seconds after a few failures, and for at most 256 watches at a time. Once one
+//! of these ends, the notice is not sent again.
 //!
 //! [`ITopicRegistry::SERVICE_NAME`]: crate::aidl::ITopicRegistry::SERVICE_NAME
 
@@ -51,9 +51,10 @@ pub trait RegistryAccess: Send + Sync {
     /// Whether `caller` may do `action` on `name` (`""` for [`Action::List`]). An action the
     /// implementation does not know is refused.
     ///
-    /// It runs while the registry holds the lock that orders its notices, on the thread of a
-    /// change and on the thread that sends notices again: it must not call the registry, and its
-    /// cost holds up the registry's other changes.
+    /// It must not call the registry. When it judges the watchers of a change it runs while the
+    /// registry holds the lock that orders its notices, so its cost holds up the registry's other
+    /// changes; every other judgement, those of notices sent again among them, runs with no lock
+    /// of the registry held.
     fn allows(&self, action: Action, name: &str, caller: &Caller) -> bool;
 }
 
@@ -111,8 +112,10 @@ pub fn is_valid_name(name: &str) -> bool {
 /// The host side of a registry of topic names: register [`as_binder`](Self::as_binder) with
 /// the service manager under [`ITopicRegistry::SERVICE_NAME`].
 ///
-/// Its callers are those of binder transactions: a call made within the host process, which is
-/// no transaction, is refused, so a publisher or subscriber of the host process cannot use it.
+/// Its callers are those of binder transactions, so a publisher or subscriber of the host
+/// process cannot use it. A call made within the host process is no transaction: outside any
+/// transaction it is refused, and within the handler of one it is judged as made by that
+/// transaction's caller, which the registry does not support.
 ///
 /// [`ITopicRegistry::SERVICE_NAME`]: crate::aidl::ITopicRegistry::SERVICE_NAME
 pub struct Registry {
@@ -450,8 +453,14 @@ impl Shared {
         let allowed = kernel_ids(caller).is_some()
             && is_valid_name(name)
             && self.access.allows(Action::Subscribe, name, caller);
-        let (topic, generation) = self.lock().table.lookup(name);
-        topic_ref((topic.filter(|_| allowed), generation))
+        let inner = self.lock();
+        // Refused, the answer of a name with no topic: the generation tells nothing of this one.
+        let found = if allowed {
+            inner.table.lookup(name)
+        } else {
+            (None, inner.table.generation())
+        };
+        topic_ref(found)
     }
 
     pub(crate) fn watch_as(
@@ -573,12 +582,15 @@ impl Shared {
 
     /// After a send under `inner`: start the retry thread, or wake it for an earlier due.
     fn owe(&self, mut inner: MutexGuard<'_, Inner>, added: bool) {
-        if !added {
+        if inner.retrying {
+            if added {
+                drop(inner);
+                self.sleep.wake();
+            }
             return;
         }
-        if inner.retrying {
-            drop(inner);
-            self.sleep.wake();
+        // Owed with no thread only after a failed spawn: any send tries it again.
+        if !added && inner.table.owed() == 0 {
             return;
         }
         inner.retrying = true;
@@ -587,8 +599,8 @@ impl Shared {
         let spawned = std::thread::Builder::new()
             .name("rsbinder-topic-registry".into())
             .spawn(move || retry(shared));
-        if spawned.is_err() {
-            // The next failure tries again.
+        if let Err(error) = spawned {
+            log::warn!("topic registry: no thread to send owed notices again: {error}");
             self.lock().retrying = false;
         }
     }
@@ -596,12 +608,11 @@ impl Shared {
     /// One round of the retry thread: every owed notice that is due, one send at a time.
     fn retry_round(&self) {
         let due = self.lock().table.due(Instant::now());
-        for (name, watcher, caller) in due {
-            #[cfg(test)]
-            self.hook(|hooks| &hooks.judging);
+        for (name, watcher, caller, generation) in due {
             // Judged outside the locks: a slow group lookup holds up no change of the host's.
             if !self.access.allows(Action::Subscribe, &name, &caller) {
-                self.lock().table.deferred(&name, &watcher, Instant::now());
+                // Kept if a newer notice failed meanwhile: that one is judged next round.
+                self.lock().table.refused(&name, &watcher, generation);
                 continue;
             }
             let order = self.fire_order.lock().expect("lock poisoned");
@@ -661,7 +672,7 @@ struct Service(Arc<Shared>);
 
 impl Interface for Service {}
 
-/// The caller of the transaction in flight; a call within this process is none and is refused.
+/// The caller of the transaction in flight; with none in flight, the call is refused.
 fn caller() -> BinderResult<Caller> {
     rsbinder::calling_caller().ok_or_else(|| security("not a binder transaction"))
 }

@@ -206,6 +206,11 @@ impl<T: Key, W: Key> Table<T, W> {
         }
     }
 
+    /// The generation now: what [`lookup`](Self::lookup) answers for a name with no topic.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Watch `name` for `caller`; what [`lookup`](Self::lookup) answers, the reply of the watch.
     pub(crate) fn watch(
         &mut self,
@@ -246,7 +251,7 @@ impl<T: Key, W: Key> Table<T, W> {
         held.collect()
     }
 
-    /// End the watches of `name` by `watcher`, one or every one of `evicted`.
+    /// End the watches of `name` whose watcher is one of `evicted`.
     pub(crate) fn unwatch(&mut self, name: &str, evicted: &[W], links: &mut dyn Links<T, W>) {
         let Some(list) = self.watchers.get_mut(name) else {
             return;
@@ -365,13 +370,14 @@ impl<T: Key, W: Key> Table<T, W> {
         added
     }
 
-    /// The owed notices due at `now`: name, watcher and the caller to judge.
-    pub(crate) fn due(&self, now: Instant) -> Vec<(String, W, Caller)> {
+    /// The owed notices due at `now`: name, watcher, the caller to judge and the owed generation.
+    pub(crate) fn due(&self, now: Instant) -> Vec<(String, W, Caller, u64)> {
         let mut due = Vec::new();
         for (name, list) in &self.watchers {
             for held in list {
-                if held.owed.as_ref().is_some_and(|o| o.due <= now) {
-                    due.push((name.clone(), held.key.clone(), held.caller.clone()));
+                if let Some(o) = held.owed.as_ref().filter(|o| o.due <= now) {
+                    let caller = held.caller.clone();
+                    due.push((name.clone(), held.key.clone(), caller, o.generation));
                 }
             }
         }
@@ -435,16 +441,15 @@ impl<T: Key, W: Key> Table<T, W> {
         }
     }
 
-    /// An owed notice whose caller the policy refuses now: not sent, asked again later.
-    pub(crate) fn deferred(&mut self, name: &str, watcher: &W, now: Instant) {
+    /// An owed notice of `generation` the policy refuses now: no longer owed (plan 15 D13-a).
+    pub(crate) fn refused(&mut self, name: &str, watcher: &W, generation: u64) {
         let held = find(&mut self.watchers, name, watcher);
-        if let Some(o) = held.and_then(|held| held.owed.as_mut()) {
-            o.attempts += 1;
-            o.due = now + backoff(o.attempts);
+        let judged = |o: &mut Owed| o.generation == generation;
+        if held.and_then(|held| held.owed.take_if(judged)).is_some() {
+            self.owed -= 1;
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn owed(&self) -> usize {
         self.owed
     }

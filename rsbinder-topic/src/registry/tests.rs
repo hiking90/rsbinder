@@ -27,8 +27,6 @@ pub(super) type Hook = Arc<dyn Fn() + Send + Sync>;
 pub(super) struct Hooks {
     /// Before a change's notice is sent, `fire_order` held.
     pub before_send: Option<Hook>,
-    /// Before the retry thread judges an owed notice's caller.
-    pub judging: Option<Hook>,
     /// After the retry thread sent one owed notice and let `fire_order` go.
     pub between_sends: Option<Hook>,
     /// Held by the retry thread while it runs, and by these hooks: a count of 3 is a thread.
@@ -481,16 +479,30 @@ fn an_owed_notice_goes_with_its_watch_its_watcher_its_topic_or_a_failure_for_goo
 }
 
 #[test]
-fn an_owed_notice_the_policy_refuses_is_put_off() {
+fn an_owed_notice_the_policy_refuses_is_not_sent_again() {
     let (mut table, _, now) = watched(1);
     table.sent("a", &key(100), 1, Sent::Busy, now);
-    let at = now + Duration::from_secs(1);
-    table.deferred("a", &key(100), at);
-    assert_eq!(
-        table.due_of("a", &key(100)),
-        Some(at + Duration::from_secs(2))
-    );
+    table.refused("a", &key(100), 1);
+    assert_eq!(table.due_of("a", &key(100)), None);
+    assert_eq!((table.owed(), table.next_due()), (0, None));
+    // The watch stays, as for a refused notice of a change.
+    assert_eq!(table.counts().watchers, 1);
+}
+
+#[test]
+fn a_refusal_leaves_owed_a_newer_notice_that_failed_after_the_judgement() {
+    let (mut table, mut links, now) = watched(1);
+    table.sent("a", &key(100), 1, Sent::Busy, now);
+    let judged = table.due(now + Duration::from_secs(1))[0].3;
+    assert_eq!(judged, 1);
+    let notices = table
+        .advertise((1, 1), "a", key(11), false, now, &mut links)
+        .unwrap();
+    table.sent("a", &key(100), notices[0].generation, Sent::Busy, now);
+    table.refused("a", &key(100), judged);
     assert_eq!(table.owed(), 1);
+    table.refused("a", &key(100), notices[0].generation);
+    assert_eq!(table.owed(), 0);
 }
 
 #[test]
@@ -694,6 +706,18 @@ fn the_shells_refusals_take_the_registrys_forms() {
     let (watcher, _) = recorder();
     let bad = shared.watch_as(&caller(1), "", &watcher).unwrap_err();
     assert_eq!(bad.exception_code(), ExceptionCode::IllegalArgument);
+    // Put in the table as no call can: the name rule alone makes the lookup's null.
+    {
+        let mut inner = shared.lock();
+        let super::Inner { table, linked, .. } = &mut *inner;
+        let this = &shared.this;
+        let mut links = super::ShellLinks { linked, this };
+        let key = super::TopicKey(topic());
+        let ids = (1, 1);
+        table
+            .advertise(ids, "a b", key, false, Instant::now(), &mut links)
+            .unwrap();
+    }
     assert!(shared.lookup_as(&caller(1), "a b").topic.is_none());
     shared.advertise_as(&caller(1), "a", &topic()).unwrap();
     let taken = shared.advertise_as(&caller(2), "a", &topic()).unwrap_err();
@@ -707,9 +731,14 @@ fn the_shells_refusals_take_the_registrys_forms() {
         .shared
         .advertise_as(&caller(2), "a", &topic())
         .unwrap();
-    // `unwatch` asks no right and ends a watch that is not there.
-    shared.unwatch_as("a", &watcher);
-    let _ = ERROR_LIMIT;
+    // `unwatch` asks no right: a caller refused now ends its watch, and one not there.
+    let refusing = Refusing::default();
+    let registry = Registry::new(refusing.clone());
+    registry.shared.watch_as(&caller(2), "a", &watcher).unwrap();
+    refusing.0.lock().unwrap().insert(2);
+    registry.shared.unwatch_as("a", &watcher);
+    registry.shared.unwatch_as("a", &watcher);
+    assert_eq!(registry.stats().watchers, 0);
 }
 
 #[test]
@@ -777,6 +806,36 @@ fn a_notice_is_sent_with_the_order_lock_held() {
 }
 
 #[test]
+fn a_change_takes_the_order_lock_before_the_table() {
+    let registry = Registry::new(AllowAll);
+    let shared = &registry.shared;
+    std::thread::scope(|s| {
+        let inner = shared.lock();
+        let change = s.spawn(|| shared.advertise_as(&caller(1), "a", &topic()));
+        // Held by a change that waits on `inner`: the retry thread takes them in this order.
+        eventually("the order lock held", || {
+            shared.fire_order.try_lock().is_err()
+        });
+        drop(inner);
+        change.join().unwrap().unwrap();
+    });
+}
+
+#[test]
+fn a_refused_lookup_answers_as_a_name_with_no_topic() {
+    let refusing = Refusing::default();
+    let registry = Registry::new(refusing.clone());
+    let shared = &registry.shared;
+    shared.advertise_as(&caller(1), "a", &topic()).unwrap();
+    shared.advertise_as(&caller(1), "b", &topic()).unwrap();
+    refusing.0.lock().unwrap().insert(2);
+    let refused = shared.lookup_as(&caller(2), "a");
+    let none = shared.lookup_as(&caller(2), "c");
+    assert!(refused.topic.is_none());
+    assert_eq!((refused.generation, none.generation), (2, 2));
+}
+
+#[test]
 fn a_notice_that_found_no_room_is_sent_again_and_the_thread_ends() {
     let registry = Registry::new(AllowAll);
     let alive = Arc::new(());
@@ -793,9 +852,9 @@ fn a_notice_that_found_no_room_is_sent_again_and_the_thread_ends() {
         .shared
         .advertise_as(&caller(1), "a", &topic())
         .unwrap();
-    assert_eq!(registry.stats().owed, 1);
+    // Counted after the watcher heard it, under the lock `owed` is cleared under.
     eventually("the owed notice delivered", || {
-        !heard.heard.lock().unwrap().is_empty()
+        registry.stats().notices_retried == 1
     });
     assert!(started.elapsed() >= Duration::from_secs(1));
     assert_eq!(*heard.heard.lock().unwrap(), [("a".to_owned(), 1)]);
@@ -808,23 +867,88 @@ fn a_notice_that_found_no_room_is_sent_again_and_the_thread_ends() {
 }
 
 #[test]
-fn the_retry_judges_outside_the_locks_and_lets_the_order_lock_go_between_sends() {
-    let registry = Registry::new(AllowAll);
-    let weak = Arc::downgrade(&registry.shared);
-    let free = Arc::new(Mutex::new(Vec::new()));
-    let try_order =
-        |at: &'static str, weak: std::sync::Weak<super::Shared>, free: Arc<Mutex<Vec<_>>>| {
-            Arc::new(move || {
-                let shared = weak.upgrade().unwrap();
-                let both = shared.fire_order.try_lock().is_ok() && shared.inner.try_lock().is_ok();
-                free.lock().unwrap().push((at, both));
-            }) as Hook
-        };
-    {
-        let mut hooks = registry.shared.hooks.lock().unwrap();
-        hooks.judging = Some(try_order("judging", weak.clone(), free.clone()));
-        hooks.between_sends = Some(try_order("between", weak, free.clone()));
+fn an_owed_notice_the_retry_thread_finds_refused_is_not_sent_and_the_thread_ends() {
+    let refusing = Refusing::default();
+    let registry = Registry::new(refusing.clone());
+    let alive = Arc::new(());
+    let mut hooks = registry.shared.hooks.lock().unwrap();
+    hooks.alive = Some(alive.clone());
+    // After the change's judgement allowed it: the retry thread's judgement refuses.
+    let refuse = refusing.clone();
+    hooks.before_send = Some(Arc::new(move || {
+        refuse.0.lock().unwrap().insert(2);
+    }));
+    drop(hooks);
+    let (watcher, heard) = recorder();
+    registry.shared.watch_as(&caller(2), "a", &watcher).unwrap();
+    heard
+        .failures
+        .lock()
+        .unwrap()
+        .push_back(StatusCode::FailedTransaction);
+    registry
+        .shared
+        .advertise_as(&caller(1), "a", &topic())
+        .unwrap();
+    eventually("the owed notice refused", || registry.stats().owed == 0);
+    assert!(heard.heard.lock().unwrap().is_empty());
+    let stats = registry.stats();
+    assert_eq!((stats.notices_retried, stats.watchers), (0, 1));
+    eventually("the retry thread ended", || Arc::strong_count(&alive) == 2);
+}
+
+type Free = Arc<Mutex<Vec<(&'static str, bool)>>>;
+
+fn both_free(shared: &super::Shared) -> bool {
+    shared.fire_order.try_lock().is_ok() && shared.inner.try_lock().is_ok()
+}
+
+/// Allows everything, and records whether both locks are free as the retry thread judges.
+struct Judging {
+    shared: Arc<std::sync::OnceLock<std::sync::Weak<super::Shared>>>,
+    free: Free,
+    /// Set once the test's change returned: the retry thread records no lock that change holds.
+    changed: Arc<AtomicBool>,
+}
+
+impl RegistryAccess for Judging {
+    fn allows(&self, _: Action, _: &str, _: &Caller) -> bool {
+        let retrying = std::thread::current().name() == Some("rsbinder-topic-registry");
+        let shared = self.shared.get().and_then(std::sync::Weak::upgrade);
+        if let Some(shared) = shared.filter(|_| retrying) {
+            eventually("the change returned", || {
+                self.changed.load(Ordering::SeqCst)
+            });
+            self.free
+                .lock()
+                .unwrap()
+                .push(("judging", both_free(&shared)));
+        }
+        true
     }
+}
+
+#[test]
+fn the_retry_judges_outside_the_locks_and_lets_the_order_lock_go_between_sends() {
+    let free: Free = Arc::default();
+    let judging = Judging {
+        shared: Arc::default(),
+        free: free.clone(),
+        changed: Arc::default(),
+    };
+    let set = judging.shared.clone();
+    let changed = judging.changed.clone();
+    let registry = Registry::new(judging);
+    set.set(Arc::downgrade(&registry.shared)).unwrap();
+    let weak = Arc::downgrade(&registry.shared);
+    let between = free.clone();
+    registry.shared.hooks.lock().unwrap().between_sends = Some(Arc::new(move || {
+        let shared = weak.upgrade().unwrap();
+        between
+            .lock()
+            .unwrap()
+            .push(("between", both_free(&shared)));
+    }));
     let mut heard = Vec::new();
     for w in 0..2 {
         let (watcher, recorder) = recorder();
@@ -840,7 +964,10 @@ fn the_retry_judges_outside_the_locks_and_lets_the_order_lock_go_between_sends()
         .shared
         .advertise_as(&caller(1), "a", &topic())
         .unwrap();
-    eventually("both delivered", || registry.stats().owed == 0);
+    changed.store(true, Ordering::SeqCst);
+    // The thread's last act for a send, and no wait on `inner`, which the hooks try.
+    eventually("both delivered", || free.lock().unwrap().len() == 4);
+    assert_eq!(registry.stats().owed, 0);
     let free = free.lock().unwrap().clone();
     assert_eq!(
         free,
