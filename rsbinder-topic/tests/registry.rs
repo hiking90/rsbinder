@@ -1,7 +1,7 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! A registry of topic names in a process of its own (plan 15 AC-15.5.4, 5.6): publishers and
+//! A registry of topic names in a process of its own (plan 15 AC-15.5.1b, 5.4–5.6): publishers and
 //! subscribers reach it through `RegistryResolver`. `#[ignore]`d: they need a binder device and a
 //! service manager that lets any name register, and has no registry of its own:
 //!
@@ -18,22 +18,26 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use common::{eventually, init, name, say, wait_for_eof, Peer, NAME, ROLE, WAIT};
+use common::{eventually, init, name, say, wait_for_eof, Peer, Stopped, NAME, ROLE, WAIT};
 use rsbinder::{
-    hub, BinderResult, ExceptionCode, Interface, ProcessState, SIBinder, Status, StatusCode, Strong,
+    hub, BinderResult, ExceptionCode, Interface, Parcel, ProcessState, SIBinder, Status,
+    StatusCode, Strong, FIRST_CALL_TRANSACTION, FLAG_CLEAR_BUF, FLAG_PRIVATE_LOCAL,
 };
-use rsbinder_topic::aidl::ITopic::ITopic;
+use rsbinder_topic::aidl::ITopic::{BnTopic, ITopic, ERROR_CLOSED};
 use rsbinder_topic::aidl::ITopicRegistry::{BnTopicRegistry, ITopicRegistry, SERVICE_NAME};
-use rsbinder_topic::aidl::ITopicWatcher::ITopicWatcher;
+use rsbinder_topic::aidl::ITopicWatcher::{BnTopicWatcher, ITopicWatcher};
+use rsbinder_topic::aidl::SubscribeRequest::SubscribeRequest;
+use rsbinder_topic::aidl::TopicEndpoint::TopicEndpoint;
 use rsbinder_topic::aidl::TopicInfo::TopicInfo;
 use rsbinder_topic::aidl::TopicRef::TopicRef;
 use rsbinder_topic::registry::{AllowAll, Registry, RegistryResolver};
 use rsbinder_topic::{
     Bytes, Closed, Disconnected, NamedSubscriber, Publisher, PublisherPolicy, RecvError, Resolver,
-    SubscriberPolicy,
+    Start, SubscriberPolicy,
 };
 
 /// Where a child finds the registry.
@@ -54,6 +58,51 @@ fn host(registry: &str) -> (Peer, RegistryResolver) {
 
 fn resolver(registry: &str) -> RegistryResolver {
     RegistryResolver::new(hub::check_service(registry).unwrap()).unwrap()
+}
+
+/// The registry's own interface, for the calls no resolver makes.
+fn client(registry: &str) -> Strong<dyn ITopicRegistry> {
+    hub::check_service(registry)
+        .unwrap()
+        .into_interface()
+        .unwrap()
+}
+
+/// The host registry's failed notices and the watches it owes one.
+fn stats(host: &mut Peer) -> (u64, usize) {
+    host.tell("stats");
+    let said = host.says();
+    match said.split_whitespace().collect::<Vec<_>>().as_slice() {
+        ["stats", failed, owed] => (failed.parse().unwrap(), owed.parse().unwrap()),
+        _ => panic!("no stats: {said}"),
+    }
+}
+
+/// `call`, which ends within a second; one held up by a `stopped` peer fails once they resume.
+fn timed<T>(what: &str, stopped: &[Stopped], call: impl FnOnce() -> T) -> T {
+    let (ended, end) = mpsc::channel::<()>();
+    let began = Instant::now();
+    std::thread::scope(|scope| {
+        // Not the caller: a thread that made a binder call pays `BINDER_THREAD_EXIT` as it ends.
+        let watchdog = scope.spawn(move || {
+            let late = matches!(
+                end.recv_timeout(Duration::from_secs(1)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            );
+            if late {
+                stopped.iter().for_each(Stopped::resume);
+            }
+            late
+        });
+        let done = call();
+        drop(ended);
+        assert!(
+            !watchdog.join().unwrap(),
+            "{what} took {:?}",
+            began.elapsed()
+        );
+        done
+    })
 }
 
 fn listed(resolver: &RegistryResolver, name: &str) -> Option<TopicInfo> {
@@ -261,6 +310,149 @@ fn a_new_host_knows_only_the_publishers_made_again() {
     assert_eq!(again.recv_timeout(WAIT), Ok(Bytes(vec![0])));
 }
 
+/// AC-15.5.1b: a binder of another interface, which a typed client cannot send, is `BadType`.
+#[test]
+#[ignore = "needs a binder device and rsb_hub"]
+fn a_binder_of_another_interface_is_refused_as_bad_type() {
+    let registry = registry_name("type");
+    let (_host, resolver) = host(&registry);
+    let name = name("type");
+    let registry = hub::check_service(&registry).unwrap();
+    let advertise = |topic: SIBinder| {
+        let proxy = registry.as_proxy().unwrap();
+        let mut data = proxy.prepare_transact(true).unwrap();
+        data.write(name.as_str()).unwrap();
+        data.write(&topic).unwrap();
+        // `advertise`, the interface's first method.
+        let flags = FLAG_CLEAR_BUF | FLAG_PRIVATE_LOCAL;
+        proxy.submit_transact(FIRST_CALL_TRANSACTION, &data, flags)
+    };
+    let refused = advertise(BnTopicWatcher::new_binder(Silent).as_binder());
+    assert_eq!(refused.unwrap_err(), StatusCode::BadType);
+    assert!(listed(&resolver, &name).is_none());
+    // The same parcel with a topic in it is taken: the type of the binder was refused.
+    advertise(BnTopic::new_binder(Ended).as_binder()).unwrap();
+    assert!(listed(&resolver, &name).is_some());
+}
+
+/// AC-15.5.1b: the registry calls no publisher, so a stopped one holds up no call of it. The
+/// stopped publisher's name is looked up by a client that holds its proxy: one with none asks the
+/// publisher for its descriptor and waits (plan 15 §12.7).
+#[test]
+#[ignore = "needs a binder device and rsb_hub"]
+fn a_stopped_publisher_holds_up_no_call_of_the_registry() {
+    let registry = registry_name("stop");
+    let (_host, resolver) = host(&registry);
+    let client = client(&registry);
+    let stopped_name = name("stop.a");
+    let other = name("stop.b");
+    let stopping = publisher(&stopped_name, &registry);
+    let held = client.r#lookup(&stopped_name).unwrap().topic.unwrap();
+    let stopped = [stopping.stop()];
+
+    let found = timed("a lookup of the stopped publisher's name", &stopped, || {
+        client.r#lookup(&stopped_name).unwrap()
+    });
+    assert!(found
+        .topic
+        .is_some_and(|topic| topic.as_binder() == held.as_binder()));
+    let names = timed("a list", &stopped, || resolver.list("").unwrap());
+    assert!(names.iter().any(|info| info.name == stopped_name));
+    let policy = PublisherPolicy::default();
+    let _other = timed("an advertise of another name", &stopped, || {
+        Publisher::<Bytes>::advertise_with(&other, &policy, &resolver).unwrap()
+    });
+    let looking = Peer::spawn_with("lookup", &other, &[(REGISTRY, &registry)]);
+    let said = looking.says();
+    let took: u64 = said.strip_prefix("found in ").unwrap().parse().unwrap();
+    assert!(took < 1000, "another client's lookup took {took} ms");
+}
+
+/// AC-15.5.5: watchers stopped past their async space hold up no call of the registry, and once
+/// resumed each meets the last publisher, by a notice sent again or by a lookup (plan 15 D14-e).
+#[test]
+#[ignore = "needs a binder device and rsb_hub"]
+fn stopped_watchers_hold_up_no_call_and_each_meets_the_last_publisher_once_resumed() {
+    const WATCHERS: usize = 8;
+    let registry = registry_name("watchers");
+    let (mut host, resolver) = host(&registry);
+    let client = client(&registry);
+    let name = name("watchers");
+    let env = [(REGISTRY, registry.as_str())];
+    let watchers: Vec<Peer> = (0..WATCHERS)
+        .map(|_| Peer::spawn_with("last", &name, &env))
+        .collect();
+    for watcher in &watchers {
+        assert_eq!(watcher.says(), "watching");
+    }
+    // A watcher's async space is half of its mapping, the default one; a quarter more than fits.
+    let size = notice_size(&client, &name);
+    let advertises = ProcessState::default_mmap_size() / 2 / size * 5 / 4;
+    eprintln!("an onAdvertised of {name:?} takes {size} bytes: {advertises} advertises");
+    let stopped: Vec<Stopped> = watchers.iter().map(Peer::stop).collect();
+
+    // Ended topics, each a new binder, refuse their subscribers: no ring for each of them.
+    let ended: Vec<Strong<dyn ITopic>> = (0..advertises)
+        .map(|_| {
+            let topic = BnTopic::new_binder(Ended);
+            timed("an advertise", &stopped, || {
+                client.r#advertise(&name, &topic).unwrap()
+            });
+            topic
+        })
+        .collect();
+    let policy = PublisherPolicy::default();
+    let last = timed("the last advertise", &stopped, || {
+        Publisher::<Bytes>::advertise_with(&name, &policy, &resolver).unwrap()
+    });
+    let (failed, owed) = stats(&mut host);
+    assert!(failed >= 1, "no notice failed");
+    assert_eq!(owed, WATCHERS);
+    let found = timed("a lookup", &stopped, || client.r#lookup(&name).unwrap());
+    assert!(found
+        .topic
+        .is_some_and(|topic| topic.as_binder() == last.as_binder()));
+
+    drop(stopped);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let done = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        // Published until each watcher has a record, or the deadline passes.
+        scope.spawn(|| {
+            while !done.load(Ordering::Relaxed) && Instant::now() < deadline {
+                last.publish(&Bytes(vec![7])).unwrap();
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let heard: Vec<String> = watchers.iter().map(|w| w.says_by(deadline)).collect();
+        done.store(true, Ordering::Relaxed);
+        assert_eq!(heard, vec!["got 7"; WATCHERS]);
+    });
+    drop(ended);
+}
+
+/// What one `onAdvertised` of `name` takes of a watcher's async space, as the kernel counts it:
+/// the data and the offset of its one object, each rounded up to 8 bytes.
+fn notice_size(registry: &Strong<dyn ITopicRegistry>, name: &str) -> usize {
+    let size = |write: &dyn Fn(&mut Parcel) -> rsbinder::Result<()>| {
+        let mut parcel = Parcel::new();
+        write(&mut parcel).unwrap();
+        parcel.data_size()
+    };
+    let binder = registry.as_binder();
+    let proxy = binder.as_proxy().unwrap();
+    // The interface token the proxy writes, with the watcher's descriptor for the registry's.
+    let header = proxy.prepare_transact(true).unwrap().data_size()
+        - size(&|parcel| parcel.write(proxy.descriptor()));
+    let token = header + size(&|parcel| parcel.write(<Silent as ITopicWatcher>::descriptor()));
+    let topic = BnTopic::new_binder(Ended);
+    let data = token
+        + size(&|parcel| parcel.write(name))
+        + size(&|parcel| parcel.write(&topic))
+        + size(&|parcel| parcel.write(&0i64));
+    data.next_multiple_of(8) + 8
+}
+
 /// The other process's side of the tests above.
 #[test]
 #[ignore = "run by the tests above as their other process"]
@@ -281,8 +473,12 @@ fn child() {
             ProcessState::init(device, 0).unwrap();
             let host = Registry::new(AllowAll);
             hub::add_service(&name, host.as_binder()).unwrap();
-            std::thread::spawn(|| {
-                wait_for_eof();
+            std::thread::spawn(move || {
+                for line in std::io::stdin().lines().map_while(Result::ok) {
+                    assert_eq!(line, "stats");
+                    let stats = host.stats();
+                    say(&format!("stats {} {}", stats.notices_failed, stats.owed));
+                }
                 std::process::exit(0);
             });
             say("ready");
@@ -327,7 +523,55 @@ fn child() {
             say("watching");
             wait_for_eof();
         }
+        "last" => {
+            init();
+            let policy = SubscriberPolicy {
+                start: Start::Last,
+                ..SubscriberPolicy::default()
+            };
+            let mut subscriber =
+                NamedSubscriber::<Bytes>::subscribe_with(&name, &policy, &registry()).unwrap();
+            say("watching");
+            let got = loop {
+                match subscriber.recv_timeout(6 * WAIT) {
+                    Err(RecvError::Disconnected(_)) => continue,
+                    got => break got.unwrap(),
+                }
+            };
+            say(&format!("got {}", got.0[0]));
+            wait_for_eof();
+        }
+        "lookup" => {
+            init();
+            let client = client(&std::env::var(REGISTRY).unwrap());
+            let began = Instant::now();
+            assert!(client.r#lookup(&name).unwrap().topic.is_some());
+            say(&format!("found in {}", began.elapsed().as_millis()));
+            wait_for_eof();
+        }
         other => panic!("no role {other}"),
+    }
+}
+
+/// A topic whose publisher ended: it refuses every subscriber.
+struct Ended;
+
+impl Interface for Ended {}
+
+impl ITopic for Ended {
+    fn r#subscribe(&self, _request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
+        Err(Status::new_service_specific_error(ERROR_CLOSED, None))
+    }
+}
+
+/// A watcher told of nothing, sent where a topic belongs.
+struct Silent;
+
+impl Interface for Silent {}
+
+impl ITopicWatcher for Silent {
+    fn r#onAdvertised(&self, _: &str, _: &Strong<dyn ITopic>, _: i64) -> BinderResult<()> {
+        Ok(())
     }
 }
 

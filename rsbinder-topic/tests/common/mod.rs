@@ -97,6 +97,20 @@ impl Peer {
         self.lines.recv_timeout(WAIT).expect("the peer to answer")
     }
 
+    /// The next line the peer says before `deadline`.
+    pub fn says_by(&self, deadline: Instant) -> String {
+        let left = deadline.saturating_duration_since(Instant::now());
+        self.lines
+            .recv_timeout(left)
+            .expect("the peer to answer in time")
+    }
+
+    /// Stop the peer with `SIGSTOP` until the guard is dropped, also when the test fails.
+    pub fn stop(&self) -> Stopped {
+        signal(self, rustix::process::Signal::STOP);
+        Stopped(self.child.id())
+    }
+
     pub fn tell(&mut self, line: &str) {
         writeln!(self.stdin.as_mut().unwrap(), "{line}").unwrap();
     }
@@ -114,8 +128,30 @@ impl Drop for Peer {
 }
 
 pub fn signal(peer: &Peer, signal: rustix::process::Signal) {
-    let pid = rustix::process::Pid::from_raw(peer.child.id() as i32).unwrap();
-    rustix::process::kill_process(pid, signal).unwrap();
+    send(peer.child.id(), signal).unwrap();
+}
+
+fn send(pid: u32, signal: rustix::process::Signal) -> rustix::io::Result<()> {
+    let pid = rustix::process::Pid::from_raw(pid as i32).unwrap();
+    rustix::process::kill_process(pid, signal)
+}
+
+/// A peer [`Peer::stop`] stopped, sent `SIGCONT` when dropped; drop it before its `Peer`.
+#[must_use = "the peer runs again when the guard is dropped"]
+pub struct Stopped(u32);
+
+impl Stopped {
+    /// Let the peer run before the guard is dropped, which sends `SIGCONT` once more.
+    pub fn resume(&self) {
+        // No panic in a drop that may run while a failed test unwinds.
+        let _ = send(self.0, rustix::process::Signal::CONT);
+    }
+}
+
+impl Drop for Stopped {
+    fn drop(&mut self) {
+        self.resume();
+    }
 }
 
 /// Read stdin until it closes: the test that spawned this child ended or dropped it.
