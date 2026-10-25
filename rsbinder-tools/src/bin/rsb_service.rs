@@ -186,7 +186,7 @@ fn cmd_topics(prefix: &str) -> ExitCode {
                 let age = format!("{:.1}s", topic.ageMillis as f64 / 1000.0);
                 println!(
                     "{:width$}  {:>6}  {:>8}  {:>9}  {}",
-                    topic.name, topic.uid, topic.pid, age, topic.watchers
+                    topic.name, topic.uid as u32, topic.pid, age, topic.watchers
                 );
             }
             ExitCode::from(exit::OK)
@@ -246,7 +246,7 @@ fn cli() -> clap::Command {
             .index(1)
     };
 
-    let command = clap::Command::new("rsb_service")
+    clap::Command::new("rsb_service")
         .version(env!("CARGO_PKG_VERSION"))
         .author(env!("CARGO_PKG_AUTHORS"))
         .about("Inspect the services registered with the binder service manager")
@@ -328,26 +328,34 @@ fn cli() -> clap::Command {
             $ rsb_service dump manager com.example    # narrow it by substring\n\n    \
             Exit status: 0 the answer is yes, 1 the answer is no, 2 the question \n    \
             could not be answered (no service manager, or its policy denied it).",
-        );
-    #[cfg(feature = "topic")]
-    let command = command.subcommand(
-        clap::Command::new("topics")
-            .about("List the topic names of rsb_hub's topic registry: name uid pid age watchers")
-            .arg(
-                clap::Arg::new("prefix")
-                    .value_name("PREFIX")
-                    .index(1)
-                    .default_value("")
-                    .help("Only list the names that start with this"),
-            ),
-    );
-    command
+        )
+        // Also without the feature, hidden: a usage error would exit 2 with nothing said of why.
+        .subcommand(
+            clap::Command::new("topics")
+                .about(
+                    "List the topic names of rsb_hub's topic registry: name uid pid age watchers",
+                )
+                .hide(!cfg!(feature = "topic"))
+                .arg(
+                    clap::Arg::new("prefix")
+                        .value_name("PREFIX")
+                        .index(1)
+                        .default_value("")
+                        .help("Only list the names that start with this"),
+                ),
+        )
 }
 
 fn main() -> ExitCode {
     let matches = cli().get_matches();
 
     env_logger::init();
+
+    #[cfg(not(feature = "topic"))]
+    if matches.subcommand_name() == Some("topics") {
+        eprintln!("rsb_service: built without the `topic` feature, so it has no `topics`");
+        return ExitCode::from(exit::ERR);
+    }
 
     let device = matches
         .get_one::<String>("device")

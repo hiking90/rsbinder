@@ -13,6 +13,12 @@
 #
 # Runs as the invoking user. Allowed and refused are told apart by name, as
 # in run_hub_policy_ac.sh; the subject sets themselves are the unit tests'.
+#
+# A hub is up once it logs that it serves, which it logs after the registry's
+# registration. A hub stopped just before may still hold the context manager
+# in the kernel's deferred release, so start_hub tries again while that is
+# what a new one dies of. Each hub writes a log of its own, hub.N.log; a FAIL
+# prints all of them, under the section that started each.
 set -u
 
 cd "$(dirname "$0")/../.." || exit 1
@@ -24,7 +30,7 @@ PROBE=./target/debug/topic_probe
 MY_UID=$(id -u)
 PASS=0; FAIL=0
 
-note() { printf '\n=== %s\n' "$*"; }
+note() { SECTION=$*; printf '\n=== %s\n' "$*"; }
 ok()   { PASS=$((PASS+1)); printf '  PASS  %s\n' "$*"; }
 bad()  { FAIL=$((FAIL+1)); printf '  FAIL  %s\n' "$*"; }
 
@@ -35,15 +41,26 @@ if [ -n "$running" ]; then
     exit 1
 fi
 
+# Until the build without the feature is done, target/debug/rsb_hub may be the topic one.
+PLAIN=0
+# Inode and ctime: cargo's uplift replaces the file, by a hard link or a copy, and so changes one.
+built() { stat -c '%i %z' "target/debug/$1" 2>/dev/null; }
+PRE_HUB=$(built rsb_hub); PRE_SVC=$(built rsb_service)
+trap '[ "$PLAIN" -eq 1 ] || { [ "$(built rsb_hub)" = "$PRE_HUB" ] || rm -f target/debug/rsb_hub
+      [ "$(built rsb_service)" = "$PRE_SVC" ] || rm -f target/debug/rsb_service; }
+      rm -f "$HUB_TOPIC" "$SVC_TOPIC"' EXIT
 cargo build -q -p rsbinder-tools --features topic --bin rsb_hub --bin rsb_service || exit 1
 cp -f target/debug/rsb_hub "$HUB_TOPIC" && cp -f target/debug/rsb_service "$SVC_TOPIC" || exit 1
 cargo build -q -p rsbinder-tools --bin rsb_hub --bin rsb_service || exit 1
+PLAIN=1
 cargo build -q -p tests --bin topic_probe || exit 1
 
 # Not under /tmp: rsb_hub refuses a configuration a world-writable directory holds.
 WORK=$(mktemp -d -p "${XDG_RUNTIME_DIR:-${HOME:?}}" rsb-topic-ac.XXXXXX) || exit 1
 CFG=$WORK/cfg
-LOG=$WORK/hub.log
+LOG=
+HUBS=()
+SECTION=
 HUB_PID=
 PIDS=()
 
@@ -59,20 +76,34 @@ stop_probes() {
     done
     PIDS=()
 }
-cleanup() { stop_probes; stop_hub; rm -f "$HUB_TOPIC" "$SVC_TOPIC"; rm -rf "$WORK"; }
+cleanup() {
+    stop_probes; stop_hub; rm -f "$HUB_TOPIC" "$SVC_TOPIC"
+    local n
+    [ "$FAIL" -eq 0 ] || { for n in "${!HUBS[@]}"; do
+            echo "--- hub $((n+1)) log, ${HUBS[n]}"; tail -50 "$WORK/hub.$((n+1)).log"; done
+        echo "--- probe stderr"; cat "$WORK/probe.err"; } >&2 2>/dev/null
+    rm -rf "$WORK"
+}
 trap cleanup EXIT
 
-# start_hub BIN ARGS...: up once it logs that it serves, which follows the registry's registration.
+# start_hub BIN ARGS...: up once it logs serving; retried while a stopped one holds handle 0.
 start_hub() {
     local bin=$1; shift
-    : > "$LOG"
-    RUST_LOG=info "$bin" "$@" >"$LOG" 2>&1 &
-    HUB_PID=$!
-    local i
-    for i in $(seq 100); do
-        grep -q "rsb_hub: serving on" "$LOG" && return 0
-        kill -0 "$HUB_PID" 2>/dev/null || { HUB_PID=; return 1; }
-        sleep 0.05
+    local try i
+    HUBS+=("$SECTION"); LOG=$WORK/hub.${#HUBS[@]}.log
+    for try in $(seq 5); do
+        : > "$LOG"
+        RUST_LOG=info "$bin" "$@" >"$LOG" 2>&1 &
+        HUB_PID=$!
+        for i in $(seq 100); do
+            grep -q "rsb_hub: serving on" "$LOG" && return 0
+            kill -0 "$HUB_PID" 2>/dev/null || break
+            sleep 0.05
+        done
+        kill -0 "$HUB_PID" 2>/dev/null && return 1
+        wait "$HUB_PID" 2>/dev/null; HUB_PID=
+        grep -q "cannot become the service manager" "$LOG" || return 1
+        sleep 0.2
     done
     return 1
 }
@@ -93,6 +124,9 @@ PERMISSIVE_TOPIC="20-topic.toml=$(cat tests/policy/topic/permissive-topic.toml)"
 LAST=
 probe() {
     local out=$1; shift
+    # Not in the child's redirection: a wait_line run first would read the last section's file.
+    : > "$out"
+    echo "--- $SECTION: $*" >> "$WORK/probe.err"
     "$PROBE" "$@" >"$out" 2>>"$WORK/probe.err" &
     LAST=$!
     PIDS+=("$LAST")
@@ -100,6 +134,7 @@ probe() {
 # probe_now OUT ARGS...: in the foreground, given 20 s.
 probe_now() {
     local out=$1; shift
+    echo "--- $SECTION: $*" >> "$WORK/probe.err"
     timeout 20 "$PROBE" "$@" >"$out" 2>>"$WORK/probe.err"
 }
 
@@ -112,6 +147,14 @@ wait_line() {
     done
     return 1
 }
+# wait_until FILE REGEX DEADLINE_MS: by the clock, not by polls; one more look past the deadline.
+wait_until() {
+    while [ "$(date +%s%3N)" -lt "$3" ]; do
+        grep -qE "$2" "$1" 2>/dev/null && return 0
+        sleep 0.05
+    done
+    grep -qE "$2" "$1" 2>/dev/null
+}
 # want FILE LINE LABEL
 want() {
     if grep -qxF "$2" "$1"; then ok "$3"; else bad "$3 (want '$2', got: $(grep -E '^(RESULT|GOT)' "$1" | tr '\n' ';'))"; fi
@@ -123,18 +166,22 @@ fast() {
     ms=$(awk -v op="$2" -v arg="$3" '$1=="TIME" && $2==op && $3==arg {ms=$4} END {print ms}' "$1")
     if [ -n "$ms" ] && [ "$ms" -lt 1000 ]; then ok "$4 (${ms} ms)"; else bad "$4 (${ms:-no answer} ms)"; fi
 }
-# stop_until_stopped PID...: SIGSTOP, then wait for the kernel to report each stopped.
+# stop_until_stopped PID...: SIGSTOP, then wait for the kernel to report every thread stopped.
 stop_until_stopped() {
     local pid i
     for pid in "$@"; do
         kill -STOP "$pid"
-        for i in $(seq 100); do
-            [ "$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null)" = T ] && break
+        for i in $(seq 101); do
+            [ "$i" -eq 101 ] && { bad "pid $pid did not stop"; return 1; }
+            awk '{sub(/.*\) /, ""); if ($1 != "T") f=1} END {exit !f}' \
+                /proc/"$pid"/task/*/stat 2>/dev/null || break
             sleep 0.01
         done
     done
 }
-dump_value() { "$SVC_TOPIC" dump manager 2>/dev/null | sed -n "s/.* $1=\([0-9]*\).*/\1/p"; }
+dump_value() {
+    timeout 10 "$SVC_TOPIC" dump manager 2>/dev/null | sed -n "s/.* $1=\([0-9]*\).*/\1/p"
+}
 # reload: SIGHUP, then wait for the hub to log one more reload, done or failed.
 reload() {
     local before i
@@ -146,13 +193,25 @@ reload() {
     done
     return 1
 }
+# reloaded: a reload that must take; a failed one is a FAIL, as the checks after it would not tell.
+reloaded() {
+    reload && grep "SIGHUP reload" "$LOG" | tail -1 | grep -q "SIGHUP reloaded" \
+        || bad "reload failed: $(grep "SIGHUP reload" "$LOG" | tail -1)"
+}
 
 ######################################################################
 note "AC-15.5.7  a hub without the feature refuses topic rules"
 config "$PERMISSIVE" "$PERMISSIVE_TOPIC"
 out=$(timeout 5 "$HUB" --config "$CFG" 2>&1); rc=$?
 [ "$rc" -eq 1 ] && ok "does not start (exit 1)" || bad "exit $rc"
-echo "$out" | grep -q "TOML parse error" && ok "names the refused file" || bad "message: $out"
+echo "$out" | grep -q "20-topic.toml: TOML parse error" && ok "names the refused file" \
+    || bad "message: $out"
+config "$PERMISSIVE" "20-t.toml=[[topic]]
+name = \"x.*\""
+out=$(timeout 5 "$HUB" --config "$CFG" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && ok "[[topic]] alone: does not start (exit 1)" || bad "exit $rc"
+echo "$out" | grep -q "20-t.toml: TOML parse error" && ok "names the refused file" \
+    || bad "message: $out"
 
 config "$PERMISSIVE"
 if start_hub "$HUB" --config "$CFG"; then
@@ -160,6 +219,8 @@ if start_hub "$HUB" --config "$CFG"; then
     reload
     grep -q "reload of .* failed, keeping" "$LOG" && ok "SIGHUP keeps the configuration in force" \
         || bad "no failed reload: $(tail -2 "$LOG")"
+    timeout 10 "$SVC_TOPIC" list >/dev/null 2>&1 && ok "and the list it grants still answers" \
+        || bad "list refused after the failed reload"
     probe_now "$WORK/out" find
     want "$WORK/out" "RESULT find  NOTFOUND" "no registry to find"
 else
@@ -180,7 +241,7 @@ if start_hub "$HUB_TOPIC" --insecure-allow-all; then
     want "$WORK/a" "RESULT lookup ia.a FOUND" "lookup allowed"
     want "$WORK/a" "LISTED ia.a $MY_UID 0" "list allowed"
     want "$WORK/a" "RESULT addreserved  SECURITY" "the registry's name is refused even so"
-    "$SVC_TOPIC" dump manager > "$WORK/dump" 2>&1
+    timeout 10 "$SVC_TOPIC" dump manager > "$WORK/dump" 2>&1
     grep -q "topic registry: registered as rsbinder.topic.registry, access control DISABLED" \
         "$WORK/dump" && ok "the dump shows the registry" || bad "dump: $(head -8 "$WORK/dump")"
 else
@@ -195,7 +256,9 @@ if start_hub "$HUB_TOPIC" --config "$CFG" --allow-cross-uid-overwrite; then
     probe "$WORK/a" addreserved publish:ls.b:v publish:ls.a:v publish:other.a:v say:done hold
     wait_line "$WORK/a" "^SAY done" 10
     want "$WORK/a" "RESULT addreserved  SECURITY" "the registry's name is refused"
-    "$SVC_TOPIC" topics ls. > "$WORK/topics" 2>&1; rc=$?
+    want "$WORK/a" "RESULT publish other.a OK" "a name outside the prefix is there"
+    # Stdout alone: a `RUST_LOG` the caller exported puts log lines on stderr.
+    timeout 10 "$SVC_TOPIC" topics ls. > "$WORK/topics" 2>>"$WORK/probe.err"; rc=$?
     [ "$rc" -eq 0 ] && ok "topics exits 0" || bad "topics exit $rc"
     head -1 "$WORK/topics" | grep -qE "^NAME +UID +PID +AGE +WATCHERS$" && ok "a header of the columns" \
         || bad "header: $(head -1 "$WORK/topics")"
@@ -237,13 +300,15 @@ if start_hub "$HUB_TOPIC" --config "$CFG"; then
         publish:zz.a:v lookup:ac.open.a lookup:ac.hidden.a list:ac. say:done hold
     wait_line "$WORK/a" "^SAY done" 10
     want "$WORK/a" "RESULT publish ac.open.a OK" "advertise allowed"
+    want "$WORK/a" "RESULT publish ac.hidden.a OK" "advertise allowed where subscribe is not"
     want "$WORK/a" "RESULT publish ac.closed.a SECURITY" "advertise refused: EX_SECURITY"
     want "$WORK/a" "RESULT publish zz.a SECURITY" "a name no rule covers is refused"
     want "$WORK/a" "RESULT lookup ac.open.a FOUND" "subscribe allowed"
     want "$WORK/a" "RESULT lookup ac.hidden.a NULL" "subscribe refused: a null topic"
     want "$WORK/a" "LISTED ac.open.a $MY_UID 0" "list shows what the caller may subscribe to"
-    reject "$WORK/a" "LISTED ac.hidden.a $MY_UID 0" "and leaves out what it may not"
-    "$SVC_TOPIC" dump manager > "$WORK/dump" 2>&1
+    if grep -q "^LISTED ac.hidden.a " "$WORK/a"; then bad "and leaves out what it may not"
+    else ok "and leaves out what it may not"; fi
+    timeout 10 "$SVC_TOPIC" dump manager > "$WORK/dump" 2>&1
     grep -q "topic registry: registered as rsbinder.topic.registry, 3 topic rule(s)" "$WORK/dump" \
         && ok "the dump counts the topic rules" || bad "dump: $(grep 'topic registry' "$WORK/dump")"
     grep -q " notices_failed=0 " "$WORK/dump" && ok "the dump carries the counters" \
@@ -252,14 +317,14 @@ if start_hub "$HUB_TOPIC" --config "$CFG"; then
     note "AC-15.5.7/8  [global] topics: undefined and \"none\" refuse list"
     stop_probes
     ac_rules ""
-    reload
+    reloaded
     probe_now "$WORK/b" list:ac.
     want "$WORK/b" "RESULT list ac. SECURITY" "undefined: refused"
     ac_rules 'topics = "none"'
-    reload
+    reloaded
     probe_now "$WORK/b" list:ac.
     want "$WORK/b" "RESULT list ac. SECURITY" "\"none\": refused"
-    "$SVC_TOPIC" topics > "$WORK/topics" 2>&1; rc=$?
+    timeout 10 "$SVC_TOPIC" topics > "$WORK/topics" 2>&1; rc=$?
     [ "$rc" -eq 2 ] && ok "topics exits 2" || bad "topics exit $rc"
     grep -q "policy denies" "$WORK/topics" && grep -q '\[global\] topics' "$WORK/topics" \
         && ok "and says which policy" || bad "topics: $(cat "$WORK/topics")"
@@ -294,7 +359,7 @@ if start_hub "$HUB_TOPIC" --config "$CFG"; then
     probe "$WORK/p1" publish:rt.a:one hold
     wait_line "$WORK/w" "^GOT rt.a one$" 10 && ok "the watcher gets the first publisher" \
         || bad "no first value: $(cat "$WORK/w")"
-    rt_rules '"none"'; reload
+    rt_rules '"none"'; reloaded
     probe "$WORK/p2" publish:rt.a:two say:up hold
     wait_line "$WORK/p2" "^SAY up" 10
     want "$WORK/p2" "RESULT publish rt.a OK" "the second publisher advertises"
@@ -302,7 +367,7 @@ if start_hub "$HUB_TOPIC" --config "$CFG"; then
     reject "$WORK/w" "GOT rt.a two" "a watcher that lost subscribe is told nothing"
     probe_now "$WORK/b" lookup:rt.a
     want "$WORK/b" "RESULT lookup rt.a NULL" "and finds nothing"
-    rt_rules '"any"'; reload
+    rt_rules '"any"'; reloaded
     probe "$WORK/p3" publish:rt.a:three hold
     wait_line "$WORK/w" "^GOT rt.a three$" 10 && ok "given it back, the next advertise reaches it" \
         || bad "no third value: $(cat "$WORK/w")"
@@ -317,14 +382,19 @@ config "$PERMISSIVE" "$PERMISSIVE_TOPIC"
 if start_hub "$HUB_TOPIC" --config "$CFG"; then
     probe "$WORK/a" publish:sp.a:x say:up hold; publisher=$LAST
     wait_line "$WORK/a" "^SAY up" 10
-    # The client looks the name up first and keeps the proxy: one with none would ask the
-    # stopped process for its descriptor, a wait of the client's own (plan 15 §12.7).
+    # Keeps the first lookup's proxy: a new one would ask the stopped publisher (plan 15 §12.7).
     probe "$WORK/c" lookup:sp.a say:looked wait:"$WORK/go1" lookup:sp.a list:sp. \
         publish:sp.b:y say:done hold
     wait_line "$WORK/c" "^SAY looked" 10
     stop_until_stopped "$publisher"
     touch "$WORK/go1"
     if wait_line "$WORK/c" "^SAY done" 10; then
+        want "$WORK/a" "RESULT publish sp.a OK" "the publisher advertises"
+        [ "$(grep -c -xF "RESULT lookup sp.a FOUND" "$WORK/c")" -eq 2 ] \
+            && ok "both lookups find it" || bad "lookups: $(grep "lookup sp.a" "$WORK/c")"
+        want "$WORK/c" "RESULT list sp. OK" "list answers"
+        grep -q "^LISTED sp.a " "$WORK/c" && ok "with the stopped publisher's name" \
+            || bad "not listed: $(grep LISTED "$WORK/c")"
         fast "$WORK/c" lookup sp.a "lookup of the stopped publisher's name"
         fast "$WORK/c" list sp. "list"
         fast "$WORK/c" publish sp.b "another publisher's advertise"
@@ -356,6 +426,7 @@ if start_hub "$HUB_TOPIC" --config "$CFG"; then
         fast "$WORK/f" flood sw.a "the longest of them"
         fast "$WORK/f" publish sw.a "the last publisher's advertise"
         probe_now "$WORK/d" lookup:sw.a
+        want "$WORK/d" "RESULT lookup sw.a FOUND" "another client finds it"
         fast "$WORK/d" lookup sw.a "another client's lookup"
         failed=$(dump_value notices_failed); owed=$(dump_value owed)
         [ "${failed:-0}" -ge 1 ] && ok "the hub's dump counts failed notices ($failed, $owed owed)" \
@@ -364,8 +435,11 @@ if start_hub "$HUB_TOPIC" --config "$CFG"; then
         bad "the hub is held up: $(cat "$WORK/f")"
     fi
     for pid in "${watchers[@]}"; do kill -CONT "$pid"; done
-    met=0
-    for i in $(seq 8); do wait_line "$WORK/w$i" "^GOT sw.a last$" 10 && met=$((met+1)); done
+    # One deadline for all 8; a watcher reached past it gets one look, not a second of its own.
+    deadline=$(( $(date +%s%3N) + 10000 )); met=0
+    for i in $(seq 8); do
+        wait_until "$WORK/w$i" "^GOT sw.a last$" "$deadline" && met=$((met+1))
+    done
     [ "$met" -eq 8 ] && ok "all 8 meet the last publisher within 10 s" || bad "$met of 8"
 else
     bad "hub did not start: $(tail -3 "$LOG")"
@@ -384,10 +458,13 @@ if start_hub "$HUB_TOPIC" --config "$CFG"; then
     want "$WORK/b" "RESULT fill fill.:40 OK" "their notices sent"
     probe "$WORK/p" publish:sm.a:small say:up hold
     wait_line "$WORK/p" "^SAY up" 10
-    owed=$(dump_value owed)
-    [ "${owed:-0}" -ge 1 ] && ok "the publisher's notice is owed ($owed owed)" || bad "owed=${owed:-none}"
+    # By name: the fill watches the hub has yet to forget may still be owed too.
+    wait_line "$LOG" 'a notice of "sm\.a" failed: Busy' 10 \
+        && ok "the publisher's notice is owed ($(dump_value owed) owed)" \
+        || bad "no owed notice of sm.a: $(grep 'a notice of' "$LOG" | tail -2)"
     touch "$WORK/go2"
-    wait_line "$WORK/s" "^GOT sm.a small$" 35 && ok "it arrives within 30 s of the pool" \
+    wait_until "$WORK/s" "^GOT sm.a small$" $(( $(date +%s%3N) + 30000 )) \
+        && ok "it arrives within 30 s of the pool" \
         || bad "never arrived: $(cat "$WORK/s")"
 else
     bad "hub did not start: $(tail -3 "$LOG")"
