@@ -101,8 +101,25 @@ Each item below changes what a 0.12.0 program observes.
   declaration(s)" (0.12.0: "N rule(s) and M service declaration(s)"), and
   its supervisor's status line reads "serving; N rule(s), M service
   declaration(s)" (0.12.0: "serving; N rule(s), M declaration(s)").
+- `RemoteProxy` has a required method, `prepare_request`. A type outside
+  rsbinder that implements the trait must add it. Generated proxies reach
+  the trait only through `as_remote`, which returns `ProxyHandle` and
+  `RpcProxy` alone, so such a type was never driven by them.
+- `Debug` of an `SIBinder` or `dyn IBinder` prints a descriptor it cannot
+  learn without a transaction as `(not cached)`: an RPC proxy no typed cast
+  has stamped yet (0.12.0: an empty string).
 
 ### Added
+
+- **Generated proxies write their own interface descriptor as the request
+  token**, as every AOSP backend does, through the new
+  `RemoteProxy::prepare_request(interface)`, also on `ProxyHandle`.
+  0.12.0 wrote the descriptor the proxy held for its remote, which a
+  successful typed cast had already made equal, so the bytes on the wire do
+  not change. `prepare_transact(true)` still writes the remote's.
+- **`IBinder::try_descriptor`**: the descriptor with the error of a query that
+  failed, where `descriptor()` returns `""` for both that and a binder
+  whose interface states none.
 
 - **`rsbinder-topic`, a new crate (Experimental)**: one publisher and many
   subscribers over kernel binder, on Linux and Android. A binder call sets

@@ -470,12 +470,12 @@ pub mod {{mod}} {
         {%- for member in fn_members %}
         fn build_parcel_{{ member.identifier }}({{ member.args }}) -> {{crate}}::Result<{{crate}}::Parcel> {
             {%- if member.write_funcs|length > 0 %}
-            let mut data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_transact(true)?;
+            let mut data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_request(<Self as {{crate}}::Proxy>::descriptor())?;
             {%- for func in member.write_funcs %}
             {{ func }}
             {%- endfor %}
             {%- else %}
-            let data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_transact(true)?;
+            let data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_request(<Self as {{crate}}::Proxy>::descriptor())?;
             {%- endif %}
             ::core::result::Result::Ok(data)
         }
@@ -508,7 +508,7 @@ pub mod {{mod}} {
         {%- endfor %}
         {%- if version is number %}
         fn build_parcel_getInterfaceVersion(&self) -> {{crate}}::Result<{{crate}}::Parcel> {
-            let data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_transact(true)?;
+            let data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_request(<Self as {{crate}}::Proxy>::descriptor())?;
             ::core::result::Result::Ok(data)
         }
         fn read_response_getInterfaceVersion(&self, _aidl_reply: {{crate}}::Result<::core::option::Option<{{crate}}::Parcel>>) -> {{crate}}::BinderResult<i32> {
@@ -522,7 +522,7 @@ pub mod {{mod}} {
         {%- endif %}
         {%- if hash %}
         fn build_parcel_getInterfaceHash(&self) -> {{crate}}::Result<{{crate}}::Parcel> {
-            let data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_transact(true)?;
+            let data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_request(<Self as {{crate}}::Proxy>::descriptor())?;
             ::core::result::Result::Ok(data)
         }
         fn read_response_getInterfaceHash(&self, _aidl_reply: {{crate}}::Result<::core::option::Option<{{crate}}::Parcel>>) -> {{crate}}::BinderResult<::std::string::String> {

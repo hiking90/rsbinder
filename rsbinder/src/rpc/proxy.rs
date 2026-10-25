@@ -252,6 +252,10 @@ impl crate::binder::RemoteProxy for RpcProxy {
         Ok(data)
     }
 
+    fn prepare_request(&self, interface: &str) -> Result<Parcel> {
+        self.build_request(interface)
+    }
+
     fn submit_transact(
         &self,
         code: TransactionCode,
@@ -364,6 +368,10 @@ impl IBinder for RpcProxy {
 
     fn descriptor(&self) -> &str {
         self.descriptor_str()
+    }
+
+    fn cached_descriptor(&self) -> Option<&str> {
+        self.descriptor.get().map(String::as_str)
     }
 
     fn is_remote(&self) -> bool {

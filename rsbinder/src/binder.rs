@@ -393,6 +393,24 @@ pub trait IBinder: Any + Send + Sync {
 
     /// Retrieve the descriptor of this object.
     fn descriptor(&self) -> &str;
+
+    /// [`descriptor`](Self::descriptor), with the error of a query that failed.
+    ///
+    /// `descriptor` returns `""` both for a binder whose interface states no
+    /// descriptor and for a query that failed; a check that must tell the two
+    /// apart calls this instead.
+    fn try_descriptor(&self) -> Result<&str> {
+        Ok(self.descriptor())
+    }
+
+    /// The descriptor if it is known without a transaction, else `None`.
+    ///
+    /// For output and checks that must not wait on the remote, such as `Debug`.
+    #[doc(hidden)]
+    fn cached_descriptor(&self) -> Option<&str> {
+        Some(self.descriptor())
+    }
+
     /// Retrieve if this object is remote.
     fn is_remote(&self) -> bool;
 
@@ -546,7 +564,18 @@ pub trait IBinder: Any + Send + Sync {
 pub trait RemoteProxy {
     /// Allocate the request `Parcel`, optionally writing the AIDL
     /// interface header.
+    ///
+    /// The header carries the descriptor the proxy holds for its remote, not
+    /// the caller's interface; [`prepare_request`](Self::prepare_request)
+    /// writes the caller's, as generated proxies do.
     fn prepare_transact(&self, write_header: bool) -> Result<Parcel>;
+    /// Allocate the request `Parcel` with the AIDL interface header for
+    /// `interface`, the descriptor of the interface the caller speaks.
+    ///
+    /// Generated proxies call this with their own descriptor, as every AOSP
+    /// backend writes the proxy class's descriptor rather than the one the
+    /// remote reports; a remote of another interface refuses the token.
+    fn prepare_request(&self, interface: &str) -> Result<Parcel>;
     /// Submit the transaction and return the reply (`None` for oneway).
     fn submit_transact(
         &self,
@@ -603,11 +632,16 @@ pub fn __rpc_stamp_descriptor(binder: &SIBinder, descriptor: &str) {
 #[cfg(not(feature = "rpc"))]
 pub fn __rpc_stamp_descriptor(_binder: &SIBinder, _descriptor: &str) {}
 
+/// `Debug`'s descriptor, never a transaction (AOSP `BPBINDER_BEST_DESCRIPTOR_LOCKED`).
+fn descriptor_for_debug(binder: &dyn IBinder) -> &str {
+    binder.cached_descriptor().unwrap_or("(not cached)")
+}
+
 impl std::fmt::Debug for dyn IBinder {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         // `as_any()` would format as the useless `Any { .. }`; show the useful fields instead.
         f.debug_struct("dyn IBinder")
-            .field("descriptor", &self.descriptor())
+            .field("descriptor", &descriptor_for_debug(self))
             .field("remote", &self.is_remote())
             .finish()
     }
@@ -1105,7 +1139,7 @@ impl SIBinder {
 impl Debug for SIBinder {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         f.debug_struct("SIBinder")
-            .field("descriptor", &self.descriptor())
+            .field("descriptor", &descriptor_for_debug(&**self))
             .field("ptr", &Arc::as_ptr(&self.inner))
             .finish()
     }

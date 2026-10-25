@@ -3067,9 +3067,11 @@ pub fn rsbinder::rpc::proxy::RpcProxy::rpc_transact(&self, rsbinder::Transaction
 pub fn rsbinder::rpc::proxy::RpcProxy::set_extension(&self, &rsbinder::SIBinder) -> rsbinder::Result<()>
 pub fn rsbinder::rpc::proxy::RpcProxy::set_parceled(&self)
 pub fn rsbinder::rpc::proxy::RpcProxy::stability(&self) -> rsbinder::Stability
+pub fn rsbinder::rpc::proxy::RpcProxy::try_descriptor(&self) -> rsbinder::Result<&str>
 pub fn rsbinder::rpc::proxy::RpcProxy::unlink_to_death(&self, alloc::sync::Weak<dyn rsbinder::DeathRecipient>) -> rsbinder::Result<()>
 pub fn rsbinder::rpc::proxy::RpcProxy::was_parceled(&self) -> bool
 impl rsbinder::RemoteProxy for rsbinder::rpc::proxy::RpcProxy
+pub fn rsbinder::rpc::proxy::RpcProxy::prepare_request(&self, &str) -> rsbinder::Result<rsbinder::Parcel>
 pub fn rsbinder::rpc::proxy::RpcProxy::prepare_transact(&self, bool) -> rsbinder::Result<rsbinder::Parcel>
 pub fn rsbinder::rpc::proxy::RpcProxy::submit_transact(&self, rsbinder::TransactionCode, &rsbinder::Parcel, rsbinder::TransactionFlags) -> rsbinder::Result<core::option::Option<rsbinder::Parcel>>
 impl !core::marker::Freeze for rsbinder::rpc::proxy::RpcProxy
@@ -3662,9 +3664,11 @@ pub fn rsbinder::rpc::proxy::RpcProxy::rpc_transact(&self, rsbinder::Transaction
 pub fn rsbinder::rpc::proxy::RpcProxy::set_extension(&self, &rsbinder::SIBinder) -> rsbinder::Result<()>
 pub fn rsbinder::rpc::proxy::RpcProxy::set_parceled(&self)
 pub fn rsbinder::rpc::proxy::RpcProxy::stability(&self) -> rsbinder::Stability
+pub fn rsbinder::rpc::proxy::RpcProxy::try_descriptor(&self) -> rsbinder::Result<&str>
 pub fn rsbinder::rpc::proxy::RpcProxy::unlink_to_death(&self, alloc::sync::Weak<dyn rsbinder::DeathRecipient>) -> rsbinder::Result<()>
 pub fn rsbinder::rpc::proxy::RpcProxy::was_parceled(&self) -> bool
 impl rsbinder::RemoteProxy for rsbinder::rpc::proxy::RpcProxy
+pub fn rsbinder::rpc::proxy::RpcProxy::prepare_request(&self, &str) -> rsbinder::Result<rsbinder::Parcel>
 pub fn rsbinder::rpc::proxy::RpcProxy::prepare_transact(&self, bool) -> rsbinder::Result<rsbinder::Parcel>
 pub fn rsbinder::rpc::proxy::RpcProxy::submit_transact(&self, rsbinder::TransactionCode, &rsbinder::Parcel, rsbinder::TransactionFlags) -> rsbinder::Result<core::option::Option<rsbinder::Parcel>>
 impl !core::marker::Freeze for rsbinder::rpc::proxy::RpcProxy
@@ -5458,6 +5462,7 @@ pub struct rsbinder::ProxyHandle
 impl rsbinder::ProxyHandle
 pub fn rsbinder::ProxyHandle::descriptor(&self) -> &str
 pub fn rsbinder::ProxyHandle::handle(&self) -> u32
+pub fn rsbinder::ProxyHandle::prepare_request(&self, &str) -> rsbinder::Result<rsbinder::Parcel>
 pub fn rsbinder::ProxyHandle::prepare_transact(&self, bool) -> rsbinder::Result<rsbinder::Parcel>
 pub fn rsbinder::ProxyHandle::submit_transact(&self, rsbinder::TransactionCode, &rsbinder::Parcel, rsbinder::TransactionFlags) -> rsbinder::Result<core::option::Option<rsbinder::Parcel>>
 impl rsbinder::ProxyHandle
@@ -5492,9 +5497,11 @@ pub fn rsbinder::ProxyHandle::rpc_transact(&self, rsbinder::TransactionCode, &mu
 pub fn rsbinder::ProxyHandle::set_extension(&self, &rsbinder::SIBinder) -> rsbinder::Result<()>
 pub fn rsbinder::ProxyHandle::set_parceled(&self)
 pub fn rsbinder::ProxyHandle::stability(&self) -> rsbinder::Stability
+pub fn rsbinder::ProxyHandle::try_descriptor(&self) -> rsbinder::Result<&str>
 pub fn rsbinder::ProxyHandle::unlink_to_death(&self, alloc::sync::Weak<dyn rsbinder::DeathRecipient>) -> rsbinder::Result<()>
 pub fn rsbinder::ProxyHandle::was_parceled(&self) -> bool
 impl rsbinder::RemoteProxy for rsbinder::ProxyHandle
+pub fn rsbinder::ProxyHandle::prepare_request(&self, &str) -> rsbinder::Result<rsbinder::Parcel>
 pub fn rsbinder::ProxyHandle::prepare_transact(&self, bool) -> rsbinder::Result<rsbinder::Parcel>
 pub fn rsbinder::ProxyHandle::submit_transact(&self, rsbinder::TransactionCode, &rsbinder::Parcel, rsbinder::TransactionFlags) -> rsbinder::Result<core::option::Option<rsbinder::Parcel>>
 impl !core::marker::Freeze for rsbinder::ProxyHandle
@@ -6252,6 +6259,7 @@ pub fn rsbinder::IBinder::rpc_transact(&self, rsbinder::TransactionCode, &mut rs
 pub fn rsbinder::IBinder::set_extension(&self, &rsbinder::SIBinder) -> rsbinder::Result<()>
 pub fn rsbinder::IBinder::set_parceled(&self)
 pub fn rsbinder::IBinder::stability(&self) -> rsbinder::Stability
+pub fn rsbinder::IBinder::try_descriptor(&self) -> rsbinder::Result<&str>
 pub fn rsbinder::IBinder::unlink_to_death(&self, alloc::sync::Weak<dyn rsbinder::DeathRecipient>) -> rsbinder::Result<()>
 pub fn rsbinder::IBinder::was_parceled(&self) -> bool
 impl rsbinder::IBinder for rsbinder::ProxyHandle
@@ -6277,6 +6285,7 @@ pub fn rsbinder::ProxyHandle::rpc_transact(&self, rsbinder::TransactionCode, &mu
 pub fn rsbinder::ProxyHandle::set_extension(&self, &rsbinder::SIBinder) -> rsbinder::Result<()>
 pub fn rsbinder::ProxyHandle::set_parceled(&self)
 pub fn rsbinder::ProxyHandle::stability(&self) -> rsbinder::Stability
+pub fn rsbinder::ProxyHandle::try_descriptor(&self) -> rsbinder::Result<&str>
 pub fn rsbinder::ProxyHandle::unlink_to_death(&self, alloc::sync::Weak<dyn rsbinder::DeathRecipient>) -> rsbinder::Result<()>
 pub fn rsbinder::ProxyHandle::was_parceled(&self) -> bool
 impl rsbinder::IBinder for rsbinder::rpc::proxy::RpcProxy
@@ -6302,6 +6311,7 @@ pub fn rsbinder::rpc::proxy::RpcProxy::rpc_transact(&self, rsbinder::Transaction
 pub fn rsbinder::rpc::proxy::RpcProxy::set_extension(&self, &rsbinder::SIBinder) -> rsbinder::Result<()>
 pub fn rsbinder::rpc::proxy::RpcProxy::set_parceled(&self)
 pub fn rsbinder::rpc::proxy::RpcProxy::stability(&self) -> rsbinder::Stability
+pub fn rsbinder::rpc::proxy::RpcProxy::try_descriptor(&self) -> rsbinder::Result<&str>
 pub fn rsbinder::rpc::proxy::RpcProxy::unlink_to_death(&self, alloc::sync::Weak<dyn rsbinder::DeathRecipient>) -> rsbinder::Result<()>
 pub fn rsbinder::rpc::proxy::RpcProxy::was_parceled(&self) -> bool
 pub trait rsbinder::Interface: core::marker::Send + core::marker::Sync
@@ -6458,12 +6468,15 @@ pub fn rsbinder::shared_memory::wire::BnMemoryHeap<H>::on_dump(&self, &mut dyn s
 pub fn rsbinder::shared_memory::wire::BnMemoryHeap<H>::on_transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 pub fn rsbinder::shared_memory::wire::BnMemoryHeap<H>::transaction_name(rsbinder::TransactionCode) -> core::option::Option<&'static str> where Self: core::marker::Sized
 pub trait rsbinder::RemoteProxy
+pub fn rsbinder::RemoteProxy::prepare_request(&self, &str) -> rsbinder::Result<rsbinder::Parcel>
 pub fn rsbinder::RemoteProxy::prepare_transact(&self, bool) -> rsbinder::Result<rsbinder::Parcel>
 pub fn rsbinder::RemoteProxy::submit_transact(&self, rsbinder::TransactionCode, &rsbinder::Parcel, rsbinder::TransactionFlags) -> rsbinder::Result<core::option::Option<rsbinder::Parcel>>
 impl rsbinder::RemoteProxy for rsbinder::ProxyHandle
+pub fn rsbinder::ProxyHandle::prepare_request(&self, &str) -> rsbinder::Result<rsbinder::Parcel>
 pub fn rsbinder::ProxyHandle::prepare_transact(&self, bool) -> rsbinder::Result<rsbinder::Parcel>
 pub fn rsbinder::ProxyHandle::submit_transact(&self, rsbinder::TransactionCode, &rsbinder::Parcel, rsbinder::TransactionFlags) -> rsbinder::Result<core::option::Option<rsbinder::Parcel>>
 impl rsbinder::RemoteProxy for rsbinder::rpc::proxy::RpcProxy
+pub fn rsbinder::rpc::proxy::RpcProxy::prepare_request(&self, &str) -> rsbinder::Result<rsbinder::Parcel>
 pub fn rsbinder::rpc::proxy::RpcProxy::prepare_transact(&self, bool) -> rsbinder::Result<rsbinder::Parcel>
 pub fn rsbinder::rpc::proxy::RpcProxy::submit_transact(&self, rsbinder::TransactionCode, &rsbinder::Parcel, rsbinder::TransactionFlags) -> rsbinder::Result<core::option::Option<rsbinder::Parcel>>
 pub trait rsbinder::Serialize

@@ -322,12 +322,22 @@ impl ProxyHandle {
 
         Ok(data)
     }
+
+    /// See [`RemoteProxy::prepare_request`].
+    pub fn prepare_request(&self, interface: &str) -> Result<Parcel> {
+        let mut data = Parcel::new();
+        data.write_interface_token(interface)?;
+        Ok(data)
+    }
 }
 
 // Delegates to the inherent methods, which generated `Bp*` code also calls via `as_proxy()`.
 impl RemoteProxy for ProxyHandle {
     fn prepare_transact(&self, write_header: bool) -> Result<Parcel> {
         ProxyHandle::prepare_transact(self, write_header)
+    }
+    fn prepare_request(&self, interface: &str) -> Result<Parcel> {
+        ProxyHandle::prepare_request(self, interface)
     }
     fn submit_transact(
         &self,

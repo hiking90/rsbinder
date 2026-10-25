@@ -131,6 +131,14 @@ impl IBinder for AccessorRoot {
         self.inner_binder().descriptor()
     }
 
+    fn try_descriptor(&self) -> Result<&str> {
+        self.inner_binder().try_descriptor()
+    }
+
+    fn cached_descriptor(&self) -> Option<&str> {
+        self.inner_binder().cached_descriptor()
+    }
+
     fn is_remote(&self) -> bool {
         self.inner_binder().is_remote()
     }
