@@ -121,10 +121,10 @@ impl Subjects {
     }
 }
 
-/// A service-name pattern.
+/// A pattern of service names (`[[rule]]`) or of topic names (`[[topic]]`).
 ///
-/// Only a trailing `*` is supported. Service names are restricted to
-/// `[A-Za-z0-9._/-]` by `rsb_hub`'s own `is_valid_service_name`, so a
+/// Only a trailing `*` is supported. Both kinds of name are restricted to
+/// `[A-Za-z0-9._/-]` (`is_valid_service_name`, and the topic registry's copy of it), so a
 /// general glob engine would buy nothing over a matcher small enough to
 /// audit by eye — and an auditable matcher is the point in a file whose
 /// job is to deny things.
@@ -388,8 +388,8 @@ impl TopicPolicy {
 /// Why a policy could not be built.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PolicyError {
-    /// A rule's `name` was the empty string.
-    #[error("service name pattern must not be empty")]
+    /// A rule's `name` was the empty string, in `[[rule]]` or `[[topic]]`.
+    #[error("name pattern must not be empty")]
     EmptyPattern,
     /// A `*` appeared anywhere but the end. See [`NamePattern::parse`].
     #[error("unsupported wildcard in {0:?}: only a trailing `*` is supported")]

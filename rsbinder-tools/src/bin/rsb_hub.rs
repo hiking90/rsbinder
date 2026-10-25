@@ -107,10 +107,16 @@ fn distinct_name_cap_exceeded<V>(map: &BTreeMap<String, V>, name: &str) -> bool 
     !map.contains_key(name) && map.len() >= MAX_DISTINCT_NAMES
 }
 
+/// AOSP `ServiceManager.cpp`'s message for `addService` and `registerClientCallback`.
+const LINK_FAILED: &str = "Couldn't linkToDeath.";
+
+/// AOSP `ServiceManager.cpp`'s message for `registerForNotifications`.
+const CALLBACK_LINK_FAILED: &str = "Couldn't link to death.";
+
 /// AOSP `ServiceManager.cpp`'s answer; `DeadObject` would read as the hub's own death.
-fn link_failed(handle: u32, status: StatusCode) -> Status {
+fn link_failed(handle: u32, status: StatusCode, message: &str) -> Status {
     log::error!("could not link to the death of handle {handle}: {status:?}");
-    Status::from((ExceptionCode::IllegalState, "Couldn't linkToDeath."))
+    Status::from((ExceptionCode::IllegalState, message))
 }
 
 /// Weak so it cannot outlive its registry entries; it is also what an obituary matches on.
@@ -157,12 +163,16 @@ impl Inner {
     }
 
     /// Pair each `Ok` with one `release_death_link` or `retire_dead_binder`; native = no-op.
-    fn retain_death_link(&mut self, binder: &SIBinder) -> rsbinder::BinderResult<()> {
+    fn retain_death_link(
+        &mut self,
+        binder: &SIBinder,
+        refusal: &str,
+    ) -> rsbinder::BinderResult<()> {
         let Some(handle) = binder.as_proxy().map(|proxy| proxy.handle()) else {
             return Ok(());
         };
         let recipient: Arc<dyn rsbinder::DeathRecipient> = self.death_recipient.clone();
-        self.retain_counted(handle, &SIBinder::downgrade(binder), || {
+        self.retain_counted(handle, &SIBinder::downgrade(binder), refusal, || {
             binder.link_to_death(Arc::downgrade(&recipient))
         })
     }
@@ -172,13 +182,14 @@ impl Inner {
         &mut self,
         handle: u32,
         weak: &rsbinder::WIBinder,
+        refusal: &str,
         link: impl FnOnce() -> rsbinder::Result<()>,
     ) -> rsbinder::BinderResult<()> {
         if let Some(existing) = self.death_links.get_mut(&handle) {
             existing.count += 1;
             return Ok(());
         }
-        link().map_err(|status| link_failed(handle, status))?;
+        link().map_err(|status| link_failed(handle, status, refusal))?;
         self.death_links.insert(
             handle,
             DeathLink {
@@ -1045,7 +1056,7 @@ impl IServiceManager for ServiceManager {
 
             // Retain before release: a failed link then leaves the old registration intact.
             if !same_binder {
-                inner.retain_death_link(service)?;
+                inner.retain_death_link(service, LINK_FAILED)?;
             }
 
             if let Some(old) = old_to_unlink {
@@ -1200,7 +1211,7 @@ impl IServiceManager for ServiceManager {
             }
 
             // One reference per (name, callback) entry.
-            inner.retain_death_link(&arg_callback.as_binder())?;
+            inner.retain_death_link(&arg_callback.as_binder(), CALLBACK_LINK_FAILED)?;
 
             inner
                 .name_to_registration_callbacks
@@ -1371,7 +1382,7 @@ impl IServiceManager for ServiceManager {
             }
 
             // Released only on death: kept across `tryUnregisterService`, as in AOSP.
-            inner.retain_death_link(&arg_callback.as_binder())?;
+            inner.retain_death_link(&arg_callback.as_binder(), LINK_FAILED)?;
 
             if service_has_clients {
                 pending.push(PendingCallback::Clients {
@@ -1950,7 +1961,7 @@ mod tests {
 
         for _ in 0..5 {
             inner
-                .retain_counted(7, &weak, || ledger.link())
+                .retain_counted(7, &weak, LINK_FAILED, || ledger.link())
                 .expect("retain must succeed");
         }
         assert_eq!(ledger.links.get(), 1, "five names, one subscription");
@@ -1976,7 +1987,7 @@ mod tests {
 
         for _ in 0..100 {
             inner
-                .retain_counted(9, &weak, || ledger.link())
+                .retain_counted(9, &weak, LINK_FAILED, || ledger.link())
                 .expect("retain must succeed");
             inner.release_counted(9, || ledger.unlink());
         }
@@ -1997,10 +2008,13 @@ mod tests {
 
         // AOSP's answer: `DeadObject` would read as the hub's own death.
         let err = inner
-            .retain_counted(3, &weak, || Err(StatusCode::DeadObject))
+            .retain_counted(3, &weak, CALLBACK_LINK_FAILED, || {
+                Err(StatusCode::DeadObject)
+            })
             .expect_err("link failure must propagate");
         assert_eq!(err.exception_code(), ExceptionCode::IllegalState);
         assert_eq!(err.transaction_error(), StatusCode::Ok);
+        assert!(err.to_string().contains(CALLBACK_LINK_FAILED), "{err}");
         assert!(inner.death_links.is_empty());
 
         // And the release that follows a failed retain is inert.
@@ -2020,13 +2034,13 @@ mod tests {
         let live_weak = SIBinder::downgrade(&live);
 
         inner
-            .retain_counted(1, &dead_weak, || ledger.link())
+            .retain_counted(1, &dead_weak, LINK_FAILED, || ledger.link())
             .unwrap();
         inner
-            .retain_counted(1, &dead_weak, || ledger.link())
+            .retain_counted(1, &dead_weak, LINK_FAILED, || ledger.link())
             .unwrap();
         inner
-            .retain_counted(2, &live_weak, || ledger.link())
+            .retain_counted(2, &live_weak, LINK_FAILED, || ledger.link())
             .unwrap();
 
         let retired = inner.retire_dead_binder(&dead_weak);
@@ -2053,7 +2067,7 @@ mod tests {
         assert!(native.as_proxy().is_none(), "precondition");
 
         inner
-            .retain_death_link(&native)
+            .retain_death_link(&native, LINK_FAILED)
             .expect("retain on a native binder must be a no-op");
         assert!(inner.death_links.is_empty());
         inner.release_death_link(&native);

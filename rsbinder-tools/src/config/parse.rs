@@ -656,7 +656,8 @@ fn policy_files(root: At<'_>, dir: &Trusted, our_uid: u32) -> Result<Vec<Trusted
 
 /// Everything one configuration directory says.
 ///
-/// Build one with `..Config::default()`: the fields grow as the configuration does.
+/// Outside this crate, start from `Config::default()` and assign the fields: they grow as the
+/// configuration does, so a struct expression, `..` included, does not compile there.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Config {

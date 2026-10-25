@@ -81,8 +81,9 @@ Each item below changes what a 0.12.0 program observes.
   text needs the new one; matching on the variant is unaffected.
 - `rsb_hub` answers an `addService`, `registerForNotifications` or
   `registerClientCallback` whose binder it cannot link to death with
-  `EX_ILLEGAL_STATE` ("Couldn't linkToDeath."), as AOSP's `servicemanager`
-  does. 0.12.0 answered the link's own status: `DeadObject` for a binder
+  `EX_ILLEGAL_STATE`, and AOSP's `servicemanager` message: "Couldn't link to
+  death." for `registerForNotifications`, "Couldn't linkToDeath." for the
+  other two. 0.12.0 answered the link's own status: `DeadObject` for a binder
   whose death notice the hub already holds, which is also what a caller
   sees when the hub itself has died. The call changes no registration in
   either release.
@@ -90,11 +91,16 @@ Each item below changes what a 0.12.0 program observes.
   `TopicPolicy`), `config::FileContents` the fields `global_topics` and
   `topic_rules`, and `config::ConfigError` the variants
   `DuplicateGlobalTopics` and `TopicPattern`, with or without the `topic`
-  feature. All three are now `#[non_exhaustive]`: build a `Config` with
-  `..Config::default()`, and give a `match` on `ConfigError` a wildcard arm.
+  feature. All three are now `#[non_exhaustive]`: outside the crate a
+  `Config` is made by `Config::default()` and assigning its fields (a struct
+  expression, `..Config::default()` included, no longer compiles), and a
+  `match` on `ConfigError` needs a wildcard arm. `PolicyError::EmptyPattern`
+  reads "name pattern must not be empty" (0.12.0: "service name pattern
+  must not be empty"), as `[[topic]]` names use it too.
   `rsb_hub` logs a loaded configuration as "N rule(s), M service
-  declaration(s)" (0.12.0: "N rule(s) and M service declaration(s)") and
-  reports the same to its supervisor's status line.
+  declaration(s)" (0.12.0: "N rule(s) and M service declaration(s)"), and
+  its supervisor's status line reads "serving; N rule(s), M service
+  declaration(s)" (0.12.0: "serving; N rule(s), M declaration(s)").
 
 ### Added
 
