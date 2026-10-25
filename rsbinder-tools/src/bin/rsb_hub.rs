@@ -97,6 +97,12 @@ fn distinct_name_cap_exceeded<V>(map: &BTreeMap<String, V>, name: &str) -> bool 
     !map.contains_key(name) && map.len() >= MAX_DISTINCT_NAMES
 }
 
+/// AOSP `ServiceManager.cpp`'s answer; `DeadObject` would read as the hub's own death.
+fn link_failed(handle: u32, status: StatusCode) -> Status {
+    log::error!("could not link to the death of handle {handle}: {status:?}");
+    Status::from((ExceptionCode::IllegalState, "Couldn't linkToDeath."))
+}
+
 /// Weak so it cannot outlive its registry entries; it is also what an obituary matches on.
 struct DeathLink {
     weak: rsbinder::WIBinder,
@@ -147,9 +153,7 @@ impl Inner {
         };
         let recipient: Arc<dyn rsbinder::DeathRecipient> = self.death_recipient.clone();
         self.retain_counted(handle, &SIBinder::downgrade(binder), || {
-            binder
-                .link_to_death(Arc::downgrade(&recipient))
-                .map_err(Into::into)
+            binder.link_to_death(Arc::downgrade(&recipient))
         })
     }
 
@@ -158,13 +162,13 @@ impl Inner {
         &mut self,
         handle: u32,
         weak: &rsbinder::WIBinder,
-        link: impl FnOnce() -> rsbinder::BinderResult<()>,
+        link: impl FnOnce() -> rsbinder::Result<()>,
     ) -> rsbinder::BinderResult<()> {
         if let Some(existing) = self.death_links.get_mut(&handle) {
             existing.count += 1;
             return Ok(());
         }
-        link()?;
+        link().map_err(|status| link_failed(handle, status))?;
         self.death_links.insert(
             handle,
             DeathLink {
@@ -1790,7 +1794,7 @@ mod tests {
     }
 
     impl LinkLedger {
-        fn link(&self) -> rsbinder::BinderResult<()> {
+        fn link(&self) -> rsbinder::Result<()> {
             self.links.set(self.links.get() + 1);
             Ok(())
         }
@@ -1853,10 +1857,12 @@ mod tests {
         let mut inner = test_inner();
         let weak = SIBinder::downgrade(&fake_binder());
 
+        // AOSP's answer: `DeadObject` would read as the hub's own death.
         let err = inner
-            .retain_counted(3, &weak, || Err(ExceptionCode::IllegalState.into()))
+            .retain_counted(3, &weak, || Err(StatusCode::DeadObject))
             .expect_err("link failure must propagate");
         assert_eq!(err.exception_code(), ExceptionCode::IllegalState);
+        assert_eq!(err.transaction_error(), StatusCode::Ok);
         assert!(inner.death_links.is_empty());
 
         // And the release that follows a failed retain is inert.

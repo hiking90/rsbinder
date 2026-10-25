@@ -79,6 +79,13 @@ Each item below changes what a 0.12.0 program observes.
   return the same error to callers that have no queue, and it is returned
   on Linux targets without 64-bit atomics as well. Code that compares the
   text needs the new one; matching on the variant is unaffected.
+- `rsb_hub` answers an `addService`, `registerForNotifications` or
+  `registerClientCallback` whose binder it cannot link to death with
+  `EX_ILLEGAL_STATE` ("Couldn't linkToDeath."), as AOSP's `servicemanager`
+  does. 0.12.0 answered the link's own status: `DeadObject` for a binder
+  whose death notice the hub already holds, which is also what a caller
+  sees when the hub itself has died. The call changes no registration in
+  either release.
 
 ### Added
 
