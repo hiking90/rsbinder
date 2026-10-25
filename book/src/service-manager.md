@@ -558,7 +558,10 @@ Built with its `topic` feature (`cargo build -p rsbinder-tools --features
 topic`, off by default while `rsbinder-topic` is Experimental), `rsb_hub`
 serves a registry of topic names under `rsbinder.topic.registry` (see
 [Topics](./topics.md#a-registry-of-topic-names)). It registers the registry
-before it reports `READY=1`. The registry's policy sits in the same files:
+before it reports `READY=1`. A client reaches the registry by looking its name
+up, so the `[[rule]]` that covers `rsbinder.topic.registry` decides who may
+use the registry at all, and the topic rules decide what each caller may do
+there. They sit in the same files:
 
 ```toml
 [global]
@@ -601,25 +604,27 @@ service name, so a policy should grant no `add` on it.
 
 `rsb_service dump manager` adds a line on the registry, whether its name
 holds it and how many topic rules are in force, and its counters as
-`key=value` (`notices_failed` counts notices a watcher had no room for).
+`key=value` (`notices_failed` counts the sends of a notice that failed, for
+want of room or otherwise, those sent again included).
 
 ### What a caller can hold the hub up with
 
 `rsb_hub` serves every caller on one binder thread, as Android's
 `servicemanager` does, so a call it waits in holds up every other, lookups
-included. It sends a client no call that waits for an answer but one: the
-first time a process receives a binder it holds no proxy of, rsbinder asks
-that binder's process for its interface descriptor, a twoway call; libbinder
-asks only when the descriptor is first used. So each call that hands the hub
-a binder makes it wait on the process that binder lives in, the first time it
-sees that binder: `add_service`, `register_for_notifications` and
-`register_client_callback`, and with the `topic` feature `advertise` and
-`watch`. A caller that passes the binder of a stopped process, or answers no
-descriptor query for its own (driving the binder device by hand), holds the
-hub up for as long, with no more than the `add`, `find`, `advertise` or
-`subscribe` permission the call needs. Short of that, the registry calls no
-publisher, and tells watchers with oneway calls, which a stopped watcher
-cannot hold up: a notice it has no room for fails and is sent again later.
+included. It sends a client no call that waits for an answer but one: each
+time a process receives a binder it holds no proxy of, rsbinder asks that
+binder's process for its interface descriptor, a twoway call; libbinder asks
+only when the descriptor is first used. The hub reads a call's arguments
+before it judges the call, so every call that hands it a binder makes it wait
+on the process that binder lives in: `add_service`, `try_unregister_service`,
+`register_for_notifications`, `unregister_for_notifications` and
+`register_client_callback`, and with the `topic` feature `advertise`,
+`withdraw`, `watch` and `unwatch`. A caller that passes the binder of a
+stopped process, or answers no descriptor query for its own (driving the
+binder device by hand), holds the hub up for as long, with no permission at
+all. Short of that, the registry calls no publisher, and tells watchers with
+oneway calls, which a stopped watcher cannot hold up: a notice it has no
+room for fails and is sent again later.
 
 ## Declaring services
 

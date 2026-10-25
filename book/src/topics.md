@@ -159,8 +159,9 @@ in [Service Manager](./service-manager.md#topic-names)):
   it up or watch it), and who may list the names.
 - A name is taken back when its publisher closes or drops, or its process
   dies; a watch goes when the watcher's process dies.
-- `rsb_service topics [PREFIX]` lists the names with the uid and pid that
-  advertised them, their age and their watchers.
+- `rsb_service topics [PREFIX]`, built with the same feature, lists the
+  names with the uid and pid that advertised them, their age and their
+  watchers.
 
 `RegistryResolver` is that registry as a `Resolver`, which
 `Publisher::advertise_with` and `NamedSubscriber::subscribe_with` take where
@@ -178,9 +179,9 @@ in [Service Manager](./service-manager.md#topic-names)):
 {{#include ../../rsbinder-topic/examples/topic_registry.rs:subscribe}}
 ```
 
-`RegistryResolver::find` fails with `NameNotFound` when the hub serves no
-registry (it was built without the feature) or its policy does not let the
-caller find `rsbinder.topic.registry`. `list` returns the names under a
+`RegistryResolver::find` fails with `NameNotFound` when the service manager
+has nothing under `rsbinder.topic.registry` or its policy does not let the
+caller find that name. `list` returns the names under a
 prefix that the caller may subscribe to, sorted:
 
 ```rust,ignore
@@ -195,9 +196,11 @@ feature.
   with `ITopicRegistry::ERROR_TAKEN` while the topic lives, unless the hub
   runs with `--allow-cross-uid-overwrite`. A name is 1 to 127 bytes of
   `[A-Za-z0-9._/-]`, as a service name.
-- **Refusals.** An advertise the policy refuses is `EX_SECURITY`. A lookup or
-  watch it refuses answers no topic, as for a name that has none, and `list`
-  leaves out the names the caller may not subscribe to.
+- **Refusals.** An advertise or watch the policy refuses is `EX_SECURITY`
+  (so `NamedSubscriber::subscribe_with` fails), as is a `list` by a caller
+  `[global] topics` leaves out. A lookup it refuses answers no topic, as for
+  a name that has none, and `list` leaves out the names the caller may not
+  subscribe to.
 - **Notices.** A watch is told of each topic its name is given by a oneway
   call, which the kernel fails when the watcher's process has no room left
   for one. The registry then sends it again, with the topic the name has by
@@ -212,8 +215,9 @@ feature.
   publisher's `authorize`.
 - **A stopped publisher.** A subscriber that receives a topic it holds no
   proxy of, from a lookup or a notice, first asks the topic's process for its
-  interface descriptor. A subscriber that receives a stopped publisher's topic
-  waits for that process; the hub does not (see
+  interface descriptor, and waits for that process if it is stopped. The hub
+  waits on nobody to hand a topic out; it waits, as any process does, on a
+  topic it receives and holds no proxy of (see
   [Service Manager](./service-manager.md#what-a-caller-can-hold-the-hub-up-with)).
 
 What the registry's check vouches for is that a uid the policy allows chose

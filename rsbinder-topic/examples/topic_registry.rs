@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! A topic named in `rsb_hub`'s registry of topic names, apart from the service names. With an
-//! `rsb_hub` built with its `topic` feature, on a configuration that lets this user advertise,
-//! subscribe to and list the name (the test suite's two permissive files do):
+//! `rsb_hub` built with its `topic` feature, on a configuration that lets this user find
+//! `rsbinder.topic.registry` (a `[[rule]]`) and advertise, subscribe to and list the name (a
+//! `[[topic]]` and `[global] topics`; the test suite's two permissive files do):
 //!
 //! ```text
 //! cargo build -p rsbinder-tools --features topic --bin rsb_hub
@@ -14,8 +15,9 @@
 //! cargo run -p rsbinder-topic --example topic_registry -- list
 //! ```
 //!
-//! The publisher publishes fifty counts, one every 100 ms, and gives the name back as it ends;
-//! the subscriber goes on with whichever publisher holds the name next.
+//! Each command runs in a terminal of its own. The publisher publishes fifty counts, one every
+//! 100 ms, and gives the name back as it ends, so `list` shows the name only while `publish`
+//! runs; the subscriber goes on with whichever publisher holds the name next.
 
 use std::time::Duration;
 
@@ -61,6 +63,7 @@ fn subscribe(registry: &RegistryResolver) -> Result<(), Box<dyn std::error::Erro
     loop {
         match subscriber.recv() {
             Ok(Bytes(value)) => println!("{value:?}"),
+            Err(RecvError::Lagged(lost)) => println!("{lost} values were overwritten unread"),
             Err(RecvError::Disconnected(why)) => println!("{why}"),
             Err(why) => return Err(why.into()),
         }
