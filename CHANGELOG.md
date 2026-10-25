@@ -126,6 +126,14 @@ Each item below changes what a 0.12.0 program observes.
     (`Advertisement`, `Watch::with_lookup`) puts the names somewhere else; a
     `Publisher` drops the `Advertisement` its resolver returned in `close`, or
     as it drops, before its end record.
+  - `registry`: a registry of topic names apart from service names, which
+    `rsb_hub` serves with its `topic` feature. `RegistryResolver` is its
+    client (`find`, `list`), taken by `Publisher::advertise_with` and
+    `NamedSubscriber::subscribe_with`: a name is taken back as its publisher
+    closes or its process dies, and a notice a watcher had no room for is
+    sent again. `Registry`, `RegistryAccess` and `RegistryStats` are the host
+    side; its AIDL (`ITopicRegistry`, `ITopicWatcher`, `TopicInfo`,
+    `TopicRef`) is rsbinder's own. See the book's Topics chapter.
   - Waits on a futex word of the topic (`Wake::Futex`, one wake system call
     per publish for every sleeping subscriber) or on a socket of the
     subscription (`Wake::Fd`, with `Wait` and `wait_any` for event loops);

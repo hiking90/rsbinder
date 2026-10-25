@@ -16,7 +16,9 @@ them.
   of slots the publisher writes in place, and a subscriber reads them where
   they lie.
 - A topic is found through the service manager, by its binder or by a name
-  that the subscriber watches and reconnects to.
+  that the subscriber watches and reconnects to, or by a name in the registry
+  of topic names `rsb_hub` serves with its `topic` feature, under a policy of
+  its own.
 
 A receiver that must see every value however slow it is uses
 `rsbinder::stream` instead, which holds the sender back.

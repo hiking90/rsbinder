@@ -552,6 +552,75 @@ $ sudo rsb_device binder --group binder --mode 0660
 An LSM (SELinux, AppArmor) can sit on top as a third, AND-ed layer where the
 platform provides one, but it is never what makes the first two unnecessary.
 
+### Topic names
+
+Built with its `topic` feature (`cargo build -p rsbinder-tools --features
+topic`, off by default while `rsbinder-topic` is Experimental), `rsb_hub`
+serves a registry of topic names under `rsbinder.topic.registry` (see
+[Topics](./topics.md#a-registry-of-topic-names)). It registers the registry
+before it reports `READY=1`. The registry's policy sits in the same files:
+
+```toml
+[global]
+# Who may list topic names at all. Omitted means nobody.
+topics = { group = ["sensors"] }
+
+[[topic]]
+name = "sensors.*"
+advertise = { user = ["sensord"] }
+subscribe = { group = ["sensors"] }
+```
+
+| Permission | Gates |
+|---|---|
+| `advertise` | giving a name to a topic (`advertise`); taking it back needs the uid and the topic that hold the name instead |
+| `subscribe` | `lookup` and `watch`, and every notice a watch is sent |
+| `list` (`[global] topics`) | `list` — a single global gate; the names it returns are filtered by `subscribe` too |
+
+`[[topic]]` patterns, subjects and order work as `[[rule]]`'s do: the first
+rule whose `name` matches decides, and a name no rule covers is denied.
+Topic names are a namespace of their own: a `[[rule]]`, `name = "*"`
+included, grants no topic permission. `[global] topics` may be set in one
+file only, as `list`. Unlike `find` for a registration callback, which is
+judged once when the callback is registered, `subscribe` is judged again for
+every notice: a reload that takes it away stops a watch's notices and keeps
+the watch, and one that gives it back lets the next notice through. Under
+`--insecure-allow-all` every topic call from a caller with a uid is allowed.
+
+The name `rsbinder.topic.registry` is reserved: such a hub refuses it to
+every `add` a client asks for (`add_service`, `register_client_callback`,
+`try_unregister_service`) with `ExceptionCode::Security`, whatever the policy
+says, under `--insecure-allow-all` and `--allow-cross-uid-overwrite` too.
+Otherwise a process granted `add` on it could put its own registry in the
+hub's place, and every client would get the topics that process chose.
+
+A hub built without the feature refuses a file that holds `[[topic]]` or
+`[global] topics`: it does not start, and a `SIGHUP` keeps the policy
+already in force. On such a hub `rsbinder.topic.registry` is an ordinary
+service name, so a policy should grant no `add` on it.
+
+`rsb_service dump manager` adds a line on the registry, whether its name
+holds it and how many topic rules are in force, and its counters as
+`key=value` (`notices_failed` counts notices a watcher had no room for).
+
+### What a caller can hold the hub up with
+
+`rsb_hub` serves every caller on one binder thread, as Android's
+`servicemanager` does, so a call it waits in holds up every other, lookups
+included. It sends a client no call that waits for an answer but one: the
+first time a process receives a binder it holds no proxy of, rsbinder asks
+that binder's process for its interface descriptor, a twoway call; libbinder
+asks only when the descriptor is first used. So each call that hands the hub
+a binder makes it wait on the process that binder lives in, the first time it
+sees that binder: `add_service`, `register_for_notifications` and
+`register_client_callback`, and with the `topic` feature `advertise` and
+`watch`. A caller that passes the binder of a stopped process, or answers no
+descriptor query for its own (driving the binder device by hand), holds the
+hub up for as long, with no more than the `add`, `find`, `advertise` or
+`subscribe` permission the call needs. Short of that, the registry calls no
+publisher, and tells watchers with oneway calls, which a stopped watcher
+cannot hold up: a notice it has no room for fails and is sent again later.
+
 ## Declaring services
 
 An access rule says who may use a name. A **declaration** says the name is

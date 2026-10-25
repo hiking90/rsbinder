@@ -146,6 +146,94 @@ the subscriber asks the service manager (`check_service`) for the binder the
 name has. It asks once more only when a notice that came during the call gave
 the name a binder it cannot use, one it refused or that ended.
 
+## A registry of topic names
+
+Through the service manager, a topic's name is a service name: `[[rule]]`
+decides who may register and find it, it is listed among the services, and it
+stays registered until the publisher's process ends. Built with its `topic`
+feature, `rsb_hub` also serves a registry of topic names under
+`rsbinder.topic.registry`, apart from the service names (its configuration is
+in [Service Manager](./service-manager.md#topic-names)):
+
+- Its own rules say who may advertise a name, who may subscribe to it (look
+  it up or watch it), and who may list the names.
+- A name is taken back when its publisher closes or drops, or its process
+  dies; a watch goes when the watcher's process dies.
+- `rsb_service topics [PREFIX]` lists the names with the uid and pid that
+  advertised them, their age and their watchers.
+
+`RegistryResolver` is that registry as a `Resolver`, which
+`Publisher::advertise_with` and `NamedSubscriber::subscribe_with` take where
+`advertise` and `subscribe` use the service manager:
+
+```rust,ignore
+{{#include ../../rsbinder-topic/examples/topic_registry.rs:find}}
+```
+
+```rust,ignore
+{{#include ../../rsbinder-topic/examples/topic_registry.rs:advertise}}
+```
+
+```rust,ignore
+{{#include ../../rsbinder-topic/examples/topic_registry.rs:subscribe}}
+```
+
+`RegistryResolver::find` fails with `NameNotFound` when the hub serves no
+registry (it was built without the feature) or its policy does not let the
+caller find `rsbinder.topic.registry`. `list` returns the names under a
+prefix that the caller may subscribe to, sorted:
+
+```rust,ignore
+{{#include ../../rsbinder-topic/examples/topic_registry.rs:list}}
+```
+
+The example's documentation shows how to run it against a hub built with the
+feature.
+
+- **One topic per name.** The uid that advertised a name may give it to
+  another topic, as a publisher started again does. Another uid is refused
+  with `ITopicRegistry::ERROR_TAKEN` while the topic lives, unless the hub
+  runs with `--allow-cross-uid-overwrite`. A name is 1 to 127 bytes of
+  `[A-Za-z0-9._/-]`, as a service name.
+- **Refusals.** An advertise the policy refuses is `EX_SECURITY`. A lookup or
+  watch it refuses answers no topic, as for a name that has none, and `list`
+  leaves out the names the caller may not subscribe to.
+- **Notices.** A watch is told of each topic its name is given by a oneway
+  call, which the kernel fails when the watcher's process has no room left
+  for one. The registry then sends it again, with the topic the name has by
+  then: once a second at first, at most once in 30 seconds after a few
+  failures, for up to 256 watches at a time. A `NamedSubscriber` also looks
+  the name up when its publisher ends, or refuses it as ended, as it does
+  through the service manager.
+- **Reloads.** A reload of the hub's policy applies to every later call and
+  to every notice: a watch whose caller lost `subscribe` is told nothing, and
+  hears of the next topic once a reload gives the permission back. A
+  subscription already set up is not cut: who stays subscribed is the
+  publisher's `authorize`.
+- **A stopped publisher.** A subscriber that receives a topic it holds no
+  proxy of, from a lookup or a notice, first asks the topic's process for its
+  interface descriptor. A subscriber that receives a stopped publisher's topic
+  waits for that process; the hub does not (see
+  [Service Manager](./service-manager.md#what-a-caller-can-hold-the-hub-up-with)).
+
+What the registry's check vouches for is that a uid the policy allows chose
+the binder a name gives. It does not vouch for the process that writes the
+ring: an allowed process can advertise, under a name of its own, a topic it
+looked up that another uid publishes. Nor does it hold unless the registry is
+the hub's own, which a hub with the feature makes sure of by refusing the
+registry's name to every `add`. Weigh both before a subscriber that found its
+topic by name calls the `unsafe` `Subscriber::trust_publisher`.
+
+### When the hub restarts
+
+The registry lives in `rsb_hub`, and its names and watches end with it. Every
+call of a `RegistryResolver` then fails with `DeadObject`. Publishers and
+subscribers already connected go on, but a publisher does not advertise its
+name to the next hub, and a `NamedSubscriber` watches nothing: make the
+`Publisher` and the `NamedSubscriber` again with a resolver of the new hub.
+The service manager path is the same, as its registrations and watches end
+with the hub too.
+
 ## Losing records, and backpressure
 
 Without backpressure a publish never waits. A subscriber that falls more than
@@ -240,8 +328,9 @@ waits for a slot instead.
 - **The binder thread pool.** A subscriber's process runs it
   (`ProcessState::start_thread_pool`) to learn that the publisher died —
   without it a wait for a record never ends — and that it was taken out. A
-  `NamedSubscriber` needs it for the service manager's notice of the name. The
-  publisher's process needs it to answer subscription calls.
+  `NamedSubscriber` needs it for the service manager's or the registry's
+  notice of the name. The publisher's process needs it to answer subscription
+  calls.
 - **Linux or Android.** The kernel must have `F_SEAL_FUTURE_WRITE` (mainline
   5.1; the Android common kernels from 4.14), and the target must be able to
   load a 64-bit word from a read-only mapping

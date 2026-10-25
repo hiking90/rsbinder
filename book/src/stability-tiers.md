@@ -228,6 +228,7 @@ cycle.
 | `rpc-tcp-debug` | `TcpDebugTransport` — plain TCP backend | Bring-up / interop only, never production. |
 | `rpc-vsock` | `VsockTransport` — host↔VM | Linux/Android only; loopback testing requires `vsock_loopback.ko`. |
 | `rpc-tls` | TLS over rustls, socket-orthogonal (tcp / unix / vsock) | Hermetic green; the `StreamOwned` decoupling (plan 2-15) has landed. Real-`libbinder` STAGE3 not yet attempted — stock emulator images ship no `libbinder_tls`. |
+| `topic` (`rsbinder-tools`) | `rsb_hub`'s registry of topic names: `[[topic]]` and `[global] topics` in its configuration, the reserved name `rsbinder.topic.registry`, `rsb_service topics`. See [Service Manager](./service-manager.md#topic-names). | Linux CI runs `rsbinder-tools`' unit tests with the feature and `tests/scripts/run_topic_registry_ac.sh` against a real hub. The configuration keys change with the registry, as `rsbinder-topic`'s AIDL does. |
 | `rsbinder-topic` (crate) | Topics: one publisher, many subscribers over kernel binder, records in shared memory the subscribers map read-only (`Publisher`, `Subscriber`, `NamedSubscriber`, loans and `Sample`). See [Topics](./topics.md). | Linux CI runs its unit and two-process tests; loom models and Miri run in the local gate. The Android CI matrix does not run it yet. The subscription AIDL and the memory layout are rsbinder's own, so no `libbinder` gate applies: the layout version is checked at each subscription, and a peer of another version is refused. |
 
 ## Non-goals
