@@ -1,0 +1,15 @@
+# Topic half of the test-suite policy, for an rsb_hub built with its `topic`
+# feature. NOT a template for a real deployment.
+#
+# A hub without the feature refuses this file, so it sits apart from
+# ../permissive.toml, which every hub of the suite loads. A topic hub is given
+# both: `rsb_hub --config <a directory holding both>`. `[global]` merges by
+# field, so `list` there and `topics` here may each be set once.
+
+[global]
+topics = "any"
+
+[[topic]]
+name = "*"
+advertise = "any"
+subscribe = "any"

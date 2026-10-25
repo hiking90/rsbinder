@@ -156,6 +156,51 @@ fn cmd_connection(name: &str) -> ExitCode {
     }
 }
 
+/// The names under `prefix` of the topic registry `rsb_hub` serves with its `topic` feature.
+#[cfg(feature = "topic")]
+fn cmd_topics(prefix: &str) -> ExitCode {
+    let resolver = match rsbinder_topic::registry::RegistryResolver::find() {
+        Ok(resolver) => resolver,
+        Err(status) => {
+            eprintln!(
+                "rsb_service: no topic registry: {status} (rsb_hub serves one with its `topic` \
+                 feature, to callers its policy lets find it)"
+            );
+            return ExitCode::from(exit::ERR);
+        }
+    };
+    match resolver.list(prefix) {
+        Ok(mut topics) => {
+            topics.sort_by(|a, b| a.name.cmp(&b.name));
+            let width = topics
+                .iter()
+                .map(|t| t.name.len())
+                .max()
+                .unwrap_or(0)
+                .max(4);
+            println!(
+                "{:width$}  {:>6}  {:>8}  {:>9}  WATCHERS",
+                "NAME", "UID", "PID", "AGE"
+            );
+            for topic in &topics {
+                let age = format!("{:.1}s", topic.ageMillis as f64 / 1000.0);
+                println!(
+                    "{:width$}  {:>6}  {:>8}  {:>9}  {}",
+                    topic.name, topic.uid, topic.pid, age, topic.watchers
+                );
+            }
+            ExitCode::from(exit::OK)
+        }
+        Err(status) => {
+            let code = report("ITopicRegistry.list", &status);
+            if status.exception_code() == ExceptionCode::Security {
+                eprintln!("  Listing topic names is `[global] topics`.");
+            }
+            code
+        }
+    }
+}
+
 /// `dumpsys <service>`: sends a dup of stdout, since the parcel closes the fd it carries.
 fn cmd_dump(name: &str, args: &[String]) -> ExitCode {
     let Some(binder) = hub::check_service(name) else {
@@ -201,7 +246,7 @@ fn cli() -> clap::Command {
             .index(1)
     };
 
-    clap::Command::new("rsb_service")
+    let command = clap::Command::new("rsb_service")
         .version(env!("CARGO_PKG_VERSION"))
         .author(env!("CARGO_PKG_AUTHORS"))
         .about("Inspect the services registered with the binder service manager")
@@ -283,7 +328,20 @@ fn cli() -> clap::Command {
             $ rsb_service dump manager com.example    # narrow it by substring\n\n    \
             Exit status: 0 the answer is yes, 1 the answer is no, 2 the question \n    \
             could not be answered (no service manager, or its policy denied it).",
-        )
+        );
+    #[cfg(feature = "topic")]
+    let command = command.subcommand(
+        clap::Command::new("topics")
+            .about("List the topic names of rsb_hub's topic registry: name uid pid age watchers")
+            .arg(
+                clap::Arg::new("prefix")
+                    .value_name("PREFIX")
+                    .index(1)
+                    .default_value("")
+                    .help("Only list the names that start with this"),
+            ),
+    );
+    command
 }
 
 fn main() -> ExitCode {
@@ -341,6 +399,11 @@ fn main() -> ExitCode {
                 .unwrap_or_default();
             cmd_dump(&name_of(m), &args)
         }
+        #[cfg(feature = "topic")]
+        Some(("topics", m)) => cmd_topics(
+            m.get_one::<String>("prefix")
+                .expect("prefix has a default value"),
+        ),
         // Unreachable: `subcommand_required` rejects this before we get here.
         _ => ExitCode::from(exit::ERR),
     }

@@ -151,7 +151,9 @@ Each item below changes what a 0.12.0 program observes.
   `advertise`, `subscribe`) and a `[global] topics` gate in the hub's
   configuration files, a namespace apart from `[[rule]]`; a hub built
   without the feature refuses a file holding either. `rsb_service dump
-  manager` reports the registry's counters. In the library:
+  manager` reports the registry's counters, and `rsb_service topics
+  [PREFIX]`, built with the same feature, lists the names a caller may
+  subscribe to with their uid, pid, age and watchers. In the library:
   `config::TopicPolicy`, `TopicRule`, `TopicPermission` and
   `Enforcer::check_topic`.
 - **The unsynchronized FMQ flavor in `rsbinder-fmq`** (also `rsbinder::fmq`):

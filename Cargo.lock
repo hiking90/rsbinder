@@ -1296,6 +1296,7 @@ dependencies = [
  "log",
  "rsbinder",
  "rsbinder-aidl",
+ "rsbinder-topic",
  "rustix",
  "tokio",
  "tracing",
