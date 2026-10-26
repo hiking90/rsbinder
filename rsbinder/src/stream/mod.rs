@@ -929,11 +929,13 @@ impl<T: Serialize> Sink<T> {
     ///   ([`ClientOptions::incoming_connections`](crate::ClientOptions::incoming_connections));
     ///   the log line says so. A ring endpoint on a platform without
     ///   kernel binder.
-    /// - [`StatusCode::BadType`] on the RPC path when the sink states
-    ///   some other interface. A binder with no interface yet — an RPC
-    ///   proxy fresh off the wire — cannot be checked and is accepted; a
+    /// - [`StatusCode::BadType`] on the RPC path when the sink is already
+    ///   known, without a transaction, to state some other interface. A
+    ///   sink whose interface is not known is not asked, so opening never
+    ///   waits on the consumer (it is usually called in a handler); a
     ///   wrong one then shows up as the consumer's server refusing the
-    ///   interface token.
+    ///   interface token of the one-way calls, and the producer waits for
+    ///   credit that does not come.
     /// - Whatever watching the consumer for death, or the RPC path's
     ///   `onStart`, fails with — [`StatusCode::DeadObject`] for a consumer
     ///   that is already gone.

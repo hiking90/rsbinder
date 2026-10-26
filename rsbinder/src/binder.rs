@@ -185,13 +185,12 @@ pub trait FromIBinder: Interface {
     /// Try to interpret a generic Binder object as this interface.
     ///
     /// A local binder converts only if it implements this interface, and
-    /// [`StatusCode::BadType`] otherwise. A remote binder (a kernel proxy)
-    /// converts without being asked for its interface, so this makes no
-    /// transaction; a remote object of another interface refuses the first
-    /// two-way call with `BadType`, as with AOSP C++ `interface_cast`.
-    /// [`SIBinder::into_interface_checked`] asks the remote first. An RPC
-    /// proxy takes the interface of its first cast and refuses a cast to
-    /// another one.
+    /// [`StatusCode::BadType`] otherwise. A remote binder (a kernel or RPC
+    /// proxy) converts without being asked for its interface, so this makes
+    /// no transaction and decides nothing about the proxy; a remote object of
+    /// another interface refuses the first two-way call with `BadType`, as
+    /// with AOSP C++ `interface_cast`. [`SIBinder::into_interface_checked`]
+    /// asks the remote first.
     fn try_from(ibinder: SIBinder) -> Result<Strong<Self>>;
 }
 
@@ -406,13 +405,14 @@ pub trait IBinder: Any + Send + Sync {
 
     /// Retrieve the descriptor of this object.
     ///
-    /// A local binder answers with its interface's descriptor. A kernel proxy
-    /// asks the remote object the first time (AOSP
+    /// A local binder answers with its interface's descriptor. A proxy, kernel
+    /// or RPC, asks the remote object the first time (AOSP
     /// `BpBinder::getInterfaceDescriptor`): that call is a two-way transaction
-    /// that waits for the remote process and is subject to the thread's
-    /// [`CallRestriction`](crate::CallRestriction), so do not make it under a
-    /// lock a binder thread needs. Its first successful answer is cached; a
-    /// failed one returns `""`.
+    /// that waits for the remote process, so do not make it under a lock a
+    /// binder thread needs. On a kernel proxy it is subject to the thread's
+    /// [`CallRestriction`](crate::CallRestriction); an RPC call is not, as in
+    /// AOSP, but needs a connection to send on as any two-way RPC call does.
+    /// The first successful answer is cached; a failed one returns `""`.
     fn descriptor(&self) -> &str;
 
     /// [`descriptor`](Self::descriptor), with the error of a query that failed.
@@ -630,36 +630,11 @@ impl dyn IBinder {
     }
 }
 
-/// Stamp the generated stub's interface descriptor onto an `RpcProxy`
-/// resolved from the RPC wire (the wire carries only an address, so
-/// such a proxy starts descriptor-less). A `#[doc(hidden)]` shim the
-/// generated `from_binder` calls unconditionally — the feature gate
-/// lives **here**, resolved against rsbinder's own `rpc` feature, not
-/// in the `macro_rules!` (where `cfg(feature = "rpc")` would wrongly
-/// resolve against the *consumer* crate). The non-`rpc` build is a
-/// zero-cost no-op, so the kernel path and `rpc`-off consumers stay
-/// byte-unaffected.
-///
-/// Returns `false` only for an `RpcProxy` stamped earlier with another
-/// descriptor, which the cast refuses; it never makes a transaction.
-#[doc(hidden)]
-#[cfg(feature = "rpc")]
-pub fn __rpc_stamp_descriptor(binder: &SIBinder, descriptor: &str) -> bool {
-    match (**binder).as_any().downcast_ref::<crate::rpc::RpcProxy>() {
-        Some(rp) => {
-            rp.stamp_descriptor(descriptor);
-            rp.cached_descriptor() == Some(descriptor)
-        }
-        None => true,
-    }
-}
-
-/// No-op shim (see the `rpc`-gated variant): keeps the generated
-/// `from_binder` compiling identically with or without `rpc`.
-#[doc(hidden)]
-#[cfg(not(feature = "rpc"))]
-pub fn __rpc_stamp_descriptor(_binder: &SIBinder, _descriptor: &str) -> bool {
-    true
+/// The descriptor an `INTERFACE_TRANSACTION` reply holds; null folds to `""` (AOSP readString16).
+pub(crate) fn read_interface_reply(reply: Option<Parcel>) -> Result<String> {
+    // `Ok(None)` is an error, not a panic.
+    let interface: Option<String> = reply.ok_or(StatusCode::UnexpectedNull)?.read()?;
+    Ok(interface.unwrap_or_default())
 }
 
 /// `Debug`'s descriptor, never a transaction (AOSP `BPBINDER_BEST_DESCRIPTOR_LOCKED`).
@@ -1129,13 +1104,13 @@ impl SIBinder {
     /// binder for its interface descriptor and refuses another interface
     /// with [`StatusCode::BadType`] (AOSP C++ `checked_interface_cast`).
     ///
-    /// For a remote binder whose descriptor is not cached yet, this makes one
-    /// two-way `INTERFACE_TRANSACTION` and waits for the answer (see
-    /// [`IBinder::try_descriptor`]); a query that fails returns its error,
-    /// such as [`StatusCode::DeadObject`]. The service manager lookups
-    /// ([`hub::check_interface`](crate::hub::check_interface) and the like),
-    /// [`connect`](crate::connect) and [`Reconnecting`](crate::Reconnecting)
-    /// cast with this.
+    /// For a remote binder, kernel or RPC, whose descriptor is not cached
+    /// yet, this makes one two-way `INTERFACE_TRANSACTION` and waits for the
+    /// answer (see [`IBinder::try_descriptor`]); a query that fails returns
+    /// its error, such as [`StatusCode::DeadObject`]. The service manager
+    /// lookups ([`hub::check_interface`](crate::hub::check_interface) and the
+    /// like), [`connect`](crate::connect), [`Reconnecting`](crate::Reconnecting)
+    /// and `RpcSession::get_interface` cast with this.
     pub fn into_interface_checked<I: FromIBinder + Interface + ?Sized>(self) -> Result<Strong<I>> {
         let remote = self.as_remote().is_some();
         let strong = FromIBinder::try_from(self.clone())?;

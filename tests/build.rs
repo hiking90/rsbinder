@@ -200,7 +200,7 @@ fn main() {
         .generate()
         .unwrap();
 
-    // Plan 16: `tests/lazy_descriptor_kernel.rs`, kernel binder only.
+    // Plan 16: `tests/lazy_descriptor_kernel.rs` and `tests/lazy_descriptor_rpc.rs`.
     rsbinder_aidl::Builder::new()
         .source(PathBuf::from("aidl/lazydesc/ILazyNode.aidl"))
         .source(PathBuf::from("aidl/lazydesc/ILazyOther.aidl"))

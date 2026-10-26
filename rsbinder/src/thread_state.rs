@@ -2202,11 +2202,7 @@ pub(crate) fn query_interface(handle: u32) -> Result<String> {
     }
 
     let data = Parcel::new();
-    let reply = transact(handle, INTERFACE_TRANSACTION, &data, 0)?;
-    // `Ok(None)` is an error, not a panic; a null descriptor folds to empty (AOSP readString16).
-    let interface: Option<String> = reply.ok_or(StatusCode::UnexpectedNull)?.read()?;
-
-    Ok(interface.unwrap_or_default())
+    crate::binder::read_interface_reply(transact(handle, INTERFACE_TRANSACTION, &data, 0)?)
 }
 
 pub(crate) fn ping_binder(handle: u32) -> Result<()> {

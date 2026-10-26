@@ -274,9 +274,9 @@ impl<T: FromIBinder + ?Sized + 'static> ReconnectBuilder<T> {
     /// `serve` / `connect` would refuse, options that do not apply to it, a
     /// missing feature, a kernel endpoint without a service name, no binder
     /// device for a kernel endpoint
-    /// ([`StatusCode::NoInit`]), a kernel service of another interface
-    /// ([`StatusCode::BadType`]; a cast to another interface over RPC is
-    /// reported by the first call), an RPC name lookup on a server without
+    /// ([`StatusCode::NoInit`]), a service of another interface
+    /// ([`StatusCode::BadType`], over RPC too: the checked cast asks the
+    /// server for its descriptor), an RPC name lookup on a server without
     /// a directory of names, such as a libbinder root (`BadType`), a name
     /// the service manager refuses to watch ([`StatusCode::BadValue`] for an
     /// invalid name, [`StatusCode::PermissionDenied`] for an SELinux `find`

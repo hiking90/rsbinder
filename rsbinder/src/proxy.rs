@@ -746,10 +746,9 @@ pub trait Proxy: Sized + Interface {
 
     /// Wrap `binder` as this interface's proxy, or `None` if it is not a remote binder.
     ///
-    /// A kernel proxy is not asked for its interface, so this makes no transaction; a remote
-    /// of another interface refuses the first two-way call with `BadType`. An RPC proxy
-    /// stamped earlier with another descriptor is refused. To check the remote's interface,
-    /// use [`SIBinder::into_interface_checked`].
+    /// A proxy, kernel or RPC, is not asked for its interface, so this makes no transaction;
+    /// a remote of another interface refuses the first two-way call with `BadType`. To check
+    /// the remote's interface, use [`SIBinder::into_interface_checked`].
     fn from_binder(binder: SIBinder) -> Option<Self>;
 }
 

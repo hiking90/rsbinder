@@ -308,26 +308,15 @@ impl std::fmt::Debug for CancellationToken {
 /// `android.os.ICancellationSignal`.
 ///
 /// How much of that is checked depends on whether the binder's interface
-/// is known without a transaction: a local binder's always is, a kernel
-/// proxy's is once something asked the remote for it
+/// is known without a transaction: a local binder's always is, and a
+/// proxy's, kernel or RPC, is once something asked the remote for it
 /// ([`IBinder::try_descriptor`](crate::IBinder::try_descriptor), a checked cast such as
-/// [`hub::check_interface`](crate::hub::check_interface)), and an RPC
-/// proxy's is once it was cast to some interface. A known interface other
+/// [`hub::check_interface`](crate::hub::check_interface)). A known interface other
 /// than `android.os.ICancellationSignal` is refused with
 /// [`StatusCode::BadType`]. An unknown one is not asked for, so this call
 /// never waits on the remote process: the binder is accepted, and the
 /// `oneway cancel()` that follows carries no reply — a server that
 /// refuses the interface token says so in its log, not to this caller.
-///
-/// **This call does not decide the proxy's interface.** For an RPC proxy
-/// not yet cast to any interface, the request is built and sent on the proxy
-/// itself rather than through a typed cast, because a cast stamps the
-/// descriptor once and for all (`OnceLock`) onto the proxy the
-/// per-address cache shares. Were it stamped here, a later
-/// [`FromIBinder::try_from`] to the interface the object really
-/// implements would fail with [`StatusCode::BadType`] for the rest of
-/// the process's life. So passing the wrong binder costs one wasted
-/// oneway, not the object.
 ///
 /// A method declared in `.aidl` as returning `ICancellationSignal` gives
 /// the caller a typed proxy it can call `cancel()` on directly — but
@@ -337,26 +326,11 @@ impl std::fmt::Debug for CancellationToken {
 /// this function avoids compiling a second copy.
 pub fn cancel_remote(binder: &SIBinder) -> Result<()> {
     let expected = <BpCancellationSignal as crate::Proxy>::descriptor();
-    match binder.cached_descriptor() {
-        Some(actual) if actual != expected => {
+    // An interface not known without a transaction is not asked for (plan 16 D6), nor by the cast.
+    if let Some(actual) = binder.cached_descriptor() {
+        if actual != expected {
             log::error!("cancel_remote: not an {expected}: {actual:?}");
             return Err(StatusCode::BadType);
-        }
-        Some(_) => {}
-        // Not known without a transaction, and not asked for (plan 16 D6).
-        None => {
-            // RPC proxy with no interface yet: send directly, a typed cast would stamp it for good.
-            #[cfg(feature = "rpc")]
-            if let Some(rp) = (**binder).as_any().downcast_ref::<crate::rpc::RpcProxy>() {
-                let data = rp.build_request(expected)?;
-                rp.transact(
-                    android::os::ICancellationSignal::transactions::r#cancel,
-                    &data,
-                    crate::FLAG_ONEWAY | crate::FLAG_CLEAR_BUF | crate::FLAG_PRIVATE_LOCAL,
-                )?;
-                return Ok(());
-            }
-            // A kernel proxy: the cast below neither asks nor decides its interface.
         }
     }
     let signal: Strong<dyn ICancellationSignal> =

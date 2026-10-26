@@ -70,7 +70,7 @@ waiting, for async code that must not block.
 `build()` tries once without waiting. It fails only for what another
 attempt cannot change — a `Uri` that `serve` / `connect` would refuse,
 options that do not fit it, a missing feature, a kernel endpoint without a
-service name, no binder device for a kernel endpoint (`NoInit`), a kernel
+service name, no binder device for a kernel endpoint (`NoInit`), a
 service of another interface (`BadType`), an RPC name lookup on a server
 without a directory of names (`BadType`), a name the service manager
 refuses to watch, or

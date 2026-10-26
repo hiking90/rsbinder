@@ -81,6 +81,11 @@ name = "reconnect_rpc"
 path = "tests/reconnect_rpc.rs"
 required-features = ["rpc"]
 
+[[test]]
+name = "lazy_descriptor_rpc"
+path = "tests/lazy_descriptor_rpc.rs"
+required-features = ["rpc"]
+
 # Plan 10-10b kernel tests: a service the tests kill and restart, so the
 # shared `test_service` is never touched.
 [[bin]]

@@ -3957,7 +3957,7 @@ impl RpcSessionInner {
                     self.hold_dec_strong(slot_id, t.address, 1);
                 }
             }
-            // No interface token: libbinder `BBinder::transact` answers these before `onTransact`.
+            // No token: libbinder answers PING in `BBinder::transact`, INTERFACE in `onTransact`.
             match t.code {
                 INTERFACE_TRANSACTION => {
                     let mut reply = Parcel::new();

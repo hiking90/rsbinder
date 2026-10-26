@@ -169,7 +169,6 @@ fn four_megabytes_cross_a_pipe_whose_fd_crossed_a_session() {
 
     {
         let root = session.get_root().expect("get_root");
-        rsbinder::__rpc_stamp_descriptor(&root, DESCRIPTOR);
         let remote = root.as_remote().expect("an RPC root is a proxy");
 
         let mut data = remote.prepare_transact(true).expect("prepare_transact");

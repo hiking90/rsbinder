@@ -418,11 +418,7 @@ macro_rules! declare_binder_interface {
             }
 
             fn from_binder(binder: $crate::SIBinder) -> ::core::option::Option<Self> {
-                // Stamps an RPC proxy, refuses another stamp: `rpc::proxy` doc "Descriptor".
-                if !$crate::__rpc_stamp_descriptor(&binder, $descriptor) {
-                    return ::core::option::Option::None
-                }
-                // A kernel proxy is not asked for its interface (plan 16 D1): no IPC here.
+                // A remote is not asked for its interface (plan 16 D1): no IPC here.
                 if binder.as_remote().is_some() {
                     ::core::option::Option::Some(Self { binder, $($fname: $finit),* })
                 } else {

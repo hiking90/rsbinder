@@ -1,9 +1,8 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! The **generated** `Bp*` stub —
-//! which emits `as_remote().ok_or(BadType)?` instead of the
-//! kernel-only `as_proxy().unwrap()` — driven over the RPC transport,
+//! The **generated** `Bp*` stub, which reaches the transport through
+//! `as_remote()`, driven over the RPC transport,
 //! with the **generated server stub reused unmodified**. No
 //! hand-written proxy (contrast `rpc_e2e.rs`): this is
 //! the single-stub end state. The interface (`rpcsmoke.IRpcSmoke`) is
@@ -11,11 +10,10 @@
 //!
 //! - an arbitrary AIDL interface round-trips over `mem`,
 //!   `unix` (and `tcp_debug` when its feature is on) through the
-//!   generated `BpRpcSmoke`, whose `from_binder` stamps the RPC
-//!   descriptor in place.
-//! - a non-remote / wrong binder is graceful — the
-//!   generator's old `.unwrap()` panic is gone (golden-proven), and
-//!   `try_from` yields a value or `Err`, never a panic.
+//!   generated `BpRpcSmoke`, which writes its own descriptor as the
+//!   interface token.
+//! - a non-remote / wrong binder is graceful: `try_from` yields a value
+//!   or `Err`, never a panic.
 //!
 //! Separate test binary, `#![cfg(feature = "rpc")]`, so it never
 //! shares a process with the kernel-binder unit tests.
@@ -48,8 +46,7 @@ impl IRpcSmoke for SmokeSvc {
         Ok(())
     }
     fn r#fail(&self, code: i32) -> rsbinder::BinderResult<()> {
-        // Built from the type, not the `i32`, so the typed-error path is
-        // what is on the wire here (plan 10-4).
+        // Built from the type, not the `i32`, so the typed-error path is on the wire (plan 10-4).
         match SmokeError::from_code(code) {
             Some(err) => Err(rsbinder::Status::service_specific(err, Some("typed"))),
             None => Err(rsbinder::Status::new_service_specific_error(code, None)),
@@ -83,15 +80,11 @@ fn run(server_t: Box<dyn RpcTransport>, client_t: Box<dyn RpcTransport>) {
         let client = RpcSession::new(client_t, AddressSpace::Initiator).expect("RpcSession::new");
         let sib = client.get_root().expect("get_root");
 
-        // The single generated stub: `try_from` → `Proxy::from_binder`
-        // (stamps the RPC descriptor on the cached proxy in place) →
-        // generated methods use `as_remote().ok_or(BadType)?`.
+        // try_from → Proxy::from_binder makes no transaction; methods go through as_remote().
         let smoke = <dyn IRpcSmoke as FromIBinder>::try_from(sib)
             .expect("AC-6.3: generated BpRpcSmoke resolves from an RPC binder");
 
-        // Scalar + string round-trip, exact values (build_parcel →
-        // prepare_transact[interface token from the stamped descriptor]
-        // → submit_transact → read_response, all generated).
+        // Generated round-trip: the stub's own descriptor is the interface token.
         assert_eq!(
             smoke.r#echo("hello generated rpc").unwrap(),
             "hello generated rpc"
@@ -101,12 +94,10 @@ fn run(server_t: Box<dyn RpcTransport>, client_t: Box<dyn RpcTransport>) {
         assert_eq!(smoke.r#add(-7, 7).unwrap(), 0);
         // oneway emit path (FLAG_ONEWAY branch of the generator).
         smoke.r#ping().unwrap();
-        // Re-call to prove the stamped descriptor is stable across
-        // transactions (OnceLock first-write-wins, not per-call).
+        // A second call on the same proxy.
         assert_eq!(smoke.r#echo("again").unwrap(), "again");
 
-        // Plan 10-4 AC-4.1, RPC half: the typed error crosses this
-        // transport with the same meaning it has over kernel binder.
+        // Plan 10-4 AC-4.1, RPC half: the typed error crosses RPC unchanged.
         let status = smoke.r#fail(2).expect_err("fail always fails");
         assert_eq!(
             status.exception_code(),
@@ -117,8 +108,7 @@ fn run(server_t: Box<dyn RpcTransport>, client_t: Box<dyn RpcTransport>) {
             Some(SmokeError::EXHAUSTED)
         );
         assert_eq!(status.message(), Some("typed"));
-        // A code this enum does not declare stays an `i32` and reads as
-        // `None` rather than as some other variant.
+        // An undeclared code stays an `i32` and reads as `None`, not as another variant.
         let unknown = smoke.r#fail(41).expect_err("fail always fails");
         assert_eq!(unknown.service_error::<SmokeError>(), None);
         assert_eq!(unknown.service_specific_error(), 41);
@@ -149,8 +139,7 @@ fn generated_stub_over_tcp_debug() {
 
 // ---- bad binder is graceful, never a panic --------------------------
 
-/// A foreign native binder of an unrelated descriptor — neither an
-/// `IRpcSmoke` proxy nor `BnRpcSmoke`.
+/// A native binder of an unrelated descriptor: neither an `IRpcSmoke` proxy nor `BnRpcSmoke`.
 struct BnOther;
 impl Remotable for BnOther {
     fn descriptor() -> &'static str {
@@ -169,27 +158,15 @@ impl Remotable for BnOther {
     }
 }
 
-/// The generator's old `as_proxy().unwrap()` (which panicked
-/// on a non-`ProxyHandle` binder) is gone — golden-proven it now
-/// emits `as_remote().ok_or(StatusCode::BadType)?`. At the boundary,
-/// `try_from`:
-///   * a local same-interface native binder → resolves via the
-///     `from_binder` → native fallback (gate is now
-///     `as_remote().is_some()`), **no panic**;
-///   * a foreign-descriptor binder → `Err`, **no panic** (the old
-///     `.unwrap()` would have aborted the process).
+/// A local same-interface binder resolves natively; a foreign one is `Err`; neither panics.
 #[test]
 fn bad_binder_is_graceful_not_panic() {
-    // Same-interface local native binder: not a proxy, so the
-    // `as_remote()` gate is `None` and the native fallback resolves
-    // it. The point is that this does not panic.
+    // Not a proxy: the native fallback resolves it, without a panic.
     let local = <dyn IRpcSmoke as FromIBinder>::try_from(root())
         .expect("local native IRpcSmoke resolves via the native fallback");
     assert_eq!(local.r#echo("local").unwrap(), "local");
 
-    // Foreign-descriptor binder: from_binder rejects (descriptor
-    // mismatch + not remote) and the native cast fails too → Err,
-    // never a panic.
+    // Not remote, and the native cast fails on type: `Err`, never a panic.
     let foreign = Interface::as_binder(&Binder::new(BnOther));
     assert!(
         <dyn IRpcSmoke as FromIBinder>::try_from(foreign).is_err(),

@@ -146,8 +146,6 @@ impl Bound {
 /// Ask for `len` bytes and return `(payload, went_inline)`.
 fn fetch(session: &RpcSession, len: usize) -> (Vec<u8>, bool) {
     let root = session.get_root().expect("get_root");
-    // Hand-written client: without the stamp the server refuses the token with `BadType`.
-    rsbinder::__rpc_stamp_descriptor(&root, DESCRIPTOR);
     let remote = root.as_remote().expect("an RPC root is a proxy");
     let mut data = remote.prepare_transact(true).expect("prepare_transact");
     data.write(&(len as i32)).expect("write len");
@@ -219,17 +217,18 @@ fn a_large_blob_falls_back_to_inline_without_fd_passing() {
 fn a_wrong_interface_token_is_refused_and_the_session_serves_on() {
     let (bound, bg, session) = serve("token", false);
 
-    // Not yet stamped, the root's requests carry an empty token.
     let root = session.get_root().expect("get_root");
     let remote = root.as_remote().expect("an RPC root is a proxy");
-    let mut data = remote.prepare_transact(true).expect("prepare_transact");
+    let mut data = remote
+        .prepare_request("wrong.IFace")
+        .expect("prepare_request");
     data.write(&16i32).expect("write len");
     assert_eq!(
         remote.submit_transact(GET_BLOB, &data, 0).err(),
         Some(rsbinder::StatusCode::BadType)
     );
 
-    // `fetch` stamps the descriptor: the same session answers.
+    // `fetch` writes the token the root states: the same session answers.
     assert_eq!(fetch(&session, 16).0, pattern(16));
 
     session.close_session();

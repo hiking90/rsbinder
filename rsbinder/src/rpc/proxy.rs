@@ -19,25 +19,20 @@
 //! # Descriptor
 //!
 //! The RPC wire transmits only an address, not a descriptor string, so a
-//! proxy resolved from `read_binder`/`get_root` starts with an empty
-//! descriptor. The generated typed stub's `from_binder` stamps its own
-//! descriptor onto the already-cached proxy once, in place
-//! (`stamp_descriptor`), since the descriptor is known only to the stub at
-//! compile time. First write wins and is idempotent for the same interface
-//! (one wire address identifies one remote object, so one interface). The
-//! proxy is never replaced: a replacement would send a second `DEC_STRONG`
-//! on drop and split the per-address dedup cache.
+//! proxy resolved from `read_binder`/`get_root` does not know its interface.
+//! As a kernel proxy, it asks the remote with a two-way
+//! `INTERFACE_TRANSACTION` when something first needs the descriptor
+//! (`try_descriptor`, AOSP `BpBinder::getInterfaceDescriptor`, which serves
+//! RPC binders too), caches the first successful answer, and caches no
+//! failure. Unlike a kernel proxy, the query is not subject to the thread's
+//! `CallRestriction`: AOSP's RPC `transact` does not pass through
+//! `IPCThreadState`. The cache lives as long as this proxy; the session's
+//! table holds proxies weakly, so a proxy received after the last one died
+//! asks again, as AOSP's RPC `BpBinder` does.
 //!
-//! `from_binder` (through `__rpc_stamp_descriptor`) stamps, then compares the
-//! stored descriptor with its own, so the comparison does not validate the
-//! remote's actual interface for a fresh RPC proxy. A wrong-interface cast is
-//! not rejected at `from_binder`; it surfaces as a transact-time `StatusCode`
-//! when the server rejects the interface token. This follows from the Android
-//! RPC wire (no descriptor transmitted). First-write-wins also protects an
-//! in-use proxy from a later differing cast: the second `from_binder` returns
-//! `None`. `stamp_descriptor` returns whether this call wrote the descriptor
-//! (the `OnceLock::set` result), so a caller can tell a fresh stamp from an
-//! existing one without a `descriptor()` round-trip.
+//! A typed cast (`from_binder`) neither asks nor records anything, so one
+//! address may be cast to several interfaces; a wrong one is refused by the
+//! server's interface-token check on the first two-way call.
 //!
 //! # Session
 //!
@@ -82,7 +77,7 @@ use super::session::RpcSessionInner;
 /// A handle to a remote object reachable over an RPC session.
 pub struct RpcProxy {
     addr: RpcAddress,
-    /// Empty off the wire, stamped once in place by `from_binder`; see module doc "Descriptor".
+    /// The first successful `INTERFACE_TRANSACTION` answer; module doc "Descriptor".
     descriptor: OnceLock<String>,
     /// Strong, as AOSP `sp<RpcSession>`: a proxy keeps its session alive; see module doc "Session".
     session: Arc<RpcSessionInner>,
@@ -160,14 +155,28 @@ impl RpcProxy {
         super::RpcSession::wrap_inner(self.session.clone())
     }
 
-    /// Stamp `descriptor` in place, first write wins; `true` if this call wrote it. See module doc.
-    pub(crate) fn stamp_descriptor(&self, descriptor: &str) -> bool {
-        self.descriptor.set(descriptor.to_string()).is_ok()
-    }
-
-    /// The stamped descriptor, or `""` for a proxy fresh off the wire.
-    fn descriptor_str(&self) -> &str {
-        self.descriptor.get().map(String::as_str).unwrap_or("")
+    /// The remote object's interface descriptor, asked for on the first call (AOSP
+    /// `BpBinder::getInterfaceDescriptor`).
+    ///
+    /// The first successful answer is cached for this proxy, and later calls make no
+    /// transaction. A failed query is returned as its error and not cached, so the next call
+    /// asks again; a closed session fails with [`StatusCode::DeadObject`]. The query is a
+    /// two-way call, so it waits for the remote and needs a connection to send on, as any
+    /// two-way call does; the thread's `CallRestriction` does not apply (module doc
+    /// "Descriptor").
+    pub fn try_descriptor(&self) -> Result<&str> {
+        if let Some(descriptor) = self.descriptor.get() {
+            return Ok(descriptor);
+        }
+        // Not under any lock; two first callers may both ask, and the first answer is kept.
+        let reply = self.session.client_transact(
+            self.addr,
+            crate::binder::INTERFACE_TRANSACTION,
+            &Parcel::new(),
+            0,
+        )?;
+        let descriptor = crate::binder::read_interface_reply(reply)?;
+        Ok(self.descriptor.get_or_init(|| descriptor))
     }
 
     /// Build an RPC-mode request `Parcel` for `descriptor`, with the
@@ -233,9 +242,9 @@ impl RpcProxy {
 /// The RPC proxy implements the same generalized
 /// [`RemoteProxy`](crate::RemoteProxy) trait as the kernel
 /// `ProxyHandle`, so the one generated `Bp*` stub drives either stack
-/// (generator emits `as_remote()`). `prepare_transact` writes
-/// the interface token from the descriptor stamped in place by the
-/// generated `from_binder` (`stamp_descriptor`).
+/// (generator emits `as_remote()`). `prepare_transact(true)` writes
+/// the remote's descriptor as the interface token, asking for it first
+/// if it is not cached (`try_descriptor`).
 impl crate::binder::RemoteProxy for RpcProxy {
     fn prepare_transact(&self, write_header: bool) -> Result<Parcel> {
         let inner = &self.session;
@@ -246,7 +255,7 @@ impl crate::binder::RemoteProxy for RpcProxy {
             inner.records_fd_positions(),
         );
         if write_header {
-            super::session::write_rpc_interface_token(&mut data, self.descriptor_str())?;
+            super::session::write_rpc_interface_token(&mut data, self.try_descriptor()?)?;
         }
         Ok(data)
     }
@@ -366,7 +375,17 @@ impl IBinder for RpcProxy {
     }
 
     fn descriptor(&self) -> &str {
-        self.descriptor_str()
+        self.try_descriptor().unwrap_or_else(|err| {
+            log::warn!(
+                "RPC addr {:?}: interface descriptor query failed: {err:?}",
+                self.addr
+            );
+            ""
+        })
+    }
+
+    fn try_descriptor(&self) -> Result<&str> {
+        RpcProxy::try_descriptor(self)
     }
 
     fn cached_descriptor(&self) -> Option<&str> {

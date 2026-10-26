@@ -20,9 +20,6 @@ use crate::status::{BinderResult, ExceptionCode, Status};
 use crate::SIBinder;
 
 use super::generated::rsbinder::stream::IStreamSink::{BnStreamSink, BpStreamSink, IStreamSink};
-// Only the hand-built request path names a transaction code; the typed proxy has its own.
-#[cfg(feature = "rpc")]
-use super::generated::rsbinder::stream::IStreamSink::transactions as sink_transactions;
 use super::generated::rsbinder::stream::IStreamSource::{
     BnStreamSource, BpStreamSource, IStreamSource,
 };
@@ -320,61 +317,25 @@ impl IStreamSource for SourceObject {
 
 // ---- Talking to a binder that may not know its own interface yet ----
 
-/// Resolved once, driven by hand: a typed cast stamps a descriptor on a shared wire proxy for good.
-enum Peer<I: FromIBinder + ?Sized> {
-    Typed(Strong<I>),
-    #[cfg(feature = "rpc")]
-    Unstamped(SIBinder),
-}
+/// The other end of a stream, cast once.
+struct Peer<I: FromIBinder + ?Sized>(Strong<I>);
 
-/// What `resolve_peer` does with a kernel proxy whose descriptor is not cached (plan 16 D6).
-#[derive(Clone, Copy)]
-enum Unknown {
-    /// Ask the remote: a user call that may wait, once per stream.
-    Ask,
-    /// Accept it unasked: a binder thread must not wait on the peer.
-    Accept,
-}
-
-/// Resolve `binder` against `I`, refusing a binder that states a different interface.
-fn resolve_peer<I>(
-    binder: &SIBinder,
-    expected: &str,
-    what: &str,
-    unknown: Unknown,
-) -> Result<Peer<I>>
+/// Cast `binder` to `I`, refusing only a known other interface: it runs in handlers (plan 16 D6).
+fn resolve_peer<I>(binder: &SIBinder, expected: &str, what: &str) -> Result<Peer<I>>
 where
     I: FromIBinder + ?Sized,
 {
-    let known = match (binder.cached_descriptor(), unknown) {
-        (Some(actual), _) => Some(actual),
-        (None, Unknown::Ask) if binder.as_proxy().is_some() => Some(binder.try_descriptor()?),
-        (None, _) => None,
-    };
-    match known {
-        Some(actual) if actual != expected => {
+    if let Some(actual) = binder.cached_descriptor() {
+        if actual != expected {
             log::error!("{what}: not an {expected}: {actual:?}");
             return Err(StatusCode::BadType);
         }
-        Some(_) => {}
-        None => {
-            #[cfg(feature = "rpc")]
-            if (**binder)
-                .as_any()
-                .downcast_ref::<crate::rpc::RpcProxy>()
-                .is_some()
-            {
-                return Ok(Peer::Unstamped(binder.clone()));
-            }
-            // A kernel proxy left unasked: the cast below neither asks nor decides.
-        }
     }
-    Ok(Peer::Typed(FromIBinder::try_from(binder.clone()).map_err(
-        |e| {
-            log::error!("{what}: not an {expected}: {e:?}");
-            StatusCode::BadType
-        },
-    )?))
+    let typed = FromIBinder::try_from(binder.clone()).map_err(|e| {
+        log::error!("{what}: not an {expected}: {e:?}");
+        StatusCode::BadType
+    })?;
+    Ok(Peer(typed))
 }
 
 // ---- Producer ----
@@ -610,7 +571,6 @@ impl<T: Serialize + ?Sized> Producer<T> {
             sink,
             <BpStreamSink as crate::Proxy>::descriptor(),
             "Sink::open",
-            Unknown::Ask,
         )?;
         let credit = Arc::new(Credit::default());
         credit.grant(policy.initial_credits);
@@ -996,74 +956,21 @@ impl<T: ?Sized> Drop for Producer<T> {
     }
 }
 
-impl<I: FromIBinder + ?Sized> Peer<I> {
-    /// The RPC proxy behind an unstamped peer, for a hand-built call.
-    #[cfg(feature = "rpc")]
-    fn rpc_proxy(binder: &SIBinder) -> Result<&crate::rpc::RpcProxy> {
-        (**binder)
-            .as_any()
-            .downcast_ref::<crate::rpc::RpcProxy>()
-            .ok_or(StatusCode::BadType)
-    }
-}
-
 impl Peer<dyn IStreamSink> {
     fn on_start(&self, source: &SIBinder, credits: i32) -> Result<()> {
-        match self {
-            Peer::Typed(sink) => sink.r#onStart(source, credits).map_err(StatusCode::from),
-            #[cfg(feature = "rpc")]
-            Peer::Unstamped(binder) => {
-                let proxy = Self::rpc_proxy(binder)?;
-                let mut data = proxy.build_request(<BpStreamSink as crate::Proxy>::descriptor())?;
-                data.write(source)?;
-                data.write(&credits)?;
-                proxy
-                    .transact(sink_transactions::r#onStart, &data, ONEWAY_FLAGS)
-                    .map(|_| ())
-            }
-        }
+        self.0.r#onStart(source, credits).map_err(StatusCode::from)
     }
 
     fn on_batch(&self, items: &[u8], count: i32) -> Result<()> {
-        match self {
-            Peer::Typed(sink) => sink.r#onBatch(items, count).map_err(StatusCode::from),
-            #[cfg(feature = "rpc")]
-            Peer::Unstamped(binder) => {
-                let proxy = Self::rpc_proxy(binder)?;
-                let mut data = proxy.build_request(<BpStreamSink as crate::Proxy>::descriptor())?;
-                data.write(items)?;
-                data.write(&count)?;
-                proxy
-                    .transact(sink_transactions::r#onBatch, &data, ONEWAY_FLAGS)
-                    .map(|_| ())
-            }
-        }
+        self.0.r#onBatch(items, count).map_err(StatusCode::from)
     }
 
     fn on_end(&self, exception: i32, service_specific: i32, message: Option<&str>) -> Result<()> {
-        match self {
-            Peer::Typed(sink) => sink
-                .r#onEnd(exception, service_specific, message)
-                .map_err(StatusCode::from),
-            #[cfg(feature = "rpc")]
-            Peer::Unstamped(binder) => {
-                let proxy = Self::rpc_proxy(binder)?;
-                let mut data = proxy.build_request(<BpStreamSink as crate::Proxy>::descriptor())?;
-                data.write(&exception)?;
-                data.write(&service_specific)?;
-                data.write(&message)?;
-                proxy
-                    .transact(sink_transactions::r#onEnd, &data, ONEWAY_FLAGS)
-                    .map(|_| ())
-            }
-        }
+        self.0
+            .r#onEnd(exception, service_specific, message)
+            .map_err(StatusCode::from)
     }
 }
-
-/// Must match the generated proxy's `oneway` flags (`rsbinder-aidl/src/generator.rs`).
-#[cfg(feature = "rpc")]
-const ONEWAY_FLAGS: crate::TransactionFlags =
-    crate::FLAG_ONEWAY | crate::FLAG_CLEAR_BUF | crate::FLAG_PRIVATE_LOCAL;
 
 // ---- Consumer ----
 
@@ -1285,7 +1192,6 @@ impl IStreamSink for SinkObject {
                 source,
                 <BpStreamSource as crate::Proxy>::descriptor(),
                 "IStreamSink.onStart",
-                Unknown::Accept,
             )
         };
         // Early answer to a second `onStart`; `refuse_start` and the keep below settle the race.
@@ -1801,41 +1707,11 @@ impl<T> Drop for Consumer<T> {
 
 impl Peer<dyn IStreamSource> {
     fn request(&self, total: i64) -> Result<()> {
-        match self {
-            Peer::Typed(source) => source.r#request(total).map_err(StatusCode::from),
-            #[cfg(feature = "rpc")]
-            Peer::Unstamped(binder) => {
-                let proxy = Self::rpc_proxy(binder)?;
-                let mut data =
-                    proxy.build_request(<BpStreamSource as crate::Proxy>::descriptor())?;
-                data.write(&total)?;
-                proxy
-                    .transact(
-                        super::generated::rsbinder::stream::IStreamSource::transactions::r#request,
-                        &data,
-                        ONEWAY_FLAGS,
-                    )
-                    .map(|_| ())
-            }
-        }
+        self.0.r#request(total).map_err(StatusCode::from)
     }
 
     fn cancel(&self) -> Result<()> {
-        match self {
-            Peer::Typed(source) => source.r#cancel().map_err(StatusCode::from),
-            #[cfg(feature = "rpc")]
-            Peer::Unstamped(binder) => {
-                let proxy = Self::rpc_proxy(binder)?;
-                let data = proxy.build_request(<BpStreamSource as crate::Proxy>::descriptor())?;
-                proxy
-                    .transact(
-                        super::generated::rsbinder::stream::IStreamSource::transactions::r#cancel,
-                        &data,
-                        ONEWAY_FLAGS,
-                    )
-                    .map(|_| ())
-            }
-        }
+        self.0.r#cancel().map_err(StatusCode::from)
     }
 }
 
@@ -2037,7 +1913,6 @@ mod tests {
                 &binder,
                 <BpStreamSink as crate::Proxy>::descriptor(),
                 "test",
-                Unknown::Accept,
             )
             .expect("a local sink");
             let credit = Arc::new(Credit::default());
@@ -2282,7 +2157,6 @@ mod tests {
                 &binder,
                 <BpStreamSink as crate::Proxy>::descriptor(),
                 "test",
-                Unknown::Accept,
             )
             .expect("a local sink");
             let outcome = Arc::new(std::sync::OnceLock::new());
@@ -3194,5 +3068,36 @@ mod tests {
                 "the abandoned wait slept on: {slept:?}"
             );
         });
+    }
+
+    /// Plan 16 D6: a peer of unknown interface is cast unasked; a known other one is refused.
+    #[cfg(feature = "rpc")]
+    #[test]
+    fn a_peer_is_not_asked_for_its_interface() {
+        use crate::rpc::transport::MemTransport;
+        use crate::rpc::{AddressSpace, RpcSession};
+
+        let (a, b) = MemTransport::pair();
+        let server = RpcSession::new(Box::new(a), AddressSpace::Acceptor).unwrap();
+        // A source where a sink is expected: asking would refuse it.
+        let source = BnStreamSource::new_binder(SourceObject(Arc::default())).as_binder();
+        server.set_root(source).unwrap();
+        let serving = thread::spawn(move || {
+            let _ = server.serve_blocking();
+        });
+        let client = RpcSession::new(Box::new(b), AddressSpace::Initiator).unwrap();
+        let root = client.get_root().unwrap();
+        let sink = <BpStreamSink as crate::Proxy>::descriptor();
+
+        assert!(resolve_peer::<dyn IStreamSink>(&root, sink, "test").is_ok());
+        assert_eq!(root.cached_descriptor(), None);
+        assert!(root.try_descriptor().is_ok());
+        assert_eq!(
+            resolve_peer::<dyn IStreamSink>(&root, sink, "test").err(),
+            Some(StatusCode::BadType)
+        );
+        drop(root);
+        client.close_session();
+        serving.join().unwrap();
     }
 }

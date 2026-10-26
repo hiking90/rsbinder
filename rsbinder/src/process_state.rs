@@ -146,7 +146,8 @@
 //! threads asking at once may both send the transaction; the first answer stored is kept, as in
 //! AOSP. The pin is the right home because it is `BpBinder`'s lifetime: a case-(b) revival keeps
 //! the pin and so the answer, and a recycled handle id gets a new pin through case (a), so it
-//! never sees the answer of the node the id named before.
+//! never sees the answer of the node the id named before. An RPC proxy follows the same rule
+//! without the `CallRestriction` (`rpc::proxy` module doc "Descriptor").
 //!
 //! # Death links
 //!

@@ -375,10 +375,7 @@ pub use binder::{
     START_RECORDING_TRANSACTION, STOP_RECORDING_TRANSACTION, SYSPROPS_TRANSACTION,
     TWEET_TRANSACTION,
 };
-// `declare_binder_interface!` calls `$crate::__rpc_stamp_descriptor` from consumer crates.
-#[doc(hidden)]
-pub use binder::__rpc_stamp_descriptor;
-// Same reason: the `function_names` arm of `declare_binder_interface!`.
+// The `function_names` arm of `declare_binder_interface!` calls it from consumer crates.
 #[doc(hidden)]
 pub use binder::__transaction_name;
 

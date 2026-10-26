@@ -3042,6 +3042,7 @@ impl rsbinder::rpc::proxy::RpcProxy
 pub fn rsbinder::rpc::proxy::RpcProxy::address(&self) -> rsbinder::rpc::address::RpcAddress
 pub fn rsbinder::rpc::proxy::RpcProxy::build_request(&self, &str) -> rsbinder::Result<rsbinder::Parcel>
 pub fn rsbinder::rpc::proxy::RpcProxy::transact(&self, rsbinder::TransactionCode, &rsbinder::Parcel, rsbinder::TransactionFlags) -> rsbinder::Result<core::option::Option<rsbinder::Parcel>>
+pub fn rsbinder::rpc::proxy::RpcProxy::try_descriptor(&self) -> rsbinder::Result<&str>
 impl core::ops::drop::Drop for rsbinder::rpc::proxy::RpcProxy
 pub fn rsbinder::rpc::proxy::RpcProxy::drop(&mut self)
 impl rsbinder::IBinder for rsbinder::rpc::proxy::RpcProxy
@@ -3639,6 +3640,7 @@ impl rsbinder::rpc::proxy::RpcProxy
 pub fn rsbinder::rpc::proxy::RpcProxy::address(&self) -> rsbinder::rpc::address::RpcAddress
 pub fn rsbinder::rpc::proxy::RpcProxy::build_request(&self, &str) -> rsbinder::Result<rsbinder::Parcel>
 pub fn rsbinder::rpc::proxy::RpcProxy::transact(&self, rsbinder::TransactionCode, &rsbinder::Parcel, rsbinder::TransactionFlags) -> rsbinder::Result<core::option::Option<rsbinder::Parcel>>
+pub fn rsbinder::rpc::proxy::RpcProxy::try_descriptor(&self) -> rsbinder::Result<&str>
 impl core::ops::drop::Drop for rsbinder::rpc::proxy::RpcProxy
 pub fn rsbinder::rpc::proxy::RpcProxy::drop(&mut self)
 impl rsbinder::IBinder for rsbinder::rpc::proxy::RpcProxy

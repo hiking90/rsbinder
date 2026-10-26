@@ -3026,7 +3026,7 @@ fn rpc_stack_has_no_globals() {
                     if name == "tcp_debug.rs" && line.contains("INSECURE_WARNED") {
                         continue;
                     }
-                    // proxy.rs `OnceLock` is a per-`RpcProxy` descriptor stamp.
+                    // proxy.rs `OnceLock` is a per-`RpcProxy` descriptor cache.
                     if name == "proxy.rs" && l.contains("OnceLock") && !static_item {
                         continue;
                     }

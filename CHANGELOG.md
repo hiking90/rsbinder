@@ -107,27 +107,34 @@ Each item below changes what a 0.12.0 program observes.
   `RpcProxy` alone, so such a type was never driven by them.
 - `Debug` of an `SIBinder`, `dyn IBinder` or `ProxyHandle` prints a
   descriptor it cannot learn without a transaction as `(not cached)`: a
-  kernel proxy whose descriptor nothing has asked for yet (see Changed;
-  0.12.0 always had it), and an RPC proxy no typed cast has stamped yet
-  (0.12.0: an empty string).
-- **A typed cast does not ask a kernel proxy for its interface.**
+  kernel or RPC proxy whose descriptor nothing has asked for yet (see
+  Changed). 0.12.0 printed a kernel proxy's, which it always had, and an RPC
+  proxy's first typed cast's descriptor, or an empty string before any.
+- **A typed cast does not ask a proxy for its interface.**
   `SIBinder::into_interface`, `FromIBinder::try_from`, `Strong::try_from`
-  and reading a `Strong<dyn I>` from a parcel convert a remote binder of
-  any interface, as AOSP C++ `interface_cast` and Java `asInterface` do; so
-  do `Strong::clone`, `Weak::upgrade`, `into_sync` and `try_into_async`,
-  which cast again. A remote object of another interface refuses the first
-  two-way call: an AIDL-generated C++, NDK, Rust or rsbinder server answers
-  `BadType`, a Java server `EX_SECURITY` (`Parcel.enforceInterface` throws
-  `SecurityException`). A one-way call to it is dropped without an error.
-  0.12.0 compared the descriptor it had asked for when the binder
-  was read and returned `BadType` from the cast. Code that cast to learn
-  whether a binder implements an interface calls the new
-  `SIBinder::into_interface_checked`. The service manager lookups
-  (`hub::check_interface`, `try_get_interface`, `wait_for_interface`, their
-  async forms), `connect`, `Client::get` and `try_get`,
-  `RpcSession::get_interface`, `Reconnecting` and
+  and reading a `Strong<dyn I>` from a parcel convert a remote binder, kernel
+  or RPC, of any interface, as AOSP C++ `interface_cast` and Java
+  `asInterface` do; so do `Strong::clone`, `Weak::upgrade`, `into_sync` and
+  `try_into_async`, which cast again. A remote object of another interface
+  refuses the first two-way call: an AIDL-generated C++, NDK, Rust or
+  rsbinder server answers `BadType`, a Java server `EX_SECURITY`
+  (`Parcel.enforceInterface` throws `SecurityException`). A one-way call to
+  it is dropped without an error. 0.12.0 compared a kernel proxy's
+  descriptor, asked for when the binder was read, and returned `BadType`
+  from the cast; an RPC proxy took the interface of its first typed cast,
+  for every later reader of that address, and refused a cast to another
+  with `BadType`. Code that cast to learn whether a binder implements an
+  interface calls the new `SIBinder::into_interface_checked`. The service
+  manager lookups (`hub::check_interface`, `try_get_interface`,
+  `wait_for_interface`, their async forms), `connect`, `Client::get` and
+  `try_get`, `RpcSession::get_interface`, `Reconnecting` and
   `rsbinder_topic::registry::RegistryResolver::new` cast with it and keep
-  their `BadType`.
+  their `BadType`. Over RPC they now ask the remote, so a root or named
+  service of another interface is refused where 0.12.0 accepted it and
+  failed its calls: `connect` and `RpcSession::get_interface` return
+  `BadType`, and `Reconnecting` treats it as a permanent error, so `build`
+  fails or the helper closes, where 0.12.0 connected and each call returned
+  `BadType`.
 - `FromIBinder` has a required associated function,
   `interface_descriptor`, which `into_interface_checked` compares with the
   remote's answer. Generated code implements it; a hand-written `impl`
@@ -136,10 +143,29 @@ Each item below changes what a 0.12.0 program observes.
   binder) unless the proxy's descriptor is already known and differs, which
   is `BadType`. 0.12.0 returned `BadType` whenever the remote's descriptor
   differed.
-- `cancel::cancel_remote` sends `cancel()` to a kernel proxy whose
-  descriptor nothing has asked for, as it did for an unstamped RPC proxy;
-  a binder of another interface drops that one-way call. A known other
-  interface is still `BadType`.
+- `cancel::cancel_remote` sends `cancel()` to a proxy, kernel or RPC, whose
+  descriptor nothing has asked for; a binder of another interface drops
+  that one-way call. A known other interface is still `BadType`. 0.12.0
+  refused a kernel proxy of another interface, and an RPC proxy a typed
+  cast had taken for another interface, with `BadType`. For the same
+  binders, `BpMemoryHeap::map` and `BpMemory::resolve` get the server's
+  refusal of the interface token (see the typed-cast item) rather than
+  `BadType` from this process. A binder whose remote answered an empty
+  descriptor is refused with `BadType` once that answer is known, where
+  0.12.0 sent the call (shared memory over kernel or RPC; `cancel_remote`
+  and streams over RPC).
+- `stream::Sink::open` asks no sink for its interface, so opening a stream
+  in a binder handler never waits on the consumer. A sink whose interface
+  is not known and is another one is accepted: its server refuses the
+  one-way `onStart` and batches, and the producer waits for credit that does
+  not come. 0.12.0 refused a kernel sink of another interface with
+  `BadType`, having asked for its descriptor when the endpoint was read.
+- A stream consumer accepts an `onStart` from a source whose interface
+  nothing has asked for and is another one: that server drops the
+  consumer's one-way `request` and `cancel`, and the consumer waits for
+  batches that do not come. 0.12.0 ended the consumer's stream with
+  `BadType` for a kernel source of another interface, having asked for its
+  descriptor when the source was read.
 - A topic registry (`rsbinder_topic::registry::Registry`) lists a binder of
   another interface that a client advertises; a subscriber of that name is
   refused with `BadType`. 0.12.0 refused the `advertise`.
@@ -154,6 +180,21 @@ Each item below changes what a 0.12.0 program observes.
   call, and these functions read the stored answer: they neither panicked
   nor failed. Ask for the descriptor before setting `FatalIfNotOneway`, and
   call `try_descriptor()` where the error matters.
+- `descriptor()` of an RPC proxy (`IBinder::descriptor`) and
+  `RpcProxy::prepare_transact(true)` make a two-way `INTERFACE_TRANSACTION`
+  when nothing has asked for the descriptor yet, as on kernel binder but
+  without the `CallRestriction` (as in AOSP). Like any two-way RPC call it
+  needs a connection to send on: when none becomes free within the session's
+  timeout, or the session has no outgoing connection, it fails with
+  `WouldBlock`: `descriptor()` returns `""` and logs it, and
+  `try_descriptor()` and `prepare_transact(true)` return the error. A reply
+  deadline that passes ends the session. 0.12.0 made no call: `descriptor()`
+  returned the descriptor of the proxy's first typed cast or `""`, and
+  `prepare_transact(true)` wrote that as the token.
+- `__rpc_stamp_descriptor` is removed. It was `#[doc(hidden)]`, called by
+  generated code from the same rsbinder; code that called it by hand to
+  have `prepare_transact(true)` write a token drops the call, and
+  `prepare_transact(true)` asks the remote for it.
 - The service manager lookups return the binder of a service whose process
   has died: `check_service` and `wait_for_service` return `Some`,
   `try_get_service` `Ok(Some)`, and the binder's first call returns
@@ -176,7 +217,7 @@ Each item below changes what a 0.12.0 program observes.
   0.12.0 wrote the descriptor the proxy held for its remote, which a
   successful typed cast had already made equal, so the bytes on the wire do
   not change. `prepare_transact(true)` still writes the remote's.
-- **`IBinder::try_descriptor`**, also on `ProxyHandle`: the descriptor with
+- **`IBinder::try_descriptor`**, also on `ProxyHandle` and `RpcProxy`: the descriptor with
   the error of a query that failed, where `descriptor()` returns `""` for
   both that and a binder whose interface states none.
 - **`SIBinder::into_interface_checked`** (AOSP C++ `checked_interface_cast`):
@@ -352,8 +393,10 @@ Each item below changes what a 0.12.0 program observes.
   `CallRestriction` (a `FatalIfNotOneway` thread panics); do not call it
   under a lock a binder thread needs. Reading the binder of a dead process
   succeeds, and its first call returns `DeadObject`. A `stream::Sink` that
-  streams by calls asks a kernel sink for its descriptor once, when opened;
-  a consumer's binder thread receiving `onStart` asks nothing.
+  streams by calls asks its sink nothing, and a consumer's binder thread
+  receiving `onStart` asks nothing. An RPC proxy follows the same rules,
+  without the `CallRestriction`: it asks when its descriptor is first
+  needed, and a typed cast neither asks nor fixes its interface.
 - **The `tokio` floor is 1.53.3**, the first release with
   `AsyncFd::register_with_interest`; the constructors it replaces are
   deprecated there as unsound (tokio #8587). `rsbinder` itself makes no new
