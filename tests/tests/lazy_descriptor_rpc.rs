@@ -110,6 +110,9 @@ impl ILazyNode for Node {
     fn r#takeNullable(&self, _: Option<&Strong<dyn ILazyNode>>) -> BinderResult<()> {
         Ok(())
     }
+    fn r#askDescriptor(&self, _: &SIBinder) -> BinderResult<String> {
+        Err(StatusCode::UnknownTransaction.into())
+    }
 }
 
 /// A served `ILazyNode` root and a client session, each side counting what it sends.

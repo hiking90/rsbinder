@@ -103,6 +103,10 @@ macro_rules! __declare_binder_interface {
                     self.0.as_sync().dump(_writer, _args)
                 }
 
+                fn on_dump_fd(&self, _fd: ::std::os::fd::OwnedFd, _args: &[::std::string::String]) -> $crate::Result<()> {
+                    self.0.as_sync().dump_fd(_fd, _args)
+                }
+
                 fn transaction_name(code: $crate::TransactionCode) -> ::core::option::Option<&'static str> where Self: Sized {
                     Self::__TRANSACTION_NAMES.and_then(|names| $crate::__transaction_name(names, code))
                 }
@@ -227,6 +231,10 @@ macro_rules! __declare_binder_interface {
 
             fn on_dump(&self, _writer: &mut dyn ::std::io::Write, _args: &[::std::string::String]) -> $crate::Result<()> {
                 self.0.dump(_writer, _args)
+            }
+
+            fn on_dump_fd(&self, _fd: ::std::os::fd::OwnedFd, _args: &[::std::string::String]) -> $crate::Result<()> {
+                self.0.dump_fd(_fd, _args)
             }
 
             fn transaction_name(code: $crate::TransactionCode) -> ::core::option::Option<&'static str> where Self: Sized {

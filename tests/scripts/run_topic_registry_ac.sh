@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # rsb_hub's topic registry (plan 15 P5-3): AC-15.5.7, 5.8, 5.12, and 5.1b and
-# 5.5 once more against a real hub. Needs a Linux host with a writable
+# 5.5 once more against a real hub; and plan 16's AC-16.6, a binder of a
+# stopped process handed to the hub. Needs a Linux host with a writable
 # /dev/binderfs/binder and no rsb_hub running: the script starts its own.
 #
 #   ./tests/scripts/run_topic_registry_ac.sh
@@ -382,16 +383,12 @@ config "$PERMISSIVE" "$PERMISSIVE_TOPIC"
 if start_hub "$HUB_TOPIC" --config "$CFG"; then
     probe "$WORK/a" publish:sp.a:x say:up hold; publisher=$LAST
     wait_line "$WORK/a" "^SAY up" 10
-    # Keeps the first lookup's proxy: a new one would ask the stopped publisher (plan 15 §12.7).
-    probe "$WORK/c" lookup:sp.a say:looked wait:"$WORK/go1" lookup:sp.a list:sp. \
-        publish:sp.b:y say:done hold
-    wait_line "$WORK/c" "^SAY looked" 10
     stop_until_stopped "$publisher"
-    touch "$WORK/go1"
+    # The client meets the stopped publisher's binder for the first time (plan 16).
+    probe "$WORK/c" lookup:sp.a list:sp. publish:sp.b:y say:done hold
     if wait_line "$WORK/c" "^SAY done" 10; then
         want "$WORK/a" "RESULT publish sp.a OK" "the publisher advertises"
-        [ "$(grep -c -xF "RESULT lookup sp.a FOUND" "$WORK/c")" -eq 2 ] \
-            && ok "both lookups find it" || bad "lookups: $(grep "lookup sp.a" "$WORK/c")"
+        want "$WORK/c" "RESULT lookup sp.a FOUND" "the lookup finds it"
         want "$WORK/c" "RESULT list sp. OK" "list answers"
         grep -q "^LISTED sp.a " "$WORK/c" && ok "with the stopped publisher's name" \
             || bad "not listed: $(grep LISTED "$WORK/c")"
@@ -405,6 +402,38 @@ if start_hub "$HUB_TOPIC" --config "$CFG"; then
         bad "a call is held up: $(cat "$WORK/c")"
     fi
     kill -CONT "$publisher"
+else
+    bad "hub did not start: $(tail -3 "$LOG")"
+fi
+stop_probes; stop_hub
+
+######################################################################
+note "AC-16.6  a stopped process's binder, new to the hub, holds up no call"
+# The first relay is the hub's first sight of the token; the rest pass it through typed casts.
+if start_hub "$HUB_TOPIC" --config "$CFG"; then
+    probe "$WORK/c" capture:rl.cap say:capturing wait:"$WORK/go3" relay:add:rl.add \
+        relay:notify:rl.notify relay:clientcb:rl.cb relay:advertise:rl.adv \
+        relay:watch:rl.watch say:relayed hold
+    wait_line "$WORK/c" "^SAY capturing" 10
+    probe "$WORK/s" subscribe:rl.cap hold; subscriber=$LAST
+    if wait_line "$WORK/c" "^SAY captured" 10; then
+        stop_until_stopped "$subscriber"
+        touch "$WORK/go3"
+        if wait_line "$WORK/c" "^SAY relayed" 10; then
+            for call in add notify clientcb advertise watch; do
+                want "$WORK/c" "RESULT relay $call OK" "the hub takes the token: $call"
+                fast "$WORK/c" relay "$call" "$call"
+            done
+            probe_now "$WORK/d" lookup:rl.cap
+            want "$WORK/d" "RESULT lookup rl.cap FOUND" "another client finds a topic"
+            fast "$WORK/d" lookup rl.cap "another client's lookup"
+        else
+            bad "a call is held up: $(cat "$WORK/c")"
+        fi
+        kill -CONT "$subscriber"
+    else
+        bad "no token captured: $(cat "$WORK/c" "$WORK/s")"
+    fi
 else
     bad "hub did not start: $(tail -3 "$LOG")"
 fi

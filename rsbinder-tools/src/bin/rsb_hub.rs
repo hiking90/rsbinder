@@ -23,8 +23,6 @@ struct Service {
     has_clients: bool,
     guarantee_client: bool,
     context: rsbinder::thread_state::CallingContext,
-    /// Descriptor is `android.os.IAccessor`; stands in for AOSP's VINTF `<accessor>` entries.
-    is_accessor: bool,
 }
 
 /// Collected under the `Inner` lock, fired after it drops: no outbound transaction under it (R1).
@@ -83,15 +81,9 @@ fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// AOSP `main.cpp`'s `addService("manager", ...)`.
-const SELF_SERVICE_NAME: &str = "manager";
+use config::{RESERVED_SERVICE_NAMES as RESERVED_NAMES, SELF_SERVICE_NAME};
 
-/// Names the hub registers at startup and refuses to every transaction's `add`, `allow_all` too.
-#[cfg(feature = "topic")]
-const RESERVED_NAMES: &[&str] = &[rsbinder_topic::aidl::ITopicRegistry::SERVICE_NAME];
-#[cfg(not(feature = "topic"))]
-const RESERVED_NAMES: &[&str] = &[];
-
+/// Refused to every transaction's `add`, `allow_all` too.
 fn is_reserved(name: &str) -> bool {
     RESERVED_NAMES.contains(&name)
 }
@@ -379,7 +371,6 @@ impl Inner {
         };
 
         let out = service.binder.clone();
-        let is_accessor = service.is_accessor;
         let is_lazy = service.dump_priority & FLAG_IS_LAZY_SERVICE != 0;
         service.guarantee_client = true;
         self.handle_service_client_callback(Self::KNOWN_CLIENTS_ON_DEMAND, name, false, pending)?;
@@ -390,7 +381,6 @@ impl Inner {
 
         Ok(Some(Lookup {
             binder: out,
-            is_accessor,
             is_lazy,
         }))
     }
@@ -454,6 +444,8 @@ struct ServiceManager {
     /// The topic registry `main` registers; read by `dump` only.
     #[cfg(feature = "topic")]
     topics: Option<rsbinder_topic::registry::Registry>,
+    /// Set while a dump writer holds a caller's fd; one only, as an unread pipe fills any number.
+    dump_writer: DumpWriter,
 }
 
 impl ServiceManager {
@@ -480,6 +472,7 @@ impl ServiceManager {
             activator,
             #[cfg(feature = "topic")]
             topics: None,
+            dump_writer: Arc::new(Mutex::new(None)),
         };
 
         this.run_death_receiver(death_receiver);
@@ -570,18 +563,63 @@ impl ServiceManager {
         permission: Permission,
         name: &str,
     ) -> bool {
+        self.allows_in(&self.enforcer.config(), caller, permission, name)
+    }
+
+    /// [`Self::allows_as`] against a config snapshot one transaction keeps for every judgement.
+    fn allows_in(
+        &self,
+        config: &config::Config,
+        caller: Option<&rsbinder::Caller>,
+        permission: Permission,
+        name: &str,
+    ) -> bool {
         let add = permission == Permission::Add;
         match caller {
             // A reserved name taken over would hand every client the taker's binder.
             Some(_) if add && is_reserved(name) => false,
-            Some(caller) => self.enforcer.check_caller(permission, name, caller),
+            Some(caller) => self
+                .enforcer
+                .check_caller_in(config, permission, name, caller),
             None => add && (name == SELF_SERVICE_NAME || is_reserved(name)),
         }
     }
 
+    /// AOSP `canFindService`/`canAddService`: the name, and the accessor it declares if any.
+    fn allows_service_in(
+        &self,
+        config: &config::Config,
+        caller: Option<&rsbinder::Caller>,
+        permission: Permission,
+        name: &str,
+    ) -> bool {
+        self.refused_in(config, caller, permission, name).is_none()
+    }
+
+    /// The first of the name and its declared accessor the policy refuses; one rule for every call.
+    fn refused_in<'a>(
+        &self,
+        config: &'a config::Config,
+        caller: Option<&rsbinder::Caller>,
+        permission: Permission,
+        name: &'a str,
+    ) -> Option<&'a str> {
+        if !self.allows_in(config, caller, permission, name) {
+            return Some(name);
+        }
+        config
+            .declarations
+            .accessor(name)
+            .filter(|accessor| !self.allows_in(config, caller, permission, accessor))
+    }
+
     /// AOSP `tryStartService`; `getService*` only: `checkService` must not start anything.
     fn try_start_service(&self, name: &str) {
-        let config = self.enforcer.config();
+        self.try_start_service_in(&self.enforcer.config(), name);
+    }
+
+    /// [`Self::try_start_service`] against a snapshot; an accessor's miss starts the instance.
+    fn try_start_service_in(&self, config: &config::Config, name: &str) {
         match config.declarations.activation(name) {
             Some(activation) => self.activator.try_start(name, activation),
             None if config.declarations.is_declared(name) => {
@@ -591,23 +629,70 @@ impl ServiceManager {
         }
     }
 
-    /// Not for lookups: AOSP `tryGetBinder` answers a denied find with null, not an error.
-    fn require(&self, permission: Permission, name: &str) -> rsbinder::BinderResult<()> {
-        if self.allows(permission, name) {
-            return Ok(());
+    /// AOSP `tryGetService`: looks the declared accessor up in the instance's stead; judges both.
+    fn try_get_service(
+        &self,
+        name: &str,
+        start: bool,
+    ) -> rsbinder::BinderResult<hub::android_16::android::os::Service::Service> {
+        let config = self.enforcer.config();
+        let caller = rsbinder::calling_caller();
+        let accessor = config.declarations.accessor(name);
+        if !self.allows_service_in(&config, caller.as_ref(), Permission::Find, name) {
+            return Ok(classify_for_service_union(None, accessor.is_some()));
         }
+        let order = lock_recover(&self.fire_order);
+        let mut pending = Vec::new();
+        let lookup = {
+            let mut inner = lock_recover(&self.inner);
+            inner.try_get_binder(accessor.unwrap_or(name), &mut pending)?
+        };
+        fire_pending(pending);
+        drop(order);
+        if lookup.is_none() && start {
+            self.try_start_service_in(&config, name);
+        }
+        Ok(classify_for_service_union(lookup, accessor.is_some()))
+    }
+
+    /// Judges the name and its declared accessor; not for lookups (AOSP answers those with null).
+    fn require(&self, permission: Permission, name: &str) -> rsbinder::BinderResult<()> {
+        self.require_in(&self.enforcer.config(), permission, name)
+    }
+
+    /// [`Self::require`] against a snapshot the transaction also answers from.
+    fn require_in(
+        &self,
+        config: &config::Config,
+        permission: Permission,
+        name: &str,
+    ) -> rsbinder::BinderResult<()> {
+        let caller = rsbinder::calling_caller();
+        let Some(target) = self.refused_in(config, caller.as_ref(), permission, name) else {
+            return Ok(());
+        };
         let ctx = rsbinder::thread_state::CallingContext::default();
-        let why = if permission == Permission::Add && is_reserved(name) {
+        let why = if permission == Permission::Add && is_reserved(target) {
             "rsb_hub reserves the name and refused"
         } else {
             "policy denied"
         };
-        let msg = format!(
-            "{why} {permission} on {name:?} for uid={} (pid={})",
+        // The caller learns no accessor name, as AOSP's "SELinux denied for the accessor".
+        let of = if target == name {
+            format!("{name:?}")
+        } else {
+            format!("the accessor of {name:?}")
+        };
+        let wire = format!(
+            "{why} {permission} on {of} for uid={} (pid={})",
             ctx.uid, ctx.pid
         );
-        log::warn!("{msg}");
-        Err((ExceptionCode::Security, msg.as_str()).into())
+        log::warn!(
+            "{why} {permission} on {target:?} ({of}) for uid={} (pid={})",
+            ctx.uid,
+            ctx.pid
+        );
+        Err((ExceptionCode::Security, wire.as_str()).into())
     }
 
     /// Pure so the hijack check is testable without two real UIDs.
@@ -663,6 +748,7 @@ struct DumpRow {
     dump_priority: i32,
     has_clients: bool,
     guarantee_client: bool,
+    /// A declaration names this as the accessor of an instance.
     is_accessor: bool,
     registration_callbacks: usize,
     client_callbacks: usize,
@@ -805,6 +891,7 @@ impl ServiceManager {
             map.get(name).map_or(0, |v| v.len())
         }
 
+        let config = self.enforcer.config();
         #[cfg(feature = "topic")]
         let mut registered = false;
         let (mut rows, mut awaited, death_subscriptions) = {
@@ -827,7 +914,7 @@ impl ServiceManager {
                     dump_priority: service.dump_priority,
                     has_clients: service.has_clients,
                     guarantee_client: service.guarantee_client,
-                    is_accessor: service.is_accessor,
+                    is_accessor: config.declarations.accessor_for(name).is_some(),
                     registration_callbacks: count(&inner.name_to_registration_callbacks, name),
                     client_callbacks: count(&inner.name_to_client_callbacks, name),
                 })
@@ -856,11 +943,12 @@ impl ServiceManager {
 
         let before = rows.len() + awaited.len();
         let caller = rsbinder::calling_caller();
-        rows.retain(|row| self.allows_as(caller.as_ref(), Permission::Find, &row.name));
-        awaited.retain(|(name, _, _)| self.allows_as(caller.as_ref(), Permission::Find, name));
+        rows.retain(|row| self.allows_in(&config, caller.as_ref(), Permission::Find, &row.name));
+        awaited.retain(|(name, _, _)| {
+            self.allows_in(&config, caller.as_ref(), Permission::Find, name)
+        });
         let hidden = before - rows.len() - awaited.len();
 
-        let config = self.enforcer.config();
         DumpSnapshot {
             services: rows,
             awaited,
@@ -881,30 +969,64 @@ impl ServiceManager {
 
 impl Interface for ServiceManager {
     /// Gated by `list`, each name by `find` too, else it would bypass the per-name policy.
-    fn dump(&self, writer: &mut dyn std::io::Write, args: &[String]) -> rsbinder::Result<()> {
+    fn dump_fd(&self, fd: std::os::fd::OwnedFd, args: &[String]) -> rsbinder::Result<()> {
+        let ctx = rsbinder::thread_state::CallingContext::default();
         if !self.allows(Permission::List, "") {
-            let ctx = rsbinder::thread_state::CallingContext::default();
             log::warn!(
                 "policy denied dump (list) for uid={} (pid={})",
                 ctx.uid,
                 ctx.pid
             );
             // Also to the fd: its only channel, else a denial looks like an empty registry.
-            let _ = writeln!(
-                writer,
-                "rsb_hub: policy denies `list` to uid={} (pid={})",
+            let text = format!(
+                "rsb_hub: policy denies `list` to uid={} (pid={})\n",
                 ctx.uid, ctx.pid
             );
+            let _ = send_dump(&self.dump_writer, fd, text.into_bytes(), &ctx);
             return Err(StatusCode::PermissionDenied);
         }
-        write_dump(writer, &self.dump_snapshot(args.to_vec()))
+        let mut text = Vec::new();
+        render_dump(&mut text, &self.dump_snapshot(args.to_vec()))
+            .map_err(|_| StatusCode::NoMemory)?;
+        send_dump(&self.dump_writer, fd, text, &ctx)
     }
 }
 
-/// [`render_dump`]; a write failure is only logged: AOSP `BpBinder` reads `DEAD_OBJECT` as death.
-fn write_dump(writer: &mut dyn std::io::Write, snapshot: &DumpSnapshot) -> rsbinder::Result<()> {
-    if let Err(e) = render_dump(writer, snapshot) {
-        log::error!("dump: writing to the caller's fd failed: {e}");
+/// The caller whose dump a writer thread is writing, as `uid=.. (pid=..)`; `None` when idle.
+type DumpWriter = Arc<Mutex<Option<String>>>;
+
+/// Writes on a thread of its own: a caller that never reads then holds it, not the binder thread.
+fn send_dump(
+    writer: &DumpWriter,
+    fd: std::os::fd::OwnedFd,
+    text: Vec<u8>,
+    caller: &rsbinder::thread_state::CallingContext,
+) -> rsbinder::Result<()> {
+    let who = format!("uid={} (pid={})", caller.uid, caller.pid);
+    {
+        let mut slot = lock_recover(writer);
+        if let Some(holder) = slot.as_deref() {
+            log::warn!("dump: refused {who}, the dump of {holder} is still being written");
+            return Err(StatusCode::WouldBlock);
+        }
+        *slot = Some(who.clone());
+    }
+    let slot = Arc::clone(writer);
+    let spawned = std::thread::Builder::new()
+        .name("rsb_hub:dump".to_owned())
+        .spawn(move || {
+            let mut file = std::fs::File::from(fd);
+            if let Err(e) = std::io::Write::write_all(&mut file, &text) {
+                log::error!("dump: writing to the fd of {who} failed: {e}");
+            }
+            // Closed before the slot frees: the caller's end-of-file is the dump's end.
+            drop(file);
+            *lock_recover(&slot) = None;
+        });
+    if let Err(e) = spawned {
+        *lock_recover(writer) = None;
+        log::error!("dump: cannot spawn the writer thread: {e}");
+        return Err(StatusCode::NoMemory);
     }
     Ok(())
 }
@@ -912,30 +1034,27 @@ fn write_dump(writer: &mut dyn std::io::Write, snapshot: &DumpSnapshot) -> rsbin
 /// A registered service, as `getService2`/`checkService2` need to see it.
 struct Lookup {
     binder: SIBinder,
-    is_accessor: bool,
     /// Clients must not cache a lazy binder: it can unregister without dying.
     is_lazy: bool,
 }
 
+/// `accessor`: the requested name declares one, so the answer is the accessor arm, found or not.
 fn classify_for_service_union(
     lookup: Option<Lookup>,
+    accessor: bool,
 ) -> hub::android_16::android::os::Service::Service {
     use hub::android_16::android::os::{Service, ServiceWithMetadata};
+    if accessor {
+        return Service::Service::Accessor(lookup.map(|found| found.binder));
+    }
     match lookup {
-        Some(Lookup {
-            binder,
-            is_accessor: true,
-            ..
-        }) => Service::Service::Accessor(Some(binder)),
-        Some(Lookup {
-            binder,
-            is_accessor: false,
-            is_lazy,
-        }) => Service::Service::ServiceWithMetadata(ServiceWithMetadata::ServiceWithMetadata {
-            service: Some(binder),
-            isLazyService: is_lazy,
-        }),
-        // As AOSP: only this arm, not `accessor(null)`, leads clients to their local fallback.
+        Some(Lookup { binder, is_lazy }) => {
+            Service::Service::ServiceWithMetadata(ServiceWithMetadata::ServiceWithMetadata {
+                service: Some(binder),
+                isLazyService: is_lazy,
+            })
+        }
+        // libbinder tries local accessors on this arm only; rsbinder on `accessor(null)` too.
         None => Service::Service::ServiceWithMetadata(ServiceWithMetadata::ServiceWithMetadata {
             service: None,
             isLazyService: false,
@@ -965,7 +1084,7 @@ impl IServiceManager for ServiceManager {
         Ok(result)
     }
 
-    /// An `IAccessor` descriptor is trusted on the registrant's word; AOSP uses VINTF.
+    /// Makes no call on `service`: a declaration, not its descriptor, says what is an accessor.
     fn addService(
         &self,
         name: &str,
@@ -986,9 +1105,6 @@ impl IServiceManager for ServiceManager {
                  no DUMP_FLAG_PRIORITY_* bit; it will not appear in listServices"
             );
         }
-
-        // A literal, not the `IAccessor` symbol, so rsb_hub builds without the `rpc` feature.
-        let is_accessor = service.descriptor() == "android.os.IAccessor";
 
         let caller = rsbinder::thread_state::CallingContext::default();
 
@@ -1069,7 +1185,6 @@ impl IServiceManager for ServiceManager {
                     if existing.context.uid == caller.uid || self.allow_cross_uid_overwrite {
                         existing.dump_priority = dumpPriority;
                         existing.guarantee_client = false;
-                        existing.is_accessor = is_accessor;
                     } else {
                         log::warn!(
                             "addService: uid={} re-added '{name}' (owned by uid={}); keeping the owner's flags",
@@ -1087,7 +1202,6 @@ impl IServiceManager for ServiceManager {
                         has_clients: prev_clients,
                         guarantee_client: false,
                         context: caller,
-                        is_accessor,
                     },
                 )?;
             }
@@ -1256,20 +1370,22 @@ impl IServiceManager for ServiceManager {
 
     /// Config `[[service]]` entries stand in for AOSP's VINTF manifests.
     fn isDeclared(&self, arg_name: &str) -> rsbinder::BinderResult<bool> {
-        self.require(Permission::Find, arg_name)?;
-        Ok(self.enforcer.config().declarations.is_declared(arg_name))
+        let config = self.enforcer.config();
+        self.require_in(&config, Permission::Find, arg_name)?;
+        Ok(config.declarations.is_declared(arg_name))
     }
 
     /// Filtered by `find`, as AOSP `getDeclaredInstances` filters by `canFindService`.
     fn getDeclaredInstances(&self, arg_iface: &str) -> rsbinder::BinderResult<Vec<String>> {
-        let declarations = &self.enforcer.config().declarations;
-        let all = declarations.instances_of(arg_iface);
+        let config = self.enforcer.config();
+        let all = config.declarations.instances_of(arg_iface);
         let declared = all.len();
         let caller = rsbinder::calling_caller();
         let allowed: Vec<String> = all
             .into_iter()
             .filter(|instance| {
-                self.allows_as(
+                self.allows_service_in(
+                    &config,
                     caller.as_ref(),
                     Permission::Find,
                     &format!("{arg_iface}/{instance}"),
@@ -1302,18 +1418,14 @@ impl IServiceManager for ServiceManager {
         arg_name: &str,
     ) -> rsbinder::BinderResult<Option<hub::android_16::android::os::ConnectionInfo::ConnectionInfo>>
     {
-        self.require(Permission::Find, arg_name)?;
-        Ok(self
-            .enforcer
-            .config()
-            .declarations
-            .connection_info(arg_name)
-            .map(
-                |info| hub::android_16::android::os::ConnectionInfo::ConnectionInfo {
-                    ipAddress: info.ip.clone(),
-                    port: info.port,
-                },
-            ))
+        let config = self.enforcer.config();
+        self.require_in(&config, Permission::Find, arg_name)?;
+        Ok(config.declarations.connection_info(arg_name).map(|info| {
+            hub::android_16::android::os::ConnectionInfo::ConnectionInfo {
+                ipAddress: info.ip.clone(),
+                port: info.port,
+            }
+        }))
     }
 
     fn registerClientCallback(
@@ -1524,38 +1636,14 @@ impl IServiceManager for ServiceManager {
         &self,
         name: &str,
     ) -> rsbinder::BinderResult<hub::android_16::android::os::Service::Service> {
-        if !self.allows(Permission::Find, name) {
-            return Ok(classify_for_service_union(None));
-        }
-        let order = lock_recover(&self.fire_order);
-        let mut pending = Vec::new();
-        let lookup = {
-            let mut inner = lock_recover(&self.inner);
-            inner.try_get_binder(name, &mut pending)?
-        };
-        fire_pending(pending);
-        drop(order);
-        if lookup.is_none() {
-            self.try_start_service(name);
-        }
-        Ok(classify_for_service_union(lookup))
+        self.try_get_service(name, true)
     }
 
     fn checkService2(
         &self,
         name: &str,
     ) -> rsbinder::BinderResult<hub::android_16::android::os::Service::Service> {
-        if !self.allows(Permission::Find, name) {
-            return Ok(classify_for_service_union(None));
-        }
-        let _order = lock_recover(&self.fire_order);
-        let mut pending = Vec::new();
-        let lookup = {
-            let mut inner = lock_recover(&self.inner);
-            inner.try_get_binder(name, &mut pending)?
-        };
-        fire_pending(pending);
-        Ok(classify_for_service_union(lookup))
+        self.try_get_service(name, false)
     }
 
     /// No APEX on Linux; see `updatableViaApex`.
@@ -1714,6 +1802,19 @@ fn reload(reloadable: Option<&Reloadable>, notifier: &Notifier) {
     }
 }
 
+/// Aborts on a panic off `main` and start threads, like AOSP's FATAL_IF_NOT_ONEWAY (plan 16 Q3).
+fn abort_on_a_background_panic() {
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        report(info);
+        let thread = std::thread::current();
+        if !matches!(thread.name(), Some("main" | config::START_THREAD_NAME)) {
+            log::error!("rsb_hub: a panic on {:?} ends the hub", thread.name());
+            std::process::abort();
+        }
+    }));
+}
+
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Before any thread: the mask is inherited, and `from_environment` mutates the env.
     if let Err(e) = block_handled_signals() {
@@ -1789,6 +1890,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .get_matches();
 
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
+    abort_on_a_background_panic();
 
     let device_name = matches
         .get_one::<String>("device")
@@ -1844,6 +1946,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     // 0 = AOSP's `setThreadPoolMaxThreadCount(0)`: single-threaded like `servicemanager`.
     ProcessState::init(&binder_path, 0)?;
+    // AOSP `main.cpp`. Before any thread uses binder, so each copies it (plan 16 D1 S2).
+    ProcessState::as_self().set_call_restriction(CallRestriction::FatalIfNotOneway);
 
     #[cfg_attr(
         not(feature = "topic"),
@@ -2079,33 +2183,54 @@ mod tests {
     fn lazy_flag_reaches_the_service_union() {
         use hub::android_16::android::os::Service::Service;
 
-        let lazy = classify_for_service_union(Some(Lookup {
-            binder: fake_binder(),
-            is_accessor: false,
-            is_lazy: true,
-        }));
+        let lazy = classify_for_service_union(
+            Some(Lookup {
+                binder: fake_binder(),
+                is_lazy: true,
+            }),
+            false,
+        );
         match lazy {
             Service::ServiceWithMetadata(swm) => assert!(swm.isLazyService),
             other => panic!("expected ServiceWithMetadata, got {other:?}"),
         }
 
-        let eager = classify_for_service_union(Some(Lookup {
-            binder: fake_binder(),
-            is_accessor: false,
-            is_lazy: false,
-        }));
+        let eager = classify_for_service_union(
+            Some(Lookup {
+                binder: fake_binder(),
+                is_lazy: false,
+            }),
+            false,
+        );
         match eager {
             Service::ServiceWithMetadata(swm) => assert!(!swm.isLazyService),
             other => panic!("expected ServiceWithMetadata, got {other:?}"),
         }
 
         // An accessor has no metadata arm to carry the flag.
-        let accessor = classify_for_service_union(Some(Lookup {
-            binder: fake_binder(),
-            is_accessor: true,
-            is_lazy: true,
-        }));
+        let accessor = classify_for_service_union(
+            Some(Lookup {
+                binder: fake_binder(),
+                is_lazy: true,
+            }),
+            true,
+        );
         assert!(matches!(accessor, Service::Accessor(Some(_))));
+    }
+
+    /// AOSP `tryGetService`: a declared accessor's arm, even with nothing registered under it.
+    #[test]
+    fn a_missing_accessor_is_a_null_accessor() {
+        use hub::android_16::android::os::Service::Service;
+
+        assert!(matches!(
+            classify_for_service_union(None, true),
+            Service::Accessor(None)
+        ));
+        assert!(matches!(
+            classify_for_service_union(None, false),
+            Service::ServiceWithMetadata(swm) if swm.service.is_none()
+        ));
     }
 
     /// So a lazy registration still needs its own priority bit to appear in `listServices`.
@@ -2246,6 +2371,83 @@ mod tests {
         }
     }
 
+    fn a_manager_over(text: &str) -> (ServiceManager, Arc<config::Config>) {
+        let file = config::parse_file(Path::new("test.toml"), text, &config::SystemResolver)
+            .expect("test config");
+        let mut config = config::Config::default();
+        config.policy.rules = file.rules;
+        for (name, declaration) in file.services {
+            config.declarations.insert(name, declaration);
+        }
+        let enforcer = Arc::new(Enforcer::enforcing(config));
+        let snapshot = enforcer.config();
+        (ServiceManager::new(false, enforcer), snapshot)
+    }
+
+    /// AOSP `canFindService`/`canAddService`: a grant on the instance alone misses its accessor.
+    #[test]
+    fn the_accessor_is_judged_with_the_instance() {
+        let (manager, config) = a_manager_over(
+            r#"
+            [[rule]]
+            name = "open.*"
+            add = { uid = [1000] }
+            find = { uid = [1000] }
+
+            [[service]]
+            name = "open.IFoo/default"
+            accessor = "closed.foo"
+
+            [[service]]
+            name = "open.IBar/default"
+            accessor = "open.bar"
+            "#,
+        );
+        let caller = kernel_caller(1000);
+        for permission in [Permission::Add, Permission::Find] {
+            assert!(manager.allows_in(&config, Some(&caller), permission, "open.IFoo/default"));
+            assert!(!manager.allows_service_in(
+                &config,
+                Some(&caller),
+                permission,
+                "open.IFoo/default"
+            ));
+            assert!(manager.allows_service_in(
+                &config,
+                Some(&caller),
+                permission,
+                "open.IBar/default"
+            ));
+            // An undeclared name is judged by itself.
+            assert!(manager.allows_service_in(&config, Some(&caller), permission, "open.x"));
+        }
+    }
+
+    /// AOSP `canFindService`: a refusal over the accessor does not name it to the caller.
+    #[test]
+    fn a_refused_accessor_is_not_named() {
+        // Outside a transaction only `add` of the hub's own name passes, so its accessor fails.
+        let text = "[[service]]\nname = \"open.IFoo/default\"\naccessor = \"closed.foo\"\n";
+        let file = config::parse_file(Path::new("test.toml"), text, &config::SystemResolver)
+            .expect("test config");
+        let mut config = config::Config::default();
+        for (_, declaration) in file.services {
+            config
+                .declarations
+                .insert(SELF_SERVICE_NAME.to_string(), declaration);
+        }
+        let enforcer = Arc::new(Enforcer::enforcing(config));
+        let config = enforcer.config();
+        let manager = ServiceManager::new(false, enforcer);
+        let err = manager
+            .require_in(&config, Permission::Add, SELF_SERVICE_NAME)
+            .expect_err("the accessor is refused");
+        assert_eq!(err.exception_code(), ExceptionCode::Security);
+        let msg = err.to_string();
+        assert!(msg.contains("the accessor of"), "{msg}");
+        assert!(!msg.contains("closed.foo"), "{msg}");
+    }
+
     /// Only startup, which runs outside any transaction, may add the hub's own names.
     #[test]
     fn a_transaction_may_add_no_reserved_name_even_allowed_all() {
@@ -2349,23 +2551,105 @@ mod tests {
         assert!(out.contains("access control DISABLED"), "{out}");
     }
 
+    /// Polls until the writer thread of [`send_dump`] lets go of the caller's fd.
+    fn wait_for_the_dump_writer(writing: &DumpWriter) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while lock_recover(writing).is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the dump writer never finished"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// The binder thread returns while the writer waits on a caller that does not read.
+    #[test]
+    fn a_dump_to_an_unread_fd_holds_only_its_writer() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+
+        const LEN: usize = 4 << 20;
+        let writing = DumpWriter::default();
+        let (mut reader, fd) = UnixStream::pair().expect("socketpair");
+        let (tx, rx) = mpsc::channel();
+        let slot = Arc::clone(&writing);
+        std::thread::spawn(move || {
+            let caller = rsbinder::thread_state::CallingContext::default();
+            let _ = tx.send(send_dump(&slot, fd.into(), vec![b'x'; LEN], &caller));
+        });
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(Ok(())));
+
+        let caller = rsbinder::thread_state::CallingContext::default();
+        let (_, other) = UnixStream::pair().expect("socketpair");
+        let reply = send_dump(&writing, other.into(), b"y".to_vec(), &caller);
+        assert_eq!(reply, Err(StatusCode::WouldBlock));
+
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).expect("read the dump");
+        assert_eq!(got.len(), LEN);
+        wait_for_the_dump_writer(&writing);
+
+        let (mut reader, fd) = UnixStream::pair().expect("socketpair");
+        assert_eq!(
+            send_dump(&writing, fd.into(), b"y".to_vec(), &caller),
+            Ok(())
+        );
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).expect("read the dump");
+        assert_eq!(got, b"y");
+    }
+
+    /// A socket whose send buffer is full, so the next blocking write to its fd waits for a read.
+    fn a_full_socket() -> (std::os::unix::net::UnixStream, std::os::fd::OwnedFd) {
+        use std::io::Write;
+        let (reader, mut writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        writer.set_nonblocking(true).expect("nonblocking");
+        loop {
+            match writer.write(&[0; 4096]) {
+                Ok(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("filling the socket: {e}"),
+            }
+        }
+        writer.set_nonblocking(false).expect("blocking");
+        (reader, writer.into())
+    }
+
+    /// A denial writes its reason to the fd too, and that write must not wait on the caller.
+    #[test]
+    fn a_dump_denial_returns_while_its_fd_is_full() {
+        // No transaction, so no caller: `list` is denied.
+        let (manager, _) = a_manager_over("");
+        let (mut reader, fd) = a_full_socket();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(manager.dump_fd(fd, &[]));
+        });
+        let reply = rx.recv_timeout(Duration::from_secs(10));
+        assert_eq!(reply, Ok(Err(StatusCode::PermissionDenied)));
+
+        let mut got = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut got).expect("read the denial");
+        let text = String::from_utf8_lossy(&got);
+        assert!(
+            text.ends_with("\n") && text.contains("policy denies `list`"),
+            "{text}"
+        );
+    }
+
     /// A broken caller fd answers OK: `DEAD_OBJECT` (`-EPIPE`) would mark rsb_hub dead in AOSP.
     #[test]
     fn a_dump_to_a_broken_fd_answers_ok() {
-        struct Broken(rustix::io::Errno);
-        impl std::io::Write for Broken {
-            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::from_raw_os_error(self.0.raw_os_error()))
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        use rustix::io::Errno;
-        for errno in [Errno::PIPE, Errno::IO, Errno::NOSPC, Errno::BADF] {
-            let reply = write_dump(&mut Broken(errno), &empty_snapshot());
-            assert_eq!(reply, Ok(()), "{errno:?}");
-        }
+        let writing = DumpWriter::default();
+        let caller = rsbinder::thread_state::CallingContext::default();
+        let (reader, fd) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        drop(reader);
+        assert_eq!(
+            send_dump(&writing, fd.into(), b"y".to_vec(), &caller),
+            Ok(())
+        );
+        wait_for_the_dump_writer(&writing);
     }
 
     /// Flags decoded, not just hex: `lazy=yes` decides whether the binder may be cached.

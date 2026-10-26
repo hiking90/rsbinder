@@ -366,6 +366,7 @@ pub mod {{mod}} {
             impl<__RsbService, __RsbRuntime> {{crate}}::Interface for __RsbAsyncWrapper<__RsbService, __RsbRuntime> where __RsbService: {{crate}}::Interface, __RsbRuntime: ::core::marker::Send + ::core::marker::Sync {
                 fn as_binder(&self) -> {{crate}}::SIBinder { self._inner.as_binder() }
                 fn dump(&self, _writer: &mut dyn ::std::io::Write, _args: &[::std::string::String]) -> {{crate}}::Result<()> { self._inner.dump(_writer, _args) }
+                fn dump_fd(&self, _fd: ::std::os::fd::OwnedFd, _args: &[::std::string::String]) -> {{crate}}::Result<()> { self._inner.dump_fd(_fd, _args) }
             }
             impl<__RsbService, __RsbRuntime> {{bn_name}}Adapter for __RsbAsyncWrapper<__RsbService, __RsbRuntime>
             where

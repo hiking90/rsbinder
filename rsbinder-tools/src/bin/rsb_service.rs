@@ -231,6 +231,12 @@ fn cmd_dump(name: &str, args: &[String]) -> ExitCode {
                      `list` permission; see `rsb_hub --help`."
                 );
             }
+            if code == rsbinder::StatusCode::WouldBlock {
+                eprintln!(
+                    "  The service is still writing an earlier dump. rsb_hub writes one at a \
+                     time, and its log names the caller whose dump it is."
+                );
+            }
             ExitCode::from(exit::ERR)
         }
     }

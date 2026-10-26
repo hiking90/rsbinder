@@ -56,8 +56,10 @@ tweaks; wire formats are already locked.
 - **RPC death notification** (session-disconnect, AOSP-faithful).
 - **IAccessor client / server** (plans 2-13 D.8 + 2-14 D.9 STAGE3
   passed against real `libbinder`).
-- **`rsb_hub`** — `addService` descriptor auto-detect, `getService2`,
-  `checkService2`, `Service::Accessor` routing. Linux-native bringup. New in
+- **`rsb_hub`** — `getService2`, `checkService2`, `Service::Accessor`
+  routing for instances whose declaration names an accessor (the
+  `[[service]] accessor` key, VINTF `<accessor>`'s stand-in; earlier
+  releases told an accessor by its descriptor). Linux-native bringup. New in
   0.11.0: per-name access control, service declarations, on-demand start,
   `dump`, supervisor integration, and the `rsb_service` CLI — the
   configuration file format is settling with them.

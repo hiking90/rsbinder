@@ -5,9 +5,10 @@
 //! process behind it; the interface descriptor is asked for when something first needs it.
 //!
 //! Each node is this test binary re-executed as `child` with [`ROLE`] set. It serves
-//! `ILazyNode`, counts the `INTERFACE_TRANSACTION`s it serves with a transaction observer, says
-//! `ready <count>` on stdout once registered, and exits when its stdin closes. The count it says
-//! includes the service manager's own query at `addService`, if it made one.
+//! `ILazyNode` on `FatalIfNotOneway` binder threads, counts the `INTERFACE_TRANSACTION`s it
+//! serves with a transaction observer, says `ready <count>` on stdout once registered, and exits
+//! when its stdin closes. The count it says includes the service manager's own query at
+//! `addService`, if it made one.
 //!
 //! Requires a binder device and a service manager that accepts `addService` for any name
 //! (`rsb_hub --insecure-allow-all`, or the kernel tier's permissive policy):
@@ -26,8 +27,8 @@ use std::time::Duration;
 
 use rsbinder::observe::{TransactionObserver, TxnContext};
 use rsbinder::{
-    hub, BinderResult, Interface, ProcessState, SIBinder, StatusCode, Strong, Tokio,
-    INTERFACE_TRANSACTION,
+    hub, BinderResult, CallRestriction, Interface, ProcessState, SIBinder, StatusCode, Strong,
+    Tokio, INTERFACE_TRANSACTION,
 };
 
 include!(concat!(env!("OUT_DIR"), "/lazy_descriptor.rs"));
@@ -108,9 +109,12 @@ impl ILazyNode for Node {
         convert_every_way(peer.ok_or(StatusCode::UnexpectedNull)?);
         Ok(())
     }
+    fn r#askDescriptor(&self, peer: &SIBinder) -> BinderResult<String> {
+        Ok(peer.try_descriptor()?.to_owned())
+    }
 }
 
-/// The node role: serve, register, say `ready <count>`, and run until stdin closes.
+/// The node role (module doc); it registers first, as its binder threads refuse twoway calls.
 #[test]
 #[ignore = "a child role of the tests below"]
 fn child() {
@@ -119,8 +123,10 @@ fn child() {
     };
     let name = std::env::var(NAME).expect("a service name");
     rsbinder::observe::set_observer(Some(Arc::new(CountQueries)));
-    init();
+    let process = ProcessState::init_default().expect("a binder device");
     hub::add_service(&name, BnLazyNode::new_binder(Node)).expect("addService");
+    process.set_call_restriction(CallRestriction::FatalIfNotOneway);
+    ProcessState::start_thread_pool();
     println!("lazydesc: ready {}", QUERIES.load(Ordering::SeqCst));
     let mut line = String::new();
     while std::io::stdin()
@@ -309,6 +315,29 @@ fn a_failed_query_is_returned_and_asked_again() {
     assert_eq!(
         peer.into_interface_checked::<dyn ILazyNode>().err(),
         Some(StatusCode::DeadObject)
+    );
+}
+
+/// AC-16.10, D2 (a): a `FatalIfNotOneway` thread's first descriptor ask sends nothing and fails.
+#[test]
+#[ignore = "requires a binder device and a permissive service manager"]
+fn a_restricted_thread_asks_no_descriptor() {
+    init();
+    let asker = Peer::spawn("asker");
+    let asked = Peer::spawn("asked");
+    let asker_typed: Strong<dyn ILazyNode> = asker.binder().into_interface().unwrap();
+    let asked_typed: Strong<dyn ILazyNode> = asked.binder().into_interface().unwrap();
+
+    let refused = asker_typed.r#askDescriptor(&asked.binder()).unwrap_err();
+    assert_eq!(
+        refused.transaction_error(),
+        StatusCode::Unknown,
+        "{refused}"
+    );
+    assert_eq!(
+        asked_typed.r#interfaceQueries().unwrap(),
+        asked.queries,
+        "nothing was sent to the asked node"
     );
 }
 

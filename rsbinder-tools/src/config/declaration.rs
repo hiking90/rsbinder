@@ -72,6 +72,19 @@ pub fn is_valid_service_name(name: &str) -> bool {
     true
 }
 
+/// The name `rsb_hub` registers itself under: AOSP `main.cpp`'s
+/// `addService("manager", ...)`.
+pub const SELF_SERVICE_NAME: &str = "manager";
+
+/// Names `rsb_hub` registers at startup and refuses to every transaction's
+/// `add`: with the `topic` feature, the topic registry's.
+#[cfg(feature = "topic")]
+pub const RESERVED_SERVICE_NAMES: &[&str] = &[rsbinder_topic::aidl::ITopicRegistry::SERVICE_NAME];
+/// Names `rsb_hub` registers at startup and refuses to every transaction's
+/// `add`: none without the `topic` feature.
+#[cfg(not(feature = "topic"))]
+pub const RESERVED_SERVICE_NAMES: &[&str] = &[];
+
 /// How to bring a declared service up on demand.
 ///
 /// AOSP's `tryStartService` sets the `ctl.interface_start` property and
@@ -105,6 +118,10 @@ pub struct Declaration {
     pub activation: Option<Activation>,
     /// Connection info to report, if any.
     pub connection: Option<ConnectionInfo>,
+    /// The name an `IAccessor` for this instance is registered under, if
+    /// clients reach it through one. AOSP reads it from a VINTF
+    /// `<accessor>` element.
+    pub accessor: Option<String>,
 }
 
 /// Every declaration, indexed by full instance name.
@@ -149,6 +166,22 @@ impl Declarations {
         self.by_name.get(name).and_then(|d| d.activation.as_ref())
     }
 
+    /// The name the `IAccessor` of an instance is registered under, if it
+    /// declared one. AOSP `getVintfAccessorName`.
+    pub fn accessor(&self, name: &str) -> Option<&str> {
+        self.by_name.get(name).and_then(|d| d.accessor.as_deref())
+    }
+
+    /// The instance whose accessor is registered under `accessor`, if any.
+    /// One at most: [`load`](super::load) refuses two instances naming one
+    /// accessor, as libvintf does.
+    pub fn accessor_for(&self, accessor: &str) -> Option<&str> {
+        self.by_name
+            .iter()
+            .find(|(_, d)| d.accessor.as_deref() == Some(accessor))
+            .map(|(name, _)| name.as_str())
+    }
+
     /// Number of declarations, for startup logging.
     pub fn len(&self) -> usize {
         self.by_name.len()
@@ -171,6 +204,7 @@ mod tests {
                 name: InstanceName::parse(name).unwrap(),
                 activation: None,
                 connection: None,
+                accessor: None,
             },
         )
     }

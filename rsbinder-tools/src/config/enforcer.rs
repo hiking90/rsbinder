@@ -120,7 +120,20 @@ impl Enforcer {
     /// may be incomplete (see [`GroupCache`]); that re-read happens at most
     /// once per [`GroupCache::MIN_REVALIDATE`] per uid.
     pub fn check_uid(&self, permission: Permission, name: &str, uid: u32) -> bool {
-        let config = self.config();
+        self.check_uid_in(&self.config(), permission, name, uid)
+    }
+
+    /// [`check_uid`](Self::check_uid) against `config`, a snapshot the
+    /// caller took with [`config`](Self::config): several judgements of one
+    /// transaction then see one configuration, a `SIGHUP` between them
+    /// notwithstanding.
+    pub fn check_uid_in(
+        &self,
+        config: &Config,
+        permission: Permission,
+        name: &str,
+        uid: u32,
+    ) -> bool {
         let policy = &config.policy;
         self.judge(
             uid,
@@ -168,8 +181,20 @@ impl Enforcer {
     /// all. Denying is the only honest answer for those — see
     /// `rsbinder::rpc::PeerIdentity`.
     pub fn check_caller(&self, permission: Permission, name: &str, caller: &Caller) -> bool {
+        self.check_caller_in(&self.config(), permission, name, caller)
+    }
+
+    /// [`check_caller`](Self::check_caller) against a snapshot, as
+    /// [`check_uid_in`](Self::check_uid_in).
+    pub fn check_caller_in(
+        &self,
+        config: &Config,
+        permission: Permission,
+        name: &str,
+        caller: &Caller,
+    ) -> bool {
         match uid_of(caller) {
-            Some(uid) => self.check_uid(permission, name, uid),
+            Some(uid) => self.check_uid_in(config, permission, name, uid),
             None => false,
         }
     }

@@ -645,9 +645,12 @@ pub(crate) struct PublishedNative {
 /// [`ProcessState::set_call_restriction`] or
 /// [`ServeOptions::call_restriction`](crate::ServeOptions).
 ///
-/// rsbinder's own first-sight interface lookup for a new handle (and the
-/// handle-0 ping on SDK >= 30) runs with the restriction lifted, so it
-/// neither logs nor panics and can block on that peer.
+/// The one call rsbinder makes on its own when it reads a binder, the
+/// handle-0 ping on SDK >= 30, runs with the restriction lifted, so it
+/// neither logs nor panics and can block on the service manager. The
+/// interface descriptor a kernel proxy asks for when first needed
+/// ([`IBinder::descriptor`](crate::IBinder::descriptor)) is under it: on a
+/// `FatalIfNotOneway` thread that first ask panics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CallRestriction {

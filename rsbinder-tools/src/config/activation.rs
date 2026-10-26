@@ -18,6 +18,10 @@ use std::sync::{Arc, Mutex};
 use super::declaration::Activation;
 use super::trust::{check_program, open_root, At};
 
+/// The name of the thread each start runs on. It makes no binder call, and a
+/// runner that panics there frees its slot and ends only that start.
+pub const START_THREAD_NAME: &str = "rsb_hub:start";
+
 /// Runs one activation to completion. Injectable so the debounce can be
 /// tested without spawning processes.
 pub trait ActivationRunner: Send + Sync {
@@ -72,7 +76,7 @@ impl Activator {
         let entry = (name.to_owned(), activation.clone());
         let in_flight = Arc::clone(&self.in_flight);
         let spawned = std::thread::Builder::new()
-            .name("rsb_hub:start".to_owned())
+            .name(START_THREAD_NAME.to_owned())
             .spawn(move || {
                 let slot = InFlightSlot { in_flight, entry };
                 let (name, activation) = &slot.entry;

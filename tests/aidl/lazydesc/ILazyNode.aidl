@@ -17,4 +17,7 @@ interface ILazyNode {
 
     // `takeTyped` for a nullable argument.
     void takeNullable(@nullable ILazyNode peer);
+
+    // Asks `peer` for its descriptor, on a binder thread that may make no twoway call.
+    String askDescriptor(IBinder peer);
 }

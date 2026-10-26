@@ -118,7 +118,7 @@ to run an independent one.
 - **Service Registration / Discovery**: services register under a unique name; clients look them up by it
 - **Lifecycle Management**: dead services are reaped, and death notifications delivered
 - **Access Control**: per-name `add` / `find` policy plus a global `list` gate (`[global] list`), keyed on caller uid and group, default-deny, reloadable with `SIGHUP`
-- **Service Declarations**: `[[service]]` entries answer `isDeclared` / `getDeclaredInstances` / `getConnectionInfo`, the Linux stand-in for VINTF manifests
+- **Service Declarations**: `[[service]]` entries answer `isDeclared` / `getDeclaredInstances` / `getConnectionInfo`, the Linux stand-in for VINTF manifests; an `accessor` key hands clients of the instance the `IAccessor` registered under that name, as VINTF `<accessor>` does
 - **On-Demand Start**: a `getService` that misses a declared service starts it (`checkService`, and so `rsb_service check`, never does), via systemd or a configured command; an `exec` command's program (`argv[0]`) runs with `rsb_hub`'s privileges, so it must be an absolute path and pass the configuration's own ownership and mode check when the configuration is loaded and again right before each start
 - **Notification System**: callbacks for service availability changes
 - **Dump Priorities**: `listServices` filters by the AOSP `DUMP_FLAG_PRIORITY_*` flags — a listing filter, not an access-control mechanism

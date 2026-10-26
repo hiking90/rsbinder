@@ -29,6 +29,12 @@
 //! start = { systemd = "example-foo.service" }
 //! # start = { exec = ["/usr/bin/exampled", "--instance", "default"] }
 //! connection = { ip = "127.0.0.1", port = 8080 }
+//!
+//! # A client of `com.example.IBar/default` gets the `IAccessor` registered
+//! # under the `accessor` name, as with AOSP's VINTF `<accessor>`.
+//! [[service]]
+//! name = "com.example.IBar/default"
+//! accessor = "android.os.IAccessor/IBar/default"
 //! ```
 //!
 //! A directory is read as every `*.toml` in it whose name does not start
@@ -64,6 +70,7 @@ use serde::Deserialize;
 
 use super::declaration::{
     is_valid_service_name, Activation, ConnectionInfo, Declaration, Declarations, InstanceName,
+    RESERVED_SERVICE_NAMES, SELF_SERVICE_NAME,
 };
 use super::policy::{NamePattern, Policy, PolicyError, Rule, Subjects, TopicPolicy, TopicRule};
 use super::trust::{At, Trusted};
@@ -271,6 +278,42 @@ pub enum ConfigError {
         /// The name as written.
         name: String,
     },
+    /// An `accessor` that `addService` would refuse (see
+    /// [`is_valid_service_name`]), or a name `rsb_hub` holds itself
+    /// ([`SELF_SERVICE_NAME`], [`RESERVED_SERVICE_NAMES`]): clients
+    /// would be handed the hub's own binder as the accessor.
+    #[error(
+        "{path}: service {name:?}: accessor {accessor:?} must be a name a service can register: \
+         at most 127 bytes of [A-Za-z0-9._/-], not one rsb_hub holds"
+    )]
+    BadAccessor {
+        /// The offending file.
+        path: PathBuf,
+        /// The instance whose `accessor` is refused.
+        name: String,
+        /// The accessor as written.
+        accessor: String,
+    },
+    /// Two instances name the same accessor. libvintf refuses this too
+    /// ("Conflicting Accessor"): an accessor serves one instance, the one
+    /// its `getInstanceName` reports.
+    #[error(
+        "services {first:?} ({}) and {second:?} ({}) both name {accessor:?} as their accessor",
+        first_path.display(),
+        second_path.display()
+    )]
+    DuplicateAccessor {
+        /// The accessor named twice.
+        accessor: String,
+        /// The instance that named it first.
+        first: String,
+        /// Where `first` is declared.
+        first_path: PathBuf,
+        /// The instance that named it again.
+        second: String,
+        /// Where `second` is declared.
+        second_path: PathBuf,
+    },
     /// A configuration path anyone but root or this process can rewrite.
     /// See [`TrustProblem`](super::TrustProblem).
     #[error("{path} is {problem}; refusing to load configuration from it")]
@@ -313,6 +356,8 @@ struct RawService {
     start: Option<RawActivation>,
     #[serde(default)]
     connection: Option<RawConnection>,
+    #[serde(default)]
+    accessor: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -382,6 +427,17 @@ impl RawService {
                 })
             }
         };
+        if let Some(accessor) = &self.accessor {
+            let held = accessor == SELF_SERVICE_NAME
+                || RESERVED_SERVICE_NAMES.contains(&accessor.as_str());
+            if held || !is_valid_service_name(accessor) {
+                return Err(ConfigError::BadAccessor {
+                    path: path.to_owned(),
+                    accessor: accessor.clone(),
+                    name: self.name,
+                });
+            }
+        }
         Ok(Declaration {
             name,
             activation,
@@ -389,6 +445,7 @@ impl RawService {
                 ip: c.ip,
                 port: c.port.get().into(),
             }),
+            accessor: self.accessor,
         })
     }
 }
@@ -770,6 +827,17 @@ fn load_at(
                     first: first.clone(),
                     second: file.clone(),
                 });
+            }
+            if let Some(accessor) = &declaration.accessor {
+                if let Some(first) = config.declarations.accessor_for(accessor) {
+                    return Err(ConfigError::DuplicateAccessor {
+                        accessor: accessor.clone(),
+                        first_path: service_origin.get(first).cloned().unwrap_or_default(),
+                        first: first.to_owned(),
+                        second: name,
+                        second_path: file.clone(),
+                    });
+                }
             }
             service_origin.insert(name.clone(), file.clone());
             config.declarations.insert(name, declaration);
@@ -1273,6 +1341,81 @@ mod tests {
             matches!(err, ConfigError::DuplicateService { ref name, .. } if name == "a/b"),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn an_accessor_is_read_by_instance_and_back() {
+        let d = parse_services(
+            "[[service]]\nname = \"a.IFoo/default\"\naccessor = \"android.os.IAccessor/IFoo/default\"\n\
+             [[service]]\nname = \"a.IBar/default\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            d.accessor("a.IFoo/default"),
+            Some("android.os.IAccessor/IFoo/default")
+        );
+        assert_eq!(d.accessor("a.IBar/default"), None);
+        assert_eq!(
+            d.accessor_for("android.os.IAccessor/IFoo/default"),
+            Some("a.IFoo/default")
+        );
+        assert_eq!(d.accessor_for("a.IFoo/default"), None);
+    }
+
+    /// An instance may be its own accessor: the accessor binder is registered under its name.
+    #[test]
+    fn an_instance_may_name_itself_as_its_accessor() {
+        let d = parse_services("[[service]]\nname = \"a/b\"\naccessor = \"a/b\"\n").unwrap();
+        assert_eq!(d.accessor("a/b"), Some("a/b"));
+    }
+
+    /// No `/` is needed: libvintf asks only that the accessor be non-empty.
+    #[test]
+    fn an_accessor_must_be_a_name_a_service_can_register() {
+        assert!(parse_services("[[service]]\nname = \"a/b\"\naccessor = \"plain\"\n").is_ok());
+        let mut refused = vec![
+            String::new(),
+            "has space".to_owned(),
+            "a".repeat(128),
+            SELF_SERVICE_NAME.to_owned(),
+        ];
+        refused.extend(RESERVED_SERVICE_NAMES.iter().map(|n| n.to_string()));
+        for accessor in refused {
+            let text = format!("[[service]]\nname = \"a/b\"\naccessor = \"{accessor}\"\n");
+            let err = parse_services(&text).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::BadAccessor { accessor: ref a, .. } if *a == accessor),
+                "{accessor:?}: {err:?}"
+            );
+        }
+    }
+
+    /// libvintf's "Conflicting Accessor": in one file or across two.
+    #[test]
+    fn two_instances_may_not_share_an_accessor() {
+        let one = "[[service]]\nname = \"a/one\"\naccessor = \"acc\"\n";
+        let two = "[[service]]\nname = \"a/two\"\naccessor = \"acc\"\n";
+        for (files, second_file) in [
+            (vec![("10-a.toml", format!("{one}{two}"))], "10-a.toml"),
+            (
+                vec![("10-a.toml", one.to_owned()), ("20-b.toml", two.to_owned())],
+                "20-b.toml",
+            ),
+        ] {
+            let files: Vec<(&str, &str)> = files.iter().map(|(n, t)| (*n, t.as_str())).collect();
+            let dir = ConfigDir::new("cfg-dupacc", &files);
+            let err = dir.load().unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::DuplicateAccessor {
+                        ref accessor, ref first, ref first_path, ref second, ref second_path
+                    } if accessor == "acc" && first == "a/one" && second == "a/two"
+                        && first_path.ends_with("10-a.toml") && second_path.ends_with(second_file)
+                ),
+                "{err:?}"
+            );
+        }
     }
 
     /// Rules and declarations coexist in one file and load independently.

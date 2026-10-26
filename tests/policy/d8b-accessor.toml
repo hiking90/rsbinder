@@ -1,0 +1,21 @@
+# rsb_hub configuration of `example-hello/cpp/run_d8b_register.sh`. NOT a
+# template for a real deployment: the rules grant everything to everyone, as
+# `permissive.toml` does.
+#
+# The declaration is what makes `rsbinder.test.d8b.IInterop/default` an
+# accessor-backed instance: a client of it is handed the `IAccessor`
+# registered under `android.os.IAccessor/d8b/default`, as AOSP's VINTF
+# `<accessor>` does. Without it the hub hands that binder out as an ordinary
+# service.
+
+[global]
+list = "any"
+
+[[rule]]
+name = "*"
+add = "any"
+find = "any"
+
+[[service]]
+name = "rsbinder.test.d8b.IInterop/default"
+accessor = "android.os.IAccessor/d8b/default"

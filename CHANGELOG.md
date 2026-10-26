@@ -208,8 +208,89 @@ Each item below changes what a 0.12.0 program observes.
   without asking for its descriptor, so a context manager that is not an
   `IServiceManager` is accepted and its calls fail as that object answers
   them. 0.12.0 returned `BadType` from `hub::default`.
+- **`rsb_hub` tells an accessor by a declaration, not by its descriptor.**
+  `getService2` and `checkService2` answer with the `Service::Accessor` arm
+  for an instance whose `[[service]]` entry has an `accessor` key, and with
+  the binder registered under the accessor name, as AOSP's servicemanager
+  does for a VINTF `<accessor>` (see Added). 0.12.0 asked every binder
+  `addService` received for its descriptor and answered with the accessor
+  arm for one registered as `android.os.IAccessor`, under its own name. That
+  binder is now an ordinary service: `try_get_service` of its name returns
+  the `IAccessor` binder, not the bridged root. To keep the name, declare it
+  as its own accessor (`name = "a.IFoo/default"`, `accessor =
+  "a.IFoo/default"`); a `wait_for_service` of it that the registration
+  notice wakes still returns the `IAccessor` binder, as with 0.12.0, since
+  the notice carries the binder registered under the name. A name without
+  `interface/instance` form cannot be declared and has to change. To follow
+  Android, register the accessor under another name and declare that one.
+  With an accessor declared,
+  - a `getService2` / `checkService2` lookup judges `find` on the accessor
+    name too, and so do the calls
+    AOSP judges that way (`addService`, `registerClientCallback`,
+    `tryUnregisterService` judge `add`; `registerForNotifications`,
+    `unregisterForNotifications`, `isDeclared`, `getDeclaredInstances`,
+    `updatableViaApex`, `getConnectionInfo` judge `find`);
+  - a `getService2` lookup (not `checkService2`) that misses the accessor
+    starts the instance's own `start`;
+  - nothing registered under the accessor name is `Service::Accessor(None)`,
+    which libbinder takes as not found and an rsbinder client follows to its
+    process-local accessor providers, where 0.12.0 answered a null
+    `ServiceWithMetadata`, on which libbinder too tried its process-local
+    accessors; an rsbinder client falls back as it did with 0.12.0;
+  - `listServices` and `rsb_service list` show the accessor name, and
+    `register_for_notifications` of an instance whose accessor has another
+    name is not told when the accessor registers, so `wait_for_service` of
+    it polls;
+  - `rsb_service dump manager` marks `accessor=yes` on a name a declaration
+    names as an accessor (0.12.0 marked a binder registered as
+    `android.os.IAccessor`), and lists the instance under *awaiting
+    registration* while a client waits on it;
+  - a client that uses only `getService` (code 0, the Android 15 and earlier
+    protocols) gets what is registered under the instance name, judged on
+    the instance name alone, and its miss still runs the instance's `start`.
+
+  `--insecure-allow-all` reads no configuration, so under it no binder is an
+  accessor. A configuration with an `accessor` key fails to load in 0.12.0's
+  `rsb_hub`, which refuses unknown keys.
+- **`rsb_hub` makes no two-way binder call.** Its threads run
+  `CallRestriction::FatalIfNotOneway`, as AOSP's servicemanager does: a
+  two-way call from a request handler panics before it is sent and the
+  caller gets `UNKNOWN_ERROR`. A panic on any thread but the binder thread
+  and a start thread aborts the hub (AOSP's servicemanager aborts on such a
+  call from any thread). 0.12.0 ended only the panicking thread, and the
+  work it did stopped with no error: retiring the registrations of dead
+  binders, `onClients(false)`. With the `topic` feature a panic on the
+  thread that sends the notices the registry owes a watcher aborts the hub
+  too. Under systemd,
+  `Restart=on-failure` brings the hub back up.
+- `rsbinder-tools`: `config::Declaration` has a field `accessor`; a struct
+  expression of it, or a pattern without `..`, outside the crate needs it. `config::ConfigError` has
+  the variants `BadAccessor` and `DuplicateAccessor`.
+- `example-hello`'s `rpc_accessor_register_interop_server` takes an
+  optional fourth argument, the name to register the accessor under; it
+  registers under the instance name without one, as before.
 
 ### Added
+
+- **`[[service]] accessor` in `rsb_hub`'s configuration**: the name the
+  `IAccessor` of an instance is registered under, AOSP's VINTF `<accessor>`
+  (see Migrating). The name must be one `addService` takes and not one the
+  hub holds (`manager`, and with the `topic` feature
+  `rsbinder.topic.registry`); two instances may not
+  name the same accessor, as libvintf refuses. `rsbinder-tools` adds
+  `config::Declarations::accessor` and `accessor_for`,
+  `config::Enforcer::check_uid_in` and `check_caller_in` (a judgement
+  against a snapshot of the configuration, so the several of one
+  transaction see one configuration), and the constants
+  `config::SELF_SERVICE_NAME`, `config::RESERVED_SERVICE_NAMES` and
+  `config::START_THREAD_NAME`.
+- **`Interface::dump_fd` and `Remotable::on_dump_fd`**: the dump handler
+  that owns the caller's fd, so a service can write the dump on another
+  thread and return, and a caller that never reads its pipe holds that
+  thread rather than the binder thread. `DUMP_TRANSACTION` now calls
+  `on_dump_fd`, which generated `Bn*` types forward to `dump_fd`; both
+  default to the writer handlers (`on_dump`, `dump`), so a service that
+  implements only `dump` behaves as in 0.12.0.
 
 - **Generated proxies write their own interface descriptor as the request
   token**, as every AOSP backend does, through the new
@@ -404,6 +485,15 @@ Each item below changes what a 0.12.0 program observes.
 
 ### Fixed
 
+- **A `dump` of `rsb_hub` no longer waits on the caller.** The hub has one
+  binder thread, and 0.12.0 wrote the dump, or the reason it was denied, to
+  the caller's fd on that thread: a caller that passed a pipe and did not
+  read it stopped every request to the hub once the pipe was full. The hub
+  now writes on a thread of its own (`rsb_hub:dump`) and replies at once;
+  the dump ends when that thread closes the fd. One dump is written at a
+  time, and a dump that arrives while one is still being written is
+  answered `WOULD_BLOCK` with nothing written, which a caller that never
+  reads makes the answer to every later dump until the hub restarts.
 - **On 32-bit Android, `rsbinder-fmq`'s futex wait and wake call `futex`, not
   `futex_time64`** (`EventFlag`, the blocking queue calls, `stream` over
   kernel binder). Android 10's seccomp allowlist (bionic

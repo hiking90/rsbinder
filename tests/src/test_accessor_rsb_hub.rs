@@ -7,13 +7,14 @@
 //!
 //!   1. A *separate* server process (the
 //!      `example-hello/src/bin/rpc_accessor_register_interop_server`
-//!      binary, reused verbatim here) registers an `IAccessor` binder
-//!      with `rsb_hub` via `hub::add_service(instance, accessor_binder)`.
-//!      rsb_hub's `addService` inspects
-//!      `service.descriptor() == "android.os.IAccessor"` and stamps
-//!      `is_accessor = true`.
-//!   2. This test process calls `hub::try_get_service(instance)`.
-//!      rsb_hub's `getService2` sees the flag and returns
+//!      binary, reused verbatim here) builds an `IAccessor` for the
+//!      instance and registers it with `rsb_hub` under another name,
+//!      `hub::add_service(ACCESSOR, accessor_binder)`. rsb_hub makes no
+//!      call on it.
+//!   2. This test process calls `hub::try_get_service(INSTANCE)`. The
+//!      hub's configuration (`tests/policy/d8b-accessor.toml`) declares
+//!      `INSTANCE` with `accessor = ACCESSOR`, as AOSP's VINTF
+//!      `<accessor>`, so `getService2` returns
 //!      `Service::Accessor(Some(binder))` — distinct from the regular
 //!      `ServiceWithMetadata` wrap.
 //!   3. The consume-side accessor arm in
@@ -39,7 +40,10 @@ use env_logger::Env;
 use rsbinder::*;
 
 /// The server bin's `argv[1]`; distinct from the STAGE3 emulator instance on a shared driver.
-const INSTANCE: &str = "rsbinder.test.d8b.accessor";
+const INSTANCE: &str = "rsbinder.test.d8b.IInterop/default";
+
+/// The server bin's `argv[4]`, the name `d8b-accessor.toml` declares as `INSTANCE`'s accessor.
+const ACCESSOR: &str = "android.os.IAccessor/d8b/default";
 
 /// Equals the server bin's `ROOT_DESC`, so its `on_transact` accepts our interface token.
 const ROOT_DESC: &str = "rsbinder.test.accessor.IInterop";
@@ -55,6 +59,24 @@ fn init_test() {
     let _ = env_logger::Builder::from_env(Env::default().default_filter_or("info")).try_init();
     ProcessState::init_default().expect("init_default");
     ProcessState::start_thread_pool();
+}
+
+/// The hub hands an undeclared accessor over as is; an accessor arm fails the instance check.
+#[test]
+#[ignore = "requires rsb_hub + rpc_accessor_register_interop_server processes; run via example-hello/cpp/run_d8b_register.sh"]
+fn d8b_an_undeclared_accessor_is_an_ordinary_service() -> Result<()> {
+    init_test();
+
+    let found = hub::try_get_service(ACCESSOR)
+        .expect("service manager")
+        .unwrap_or_else(|| {
+            panic!("{ACCESSOR:?} was vended as an accessor, not as the binder under it")
+        });
+    assert!(
+        found.as_proxy().is_some(),
+        "{ACCESSOR:?} is not a kernel proxy"
+    );
+    Ok(())
 }
 
 #[test]

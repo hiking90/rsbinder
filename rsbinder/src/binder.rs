@@ -157,6 +157,19 @@ pub trait Interface: Send + Sync {
     fn dump(&self, _writer: &mut dyn std::io::Write, _args: &[String]) -> Result<()> {
         Ok(())
     }
+
+    /// Dump transaction handler that owns the caller's fd.
+    ///
+    /// The binder thread calls this; the default writes through [`dump`](Self::dump)
+    /// on that thread and closes the fd when it returns. A writer that never
+    /// blocks the binder thread needs the fd itself: a caller that passes a pipe
+    /// and never reads it stops `dump` once the pipe is full, and with it every
+    /// transaction queued for that thread. Override this to hand the fd to
+    /// another thread and return; the dump stays open until that thread drops
+    /// the fd, which is the end-of-file a reader such as `dumpsys` waits for.
+    fn dump_fd(&self, fd: std::os::fd::OwnedFd, args: &[String]) -> Result<()> {
+        self.dump(&mut std::fs::File::from(fd), args)
+    }
 }
 
 /// Trait for converting a generic Binder object into a specific Binder
@@ -689,6 +702,13 @@ pub trait Remotable: Send + Sync {
     /// `?` on a write to a pipe whose reader exited (`EPIPE`, so `DeadObject`)
     /// reaches the caller as `FailedTransaction`, which leaves its proxy alive.
     fn on_dump(&self, writer: &mut dyn std::io::Write, args: &[String]) -> Result<()>;
+
+    /// What a `DUMP_TRANSACTION` calls, with the fd it carried; the default
+    /// writes through [`on_dump`](Self::on_dump). Generated `Bn*` types forward
+    /// it to [`Interface::dump_fd`], so a service can keep the fd past the call.
+    fn on_dump_fd(&self, fd: std::os::fd::OwnedFd, args: &[String]) -> Result<()> {
+        self.on_dump(&mut std::fs::File::from(fd), args)
+    }
 
     /// The AIDL method name for a transaction code, for tracing and
     /// transaction observers. `None` when the code names no method or the
@@ -1598,6 +1618,10 @@ impl<I: FromIBinder + ?Sized> Interface for Strong<I> {
 
     fn dump(&self, writer: &mut dyn std::io::Write, args: &[String]) -> Result<()> {
         (**self).dump(writer, args)
+    }
+
+    fn dump_fd(&self, fd: std::os::fd::OwnedFd, args: &[String]) -> Result<()> {
+        (**self).dump_fd(fd, args)
     }
 }
 

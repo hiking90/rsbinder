@@ -17,6 +17,12 @@
 //!   watchmany:PREFIX:N       a watch of each of PREFIX0 .. PREFIX<N-1>, told nothing
 //!   subscribe:NAME           a NamedSubscriber (`Start::Last`), a `GOT` line per new value
 //!   addreserved              addService of the registry's own name
+//!   capture:NAME             advertise NAME as a topic that keeps the first subscriber's token
+//!   relay:CALL:TARGET        hand the kept token to the hub under TARGET: CALL is `add`
+//!                            (addService, tryUnregisterService), `notify` (registerFor- and
+//!                            unregisterForNotifications), `clientcb` (addService of this
+//!                            process's binder, registerClientCallback), `advertise` (and
+//!                            withdraw) or `watch` (and unwatch)
 //!   pool                     start the binder thread pool
 //!   say:TEXT  wait:FILE  sleep:MS  hold[:SECS]
 //! ```
@@ -29,8 +35,15 @@
 //! Without `--mmap` the process starts its binder thread pool at once; with it, it maps that
 //! many bytes to receive in and starts none until `pool`, so the notices of its watches stay
 //! in that mapping, unread, and fill it (AC-15.5.12).
+//!
+//! `capture` and `relay` hand the hub a binder of another process (plan 16 AC-16.6): a
+//! subscriber's token goes to the publisher only, so the hub has never held it until the first
+//! `relay`; the later ones pass the handle it then holds through typed casts. `relay` times
+//! the call of CALL that hands the token over; its outcome is that call's, or the setup call's
+//! (`clientcb`'s addService) if that failed first.
 
 use std::any::Any;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use rsbinder::{
@@ -41,6 +54,7 @@ use rsbinder_topic::aidl::ITopic::{BnTopic, ITopic, ERROR_CLOSED};
 use rsbinder_topic::aidl::ITopicRegistry::{
     ITopicRegistry, ERROR_LIMIT, ERROR_TAKEN, SERVICE_NAME,
 };
+use rsbinder_topic::aidl::ITopicWatcher::ITopicWatcher;
 use rsbinder_topic::aidl::SubscribeRequest::SubscribeRequest;
 use rsbinder_topic::aidl::TopicEndpoint::TopicEndpoint;
 use rsbinder_topic::registry::RegistryResolver;
@@ -57,6 +71,89 @@ impl Interface for Ended {}
 impl ITopic for Ended {
     fn r#subscribe(&self, _request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
         Err(Status::new_service_specific_error(ERROR_CLOSED, None))
+    }
+}
+
+/// The first token a [`Capture`] topic was handed.
+static CAPTURED: Mutex<Option<SIBinder>> = Mutex::new(None);
+
+/// A topic that keeps the first subscriber's token and refuses every subscriber as ended.
+struct Capture;
+
+impl Interface for Capture {}
+
+impl ITopic for Capture {
+    fn r#subscribe(&self, request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
+        let mut captured = CAPTURED.lock().expect("lock poisoned");
+        if let (None, Some(token)) = (captured.as_ref(), &request.token) {
+            *captured = Some(token.clone());
+            println!("SAY captured");
+        }
+        Err(Status::new_service_specific_error(ERROR_CLOSED, None))
+    }
+}
+
+/// A callback nothing calls: the hub's are oneway, and the stopped process would not answer.
+struct Silent;
+
+impl Interface for Silent {}
+
+impl hub::IClientCallback for Silent {
+    fn r#onClients(&self, _: &SIBinder, _: bool) -> BinderResult<()> {
+        Ok(())
+    }
+}
+
+/// Hands the kept token to the hub by `call`, timed; unchecked casts ask its process nothing.
+fn relay(
+    call: &str,
+    target: &str,
+    kept: &mut Vec<Box<dyn Any>>,
+) -> BinderResult<(BinderResult<()>, Duration)> {
+    let token = CAPTURED.lock().expect("lock poisoned").clone();
+    let token = token.ok_or(StatusCode::NameNotFound)?;
+    let timed = |call: &mut dyn FnMut() -> BinderResult<()>| {
+        let began = Instant::now();
+        let got = call();
+        (got, began.elapsed())
+    };
+    match call {
+        "add" => {
+            let got = timed(&mut || hub::add_service(target, token.clone()));
+            // Refused while the hub counts a client, as AOSP's: the registration stays.
+            let _ = hub::try_unregister_service(target, &token);
+            Ok(got)
+        }
+        "notify" => {
+            let callback: Strong<dyn hub::IServiceCallback> = token.into_interface()?;
+            let got = timed(&mut || Ok(hub::register_for_notifications(target, &callback)?));
+            let _ = hub::unregister_for_notifications(target, &callback);
+            Ok(got)
+        }
+        "clientcb" => {
+            let own = hub::BnClientCallback::new_binder(Silent).as_binder();
+            hub::add_service(target, own.clone())?;
+            kept.push(Box::new(own.clone()));
+            let callback: Strong<dyn hub::IClientCallback> = token.into_interface()?;
+            Ok(timed(&mut || {
+                Ok(hub::register_client_callback(target, &own, &callback)?)
+            }))
+        }
+        "advertise" => {
+            let registry = registry()?;
+            let topic: Strong<dyn ITopic> = token.into_interface()?;
+            let got = timed(&mut || registry.r#advertise(target, &topic));
+            let _ = registry.r#withdraw(target, &topic);
+            Ok(got)
+        }
+        "watch" => {
+            let registry = registry()?;
+            let watcher: Strong<dyn ITopicWatcher> = token.into_interface()?;
+            let got = timed(&mut || registry.r#watch(target, &watcher).map(drop));
+            let _ = registry.r#unwatch(target, &watcher);
+            Ok(got)
+        }
+        _ => panic!("unknown relay call {call:?}"),
     }
 }
 
@@ -180,11 +277,7 @@ fn step(op: &str, arg: &str, kept: &mut Vec<Box<dyn Any>>) {
             let got = registry().and_then(|registry| registry.r#lookup(arg));
             time(op, arg, began.elapsed());
             match got {
-                // Kept, so a later lookup of the name asks its publisher for no descriptor.
-                Ok(found) if found.topic.is_some() => {
-                    kept.push(Box::new(found.topic));
-                    result(op, arg, "FOUND")
-                }
+                Ok(found) if found.topic.is_some() => result(op, arg, "FOUND"),
                 Ok(_) => result(op, arg, "NULL"),
                 Err(status) => result(op, arg, &outcome(&status)),
             }
@@ -226,6 +319,25 @@ fn step(op: &str, arg: &str, kept: &mut Vec<Box<dyn Any>>) {
         })()),
         "subscribe" => done(subscribe(arg, kept)),
         "addreserved" => done(hub::add_service(SERVICE_NAME, ended())),
+        "capture" => done((|| {
+            let topic: Strong<dyn ITopic> = BnTopic::new_binder(Capture);
+            registry()?.r#advertise(arg, &topic)?;
+            kept.push(Box::new(topic));
+            Ok(())
+        })()),
+        "relay" => {
+            let (call, target) = arg.split_once(':').expect("CALL:TARGET");
+            match relay(call, target, kept) {
+                Ok((got, took)) => {
+                    time(op, call, took);
+                    match got {
+                        Ok(()) => result(op, call, "OK"),
+                        Err(status) => result(op, call, &outcome(&status)),
+                    }
+                }
+                Err(status) => result(op, call, &outcome(&status)),
+            }
+        }
         "pool" => {
             ProcessState::start_thread_pool();
             result(op, "-", "OK");

@@ -92,7 +92,6 @@
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::convert::TryFrom;
-use std::fs::File;
 use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -278,7 +277,7 @@ impl<T: Remotable> Inner<T> {
             INTERFACE_TRANSACTION => reply.write(T::descriptor()),
             DUMP_TRANSACTION => {
                 // AOSP `readFileDescriptor`, kernel or RPC; a kernel parcel closes its own fd.
-                let mut file = File::from(crate::file_descriptor::read_raw_fd(_reader)?);
+                let fd = crate::file_descriptor::read_raw_fd(_reader)?;
 
                 let argc = _reader.read::<i32>()?;
                 let mut argv = Vec::new();
@@ -286,7 +285,7 @@ impl<T: Remotable> Inner<T> {
                     argv.push(_reader.read::<String>()?);
                 }
 
-                self.remotable.on_dump(&mut file, argv.as_slice())
+                self.remotable.on_dump_fd(fd, argv.as_slice())
             }
             SHELL_COMMAND_TRANSACTION => {
                 log::error!("SHELL_COMMAND_TRANSACTION is not supported.");
@@ -1168,7 +1167,48 @@ mod rpc_dispatch_tests {
             .unwrap();
         drop(data);
         let mut got = Vec::new();
-        File::from(read_end).read_to_end(&mut got).unwrap();
+        std::fs::File::from(read_end).read_to_end(&mut got).unwrap();
         assert_eq!(got, b"dumped");
+    }
+
+    /// A generated `Bn*` hands the fd to `Interface::dump_fd`, which may keep it past the call.
+    #[test]
+    fn a_generated_binder_hands_the_dump_fd_to_its_service() {
+        use crate::cancel::{BnCancellationSignal, ICancellationSignal};
+        use std::io::{Read, Write};
+        use std::os::fd::OwnedFd;
+
+        struct Keeper(Arc<Mutex<Option<OwnedFd>>>);
+        impl Interface for Keeper {
+            fn dump_fd(&self, fd: OwnedFd, _: &[String]) -> Result<()> {
+                *self.0.lock().unwrap() = Some(fd);
+                Ok(())
+            }
+        }
+        impl ICancellationSignal for Keeper {
+            fn r#cancel(&self) -> crate::BinderResult<()> {
+                Ok(())
+            }
+        }
+
+        let (read_end, write_end) = rustix::pipe::pipe().unwrap();
+        let mut bytes = 0i32.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        let mut data = Parcel::data_only_from_vec(bytes);
+        data.set_rpc_fd_mode(crate::rpc::FileDescriptorTransportMode::Unix);
+        data.rpc_set_in_fds(vec![write_end]);
+
+        let kept = Arc::new(Mutex::new(None));
+        let binder = BnCancellationSignal::new_binder(Keeper(Arc::clone(&kept))).as_binder();
+        let mut reply = Parcel::new();
+        binder
+            .rpc_transact(DUMP_TRANSACTION, &mut data, &mut reply)
+            .unwrap();
+        drop(data);
+        let fd = kept.lock().unwrap().take().expect("dump_fd kept no fd");
+        std::fs::File::from(fd).write_all(b"later").unwrap();
+        let mut got = Vec::new();
+        std::fs::File::from(read_end).read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"later");
     }
 }
