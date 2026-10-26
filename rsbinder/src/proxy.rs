@@ -225,7 +225,6 @@ pub struct ProxyHandle {
     handle: u32,
     /// Shared `BC_INCREFS`; its generation is this proxy's. See module doc "Proxy identity".
     pin: Arc<HandlePin>,
-    descriptor: String,
     stability: Stability,
     /// Lock-free readers `Acquire`, locked readers `Relaxed`; see the module doc table.
     obituary_sent: AtomicBool,
@@ -239,17 +238,12 @@ pub struct ProxyHandle {
 
 impl ProxyHandle {
     /// Sends `BC_ACQUIRE`; caller holds the proxy-cache lock and `pin`. See module doc.
-    pub(crate) fn new_acquired(
-        pin: &Arc<HandlePin>,
-        descriptor: String,
-        stability: Stability,
-    ) -> Result<Arc<Self>> {
+    pub(crate) fn new_acquired(pin: &Arc<HandlePin>, stability: Stability) -> Result<Arc<Self>> {
         let handle = pin.handle();
         thread_state::inc_strong_handle(handle)?;
         Ok(Arc::new_cyclic(|me| Self {
             handle,
             pin: Arc::clone(pin),
-            descriptor,
             stability,
             obituary_sent: AtomicBool::new(false),
             recipients: Mutex::new(Vec::new()),
@@ -279,9 +273,38 @@ impl ProxyHandle {
         &self.pin
     }
 
-    /// Get the interface descriptor for this proxy.
+    /// The remote object's interface descriptor, or `""` if asking for it failed.
+    ///
+    /// The first call may make a two-way `INTERFACE_TRANSACTION` to the remote process and wait
+    /// for its answer; see [`try_descriptor`](Self::try_descriptor). Do not call it under a lock
+    /// another binder thread may need.
     pub fn descriptor(&self) -> &str {
-        &self.descriptor
+        self.try_descriptor().unwrap_or_else(|err| {
+            log::warn!(
+                "interface descriptor of handle {} unavailable: {err:?}",
+                self.handle
+            );
+            ""
+        })
+    }
+
+    /// The remote object's interface descriptor, asked for on the first call (AOSP
+    /// `BpBinder::getInterfaceDescriptor`).
+    ///
+    /// The first successful answer is cached for every proxy of this handle, and later calls
+    /// make no transaction. A failed query is returned as its error and not cached, so the next
+    /// call asks again. A proxy whose death notice has arrived fails with
+    /// [`StatusCode::DeadObject`] without a transaction. The query honors the calling thread's
+    /// [`CallRestriction`](crate::CallRestriction): on a `FatalIfNotOneway` thread it panics.
+    pub fn try_descriptor(&self) -> Result<&str> {
+        if let Some(descriptor) = self.pin.cached_descriptor() {
+            return Ok(descriptor);
+        }
+        if self.obituary_sent.load(Ordering::Acquire) {
+            return Err(StatusCode::DeadObject);
+        }
+        let descriptor = thread_state::query_interface(self.handle)?;
+        Ok(self.pin.cache_descriptor(descriptor))
     }
 
     /// `Weak` only for a proxy with this proxy's own handle; see module doc "Extension cache".
@@ -313,11 +336,14 @@ impl ProxyHandle {
         thread_state::transact(self.handle(), code, data, flags)
     }
 
+    /// See [`RemoteProxy::prepare_transact`]. With `write_header`, the token is
+    /// [`try_descriptor`](Self::try_descriptor), which may ask the remote for it on the first
+    /// call; a failed query is returned as its error, and no parcel is built.
     pub fn prepare_transact(&self, write_header: bool) -> Result<Parcel> {
         let mut data = Parcel::new();
 
         if write_header {
-            data.write_interface_token(self.descriptor())?;
+            data.write_interface_token(self.try_descriptor()?)?;
         }
 
         Ok(data)
@@ -464,7 +490,10 @@ impl Debug for ProxyHandle {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProxyHandle")
             .field("handle", &self.handle)
-            .field("descriptor", &self.descriptor)
+            .field(
+                "descriptor",
+                &self.pin.cached_descriptor().unwrap_or("(not cached)"),
+            )
             .field("stability", &self.stability)
             .field("obituary_sent", &self.obituary_sent)
             .finish()
@@ -625,9 +654,9 @@ impl IBinder for ProxyHandle {
         if !process.thread_pool_started() && process.current_threads.load(Ordering::Relaxed) == 0 {
             // AOSP's `getThreadPoolMaxTotalThreadCount() == 0` (`BpBinder.cpp:617`): no looper yet.
             log::error!(
-                "add_frozen_state_change_callback on {} but no thread serves binder: \
+                "add_frozen_state_change_callback on handle {} but no thread serves binder: \
                  notifications wait for start_thread_pool or join_thread_pool",
-                self.descriptor
+                self.handle
             );
         }
         // Before the add: a callback it delivers may remove itself before the add returns.
@@ -665,6 +694,14 @@ impl IBinder for ProxyHandle {
 
     fn descriptor(&self) -> &str {
         self.descriptor()
+    }
+
+    fn try_descriptor(&self) -> Result<&str> {
+        self.try_descriptor()
+    }
+
+    fn cached_descriptor(&self) -> Option<&str> {
+        self.pin.cached_descriptor()
     }
 
     fn is_remote(&self) -> bool {
@@ -707,8 +744,12 @@ pub trait Proxy: Sized + Interface {
     /// the same between all implementations of that interface.
     fn descriptor() -> &'static str;
 
-    /// Create a new interface from the given proxy, if it matches the expected
-    /// type of this interface.
+    /// Wrap `binder` as this interface's proxy, or `None` if it is not a remote binder.
+    ///
+    /// A kernel proxy is not asked for its interface, so this makes no transaction; a remote
+    /// of another interface refuses the first two-way call with `BadType`. An RPC proxy
+    /// stamped earlier with another descriptor is refused. To check the remote's interface,
+    /// use [`SIBinder::into_interface_checked`].
     fn from_binder(binder: SIBinder) -> Option<Self>;
 }
 
@@ -751,10 +792,18 @@ mod tests {
 
     /// `ProxyHandle` with no kernel refs; `mem::forget` it to skip `BC_RELEASE` and `BC_DECREFS`.
     fn synthetic_proxy(obituary_sent: bool) -> Arc<ProxyHandle> {
+        synthetic_proxy_caching(obituary_sent, Some("test"))
+    }
+
+    /// [`synthetic_proxy`] whose pin has `descriptor` cached, or nothing.
+    fn synthetic_proxy_caching(obituary_sent: bool, descriptor: Option<&str>) -> Arc<ProxyHandle> {
+        let pin = HandlePin::synthetic(1, 1);
+        if let Some(descriptor) = descriptor {
+            pin.cache_descriptor(descriptor.to_string());
+        }
         Arc::new_cyclic(|me| ProxyHandle {
             handle: 1,
-            pin: HandlePin::synthetic(1, 1),
-            descriptor: "test".to_string(),
+            pin,
             stability: Stability::Local,
             obituary_sent: AtomicBool::new(obituary_sent),
             recipients: Mutex::new(Vec::new()),
@@ -855,6 +904,37 @@ mod tests {
             debug_str,
             "ProxyHandle { handle: 1, descriptor: \"test\", stability: Local, obituary_sent: false }"
         );
+
+        std::mem::forget(handle);
+    }
+
+    /// Plan 16: printing a proxy never asks the remote, and a dead one is not asked either.
+    #[test]
+    fn an_uncached_descriptor_is_neither_printed_nor_asked_of_a_dead_proxy() {
+        let handle = synthetic_proxy_caching(true, None);
+        assert_eq!(IBinder::cached_descriptor(&*handle), None);
+        assert_eq!(
+            format!("{handle:?}"),
+            "ProxyHandle { handle: 1, descriptor: \"(not cached)\", stability: Local, \
+             obituary_sent: true }"
+        );
+        let sib = SIBinder::from_arc(handle.clone() as Arc<dyn IBinder>);
+        assert!(format!("{sib:?}").contains("(not cached)"), "{sib:?}");
+        // Handle 1 names nothing in this process: a query would fail with another code.
+        assert_eq!(handle.try_descriptor(), Err(StatusCode::DeadObject));
+        assert_eq!(handle.descriptor(), "");
+
+        std::mem::forget(sib);
+        std::mem::forget(handle);
+    }
+
+    /// The first answer stored is the one every later call sees (AOSP `getInterfaceDescriptor`).
+    #[test]
+    fn the_first_cached_descriptor_is_kept() {
+        let handle = synthetic_proxy_caching(true, Some("first"));
+        assert_eq!(handle.pin().cache_descriptor("second".to_string()), "first");
+        assert_eq!(handle.try_descriptor(), Ok("first"));
+        assert_eq!(IBinder::cached_descriptor(&*handle), Some("first"));
 
         std::mem::forget(handle);
     }

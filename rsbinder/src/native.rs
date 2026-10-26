@@ -34,6 +34,11 @@
 //! `as_any()` and `descriptor()` to a wrapped `Binder<B>` fails the cast with
 //! `BadValue` instead of being reinterpreted as `Inner<B>`.
 //!
+//! The downcast comes first, and a failed one tells `BadType` (another
+//! interface) from `BadValue` by the descriptor only when it is known without
+//! a transaction (`IBinder::cached_descriptor`). A remote proxy reaching this
+//! cast is therefore never asked for its interface (plan 16).
+//!
 //! # Flat-binder flags
 //!
 //! `BinderFeatures::flat_flags` encodes the `flat_binder_object.flags` word.
@@ -647,23 +652,24 @@ impl<B: Remotable + 'static> TryFrom<SIBinder> for Binder<B> {
     type Error = StatusCode;
 
     fn try_from(ibinder: SIBinder) -> Result<Self> {
-        if B::descriptor() != ibinder.descriptor() {
-            // Single funnel of every failed interface cast: the one place BadType is explained.
-            log::error!(
-                "binder interface cast mismatch: expected `{}`, got `{}`",
-                B::descriptor(),
-                ibinder.descriptor()
-            );
-            return Err(StatusCode::BadType);
-        }
-
         // Two bindings: upcasting `Arc::clone`'s result in one expression fails to infer (E0308).
         let arc: Arc<dyn IBinder> = Arc::clone(ibinder.as_arc());
         let any: Arc<dyn Any + Send + Sync> = arc;
-        match any.downcast::<Inner<B>>() {
-            Ok(inner) => Ok(Self { inner }),
-            Err(_) => {
-                // Descriptor matched: a remote proxy, another `Remotable`, or a delegating wrapper.
+        if let Ok(inner) = any.downcast::<Inner<B>>() {
+            return Ok(Self { inner });
+        }
+        // Only a known descriptor decides the error: a remote proxy is never asked (plan 16).
+        match ibinder.cached_descriptor() {
+            Some(actual) if actual != B::descriptor() => {
+                // Funnel of the failed local casts: the place BadType is explained.
+                log::error!(
+                    "binder interface cast mismatch: expected `{}`, got `{actual}`",
+                    B::descriptor()
+                );
+                Err(StatusCode::BadType)
+            }
+            _ => {
+                // A remote proxy, another `Remotable` of this descriptor, or a delegating wrapper.
                 log::error!(
                     "cast to local Binder<{}> failed: not a local binder (remote proxy or different Remotable)",
                     B::descriptor()

@@ -60,7 +60,7 @@ impl RegistryResolver {
             return Err(StatusCode::BadValue.into());
         }
         Ok(Self {
-            registry: binder.into_interface()?,
+            registry: binder.into_interface_checked()?,
         })
     }
 

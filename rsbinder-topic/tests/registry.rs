@@ -14,12 +14,12 @@
 //! test's own. A fake registry, also a `child`, answers as the tests tell it, to send a watch the
 //! notices a registry would not.
 //!
-//! A stopped peer holds up a call only through what the call reaches. A client with no proxy of a
-//! topic asks its publisher for the descriptor (plan 15 §12.7), so a stopped publisher's name is
-//! looked up by a client that already holds its proxy. An `onAdvertised` takes of a watcher's
-//! async space what the kernel counts: its data and the offset of its one object, each rounded up
-//! to 8 bytes. A resumed watcher meets the last publisher by a notice sent again or by a lookup
-//! (plan 15 D14-e).
+//! A stopped peer holds up a call only through what the call reaches. Receiving a topic's binder
+//! asks its publisher nothing (plan 16), so a lookup of a stopped publisher's name waits on nothing
+//! of that publisher, even as the first proxy of it in this process. An `onAdvertised` takes of a
+//! watcher's async space what the kernel counts: its data and the offset of its one object, each
+//! rounded up to 8 bytes. A resumed watcher meets the last publisher by a notice sent again or by
+//! a lookup (plan 15 D14-e).
 
 #![cfg(any(target_os = "linux", target_os = "android"))]
 
@@ -317,32 +317,35 @@ fn a_new_host_knows_only_the_publishers_made_again() {
     assert_eq!(again.recv_timeout(WAIT), Ok(Bytes(vec![0])));
 }
 
-/// AC-15.5.1b: a binder of another interface, which a typed client cannot send, is `BadType`.
+/// AC-15.5.1b: another interface's binder is taken, and the name's subscribers get `BadType`.
 #[test]
 #[ignore = "needs a binder device and rsb_hub"]
-fn a_binder_of_another_interface_is_refused_as_bad_type() {
+fn a_binder_of_another_interface_is_taken_and_refused_to_subscribers() {
     let registry = registry_name("type");
     let (_host, resolver) = host(&registry);
     let name = name("type");
     let registry = hub::check_service(&registry).unwrap();
-    let advertise = |topic: SIBinder| {
-        let proxy = registry.as_proxy().unwrap();
-        let mut data = proxy.prepare_transact(true).unwrap();
-        data.write(name.as_str()).unwrap();
-        data.write(&topic).unwrap();
-        // `advertise`, the interface's first method.
-        let flags = FLAG_CLEAR_BUF | FLAG_PRIVATE_LOCAL;
-        proxy.submit_transact(FIRST_CALL_TRANSACTION, &data, flags)
-    };
-    let refused = advertise(BnTopicWatcher::new_binder(Silent).as_binder());
-    assert_eq!(refused.unwrap_err(), StatusCode::BadType);
-    assert!(listed(&resolver, &name).is_none());
-    // The same parcel with a topic in it is taken: the type of the binder was refused.
-    advertise(BnTopic::new_binder(Ended).as_binder()).unwrap();
+    let proxy = registry.as_proxy().unwrap();
+    let mut data = proxy.prepare_transact(true).unwrap();
+    data.write(name.as_str()).unwrap();
+    data.write(&BnTopicWatcher::new_binder(Silent).as_binder())
+        .unwrap();
+    // `advertise`, the interface's first method.
+    let flags = FLAG_CLEAR_BUF | FLAG_PRIVATE_LOCAL;
+    proxy
+        .submit_transact(FIRST_CALL_TRANSACTION, &data, flags)
+        .unwrap();
     assert!(listed(&resolver, &name).is_some());
+
+    // Our own binder: the resolver's `watch` reply fails to read it as `ITopic`.
+    let policy = SubscriberPolicy::default();
+    let refused = NamedSubscriber::<Bytes>::subscribe_with(&name, &policy, &resolver)
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(refused.transaction_error(), StatusCode::BadType);
 }
 
-/// AC-15.5.1b: a stopped publisher holds up no call; its name is looked up by a proxy holder.
+/// AC-15.5.1b: a stopped publisher holds up no call; this process's first lookup of it ends.
 #[test]
 #[ignore = "needs a binder device and rsb_hub"]
 fn a_stopped_publisher_holds_up_no_call_of_the_registry() {
@@ -352,15 +355,14 @@ fn a_stopped_publisher_holds_up_no_call_of_the_registry() {
     let stopped_name = name("stop.a");
     let other = name("stop.b");
     let stopping = publisher(&stopped_name, &registry);
-    let held = client.r#lookup(&stopped_name).unwrap().topic.unwrap();
     let stopped = [stopping.stop()];
 
     let found = timed("a lookup of the stopped publisher's name", &stopped, || {
         client.r#lookup(&stopped_name).unwrap()
     });
-    assert!(found
-        .topic
-        .is_some_and(|topic| topic.as_binder() == held.as_binder()));
+    let found = found.topic.unwrap();
+    let again = client.r#lookup(&stopped_name).unwrap().topic.unwrap();
+    assert!(found.as_binder() == again.as_binder());
     let names = timed("a list", &stopped, || resolver.list("").unwrap());
     assert!(names.iter().any(|info| info.name == stopped_name));
     let policy = PublisherPolicy::default();

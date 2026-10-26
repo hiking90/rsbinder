@@ -327,27 +327,47 @@ enum Peer<I: FromIBinder + ?Sized> {
     Unstamped(SIBinder),
 }
 
+/// What `resolve_peer` does with a kernel proxy whose descriptor is not cached (plan 16 D6).
+#[derive(Clone, Copy)]
+enum Unknown {
+    /// Ask the remote: a user call that may wait, once per stream.
+    Ask,
+    /// Accept it unasked: a binder thread must not wait on the peer.
+    Accept,
+}
+
 /// Resolve `binder` against `I`, refusing a binder that states a different interface.
-fn resolve_peer<I>(binder: &SIBinder, expected: &str, what: &str) -> Result<Peer<I>>
+fn resolve_peer<I>(
+    binder: &SIBinder,
+    expected: &str,
+    what: &str,
+    unknown: Unknown,
+) -> Result<Peer<I>>
 where
     I: FromIBinder + ?Sized,
 {
-    let actual = binder.descriptor();
-    if actual.is_empty() {
-        #[cfg(feature = "rpc")]
-        if (**binder)
-            .as_any()
-            .downcast_ref::<crate::rpc::RpcProxy>()
-            .is_some()
-        {
-            return Ok(Peer::Unstamped(binder.clone()));
+    let known = match (binder.cached_descriptor(), unknown) {
+        (Some(actual), _) => Some(actual),
+        (None, Unknown::Ask) if binder.as_proxy().is_some() => Some(binder.try_descriptor()?),
+        (None, _) => None,
+    };
+    match known {
+        Some(actual) if actual != expected => {
+            log::error!("{what}: not an {expected}: {actual:?}");
+            return Err(StatusCode::BadType);
         }
-        log::error!("{what}: a descriptor-less binder that is not an RPC proxy");
-        return Err(StatusCode::BadType);
-    }
-    if actual != expected {
-        log::error!("{what}: not an {expected}: {actual}");
-        return Err(StatusCode::BadType);
+        Some(_) => {}
+        None => {
+            #[cfg(feature = "rpc")]
+            if (**binder)
+                .as_any()
+                .downcast_ref::<crate::rpc::RpcProxy>()
+                .is_some()
+            {
+                return Ok(Peer::Unstamped(binder.clone()));
+            }
+            // A kernel proxy left unasked: the cast below neither asks nor decides.
+        }
     }
     Ok(Peer::Typed(FromIBinder::try_from(binder.clone()).map_err(
         |e| {
@@ -590,6 +610,7 @@ impl<T: Serialize + ?Sized> Producer<T> {
             sink,
             <BpStreamSink as crate::Proxy>::descriptor(),
             "Sink::open",
+            Unknown::Ask,
         )?;
         let credit = Arc::new(Credit::default());
         credit.grant(policy.initial_credits);
@@ -1264,6 +1285,7 @@ impl IStreamSink for SinkObject {
                 source,
                 <BpStreamSource as crate::Proxy>::descriptor(),
                 "IStreamSink.onStart",
+                Unknown::Accept,
             )
         };
         // Early answer to a second `onStart`; `refuse_start` and the keep below settle the race.
@@ -2015,6 +2037,7 @@ mod tests {
                 &binder,
                 <BpStreamSink as crate::Proxy>::descriptor(),
                 "test",
+                Unknown::Accept,
             )
             .expect("a local sink");
             let credit = Arc::new(Credit::default());
@@ -2259,6 +2282,7 @@ mod tests {
                 &binder,
                 <BpStreamSink as crate::Proxy>::descriptor(),
                 "test",
+                Unknown::Accept,
             )
             .expect("a local sink");
             let outcome = Arc::new(std::sync::OnceLock::new());

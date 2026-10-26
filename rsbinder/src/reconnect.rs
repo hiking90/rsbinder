@@ -993,7 +993,7 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
             recipient: None,
         };
 
-        let proxy: Strong<T> = match FromIBinder::try_from(conn_parts.binder.clone()) {
+        let proxy: Strong<T> = match conn_parts.binder.clone().into_interface_checked() {
             Ok(p) => p,
             Err(code) => {
                 self.end_parts(conn_parts);
@@ -1346,6 +1346,9 @@ mod tests {
     impl crate::Interface for Unreachable {}
 
     impl FromIBinder for Unreachable {
+        fn interface_descriptor() -> &'static str {
+            "rsbinder.test.Unreachable"
+        }
         fn try_from(_: SIBinder) -> Result<Strong<Self>> {
             Err(StatusCode::BadType)
         }

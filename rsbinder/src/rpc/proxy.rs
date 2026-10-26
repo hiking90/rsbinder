@@ -28,17 +28,16 @@
 //! proxy is never replaced: a replacement would send a second `DEC_STRONG`
 //! on drop and split the per-address dedup cache.
 //!
-//! Because `from_binder` stamps before its `binder.descriptor() !=
-//! $descriptor` check, that check is self-referential for a fresh RPC proxy:
-//! unlike the kernel `ProxyHandle` path it does not validate the remote's
-//! actual interface. A wrong-interface cast is not rejected at `from_binder`;
-//! it surfaces as a transact-time `StatusCode` when the server rejects the
-//! interface token. This follows from the Android RPC wire (no descriptor
-//! transmitted). First-write-wins also protects an in-use proxy from a later
-//! differing cast: the second `from_binder`'s descriptor check returns
+//! `from_binder` (through `__rpc_stamp_descriptor`) stamps, then compares the
+//! stored descriptor with its own, so the comparison does not validate the
+//! remote's actual interface for a fresh RPC proxy. A wrong-interface cast is
+//! not rejected at `from_binder`; it surfaces as a transact-time `StatusCode`
+//! when the server rejects the interface token. This follows from the Android
+//! RPC wire (no descriptor transmitted). First-write-wins also protects an
+//! in-use proxy from a later differing cast: the second `from_binder` returns
 //! `None`. `stamp_descriptor` returns whether this call wrote the descriptor
 //! (the `OnceLock::set` result), so a caller can tell a fresh stamp from an
-//! existing one without a `descriptor()` round-trip; `from_binder` ignores it.
+//! existing one without a `descriptor()` round-trip.
 //!
 //! # Session
 //!

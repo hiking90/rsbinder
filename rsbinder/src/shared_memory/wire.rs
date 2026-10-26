@@ -59,11 +59,12 @@ pub const GET_MEMORY: TransactionCode = FIRST_CALL_TRANSACTION;
 /// Token-only transaction: a remote binder via the proxy path, a local `Binder<T>` in-process.
 fn call(binder: &SIBinder, descriptor: &str, code: TransactionCode) -> Result<Parcel> {
     if let Some(remote) = binder.as_remote() {
-        // A known other interface is refused: the token must be `descriptor`, as AOSP writes it.
-        let actual = binder.descriptor();
-        if !actual.is_empty() && actual != descriptor {
-            log::error!("shared memory: not an {descriptor}: {actual}");
-            return Err(StatusCode::BadType);
+        // A cached other interface is refused unasked; the server's token check does the rest.
+        if let Some(actual) = binder.cached_descriptor() {
+            if !actual.is_empty() && actual != descriptor {
+                log::error!("shared memory: not an {descriptor}: {actual}");
+                return Err(StatusCode::BadType);
+            }
         }
         // An unstamped RPC proxy stays unstamped; see `cancel_remote`.
         #[cfg(feature = "rpc")]

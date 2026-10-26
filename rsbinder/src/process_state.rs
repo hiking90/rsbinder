@@ -51,11 +51,12 @@
 //!   `read_size = 0`): no `BR_*` — `BR_DEAD_BINDER` included — is
 //!   dispatched, and re-entrant `send_obituary_for_handle` paths only
 //!   originate from `BR_DEAD_BINDER`.
-//! - **P2** — lock released. IPC (`ping_binder` for handle 0 on sdk >= 30,
-//!   `query_interface` for case (a)) runs without the lock, so a re-entrant
+//! - **P2** — lock released. IPC (`ping_binder` for handle 0 on sdk >= 30)
+//!   runs without the lock, so a re-entrant
 //!   `BR_DEAD_BINDER` → `send_obituary_for_handle` on the same thread can
 //!   take it without deadlocking against `std::sync::RwLock`'s
-//!   non-reentrant write lock.
+//!   non-reentrant write lock. No interface descriptor is asked for here
+//!   (module doc "Interface descriptor").
 //! - **P3** — write lock re-acquired. Re-checks case (c) and the cross-thread
 //!   race, and commits the entry.
 //!
@@ -63,9 +64,8 @@
 //!
 //! - **(a)** entry absent, or its pin already in `Drop` (AOSP `attemptIncWeak` fails). P1 pins.
 //! - **(b)** entry present with no live proxy but a live pin. P1 upgrades the pin and holds it
-//!   to P3 for its `BC_ACQUIRE`; P2 skips `query_interface`
-//!   (the descriptor is immutable for the `binder_ref` slot's lifetime), and
-//!   P3 resurrects under the pin's generation (AOSP `force_set`).
+//!   to P3 for its `BC_ACQUIRE`, and P3 resurrects under the pin's generation (AOSP `force_set`),
+//!   keeping whatever descriptor the pin has cached.
 //! - **(c)** another thread inserted or upgraded the entry between the
 //!   fast-path miss and P1; the live entry is returned.
 //!
@@ -80,7 +80,8 @@
 //! P3 covers a race in which another thread T2 ran a complete case (a) during this thread's P2
 //! IPC and then dropped its `Arc` while a `WIBinder` kept its pin: the plan is `CaseA`, yet the
 //! entry names T2's live pin, which P3 adopts, releasing this thread's pin. A `CaseB` whose
-//! entry an obituary removed re-runs from P1 as case (a); its `query_interface` gets `DeadObject`.
+//! entry an obituary removed re-runs from P1 as case (a), whose proxy's first call gets
+//! `DeadObject`.
 //!
 //! # Proxy cache entry
 //!
@@ -128,12 +129,24 @@
 //! `thread_state::get_calling_uid` (AOSP `IPCThreadState::getCallingUid()`):
 //! the sender of the `BR_TRANSACTION` being handled, or this process's own
 //! `getuid()` when none is on the stack. Counting at P1's pinning would charge
-//! pins that are never committed — a P2 `query_interface` failure, or P3
+//! pins that are never committed — a P2 ping failure, or P3
 //! adopting another thread's pin — so no proxy anyone received; AOSP builds
 //! and returns its `BpBinder` under one lock and has no such pin. The cost is
 //! that a pin is uncounted during its P2 IPC. A case (a) replacing a pin in
 //! its `Drop` counts 2 until that `Drop` posts, as AOSP does while a new
 //! `BpBinder` replaces one in its destructor.
+//!
+//! # Interface descriptor
+//!
+//! Reading a handle from a parcel sends no `INTERFACE_TRANSACTION`, so receiving a binder never
+//! waits on the process behind it. The descriptor is asked for when something first needs it
+//! (`ProxyHandle::try_descriptor`, AOSP `BpBinder::getInterfaceDescriptor`, `BpBinder.cpp:328`),
+//! outside any lock and under the calling thread's `CallRestriction`, and the first successful
+//! answer is cached on the pin. A failure is not cached, so the next caller asks again. Two
+//! threads asking at once may both send the transaction; the first answer stored is kept, as in
+//! AOSP. The pin is the right home because it is `BpBinder`'s lifetime: a case-(b) revival keeps
+//! the pin and so the answer, and a recycled handle id gets a new pin through case (a), so it
+//! never sees the answer of the node the id named before.
 //!
 //! # Death links
 //!
@@ -332,6 +345,8 @@ pub(crate) struct HandlePin {
     generation: u64,
     /// Set by the pin's first commit; module doc "Proxy counting".
     counted: OnceLock<CountedPin>,
+    /// The first successful `INTERFACE_TRANSACTION` answer; module doc "Interface descriptor".
+    descriptor: OnceLock<String>,
 }
 
 /// What `on_proxy_create` charged, for the matching `on_proxy_drop` (AOSP `mTrackedUid`).
@@ -347,6 +362,7 @@ impl HandlePin {
             handle,
             generation,
             counted: OnceLock::new(),
+            descriptor: OnceLock::new(),
         })
     }
 
@@ -374,6 +390,15 @@ impl HandlePin {
 
     pub(crate) fn generation(&self) -> u64 {
         self.generation
+    }
+
+    pub(crate) fn cached_descriptor(&self) -> Option<&str> {
+        self.descriptor.get().map(String::as_str)
+    }
+
+    /// Keeps the first answer stored, as `BpBinder::getInterfaceDescriptor` does; returns it.
+    pub(crate) fn cache_descriptor(&self, descriptor: String) -> &str {
+        self.descriptor.get_or_init(|| descriptor)
     }
 }
 
@@ -406,7 +431,7 @@ impl Drop for HandlePin {
 enum SlowPathPlan {
     /// Case (a): this thread's fresh pin; dropping it unused releases its `BC_INCREFS`.
     CaseA { pin: Arc<HandlePin> },
-    /// Case (b): the entry's pin, held through P3 so its `BC_INCREFS` stays; P2 makes no query.
+    /// Case (b): the entry's pin, held through P3 so its `BC_INCREFS` stays.
     CaseB { pin: Arc<HandlePin> },
 }
 
@@ -418,13 +443,10 @@ enum SlowPathDecision {
     NeedIpc(SlowPathPlan),
 }
 
-/// P2 output; each case carries its pin and descriptor into P3.
+/// P2 output; each case carries its pin into P3.
 enum SlowPathReady {
-    /// Case (a): descriptor freshly obtained by P2's `query_interface`.
-    CaseA {
-        pin: Arc<HandlePin>,
-        descriptor: String,
-    },
+    /// Case (a): this thread's fresh pin, past P2's ping.
+    CaseA { pin: Arc<HandlePin> },
     /// Case (b): only held, not read; P3 commits on the entry's live pin, this one or newer.
     CaseB { _pin: Arc<HandlePin> },
 }
@@ -467,17 +489,15 @@ fn slow_path_p2_test_hook(handle: u32) {
 fn commit_new_acquired(
     handle_to_proxy: &mut HashMap<u32, CacheEntry>,
     pin: &Arc<HandlePin>,
-    descriptor: String,
     stability: Stability,
 ) -> Result<SIBinder> {
-    let arc = ProxyHandle::new_acquired(pin, descriptor.clone(), stability)?;
+    let arc = ProxyHandle::new_acquired(pin, stability)?;
     pin.count_once();
     handle_to_proxy.insert(
         pin.handle(),
         CacheEntry {
             weak: Arc::downgrade(&arc),
             pin: Arc::downgrade(pin),
-            descriptor,
         },
     );
     Ok(SIBinder::from_arc(arc as Arc<dyn IBinder>))
@@ -488,7 +508,6 @@ pub(crate) struct CacheEntry {
     pub(crate) weak: sync::Weak<ProxyHandle>,
     /// Upgrading it under the lock is AOSP `attemptIncWeak`; never drop the result there.
     pub(crate) pin: sync::Weak<HandlePin>,
-    pub(crate) descriptor: String,
 }
 
 /// Removes `handle`'s entry iff it still names `pin`; `true` if removed.
@@ -1063,24 +1082,21 @@ impl ProcessState {
         }))
     }
 
-    /// P2, lock released: `ping_binder(0)` (sdk >= 30), then CaseA's `query_interface`.
+    /// P2, lock released: `ping_binder(0)` (sdk >= 30).
     fn slow_path_p2(&self, handle: u32, plan: SlowPathPlan) -> Result<SlowPathReady> {
         // Test-only: the same-thread obituary test re-enters the cache here, lock released.
         #[cfg(test)]
         slow_path_p2_test_hook(handle);
 
-        // P2's ping and `query_interface` are internal IPC, so the caller's restriction is lifted.
-        let _restore = RestoreCallRestriction(thread_state::call_restriction());
-        thread_state::set_call_restriction(CallRestriction::None);
-        // An error drops `plan` here, unlocked; a case-(a) pin's `Drop` then releases it.
         if handle == 0 && crate::sdk_at_least(30) {
+            // The ping is internal IPC, so the caller's restriction is lifted for it.
+            let _restore = RestoreCallRestriction(thread_state::call_restriction());
+            thread_state::set_call_restriction(CallRestriction::None);
+            // An error drops `plan` here, unlocked; a case-(a) pin's `Drop` then releases it.
             thread_state::ping_binder(handle)?;
         }
         match plan {
-            SlowPathPlan::CaseA { pin } => Ok(SlowPathReady::CaseA {
-                descriptor: thread_state::query_interface(handle)?,
-                pin,
-            }),
+            SlowPathPlan::CaseA { pin } => Ok(SlowPathReady::CaseA { pin }),
             SlowPathPlan::CaseB { pin } => Ok(SlowPathReady::CaseB { _pin: pin }),
         }
     }
@@ -1090,7 +1106,7 @@ impl ProcessState {
         &self,
         handle: u32,
         stability: Stability,
-        mut ready: SlowPathReady,
+        ready: SlowPathReady,
     ) -> Result<Option<SIBinder>> {
         // Declared first so it drops after the lock: watermark callbacks may re-enter the cache.
         let _proxy_count_defer = crate::proxy_count::CallbackDeferGuard::new();
@@ -1106,18 +1122,17 @@ impl ProcessState {
         if let Some(arc) = entry.and_then(|e| e.weak.upgrade()) {
             return Ok(Some(SIBinder::from_arc(arc)));
         }
-        let entry_descriptor = entry.map(|e| e.descriptor.clone());
         entry_pin = entry.and_then(|e| e.pin.upgrade());
 
-        let (pin, descriptor) = match (&mut ready, &entry_pin, entry_descriptor) {
+        let pin = match (&ready, &entry_pin) {
             // Case (b), or another thread's commit during P2: revive the entry on its live pin.
-            (_, Some(pin), Some(descriptor)) => (pin, descriptor),
+            (_, Some(pin)) => pin,
             // Standard case (a), replacing an entry whose pin is in its `Drop`, if any.
-            (SlowPathReady::CaseA { pin, descriptor }, _, _) => (&*pin, std::mem::take(descriptor)),
+            (SlowPathReady::CaseA { pin }, _) => pin,
             // An obituary removed the entry, or replaced it with a dying pin: redo P1.
-            (SlowPathReady::CaseB { .. }, _, _) => return Ok(None),
+            (SlowPathReady::CaseB { .. }, _) => return Ok(None),
         };
-        commit_new_acquired(&mut handle_to_proxy, pin, descriptor, stability).map(Some)
+        commit_new_acquired(&mut handle_to_proxy, pin, stability).map(Some)
     }
 
     /// The live proxy of the entry that still names `pin`; module doc "Proxy cache entry".
@@ -1921,7 +1936,6 @@ mod tests {
         let entry = || CacheEntry {
             weak: sync::Weak::new(),
             pin: pin.clone(),
-            descriptor: String::new(),
         };
         let other = std::ptr::NonNull::<HandlePin>::dangling()
             .as_ptr()

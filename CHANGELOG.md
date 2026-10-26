@@ -105,9 +105,68 @@ Each item below changes what a 0.12.0 program observes.
   rsbinder that implements the trait must add it. Generated proxies reach
   the trait only through `as_remote`, which returns `ProxyHandle` and
   `RpcProxy` alone, so such a type was never driven by them.
-- `Debug` of an `SIBinder` or `dyn IBinder` prints a descriptor it cannot
-  learn without a transaction as `(not cached)`: an RPC proxy no typed cast
-  has stamped yet (0.12.0: an empty string).
+- `Debug` of an `SIBinder`, `dyn IBinder` or `ProxyHandle` prints a
+  descriptor it cannot learn without a transaction as `(not cached)`: a
+  kernel proxy whose descriptor nothing has asked for yet (see Changed;
+  0.12.0 always had it), and an RPC proxy no typed cast has stamped yet
+  (0.12.0: an empty string).
+- **A typed cast does not ask a kernel proxy for its interface.**
+  `SIBinder::into_interface`, `FromIBinder::try_from`, `Strong::try_from`
+  and reading a `Strong<dyn I>` from a parcel convert a remote binder of
+  any interface, as AOSP C++ `interface_cast` and Java `asInterface` do; so
+  do `Strong::clone`, `Weak::upgrade`, `into_sync` and `try_into_async`,
+  which cast again. A remote object of another interface refuses the first
+  two-way call: an AIDL-generated C++, NDK, Rust or rsbinder server answers
+  `BadType`, a Java server `EX_SECURITY` (`Parcel.enforceInterface` throws
+  `SecurityException`). A one-way call to it is dropped without an error.
+  0.12.0 compared the descriptor it had asked for when the binder
+  was read and returned `BadType` from the cast. Code that cast to learn
+  whether a binder implements an interface calls the new
+  `SIBinder::into_interface_checked`. The service manager lookups
+  (`hub::check_interface`, `try_get_interface`, `wait_for_interface`, their
+  async forms), `connect`, `Client::get` and `try_get`,
+  `RpcSession::get_interface`, `Reconnecting` and
+  `rsbinder_topic::registry::RegistryResolver::new` cast with it and keep
+  their `BadType`.
+- `FromIBinder` has a required associated function,
+  `interface_descriptor`, which `into_interface_checked` compares with the
+  remote's answer. Generated code implements it; a hand-written `impl`
+  returns its interface's descriptor.
+- `Binder::<B>::try_from` of a remote binder returns `BadValue` (not a local
+  binder) unless the proxy's descriptor is already known and differs, which
+  is `BadType`. 0.12.0 returned `BadType` whenever the remote's descriptor
+  differed.
+- `cancel::cancel_remote` sends `cancel()` to a kernel proxy whose
+  descriptor nothing has asked for, as it did for an unstamped RPC proxy;
+  a binder of another interface drops that one-way call. A known other
+  interface is still `BadType`.
+- A topic registry (`rsbinder_topic::registry::Registry`) lists a binder of
+  another interface that a client advertises; a subscriber of that name is
+  refused with `BadType`. 0.12.0 refused the `advertise`.
+- `descriptor()` of a kernel proxy (`IBinder::descriptor`,
+  `ProxyHandle::descriptor`) and `ProxyHandle::prepare_transact(true)`, which
+  writes it as the token, make a two-way `INTERFACE_TRANSACTION` when
+  nothing has asked for the descriptor yet (see Changed). That call follows
+  the calling thread's `CallRestriction`, so on a `FatalIfNotOneway` thread
+  it panics. A query that fails makes `descriptor()` return `""` and
+  `prepare_transact(true)` return the error, such as `DeadObject`. 0.12.0
+  asked when the binder was read, with the restriction lifted for that
+  call, and these functions read the stored answer: they neither panicked
+  nor failed. Ask for the descriptor before setting `FatalIfNotOneway`, and
+  call `try_descriptor()` where the error matters.
+- The service manager lookups return the binder of a service whose process
+  has died: `check_service` and `wait_for_service` return `Some`,
+  `try_get_service` `Ok(Some)`, and the binder's first call returns
+  `DeadObject`; `check_interface`, `wait_for_interface` and
+  `try_get_interface` return `Err(DeadObject)` from the checked cast.
+  0.12.0 failed reading the binder from the reply: `check_service` and
+  `wait_for_service` returned `None`, `try_get_service` and
+  `try_get_interface` the read's error (`Ok(None)` on Android 10), and
+  `check_interface` and `wait_for_interface` `Err(NameNotFound)`.
+- `hub::default` takes the context object (handle 0) as the service manager
+  without asking for its descriptor, so a context manager that is not an
+  `IServiceManager` is accepted and its calls fail as that object answers
+  them. 0.12.0 returned `BadType` from `hub::default`.
 
 ### Added
 
@@ -117,9 +176,13 @@ Each item below changes what a 0.12.0 program observes.
   0.12.0 wrote the descriptor the proxy held for its remote, which a
   successful typed cast had already made equal, so the bytes on the wire do
   not change. `prepare_transact(true)` still writes the remote's.
-- **`IBinder::try_descriptor`**: the descriptor with the error of a query that
-  failed, where `descriptor()` returns `""` for both that and a binder
-  whose interface states none.
+- **`IBinder::try_descriptor`**, also on `ProxyHandle`: the descriptor with
+  the error of a query that failed, where `descriptor()` returns `""` for
+  both that and a binder whose interface states none.
+- **`SIBinder::into_interface_checked`** (AOSP C++ `checked_interface_cast`):
+  `into_interface` that also asks a remote binder for its descriptor, once
+  per proxy, and refuses another interface with `BadType`; a query that
+  fails returns its error, such as `DeadObject`.
 
 - **`rsbinder-topic`, a new crate (Experimental)**: one publisher and many
   subscribers over kernel binder, on Linux and Android. A binder call sets
@@ -277,6 +340,20 @@ Each item below changes what a 0.12.0 program observes.
 
 ### Changed
 
+- **Receiving a kernel binder makes no call to the process behind it.**
+  Reading a handle from a parcel sends no `INTERFACE_TRANSACTION`; a kernel
+  proxy asks for its descriptor when `descriptor()`, `try_descriptor()` or a
+  checked cast first needs it, caches the first answer, and caches no
+  failure (AOSP `BpBinder::getInterfaceDescriptor`). A service that receives
+  a binder from a stopped or slow process no longer waits for that process,
+  and a process looking up the service manager no longer asks it for its
+  descriptor. So `descriptor()` on a kernel proxy may make a two-way call
+  the first time, returns `""` if it fails, and is subject to the thread's
+  `CallRestriction` (a `FatalIfNotOneway` thread panics); do not call it
+  under a lock a binder thread needs. Reading the binder of a dead process
+  succeeds, and its first call returns `DeadObject`. A `stream::Sink` that
+  streams by calls asks a kernel sink for its descriptor once, when opened;
+  a consumer's binder thread receiving `onStart` asks nothing.
 - **The `tokio` floor is 1.53.3**, the first release with
   `AsyncFd::register_with_interest`; the constructors it replaces are
   deprecated there as unsound (tokio #8587). `rsbinder` itself makes no new

@@ -195,7 +195,7 @@ pub fn get_interface<T: FromIBinder + ?Sized>(
     name: &str,
 ) -> Result<Strong<T>> {
     match get_service(sm, name) {
-        Some(service) => FromIBinder::try_from(service),
+        Some(service) => service.into_interface_checked(),
         None => {
             log::error!("Service {name} not found");
             Err(StatusCode::NameNotFound)

@@ -69,8 +69,15 @@
 //! manager try to start an unregistered lazy service — see the docs on
 //! `hub::android_15::check_service` (an Android-only module, so not
 //! linkable from a host build). On the Android 10 legacy C service manager, which
-//! cannot distinguish not-found from a transport failure, the `try_*`
-//! functions map any failure to `Ok(None)`.
+//! cannot distinguish not-found from a transport failure, `try_get_service`
+//! maps any failure of the lookup to `Ok(None)`; `try_get_interface` still
+//! returns the error of the service's own descriptor query (below).
+//!
+//! The `*_interface` functions cast with
+//! [`SIBinder::into_interface_checked`](crate::SIBinder::into_interface_checked):
+//! the first lookup of a service asks it for its interface descriptor, one
+//! more two-way call, and a service that does not answer fails the lookup
+//! with that call's error.
 //!
 //! ### Version-Specific API
 //!
@@ -252,7 +259,7 @@ macro_rules! impl_sm_module_body {
             name: &str,
         ) -> Result<Strong<T>> {
             match sm.getService(name) {
-                Ok(Some(service)) => FromIBinder::try_from(service),
+                Ok(Some(service)) => service.into_interface_checked(),
                 Ok(None) => {
                     log::error!("Service {} not found", name);
                     Err(StatusCode::NameNotFound)
@@ -936,7 +943,7 @@ impl ServiceManager {
     }
 
     /// Resolve a service by name **without blocking** and cast it to the
-    /// interface `T` — the `interface_cast(check_service(name))` of AOSP.
+    /// interface `T` — the `checked_interface_cast(check_service(name))` of AOSP.
     ///
     /// Returns [`StatusCode::NameNotFound`] immediately if the service is not
     /// registered, in contrast to
@@ -944,7 +951,7 @@ impl ServiceManager {
     /// appears.
     pub fn check_interface<T: FromIBinder + ?Sized>(&self, name: &str) -> Result<Strong<T>> {
         match self.check_service(name) {
-            Some(binder) => FromIBinder::try_from(binder),
+            Some(binder) => binder.into_interface_checked(),
             None => Err(StatusCode::NameNotFound),
         }
     }
@@ -1686,10 +1693,12 @@ impl ServiceManager {
     /// distinction and casts the result to `T`.
     ///
     /// `Ok(Some(strong))` found and cast, `Ok(None)` not registered, `Err` on a
-    /// transport/SM failure *or* a descriptor mismatch. A name registered under
-    /// the wrong interface stays distinguishable from an unreachable service
-    /// manager: the former is exactly [`StatusCode::BadType`], the latter a
-    /// transport code (the lookup never yields `BadType` itself). Contrast
+    /// transport/SM failure, a descriptor mismatch, *or* a failure of the
+    /// service's own descriptor query (such as [`StatusCode::DeadObject`]).
+    /// A name registered under the wrong interface stays distinguishable from
+    /// an unreachable service manager: the former is exactly
+    /// [`StatusCode::BadType`], the latter a transport code (the lookup never
+    /// yields `BadType` itself). Contrast
     /// [`check_interface`](Self::check_interface), which folds not-found into
     /// `Err(NameNotFound)`, and [`wait_for_interface`](Self::wait_for_interface),
     /// which blocks until the service appears.
@@ -1698,7 +1707,7 @@ impl ServiceManager {
         name: &str,
     ) -> Result<Option<Strong<T>>> {
         match self.try_get_service(name)? {
-            Some(binder) => FromIBinder::try_from(binder).map(Some),
+            Some(binder) => binder.into_interface_checked().map(Some),
             None => Ok(None),
         }
     }
@@ -1830,12 +1839,12 @@ impl ServiceManager {
 
     /// Interface-typed [`wait_for_service`](Self::wait_for_service): block
     /// until `name` is registered, then cast it to `T`. The event-driven
-    /// equivalent of AOSP `waitForService` + `interface_cast` (the binding's
+    /// equivalent of AOSP `waitForService` + `checked_interface_cast` (the binding's
     /// `wait_for_interface`). Returns [`StatusCode::NameNotFound`] only when
     /// the wait gives up — see [`wait_for_service`](Self::wait_for_service).
     pub fn wait_for_interface<T: FromIBinder + ?Sized>(&self, name: &str) -> Result<Strong<T>> {
         match self.wait_for_service(name) {
-            Some(binder) => FromIBinder::try_from(binder),
+            Some(binder) => binder.into_interface_checked(),
             None => Err(StatusCode::NameNotFound),
         }
     }
@@ -2122,8 +2131,9 @@ pub fn try_get_service(name: &str) -> Result<Option<SIBinder>> {
 /// from the default ServiceManager.
 ///
 /// Equivalent to `default().try_get_interface(name)`. `Ok(Some)` found and
-/// cast, `Ok(None)` not registered, `Err` on a transport/SM failure or a
-/// descriptor mismatch. See [`ServiceManager::try_get_interface`].
+/// cast, `Ok(None)` not registered, `Err` on a transport/SM failure, a
+/// descriptor mismatch or a failure of the service's own descriptor query.
+/// See [`ServiceManager::try_get_interface`].
 #[inline]
 pub fn try_get_interface<T: FromIBinder + ?Sized>(name: &str) -> Result<Option<Strong<T>>> {
     default()?.try_get_interface(name)

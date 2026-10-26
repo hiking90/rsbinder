@@ -2237,7 +2237,7 @@ impl RpcSession {
     /// Client: resolve a named service published via
     /// [`RpcServer::add_service`] and cast it to the interface `T`.
     ///
-    /// Convenience for `Strong::try_from(self.get_service(name)?)`, mirroring
+    /// Convenience for `self.get_service(name)?.into_interface_checked()`, mirroring
     /// [`hub::wait_for_interface`](crate::hub::wait_for_interface) on the kernel
     /// stack. Returns [`StatusCode::BadType`] if the resolved binder does not
     /// implement `T`, or any error surfaced by [`get_service`](Self::get_service).
@@ -2245,6 +2245,6 @@ impl RpcSession {
         &self,
         name: &str,
     ) -> Result<crate::Strong<T>> {
-        crate::Strong::<T>::try_from(self.get_service(name)?)
+        self.get_service(name)?.into_interface_checked()
     }
 }

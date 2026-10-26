@@ -396,6 +396,8 @@ tier_kernel() {
         --test freeze_kernel -- --ignored --test-threads=1
     run "death_reorder_kernel" tpass cargo test -p tests --features rpc \
         --test death_reorder_kernel -- --ignored --test-threads=1
+    run "lazy_descriptor_kernel" tpass cargo test -p tests \
+        --test lazy_descriptor_kernel -- --ignored --test-threads=1
     local t
     for t in test_death_recipient test_wibinder_upgrade_after_obituary \
         test_death_recipient_panic_does_not_starve_others \

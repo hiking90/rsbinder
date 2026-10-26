@@ -5465,6 +5465,7 @@ pub fn rsbinder::ProxyHandle::handle(&self) -> u32
 pub fn rsbinder::ProxyHandle::prepare_request(&self, &str) -> rsbinder::Result<rsbinder::Parcel>
 pub fn rsbinder::ProxyHandle::prepare_transact(&self, bool) -> rsbinder::Result<rsbinder::Parcel>
 pub fn rsbinder::ProxyHandle::submit_transact(&self, rsbinder::TransactionCode, &rsbinder::Parcel, rsbinder::TransactionFlags) -> rsbinder::Result<core::option::Option<rsbinder::Parcel>>
+pub fn rsbinder::ProxyHandle::try_descriptor(&self) -> rsbinder::Result<&str>
 impl rsbinder::ProxyHandle
 pub fn rsbinder::ProxyHandle::dump<F: core::convert::Into<std::os::fd::owned::OwnedFd>>(&self, F, &[alloc::string::String]) -> rsbinder::Result<()>
 impl core::cmp::Eq for rsbinder::ProxyHandle
@@ -5539,6 +5540,7 @@ pub fn rsbinder::SIBinder::downgrade(&Self) -> rsbinder::WIBinder
 pub fn rsbinder::SIBinder::force_downgrade_to_system_stability(&self) -> rsbinder::Result<()>
 pub fn rsbinder::SIBinder::force_downgrade_to_vendor_stability(&self) -> rsbinder::Result<()>
 pub fn rsbinder::SIBinder::into_interface<I: rsbinder::FromIBinder + rsbinder::Interface + ?core::marker::Sized>(self) -> rsbinder::Result<rsbinder::Strong<I>>
+pub fn rsbinder::SIBinder::into_interface_checked<I: rsbinder::FromIBinder + rsbinder::Interface + ?core::marker::Sized>(self) -> rsbinder::Result<rsbinder::Strong<I>>
 pub fn rsbinder::SIBinder::link_to_death_arc<R: rsbinder::DeathRecipient + 'static>(&self, &alloc::sync::Arc<R>) -> rsbinder::Result<()>
 pub fn rsbinder::SIBinder::mark_vintf(&self) -> rsbinder::Result<()>
 pub fn rsbinder::SIBinder::new(alloc::sync::Arc<dyn rsbinder::IBinder>) -> rsbinder::Result<Self>
@@ -6211,28 +6213,40 @@ impl<T> rsbinder::DeserializeOption for rsbinder::stream::StreamEndpoint<T>
 pub fn rsbinder::stream::StreamEndpoint<T>::deserialize_option(&mut rsbinder::Parcel) -> rsbinder::Result<core::option::Option<Self>>
 pub fn rsbinder::stream::StreamEndpoint<T>::deserialize_option_from(&mut core::option::Option<Self>, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 pub trait rsbinder::FromIBinder: rsbinder::Interface
+pub fn rsbinder::FromIBinder::interface_descriptor() -> &'static str
 pub fn rsbinder::FromIBinder::try_from(rsbinder::SIBinder) -> rsbinder::Result<rsbinder::Strong<Self>>
 impl rsbinder::FromIBinder for dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal
+pub fn dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal::interface_descriptor() -> &'static str
 pub fn dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal::try_from(rsbinder::SIBinder) -> rsbinder::Result<rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignal>>
 impl rsbinder::FromIBinder for dyn rsbinder::hub::android_16::IAccessor
+pub fn dyn rsbinder::hub::android_16::IAccessor::interface_descriptor() -> &'static str
 pub fn dyn rsbinder::hub::android_16::IAccessor::try_from(rsbinder::SIBinder) -> rsbinder::Result<rsbinder::Strong<dyn rsbinder::hub::android_16::IAccessor>>
 impl rsbinder::FromIBinder for dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback
+pub fn dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback::interface_descriptor() -> &'static str
 pub fn dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback::try_from(rsbinder::SIBinder) -> rsbinder::Result<rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback>>
 impl rsbinder::FromIBinder for dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback
+pub fn dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback::interface_descriptor() -> &'static str
 pub fn dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback::try_from(rsbinder::SIBinder) -> rsbinder::Result<rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>>
 impl rsbinder::FromIBinder for dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager
+pub fn dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager::interface_descriptor() -> &'static str
 pub fn dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager::try_from(rsbinder::SIBinder) -> rsbinder::Result<rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager>>
 impl rsbinder::FromIBinder for dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionController
+pub fn dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionController::interface_descriptor() -> &'static str
 pub fn dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionController::try_from(rsbinder::SIBinder) -> rsbinder::Result<rsbinder::Strong<dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionController>>
 impl<P: rsbinder::BinderAsyncPool> rsbinder::FromIBinder for dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<P>
+pub fn dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<P>::interface_descriptor() -> &'static str
 pub fn dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<P>::try_from(rsbinder::SIBinder) -> core::result::Result<rsbinder::Strong<dyn rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<P>>, rsbinder::StatusCode>
 impl<P: rsbinder::BinderAsyncPool> rsbinder::FromIBinder for dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsync<P>
+pub fn dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsync<P>::interface_descriptor() -> &'static str
 pub fn dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsync<P>::try_from(rsbinder::SIBinder) -> core::result::Result<rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsync<P>>, rsbinder::StatusCode>
 impl<P: rsbinder::BinderAsyncPool> rsbinder::FromIBinder for dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsync<P>
+pub fn dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsync<P>::interface_descriptor() -> &'static str
 pub fn dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsync<P>::try_from(rsbinder::SIBinder) -> core::result::Result<rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsync<P>>, rsbinder::StatusCode>
 impl<P: rsbinder::BinderAsyncPool> rsbinder::FromIBinder for dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsync<P>
+pub fn dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsync<P>::interface_descriptor() -> &'static str
 pub fn dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsync<P>::try_from(rsbinder::SIBinder) -> core::result::Result<rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsync<P>>, rsbinder::StatusCode>
 impl<P: rsbinder::BinderAsyncPool> rsbinder::FromIBinder for dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync<P>
+pub fn dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync<P>::interface_descriptor() -> &'static str
 pub fn dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync<P>::try_from(rsbinder::SIBinder) -> core::result::Result<rsbinder::Strong<dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerAsync<P>>, rsbinder::StatusCode>
 pub trait rsbinder::FrozenStateChangeCallback: core::marker::Send + core::marker::Sync
 pub fn rsbinder::FrozenStateChangeCallback::on_state_changed(&self, &rsbinder::WIBinder, rsbinder::FrozenState)

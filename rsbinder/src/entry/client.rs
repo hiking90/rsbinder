@@ -545,7 +545,7 @@ impl Client {
     /// service is registered (AOSP `waitForService`); RPC: one lookup in
     /// the server's directory ([`StatusCode::NameNotFound`] if absent).
     pub fn get<T: FromIBinder + ?Sized>(&self, name: &str) -> Result<Strong<T>> {
-        FromIBinder::try_from(self.binder(name)?)
+        self.binder(name)?.into_interface_checked()
     }
 
     /// Non-waiting form of [`get`](Self::get): `Ok(None)` when `name` is
@@ -555,7 +555,7 @@ impl Client {
             Inner::Kernel => crate::hub::try_get_interface(name),
             #[cfg(feature = "rpc")]
             Inner::Rpc(s) => match s.get_service(name) {
-                Ok(b) => FromIBinder::try_from(b).map(Some),
+                Ok(b) => b.into_interface_checked().map(Some),
                 Err(StatusCode::NameNotFound) => Ok(None),
                 Err(e) => Err(e),
             },

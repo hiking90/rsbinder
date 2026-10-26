@@ -486,7 +486,7 @@ impl<T: Payload + 'static> Accept for Shared<T> {
         if token.as_proxy().is_none() && !asked_here(request) {
             return Err(StatusCode::BadValue.into());
         }
-        // A comparison of the cached descriptor, no call; outside the lock all the same.
+        // No call: a remote token is not asked for its interface (plan 16); outside the lock too.
         let subscription: Strong<dyn ISubscription> = token
             .clone()
             .into_interface()
