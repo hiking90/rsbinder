@@ -257,9 +257,13 @@ Each item below changes what a 0.12.0 program observes.
   accessor. A hub run with it that served an accessor moves to `--config`
   with a file that grants everything (`[global] list = "any"`, a `[[rule]]`
   with `name = "*"`, `add = "any"` and `find = "any"`) and holds the
-  `[[service]]` declaration, as `tests/policy/d8b-accessor.toml` does. A
-  configuration with an `accessor` key fails to load in 0.12.0's `rsb_hub`,
-  which refuses unknown keys.
+  `[[service]]` declaration, as `tests/policy/d8b-accessor.toml` does; a
+  hub built with the `topic` feature also needs `[global] topics = "any"`
+  and a `[[topic]]` with `name = "*"`, `advertise = "any"` and
+  `subscribe = "any"`, as `tests/policy/topic/permissive-topic.toml` has,
+  since a `[[rule]]` grants no topic permission. A configuration with an
+  `accessor` key fails to load in 0.12.0's `rsb_hub`, which refuses unknown
+  keys.
 - **`rsb_hub` makes no two-way binder call.** Its threads run
   `CallRestriction::FatalIfNotOneway`, as AOSP's servicemanager does: a
   two-way call from a request handler panics before it is sent and the

@@ -36,7 +36,7 @@ impl Remotable for ProbeBinder {
     fn descriptor() -> &'static str {
         "rsbinder.test.ac61.IProbe"
     }
-    /// `UnknownTransaction`, so `Inner::transact` answers `INTERFACE_TRANSACTION` and ping itself.
+    /// `UnknownTransaction` lets `Inner::transact` answer `INTERFACE_TRANSACTION`; `Ok` is empty.
     fn on_transact(
         &self,
         _code: TransactionCode,
