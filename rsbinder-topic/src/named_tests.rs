@@ -2212,13 +2212,24 @@ fn waited(subscriber: &mut NamedSubscriber<Bytes>, timeout: Duration) -> bool {
     wait_any(&mut waits, Some(timeout)).unwrap()
 }
 
+/// `connected`, and the fd readable: the connection thread's eventfd wake, which comes after.
+fn announced(subscriber: &NamedSubscriber<Bytes>) {
+    use rustix::event::{poll, PollFd, PollFlags, Timespec};
+    connected(subscriber);
+    let fd = subscriber.wait_fd().unwrap();
+    let mut fds = [PollFd::from_borrowed_fd(fd, PollFlags::IN)];
+    let timeout = Timespec::try_from(WAIT).unwrap();
+    let ready = poll(&mut fds, Some(&timeout)).unwrap();
+    assert_eq!(ready, 1, "announced within {WAIT:?}");
+}
+
 /// Raised after a poll returned, its wakes drained: the next call returns at once, then a sleep.
 fn an_interrupt_whose_wakes_a_finish_wait_drains_ends_the_next_poll(connection: bool) {
     let names = Names::default();
     let mut subscriber = subscribe_on(&names, NAME, Wake::Fd);
     let _publisher = connection.then(|| advertise(&names, &policy()));
     if connection {
-        connected(&subscriber);
+        announced(&subscriber);
         // Takes the connection.
         assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
     }
@@ -2250,7 +2261,8 @@ fn an_interrupt_before_the_connection_is_taken_kicks_one_poll() {
     let names = Names::default();
     let mut subscriber = subscribe_on(&names, NAME, Wake::Fd);
     let _publisher = advertise(&names, &policy());
-    connected(&subscriber);
+    // The connection's eventfd wake lands now, not after a poll counted below drained the fd.
+    announced(&subscriber);
     subscriber.interrupter().interrupt();
     // Takes the connection, and does not wait.
     assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
@@ -2272,7 +2284,7 @@ fn a_name_subscribers_receive_cancelled_by_an_interrupt_leaves_no_poll_to_end_fo
     let names = Names::default();
     let mut subscriber = subscribe_on(&names, NAME, Wake::Fd);
     let _publisher = advertise(&names, &policy());
-    connected(&subscriber);
+    announced(&subscriber);
     assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
     subscriber.interrupter().interrupt();
     let short = Duration::from_millis(50);

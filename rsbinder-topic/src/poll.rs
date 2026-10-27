@@ -45,7 +45,8 @@ pub trait Sealed {}
 /// reconnection. Register it once, level-triggered or edge-triggered: bytes a `finish_wait` leaves
 /// make the next `prepare_wait` return `false`, so no poll sleeps on readiness it was told of
 /// already. A `NamedSubscriber` also ends a poll when its connection changes: a notice to return,
-/// a connection to take; its `try_recv` then returns it.
+/// a connection to take; its `try_recv` then returns it. The connection's wake can land after a
+/// receive took the connection, and then ends one poll whose `try_recv` returns `Empty`.
 pub trait Wait: Sealed {
     /// The fd to poll for readability: a `Subscriber`'s end of its wake socket, or a
     /// `NamedSubscriber`'s epoll instance, which holds its current connection's fd and an
