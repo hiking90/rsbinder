@@ -613,12 +613,7 @@ impl ServiceManager {
             .filter(|accessor| !self.allows_in(config, caller, permission, accessor))
     }
 
-    /// AOSP `tryStartService`; `getService*` only: `checkService` must not start anything.
-    fn try_start_service(&self, name: &str) {
-        self.try_start_service_in(&self.enforcer.config(), name);
-    }
-
-    /// [`Self::try_start_service`] against a snapshot; an accessor's miss starts the instance.
+    /// AOSP `tryStartService`, `getService*` only; an accessor's miss starts the instance.
     fn try_start_service_in(&self, config: &config::Config, name: &str) {
         match config.declarations.activation(name) {
             Some(activation) => self.activator.try_start(name, activation),
@@ -885,13 +880,17 @@ fn yes_no(b: bool) -> &'static str {
 
 impl ServiceManager {
     /// The `find` filter runs outside the lock: it can hit the name service (R1).
-    fn dump_snapshot(&self, filter: Vec<String>) -> DumpSnapshot {
+    fn dump_snapshot(
+        &self,
+        config: &config::Config,
+        caller: Option<&rsbinder::Caller>,
+        filter: Vec<String>,
+    ) -> DumpSnapshot {
         /// Generic because the two maps hold different callback traits.
         fn count<V>(map: &BTreeMap<String, Vec<V>>, name: &str) -> usize {
             map.get(name).map_or(0, |v| v.len())
         }
 
-        let config = self.enforcer.config();
         #[cfg(feature = "topic")]
         let mut registered = false;
         let (mut rows, mut awaited, death_subscriptions) = {
@@ -942,25 +941,22 @@ impl ServiceManager {
         awaited.retain(|(name, _, _)| dump_filter_matches(&filter, name));
 
         let before = rows.len() + awaited.len();
-        let caller = rsbinder::calling_caller();
-        rows.retain(|row| self.allows_in(&config, caller.as_ref(), Permission::Find, &row.name));
-        awaited.retain(|(name, _, _)| {
-            self.allows_in(&config, caller.as_ref(), Permission::Find, name)
-        });
+        rows.retain(|row| self.allows_in(config, caller, Permission::Find, &row.name));
+        awaited.retain(|(name, _, _)| self.allows_in(config, caller, Permission::Find, name));
         let hidden = before - rows.len() - awaited.len();
 
         DumpSnapshot {
             services: rows,
             awaited,
             death_subscriptions,
-            rules: (!self.enforcer.is_allow_all()).then(|| config.policy.rules.len()),
+            rules: (!self.enforcer.is_allow_all()).then_some(config.policy.rules.len()),
             declarations: config.declarations.len(),
             filter,
             hidden,
             #[cfg(feature = "topic")]
             topics: self.topics.as_ref().map(|registry| TopicDump {
                 registered,
-                rules: (!self.enforcer.is_allow_all()).then(|| config.topics.rules.len()),
+                rules: (!self.enforcer.is_allow_all()).then_some(config.topics.rules.len()),
                 stats: registry.stats(),
             }),
         }
@@ -971,7 +967,9 @@ impl Interface for ServiceManager {
     /// Gated by `list`, each name by `find` too, else it would bypass the per-name policy.
     fn dump_fd(&self, fd: std::os::fd::OwnedFd, args: &[String]) -> rsbinder::Result<()> {
         let ctx = rsbinder::thread_state::CallingContext::default();
-        if !self.allows(Permission::List, "") {
+        let config = self.enforcer.config();
+        let caller = rsbinder::calling_caller();
+        if !self.allows_in(&config, caller.as_ref(), Permission::List, "") {
             log::warn!(
                 "policy denied dump (list) for uid={} (pid={})",
                 ctx.uid,
@@ -986,8 +984,11 @@ impl Interface for ServiceManager {
             return Err(StatusCode::PermissionDenied);
         }
         let mut text = Vec::new();
-        render_dump(&mut text, &self.dump_snapshot(args.to_vec()))
-            .map_err(|_| StatusCode::NoMemory)?;
+        render_dump(
+            &mut text,
+            &self.dump_snapshot(&config, caller.as_ref(), args.to_vec()),
+        )
+        .map_err(|_| StatusCode::NoMemory)?;
         send_dump(&self.dump_writer, fd, text, &ctx)
     }
 }
@@ -1065,7 +1066,9 @@ fn classify_for_service_union(
 impl IServiceManager for ServiceManager {
     /// Starts a declared service on a miss, as AOSP; `checkService` must not.
     fn getService(&self, name: &str) -> rsbinder::BinderResult<Option<rsbinder::SIBinder>> {
-        if !self.allows(Permission::Find, name) {
+        let config = self.enforcer.config();
+        let caller = rsbinder::calling_caller();
+        if !self.allows_in(&config, caller.as_ref(), Permission::Find, name) {
             return Ok(None);
         }
         let order = lock_recover(&self.fire_order);
@@ -1079,7 +1082,7 @@ impl IServiceManager for ServiceManager {
         fire_pending(pending);
         drop(order);
         if result.is_none() {
-            self.try_start_service(name);
+            self.try_start_service_in(&config, name);
         }
         Ok(result)
     }
@@ -1263,7 +1266,8 @@ impl IServiceManager for ServiceManager {
 
     /// `list`, then `find` per name, as AOSP's `getUpdatableNames` filters.
     fn listServices(&self, dump_priority: i32) -> rsbinder::BinderResult<Vec<String>> {
-        self.require(Permission::List, "")?;
+        let config = self.enforcer.config();
+        self.require_in(&config, Permission::List, "")?;
 
         // Filter outside the lock: `allows` can hit the name service.
         let candidates: Vec<String> = {
@@ -1279,7 +1283,7 @@ impl IServiceManager for ServiceManager {
         let caller = rsbinder::calling_caller();
         Ok(candidates
             .into_iter()
-            .filter(|name| self.allows_as(caller.as_ref(), Permission::Find, name))
+            .filter(|name| self.allows_in(&config, caller.as_ref(), Permission::Find, name))
             .collect())
     }
 
@@ -1610,7 +1614,8 @@ impl IServiceManager for ServiceManager {
         &self,
     ) -> rsbinder::BinderResult<Vec<hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInfo>>
     {
-        self.require(Permission::List, "")?;
+        let config = self.enforcer.config();
+        self.require_in(&config, Permission::List, "")?;
 
         // See `listServices`: snapshot under the lock, filter outside it.
         let snapshot: Vec<(String, i32)> = {
@@ -1625,7 +1630,7 @@ impl IServiceManager for ServiceManager {
         let caller = rsbinder::calling_caller();
         Ok(snapshot
             .into_iter()
-            .filter(|(name, _)| self.allows_as(caller.as_ref(), Permission::Find, name))
+            .filter(|(name, _)| self.allows_in(&config, caller.as_ref(), Permission::Find, name))
             .map(|(name, debugPid)| {
                 hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInfo { name, debugPid }
             })

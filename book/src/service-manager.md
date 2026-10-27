@@ -827,8 +827,9 @@ which only learned the AIDL-based interface in Android 11; `get_service_debug_in
 was added in Android 12. On Linux, rsbinder always uses the Android 16
 protocol — what `rsb_hub` implements — so every row in the Android 12+
 column applies. `is_declared` answers from the declarations above rather
-than from a VINTF manifest, so it is `false` only when nothing declares the
-name.
+than from a VINTF manifest, so it is `false` when nothing declares the name,
+or when the policy refuses the caller `find` on it or on its declared
+accessor; `try_is_declared` tells those apart.
 
 ## Using the ServiceManager Object Directly
 

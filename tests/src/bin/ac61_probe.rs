@@ -36,13 +36,7 @@ impl Remotable for ProbeBinder {
     fn descriptor() -> &'static str {
         "rsbinder.test.ac61.IProbe"
     }
-    /// Handles nothing, and says so. Returning `Ok(())` here would be a
-    /// trap: `Inner::transact` only falls back to its built-in handling of
-    /// `INTERFACE_TRANSACTION` when the remotable answers
-    /// `UnknownTransaction`. Swallowing the code instead sends an empty
-    /// reply, and the hub — which resolves every freshly received binder by
-    /// asking it for its descriptor — then fails `addService` while reading
-    /// that reply, which reads as a parcel bug rather than as this.
+    /// `UnknownTransaction`, so `Inner::transact` answers `INTERFACE_TRANSACTION` and ping itself.
     fn on_transact(
         &self,
         _code: TransactionCode,
@@ -94,12 +88,7 @@ fn main() {
     }
 
     ProcessState::init_default().expect("binder device");
-    // Required before registering anything: the hub resolves a freshly
-    // received binder by sending it an `INTERFACE_TRANSACTION`
-    // (`ProcessState::strong_proxy_for_handle` -> `query_interface`). With no
-    // pooled thread to answer it, the hub's `addService` fails while reading
-    // an empty reply, and the failure looks like a parcel bug rather than a
-    // missing thread pool.
+    // Serves the hub's oneway notices and a later client's descriptor query to `ProbeBinder`.
     ProcessState::start_thread_pool();
 
     // Registered binders are kept alive for the whole run by this vector.

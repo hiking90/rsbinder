@@ -141,8 +141,10 @@ Each item below changes what a 0.12.0 program observes.
   returns its interface's descriptor.
 - `Binder::<B>::try_from` of a remote binder returns `BadValue` (not a local
   binder) unless the proxy's descriptor is already known and differs, which
-  is `BadType`. 0.12.0 returned `BadType` whenever the remote's descriptor
-  differed.
+  is `BadType`. 0.12.0 returned `BadType` whenever the descriptor the proxy
+  held differed: a kernel proxy's, asked for when it was read, or an RPC
+  proxy's from its first typed cast, `""` before any, so an RPC proxy no
+  typed cast had reached was `BadType` for every `B`.
 - `cancel::cancel_remote` sends `cancel()` to a proxy, kernel or RPC, whose
   descriptor nothing has asked for; a binder of another interface drops
   that one-way call. A known other interface is still `BadType`. 0.12.0
@@ -158,14 +160,16 @@ Each item below changes what a 0.12.0 program observes.
   in a binder handler never waits on the consumer. A sink whose interface
   is not known and is another one is accepted: its server refuses the
   one-way `onStart` and batches, and the producer waits for credit that does
-  not come. 0.12.0 refused a kernel sink of another interface with
-  `BadType`, having asked for its descriptor when the endpoint was read.
+  not come. 0.12.0 refused with `BadType` a kernel sink of another
+  interface, having asked for its descriptor when the endpoint was read, and
+  an RPC sink a typed cast had taken for another interface.
 - A stream consumer accepts an `onStart` from a source whose interface
   nothing has asked for and is another one: that server drops the
   consumer's one-way `request` and `cancel`, and the consumer waits for
   batches that do not come. 0.12.0 ended the consumer's stream with
   `BadType` for a kernel source of another interface, having asked for its
-  descriptor when the source was read.
+  descriptor when the source was read, and for an RPC source a typed cast
+  had taken for another interface.
 - A topic registry (`rsbinder_topic::registry::Registry`) lists a binder of
   another interface that a client advertises; a subscriber of that name is
   refused with `BadType`. 0.12.0 refused the `advertise`.
@@ -250,8 +254,12 @@ Each item below changes what a 0.12.0 program observes.
     the instance name alone, and its miss still runs the instance's `start`.
 
   `--insecure-allow-all` reads no configuration, so under it no binder is an
-  accessor. A configuration with an `accessor` key fails to load in 0.12.0's
-  `rsb_hub`, which refuses unknown keys.
+  accessor. A hub run with it that served an accessor moves to `--config`
+  with a file that grants everything (`[global] list = "any"`, a `[[rule]]`
+  with `name = "*"`, `add = "any"` and `find = "any"`) and holds the
+  `[[service]]` declaration, as `tests/policy/d8b-accessor.toml` does. A
+  configuration with an `accessor` key fails to load in 0.12.0's `rsb_hub`,
+  which refuses unknown keys.
 - **`rsb_hub` makes no two-way binder call.** Its threads run
   `CallRestriction::FatalIfNotOneway`, as AOSP's servicemanager does: a
   two-way call from a request handler panics before it is sent and the

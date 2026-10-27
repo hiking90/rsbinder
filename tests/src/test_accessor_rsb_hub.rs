@@ -70,7 +70,7 @@ fn d8b_an_undeclared_accessor_is_an_ordinary_service() -> Result<()> {
     let found = hub::try_get_service(ACCESSOR)
         .expect("service manager")
         .unwrap_or_else(|| {
-            panic!("{ACCESSOR:?} was vended as an accessor, not as the binder under it")
+            panic!("{ACCESSOR:?}: None: not registered, or vended as an accessor arm the instance check refused")
         });
     assert!(
         found.as_proxy().is_some(),

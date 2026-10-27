@@ -284,7 +284,7 @@ pub enum ConfigError {
     /// would be handed the hub's own binder as the accessor.
     #[error(
         "{path}: service {name:?}: accessor {accessor:?} must be a name a service can register: \
-         at most 127 bytes of [A-Za-z0-9._/-], not one rsb_hub holds"
+         1 to 127 bytes of [A-Za-z0-9._/-], not one rsb_hub holds"
     )]
     BadAccessor {
         /// The offending file.

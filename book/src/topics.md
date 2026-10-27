@@ -213,11 +213,11 @@ feature.
   hears of the next topic once a reload gives the permission back. A
   subscription already set up is not cut: who stays subscribed is the
   publisher's `authorize`.
-- **A stopped publisher.** A subscriber that receives a topic it holds no
-  proxy of, from a lookup or a notice, first asks the topic's process for its
-  interface descriptor, and waits for that process if it is stopped. The hub
-  waits on nobody to hand a topic out; it waits, as any process does, on a
-  topic it receives and holds no proxy of (see
+- **A stopped publisher.** Receiving a topic, from a lookup or a notice,
+  sends nothing to the topic's process, so a lookup of a stopped publisher's
+  name answers as any other does. Subscribing is a call to the publisher
+  (`ITopic.subscribe`), and it waits for that process while it is stopped.
+  The hub waits on nobody to hand a topic out (see
   [Service Manager](./service-manager.md#what-a-caller-can-hold-the-hub-up-with)).
 
 What the registry's check vouches for is that a uid the policy allows chose
