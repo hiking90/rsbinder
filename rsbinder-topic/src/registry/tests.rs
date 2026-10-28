@@ -1066,6 +1066,72 @@ fn an_owed_notice_the_retry_thread_finds_refused_is_not_sent_and_the_thread_ends
     eventually("the retry thread ended", || Arc::strong_count(&alive) == 2);
 }
 
+/// Allows every action, and panics on judging `Subscribe` while armed.
+#[derive(Clone, Default)]
+struct Panicking(Arc<AtomicBool>);
+
+impl RegistryAccess for Panicking {
+    fn allows(&self, action: Action, _: &str, _: &Caller) -> bool {
+        let armed = action == Action::Subscribe && self.0.load(Ordering::SeqCst);
+        assert!(!armed, "the test's judgement panics");
+        true
+    }
+}
+
+#[test]
+fn a_change_whose_judgement_panicked_leaves_the_next_to_go_on() {
+    let panicking = Panicking::default();
+    let registry = Registry::new(panicking.clone());
+    let shared = &registry.shared;
+    let (watcher, heard) = recorder();
+    shared.watch_as(&caller(2), "a", &watcher).unwrap();
+    panicking.0.store(true, Ordering::SeqCst);
+    let changed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        shared.advertise_as(&caller(1), "a", &topic())
+    }));
+    assert!(changed.is_err());
+    panicking.0.store(false, Ordering::SeqCst);
+    // The panic was under the order lock: the next change takes it all the same.
+    shared.advertise_as(&caller(1), "a", &topic()).unwrap();
+    assert_eq!(*heard.heard.lock().unwrap(), [("a".to_owned(), 2)]);
+}
+
+#[test]
+fn a_retry_thread_whose_judgement_panicked_leaves_the_next_send_to_start_another() {
+    let panicking = Panicking::default();
+    let registry = Registry::new(panicking.clone());
+    let shared = &registry.shared;
+    let alive = Arc::new(());
+    let (stuck, heard) = recorder();
+    let (other, _) = recorder();
+    shared.watch_as(&caller(2), "a", &stuck).unwrap();
+    shared.watch_as(&caller(2), "b", &other).unwrap();
+    heard
+        .failures
+        .lock()
+        .unwrap()
+        .push_back(StatusCode::FailedTransaction);
+    let mut hooks = shared.hooks.lock().unwrap();
+    hooks.alive = Some(alive.clone());
+    // After the change's judgement: the retry thread's panics.
+    let arm = panicking.clone();
+    hooks.before_send = Some(Arc::new(move || arm.0.store(true, Ordering::SeqCst)));
+    drop(hooks);
+    shared.advertise_as(&caller(1), "a", &topic()).unwrap();
+    eventually("a retry thread", || Arc::strong_count(&alive) == 3);
+    eventually("the retry thread ended", || Arc::strong_count(&alive) == 2);
+    assert_eq!(registry.stats().owed, 1);
+
+    shared.hooks.lock().unwrap().before_send = None;
+    panicking.0.store(false, Ordering::SeqCst);
+    // Delivered, so it owes nothing new: it starts a thread for what was owed.
+    shared.advertise_as(&caller(1), "b", &topic()).unwrap();
+    eventually("the owed notice delivered", || {
+        registry.stats().notices_retried == 1
+    });
+    assert_eq!(*heard.heard.lock().unwrap(), [("a".to_owned(), 1)]);
+}
+
 type Free = Arc<Mutex<Vec<(&'static str, bool)>>>;
 
 fn both_free(shared: &super::Shared) -> bool {
