@@ -1269,7 +1269,7 @@ impl IServiceManager for ServiceManager {
         let config = self.enforcer.config();
         self.require_in(&config, Permission::List, "")?;
 
-        // Filter outside the lock: `allows` can hit the name service.
+        // Filter outside the lock: `allows_in` can hit the name service.
         let candidates: Vec<String> = {
             let inner = lock_recover(&self.inner);
             inner
