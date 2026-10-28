@@ -8860,14 +8860,16 @@ mod tests {
         use super::super::transport::UnixTransport;
         let (a, peer) = UnixTransport::pair().expect("socketpair");
         let session = RpcSession::new(Box::new(a), AddressSpace::Initiator).expect("session");
-        session.set_timeout(Some(Duration::from_millis(300)));
-        let payload = 2usize << 20;
+        let deadline = Duration::from_secs(1);
+        session.set_timeout(Some(deadline));
+        let payload = 1usize << 20;
         let mut data = Parcel::new();
         data.write(&vec![0u8; payload]).expect("payload");
 
-        // 64 KiB every 50 ms: the sender waits about 50 ms at a time, far under its 300 ms.
+        // 8 KiB every 50 ms, the most XNU's 8 KiB AF_UNIX buffer hands over, so both kernels
+        // see ~128 waits of ~50 ms each: the send outlasts the deadline, no wait comes near it.
         let reader = std::thread::spawn(move || {
-            let mut buf = vec![0u8; 64 << 10];
+            let mut buf = vec![0u8; 8 << 10];
             let mut total = 0usize;
             while total < payload {
                 match peer.recv_raw(&mut buf) {
@@ -8878,10 +8880,16 @@ mod tests {
             }
             total
         });
+        let started = std::time::Instant::now();
         let sent = session
             .inner
             .client_transact(RpcAddress::zero(), 1, &data, FLAG_ONEWAY);
+        let took = started.elapsed();
         assert!(matches!(sent, Ok(None)), "got {sent:?}");
+        assert!(
+            took > deadline,
+            "the send took {took:?}, within one deadline"
+        );
         assert!(reader.join().expect("reader") >= payload);
         assert!(!session.inner.shared.lifecycle.is_torn_down());
     }
