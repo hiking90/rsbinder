@@ -85,11 +85,13 @@ pub(crate) struct Listed {
 struct Watcher<W> {
     key: W,
     caller: Caller,
-    owed: Option<Owed>,
 }
 
 /// A notice a watch did not get: sent again at `due` with the topic the name has then.
-struct Owed {
+struct Owed<W> {
+    watcher: W,
+    /// The watch's, which never changes: a round judges it without visiting the watches.
+    caller: Caller,
     generation: u64,
     attempts: u32,
     due: Instant,
@@ -115,7 +117,9 @@ pub(crate) struct Table<T, W> {
     generation: u64,
     /// Uses of each handle by the two maps.
     links: BTreeMap<u32, usize>,
-    owed: usize,
+    /// The watches owed a notice, by name, apart from `watchers` so that a round visits these
+    /// alone: each one a watch's, at most [`MAX_OWED`] in all, and no list empty.
+    owed: BTreeMap<String, Vec<Owed<W>>>,
     counts: Counts,
 }
 
@@ -132,7 +136,7 @@ impl<T: Key, W: Key> Table<T, W> {
             watchers: BTreeMap::new(),
             generation: 0,
             links: BTreeMap::new(),
-            owed: 0,
+            owed: BTreeMap::new(),
             counts: Counts::default(),
         }
     }
@@ -230,7 +234,6 @@ impl<T: Key, W: Key> Table<T, W> {
         let entry = Watcher {
             key: watcher,
             caller,
-            owed: None,
         };
         self.watchers
             .entry(name.to_owned())
@@ -252,18 +255,18 @@ impl<T: Key, W: Key> Table<T, W> {
             return;
         };
         let mut gone = Vec::new();
-        list.retain_mut(|held| {
+        list.retain(|held| {
             let keep = !evicted.contains(&held.key);
             if !keep {
-                gone.push((held.key.handle(), held.owed.is_some()));
+                gone.push(held.key.handle());
             }
             keep
         });
         if list.is_empty() {
             self.watchers.remove(name);
         }
-        for (handle, owed) in gone {
-            self.owed -= usize::from(owed);
+        retain_owed(&mut self.owed, name, |o| !evicted.contains(&o.watcher));
+        for handle in gone {
             self.release(handle, links);
         }
     }
@@ -298,16 +301,14 @@ impl<T: Key, W: Key> Table<T, W> {
             self.generation += 1;
             self.clear_owed(&name);
         }
-        let mut owed = 0;
         self.watchers.retain(|_, list| {
-            list.retain(|held| {
-                let keep = held.key.handle() != Some(handle);
-                owed += usize::from(!keep && held.owed.is_some());
-                keep
-            });
+            list.retain(|held| held.key.handle() != Some(handle));
             !list.is_empty()
         });
-        self.owed -= owed;
+        self.owed.retain(|_, list| {
+            list.retain(|o| o.watcher.handle() != Some(handle));
+            !list.is_empty()
+        });
         self.links.remove(&handle);
     }
 
@@ -325,14 +326,14 @@ impl<T: Key, W: Key> Table<T, W> {
         } else {
             self.counts.failed += 1;
         }
-        let (mut owed, mut dropped) = (self.owed, false);
-        let Some(held) = find(&mut self.watchers, name, watcher) else {
+        let Some(held) = find(&self.watchers, name, watcher) else {
             return false;
         };
-        let added = match (sent, &mut held.owed) {
+        let full = self.owed() >= MAX_OWED;
+        let other = |o: &Owed<W>| o.watcher != *watcher;
+        match (sent, owed_mut(&mut self.owed, name, watcher)) {
             (Sent::Delivered, Some(o)) if o.generation <= generation => {
-                held.owed = None;
-                owed -= 1;
+                retain_owed(&mut self.owed, name, other);
                 false
             }
             (Sent::Delivered, _) => false,
@@ -340,53 +341,46 @@ impl<T: Key, W: Key> Table<T, W> {
                 o.generation = o.generation.max(generation);
                 false
             }
-            (Sent::Busy, None) if owed >= MAX_OWED => {
-                dropped = true;
+            (Sent::Busy, None) if full => {
+                self.counts.dropped += 1;
                 false
             }
             (Sent::Busy, None) => {
-                held.owed = Some(Owed {
+                let owed = Owed {
+                    watcher: watcher.clone(),
+                    caller: held.caller.clone(),
                     generation,
                     attempts: 0,
                     due: now + backoff(0),
-                });
-                owed += 1;
+                };
+                self.owed.entry(name.to_owned()).or_default().push(owed);
                 true
             }
             (Sent::Failed, Some(_)) => {
-                held.owed = None;
-                owed -= 1;
+                retain_owed(&mut self.owed, name, other);
                 false
             }
             (Sent::Failed, None) => false,
-        };
-        self.owed = owed;
-        self.counts.dropped += u64::from(dropped);
-        added
+        }
     }
 
     /// The owed notices due at `now`: name, watcher, the caller to judge and the owed generation.
     pub(crate) fn due(&self, now: Instant) -> Vec<(String, W, Caller, u64)> {
-        let mut due = Vec::new();
-        for (name, list) in &self.watchers {
-            for held in list {
-                if let Some(o) = held.owed.as_ref().filter(|o| o.due <= now) {
-                    let caller = held.caller.clone();
-                    due.push((name.clone(), held.key.clone(), caller, o.generation));
-                }
-            }
-        }
-        due
+        let owed = self
+            .owed
+            .iter()
+            .flat_map(|(name, list)| list.iter().map(move |o| (name, o)));
+        let due = owed.filter(|(_, o)| o.due <= now);
+        let due = due.map(|(name, o)| {
+            let caller = o.caller.clone();
+            (name.clone(), o.watcher.clone(), caller, o.generation)
+        });
+        due.collect()
     }
 
     /// When the next owed notice is due, if any is owed.
     pub(crate) fn next_due(&self) -> Option<Instant> {
-        let owed = self
-            .watchers
-            .values()
-            .flatten()
-            .filter_map(|w| w.owed.as_ref());
-        owed.map(|o| o.due).min()
+        self.owed.values().flatten().map(|o| o.due).min()
     }
 
     /// The topic to send for an owed notice; `None` if none is owed, or no topic, which clears it.
@@ -395,11 +389,9 @@ impl<T: Key, W: Key> Table<T, W> {
             .topics
             .get(name)
             .map(|held| (held.key.clone(), held.generation));
-        let held = find(&mut self.watchers, name, watcher)?;
-        held.owed.as_ref()?;
+        owed_mut(&mut self.owed, name, watcher)?;
         if topic.is_none() {
-            held.owed = None;
-            self.owed -= 1;
+            retain_owed(&mut self.owed, name, |o| o.watcher != *watcher);
         }
         topic
     }
@@ -417,17 +409,13 @@ impl<T: Key, W: Key> Table<T, W> {
         if sent != Sent::Delivered {
             self.counts.failed += 1;
         }
-        let Some(held) = find(&mut self.watchers, name, watcher) else {
-            return;
-        };
-        let Some(o) = &mut held.owed else {
+        let Some(o) = owed_mut(&mut self.owed, name, watcher) else {
             return;
         };
         match sent {
             Sent::Delivered if o.generation > generation => {}
             Sent::Delivered | Sent::Failed => {
-                held.owed = None;
-                self.owed -= 1;
+                retain_owed(&mut self.owed, name, |o| o.watcher != *watcher);
             }
             Sent::Busy => {
                 o.attempts += 1;
@@ -438,15 +426,14 @@ impl<T: Key, W: Key> Table<T, W> {
 
     /// An owed notice of `generation` the policy refuses now: no longer owed (plan 15 D13-a).
     pub(crate) fn refused(&mut self, name: &str, watcher: &W, generation: u64) {
-        let held = find(&mut self.watchers, name, watcher);
-        let judged = |o: &mut Owed| o.generation == generation;
-        if held.and_then(|held| held.owed.take_if(judged)).is_some() {
-            self.owed -= 1;
+        let owed = owed_mut(&mut self.owed, name, watcher);
+        if owed.is_some_and(|o| o.generation == generation) {
+            retain_owed(&mut self.owed, name, |o| o.watcher != *watcher);
         }
     }
 
     pub(crate) fn owed(&self) -> usize {
-        self.owed
+        self.owed.values().map(Vec::len).sum()
     }
 
     pub(crate) fn counts(&self) -> Counts {
@@ -454,7 +441,7 @@ impl<T: Key, W: Key> Table<T, W> {
             topics: self.topics.len(),
             watched: self.watchers.len(),
             watchers: self.watchers.values().map(Vec::len).sum(),
-            owed: self.owed,
+            owed: self.owed(),
             ..self.counts
         }
     }
@@ -494,14 +481,7 @@ impl<T: Key, W: Key> Table<T, W> {
 
     /// The name has no topic: no watch of it is owed a notice.
     fn clear_owed(&mut self, name: &str) {
-        let Some(list) = self.watchers.get_mut(name) else {
-            return;
-        };
-        for held in list {
-            if held.owed.take().is_some() {
-                self.owed -= 1;
-            }
-        }
+        self.owed.remove(name);
     }
 
     /// The death links held, for a test.
@@ -512,21 +492,70 @@ impl<T: Key, W: Key> Table<T, W> {
 
     /// The due of an owed notice, for a test.
     #[cfg(test)]
-    pub(crate) fn due_of(&mut self, name: &str, watcher: &W) -> Option<Instant> {
-        find(&mut self.watchers, name, watcher)?
-            .owed
-            .as_ref()
-            .map(|o| o.due)
+    pub(crate) fn due_of(&self, name: &str, watcher: &W) -> Option<Instant> {
+        let list = self.owed.get(name)?;
+        list.iter().find(|o| o.watcher == *watcher).map(|o| o.due)
+    }
+
+    /// Panic on the first broken invariant of the maps (plan 15-pubsub-registry-index §6.2).
+    #[cfg(test)]
+    pub(crate) fn check(&self) {
+        for (name, list) in &self.watchers {
+            assert!(!list.is_empty(), "{name:?}: an empty watch list");
+            for (i, held) in list.iter().enumerate() {
+                let again = list[..i].iter().any(|other| other.key == held.key);
+                assert!(!again, "{name:?}: a watcher watches twice");
+            }
+        }
+        for (name, list) in &self.owed {
+            assert!(!list.is_empty(), "{name:?}: an empty owed list");
+            for (i, o) in list.iter().enumerate() {
+                let watched = find(&self.watchers, name, &o.watcher).is_some();
+                assert!(watched, "{name:?}: owed to no watch");
+                let again = list[..i].iter().any(|other| other.watcher == o.watcher);
+                assert!(!again, "{name:?}: a watch owed twice");
+            }
+        }
+        assert!(self.owed() <= MAX_OWED, "{} owed", self.owed());
+        let mut uses = BTreeMap::new();
+        let topics = self.topics.values().map(|held| held.key.handle());
+        let watches = self.watchers.values().flatten().map(|w| w.key.handle());
+        for handle in topics.chain(watches).flatten() {
+            *uses.entry(handle).or_insert(0) += 1;
+        }
+        assert_eq!(self.links, uses, "the uses of each handle");
     }
 }
 
 fn find<'t, W: PartialEq>(
-    watchers: &'t mut BTreeMap<String, Vec<Watcher<W>>>,
+    watchers: &'t BTreeMap<String, Vec<Watcher<W>>>,
     name: &str,
     watcher: &W,
-) -> Option<&'t mut Watcher<W>> {
-    watchers
-        .get_mut(name)?
+) -> Option<&'t Watcher<W>> {
+    watchers.get(name)?.iter().find(|held| held.key == *watcher)
+}
+
+fn owed_mut<'t, W: PartialEq>(
+    owed: &'t mut BTreeMap<String, Vec<Owed<W>>>,
+    name: &str,
+    watcher: &W,
+) -> Option<&'t mut Owed<W>> {
+    owed.get_mut(name)?
         .iter_mut()
-        .find(|held| held.key == *watcher)
+        .find(|o| o.watcher == *watcher)
+}
+
+/// Keep the notices owed for `name` that `keep` takes; a list emptied leaves the map.
+fn retain_owed<W>(
+    owed: &mut BTreeMap<String, Vec<Owed<W>>>,
+    name: &str,
+    keep: impl FnMut(&Owed<W>) -> bool,
+) {
+    let Some(list) = owed.get_mut(name) else {
+        return;
+    };
+    list.retain(keep);
+    if list.is_empty() {
+        owed.remove(name);
+    }
 }

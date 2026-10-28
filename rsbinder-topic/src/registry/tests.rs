@@ -542,6 +542,106 @@ fn past_the_bound_a_failure_is_counted_and_not_owed() {
 }
 
 #[test]
+fn of_a_names_owed_notices_each_goes_alone() {
+    let (mut table, mut links, now) = watched(3);
+    for w in 100..103 {
+        table.sent("a", &key(w), 1, Sent::Busy, now);
+    }
+    table.unwatch("a", &[key(100)], &mut links);
+    assert_eq!((table.owed(), table.due_of("a", &key(100))), (2, None));
+    table.refused("a", &key(101), 1);
+    assert_eq!((table.owed(), table.due_of("a", &key(101))), (1, None));
+    let at = now + Duration::from_secs(1);
+    let due: Vec<u32> = table.due(at).iter().map(|due| due.1.id).collect();
+    assert_eq!(due, [102]);
+    table.retried("a", &key(102), 1, Sent::Failed, at);
+    assert_eq!((table.owed(), table.next_due()), (0, None));
+    table.check();
+}
+
+/// xorshift64: one sequence of changes per seed, with no crate for it.
+struct Rng(u64);
+
+impl Rng {
+    fn below(&mut self, n: u64) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0 % n
+    }
+
+    fn pick<'a, X>(&mut self, of: &'a [X]) -> &'a X {
+        &of[self.below(of.len() as u64) as usize]
+    }
+
+    fn sent(&mut self) -> Sent {
+        *self.pick(&[Sent::Delivered, Sent::Busy, Sent::Failed])
+    }
+}
+
+#[test]
+fn every_sequence_of_changes_keeps_the_maps_in_step() {
+    let names = ["a", "b", "c", "d", "e"];
+    let local = |id| K { id, handle: None };
+    let topics = [key(10), key(11), key(12), key(13), local(1), local(2)];
+    let mut watchers: Vec<K> = (20..28).map(key).collect();
+    watchers.extend([local(3), local(4)]);
+    let handles: Vec<u32> = (10..14).chain(20..28).collect();
+    for seed in 1..=8u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let (mut table, mut links) = (T::new(), Fake::default());
+        let mut now = Instant::now();
+        for step in 0..5_000 {
+            let name = *rng.pick(&names);
+            let watcher = rng.pick(&watchers).clone();
+            let uid = 1 + rng.below(2) as u32;
+            // One older than the name's, its own, or one newer.
+            let generation = (table.lookup(name).1 + rng.below(3)).saturating_sub(1);
+            links.fail = (rng.below(10) == 0).then(|| *rng.pick(&handles));
+            match rng.below(10) {
+                0 => {
+                    let (topic, cross_uid) = (rng.pick(&topics).clone(), rng.below(2) == 0);
+                    let ids = (uid, uid as i32);
+                    let changed = table.advertise(ids, name, topic, cross_uid, now, &mut links);
+                    for notice in changed.unwrap_or_default() {
+                        let sent = rng.sent();
+                        table.sent(name, &notice.watcher, notice.generation, sent, now);
+                    }
+                }
+                1 => {
+                    table.withdraw(uid, name, rng.pick(&topics), &mut links);
+                }
+                2 => {
+                    let _ = table.watch(name, watcher, caller(uid), &mut links);
+                }
+                3 => {
+                    let evicted = [watcher, rng.pick(&watchers).clone()];
+                    table.unwatch(name, &evicted, &mut links);
+                }
+                4 => table.forget(*rng.pick(&handles)),
+                5 => {
+                    let sent = rng.sent();
+                    table.sent(name, &watcher, generation, sent, now);
+                }
+                6 => table.refused(name, &watcher, generation),
+                7 => {
+                    // As a retry round does, the policy's judgement aside.
+                    for (name, watcher, _, _) in table.due(now) {
+                        if let Some((_, generation)) = table.retry_target(&name, &watcher) {
+                            let sent = rng.sent();
+                            table.retried(&name, &watcher, generation, sent, now);
+                        }
+                    }
+                }
+                _ => now += Duration::from_secs(rng.below(40)),
+            }
+            let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| table.check()));
+            assert!(checked.is_ok(), "seed {seed}, step {step}");
+        }
+    }
+}
+
+#[test]
 fn a_status_is_sent_again_when_the_kernel_blames_a_lack_of_room_or_names_no_cause() {
     let failed = Status::from(StatusCode::FailedTransaction);
     let detail = |param| {
