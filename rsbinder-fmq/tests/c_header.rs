@@ -12,7 +12,8 @@
 //! Linux only: the header targets Android too, but this harness needs a C
 //! compiler where the test runs, which a device does not have.
 
-#![cfg(target_os = "linux")]
+// Without 64-bit atomics a queue is `Unsupported` (`MessageQueue::create`).
+#![cfg(all(target_os = "linux", target_has_atomic = "64"))]
 
 mod common;
 
@@ -21,9 +22,11 @@ use std::os::fd::AsFd;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use rsbinder_fmq::shm::{Access, Mapping};
 use rsbinder_fmq::{AttachPolicy, Descriptor, Flavor, Grantor, MessageQueue, NOT_EMPTY, NOT_FULL};
 
 const COUNT: u32 = 5000;
@@ -337,21 +340,11 @@ fn c_refuses_hostile_counters() {
         let (_q, desc) = rust_queue();
         let fd = desc.fds[0].try_clone().unwrap();
         let out = probe(tag, &desc, CAPACITY, move || {
-            // SAFETY: a fresh shared map of the counters' page (offsets 0, 8); unmapped after.
-            unsafe {
-                let base = rustix::mm::mmap(
-                    std::ptr::null_mut(),
-                    4096,
-                    rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE,
-                    rustix::mm::MapFlags::SHARED,
-                    &fd,
-                    0,
-                )
-                .unwrap()
-                .cast::<u64>();
-                base.write_volatile(read);
-                base.add(1).write_volatile(write);
-                rustix::mm::munmap(base.cast(), 4096).unwrap();
+            let map = Mapping::map(fd.as_fd(), 0, 16, Access::ReadWrite).unwrap();
+            for (index, value) in [read, write].into_iter().enumerate() {
+                // SAFETY: the counters at offsets 0 and 8 of a live mapping, atomics only.
+                let word = unsafe { map.as_ptr().add(8 * index).cast::<AtomicU64>().as_ref() };
+                word.store(value, Ordering::SeqCst);
             }
         });
         assert!(

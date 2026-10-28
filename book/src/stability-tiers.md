@@ -8,7 +8,7 @@ what callers can rely on.
 |------|-----------|--------------------|--------------------|
 | **Stable** | Semver-strict | AOSP-faithful, byte-tested against real `libbinder` | Only on a major bump — and pre-1.0 the `0.x` minor slot *is* the major slot (see the [changelog](https://github.com/hiking90/rsbinder/blob/master/CHANGELOG.md) preamble). Breaking changes are last-resort. |
 | **Provisional** | Stabilizing toward 1.0 | AOSP-faithful in the validated cases (hermetic + real-`libbinder` STAGE3) | May break in a minor bump if 1.0 review surfaces an issue. Will be re-classified as Stable or Experimental at 1.0. |
-| **Experimental** | Opt-in via Cargo feature | **No guarantee** until the corresponding real-`libbinder` interop gate passes | Anytime, including the wire format. Default builds do not reach this code. |
+| **Experimental** | Opt-in: a Cargo feature, or a crate of its own | **No guarantee** until the corresponding real-`libbinder` interop gate passes, or, where the wire is rsbinder's own, at all | Anytime, including the wire format. Default builds do not reach this code. |
 
 ## Stable
 
@@ -56,8 +56,10 @@ tweaks; wire formats are already locked.
 - **RPC death notification** (session-disconnect, AOSP-faithful).
 - **IAccessor client / server** (plans 2-13 D.8 + 2-14 D.9 STAGE3
   passed against real `libbinder`).
-- **`rsb_hub`** — `addService` descriptor auto-detect, `getService2`,
-  `checkService2`, `Service::Accessor` routing. Linux-native bringup. New in
+- **`rsb_hub`** — `getService2`, `checkService2`, `Service::Accessor`
+  routing for instances whose declaration names an accessor (the
+  `[[service]] accessor` key, VINTF `<accessor>`'s stand-in; earlier
+  releases told an accessor by its descriptor). Linux-native bringup. New in
   0.11.0: per-name access control, service declarations, on-demand start,
   `dump`, supervisor integration, and the `rsb_service` CLI — the
   configuration file format is settling with them.
@@ -109,7 +111,8 @@ tweaks; wire formats are already locked.
   `DeathSignal`. Wire behavior is that of the synchronous calls they wrap.
 - **Fast Message Queue (new in 0.12.0)** — the `rsbinder-fmq` crate
   (`MessageQueue`, `EventFlag`, `Descriptor`, `AttachPolicy`; the synchronized
-  flavor, primitive elements, Linux and Android) and `rsbinder::fmq`, which
+  flavor, primitive elements, Linux and Android targets with 64-bit atomics)
+  and `rsbinder::fmq`, which
   re-exports it on every platform beside the AOSP parcelables `MQDescriptor`,
   `GrantorDescriptor`, `SynchronizedReadWrite`, `UnsynchronizedWrite` and
   `NativeHandle`, with the two `TryFrom` conversions between `MQDescriptor`
@@ -130,6 +133,36 @@ tweaks; wire formats are already locked.
   rsbinder on an emulator (`example-hello/cpp/run_stream_interop.sh`).
   See [Builtin AOSP Types](./aidl-data-types.md#builtin-aosp-types) and
   [Generic Parcelables](./aidl-parcelable.md#generic-parcelables).
+- **Fast Message Queue, unsynchronized flavor** — `UnsyncWriter` and
+  `UnsyncReader` of `rsbinder-fmq`, with `UnsyncCreate`, `UnsyncStart` and
+  `UnsyncRead`: one writer, any number of readers, a full ring overwrites its
+  oldest elements. The layout and the counter discipline are `libfmq`'s as of
+  `android-17.0.0_r1` (the write region end, the resume half a ring behind
+  the writer, `readLatest`), so, as for the synchronized flavor, only the
+  Rust signatures may still change. It differs from `libfmq` in the places
+  the documentation of the types names, the main ones being that the writer
+  never lowers the write region end, and that a reader maps the queue
+  read-only and resets no counter when it attaches.
+  Validated against AOSP's own `libfmq` on the host in both roles
+  (`rsbinder-fmq/tests/libfmq_host.rs`); not yet run on an Android device or
+  on AArch64.
+- **Shared-memory primitives** — the `rsbinder_fmq::shm` module, also
+  reachable as `rsbinder::fmq::shm`: `create` / `add_seals` / `seals` /
+  `Seals` (a memfd and its seals), `Mapping` / `Access`, `Run` (copies
+  through atomics, relaxed or ordered), `futex_wait` / `futex_wake` /
+  `Deadline`, `RoRun` / `RoWord32` / `RoWord64` (memory this process may
+  only read), `verify_received` (the checks on a peer's memfd before it is
+  mapped), and the fd queries `region_size`, `shrink_sealed`, `is_ashmem_fd`,
+  `ashmem_size`, `ashmem_write_protected`. This is what the queue above is built from, made public for
+  protocols of the caller's own; `rsbinder`'s shared-memory types create,
+  seal and map through it as well. It is listed apart from the queue
+  because its tier is its own: there is no wire or layout here to be faithful
+  to — the module wraps system calls — so what Provisional covers is the Rust
+  signatures. memfd, seals and futex are Linux and Android. `Mapping` needs
+  only `mmap`, so it works on macOS too (on WASI `Mapping::map` returns
+  `Unsupported`), and `Run` only atomics. `RoWord64` exists on the 64-bit
+  architectures, on 32-bit x86 with SSE2 and on 32-bit ARM with 64-bit
+  atomics.
 - **Streaming (new in 0.12.0)** — the `stream` module: `Sink`, `Receiver`,
   and the three AIDL files in `rsbinder/aidl/stream/`: the
   `rsbinder.stream.StreamEndpoint<T>` parcelable (`T` the item type; the ring's
@@ -188,14 +221,17 @@ tweaks; wire formats are already locked.
 
 ## Experimental (opt-in)
 
-Off by default, gated by a Cargo feature. Wire format and API may
-change without a deprecation cycle.
+Off by default: gated by a Cargo feature, or in a crate of its own that a
+build has to add. Wire format and API may change without a deprecation
+cycle.
 
-| Feature | Surface | Status |
+| Feature or crate | Surface | Status |
 |---------|---------|--------|
 | `rpc-tcp-debug` | `TcpDebugTransport` — plain TCP backend | Bring-up / interop only, never production. |
 | `rpc-vsock` | `VsockTransport` — host↔VM | Linux/Android only; loopback testing requires `vsock_loopback.ko`. |
 | `rpc-tls` | TLS over rustls, socket-orthogonal (tcp / unix / vsock) | Hermetic green; the `StreamOwned` decoupling (plan 2-15) has landed. Real-`libbinder` STAGE3 not yet attempted — stock emulator images ship no `libbinder_tls`. |
+| `topic` (`rsbinder-tools`) | `rsb_hub`'s registry of topic names: `[[topic]]` and `[global] topics` in its configuration, the reserved name `rsbinder.topic.registry`, `rsb_service topics`. See [Service Manager](./service-manager.md#topic-names). | Linux CI runs `rsbinder-tools`' unit tests with the feature and `tests/scripts/run_topic_registry_ac.sh` against a real hub. The configuration keys change with the registry, as `rsbinder-topic`'s AIDL does. |
+| `rsbinder-topic` (crate) | Topics: one publisher, many subscribers over kernel binder, records in shared memory the subscribers map read-only (`Publisher`, `Subscriber`, `NamedSubscriber`, loans and `Sample`). See [Topics](./topics.md). | Linux CI runs its unit and two-process tests; loom models and Miri run in the local gate. The Android CI matrix does not run it yet. The subscription AIDL and the memory layout are rsbinder's own, so no `libbinder` gate applies: the layout version is checked at each subscription, and a peer of another version is refused. |
 
 ## Non-goals
 
@@ -226,13 +262,16 @@ these types reads as intentional rather than as a gap.
   replacement to name; one that only alters a value or a behavior may be
   recorded under *Fixed* instead. *Changed* / *Removed* carry the rationale
   for the entries that have one, but not every entry appears there.
-  rsbinder runs `cargo-semver-checks` for both `rsbinder` and `rsbinder-aidl`
-  (default features and RPC features) on pull requests targeting `master`; it
+  rsbinder runs `cargo-semver-checks` for `rsbinder`, `rsbinder-aidl` and
+  `rsbinder-fmq` (default features, and `rsbinder` with the RPC features) on
+  pull requests targeting `master`; it
   reports signature changes, and cannot see a change that alters only a value
   or a behavior. Neither can your build — for those, read *Migrating* and
   *Fixed* both.
 - **Experimental** features never break the default build's wire
-  format. Enabling one is an explicit acknowledgement that the
-  corresponding interop gate has not passed.
+  format. Enabling one, or depending on an Experimental crate, is an
+  explicit acknowledgement that the corresponding interop gate has not
+  passed, or that there is none, and that its API may change in any
+  release.
 - After 1.0, all **Stable** items follow Semver strictly. Provisional
   items get re-classified as Stable or moved into a feature gate.

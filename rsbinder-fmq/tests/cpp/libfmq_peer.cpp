@@ -18,6 +18,24 @@
 // before exiting (so the mapping outlives the reader's last read); as
 // reader, `readBlocking`s count items, checks the sequence and prints
 // `sum=<total>`.
+//
+//   libfmq_peer unsync <create|attach|attach-reset> <socket path> 0 <capacity>
+//
+// The unsynchronized flavor (plan 15 AC-15.1.6). `create` makes the queue
+// with libfmq and sends the descriptor; `attach` receives one and attaches
+// with `resetPointers = false`, which is what a reader of a queue in use
+// must pass; `attach-reset` attaches with libfmq's default `true`, which
+// stores zero in the shared counters. After the "attached" byte it serves
+// commands from the socket, each one byte and little-endian u32 arguments,
+// and answers each with little-endian u32 words:
+//
+//   'A'            availableToRead()            -> count
+//   'R' n          read(buf, n)                 -> ok, then n values if ok
+//   'L' n          readLatest(buf, n)           -> count, then count values
+//   'W' n start    write(start .. start + n)    -> ok
+//   'B' n start    beginWrite(n), then fill the regions with start .. start + n -> ok
+//   'C' n          commitWrite(n)               -> ok
+//   'Q'            print "done" and exit
 
 // The libfmq headers expect these to have been included already.
 #include <algorithm>
@@ -37,12 +55,14 @@
 #include <fmq/MessageQueueBase.h>
 #include <fmq/AidlMQDescriptorShimBase.h>
 
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
 
 using android::hardware::GrantorDescriptor;
 using android::hardware::kSynchronizedReadWrite;
+using android::hardware::kUnsynchronizedWrite;
 using android::hardware::MQFlavor;
 
 // ---- the AIDL types libfmq's shim is written against, as plain structs ----
@@ -95,6 +115,7 @@ struct HostShim : public android::details::AidlMQDescriptorShimBase<T, flavor, H
 };
 
 using Queue = android::MessageQueueBase<HostShim, uint32_t, kSynchronizedReadWrite>;
+using UnsyncQueue = android::MessageQueueBase<HostShim, uint32_t, kUnsynchronizedWrite>;
 
 // ---- socket plumbing ------------------------------------------------------
 
@@ -125,7 +146,8 @@ static uint64_t get_u64(const uint8_t* p) {
     return uint64_t(get_u32(p)) | uint64_t(get_u32(p + 4)) << 32;
 }
 
-static void send_descriptor(int sock, const Queue& q) {
+template <typename Q>
+static void send_descriptor(int sock, const Q& q) {
     const auto* desc = q.getDesc();
     const native_handle_t* h = desc->handle();
     std::vector<uint8_t> body;
@@ -159,7 +181,8 @@ static void send_descriptor(int sock, const Queue& q) {
 }
 
 // Returns a shim that owns the received fds.
-static HostShim<uint32_t, kSynchronizedReadWrite>* recv_descriptor(int sock) {
+template <MQFlavor flavor>
+static HostShim<uint32_t, flavor>* recv_descriptor(int sock) {
     std::vector<uint8_t> data(4096);
     std::vector<uint8_t> control(CMSG_SPACE(sizeof(int) * 8));
     iovec iov{data.data(), data.size()};
@@ -188,7 +211,7 @@ static HostShim<uint32_t, kSynchronizedReadWrite>* recv_descriptor(int sock) {
     uint32_t flags = get_u32(p + 8);
     uint32_t n_grantors = get_u32(p + 12);
     uint32_t n_ints = get_u32(p + 16);
-    if (flags != kSynchronizedReadWrite) { fprintf(stderr, "flavor %u\n", flags); exit(2); }
+    if (flags != flavor) { fprintf(stderr, "flavor %u\n", flags); exit(2); }
     size_t o = 20;
     std::vector<GrantorDescriptor> grantors;
     for (uint32_t i = 0; i < n_grantors; i++) {
@@ -206,7 +229,7 @@ static HostShim<uint32_t, kSynchronizedReadWrite>* recv_descriptor(int sock) {
         h->data[fds.size() + i] = int(get_u32(p + o));
         o += 4;
     }
-    return new HostShim<uint32_t, kSynchronizedReadWrite>(grantors, h, quantum);
+    return new HostShim<uint32_t, flavor>(grantors, h, quantum);
 }
 
 static void send_byte(int sock) {
@@ -260,15 +283,123 @@ static void run_reader(Queue& q, uint32_t count) {
     fflush(stdout);
 }
 
+// ---- the unsynchronized flavor ----------------------------------------------
+
+static void send_all(int sock, const std::vector<uint8_t>& bytes) {
+    size_t sent = 0;
+    while (sent < bytes.size()) {
+        ssize_t n = write(sock, bytes.data() + sent, bytes.size() - sent);
+        if (n <= 0) { perror("write"); exit(2); }
+        sent += size_t(n);
+    }
+}
+
+static uint32_t recv_u32(int sock) {
+    uint8_t b[4];
+    size_t got = 0;
+    while (got < sizeof(b)) {
+        ssize_t n = read(sock, b + got, sizeof(b) - got);
+        if (n <= 0) { perror("read"); exit(2); }
+        got += size_t(n);
+    }
+    return get_u32(b);
+}
+
+static int run_unsync(const std::string& origin, int sock, size_t capacity) {
+    UnsyncQueue* q;
+    if (origin == "create") {
+        q = new UnsyncQueue(capacity, /*configureEventFlagWord=*/false);
+        if (!q->isValid()) { fprintf(stderr, "create: invalid queue\n"); return 1; }
+        send_descriptor(sock, *q);
+    } else {
+        auto* shim = recv_descriptor<kUnsynchronizedWrite>(sock);
+        bool reset = origin == "attach-reset";
+        printf("resetPointers=%d\n", reset);
+        fflush(stdout);
+        if (reset) {
+            // The fault below is the test's expected outcome: leave no core file for it.
+            struct rlimit none = {0, 0};
+            setrlimit(RLIMIT_CORE, &none);
+        }
+        // With `reset` on a read-only queue this constructor faults: it stores to the counters.
+        q = new UnsyncQueue(*shim, reset);
+        if (!q->isValid()) { fprintf(stderr, "attach: invalid queue\n"); return 1; }
+        if (q->getQuantumCount() != capacity) {
+            fprintf(stderr, "attach: capacity %zu, expected %zu\n", q->getQuantumCount(), capacity);
+            return 1;
+        }
+    }
+    printf("capacity=%zu grantors=%zu\n", q->getQuantumCount(), q->getDesc()->countGrantors());
+    fflush(stdout);
+    send_byte(sock);  // attached (or created and described)
+
+    for (;;) {
+        uint8_t cmd;
+        if (read(sock, &cmd, 1) != 1) { fprintf(stderr, "command socket closed\n"); return 1; }
+        std::vector<uint8_t> reply;
+        switch (cmd) {
+            case 'A':
+                put_u32(reply, uint32_t(q->availableToRead()));
+                break;
+            case 'R': {
+                std::vector<uint32_t> buf(recv_u32(sock));
+                bool ok = q->read(buf.data(), buf.size());
+                put_u32(reply, ok);
+                if (ok) for (uint32_t v : buf) put_u32(reply, v);
+                break;
+            }
+            case 'L': {
+                std::vector<uint32_t> buf(recv_u32(sock));
+                size_t got = q->readLatest(buf.data(), buf.size());
+                put_u32(reply, uint32_t(got));
+                for (size_t i = 0; i < got; i++) put_u32(reply, buf[i]);
+                break;
+            }
+            case 'W': {
+                std::vector<uint32_t> buf(recv_u32(sock));
+                uint32_t start = recv_u32(sock);
+                for (size_t i = 0; i < buf.size(); i++) buf[i] = start + uint32_t(i);
+                put_u32(reply, q->write(buf.data(), buf.size()));
+                break;
+            }
+            case 'B': {
+                std::vector<uint32_t> buf(recv_u32(sock));
+                uint32_t start = recv_u32(sock);
+                for (size_t i = 0; i < buf.size(); i++) buf[i] = start + uint32_t(i);
+                UnsyncQueue::MemTransaction tx;
+                // Reserved and filled, not committed: the region end is ahead of the write counter.
+                bool ok = q->beginWrite(buf.size(), &tx) && tx.copyTo(buf.data(), 0, buf.size());
+                put_u32(reply, ok);
+                break;
+            }
+            case 'C':
+                put_u32(reply, q->commitWrite(recv_u32(sock)));
+                break;
+            case 'Q':
+                printf("done\n");
+                delete q;
+                return 0;
+            default:
+                fprintf(stderr, "command %#x\n", cmd);
+                return 2;
+        }
+        send_all(sock, reply);
+    }
+}
+
 int main(int argc, char** argv) {
     if (argc != 6) {
-        fprintf(stderr, "usage: %s <create|attach> <read|write> <socket> <count> <capacity>\n", argv[0]);
+        fprintf(stderr,
+                "usage: %s <create|attach> <read|write> <socket> <count> <capacity>\n"
+                "       %s unsync <create|attach|attach-reset> <socket> 0 <capacity>\n",
+                argv[0], argv[0]);
         return 2;
     }
     std::string origin = argv[1], role = argv[2];
     uint32_t count = uint32_t(strtoul(argv[4], nullptr, 10));
     size_t capacity = strtoul(argv[5], nullptr, 10);
     int sock = connect_unix(argv[3]);
+    if (origin == "unsync") return run_unsync(role, sock, capacity);
 
     Queue* q;
     if (origin == "create") {
@@ -276,7 +407,7 @@ int main(int argc, char** argv) {
         if (!q->isValid()) { fprintf(stderr, "create: invalid queue\n"); return 1; }
         send_descriptor(sock, *q);
     } else {
-        auto* shim = recv_descriptor(sock);
+        auto* shim = recv_descriptor<kSynchronizedReadWrite>(sock);
         q = new Queue(*shim /* resetPointers = true, libfmq's default */);
         if (!q->isValid()) { fprintf(stderr, "attach: invalid queue\n"); return 1; }
         if (q->getQuantumCount() != capacity) {

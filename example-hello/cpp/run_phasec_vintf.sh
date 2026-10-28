@@ -8,6 +8,9 @@
 #   `hub::add_service("android.os.IAccessor/<iface>/<inst>", ...)`,
 #   and a VINTF `<accessor>` entry on the device tells servicemanager
 #   "service `<pkg>.<iface>/<inst>` is reachable via that accessor".
+#   The accessor reports the service name as its instance, which an
+#   rsbinder client checks (libbinder checks it on its injected
+#   accessors only).
 #   A real-libbinder client then asks for the *service* name and
 #   `AServiceManager_waitForService` transparently returns the RPC
 #   root — no manual `BpAccessor::from_binder` dance.
@@ -180,7 +183,7 @@ esac
 
 echo "==> [8/8] starting rsbinder server + running Phase C client"
 adb -s "$DEVICE" shell "pkill -9 -f rpc_accessor_register_interop_server 2>/dev/null; rm -f $SOCK; sleep 1" || true
-adb -s "$DEVICE" shell "nohup /data/local/tmp/rpc_accessor_register_interop_server '$INSTANCE' '$SOCK' 2 > /data/local/tmp/phasec_srv.stdout 2> /data/local/tmp/phasec_srv.stderr &" &
+adb -s "$DEVICE" shell "nohup /data/local/tmp/rpc_accessor_register_interop_server '$SERVICE_NAME' '$SOCK' 2 '$INSTANCE' > /data/local/tmp/phasec_srv.stdout 2> /data/local/tmp/phasec_srv.stderr &" &
 sleep 3
 ready=$(adb -s "$DEVICE" shell "cat /data/local/tmp/phasec_srv.stdout 2>/dev/null" | tr -d '\r')
 if [[ "$ready" != *"READY"* ]]; then

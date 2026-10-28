@@ -156,6 +156,51 @@ fn cmd_connection(name: &str) -> ExitCode {
     }
 }
 
+/// The names under `prefix` of the topic registry `rsb_hub` serves with its `topic` feature.
+#[cfg(feature = "topic")]
+fn cmd_topics(prefix: &str) -> ExitCode {
+    let resolver = match rsbinder_topic::registry::RegistryResolver::find() {
+        Ok(resolver) => resolver,
+        Err(status) => {
+            eprintln!(
+                "rsb_service: no topic registry: {status} (rsb_hub serves one with its `topic` \
+                 feature, to callers its policy lets find it)"
+            );
+            return ExitCode::from(exit::ERR);
+        }
+    };
+    match resolver.list(prefix) {
+        Ok(mut topics) => {
+            topics.sort_by(|a, b| a.name.cmp(&b.name));
+            let width = topics
+                .iter()
+                .map(|t| t.name.len())
+                .max()
+                .unwrap_or(0)
+                .max(4);
+            println!(
+                "{:width$}  {:>6}  {:>8}  {:>9}  WATCHERS",
+                "NAME", "UID", "PID", "AGE"
+            );
+            for topic in &topics {
+                let age = format!("{:.1}s", topic.ageMillis as f64 / 1000.0);
+                println!(
+                    "{:width$}  {:>6}  {:>8}  {:>9}  {}",
+                    topic.name, topic.uid as u32, topic.pid, age, topic.watchers
+                );
+            }
+            ExitCode::from(exit::OK)
+        }
+        Err(status) => {
+            let code = report("ITopicRegistry.list", &status);
+            if status.exception_code() == ExceptionCode::Security {
+                eprintln!("  Listing topic names is `[global] topics`.");
+            }
+            code
+        }
+    }
+}
+
 /// `dumpsys <service>`: sends a dup of stdout, since the parcel closes the fd it carries.
 fn cmd_dump(name: &str, args: &[String]) -> ExitCode {
     let Some(binder) = hub::check_service(name) else {
@@ -184,6 +229,12 @@ fn cmd_dump(name: &str, args: &[String]) -> ExitCode {
                 eprintln!(
                     "  The service refused the dump. For rsb_hub itself this is the \
                      `list` permission; see `rsb_hub --help`."
+                );
+            }
+            if code == rsbinder::StatusCode::WouldBlock {
+                eprintln!(
+                    "  The service is still writing an earlier dump. rsb_hub writes one at a \
+                     time, and its log names the caller whose dump it is."
                 );
             }
             ExitCode::from(exit::ERR)
@@ -284,12 +335,33 @@ fn cli() -> clap::Command {
             Exit status: 0 the answer is yes, 1 the answer is no, 2 the question \n    \
             could not be answered (no service manager, or its policy denied it).",
         )
+        // Also without the feature, hidden: a usage error would exit 2 with nothing said of why.
+        .subcommand(
+            clap::Command::new("topics")
+                .about(
+                    "List the topic names of rsb_hub's topic registry: name uid pid age watchers",
+                )
+                .hide(!cfg!(feature = "topic"))
+                .arg(
+                    clap::Arg::new("prefix")
+                        .value_name("PREFIX")
+                        .index(1)
+                        .default_value("")
+                        .help("Only list the names that start with this"),
+                ),
+        )
 }
 
 fn main() -> ExitCode {
     let matches = cli().get_matches();
 
     env_logger::init();
+
+    #[cfg(not(feature = "topic"))]
+    if matches.subcommand_name() == Some("topics") {
+        eprintln!("rsb_service: built without the `topic` feature, so it has no `topics`");
+        return ExitCode::from(exit::ERR);
+    }
 
     let device = matches
         .get_one::<String>("device")
@@ -341,6 +413,11 @@ fn main() -> ExitCode {
                 .unwrap_or_default();
             cmd_dump(&name_of(m), &args)
         }
+        #[cfg(feature = "topic")]
+        Some(("topics", m)) => cmd_topics(
+            m.get_one::<String>("prefix")
+                .expect("prefix has a default value"),
+        ),
         // Unreachable: `subcommand_required` rejects this before we get here.
         _ => ExitCode::from(exit::ERR),
     }

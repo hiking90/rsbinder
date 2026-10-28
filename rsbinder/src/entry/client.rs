@@ -243,7 +243,7 @@ pub(crate) fn open_staged(
         let cfg = rpc_setup(&uri, &o).map_err(setup)?;
         let session = rpc_connect(cfg, &uri, &o).map_err(|code| (OpenStage::Connect, code))?;
         return Ok(Client {
-            endpoint: uri.endpoint.clone(),
+            endpoint: uri.endpoint,
             inner: Inner::Rpc(session),
         });
     }
@@ -291,7 +291,7 @@ fn kernel_open(uri: Uri, o: ClientOptions) -> Result<Client> {
             super::server::kernel_init(driver, k.threads(), mmap_size)?;
             crate::ProcessState::start_thread_pool();
             Ok(Client {
-                endpoint: uri.endpoint.clone(),
+                endpoint: uri.endpoint,
                 inner: Inner::Kernel,
             })
         }
@@ -498,7 +498,7 @@ fn client_config<'a>(
                 })?;
                 let name = o.tls_server_name.as_deref().unwrap_or(host);
                 // `TlsTransport::connect_stream`'s refusal (same code), made before connecting.
-                if rustls::pki_types::ServerName::try_from(name.to_string()).is_err() {
+                if rustls::pki_types::ServerName::try_from(name).is_err() {
                     log::error!("rsbinder::Client::open: invalid TLS server name {name:?}");
                     return Err(StatusCode::RpcError);
                 }
@@ -545,7 +545,7 @@ impl Client {
     /// service is registered (AOSP `waitForService`); RPC: one lookup in
     /// the server's directory ([`StatusCode::NameNotFound`] if absent).
     pub fn get<T: FromIBinder + ?Sized>(&self, name: &str) -> Result<Strong<T>> {
-        FromIBinder::try_from(self.binder(name)?)
+        self.binder(name)?.into_interface_checked()
     }
 
     /// Non-waiting form of [`get`](Self::get): `Ok(None)` when `name` is
@@ -555,7 +555,7 @@ impl Client {
             Inner::Kernel => crate::hub::try_get_interface(name),
             #[cfg(feature = "rpc")]
             Inner::Rpc(s) => match s.get_service(name) {
-                Ok(b) => FromIBinder::try_from(b).map(Some),
+                Ok(b) => b.into_interface_checked().map(Some),
                 Err(StatusCode::NameNotFound) => Ok(None),
                 Err(e) => Err(e),
             },

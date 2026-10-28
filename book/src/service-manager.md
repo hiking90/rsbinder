@@ -400,9 +400,8 @@ if declared {
 }
 ```
 
-On Linux with `rsb_hub`, this **always** returns `false` because `rsb_hub`
-has no VINTF parser and no manifest concept ([rsb_hub.rs](https://github.com/hiking90/rsbinder/blob/master/rsbinder-tools/src/bin/rsb_hub.rs)
-implements `isDeclared` as `Ok(false)`). On Android, it reflects the device's
+On Linux with `rsb_hub`, it answers from the `[[service]]` declarations
+([below](#declaring-services)). On Android, it reflects the device's
 hardware interface declarations.
 
 ## Debug Information
@@ -552,6 +551,92 @@ $ sudo rsb_device binder --group binder --mode 0660
 An LSM (SELinux, AppArmor) can sit on top as a third, AND-ed layer where the
 platform provides one, but it is never what makes the first two unnecessary.
 
+### Topic names
+
+Built with its `topic` feature (`cargo build -p rsbinder-tools --features
+topic`, off by default while `rsbinder-topic` is Experimental), `rsb_hub`
+serves a registry of topic names under `rsbinder.topic.registry` (see
+[Topics](./topics.md#a-registry-of-topic-names)). It registers the registry
+before it reports `READY=1`. A client reaches the registry by looking its name
+up, so the `[[rule]]` that covers `rsbinder.topic.registry` decides who may
+use the registry at all, and the topic rules decide what each caller may do
+there. They sit in the same files:
+
+```toml
+[global]
+# Who may list topic names at all. Omitted means nobody.
+topics = { group = ["sensors"] }
+
+[[topic]]
+name = "sensors.*"
+advertise = { user = ["sensord"] }
+subscribe = { group = ["sensors"] }
+```
+
+| Permission | Gates |
+|---|---|
+| `advertise` | giving a name to a topic (`advertise`); taking it back needs the uid and the topic that hold the name instead |
+| `subscribe` | `lookup` and `watch`, and every notice a watch is sent |
+| `list` (`[global] topics`) | `list` — a single global gate; the names it returns are filtered by `subscribe` too |
+
+`[[topic]]` patterns, subjects and order work as `[[rule]]`'s do: the first
+rule whose `name` matches decides, and a name no rule covers is denied.
+Topic names are a namespace of their own: a `[[rule]]`, `name = "*"`
+included, grants no topic permission. `[global] topics` may be set in one
+file only, as `list`. Unlike `find` for a registration callback, which is
+judged once when the callback is registered, `subscribe` is judged again for
+every notice: a reload that takes it away stops a watch's notices and keeps
+the watch, and one that gives it back lets the next notice through. Under
+`--insecure-allow-all` every topic call from a caller with a uid is allowed.
+
+The name `rsbinder.topic.registry` is reserved: such a hub refuses it to
+every `add` a client asks for (`add_service`, `register_client_callback`,
+`try_unregister_service`) with `ExceptionCode::Security`, whatever the policy
+says, under `--insecure-allow-all` and `--allow-cross-uid-overwrite` too.
+Otherwise a process granted `add` on it could put its own registry in the
+hub's place, and every client would get the topics that process chose.
+
+A hub built without the feature refuses a file that holds `[[topic]]` or
+`[global] topics`: it does not start, and a `SIGHUP` keeps the policy
+already in force. On such a hub `rsbinder.topic.registry` is an ordinary
+service name, so a policy should grant no `add` on it.
+
+`rsb_service dump manager` adds a line on the registry, whether its name
+holds it and how many topic rules are in force, and its counters as
+`key=value` (`notices_failed` counts the sends of a notice that failed, for
+want of room or otherwise, those sent again included).
+
+### What a caller can hold the hub up with
+
+`rsb_hub` serves every caller on one binder thread, as Android's
+`servicemanager` does, so a call it waited in would hold up every other,
+lookups included. It makes no call that waits for an answer. It runs under
+`CallRestriction::FatalIfNotOneway`, as `servicemanager` does: a two-way
+call panics before it is sent. The calls it sends are oneway notices:
+`onRegistration` to a `register_for_notifications` callback, `onClients` to
+a `register_client_callback` callback, and with the `topic` feature the
+registry's notices to watchers.
+
+Reading a binder from a call's arguments, or casting it to an interface,
+sends nothing to the process that binder lives in: rsbinder asks a binder
+for its interface descriptor only when something first needs it, as
+libbinder does, and the hub needs none. So the calls that hand the hub a
+binder (`add_service`, `try_unregister_service`,
+`register_for_notifications`, `unregister_for_notifications` and
+`register_client_callback`, and with the `topic` feature `advertise`,
+`withdraw`, `watch` and `unwatch`) do not wait on that process, and a binder
+of a stopped process holds none of them up. The registry calls no
+publisher, and a stopped watcher cannot hold it up either: a notice it has
+no room for fails and is sent again later.
+
+`dump` does not wait on the caller either: the hub writes the dump, or the
+reason it is denied, to the caller's fd on a thread of its own and replies
+at once, and the dump ends when that thread closes the fd. It writes one
+dump at a time. A dump that arrives while one is still being written is
+refused with `WOULD_BLOCK`, so a caller that passes a pipe and never reads
+it leaves every later dump refused until the hub restarts, and the hub's
+log names that caller's uid and pid.
+
 ## Declaring services
 
 An access rule says who may use a name. A **declaration** says the name is
@@ -633,6 +718,75 @@ shell string.
 > made between the two is not caught; a path that passed can be replaced
 > only by root or by `rsb_hub`'s own uid.
 
+### Reaching an instance through an accessor
+
+An `accessor` entry makes an instance one that clients reach through an
+[`IAccessor`](./rpc-transport.md#bridging-rpc-and-the-service-manager-the-accessor-pattern):
+the service manager hands a client of the instance the binder registered
+under the accessor name, and rsbinder's lookups turn it into a connection to
+the socket the accessor serves. It is Android's VINTF `<accessor>` element:
+
+```toml
+[[service]]
+name = "com.example.IFoo/default"
+accessor = "android.os.IAccessor/IFoo/default"
+```
+
+The server builds the accessor for the instance and registers it under the
+accessor name, which is what an Android server with a VINTF entry does too:
+
+```rust
+let accessor = create_accessor("com.example.IFoo/default", provider);
+hub::add_service("android.os.IAccessor/IFoo/default", accessor)?;
+```
+
+What the declaration changes:
+
+- `try_get_service` / `wait_for_service` / `check_service` of the instance
+  (`getService2` / `checkService2` on the wire) answer with the accessor.
+  Nothing needs to be registered under the instance name. The hub makes no call on the accessor
+  binder, and a binder registered under a name no declaration names as an
+  accessor is handed out as the binder it is, whatever its interface. Only a
+  client built with rsbinder's `rpc` feature bridges the accessor; without it
+  `try_get_service` and `check_service` of the instance return nothing, and
+  `wait_for_service` keeps waiting, or, for an instance that is its own
+  accessor, returns the accessor binder (below). `rsb_service` is built without it unless
+  `rsbinder-tools`' `rpc` feature is on, so its `check` and `dump` report the
+  instance not registered; `rsb_service check` of the accessor name, when it
+  is not the instance name, shows whether the accessor is up.
+- A `getService2` / `checkService2` lookup judges `find` on both names, and
+  so do the calls Android judges
+  that way: `add_service`, `register_client_callback` and
+  `try_unregister_service` judge `add`; `register_for_notifications`,
+  `unregister_for_notifications`, `is_declared`, `get_declared_instances`,
+  `updatableViaApex` and `get_connection_info` judge `find`. A policy grants
+  the server `add` on the accessor name and clients `find` on both.
+- A `getService2` lookup (not `checkService2`) that misses the accessor
+  starts the instance's `start` entry, if it has one: what runs is the
+  process that registers the accessor.
+- With nothing registered under the accessor name, a lookup finds nothing.
+  An rsbinder client then tries the accessors its own process provides
+  (`add_accessor_provider`); libbinder does that only when the service
+  manager answers without an accessor.
+- `register_for_notifications` of an instance whose accessor has another
+  name is not told when the accessor registers, as on Android, so
+  `wait_for_service` of it finds the accessor by polling, once a second.
+- A client that speaks only `getService` (the Android 15 and earlier
+  protocols) gets the binder registered under the instance name, which is
+  usually none, judged on the instance name alone; its miss still runs the
+  instance's `start`.
+
+An instance may name itself as its accessor; the accessor binder is then
+registered under the instance name. Then `register_for_notifications` of the
+instance is told with the accessor binder itself, and a `wait_for_service`
+that the notice wakes returns that binder, not the bridged root, so
+`wait_for_interface` of the instance's interface fails with `BadType`;
+register the accessor under another name if clients wait for it. Two
+instances may not name the same accessor, and the accessor may not be a name `rsb_hub` holds (`manager`, and
+with the `topic` feature `rsbinder.topic.registry`): the configuration fails
+to load. `--insecure-allow-all` reads no configuration, so under it no
+instance has an accessor.
+
 ## Linux vs. Android Differences
 
 While rsbinder aims for API compatibility across both platforms, there are
@@ -644,6 +798,7 @@ Android's native `servicemanager`:
 | **Process**             | User-space `rsb_hub` binary             | System `servicemanager` daemon          |
 | **Access control**      | uid/group policy files ([above](#access-control)) | SELinux MAC policy                      |
 | **Service declarations** | `[[service]]` entries ([above](#declaring-services)) | VINTF manifests                        |
+| **Accessors**           | `[[service]] accessor` ([above](#reaching-an-instance-through-an-accessor)) | VINTF `<accessor>`  |
 | **Service debug info**  | Supported                               | Supported (Android 12+; not on 10/11)   |
 | **Binder device**       | Must be created with `rsb_device`       | Managed by Android init                 |
 | **Version selection**   | Always uses Android 16 protocol         | Auto-detected from SDK version          |
@@ -672,8 +827,9 @@ which only learned the AIDL-based interface in Android 11; `get_service_debug_in
 was added in Android 12. On Linux, rsbinder always uses the Android 16
 protocol — what `rsb_hub` implements — so every row in the Android 12+
 column applies. `is_declared` answers from the declarations above rather
-than from a VINTF manifest, so it is `false` only when nothing declares the
-name.
+than from a VINTF manifest, so it is `false` when nothing declares the name,
+or when the policy refuses the caller `find` on it or on its declared
+accessor; `try_is_declared` tells those apart.
 
 ## Using the ServiceManager Object Directly
 

@@ -236,7 +236,7 @@ three answers, and which one applies depends on the direction:
 
 | Direction | Mechanism | Where |
 |---|---|---|
-| kernel client → socket service | **Accessor** (`IAccessor`, Android 16 / `rsb_hub`) — the service manager hands the client a connection to the socket | [RPC Transport § Bridging](./rpc-transport.md) |
+| kernel client → socket service | **Accessor** (`IAccessor`, Android 16 / `rsb_hub`) — the service manager, told by a declaration (VINTF `<accessor>`, `[[service]] accessor`), hands the client a connection to the socket | [RPC Transport § Bridging](./rpc-transport.md) |
 | one service, both transports | **dual-hosting** — the same `Bn*` passed to two `serve(...).add(...)` calls | this chapter |
 | socket client → kernel service | **gateway** — a process that re-publishes an upstream proxy as a local service | below |
 

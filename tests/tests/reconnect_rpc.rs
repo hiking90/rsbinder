@@ -210,15 +210,8 @@ fn build_refuses_what_a_retry_cannot_fix() {
         .build()
         .err();
     assert_eq!(r, Some(StatusCode::BadValue));
-    // An RPC cast does not ask the server, so a root of another interface fails at the call.
-    let h = Reconnecting::<dyn IRpcSmoke>::builder(sock.uri())
-        .build()
-        .expect("the cast does not check the interface");
-    assert_eq!(
-        echo(&h, "x").unwrap_err().transaction_error(),
-        StatusCode::BadType
-    );
-    assert_eq!(h.generation(), 1);
+    // The connection's checked cast asks the root, so a root of another interface is refused.
+    assert_eq!(build(sock.uri()), Some(StatusCode::BadType));
 }
 
 /// AC-10b.10c: `on_connect` stops the helper only by `ConnectError::stop`.

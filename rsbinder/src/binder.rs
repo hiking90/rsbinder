@@ -157,6 +157,19 @@ pub trait Interface: Send + Sync {
     fn dump(&self, _writer: &mut dyn std::io::Write, _args: &[String]) -> Result<()> {
         Ok(())
     }
+
+    /// Dump transaction handler that owns the caller's fd.
+    ///
+    /// The binder thread calls this; the default writes through [`dump`](Self::dump)
+    /// on that thread and closes the fd when it returns. A writer that never
+    /// blocks the binder thread needs the fd itself: a caller that passes a pipe
+    /// and never reads it stops `dump` once the pipe is full, and with it every
+    /// transaction queued for that thread. Override this to hand the fd to
+    /// another thread and return; the dump stays open until that thread drops
+    /// the fd, which is the end-of-file a reader such as `dumpsys` waits for.
+    fn dump_fd(&self, fd: std::os::fd::OwnedFd, args: &[String]) -> Result<()> {
+        self.dump(&mut std::fs::File::from(fd), args)
+    }
 }
 
 /// Trait for converting a generic Binder object into a specific Binder
@@ -168,6 +181,9 @@ pub trait Interface: Send + Sync {
 /// # use rsbinder::{FromIBinder, SIBinder, Interface, Result, Strong};
 /// # trait IFoo : Interface {}
 /// impl FromIBinder for dyn IFoo {
+///     fn interface_descriptor() -> &'static str {
+///         "my.pkg.IFoo"
+///     }
 ///     fn try_from(ibinder: SIBinder) -> Result<Strong<Self>> {
 ///         // ...
 ///         # Err(rsbinder::StatusCode::Ok)
@@ -175,10 +191,19 @@ pub trait Interface: Send + Sync {
 /// }
 /// ```
 pub trait FromIBinder: Interface {
+    /// The interface descriptor of `Self`, which
+    /// [`SIBinder::into_interface_checked`] compares with the remote object's.
+    fn interface_descriptor() -> &'static str;
+
     /// Try to interpret a generic Binder object as this interface.
     ///
-    /// Returns a trait object for the `Self` interface if this object
-    /// implements that interface.
+    /// A local binder converts only if it implements this interface, and
+    /// [`StatusCode::BadType`] otherwise. A remote binder (a kernel or RPC
+    /// proxy) converts without being asked for its interface, so this makes
+    /// no transaction and decides nothing about the proxy; a remote object of
+    /// another interface refuses the first two-way call with `BadType`, as
+    /// with AOSP C++ `interface_cast`. [`SIBinder::into_interface_checked`]
+    /// asks the remote first.
     fn try_from(ibinder: SIBinder) -> Result<Strong<Self>>;
 }
 
@@ -392,7 +417,34 @@ pub trait IBinder: Any + Send + Sync {
     fn as_transactable(&self) -> Option<&dyn Transactable>;
 
     /// Retrieve the descriptor of this object.
+    ///
+    /// A local binder answers with its interface's descriptor. A proxy, kernel
+    /// or RPC, asks the remote object the first time (AOSP
+    /// `BpBinder::getInterfaceDescriptor`): that call is a two-way transaction
+    /// that waits for the remote process, so do not make it under a lock a
+    /// binder thread needs. On a kernel proxy it is subject to the thread's
+    /// [`CallRestriction`](crate::CallRestriction); an RPC call is not, as in
+    /// AOSP, but needs a connection to send on as any two-way RPC call does.
+    /// The first successful answer is cached; a failed one returns `""`.
     fn descriptor(&self) -> &str;
+
+    /// [`descriptor`](Self::descriptor), with the error of a query that failed.
+    ///
+    /// `descriptor` returns `""` both for a binder whose interface states no
+    /// descriptor and for a query that failed; a check that must tell the two
+    /// apart calls this instead.
+    fn try_descriptor(&self) -> Result<&str> {
+        Ok(self.descriptor())
+    }
+
+    /// The descriptor if it is known without a transaction, else `None`.
+    ///
+    /// For output and checks that must not wait on the remote, such as `Debug`.
+    #[doc(hidden)]
+    fn cached_descriptor(&self) -> Option<&str> {
+        Some(self.descriptor())
+    }
+
     /// Retrieve if this object is remote.
     fn is_remote(&self) -> bool;
 
@@ -546,7 +598,18 @@ pub trait IBinder: Any + Send + Sync {
 pub trait RemoteProxy {
     /// Allocate the request `Parcel`, optionally writing the AIDL
     /// interface header.
+    ///
+    /// The header carries the descriptor the proxy holds for its remote, not
+    /// the caller's interface; [`prepare_request`](Self::prepare_request)
+    /// writes the caller's, as generated proxies do.
     fn prepare_transact(&self, write_header: bool) -> Result<Parcel>;
+    /// Allocate the request `Parcel` with the AIDL interface header for
+    /// `interface`, the descriptor of the interface the caller speaks.
+    ///
+    /// Generated proxies call this with their own descriptor, as every AOSP
+    /// backend writes the proxy class's descriptor rather than the one the
+    /// remote reports; a remote of another interface refuses the token.
+    fn prepare_request(&self, interface: &str) -> Result<Parcel>;
     /// Submit the transaction and return the reply (`None` for oneway).
     fn submit_transact(
         &self,
@@ -580,34 +643,23 @@ impl dyn IBinder {
     }
 }
 
-/// Stamp the generated stub's interface descriptor onto an `RpcProxy`
-/// resolved from the RPC wire (the wire carries only an address, so
-/// such a proxy starts descriptor-less). A `#[doc(hidden)]` shim the
-/// generated `from_binder` calls unconditionally — the feature gate
-/// lives **here**, resolved against rsbinder's own `rpc` feature, not
-/// in the `macro_rules!` (where `cfg(feature = "rpc")` would wrongly
-/// resolve against the *consumer* crate). The non-`rpc` build is a
-/// zero-cost no-op, so the kernel path and `rpc`-off consumers stay
-/// byte-unaffected.
-#[doc(hidden)]
-#[cfg(feature = "rpc")]
-pub fn __rpc_stamp_descriptor(binder: &SIBinder, descriptor: &str) {
-    if let Some(rp) = (**binder).as_any().downcast_ref::<crate::rpc::RpcProxy>() {
-        rp.stamp_descriptor(descriptor);
-    }
+/// The descriptor an `INTERFACE_TRANSACTION` reply holds; null folds to `""` (AOSP readString16).
+pub(crate) fn read_interface_reply(reply: Option<Parcel>) -> Result<String> {
+    // `Ok(None)` is an error, not a panic.
+    let interface: Option<String> = reply.ok_or(StatusCode::UnexpectedNull)?.read()?;
+    Ok(interface.unwrap_or_default())
 }
 
-/// No-op shim (see the `rpc`-gated variant): keeps the generated
-/// `from_binder` compiling identically with or without `rpc`.
-#[doc(hidden)]
-#[cfg(not(feature = "rpc"))]
-pub fn __rpc_stamp_descriptor(_binder: &SIBinder, _descriptor: &str) {}
+/// `Debug`'s descriptor, never a transaction (AOSP `BPBINDER_BEST_DESCRIPTOR_LOCKED`).
+fn descriptor_for_debug(binder: &dyn IBinder) -> &str {
+    binder.cached_descriptor().unwrap_or("(not cached)")
+}
 
 impl std::fmt::Debug for dyn IBinder {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         // `as_any()` would format as the useless `Any { .. }`; show the useful fields instead.
         f.debug_struct("dyn IBinder")
-            .field("descriptor", &self.descriptor())
+            .field("descriptor", &descriptor_for_debug(self))
             .field("remote", &self.is_remote())
             .finish()
     }
@@ -650,6 +702,13 @@ pub trait Remotable: Send + Sync {
     /// `?` on a write to a pipe whose reader exited (`EPIPE`, so `DeadObject`)
     /// reaches the caller as `FailedTransaction`, which leaves its proxy alive.
     fn on_dump(&self, writer: &mut dyn std::io::Write, args: &[String]) -> Result<()>;
+
+    /// What a `DUMP_TRANSACTION` calls, with the fd it carried; the default
+    /// writes through [`on_dump`](Self::on_dump). Generated `Bn*` types forward
+    /// it to [`Interface::dump_fd`], so a service can keep the fd past the call.
+    fn on_dump_fd(&self, fd: std::os::fd::OwnedFd, args: &[String]) -> Result<()> {
+        self.on_dump(&mut std::fs::File::from(fd), args)
+    }
 
     /// The AIDL method name for a transaction code, for tracing and
     /// transaction observers. `None` when the code names no method or the
@@ -1051,10 +1110,41 @@ impl SIBinder {
     /// Try to convert this Binder object into a trait object for the given
     /// Binder interface.
     ///
-    /// If this object does not implement the expected interface, the error
-    /// `StatusCode::BadType` is returned.
+    /// A local binder that does not implement `I` is
+    /// [`StatusCode::BadType`]. A remote binder is not asked for its
+    /// interface, so this never makes a transaction and never waits on the
+    /// remote process (plan 16); see [`FromIBinder::try_from`]. Use
+    /// [`into_interface_checked`](Self::into_interface_checked) to have the
+    /// remote's interface checked first.
     pub fn into_interface<I: FromIBinder + Interface + ?Sized>(self) -> Result<Strong<I>> {
         FromIBinder::try_from(self)
+    }
+
+    /// [`into_interface`](Self::into_interface) that also asks a remote
+    /// binder for its interface descriptor and refuses another interface
+    /// with [`StatusCode::BadType`] (AOSP C++ `checked_interface_cast`).
+    ///
+    /// For a remote binder, kernel or RPC, whose descriptor is not cached
+    /// yet, this makes one two-way `INTERFACE_TRANSACTION` and waits for the
+    /// answer (see [`IBinder::try_descriptor`]); a query that fails returns
+    /// its error, such as [`StatusCode::DeadObject`]. The service manager
+    /// lookups ([`hub::check_interface`](crate::hub::check_interface) and the
+    /// like), [`connect`](crate::connect), [`Reconnecting`](crate::Reconnecting)
+    /// and `RpcSession::get_interface` cast with this.
+    pub fn into_interface_checked<I: FromIBinder + Interface + ?Sized>(self) -> Result<Strong<I>> {
+        let remote = self.as_remote().is_some();
+        let strong = FromIBinder::try_from(self.clone())?;
+        if remote {
+            let expected = I::interface_descriptor();
+            let actual = self.try_descriptor()?;
+            if actual != expected {
+                log::error!(
+                    "binder interface cast mismatch: expected `{expected}`, got `{actual}`"
+                );
+                return Err(StatusCode::BadType);
+            }
+        }
+        Ok(strong)
     }
 
     /// Register a death notification, accepting an `Arc<R>` of the concrete
@@ -1105,7 +1195,7 @@ impl SIBinder {
 impl Debug for SIBinder {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         f.debug_struct("SIBinder")
-            .field("descriptor", &self.descriptor())
+            .field("descriptor", &descriptor_for_debug(&**self))
             .field("ptr", &Arc::as_ptr(&self.inner))
             .finish()
     }
@@ -1449,8 +1539,10 @@ impl<I: FromIBinder + ?Sized> TryFrom<SIBinder> for Strong<I> {
     ///
     /// Equivalent to [`SIBinder::into_interface`] and to the
     /// [`FromIBinder::try_from`] trait method; provided so the idiomatic
-    /// `Strong::<dyn IFoo>::try_from(binder)` spelling resolves. Returns
-    /// [`StatusCode::BadType`] when the binder does not implement `I`.
+    /// `Strong::<dyn IFoo>::try_from(binder)` spelling resolves. A local
+    /// binder that does not implement `I` is [`StatusCode::BadType`]; a remote
+    /// one is not asked, so this makes no transaction (plan 16; see
+    /// [`SIBinder::into_interface_checked`]).
     fn try_from(ibinder: SIBinder) -> Result<Strong<I>> {
         FromIBinder::try_from(ibinder)
     }
@@ -1526,6 +1618,10 @@ impl<I: FromIBinder + ?Sized> Interface for Strong<I> {
 
     fn dump(&self, writer: &mut dyn std::io::Write, args: &[String]) -> Result<()> {
         (**self).dump(writer, args)
+    }
+
+    fn dump_fd(&self, fd: std::os::fd::OwnedFd, args: &[String]) -> Result<()> {
+        (**self).dump_fd(fd, args)
     }
 }
 

@@ -118,7 +118,7 @@ impl IBinder for AccessorRoot {
         self.inner_binder().ping_binder()
     }
 
-    /// The inner `RpcProxy`, so `as_remote`/`as_proxy`/`__rpc_stamp_descriptor` see its type.
+    /// The inner `RpcProxy`, so `as_remote`/`as_proxy` and generated `from_binder` see its type.
     fn as_any(&self) -> &dyn Any {
         self.inner_binder().as_any()
     }
@@ -129,6 +129,14 @@ impl IBinder for AccessorRoot {
 
     fn descriptor(&self) -> &str {
         self.inner_binder().descriptor()
+    }
+
+    fn try_descriptor(&self) -> Result<&str> {
+        self.inner_binder().try_descriptor()
+    }
+
+    fn cached_descriptor(&self) -> Option<&str> {
+        self.inner_binder().cached_descriptor()
     }
 
     fn is_remote(&self) -> bool {

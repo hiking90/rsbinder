@@ -384,7 +384,6 @@ fn rpc_call_via_generalized_remote_proxy_trait() {
 
     let client = RpcSession::new(Box::new(b), AddressSpace::Initiator).expect("RpcSession::new");
     let root = client.get_root().expect("get_root");
-    rsbinder::__rpc_stamp_descriptor(&root, ISMOKE_DESC);
 
     // `as_proxy()` is kernel-only; `as_remote()` also resolves an RPC binder.
     let remote = (*root)

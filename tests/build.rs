@@ -200,6 +200,14 @@ fn main() {
         .generate()
         .unwrap();
 
+    // Plan 16: `tests/lazy_descriptor_kernel.rs` and `tests/lazy_descriptor_rpc.rs`.
+    rsbinder_aidl::Builder::new()
+        .source(PathBuf::from("aidl/lazydesc/ILazyNode.aidl"))
+        .source(PathBuf::from("aidl/lazydesc/ILazyOther.aidl"))
+        .output(PathBuf::from("lazy_descriptor.rs"))
+        .generate()
+        .unwrap();
+
     // Plan 10-7: `stream_rpc.rs` and the kernel `stream_probe` share it, so not behind `rpc`.
     rsbinder_aidl::Builder::new()
         .source(PathBuf::from("aidl/streamdemo/IStreamDemo.aidl"))

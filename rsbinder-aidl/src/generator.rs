@@ -366,6 +366,7 @@ pub mod {{mod}} {
             impl<__RsbService, __RsbRuntime> {{crate}}::Interface for __RsbAsyncWrapper<__RsbService, __RsbRuntime> where __RsbService: {{crate}}::Interface, __RsbRuntime: ::core::marker::Send + ::core::marker::Sync {
                 fn as_binder(&self) -> {{crate}}::SIBinder { self._inner.as_binder() }
                 fn dump(&self, _writer: &mut dyn ::std::io::Write, _args: &[::std::string::String]) -> {{crate}}::Result<()> { self._inner.dump(_writer, _args) }
+                fn dump_fd(&self, _fd: ::std::os::fd::OwnedFd, _args: &[::std::string::String]) -> {{crate}}::Result<()> { self._inner.dump_fd(_fd, _args) }
             }
             impl<__RsbService, __RsbRuntime> {{bn_name}}Adapter for __RsbAsyncWrapper<__RsbService, __RsbRuntime>
             where
@@ -470,12 +471,12 @@ pub mod {{mod}} {
         {%- for member in fn_members %}
         fn build_parcel_{{ member.identifier }}({{ member.args }}) -> {{crate}}::Result<{{crate}}::Parcel> {
             {%- if member.write_funcs|length > 0 %}
-            let mut data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_transact(true)?;
+            let mut data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_request(<Self as {{crate}}::Proxy>::descriptor())?;
             {%- for func in member.write_funcs %}
             {{ func }}
             {%- endfor %}
             {%- else %}
-            let data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_transact(true)?;
+            let data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_request(<Self as {{crate}}::Proxy>::descriptor())?;
             {%- endif %}
             ::core::result::Result::Ok(data)
         }
@@ -508,7 +509,7 @@ pub mod {{mod}} {
         {%- endfor %}
         {%- if version is number %}
         fn build_parcel_getInterfaceVersion(&self) -> {{crate}}::Result<{{crate}}::Parcel> {
-            let data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_transact(true)?;
+            let data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_request(<Self as {{crate}}::Proxy>::descriptor())?;
             ::core::result::Result::Ok(data)
         }
         fn read_response_getInterfaceVersion(&self, _aidl_reply: {{crate}}::Result<::core::option::Option<{{crate}}::Parcel>>) -> {{crate}}::BinderResult<i32> {
@@ -522,7 +523,7 @@ pub mod {{mod}} {
         {%- endif %}
         {%- if hash %}
         fn build_parcel_getInterfaceHash(&self) -> {{crate}}::Result<{{crate}}::Parcel> {
-            let data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_transact(true)?;
+            let data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_request(<Self as {{crate}}::Proxy>::descriptor())?;
             ::core::result::Result::Ok(data)
         }
         fn read_response_getInterfaceHash(&self, _aidl_reply: {{crate}}::Result<::core::option::Option<{{crate}}::Parcel>>) -> {{crate}}::BinderResult<::std::string::String> {

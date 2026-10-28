@@ -7,11 +7,13 @@
 # root) against rsbinder server + rsb_hub all on the same Linux box.
 #
 # What gets exercised here that the D.9 STAGE3 (emulator) gate does
-# not: rsb_hub's `addService` descriptor auto-detect (B.6) and
-# `getService2`/`checkService2` accessor-arm vend (B.7). The D.9 path
-# uses real Android servicemanager, which already has VINTF semantics
-# rsb_hub doesn't — so D.8.b is the *only* gate where rsb_hub's
-# Phase B code runs in earnest.
+# not: rsb_hub's `[[service]] accessor` declaration (plan 16 §11), its
+# stand-in for AOSP's VINTF `<accessor>`, and the `getService2`/
+# `checkService2` accessor-arm vend. The accessor server registers its
+# `IAccessor` under ACCESSOR and reports INSTANCE as its instance; the
+# hub's configuration (`tests/policy/d8b-accessor.toml`) declares
+# INSTANCE with that accessor. D.8.b is the *only* gate where rsb_hub's
+# accessor code runs in earnest.
 #
 # Prereqs:
 #   * Linux kernel with `CONFIG_ANDROID_BINDER_IPC` (or `_RUST`) and
@@ -27,7 +29,9 @@
 
 set -euo pipefail
 
-INSTANCE=rsbinder.test.d8b.accessor
+# Both as `tests/policy/d8b-accessor.toml` and `tests/src/test_accessor_rsb_hub.rs` name them.
+INSTANCE=rsbinder.test.d8b.IInterop/default
+ACCESSOR=android.os.IAccessor/d8b/default
 SOCK=/tmp/rsacc-d8b.sock
 HUB_LOG=/tmp/rsb_hub.log
 SRV_LOG=/tmp/rsacc_d8b.log
@@ -66,7 +70,7 @@ cargo build -p example-hello --features rpc,android_16 \
 cargo test --no-run -p tests --features rpc --lib 2>&1 | tail -3
 
 echo "==> [3/4] starting rsb_hub + accessor server"
-RUST_LOG=warn nohup ./target/debug/rsb_hub --config tests/policy/permissive.toml \
+RUST_LOG=warn nohup ./target/debug/rsb_hub --config tests/policy/d8b-accessor.toml \
     > "$HUB_LOG" 2>&1 &
 HUB_PID=$!
 disown $HUB_PID || true
@@ -77,7 +81,7 @@ kill -0 $HUB_PID 2>/dev/null || {
 echo "  rsb_hub PID=$HUB_PID"
 
 RUST_LOG=warn nohup ./target/debug/rpc_accessor_register_interop_server \
-    "$INSTANCE" "$SOCK" 2 > "$SRV_LOG" 2>&1 &
+    "$INSTANCE" "$SOCK" 2 "$ACCESSOR" > "$SRV_LOG" 2>&1 &
 SRV_PID=$!
 disown $SRV_PID || true
 sleep 2
@@ -94,9 +98,9 @@ grep -q READY "$SRV_LOG" || {
     echo "ERROR: accessor server never printed READY. log:"; cat "$SRV_LOG"; exit 1
 }
 
-echo "==> [4/4] running D.8.b ignored test"
+echo "==> [4/4] running D.8.b ignored tests"
 cargo test --features rpc -p tests \
-    --lib d8b_cross_process_accessor_via_rsb_hub \
+    --lib d8b_ \
     -- --ignored --nocapture
 TEST_EXIT=$?
 

@@ -29,6 +29,12 @@
 //! start = { systemd = "example-foo.service" }
 //! # start = { exec = ["/usr/bin/exampled", "--instance", "default"] }
 //! connection = { ip = "127.0.0.1", port = 8080 }
+//!
+//! # A client of `com.example.IBar/default` gets the `IAccessor` registered
+//! # under the `accessor` name, as with AOSP's VINTF `<accessor>`.
+//! [[service]]
+//! name = "com.example.IBar/default"
+//! accessor = "android.os.IAccessor/IBar/default"
 //! ```
 //!
 //! A directory is read as every `*.toml` in it whose name does not start
@@ -37,6 +43,23 @@
 //! control precedence the way they do in any other `.d` directory.
 //! Because the evaluator stops at the **first** matching rule
 //! ([`Policy::check`]), a catch-all belongs in the highest-numbered file.
+//!
+//! With the `topic` feature the same files also hold the policy of topic
+//! names ([`TopicPolicy`]), a namespace of its own:
+//!
+//! ```toml
+//! [global]
+//! topics = { group = ["sensors"] }   # who may list topic names
+//!
+//! [[topic]]
+//! name = "sensors.*"
+//! advertise = { user = ["sensord"] }
+//! subscribe = { group = ["sensors"] }
+//! ```
+//!
+//! `[[topic]]` patterns, subjects and order follow `[[rule]]`'s, and
+//! `[global] topics` may be set in one file only, as `list`. Without the
+//! feature a file holding either is refused as one with an unknown key.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::AsFd;
@@ -47,8 +70,9 @@ use serde::Deserialize;
 
 use super::declaration::{
     is_valid_service_name, Activation, ConnectionInfo, Declaration, Declarations, InstanceName,
+    RESERVED_SERVICE_NAMES, SELF_SERVICE_NAME,
 };
-use super::policy::{NamePattern, Policy, PolicyError, Rule, Subjects};
+use super::policy::{NamePattern, Policy, PolicyError, Rule, Subjects, TopicPolicy, TopicRule};
 use super::trust::{At, Trusted};
 use crate::nss::{self, NssError};
 
@@ -79,6 +103,7 @@ impl NameResolver for SystemResolver {
 
 /// Why a policy could not be loaded.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ConfigError {
     /// The configuration path could not be read.
     #[error("cannot read configuration path {path}: {source}")]
@@ -127,6 +152,25 @@ pub enum ConfigError {
         first: PathBuf,
         /// The file that set it again.
         second: PathBuf,
+    },
+    /// `[global] topics` was set in more than one file, as
+    /// [`DuplicateGlobal`](Self::DuplicateGlobal) is for `list`.
+    #[error("[global] topics is defined in both {first} and {second}; it may only be set once")]
+    DuplicateGlobalTopics {
+        /// The file that set it first.
+        first: PathBuf,
+        /// The file that set it again.
+        second: PathBuf,
+    },
+    /// A `[[topic]]` rule's `name` pattern was rejected.
+    #[error("{path}: topic rule {index}: {source}")]
+    TopicPattern {
+        /// The offending file.
+        path: PathBuf,
+        /// Zero-based index of the `[[topic]]` rule within its file.
+        index: usize,
+        /// Why the pattern was rejected.
+        source: PolicyError,
     },
     /// The same instance is declared in two places. Ambiguity about what
     /// exists — and, with `start`, about what runs — is an error.
@@ -234,6 +278,42 @@ pub enum ConfigError {
         /// The name as written.
         name: String,
     },
+    /// An `accessor` that `addService` would refuse (see
+    /// [`is_valid_service_name`]), or a name `rsb_hub` holds itself
+    /// ([`SELF_SERVICE_NAME`], [`RESERVED_SERVICE_NAMES`]): clients
+    /// would be handed the hub's own binder as the accessor.
+    #[error(
+        "{path}: service {name:?}: accessor {accessor:?} must be a name a service can register: \
+         1 to 127 bytes of [A-Za-z0-9._/-], not one rsb_hub holds"
+    )]
+    BadAccessor {
+        /// The offending file.
+        path: PathBuf,
+        /// The instance whose `accessor` is refused.
+        name: String,
+        /// The accessor as written.
+        accessor: String,
+    },
+    /// Two instances name the same accessor. libvintf refuses this too
+    /// ("Conflicting Accessor"): an accessor serves one instance, the one
+    /// its `getInstanceName` reports.
+    #[error(
+        "services {first:?} ({}) and {second:?} ({}) both name {accessor:?} as their accessor",
+        first_path.display(),
+        second_path.display()
+    )]
+    DuplicateAccessor {
+        /// The accessor named twice.
+        accessor: String,
+        /// The instance that named it first.
+        first: String,
+        /// Where `first` is declared.
+        first_path: PathBuf,
+        /// The instance that named it again.
+        second: String,
+        /// Where `second` is declared.
+        second_path: PathBuf,
+    },
     /// A configuration path anyone but root or this process can rewrite.
     /// See [`TrustProblem`](super::TrustProblem).
     #[error("{path} is {problem}; refusing to load configuration from it")]
@@ -262,6 +342,10 @@ struct RawFile {
     rule: Vec<RawRule>,
     #[serde(default)]
     service: Vec<RawService>,
+    // Absent without the feature, so `deny_unknown_fields` refuses a `[[topic]]` there.
+    #[cfg(feature = "topic")]
+    #[serde(default)]
+    topic: Vec<RawTopicRule>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -272,6 +356,8 @@ struct RawService {
     start: Option<RawActivation>,
     #[serde(default)]
     connection: Option<RawConnection>,
+    #[serde(default)]
+    accessor: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -341,6 +427,17 @@ impl RawService {
                 })
             }
         };
+        if let Some(accessor) = &self.accessor {
+            let held = accessor == SELF_SERVICE_NAME
+                || RESERVED_SERVICE_NAMES.contains(&accessor.as_str());
+            if held || !is_valid_service_name(accessor) {
+                return Err(ConfigError::BadAccessor {
+                    path: path.to_owned(),
+                    accessor: accessor.clone(),
+                    name: self.name,
+                });
+            }
+        }
         Ok(Declaration {
             name,
             activation,
@@ -348,6 +445,7 @@ impl RawService {
                 ip: c.ip,
                 port: c.port.get().into(),
             }),
+            accessor: self.accessor,
         })
     }
 }
@@ -357,6 +455,9 @@ impl RawService {
 struct RawGlobal {
     #[serde(default)]
     list: Option<RawSubjects>,
+    #[cfg(feature = "topic")]
+    #[serde(default)]
+    topics: Option<RawSubjects>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -367,6 +468,17 @@ struct RawRule {
     add: Option<RawSubjects>,
     #[serde(default)]
     find: Option<RawSubjects>,
+}
+
+#[cfg(feature = "topic")]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTopicRule {
+    name: String,
+    #[serde(default)]
+    advertise: Option<RawSubjects>,
+    #[serde(default)]
+    subscribe: Option<RawSubjects>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -420,6 +532,7 @@ impl RawSubjects {
 }
 
 /// One file's contribution to the configuration.
+#[non_exhaustive]
 pub struct FileContents {
     /// The `[global] list` gate, if this file sets one.
     pub global_list: Option<Subjects>,
@@ -427,6 +540,11 @@ pub struct FileContents {
     pub rules: Vec<Rule>,
     /// Service declarations, paired with the full instance name they were written under.
     pub services: Vec<(String, Declaration)>,
+    /// The `[global] topics` gate, if this file sets one; always `None` without the `topic`
+    /// feature.
+    pub global_topics: Option<Subjects>,
+    /// `[[topic]]` rules, in file order; always empty without the `topic` feature.
+    pub topic_rules: Vec<TopicRule>,
 }
 
 /// Parse one configuration file, resolving every user and group name
@@ -443,18 +561,34 @@ pub fn parse_file(
         source,
     })?;
 
-    let global = match raw.global.and_then(|g| g.list) {
-        Some(list) => Some(list.resolve(path, resolver)?),
-        None => None,
+    let resolve = |subjects: Option<RawSubjects>| match subjects {
+        Some(subjects) => subjects.resolve(path, resolver).map(Some),
+        None => Ok(None),
     };
-
-    let mut services = Vec::with_capacity(raw.service.len());
-    for raw_service in raw.service {
-        let full_name = raw_service.name.clone();
-        services.push((full_name, raw_service.resolve(path)?));
+    let mut contents = FileContents {
+        global_list: None,
+        rules: Vec::with_capacity(raw.rule.len()),
+        services: Vec::with_capacity(raw.service.len()),
+        global_topics: None,
+        topic_rules: Vec::new(),
+    };
+    if let Some(global) = raw.global {
+        contents.global_list = resolve(global.list)?;
+        #[cfg(feature = "topic")]
+        {
+            contents.global_topics = resolve(global.topics)?;
+        }
     }
 
-    let mut rules = Vec::with_capacity(raw.rule.len());
+    for raw_service in raw.service {
+        let full_name = raw_service.name.clone();
+        contents
+            .services
+            .push((full_name, raw_service.resolve(path)?));
+    }
+
+    // An omitted permission denies; nothing inherits from earlier rules or `[global]`.
+    let grant = |subjects| resolve(subjects).map(Option::unwrap_or_default);
     for (index, raw_rule) in raw.rule.into_iter().enumerate() {
         let pattern =
             NamePattern::parse(&raw_rule.name).map_err(|source| ConfigError::Pattern {
@@ -462,24 +596,27 @@ pub fn parse_file(
                 index,
                 source,
             })?;
-        rules.push(Rule {
+        contents.rules.push(Rule {
             pattern,
-            // An omitted permission denies; nothing inherits from earlier rules or `[global]`.
-            add: match raw_rule.add {
-                Some(s) => s.resolve(path, resolver)?,
-                None => Subjects::None,
-            },
-            find: match raw_rule.find {
-                Some(s) => s.resolve(path, resolver)?,
-                None => Subjects::None,
-            },
+            add: grant(raw_rule.add)?,
+            find: grant(raw_rule.find)?,
         });
     }
-    Ok(FileContents {
-        global_list: global,
-        rules,
-        services,
-    })
+    #[cfg(feature = "topic")]
+    for (index, raw_rule) in raw.topic.into_iter().enumerate() {
+        let pattern =
+            NamePattern::parse(&raw_rule.name).map_err(|source| ConfigError::TopicPattern {
+                path: path.to_owned(),
+                index,
+                source,
+            })?;
+        contents.topic_rules.push(TopicRule {
+            pattern,
+            advertise: grant(raw_rule.advertise)?,
+            subscribe: grant(raw_rule.subscribe)?,
+        });
+    }
+    Ok(contents)
 }
 
 /// Walk `rel` from `start`, refusing what others can rewrite or redirect; see [`super::trust`].
@@ -575,12 +712,19 @@ fn policy_files(root: At<'_>, dir: &Trusted, our_uid: u32) -> Result<Vec<Trusted
 }
 
 /// Everything one configuration directory says.
+///
+/// Outside this crate, start from `Config::default()` and assign the fields: they grow as the
+/// configuration does, so a struct expression, `..` included, does not compile there.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Config {
     /// Who may do what.
     pub policy: Policy,
     /// What services exist, and how to start them.
     pub declarations: Declarations,
+    /// Who may do what with topic names. Empty, so denying everything, without the `topic`
+    /// feature, which alone reads `[[topic]]` and `[global] topics`.
+    pub topics: TopicPolicy,
 }
 
 /// Load the configuration from a single file or from a directory of `*.toml`.
@@ -644,6 +788,7 @@ fn load_at(
 
     let mut config = Config::default();
     let mut global_origin: Option<PathBuf> = None;
+    let mut topics_origin: Option<PathBuf> = None;
     let mut service_origin: BTreeMap<String, PathBuf> = BTreeMap::new();
 
     for entry in files {
@@ -660,7 +805,18 @@ fn load_at(
             config.policy.list = global;
             global_origin = Some(file.clone());
         }
+        if let Some(global) = contents.global_topics {
+            if let Some(first) = &topics_origin {
+                return Err(ConfigError::DuplicateGlobalTopics {
+                    first: first.clone(),
+                    second: file.clone(),
+                });
+            }
+            config.topics.list = global;
+            topics_origin = Some(file.clone());
+        }
         config.policy.rules.extend(contents.rules);
+        config.topics.rules.extend(contents.topic_rules);
         for (name, declaration) in contents.services {
             if let Some(Activation::Exec(argv)) = &declaration.activation {
                 check_exec(root, &file, &name, &argv[0], our_uid)?;
@@ -671,6 +827,17 @@ fn load_at(
                     first: first.clone(),
                     second: file.clone(),
                 });
+            }
+            if let Some(accessor) = &declaration.accessor {
+                if let Some(first) = config.declarations.accessor_for(accessor) {
+                    return Err(ConfigError::DuplicateAccessor {
+                        accessor: accessor.clone(),
+                        first_path: service_origin.get(first).cloned().unwrap_or_default(),
+                        first: first.to_owned(),
+                        second: name,
+                        second_path: file.clone(),
+                    });
+                }
             }
             service_origin.insert(name.clone(), file.clone());
             config.declarations.insert(name, declaration);
@@ -1176,6 +1343,81 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_accessor_is_read_by_instance_and_back() {
+        let d = parse_services(
+            "[[service]]\nname = \"a.IFoo/default\"\naccessor = \"android.os.IAccessor/IFoo/default\"\n\
+             [[service]]\nname = \"a.IBar/default\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            d.accessor("a.IFoo/default"),
+            Some("android.os.IAccessor/IFoo/default")
+        );
+        assert_eq!(d.accessor("a.IBar/default"), None);
+        assert_eq!(
+            d.accessor_for("android.os.IAccessor/IFoo/default"),
+            Some("a.IFoo/default")
+        );
+        assert_eq!(d.accessor_for("a.IFoo/default"), None);
+    }
+
+    /// An instance may be its own accessor: the accessor binder is registered under its name.
+    #[test]
+    fn an_instance_may_name_itself_as_its_accessor() {
+        let d = parse_services("[[service]]\nname = \"a/b\"\naccessor = \"a/b\"\n").unwrap();
+        assert_eq!(d.accessor("a/b"), Some("a/b"));
+    }
+
+    /// No `/` is needed: libvintf asks only that the accessor be non-empty.
+    #[test]
+    fn an_accessor_must_be_a_name_a_service_can_register() {
+        assert!(parse_services("[[service]]\nname = \"a/b\"\naccessor = \"plain\"\n").is_ok());
+        let mut refused = vec![
+            String::new(),
+            "has space".to_owned(),
+            "a".repeat(128),
+            SELF_SERVICE_NAME.to_owned(),
+        ];
+        refused.extend(RESERVED_SERVICE_NAMES.iter().map(|n| n.to_string()));
+        for accessor in refused {
+            let text = format!("[[service]]\nname = \"a/b\"\naccessor = \"{accessor}\"\n");
+            let err = parse_services(&text).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::BadAccessor { accessor: ref a, .. } if *a == accessor),
+                "{accessor:?}: {err:?}"
+            );
+        }
+    }
+
+    /// libvintf's "Conflicting Accessor": in one file or across two.
+    #[test]
+    fn two_instances_may_not_share_an_accessor() {
+        let one = "[[service]]\nname = \"a/one\"\naccessor = \"acc\"\n";
+        let two = "[[service]]\nname = \"a/two\"\naccessor = \"acc\"\n";
+        for (files, second_file) in [
+            (vec![("10-a.toml", format!("{one}{two}"))], "10-a.toml"),
+            (
+                vec![("10-a.toml", one.to_owned()), ("20-b.toml", two.to_owned())],
+                "20-b.toml",
+            ),
+        ] {
+            let files: Vec<(&str, &str)> = files.iter().map(|(n, t)| (*n, t.as_str())).collect();
+            let dir = ConfigDir::new("cfg-dupacc", &files);
+            let err = dir.load().unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::DuplicateAccessor {
+                        ref accessor, ref first, ref first_path, ref second, ref second_path
+                    } if accessor == "acc" && first == "a/one" && second == "a/two"
+                        && first_path.ends_with("10-a.toml") && second_path.ends_with(second_file)
+                ),
+                "{err:?}"
+            );
+        }
+    }
+
     /// Rules and declarations coexist in one file and load independently.
     #[test]
     fn rules_and_declarations_share_a_file() {
@@ -1236,6 +1478,101 @@ mod tests {
         assert!(matches!(
             dir.load(),
             Err(ConfigError::DuplicateGlobal { .. })
+        ));
+    }
+
+    /// A hub that cannot enforce topic rules must not start as if it held none.
+    #[cfg(not(feature = "topic"))]
+    #[test]
+    fn topic_rules_are_refused_without_the_feature() {
+        for text in [
+            "[[topic]]\nname = \"*\"\nsubscribe = \"any\"\n",
+            "[global]\ntopics = \"any\"\n",
+        ] {
+            let err = parse(text).unwrap_err();
+            assert!(matches!(err, ConfigError::Toml { .. }), "{text:?}: {err:?}");
+        }
+    }
+
+    #[cfg(feature = "topic")]
+    #[test]
+    fn topic_rules_parse_apart_from_service_rules() {
+        use crate::config::TopicPermission;
+        let c = parse_file(
+            Path::new("test.toml"),
+            r#"
+            [global]
+            list = "none"
+            topics = { group = ["admin"] }
+
+            [[topic]]
+            name = "sensors.*"
+            advertise = { user = ["svcuser"] }
+            subscribe = { group = ["svcgroup"] }
+
+            [[topic]]
+            name = "*"
+
+            [[rule]]
+            name = "*"
+            add = "any"
+            find = "any"
+            "#,
+            &FakeResolver,
+        )
+        .expect("must parse");
+        let topics = TopicPolicy {
+            list: c.global_topics.expect("[global] topics"),
+            rules: c.topic_rules,
+        };
+        assert!(topics.check(TopicPermission::Advertise, "sensors.a", &subject(1000, &[])));
+        assert!(topics.check(TopicPermission::Subscribe, "sensors.a", &subject(2, &[50])));
+        assert!(!topics.check(TopicPermission::Subscribe, "sensors.a", &subject(1000, &[])));
+        // An omitted permission denies, and the service catch-all opens no topic.
+        assert!(!topics.check(TopicPermission::Advertise, "other", &subject(1000, &[])));
+        assert!(topics.check(TopicPermission::List, "", &subject(3, &[51])));
+        assert_eq!(c.global_list, Some(Subjects::None));
+        assert_eq!(c.rules.len(), 1);
+    }
+
+    #[cfg(feature = "topic")]
+    #[test]
+    fn a_bad_topic_pattern_or_key_is_rejected() {
+        let err = parse("[[topic]]\nname = \"a\"\n\n[[topic]]\nname = \"*.bad\"\n").unwrap_err();
+        assert!(
+            matches!(err, ConfigError::TopicPattern { index: 1, .. }),
+            "{err:?}"
+        );
+        // A service rule's key is a typo in a topic rule.
+        let err = parse("[[topic]]\nname = \"*\"\nfind = \"any\"\n").unwrap_err();
+        assert!(matches!(err, ConfigError::Toml { .. }), "{err:?}");
+    }
+
+    /// `[global]` merges by field: `list` and `topics` may sit in different files, each once.
+    #[cfg(feature = "topic")]
+    #[test]
+    fn global_topics_may_be_set_in_one_file_only() {
+        let apart = ConfigDir::new(
+            "cfg-topics-apart",
+            &[
+                ("10-a.toml", "[global]\nlist = \"any\"\n"),
+                ("20-b.toml", "[global]\ntopics = \"any\"\n"),
+            ],
+        );
+        let config = apart.load().expect("one field per file loads");
+        assert_eq!(config.policy.list, Subjects::Any);
+        assert_eq!(config.topics.list, Subjects::Any);
+
+        let twice = ConfigDir::new(
+            "cfg-topics-twice",
+            &[
+                ("10-a.toml", "[global]\ntopics = \"any\"\n"),
+                ("20-b.toml", "[global]\ntopics = \"none\"\n"),
+            ],
+        );
+        assert!(matches!(
+            twice.load(),
+            Err(ConfigError::DuplicateGlobalTopics { .. })
         ));
     }
 

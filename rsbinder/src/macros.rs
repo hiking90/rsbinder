@@ -103,6 +103,10 @@ macro_rules! __declare_binder_interface {
                     self.0.as_sync().dump(_writer, _args)
                 }
 
+                fn on_dump_fd(&self, _fd: ::std::os::fd::OwnedFd, _args: &[::std::string::String]) -> $crate::Result<()> {
+                    self.0.as_sync().dump_fd(_fd, _args)
+                }
+
                 fn transaction_name(code: $crate::TransactionCode) -> ::core::option::Option<&'static str> where Self: Sized {
                     Self::__TRANSACTION_NAMES.and_then(|names| $crate::__transaction_name(names, code))
                 }
@@ -114,6 +118,10 @@ macro_rules! __declare_binder_interface {
         $(
             // Async interface trait implementations.
             impl<P: $crate::BinderAsyncPool> $crate::FromIBinder for dyn $async_interface<P> {
+                fn interface_descriptor() -> &'static str {
+                    $descriptor
+                }
+
                 fn try_from(ibinder: $crate::SIBinder) -> ::std::result::Result<$crate::Strong<dyn $async_interface<P>>, $crate::StatusCode> {
                     match <$proxy as $crate::Proxy>::from_binder(ibinder.clone()) {
                         ::core::option::Option::Some(proxy) => ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new(proxy))),
@@ -223,6 +231,10 @@ macro_rules! __declare_binder_interface {
 
             fn on_dump(&self, _writer: &mut dyn ::std::io::Write, _args: &[::std::string::String]) -> $crate::Result<()> {
                 self.0.dump(_writer, _args)
+            }
+
+            fn on_dump_fd(&self, _fd: ::std::os::fd::OwnedFd, _args: &[::std::string::String]) -> $crate::Result<()> {
+                self.0.dump_fd(_fd, _args)
             }
 
             fn transaction_name(code: $crate::TransactionCode) -> ::core::option::Option<&'static str> where Self: Sized {
@@ -414,12 +426,7 @@ macro_rules! declare_binder_interface {
             }
 
             fn from_binder(binder: $crate::SIBinder) -> ::core::option::Option<Self> {
-                // Stamps a descriptor-less RPC proxy; see `rpc::proxy` module doc "Descriptor".
-                $crate::__rpc_stamp_descriptor(&binder, $descriptor);
-                // Self-referential for a fresh `RpcProxy`: `rpc::proxy` module doc "Descriptor".
-                if binder.descriptor() != $descriptor {
-                    return ::core::option::Option::None
-                }
+                // A remote is not asked for its interface (plan 16 D1): no IPC here.
                 if binder.as_remote().is_some() {
                     ::core::option::Option::Some(Self { binder, $($fname: $finit),* })
                 } else {
@@ -446,6 +453,10 @@ macro_rules! declare_binder_interface {
         }
 
         impl $crate::FromIBinder for dyn $interface {
+            fn interface_descriptor() -> &'static str {
+                $descriptor
+            }
+
             fn try_from(binder: $crate::SIBinder) -> $crate::Result<$crate::Strong<dyn $interface>> {
                 match <$proxy as $crate::Proxy>::from_binder(binder.clone()) {
                     ::core::option::Option::Some(proxy) => ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new(proxy))),

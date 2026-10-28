@@ -323,6 +323,16 @@ jobs:
             exit 1
           }
 
+      - name: Run lazy_descriptor_kernel (receiving a binder asks nothing of its process, #[ignore]'d)
+        run: |
+          # Plan 16: a stopped process's binder, read as an argument and cast
+          # every way, holds up no receiver; the descriptor is asked once.
+          RUST_BACKTRACE=1 cargo test -p tests --test lazy_descriptor_kernel -- --ignored --test-threads=1 || {
+            echo "::error::lazy_descriptor_kernel failed"
+            cp -f rsb_hub.log artifacts/lazy-descriptor-kernel-rsb_hub.log 2>/dev/null || true
+            exit 1
+          }
+
       - name: Run fmq_binder (an FMQ descriptor across the kernel binder, #[ignore]'d)
         run: |
           # Plan 12-fmq F2. `fmq_probe serve` in a child process makes and
@@ -336,6 +346,33 @@ jobs:
           RUST_BACKTRACE=1 cargo test -p tests --test fmq_binder -- --ignored || {
             echo "::error::fmq_binder failed"
             cp -f rsb_hub.log artifacts/fmq-binder-rsb_hub.log 2>/dev/null || true
+            exit 1
+          }
+
+      - name: Run rsbinder-topic two_process (#[ignore]'d)
+        run: |
+          # Plan 15 P2b-1: a publisher and a subscriber in two processes (the
+          # test binary run again as the other one). Subscribers killed, also
+          # while they subscribe, and dropped; refusals across processes; a
+          # reply the subscriber refuses; a publisher that dies. Needs
+          # /dev/binder and the permissive rsb_hub; registers names of its
+          # own. One at a time: each counts the publisher's memfds.
+          RUST_BACKTRACE=1 cargo test -p rsbinder-topic --test two_process -- --ignored --test-threads=1 || {
+            echo "::error::rsbinder-topic two_process failed"
+            cp -f rsb_hub.log artifacts/topic-two-process-rsb_hub.log 2>/dev/null || true
+            exit 1
+          }
+
+      - name: Run rsbinder-topic registry (#[ignore]'d)
+        run: |
+          # Plan 15 P5-1b: a registry of topic names in a process of its own,
+          # with one binder thread as rsb_hub runs, registered under a name of
+          # the test's; publishers and subscribers reach it through
+          # RegistryResolver. Needs /dev/binder and the permissive rsb_hub,
+          # which has no registry of its own (one test finds none).
+          RUST_BACKTRACE=1 cargo test -p rsbinder-topic --test registry -- --ignored --test-threads=1 || {
+            echo "::error::rsbinder-topic registry failed"
+            cp -f rsb_hub.log artifacts/topic-registry-rsb_hub.log 2>/dev/null || true
             exit 1
           }
 
@@ -468,8 +505,11 @@ jobs:
       - name: Run the kernel acceptance scripts (tests/scripts/run_*_ac.sh, run_d8b_register.sh)
         # Each starts its own rsb_hub and refuses to while another runs, so
         # they follow the step above. The binaries they drive are from the
-        # workspace build at the top of this job. A device-only script must
-        # not match `run_*_ac.sh` (name it `run_*_stage3.sh`).
+        # workspace build at the top of this job, but for
+        # run_topic_registry_ac.sh's hub with the `topic` feature, which it
+        # builds into this target dir as rsb_hub_topic and removes when it
+        # ends. A device-only script must not match `run_*_ac.sh` (name it
+        # `run_*_stage3.sh`).
         run: |
           rc=0
           for s in tests/scripts/run_*_ac.sh example-hello/cpp/run_d8b_register.sh; do

@@ -64,7 +64,7 @@ pub fn get_service(sm: &BpServiceManager, name: &str) -> Option<SIBinder> {
     const RETRIES: u32 = 5;
     for attempt in 0..=RETRIES {
         let result = (|| -> Result<Option<SIBinder>> {
-            let mut data = sm.proxy().prepare_transact(true)?;
+            let mut data = sm.proxy().prepare_request(SERVICE_MANAGER_DESCRIPTOR)?;
             data.write(name)?;
             sm.transact(GET_SERVICE, &data)?.read()
         })();
@@ -95,7 +95,7 @@ pub fn get_service(sm: &BpServiceManager, name: &str) -> Option<SIBinder> {
 /// appears. (11+ can distinguish the two and so propagates `Err`.)
 pub fn try_get_service(sm: &BpServiceManager, name: &str) -> Result<Option<SIBinder>> {
     let result = (|| -> Result<Option<SIBinder>> {
-        let mut data = sm.proxy().prepare_transact(true)?;
+        let mut data = sm.proxy().prepare_request(SERVICE_MANAGER_DESCRIPTOR)?;
         data.write(name)?;
         sm.transact(GET_SERVICE, &data)?.read()
     })();
@@ -113,7 +113,7 @@ pub fn try_get_service(sm: &BpServiceManager, name: &str) -> Result<Option<SIBin
 /// exist.
 pub fn check_service(sm: &BpServiceManager, name: &str) -> Option<SIBinder> {
     let result = (|| -> Result<Option<SIBinder>> {
-        let mut data = sm.proxy().prepare_transact(true)?;
+        let mut data = sm.proxy().prepare_request(SERVICE_MANAGER_DESCRIPTOR)?;
         data.write(name)?;
         sm.transact(CHECK_SERVICE, &data)?.read()
     })();
@@ -141,7 +141,7 @@ pub fn list_services(sm: &BpServiceManager, dump_priority: i32) -> Vec<String> {
 
     loop {
         let result = (|| -> Result<Parcel> {
-            let mut data = sm.proxy().prepare_transact(true)?;
+            let mut data = sm.proxy().prepare_request(SERVICE_MANAGER_DESCRIPTOR)?;
             data.write::<i32>(&n)?;
             data.write::<i32>(&dump_priority)?;
             sm.transact(LIST_SERVICES, &data)
@@ -172,7 +172,7 @@ pub fn add_service(
     binder: SIBinder,
 ) -> std::result::Result<(), Status> {
     let result = (|| -> Result<()> {
-        let mut data = sm.proxy().prepare_transact(true)?;
+        let mut data = sm.proxy().prepare_request(SERVICE_MANAGER_DESCRIPTOR)?;
         data.write(identifier)?;
         data.write(&binder)?;
         data.write::<i32>(&ALLOW_ISOLATED_FALSE)?;
@@ -195,7 +195,7 @@ pub fn get_interface<T: FromIBinder + ?Sized>(
     name: &str,
 ) -> Result<Strong<T>> {
     match get_service(sm, name) {
-        Some(service) => FromIBinder::try_from(service),
+        Some(service) => service.into_interface_checked(),
         None => {
             log::error!("Service {name} not found");
             Err(StatusCode::NameNotFound)

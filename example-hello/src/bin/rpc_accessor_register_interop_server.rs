@@ -18,7 +18,7 @@
 //!         --bin rpc_accessor_register_interop_server
 //! adb -s emulator-5556 push <bin> /data/local/tmp/rsacc_reg_srv
 //! adb -s emulator-5556 shell /data/local/tmp/rsacc_reg_srv \
-//!     rsbinder.test.acc.reg /data/local/tmp/rsacc-reg-rpc.sock 2
+//!     rsbinder.test.acc.reg /data/local/tmp/rsacc-reg-rpc.sock 2 [REGISTER_NAME]
 //! ```
 //!
 //! Flow:
@@ -39,11 +39,13 @@
 //!      service — same shape as the consume-side launcher's, swapped sides.
 //!   6. `create_accessor(instance, addr_provider)` builds the
 //!      `LocalAccessor` `BnAccessor` binder; `hub::add_service` publishes
-//!      it to the kernel service manager as a regular service — no
-//!      VINTF `<accessor>` entry needed (the stock emulator's /system is
-//!      read-only). The libbinder client picks it up the same way the
-//!      consume-side launcher's `AServiceManager_addService` did, then
-//!      transacts `addConnection()` on it directly.
+//!      it to the kernel service manager as a regular service, under the
+//!      instance name or under `argv[4]`. Without a VINTF `<accessor>`
+//!      entry (the stock emulator's /system is read-only) the libbinder
+//!      client picks it up the same way the consume-side launcher's
+//!      `AServiceManager_addService` did, then transacts `addConnection()`
+//!      on it directly. With one, or with an `rsb_hub` declaration, the
+//!      service manager hands it to clients of the instance.
 //!   7. `RpcServer::run_background()` serves the preconnected fd; the
 //!      main thread joins the kernel-binder thread pool to keep
 //!      servicing IAccessor calls.
@@ -58,18 +60,12 @@ use rsbinder::hub::{
 use rsbinder::rpc::RpcServer;
 use rsbinder::*;
 
-/// Must match the interface descriptor the libbinder C launcher
-/// registers via `AIBinder_Class_define`, so its `writeInterfaceToken`
-/// matches what rsbinder's RPC root expects on `on_transact`.
+/// Must match the descriptor the libbinder C launcher passes to `AIBinder_Class_define`.
 const ROOT_DESC: &str = "rsbinder.test.accessor.IInterop";
 /// Transaction codes — the launcher's C side hardcodes the same.
 const TX_ECHO: TransactionCode = FIRST_CALL_TRANSACTION;
 const TX_GIVE_MARKER: TransactionCode = FIRST_CALL_TRANSACTION + 1;
-/// Hard-coded server-side marker. The libbinder client asserts byte
-/// equality after a full Parcel-body round trip — proving the AIDL
-/// `Status::Ok` + `writeString16` reply encoding rsbinder emits is the
-/// shape the real BpAccessor / NDK `AParcel_readString` decoder
-/// expects.
+/// The libbinder client checks these bytes, so a wrong reply encoding fails the run.
 const MARKER: &str = "stage3-from-rsbinder";
 
 struct Interop;
@@ -89,11 +85,7 @@ impl Remotable for Interop {
         eprintln!("[rsbinder-server] on_transact code={code:#x}");
         match code {
             TX_ECHO => {
-                // AIDL-shaped wire: caller writes one String arg; reply
-                // is `Status::Ok` + the echoed String. Mirrors the C++
-                // consume-side launcher's `TX_ECHO`
-                // (`rpc_accessor_interop_launcher.cpp`) bit-for-bit,
-                // just on the opposite side of the bridge.
+                // Same wire as `TX_ECHO` in `rpc_accessor_interop_launcher.cpp`.
                 let s: String = reader.read()?;
                 eprintln!("[rsbinder-server] TX_ECHO arg={s:?} (from real libbinder client)");
                 reply.write(&Status::from(StatusCode::Ok))?;
@@ -129,43 +121,31 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let sock_path = std::env::args()
         .nth(2)
         .unwrap_or_else(|| "/data/local/tmp/rsacc-reg-rpc.sock".to_string());
-    // argv[3] = max RPC_WIRE_PROTOCOL_VERSION offered (default 2 =
-    // android-16 v2 object-table wire). The emulator's real libbinder
-    // (API 36) has its own max=2, so negotiation picks min(2, 2) = 2.
+    // argv[3]: max RPC wire version offered; 2 is also the max of libbinder on API 36.
     let max_version: u32 = std::env::args()
         .nth(3)
         .and_then(|s| s.parse().ok())
         .unwrap_or(2);
+    // argv[4]: the name the accessor registers under (default: the instance).
+    let register_name = std::env::args().nth(4).unwrap_or_else(|| instance.clone());
 
     eprintln!(
-        "[rsbinder-server] STAGE3 register-side: instance={instance} sock={sock_path} v{max_version}"
+        "[rsbinder-server] STAGE3 register-side: instance={instance} \
+         registered as {register_name} sock={sock_path} v{max_version}"
     );
 
-    // 1) Kernel binder driver — required for `hub::add_service` to
-    //    register the IAccessor binder with the system service manager.
     ProcessState::init_default()?;
-    // 2) Kernel-binder worker threads — without these, the registered
-    //    IAccessor binder cannot answer transactions and the libbinder
-    //    client hangs in `addConnection()` (mirrors the
-    //    `ABinderProcess_startThreadPool()` call in the consume-side
-    //    launcher).
+    // Without workers the client hangs in `addConnection()` on the accessor.
     ProcessState::start_thread_pool();
 
-    // 3) RPC server on a UDS — the listener that `LocalAccessor`
-    //    `connect(2)`s into on every `addConnection()`. Both ends of
-    //    the socket pair stay inside the kernel: the accepted side
-    //    feeds the RPC accept loop, the connect side rides PFD to the
-    //    remote client.
+    // `LocalAccessor` connect(2)s to this listener and hands the client the connected fd.
     let _ = std::fs::remove_file(&sock_path);
     let server: Arc<RpcServer> = RpcServer::setup_unix_server(&sock_path)?;
     server.set_android13plus(max_version);
     server.set_root(Interface::as_binder(&Binder::new(Interop)))?;
     let _bg = server.run_background();
 
-    // 4) IAccessor binder via `LocalAccessor` (AOSP `createAccessor`
-    //    equivalent). The closure ignores the queried name — there's
-    //    exactly one instance bound to this server. AOSP's
-    //    `singleSocketConnection` does the same `connect(path)` here.
+    // One instance per server, so the provider ignores the queried name.
     let path_for_provider = PathBuf::from(&sock_path);
     let addr_provider: AccessorAddrProvider =
         Box::new(move |_name: &str| Ok(AccessorSockAddr::Unix(path_for_provider.clone())));
@@ -175,20 +155,12 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         accessor_binder.descriptor()
     );
 
-    // 5) Publish to the kernel service manager as a regular service —
-    //    the libbinder client looks it up via `AServiceManager_get*`
-    //    and then transacts `addConnection()` on it directly. No VINTF
-    //    `<accessor>` entry is needed (the stock emulator's read-only
-    //    /system blocks it anyway — same constraint the consume-side
-    //    launcher hits and works around).
-    hub::add_service(&instance, accessor_binder)?;
+    // Publish under register_name; the module doc says when a service manager vends it.
+    hub::add_service(&register_name, accessor_binder)?;
 
-    eprintln!("[rsbinder-server] addService({instance}) OK; READY (joining)");
+    eprintln!("[rsbinder-server] addService({register_name}) OK; READY (joining)");
     println!("[rsbinder-server] READY");
 
-    // 6) Block on the kernel-binder thread pool so the IAccessor
-    //    binder keeps servicing addConnection() calls. The RPC server
-    //    runs on the background thread pool spawned by
-    //    `run_background()`; the kernel-binder side runs here.
+    // The RPC server runs on `run_background()`'s threads; this one serves the accessor.
     Ok(ProcessState::join_thread_pool()?)
 }

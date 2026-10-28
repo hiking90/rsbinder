@@ -59,22 +59,14 @@ pub const GET_MEMORY: TransactionCode = FIRST_CALL_TRANSACTION;
 /// Token-only transaction: a remote binder via the proxy path, a local `Binder<T>` in-process.
 fn call(binder: &SIBinder, descriptor: &str, code: TransactionCode) -> Result<Parcel> {
     if let Some(remote) = binder.as_remote() {
-        // A known other interface is refused: the token must be `descriptor`, as AOSP writes it.
-        let actual = binder.descriptor();
-        if !actual.is_empty() && actual != descriptor {
-            log::error!("shared memory: not an {descriptor}: {actual}");
-            return Err(StatusCode::BadType);
+        // A cached other interface is refused unasked; the server's token check does the rest.
+        if let Some(actual) = binder.cached_descriptor() {
+            if actual != descriptor {
+                log::error!("shared memory: not an {descriptor}: {actual:?}");
+                return Err(StatusCode::BadType);
+            }
         }
-        // An unstamped RPC proxy stays unstamped; see `cancel_remote`.
-        #[cfg(feature = "rpc")]
-        if let Some(rp) = (**binder).as_any().downcast_ref::<crate::rpc::RpcProxy>() {
-            let data = rp.build_request(descriptor)?;
-            return rp
-                .transact(code, &data, crate::FLAG_CLEAR_BUF)?
-                .ok_or(StatusCode::UnexpectedNull);
-        }
-        let mut data = Parcel::new();
-        data.write_interface_token(descriptor)?;
+        let data = remote.prepare_request(descriptor)?;
         return remote
             .submit_transact(code, &data, crate::FLAG_CLEAR_BUF)?
             .ok_or(StatusCode::UnexpectedNull);
@@ -695,8 +687,8 @@ mod tests {
             }
         }
 
-        // Each case gets its own session, so its root proxy starts unstamped.
-        let with_root = |case: &dyn Fn(SIBinder)| {
+        // Each case gets its own session, so its root proxy starts with nothing cached.
+        let with_root = |case: &dyn Fn(&RpcSession, SIBinder)| {
             let hit = Arc::new(AtomicBool::new(false));
             let (a, b) = MemTransport::pair();
             let server = RpcSession::new(Box::new(a), AddressSpace::Acceptor).unwrap();
@@ -708,14 +700,16 @@ mod tests {
             });
             {
                 let client = RpcSession::new(Box::new(b), AddressSpace::Initiator).unwrap();
-                case(client.get_root().unwrap());
+                case(&client, client.get_root().unwrap());
+                client.close_session();
             }
             handle.join().unwrap();
             assert!(!hit.load(Ordering::SeqCst), "x.y.IFoo code 1 ran");
         };
-        // Stamped as another interface: refused before anything is sent.
-        with_root(&|root| {
-            crate::binder::__rpc_stamp_descriptor(&root, "x.y.IFoo");
+        // Known as another interface: refused before anything is sent, which would be `DeadObject`.
+        with_root(&|client, root| {
+            assert_eq!(root.try_descriptor(), Ok("x.y.IFoo"));
+            client.close_session();
             assert_eq!(
                 BpMemoryHeap::new(root.clone()).map().unwrap_err(),
                 StatusCode::BadType
@@ -725,29 +719,14 @@ mod tests {
                 StatusCode::BadType
             );
         });
-        // Unstamped: sent with the IMemoryHeap token, and the proxy is left unstamped.
-        with_root(&|root| {
-            assert!(BpMemoryHeap::new(root.clone()).map().is_err());
-            assert_eq!(root.descriptor(), "");
-        });
-        // A real heap root would answer, so `BadType` here can only be the client's refusal.
-        let (a, b) = MemTransport::pair();
-        let server = RpcSession::new(Box::new(a), AddressSpace::Acceptor).unwrap();
-        let heap = export_heap(Arc::new(MemoryHeapBase::new(page(), 0).unwrap()));
-        server.set_root(heap).unwrap();
-        let handle = std::thread::spawn(move || {
-            let _ = server.serve_blocking();
-        });
-        {
-            let client = RpcSession::new(Box::new(b), AddressSpace::Initiator).unwrap();
-            let root = client.get_root().unwrap();
-            crate::binder::__rpc_stamp_descriptor(&root, "x.y.IFoo");
+        // Not asked: sent with the IMemoryHeap token, and still not asked afterwards.
+        with_root(&|_, root| {
             assert_eq!(
-                BpMemoryHeap::new(root).map().unwrap_err(),
+                BpMemoryHeap::new(root.clone()).map().unwrap_err(),
                 StatusCode::BadType
             );
-        }
-        handle.join().unwrap();
+            assert_eq!(root.cached_descriptor(), None);
+        });
     }
 
     #[test]

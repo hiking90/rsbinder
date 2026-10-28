@@ -12,7 +12,7 @@
 //! `ProxyHandle` follows C++ `BpBinder` (`BpBinder.cpp`) for the recipient
 //! list and the obituary:
 //!
-//! - `link_to_death` and `unlink_to_death` take the `recipients` write lock
+//! - `link_to_death` and `unlink_to_death` take the `recipients` lock
 //!   before reading `obituary_sent`, as `BpBinder::linkToDeath` /
 //!   `unlinkToDeath` read `mObitsSent` inside `AutoMutex _l(mLock)`. Checking
 //!   the flag outside the lock would leave a window where `send_obituary`
@@ -142,8 +142,8 @@
 //! | Call site | Lock state | Ordering | Why |
 //! |---|---|---|---|
 //! | `submit_transact`, `dump` | none (lock-free) | `Acquire` | Pairs with the `Release` store in `send_obituary` that publishes the recipients teardown. |
-//! | `link_to_death` / `unlink_to_death` | inside `recipients` write lock | `Relaxed` | The `RwLock` acquire/release orders it against `send_obituary`'s store. |
-//! | `send_obituary` | inside `recipients` write lock | `Relaxed` | Same; the store's `Release` serves the lock-free readers only. |
+//! | `link_to_death` / `unlink_to_death` | inside `recipients` lock | `Relaxed` | The `Mutex` acquire/release orders it against `send_obituary`'s store. |
+//! | `send_obituary` | inside `recipients` lock | `Relaxed` | Same; the store's `Release` serves the lock-free readers only. |
 //!
 //! # Extension cache
 //!
@@ -193,7 +193,7 @@ use std::fmt::{Debug, Formatter};
 use std::mem::ManuallyDrop;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{self, Arc, RwLock};
+use std::sync::{self, Arc, Mutex, RwLock};
 
 use crate::process_state::{HandlePin, ProcessState};
 use crate::{binder::*, error::*, parcel::*, parcelable::DeserializeOption, thread_state};
@@ -225,11 +225,10 @@ pub struct ProxyHandle {
     handle: u32,
     /// Shared `BC_INCREFS`; its generation is this proxy's. See module doc "Proxy identity".
     pin: Arc<HandlePin>,
-    descriptor: String,
     stability: Stability,
     /// Lock-free readers `Acquire`, locked readers `Relaxed`; see the module doc table.
     obituary_sent: AtomicBool,
-    recipients: RwLock<Vec<sync::Weak<dyn DeathRecipient>>>,
+    recipients: Mutex<Vec<sync::Weak<dyn DeathRecipient>>>,
     extension: RwLock<ExtensionCache>,
     /// Set by every freeze-callback add, never cleared; while unset `Drop` skips the freeze lock.
     freeze_used: AtomicBool,
@@ -239,20 +238,15 @@ pub struct ProxyHandle {
 
 impl ProxyHandle {
     /// Sends `BC_ACQUIRE`; caller holds the proxy-cache lock and `pin`. See module doc.
-    pub(crate) fn new_acquired(
-        pin: &Arc<HandlePin>,
-        descriptor: String,
-        stability: Stability,
-    ) -> Result<Arc<Self>> {
+    pub(crate) fn new_acquired(pin: &Arc<HandlePin>, stability: Stability) -> Result<Arc<Self>> {
         let handle = pin.handle();
         thread_state::inc_strong_handle(handle)?;
         Ok(Arc::new_cyclic(|me| Self {
             handle,
             pin: Arc::clone(pin),
-            descriptor,
             stability,
             obituary_sent: AtomicBool::new(false),
-            recipients: RwLock::new(Vec::new()),
+            recipients: Mutex::new(Vec::new()),
             extension: RwLock::new(ExtensionCache::NotQueried),
             freeze_used: AtomicBool::new(false),
             me: me.clone(),
@@ -279,9 +273,38 @@ impl ProxyHandle {
         &self.pin
     }
 
-    /// Get the interface descriptor for this proxy.
+    /// The remote object's interface descriptor, or `""` if asking for it failed.
+    ///
+    /// The first call may make a two-way `INTERFACE_TRANSACTION` to the remote process and wait
+    /// for its answer; see [`try_descriptor`](Self::try_descriptor). Do not call it under a lock
+    /// another binder thread may need.
     pub fn descriptor(&self) -> &str {
-        &self.descriptor
+        self.try_descriptor().unwrap_or_else(|err| {
+            log::warn!(
+                "interface descriptor of handle {} unavailable: {err:?}",
+                self.handle
+            );
+            ""
+        })
+    }
+
+    /// The remote object's interface descriptor, asked for on the first call (AOSP
+    /// `BpBinder::getInterfaceDescriptor`).
+    ///
+    /// The first successful answer is cached for every proxy of this handle, and later calls
+    /// make no transaction. A failed query is returned as its error and not cached, so the next
+    /// call asks again. A proxy whose death notice has arrived fails with
+    /// [`StatusCode::DeadObject`] without a transaction. The query honors the calling thread's
+    /// [`CallRestriction`](crate::CallRestriction): on a `FatalIfNotOneway` thread it panics.
+    pub fn try_descriptor(&self) -> Result<&str> {
+        if let Some(descriptor) = self.pin.cached_descriptor() {
+            return Ok(descriptor);
+        }
+        if self.obituary_sent.load(Ordering::Acquire) {
+            return Err(StatusCode::DeadObject);
+        }
+        let descriptor = thread_state::query_interface(self.handle)?;
+        Ok(self.pin.cache_descriptor(descriptor))
     }
 
     /// `Weak` only for a proxy with this proxy's own handle; see module doc "Extension cache".
@@ -313,13 +336,23 @@ impl ProxyHandle {
         thread_state::transact(self.handle(), code, data, flags)
     }
 
+    /// See [`RemoteProxy::prepare_transact`]. With `write_header`, the token is
+    /// [`try_descriptor`](Self::try_descriptor), which may ask the remote for it on the first
+    /// call; a failed query is returned as its error, and no parcel is built.
     pub fn prepare_transact(&self, write_header: bool) -> Result<Parcel> {
         let mut data = Parcel::new();
 
         if write_header {
-            data.write_interface_token(self.descriptor())?;
+            data.write_interface_token(self.try_descriptor()?)?;
         }
 
+        Ok(data)
+    }
+
+    /// See [`RemoteProxy::prepare_request`].
+    pub fn prepare_request(&self, interface: &str) -> Result<Parcel> {
+        let mut data = Parcel::new();
+        data.write_interface_token(interface)?;
         Ok(data)
     }
 }
@@ -328,6 +361,9 @@ impl ProxyHandle {
 impl RemoteProxy for ProxyHandle {
     fn prepare_transact(&self, write_header: bool) -> Result<Parcel> {
         ProxyHandle::prepare_transact(self, write_header)
+    }
+    fn prepare_request(&self, interface: &str) -> Result<Parcel> {
+        ProxyHandle::prepare_request(self, interface)
     }
     fn submit_transact(
         &self,
@@ -343,7 +379,7 @@ impl ProxyHandle {
     pub(crate) fn send_obituary(&self, who: &WIBinder) -> Result<()> {
         // Mirrors C++ `BpBinder::sendObituary`; see module doc "Death notifications".
         let recipients_snapshot: Vec<sync::Weak<dyn DeathRecipient>> = {
-            let mut recipients = self.recipients.write().expect("Recipients lock poisoned");
+            let mut recipients = self.recipients.lock().expect("Recipients lock poisoned");
 
             // Checked and set under the lock (as C++), so `Relaxed` suffices.
             if self.obituary_sent.load(Ordering::Relaxed) {
@@ -454,7 +490,10 @@ impl Debug for ProxyHandle {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProxyHandle")
             .field("handle", &self.handle)
-            .field("descriptor", &self.descriptor)
+            .field(
+                "descriptor",
+                &self.pin.cached_descriptor().unwrap_or("(not cached)"),
+            )
             .field("stability", &self.stability)
             .field("obituary_sent", &self.obituary_sent)
             .finish()
@@ -551,7 +590,7 @@ impl IBinder for ProxyHandle {
     /// Register a death notification for this object.
     fn link_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()> {
         // Lock before checking `obituary_sent`; see module doc "Death notifications".
-        let mut recipients = self.recipients.write().expect("Recipients lock poisoned");
+        let mut recipients = self.recipients.lock().expect("Recipients lock poisoned");
         if self.obituary_sent.load(Ordering::Relaxed) {
             return Err(StatusCode::DeadObject);
         }
@@ -579,7 +618,7 @@ impl IBinder for ProxyHandle {
     /// once expects one callback to remain.
     fn unlink_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()> {
         // Lock before checking `obituary_sent`, as C++ `BpBinder::unlinkToDeath`.
-        let mut recipients = self.recipients.write().expect("Recipients lock poisoned");
+        let mut recipients = self.recipients.lock().expect("Recipients lock poisoned");
         if self.obituary_sent.load(Ordering::Relaxed) {
             return Err(StatusCode::DeadObject);
         }
@@ -615,9 +654,9 @@ impl IBinder for ProxyHandle {
         if !process.thread_pool_started() && process.current_threads.load(Ordering::Relaxed) == 0 {
             // AOSP's `getThreadPoolMaxTotalThreadCount() == 0` (`BpBinder.cpp:617`): no looper yet.
             log::error!(
-                "add_frozen_state_change_callback on {} but no thread serves binder: \
+                "add_frozen_state_change_callback on handle {} but no thread serves binder: \
                  notifications wait for start_thread_pool or join_thread_pool",
-                self.descriptor
+                self.handle
             );
         }
         // Before the add: a callback it delivers may remove itself before the add returns.
@@ -655,6 +694,14 @@ impl IBinder for ProxyHandle {
 
     fn descriptor(&self) -> &str {
         self.descriptor()
+    }
+
+    fn try_descriptor(&self) -> Result<&str> {
+        self.try_descriptor()
+    }
+
+    fn cached_descriptor(&self) -> Option<&str> {
+        self.pin.cached_descriptor()
     }
 
     fn is_remote(&self) -> bool {
@@ -697,8 +744,11 @@ pub trait Proxy: Sized + Interface {
     /// the same between all implementations of that interface.
     fn descriptor() -> &'static str;
 
-    /// Create a new interface from the given proxy, if it matches the expected
-    /// type of this interface.
+    /// Wrap `binder` as this interface's proxy, or `None` if it is not a remote binder.
+    ///
+    /// A proxy, kernel or RPC, is not asked for its interface, so this makes no transaction;
+    /// a remote of another interface refuses the first two-way call with `BadType`. To check
+    /// the remote's interface, use [`SIBinder::into_interface_checked`].
     fn from_binder(binder: SIBinder) -> Option<Self>;
 }
 
@@ -741,13 +791,21 @@ mod tests {
 
     /// `ProxyHandle` with no kernel refs; `mem::forget` it to skip `BC_RELEASE` and `BC_DECREFS`.
     fn synthetic_proxy(obituary_sent: bool) -> Arc<ProxyHandle> {
+        synthetic_proxy_caching(obituary_sent, Some("test"))
+    }
+
+    /// [`synthetic_proxy`] whose pin has `descriptor` cached, or nothing.
+    fn synthetic_proxy_caching(obituary_sent: bool, descriptor: Option<&str>) -> Arc<ProxyHandle> {
+        let pin = HandlePin::synthetic(1, 1);
+        if let Some(descriptor) = descriptor {
+            pin.cache_descriptor(descriptor.to_string());
+        }
         Arc::new_cyclic(|me| ProxyHandle {
             handle: 1,
-            pin: HandlePin::synthetic(1, 1),
-            descriptor: "test".to_string(),
+            pin,
             stability: Stability::Local,
             obituary_sent: AtomicBool::new(obituary_sent),
-            recipients: RwLock::new(Vec::new()),
+            recipients: Mutex::new(Vec::new()),
             extension: RwLock::new(ExtensionCache::NotQueried),
             freeze_used: AtomicBool::new(false),
             me: me.clone(),
@@ -849,6 +907,37 @@ mod tests {
         std::mem::forget(handle);
     }
 
+    /// Plan 16: printing a proxy never asks the remote, and a dead one is not asked either.
+    #[test]
+    fn an_uncached_descriptor_is_neither_printed_nor_asked_of_a_dead_proxy() {
+        let handle = synthetic_proxy_caching(true, None);
+        assert_eq!(IBinder::cached_descriptor(&*handle), None);
+        assert_eq!(
+            format!("{handle:?}"),
+            "ProxyHandle { handle: 1, descriptor: \"(not cached)\", stability: Local, \
+             obituary_sent: true }"
+        );
+        let sib = SIBinder::from_arc(handle.clone() as Arc<dyn IBinder>);
+        assert!(format!("{sib:?}").contains("(not cached)"), "{sib:?}");
+        // Handle 1 names nothing in this process: a query would fail with another code.
+        assert_eq!(handle.try_descriptor(), Err(StatusCode::DeadObject));
+        assert_eq!(handle.descriptor(), "");
+
+        std::mem::forget(sib);
+        std::mem::forget(handle);
+    }
+
+    /// The first answer stored is the one every later call sees (AOSP `getInterfaceDescriptor`).
+    #[test]
+    fn the_first_cached_descriptor_is_kept() {
+        let handle = synthetic_proxy_caching(true, Some("first"));
+        assert_eq!(handle.pin().cache_descriptor("second".to_string()), "first");
+        assert_eq!(handle.try_descriptor(), Ok("first"));
+        assert_eq!(IBinder::cached_descriptor(&*handle), Some("first"));
+
+        std::mem::forget(handle);
+    }
+
     /// `DeadObject` without IPC, as C++ `BpBinder::transact`'s `if (mAlive)` (BpBinder.cpp:337).
     #[test]
     fn test_submit_transact_fast_fails_when_obituary_sent() {
@@ -894,7 +983,7 @@ mod tests {
         let proxy = synthetic_proxy(false);
         let (_arc, weak) = live_recipient_pair();
         {
-            let mut recipients = proxy.recipients.write().expect("recipients lock");
+            let mut recipients = proxy.recipients.lock().expect("recipients lock");
             recipients.push(weak.clone());
             recipients.push(weak.clone());
         }
@@ -902,7 +991,7 @@ mod tests {
         let result = proxy.unlink_to_death(weak.clone());
         assert!(matches!(result, Ok(())), "expected Ok, got {result:?}");
 
-        let recipients = proxy.recipients.read().expect("recipients lock");
+        let recipients = proxy.recipients.lock().expect("recipients lock");
         assert_eq!(
             recipients.len(),
             1,
@@ -928,7 +1017,7 @@ mod tests {
             "expected NameNotFound, got {result:?}"
         );
         assert!(
-            proxy.recipients.read().expect("recipients lock").is_empty(),
+            proxy.recipients.lock().expect("recipients lock").is_empty(),
             "recipients vec must remain empty"
         );
         std::mem::forget(proxy);
@@ -1002,7 +1091,7 @@ mod tests {
             "expected BadValue, got {result:?}"
         );
         assert!(
-            proxy.recipients.read().expect("recipients lock").is_empty(),
+            proxy.recipients.lock().expect("recipients lock").is_empty(),
             "dead-weak rejection must not push a recipient"
         );
         std::mem::forget(proxy);
@@ -1061,7 +1150,7 @@ mod tests {
         let (_a_arc, a_weak) = live_recipient_pair();
         let (_b_arc, b_weak) = live_recipient_pair();
         {
-            let mut recipients = proxy.recipients.write().expect("recipients lock");
+            let mut recipients = proxy.recipients.lock().expect("recipients lock");
             recipients.push(a_weak.clone());
         }
 
@@ -1071,7 +1160,7 @@ mod tests {
             "expected NameNotFound, got {result:?}"
         );
 
-        let recipients = proxy.recipients.read().expect("recipients lock");
+        let recipients = proxy.recipients.lock().expect("recipients lock");
         assert_eq!(recipients.len(), 1, "registered recipient must survive");
         assert!(
             sync::Weak::ptr_eq(&recipients[0], &a_weak),

@@ -32,10 +32,14 @@ tokio = { workspace = true, features = ["rt-multi-thread", "time", "macros"] }
 env_logger = { workspace = true }
 # `mm`: `src/fmq_peer.rs` maps a queue's fd to damage its counters. `net`: the
 # relay in `tests/stream_rpc.rs` carries `SCM_RIGHTS` across, as a ring's memfd needs.
-rustix = { workspace = true, features = ["pipe", "param", "mm", "net"] }
+# `process`: `tests/lazy_descriptor_kernel.rs` stops a node with `SIGSTOP`.
+rustix = { workspace = true, features = ["pipe", "param", "mm", "net", "process"] }
 async-trait = { workspace = true }
 log.workspace = true
 tracing = { workspace = true, optional = true }
+# `src/bin/topic_probe.rs`, the client of `rsb_hub`'s topic registry in
+# `tests/scripts/run_topic_registry_ac.sh`; its sync API is all it uses.
+rsbinder-topic = { version = "0.12.0", path = "../rsbinder-topic", default-features = false }
 
 # Mesh integration node: one binary, configured by argv into a kernel
 # and/or RPC role. Driven by `tests/mesh_rpc.rs` (+ `mesh_kernel.rs`).
@@ -75,6 +79,11 @@ required-features = ["rpc"]
 [[test]]
 name = "reconnect_rpc"
 path = "tests/reconnect_rpc.rs"
+required-features = ["rpc"]
+
+[[test]]
+name = "lazy_descriptor_rpc"
+path = "tests/lazy_descriptor_rpc.rs"
 required-features = ["rpc"]
 
 # Plan 10-10b kernel tests: a service the tests kill and restart, so the

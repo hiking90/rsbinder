@@ -21,6 +21,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 rsbinder = { path = "../rsbinder", features = ["rpc", "android_16", "fuzzing"] }
+rsbinder-topic = { path = "../rsbinder-topic", features = ["fuzzing"] }
 
 [[bin]]
 name = "rpc_frame_decode"
@@ -88,6 +89,13 @@ bench = false
 [[bin]]
 name = "data_parcel_decode"
 path = "fuzz_targets/data_parcel_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "topic_recv"
+path = "fuzz_targets/topic_recv.rs"
 test = false
 doc = false
 bench = false

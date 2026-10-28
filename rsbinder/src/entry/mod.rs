@@ -76,7 +76,7 @@ pub fn serve(uri: impl Into<Uri>) -> Result<Server> {
 /// up. The returned proxy keeps its RPC session alive — nothing else needs
 /// to be held.
 pub fn connect<T: FromIBinder + ?Sized>(uri: impl Into<Uri>) -> Result<Strong<T>> {
-    FromIBinder::try_from(connect_binder(uri)?)
+    connect_binder(uri)?.into_interface_checked()
 }
 
 /// [`connect`] without the interface cast.

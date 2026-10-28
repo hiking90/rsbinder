@@ -81,7 +81,7 @@ pub mod ITestService {
     }
     impl BpTestService {
         fn build_parcel_ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut ::std::vec::Vec<bool>) -> rsbinder::Result<rsbinder::Parcel> {
-            let mut data = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.prepare_transact(true)?;
+            let mut data = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.prepare_request(<Self as rsbinder::Proxy>::descriptor())?;
             data.write(_arg_input)?;
             data.write_slice_size(::core::option::Option::Some(_arg_repeated))?;
             ::core::result::Result::Ok(data)
@@ -100,7 +100,7 @@ pub mod ITestService {
             ::core::result::Result::Ok(_aidl_return)
         }
         fn build_parcel_RepeatNullableIntArray(&self, _arg_input: ::core::option::Option<&[i32]>) -> rsbinder::Result<rsbinder::Parcel> {
-            let mut data = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.prepare_transact(true)?;
+            let mut data = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.prepare_request(<Self as rsbinder::Proxy>::descriptor())?;
             data.write(&_arg_input)?;
             ::core::result::Result::Ok(data)
         }
@@ -117,7 +117,7 @@ pub mod ITestService {
             ::core::result::Result::Ok(_aidl_return)
         }
         fn build_parcel_FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable) -> rsbinder::Result<rsbinder::Parcel> {
-            let mut data = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.prepare_transact(true)?;
+            let mut data = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.prepare_request(<Self as rsbinder::Proxy>::descriptor())?;
             data.write(_arg_parcel)?;
             ::core::result::Result::Ok(data)
         }
@@ -379,7 +379,7 @@ pub mod FixedSizeArrayExample {
         }
         impl BpRepeatFixedSizeArray {
             fn build_parcel_Repeat2dParcelables(&self, _arg_input: &[[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &mut [[super::IntParcelable::IntParcelable; 3]; 2]) -> rsbinder::Result<rsbinder::Parcel> {
-                let mut data = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.prepare_transact(true)?;
+                let mut data = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.prepare_request(<Self as rsbinder::Proxy>::descriptor())?;
                 data.write(_arg_input)?;
                 ::core::result::Result::Ok(data)
             }

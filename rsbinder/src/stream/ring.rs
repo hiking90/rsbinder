@@ -4,10 +4,11 @@
 //! The ring path (kernel binder, or an opted-in Unix RPC session): records on an FMQ ring.
 
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use rsbinder_fmq::shm::spin::{spin_budget, spin_until, SpinGauge, SPIN_CLOCK_EVERY};
 use rsbinder_fmq::{AttachPolicy, Descriptor, EventFlag, MessageQueue, NOT_EMPTY, NOT_FULL};
 
 use crate::binder::Interface;
@@ -42,28 +43,8 @@ const END_FIELDS: usize = 8;
 /// Bytes of message an end record can carry within the reserve.
 const END_MESSAGE_MAX: usize = END_RESERVE - HEADER - END_FIELDS;
 
-/// How long a side looks at the ring before it parks; a park costs a wake syscall on each side.
-const SPIN: Duration = Duration::from_micros(20);
-/// Full spins in a row that found nothing, after which a side parks without spinning.
-const WASTED_SPINS: u32 = 64;
-/// While a side parks without spinning, every this many waits spin in full to see if they pay.
-const PROBE_EVERY: u32 = 8;
-/// Looks between clock reads while spinning.
-const SPIN_CLOCK_EVERY: u32 = 32;
 /// Bytes a refill lets build while the producer adds: reading right behind it steals its line.
 const MIN_BATCH: usize = 4096;
-
-/// The spin for a wait ending at `deadline`; none on one core, where spinning holds up the peer.
-fn spin_budget(deadline: Option<Instant>) -> Duration {
-    static MULTICORE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let multicore =
-        *MULTICORE.get_or_init(|| std::thread::available_parallelism().is_ok_and(|n| n.get() > 1));
-    match deadline {
-        _ if !multicore => Duration::ZERO,
-        Some(deadline) => SPIN.min(deadline.saturating_duration_since(Instant::now())),
-        None => SPIN,
-    }
-}
 
 /// `EventFlag::wake_lazy` where the hardware also orders it against a libfmq waiter, else `wake`.
 fn wake_after_commit(flag: &EventFlag, bits: u32) -> rsbinder_fmq::Result<()> {
@@ -77,113 +58,6 @@ fn wake_after_commit(flag: &EventFlag, bits: u32) -> rsbinder_fmq::Result<()> {
         flag.wake_lazy(bits)
     } else {
         flag.wake(bits)
-    }
-}
-
-/// One of this process's concurrent spins: a spin pays only while its peer runs, so half the cores.
-struct SpinSlot;
-
-static SPINNERS: AtomicUsize = AtomicUsize::new(0);
-
-impl SpinSlot {
-    fn take() -> Option<SpinSlot> {
-        static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let max = *MAX.get_or_init(|| {
-            std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1))
-        });
-        if SPINNERS.fetch_add(1, Ordering::Relaxed) >= max {
-            SPINNERS.fetch_sub(1, Ordering::Relaxed);
-            return None;
-        }
-        Some(SpinSlot)
-    }
-}
-
-impl Drop for SpinSlot {
-    fn drop(&mut self) {
-        SPINNERS.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
-/// Look until `done` holds or `budget` passes: whether it held, and the budget spun (zero when
-/// no slot was free). The caller has just looked once.
-fn spin_until(budget: Duration, mut done: impl FnMut() -> bool) -> (bool, Duration) {
-    if budget.is_zero() {
-        return (false, budget);
-    }
-    // A first round touches nothing shared; on a busy ring most spins end in it.
-    for _ in 0..SPIN_CLOCK_EVERY {
-        std::hint::spin_loop();
-        if done() {
-            return (true, budget);
-        }
-    }
-    let Some(_slot) = SpinSlot::take() else {
-        return (false, Duration::ZERO);
-    };
-    let start = Instant::now();
-    loop {
-        for _ in 0..SPIN_CLOCK_EVERY {
-            std::hint::spin_loop();
-            if done() {
-                return (true, budget);
-            }
-        }
-        if start.elapsed() >= budget {
-            return (false, budget);
-        }
-    }
-}
-
-/// One side's spin, off after `WASTED_SPINS` misses until a quick wake or probe (plan 10-7c D13).
-#[derive(Default)]
-struct SpinGauge {
-    wasted: AtomicU32,
-    /// Waits parked without a spin since the last probe.
-    skipped: AtomicU32,
-}
-
-impl SpinGauge {
-    /// This wait's spin; counts the wait while the spin is off.
-    fn budget(&self, deadline: Option<Instant>) -> Duration {
-        if self.is_off() {
-            let skipped = self.skipped.load(Ordering::Relaxed) + 1;
-            if skipped < PROBE_EVERY {
-                self.skipped.store(skipped, Ordering::Relaxed);
-                return Duration::ZERO;
-            }
-            self.skipped.store(0, Ordering::Relaxed);
-        }
-        spin_budget(deadline)
-    }
-
-    fn is_off(&self) -> bool {
-        self.wasted.load(Ordering::Relaxed) >= WASTED_SPINS
-    }
-
-    /// A spin of `budget` ended, `found` or not. One a near deadline cut short says nothing.
-    fn spun(&self, budget: Duration, found: bool) {
-        if found {
-            self.turn_on();
-        } else if budget >= SPIN {
-            let wasted = self.wasted.load(Ordering::Relaxed);
-            self.wasted.store(
-                wasted.saturating_add(1).min(WASTED_SPINS),
-                Ordering::Relaxed,
-            );
-        }
-    }
-
-    /// Only a park no spin preceded: after a full spin, a quick wake is that spin's miss.
-    fn parked(&self, took: Duration) {
-        if self.is_off() && self.skipped.load(Ordering::Relaxed) > 0 && took < SPIN {
-            self.turn_on();
-        }
-    }
-
-    fn turn_on(&self) {
-        self.wasted.store(0, Ordering::Relaxed);
-        self.skipped.store(0, Ordering::Relaxed);
     }
 }
 
@@ -1394,7 +1268,7 @@ impl<T: Deserialize> Consumer<T> {
                 hook();
             }
             if outranks {
-                *end = Some(status.clone());
+                return Step::End(end.insert(status).clone());
             }
             // What was recorded is the end, as the empty-ring branch reports it.
             return Step::End(end.clone().unwrap_or(status));
@@ -1556,6 +1430,7 @@ impl<T> Drop for Consumer<T> {
 #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 mod tests {
     use super::*;
+    use rsbinder_fmq::shm::spin::SPIN;
     #[cfg(feature = "tokio")]
     use std::future::Future;
     use std::sync::atomic::AtomicUsize;
@@ -2106,95 +1981,6 @@ mod tests {
                 "item {item} took {took:?}"
             );
         }
-    }
-
-    /// With every spin slot taken, a spin ends after its first round and reports no spin.
-    #[test]
-    fn a_spin_with_no_free_slot_reports_no_spin() {
-        if spin_budget(None) < SPIN {
-            return;
-        }
-        // Other tests' waits only skip their spins meanwhile.
-        SPINNERS.fetch_add(1 << 20, Ordering::Relaxed);
-        let unspun = spin_until(SPIN, || false);
-        let mut looks = 0;
-        let caught = spin_until(SPIN, || {
-            looks += 1;
-            looks == 3
-        });
-        SPINNERS.fetch_sub(1 << 20, Ordering::Relaxed);
-        assert_eq!(unspun, (false, Duration::ZERO));
-        assert_eq!(caught, (true, SPIN), "the first round needs no slot");
-    }
-
-    /// Plan 10-7c D13: a spin a deadline cut short and a slow wake change nothing.
-    #[test]
-    fn the_spin_turns_off_after_wasted_spins_and_back_on_after_a_quick_wake() {
-        if spin_budget(None) < SPIN {
-            return; // One core: no spin to turn off.
-        }
-        let gauge = SpinGauge::default();
-        for _ in 0..WASTED_SPINS - 1 {
-            gauge.spun(SPIN, false);
-        }
-        gauge.spun(SPIN / 2, false);
-        gauge.parked(Duration::from_millis(1));
-        assert_eq!(
-            gauge.budget(None),
-            SPIN,
-            "one wasted full spin short of the limit"
-        );
-        gauge.spun(SPIN, false);
-        gauge.parked(Duration::from_micros(1));
-        assert_eq!(
-            gauge.budget(None),
-            Duration::ZERO,
-            "a quick wake after a wasted full spin keeps it off"
-        );
-        gauge.spun(Duration::ZERO, false);
-        gauge.parked(Duration::from_millis(1));
-        assert_eq!(
-            gauge.budget(None),
-            Duration::ZERO,
-            "a slow wake keeps it off"
-        );
-        gauge.parked(Duration::from_micros(1));
-        assert_eq!(gauge.budget(None), SPIN, "a wake a spin would have caught");
-        for _ in 0..WASTED_SPINS - 1 {
-            gauge.spun(SPIN, false);
-        }
-        gauge.spun(SPIN, true);
-        gauge.spun(SPIN, false);
-        assert_eq!(gauge.budget(None), SPIN, "a find starts the count over");
-    }
-
-    /// Plan 10-7c D13: no quick wake needed, which an emulator's wakes never are.
-    #[test]
-    fn a_spin_turned_off_is_probed_and_a_probe_that_finds_turns_it_on() {
-        if spin_budget(None) < SPIN {
-            return;
-        }
-        let gauge = SpinGauge::default();
-        for _ in 0..WASTED_SPINS {
-            gauge.spun(SPIN, false);
-        }
-        for round in 0..2 {
-            for wait in 1..PROBE_EVERY {
-                let budget = gauge.budget(None);
-                assert_eq!(budget, Duration::ZERO, "round {round}, wait {wait}");
-                gauge.spun(budget, false);
-                gauge.parked(Duration::from_millis(1));
-            }
-            assert_eq!(gauge.budget(None), SPIN, "round {round}: the probe");
-            if round == 0 {
-                gauge.spun(SPIN, false);
-                gauge.parked(Duration::from_micros(1));
-                assert!(gauge.is_off(), "a probe that finds nothing keeps it off");
-            }
-        }
-        gauge.spun(SPIN, true);
-        assert!(!gauge.is_off());
-        assert_eq!(gauge.budget(None), SPIN);
     }
 
     /// Plan 10-7c D13: items further apart than a spin turn the consumer's spin off.

@@ -45,13 +45,15 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
-      - name: Check semver (rsbinder + rsbinder-aidl)
+      - name: Check semver (rsbinder + rsbinder-aidl + rsbinder-fmq)
         uses: obi1kenobi/cargo-semver-checks-action@v2
         with:
-          # The two published library crates whose public API stability
+          # The published library crates whose public API stability
           # matters to downstream consumers. `rsbinder-tools` is binaries
-          # only, no library surface.
-          package: rsbinder,rsbinder-aidl
+          # only, no library surface. `rsbinder-fmq` is checked by name:
+          # `rsbinder` re-exports it with a glob, which this check does
+          # not follow into the other crate.
+          package: rsbinder,rsbinder-aidl,rsbinder-fmq
           # `default` profile already exercises the common surface; the
           # RPC stack has its own dedicated stability discussion (see
           # RpcServer::set_max_threads rustdoc) and is checked under
@@ -83,11 +85,16 @@ jobs:
     # one: everything RPC — including `to_bytes`/`from_bytes`, which need
     # the session-less parcel mode — would otherwise change unobserved.
     #
+    # `rsbinder-fmq` has a golden of its own: `rsbinder::fmq` re-exports it
+    # with a glob, which the `rsbinder` goldens record as one line, so an
+    # item added to `rsbinder_fmq::shm` would show in neither.
+    #
     # To update after an intentional change, run the same commands and
     # commit the result:
     #
     #   cargo +nightly-2026-05-25 public-api -p rsbinder --simplified > api/rsbinder.txt
     #   cargo +nightly-2026-05-25 public-api -p rsbinder --simplified --features rpc > api/rsbinder-rpc.txt
+    #   cargo +nightly-2026-05-25 public-api -p rsbinder-fmq --simplified > api/rsbinder-fmq.txt
     #
     # Both the toolchain and the tool version are pinned because the
     # rendering is not stable across either; bumping one means
@@ -109,6 +116,8 @@ jobs:
           diff -u api/rsbinder.txt /tmp/public-api.txt
           cargo public-api -p rsbinder --simplified --features rpc > /tmp/public-api-rpc.txt
           diff -u api/rsbinder-rpc.txt /tmp/public-api-rpc.txt
+          cargo public-api -p rsbinder-fmq --simplified > /tmp/public-api-fmq.txt
+          diff -u api/rsbinder-fmq.txt /tmp/public-api-fmq.txt
 
   test:
     name: Test Suite
@@ -241,11 +250,25 @@ jobs:
         # the C header's peer with the runner's own `cc` and `c++` (plan
         # 10-7b P4).
         run: cargo test -p rsbinder-fmq
+      - name: Topic tests (hermetic — plan 15)
+        # Needs memfd only: the ring's writer and reader over heap memory and
+        # over two mappings of one memfd, forged memory images, the layout of
+        # the two memory objects, and the subscription call between a
+        # publisher and a subscriber of one process, which reach each other
+        # without binder (and an RPC binder, refused). The two-process tests
+        # are `#[ignore]`d and run in integration-test.yml. Its loom models
+        # and its run under Miri are in `scripts/local_gate.sh`, as
+        # `rsbinder-fmq`'s are.
+        run: cargo test -p rsbinder-topic
       - name: rsbinder-tools unit tests (hermetic)
         # The `rsb_hub` configuration parser, policy and enforcer, the NSS
         # and notify helpers, and the three binaries' own tests: none opens
-        # the binder device, so the whole package runs here.
-        run: cargo test -p rsbinder-tools
+        # the binder device, so the whole package runs here. Once more with
+        # `topic`: its `[[topic]]` parse, the reserved registry name and the
+        # name rule shared with `rsbinder-topic` are tested under that feature.
+        run: |
+          cargo test -p rsbinder-tools
+          cargo test -p rsbinder-tools --features topic
 
   rpc-suite:
     name: RPC Transport Suite
@@ -337,7 +360,8 @@ jobs:
           cargo test -p tests --features rpc --test rpc_generated_stub --test entry_rpc --test gateway_rpc --test codegen_shapes \
             --test rpc_async --test rpc_calling_identity --test rpc_enforce_permission_deny \
             --test work_source_rpc --test observer_rpc --test transaction_names \
-            --test transport_caps --test cancel_rpc --test stream_rpc --test reconnect_rpc
+            --test transport_caps --test cancel_rpc --test stream_rpc --test reconnect_rpc \
+            --test lazy_descriptor_rpc
           cargo test -p tests --features rpc-tcp-debug --test rpc_generated_stub
           # `aidl_spans` installs a global `tracing` subscriber, so it needs
           # the `tracing` feature on top of `rpc`.
@@ -537,9 +561,14 @@ jobs:
         # path either.
         run: cargo test -p rsbinder-aidl
       - name: Fast Message Queue on a target without one (plan 12 AC-12.8)
-        # The crate compiles everywhere; off Linux/Android every constructor
-        # returns `Unsupported`, and that is the one test that runs here.
+        # macOS has `shm::Mapping` and `shm::Run` but no memfd or futex: the
+        # queue's constructors and those `shm` functions return `Unsupported`,
+        # and the mapping and run tests run here.
         run: cargo test -p rsbinder-fmq
+      - name: Topics on a target without memfd (plan 15 AC-15.2.40)
+        # The ring's writer and reader run here over heap memory; making or
+        # mapping topic memory or a control page returns `Unsupported`.
+        run: cargo test -p rsbinder-topic
 
   android-build:
     name: Android Build

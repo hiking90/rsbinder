@@ -176,7 +176,7 @@ pub async fn wait_for_interface_async<T: FromIBinder + ?Sized + 'static>(
                 end.log(&name);
                 StatusCode::NameNotFound
             })?;
-        FromIBinder::try_from(binder)
+        binder.into_interface_checked()
     })
     .await;
     res.unwrap_or_else(|e| Err(join_error_status(e)))

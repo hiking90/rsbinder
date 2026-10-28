@@ -1,13 +1,12 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::ptr::NonNull;
 use std::sync::atomic::{fence, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
-use crate::sys::{self, Mapping, Timespec};
+use crate::shm::{self, Deadline, Mapping};
 
 /// libfmq `FMQ_NOT_FULL`: the reader sets it after consuming, the writer
 /// waits on it when the ring is full.
@@ -17,13 +16,8 @@ pub const NOT_FULL: u32 = 0x01;
 pub const NOT_EMPTY: u32 = 0x02;
 
 struct Inner {
-    _mapping: Mapping,
-    word: NonNull<AtomicU32>,
+    mapping: Mapping,
 }
-
-// SAFETY: `word` points into `_mapping`, owned by `Inner`, and is touched only as `AtomicU32`.
-unsafe impl Send for Inner {}
-unsafe impl Sync for Inner {}
 
 /// A handle on the queue's 32-bit EventFlag word: the futex both peers wait
 /// on and wake through (libfmq `EventFlag`, `EventFlag.cpp`).
@@ -53,22 +47,18 @@ pub struct EventFlag {
 
 impl EventFlag {
     pub(crate) fn from_mapping(mapping: Mapping) -> Self {
-        let word = mapping.ptr().cast::<AtomicU32>();
         debug_assert_eq!(
-            word.as_ptr() as usize % std::mem::align_of::<AtomicU32>(),
+            mapping.as_ptr().as_ptr() as usize % std::mem::align_of::<AtomicU32>(),
             0
         );
         Self {
-            inner: Arc::new(Inner {
-                _mapping: mapping,
-                word,
-            }),
+            inner: Arc::new(Inner { mapping }),
         }
     }
 
     fn word(&self) -> &AtomicU32 {
         // SAFETY: in `inner`'s mapping, 4-aligned (grantor offsets are 8-aligned), atomic-only.
-        unsafe { self.inner.word.as_ref() }
+        unsafe { self.inner.mapping.as_ptr().cast::<AtomicU32>().as_ref() }
     }
 
     pub(crate) fn reset(&self) {
@@ -120,11 +110,11 @@ impl EventFlag {
     /// indefinitely; otherwise [`Error::TimedOut`]
     /// once it elapses. `bits == 0` is rejected.
     pub fn wait(&self, bits: u32, timeout: Option<Duration>) -> Result<u32> {
-        self.wait_until(bits, sys::deadline_after(timeout)?)
+        self.wait_until(bits, timeout.and_then(Deadline::after))
     }
 
     /// [`wait`](Self::wait) against an absolute deadline, so a retry loop keeps one deadline.
-    pub(crate) fn wait_until(&self, bits: u32, deadline: Option<Timespec>) -> Result<u32> {
+    pub(crate) fn wait_until(&self, bits: u32, deadline: Option<Deadline>) -> Result<u32> {
         wait_until(self.word(), bits, deadline.as_ref())
     }
 
@@ -141,7 +131,7 @@ pub(crate) trait FlagWord {
     fn load(&self, order: Ordering) -> u32;
     fn fence(&self, order: Ordering);
     /// Sleep while the word holds `expected`, until a wake on `bits` or `deadline`.
-    fn futex_wait(&self, expected: u32, bits: u32, deadline: Option<&Timespec>) -> Result<()>;
+    fn futex_wait(&self, expected: u32, bits: u32, deadline: Option<&Deadline>) -> Result<()>;
     fn futex_wake(&self, bits: u32) -> Result<()>;
 }
 
@@ -158,11 +148,11 @@ impl FlagWord for AtomicU32 {
     fn fence(&self, order: Ordering) {
         fence(order);
     }
-    fn futex_wait(&self, expected: u32, bits: u32, deadline: Option<&Timespec>) -> Result<()> {
-        sys::futex_wait(self, expected, bits, deadline)
+    fn futex_wait(&self, expected: u32, bits: u32, deadline: Option<&Deadline>) -> Result<()> {
+        shm::futex_wait(self, expected, bits, deadline)
     }
     fn futex_wake(&self, bits: u32) -> Result<()> {
-        sys::futex_wake(self, bits)
+        shm::futex_wake(self, bits)
     }
 }
 
@@ -191,7 +181,7 @@ pub(crate) fn wake_lazy<W: FlagWord + ?Sized>(word: &W, bits: u32) -> Result<()>
 pub(crate) fn wait_until<W: FlagWord + ?Sized>(
     word: &W,
     bits: u32,
-    deadline: Option<&Timespec>,
+    deadline: Option<&Deadline>,
 ) -> Result<u32> {
     if bits == 0 {
         return Err(Error::BadValue("empty bit mask"));

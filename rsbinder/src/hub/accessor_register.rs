@@ -38,9 +38,9 @@
 //! `name`. `add_accessor_provider`, `remove_accessor_provider` and
 //! `resolve_via_process_local` are the rsbinder counterparts.
 //!
-//! The registry is one process-wide `Mutex<Vec<_>>`, built lazily through a
-//! `OnceLock` so a process that never adds, removes or looks up a provider
-//! never allocates it, and walked on add, remove and lookup. Lookup follows AOSP
+//! The registry is one process-wide `Mutex<Vec<_>>`, empty until a provider is
+//! added, so a process that never adds one never allocates, and walked on add,
+//! remove and lookup. Lookup follows AOSP
 //! `getInjectedAccessor` (`IServiceManager.cpp:284-312`): it snapshots the
 //! matching entries' `Arc` callbacks under the lock, releases the lock,
 //! then calls each closure until one returns `Some(binder)` — no callback
@@ -424,7 +424,7 @@ pub type AccessorAddrProvider = Box<dyn Fn(&str) -> Result<AccessorSockAddr> + S
 // --- process-local AccessorProvider registry (AOSP mapping: module doc) ----
 
 use std::collections::HashSet;
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Weak};
 
 /// Closure type for [`add_accessor_provider`]. Maps an instance name
 /// to an `IAccessor` `SIBinder` (typically built via
@@ -444,10 +444,10 @@ struct AccessorProviderEntry {
 }
 
 /// AOSP `gAccessorProviders`; no closure runs under this lock (module doc, registry section).
-static REGISTRY: OnceLock<std::sync::Mutex<Vec<AccessorProviderEntry>>> = OnceLock::new();
+static REGISTRY: std::sync::Mutex<Vec<AccessorProviderEntry>> = std::sync::Mutex::new(Vec::new());
 
 fn registry() -> &'static std::sync::Mutex<Vec<AccessorProviderEntry>> {
-    REGISTRY.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+    &REGISTRY
 }
 
 /// AOSP `isInstanceProvidedLocked` (`IServiceManager.cpp:359-366`); caller holds the lock.

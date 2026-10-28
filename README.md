@@ -19,12 +19,14 @@ If you'd rather use C++ on Linux, see [binder-linux](https://github.com/hiking90
 * **rsbinder** — the binder library: services, clients, parcels, async.
 * **[rsbinder-aidl][rsbinder-aidl-readme]** — AIDL → Rust code generator.
 * **[rsbinder-macros][rsbinder-macros-readme]** — `#[rsbinder::interface]`: declare an interface as a Rust trait, without `.aidl`.
-* **[rsbinder-fmq][rsbinder-fmq-readme]** — Android's Fast Message Queue (`libfmq`), independent of binder.
+* **[rsbinder-fmq][rsbinder-fmq-readme]** — Android's Fast Message Queue (`libfmq`), independent of binder, and the shared-memory primitives under it.
+* **[rsbinder-topic][rsbinder-topic-readme]** — one publisher, many subscribers over kernel binder, records in shared memory (experimental).
 * **[rsbinder-tools][rsbinder-tools-readme]** — `rsb_hub` (service manager for Linux), `rsb_device`, `rsb_service`.
 
 [rsbinder-aidl-readme]: https://github.com/hiking90/rsbinder/blob/master/rsbinder-aidl/README.md
 [rsbinder-macros-readme]: https://github.com/hiking90/rsbinder/blob/master/rsbinder-macros/README.md
 [rsbinder-fmq-readme]: https://github.com/hiking90/rsbinder/blob/master/rsbinder-fmq/README.md
+[rsbinder-topic-readme]: https://github.com/hiking90/rsbinder/blob/master/rsbinder-topic/README.md
 [rsbinder-tools-readme]: https://github.com/hiking90/rsbinder/blob/master/rsbinder-tools/README.md
 
 ## Features

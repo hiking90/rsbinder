@@ -173,7 +173,7 @@ use std::os::linux::net::SocketAddrExt;
 use std::os::unix::net::SocketAddr as UnixSocketAddr;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -436,7 +436,7 @@ pub struct RpcServer {
     named: Arc<Mutex<HashMap<String, SIBinder>>>,
     /// Directory root over `named`, built once; `add_service` installs it as the root.
     directory: SIBinder,
-    max_threads: Mutex<u32>,
+    max_threads: AtomicU32,
     /// Whether sessions advertise `Unix` FD support (default false ⇒ every FD refused).
     fd_unix_supported: AtomicBool,
     /// `None` ⇒ android-12 r34 wire; `Some(max)` ⇒ AOSP handshake negotiating `min(max, client)`.
@@ -638,7 +638,7 @@ impl RpcServer {
             root: Mutex::new(None),
             named,
             directory,
-            max_threads: Mutex::new(1),
+            max_threads: AtomicU32::new(1),
             fd_unix_supported: AtomicBool::new(false),
             wire_max_version: Mutex::new(None),
             max_connections: Mutex::new(None),
@@ -807,7 +807,7 @@ impl RpcServer {
     /// connection-per-session) are both validated against real
     /// android-13/14/15/16 libbinder peers.
     pub fn set_max_threads(&self, n: u32) {
-        *self.max_threads.lock().expect("max_threads poisoned") = n.max(1);
+        self.max_threads.store(n.max(1), Ordering::SeqCst);
     }
 
     /// Opt-in **server-side admission bound** on concurrent
@@ -1233,7 +1233,7 @@ impl RpcServer {
                 log::error!("RPC: server root rejected by the new session: {e:?}");
             }
         }
-        let max_threads = *self.max_threads.lock().expect("max_threads poisoned");
+        let max_threads = self.max_threads.load(Ordering::SeqCst);
         session.set_max_threads(max_threads);
         let reply_timeout = *self.reply_timeout.lock().expect("reply_timeout poisoned");
         session.set_timeout(reply_timeout);
@@ -2237,7 +2237,7 @@ impl RpcSession {
     /// Client: resolve a named service published via
     /// [`RpcServer::add_service`] and cast it to the interface `T`.
     ///
-    /// Convenience for `Strong::try_from(self.get_service(name)?)`, mirroring
+    /// Convenience for `self.get_service(name)?.into_interface_checked()`, mirroring
     /// [`hub::wait_for_interface`](crate::hub::wait_for_interface) on the kernel
     /// stack. Returns [`StatusCode::BadType`] if the resolved binder does not
     /// implement `T`, or any error surfaced by [`get_service`](Self::get_service).
@@ -2245,6 +2245,6 @@ impl RpcSession {
         &self,
         name: &str,
     ) -> Result<crate::Strong<T>> {
-        crate::Strong::<T>::try_from(self.get_service(name)?)
+        self.get_service(name)?.into_interface_checked()
     }
 }

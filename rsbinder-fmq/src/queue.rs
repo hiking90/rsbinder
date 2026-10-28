@@ -4,9 +4,11 @@
 use std::cell::Cell;
 use std::marker::PhantomData;
 use std::mem::size_of;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(target_has_atomic = "64")]
+pub(crate) use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::descriptor::{
@@ -14,8 +16,8 @@ use crate::descriptor::{
 };
 use crate::error::{Error, Result};
 use crate::event_flag::EventFlag;
-use crate::ring::{self, Run};
-use crate::sys::{self, Mapping};
+use crate::ring;
+use crate::shm::{self, Access, CreateOptions, Deadline, Mapping, Run, Seals};
 
 /// A type that can be an element of a [`MessageQueue`].
 ///
@@ -40,20 +42,51 @@ macro_rules! elements {
 }
 elements!(u8, i8, u16, i16, u32, i32, u64, i64, f32, f64);
 
-struct Counter {
+/// Stands in for std's `AtomicU64` on a target without one. Uninhabited: no `Counter` is made.
+#[cfg(not(target_has_atomic = "64"))]
+pub(crate) enum AtomicU64 {}
+
+#[cfg(not(target_has_atomic = "64"))]
+impl AtomicU64 {
+    fn load(&self, _: Ordering) -> u64 {
+        match *self {}
+    }
+
+    pub(crate) fn store(&self, _: u64, _: Ordering) {
+        match *self {}
+    }
+}
+
+/// `Unsupported` where no queue can exist: off Linux and Android, or without 64-bit atomics.
+pub(crate) fn check_target() -> Result<()> {
+    let runs_a_queue = cfg!(all(
+        any(target_os = "linux", target_os = "android"),
+        target_has_atomic = "64"
+    ));
+    if runs_a_queue {
+        Ok(())
+    } else {
+        Err(Error::Unsupported)
+    }
+}
+
+pub(crate) struct Counter {
     _mapping: Mapping,
     ptr: NonNull<AtomicU64>,
 }
 
 impl Counter {
-    fn map(desc: &Descriptor, g: Grantor) -> Result<Self> {
+    pub(crate) fn map(desc: &Descriptor, g: Grantor) -> Result<Self> {
+        // No `Counter` exists where `AtomicU64` is the uninhabited stand-in; `get` relies on it.
+        check_target()?;
         // Only the 8-byte word: a peer-sized extent would be the peer's choice of address space.
         let mapping = Mapping::map(
             desc.fds[g.fd_index as usize].as_fd(),
             u64::from(g.offset),
             8,
+            Access::ReadWrite,
         )?;
-        let ptr = mapping.ptr().cast::<AtomicU64>();
+        let ptr = mapping.as_ptr().cast::<AtomicU64>();
         debug_assert_eq!(ptr.as_ptr() as usize % std::mem::align_of::<AtomicU64>(), 0);
         Ok(Self {
             _mapping: mapping,
@@ -65,12 +98,50 @@ impl Counter {
         // SAFETY: in `_mapping`, 8-aligned (grantor offsets are 8-aligned), atomic-only.
         unsafe { self.ptr.as_ref() }
     }
+
+    /// The word's address, valid while this `Counter` lives.
+    pub(crate) fn address(&self) -> NonNull<AtomicU64> {
+        self.ptr
+    }
 }
 
-struct Ring {
+pub(crate) struct Ring {
     _mapping: Mapping,
-    base: NonNull<u8>,
-    bytes: usize,
+    pub(crate) base: NonNull<u8>,
+    pub(crate) bytes: usize,
+}
+
+impl Ring {
+    /// Map the data grantor `g` of a descriptor that `validate` passed or this crate laid out.
+    pub(crate) fn map(desc: &Descriptor, g: Grantor, access: Access) -> Result<Self> {
+        let mapping = Mapping::map(
+            desc.fds[g.fd_index as usize].as_fd(),
+            u64::from(g.offset),
+            g.extent,
+            access,
+        )?;
+        Ok(Self {
+            base: mapping.as_ptr(),
+            // ≤ i32::MAX: checked by `validate`, and by `ring_bytes` for a new queue.
+            bytes: g.extent as usize,
+            _mapping: mapping,
+        })
+    }
+}
+
+/// `capacity * size_of::<T>()`, within what libfmq maps and a 32-bit `usize` holds.
+pub(crate) fn ring_bytes<T: Element>(capacity: usize) -> Result<u64> {
+    let quantum = size_of::<T>();
+    if quantum == 0 {
+        return Err(Error::BadValue("zero-sized element"));
+    }
+    if capacity == 0 {
+        return Err(Error::BadValue("capacity of zero"));
+    }
+    (capacity as u64)
+        .checked_mul(quantum as u64)
+        .filter(|b| *b <= i32::MAX as u64 - rustix::param::page_size() as u64)
+        .ok_or(Error::BadValue("queue too large"))
 }
 
 /// A synchronized-flavor Fast Message Queue: one writer, one reader, a ring
@@ -98,10 +169,11 @@ struct Ring {
 /// It is not undefined behavior, since every access to the shared memory is
 /// atomic (see "Soundness" on [`Regions`]).
 ///
-/// The unsynchronized flavor is not attachable: libfmq lets any number of
-/// its readers copy while the writer may overwrite the same bytes, and
-/// detects the overwrite afterwards (`MessageQueueBase.h`); this crate
-/// implements no such detection.
+/// A descriptor of the unsynchronized flavor is refused here: that flavor
+/// has any number of readers, each with a read counter of its own, and a
+/// writer that overwrites what they have not read. It is
+/// [`UnsyncWriter`](crate::UnsyncWriter) and
+/// [`UnsyncReader`](crate::UnsyncReader).
 ///
 /// ```compile_fail,E0277
 /// fn is_sync<T: Sync>() {}
@@ -162,25 +234,26 @@ impl<T: Element> MessageQueue<T> {
     /// refuses a larger extent, and the EventFlag word's offset, an AIDL
     /// `int`, lands past the ring. [`attach`](Self::attach) caps `extent` (a `long`
     /// in AIDL) at `i32::MAX` too, so that a ring fits a 32-bit `usize`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Unsupported`] comes first: on a target that cannot run a
+    /// queue — one that is not Linux or Android, or has no 64-bit atomics —
+    /// it is returned whatever the arguments are, before any system call.
+    /// On the other targets: [`Error::BadValue`] for a zero-sized `T` or a
+    /// `capacity` outside the bounds above, then [`Error::Os`] when
+    /// creating, allocating, sealing or mapping the memfd fails.
     pub fn create(capacity: usize, event_flag: bool) -> Result<Self> {
-        let quantum = size_of::<T>();
-        if quantum == 0 {
-            return Err(Error::BadValue("zero-sized element"));
-        }
-        if capacity == 0 {
-            return Err(Error::BadValue("capacity of zero"));
-        }
-        let data_bytes = (capacity as u64)
-            .checked_mul(quantum as u64)
-            .filter(|b| *b <= i32::MAX as u64 - rustix::param::page_size() as u64)
-            .ok_or(Error::BadValue("queue too large"))?;
+        check_target()?;
+        let data_bytes = ring_bytes::<T>(capacity)?;
         let (grantors, total) = default_layout(data_bytes, event_flag);
-        let fd = sys::create_shared(total)?;
+        let fd = allocate_shared(total)?;
+        shm::add_seals(fd.as_fd(), Seals::GROW | Seals::SHRINK | Seals::SEAL)?;
         let desc = Descriptor {
             fds: vec![fd],
             ints: Vec::new(),
             grantors,
-            quantum: quantum as u32,
+            quantum: size_of::<T>() as u32,
             flavor: Flavor::SynchronizedReadWrite,
         };
         let policy = AttachPolicy {
@@ -202,7 +275,24 @@ impl<T: Element> MessageQueue<T> {
     /// duplicated; `desc` stays usable. A synchronized single-fd queue that
     /// libfmq made is within the `i32::MAX` caps (its shim bounds offsets
     /// there too); a two-fd one may exceed the `extent` cap, and an
-    /// unsynchronized one is refused.
+    /// unsynchronized one is refused
+    /// ([`UnsyncReader::attach`](crate::UnsyncReader::attach) takes it).
+    ///
+    /// On a 32-bit target the ring has one more bound. The bytes mapped for
+    /// it start at the page boundary below the data grantor's `offset`, and
+    /// [`Mapping::map`] refuses more than `isize::MAX` of them: `extent`
+    /// plus `offset` modulo the page size is at most that, or the descriptor
+    /// is `BadValue`. On 32-bit Android bionic's `mmap64` also refuses
+    /// (`ENOMEM`) a mapping whose page-rounded length is more than
+    /// `isize::MAX`.
+    ///
+    /// A descriptor in which a counter, the data or the EventFlag grantor
+    /// names a hugetlbfs fd (a memfd created `MFD_HUGETLB`) is `BadValue` as
+    /// well: [`Mapping::map`] refuses a file the kernel reports as
+    /// hugetlbfs, whose mapping it could not release. Where the kernel does
+    /// not answer that query (see [`Mapping`]) the fd is mapped like any
+    /// other, and a mapping of a hugetlbfs file stays until the process
+    /// exits.
     ///
     /// The counters are left as they are.
     ///
@@ -215,38 +305,35 @@ impl<T: Element> MessageQueue<T> {
     /// at all; an overlap that passes makes the counters fail their check
     /// or the elements wrong, not undefined behavior (see "One handle, one
     /// side").
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Unsupported`] comes first: on a target that cannot run a
+    /// queue — one that is not Linux or Android, or has no 64-bit atomics —
+    /// it is returned whatever `desc` and `policy` hold, before any system
+    /// call. On the other targets: [`Error::Os`] when an fd cannot be
+    /// duplicated, [`Error::BadValue`] for a descriptor the checks above
+    /// refuse, and [`Error::Os`] when a system call those checks or the
+    /// mappings make fails.
     pub fn attach(desc: &Descriptor, policy: &AttachPolicy) -> Result<Self> {
+        check_target()?;
         Self::open(desc.try_clone()?, policy)
     }
 
     fn open(desc: Descriptor, policy: &AttachPolicy) -> Result<Self> {
-        // Before validation: off Linux no fd is sealed, so the policy would refuse first.
-        if cfg!(not(any(target_os = "linux", target_os = "android"))) {
-            return Err(Error::Unsupported);
-        }
-        let geo = validate(&desc, size_of::<T>(), policy)?;
+        // The target's verdict comes before the descriptor's.
+        check_target()?;
+        let geo = validate(&desc, size_of::<T>(), policy, Flavor::SynchronizedReadWrite)?;
         let read = Counter::map(&desc, geo.read)?;
         let write = Counter::map(&desc, geo.write)?;
-        let ring = {
-            let g = geo.data;
-            let mapping = Mapping::map(
-                desc.fds[g.fd_index as usize].as_fd(),
-                u64::from(g.offset),
-                g.extent,
-            )?;
-            Ring {
-                base: mapping.ptr(),
-                // ≤ i32::MAX, checked by `validate`.
-                bytes: g.extent as usize,
-                _mapping: mapping,
-            }
-        };
+        let ring = Ring::map(&desc, geo.data, Access::ReadWrite)?;
         let flag = match geo.event_flag {
             // The 4-byte word only, as for the counters.
             Some(g) => Some(EventFlag::from_mapping(Mapping::map(
                 desc.fds[g.fd_index as usize].as_fd(),
                 u64::from(g.offset),
                 4,
+                Access::ReadWrite,
             )?)),
             None => None,
         };
@@ -322,24 +409,9 @@ impl<T: Element> MessageQueue<T> {
     }
 
     fn regions_at(&self, position: u64, n: usize) -> Regions<'_, T> {
-        let q = size_of::<T>();
-        let offset = (position % self.ring.bytes as u64) as usize;
-        let contiguous = (self.ring.bytes - offset) / q;
-        debug_assert_eq!(offset % q, 0);
-        // SAFETY: `offset < bytes`, so the pointer stays in the ring's mapping.
-        let first = unsafe { self.ring.base.add(offset) };
-        let (first_len, second_len) = if n > contiguous {
-            (contiguous, n - contiguous)
-        } else {
-            (n, 0)
-        };
-        Regions {
-            first,
-            first_len,
-            second: self.ring.base,
-            second_len,
-            _borrow: PhantomData,
-        }
+        debug_assert!(n <= self.capacity);
+        // SAFETY: the ring is mapped read-write while `self` is borrowed; callers check `n`.
+        unsafe { Regions::over(self.ring.base, self.ring.bytes, position, n, false) }
     }
 
     /// Reserve `n` elements to write. `None` when fewer are free (or `n`
@@ -544,25 +616,25 @@ impl<T: Element> MessageQueue<T> {
         wake_bits: u32,
         timeout: Option<Duration>,
     ) -> Result<()> {
-        let flag = self.flag.clone().ok_or(Error::NoEventFlag)?;
+        self.flag_ref()?;
         if wait_bits == 0 {
             return Err(Error::BadValue("empty wait mask"));
         }
         if items.len() > self.capacity {
             return Err(Error::BadValue("more items than the queue holds"));
         }
-        let deadline = sys::deadline_after(timeout)?;
+        let deadline = timeout.and_then(Deadline::after);
         loop {
             if self.write(items)? {
-                wake_after_commit(&flag, wake_bits);
+                self.wake_after_commit(wake_bits);
                 return Ok(());
             }
-            match flag.wait_until(wait_bits, deadline) {
+            match self.flag_ref()?.wait_until(wait_bits, deadline) {
                 Ok(_) => {}
                 // One more try: the reader may have run while the clock ran out.
                 Err(Error::TimedOut) => {
                     if self.write(items)? {
-                        wake_after_commit(&flag, wake_bits);
+                        self.wake_after_commit(wake_bits);
                         return Ok(());
                     }
                     return Err(Error::TimedOut);
@@ -585,24 +657,24 @@ impl<T: Element> MessageQueue<T> {
         wake_bits: u32,
         timeout: Option<Duration>,
     ) -> Result<()> {
-        let flag = self.flag.clone().ok_or(Error::NoEventFlag)?;
+        self.flag_ref()?;
         if wait_bits == 0 {
             return Err(Error::BadValue("empty wait mask"));
         }
         if out.len() > self.capacity {
             return Err(Error::BadValue("more items than the queue holds"));
         }
-        let deadline = sys::deadline_after(timeout)?;
+        let deadline = timeout.and_then(Deadline::after);
         loop {
             if self.read(out)? {
-                wake_after_commit(&flag, wake_bits);
+                self.wake_after_commit(wake_bits);
                 return Ok(());
             }
-            match flag.wait_until(wait_bits, deadline) {
+            match self.flag_ref()?.wait_until(wait_bits, deadline) {
                 Ok(_) => {}
                 Err(Error::TimedOut) => {
                     if self.read(out)? {
-                        wake_after_commit(&flag, wake_bits);
+                        self.wake_after_commit(wake_bits);
                         return Ok(());
                     }
                     return Err(Error::TimedOut);
@@ -613,10 +685,30 @@ impl<T: Element> MessageQueue<T> {
     }
 }
 
-/// The transfer is committed, so a failed wake is logged rather than returned (libfmq does too).
-fn wake_after_commit(flag: &EventFlag, bits: u32) {
-    if let Err(e) = flag.wake(bits) {
-        log::error!("fmq: the wake after a committed transfer failed: {e:?}");
+/// A fully allocated memfd of `total` bytes, page-rounded as libfmq rounds ashmem; no seal yet.
+pub(crate) fn allocate_shared(total: u64) -> Result<OwnedFd> {
+    let page = rustix::param::page_size() as u64;
+    let total = total
+        .checked_add(page - 1)
+        .map(|t| t & !(page - 1))
+        .ok_or(Error::BadValue("queue too large"))?;
+    shm::create(total, &CreateOptions::new("rsbinder-fmq").allocate(true))
+}
+
+impl<T: Element> MessageQueue<T> {
+    fn flag_ref(&self) -> Result<&EventFlag> {
+        match &self.flag {
+            Some(flag) => Ok(flag),
+            None => Err(Error::NoEventFlag),
+        }
+    }
+
+    /// The transfer is committed, so a failed wake is logged, not returned (libfmq does too).
+    fn wake_after_commit(&self, bits: u32) {
+        let Some(flag) = &self.flag else { return };
+        if let Err(e) = flag.wake(bits) {
+            log::error!("fmq: the wake after a committed transfer failed: {e:?}");
+        }
     }
 }
 
@@ -634,6 +726,8 @@ impl<T: Element> std::fmt::Debug for MessageQueue<T> {
 /// [`begin_read`](MessageQueue::begin_read) covers: `first_len` elements
 /// up to the ring's end, then `second_len` from its start (libfmq
 /// `MemTransaction`). An element is never split between the two.
+/// [`UnsyncWriter::begin_write`](crate::UnsyncWriter::begin_write) returns
+/// one too.
 ///
 /// Indices in [`write_at`](Self::write_at) and [`read_at`](Self::read_at)
 /// run over both parts as one sequence, so a caller lays out a record
@@ -644,13 +738,19 @@ impl<T: Element> std::fmt::Debug for MessageQueue<T> {
 ///
 /// Both runs of a copy lie inside the ring: the index range is checked
 /// against [`len`](Self::len). The ring stays mapped while a `Regions`
-/// borrows its queue. Every access to ring bytes is a relaxed
+/// borrows its queue. It is one read-write [`Mapping`]: a single `mmap`
+/// result of at most `isize::MAX` bytes, every byte initialized as the pages
+/// of a mapped file are. Every access to ring bytes is a relaxed
 /// atomic load or store — `AtomicU8` up to the first `usize` boundary,
 /// `AtomicUsize` words after it, `AtomicU8` for the bytes left over — and
 /// the caller's slice is ordinary memory on the other side of the copy.
+/// The regions of an [`UnsyncWriter`](crate::UnsyncWriter) differ in one
+/// respect: their stores are `Release`, the order that flavor's readers
+/// depend on.
 /// Nothing hands out a reference into the ring. The split depends only on
-/// where a run starts, which is any byte for `u8` elements, so nothing
-/// relies on the ring base's alignment.
+/// which `usize`-aligned words a run covers whole — its start and its
+/// length, the start being any byte for `u8` elements — so nothing relies
+/// on the ring base's alignment.
 ///
 /// A change made to the ring from outside — the peer process, another
 /// handle in this process (each handle `mmap`s the memory itself: a second
@@ -665,10 +765,11 @@ impl<T: Element> std::fmt::Debug for MessageQueue<T> {
 /// mapping the same way.
 ///
 /// Rust's model makes unordered atomic accesses of different sizes to the
-/// same bytes a data race, and two copies from different starts split the
-/// same bytes into different sizes. Copies through one mapping never run at
-/// the same time: a `Regions` is neither `Send` nor `Sync` and borrows a
-/// `&mut MessageQueue`, which is not `Sync`.
+/// same bytes undefined behavior unless both are loads, and two copies that
+/// differ in start or length split the same bytes into different sizes.
+/// Copies through one mapping
+/// never run at the same time: a `Regions` is neither `Send` nor `Sync` and
+/// borrows its queue or writer mutably, and neither of those is `Sync`.
 ///
 /// ```compile_fail,E0277
 /// fn is_send<T: Send>() {}
@@ -690,7 +791,40 @@ pub struct Regions<'a, T: Element> {
     first_len: usize,
     second: NonNull<u8>,
     second_len: usize,
+    /// `write_at` stores with `Release`: the unsynchronized writer's order (`Run::store_release`).
+    release: bool,
     _borrow: PhantomData<&'a mut [T]>,
+}
+
+impl<'a, T: Element> Regions<'a, T> {
+    /// # Safety: the ring is writable and meets `Run::new` for `'a`; `n` elements fit in `bytes`.
+    pub(crate) unsafe fn over(
+        base: NonNull<u8>,
+        bytes: usize,
+        position: u64,
+        n: usize,
+        release: bool,
+    ) -> Self {
+        let q = size_of::<T>();
+        let offset = (position % bytes as u64) as usize;
+        let contiguous = (bytes - offset) / q;
+        debug_assert_eq!(offset % q, 0);
+        // SAFETY: `offset < bytes`, so the pointer stays in the ring.
+        let first = unsafe { base.add(offset) };
+        let (first_len, second_len) = if n > contiguous {
+            (contiguous, n - contiguous)
+        } else {
+            (n, 0)
+        };
+        Regions {
+            first,
+            first_len,
+            second: base,
+            second_len,
+            release,
+            _borrow: PhantomData,
+        }
+    }
 }
 
 impl<T: Element> Regions<'_, T> {
@@ -743,8 +877,13 @@ impl<T: Element> Regions<'_, T> {
         }
         let [head, tail] = self.runs(start, src.len());
         let (to_head, to_tail) = ring::bytes_of(src).split_at(head.len());
-        head.store(to_head);
-        tail.store(to_tail);
+        if self.release {
+            head.store_release(to_head);
+            tail.store_release(to_tail);
+        } else {
+            head.store(to_head);
+            tail.store(to_tail);
+        }
         Ok(())
     }
 

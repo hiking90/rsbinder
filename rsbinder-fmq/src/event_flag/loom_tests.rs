@@ -10,7 +10,7 @@ use loom::thread;
 
 use super::{wait_until, wake_lazy, FlagWord};
 use crate::error::Result;
-use crate::sys::Timespec;
+use crate::shm::Deadline;
 
 const BIT: u32 = 0x2;
 
@@ -42,7 +42,7 @@ impl FlagWord for Side {
             fence(order);
         }
     }
-    fn futex_wait(&self, expected: u32, _bits: u32, _deadline: Option<&Timespec>) -> Result<()> {
+    fn futex_wait(&self, expected: u32, _bits: u32, _deadline: Option<&Deadline>) -> Result<()> {
         let guard = self.word.futex.lock().unwrap();
         if self.word.word.load(Ordering::SeqCst) == expected {
             drop(self.word.sleepers.wait(guard).unwrap());

@@ -46,9 +46,9 @@ Linux/Android-only.
 
 - `scripts/local_gate.sh` passes: at least `hermetic`, plus `kernel` for
   anything touching `rsbinder::*` or `rpc::`
-- `cargo-semver-checks` runs automatically on PRs against `rsbinder`
-  and `rsbinder-aidl` — intentional API breaks need acknowledgment in
-  the PR description
+- `cargo-semver-checks` runs automatically on PRs against `rsbinder`,
+  `rsbinder-aidl` and `rsbinder-fmq` — intentional API breaks need
+  acknowledgment in the PR description
 - Wire-format-affecting changes need a STAGE3 (real-`libbinder` interop)
   result documented in the PR
 
@@ -69,8 +69,8 @@ Library code (each lib crate outside `#[cfg(test)]`) does not call
 
 Every `allow` outside tests carries `reason = ".."`; one the code needs
 in every build is an `#[expect]`. The library crates (rsbinder,
-rsbinder-aidl, rsbinder-macros, rsbinder-fmq, rsbinder-tools) enforce
-the no-`unwrap` rule and the `reason` rule with
+rsbinder-aidl, rsbinder-macros, rsbinder-fmq, rsbinder-topic,
+rsbinder-tools) enforce the no-`unwrap` rule and the `reason` rule with
 `#![cfg_attr(not(test), deny(clippy::unwrap_used))]` and
 `#![cfg_attr(not(test), deny(clippy::allow_attributes_without_reason))]`
 at the crate root; a new library crate adds the same two lines. Review
@@ -135,9 +135,30 @@ Avoid:
 Public API stability follows the 3-tier model documented in
 [`book/src/stability-tiers.md`](book/src/stability-tiers.md): **Stable**
 (semver-strict), **Provisional** (signature may tweak in a minor bump,
-wire format already locked), **Experimental** (opt-in Cargo feature,
-wire format may change). Check the table before changing a public
-signature — Stable surfaces require deprecation discussion in the PR.
+wire format already locked), **Experimental** (an opt-in Cargo feature or
+a crate of its own, `rsbinder-topic`; wire format may change). Check the
+table before changing a public signature — Stable surfaces require
+deprecation discussion in the PR.
+
+## Releasing
+
+Every crate of the workspace is published at the workspace version, in
+dependency order, since each must already be on crates.io before the next
+one can resolve it:
+
+1. `rsbinder-fmq` — depends on no other crate here.
+2. `rsbinder-aidl`
+3. `rsbinder-macros` — depends on `rsbinder-aidl`.
+4. `rsbinder` — requires `rsbinder-fmq`, and names `rsbinder-macros` behind
+   the `macros` feature with a version requirement.
+5. `rsbinder-topic` — depends on `rsbinder` and builds its AIDL with
+   `rsbinder-aidl`.
+6. `rsbinder-tools`
+
+`source envsetup.sh` and then `publish_dry_run` / `publish` run
+`cargo publish` in this order (`publish_dirs` there); a crate added to the
+workspace is added to that list in its place. `tests`, `example-hello`,
+`fuzz` and `bench/ipc-compare` are not published.
 
 ## License
 

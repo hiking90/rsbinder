@@ -783,7 +783,13 @@ rsbinder implements **both sides** of this pattern:
 
 - **Register side** — `hub::android_16::create_accessor(instance,
   addr_provider)` builds a `LocalAccessor` `BnAccessor` you can
-  publish via `hub::add_service`. The provider closure resolves an
+  publish via `hub::add_service`. The service manager hands it to
+  clients of `instance` only when a declaration says so: a VINTF
+  `<accessor>` element on Android, a
+  [`[[service]] accessor`](./service-manager.md#reaching-an-instance-through-an-accessor)
+  entry for `rsb_hub`. Both name the accessor, the name you register
+  it under; the accessor itself reports `instance`, which the consume
+  side checks. The provider closure resolves an
   instance name to an
   [`AccessorSockAddr`](https://docs.rs/rsbinder/latest/rsbinder/hub/android_16/enum.AccessorSockAddr.html)
   (`Unix(path)`, `UnixAbstract(name)` — added in 0.10.0 —
@@ -811,13 +817,17 @@ rsbinder implements **both sides** of this pattern:
   server.set_root(my_root)?;
   let _bg = server.run_background();
 
-  // 2. Vend an IAccessor that hands clients an fd connected to
-  //    `sock`, and publish it through the kernel service manager.
+  // 2. Vend an IAccessor that hands clients of `my.IService/default` an
+  //    fd connected to `sock`, and publish it through the kernel service
+  //    manager under the name the declaration gives it:
+  //      [[service]]
+  //      name = "my.IService/default"
+  //      accessor = "android.os.IAccessor/IService/default"
   let path = sock.clone();
-  let accessor = create_accessor("my.service", Box::new(move |_name| {
+  let accessor = create_accessor("my.IService/default", Box::new(move |_name| {
       Ok(AccessorSockAddr::Unix(path.clone()))
   }));
-  hub::add_service("my.service", accessor)?;
+  hub::add_service("android.os.IAccessor/IService/default", accessor)?;
 
   // 3. Block on the kernel binder thread pool so the accessor stays
   //    reachable for the lifetime of the process.

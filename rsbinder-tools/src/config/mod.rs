@@ -53,13 +53,17 @@ mod parse;
 mod policy;
 mod trust;
 
-pub use activation::{ActivationRunner, Activator, SystemRunner};
+pub use activation::{ActivationRunner, Activator, SystemRunner, START_THREAD_NAME};
 pub use declaration::{
     is_valid_service_name, Activation, ConnectionInfo, Declaration, Declarations, InstanceName,
+    RESERVED_SERVICE_NAMES, SELF_SERVICE_NAME,
 };
 pub use enforcer::Enforcer;
 pub use parse::{
     load, parse_file, Config, ConfigError, FileContents, NameResolver, SystemResolver,
 };
-pub use policy::{NamePattern, Permission, Policy, PolicyError, Rule, Subject, Subjects};
+pub use policy::{
+    NamePattern, Permission, Policy, PolicyError, Rule, Subject, Subjects, TopicPermission,
+    TopicPolicy, TopicRule,
+};
 pub use trust::{trust_problem, TrustProblem, Untrusted};

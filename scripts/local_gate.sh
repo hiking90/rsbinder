@@ -158,11 +158,41 @@ public_api() {
     cargo +nightly-2026-05-25 public-api -p rsbinder --simplified > "$out.txt" &&
         diff -u api/rsbinder.txt "$out.txt" &&
         cargo +nightly-2026-05-25 public-api -p rsbinder --simplified --features rpc > "$out-rpc.txt" &&
-        diff -u api/rsbinder-rpc.txt "$out-rpc.txt"
+        diff -u api/rsbinder-rpc.txt "$out-rpc.txt" &&
+        cargo +nightly-2026-05-25 public-api -p rsbinder-fmq --simplified > "$out-fmq.txt" &&
+        diff -u api/rsbinder-fmq.txt "$out-fmq.txt"
+}
+
+# `shm::Run` and the unsynchronized queue's two cores under Miri, in two passes. The copies that
+# race need Miri's weak-memory emulation, and it is what tells `Release`/`Acquire` from `Relaxed`
+# (x86 runs both as the same code); the round trip makes sequential accesses at two sizes, on
+# which that emulation panics.
+miri_fmq() {
+    local seed dir=CARGO_TARGET_DIR=target/miri
+    local miri=(cargo +nightly-2026-05-25 miri test -p rsbinder-fmq --lib --)
+    for seed in 0 1 2 3 4 5 6 7; do
+        tpass env "$dir" MIRIFLAGS="-Zmiri-seed=$seed" "${miri[@]}" \
+            shm::run unsync::tests --skip round_trip || return 1
+    done
+    tpass env "$dir" MIRIFLAGS="-Zmiri-disable-weak-memory-emulation" "${miri[@]}" \
+        shm::run::tests::round_trip
+}
+
+# The topic ring over heap memory under Miri: the two tests in which a reader copies records while
+# the publisher overwrites them, and the reads of forged memory images, where a copy outside the
+# ring would be an out-of-bounds access. The other tests of `ring::tests` publish thousands of
+# records to one thread and add nothing here for the minutes they take.
+miri_topic() {
+    local seed dir=CARGO_TARGET_DIR=target/miri
+    for seed in 0 1 2 3 4 5 6 7; do
+        tpass env "$dir" MIRIFLAGS="-Zmiri-seed=$seed" \
+            cargo +nightly-2026-05-25 miri test -p rsbinder-topic --lib -- image::tests \
+            ring::tests::records_returned ring::tests::a_copy_that || return 1
+    done
 }
 
 semver() {
-    cargo semver-checks check-release -p rsbinder -p rsbinder-aidl --default-features &&
+    cargo semver-checks check-release -p rsbinder -p rsbinder-aidl -p rsbinder-fmq --default-features &&
         cargo semver-checks check-release -p rsbinder --only-explicit-features \
             --features rpc,rpc-tcp-debug,rpc-tls,rpc-vsock,async
 }
@@ -188,11 +218,28 @@ tier_hermetic() {
     linux_run "tests: c_stream_header" tpass cargo test -p tests --test c_stream_header
     run "rsbinder-fmq" tpass cargo test -p rsbinder-fmq
     # CI does not run loom; a target dir of its own, since the cfg rebuilds every dependency.
-    run "rsbinder-fmq loom (EventFlag)" tpass env CARGO_TARGET_DIR=target/loom \
+    run "rsbinder-fmq loom (EventFlag, Run order, unsync reader)" tpass env CARGO_TARGET_DIR=target/loom \
         RUSTFLAGS="--cfg loom" cargo test -p rsbinder-fmq --lib --release loom
+    run "rsbinder-topic" tpass cargo test -p rsbinder-topic
+    run "rsbinder-topic loom (ring writer and reader, wait and wake)" tpass env CARGO_TARGET_DIR=target/loom \
+        RUSTFLAGS="--cfg loom" cargo test -p rsbinder-topic --lib --release loom
+    # CI does not run Miri either.
+    if toolchain nightly-2026-05-25 &&
+        cargo +nightly-2026-05-25 miri --version >/dev/null 2>&1 &&
+        rustup +nightly-2026-05-25 component list --installed 2>/dev/null |
+        grep -q '^rust-src'; then
+        run "rsbinder-fmq Miri (shm::Run, unsync)" miri_fmq
+        run "rsbinder-topic Miri (ring over heap memory)" miri_topic
+    else
+        skip "rsbinder-fmq Miri (shm::Run, unsync)" \
+            "rustup toolchain install nightly-2026-05-25 --component miri,rust-src"
+        skip "rsbinder-topic Miri (ring over heap memory)" \
+            "rustup toolchain install nightly-2026-05-25 --component miri,rust-src"
+    fi
     run "rsbinder loom (cache pin)" tpass env CARGO_TARGET_DIR=target/loom \
         RUSTFLAGS="--cfg loom" cargo test -p rsbinder --test loom_cache_pin --release
     run "rsbinder-tools" tpass cargo test -p rsbinder-tools
+    run "rsbinder-tools (topic)" tpass cargo test -p rsbinder-tools --features topic
 
     run "rpc build matrix" rpc_build_matrix
     run "rsbinder lib (no binder device)" bash scripts/ci_rsbinder_lib_tests.sh
@@ -220,7 +267,7 @@ tier_hermetic() {
         --test entry_rpc --test gateway_rpc --test codegen_shapes --test rpc_async \
         --test rpc_calling_identity --test rpc_enforce_permission_deny --test work_source_rpc \
         --test observer_rpc --test transaction_names --test transport_caps --test cancel_rpc \
-        --test stream_rpc --test reconnect_rpc
+        --test stream_rpc --test reconnect_rpc --test lazy_descriptor_rpc
     run "tests: rpc_generated_stub (tcp-debug)" tpass cargo test -p tests --features rpc-tcp-debug --test rpc_generated_stub
     run "tests: aidl_spans" tpass cargo test -p tests --features rpc,tracing --test aidl_spans
     run "rsbinder-macros" tpass cargo test -p rsbinder-macros
@@ -339,12 +386,18 @@ tier_kernel() {
     run "async_wait + entry_kernel_options" tpass cargo test -p tests --features rpc \
         --test async_wait --test entry_kernel_options -- --ignored --test-threads=1
     run "fmq_binder" tpass cargo test -p tests --test fmq_binder -- --ignored
+    run "rsbinder-topic two_process" tpass cargo test -p rsbinder-topic --test two_process \
+        -- --ignored --test-threads=1
+    run "rsbinder-topic registry" tpass cargo test -p rsbinder-topic --test registry \
+        -- --ignored --test-threads=1
     run "reconnect_kernel" tpass cargo test -p tests --features rpc \
         --test reconnect_kernel -- --ignored --test-threads=1
     run "freeze_kernel" tpass cargo test -p tests --features rpc \
         --test freeze_kernel -- --ignored --test-threads=1
     run "death_reorder_kernel" tpass cargo test -p tests --features rpc \
         --test death_reorder_kernel -- --ignored --test-threads=1
+    run "lazy_descriptor_kernel" tpass cargo test -p tests \
+        --test lazy_descriptor_kernel -- --ignored --test-threads=1
     local t
     for t in test_death_recipient test_wibinder_upgrade_after_obituary \
         test_death_recipient_panic_does_not_starve_others \
@@ -454,7 +507,7 @@ stage3_selected() {
     changed=$({ git diff --name-only "$BASE"...HEAD 2>/dev/null
                 git diff --name-only HEAD
                 git ls-files --others --exclude-standard; } |
-              grep -E '^(rsbinder|rsbinder-aidl|rsbinder-fmq|rsbinder-macros|contrib|example-hello|tests)/' |
+              grep -E '^(rsbinder|rsbinder-aidl|rsbinder-fmq|rsbinder-macros|rsbinder-topic|contrib|example-hello|tests)/' |
               grep -vE '\.md$')
     [ -n "$changed" ]
 }
@@ -544,15 +597,10 @@ tier_stage3() {
         run "cargo ndk build example-hello ($triple)" cargo ndk -t "$triple" --platform 29 build -p example-hello --bins
     fi
     local ndk_api=$((sdk < 35 ? sdk : 35))
+    # One `rpc` build of stream_probe serves stream_ac as well, when both are queued.
+    local probe_rpc=
     if grep -qx stream_rpc_selinux_stage3 <<<"$(printf '%s\n' "${queue[@]}")"; then
-        # One `rpc` build of stream_probe serves stream_ac as well.
-        run "cargo ndk build stream_probe, rpc ($triple)" cargo ndk -t "$triple" \
-            --platform "$ndk_api" build -p tests --features rpc --bin stream_probe
-        run "cargo ndk build stream_rpc test ($triple)" cargo ndk -t "$triple" \
-            --platform "$ndk_api" test -p tests --features rpc --test stream_rpc --no-run
-    elif grep -qx stream_ac <<<"$(printf '%s\n' "${queue[@]}")"; then
-        run "cargo ndk build stream_probe ($triple)" cargo ndk -t "$triple" \
-            --platform "$ndk_api" build -p tests --bin stream_probe
+        probe_rpc=1
     fi
 
     trap 'stage3_restore; stop_service; stop_hub' EXIT
@@ -560,10 +608,24 @@ tier_stage3() {
         restore_enforce
         local script
         script=$(stage3_script "$name")
+        # The two stream scripts push debug/stream_probe and build nothing themselves. It is
+        # built right before each: other scripts build `tests` into the same directory.
         case "$name" in
             lazy_service_stage3) run "run_$name" timeout 1800 bash "$script" "$SERIAL" ;;
-            stream_ac) run "run_stream_ac --adb" timeout 1800 bash "$script" --adb -s "$SERIAL" --target "$triple" ;;
-            stream_rpc_selinux_stage3) run "run_$name" timeout 1800 bash "$script" -s "$SERIAL" --target "$triple" ;;
+            stream_ac)
+                # Unquoted on purpose: two words, or none.
+                # shellcheck disable=SC2086
+                run "cargo ndk build stream_probe for stream_ac ($triple)" cargo ndk -t "$triple" \
+                    --platform "$ndk_api" build -p tests ${probe_rpc:+--features rpc} --bin stream_probe
+                run "run_stream_ac --adb" timeout 1800 bash "$script" --adb -s "$SERIAL" --target "$triple"
+                ;;
+            stream_rpc_selinux_stage3)
+                run "cargo ndk build stream_probe, rpc ($triple)" cargo ndk -t "$triple" \
+                    --platform "$ndk_api" build -p tests --features rpc --bin stream_probe
+                run "cargo ndk build stream_rpc test ($triple)" cargo ndk -t "$triple" \
+                    --platform "$ndk_api" test -p tests --features rpc --test stream_rpc --no-run
+                run "run_$name" timeout 1800 bash "$script" -s "$SERIAL" --target "$triple"
+                ;;
             *) run "run_$name" timeout 1800 bash "$script" -s "$SERIAL" ;;
         esac
     done

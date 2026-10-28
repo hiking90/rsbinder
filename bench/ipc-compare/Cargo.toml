@@ -1,0 +1,26 @@
+# Measurement harness for plan 15 §8: rsbinder's paths next to iceoryx2's.
+#
+# Excluded from the main workspace (root Cargo.toml `exclude`): iceoryx2
+# 0.10.0 needs Rust 1.89 and edition 2024, above the workspace MSRV, and no
+# rsbinder crate may depend on it. CI does not build this crate.
+#
+# Run: bench/ipc-compare/run.sh (needs a binder device and a running rsb_hub).
+[package]
+name = "ipc-compare"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[dependencies]
+rsbinder = { path = "../../rsbinder" }
+rsbinder-topic = { path = "../../rsbinder-topic" }
+iceoryx2 = "=0.10.0"
+iceoryx2-bb-lock-free = "=0.10.0"
+hdrhistogram = "7.5"
+rustix = { version = "1", features = ["process", "thread", "time", "system"] }
+
+[build-dependencies]
+rsbinder-aidl = { path = "../../rsbinder-aidl" }
+
+[profile.release]
+debug = 1

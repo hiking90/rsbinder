@@ -135,7 +135,7 @@
 //! All of them refuse before anything is written, so there is no second check
 //! on the finished bytes to keep in step. It is not behind `rpc`: the
 //! refusals follow from the missing session, not from the transport. On the
-//! read side (`Parcel::from_slice`) data-only makes `read_object` an immediate
+//! read side (`Parcel::data_only_from_vec`) data-only makes `read_object` an immediate
 //! `BadType`, so a forged `flat_binder_object` in the input cannot become a
 //! binder.
 //!
@@ -1109,12 +1109,7 @@ impl Parcel {
         Parcel::data_only_from_vec(Vec::with_capacity(256))
     }
 
-    /// A data-only parcel over a copy of `bytes`; a forged object in it reads as `BadType`.
-    pub(crate) fn from_slice(bytes: &[u8]) -> Self {
-        Parcel::data_only_from_vec(bytes.to_vec())
-    }
-
-    /// [`Parcel::from_slice`] adopting `bytes` instead of copying them.
+    /// A data-only parcel over `bytes`; a forged object in them reads as `BadType`.
     pub(crate) fn data_only_from_vec(bytes: Vec<u8>) -> Self {
         let mut p = Parcel::from_vec(bytes);
         // Born in RPC mode: `set_for_rpc` refuses a parcel that already holds bytes.
@@ -2790,14 +2785,44 @@ impl<const N: usize> TryFrom<&mut Parcel> for [u8; N] {
 /// payload returns `BadType`, since the decoder has no session to marshal
 /// a binder through.
 pub fn to_bytes<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
-    let mut parcel = Parcel::new_data_only();
-    parcel.write(value)?;
-    let bytes = parcel.into_bytes()?;
+    let mut bytes = Vec::with_capacity(256);
+    to_bytes_into(value, &mut bytes)?;
     // A small value keeps the 256-byte parcel buffer; copying beats a moving `shrink_to_fit`.
     if bytes.capacity() > 2 * bytes.len() {
         return Ok(bytes.as_slice().to_vec());
     }
     Ok(bytes)
+}
+
+/// [`to_bytes`], appending to `out` instead of returning a new buffer.
+///
+/// The bytes appended are exactly those [`to_bytes`] returns for the
+/// same value, whatever `out` already holds: AIDL pads each write by its
+/// own length, not by where it lands, so the value need not start at a
+/// multiple of 4. A caller that encodes many values reuses one buffer
+/// and allocates only when it grows.
+///
+/// # Errors
+///
+/// Those of [`to_bytes`]. On an error `out` is as it was: whatever the
+/// value had written is cut off again. The `i32` bound applies to `out`
+/// as a whole — its length before the call plus the value. If the value's
+/// `Serialize` panics, `out` is left empty.
+pub fn to_bytes_into<T: Serialize + ?Sized>(value: &T, out: &mut Vec<u8>) -> Result<()> {
+    let start = out.len();
+    if start >= i32::MAX as usize {
+        return Err(StatusCode::BadValue);
+    }
+    let mut parcel = Parcel::data_only_from_vec(std::mem::take(out));
+    parcel.set_data_position(start);
+    let written = parcel.write(value);
+    // A data-only parcel records no object, so it always gives its bytes back.
+    *out = parcel.into_bytes()?;
+    if let Err(e) = written {
+        out.truncate(start);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Decodes one value from bytes written by [`to_bytes`].
@@ -2821,9 +2846,32 @@ pub fn from_bytes<T: Deserialize>(bytes: &[u8]) -> Result<T> {
     if bytes.len() >= i32::MAX as usize {
         return Err(StatusCode::BadValue);
     }
-    let mut parcel = Parcel::from_slice(bytes);
-    let value = parcel.read::<T>()?;
-    if parcel.data_avail() != 0 {
+    from_bytes_in(&mut bytes.to_vec())
+}
+
+/// [`from_bytes`], reading the bytes where they are instead of from a copy.
+///
+/// The decoder needs a buffer of its own, so [`from_bytes`] copies its
+/// input into one. This takes the caller's buffer for the read and puts it
+/// back unchanged, so nothing is copied or allocated beyond what the
+/// value itself holds. All of `bytes` must be the value: a buffer that
+/// carries more, padding included, is `BadValue`, as in [`from_bytes`].
+///
+/// # Errors
+///
+/// Those of [`from_bytes`]; `bytes` is unchanged either way. If the
+/// value's `Deserialize` panics, `bytes` is left empty.
+pub fn from_bytes_in<T: Deserialize>(bytes: &mut Vec<u8>) -> Result<T> {
+    if bytes.len() >= i32::MAX as usize {
+        return Err(StatusCode::BadValue);
+    }
+    let mut parcel = Parcel::data_only_from_vec(std::mem::take(bytes));
+    let value = parcel.read::<T>();
+    let left = parcel.data_avail();
+    // A data-only parcel records no object, so it always gives its bytes back.
+    *bytes = parcel.into_bytes()?;
+    let value = value?;
+    if left != 0 {
         return Err(StatusCode::BadValue);
     }
     Ok(value)
@@ -2837,15 +2885,12 @@ mod tests {
     #[should_panic(expected = "can't support as_mut_slice()")]
     fn parcel_data_slice_refuses_as_mut_slice() {
         // A `Slice` stands for the read-only kernel mapping: reads alias it, writes panic.
-        let leaked: &'static mut [u8] = Box::leak(vec![0u8, 1, 2, 3].into_boxed_slice());
-        let ptr = leaked.as_mut_ptr();
-        let len = leaked.len();
-        // SAFETY: `Box::leak` yields a valid, exclusive, `'static` buffer of `len` bytes.
-        let mut pd: super::ParcelData<u8> =
-            unsafe { super::ParcelData::from_raw_parts_mut(ptr, len) };
+        let leaked: &'static [u8] = Box::leak(vec![0u8, 1, 2, 3].into_boxed_slice());
+        let ptr = leaked.as_ptr();
+        let mut pd: super::ParcelData<u8> = super::ParcelData::Slice(leaked);
 
         assert_eq!(pd.as_slice(), &[0u8, 1, 2, 3][..]);
-        assert_eq!(pd.as_ptr(), ptr as *const u8);
+        assert_eq!(pd.as_ptr(), ptr);
         let _ = pd.as_mut_slice();
     }
 
@@ -2903,10 +2948,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "can't support write_at()")]
     fn parcel_data_slice_refuses_write_at() {
-        let leaked: &'static mut [u8] = Box::leak(vec![0u8; 4].into_boxed_slice());
-        // SAFETY: `Box::leak` yields a valid, exclusive, `'static` buffer of 4 bytes.
-        let mut pd: super::ParcelData<u8> =
-            unsafe { super::ParcelData::from_raw_parts_mut(leaked.as_mut_ptr(), 4) };
+        let leaked: &'static [u8] = Box::leak(vec![0u8; 4].into_boxed_slice());
+        let mut pd: super::ParcelData<u8> = super::ParcelData::Slice(leaked);
         pd.write_at(0, &[1], 0);
     }
 
@@ -4174,6 +4217,110 @@ mod data_serde {
         let mut kernel = Parcel::new();
         kernel.write(&value).unwrap();
         assert_eq!(to_bytes(&value).unwrap(), kernel.data.as_slice());
+    }
+
+    /// A parcelable's shape: a size header around odd-length fields and an inline blob.
+    #[derive(Debug, PartialEq)]
+    struct Nested {
+        name: String,
+        bytes: Vec<u8>,
+        blob: Vec<u8>,
+    }
+
+    impl Serialize for Nested {
+        fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
+            parcel.sized_write(|parcel| {
+                parcel.write(&self.name)?;
+                parcel.write(&self.bytes)?;
+                parcel.write_blob(&self.blob, false)
+            })
+        }
+    }
+
+    impl Deserialize for Nested {
+        fn deserialize(parcel: &mut Parcel) -> Result<Self> {
+            let mut value = Nested {
+                name: String::new(),
+                bytes: Vec::new(),
+                blob: Vec::new(),
+            };
+            parcel.sized_read(|parcel| {
+                value.name = parcel.read()?;
+                value.bytes = parcel.read()?;
+                let blob = parcel.read_blob()?;
+                value.blob = blob.inline().ok_or(StatusCode::BadValue)?.to_vec();
+                Ok(())
+            })?;
+            Ok(value)
+        }
+    }
+
+    fn nested() -> Nested {
+        Nested {
+            name: "abc".into(),
+            bytes: vec![1, 2, 3, 4, 5],
+            blob: vec![9; 7],
+        }
+    }
+
+    #[test]
+    fn appended_bytes_are_the_bytes_of_to_bytes_wherever_they_start() {
+        let alone = to_bytes(&nested()).unwrap();
+        for prefix in 0..8 {
+            let mut out = vec![0xee; prefix];
+            to_bytes_into(&nested(), &mut out).unwrap();
+            assert_eq!(&out[..prefix], &vec![0xee; prefix][..], "prefix {prefix}");
+            assert_eq!(&out[prefix..], alone.as_slice(), "after {prefix} bytes");
+        }
+    }
+
+    /// Writes a word, then fails: an error that comes after bytes were written.
+    struct FailsHalfway;
+
+    impl Serialize for FailsHalfway {
+        fn serialize(&self, parcel: &mut Parcel) -> Result<()> {
+            parcel.write(&7i32)?;
+            Err(StatusCode::BadValue)
+        }
+    }
+
+    #[test]
+    fn a_refused_append_leaves_the_buffer_as_it_was() {
+        let mut out = vec![1, 2, 3];
+        let capacity = out.capacity();
+        assert_eq!(
+            to_bytes_into(&FailsHalfway, &mut out),
+            Err(StatusCode::BadValue)
+        );
+        assert_eq!(out, [1, 2, 3]);
+        let fd = crate::ParcelFileDescriptor::new(std::fs::File::open("/dev/null").unwrap());
+        assert_eq!(to_bytes_into(&fd, &mut out), Err(StatusCode::FdsNotAllowed));
+        assert_eq!(out, [1, 2, 3]);
+        assert!(out.capacity() >= capacity);
+    }
+
+    #[test]
+    fn a_read_in_place_gives_what_from_bytes_gives_and_keeps_the_buffer() {
+        let mut bytes = to_bytes(&nested()).unwrap();
+        let (copy, at) = (bytes.clone(), bytes.as_ptr());
+        assert_eq!(from_bytes_in::<Nested>(&mut bytes).unwrap(), nested());
+        assert_eq!(from_bytes::<Nested>(&copy).unwrap(), nested());
+        assert_eq!(bytes, copy, "the bytes are unchanged");
+        assert_eq!(bytes.as_ptr(), at, "the buffer is the caller's, not a copy");
+
+        let mut trailing = copy.clone();
+        trailing.extend_from_slice(&[0; 4]);
+        assert_eq!(
+            from_bytes_in::<Nested>(&mut trailing),
+            Err(StatusCode::BadValue)
+        );
+        assert_eq!(trailing.len(), copy.len() + 4, "unchanged on an error");
+        let mut short = copy[..copy.len() - 4].to_vec();
+        assert_eq!(
+            from_bytes_in::<Nested>(&mut short),
+            from_bytes::<Nested>(&copy[..copy.len() - 4])
+        );
+        assert_eq!(short, copy[..copy.len() - 4]);
     }
 
     #[test]

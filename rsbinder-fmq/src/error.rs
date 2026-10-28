@@ -3,16 +3,26 @@
 
 use std::fmt;
 
-/// Why a queue, descriptor or flag operation failed.
+/// Why a queue, descriptor, flag or [`shm`](crate::shm) operation failed.
 ///
 /// The two `&'static str` payloads name the check that failed; they are for
 /// logs and test assertions, not for matching on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
-    /// This target has no shared-memory or futex backend. Only Linux and
-    /// Android are supported; elsewhere the crate compiles and every
-    /// constructor returns this.
+    /// The target lacks what the call needs. The queue's constructors return
+    /// this off Linux and Android, and on a target without 64-bit atomics;
+    /// [`UnsyncReader::attach`](crate::UnsyncReader::attach) also where
+    /// `shm::RoWord64::PRESENT` is false (32-bit x86 without SSE2); the
+    /// memfd, seal and futex functions of [`shm`](crate::shm) off Linux and
+    /// Android;
+    /// [`Mapping::map`](crate::shm::Mapping::map) on a target
+    /// without `mmap` (WASI).
+    ///
+    /// One case depends on the running kernel and not on the target:
+    /// [`UnsyncWriter::create`](crate::UnsyncWriter::create) with
+    /// [`read_only_readers`](field@crate::UnsyncCreate::read_only_readers)
+    /// returns this on a kernel without `F_SEAL_FUTURE_WRITE`.
     Unsupported,
     /// A descriptor, policy or argument failed a check; the failing call
     /// moved no counter, though a `write` may already have copied items into
@@ -40,7 +50,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Unsupported => f.write_str("fast message queues need Linux or Android"),
+            Error::Unsupported => f.write_str(
+                "not supported on this target or kernel: it lacks memfd, futex, mmap, \
+                 64-bit atomics, a read-only 64-bit load or F_SEAL_FUTURE_WRITE",
+            ),
             Error::BadValue(what) => write!(f, "rejected: {what}"),
             Error::Corrupted(what) => write!(f, "shared counters corrupted: {what}"),
             Error::NoEventFlag => f.write_str("the queue has no EventFlag word"),
@@ -84,5 +97,18 @@ impl From<Error> for std::io::Error {
             }
             Error::Corrupted(_) => std::io::Error::new(ErrorKind::InvalidData, e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_names_the_target_not_the_queue() {
+        // `shm`'s functions return it too, to callers that have no queue.
+        let text = Error::Unsupported.to_string();
+        assert!(text.contains("this target"), "{text}");
+        assert!(!text.to_lowercase().contains("queue"), "{text}");
     }
 }
