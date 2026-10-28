@@ -780,7 +780,11 @@ fn a_reader_lapped_at_every_look_ends_at_its_deadline() {
     moving(&mut subscriber);
     #[cfg_attr(
         not(feature = "tokio"),
-        expect(unused_mut, reason = "only the async drivers are pushed")
+        expect(
+            unused_mut,
+            clippy::useless_vec,
+            reason = "only the async drivers are pushed"
+        )
     )]
     let mut locals = vec![subscriber.local().clone()];
     let to = sent.clone();

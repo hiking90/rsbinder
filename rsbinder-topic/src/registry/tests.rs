@@ -375,6 +375,59 @@ fn a_death_takes_its_topics_and_watches_and_counts_a_generation_for_each_name() 
     assert_eq!(told, [20]);
 }
 
+#[test]
+fn a_death_takes_only_what_its_handle_held() {
+    let (mut table, mut links) = (T::new(), Fake::default());
+    let now = Instant::now();
+    advertise(&mut table, &mut links, 1, "a", key(10)).unwrap();
+    advertise(&mut table, &mut links, 1, "b", key(10)).unwrap();
+    advertise(&mut table, &mut links, 1, "c", key(11)).unwrap();
+    for name in ["c", "d", "e"] {
+        watch(&mut table, &mut links, name, key(20)).unwrap();
+        watch(&mut table, &mut links, name, key(21)).unwrap();
+    }
+    table.sent("c", &key(20), 3, Sent::Busy, now);
+    table.sent("c", &key(21), 3, Sent::Busy, now);
+    let watching = |table: &T, name| -> Vec<u32> {
+        let callers = table.callers_of(name);
+        callers.iter().map(|(watcher, _)| watcher.id).collect()
+    };
+
+    table.forget(20);
+    for name in ["c", "d", "e"] {
+        assert_eq!(watching(&table, name), [21], "{name}");
+    }
+    assert_eq!(table.due_of("c", &key(20)), None);
+    assert!(table.due_of("c", &key(21)).is_some());
+    let linked: Vec<_> = table.linked().into_iter().collect();
+    assert_eq!(linked, [(10, 2), (11, 1), (21, 3)]);
+
+    table.forget(10);
+    assert_eq!(table.lookup("a"), (None, 5));
+    assert_eq!(table.lookup("b"), (None, 5));
+    assert_eq!(table.lookup("c"), (Some(key(11)), 3));
+    assert_eq!(table.owed(), 1);
+    let linked: Vec<_> = table.linked().into_iter().collect();
+    assert_eq!(linked, [(11, 1), (21, 3)]);
+    // A death after the last use was given up finds nothing.
+    table.forget(10);
+    assert_eq!(table.lookup("a"), (None, 5));
+    table.check();
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "two keys of handle 5")]
+fn two_keys_of_one_handle_under_one_name_break_the_key_contract() {
+    let (mut table, mut links) = (T::new(), Fake::default());
+    let twin = |id| K {
+        id,
+        handle: Some(5),
+    };
+    watch(&mut table, &mut links, "a", twin(1)).unwrap();
+    let _ = watch(&mut table, &mut links, "a", twin(2));
+}
+
 // ---- the table: notices owed (AC-15.5.11) ----
 
 /// A table with `watchers` watches of "a", given to topic 10: the notices of that change.
@@ -539,6 +592,106 @@ fn past_the_bound_a_failure_is_counted_and_not_owed() {
         (counts.owed, counts.dropped),
         (MAX_OWED, MAX_WATCHERS as u64 * 2 - MAX_OWED as u64)
     );
+}
+
+#[test]
+fn of_a_names_owed_notices_each_goes_alone() {
+    let (mut table, mut links, now) = watched(3);
+    for w in 100..103 {
+        table.sent("a", &key(w), 1, Sent::Busy, now);
+    }
+    table.unwatch("a", &[key(100)], &mut links);
+    assert_eq!((table.owed(), table.due_of("a", &key(100))), (2, None));
+    table.refused("a", &key(101), 1);
+    assert_eq!((table.owed(), table.due_of("a", &key(101))), (1, None));
+    let at = now + Duration::from_secs(1);
+    let due: Vec<u32> = table.due(at).iter().map(|due| due.1.id).collect();
+    assert_eq!(due, [102]);
+    table.retried("a", &key(102), 1, Sent::Failed, at);
+    assert_eq!((table.owed(), table.next_due()), (0, None));
+    table.check();
+}
+
+/// xorshift64: one sequence of changes per seed, with no crate for it.
+struct Rng(u64);
+
+impl Rng {
+    fn below(&mut self, n: u64) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0 % n
+    }
+
+    fn pick<'a, X>(&mut self, of: &'a [X]) -> &'a X {
+        &of[self.below(of.len() as u64) as usize]
+    }
+
+    fn sent(&mut self) -> Sent {
+        *self.pick(&[Sent::Delivered, Sent::Busy, Sent::Failed])
+    }
+}
+
+#[test]
+fn every_sequence_of_changes_keeps_the_maps_in_step() {
+    let names = ["a", "b", "c", "d", "e"];
+    let local = |id| K { id, handle: None };
+    let topics = [key(10), key(11), key(12), key(13), local(1), local(2)];
+    let mut watchers: Vec<K> = (20..28).map(key).collect();
+    watchers.extend([local(3), local(4)]);
+    let handles: Vec<u32> = (10..14).chain(20..28).collect();
+    for seed in 1..=8u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let (mut table, mut links) = (T::new(), Fake::default());
+        let mut now = Instant::now();
+        for step in 0..5_000 {
+            let name = *rng.pick(&names);
+            let watcher = rng.pick(&watchers).clone();
+            let uid = 1 + rng.below(2) as u32;
+            // One older than the name's, its own, or one newer.
+            let generation = (table.lookup(name).1 + rng.below(3)).saturating_sub(1);
+            links.fail = (rng.below(10) == 0).then(|| *rng.pick(&handles));
+            match rng.below(10) {
+                0 => {
+                    let (topic, cross_uid) = (rng.pick(&topics).clone(), rng.below(2) == 0);
+                    let ids = (uid, uid as i32);
+                    let changed = table.advertise(ids, name, topic, cross_uid, now, &mut links);
+                    for notice in changed.unwrap_or_default() {
+                        let sent = rng.sent();
+                        table.sent(name, &notice.watcher, notice.generation, sent, now);
+                    }
+                }
+                1 => {
+                    table.withdraw(uid, name, rng.pick(&topics), &mut links);
+                }
+                2 => {
+                    let _ = table.watch(name, watcher, caller(uid), &mut links);
+                }
+                3 => {
+                    let evicted = [watcher, rng.pick(&watchers).clone()];
+                    table.unwatch(name, &evicted, &mut links);
+                }
+                4 => table.forget(*rng.pick(&handles)),
+                5 => {
+                    let sent = rng.sent();
+                    table.sent(name, &watcher, generation, sent, now);
+                }
+                6 => table.refused(name, &watcher, generation),
+                7 => {
+                    // As a retry round does, the policy's judgement aside.
+                    for (name, watcher, _, _) in table.due(now) {
+                        if let Some((_, generation)) = table.retry_target(&name, &watcher) {
+                            let sent = rng.sent();
+                            table.retried(&name, &watcher, generation, sent, now);
+                        }
+                    }
+                }
+                _ => now += Duration::from_secs(rng.below(40)),
+            }
+            let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| table.check()));
+            assert!(checked.is_ok(), "seed {seed}, step {step}");
+        }
+    }
 }
 
 #[test]
@@ -911,6 +1064,72 @@ fn an_owed_notice_the_retry_thread_finds_refused_is_not_sent_and_the_thread_ends
     let stats = registry.stats();
     assert_eq!((stats.notices_retried, stats.watchers), (0, 1));
     eventually("the retry thread ended", || Arc::strong_count(&alive) == 2);
+}
+
+/// Allows every action, and panics on judging `Subscribe` while armed.
+#[derive(Clone, Default)]
+struct Panicking(Arc<AtomicBool>);
+
+impl RegistryAccess for Panicking {
+    fn allows(&self, action: Action, _: &str, _: &Caller) -> bool {
+        let armed = action == Action::Subscribe && self.0.load(Ordering::SeqCst);
+        assert!(!armed, "the test's judgement panics");
+        true
+    }
+}
+
+#[test]
+fn a_change_whose_judgement_panicked_leaves_the_next_to_go_on() {
+    let panicking = Panicking::default();
+    let registry = Registry::new(panicking.clone());
+    let shared = &registry.shared;
+    let (watcher, heard) = recorder();
+    shared.watch_as(&caller(2), "a", &watcher).unwrap();
+    panicking.0.store(true, Ordering::SeqCst);
+    let changed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        shared.advertise_as(&caller(1), "a", &topic())
+    }));
+    assert!(changed.is_err());
+    panicking.0.store(false, Ordering::SeqCst);
+    // The panic was under the order lock: the next change takes it all the same.
+    shared.advertise_as(&caller(1), "a", &topic()).unwrap();
+    assert_eq!(*heard.heard.lock().unwrap(), [("a".to_owned(), 2)]);
+}
+
+#[test]
+fn a_retry_thread_whose_judgement_panicked_leaves_the_next_send_to_start_another() {
+    let panicking = Panicking::default();
+    let registry = Registry::new(panicking.clone());
+    let shared = &registry.shared;
+    let alive = Arc::new(());
+    let (stuck, heard) = recorder();
+    let (other, _) = recorder();
+    shared.watch_as(&caller(2), "a", &stuck).unwrap();
+    shared.watch_as(&caller(2), "b", &other).unwrap();
+    heard
+        .failures
+        .lock()
+        .unwrap()
+        .push_back(StatusCode::FailedTransaction);
+    let mut hooks = shared.hooks.lock().unwrap();
+    hooks.alive = Some(alive.clone());
+    // After the change's judgement: the retry thread's panics.
+    let arm = panicking.clone();
+    hooks.before_send = Some(Arc::new(move || arm.0.store(true, Ordering::SeqCst)));
+    drop(hooks);
+    shared.advertise_as(&caller(1), "a", &topic()).unwrap();
+    eventually("a retry thread", || Arc::strong_count(&alive) == 3);
+    eventually("the retry thread ended", || Arc::strong_count(&alive) == 2);
+    assert_eq!(registry.stats().owed, 1);
+
+    shared.hooks.lock().unwrap().before_send = None;
+    panicking.0.store(false, Ordering::SeqCst);
+    // Delivered, so it owes nothing new: it starts a thread for what was owed.
+    shared.advertise_as(&caller(1), "b", &topic()).unwrap();
+    eventually("the owed notice delivered", || {
+        registry.stats().notices_retried == 1
+    });
+    assert_eq!(*heard.heard.lock().unwrap(), [("a".to_owned(), 1)]);
 }
 
 type Free = Arc<Mutex<Vec<(&'static str, bool)>>>;

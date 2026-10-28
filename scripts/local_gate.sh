@@ -202,6 +202,7 @@ tier_hermetic() {
     run "fmt" cargo fmt --all -- --check
     run "clippy (workspace, all features)" cargo clippy --all-targets --all-features -- -D warnings
     run "clippy (rsbinder, no default features)" cargo clippy -p rsbinder --lib --no-default-features
+    run "clippy (rsbinder-topic, no default features)" cargo clippy -p rsbinder-topic --all-targets --no-default-features -- -D warnings
     run "rustdoc (all features)" env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
     run "rustdoc (default features)" env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
     if toolchain 1.86; then

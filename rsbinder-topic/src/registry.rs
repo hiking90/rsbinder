@@ -38,7 +38,7 @@ pub use resolver::RegistryResolver;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Instant;
 
 use rsbinder::{
@@ -63,6 +63,10 @@ pub trait RegistryAccess: Send + Sync {
     /// registry holds the lock that orders its notices, so its cost holds up the registry's other
     /// changes; every other judgement, those of notices sent again among them, runs with no lock
     /// of the registry held.
+    ///
+    /// A panic in it ends the call that asked, and the registry goes on: a change keeps its new
+    /// state, and those of its notices not sent by then are not sent; a notice the retry thread
+    /// was judging stays owed, and the next send starts another thread for it.
     fn allows(&self, action: Action, name: &str, caller: &Caller) -> bool;
 }
 
@@ -419,6 +423,14 @@ impl Shared {
         self.inner.lock().expect("lock poisoned")
     }
 
+    /// `fire_order` guards no data: a panic while it was held, as a judgement may, leaves nothing
+    /// to repair, and the next change goes on.
+    fn order(&self) -> MutexGuard<'_, ()> {
+        self.fire_order
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     pub(crate) fn advertise_as(
         &self,
         caller: &Caller,
@@ -435,7 +447,7 @@ impl Shared {
             ));
         }
         let cross_uid = self.cross_uid.load(Ordering::Relaxed);
-        let order = self.fire_order.lock().expect("lock poisoned");
+        let order = self.order();
         let mut inner = self.lock();
         let Inner { table, linked, .. } = &mut *inner;
         let mut links = ShellLinks {
@@ -629,7 +641,7 @@ impl Shared {
                 self.lock().table.refused(&name, &watcher, generation);
                 continue;
             }
-            let order = self.fire_order.lock().expect("lock poisoned");
+            let order = self.order();
             let target = self.lock().table.retry_target(&name, &watcher);
             if let Some((topic, generation)) = target {
                 let sent = send(&watcher, &name, &topic, generation);
@@ -655,8 +667,25 @@ impl Shared {
     }
 }
 
+/// Clears `retrying` when the retry thread ends by a panic, as a judgement may: a later send then
+/// starts another, where the flag left set would keep every owed notice unsent for good.
+struct Ending(Weak<Shared>);
+
+impl Drop for Ending {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        if let Some(shared) = self.0.upgrade() {
+            let mut inner = shared.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            inner.retrying = false;
+        }
+    }
+}
+
 /// The retry thread: rounds until nothing is owed or the registry is gone.
 fn retry(shared: Weak<Shared>) {
+    let _ending = Ending(shared.clone());
     #[cfg(test)]
     let _alive = shared
         .upgrade()

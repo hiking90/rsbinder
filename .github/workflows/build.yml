@@ -138,6 +138,9 @@ jobs:
         # Lints the `cfg(not(feature = ..))` code the step above never compiles. No
         # `-D warnings`: only the crate's deny-level lints (plans/13) fail it.
         run: cargo clippy -p rsbinder --lib --no-default-features
+      - name: Run clippy (rsbinder-topic, no default features)
+        # The sync-only build and its tests: `tokio` is the crate's one default feature.
+        run: cargo clippy -p rsbinder-topic --all-targets --no-default-features -- -D warnings
       - name: Check rustdoc
         # docs.rs builds `rsbinder` with `all-features`, so a link that only
         # resolves with `rpc` on still ships — but anyone running `cargo doc`
