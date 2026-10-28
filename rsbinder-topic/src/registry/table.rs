@@ -4,7 +4,7 @@
 //! The registry's state without binder (plan 15 §12.4): the shell hands it keys, callers, times
 //! and the results of its sends, so the hermetic tests drive it with keys of their own.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use rsbinder::{BinderResult, Caller};
@@ -19,6 +19,8 @@ pub(crate) const MAX_WATCHERS: usize = 256;
 pub(crate) const MAX_OWED: usize = MAX_WATCHERS;
 
 /// A binder as the table knows it: equality, and the handle its death link is counted by.
+///
+/// Keys with the same handle are equal: a process has one proxy per handle.
 pub(crate) trait Key: Clone + PartialEq {
     /// The handle of a proxy; `None` for a binder of this process, which is not linked.
     fn handle(&self) -> Option<u32>;
@@ -97,6 +99,32 @@ struct Owed<W> {
     due: Instant,
 }
 
+/// The names a handle is used under, as a topic and as a watcher.
+#[derive(Default)]
+struct Uses {
+    topics: BTreeSet<String>,
+    watches: BTreeSet<String>,
+}
+
+#[derive(Clone, Copy)]
+enum Use {
+    Topic,
+    Watch,
+}
+
+impl Uses {
+    fn names(&mut self, kind: Use) -> &mut BTreeSet<String> {
+        match kind {
+            Use::Topic => &mut self.topics,
+            Use::Watch => &mut self.watches,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.topics.is_empty() && self.watches.is_empty()
+    }
+}
+
 /// What the table holds and did, for [`RegistryStats`](super::RegistryStats).
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Counts {
@@ -115,8 +143,8 @@ pub(crate) struct Table<T, W> {
     watchers: BTreeMap<String, Vec<Watcher<W>>>,
     /// One counter for every name, so that an entry made again does not count from zero again.
     generation: u64,
-    /// Uses of each handle by the two maps.
-    links: BTreeMap<u32, usize>,
+    /// The uses of each linked handle by the two maps, none empty: a death visits these alone.
+    links: BTreeMap<u32, Uses>,
     /// The watches owed a notice, by name, apart from `watchers` so that a round visits these
     /// alone: each one a watch's, at most [`MAX_OWED`] in all, and no list empty.
     owed: BTreeMap<String, Vec<Owed<W>>>,
@@ -158,8 +186,10 @@ impl<T: Key, W: Key> Table<T, W> {
             None if self.topics.len() >= MAX_NAMES => return Err(Refused::Limit),
             None => {}
         }
-        self.retain(topic.handle(), |handle| links.link_topic(handle, &topic))
-            .map_err(Refused::Link)?;
+        self.retain(topic.handle(), name, Use::Topic, |handle| {
+            links.link_topic(handle, &topic)
+        })
+        .map_err(Refused::Link)?;
         self.generation += 1;
         let advertised = Advertised {
             key: topic.clone(),
@@ -169,7 +199,7 @@ impl<T: Key, W: Key> Table<T, W> {
             generation: self.generation,
         };
         if let Some(old) = self.topics.insert(name.to_owned(), advertised) {
-            self.release(old.key.handle(), links);
+            self.release(old.key.handle(), name, Use::Topic, links);
         }
         let watchers = self.watchers.get(name).map_or(&[][..], Vec::as_slice);
         let notices = watchers.iter().map(|watcher| Notice {
@@ -196,7 +226,7 @@ impl<T: Key, W: Key> Table<T, W> {
         }
         if let Some(old) = self.topics.remove(name) {
             self.generation += 1;
-            self.release(old.key.handle(), links);
+            self.release(old.key.handle(), name, Use::Topic, links);
         }
         self.clear_owed(name);
         true
@@ -227,7 +257,7 @@ impl<T: Key, W: Key> Table<T, W> {
             None if self.watchers.len() >= MAX_NAMES => return Err(Refused::Limit),
             None => {}
         }
-        self.retain(watcher.handle(), |handle| {
+        self.retain(watcher.handle(), name, Use::Watch, |handle| {
             links.link_watcher(handle, &watcher)
         })
         .map_err(Refused::Link)?;
@@ -267,7 +297,7 @@ impl<T: Key, W: Key> Table<T, W> {
         }
         retain_owed(&mut self.owed, name, |o| !evicted.contains(&o.watcher));
         for handle in gone {
-            self.release(handle, links);
+            self.release(handle, name, Use::Watch, links);
         }
     }
 
@@ -290,26 +320,24 @@ impl<T: Key, W: Key> Table<T, W> {
 
     /// The binder of `handle` died: its topics and its watches go, and its link.
     pub(crate) fn forget(&mut self, handle: u32) {
-        let dead: Vec<String> = self
-            .topics
-            .iter()
-            .filter(|(_, held)| held.key.handle() == Some(handle))
-            .map(|(name, _)| name.clone())
-            .collect();
-        for name in dead {
+        let Some(uses) = self.links.remove(&handle) else {
+            return;
+        };
+        for name in uses.topics {
             self.topics.remove(&name);
             self.generation += 1;
             self.clear_owed(&name);
         }
-        self.watchers.retain(|_, list| {
-            list.retain(|held| held.key.handle() != Some(handle));
-            !list.is_empty()
-        });
-        self.owed.retain(|_, list| {
-            list.retain(|o| o.watcher.handle() != Some(handle));
-            !list.is_empty()
-        });
-        self.links.remove(&handle);
+        let other = |key: &W| key.handle() != Some(handle);
+        for name in uses.watches {
+            if let Some(list) = self.watchers.get_mut(&name) {
+                list.retain(|held| other(&held.key));
+                if list.is_empty() {
+                    self.watchers.remove(&name);
+                }
+            }
+            retain_owed(&mut self.owed, &name, |o| other(&o.watcher));
+        }
     }
 
     /// Count a send of a change's notice; whether it left a notice owed that was not before.
@@ -446,34 +474,39 @@ impl<T: Key, W: Key> Table<T, W> {
         }
     }
 
-    /// One use more of `handle`, linked on its first: the link runs before any change.
+    /// One use more of `handle`, under `name`, linked on its first: the link runs before any change.
     fn retain(
         &mut self,
         handle: Option<u32>,
+        name: &str,
+        kind: Use,
         link: impl FnOnce(u32) -> BinderResult<()>,
     ) -> BinderResult<()> {
         let Some(handle) = handle else {
             return Ok(());
         };
         if let Some(uses) = self.links.get_mut(&handle) {
-            *uses += 1;
+            let new = uses.names(kind).insert(name.to_owned());
+            debug_assert!(new, "{name:?}: two keys of handle {handle}, against `Key`");
             return Ok(());
         }
         link(handle)?;
-        self.links.insert(handle, 1);
+        let mut uses = Uses::default();
+        uses.names(kind).insert(name.to_owned());
+        self.links.insert(handle, uses);
         Ok(())
     }
 
-    /// One use less of `handle`, unlinked on its last.
-    fn release(&mut self, handle: Option<u32>, links: &mut dyn Links<T, W>) {
+    /// One use less of `handle`, under `name`, unlinked on its last.
+    fn release(&mut self, handle: Option<u32>, name: &str, kind: Use, links: &mut dyn Links<T, W>) {
         let Some(handle) = handle else {
             return;
         };
         let Some(uses) = self.links.get_mut(&handle) else {
             return;
         };
-        *uses -= 1;
-        if *uses == 0 {
+        uses.names(kind).remove(name);
+        if uses.is_empty() {
             self.links.remove(&handle);
             links.unlink(handle);
         }
@@ -487,7 +520,9 @@ impl<T: Key, W: Key> Table<T, W> {
     /// The death links held, for a test.
     #[cfg(test)]
     pub(crate) fn linked(&self) -> BTreeMap<u32, usize> {
-        self.links.clone()
+        let uses = self.links.iter();
+        let counted = uses.map(|(handle, uses)| (*handle, uses.topics.len() + uses.watches.len()));
+        counted.collect()
     }
 
     /// The due of an owed notice, for a test.
@@ -517,13 +552,27 @@ impl<T: Key, W: Key> Table<T, W> {
             }
         }
         assert!(self.owed() <= MAX_OWED, "{} owed", self.owed());
-        let mut uses = BTreeMap::new();
-        let topics = self.topics.values().map(|held| held.key.handle());
-        let watches = self.watchers.values().flatten().map(|w| w.key.handle());
-        for handle in topics.chain(watches).flatten() {
-            *uses.entry(handle).or_insert(0) += 1;
+        type Names<'a> = (BTreeSet<&'a str>, BTreeSet<&'a str>);
+        let mut uses: BTreeMap<u32, Names<'_>> = BTreeMap::new();
+        for (name, held) in &self.topics {
+            if let Some(handle) = held.key.handle() {
+                uses.entry(handle).or_default().0.insert(name);
+            }
         }
-        assert_eq!(self.links, uses, "the uses of each handle");
+        for (name, list) in &self.watchers {
+            for handle in list.iter().filter_map(|held| held.key.handle()) {
+                uses.entry(handle).or_default().1.insert(name);
+            }
+        }
+        fn names(set: &BTreeSet<String>) -> BTreeSet<&str> {
+            set.iter().map(String::as_str).collect()
+        }
+        let indexed: BTreeMap<u32, Names<'_>> = self
+            .links
+            .iter()
+            .map(|(handle, held)| (*handle, (names(&held.topics), names(&held.watches))))
+            .collect();
+        assert_eq!(indexed, uses, "the names of each handle");
     }
 }
 

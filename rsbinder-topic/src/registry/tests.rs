@@ -375,6 +375,59 @@ fn a_death_takes_its_topics_and_watches_and_counts_a_generation_for_each_name() 
     assert_eq!(told, [20]);
 }
 
+#[test]
+fn a_death_takes_only_what_its_handle_held() {
+    let (mut table, mut links) = (T::new(), Fake::default());
+    let now = Instant::now();
+    advertise(&mut table, &mut links, 1, "a", key(10)).unwrap();
+    advertise(&mut table, &mut links, 1, "b", key(10)).unwrap();
+    advertise(&mut table, &mut links, 1, "c", key(11)).unwrap();
+    for name in ["c", "d", "e"] {
+        watch(&mut table, &mut links, name, key(20)).unwrap();
+        watch(&mut table, &mut links, name, key(21)).unwrap();
+    }
+    table.sent("c", &key(20), 3, Sent::Busy, now);
+    table.sent("c", &key(21), 3, Sent::Busy, now);
+    let watching = |table: &T, name| -> Vec<u32> {
+        let callers = table.callers_of(name);
+        callers.iter().map(|(watcher, _)| watcher.id).collect()
+    };
+
+    table.forget(20);
+    for name in ["c", "d", "e"] {
+        assert_eq!(watching(&table, name), [21], "{name}");
+    }
+    assert_eq!(table.due_of("c", &key(20)), None);
+    assert!(table.due_of("c", &key(21)).is_some());
+    let linked: Vec<_> = table.linked().into_iter().collect();
+    assert_eq!(linked, [(10, 2), (11, 1), (21, 3)]);
+
+    table.forget(10);
+    assert_eq!(table.lookup("a"), (None, 5));
+    assert_eq!(table.lookup("b"), (None, 5));
+    assert_eq!(table.lookup("c"), (Some(key(11)), 3));
+    assert_eq!(table.owed(), 1);
+    let linked: Vec<_> = table.linked().into_iter().collect();
+    assert_eq!(linked, [(11, 1), (21, 3)]);
+    // A death after the last use was given up finds nothing.
+    table.forget(10);
+    assert_eq!(table.lookup("a"), (None, 5));
+    table.check();
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "two keys of handle 5")]
+fn two_keys_of_one_handle_under_one_name_break_the_key_contract() {
+    let (mut table, mut links) = (T::new(), Fake::default());
+    let twin = |id| K {
+        id,
+        handle: Some(5),
+    };
+    watch(&mut table, &mut links, "a", twin(1)).unwrap();
+    let _ = watch(&mut table, &mut links, "a", twin(2));
+}
+
 // ---- the table: notices owed (AC-15.5.11) ----
 
 /// A table with `watchers` watches of "a", given to topic 10: the notices of that change.
