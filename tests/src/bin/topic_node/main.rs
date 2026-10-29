@@ -78,7 +78,34 @@ mod node {
     pub enum Request {
         /// Answer with the role's statistics.
         Stats(mpsc::Sender<Vec<Kind>>),
+        /// A command of the controller for the role's topic.
+        Command(Command),
         Stop,
+    }
+
+    /// `<command> TOPIC` on stdin, sent to the roles of `TOPIC`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Command {
+        /// A publisher: close the topic and print `PUBLISHED`, then publish nothing more (X2).
+        Close,
+        /// A publisher: register its binder with the service manager again (X3b, X10).
+        Readvertise,
+        /// A publisher made with `prepub`: start publishing (X1).
+        Resume,
+        /// A `recv_sample` subscription: receive a sample and keep it until killed (X7).
+        HoldSample,
+    }
+
+    impl Command {
+        fn parse(word: &str) -> Option<Self> {
+            Some(match word {
+                "close" => Self::Close,
+                "readvertise" => Self::Readvertise,
+                "resume" => Self::Resume,
+                "hold-sample" => Self::HoldSample,
+                _ => return None,
+            })
+        }
     }
 
     /// A role's threads, and how to reach them.
@@ -87,6 +114,8 @@ mod node {
         /// Makes the threads look at their requests: interrupts the waits of a subscription.
         pub wake: Box<dyn Fn() + Send>,
         pub threads: Vec<JoinHandle<()>>,
+        /// The topic a command names to reach this role.
+        pub topic: Option<String>,
     }
 
     impl Running {
@@ -96,7 +125,23 @@ mod node {
                 requests,
                 wake: Box::new(|| {}),
                 threads: vec![thread],
+                topic: None,
             }
+        }
+
+        pub fn for_topic(mut self, topic: &str) -> Self {
+            self.topic = Some(topic.into());
+            self
+        }
+
+        /// Send `command` if this role is of `topic`.
+        fn command(&self, topic: &str, command: Command) -> bool {
+            if self.topic.as_deref() != Some(topic) {
+                return false;
+            }
+            let _ = self.requests.send(Request::Command(command));
+            (self.wake)();
+            true
         }
 
         fn stats(&self) -> Vec<Kind> {
@@ -117,14 +162,20 @@ mod node {
         }
     }
 
-    /// The `Stop` among `requests` answered so far, every `Stats` answered with `stats`.
-    pub fn serve(requests: &mpsc::Receiver<Request>, mut stats: impl FnMut() -> Vec<Kind>) -> bool {
+    /// Whether `requests` so far held a `Stop`: each `Stats` is answered with `stats` and each
+    /// `Command` handed to `command`.
+    pub fn serve(
+        requests: &mpsc::Receiver<Request>,
+        mut stats: impl FnMut() -> Vec<Kind>,
+        mut command: impl FnMut(Command),
+    ) -> bool {
         let mut stop = false;
         while let Ok(request) = requests.try_recv() {
             match request {
                 Request::Stats(answer) => {
                     let _ = answer.send(stats());
                 }
+                Request::Command(order) => command(order),
                 Request::Stop => stop = true,
             }
         }
@@ -258,7 +309,21 @@ mod node {
                     }
                     out.send(Kind::StatsDone);
                 }
-                other => out.fault(format!("unknown command {other:?}")),
+                other => {
+                    let order = other
+                        .split_once(' ')
+                        .and_then(|(word, topic)| Some((Command::parse(word)?, topic)));
+                    let sent = order.is_some_and(|(command, topic)| {
+                        running
+                            .iter()
+                            .filter(|role| role.command(topic, command))
+                            .count()
+                            > 0
+                    });
+                    if !sent {
+                        out.fault(format!("no role takes {other:?}"));
+                    }
+                }
             }
         }
     }

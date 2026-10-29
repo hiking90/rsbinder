@@ -28,7 +28,7 @@ use tests::topic_fleet::record::{topic_id, Incarnation, Stamp};
 use tests::topic_fleet::spec::{Api, PayloadKind, Recv, SubSpec, Via};
 use tests::topic_fleet::transport;
 
-use crate::node::{serve, Out, Request, Running};
+use crate::node::{serve, Command, Out, Request, Running};
 use crate::publish::pub_stats;
 
 const COUNT_EVERY: Duration = Duration::from_secs(1);
@@ -61,6 +61,8 @@ trait Source: Send {
     fn wait(&mut self) -> &mut dyn Wait;
     /// Subscribe again after the topic ended: a plain subscriber's own reconnection.
     fn resubscribe(&mut self) -> BinderResult<()>;
+    /// Receive a sample and keep it, its slot pinned, until the process is killed (X7).
+    fn hold(&mut self) {}
 }
 
 fn runtime(spec: &SubSpec) -> Option<tokio::runtime::Runtime> {
@@ -216,6 +218,17 @@ impl<M: SampleTrust> Source for Samples<M> {
     fn try_receive(&mut self, _how: Recv) -> Result<Got, RecvError> {
         let bytes = self.subscriber.try_recv_sample()?.to_owned();
         Ok(self.checked(bytes))
+    }
+
+    fn hold(&mut self) {
+        loop {
+            // A `Lagged` or another error before a sample: receive again.
+            if let Ok(_held) = self.subscriber.recv_sample() {
+                loop {
+                    thread::park();
+                }
+            }
+        }
     }
 
     fn interrupter(&self) -> Interrupter {
@@ -459,7 +472,11 @@ impl Sub {
 
     fn stats(&self) -> Vec<Kind> {
         let stats = self.source.stats();
-        let (node_received, node_lagged) = self.judge.totals();
+        // A plain subscriber made again counts from zero; a named one over every connection.
+        let (node_received, node_lagged) = match self.spec.api {
+            Api::Plain => self.judge.current(),
+            Api::Named => self.judge.totals(),
+        };
         let mut kinds = vec![Kind::SubStats {
             topic: self.topic(),
             received: stats.received,
@@ -506,6 +523,22 @@ fn wake_all(interrupters: Vec<Arc<Mutex<Interrupter>>>) -> Box<dyn Fn() + Send> 
     })
 }
 
+/// Whether `requests` held a `Stop`; `hold-sample` does not return.
+fn serve_one(out: &Out, sub: &mut Sub, requests: &mpsc::Receiver<Request>) -> bool {
+    let mut commands = Vec::new();
+    let stop = serve(requests, || sub.stats(), |command| commands.push(command));
+    for command in commands {
+        match command {
+            Command::HoldSample => sub.source.hold(),
+            other => out.fault(format!(
+                "{other:?} {}: not for a subscription",
+                sub.spec.topic
+            )),
+        }
+    }
+    stop
+}
+
 /// One subscription on its own thread.
 fn run_one(out: Out, mut sub: Sub, requested: mpsc::Receiver<Request>) {
     loop {
@@ -519,20 +552,26 @@ fn run_one(out: Out, mut sub: Sub, requested: mpsc::Receiver<Request>) {
                 Ok(Request::Stats(answer)) => {
                     let _ = answer.send(sub.stats());
                 }
+                Ok(Request::Command(command)) => {
+                    out.fault(format!(
+                        "{command:?} {}: no subscription now",
+                        sub.spec.topic
+                    ));
+                }
                 Ok(Request::Stop) | Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => {}
             }
             if sub.resubscribe {
                 sub.try_resubscribe();
                 // A `Stop` sent before the new interrupter was in place interrupted the old one.
-                if serve(&requested, || sub.stats()) {
+                if serve_one(&out, &mut sub, &requested) {
                     break;
                 }
             }
             continue;
         }
         let received = sub.source.receive(sub.spec.recv);
-        if sub.handle(&out, received) == Flow::Look && serve(&requested, || sub.stats()) {
+        if sub.handle(&out, received) == Flow::Look && serve_one(&out, &mut sub, &requested) {
             break;
         }
     }
@@ -558,7 +597,8 @@ fn run_group(
             sub.try_resubscribe();
         }
         // After the resubscriptions: a `Stop` sent meanwhile interrupted an old subscription.
-        if serve(&requested, || stats(&subs, &extra)) {
+        let refuse = |command: Command| out.fault(format!("{command:?}: not for a group"));
+        if serve(&requested, || stats(&subs, &extra), refuse) {
             break;
         }
         let mut waits: Vec<&mut dyn Wait> = subs
@@ -572,6 +612,7 @@ fn run_group(
                 Ok(Request::Stats(answer)) => {
                     let _ = answer.send(stats(&subs, &extra));
                 }
+                Ok(Request::Command(command)) => out.fault(format!("{command:?}: not for a group")),
                 Ok(Request::Stop) | Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => {}
             }
@@ -606,6 +647,8 @@ fn spawn(out: &Out, subs: Vec<Sub>, extra: Option<Extra>, group: bool) -> Runnin
     let (requests, requested) = mpsc::channel();
     let wake = wake_all(subs.iter().map(|sub| sub.interrupter.clone()).collect());
     let out = out.clone();
+    // A command names a topic: it reaches a subscription on its own thread, not a group.
+    let topic = (!group).then(|| subs[0].topic());
     let thread = if group {
         thread::spawn(move || run_group(out, subs, requested, extra))
     } else {
@@ -616,6 +659,7 @@ fn spawn(out: &Out, subs: Vec<Sub>, extra: Option<Extra>, group: bool) -> Runnin
         requests,
         wake,
         threads: vec![thread],
+        topic,
     }
 }
 

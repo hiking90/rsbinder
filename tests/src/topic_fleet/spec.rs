@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! --pub       topic=NAME [payload=bytes|record] [hz=10] [size=32] [ring=BYTES] [subs=N]
-//!             [pool] [bp=MS] [via=sm|REGISTRY]
+//!             [pool] [bp=MS] [window=N] [via=sm|REGISTRY] [prepub=K]
 //! --sub       topic=NAME [payload=bytes|record] [api=plain|named] [recv=recv|latest|sample|async]
 //!             [wake=futex|fd] [start=latest|last|oldest] [trust] [group=G] [via=sm|REGISTRY]
 //! --fuse      out=NAME frames=NAME readings=NAME [via=sm]
@@ -16,7 +16,9 @@
 //!
 //! `via` names how a topic is found: the service manager (`sm`, the default) or the topic
 //! registry registered with it under that name. Subscriptions of one `group` share a thread
-//! that waits on them with `wait_any`, which takes `wake=fd`.
+//! that waits on them with `wait_any`, which takes `wake=fd`. `prepub=K` makes the topic,
+//! publishes `K` records, registers it with the service manager, and publishes nothing more
+//! until `resume` (X1: a connection then has records to start from).
 
 use rsbinder_topic::{Start, Wake};
 
@@ -59,7 +61,11 @@ pub struct PubSpec {
     pub pool: bool,
     /// The backpressure timeout in milliseconds.
     pub backpressure_ms: Option<u64>,
+    /// The backpressure window: the most records a subscriber may be behind.
+    pub window: Option<usize>,
     pub via: Via,
+    /// Records published before the topic is registered, after which it waits for `resume`.
+    pub prepublish: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -209,7 +215,17 @@ impl Role {
                     .map(str::parse)
                     .transpose()
                     .map_err(|_| "bp")?,
+                window: items
+                    .value("window")?
+                    .map(str::parse)
+                    .transpose()
+                    .map_err(|_| "window")?,
                 via: items.via()?,
+                prepublish: items
+                    .value("prepub")?
+                    .map(str::parse)
+                    .transpose()
+                    .map_err(|_| "prepub")?,
             }),
             "--sub" => Role::Sub(SubSpec {
                 topic: items.required("topic")?,
@@ -266,6 +282,15 @@ impl Role {
             Role::Pub(spec) if spec.hz == 0 => Err("hz=0".into()),
             Role::Pub(spec) if spec.pool && spec.payload != PayloadKind::Bytes => {
                 Err("a pool lends slots of bytes".into())
+            }
+            Role::Pub(spec) if spec.prepublish.is_some() && spec.via != Via::ServiceManager => {
+                Err("prepub registers with the service manager".into())
+            }
+            Role::Pub(spec)
+                if spec.window.is_some_and(|window| window == 0)
+                    || (spec.window.is_some() && spec.backpressure_ms.is_none()) =>
+            {
+                Err("a window is of backpressure, and at least 1".into())
             }
             Role::Report { hz: 0, .. } => Err("hz=0".into()),
             Role::Sub(spec) => {
@@ -353,6 +378,7 @@ mod tests {
                 "--sub",
                 "topic=t,payload=record,recv=async,wake=fd,start=last",
             ),
+            ("--pub", "topic=t,payload=record,hz=1000,prepub=50"),
             ("--fuse", "out=a,frames=b,readings=c"),
             ("--relay", "topic=t,service=s"),
             ("--report", "service=s,hz=5"),
@@ -374,6 +400,10 @@ mod tests {
             ("--pub", "topic=t,payload=record,pool"),
             ("--pub", "topic=t,color=red"),
             ("--pub", "topic=t,pool=1"),
+            ("--pub", "topic=t,prepub=5,via=reg"),
+            ("--pub", "topic=t,prepub=x"),
+            ("--pub", "topic=t,window=8"),
+            ("--pub", "topic=t,bp=1000,window=0"),
             ("--sub", "topic=t,api=named,recv=sample"),
             ("--sub", "topic=t,payload=record,recv=sample"),
             ("--sub", "topic=t,trust"),

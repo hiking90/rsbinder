@@ -22,7 +22,7 @@
 
 #![cfg(any(target_os = "linux", target_os = "android"))]
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
@@ -34,9 +34,13 @@ use std::time::{Duration, Instant};
 
 use rsbinder::{hub, ProcessState};
 use rsbinder_topic::aidl::ITopicRegistry::SERVICE_NAME;
+use rsbinder_topic::Start;
 use rustix::process::{Pid, Signal};
 use tests::topic_fleet::event::{Event, Kind, Subscribed};
-use tests::topic_fleet::judge::{self, check_end, end_reason, Injected, Mode};
+use tests::topic_fleet::judge::{
+    self, check_end, check_first, end_reason, end_reasons, first_seq, Committed, History, Injected,
+    Mode,
+};
 use tests::topic_fleet::now_ns;
 use tests::topic_fleet::record::Incarnation;
 
@@ -111,10 +115,54 @@ struct Fleet {
     recv: mpsc::Receiver<Message>,
     /// What earlier waits read but did not match, oldest first.
     backlog: VecDeque<Seen>,
-    /// The latest `COUNT` of each node.
-    counts: HashMap<String, Event>,
+    /// The latest `COUNT` of each node's connection to each topic.
+    counts: HashMap<(String, String), Counted>,
     /// The `PUBLISHED` of each node.
     published: HashMap<String, Event>,
+    /// Every `ENDED`, with the connection's last `COUNT`, in the order read.
+    endings: Vec<Ending>,
+    /// Every `CONNECTED`, in the order read.
+    connections: Vec<Connection>,
+}
+
+/// A `COUNT`: received, lagged, first and last seq.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Counted {
+    received: u64,
+    lagged: u64,
+    first_seq: u64,
+    last_seq: u64,
+}
+
+impl Counted {
+    fn judged(self, incarnation: Incarnation) -> judge::Count {
+        judge::Count {
+            incarnation,
+            received: self.received,
+            lagged: self.lagged,
+            first_seq: self.first_seq,
+            last_seq: self.last_seq,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Ending {
+    node: String,
+    topic: String,
+    reason: String,
+    /// The last `COUNT` of the connection that ended, if it read a record.
+    count: Option<Counted>,
+    at_ns: u64,
+}
+
+#[derive(Clone, Debug)]
+struct Connection {
+    node: String,
+    topic: String,
+    incarnation: Incarnation,
+    first_seq: u64,
+    at_ns: u64,
 }
 
 fn node_bin() -> PathBuf {
@@ -163,6 +211,8 @@ impl Fleet {
             backlog: VecDeque::new(),
             counts: HashMap::new(),
             published: HashMap::new(),
+            endings: Vec::new(),
+            connections: Vec::new(),
         }
     }
 
@@ -287,10 +337,47 @@ impl Fleet {
                                 self.failure(Some(&node), format!("{what}: {}", event.line()))
                             );
                         }
-                        Kind::Count { .. } => {
-                            self.counts.insert(event.node.clone(), event);
+                        Kind::Count {
+                            ref topic,
+                            received,
+                            lagged,
+                            first_seq,
+                            last_seq,
+                        } => {
+                            let counted = Counted {
+                                received,
+                                lagged,
+                                first_seq,
+                                last_seq,
+                            };
+                            self.counts
+                                .insert((event.node.clone(), topic.clone()), counted);
                             continue;
                         }
+                        Kind::Ended {
+                            ref topic,
+                            ref reason,
+                        } => {
+                            let key = (event.node.clone(), topic.clone());
+                            self.endings.push(Ending {
+                                count: self.counts.remove(&key),
+                                node: key.0,
+                                topic: key.1,
+                                reason: reason.clone(),
+                                at_ns: event.at_ns,
+                            });
+                        }
+                        Kind::Connected {
+                            ref topic,
+                            incarnation,
+                            first_seq,
+                        } => self.connections.push(Connection {
+                            node: event.node.clone(),
+                            topic: topic.clone(),
+                            incarnation,
+                            first_seq,
+                            at_ns: event.at_ns,
+                        }),
                         Kind::Published { .. } => {
                             self.published.insert(event.node.clone(), event.clone());
                         }
@@ -413,24 +500,65 @@ impl Fleet {
         Ok(())
     }
 
-    /// `(received, lagged, first_seq, last_seq)` of `node`'s latest `COUNT`.
-    fn count(&self, node: &str, incarnation: Incarnation) -> judge::Count {
-        match self.counts.get(node).map(|event| &event.kind) {
-            Some(&Kind::Count {
-                received,
-                lagged,
-                first_seq,
-                last_seq,
-                ..
-            }) => judge::Count {
-                incarnation,
-                received,
-                lagged,
-                first_seq,
-                last_seq,
-            },
-            _ => panic!("no COUNT from {node}"),
+    /// The last `COUNT` of `node`'s latest connection to `topic` that ended.
+    fn ended_count(&self, node: &str, topic: &str) -> Option<Counted> {
+        self.endings
+            .iter()
+            .rev()
+            .find(|ending| ending.node == node && ending.topic == topic)
+            .and_then(|ending| ending.count)
+    }
+
+    /// Read what the nodes print until `done` holds of what was read, within `within`.
+    fn until(
+        &mut self,
+        what: &str,
+        within: Duration,
+        mut done: impl FnMut(&Fleet) -> bool,
+    ) -> Result<(), Failure> {
+        let deadline = Instant::now() + within;
+        loop {
+            if done(self) {
+                return Ok(());
+            }
+            match self.pump(what, deadline)? {
+                Some(seen) => self.backlog.push_back(seen),
+                None if done(self) => return Ok(()),
+                None => return Err(self.failure(None, format!("{what}: not within {within:?}"))),
+            }
         }
+    }
+
+    /// `SIGSTOP` `node`, and wait until every thread of it stopped.
+    fn stop(&mut self, node: &str) {
+        let pid = Pid::from_raw(self.pid(node)).unwrap();
+        rustix::process::kill_process(pid, Signal::STOP).unwrap();
+        let stopped =
+            rustix::process::WaitIdOptions::STOPPED | rustix::process::WaitIdOptions::NOWAIT;
+        rustix::process::waitid(rustix::process::WaitId::Pid(pid), stopped).unwrap();
+    }
+
+    fn cont(&mut self, node: &str) {
+        let pid = Pid::from_raw(self.pid(node)).unwrap();
+        rustix::process::kill_process(pid, Signal::CONT).unwrap();
+    }
+
+    /// The incarnation of a running `node`.
+    fn incarnation(&self, node: &str) -> Incarnation {
+        Incarnation {
+            pid: self.pid(node) as u32,
+            start: self.starts[node],
+        }
+    }
+
+    /// Wait for the end of `node`, which was told to end or killed.
+    fn ended_node(&mut self, node: &str) -> Result<(), Failure> {
+        self.wait_for(
+            &format!("{node} to end"),
+            EXIT,
+            |seen| matches!(seen, Seen::Ended { node: n } if n == node),
+        )
+        .map(drop)
     }
 
     /// The incarnation and last seq of `node`'s `PUBLISHED`.
@@ -499,8 +627,12 @@ fn steady_state_one_topic() {
     }
     fleet.finish().unwrap();
     let (incarnation, last_published) = fleet.published("pub");
+    let topic = fleet.name("frames");
     for sub in SUBSCRIBERS {
-        let count = fleet.count(sub, incarnation);
+        let count = fleet
+            .ended_count(sub, &topic)
+            .unwrap_or_else(|| panic!("{sub}: no COUNT"))
+            .judged(incarnation);
         check_end(
             Mode::Counted,
             false,
@@ -577,6 +709,21 @@ fn env_number(name: &str, default: u64) -> u64 {
 struct Planned {
     node: String,
     topic: String,
+    named: bool,
+    mode: Mode,
+    start: Start,
+}
+
+impl Planned {
+    fn new(node: &str, topic: &str) -> Self {
+        Self {
+            node: node.into(),
+            topic: topic.into(),
+            named: false,
+            mode: Mode::Counted,
+            start: Start::Latest,
+        }
+    }
 }
 
 /// The six topics of plan 15 fleet test §3.1, their producers, a registry host, and
@@ -647,7 +794,8 @@ impl Topology {
             (
                 "p-control",
                 "--pub",
-                format!("topic={control},hz=50,bp=1000"),
+                // A subscriber 160 ms behind holds a publish, one stopped for 1 s is evicted (X5).
+                format!("topic={control},hz=50,bp=1000,window=8"),
                 &control,
             ),
             (
@@ -674,10 +822,14 @@ impl Topology {
             );
             topology.publishers.push((node.into(), topic.clone()));
             topology.reporters.push(node.into());
-            topology.planned(node, &status);
+            topology.subscriptions.push(Planned::new(node, &status));
         }
-        topology.planned("p-fused", &frames);
-        topology.planned("p-fused", &readings);
+        topology
+            .subscriptions
+            .push(Planned::new("p-fused", &frames));
+        topology
+            .subscriptions
+            .push(Planned::new("p-fused", &readings));
 
         // (topic, payload, a pool of bytes, through the registry)
         let topics = [
@@ -719,7 +871,16 @@ impl Topology {
                     spec += &format!(",via={registry}");
                 }
                 roles.push(("--sub", spec));
-                topology.planned(&node, topic);
+                topology.subscriptions.push(Planned {
+                    named,
+                    mode: if recv == "latest" {
+                        Mode::Latest
+                    } else {
+                        Mode::Counted
+                    },
+                    start: [Start::Latest, Start::Last, Start::Oldest][s % 3],
+                    ..Planned::new(&node, topic)
+                });
             }
             topology.node(&node, &roles);
         }
@@ -734,11 +895,31 @@ impl Topology {
         self.nodes.push((node.into(), args));
     }
 
-    fn planned(&mut self, node: &str, topic: &str) {
-        self.subscriptions.push(Planned {
-            node: node.into(),
-            topic: topic.into(),
-        });
+    /// The role arguments of `node`.
+    fn args(&self, node: &str) -> Vec<String> {
+        let (_, args) = self
+            .nodes
+            .iter()
+            .find(|(n, _)| n == node)
+            .expect("a node of the topology");
+        args.clone()
+    }
+
+    /// The subscriptions of `topic`.
+    fn of<'a>(&'a self, topic: &'a str) -> impl Iterator<Item = &'a Planned> + 'a {
+        self.subscriptions
+            .iter()
+            .filter(move |planned| planned.topic == topic)
+    }
+
+    /// The topic `node` publishes.
+    fn topic_of(&self, node: &str) -> String {
+        let (_, topic) = self
+            .publishers
+            .iter()
+            .find(|(n, _)| n == node)
+            .expect("a publisher");
+        topic.clone()
     }
 
     /// The nodes that publish, report or host the registry: asked first at a stop point.
@@ -751,8 +932,30 @@ impl Topology {
 /// binder and tokio pools; and the service manager's open files.
 #[derive(Debug, PartialEq)]
 struct Snapshot {
-    processes: BTreeMap<String, (usize, usize, usize)>,
+    /// Keyed by node and start count: a restarted node is another process.
+    processes: BTreeMap<(String, u32), (usize, usize, usize)>,
     hub_fds: Option<usize>,
+}
+
+impl Snapshot {
+    /// What changed from `earlier` in the processes both found, and in the hub.
+    fn changes(&self, earlier: &Snapshot) -> Vec<String> {
+        let mut changes: Vec<String> = self
+            .processes
+            .iter()
+            .filter_map(|(key, now)| {
+                let then = earlier.processes.get(key)?;
+                (then != now).then(|| format!("{key:?}: {then:?} -> {now:?}"))
+            })
+            .collect();
+        if self.hub_fds != earlier.hub_fds {
+            changes.push(format!(
+                "rsb_hub fds: {:?} -> {:?}",
+                earlier.hub_fds, self.hub_fds
+            ));
+        }
+        changes
+    }
 }
 
 fn memfd_counts(pid: i32) -> (usize, usize, usize) {
@@ -800,7 +1003,11 @@ fn hub_fds() -> Option<usize> {
 /// Producers are asked before subscribers, and the subscribers a second after, so that a
 /// subscriber's counts, read later, are at least what its publisher saw, and the last report
 /// a reporter had sent has reached every T5 subscriber.
-fn stop_point(fleet: &mut Fleet, topology: &Topology) -> Result<Snapshot, Failure> {
+fn stop_point(
+    fleet: &mut Fleet,
+    topology: &Topology,
+    evicted: &HashMap<String, u64>,
+) -> Result<Snapshot, Failure> {
     let mut wrong = Vec::new();
     let mut published: HashMap<String, (u64, Vec<Subscribed>)> = HashMap::new();
     let mut reported: Vec<(String, u64)> = Vec::new();
@@ -874,12 +1081,15 @@ fn stop_point(fleet: &mut Fleet, topology: &Topology) -> Result<Snapshot, Failur
         .map(|(node, _)| (fleet.pid(node), node.clone()))
         .collect();
     for (publisher, topic) in &topology.publishers {
-        let Some((evicted, subscribed)) = published.get(topic) else {
+        let Some((evictions, subscribed)) = published.get(topic) else {
             wrong.push(format!("{publisher}: no PSTATS of {topic}"));
             continue;
         };
-        if *evicted != 0 {
-            wrong.push(format!("{publisher} {topic}: {evicted} evicted"));
+        let expected_evictions = evicted.get(topic).copied().unwrap_or(0);
+        if *evictions != expected_evictions {
+            wrong.push(format!(
+                "{publisher} {topic}: {evictions} evicted, expected {expected_evictions}"
+            ));
         }
         let mut expected: Vec<i32> = topology
             .subscriptions
@@ -969,10 +1179,49 @@ fn stop_point(fleet: &mut Fleet, topology: &Topology) -> Result<Snapshot, Failur
         processes: topology
             .nodes
             .iter()
-            .map(|(node, _)| (node.clone(), memfd_counts(fleet.pid(node))))
+            .map(|(node, _)| {
+                (
+                    (node.clone(), fleet.starts[node.as_str()]),
+                    memfd_counts(fleet.pid(node)),
+                )
+            })
             .collect(),
         hub_fds: hub_fds(),
     })
+}
+
+/// A stop point that holds within `within`: asked again while it fails, as the fleet converges
+/// after a fault (plan 15 fleet test §5.2: what the service manager's late notices cause settles
+/// by a stop point). The failure is the last one.
+fn settle(
+    fleet: &mut Fleet,
+    topology: &Topology,
+    evicted: &HashMap<String, u64>,
+    within: Duration,
+) -> Result<Snapshot, Failure> {
+    let deadline = Instant::now() + within;
+    loop {
+        match stop_point(fleet, topology, evicted) {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(failure) if Instant::now() >= deadline => return Err(failure),
+            Err(_) => fleet.watch("settling", Duration::from_millis(500))?,
+        }
+    }
+}
+
+/// The topology of `tag` started, every subscription connected.
+fn start_fleet(tag: &str) -> (Fleet, Topology) {
+    init();
+    let scale = env_number("FLEET_SCALE", 1) as usize;
+    let mut fleet = Fleet::new(tag);
+    let topology = Topology::new(&fleet, scale);
+    for (node, args) in &topology.nodes {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        fleet.spawn(node, &args);
+    }
+    let all = |_: &Planned| true;
+    connected_since(&mut fleet, &topology, all, 0, None, CONNECT).unwrap();
+    (fleet, topology)
 }
 
 /// Plan 15 fleet test F2: the six topics run with no fault; at each stop point every check of
@@ -980,43 +1229,471 @@ fn stop_point(fleet: &mut Fleet, topology: &Topology) -> Result<Snapshot, Failur
 #[test]
 #[ignore = "requires a binder device and a permissive service manager"]
 fn steady_state_fleet() {
-    init();
-    let scale = env_number("FLEET_SCALE", 1) as usize;
     let steady = Duration::from_secs(env_number("FLEET_STEADY_SECS", 30));
-    let mut fleet = Fleet::new("fleet");
-    let topology = Topology::new(&fleet, scale);
-    for (node, args) in &topology.nodes {
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        fleet.spawn(node, &args);
-    }
-    let mut pending: HashSet<(String, String)> = topology
-        .subscriptions
-        .iter()
-        .map(|planned| (planned.node.clone(), planned.topic.clone()))
-        .collect();
-    while !pending.is_empty() {
-        let seen = fleet
-            .wait_for("every subscription CONNECTED", Duration::from_secs(20), |seen| {
-                matches!(seen, Seen::Event(Event { node, kind: Kind::Connected { topic, .. }, .. })
-                    if pending.contains(&(node.clone(), topic.clone())))
-            })
-            .unwrap_or_else(|failure| panic!("{failure:?}\nnot connected: {pending:?}"));
-        if let Seen::Event(Event {
-            node,
-            kind: Kind::Connected { topic, .. },
-            ..
-        }) = seen
-        {
-            pending.remove(&(node, topic));
-        }
-    }
+    let (mut fleet, topology) = start_fleet("fleet");
+    let none = HashMap::new();
     fleet.watch("warm-up", Duration::from_secs(5)).unwrap();
-    let first = stop_point(&mut fleet, &topology).unwrap();
+    let first = stop_point(&mut fleet, &topology, &none).unwrap();
     fleet.watch("steady state", steady).unwrap();
-    let second = stop_point(&mut fleet, &topology).unwrap();
+    let second = stop_point(&mut fleet, &topology, &none).unwrap();
     assert_eq!(
         first, second,
         "memfds, mappings, threads or hub files changed"
     );
+    fleet.finish().unwrap();
+}
+
+/// From a restart (or `resume`, `rebind`, `SIGCONT`) to a connection (§5.4).
+const CONNECT: Duration = Duration::from_secs(10);
+/// From the end of a phase to a stop point that holds.
+const SETTLE: Duration = Duration::from_secs(15);
+
+/// A bound of §5.4, times `FLEET_TIME_FACTOR` (default 1) for a loaded machine.
+fn bound(base: Duration) -> Duration {
+    base * env_number("FLEET_TIME_FACTOR", 1) as u32
+}
+
+/// Until each subscription `which` takes has a `CONNECTED` read after `since`, to `incarnation`
+/// if one is given.
+fn connected_since(
+    fleet: &mut Fleet,
+    topology: &Topology,
+    which: impl Fn(&Planned) -> bool,
+    since: u64,
+    incarnation: Option<Incarnation>,
+    within: Duration,
+) -> Result<(), Failure> {
+    let wanted: Vec<(String, String)> = topology
+        .subscriptions
+        .iter()
+        .filter(|planned| which(planned))
+        .map(|planned| (planned.node.clone(), planned.topic.clone()))
+        .collect();
+    let connected = |fleet: &Fleet, (node, topic): &(String, String)| {
+        fleet.connections.iter().any(|c| {
+            c.node == *node
+                && c.topic == *topic
+                && c.at_ns >= since
+                && incarnation.is_none_or(|incarnation| c.incarnation == incarnation)
+        })
+    };
+    let result = fleet.until("every subscription connected", bound(within), |fleet| {
+        wanted.iter().all(|key| connected(fleet, key))
+    });
+    result.map_err(|failure| {
+        let missing: Vec<_> = wanted.iter().filter(|key| !connected(fleet, key)).collect();
+        Failure(format!("{}\nnot connected: {missing:?}", failure.0))
+    })
+}
+
+/// The `ENDED` of `planned` that answers `injected`, read after `since`: a plain subscriber's
+/// first end, a named one's first end of an expected reason (the service manager's late
+/// notices may end a connection of it first, §5.2).
+fn answer<'a>(
+    fleet: &'a Fleet,
+    planned: &Planned,
+    injected: Injected,
+    since: u64,
+) -> Option<&'a Ending> {
+    let allowed = end_reasons(injected, planned.named);
+    let mut after = fleet
+        .endings
+        .iter()
+        .filter(|e| e.node == planned.node && e.topic == planned.topic && e.at_ns >= since);
+    if planned.named {
+        after.find(|e| allowed.contains(&e.reason.as_str()))
+    } else {
+        after.next()
+    }
+}
+
+/// Every subscription `which` takes ends after `since` as `injected` makes it, within `limit`.
+fn ended_since(
+    fleet: &mut Fleet,
+    topology: &Topology,
+    which: impl Fn(&Planned) -> bool,
+    injected: Injected,
+    since: u64,
+    limit: Duration,
+) -> Result<(), Failure> {
+    let limit = bound(limit);
+    let planned: Vec<&Planned> = topology.subscriptions.iter().filter(|p| which(p)).collect();
+    fleet.until(&format!("every {injected:?} end"), limit * 2, |fleet| {
+        planned
+            .iter()
+            .all(|p| answer(fleet, p, injected, since).is_some())
+    })?;
+    let mut wrong = Vec::new();
+    for p in planned {
+        let allowed = end_reasons(injected, p.named);
+        let Some(ending) = answer(fleet, p, injected, since) else {
+            continue;
+        };
+        let took = Duration::from_nanos(ending.at_ns.saturating_sub(since));
+        if !allowed.contains(&ending.reason.as_str()) {
+            wrong.push(format!(
+                "{} {}: ended {}, not {allowed:?}",
+                p.node, p.topic, ending.reason
+            ));
+        } else if took > limit {
+            wrong.push(format!(
+                "{} {}: ended {} after {took:?}",
+                p.node, p.topic, ending.reason
+            ));
+        }
+    }
+    if wrong.is_empty() {
+        Ok(())
+    } else {
+        Err(fleet.failure(None, wrong.join("\n")))
+    }
+}
+
+fn args_of(args: &[String]) -> Vec<&str> {
+    args.iter().map(String::as_str).collect()
+}
+
+type Phase = fn(&mut Fleet, &Topology, &mut HashMap<String, u64>) -> Result<(), Failure>;
+
+/// X1: a producer killed and restarted with records it published before it registered; each
+/// connection to it starts where `NamedSubscriber`'s rule, or the plain subscriber's own start,
+/// says.
+fn x1_killed_producer_restarts_with_records(
+    fleet: &mut Fleet,
+    topology: &Topology,
+    _: &mut HashMap<String, u64>,
+) -> Result<(), Failure> {
+    const RECORDS: u64 = 50;
+    let node = "p-readings";
+    let topic = topology.topic_of(node);
+    let of_topic = |p: &Planned| p.topic == topic;
+    let since = now_ns();
+    fleet.kill(node, Signal::KILL);
+    ended_since(fleet, topology, of_topic, Injected::Kill, since, END)?;
+    fleet.ended_node(node)?;
+    let mut args = topology.args(node);
+    args[1] += &format!(",prepub={RECORDS}");
+    let restarted = now_ns();
+    fleet.spawn(node, &args_of(&args));
+    let incarnation = fleet.incarnation(node);
+
+    // Every subscription made again before the first record after the K: then each starts
+    // where the rule says, not where the publisher happened to be.
+    let mut expected: Vec<i32> = topology.of(&topic).map(|p| fleet.pid(&p.node)).collect();
+    expected.sort_unstable();
+    let deadline = Instant::now() + bound(CONNECT);
+    loop {
+        let mut held: Vec<i32> = fleet
+            .stats(node)?
+            .into_iter()
+            .find_map(|kind| match kind {
+                Kind::PubStats {
+                    topic: t,
+                    subscribers,
+                    ..
+                } if t == topic => Some(subscribers.iter().map(|info| info.pid).collect()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        held.sort_unstable();
+        if held == expected {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(fleet.failure(
+                None,
+                format!("X1: subscriptions {held:?}, expected {expected:?}"),
+            ));
+        }
+        fleet.watch("X1 resubscriptions", Duration::from_millis(200))?;
+    }
+    fleet.command(node, &format!("resume {topic}"));
+    connected_since(
+        fleet,
+        topology,
+        of_topic,
+        restarted,
+        Some(incarnation),
+        CONNECT,
+    )?;
+
+    let at = Committed {
+        next: RECORDS,
+        oldest: 0,
+    };
+    let mut wrong = Vec::new();
+    for p in topology.of(&topic).filter(|p| p.mode == Mode::Counted) {
+        let history = if p.named {
+            History::NewPublisher
+        } else {
+            History::First
+        };
+        let connection = fleet
+            .connections
+            .iter()
+            .find(|c| c.node == p.node && c.topic == topic && c.incarnation == incarnation);
+        if let Some(connection) = connection {
+            if let Err(text) = check_first(first_seq(p.start, history, at), connection.first_seq) {
+                wrong.push(format!(
+                    "{} ({:?}, named {}): {text}",
+                    p.node, p.start, p.named
+                ));
+            }
+        }
+    }
+    if wrong.is_empty() {
+        Ok(())
+    } else {
+        Err(fleet.failure(None, format!("X1 start positions:\n{}", wrong.join("\n"))))
+    }
+}
+
+/// X2: a producer closes its topic, then exits and starts again; every record before the end
+/// was returned or counted.
+fn x2_closed_producer_restarts(
+    fleet: &mut Fleet,
+    topology: &Topology,
+    evicted: &mut HashMap<String, u64>,
+) -> Result<(), Failure> {
+    let node = "p-control";
+    let topic = topology.topic_of(node);
+    let of_topic = |p: &Planned| p.topic == topic;
+    let incarnation = fleet.incarnation(node);
+    let since = now_ns();
+    fleet.command(node, &format!("close {topic}"));
+    ended_since(fleet, topology, of_topic, Injected::Close, since, END)?;
+    fleet.until("X2 PUBLISHED", bound(END), |fleet| {
+        fleet
+            .published
+            .get(node)
+            .is_some_and(|event| event.at_ns >= since)
+    })?;
+    let (_, last_published) = fleet.published(node);
+    let mut wrong = Vec::new();
+    for p in topology.of(&topic) {
+        let ending = answer(fleet, p, Injected::Close, since).cloned();
+        let Some(ending) = ending else { continue };
+        let count = ending.count.map(|count| count.judged(incarnation));
+        if let Err(text) = check_end(
+            p.mode,
+            p.named,
+            Injected::Close,
+            &ending.reason,
+            count.as_ref(),
+            Some(last_published),
+        ) {
+            wrong.push(format!("{}: {text}", p.node));
+        }
+    }
+    if !wrong.is_empty() {
+        return Err(fleet.failure(None, format!("X2 ends:\n{}", wrong.join("\n"))));
+    }
+    fleet.command(node, "exit");
+    fleet.ended_node(node)?;
+    evicted.remove(&topic);
+    let restarted = now_ns();
+    fleet.spawn(node, &args_of(&topology.args(node)));
+    let incarnation = Some(fleet.incarnation(node));
+    connected_since(fleet, topology, of_topic, restarted, incarnation, CONNECT)
+}
+
+/// X3 and X3b: a second process takes a producer's name while it runs; named subscribers drain
+/// and follow it, plain ones stay. Killed, it takes the name with it; the first process
+/// registers its binder again, and the named subscribers come back without a record twice.
+fn x3_duplicate_takes_the_name_and_gives_it_back(
+    fleet: &mut Fleet,
+    topology: &Topology,
+    _: &mut HashMap<String, u64>,
+) -> Result<(), Failure> {
+    let node = "p-control";
+    let duplicate = "p-control-dup";
+    let topic = topology.topic_of(node);
+    let named = |p: &Planned| p.topic == topic && p.named;
+    let since = now_ns();
+    let spec = topology.args(node)[1].clone();
+    fleet.spawn(duplicate, &["--pub", &spec]);
+    let taken = fleet.incarnation(duplicate);
+    fleet.until("X3 Replaced", bound(CONNECT), |fleet| {
+        topology.of(&topic).filter(|p| p.named).all(|p| {
+            fleet.endings.iter().any(|e| {
+                e.node == p.node && e.topic == topic && e.at_ns >= since && e.reason == "Replaced"
+            })
+        })
+    })?;
+    connected_since(fleet, topology, named, since, Some(taken), CONNECT)?;
+
+    let killed = now_ns();
+    fleet.kill(duplicate, Signal::KILL);
+    ended_since(fleet, topology, named, Injected::Kill, killed, END)?;
+    fleet.ended_node(duplicate)?;
+
+    let readvertised = now_ns();
+    fleet.command(node, &format!("readvertise {topic}"));
+    let back = Some(fleet.incarnation(node));
+    connected_since(fleet, topology, named, readvertised, back, CONNECT)?;
+
+    let plain_ended: Vec<&Ending> = fleet
+        .endings
+        .iter()
+        .filter(|e| e.topic == topic && e.at_ns >= since)
+        .filter(|e| topology.of(&topic).any(|p| p.node == e.node && !p.named))
+        .collect();
+    if plain_ended.is_empty() {
+        Ok(())
+    } else {
+        Err(fleet.failure(
+            None,
+            format!("X3: plain subscribers ended: {plain_ended:?}"),
+        ))
+    }
+}
+
+/// X4: half the subscriber nodes killed at once and started again.
+fn x4_half_the_subscribers_die(
+    fleet: &mut Fleet,
+    topology: &Topology,
+    _: &mut HashMap<String, u64>,
+) -> Result<(), Failure> {
+    let victims: Vec<String> = topology
+        .nodes
+        .iter()
+        .map(|(node, _)| node.clone())
+        .filter(|node| !Topology::is_producer(node))
+        .step_by(2)
+        .collect();
+    for node in &victims {
+        fleet.kill(node, Signal::KILL);
+    }
+    for node in &victims {
+        fleet.ended_node(node)?;
+    }
+    let restarted = now_ns();
+    for node in &victims {
+        fleet.spawn(node, &args_of(&topology.args(node)));
+    }
+    let restarted_nodes = |p: &Planned| victims.contains(&p.node);
+    connected_since(fleet, topology, restarted_nodes, restarted, None, CONNECT)
+}
+
+/// X5: two subscriber nodes stopped for 2 s: one of T2 counts exactly what it lost (its node's
+/// judge checks the next seq), one of T3 is evicted and started again.
+fn x5_stopped_subscribers(
+    fleet: &mut Fleet,
+    topology: &Topology,
+    evicted: &mut HashMap<String, u64>,
+) -> Result<(), Failure> {
+    let control = topology.topic_of("p-control");
+    let readings = topology.topic_of("p-readings");
+    let subscriber = |p: &&Planned| !Topology::is_producer(&p.node);
+    let slow = topology
+        .of(&control)
+        .find(subscriber)
+        .map(|p| p.node.clone())
+        .expect("a T3 subscriber node");
+    let lagging = topology
+        .of(&readings)
+        .filter(subscriber)
+        .find(|p| {
+            p.mode == Mode::Counted && !p.named && topology.of(&control).all(|c| c.node != p.node)
+        })
+        .map(|p| p.node.clone())
+        .expect("a counted plain T2 subscriber node");
+    let lagged = |fleet: &Fleet| {
+        fleet
+            .counts
+            .get(&(lagging.clone(), readings.clone()))
+            .map_or(0, |count| count.lagged)
+    };
+    let before = lagged(fleet);
+    let since = now_ns();
+    fleet.stop(&slow);
+    fleet.stop(&lagging);
+    fleet.watch("X5 stopped", Duration::from_secs(2))?;
+    fleet.cont(&slow);
+    fleet.cont(&lagging);
+    fleet.until("X5 eviction", bound(END * 2), |fleet| {
+        fleet.endings.iter().any(|e| {
+            e.node == slow
+                && e.topic == control
+                && e.at_ns >= since
+                && e.reason.ends_with("Evicted")
+        })
+    })?;
+    *evicted.entry(control.clone()).or_default() += 1;
+    fleet.until("X5 lag", bound(END * 3), |fleet| lagged(fleet) > before)?;
+
+    fleet.kill(&slow, Signal::KILL);
+    fleet.ended_node(&slow)?;
+    let restarted = now_ns();
+    fleet.spawn(&slow, &args_of(&topology.args(&slow)));
+    let restarted_node = |p: &Planned| p.node == slow;
+    connected_since(fleet, topology, restarted_node, restarted, None, CONNECT)
+}
+
+/// X6: a producer stopped for 3 s: no subscriber takes it for gone, and all go on after it.
+fn x6_stopped_producer(
+    fleet: &mut Fleet,
+    topology: &Topology,
+    _: &mut HashMap<String, u64>,
+) -> Result<(), Failure> {
+    let node = "p-frames";
+    let topic = topology.topic_of(node);
+    let last = |fleet: &Fleet, p: &Planned| {
+        fleet
+            .counts
+            .get(&(p.node.clone(), topic.clone()))
+            .map(|count| count.last_seq)
+    };
+    let before: Vec<(&Planned, Option<u64>)> =
+        topology.of(&topic).map(|p| (p, last(fleet, p))).collect();
+    let since = now_ns();
+    fleet.stop(node);
+    fleet.watch("X6 stopped", Duration::from_secs(3))?;
+    fleet.cont(node);
+    fleet.until("X6 records after SIGCONT", bound(CONNECT), |fleet| {
+        before
+            .iter()
+            .all(|&(p, seq)| last(fleet, p).is_some_and(|now| seq.is_none_or(|seq| now > seq)))
+    })?;
+    let ended: Vec<&Ending> = fleet
+        .endings
+        .iter()
+        .filter(|e| e.topic == topic && e.at_ns >= since)
+        .collect();
+    if ended.is_empty() {
+        Ok(())
+    } else {
+        Err(fleet.failure(None, format!("X6: a stopped producer ended {ended:?}")))
+    }
+}
+
+/// Plan 15 fleet test F3: the scripted faults, one at a time, each followed by a stop point that
+/// holds and leaves every process that lived through it as it was.
+#[test]
+#[ignore = "requires a binder device and a permissive service manager"]
+fn scripted_faults() {
+    let (mut fleet, topology) = start_fleet("faults");
+    let mut evicted = HashMap::new();
+    fleet.watch("warm-up", Duration::from_secs(3)).unwrap();
+    let baseline = settle(&mut fleet, &topology, &evicted, SETTLE).unwrap();
+    let phases: [(&str, Phase); 6] = [
+        ("X1", x1_killed_producer_restarts_with_records),
+        ("X2", x2_closed_producer_restarts),
+        ("X3", x3_duplicate_takes_the_name_and_gives_it_back),
+        ("X4", x4_half_the_subscribers_die),
+        ("X5", x5_stopped_subscribers),
+        ("X6", x6_stopped_producer),
+    ];
+    for (name, phase) in phases {
+        phase(&mut fleet, &topology, &mut evicted)
+            .unwrap_or_else(|failure| panic!("{name}: {failure:?}"));
+        let snapshot = settle(&mut fleet, &topology, &evicted, SETTLE)
+            .unwrap_or_else(|failure| panic!("{name}, stop point: {failure:?}"));
+        let changes = snapshot.changes(&baseline);
+        assert!(
+            changes.is_empty(),
+            "{name}: processes changed: {changes:#?}"
+        );
+    }
     fleet.finish().unwrap();
 }

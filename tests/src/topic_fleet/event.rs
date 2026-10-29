@@ -55,8 +55,9 @@ pub enum Kind {
     Violation { topic: String, text: String },
     /// The node cannot go on.
     Fault { text: String },
-    /// At `stats`: a subscription's `stats()`, then what the node counted over all of its
-    /// connections, and for a `NamedSubscriber` whether it is connected (a plain one always is).
+    /// At `stats`: a subscription's `stats()`, then what the node counted over what those cover
+    /// (a `NamedSubscriber`'s every connection, a `Subscriber`'s current one), and for a
+    /// `NamedSubscriber` whether it is connected (a plain one always is).
     SubStats {
         topic: String,
         received: u64,

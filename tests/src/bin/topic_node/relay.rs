@@ -133,6 +133,8 @@ pub fn report(out: &Out, service: String, hz: u32, incarnation: Incarnation) -> 
                     }]);
                     continue;
                 }
+                // A reporter has no topic, so no command names it.
+                Ok(Request::Command(_)) => continue,
                 Ok(Request::Stop) | Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => {}
             }
