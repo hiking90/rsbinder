@@ -22,7 +22,7 @@
 
 #![cfg(any(target_os = "linux", target_os = "android"))]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
@@ -32,8 +32,10 @@ use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use rsbinder::{hub, ProcessState};
+use rsbinder_topic::aidl::ITopicRegistry::SERVICE_NAME;
 use rustix::process::{Pid, Signal};
-use tests::topic_fleet::event::{Event, Kind};
+use tests::topic_fleet::event::{Event, Kind, Subscribed};
 use tests::topic_fleet::judge::{self, check_end, end_reason, Injected, Mode};
 use tests::topic_fleet::now_ns;
 use tests::topic_fleet::record::Incarnation;
@@ -119,6 +121,18 @@ fn node_bin() -> PathBuf {
     std::env::var_os("TOPIC_NODE_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| env!("CARGO_BIN_EXE_topic_node").into())
+}
+
+fn is_stats(kind: &Kind) -> bool {
+    matches!(
+        kind,
+        Kind::SubStats { .. }
+            | Kind::PubStats { .. }
+            | Kind::RegStats { .. }
+            | Kind::Reported { .. }
+            | Kind::ReportSeen { .. }
+            | Kind::StatsDone
+    )
 }
 
 fn tail(path: &Path, lines: usize) -> String {
@@ -255,39 +269,34 @@ impl Fleet {
         let _ = writeln!(self.log, "{line}");
     }
 
-    /// The first thing seen that `matches`, from the backlog or the nodes, within `within`.
-    fn wait_for(
-        &mut self,
-        what: &str,
-        within: Duration,
-        mut matches: impl FnMut(&Seen) -> bool,
-    ) -> Result<Seen, Failure> {
-        if let Some(at) = self.backlog.iter().position(&mut matches) {
-            return Ok(self.backlog.remove(at).unwrap());
-        }
-        let deadline = Instant::now() + within;
+    /// The next thing seen from the nodes before `deadline`, `None` at it. A `COUNT` is kept as
+    /// its node's latest and not returned: no wait is for one.
+    fn pump(&mut self, what: &str, deadline: Instant) -> Result<Option<Seen>, Failure> {
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             let Ok(message) = self.recv.recv_timeout(left) else {
-                return Err(self.failure(None, format!("{what}: not within {within:?}")));
+                return Ok(None);
             };
-            let seen = match message {
+            match message {
                 Message::Line(event) => {
                     self.log(&event.line());
-                    if let Kind::Fault { .. } | Kind::Violation { .. } = event.kind {
-                        let node = event.node.clone();
-                        return Err(self.failure(Some(&node), format!("{what}: {}", event.line())));
-                    }
                     match event.kind {
+                        Kind::Fault { .. } | Kind::Violation { .. } => {
+                            let node = event.node.clone();
+                            return Err(
+                                self.failure(Some(&node), format!("{what}: {}", event.line()))
+                            );
+                        }
                         Kind::Count { .. } => {
-                            self.counts.insert(event.node.clone(), event.clone());
+                            self.counts.insert(event.node.clone(), event);
+                            continue;
                         }
                         Kind::Published { .. } => {
                             self.published.insert(event.node.clone(), event.clone());
                         }
                         _ => {}
                     }
-                    Seen::Event(event)
+                    return Ok(Some(Seen::Event(event)));
                 }
                 Message::Garbled { node, line } => {
                     self.log(&format!("{node} garbled: {line}"));
@@ -311,14 +320,62 @@ impl Fleet {
                             format!("{what}: {node} ended with {status}, expected {expect:?}"),
                         ));
                     }
-                    Seen::Ended { node }
+                    return Ok(Some(Seen::Ended { node }));
                 }
-            };
+            }
+        }
+    }
+
+    /// The first thing seen that `matches`, from the backlog or the nodes, within `within`.
+    fn wait_for(
+        &mut self,
+        what: &str,
+        within: Duration,
+        mut matches: impl FnMut(&Seen) -> bool,
+    ) -> Result<Seen, Failure> {
+        if let Some(at) = self.backlog.iter().position(&mut matches) {
+            return Ok(self.backlog.remove(at).unwrap());
+        }
+        let deadline = Instant::now() + within;
+        while let Some(seen) = self.pump(what, deadline)? {
             if matches(&seen) {
                 return Ok(seen);
             }
             self.backlog.push_back(seen);
         }
+        Err(self.failure(None, format!("{what}: not within {within:?}")))
+    }
+
+    /// Read what the nodes print for `duration`, failing as a wait does; what it reads is not
+    /// kept for a later wait.
+    fn watch(&mut self, what: &str, duration: Duration) -> Result<(), Failure> {
+        let deadline = Instant::now() + duration;
+        while self.pump(what, deadline)?.is_some() {}
+        Ok(())
+    }
+
+    /// `node`'s answer to `stats`: every line up to its `STATSDONE`.
+    fn stats(&mut self, node: &str) -> Result<Vec<Kind>, Failure> {
+        self.command(node, "stats");
+        let mut kinds = Vec::new();
+        loop {
+            let seen = self.wait_for(&format!("{node} stats"), READY, |seen| {
+                matches!(seen, Seen::Event(Event { node: n, kind, .. }) if n == node && is_stats(kind))
+            })?;
+            match seen {
+                Seen::Event(Event {
+                    kind: Kind::StatsDone,
+                    ..
+                }) => return Ok(kinds),
+                Seen::Event(event) => kinds.push(event.kind),
+                Seen::Ended { .. } => unreachable!(),
+            }
+        }
+    }
+
+    /// The pid of a running `node`.
+    fn pid(&self, node: &str) -> i32 {
+        self.nodes[node].child.id() as i32
     }
 
     /// `node`'s `ENDED` of `topic` with `reason`.
@@ -413,9 +470,9 @@ const SUBSCRIBERS: [&str; 2] = ["sub-1", "sub-2"];
 fn one_topic(tag: &str, hz: u32) -> Fleet {
     let mut fleet = Fleet::new(tag);
     let topic = fleet.name("frames");
-    fleet.spawn("pub", &["--pub", &format!("{topic}:{hz}")]);
+    fleet.spawn("pub", &["--pub", &format!("topic={topic},hz={hz}")]);
     for sub in SUBSCRIBERS {
-        fleet.spawn(sub, &["--sub", &topic]);
+        fleet.spawn(sub, &["--sub", &format!("topic={topic}")]);
     }
     fleet
 }
@@ -496,6 +553,470 @@ fn a_node_that_panics_fails_the_run() {
         failure.0.contains("sub-1 ended with")
             && failure.0.contains("crash, as the controller asked"),
         "{failure:?}"
+    );
+    fleet.finish().unwrap();
+}
+
+/// This process's binder, for the service manager's list of names.
+fn init() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        ProcessState::init_default().expect("a binder device");
+        ProcessState::start_thread_pool();
+    });
+}
+
+fn env_number(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+/// One subscription the topology makes.
+struct Planned {
+    node: String,
+    topic: String,
+}
+
+/// The six topics of plan 15 fleet test §3.1, their producers, a registry host, and
+/// subscriber nodes that each hold three subscriptions over the axes of §3.2.
+struct Topology {
+    /// In start order: a node and its role arguments.
+    nodes: Vec<(String, Vec<String>)>,
+    subscriptions: Vec<Planned>,
+    /// Each publishing node and its topic.
+    publishers: Vec<(String, String)>,
+    reporters: Vec<String>,
+    registry: String,
+    /// The names the service manager is expected to hold for this fleet.
+    registered: Vec<String>,
+    /// T5 and T6.
+    status: String,
+    named: String,
+}
+
+impl Topology {
+    fn new(fleet: &Fleet, scale: usize) -> Self {
+        let name = |topic: &str| fleet.name(topic);
+        let (frames, readings, control) = (name("frames"), name("readings"), name("control"));
+        let (fused, status, named) = (name("fused"), name("status"), name("named.reg"));
+        let service = name("status.svc");
+        let registry = format!("{SERVICE_NAME}.fleet.{}.{}", fleet.tag, std::process::id());
+        let report = format!("service={service}");
+        let to_status = format!("topic={status},payload=record");
+        let mut topology = Self {
+            nodes: Vec::new(),
+            subscriptions: Vec::new(),
+            publishers: Vec::new(),
+            reporters: Vec::new(),
+            registry: registry.clone(),
+            registered: vec![
+                frames.clone(),
+                readings.clone(),
+                control.clone(),
+                fused.clone(),
+                status.clone(),
+                service.clone(),
+                registry.clone(),
+            ],
+            status: status.clone(),
+            named: named.clone(),
+        };
+        topology.node("registry", &[("--registry", format!("service={registry}"))]);
+        topology.node(
+            "p-status",
+            &[("--relay", format!("topic={status},service={service}"))],
+        );
+        topology
+            .publishers
+            .push(("p-status".into(), status.clone()));
+        let producers = [
+            (
+                "p-frames",
+                "--pub",
+                format!("topic={frames},size=1048576,pool,subs=32,hz=10"),
+                &frames,
+            ),
+            (
+                "p-readings",
+                "--pub",
+                format!("topic={readings},payload=record,hz=1000,ring=16384"),
+                &readings,
+            ),
+            (
+                "p-control",
+                "--pub",
+                format!("topic={control},hz=50,bp=1000"),
+                &control,
+            ),
+            (
+                "p-named",
+                "--pub",
+                format!("topic={named},hz=20,via={registry}"),
+                &named,
+            ),
+            (
+                "p-fused",
+                "--fuse",
+                format!("out={fused},frames={frames},readings={readings}"),
+                &fused,
+            ),
+        ];
+        for (node, role, spec, topic) in producers {
+            topology.node(
+                node,
+                &[
+                    (role, spec),
+                    ("--report", report.clone()),
+                    ("--sub", to_status.clone()),
+                ],
+            );
+            topology.publishers.push((node.into(), topic.clone()));
+            topology.reporters.push(node.into());
+            topology.planned(node, &status);
+        }
+        topology.planned("p-fused", &frames);
+        topology.planned("p-fused", &readings);
+
+        // (topic, payload, a pool of bytes, through the registry)
+        let topics = [
+            (&frames, "bytes", true, false),
+            (&readings, "record", false, false),
+            (&control, "bytes", false, false),
+            (&fused, "record", false, false),
+            (&status, "record", false, false),
+            (&named, "bytes", false, true),
+        ];
+        for i in 0..20 * scale {
+            let node = format!("s-{i}");
+            let mut roles = Vec::new();
+            for j in 0..3 {
+                let (topic, payload, pool, via_registry) = topics[(i + 2 * j) % topics.len()];
+                let s = i * 3 + j;
+                let named = via_registry || s % 3 == 1;
+                let recv = match s % 5 {
+                    1 => "latest",
+                    2 => "async",
+                    4 if pool && !named => "sample",
+                    _ => "recv",
+                };
+                let fd = s % 2 == 1;
+                let start = ["latest", "last", "oldest"][s % 3];
+                let mut spec = format!(
+                    "topic={topic},payload={payload},api={},recv={recv},wake={},start={start}",
+                    if named { "named" } else { "plain" },
+                    if fd { "fd" } else { "futex" },
+                );
+                // At scale 1, one trusted sample and one untrusted (s = 44, 54).
+                if recv == "sample" && s % 4 == 0 {
+                    spec += ",trust";
+                }
+                if fd && recv != "async" {
+                    spec += ",group=g";
+                }
+                if via_registry {
+                    spec += &format!(",via={registry}");
+                }
+                roles.push(("--sub", spec));
+                topology.planned(&node, topic);
+            }
+            topology.node(&node, &roles);
+        }
+        topology
+    }
+
+    fn node(&mut self, node: &str, roles: &[(&str, String)]) {
+        let args = roles
+            .iter()
+            .flat_map(|(flag, spec)| [flag.to_string(), spec.clone()])
+            .collect();
+        self.nodes.push((node.into(), args));
+    }
+
+    fn planned(&mut self, node: &str, topic: &str) {
+        self.subscriptions.push(Planned {
+            node: node.into(),
+            topic: topic.into(),
+        });
+    }
+
+    /// The nodes that publish, report or host the registry: asked first at a stop point.
+    fn is_producer(node: &str) -> bool {
+        !node.starts_with("s-")
+    }
+}
+
+/// What a stop point found of each process: memfds open, memfd mappings, threads outside the
+/// binder and tokio pools; and the service manager's open files.
+#[derive(Debug, PartialEq)]
+struct Snapshot {
+    processes: BTreeMap<String, (usize, usize, usize)>,
+    hub_fds: Option<usize>,
+}
+
+fn memfd_counts(pid: i32) -> (usize, usize, usize) {
+    let memfds = fs::read_dir(format!("/proc/{pid}/fd"))
+        .map(|fds| {
+            fds.filter_map(Result::ok)
+                .filter(|fd| {
+                    fs::read_link(fd.path())
+                        .is_ok_and(|target| target.to_string_lossy().starts_with("/memfd:"))
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    let maps = fs::read_to_string(format!("/proc/{pid}/maps"))
+        .map(|maps| maps.lines().filter(|line| line.contains("/memfd:")).count())
+        .unwrap_or(0);
+    // The binder pool and tokio's blocking pool start threads on demand and the latter ends idle
+    // ones, so neither count is fixed; what a leak leaves (a connect or retry thread of
+    // rsbinder-topic, a role's) is named otherwise.
+    let threads = fs::read_dir(format!("/proc/{pid}/task")).map_or(0, |tasks| {
+        tasks
+            .filter_map(Result::ok)
+            .filter(|task| {
+                let comm = fs::read_to_string(task.path().join("comm")).unwrap_or_default();
+                !comm.starts_with("binder:") && !comm.starts_with("tokio-")
+            })
+            .count()
+    });
+    (memfds, maps, threads)
+}
+
+/// The open files of the `rsb_hub` this machine runs, if one.
+fn hub_fds() -> Option<usize> {
+    let hub = fs::read_dir("/proc")
+        .ok()?
+        .filter_map(Result::ok)
+        .find(|entry| {
+            fs::read_to_string(entry.path().join("comm")).is_ok_and(|comm| comm.trim() == "rsb_hub")
+        })?;
+    Some(fs::read_dir(hub.path().join("fd")).ok()?.count())
+}
+
+/// The checks of plan 15 fleet test §5.3 at a moment no fault is being injected.
+///
+/// Producers are asked before subscribers, and the subscribers a second after, so that a
+/// subscriber's counts, read later, are at least what its publisher saw, and the last report
+/// a reporter had sent has reached every T5 subscriber.
+fn stop_point(fleet: &mut Fleet, topology: &Topology) -> Result<Snapshot, Failure> {
+    let mut wrong = Vec::new();
+    let mut published: HashMap<String, (u64, Vec<Subscribed>)> = HashMap::new();
+    let mut reported: Vec<(String, u64)> = Vec::new();
+    let mut registry = None;
+    let (producers, subscribers): (Vec<&String>, Vec<&String>) = topology
+        .nodes
+        .iter()
+        .map(|(node, _)| node)
+        .partition(|node| Topology::is_producer(node));
+    for node in &producers {
+        for kind in fleet.stats(node)? {
+            match kind {
+                Kind::PubStats {
+                    topic,
+                    evicted,
+                    subscribers,
+                    ..
+                } => {
+                    published.insert(topic, (evicted, subscribers));
+                }
+                Kind::Reported { sent, .. } => reported.push((node.to_string(), sent)),
+                Kind::RegStats {
+                    topics, watchers, ..
+                } => registry = Some((topics, watchers)),
+                _ => {}
+            }
+        }
+    }
+    fleet.watch("a stop point", Duration::from_secs(1))?;
+    // (node, topic) → node_lagged, and each T5 subscription's latest report per reporter run.
+    let mut lagged: HashMap<(String, String), (u64, u64)> = HashMap::new();
+    let mut seen: HashMap<(String, Incarnation), Vec<u64>> = HashMap::new();
+    for node in producers.iter().chain(&subscribers) {
+        for kind in fleet.stats(node)? {
+            match kind {
+                Kind::SubStats {
+                    topic,
+                    received,
+                    lost,
+                    decode_errors,
+                    connections,
+                    node_received,
+                    node_lagged,
+                    connected,
+                } => {
+                    if (received, lost, decode_errors) != (node_received, node_lagged, 0)
+                        || !connected
+                    {
+                        wrong.push(format!(
+                            "{node} {topic}: stats received {received} lost {lost} decode errors \
+                             {decode_errors} connected {connected}; the node counted {node_received} \
+                             received, {node_lagged} lagged"
+                        ));
+                    }
+                    lagged.insert((node.to_string(), topic), (node_lagged, connections));
+                }
+                Kind::ReportSeen {
+                    reporter,
+                    incarnation,
+                    seq,
+                    ..
+                } => seen.entry((reporter, incarnation)).or_default().push(seq),
+                _ => {}
+            }
+        }
+    }
+
+    let pid_node: HashMap<i32, String> = topology
+        .nodes
+        .iter()
+        .map(|(node, _)| (fleet.pid(node), node.clone()))
+        .collect();
+    for (publisher, topic) in &topology.publishers {
+        let Some((evicted, subscribed)) = published.get(topic) else {
+            wrong.push(format!("{publisher}: no PSTATS of {topic}"));
+            continue;
+        };
+        if *evicted != 0 {
+            wrong.push(format!("{publisher} {topic}: {evicted} evicted"));
+        }
+        let mut expected: Vec<i32> = topology
+            .subscriptions
+            .iter()
+            .filter(|planned| planned.topic == *topic)
+            .map(|planned| fleet.pid(&planned.node))
+            .collect();
+        let mut held: Vec<i32> = subscribed.iter().map(|info| info.pid).collect();
+        expected.sort_unstable();
+        held.sort_unstable();
+        if held != expected {
+            wrong.push(format!(
+                "{publisher} {topic}: subscriptions of pids {held:?}, expected {expected:?}"
+            ));
+        }
+        for info in subscribed {
+            let node = pid_node.get(&info.pid).cloned().unwrap_or_default();
+            match lagged.get(&(node.clone(), topic.clone())) {
+                Some(&(node_lagged, 1)) if info.lost > node_lagged => wrong.push(format!(
+                    "{publisher} {topic}: {node} reported {} lost, counted {node_lagged} later",
+                    info.lost
+                )),
+                Some(_) => {}
+                None => wrong.push(format!(
+                    "{publisher} {topic}: {node} ({}) has no SSTATS",
+                    info.pid
+                )),
+            }
+        }
+    }
+
+    let watchers = topology
+        .subscriptions
+        .iter()
+        .filter(|planned| planned.topic == topology.named)
+        .count();
+    if registry != Some((1, watchers)) {
+        wrong.push(format!(
+            "registry: (topics, watchers) {registry:?}, expected (1, {watchers})"
+        ));
+    }
+
+    let status_subscriptions = topology
+        .subscriptions
+        .iter()
+        .filter(|planned| planned.topic == topology.status)
+        .count();
+    for (reporter, sent) in &reported {
+        let Some(last) = sent.checked_sub(1) else {
+            wrong.push(format!("{reporter}: no report sent"));
+            continue;
+        };
+        let incarnation = Incarnation {
+            pid: fleet.pid(reporter) as u32,
+            start: fleet.starts[reporter.as_str()],
+        };
+        let seqs = seen
+            .get(&(reporter.clone(), incarnation))
+            .cloned()
+            .unwrap_or_default();
+        if seqs.len() != status_subscriptions || seqs.iter().any(|&seq| seq < last) {
+            wrong.push(format!(
+                "{reporter}: report {last} sent, the {status_subscriptions} T5 subscriptions \
+                 have {seqs:?}"
+            ));
+        }
+    }
+
+    let prefix = format!("rsb.fleet.{}.", fleet.tag);
+    let mut listed: Vec<String> = hub::list_services(hub::DUMP_FLAG_PRIORITY_ALL)
+        .into_iter()
+        .filter(|name| name.starts_with(&prefix) || *name == topology.registry)
+        .collect();
+    let mut registered = topology.registered.clone();
+    listed.sort();
+    registered.sort();
+    if listed != registered {
+        wrong.push(format!(
+            "service manager: {listed:?}, expected {registered:?}"
+        ));
+    }
+
+    if !wrong.is_empty() {
+        return Err(fleet.failure(None, format!("stop point:\n  {}", wrong.join("\n  "))));
+    }
+    Ok(Snapshot {
+        processes: topology
+            .nodes
+            .iter()
+            .map(|(node, _)| (node.clone(), memfd_counts(fleet.pid(node))))
+            .collect(),
+        hub_fds: hub_fds(),
+    })
+}
+
+/// Plan 15 fleet test F2: the six topics run with no fault; at each stop point every check of
+/// §5.3 holds, and no process holds more memfds, mappings or threads than at the first.
+#[test]
+#[ignore = "requires a binder device and a permissive service manager"]
+fn steady_state_fleet() {
+    init();
+    let scale = env_number("FLEET_SCALE", 1) as usize;
+    let steady = Duration::from_secs(env_number("FLEET_STEADY_SECS", 30));
+    let mut fleet = Fleet::new("fleet");
+    let topology = Topology::new(&fleet, scale);
+    for (node, args) in &topology.nodes {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        fleet.spawn(node, &args);
+    }
+    let mut pending: HashSet<(String, String)> = topology
+        .subscriptions
+        .iter()
+        .map(|planned| (planned.node.clone(), planned.topic.clone()))
+        .collect();
+    while !pending.is_empty() {
+        let seen = fleet
+            .wait_for("every subscription CONNECTED", Duration::from_secs(20), |seen| {
+                matches!(seen, Seen::Event(Event { node, kind: Kind::Connected { topic, .. }, .. })
+                    if pending.contains(&(node.clone(), topic.clone())))
+            })
+            .unwrap_or_else(|failure| panic!("{failure:?}\nnot connected: {pending:?}"));
+        if let Seen::Event(Event {
+            node,
+            kind: Kind::Connected { topic, .. },
+            ..
+        }) = seen
+        {
+            pending.remove(&(node, topic));
+        }
+    }
+    fleet.watch("warm-up", Duration::from_secs(5)).unwrap();
+    let first = stop_point(&mut fleet, &topology).unwrap();
+    fleet.watch("steady state", steady).unwrap();
+    let second = stop_point(&mut fleet, &topology).unwrap();
+    assert_eq!(
+        first, second,
+        "memfds, mappings, threads or hub files changed"
     );
     fleet.finish().unwrap();
 }

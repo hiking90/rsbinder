@@ -208,6 +208,15 @@ fn main() {
         .generate()
         .unwrap();
 
+    // Plan 15 fleet test (`src/topic_fleet/payload.rs`): the parcelable topics and the T5 relay.
+    rsbinder_aidl::Builder::new()
+        .source(PathBuf::from("aidl/topicfleet/FleetRecord.aidl"))
+        .source(PathBuf::from("aidl/topicfleet/StatusReport.aidl"))
+        .source(PathBuf::from("aidl/topicfleet/IFleetStatus.aidl"))
+        .output(PathBuf::from("topic_fleet.rs"))
+        .generate()
+        .unwrap();
+
     // Plan 10-7: `stream_rpc.rs` and the kernel `stream_probe` share it, so not behind `rpc`.
     rsbinder_aidl::Builder::new()
         .source(PathBuf::from("aidl/streamdemo/IStreamDemo.aidl"))

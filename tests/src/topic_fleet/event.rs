@@ -55,6 +55,77 @@ pub enum Kind {
     Violation { topic: String, text: String },
     /// The node cannot go on.
     Fault { text: String },
+    /// At `stats`: a subscription's `stats()`, then what the node counted over all of its
+    /// connections, and for a `NamedSubscriber` whether it is connected (a plain one always is).
+    SubStats {
+        topic: String,
+        received: u64,
+        lost: u64,
+        decode_errors: u64,
+        connections: u64,
+        node_received: u64,
+        node_lagged: u64,
+        connected: bool,
+    },
+    /// At `stats`: a publisher's `stats()`.
+    PubStats {
+        topic: String,
+        published: u64,
+        evicted: u64,
+        subscribers: Vec<Subscribed>,
+    },
+    /// At `stats`: a registry host's names with a topic and watches.
+    RegStats {
+        service: String,
+        topics: usize,
+        watchers: usize,
+    },
+    /// At `stats`: the reports a reporter sent.
+    Reported { service: String, sent: u64 },
+    /// At `stats`: the latest report a T5 subscription received from each reporter's run.
+    ReportSeen {
+        topic: String,
+        reporter: String,
+        incarnation: Incarnation,
+        seq: u64,
+    },
+    /// The last line of a node's answer to `stats`.
+    StatsDone,
+}
+
+/// One subscription in a [`Kind::PubStats`]: `pid:lost:evicted` in the line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Subscribed {
+    pub pid: i32,
+    pub lost: u64,
+    pub evicted: bool,
+}
+
+impl fmt::Display for Subscribed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}:{}", self.pid, self.lost, u8::from(self.evicted))
+    }
+}
+
+impl std::str::FromStr for Subscribed {
+    type Err = String;
+
+    fn from_str(word: &str) -> Result<Self, String> {
+        let [pid, lost, evicted] = split::<3>(word, ':')?;
+        Ok(Self {
+            pid: number(pid)?,
+            lost: number(lost)?,
+            evicted: flag(evicted)?,
+        })
+    }
+}
+
+fn flag(word: &str) -> Result<bool, String> {
+    match word {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => Err(format!("not 0 or 1: {word:?}")),
+    }
 }
 
 /// The `ENDED` token of a [`Closed`]: its variant's name, without a status's message.
@@ -148,6 +219,58 @@ impl Event {
                 }
             }
             "FAULT" => Kind::Fault { text: rest.into() },
+            "SSTATS" => {
+                let [topic, received, lost, decode_errors, connections, node_received, node_lagged, connected] =
+                    words(rest)?;
+                Kind::SubStats {
+                    topic: topic.into(),
+                    received: number(received)?,
+                    lost: number(lost)?,
+                    decode_errors: number(decode_errors)?,
+                    connections: number(connections)?,
+                    node_received: number(node_received)?,
+                    node_lagged: number(node_lagged)?,
+                    connected: flag(connected)?,
+                }
+            }
+            "PSTATS" => {
+                let [topic, published, evicted, subscribers] = words(rest)?;
+                let subscribers = match subscribers {
+                    "-" => Vec::new(),
+                    list => list.split(',').map(str::parse).collect::<Result<_, _>>()?,
+                };
+                Kind::PubStats {
+                    topic: topic.into(),
+                    published: number(published)?,
+                    evicted: number(evicted)?,
+                    subscribers,
+                }
+            }
+            "RSTATS" => {
+                let [service, topics, watchers] = words(rest)?;
+                Kind::RegStats {
+                    service: service.into(),
+                    topics: number(topics)?,
+                    watchers: number(watchers)?,
+                }
+            }
+            "REPORTED" => {
+                let [service, sent] = words(rest)?;
+                Kind::Reported {
+                    service: service.into(),
+                    sent: number(sent)?,
+                }
+            }
+            "RSEEN" => {
+                let [topic, reporter, incarnation, seq] = words(rest)?;
+                Kind::ReportSeen {
+                    topic: topic.into(),
+                    reporter: reporter.into(),
+                    incarnation: incarnation.parse()?,
+                    seq: number(seq)?,
+                }
+            }
+            "STATSDONE" if rest.is_empty() => Kind::StatsDone,
             other => return Err(format!("unknown kind {other:?}: {line:?}")),
         };
         Ok(Self {
@@ -186,6 +309,47 @@ impl fmt::Display for Event {
             } => write!(f, "PUBLISHED {topic} {incarnation} {last_seq}"),
             Kind::Violation { topic, text } => write!(f, "VIOLATION {topic} {}", one_line(text)),
             Kind::Fault { text } => write!(f, "FAULT {}", one_line(text)),
+            Kind::SubStats {
+                topic,
+                received,
+                lost,
+                decode_errors,
+                connections,
+                node_received,
+                node_lagged,
+                connected,
+            } => write!(
+                f,
+                "SSTATS {topic} {received} {lost} {decode_errors} {connections} {node_received} \
+                 {node_lagged} {}",
+                u8::from(*connected)
+            ),
+            Kind::PubStats {
+                topic,
+                published,
+                evicted,
+                subscribers,
+            } => {
+                write!(f, "PSTATS {topic} {published} {evicted} ")?;
+                if subscribers.is_empty() {
+                    return f.write_str("-");
+                }
+                let list: Vec<String> = subscribers.iter().map(Subscribed::to_string).collect();
+                f.write_str(&list.join(","))
+            }
+            Kind::RegStats {
+                service,
+                topics,
+                watchers,
+            } => write!(f, "RSTATS {service} {topics} {watchers}"),
+            Kind::Reported { service, sent } => write!(f, "REPORTED {service} {sent}"),
+            Kind::ReportSeen {
+                topic,
+                reporter,
+                incarnation,
+                seq,
+            } => write!(f, "RSEEN {topic} {reporter} {incarnation} {seq}"),
+            Kind::StatsDone => f.write_str("STATSDONE"),
         }
     }
 }
@@ -202,10 +366,15 @@ fn number<N: std::str::FromStr>(field: &str) -> Result<N, String> {
 
 /// Exactly `N` space-separated words.
 fn words<const N: usize>(rest: &str) -> Result<[&str; N], String> {
-    let words: Vec<&str> = rest.split(' ').collect();
-    words
+    split(rest, ' ')
+}
+
+/// Exactly `N` parts of `text` between `separator`s.
+fn split<const N: usize>(text: &str, separator: char) -> Result<[&str; N], String> {
+    let parts: Vec<&str> = text.split(separator).collect();
+    parts
         .try_into()
-        .map_err(|words: Vec<&str>| format!("{} fields, not {N}: {rest:?}", words.len()))
+        .map_err(|parts: Vec<&str>| format!("{} fields, not {N}: {text:?}", parts.len()))
 }
 
 #[cfg(test)]
@@ -238,12 +407,61 @@ mod tests {
                 last_seq: 322,
             },
             Kind::Violation {
-                topic,
+                topic: topic.clone(),
                 text: "seq 9 after 10".into(),
             },
             Kind::Fault {
                 text: "subscribe: NameNotFound".into(),
             },
+            Kind::SubStats {
+                topic: topic.clone(),
+                received: 10,
+                lost: 2,
+                decode_errors: 0,
+                connections: 3,
+                node_received: 10,
+                node_lagged: 2,
+                connected: true,
+            },
+            Kind::PubStats {
+                topic: topic.clone(),
+                published: 99,
+                evicted: 1,
+                subscribers: vec![
+                    Subscribed {
+                        pid: 12,
+                        lost: 0,
+                        evicted: false,
+                    },
+                    Subscribed {
+                        pid: 13,
+                        lost: 5,
+                        evicted: true,
+                    },
+                ],
+            },
+            Kind::PubStats {
+                topic: topic.clone(),
+                published: 0,
+                evicted: 0,
+                subscribers: Vec::new(),
+            },
+            Kind::RegStats {
+                service: "rsbinder.topic.registry.fleet.1".into(),
+                topics: 1,
+                watchers: 4,
+            },
+            Kind::Reported {
+                service: "rsb.fleet.t.status.1".into(),
+                sent: 17,
+            },
+            Kind::ReportSeen {
+                topic,
+                reporter: "prod-2".into(),
+                incarnation: Incarnation { pid: 8, start: 1 },
+                seq: 16,
+            },
+            Kind::StatsDone,
         ]
     }
 

@@ -11,7 +11,9 @@
 
 pub mod event;
 pub mod judge;
+pub mod payload;
 pub mod record;
+pub mod spec;
 pub mod transport;
 
 /// `CLOCK_MONOTONIC` in nanoseconds: one clock for every process of the machine, so the

@@ -62,6 +62,9 @@ pub struct Subscription {
     count: Option<Count>,
     /// Records lagged since the last record of the connection, or since it started.
     pending: u64,
+    /// Records accepted and lagged over every connection, for `SubscriberStats`.
+    received: u64,
+    lagged: u64,
 }
 
 impl Subscription {
@@ -71,7 +74,15 @@ impl Subscription {
             joined: HashMap::new(),
             count: None,
             pending: 0,
+            received: 0,
+            lagged: 0,
         }
+    }
+
+    /// `(received, lagged)` over every connection: what `SubscriberStats` counts as `received`
+    /// and `lost` when no check failed.
+    pub fn totals(&self) -> (u64, u64) {
+        (self.received, self.lagged)
     }
 
     /// Check a record; `Ok(true)` when it is the first of its connection.
@@ -134,6 +145,7 @@ impl Subscription {
             count.last_seq = seq;
         }
         self.pending = 0;
+        self.received += 1;
         let seen = self.joined.entry(stamp.incarnation).or_insert(seq);
         *seen = (*seen).max(seq);
         Ok(first)
@@ -144,6 +156,7 @@ impl Subscription {
             return Err("Lagged(0)".into());
         }
         self.pending += records;
+        self.lagged += records;
         Ok(())
     }
 
