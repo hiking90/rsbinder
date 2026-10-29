@@ -78,8 +78,8 @@ mod node {
     pub enum Request {
         /// Answer with the role's statistics.
         Stats(mpsc::Sender<Vec<Kind>>),
-        /// A command of the controller for the role's topic.
-        Command(Command),
+        /// A command of the controller, and the topic it named: a group holds several.
+        Command(Command, String),
         Stop,
     }
 
@@ -143,7 +143,7 @@ mod node {
             if !self.topics.iter().any(|t| t == topic) {
                 return false;
             }
-            let _ = self.requests.send(Request::Command(command));
+            let _ = self.requests.send(Request::Command(command, topic.into()));
             (self.wake)();
             true
         }
@@ -171,7 +171,7 @@ mod node {
     pub fn serve(
         requests: &mpsc::Receiver<Request>,
         mut stats: impl FnMut() -> Vec<Kind>,
-        mut command: impl FnMut(Command),
+        mut command: impl FnMut(Command, String),
     ) -> bool {
         let mut stop = false;
         while let Ok(request) = requests.try_recv() {
@@ -179,7 +179,7 @@ mod node {
                 Request::Stats(answer) => {
                     let _ = answer.send(stats());
                 }
-                Request::Command(order) => command(order),
+                Request::Command(order, topic) => command(order, topic),
                 Request::Stop => stop = true,
             }
         }

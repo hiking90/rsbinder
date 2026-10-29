@@ -199,12 +199,12 @@ fn run<T: FleetPayload>(
                     let _ = answer.send(vec![pub_stats(&spec.topic, stats)]);
                     continue;
                 }
-                Ok(Request::Command(Command::Resume)) if state == State::Paused => {
+                Ok(Request::Command(Command::Resume, _)) if state == State::Paused => {
                     state = State::Publishing;
                     next_at = Instant::now();
                     continue;
                 }
-                Ok(Request::Command(Command::Close)) if state == State::Publishing => {
+                Ok(Request::Command(Command::Close, _)) if state == State::Publishing => {
                     if let Some(publisher) = &publisher {
                         publisher.close(&Status::from(ExceptionCode::None));
                     }
@@ -212,7 +212,7 @@ fn run<T: FleetPayload>(
                     state = State::Done;
                     continue;
                 }
-                Ok(Request::Command(Command::Readvertise)) if publisher.is_some() => {
+                Ok(Request::Command(Command::Readvertise, _)) if publisher.is_some() => {
                     let binder = publisher.as_ref().map(Publisher::as_binder);
                     if let Some(Err(status)) =
                         binder.map(|binder| hub::add_service(&spec.topic, binder))
@@ -223,7 +223,7 @@ fn run<T: FleetPayload>(
                 }
                 // The old publisher ends (its end record); the new one goes on with the seqs, so
                 // that a connection to it returns none an earlier one did.
-                Ok(Request::Command(Command::Rebind))
+                Ok(Request::Command(Command::Rebind, _))
                     if through_registry && state != State::Done =>
                 {
                     if let Some(old) = publisher.take() {
@@ -245,7 +245,7 @@ fn run<T: FleetPayload>(
                     }
                     continue;
                 }
-                Ok(Request::Command(command)) => {
+                Ok(Request::Command(command, _)) => {
                     out.fault(format!(
                         "{command:?} {}: not for this publisher now",
                         spec.topic

@@ -176,10 +176,9 @@ impl<T: FleetPayload> Source for Named<T> {
         Ok(())
     }
 
+    /// After its registry's host or the service manager started again (plan 15 D8; X9, X10).
     fn rebind(&mut self) -> BinderResult<()> {
-        if self.via != Via::ServiceManager {
-            self.subscriber = transport::subscribe_named(&self.name, &self.policy, &self.via)?;
-        }
+        self.subscriber = transport::subscribe_named(&self.name, &self.policy, &self.via)?;
         Ok(())
     }
 }
@@ -496,6 +495,7 @@ impl Sub {
         match self.source.rebind() {
             Ok(()) => {
                 self.idle = false;
+                self.judge.remade();
                 self.base = self.judge.totals();
                 *self
                     .interrupter
@@ -518,6 +518,7 @@ impl Sub {
             Ok(()) => {
                 self.resubscribe = false;
                 self.full = false;
+                self.judge.remade();
                 self.base = self.judge.totals();
                 *self
                     .interrupter
@@ -579,7 +580,10 @@ impl Sub {
 
 /// What a group's thread does at `stats` and `exit` besides its subscriptions (`--fuse`).
 struct Extra {
+    /// The topic it publishes, which `readvertise` names.
+    topic: String,
     stats: Box<dyn Fn() -> Vec<Kind> + Send>,
+    readvertise: Box<dyn Fn() + Send>,
     finish: Box<dyn FnOnce() + Send>,
 }
 
@@ -597,7 +601,11 @@ fn wake_all(interrupters: Vec<Arc<Mutex<Interrupter>>>) -> Box<dyn Fn() + Send> 
 /// Whether `requests` held a `Stop`; `hold-sample` does not return.
 fn serve_one(out: &Out, sub: &mut Sub, requests: &mpsc::Receiver<Request>) -> bool {
     let mut commands = Vec::new();
-    let stop = serve(requests, || sub.stats(), |command| commands.push(command));
+    let stop = serve(
+        requests,
+        || sub.stats(),
+        |command, _| commands.push(command),
+    );
     for command in commands {
         match command {
             Command::HoldSample => sub.source.hold(),
@@ -624,8 +632,8 @@ fn run_one(out: Out, mut sub: Sub, requested: mpsc::Receiver<Request>) {
                 Ok(Request::Stats(answer)) => {
                     let _ = answer.send(sub.stats());
                 }
-                Ok(Request::Command(Command::Rebind)) => sub.rebind(&out),
-                Ok(Request::Command(command)) => {
+                Ok(Request::Command(Command::Rebind, _)) => sub.rebind(&out),
+                Ok(Request::Command(command, _)) => {
                     out.fault(format!(
                         "{command:?} {}: no subscription now",
                         sub.spec.topic
@@ -651,15 +659,22 @@ fn run_one(out: Out, mut sub: Sub, requested: mpsc::Receiver<Request>) {
     sub.stop(&out);
 }
 
-/// A command to a group: `rebind` reaches its subscriptions found through a registry, which
-/// are of the one topic a group can have there.
-fn group_command(out: &Out, subs: &mut [Sub], command: Command) {
-    match command {
-        Command::Rebind => subs
+/// A command to a group for `topic`: `rebind` reaches its subscriptions of the topic,
+/// `readvertise` the publisher of `--fuse`.
+fn group_command(
+    out: &Out,
+    subs: &mut [Sub],
+    extra: &Option<Extra>,
+    command: Command,
+    topic: &str,
+) {
+    match (command, extra) {
+        (Command::Rebind, _) => subs
             .iter_mut()
-            .filter(|sub| matches!(sub.spec.via, Via::Registry(_)))
+            .filter(|sub| sub.spec.topic == topic)
             .for_each(|sub| sub.rebind(out)),
-        other => out.fault(format!("{other:?}: not for a group")),
+        (Command::Readvertise, Some(extra)) if extra.topic == topic => (extra.readvertise)(),
+        (other, _) => out.fault(format!("{other:?} {topic}: not for a group")),
     }
 }
 
@@ -686,10 +701,10 @@ fn run_group(
         let stop = serve(
             &requested,
             || stats(&subs, &extra),
-            |command| commands.push(command),
+            |command, topic| commands.push((command, topic)),
         );
-        for command in commands {
-            group_command(&out, &mut subs, command);
+        for (command, topic) in commands {
+            group_command(&out, &mut subs, &extra, command, &topic);
         }
         if stop {
             break;
@@ -705,7 +720,9 @@ fn run_group(
                 Ok(Request::Stats(answer)) => {
                     let _ = answer.send(stats(&subs, &extra));
                 }
-                Ok(Request::Command(command)) => group_command(&out, &mut subs, command),
+                Ok(Request::Command(command, topic)) => {
+                    group_command(&out, &mut subs, &extra, command, &topic)
+                }
                 Ok(Request::Stop) | Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => {}
             }
@@ -799,6 +816,7 @@ pub fn fuse(
     readings: String,
     incarnation: Incarnation,
 ) -> Result<Running, String> {
+    let topic_name = topic.clone();
     let publisher: Arc<Publisher<FleetRecord>> = Arc::new(
         transport::advertise(&topic, &PublisherPolicy::default(), &Via::ServiceManager)
             .map_err(|status| format!("advertise {topic}: {status}"))?,
@@ -832,9 +850,18 @@ pub fn fuse(
         }
     }));
     let extra = Extra {
+        topic: topic.clone(),
         stats: Box::new({
             let (publisher, topic) = (publisher.clone(), topic.clone());
             move || vec![pub_stats(&topic, publisher.stats())]
+        }),
+        readvertise: Box::new({
+            let (publisher, topic, out) = (publisher.clone(), topic.clone(), out.clone());
+            move || {
+                if let Err(status) = rsbinder::hub::add_service(&topic, publisher.as_binder()) {
+                    out.fault(format!("addService {topic}: {status}"));
+                }
+            }
         }),
         finish: Box::new({
             let out = out.clone();
@@ -850,5 +877,7 @@ pub fn fuse(
             }
         }),
     };
-    Ok(spawn(out, vec![frames, readings], Some(extra), true))
+    let mut running = spawn(out, vec![frames, readings], Some(extra), true);
+    running.topics.push(topic_name);
+    Ok(running)
 }

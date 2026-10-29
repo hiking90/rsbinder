@@ -86,6 +86,13 @@ impl Subscription {
         (self.received, self.lagged)
     }
 
+    /// The subscription object was made again: it remembers no publisher, so its first
+    /// connection starts where its policy says, though an earlier object read the same
+    /// publisher. The rule that no seq comes twice holds within one `NamedSubscriber`.
+    pub fn remade(&mut self) {
+        self.joined.clear();
+    }
+
     /// Check a record; `Ok(true)` when it is the first of its connection.
     pub fn record(&mut self, stamp: Stamp) -> Result<bool, String> {
         let seq = stamp.seq;
@@ -460,6 +467,18 @@ mod tests {
         let again = [&earlier[..], &[Rec(A, 2)]].concat();
         assert_eq!(violation_at(Mode::Counted, &again), 6);
         feed(Mode::Counted, &[&earlier[..], &[Rec(A, 3)]].concat()).unwrap();
+    }
+
+    /// A subscriber made again (X10's `rebind`) starts where its policy says, history included.
+    #[test]
+    fn a_remade_subscriber_may_read_a_publisher_again() {
+        let mut subscription = Subscription::new(Mode::Counted);
+        for seq in 0..3 {
+            subscription.record(stamp(A, seq)).unwrap();
+        }
+        subscription.end();
+        subscription.remade();
+        assert_eq!(subscription.record(stamp(A, 1)), Ok(true));
     }
 
     #[test]

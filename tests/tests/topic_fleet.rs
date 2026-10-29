@@ -2314,6 +2314,134 @@ fn scripted_faults() {
     usage.report(&mut fleet, "scripted faults");
 }
 
+/// An `rsb_hub` of the test's own, killed when dropped (X10). `RSB_HUB_BIN` replaces the binary,
+/// `target/debug/rsb_hub` by default, as for `tests/reconnect_hub_restart.rs`.
+struct OwnHub(Child);
+
+impl OwnHub {
+    fn start() -> Self {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let bin = std::env::var_os("RSB_HUB_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| manifest.join("../target/debug/rsb_hub"));
+        let child = Command::new(&bin)
+            .arg("--config")
+            .arg(manifest.join("policy/permissive.toml"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap_or_else(|err| panic!("spawn {}: {err}", bin.display()));
+        let deadline = Instant::now() + READY;
+        // Up once it answers a lookup as the context manager.
+        while hub::default()
+            .and_then(|sm| sm.try_get_service("none"))
+            .is_err()
+        {
+            assert!(Instant::now() < deadline, "rsb_hub did not come up");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Self(child)
+    }
+
+    fn kill(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for OwnHub {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Plan 15 fleet test X10 (F-D4, F-D9): the service manager killed and started again under the
+/// fleet. Connections go on without it; the new one tells nothing to the watches made on the old
+/// one (plan 15 D8, §12.5). Then each node does what an application does: the T1–T4 producers
+/// register their living publishers again (their connections go on), the T5 relay makes its
+/// publisher again, the registry's host registers the registry again, and every named
+/// subscriber of the service manager is made again; T6, found through the registry, is untouched.
+#[test]
+#[ignore = "starts its own rsb_hub: run with no other rsb_hub up"]
+fn hub_restarts() {
+    let running = Command::new("pgrep").args(["-x", "rsb_hub"]).output();
+    assert!(
+        !running.is_ok_and(|o| o.status.success()),
+        "another rsb_hub is running; stop it first (this test owns the context manager)"
+    );
+    init();
+    let mut own = OwnHub::start();
+    let usage = Usage::start();
+    let (mut fleet, topology) = start_fleet("hub");
+    let none = HashMap::new();
+    fleet.watch("warm-up", Duration::from_secs(3)).unwrap();
+    let baseline = settle(&mut fleet, &topology, Some(&none), SETTLE).unwrap();
+
+    let all = |_: &Planned| true;
+    let before = last_seqs(&fleet, &topology, all);
+    let killed = now_ns();
+    own.kill();
+    own = OwnHub::start();
+    let restarted = now_ns();
+    fleet.watch("X10 new hub", Duration::from_secs(2)).unwrap();
+    advanced(&mut fleet, "X10 records without the hub", &before).unwrap();
+    let ended: Vec<&Ending> = fleet.endings.iter().filter(|e| e.at_ns >= killed).collect();
+    assert!(
+        ended.is_empty(),
+        "X10: connections ended with the hub: {ended:?}"
+    );
+    let told: Vec<&Connection> = fleet
+        .connections
+        .iter()
+        .filter(|c| c.at_ns >= restarted)
+        .collect();
+    assert!(
+        told.is_empty(),
+        "X10: the new hub told the old watches: {told:?}"
+    );
+
+    let since = now_ns();
+    let named = topology.named.clone();
+    let mut producers: Vec<(String, String)> = topology
+        .publishers
+        .iter()
+        .filter(|(node, topic)| node != "p-status" && *topic != named)
+        .cloned()
+        .collect();
+    producers.push(("registry".into(), topology.registry.clone()));
+    for (node, topic) in &producers {
+        fleet.command(node, &format!("readvertise {topic}"));
+    }
+    fleet.command("p-status", &format!("rebind {}", topology.status));
+    let remade: Vec<(String, String)> = topology
+        .subscriptions
+        .iter()
+        .filter(|p| p.named && p.topic != named)
+        .map(|p| (p.node.clone(), p.topic.clone()))
+        .collect();
+    for (node, topic) in &remade {
+        fleet.command(node, &format!("rebind {topic}"));
+    }
+    let status = topology.status.clone();
+    let touched = |p: &Planned| (p.named && p.topic != named) || p.topic == status;
+    connected_since(&mut fleet, &topology, touched, since, None, CONNECT).unwrap();
+    let snapshot = settle(&mut fleet, &topology, Some(&none), SETTLE).unwrap();
+    // The hub is another process now: compare the fleet's processes alone.
+    let changed: Vec<String> = snapshot
+        .processes
+        .iter()
+        .filter_map(|(key, now)| {
+            let then = baseline.processes.get(key)?;
+            (then != now).then(|| format!("{key:?}: {then:?} -> {now:?}"))
+        })
+        .collect();
+    assert!(changed.is_empty(), "X10: processes changed: {changed:#?}");
+    fleet.finish().unwrap();
+    usage.report(&mut fleet, "hub restart");
+    drop(fleet);
+    drop(own);
+}
+
 /// xorshift64*: the chaos layer's schedule from a seed, without a dependency.
 struct Rng(u64);
 

@@ -21,7 +21,7 @@ use tests::topic_fleet::record::{topic_id, Incarnation, Stamp};
 use tests::topic_fleet::spec::Via;
 use tests::topic_fleet::transport;
 
-use crate::node::{Out, Request, Running};
+use crate::node::{Command, Out, Request, Running};
 use crate::publish::pub_stats;
 
 /// The relay's publisher and the seq of its next record, under one lock: records go out in the
@@ -86,19 +86,49 @@ pub fn relay(
         incarnation,
         out: out.clone(),
     };
-    hub::add_service(&service, BnFleetStatus::new_binder(relay).as_binder())
+    let binder = BnFleetStatus::new_binder(relay).as_binder();
+    hub::add_service(&service, binder.clone())
         .map_err(|status| format!("addService {service}: {status}"))?;
     let (requests, requested) = mpsc::channel();
     let out = out.clone();
+    let name = topic.clone();
     let thread = thread::spawn(move || {
-        while let Ok(Request::Stats(answer)) = requested.recv() {
-            let relayed = relayed.lock().unwrap_or_else(PoisonError::into_inner);
-            let stats = relayed
-                .publisher
-                .as_ref()
-                .map(Publisher::stats)
-                .unwrap_or_default();
-            let _ = answer.send(vec![pub_stats(&topic, stats)]);
+        loop {
+            match requested.recv() {
+                Ok(Request::Stats(answer)) => {
+                    let relayed = relayed.lock().unwrap_or_else(PoisonError::into_inner);
+                    let stats = relayed
+                        .publisher
+                        .as_ref()
+                        .map(Publisher::stats)
+                        .unwrap_or_default();
+                    let _ = answer.send(vec![pub_stats(&topic, stats)]);
+                }
+                // The service manager started again (X10, F-D9): the publisher is made again on
+                // it, going on with the seqs, and the relay registered again.
+                Ok(Request::Command(Command::Rebind, _)) => {
+                    let mut relayed = relayed.lock().unwrap_or_else(PoisonError::into_inner);
+                    if let Some(old) = relayed.publisher.take() {
+                        old.close(&Status::from(ExceptionCode::None));
+                    }
+                    match transport::advertise(
+                        &topic,
+                        &PublisherPolicy::default(),
+                        &Via::ServiceManager,
+                    ) {
+                        Ok(new) => relayed.publisher = Some(new),
+                        Err(status) => out.fault(format!("advertise {topic}: {status}")),
+                    }
+                    drop(relayed);
+                    if let Err(status) = hub::add_service(&service, binder.clone()) {
+                        out.fault(format!("addService {service}: {status}"));
+                    }
+                }
+                Ok(Request::Command(command, _)) => {
+                    out.fault(format!("{command:?} {topic}: not for the relay"));
+                }
+                Ok(Request::Stop) | Err(_) => break,
+            }
         }
         let mut relayed = relayed.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(publisher) = relayed.publisher.take() {
@@ -112,7 +142,7 @@ pub fn relay(
             });
         }
     });
-    Ok(Running::thread(requests, thread))
+    Ok(Running::thread(requests, thread).for_topic(&name))
 }
 
 /// Report to the relay under `service` `hz` times a second, finding it again after it died.
@@ -134,7 +164,7 @@ pub fn report(out: &Out, service: String, hz: u32, incarnation: Incarnation) -> 
                     continue;
                 }
                 // A reporter has no topic, so no command names it.
-                Ok(Request::Command(_)) => continue,
+                Ok(Request::Command(..)) => continue,
                 Ok(Request::Stop) | Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => {}
             }
@@ -166,16 +196,29 @@ pub fn registry(service: String) -> Result<Running, String> {
     hub::add_service(&service, registry.as_binder())
         .map_err(|status| format!("addService {service}: {status}"))?;
     let (requests, requested) = mpsc::channel();
+    let name = service.clone();
     let thread = thread::spawn(move || {
-        while let Ok(Request::Stats(answer)) = requested.recv() {
-            let stats = registry.stats();
-            let _ = answer.send(vec![Kind::RegStats {
-                service: service.clone(),
-                topics: stats.topics,
-                watchers: stats.watchers,
-            }]);
+        loop {
+            match requested.recv() {
+                Ok(Request::Stats(answer)) => {
+                    let stats = registry.stats();
+                    let _ = answer.send(vec![Kind::RegStats {
+                        service: service.clone(),
+                        topics: stats.topics,
+                        watchers: stats.watchers,
+                    }]);
+                }
+                // The service manager started again (X10): the registry is registered again.
+                Ok(Request::Command(Command::Readvertise, _)) => {
+                    if let Err(status) = hub::add_service(&service, registry.as_binder()) {
+                        eprintln!("topic_node: addService {service}: {status}");
+                    }
+                }
+                Ok(Request::Command(..)) => {}
+                Ok(Request::Stop) | Err(_) => break,
+            }
         }
         drop(registry);
     });
-    Ok(Running::thread(requests, thread))
+    Ok(Running::thread(requests, thread).for_topic(&name))
 }
