@@ -6,3 +6,5 @@ pub mod fmq_peer;
 mod test_accessor_rsb_hub;
 mod test_client;
 mod test_sm;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub mod topic_fleet;
