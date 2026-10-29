@@ -761,6 +761,8 @@ struct Topology {
     /// T5 and T6.
     status: String,
     named: String,
+    /// X7's small pool.
+    pins: String,
 }
 
 impl Topology {
@@ -789,6 +791,7 @@ impl Topology {
             ],
             status: status.clone(),
             named: named.clone(),
+            pins: String::new(),
         };
         topology.node("registry", &[("--registry", format!("service={registry}"))]);
         topology.node(
@@ -857,6 +860,36 @@ impl Topology {
             .subscriptions
             .push(Planned::new("p-fused", &readings));
 
+        // X7's own pool: as many slots as `subs + 1 + depth + max_loans`, 3 + 1 + 2 + 1, and at
+        // most 2 pinned and 3 kept at once. A holder killed with its slot pinned that the
+        // publisher never lends again takes a slot for good, and 7 of them leave none to lend:
+        // the publish fails, which the node reports as a FAULT.
+        let pins = name("pins");
+        topology.pins = pins.clone();
+        let (_, frames_args) = topology
+            .nodes
+            .iter_mut()
+            .find(|(node, _)| node == "p-frames")
+            .expect("p-frames");
+        frames_args.extend([
+            "--pub".to_string(),
+            format!("topic={pins},size=64,pool,subs=3,hz=50"),
+        ]);
+        topology.publishers.push(("p-frames".into(), pins.clone()));
+        topology.registered.push(pins.clone());
+        topology.node("x7-reader", &[("--sub", format!("topic={pins}"))]);
+        topology.node(
+            "x7-holder",
+            &[("--sub", format!("topic={pins},recv=sample"))],
+        );
+        topology
+            .subscriptions
+            .push(Planned::new("x7-reader", &pins));
+        topology.subscriptions.push(Planned {
+            sample: true,
+            ..Planned::new("x7-holder", &pins)
+        });
+
         // (topic, payload, a pool of bytes, through the registry)
         let topics = [
             (&frames, "bytes", true, false),
@@ -880,7 +913,11 @@ impl Topology {
                     _ => "recv",
                 };
                 let fd = s % 2 == 1;
-                let start = ["latest", "last", "oldest"][s % 3];
+                // Not `s % 3`, which is `named`'s: every named subscription would start at
+                // `Last`, and X1 would see no other start rule. A topic's subscriptions of one
+                // API recur every 18 `s` (6 nodes, 3 a node), so this turns within them.
+                let start_at = (s / 18) % 3;
+                let start = ["latest", "last", "oldest"][start_at];
                 let mut spec = format!(
                     "topic={topic},payload={payload},api={},recv={recv},wake={},start={start}",
                     if named { "named" } else { "plain" },
@@ -904,7 +941,7 @@ impl Topology {
                     } else {
                         Mode::Counted
                     },
-                    start: [Start::Latest, Start::Last, Start::Oldest][s % 3],
+                    start: [Start::Latest, Start::Last, Start::Oldest][start_at],
                     sample: recv == "sample",
                     ..Planned::new(&node, topic)
                 });
@@ -1544,6 +1581,14 @@ fn x1_killed_producer_restarts_with_records(
     let node = "p-readings";
     let topic = topology.topic_of(node);
     let of_topic = |p: &Planned| p.topic == topic;
+    // The rule for a named subscriber's later connection is seen only on one that counts its
+    // records and does not start at `Last`, which keeps its start.
+    assert!(
+        topology
+            .of(&topic)
+            .any(|p| p.named && p.mode == Mode::Counted && p.start != Start::Last),
+        "X1: no subscription of T2 shows the start rule of a named subscriber"
+    );
     let since = now_ns();
     fleet.kill(node, Signal::KILL);
     ended_since(fleet, topology, of_topic, Injected::Kill, since, END)?;
@@ -1926,7 +1971,41 @@ fn x7_killed_holding_a_sample(
         restarted,
         None,
         CONNECT,
-    )
+    )?;
+    x7_every_slot_comes_back(fleet, topology)
+}
+
+/// X7 on the small pool: a holder killed with a slot pinned, more times than the pool has slots.
+/// A slot the publisher never lent again would leave none after these rounds, and its publish
+/// would fail; this asks nothing of how the publisher keeps its pins.
+fn x7_every_slot_comes_back(fleet: &mut Fleet, topology: &Topology) -> Result<(), Failure> {
+    // 3 + 1 + 2 + 1 slots, and one round more.
+    const ROUNDS: usize = 8;
+    let pins = topology.pins.clone();
+    let holder = "x7-holder";
+    for round in 1..=ROUNDS {
+        let pid = fleet.pid(holder);
+        fleet.command(holder, &format!("hold-sample {pins}"));
+        fleet.watch("X7 holding", Duration::from_millis(200))?;
+        fleet.kill(holder, Signal::KILL);
+        fleet.ended_node(holder)?;
+        let what = format!("X7 round {round}: the holder taken out");
+        held_until(fleet, "p-frames", &pins, &what, bound(END), |held| {
+            !held.contains(&pid)
+        })?;
+        let restarted = now_ns();
+        fleet.spawn(holder, &args_of(&topology.args(holder)));
+        connected_since(
+            fleet,
+            topology,
+            |p| p.node == holder,
+            restarted,
+            None,
+            CONNECT,
+        )?;
+    }
+    let reader = last_seqs(fleet, topology, |p| p.node == "x7-reader");
+    advanced(fleet, "X7 the small pool still lends", &reader)
 }
 
 /// X8: the T4 process killed: its subscribers end, its publishers drop its subscriptions.
