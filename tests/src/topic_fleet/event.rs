@@ -45,6 +45,12 @@ pub enum Kind {
     /// A receive returned `Closed` or `Disconnected`; `reason` is [`closed_reason`] or
     /// [`disconnected_reason`].
     Ended { topic: String, reason: String },
+    /// A publisher stopped publishing at `exit`; its last record was `last_seq`.
+    Published {
+        topic: String,
+        incarnation: Incarnation,
+        last_seq: u64,
+    },
     /// A check of a connection failed.
     Violation { topic: String, text: String },
     /// The node cannot go on.
@@ -124,6 +130,14 @@ impl Event {
                     reason: reason.into(),
                 }
             }
+            "PUBLISHED" => {
+                let [topic, incarnation, last_seq] = words(rest)?;
+                Kind::Published {
+                    topic: topic.into(),
+                    incarnation: incarnation.parse()?,
+                    last_seq: number(last_seq)?,
+                }
+            }
             "VIOLATION" => {
                 let (topic, text) = rest
                     .split_once(' ')
@@ -165,6 +179,11 @@ impl fmt::Display for Event {
                 "COUNT {topic} {received} {lagged} {first_seq} {last_seq}"
             ),
             Kind::Ended { topic, reason } => write!(f, "ENDED {topic} {reason}"),
+            Kind::Published {
+                topic,
+                incarnation,
+                last_seq,
+            } => write!(f, "PUBLISHED {topic} {incarnation} {last_seq}"),
             Kind::Violation { topic, text } => write!(f, "VIOLATION {topic} {}", one_line(text)),
             Kind::Fault { text } => write!(f, "FAULT {}", one_line(text)),
         }
@@ -212,6 +231,11 @@ mod tests {
             Kind::Ended {
                 topic: topic.clone(),
                 reason: disconnected_reason(&Disconnected::Ended(Closed::PublisherDied)),
+            },
+            Kind::Published {
+                topic: topic.clone(),
+                incarnation: Incarnation { pid: 7, start: 2 },
+                last_seq: 322,
             },
             Kind::Violation {
                 topic,

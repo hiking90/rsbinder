@@ -33,7 +33,8 @@ mod node {
     };
     use rustix::process::{Pid, Resource, Rlimit, Signal};
     use tests::topic_fleet::event::{closed_reason, Event, Kind};
-    use tests::topic_fleet::record::{Incarnation, Stamp};
+    use tests::topic_fleet::judge::{self, Mode, Subscription};
+    use tests::topic_fleet::record::{topic_id, Incarnation, Stamp, HEADER};
     use tests::topic_fleet::transport;
 
     const COUNT_EVERY: Duration = Duration::from_secs(1);
@@ -156,17 +157,24 @@ mod node {
             .map_err(|status| format!("advertise {topic}: {status}"))?;
         let (stop, stopped) = mpsc::channel::<()>();
         let period = Duration::from_secs(1) / hz;
+        let id = topic_id(&topic);
         let out = out.clone();
         let thread = thread::spawn(move || {
             let mut next = Instant::now();
+            let mut last_seq = 0;
             for seq in 0.. {
-                let stamp = Stamp { incarnation, seq };
-                if let Err(err) = publisher.publish(&stamp.encode()) {
+                let stamp = Stamp {
+                    topic: id,
+                    incarnation,
+                    seq,
+                };
+                if let Err(err) = publisher.publish(&stamp.encode(HEADER)) {
                     out.send(Kind::Fault {
                         text: format!("publish {topic} seq {seq}: {err}"),
                     });
                     return;
                 }
+                last_seq = seq;
                 next += period;
                 match stopped.recv_timeout(next.saturating_duration_since(Instant::now())) {
                     Err(RecvTimeoutError::Timeout) => {}
@@ -175,6 +183,11 @@ mod node {
             }
             // Writes the end record.
             drop(publisher);
+            out.send(Kind::Published {
+                topic,
+                incarnation,
+                last_seq,
+            });
         });
         Ok(Running {
             stop: Box::new(move || drop(stop)),
@@ -182,26 +195,20 @@ mod node {
         })
     }
 
-    /// What one connection has received, for `CONNECTED` and `COUNT`.
-    struct Connection {
+    /// One subscription's receives, checked by the judge, and when it last printed a `COUNT`.
+    struct Receives {
         topic: String,
-        incarnation: Option<Incarnation>,
-        received: u64,
-        lagged: u64,
-        first_seq: u64,
-        last_seq: u64,
+        id: u32,
+        judge: Subscription,
         counted: Instant,
     }
 
-    impl Connection {
-        fn new(topic: String) -> Self {
+    impl Receives {
+        fn new(topic: String, mode: Mode) -> Self {
             Self {
+                id: topic_id(&topic),
                 topic,
-                incarnation: None,
-                received: 0,
-                lagged: 0,
-                first_seq: 0,
-                last_seq: 0,
+                judge: Subscription::new(mode),
                 counted: Instant::now(),
             }
         }
@@ -213,55 +220,50 @@ mod node {
             });
         }
 
-        fn record(&mut self, out: &Out, stamp: Stamp) {
-            match self.incarnation {
-                None => {
-                    let Some(first_seq) = stamp.seq.checked_sub(self.lagged) else {
-                        self.violation(
-                            out,
-                            format!("{} lagged before seq {}", self.lagged, stamp.seq),
-                        );
-                        return;
-                    };
-                    self.incarnation = Some(stamp.incarnation);
-                    self.first_seq = first_seq;
-                    out.send(Kind::Connected {
-                        topic: self.topic.clone(),
-                        incarnation: stamp.incarnation,
-                        first_seq: stamp.seq,
-                    });
-                }
-                Some(incarnation) if incarnation != stamp.incarnation => {
-                    self.violation(out, format!("{} within {incarnation}", stamp.incarnation));
-                    return;
-                }
-                Some(_) if stamp.seq <= self.last_seq => {
-                    self.violation(out, format!("seq {} after {}", stamp.seq, self.last_seq));
-                    return;
-                }
-                Some(_) => {}
+        fn record(&mut self, out: &Out, bytes: &[u8]) {
+            let checked = Stamp::decode(bytes, self.id)
+                .and_then(|stamp| Ok((stamp, self.judge.record(stamp)?)));
+            match checked {
+                Ok((stamp, true)) => out.send(Kind::Connected {
+                    topic: self.topic.clone(),
+                    incarnation: stamp.incarnation,
+                    first_seq: stamp.seq,
+                }),
+                Ok((_, false)) => {}
+                Err(text) => self.violation(out, text),
             }
-            self.received += 1;
-            self.last_seq = stamp.seq;
         }
 
-        fn count(&mut self, out: &Out) {
+        fn lagged(&mut self, out: &Out, records: u64) {
+            if let Err(text) = self.judge.lagged(records) {
+                self.violation(out, text);
+            }
+        }
+
+        fn print(&mut self, out: &Out, count: Option<judge::Count>) {
             self.counted = Instant::now();
-            if self.incarnation.is_some() {
+            if let Some(count) = count {
                 out.send(Kind::Count {
                     topic: self.topic.clone(),
-                    received: self.received,
-                    lagged: self.lagged,
-                    first_seq: self.first_seq,
-                    last_seq: self.last_seq,
+                    received: count.received,
+                    lagged: count.lagged,
+                    first_seq: count.first_seq,
+                    last_seq: count.last_seq,
                 });
             }
         }
 
         fn count_if_due(&mut self, out: &Out) {
             if self.counted.elapsed() >= COUNT_EVERY {
-                self.count(out);
+                let count = self.judge.count();
+                self.print(out, count);
             }
+        }
+
+        /// The connection's last `COUNT`, its lag after the last record included.
+        fn end(&mut self, out: &Out) {
+            let count = self.judge.end();
+            self.print(out, count);
         }
     }
 
@@ -272,36 +274,31 @@ mod node {
         let interrupter = subscriber.interrupter();
         let out = out.clone();
         let thread = thread::spawn(move || {
-            let mut connection = Connection::new(topic);
+            let mut receives = Receives::new(topic, Mode::Counted);
             loop {
                 match subscriber.recv() {
-                    Ok(Bytes(bytes)) => match Stamp::decode(&bytes) {
-                        Some(stamp) => connection.record(&out, stamp),
-                        None => {
-                            connection.violation(&out, format!("a record of {} bytes", bytes.len()))
-                        }
-                    },
-                    Err(RecvError::Lagged(records)) => connection.lagged += records,
+                    Ok(Bytes(bytes)) => receives.record(&out, &bytes),
+                    Err(RecvError::Lagged(records)) => receives.lagged(&out, records),
                     Err(RecvError::Closed(closed)) => {
-                        connection.count(&out);
+                        receives.end(&out);
                         out.send(Kind::Ended {
-                            topic: connection.topic.clone(),
+                            topic: receives.topic.clone(),
                             reason: closed_reason(&closed).into(),
                         });
                         return;
                     }
                     Err(RecvError::Cancelled) => {
-                        connection.count(&out);
+                        receives.end(&out);
                         return;
                     }
                     Err(err) => {
                         out.send(Kind::Fault {
-                            text: format!("recv {}: {err}", connection.topic),
+                            text: format!("recv {}: {err}", receives.topic),
                         });
                         return;
                     }
                 }
-                connection.count_if_due(&out);
+                receives.count_if_due(&out);
             }
         });
         Ok(Running {

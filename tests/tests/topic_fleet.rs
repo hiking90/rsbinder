@@ -34,7 +34,9 @@ use std::time::{Duration, Instant};
 
 use rustix::process::{Pid, Signal};
 use tests::topic_fleet::event::{Event, Kind};
+use tests::topic_fleet::judge::{self, check_end, end_reason, Injected, Mode};
 use tests::topic_fleet::now_ns;
+use tests::topic_fleet::record::Incarnation;
 
 /// From a spawn to the node's `READY`.
 const READY: Duration = Duration::from_secs(10);
@@ -109,6 +111,8 @@ struct Fleet {
     backlog: VecDeque<Seen>,
     /// The latest `COUNT` of each node.
     counts: HashMap<String, Event>,
+    /// The `PUBLISHED` of each node.
+    published: HashMap<String, Event>,
 }
 
 fn node_bin() -> PathBuf {
@@ -144,6 +148,7 @@ impl Fleet {
             recv,
             backlog: VecDeque::new(),
             counts: HashMap::new(),
+            published: HashMap::new(),
         }
     }
 
@@ -273,8 +278,14 @@ impl Fleet {
                         let node = event.node.clone();
                         return Err(self.failure(Some(&node), format!("{what}: {}", event.line())));
                     }
-                    if let Kind::Count { .. } = event.kind {
-                        self.counts.insert(event.node.clone(), event.clone());
+                    match event.kind {
+                        Kind::Count { .. } => {
+                            self.counts.insert(event.node.clone(), event.clone());
+                        }
+                        Kind::Published { .. } => {
+                            self.published.insert(event.node.clone(), event.clone());
+                        }
+                        _ => {}
                     }
                     Seen::Event(event)
                 }
@@ -346,7 +357,7 @@ impl Fleet {
     }
 
     /// `(received, lagged, first_seq, last_seq)` of `node`'s latest `COUNT`.
-    fn count(&self, node: &str) -> (u64, u64, u64, u64) {
+    fn count(&self, node: &str, incarnation: Incarnation) -> judge::Count {
         match self.counts.get(node).map(|event| &event.kind) {
             Some(&Kind::Count {
                 received,
@@ -354,8 +365,26 @@ impl Fleet {
                 first_seq,
                 last_seq,
                 ..
-            }) => (received, lagged, first_seq, last_seq),
+            }) => judge::Count {
+                incarnation,
+                received,
+                lagged,
+                first_seq,
+                last_seq,
+            },
             _ => panic!("no COUNT from {node}"),
+        }
+    }
+
+    /// The incarnation and last seq of `node`'s `PUBLISHED`.
+    fn published(&self, node: &str) -> (Incarnation, u64) {
+        match self.published.get(node).map(|event| &event.kind) {
+            Some(&Kind::Published {
+                incarnation,
+                last_seq,
+                ..
+            }) => (incarnation, last_seq),
+            _ => panic!("no PUBLISHED from {node}"),
         }
     }
 }
@@ -402,8 +431,9 @@ fn steady_state_one_topic() {
     std::thread::sleep(Duration::from_secs(3));
     let exited = now_ns();
     fleet.command("pub", "exit");
+    let reason = end_reason(Injected::Close, false);
     for sub in SUBSCRIBERS {
-        let ended = fleet.ended(sub, "End", END * 2).unwrap();
+        let ended = fleet.ended(sub, reason, END * 2).unwrap();
         assert!(
             since(exited, &ended) < END,
             "{sub}: {:?}",
@@ -411,10 +441,19 @@ fn steady_state_one_topic() {
         );
     }
     fleet.finish().unwrap();
+    let (incarnation, last_published) = fleet.published("pub");
     for sub in SUBSCRIBERS {
-        let (received, lagged, first_seq, last_seq) = fleet.count(sub);
-        assert_eq!(received + lagged, last_seq - first_seq + 1, "{sub}");
-        assert!(received >= 100, "{sub}: {received}");
+        let count = fleet.count(sub, incarnation);
+        check_end(
+            Mode::Counted,
+            false,
+            Injected::Close,
+            reason,
+            Some(&count),
+            Some(last_published),
+        )
+        .unwrap_or_else(|text| panic!("{sub}: {text}"));
+        assert!(count.received >= 100, "{sub}: {count:?}");
     }
 }
 
@@ -432,7 +471,9 @@ fn a_killed_publisher_ends_its_subscribers() {
     let killed = now_ns();
     fleet.kill("pub", Signal::KILL);
     for sub in SUBSCRIBERS {
-        let ended = fleet.ended(sub, "PublisherDied", END * 2).unwrap();
+        let ended = fleet
+            .ended(sub, end_reason(Injected::Kill, false), END * 2)
+            .unwrap();
         assert!(
             since(killed, &ended) < END,
             "{sub}: {:?}",

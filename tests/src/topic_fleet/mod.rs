@@ -5,11 +5,12 @@
 //! over kernel binder while `tests/topic_fleet.rs` starts, stops and kills them.
 //!
 //! What both sides share lives here: the line a node prints for each event ([`event`]), the
-//! record a publisher writes ([`record`]), and the one place a node finds and joins a topic
-//! ([`transport`]). A node prints an event only when something changes (a connection, an end, a
+//! record a publisher writes ([`record`]), the checks of what a subscription receives
+//! ([`judge`]), and the one place a node finds and joins a topic ([`transport`]). A node prints an event only when something changes (a connection, an end, a
 //! violation, a count at most once a second), never one per record.
 
 pub mod event;
+pub mod judge;
 pub mod record;
 pub mod transport;
 
