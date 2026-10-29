@@ -19,6 +19,12 @@
 //!
 //! `TOPIC_NODE_BIN` replaces the node binary and `TOPIC_FLEET_DIR` the directory the run
 //! directories go in (`target/tmp/topic-fleet`), for a device the binaries were pushed to.
+//!
+//! On Android the platform service manager is the context manager and the nodes run as root:
+//! `su` is a permissive domain on a userdebug build, so any name can be added under enforcing
+//! SELinux. `hub_restarts` does not apply there. Android 10's service manager sends no
+//! registration notices: only T6's subscribers, through the registry, are named, and X1, X3
+//! and X12 judge the plain ones alone.
 
 #![cfg(any(target_os = "linux", target_os = "android"))]
 
@@ -32,9 +38,9 @@ use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use rsbinder::{hub, ProcessState};
+use rsbinder::{hub, ProcessState, StatusCode};
 use rsbinder_topic::aidl::ITopicRegistry::SERVICE_NAME;
-use rsbinder_topic::Start;
+use rsbinder_topic::{Resolver, ServiceManager, Start};
 use rustix::process::{Pid, Signal};
 use tests::topic_fleet::event::{Event, Kind, Subscribed};
 use tests::topic_fleet::judge::{
@@ -728,6 +734,18 @@ fn init() {
     });
 }
 
+/// Whether the service manager sends registration notices. Android 10's has none, so a named
+/// subscriber can follow a name only through the registry there (`rsbinder_topic::ServiceManager`).
+fn registration_notices() -> bool {
+    init();
+    let probe = format!("rsb.fleet.probe.{}", std::process::id());
+    match ServiceManager.watch(&probe, Box::new(|_| {})) {
+        Ok(_) => true,
+        Err(status) if status.transaction_error() == StatusCode::UnknownTransaction => false,
+        Err(status) => panic!("watching {probe}: {status:?}"),
+    }
+}
+
 fn env_number(name: &str, default: u64) -> u64 {
     std::env::var(name)
         .ok()
@@ -776,6 +794,8 @@ struct Topology {
     named: String,
     /// X7's small pool.
     pins: String,
+    /// The service manager sends registration notices: T1–T5 have named subscribers too.
+    notices: bool,
 }
 
 impl Topology {
@@ -805,6 +825,7 @@ impl Topology {
             status: status.clone(),
             named: named.clone(),
             pins: String::new(),
+            notices: registration_notices(),
         };
         topology.node("registry", &[("--registry", format!("service={registry}"))]);
         topology.node(
@@ -918,7 +939,7 @@ impl Topology {
             for j in 0..3 {
                 let (topic, payload, pool, via_registry) = topics[(i + 2 * j) % topics.len()];
                 let s = i * 3 + j;
-                let named = via_registry || s % 3 == 1;
+                let named = via_registry || (topology.notices && s % 3 == 1);
                 let recv = match s % 5 {
                     1 => "latest",
                     2 => "async",
@@ -1238,10 +1259,16 @@ fn stop_point(
         }
     }
 
-    let prefix = format!("rsb.fleet.{}.", fleet.tag);
+    // Android 10's service manager lists a dead service's name for good, an earlier run's too.
+    let (prefix, suffix) = (
+        format!("rsb.fleet.{}.", fleet.tag),
+        format!(".{}", std::process::id()),
+    );
     let mut listed: Vec<String> = hub::list_services(hub::DUMP_FLAG_PRIORITY_ALL)
         .into_iter()
-        .filter(|name| name.starts_with(&prefix) || *name == topology.registry)
+        .filter(|name| {
+            (name.starts_with(&prefix) && name.ends_with(&suffix)) || *name == topology.registry
+        })
         .collect();
     let mut registered = topology.registered.clone();
     listed.sort();
@@ -1600,9 +1627,10 @@ fn x1_killed_producer_restarts_with_records(
     // The rule for a named subscriber's later connection is seen only on one that counts its
     // records and does not start at `Last`, which keeps its start.
     assert!(
-        topology
-            .of(&topic)
-            .any(|p| p.named && p.mode == Mode::Counted && p.start != Start::Last),
+        !topology.notices
+            || topology
+                .of(&topic)
+                .any(|p| p.named && p.mode == Mode::Counted && p.start != Start::Last),
         "X1: no subscription of T2 shows the start rule of a named subscriber"
     );
     let since = now_ns();
@@ -1744,6 +1772,10 @@ fn x3_duplicate_takes_the_name_and_gives_it_back(
     let duplicate = "p-control-dup";
     let topic = topology.topic_of(node);
     let named = |p: &Planned| p.topic == topic && p.named;
+    assert!(
+        !topology.notices || topology.of(&topic).any(named),
+        "X3: T3 has no named subscriber"
+    );
     let since = now_ns();
     let spec = topology.args(node)[1].clone();
     fleet.spawn(duplicate, &["--pub", &spec]);
@@ -2173,6 +2205,10 @@ fn x12_replaced_producer_dies_in_the_drain(
     let of_topic = |p: &Planned| p.topic == topic;
     let named = |p: &Planned| p.topic == topic && p.named;
     let plain = |p: &Planned| p.topic == topic && !p.named;
+    assert!(
+        !topology.notices || topology.of(&topic).any(named),
+        "X12: T3 has no named subscriber"
+    );
     ended_since(
         fleet,
         topology,

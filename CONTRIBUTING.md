@@ -69,6 +69,23 @@ A failing test keeps its run directory (`target/tmp/topic-fleet/`): the
 event log and each node's stderr. A debug build's nodes take about three
 cores; on a smaller machine run it with `--release`.
 
+On a rootable emulator (userdebug image) the fleet runs against the
+platform service manager, everything but `hub_restarts`:
+
+```
+cargo ndk -t x86_64-linux-android --platform 29 test --release -p tests --test topic_fleet --no-run
+adb root && adb shell mkdir -p /data/local/tmp/fleet
+adb push target/x86_64-linux-android/release/topic_node /data/local/tmp/fleet/
+adb push target/x86_64-linux-android/release/deps/topic_fleet-<hash> /data/local/tmp/fleet/topic_fleet
+adb shell 'cd /data/local/tmp/fleet && TOPIC_NODE_BIN=$PWD/topic_node TOPIC_FLEET_DIR=$PWD/run \
+  ./topic_fleet --ignored --test-threads=1 --skip hub_restarts'
+```
+
+Take `<hash>` from the build's `Executable tests/topic_fleet.rs (...)` line;
+`deps/` keeps older builds of the same test. Android 10 (`i686-linux-android`
+for the API 29 x86 image) has no registration notices in its service
+manager, so there the named subscribers are T6's alone.
+
 ## Pull request checklist
 
 - `scripts/local_gate.sh` passes: at least `hermetic`, plus `kernel` for
