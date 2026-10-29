@@ -79,19 +79,11 @@ impl Subscription {
         }
     }
 
-    /// `(received, lagged)` over every connection: what a `NamedSubscriber`'s `SubscriberStats`
-    /// counts as `received` and `lost` when no check failed.
+    /// `(received, lagged)` over every connection. Less what it was when the subscription object
+    /// was made, it is what that object's `SubscriberStats` counts as `received` and `lost` when
+    /// no check failed.
     pub fn totals(&self) -> (u64, u64) {
         (self.received, self.lagged)
-    }
-
-    /// `(received, lagged)` of the current connection: what a `Subscriber`'s counts, which a
-    /// subscription made again starts from zero.
-    pub fn current(&self) -> (u64, u64) {
-        let (received, lagged) = self
-            .count
-            .map_or((0, 0), |count| (count.received, count.lagged));
-        (received, lagged + self.pending)
     }
 
     /// Check a record; `Ok(true)` when it is the first of its connection.

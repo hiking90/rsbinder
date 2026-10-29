@@ -16,10 +16,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rsbinder::BinderResult;
+use rsbinder::{BinderResult, ExceptionCode, Status};
+use rsbinder_topic::aidl::ITopic::ERROR_FULL;
 use rsbinder_topic::{
-    wait_any, Bytes, Closed, Interrupter, NamedSubscriber, Publisher, PublisherPolicy, RecvError,
-    Subscriber, SubscriberPolicy, SubscriberStats, Trust, Trusted, Untrusted, Wait, Wake,
+    wait_any, Bytes, Closed, Disconnected, Interrupter, NamedSubscriber, Publisher,
+    PublisherPolicy, RecvError, Subscriber, SubscriberPolicy, SubscriberStats, Trust, Trusted,
+    Untrusted, Wait, Wake,
 };
 use tests::topic_fleet::event::{closed_reason, disconnected_reason, Kind};
 use tests::topic_fleet::judge::{self, Mode, Reports, Subscription};
@@ -63,6 +65,11 @@ trait Source: Send {
     fn resubscribe(&mut self) -> BinderResult<()>;
     /// Receive a sample and keep it, its slot pinned, until the process is killed (X7).
     fn hold(&mut self) {}
+    /// Subscribe again through the registry's host now registered (plan 15 D8); a subscriber
+    /// of the service manager has nothing to do.
+    fn rebind(&mut self) -> BinderResult<()> {
+        Ok(())
+    }
 }
 
 fn runtime(spec: &SubSpec) -> Option<tokio::runtime::Runtime> {
@@ -126,6 +133,9 @@ struct Named<T: FleetPayload> {
     subscriber: NamedSubscriber<T>,
     runtime: Option<tokio::runtime::Runtime>,
     id: u32,
+    name: String,
+    policy: SubscriberPolicy,
+    via: Via,
 }
 
 impl<T: FleetPayload> Source for Named<T> {
@@ -163,6 +173,13 @@ impl<T: FleetPayload> Source for Named<T> {
     }
 
     fn resubscribe(&mut self) -> BinderResult<()> {
+        Ok(())
+    }
+
+    fn rebind(&mut self) -> BinderResult<()> {
+        if self.via != Via::ServiceManager {
+            self.subscriber = transport::subscribe_named(&self.name, &self.policy, &self.via)?;
+        }
         Ok(())
     }
 }
@@ -271,6 +288,9 @@ fn typed<T: FleetPayload>(
             subscriber: transport::subscribe_named(&spec.topic, &policy, &spec.via)?,
             runtime,
             id,
+            name: spec.topic.clone(),
+            policy,
+            via: spec.via.clone(),
         }),
     })
 }
@@ -325,6 +345,10 @@ struct Sub {
     resubscribe: bool,
     idle: bool,
     on_record: Option<OnRecord>,
+    /// The judge's totals when the current subscription object was made.
+    base: (u64, u64),
+    /// A refusal with `ERROR_FULL` was reported and no subscription made since.
+    full: bool,
 }
 
 impl Sub {
@@ -345,6 +369,8 @@ impl Sub {
             resubscribe: false,
             idle: false,
             on_record: None,
+            base: (0, 0),
+            full: false,
         })
     }
 
@@ -425,6 +451,9 @@ impl Sub {
                 Flow::Next
             }
             Err(RecvError::Disconnected(why)) => {
+                if let Disconnected::Rejected(status) = &why {
+                    self.refused(out, status);
+                }
                 self.end(out, disconnected_reason(&why));
                 Flow::Next
             }
@@ -459,24 +488,66 @@ impl Sub {
         flow
     }
 
+    /// `rebind`: the connection ends here (its last `COUNT`, no `ENDED`: nothing ended it from
+    /// the publisher's side), and the subscription is made again through the registry.
+    fn rebind(&mut self, out: &Out) {
+        let count = self.judge.end();
+        self.print(out, count);
+        match self.source.rebind() {
+            Ok(()) => {
+                self.idle = false;
+                self.base = self.judge.totals();
+                *self
+                    .interrupter
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = self.source.interrupter();
+            }
+            Err(status) => {
+                self.idle = true;
+                out.send(Kind::Unbound {
+                    topic: self.topic(),
+                    text: format!("subscribe: {status}"),
+                });
+            }
+        }
+    }
+
     /// One try to subscribe again; the current interrupter is in place before it returns.
-    fn try_resubscribe(&mut self) {
-        if self.source.resubscribe().is_ok() {
-            self.resubscribe = false;
-            *self
-                .interrupter
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) = self.source.interrupter();
+    fn try_resubscribe(&mut self, out: &Out) {
+        match self.source.resubscribe() {
+            Ok(()) => {
+                self.resubscribe = false;
+                self.full = false;
+                self.base = self.judge.totals();
+                *self
+                    .interrupter
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = self.source.interrupter();
+            }
+            // Retried every 100 ms: one `FULL` per run of refusals.
+            Err(status) if !self.full => self.refused(out, &status),
+            Err(_) => {}
+        }
+    }
+
+    /// `FULL` for a refusal with `ITopic::ERROR_FULL` (plan 15 fleet test §5.4).
+    fn refused(&mut self, out: &Out, status: &Status) {
+        if status.exception_code() == ExceptionCode::ServiceSpecific
+            && status.service_specific_error() == ERROR_FULL
+        {
+            self.full = true;
+            out.send(Kind::Full {
+                topic: self.topic(),
+            });
         }
     }
 
     fn stats(&self) -> Vec<Kind> {
         let stats = self.source.stats();
-        // A plain subscriber made again counts from zero; a named one over every connection.
-        let (node_received, node_lagged) = match self.spec.api {
-            Api::Plain => self.judge.current(),
-            Api::Named => self.judge.totals(),
-        };
+        // A subscription object made again (a plain resubscription, a `rebind`) counts from zero.
+        let (received_total, lagged_total) = self.judge.totals();
+        let (node_received, node_lagged) =
+            (received_total - self.base.0, lagged_total - self.base.1);
         let mut kinds = vec![Kind::SubStats {
             topic: self.topic(),
             received: stats.received,
@@ -530,6 +601,7 @@ fn serve_one(out: &Out, sub: &mut Sub, requests: &mpsc::Receiver<Request>) -> bo
     for command in commands {
         match command {
             Command::HoldSample => sub.source.hold(),
+            Command::Rebind => sub.rebind(out),
             other => out.fault(format!(
                 "{other:?} {}: not for a subscription",
                 sub.spec.topic
@@ -552,6 +624,7 @@ fn run_one(out: Out, mut sub: Sub, requested: mpsc::Receiver<Request>) {
                 Ok(Request::Stats(answer)) => {
                     let _ = answer.send(sub.stats());
                 }
+                Ok(Request::Command(Command::Rebind)) => sub.rebind(&out),
                 Ok(Request::Command(command)) => {
                     out.fault(format!(
                         "{command:?} {}: no subscription now",
@@ -562,7 +635,7 @@ fn run_one(out: Out, mut sub: Sub, requested: mpsc::Receiver<Request>) {
                 Err(RecvTimeoutError::Timeout) => {}
             }
             if sub.resubscribe {
-                sub.try_resubscribe();
+                sub.try_resubscribe(&out);
                 // A `Stop` sent before the new interrupter was in place interrupted the old one.
                 if serve_one(&out, &mut sub, &requested) {
                     break;
@@ -576,6 +649,18 @@ fn run_one(out: Out, mut sub: Sub, requested: mpsc::Receiver<Request>) {
         }
     }
     sub.stop(&out);
+}
+
+/// A command to a group: `rebind` reaches its subscriptions found through a registry, which
+/// are of the one topic a group can have there.
+fn group_command(out: &Out, subs: &mut [Sub], command: Command) {
+    match command {
+        Command::Rebind => subs
+            .iter_mut()
+            .filter(|sub| matches!(sub.spec.via, Via::Registry(_)))
+            .for_each(|sub| sub.rebind(out)),
+        other => out.fault(format!("{other:?}: not for a group")),
+    }
 }
 
 /// Subscriptions with `Wake::Fd` that one thread waits on with `wait_any`.
@@ -594,11 +679,19 @@ fn run_group(
     };
     loop {
         for sub in subs.iter_mut().filter(|sub| sub.resubscribe) {
-            sub.try_resubscribe();
+            sub.try_resubscribe(&out);
         }
         // After the resubscriptions: a `Stop` sent meanwhile interrupted an old subscription.
-        let refuse = |command: Command| out.fault(format!("{command:?}: not for a group"));
-        if serve(&requested, || stats(&subs, &extra), refuse) {
+        let mut commands = Vec::new();
+        let stop = serve(
+            &requested,
+            || stats(&subs, &extra),
+            |command| commands.push(command),
+        );
+        for command in commands {
+            group_command(&out, &mut subs, command);
+        }
+        if stop {
             break;
         }
         let mut waits: Vec<&mut dyn Wait> = subs
@@ -612,7 +705,7 @@ fn run_group(
                 Ok(Request::Stats(answer)) => {
                     let _ = answer.send(stats(&subs, &extra));
                 }
-                Ok(Request::Command(command)) => out.fault(format!("{command:?}: not for a group")),
+                Ok(Request::Command(command)) => group_command(&out, &mut subs, command),
                 Ok(Request::Stop) | Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => {}
             }
@@ -647,8 +740,7 @@ fn spawn(out: &Out, subs: Vec<Sub>, extra: Option<Extra>, group: bool) -> Runnin
     let (requests, requested) = mpsc::channel();
     let wake = wake_all(subs.iter().map(|sub| sub.interrupter.clone()).collect());
     let out = out.clone();
-    // A command names a topic: it reaches a subscription on its own thread, not a group.
-    let topic = (!group).then(|| subs[0].topic());
+    let topics = subs.iter().map(Sub::topic).collect();
     let thread = if group {
         thread::spawn(move || run_group(out, subs, requested, extra))
     } else {
@@ -659,7 +751,7 @@ fn spawn(out: &Out, subs: Vec<Sub>, extra: Option<Extra>, group: bool) -> Runnin
         requests,
         wake,
         threads: vec![thread],
-        topic,
+        topics,
     }
 }
 
@@ -687,6 +779,21 @@ fn fuse_input(topic: String, payload: PayloadKind) -> SubSpec {
     }
 }
 
+/// A subscription to an input of `--fuse`, which waits up to [`INPUT_WAIT`] for its topic to be
+/// registered: the T4 node may start while a producer of its input restarts (X13).
+fn fuse_sub(topic: String, payload: PayloadKind) -> Result<Sub, String> {
+    let deadline = Instant::now() + INPUT_WAIT;
+    loop {
+        match Sub::new(fuse_input(topic.clone(), payload)) {
+            Ok(sub) => return Ok(sub),
+            Err(_) if Instant::now() < deadline => thread::sleep(RETRY),
+            Err(text) => return Err(text),
+        }
+    }
+}
+
+const INPUT_WAIT: Duration = Duration::from_secs(20);
+
 /// T4: a record on `topic` for each frame (T1), carrying its seq and the latest reading's (T2).
 pub fn fuse(
     out: &Out,
@@ -699,8 +806,8 @@ pub fn fuse(
         transport::advertise(&topic, &PublisherPolicy::default(), &Via::ServiceManager)
             .map_err(|status| format!("advertise {topic}: {status}"))?,
     );
-    let mut frames = Sub::new(fuse_input(frames, PayloadKind::Bytes))?;
-    let mut readings = Sub::new(fuse_input(readings, PayloadKind::Record))?;
+    let mut frames = fuse_sub(frames, PayloadKind::Bytes)?;
+    let mut readings = fuse_sub(readings, PayloadKind::Record)?;
     let next = Arc::new(AtomicU64::new(0));
     let reading = Arc::new(AtomicU64::new(u64::MAX));
     readings.on_record = Some(Box::new({

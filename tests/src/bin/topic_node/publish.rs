@@ -14,7 +14,7 @@ use rsbinder_topic::{Backpressure, Bytes, PoolPolicy, Publisher, PublisherPolicy
 use tests::topic_fleet::event::{Kind, Subscribed};
 use tests::topic_fleet::payload::{FleetPayload, FleetRecord};
 use tests::topic_fleet::record::{topic_id, Incarnation, Stamp};
-use tests::topic_fleet::spec::{PayloadKind, PubSpec};
+use tests::topic_fleet::spec::{PayloadKind, PubSpec, Via};
 use tests::topic_fleet::transport;
 
 use crate::node::{Command, Out, Request, Running};
@@ -58,6 +58,7 @@ pub fn pub_stats(topic: &str, stats: PublisherStats) -> Kind {
                 evicted: info.evicted,
             })
             .collect(),
+        bytes: stats.bytes,
     }
 }
 
@@ -155,6 +156,8 @@ enum State {
     Publishing,
     /// Made with `prepub`, until `resume`.
     Paused,
+    /// Found through a registry that could not be reached: no publisher until `rebind`.
+    Unbound,
     /// After `close`, or a publish that failed: it answers `stats` and `exit` only.
     Done,
 }
@@ -165,27 +168,35 @@ fn run<T: FleetPayload>(
     incarnation: Incarnation,
     write: Write<T>,
 ) -> Result<Running, String> {
-    let (publisher, mut seq) = make(&spec, incarnation, &write)?;
+    let through_registry = matches!(spec.via, Via::Registry(_));
+    let (mut publisher, mut seq, mut state) = match make(&spec, incarnation, &write) {
+        Ok((publisher, seq)) if spec.prepublish.is_some() => (Some(publisher), seq, State::Paused),
+        Ok((publisher, seq)) => (Some(publisher), seq, State::Publishing),
+        Err(text) if through_registry => {
+            out.send(Kind::Unbound {
+                topic: spec.topic.clone(),
+                text,
+            });
+            (None, 0, State::Unbound)
+        }
+        Err(text) => return Err(text),
+    };
     let (requests, requested) = mpsc::channel();
     let period = Duration::from_secs(1) / spec.hz;
     let id = topic_id(&spec.topic);
     let topic = spec.topic.clone();
     let out = out.clone();
     let thread = thread::spawn(move || {
-        let mut state = if spec.prepublish.is_some() {
-            State::Paused
-        } else {
-            State::Publishing
-        };
         let mut next_at = Instant::now();
         loop {
             let wait = match state {
                 State::Publishing => next_at.saturating_duration_since(Instant::now()),
-                State::Paused | State::Done => Duration::from_secs(3600),
+                State::Paused | State::Unbound | State::Done => Duration::from_secs(3600),
             };
             match requested.recv_timeout(wait) {
                 Ok(Request::Stats(answer)) => {
-                    let _ = answer.send(vec![pub_stats(&spec.topic, publisher.stats())]);
+                    let stats = publisher.as_ref().map(Publisher::stats).unwrap_or_default();
+                    let _ = answer.send(vec![pub_stats(&spec.topic, stats)]);
                     continue;
                 }
                 Ok(Request::Command(Command::Resume)) if state == State::Paused => {
@@ -193,15 +204,44 @@ fn run<T: FleetPayload>(
                     next_at = Instant::now();
                     continue;
                 }
-                Ok(Request::Command(Command::Close)) if state != State::Done => {
-                    publisher.close(&Status::from(ExceptionCode::None));
+                Ok(Request::Command(Command::Close)) if state == State::Publishing => {
+                    if let Some(publisher) = &publisher {
+                        publisher.close(&Status::from(ExceptionCode::None));
+                    }
                     published(&out, &spec.topic, incarnation, seq);
                     state = State::Done;
                     continue;
                 }
-                Ok(Request::Command(Command::Readvertise)) => {
-                    if let Err(status) = hub::add_service(&spec.topic, publisher.as_binder()) {
+                Ok(Request::Command(Command::Readvertise)) if publisher.is_some() => {
+                    let binder = publisher.as_ref().map(Publisher::as_binder);
+                    if let Some(Err(status)) =
+                        binder.map(|binder| hub::add_service(&spec.topic, binder))
+                    {
                         out.fault(format!("addService {}: {status}", spec.topic));
+                    }
+                    continue;
+                }
+                // The old publisher ends (its end record); the new one goes on with the seqs, so
+                // that a connection to it returns none an earlier one did.
+                Ok(Request::Command(Command::Rebind))
+                    if through_registry && state != State::Done =>
+                {
+                    if let Some(old) = publisher.take() {
+                        old.close(&Status::from(ExceptionCode::None));
+                    }
+                    match transport::advertise(&spec.topic, &policy(&spec), &spec.via) {
+                        Ok(new) => {
+                            publisher = Some(new);
+                            state = State::Publishing;
+                            next_at = Instant::now();
+                        }
+                        Err(status) => {
+                            out.send(Kind::Unbound {
+                                topic: spec.topic.clone(),
+                                text: format!("advertise: {status}"),
+                            });
+                            state = State::Unbound;
+                        }
                     }
                     continue;
                 }
@@ -216,12 +256,13 @@ fn run<T: FleetPayload>(
                 Err(RecvTimeoutError::Timeout) if state != State::Publishing => continue,
                 Err(RecvTimeoutError::Timeout) => {}
             }
+            let Some(current) = &publisher else { continue };
             let stamp = Stamp {
                 topic: id,
                 incarnation,
                 seq,
             };
-            if let Err(err) = write(&publisher, &stamp) {
+            if let Err(err) = write(current, &stamp) {
                 out.fault(format!("publish {} seq {seq}: {err}", spec.topic));
                 state = State::Done;
                 continue;
@@ -229,10 +270,11 @@ fn run<T: FleetPayload>(
             seq += 1;
             next_at += period;
         }
-        if state == State::Done {
-            drop(publisher);
-        } else {
-            finish(&out, &spec.topic, publisher, incarnation, seq);
+        match publisher {
+            Some(publisher) if state != State::Done => {
+                finish(&out, &spec.topic, publisher, incarnation, seq)
+            }
+            _ => drop(publisher),
         }
     });
     Ok(Running::thread(requests, thread).for_topic(&topic))

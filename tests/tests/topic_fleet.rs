@@ -123,6 +123,8 @@ struct Fleet {
     endings: Vec<Ending>,
     /// Every `CONNECTED`, in the order read.
     connections: Vec<Connection>,
+    /// Every `FULL`: node, topic, when.
+    fulls: Vec<(String, String, u64)>,
 }
 
 /// A `COUNT`: received, lagged, first and last seq.
@@ -213,6 +215,7 @@ impl Fleet {
             published: HashMap::new(),
             endings: Vec::new(),
             connections: Vec::new(),
+            fulls: Vec::new(),
         }
     }
 
@@ -223,6 +226,20 @@ impl Fleet {
 
     /// Start `node` with `role`, and wait for its `READY`.
     fn spawn(&mut self, node: &str, role: &[&str]) {
+        self.launch(node, role);
+        self.ready(node, READY).unwrap();
+    }
+
+    /// Wait for `node`'s `READY`, its roles made.
+    fn ready(&mut self, node: &str, within: Duration) -> Result<(), Failure> {
+        self.wait_for(&format!("{node} READY"), within, |seen| {
+            matches!(seen, Seen::Event(Event { node: n, kind: Kind::Ready { .. }, .. }) if n == node)
+        })
+        .map(drop)
+    }
+
+    /// Start `node` with `role`, without waiting for it to make its roles.
+    fn launch(&mut self, node: &str, role: &[&str]) {
         if let Some(running) = self.nodes.get(node) {
             assert!(running.status.is_some(), "{node} is running already");
         }
@@ -270,10 +287,6 @@ impl Fleet {
                 status: None,
             },
         );
-        self.wait_for(&format!("{node} READY"), READY, |seen| {
-            matches!(seen, Seen::Event(Event { node: n, kind: Kind::Ready { .. }, .. }) if n == node)
-        })
-        .unwrap();
     }
 
     fn node(&mut self, node: &str) -> &mut Node {
@@ -378,6 +391,10 @@ impl Fleet {
                             first_seq,
                             at_ns: event.at_ns,
                         }),
+                        Kind::Full { ref topic } => {
+                            self.fulls
+                                .push((event.node.clone(), topic.clone(), event.at_ns));
+                        }
                         Kind::Published { .. } => {
                             self.published.insert(event.node.clone(), event.clone());
                         }
@@ -712,6 +729,8 @@ struct Planned {
     named: bool,
     mode: Mode,
     start: Start,
+    /// `recv_sample`: what `hold-sample` takes (X7).
+    sample: bool,
 }
 
 impl Planned {
@@ -722,6 +741,7 @@ impl Planned {
             named: false,
             mode: Mode::Counted,
             start: Start::Latest,
+            sample: false,
         }
     }
 }
@@ -778,30 +798,36 @@ impl Topology {
         topology
             .publishers
             .push(("p-status".into(), status.clone()));
+        // Each topic has 10 subscriptions of subscriber nodes per scale, and X4 kills half the
+        // nodes: the dead ones may still be held when the restarted ones subscribe (§3.3), so
+        // `subs` leaves room for both, and for T1 and T2 the T4 node's. T1's pool is
+        // `subs + 1 + depth + max_loans` slots of 1 MiB (`publish.rs:165-171`).
+        let per_topic = 10 * scale;
+        let subs = per_topic + per_topic / 2 + 3;
         let producers = [
             (
                 "p-frames",
                 "--pub",
-                format!("topic={frames},size=1048576,pool,subs=32,hz=10"),
+                format!("topic={frames},size=1048576,pool,subs={subs},hz=10"),
                 &frames,
             ),
             (
                 "p-readings",
                 "--pub",
-                format!("topic={readings},payload=record,hz=1000,ring=16384"),
+                format!("topic={readings},payload=record,hz=1000,ring=16384,subs={subs}"),
                 &readings,
             ),
             (
                 "p-control",
                 "--pub",
                 // A subscriber 160 ms behind holds a publish, one stopped for 1 s is evicted (X5).
-                format!("topic={control},hz=50,bp=1000,window=8"),
+                format!("topic={control},hz=50,bp=1000,window=8,subs={subs}"),
                 &control,
             ),
             (
                 "p-named",
                 "--pub",
-                format!("topic={named},hz=20,via={registry}"),
+                format!("topic={named},hz=20,via={registry},subs={subs}"),
                 &named,
             ),
             (
@@ -879,6 +905,7 @@ impl Topology {
                         Mode::Counted
                     },
                     start: [Start::Latest, Start::Last, Start::Oldest][s % 3],
+                    sample: recv == "sample",
                     ..Planned::new(&node, topic)
                 });
             }
@@ -1209,10 +1236,68 @@ fn settle(
     }
 }
 
+/// CPU seconds of the children this process has waited for, user and system
+/// (`/proc/self/stat` `cutime`, `cstime`).
+fn children_cpu() -> (f64, f64) {
+    let stat = fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    // The fields after the command name, which may hold spaces, start at `state` (field 3).
+    let fields: Vec<&str> = stat
+        .rsplit_once(')')
+        .map(|(_, rest)| rest.split_whitespace().collect())
+        .unwrap_or_default();
+    let ticks = rustix::param::clock_ticks_per_second() as f64;
+    let field = |n: usize| {
+        fields
+            .get(n - 3)
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0)
+            / ticks
+    };
+    (field(16), field(17))
+}
+
+/// What a fleet test took: wall time, and the CPU its nodes used, which it reports and logs
+/// (plan 15 fleet test F3 "실행 시간과 CPU 사용률").
+struct Usage {
+    started: Instant,
+    cpu: (f64, f64),
+}
+
+impl Usage {
+    fn start() -> Self {
+        Self {
+            started: Instant::now(),
+            cpu: children_cpu(),
+        }
+    }
+
+    /// After `finish`: every node waited for, so its CPU is counted.
+    fn report(&self, fleet: &mut Fleet, what: &str) {
+        let wall = self.started.elapsed().as_secs_f64();
+        let (user, system) = children_cpu();
+        let (user, system) = (user - self.cpu.0, system - self.cpu.1);
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get()) as f64;
+        let line = format!(
+            "{what}: wall {wall:.1} s, nodes' CPU {user:.1} s user + {system:.1} s system, \
+             {:.0}% of {cores} cores",
+            100.0 * (user + system) / (wall * cores)
+        );
+        eprintln!("topic fleet: {line}");
+        fleet.log(&line);
+    }
+}
+
 /// The topology of `tag` started, every subscription connected.
 fn start_fleet(tag: &str) -> (Fleet, Topology) {
     init();
     let scale = env_number("FLEET_SCALE", 1) as usize;
+    // The T5 relay and the T4 node take the default 64 subscriptions: at scale 3, T5 has
+    // 35 and up to 15 dead ones of X4. Scale 1 has 10 subscriber processes per topic already;
+    // scale 3 is the first ask's 60 processes or more (67).
+    assert!(
+        (1..=3).contains(&scale),
+        "FLEET_SCALE is 1 to 3, not {scale}"
+    );
     let mut fleet = Fleet::new(tag);
     let topology = Topology::new(&fleet, scale);
     for (node, args) in &topology.nodes {
@@ -1230,6 +1315,7 @@ fn start_fleet(tag: &str) -> (Fleet, Topology) {
 #[ignore = "requires a binder device and a permissive service manager"]
 fn steady_state_fleet() {
     let steady = Duration::from_secs(env_number("FLEET_STEADY_SECS", 30));
+    let usage = Usage::start();
     let (mut fleet, topology) = start_fleet("fleet");
     let none = HashMap::new();
     fleet.watch("warm-up", Duration::from_secs(5)).unwrap();
@@ -1241,6 +1327,35 @@ fn steady_state_fleet() {
         "memfds, mappings, threads or hub files changed"
     );
     fleet.finish().unwrap();
+    usage.report(&mut fleet, "steady state");
+}
+
+/// How many records T2's ring holds, from the payload its publisher has written: a record takes
+/// its payload rounded up to 8 bytes, and 8 more (`PublisherPolicy::for_payload`).
+fn report_t2_depth(fleet: &mut Fleet, topology: &Topology) -> Result<(), Failure> {
+    const RING: u64 = 16384;
+    let readings = topology.topic_of("p-readings");
+    let payload = fleet
+        .stats("p-readings")?
+        .into_iter()
+        .find_map(|kind| match kind {
+            Kind::PubStats {
+                topic,
+                published,
+                bytes,
+                ..
+            } if topic == readings && published > 0 => Some(bytes / published),
+            _ => None,
+        });
+    if let Some(payload) = payload {
+        let line = format!(
+            "T2: {payload} bytes of payload a record, {} records in the ring",
+            RING / (payload.div_ceil(8) * 8 + 8)
+        );
+        eprintln!("topic fleet: {line}");
+        fleet.log(&line);
+    }
+    Ok(())
 }
 
 /// From a restart (or `resume`, `rebind`, `SIGCONT`) to a connection (§5.4).
@@ -1254,7 +1369,8 @@ fn bound(base: Duration) -> Duration {
 }
 
 /// Until each subscription `which` takes has a `CONNECTED` read after `since`, to `incarnation`
-/// if one is given.
+/// if one is given. One refused with `ERROR_FULL` since then is retried at 1 to 30 s: it is left
+/// to the stop point and logged (§5.4).
 fn connected_since(
     fleet: &mut Fleet,
     topology: &Topology,
@@ -1269,17 +1385,38 @@ fn connected_since(
         .filter(|planned| which(planned))
         .map(|planned| (planned.node.clone(), planned.topic.clone()))
         .collect();
-    let connected = |fleet: &Fleet, (node, topic): &(String, String)| {
-        fleet.connections.iter().any(|c| {
-            c.node == *node
-                && c.topic == *topic
-                && c.at_ns >= since
-                && incarnation.is_none_or(|incarnation| c.incarnation == incarnation)
-        })
+    let full = |fleet: &Fleet, (node, topic): &(String, String)| {
+        fleet
+            .fulls
+            .iter()
+            .any(|(n, t, at)| n == node && t == topic && *at >= since)
+    };
+    let connected = |fleet: &Fleet, key: &(String, String)| {
+        full(fleet, key)
+            || fleet.connections.iter().any(|c| {
+                c.node == key.0
+                    && c.topic == key.1
+                    && c.at_ns >= since
+                    && incarnation.is_none_or(|incarnation| c.incarnation == incarnation)
+            })
     };
     let result = fleet.until("every subscription connected", bound(within), |fleet| {
         wanted.iter().all(|key| connected(fleet, key))
     });
+    let refused: Vec<String> = wanted
+        .iter()
+        .filter(|key| full(fleet, key))
+        .map(|(node, topic)| format!("{node} {topic}"))
+        .collect();
+    if !refused.is_empty() {
+        let line = format!(
+            "{} ERROR_FULL, no time bound: {}",
+            now_ns(),
+            refused.join(", ")
+        );
+        eprintln!("topic fleet: {line}");
+        fleet.log(&line);
+    }
     result.map_err(|failure| {
         let missing: Vec<_> = wanted.iter().filter(|key| !connected(fleet, key)).collect();
         Failure(format!("{}\nnot connected: {missing:?}", failure.0))
@@ -1349,6 +1486,46 @@ fn ended_since(
     }
 }
 
+/// The pids of the subscriptions `node`'s publisher of `topic` holds, sorted.
+fn held(fleet: &mut Fleet, node: &str, topic: &str) -> Result<Vec<i32>, Failure> {
+    let mut pids: Vec<i32> = fleet
+        .stats(node)?
+        .into_iter()
+        .find_map(|kind| match kind {
+            Kind::PubStats {
+                topic: t,
+                subscribers,
+                ..
+            } if t == topic => Some(subscribers.iter().map(|info| info.pid).collect()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    pids.sort_unstable();
+    Ok(pids)
+}
+
+/// Ask `node`'s publisher of `topic` until the pids it holds satisfy `done`, within `within`.
+fn held_until(
+    fleet: &mut Fleet,
+    node: &str,
+    topic: &str,
+    what: &str,
+    within: Duration,
+    mut done: impl FnMut(&[i32]) -> bool,
+) -> Result<(), Failure> {
+    let deadline = Instant::now() + within;
+    loop {
+        let pids = held(fleet, node, topic)?;
+        if done(&pids) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(fleet.failure(None, format!("{what}: {node} holds {pids:?}")));
+        }
+        fleet.watch(what, Duration::from_millis(50))?;
+    }
+}
+
 fn args_of(args: &[String]) -> Vec<&str> {
     args.iter().map(String::as_str).collect()
 }
@@ -1381,32 +1558,14 @@ fn x1_killed_producer_restarts_with_records(
     // where the rule says, not where the publisher happened to be.
     let mut expected: Vec<i32> = topology.of(&topic).map(|p| fleet.pid(&p.node)).collect();
     expected.sort_unstable();
-    let deadline = Instant::now() + bound(CONNECT);
-    loop {
-        let mut held: Vec<i32> = fleet
-            .stats(node)?
-            .into_iter()
-            .find_map(|kind| match kind {
-                Kind::PubStats {
-                    topic: t,
-                    subscribers,
-                    ..
-                } if t == topic => Some(subscribers.iter().map(|info| info.pid).collect()),
-                _ => None,
-            })
-            .unwrap_or_default();
-        held.sort_unstable();
-        if held == expected {
-            break;
-        }
-        if Instant::now() >= deadline {
-            return Err(fleet.failure(
-                None,
-                format!("X1: subscriptions {held:?}, expected {expected:?}"),
-            ));
-        }
-        fleet.watch("X1 resubscriptions", Duration::from_millis(200))?;
-    }
+    held_until(
+        fleet,
+        node,
+        &topic,
+        "X1 resubscriptions",
+        bound(CONNECT),
+        |held| held == expected,
+    )?;
     fleet.command(node, &format!("resume {topic}"));
     connected_since(
         fleet,
@@ -1487,6 +1646,21 @@ fn x2_closed_producer_restarts(
     }
     if !wrong.is_empty() {
         return Err(fleet.failure(None, format!("X2 ends:\n{}", wrong.join("\n"))));
+    }
+    // The name stays registered until the process ends; a subscription to it meanwhile is
+    // refused (`ERROR_CLOSED`) and waits for the next registration: none reaches the closed one.
+    // A plain subscriber tries again every 100 ms, so a second gives it ten tries.
+    fleet.watch("X2 closed, not exited", Duration::from_secs(1))?;
+    let reconnected: Vec<&Connection> = fleet
+        .connections
+        .iter()
+        .filter(|c| c.topic == topic && c.at_ns >= since && c.incarnation == incarnation)
+        .collect();
+    if !reconnected.is_empty() {
+        return Err(fleet.failure(
+            None,
+            format!("X2: connected to the closed topic: {reconnected:?}"),
+        ));
     }
     fleet.command(node, "exit");
     fleet.ended_node(node)?;
@@ -1613,10 +1787,7 @@ fn x5_stopped_subscribers(
     fleet.cont(&lagging);
     fleet.until("X5 eviction", bound(END * 2), |fleet| {
         fleet.endings.iter().any(|e| {
-            e.node == slow
-                && e.topic == control
-                && e.at_ns >= since
-                && e.reason.ends_with("Evicted")
+            e.node == slow && e.topic == control && e.at_ns >= since && e.reason == "Evicted"
         })
     })?;
     *evicted.entry(control.clone()).or_default() += 1;
@@ -1667,22 +1838,371 @@ fn x6_stopped_producer(
     }
 }
 
+/// The last seq each subscription `which` takes has counted.
+fn last_seqs(
+    fleet: &Fleet,
+    topology: &Topology,
+    which: impl Fn(&Planned) -> bool,
+) -> Vec<((String, String), Option<u64>)> {
+    topology
+        .subscriptions
+        .iter()
+        .filter(|p| which(p))
+        .map(|p| {
+            let key = (p.node.clone(), p.topic.clone());
+            let seq = fleet.counts.get(&key).map(|count| count.last_seq);
+            (key, seq)
+        })
+        .collect()
+}
+
+/// Until each subscription of `before` has counted past the seq it had then.
+fn advanced(
+    fleet: &mut Fleet,
+    what: &str,
+    before: &[((String, String), Option<u64>)],
+) -> Result<(), Failure> {
+    fleet.until(what, bound(CONNECT), |fleet| {
+        before.iter().all(|(key, seq)| {
+            let now = fleet.counts.get(key).map(|count| count.last_seq);
+            now.is_some_and(|now| seq.is_none_or(|seq| now > seq))
+        })
+    })
+}
+
+/// The `ENDED` lines of `topic` read after `since`.
+fn endings_since<'a>(fleet: &'a Fleet, topic: &'a str, since: u64) -> Vec<&'a Ending> {
+    fleet
+        .endings
+        .iter()
+        .filter(|e| e.topic == topic && e.at_ns >= since)
+        .collect()
+}
+
+/// X7: a subscriber killed while it holds a sample lent from T1's pool; the publisher goes on
+/// lending to every other subscriber.
+fn x7_killed_holding_a_sample(
+    fleet: &mut Fleet,
+    topology: &Topology,
+    _: &mut HashMap<String, u64>,
+) -> Result<(), Failure> {
+    let frames = topology.topic_of("p-frames");
+    let holder = topology
+        .of(&frames)
+        .find(|p| p.sample)
+        .map(|p| p.node.clone())
+        .expect("a recv_sample subscriber of T1");
+    let pid = fleet.pid(&holder);
+    fleet.command(&holder, &format!("hold-sample {frames}"));
+    fleet.watch("X7 holding", Duration::from_millis(500))?;
+    if !held(fleet, "p-frames", &frames)?.contains(&pid) {
+        return Err(fleet.failure(
+            None,
+            format!("X7: {holder} ({pid}) not subscribed as it holds"),
+        ));
+    }
+    // The publisher lends no slot a subscription it holds pins, and takes the pins from those
+    // subscriptions alone (rsbinder-topic `link.rs`, `load_pins`): the dead holder's slot is
+    // lendable once its subscription is out. A check of the slot itself needs the pin of each
+    // subscription in the publisher's stats (plans/15-pubsub-api-review.md A-6).
+    fleet.kill(&holder, Signal::KILL);
+    fleet.ended_node(&holder)?;
+    held_until(
+        fleet,
+        "p-frames",
+        &frames,
+        "X7 the holder taken out",
+        bound(END),
+        |held| !held.contains(&pid),
+    )?;
+    let others = last_seqs(fleet, topology, |p| p.topic == frames && p.node != holder);
+    advanced(fleet, "X7 lending after the holder died", &others)?;
+    let restarted = now_ns();
+    fleet.spawn(&holder, &args_of(&topology.args(&holder)));
+    connected_since(
+        fleet,
+        topology,
+        |p| p.node == holder,
+        restarted,
+        None,
+        CONNECT,
+    )
+}
+
+/// X8: the T4 process killed: its subscribers end, its publishers drop its subscriptions.
+fn x8_pipeline_process_dies(
+    fleet: &mut Fleet,
+    topology: &Topology,
+    _: &mut HashMap<String, u64>,
+) -> Result<(), Failure> {
+    let node = "p-fused";
+    let fused = topology.topic_of(node);
+    let since = now_ns();
+    fleet.kill(node, Signal::KILL);
+    ended_since(
+        fleet,
+        topology,
+        |p| p.topic == fused,
+        Injected::Kill,
+        since,
+        END,
+    )?;
+    fleet.ended_node(node)?;
+    let restarted = now_ns();
+    fleet.spawn(node, &args_of(&topology.args(node)));
+    let touched = |p: &Planned| p.topic == fused || p.node == node;
+    connected_since(fleet, topology, touched, restarted, None, CONNECT)
+}
+
+/// `rebind` to the T6 publisher, then to every T6 subscriber node (plan 15 D8: an application
+/// makes again what it made through a registry whose host died); each connects to the
+/// publisher within the bound.
+fn rebind_named(fleet: &mut Fleet, topology: &Topology) -> Result<(), Failure> {
+    let named = topology.named.clone();
+    let since = now_ns();
+    fleet.command("p-named", &format!("rebind {named}"));
+    for node in topology
+        .of(&named)
+        .map(|p| p.node.clone())
+        .collect::<Vec<_>>()
+    {
+        fleet.command(&node, &format!("rebind {named}"));
+    }
+    let publisher = Some(fleet.incarnation("p-named"));
+    connected_since(
+        fleet,
+        topology,
+        |p| p.topic == named,
+        since,
+        publisher,
+        CONNECT,
+    )
+}
+
+/// X9: the registry's host killed and started again. Connections made through it go on; the
+/// new host tells nothing to what the old one served (D8), until `rebind`.
+fn x9_registry_host_restarts(
+    fleet: &mut Fleet,
+    topology: &Topology,
+    _: &mut HashMap<String, u64>,
+) -> Result<(), Failure> {
+    let named = topology.named.clone();
+    let host = "registry";
+    let before = last_seqs(fleet, topology, |p| p.topic == named);
+    let killed = now_ns();
+    fleet.kill(host, Signal::KILL);
+    fleet.ended_node(host)?;
+    fleet.watch("X9 host dead", Duration::from_secs(2))?;
+    advanced(fleet, "X9 records after the host died", &before)?;
+    let ended = endings_since(fleet, &named, killed);
+    if !ended.is_empty() {
+        return Err(fleet.failure(
+            None,
+            format!("X9: connections ended with the host: {ended:?}"),
+        ));
+    }
+    let restarted = now_ns();
+    fleet.spawn(host, &args_of(&topology.args(host)));
+    // A negative: the new host must not tell the old watches anything (§4, two seconds).
+    fleet.watch("X9 new host", Duration::from_secs(2))?;
+    let told: Vec<&Connection> = fleet
+        .connections
+        .iter()
+        .filter(|c| c.topic == named && c.at_ns >= restarted)
+        .collect();
+    if !told.is_empty() {
+        return Err(fleet.failure(
+            None,
+            format!("X9: connected through the new host before rebind: {told:?}"),
+        ));
+    }
+    rebind_named(fleet, topology)
+}
+
+/// X11: the T6 producer starts again while the registry's host is stopped: its advertise waits
+/// for `SIGCONT`, and no other topic waits with it.
+fn x11_producer_restarts_while_the_host_is_stopped(
+    fleet: &mut Fleet,
+    topology: &Topology,
+    _: &mut HashMap<String, u64>,
+) -> Result<(), Failure> {
+    let node = "p-named";
+    let named = topology.named.clone();
+    let frames = topology.topic_of("p-frames");
+    fleet.stop("registry");
+    fleet.kill(node, Signal::KILL);
+    fleet.ended_node(node)?;
+    fleet.launch(node, &args_of(&topology.args(node)));
+    let others = last_seqs(fleet, topology, |p| p.topic == frames);
+    let flowing = advanced(fleet, "X11 other topics while the host is stopped", &others);
+    let ready_early = fleet
+        .backlog
+        .iter()
+        .any(|seen| matches!(seen, Seen::Event(Event { node: n, kind: Kind::Ready { .. }, .. }) if n == node));
+    let resumed = now_ns();
+    fleet.cont("registry");
+    flowing?;
+    if ready_early {
+        return Err(fleet.failure(
+            None,
+            "X11: the producer advertised through a stopped host".into(),
+        ));
+    }
+    fleet.ready(node, bound(CONNECT))?;
+    let publisher = Some(fleet.incarnation(node));
+    connected_since(
+        fleet,
+        topology,
+        |p| p.topic == named,
+        resumed,
+        publisher,
+        CONNECT,
+    )
+}
+
+/// X12: a second process takes a producer's name and the first is killed during the drain;
+/// named subscribers end either way X12 allows and follow the second. Then the second is killed
+/// and the producer started again.
+fn x12_replaced_producer_dies_in_the_drain(
+    fleet: &mut Fleet,
+    topology: &Topology,
+    evicted: &mut HashMap<String, u64>,
+) -> Result<(), Failure> {
+    let node = "p-control";
+    let duplicate = "p-control-dup";
+    let topic = topology.topic_of(node);
+    let spec = topology.args(node)[1].clone();
+    let since = now_ns();
+    fleet.spawn(duplicate, &["--pub", &spec]);
+    fleet.kill(node, Signal::KILL);
+    let of_topic = |p: &Planned| p.topic == topic;
+    let named = |p: &Planned| p.topic == topic && p.named;
+    let plain = |p: &Planned| p.topic == topic && !p.named;
+    ended_since(
+        fleet,
+        topology,
+        named,
+        Injected::ReplaceThenKill,
+        since,
+        CONNECT,
+    )?;
+    ended_since(fleet, topology, plain, Injected::Kill, since, END)?;
+    let taken = Some(fleet.incarnation(duplicate));
+    connected_since(fleet, topology, of_topic, since, taken, CONNECT)?;
+    fleet.ended_node(node)?;
+
+    let killed = now_ns();
+    fleet.kill(duplicate, Signal::KILL);
+    ended_since(fleet, topology, of_topic, Injected::Kill, killed, END)?;
+    fleet.ended_node(duplicate)?;
+    evicted.remove(&topic);
+    let restarted = now_ns();
+    fleet.spawn(node, &args_of(&topology.args(node)));
+    let back = Some(fleet.incarnation(node));
+    connected_since(fleet, topology, of_topic, restarted, back, CONNECT)
+}
+
+/// X13: the T1 producer killed while the T4 process starts and subscribes to it; T4 connects
+/// once T1 is back, and T2 and T4's other work go on.
+fn x13_input_dies_while_the_pipeline_starts(
+    fleet: &mut Fleet,
+    topology: &Topology,
+    _: &mut HashMap<String, u64>,
+) -> Result<(), Failure> {
+    let pipeline = "p-fused";
+    let input = "p-frames";
+    let frames = topology.topic_of(input);
+    let fused = topology.topic_of(pipeline);
+    fleet.kill(pipeline, Signal::KILL);
+    fleet.ended_node(pipeline)?;
+    let since = now_ns();
+    fleet.launch(pipeline, &args_of(&topology.args(pipeline)));
+    fleet.kill(input, Signal::KILL);
+    let others = |p: &Planned| p.topic == frames && p.node != pipeline;
+    ended_since(fleet, topology, others, Injected::Kill, since, END)?;
+    fleet.ended_node(input)?;
+    fleet.spawn(input, &args_of(&topology.args(input)));
+    fleet.ready(pipeline, bound(CONNECT * 2))?;
+    let ready = now_ns();
+    let touched = |p: &Planned| p.topic == frames || p.topic == fused || p.node == pipeline;
+    connected_since(fleet, topology, touched, since, None, CONNECT)?;
+    // T2 was not touched: no subscription of it ends, T4's own included; and once T4 is up,
+    // no subscription of T4 ends.
+    fleet.watch("X13 after", Duration::from_secs(1))?;
+    let readings = topology.topic_of("p-readings");
+    let mut ended = endings_since(fleet, &readings, since);
+    ended.extend(endings_since(fleet, &fused, ready));
+    if ended.is_empty() {
+        Ok(())
+    } else {
+        Err(fleet.failure(
+            None,
+            format!("X13: untouched subscriptions ended: {ended:?}"),
+        ))
+    }
+}
+
+/// X14: the registry's host killed while the T6 producer starts: its advertise fails (it says
+/// `UNBOUND`) or reaches the dead host; either way `rebind` makes it again.
+fn x14_host_dies_while_the_producer_starts(
+    fleet: &mut Fleet,
+    topology: &Topology,
+    _: &mut HashMap<String, u64>,
+) -> Result<(), Failure> {
+    let node = "p-named";
+    let host = "registry";
+    fleet.kill(node, Signal::KILL);
+    fleet.ended_node(node)?;
+    fleet.launch(node, &args_of(&topology.args(node)));
+    fleet.kill(host, Signal::KILL);
+    fleet.ended_node(host)?;
+    fleet.ready(node, bound(CONNECT))?;
+    fleet.spawn(host, &args_of(&topology.args(host)));
+    rebind_named(fleet, topology)
+}
+
+/// X1 and X4 `FLEET_REPEAT` times (default 30), to see that what each leaves behind does not add
+/// up (§4 "반복 phase").
+fn repeat_x1_x4(
+    fleet: &mut Fleet,
+    topology: &Topology,
+    evicted: &mut HashMap<String, u64>,
+) -> Result<(), Failure> {
+    let times = env_number("FLEET_REPEAT", 30);
+    for round in 1..=times {
+        let tag = |failure: Failure| Failure(format!("round {round}/{times}: {}", failure.0));
+        x1_killed_producer_restarts_with_records(fleet, topology, evicted).map_err(tag)?;
+        x4_half_the_subscribers_die(fleet, topology, evicted).map_err(tag)?;
+    }
+    Ok(())
+}
+
 /// Plan 15 fleet test F3: the scripted faults, one at a time, each followed by a stop point that
 /// holds and leaves every process that lived through it as it was.
 #[test]
 #[ignore = "requires a binder device and a permissive service manager"]
 fn scripted_faults() {
+    let usage = Usage::start();
     let (mut fleet, topology) = start_fleet("faults");
     let mut evicted = HashMap::new();
     fleet.watch("warm-up", Duration::from_secs(3)).unwrap();
     let baseline = settle(&mut fleet, &topology, &evicted, SETTLE).unwrap();
-    let phases: [(&str, Phase); 6] = [
+    report_t2_depth(&mut fleet, &topology).unwrap();
+    let phases: [(&str, Phase); 14] = [
         ("X1", x1_killed_producer_restarts_with_records),
         ("X2", x2_closed_producer_restarts),
         ("X3", x3_duplicate_takes_the_name_and_gives_it_back),
         ("X4", x4_half_the_subscribers_die),
         ("X5", x5_stopped_subscribers),
         ("X6", x6_stopped_producer),
+        ("X7", x7_killed_holding_a_sample),
+        ("X8", x8_pipeline_process_dies),
+        ("X9", x9_registry_host_restarts),
+        ("X11", x11_producer_restarts_while_the_host_is_stopped),
+        ("X12", x12_replaced_producer_dies_in_the_drain),
+        ("X13", x13_input_dies_while_the_pipeline_starts),
+        ("X14", x14_host_dies_while_the_producer_starts),
+        ("repeat", repeat_x1_x4),
     ];
     for (name, phase) in phases {
         phase(&mut fleet, &topology, &mut evicted)
@@ -1696,4 +2216,5 @@ fn scripted_faults() {
         );
     }
     fleet.finish().unwrap();
+    usage.report(&mut fleet, "scripted faults");
 }

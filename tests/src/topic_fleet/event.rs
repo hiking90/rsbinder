@@ -74,6 +74,8 @@ pub enum Kind {
         published: u64,
         evicted: u64,
         subscribers: Vec<Subscribed>,
+        /// Bytes of payload published, the last field of the line.
+        bytes: u64,
     },
     /// At `stats`: a registry host's names with a topic and watches.
     RegStats {
@@ -92,6 +94,12 @@ pub enum Kind {
     },
     /// The last line of a node's answer to `stats`.
     StatsDone,
+    /// A role of a topic found through a registry could not reach it, and waits for `rebind`
+    /// (X14: the registry's host died as the role started).
+    Unbound { topic: String, text: String },
+    /// A subscription was refused with `ITopic::ERROR_FULL`: retried at 1 to 30 s, so the time
+    /// bounds of §5.4 do not hold for it, and the topology sized its topics to avoid it (§3.3).
+    Full { topic: String },
 }
 
 /// One subscription in a [`Kind::PubStats`]: `pid:lost:evicted` in the line.
@@ -235,7 +243,7 @@ impl Event {
                 }
             }
             "PSTATS" => {
-                let [topic, published, evicted, subscribers] = words(rest)?;
+                let [topic, published, evicted, subscribers, bytes] = words(rest)?;
                 let subscribers = match subscribers {
                     "-" => Vec::new(),
                     list => list.split(',').map(str::parse).collect::<Result<_, _>>()?,
@@ -245,6 +253,7 @@ impl Event {
                     published: number(published)?,
                     evicted: number(evicted)?,
                     subscribers,
+                    bytes: number(bytes)?,
                 }
             }
             "RSTATS" => {
@@ -272,6 +281,21 @@ impl Event {
                 }
             }
             "STATSDONE" if rest.is_empty() => Kind::StatsDone,
+            "UNBOUND" => {
+                let (topic, text) = rest
+                    .split_once(' ')
+                    .ok_or_else(|| format!("UNBOUND without text: {line:?}"))?;
+                Kind::Unbound {
+                    topic: topic.into(),
+                    text: text.into(),
+                }
+            }
+            "FULL" => {
+                let [topic] = words(rest)?;
+                Kind::Full {
+                    topic: topic.into(),
+                }
+            }
             other => return Err(format!("unknown kind {other:?}: {line:?}")),
         };
         Ok(Self {
@@ -330,13 +354,15 @@ impl fmt::Display for Event {
                 published,
                 evicted,
                 subscribers,
+                bytes,
             } => {
-                write!(f, "PSTATS {topic} {published} {evicted} ")?;
-                if subscribers.is_empty() {
-                    return f.write_str("-");
-                }
                 let list: Vec<String> = subscribers.iter().map(Subscribed::to_string).collect();
-                f.write_str(&list.join(","))
+                let list = if list.is_empty() {
+                    "-".to_string()
+                } else {
+                    list.join(",")
+                };
+                write!(f, "PSTATS {topic} {published} {evicted} {list} {bytes}")
             }
             Kind::RegStats {
                 service,
@@ -351,6 +377,8 @@ impl fmt::Display for Event {
                 seq,
             } => write!(f, "RSEEN {topic} {reporter} {incarnation} {seq}"),
             Kind::StatsDone => f.write_str("STATSDONE"),
+            Kind::Unbound { topic, text } => write!(f, "UNBOUND {topic} {}", one_line(text)),
+            Kind::Full { topic } => write!(f, "FULL {topic}"),
         }
     }
 }
@@ -440,12 +468,17 @@ mod tests {
                         evicted: true,
                     },
                 ],
+                bytes: 3168,
             },
             Kind::PubStats {
                 topic: topic.clone(),
                 published: 0,
                 evicted: 0,
                 subscribers: Vec::new(),
+                bytes: 0,
+            },
+            Kind::Full {
+                topic: topic.clone(),
             },
             Kind::RegStats {
                 service: "rsbinder.topic.registry.fleet.1".into(),
@@ -463,6 +496,10 @@ mod tests {
                 seq: 16,
             },
             Kind::StatsDone,
+            Kind::Unbound {
+                topic: "rsb.fleet.t.named.reg.1".into(),
+                text: "advertise: DeadObject".into(),
+            },
         ]
     }
 

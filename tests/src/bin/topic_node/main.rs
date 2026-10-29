@@ -94,6 +94,9 @@ mod node {
         Resume,
         /// A `recv_sample` subscription: receive a sample and keep it until killed (X7).
         HoldSample,
+        /// A role found through a registry: make it again through the registry's host now
+        /// registered (plan 15 D8; X9, X14).
+        Rebind,
     }
 
     impl Command {
@@ -103,6 +106,7 @@ mod node {
                 "readvertise" => Self::Readvertise,
                 "resume" => Self::Resume,
                 "hold-sample" => Self::HoldSample,
+                "rebind" => Self::Rebind,
                 _ => return None,
             })
         }
@@ -114,8 +118,8 @@ mod node {
         /// Makes the threads look at their requests: interrupts the waits of a subscription.
         pub wake: Box<dyn Fn() + Send>,
         pub threads: Vec<JoinHandle<()>>,
-        /// The topic a command names to reach this role.
-        pub topic: Option<String>,
+        /// The topics a command names to reach this role: a group's every subscription's.
+        pub topics: Vec<String>,
     }
 
     impl Running {
@@ -125,18 +129,18 @@ mod node {
                 requests,
                 wake: Box::new(|| {}),
                 threads: vec![thread],
-                topic: None,
+                topics: Vec::new(),
             }
         }
 
         pub fn for_topic(mut self, topic: &str) -> Self {
-            self.topic = Some(topic.into());
+            self.topics.push(topic.into());
             self
         }
 
         /// Send `command` if this role is of `topic`.
         fn command(&self, topic: &str, command: Command) -> bool {
-            if self.topic.as_deref() != Some(topic) {
+            if !self.topics.iter().any(|t| t == topic) {
                 return false;
             }
             let _ = self.requests.send(Request::Command(command));
