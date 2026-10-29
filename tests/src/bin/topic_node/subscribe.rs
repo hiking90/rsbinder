@@ -758,10 +758,7 @@ fn spawn(out: &Out, subs: Vec<Sub>, extra: Option<Extra>, group: bool) -> Runnin
 /// One subscription on its own thread, or a group of them on one.
 pub fn start(out: &Out, specs: Vec<SubSpec>) -> Result<Running, String> {
     let group = specs.iter().any(|spec| spec.group.is_some());
-    let subs = specs
-        .into_iter()
-        .map(Sub::new)
-        .collect::<Result<Vec<_>, _>>()?;
+    let subs = specs.into_iter().map(made).collect::<Result<Vec<_>, _>>()?;
     Ok(spawn(out, subs, None, group))
 }
 
@@ -779,12 +776,12 @@ fn fuse_input(topic: String, payload: PayloadKind) -> SubSpec {
     }
 }
 
-/// A subscription to an input of `--fuse`, which waits up to [`INPUT_WAIT`] for its topic to be
-/// registered: the T4 node may start while a producer of its input restarts (X13).
-fn fuse_sub(topic: String, payload: PayloadKind) -> Result<Sub, String> {
+/// The subscription of `spec`, tried again for up to [`INPUT_WAIT`]: a node may start while the
+/// producer of its topic, or the registry it is found through, restarts (X13, the chaos layer).
+fn made(spec: SubSpec) -> Result<Sub, String> {
     let deadline = Instant::now() + INPUT_WAIT;
     loop {
-        match Sub::new(fuse_input(topic.clone(), payload)) {
+        match Sub::new(spec.clone()) {
             Ok(sub) => return Ok(sub),
             Err(_) if Instant::now() < deadline => thread::sleep(RETRY),
             Err(text) => return Err(text),
@@ -806,8 +803,8 @@ pub fn fuse(
         transport::advertise(&topic, &PublisherPolicy::default(), &Via::ServiceManager)
             .map_err(|status| format!("advertise {topic}: {status}"))?,
     );
-    let mut frames = fuse_sub(frames, PayloadKind::Bytes)?;
-    let mut readings = fuse_sub(readings, PayloadKind::Record)?;
+    let mut frames = made(fuse_input(frames, PayloadKind::Bytes))?;
+    let mut readings = made(fuse_input(readings, PayloadKind::Record))?;
     let next = Arc::new(AtomicU64::new(0));
     let reading = Arc::new(AtomicU64::new(u64::MAX));
     readings.on_record = Some(Box::new({

@@ -243,6 +243,10 @@ impl Fleet {
         if let Some(running) = self.nodes.get(node) {
             assert!(running.status.is_some(), "{node} is running already");
         }
+        // A `READY` an earlier start of the node left unread is not this start's.
+        self.backlog.retain(|seen| {
+            !matches!(seen, Seen::Event(Event { node: n, kind: Kind::Ready { .. }, .. }) if n == node)
+        });
         let start = self.starts.entry(node.into()).or_insert(0);
         *start += 1;
         let start = *start;
@@ -450,11 +454,20 @@ impl Fleet {
         Err(self.failure(None, format!("{what}: not within {within:?}")))
     }
 
-    /// Read what the nodes print for `duration`, failing as a wait does; what it reads is not
-    /// kept for a later wait.
+    /// Read what the nodes print for `duration`, failing as a wait does. What it reads is not
+    /// kept for a later wait but a `READY`, which a node started without waiting for it
+    /// (`launch`) is waited for by later.
     fn watch(&mut self, what: &str, duration: Duration) -> Result<(), Failure> {
         let deadline = Instant::now() + duration;
-        while self.pump(what, deadline)?.is_some() {}
+        while let Some(seen) = self.pump(what, deadline)? {
+            if let Seen::Event(Event {
+                kind: Kind::Ready { .. },
+                ..
+            }) = seen
+            {
+                self.backlog.push_back(seen);
+            }
+        }
         Ok(())
     }
 
@@ -1066,11 +1079,12 @@ fn hub_fds() -> Option<usize> {
 ///
 /// Producers are asked before subscribers, and the subscribers a second after, so that a
 /// subscriber's counts, read later, are at least what its publisher saw, and the last report
-/// a reporter had sent has reached every T5 subscriber.
+/// a reporter had sent has reached every T5 subscriber. `evicted` is the evictions each topic's
+/// publisher has made; `None` leaves them unchecked (the chaos layer, which cannot know them).
 fn stop_point(
     fleet: &mut Fleet,
     topology: &Topology,
-    evicted: &HashMap<String, u64>,
+    evicted: Option<&HashMap<String, u64>>,
 ) -> Result<Snapshot, Failure> {
     let mut wrong = Vec::new();
     let mut published: HashMap<String, (u64, Vec<Subscribed>)> = HashMap::new();
@@ -1149,11 +1163,13 @@ fn stop_point(
             wrong.push(format!("{publisher}: no PSTATS of {topic}"));
             continue;
         };
-        let expected_evictions = evicted.get(topic).copied().unwrap_or(0);
-        if *evictions != expected_evictions {
-            wrong.push(format!(
-                "{publisher} {topic}: {evictions} evicted, expected {expected_evictions}"
-            ));
+        if let Some(evicted) = evicted {
+            let expected_evictions = evicted.get(topic).copied().unwrap_or(0);
+            if *evictions != expected_evictions {
+                wrong.push(format!(
+                    "{publisher} {topic}: {evictions} evicted, expected {expected_evictions}"
+                ));
+            }
         }
         let mut expected: Vec<i32> = topology
             .subscriptions
@@ -1260,7 +1276,7 @@ fn stop_point(
 fn settle(
     fleet: &mut Fleet,
     topology: &Topology,
-    evicted: &HashMap<String, u64>,
+    evicted: Option<&HashMap<String, u64>>,
     within: Duration,
 ) -> Result<Snapshot, Failure> {
     let deadline = Instant::now() + within;
@@ -1356,9 +1372,9 @@ fn steady_state_fleet() {
     let (mut fleet, topology) = start_fleet("fleet");
     let none = HashMap::new();
     fleet.watch("warm-up", Duration::from_secs(5)).unwrap();
-    let first = stop_point(&mut fleet, &topology, &none).unwrap();
+    let first = stop_point(&mut fleet, &topology, Some(&none)).unwrap();
     fleet.watch("steady state", steady).unwrap();
-    let second = stop_point(&mut fleet, &topology, &none).unwrap();
+    let second = stop_point(&mut fleet, &topology, Some(&none)).unwrap();
     assert_eq!(
         first, second,
         "memfds, mappings, threads or hub files changed"
@@ -2265,7 +2281,7 @@ fn scripted_faults() {
     let (mut fleet, topology) = start_fleet("faults");
     let mut evicted = HashMap::new();
     fleet.watch("warm-up", Duration::from_secs(3)).unwrap();
-    let baseline = settle(&mut fleet, &topology, &evicted, SETTLE).unwrap();
+    let baseline = settle(&mut fleet, &topology, Some(&evicted), SETTLE).unwrap();
     report_t2_depth(&mut fleet, &topology).unwrap();
     let phases: [(&str, Phase); 14] = [
         ("X1", x1_killed_producer_restarts_with_records),
@@ -2286,7 +2302,7 @@ fn scripted_faults() {
     for (name, phase) in phases {
         phase(&mut fleet, &topology, &mut evicted)
             .unwrap_or_else(|failure| panic!("{name}: {failure:?}"));
-        let snapshot = settle(&mut fleet, &topology, &evicted, SETTLE)
+        let snapshot = settle(&mut fleet, &topology, Some(&evicted), SETTLE)
             .unwrap_or_else(|failure| panic!("{name}, stop point: {failure:?}"));
         let changes = snapshot.changes(&baseline);
         assert!(
@@ -2296,4 +2312,294 @@ fn scripted_faults() {
     }
     fleet.finish().unwrap();
     usage.report(&mut fleet, "scripted faults");
+}
+
+/// xorshift64*: the chaos layer's schedule from a seed, without a dependency.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+
+    fn millis(&mut self, from: u64, to: u64) -> Duration {
+        Duration::from_millis(from + self.below(to - from + 1))
+    }
+
+    fn pick<'a, T>(&mut self, from: &'a [T]) -> Option<&'a T> {
+        (!from.is_empty()).then(|| &from[self.below(from.len() as u64) as usize])
+    }
+}
+
+/// What the chaos layer undoes later: a fault's other half.
+enum Due {
+    Restart(String),
+    Cont(String),
+    /// Kill the duplicate of `owner` and register the owner's binder again (X3b).
+    EndDuplicate {
+        duplicate: String,
+        owner: String,
+    },
+}
+
+/// The chaos layer's state between stop points.
+struct Chaos<'a> {
+    fleet: &'a mut Fleet,
+    topology: &'a Topology,
+    rng: Rng,
+    due: Vec<(Instant, Due)>,
+    /// Nodes down, stopped or duplicated: no other fault touches them until undone.
+    busy: Vec<String>,
+    /// Nodes started again whose `READY` is not read yet.
+    starting: Vec<String>,
+    /// The registry's host started again since the last `rebind`.
+    rebind: bool,
+}
+
+/// The nodes a producer fault may hit, and those whose `--pub` a duplicate takes.
+const PRODUCERS: [&str; 7] = [
+    "p-readings",
+    "p-control",
+    "p-frames",
+    "p-fused",
+    "p-named",
+    "p-status",
+    "registry",
+];
+const DUPLICABLE: [&str; 3] = ["p-readings", "p-control", "p-frames"];
+
+impl Chaos<'_> {
+    fn free(&self, nodes: &[String]) -> Vec<String> {
+        nodes
+            .iter()
+            .filter(|node| !self.busy.contains(node))
+            .cloned()
+            .collect()
+    }
+
+    fn later(&mut self, after: Duration, due: Due) {
+        self.due.push((Instant::now() + after, due));
+    }
+
+    /// One fault, drawn from the seed.
+    fn inject(&mut self) -> Result<(), Failure> {
+        let producers: Vec<String> = PRODUCERS.iter().map(|node| node.to_string()).collect();
+        let subscribers: Vec<String> = self
+            .topology
+            .nodes
+            .iter()
+            .map(|(node, _)| node.clone())
+            .filter(|node| !PRODUCERS.contains(&node.as_str()))
+            .collect();
+        match self.rng.below(4) {
+            0 => {
+                let Some(node) = self.rng.pick(&self.free(&producers)).cloned() else {
+                    return Ok(());
+                };
+                self.kill(&node)?;
+            }
+            1 => {
+                for _ in 0..=self.rng.below(3) {
+                    if let Some(node) = self.rng.pick(&self.free(&subscribers)).cloned() {
+                        self.kill(&node)?;
+                    }
+                }
+            }
+            2 => {
+                let all: Vec<String> = producers.iter().chain(&subscribers).cloned().collect();
+                let Some(node) = self.rng.pick(&self.free(&all)).cloned() else {
+                    return Ok(());
+                };
+                self.fleet.log(&format!("{} chaos: stop {node}", now_ns()));
+                self.fleet.stop(&node);
+                self.busy.push(node.clone());
+                let after = self.rng.millis(200, 3000);
+                self.later(after, Due::Cont(node));
+            }
+            _ => {
+                let owners: Vec<String> = DUPLICABLE.iter().map(|node| node.to_string()).collect();
+                let Some(owner) = self.rng.pick(&self.free(&owners)).cloned() else {
+                    return Ok(());
+                };
+                let duplicate = format!("dup-{owner}");
+                self.fleet
+                    .log(&format!("{} chaos: duplicate {owner}", now_ns()));
+                let spec = self.topology.args(&owner)[1].clone();
+                self.fleet.launch(&duplicate, &["--pub", &spec]);
+                self.busy.extend([owner.clone(), duplicate.clone()]);
+                let after = self.rng.millis(500, 3000);
+                self.later(after, Due::EndDuplicate { duplicate, owner });
+            }
+        }
+        Ok(())
+    }
+
+    fn kill(&mut self, node: &str) -> Result<(), Failure> {
+        self.fleet.log(&format!("{} chaos: kill {node}", now_ns()));
+        self.fleet.kill(node, Signal::KILL);
+        self.fleet.ended_node(node)?;
+        self.starting.retain(|n| n != node);
+        self.busy.push(node.into());
+        let after = self.rng.millis(200, 2000);
+        self.later(after, Due::Restart(node.into()));
+        Ok(())
+    }
+
+    fn undo(&mut self, due: Due) -> Result<(), Failure> {
+        match due {
+            Due::Restart(node) => {
+                let args = self.topology.args(&node);
+                self.fleet.launch(&node, &args_of(&args));
+                self.rebind |= node == "registry";
+                self.starting.push(node.clone());
+                self.busy.retain(|n| *n != node);
+            }
+            Due::Cont(node) => {
+                self.fleet.cont(&node);
+                self.busy.retain(|n| *n != node);
+            }
+            Due::EndDuplicate { duplicate, owner } => {
+                self.fleet.kill(&duplicate, Signal::KILL);
+                self.fleet.ended_node(&duplicate)?;
+                let topic = self.topology.topic_of(&owner);
+                self.fleet.command(&owner, &format!("readvertise {topic}"));
+                self.busy.retain(|n| *n != owner && *n != duplicate);
+            }
+        }
+        Ok(())
+    }
+
+    /// Faults until `until`, each undone when its time comes.
+    fn run(&mut self, until: Instant) -> Result<(), Failure> {
+        let mut next_fault = Instant::now();
+        while Instant::now() < until {
+            self.due.sort_by_key(|(at, _)| *at);
+            while self
+                .due
+                .first()
+                .is_some_and(|(at, _)| *at <= Instant::now())
+            {
+                let (_, due) = self.due.remove(0);
+                self.undo(due)?;
+            }
+            if Instant::now() >= next_fault {
+                self.inject()?;
+                next_fault = Instant::now() + self.rng.millis(300, 1500);
+            }
+            let next_due = self.due.first().map_or(next_fault, |(at, _)| *at);
+            let wake = next_due.min(next_fault).min(until);
+            self.fleet
+                .watch("chaos", wake.saturating_duration_since(Instant::now()))?;
+        }
+        Ok(())
+    }
+
+    /// Undo every fault, start again every node a T3 publisher evicted since `since`, and
+    /// `rebind` T6 if its registry's host started again.
+    fn quiesce(&mut self, since: u64) -> Result<(), Failure> {
+        self.due.sort_by_key(|(at, _)| *at);
+        for (_, due) in std::mem::take(&mut self.due) {
+            self.undo(due)?;
+        }
+        for node in std::mem::take(&mut self.starting) {
+            self.fleet.ready(&node, bound(CONNECT * 3))?;
+        }
+        let evicted: Vec<String> = self
+            .fleet
+            .endings
+            .iter()
+            .filter(|e| e.at_ns >= since && e.reason == "Evicted")
+            .map(|e| e.node.clone())
+            .collect();
+        for node in evicted {
+            if self.fleet.nodes[&node].status.is_none() {
+                self.fleet.kill(&node, Signal::KILL);
+                self.fleet.ended_node(&node)?;
+            }
+            self.fleet
+                .spawn(&node, &args_of(&self.topology.args(&node)));
+        }
+        if std::mem::take(&mut self.rebind) {
+            rebind_named(self.fleet, self.topology)?;
+        }
+        Ok(())
+    }
+}
+
+/// Plan 15 fleet test F5, the chaos layer (§6.5): faults drawn from a seed, overlapping, for
+/// `FLEET_SECS` (default 60), with a stop point every 20 s once every fault is undone. Only a
+/// check of meaning fails it (a violation, a fault, an unexpected end, a stop point that does not
+/// hold within 30 s); the time bounds of §5.4 are not judged, as overlapping faults overlap their
+/// load. `FLEET_SEED` replays a schedule; the seed is printed either way.
+#[test]
+#[ignore = "requires a binder device and a permissive service manager"]
+fn chaos_faults() {
+    let seed = std::env::var("FLEET_SEED")
+        .ok()
+        .and_then(|seed| seed.parse().ok())
+        .unwrap_or_else(|| now_ns() | 1);
+    eprintln!("topic fleet: chaos seed {seed} (FLEET_SEED={seed} replays it)");
+    let secs = env_number("FLEET_SECS", 60);
+    let usage = Usage::start();
+    let (mut fleet, topology) = start_fleet("chaos");
+    fleet.log(&format!("chaos seed {seed}"));
+    let fail = |what: &str, failure: Failure| -> ! { panic!("seed {seed}, {what}: {failure:?}") };
+    fleet
+        .watch("warm-up", Duration::from_secs(3))
+        .unwrap_or_else(|f| fail("warm-up", f));
+    let mut first: BTreeMap<(String, u32), (usize, usize, usize)> = BTreeMap::new();
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let mut chaos = Chaos {
+        fleet: &mut fleet,
+        topology: &topology,
+        rng: Rng(seed),
+        due: Vec::new(),
+        busy: Vec::new(),
+        starting: Vec::new(),
+        rebind: false,
+    };
+    let mut round = 0;
+    loop {
+        round += 1;
+        let since = now_ns();
+        let until = (Instant::now() + Duration::from_secs(20)).min(deadline);
+        chaos
+            .run(until)
+            .unwrap_or_else(|f| fail(&format!("round {round}"), f));
+        chaos
+            .quiesce(since)
+            .unwrap_or_else(|f| fail(&format!("round {round}, undoing"), f));
+        let snapshot = settle(chaos.fleet, &topology, None, Duration::from_secs(30))
+            .unwrap_or_else(|f| fail(&format!("round {round}, stop point"), f));
+        let mut changed = Vec::new();
+        for (key, counts) in snapshot.processes {
+            match first.get(&key) {
+                Some(then) if *then != counts => {
+                    changed.push(format!("{key:?}: {then:?} -> {counts:?}"))
+                }
+                Some(_) => {}
+                None => {
+                    first.insert(key, counts);
+                }
+            }
+        }
+        assert!(
+            changed.is_empty(),
+            "seed {seed}, round {round}: processes changed: {changed:#?}"
+        );
+        if Instant::now() >= deadline {
+            break;
+        }
+    }
+    fleet.finish().unwrap_or_else(|f| fail("finish", f));
+    usage.report(&mut fleet, &format!("chaos, seed {seed}, {round} rounds"));
 }
