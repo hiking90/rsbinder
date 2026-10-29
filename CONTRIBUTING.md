@@ -42,6 +42,33 @@ adb shell 'chmod 755 /data/local/tmp/<binary> && cd /data/local/tmp && TMPDIR=/d
 macOS supports the RPC stack (mem / unix / TLS); kernel binder is
 Linux/Android-only.
 
+### Topic fleet test
+
+`tests/tests/topic_fleet.rs` runs `rsbinder-topic` the way a deployment
+does: 27 processes (`tests/src/bin/topic_node/`) over six topics, killed,
+stopped and started again while every receive is checked. The `kernel`
+tier runs it; by hand, with a binder device and a permissive `rsb_hub`
+(`--config tests/policy/permissive.toml`):
+
+```
+cargo test -p tests --test topic_fleet -- --ignored --test-threads=1 --skip hub_restarts
+cargo test -p tests --test topic_fleet -- --ignored --exact hub_restarts   # no rsb_hub running
+```
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `FLEET_SCALE` | 1 | subscriber nodes ×20; 3 is 67 processes |
+| `FLEET_SECS` | 60 | length of the chaos layer |
+| `FLEET_SEED` | from the clock | replays a chaos schedule (the log prints the seed) |
+| `FLEET_REPEAT` | 30 | rounds of the repeat phase |
+| `FLEET_STEADY_SECS` | 30 | length of the steady-state run |
+| `FLEET_TIME_FACTOR` | 1 | multiplies the time bounds on a loaded machine |
+| `FLEET_KEEP` | unset | `1` keeps the run directory of a passing test |
+
+A failing test keeps its run directory (`target/tmp/topic-fleet/`): the
+event log and each node's stderr. A debug build's nodes take about three
+cores; on a smaller machine run it with `--release`.
+
 ## Pull request checklist
 
 - `scripts/local_gate.sh` passes: at least `hermetic`, plus `kernel` for

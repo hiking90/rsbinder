@@ -49,6 +49,11 @@ on:
         required: false
         default: true
         type: boolean
+      fleet_secs:
+        description: 'Seconds of the topic fleet chaos layer (FLEET_SECS)'
+        required: false
+        default: '60'
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -376,6 +381,22 @@ jobs:
             exit 1
           }
 
+      - name: Run the topic fleet (scripted faults, steady state, chaos; #[ignore]'d)
+        env:
+          FLEET_SECS: ${{ github.event.inputs.fleet_secs || '60' }}
+        run: |
+          # Plan 15 fleet test: 27 processes over six topics under the scripted
+          # faults X1-X14 (X10 below), a repeat phase, and a chaos layer whose
+          # seed the log prints (FLEET_SEED replays it). Release: a debug build's
+          # nodes take about three cores, which this runner does not have to spare.
+          RUST_BACKTRACE=1 cargo test --release -p tests --test topic_fleet -- --ignored --test-threads=1 --skip hub_restarts || {
+            echo "::error::topic fleet failed"
+            mkdir -p artifacts
+            cp -rf target/tmp/topic-fleet artifacts/ 2>/dev/null || true
+            cp -f rsb_hub.log artifacts/topic-fleet-rsb_hub.log 2>/dev/null || true
+            exit 1
+          }
+
       - name: Restart test_service for test_death_recipient
         run: |
           # Each #[ignore]'d destructive test consumes a live
@@ -522,6 +543,16 @@ jobs:
         # Starts and kills its own rsb_hub and refuses to while another
         # runs, so it follows "Stop background services".
         run: RUST_BACKTRACE=1 cargo test -p tests --features rpc --test reconnect_hub_restart -- --ignored
+
+      - name: Run the topic fleet across an rsb_hub restart (X10, #[ignore]'d)
+        # Starts and kills its own rsb_hub (target/debug/rsb_hub), as above.
+        run: |
+          RUST_BACKTRACE=1 cargo test --release -p tests --test topic_fleet -- --ignored --exact hub_restarts || {
+            echo "::error::topic fleet hub restart failed"
+            mkdir -p artifacts
+            cp -rf target/tmp/topic-fleet artifacts/ 2>/dev/null || true
+            exit 1
+          }
 
       - name: Run the vsock loopback tests (#[ignore]'d)
         run: |
