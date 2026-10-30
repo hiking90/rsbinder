@@ -1084,6 +1084,12 @@ impl Interrupter {
     /// or the socket is found shut down, which the wait reads as an end of file, and the wait may
     /// still be polling; or once the wait is out, or a `prepare_wait` returned `false` for the
     /// interrupt. With none, it sends nothing: the next wait sees the interrupt as it starts.
+    ///
+    /// The call blocks until the waiting thread has run: with [`Wake::Futex`] it wakes the wait,
+    /// yields, and wakes again a sleep apart (50 µs, doubling up to 1 ms) for as long as the wait
+    /// stays asleep. A waiter that cannot be scheduled, such as one stopped alone under a
+    /// debugger, keeps it in that loop. Because the loop sleeps, it gives the core up even when
+    /// the caller is a real-time thread and the waiter shares its core at a lower priority.
     pub fn interrupt(&self) {
         match &self.target {
             Target::Subscriber(local) => {
