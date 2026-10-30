@@ -1,7 +1,7 @@
 name: Integration Test
 
 # Combined Linux + Android + macOS RPC integration test suite — manual
-# trigger only.
+# trigger only. A fourth job runs the topic fleet on the arm64 Linux runner.
 #
 # All jobs are cost-sensitive (the Linux binder job builds the workspace
 # and loops cargo test against a live rsb_hub; the Android matrix boots
@@ -10,7 +10,7 @@ name: Integration Test
 # push/pull_request — the maintainer dispatches the workflow when
 # integration coverage is wanted (e.g. before cutting a release, or to
 # validate a fix that touches binder/IPC/RPC paths). A single dispatch
-# runs all three in parallel, which is the "one request runs all tests"
+# runs all four in parallel, which is the "one request runs all tests"
 # entry point.
 #
 # Scope split with `build.yml`:
@@ -36,6 +36,11 @@ on:
         type: string
       run_linux:
         description: 'Run the Linux binder integration test'
+        required: false
+        default: true
+        type: boolean
+      run_linux_arm64:
+        description: 'Run the topic fleet on the arm64 Linux runner'
         required: false
         default: true
         type: boolean
@@ -592,6 +597,82 @@ jobs:
             rsb_hub.log
             test_service.log
             test_service_async.log
+            artifacts/
+          if-no-files-found: ignore
+
+  # --------------------------------------------------------------------------
+  # Topic fleet on arm64 — the shared-memory rings under ARM's weaker memory
+  # ordering, on real cores (the Android matrix is x86_64 AVDs)
+  # --------------------------------------------------------------------------
+  linux-arm64-topic-fleet:
+    name: Linux arm64 Topic Fleet
+    if: github.actor == github.repository_owner && github.event.inputs.run_linux_arm64 != 'false'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Load binder_linux
+        # The arm64 runner's azure kernel ships binder_linux in its default
+        # modules tree; no linux-modules-extra install is needed.
+        run: |
+          uname -a
+          grep -q binder /proc/filesystems || sudo modprobe binder_linux
+          grep -q binder /proc/filesystems || { echo "::error::binderfs unavailable on this runner kernel"; exit 1; }
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        # X10 starts target/debug/rsb_hub; the fleet itself runs in release.
+        run: |
+          cargo build -p rsbinder-tools --bin rsb_device --bin rsb_hub
+          cargo test --release -p tests --test topic_fleet --no-run
+
+      - name: Setup binderfs and create binder device
+        run: sudo target/debug/rsb_device binder --group "$(id -gn)" --mode 0660
+
+      - name: Start rsb_hub
+        run: |
+          RUST_LOG=info nohup target/debug/rsb_hub --config tests/policy/permissive.toml \
+            > rsb_hub.log 2>&1 &
+          echo $! > rsb_hub.pid
+          sleep 1
+          kill -0 "$(cat rsb_hub.pid)" || { echo "::error::rsb_hub failed to start"; cat rsb_hub.log; exit 1; }
+
+      - name: Run the topic fleet (#[ignore]'d)
+        env:
+          FLEET_SECS: ${{ github.event.inputs.fleet_secs || '60' }}
+        run: |
+          RUST_BACKTRACE=1 cargo test --release -p tests --test topic_fleet -- --ignored --test-threads=1 --skip hub_restarts --nocapture || {
+            echo "::error::topic fleet failed"
+            mkdir -p artifacts
+            cp -rf target/tmp/topic-fleet artifacts/ 2>/dev/null || true
+            exit 1
+          }
+
+      - name: Stop rsb_hub
+        if: always()
+        run: kill "$(cat rsb_hub.pid)" 2>/dev/null || true
+
+      - name: Run the topic fleet across an rsb_hub restart (X10, #[ignore]'d)
+        run: |
+          RUST_BACKTRACE=1 cargo test --release -p tests --test topic_fleet -- --ignored --exact hub_restarts || {
+            echo "::error::topic fleet hub restart failed"
+            mkdir -p artifacts
+            cp -rf target/tmp/topic-fleet artifacts/ 2>/dev/null || true
+            exit 1
+          }
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-arm64-topic-fleet-${{ github.run_attempt }}
+          path: |
+            rsb_hub.log
             artifacts/
           if-no-files-found: ignore
 
