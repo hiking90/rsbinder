@@ -56,10 +56,11 @@
 //! bit 12    (0x1000): FLAT_BINDER_FLAG_TXN_SECURITY_CTX
 //! ```
 //!
-//! An out-of-range `min_priority` is masked to the low byte and
-//! `min_sched_policy` to two bits, so neither bleeds into the adjacent
-//! scheduler-policy or `INHERIT_RT` field and changes the scheduler class of
-//! every transaction.
+//! The `Binder` constructors refuse a policy or priority AOSP refuses
+//! (`BinderFeatures::check_scheduler`). The encoder still masks
+//! `min_priority` to the low byte and `min_sched_policy` to two bits, so
+//! neither can bleed into the adjacent scheduler-policy or `INHERIT_RT`
+//! field and change the scheduler class of every transaction.
 //!
 //! # Runtime stability
 //!
@@ -149,9 +150,11 @@ pub struct BinderFeatures {
     pub set_requesting_sid: bool,
 
     /// Advertise a minimum scheduler policy on the
-    /// binder node. Must be one of `SCHED_NORMAL`/`SCHED_BATCH` (low /
-    /// best-effort) or `SCHED_FIFO`/`SCHED_RR` (real-time); kernel
-    /// `binder.c::binder_priority_to_native` clamps anything else.
+    /// binder node: `SCHED_NORMAL` (0), `SCHED_FIFO` (1) or `SCHED_RR` (2),
+    /// the policies AOSP `BBinder::setMinSchedulerPolicy` accepts. The
+    /// `Binder` constructors panic on any other value, as AOSP aborts:
+    /// the field has two bits on the wire, so `SCHED_IDLE` (5) would
+    /// otherwise reach the driver as `SCHED_FIFO`.
     /// Pair with [`Self::min_priority`] — both fields are encoded into
     /// `flat_binder_object.flags` so the driver can lift an incoming
     /// transaction's worker thread to the requested floor before
@@ -163,16 +166,13 @@ pub struct BinderFeatures {
     pub min_sched_policy: Option<i32>,
 
     /// Minimum priority within the policy declared
-    /// by [`Self::min_sched_policy`]. For SCHED_FIFO/SCHED_RR this is
-    /// the kernel RT priority (`1..=99`); for SCHED_NORMAL/BATCH it is
-    /// a nice-bias value. Only the low 8 bits are used (mask
-    /// `FLAT_BINDER_FLAG_PRIORITY_MASK = 0xff`); higher bits are masked
-    /// off at encode time, so a value outside the expected range is
-    /// silently truncated — the kernel will then interpret whatever low
-    /// 8 bits remain, which may not be the priority the caller
-    /// intended. Callers should validate against the policy's allowed
-    /// range before constructing `BinderFeatures` (AOSP
-    /// `BBinder::setMinSchedulerPolicy` aborts on out-of-range input).
+    /// by [`Self::min_sched_policy`] (`SCHED_NORMAL` when that is `None`):
+    /// the nice value `-20..=19` for `SCHED_NORMAL`, the RT priority
+    /// `1..=99` for `SCHED_FIFO`/`SCHED_RR`; `None` stands for `0`. The
+    /// `Binder` constructors panic on a value outside the policy's range,
+    /// as AOSP `BBinder::setMinSchedulerPolicy` aborts. The wire field is
+    /// the low 8 bits (`FLAT_BINDER_FLAG_PRIORITY_MASK = 0xff`), which the
+    /// driver reads as a signed byte.
     pub min_priority: Option<i32>,
 
     /// Set the kernel
@@ -189,6 +189,29 @@ pub struct BinderFeatures {
 }
 
 impl BinderFeatures {
+    /// AOSP `BBinder::setMinSchedulerPolicy`'s checks (`Binder.cpp`); a failure is a caller bug.
+    fn check_scheduler(self) {
+        if self.min_sched_policy.is_none() && self.min_priority.is_none() {
+            return;
+        }
+        let policy = self.min_sched_policy.unwrap_or(0);
+        let priority = self.min_priority.unwrap_or(0);
+        match policy {
+            0 => assert!(
+                (-20..=19).contains(&priority),
+                "BinderFeatures: invalid min_priority {priority} for SCHED_NORMAL (-20..=19)"
+            ),
+            1 | 2 => assert!(
+                (1..=99).contains(&priority),
+                "BinderFeatures: invalid min_priority {priority} for sched policy {policy} (1..=99)"
+            ),
+            _ => panic!(
+                "BinderFeatures: unsupported min_sched_policy {policy} \
+                 (SCHED_NORMAL 0, SCHED_FIFO 1 or SCHED_RR 2)"
+            ),
+        }
+    }
+
     /// Encodes the `flat_binder_object.flags` word; bit layout in module doc "Flat-binder flags".
     pub(crate) fn flat_flags(self) -> u32 {
         self.flat_flags_with(crate::process_state::selinux_available())
@@ -537,11 +560,19 @@ impl<T: 'static + Remotable> Binder<T> {
     /// This is the underlying constructor; the other `new_*` variants
     /// delegate to this with default values for the parameters they
     /// don't take. See [`BinderFeatures`] for the available feature opt-ins.
+    ///
+    /// # Panics
+    ///
+    /// If `features` names a scheduler policy or priority AOSP
+    /// `BBinder::setMinSchedulerPolicy` refuses; see
+    /// [`BinderFeatures::min_sched_policy`] and
+    /// [`BinderFeatures::min_priority`].
     pub fn new_with_stability_and_features(
         remotable: T,
         stability: Stability,
         features: BinderFeatures,
     ) -> Self {
+        features.check_scheduler();
         Binder::<T> {
             inner: Arc::new(Inner {
                 remotable,
@@ -819,6 +850,26 @@ mod feature_flags_tests {
         assert_eq!(flags & FLAT_BINDER_FLAG_PRIORITY_MASK, 0x34);
         // SCHED_POLICY untouched (no policy set, no bleed from the 0x12).
         assert_eq!(flags & FLAT_BINDER_FLAG_SCHED_POLICY_MASK, 0);
+    }
+
+    /// The constructors refuse what AOSP `setMinSchedulerPolicy` aborts on.
+    #[test]
+    fn constructors_refuse_scheduler_values_aosp_refuses() {
+        let with = |policy: Option<i32>, priority: Option<i32>| {
+            let f = BinderFeatures {
+                min_sched_policy: policy,
+                min_priority: priority,
+                ..Default::default()
+            };
+            std::panic::catch_unwind(|| Binder::new_with_features(DummyRemotable, f)).is_ok()
+        };
+        assert!(with(None, None));
+        assert!(with(None, Some(-20)) && with(Some(0), Some(19)));
+        assert!(with(Some(1), Some(1)) && with(Some(2), Some(99)));
+        // SCHED_IDLE would encode as SCHED_FIFO; SCHED_BATCH is outside AOSP's list.
+        assert!(!with(Some(5), None) && !with(Some(3), None));
+        assert!(!with(None, Some(300)) && !with(Some(0), Some(-21)));
+        assert!(!with(Some(1), None) && !with(Some(2), Some(100)));
     }
 
     /// Policy bits above 2 are dropped so they cannot set bit 11 (INHERIT_RT) or higher.
