@@ -391,6 +391,10 @@ tier_kernel() {
         -- --ignored --test-threads=1
     run "rsbinder-topic registry" tpass cargo test -p rsbinder-topic --test registry \
         -- --ignored --test-threads=1
+    # Plan 15 fleet test: scripted faults, steady state, a 60 s chaos layer (FLEET_SECS).
+    # Debug, as the other kernel steps: its nodes take about three cores (CI runs it in release).
+    run "topic fleet" tpass cargo test -p tests --test topic_fleet \
+        -- --ignored --test-threads=1 --skip hub_restarts
     run "reconnect_kernel" tpass cargo test -p tests --features rpc \
         --test reconnect_kernel -- --ignored --test-threads=1
     run "freeze_kernel" tpass cargo test -p tests --features rpc \
@@ -419,6 +423,8 @@ tier_kernel() {
     # Starts and kills its own rsb_hub, so it too runs with the shared one stopped.
     run "reconnect_hub_restart" tpass cargo test -p tests --features rpc \
         --test reconnect_hub_restart -- --ignored
+    run "topic fleet hub restart" tpass cargo test -p tests --test topic_fleet \
+        -- --ignored --exact hub_restarts
 
     if [ -e /dev/vsock ] && grep -q '^vsock_loopback ' /proc/modules 2>/dev/null; then
         run "rpc_vsock (loopback)" tpass cargo test -p rsbinder --features rpc-vsock --test rpc_vsock -- --ignored

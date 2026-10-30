@@ -42,6 +42,50 @@ adb shell 'chmod 755 /data/local/tmp/<binary> && cd /data/local/tmp && TMPDIR=/d
 macOS supports the RPC stack (mem / unix / TLS); kernel binder is
 Linux/Android-only.
 
+### Topic fleet test
+
+`tests/tests/topic_fleet.rs` runs `rsbinder-topic` the way a deployment
+does: 27 processes (`tests/src/bin/topic_node/`) over six topics, killed,
+stopped and started again while every receive is checked. The `kernel`
+tier runs it; by hand, with a binder device and a permissive `rsb_hub`
+(`--config tests/policy/permissive.toml`):
+
+```
+cargo test -p tests --test topic_fleet -- --ignored --test-threads=1 --skip hub_restarts
+cargo test -p tests --test topic_fleet -- --ignored --exact hub_restarts   # no rsb_hub running
+```
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `FLEET_SCALE` | 1 | subscriber nodes ×20; 3 is 67 processes |
+| `FLEET_SECS` | 60 | length of the chaos layer |
+| `FLEET_SEED` | from the clock | replays a chaos schedule (the log prints the seed) |
+| `FLEET_REPEAT` | 30 | rounds of the repeat phase |
+| `FLEET_STEADY_SECS` | 30 | length of the steady-state run |
+| `FLEET_TIME_FACTOR` | 1 | multiplies the time bounds on a loaded machine |
+| `FLEET_KEEP` | unset | `1` keeps the run directory of a passing test |
+
+A failing test keeps its run directory (`target/tmp/topic-fleet/`): the
+event log and each node's stderr. A debug build's nodes take about three
+cores; on a smaller machine run it with `--release`.
+
+On a rootable emulator (userdebug image) the fleet runs against the
+platform service manager, everything but `hub_restarts`:
+
+```
+cargo ndk -t x86_64-linux-android --platform 29 test --release -p tests --test topic_fleet --no-run
+adb root && adb shell mkdir -p /data/local/tmp/fleet
+adb push target/x86_64-linux-android/release/topic_node /data/local/tmp/fleet/
+adb push target/x86_64-linux-android/release/deps/topic_fleet-<hash> /data/local/tmp/fleet/topic_fleet
+adb shell 'cd /data/local/tmp/fleet && TOPIC_NODE_BIN=$PWD/topic_node TOPIC_FLEET_DIR=$PWD/run \
+  ./topic_fleet --ignored --test-threads=1 --skip hub_restarts'
+```
+
+Take `<hash>` from the build's `Executable tests/topic_fleet.rs (...)` line;
+`deps/` keeps older builds of the same test. Android 10 (`i686-linux-android`
+for the API 29 x86 image) has no registration notices in its service
+manager, so there the named subscribers are T6's alone.
+
 ## Pull request checklist
 
 - `scripts/local_gate.sh` passes: at least `hermetic`, plus `kernel` for
