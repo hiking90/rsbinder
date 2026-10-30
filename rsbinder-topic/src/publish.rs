@@ -39,7 +39,10 @@ pub struct PublisherPolicy {
     /// The publisher maps each subscriber's control page and, after every commit, loads a word of
     /// it, so the bound limits both the mappings a subscriber can make this process hold and the
     /// work of a publish. One more is refused with [`ITopic::ERROR_FULL`]; subscriptions that
-    /// ended (the subscriber dropped it, or its process died) are taken out first.
+    /// ended (the subscriber dropped it, or its process died) are taken out first. With 0 every
+    /// subscription is refused so, and a [`NamedSubscriber`](crate::NamedSubscriber) retries
+    /// `ERROR_FULL` for as long as it lives; to refuse callers for good, use
+    /// [`authorize`](Self::authorize), whose refusal it does not retry.
     ///
     /// A publish wakes the subscribers it finds waiting before it lets go of the topic's lock,
     /// so the bound is also the longest a publish holds it and the other publishers wait. The
@@ -57,7 +60,8 @@ pub struct PublisherPolicy {
     pub max_subscribers: usize,
     /// Subscriptions one uid holds at once, refused past it as `max_subscribers` is. Default 64,
     /// which with the default `max_subscribers` limits nothing: lower it so that one uid allowed
-    /// to subscribe cannot take every place.
+    /// to subscribe cannot take every place. With 0 every subscription is refused, as with a
+    /// `max_subscribers` of 0.
     pub max_per_uid: usize,
     /// Who may subscribe. Default `None`: any caller that can reach the topic's binder, which
     /// for a topic registered with the service manager is any caller it lets find the name.
@@ -136,7 +140,8 @@ pub struct PoolPolicy {
     /// slot every subscriber has read past, and a subscriber can fall at least `depth + 1` values
     /// behind before a loan waits for it.
     pub depth: usize,
-    /// Loans held at once and not yet published, past which a loan is refused. Default 1.
+    /// Loans held at once and not yet published, past which a loan is refused. Default 1; 0
+    /// counts as 1.
     pub max_loans: usize,
     /// Ask the kernel for transparent huge pages for the pool (`MADV_HUGEPAGE`). Default
     /// `false`.
@@ -161,6 +166,16 @@ impl Default for PoolPolicy {
 }
 
 impl PoolPolicy {
+    /// `depth` as the pool keeps it: 0 counts as 1. The slot count and the pool read only this.
+    pub(crate) fn kept(&self) -> usize {
+        self.depth.max(1)
+    }
+
+    /// `max_loans` as the pool lends: 0 counts as 1. The slot count and the pool read only this.
+    pub(crate) fn loans(&self) -> usize {
+        self.max_loans.max(1)
+    }
+
     /// Slots and the bytes of each for a topic of `max_subscribers`; `None` past what a pool holds.
     pub(crate) fn shape(&self, max_subscribers: usize) -> Option<(u32, u32)> {
         let grain = layout::SLOT_GRAIN as usize;
@@ -168,8 +183,8 @@ impl PoolPolicy {
         let slots = max_subscribers
             .checked_mul(MAX_PINS as usize)?
             .checked_add(1)?
-            .checked_add(self.depth)?
-            .checked_add(self.max_loans)?;
+            .checked_add(self.kept())?
+            .checked_add(self.loans())?;
         let (slots, slot_bytes) = (u32::try_from(slots).ok()?, u32::try_from(slot_bytes).ok()?);
         layout::pool_size(slots, slot_bytes)?;
         Some((slots, slot_bytes))
@@ -469,8 +484,8 @@ impl<T: Payload> TypedWriter<T, Stored<Mapping>> {
         let lossless = policy.backpressure.is_some();
         writer.lock().lending = Some(Lending {
             memory,
-            slots: Slots::new(slots, pool.depth, pool.max_loans, lossless),
-            max_loans: pool.max_loans,
+            slots: Slots::new(slots, pool.kept(), pool.loans(), lossless),
+            max_loans: pool.loans(),
         });
         let pool_fd = PoolFd {
             fd: pool_fd,

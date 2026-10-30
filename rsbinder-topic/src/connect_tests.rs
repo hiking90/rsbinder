@@ -444,6 +444,30 @@ fn a_publisher_with_a_pool_hands_it_to_each_subscriber() {
     assert!(subscriber.pool().is_none());
 }
 
+/// A `depth` or `max_loans` of 0 counts as 1 in the slot count, as the pool keeps and lends.
+#[test]
+fn a_zero_depth_or_loan_count_is_counted_as_the_pool_uses_it() {
+    let zero = PoolPolicy {
+        slot_bytes: 64,
+        depth: 0,
+        max_loans: 0,
+        huge_pages: false,
+    };
+    assert_eq!(zero.shape(2), Some((2 + 1 + 1 + 1, 64)));
+    let policy = PublisherPolicy {
+        max_subscribers: 2,
+        pool: Some(zero),
+        ..policy()
+    };
+    let publisher = Publisher::<Bytes>::new(&policy).unwrap();
+    let loan = publisher.loan_slice(8).expect("a loan with max_loans 0");
+    assert_eq!(
+        publisher.loan_slice(8).err(),
+        Some(PublishError::TooManyLoans { max: 1 })
+    );
+    drop(loan);
+}
+
 #[test]
 fn a_pool_past_4_gib_is_refused_before_anything_is_made() {
     let pool = |slot_bytes| PoolPolicy {
