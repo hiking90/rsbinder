@@ -355,7 +355,7 @@ impl Server {
     /// Pool before names: a registered name always has a looper, even when a later one fails.
     fn start_kernel(self) -> Result<()> {
         self.apply_kernel_options()?;
-        ProcessState::start_thread_pool();
+        ProcessState::try_start_thread_pool()?;
         for (name, binder) in self.pending {
             crate::hub::add_service(&name, binder).map_err(|e| {
                 log::error!("rsbinder::serve: registering {name:?} failed: {e:?}");

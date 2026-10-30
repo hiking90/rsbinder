@@ -1611,7 +1611,8 @@ fn execute_command(cmd: i32) -> Result<()> {
             }
             binder::BR_NOOP => {}
             binder::BR_SPAWN_LOOPER => {
-                ProcessState::as_self().spawn_pooled_thread(false);
+                // Logged there; the kernel never asks again (`requested_threads`), as in AOSP.
+                let _ = ProcessState::as_self().spawn_pooled_thread(false);
             }
             binder::BR_FINISHED => {
                 return Err(StatusCode::TimedOut);

@@ -289,7 +289,7 @@ fn kernel_open(uri: Uri, o: ClientOptions) -> Result<Client> {
             let driver = one_source("driver", o.driver.as_deref(), k.driver())?;
             let mmap_size = one_source("mmap_size", o.mmap_size, k.mmap_size())?;
             super::server::kernel_init(driver, k.threads(), mmap_size)?;
-            crate::ProcessState::start_thread_pool();
+            crate::ProcessState::try_start_thread_pool()?;
             Ok(Client {
                 endpoint: uri.endpoint,
                 inner: Inner::Kernel,
