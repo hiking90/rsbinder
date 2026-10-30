@@ -317,6 +317,20 @@ Each item below changes what a 0.12.0 program observes.
   `binder://` `Client` and starting a kernel `Server` now return the
   failure as an `Err` (`try_start_thread_pool`, see Added) instead of
   succeeding with no pool.
+- **`MessageQueue::write`, `read`, `begin_write` and `begin_read` refuse
+  more elements than the capacity with `BadValue`**, as the blocking calls
+  and the unsync flavor already did; `begin_write_cached` refuses more than
+  its `limit` (capped at the capacity) the same way. 0.12.0 returned
+  `Ok(false)` / `Ok(None)`, the answer for "not now", and a loop that
+  polled until the transfer fit never ended. libfmq returns `false` there;
+  only the Rust signalling changes.
+- **`shm::Mapping::map` refuses, with `BadValue`, a range that reaches past
+  the end of a regular file** (a memfd is one). 0.12.0 mapped it, and the
+  first access past the end raised `SIGBUS`; the refusal reaches whatever
+  maps through it: `MessageQueue::attach`, `MappedHeap::from_fd` and so
+  `SharedMemory::from_fd`, `Parcel::read_blob` and a received `IMemory`.
+  An fd that is not a regular file (ashmem, a device) is not measured, and
+  a failed `fstat` leaves the fd to `mmap` as before.
 
 ### Added
 
