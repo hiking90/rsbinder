@@ -322,7 +322,7 @@ impl Drop for DeathSignal {
 /// Watch `binder` and complete when it dies.
 ///
 /// ```ignore
-/// let svc = rsbinder::get_interface_async::<dyn IFoo<Tokio>>("foo").await?;
+/// let svc = rsbinder::get_interface_async::<dyn IFooAsync<Tokio>>("foo").await?;
 /// let died = rsbinder::death_signal(&svc.as_binder())?;
 /// tokio::select! {
 ///     r = svc.work() => r?,

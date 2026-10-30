@@ -586,7 +586,7 @@ impl RpcServer {
     /// can rely on directory modes for access control; an abstract
     /// server cannot. When exposure matters, install a
     /// [`set_authorizer`](Self::set_authorizer) hook and check the
-    /// peer identity (uid/gid/pid) it receives.
+    /// peer identity (`PeerIdentity::Local`'s uid and pid) it receives.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn setup_unix_server_abstract(name: &[u8]) -> Result<Arc<RpcServer>> {
         let addr = UnixSocketAddr::from_abstract_name(name)?;

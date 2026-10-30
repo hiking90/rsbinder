@@ -128,7 +128,7 @@ macro_rules! __declare_binder_interface {
                         ::core::option::Option::None => {
                             match $crate::Binder::<$native>::try_from(ibinder) {
                                 ::core::result::Result::Ok(native) => {
-                                    // Sync-only native: BadType like AOSP, not `as_async()` panic.
+                                    // Sync-only native: BadType (AOSP proxies the local binder instead).
                                     if native.0.try_as_async().is_some() {
                                         ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new(native)))
                                     } else {

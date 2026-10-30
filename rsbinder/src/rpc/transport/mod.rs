@@ -623,13 +623,19 @@ pub enum PeerIdentity {
     Certificate(CertId),
     /// No identity is available. **ACL is not possible** against an
     /// anonymous peer; this must be surfaced in logs and never treated
-    /// as trusted. Used by the debug-only plaintext TCP backend.
+    /// as trusted. The debug-only plaintext TCP backend always reports it,
+    /// and so does a TLS server whose rustls config asks no client
+    /// certificate (`with_no_client_auth()`).
     Anonymous,
 }
 
-/// Identity extracted from a peer's TLS leaf certificate. Carries the
-/// subject and a SHA-256 fingerprint; ACL is the caller's
-/// responsibility on top of this.
+/// Identity of a peer's TLS leaf certificate: its SHA-256 fingerprint and a
+/// label; ACL is the caller's responsibility on top of this.
+///
+/// Authorize by [`fingerprint`](Self::fingerprint). The label does not come
+/// from the certificate (see [`subject`](Self::subject)), and `PartialEq`
+/// compares it too, so two values for the same certificate seen from
+/// different sides compare unequal.
 #[derive(Clone, PartialEq, Eq)]
 pub struct CertId {
     subject: String,
@@ -644,7 +650,11 @@ impl CertId {
             fingerprint,
         }
     }
-    /// The certificate subject (DN / SAN summary).
+    /// A label for logs, not read from the certificate: on the client side
+    /// the `server_name` the connection verified the certificate against,
+    /// on the server side `"<mtls-client>"` for every client certificate.
+    /// It is not a basis for authorization; use
+    /// [`fingerprint`](Self::fingerprint).
     pub fn subject(&self) -> &str {
         &self.subject
     }
