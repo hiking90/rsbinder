@@ -2527,6 +2527,8 @@ struct Chaos<'a> {
     starting: Vec<String>,
     /// The registry's host started again since the last `rebind`.
     rebind: bool,
+    /// `fleet.endings` before this index have been looked at for an eviction.
+    endings_seen: usize,
 }
 
 /// The nodes a producer fault may hit, and those whose `--pub` a duplicate takes.
@@ -2667,9 +2669,9 @@ impl Chaos<'_> {
         Ok(())
     }
 
-    /// Undo every fault, start again every node a T3 publisher evicted since `since`, and
-    /// `rebind` T6 if its registry's host started again.
-    fn quiesce(&mut self, since: u64) -> Result<(), Failure> {
+    /// Undo every fault, start again every node a T3 publisher evicted, and `rebind` T6 if its
+    /// registry's host started again.
+    fn quiesce(&mut self) -> Result<(), Failure> {
         self.due.sort_by_key(|(at, _)| *at);
         for (_, due) in std::mem::take(&mut self.due) {
             self.undo(due)?;
@@ -2677,13 +2679,22 @@ impl Chaos<'_> {
         for node in std::mem::take(&mut self.starting) {
             self.fleet.ready(&node, bound(CONNECT * 3))?;
         }
-        let evicted: Vec<String> = self
-            .fleet
-            .endings
+        self.restart_evicted()?;
+        if std::mem::take(&mut self.rebind) {
+            rebind_named(self.fleet, self.topology)?;
+        }
+        Ok(())
+    }
+
+    /// Start again each node with an eviction not yet looked at. A stopped subscriber reports
+    /// its eviction only once `SIGCONT` lets it run, which can be after `quiesce` looked.
+    fn restart_evicted(&mut self) -> Result<(), Failure> {
+        let evicted: Vec<String> = self.fleet.endings[self.endings_seen..]
             .iter()
-            .filter(|e| e.at_ns >= since && e.reason == "Evicted")
+            .filter(|e| e.reason == "Evicted")
             .map(|e| e.node.clone())
             .collect();
+        self.endings_seen = self.fleet.endings.len();
         for node in evicted {
             if self.fleet.nodes[&node].status.is_none() {
                 self.fleet.kill(&node, Signal::KILL);
@@ -2692,10 +2703,21 @@ impl Chaos<'_> {
             self.fleet
                 .spawn(&node, &args_of(&self.topology.args(&node)));
         }
-        if std::mem::take(&mut self.rebind) {
-            rebind_named(self.fleet, self.topology)?;
-        }
         Ok(())
+    }
+
+    /// [`settle`] that starts again a node whose eviction arrives while the stop point is asked:
+    /// an evicted subscription is in no publisher's list, so the stop point holds only after.
+    fn settle(&mut self, within: Duration) -> Result<Snapshot, Failure> {
+        let deadline = Instant::now() + within;
+        loop {
+            self.restart_evicted()?;
+            match stop_point(self.fleet, self.topology, None) {
+                Ok(snapshot) => return Ok(snapshot),
+                Err(failure) if Instant::now() >= deadline => return Err(failure),
+                Err(_) => self.fleet.watch("settling", Duration::from_millis(500))?,
+            }
+        }
     }
 }
 
@@ -2730,19 +2752,20 @@ fn chaos_faults() {
         busy: Vec::new(),
         starting: Vec::new(),
         rebind: false,
+        endings_seen: 0,
     };
     let mut round = 0;
     loop {
         round += 1;
-        let since = now_ns();
         let until = (Instant::now() + Duration::from_secs(20)).min(deadline);
         chaos
             .run(until)
             .unwrap_or_else(|f| fail(&format!("round {round}"), f));
         chaos
-            .quiesce(since)
+            .quiesce()
             .unwrap_or_else(|f| fail(&format!("round {round}, undoing"), f));
-        let snapshot = settle(chaos.fleet, &topology, None, Duration::from_secs(30))
+        let snapshot = chaos
+            .settle(Duration::from_secs(30))
             .unwrap_or_else(|f| fail(&format!("round {round}, stop point"), f));
         let mut changed = Vec::new();
         for (key, counts) in snapshot.processes {
