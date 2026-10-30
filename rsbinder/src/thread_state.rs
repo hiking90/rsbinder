@@ -2635,32 +2635,37 @@ pub fn get_calling_uid() -> binder::uid_t {
 ///
 /// # Behavior outside a transaction
 ///
-/// Returns `0` and is a no-op when not currently dispatching a binder
-/// transaction (no kernel-delivered identity exists to clear). This
-/// differs from AOSP, which stores calling identity in flat
-/// `IPCThreadState` fields that persist between transactions — but the
-/// AOSP user-facing semantics (clear before downstream call, restore
-/// after) match.
+/// Changes nothing and returns the token of this process's own uid and
+/// pid, which is what AOSP returns there: its flat `IPCThreadState`
+/// fields hold the process's own identity between transactions. Restoring
+/// that token inside a kernel transaction makes this process the caller,
+/// as a clear does; no token this function returns names a uid other than
+/// the caller's or this process's.
 ///
 /// # Behavior during an RPC transaction
 ///
 /// **Also a no-op, and the RPC peer stays visible.** While an RPC
-/// calling context is installed this function returns `0` and changes
-/// nothing; any kernel transaction below it on the stack belongs to an
-/// outer frame. [`get_calling_uid`] / [`get_calling_pid`] keep answering
-/// for the peer, so the AOSP idiom `let t = clear_calling_identity(); …;
-/// restore_calling_identity(t);` drops nothing over RPC. The 64-bit
-/// token cannot carry a `PeerIdentity` back. Authorize an RPC caller
-/// through [`calling_caller`] or `RpcServer::set_authorizer` instead.
+/// calling context is installed this function returns the same token of
+/// this process's own identity and changes nothing; any kernel transaction
+/// below it on the stack belongs to an outer frame. [`get_calling_uid`] /
+/// [`get_calling_pid`] keep answering for the peer, so the AOSP idiom
+/// `let t = clear_calling_identity(); …; restore_calling_identity(t);`
+/// drops nothing over RPC. The 64-bit token cannot carry a `PeerIdentity`
+/// back. Authorize an RPC caller through [`calling_caller`] or
+/// `RpcServer::set_authorizer` instead.
 pub fn clear_calling_identity() -> i64 {
+    let own = || {
+        let pid = rustix::process::getpid().as_raw_nonzero().get() as binder::pid_t;
+        pack_calling_identity(false, rustix::process::getuid().as_raw(), pid)
+    };
     // An RPC dispatch is innermost: the kernel transaction under it is an outer frame's.
     if rpc_calling().is_some() || !ProcessState::is_initialized() {
-        return 0;
+        return own();
     }
     THREAD_STATE.with(|thread_state| {
         let mut thread_state = thread_state.borrow_mut();
         let Some(ref mut tr) = thread_state.transaction else {
-            return 0;
+            return own();
         };
         let token = pack_calling_identity(tr.has_explicit_identity, tr.calling_uid, tr.calling_pid);
         // AOSP `clearCaller()`: own uid/pid, SID dropped ("expensive to lookup").
@@ -2685,7 +2690,7 @@ pub fn clear_calling_identity() -> i64 {
 /// # When this is a no-op
 ///
 /// Under the same two conditions in which [`clear_calling_identity`]
-/// returns `0` — outside a kernel transaction, and during an RPC
+/// changes nothing — outside a kernel transaction, and during an RPC
 /// dispatch. The token is discarded.
 ///
 /// # Token mismatch
@@ -2697,7 +2702,7 @@ pub fn clear_calling_identity() -> i64 {
 /// (caller wraps `clear`/`restore` in a `Drop` impl) is recommended; see
 /// AOSP `IPCThreadState::CallingIdentityScope` for the C++ analogue.
 pub fn restore_calling_identity(token: i64) {
-    // Same gate as `clear_calling_identity`: an RPC handler's token is `0`.
+    // Same gate as `clear_calling_identity`: under RPC the token names this process.
     if rpc_calling().is_some() || !ProcessState::is_initialized() {
         return;
     }
@@ -3640,10 +3645,19 @@ mod tests {
         assert_eq!(get_calling_pid(), own_pid());
         assert!(get_calling_sid().is_none());
         assert!(!has_explicit_identity());
-        // clear/restore are no-ops outside a transaction.
-        assert_eq!(clear_calling_identity(), 0);
+        // clear/restore are no-ops outside a transaction; the token names this process (AOSP).
+        let token = clear_calling_identity();
+        assert_eq!(unpack_calling_uid(token), own_uid());
+        assert_eq!(unpack_calling_pid(token), own_pid());
+        assert!(!unpack_has_explicit_identity(token));
         restore_calling_identity(0xDEAD_BEEF_DEAD_BEEFu64 as i64); // must not panic
         assert_eq!(get_calling_uid(), own_uid());
+
+        // Restored inside a transaction, it makes this process the caller, never uid 0.
+        let _guard = FakeTransactionGuard::install(1000, 9999, None);
+        restore_calling_identity(token);
+        assert_eq!(get_calling_uid(), own_uid());
+        assert_eq!(get_calling_pid(), own_pid());
     }
 
     /// Getters return the kernel-delivered values; the SID is a `CString` copy of secctx.
