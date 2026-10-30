@@ -287,8 +287,9 @@ fn unwatched_session_link() {
     log::error!(
         "link_to_death over RPC refused: nothing reads this session's connections, so its \
          loss would go unnoticed. Open incoming connections \
-         (RpcClientConfig::incoming_connections / ClientOptions::incoming_connections) \
-         or start a serve loop with RpcSession::spawn_serve first."
+         (RpcClientConfig::incoming_connections / ClientOptions::incoming_connections), \
+         or start a serve loop with RpcSession::spawn_serve first if this session makes no \
+         further calls of its own: the loop holds the only connection."
     );
 }
 
