@@ -25,7 +25,10 @@ struct Inner {
 /// The handle is a clone-able, `Send + Sync` reference to the mapping; it
 /// keeps the word mapped after the [`MessageQueue`](crate::MessageQueue) it
 /// came from is dropped, so a thread other than the one reading or writing
-/// can wake a waiter (a death notification, for instance).
+/// can wake a waiter (a death notification, for instance). That waiter is
+/// one that calls [`wait`](Self::wait) itself and looks at the bits it
+/// returns; the queue's blocking calls end only at the transfer or the
+/// deadline (see [`MessageQueue::write_blocking`](crate::MessageQueue::write_blocking)).
 ///
 /// The protocol is libfmq's exactly, which is what makes a Rust waiter and a
 /// C++ waker interoperate:

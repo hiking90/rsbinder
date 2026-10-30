@@ -614,6 +614,14 @@ impl<T: Element> MessageQueue<T> {
     /// `writeBlocking` ignores it. An `Err` there would invite a retry that
     /// writes the items twice. The bits are set before the futex call, so a
     /// waiter that has not yet slept still sees them.
+    ///
+    /// Only the transfer or the deadline ends the call, as in libfmq. A bit
+    /// another thread or process sets wakes it only when the bit is in
+    /// `wait_bits`; the wait then takes the bit off the word and tries the
+    /// transfer again, so the bit is not seen by anyone else. To stop a
+    /// blocked writer from outside, give it a deadline, or wait on the
+    /// [`EventFlag`](crate::EventFlag) yourself and transfer with
+    /// [`write`](Self::write).
     pub fn write_blocking(
         &mut self,
         items: &[T],
@@ -653,8 +661,8 @@ impl<T: Element> MessageQueue<T> {
     /// (normally [`NOT_EMPTY`](crate::NOT_EMPTY)) while too few elements are
     /// available, and setting `wake_bits` (normally
     /// [`NOT_FULL`](crate::NOT_FULL); `0` for none) once they are out.
-    /// libfmq `readBlocking`; the failures are those of
-    /// [`write_blocking`](Self::write_blocking).
+    /// libfmq `readBlocking`; the failures, and what ends the wait, are those
+    /// of [`write_blocking`](Self::write_blocking).
     pub fn read_blocking(
         &mut self,
         out: &mut [T],
