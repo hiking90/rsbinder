@@ -195,13 +195,20 @@ fn wrap_splits_the_regions_and_keeps_the_order() {
 fn write_and_read_are_all_or_nothing() {
     let mut w = MessageQueue::<u8>::create(4, false).unwrap();
     let mut r = attach(&w);
-    assert!(!w.write(&[0; 5]).unwrap());
-    assert!(w.begin_write(5).unwrap().is_none());
+    // More than the capacity never fits: an error, not a `false` a poll would wait on.
+    let too_many = Some(Error::BadValue("more items than the queue holds"));
+    assert_eq!(w.write(&[0; 5]).err(), too_many);
+    assert_eq!(w.begin_write(5).err(), too_many);
+    assert_eq!(
+        w.begin_write_cached(3, 2).err(),
+        Some(Error::BadValue("more items than the limit in flight"))
+    );
     assert!(w.write(&[1, 2, 3, 4]).unwrap());
     assert!(!w.write(&[5]).unwrap());
     assert!(w.write(&[]).unwrap());
     let mut five = [0u8; 5];
-    assert!(!r.read(&mut five).unwrap());
+    assert_eq!(r.read(&mut five).err(), too_many);
+    assert_eq!(r.begin_read(5).err(), too_many);
     let mut two = [0u8; 2];
     assert!(r.read(&mut two).unwrap());
     assert_eq!(two, [1, 2]);
