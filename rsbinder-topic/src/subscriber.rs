@@ -516,7 +516,8 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
         }
     }
 
-    /// What this subscription has received, counted in this process (plan 15 §5.9a).
+    /// What this subscription has received since it was made (plan 15 §5.9a); see
+    /// [`SubscriberStats`] for what that counts and what it does not.
     pub fn stats(&self) -> SubscriberStats {
         SubscriberStats {
             received: self.received,

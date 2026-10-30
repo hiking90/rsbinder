@@ -54,7 +54,11 @@ const DRAIN_STALLS: u32 = 2;
 ///
 /// A receive returns what a [`Subscriber`]'s does, except that the end of a connection is
 /// [`RecvError::Disconnected`], returned once, after which the next receive goes on with the next
-/// connection. The one [`RecvError::Closed`] a `NamedSubscriber` returns is
+/// connection. Two of them leave no next connection while the name stays where it is: a refusal a
+/// retry cannot change ([`Disconnected::Rejected`] says which) and a corrupt ring
+/// ([`Disconnected::Ended`] with [`Closed::Corrupted`]); the receives after them wait until the
+/// name is registered anew, so a loop logs the `Disconnected` it goes on past, as the example
+/// below does. The one [`RecvError::Closed`] a `NamedSubscriber` returns is
 /// [`Closed::Evicted`]: a publisher with backpressure took the subscription out, and since a
 /// subscriber as slow as before would be taken out again, no connection is made after it, to that
 /// publisher or the next; it is returned from then on. Code that only wants the values goes on
@@ -73,7 +77,7 @@ const DRAIN_STALLS: u32 = 2;
 ///     match subscriber.recv() {
 ///         Ok(Bytes(value)) => println!("{value:?}"),
 ///         Err(RecvError::Lagged(_) | RecvError::Decode(_)) => continue,
-///         Err(RecvError::Disconnected(_)) => continue,
+///         Err(RecvError::Disconnected(why)) => eprintln!("example.topic: {why:?}"),
 ///         Err(_) => break,
 ///     }
 /// }
@@ -412,8 +416,8 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
         })
     }
 
-    /// What this subscriber has received over all its connections, counted in this process
-    /// (plan 15 §5.9a).
+    /// What this subscriber has received over all its connections since it was made (plan 15
+    /// §5.9a); see [`SubscriberStats`] for what that counts and what it does not.
     pub fn stats(&self) -> SubscriberStats {
         let mut stats = self.past;
         if let Some(connection) = &self.current {
