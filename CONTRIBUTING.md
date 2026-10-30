@@ -47,7 +47,8 @@ Linux/Android-only.
 `tests/tests/topic_fleet.rs` runs `rsbinder-topic` the way a deployment
 does: 27 processes (`tests/src/bin/topic_node/`) over six topics, killed,
 stopped and started again while every receive is checked. The `kernel`
-tier runs it; by hand, with a binder device and a permissive `rsb_hub`
+tier runs it, and `integration-test.yml` on x86_64 and on the arm64 Linux
+runner; by hand, with a binder device and a permissive `rsb_hub`
 (`--config tests/policy/permissive.toml`):
 
 ```
