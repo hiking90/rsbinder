@@ -178,6 +178,25 @@ fn a_closed_or_dropped_publishers_name_is_gone_from_the_next_call() {
     assert!(listed(&resolver, &name).is_none());
 }
 
+/// The registry keeps one entry for a name and binder given twice: giving it again on the same
+/// host keeps it, and a name given anew moves without a gap.
+#[test]
+#[ignore = "needs a binder device and rsb_hub"]
+fn a_name_given_again_on_the_same_host_stays_and_a_new_name_takes_its_place() {
+    let registry = registry_name("again");
+    let (_host, resolver) = host(&registry);
+    let (first, second) = (name("again.first"), name("again.second"));
+    let policy = PublisherPolicy::default();
+    let publisher = Publisher::<Bytes>::advertise_with(&first, &policy, &resolver).unwrap();
+    publisher.advertise_on(&first, &self::resolver(&registry)).unwrap();
+    assert!(listed(&resolver, &first).is_some());
+    publisher.advertise_on(&second, &resolver).unwrap();
+    assert!(listed(&resolver, &second).is_some());
+    assert!(listed(&resolver, &first).is_none());
+    publisher.close(&Status::from(ExceptionCode::None));
+    assert!(listed(&resolver, &second).is_none());
+}
+
 /// AC-15.5.6: a hub with no registry has none to find; this one has no feature `topic`.
 #[test]
 #[ignore = "needs a binder device and rsb_hub"]

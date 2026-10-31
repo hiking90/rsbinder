@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use rsbinder::{BinderResult, DeathRecipient, ExceptionCode, Interface, SIBinder, Status};
 
-use crate::aidl::ITopic::{BnTopic, ITopic, ERROR_FULL};
+use crate::aidl::ITopic::{BnTopic, ITopic, ERROR_CLOSED, ERROR_FULL};
 use crate::aidl::SubscribeRequest::SubscribeRequest;
 use crate::aidl::TopicEndpoint::TopicEndpoint;
 use crate::layout::{self, Stored, HEADER_OFFSET, MIN_RING, VERSION};
@@ -1569,6 +1569,51 @@ fn a_closed_publisher_is_waited_past_without_a_notice() {
     connected(&subscriber);
     next.publish(&bytes(7)).unwrap();
     assert_eq!(recv(&mut subscriber), Ok(bytes(7)));
+}
+
+#[test]
+fn a_topic_advertised_after_it_published_is_read_from_its_oldest_record() {
+    let names = Names::default();
+    let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
+    publisher.publish(&bytes(1)).unwrap();
+    publisher.publish(&bytes(2)).unwrap();
+    let oldest = SubscriberPolicy {
+        start: Start::Oldest,
+        ..SubscriberPolicy::default()
+    };
+    let mut subscriber = NamedSubscriber::subscribe_with(NAME, &oldest, &names).unwrap();
+    publisher.advertise_on(NAME, &names).unwrap();
+    connected(&subscriber);
+    assert_eq!(recv(&mut subscriber), Ok(bytes(1)));
+    assert_eq!(recv(&mut subscriber), Ok(bytes(2)));
+}
+
+#[test]
+fn a_closed_publisher_gives_no_name() {
+    let names = Names::default();
+    let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
+    publisher.close(&Status::from(ExceptionCode::None));
+    let refused = publisher.advertise_on(NAME, &names).unwrap_err();
+    assert_eq!(refused.service_specific_error(), ERROR_CLOSED);
+    assert!(names.0.lock().unwrap().given.is_empty());
+}
+
+#[test]
+fn a_binder_of_the_applications_own_is_advertised_in_the_publishers_place() {
+    let names = Names::default();
+    let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
+    let asked = Arc::new(AtomicUsize::new(0));
+    let counted = Counted {
+        acceptor: publisher.acceptor(),
+        asked: asked.clone(),
+    };
+    let binder = BnTopic::new_binder(counted).as_binder();
+    publisher.advertise_binder_on(NAME, binder, &names).unwrap();
+    let mut subscriber = subscribe(&names);
+    connected(&subscriber);
+    publisher.publish(&bytes(3)).unwrap();
+    assert_eq!(recv(&mut subscriber), Ok(bytes(3)));
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
 }
 
 /// An `ITopic` that counts its subscription calls and hands them to a publisher's acceptor.

@@ -48,6 +48,25 @@ pub trait Resolver: Send + Sync {
         name: &str,
         on_registered: Box<dyn Fn(SIBinder) + Send + Sync>,
     ) -> BinderResult<Watch>;
+
+    /// The binder of the process that holds the names and the watches, if the resolver knows
+    /// one; `None` by default.
+    ///
+    /// A [`NamedSubscriber`](crate::NamedSubscriber) links to its death: once it dies, no call
+    /// of a watch comes again, and the subscriber returns
+    /// [`Closed::ResolverDied`](crate::Closed::ResolverDied) once no connection is left.
+    /// [`Publisher::advertise_on`](crate::Publisher::advertise_on) asks no resolver of the same
+    /// host again for the name and binder it holds: a registry given the same name and binder
+    /// twice keeps one entry, which the drop of either advertisement would take back.
+    ///
+    /// A [`RegistryResolver`](crate::registry::RegistryResolver) returns the registry's binder.
+    /// [`ServiceManager`] returns none: a death link on the service manager's binder (handle 0)
+    /// marks this process's proxy of it dead, and once a restarted service manager serves
+    /// handle 0, every call through that proxy, the next watch of a name among them, fails with
+    /// `DeadObject`.
+    fn host(&self) -> Option<SIBinder> {
+        None
+    }
 }
 
 /// A name [`Resolver::advertise`] gave: dropping it takes the name back, as far as the resolver
@@ -86,7 +105,6 @@ pub(crate) type Lookup = Arc<dyn Fn() -> BinderResult<Option<SIBinder>> + Send +
 pub struct Watch {
     _guard: Box<dyn Any + Send + Sync>,
     lookup: Option<Lookup>,
-    host: Option<SIBinder>,
 }
 
 impl Watch {
@@ -95,23 +113,7 @@ impl Watch {
         Self {
             _guard: Box::new(guard),
             lookup: None,
-            host: None,
         }
-    }
-
-    /// This watch with the binder of the process that holds it: once that binder dies, the watch
-    /// makes no more calls, and a [`NamedSubscriber`](crate::NamedSubscriber) reports
-    /// [`Closed::ResolverDied`](crate::Closed::ResolverDied) once it has no connection left.
-    ///
-    /// A [`RegistryResolver`](crate::registry::RegistryResolver) gives the registry's binder.
-    /// [`ServiceManager`] gives none: a death link on the service manager's binder (handle 0)
-    /// marks this process's proxy of it dead, and once a restarted service manager serves
-    /// handle 0, every call through that proxy, the next watch of a name among them, fails with
-    /// `DeadObject`. A watch without a host never reports the death: the subscriber waits for the
-    /// next call.
-    pub fn with_host(mut self, host: SIBinder) -> Self {
-        self.host = Some(host);
-        self
     }
 
     /// A watch that can also be asked for the binder the name has now: `lookup` returns it, or
@@ -135,7 +137,6 @@ impl Watch {
         Self {
             _guard: Box::new(guard),
             lookup: Some(Arc::new(lookup)),
-            host: None,
         }
     }
 
@@ -143,18 +144,12 @@ impl Watch {
     pub(crate) fn lookup(&self) -> Option<Lookup> {
         self.lookup.clone()
     }
-
-    /// The binder of the process that holds the watch, if [`with_host`](Self::with_host) gave it.
-    pub(crate) fn host(&self) -> Option<&SIBinder> {
-        self.host.as_ref()
-    }
 }
 
 impl fmt::Debug for Watch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Watch")
             .field("lookup", &self.lookup.is_some())
-            .field("host", &self.host.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -191,7 +186,6 @@ impl Resolver for ServiceManager {
         let callback = BnServiceCallback::new_binder(Notice(on_registered));
         hub::register_for_notifications(name, &callback)?;
         let looked_up = name.to_owned();
-        // No host: linking handle 0's death fails every later hub call once the manager restarts.
         Ok(Watch::with_lookup(
             Registered {
                 name: name.to_owned(),

@@ -140,9 +140,8 @@ pub enum Closed {
     Evicted,
     /// A [`NamedSubscriber`](crate::NamedSubscriber)'s resolver died: the process that held its
     /// watch of the name is gone, so no publisher of the name will reach the subscriber again.
-    /// Only a resolver whose watch names its host reports it
-    /// ([`Watch::with_host`](crate::Watch::with_host)): a registry's does, the service manager's
-    /// does not. Returned once no connection is left: a
+    /// Only a resolver that names its host reports it ([`Resolver::host`](crate::Resolver::host)):
+    /// a registry does, the service manager does not. Returned once no connection is left: a
     /// connection held when the resolver died goes on until it ends, and the `Disconnected` of
     /// that end comes first. Make the subscriber again with a resolver of the new host (plan 15
     /// D8). A [`Subscriber`](crate::Subscriber) never returns it.

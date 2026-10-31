@@ -62,8 +62,16 @@ use crate::{wake, Authorize, Bytes, Payload, PublishError, PublisherPolicy, Publ
 pub struct Publisher<T: Payload> {
     shared: Arc<Shared<T>>,
     binder: SIBinder,
-    /// The name [`advertise_with`](Self::advertise_with) gave, dropped before the end record.
-    advertised: Mutex<Option<Advertisement>>,
+    /// The name the publisher holds, dropped before the end record.
+    advertised: Mutex<Option<Held>>,
+}
+
+/// A name a resolver gave: what to, where, and the advertisement that takes it back.
+struct Held {
+    name: String,
+    binder: SIBinder,
+    host: Option<SIBinder>,
+    _advertisement: Advertisement,
 }
 
 /// What the publisher, the acceptors and the death notifications share.
@@ -135,10 +143,79 @@ impl<T: Payload + 'static> Publisher<T> {
         policy: &PublisherPolicy,
         resolver: &dyn Resolver,
     ) -> BinderResult<Self> {
-        let mut publisher = Self::new(policy).map_err(status_of)?;
-        let advertised = resolver.advertise(name, publisher.as_binder())?;
-        publisher.advertised = Mutex::new(Some(advertised));
+        let publisher = Self::new(policy).map_err(status_of)?;
+        publisher.advertise_on(name, resolver)?;
         Ok(publisher)
+    }
+
+    /// Give `name` to this topic through `resolver`, after it was made: to publish what a
+    /// subscriber starting at [`Start::Last`](crate::Start::Last) or
+    /// [`Start::Oldest`](crate::Start::Oldest) reads before anyone can find the topic, or to
+    /// give the name again through the resolver of a registry host that was started again
+    /// (plan 15 D8), keeping the subscribers already connected.
+    ///
+    /// The publisher holds one name. The advertisement it held before is dropped once the
+    /// resolver has given this one, so the name moves without a gap; when `resolver`'s
+    /// [`host`](Resolver::host) is the one the publisher's name is held on and `name` is that
+    /// name, the resolver is not asked again (a registry keeps one entry for the same name and
+    /// binder, which the drop of the earlier advertisement would take back).
+    ///
+    /// [`ITopic::ERROR_CLOSED`] once the publisher is closed: the call never gives the name of a
+    /// topic whose end record is written, and a close during the call takes the new name back.
+    /// The resolver's error otherwise, and the publisher keeps the name it held.
+    ///
+    /// [`ITopic::ERROR_CLOSED`]: crate::aidl::ITopic::ERROR_CLOSED
+    pub fn advertise_on(&self, name: &str, resolver: &dyn Resolver) -> BinderResult<()> {
+        self.advertise_binder_on(name, self.as_binder(), resolver)
+    }
+
+    /// [`advertise_on`](Self::advertise_on) with `binder` in place of the publisher's own: an
+    /// `ITopic` of the application's own that decides who may subscribe and hands the rest to
+    /// [`acceptor`](Self::acceptor).
+    pub fn advertise_binder_on(
+        &self,
+        name: &str,
+        binder: SIBinder,
+        resolver: &dyn Resolver,
+    ) -> BinderResult<()> {
+        let host = resolver.host();
+        let closed = || refuse(ERROR_CLOSED, "the publisher has been closed");
+        {
+            let held = self.lock_advertised();
+            if self.shared.writer.lock().writer.ended() {
+                return Err(closed());
+            }
+            let same = held.as_ref().is_some_and(|held| {
+                host.is_some() && held.host == host && held.name == name && held.binder == binder
+            });
+            if same {
+                return Ok(());
+            }
+        }
+        // Not under the lock: `close` holds it through the end record, which may wait.
+        let advertisement = resolver.advertise(name, binder.clone())?;
+        let new = Held {
+            name: name.to_owned(),
+            binder,
+            host,
+            _advertisement: advertisement,
+        };
+        let mut held = self.lock_advertised();
+        if self.shared.writer.lock().writer.ended() {
+            drop(held);
+            drop(new);
+            return Err(closed());
+        }
+        let old = held.replace(new);
+        drop(held);
+        drop(old);
+        Ok(())
+    }
+
+    fn lock_advertised(&self) -> std::sync::MutexGuard<'_, Option<Held>> {
+        self.advertised
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 }
 

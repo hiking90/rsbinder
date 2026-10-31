@@ -129,7 +129,11 @@ impl Resolver for RegistryResolver {
             watcher,
             newest,
         };
-        Ok(Watch::with_lookup(watching, lookup).with_host(self.registry.as_binder()))
+        Ok(Watch::with_lookup(watching, lookup))
+    }
+
+    fn host(&self) -> Option<SIBinder> {
+        Some(self.registry.as_binder())
     }
 }
 

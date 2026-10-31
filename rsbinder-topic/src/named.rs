@@ -489,7 +489,7 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
         if look {
             named.connect(Begin::Look(None), Duration::ZERO);
         }
-        let host = watch.host().and_then(|host| named.link_host(host));
+        let host = resolver.host().and_then(|host| named.link_host(&host));
         Ok(Self {
             named,
             current: None,
