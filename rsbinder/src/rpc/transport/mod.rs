@@ -666,7 +666,7 @@ pub enum PeerIdentity {
 /// different sides compare unequal.
 #[derive(Clone, PartialEq, Eq)]
 pub struct CertId {
-    subject: String,
+    subject: std::sync::Arc<str>,
     fingerprint: [u8; 32],
 }
 
@@ -674,7 +674,7 @@ impl CertId {
     /// Construct from a subject string and the leaf cert SHA-256.
     pub fn new(subject: impl Into<String>, fingerprint: [u8; 32]) -> Self {
         CertId {
-            subject: subject.into(),
+            subject: std::sync::Arc::from(subject.into()),
             fingerprint,
         }
     }

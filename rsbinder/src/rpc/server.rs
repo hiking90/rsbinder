@@ -192,10 +192,6 @@ use super::transport::{TlsStream, TlsTransport};
 use super::wire_android13::BAD_SESSION_ID_SIZE;
 use super::RpcResult;
 
-/// Server TLS config, `None` = plain; `Mutex<Option>` like the other late-bound knobs.
-#[cfg(feature = "rpc-tls")]
-type TlsServerConfigCell = Mutex<Option<Arc<rustls::ServerConfig>>>;
-
 /// The accept loop's listener; `Tcp` is TLS-only (see module doc "Accept and wrap").
 enum ServerListener {
     Unix(UnixListener),
@@ -432,7 +428,7 @@ pub struct RpcServer {
     bind: BindAddress,
     /// `Some` ⇒ every accepted connection is TLS-handshaken on its worker; set by `setup_*_tls`.
     #[cfg(feature = "rpc-tls")]
-    tls_config: TlsServerConfigCell,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
     root: Mutex<Option<SIBinder>>,
     /// Services behind `add_service`; shared with the `directory` root, so no rebuild per insert.
     named: Arc<Mutex<HashMap<String, SIBinder>>>,
@@ -454,6 +450,7 @@ pub struct RpcServer {
     authorizer: Mutex<Option<Authorizer>>,
     /// Test barrier on the attach arm before the `shutdown` gate (`__set_attach_shutdown_probe`).
     #[doc(hidden)]
+    #[cfg(feature = "test-util")]
     attach_shutdown_probe: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Id → founding inner (AOSP `RpcServer::mSessions`); see module doc "Session registry".
     sessions: Mutex<HashMap<RpcSessionId, std::sync::Weak<RpcSessionInner>>>,
@@ -638,7 +635,7 @@ impl RpcServer {
             listener,
             bind,
             #[cfg(feature = "rpc-tls")]
-            tls_config: Mutex::new(None),
+            tls_config: None,
             root: Mutex::new(None),
             named,
             directory,
@@ -650,6 +647,7 @@ impl RpcServer {
             idle_timeout: Mutex::new(None),
             reply_timeout: Mutex::new(None),
             authorizer: Mutex::new(None),
+            #[cfg(feature = "test-util")]
             attach_shutdown_probe: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
             r34_sessions: Mutex::new(HashMap::new()),
@@ -682,8 +680,10 @@ impl RpcServer {
         path: impl Into<PathBuf>,
         config: Arc<rustls::ServerConfig>,
     ) -> Result<Arc<RpcServer>> {
-        let server = Self::setup_unix_server(path)?;
-        *server.tls_config.lock().expect("tls_config poisoned") = Some(config);
+        let mut server = Self::setup_unix_server(path)?;
+        Arc::get_mut(&mut server)
+            .expect("a server no one else holds yet")
+            .tls_config = Some(config);
         Ok(server)
     }
 
@@ -701,8 +701,10 @@ impl RpcServer {
         let local = listener.local_addr()?;
         let listener = ServerListener::Tcp(listener);
         listener.set_nonblocking(true)?;
-        let server = Self::wrap(listener, BindAddress::Tcp(local));
-        *server.tls_config.lock().expect("tls_config poisoned") = Some(config);
+        let mut server = Self::wrap(listener, BindAddress::Tcp(local));
+        Arc::get_mut(&mut server)
+            .expect("a server no one else holds yet")
+            .tls_config = Some(config);
         Ok(server)
     }
 
@@ -721,15 +723,17 @@ impl RpcServer {
         port: u32,
         config: Arc<rustls::ServerConfig>,
     ) -> Result<Arc<RpcServer>> {
-        let server = Self::setup_vsock_server(cid, port)?;
-        *server.tls_config.lock().expect("tls_config poisoned") = Some(config);
+        let mut server = Self::setup_vsock_server(cid, port)?;
+        Arc::get_mut(&mut server)
+            .expect("a server no one else holds yet")
+            .tls_config = Some(config);
         Ok(server)
     }
 
     /// TLS config snapshot (`None` = plain), taken once per connection for the worker's lifetime.
     #[cfg(feature = "rpc-tls")]
     fn tls_snapshot(&self) -> Option<Arc<rustls::ServerConfig>> {
-        self.tls_config.lock().expect("tls_config poisoned").clone()
+        self.tls_config.clone()
     }
 
     /// Raise `started` under the `root` lock, so a setter's check and its store are not split.
@@ -1203,13 +1207,16 @@ impl RpcServer {
 
     /// Run the attach-shutdown probe, if set, outside its lock so it may re-enter the server.
     fn run_attach_shutdown_probe(&self) {
-        let probe = self
-            .attach_shutdown_probe
-            .lock()
-            .expect("attach_shutdown_probe poisoned")
-            .clone();
-        if let Some(p) = probe {
-            p();
+        #[cfg(feature = "test-util")]
+        {
+            let probe = self
+                .attach_shutdown_probe
+                .lock()
+                .expect("attach_shutdown_probe poisoned")
+                .clone();
+            if let Some(p) = probe {
+                p();
+            }
         }
     }
 
@@ -1366,11 +1373,15 @@ impl RpcServer {
         Ok(id)
     }
 
-    /// The live session an r34 joining connection names, with its founding peer.
-    fn resolve_r34_session(&self, id: i32) -> Option<(Arc<RpcSessionInner>, PeerIdentity)> {
+    /// The live session an r34 joining connection names, with its founding peer's uid.
+    fn resolve_r34_session(&self, id: i32) -> Option<(Arc<RpcSessionInner>, Option<u32>)> {
         let map = self.r34_sessions.lock().expect("r34_sessions poisoned");
         let entry = map.get(&id)?;
-        Some((entry.inner.upgrade()?, entry.founder.clone()))
+        let founder_uid = match entry.founder {
+            PeerIdentity::Local { uid, .. } => Some(uid),
+            _ => None,
+        };
+        Some((entry.inner.upgrade()?, founder_uid))
     }
 
     /// Echoed id → live founding inner; `None` for a non-32-byte, unknown or stale id.
@@ -1895,7 +1906,7 @@ impl RpcServer {
             server.rejected_unknown_id.fetch_add(1, Ordering::SeqCst);
             log::warn!("RPC r34: connection asking to join session {id} refused: {why}");
         };
-        let Some((inner, founder)) = server.resolve_r34_session(id) else {
+        let Some((inner, founder_uid)) = server.resolve_r34_session(id) else {
             // An android-13+ client's `RpcConnectionHeader` opens with its version where r34 has the id.
             if u32::try_from(id).is_ok_and(super::wire_android13::is_supported_protocol_version) {
                 log::warn!(
@@ -1911,7 +1922,7 @@ impl RpcServer {
         // Not in AOSP 12, whose id a counter makes guessable (b/183988761): another local
         // process joining would reach every object the session's client was handed.
         if let PeerIdentity::Local { uid, .. } = transport.peer_identity() {
-            if !matches!(founder, PeerIdentity::Local { uid: founding, .. } if founding == uid) {
+            if founder_uid != Some(uid) {
                 return refuse("its peer is not the founding connection's uid");
             }
         }
