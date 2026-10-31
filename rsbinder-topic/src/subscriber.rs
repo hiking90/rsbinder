@@ -386,6 +386,12 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
         self.wait(None, true)
     }
 
+    /// [`recv_latest`](Self::recv_latest) with a bound: [`RecvError::Timeout`] once `timeout`
+    /// passes with no record unread. A `timeout` too long for an `Instant` waits without one.
+    pub fn recv_latest_timeout(&mut self, timeout: Duration) -> Result<T, RecvError> {
+        self.wait(Instant::now().checked_add(timeout), true)
+    }
+
     /// [`recv`](Self::recv) for an async caller.
     ///
     /// With [`Wake::Futex`] the wait sleeps on a thread of the blocking pool

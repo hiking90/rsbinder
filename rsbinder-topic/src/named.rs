@@ -563,6 +563,12 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
         self.receive(Some(None), true)
     }
 
+    /// [`recv_latest`](Self::recv_latest) with a bound: [`RecvError::Timeout`] once `timeout`
+    /// passes with no record. A `timeout` too long for an `Instant` waits without one.
+    pub fn recv_latest_timeout(&mut self, timeout: Duration) -> Result<T, RecvError> {
+        self.receive(Some(Instant::now().checked_add(timeout)), true)
+    }
+
     /// A handle that ends this subscriber's wait from another thread, also a wait for a
     /// connection. The connection, or the search for one, goes on.
     pub fn interrupter(&self) -> Interrupter {

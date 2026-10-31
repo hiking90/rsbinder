@@ -188,7 +188,9 @@ fn a_name_given_again_on_the_same_host_stays_and_a_new_name_takes_its_place() {
     let (first, second) = (name("again.first"), name("again.second"));
     let policy = PublisherPolicy::default();
     let publisher = Publisher::<Bytes>::advertise_with(&first, &policy, &resolver).unwrap();
-    publisher.advertise_on(&first, &self::resolver(&registry)).unwrap();
+    publisher
+        .advertise_on(&first, &self::resolver(&registry))
+        .unwrap();
     assert!(listed(&resolver, &first).is_some());
     publisher.advertise_on(&second, &resolver).unwrap();
     assert!(listed(&resolver, &second).is_some());

@@ -1589,6 +1589,25 @@ fn a_topic_advertised_after_it_published_is_read_from_its_oldest_record() {
 }
 
 #[test]
+fn a_bounded_latest_receive_times_out_and_then_returns_the_newest_record() {
+    let names = Names::default();
+    let publisher = advertise(&names, &policy());
+    let mut named = subscribe(&names);
+    connected(&named);
+    let request =
+        Subscriber::<Bytes>::request(&publisher.as_binder(), &SubscriberPolicy::default());
+    let mut plain = request.unwrap();
+    let short = Duration::from_millis(50);
+    assert_eq!(named.recv_latest_timeout(short), Err(RecvError::Timeout));
+    assert_eq!(plain.recv_latest_timeout(short), Err(RecvError::Timeout));
+    publisher
+        .publish_all(&[bytes(1), bytes(2), bytes(3)])
+        .unwrap();
+    assert_eq!(named.recv_latest_timeout(WAIT), Ok(bytes(3)));
+    assert_eq!(plain.recv_latest_timeout(WAIT), Ok(bytes(3)));
+}
+
+#[test]
 fn a_closed_publisher_gives_no_name() {
     let names = Names::default();
     let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
