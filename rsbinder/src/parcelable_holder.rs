@@ -341,12 +341,10 @@ impl Deserialize for ParcelableHolder {
         if status == NULL_PARCELABLE_FLAG {
             log::error!("ParcelableHolder::deserialize: unexpected null");
             Err(StatusCode::UnexpectedNull)
-        } else if status == NON_NULL_PARCELABLE_FLAG {
+        } else {
             let mut parcelable = ParcelableHolder::default();
             parcelable.read_from_parcel(parcel)?;
             Ok(parcelable)
-        } else {
-            Err(StatusCode::UnexpectedNull)
         }
     }
 
@@ -361,10 +359,8 @@ impl Deserialize for ParcelableHolder {
         if status == NULL_PARCELABLE_FLAG {
             log::error!("ParcelableHolder::deserialize_from: unexpected null");
             Err(StatusCode::UnexpectedNull)
-        } else if status == NON_NULL_PARCELABLE_FLAG {
-            self.read_from_parcel(parcel)
         } else {
-            Err(StatusCode::UnexpectedNull)
+            self.read_from_parcel(parcel)
         }
     }
 }
@@ -523,21 +519,43 @@ mod tests {
         }
     }
 
-    /// Non-nullable: only `NON_NULL_PARCELABLE_FLAG` (1) passes; 0 or garbage is `UnexpectedNull`.
+    /// Non-nullable: only zero is `UnexpectedNull`; every nonzero presence reads the body.
     #[test]
-    fn holder_rejects_null_and_garbage_sentinels() {
-        for status in [NULL_PARCELABLE_FLAG, 2, -1] {
+    fn holder_accepts_nonzero_presence() {
+        for status in [0, 1, 2, -1, i32::MAX, i32::MIN] {
             let mut p = Parcel::new();
             p.write(&status).unwrap();
+            if status != 0 {
+                ParcelableHolder::default().write_to_parcel(&mut p).unwrap();
+            }
+            p.write(&7i32).unwrap();
             p.set_data_position(0);
-            assert!(
-                matches!(
-                    ParcelableHolder::deserialize(&mut p),
-                    Err(StatusCode::UnexpectedNull)
-                ),
-                "status {status} must be rejected as UnexpectedNull",
+            let expected = if status == 0 {
+                Err(StatusCode::UnexpectedNull)
+            } else {
+                Ok(())
+            };
+            assert_eq!(ParcelableHolder::deserialize(&mut p).map(|_| ()), expected);
+            assert_eq!(p.read::<i32>(), Ok(7));
+            p.set_data_position(0);
+            assert_eq!(
+                ParcelableHolder::default().deserialize_from(&mut p),
+                expected
             );
+            assert_eq!(p.read::<i32>(), Ok(7));
         }
+        let mut p = Parcel::new();
+        p.write(&2i32).unwrap();
+        p.set_data_position(0);
+        assert_eq!(
+            ParcelableHolder::deserialize(&mut p).err(),
+            Some(StatusCode::NotEnoughData)
+        );
+        p.set_data_position(0);
+        assert_eq!(
+            ParcelableHolder::default().deserialize_from(&mut p),
+            Err(StatusCode::NotEnoughData)
+        );
     }
 
     /// The payload sub-parcel inherits data-only mode; see module doc "Data-only payloads".

@@ -1809,10 +1809,13 @@ impl Parcel {
             return Err(StatusCode::BadValue);
         }
 
-        let end = start.checked_add(parcelable_size as _).ok_or_else(|| {
-            log::error!("Parcel: check_add error: {parcelable_size}");
-            StatusCode::BadValue
-        })?;
+        let end = start
+            .checked_add(parcelable_size as _)
+            .filter(|&end| end <= i32::MAX as usize)
+            .ok_or_else(|| {
+                log::error!("Parcel: check_add error: {parcelable_size}");
+                StatusCode::BadValue
+            })?;
         if end > self.data_size() {
             log::error!("Parcel: not enough data: {} > {}", end, self.data_size());
             return Err(StatusCode::NotEnoughData);
@@ -1854,7 +1857,7 @@ impl Parcel {
         let len: i32 = self.read()?;
         if len < -1 {
             log::error!("Parcel: bad array length: {len}");
-            return Err(StatusCode::UnexpectedNull);
+            return Err(StatusCode::BadValue);
         }
         if len == -1 {
             return Ok(None);
@@ -1864,15 +1867,16 @@ impl Parcel {
         }
 
         // Checked so a hostile `len` cannot wrap `size` on 32-bit; see `checked_array_layout`.
-        let (size, padded) = checked_array_layout(len, std::mem::size_of::<D>())?;
+        let (size, padded) = checked_array_layout(len, std::mem::size_of::<D>())
+            .map_err(|_| StatusCode::NoMemory)?;
 
-        if padded > self.data_avail() {
+        if size > i32::MAX as usize || padded > self.data_avail() {
             log::error!(
                 "Parcel: not enough data to read array: {} > {}",
                 padded,
                 self.data_avail()
             );
-            return Err(StatusCode::NotEnoughData);
+            return Err(StatusCode::NoMemory);
         }
 
         let pos = self.pos;
@@ -1894,7 +1898,7 @@ impl Parcel {
         let len: i32 = self.read()?;
         if len < -1 {
             log::error!("Parcel: bad array length: {len}");
-            return Err(StatusCode::UnexpectedNull);
+            return Err(StatusCode::BadValue);
         }
         if len == -1 {
             return Ok(None);
@@ -1902,9 +1906,14 @@ impl Parcel {
         if len == 0 {
             return Ok(Some(Vec::new()));
         }
+        // NDK checks the u16 allocation size even though each char occupies an i32 wire slot.
+        if len as usize > self.data_avail() || len > i32::MAX / 2 {
+            return Err(StatusCode::NoMemory);
+        }
 
         // Checked as in `read_array`; a char-array element is always 4 wire bytes.
-        let (size, padded) = checked_array_layout(len, std::mem::size_of::<i32>())?;
+        let (size, padded) = checked_array_layout(len, std::mem::size_of::<i32>())
+            .map_err(|_| StatusCode::NoMemory)?;
 
         if padded > self.data_avail() {
             log::error!(
@@ -3006,22 +3015,43 @@ mod tests {
 
     #[test]
     fn read_array_rejects_hostile_len_gracefully() {
-        // A bare length word far beyond `data_avail()` must be `Err`, never a capacity panic.
+        for (len, error) in [
+            (-2, StatusCode::BadValue),
+            (1, StatusCode::NoMemory),
+            (i32::MAX, StatusCode::NoMemory),
+        ] {
+            let mut parcel = Parcel::new();
+            parcel.write(&len).unwrap();
+            parcel.set_data_position(0);
+            assert_eq!(parcel.read_array::<i32>(), Err(error));
+        }
         let mut parcel = Parcel::new();
-        parcel.write::<i32>(&1_000_000_000).unwrap();
+        parcel.write(&2i32).unwrap();
+        parcel.write(&7i32).unwrap();
         parcel.set_data_position(0);
-        let r = parcel.read_array::<i32>();
-        assert!(r.is_err(), "expected Err, got {r:?}");
+        assert_eq!(parcel.read_array::<i32>(), Err(StatusCode::NoMemory));
     }
 
     #[test]
     fn read_array_char_rejects_hostile_len_gracefully() {
-        // Char-array twin of the test above; both go through `checked_array_layout`.
+        for (len, error) in [
+            (-2, StatusCode::BadValue),
+            (1, StatusCode::NoMemory),
+            (i32::MAX, StatusCode::NoMemory),
+        ] {
+            let mut parcel = Parcel::new();
+            parcel.write(&len).unwrap();
+            parcel.set_data_position(0);
+            assert_eq!(parcel.read_array_char::<u16>(), Err(error));
+        }
         let mut parcel = Parcel::new();
-        parcel.write::<i32>(&1_000_000_000).unwrap();
+        parcel.write(&2i32).unwrap();
+        parcel.write(&7i32).unwrap();
         parcel.set_data_position(0);
-        let r = parcel.read_array_char::<u16>();
-        assert!(r.is_err(), "expected Err, got {r:?}");
+        assert_eq!(
+            parcel.read_array_char::<u16>(),
+            Err(StatusCode::NotEnoughData)
+        );
     }
 
     #[test]
@@ -3104,7 +3134,7 @@ mod tests {
         assert_eq!(parcel.read::<Vec<u8>>(), Err(StatusCode::UnexpectedNull));
         assert_eq!(parcel.read::<Vec<u8>>(), Ok(Vec::new()));
         assert_eq!(parcel.read::<Option<Vec<u8>>>(), Ok(Some(Vec::<u8>::new())));
-        assert_eq!(parcel.read::<Vec<u8>>(), Err(StatusCode::UnexpectedNull));
+        assert_eq!(parcel.read::<Vec<u8>>(), Err(StatusCode::BadValue));
     }
 
     #[test]
@@ -3436,6 +3466,10 @@ mod tests {
             0x5555_5555,
             "extra field skipped to block end, sentinel intact"
         );
+        wv3.set_data_position(4);
+        wv3.write(&i32::MAX).unwrap();
+        wv3.set_data_position(4);
+        assert_eq!(wv3.sized_read(|_| Ok(())), Err(StatusCode::BadValue));
     }
 
     /// Nesting past [`MAX_NESTED_READ_DEPTH`] is `BadValue`; the depth never leaks across reads.

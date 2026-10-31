@@ -371,22 +371,20 @@ impl SerializeOption for String {
     }
 }
 
-/// A `String16`'s unit bytes, NUL excluded; `None` for null (`-1` only, other negatives are errors).
-pub(crate) fn read_string16_units(parcel: &mut Parcel) -> Result<Option<&[u8]>> {
-    let len = parcel.read::<i32>()?;
-
-    if len == -1 {
-        return Ok(None);
-    }
+/// A `String16`'s unit bytes, NUL excluded; null or malformed input is `None`, as in AOSP NDK.
+pub(crate) fn read_string16_units(parcel: &mut Parcel) -> Option<&[u8]> {
+    let len = parcel.read::<i32>().ok()?;
     if !(0..i32::MAX).contains(&len) {
-        return Err(StatusCode::UnexpectedNull);
+        return None;
     }
 
     // `len + 1` units incl. NUL, checked so a hostile `len` cannot wrap on 32-bit targets.
-    let (byte_count, _) = crate::parcel::checked_array_layout(len + 1, std::mem::size_of::<u16>())?;
+    let (byte_count, _) =
+        crate::parcel::checked_array_layout(len + 1, std::mem::size_of::<u16>()).ok()?;
     // Bounds-checked against the parcel before anything is allocated for it.
-    let data = parcel.read_aligned_data(byte_count)?;
-    Ok(Some(&data[..byte_count - std::mem::size_of::<u16>()]))
+    let data = parcel.read_aligned_data(byte_count).ok()?;
+    let end = byte_count - std::mem::size_of::<u16>();
+    (data[end..] == [0, 0]).then_some(&data[..end])
 }
 
 /// The units of `String16` bytes; a `&[u16]` view of the 1-byte-aligned buffer would be UB.
@@ -396,37 +394,32 @@ fn string16_units(bytes: &[u8]) -> impl Iterator<Item = u16> + '_ {
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
 }
 
-/// Decodes `String16` unit bytes; an unpaired surrogate is `BadValue`.
-fn decode_string16_units(bytes: &[u8]) -> Result<String> {
+/// Decodes `String16` unit bytes, skipping unpaired surrogates as AOSP does.
+fn decode_string16_units(bytes: &[u8]) -> String {
     let mut text = String::with_capacity(bytes.len() / std::mem::size_of::<u16>());
-    for c in char::decode_utf16(string16_units(bytes)) {
-        text.push(c.map_err(|e| {
-            log::error!("Deserialize for Option<String16>: {e}");
-            StatusCode::BadValue
-        })?);
+    for c in char::decode_utf16(string16_units(bytes)).flatten() {
+        text.push(c);
     }
-    Ok(text)
+    text
 }
 
-/// Non-null `String16` vs `expected` in place: `Ok(Err(got))` on mismatch, else as a `String` read.
+/// Compare raw interface-token units in place; decode only the mismatch diagnostic.
 pub(crate) fn read_string16_matches(
     parcel: &mut Parcel,
     expected: &str,
 ) -> Result<std::result::Result<(), String>> {
-    let units = read_string16_units(parcel)?.ok_or(StatusCode::UnexpectedNull)?;
+    let units = read_string16_units(parcel).ok_or(StatusCode::UnexpectedNull)?;
     // Unequal lengths are unequal: `Iterator::eq` checks both ends.
     if string16_units(units).eq(expected.encode_utf16()) {
         Ok(Ok(()))
     } else {
-        decode_string16_units(units).map(Err)
+        Ok(Err(decode_string16_units(units)))
     }
 }
 
 impl DeserializeOption for String {
     fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
-        read_string16_units(parcel)?
-            .map(decode_string16_units)
-            .transpose()
+        Ok(read_string16_units(parcel).map(decode_string16_units))
     }
 }
 
@@ -608,10 +601,10 @@ pub trait DeserializeOption: Deserialize {
     /// Deserialize an Option of this type from the given parcel.
     fn deserialize_option(parcel: &mut Parcel) -> Result<Option<Self>> {
         let null: i32 = parcel.read()?;
-        match null {
-            NULL_PARCELABLE_FLAG => Ok(None),
-            NON_NULL_PARCELABLE_FLAG => parcel.read().map(Some),
-            _ => Err(StatusCode::UnexpectedNull),
+        if null == NULL_PARCELABLE_FLAG {
+            Ok(None)
+        } else {
+            parcel.read().map(Some)
         }
     }
 
@@ -752,13 +745,16 @@ pub trait DeserializeArray: Deserialize {
         let len: i32 = parcel.read()?;
         if len < -1 {
             log::error!("Negative array size given in parcel: {len}");
-            return Err(StatusCode::UnexpectedNull);
+            return Err(StatusCode::BadValue);
         }
         if len == -1 {
             return Ok(None);
         }
         if len == 0 {
             return Ok(Some(Vec::new()));
+        }
+        if len as usize > parcel.data_avail() {
+            return Err(StatusCode::NoMemory);
         }
         // Pre-allocate at most one element per 4 wire bytes left; see the trait rustdoc.
         let cap = (len as usize).min(parcel.data_avail() / 4);
@@ -860,32 +856,33 @@ impl<T: DeserializeArray, const N: usize> DeserializeArray for [T; N] {}
 mod tests {
     //! # Notes
     //!
-    //! - `hostile_string16_length_returns_err_not_panic`: on 32-bit targets the `(len + 1) * 2`
-    //!   byte count — and the `+ 3` inside `pad_size` — could wrap `usize` and slip past the
-    //!   bounds check into a slice-index panic; routing through `checked_array_layout` rejects
-    //!   it as `BadValue`. 64-bit surfaces it as `NotEnoughData`; either way it is an `Err`.
+    //! - `hostile_string16_length_returns_err_not_panic`: malformed String16 is null in AOSP;
+    //!   a non-nullable String still returns `UnexpectedNull`, without overflow or allocation.
     //! - `generic_vec_deserialize_rejects_null_but_accepts_empty`: the generic
     //!   `DeserializeArray::deserialize_array` default is the path of `String` / `bool` /
     //!   parcelable elements, distinct from the `u8` / `u16` fast paths in `parcel.rs`. A
     //!   non-null `Vec<T>` rejects null; an `Option<Vec<T>>` maps `0` to `Some(empty)`, not
     //!   `None`.
-    //! - `default_option_rejects_garbage_sentinel`: the default
+    //! - `default_option_accepts_nonzero_presence`: the default
     //!   `DeserializeOption::deserialize_option` serves primitive `Option<T>` such as
-    //!   `Option<i32>`; any sentinel other than `0` / `1` is `UnexpectedNull`, matching AOSP's
-    //!   `readData(Parcelable*)` `present != kNonNullParcelableFlag`.
+    //!   `Option<i32>`; only zero is null, matching AOSP Rust's default implementation.
 
     use super::*;
 
     /// A hostile String16 length is an `Err`, not a panic; see this module's doc.
     #[test]
     fn hostile_string16_length_returns_err_not_panic() {
-        for len in [-2, i32::MAX - 1, i32::MAX] {
+        for len in [-2, 0, 1, i32::MAX - 1, i32::MAX] {
             let mut p = Parcel::new();
             p.write::<i32>(&len).unwrap();
             p.set_data_position(0);
-            let r = <String as DeserializeOption>::deserialize_option(&mut p);
-            assert!(r.is_err(), "len {len} returned {r:?}");
+            assert_eq!(p.read::<Option<String>>(), Ok(None), "len {len}");
+            p.set_data_position(0);
+            assert_eq!(p.read::<String>(), Err(StatusCode::UnexpectedNull));
         }
+        let mut p = Parcel::new();
+        assert_eq!(p.read::<Option<String>>(), Ok(None));
+        assert_eq!(p.read::<String>(), Err(StatusCode::UnexpectedNull));
     }
 
     /// A normal string still round-trips byte-identically.
@@ -987,7 +984,7 @@ mod tests {
     }
 
     #[test]
-    fn string16_compare_reports_null_and_invalid_units_as_a_read_does() {
+    fn string16_compare_rejects_null_and_keeps_raw_units() {
         let mut p = Parcel::new();
         p.write(&-1i32).unwrap();
         p.set_data_position(0);
@@ -996,20 +993,46 @@ mod tests {
             Err(StatusCode::UnexpectedNull)
         );
 
-        // One unpaired high surrogate, then its NUL.
-        for expected in ["x", ""] {
+        // String conversion skips bad surrogates; interface tokens must still compare raw units.
+        for (len, units, expected, decoded) in [
+            (1, 0xD800u32, "x", ""),
+            (1, 0xD800, "", ""),
+            (1, 0xDC00, "", ""),
+            (2, 0x0041_D800, "A", "A"),
+        ] {
             let mut p = Parcel::new();
-            p.write(&1i32).unwrap();
-            p.write(&0xD800u16).unwrap();
-            p.write(&0u16).unwrap();
+            p.write(&len).unwrap();
+            p.write(&units).unwrap();
+            if len == 2 {
+                p.write(&0i32).unwrap();
+            }
+            p.write(&7i32).unwrap();
             p.set_data_position(0);
             assert_eq!(
                 read_string16_matches(&mut p, expected),
-                Err(StatusCode::BadValue)
+                Ok(Err(decoded.to_owned()))
             );
+            assert_eq!(p.read::<i32>(), Ok(7));
             p.set_data_position(0);
-            assert_eq!(p.read::<String>(), Err(StatusCode::BadValue));
+            assert_eq!(p.read::<String>(), Ok(decoded.to_owned()));
+            assert_eq!(p.read::<i32>(), Ok(7));
         }
+
+        let mut p = Parcel::new();
+        p.write(&1i32).unwrap();
+        p.write(&0x0042_0041u32).unwrap(); // 'A' followed by a non-NUL terminator.
+        p.write(&7i32).unwrap();
+        p.set_data_position(0);
+        assert_eq!(p.read::<Option<String>>(), Ok(None));
+        assert_eq!(p.read::<i32>(), Ok(7));
+        p.set_data_position(0);
+        assert_eq!(p.read::<String>(), Err(StatusCode::UnexpectedNull));
+        p.set_data_position(0);
+        assert_eq!(
+            read_string16_matches(&mut p, "A"),
+            Err(StatusCode::UnexpectedNull)
+        );
+        assert_eq!(p.read::<i32>(), Ok(7));
 
         for len in [-2, i32::MAX - 1, i32::MAX] {
             let mut p = Parcel::new();
@@ -1034,22 +1057,39 @@ mod tests {
         assert_eq!(p.read::<Option<Vec<String>>>(), Ok(None));
         assert_eq!(p.read::<Vec<String>>(), Ok(Vec::new()));
         assert_eq!(p.read::<Option<Vec<String>>>(), Ok(Some(Vec::new())));
-        assert_eq!(p.read::<Vec<String>>(), Err(StatusCode::UnexpectedNull));
+        assert_eq!(p.read::<Vec<String>>(), Err(StatusCode::BadValue));
+
+        let mut p = Parcel::new();
+        p.write(&1i32).unwrap();
+        p.set_data_position(0);
+        assert_eq!(p.read::<Vec<bool>>(), Err(StatusCode::NoMemory));
+        p.set_data_position(0);
+        p.write(&2i32).unwrap();
+        p.write(&1i32).unwrap();
+        p.set_data_position(0);
+        assert_eq!(p.read::<Vec<bool>>(), Err(StatusCode::NotEnoughData));
     }
 
-    /// Default `deserialize_option` takes only 0/1, as AOSP `present != kNonNullParcelableFlag`.
+    /// The default nullable codec treats every nonzero presence as present, as AOSP Rust does.
     #[test]
-    fn default_option_rejects_garbage_sentinel() {
-        let mut p = Parcel::new();
-        p.write(&NULL_PARCELABLE_FLAG).unwrap(); // 0 → None
-        p.write(&NON_NULL_PARCELABLE_FLAG).unwrap(); // 1 → present
-        p.write(&42i32).unwrap(); //     payload
-        p.write(&2i32).unwrap(); // garbage sentinel
-        p.set_data_position(0);
-
-        assert_eq!(p.read::<Option<i32>>(), Ok(None));
-        assert_eq!(p.read::<Option<i32>>(), Ok(Some(42)));
-        assert_eq!(p.read::<Option<i32>>(), Err(StatusCode::UnexpectedNull));
+    fn default_option_accepts_nonzero_presence() {
+        for presence in [0, 1, 2, -1, i32::MAX, i32::MIN] {
+            let mut p = Parcel::new();
+            p.write(&presence).unwrap();
+            if presence != 0 {
+                p.write(&42i32).unwrap();
+            }
+            p.write(&7i32).unwrap();
+            p.set_data_position(0);
+            let expected = if presence == 0 { None } else { Some(42) };
+            assert_eq!(p.read::<Option<i32>>(), Ok(expected));
+            assert_eq!(p.read::<i32>(), Ok(7));
+            p.set_data_position(0);
+            let mut value = Some(99);
+            p.read_onto(&mut value).unwrap();
+            assert_eq!(value, expected);
+            assert_eq!(p.read::<i32>(), Ok(7));
+        }
     }
 
     /// Structured parcelables treat only zero as null, as AOSP Rust does.
