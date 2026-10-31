@@ -21,18 +21,6 @@ pub struct ClientOptions {
     pub tls: Option<std::sync::Arc<crate::rpc::rustls::ClientConfig>>,
     #[cfg(feature = "rpc-tls")]
     pub tls_server_name: Option<String>,
-    /// RPC (android13plus profile): a non-empty id is refused with
-    /// [`StatusCode::BadValue`]. It would open a second client session
-    /// on a server session that another client session founded, with
-    /// its own oneway numbering, binder addresses and lifetime (AOSP has
-    /// no public entry for this either). Add a connection to a session
-    /// with `RpcSession::add_outgoing_connection` on that
-    /// session. Empty or `None` opens a new session.
-    #[deprecated(
-        since = "0.12.0",
-        note = "a non-empty id is refused with BadValue: open a new session, then add connections with `RpcSession::add_outgoing_connection` on it"
-    )]
-    pub session_id: Option<Vec<u8>>,
     /// RPC (android13plus profile, every RPC transport): number of
     /// outgoing connections to open (AOSP `setupClient` fan-out).
     pub outgoing_connections: Option<u32>,
@@ -107,18 +95,6 @@ pub struct ClientOptions {
     /// connecting, as `RpcSession::set_reply_timeout` refuses it (plan 17
     /// C-2).
     pub timeout: Option<Duration>,
-    /// RPC: deadline for the connection **handshake**, in place of
-    /// [`timeout`](Self::timeout) for that phase. The r34 wire (no
-    /// `?profile=`) has no handshake, so on a plain r34 endpoint other than
-    /// `tls://` `open` refuses it with
-    /// [`StatusCode::BadValue`], and it
-    /// refuses `Some(Duration::ZERO)` the same way.
-    #[cfg(feature = "rpc")]
-    #[deprecated(
-        since = "0.12.0",
-        note = "`timeout` bounds each connect and handshake step too; set it instead (plan 2-24 D6)"
-    )]
-    pub handshake_timeout: Option<Duration>,
     /// Kernel: `?driver=` equivalent. The device is fixed process-wide by
     /// whoever initializes `ProcessState` first, so a *different* path here
     /// is [`StatusCode::BadValue`] at
@@ -173,21 +149,15 @@ impl std::fmt::Debug for Client {
 }
 
 impl std::fmt::Debug for ClientOptions {
-    #[expect(
-        deprecated,
-        reason = "shows `session_id` and `handshake_timeout` while they are still read"
-    )]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut d = f.debug_struct("ClientOptions");
         #[cfg(feature = "rpc-tls")]
         d.field("tls", &self.tls.is_some())
             .field("tls_server_name", &self.tls_server_name);
-        d.field("session_id", &self.session_id.as_ref().map(|v| v.len()))
-            .field("outgoing_connections", &self.outgoing_connections)
+        d.field("outgoing_connections", &self.outgoing_connections)
             .field("incoming_connections", &self.incoming_connections);
         #[cfg(feature = "rpc")]
-        d.field("fd_mode", &self.fd_mode)
-            .field("handshake_timeout", &self.handshake_timeout);
+        d.field("fd_mode", &self.fd_mode);
         d.field("timeout", &self.timeout)
             .field("driver", &self.driver)
             .field("mmap_size", &self.mmap_size)
@@ -253,10 +223,6 @@ pub(crate) fn open_staged(
 }
 
 /// The kernel endpoint and every option check; RPC endpoints end here without the `rpc` feature.
-#[expect(
-    deprecated,
-    reason = "refuses `session_id` and `handshake_timeout` where they do not apply"
-)]
 fn kernel_open(uri: Uri, o: ClientOptions) -> Result<Client> {
     if uri.service.is_some() {
         log::error!("rsbinder::Client::open: a service name is not allowed here (use connect)");
@@ -271,18 +237,15 @@ fn kernel_open(uri: Uri, o: ClientOptions) -> Result<Client> {
     };
     match &uri.endpoint {
         Endpoint::Kernel(k) => {
-            if o.session_id.is_some()
-                || o.outgoing_connections.is_some()
+            if o.outgoing_connections.is_some()
                 || o.incoming_connections.is_some()
                 || o.timeout.is_some()
             {
-                return Err(reject(
-                    "session_id/outgoing_connections/incoming_connections/timeout",
-                ));
+                return Err(reject("outgoing_connections/incoming_connections/timeout"));
             }
             #[cfg(feature = "rpc")]
-            if o.fd_mode.is_some() || o.handshake_timeout.is_some() {
-                return Err(reject("fd_mode/handshake_timeout"));
+            if o.fd_mode.is_some() {
+                return Err(reject("fd_mode"));
             }
             #[cfg(feature = "rpc-tls")]
             if o.tls.is_some() || o.tls_server_name.is_some() {
@@ -310,10 +273,6 @@ fn kernel_open(uri: Uri, o: ClientOptions) -> Result<Client> {
 
 /// Every check an RPC open makes before any I/O, and the config it then connects with.
 #[cfg(feature = "rpc")]
-#[expect(
-    deprecated,
-    reason = "forwards `handshake_timeout` to the config's own deprecated setter"
-)]
 fn rpc_setup(uri: &Uri, o: &ClientOptions) -> Result<crate::rpc::RpcClientConfig> {
     if uri.service.is_some() {
         log::error!("rsbinder::Client::open: a service name is not allowed here (use connect)");
@@ -344,10 +303,6 @@ fn rpc_setup(uri: &Uri, o: &ClientOptions) -> Result<crate::rpc::RpcClientConfig
 
     // Refuse zero here, where the option can be named; its downstream consumers reject it too.
     crate::rpc::session::reject_zero_deadline(o.timeout, "ClientOptions::timeout")?;
-    crate::rpc::session::reject_zero_deadline(
-        o.handshake_timeout,
-        "ClientOptions::handshake_timeout",
-    )?;
     let versioned = match uri.wire {
         WireProfile::R34 => None,
         WireProfile::Android13Plus(v) => Some(v.get()),
@@ -356,22 +311,10 @@ fn rpc_setup(uri: &Uri, o: &ClientOptions) -> Result<crate::rpc::RpcClientConfig
     let incoming = o.incoming_connections.unwrap_or(0);
     // `is_some()`, not the value: a set option this endpoint lacks is `BadValue`, never ignored.
     let multi_conn = o.outgoing_connections.is_some() || o.incoming_connections.is_some();
-    if versioned.is_none() && (o.session_id.is_some() || multi_conn) {
+    if versioned.is_none() && multi_conn {
         log::error!(
-            "rsbinder::Client::open: session_id/outgoing_connections/incoming_connections \
-             need `WireProfile::Android13Plus` (`?profile=android13plus`) ({:?})",
-            uri.endpoint
-        );
-        return Err(StatusCode::BadValue);
-    }
-    // r34 has no handshake to bound (see `ClientOptions::handshake_timeout`); `tls://` does.
-    if versioned.is_none()
-        && o.handshake_timeout.is_some()
-        && !matches!(uri.endpoint, Endpoint::Tls { .. })
-    {
-        log::error!(
-            "rsbinder::Client::open: handshake_timeout needs `WireProfile::Android13Plus` \
-             (`?profile=android13plus`) or a TLS endpoint ({:?})",
+            "rsbinder::Client::open: outgoing_connections/incoming_connections need \
+             `WireProfile::Android13Plus` (`?profile=android13plus`) ({:?})",
             uri.endpoint
         );
         return Err(StatusCode::BadValue);
@@ -391,18 +334,6 @@ fn rpc_setup(uri: &Uri, o: &ClientOptions) -> Result<crate::rpc::RpcClientConfig
     }
     if let Some(t) = o.timeout {
         cfg = cfg.timeout(t);
-    }
-    if let Some(t) = o.handshake_timeout {
-        cfg = cfg.handshake_timeout(t);
-    }
-    // The session layer's own pre-connect refusal, made here so it counts as setup.
-    if o.session_id.as_deref().is_some_and(|id| !id.is_empty()) {
-        log::error!(
-            "rsbinder::Client::open: session_id would open a second client session on a server \
-             session another one founded; add the connection with \
-             `RpcSession::add_outgoing_connection` on that session instead"
-        );
-        return Err(StatusCode::BadValue);
     }
     Ok(cfg
         .outgoing_connections(fan_out)
@@ -628,7 +559,6 @@ mod tests {
     /// A refusal that does no I/O is `Setup`; a socket that is not there yet is `Connect`.
     #[cfg(feature = "rpc")]
     #[test]
-    #[allow(deprecated)] // Sets `session_id` to pin its refusal.
     fn open_reports_the_stage_that_failed() {
         use super::super::uri::WireVersion;
         let open = |uri: Uri, f: fn(&mut ClientOptions)| {
@@ -648,12 +578,10 @@ mod tests {
                 missing
                     .clone()
                     .with_wire(WireProfile::Android13Plus(WireVersion::MAX)),
-                |o| {
-                    o.session_id = Some(vec![1; 32]);
-                }
+                |o| o.timeout = Some(Duration::ZERO)
             ),
             Err((OpenStage::Setup, StatusCode::BadValue)),
-            "a session_id would open a second client session on one server session"
+            "a zero timeout is refused before connecting"
         );
         assert_eq!(
             open(missing, |_| {}),

@@ -182,10 +182,9 @@
 //!   session's deadline, forever if it has none, and the outer caller waits with it. A
 //!   multi-session relay sets a deadline on every session it transacts through.
 //! * A handshake is bounded when its caller gives it a deadline: an attach by the session's
-//!   `set_timeout`, a config connect by `RpcClientConfig::timeout`, the deprecated
-//!   `handshake_timeout` taking precedence in both; `from_preconnected_fd` arms a fixed 10 s, and
-//!   the transport-taking `connect_android13plus*` entries arm none. That deadline covers both
-//!   directions, as the server arms both for its half. It is cleared on drop: the reply guard
+//!   `set_timeout`, a config connect by `RpcClientConfig::timeout`; `from_preconnected_fd` arms a
+//!   fixed 10 s, and the transport-taking `connect_android13plus*` entries arm none. That
+//!   deadline covers both directions, as the server arms both for its half. It is cleared on drop: the reply guard
 //!   restores only a deadline it armed, and arms none when the session has neither a timeout
 //!   nor an idle value (every client session), so a leftover handshake deadline would bound every
 //!   later `recv` and send on the slot and break a client's callback serve loop outright.
@@ -627,132 +626,6 @@ impl std::fmt::Debug for RpcUnixAddr {
     }
 }
 
-/// Unix-domain android-13+ RPC client configuration.
-///
-/// Superseded by [`RpcClientConfig`], which takes the same knobs on every
-/// transport: [`RpcClientConfig::unix`] and
-/// `RpcClientConfig::unix_abstract` (Linux/Android) replace the two constructors here.
-#[deprecated(
-    since = "0.12.0",
-    note = "use `RpcClientConfig::unix`/`unix_abstract`, which carry the same knobs on every transport"
-)]
-pub struct RpcUnixClientConfig<'a> {
-    addr: RpcUnixAddr,
-    max_version: u32,
-    session_id: &'a [u8],
-    outgoing_connections: u32,
-    incoming_connections: u32,
-    fd_mode: Option<FileDescriptorTransportMode>,
-    timeout: Option<Duration>,
-    handshake_timeout: Option<Duration>,
-}
-
-#[expect(
-    deprecated,
-    reason = "implements the deprecated config while it is honored"
-)]
-impl<'a> RpcUnixClientConfig<'a> {
-    fn new(addr: RpcUnixAddr, max_version: u32) -> Self {
-        Self {
-            addr,
-            max_version,
-            session_id: &[],
-            outgoing_connections: 1,
-            incoming_connections: 0,
-            fd_mode: None,
-            timeout: None,
-            handshake_timeout: None,
-        }
-    }
-
-    /// See [`RpcClientConfig::unix`].
-    pub fn path(path: &'a Path, max_version: u32) -> Self {
-        Self::new(RpcUnixAddr::Path(path.to_path_buf()), max_version)
-    }
-
-    /// See [`RpcClientConfig::unix_abstract`].
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    pub fn abstract_name(name: &'a [u8], max_version: u32) -> Self {
-        Self::new(RpcUnixAddr::Abstract(name.to_vec()), max_version)
-    }
-
-    /// See [`RpcClientConfig::session_id`].
-    pub fn session_id(mut self, session_id: &'a [u8]) -> Self {
-        self.session_id = session_id;
-        self
-    }
-
-    /// See [`RpcClientConfig::outgoing_connections`].
-    pub fn outgoing_connections(mut self, n: u32) -> Self {
-        self.outgoing_connections = n;
-        self
-    }
-
-    /// See [`RpcClientConfig::incoming_connections`].
-    pub fn incoming_connections(mut self, n: u32) -> Self {
-        self.incoming_connections = n;
-        self
-    }
-
-    /// See [`RpcClientConfig::fd_mode`].
-    pub fn fd_mode(mut self, mode: FileDescriptorTransportMode) -> Self {
-        self.fd_mode = Some(mode);
-        self
-    }
-
-    /// See [`RpcClientConfig::timeout`].
-    pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = Some(timeout);
-        self
-    }
-
-    /// See [`RpcClientConfig::handshake_timeout`].
-    pub fn handshake_timeout(mut self, timeout: Duration) -> Self {
-        self.handshake_timeout = Some(timeout);
-        self
-    }
-
-    fn into_generic(self) -> RpcClientConfig {
-        RpcClientConfig {
-            source: ClientSource::Unix(self.addr),
-            max_version: self.max_version,
-            session_id: self.session_id.to_vec(),
-            outgoing_connections: self.outgoing_connections,
-            incoming_connections: self.incoming_connections,
-            fd_mode: self.fd_mode,
-            timeout: self.timeout,
-            handshake_timeout: self.handshake_timeout,
-        }
-    }
-
-    /// For the deprecated attach calls, which ignore `timeout` instead of refusing it.
-    fn into_attach(self) -> RpcClientConfig {
-        RpcClientConfig {
-            timeout: None,
-            ..self.into_generic()
-        }
-    }
-}
-
-#[expect(
-    deprecated,
-    reason = "implements the deprecated config while it is honored"
-)]
-impl std::fmt::Debug for RpcUnixClientConfig<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RpcUnixClientConfig")
-            .field("addr", &self.addr)
-            .field("max_version", &self.max_version)
-            .field("session_id_len", &self.session_id.len())
-            .field("outgoing_connections", &self.outgoing_connections)
-            .field("incoming_connections", &self.incoming_connections)
-            .field("fd_mode", &self.fd_mode)
-            .field("timeout", &self.timeout)
-            .field("handshake_timeout", &self.handshake_timeout)
-            .finish()
-    }
-}
-
 fn unix_connect(addr: &RpcUnixAddr) -> Result<Box<dyn RpcTransport>> {
     let t = match addr {
         RpcUnixAddr::Path(path) => super::transport::UnixTransport::connect(path),
@@ -1024,7 +897,6 @@ pub struct RpcClientConfig {
     incoming_connections: u32,
     fd_mode: Option<FileDescriptorTransportMode>,
     timeout: Option<Duration>,
-    handshake_timeout: Option<Duration>,
 }
 
 impl RpcClientConfig {
@@ -1037,7 +909,6 @@ impl RpcClientConfig {
             incoming_connections: 0,
             fd_mode: None,
             timeout: None,
-            handshake_timeout: None,
         }
     }
 
@@ -1117,8 +988,7 @@ impl RpcClientConfig {
     /// `connect(2)` and the TLS handshake.
     ///
     /// `connect` must be [`Send`]: the config can be built on one thread
-    /// and consumed on another, which is what the `RpcUnixClientConfig`
-    /// it replaces allowed. A closure capturing an [`Rc`](std::rc::Rc) or
+    /// and consumed on another. A closure capturing an [`Rc`](std::rc::Rc) or
     /// another `!Send` handle does not compile here.
     ///
     /// `connect` must be `'static`: the session keeps it, so that
@@ -1162,9 +1032,13 @@ impl RpcClientConfig {
     /// non-empty id with [`StatusCode::BadValue`]: it builds a new
     /// `RpcSession`, which would then share one server session with the
     /// `RpcSession` that founded it while keeping its own oneway
-    /// numbering, binder addresses and lifetime (see
-    /// [`connect_android13plus_fd_with_id`](RpcSession::connect_android13plus_fd_with_id)).
-    /// AOSP has no public entry that does this.
+    /// numbering, binder addresses and lifetime. The server would drop one
+    /// side's oneway calls as stale, could dispatch a call meant for one
+    /// side's binder to the other side's binder at the same address, and
+    /// would end the shared session when either side's connection closes.
+    /// AOSP has no public entry that does this: `RpcSession::setupClient`
+    /// is private, and the follow-up connections that echo the id are
+    /// opened by the same `RpcSession`.
     #[deprecated(
         since = "0.13.0",
         note = "only the deprecated manual attach reads it: `RpcSession::add_outgoing_connection`/`add_incoming_connection` echo the session's own id"
@@ -1280,37 +1154,15 @@ impl RpcClientConfig {
         self
     }
 
-    /// Deadline for each **connection handshake** this config performs,
-    /// in place of [`timeout`](Self::timeout) for that phase.
-    ///
-    /// `Duration::ZERO` is not a deadline: the setup call this config is
-    /// passed to refuses it with [`StatusCode::BadValue`] rather than
-    /// silently dropping the bound the caller asked for.
-    #[deprecated(
-        since = "0.12.0",
-        note = "`timeout` bounds each handshake step too; set it instead (plan 2-24 D6)"
-    )]
-    pub fn handshake_timeout(mut self, timeout: Duration) -> Self {
-        self.handshake_timeout = Some(timeout);
-        self
-    }
-
-    /// The handshake bound: a deprecated `handshake_timeout` if set, else `timeout`.
-    fn handshake_deadline(&self) -> Option<Duration> {
-        self.handshake_timeout.or(self.timeout)
-    }
-
-    /// `BadValue` for a zero `timeout` or `handshake_timeout`; `what` names the latter's setter.
-    fn reject_zero_deadlines(&self, what: &str) -> Result<()> {
-        reject_zero_deadline(self.timeout, "RpcClientConfig::timeout")?;
-        reject_zero_deadline(self.handshake_timeout, what)
+    /// `BadValue` for a zero `timeout`.
+    fn reject_zero_timeout(&self) -> Result<()> {
+        reject_zero_deadline(self.timeout, "RpcClientConfig::timeout")
     }
 
     /// One connection, for a caller that drives the wire itself (the entry layer's r34 path).
     pub(crate) fn connect_once(self) -> Result<Box<dyn RpcTransport>> {
-        self.reject_zero_deadlines("RpcClientConfig::handshake_timeout")?;
-        let deadline = self.handshake_deadline();
-        (self.source.into_connector(deadline))()
+        self.reject_zero_timeout()?;
+        (self.source.into_connector(self.timeout))()
     }
 }
 
@@ -1324,7 +1176,6 @@ impl std::fmt::Debug for RpcClientConfig {
             .field("incoming_connections", &self.incoming_connections)
             .field("fd_mode", &self.fd_mode)
             .field("timeout", &self.timeout)
-            .field("handshake_timeout", &self.handshake_timeout)
             .finish()
     }
 }
@@ -1715,7 +1566,7 @@ fn refuse_id_on_new_session(session_id: &[u8], what: &str) -> Result<()> {
     log::error!(
         "{what}: a session id would build a second client RpcSession on a server session \
          another RpcSession founded, with its own oneway numbering, binder addresses and \
-         lifetime; add the connection with `add_outgoing_connection_with_config` on that \
+         lifetime; add the connection with `add_outgoing_connection()` on that \
          RpcSession instead"
     );
     Err(StatusCode::BadValue)
@@ -1740,8 +1591,8 @@ fn client_handshake_err(e: RpcError) -> StatusCode {
         RpcError::Timeout | RpcError::DeadlineMidFrame => log::error!(
             "rsbinder RPC: the android-13+ handshake did not complete within a deadline \
                  armed on this connection — that deadline is the caller's own (the \
-                 whole-step bound of `RpcClientConfig::timeout` / `ClientOptions::timeout` \
-                 or their deprecated `handshake_timeout`, the 10s whole-handshake bound \
+                 whole-step bound of `RpcClientConfig::timeout` / `ClientOptions::timeout`, \
+                 the 10s whole-handshake bound \
                  `RpcSession::from_preconnected_fd` arms, or a read deadline set on the \
                  transport directly), so it may simply be shorter than this peer's \
                  legitimate response time, a peer answering a byte at a time included. A \
@@ -4679,35 +4530,6 @@ impl RpcSession {
         Self::connect_android13plus_fd_hs(transport, max_version, fd_mode, None)
     }
 
-    /// [`connect_android13plus_fd`](Self::connect_android13plus_fd) for an
-    /// empty `session_id`; any other id is [`StatusCode::BadValue`].
-    ///
-    /// A non-empty id would build a second client `RpcSession` on a
-    /// server session that another `RpcSession` founded. The two keep
-    /// separate oneway numbering, binder addresses and lifetimes against
-    /// one server-side session: the server drops one side's oneway calls
-    /// as stale, can dispatch a call meant for one side's binder to the
-    /// other side's binder at the same address, and ends the shared
-    /// session when either side's connection closes. AOSP has no public
-    /// entry for this either: `RpcSession::setupClient` is private, and
-    /// the follow-up connections that echo the id are opened by the same
-    /// `RpcSession`. Add a connection to a session with
-    /// [`add_outgoing_connection`](Self::add_outgoing_connection)
-    /// on that session.
-    #[deprecated(
-        since = "0.12.0",
-        note = "a non-empty id is refused with BadValue: use `connect_android13plus_fd` for a new session, then `add_outgoing_connection_with_config` with `RpcClientConfig::session_id` on that session to add a connection"
-    )]
-    pub fn connect_android13plus_fd_with_id(
-        transport: Box<dyn RpcTransport>,
-        max_version: u32,
-        fd_mode: FileDescriptorTransportMode,
-        session_id: &[u8],
-    ) -> Result<RpcSession> {
-        refuse_id_on_new_session(session_id, "RpcSession::connect_android13plus_fd_with_id")?;
-        Self::connect_android13plus_fd_hs(transport, max_version, fd_mode, None)
-    }
-
     /// `connect_android13plus_fd` with a whole-handshake deadline (`HandshakeDeadline`).
     pub(crate) fn connect_android13plus_fd_hs(
         transport: Box<dyn RpcTransport>,
@@ -5586,64 +5408,12 @@ impl RpcSession {
         RpcSession::connect_android13plus(Box::new(t), max_version)
     }
 
-    /// Client: connect to a Unix-domain android-13+ RPC server. An
-    /// **empty** `session_id` is byte-identical to
-    /// `setup_unix_client_android13plus`; any other id is
-    /// [`StatusCode::BadValue`], for the reason
-    /// [`connect_android13plus_fd_with_id`](Self::connect_android13plus_fd_with_id)
-    /// gives. To add a connection to a session, call
-    /// [`add_outgoing_connection`](Self::add_outgoing_connection)
-    /// on that session.
-    #[deprecated(
-        since = "0.12.0",
-        note = "a non-empty id is refused with BadValue: use `setup_client_android13plus_with_config(RpcClientConfig::unix(path, v))` for a new session, then `add_outgoing_connection_with_config(RpcClientConfig::unix(path, v).session_id(id))` on that session to add a connection"
-    )]
-    pub fn setup_unix_client_android13plus_with_id(
-        path: impl AsRef<std::path::Path>,
-        max_version: u32,
-        session_id: &[u8],
-    ) -> Result<RpcSession> {
-        let mut config = RpcClientConfig::unix(path, max_version);
-        config.session_id = session_id.to_vec();
-        Self::setup_client_android13plus_with_config(config)
-    }
-
-    /// Client: connect to a Unix-domain android-13+ server using a config object.
-    #[deprecated(
-        since = "0.12.0",
-        note = "use `setup_client_android13plus_with_config` with `RpcClientConfig::unix`/`unix_abstract`"
-    )]
-    #[expect(deprecated, reason = "takes the deprecated `RpcUnixClientConfig`")]
-    pub fn setup_unix_client_android13plus_with_config(
-        config: RpcUnixClientConfig,
-    ) -> Result<RpcSession> {
-        Self::setup_client_android13plus(
-            config.into_generic(),
-            "RpcSession::setup_unix_client_android13plus_with_config",
-            "RpcUnixClientConfig::handshake_timeout",
-        )
-    }
-
     /// Client: connect to an android-13+ server over any transport — the
     /// founding connection, the outgoing fan-out and the incoming
     /// (callback) connections each come from one call to the config's
     /// `connect`. See [`RpcClientConfig`].
     pub fn setup_client_android13plus_with_config(config: RpcClientConfig) -> Result<RpcSession> {
-        Self::setup_client_android13plus(
-            config,
-            "RpcSession::setup_client_android13plus_with_config",
-            "RpcClientConfig::handshake_timeout",
-        )
-    }
-
-    /// `entry` names the public call for logs; `what` the caller's own handshake-timeout setter.
-    fn setup_client_android13plus(
-        config: RpcClientConfig,
-        entry: &str,
-        what: &str,
-    ) -> Result<RpcSession> {
-        config.reject_zero_deadlines(what)?;
-        let handshake_deadline = config.handshake_deadline();
+        config.reject_zero_timeout()?;
         let RpcClientConfig {
             source,
             max_version,
@@ -5652,11 +5422,14 @@ impl RpcSession {
             incoming_connections: incoming,
             fd_mode: requested_fd_mode,
             timeout,
-            handshake_timeout: _,
         } = config;
-        let handshake_timeout = handshake_deadline;
+        // `timeout` bounds every connecting step as well as the session's reply waits.
+        let handshake_timeout = timeout;
         let local = outgoing_connections.max(1);
-        refuse_id_on_new_session(&requested_id, entry)?;
+        refuse_id_on_new_session(
+            &requested_id,
+            "RpcSession::setup_client_android13plus_with_config",
+        )?;
 
         let mut connect = source.into_connector(handshake_timeout);
         let founding = connect()?;
@@ -5826,70 +5599,6 @@ impl RpcSession {
         )
     }
 
-    /// Client multi-outgoing: open one *additional*
-    /// outgoing connection to the same android-13+ server session and
-    /// add it as a new slot in this `RpcSession`'s pool (AOSP
-    /// `RpcSession::setupClient` opens N outgoing; `findConnection`
-    /// distributes outgoing calls across them). Returns the
-    /// new slot id. `session_id` MUST be this session's server-minted
-    /// id (`get_session_id()` on the founding connection), any other id
-    /// is [`StatusCode::BadValue`] before connecting — the server
-    /// id-demuxes the echo onto the same `SharedSession`, so
-    /// state/root/proxies are shared with the founding connection.
-    /// Profile uniformity is enforced: the additional connection's
-    /// negotiated wire version must equal this session's, so
-    /// `max_version` must be **at least**
-    /// [`wire_protocol_version()`](Self::wire_protocol_version) —
-    /// passing less can never attach ([`StatusCode::BadType`]), because
-    /// an attach gets no version negotiation of its own (the founding
-    /// connection already pinned it).
-    ///
-    /// The server's admission is confirmed before the new slot joins
-    /// the pool (one `GET_SESSION_ID` round trip on the fresh
-    /// connection, see `confirm_attach`): a refused attach — `session_id`
-    /// unknown or stale, the server's `set_max_threads` outgoing-slot
-    /// cap spent, server shutting down — is an error **here**, never a
-    /// dead slot that fails some unrelated call later. Stay within
-    /// [`negotiate()`](Self::negotiate) connections to avoid the cap.
-    /// A failure ends the session unless the header never went out, a
-    /// refusal included, as in
-    /// [`add_outgoing_connection_with_config`](Self::add_outgoing_connection_with_config).
-    ///
-    /// The default single-connection sessions never call this ⇒ the
-    /// pool stays at one slot ⇒ `find_conn` always selects that slot.
-    #[deprecated(
-        since = "0.12.0",
-        note = "use `add_outgoing_connection()` on a session set up from an `RpcClientConfig`"
-    )]
-    pub fn add_outgoing_connection_android13plus(
-        &self,
-        path: impl AsRef<std::path::Path>,
-        max_version: u32,
-        session_id: &[u8],
-    ) -> Result<u64> {
-        let mut config = RpcClientConfig::unix(path, max_version);
-        config.session_id = session_id.to_vec();
-        self.add_outgoing_connection_named(config, "RpcClientConfig::handshake_timeout")
-    }
-
-    /// Client multi-outgoing using a [`RpcUnixClientConfig`], held to the
-    /// [manual attach](RpcClientConfig#manual-attach) rule except that a
-    /// session `timeout` is ignored rather than refused.
-    #[deprecated(
-        since = "0.12.0",
-        note = "use `add_outgoing_connection_with_config` with a `RpcClientConfig`"
-    )]
-    #[expect(deprecated, reason = "takes the deprecated `RpcUnixClientConfig`")]
-    pub fn add_outgoing_connection_android13plus_with_config(
-        &self,
-        config: RpcUnixClientConfig,
-    ) -> Result<u64> {
-        self.add_outgoing_connection_named(
-            config.into_attach(),
-            "RpcUnixClientConfig::handshake_timeout",
-        )
-    }
-
     /// Client multi-outgoing using a [`RpcClientConfig`], which is held
     /// to the [manual attach](RpcClientConfig#manual-attach) rule.
     ///
@@ -5923,18 +5632,13 @@ impl RpcSession {
         note = "use `add_outgoing_connection()`, which reuses the founding config's connector and echoes the session's own id, version and fd mode"
     )]
     pub fn add_outgoing_connection_with_config(&self, config: RpcClientConfig) -> Result<u64> {
-        self.add_outgoing_connection_named(config, "RpcClientConfig::handshake_timeout")
-    }
-
-    /// `what` names the caller's own setter, which a deprecated wrapper's caller may lack.
-    fn add_outgoing_connection_named(&self, config: RpcClientConfig, what: &str) -> Result<u64> {
         let AttachParts {
             mut connect,
             max_version,
             session_id,
             fd_mode,
             handshake_timeout,
-        } = self.attach_parts(config, what)?;
+        } = self.attach_parts(config)?;
         self.add_outgoing_connection_android13plus_transport(
             &mut connect,
             max_version,
@@ -5945,8 +5649,7 @@ impl RpcSession {
     }
 
     /// The connection and knobs of a manual attach, refusing what an attach cannot express.
-    fn attach_parts(&self, config: RpcClientConfig, what: &str) -> Result<AttachParts> {
-        reject_zero_deadline(config.handshake_timeout, what)?;
+    fn attach_parts(&self, config: RpcClientConfig) -> Result<AttachParts> {
         if config.outgoing_connections.max(1) != 1
             || config.incoming_connections != 0
             || config.session_id.len() != 32
@@ -5960,8 +5663,7 @@ impl RpcSession {
             return Err(StatusCode::BadValue);
         }
         // `timeout` is refused above: the session's own bounds the attach's handshake.
-        let session_timeout = *self.inner.shared.timeout.lock().expect("timeout poisoned");
-        let handshake_timeout = config.handshake_timeout.or(session_timeout);
+        let handshake_timeout = *self.inner.shared.timeout.lock().expect("timeout poisoned");
         Ok(AttachParts {
             connect: config.source.into_connector(handshake_timeout),
             max_version: config.max_version,
@@ -6070,38 +5772,6 @@ impl RpcSession {
         status
     }
 
-    /// Open one *additional* **incoming (callback) connection** to the
-    /// android-13+ server session this client founded and serve it on a
-    /// thread owned by this session — the manual, one-at-a-time form of
-    /// [`RpcUnixClientConfig::incoming_connections`] (AOSP
-    /// `RpcSession::addIncomingConnection`). `config` is held to the
-    /// [manual attach](RpcClientConfig#manual-attach) rule, except that a
-    /// session `timeout` is ignored rather than refused; the server adds
-    /// the connection as a slot it sends on. Returns the new slot id.
-    ///
-    /// Profile uniformity is enforced as for the outgoing attach
-    /// (R34 ⇒ `BadType`; a `max_version` below the session's ⇒
-    /// `BadType`, refused before connecting). The server refusing the attach
-    /// (its callback-slot budget, `2 * set_max_threads`, is spent)
-    /// surfaces as a handshake error. A failure ends the session unless
-    /// the header never went out or the connection closed before any
-    /// `"cci"` byte, as in
-    /// [`add_incoming_connection_with_config`](Self::add_incoming_connection_with_config).
-    #[deprecated(
-        since = "0.12.0",
-        note = "use `add_incoming_connection_with_config` with a `RpcClientConfig`"
-    )]
-    #[expect(deprecated, reason = "takes the deprecated `RpcUnixClientConfig`")]
-    pub fn add_incoming_connection_android13plus_with_config(
-        &self,
-        config: RpcUnixClientConfig,
-    ) -> Result<u64> {
-        self.add_incoming_connection_named(
-            config.into_attach(),
-            "RpcUnixClientConfig::handshake_timeout",
-        )
-    }
-
     /// Open one *additional* incoming (callback) connection using a
     /// [`RpcClientConfig`] — on any transport, not only a Unix socket.
     /// The config is held to the
@@ -6135,18 +5805,13 @@ impl RpcSession {
         note = "use `add_incoming_connection()`, which reuses the founding config's connector and echoes the session's own id, version and fd mode"
     )]
     pub fn add_incoming_connection_with_config(&self, config: RpcClientConfig) -> Result<u64> {
-        self.add_incoming_connection_named(config, "RpcClientConfig::handshake_timeout")
-    }
-
-    /// `what` names the caller's own setter, which a deprecated wrapper's caller may lack.
-    fn add_incoming_connection_named(&self, config: RpcClientConfig, what: &str) -> Result<u64> {
         let AttachParts {
             mut connect,
             max_version,
             session_id,
             fd_mode,
             handshake_timeout,
-        } = self.attach_parts(config, what)?;
+        } = self.attach_parts(config)?;
         self.add_incoming_connection_android13plus_transport(
             &mut connect,
             max_version,
@@ -6301,60 +5966,6 @@ impl RpcSession {
         );
         self.inner.fail_session();
         StatusCode::from(e)
-    }
-
-    /// Automatic outgoing-pool fan-out.
-    /// AOSP `RpcSession::setupClient` automation for the path-based
-    /// UDS client (one helper instead of three explicit steps).
-    ///
-    /// Establishes the founding connection (a brand-new session, empty
-    /// session id), runs `GET_MAX_THREADS` and `GET_SESSION_ID` against
-    /// the server, then mints additional outgoing connections to the
-    /// same `path` echoing the server-minted session id, up to
-    /// `N = min(remote_max_threads, local_max_outgoing) - 1` extras.
-    /// The returned `RpcSession` then has a pool of `N` connections,
-    /// matching the size AOSP's
-    /// [`RpcSession::setupClient`](https://cs.android.com/android/platform/superproject/main/+/main:frameworks/native/libs/binder/RpcSession.cpp;l=483)
-    /// would build for the same `mMaxOutgoingConnections`.
-    ///
-    /// **`local_max_outgoing <= 1`** is the *single-connection* path:
-    /// no `GET_MAX_THREADS` exchange, no fan-out, returned session is
-    /// byte-identical to
-    /// [`setup_unix_client_android13plus`](RpcSession::setup_unix_client_android13plus).
-    /// A `0` is treated as `1` — a session must have at least the
-    /// founding connection to be useful (AOSP rejects 0 as a misuse).
-    ///
-    /// **Profile uniformity**: every fan-out connection offers the
-    /// founding call's `max_version`, which the session's negotiated
-    /// version never exceeds, so a fan-out attach never fails the version
-    /// check of
-    /// [`add_outgoing_connection_android13plus`](RpcSession::add_outgoing_connection_android13plus).
-    /// A failed extra ends and closes the partially-built session (AOSP
-    /// `scope_guard` cleanup); the caller never gets a handle.
-    ///
-    /// **No retry / no progressive degradation**: a fan-out connect
-    /// failure (e.g. the server's `set_max_threads` is tighter than
-    /// `local_max_outgoing - 1` would imply, so the attach is refused
-    /// past the cap) surfaces as `Err`. A
-    /// [`setup_unix_client_android13plus`](RpcSession::setup_unix_client_android13plus) +
-    /// manual `add_outgoing_connection_android13plus` loop is no softer:
-    /// a failed extra ends the session once its header went out, a
-    /// refusal at the server's cap included (see
-    /// [`add_outgoing_connection`](RpcSession::add_outgoing_connection)),
-    /// so bound the loop by [`negotiate()`](RpcSession::negotiate).
-    #[deprecated(
-        since = "0.12.0",
-        note = "use `setup_client_android13plus_with_config(RpcClientConfig::unix(path, v).outgoing_connections(n))`"
-    )]
-    pub fn setup_unix_client_android13plus_fan_out(
-        path: impl AsRef<std::path::Path>,
-        max_version: u32,
-        local_max_outgoing: u32,
-    ) -> Result<RpcSession> {
-        Self::setup_client_android13plus_with_config(
-            RpcClientConfig::unix(path.as_ref(), max_version)
-                .outgoing_connections(local_max_outgoing),
-        )
     }
 
     /// Client: connect to a Unix-domain android-13+ RPC server **with
@@ -6908,14 +6519,13 @@ mod tests {
         );
     }
 
-    /// The config entries report a zero handshake timeout as `BadValue`, before any connect.
+    /// The config entry reports a zero `timeout` as `BadValue`, before any connect.
     #[test]
-    #[allow(deprecated)] // The deprecated setter is still honored, so its zero is still refused.
-    fn zero_handshake_timeout_is_bad_value_at_the_config_entries() {
-        let path = std::path::Path::new("/nonexistent/rsb-zero-handshake.sock");
+    fn zero_timeout_is_bad_value_at_the_config_entry() {
+        let path = std::path::Path::new("/nonexistent/rsb-zero-timeout.sock");
         assert_eq!(
             RpcSession::setup_client_android13plus_with_config(
-                RpcClientConfig::unix(path, 2).handshake_timeout(Duration::ZERO),
+                RpcClientConfig::unix(path, 2).timeout(Duration::ZERO),
             )
             .err(),
             Some(StatusCode::BadValue),

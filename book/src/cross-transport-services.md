@@ -169,11 +169,9 @@ let hello: Strong<dyn IHello> = rsbinder::Client::open_with(Endpoint::tls("host"
 `ServeOptions`: `threads`, `mmap_size`, `max_connections`,
 `handshake_timeout`, `idle_timeout`, `reply_timeout`, `authorizer`, `tls`,
 `fd_modes`, `call_restriction`.
-`ClientOptions`: `tls` / `tls_server_name`, `session_id` (deprecated: a
-non-empty id is refused),
-`outgoing_connections`, `incoming_connections`, `fd_mode`, `timeout`,
-`handshake_timeout` (deprecated: `timeout` bounds connecting), `driver`,
-`mmap_size`. What each timeout bounds, and what its expiry ends, is in
+`ClientOptions`: `tls` / `tls_server_name`, `outgoing_connections`,
+`incoming_connections`, `fd_mode`, `timeout` (it also bounds connecting),
+`driver`, `mmap_size`. What each timeout bounds, and what its expiry ends, is in
 [Timeouts](./rpc-transport.md#timeouts).
 
 ### Receive mapping size

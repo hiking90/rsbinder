@@ -590,7 +590,6 @@ pub rsbinder::entry::ClientOptions::driver: core::option::Option<std::path::Path
 pub rsbinder::entry::ClientOptions::incoming_connections: core::option::Option<u32>
 pub rsbinder::entry::ClientOptions::mmap_size: core::option::Option<usize>
 pub rsbinder::entry::ClientOptions::outgoing_connections: core::option::Option<u32>
-pub rsbinder::entry::ClientOptions::session_id: core::option::Option<alloc::vec::Vec<u8>>
 pub rsbinder::entry::ClientOptions::timeout: core::option::Option<core::time::Duration>
 impl core::default::Default for rsbinder::ClientOptions
 pub fn rsbinder::ClientOptions::default() -> rsbinder::ClientOptions
@@ -3740,7 +3739,6 @@ pub rsbinder::ClientOptions::driver: core::option::Option<std::path::PathBuf>
 pub rsbinder::ClientOptions::incoming_connections: core::option::Option<u32>
 pub rsbinder::ClientOptions::mmap_size: core::option::Option<usize>
 pub rsbinder::ClientOptions::outgoing_connections: core::option::Option<u32>
-pub rsbinder::ClientOptions::session_id: core::option::Option<alloc::vec::Vec<u8>>
 pub rsbinder::ClientOptions::timeout: core::option::Option<core::time::Duration>
 impl core::default::Default for rsbinder::ClientOptions
 pub fn rsbinder::ClientOptions::default() -> rsbinder::ClientOptions
@@ -3832,7 +3830,6 @@ pub fn rsbinder::Parcel::data_position(&self) -> usize
 pub fn rsbinder::Parcel::data_size(&self) -> usize
 pub unsafe fn rsbinder::Parcel::from_ipc_parts(*mut u8, usize, *mut std::os::raw::c_ulonglong, usize, fn(core::option::Option<&rsbinder::Parcel>, std::os::raw::c_ulonglong, usize, std::os::raw::c_ulonglong, usize) -> rsbinder::Result<()>) -> Self
 pub fn rsbinder::Parcel::has_more_data(&self) -> bool
-pub fn rsbinder::Parcel::is_for_rpc(&self) -> bool
 pub fn rsbinder::Parcel::is_kernel_backed(&self) -> bool
 pub fn rsbinder::Parcel::new() -> Self
 pub fn rsbinder::Parcel::read<D: rsbinder::Deserialize>(&mut self) -> rsbinder::Result<D>

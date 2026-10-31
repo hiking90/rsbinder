@@ -330,9 +330,12 @@ let session = RpcSession::setup_client_android13plus_with_config(
 )?;
 ```
 
-The Unix-only predecessor `RpcUnixClientConfig`, and the
-`setup_unix_client_android13plus_{with_config,with_id,fan_out}` helpers,
-are deprecated since 0.12.0 and will be removed in the release after it.
+`RpcClientConfig` is the one config for every android-13+ client setup
+that goes beyond a single connection: a fan-out is
+`.outgoing_connections(n)`, and the session's further connections come
+from the session itself, as described next. The single-connection calls
+(`setup_unix_client_android13plus`, `_abstract`, `_fd`,
+`setup_tcp_client_tls_android13plus`) take no config.
 
 The builder owns what it connects with, and the session it founds keeps
 its connector: `RpcSession::add_outgoing_connection()` and
@@ -346,12 +349,9 @@ calls return `InvalidOperation` on it. So a connect function given to
 
 The deprecated manual attach calls, `add_outgoing_connection_with_config`
 and `add_incoming_connection_with_config`, take a config of their own
-whose deprecated `session_id` knob names the session. Every entry that
-builds a new `RpcSession` —
-`setup_client_android13plus_with_config`, the deprecated
-`setup_unix_client_android13plus_with_id` and
-`connect_android13plus_fd_with_id`, and the entry API's deprecated
-`ClientOptions::session_id` — refuses a non-empty id with `BadValue`. A
+whose deprecated `session_id` knob names the session.
+`setup_client_android13plus_with_config`, which builds a new
+`RpcSession`, refuses a config with a non-empty id with `BadValue`. A
 second client `RpcSession` on one server session would keep its own oneway
 numbering, binder addresses and lifetime: the server would drop one side's
 oneway calls as out of order, could dispatch a call meant for one side's
@@ -812,10 +812,12 @@ TCP or TLS peers and caps them; one that picks its peers with
 counts as idle, including a client that only waits for callbacks, is
 stated once, in `set_idle_timeout`.
 
-`RpcClientConfig::handshake_timeout` and
-`ClientOptions::handshake_timeout` are deprecated: the client timeout
-bounds connecting. A value still set there takes precedence for the
-handshake.
+**A client has one deadline.** `RpcClientConfig::timeout` and
+`ClientOptions::timeout` bound each connect and handshake step as well
+as the session's reply waits; there is no separate handshake setting on
+the client side. A caller that wants a bounded connect but unbounded
+reply waits calls `set_reply_timeout(None)` on the session once it is
+set up.
 
 ## Bridging RPC and the service manager: the Accessor pattern
 

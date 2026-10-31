@@ -17,7 +17,6 @@
 ))]
 
 use std::sync::Arc;
-use std::thread;
 
 use rsbinder::blob::BLOB_INPLACE_LIMIT;
 use rsbinder::rpc::{
@@ -109,7 +108,7 @@ impl Bound {
             if self.path.exists() {
                 break;
             }
-            thread::sleep(std::time::Duration::from_millis(5));
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
         bg
     }
