@@ -238,7 +238,12 @@ one can resolve it:
 The workspace requires `rsbinder-aidl` with `=` (generated code calls
 hidden items of the `rsbinder` it was generated for), so a version bump
 changes that requirement in the root `Cargo.toml` together with
-`workspace.package.version`.
+`workspace.package.version`. `version_update X.Y.Z` (after `source
+envsetup.sh`) does both, and every other `rsbinder*` requirement, then
+rewrites `Cargo.lock` and the lockfiles of `bench/ipc-compare` and `fuzz`,
+which record the versions they reach by path;
+`scripts/excluded_lockfiles.sh --check` (CI, `local_gate.sh hermetic`)
+fails when those two are left behind.
 
 `source envsetup.sh` and then `publish_dry_run` / `publish` run
 `cargo publish` in this order (`publish_dirs` there); a crate added to the
