@@ -198,6 +198,7 @@ semver() {
 tier_hermetic() {
     section "hermetic — .github/workflows/build.yml"
     run "fmt" cargo fmt --all -- --check
+    run "excluded crates' lockfiles" scripts/excluded_lockfiles.sh --check
     run "clippy (workspace, all features)" cargo clippy --all-targets --all-features -- -D warnings
     run "clippy (rsbinder, no default features)" cargo clippy -p rsbinder --lib --no-default-features
     run "clippy (rsbinder-topic, no default features)" cargo clippy -p rsbinder-topic --all-targets --no-default-features -- -D warnings
