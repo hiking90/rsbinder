@@ -9,6 +9,8 @@
     target_has_atomic = "64"
 ))]
 
+mod common;
+
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -49,8 +51,7 @@ impl Counters {
     }
 
     fn counter(&self, index: usize) -> &AtomicU64 {
-        // SAFETY: offsets 0 and 8 of the default layout, inside the mapping.
-        unsafe { self.0.as_ptr().add(8 * index).cast::<AtomicU64>().as_ref() }
+        common::counter(&self.0, index)
     }
 
     fn set(&self, read: u64, write: u64) {

@@ -220,7 +220,6 @@ fn wake_crosses_the_process_boundary() {
 #[test]
 fn a_read_only_word_waits_and_wakes_across_processes() {
     use rsbinder_fmq::shm::{self, Access, CreateOptions, Deadline, Mapping, RoWord32, Seals};
-    use std::ptr::NonNull;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     const BITS: std::num::NonZeroU32 = match std::num::NonZeroU32::new(0x4) {
@@ -230,8 +229,9 @@ fn a_read_only_word_waits_and_wakes_across_processes() {
     let limit = Duration::from_secs(10);
     let page = rustix::param::page_size() as u64;
     let word_at = |mapping: &Mapping, index: usize| {
-        // SAFETY: a 4-aligned word inside the page the mapping covers.
-        unsafe { NonNull::new_unchecked(mapping.as_ptr().as_ptr().add(4 * index)) }
+        mapping
+            .as_ptr()
+            .map_addr(|addr| addr.saturating_add(4 * index))
     };
 
     if is_child() {

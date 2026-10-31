@@ -20,6 +20,8 @@
     )
 ))]
 
+mod common;
+
 use std::os::fd::AsFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -54,8 +56,7 @@ impl Counters {
     }
 
     fn word(&self, index: usize) -> &AtomicU64 {
-        // SAFETY: an 8-aligned word of a live page-aligned mapping, reached only through atomics.
-        unsafe { self.0.as_ptr().add(8 * index).cast::<AtomicU64>().as_ref() }
+        common::counter(&self.0, index)
     }
 
     fn end(&self) -> &AtomicU64 {

@@ -27,6 +27,20 @@ use std::time::{Duration, Instant};
 
 use rsbinder_fmq::{Descriptor, Flavor, Grantor};
 
+/// The `index`th 8-byte word of `map` as an atomic: a queue's counters, as a hostile peer
+/// would reach them. The caller reaches these bytes only through atomics of this size.
+#[cfg(target_has_atomic = "64")]
+pub fn counter(map: &rsbinder_fmq::shm::Mapping, index: usize) -> &std::sync::atomic::AtomicU64 {
+    assert!(
+        8 * index + 8 <= map.len(),
+        "word {index} outside the mapping"
+    );
+    let at = map.as_ptr().map_addr(|addr| addr.saturating_add(8 * index));
+    assert_eq!(at.addr().get() % 8, 0, "word {index} is not 8-aligned");
+    // SAFETY: an aligned word inside a live mapping that `map` borrows for the result's life.
+    unsafe { at.cast::<std::sync::atomic::AtomicU64>().as_ref() }
+}
+
 pub fn send_descriptor(sock: &UnixStream, desc: &Descriptor) {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&desc.quantum.to_le_bytes());

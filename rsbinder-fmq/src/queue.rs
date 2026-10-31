@@ -1152,8 +1152,7 @@ impl<'a, T: Element> Regions<'a, T> {
         let offset = (position % bytes as u64) as usize;
         let contiguous = (bytes - offset) / q;
         debug_assert_eq!(offset % q, 0);
-        // SAFETY: `offset < bytes`, so the pointer stays in the ring.
-        let first = unsafe { base.add(offset) };
+        let first = base.map_addr(|addr| addr.saturating_add(offset));
         let (first_len, second_len) = if n > contiguous {
             (contiguous, n - contiguous)
         } else {
