@@ -590,11 +590,11 @@ jobs:
         local-cache: true
     - name: FMQ C header on the 32-bit Android ABIs (compile only — plan 17 Q-17)
       # The host build is 64-bit only; i686 aligns uint64_t to 4. Once, not per target.
+      # The runner's NDK, which cargo-ndk builds with; setup-ndk's local-cache copy has no clang.
       if: matrix.target == 'x86_64-linux-android'
-      env:
-        NDK_BIN: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin
       run: |
         set -eux
+        NDK_BIN=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
         cd rsbinder-fmq
         for target in i686-linux-android29 armv7a-linux-androideabi29; do
           "$NDK_BIN/clang" --target=$target -std=c11 -pedantic -Wall -Wextra -Werror \
