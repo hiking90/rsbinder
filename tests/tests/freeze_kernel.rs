@@ -11,7 +11,7 @@
 //!
 //! The observed process is a `reconnect_service` of this test's own name;
 //! this process registers the callbacks and freezes it with
-//! `ProcessState::freeze_process`, which the driver allows any binder process
+//! `ProcessState::freeze`, which the driver allows any binder process
 //! to issue; Android's SELinux allows it to system_server only, so there these
 //! tests run as root with SELinux permissive.
 //! `unprivileged_domain_observes_app_freeze` covers the enforcing `shell`
@@ -96,7 +96,7 @@ impl Service {
 impl Drop for Service {
     fn drop(&mut self) {
         // Thaw first: the driver keeps no freeze state past the process, but be tidy.
-        let _ = ProcessState::as_self().freeze_process(self.pid(), false, Duration::ZERO);
+        let _ = ProcessState::as_self().thaw(self.pid());
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
@@ -169,14 +169,20 @@ impl FrozenStateChangeCallback for Recorder {
     }
 }
 
-/// `freeze_process`, retried while the driver reports transactions still draining.
+/// `ProcessState::freeze`, retried while the driver reports transactions still draining, or `thaw`.
 fn set_frozen(pid: i32, frozen: bool) {
+    let state = ProcessState::as_self();
+    if !frozen {
+        return state
+            .thaw(pid)
+            .unwrap_or_else(|err| panic!("thaw(pid {pid}): {err:?}"));
+    }
     let end = Instant::now() + WAIT;
     loop {
-        match ProcessState::as_self().freeze_process(pid, frozen, Duration::from_millis(100)) {
+        match state.freeze(pid, Duration::from_millis(100)) {
             Ok(()) => return,
             Err(StatusCode::WouldBlock) if Instant::now() < end => continue,
-            Err(err) => panic!("freeze_process(pid {pid}, {frozen}): {err:?}"),
+            Err(err) => panic!("freeze(pid {pid}): {err:?}"),
         }
     }
 }
@@ -471,7 +477,7 @@ fn unprivileged_domain_observes_app_freeze() {
         let me = std::process::id() as i32;
         let eacces = StatusCode::Errno(-13);
         assert_eq!(
-            ProcessState::as_self().freeze_process(me, false, Duration::ZERO),
+            ProcessState::as_self().thaw(me),
             Err(eacces),
             "SELinux refuses BINDER_FREEZE"
         );

@@ -143,7 +143,7 @@ findings repeated one of these causes. Two are checked by
   `library_threads_are_made_by_builder`.
 - **No adjacent positional arguments of one primitive type, and no `bool`
   with two meanings.** Use a named struct, an enum or two functions
-  (`freeze_process` / `thaw_process`, not `freeze_process(pid, bool, ..)`).
+  (`ProcessState::freeze` / `thaw`, not `freeze_process(pid, bool, ..)`).
 - **Timeouts.** A required deadline is a `Duration`, an optional one an
   `Option<Duration>` with `None` waiting without end. `Duration::ZERO`
   means "do not wait" where one attempt is meaningful (a receive, a send, a

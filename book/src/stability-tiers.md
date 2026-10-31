@@ -201,7 +201,7 @@ tweaks; wire formats are already locked.
 - **Freeze notifications (new in 0.12.0)** —
   `IBinder::add_frozen_state_change_callback` /
   `remove_frozen_state_change_callback`, `FrozenStateChangeCallback`,
-  `FrozenState`, and `ProcessState::freeze_process` /
+  `FrozenState`, and `ProcessState::freeze` / `thaw` /
   `process_freeze_info`: AOSP `addFrozenStateChangeCallback` (libbinder
   android-15.0.0_r6+) over the driver's own commands, so the contract is the
   kernel UAPI rather than a libbinder wire. Validated on the Rust binder

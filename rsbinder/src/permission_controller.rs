@@ -92,15 +92,44 @@ static AUTHORITY: RwLock<Option<Arc<dyn PermissionAuthority>>> = RwLock::new(Non
 
 /// Install the process-wide [`PermissionAuthority`]; subsequent
 /// [`check_permission`] calls delegate the whole decision to it. Replaces
-/// any previously installed authority.
+/// any previously installed authority, which is dropped here after the
+/// slot's lock is released.
+///
+/// Code that installs an authority into a process it does not own (a
+/// library) should use [`replace_permission_authority`] and keep what it
+/// replaced.
 pub fn set_permission_authority(authority: Arc<dyn PermissionAuthority>) {
-    *AUTHORITY.write().expect("permission authority poisoned") = Some(authority);
+    drop(replace_permission_authority(Some(authority)));
 }
 
 /// Remove any installed [`PermissionAuthority`], restoring the built-in
-/// default (kernel → PMS, RPC → deny).
+/// default (kernel → PMS, RPC → deny). The removed authority is dropped
+/// after the slot's lock is released.
 pub fn clear_permission_authority() {
-    *AUTHORITY.write().expect("permission authority poisoned") = None;
+    drop(replace_permission_authority(None));
+}
+
+/// Install `authority` as the process-wide [`PermissionAuthority`], or
+/// restore the built-in default with `None`, and return the authority it
+/// replaced, `None` if the default was in effect.
+///
+/// A check already running in another thread finishes with the authority
+/// it started with.
+pub fn replace_permission_authority(
+    authority: Option<Arc<dyn PermissionAuthority>>,
+) -> Option<Arc<dyn PermissionAuthority>> {
+    let mut slot = AUTHORITY.write().unwrap_or_else(PoisonError::into_inner);
+    // Returned after the guard drops, so the old authority's user `Drop` never runs under the lock.
+    std::mem::replace(&mut *slot, authority)
+}
+
+/// The process-wide [`PermissionAuthority`] installed now, `None` while
+/// the built-in default (kernel → PMS, RPC → deny) is in effect.
+pub fn permission_authority() -> Option<Arc<dyn PermissionAuthority>> {
+    AUTHORITY
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
 }
 
 /// Acquire a `BpPermissionController` proxy for the system-wide
@@ -219,10 +248,7 @@ pub fn default() -> Result<Strong<dyn IPermissionController>> {
 /// kernel→PMS / RPC→deny behavior applies unchanged.
 pub fn check_permission(_reader: &Parcel, permission_name: &str) -> bool {
     // Clone the Arc out so the read lock is released before the (re-entrant) policy runs.
-    let authority = AUTHORITY
-        .read()
-        .expect("permission authority poisoned")
-        .clone();
+    let authority = permission_authority();
     // No caller (not in a transaction) ⇒ fail closed on either path.
     let caller = crate::calling_caller();
     if let Some(authority) = authority {
@@ -434,6 +460,72 @@ mod tests {
             !check_permission(&kernel_parcel, "android.permission.INTERNET"),
             "outside a transaction the kernel path denies before PMS"
         );
+    }
+
+    /// Plan 17 K-23: the getter sees each install; a replaced authority's `Drop` panic is harmless.
+    #[serial_test::serial(authority)]
+    #[test]
+    fn authority_getter_and_a_panicking_drop_of_the_replaced_one() {
+        struct Fixed {
+            grant: bool,
+            panic_on_drop: bool,
+        }
+        impl PermissionAuthority for Fixed {
+            fn check(&self, _: &str, _: &Caller) -> bool {
+                self.grant
+            }
+        }
+        impl Drop for Fixed {
+            fn drop(&mut self) {
+                if self.panic_on_drop {
+                    panic!("injected authority Drop panic");
+                }
+            }
+        }
+
+        assert!(permission_authority().is_none());
+        let first: Arc<dyn PermissionAuthority> = Arc::new(Fixed {
+            grant: false,
+            panic_on_drop: true,
+        });
+        assert!(replace_permission_authority(Some(first.clone())).is_none());
+        let seen = permission_authority().expect("the getter sees the installed authority");
+        assert!(Arc::ptr_eq(&seen, &first));
+        // The slot now holds the last reference, so replacing it runs the panicking `Drop`.
+        drop((seen, first));
+
+        let second: Arc<dyn PermissionAuthority> = Arc::new(Fixed {
+            grant: true,
+            panic_on_drop: false,
+        });
+        let replaced = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            set_permission_authority(second.clone())
+        }));
+        assert!(replaced.is_err(), "the replaced authority's Drop panicked");
+        assert!(
+            !AUTHORITY.is_poisoned(),
+            "the Drop ran after the write lock was released"
+        );
+        let seen = permission_authority().expect("the new authority is installed");
+        assert!(Arc::ptr_eq(&seen, &second));
+
+        // Not in a transaction: denies without consulting the authority, and without panicking.
+        assert!(!check_permission(&Parcel::new(), "p"));
+        #[cfg(feature = "rpc")]
+        {
+            let _g = crate::thread_state::RpcCallingGuard::install(
+                Arc::new(crate::rpc::transport::PeerIdentity::Local { uid: 1000, pid: 7 }),
+                UNIX_CAPS,
+            );
+            assert!(
+                check_permission(&Parcel::new(), "p"),
+                "the new authority decides"
+            );
+        }
+
+        let last = replace_permission_authority(None).expect("the second authority");
+        assert!(Arc::ptr_eq(&last, &second));
+        assert!(permission_authority().is_none());
     }
 
     /// Plan 2-16 Phase C: an installed authority grants a Unix-RPC uid what the default denies.

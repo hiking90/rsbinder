@@ -361,7 +361,7 @@ pub trait IBinder: Any + Send + Sync {
     /// each change; see [`FrozenStateChangeCallback`] for delivery rules.
     /// The state is the one the kernel binder driver tracks, set by
     /// `BINDER_FREEZE` (on Android, the cached-app freezer;
-    /// [`ProcessState::freeze_process`](crate::ProcessState::freeze_process)
+    /// [`ProcessState::freeze`](crate::ProcessState::freeze)
     /// elsewhere). A cgroup freezer alone produces no notification.
     ///
     /// This link holds a weak reference to `callback`: keep a strong `Arc`

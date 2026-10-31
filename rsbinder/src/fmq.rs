@@ -32,7 +32,8 @@
 //! * The two conversions below join them: an [`MQDescriptor`] that arrived in
 //!   a parcel becomes a `Descriptor` to attach to (`TryFrom<&MQDescriptor>`),
 //!   and a queue's `Descriptor` becomes the [`MQDescriptor`] to send
-//!   (`TryFrom<Descriptor>`).
+//!   ([`MQDescriptor::try_from_sized`], which also checks the element size,
+//!   or `TryFrom<Descriptor>`).
 //!
 //! ```no_run
 //! # #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -41,7 +42,7 @@
 //!
 //! // The service side: make a queue and describe it for the reply.
 //! let queue = MessageQueue::<u8>::create(1024, true)?;
-//! let reply: MQDescriptor<i8, SynchronizedReadWrite> = queue.descriptor()?.try_into()?;
+//! let reply = MQDescriptor::<i8, SynchronizedReadWrite>::try_from_sized(queue.descriptor()?)?;
 //!
 //! // The client side: attach to what the reply named.
 //! let desc = Descriptor::try_from(&reply)?;
@@ -210,6 +211,27 @@ mod convert {
         }
     }
 
+    impl<T, F: FlavorType> MQDescriptor<T, F> {
+        /// `desc` as the parcelable to send, as `TryFrom<Descriptor>` makes
+        /// it, and `BadValue` also when the queue's `quantum` is not
+        /// `size_of::<T>()`.
+        ///
+        /// `TryFrom<Descriptor>` does not look at `T`, and the AIDL method's
+        /// return type infers it, so a queue of `u32` converts to an
+        /// `MQDescriptor<i8, _>` without a word; the peer's libfmq then
+        /// refuses the descriptor ("Payload size differs") and the failure
+        /// shows on the peer only. This refuses it here. For a
+        /// `@FixedSize` parcelable `T`, whose Rust layout need not be the
+        /// C++ `sizeof`, use `TryFrom<Descriptor>` and size the queue's
+        /// element type to the peer's.
+        pub fn try_from_sized(desc: Descriptor) -> Result<Self, StatusCode> {
+            if usize::try_from(desc.quantum).ok() != Some(std::mem::size_of::<T>()) {
+                return Err(StatusCode::BadValue);
+            }
+            Self::try_from(desc)
+        }
+    }
+
     // `MessageQueue::create` is `Unsupported` off Linux/Android.
     #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
     mod tests {
@@ -217,6 +239,15 @@ mod convert {
         use rsbinder_fmq::MessageQueue;
 
         type Sync = super::super::SynchronizedReadWrite;
+
+        #[test]
+        fn a_sized_conversion_refuses_an_element_of_another_size() {
+            let queue = MessageQueue::<u32>::create(64, true).unwrap();
+            let wrong = MQDescriptor::<i8, Sync>::try_from_sized(queue.descriptor().unwrap());
+            assert_eq!(wrong.err(), Some(StatusCode::BadValue));
+            let right = MQDescriptor::<i32, Sync>::try_from_sized(queue.descriptor().unwrap());
+            assert_eq!(right.unwrap().quantum, 4);
+        }
 
         #[test]
         fn descriptor_round_trips_through_the_parcelable() {

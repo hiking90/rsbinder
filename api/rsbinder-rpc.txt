@@ -35,6 +35,7 @@ pub fn rsbinder::bridge::Rewrap<I>::is_empty(&self) -> bool
 pub fn rsbinder::bridge::Rewrap<I>::len(&self) -> usize
 pub fn rsbinder::bridge::Rewrap<I>::new(impl core::ops::function::Fn(rsbinder::Strong<I>) -> rsbinder::Strong<I> + core::marker::Send + core::marker::Sync + 'static) -> Self
 pub fn rsbinder::bridge::Rewrap<I>::purge_dead(&self) -> usize
+pub fn rsbinder::bridge::Rewrap<I>::remote_of(&self, &rsbinder::Strong<I>) -> core::option::Option<rsbinder::Strong<I>>
 pub fn rsbinder::bridge::Rewrap<I>::wrap(&self, &rsbinder::Strong<I>) -> rsbinder::Strong<I>
 impl<I: rsbinder::FromIBinder + ?core::marker::Sized> core::fmt::Debug for rsbinder::bridge::Rewrap<I>
 pub fn rsbinder::bridge::Rewrap<I>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -846,6 +847,8 @@ pub rsbinder::fmq::MQDescriptor::flags: i32
 pub rsbinder::fmq::MQDescriptor::grantors: alloc::vec::Vec<rsbinder::fmq::GrantorDescriptor>
 pub rsbinder::fmq::MQDescriptor::handle: rsbinder::NativeHandle
 pub rsbinder::fmq::MQDescriptor::quantum: i32
+impl<T, F: rsbinder::fmq::FlavorType> rsbinder::fmq::MQDescriptor<T, F>
+pub fn rsbinder::fmq::MQDescriptor<T, F>::try_from_sized(rsbinder_fmq::descriptor::Descriptor) -> core::result::Result<Self, rsbinder::StatusCode>
 impl<T, F: rsbinder::fmq::FlavorType> core::convert::TryFrom<&rsbinder::fmq::MQDescriptor<T, F>> for rsbinder_fmq::descriptor::Descriptor
 pub type rsbinder_fmq::descriptor::Descriptor::Error = rsbinder::StatusCode
 pub fn rsbinder_fmq::descriptor::Descriptor::try_from(&rsbinder::fmq::MQDescriptor<T, F>) -> core::result::Result<Self, rsbinder::StatusCode>
@@ -2343,6 +2346,24 @@ impl !core::panic::unwind_safe::RefUnwindSafe for rsbinder::lazy_service::LazySe
 impl !core::panic::unwind_safe::UnwindSafe for rsbinder::lazy_service::LazyServiceRegistrar
 pub type rsbinder::lazy_service::ActiveServicesCallback = alloc::sync::Arc<(dyn core::ops::function::Fn(bool) -> bool + core::marker::Send + core::marker::Sync)>
 pub mod rsbinder::observe
+pub struct rsbinder::observe::Fanout
+impl rsbinder::observe::Fanout
+pub fn rsbinder::observe::Fanout::new(impl core::iter::traits::collect::IntoIterator<Item = alloc::sync::Arc<dyn rsbinder::observe::TransactionObserver>>) -> Self
+pub fn rsbinder::observe::Fanout::observers(&self) -> &[alloc::sync::Arc<dyn rsbinder::observe::TransactionObserver>]
+impl core::clone::Clone for rsbinder::observe::Fanout
+pub fn rsbinder::observe::Fanout::clone(&self) -> rsbinder::observe::Fanout
+impl core::fmt::Debug for rsbinder::observe::Fanout
+pub fn rsbinder::observe::Fanout::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl rsbinder::observe::TransactionObserver for rsbinder::observe::Fanout
+pub fn rsbinder::observe::Fanout::on_reply(&self, &rsbinder::observe::TxnContext<'_>, core::option::Option<alloc::boxed::Box<(dyn core::any::Any + core::marker::Send)>>, &rsbinder::Result<()>, core::time::Duration)
+pub fn rsbinder::observe::Fanout::on_transact(&self, &rsbinder::observe::TxnContext<'_>) -> core::option::Option<alloc::boxed::Box<(dyn core::any::Any + core::marker::Send)>>
+impl core::marker::Freeze for rsbinder::observe::Fanout
+impl core::marker::Send for rsbinder::observe::Fanout
+impl core::marker::Sync for rsbinder::observe::Fanout
+impl core::marker::Unpin for rsbinder::observe::Fanout
+impl core::marker::UnsafeUnpin for rsbinder::observe::Fanout
+impl !core::panic::unwind_safe::RefUnwindSafe for rsbinder::observe::Fanout
+impl !core::panic::unwind_safe::UnwindSafe for rsbinder::observe::Fanout
 pub struct rsbinder::observe::LatencyHistogram
 impl rsbinder::observe::LatencyHistogram
 pub fn rsbinder::observe::LatencyHistogram::counts(&self) -> &[u64; 25]
@@ -2456,6 +2477,13 @@ pub rsbinder::observe::TxnContext::descriptor: &'a str
 pub rsbinder::observe::TxnContext::is_oneway: bool
 pub rsbinder::observe::TxnContext::method: core::option::Option<&'static str>
 pub rsbinder::observe::TxnContext::transport: rsbinder::TransportCaps
+impl<'a> rsbinder::observe::TxnContext<'a>
+pub const fn rsbinder::observe::TxnContext<'a>::new(&'a str, rsbinder::TransactionCode) -> Self
+pub const fn rsbinder::observe::TxnContext<'a>::with_calling_pid(self, std::os::raw::c_int) -> Self
+pub const fn rsbinder::observe::TxnContext<'a>::with_calling_uid(self, std::os::raw::c_uint) -> Self
+pub const fn rsbinder::observe::TxnContext<'a>::with_method(self, &'static str) -> Self
+pub const fn rsbinder::observe::TxnContext<'a>::with_oneway(self, bool) -> Self
+pub const fn rsbinder::observe::TxnContext<'a>::with_transport(self, rsbinder::TransportCaps) -> Self
 impl<'a> core::clone::Clone for rsbinder::observe::TxnContext<'a>
 pub fn rsbinder::observe::TxnContext<'a>::clone(&self) -> rsbinder::observe::TxnContext<'a>
 impl<'a> core::fmt::Debug for rsbinder::observe::TxnContext<'a>
@@ -2471,12 +2499,17 @@ pub const rsbinder::observe::LATENCY_BUCKETS: usize
 pub trait rsbinder::observe::TransactionObserver: core::marker::Send + core::marker::Sync
 pub fn rsbinder::observe::TransactionObserver::on_reply(&self, &rsbinder::observe::TxnContext<'_>, core::option::Option<alloc::boxed::Box<(dyn core::any::Any + core::marker::Send)>>, &rsbinder::Result<()>, core::time::Duration)
 pub fn rsbinder::observe::TransactionObserver::on_transact(&self, &rsbinder::observe::TxnContext<'_>) -> core::option::Option<alloc::boxed::Box<(dyn core::any::Any + core::marker::Send)>>
+impl rsbinder::observe::TransactionObserver for rsbinder::observe::Fanout
+pub fn rsbinder::observe::Fanout::on_reply(&self, &rsbinder::observe::TxnContext<'_>, core::option::Option<alloc::boxed::Box<(dyn core::any::Any + core::marker::Send)>>, &rsbinder::Result<()>, core::time::Duration)
+pub fn rsbinder::observe::Fanout::on_transact(&self, &rsbinder::observe::TxnContext<'_>) -> core::option::Option<alloc::boxed::Box<(dyn core::any::Any + core::marker::Send)>>
 impl rsbinder::observe::TransactionObserver for rsbinder::observe::LogObserver
 pub fn rsbinder::observe::LogObserver::on_reply(&self, &rsbinder::observe::TxnContext<'_>, core::option::Option<alloc::boxed::Box<(dyn core::any::Any + core::marker::Send)>>, &rsbinder::Result<()>, core::time::Duration)
 pub fn rsbinder::observe::LogObserver::on_transact(&self, &rsbinder::observe::TxnContext<'_>) -> core::option::Option<alloc::boxed::Box<(dyn core::any::Any + core::marker::Send)>>
 impl rsbinder::observe::TransactionObserver for rsbinder::observe::StatsObserver
 pub fn rsbinder::observe::StatsObserver::on_reply(&self, &rsbinder::observe::TxnContext<'_>, core::option::Option<alloc::boxed::Box<(dyn core::any::Any + core::marker::Send)>>, &rsbinder::Result<()>, core::time::Duration)
 pub fn rsbinder::observe::StatsObserver::on_transact(&self, &rsbinder::observe::TxnContext<'_>) -> core::option::Option<alloc::boxed::Box<(dyn core::any::Any + core::marker::Send)>>
+pub fn rsbinder::observe::observer() -> core::option::Option<alloc::sync::Arc<dyn rsbinder::observe::TransactionObserver>>
+pub fn rsbinder::observe::replace_observer(core::option::Option<alloc::sync::Arc<dyn rsbinder::observe::TransactionObserver>>) -> core::option::Option<alloc::sync::Arc<dyn rsbinder::observe::TransactionObserver>>
 pub fn rsbinder::observe::set_observer(core::option::Option<alloc::sync::Arc<dyn rsbinder::observe::TransactionObserver>>)
 pub mod rsbinder::permission_controller
 pub mod rsbinder::permission_controller::android
@@ -2735,6 +2768,8 @@ pub fn rsbinder::permission_controller::PermissionAuthority::check(&self, &str, 
 pub fn rsbinder::permission_controller::check_permission(&rsbinder::Parcel, &str) -> bool
 pub fn rsbinder::permission_controller::clear_permission_authority()
 pub fn rsbinder::permission_controller::default() -> rsbinder::Result<rsbinder::Strong<dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionController>>
+pub fn rsbinder::permission_controller::permission_authority() -> core::option::Option<alloc::sync::Arc<dyn rsbinder::permission_controller::PermissionAuthority>>
+pub fn rsbinder::permission_controller::replace_permission_authority(core::option::Option<alloc::sync::Arc<dyn rsbinder::permission_controller::PermissionAuthority>>) -> core::option::Option<alloc::sync::Arc<dyn rsbinder::permission_controller::PermissionAuthority>>
 pub fn rsbinder::permission_controller::set_permission_authority(alloc::sync::Arc<dyn rsbinder::permission_controller::PermissionAuthority>)
 pub type rsbinder::permission_controller::IPermissionControllerDefaultRef = alloc::sync::Arc<dyn rsbinder::permission_controller::android::os::IPermissionController::IPermissionControllerDefault>
 pub mod rsbinder::proxy_count
@@ -5511,6 +5546,7 @@ pub fn rsbinder::ProcessState::context_object(&self) -> rsbinder::Result<rsbinde
 pub fn rsbinder::ProcessState::default_mmap_size() -> usize
 pub fn rsbinder::ProcessState::disable_background_scheduling(&self, bool)
 pub fn rsbinder::ProcessState::driver(&self) -> alloc::sync::Arc<std::fs::File>
+pub fn rsbinder::ProcessState::freeze(&self, i32, core::time::Duration) -> rsbinder::Result<()>
 pub fn rsbinder::ProcessState::freeze_process(&self, i32, bool, core::time::Duration) -> rsbinder::Result<()>
 pub fn rsbinder::ProcessState::init(&str, u32) -> core::result::Result<&'static rsbinder::ProcessState, alloc::boxed::Box<dyn core::error::Error>>
 pub fn rsbinder::ProcessState::init_default() -> core::result::Result<&'static rsbinder::ProcessState, alloc::boxed::Box<dyn core::error::Error>>
@@ -5523,6 +5559,7 @@ pub fn rsbinder::ProcessState::set_call_restriction(&self, rsbinder::CallRestric
 pub fn rsbinder::ProcessState::start_thread_pool()
 pub fn rsbinder::ProcessState::strong_proxy_for_handle(&self, u32) -> rsbinder::Result<rsbinder::SIBinder>
 pub fn rsbinder::ProcessState::strong_ref_count_for_node(&self, &rsbinder::ProxyHandle) -> rsbinder::Result<usize>
+pub fn rsbinder::ProcessState::thaw(&self, i32) -> rsbinder::Result<()>
 pub fn rsbinder::ProcessState::try_start_thread_pool() -> rsbinder::Result<()>
 impl core::fmt::Debug for rsbinder::ProcessState
 pub fn rsbinder::ProcessState::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result

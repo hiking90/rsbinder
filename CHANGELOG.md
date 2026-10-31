@@ -345,6 +345,24 @@ Each item below changes what a 0.12.0 program observes.
 - **`AccessorProviderHandle::keep_for_process()`**: keeps the provider
   registered until the process exits, as AOSP's `addAccessorProvider` does
   when its caller discards the returned weak pointer.
+- **`ProcessState::freeze(pid, timeout)` and `thaw(pid)`**, which name the
+  direction; `freeze_process(pid, enable, timeout)` is deprecated (a
+  positional `bool`, and a `timeout` a thaw ignores).
+- **The process-wide slots can be read and swapped**:
+  `observe::observer()` and `replace_observer()`,
+  `permission_controller::permission_authority()` and
+  `replace_permission_authority()`. A library that installs into a process
+  it does not own keeps what it replaced, or installs an `observe::Fanout`,
+  which forwards to several observers, each with its own tag, a panic in
+  one not reaching the others. The replaced authority is dropped after the
+  slot's lock is released, so a panicking `Drop` no longer poisons it.
+- **`TxnContext::new(descriptor, code)`** and `with_*` setters, to
+  unit-test a `TransactionObserver` without a transaction.
+- **`bridge::Rewrap::remote_of(&wrapper)`**: the remote a wrapper was made
+  for, for an upstream that hands a wrapper back.
+- **`fmq::MQDescriptor::try_from_sized(descriptor)`**: `TryFrom<Descriptor>`
+  that also refuses a queue whose element size is not `size_of::<T>()`,
+  which the untyped conversion leaves for the peer's libfmq to refuse.
 - **`Debug` for the public types that had none**: `ProcessState`,
   `Binder<T>`, `Reconnecting<T>`, `WeakReconnecting<T>`,
   `ReconnectBuilder<T>`, `LazyServiceRegistrar`, `hub::ServiceManager`,

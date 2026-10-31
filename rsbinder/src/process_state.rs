@@ -1407,22 +1407,23 @@ impl ProcessState {
         }
     }
 
-    /// Freeze or thaw the binder state of process `pid`. AOSP `IPCThreadState::freeze`.
+    /// Freeze the binder state of process `pid`. AOSP
+    /// `IPCThreadState::freeze(pid, true, timeout_ms)`.
     ///
     /// This sets the kernel binder driver's per-process freeze state; it does
     /// not stop the process's threads, which is the cgroup freezer's job
     /// (Android's cached-app freezer does both). While frozen, the driver
     /// fails synchronous calls into the process with
     /// [`StatusCode::FailedTransaction`] (`BR_FROZEN_REPLY`), queues oneway
-    /// calls until it is thawed, and notifies every
+    /// calls until it is thawed with [`thaw`](Self::thaw), and notifies every
     /// [`FrozenStateChangeCallback`] registered on its binders.
     ///
-    /// Freezing waits up to `timeout` for the process's in-flight
+    /// The call waits up to `timeout` for the process's in-flight
     /// transactions to finish. If synchronous ones are still pending, the
     /// freeze is rolled back and [`StatusCode::WouldBlock`] (`EAGAIN`) is
     /// returned; call again to retry, as AOSP documents. A zero `timeout`
-    /// checks once without waiting. Thawing never waits. `timeout` is
-    /// rounded down to milliseconds and capped at `u32::MAX` of them.
+    /// checks once without waiting. `timeout` is rounded down to
+    /// milliseconds and capped at `u32::MAX` of them.
     ///
     /// The driver makes no permission check of its own and applies the
     /// call to every binder context the process opened. On Android, SELinux
@@ -1437,7 +1438,40 @@ impl ProcessState {
     ///   no binder state (it never opened a binder device).
     /// - [`StatusCode::WouldBlock`] as described above.
     /// - `StatusCode::Errno(-EACCES)` on Android outside `system_server`.
+    pub fn freeze(&self, pid: i32, timeout: Duration) -> Result<()> {
+        self.set_frozen(pid, true, timeout)
+    }
+
+    /// Thaw the binder state of process `pid`, undoing [`freeze`](Self::freeze).
+    /// AOSP `IPCThreadState::freeze(pid, false, 0)`.
+    ///
+    /// The driver delivers the oneway calls it queued while the process was
+    /// frozen and notifies every [`FrozenStateChangeCallback`] registered on
+    /// its binders. Thawing never waits, so it takes no timeout. Thawing a
+    /// process that is not frozen succeeds.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`freeze`](Self::freeze), except that it never returns
+    /// [`StatusCode::WouldBlock`].
+    pub fn thaw(&self, pid: i32) -> Result<()> {
+        self.set_frozen(pid, false, Duration::ZERO)
+    }
+
+    /// Freeze (`enable`) or thaw the binder state of process `pid`. AOSP
+    /// `IPCThreadState::freeze`.
+    ///
+    /// `timeout` applies to a freeze only; see [`freeze`](Self::freeze) and
+    /// [`thaw`](Self::thaw), which this forwards to.
+    #[deprecated(
+        since = "0.13.0",
+        note = "use `freeze(pid, timeout)` or `thaw(pid)`, which name the direction"
+    )]
     pub fn freeze_process(&self, pid: i32, enable: bool, timeout: Duration) -> Result<()> {
+        self.set_frozen(pid, enable, timeout)
+    }
+
+    fn set_frozen(&self, pid: i32, enable: bool, timeout: Duration) -> Result<()> {
         let pid = u32::try_from(pid)
             .ok()
             .filter(|pid| *pid > 0)
@@ -1459,7 +1493,7 @@ impl ProcessState {
     ///   binder state.
     /// - `StatusCode::Errno(-EACCES)` on Android outside `system_server`,
     ///   which SELinux grants this ioctl alone, as for
-    ///   [`freeze_process`](Self::freeze_process).
+    ///   [`freeze`](Self::freeze).
     pub fn process_freeze_info(&self, pid: i32) -> Result<ProcessFreezeInfo> {
         let pid = u32::try_from(pid)
             .ok()

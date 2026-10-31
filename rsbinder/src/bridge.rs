@@ -267,6 +267,37 @@ impl<I: FromIBinder + ?Sized> Rewrap<I> {
         local
     }
 
+    /// The remote that `local` wraps, if `local` is a wrapper this table
+    /// made and both halves are still alive.
+    ///
+    /// This is the reverse of [`wrap`](Self::wrap), for an upstream that
+    /// hands a wrapper back: it arrives as the gateway's own local object,
+    /// and passing it to `wrap` would mint a wrapper of the wrapper instead
+    /// of reaching the original remote. A gateway forwarding a returned
+    /// binder downstream does
+    ///
+    /// ```ignore
+    /// let cb = self.upstream.current_callback()?;
+    /// let out = self.callbacks.remote_of(&cb).unwrap_or(cb);
+    /// ```
+    ///
+    /// `None` for any binder the table did not make, a wrapper whose entry
+    /// was swept, a remote that has died, and a remote that no longer casts
+    /// to `I`. The lookup scans the table, so it costs one comparison per
+    /// entry; the cast runs after the table lock is released, since it may
+    /// query a proxy's descriptor.
+    pub fn remote_of(&self, local: &Strong<I>) -> Option<Strong<I>> {
+        let local = SIBinder::downgrade(&local.as_binder());
+        let remote = {
+            let entries = self.entries.lock().expect("rewrap table poisoned");
+            entries
+                .values()
+                .find(|e| e.local == local)
+                .and_then(|e| e.remote.upgrade().ok())?
+        };
+        <I as FromIBinder>::try_from(remote).ok()
+    }
+
     /// Drop every entry whose remote or wrapper is gone, and report how many
     /// went. `wrap` sweeps too; this is for a gateway that wants to reclaim
     /// on its own schedule, and for tests.
@@ -432,6 +463,45 @@ mod tests {
             2,
             "the entries either side of the panicking one must still be unlinked"
         );
+    }
+
+    struct Callback;
+
+    impl crate::Interface for Callback {}
+
+    impl crate::hub::IServiceCallback for Callback {
+        fn onRegistration(&self, _: &str, _: &SIBinder) -> crate::status::BinderResult<()> {
+            Ok(())
+        }
+    }
+
+    /// Plan 17 K-27: a wrapper maps back to its remote; a binder the table did not make, to none.
+    #[test]
+    fn remote_of_returns_the_remote_a_wrapper_was_made_for() {
+        use crate::hub::{BnServiceCallback, IServiceCallback};
+
+        let table: Rewrap<dyn IServiceCallback> = Rewrap::new(BnServiceCallback::new_binder);
+        let remote = BnServiceCallback::new_binder(Callback);
+        let other = BnServiceCallback::new_binder(Callback);
+        let local = table.wrap(&remote);
+        let other_local = table.wrap(&other);
+        assert!(local.as_binder() != remote.as_binder());
+
+        let back = table.remote_of(&local).expect("the wrapper's remote");
+        assert!(back.as_binder() == remote.as_binder());
+        let back = table
+            .remote_of(&other_local)
+            .expect("the other wrapper's remote");
+        assert!(back.as_binder() == other.as_binder());
+
+        assert!(
+            table.remote_of(&remote).is_none(),
+            "a remote is not a wrapper"
+        );
+        let unrelated = BnServiceCallback::new_binder(Callback);
+        assert!(table.remote_of(&unrelated).is_none());
+        // Wrapping the wrapper is what `remote_of` lets a gateway avoid: that wrapper is new.
+        assert!(table.wrap(&local).as_binder() != local.as_binder());
     }
 
     /// `Drop` swallows the panic: unwinding out of a drop during another unwind aborts.
