@@ -911,12 +911,9 @@ macro_rules! impl_deserialize_for_parcelable {
                 let status: i32 = parcel.read()?;
                 if status == $crate::NULL_PARCELABLE_FLAG {
                     ::core::result::Result::Err($crate::StatusCode::UnexpectedNull.into())
-                } else if status == $crate::NON_NULL_PARCELABLE_FLAG {
+                } else {
                     use $crate::Parcelable;
                     self.read_from_parcel(parcel)
-                } else {
-                    // Other flags are UNEXPECTED_NULL, as in AOSP C++ `Parcel::readData`.
-                    ::core::result::Result::Err($crate::StatusCode::UnexpectedNull.into())
                 }
             }
         }
@@ -939,13 +936,10 @@ macro_rules! impl_deserialize_for_parcelable {
                 if status == $crate::NULL_PARCELABLE_FLAG {
                     *this = ::core::option::Option::None;
                     ::core::result::Result::Ok(())
-                } else if status == $crate::NON_NULL_PARCELABLE_FLAG {
+                } else {
                     use $crate::Parcelable;
                     this.get_or_insert_with(Self::default)
                         .read_from_parcel(parcel)
-                } else {
-                    // Other flags are UNEXPECTED_NULL, as in AOSP C++ `Parcel::readData`.
-                    ::core::result::Result::Err($crate::StatusCode::UnexpectedNull.into())
                 }
             }
         }
