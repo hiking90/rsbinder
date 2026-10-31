@@ -40,6 +40,15 @@ pub struct VsockTransport {
     queue: OutQueue,
 }
 
+impl std::fmt::Debug for VsockTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VsockTransport")
+            .field("desc", &self.desc)
+            .field("peer", &self.peer)
+            .finish_non_exhaustive()
+    }
+}
+
 impl VsockTransport {
     /// Connect to `(cid, port)` (client side).
     pub fn connect(cid: u32, port: u32) -> RpcResult<Self> {

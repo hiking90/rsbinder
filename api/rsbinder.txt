@@ -658,6 +658,8 @@ pub rsbinder::entry::ServeOptions::reply_timeout: core::option::Option<core::tim
 pub rsbinder::entry::ServeOptions::threads: core::option::Option<u32>
 impl core::default::Default for rsbinder::ServeOptions
 pub fn rsbinder::ServeOptions::default() -> rsbinder::ServeOptions
+impl core::fmt::Debug for rsbinder::ServeOptions
+pub fn rsbinder::ServeOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for rsbinder::ServeOptions
 impl core::marker::Send for rsbinder::ServeOptions
 impl core::marker::Sync for rsbinder::ServeOptions
@@ -672,6 +674,8 @@ pub fn rsbinder::Server::endpoint(&self) -> &rsbinder::entry::uri::Endpoint
 pub fn rsbinder::Server::run(self) -> rsbinder::Result<()>
 pub fn rsbinder::Server::spawn(self) -> rsbinder::Result<rsbinder::ServerGuard>
 pub fn rsbinder::Server::with(self, impl core::ops::function::FnOnce(&mut rsbinder::ServeOptions)) -> Self
+impl core::fmt::Debug for rsbinder::Server
+pub fn rsbinder::Server::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for rsbinder::Server
 impl core::marker::Send for rsbinder::Server
 impl core::marker::Sync for rsbinder::Server
@@ -1953,6 +1957,8 @@ pub fn rsbinder::hub::ServiceManager::try_unregister_service(&self, &str, &rsbin
 pub fn rsbinder::hub::ServiceManager::unregister_for_notifications(&self, &str, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::Result<()>
 pub fn rsbinder::hub::ServiceManager::wait_for_interface<T: rsbinder::FromIBinder + ?core::marker::Sized>(&self, &str) -> rsbinder::Result<rsbinder::Strong<T>>
 pub fn rsbinder::hub::ServiceManager::wait_for_service(&self, &str) -> core::option::Option<rsbinder::SIBinder>
+impl core::fmt::Debug for rsbinder::hub::ServiceManager
+pub fn rsbinder::hub::ServiceManager::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for rsbinder::hub::ServiceManager
 impl core::marker::Send for rsbinder::hub::ServiceManager
 impl core::marker::Sync for rsbinder::hub::ServiceManager
@@ -2155,6 +2161,8 @@ impl core::clone::Clone for rsbinder::lazy_service::LazyServiceRegistrar
 pub fn rsbinder::lazy_service::LazyServiceRegistrar::clone(&self) -> rsbinder::lazy_service::LazyServiceRegistrar
 impl core::default::Default for rsbinder::lazy_service::LazyServiceRegistrar
 pub fn rsbinder::lazy_service::LazyServiceRegistrar::default() -> Self
+impl core::fmt::Debug for rsbinder::lazy_service::LazyServiceRegistrar
+pub fn rsbinder::lazy_service::LazyServiceRegistrar::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for rsbinder::lazy_service::LazyServiceRegistrar
 impl core::marker::Send for rsbinder::lazy_service::LazyServiceRegistrar
 impl core::marker::Sync for rsbinder::lazy_service::LazyServiceRegistrar
@@ -2638,6 +2646,8 @@ pub fn rsbinder::reconnect::ReconnectBuilder<T>::build(self) -> rsbinder::Result
 pub fn rsbinder::reconnect::ReconnectBuilder<T>::on_connect(self, impl core::ops::function::Fn(&rsbinder::reconnect::Connection<'_, T>) -> core::result::Result<(), rsbinder::reconnect::ConnectError> + core::marker::Send + core::marker::Sync + 'static) -> Self
 pub fn rsbinder::reconnect::ReconnectBuilder<T>::options(self, impl core::ops::function::Fn(&mut rsbinder::ClientOptions, &rsbinder::entry::uri::Endpoint) + core::marker::Send + core::marker::Sync + 'static) -> Self
 pub fn rsbinder::reconnect::ReconnectBuilder<T>::policy(self, rsbinder::reconnect::ReconnectPolicy) -> Self
+impl<T: rsbinder::FromIBinder + ?core::marker::Sized> core::fmt::Debug for rsbinder::reconnect::ReconnectBuilder<T>
+pub fn rsbinder::reconnect::ReconnectBuilder<T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<T> core::marker::Freeze for rsbinder::reconnect::ReconnectBuilder<T> where T: ?core::marker::Sized
 impl<T> core::marker::Send for rsbinder::reconnect::ReconnectBuilder<T> where T: ?core::marker::Sized
 impl<T> core::marker::Sync for rsbinder::reconnect::ReconnectBuilder<T> where T: ?core::marker::Sized
@@ -2677,6 +2687,8 @@ pub fn rsbinder::reconnect::Reconnecting<T>::is_closed(&self) -> bool
 pub fn rsbinder::reconnect::Reconnecting<T>::last_error(&self) -> core::option::Option<rsbinder::StatusCode>
 pub fn rsbinder::reconnect::Reconnecting<T>::wait_connected(&self, core::option::Option<core::time::Duration>) -> rsbinder::Result<rsbinder::Strong<T>>
 pub fn rsbinder::reconnect::Reconnecting<T>::with<R, E: core::convert::From<rsbinder::StatusCode>>(&self, impl core::ops::function::FnOnce(&rsbinder::Strong<T>) -> core::result::Result<R, E>) -> core::result::Result<R, E>
+impl<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static> core::fmt::Debug for rsbinder::reconnect::Reconnecting<T>
+pub fn rsbinder::reconnect::Reconnecting<T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static> core::ops::drop::Drop for rsbinder::reconnect::Reconnecting<T>
 pub fn rsbinder::reconnect::Reconnecting<T>::drop(&mut self)
 impl<T> core::marker::Freeze for rsbinder::reconnect::Reconnecting<T> where T: ?core::marker::Sized
@@ -2693,6 +2705,8 @@ pub fn rsbinder::reconnect::WeakReconnecting<T>::generation(&self) -> core::opti
 pub fn rsbinder::reconnect::WeakReconnecting<T>::with<R, E: core::convert::From<rsbinder::StatusCode>>(&self, impl core::ops::function::FnOnce(&rsbinder::Strong<T>) -> core::result::Result<R, E>) -> core::result::Result<R, E>
 impl<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static> core::clone::Clone for rsbinder::reconnect::WeakReconnecting<T>
 pub fn rsbinder::reconnect::WeakReconnecting<T>::clone(&self) -> Self
+impl<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static> core::fmt::Debug for rsbinder::reconnect::WeakReconnecting<T>
+pub fn rsbinder::reconnect::WeakReconnecting<T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<T> core::marker::Freeze for rsbinder::reconnect::WeakReconnecting<T> where T: ?core::marker::Sized
 impl<T> core::marker::Send for rsbinder::reconnect::WeakReconnecting<T> where T: ?core::marker::Sized
 impl<T> core::marker::Sync for rsbinder::reconnect::WeakReconnecting<T> where T: ?core::marker::Sized
@@ -3903,6 +3917,8 @@ pub fn rsbinder::Binder<T>::dump(&self, &mut dyn std::io::Write, &[alloc::string
 pub fn rsbinder::Binder<T>::dump_fd(&self, std::os::fd::owned::OwnedFd, &[alloc::string::String]) -> rsbinder::Result<()>
 impl<T: rsbinder::Remotable> core::clone::Clone for rsbinder::Binder<T>
 pub fn rsbinder::Binder<T>::clone(&self) -> Self
+impl<T: rsbinder::Remotable> core::fmt::Debug for rsbinder::Binder<T>
+pub fn rsbinder::Binder<T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<__RsbPool: rsbinder::BinderAsyncPool> rsbinder::cancel::android::os::ICancellationSignal::ICancellationSignalAsync<__RsbPool> for rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>
 pub fn rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>::cancel<'a>(&'a self) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
 pub fn rsbinder::Binder<rsbinder::cancel::android::os::ICancellationSignal::BnCancellationSignal>::descriptor() -> &'static str where Self: core::marker::Sized
@@ -4021,6 +4037,8 @@ impl core::marker::UnsafeUnpin for rsbinder::ClientOptions
 impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::ClientOptions
 impl core::panic::unwind_safe::UnwindSafe for rsbinder::ClientOptions
 pub struct rsbinder::DeathSignal
+impl core::fmt::Debug for rsbinder::DeathSignal
+pub fn rsbinder::DeathSignal::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::future::future::Future for rsbinder::DeathSignal
 pub type rsbinder::DeathSignal::Output = ()
 pub fn rsbinder::DeathSignal::poll(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<()>
@@ -4270,6 +4288,8 @@ pub fn rsbinder::ProcessState::start_thread_pool()
 pub fn rsbinder::ProcessState::strong_proxy_for_handle(&self, u32) -> rsbinder::Result<rsbinder::SIBinder>
 pub fn rsbinder::ProcessState::strong_ref_count_for_node(&self, &rsbinder::ProxyHandle) -> rsbinder::Result<usize>
 pub fn rsbinder::ProcessState::try_start_thread_pool() -> rsbinder::Result<()>
+impl core::fmt::Debug for rsbinder::ProcessState
+pub fn rsbinder::ProcessState::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::ops::drop::Drop for rsbinder::ProcessState
 pub fn rsbinder::ProcessState::drop(&mut rsbinder::ProcessState)
 impl !core::marker::Freeze for rsbinder::ProcessState
@@ -4344,6 +4364,8 @@ pub fn rsbinder::reconnect::Reconnecting<T>::is_closed(&self) -> bool
 pub fn rsbinder::reconnect::Reconnecting<T>::last_error(&self) -> core::option::Option<rsbinder::StatusCode>
 pub fn rsbinder::reconnect::Reconnecting<T>::wait_connected(&self, core::option::Option<core::time::Duration>) -> rsbinder::Result<rsbinder::Strong<T>>
 pub fn rsbinder::reconnect::Reconnecting<T>::with<R, E: core::convert::From<rsbinder::StatusCode>>(&self, impl core::ops::function::FnOnce(&rsbinder::Strong<T>) -> core::result::Result<R, E>) -> core::result::Result<R, E>
+impl<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static> core::fmt::Debug for rsbinder::reconnect::Reconnecting<T>
+pub fn rsbinder::reconnect::Reconnecting<T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<T: rsbinder::FromIBinder + ?core::marker::Sized + 'static> core::ops::drop::Drop for rsbinder::reconnect::Reconnecting<T>
 pub fn rsbinder::reconnect::Reconnecting<T>::drop(&mut self)
 impl<T> core::marker::Freeze for rsbinder::reconnect::Reconnecting<T> where T: ?core::marker::Sized
@@ -4425,6 +4447,8 @@ pub rsbinder::ServeOptions::reply_timeout: core::option::Option<core::time::Dura
 pub rsbinder::ServeOptions::threads: core::option::Option<u32>
 impl core::default::Default for rsbinder::ServeOptions
 pub fn rsbinder::ServeOptions::default() -> rsbinder::ServeOptions
+impl core::fmt::Debug for rsbinder::ServeOptions
+pub fn rsbinder::ServeOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for rsbinder::ServeOptions
 impl core::marker::Send for rsbinder::ServeOptions
 impl core::marker::Sync for rsbinder::ServeOptions
@@ -4439,6 +4463,8 @@ pub fn rsbinder::Server::endpoint(&self) -> &rsbinder::entry::uri::Endpoint
 pub fn rsbinder::Server::run(self) -> rsbinder::Result<()>
 pub fn rsbinder::Server::spawn(self) -> rsbinder::Result<rsbinder::ServerGuard>
 pub fn rsbinder::Server::with(self, impl core::ops::function::FnOnce(&mut rsbinder::ServeOptions)) -> Self
+impl core::fmt::Debug for rsbinder::Server
+pub fn rsbinder::Server::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for rsbinder::Server
 impl core::marker::Send for rsbinder::Server
 impl core::marker::Sync for rsbinder::Server

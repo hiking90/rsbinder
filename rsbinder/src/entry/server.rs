@@ -98,6 +98,25 @@ pub struct ServeOptions {
     pub call_restriction: Option<CallRestriction>,
 }
 
+impl std::fmt::Debug for ServeOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("ServeOptions");
+        d.field("threads", &self.threads)
+            .field("mmap_size", &self.mmap_size)
+            .field("max_connections", &self.max_connections)
+            .field("handshake_timeout", &self.handshake_timeout)
+            .field("idle_timeout", &self.idle_timeout)
+            .field("reply_timeout", &self.reply_timeout);
+        #[cfg(feature = "rpc")]
+        d.field("authorizer", &self.authorizer.is_some());
+        #[cfg(feature = "rpc-tls")]
+        d.field("tls", &self.tls.is_some());
+        #[cfg(feature = "rpc")]
+        d.field("fd_modes", &self.fd_modes);
+        d.field("call_restriction", &self.call_restriction).finish()
+    }
+}
+
 /// A server being assembled by [`serve`](super::serve). Transport is
 /// fixed by the URI; services are added with [`add`](Self::add); then
 /// [`run`](Self::run) (blocking) or [`spawn`](Self::spawn).
@@ -509,5 +528,16 @@ impl Server {
             server.add_service(&name, binder)?;
         }
         Ok(server)
+    }
+}
+
+impl std::fmt::Debug for Server {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<&str> = self.pending.iter().map(|(name, _)| name.as_str()).collect();
+        f.debug_struct("Server")
+            .field("uri", &format_args!("{}", self.uri))
+            .field("services", &names)
+            .field("options", &self.options)
+            .finish()
     }
 }

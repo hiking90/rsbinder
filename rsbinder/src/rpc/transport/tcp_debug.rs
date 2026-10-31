@@ -56,6 +56,14 @@ pub struct TcpDebugTransport {
     queue: OutQueue,
 }
 
+impl std::fmt::Debug for TcpDebugTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TcpDebugTransport")
+            .field("desc", &self.desc)
+            .finish_non_exhaustive()
+    }
+}
+
 impl TcpDebugTransport {
     /// Wrap an accepted/connected `TcpStream` (sets `TCP_NODELAY`).
     pub fn from_stream(stream: TcpStream) -> RpcResult<Self> {

@@ -506,6 +506,29 @@ pub enum ServiceManager {
     Android16(android_16::BpServiceManager),
 }
 
+impl std::fmt::Debug for ServiceManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let protocol = match self {
+            #[cfg(all(target_os = "android", feature = "android_10"))]
+            ServiceManager::Android10(_) => "android_10",
+            #[cfg(all(target_os = "android", feature = "android_11"))]
+            ServiceManager::Android11(_) => "android_11",
+            #[cfg(all(target_os = "android", feature = "android_12"))]
+            ServiceManager::Android12(_) => "android_12",
+            #[cfg(all(target_os = "android", feature = "android_13"))]
+            ServiceManager::Android13(_) => "android_13",
+            #[cfg(all(target_os = "android", feature = "android_14"))]
+            ServiceManager::Android14(_) => "android_14",
+            #[cfg(all(target_os = "android", feature = "android_15"))]
+            ServiceManager::Android15(_) => "android_15",
+            ServiceManager::Android16(_) => "android_16",
+        };
+        f.debug_struct("ServiceManager")
+            .field("protocol", &protocol)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Which of Android 15's two service-manager numberings this device speaks ([`android_15`]).
 #[cfg(all(
     target_os = "android",

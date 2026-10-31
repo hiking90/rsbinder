@@ -282,6 +282,16 @@ impl Drop for RpcProxy {
     }
 }
 
+impl std::fmt::Debug for RpcProxy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RpcProxy")
+            .field("addr", &self.addr)
+            .field("descriptor", &self.descriptor.get())
+            .field("obituary_sent", &self.obituary_sent.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
 /// Why an RPC `link_to_death` was refused; logged each time (the RPC stack keeps no globals).
 fn unwatched_session_link() {
     log::error!(

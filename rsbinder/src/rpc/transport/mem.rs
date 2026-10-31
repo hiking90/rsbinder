@@ -86,6 +86,17 @@ impl Inbox {
     }
 }
 
+impl std::fmt::Debug for MemTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemTransport")
+            .field("desc", &self.desc)
+            .field("peer", &self.peer)
+            .field("closed", &self.closed.load(Ordering::Relaxed))
+            .field("peer_closed", &self.peer_closed.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
 impl MemTransport {
     /// Create a connected pair. Anything sent on `.0` is received on
     /// `.1` and vice-versa. Peer identity is this process (the only
@@ -256,6 +267,16 @@ impl RpcTransport for MemTransport {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn debug_shows_each_end_closing() {
+        let (a, b) = MemTransport::pair();
+        a.shutdown().unwrap();
+        let a = format!("{a:?}");
+        let b = format!("{b:?}");
+        assert!(a.contains("closed: true, peer_closed: false"), "{a}");
+        assert!(b.contains("closed: false, peer_closed: true"), "{b}");
+    }
 
     #[test]
     fn mem_roundtrip_all_sizes() {

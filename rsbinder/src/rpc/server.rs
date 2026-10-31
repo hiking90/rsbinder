@@ -2213,6 +2213,26 @@ impl Drop for RpcServer {
     }
 }
 
+impl std::fmt::Debug for RpcServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("RpcServer");
+        match &self.bind {
+            BindAddress::Unix { path, .. } => d.field("bind", path),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            BindAddress::UnixAbstract => d.field("bind", &"unix-abstract"),
+            #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
+            BindAddress::Vsock { cid, port } => {
+                d.field("bind", &format_args!("vsock {cid}:{port}"))
+            }
+            #[cfg(feature = "rpc-tls")]
+            BindAddress::Tcp(addr) => d.field("bind", addr),
+        };
+        d.field("max_threads", &self.max_threads.load(Ordering::Relaxed))
+            .field("shutdown", &self.shutdown.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
 impl RpcSession {
     /// Client: resolve a named service published via
     /// [`RpcServer::add_service`].

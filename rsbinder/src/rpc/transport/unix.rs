@@ -387,6 +387,15 @@ pub struct UnixTransport {
     queue: OutQueue,
 }
 
+impl std::fmt::Debug for UnixTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnixTransport")
+            .field("desc", &self.desc)
+            .field("peer", &self.peer)
+            .finish_non_exhaustive()
+    }
+}
+
 impl UnixTransport {
     /// Wrap an already-connected `UnixStream`. Peer identity is
     /// resolved once, here, from the socket.

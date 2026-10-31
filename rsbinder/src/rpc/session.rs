@@ -614,6 +614,19 @@ enum RpcUnixAddr<'a> {
     Abstract(&'a [u8]),
 }
 
+impl std::fmt::Debug for RpcUnixAddr<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RpcUnixAddr::Path(path) => f.debug_tuple("Path").field(path).finish(),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            RpcUnixAddr::Abstract(name) => f
+                .debug_tuple("Abstract")
+                .field(&format_args!("{}", name.escape_ascii()))
+                .finish(),
+        }
+    }
+}
+
 /// Unix-domain android-13+ RPC client configuration.
 ///
 /// Superseded by [`RpcClientConfig`], which takes the same knobs on every
@@ -721,6 +734,25 @@ impl<'a> RpcUnixClientConfig<'a> {
     }
 }
 
+#[expect(
+    deprecated,
+    reason = "implements the deprecated config while it is honored"
+)]
+impl std::fmt::Debug for RpcUnixClientConfig<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RpcUnixClientConfig")
+            .field("addr", &self.addr)
+            .field("max_version", &self.max_version)
+            .field("session_id_len", &self.session_id.len())
+            .field("outgoing_connections", &self.outgoing_connections)
+            .field("incoming_connections", &self.incoming_connections)
+            .field("fd_mode", &self.fd_mode)
+            .field("timeout", &self.timeout)
+            .field("handshake_timeout", &self.handshake_timeout)
+            .finish()
+    }
+}
+
 fn unix_connect(addr: RpcUnixAddr<'_>) -> Result<Box<dyn RpcTransport>> {
     let t = match addr {
         RpcUnixAddr::Path(path) => super::transport::UnixTransport::connect(path),
@@ -752,6 +784,35 @@ enum ClientSource<'a> {
         config: std::sync::Arc<rustls::ClientConfig>,
     },
     Custom(Connector<'a>),
+}
+
+impl std::fmt::Debug for ClientSource<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClientSource::Unix(addr) => f.debug_tuple("Unix").field(addr).finish(),
+            #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
+            ClientSource::Vsock { cid, port } => f
+                .debug_struct("Vsock")
+                .field("cid", cid)
+                .field("port", port)
+                .finish(),
+            #[cfg(feature = "rpc-tcp-debug")]
+            ClientSource::TcpDebug(addr) => f.debug_tuple("TcpDebug").field(addr).finish(),
+            #[cfg(feature = "rpc-tls")]
+            ClientSource::Tls {
+                host,
+                port,
+                server_name,
+                ..
+            } => f
+                .debug_struct("Tls")
+                .field("host", host)
+                .field("port", port)
+                .field("server_name", server_name)
+                .finish_non_exhaustive(),
+            ClientSource::Custom(_) => f.debug_tuple("Custom").finish_non_exhaustive(),
+        }
+    }
 }
 
 impl<'a> ClientSource<'a> {
@@ -1236,6 +1297,21 @@ impl<'a> RpcClientConfig<'a> {
     pub(crate) fn connect_once(self) -> Result<Box<dyn RpcTransport>> {
         let deadline = self.handshake_deadline();
         (self.source.into_connector(deadline))()
+    }
+}
+
+impl std::fmt::Debug for RpcClientConfig<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RpcClientConfig")
+            .field("source", &self.source)
+            .field("max_version", &self.max_version)
+            .field("session_id_len", &self.session_id.len())
+            .field("outgoing_connections", &self.outgoing_connections)
+            .field("incoming_connections", &self.incoming_connections)
+            .field("fd_mode", &self.fd_mode)
+            .field("timeout", &self.timeout)
+            .field("handshake_timeout", &self.handshake_timeout)
+            .finish()
     }
 }
 
@@ -4262,6 +4338,16 @@ fn recv_end_reason(e: RpcError) -> EndReason {
 #[derive(Clone)]
 pub struct RpcSession {
     inner: Arc<RpcSessionInner>,
+}
+
+impl std::fmt::Debug for RpcSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RpcSession")
+            .field("wire_protocol_version", &self.wire_protocol_version())
+            .field("space", &self.inner.shared.space)
+            .field("ended", &self.is_ended())
+            .finish_non_exhaustive()
+    }
 }
 
 impl RpcSession {

@@ -77,7 +77,7 @@ use std::any::Any;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError, Weak};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
@@ -351,6 +351,17 @@ impl<T: FromIBinder + ?Sized + 'static> ReconnectBuilder<T> {
     }
 }
 
+impl<T: FromIBinder + ?Sized> std::fmt::Debug for ReconnectBuilder<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReconnectBuilder")
+            .field("uri", &format_args!("{}", self.uri))
+            .field("options", &self.options.is_some())
+            .field("on_connect", &self.on_connect.is_some())
+            .field("policy", &self.policy)
+            .finish()
+    }
+}
+
 /// A proxy to one service that reconnects when the service goes away; see
 /// the [module doc](self).
 ///
@@ -480,6 +491,23 @@ impl<T: FromIBinder + ?Sized + 'static> Drop for Reconnecting<T> {
     }
 }
 
+impl<T: FromIBinder + ?Sized + 'static> std::fmt::Debug for Reconnecting<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("Reconnecting");
+        d.field("target", &format_args!("{}", self.shared.cfg));
+        let state = match self.shared.state.try_lock() {
+            Ok(st) => Some(st),
+            Err(TryLockError::Poisoned(e)) => Some(e.into_inner()),
+            Err(TryLockError::WouldBlock) => None,
+        };
+        match state {
+            Some(st) => d.field("phase", &st.phase).field("generation", &st.gen),
+            None => d.field("state", &"<locked>"),
+        };
+        d.finish_non_exhaustive()
+    }
+}
+
 /// A [`Reconnecting`] that does not keep it alive: every call is
 /// `DeadObject` once the helper is dropped or closed.
 pub struct WeakReconnecting<T: FromIBinder + ?Sized + 'static> {
@@ -491,6 +519,15 @@ impl<T: FromIBinder + ?Sized + 'static> Clone for WeakReconnecting<T> {
         Self {
             shared: self.shared.clone(),
         }
+    }
+}
+
+impl<T: FromIBinder + ?Sized + 'static> std::fmt::Debug for WeakReconnecting<T> {
+    // No `upgrade`: a temporary strong ref could become the last one and drop the helper here.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeakReconnecting")
+            .field("live", &(self.shared.strong_count() > 0))
+            .finish_non_exhaustive()
     }
 }
 

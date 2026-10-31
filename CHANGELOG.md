@@ -339,6 +339,14 @@ Each item below changes what a 0.12.0 program observes.
 - **`AccessorProviderHandle::keep_for_process()`**: keeps the provider
   registered until the process exits, as AOSP's `addAccessorProvider` does
   when its caller discards the returned weak pointer.
+- **`Debug` for the public types that had none**: `ProcessState`,
+  `Binder<T>`, `Reconnecting<T>`, `WeakReconnecting<T>`,
+  `ReconnectBuilder<T>`, `LazyServiceRegistrar`, `hub::ServiceManager`,
+  `DeathSignal`, `entry::{Server, ServeOptions}`, and with `rpc`
+  `RpcSession`, `RpcServer`, `RpcClientConfig`, `RpcUnixClientConfig`,
+  `RpcProxy` and the transports. None blocks, takes a lock a binder thread
+  holds (a busy one prints `<locked>`), makes a call, or prints key
+  material or a session id.
 
 - **`[[service]] accessor` in `rsb_hub`'s configuration**: the name the
   `IAccessor` of an instance is registered under, AOSP's VINTF `<accessor>`

@@ -1871,6 +1871,17 @@ impl Drop for ProcessState {
     }
 }
 
+impl std::fmt::Debug for ProcessState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProcessState")
+            .field("driver", &self.driver_name)
+            .field("max_threads", &self.max_threads)
+            .field("mmap_size", &self.mmap.size)
+            .field("thread_pool_started", &self.thread_pool_started())
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

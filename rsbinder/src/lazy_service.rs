@@ -663,6 +663,25 @@ impl Default for LazyServiceRegistrar {
     }
 }
 
+impl std::fmt::Debug for LazyServiceRegistrar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("LazyServiceRegistrar");
+        d.field("force_persist", &self.is_force_persisted());
+        let inner = match self.shared.inner.try_lock() {
+            Ok(g) => Some(g),
+            Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        match inner {
+            Some(inner) => d
+                .field("services", &inner.services.len())
+                .field("connected_services", &inner.num_connected_services),
+            None => d.field("state", &"<locked>"),
+        };
+        d.finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! The fakes follow the service manager's `onClients` contract: one notification per

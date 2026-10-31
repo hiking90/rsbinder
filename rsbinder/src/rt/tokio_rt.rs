@@ -320,6 +320,15 @@ impl Drop for DeathSignal {
     }
 }
 
+impl std::fmt::Debug for DeathSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeathSignal")
+            .field("linked", &self.linked)
+            .field("fired", &self.fired)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Watch `binder` and complete when it dies.
 ///
 /// ```ignore

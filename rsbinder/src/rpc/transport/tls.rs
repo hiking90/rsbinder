@@ -426,6 +426,19 @@ fn drive_handshake(conn: &mut Connection, stream: &dyn TlsStream) -> RpcResult<(
     Ok(())
 }
 
+impl std::fmt::Debug for TlsTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsTransport")
+            .field("desc", &self.desc)
+            .field("peer", &self.peer)
+            .field(
+                "shut",
+                &self.shut.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
 impl TlsTransport {
     /// Client side over **any** stream: TLS-handshake to `server_name`,
     /// verifying the server per `config`. Returns only after a

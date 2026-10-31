@@ -669,6 +669,14 @@ impl<T: Remotable> Clone for Binder<T> {
     }
 }
 
+impl<T: Remotable> std::fmt::Debug for Binder<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Binder")
+            .field("descriptor", &T::descriptor())
+            .finish_non_exhaustive()
+    }
+}
+
 impl<T: 'static + Remotable> Deref for Binder<T> {
     type Target = T;
 
