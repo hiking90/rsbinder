@@ -9,6 +9,7 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use rsbinder_fmq::shm::spin::{spin_budget, spin_until, SpinGauge, SPIN_CLOCK_EVERY};
+use rsbinder_fmq::shm::Deadline;
 use rsbinder_fmq::{AttachPolicy, Descriptor, EventFlag, MessageQueue, NOT_EMPTY, NOT_FULL};
 
 use crate::binder::Interface;
@@ -183,6 +184,7 @@ impl Shared {
             self.capacity - END_RESERVE
         };
         let n = HEADER + payload.len();
+        let spin_deadline = wait.spin_deadline();
         // The last wait returned: a bit the consumer left set ends a wait at once, so no second spin.
         let mut woke = false;
         loop {
@@ -200,23 +202,15 @@ impl Shared {
             {
                 let mut queue = self.queue();
                 // The only writer: the reader's counter is reloaded only when it shows no room.
-                let reserved = match queue
+                if let Some(mut txn) = queue
                     .begin_write_cached(n, limit)
                     .map_err(WriteFailure::broken)?
                 {
-                    Some(mut regions) => {
-                        regions
-                            .write_at(0, &header.to_le_bytes())
-                            .map_err(WriteFailure::broken)?;
-                        regions
-                            .write_at(HEADER, payload)
-                            .map_err(WriteFailure::broken)?;
-                        true
-                    }
-                    None => false,
-                };
-                if reserved {
-                    queue.commit_write_cached(n).map_err(WriteFailure::broken)?;
+                    txn.write_at(0, &header.to_le_bytes())
+                        .map_err(WriteFailure::broken)?;
+                    txn.write_at(HEADER, payload)
+                        .map_err(WriteFailure::broken)?;
+                    txn.commit().map_err(WriteFailure::broken)?;
                     drop(queue);
                     self.bump_activity();
                     // Committed is delivered: libfmq's `writeBlocking` ignores a failed wake too.
@@ -236,7 +230,7 @@ impl Shared {
                     Some(deadline)
                 }
             };
-            if !woke && self.turns_within(n, limit, is_end, deadline) {
+            if !woke && self.turns_within(n, limit, is_end, spin_deadline.as_ref()) {
                 continue;
             }
             let seen = match self.park(NOT_FULL | CANCEL, deadline) {
@@ -262,30 +256,30 @@ impl Shared {
         n: usize,
         limit: usize,
         is_end: bool,
-        deadline: Option<Instant>,
+        deadline: Option<&Deadline>,
     ) -> bool {
         let budget = self.spin.budget(deadline);
         let mut queue = self.queue();
-        let (found, spun) = spin_until(budget, || {
+        let (look, spun) = spin_until(budget, || {
             self.dead.load(Ordering::Relaxed)
                 || (!is_end
                     && (self.flag.peek() & CANCEL != 0 || self.abandoned.load(Ordering::Relaxed)))
                 // A broken counter ends the spin too; the loop top reports it.
                 || !matches!(queue.begin_write_cached(n, limit), Ok(None))
         });
-        self.spin.spun(spun, found);
-        found
+        self.spin.spun(spun, look);
+        look.is_found()
     }
 
     /// Look for a record or a death for a spin before parking, leaving the flag word alone.
-    fn fills_within(&self, deadline: Option<Instant>) -> bool {
+    fn fills_within(&self, deadline: Option<&Deadline>) -> bool {
         let budget = self.spin.budget(deadline);
         let queue = self.queue();
-        let (found, spun) = spin_until(budget, || {
+        let (look, spun) = spin_until(budget, || {
             self.dead.load(Ordering::Relaxed) || !matches!(queue.available_to_read(), Ok(0))
         });
-        self.spin.spun(spun, found);
-        found
+        self.spin.spun(spun, look);
+        look.is_found()
     }
 }
 
@@ -600,11 +594,7 @@ impl<T: Serialize + ?Sized> Producer<T> {
     /// Attach to the consumer's ring and watch its sink for death.
     pub(super) fn open(ring: &Ring, sink: &SIBinder, policy: &SinkPolicy) -> Result<Self> {
         let desc = Descriptor::try_from(ring)?;
-        let attach = AttachPolicy {
-            max_capacity: policy.max_ring_bytes,
-            require_seal: true,
-            require_event_flag: true,
-        };
+        let attach = AttachPolicy::new(policy.max_ring_bytes).require_event_flag(true);
         let queue = MessageQueue::<u8>::attach(&desc, &attach).map_err(|e| {
             log::error!("Sink::open: the endpoint's ring cannot be attached: {e}");
             StatusCode::from(e)
@@ -1029,6 +1019,14 @@ impl Wait {
     fn from_deadline(deadline: Option<Instant>) -> Self {
         deadline.map_or(Wait::Forever, Wait::Until)
     }
+
+    /// The deadline a spin budget is cut to, made once for the whole call.
+    fn spin_deadline(&self) -> Option<Deadline> {
+        match *self {
+            Wait::Until(at) => Deadline::after(at.saturating_duration_since(Instant::now())),
+            Wait::Never | Wait::Forever => None,
+        }
+    }
 }
 
 /// What one look at the ring came to.
@@ -1152,6 +1150,7 @@ impl<T: Deserialize> Consumer<T> {
             Wait::Until(deadline) => Some(deadline),
             Wait::Never | Wait::Forever => None,
         };
+        let spin_deadline = wait.spin_deadline();
         // A wait returned: no second spin (a bit left set ends a wait at once), no batch wait.
         let mut woke = false;
         loop {
@@ -1167,7 +1166,7 @@ impl<T: Deserialize> Consumer<T> {
             }
             // Only a call that may wait, and not after a park: the producer was not just writing.
             if !matches!(wait, Wait::Never) && !woke && self.at == self.filled {
-                self.let_a_batch_build(deadline);
+                self.let_a_batch_build(spin_deadline.as_ref());
             }
             match self.step() {
                 Step::Item(item) => return Some(Ok(item)),
@@ -1177,7 +1176,7 @@ impl<T: Deserialize> Consumer<T> {
             if matches!(wait, Wait::Never) {
                 return None;
             }
-            if !woke && self.shared.fills_within(deadline) {
+            if !woke && self.shared.fills_within(spin_deadline.as_ref()) {
                 continue;
             }
             #[cfg(test)]
@@ -1329,13 +1328,16 @@ impl<T: Deserialize> Consumer<T> {
         let batch = &mut self.batch[..available];
         queue
             .begin_read(available)
-            .map_err(StatusCode::from)
-            .and_then(|regions| match regions {
-                Some(regions) => regions.read_at(0, batch).map_err(StatusCode::from),
-                None => Err(StatusCode::BadValue),
+            .and_then(|txn| match txn {
+                Some(txn) => {
+                    txn.read_at(0, batch)?;
+                    txn.commit()
+                }
+                None => Err(rsbinder_fmq::Error::Corrupted(
+                    "fewer elements than were available",
+                )),
             })
-            .and_then(|()| queue.commit_read(available).map_err(StatusCode::from))
-            .map_err(|e| format!("the ring's counters: {e:?}"))?;
+            .map_err(|e| format!("the ring's counters: {:?}", StatusCode::from(e)))?;
         drop(queue);
         self.shared.bump_activity();
         self.at = 0;
@@ -1346,7 +1348,7 @@ impl<T: Deserialize> Consumer<T> {
     }
 
     /// Let up to `MIN_BATCH` bytes build while the producer adds, within the spin budget.
-    fn let_a_batch_build(&self, deadline: Option<Instant>) {
+    fn let_a_batch_build(&self, deadline: Option<&Deadline>) {
         let budget = spin_budget(deadline);
         if budget.is_zero() {
             return;
@@ -1774,11 +1776,7 @@ mod tests {
 
     /// A writer handle outside the producer's checks, which is what a hostile peer amounts to.
     fn raw_writer(ring: &Ring) -> MessageQueue<u8> {
-        let policy = AttachPolicy {
-            max_capacity: 512,
-            require_seal: true,
-            require_event_flag: true,
-        };
+        let policy = AttachPolicy::new(512).require_event_flag(true);
         MessageQueue::<u8>::attach(&Descriptor::try_from(ring).expect("desc"), &policy)
             .expect("attach")
     }
@@ -1853,7 +1851,7 @@ mod tests {
         records.extend_from_slice(&7i32.to_le_bytes());
         records.extend_from_slice(&item_header(512).to_le_bytes());
         records.extend_from_slice(&[0; 4]);
-        assert!(raw.write(&records).expect("write"));
+        assert!(raw.write(&records).expect("write").is_done());
 
         assert_eq!(rx.try_recv().expect("no error"), Some(7));
         let failure = rx.try_recv().expect_err("the stream must end");
@@ -1867,7 +1865,10 @@ mod tests {
     fn a_record_committed_in_two_parts_ends_the_stream() {
         let (mut rx, ring, _sink) = Consumer::<i32>::new(&receiver_policy(512)).expect("a ring");
         let mut raw = raw_writer(&ring);
-        assert!(raw.write(&item_header(4).to_le_bytes()).expect("write"));
+        assert!(raw
+            .write(&item_header(4).to_le_bytes())
+            .expect("write")
+            .is_done());
         let failure = rx.try_recv().expect_err("the stream must end");
         assert_eq!(failure.exception_code(), ExceptionCode::IllegalState);
         assert!(
@@ -2016,17 +2017,13 @@ mod tests {
         let (rx, ring, _sink) = Consumer::<i32>::new(&receiver_policy(512)).expect("a ring");
         let mut rx = rx;
         // A second writer outside the producer's checks is what a hostile peer amounts to.
-        let policy = AttachPolicy {
-            max_capacity: 512,
-            require_seal: true,
-            require_event_flag: true,
-        };
+        let policy = AttachPolicy::new(512).require_event_flag(true);
         let mut raw =
             MessageQueue::<u8>::attach(&Descriptor::try_from(&ring).expect("desc"), &policy)
                 .expect("attach");
         let bogus = item_header(512 - END_RESERVE);
-        assert!(raw.write(&bogus.to_le_bytes()).expect("write"));
-        assert!(raw.write(&[0, 0, 0, 0]).expect("write"));
+        assert!(raw.write(&bogus.to_le_bytes()).expect("write").is_done());
+        assert!(raw.write(&[0, 0, 0, 0]).expect("write").is_done());
 
         let failure = rx.try_recv().expect_err("the stream must end");
         assert_eq!(failure.exception_code(), ExceptionCode::IllegalState);

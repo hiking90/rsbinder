@@ -9,7 +9,7 @@
 //! that is not a subscriber drops the control page with `CLOSED` set in it, so a publisher that
 //! added the subscription before its reply was lost takes it out at its next publish.
 //!
-//! A receive that waits looks at the ring, spins a little ([`rsbinder::fmq::shm::spin`]), and
+//! A receive that waits looks at the ring, spins a little (`rsbinder::fmq::shm::spin`), and
 //! sleeps on the topic's `seq` by the protocol in `wait.rs`.
 
 use std::fmt;
@@ -44,7 +44,8 @@ use crate::pool::{PoolReader, MAX_PINS};
 use crate::receive::{Held, TypedReader};
 use crate::ring::{self, Loads, Reader};
 use crate::wait::{
-    decide, Died, Local, Looked, Next, Parts, Slept, Words, ABANDON, ALL, INTERRUPTED, NOTICE,
+    decide, Died, Local, Looked, Next, Parts, Slept, Until, Words, ABANDON, ALL, INTERRUPTED,
+    NOTICE,
 };
 #[cfg(feature = "tokio")]
 use crate::wait::{on_pool, Armed, Leftover, REACTOR_ENDS};
@@ -134,7 +135,7 @@ impl Default for SubscriberPolicy {
 /// | [`Wait`](crate::Wait), [`wait_any`](crate::wait_any) ([`Wake::Fd`]) | the caller polls |
 ///
 /// A wait first looks at the ring for up to 20 µs, the policy of
-/// [`rsbinder::fmq::shm::spin`], then sleeps until the publisher commits, as
+/// `rsbinder::fmq::shm::spin`, then sleeps until the publisher commits, as
 /// [`SubscriberPolicy::wake`] says: on a word of the topic's memory, for which the publisher
 /// makes one wake system call per commit when some subscriber sleeps, whatever their number, and
 /// none when none does; or on file descriptors of the subscription. An [`Interrupter`] ends a
@@ -639,6 +640,7 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
             }
             self.local.take(ABANDON);
         }
+        let until = deadline.map(Until::new);
         // After a wake, look without spinning: the publisher has just committed or a bit is up.
         let mut woke = false;
         loop {
@@ -655,7 +657,7 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 return Err(RecvError::Timeout);
             }
-            if !woke && self.spun(deadline) {
+            if !woke && self.spun(until.as_ref()) {
                 // Once: on a ring lapped at every look `pending` holds, so every spin ends at once.
                 woke = true;
                 continue;
@@ -670,7 +672,7 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
                 hook();
             }
             let parked_at = Instant::now();
-            let slept = self.local.park(seen, deadline);
+            let slept = self.local.park(seen, until.as_ref());
             #[cfg(all(test, feature = "tokio"))]
             self.trace.parks.push((slept, parked_at.elapsed(), seen));
             match slept {
@@ -682,11 +684,13 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
     }
 
     /// Look at the ring for a spin's budget; whether a record or a bit in `stop` turned up.
-    fn spun(&self, deadline: Option<Instant>) -> bool {
-        let budget = self.spin.budget(deadline);
-        let (found, spun) = spin_until(budget, || self.reader.pending() || self.local.stopped());
-        self.spin.spun(spun, found);
-        found
+    fn spun(&self, deadline: Option<&Until>) -> bool {
+        let budget = self
+            .spin
+            .budget(deadline.and_then(|until| until.futex.as_ref()));
+        let (look, spun) = spin_until(budget, || self.reader.pending() || self.local.stopped());
+        self.spin.spun(spun, look);
+        look.is_found()
     }
 
     /// `seq`, as a wait loads it to decide on and sleep on.

@@ -4,6 +4,8 @@
 //! Loom runs of the real `wake_lazy`/`wait_until` against a modeled word and futex.
 //! Run: see `Cargo.toml` (`--cfg loom`).
 
+use std::num::NonZeroU32;
+
 use loom::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
 use loom::sync::{Arc, Condvar, Mutex};
 use loom::thread;
@@ -42,14 +44,19 @@ impl FlagWord for Side {
             fence(order);
         }
     }
-    fn futex_wait(&self, expected: u32, _bits: u32, _deadline: Option<&Deadline>) -> Result<()> {
+    fn futex_wait(
+        &self,
+        expected: u32,
+        _bits: NonZeroU32,
+        _deadline: Option<&Deadline>,
+    ) -> Result<()> {
         let guard = self.word.futex.lock().unwrap();
         if self.word.word.load(Ordering::SeqCst) == expected {
             drop(self.word.sleepers.wait(guard).unwrap());
         }
         Ok(())
     }
-    fn futex_wake(&self, _bits: u32) -> Result<()> {
+    fn futex_wake(&self, _bits: NonZeroU32) -> Result<()> {
         let _guard = self.word.futex.lock().unwrap();
         self.word.sleepers.notify_all();
         Ok(())

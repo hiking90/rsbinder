@@ -113,7 +113,7 @@ impl Words for Arc<Model> {
         false
     }
 
-    fn sleep(&self, seen: u32, _: Option<Instant>) -> bool {
+    fn sleep(&self, seen: u32, _: Option<&Until>) -> bool {
         if self.fd {
             if self.flaw != Flaw::NoSecondLook && self.seq() != seen {
                 return true;

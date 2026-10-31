@@ -27,7 +27,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use rsbinder_fmq::shm::{Access, Mapping};
-use rsbinder_fmq::{AttachPolicy, Descriptor, Flavor, Grantor, MessageQueue, NOT_EMPTY, NOT_FULL};
+use rsbinder_fmq::{AttachPolicy, Descriptor, Flavor, Grantor, MessageQueue};
 
 const COUNT: u32 = 5000;
 const CAPACITY: usize = 64;
@@ -73,11 +73,7 @@ fn peer() -> Command {
 }
 
 fn policy() -> AttachPolicy {
-    AttachPolicy {
-        max_capacity: 1 << 16,
-        require_seal: true,
-        require_event_flag: true,
-    }
+    AttachPolicy::new(1 << 16).require_event_flag(true)
 }
 
 fn expected_sum() -> u64 {
@@ -93,8 +89,7 @@ fn write_all(q: &mut MessageQueue<u32>) {
             *slot = next;
             next += 1;
         }
-        q.write_blocking(&batch[..n], NOT_FULL, NOT_EMPTY, WAIT)
-            .expect("write_blocking");
+        q.write_blocking(&batch[..n], WAIT).expect("write_blocking");
     }
 }
 
@@ -104,8 +99,7 @@ fn read_all(q: &mut MessageQueue<u32>) {
     let mut sum = 0u64;
     while next < COUNT {
         let n = buf.len().min((COUNT - next) as usize);
-        q.read_blocking(&mut buf[..n], NOT_EMPTY, NOT_FULL, WAIT)
-            .expect("read_blocking");
+        q.read_blocking(&mut buf[..n], WAIT).expect("read_blocking");
         for &v in &buf[..n] {
             assert_eq!(v, next);
             sum += u64::from(v);

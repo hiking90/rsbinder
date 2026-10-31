@@ -181,14 +181,16 @@ impl<'a> CreateOptions<'a> {
 /// [`Error::Unsupported`](crate::Error::Unsupported) off Linux and Android.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn create(size: u64, options: &CreateOptions<'_>) -> Result<OwnedFd> {
+    use crate::error::os;
     use rustix::fs::{FallocateFlags, MemfdFlags};
     let fd = rustix::fs::memfd_create(
         options.name,
         MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
-    )?;
-    rustix::fs::ftruncate(&fd, size)?;
+    )
+    .map_err(os)?;
+    rustix::fs::ftruncate(&fd, size).map_err(os)?;
     if options.allocate {
-        rustix::fs::fallocate(&fd, FallocateFlags::empty(), 0, size)?;
+        rustix::fs::fallocate(&fd, FallocateFlags::empty(), 0, size).map_err(os)?;
     }
     if options.populate {
         // 64 KiB a call: zeros the kernel copies into each page, which marks the page as data.
@@ -196,8 +198,8 @@ pub fn create(size: u64, options: &CreateOptions<'_>) -> Result<OwnedFd> {
         let mut at = 0;
         while at < size {
             let chunk = &zeros[..(size - at).min(zeros.len() as u64) as usize];
-            match rustix::io::pwrite(&fd, chunk, at)? {
-                0 => return Err(rustix::io::Errno::NOSPC.into()),
+            match rustix::io::pwrite(&fd, chunk, at).map_err(os)? {
+                0 => return Err(os(rustix::io::Errno::NOSPC)),
                 written => at += written as u64,
             }
         }
@@ -303,7 +305,8 @@ pub fn create_mapped(
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn add_seals(fd: BorrowedFd<'_>, seals: Seals) -> Result<()> {
     use rustix::fs::SealFlags;
-    rustix::fs::fcntl_add_seals(fd, SealFlags::from_bits_retain(seals.bits()))?;
+    rustix::fs::fcntl_add_seals(fd, SealFlags::from_bits_retain(seals.bits()))
+        .map_err(crate::error::os)?;
     Ok(())
 }
 
@@ -329,7 +332,11 @@ pub fn add_seals(_fd: BorrowedFd<'_>, _seals: Seals) -> Result<()> {
 /// [`Error::Unsupported`](crate::Error::Unsupported) off Linux and Android.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn seals(fd: BorrowedFd<'_>) -> Result<Seals> {
-    Ok(Seals(rustix::fs::fcntl_get_seals(fd)?.bits()))
+    Ok(Seals(
+        rustix::fs::fcntl_get_seals(fd)
+            .map_err(crate::error::os)?
+            .bits(),
+    ))
 }
 
 /// The seals `fd` carries. [`Error::Unsupported`](crate::Error::Unsupported)
@@ -408,16 +415,17 @@ const TMPFS_MAGIC: i128 = 0x0102_1994;
 /// [`Error::Unsupported`](crate::Error::Unsupported) off Linux and Android.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn verify_received(fd: BorrowedFd<'_>) -> Result<u64> {
+    use crate::error::{os, EINVAL};
     use crate::Error;
     use rustix::fs::SeekFrom;
     let seals = match seals(fd) {
         Ok(seals) => seals,
-        Err(Error::Os(rustix::io::Errno::INVAL)) => {
+        Err(Error::Os(EINVAL)) => {
             return Err(Error::BadValue("received fd is not a sealable file"));
         }
         Err(e) => return Err(e),
     };
-    if i128::from(rustix::fs::fstatfs(fd)?.f_type) != TMPFS_MAGIC {
+    if i128::from(rustix::fs::fstatfs(fd).map_err(os)?.f_type) != TMPFS_MAGIC {
         return Err(Error::BadValue("received fd is not a tmpfs file"));
     }
     if !seals.contains(Seals::SHRINK) || !seals.intersects(Seals::WRITE.union(Seals::FUTURE_WRITE))
@@ -426,15 +434,15 @@ pub fn verify_received(fd: BorrowedFd<'_>) -> Result<u64> {
             "received memfd is not sealed against shrinking and writing",
         ));
     }
-    let size = u64::try_from(rustix::fs::fstat(fd)?.st_size)
+    let size = u64::try_from(rustix::fs::fstat(fd).map_err(os)?.st_size)
         .map_err(|_| Error::BadValue("received memfd has a negative size"))?;
     if size == 0 {
         return Err(Error::BadValue("received memfd is empty"));
     }
-    let offset = rustix::fs::tell(fd)?;
+    let offset = rustix::fs::tell(fd).map_err(os)?;
     let first_hole = rustix::fs::seek(fd, SeekFrom::Hole(0));
-    rustix::fs::seek(fd, SeekFrom::Start(offset))?;
-    if first_hole? != size {
+    rustix::fs::seek(fd, SeekFrom::Start(offset)).map_err(os)?;
+    if first_hole.map_err(os)? != size {
         return Err(Error::BadValue("received memfd has a page without data"));
     }
     Ok(size)
@@ -451,6 +459,7 @@ pub fn verify_received(_fd: BorrowedFd<'_>) -> Result<u64> {
 mod tests {
     use super::super::{Access, Mapping};
     use super::*;
+    use crate::error::os;
     use crate::Error;
     use rustix::io::Errno;
     use std::os::fd::AsFd;
@@ -512,7 +521,7 @@ mod tests {
         add_seals(fd.as_fd(), Seals::SEAL).unwrap();
         assert_eq!(
             add_seals(fd.as_fd(), Seals::WRITE).unwrap_err(),
-            Error::Os(Errno::PERM)
+            os(Errno::PERM)
         );
     }
 
@@ -522,7 +531,7 @@ mod tests {
         let unknown = Seals::from_bits(1 << 30);
         assert_eq!(
             add_seals(fd.as_fd(), Seals::GROW | unknown).unwrap_err(),
-            Error::Os(Errno::INVAL)
+            os(Errno::INVAL)
         );
         assert_eq!(named_seals(&fd), Seals::empty());
     }
@@ -534,7 +543,7 @@ mod tests {
         add_seals(fd.as_fd(), Seals::FUTURE_WRITE).unwrap();
         assert_eq!(
             Mapping::map(fd.as_fd(), 0, page(), Access::ReadWrite).unwrap_err(),
-            Error::Os(Errno::PERM)
+            os(Errno::PERM)
         );
         let reader = Mapping::map(fd.as_fd(), 0, page(), Access::ReadOnly).unwrap();
         byte(&owner, 0).store(0x5a, Ordering::Relaxed);
@@ -551,7 +560,7 @@ mod tests {
         assert_eq!(verify_received(fd.as_fd()).unwrap(), 2 * page());
         assert_eq!(
             Mapping::map(fd.as_fd(), 0, page(), Access::ReadWrite).unwrap_err(),
-            Error::Os(Errno::PERM)
+            os(Errno::PERM)
         );
         let reader = Mapping::map(fd.as_fd(), 0, 2 * page(), Access::ReadOnly).unwrap();
         let last = 2 * page() as usize - 1;
@@ -578,7 +587,7 @@ mod tests {
         let unknown = Seals::from_bits(1 << 30);
         assert_eq!(
             create_mapped(page(), &options, unknown).err(),
-            Some(Error::Os(Errno::INVAL))
+            Some(os(Errno::INVAL))
         );
         assert!(matches!(
             create_mapped(0, &options, Seals::SHRINK),
@@ -592,7 +601,7 @@ mod tests {
         let reader = Mapping::map(fd.as_fd(), 0, page(), Access::ReadOnly).unwrap();
         assert_eq!(
             add_seals(fd.as_fd(), Seals::WRITE).unwrap_err(),
-            Error::Os(Errno::BUSY)
+            os(Errno::BUSY)
         );
         drop(reader);
         add_seals(fd.as_fd(), Seals::WRITE).unwrap();
@@ -602,7 +611,7 @@ mod tests {
     fn an_fd_without_seals_is_einval() {
         // Not a file: a regular tmpfs file has seals, and the test binary may sit on tmpfs.
         let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
-        assert_eq!(seals(socket.as_fd()).unwrap_err(), Error::Os(Errno::INVAL));
+        assert_eq!(seals(socket.as_fd()).unwrap_err(), os(Errno::INVAL));
     }
 
     #[test]
@@ -749,7 +758,7 @@ mod tests {
             Err(e) => panic!("memfd_create(MFD_HUGETLB): {e}"),
         };
         // Seals on a hugetlbfs memfd came with Linux 4.16; before, it is refused as unsealable.
-        if let Err(Error::Os(Errno::INVAL)) = seals(huge.as_fd()) {
+        if seals(huge.as_fd()) == Err(os(Errno::INVAL)) {
             assert_eq!(refusal(huge.as_fd()), "received fd is not a sealable file");
             return;
         }

@@ -6,7 +6,7 @@
 
 use std::os::fd::{AsFd, OwnedFd};
 
-use crate::error::{Error, Result};
+use crate::error::{os, received, Error, Result};
 use crate::shm;
 
 /// `MQFlavor` — which reader/writer discipline the queue follows.
@@ -18,7 +18,8 @@ use crate::shm;
 /// [`UnsyncWriter`](crate::UnsyncWriter) and
 /// [`UnsyncReader`](crate::UnsyncReader) for
 /// [`UnsynchronizedWrite`](Flavor::UnsynchronizedWrite). Attaching a
-/// descriptor of the other flavor is `BadValue`.
+/// descriptor of the other flavor is
+/// [`InvalidDescriptor`](Error::InvalidDescriptor).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Flavor {
     /// One reader, one writer; a full queue refuses the write.
@@ -142,12 +143,23 @@ fn io_to_errno(e: std::io::Error) -> Error {
 
 /// What a receiver demands of a descriptor before mapping it. libfmq's own
 /// checks (field ranges, alignment, minimum extents, quantum) always run;
-/// these are the ones libfmq does not make.
+/// these are the ones libfmq does not make. A descriptor that fails one is
+/// [`Error::InvalidDescriptor`].
+///
+/// Made with [`new`](Self::new) and the setters:
+///
+/// ```
+/// use rsbinder_fmq::AttachPolicy;
+///
+/// let policy = AttachPolicy::new(1 << 16).require_event_flag(true);
+/// assert!(policy.require_seal);
+/// ```
 ///
 /// There is no `Default`: `max_capacity` is a bound only the caller can
 /// choose, and a receiver that maps a peer-sized region without one has
 /// handed the peer control of its address space.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AttachPolicy {
     /// Largest element count the receiver will map.
     pub max_capacity: usize,
@@ -156,10 +168,45 @@ pub struct AttachPolicy {
     /// (a later access would raise `SIGBUS`). An ashmem region can be
     /// resized until its first `mmap`, so attaching re-reads its size after
     /// mapping and refuses a region that no longer covers the grantors.
+    ///
+    /// `true` from [`new`](Self::new). Every queue libfmq makes passes: an
+    /// ashmem region, or on Android 11 and later a memfd libcutils seals
+    /// `GROW | SHRINK`; so does every queue this crate makes.
     pub require_seal: bool,
     /// Require the EventFlag word, without which no blocking operation
-    /// exists.
+    /// exists. [`MessageQueue::attach`](crate::MessageQueue::attach) checks
+    /// it; [`UnsyncReader::attach`](crate::UnsyncReader::attach) ignores it,
+    /// since a reader of that flavor never maps the word.
+    ///
+    /// `false` from [`new`](Self::new), as in libfmq, where the word is
+    /// optional: without it a blocking call fails at call time with
+    /// [`Error::NoEventFlag`].
     pub require_event_flag: bool,
+}
+
+impl AttachPolicy {
+    /// A policy that maps at most `max_capacity` elements, requires the
+    /// seal ([`require_seal`](field@Self::require_seal)) and not the
+    /// EventFlag word ([`require_event_flag`](field@Self::require_event_flag)).
+    pub const fn new(max_capacity: usize) -> Self {
+        Self {
+            max_capacity,
+            require_seal: true,
+            require_event_flag: false,
+        }
+    }
+
+    /// Set [`require_seal`](field@Self::require_seal).
+    pub const fn require_seal(mut self, require_seal: bool) -> Self {
+        self.require_seal = require_seal;
+        self
+    }
+
+    /// Set [`require_event_flag`](field@Self::require_event_flag).
+    pub const fn require_event_flag(mut self, require_event_flag: bool) -> Self {
+        self.require_event_flag = require_event_flag;
+        self
+    }
 }
 
 /// Grantor offsets are multiples of this (`alignToWordBoundary`, 64 bits).
@@ -212,7 +259,7 @@ impl Object {
         if shm::is_ashmem_fd(fd) {
             return Ok(Object::Ashmem(index));
         }
-        let st = rustix::fs::fstat(fd)?;
+        let st = rustix::fs::fstat(fd).map_err(os)?;
         Ok(Object::File {
             dev: st.st_dev as u64,
             ino: st.st_ino as u64,
@@ -227,21 +274,24 @@ pub(crate) fn validate(
     policy: &AttachPolicy,
     flavor: Flavor,
 ) -> Result<Geometry> {
+    let invalid = |what| Err(Error::InvalidDescriptor(what));
     if desc.flavor != flavor {
-        return Err(Error::BadValue(match flavor {
+        return invalid(match flavor {
             Flavor::SynchronizedReadWrite => "descriptor is not of the synchronized flavor",
             Flavor::UnsynchronizedWrite => "descriptor is not of the unsynchronized flavor",
-        }));
+        });
     }
     if quantum == 0 || desc.quantum as usize != quantum {
-        return Err(Error::BadValue("quantum differs from the element size"));
+        return invalid("quantum differs from the element size");
     }
     let n = desc.grantors.len();
     if n <= Descriptor::DATA {
-        return Err(Error::BadValue("fewer than three grantors"));
+        return invalid("fewer than three grantors");
     }
-    if policy.require_event_flag && n <= Descriptor::EVENT_FLAG_WORD {
-        return Err(Error::BadValue("no EventFlag word"));
+    // An unsync reader never maps the word, so the policy asks for it of a sync queue only.
+    let wants_flag = policy.require_event_flag && flavor == Flavor::SynchronizedReadWrite;
+    if wants_flag && n <= Descriptor::EVENT_FLAG_WORD {
+        return invalid("no EventFlag word");
     }
     let used = &desc.grantors[..n.min(Descriptor::EVENT_FLAG_WORD + 1)];
 
@@ -250,18 +300,16 @@ pub(crate) fn validate(
     for (i, g) in used.iter().enumerate() {
         let fd_index = g.fd_index as usize;
         if fd_index >= desc.fds.len() {
-            return Err(Error::BadValue("grantor fd index out of range"));
+            return invalid("grantor fd index out of range");
         }
         if u64::from(g.offset) % ALIGN != 0 {
-            return Err(Error::BadValue("grantor offset not 8-byte aligned"));
+            return invalid("grantor offset not 8-byte aligned");
         }
         if g.offset > i32::MAX as u32 || g.extent > i32::MAX as u64 {
-            return Err(Error::BadValue("grantor offset or extent exceeds i32"));
+            return invalid("grantor offset or extent exceeds i32");
         }
         if g.extent < MIN_EXTENT[i] {
-            return Err(Error::BadValue(
-                "grantor extent below the minimum for its role",
-            ));
+            return invalid("grantor extent below the minimum for its role");
         }
         let size = match sizes[fd_index] {
             Some((s, _)) => s,
@@ -269,28 +317,26 @@ pub(crate) fn validate(
                 // Seal first: a memfd seal is permanent; ashmem's size is re-checked once mapped.
                 let fd = desc.fds[fd_index].as_fd();
                 if policy.require_seal && !(shm::shrink_sealed(fd) || shm::is_ashmem_fd(fd)) {
-                    return Err(Error::BadValue("fd is neither shrink-sealed nor ashmem"));
+                    return invalid("fd is neither shrink-sealed nor ashmem");
                 }
-                let s = shm::region_size(fd)?;
+                let s = shm::region_size(fd).map_err(received)?;
                 sizes[fd_index] = Some((s, Object::of(fd, fd_index)?));
                 s
             }
         };
         if u64::from(g.offset) + g.extent > size {
-            return Err(Error::BadValue("grantor extends past the end of its fd"));
+            return invalid("grantor extends past the end of its fd");
         }
     }
 
     let data = used[Descriptor::DATA];
     if data.extent % quantum as u64 != 0 {
-        return Err(Error::BadValue("data extent not a multiple of the quantum"));
+        return invalid("data extent not a multiple of the quantum");
     }
     // ≤ i32::MAX, so it fits a 32-bit usize.
     let capacity = (data.extent / quantum as u64) as usize;
     if capacity > policy.max_capacity {
-        return Err(Error::BadValue(
-            "capacity above the attach policy's maximum",
-        ));
+        return invalid("capacity above the attach policy's maximum");
     }
 
     // Every used grantor's fd was visited above, so its object is known.
@@ -303,7 +349,7 @@ pub(crate) fn validate(
             let (a0, a1) = (u64::from(ga.offset), u64::from(ga.offset) + ga.extent);
             let (b0, b1) = (u64::from(gb.offset), u64::from(gb.offset) + gb.extent);
             if a0 < b1 && b0 < a1 {
-                return Err(Error::BadValue("grantor regions overlap"));
+                return invalid("grantor regions overlap");
             }
         }
     }
@@ -324,8 +370,12 @@ pub(crate) fn recheck_ashmem_sizes(desc: &Descriptor, geo: &Geometry) -> Result<
         .chain(geo.event_flag);
     for g in grantors {
         let fd = desc.fds[g.fd_index as usize].as_fd();
-        if shm::is_ashmem_fd(fd) && u64::from(g.offset) + g.extent > shm::ashmem_size(fd)? {
-            return Err(Error::BadValue("grantor extends past the end of its fd"));
+        if shm::is_ashmem_fd(fd)
+            && u64::from(g.offset) + g.extent > shm::ashmem_size(fd).map_err(received)?
+        {
+            return Err(Error::InvalidDescriptor(
+                "grantor extends past the end of its fd",
+            ));
         }
     }
     Ok(())
@@ -334,6 +384,7 @@ pub(crate) fn recheck_ashmem_sizes(desc: &Descriptor, geo: &Geometry) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Errno;
 
     #[test]
     fn default_layout_matches_libfmq_offsets() {
@@ -380,22 +431,20 @@ mod tests {
 
     #[test]
     fn an_io_error_without_a_valid_errno_maps_to_eio() {
-        // linux_raw panics on these and libc keeps them; both backends must give `EIO`.
+        // No errno the kernel returns: every such code is `EIO`.
+        let eio = Error::Os(Errno::from_raw(rustix::io::Errno::IO.raw_os_error()));
         for code in [0, -1, 4096, i32::MAX] {
             assert_eq!(
                 io_to_errno(std::io::Error::from_raw_os_error(code)),
-                Error::Os(rustix::io::Errno::IO),
+                eio,
                 "{code}"
             );
         }
-        assert_eq!(
-            io_to_errno(std::io::Error::other("no code")),
-            Error::Os(rustix::io::Errno::IO)
-        );
+        assert_eq!(io_to_errno(std::io::Error::other("no code")), eio);
         let emfile = rustix::io::Errno::MFILE.raw_os_error();
         assert_eq!(
             io_to_errno(std::io::Error::from_raw_os_error(emfile)),
-            Error::Os(rustix::io::Errno::MFILE)
+            Error::Os(Errno::from_raw(emfile))
         );
     }
 

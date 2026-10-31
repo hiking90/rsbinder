@@ -1155,11 +1155,7 @@ fn an_unsynchronized_reader_of_bytes_reads_the_records_of_a_reply() {
         publisher.acceptor().accept(&asked).unwrap()
     };
     let descriptor = Descriptor::try_from(&endpoint.ring).unwrap();
-    let policy = AttachPolicy {
-        max_capacity: MIN_RING,
-        require_seal: true,
-        require_event_flag: false,
-    };
+    let policy = AttachPolicy::new(MIN_RING);
     let mut reader = UnsyncReader::<u8>::attach(&descriptor, &policy, UnsyncStart::Oldest).unwrap();
     assert_eq!(reader.capacity(), MIN_RING);
     let mut read_exactly = |len: usize| {

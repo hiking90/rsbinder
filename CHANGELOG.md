@@ -17,21 +17,73 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 Each item below changes what a 0.12.0 program observes.
 
-- On a 32-bit target `MessageQueue::attach` refuses, with `BadValue`, a data
-  grantor whose `extent` plus `offset` modulo the page size is more than
+- **`MessageQueue::begin_write`, `begin_write_cached` and `begin_read`
+  return a transaction, `WriteTxn` or `ReadTxn`; `commit_write`,
+  `commit_write_cached` and `commit_read` are gone.** The transaction gives
+  `write_at` (a `WriteTxn`) or `read_at` (a `ReadTxn`) and is committed with
+  `commit()` (all of it) or `commit_first(n)` (a prefix):
+  `if let Some(mut r) = q.begin_write(n)? { r.write_at(0, x)?; } q.commit_write(n)?;`
+  becomes
+  `if let Some(mut txn) = q.begin_write(n)? { txn.write_at(0, x)?; txn.commit()?; }`.
+  A transaction dropped without a commit publishes or frees nothing (AOSP's
+  Rust `WriteCompletion` commits the whole reservation on drop, which
+  publishes elements never written). A commit cannot exceed its own
+  reservation (`commit_first(n)` above `len` is `BadValue`), and one that
+  finds this side's counter moved since its begin, or the peer's moved
+  back, is `Corrupted`; 0.12.0 returned `BadValue("commit exceeds …")`
+  there and accepted a commit with no begin.
+- **`MessageQueue::write` and `read` return `Result<Transfer>`**
+  (`Transfer::Done` / `Transfer::WouldBlock`, `is_done()`), not
+  `Result<bool>`. `Transfer` is `#[must_use]`, so `q.write(&x)?;`, which
+  loses the items of a write that would block, now warns.
+- **`write_blocking` and `read_blocking` take the items and the timeout
+  only**, waiting on and waking the default bits; other bits go through
+  `write_blocking_with` / `read_blocking_with` and
+  `Notify { wait, wake }`. `write_blocking(items, NOT_FULL, NOT_EMPTY, t)`
+  becomes `write_blocking(items, t)`, `read_blocking(out, NOT_EMPTY,
+  NOT_FULL, t)` becomes `read_blocking(out, t)`, and other masks become
+  `*_with(.., Notify::new(wait, wake), t)` with `wait` a `NonZeroU32`.
+  libfmq's `readBlocking` lists the wake mask before the wait mask, the
+  reverse of the 0.12.0 positions; named fields cannot be swapped by
+  position. `Some(Duration::ZERO)` tries once and returns `TimedOut`
+  without touching the EventFlag word; 0.12.0 waited on a deadline already
+  past, which cleared the wait bits it found set.
+- **`shm::futex_wait`, `shm::futex_wake`, `shm::RoWord32::wait` and `wake`
+  take the bit mask as `NonZeroU32`**; the `BadValue("empty bit mask")`
+  for `0` is gone. `EventFlag::wait(0)` is still `BadValue` and
+  `EventFlag::wake(0)` a no-op, as in libfmq.
+- **`AttachPolicy` is `#[non_exhaustive]`**: `AttachPolicy { max_capacity:
+  n, require_seal: true, require_event_flag: e }` becomes
+  `AttachPolicy::new(n).require_event_flag(e)`. `new` sets `require_seal`
+  and leaves `require_event_flag` off; `.require_seal(false)` turns the
+  seal check off. The fields stay readable.
+- **A descriptor that `MessageQueue::attach` or `UnsyncReader::attach`
+  refuses is `Error::InvalidDescriptor`, not `BadValue`**: flavor, quantum,
+  grantor geometry and overlap, an fd that is unsealed, too small or a
+  hugetlbfs file, a ring mapping over `isize::MAX` on 32-bit, and the
+  `AttachPolicy` refusals. `BadValue` is for the caller's own arguments.
+  `StatusCode::from` maps `InvalidDescriptor` to `BadValue`, so code that
+  converts to a binder status sees no change.
+- **`Error::Os` carries `rsbinder_fmq::Errno`, not `rustix::io::Errno`**, and
+  `impl From<rustix::io::Errno> for rsbinder_fmq::Error` is removed, so a
+  rustix major release is no longer a semver break of this crate.
+  `Errno::raw()` gives the number and `Errno::from_raw` builds one;
+  `std::io::Error::from` takes both `Errno` and `Error`.
+- On a 32-bit target `MessageQueue::attach` refuses, with
+  `InvalidDescriptor`, a data grantor whose `extent` plus `offset` modulo the page size is more than
   `isize::MAX` (2 GiB − 1). That sum is the length mapped for the ring, and
   `shm::Mapping` maps no more than a Rust slice may span. 0.12.0 passed the
   length to `mmap`: on 32-bit Linux it attached the queue when the address
   space had room for it (it does in an i686 process on an x86_64 kernel);
   on 32-bit Android bionic's `mmap64` refused the length with `ENOMEM`, so
-  there only the error changes (`Os(ENOMEM)` to `BadValue`). Only a
+  there only the error changes (`Os(ENOMEM)` to `InvalidDescriptor`). Only a
   descriptor with an `extent` within one page of `i32::MAX` and a data
   `offset` that is not a multiple of the page size can be refused; one from
   `MessageQueue::create` never is, and 64-bit targets are not affected. Make
   the ring smaller; on 32-bit Linux a data grantor on a page boundary
   attaches too.
-- `MessageQueue::attach` refuses, with `BadValue`, a descriptor in which a
-  counter, the data or the EventFlag grantor names an fd that is a hugetlbfs
+- `MessageQueue::attach` refuses, with `InvalidDescriptor`, a descriptor in
+  which a counter, the data or the EventFlag grantor names an fd that is a hugetlbfs
   file, such as a memfd created `MFD_HUGETLB`; the check is in
   `shm::Mapping::map`, which on Linux and Android calls `fstatfs`
   (`fstatfs64` on a 32-bit target) before each `mmap` and refuses an fd
@@ -62,10 +114,9 @@ Each item below changes what a 0.12.0 program observes.
   memfd or ashmem regions, which are not refused. The `fstatfs` of the item
   above is made here too, once for each mapping.
 - `MessageQueue::attach` refuses a descriptor of the unsynchronized flavor
-  with `BadValue("descriptor is not of the synchronized flavor")` (0.12.0:
-  `"only the synchronized flavor is supported"`). The flavor now has types
-  of its own (see Added). Code that compares the text needs the new one;
-  matching on the variant is unaffected.
+  with `InvalidDescriptor("descriptor is not of the synchronized flavor")`
+  (0.12.0: `BadValue("only the synchronized flavor is supported")`). The
+  flavor now has types of its own (see Added).
 - Off Linux and Android (macOS), `MessageQueue::create` and
   `MessageQueue::attach` return `Error::Unsupported` before they look at
   their arguments or make a system call. 0.12.0 checked `create`'s
@@ -492,8 +543,13 @@ Each item below changes what a 0.12.0 program observes.
     libfmq from `android-16.0.0_r4`), which the writer stores before it
     copies and a reader loads after its own copy to find out that it was
     overwritten. `UnsyncReader::read_latest` follows libfmq's `readLatest`,
-    except that a write in progress on a full ring makes it return `0` only
-    when that write reserves the whole ring.
+    except that a write in progress on a full ring makes it copy nothing
+    (`UnsyncLatest { copied: 0 }`) only when that write reserves the whole
+    ring.
+  - `UnsyncWriter::begin_write` returns an `UnsyncWriteTxn`, committed with
+    `commit()` or `commit_first(n)` as the synchronized flavor's
+    transactions are. `UnsyncReader::attach` maps no EventFlag word, so it
+    ignores `AttachPolicy::require_event_flag`.
   - `UnsyncCreate::read_only_readers` seals the memfd `F_SEAL_FUTURE_WRITE`
     after the writer mapped it, so no reader can write the counters or the
     ring. On a kernel without that seal (mainline Linux before 5.1)
@@ -562,12 +618,17 @@ Each item below changes what a 0.12.0 program observes.
     length grows by the run's length, and the bytes it held stay in front.
     A caller that receives into a new or reused buffer no longer writes
     every byte twice, once with zeros and once with the copy.
-- **`rsbinder_fmq::shm::spin`**: how long a side of a shared-memory channel
-  looks at the memory before it parks on a futex — `SPIN`, `spin_budget`,
-  `spin_until`, `SpinGauge` and `SPIN_CLOCK_EVERY`. This is the policy
-  `rsbinder::stream`'s ring has used since 0.12.0, moved here unchanged so
-  that every channel in a process counts against one limit on concurrent
-  looks (half the cores); `stream` now calls it from here.
+- **`rsbinder_fmq::shm::spin`** (workspace-internal, `#[doc(hidden)]`, not
+  covered by the stability tier): how long a side of a shared-memory
+  channel looks at the memory before it parks on a futex. This is the
+  policy `rsbinder::stream`'s ring has used since 0.12.0, moved here so
+  that every channel in a process, `stream`'s and `rsbinder-topic`'s,
+  counts against one limit on concurrent looks (half the cores).
+- **`MessageQueue::write_blocking_with` / `read_blocking_with` and
+  `Notify`** (with `Notify::WRITE` / `Notify::READ`, the default bits),
+  **`Transfer`**, **`WriteTxn` / `ReadTxn`**, **`AttachPolicy::new`** with
+  `require_seal` / `require_event_flag`, **`Error::InvalidDescriptor`** and
+  **`rsbinder_fmq::Errno`**: see Migrating.
 - **`to_bytes_into` and `from_bytes_in`**: `to_bytes` and `from_bytes` on a
   buffer the caller keeps. `to_bytes_into(&value, &mut out)` appends to `out`
   the bytes `to_bytes` returns, wherever `out` ends, and on an error leaves

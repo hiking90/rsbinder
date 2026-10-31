@@ -110,7 +110,8 @@ tweaks; wire formats are already locked.
   `wait_for_interface_async`, `check_interface_async`, `death_signal` /
   `DeathSignal`. Wire behavior is that of the synchronous calls they wrap.
 - **Fast Message Queue (new in 0.12.0)** — the `rsbinder-fmq` crate
-  (`MessageQueue`, `EventFlag`, `Descriptor`, `AttachPolicy`; the synchronized
+  (`MessageQueue` with `WriteTxn`, `ReadTxn`, `Transfer` and `Notify`,
+  `EventFlag`, `Descriptor`, `AttachPolicy`, `Error` and `Errno`; the synchronized
   flavor, primitive elements, Linux and Android targets with 64-bit atomics)
   and `rsbinder::fmq`, which
   re-exports it on every platform beside the AOSP parcelables `MQDescriptor`,
@@ -134,8 +135,8 @@ tweaks; wire formats are already locked.
   See [Builtin AOSP Types](./aidl-data-types.md#builtin-aosp-types) and
   [Generic Parcelables](./aidl-parcelable.md#generic-parcelables).
 - **Fast Message Queue, unsynchronized flavor** — `UnsyncWriter` and
-  `UnsyncReader` of `rsbinder-fmq`, with `UnsyncCreate`, `UnsyncStart` and
-  `UnsyncRead`: one writer, any number of readers, a full ring overwrites its
+  `UnsyncReader` of `rsbinder-fmq`, with `UnsyncWriteTxn`, `UnsyncCreate`,
+  `UnsyncStart`, `UnsyncRead` and `UnsyncLatest`: one writer, any number of readers, a full ring overwrites its
   oldest elements. The layout and the counter discipline are `libfmq`'s as of
   `android-17.0.0_r1` (the write region end, the resume half a ring behind
   the writer, `readLatest`), so, as for the synchronized flavor, only the
@@ -162,7 +163,9 @@ tweaks; wire formats are already locked.
   only `mmap`, so it works on macOS too (on WASI `Mapping::map` returns
   `Unsupported`), and `Run` only atomics. `RoWord64` exists on the 64-bit
   architectures, on 32-bit x86 with SSE2 and on 32-bit ARM with 64-bit
-  atomics.
+  atomics. `shm::spin` (how long a side looks before it parks) is public
+  only so that `rsbinder`'s streams and `rsbinder-topic` share one limit; it
+  is hidden from the documentation and is not part of this tier.
 - **Streaming (new in 0.12.0)** — the `stream` module: `Sink`, `Receiver`,
   and the three AIDL files in `rsbinder/aidl/stream/`: the
   `rsbinder.stream.StreamEndpoint<T>` parcelable (`T` the item type; the ring's

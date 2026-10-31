@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use rsbinder::fmq::{
     AttachPolicy, Descriptor, Error as FmqError, MQDescriptor, MessageQueue, SynchronizedReadWrite,
-    NOT_EMPTY, NOT_FULL,
+    Transfer,
 };
 use rsbinder::*;
 
@@ -46,11 +46,7 @@ type FmqResult<T> = std::result::Result<T, FmqError>;
 
 /// Receiver policy: shrink-sealed memfd or ashmem, plus the EventFlag word the blocking legs need.
 pub fn policy() -> AttachPolicy {
-    AttachPolicy {
-        max_capacity: 1 << 16,
-        require_seal: true,
-        require_event_flag: true,
-    }
+    AttachPolicy::new(1 << 16).require_event_flag(true)
 }
 
 fn expected_sum(count: i32) -> i64 {
@@ -67,7 +63,7 @@ pub fn write_all(q: &mut MessageQueue<i32>, count: i32) -> FmqResult<()> {
             *slot = next;
             next += 1;
         }
-        q.write_blocking(&chunk[..n], NOT_FULL, NOT_EMPTY, WAIT)?;
+        q.write_blocking(&chunk[..n], WAIT)?;
     }
     Ok(())
 }
@@ -80,7 +76,7 @@ pub fn read_all(q: &mut MessageQueue<i32>, count: i32) -> FmqResult<(i64, bool)>
     let mut chunk = [0i32; 7];
     while next < count {
         let n = chunk.len().min((count - next) as usize);
-        q.read_blocking(&mut chunk[..n], NOT_EMPTY, NOT_FULL, WAIT)?;
+        q.read_blocking(&mut chunk[..n], WAIT)?;
         for item in &chunk[..n] {
             if *item != next {
                 ordered = false;
@@ -166,8 +162,8 @@ impl IFmqPeer for Peer {
         let availableToWrite = report(q.available_to_write());
         let mut items = vec![0i32; usize::try_from(count).map_err(|_| StatusCode::BadValue)?];
         let (readResult, sum) = match q.read(&mut items) {
-            Ok(true) => (1, items.iter().map(|i| i64::from(*i)).sum()),
-            Ok(false) => (0, 0),
+            Ok(Transfer::Done) => (1, items.iter().map(|i| i64::from(*i)).sum()),
+            Ok(Transfer::WouldBlock) => (0, 0),
             Err(_) => (-1, 0),
         };
         Ok(QueueView {

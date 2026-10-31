@@ -4,6 +4,7 @@
 use std::cell::Cell;
 use std::marker::PhantomData;
 use std::mem::size_of;
+use std::num::NonZeroU32;
 use std::os::fd::{AsFd, OwnedFd};
 use std::ptr::NonNull;
 #[cfg(target_has_atomic = "64")]
@@ -14,8 +15,8 @@ use std::time::Duration;
 use crate::descriptor::{
     default_layout, recheck_ashmem_sizes, validate, AttachPolicy, Descriptor, Flavor, Grantor,
 };
-use crate::error::{Error, Result};
-use crate::event_flag::EventFlag;
+use crate::error::{received, Error, Result};
+use crate::event_flag::{EventFlag, NOT_EMPTY, NOT_FULL};
 use crate::ring;
 use crate::shm::{self, Access, CreateOptions, Deadline, Mapping, Run, Seals};
 
@@ -80,12 +81,7 @@ impl Counter {
         // No `Counter` exists where `AtomicU64` is the uninhabited stand-in; `get` relies on it.
         check_target()?;
         // Only the 8-byte word: a peer-sized extent would be the peer's choice of address space.
-        let mapping = Mapping::map(
-            desc.fds[g.fd_index as usize].as_fd(),
-            u64::from(g.offset),
-            8,
-            Access::ReadWrite,
-        )?;
+        let mapping = map_grantor(desc, g, 8, Access::ReadWrite)?;
         let ptr = mapping.as_ptr().cast::<AtomicU64>();
         debug_assert_eq!(ptr.as_ptr() as usize % std::mem::align_of::<AtomicU64>(), 0);
         Ok(Self {
@@ -114,12 +110,7 @@ pub(crate) struct Ring {
 impl Ring {
     /// Map the data grantor `g` of a descriptor that `validate` passed or this crate laid out.
     pub(crate) fn map(desc: &Descriptor, g: Grantor, access: Access) -> Result<Self> {
-        let mapping = Mapping::map(
-            desc.fds[g.fd_index as usize].as_fd(),
-            u64::from(g.offset),
-            g.extent,
-            access,
-        )?;
+        let mapping = map_grantor(desc, g, g.extent, access)?;
         Ok(Self {
             base: mapping.as_ptr(),
             // ≤ i32::MAX: checked by `validate`, and by `ring_bytes` for a new queue.
@@ -127,6 +118,17 @@ impl Ring {
             _mapping: mapping,
         })
     }
+}
+
+/// `len` bytes at grantor `g`; what `Mapping::map` refuses of it is the descriptor's failure.
+pub(crate) fn map_grantor(
+    desc: &Descriptor,
+    g: Grantor,
+    len: u64,
+    access: Access,
+) -> Result<Mapping> {
+    let fd = desc.fds[g.fd_index as usize].as_fd();
+    Mapping::map(fd, u64::from(g.offset), len, access).map_err(received)
 }
 
 /// `capacity * size_of::<T>()`, within what libfmq maps and a 32-bit `usize` holds.
@@ -182,15 +184,17 @@ pub(crate) fn ring_bytes<T: Element>(capacity: usize) -> Result<u64> {
 ///
 /// # What the reader sees
 ///
-/// A write is visible only after [`commit_write`](Self::commit_write) moves
-/// the write counter (a `Release` store after the data copy), and the
-/// reader loads the counter with `Acquire`; so the reader never observes a
-/// partially copied element. The reverse holds for the space a read frees.
+/// A write is visible only after [`WriteTxn::commit`] moves the write
+/// counter (a `Release` store after the data copy), and the reader loads
+/// the counter with `Acquire`; so the reader never observes a partially
+/// copied element. The reverse holds for the space a read frees
+/// ([`ReadTxn::commit`]).
 ///
 /// # The ring is the peer's memory too
 ///
-/// Nothing here hands out a `&[T]` into the ring. [`Regions`] copies
-/// elements in and out between the counter accesses, and a reader interprets
+/// Nothing here hands out a `&[T]` into the ring. [`Regions`], which a
+/// transaction derefs to, copies elements in and out between the counter
+/// accesses, and a reader interprets
 /// what it copied out, never the ring itself — a peer may rewrite the
 /// bytes at any moment, and a hostile one will.
 ///
@@ -256,11 +260,7 @@ impl<T: Element> MessageQueue<T> {
             quantum: size_of::<T>() as u32,
             flavor: Flavor::SynchronizedReadWrite,
         };
-        let policy = AttachPolicy {
-            max_capacity: capacity,
-            require_seal: true,
-            require_event_flag: event_flag,
-        };
+        let policy = AttachPolicy::new(capacity).require_event_flag(event_flag);
         let queue = Self::open(desc, &policy)?;
         queue.read.get().store(0, Ordering::Release);
         queue.write.get().store(0, Ordering::Release);
@@ -282,13 +282,13 @@ impl<T: Element> MessageQueue<T> {
     /// it start at the page boundary below the data grantor's `offset`, and
     /// [`Mapping::map`] refuses more than `isize::MAX` of them: `extent`
     /// plus `offset` modulo the page size is at most that, or the descriptor
-    /// is `BadValue`. On 32-bit Android bionic's `mmap64` also refuses
-    /// (`ENOMEM`) a mapping whose page-rounded length is more than
-    /// `isize::MAX`.
+    /// is [`InvalidDescriptor`](Error::InvalidDescriptor). On 32-bit Android
+    /// bionic's `mmap64` also refuses (`ENOMEM`) a mapping whose page-rounded
+    /// length is more than `isize::MAX`.
     ///
     /// A descriptor in which a counter, the data or the EventFlag grantor
-    /// names a hugetlbfs fd (a memfd created `MFD_HUGETLB`) is `BadValue` as
-    /// well: [`Mapping::map`] refuses a file the kernel reports as
+    /// names a hugetlbfs fd (a memfd created `MFD_HUGETLB`) is
+    /// `InvalidDescriptor` as well: [`Mapping::map`] refuses a file the kernel reports as
     /// hugetlbfs, whose mapping it could not release. Where the kernel does
     /// not answer that query (see [`Mapping`]) the fd is mapped like any
     /// other, and a mapping of a hugetlbfs file stays until the process
@@ -312,9 +312,9 @@ impl<T: Element> MessageQueue<T> {
     /// queue — one that is not Linux or Android, or has no 64-bit atomics —
     /// it is returned whatever `desc` and `policy` hold, before any system
     /// call. On the other targets: [`Error::Os`] when an fd cannot be
-    /// duplicated, [`Error::BadValue`] for a descriptor the checks above
-    /// refuse, and [`Error::Os`] when a system call those checks or the
-    /// mappings make fails.
+    /// duplicated, [`Error::InvalidDescriptor`] for a descriptor the checks
+    /// above or `policy` refuse, and [`Error::Os`] when a system call those
+    /// checks or the mappings make fails.
     pub fn attach(desc: &Descriptor, policy: &AttachPolicy) -> Result<Self> {
         check_target()?;
         Self::open(desc.try_clone()?, policy)
@@ -329,9 +329,9 @@ impl<T: Element> MessageQueue<T> {
         let ring = Ring::map(&desc, geo.data, Access::ReadWrite)?;
         let flag = match geo.event_flag {
             // The 4-byte word only, as for the counters.
-            Some(g) => Some(EventFlag::from_mapping(Mapping::map(
-                desc.fds[g.fd_index as usize].as_fd(),
-                u64::from(g.offset),
+            Some(g) => Some(EventFlag::from_mapping(map_grantor(
+                &desc,
+                g,
                 4,
                 Access::ReadWrite,
             )?)),
@@ -408,18 +408,36 @@ impl<T: Element> MessageQueue<T> {
         Ok(self.capacity - self.available_to_read()?)
     }
 
-    fn regions_at(&self, position: u64, n: usize) -> Regions<'_, T> {
+    /// The ring's `n` elements at counter value `position`, for as long as `'a` borrows `self`.
+    fn regions_at<'a>(&self, position: u64, n: usize) -> Regions<'a, T> {
         debug_assert!(n <= self.capacity);
-        // SAFETY: the ring is mapped read-write while `self` is borrowed; callers check `n`.
+        // SAFETY: mapped read-write while the transaction holds `&'a mut self`; callers check `n`.
         unsafe { Regions::over(self.ring.base, self.ring.bytes, position, n, false) }
     }
 
     /// Reserve `n` elements to write. `None` when fewer are free now;
     /// [`BadValue`](Error::BadValue) when `n` exceeds the capacity, which no
-    /// wait can make room for. The reservation is made real by
-    /// [`commit_write`](Self::commit_write). The two regions of the result
-    /// are the part before the ring's end and the part after its wrap.
-    pub fn begin_write(&mut self, n: usize) -> Result<Option<Regions<'_, T>>> {
+    /// wait can make room for. Copy the elements in through the
+    /// transaction's [`Regions`], then [`commit`](WriteTxn::commit) it; a
+    /// transaction dropped without a commit publishes nothing. The two
+    /// regions are the part before the ring's end and the part after its
+    /// wrap.
+    ///
+    /// ```
+    /// # #[cfg(any(target_os = "linux", target_os = "android"))]
+    /// # fn main() -> Result<(), rsbinder_fmq::Error> {
+    /// let mut queue = rsbinder_fmq::MessageQueue::<u32>::create(8, false)?;
+    /// if let Some(mut txn) = queue.begin_write(3)? {
+    ///     txn.write_at(0, &[1, 2])?;
+    ///     txn.write_at(2, &[3])?;
+    ///     txn.commit()?;
+    /// }
+    /// assert_eq!(queue.available_to_read()?, 3);
+    /// # Ok(()) }
+    /// # #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    /// # fn main() {}
+    /// ```
+    pub fn begin_write(&mut self, n: usize) -> Result<Option<WriteTxn<'_, T>>> {
         if n > self.capacity {
             return Err(Error::BadValue("more items than the queue holds"));
         }
@@ -428,22 +446,29 @@ impl<T: Element> MessageQueue<T> {
         if free < n {
             return Ok(None);
         }
-        Ok(Some(self.regions_at(write, n)))
+        let regions = self.regions_at(write, n);
+        Ok(Some(WriteTxn {
+            queue: self,
+            regions,
+            position: write,
+            path: WritePath::Loaded,
+        }))
     }
 
-    /// Publish `n` elements written into the regions
-    /// [`begin_write`](Self::begin_write) returned. `n` must not exceed the
-    /// space free at this moment.
-    ///
-    /// Drops the view [`begin_write_cached`](Self::begin_write_cached)
-    /// keeps, so a cached write after this one loads both counters again.
-    pub fn commit_write(&mut self, n: usize) -> Result<()> {
+    /// Publish `n` elements at `position`, the write counter `begin_write` loaded; drops the view.
+    fn commit_write(&mut self, position: u64, n: usize) -> Result<()> {
         self.writer_view = None;
         let (read, write) = self.positions()?;
+        if write != position {
+            return Err(Error::Corrupted(
+                "write counter moved during the transaction",
+            ));
+        }
         let q = size_of::<T>() as u64;
-        let free = self.capacity as u64 - (write - read) / q;
-        if n as u64 > free {
-            return Err(Error::BadValue("commit exceeds the space that was free"));
+        if (write - read) / q + n as u64 > self.capacity as u64 {
+            return Err(Error::Corrupted(
+                "read counter moved back during the transaction",
+            ));
         }
         self.write
             .get()
@@ -458,14 +483,14 @@ impl<T: Element> MessageQueue<T> {
     /// capped `limit`, which they never fit.
     ///
     /// The write counter is this handle's own: it is loaded on the first
-    /// call, then taken from what
-    /// [`commit_write_cached`](Self::commit_write_cached) stored. The read
-    /// counter is loaded again only when the last value seen leaves no room
-    /// for `n`. A write that fits by that value loads no counter at all,
-    /// where `begin_write` and `commit_write` load both counters each, and
-    /// does not load the counter the reader writes. The commit's store still
-    /// writes the reader's cache line: libfmq's layout puts both counters in
-    /// the first 16 bytes.
+    /// call, then taken from what the last cached transaction's
+    /// [`commit`](WriteTxn::commit) stored. The read counter is loaded again
+    /// only when the last value seen leaves no room for `n`. A write that
+    /// fits by that value loads no counter at all, where a `begin_write`
+    /// transaction loads both counters at its begin and again at its commit,
+    /// and does not load the counter the reader writes. The commit's store
+    /// still writes the reader's cache line: libfmq's layout puts both
+    /// counters in the first 16 bytes.
     ///
     /// A reloaded read counter is checked against the view: it may not move
     /// backwards, pass the write counter, put more than the ring in flight
@@ -477,15 +502,19 @@ impl<T: Element> MessageQueue<T> {
     /// the reader's side, as the counters failing its check or wrong
     /// elements (see "One handle, one side").
     ///
-    /// [`commit_write`](Self::commit_write), and so [`write`](Self::write)
-    /// and [`write_blocking`](Self::write_blocking), drops the view; the
-    /// next cached call loads both counters again.
-    pub fn begin_write_cached(&mut self, n: usize, limit: usize) -> Result<Option<Regions<'_, T>>> {
+    /// The commit of a [`begin_write`](Self::begin_write) transaction, and
+    /// so [`write`](Self::write) and [`write_blocking`](Self::write_blocking),
+    /// drops the view; the next cached call loads both counters again.
+    pub fn begin_write_cached(
+        &mut self,
+        n: usize,
+        limit: usize,
+    ) -> Result<Option<WriteTxn<'_, T>>> {
         let limit = limit.min(self.capacity);
         if n > limit {
             return Err(Error::BadValue("more items than the limit in flight"));
         }
-        let (read, write) = match self.writer_view {
+        let (mut read, write) = match self.writer_view {
             Some(view) => view,
             None => {
                 let view = self.positions()?;
@@ -515,24 +544,20 @@ impl<T: Element> MessageQueue<T> {
             if !fits(fresh) {
                 return Ok(None);
             }
+            read = fresh;
         }
-        Ok(Some(self.regions_at(write, n)))
+        let regions = self.regions_at(write, n);
+        Ok(Some(WriteTxn {
+            queue: self,
+            regions,
+            position: write,
+            path: WritePath::Cached { read },
+        }))
     }
 
-    /// Publish `n` elements written into the regions
-    /// [`begin_write_cached`](Self::begin_write_cached) returned, and keep
-    /// the new write position as the view. `BadValue` when no cached call
-    /// made a view, or when `n` exceeds the space free by it.
-    pub fn commit_write_cached(&mut self, n: usize) -> Result<()> {
-        let (read, write) = self
-            .writer_view
-            .ok_or(Error::BadValue("commit with no cached view"))?;
-        let q = size_of::<T>() as u64;
-        let free = self.capacity as u64 - (write - read) / q;
-        if n as u64 > free {
-            return Err(Error::BadValue("commit exceeds the space that was free"));
-        }
-        let next = write + n as u64 * q;
+    /// Publish `n` elements at `position`, the view's write counter, and keep the new one as view.
+    fn commit_write_cached(&mut self, read: u64, position: u64, n: usize) -> Result<()> {
+        let next = position + n as u64 * size_of::<T>() as u64;
         // `positions` refused a start this close; reaching it takes 2^64 bytes.
         if next > u64::MAX - self.ring.bytes as u64 {
             return Err(Error::Corrupted("counter too close to wrapping"));
@@ -544,9 +569,11 @@ impl<T: Element> MessageQueue<T> {
 
     /// The next `n` unread elements, or `None` when fewer are available now;
     /// [`BadValue`](Error::BadValue) when `n` exceeds the capacity, which
-    /// never holds that many. Copy them out, then
-    /// [`commit_read`](Self::commit_read) to free the space.
-    pub fn begin_read(&mut self, n: usize) -> Result<Option<Regions<'_, T>>> {
+    /// never holds that many. Copy them out through the transaction's
+    /// [`Regions`], then [`commit`](ReadTxn::commit) it to free the space; a
+    /// transaction dropped without a commit frees nothing, and the next read
+    /// sees the same elements.
+    pub fn begin_read(&mut self, n: usize) -> Result<Option<ReadTxn<'_, T>>> {
         if n > self.capacity {
             return Err(Error::BadValue("more items than the queue holds"));
         }
@@ -555,16 +582,27 @@ impl<T: Element> MessageQueue<T> {
         if available < n {
             return Ok(None);
         }
-        Ok(Some(self.regions_at(read, n)))
+        let regions = self.regions_at(read, n);
+        Ok(Some(ReadTxn {
+            queue: self,
+            regions,
+            position: read,
+        }))
     }
 
-    /// Free `n` elements read from the regions [`begin_read`](Self::begin_read)
-    /// returned. `n` must not exceed the elements available at this moment.
-    pub fn commit_read(&mut self, n: usize) -> Result<()> {
+    /// Free `n` elements at `position`, the read counter `begin_read` loaded.
+    fn commit_read(&mut self, position: u64, n: usize) -> Result<()> {
         let (read, write) = self.positions()?;
+        if read != position {
+            return Err(Error::Corrupted(
+                "read counter moved during the transaction",
+            ));
+        }
         let q = size_of::<T>() as u64;
         if n as u64 > (write - read) / q {
-            return Err(Error::BadValue("commit exceeds the elements available"));
+            return Err(Error::Corrupted(
+                "write counter moved back during the transaction",
+            ));
         }
         self.read
             .get()
@@ -572,129 +610,399 @@ impl<T: Element> MessageQueue<T> {
         Ok(())
     }
 
-    /// Write all of `items`, or none: `Ok(false)` when they do not fit now,
+    /// Write all of `items`, or none: [`Transfer::WouldBlock`] when they do
+    /// not fit now, and the items stay the caller's;
     /// [`BadValue`](Error::BadValue) when there are more than the capacity.
-    pub fn write(&mut self, items: &[T]) -> Result<bool> {
-        {
-            let Some(mut regions) = self.begin_write(items.len())? else {
-                return Ok(false);
-            };
-            regions.write_at(0, items)?;
-        }
-        self.commit_write(items.len())?;
-        Ok(true)
+    pub fn write(&mut self, items: &[T]) -> Result<Transfer> {
+        let Some(mut txn) = self.begin_write(items.len())? else {
+            return Ok(Transfer::WouldBlock);
+        };
+        txn.write_at(0, items)?;
+        txn.commit()?;
+        Ok(Transfer::Done)
     }
 
-    /// Fill all of `out`, or nothing: `Ok(false)` when fewer elements are
-    /// available now, [`BadValue`](Error::BadValue) when `out` is longer than
-    /// the capacity.
-    pub fn read(&mut self, out: &mut [T]) -> Result<bool> {
-        {
-            let Some(regions) = self.begin_read(out.len())? else {
-                return Ok(false);
-            };
-            regions.read_at(0, out)?;
-        }
-        self.commit_read(out.len())?;
-        Ok(true)
+    /// Fill all of `out`, or nothing: [`Transfer::WouldBlock`] when fewer
+    /// elements are available now, and `out` is unchanged;
+    /// [`BadValue`](Error::BadValue) when `out` is longer than the capacity.
+    pub fn read(&mut self, out: &mut [T]) -> Result<Transfer> {
+        let Some(txn) = self.begin_read(out.len())? else {
+            return Ok(Transfer::WouldBlock);
+        };
+        txn.read_at(0, out)?;
+        txn.commit()?;
+        Ok(Transfer::Done)
     }
 
-    /// [`write`](Self::write), waiting on the EventFlag for `wait_bits`
-    /// (normally [`NOT_FULL`](crate::NOT_FULL)) while the items do not fit,
-    /// and setting `wake_bits` (normally [`NOT_EMPTY`](crate::NOT_EMPTY);
-    /// `0` for none) once they are in. libfmq `writeBlocking`.
+    /// [`write`](Self::write), waiting on the EventFlag for
+    /// [`NOT_FULL`](crate::NOT_FULL) while the items do not fit and setting
+    /// [`NOT_EMPTY`](crate::NOT_EMPTY) once they are in: libfmq's
+    /// `writeBlocking(data, count, timeOutNanos)`.
+    /// [`write_blocking_with`](Self::write_blocking_with) with
+    /// [`Notify::WRITE`].
+    ///
+    /// `timeout` `None` waits without end, as libfmq's `timeOutNanos == 0`
+    /// does; `Some(Duration::ZERO)` tries once, without waiting and without
+    /// touching the EventFlag word, and is [`TimedOut`](Error::TimedOut)
+    /// when the items do not fit.
     ///
     /// Fails with [`NoEventFlag`](Error::NoEventFlag) on a queue without the
     /// word, `BadValue` when `items` exceed the capacity (the wait could
-    /// never end) or `wait_bits == 0`, and
-    /// [`TimedOut`](Error::TimedOut) when `timeout` elapses first.
+    /// never end), and `TimedOut` when `timeout` elapses first. The transfer
+    /// is tried once more after the deadline, since the reader may have run
+    /// while the clock ran out.
     ///
     /// Once the items are committed the call succeeds: a failure of the
-    /// `wake_bits` wake that follows is logged, not returned, as libfmq's
+    /// wake that follows is logged, not returned, as libfmq's
     /// `writeBlocking` ignores it. An `Err` there would invite a retry that
     /// writes the items twice. The bits are set before the futex call, so a
     /// waiter that has not yet slept still sees them.
     ///
     /// Only the transfer or the deadline ends the call, as in libfmq. A bit
-    /// another thread or process sets wakes it only when the bit is in
-    /// `wait_bits`; the wait then takes the bit off the word and tries the
+    /// another thread or process sets wakes it only when the bit is in the
+    /// wait mask; the wait then takes the bit off the word and tries the
     /// transfer again, so the bit is not seen by anyone else. To stop a
     /// blocked writer from outside, give it a deadline, or wait on the
     /// [`EventFlag`](crate::EventFlag) yourself and transfer with
     /// [`write`](Self::write).
-    pub fn write_blocking(
+    pub fn write_blocking(&mut self, items: &[T], timeout: Option<Duration>) -> Result<()> {
+        self.write_blocking_with(items, Notify::WRITE, timeout)
+    }
+
+    /// [`write_blocking`](Self::write_blocking) with the EventFlag bits of
+    /// `notify`: wait on [`notify.wait`](field@Notify::wait) while the items
+    /// do not fit, set [`notify.wake`](field@Notify::wake) (`0` for none)
+    /// once they are in. libfmq's `writeBlocking(data, count,
+    /// readNotification, writeNotification, timeOutNanos)` is
+    /// `Notify { wait: readNotification, wake: writeNotification }`.
+    pub fn write_blocking_with(
         &mut self,
         items: &[T],
-        wait_bits: u32,
-        wake_bits: u32,
+        notify: Notify,
         timeout: Option<Duration>,
     ) -> Result<()> {
         self.flag_ref()?;
-        if wait_bits == 0 {
-            return Err(Error::BadValue("empty wait mask"));
-        }
         if items.len() > self.capacity {
             return Err(Error::BadValue("more items than the queue holds"));
         }
+        self.blocking(notify, timeout, |queue| queue.write(items))
+    }
+
+    /// [`read`](Self::read), waiting on the EventFlag for
+    /// [`NOT_EMPTY`](crate::NOT_EMPTY) while too few elements are available
+    /// and setting [`NOT_FULL`](crate::NOT_FULL) once they are out: libfmq's
+    /// `readBlocking(data, count, timeOutNanos)`.
+    /// [`read_blocking_with`](Self::read_blocking_with) with
+    /// [`Notify::READ`]. The timeout, the failures, and what ends the wait
+    /// are those of [`write_blocking`](Self::write_blocking).
+    pub fn read_blocking(&mut self, out: &mut [T], timeout: Option<Duration>) -> Result<()> {
+        self.read_blocking_with(out, Notify::READ, timeout)
+    }
+
+    /// [`read_blocking`](Self::read_blocking) with the EventFlag bits of
+    /// `notify`: wait on [`notify.wait`](field@Notify::wait) while too few
+    /// elements are available, set [`notify.wake`](field@Notify::wake) (`0`
+    /// for none) once they are out.
+    ///
+    /// libfmq's `readBlocking(data, count, readNotification,
+    /// writeNotification, timeOutNanos)` takes the bits the other way round:
+    /// it is `Notify { wait: writeNotification, wake: readNotification }`.
+    /// libfmq names each mask after the side that sets it, and this type
+    /// after what this call does with it.
+    pub fn read_blocking_with(
+        &mut self,
+        out: &mut [T],
+        notify: Notify,
+        timeout: Option<Duration>,
+    ) -> Result<()> {
+        self.flag_ref()?;
+        if out.len() > self.capacity {
+            return Err(Error::BadValue("more items than the queue holds"));
+        }
+        self.blocking(notify, timeout, |queue| queue.read(out))
+    }
+
+    /// Run `transfer` until it is done, waiting on `notify.wait` between tries; wake once done.
+    fn blocking(
+        &mut self,
+        notify: Notify,
+        timeout: Option<Duration>,
+        mut transfer: impl FnMut(&mut Self) -> Result<Transfer>,
+    ) -> Result<()> {
+        let done = |queue: &mut Self, transfer: Transfer| {
+            if transfer.is_done() {
+                queue.wake_after_commit(notify.wake);
+            }
+            transfer.is_done()
+        };
+        if timeout == Some(Duration::ZERO) {
+            let transfer = transfer(self)?;
+            return if done(self, transfer) {
+                Ok(())
+            } else {
+                Err(Error::TimedOut)
+            };
+        }
         let deadline = timeout.and_then(Deadline::after);
         loop {
-            if self.write(items)? {
-                self.wake_after_commit(wake_bits);
+            let transfer_now = transfer(self)?;
+            if done(self, transfer_now) {
                 return Ok(());
             }
-            match self.flag_ref()?.wait_until(wait_bits, deadline) {
+            match self.flag_ref()?.wait_until(notify.wait.get(), deadline) {
                 Ok(_) => {}
-                // One more try: the reader may have run while the clock ran out.
+                // One more try: the peer may have run while the clock ran out.
                 Err(Error::TimedOut) => {
-                    if self.write(items)? {
-                        self.wake_after_commit(wake_bits);
-                        return Ok(());
-                    }
-                    return Err(Error::TimedOut);
+                    let last = transfer(self)?;
+                    return if done(self, last) {
+                        Ok(())
+                    } else {
+                        Err(Error::TimedOut)
+                    };
                 }
                 Err(e) => return Err(e),
             }
         }
     }
+}
 
-    /// [`read`](Self::read), waiting on the EventFlag for `wait_bits`
-    /// (normally [`NOT_EMPTY`](crate::NOT_EMPTY)) while too few elements are
-    /// available, and setting `wake_bits` (normally
-    /// [`NOT_FULL`](crate::NOT_FULL); `0` for none) once they are out.
-    /// libfmq `readBlocking`; the failures, and what ends the wait, are those
-    /// of [`write_blocking`](Self::write_blocking).
-    pub fn read_blocking(
-        &mut self,
-        out: &mut [T],
-        wait_bits: u32,
-        wake_bits: u32,
-        timeout: Option<Duration>,
-    ) -> Result<()> {
-        self.flag_ref()?;
-        if wait_bits == 0 {
-            return Err(Error::BadValue("empty wait mask"));
+/// Which counter a [`WriteTxn`]'s commit reads: both again, or the cached writer's view.
+#[derive(Clone, Copy, Debug)]
+enum WritePath {
+    Loaded,
+    Cached { read: u64 },
+}
+
+/// A write reserved by [`MessageQueue::begin_write`] or
+/// [`MessageQueue::begin_write_cached`]: [`len`](Regions::len) elements of
+/// ring at the write position, which no reader sees until a commit.
+///
+/// Copy the elements in with [`write_at`](Self::write_at), then
+/// [`commit`](Self::commit) all of them or
+/// [`commit_first`](Self::commit_first) a prefix. The transaction borrows
+/// its queue mutably, so nothing else moves the queue's counters meanwhile.
+/// It derefs to its [`Regions`] for the lengths, shared only: a `&mut
+/// Regions` would let two transactions swap theirs, and each then write the
+/// other queue's ring and commit its own position.
+///
+/// ```compile_fail,E0596
+/// # fn swap(a: &mut rsbinder_fmq::MessageQueue<u8>, b: &mut rsbinder_fmq::MessageQueue<u8>)
+/// # -> rsbinder_fmq::Result<()> {
+/// let mut x = a.begin_write(1)?.expect("room");
+/// let mut y = b.begin_write(1)?.expect("room");
+/// std::mem::swap(&mut *x, &mut *y);
+/// # Ok(()) }
+/// ```
+///
+/// # Dropped without a commit
+///
+/// A transaction dropped without a commit publishes nothing: the write
+/// counter stays where it was, the next `begin_write` returns the same
+/// position, and what was copied in is overwritten by the next write.
+/// libfmq has no transaction object; its `commitWrite(n)` is a call of its
+/// own. AOSP's Rust binding to libfmq (`WriteCompletion`) commits the
+/// whole reservation when it is dropped, whether or not the elements were
+/// written. This type does not, since a commit on drop publishes elements
+/// that were never written — after an early return or a `?`, a reader
+/// would read whatever the ring held.
+#[must_use = "dropping a write transaction publishes nothing; `commit` makes the elements visible"]
+pub struct WriteTxn<'a, T: Element> {
+    queue: &'a mut MessageQueue<T>,
+    regions: Regions<'a, T>,
+    position: u64,
+    path: WritePath,
+}
+
+impl<T: Element> WriteTxn<'_, T> {
+    /// Copy `src` into the reserved elements starting at `start`:
+    /// [`Regions::write_at`]. `BadValue` when `start + src.len()` exceeds
+    /// [`len`](Regions::len).
+    pub fn write_at(&mut self, start: usize, src: &[T]) -> Result<()> {
+        self.regions.write_at(start, src)
+    }
+
+    /// Publish every element the transaction reserved.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corrupted`] when the counters fail their check, or when the
+    /// write counter is no longer where the transaction began or the read
+    /// counter moved backwards: another party broke the protocol. A
+    /// transaction of [`begin_write_cached`](MessageQueue::begin_write_cached)
+    /// loads no counter here and fails only when the write counter would
+    /// come within one ring of wrapping. Nothing is published on an `Err`.
+    pub fn commit(self) -> Result<()> {
+        let n = self.regions.len();
+        self.commit_first(n)
+    }
+
+    /// Publish the first `n` of the elements reserved; the rest are not
+    /// published, and the next write starts right after the `n`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadValue`] when `n` exceeds [`len`](Regions::len), and those
+    /// of [`commit`](Self::commit).
+    pub fn commit_first(self, n: usize) -> Result<()> {
+        if n > self.regions.len() {
+            return Err(Error::BadValue("commit exceeds the elements reserved"));
         }
-        if out.len() > self.capacity {
-            return Err(Error::BadValue("more items than the queue holds"));
+        match self.path {
+            WritePath::Loaded => self.queue.commit_write(self.position, n),
+            WritePath::Cached { read } => self.queue.commit_write_cached(read, self.position, n),
         }
-        let deadline = timeout.and_then(Deadline::after);
-        loop {
-            if self.read(out)? {
-                self.wake_after_commit(wake_bits);
-                return Ok(());
-            }
-            match self.flag_ref()?.wait_until(wait_bits, deadline) {
-                Ok(_) => {}
-                Err(Error::TimedOut) => {
-                    if self.read(out)? {
-                        self.wake_after_commit(wake_bits);
-                        return Ok(());
-                    }
-                    return Err(Error::TimedOut);
-                }
-                Err(e) => return Err(e),
-            }
+    }
+}
+
+impl<'a, T: Element> std::ops::Deref for WriteTxn<'a, T> {
+    type Target = Regions<'a, T>;
+
+    fn deref(&self) -> &Regions<'a, T> {
+        &self.regions
+    }
+}
+
+impl<T: Element> std::fmt::Debug for WriteTxn<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WriteTxn")
+            .field("regions", &self.regions)
+            .field("cached", &matches!(self.path, WritePath::Cached { .. }))
+            .finish()
+    }
+}
+
+/// A read reserved by [`MessageQueue::begin_read`]: the next
+/// [`len`](Regions::len) unread elements, which stay in the ring until a
+/// commit frees their space.
+///
+/// Copy the elements out through the [`Regions`] the transaction derefs to,
+/// then [`commit`](Self::commit) all of them or
+/// [`commit_first`](Self::commit_first) a prefix. A transaction dropped
+/// without a commit frees nothing: the next `begin_read` returns the same
+/// elements. The transaction gives no way to write the ring.
+#[must_use = "dropping a read transaction frees nothing; `commit` consumes the elements"]
+pub struct ReadTxn<'a, T: Element> {
+    queue: &'a mut MessageQueue<T>,
+    regions: Regions<'a, T>,
+    position: u64,
+}
+
+impl<T: Element> ReadTxn<'_, T> {
+    /// Free the space of every element the transaction covers.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corrupted`] when the counters fail their check, or when the
+    /// read counter is no longer where the transaction began or the write
+    /// counter moved backwards: another party broke the protocol. Nothing
+    /// is freed on an `Err`.
+    pub fn commit(self) -> Result<()> {
+        let n = self.regions.len();
+        self.commit_first(n)
+    }
+
+    /// Free the space of the first `n` elements; the rest stay unread, and
+    /// the next read starts with them.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadValue`] when `n` exceeds [`len`](Regions::len), and those
+    /// of [`commit`](Self::commit).
+    pub fn commit_first(self, n: usize) -> Result<()> {
+        if n > self.regions.len() {
+            return Err(Error::BadValue("commit exceeds the elements reserved"));
         }
+        self.queue.commit_read(self.position, n)
+    }
+}
+
+impl<'a, T: Element> std::ops::Deref for ReadTxn<'a, T> {
+    type Target = Regions<'a, T>;
+
+    fn deref(&self) -> &Regions<'a, T> {
+        &self.regions
+    }
+}
+
+impl<T: Element> std::fmt::Debug for ReadTxn<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadTxn")
+            .field("regions", &self.regions)
+            .finish()
+    }
+}
+
+/// What [`MessageQueue::write`] or [`MessageQueue::read`] did.
+///
+/// The type is `#[must_use]`, so a caller that drops the answer — and with
+/// it the items of a write that would block — is warned, after `?` too:
+///
+/// ```compile_fail
+/// #![deny(unused_must_use)]
+/// fn send(queue: &mut rsbinder_fmq::MessageQueue<u8>) -> rsbinder_fmq::Result<()> {
+///     queue.write(&[1])?;
+///     Ok(())
+/// }
+/// ```
+///
+/// ```
+/// #![deny(unused_must_use)]
+/// fn send(queue: &mut rsbinder_fmq::MessageQueue<u8>) -> rsbinder_fmq::Result<bool> {
+///     Ok(queue.write(&[1])?.is_done())
+/// }
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[must_use = "`WouldBlock` means nothing was transferred: the items are still the caller's"]
+pub enum Transfer {
+    /// Every element was written or read.
+    Done,
+    /// The elements did not fit (a write) or were not all there (a read)
+    /// now; nothing was transferred and no counter moved.
+    WouldBlock,
+}
+
+impl Transfer {
+    /// Whether the elements were transferred.
+    pub const fn is_done(self) -> bool {
+        matches!(self, Transfer::Done)
+    }
+}
+
+/// The EventFlag bits of a blocking call: what it waits on while the
+/// transfer cannot be made, and what it sets once it has been.
+///
+/// Named fields rather than two positional `u32`s, because libfmq's
+/// `writeBlocking` and `readBlocking` put them in opposite orders (see
+/// [`MessageQueue::read_blocking_with`]). The wait mask is never empty: a
+/// wait on no bit could only end at the deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Notify {
+    /// Bits to wait on; the wait consumes them (see [`EventFlag`]).
+    pub wait: NonZeroU32,
+    /// Bits to set, and wake their waiters, after the transfer; `0` sets
+    /// none.
+    pub wake: u32,
+}
+
+impl Notify {
+    /// The bits of [`MessageQueue::write_blocking`]: wait on
+    /// [`NOT_FULL`](crate::NOT_FULL), wake [`NOT_EMPTY`](crate::NOT_EMPTY).
+    pub const WRITE: Notify = Notify::new(mask(NOT_FULL), NOT_EMPTY);
+    /// The bits of [`MessageQueue::read_blocking`]: wait on
+    /// [`NOT_EMPTY`](crate::NOT_EMPTY), wake [`NOT_FULL`](crate::NOT_FULL).
+    pub const READ: Notify = Notify::new(mask(NOT_EMPTY), NOT_FULL);
+
+    /// Wait on `wait`, wake `wake`.
+    pub const fn new(wait: NonZeroU32, wake: u32) -> Self {
+        Self { wait, wake }
+    }
+}
+
+/// `bits` of a constant mask, which is never zero.
+const fn mask(bits: u32) -> NonZeroU32 {
+    match NonZeroU32::new(bits) {
+        Some(mask) => mask,
+        None => panic!("an EventFlag mask constant is zero"),
     }
 }
 
@@ -735,12 +1043,12 @@ impl<T: Element> std::fmt::Debug for MessageQueue<T> {
     }
 }
 
-/// The span of ring a [`begin_write`](MessageQueue::begin_write) or
-/// [`begin_read`](MessageQueue::begin_read) covers: `first_len` elements
-/// up to the ring's end, then `second_len` from its start (libfmq
-/// `MemTransaction`). An element is never split between the two.
-/// [`UnsyncWriter::begin_write`](crate::UnsyncWriter::begin_write) returns
-/// one too.
+/// The span of ring a transaction covers — [`WriteTxn`], [`ReadTxn`] and
+/// [`UnsyncWriteTxn`](crate::UnsyncWriteTxn) deref to one, shared only:
+/// `first_len` elements up to the ring's end, then `second_len` from its
+/// start (libfmq `MemTransaction`). An element is never split between the
+/// two. A write transaction copies in through its own `write_at`, which is
+/// this type's [`write_at`](Self::write_at).
 ///
 /// Indices in [`write_at`](Self::write_at) and [`read_at`](Self::read_at)
 /// run over both parts as one sequence, so a caller lays out a record
@@ -751,7 +1059,11 @@ impl<T: Element> std::fmt::Debug for MessageQueue<T> {
 ///
 /// Both runs of a copy lie inside the ring: the index range is checked
 /// against [`len`](Self::len). The ring stays mapped while a `Regions`
-/// borrows its queue. It is one read-write [`Mapping`]: a single `mmap`
+/// lives: it is reached only through the transaction that holds it, whose
+/// lifetime `'a` is that of its mutable borrow of the queue or writer, and
+/// no transaction hands out a `&mut Regions`, so one cannot be moved out or
+/// swapped into another transaction. It is
+/// one read-write [`Mapping`]: a single `mmap`
 /// result of at most `isize::MAX` bytes, every byte initialized as the pages
 /// of a mapped file are. Every access to ring bytes is a relaxed
 /// atomic load or store — `AtomicU8` up to the first `usize` boundary,
@@ -781,8 +1093,9 @@ impl<T: Element> std::fmt::Debug for MessageQueue<T> {
 /// same bytes undefined behavior unless both are loads, and two copies that
 /// differ in start or length split the same bytes into different sizes.
 /// Copies through one mapping
-/// never run at the same time: a `Regions` is neither `Send` nor `Sync` and
-/// borrows its queue or writer mutably, and neither of those is `Sync`.
+/// never run at the same time: a `Regions`, and every transaction that
+/// holds one, is neither `Send` nor `Sync`; the transaction borrows its
+/// queue or writer mutably, and neither of those is `Sync`.
 ///
 /// ```compile_fail,E0277
 /// fn is_send<T: Send>() {}
@@ -794,11 +1107,26 @@ impl<T: Element> std::fmt::Debug for MessageQueue<T> {
 /// is_sync::<rsbinder_fmq::Regions<'static, u8>>();
 /// ```
 ///
+/// ```compile_fail,E0277
+/// fn is_send<T: Send>() {}
+/// is_send::<rsbinder_fmq::WriteTxn<'static, u8>>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// fn is_send<T: Send>() {}
+/// is_send::<rsbinder_fmq::ReadTxn<'static, u8>>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// fn is_send<T: Send>() {}
+/// is_send::<rsbinder_fmq::UnsyncWriteTxn<'static, u8>>();
+/// ```
+///
 /// When the protocol is kept, the reader copies elements only after the
-/// `Acquire` load of the write counter, which
-/// [`commit_write`](MessageQueue::commit_write) stored with `Release` after
-/// the writer's copy, so the reader sees every byte the writer copied
-/// (libfmq's `write` is a `memcpy` followed by the same store).
+/// `Acquire` load of the write counter, which [`WriteTxn::commit`] stored
+/// with `Release` after the writer's copy, so the reader sees every byte the
+/// writer copied (libfmq's `write` is a `memcpy` followed by the same
+/// store).
 pub struct Regions<'a, T: Element> {
     first: NonNull<u8>,
     first_len: usize,

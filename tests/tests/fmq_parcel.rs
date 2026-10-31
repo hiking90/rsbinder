@@ -92,16 +92,12 @@ fn a_queue_descriptor_survives_the_parcel_and_attaches() {
     assert_eq!(received.grantors.len(), 4);
     assert_eq!(received.quantum, 1);
 
-    let policy = AttachPolicy {
-        max_capacity: 32,
-        require_seal: true,
-        require_event_flag: true,
-    };
+    let policy = AttachPolicy::new(32).require_event_flag(true);
     let desc = Descriptor::try_from(&received).unwrap();
     let mut reader = MessageQueue::<u8>::attach(&desc, &policy).unwrap();
-    assert!(writer.write(b"fmq").unwrap());
+    assert!(writer.write(b"fmq").unwrap().is_done());
     let mut out = [0u8; 3];
-    assert!(reader.read(&mut out).unwrap());
+    assert!(reader.read(&mut out).unwrap().is_done());
     assert_eq!(&out, b"fmq");
 }
 

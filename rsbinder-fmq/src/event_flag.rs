@@ -1,6 +1,7 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+use std::num::NonZeroU32;
 use std::sync::atomic::{fence, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -134,8 +135,13 @@ pub(crate) trait FlagWord {
     fn load(&self, order: Ordering) -> u32;
     fn fence(&self, order: Ordering);
     /// Sleep while the word holds `expected`, until a wake on `bits` or `deadline`.
-    fn futex_wait(&self, expected: u32, bits: u32, deadline: Option<&Deadline>) -> Result<()>;
-    fn futex_wake(&self, bits: u32) -> Result<()>;
+    fn futex_wait(
+        &self,
+        expected: u32,
+        bits: NonZeroU32,
+        deadline: Option<&Deadline>,
+    ) -> Result<()>;
+    fn futex_wake(&self, bits: NonZeroU32) -> Result<()>;
 }
 
 impl FlagWord for AtomicU32 {
@@ -151,22 +157,27 @@ impl FlagWord for AtomicU32 {
     fn fence(&self, order: Ordering) {
         fence(order);
     }
-    fn futex_wait(&self, expected: u32, bits: u32, deadline: Option<&Deadline>) -> Result<()> {
+    fn futex_wait(
+        &self,
+        expected: u32,
+        bits: NonZeroU32,
+        deadline: Option<&Deadline>,
+    ) -> Result<()> {
         shm::futex_wait(self, expected, bits, deadline)
     }
-    fn futex_wake(&self, bits: u32) -> Result<()> {
+    fn futex_wake(&self, bits: NonZeroU32) -> Result<()> {
         shm::futex_wake(self, bits)
     }
 }
 
 /// [`EventFlag::wake`].
 pub(crate) fn wake<W: FlagWord + ?Sized>(word: &W, bits: u32) -> Result<()> {
-    if bits == 0 {
+    let Some(mask) = NonZeroU32::new(bits) else {
         return Ok(());
-    }
+    };
     let old = word.fetch_or(bits, Ordering::SeqCst);
     if !old & bits != 0 {
-        word.futex_wake(bits)?;
+        word.futex_wake(mask)?;
     }
     Ok(())
 }
@@ -186,9 +197,7 @@ pub(crate) fn wait_until<W: FlagWord + ?Sized>(
     bits: u32,
     deadline: Option<&Deadline>,
 ) -> Result<u32> {
-    if bits == 0 {
-        return Err(Error::BadValue("empty bit mask"));
-    }
+    let mask = NonZeroU32::new(bits).ok_or(Error::BadValue("empty bit mask"))?;
     loop {
         let old = word.fetch_and(!bits, Ordering::SeqCst);
         let set = old & bits;
@@ -198,7 +207,7 @@ pub(crate) fn wait_until<W: FlagWord + ?Sized>(
             return Ok(set);
         }
         // Sleep only if the word is unchanged since the clear: a wake in between is kept.
-        word.futex_wait(old & !bits, bits, deadline)?;
+        word.futex_wait(old & !bits, mask, deadline)?;
     }
 }
 

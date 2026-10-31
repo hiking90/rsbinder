@@ -227,7 +227,7 @@ pub(crate) fn is_ashmem_fd(_fd: std::os::fd::BorrowedFd<'_>) -> bool {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn ashmem_size(fd: std::os::fd::BorrowedFd<'_>) -> Result<usize> {
     let size = rsbinder_fmq::shm::ashmem_size(fd).map_err(|e| match e {
-        rsbinder_fmq::Error::Os(errno) => StatusCode::from(errno),
+        rsbinder_fmq::Error::Os(errno) => StatusCode::from(std::io::Error::from(errno)),
         _ => StatusCode::BadValue,
     })?;
     usize::try_from(size).map_err(|_| StatusCode::BadValue)

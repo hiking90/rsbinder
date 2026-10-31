@@ -164,7 +164,7 @@ pub(crate) fn wait_until(
     if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
         return Room::TimedOut;
     }
-    if spin_until(SPIN, &mut made).0 {
+    if spin_until(SPIN, &mut made).0.is_found() {
         return Room::Made;
     }
     let mut nap = MIN_NAP;

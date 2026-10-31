@@ -48,11 +48,7 @@ const SOAK_ENV: &str = "RSBINDER_FMQ_SOAK_SECS";
 const CAPACITY: usize = 64;
 const LIMIT: Duration = Duration::from_secs(20);
 
-const POLICY: AttachPolicy = AttachPolicy {
-    max_capacity: 1 << 16,
-    require_seal: true,
-    require_event_flag: false,
-};
+const POLICY: AttachPolicy = AttachPolicy::new(1 << 16);
 
 fn spawn_child(test_name: &str, sock: &PathBuf, batch: usize) -> Child {
     let exe = std::env::current_exe().expect("current_exe");
@@ -266,7 +262,9 @@ fn a_reader_process_cannot_map_the_queue_writable() {
             let offset = u64::from(grantor.offset);
             assert_eq!(
                 Mapping::map(fd, offset, grantor.extent, Access::ReadWrite).err(),
-                Some(Error::Os(rustix::io::Errno::PERM)),
+                Some(Error::Os(rsbinder_fmq::Errno::from_raw(
+                    rustix::io::Errno::PERM.raw_os_error()
+                ))),
                 "grantor at {offset}"
             );
         }

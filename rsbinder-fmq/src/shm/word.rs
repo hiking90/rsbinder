@@ -1,6 +1,7 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+use std::num::NonZeroU32;
 use std::ptr::NonNull;
 use std::sync::atomic::{fence, AtomicU32, Ordering};
 
@@ -82,7 +83,7 @@ impl RoWord32 {
     /// return value and errors. The kernel reads the word to compare it with
     /// `expected` and never writes it, so a read-only mapping is enough.
     #[inline]
-    pub fn wait(&self, expected: u32, bits: u32, deadline: Option<&Deadline>) -> Result<()> {
+    pub fn wait(&self, expected: u32, bits: NonZeroU32, deadline: Option<&Deadline>) -> Result<()> {
         super::futex_wait(&self.0, expected, bits, deadline)
     }
 
@@ -92,7 +93,7 @@ impl RoWord32 {
     /// it — the kernel asks for nothing more than a readable address — so a
     /// protocol must not take a wake as proof that the word changed.
     #[inline]
-    pub fn wake(&self, bits: u32) -> Result<()> {
+    pub fn wake(&self, bits: NonZeroU32) -> Result<()> {
         super::futex_wake(&self.0, bits)
     }
 }
@@ -370,7 +371,7 @@ mod tests {
         // SAFETY: as above.
         let word = unsafe { RoWord32::from_ptr(NonNull::from(&owner).cast()) };
         // The kernel compares first: `expected` is stale, so there is no sleep and no error.
-        word.wait(0, u32::MAX, None).unwrap();
-        word.wake(u32::MAX).unwrap();
+        word.wait(0, NonZeroU32::MAX, None).unwrap();
+        word.wake(NonZeroU32::MAX).unwrap();
     }
 }

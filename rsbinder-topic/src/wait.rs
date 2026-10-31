@@ -60,6 +60,8 @@ use std::sync::{Arc, Weak};
 use std::thread::yield_now;
 use std::time::{Duration, Instant};
 
+use rsbinder::fmq::shm::Deadline;
+
 /// `stop`: an [`Interrupter`](crate::Interrupter) asked, raised with [`KICK`]. A receive's wait
 /// ends at it and takes both ([`Local::cancelled`]); a wait on the pool ends at it and leaves it to
 /// the receive after; a poll does not end at it, but at the kick.
@@ -126,6 +128,24 @@ fn sleep(_nap: Duration) {
     yield_now();
 }
 
+/// A wait's end in both forms it is read in: the `Instant` the loop and a poll compare against,
+/// and the futex's `Deadline`, made once from it for the whole wait.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Until {
+    pub(crate) at: Instant,
+    /// `None` when the futex clock cannot express `at`, which then never arrives.
+    pub(crate) futex: Option<Deadline>,
+}
+
+impl Until {
+    pub(crate) fn new(at: Instant) -> Self {
+        Self {
+            at,
+            futex: Deadline::after(at.saturating_duration_since(Instant::now())),
+        }
+    }
+}
+
 /// What a wait sleeps on: the topic's `seq` and the subscriber's `state`.
 pub(crate) trait Words: Send + Sync {
     /// `seq`, ordered before the caller's next look at the ring.
@@ -135,7 +155,7 @@ pub(crate) trait Words: Send + Sync {
     /// Drain an fd wake, then lower `WAITING` alone; `true` when the publisher's socket hung up.
     fn end_wait(&self) -> bool;
     /// Sleep while `seq` holds `seen`; `false` when `deadline` passed first.
-    fn sleep(&self, seen: u32, deadline: Option<Instant>) -> bool;
+    fn sleep(&self, seen: u32, deadline: Option<&Until>) -> bool;
     /// Wake the sleeper; `false` when an fd wake queued no byte, which a later one may.
     fn wake(&self) -> bool;
     /// Whether a wake sent before the sleep still ends it (a byte on the wake socket).
@@ -195,7 +215,7 @@ impl<W: Words> Local<W> {
     }
 
     /// One wait: sleep on `seq` while it holds `seen`, unless a bit in `stop` is up.
-    pub(crate) fn park(&self, seen: u32, deadline: Option<Instant>) -> Slept {
+    pub(crate) fn park(&self, seen: u32, deadline: Option<&Until>) -> Slept {
         let stopped = self.arm(seen) != 0;
         let armed = Armed(self);
         #[cfg(all(test, not(loom)))]
@@ -539,15 +559,16 @@ pub(crate) use real::{Died, Parts};
 
 /// The words in shared memory, and the death notice. Compiled under loom too, never run there.
 mod real {
+    use std::num::NonZeroU32;
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::time::Instant;
 
-    use rsbinder::fmq::shm::{Deadline, Mapping};
+    use rsbinder::fmq::shm::Mapping;
     use rsbinder::fmq::Error;
     use rsbinder::{DeathRecipient, WIBinder};
 
-    use super::{Local, Words, DIED};
+    use super::{Local, Until, Words, DIED};
     use crate::layout::{seen_field, ControlPage, Seq, CLOSED, WAITING};
     use crate::link::Dead;
     use crate::wake::FdWake;
@@ -586,24 +607,18 @@ mod real {
             hung_up
         }
 
-        fn sleep(&self, seen: u32, deadline: Option<Instant>) -> bool {
+        fn sleep(&self, seen: u32, deadline: Option<&Until>) -> bool {
             if let Some(fd) = &self.fd {
                 // What the futex's compare does in the kernel: after `WAITING`, `seq` once more.
-                return self.seq() != seen || fd.sleep(deadline);
+                return self.seq() != seen || fd.sleep(deadline.map(|until| until.at));
             }
-            let deadline = match deadline {
-                None => None,
-                Some(at) => {
-                    let left = at.saturating_duration_since(Instant::now());
-                    if left.is_zero() {
-                        return false;
-                    }
-                    Deadline::after(left)
-                }
-            };
+            if deadline.is_some_and(|until| until.at <= Instant::now()) {
+                return false;
+            }
+            let futex = deadline.and_then(|until| until.futex.as_ref());
             // Any other error is a sleep that did not happen: the caller looks and comes back.
             !matches!(
-                self.seq.word().wait(seen, u32::MAX, deadline.as_ref()),
+                self.seq.word().wait(seen, NonZeroU32::MAX, futex),
                 Err(Error::TimedOut)
             )
         }
@@ -613,7 +628,7 @@ mod real {
                 Some(fd) => fd.poke(),
                 // Fails only where the system call does not exist, and then nobody sleeps on it.
                 None => {
-                    let _ = self.seq.word().wake(u32::MAX);
+                    let _ = self.seq.word().wake(NonZeroU32::MAX);
                     true
                 }
             }
@@ -815,9 +830,9 @@ mod pool {
 mod raise_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
-    use super::{Local, Words, DIED};
+    use super::{Local, Until, Words, DIED};
 
     /// Words whose wake reaches no one: only the waiter's own `disarm` ends a raise.
     struct Unheard(AtomicUsize);
@@ -830,7 +845,7 @@ mod raise_tests {
         fn end_wait(&self) -> bool {
             false
         }
-        fn sleep(&self, _seen: u32, _deadline: Option<Instant>) -> bool {
+        fn sleep(&self, _seen: u32, _deadline: Option<&Until>) -> bool {
             true
         }
         fn wake(&self) -> bool {

@@ -103,7 +103,7 @@ use std::sync::Arc;
 use rsbinder::fmq::shm::{
     self, Access, CreateOptions, Mapping, RoRun, RoWord32, RoWord64, Run, Seals,
 };
-use rsbinder::fmq::{Descriptor, Error, Flavor, Grantor, Result};
+use rsbinder::fmq::{Descriptor, Errno, Error, Flavor, Grantor, Result};
 
 use crate::pool::{GenerationLoads, Generations, LendError, Pin, Pins, Slots};
 use crate::ring::{Loads, Stores};
@@ -203,11 +203,14 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
+/// The errno a kernel answers for a seal it does not know.
+const EINVAL: Errno = Errno::from_raw(rustix::io::Errno::INVAL.raw_os_error());
+
 /// Add `seals` to `fd`: `shm::add_seals`, behind the switch above.
 fn add_seals(fd: BorrowedFd<'_>, seals: Seals) -> Result<()> {
     #[cfg(test)]
     if seals.contains(Seals::FUTURE_WRITE) && NO_FUTURE_WRITE.get() {
-        return Err(Error::Os(rustix::io::Errno::INVAL));
+        return Err(Error::Os(EINVAL));
     }
     shm::add_seals(fd, seals)
 }
@@ -217,7 +220,7 @@ fn seal(fd: BorrowedFd<'_>) -> Result<()> {
     let seals = Seals::GROW | Seals::SHRINK | Seals::FUTURE_WRITE | Seals::SEAL;
     match add_seals(fd, seals) {
         // The kernel applies none of a mask that holds a seal it does not know.
-        Err(Error::Os(rustix::io::Errno::INVAL)) => Err(Error::Unsupported),
+        Err(Error::Os(EINVAL)) => Err(Error::Unsupported),
         other => other,
     }
 }
@@ -318,7 +321,7 @@ impl<O> Stores for Stored<O> {
 
     fn wake_seq(&self) {
         // Fails only where the system call does not exist; there no subscriber can sleep either.
-        let _ = shm::futex_wake(self.word32(topic::SEQ), u32::MAX);
+        let _ = shm::futex_wake(self.word32(topic::SEQ), std::num::NonZeroU32::MAX);
     }
 
     fn store_ring(&self, position: u64, src: &[u8]) {

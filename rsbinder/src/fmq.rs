@@ -46,7 +46,7 @@
 //!
 //! // The client side: attach to what the reply named.
 //! let desc = Descriptor::try_from(&reply)?;
-//! let policy = AttachPolicy { max_capacity: 4096, require_seal: true, require_event_flag: true };
+//! let policy = AttachPolicy::new(4096).require_event_flag(true);
 //! let reader = MessageQueue::<u8>::attach(&desc, &policy)?;
 //! # let _ = reader; Ok(()) }
 //! # #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -67,12 +67,20 @@
 //! AIDL's signed field (an offset past `i32::MAX`, which no queue libfmq or
 //! `rsbinder-fmq` makes has).
 //!
-//! `rsbinder-fmq`'s `Error` becomes a binder `StatusCode` as follows. A
-//! descriptor or policy check and a corrupted counter are both `BadValue`
-//! (the caller cannot tell a hostile peer from a defective one and treats
-//! both as the end of the queue), a missing EventFlag word or an unsupported
-//! platform is `InvalidOperation`, a wait that ran out is `TimedOut`, and an
-//! OS error keeps its errno.
+//! `rsbinder-fmq`'s `Error` becomes a binder `StatusCode` as follows:
+//!
+//! | `rsbinder_fmq::Error` | `StatusCode` |
+//! |---|---|
+//! | `BadValue` (the caller's argument) | `BadValue` |
+//! | `InvalidDescriptor` (a descriptor or policy check) | `BadValue` |
+//! | `Corrupted` (the shared counters) | `BadValue` |
+//! | `NoEventFlag`, `Unsupported` | `InvalidOperation` |
+//! | `TimedOut` | `TimedOut` |
+//! | `Os(errno)` | the errno's status, as `From<std::io::Error>` maps it |
+//!
+//! A refused descriptor and a corrupted counter are both `BadValue`: the
+//! caller cannot tell a hostile peer from a defective one and treats both as
+//! the end of the queue.
 
 pub(crate) mod generated {
     include!(concat!(env!("OUT_DIR"), "/fmq.rs"));
@@ -121,14 +129,15 @@ mod convert {
     impl From<rsbinder_fmq::Error> for StatusCode {
         fn from(e: rsbinder_fmq::Error) -> Self {
             match e {
-                rsbinder_fmq::Error::BadValue(_) | rsbinder_fmq::Error::Corrupted(_) => {
-                    StatusCode::BadValue
-                }
+                rsbinder_fmq::Error::BadValue(_)
+                | rsbinder_fmq::Error::InvalidDescriptor(_)
+                | rsbinder_fmq::Error::Corrupted(_) => StatusCode::BadValue,
                 rsbinder_fmq::Error::NoEventFlag | rsbinder_fmq::Error::Unsupported => {
                     StatusCode::InvalidOperation
                 }
                 rsbinder_fmq::Error::TimedOut => StatusCode::TimedOut,
-                rsbinder_fmq::Error::Os(errno) => StatusCode::from(errno),
+                // Not rustix's `from_raw_os_error`, which panics on a number no kernel returns.
+                rsbinder_fmq::Error::Os(errno) => StatusCode::from(std::io::Error::from(errno)),
                 // `Error` is `#[non_exhaustive]`; a new variant is `Unknown` until named here.
                 _ => StatusCode::Unknown,
             }
@@ -275,16 +284,12 @@ mod convert {
             );
 
             // And the duplicate attaches like the original would.
-            let policy = rsbinder_fmq::AttachPolicy {
-                max_capacity: 64,
-                require_seal: true,
-                require_event_flag: true,
-            };
+            let policy = rsbinder_fmq::AttachPolicy::new(64).require_event_flag(true);
             let mut reader = MessageQueue::<u32>::attach(&back, &policy).unwrap();
             let mut writer = queue;
-            assert!(writer.write(&[7, 8, 9]).unwrap());
+            assert!(writer.write(&[7, 8, 9]).unwrap().is_done());
             let mut out = [0u32; 3];
-            assert!(reader.read(&mut out).unwrap());
+            assert!(reader.read(&mut out).unwrap().is_done());
             assert_eq!(out, [7, 8, 9]);
         }
 
@@ -346,6 +351,10 @@ mod convert {
                 StatusCode::BadValue
             );
             assert_eq!(
+                StatusCode::from(rsbinder_fmq::Error::InvalidDescriptor("x")),
+                StatusCode::BadValue
+            );
+            assert_eq!(
                 StatusCode::from(rsbinder_fmq::Error::Corrupted("x")),
                 StatusCode::BadValue
             );
@@ -357,10 +366,11 @@ mod convert {
                 StatusCode::from(rsbinder_fmq::Error::TimedOut),
                 StatusCode::TimedOut
             );
-            assert_eq!(
-                StatusCode::from(rsbinder_fmq::Error::Os(rustix::io::Errno::NOMEM)),
-                StatusCode::from(rustix::io::Errno::NOMEM)
-            );
+            let nomem = rustix::io::Errno::NOMEM;
+            let os = rsbinder_fmq::Error::Os(rsbinder_fmq::Errno::from_raw(nomem.raw_os_error()));
+            assert_eq!(StatusCode::from(os), StatusCode::from(nomem));
+            let not_an_errno = rsbinder_fmq::Error::Os(rsbinder_fmq::Errno::from_raw(0));
+            assert_eq!(StatusCode::from(not_an_errno), StatusCode::Unknown);
         }
     }
 }

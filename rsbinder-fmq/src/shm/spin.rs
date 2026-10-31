@@ -17,10 +17,33 @@
 //!
 //! The limit on concurrent looks is one counter per process. A crate that copied this code
 //! would have a counter of its own and double the limit, which is why it lives here.
+//!
+//! **Workspace-internal.** The module is public so that `rsbinder`'s `stream` and
+//! `rsbinder-topic` share the one counter; it is hidden from the documentation and is not part
+//! of the Provisional tier of [`shm`](super). Its items change without notice.
 
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+use super::Deadline;
+
+/// What a look came up with: whether the condition it looked for held before its budget ran out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Look {
+    /// The condition held.
+    Found,
+    /// The budget ran out, or there was none, and the condition did not hold.
+    Empty,
+}
+
+impl Look {
+    /// Whether the look found what it looked for.
+    #[inline]
+    pub const fn is_found(self) -> bool {
+        matches!(self, Look::Found)
+    }
+}
 
 /// How long one look lasts at most.
 ///
@@ -39,14 +62,17 @@ const PROBE_EVERY: u32 = 8;
 
 /// The look for a wait that ends at `deadline`: [`SPIN`], cut to what is left before
 /// `deadline`, and zero on a single-core machine, where looking only holds up the peer.
+///
+/// `deadline` is the one the wait's [`futex_wait`](super::futex_wait) takes, made once for
+/// the whole wait; `None` is no deadline.
 #[inline]
-pub fn spin_budget(deadline: Option<Instant>) -> Duration {
+pub fn spin_budget(deadline: Option<&Deadline>) -> Duration {
     static MULTICORE: OnceLock<bool> = OnceLock::new();
     let multicore =
         *MULTICORE.get_or_init(|| std::thread::available_parallelism().is_ok_and(|n| n.get() > 1));
     match deadline {
         _ if !multicore => Duration::ZERO,
-        Some(deadline) => SPIN.min(deadline.saturating_duration_since(Instant::now())),
+        Some(deadline) => SPIN.min(deadline.remaining()),
         None => SPIN,
     }
 }
@@ -80,39 +106,40 @@ impl Drop for SpinSlot {
 
 /// Looks until `done` returns `true` or `budget` has passed.
 ///
-/// Returns whether `done` held, and the budget the look ran under: `budget` itself, or zero
+/// Returns what the look came up with, and the budget it ran under: `budget` itself, or zero
 /// when the look ended early because the process already had its share of threads looking.
-/// Pass that second value to [`SpinGauge::spun`].
+/// Pass both to [`SpinGauge::spun`].
 ///
 /// The first [`SPIN_CLOCK_EVERY`] looks touch nothing shared and read no clock, and on a busy
 /// channel most looks end there. Only past them does the call take one of the process's look
 /// slots — half its cores' worth, counted for every caller of this function in the process —
 /// and read the clock every [`SPIN_CLOCK_EVERY`] looks. The caller has looked once already
-/// before calling: a zero `budget` returns `(false, Duration::ZERO)` without calling `done`.
+/// before calling: a zero `budget` returns `(Look::Empty, Duration::ZERO)` without calling
+/// `done`.
 #[inline]
-pub fn spin_until(budget: Duration, mut done: impl FnMut() -> bool) -> (bool, Duration) {
+pub fn spin_until(budget: Duration, mut done: impl FnMut() -> bool) -> (Look, Duration) {
     if budget.is_zero() {
-        return (false, budget);
+        return (Look::Empty, budget);
     }
     for _ in 0..SPIN_CLOCK_EVERY {
         std::hint::spin_loop();
         if done() {
-            return (true, budget);
+            return (Look::Found, budget);
         }
     }
     let Some(_slot) = SpinSlot::take() else {
-        return (false, Duration::ZERO);
+        return (Look::Empty, Duration::ZERO);
     };
     let start = Instant::now();
     loop {
         for _ in 0..SPIN_CLOCK_EVERY {
             std::hint::spin_loop();
             if done() {
-                return (true, budget);
+                return (Look::Found, budget);
             }
         }
         if start.elapsed() >= budget {
-            return (false, budget);
+            return (Look::Empty, budget);
         }
     }
 }
@@ -128,15 +155,15 @@ pub fn spin_until(budget: Duration, mut done: impl FnMut() -> bool) -> (bool, Du
 /// One gauge per side and channel. Each wait goes:
 ///
 /// ```
-/// # use rsbinder_fmq::shm::spin::{spin_until, SpinGauge};
+/// # use rsbinder_fmq::shm::spin::{spin_until, Look, SpinGauge};
 /// # use std::time::Instant;
 /// # let gauge = SpinGauge::default();
 /// # let ready = || true;
 /// # let park = || ();
 /// let budget = gauge.budget(None);
-/// let (found, spun) = spin_until(budget, ready);
-/// gauge.spun(spun, found);
-/// if !found {
+/// let (look, spun) = spin_until(budget, ready);
+/// gauge.spun(spun, look);
+/// if look == Look::Empty {
 ///     let parked_at = Instant::now();
 ///     park();
 ///     gauge.parked(parked_at.elapsed());
@@ -156,7 +183,7 @@ impl SpinGauge {
     /// The look for this wait: [`spin_budget`], or zero while the gauge is off and this wait
     /// is not a probe. A wait that returns zero is counted towards the next probe.
     #[inline]
-    pub fn budget(&self, deadline: Option<Instant>) -> Duration {
+    pub fn budget(&self, deadline: Option<&Deadline>) -> Duration {
         if self.is_off() {
             let skipped = self.skipped.load(Ordering::Relaxed) + 1;
             if skipped < PROBE_EVERY {
@@ -174,13 +201,13 @@ impl SpinGauge {
         self.wasted.load(Ordering::Relaxed) >= WASTED_SPINS
     }
 
-    /// A look of `budget` ended; `found` is whether it found what it looked for.
+    /// A look of `budget` ended with `look`.
     ///
     /// A find turns the look on. A miss counts only when `budget` was a full [`SPIN`]: a look
     /// a near deadline cut short, or one that got no slot, says nothing about the peer.
     #[inline]
-    pub fn spun(&self, budget: Duration, found: bool) {
-        if found {
+    pub fn spun(&self, budget: Duration, look: Look) {
+        if look.is_found() {
             self.turn_on();
         } else if budget >= SPIN {
             let wasted = self.wasted.load(Ordering::Relaxed);
@@ -230,8 +257,8 @@ mod tests {
             looks == 3
         });
         SPINNERS.fetch_sub(1 << 20, Ordering::Relaxed);
-        assert_eq!(unspun, (false, Duration::ZERO));
-        assert_eq!(caught, (true, SPIN), "the first round needs no slot");
+        assert_eq!(unspun, (Look::Empty, Duration::ZERO));
+        assert_eq!(caught, (Look::Found, SPIN), "the first round needs no slot");
     }
 
     /// Plan 10-7c D13: a spin a deadline cut short and a slow wake change nothing.
@@ -242,23 +269,23 @@ mod tests {
         }
         let gauge = SpinGauge::default();
         for _ in 0..WASTED_SPINS - 1 {
-            gauge.spun(SPIN, false);
+            gauge.spun(SPIN, Look::Empty);
         }
-        gauge.spun(SPIN / 2, false);
+        gauge.spun(SPIN / 2, Look::Empty);
         gauge.parked(Duration::from_millis(1));
         assert_eq!(
             gauge.budget(None),
             SPIN,
             "one wasted full spin short of the limit"
         );
-        gauge.spun(SPIN, false);
+        gauge.spun(SPIN, Look::Empty);
         gauge.parked(Duration::from_micros(1));
         assert_eq!(
             gauge.budget(None),
             Duration::ZERO,
             "a quick wake after a wasted full spin keeps it off"
         );
-        gauge.spun(Duration::ZERO, false);
+        gauge.spun(Duration::ZERO, Look::Empty);
         gauge.parked(Duration::from_millis(1));
         assert_eq!(
             gauge.budget(None),
@@ -268,10 +295,10 @@ mod tests {
         gauge.parked(Duration::from_micros(1));
         assert_eq!(gauge.budget(None), SPIN, "a wake a spin would have caught");
         for _ in 0..WASTED_SPINS - 1 {
-            gauge.spun(SPIN, false);
+            gauge.spun(SPIN, Look::Empty);
         }
-        gauge.spun(SPIN, true);
-        gauge.spun(SPIN, false);
+        gauge.spun(SPIN, Look::Found);
+        gauge.spun(SPIN, Look::Empty);
         assert_eq!(gauge.budget(None), SPIN, "a find starts the count over");
     }
 
@@ -283,23 +310,23 @@ mod tests {
         }
         let gauge = SpinGauge::default();
         for _ in 0..WASTED_SPINS {
-            gauge.spun(SPIN, false);
+            gauge.spun(SPIN, Look::Empty);
         }
         for round in 0..2 {
             for wait in 1..PROBE_EVERY {
                 let budget = gauge.budget(None);
                 assert_eq!(budget, Duration::ZERO, "round {round}, wait {wait}");
-                gauge.spun(budget, false);
+                gauge.spun(budget, Look::Empty);
                 gauge.parked(Duration::from_millis(1));
             }
             assert_eq!(gauge.budget(None), SPIN, "round {round}: the probe");
             if round == 0 {
-                gauge.spun(SPIN, false);
+                gauge.spun(SPIN, Look::Empty);
                 gauge.parked(Duration::from_micros(1));
                 assert!(gauge.is_off(), "a probe that finds nothing keeps it off");
             }
         }
-        gauge.spun(SPIN, true);
+        gauge.spun(SPIN, Look::Found);
         assert!(!gauge.is_off());
         assert_eq!(gauge.budget(None), SPIN);
     }
