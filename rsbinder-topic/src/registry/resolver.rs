@@ -12,8 +12,8 @@ use rsbinder::{hub, BinderResult, Interface, SIBinder, StatusCode, Strong};
 use crate::aidl::ITopic::ITopic;
 use crate::aidl::ITopicRegistry::{ITopicRegistry, SERVICE_NAME};
 use crate::aidl::ITopicWatcher::{BnTopicWatcher, ITopicWatcher};
-use crate::aidl::TopicInfo::TopicInfo;
 use crate::aidl::TopicRef::TopicRef;
+use crate::registry::TopicListing;
 use crate::resolve::{Advertisement, Resolver, Watch};
 
 /// A registry of topic names as a [`Resolver`]: names apart from service names, under the policy
@@ -66,9 +66,11 @@ impl RegistryResolver {
         })
     }
 
-    /// The names under `prefix` with a topic that this process may subscribe to, sorted.
-    pub fn list(&self, prefix: &str) -> BinderResult<Vec<TopicInfo>> {
-        self.registry.r#list(prefix)
+    /// The names under `prefix` with a topic that this process may subscribe to, sorted, as the
+    /// registry sends them. `EX_SECURITY` when the host's policy does not let this process list.
+    pub fn list(&self, prefix: &str) -> BinderResult<Vec<TopicListing>> {
+        let listed = self.registry.r#list(prefix)?;
+        Ok(listed.into_iter().map(TopicListing::from).collect())
     }
 }
 

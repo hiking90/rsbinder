@@ -217,6 +217,8 @@ pub fn first_seq(start: Start, history: History, at: Committed) -> u64 {
         Start::Last => at.next.saturating_sub(1),
         Start::Oldest if at.next == 0 => 0,
         Start::Oldest => at.oldest,
+        // `Start` is `#[non_exhaustive]`: a start the judge has no rule for is the harness's bug.
+        other => panic!("no rule for where a connection at {other:?} starts"),
     }
 }
 

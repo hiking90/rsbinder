@@ -483,8 +483,14 @@ Each item below changes what a 0.12.0 program observes.
   - `Publisher<T>` and `Subscriber<T>` for any parcelable or `Bytes`
     (`Payload`). A publish never waits: a subscriber that falls a ring
     behind gets `RecvError::Lagged` with the number it lost. With
-    `PublisherPolicy::backpressure` a publish waits up to a timeout and then
-    takes the subscribers in the way out (`Closed::Evicted`).
+    `PublisherPolicy::backpressure` a publish waits up to
+    `Backpressure::publish_timeout` (which also bounds a loan and the end
+    record of `close` or a drop) and then takes the subscribers in the way
+    out (`Closed::Evicted`); a stopped subscriber is taken out only once it
+    holds a publish up. `Publisher::close()` ends the topic with
+    `Closed::End`, `close_with(&Status)` with a status. `Publisher::new`
+    returns `BinderResult` as the other constructors do
+    (`EX_ILLEGAL_ARGUMENT` with the failed check for a policy out of range).
   - `Publisher::advertise` and `NamedSubscriber`: a topic found by a service
     manager name, the subscriber reconnecting to whichever publisher holds
     it (`RecvError::Disconnected` between connections). A registration
@@ -492,30 +498,49 @@ Each item below changes what a 0.12.0 program observes.
     room for it) is made up by a `check_service` when a publisher ends, or
     refuses as ended, with no other binder for the name; it asks once more
     when a notice during the call gives the name a binder it cannot use. `Resolver`
-    (`Advertisement`, `Watch::with_lookup`) puts the names somewhere else; a
-    `Publisher` drops the `Advertisement` its resolver returned in `close`, or
-    as it drops, before its end record.
+    (`Advertisement`, `Watch::with_lookup`, `host`) puts the names somewhere
+    else; a `Publisher` drops the `Advertisement` its resolver returned in
+    `close`, or as it drops, before its end record, and
+    `Publisher::advertise_on` gives a name after the topic was made.
+    `NamedSubscriber::state` reports, at every ask, a refusal a retry cannot
+    change, a corrupt ring, or `Closed::ResolverDied` once a registry's host
+    died and no connection is left. A `NamedSubscriber<Bytes>` receives
+    samples too (`recv_sample`, `try_recv_sample`, `try_latest_sample`,
+    `recv_sample_timeout`, `recv_sample_async`), with the value receives'
+    connection and drain rules; `unsafe` `trust_publisher` makes a
+    `NamedSubscriber<Bytes, Trusted>` that vouches for every publisher of
+    the name.
   - `registry`: a registry of topic names apart from service names, which
     `rsb_hub` serves with its `topic` feature. `RegistryResolver` is its
     client (`find`, `list`), taken by `Publisher::advertise_with` and
     `NamedSubscriber::subscribe_with`: a name is taken back as its publisher
     closes or its process dies, and a notice a watcher had no room for is
     sent again. `Registry`, `RegistryAccess` and `RegistryStats` are the host
-    side; its AIDL (`ITopicRegistry`, `ITopicWatcher`, `TopicInfo`,
-    `TopicRef`) is rsbinder's own. See the book's Topics chapter.
+    side. `RegistryResolver::list` returns `registry::TopicListing` (`uid:
+    u32`, `age: Duration`). The AIDL is rsbinder's own; the wire-only types
+    (`ITopicWatcher`, `TopicInfo`, `TopicRef`, `ISubscription`, `Pool`) are
+    hidden from the docs, and `ITopic`, `ITopicRegistry`, `SubscribeRequest`
+    and `TopicEndpoint` stay documented. See the book's Topics chapter.
   - Waits on a futex word of the topic (`Wake::Futex`, one wake system call
     per publish for every sleeping subscriber) or on a socket of the
     subscription (`Wake::Fd`, with `Wait` and `wait_any` for event loops);
-    `recv_async` with the `tokio` feature; `Interrupter`.
+    `recv_async` with the `tokio` feature, `RecvError::Runtime` when the
+    runtime cannot run a wait; `Interrupter`, the only source of
+    `RecvError::Cancelled`; `recv_latest_timeout`.
   - Loans (`PoolPolicy`, `Publisher::loan_slice`, `LoanMut`): a `Bytes` value
     written straight into a slot of a second memfd and received in place as
     a `Sample` (`recv_sample`, `try_latest_sample`, `recv_sample_async`).
     An `Untrusted` subscriber copies a slot with atomic loads; `unsafe`
     `trust_publisher` makes a `Trusted` one, whose samples deref to `[u8]`.
   - `PublisherPolicy::authorize` and `Acceptor` decide who may subscribe;
-    `Publisher::stats` and `Subscriber::stats` count what went through.
-  - The error enums `RecvError`, `Closed`, `Disconnected` and `PublishError`
-    are `#[non_exhaustive]`. The subscription AIDL (`aidl/rsbinder/topic/`)
+    `Publisher::stats` and `Subscriber::stats` count what went through, and
+    `Publisher::stats` reports each subscription's pinned pool slot
+    (`SubscriberInfo::pinned`) and whether the publisher holds a name
+    (`PublisherStats::advertised`).
+  - The error enums `RecvError`, `Closed`, `Disconnected` and `PublishError`,
+    the enums `Start` and `Wake`, and `PublisherStats`, `SubscriberInfo`,
+    `SubscriberStats` and `registry::TopicListing` are `#[non_exhaustive]`.
+    The subscription AIDL (`aidl/rsbinder/topic/`)
     and the memory layout are rsbinder's own; a publisher and a subscriber
     of different layout versions refuse each other
     (`ITopic::ERROR_VERSION`).

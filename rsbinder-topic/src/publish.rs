@@ -471,7 +471,10 @@ impl<T: Payload> TypedWriter<T, Stored<Mapping>> {
         let writer = Self::new(Writer::new(stored));
         {
             let mut state = writer.lock();
-            state.backpressure = policy.backpressure.as_ref().map(|wait| wait.timeout);
+            state.backpressure = policy
+                .backpressure
+                .as_ref()
+                .map(|wait| wait.publish_timeout);
             state.window = policy.backpressure.as_ref().and_then(|wait| wait.window);
         }
         let Some(pool) = &policy.pool else {
@@ -528,6 +531,7 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
             bytes: state.bytes,
             subscribers: state.links.infos(state.writer.position()),
             evicted: state.evicted,
+            advertised: false,
         };
         drop(state);
         drop(gone);

@@ -56,6 +56,7 @@ use crate::{
 
 /// Where a subscription starts reading.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Start {
     /// At the first record published after the publisher took the subscription.
     #[default]
@@ -69,6 +70,7 @@ pub enum Start {
 
 /// How the publisher wakes a subscriber that waits.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Wake {
     /// A futex on a word of the topic's memory: one wake system call per commit serves every
     /// subscriber of this kind that sleeps, however many. A wait holds a thread: `recv` the
@@ -412,8 +414,8 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
     /// as any wait does, at a commit, an interrupt or a death; while it is still queued nothing
     /// ends the join, however long the pool takes. A [`recv_timeout`](Self::recv_timeout) whose
     /// `timeout` passes first looks at the ring once more and does not wait. Besides `recv`'s
-    /// results, [`RecvError::Cancelled`] when the pool cannot run the wait, or the reactor cannot
-    /// take the subscription's file descriptors.
+    /// results, [`RecvError::Runtime`] when the pool cannot run the wait, or the reactor cannot
+    /// take the subscription's file descriptor.
     ///
     /// # Panics
     ///
@@ -427,7 +429,7 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
 
     /// An async wait until `look` finds other than `Empty`; `look` holds no borrow.
     #[cfg(feature = "tokio")]
-    async fn wait_async_with<V>(
+    pub(crate) async fn wait_async_with<V>(
         &mut self,
         mut look: impl FnMut(&mut Self) -> Result<V, RecvError>,
     ) -> Result<V, RecvError> {
@@ -462,7 +464,7 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
             }
             let ran = on_pool(&self.local, &self.leftover, seen).await;
             if ran.is_err() {
-                return Err(RecvError::Cancelled);
+                return Err(RecvError::Runtime(std::io::ErrorKind::Other));
             }
         }
     }
@@ -486,14 +488,15 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
                 yield_once().await;
                 continue;
             }
-            if self.reactor.is_none() {
-                let fd = self.local.words().fd.as_ref().map(FdWake::fd);
-                // SAFETY: `reactor` is declared before `local`, whose last `Arc` closes the fd.
-                let made = fd.map(|fd| unsafe { Reactor::new(fd) }).transpose();
-                self.reactor = made.map_err(|_| RecvError::Cancelled)?;
-            }
-            let Some(reactor) = &self.reactor else {
-                return Err(RecvError::Cancelled);
+            let reactor = match &mut self.reactor {
+                Some(reactor) => reactor,
+                none => {
+                    let fd = self.local.words().fd.as_ref().map(FdWake::fd);
+                    let fd = fd.expect("a `Wake::Fd` subscription waits on the reactor");
+                    // SAFETY: `reactor` is declared before `local`, whose last `Arc` closes it.
+                    let made = unsafe { Reactor::new(fd) };
+                    none.insert(made.map_err(|error| RecvError::Runtime(error.kind()))?)
+                }
             };
             #[cfg(test)]
             if let Some(hook) = self.about_to_park.as_mut() {
@@ -577,7 +580,7 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
     }
 
     /// The next record, or the newest with `latest`, without waiting.
-    fn look(&mut self, latest: bool) -> Result<T, RecvError> {
+    pub(crate) fn look(&mut self, latest: bool) -> Result<T, RecvError> {
         if self.local.evicted() {
             self.looked = Looked::Exact;
             return Err(RecvError::Closed(Closed::Evicted));
@@ -608,7 +611,7 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
     }
 
     /// Wait until `look` finds other than `Empty`, or `deadline` passes; `look` holds no borrow.
-    fn wait_with<V>(
+    pub(crate) fn wait_with<V>(
         &mut self,
         deadline: Option<Instant>,
         mut look: impl FnMut(&mut Self) -> Result<V, RecvError>,
@@ -809,6 +812,18 @@ impl Subscriber<Bytes> {
     /// }
     /// ```
     pub unsafe fn trust_publisher(self) -> Subscriber<Bytes, Trusted> {
+        // SAFETY: the caller's word for the publisher, this function's contract.
+        unsafe { self.vouched() }
+    }
+}
+
+impl<T: Payload> Subscriber<T> {
+    /// This subscriber as one of `N`, the subscription as it was.
+    ///
+    /// # Safety
+    ///
+    /// With `N` [`Trusted`], [`Subscriber::trust_publisher`]'s.
+    pub(crate) unsafe fn vouched<N: Trust>(self) -> Subscriber<T, N> {
         let Self {
             _abandon,
             reader,
@@ -874,7 +889,7 @@ impl<M: Trust> Subscriber<Bytes, M> {
     /// before this call pinned it is a loss of one record, [`RecvError::Lagged`]`(1)`.
     pub fn try_recv_sample(&mut self) -> Result<Sample<'_, M>, RecvError> {
         let held = self.look_held(false)?;
-        Ok(self.reader.sample(held, self.control.0.read()))
+        Ok(self.sample(held))
     }
 
     /// The newest value where it lies, without waiting: [`try_latest`](Self::try_latest) with no
@@ -889,14 +904,14 @@ impl<M: Trust> Subscriber<Bytes, M> {
     /// are `try_latest`'s.
     pub fn try_latest_sample(&mut self) -> Result<Sample<'_, M>, RecvError> {
         let held = self.look_held(true)?;
-        Ok(self.reader.sample(held, self.control.0.read()))
+        Ok(self.sample(held))
     }
 
     /// The next value where it lies, waiting for one: [`try_recv_sample`](Self::try_recv_sample)
     /// after the wait [`recv`](Self::recv) makes.
     pub fn recv_sample(&mut self) -> Result<Sample<'_, M>, RecvError> {
         let held = self.wait_with(None, |subscriber| subscriber.look_held(false))?;
-        Ok(self.reader.sample(held, self.control.0.read()))
+        Ok(self.sample(held))
     }
 
     /// [`recv_sample`](Self::recv_sample) with a bound: [`RecvError::Timeout`] once `timeout`
@@ -904,7 +919,7 @@ impl<M: Trust> Subscriber<Bytes, M> {
     pub fn recv_sample_timeout(&mut self, timeout: Duration) -> Result<Sample<'_, M>, RecvError> {
         let deadline = Instant::now().checked_add(timeout);
         let held = self.wait_with(deadline, |subscriber| subscriber.look_held(false))?;
-        Ok(self.reader.sample(held, self.control.0.read()))
+        Ok(self.sample(held))
     }
 
     /// [`recv_sample`](Self::recv_sample) for an async caller: the value where it lies, waiting
@@ -913,7 +928,7 @@ impl<M: Trust> Subscriber<Bytes, M> {
     /// Cancel-safe, as `recv_async` is: a slot is pinned only by the look that finds its value,
     /// and the future returns the [`Sample`] in that same poll, so a future dropped while it
     /// waits holds no pin and loses no record. The results are `recv_sample`'s, and `recv_async`'s
-    /// [`RecvError::Cancelled`].
+    /// [`RecvError::Runtime`].
     ///
     /// # Panics
     ///
@@ -924,10 +939,16 @@ impl<M: Trust> Subscriber<Bytes, M> {
         let held = self
             .wait_async_with(|subscriber| subscriber.look_held(false))
             .await?;
-        Ok(self.reader.sample(held, self.control.0.read()))
+        Ok(self.sample(held))
     }
 
-    fn look_held(&mut self, latest: bool) -> Result<Held, RecvError> {
+    /// The sample of what the last [`look_held`](Self::look_held) returned.
+    pub(crate) fn sample(&self, held: Held) -> Sample<'_, M> {
+        self.reader.sample(held, self.control.0.read())
+    }
+
+    /// The next value, the newest with `latest`, in the reader's buffer or a slot it pins now.
+    pub(crate) fn look_held(&mut self, latest: bool) -> Result<Held, RecvError> {
         if self.local.evicted() {
             self.looked = Looked::Exact;
             return Err(RecvError::Closed(Closed::Evicted));

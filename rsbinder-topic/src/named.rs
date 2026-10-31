@@ -29,12 +29,13 @@ use crate::aidl::ITopic::{ERROR_CLOSED, ERROR_VERSION};
 use crate::connect::status_of;
 use crate::layout;
 use crate::poll::{Sealed, Wait};
+use crate::receive::Held;
 use crate::resolve::{Lookup, Resolver, ServiceManager, Watch};
 use crate::subscriber::Interrupt;
 use crate::wake::NamedFds;
 use crate::{
-    Closed, Disconnected, Interrupter, Payload, RecvError, Start, Subscriber, SubscriberPolicy,
-    SubscriberStats, Wake,
+    Bytes, Closed, Disconnected, Interrupter, Payload, RecvError, Sample, Start, Subscriber,
+    SubscriberPolicy, SubscriberStats, Trust, Trusted, Untrusted, Wake,
 };
 
 /// The first wait before a refused subscription is asked again, doubled up to [`LAST_RETRY`].
@@ -161,20 +162,52 @@ pub enum NamedState {
 /// `recv_async` waits on the connection's `recv_async`, and between connections without a
 /// thread.
 ///
+/// # Samples
+///
+/// A subscriber of [`Bytes`] also receives a value where it lies,
+/// [`recv_sample`](Self::recv_sample) and the calls beside it, as a [`Subscriber`]'s do: the
+/// [`Sample`] pins the slot of a lent value. The connection rules are those of the value
+/// receives, the drain before a [`Disconnected::Replaced`] included. A sample borrows the
+/// subscriber, so no connection is taken, ended or replaced while one is held; a change of the
+/// name meanwhile is seen by the next receive.
+///
+/// `M` says whether the subscriber vouches for its publishers, as for a [`Subscriber`]: one made
+/// by [`subscribe`](Self::subscribe) is [`Untrusted`], and `unsafe`
+/// [`trust_publisher`](NamedSubscriber::trust_publisher) makes it [`Trusted`] for every
+/// connection, those it makes later included.
+///
 /// **The process has to run the binder thread pool**
 /// (`rsbinder::ProcessState::start_thread_pool`): the service manager's notice of the name is a
 /// call into it, and without the pool the subscriber never connects.
 ///
 /// [`ITopic::ERROR_CLOSED`]: crate::aidl::ITopic::ERROR_CLOSED
 #[must_use = "dropping the subscriber at once ends the subscription at once"]
-pub struct NamedSubscriber<T: Payload> {
+pub struct NamedSubscriber<T: Payload, M: Trust = Untrusted> {
+    /// Ends the name layer's work as the subscriber drops, first of the fields.
+    _leave: Leave<T>,
     named: Arc<Named<T>>,
-    current: Option<Connection<T>>,
+    current: Option<Connection<T, M>>,
     /// What the connections that ended counted.
     past: SubscriberStats,
     _watch: Watch,
     /// The death link to the watch's host, when it has one.
     _host: Option<HostLink>,
+}
+
+/// Marks the name layer dropped when the subscriber drops: a connection thread then ends.
+struct Leave<T: Payload>(Arc<Named<T>>);
+
+impl<T: Payload> Drop for Leave<T> {
+    fn drop(&mut self) {
+        let mut state = self.0.lock();
+        state.dropped = true;
+        state.wake = None;
+        let ready = state.ready.take();
+        drop(state);
+        // A connection thread asleep before a retry looks at `dropped` and ends.
+        self.0.signal();
+        drop(ready);
+    }
 }
 
 /// Unlinks from the watch's host as the subscriber drops.
@@ -209,14 +242,17 @@ impl DeathRecipient for HostDeath {
 }
 
 /// The connection the receiving thread holds.
-struct Connection<T: Payload> {
-    subscriber: Subscriber<T>,
+struct Connection<T: Payload, M: Trust> {
+    subscriber: Subscriber<T, M>,
     binder: SIBinder,
     /// The records to return before the end, once another publisher took the name.
     drain: Option<Drain>,
 }
 
-impl<T: Payload> Connection<T> {
+/// How a receive takes what it returns from a connection: a value, or one held where it lies.
+type Look<T, M, V> = fn(&mut Subscriber<T, M>, bool) -> Result<V, RecvError>;
+
+impl<T: Payload, M: Trust> Connection<T, M> {
     /// The name came back to this connection's publisher: nothing replaced, no drain, read live.
     fn keep(&mut self, state: &mut State<T>) {
         state.replaced = false;
@@ -491,6 +527,7 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
         }
         let host = resolver.host().and_then(|host| named.link_host(&host));
         Ok(Self {
+            _leave: Leave(named.clone()),
             named,
             current: None,
             past: SubscriberStats::default(),
@@ -498,7 +535,123 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
             _host: host,
         })
     }
+}
 
+impl NamedSubscriber<Bytes> {
+    /// This subscriber, vouching from now on for every publisher the name is given to
+    /// ([`Trusted`]): the connection it holds and each one it makes later, as
+    /// [`Subscriber::trust_publisher`] does for one subscription. Its samples deref to `[u8]` in
+    /// place, and every copy of a lent value, a sample's or [`recv`](Self::recv)'s, is a plain
+    /// memory copy into a buffer not zeroed first.
+    ///
+    /// The subscriber goes on as it was: the same connection, read position, waits and
+    /// statistics. There is no way back: a subscriber that stops vouching subscribes again.
+    ///
+    /// # Safety
+    ///
+    /// For as long as the subscriber lives, every publisher its resolver gives the name to keeps
+    /// the pin protocol of plan 15 §6.2: it never writes a slot a subscriber has pinned. An
+    /// `rsbinder-topic` [`Publisher`](crate::Publisher) does. Nothing in this process can check
+    /// which process holds the name, now or after the next registration, so the caller answers
+    /// for every process the name may be given to: names that only this system's own services
+    /// may register under the policy of the service manager or the registry, say, and not a name
+    /// a process less privileged than the caller may take. A publisher that breaks the protocol
+    /// can change the bytes under a live `&[u8]`, which is undefined behavior.
+    ///
+    /// ```no_run
+    /// use rsbinder_topic::{Bytes, NamedSubscriber, SubscriberPolicy, Trusted};
+    ///
+    /// fn checksum() -> rsbinder::BinderResult<u32> {
+    ///     let policy = SubscriberPolicy::default();
+    ///     let subscriber = NamedSubscriber::<Bytes>::subscribe("example.frames", &policy)?;
+    ///     // SAFETY: only this system's own frame service may register the name.
+    ///     let mut subscriber: NamedSubscriber<Bytes, Trusted> =
+    ///         unsafe { subscriber.trust_publisher() };
+    ///     let sample = subscriber.recv_sample().expect("a value");
+    ///     Ok(sample.iter().map(|&byte| u32::from(byte)).sum())
+    /// }
+    /// ```
+    pub unsafe fn trust_publisher(self) -> NamedSubscriber<Bytes, Trusted> {
+        let Self {
+            _leave,
+            named,
+            current,
+            past,
+            _watch,
+            _host,
+        } = self;
+        let current = current.map(|connection| Connection {
+            // SAFETY: the caller's word for every publisher of the name, this function's contract.
+            subscriber: unsafe { connection.subscriber.vouched() },
+            binder: connection.binder,
+            drain: connection.drain,
+        });
+        NamedSubscriber {
+            _leave,
+            named,
+            current,
+            past,
+            _watch,
+            _host,
+        }
+    }
+}
+
+impl<M: Trust> NamedSubscriber<Bytes, M> {
+    /// The next value where it lies, without waiting: [`Subscriber::try_recv_sample`] on the
+    /// connection, with the results of [`try_recv`](Self::try_recv).
+    ///
+    /// The [`Sample`] pins the slot of a lent value until it drops, and borrows the subscriber
+    /// meanwhile (see the type's documentation). A lent slot the publisher took back before this
+    /// call pinned it is a loss of one record, [`RecvError::Lagged`]`(1)`.
+    pub fn try_recv_sample(&mut self) -> Result<Sample<'_, M>, RecvError> {
+        let held = self.receive(None, false, Subscriber::look_held)?;
+        Ok(self.held(held))
+    }
+
+    /// The newest value where it lies, without waiting: [`Subscriber::try_latest_sample`] on the
+    /// connection, with the results of [`try_latest`](Self::try_latest).
+    pub fn try_latest_sample(&mut self) -> Result<Sample<'_, M>, RecvError> {
+        let held = self.receive(None, true, Subscriber::look_held)?;
+        Ok(self.held(held))
+    }
+
+    /// The next value where it lies, waiting for one, and for a connection when there is none:
+    /// [`try_recv_sample`](Self::try_recv_sample) after the wait [`recv`](Self::recv) makes.
+    pub fn recv_sample(&mut self) -> Result<Sample<'_, M>, RecvError> {
+        let held = self.receive(Some(None), false, Subscriber::look_held)?;
+        Ok(self.held(held))
+    }
+
+    /// [`recv_sample`](Self::recv_sample) with a bound: [`RecvError::Timeout`] once `timeout`
+    /// passes with no record. A `timeout` too long for an `Instant` waits without one.
+    pub fn recv_sample_timeout(&mut self, timeout: Duration) -> Result<Sample<'_, M>, RecvError> {
+        let deadline = Instant::now().checked_add(timeout);
+        let held = self.receive(Some(deadline), false, Subscriber::look_held)?;
+        Ok(self.held(held))
+    }
+
+    /// [`recv_sample`](Self::recv_sample) for an async caller, waiting as
+    /// [`recv_async`](Self::recv_async) does.
+    ///
+    /// Cancel-safe, as [`Subscriber::recv_sample_async`] is, and with its panics.
+    #[cfg(feature = "tokio")]
+    pub async fn recv_sample_async(&mut self) -> Result<Sample<'_, M>, RecvError> {
+        let held = self.receive_async(Subscriber::look_held).await?;
+        Ok(self.held(held))
+    }
+
+    /// The sample of a value a receive of the connection held.
+    fn held(&self, held: Held) -> Sample<'_, M> {
+        let connection = self
+            .current
+            .as_ref()
+            .expect("a value held is the connection's");
+        connection.subscriber.sample(held)
+    }
+}
+
+impl<T: Payload + 'static, M: Trust> NamedSubscriber<T, M> {
     /// Where the subscriber stands now; see [`NamedState`].
     ///
     /// Unlike a receive, which reports a change once, this answers the same until the state
@@ -534,24 +687,25 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
     /// The next value, without waiting: [`Subscriber::try_recv`] on the connection.
     /// [`RecvError::Empty`] also when there is none.
     pub fn try_recv(&mut self) -> Result<T, RecvError> {
-        self.receive(None, false)
+        self.receive(None, false, Subscriber::look)
     }
 
     /// The newest value, without waiting: [`Subscriber::try_latest`] on the connection.
     pub fn try_latest(&mut self) -> Result<T, RecvError> {
-        self.receive(None, true)
+        self.receive(None, true, Subscriber::look)
     }
 
     /// The next value, waiting for one, and for a connection when there is none.
     /// [`RecvError::Cancelled`] when an [`Interrupter`] ends the wait.
     pub fn recv(&mut self) -> Result<T, RecvError> {
-        self.receive(Some(None), false)
+        self.receive(Some(None), false, Subscriber::look)
     }
 
     /// [`recv`](Self::recv) with a bound: [`RecvError::Timeout`] once `timeout` passes with no
     /// record. A `timeout` too long for an `Instant` waits without one.
     pub fn recv_timeout(&mut self, timeout: Duration) -> Result<T, RecvError> {
-        self.receive(Some(Instant::now().checked_add(timeout)), false)
+        let deadline = Instant::now().checked_add(timeout);
+        self.receive(Some(deadline), false, Subscriber::look)
     }
 
     /// The newest value, waiting until some record is unread, as [`Subscriber::recv_latest`].
@@ -560,13 +714,14 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
     /// committed after that was seen, the newest when it looked, and then
     /// [`Disconnected::Replaced`].
     pub fn recv_latest(&mut self) -> Result<T, RecvError> {
-        self.receive(Some(None), true)
+        self.receive(Some(None), true, Subscriber::look)
     }
 
     /// [`recv_latest`](Self::recv_latest) with a bound: [`RecvError::Timeout`] once `timeout`
     /// passes with no record. A `timeout` too long for an `Instant` waits without one.
     pub fn recv_latest_timeout(&mut self, timeout: Duration) -> Result<T, RecvError> {
-        self.receive(Some(Instant::now().checked_add(timeout)), true)
+        let deadline = Instant::now().checked_add(timeout);
+        self.receive(Some(deadline), true, Subscriber::look)
     }
 
     /// A handle that ends this subscriber's wait from another thread, also a wait for a
@@ -604,18 +759,23 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
     }
 
     /// A receive: without waiting (`wait` is `None`), or waiting until a deadline or without one.
-    fn receive(&mut self, wait: Option<Option<Instant>>, latest: bool) -> Result<T, RecvError> {
+    fn receive<V>(
+        &mut self,
+        wait: Option<Option<Instant>>,
+        latest: bool,
+        look: Look<T, M, V>,
+    ) -> Result<V, RecvError> {
         loop {
             let named = self.named.clone();
-            let mut state = match self.step(named.lock(), latest) {
+            let mut state = match self.step(named.lock(), latest, look) {
                 Step::Done(received) => return received,
                 Step::Idle(state) => state,
                 Step::Connected => {
                     let connection = self.current.as_mut().expect("a connection");
+                    let subscriber = &mut connection.subscriber;
                     let received = match wait {
-                        None if latest => connection.subscriber.try_latest(),
-                        None => connection.subscriber.try_recv(),
-                        Some(deadline) => connection.subscriber.wait(deadline, latest),
+                        None => look(subscriber, latest),
+                        Some(deadline) => subscriber.wait_with(deadline, |s| look(s, latest)),
                     };
                     match self.settle(received) {
                         Some(received) => return received,
@@ -649,12 +809,18 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
     /// Cancel-safe, as `Subscriber::recv_async` is, and with its panics.
     #[cfg(feature = "tokio")]
     pub async fn recv_async(&mut self) -> Result<T, RecvError> {
+        self.receive_async(Subscriber::look).await
+    }
+
+    /// [`recv_async`](Self::recv_async), taking from the connection with `look`.
+    #[cfg(feature = "tokio")]
+    async fn receive_async<V>(&mut self, look: Look<T, M, V>) -> Result<V, RecvError> {
         loop {
             let named = self.named.clone();
             // Made before the look: a `Notified` gets `notify_waiters` from its creation on.
             let notified = named.notify.notified();
             // Decided before any await: the lock, and the type that holds it, end here.
-            let connected = match self.step(named.lock(), false) {
+            let connected = match self.step(named.lock(), false, look) {
                 Step::Done(received) => return received,
                 Step::Idle(state) => {
                     if take_interrupt(state) {
@@ -669,7 +835,8 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
                 continue;
             }
             let connection = self.current.as_mut().expect("a connection");
-            let received = connection.subscriber.recv_async().await;
+            let subscriber = &mut connection.subscriber;
+            let received = subscriber.wait_async_with(|s| look(s, false)).await;
             if let Some(received) = self.settle(received) {
                 return received;
             }
@@ -677,7 +844,12 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
     }
 
     /// A notice, a connection, or its next record before a replacement; `Idle` keeps the lock.
-    fn step<'n>(&mut self, mut state: MutexGuard<'n, State<T>>, latest: bool) -> Step<'n, T> {
+    fn step<'n, V>(
+        &mut self,
+        mut state: MutexGuard<'n, State<T>>,
+        latest: bool,
+        look: Look<T, M, V>,
+    ) -> Step<'n, T, V> {
         if let Some(closed) = &state.closed {
             return Step::Done(Err(RecvError::Closed(closed.clone())));
         }
@@ -727,6 +899,8 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
                     wake.notice();
                 }
                 state.wake = Some(wake);
+                // SAFETY: `M` is `Trusted` only after `trust_publisher`, on its caller's word.
+                let subscriber = unsafe { subscriber.vouched::<M>() };
                 self.current = Some(Connection {
                     subscriber,
                     binder,
@@ -758,11 +932,7 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
             let mut settle = drain.stalls == DRAIN_STALLS;
             let mut received = Err(RecvError::Empty);
             while !settle {
-                received = if latest {
-                    subscriber.try_latest()
-                } else {
-                    subscriber.try_recv()
-                };
+                received = look(subscriber, latest);
                 // The give-up as a wait sees it: also when a death turned its `Empty` to `Closed`.
                 match drain.after_look(subscriber.gave_up(), subscriber.position()) {
                     AfterLook::Return => break,
@@ -799,7 +969,7 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
     }
 
     /// End the drain, unless the name came back to its publisher: decided in `finish`'s lock.
-    fn end_drain<'n>(&mut self) -> Step<'n, T> {
+    fn end_drain<'n, V>(&mut self) -> Step<'n, T, V> {
         #[cfg(test)]
         BEFORE_DRAIN_ENDS.with_borrow_mut(|hook| hook.iter_mut().for_each(|hook| hook()));
         let named = self.named.clone();
@@ -815,7 +985,7 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
     }
 
     /// What a receive on the connection leads to: a result, or `None` to look again.
-    fn settle(&mut self, received: Result<T, RecvError>) -> Option<Result<T, RecvError>> {
+    fn settle<V>(&mut self, received: Result<V, RecvError>) -> Option<Result<V, RecvError>> {
         match received {
             Err(RecvError::Cancelled) => {
                 let state = &mut *self.named.lock();
@@ -824,7 +994,7 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
                 }
                 let current = self.current.as_ref();
                 let noticed = current.is_some_and(|c| c.subscriber.take_notice());
-                // A notice ended the wait to be looked at; else the runtime could not run it.
+                // A notice to look at the state: the connection's interrupter makes no other.
                 (!noticed && !state.replaced).then_some(Err(RecvError::Cancelled))
             }
             Err(RecvError::Closed(Closed::Evicted)) => Some(Err(self.evict())),
@@ -1085,20 +1255,20 @@ fn take_interrupt<T: Payload>(mut state: MutexGuard<'_, State<T>>) -> bool {
 }
 
 /// Where a receive stands after [`NamedSubscriber::step`].
-enum Step<'n, T: Payload> {
-    Done(Result<T, RecvError>),
+enum Step<'n, T: Payload, V> {
+    Done(Result<V, RecvError>),
     /// No connection, nothing to return: wait for a change, the lock held until then.
     Idle(MutexGuard<'n, State<T>>),
     /// Receive from the connection.
     Connected,
 }
 
-impl<T: Payload> Sealed for NamedSubscriber<T> {}
+impl<T: Payload, M: Trust> Sealed for NamedSubscriber<T, M> {}
 
 /// A [`Wake::Fd`] name subscriber's fd is an epoll instance that holds the current connection's
 /// fd and an eventfd its changes of state add to: the same fd for the subscriber's life, through
 /// every reconnection.
-impl<T: Payload + 'static> Wait for NamedSubscriber<T> {
+impl<T: Payload + 'static, M: Trust> Wait for NamedSubscriber<T, M> {
     fn wait_fd(&self) -> Option<BorrowedFd<'_>> {
         self.named.fds.as_ref().map(NamedFds::fd)
     }
@@ -1143,23 +1313,11 @@ impl<T: Payload + 'static> Wait for NamedSubscriber<T> {
     }
 }
 
-impl<T: Payload> Drop for NamedSubscriber<T> {
-    fn drop(&mut self) {
-        let mut state = self.named.lock();
-        state.dropped = true;
-        state.wake = None;
-        let ready = state.ready.take();
-        drop(state);
-        // A connection thread asleep before a retry looks at `dropped` and ends.
-        self.named.signal();
-        drop(ready);
-    }
-}
-
-impl<T: Payload> fmt::Debug for NamedSubscriber<T> {
+impl<T: Payload, M: Trust> fmt::Debug for NamedSubscriber<T, M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NamedSubscriber")
             .field("type", &T::type_name())
+            .field("trusted", &M::TRUSTED)
             .field("connected", &self.current.is_some())
             .finish_non_exhaustive()
     }

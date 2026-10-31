@@ -11,12 +11,21 @@
 //! these files into another crate's AIDL build makes types of the same names that this crate does
 //! not take.
 //!
-//! [`ITopicRegistry`](ITopicRegistry::ITopicRegistry), [`ITopicWatcher`](ITopicWatcher::ITopicWatcher),
-//! `TopicRef` and `TopicInfo` are the interface of a registry of topic names, which
-//! [`registry::Registry`](crate::registry::Registry) serves.
+//! [`ITopicRegistry`](ITopicRegistry::ITopicRegistry) is the interface of a registry of topic
+//! names, which [`registry::Registry`](crate::registry::Registry) serves and
+//! [`registry::RegistryResolver`](crate::registry::RegistryResolver) calls; its module holds the
+//! service name and the registry's refusal codes.
+//!
+//! The rest of the package is the wire between the two ends of this crate and is hidden from the
+//! documentation: the subscription token (`ISubscription`), the pool of a reply (`Pool`), and the
+//! registry's watcher, reply and listing types (`ITopicWatcher`, `TopicRef`, `TopicInfo`). A
+//! listing reaches an application as [`registry::TopicListing`](crate::registry::TopicListing).
 
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/topic.rs"));
 }
 
-pub use generated::rsbinder::topic::*;
+pub use generated::rsbinder::topic::{ITopic, ITopicRegistry, SubscribeRequest, TopicEndpoint};
+
+#[doc(hidden)]
+pub use generated::rsbinder::topic::{ISubscription, ITopicWatcher, Pool, TopicInfo, TopicRef};

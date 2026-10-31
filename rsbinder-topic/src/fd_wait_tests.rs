@@ -247,7 +247,7 @@ fn a_poll_loop_of_the_callers_receives_every_record() {
                     thread::sleep(Duration::from_micros(50));
                 }
             }
-            publisher.close(&rsbinder::Status::from(rsbinder::ExceptionCode::None));
+            publisher.close();
         })
     };
     let mut next = 0;
@@ -1041,6 +1041,55 @@ mod reactor {
         });
         let arms = || local.arms.load(Ordering::SeqCst);
         eventually("a drain, then a wait", || arms() >= 2 && local.is_parked());
+        interrupter.interrupt();
+        assert_eq!(
+            runtime.block_on(receiving).unwrap().ok(),
+            Some(Err(RecvError::Cancelled))
+        );
+    }
+
+    /// The caller's fd, as the reactor takes it.
+    struct Theirs(std::os::fd::RawFd);
+
+    impl AsRawFd for Theirs {
+        fn as_raw_fd(&self) -> std::os::fd::RawFd {
+            self.0
+        }
+    }
+
+    /// A reactor that refuses the fd (registered by the caller already) is a runtime error, each
+    /// time, apart from an interrupt; once it takes the fd, the wait goes on.
+    #[test]
+    fn a_reactor_that_refuses_the_fd_is_a_runtime_error_and_not_a_cancel() {
+        use tokio::io::{unix::AsyncFd, Interest};
+        let runtime = runtime();
+        let publisher = topic(64 << 10);
+        let mut subscriber = fd_subscriber(&publisher);
+        let fd = Theirs(subscriber.wait_fd().unwrap().as_raw_fd());
+        let refused = Err(RecvError::Runtime(std::io::ErrorKind::AlreadyExists));
+        let theirs = runtime.block_on(async {
+            // SAFETY: the subscriber, which owns the fd, outlives this registration.
+            let theirs = unsafe { AsyncFd::register_with_interest(fd, Interest::READABLE) };
+            let theirs = theirs.unwrap();
+            assert_eq!(subscriber.recv_async().await.map(drop), refused);
+            assert_eq!(subscriber.recv_async().await.map(drop), refused);
+            theirs
+        });
+        drop(theirs);
+        publisher.publish(&num(4)).unwrap();
+        let got = runtime.block_on(async {
+            let waited = tokio::time::timeout(WAIT, subscriber.recv_async()).await;
+            waited.map(|got| got.map(|bytes| value(&bytes)))
+        });
+        assert_eq!(got.ok(), Some(Ok(4)));
+        // With no record, the wait registers the fd now and an interrupt ends it as `Cancelled`.
+        let interrupter = subscriber.interrupter();
+        let local = subscriber.local().clone();
+        let receiving = runtime.spawn(async move {
+            let waited = tokio::time::timeout(WAIT, subscriber.recv_async());
+            waited.await.map(|got| got.map(drop))
+        });
+        eventually("the wait sleeps", || local.is_parked());
         interrupter.interrupt();
         assert_eq!(
             runtime.block_on(receiving).unwrap().ok(),

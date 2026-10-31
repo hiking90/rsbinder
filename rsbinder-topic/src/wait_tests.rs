@@ -168,7 +168,7 @@ fn a_close_wakes_a_sleeping_subscriber_with_its_status() {
     let publisher = topic(64 << 10);
     let receiving = asleep(subscriber(&publisher), Subscriber::recv);
     let status = Status::new_service_specific_error(5, Some("over".into()));
-    publisher.close(&status);
+    publisher.close_with(&status);
     assert_eq!(
         joined(receiving),
         Err(RecvError::Closed(Closed::Status(status)))

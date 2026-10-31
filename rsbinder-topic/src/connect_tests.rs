@@ -322,7 +322,7 @@ fn a_full_publisher_refuses_until_a_subscriber_goes() {
 fn a_closed_publisher_takes_no_subscription() {
     let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
     let mut subscriber = subscribe::<Bytes>(&publisher.as_binder(), Start::Latest).unwrap();
-    publisher.close(&Status::new_service_specific_error(9, None));
+    publisher.close_with(&Status::new_service_specific_error(9, None));
     let late = subscribe::<Bytes>(&publisher.as_binder(), Start::Latest);
     assert_eq!(service_specific(late), ERROR_CLOSED);
     assert!(matches!(
@@ -483,10 +483,18 @@ fn a_pool_past_4_gib_is_refused_before_anything_is_made() {
         pool: Some(pool(64 << 20)),
         ..policy()
     };
-    let made = Publisher::<Bytes>::new(&policy);
+    let refused = Publisher::<Bytes>::new(&policy).unwrap_err();
+    assert_eq!(refused.exception_code(), ExceptionCode::IllegalArgument);
+    assert_eq!(refused.message(), Some("rejected: pool larger than 4 GiB"));
+    let small = PublisherPolicy {
+        ring_bytes: 4095,
+        ..PublisherPolicy::default()
+    };
+    let refused = Publisher::<Bytes>::new(&small).unwrap_err();
+    assert_eq!(refused.exception_code(), ExceptionCode::IllegalArgument);
     assert_eq!(
-        made.err(),
-        Some(rsbinder::fmq::Error::BadValue("pool larger than 4 GiB"))
+        refused.message(),
+        Some("rejected: ring size outside 4 KiB to 1 GiB")
     );
 }
 
@@ -1016,7 +1024,7 @@ fn without_the_future_write_seal_nothing_is_made_and_nothing_is_left() {
     NO_FUTURE_WRITE.set(true);
     assert_eq!(
         Publisher::<Bytes>::new(&policy()).err(),
-        Some(rsbinder::fmq::Error::Unsupported)
+        Some(Status::from(ExceptionCode::UnsupportedOperation))
     );
     let refused = subscribe::<Bytes>(&publisher.as_binder(), Start::Latest);
     assert_eq!(

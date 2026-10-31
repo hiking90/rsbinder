@@ -28,7 +28,7 @@ use crate::aidl::ITopic::{
 use crate::aidl::Pool::Pool;
 use crate::aidl::SubscribeRequest::SubscribeRequest;
 use crate::aidl::TopicEndpoint::TopicEndpoint;
-use crate::connect::{asked_here, refuse, status_of};
+use crate::connect::{asked_here, policy_status, refuse, status_of};
 use crate::layout::{self, ControlView, LentSlot, Stored, HEADER_OFFSET, VERSION};
 use crate::link::{Dead, Forget, Link};
 use crate::pool::MAX_PINS;
@@ -90,12 +90,13 @@ struct Shared<T> {
 impl<T: Payload + 'static> Publisher<T> {
     /// Make a topic with `policy`.
     ///
-    /// `BadValue` when `policy.ring_bytes` is outside 4 KiB to 1 GiB, or `policy.pool` makes a
-    /// pool larger than 4 GiB. `Unsupported` off Linux and Android, on a target where a 64-bit
-    /// word of a read-only mapping cannot be loaded, and on a kernel without
-    /// `F_SEAL_FUTURE_WRITE`. An OS error when the memory cannot be made.
-    pub fn new(policy: &PublisherPolicy) -> rsbinder::fmq::Result<Self> {
-        let (fd, pool, writer) = TypedWriter::create(policy)?;
+    /// `EX_ILLEGAL_ARGUMENT` when `policy.ring_bytes` is outside 4 KiB to 1 GiB, or
+    /// `policy.pool` makes a pool larger than 4 GiB; the status's message names the check that
+    /// failed. `EX_UNSUPPORTED_OPERATION` off Linux and Android, on a target where a 64-bit word
+    /// of a read-only mapping cannot be loaded, and on a kernel without `F_SEAL_FUTURE_WRITE`.
+    /// The status code of the OS error when the memory cannot be made (`NoMemory` for `ENOMEM`).
+    pub fn new(policy: &PublisherPolicy) -> BinderResult<Self> {
+        let (fd, pool, writer) = TypedWriter::create(policy).map_err(policy_status)?;
         let capacity = writer.lock().writer.capacity();
         let shared = Arc::new(Shared {
             writer,
@@ -121,9 +122,8 @@ impl<T: Payload + 'static> Publisher<T> {
     /// `name`, for [`NamedSubscriber`](crate::NamedSubscriber)s of the name to find.
     ///
     /// The name follows the service manager's rules for a service name; a name it refuses, or a
-    /// caller it does not let add a service, fails here. The errors of [`new`](Self::new) come
-    /// back as a status: `EX_UNSUPPORTED_OPERATION` for `Unsupported`, `BadValue`, or an OS
-    /// error's code. Who may subscribe is [`PublisherPolicy::authorize`].
+    /// caller it does not let add a service, fails here, as do the errors of
+    /// [`new`](Self::new). Who may subscribe is [`PublisherPolicy::authorize`].
     ///
     /// Dropping the publisher ends the topic but leaves the name registered until the process
     /// ends; a subscriber that reaches it after that is refused with
@@ -143,7 +143,7 @@ impl<T: Payload + 'static> Publisher<T> {
         policy: &PublisherPolicy,
         resolver: &dyn Resolver,
     ) -> BinderResult<Self> {
-        let publisher = Self::new(policy).map_err(status_of)?;
+        let publisher = Self::new(policy)?;
         publisher.advertise_on(name, resolver)?;
         Ok(publisher)
     }
@@ -264,7 +264,9 @@ impl<T: Payload + 'static> Publisher<T> {
     /// What the topic has published, and each subscription it holds after taking out those that
     /// ended: who made it and what its control page reports (plan 15 §5.9a).
     pub fn stats(&self) -> PublisherStats {
-        self.shared.writer.stats()
+        let mut stats = self.shared.writer.stats();
+        stats.advertised = self.lock_advertised().is_some();
+        stats
     }
 
     /// The subscriptions the topic holds, after taking out those that ended.
@@ -280,26 +282,32 @@ impl<T: Payload + 'static> Publisher<T> {
         count
     }
 
-    /// End the topic with `status`: subscribers receive the records before it, then
-    /// [`Closed::Status`](crate::Closed::Status) with this status, or
-    /// [`Closed::End`](crate::Closed::End) for an ok one. Later publishes are
-    /// [`PublishError::Closed`] and later subscriptions are refused with
-    /// [`ITopic::ERROR_CLOSED`]. Closing again does nothing.
+    /// End the topic without an error: subscribers receive the records before it, then
+    /// [`Closed::End`](crate::Closed::End). Later publishes are [`PublishError::Closed`] and
+    /// later subscriptions are refused with [`ITopic::ERROR_CLOSED`]. Closing again does
+    /// nothing; dropping the publisher closes it so.
     ///
-    /// A name [`advertise_with`](Self::advertise_with) gave is taken back first, as its
-    /// resolver does it: the service manager does not.
+    /// A name the publisher holds ([`advertise_with`](Self::advertise_with),
+    /// [`advertise_on`](Self::advertise_on)) is taken back first, as its resolver does it: the
+    /// service manager does not.
     ///
-    /// The status's message is cut to 1 KiB. With
-    /// [`backpressure`](PublisherPolicy::backpressure) the end record waits for room as a value
-    /// does, so this call, and dropping the publisher, can take up to the timeout.
+    /// With [`backpressure`](PublisherPolicy::backpressure) the end record waits for room as a
+    /// value does, so this call, and dropping the publisher, can take up to
+    /// [`publish_timeout`](crate::Backpressure::publish_timeout).
     ///
     /// [`ITopic::ERROR_CLOSED`]: crate::aidl::ITopic::ERROR_CLOSED
-    pub fn close(&self, status: &Status) {
+    pub fn close(&self) {
+        self.close_with(&Status::ok());
+    }
+
+    /// [`close`](Self::close) with `status`: subscribers receive the records before it, then
+    /// [`Closed::Status`](crate::Closed::Status) with this status, or
+    /// [`Closed::End`](crate::Closed::End) for an ok one, as `close` gives.
+    ///
+    /// The status's message is cut to 1 KiB.
+    pub fn close_with(&self, status: &Status) {
         // Held through the end record: a second `close` writes none before the name is taken back.
-        let mut advertised = self
-            .advertised
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut advertised = self.lock_advertised();
         drop(advertised.take());
         self.shared.writer.close(status);
     }
@@ -428,7 +436,7 @@ impl<T: Payload> Drop for Publisher<T> {
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner);
         drop(advertised.take());
-        self.shared.writer.close(&Status::from(ExceptionCode::None));
+        self.shared.writer.close(&Status::ok());
     }
 }
 

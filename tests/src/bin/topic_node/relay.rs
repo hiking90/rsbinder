@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rsbinder::{hub, BinderResult, ExceptionCode, Interface, Status, Strong};
+use rsbinder::{hub, BinderResult, Interface, Strong};
 use rsbinder_topic::registry::{AllowAll, Registry};
 use rsbinder_topic::{Publisher, PublisherPolicy};
 use tests::topic_fleet::event::Kind;
@@ -109,7 +109,7 @@ pub fn relay(
                 Ok(Request::Command(Command::Rebind, _)) => {
                     let mut relayed = relayed.lock().unwrap_or_else(PoisonError::into_inner);
                     if let Some(old) = relayed.publisher.take() {
-                        old.close(&Status::from(ExceptionCode::None));
+                        old.close();
                     }
                     match transport::advertise(
                         &topic,
@@ -132,7 +132,7 @@ pub fn relay(
         }
         let mut relayed = relayed.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(publisher) = relayed.publisher.take() {
-            publisher.close(&Status::from(ExceptionCode::None));
+            publisher.close();
         }
         if let Some(last_seq) = relayed.next.checked_sub(1) {
             out.send(Kind::Published {

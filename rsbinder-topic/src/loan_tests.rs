@@ -9,7 +9,7 @@ use std::os::fd::AsFd;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 
-use rsbinder::{ExceptionCode, ParcelFileDescriptor, Status};
+use rsbinder::ParcelFileDescriptor;
 
 use crate::aidl::ITopic::WAKE_FUTEX;
 use crate::aidl::SubscribeRequest::SubscribeRequest;
@@ -103,7 +103,7 @@ fn a_loan_is_refused_without_a_pool_past_a_slot_past_the_bound_and_once_closed()
     assert_eq!(publisher.loan_slice(8).err(), Some(too_many));
     drop(held);
     let held = publisher.loan_slice(8).unwrap();
-    publisher.close(&Status::from(ExceptionCode::None));
+    publisher.close();
     assert_eq!(held.publish(), Err(PublishError::Closed));
     assert_eq!(publisher.loan_slice(8).err(), Some(PublishError::Closed));
 }
@@ -406,7 +406,10 @@ fn a_dropped_sample_lets_go_of_its_slot() {
     let mut subscriber = subscribe(&publisher);
     let slot = lend(&publisher, &[3; 8]);
     lend(&publisher, &[4; 8]);
-    drop(subscriber.try_recv_sample().unwrap());
+    let sample = subscriber.try_recv_sample().unwrap();
+    assert_eq!(publisher.stats().subscribers[0].pinned, Some(slot));
+    drop(sample);
+    assert_eq!(publisher.stats().subscribers[0].pinned, None);
     // The free slots first; then the only one read past, as nothing pins it.
     for n in 0..3u8 {
         assert_ne!(lend(&publisher, &[n; 8]), slot);
@@ -431,7 +434,7 @@ fn a_sample_is_waited_for_until_a_value_a_bound_or_the_end() {
         let sample = subscriber.recv_sample().unwrap();
         assert_eq!(sample.to_owned(), pattern(1, 64));
     });
-    publisher.close(&Status::from(ExceptionCode::None));
+    publisher.close();
     assert_eq!(
         subscriber.recv_sample().err(),
         Some(RecvError::Closed(crate::Closed::End))

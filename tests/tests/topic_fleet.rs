@@ -1566,22 +1566,77 @@ fn ended_since(
     }
 }
 
+/// The subscriptions `node`'s publisher of `topic` holds, as its `stats()` lists them.
+fn subscriptions(fleet: &mut Fleet, node: &str, topic: &str) -> Result<Vec<Subscribed>, Failure> {
+    let listed = fleet.stats(node)?.into_iter().find_map(|kind| match kind {
+        Kind::PubStats {
+            topic: t,
+            subscribers,
+            ..
+        } if t == topic => Some(subscribers),
+        _ => None,
+    });
+    Ok(listed.unwrap_or_default())
+}
+
 /// The pids of the subscriptions `node`'s publisher of `topic` holds, sorted.
 fn held(fleet: &mut Fleet, node: &str, topic: &str) -> Result<Vec<i32>, Failure> {
-    let mut pids: Vec<i32> = fleet
-        .stats(node)?
-        .into_iter()
-        .find_map(|kind| match kind {
-            Kind::PubStats {
-                topic: t,
-                subscribers,
-                ..
-            } if t == topic => Some(subscribers.iter().map(|info| info.pid).collect()),
-            _ => None,
-        })
-        .unwrap_or_default();
+    let mut pids: Vec<i32> = subscriptions(fleet, node, topic)?
+        .iter()
+        .map(|info| info.pid)
+        .collect();
     pids.sort_unstable();
     Ok(pids)
+}
+
+/// The slot `pid`'s subscription to `node`'s publisher of `topic` pins, asked until it pins one
+/// or `within` passes.
+fn pinned_by(
+    fleet: &mut Fleet,
+    node: &str,
+    topic: &str,
+    pid: i32,
+    within: Duration,
+) -> Result<u32, Failure> {
+    let deadline = Instant::now() + within;
+    loop {
+        let listed = subscriptions(fleet, node, topic)?;
+        let slot = listed.iter().find(|info| info.pid == pid);
+        if let Some(slot) = slot.and_then(|info| info.pinned) {
+            return Ok(slot);
+        }
+        if Instant::now() >= deadline {
+            let text = format!("X7: {pid} pins no slot of {topic} as it holds: {listed:?}");
+            return Err(fleet.failure(None, text));
+        }
+        fleet.watch("X7 holding", Duration::from_millis(50))?;
+    }
+}
+
+/// Ask `node`'s publisher of `topic` until no subscription is `pid`'s and none pins `slot`
+/// (plan 15 #6), within `within`: judged from the pins it reports, whatever keeps them.
+fn let_go(
+    fleet: &mut Fleet,
+    (node, topic): (&str, &str),
+    (pid, slot): (i32, u32),
+    what: &str,
+    within: Duration,
+) -> Result<(), Failure> {
+    let deadline = Instant::now() + within;
+    loop {
+        let listed = subscriptions(fleet, node, topic)?;
+        if listed
+            .iter()
+            .all(|info| info.pid != pid && info.pinned != Some(slot))
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let text = format!("{what}: {node} holds {listed:?}, slot {slot} of {pid}");
+            return Err(fleet.failure(None, text));
+        }
+        fleet.watch(what, Duration::from_millis(50))?;
+    }
 }
 
 /// Ask `node`'s publisher of `topic` until the pids it holds satisfy `done`, within `within`.
@@ -1988,25 +2043,15 @@ fn x7_killed_holding_a_sample(
     let pid = fleet.pid(&holder);
     fleet.command(&holder, &format!("hold-sample {frames}"));
     fleet.watch("X7 holding", Duration::from_millis(500))?;
-    if !held(fleet, "p-frames", &frames)?.contains(&pid) {
-        return Err(fleet.failure(
-            None,
-            format!("X7: {holder} ({pid}) not subscribed as it holds"),
-        ));
-    }
-    // The publisher lends no slot a subscription it holds pins, and takes the pins from those
-    // subscriptions alone (rsbinder-topic `link.rs`, `load_pins`): the dead holder's slot is
-    // lendable once its subscription is out. A check of the slot itself needs the pin of each
-    // subscription in the publisher's stats (plans/15-pubsub-api-review.md A-6).
+    let slot = pinned_by(fleet, "p-frames", &frames, pid, bound(END))?;
     fleet.kill(&holder, Signal::KILL);
     fleet.ended_node(&holder)?;
-    held_until(
+    let_go(
         fleet,
-        "p-frames",
-        &frames,
-        "X7 the holder taken out",
+        ("p-frames", &frames),
+        (pid, slot),
+        "X7 the holder taken out and its slot let go",
         bound(END),
-        |held| !held.contains(&pid),
     )?;
     let others = last_seqs(fleet, topology, |p| p.topic == frames && p.node != holder);
     advanced(fleet, "X7 lending after the holder died", &others)?;
@@ -2035,12 +2080,11 @@ fn x7_every_slot_comes_back(fleet: &mut Fleet, topology: &Topology) -> Result<()
         let pid = fleet.pid(holder);
         fleet.command(holder, &format!("hold-sample {pins}"));
         fleet.watch("X7 holding", Duration::from_millis(200))?;
+        let slot = pinned_by(fleet, "p-frames", &pins, pid, bound(END))?;
         fleet.kill(holder, Signal::KILL);
         fleet.ended_node(holder)?;
-        let what = format!("X7 round {round}: the holder taken out");
-        held_until(fleet, "p-frames", &pins, &what, bound(END), |held| {
-            !held.contains(&pid)
-        })?;
+        let what = format!("X7 round {round}: the holder taken out and its slot let go");
+        let_go(fleet, ("p-frames", &pins), (pid, slot), &what, bound(END))?;
         let restarted = now_ns();
         fleet.spawn(holder, &args_of(&topology.args(holder)));
         connected_since(

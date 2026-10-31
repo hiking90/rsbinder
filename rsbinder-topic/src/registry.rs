@@ -39,7 +39,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rsbinder::{
     BinderResult, Caller, DeathRecipient, ExceptionCode, Interface, SIBinder, Status, StatusCode,
@@ -112,6 +112,39 @@ pub struct RegistryStats {
     pub notices_retried: u64,
     /// Failed notices not kept to send again, as 256 were owed already.
     pub owed_dropped: u64,
+}
+
+/// One name with a topic, as [`RegistryResolver::list`] returns it.
+///
+/// The fields are what the registry reports: a registry this process does not vouch for can make
+/// them say anything.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TopicListing {
+    /// The name.
+    pub name: String,
+    /// The uid of the process that advertised the topic.
+    pub uid: u32,
+    /// Its pid.
+    pub pid: i32,
+    /// How long the name has been given to its topic, on the registry's monotonic clock, to the
+    /// millisecond.
+    pub age: Duration,
+    /// Watches of the name.
+    pub watchers: usize,
+}
+
+impl From<TopicInfo> for TopicListing {
+    fn from(info: TopicInfo) -> Self {
+        Self {
+            name: info.name,
+            // The bits of the `u32` the registry wrote.
+            uid: info.uid as u32,
+            pid: info.pid,
+            age: Duration::from_millis(u64::try_from(info.ageMillis).unwrap_or(0)),
+            watchers: usize::try_from(info.watchers).unwrap_or(0),
+        }
+    }
 }
 
 /// Whether `name` is one a registry takes: 1 to 127 bytes of `[A-Za-z0-9._/-]`, as a service

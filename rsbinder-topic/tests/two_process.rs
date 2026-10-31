@@ -588,7 +588,7 @@ fn waiting(tag: &str, timeout: Duration) -> (String, Publisher<Bytes>) {
     let publisher = Publisher::<Bytes>::new(&PublisherPolicy {
         ring_bytes: 4096,
         backpressure: Some(Backpressure {
-            timeout,
+            publish_timeout: timeout,
             ..Backpressure::default()
         }),
         ..PublisherPolicy::default()

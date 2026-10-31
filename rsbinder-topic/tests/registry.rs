@@ -41,7 +41,7 @@ use rsbinder_topic::aidl::SubscribeRequest::SubscribeRequest;
 use rsbinder_topic::aidl::TopicEndpoint::TopicEndpoint;
 use rsbinder_topic::aidl::TopicInfo::TopicInfo;
 use rsbinder_topic::aidl::TopicRef::TopicRef;
-use rsbinder_topic::registry::{AllowAll, Registry, RegistryResolver};
+use rsbinder_topic::registry::{AllowAll, Registry, RegistryResolver, TopicListing};
 use rsbinder_topic::{
     Bytes, Closed, Disconnected, NamedState, NamedSubscriber, Publisher, PublisherPolicy,
     RecvError, Resolver, Start, SubscriberPolicy,
@@ -112,7 +112,7 @@ fn timed<T>(what: &str, stopped: &[Stopped], call: impl FnOnce() -> T) -> T {
     })
 }
 
-fn listed(resolver: &RegistryResolver, name: &str) -> Option<TopicInfo> {
+fn listed(resolver: &RegistryResolver, name: &str) -> Option<TopicListing> {
     let mut infos = resolver.list(name).unwrap();
     infos.retain(|info| info.name == name);
     infos.pop()
@@ -170,7 +170,9 @@ fn a_closed_or_dropped_publishers_name_is_gone_from_the_next_call() {
     let policy = PublisherPolicy::default();
     let publisher = Publisher::<Bytes>::advertise_with(&name, &policy, &resolver).unwrap();
     assert!(listed(&resolver, &name).is_some());
-    publisher.close(&Status::from(ExceptionCode::None));
+    assert!(publisher.stats().advertised);
+    publisher.close();
+    assert!(!publisher.stats().advertised);
     assert!(listed(&resolver, &name).is_none());
     let publisher = Publisher::<Bytes>::advertise_with(&name, &policy, &resolver).unwrap();
     assert!(listed(&resolver, &name).is_some());
@@ -195,7 +197,7 @@ fn a_name_given_again_on_the_same_host_stays_and_a_new_name_takes_its_place() {
     publisher.advertise_on(&second, &resolver).unwrap();
     assert!(listed(&resolver, &second).is_some());
     assert!(listed(&resolver, &first).is_none());
-    publisher.close(&Status::from(ExceptionCode::None));
+    publisher.close();
     assert!(listed(&resolver, &second).is_none());
 }
 
@@ -218,7 +220,11 @@ fn a_dead_publishers_name_and_a_dead_watchers_watch_go() {
     let mut publisher = publisher(&name, &registry);
     let watcher = Peer::spawn_with("subscribe", &name, &[(REGISTRY, &registry)]);
     assert_eq!(watcher.says(), "watching");
-    assert_eq!(listed(&resolver, &name).map(|info| info.watchers), Some(1));
+    let listing = listed(&resolver, &name).unwrap();
+    assert_eq!(listing.watchers, 1);
+    // The publisher is a child of this test, of its uid.
+    assert_eq!(listing.uid, rustix::process::getuid().as_raw());
+    assert!(listing.age < Duration::from_secs(60), "{listing:?}");
     drop(watcher);
     eventually("the dead watcher's watch to go", || {
         listed(&resolver, &name).map(|info| info.watchers) == Some(0)

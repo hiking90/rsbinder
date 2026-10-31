@@ -227,7 +227,10 @@ mod unsupported_tests {
     #[test]
     fn neither_end_of_a_topic_is_made_on_a_target_without_memfd() {
         let made = Publisher::<Bytes>::new(&PublisherPolicy::default());
-        assert_eq!(made.err(), Some(rsbinder::fmq::Error::Unsupported));
+        assert_eq!(
+            made.err().map(|status| status.exception_code()),
+            Some(ExceptionCode::UnsupportedOperation)
+        );
         let topic = crate::connect::Token::detached();
         let refused = Subscriber::<Bytes>::request(&topic, &SubscriberPolicy::default());
         assert_eq!(

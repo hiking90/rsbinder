@@ -183,10 +183,10 @@ fn cmd_topics(prefix: &str) -> ExitCode {
                 "NAME", "UID", "PID", "AGE"
             );
             for topic in &topics {
-                let age = format!("{:.1}s", topic.ageMillis as f64 / 1000.0);
+                let age = format!("{:.1}s", topic.age.as_secs_f64());
                 println!(
                     "{:width$}  {:>6}  {:>8}  {:>9}  {}",
-                    topic.name, topic.uid as u32, topic.pid, age, topic.watchers
+                    topic.name, topic.uid, topic.pid, age, topic.watchers
                 );
             }
             ExitCode::from(exit::OK)

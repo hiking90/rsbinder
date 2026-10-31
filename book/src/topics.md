@@ -136,8 +136,12 @@ Where a `Subscriber`'s topic ends with `RecvError::Closed`, a
 `NamedSubscriber` returns `RecvError::Disconnected` once (the publisher ended
 or died, or another took the name) and waits for the next publisher. Records
 do not carry over: what was published between two connections is not counted
-as lost, and the `Disconnected` marks the gap. Only being taken out by a topic
-with backpressure, `Closed::Evicted`, ends it. The watch uses the service
+as lost, and the `Disconnected` marks the gap. Two things end it, each then
+returned by every receive: being taken out by a topic with backpressure
+(`Closed::Evicted`), and, once no connection is left, the death of a
+registry's host (`Closed::ResolverDied`; the service manager's death is not
+reported). `NamedSubscriber::state` tells a wait for a publisher from a wait
+only a new registration of the name ends. The watch uses the service
 manager's registration notices, which Android 10's service manager does not
 have: there `NamedSubscriber::subscribe` fails. A notice is a oneway call,
 which the kernel fails when the subscriber's process has no room left for one;
@@ -246,12 +250,18 @@ then the next record. `try_latest` and `recv_latest` skip to the newest
 record and report nothing skipped as lost.
 
 `PublisherPolicy::backpressure` makes a publish wait, up to
-`Backpressure::timeout`, for its subscribers to read what it would overwrite.
-Past the timeout the subscribers in the way are taken out: each is told, and
-its receives return `Closed::Evicted`. `Backpressure::window` also bounds how
-many records a subscriber may be behind. The wait holds the topic's lock and
-sleeps the publishing thread, so from async code a publish runs on a blocking
-thread. The `Backpressure` rustdoc lists what waits with it.
+`Backpressure::publish_timeout`, for its subscribers to read what it would
+overwrite. Past the timeout the subscribers in the way are taken out: each is
+told, and its receives return `Closed::Evicted`. `Backpressure::window` also
+bounds how many records a subscriber may be behind. The same timeout bounds a
+loan's wait for a slot and the end record's wait in `close` or the drop.
+
+The timeout is the publisher's, not a subscriber's: a subscriber that stops
+reading is taken out only once it holds up a publish, and the time until then
+is the time the publisher takes to fill the ring (or the window) behind it,
+which the publish rate decides, plus the timeout. The wait holds the topic's
+lock and sleeps the publishing thread, so from async code a publish runs on a
+blocking thread. The `Backpressure` rustdoc lists what waits with it.
 
 ## Waiting
 
@@ -283,9 +293,12 @@ second memfd, and the ring carries only a record that names the slot:
 ```
 
 A `Bytes` subscriber receives a lent value as any other, or where it lies with
-`recv_sample`, `try_recv_sample`, `try_latest_sample` and `recv_sample_async`.
-The `Sample` pins its slot until it is dropped, and the publisher lends no
-pinned slot. By default the subscriber reads the slot with atomic loads:
+`recv_sample`, `try_recv_sample`, `try_latest_sample` and `recv_sample_async`;
+a `NamedSubscriber` of `Bytes` has the same calls, which follow it from one
+publisher to the next. The `Sample` pins its slot until it is dropped, and the
+publisher lends no pinned slot (`SubscriberInfo::pinned` in the publisher's
+stats shows which). By default the subscriber reads the slot with atomic
+loads:
 
 ```rust,ignore
 {{#include ../../rsbinder-topic/examples/topic_frames.rs:sample}}
@@ -302,7 +315,8 @@ undefined behavior in Rust.
 A subscriber that can vouch for the publisher's process — this system's own
 service, say, and not a process less privileged than the subscriber — calls
 `unsafe` `trust_publisher`. Its samples then deref to `[u8]` in place, and its
-copies are plain memory copies:
+copies are plain memory copies. A `NamedSubscriber`'s `trust_publisher`
+vouches for every publisher the name may be given to, the later ones included:
 
 ```rust,ignore
 {{#include ../../rsbinder-topic/examples/topic_frames.rs:trusted}}
