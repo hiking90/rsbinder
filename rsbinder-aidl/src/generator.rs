@@ -1165,7 +1165,6 @@ impl InterfaceRender {
         let bp_name = format!("Bp{stem}");
         let escaped = crate::escape_rust_keyword(&raw).into_owned();
         Self {
-            crate_name: "rsbinder".to_string(),
             module: escaped.clone(),
             bn_name,
             bp_name,
@@ -1493,12 +1492,11 @@ fn make_fn_member(
         func_call_params += &format!("{}, ", generator.identifier);
 
         if !matches!(arg.direction, Direction::Out) {
-            let param = if type_decl_for_func.starts_with('&') {
-                generator.identifier.to_owned()
+            if type_decl_for_func.starts_with('&') {
+                write_funcs.push(format!("data.write({})?;", generator.identifier));
             } else {
-                format!("&{}", generator.identifier)
-            };
-            write_funcs.push(format!("data.write({param})?;"));
+                write_funcs.push(format!("data.write(&{})?;", generator.identifier));
+            }
         } else if generator.is_variable_array() {
             if generator.is_nullable {
                 write_funcs.push(format!(
@@ -1528,6 +1526,7 @@ fn make_fn_member(
             }
         }
 
+        transaction_params += &format!("{}, ", generator.func_call_param());
         if matches!(arg.direction, Direction::Out | Direction::Inout) {
             transaction_write.push(TransactionWrite {
                 identifier: generator.identifier.to_owned(),
@@ -1535,9 +1534,8 @@ fn make_fn_member(
                 null_guard_flatten: generator.out_array_null_guard_flatten(),
                 needs_unwrap: generator.out_scalar_needs_unwrap(),
             });
-            read_onto_params.push(generator.identifier.to_owned());
+            read_onto_params.push(generator.identifier);
         }
-        transaction_params += &format!("{}, ", generator.func_call_param());
     }
 
     let func_call_params = if func_call_params.chars().count() > 2 {
@@ -1688,8 +1686,7 @@ fn validate_transaction_codes(decl: &parser::InterfaceDecl) -> Result<(), AidlEr
     }
 
     // Detect negative, overflowing, or duplicate transaction codes.
-    let mut seen: std::collections::HashMap<i64, (String, Option<(usize, usize)>)> =
-        std::collections::HashMap::new();
+    let mut seen = std::collections::HashMap::new();
     for method in decl.method_list.iter() {
         let Some(code) = method.intvalue else {
             continue;
@@ -1727,11 +1724,11 @@ fn validate_transaction_codes(decl: &parser::InterfaceDecl) -> Result<(), AidlEr
             .into());
         }
         if let Some((prev_name, prev_span)) =
-            seen.insert(code, (method.identifier.clone(), method.identifier_span))
+            seen.insert(code, (method.identifier.as_str(), method.identifier_span))
         {
             return Err(SemanticError::DuplicateTransactionCode {
                 interface: decl.name.clone(),
-                method1: prev_name,
+                method1: prev_name.to_owned(),
                 method2: method.identifier.clone(),
                 code,
                 src: NamedSource::new(&source_name, source_text.clone()),
@@ -2321,7 +2318,7 @@ pub mod {mod} {{
         let mut members = Vec::new();
         let mut declarations = Vec::new();
 
-        let owner_name = decl.name.clone();
+        let owner_name = decl.name.as_str();
         // Not scoped: a nested parcelable does not inherit `@FixedSize`.
         let is_fixed_size =
             parser::has_annotation(&decl.annotation_list, parser::AnnotationType::FixedSize);
@@ -2369,26 +2366,26 @@ pub mod {mod} {{
                 Self::ensure_no_type_param_field(
                     &generator,
                     &decl_type_params,
-                    &owner_name,
+                    owner_name,
                     &var.identifier,
                 )?;
                 generator.ensure_resolvable()?;
                 generator.ensure_sized(&var.identifier)?;
-                Self::ensure_declarable(&generator, &owner_name, &var.identifier)?;
+                Self::ensure_declarable(&generator, owner_name, &var.identifier)?;
                 if var.constant {
-                    Self::ensure_constant_type(&generator, &owner_name, &var.identifier)?;
+                    Self::ensure_constant_type(&generator, owner_name, &var.identifier)?;
                 }
                 if !var.constant {
                     if is_fixed_size {
                         Self::ensure_fixed_size_field(
                             &generator,
                             "parcelable",
-                            &owner_name,
+                            owner_name,
                             &var.identifier,
                         )?;
                     }
                     if is_vintf {
-                        Self::ensure_vintf_closure(&generator, "parcelable", &owner_name)?;
+                        Self::ensure_vintf_closure(&generator, "parcelable", owner_name)?;
                     }
                 }
 
@@ -2403,16 +2400,20 @@ pub mod {mod} {{
                         deprecated_attr(var.deprecated.as_ref()),
                     ));
                 } else {
+                    let holder;
                     let init_value = match generator.value_type {
-                        ValueType::Holder => Some(ConstExpr::new(ValueType::Holder)),
-                        _ => var.const_expr.clone(),
+                        ValueType::Holder => {
+                            holder = ConstExpr::new(ValueType::Holder);
+                            Some(&holder)
+                        }
+                        _ => var.const_expr.as_ref(),
                     };
 
                     members.push(ParcelableMember {
                         identifier: var.identifier(),
                         type_decl: generator.type_declaration(true),
                         init: generator.init_value(
-                            init_value.as_ref(),
+                            init_value,
                             InitParam::builder()
                                 .with_const(false)
                                 .with_vintf(is_vintf)
@@ -2428,7 +2429,7 @@ pub mod {mod} {{
             }
         }
 
-        Self::ensure_nested_names(Some(&owner_name), &declarations)?;
+        Self::ensure_nested_names(Some(owner_name), &declarations)?;
         let nested = &self.declarations(&declarations, indent + 1)?;
         let namespace = parser::get_descriptor_from_annotation_list(&decl.annotation_list)?
             .unwrap_or_else(|| decl.namespace.to_string(Namespace::AIDL));
@@ -2540,7 +2541,7 @@ pub mod {mod} {{
             ));
         }
 
-        let generator = &parser::get_backing_type(&decl.annotation_list, decl.name_span)?;
+        let generator = parser::get_backing_type(&decl.annotation_list, decl.name_span)?;
 
         let mut members = Vec::new();
 
@@ -2624,7 +2625,6 @@ pub mod {mod} {{
             module: crate::escape_rust_keyword(&decl.name).into_owned(),
             name: decl.name.clone(),
             backing_type: generator
-                .clone()
                 .direction(&Direction::None)?
                 .type_declaration(true),
             members,

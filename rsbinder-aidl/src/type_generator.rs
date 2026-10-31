@@ -1608,7 +1608,7 @@ impl TypeGenerator {
         let calculated = self.validate_enum_value(expr, target_lookup)?;
         Ok(calculated
             .value
-            .to_init(param.with_fixed_array(false).with_nullable(false)))
+            .to_init(&param.with_fixed_array(false).with_nullable(false)))
     }
 
     fn init_enum_array_value(
@@ -1639,7 +1639,7 @@ impl TypeGenerator {
         }
 
         Ok(ValueType::Array(enum_values).to_init(
-            param
+            &param
                 .with_fixed_array(is_fixed_array)
                 .with_nullable(is_nullable),
         ))
@@ -1717,7 +1717,7 @@ impl TypeGenerator {
         };
         self.check_fixed_arity(values, &array_info.sizes)?;
         Ok(converted.value.to_init(
-            param
+            &param
                 .with_fixed_array(array_info.is_fixed())
                 .with_nullable(is_nullable),
         ))
@@ -1791,14 +1791,14 @@ impl TypeGenerator {
                     .convert_to(&self.value_type)
                     .map_err(|e| make_type_error(e.message, self.type_span))?
                     .value
-                    .to_init(scalar_param)
+                    .to_init(&scalar_param)
             }
             // Laxer than AOSP `ValueString` for char/float/double targets; non-enum types error.
             _ => calculated
                 .convert_to(&self.value_type)
                 .map_err(|e| make_type_error(e.message, self.type_span))?
                 .value
-                .to_init(scalar_param),
+                .to_init(&scalar_param),
         })
     }
 
@@ -1812,7 +1812,7 @@ impl TypeGenerator {
             if let Some(init) = self.fixed_array_default() {
                 return Ok(init);
             }
-            return Ok(ValueType::Void.to_init(param.with_fixed_array(false).with_nullable(false)));
+            return Ok(ValueType::Void.to_init(&param.with_fixed_array(false).with_nullable(false)));
         };
 
         let init_str = if matches!(self.value_type, ValueType::Array(_)) {
